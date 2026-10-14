@@ -359,13 +359,13 @@ fn apply_dry_run_issues_no_mutation() {
     };
     let mut r = req(Target::Existing(7));
     r.dry_run = true;
-    r.also_labels = vec!["loom:operator-only".into()];
+    r.also_labels = vec!["loom:important".into()];
     r.remove_labels = vec!["loom:building".into()];
     let (code, out, _) = run(&mut f, &decision(2), &r);
     assert_eq!(code, exit::OK);
     assert!(f.mutations().is_empty(), "{:?}", f.calls);
     assert!(out.contains("DRY_RUN=true"));
-    assert!(out.contains("LABELS_ADD=loom:operator-decision,loom:operator-only"));
+    assert!(out.contains("LABELS_ADD=loom:operator,loom:important"));
     assert!(out.contains("LABELS_REMOVE=loom:building"));
     assert!(out.contains("```decision"));
 
@@ -387,7 +387,7 @@ fn apply_relabel_writes_body_before_labels() {
         ..FakeForge::default()
     };
     let mut r = req(Target::Existing(7));
-    r.also_labels = vec!["loom:operator-only".into()];
+    r.also_labels = vec!["loom:important".into()];
     r.remove_labels = vec!["loom:building".into(), "loom:not-present".into()];
     let (code, _, err) = run(&mut f, &decision(2), &r);
     assert_eq!(code, exit::OK, "{err}");
@@ -396,7 +396,7 @@ fn apply_relabel_writes_body_before_labels() {
         vec![
             "view 7",
             "set_body 7",
-            "add_labels 7 loom:operator-decision,loom:operator-only",
+            "add_labels 7 loom:operator,loom:important",
             "remove_label 7 loom:building",
             "remove_label 7 loom:decision-malformed",
         ]
@@ -449,10 +449,49 @@ fn apply_new_files_with_labels() {
     let mut r = req(Target::New {
         title: "Pick a backend".into(),
     });
-    r.also_labels = vec!["loom:operator-only".into(), DECISION_LABEL.into()];
+    r.also_labels = vec!["loom:important".into(), DECISION_LABEL.into()];
     let (code, out, _) = run(&mut f, &decision(4), &r);
     assert_eq!(code, exit::OK);
-    assert_eq!(f.calls, vec!["create Pick a backend loom:operator-decision,loom:operator-only"]);
+    assert_eq!(f.calls, vec!["create Pick a backend loom:operator,loom:important"]);
     assert!(out.contains("CREATED=https://github.com/o/r/issues/99"));
     assert_eq!(parse_block(&f.state.body).unwrap(), decision(4));
+}
+
+/// #11795: a decision is `loom:operator` plus the body's decision block; the
+/// retired sub-labels are never applied.
+#[test]
+fn apply_labels_a_decision_loom_operator() {
+    assert_eq!(DECISION_LABEL, "loom:operator");
+    let mut f = FakeForge::default();
+    let (code, _, _) = run(&mut f, &decision(2), &req(Target::New { title: "t".into() }));
+    assert_eq!(code, exit::OK);
+    assert_eq!(f.calls, vec!["create t loom:operator"]);
+    assert!(crate::operator_decision::render::has_decision_block(&f.state.body));
+}
+
+/// #11795: a not-yet-updated caller's `--also-label` of a retired hold name
+/// adds its replacement, never the retired name; one with no replacement is
+/// dropped.
+#[test]
+fn apply_maps_a_retired_also_label_to_its_replacement() {
+    let mut f = FakeForge::default();
+    let mut r = req(Target::New { title: "t".into() });
+    r.also_labels = vec![
+        "loom:operator-only".into(),
+        "loom:operator-decision".into(),
+        "loom:needs-capability".into(),
+        "loom:urgent".into(),
+    ];
+    let (code, _, _) = run(&mut f, &decision(2), &r);
+    assert_eq!(code, exit::OK);
+    assert_eq!(f.calls, vec!["create t loom:operator,loom:blocked"]);
+}
+
+#[test]
+fn has_decision_block_reads_the_fence_or_the_managed_section() {
+    use crate::operator_decision::render::{has_decision_block, render_section};
+    assert!(has_decision_block("x\n```decision\n{}\n```"));
+    assert!(has_decision_block(&render_section(&decision(2))));
+    assert!(!has_decision_block("prose mentioning ```decision inline"));
+    assert!(!has_decision_block("<!-- loom:capability=host-sudo -->"));
 }

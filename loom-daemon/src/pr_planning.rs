@@ -13,7 +13,7 @@ mod listing;
 mod tests;
 #[cfg(test)]
 mod workflow_shaped_tests;
-pub use listing::{fetch_queue, has_judge_fallback};
+pub use listing::{fetch_queue, has_judge_fallback, has_judge_work};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PrRole {
@@ -129,10 +129,13 @@ pub fn ordered_queue(
                 .is_some_and(|s| s.eq_ignore_ascii_case("open"))
                 && r["draft"] != true
                 && r["isDraft"] != true
-                && !has_label(r, "loom:blocked")
-                && !has_label(r, "loom:operator-only")
-                // #11743: no role reviews, treats or merges a frozen PR.
-                && !has_label(r, crate::work_finder::FROZEN_LABEL)
+                // The PR-lane parks: `loom:blocked`, `loom:frozen` (#11743: no
+                // role reviews, treats or merges a frozen PR) and the retired
+                // `loom:operator-only`. Not `loom:operator` (#11795): Doctor
+                // drains a held PR (#7660); Judge skips it below.
+                && !crate::work_finder::PR_LANE_PARK_LABELS
+                    .iter()
+                    .any(|l| has_label(r, l))
         })
         .collect();
     candidates.retain(|r| match role {

@@ -264,7 +264,9 @@ pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
+// #11855: bound Judge re-runs on a PR whose passes end without a verdict.
 pub mod journal;
+pub mod judge_backstop;
 pub mod key_ref;
 pub mod kimi_usage;
 pub mod label_registry;

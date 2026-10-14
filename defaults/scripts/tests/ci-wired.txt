@@ -112,7 +112,7 @@ test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
 test-guide-blocked-unblock-limit.sh
-test-guide-operator-only-exclude.sh
+test-guide-operator-hold-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
 test-guide-superseding-block-merge-state.sh
@@ -125,7 +125,7 @@ test-guide-work-log-pr-pagination.sh
 test-guide-work-log-self-loop.sh
 test-guide-work-plan-approved-review-label-fidelity.sh
 test-guide-work-plan-debounce.sh
-test-guide-work-plan-operator-only-exclude.sh
+test-guide-work-plan-operator-hold-exclude.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
@@ -164,7 +164,7 @@ test-merge-pr-tree-checks.sh
 test-merge-pr-ci-result.sh
 test-merge-pr-required-checks.sh
 test-nextest-daemon-guard.sh
-test-operator-only-subkind.sh
+test-operator-hold-routing.sh
 test-post-verdict.sh
 test-pr-worktree-isolation.sh
 test-probe-tokens-fallback.sh

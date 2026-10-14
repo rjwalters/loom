@@ -1,15 +1,14 @@
-//! Capability declarations for the `loom:operator-mechanical` dispatch lane
-//! (#6885 Part 2, issue #6893).
+//! Capability declarations for the mechanical operator-hold dispatch lane
+//! (#6885 Part 2, issue #6893; re-keyed on the body by #11795).
 //!
 //! # What this module is for
 //!
-//! `loom:operator-only` is a **hard park**: every dispatch route refuses the
-//! item, unconditionally, keyed on the base label
-//! ([`crate::work_finder::PARK_LABELS`]). Its sub-kind labels (#5671) are
-//! additive metadata the skip logic never branched on, so a
-//! `loom:operator-mechanical` item — "needs a credential/host access, but **no
-//! judgement**" — was parked exactly like a genuine `loom:operator-decision`
-//! item even though nothing about it requires a human *ruling*.
+//! `loom:operator` is a **park** on an issue: every dispatch route refuses the
+//! item ([`crate::work_finder::PARK_LABELS`]). Some operator holds need no
+//! judgement, only access a human holds — a credential, root on a host. Since
+//! #11795 such an item is told apart by its body, not a sub-label: it declares
+//! the access it needs in `<!-- loom:capability=<name> -->` markers and carries
+//! **no** ```` ```decision ```` block (a decision is a ruling, never mechanical).
 //!
 //! This module supplies the two halves of the check that lets a worker which
 //! actually holds the needed access attempt such an item instead:
@@ -21,8 +20,7 @@
 //!    declares it holds, from the environment.
 //!
 //! [`WorkItem::mechanical_routing`](crate::work_finder::WorkItem::mechanical_routing)
-//! combines them into a routing decision; nothing here reads labels or touches
-//! the forge.
+//! combines them into a routing decision; nothing here touches the forge.
 //!
 //! # Safety properties (all four are load-bearing)
 //!
@@ -86,7 +84,7 @@ use std::collections::BTreeSet;
 /// never by the repo"): a committed config file must not be able to claim the
 /// machine running it has root or a production credential. Unset or empty — the
 /// default everywhere — means "no capabilities", which keeps every
-/// `loom:operator-mechanical` item parked exactly as before this module existed.
+/// mechanical operator hold parked exactly as before this module existed.
 pub const WORKER_CAPABILITIES_ENV: &str = "LOOM_WORKER_CAPABILITIES";
 
 /// Closed vocabulary, literal values. Kept in sync with the table in
@@ -102,38 +100,30 @@ pub const KNOWN_CAPABILITY_LITERALS: &[&str] =
 /// is **not** a valid value — something must follow the colon.
 pub const KNOWN_CAPABILITY_PREFIXES: &[&str] = &["cloud-profile:"];
 
-/// The `loom:operator-only` base label — the hard park all its sub-kinds
-/// inherit.
-pub const OPERATOR_ONLY_LABEL: &str = "loom:operator-only";
+/// The retired judgement sub-labels (#11795). An unmigrated item carrying one
+/// is a decision (or a wait on something named) by label, which vetoes the
+/// lane exactly as a decision block does, as it did before the fold. Read only
+/// for the migration window; `labels migrate` replaces them with
+/// `loom:operator` on open items.
+const LEGACY_JUDGEMENT_LABELS: [&str; 2] = ["loom:operator-decision", "loom:operator-blocked"];
 
-/// The one `loom:operator-only` sub-kind this lane applies to: mechanical work
-/// requiring access, not a ruling (#5671).
-pub const OPERATOR_MECHANICAL_LABEL: &str = "loom:operator-mechanical";
-
-/// The other two `loom:operator-only` sub-kinds. Each stays hard-skipped
-/// **unconditionally**, regardless of any capability marker in its body — the
-/// convention doc is explicit that they ignore the marker entirely. Listed here
-/// so [`labels_eligible_for_capability_lane`] can refuse an item that carries
-/// one of them *alongside* `loom:operator-mechanical` (a contradictory
-/// labelling, resolved conservatively in favour of the judgement sub-kind).
-pub const JUDGEMENT_SUB_KIND_LABELS: &[&str] = &["loom:operator-decision", "loom:operator-blocked"];
-
-/// Labels that veto the capability lane outright even next to a well-formed
-/// mechanical declaration.
+/// Whether `label` vetoes the capability lane outright, even next to a
+/// well-formed declaration (#11795): any skip label other than the operator
+/// hold itself (under any of its names) and the daemon's own claim, plus the
+/// legacy judgement sub-labels.
 ///
-/// - `loom:blocked` is an independent park with its own release condition (a
-///   named dependency landing); a capability declaration says nothing about it.
-/// - `loom:needs-capability` is explicitly out of scope (#5817/#6885 non-goal):
-///   it asserts the capability *does not exist yet*, which no worker can hold.
-/// - `loom:operator` means "the engine has stopped on this artifact and a human
-///   must act"; un-parking past it would defeat the hold.
-/// - `loom:frozen` (#11743) means "don't touch"; nothing may relax it.
-pub(crate) const LANE_VETO_LABELS: &[&str] = &[
-    "loom:blocked",
-    "loom:needs-capability",
-    "loom:operator",
-    "loom:frozen",
-];
+/// Derived from [`crate::work_finder::SKIP_LABELS`], so it covers
+/// `loom:blocked` and its retired names (an independent hold with its own
+/// release), `loom:frozen` ("don't touch"), `loom:decision-malformed` (a
+/// decision under repair) and `loom:epic`. `loom:building` is not a veto: the
+/// dispatch guard sees it on the daemon's own re-dispatch of a lane item.
+fn is_lane_veto(label: &str) -> bool {
+    use crate::work_finder::{BUILDING_LABEL, OPERATOR_HOLD_NAMES, SKIP_LABELS};
+    LEGACY_JUDGEMENT_LABELS.contains(&label)
+        || (SKIP_LABELS.contains(&label)
+            && label != BUILDING_LABEL
+            && !OPERATOR_HOLD_NAMES.contains(&label))
+}
 
 /// True when `value` is in the closed vocabulary above.
 ///
@@ -180,7 +170,7 @@ pub struct CapabilityDeclaration {
 impl CapabilityDeclaration {
     /// True when the body carried no capability marker at all — neither valid
     /// nor unknown. This is the common case for almost every item, including
-    /// most `loom:operator-mechanical` ones.
+    /// most mechanical operator holds.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.required.is_empty() && self.unknown.is_empty()
@@ -336,7 +326,7 @@ fn is_value_class(c: char) -> bool {
 /// [`WORKER_CAPABILITIES_ENV`].
 ///
 /// Empty (the default — the variable unset, empty, or naming only unrecognized
-/// values) means every `loom:operator-mechanical` item stays parked, i.e. **zero
+/// values) means every mechanical operator hold stays parked, i.e. **zero
 /// behavior change** from before this lane existed.
 #[must_use]
 pub fn held_capabilities() -> BTreeSet<String> {
@@ -369,28 +359,17 @@ pub fn parse_held_capabilities(raw: &str) -> BTreeSet<String> {
 
 /// True when `labels` describe an item the capability lane may even *consider*.
 ///
-/// Requires **both** `loom:operator-only` and `loom:operator-mechanical`, and
-/// refuses the item outright if it also carries any of the three judgement
-/// sub-kinds ([`JUDGEMENT_SUB_KIND_LABELS`]) or any [`LANE_VETO_LABELS`] entry.
-/// A body's capability markers are never consulted for an item this rejects —
-/// which is what keeps `loom:operator-decision` / `-blocked` / `-objective`
-/// hard-skipped exactly as today even if one of them happens to contain a
-/// marker.
+/// Requires the operator hold ([`crate::work_finder::is_operator_hold`], so an
+/// unmigrated `loom:operator-only` item qualifies) and refuses the item outright
+/// if any label is a lane veto (see `is_lane_veto`). The body is checked
+/// separately by [`route_mechanical`]: a capability marker is required and a
+/// decision block refuses, so an alert issue or a Champion merge-risk hold,
+/// which carry no marker, can never enter the lane.
 ///
 /// This is a pure predicate over label names: no forge I/O, no body read.
 #[must_use]
 pub fn labels_eligible_for_capability_lane<S: AsRef<str>>(labels: &[S]) -> bool {
-    let has = |name: &str| labels.iter().any(|l| l.as_ref() == name);
-    if !has(OPERATOR_ONLY_LABEL) || !has(OPERATOR_MECHANICAL_LABEL) {
-        return false;
-    }
-    if JUDGEMENT_SUB_KIND_LABELS.iter().any(|l| has(l)) {
-        return false;
-    }
-    if LANE_VETO_LABELS.iter().any(|l| has(l)) {
-        return false;
-    }
-    true
+    crate::work_finder::is_operator_hold(labels) && !labels.iter().any(|l| is_lane_veto(l.as_ref()))
 }
 
 // ============================================================================
@@ -409,10 +388,11 @@ pub fn labels_eligible_for_capability_lane<S: AsRef<str>>(labels: &[S]) -> bool 
 /// fail to compile until that decision is made consciously.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MechanicalRouting {
-    /// Not a capability-lane item at all — the labels do not describe a
-    /// mechanical operator-only item (see
-    /// [`labels_eligible_for_capability_lane`]). The item's normal skip/park
-    /// behavior applies, completely unchanged.
+    /// Not a capability-lane item at all — the labels do not describe an
+    /// operator hold the lane may consider (see
+    /// [`labels_eligible_for_capability_lane`]), or the body carries a
+    /// decision block. The item's normal skip/park behavior applies,
+    /// completely unchanged.
     NotApplicable,
     /// Eligible labels, but the body declares no resolvable capability — either
     /// no marker at all, or at least one value outside the closed vocabulary.
@@ -440,7 +420,7 @@ pub enum MechanicalRouting {
 
 impl MechanicalRouting {
     /// True only for [`ProposeDispatch`](Self::ProposeDispatch) — i.e. "this
-    /// item is exempt from the `loom:operator-only` park". Every other variant
+    /// item is exempt from the `loom:operator` park". Every other variant
     /// leaves the park in force.
     #[must_use]
     pub fn is_dispatchable(&self) -> bool {
@@ -460,7 +440,9 @@ pub fn route_mechanical<S: AsRef<str>>(
     body: Option<&str>,
     held: &BTreeSet<String>,
 ) -> MechanicalRouting {
-    if !labels_eligible_for_capability_lane(labels) {
+    if !labels_eligible_for_capability_lane(labels)
+        || body.is_some_and(crate::operator_decision::render::has_decision_block)
+    {
         return MechanicalRouting::NotApplicable;
     }
     // No body fetched is not "no declaration we can trust" — it is "we could not
@@ -738,59 +720,54 @@ mod tests {
     // ---- label eligibility -----------------------------------------------
 
     #[test]
-    fn lane_requires_both_the_base_label_and_the_mechanical_sub_kind() {
+    fn lane_requires_the_operator_hold_under_any_of_its_names() {
+        assert!(labels_eligible_for_capability_lane(&labels(&["loom:issue", "loom:operator"])));
+        // Unmigrated items (#11795): the retired names fold into loom:operator.
         assert!(labels_eligible_for_capability_lane(&labels(&[
-            "loom:issue",
             "loom:operator-only",
             "loom:operator-mechanical",
         ])));
-        // Sub-kind without the base label: not the shape this lane un-parks.
-        assert!(!labels_eligible_for_capability_lane(&labels(&["loom:operator-mechanical"])));
-        // Base label alone: the ordinary hard park.
-        assert!(!labels_eligible_for_capability_lane(&labels(&["loom:operator-only"])));
+        assert!(labels_eligible_for_capability_lane(&labels(&["loom:operator-only"])));
+        // No operator hold: not the shape this lane un-parks.
+        assert!(!labels_eligible_for_capability_lane(&labels(&["loom:issue"])));
+        assert!(!labels_eligible_for_capability_lane(&labels(&["loom:blocked"])));
     }
 
     #[test]
-    fn the_other_three_sub_kinds_are_never_eligible() {
-        for sub_kind in JUDGEMENT_SUB_KIND_LABELS {
-            assert!(
-                !labels_eligible_for_capability_lane(&labels(&["loom:operator-only", sub_kind])),
-                "{sub_kind} must stay hard-skipped"
-            );
-            // ...and a contradictory pairing resolves in favour of the
-            // judgement sub-kind, never the mechanical one.
-            assert!(
-                !labels_eligible_for_capability_lane(&labels(&[
-                    "loom:operator-only",
-                    "loom:operator-mechanical",
-                    sub_kind
-                ])),
-                "{sub_kind} alongside mechanical must still refuse"
-            );
-        }
+    fn a_decision_by_label_is_never_eligible() {
+        assert!(!labels_eligible_for_capability_lane(&labels(&[
+            "loom:operator-only",
+            "loom:operator-mechanical",
+            "loom:operator-decision",
+        ])));
+        assert!(!labels_eligible_for_capability_lane(&labels(&[
+            "loom:operator",
+            "loom:decision-malformed",
+        ])));
     }
 
     #[test]
     fn veto_labels_refuse_the_lane() {
-        for veto in LANE_VETO_LABELS {
+        for veto in [
+            "loom:blocked",
+            "loom:operator-blocked",
+            "loom:needs-capability",
+            "loom:frozen",
+            "loom:epic",
+        ] {
             assert!(
-                !labels_eligible_for_capability_lane(&labels(&[
-                    "loom:operator-only",
-                    "loom:operator-mechanical",
-                    veto
-                ])),
+                !labels_eligible_for_capability_lane(&labels(&["loom:operator", veto])),
                 "{veto} must veto the capability lane"
             );
         }
+        // The daemon's own claim is not a veto (its re-dispatch of a lane item).
+        assert!(labels_eligible_for_capability_lane(&labels(&[
+            "loom:operator",
+            "loom:building"
+        ])));
     }
 
-    // ---- routing ---------------------------------------------------------
-
-    const MECHANICAL: &[&str] = &[
-        "loom:issue",
-        "loom:operator-only",
-        "loom:operator-mechanical",
-    ];
+    const MECHANICAL: &[&str] = &["loom:issue", "loom:operator"];
 
     #[test]
     fn routes_to_propose_when_every_capability_is_held() {
@@ -866,18 +843,25 @@ mod tests {
     }
 
     #[test]
-    fn a_judgement_sub_kind_with_a_marker_and_a_capable_worker_still_parks() {
-        // The convention doc's explicit rule: the other sub-kinds ignore
-        // the marker entirely.
-        for sub_kind in JUDGEMENT_SUB_KIND_LABELS {
-            let routing = route_mechanical(
-                &labels(&["loom:issue", "loom:operator-only", sub_kind]),
-                Some("<!-- loom:capability=host-sudo -->"),
-                &held(&["host-sudo"]),
-            );
-            assert_eq!(routing, MechanicalRouting::NotApplicable, "{sub_kind}");
-            assert!(!routing.is_dispatchable());
+    fn a_decision_block_with_a_marker_and_a_capable_worker_still_parks() {
+        // #11795: a decision is a ruling, never mechanical, whatever markers the
+        // body also carries.
+        let fenced = "<!-- loom:capability=host-sudo -->\n\n```decision\n{}\n```\n";
+        let managed = "<!-- loom:operator-decision:start -->\n<!-- loom:capability=host-sudo -->";
+        for body in [fenced, managed] {
+            let routing = route_mechanical(&labels(MECHANICAL), Some(body), &held(&["host-sudo"]));
+            assert_eq!(routing, MechanicalRouting::NotApplicable, "{body:?}");
         }
+    }
+
+    #[test]
+    fn an_unmigrated_mechanical_item_still_routes() {
+        let routing = route_mechanical(
+            &labels(&["loom:operator-only", "loom:operator-mechanical"]),
+            Some("<!-- loom:capability=host-sudo -->"),
+            &held(&["host-sudo"]),
+        );
+        assert_eq!(routing, MechanicalRouting::ProposeDispatch);
     }
 
     /// AC4 tripwire (#6893). `MechanicalRouting` has exactly **one**

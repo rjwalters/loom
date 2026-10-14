@@ -1,5 +1,7 @@
 //! `loom-daemon operator-decision` (#9344): the one helper every role uses to
-//! open or relabel a `loom:operator-decision` issue.
+//! open or relabel an operator decision: a `loom:operator` issue whose body
+//! carries the decision block (#11795 folded the old `loom:operator-decision`
+//! sub-label into that pair).
 //!
 //! An operator decision is not free prose. It is a one-line question, a line
 //! or two of context, and **2-4 options ranked best → worst**, each carrying a
@@ -34,8 +36,9 @@ pub mod validate;
 #[cfg(test)]
 mod tests;
 
-/// The operator-decision label this helper is the sole sanctioned applier of.
-pub const DECISION_LABEL: &str = "loom:operator-decision";
+/// The label `apply` puts on a decision (#11795): the operator hold. The
+/// decision block in the body, not a sub-label, is what makes it a decision.
+pub const DECISION_LABEL: &str = crate::work_finder::OPERATOR_HOLD_LABEL;
 
 /// The label loom-ui swaps in when a decision fails the contract. A
 /// successful `apply` clears it: a valid body is the repair.

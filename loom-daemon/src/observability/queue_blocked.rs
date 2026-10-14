@@ -38,18 +38,20 @@ pub const BLOCKED_LABEL: &str = "loom:blocked";
 
 /// Co-labels that explain a hold and may be exported as `detail`. Label
 /// names only, never free text.
-/// Derived (#10013): the registry's `blocked_colabel` labels, presented in the
-/// fixed order below (the `detail` text is order-sensitive); a label outside
-/// that list sorts last, in registry order.
+/// Derived (#10013): the registry's `blocked_colabel` labels plus the retired
+/// names that fold into one (#11795: `loom:operator`'s old names), presented
+/// in the fixed order below (the `detail` text is order-sensitive); a label
+/// outside that list sorts last, in registry order. The retired
+/// `loom:needs-capability` folds into `loom:blocked` itself, so it no longer
+/// explains a blocked row.
 pub static HOLD_LABELS: crate::label_registry::LabelSet =
     crate::label_registry::LabelSet::new(|| {
-        const PRESENTATION_ORDER: [&str; 4] = [
+        const PRESENTATION_ORDER: [&str; 3] = [
             "loom:operator",
             "loom:operator-only",
             "loom:operator-mechanical",
-            "loom:needs-capability",
         ];
-        let mut v = crate::label_registry::embedded_set("blocked_colabel");
+        let mut v = crate::label_registry::embedded_set_with_retired("blocked_colabel");
         v.sort_by_key(|n| {
             PRESENTATION_ORDER
                 .iter()

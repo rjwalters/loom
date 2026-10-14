@@ -584,8 +584,8 @@ function renderPipeline(rows) {
       el("th", { text: "merged 24h" }),
       // Issue #8091: the operator-attention bucket, reusing this same row —
       // "held" is open PRs labeled loom:operator (a first-class, re-evaluable
-      // hold, not a fault), "op-only" is open issues labeled
-      // loom:operator-only (the hard park).
+      // hold, not a fault), "op-only" is open issues held by loom:operator
+      // (the issue park; the retired loom:operator-only counts, #11795).
       el("th", { text: "held" }), el("th", { text: "op-only" }),
     ])]),
   ]);

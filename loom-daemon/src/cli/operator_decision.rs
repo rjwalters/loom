@@ -19,7 +19,7 @@ pub(crate) enum OperatorDecisionCommand {
         input: PathBuf,
     },
     /// Write a validated decision onto an issue (or file a new one) and label
-    /// it loom:operator-decision. Refuses, touching nothing, on any contract
+    /// it loom:operator (#11795). Refuses, touching nothing, on any contract
     /// failure.
     Apply {
         /// Existing issue to rewrite and relabel (relabel mode).
@@ -38,8 +38,8 @@ pub(crate) enum OperatorDecisionCommand {
         #[arg(long, value_name = "FILE|-")]
         input: PathBuf,
 
-        /// Extra label to add with loom:operator-decision (repeatable), e.g.
-        /// loom:operator-only.
+        /// Extra label to add with loom:operator (repeatable), e.g.
+        /// loom:important. A retired name is added as its replacement.
         #[arg(long = "also-label", value_name = "LABEL")]
         also_label: Vec<String>,
 

@@ -1,0 +1,363 @@
+//! Issue #11853: the landed pre-filter — the closes-graph verdict, the
+//! Curator routing, the verdict cache, and the tick seam.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use anyhow::{anyhow, Result};
+use serde_json::json;
+
+use super::super::*;
+use super::*;
+use crate::types::{QueueDisposition, ReadyQueueRow};
+
+// ---------------------------------------------------------------------------
+// The verdict
+// ---------------------------------------------------------------------------
+
+fn pr(number: u32, state: &str, merged_at: Option<&str>) -> Value {
+    json!({ "number": number, "state": state, "mergedAt": merged_at })
+}
+
+fn alias(state: &str, reopened: Option<&str>, prs: &[Value], total: Option<u64>) -> Value {
+    let nodes: Vec<Value> = reopened
+        .map(|at| json!({ "createdAt": at }))
+        .into_iter()
+        .collect();
+    json!({
+        "state": state,
+        "timelineItems": { "nodes": nodes },
+        "closedByPullRequestsReferences": {
+            "totalCount": total.unwrap_or(prs.len() as u64),
+            "nodes": prs,
+        },
+    })
+}
+
+const T1: &str = "2026-10-10T10:00:00Z";
+const T2: &str = "2026-10-11T10:00:00Z";
+
+/// A PR that closes the issue (a closing keyword or a closing link puts it
+/// in the closes-graph) has merged, and the issue is still open: landed.
+#[test]
+fn a_merged_closing_pr_on_an_open_issue_is_landed() {
+    let a = alias("OPEN", None, &[pr(40, "MERGED", Some(T1))], None);
+    assert_eq!(alias_verdict(&a), Some(Some(40)));
+    // The latest of several merges names the landing.
+    let a = alias("OPEN", None, &[pr(41, "MERGED", Some(T2)), pr(40, "MERGED", Some(T1))], None);
+    assert_eq!(alias_verdict(&a), Some(Some(41)));
+}
+
+/// A merged `Part of #N` / `Refs #N` PR is not in the closes-graph, which is
+/// exactly how GitHub tells it from a closing one: not landed, and the issue
+/// keeps its stage. Neither is an open or closed-unmerged closing PR.
+#[test]
+fn a_part_of_merge_or_an_unmerged_closing_pr_is_not_landed() {
+    let part_of_only = alias("OPEN", None, &[], None);
+    assert_eq!(alias_verdict(&part_of_only), Some(None));
+    let open = alias("OPEN", None, &[pr(40, "OPEN", None)], None);
+    assert_eq!(alias_verdict(&open), Some(None));
+    let abandoned = alias("OPEN", None, &[pr(40, "CLOSED", None)], None);
+    assert_eq!(alias_verdict(&abandoned), Some(None));
+}
+
+/// A merge older than the issue's last reopen is a person asking for more
+/// work: not landed. A merge after it is.
+#[test]
+fn a_merge_before_the_last_reopen_is_not_landed() {
+    let before = alias("OPEN", Some(T2), &[pr(40, "MERGED", Some(T1))], None);
+    assert_eq!(alias_verdict(&before), Some(None));
+    let after = alias("OPEN", Some(T1), &[pr(41, "MERGED", Some(T2))], None);
+    assert_eq!(alias_verdict(&after), Some(Some(41)));
+}
+
+/// No verdict on a guess: a truncated graph without a merge in it, or a
+/// missing alias. A closed issue is not this pre-filter's to refuse.
+#[test]
+fn a_truncated_graph_or_a_missing_alias_is_no_verdict() {
+    let truncated = alias("OPEN", None, &[pr(40, "OPEN", None)], Some(30));
+    assert_eq!(alias_verdict(&truncated), None);
+    let closed = alias("CLOSED", None, &[pr(40, "MERGED", Some(T1))], None);
+    assert_eq!(alias_verdict(&closed), Some(None));
+
+    let body = json!({ "data": { "repository": {
+        "i1": alias("OPEN", None, &[pr(40, "MERGED", Some(T1))], None),
+        "i2": alias("OPEN", None, &[], None),
+        "i3": null,
+    } } })
+    .to_string();
+    let parsed = parse_landed(&body, &[1, 2, 3, 4]).unwrap();
+    assert_eq!(parsed.get(&1), Some(&Some(40)));
+    assert_eq!(parsed.get(&2), Some(&None));
+    assert!(!parsed.contains_key(&3) && !parsed.contains_key(&4));
+    assert_eq!(parse_landed(r#"{"errors":[{"message":"x"}]}"#, &[1]), None);
+}
+
+#[test]
+fn the_query_asks_for_closed_prs_and_the_last_reopen() {
+    let q = landed_query("o", "r", &[7, 9]);
+    assert!(q.contains("i7: issue(number: 7)") && q.contains("i9: issue(number: 9)"), "{q}");
+    assert!(q.contains("includeClosedPrs: true"), "{q}");
+    assert!(q.contains("REOPENED_EVENT") && q.contains("mergedAt"), "{q}");
+}
+
+// ---------------------------------------------------------------------------
+// Routing and the cache, against a fake forge
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct FakeForge {
+    /// The closes-graph answer: issue to merged closing PR (`None` = not
+    /// landed). An issue absent here gets no verdict.
+    graph: HashMap<u32, Option<u32>>,
+    labels: HashMap<u32, Vec<String>>,
+    /// Issues whose comments already carry the marker for this PR.
+    marked: HashSet<(u32, u32)>,
+    asked: Vec<Vec<u32>>,
+    writes: Vec<String>,
+}
+
+impl FakeForge {
+    fn with_labels(mut self, issue: u32, labels: &[&str]) -> Self {
+        self.labels
+            .insert(issue, labels.iter().map(ToString::to_string).collect());
+        self
+    }
+}
+
+impl LandedForge for FakeForge {
+    fn closing_verdicts(&mut self, issues: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
+        self.asked.push(issues.to_vec());
+        Some(
+            issues
+                .iter()
+                .filter_map(|n| self.graph.get(n).map(|v| (*n, *v)))
+                .collect(),
+        )
+    }
+    fn labels(&mut self, issue: u32) -> Result<Option<Vec<String>>> {
+        self.labels
+            .get(&issue)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| anyhow!("no such issue"))
+    }
+    fn route_marked(&mut self, issue: u32, pr: u32) -> Result<bool> {
+        Ok(self.marked.contains(&(issue, pr)))
+    }
+    fn add_label(&mut self, issue: u32, label: &str) -> bool {
+        self.writes.push(format!("+{issue} {label}"));
+        true
+    }
+    fn remove_label(&mut self, issue: u32, label: &str) -> bool {
+        self.writes.push(format!("-{issue} {label}"));
+        true
+    }
+    fn comment(&mut self, issue: u32, body: &str) -> bool {
+        self.writes.push(format!("comment {issue} {body}"));
+        true
+    }
+}
+
+/// A closing-merged PR: the issue goes to Curator (`loom:issue` swapped for
+/// `loom:triage`, one comment naming the PR and carrying the marker) and is
+/// reported landed. A `Part of` issue (empty closes-graph) is left alone.
+#[test]
+fn a_landed_issue_is_routed_to_curator_and_a_part_of_one_is_not() {
+    let mut forge = FakeForge::default()
+        .with_labels(5, &["loom:issue", "loom:important"])
+        .with_labels(6, &["loom:issue"]);
+    forge.graph.insert(5, Some(40));
+    forge.graph.insert(6, None);
+    let mut cache = LandedCache::default();
+    let now = Instant::now();
+
+    let landed = detect(&mut forge, &mut cache, &[5, 6], &[], now);
+    assert_eq!(landed, HashMap::from([(5, 40)]));
+    assert_eq!(forge.writes.len(), 3, "{:?}", forge.writes);
+    assert_eq!(forge.writes[0], "+5 loom:triage", "labels first");
+    assert_eq!(forge.writes[1], "-5 loom:issue");
+    assert!(forge.writes[2].starts_with("comment 5 PR #40"), "{}", forge.writes[2]);
+    assert!(forge.writes[2].contains(&route_marker(40)));
+    assert!(!forge.writes.iter().any(|w| w.contains(" 6 ")), "#6 is untouched");
+}
+
+/// At most once: when the issue's comments already carry the marker for the
+/// same PR, Curator saw this landing and put the issue back. It is not
+/// landed, nothing is written, and it is never asked about again.
+#[test]
+fn an_issue_curator_kept_after_this_landing_is_dispatchable() {
+    let mut forge = FakeForge::default().with_labels(5, &["loom:issue"]);
+    forge.graph.insert(5, Some(40));
+    forge.marked.insert((5, 40));
+    let mut cache = LandedCache::default();
+    let now = Instant::now();
+
+    assert!(detect(&mut forge, &mut cache, &[5], &[], now).is_empty());
+    assert!(forge.writes.is_empty(), "{:?}", forge.writes);
+    let much_later = now + LANDED_RECHECK * 4;
+    assert!(detect(&mut forge, &mut cache, &[5], &[5], much_later).is_empty());
+    assert_eq!(forge.asked.len(), 1, "a kept verdict is never asked again");
+}
+
+/// `loom:frozen`, a park label or a live claim: still landed (so the
+/// cooldown applies), but never relabelled.
+#[test]
+fn a_frozen_or_parked_issue_is_not_relabelled() {
+    for labels in [
+        &["loom:issue", "loom:frozen"][..],
+        &["loom:issue", "loom:blocked"][..],
+        &["loom:issue", "loom:building"][..],
+    ] {
+        let mut forge = FakeForge::default().with_labels(5, labels);
+        assert!(matches!(route_to_curator(&mut forge, 5, 40), Route::Unrouted(_)), "{labels:?}");
+        assert!(forge.writes.is_empty(), "{labels:?}: {:?}", forge.writes);
+    }
+}
+
+/// One question per tick at most; a verdict is reused until it is
+/// [`LANDED_RECHECK`] old, and forgotten as soon as the issue shows an open
+/// PR, so the tick that PR merges asks again.
+#[test]
+fn verdicts_are_cached_until_stale_or_an_open_pr_appears() {
+    let mut forge = FakeForge::default().with_labels(5, &["loom:issue"]);
+    forge.graph.insert(5, None);
+    forge.graph.insert(6, None);
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+
+    assert!(detect(&mut forge, &mut cache, &[5, 6], &[], t0).is_empty());
+    assert!(detect(&mut forge, &mut cache, &[5, 6], &[], t0).is_empty());
+    assert_eq!(forge.asked, vec![vec![5, 6]], "the second tick is served from the cache");
+
+    // #5 gets an open PR, which then merges and closes it.
+    assert!(detect(&mut forge, &mut cache, &[6], &[5], t0).is_empty());
+    forge.graph.insert(5, Some(40));
+    let landed = detect(&mut forge, &mut cache, &[5, 6], &[], t0);
+    assert_eq!(landed, HashMap::from([(5, 40)]));
+    assert_eq!(forge.asked.last().unwrap(), &vec![5], "only the forgotten verdict is asked");
+
+    let stale = t0 + LANDED_RECHECK;
+    detect(&mut forge, &mut cache, &[6], &[], stale);
+    assert_eq!(forge.asked.last().unwrap(), &vec![6], "a stale verdict is asked again");
+}
+
+/// An unanswered query is no verdict: nothing is removed.
+#[test]
+fn an_unanswered_query_removes_nothing() {
+    struct Down;
+    impl LandedForge for Down {
+        fn closing_verdicts(&mut self, _: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
+            None
+        }
+        fn labels(&mut self, _: u32) -> Result<Option<Vec<String>>> {
+            unreachable!()
+        }
+        fn route_marked(&mut self, _: u32, _: u32) -> Result<bool> {
+            unreachable!()
+        }
+        fn add_label(&mut self, _: u32, _: &str) -> bool {
+            unreachable!()
+        }
+        fn remove_label(&mut self, _: u32, _: &str) -> bool {
+            unreachable!()
+        }
+        fn comment(&mut self, _: u32, _: &str) -> bool {
+            unreachable!()
+        }
+    }
+    let mut cache = LandedCache::default();
+    assert!(detect(&mut Down, &mut cache, &[1, 2], &[], Instant::now()).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The tick seam
+// ---------------------------------------------------------------------------
+
+struct OneShotSource(Option<Vec<WorkItem>>);
+
+impl WorkSource for OneShotSource {
+    fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
+        Ok(self.0.take().unwrap_or_default())
+    }
+}
+
+/// A dispatcher whose forge knows open linked PRs and merged closing PRs.
+#[derive(Default)]
+struct Disp {
+    open_pr: HashMap<u32, u32>,
+    landed: HashMap<u32, u32>,
+    in_flight: HashSet<u32>,
+    asked: RefCell<Vec<(Vec<u32>, Vec<u32>)>>,
+    attempts: Vec<u32>,
+}
+
+impl WorkDispatcher for Disp {
+    fn in_flight(&self) -> HashSet<u32> {
+        self.in_flight.clone()
+    }
+    fn occupancy(&self) -> usize {
+        self.in_flight.len()
+    }
+    fn open_pr_blocked(&self, candidates: &[u32]) -> HashMap<u32, u32> {
+        candidates
+            .iter()
+            .filter_map(|n| self.open_pr.get(n).map(|p| (*n, *p)))
+            .collect()
+    }
+    fn landed_closing_prs(&self, candidates: &[u32], open_pr: &[u32]) -> HashMap<u32, u32> {
+        let mut c = candidates.to_vec();
+        let mut o = open_pr.to_vec();
+        c.sort_unstable();
+        o.sort_unstable();
+        self.asked.borrow_mut().push((c, o));
+        candidates
+            .iter()
+            .filter_map(|n| self.landed.get(n).map(|p| (*n, *p)))
+            .collect()
+    }
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
+        self.attempts.push(issue);
+        self.in_flight.insert(issue);
+        Ok(true)
+    }
+}
+
+fn items(numbers: &[u32]) -> Vec<WorkItem> {
+    numbers
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let created = format!("2026-09-{:02}T00:00:00Z", i + 1);
+            WorkItem::with_created_at(*n, vec!["loom:issue".to_string()], Some(created))
+        })
+        .collect()
+}
+
+fn rows(report: &TickReport) -> Vec<ReadyQueueRow> {
+    ready_queue::finish(&report.queue, &[PathBuf::from("/repo/a")])
+}
+
+/// A landed candidate is never offered to `dispatch()`: it is resolved
+/// `AlreadyLanded` with the PR named, the next candidate takes the slot, and
+/// the workspace is asked once, without its open-PR candidates.
+#[test]
+fn a_landed_candidate_is_skipped_without_a_dispatch_attempt() {
+    let disp = Disp {
+        open_pr: HashMap::from([(1, 801)]),
+        landed: HashMap::from([(2, 900)]),
+        ..Disp::default()
+    };
+    let mut multi = vec![(OneShotSource(Some(items(&[1, 2, 3, 4]))), disp)];
+    let report = tick_multi(&mut multi, &[1], 1, &[false]);
+
+    let disp = &multi[0].1;
+    assert_eq!(disp.attempts, vec![3], "2 is landed, 1 has an open PR");
+    assert_eq!(disp.asked.borrow().clone(), vec![(vec![2, 3, 4], vec![1])]);
+    assert_eq!(report.skipped_already_landed, 1);
+    assert_eq!(report.skipped_pr_open, 1);
+    let row = rows(&report).into_iter().find(|r| r.issue == 2).unwrap();
+    assert_eq!(row.disposition, QueueDisposition::AlreadyLanded);
+    assert_eq!(row.detail.as_deref(), Some("merged closing PR #900"));
+}

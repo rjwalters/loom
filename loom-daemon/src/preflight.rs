@@ -417,7 +417,7 @@ fn settle_claim_with(
 /// Release the Builder's claim on `issue` after a terminal verdict, through
 /// the same protected path the reaper uses: the stale `loom:building` claim is
 /// always removed, `loom:issue` is re-added only if the issue is not parked
-/// (`loom:blocked` / `loom:operator-only`), not a PR and not closed, and every
+/// (`loom:blocked` / `loom:operator`), not a PR and not closed, and every
 /// forge call is scoped to `worktree`'s repository (`LOOM_REPO` still wins).
 ///
 /// # Errors

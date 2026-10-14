@@ -25,8 +25,8 @@
 //! started a tick apart would race for it). On its blocking thread, before any
 //! agent is spawned, it reads the shared Doctor queue (`loom-daemon pr-queue
 //! --role doctor`'s own ordering, [`crate::pr_planning::fetch_queue`], which
-//! already leaves out `loom:treating`, `loom:blocked` and
-//! `loom:operator-only`), reserves the first row no other lane of this
+//! already leaves out `loom:treating` and the PR-lane parks, e.g.
+//! `loom:blocked`), reserves the first row no other lane of this
 //! repository holds ([`LaneAssignment`], released when the run ends), runs
 //! the existing stale-verdict guard on it, and dispatches `/loom:doctor <PR>`
 //! — Doctor's PR Fix Mode, which still runs the stale `loom:treating` claim

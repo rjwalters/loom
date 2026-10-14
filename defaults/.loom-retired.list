@@ -128,3 +128,9 @@ docs/forge-egress.md
 scripts/tests/test-resync-installed-egress-doctor.sh
 scripts/tests/test-spawn-claude-managed-gh.sh
 hooks/tests/test-guard-forge-egress.sh
+
+# #11795 (2026-10-14) — hold-taxonomy collapse: the shell suites named for the
+# retired loom:operator-only label were renamed for the three holds.
+scripts/tests/test-guide-operator-only-exclude.sh
+scripts/tests/test-guide-work-plan-operator-only-exclude.sh
+scripts/tests/test-operator-only-subkind.sh

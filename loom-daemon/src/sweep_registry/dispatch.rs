@@ -13,6 +13,9 @@ pub(super) mod child_env_markers;
 // Issue #11304: claim-unwind + post-claim closed-issue re-verification.
 mod claim_release;
 
+// Issue #11853: the long, fleet-wide window an already-landed issue gets.
+mod landed_cooldown;
+
 // Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
 mod lease_renewal_start;
 use lease_renewal_start::lease_renewal_start_command;
@@ -164,7 +167,7 @@ impl std::error::Error for OpenPrDispatchError {}
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
 /// park-label guard (Issue #4444, step 2.7) refuses a dispatch because the
 /// target issue currently carries a [`PARK_LABELS`] entry (`loom:blocked` /
-/// `loom:operator-only`).
+/// `loom:operator` / `loom:frozen`).
 ///
 /// The work-finder's [`SKIP_LABELS`] filter only covers *its own* candidate
 /// query. Every other dispatch route — all three watchdogs (#3887 / #3895 /
@@ -185,8 +188,8 @@ impl std::error::Error for OpenPrDispatchError {}
 pub struct ParkedIssueDispatchError {
     /// The issue whose dispatch was refused.
     pub issue: u32,
-    /// The park label that triggered the refusal (`loom:blocked` or
-    /// `loom:operator-only`).
+    /// The park label that triggered the refusal (`loom:blocked`,
+    /// `loom:operator`, `loom:frozen`, or a retired name for one).
     pub label: String,
 }
 
@@ -793,6 +796,8 @@ pub(crate) enum DispatchBackoffCause {
     /// The open-PR guard (#4123, step 2.5/2.6) refused dispatch because the
     /// issue already has a verified open linked PR (#7606).
     OpenPrGuard,
+    /// The issue's work already landed (#11853): see `landed_cooldown`.
+    Landed,
 }
 
 /// Per-issue dispatch-backoff bookkeeping (Issue #4485).

@@ -1897,12 +1897,18 @@ that covers candidate evaluation and dispatch. Its attributes are
 `loom.dispatch.result` (`dispatched`, `halted_<cause>`, `halted`, `saturation_held`,
 `error`, `build_backoff_held` (#9410; only when the back-off deferred at least one candidate, #10624),
 `no_eligible_work`, `capacity_full`, `all_skipped`, first match wins), `loom.dispatch.seen`, `loom.dispatch.dispatched`,
-`loom.dispatch.errors`, `loom.dispatch.max_concurrent` and, on a held tick, `loom.dispatch.halt_causes`.
+`loom.dispatch.errors`, `loom.dispatch.max_concurrent`, `loom.dispatch.held_roots` (#11857: how many workspaces a hold
+gated this tick, `0` when none) and, on a held tick, `loom.dispatch.halt_causes`.
 A held tick's result names its hold (#11649): when every held workspace has the same cause it is
 `halted_` plus that `HaltCause` token (`halted_main_red`, `halted_disk_reservation`, `halted_weight_zero`, `halted_token_pool`,
 `halted_drain`, `halted_ci_billing` (#10113), …); when the holds have several causes it is `halted`, and
 `loom.dispatch.halt_causes` lists them comma-joined. Before #11649 every hold read `halted_main_red`
-(or `halted_ci_billing`), so older rows with that value may have been held for any reason. Each `dispatch()` attempt in the
+(or `halted_ci_billing`), so older rows with that value may have been held for any reason. Since #11857 a hold names
+the result only when it covered the tick's work: every workspace that listed ready candidates was held (a weight-0
+workspace counts as held), or every workspace was held when none listed any. A partial hold, such as one maintain-only
+repo beside healthy repos with nothing dispatchable, falls through to the per-candidate result (`all_skipped`,
+`no_eligible_work`, …) and keeps its causes on `loom.dispatch.halt_causes` and its size on `loom.dispatch.held_roots`.
+Before #11857 any one held workspace made every undispatched tick read `halted_*`. Each `dispatch()` attempt in the
 tick is one `loom.dispatch.admission` child span (#8907; a candidate the #8865
 open-PR pre-filter skips is not an attempt and has no admission span), with the tick's trace
 id and the tick span as its parent. Its attributes are `loom.issue`,

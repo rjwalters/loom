@@ -3410,12 +3410,11 @@ managed repo, fetched *after* the IPC round-trip completes:
 
 - **Counts** — for each root in `report.per_repo` (already priority-ordered):
   open, dispatchable `loom:issue` rows (queued — `gh issue list --search
-  "is:open label:loom:issue -label:loom:blocked -label:loom:operator-only"`,
+  "is:open label:loom:issue -label:loom:blocked -label:loom:operator"`,
   excluding every `work_finder::PARK_LABELS` park label so `queued` matches
-  the work-finder's own admission definition, #4825 — `PARK_LABELS` is
-  `loom:blocked` / `loom:operator-only` only as of #5817; the Rust daemon's own
-  dispatch is a separate follow-up from `/loom:sweep`'s skip parity, see
-  "Park-label dispatch guard" below), open `loom:building`
+  the work-finder's own admission definition, #4825 — `PARK_LABELS` is the
+  registry's `park` set, the holds `loom:blocked` / `loom:operator` /
+  `loom:frozen` since #11795; see "Park-label dispatch guard" below), open `loom:building`
   (claimed), open PRs by `loom:review-requested` / `loom:changes-requested` /
   `loom:pr`, PRs merged in the last 24h (`gh pr list --state merged
   --search "merged:>=<24h-ago RFC3339>"`), and — since Issue #8091 — the
@@ -3423,7 +3422,10 @@ managed repo, fetched *after* the IPC round-trip completes:
   (`operator_held`, plus `operator_held_conflicting` — the `mergeable:
   CONFLICTING` subset — and `operator_held_oldest_days`, all three from one
   `gh pr list --label loom:operator --json number,mergeable,createdAt` call)
-  and open issues labeled `loom:operator-only` (`operator_only_issues`).
+  and open issues labeled `loom:operator`, plus those still carrying only the
+  retired `loom:operator-only` until `labels migrate` relabels them
+  (`operator_only_issues`; the field keeps its pre-#11795 name, a wire
+  contract the dashboard reads).
 - **Module** — `loom_daemon::pipeline_snapshot`: `PipelineSource` is the forge
   abstraction (mirrors `work_finder::WorkSource` / `GhWorkSource`),
   `GhPipelineSource` is the `gh`-backed implementation (up to nine `gh`
@@ -3562,7 +3564,7 @@ visibility" below:
 | `role_liveness` | roles configured to tick that have gone **silent** — no tick at all in `>= 4x` their own interval (#6201) | `role_runner::last_role_tick_snapshot()` + each root's `role_runner_enabled`/`role_runner_roles` |
 | `queues` | per-root ready (`loom:issue`) counts **plus the review-side axes** (`loom:review-requested` / `loom:changes-requested` / `loom:pr`), and a per-repo *review stall* verdict | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
 | `throughput` | merges across managed repos inside the window | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
-| `operator_attention` | fleet-wide open PRs labeled `loom:operator` (the first-class, re-evaluable "a human is needed" hold, #5502) — count, `CONFLICTING`-mergeable sub-count, oldest age in days — plus open issues labeled `loom:operator-only` (the hard park). **Always `GREEN`** (#8091): held work is normal steady state, not a fault, so this section can never move `health`'s exit code — see "`operator_attention` is always GREEN" below | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
+| `operator_attention` | fleet-wide open PRs labeled `loom:operator` (the first-class, re-evaluable "a human is needed" hold, #5502) — count, `CONFLICTING`-mergeable sub-count, oldest age in days — plus open issues labeled `loom:operator` (on an issue, a park; #11795). **Always `GREEN`** (#8091): held work is normal steady state, not a fault, so this section can never move `health`'s exit code — see "`operator_attention` is always GREEN" below | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
 
 #### `queues`: the review-stall rule (#5021)
 
@@ -4113,7 +4115,7 @@ old→new-SHA comment, then swaps the verdict label (plus the per-tree companion
 | No marker for the held verdict kind | `Keep(Unverifiable)` — **fail safe, never cleared**. Every verdict written before this shipped is in that state, so the pass is inert on rollout instead of force-clearing the queue. Since #6319 it is also **counted and anchored** rather than silently kept — see below. |
 | Marker of a *different* verdict kind | Ignored. A PR rejected at SHA A and later approved at SHA B carries both; only the marker matching the currently-held label describes the current verdict. |
 | Head SHA unreadable | `Keep(NoHeadSha)` — fail safe. |
-| `loom:blocked` / `loom:operator` / `loom:operator-only` | `Keep(Held)` — still stale, but clearing would silently un-park a PR an operator (or Champion's capped-PR recovery pass) deliberately held. |
+| `loom:blocked` / `loom:operator` / `loom:frozen` | `Keep(Held)` — still stale, but clearing would silently un-park a PR an operator (or Champion's capped-PR recovery pass) deliberately held. |
 | Force-push vs. new commits | Not distinguished, deliberately. Any head move invalidates the verdict; an appended commit is as much "not the tree that was reviewed" as a rebase. |
 | Head moved but the **change did not** | `handle_invalidate` re-anchors instead of clearing (#9124, #9416) — see below. |
 
@@ -4294,7 +4296,7 @@ open `loom:review-requested` and `loom:merge-conflict` PRs.
 | `CONFLICTING` + `loom:review-requested` | Comment, then Judge's own DIRTY transition: `loom:review-requested` → `loom:changes-requested` + `loom:merge-conflict` (routes to Doctor; Judge's review-requested find-work query no longer sees it). The comment carries `<!-- loom:base-conflict flagged -->` **and** a `verdict=changes-requested` verdict-sha marker for the head, so the stale-verdict pass reads it `Fresh` and re-queues it itself once a rebase moves the head. |
 | `MERGEABLE` + `loom:merge-conflict` (no head move) | Returned to `loom:review-requested` — **only** if the newest state-changing comment is this pass's flag. A Judge's own DIRTY fallback or any later verdict is never undone here. |
 | `mergeable=UNKNOWN` | No information (GitHub computes it lazily) — no label change in either direction; re-read next tick. |
-| `loom:blocked` / `loom:operator` / `loom:operator-only` | Never touched. |
+| `loom:blocked` / `loom:operator` / `loom:frozen` | Never touched. |
 | `loom:reviewing` / `loom:treating` | Left to the agent in flight. |
 
 ### Startup capacity seed: adopting live survivors (#6262)
@@ -4625,7 +4627,7 @@ Each tick:
 2. Filters out issues that are **already in flight** (a live `Running` /
    `Pending` entry in the sweep registry — the authoritative dedup, robust to
    `loom:issue → loom:building` label-flip lag) or that defensively carry any
-   skip label (`loom:building` / `loom:blocked` / `loom:operator-only`).
+   skip label (`loom:building` / `loom:blocked` / `loom:operator` / `loom:frozen`).
    A `loom:epic` issue is never a work-finder candidate either, even when it
    also carries `loom:issue` (#11399): an epic is a tracking container, and
    only its `loom:epic-phase` children are build work. It is counted as
@@ -5297,13 +5299,13 @@ repository is now the parallelism boundary:
   count (`forge_call_stats` caller `role_demand`) after each **admitted**
   champion run — so it adds no forge query per tick per repository. Only PR
   rows count, and the `loom:pr` count leaves out PRs held for a human —
-  those also carrying `loom:blocked`, `loom:operator` or `loom:operator-only`
+  those also carrying `loom:blocked`, `loom:operator` or `loom:frozen`
   (the set `champion-pr-merge.md` names as not merge-eligible; the critical-file
   hold is one of them, via `loom:operator`) — because Champion cannot drain
   them (#9410). Likewise the `loom:changes-requested` count leaves out PRs
   Doctor will not drain — those also carrying `loom:blocked` or
-  `loom:operator-only` (`doctor.md` Priority 2's skip set, the work finder's
-  `PARK_LABELS`; this includes the Doctor-cycle-cap park) — but still counts
+  `loom:frozen` (`doctor.md` Priority 2's skip set; this includes the
+  Doctor-cycle-cap park) — but still counts
   `loom:operator` (Doctor drains stale held PRs Champion routes to it, #7660)
   and `loom:treating` (a live Doctor claim) (#9421). The
   `loom:review-requested` count is unfiltered: Judge's queue has no label
@@ -5374,7 +5376,7 @@ repository is now the parallelism boundary:
   **assigned a different PR** instead of taking the queue head: before any
   agent starts, the run reads the shared Doctor queue (the same ordering as
   `loom-daemon pr-queue --role doctor`, which already skips `loom:treating`,
-  `loom:blocked` and `loom:operator-only`), reserves the first row no other lane
+  `loom:blocked` and `loom:frozen`), reserves the first row no other lane
   on this host holds, runs `verdict-staleness-guard.sh <PR> --clear` on it
   (exit `0`/`11` take it; `10`/`12`/error skip it; at most 3 rows per run), and
   dispatches `/loom:doctor <PR>` — PR Fix Mode, which still runs the stale
@@ -5441,8 +5443,8 @@ adds no PR dispatch path of its own.
   their last-known value (#9414), because an over-count here would keep new
   builds held off. **No forge call** is added. Each axis leaves out the PRs its role will not
   drain: merge excludes operator-held PRs (`loom:blocked` / `loom:operator` /
-  `loom:operator-only`), changes excludes parked PRs (`loom:blocked` /
-  `loom:operator-only` — not `loom:operator`, which Doctor still drains;
+  `loom:frozen`), changes excludes parked PRs (`loom:blocked` /
+  `loom:frozen` — not `loom:operator`, which Doctor still drains;
   #9421), and review is unfiltered. An axis whose every PR is excluded reads
   as observed zero, not unobserved. The ledger covers
   only the repositories whose roles this host runs, so two hosts can
@@ -6390,7 +6392,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.prlessRetry.threshold` | `LOOM_WORK_FINDER_PRLESS_RETRY_THRESHOLD` | `3` | Consecutive dispatches that claim an issue, release it, and leave **no pull request** behind before the issue is held with `loom:blocked` (plus a comment naming the failure and the count). Counted **fleet-wide** across dispatch hosts when peer coordination is on (#9292), per-host otherwise. Matches `quarantine.threshold`. Zero/invalid → default |
 | `autonomous.workFinder.prlessRetry.backoffSecs` | `LOOM_WORK_FINDER_PRLESS_RETRY_BACKOFF_SECS` | `300` | Window applied after the **first** PR-less release; doubles per consecutive release. Deliberately longer than `dispatchBackoff.baseSecs` — the reported symptom was claim/release pairs inside the same minute, and a PR-less release follows a full agent session, so a one-minute retry cannot plausibly land differently. Zero/invalid → default |
 | `autonomous.workFinder.prlessRetry.maxBackoffSecs` | `LOOM_WORK_FINDER_PRLESS_RETRY_MAX_BACKOFF_SECS` | `3600` | Ceiling on the doubling — also the idle window after which a cold streak restarts at zero, and the in-memory TTL of a hold (whose durable half is the `loom:blocked` label). The fleet-wide streak clock (#9292) is the shipped 3600 s regardless of this value, since a receiving host reads its peers' releases rather than their config. Zero/invalid → default; clamped up to `backoffSecs` |
-| `autonomous.workFinder.extraSkipLabels` | `LOOM_WORK_FINDER_EXTRA_SKIP_LABELS` (comma-separated) | `[]` | Per-workspace/per-repo **additional** label names (#6685) the work-finder treats as a skip/park signal, beyond the hardcoded `loom:blocked` / `loom:operator-only` (`PARK_LABELS`) — e.g. a repo-local `blocked-upstream` label that will never be renamed to a `loom:*` name. Purely additive to `SKIP_LABELS`' candidate-query filter (`WorkItem::is_skipped_with_extra`); it does **not** extend the separate dispatch()-level park-label guard (#4444) above, which stays keyed on `PARK_LABELS` only. Env replaces config entirely when set (even to an empty string); resolved once per workspace, live on the next tick (a cheap `.loom/config.json` read, no daemon restart needed). **`loom:building` can never be added to the resolved list** — filtered out defensively even if named explicitly in config/env, so a misconfiguration can never re-introduce the "an in-flight claim is treated as a park" regression `SKIP_LABELS`' own doc comment warns against |
+| `autonomous.workFinder.extraSkipLabels` | `LOOM_WORK_FINDER_EXTRA_SKIP_LABELS` (comma-separated) | `[]` | Per-workspace/per-repo **additional** label names (#6685) the work-finder treats as a skip/park signal, beyond the registry's park set (`PARK_LABELS`: `loom:blocked` / `loom:operator` / `loom:frozen`) — e.g. a repo-local `blocked-upstream` label that will never be renamed to a `loom:*` name. Purely additive to `SKIP_LABELS`' candidate-query filter (`WorkItem::is_skipped_with_extra`); it does **not** extend the separate dispatch()-level park-label guard (#4444) above, which stays keyed on `PARK_LABELS` only. Env replaces config entirely when set (even to an empty string); resolved once per workspace, live on the next tick (a cheap `.loom/config.json` read, no daemon restart needed). **`loom:building` can never be added to the resolved list** — filtered out defensively even if named explicitly in config/env, so a misconfiguration can never re-introduce the "an in-flight claim is treated as a park" regression `SKIP_LABELS`' own doc comment warns against |
 | `autonomous.workFinder.redMainAutofile.enabled` | — | `false` | Auto-file, reuse and close the red-main fix issue (#11766). Off by default; `true` turns it on (set fleet-wide through the fleet config). **Hot-applies.** See "Auto-filed red-main fix issue (#11766)" above |
 | `autonomous.workFinder.redMainAutofile.intervalSecs` | — | `600` | Seconds between reconciles of one repo's auto-filed fix issue (#11766); a gate verdict change reconciles sooner. Positive integer; anything else uses the default. **Hot-applies** |
 | `autonomous.workFinder.redFixEscalateAfterSecs` | — | `1800` | How long a `<!-- loom:main-red-fix -->` candidate may wait unclaimed on a red `main` before the daemon files one `loom:operator` alert issue for it (#10118). Positive integer seconds; anything else uses the default. **Hot-applies** (read when a fix is waiting). See "Unpromoted red-main fixes (#10118)" above |
@@ -7325,7 +7327,7 @@ immediately, with no caller involvement required.
 work-finder's own candidate-query filter, not the **Park-label dispatch
 guard** documented below under
 [Cross-host dispatch-collision detection and enforcement](#cross-host-dispatch-collision-detection-and-enforcement-4085-phase-0-of-4028-enforcement-added-by-5789))
-are a hardcoded `loom:blocked` / `loom:operator-only` pair — there was
+were a hardcoded `loom:blocked` / `loom:operator-only` pair (registry-derived since #10013) — there was
 previously no way for a repo whose own label taxonomy uses a different name
 (e.g. `blocked-upstream`, observed on `rjwalters/vibesql#6399`) to get the
 same durable-park treatment without renaming the label to a `loom:*` name.
@@ -7761,9 +7763,9 @@ The only fix for a held-PR-backlog read of "starvation" is clearing the
 operator holds (merge or close the held PRs) — see `champion-pr-merge.md`'s
 "Held-PR Census" for the operator-facing view of that backlog.
 
-**Park-label dispatch guard (#4444, step 2.7).** The `loom:blocked` /
-`loom:operator-only` **park** labels are the state machine's only "take this out
-of automation" signal, and until #4444 they were enforced *only* in the
+**Park-label dispatch guard (#4444, step 2.7).** The **park** labels
+(`loom:blocked`, `loom:operator` on an issue, `loom:frozen`; #11795) are the
+state machine's only "take this out of automation" signal, and until #4444 they were enforced *only* in the
 work-finder's candidate query (`SKIP_LABELS`) — one of six dispatch routes. Every
 other route (all three watchdogs, the reaper's checkpoint-resume, the epic
 supervisor, the IPC/CLI `dispatch_sweep`) funnels through
@@ -7775,12 +7777,9 @@ dispatch whose issue currently carries a park label, with a typed
 `ParkedIssueDispatchError` the work finder attributes to `labeled-skip` (never to
 `error(s)`). Four properties are load-bearing:
 
-- **`PARK_LABELS`, not `SKIP_LABELS`.** The guard keys on the
-  `loom:blocked` / `loom:operator-only` subset only — `loom:needs-capability`
-  (#5817) is not (yet) a member; extending the Rust daemon's own dispatch
-  guard to the new label is out of scope for #5817, which covers
-  `/loom:sweep`'s skip parity only (see `.loom/docs/label-state-machine.md`).
-  `loom:building` is
+- **`PARK_LABELS`, not `SKIP_LABELS`.** The guard keys on the registry's
+  `park` set only (see `.loom/docs/label-state-machine.md` → "The three
+  holds"). `loom:building` is
   *legitimately* present on a watchdog re-dispatch or a checkpoint-resume of the
   daemon's **own** claim, so refusing it would break exactly the recovery paths
   this guard is meant to constrain. The two constants live side by side in

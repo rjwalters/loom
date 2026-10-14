@@ -1841,8 +1841,8 @@ fn test_tick_lease_order_refusal_counts_as_backoff_skip_not_error() {
 fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     // #4444: the dispatch-time guard keys on PARK_LABELS, so the two
     // constants must stay in lockstep — SKIP_LABELS is exactly
-    // BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL + `loom:epic`
-    // (#11399) + the decision sub-kind, and PARK_LABELS
+    // BUILDING_LABEL + PARK_LABELS (loom:operator among them since #11795) +
+    // the bounced decision + `loom:epic` (#11399), and PARK_LABELS
     // must never contain `loom:building` (a guard that refused it would break
     // the watchdogs' and the reaper's re-dispatch of the daemon's OWN claim).
     assert!(
@@ -1859,13 +1859,11 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     let mut expected = [&[BUILDING_LABEL], PARK_LABELS.as_slice()].concat();
     expected.extend([
         "loom:decision-malformed", // #11480
-        OPERATOR_HOLD_LABEL,
         labels::EPIC_LABEL,
-        labels::OPERATOR_DECISION_LABEL,
     ]);
     assert_eq!(
         *SKIP_LABELS, expected,
-        "SKIP_LABELS is the claim + the parks + the bounced decision + the hold + the epic container + the decision sub-kind"
+        "SKIP_LABELS is the claim + the parks + the bounced decision + the epic container"
     );
 }
 
@@ -2631,14 +2629,14 @@ fn test_empty_held_set_is_byte_for_byte_is_skipped_with_extra() {
 #[test]
 fn test_capability_lane_does_not_touch_ordinary_items() {
     // A plain `loom:issue` row is dispatchable with or without the lane, and
-    // a plain `loom:operator-only` row is parked with or without it.
+    // an operator hold with no capability marker is parked with or without it.
     let held = caps(&["host-sudo", "forge-admin-token", "tailnet-access"]);
     assert!(!issue(1).is_skipped_with_capabilities(&[], &held));
-    let operator_only = WorkItem::new(2, vec!["loom:issue".into(), "loom:operator-only".into()])
-        .with_body(Some("<!-- loom:capability=host-sudo -->".to_string()));
+    let operator = WorkItem::new(2, vec!["loom:issue".into(), "loom:operator".into()])
+        .with_body(Some("an alert: no capability marker".to_string()));
     assert!(
-        operator_only.is_skipped_with_capabilities(&[], &held),
-        "a marker WITHOUT the mechanical sub-kind label changes nothing"
+        operator.is_skipped_with_capabilities(&[], &held),
+        "#11795: the lane keys on the marker; without one nothing changes"
     );
 }
 

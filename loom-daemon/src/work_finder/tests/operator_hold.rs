@@ -1,48 +1,82 @@
 use super::*;
 
+/// #11795: `loom:operator` is an issue-dispatch park. A hold applied after
+/// dispatch must stop every re-dispatch route (watchdog, checkpoint resume,
+/// epic supervisor), the #4366 shape `loom:operator-only` used to guard; the
+/// human overrides by removing the label.
 #[test]
-fn test_operator_hold_skips_candidates_but_is_never_a_park() {
-    // vibesql#6664: a sweep that decides "a human is needed" releases its
-    // claim (restoring `loom:issue`) and applies `loom:operator` in one
-    // motion. The work finder must not start a fresh `--claim-owned` build on
-    // that candidate — the incident showed the daemon re-dispatching onto the
-    // fresh hold 3x in 13 minutes.
+fn test_operator_hold_is_an_issue_dispatch_park() {
+    // vibesql#6664: a fresh `loom:issue` candidate carrying the hold is never
+    // dispatched.
     let held = WorkItem::new(6172, vec!["loom:issue".into(), OPERATOR_HOLD_LABEL.into()]);
-    assert!(
-        held.is_skipped(),
-        "a `loom:issue` candidate carrying `loom:operator` must not dispatch a new builder"
-    );
+    assert!(held.is_skipped());
+    assert!(PARK_LABELS.contains(&OPERATOR_HOLD_LABEL));
+    // ...but it is not a PR-lane park (#7660: Doctor drains held PRs).
+    assert!(!PR_LANE_PARK_LABELS.contains(&OPERATOR_HOLD_LABEL));
+}
 
-    // ...but the hold is NOT a park: dispatch step 2.7's guard consults
-    // PARK_LABELS only, so the re-evaluation routes (watchdog re-dispatch,
-    // reaper checkpoint-resume, explicit `loom-daemon dispatch <N>`) keep
-    // reaching held items. `label-state-machine.md`'s re-evaluability
-    // contract depends on this — graduating the hold into PARK_LABELS would
-    // refuse the human's own override path.
-    assert!(
-        !PARK_LABELS.contains(&OPERATOR_HOLD_LABEL),
-        "`loom:operator` is re-evaluable by design; it must never become a PARK_LABELS \
-             entry (that is what OPERATOR_HOLD_LABEL in SKIP_LABELS alone expresses)"
-    );
+/// #11795 transition: an item still carrying a retired name is held exactly
+/// as its replacement until `labels migrate` relabels it.
+#[test]
+fn test_unmigrated_hold_names_stay_held() {
+    for old in [
+        "loom:operator-only",
+        "loom:operator-decision",
+        "loom:operator-mechanical",
+        "loom:operator-blocked",
+    ] {
+        let item = WorkItem::new(1, vec!["loom:issue".into(), old.into()]);
+        assert!(item.is_skipped(), "{old}");
+        assert!(PARK_LABELS.contains(&old), "{old}");
+        assert!(is_operator_hold(&[old]), "{old}");
+        assert!(!is_blocked_hold(&[old]), "{old}");
+        assert_eq!(restore_veto(&[old.to_string()], &[]), Some(old), "{old}");
+    }
+    let cap = WorkItem::new(2, vec!["loom:issue".into(), "loom:needs-capability".into()]);
+    assert!(cap.is_skipped());
+    assert!(is_blocked_hold(&["loom:needs-capability"]));
+    assert!(!is_operator_hold(&["loom:needs-capability"]));
+}
 
-    // The #6893 mechanical lane cannot relax the hold either — an item
-    // carrying `loom:operator` alongside the mechanical sub-kind stays
-    // skipped regardless of held capabilities, matching the documented
-    // "loom:operator vetoes the exemption outright" (work_finder.rs,
-    // is_skipped_with_capabilities) and LANE_VETO_LABELS.
-    let mut held_caps = std::collections::BTreeSet::new();
-    held_caps.insert("sql".to_string());
-    let lane_item = WorkItem::new(
-        6173,
-        vec![
-            "loom:issue".into(),
-            crate::capability::OPERATOR_ONLY_LABEL.into(),
-            "loom:operator-mechanical".into(),
-            OPERATOR_HOLD_LABEL.into(),
-        ],
-    );
+fn caps() -> std::collections::BTreeSet<String> {
+    ["host-sudo".to_string()].into_iter().collect()
+}
+
+/// #11795: the capability lane keys on `loom:operator` + a capability marker
+/// + no decision block. Never without a marker.
+#[test]
+fn test_capability_lane_needs_a_marker_and_no_decision_block() {
+    let lane = |labels: Vec<String>, body: &str| {
+        !WorkItem::new(6173, labels)
+            .with_body(Some(body.to_string()))
+            .is_skipped_with_capabilities(&[], &caps())
+    };
+    let op = || vec!["loom:issue".to_string(), OPERATOR_HOLD_LABEL.to_string()];
+    let marker = "<!-- loom:capability=host-sudo -->";
+    assert!(lane(op(), marker), "marker, no decision: propose lane");
+    assert!(!lane(op(), "no marker here"), "no marker: parked (alerts, merge-risk)");
     assert!(
-        lane_item.is_skipped_with_capabilities(&[], &held_caps),
-        "a generic `loom:operator` hold vetoes the capability lane (#6893)"
+        !lane(op(), &format!("{marker}\n```decision\n{{}}\n```")),
+        "a decision block is a ruling, never mechanical"
     );
+    // Unmigrated mechanical item: still routes.
+    let old = vec![
+        "loom:issue".to_string(),
+        "loom:operator-only".to_string(),
+        "loom:operator-mechanical".to_string(),
+    ];
+    assert!(lane(old, marker));
+    // Unmigrated decision / operator-blocked by label: never.
+    for judgement in ["loom:operator-decision", "loom:operator-blocked"] {
+        let mut l = op();
+        l.push(judgement.to_string());
+        assert!(!lane(l, marker), "{judgement}");
+    }
+    // Another hold beside it vetoes.
+    let mut blocked = op();
+    blocked.push("loom:blocked".to_string());
+    assert!(!lane(blocked, marker));
+    // No host capabilities: the default everywhere, always parked.
+    let item = WorkItem::new(6174, op()).with_body(Some(marker.to_string()));
+    assert!(item.is_skipped_with_capabilities(&[], &std::collections::BTreeSet::new()));
 }

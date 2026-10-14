@@ -299,8 +299,15 @@ fn unescalate_mode(
     view: &forge::IssueView,
     findings_override: Option<String>,
 ) -> Result<i32, i32> {
+    let present = view.label_names();
+    let held = consts::held_label(&present);
+    let also = consts::other_hold_names(&present, held);
+    let labels = apply::Labels {
+        hold: held,
+        also: &also,
+    };
     let markers = unescalate::Markers {
-        operator_only_label: consts::OPERATOR_ONLY_LABEL,
+        operator_only_label: held,
         cycle_prefix: consts::CYCLE_MARKER_PREFIX,
         unescalate_prefix: consts::UNESCALATE_MARKER_PREFIX,
     };
@@ -331,8 +338,7 @@ fn unescalate_mode(
             cleared,
             blocker_fingerprint,
         } => apply::cleared_body(
-            consts::OPERATOR_ONLY_LABEL,
-            consts::OPERATOR_BLOCKED_LABEL,
+            &labels,
             &cleared.join(" "),
             &format!("{}{blocker_fingerprint} -->", consts::UNESCALATE_MARKER_PREFIX),
         ),
@@ -341,8 +347,7 @@ fn unescalate_mode(
             blocker_fingerprint,
             subset,
         } => apply::subset_body(
-            consts::OPERATOR_ONLY_LABEL,
-            consts::OPERATOR_BLOCKED_LABEL,
+            &labels,
             &still_open.join(" "),
             subset,
             &format!("{}{blocker_fingerprint} -->", consts::UNESCALATE_MARKER_PREFIX),
@@ -355,10 +360,6 @@ fn unescalate_mode(
         issue: opts.issue,
         repo,
         repo_root: cwd,
-    };
-    let labels = apply::Labels {
-        operator_only: consts::OPERATOR_ONLY_LABEL,
-        operator_blocked: consts::OPERATOR_BLOCKED_LABEL,
     };
     // The warning wording is the shell's, verbatim. It is what an operator
     // greps a sweep log for, and it names which half landed — which is the
@@ -373,16 +374,14 @@ fn unescalate_mode(
         // one would misstate the issue's real state.
         Err(apply::ApplyError::CommentPost(_)) => {
             warn(&format!(
-                "removed {} from {self_node} but could not post the un-escalation comment (audit trail missing)",
-                consts::OPERATOR_ONLY_LABEL
+                "removed {held} from {self_node} but could not post the un-escalation comment (audit trail missing)"
             ));
             println!("UNESCALATED: {self_node}");
             Ok(0)
         }
         Err(_) => {
             warn(&format!(
-                "could not remove {} from {self_node} (no comment posted; a later pass will retry)",
-                consts::OPERATOR_ONLY_LABEL
+                "could not remove {held} from {self_node} (no comment posted; a later pass will retry)"
             ));
             println!("REASON: apply-failed");
             Ok(1)
@@ -405,15 +404,22 @@ fn fact_mode(
         .as_deref()
         .and_then(|p| std::fs::read_to_string(p).ok());
 
+    let present = view.label_names();
+    let held = consts::held_label(&present);
+    let also = consts::other_hold_names(&present, held);
+    let labels = apply::Labels {
+        hold: held,
+        also: &also,
+    };
     let inputs = fact::Inputs {
-        labels: view.label_names(),
+        labels: present.clone(),
         comments: view.comments_joined(),
         escalation: view.last_comment_containing(consts::ESCALATE_MARKER),
         resolutions: resolutions.clone(),
         commit_sha: opts.commit.clone(),
     };
     let markers = fact::Markers {
-        operator_only_label: consts::OPERATOR_ONLY_LABEL,
+        operator_only_label: held,
         cycle_prefix: consts::CYCLE_MARKER_PREFIX,
         fact_unescalate_prefix: consts::FACT_UNESCALATE_MARKER_PREFIX,
     };
@@ -440,8 +446,7 @@ fn fact_mode(
     let revised =
         apply::fact_revised_body(&view.body, &today, verified_commit, &summary, &revision_marker);
     let comment = apply::fact_comment_body(
-        consts::OPERATOR_ONLY_LABEL,
-        consts::OPERATOR_DECISION_LABEL,
+        &labels,
         verified_commit,
         &summary,
         &format!("{}{fingerprint} -->", consts::FACT_UNESCALATE_MARKER_PREFIX),
@@ -451,10 +456,6 @@ fn fact_mode(
         issue: opts.issue,
         repo,
         repo_root: cwd,
-    };
-    let labels = apply::FactLabels {
-        operator_only: consts::OPERATOR_ONLY_LABEL,
-        operator_decision: consts::OPERATOR_DECISION_LABEL,
     };
     match apply::apply_fact_unescalation(
         &mut writer,
@@ -487,8 +488,7 @@ fn fact_mode(
         }
         Err(apply::ApplyError::LabelRemoval(_)) => {
             warn(&format!(
-                "could not remove {} from {self_node} (no comment posted; a later pass will retry)",
-                consts::OPERATOR_ONLY_LABEL
+                "could not remove {held} from {self_node} (no comment posted; a later pass will retry)"
             ));
             println!("REASON: apply-failed");
             Ok(1)
@@ -607,11 +607,8 @@ fn report_cycle(cwd: &Path, root: &str, pretty: &str, nodes: &str, fingerprint: 
         warn(&format!("could not comment on {root}"));
         return;
     }
-    if !writer
-        .add_labels("loom:operator-only,loom:operator-decision")
-        .succeeded()
-    {
-        warn(&format!("could not add loom:operator-only to {root}"));
+    if !writer.add_labels(consts::OPERATOR_LABEL).succeeded() {
+        warn(&format!("could not add {} to {root}", consts::OPERATOR_LABEL));
     }
     println!("REPORTED: {root}");
 }
@@ -622,7 +619,7 @@ fn report_cycle(cwd: &Path, root: &str, pretty: &str, nodes: &str, fingerprint: 
 #[must_use]
 pub fn cycle_report_body(pretty: &str, nodes: &str, marker: &str) -> String {
     format!(
-        "**Dependency cycle detected** - this issue cannot be unblocked by waiting.\n\nThe declared `Blocked by` / `Depends on` / `Requires` references form a closed loop:\n\n```\n{pretty}\n```\n\nEvery issue on that path is OPEN, and the progress of each node is declared to depend\non the next, so the loop can never resolve itself: each side re-derives \"still\nblocked\" on every pass, indefinitely. This is the deadlock shape that previously had\nto be found by hand.\n\nBreaking a cycle is a human decision - which declared dependency edge is wrong, or\nwhich side ships a partial increment first - so Champion is routing this to\n`loom:operator-only` (with the `loom:operator-decision` sub-kind: this is a\njudgement call, not a self-clearing wait) instead of re-deriving the same\nconclusion forever.\n\n**Cycle members** (machine-readable, #5671): Blocked by {nodes}\n\n---\n*Automated by Champion role (detect-dependency-cycle.sh)*\n{marker}\n"
+        "**Dependency cycle detected** - this issue cannot be unblocked by waiting.\n\nThe declared `Blocked by` / `Depends on` / `Requires` references form a closed loop:\n\n```\n{pretty}\n```\n\nEvery issue on that path is OPEN, and the progress of each node is declared to depend\non the next, so the loop can never resolve itself: each side re-derives \"still\nblocked\" on every pass, indefinitely. This is the deadlock shape that previously had\nto be found by hand.\n\nBreaking a cycle is a human decision - which declared dependency edge is wrong, or\nwhich side ships a partial increment first - so Champion is routing this to\n`loom:operator` (a judgement call, not a self-clearing wait) instead of\nre-deriving the same conclusion forever.\n\n**Cycle members** (machine-readable, #5671): Blocked by {nodes}\n\n---\n*Automated by Champion role (detect-dependency-cycle.sh)*\n{marker}\n"
     )
 }
 
