@@ -213,6 +213,10 @@ pub fn register_global_ops_sink(sink: OpsSink) {
 /// The registered sink, or `None` when ops signals are not exported.
 #[must_use]
 pub fn global_ops_sink() -> Option<&'static OpsSink> {
+    #[cfg(test)]
+    if capture::sinkless() {
+        return None;
+    }
     GLOBAL_OPS_SINK.get()
 }
 
