@@ -782,6 +782,12 @@ pub(crate) enum PrLeaseAction {
     /// Print `PR_LEASE_STATE=free|held-self|held-peer|unknown` (+ holder).
     /// Exit 0 free/held-self, 4 held-peer, 5 unknown.
     Check(Common),
+    /// Internal: renew-only (#11906). Re-attach to this claimant's own live
+    /// lease and start its renewer; never posts a lease. Exit 0 = attached;
+    /// 3 = this claimant holds no live lease (released, reaped or aged out);
+    /// 4 = a peer holds this role's lease; 5 = unreadable.
+    #[command(hide = true)]
+    Attach(Common),
     /// Internal: the detached renewal loop `claim` starts.
     #[command(hide = true)]
     RenewLoop(renew::RenewLoopArgs),
@@ -823,6 +829,7 @@ impl PrLeaseAction {
             // fence and release fail open.
             Self::Claim(c) => with_context(&c, EXIT_UNVERIFIED, true, |ctx| ctx.claim()),
             Self::Fence(c) => with_context(&c, EXIT_HELD, false, |ctx| ctx.fence()),
+            Self::Attach(c) => with_context(&c, EXIT_UNVERIFIED, false, |ctx| ctx.attach()),
             Self::Release(c) => with_context(&c, EXIT_HELD, true, |ctx| ctx.release()),
             Self::Check(c) => with_context(&c, EXIT_UNVERIFIED, false, |ctx| ctx.check()),
             Self::Reap(r) => {
@@ -1027,6 +1034,37 @@ impl Ctx {
                 println!("{} {}", self.me.host, self.me.sweep);
                 EXIT_HELD
             }
+        }
+    }
+
+    /// `attach`: [`claim`](Self::claim)'s re-attach to this claimant's own
+    /// live lease, and nothing else (#11906). The step engine renews a step's
+    /// pre-taken lease this way once the session exists: a lease already
+    /// released or reaped must stay gone, never be re-posted on a dead pid.
+    pub(crate) fn attach(&self) -> i32 {
+        let rows = self.gh.read_rows_retrying(self.pr(), &self.policy);
+        match self.state_of(rows.as_deref()) {
+            ClaimState::HeldBySelf { id } => {
+                let leased_at = rows
+                    .iter()
+                    .flatten()
+                    .find(|r| r.id == id)
+                    .map_or_else(self.now, |r| r.updated_at);
+                self.start_renewal(id, self.gh.story_issue(self.pr()), leased_at);
+                EXIT_HELD
+            }
+            ClaimState::HeldByPeer { holder, .. } => {
+                self.say(&format!(
+                    "PEER_LEASE host={} sweep={}; not renewing",
+                    holder.host, holder.sweep
+                ));
+                EXIT_PEER
+            }
+            ClaimState::Free => {
+                self.say("no live lease of this claimant; not renewing, nothing posted");
+                EXIT_EXPIRED
+            }
+            ClaimState::Unknown => EXIT_UNVERIFIED,
         }
     }
 

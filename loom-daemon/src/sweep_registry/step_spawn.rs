@@ -15,7 +15,9 @@
 //! the role's model and effort (`roleModels` / `roleEfforts`, the role draw's
 //! model when one picked the tap, #7894's reconciliation, #5028's mismatch
 //! refusal). Only a Builder step keeps the per-issue experiment arm
-//! (`model_dispatch.rs`). A refused gate refuses the step before any claim.
+//! (`model_dispatch.rs`). A binding whose only unmet requirement is
+//! repository isolation is admitted on private-clone containment (#8787),
+//! as a role run is. A refused gate refuses the step before any claim.
 //!
 //! # Claims (B1)
 //!
@@ -45,6 +47,7 @@
 use super::*;
 use crate::observability::ops::dispatch_step::{self, StepDispatch};
 use crate::step_role::StepRole;
+use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 
 pub(crate) mod capture;
 pub(crate) mod lease;
@@ -116,6 +119,9 @@ pub(crate) struct StepLaunch {
     pub(crate) admission: crate::runtime_preference::DispatchAdmission,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    /// A private-clone containment selection (#8787), when admission needed
+    /// one; the launch uses exactly it.
+    pub(crate) selection: Option<crate::tokens_pool::private_workspace::dispatch::Selection>,
 }
 
 /// A spawned step awaiting its account-selection poll, which the caller runs
@@ -216,7 +222,7 @@ impl SweepRegistry {
             launch.effort.as_deref(),
             None,
             launch.admission.admitted.as_ref(),
-            None,
+            launch.selection.as_ref(),
         ) {
             Ok((child, header_anchor)) => Ok(PreparedStep {
                 child,
@@ -254,17 +260,53 @@ impl SweepRegistry {
                 admission: crate::runtime_preference::DispatchAdmission::none(),
                 model,
                 effort,
+                selection: None,
             });
         }
-        let statically = crate::runtime_admission::resolve_and_admit(root, name, None);
+        // #8787: a binding whose only unmet requirement is repository
+        // isolation (a Codex Doctor, say) may be admitted on verified
+        // private-clone containment, exactly as the role runner admits a role
+        // run. The selection the preparer holds is the one the launch uses.
+        let hint = match role {
+            StepRole::Builder => None,
+            _ => Some(models::resolve_role_runner_model(root, name)),
+        };
+        let config = &self.config;
+        let (job, issue) = match role {
+            StepRole::Builder => (JobKind::Sweep, Some(u64::from(kind.item_number().unwrap_or(0)))),
+            _ => (JobKind::Role, None),
+        };
+        let mut containment = Preparer::new(
+            root,
+            job,
+            issue,
+            format!("step-{role}-{}", uuid::Uuid::new_v4()),
+            Box::new(move |runtime: &str| match &hint {
+                None => DispatchModel::Autonomous.resolve_for_runtime(config, kind, Some(runtime)),
+                Some((model, source)) => {
+                    let (model, _) = models::reconcile_unpinned_model_with_runtime(
+                        runtime,
+                        model.clone(),
+                        source.clone(),
+                    );
+                    non_empty(model)
+                }
+            }),
+        );
+        let statically = match crate::runtime_admission::resolve_and_admit(root, name, None) {
+            Err(rejection) if rejection.containment_eligible() => {
+                use crate::runtime_preference::ContainmentPreparer;
+                containment.contain(name, None, rejection)
+            }
+            other => other,
+        };
         let logs = root.join(".loom").join("logs");
-        let mut none = crate::runtime_preference::NoContainment;
         let chosen = crate::role_runner::runtime_preflight::check(
             root,
             &logs,
             name,
             Some(&statically),
-            &mut none,
+            &mut containment,
         )
         .map_err(|outcome| {
             if matches!(outcome, crate::role_runner::RoleTickOutcome::PoolExhausted { .. }) {
@@ -272,6 +314,7 @@ impl SweepRegistry {
             }
             refusal_of(&outcome)
         })?;
+        let selection = containment.take().map(|(selection, _)| selection);
         let admitted = match chosen.admitted.map_or(statically, Ok) {
             Ok(admitted) => admitted,
             Err(rejection) => return Err(StepRefusal::new("runtime_rejected", rejection.reason)),
@@ -301,6 +344,7 @@ impl SweepRegistry {
             },
             model,
             effort,
+            selection,
         })
     }
 
@@ -438,7 +482,7 @@ impl SweepRegistry {
             "sweep_registry: {role} step {sweep_id} on #{item} spawned (pid {pid}, model {}, \
              timeout {}s, #11906)",
             launch.model.as_deref().unwrap_or("default"),
-            step_timeout(role).as_secs()
+            step_timeout(&self.config.workspace_root, role).as_secs()
         );
         Ok(DispatchOutcome {
             sweep_id,
@@ -488,7 +532,9 @@ impl SweepRegistry {
 
 /// The step-only environment of a step child (called from
 /// `spawn_child_process_for`): the lease file its won PR leases are listed
-/// in, so a timed-out step's leases are reaped (#11931); its pick journal
+/// in, so a timed-out step's leases are reaped (#11931); the daemon's lease
+/// host id (`LOOM_HOST_ID`), so its pre-taken lease is the session's own
+/// wherever the session runs; its pick journal
 /// (#11877's capture); and, for a Curator, the curation provenance the role
 /// runner gives its Curator (`role_runner/launch/curation.rs`).
 pub(crate) fn apply_step_env(
@@ -503,6 +549,10 @@ pub(crate) fn apply_step_env(
         crate::pr_lease_reap::LEASE_FILE_ENV,
         crate::pr_lease_reap::path_for(root, sweep_id),
     );
+    // The lease's owner is role, host and sweep. A session in a container
+    // (Codex) has its own hostname, so without the daemon's host id pinned
+    // it would read the daemon's pre-taken lease as a peer's (#11906).
+    cmd.env(crate::host_identity::HOST_ID_ENV, crate::host_identity::lease_host_identity());
     crate::observability::pick_journal::attach_step(cmd, sweep_id);
     if role == StepRole::Curator {
         cmd.env("LOOM_CURATION_MODEL", model.filter(|m| !m.is_empty()).unwrap_or("unknown"))

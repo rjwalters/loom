@@ -72,7 +72,7 @@ impl SweepRegistry {
                 "sweep_registry: {role} step {sweep_id} on #{item} ended, but its claim is held \
                  elsewhere now — leaving the labels alone (#11898)"
             );
-            self.end_step(sweep_id, role, started_at, end);
+            self.end_step(sweep_id, item, role, started_at, end);
             return true;
         }
         if !self.config.skip_label_flip {
@@ -88,7 +88,7 @@ impl SweepRegistry {
             }
             self.note_label_flip(item);
         }
-        self.end_step(sweep_id, role, started_at, end);
+        self.end_step(sweep_id, item, role, started_at, end);
         false
     }
 
