@@ -24,6 +24,7 @@ fn item(number: u32, labels: &[&str]) -> RestIssue {
         author_association: None,
         is_pull_request: false,
         open_sub_issues: None,
+        labels_at: None,
     }
 }
 
