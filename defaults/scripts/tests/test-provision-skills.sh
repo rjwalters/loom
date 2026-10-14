@@ -24,6 +24,10 @@
 
 set -uo pipefail
 
+# Fixtures live under /tmp, which the reference guard refuses by default;
+# Test 20 unsets this to exercise the guard itself.
+export LOOM_PROVISION_ALLOW_TMP_REFERENCE=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # defaults/scripts/tests -> defaults/scripts/tests/../../.. -> repo root
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -309,11 +313,11 @@ else
 fi
 
 # ── Test 14: a stale machine checkout never wins over the synced source ───────
-# 2AMLogic/2am#4345: a worker's ~/.local/share/loom was a month-old real clone
+# A fleet incident: a worker's ~/.local/share/loom was a month-old real clone
 # (0.19.27) while resync synced from a fresh source (0.19.1159); the user-scope
 # /loom:* link pointed into the stale clone and shadowed every repo's copy, so
 # agents re-applied retired labels.
-echo "Test 14: [reference_root] replaces an older machine checkout (2am#4345)"
+echo "Test 14: [reference_root] replaces an older machine checkout"
 OLD=$(make_real_checkout); echo "0.19.27" > "$OLD/VERSION"
 NEW=$(make_real_checkout); echo "0.19.1160" > "$NEW/VERSION"
 HOME_T=$(mktemp -d)
@@ -372,6 +376,23 @@ if [[ -f "$RESYNC" ]]; then
 else
     echo "  SKIP: resync-installed.sh not found"
 fi
+
+echo "Test 19: a later, older reference never downgrades the current link target"
+REFA=$(make_real_checkout); echo "0.19.1160" > "$REFA/VERSION"
+REFB=$(make_real_checkout); echo "0.19.1100" > "$REFB/VERSION"
+HOME_T=$(mktemp -d)
+HOME="$HOME_T" provision_loom_skills "$OLD" "$HOME_T/.claude" "$REFA" >/dev/null 2>&1
+out=$(HOME="$HOME_T" provision_loom_skills "$OLD" "$HOME_T/.claude" "$REFB" 2>&1)
+assert_eq "$(readlink "$HOME_T/.claude/commands/loom")" "$REFA/defaults/.claude/commands/loom" \
+    "the link stays on the newer tree it already targets"
+assert_contains "$out" "keeping the current link target" "the kept target is named"
+
+echo "Test 20: a reference under a temp dir is refused (it can vanish)"
+HOME_T=$(mktemp -d)
+out=$(unset LOOM_PROVISION_ALLOW_TMP_REFERENCE; HOME="$HOME_T" provision_loom_skills "$OLD" "$HOME_T/.claude" "$NEW" 2>&1)
+assert_eq "$(readlink "$HOME_T/.claude/commands/loom")" "$OLD/defaults/.claude/commands/loom" \
+    "the machine checkout keeps the links"
+assert_contains "$out" "may vanish" "the refusal is warned"
 
 echo ""
 echo "======================================"

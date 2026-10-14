@@ -88,7 +88,7 @@ provision_loom_skills() {
     local claude_dir="${2:-$HOME/.claude}"
     local reference_root="${3:-}"
 
-    checkout_dir="$(_pskill_pick_checkout "$checkout_dir" "$reference_root")"
+    checkout_dir="$(_pskill_pick_checkout "$checkout_dir" "$reference_root" "$claude_dir")"
 
     local commands_src="$checkout_dir/defaults/.claude/commands/loom"
     local agents_src="$checkout_dir/defaults/.claude/agents"
@@ -233,12 +233,30 @@ _pskill_version_lt() {
 # is older than it (or has no readable VERSION, or no skills tree). The
 # fallback is warned on stderr so the operator can refresh the machine
 # checkout (`loom update` fast-forwards it).
+#
+# Two guards keep the fallback from making things worse. A reference under a
+# temp dir is refused (a throwaway clone can vanish and leave the links
+# dangling; set LOOM_PROVISION_ALLOW_TMP_REFERENCE=1 to override, e.g. in
+# tests). And the link is never repointed to a tree older than the live target
+# of the current link: the newest of {checkout, current target, reference} wins,
+# so one repo's resync cannot downgrade what another repo's resync linked.
 _pskill_pick_checkout() {
-    local checkout="$1" ref="${2:-}"
+    local checkout="$1" ref="${2:-}" claude_dir="${3:-}"
     if [[ -z "$ref" || ! -d "$ref/defaults/.claude/commands/loom" ]]; then
         printf '%s\n' "$checkout"; return 0
     fi
     local c_real r_real
+    if [[ "${LOOM_PROVISION_ALLOW_TMP_REFERENCE:-0}" != "1" ]]; then
+        local ref_abs t
+        ref_abs="$(cd "$ref" 2>/dev/null && pwd -P || true)"
+        for t in "${TMPDIR:-/tmp}" /tmp /private/tmp /var/folders; do
+            t="${t%/}"
+            if [[ -n "$t" && ( "$ref_abs" == "$t"/* || "$ref" == "$t"/* ) ]]; then
+                _pskill_warn "reference $ref is under $t (may vanish); keeping machine checkout $checkout."
+                printf '%s\n' "$checkout"; return 0
+            fi
+        done
+    fi
     c_real="$(cd "$checkout" 2>/dev/null && pwd -P || true)"
     r_real="$(cd "$ref" 2>/dev/null && pwd -P || true)"
     if [[ -n "$c_real" && "$c_real" == "$r_real" ]]; then
@@ -255,6 +273,18 @@ _pskill_pick_checkout() {
         why="is at $cv, older than $rv"
     fi
     if [[ -n "$why" ]]; then
+        # Never downgrade: keep the tree the current link already targets when
+        # it is at least as new as the reference.
+        local cur cur_tree curv
+        cur="$(readlink "$claude_dir/commands/loom" 2>/dev/null || true)"
+        cur_tree="${cur%/defaults/.claude/commands/loom}"
+        if [[ -n "$claude_dir" && "$cur_tree" != "$cur" && -d "$cur" ]]; then
+            curv="$(_pskill_version "$cur_tree")"
+            if [[ -n "$curv" && "$cur_tree" != "$ref" ]] && ! _pskill_version_lt "$curv" "$rv"; then
+                _pskill_warn "machine checkout $checkout $why in $ref; keeping the current link target $cur_tree ($curv), which is not older than $ref."
+                printf '%s\n' "$cur_tree"; return 0
+            fi
+        fi
         _pskill_warn "machine checkout $checkout $why in $ref; linking user-scope skills into $ref instead, because a stale user-scope /loom:* command shadows every repo's own copy. Refresh it with 'loom update'."
         printf '%s\n' "$ref"; return 0
     fi
