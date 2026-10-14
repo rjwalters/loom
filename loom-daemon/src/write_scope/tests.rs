@@ -444,6 +444,14 @@ fn daemon_write_paths_are_scoped() {
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
+        (
+            "intake_reconcile/demote.rs",
+            Via(
+                "intake_reconcile.rs",
+                "demotion step (#11820): the inline pass behind gate_root_with, and the \
+                 singleton's run_repo behind may_write (gate_repo_with)",
+            ),
+        ),
         ("stale_blocked/release_gh.rs", Gated),
         ("work_finder/main_red_autofile.rs", Gated),
         (
