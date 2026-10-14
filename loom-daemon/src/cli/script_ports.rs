@@ -550,6 +550,13 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     ParkRecord(super::park_record::ParkRecordCommand),
 
+    /// Classify a PR for Champion's Verdict-State Janitor and merge step
+    /// (#11932): Champion's own hold, another actor's `loom:blocked` park, a
+    /// verdict contradiction, or clear; and the once-per-head "Merge Failed"
+    /// marker. Reads trusted comments only.
+    #[command(subcommand)]
+    ChampionHold(super::champion_hold_cmd::ChampionHoldCommand),
+
     /// Validate the Curator's `<!-- loom:points=<N> -->` marker in one issue
     /// body read from stdin (#9056). The gate itself, which also reads
     /// trusted comments, is `loom-daemon curation-complete` (#11663).
@@ -733,6 +740,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
+            ScriptPortCommand::ChampionHold(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
             ScriptPortCommand::RamScopeLimit(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),

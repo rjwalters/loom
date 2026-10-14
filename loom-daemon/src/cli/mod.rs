@@ -27,6 +27,7 @@ pub(crate) mod attend_hook;
 mod branch_update;
 pub(crate) mod cancel;
 pub(crate) mod cargo_target_dir;
+mod champion_hold_cmd;
 mod check_dependabot_labels;
 mod check_guard_wiring;
 mod check_private_control_version;
