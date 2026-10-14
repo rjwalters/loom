@@ -291,6 +291,8 @@ pub(super) fn record(
     };
 
     let cred = cred_of(inv);
+    let route =
+        crate::forge_gateway::route_label(cred.kind, inv.intent == super::AccessIntent::Read);
     let resource = headers
         .and_then(|h| h.resource.clone())
         .map_or_else(|| pool.as_str().to_string(), |r| r.trim().to_ascii_lowercase());
@@ -319,6 +321,7 @@ pub(super) fn record(
         pu,
         rd,
         fr: probe.then_some(true),
+        rt: Some(route.to_string()),
     };
     forge_call_stats::record_attributed(caller, &identity, pool, classified, headers, &attribution);
 
@@ -337,7 +340,7 @@ pub(super) fn record(
         }
     }
 
-    record_metric(caller, &identity, &cred, &resource, classified, pg);
+    record_metric(caller, &identity, &cred, (&resource, route), classified, pg);
     Billing::sent(
         response.as_ref().map(|r| r.status),
         stderr,
@@ -385,6 +388,7 @@ pub(super) fn record_shed(
         rd: None,
         // Nothing was sent; `o=shed` alone already says "never charged".
         fr: None,
+        rt: Some("none".to_string()),
     };
     forge_call_stats::record_attributed(caller, &identity, pool, Outcome::Shed, None, &attribution);
     let cred = CredAttr {
@@ -393,7 +397,7 @@ pub(super) fn record_shed(
         kind: "shed",
         installation: None,
     };
-    record_metric(caller, &identity, &cred, resource.as_str(), Outcome::Shed, None);
+    record_metric(caller, &identity, &cred, (resource.as_str(), "none"), Outcome::Shed, None);
 }
 
 /// Add the row to `loom.forge.calls` (a no-op without an ops sink).
@@ -401,7 +405,7 @@ fn record_metric(
     caller: &'static str,
     identity: &CallIdentity,
     cred: &CredAttr,
-    resource: &str,
+    (resource, route): (&str, &'static str),
     outcome: Outcome,
     pg: Option<u32>,
 ) {
@@ -425,6 +429,7 @@ fn record_metric(
             .unwrap_or_else(|| crate::forge_bucket_book::NO_INSTALLATION.to_string()),
         target_owner,
         resource: resource.to_string(),
+        route,
         outcome: match outcome {
             Outcome::Ok => CallOutcome::Ok,
             Outcome::NotModified => CallOutcome::NotModified,
