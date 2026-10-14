@@ -223,10 +223,6 @@ fn replay_from_the_seed_gives_an_identical_draw_without_replacement() {
     numbers.sort_unstable();
     assert_eq!(numbers, (1..=12).collect::<Vec<_>>());
     assert_ne!(first, order(key(43)));
-    // The logged roll re-picks the same item from the logged pool.
-    let pool = pool_of(12);
-    let (i, _, roll) = pick_index(&pool, first[0].1).unwrap();
-    assert_eq!((pool[i].item.issue.unwrap(), roll), (first[0].0, first[0].2));
 }
 
 #[test]
@@ -269,4 +265,62 @@ fn the_layer_overlays_in_range_values_only() {
     assert_eq!(w.age_divisor_days, 7);
     assert_eq!(w.age_cap_days, DEFAULT_AGE_CAP_DAYS);
     assert_eq!(ItemWeights::from_layer(&Value::Null), ItemWeights::default());
+}
+
+/// Replay a workspace's draws from a `pick.decision` record alone: the header
+/// gives the seed inputs, `pools` the pool in pool order, and each draw the
+/// item that left it.
+#[test]
+fn the_record_alone_replays_every_draw() {
+    use crate::observability::pick_decision::{item_draw_record, ItemDrawWorkspace};
+    use crate::priority_pick::PickRng;
+
+    let k = key(42);
+    let pool = pool_of(12);
+    let draws: Vec<DrawRecord> = ItemDraw::new(pool.clone(), k.clone()).collect();
+    let excluded = BTreeMap::new();
+    let record = item_draw_record(
+        k.minute,
+        &k.host,
+        k.tick_counter,
+        &[ItemDrawWorkspace {
+            repo: &k.workspace,
+            excluded: &excluded,
+            pool: &pool,
+            draws: &draws,
+        }],
+    )
+    .unwrap();
+
+    let header = SeedKey {
+        minute: record.seed_minute.parse().unwrap(),
+        host: record.seed_host.clone(),
+        tick_counter: record.tick_counter.parse().unwrap(),
+        workspace: k.workspace.clone(),
+    };
+    let mut remaining: Vec<(u32, u64)> = record
+        .pools
+        .iter()
+        .filter(|e| e.repo == header.workspace)
+        .map(|e| (e.number, e.weight))
+        .collect();
+    assert_eq!(remaining.len(), 12, "the whole initial pool is logged");
+    for step in &record.draws {
+        let seed = item_seed(&header, step.draw_index);
+        assert_eq!(seed.to_string(), step.seed);
+        let total: u64 = remaining.iter().map(|r| r.1).sum();
+        assert_eq!((total, remaining.len()), (step.total_weight, step.pool_size));
+        let roll = PickRng::from_seed(seed).below(total);
+        assert_eq!(roll, step.roll);
+        let mut acc = 0u64;
+        let i = remaining
+            .iter()
+            .position(|r| {
+                acc += r.1;
+                roll < acc
+            })
+            .unwrap();
+        assert_eq!(remaining.remove(i).0, step.number, "draw {}", step.draw_index);
+    }
+    assert!(remaining.is_empty());
 }

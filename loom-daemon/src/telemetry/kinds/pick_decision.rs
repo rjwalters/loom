@@ -357,7 +357,9 @@ pub struct PickWorkspaceDraw {
 }
 
 /// The step engine's item draws for one tick (#11896): the seed inputs, the
-/// weight-0 exclusion counts and every draw, enough to replay the sequence.
+/// weight-0 exclusion counts, each workspace's initial pool and every draw,
+/// enough to replay the sequence: the seed rolls over the pool minus the
+/// items earlier draws took.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickItemDraw {
     /// `loom-draw/v2`.
@@ -374,8 +376,31 @@ pub struct PickItemDraw {
     /// chunk, so read it from one chunk only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded: Vec<PickItemExclusion>,
+    /// Each workspace's pool before its first draw, in pool order (the order
+    /// the roll indexes into), workspaces in draw order (the chunk's in-order
+    /// slice). Replay: roll over a workspace's entries minus its earlier
+    /// picks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<PickItemPoolEntry>,
     /// Every draw, in order (the chunk's in-order slice).
     pub draws: Vec<PickItemDrawStep>,
+}
+
+/// One item in a workspace's initial draw pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemPoolEntry {
+    /// Forge `owner/repo`: the workspace whose pool this entry belongs to.
+    pub repo: String,
+    /// The number the step acts on (the PR for a PR step).
+    pub number: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u32>,
+    /// The step (`builder`, `judge`, `champion_merge`, ...).
+    pub step: String,
+    /// The item's draw weight, as summed into `total_weight`.
+    pub weight: u64,
 }
 
 /// How many items of one workspace a reason kept out of the item draw.
@@ -676,6 +701,7 @@ enum PickChunkEntry {
     Draw(PickDraw),
     Demoted(PickViDemotion),
     ItemDraw(PickItemDrawStep),
+    ItemPool(PickItemPoolEntry),
 }
 
 /// Split `record` into chunks whose JSON is at most `max_bytes` each (one
@@ -733,6 +759,15 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
                 .unwrap_or_default()
                 .into_iter()
                 .map(PickChunkEntry::ItemDraw),
+        )
+        .chain(
+            header
+                .item_draw
+                .as_mut()
+                .map(|d| std::mem::take(&mut d.pools))
+                .unwrap_or_default()
+                .into_iter()
+                .map(PickChunkEntry::ItemPool),
         );
 
     // Header plus room for the multi-digit chunk numbers.
@@ -748,6 +783,7 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
             PickChunkEntry::Draw(d) => json_len(d),
             PickChunkEntry::Demoted(d) => json_len(d),
             PickChunkEntry::ItemDraw(d) => json_len(d),
+            PickChunkEntry::ItemPool(p) => json_len(p),
         } + 1; // the separating comma
                // Cut between entries; a lone oversized entry still goes out whole.
         if used > 0 && used + len > budget {
@@ -777,6 +813,11 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
             PickChunkEntry::ItemDraw(d) => {
                 if let Some(item_draw) = chunk.item_draw.as_mut() {
                     item_draw.draws.push(d);
+                }
+            }
+            PickChunkEntry::ItemPool(p) => {
+                if let Some(item_draw) = chunk.item_draw.as_mut() {
+                    item_draw.pools.push(p);
                 }
             }
         }

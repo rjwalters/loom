@@ -32,12 +32,12 @@ use super::pick_journal::{
 };
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
-use crate::step_dispatch::item_draw::{DrawRecord, Exclusion, ITEM_DRAW_SEED_SCHEME};
+use crate::step_dispatch::item_draw::{Candidate, DrawRecord, Exclusion, ITEM_DRAW_SEED_SCHEME};
 use crate::telemetry::kinds::pick_decision::{
     source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
-    PickDrawCandidate, PickItemDraw, PickItemDrawStep, PickItemExclusion, PickLane, PickQueueSkip,
-    PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion, PickWorkspaceDraw,
-    CHUNK_BYTES, WORK_FINDER_ROLE,
+    PickDrawCandidate, PickItemDraw, PickItemDrawStep, PickItemExclusion, PickItemPoolEntry,
+    PickLane, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion,
+    PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
@@ -325,6 +325,8 @@ pub struct ItemDrawWorkspace<'a> {
     pub repo: &'a str,
     /// [`Weighing::excluded`](crate::step_dispatch::item_draw::Weighing::excluded).
     pub excluded: &'a std::collections::BTreeMap<Exclusion, usize>,
+    /// The pool before the first draw, in pool order: what the rolls index.
+    pub pool: &'a [Candidate],
     /// The draws taken, in order.
     pub draws: &'a [DrawRecord],
 }
@@ -354,6 +356,19 @@ pub fn item_draw_record(
                     skip_reason: PickSkipReason::from_exclusion(reason),
                     count,
                 })
+        })
+        .collect();
+    let pools = workspaces
+        .iter()
+        .flat_map(|w| {
+            w.pool.iter().map(|c| PickItemPoolEntry {
+                repo: w.repo.to_string(),
+                number: c.target(),
+                issue: c.item.issue,
+                pr: c.item.pr,
+                step: c.step.as_str().to_string(),
+                weight: c.terms.weight,
+            })
         })
         .collect();
     let draws: Vec<PickItemDrawStep> = workspaces
@@ -391,6 +406,7 @@ pub fn item_draw_record(
         tick_counter: tick_counter.to_string(),
         draws_total: draws.len(),
         excluded,
+        pools,
         draws,
     })
 }

@@ -794,6 +794,7 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
             AgeSource::Mirror,
         ),
     };
+    let pool = [picked.clone()];
     let draws = [DrawRecord {
         draw_index: 0,
         seed: 99,
@@ -813,12 +814,19 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
         &[ItemDrawWorkspace {
             repo: "o/r",
             excluded: &excluded,
+            pool: &pool,
             draws: &draws,
         }],
     )
     .unwrap();
     assert_eq!(d.seed_scheme, "loom-draw/v2");
     assert_eq!(d.tick_counter, "17");
+    assert_eq!(d.pools.len(), 1);
+    assert_eq!(
+        (d.pools[0].repo.as_str(), d.pools[0].number, d.pools[0].step.as_str()),
+        ("o/r", 8, "judge")
+    );
+    assert_eq!(d.pools[0].weight, d.draws[0].weight);
     let step = &d.draws[0];
     assert_eq!(step.number, 8, "a Judge step acts on the PR");
     assert_eq!((step.priority, step.age_permille), (3, 2000));

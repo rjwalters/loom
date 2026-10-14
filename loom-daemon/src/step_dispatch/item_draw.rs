@@ -50,8 +50,9 @@
 //! draw's `loom-draw/v1` is keyed `(minute, host)` only, so two ticks in one
 //! minute repeat it; the tick counter and workspace end that. Draws are
 //! without replacement: a drawn item leaves the pool, and the next draw uses
-//! the next `draw_index`. `pick.decision` carries the seed inputs and every
-//! draw's weight terms, so the sequence replays from the record.
+//! the next `draw_index`. `pick.decision` carries the seed inputs, each
+//! workspace's initial pool (in pool order) and every draw's weight terms, so
+//! the sequence replays from the record.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

@@ -360,6 +360,11 @@ fn reassemble(chunks: &[PickDecisionRecord]) -> PickDecisionRecord {
         .iter()
         .find_map(|c| c.item_draw.clone())
         .map(|mut d| {
+            d.pools = sorted
+                .iter()
+                .filter_map(|c| c.item_draw.as_ref())
+                .flat_map(|d| d.pools.iter().cloned())
+                .collect();
             d.draws = sorted
                 .iter()
                 .filter_map(|c| c.item_draw.as_ref())
@@ -446,6 +451,16 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
             seed_host: "host-a".to_string(),
             tick_counter: "17".to_string(),
             draws_total: 9,
+            pools: (0..9)
+                .map(|i| PickItemPoolEntry {
+                    repo: "o/r".to_string(),
+                    number: 100 + i,
+                    issue: Some(100 + i),
+                    pr: None,
+                    step: "builder".to_string(),
+                    weight: 43_200,
+                })
+                .collect(),
             excluded: vec![PickItemExclusion {
                 repo: "o/r".to_string(),
                 reason: "pool_exhausted".to_string(),
