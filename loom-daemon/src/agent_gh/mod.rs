@@ -309,10 +309,10 @@ fn serve(raw: &[OsString], next: &Path) -> Option<Served> {
 
 /// Run a classified read under its owner's gateway profile, with every env
 /// token removed (one would outrank the profile), and replay its output.
-/// `None` when the relay is down or unreachable (a transport error or a
-/// `502`/`503`/`504`): the caller then runs the call direct, and the outage
-/// is recorded beside the profiles so the next calls skip the gateway
-/// ([`crate::forge_gateway::outage`]). Output is buffered, so the classifier
+/// `None` when the attempt failed with a `5xx` or a transport error: the
+/// caller then runs the call direct. When the gateway signalled the fault
+/// itself, the outage is also recorded beside the profiles so the next calls
+/// skip the gateway ([`crate::forge_gateway::outage`]). Output is buffered, so the classifier
 /// never sends a streaming call (`--watch`) or a log dump (`run view --log`)
 /// here.
 fn run_on_gateway(next: &Path, raw: &[OsString], dir: &Path, depth: u32) -> Option<i32> {
@@ -329,11 +329,18 @@ fn run_on_gateway(next: &Path, raw: &[OsString], dir: &Path, depth: u32) -> Opti
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let response = crate::forge_listing::parse_http_response(&stdout);
-    if !out.status.success()
-        && crate::forge_gateway::outage::is_outage(response.as_ref(), &stdout, &stderr)
-    {
-        if let Some(base) = dir.parent() {
-            crate::forge_gateway::outage::note_front_outage(base);
+    let fault = if out.status.success() {
+        crate::forge_gateway::outage::Fault::None
+    } else {
+        crate::forge_gateway::outage::fault(response.as_ref(), &stdout, &stderr)
+    };
+    if fault.reruns() {
+        // Any gateway 5xx or transport error is run again direct. Only a
+        // fault the gateway itself signalled keeps the next calls off it.
+        if fault == crate::forge_gateway::outage::Fault::Withdraw {
+            if let Some(base) = dir.parent() {
+                crate::forge_gateway::outage::note_front_outage(base);
+            }
         }
         return None;
     }

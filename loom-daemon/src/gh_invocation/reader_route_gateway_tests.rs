@@ -155,13 +155,28 @@ fn a_not_found_through_the_gateway_is_not_an_outage() {
     assert!(withdrawals.is_empty(), "{withdrawals:?}");
 }
 
+/// A relayed GitHub 5xx, and a non-`api` read's bare `HTTP 500` (gh prints
+/// nothing else for `pr view`), cannot be told from a gateway fault: they
+/// rerun on the writer, but never withdraw the gateway.
 #[test]
-fn a_github_502_through_the_gateway_or_a_gh_usage_error_is_not_an_outage() {
-    for on_gw in [RELAYED_502, GH_REFUSED] {
+fn an_unmarked_5xx_reruns_direct_and_does_not_withdraw() {
+    const PR_VIEW_500: &str = "echo 'HTTP 500 (https://gw.example.com/graphql)' >&2; exit 1";
+    for on_gw in [RELAYED_502, PR_VIEW_500] {
         let s = stub(on_gw, OK, OK);
-        let (out, _) = s.run(true);
-        assert!(!ok(&out), "{on_gw}: the gateway's answer stands");
-        assert_eq!(s.calls(), ["gateway"], "{on_gw}");
+        let (out, withdrawals) = s.run(false);
+        assert!(ok(&out), "{on_gw}: served by the rerun: {out:?}");
+        assert_eq!(s.calls(), ["gateway", "writer"], "{on_gw}");
         assert!(crate::forge_gateway::outage::take_test_outages().is_empty(), "{on_gw}");
+        assert!(withdrawals.is_empty(), "{on_gw}: {withdrawals:?}");
     }
+}
+
+/// gh refusing the argv before sending anything is the answer: no rerun.
+#[test]
+fn a_gh_usage_error_is_neither_rerun_nor_an_outage() {
+    let s = stub(GH_REFUSED, OK, OK);
+    let (out, _) = s.run(true);
+    assert!(!ok(&out));
+    assert_eq!(s.calls(), ["gateway"]);
+    assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
 }

@@ -1,14 +1,24 @@
-//! A gateway outage is not a credential failure: fall back, don't fail.
+//! A failed gateway attempt is not a credential failure: rerun, and withdraw
+//! only on the gateway's own evidence.
 //!
 //! The reader chain withdraws a reader only for what it understands as the
 //! credential's fault (a rate limit, a refused token, a coverage miss), and
 //! returns any other failure as the answer, since another reader would not
-//! help. That is wrong for the gateway: when the relay itself is down or
-//! unreachable, the host-held readers and the writer still reach GitHub. So a
-//! gateway attempt that fails with a transport error, a timeout or a
-//! `502`/`503`/`504` withdraws the gateway everywhere for
-//! [`crate::forge_read_pool::DEFAULT_WITHDRAWAL`], and the read continues to
-//! the readers, then the writer.
+//! help. That is wrong for the gateway: when the relay itself is broken, the
+//! host-held readers and the writer still reach GitHub. Two decisions follow
+//! ([`fault`]):
+//!
+//! - **Rerun** ([`Fault::Rerun`]): any gateway attempt that times out, gets
+//!   a transport error, or fails with a `5xx` is run once more on the
+//!   readers, then the writer. A non-`api` read (`gh pr view`, …) shows only
+//!   `HTTP 5xx` on stderr, so whose `5xx` it was cannot be told. A `5xx`
+//!   GitHub relayed then costs one repeated read, and a real gateway fault
+//!   (a `500 misconfigured`, a Worker crash) is still served.
+//! - **Withdraw** ([`Fault::Withdraw`], App-wide for
+//!   [`crate::forge_read_pool::DEFAULT_WITHDRAWAL`], and the front's
+//!   `outage-until`): only on evidence the gateway itself gives (see
+//!   [`is_outage`]). A `5xx` GitHub returns through the relay never takes
+//!   the gateway out.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -82,7 +92,11 @@ pub fn is_outage(
 }
 
 /// The gateway's opaque 5xx body: `{"error": <code>, "request_id": …}` and
-/// no `message` (errors.js, SECURITY.md rule 6 on the gateway side).
+/// no `message` (errors.js, SECURITY.md rule 6 on the gateway side). It
+/// depends on the gateway keeping `request_id` in that body. If it is ever
+/// dropped, an unmarked fault still reruns ([`Fault::Rerun`]); it just stops
+/// withdrawing the gateway. With headers the `x-github-proxy-refusal` mark
+/// decides instead.
 fn is_gateway_body(stdout: &str) -> bool {
     let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(stdout.trim())
     else {
@@ -91,6 +105,46 @@ fn is_gateway_body(stdout: &str) -> bool {
     m.get("error").is_some_and(serde_json::Value::is_string)
         && m.contains_key("request_id")
         && !m.contains_key("message")
+}
+
+/// What a failed gateway attempt calls for (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// An answer: the chain's usual rules apply.
+    None,
+    /// Run it once more on the readers, then the writer.
+    Rerun,
+    /// Rerun, and withdraw the gateway: it signalled the fault itself.
+    Withdraw,
+}
+
+impl Fault {
+    /// Whether the read goes on past the gateway.
+    #[must_use]
+    pub fn reruns(self) -> bool {
+        self != Self::None
+    }
+}
+
+/// Classify a failed gateway attempt from its output. A timeout has none;
+/// callers treat it as [`Fault::Rerun`].
+#[must_use]
+pub fn fault(
+    response: Option<&crate::forge_listing::HttpResponse>,
+    stdout: &str,
+    stderr: &str,
+) -> Fault {
+    if is_outage(response, stdout, stderr) {
+        return Fault::Withdraw;
+    }
+    let status = response
+        .map(|r| r.status)
+        .or_else(|| http_status_in(stderr));
+    if status.is_some_and(|s| s >= 500) {
+        Fault::Rerun
+    } else {
+        Fault::None
+    }
 }
 
 /// Withdraw the gateway App-wide for the default window. A test build

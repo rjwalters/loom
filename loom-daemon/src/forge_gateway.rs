@@ -520,6 +520,24 @@ pub fn decide(
     })
 }
 
+/// `decision`, unless it is the gateway: then the reader pool's answer for
+/// `req`. For a read rerunning past a gateway fault that did not withdraw it
+/// ([`outage::Fault::Rerun`]), so the rerun reaches the readers before the
+/// writer.
+#[must_use]
+pub fn past_gateway(
+    decision: RouteDecision,
+    req: &RouteRequest<'_>,
+    now: SystemTime,
+) -> RouteDecision {
+    match decision {
+        RouteDecision::Reader { ref app_id, .. } if app_id == GATEWAY_APP_ID => {
+            crate::forge_identity::route_read(req, now)
+        }
+        other => other,
+    }
+}
+
 /// A gateway failure withdraws it through the reader tables
 /// ([`crate::forge_identity::withdraw_after`]); honour every scope.
 fn is_withdrawn(owner: &str, req: &RouteRequest<'_>, now: SystemTime) -> bool {

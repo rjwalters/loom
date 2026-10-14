@@ -480,6 +480,23 @@ fn only_an_outage_the_gateway_signals_withdraws_it() {
         assert!(!check(String::new(), stderr), "{stderr}");
     }
     assert!(!check(included(404, &[version], "{}"), "gh: Not Found (HTTP 404)"));
+
+    // Rerun vs withdraw: any 5xx reruns; only the gateway's own evidence
+    // withdraws.
+    use outage::{fault, Fault};
+    let f = |stdout: String, stderr: &str| {
+        let r = parse_http_response(&stdout);
+        fault(r.as_ref(), &stdout, stderr)
+    };
+    assert_eq!(f(String::new(), "HTTP 500 (https://gw/graphql)"), Fault::Rerun);
+    assert_eq!(f(included(502, &[version], "{}"), "gh: HTTP 502"), Fault::Rerun);
+    assert_eq!(
+        f(included(500, &[version, "x-github-proxy-refusal: misconfigured"], "{}"), ""),
+        Fault::Withdraw
+    );
+    assert_eq!(f(String::new(), "dial tcp: connection refused"), Fault::Withdraw);
+    assert_eq!(f(String::new(), "gh: Not Found (HTTP 404)"), Fault::None);
+    assert_eq!(f(String::new(), "unknown flag: --nope"), Fault::None);
 }
 
 #[test]
