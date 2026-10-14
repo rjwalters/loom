@@ -657,6 +657,12 @@ impl WorkDispatcher for RegistryDispatcher {
         super::landed_prefilter::landed_in(&self.registry, candidates, open_pr)
     }
 
+    /// Landed cooldowns to lift early (#11901); see
+    /// [`super::landed_prefilter::lift_in`].
+    fn lift_landed_cooldowns(&self, held: &[u32]) -> HashSet<u32> {
+        super::landed_prefilter::lift_in(&self.registry, held)
+    }
+
     /// Whether a live sweep in this registry is the host's overflow sweep
     /// (#9244). The multi-workspace tick ORs this across every root.
     fn overflow_in_flight(&self) -> bool {
