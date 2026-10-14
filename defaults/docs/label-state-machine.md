@@ -270,6 +270,15 @@ hold stands, so a removal is always a human's release. The Capped-PR Recovery
 Pass, which also reads `loom:blocked` + `loom:changes-requested`, skips a PR
 with a Champion hold marker.
 
+A held PR whose Doctor cycle is capped (`doctor_cycle_capped`: a trusted
+"doctor cycle exhausted" comment after the newest hold marker) is **terminal for
+automation**: Doctor skips it, Judge never gets it, Champion's queue does not see
+it (no `loom:pr`), and the Recovery Pass skips it. Nothing may remove
+`loom:blocked`; a human releases or closes it. It carries no `loom:operator`, so
+it is not in the operator inbox or the held-PR digest (which lists `loom:pr`
+PRs); find it with
+`gh pr list --label loom:blocked --label loom:changes-requested`.
+
 ### The out-of-band AC hold on an issue (#6883)
 
 Champion's Step 4 gate applies `loom:operator` to an **issue** whose acceptance

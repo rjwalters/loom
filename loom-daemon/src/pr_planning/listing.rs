@@ -139,28 +139,40 @@ fn trusted_comment_bodies(
     Ok(bodies)
 }
 
+/// Annotate every Champion-hold-shaped row with [`super::CHAMPION_HOLD_FIELD`]
+/// for Doctor and Judge: whether the trusted comments carry a standing marker
+/// that lets this role serve the `loom:blocked` PR. Shared by [`fetch_queue`]
+/// and the Judge gate ([`has_judge_work`]) so the gate reads the queue Judge
+/// actually reads — a gate on the raw listing drops a handed-back held PR and
+/// strands it.
+fn annotate_champion_hold(root: &Path, gh: &Path, rows: &mut [Value], role: PrRole) -> Result<()> {
+    if !matches!(role, PrRole::Doctor | PrRole::Judge) {
+        return Ok(());
+    }
+    let policy = TrustPolicy::for_root(root);
+    for row in rows {
+        let labels = row_labels(row);
+        let shape = match role {
+            PrRole::Doctor => crate::champion_hold::doctor_shape(&labels),
+            _ => crate::champion_hold::judge_shape(&labels),
+        };
+        if shape {
+            let number = row["number"].as_u64().context("PR number missing")?;
+            let trusted = trusted_comment_bodies(root, gh, number, &policy)?;
+            row[super::CHAMPION_HOLD_FIELD] = Value::Bool(match role {
+                PrRole::Doctor => crate::champion_hold::doctor_may_work(&labels, &trusted),
+                _ => crate::champion_hold::judge_may_review(&labels, &trusted),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Listing and fallback guard failures are errors, never an empty queue.
 /// Fallback review only; no workflow labels or branch mutations occur here.
 pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
     let mut rows = list_open(root, gh)?;
-    if matches!(role, PrRole::Doctor | PrRole::Judge) {
-        let policy = TrustPolicy::for_root(root);
-        for row in &mut rows {
-            let labels = row_labels(row);
-            let shape = match role {
-                PrRole::Doctor => crate::champion_hold::doctor_shape(&labels),
-                _ => crate::champion_hold::judge_shape(&labels),
-            };
-            if shape {
-                let number = row["number"].as_u64().context("PR number missing")?;
-                let trusted = trusted_comment_bodies(root, gh, number, &policy)?;
-                row[super::CHAMPION_HOLD_FIELD] = Value::Bool(match role {
-                    PrRole::Doctor => crate::champion_hold::doctor_may_work(&labels, &trusted),
-                    _ => crate::champion_hold::judge_may_review(&labels, &trusted),
-                });
-            }
-        }
-    }
+    annotate_champion_hold(root, gh, &mut rows, role)?;
     if role == PrRole::Doctor {
         for row in &mut rows {
             if has_label(row, "loom:pr")
@@ -270,7 +282,9 @@ fn backstop_holds(root: &Path, gh: &Path, row: &Value, trust: &TrustPolicy) -> b
 /// row's record read.
 pub fn has_judge_work(root: &Path, gh: &Path) -> Result<bool> {
     let (prefer, trust) = (prefer_human_prs(root), TrustPolicy::for_root(root));
-    for row in ordered_queue(list_open(root, gh)?, PrRole::Judge, prefer, &trust) {
+    let mut rows = list_open(root, gh)?;
+    annotate_champion_hold(root, gh, &mut rows, PrRole::Judge)?;
+    for row in ordered_queue(rows, PrRole::Judge, prefer, &trust) {
         let served = if row["mode"] == "fallback" {
             guard_admits(root, &row)?
         } else {
@@ -290,7 +304,9 @@ pub fn has_judge_work(root: &Path, gh: &Path) -> Result<bool> {
 /// guard at all, and the first admitted row settles it.
 pub fn has_judge_fallback(root: &Path, gh: &Path) -> Result<bool> {
     let (prefer, trust) = (prefer_human_prs(root), TrustPolicy::for_root(root));
-    for row in ordered_queue(list_open(root, gh)?, PrRole::Judge, prefer, &trust) {
+    let mut rows = list_open(root, gh)?;
+    annotate_champion_hold(root, gh, &mut rows, PrRole::Judge)?;
+    for row in ordered_queue(rows, PrRole::Judge, prefer, &trust) {
         if row["mode"] == "fallback"
             && joins_busy_queue(&row, prefer, &trust)
             && guard_admits(root, &row)?

@@ -155,7 +155,9 @@ pub const DOCTOR_CYCLE_CAP_PHRASE: &str = "doctor cycle exhausted";
 
 /// Whether the Doctor-cycle cap was hit after the latest hold notice: a
 /// trusted comment naming it, later than the newest hold marker. A capped
-/// held PR is the Capped-PR Recovery Pass's, not Doctor's (#11861 review).
+/// held PR is terminal for automation (#11861 review): Doctor skips it, Judge
+/// and Champion never see it, and the Recovery Pass skips hold-marker PRs. Only
+/// a human releases it; `label-state-machine.md` says how to find it.
 #[must_use]
 pub fn doctor_cycle_capped<C: AsRef<str>>(trusted: &[C]) -> bool {
     let hold = trusted.iter().rposition(|c| {

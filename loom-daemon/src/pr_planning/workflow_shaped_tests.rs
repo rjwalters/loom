@@ -242,3 +242,74 @@ case "$*" in *issues*) echo '[]';; *) cat pulls.json;; esac"#,
         assert_eq!(log, want_log, "{case}: guard invocations");
     }
 }
+
+/// #11861 review: a Champion-held PR that Doctor handed back
+/// (`loom:review-requested` + `loom:blocked`, standing trusted marker) must
+/// open the real Judge gate even when it is the only review work — the gate
+/// reads the same annotated queue `fetch_queue` serves. Without the trusted
+/// marker, neither serves it.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn real_judge_gate_opens_for_a_held_pr_handed_back_and_agrees_with_fetch_queue() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+    let gh = root.join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf 'HTTP/2 200 OK\r\n\r\n'
+case "$*" in
+  *comments*) cat comments.json;;
+  *issues*) cat issues.json;;
+  *) cat pulls.json;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let labels = ["loom:review-requested", "loom:blocked"];
+    let park = crate::park_record::render_park(
+        &[],
+        Some("champion"),
+        None,
+        Some(crate::champion_hold::MERGE_RISK_HOLD_REASON),
+    );
+    let mut row = pr(42, "autonomous", &labels, "feature/issue-42", repo(BASE_ID, "acme/widgets"));
+    row["body"] = json!(park);
+    let mut issue = row.clone();
+    issue["pull_request"] = json!({});
+    std::fs::write(root.join("pulls.json"), serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+    std::fs::write(root.join("issues.json"), serde_json::to_vec(&vec![issue]).unwrap()).unwrap();
+    let marker = |body: &str| {
+        let comments = json!([{"body":body,"user":{"login":"owner"},"author_association":"OWNER"}]);
+        std::fs::write(root.join("comments.json"), serde_json::to_vec(&comments).unwrap()).unwrap();
+    };
+
+    let old = std::env::var_os("LOOM_GH_BIN");
+    std::env::set_var("LOOM_GH_BIN", &gh);
+    let probe = crate::role_runner::concurrent_dispatch::forge_queue_probe();
+    let mut seen = Vec::new();
+    for (case, body, want) in [
+        ("standing marker", crate::champion_hold::MERGE_RISK_HOLD_MARKER, true),
+        ("no marker", "just a comment", false),
+    ] {
+        marker(body);
+        let served = fetch_queue(root, &gh, PrRole::Judge).map(|q| !q.is_empty());
+        let gate = probe(root, &["loom:review-requested"]);
+        let work = has_judge_work(root, &gh).map_err(|e| e.to_string());
+        seen.push((case, want, served.map_err(|e| e.to_string()), work, gate));
+    }
+    if let Some(old) = old {
+        std::env::set_var("LOOM_GH_BIN", old);
+    } else {
+        std::env::remove_var("LOOM_GH_BIN");
+    }
+    for (case, want, served, work, gate) in seen {
+        assert_eq!(served, Ok(want), "{case}: fetch_queue");
+        assert_eq!(work, Ok(want), "{case}: has_judge_work");
+        assert_eq!(gate, Ok(want), "{case}: forge_queue_probe");
+    }
+}
