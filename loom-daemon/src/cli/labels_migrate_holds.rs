@@ -25,7 +25,8 @@
 //!    still open → `loom:blocked` + one park record per blocker, and the
 //!    stale-blocked release pass lifts it when they close.
 //!
-//! Every other operator-held item is a human's hold and is left alone. That
+//! Every other operator-held item is a human's hold and is left alone, and so
+//! is a held PR the Capped-PR Recovery Pass routed to a human (#11905). That
 //! includes a PR held only by the retired `loom:operator-only`: since #11861
 //! `loom:operator` parks a PR too, so the plain retired-label migration keeps
 //! it parked and the #11795 Q1 "+ `loom:blocked`" pre-pass is not needed.
@@ -45,7 +46,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use loom_daemon::champion_hold::{standing_hold, HoldKind, HOLD_BY};
+use loom_daemon::champion_hold::{capped_hold_routed, standing_hold, HoldKind, HOLD_BY};
 use loom_daemon::dep_classify::cli::EscalationMigration;
 use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use serde::Serialize;
@@ -345,6 +346,13 @@ fn pr_hold(
         r.summary.untouched += 1;
         return Ok(());
     };
+    // The capped-hold recommendation's `loom:operator` (#11905) routes the PR
+    // to a human; it is not the pre-#11861 hold label, and only a human
+    // removes it. `loom:blocked` is already on (the pass reads that pair).
+    if capped_hold_routed(&comments) {
+        r.summary.untouched += 1;
+        return Ok(());
+    }
     let hold = match kind {
         HoldKind::MergeRisk => "merge-risk",
         HoldKind::CriticalFile => "critical-file",
