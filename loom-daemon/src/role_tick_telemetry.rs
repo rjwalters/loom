@@ -806,7 +806,7 @@ fn emit_correlated(
             trace,
             &tick.role,
             tick.ended_at,
-            story_runtime.as_deref(),
+            usage::span_runtime(story_runtime.as_deref(), source),
             llm_billing.as_ref(),
             rows,
         );

@@ -56,7 +56,6 @@ test-champion-standing-authorization.sh
 test-check-ci-status.sh
 test-check-config-no-host-paths.sh
 test-check-conflict-markers.sh
-test-check-dependabot-labels.sh
 test-check-evaluating-staleness.sh
 test-check-git-identity.sh
 test-check-guards-installed.sh
@@ -309,7 +308,7 @@ tests/hermit/test-stateless-ceremony.sh
 # repo under mktemp -d with its own identity, no network, no gh.
 scripts/test-changelog.sh
 
-# #11790 (2AMLogic/2am#4367): spawn-claude.sh's container gh credentials and
+# #11790: spawn-claude.sh's container gh credentials and
 # `gh-shim container-mount` sink mount. Hermetic: stub docker + stub daemon
 # under mktemp -d; no network, forge or real daemon binary.
 test-spawn-claude-container-gh.sh

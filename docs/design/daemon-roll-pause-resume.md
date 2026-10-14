@@ -945,3 +945,36 @@ Consequences:
   (written by `restart --drain --then-exit` or `fleet drain`) holds a roll,
   and that tick is skipped; `restart --abort-drain` clears the record and
   releases the hold. A `stopped` host exits at boot, before the loop exists.
+
+## 14. Host maintenance: pause and stay down (#11812)
+
+Operator direction (2026-10-13): host maintenance (instance resize, rebuild,
+OS work) uses this pause, not a wait-for-zero drain. `loom-daemon restart
+--pause --then-exit` (`Request::PauseThenExit`,
+`auto_update/pause_roll/maintenance.rs`) runs H4 exactly as a roll does, with
+`target_source = trigger = host-maintenance` and no `to_version`, and the
+daemon then exits `143` and stays down with the operator stop on record. The
+next start's H5 is unchanged: it does not key on the trigger, and with no
+`to_version` it records `resumed_on = target` and no roll back-off.
+
+- **Taking over.** `DrainState::begin_host_maintenance` decides under the
+  descriptor lock and never clears the dispatch flag: an operator drain (in
+  progress or timed out and held), a startup hold and a fleet hold are
+  converted in place to a then-exit pause roll, with the generation bumped so
+  the drain supervisor stands down; a pause roll already in H4 is escalated to
+  then-exit (rule 3 of §7's operator interplay, without the promotion an
+  operator `--drain` request would cause); an H5 resume hold refuses.
+- **Failure never reopens dispatch.** A then-exit pause that fails before it
+  stops anything (manifest write, H4 deadline, H4 task death) falls back to a
+  held then-exit drain (`DrainState::pause_fallback_to_operator_drain`) whose
+  supervisor stops the daemon once nothing is in flight.
+- **The time bound stays the lease TTL.** The manifest's `max_age_secs` is the
+  lease TTL (15 min by default). A per-pause bound longer than the TTL is not
+  safe as things stand: lease freshness is judged by the *reading* host, from
+  the lease comment's forge `updated_at` against its own TTL
+  (`claim_reconciliation::lease_is_fresh`), and nothing renews a lease while
+  the host is down, so one refresh at H4 cannot cover more than one TTL. A
+  longer bound needs a lease record that carries its own expiry, honoured by
+  every reader, or an off-host renewer; both are separate changes. The CLI
+  prints the deadline instead: pause start + max age − (verify probation +
+  resume budget).

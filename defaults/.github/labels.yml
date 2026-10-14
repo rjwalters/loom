@@ -265,6 +265,15 @@
   description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
   color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
 
+# loom:frozen (#11743) means "not now, don't touch": nothing is pending, so
+# nothing re-evaluates it. Unlike loom:blocked (waiting on something, released
+# automatically) no agent or daemon path reads it as work, comments on it,
+# relabels it or dispatches it. A human applies it and only a human removes it.
+# It is a park, a skip and a hard exclusion (hard-exclusion-labels.sh).
+- name: loom:frozen
+  description: "Not now, don't touch: no agent or daemon path acts on it. Humans apply and remove it."
+  color: "94A3B8"  # slate-400 - inert, not an action signal
+
 # loom:important (#11103) is the middle of Loom's three priority levels (none /
 # important / very important). Within a workspace the queue order is level,
 # then oldest createdAt, then issue number. NOT a hold, never inherited by the

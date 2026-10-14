@@ -25,6 +25,9 @@ pub(crate) fn veto(gh_bin: &Path, root: &Path, issue: u32, removing: &[&str]) ->
 /// `loom:building` vetoes too, since this path never removes it.
 pub(crate) fn quarantine_veto(gh_bin: &Path, root: &Path, issue: u32) -> Option<String> {
     let labels = labels(gh_bin, root, issue)?;
+    if crate::work_finder::is_frozen(&labels) {
+        return Some(crate::work_finder::FROZEN_LABEL.to_string());
+    }
     let building = crate::work_finder::BUILDING_LABEL;
     if labels.iter().any(|l| l == building) {
         return Some(building.to_string());

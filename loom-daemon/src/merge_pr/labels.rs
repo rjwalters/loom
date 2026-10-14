@@ -91,10 +91,15 @@ pub static BLOCKING: crate::label_registry::LabelSet = crate::label_registry::La
 ///
 /// `labels` is newline-separated, as both forges' `labels[].name` renders.
 /// Returns `None` when `loom:pr` is absent — this guard is only ever about a
-/// PR claiming approval.
+/// PR claiming approval — with one exception: `loom:frozen` (#11743) refuses
+/// the merge whatever else the PR carries, because nothing may act on a
+/// frozen artifact and only a human removes the label.
 #[must_use]
 pub fn contradiction(labels: &str) -> Option<&'static str> {
     let present = |want: &str| labels.lines().any(|l| l.trim() == want);
+    if present(crate::work_finder::FROZEN_LABEL) {
+        return Some(crate::work_finder::FROZEN_LABEL);
+    }
     if !present("loom:pr") {
         return None;
     }
@@ -138,6 +143,13 @@ pub fn message(pr: &str, blocker: &str, labels: &str, head_sha: &str) -> String 
     } else {
         labels.trim().to_string()
     };
+    if blocker == crate::work_finder::FROZEN_LABEL {
+        return format!(
+            "Merge blocked: PR #{pr} is `loom:frozen` (#11743): not now, don't touch. Only a \
+             human removes the label; there is no override.\n\nCurrent labels: {shown}\n\
+             Current head SHA: {head_sha}"
+        );
+    }
     format!(
         "Merge blocked: PR #{pr} carries both `loom:pr` and `{blocker}` simultaneously — a \
 contradictory verdict state (see the mutual-exclusion invariant documented in \

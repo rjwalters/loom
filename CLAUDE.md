@@ -95,6 +95,7 @@ label documents its own `Applied by:` owner). State transitions:
 - **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
   `loom:epic-phase` issues.
 
+`loom:frozen` means not now: every agent and daemon path ignores it; only a human removes it (#11743).
 `loom:operator` means "a human is needed" (engine stops, re-evaluable, unlike
 `loom:operator-only`; set by Champion's merge-risk hold). `loom:very-important` /
 `loom:important` reorder (not holds, not approval); every stage takes them first. Your

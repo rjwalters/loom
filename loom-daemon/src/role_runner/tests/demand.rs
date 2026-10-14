@@ -265,7 +265,7 @@ fn parked_prs_are_not_changes_debt() {
         labelled(5, "loom:treating"),
     ];
     assert_eq!(count_axis_rows(DebtAxis::Changes, &rows), 3, "#1, #4 and #5");
-    assert_eq!(count_axis_rows(DebtAxis::Review, &rows), 5, "review is unfiltered");
+    assert_eq!(count_axis_rows(DebtAxis::Review, &rows), 5, "review parks only frozen");
     assert_eq!(count_axis_rows(DebtAxis::Merge, &rows), 2, "merge set unchanged");
 
     let ledger = DemandLedger::default();
@@ -334,6 +334,20 @@ fn drainable_changes_pr_opens_the_gate() {
         ..queue_row(2, label, &[])
     };
     assert!(!listing_has_work(label, &[closed, issue]));
+}
+
+/// #11743: a `loom:frozen` PR is debt on no axis, and an all-frozen queue
+/// opens no gate — not even Judge's, whose `pr-queue` drops frozen PRs.
+#[test]
+fn frozen_prs_are_no_axis_debt_and_open_no_gate() {
+    for axis in DebtAxis::ALL {
+        let label = axis.label();
+        let frozen = queue_row(1, label, &["loom:frozen"]);
+        let open = queue_row(2, label, &[]);
+        assert_eq!(count_axis_rows(axis, &[frozen.clone(), open.clone()]), 1, "{label}");
+        assert!(!listing_has_work(label, std::slice::from_ref(&frozen)), "{label}");
+        assert!(listing_has_work(label, &[frozen, open]), "{label}");
+    }
 }
 
 #[test]
@@ -407,7 +421,10 @@ fn changes_park_set_is_the_work_finder_park_set() {
     assert_eq!(axis_park_labels(DebtAxis::Changes), crate::work_finder::PARK_LABELS.as_slice());
     assert!(!axis_park_labels(DebtAxis::Changes).contains(&"loom:operator"));
     assert_eq!(axis_park_labels(DebtAxis::Merge), &MERGE_HOLD_LABELS[..]);
-    assert!(axis_park_labels(DebtAxis::Review).is_empty());
+    // #11743: the review axis parks only `loom:frozen`; merge holds include it.
+    assert_eq!(axis_park_labels(DebtAxis::Review), &[crate::work_finder::FROZEN_LABEL]);
+    assert!(MERGE_HOLD_LABELS.contains(&crate::work_finder::FROZEN_LABEL));
+    assert!(axis_park_labels(DebtAxis::Changes).contains(&crate::work_finder::FROZEN_LABEL));
 }
 
 #[test]

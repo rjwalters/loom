@@ -454,7 +454,10 @@ fn daemon_write_paths_are_scoped() {
             "sweep_registry/dispatch/claim_release.rs",
             Via(DISPATCH, "releases the claim of a dispatched sweep found closed post-flip (#11304)"),
         ),
-        ("sweep_registry/watchdog.rs", Via(DISPATCH, "acts on dispatched sweeps")),
+        (
+            "sweep_registry/watchdog/forge_comments.rs",
+            Via(DISPATCH, "acts on dispatched sweeps (moved from watchdog.rs, #11743)"),
+        ),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
             "sweep_registry/roll_requeue.rs",

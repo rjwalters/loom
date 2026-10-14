@@ -48,30 +48,47 @@ use std::path::Path;
 
 use anyhow::Result;
 
+/// What [`reclaim_and_warn`] did on success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reclaim {
+    /// The claim was released (fully, or the claim only under a veto).
+    Released,
+    /// The issue is `loom:frozen` (#11743): nothing was written, so the
+    /// caller must not count or log it as a reclaim.
+    Frozen,
+}
+
 /// Reclaim `issue`'s `loom:building` label, then warn if the forge says
 /// somebody had already opened a PR from its worktree branch.
 ///
-/// A drop-in wrapper around [`crate::claim_reconciliation::forge::reclaim`]:
-/// the return value is that call's, unchanged, and the diagnostic runs only on
-/// success (a failed flip changed nothing worth explaining).
-pub(crate) fn reclaim_and_warn(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
+/// A wrapper around [`crate::claim_reconciliation::forge::reclaim`]: an error
+/// is that call's, unchanged, and the diagnostic runs only on success (a
+/// failed flip changed nothing worth explaining). `Ok(Reclaim::Frozen)` is the
+/// frozen skip, which wrote nothing.
+pub(crate) fn reclaim_and_warn(gh_bin: &Path, root: &Path, issue: u32) -> Result<Reclaim> {
     // #11480: an item another hold took out of the queue loses only the stale
     // claim; `loom:issue` is not re-added.
     if let Some(label) = crate::release_veto::veto(gh_bin, root, issue, &[]) {
+        if label == crate::work_finder::FROZEN_LABEL {
+            log::warn!(
+                "claim_reconciliation: #{issue} in {} is `loom:frozen` — not reclaiming, no \
+                 label write (#11743)",
+                root.display()
+            );
+            return Ok(Reclaim::Frozen);
+        }
         log::warn!(
             "claim_reconciliation: #{issue} in {} carries `{label}` — removing the stale \
              `loom:building` claim only, NOT re-adding `loom:issue` (#11480)",
             root.display()
         );
-        return release_claim_only(gh_bin, root, issue);
+        return release_claim_only(gh_bin, root, issue).map(|()| Reclaim::Released);
     }
-    let result = crate::claim_reconciliation::forge::reclaim(gh_bin, root, issue);
-    if result.is_ok() {
-        if let Some(pr) = open_pr_on_issue_branch(gh_bin, root, issue) {
-            log::warn!("{}", open_pr_warning(issue, pr, root));
-        }
+    crate::claim_reconciliation::forge::reclaim(gh_bin, root, issue)?;
+    if let Some(pr) = open_pr_on_issue_branch(gh_bin, root, issue) {
+        log::warn!("{}", open_pr_warning(issue, pr, root));
     }
-    result
+    Ok(Reclaim::Released)
 }
 
 /// The vetoed reclaim (#11480): remove `loom:building`, add nothing.
@@ -152,6 +169,8 @@ mod tests {
         for (labels, restores) in [
             (r#"["loom:building","loom:operator-only"]"#, false),
             (r#"["loom:building"]"#, true),
+            // #11743: frozen — no edit at all (checked below).
+            (r#"["loom:building","loom:frozen"]"#, false),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("repo");
@@ -169,9 +188,16 @@ mod tests {
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
             let ws = WritableRoot::register_with_gh(&root, &gh);
 
-            reclaim_and_warn(&ws.gh, &root, 42).unwrap();
+            let done = reclaim_and_warn(&ws.gh, &root, 42).unwrap();
 
             let calls = std::fs::read_to_string(&log).unwrap();
+            if labels.contains("loom:frozen") {
+                assert!(!calls.contains("issue edit"), "{labels}: {calls}");
+                // #11743: distinguishable, so the caller does not count it.
+                assert_eq!(done, Reclaim::Frozen);
+                continue;
+            }
+            assert_eq!(done, Reclaim::Released, "{labels}");
             assert!(calls.contains("issue edit 42 --remove-label loom:building"), "{calls}");
             assert_eq!(calls.contains("--add-label loom:issue"), restores, "{labels}: {calls}");
         }

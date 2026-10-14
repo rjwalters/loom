@@ -1893,7 +1893,17 @@ fn test_hard_exclusion_labels_are_disjoint_from_skip_labels() {
     // So assert the two sets stay disjoint. If a future label genuinely
     // belongs in both, that is a deliberate decision that should have to
     // edit this test.
-    for excluded in crate::hard_exclusion::HARD_EXCLUSION_LABELS.iter() {
+    //
+    // #11743: `loom:frozen` is that deliberate decision. It must refuse every
+    // route: as a park (the dispatch-time guard, so also a skip by #4444) AND
+    // as a hard exclusion (every role and daemon pass that reads the
+    // `hard_exclusion` property). The skip filter runs first, so it counts
+    // once, as `labeled-skip`, a human park. It cannot be relaxed, because it
+    // is a capability `LANE_VETO_LABELS` entry.
+    for excluded in crate::hard_exclusion::HARD_EXCLUSION_LABELS
+        .iter()
+        .filter(|l| **l != "loom:frozen")
+    {
         assert!(
             !SKIP_LABELS.contains(excluded),
             "{excluded} is a hard exclusion (#7528), counted as `declined-skip`; it must \

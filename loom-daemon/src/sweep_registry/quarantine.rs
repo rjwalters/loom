@@ -1043,10 +1043,10 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
-        // Body park record first (#10161); a timeout stops here (park_hold.rs).
-        if self
-            .record_daemon_hold(issue, park_hold::QUARANTINE_HOLD_REASON)
-            .is_err()
+        // Body park record first (#10161); a timeout stops here (park_hold.rs),
+        // and so does a `loom:frozen` issue (#11743).
+        if self.record_daemon_hold(issue, park_hold::QUARANTINE_HOLD_REASON)
+            != Ok(park_hold::HoldGate::Proceed)
         {
             return;
         }
@@ -1120,6 +1120,9 @@ impl SweepRegistry {
         // Counted as `quarantine.release` (#10089). Bounded (Issue #3973):
         // expire_quarantine runs from `reap_once`, on the read path.
         let issue_arg = issue.to_string();
+        let Some(restore) = self.quarantine_release_plan(issue) else {
+            return true;
+        };
         let mut edit = vec![
             "issue",
             "edit",
@@ -1127,7 +1130,7 @@ impl SweepRegistry {
             "--remove-label",
             "loom:blocked",
         ];
-        if self.quarantine_release_restores_ready(issue) {
+        if restore {
             edit.extend(["--add-label", "loom:issue"]);
         }
         let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();

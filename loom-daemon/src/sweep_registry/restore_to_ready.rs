@@ -37,6 +37,15 @@ use super::*;
 
 mod prior_label;
 
+/// What a claim release did (#11743).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimRelease {
+    /// The release edit ran.
+    Released,
+    /// The issue is `loom:frozen`: no label was touched.
+    Frozen,
+}
+
 impl SweepRegistry {
     /// The reaper's claim release for the reaped dispatch `sweep_id` (Issue
     /// #11438): [`restore_label_to_ready`](Self::restore_label_to_ready),
@@ -71,6 +80,13 @@ impl SweepRegistry {
     /// lives here (a sibling module) so the size-ratcheted `guards.rs` only
     /// keeps the delegating entry point.
     pub(crate) fn restore_label_to_ready_with_state_check(&self, issue: u32) -> Result<()> {
+        self.restore_label_to_ready_checked(issue).map(|_| ())
+    }
+
+    /// [`restore_label_to_ready_with_state_check`](Self::restore_label_to_ready_with_state_check),
+    /// reporting whether the release found the issue `loom:frozen` and so
+    /// wrote nothing (#11743) — for a caller with a write of its own to skip.
+    pub(crate) fn restore_label_to_ready_checked(&self, issue: u32) -> Result<ClaimRelease> {
         // #11480: one REST read (state + labels) answers both the park
         // carve-outs and #9463's closed-state probe, and the shared
         // `restore_veto` decides the park side for every release path. It
@@ -79,6 +95,13 @@ impl SweepRegistry {
         // no labels and no state, so the restore goes ahead.
         let signals = self.release_issue_signals(issue);
         let veto = crate::work_finder::restore_veto(&signals.labels, &[]);
+        if veto == Some(crate::work_finder::FROZEN_LABEL) {
+            log::info!(
+                "sweep_registry: #{issue} is `loom:frozen` — leaving every label as it is, \
+                 even the stale `loom:building` claim (#11743)"
+            );
+            return Ok(ClaimRelease::Frozen);
+        }
         // Only probe PR-ness when a veto doesn't already decide the outcome.
         let is_pr = veto.is_none() && self.issue_is_pull_request(issue).unwrap_or(false);
         let closed = if veto.is_some() || is_pr {
@@ -127,6 +150,7 @@ impl SweepRegistry {
             args.extend(["--add-label".to_string(), "loom:issue".to_string()]);
         }
         self.run_claim_release_edit(issue, args)
+            .map(|()| ClaimRelease::Released)
     }
 
     /// The issue-signals read for a release path's restore veto (#11480).
@@ -270,6 +294,22 @@ exit 0
         let calls = std::fs::read_to_string(&gh_log).unwrap();
         assert!(calls.contains("issue edit 11480 --remove-label loom:building"), "{calls}");
         assert!(!calls.contains("--add-label loom:issue"), "{calls}");
+    }
+
+    /// #11743: the reaper makes no label write at all to a frozen item, not
+    /// even removing the stale `loom:building` claim.
+    #[test]
+    #[serial_test::serial]
+    fn a_frozen_item_gets_no_label_write_on_claim_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) =
+            fake_gh_labels(dir.path(), "open", r#""loom:building","loom:frozen""#);
+        let registry = registry_with(&fake_gh, dir.path());
+
+        registry.restore_label_to_ready(11743).unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(!calls.contains("issue edit"), "{calls}");
     }
 
     /// #9463 regression: merge closes the issue, then the sweep exits — the

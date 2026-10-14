@@ -63,6 +63,7 @@ pub fn start_pause_roll(
                 "state": state,
                 "reason": why,
                 "target_source": target.source.as_str(),
+                "trigger": target.source.as_str(),
                 "to_version": target.to_version,
             }),
         );
@@ -156,6 +157,7 @@ pub fn start_pause_roll(
                 "daemon.roll.pause_started",
                 serde_json::json!({
                     "target_source": target.source.as_str(),
+                    "trigger": target.source.as_str(),
                     "to_version": target.to_version,
                     "from_version": plan.from_version,
                     "pause_budget_secs": tuning.pause_budget.as_secs(),
@@ -253,11 +255,30 @@ pub(crate) fn end_unfinished(
     why: &str,
 ) -> H4Outcome {
     let generation = plan.generation;
-    let note = format!(
-        "PAUSE FAILED (H7 pause-failed): {why} before any agent was stopped. Dispatch resumed; \
-         this host stays on {} until the next roll attempt.",
-        plan.from_version
-    );
+    let note = if drain.then_exit() {
+        format!("PAUSE FAILED (H7 pause-failed): {why} before any agent was stopped.")
+    } else {
+        format!(
+            "PAUSE FAILED (H7 pause-failed): {why} before any agent was stopped. Dispatch \
+             resumed; this host stays on {} until the next roll attempt.",
+            plan.from_version
+        )
+    };
+    // #11812: a then-exit pause (host maintenance) never reopens dispatch. It
+    // falls back to a held then-exit drain, which the caller supervises.
+    if drain.pause_fallback_to_operator_drain(generation, note.clone()) {
+        ledger.undo(host);
+        host.close_dispatch(false, ledger.id());
+        log::error!("pause_roll: {note}");
+        host.emit(
+            "daemon.roll.pause_failed",
+            serde_json::json!({
+                "manifest_id": ledger.id(), "error": why, "fallback": "then-exit-drain",
+                "trigger": plan.target.source.as_str(),
+            }),
+        );
+        return H4Outcome::StoodDown { promoted: true };
+    }
     if drain.pause_abort_uncommitted(generation, note.clone()) {
         ledger.undo(host);
         host.close_dispatch(false, ledger.id());
@@ -265,7 +286,10 @@ pub(crate) fn end_unfinished(
         super::loom_ui::pause_failed(&plan.from_version, &note); // #11295
         host.emit(
             "daemon.roll.pause_failed",
-            serde_json::json!({ "manifest_id": ledger.id(), "error": why }),
+            serde_json::json!({
+                "manifest_id": ledger.id(), "error": why,
+                "trigger": plan.target.source.as_str(),
+            }),
         );
         return H4Outcome::Failed(note);
     }
@@ -285,6 +309,7 @@ pub(crate) fn end_unfinished(
                     "manifest_id": manifest_id,
                     "reason": why,
                     "forced_items": forced,
+                    "trigger": plan.target.source.as_str(),
                     "h4_deadline_secs": plan.tuning.h4_deadline().as_secs(),
                 }),
             );
@@ -305,7 +330,7 @@ pub(crate) fn end_unfinished(
 
 /// The pause supervisor: run H4 off the runtime under its deadline, then act
 /// on how it ended.
-async fn supervise(
+pub(super) async fn supervise(
     drain: Arc<DrainState>,
     workspace_pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,

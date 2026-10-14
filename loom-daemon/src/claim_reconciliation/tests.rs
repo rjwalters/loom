@@ -1086,6 +1086,52 @@ fn reconcile_workspace_skips_reclaim_when_issue_closed_concurrently() {
     std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
 }
 
+/// #11743: an issue frozen after this pass listed it (so the listing still
+/// shows a plain claim) reaches `reclaim_and_warn`'s frozen veto, which writes
+/// nothing. That skip must not be counted as a reclaim, and the journal entry
+/// stays.
+#[test]
+#[serial]
+fn reconcile_workspace_does_not_count_a_frozen_skip_as_a_reclaim() {
+    let dir = tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let repo_str = repo_root.display().to_string();
+    let journal_path = dir.path().join("sweeps.json");
+    std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+    let mut journal = SweepJournal::default();
+    journal.entries.push(journal_entry(&repo_str, 99, 0));
+    sweep_journal::save(&journal_path, &journal).unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = dir.path().join("fake-gh-frozen-race.sh");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+case "$*" in
+  api*--include*) printf 'HTTP/2.0 200 OK\r\n\r\n'
+    echo '[{{"number":99,"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{now}"}}]' ;;
+  *"issues/99 --jq .state"*) echo open ;;
+  *"issues/99 --jq"*) echo '["loom:building","loom:frozen"]' ;;
+esac
+exit 0
+"#,
+        log = gh_log.display(),
+        now = Utc::now().to_rfc3339(),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
+
+    std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    assert_eq!((checked, reclaimed), (1, 0), "a frozen skip is not a reclaim");
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(!gh_calls.contains("issue edit"), "{gh_calls}");
+    assert!(gh_calls.contains("issues/99 --jq [(.labels"), "the veto read ran: {gh_calls}");
+    let after = sweep_journal::load(&journal_path);
+    assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
+}
+
 /// #6263 regression: a single `gh issue edit --remove-label
 /// loom:building --add-label loom:issue` invocation can exit 0 while
 /// only *partially* applying the swap — root cause: `gh` implements
@@ -2917,6 +2963,38 @@ fn reconcile_pr_claims_reclaims_stale_reviewing_and_backfills_state_label() {
     std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
     std::env::remove_var(STALE_TREATING_MINUTES_ENV);
+}
+
+/// #11743: a stale claim on a `loom:frozen` PR is never reclaimed — no
+/// `pr edit` at all, and nothing counted as checked or reclaimed.
+#[test]
+#[serial]
+fn reconcile_pr_claims_leaves_a_frozen_pr_alone() {
+    let dir = tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, dir.path().join("sweeps.json"));
+    std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "30");
+    let gh_log = dir.path().join("gh-invocations.log");
+    let old = (Utc::now() - Duration::minutes(90)).to_rfc3339();
+    let fake_gh = dir.path().join("fake-gh-frozen-pr.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\n{pulls}exit 0\n",
+        log = gh_log.display(),
+        pulls = pulls_arm(&[row(502, &["loom:reviewing", "loom:frozen"])
+            .head("some-random-branch")
+            .updated(&old)]),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (checked, reclaimed) = forge::reconcile_pr_claims(&fake_gh, &repo_root);
+
+    std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+    assert_eq!((checked, reclaimed), (0, 0));
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(!gh_calls.contains("pr edit"), "{gh_calls}");
 }
 
 #[test]
