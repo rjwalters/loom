@@ -291,9 +291,11 @@ pub fn enable_front(next_gh: &Path) {
 /// see the gateway and go to whatever `GH_CONFIG_DIR` it inherited. It
 /// honours [`DIR_ENV`] on the front's terms: only when the `gh` the facade
 /// will exec ([`crate::gh_invocation::resolver::resolve`]) is the one the
-/// daemon version-checked, and not during a front outage. The variable
+/// daemon version-checked, and not during a front outage, from a checked base
+/// ([`publish::safe_base`]). The variable
 /// names a directory, never a key. A no-op in the daemon, whose own
-/// published set always wins ([`profile_for`]), and once per process; unset,
+/// published set always wins ([`profile_for`]), and once per process (also a
+/// no-op after [`enable_front`] ran in the same process); unset,
 /// nothing changes. A CLI that makes forge reads calls it before the first.
 pub fn enable_cli() {
     if DAEMON.get().is_some() {
@@ -311,11 +313,13 @@ fn cli_base(dir_env: Option<OsString>, program: &str, now: SystemTime) -> Option
 }
 
 /// The base directory a non-daemon process may route through: [`DIR_ENV`]'s
-/// value, when set, its marker names `gh` and no front outage holds.
+/// value, when set, a [`publish::safe_base`], its marker names `gh` and no
+/// front outage holds.
 fn front_base(dir_env: Option<OsString>, gh: &Path, now: SystemTime) -> Option<PathBuf> {
     dir_env
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+        .filter(|base| publish::safe_base(base))
         .filter(|base| publish::gh_marker_matches(base, gh))
         .filter(|base| !outage::front_outage_active(base, now))
 }
@@ -346,7 +350,12 @@ pub fn profile_for(owner: &str) -> Option<PathBuf> {
         FRONT.get()?.clone()?
     };
     let dir = base.join(&owner);
-    dir.join("hosts.yml").is_file().then_some(dir)
+    if !dir.join("hosts.yml").is_file() {
+        return None;
+    }
+    // A front or CLI takes the base from its environment: check the profile
+    // too. The daemon routes only what it published itself.
+    (DAEMON.get().is_some() || publish::safe_profile(&dir)).then_some(dir)
 }
 
 /// The variables an agent session gets: `GH_NO_UPDATE_NOTIFIER=1` always,
