@@ -38,6 +38,7 @@ fn ctx() -> WeighContext {
         build_backoff_engaged: false,
         pool_exhausted_roles: BTreeSet::new(),
         workspace_idx: 0,
+        cooldowns: Default::default(),
     }
 }
 
@@ -152,6 +153,34 @@ fn passes_backoff_and_exhausted_pools_are_excluded_and_counted() {
             ("build_backoff", 1)
         ]
     );
+}
+
+/// #11900: the ledger's query zeroes `actionable` for a cooling
+/// `(item, step)` only, at the tick's clock; the draw keys PR steps on the PR.
+#[test]
+fn a_cooling_item_step_is_excluded_and_counted() {
+    let pr_judge = DrawInput {
+        item: item(Some(3), Some(40), Verdict::Step(Step::Judge), Lane::Normal),
+        ..step_input(3, Step::Judge, &[], "2026-10-01T00:00:00Z")
+    };
+    let inputs = vec![
+        step_input(1, Step::Builder, &["loom:issue"], "2026-10-01T00:00:00Z"),
+        step_input(2, Step::ChampionReevaluate, &["loom:curated"], "2026-10-01T00:00:00Z"),
+        pr_judge,
+    ];
+    let mut c = ctx();
+    c.cooldowns
+        .insert(1, StepRole::Builder, now() + chrono::Duration::minutes(5));
+    c.cooldowns
+        .insert(1, StepRole::Curator, now() + chrono::Duration::hours(5));
+    c.cooldowns
+        .insert(2, StepRole::ChampionPromote, now() + chrono::Duration::hours(6));
+    c.cooldowns.insert(40, StepRole::Judge, now());
+    let w = weigh(&inputs, &c, &ItemWeights::default());
+    assert_eq!(w.excluded.get(&Exclusion::CoolingDown), Some(&2));
+    let pooled: Vec<u32> = w.pool.iter().map(Candidate::target).collect();
+    assert_eq!(pooled, vec![40], "a window ending now has lapsed");
+    assert_eq!(Exclusion::CoolingDown.as_str(), "cooling_down");
 }
 
 #[test]

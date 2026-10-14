@@ -104,6 +104,7 @@ pub use coordination_idle::{
     DEFAULT_ADVERTISE_ACTIVITY_WINDOW,
 };
 pub use fast_fail_tally::MAX_PEER_FAST_FAIL_STREAK_AGE;
+pub use steps::MAX_PEER_STEP_COOLDOWN;
 
 mod send_health;
 pub use send_health::{
@@ -352,6 +353,10 @@ pub enum ClaimKind {
     /// while every peer stayed suppressed for up to 15 more minutes —
     /// converting a latency win into a fleet-wide stall.
     PoolHoldCleared,
+    /// "I armed a step cooldown on `(issue, step)`, `remaining_secs` left"
+    /// (#11900): the step-outcome ledger's short window, keyed by the ad's
+    /// `step`. Zero is a clear. See `steps.rs`.
+    StepCooldownArmed,
     /// "I am alive" (Issue #8736) — a periodic liveness signal published
     /// every reaper tick **regardless of live-sweep count**, unlike
     /// [`ClaimKind::Advertise`] (entirely dispatch-gated). Closes the
@@ -397,6 +402,7 @@ impl ClaimKind {
             ClaimKind::PrlessReleaseArmed => "prless_release_armed",
             ClaimKind::PoolHoldArmed => "pool_hold_armed",
             ClaimKind::PoolHoldCleared => "pool_hold_cleared",
+            ClaimKind::StepCooldownArmed => "step_cooldown_armed",
             ClaimKind::Heartbeat => "heartbeat",
         }
     }
@@ -414,6 +420,7 @@ impl ClaimKind {
             "prless_release_armed" => Some(ClaimKind::PrlessReleaseArmed),
             "pool_hold_armed" => Some(ClaimKind::PoolHoldArmed),
             "pool_hold_cleared" => Some(ClaimKind::PoolHoldCleared),
+            "step_cooldown_armed" => Some(ClaimKind::StepCooldownArmed),
             "heartbeat" => Some(ClaimKind::Heartbeat),
             _ => None,
         }
@@ -448,6 +455,7 @@ impl ClaimKind {
             ClaimKind::NoopCooldownArmed
                 | ClaimKind::DispatchBackoffArmed
                 | ClaimKind::PrlessReleaseArmed
+                | ClaimKind::StepCooldownArmed
         )
     }
 
@@ -1253,6 +1261,8 @@ pub struct PeerClaimView {
     ///   for diagnostics, exactly as the filing lane does for its own
     ///   fleet-wide hold.
     pool_holds: HashMap<(String, String), Instant>,
+    /// Peer step cooldowns (#11900), `(repo, item, step)` → local expiry.
+    step_cooldowns: HashMap<(String, u32, crate::step_role::StepRole), Instant>,
     /// Publish-side health (Issue #9294): whether safehoused is currently
     /// **accepting** this host's claim ads at all. See [`send_health`] — a
     /// refused send is direct proof the channel is one-way, which every other
@@ -1307,6 +1317,7 @@ impl PeerClaimView {
             prless_releases: HashMap::new(),
             fast_fail_streaks: HashMap::new(),
             pool_holds: HashMap::new(),
+            step_cooldowns: HashMap::new(),
             send_health: ClaimSendHealth::default(),
             last_coordination_reason: None,
             degraded_cause_publish: false,
@@ -1484,6 +1495,7 @@ impl PeerClaimView {
             | ClaimKind::PrlessReleaseArmed
             | ClaimKind::PoolHoldArmed
             | ClaimKind::PoolHoldCleared
+            | ClaimKind::StepCooldownArmed
             | ClaimKind::Heartbeat => {
                 unreachable!("returned above")
             }

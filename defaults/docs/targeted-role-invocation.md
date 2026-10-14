@@ -98,7 +98,7 @@ the same place as `loom:frozen`, writing nothing:
 Every targeted step ends in exactly one class. The class decides what the
 step-outcome ledger does next, so the four must be told apart:
 
-| Class | Meaning | Ledger effect (proposed) |
+| Class | Meaning | Ledger effect (#11900) |
 |---|---|---|
 | `verdict` | The role reached a decision that moved the item: Judge approved or requested changes, Builder opened a PR or parked the issue, Curator curated, parked or closed it | none; the next step comes from the labels |
 | `noop` | The role took (or evaluated) the item and found nothing to do | the existing per-item no-op cooldown |
@@ -183,10 +183,12 @@ without a sweep around it gets neither unless the engine does both.
   `/loom:curator <N>` still claims by label, with `claim-staleness.sh` and
   `stale_after_minutes` (`loom:curating`, 30) as the liveness, until its
   prompt is taught the lease.
-- **The classifier itself.** The step spawn (#11906) reads a step's last
+- **The classifier.** The step spawn (#11906) reads a step's last
   `LOOM_STEP_OUTCOME` line from its log into its end record and role-tick
-  capture; nothing applies the post-state table yet. The step-outcome ledger
-  implements it.
+  capture. The step-outcome ledger (#11900,
+  `loom-daemon/src/step_dispatch/outcome_ledger.rs`) parses
+  `LOOM_STEP_OUTCOME` and `CHAMPION-STEP`, applies the post-state rule
+  (`classify`) and maps each class to its effect.
 - **Doctor** was out of this audit's scope (it was already targeted). Its PR
   Fix Mode has no kind probe: it should take gate 2 of the Judge row.
 - **The Judge lane assigner** hands fallback rows to `/loom:judge <PR>`. The
