@@ -65,8 +65,13 @@ pub struct EventsPage {
 /// Read `label`'s latest `labeled` event (and every other label time the
 /// pages read can vouch for) through `read`, which returns page `n` or
 /// `None` on failure, spending at most `max_pages` reads (at least one, at
-/// most [`MAX_PAGES`]). A multi-page item read with a budget of one page is
-/// unanswered (`times: None`).
+/// most [`MAX_PAGES`]).
+///
+/// A walk the **caller's budget** stopped (`max_pages` below
+/// [`MAX_PAGES`]) before it saw the label or reached page 2 is unanswered
+/// (`times: None`): the label may sit on a page the budget skipped, and a
+/// caller caches "not found". Only a walk stopped by the [`MAX_PAGES`] cap
+/// itself answers "not found" for a label it never saw.
 pub fn walk(
     mut read: impl FnMut(u32) -> Option<EventsPage>,
     label: &str,
@@ -99,12 +104,6 @@ pub fn walk(
             tail.entry(name).or_insert(at);
         }
         lowest = page;
-    }
-    if lowest > last {
-        // The budget allowed page 1 alone: on a multi-page item that answers
-        // nothing (its times may all be superseded), so it is unanswered,
-        // not "not found".
-        return LabelTimes { times: None, pages };
     }
     if lowest > 2 && max_pages < MAX_PAGES && !has(&tail, label) {
         // The caller's budget (not the cap) stopped the walk short of page 2

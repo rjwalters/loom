@@ -377,3 +377,73 @@ fn a_re_read_that_misses_the_label_keeps_the_time_already_known() {
     at(&mut p, &mut f, &moved, past + Duration::days(1));
     assert_eq!(f.reads, [14, 14]);
 }
+
+/// A cached `loom:pr` time for `number`, read at `now()` when the item's
+/// `updated_at` was earlier than the row's, so the next ask past the
+/// window is a re-read.
+fn known(p: &mut StageEntryProvider, number: u32, at: &str) {
+    p.cache.insert(
+        key(REPO, number, "loom:pr"),
+        Cached {
+            at: Some(t(at)),
+            read_at: now() - Duration::seconds(REVALIDATE_SECS),
+            updated_at: Some("2026-10-01T00:00:00Z".to_string()),
+        },
+    );
+}
+
+fn moved(number: u32) -> RestIssue {
+    updated(item(number, &["loom:pr"], Some("2026-09-01T00:00:00Z")), "2026-10-14T11:00:00Z")
+}
+
+#[test]
+fn first_time_reads_take_the_budget_before_re_reads() {
+    let mut f = FakeEvents::default()
+        .with(21, "loom:pr", "2026-10-12T00:00:00Z")
+        .with(22, "loom:pr", "2026-10-12T00:00:00Z")
+        .with(23, "loom:pr", "2026-10-12T00:00:00Z");
+    let mut p = provider(4);
+    known(&mut p, 21, "2026-10-08T00:00:00Z");
+    known(&mut p, 22, "2026-10-08T00:00:00Z");
+    // Re-reads may spend only the half not kept for first-time reads.
+    assert_eq!(
+        ask(&mut p, &mut f, &moved(21), "loom:pr").unwrap().at,
+        t("2026-10-12T00:00:00Z")
+    );
+    assert_eq!(
+        ask(&mut p, &mut f, &moved(22), "loom:pr").unwrap().at,
+        t("2026-10-12T00:00:00Z")
+    );
+    assert_eq!(f.allowed, [2, 1], "never into the reserved half");
+    assert_eq!(p.budget_left(), 2);
+    known(&mut p, 24, "2026-10-08T00:00:00Z");
+    assert_eq!(
+        ask(&mut p, &mut f, &moved(24), "loom:pr").unwrap().at,
+        t("2026-10-08T00:00:00Z")
+    );
+    assert_eq!(f.reads, [21, 22], "the reserve is not a re-read's");
+    // A first-time read still has it.
+    let fresh = item(23, &["loom:pr"], Some("2026-09-01T00:00:00Z"));
+    assert_eq!(ask(&mut p, &mut f, &fresh, "loom:pr").unwrap().source, Source::Events);
+
+    // A tick in which a first-time read went unserved: no re-reads in it or
+    // the next one.
+    let mut p = provider(2);
+    known(&mut p, 21, "2026-10-08T00:00:00Z");
+    let mut f = FakeEvents::default().with(21, "loom:pr", "2026-10-12T00:00:00Z");
+    for n in [30, 31, 32] {
+        ask(&mut p, &mut f, &item(n, &["loom:pr"], Some("2026-09-01T00:00:00Z")), "loom:pr");
+    }
+    assert_eq!(f.reads, [30, 31], "#32 found the budget spent");
+    p.begin_tick();
+    assert_eq!(
+        ask(&mut p, &mut f, &moved(21), "loom:pr").unwrap().at,
+        t("2026-10-08T00:00:00Z")
+    );
+    assert_eq!(f.reads, [30, 31], "the tick after a starved one re-reads nothing");
+    p.begin_tick();
+    assert_eq!(
+        ask(&mut p, &mut f, &moved(21), "loom:pr").unwrap().at,
+        t("2026-10-12T00:00:00Z")
+    );
+}

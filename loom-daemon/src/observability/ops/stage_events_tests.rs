@@ -204,3 +204,15 @@ fn the_last_page_comes_from_the_link_header_only() {
     assert_eq!(parse_page("HTTP/2.0 404 Not Found\r\n\r\n{\"message\": \"Not Found\"}"), None);
     assert_eq!(parse_page("not an http response"), None);
 }
+
+#[test]
+fn a_budget_stop_that_saw_the_label_answers() {
+    let mut item = Item::new(vec![
+        filler(100),
+        filler(1),
+        vec![labeled("x", "2026-09-03T00:00:00Z")],
+    ]);
+    let read = item.walk("x", 2);
+    assert_eq!(item.reads, [1, 3]);
+    assert_eq!(read.times.unwrap()["x"], t("2026-09-03T00:00:00Z"));
+}

@@ -35,8 +35,11 @@
 //!   removal and re-application between two listings moves `updated_at`
 //!   (as any other change to the item does), so an entry whose item has
 //!   moved on is re-read, at most once per [`REVALIDATE_SECS`], whenever the
-//!   budget allows. Only with the budget spent is the old time served,
-//!   until a read is possible; it is still closer than `created`.
+//!   budget allows. First-time reads come first: a re-read never spends the
+//!   half of the budget kept for them, nor any budget in a tick after one
+//!   where a first-time read went unserved. Until a re-read happens the old
+//!   time is served; it is still closer than `created`. A re-read that does
+//!   not see the label keeps it too.
 //!
 //! What the events cannot tell: adding a label an item already carries
 //! records no `labeled` event (and leaves the label's time unchanged on
@@ -200,6 +203,10 @@ pub struct StageEntryProvider {
     path: Option<PathBuf>,
     budget: usize,
     left: usize,
+    /// A first-time read (an item with no time yet) found the budget spent
+    /// this tick / last tick: re-reads then wait (#11924).
+    starved: bool,
+    starved_last: bool,
     dirty: bool,
 }
 
@@ -232,6 +239,8 @@ impl StageEntryProvider {
             path,
             budget,
             left: budget,
+            starved: false,
+            starved_last: false,
             dirty: false,
         }
     }
@@ -239,6 +248,19 @@ impl StageEntryProvider {
     /// Start a tick: the events budget is whole again.
     pub fn begin_tick(&mut self) {
         self.left = self.budget;
+        self.starved_last = std::mem::take(&mut self.starved);
+    }
+
+    /// Pages a re-read of an already-known time may spend now. First-time
+    /// reads come first: re-reads never touch the half of the budget kept
+    /// for them, and wait out any tick (this one or the last) in which a
+    /// first-time read went unserved, so a busy item cannot starve one that
+    /// has no time yet.
+    fn reread_allowance(&self) -> usize {
+        if self.starved || self.starved_last {
+            return 0;
+        }
+        self.left.saturating_sub(self.budget / 2)
     }
 
     /// Events reads left this tick.
@@ -297,7 +319,9 @@ impl StageEntryProvider {
     /// The cached events time, else (budget permitting) one events read
     /// that caches every carried label's time. A found time whose item has
     /// been updated since it was read is re-read when the budget allows (at
-    /// most once per [`REVALIDATE_SECS`]), else served as it stands.
+    /// most once per [`REVALIDATE_SECS`]) and first-time reads leave room
+    /// ([`Self::reread_allowance`]), else served as it stands. A re-read
+    /// that does not see the label keeps the known time.
     fn events_time(
         &mut self,
         events: &mut impl EventsSource,
@@ -324,10 +348,16 @@ impl StageEntryProvider {
             }
             stale_time = cached.at;
         }
-        if self.left == 0 {
+        let allowance = if stale_time.is_some() {
+            self.reread_allowance()
+        } else {
+            self.left
+        };
+        if allowance == 0 {
+            self.starved |= stale_time.is_none();
             return stale_time;
         }
-        let read = events.label_times(root, slug, item.number, label, self.left);
+        let read = events.label_times(root, slug, item.number, label, allowance);
         self.left = self.left.saturating_sub(read.pages.max(1));
         let Some(times) = read.times else {
             return stale_time;
@@ -343,6 +373,9 @@ impl StageEntryProvider {
                 self.cache.insert(key(slug, item.number, name), cached);
             }
         }
+        // A re-read that did not reach the label (it lies further back than
+        // the pages read) keeps the time already known rather than
+        // forgetting it as "not found".
         let found = times
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(label))
