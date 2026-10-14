@@ -531,18 +531,27 @@ pub fn forge_queue_probe() -> QueueProbe {
 
 /// The PR role whose queue may serve a Champion hold on its round trip in
 /// `rows` of queue `label` (#11861), when any row has that shape.
+///
+/// A Doctor-shaped row whose body declares a Doctor-cycle-cap park and no
+/// Champion hold record is an ordinary capped PR (#11905): Doctor's queue
+/// never serves it, so it must not cost a cached queue read every tick.
 fn round_trip_role(
     label: &str,
     rows: &[crate::forge_listing::RestIssue],
 ) -> Option<crate::pr_planning::PrRole> {
+    use crate::champion_hold::{body_declares_doctor_cap, body_declares_hold};
     use crate::champion_hold::{doctor_shape, judge_shape};
+    use crate::forge_listing::RestIssue;
     use crate::pr_planning::PrRole;
-    let (role, shape): (PrRole, fn(&[String]) -> bool) = match label {
-        "loom:changes-requested" => (PrRole::Doctor, |l| doctor_shape(l)),
-        "loom:review-requested" => (PrRole::Judge, |l| judge_shape(l)),
+    let (role, shape): (PrRole, fn(&RestIssue) -> bool) = match label {
+        "loom:changes-requested" => (PrRole::Doctor, |r| {
+            let body = r.body.as_deref().unwrap_or("");
+            doctor_shape(&r.labels) && (body_declares_hold(body) || !body_declares_doctor_cap(body))
+        }),
+        "loom:review-requested" => (PrRole::Judge, |r| judge_shape(&r.labels)),
         _ => return None,
     };
-    rows.iter().any(|r| shape(&r.labels)).then_some(role)
+    rows.iter().any(shape).then_some(role)
 }
 
 /// The `gh` binary the gate listings use: `LOOM_GH_BIN` when set, else the

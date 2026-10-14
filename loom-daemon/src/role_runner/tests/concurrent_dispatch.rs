@@ -1025,3 +1025,43 @@ fn curator_keeps_round_robin_for_unobserved_roots() {
     ledger.record_untriaged(&b, 40);
     assert_eq!(curator_order(ledger, &paths), vec![a, b]);
 }
+
+/// #11905: an ordinary Doctor-cycle-capped PR (`loom:changes-requested` +
+/// `loom:blocked`, a cap park record, no Champion hold record) no longer
+/// sends the gate to Doctor's queue; a Champion hold on its round trip still
+/// does, capped or not (its queue decides from the trusted marker).
+#[test]
+fn a_capped_pr_with_no_hold_record_skips_the_doctor_queue_read() {
+    use crate::champion_hold::{CRITICAL_FILE_HOLD_REASON, DOCTOR_CYCLE_CAP_MARKER};
+    let record = |reason: &str| {
+        crate::park_record::render_park(&[], Some("x"), Some("2026-10-14T00:00:00Z"), Some(reason))
+    };
+    let with_body = |body: String| {
+        let mut r = row(1, true, &["loom:changes-requested", "loom:blocked"]);
+        r.body = Some(body);
+        r
+    };
+    let label = "loom:changes-requested";
+    let capped = with_body(record("doctor cycle exhausted"));
+    assert_eq!(round_trip_role(label, std::slice::from_ref(&capped)), None);
+    assert_eq!(
+        round_trip_role(label, &[with_body(format!("x\n{DOCTOR_CYCLE_CAP_MARKER}"))]),
+        None
+    );
+    let held = with_body(record(CRITICAL_FILE_HOLD_REASON));
+    assert_eq!(
+        round_trip_role(label, std::slice::from_ref(&held)),
+        Some(crate::pr_planning::PrRole::Doctor)
+    );
+    let both =
+        with_body(format!("{}\n{}", record(CRITICAL_FILE_HOLD_REASON), record("doctor cap")));
+    assert_eq!(round_trip_role(label, &[both]), Some(crate::pr_planning::PrRole::Doctor));
+    // No record at all: the label shape alone still asks (a hold whose body
+    // record a human edited away).
+    let bare = row(2, true, &["loom:changes-requested", "loom:blocked"]);
+    assert_eq!(round_trip_role(label, &[bare]), Some(crate::pr_planning::PrRole::Doctor));
+    assert_eq!(
+        round_trip_role(label, &[capped, held]),
+        Some(crate::pr_planning::PrRole::Doctor)
+    );
+}

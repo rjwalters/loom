@@ -181,3 +181,20 @@ fn a_many_repo_sample_survives_the_per_record_bound() {
         "dwell pairs lead the first batch"
     );
 }
+
+/// #11905: held approvals (`loom:pr` + `loom:blocked`, by label) are their own
+/// state, so they stay visible once they leave `loom:operator`; an
+/// operator-held approval is not counted twice.
+#[test]
+fn champion_held_prs_are_a_sibling_state() {
+    let rows = [
+        row(40, &["loom:pr", "loom:blocked"], Some("")),
+        row(41, &["loom:pr", "loom:blocked", "loom:operator"], Some("")),
+        row(42, &["loom:pr", "loom:operator"], Some("")),
+        row(43, &["loom:changes-requested", "loom:blocked"], Some("")),
+        row(44, &["loom:pr", "loom:blocked"], None),
+    ];
+    let c = counts(&rows);
+    assert_eq!(c["pr_champion_held"], 1, "PR 40 only; 44 is an issue");
+    assert_eq!(c["pr_held"], 4, "pr_held is unchanged and a superset");
+}
