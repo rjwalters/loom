@@ -452,8 +452,8 @@ pub fn script_runner_factory() -> RunnerFactory {
 /// on rows of the queue's own kind ([`queue_rows_have_work`], #9929), never on the
 /// raw row count. The PR rows it saw are recorded in
 /// the demand ledger (#9392) — the same listing, no second call. Changes debt
-/// leaves out PRs Doctor will not drain (`loom:blocked` /
-/// `loom:operator-only`, #9421); review debt is unfiltered
+/// leaves out PRs Doctor will not drain (the PR-lane parks, e.g.
+/// `loom:blocked`, #9421); review debt is unfiltered
 /// ([`demand::count_axis_rows`]). The gate opens on
 /// [`demand::listing_has_work`], so an all-parked Doctor queue stays shut
 /// (#9435).

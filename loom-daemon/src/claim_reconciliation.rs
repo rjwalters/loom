@@ -1365,7 +1365,7 @@ impl VerdictKind {
 /// still stale, but clearing it would silently un-park the PR, so this pass
 /// leaves it alone (mirrors `verdict-staleness-guard.sh`'s `--clear`
 /// suppression and doctor.md's Priority-2 `PARK_LABELS` exclusion).
-pub const VERDICT_HOLD_LABELS: [&str; 4] = pr_label_info::VERDICT_HOLDS;
+pub use pr_label_info::VERDICT_HOLDS as VERDICT_HOLD_LABELS;
 
 /// An open PR carrying a terminal verdict label, trimmed to the fields the
 /// staleness decision needs.

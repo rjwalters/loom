@@ -390,7 +390,8 @@ pub fn record_gh_actions(raw: &[OsString]) {
 // ---------------------------------------------------------------------------
 
 /// The role action a label write means (one of `ROLE_ACTIONS`), or `None`
-/// for a label that is not a Loom workflow label.
+/// for a label that is not a Loom workflow label. A retired hold name reads as
+/// the hold it folds into (#11795).
 #[must_use]
 pub fn action_for_label(label: &str) -> Option<&'static str> {
     Some(match label {
@@ -400,8 +401,8 @@ pub fn action_for_label(label: &str) -> Option<&'static str> {
         "loom:changes-requested" => "changes_requested",
         "loom:curated" => "curated",
         "loom:issue" => "promoted",
-        "loom:blocked" => "blocked",
-        "loom:operator" | "loom:operator-only" | "loom:operator-decision" => "escalated",
+        l if crate::work_finder::BLOCKED_HOLD_NAMES.contains(&l) => "blocked",
+        l if crate::work_finder::OPERATOR_HOLD_NAMES.contains(&l) => "escalated",
         l if l.starts_with("loom:") => "labeled",
         _ => return None,
     })
@@ -419,14 +420,9 @@ pub fn known_action(action: &str) -> Option<&'static str> {
 #[must_use]
 pub fn skip_reason_for_labels(labels: &[String]) -> Option<PickSkipReason> {
     let has = |set: &[&str]| labels.iter().any(|l| set.contains(&l.as_str()));
-    if has(&[
-        "loom:operator",
-        "loom:operator-only",
-        "loom:operator-decision",
-        "loom:operator-mechanical",
-    ]) {
+    if crate::work_finder::is_operator_hold(labels) {
         Some(PickSkipReason::OperatorHold)
-    } else if has(&["loom:blocked", "loom:ci-failure"]) {
+    } else if crate::work_finder::is_blocked_hold(labels) || has(&["loom:ci-failure"]) {
         Some(PickSkipReason::Blocked)
     } else if has(&["loom:sequenced"]) {
         Some(PickSkipReason::OverlapChain)

@@ -414,11 +414,16 @@ fn review_debt_counts_held_and_parked_prs() {
 }
 
 #[test]
-fn changes_park_set_is_the_work_finder_park_set() {
-    // #9421: the changes exclusion reuses `work_finder::PARK_LABELS` rather
-    // than a second literal list, and deliberately differs from the merge
-    // hold set by `loom:operator` (#7660).
-    assert_eq!(axis_park_labels(DebtAxis::Changes), crate::work_finder::PARK_LABELS.as_slice());
+fn changes_park_set_is_the_pr_lane_park_set() {
+    // #9421: the changes exclusion reuses the work finder's derived park set
+    // rather than a second literal list, and deliberately differs from the
+    // merge hold set by `loom:operator` (#7660). #11795: that is the PR-lane
+    // set, since loom:operator parks an issue but not a PR.
+    assert_eq!(
+        axis_park_labels(DebtAxis::Changes),
+        crate::work_finder::PR_LANE_PARK_LABELS.as_slice()
+    );
+    assert!(crate::work_finder::PARK_LABELS.contains(&"loom:operator"));
     assert!(!axis_park_labels(DebtAxis::Changes).contains(&"loom:operator"));
     assert_eq!(axis_park_labels(DebtAxis::Merge), &MERGE_HOLD_LABELS[..]);
     // #11743: the review axis parks only `loom:frozen`; merge holds include it.
