@@ -118,6 +118,7 @@ pub use model::generate_sweep_id;
 mod config_paths;
 mod decline_cooldown;
 mod dispatch;
+mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
 mod journal_shadow;

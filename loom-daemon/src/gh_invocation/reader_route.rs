@@ -42,6 +42,7 @@
 
 use super::{AccessIntent, GhCompletion, GhInvocation, OutputContract};
 use crate::forge_bucket_book::Resource;
+use crate::forge_gateway::outage::Fault;
 use crate::forge_identity::{self, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest};
 use crate::proc_exec::{Completion, ExecError};
 
@@ -99,6 +100,7 @@ impl GhInvocation {
         let Some((dir, app_id)) = lookup(&request).into_credential() else {
             return self.execute_direct();
         };
+        let outage = std::cell::Cell::new(false);
         forge_identity::reader_then_writer(
             Some(dir.as_path()),
             |reader_dir, role| {
@@ -113,13 +115,54 @@ impl GhInvocation {
                 .execute_direct()
             },
             succeeded,
-            |result| failure_of(result, resource),
+            |result| {
+                // 2am#4367 P4: a gateway outage falls back to the writer
+                // (legacy routing has no reader spill) and withdraws the
+                // gateway for the default window, not as a credential.
+                if app_id == crate::forge_gateway::GATEWAY_APP_ID {
+                    let fault = gateway_fault(result);
+                    if fault.reruns() {
+                        outage.set(true);
+                        if fault == Fault::Withdraw {
+                            withdraw_gateway_outage(self.operation.as_str());
+                        }
+                        return Some(Failure::Credential);
+                    }
+                }
+                failure_of(result, resource)
+            },
             |failure, _| {
+                if outage.get() {
+                    return;
+                }
                 let why = format!("{} via the gh choke point", self.operation.as_str());
                 withdraw(&app_id, &slug, failure, &why);
             },
         )
     }
+}
+
+/// What a failed gateway attempt calls for
+/// ([`crate::forge_gateway::outage::fault`]); a timeout reruns.
+pub(super) fn gateway_fault(result: &GhCompletion) -> Fault {
+    let out = match result {
+        GhCompletion::Captured(Completion::TimedOut { .. }) => return Fault::Rerun,
+        GhCompletion::Captured(Completion::Exited(out)) if !out.status.success() => out,
+        _ => return Fault::None,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let response = crate::forge_listing::parse_http_response(&stdout);
+    crate::forge_gateway::outage::fault(
+        response.as_ref(),
+        &stdout,
+        &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+/// Withdraw the gateway after an outage
+/// ([`crate::forge_gateway::outage::withdraw_for_outage`]).
+pub(super) fn withdraw_gateway_outage(why: &str) {
+    crate::forge_gateway::outage::withdraw_for_outage(why);
 }
 
 /// A captured run that exited 0.
@@ -171,3 +214,7 @@ mod tests;
 #[cfg(test)]
 #[path = "reader_route_v2_tests.rs"]
 mod v2_tests;
+
+#[cfg(test)]
+#[path = "reader_route_gateway_tests.rs"]
+mod gateway_tests;

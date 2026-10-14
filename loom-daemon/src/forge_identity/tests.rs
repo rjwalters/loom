@@ -350,6 +350,10 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // under the repo's reader (token env stripped) for visibility and
         // identity only; the write-scope probe passes the writer explicitly.
         "forge_repo_facts/installation.rs",
+        // 2am#4367 P4: the gateway-first router wraps `route_read` (and its
+        // tests compare the two); the gateway itself is a reviewed read path.
+        "forge_gateway.rs",
+        "forge_gateway/tests.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let re = regex::Regex::new(

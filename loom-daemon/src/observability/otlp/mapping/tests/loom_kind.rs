@@ -157,6 +157,9 @@ fn samples() -> Vec<TelemetryRecord> {
                     "stage": "doctor", "role": "doctor", "sweep_id": "s",
                     "stage_attempt": 1, "started_at": AT, "source": "sweep_checkpoint",
                     "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "backlog.level", "repo": "rjwalters/loom", "open": 412,
+                    "target": 140, "level": "strict", "dispatch_id": "role-curator-x",
+                    "observed_at": AT, "loom": p})),
     ]
 }
 

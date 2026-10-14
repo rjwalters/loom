@@ -18,6 +18,30 @@ pub(crate) const VERDICT_HOLDS: [&str; 4] = [
     "loom:frozen",
 ];
 
+/// The PR-side claim pass's listing less every `loom:frozen` PR (#11743):
+/// `reconcile_pr_claims` must not remove a stale `loom:reviewing` /
+/// `loom:treating` from a frozen PR, nor backfill `loom:review-requested`.
+/// It decides on the listing's own labels, so it adds no read. Defined here
+/// because `claim_reconciliation.rs` is size-frozen.
+pub(super) fn drop_frozen_claims(
+    rows: Vec<crate::forge_pull_listing::RestPull>,
+    claim_label: &str,
+) -> Vec<crate::forge_pull_listing::RestPull> {
+    rows.into_iter()
+        .filter(|r| {
+            let frozen = crate::work_finder::is_frozen(&r.labels);
+            if frozen {
+                log::info!(
+                    "claim_reconciliation: PR #{} is `loom:frozen` — leaving its {claim_label} \
+                     claim alone (#11743)",
+                    r.number
+                );
+            }
+            !frozen
+        })
+        .collect()
+}
+
 /// The PR's currently-applied state labels plus its draft status (a
 /// best-effort subset of the REST `pulls/{n}` body — `labels[].name` and
 /// `draft` — used only to decide whether [`super::forge::reclaim_pr`]'s

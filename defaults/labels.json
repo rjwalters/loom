@@ -1316,6 +1316,36 @@
       "replaced_by": null,
       "owned": true,
       "retired_in": "#11105"
+    },
+    {
+      "name": "loom:ready",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11818"
+    },
+    {
+      "name": "loom:approved",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11818"
+    },
+    {
+      "name": "loom:in-progress",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11818"
+    },
+    {
+      "name": "loom:pr-feedback",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11818"
+    },
+    {
+      "name": "loom:worked-example",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11818"
     }
   ]
 }

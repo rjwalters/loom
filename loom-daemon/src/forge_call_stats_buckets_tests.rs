@@ -66,6 +66,7 @@ fn attributed(pg: Option<u32>) -> CallAttribution {
         pu: None,
         rd: Some(true),
         fr: None,
+        rt: None,
     }
 }
 

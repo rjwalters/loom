@@ -258,7 +258,7 @@ pub use drain_status::{DrainRollStatus, PauseRollStatus, MAX_DRAIN_PENDING_BUDGE
 pub mod drain_state;
 pub use drain_state::{
     evaluate_drain_tick, AbortOutcome, DrainBegin, DrainDescriptor, DrainOrigin, DrainState,
-    DrainTick, PauseOwnership, ResumeHold,
+    DrainTick, MaintenanceBegin, PauseOwnership, ResumeHold, TookOver,
 };
 /// `DrainAndRestartDaemon` handling and the drain supervisor — see the module doc.
 pub mod drain_supervisor;
@@ -776,6 +776,22 @@ async fn handle_client(
             );
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            continue;
+        }
+
+        // #11812: host maintenance. Acked at once; H4 runs on its supervisor.
+        if let Request::PauseThenExit = request {
+            let response = crate::auto_update::pause_roll::maintenance::handle_request(
+                &drain_state,
+                &workspace_pool,
+                &fallback_root,
+                &event_bus,
+            );
+            writer
+                .write_all(serde_json::to_string(&response)?.as_bytes())
+                .await?;
             writer.write_all(b"\n").await?;
             writer.flush().await?;
             continue;
@@ -3386,7 +3402,7 @@ fn handle_request(
         Request::ReadIssueState { .. } => Response::Error {
             message: "internal: ReadIssueState is handled by handle_client".to_string(),
         },
-        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
+        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain | Request::PauseThenExit => {
             // Structurally unreachable: `handle_client` intercepts both drain
             // requests (#4090) before dispatching here, because a drain must ack
             // immediately and exit from a background supervisor task minutes

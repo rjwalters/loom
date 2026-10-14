@@ -140,7 +140,13 @@ open_enum!(
 );
 open_enum!(
     /// What triggered the roll.
-    TargetSource { Floor => "floor", RepoAhead => "repo_ahead", ConfigRestart => "config_restart", AutoUpdate => "autoupdate" }
+    TargetSource {
+        Floor => "floor", RepoAhead => "repo_ahead", ConfigRestart => "config_restart",
+        AutoUpdate => "autoupdate",
+        // #11812: `loom-daemon restart --pause --then-exit`. Not a version roll:
+        // the host itself is changed while the daemon is down.
+        HostMaintenance => "host-maintenance",
+    }
 );
 
 /// Who wrote the manifest.

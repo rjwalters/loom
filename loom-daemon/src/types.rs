@@ -599,6 +599,16 @@ pub enum Request {
     /// fires — even if the in-flight count subsequently reaches zero on its own.
     /// A no-op (idempotent) when no drain is in progress.
     AbortDrain,
+    /// Host maintenance (#11812, `loom-daemon restart --pause --then-exit`):
+    /// run the version roll's H4 pause (same safe points, manifest and lease
+    /// refresh, `trigger = host-maintenance`), then exit and **stay down**. The
+    /// next start's H5 resumes the manifest. Takes over an operator drain (in
+    /// progress or timed out), a startup hold or a fleet hold without
+    /// reopening dispatch; escalates a pause roll already in H4 to stay down;
+    /// refused while H5 is resuming or a live manifest exists. A new variant,
+    /// not a flag on [`Request::DrainAndRestartDaemon`]: an older daemon must
+    /// reject it, never silently run a wait-for-zero drain instead.
+    PauseThenExit,
     Shutdown,
 }
 
@@ -781,6 +791,24 @@ pub enum Response {
     DaemonRestart {
         scheduled: bool,
         supervisor: Option<String>,
+        message: String,
+    },
+    /// Reply to [`Request::PauseThenExit`] (#11812), sent before H4 finishes.
+    /// `manifest_id` is the pause's (`None` when an escalated roll has not
+    /// written one yet); `manifest_path` is where the CLI waits for it.
+    /// `max_age_secs` is the manifest's staleness bound (the lease TTL) and
+    /// `resume_window_secs` what H5 needs inside it (probation + resume).
+    HostMaintenancePause {
+        accepted: bool,
+        manifest_id: Option<String>,
+        manifest_path: Option<String>,
+        took_over: Option<String>,
+        escalated: bool,
+        in_flight: usize,
+        pause_budget_secs: u64,
+        h4_deadline_secs: u64,
+        max_age_secs: u64,
+        resume_window_secs: u64,
         message: String,
     },
     /// Result of a `DrainAndRestartDaemon` / `AbortDrain` request (Issue #4090).

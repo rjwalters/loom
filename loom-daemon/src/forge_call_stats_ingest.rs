@@ -265,6 +265,7 @@ fn validate(row: &SinkLine, source: Source, now: i64) -> Option<AgentCall> {
             .filter(|r| is_token(r, 32))
             .unwrap_or(row.p.as_str())
             .to_string(),
+        route: route(row.at.rt.as_deref(), row.at.tk.as_deref()),
         outcome: match row.o {
             Outcome::Ok => CallOutcome::Ok,
             Outcome::NotModified => CallOutcome::NotModified,
@@ -281,6 +282,16 @@ fn validate(row: &SinkLine, source: Source, now: i64) -> Option<AgentCall> {
         requests: u64::from(row.at.pg.unwrap_or(1).clamp(1, MAX_ROW_REQUESTS)),
         source,
     })
+}
+
+/// `rt`, back to its `&'static` vocabulary entry (2am#4367 P4). A row from
+/// an older front has none: a gateway credential kind still says `gateway`,
+/// anything else is `direct` (its read/write intent was not recorded).
+fn route(rt: Option<&str>, tk: Option<&str>) -> &'static str {
+    if let Some(r) = rt.and_then(|r| crate::forge_gateway::ROUTES.iter().find(|v| **v == r)) {
+        return r;
+    }
+    crate::forge_gateway::route_label(tk.unwrap_or_default(), false)
 }
 
 /// `ag`, back to its `&'static` vocabulary entry.

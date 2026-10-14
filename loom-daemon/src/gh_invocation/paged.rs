@@ -281,6 +281,53 @@ pub(super) fn next_link(head: &[u8]) -> Next {
     Next::End
 }
 
+/// A walk under a gateway read profile (2am#4367 P4) follows only next
+/// links on that profile's `api_host`: an `api.github.com` link (a gateway
+/// that did not rewrite `Link`) is moved onto it, so the gateway key never
+/// travels to another host and the next page is not read from GitHub
+/// directly under it; any other host ends the walk as incomplete.
+fn keep_on_gateway(inv: &GhInvocation, url: String) -> Result<String, ExecError> {
+    let Some(dir) = inv
+        .config_dir
+        .as_deref()
+        .filter(|d| crate::forge_gateway::owner_of_profile_dir(d).is_some())
+    else {
+        return Ok(url);
+    };
+    let Some(api_host) = crate::forge_gateway::profile_api_host(dir) else {
+        return Err(incomplete("a gateway profile names no api_host"));
+    };
+    gateway_next(&url, &api_host).ok_or_else(|| incomplete("a next link left the gateway"))
+}
+
+/// `url` kept on `api_host` (see [`keep_on_gateway`]), or `None`.
+fn gateway_next(url: &str, api_host: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if host.eq_ignore_ascii_case(api_host) {
+        Some(url.to_string())
+    } else if host.eq_ignore_ascii_case("api.github.com") {
+        Some(format!("https://{api_host}/{path}"))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_gateway_walk_stays_on_its_api_host() {
+    let gw = "gw.example.com";
+    assert_eq!(
+        gateway_next("https://gw.example.com/repos/a/b/issues?page=2", gw).as_deref(),
+        Some("https://gw.example.com/repos/a/b/issues?page=2")
+    );
+    assert_eq!(
+        gateway_next("https://api.github.com/repos/a/b/issues?page=2", gw).as_deref(),
+        Some("https://gw.example.com/repos/a/b/issues?page=2")
+    );
+    assert_eq!(gateway_next("https://evil.example.net/x", gw), None);
+}
+
 /// The elements of every page when each body is a JSON array (`None` when
 /// one is not), joined with commas and with no enclosing brackets.
 fn array_elements(bodies: &[Vec<u8>]) -> Option<Vec<u8>> {
@@ -396,7 +443,7 @@ pub(super) fn walk(
                         Some(Next::Unfollowable) => {
                             return Err(incomplete("a next link was not an https URL"));
                         }
-                        Some(Next::Url(url)) => Some(url),
+                        Some(Next::Url(url)) => Some(keep_on_gateway(inv, url)?),
                         Some(Next::End) => None,
                     }
                 } else {

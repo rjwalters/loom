@@ -26,6 +26,10 @@
 //!   queue label) — but the live-sweep-on-a-closed-issue shape is logged at
 //!   `warn`, because it means a sweep is building a done issue.
 //!
+//! - OPEN and `loom:frozen` → touch nothing (#11743: no daemon path
+//!   writes to a frozen item), logged at `info`. The read above is the check;
+//!   a failed read already skips the issue, so there is no unverified write.
+//!
 //! Bounded per pass (`MAX_PROBES_PER_PASS`) so a pathological journal cannot
 //! turn one reconciliation tick into an unbounded `gh` fan-out, and
 //! fail-open everywhere: every `gh` failure is logged and skipped, never
@@ -47,6 +51,8 @@ pub struct BuildingHealStats {
     pub healed: usize,
     /// Live-sweep issues skipped because the issue is CLOSED (#9463).
     pub closed_skipped: usize,
+    /// Live-sweep issues skipped because the issue is `loom:frozen` (#11743).
+    pub frozen_skipped: usize,
 }
 
 /// Run one heal pass against `root`'s workspace using `gh_bin`.
@@ -87,6 +93,14 @@ pub fn heal_missing_building_labels(gh_bin: &Path, root: &Path) -> BuildingHealS
             log::warn!(
                 "building_heal: issue #{issue} is CLOSED but a live sweep on this host is \
                  still working it (#9464/#9463) — not re-applying any queue label"
+            );
+            continue;
+        }
+        if crate::work_finder::is_frozen(&labels) {
+            stats.frozen_skipped += 1;
+            log::info!(
+                "building_heal: issue #{issue} is `loom:frozen` — not re-applying \
+                 `loom:building` (#11743)"
             );
             continue;
         }
@@ -349,6 +363,27 @@ mod tests {
         for stats in [first, second] {
             assert_eq!((stats.checked, stats.healed), (1, 0), "{calls}");
         }
+        assert!(!calls.contains("issue edit"), "{calls}");
+    }
+
+    /// #11743: a frozen issue whose claim label is missing is left alone.
+    #[test]
+    #[serial_test::serial]
+    fn a_frozen_issue_is_never_relabelled() {
+        let journal_path_dir = tempfile::tempdir().unwrap();
+        let journal_path = journal_path_dir.path().join("sweeps.json");
+        std::env::set_var(crate::sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        let dir = tempfile::tempdir().unwrap();
+        seed_live_sweep(&journal_path, dir.path(), 11743);
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "open", &["loom:frozen"]);
+
+        let stats = heal_missing_building_labels(&fake_gh, dir.path());
+
+        std::env::remove_var(crate::sweep_journal::JOURNAL_PATH_ENV);
+
+        assert_eq!((stats.checked, stats.healed, stats.frozen_skipped), (1, 0, 1));
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
         assert!(!calls.contains("issue edit"), "{calls}");
     }
 
