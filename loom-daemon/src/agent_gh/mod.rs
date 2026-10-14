@@ -223,19 +223,10 @@ pub fn run(raw: &[OsString]) -> i32 {
         // replaces this process. It can never fail or delay the call.
         ledger::book(raw, cwd.as_deref(), &route);
         if let Some(dir) = &route.gateway {
-            // A classified read: that owner's gateway profile is the only
-            // credential `gh` sees (an env token would outrank it).
-            let err = crate::gh_invocation::transparent::exec_with(
-                &next,
-                raw,
-                &[
-                    (SENTINEL_ENV, OsString::from((depth + 1).to_string())),
-                    ("GH_CONFIG_DIR", dir.clone().into_os_string()),
-                ],
-                &crate::gh_invocation::TOKEN_ENV_VARS,
-            );
-            eprintln!("gh (loom front): failed to exec {}: {err}", next.display());
-            return 127;
+            if let Some(code) = run_on_gateway(&next, raw, dir, depth) {
+                return code;
+            }
+            // The relay did not answer: the same call, direct (below).
         }
     }
     let err = crate::gh_invocation::transparent::exec(
@@ -306,6 +297,41 @@ fn serve(raw: &[OsString], next: &Path) -> Option<Served> {
     }
 }
 
+/// Run a classified read under its owner's gateway profile, with every env
+/// token removed (one would outrank the profile), and replay its output.
+/// `None` when the relay is down or unreachable (a transport error or a
+/// `502`/`503`/`504`): the caller then runs the call direct, and the outage
+/// is recorded beside the profiles so the next calls skip the gateway
+/// ([`crate::forge_gateway::outage`]). Output is buffered, so the classifier
+/// never sends a streaming call (`--watch`) here.
+fn run_on_gateway(next: &Path, raw: &[OsString], dir: &Path, depth: u32) -> Option<i32> {
+    let out = crate::gh_invocation::transparent::run_captured(
+        next,
+        raw,
+        &[
+            (SENTINEL_ENV, OsString::from((depth + 1).to_string())),
+            ("GH_CONFIG_DIR", dir.as_os_str().to_os_string()),
+        ],
+        &crate::gh_invocation::TOKEN_ENV_VARS,
+    )
+    .ok()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let headers = raw.first().is_some_and(|a| a == "api")
+        && raw.iter().any(|a| a == "-i" || a == "--include");
+    let status = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
+        .map(|r| r.status);
+    if !out.status.success() && crate::forge_gateway::outage::is_outage(status, &stderr, headers) {
+        if let Some(base) = dir.parent() {
+            crate::forge_gateway::outage::note_front_outage(base);
+        }
+        return None;
+    }
+    let _ = std::io::stdout().lock().write_all(&out.stdout);
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().lock().write_all(&out.stderr);
+    Some(out.status.code().unwrap_or(1))
+}
+
 /// How a passthrough runs (2am#4367 P4, [`read_route`]): a read whose owner
 /// is certain goes to that owner's gateway profile; anything else, or any
 /// doubt, keeps the session's credential.
@@ -317,13 +343,20 @@ fn passthrough_route(raw: &[OsString], cwd: Option<&Path>) -> read_route::FrontR
     else {
         return read_route::FrontRoute::default();
     };
-    if std::env::var("GH_HOST").is_ok_and(|h| !h.is_empty() && h != "github.com")
+    if !crate::forge_gateway::any_live() {
+        // Break-glass: no gateway, no forge detection, no `git` read of the
+        // remote — nothing beyond the classification of the argv.
+        return read_route::FrontRoute {
+            gateway: None,
+            read: read_route::is_read(&args),
+        };
+    }
+    if std::io::stdout().is_terminal()
+        || std::env::var("GH_HOST").is_ok_and(|h| !h.is_empty() && h != "github.com")
         || crate::forge_cmd::detect_forge(None) == crate::forge_cmd::ForgeType::Gitea
     {
-        return read_route::FrontRoute::default();
-    }
-    if !crate::forge_gateway::any_live() {
-        // Break-glass: no gateway, no `git` read of the remote, nothing new.
+        // A TTY gets gh's live output, which a buffered gateway attempt
+        // would hold back; another forge has no gateway.
         return read_route::FrontRoute {
             gateway: None,
             read: read_route::is_read(&args),

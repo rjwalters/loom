@@ -354,6 +354,7 @@ pub(crate) fn fetch_conditional_via(
         .into_credential()
     });
     let reader_dir = reader.as_ref().map(|(dir, _)| dir.as_path());
+    let gateway_down = std::cell::Cell::new(false);
     let family = served::endpoint_family(url);
     let now = std::time::SystemTime::now;
     let http_ok = |r: &FetchResult| {
@@ -393,6 +394,13 @@ pub(crate) fn fetch_conditional_via(
         },
         http_ok,
         |r: &FetchResult| {
+            // 2am#4367 P4: the relay down or unreachable is not a credential
+            // failure: withdraw it for the default window and use the writer.
+            if is_gateway_outage(reader.as_ref().map(|(_, a)| a.as_str()), r) {
+                gateway_down.set(true);
+                crate::forge_gateway::outage::withdraw_for_outage(site.caller);
+                return Some(crate::forge_identity::Failure::Credential);
+            }
             let failure = reader_failure(r)?;
             let item_404 = site.item_scoped
                 && failure == crate::forge_identity::Failure::Coverage
@@ -409,6 +417,9 @@ pub(crate) fn fetch_conditional_via(
             Some(failure)
         },
         |failure, _| {
+            if gateway_down.get() {
+                return;
+            }
             if let Some((_, app_id)) = &reader {
                 let repo = target.repo.as_deref().unwrap_or_default();
                 let why = format!("{} {url}", site.caller);
@@ -426,6 +437,15 @@ fn repo_of(target: &Target) -> &str {
 /// What a failed conditional read says about its credential. The parsed
 /// `--include` headers travel with it (W4-A), so a rate-limit refusal names
 /// its pool and its real `x-ratelimit-reset` rather than the flat default.
+/// Whether a failed conditional read on `app` was the gateway's outage. A
+/// conditional read always asks for headers, so no parsed response at all
+/// means no answer arrived.
+pub(crate) fn is_gateway_outage(app: Option<&str>, r: &FetchResult) -> bool {
+    app == Some(crate::forge_gateway::GATEWAY_APP_ID)
+        && !r.0.success()
+        && crate::forge_gateway::outage::is_outage(r.1.as_ref().map(|h| h.status), &r.2, true)
+}
+
 pub(crate) fn reader_failure(r: &FetchResult) -> Option<crate::forge_identity::Failure> {
     crate::forge_identity::classify_failure(
         &r.2,

@@ -8,19 +8,23 @@
 //! session's credential (the writer).
 //!
 //! **Unclassified means direct.** A call is a read only when its shape says
-//! so: `issue|pr view|list|status`, `pr checks|diff`, `repo view`,
+//! so: `issue|pr view|list`, `pr checks|diff`, `repo view`,
 //! `run|workflow view|list`, `label list`, and `gh api <path>` with no
-//! method, field or input flag and a path that is not `graphql`. Everything
+//! method, field or input flag and a path that is not `graphql` — and only
+//! when every flag is one that shape is known to take. `issue|pr status`,
+//! and any call whose `--json`/`--jq`/`--template` names a `viewer*` value,
+//! are answered for the caller and stay on it (#9872). Everything
 //! else — every mutation, `gh api -X …`, `gh release`, `gh auth` (the git
 //! credential helper), search, extensions, aliases and anything unknown —
 //! keeps the session's credential, as before.
 //!
 //! **The owner must be certain.** A gateway key answers for one owner's
 //! installation, so naming the wrong owner would turn a read into a 404.
-//! The owner comes from a plain `-R owner/repo`, a `gh api repos/<o>/<r>/…`
-//! path, a `github.com` URL argument, `GH_REPO`, or the checkout's one
-//! `origin` remote ([`super::implicit_repo`]'s rule); when none of these is
-//! unambiguous the call stays direct.
+//! The owner comes from the last `-R owner/repo` (attached `-Rowner/repo`
+//! too), a `gh api repos/<o>/<r>/…` path, a positional `github.com` URL,
+//! `GH_REPO`, or the checkout's one `origin` remote
+//! ([`super::implicit_repo`]'s rule). Flag values are never read as URLs,
+//! and when the sources disagree or cannot be read the call stays direct.
 
 use std::path::PathBuf;
 
@@ -35,8 +39,21 @@ pub struct FrontRoute {
     pub read: bool,
 }
 
-/// Flags that make any call unclassified.
-const NEVER: &[&str] = &["-h", "--help", "--web", "-w"];
+/// The flags one read shape accepts: those taking a value, and the boolean
+/// ones. A flag in neither list makes the call unclassified, so an argument
+/// is never mistaken for a value (or the reverse) on a shape this does not
+/// know.
+struct Spec {
+    valued: &'static [&'static str],
+    bools: &'static [&'static str],
+}
+
+/// Accepted by every read shape.
+const COMMON_VALUED: &[&str] = &["-R", "--repo", "--json", "-q", "--jq", "-t", "--template"];
+
+/// Fields and filters naming these are answered for the caller (`viewer*`):
+/// a gateway, which asks as its own App, would answer for itself (#9872).
+const VIEWER: &str = "viewer";
 
 /// `gh api` flags that change the method or send a body.
 const API_WRITE_FLAGS: &[&str] = &[
@@ -50,136 +67,275 @@ const API_WRITE_FLAGS: &[&str] = &[
     "--hostname",
 ];
 
-/// `gh api` flags that take a value (skipped when finding the path).
-const API_VALUED: &[&str] = &[
-    "-H",
-    "--header",
-    "-q",
-    "--jq",
-    "-t",
-    "--template",
-    "--cache",
-    "-p",
-    "--preview",
-];
+/// The flags of a classified read shape, or `None` for any other call.
+fn spec(cmd: &str, verb: &str) -> Option<Spec> {
+    let (valued, bools): (&'static [&'static str], &'static [&'static str]) = match (cmd, verb) {
+        ("issue", "list") => (
+            &[
+                "-L",
+                "--limit",
+                "-s",
+                "--state",
+                "-l",
+                "--label",
+                "-a",
+                "--assignee",
+                "-A",
+                "--author",
+                "-S",
+                "--search",
+                "-m",
+                "--milestone",
+                "--mention",
+                "--app",
+            ],
+            &[],
+        ),
+        ("pr", "list") => (
+            &[
+                "-L",
+                "--limit",
+                "-s",
+                "--state",
+                "-l",
+                "--label",
+                "-a",
+                "--assignee",
+                "-A",
+                "--author",
+                "-S",
+                "--search",
+                "-B",
+                "--base",
+                "-H",
+                "--head",
+                "--app",
+            ],
+            &["-d", "--draft"],
+        ),
+        ("issue" | "pr", "view") => (&[], &["-c", "--comments"]),
+        ("pr", "checks") => (&["-i", "--interval"], &["--required", "--fail-fast"]),
+        ("pr", "diff") => (&["--color"], &["--name-only", "--patch"]),
+        ("repo", "view") => (&["-b", "--branch"], &[]),
+        ("run", "list") => (
+            &[
+                "-L",
+                "--limit",
+                "-b",
+                "--branch",
+                "-u",
+                "--user",
+                "-e",
+                "--event",
+                "-s",
+                "--status",
+                "-c",
+                "--commit",
+                "--created",
+                "-w",
+                "--workflow",
+            ],
+            &["-a", "--all"],
+        ),
+        ("run", "view") => (
+            &["-j", "--job", "--attempt"],
+            &["--log", "--log-failed", "--exit-status", "-v", "--verbose"],
+        ),
+        ("workflow", "list") => (&["-L", "--limit"], &["-a", "--all"]),
+        ("workflow", "view") => (&["-r", "--ref"], &["-y", "--yaml"]),
+        ("label", "list") => (&["-L", "--limit", "-S", "--search", "--order", "--sort"], &[]),
+        ("api", _) => (
+            &["-H", "--header", "--cache", "-p", "--preview"],
+            &[
+                "-i",
+                "--include",
+                "--paginate",
+                "--silent",
+                "--verbose",
+                "--slurp",
+            ],
+        ),
+        _ => return None,
+    };
+    Some(Spec { valued, bools })
+}
+
+/// One argument of a classified shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tok<'a> {
+    /// A flag, with its value when it takes one (`--x v`, `--x=v`, `-xv`).
+    Flag(&'a str, Option<&'a str>),
+    /// A positional argument.
+    Arg(&'a str),
+}
+
+/// Split `rest` (the argv after the command, and after the verb unless the
+/// command is `api`) against `spec`. `Err` on anything it cannot place:
+/// an unknown flag, a valued flag with no value, `--`, or bundled short
+/// booleans.
+fn tokenize<'a>(rest: &'a [String], spec: &Spec) -> Result<Vec<Tok<'a>>, ()> {
+    let valued = |f: &str| COMMON_VALUED.contains(&f) || spec.valued.contains(&f);
+    let known = |f: &str| valued(f) || spec.bools.contains(&f);
+    let mut out = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if a == "--" {
+            return Err(());
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (&a[..2 + n.len()], Some(v)),
+                None => (a, None),
+            };
+            if !known(name) {
+                return Err(());
+            }
+            let value = match (valued(name), inline) {
+                (true, Some(v)) => Some(v),
+                (true, None) => Some(it.next().ok_or(())?.as_str()),
+                (false, None) => None,
+                (false, Some(_)) => return Err(()),
+            };
+            out.push(Tok::Flag(name, value));
+        } else if a.len() >= 2 && a.starts_with('-') {
+            let name = &a[..2];
+            if !known(name) {
+                return Err(());
+            }
+            let value = match (valued(name), a.len() > 2) {
+                (true, true) => Some(&a[2..]),
+                (true, false) => Some(it.next().ok_or(())?.as_str()),
+                (false, false) => None,
+                // `-ab`: bundled booleans are a shape this does not read.
+                (false, true) => return Err(()),
+            };
+            out.push(Tok::Flag(name, value));
+        } else {
+            out.push(Tok::Arg(a));
+        }
+    }
+    Ok(out)
+}
+
+/// The tokens after the command (and verb), for a classified shape.
+fn parse(args: &[String]) -> Option<(&str, Vec<Tok<'_>>)> {
+    let cmd = args.first()?.as_str();
+    let verb = args.get(1).map_or("", String::as_str);
+    let spec = spec(cmd, verb)?;
+    let rest = if cmd == "api" { &args[1..] } else { &args[2..] };
+    Some((cmd, tokenize(rest, &spec).ok()?))
+}
 
 /// Whether `args` (argv without the program) is a read this front may send
-/// to the gateway.
+/// to the gateway: a classified shape, every flag understood, no `--web` /
+/// `--help` / `--watch`, no field or filter that names a `viewer*` value,
+/// and for `gh api` one path that is not `graphql` and no method, field or
+/// input flag.
 #[must_use]
 pub fn is_read(args: &[String]) -> bool {
-    let (Some(cmd), Some(verb)) = (args.first(), args.get(1)) else {
+    if args
+        .iter()
+        .any(|a| ["-h", "--help", "--web", "--watch"].contains(&a.as_str()))
+    {
+        return false;
+    }
+    if args.first().is_some_and(|c| c == "api")
+        && args[1..].iter().any(|a| {
+            API_WRITE_FLAGS.iter().any(|f| {
+                a == f
+                    || a.starts_with(&format!("{f}="))
+                    || (f.len() == 2 && a.len() > 2 && a.starts_with(f))
+            })
+        })
+    {
+        return false;
+    }
+    let Some((cmd, toks)) = parse(args) else {
         return false;
     };
-    if args.iter().any(|a| NEVER.contains(&a.as_str())) {
+    let viewer = toks.iter().any(|t| {
+        matches!(t, Tok::Flag("--json" | "-q" | "--jq" | "-t" | "--template", Some(v))
+            if v.to_ascii_lowercase().contains(VIEWER))
+    });
+    if viewer {
         return false;
     }
-    match (cmd.as_str(), verb.as_str()) {
-        ("issue", "view" | "list" | "status")
-        | ("pr", "view" | "list" | "status" | "checks" | "diff")
-        | ("repo", "view")
-        | ("run" | "workflow", "view" | "list")
-        | ("label", "list") => true,
-        ("api", _) => api_path(&args[1..]).is_some_and(|p| p.trim_start_matches('/') != "graphql"),
-        _ => false,
-    }
-}
-
-/// The endpoint of a `gh api` argv tail, or `None` when a flag makes the
-/// call a non-GET (or the argv is not understood).
-fn api_path(rest: &[String]) -> Option<&str> {
-    let mut path = None;
-    let mut i = 0;
-    while i < rest.len() {
-        let a = rest[i].as_str();
-        let flag = a.split('=').next().unwrap_or(a);
-        // `-XPOST`, `-fbody=x`: a short flag with its value attached.
-        let attached = ["-X", "-f", "-F"]
+    if cmd == "api" {
+        let paths: Vec<&str> = toks
             .iter()
-            .any(|f| a.len() > 2 && a.starts_with(f));
-        if API_WRITE_FLAGS.contains(&flag) || attached {
-            return None;
-        }
-        if API_VALUED.contains(&a) {
-            i += 2;
-            continue;
-        }
-        if !a.starts_with('-') {
-            if path.is_some() {
-                return None; // two positionals: not a shape gh accepts
-            }
-            path = Some(a);
-        }
-        i += 1;
+            .filter_map(|t| if let Tok::Arg(a) = t { Some(*a) } else { None })
+            .collect();
+        return matches!(paths.as_slice(), [p] if p.trim_start_matches('/') != "graphql");
     }
-    path
+    true
 }
 
-/// The `owner/repo` a read names on its own argv: `-R`/`--repo`, a
-/// `repos/<o>/<r>` API path, a `github.com` URL, or `repo view <o>/<r>`.
-/// `Err` when the argv names a repo this cannot resolve (a non-slug `-R`, a
-/// URL on another host), which keeps the call direct.
+/// `https://github.com/<o>/<r>/…` → `o/r`; any other URL is `Err`.
+fn url_repo(url: &str) -> Result<String, ()> {
+    let rest = url.strip_prefix("https://github.com/").ok_or(())?;
+    let mut parts = rest.split(['/', '?', '#']);
+    let slug = format!("{}/{}", parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    if is_slug(&slug) {
+        Ok(slug)
+    } else {
+        Err(())
+    }
+}
+
+/// The `owner/repo` a read names on its own argv, `Ok(None)` when it names
+/// none (gh then uses `GH_REPO` or the checkout). Only `-R`/`--repo` values
+/// (the last one wins, as in gh), positional URLs, a `repo view` slug and a
+/// `repos/<o>/<r>` API path count; a value of another flag (`--search`,
+/// `--jq`, …) is never read as a URL. `Err` for anything ambiguous: a
+/// non-slug `-R`, a URL on another host, or two sources that disagree.
 fn argv_repo(args: &[String]) -> Result<Option<String>, ()> {
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_str();
-        let value = if a == "-R" || a == "--repo" {
-            i += 1;
-            Some(args.get(i).map_or("", String::as_str))
-        } else {
-            a.strip_prefix("--repo=").or_else(|| a.strip_prefix("-R="))
-        };
-        if let Some(v) = value {
-            return if is_slug(v) {
-                Ok(Some(v.to_string()))
-            } else {
-                Err(())
-            };
-        }
-        i += 1;
-    }
-    for a in &args[1..] {
-        if a.contains("://") {
-            let rest = a.strip_prefix("https://github.com/").ok_or(())?;
-            let mut parts = rest.split('/');
-            let slug = format!("{}/{}", parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-            return if is_slug(&slug) {
-                Ok(Some(slug))
-            } else {
-                Err(())
-            };
-        }
-    }
-    if args.first().map(String::as_str) == Some("api") {
-        let Some(path) = api_path(&args[1..]) else {
+    let (cmd, toks) = parse(args).ok_or(())?;
+    let mut named: Vec<String> = Vec::new();
+    if let Some(v) = toks.iter().rev().find_map(|t| match t {
+        Tok::Flag("-R" | "--repo", v) => *v,
+        _ => None,
+    }) {
+        if !is_slug(v) {
             return Err(());
-        };
-        let path = path.trim_start_matches('/');
-        let Some(rest) = path.strip_prefix("repos/") else {
-            // `/user`, `orgs/…`, `rate_limit`: no repo, so no owner.
-            return Err(());
-        };
-        let mut parts = rest.split(['/', '?']);
-        let (o, r) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-        if o == "{owner}" {
-            return Ok(None); // gh fills it from the checkout, as below
         }
-        let slug = format!("{o}/{r}");
-        return if is_slug(&slug) {
-            Ok(Some(slug))
-        } else {
-            Err(())
-        };
+        named.push(v.to_string());
     }
-    if args.first().map(String::as_str) == Some("repo") {
-        if let Some(p) = args[2..].iter().find(|a| !a.starts_with('-')) {
-            return if is_slug(p) {
-                Ok(Some(p.clone()))
+    let positionals = toks.iter().filter_map(|t| match t {
+        Tok::Arg(a) => Some(*a),
+        Tok::Flag(..) => None,
+    });
+    for p in positionals {
+        if p.contains("://") {
+            named.push(url_repo(p)?);
+        } else if cmd == "repo" {
+            named.push(if is_slug(p) {
+                p.to_string()
             } else {
-                Err(())
+                return Err(());
+            });
+        } else if cmd == "api" {
+            let path = p.trim_start_matches('/');
+            let Some(rest) = path.strip_prefix("repos/") else {
+                // `/user`, `orgs/…`, `rate_limit`: no repo, so no owner.
+                return Err(());
             };
+            let mut parts = rest.split(['/', '?']);
+            let (o, r) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            if o != "{owner}" {
+                let slug = format!("{o}/{r}");
+                named.push(if is_slug(&slug) { slug } else { return Err(()) });
+            }
         }
     }
-    Ok(None)
+    let first = named.first().cloned();
+    if named
+        .iter()
+        .any(|n| !n.eq_ignore_ascii_case(first.as_deref().unwrap_or("")))
+    {
+        return Err(());
+    }
+    Ok(first)
 }
 
 /// The owner of the repo a read targets, if certain. `gh_repo` is

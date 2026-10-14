@@ -68,7 +68,7 @@ pub fn cred_of(inv: &GhInvocation) -> CredAttr {
 /// - `…/.loom/gh-config-by-owner/<owner>/<digits>` ⇒ `app-<digits>`, reader;
 /// - `…/.loom/gh-config-by-owner/<owner>` ⇒ the writer App, that owner;
 /// - `…/.loom/gh-config` ⇒ the writer App, the workspace's own owner;
-/// - `…/.loom/gh-gateway/<owner>` ⇒ `gateway`, that owner (2am#4367 P4);
+/// - `…/.loom/gh-config-gateway/<owner>` ⇒ `gateway`, that owner (2am#4367 P4);
 /// - anything else, or none ⇒ `ambient`.
 ///
 /// A writer directory's App and owner are the ones its `identity.json`

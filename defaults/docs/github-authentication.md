@@ -536,38 +536,59 @@ silently, so it would send the key to GitHub instead.
 ```json
 "forge": { "gateway": {
   "origin": "https://github-proxy.example.com",
+  "region": "example-region-1",
   "keyRefs": {
-    "example-org": "file:/home/loom/.loom/github-gateway/example-org.key",
+    "example-org": "ssm:///github-proxy/profiles/relay-host-example-org/key",
     "other-org":   "ssm:///github-proxy/profiles/relay-host-other-org/key"
   }
 } }
 ```
 
 - **`origin`**: `https://<host>` or a bare host. No path, port or
-  credentials, and never a GitHub host.
+  credentials, and never a GitHub host (a trailing `.` included).
 - **`keyRefs`** (`key_refs` is accepted too): owner → where its key is read.
-  `file:<path>` must be an owner-only file outside every checkout.
-  `ssm://<parameter>` is read with the AWS CLI. The key goes only into the
-  profile's `hosts.yml` (0600, in a 0700 directory). It never appears in
-  argv, logs or spans. An owner with no ref keeps today's routing.
+  Prefer `ssm://<parameter>` (read with the AWS CLI under the host's own
+  grant), so no key file sits on the host. It is always read with an
+  explicit `--region`: `region`, else `AWS_REGION`, else
+  `AWS_DEFAULT_REGION`. With none of these set, `ssm://` refs are refused
+  (logged once) and that owner keeps today's routing. `file:<path>` must be an
+  owner-only file outside every checkout. An owner with no ref keeps
+  today's routing.
 
-The daemon re-reads this block every minute. When it is set and `gh` is
-new enough, the daemon publishes `.loom/gh-gateway/<owner>/` and rewrites it
-every five minutes, so a rotated key is picked up. `api_host` is written
-every time `hosts.yml` is. From then on:
+The daemon re-reads this block every minute. When it is set and `gh` is new
+enough, it publishes `.loom/gh-config-gateway/<owner>/` and rewrites it
+every five minutes, so a rotated key is picked up. `hosts.yml` (0600, in a
+0700 directory) holds only the key and `api_host`, which is written every
+time the file is. It names no `user` or `git_protocol`, so it is never a git
+credential. The directory is named `gh-config-*` so the managed `.gitignore`
+block and every stager's credential refusal already cover it: a profile can
+never be committed. The key never appears in argv, logs or spans. From then
+on:
 
 - **Daemon reads** (facade reads and conditional ETag reads) try the
-  gateway profile before any reader App. A gateway failure withdraws it
-  like a reader, so the read falls back to the readers, then the writer.
+  gateway profile before any reader App. A gateway refusal withdraws it like
+  a reader. A gateway **outage** (a timeout, a transport error, or a
+  `502`/`503`/`504`) withdraws it everywhere for five minutes. Either way the
+  read continues to the readers, then the writer. A page walk under a
+  gateway profile follows next links only on its `api_host`.
 - **Agent `gh` calls**: the front sends a read to the gateway only when it
-  can classify it *and* name its owner for certain. The reads it classifies
-  are `issue|pr view|list|status`, `pr checks|diff`, `repo view`,
-  `run|workflow view|list`, `label list`, and `gh api <path>` with no
-  method, field or input flag that is not `graphql`. The owner comes from
-  `-R owner/repo`, a `repos/<o>/<r>` path, a `github.com` URL, `GH_REPO`, or
-  a lone `origin` remote. Everything else stays on the session's credential.
-  That covers every mutation, `gh api -X …`, GraphQL, search, `gh release`
-  and `gh auth git-credential`.
+  can classify it *and* name its owner for certain.
+  - The reads it classifies: `issue|pr view|list`, `pr checks|diff`,
+    `repo view`, `run|workflow view|list`, `label list`, and `gh api <path>`
+    that is not `graphql`, has no method, field or input flag, and uses only
+    flags that shape is known to take.
+  - A call whose `--json`/`--jq`/`--template` names a `viewer*` value is
+    answered for the caller, so it stays on the caller, as do `issue|pr
+    status`.
+  - The owner comes from the last `-R` (attached `-Rowner/repo` too), a
+    `repos/<o>/<r>` path, a positional `github.com` URL, `GH_REPO`, or a lone
+    `origin` remote. A flag's value is never read as a URL, and when two
+    sources disagree the call stays direct.
+  - Everything else stays on the session's credential: every mutation,
+    `gh api -X …`, GraphQL, search, `gh release`, `gh auth git-credential`,
+    `--watch`, and any call on a TTY.
+  - If the gateway is down, the front runs the same call direct and skips
+    the gateway for five minutes.
 - **Writes, git and releases** are unchanged: the writer App, no `api_host`.
 - **`GH_NO_UPDATE_NOTIFIER=1`** is set for the daemon and every agent,
   whether or not a gateway is configured.

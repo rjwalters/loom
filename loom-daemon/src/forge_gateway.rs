@@ -31,7 +31,7 @@
 //! # What changes when it is set
 //!
 //! [`refresh`] (every [`CHECK_INTERVAL`]) publishes one read profile per
-//! configured owner at `.loom/gh-gateway/<owner>/`, with `api_host` set, and
+//! configured owner at `.loom/gh-config-gateway/<owner>/`, with `api_host` set, and
 //! rewrites `api_host` every time it rewrites `hosts.yml`. Then:
 //!
 //! - the daemon's reads ([`crate::gh_invocation::GhInvocation`] with read
@@ -48,7 +48,7 @@
 //! # Break-glass
 //!
 //! With `forge.gateway` unset, nothing is published, an existing
-//! `.loom/gh-gateway/` is removed on the next pass, agents are not told
+//! `.loom/gh-config-gateway/` is removed on the next pass, agents are not told
 //! about it, and [`route_read`] is exactly [`crate::forge_identity::route_read`].
 //! Below gh 2.100.0 the same holds (logged once): `api_host` would be
 //! ignored and the gateway key sent to `api.github.com`. The fleet store
@@ -65,11 +65,14 @@ use serde_json::Value;
 
 use crate::forge_identity::{Placement, RouteDecision, RouteRequest};
 
+#[path = "forge_gateway/outage.rs"]
+pub mod outage;
 #[path = "forge_gateway/publish.rs"]
 mod publish;
 pub use publish::{
-    parse_gh_version, publish_profile, refresh, spawn_refresh, teardown, Deps, GhVersion,
-    PassOutcome, Refresher, MIN_GH_VERSION,
+    gateway_hosts_yaml, parse_gh_version, profile_api_host, publish_profile, refresh,
+    spawn_refresh, teardown, Deps, GhVersion, PassOutcome, Refresher, GATEWAY_CONFIG_YAML,
+    MIN_GH_VERSION,
 };
 
 #[cfg(test)]
@@ -96,8 +99,12 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The `.loom/` subdirectory holding the profiles. Distinct from
 /// `gh-config-by-owner/` so the bucket-book probes, the writer and reader
-/// publications and their path classifier never see a gateway profile.
-pub const DIR_NAME: &str = "gh-gateway";
+/// publications and their path classifier never see a gateway profile, and
+/// named `gh-config-*` on purpose: the deployed `.gitignore` block
+/// (`.loom/gh-config-*/`) and every stager's credential refusal
+/// (`.loom/gh-config` as a prefix) already cover it, so a profile's key can
+/// never be committed, even by a stale install (#7818).
+pub const DIR_NAME: &str = "gh-config-gateway";
 
 /// Where an owner's key is read from. Holds a location, never a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,21 +147,107 @@ impl KeyRef {
     /// # Errors
     ///
     /// When the source cannot be read, or holds no plausible key.
-    pub fn read(&self) -> Result<String, String> {
+    pub fn read(&self, region: Option<&str>) -> Result<String, String> {
         use crate::telemetry_join::{credential_source, Credential, CredentialSpec};
-        let spec = match self {
-            Self::Ssm(p) => CredentialSpec::Ssm {
-                parameter: p.clone(),
-            },
-            Self::File(p) => CredentialSpec::File { path: p.clone() },
+        let fetched = match self {
+            Self::Ssm(p) => {
+                // An explicit region always: a daemon's environment often
+                // has none, and the AWS CLI would then fail or guess.
+                let region = region.ok_or_else(|| {
+                    format!(
+                        "an ssm:// key ref needs a region: set {CONFIG_KEY}.region, or \
+                         AWS_REGION / AWS_DEFAULT_REGION in the daemon's environment"
+                    )
+                })?;
+                ssm_get(p, region)?
+            }
+            Self::File(p) => {
+                match credential_source(&CredentialSpec::File { path: p.clone() }, None)
+                    .credential()
+                {
+                    Ok(Credential::Bearer(key)) => key,
+                    Ok(_) => {
+                        return Err("the source does not hold a single-line gateway key".into())
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
         };
-        let fetched = credential_source(&spec, None).credential();
-        match fetched {
-            Ok(Credential::Bearer(key)) if valid_key(&key) => Ok(key),
-            Ok(_) => Err("the source does not hold a single-line gateway key".into()),
-            Err(e) => Err(e.to_string()),
+        if valid_key(&fetched) {
+            Ok(fetched)
+        } else {
+            Err("the source does not hold a single-line gateway key".into())
         }
     }
+}
+
+/// `aws ssm get-parameter` for `parameter` in `region`, decrypted. Only the
+/// parameter's name and the region are on the command line, never a value;
+/// an error names the parameter and the exit, never the output.
+fn ssm_get(parameter: &str, region: &str) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("aws");
+    cmd.args(ssm_args(parameter, region))
+        .stdin(std::process::Stdio::null());
+    match crate::proc_exec::run_bounded(cmd, SSM_TIMEOUT) {
+        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(crate::proc_exec::Completion::Exited(out)) => Err(format!(
+            "aws ssm get-parameter {parameter} ({region}) exited {}",
+            out.status.code().unwrap_or(-1)
+        )),
+        Ok(_) => Err(format!("aws ssm get-parameter {parameter} ({region}) timed out")),
+        Err(e) => Err(format!("aws ssm get-parameter {parameter}: {e}")),
+    }
+}
+
+/// The `aws` argv of [`ssm_get`].
+#[must_use]
+pub fn ssm_args(parameter: &str, region: &str) -> Vec<String> {
+    [
+        "ssm",
+        "get-parameter",
+        "--name",
+        parameter,
+        "--with-decryption",
+        "--region",
+        region,
+        "--query",
+        "Parameter.Value",
+        "--output",
+        "text",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+/// Deadline for one SSM read.
+const SSM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The region an `ssm://` ref is read in: `forge.gateway.region`, else
+/// `AWS_REGION`, else `AWS_DEFAULT_REGION` (the AWS CLI's own order), each
+/// only when it is a plausible region name. `None` refuses `ssm://` refs.
+#[must_use]
+pub fn resolve_region(
+    configured: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    configured
+        .map(str::to_string)
+        .or_else(|| env("AWS_REGION"))
+        .or_else(|| env("AWS_DEFAULT_REGION"))
+        .map(|r| r.trim().to_string())
+        .filter(|r| valid_region(r))
+}
+
+/// `us-east-1`-shaped: lowercase letters, digits and dashes.
+#[must_use]
+pub fn valid_region(r: &str) -> bool {
+    (4..=32).contains(&r.len())
+        && r.contains('-')
+        && r.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// A key is one token of URL-safe characters: anything else could not be
@@ -174,13 +267,16 @@ pub struct GatewayConfig {
     pub api_host: String,
     /// Owner (lowercased) → where its key is read.
     pub key_refs: BTreeMap<String, KeyRef>,
+    /// `forge.gateway.region`: the AWS region `ssm://` refs are read in,
+    /// when set (else the environment's, [`resolve_region`]).
+    pub region: Option<String>,
 }
 
 impl GatewayConfig {
     /// A stable digest of what the profiles depend on, keys excluded.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        format!("{}|{:?}", self.api_host, self.key_refs)
+        format!("{}|{:?}|{:?}", self.api_host, self.key_refs, self.region)
     }
 }
 
@@ -199,6 +295,8 @@ pub fn api_host_of(origin: &str) -> Result<String, String> {
         None => o,
     };
     let host = host.strip_suffix('/').unwrap_or(host).to_ascii_lowercase();
+    // `github.com.` is GitHub too: compare and store without the root dot.
+    let host = host.strip_suffix('.').unwrap_or(&host).to_string();
     let ok = host.contains('.')
         && !host.starts_with(['.', '-'])
         && host
@@ -266,16 +364,33 @@ pub fn parse(effective: &Value) -> (Option<GatewayConfig>, Vec<String>) {
         warnings.push(format!("{CONFIG_KEY}.keyRefs names no usable owner; the gateway stays off"));
         return (None, warnings);
     }
-    (Some(GatewayConfig { api_host, key_refs }), warnings)
+    let region = match block.get("region") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(r)) if valid_region(r.trim()) => Some(r.trim().to_string()),
+        Some(other) => {
+            warnings.push(format!(
+                "{CONFIG_KEY}.region must be an AWS region name, not {other}; ignored"
+            ));
+            None
+        }
+    };
+    (
+        Some(GatewayConfig {
+            api_host,
+            key_refs,
+            region,
+        }),
+        warnings,
+    )
 }
 
-/// `<workspace>/.loom/gh-gateway`.
+/// `<workspace>/.loom/gh-config-gateway`.
 #[must_use]
 pub fn base_dir(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".loom").join(DIR_NAME)
 }
 
-/// The owner a `…/.loom/gh-gateway/<owner>` directory is the profile of.
+/// The owner a `…/.loom/gh-config-gateway/<owner>` directory is the profile of.
 #[must_use]
 pub fn owner_of_profile_dir(dir: &Path) -> Option<String> {
     let owner = dir.file_name()?.to_str()?;
@@ -323,7 +438,8 @@ pub fn enable_front(next_gh: &Path) {
     let base = std::env::var_os(DIR_ENV)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .filter(|base| publish::gh_marker_matches(base, next_gh));
+        .filter(|base| publish::gh_marker_matches(base, next_gh))
+        .filter(|base| !outage::front_outage_active(base, SystemTime::now()));
     let _ = FRONT.set(base);
 }
 

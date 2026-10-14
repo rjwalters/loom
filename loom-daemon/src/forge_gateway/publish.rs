@@ -59,7 +59,7 @@ pub trait Deps {
     /// # Errors
     ///
     /// A reason that never contains the key.
-    fn read_key(&self, r: &KeyRef) -> Result<String, String>;
+    fn read_key(&self, r: &KeyRef, region: Option<&str>) -> Result<String, String>;
 }
 
 struct RealDeps;
@@ -93,8 +93,8 @@ impl Deps for RealDeps {
         Some((path, v))
     }
 
-    fn read_key(&self, r: &KeyRef) -> Result<String, String> {
-        r.read()
+    fn read_key(&self, r: &KeyRef, region: Option<&str>) -> Result<String, String> {
+        r.read(region)
     }
 }
 
@@ -231,9 +231,12 @@ impl Refresher {
     ) -> PassOutcome {
         let mut owners = Vec::new();
         let mut failed = Vec::new();
+        let region = super::resolve_region(cfg.region.as_deref(), &|k| {
+            std::env::var(k).ok().filter(|v| !v.is_empty())
+        });
         for (owner, r) in &cfg.key_refs {
             let dir = base.join(owner);
-            let result = deps.read_key(r).and_then(|key| {
+            let result = deps.read_key(r, region.as_deref()).and_then(|key| {
                 publish_profile(&dir, &key, &cfg.api_host).map_err(|e| e.to_string())
             });
             match result {
@@ -312,10 +315,12 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// Write `bytes` to `path` atomically, created 0600 (never readable by
 /// others, not even for an instant).
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // A leftover from a crashed run may carry any mode: never reuse it.
+    let _ = std::fs::remove_file(&tmp);
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -323,7 +328,16 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let written = opts
         .open(&tmp)
-        .and_then(|mut f| f.write_all(bytes))
+        .and_then(|mut f| {
+            // The umask cannot widen 0600, but make the mode explicit anyway
+            // before a byte of the key is written.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            f.write_all(bytes)
+        })
         .and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -331,9 +345,34 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     written
 }
 
-/// Publish one read profile: `config.yml` (skips gh's account migration) and
-/// a `hosts.yml` carrying `key` with `api_host`, both 0600 in a 0700 `dir`.
-/// `api_host` is written every time `hosts.yml` is.
+/// The gateway profile's `config.yml`: `version: 1` skips gh's account
+/// migration (which calls `/user`). No `git_protocol`: a gateway profile is
+/// never a git credential.
+pub const GATEWAY_CONFIG_YAML: &str = "version: 1\n";
+
+/// The gateway profile's `hosts.yml`: the key and `api_host`, nothing else.
+/// Unlike the App profiles (`credential_preflight::gh_hosts_yaml`) it names
+/// no `user` and no `git_protocol`, so `gh auth git-credential` run under it
+/// has nothing to hand git, and the key cannot become a git password.
+#[must_use]
+pub fn gateway_hosts_yaml(key: &str, api_host: &str) -> String {
+    format!("github.com:\n    oauth_token: {key}\n    api_host: {api_host}\n")
+}
+
+/// The `api_host` a published profile in `dir` names (the page walk keeps
+/// its next links on it).
+#[must_use]
+pub fn profile_api_host(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("hosts.yml")).ok()?;
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("api_host:"))
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+}
+
+/// Publish one read profile: `config.yml` and a `hosts.yml` carrying `key`
+/// with `api_host`, both 0600 in a 0700 `dir`. `api_host` is written every
+/// time `hosts.yml` is.
 ///
 /// # Errors
 ///
@@ -343,9 +382,8 @@ pub fn publish_profile(dir: &Path, key: &str, api_host: &str) -> std::io::Result
         return Err(std::io::Error::other("refusing an invalid gateway key or api_host"));
     }
     ensure_private_dir(dir)?;
-    write_private(&dir.join("config.yml"), crate::credential_preflight::GH_CONFIG_YAML.as_bytes())?;
-    let hosts = crate::credential_preflight::gh_hosts_yaml(key, Some(api_host));
-    write_private(&dir.join("hosts.yml"), hosts.as_bytes())
+    write_private(&dir.join("config.yml"), GATEWAY_CONFIG_YAML.as_bytes())?;
+    write_private(&dir.join("hosts.yml"), gateway_hosts_yaml(key, api_host).as_bytes())
 }
 
 /// One pass for `ws` (see [`Refresher`]).

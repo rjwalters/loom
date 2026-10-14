@@ -25,26 +25,9 @@ use std::process::Command;
 /// failure.
 #[cfg(unix)]
 pub fn exec<A: AsRef<OsStr>>(program: &Path, args: &[A], env: &[(&str, OsString)]) -> io::Error {
-    exec_with(program, args, env, &[])
-}
-
-/// [`exec`] that also removes `remove` from the child's environment — for
-/// the one credential swap the front makes (2am#4367 P4: a classified read
-/// on a gateway profile, with every env token removed so it cannot outrank
-/// the profile).
-#[cfg(unix)]
-pub fn exec_with<A: AsRef<OsStr>>(
-    program: &Path,
-    args: &[A],
-    env: &[(&str, OsString)],
-    remove: &[&str],
-) -> io::Error {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(program);
     cmd.args(args);
-    for k in remove {
-        cmd.env_remove(k);
-    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -54,22 +37,8 @@ pub fn exec_with<A: AsRef<OsStr>>(
 /// Non-unix: spawn with inherited stdio, wait, and exit with the child's code.
 #[cfg(not(unix))]
 pub fn exec<A: AsRef<OsStr>>(program: &Path, args: &[A], env: &[(&str, OsString)]) -> io::Error {
-    exec_with(program, args, env, &[])
-}
-
-/// Non-unix [`exec_with`].
-#[cfg(not(unix))]
-pub fn exec_with<A: AsRef<OsStr>>(
-    program: &Path,
-    args: &[A],
-    env: &[(&str, OsString)],
-    remove: &[&str],
-) -> io::Error {
     let mut cmd = Command::new(program);
     cmd.args(args);
-    for k in remove {
-        cmd.env_remove(k);
-    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -77,4 +46,32 @@ pub fn exec_with<A: AsRef<OsStr>>(
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(e) => e,
     }
+}
+
+/// Run `program args…` to completion with stdin inherited and stdout/stderr
+/// captured, `env` set and `remove` removed — the agent front's gateway
+/// attempt (2am#4367 P4), which must be able to fall back to the direct
+/// call when the relay is down, so it cannot `exec`.
+///
+/// # Errors
+///
+/// When the child cannot be spawned or waited for.
+pub fn run_captured<A: AsRef<OsStr>>(
+    program: &Path,
+    args: &[A],
+    env: &[(&str, OsString)],
+    remove: &[&str],
+) -> io::Result<std::process::Output> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output()
 }
