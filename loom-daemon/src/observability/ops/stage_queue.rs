@@ -33,7 +33,7 @@
 //! | `issue_no_pr` | `loom:issue` with no open PR closing it |
 //! | `parked` | issues carrying a park label (registry `park` property) |
 //! | `pr_held` | **PRs** carrying a hold label (registry `hold` property), e.g. an approved `loom:pr` under `loom:operator` |
-//! | `pr_champion_held` | **PRs** at the Champion-hold label shape: `loom:pr` + `loom:blocked`, no operator hold (#11905), a subset of `pr_held`; may include markerless parks until #11932 |
+//! | `pr_champion_held` | **PRs** at the Champion-hold label shape: `loom:pr` + `loom:blocked`, no operator hold (#11905), a subset of `pr_held`; markerless parks count too (no marker read) |
 
 use std::collections::{BTreeMap, BTreeSet};
 

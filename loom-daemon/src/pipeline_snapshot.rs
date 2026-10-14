@@ -109,8 +109,9 @@ pub struct RepoPipelineSnapshot {
     /// [`Self::operator_held`]) or the read failed.
     pub operator_held_oldest_days: Option<i64>,
     /// Open PRs at the Champion-hold label shape (#11905): the approval beside
-    /// `loom:blocked`, and no operator hold; it may include another actor's
-    /// markerless park at approval until #11932 lands
+    /// `loom:blocked`, and no operator hold; it includes another actor's
+    /// markerless park at approval (which Champion's `champion-hold classify`,
+    /// #11932, skips: this count reads no marker), so read it as held approvals
     /// ([`crate::champion_hold::held_approval_shape`]), so it never overlaps
     /// [`Self::operator_held`]. The sibling count that keeps Champion's
     /// merge-risk and critical-file holds visible once `labels migrate
