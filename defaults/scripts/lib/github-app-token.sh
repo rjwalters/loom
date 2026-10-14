@@ -312,24 +312,13 @@ _github_app_needs_remint() {
 # require a live GitHub App") -- they are exercised only by the executable
 # CLI dispatch below, in production, once an app is actually installed.
 
-# _curl_cfg_quote <value> -> value escaped for a double-quoted curl config
-# string (backslash and double quote; newlines stripped). Used with
-# `curl --config <(printf ...)` so credentials never reach curl's argv (#10463).
-_curl_cfg_quote() {
-  local v="$1"
-  v="${v//$'\n'/}"; v="${v//$'\r'/}"
-  v="${v//\\/\\\\}"
-  v="${v//\"/\\\"}"
-  printf '%s' "$v"
-}
-
 # _github_app_api_get_installation <owner/repo> -> echoes the installation id
 # on stdout. Requires a fresh JWT (github_app_jwt).
 _github_app_api_get_installation() {
   local nwo="$1" jwt resp http_code body
   jwt=$(github_app_jwt) || return 1
   resp=$(curl -sS -w '\n%{http_code}' \
-    --config <(printf 'header = "Authorization: Bearer %s"\n' "$(_curl_cfg_quote "$jwt")") \
+    --config <(printf 'header = "Authorization: Bearer %s"\n' "$jwt") \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "https://api.github.com/repos/${nwo}/installation" 2>/dev/null) || {
@@ -362,7 +351,7 @@ _github_app_api_mint_token() {
   local installation_id="$1" jwt resp http_code body
   jwt=$(github_app_jwt) || return 1
   resp=$(curl -sS -w '\n%{http_code}' -X POST \
-    --config <(printf 'header = "Authorization: Bearer %s"\n' "$(_curl_cfg_quote "$jwt")") \
+    --config <(printf 'header = "Authorization: Bearer %s"\n' "$jwt") \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "https://api.github.com/app/installations/${installation_id}/access_tokens" 2>/dev/null) || {
