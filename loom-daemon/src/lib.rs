@@ -446,6 +446,7 @@ pub mod watchdog;
 pub mod watchdog_provisioning_guard;
 pub mod weighted_draw;
 pub mod work_finder;
+pub mod work_finder_guard;
 pub mod worker_spawn;
 pub mod workspace_hold;
 pub mod workspace_pool;
