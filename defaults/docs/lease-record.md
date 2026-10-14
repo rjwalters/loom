@@ -750,6 +750,18 @@ the same lease semantics, **keyed by role**:
   waiting out the TTL.
 - **`check`** prints `PR_LEASE_STATE=free|held-self|held-peer|unknown`: the
   PR-phase shape of #11118's `claim_state(item)`.
+- **Judge no-verdict backstop (#11855).** A Judge `release` that finds the PR
+  open, still `loom:review-requested` and carrying neither `loom:pr` nor
+  `loom:changes-requested` appends `head=<sha> verdict=none labels=<digest>`
+  to the released marker (the digest is the sorted `loom:*` labels, claim
+  labels left out). Those records, from trusted authors and at the PR's
+  current head and digest, hold the PR out of `pr-queue --role judge`, the
+  role runner's Judge gate and a Judge `claim` (exit 6, nothing written): one
+  hour after the first, four after the second, and after the third until the
+  oldest of the last three is 24 h old, so an unchanged PR gets at most three
+  Judge runs a day. A push or a label change releases the hold at once; an
+  unreadable record list serves the PR; `LOOM_JUDGE_BACKSTOP=0` turns it off.
+  Rules: `loom-daemon/src/judge_backstop.rs`.
 - **Provenance.** Lease and yield comments end with the `loom:provenance v1`
   line (`loom-daemon provenance`'s format). Its `host=` carries the published id
   rather than the raw hostname, so one comment never pairs an opaque id with

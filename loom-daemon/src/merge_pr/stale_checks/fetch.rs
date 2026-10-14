@@ -11,7 +11,8 @@
 //! 2. **required contexts** — the same TWO-source union
 //!    `forge_get_required_status_check_contexts` builds (#8103): rulesets
 //!    (`GET /repos/{nwo}/rules/branches/{branch}`) and classic branch
-//!    protection (GraphQL `branchProtectionRule.requiredStatusCheckContexts`),
+//!    protection (GraphQL `branchProtectionRule.requiredStatusCheckContexts`,
+//!    or the REST branch summary when GraphQL is refused, #11855),
 //!    because a required check configured in either is invisible to the
 //!    other's API. A failure on EITHER source fails the whole lookup closed —
 //!    a surviving source's answer is a partial view, and a partial view of
@@ -322,6 +323,65 @@ fn ruleset_contexts(body: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// The classic-protection read REST serves to any reader (#11855).
+const BRANCH_OP: ForgeOp =
+    ForgeOp::uninventoried("branch protection summary read by the freshness guard");
+
+/// Classic branch protection's required contexts from the REST branch summary
+/// (`GET /repos/{nwo}/branches/{branch}`, #11855), the fallback for a refused
+/// GraphQL `branchProtectionRule` read. Conditional like the rulesets read.
+fn classic_from_branch(
+    gh: &str,
+    nwo: &str,
+    base_ref: &str,
+    store: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let url = format!("repos/{nwo}/branches/{base_ref}");
+    let body = conditional(gh, nwo, store, |r| r.read(&url, BRANCH_OP))?;
+    branch_protection_contexts(&body)
+}
+
+/// The contexts a `branches/{ref}` answer's `protection` summary requires
+/// (`contexts` plus `checks[].context`, de-duplicated). An unprotected branch
+/// requires none. A protected branch whose answer carries no `protection`
+/// object is an `Err`: the summary was withheld, not empty, and the caller
+/// fails closed on it.
+pub(crate) fn branch_protection_contexts(body: &str) -> Result<Vec<String>, String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| format!("branch response was not JSON: {e}"))?;
+    let protected = v
+        .get("protected")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("branch response has no `protected` flag")?;
+    let Some(protection) = v.get("protection").filter(|p| p.is_object()) else {
+        return if protected {
+            Err("branch is protected but its `protection` summary was withheld".into())
+        } else {
+            Ok(Vec::new())
+        };
+    };
+    let checks = protection.pointer("/required_status_checks");
+    let named = checks
+        .and_then(|c| c.get("contexts"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str);
+    let by_app = checks
+        .and_then(|c| c.get("checks"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("context").and_then(serde_json::Value::as_str));
+    let mut out: Vec<String> = Vec::new();
+    for ctx in named.chain(by_app) {
+        if !ctx.trim().is_empty() && !out.iter().any(|s| s == ctx) {
+            out.push(ctx.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// Required status check contexts, unioned across rulesets and classic branch
 /// protection (mirroring `forge_get_required_status_check_contexts`, #8103),
 /// plus any [`plan_gated_notice`] the lookup had to record.
@@ -375,7 +435,22 @@ fn fetch_required(
             notices.push(plan_gated_notice("classic branch-protection", base_ref, &e));
             String::new()
         }
-        Err(e) => return Err(format!("classic branch-protection lookup failed: {e}")),
+        // #11855: the GraphQL field needs `Administration: read`, which a
+        // read-only App token lacks ("Resource not accessible by
+        // integration"). The REST branch summary answers the same question
+        // with read access alone, so a refused GraphQL read is retried there
+        // before the lookup fails closed.
+        Err(e) => match classic_from_branch(gh, nwo, base_ref, store) {
+            Ok(contexts) => {
+                log::debug!("required contexts for {nwo}@{base_ref}: GraphQL failed ({e}); read the REST branch summary instead (#11855)");
+                contexts.join("\n")
+            }
+            Err(rest) => {
+                return Err(format!(
+                    "classic branch-protection lookup failed: {e}; REST branch fallback: {rest}"
+                ))
+            }
+        },
     };
 
     // Union, order-preserving, de-duplicated: a context can legitimately be

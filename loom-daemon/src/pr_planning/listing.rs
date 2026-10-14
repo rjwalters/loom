@@ -119,17 +119,110 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
             }
         }
     }
-    let mut queue = ordered_queue(rows, role, prefer_human_prs(root), &TrustPolicy::for_root(root));
+    let trust = TrustPolicy::for_root(root);
+    let mut queue = ordered_queue(rows, role, prefer_human_prs(root), &trust);
     if role == PrRole::Judge {
         let mut guarded = Vec::new();
         for row in queue {
-            if row["mode"] != "fallback" || guard_admits(root, &row)? {
+            if row["mode"] == "fallback" {
+                if guard_admits(root, &row)? {
+                    guarded.push(row);
+                }
+            } else if !backstop_holds(root, gh, &row, &trust) {
                 guarded.push(row);
             }
         }
         queue = guarded;
     }
     Ok(queue)
+}
+
+/// Every trusted comment on issue/PR `number`, oldest first, through the
+/// same conditional pages as the listing (an unchanged page is a free `304`).
+fn trusted_comments(
+    root: &Path,
+    gh: &Path,
+    number: u64,
+    trust: &TrustPolicy,
+) -> Result<Vec<Value>> {
+    let mut rows = Vec::new();
+    for page in 1.. {
+        let value = read(
+            root,
+            gh,
+            ops::COMMENT_LIST,
+            &format!("issues/{number}/comments?per_page=100&page={page}"),
+        )?;
+        let batch = value
+            .as_array()
+            .context("comment listing must be an array")?;
+        rows.extend(batch.iter().cloned());
+        if batch.len() < 100 {
+            break;
+        }
+    }
+    Ok(trust.filter(rows))
+}
+
+/// Whether the Judge no-verdict backstop holds this workflow row
+/// ([`crate::judge_backstop`], #11855): its passes at this head and label set
+/// already ended without a verdict often enough. Fails open — an unreadable
+/// record list serves the PR — and says why on stderr (stdout is the queue).
+fn backstop_holds(root: &Path, gh: &Path, row: &Value, trust: &TrustPolicy) -> bool {
+    use crate::judge_backstop as backstop;
+    let (Some(number), Some(head)) = (row["number"].as_u64(), row["head"]["sha"].as_str()) else {
+        return false;
+    };
+    if !backstop::enabled() || !has_label(row, backstop::REVIEW_LABEL) {
+        return false;
+    }
+    let labels: Vec<&str> = row["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.as_str().or_else(|| l["name"].as_str()))
+        .collect();
+    let comments = match trusted_comments(root, gh, number, trust) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Judge backstop: PR #{number} records unreadable ({e:#}); serving it (#11855)"
+            );
+            return false;
+        }
+    };
+    match backstop::hold_from_comments(&comments, head, &labels, chrono::Utc::now()) {
+        Some(until) => {
+            eprintln!(
+                "Judge backstop: PR #{number} held until {} — its Judge passes at head {} ended \
+                 without a verdict (#11855); a push or label change releases it",
+                until.to_rfc3339(),
+                &head[..head.len().min(12)]
+            );
+            true
+        }
+        None => false,
+    }
+}
+
+/// The Judge role-runner gate on a non-empty labeled listing (#11855): is
+/// there a row `pr-queue --role judge` would actually serve — a labeled row
+/// the no-verdict backstop does not hold, or a guard-admitted fallback row?
+/// Stops at the first one, so a repository with servable work pays for one
+/// row's record read.
+pub fn has_judge_work(root: &Path, gh: &Path) -> Result<bool> {
+    let (prefer, trust) = (prefer_human_prs(root), TrustPolicy::for_root(root));
+    for row in ordered_queue(list_open(root, gh)?, PrRole::Judge, prefer, &trust) {
+        let served = if row["mode"] == "fallback" {
+            guard_admits(root, &row)?
+        } else {
+            !backstop_holds(root, gh, &row, &trust)
+        };
+        if served {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Judge's role-runner gate on an empty labeled listing (#9389): is there a
