@@ -39,10 +39,9 @@ pub(crate) fn prepare(
     {
         anyhow::bail!("dispatch refused (#9548): {why}");
     }
-    let issue = match kind {
-        SweepKind::Issue(n) => Some(u64::from(*n)),
-        SweepKind::PrSet(_) => None,
-    };
+    // A step on an issue is that issue's work, as its sweep would be; a PR
+    // step names no exported issue (#11898).
+    let issue = kind.issue_number().map(u64::from);
     // Verified private-clone containment (#8787) is prepared HERE — outside
     // the registry lock, where the rest of the Docker work already happens —
     // and only for a candidate whose sole unmet requirement it can satisfy.
@@ -156,7 +155,12 @@ impl SweepRegistry {
             .as_deref()
             .is_some_and(|key| self.find_running_by_key(key).is_some());
         if !existing && !self.config.skip_label_flip {
-            let private_issue = matches!(kind, SweepKind::Issue(n) if crate::tokens_pool::private_workspace::export::has_issue(&self.config.workspace_root, *n));
+            let private_issue = kind.issue_number().is_some_and(|n| {
+                crate::tokens_pool::private_workspace::export::has_issue(
+                    &self.config.workspace_root,
+                    n,
+                )
+            });
             let codex = crate::runtime_admission::resolve_binding(
                 &self.config.workspace_root,
                 "sweep-lifecycle",

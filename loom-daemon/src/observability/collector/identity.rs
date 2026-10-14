@@ -128,8 +128,11 @@ impl Sampler {
                         (guard.config().workspace_root.clone(), guard.snapshot())
                     };
                     for info in snapshot.list(None) {
-                        let SweepKind::Issue(issue) = info.kind else {
-                            continue;
+                        // A step's identity is keyed by its item (#11898),
+                        // as a sweep's by its issue.
+                        let issue = match info.kind {
+                            SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => n,
+                            SweepKind::PrSet(_) => continue,
                         };
                         if info.state.is_terminal() {
                             continue;

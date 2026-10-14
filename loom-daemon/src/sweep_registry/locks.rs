@@ -863,7 +863,8 @@ impl SweepRegistry {
     #[must_use]
     fn has_tracked_sweep_for(&self, issue: u32) -> bool {
         self.entries.values().any(|info| {
-            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
+            // An issue step holds the same `issue-<N>` lock (#11898).
+            !info.state.is_terminal() && info.kind.issue_number() == Some(issue)
         })
     }
 
@@ -1132,7 +1133,7 @@ impl SweepRegistry {
                 // Skip if we already have a Running entry for this issue.
                 let already_running = self.entries.values().any(|info| {
                     matches!(info.state, SweepState::Running | SweepState::Pending)
-                        && matches!(info.kind, SweepKind::Issue(n) if n == issue)
+                        && info.kind.issue_number() == Some(issue)
                 });
                 if already_running {
                     continue;

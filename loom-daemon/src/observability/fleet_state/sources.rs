@@ -137,15 +137,28 @@ fn held_sweeps(
             continue;
         };
         for info in snapshot.list(None) {
-            let SweepKind::Issue(issue) = info.kind else {
-                continue;
-            };
             if info.state.is_terminal() {
                 continue;
             }
-            let (phase, phase_at, pr) = checkpoint(&checkpoint_dir, issue, info.started_at);
-            let (stage, entered_at, lower_bound) =
-                held_stage(phase.as_deref(), phase_at, info.started_at);
+            let (issue, stage, entered_at, lower_bound, pr) = match info.kind {
+                SweepKind::Issue(issue) => {
+                    let (phase, phase_at, pr) = checkpoint(&checkpoint_dir, issue, info.started_at);
+                    let (stage, entered_at, lower_bound) =
+                        held_stage(phase.as_deref(), phase_at, info.started_at);
+                    (issue, stage, entered_at, lower_bound, pr)
+                }
+                // A step is held in its role's stage from its start (#11898).
+                // A PR step's row names the PR as both item and `pr`;
+                // `build_view` re-keys it to the PR's linked issue.
+                SweepKind::Step { item, role } => (
+                    item,
+                    super::step_stage(role),
+                    info.started_at,
+                    false,
+                    role.acts_on_pr().then_some(item),
+                ),
+                SweepKind::PrSet(_) => continue,
+            };
             held.push(HeldSweep {
                 repo: slug.to_ascii_lowercase(),
                 issue,

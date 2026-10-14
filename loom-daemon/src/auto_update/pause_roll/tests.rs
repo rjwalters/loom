@@ -245,6 +245,8 @@ pub(super) fn cand(dir: &Path, id: &str, issue: u32, age_secs: i64) -> Candidate
         role: None,
         timeout_remaining_secs: None,
         holds_issue_creation_mutex: false,
+        pr: None,
+        step: None,
     }
 }
 

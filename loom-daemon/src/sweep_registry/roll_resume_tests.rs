@@ -69,6 +69,7 @@ fn launch(runtime: &str) -> RollResumeLaunch {
 
 fn spec(issue: u32, launch: RollResumeLaunch) -> RollResumeSpec {
     RollResumeSpec {
+        step: None,
         issue,
         old_sweep_id: OLD.to_string(),
         launch,
@@ -496,4 +497,43 @@ fn restart_recovery_can_be_run_for_one_released_issue() {
         .collect();
     assert_eq!(crashed.len(), 1);
     assert_eq!(crashed[0].kind, SweepKind::Issue(88));
+}
+
+/// #11898: a paused issue step resumes from its saved session as the same
+/// step: tracked as `Step`, its own step log, the claim lock kept, and no
+/// issue-sweep journal record (restart recovery rebuilds sweeps, not steps).
+#[test]
+fn a_paused_issue_step_resumes_as_its_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let (mut reg, _record) = registry(&ws);
+    pause_issue(&reg, &ws, 79, OLD, "claude");
+    let mut spec = spec(79, launch("claude"));
+    spec.step = Some(crate::step_role::StepRole::Curator);
+
+    let resumed = resume(&mut reg, &spec);
+
+    assert!(resumed.sweep_id.starts_with("step-curator-79-"), "{}", resumed.sweep_id);
+    let entry = reg
+        .entries
+        .get(&resumed.sweep_id)
+        .expect("a registry entry");
+    assert_eq!(
+        entry.kind,
+        SweepKind::Step {
+            item: 79,
+            role: crate::step_role::StepRole::Curator
+        }
+    );
+    assert_eq!(entry.log_path, reg.compute_step_log_path(79, spec.step.unwrap()));
+    assert_eq!(owner(&reg, 79).sweep_id, resumed.sweep_id, "the claim is kept");
+    let journal = crate::sweep_journal::load(&ws.join("test-sweeps-journal.json"));
+    assert!(
+        !journal
+            .entries
+            .iter()
+            .any(|e| e.issue == 79 && e.pid == resumed.pid),
+        "a step is not journalled as an issue sweep"
+    );
+    reg.abandon_roll_resume(&resumed.sweep_id);
 }
