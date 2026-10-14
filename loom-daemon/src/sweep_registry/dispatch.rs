@@ -164,7 +164,7 @@ impl std::error::Error for OpenPrDispatchError {}
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
 /// park-label guard (Issue #4444, step 2.7) refuses a dispatch because the
 /// target issue currently carries a [`PARK_LABELS`] entry (`loom:blocked` /
-/// `loom:operator-only`).
+/// `loom:operator` / `loom:frozen`).
 ///
 /// The work-finder's [`SKIP_LABELS`] filter only covers *its own* candidate
 /// query. Every other dispatch route — all three watchdogs (#3887 / #3895 /
@@ -185,8 +185,8 @@ impl std::error::Error for OpenPrDispatchError {}
 pub struct ParkedIssueDispatchError {
     /// The issue whose dispatch was refused.
     pub issue: u32,
-    /// The park label that triggered the refusal (`loom:blocked` or
-    /// `loom:operator-only`).
+    /// The park label that triggered the refusal (`loom:blocked`,
+    /// `loom:operator`, `loom:frozen`, or a retired name for one).
     pub label: String,
 }
 

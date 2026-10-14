@@ -42,7 +42,7 @@ Safety Criteria still apply (see its "Batch Processing").
 Runs every pass, whether or not PRs remain ("Autonomous Operation" below,
 #10753). Check for curated issues. Exclude `loom:evaluating` (a
 fresh claim from a concurrent Champion evaluation, #4954), as well as
-`loom:operator-only` and `loom:blocked` — both put an issue permanently outside
+`loom:operator`, `loom:blocked` and `loom:frozen` — each puts an issue outside
 Champion's promotion authority per `champion-issue-promo.md`'s "When NOT to
 Promote", so there is no reason to hand them into the evaluation pass at all
 (#5163). Also exclude `loom:issue` and `loom:building` (why: the note below
@@ -53,9 +53,9 @@ terminal — `title`/`body` feed `champion-issue-promo.md`'s body-hash
 idempotency check (the issue's aggregate `updatedAt` is deliberately NOT used
 for it, #4966):
 
-> **`loom:operator-only` is excluded here, but not unexamined (#5664).**
+> **`loom:operator` is excluded here, but not unexamined (#5664).**
 > `champion-issue-promo.md` → "Pass 0: Self-Healing Un-Escalation Re-Scan" runs
-> one bounded scan of `loom:operator-only` proposals *before* this discovery
+> one bounded scan of `loom:operator` proposals *before* this discovery
 > query and removes the label from any whose escalation was Champion's own,
 > dependency-only, and whose recorded blocker has since closed. Those issues then
 > match the query below in the same pass. Without that scan, an escalation for an
@@ -63,12 +63,10 @@ for it, #4966):
 > the only actor that could notice the blocker closed is the one this exclusion
 > tells to ignore it.
 >
-> **A `loom:operator-only` proposal you read that is really blocked on
-> missing capability** is relabeled `loom:needs-capability` per
-> `.loom/docs/label-state-machine.md` → "Bidirectional routing" (#5818), an
-> opportunistic per-occurrence call. **Any operator label you apply** is for a
-> PO-level decision (ranked options) or a human-hands step only (#10001):
-> `curator.md` → "Applying `loom:operator-only`".
+> **A `loom:operator` proposal you read that is really blocked on a missing
+> capability** is swapped to `loom:blocked` + capability marker (#5818), an
+> opportunistic per-occurrence call. **Any hold you apply** follows
+> `.loom/docs/label-state-machine.md` → "Routing to a human" (#10001).
 
 > **`loom:evaluating` is excluded here too, but not unexamined (#6828).**
 > `champion-issue-promo.md` → "Pass 0b: Stale `loom:evaluating` Claim Re-Scan"
@@ -82,17 +80,18 @@ for it, #4966):
 > "Claim (staleness-aware...)" reconciliation for this exact case never runs,
 > because it only fires on an issue *after* discovery has already selected it.
 > A `loom:evaluating` claim that keeps going stale on the SAME issue routes to
-> `loom:operator-only,loom:operator-mechanical` after repeated reclaims rather
+> `loom:operator` after repeated reclaims rather
 > than looping forever — see Pass 0b for the bound.
 
 ```bash
-# Level, then oldest first (#11103)
+# Level, then oldest first (#11103); holds: champion-common.md "Hold set"
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
 gh issue list \
   --label="loom:curated" \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments,createdAt \
-  --jq 'sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator-only","loom:blocked","loom:issue","loom:building","loom:needs-revision","loom:frozen")) | not) |
+  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building","loom:needs-revision") or IN($h[])) | not) |
   "#\(.number) \(.title)"'
 ```
 
@@ -111,13 +110,14 @@ required) and `title`/`body` fetch:
 
 ```bash
 # Architect proposals, Hermit proposals, Auditor bug reports
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
 for P in architect hermit auditor; do
 gh issue list \
   --label="loom:$P" \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments,createdAt \
-  --jq 'sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator-only","loom:blocked","loom:issue","loom:building","loom:needs-revision","loom:frozen")) | not) |
+  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building","loom:needs-revision") or IN($h[])) | not) |
   "#\(.number) \(.title) ['"$P"']"'
 done
 ```
@@ -157,7 +157,7 @@ gh pr list \
   --jq '.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "#\(.number) \(.title)"'
 ```
 
-Ignore any that also carry `loom:operator-only` (already routed to a human). If found, **read and follow instructions in `.claude/commands/loom/champion-pr-merge.md` → "Capped-PR Recovery Pass"**: read the full rejection history, apply the forward-progress test, and either grant one more Doctor→Judge cycle (remove `loom:blocked` only), keep the PR parked, or recommend closure to the operator — always with a rationale comment. This pass never merges or closes (Champion's only close authority is the proposal "premise-false close gate", `champion-issue-promo.md` Step 4, #7657 — never a PR).
+Ignore any that also carry `loom:operator` (already routed to a human). If found, **read and follow instructions in `.claude/commands/loom/champion-pr-merge.md` → "Capped-PR Recovery Pass"**: read the full rejection history, apply the forward-progress test, and either grant one more Doctor→Judge cycle (remove `loom:blocked` only), keep the PR parked, or recommend closure to the operator — always with a rationale comment. This pass never merges or closes (Champion's only close authority is the proposal "premise-false close gate", `champion-issue-promo.md` Step 4, #7657 — never a PR).
 
 ### Rollout Check Pass (every pass, max 3 items)
 

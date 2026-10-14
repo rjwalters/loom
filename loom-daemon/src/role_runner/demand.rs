@@ -492,18 +492,17 @@ pub fn count_pr_rows(rows: &[RestIssue]) -> usize {
 
 /// Labels that make a `loom:pr` PR one Champion will not merge — held for a
 /// human (#9410). The authoritative set is `champion-pr-merge.md`'s
-/// "`loom:blocked` / `loom:operator` / `loom:operator-only` PRs ... are still
-/// not merge-eligible". The critical-file hold (#6879) is one of these: it
-/// adds `loom:operator` (`champion-critical-file-hold.md`); there is no
-/// separate `loom:critical-file-hold` label, only a comment marker.
-/// `loom:frozen` (#11743) is in it too: no role touches a frozen PR, and
+/// "`loom:blocked` / `loom:operator` PRs ... are still not merge-eligible".
+/// The critical-file hold (#6879) is one of these: it adds `loom:operator`
+/// (`champion-critical-file-hold.md`); there is no separate
+/// `loom:critical-file-hold` label, only a comment marker. `loom:frozen`
+/// (#11743) is in it too: no role touches a frozen PR, and
 /// `champion-pr-merge.md` skips it.
-pub const MERGE_HOLD_LABELS: [&str; 4] = [
-    "loom:blocked",
-    "loom:operator",
-    "loom:operator-only",
-    crate::work_finder::FROZEN_LABEL,
-];
+///
+/// Derived (#11795): [`crate::work_finder::HOLD_NAMES`], the three holds and
+/// the retired names that fold into them, so an unmigrated
+/// `loom:operator-only` PR is still held.
+pub use crate::work_finder::HOLD_NAMES as MERGE_HOLD_LABELS;
 
 /// The review axis's park set (#11743): only `loom:frozen`, which the Judge's
 /// `pr-queue` drops since #11793. `judge.md`'s queue has no other exclusions.
@@ -513,8 +512,8 @@ const REVIEW_HOLD_LABELS: [&str; 1] = [crate::work_finder::FROZEN_LABEL];
 /// Each set is defined once, where its role's skip rule lives:
 ///
 /// - Merge: [`MERGE_HOLD_LABELS`] (`champion-pr-merge.md`).
-/// - Changes: [`crate::work_finder::PARK_LABELS`] (`loom:blocked`,
-///   `loom:operator-only`, and since #11743 `loom:frozen`, all from the label
+/// - Changes: [`crate::work_finder::PR_LANE_PARK_LABELS`] (`loom:blocked`,
+///   `loom:frozen` and the retired `loom:operator-only`, all from the label
 ///   registry), the set `doctor.md` Priority 2 skips (#9421).
 ///   `loom:operator` is deliberately *not* in it: Champion routes stale held
 ///   PRs to Doctor with that label still on, and Doctor drains them (#7660).
@@ -525,7 +524,7 @@ const REVIEW_HOLD_LABELS: [&str; 1] = [crate::work_finder::FROZEN_LABEL];
 pub(crate) fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
     match axis {
         DebtAxis::Merge => &MERGE_HOLD_LABELS,
-        DebtAxis::Changes => &crate::work_finder::PARK_LABELS,
+        DebtAxis::Changes => &crate::work_finder::PR_LANE_PARK_LABELS,
         DebtAxis::Review => &REVIEW_HOLD_LABELS,
     }
 }
@@ -533,7 +532,7 @@ pub(crate) fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
 /// Open PR rows that count as debt on `axis`. PRs the axis's owning role will
 /// not drain are left out ([`axis_park_labels`]): merge debt skips PRs held
 /// for a human ([`MERGE_HOLD_LABELS`]), changes debt skips parked PRs
-/// ([`crate::work_finder::PARK_LABELS`], #9421), review debt skips frozen
+/// ([`crate::work_finder::PR_LANE_PARK_LABELS`], #9421), review debt skips frozen
 /// PRs (#11743).
 /// Counting undrainable PRs would keep the work finder's build back-off
 /// (#9410) engaged on a host with many of them. Uses the labels already in

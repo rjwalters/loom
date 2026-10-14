@@ -18,7 +18,7 @@
 //! 2. Filters out issues that are **already in flight** (present in the
 //!    [`SweepRegistry`](crate::sweep_registry::SweepRegistry) as a `Running` /
 //!    `Pending` sweep) or that defensively carry any [`SKIP_LABELS`] entry
-//!    (`loom:building` / `loom:blocked` / `loom:operator-only`).
+//!    (`loom:building` / `loom:blocked` / `loom:operator`).
 //! 3. For each remaining issue, dispatches through the existing
 //!    [`SweepRegistry::dispatch`](crate::sweep_registry::SweepRegistry::dispatch)
 //!    path — up to a **work-driven** max-concurrency cap recomputed every tick
@@ -248,10 +248,7 @@ mod tracking_parent;
 pub mod vi_cap;
 pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
-pub use labels::{
-    is_frozen, restore_veto, BUILDING_LABEL, FROZEN_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS,
-    SKIP_LABELS,
-};
+pub use labels::*;
 pub use main_red_fix::RedMainLane;
 pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};
@@ -381,14 +378,14 @@ impl WorkItem {
                 .any(|l| extra_skip_labels.iter().any(|e| e == l))
     }
 
-    /// How the capability-aware `loom:operator-mechanical` lane (#6893) routes
-    /// this item, given the capabilities this worker declares it holds.
+    /// How the capability lane (#6893) routes this item, given the capabilities
+    /// this worker declares it holds.
     ///
     /// A thin adapter over [`crate::capability::route_mechanical`] — the labels
     /// and body already fetched by the listing, no extra forge read. Returns
     /// [`MechanicalRouting::NotApplicable`](crate::capability::MechanicalRouting::NotApplicable)
-    /// for every item that is not a `loom:operator-only` +
-    /// `loom:operator-mechanical` pair, which is all but a handful.
+    /// for every item that is not an operator hold without a decision block,
+    /// which is all but a handful.
     #[must_use]
     pub fn mechanical_routing(
         &self,
@@ -410,23 +407,20 @@ impl WorkItem {
         crate::host_affinity::host_constraint(&self.labels, self.body.as_deref())
     }
 
-    /// True when the issue is skipped, with the `loom:operator-only` hard park
-    /// made **capability-aware for the mechanical sub-kind only** (#6893, AC1).
+    /// True when the issue is skipped, with the `loom:operator` park made
+    /// **capability-aware for mechanical holds only** (#6893, AC1; #11795).
     ///
     /// Identical to [`Self::is_skipped_with_extra`] except for one narrow
-    /// exemption: an item carrying `loom:operator-only` **and**
-    /// `loom:operator-mechanical`, whose body declares capabilities (the
+    /// exemption: an operator hold whose body declares capabilities (the
     /// `<!-- loom:capability=<name> -->` markers from #6892) that
-    /// `held_capabilities` fully covers, is **not** skipped — it is dispatchable
-    /// into the propose-mode lane. Everything else about the park is unchanged:
+    /// `held_capabilities` fully covers, and carries no decision block, is
+    /// **not** skipped — it is dispatchable into the propose-mode lane:
     ///
-    /// - The other two sub-kinds (`loom:operator-decision`,
-    ///   `loom:operator-blocked`) stay hard-skipped unconditionally, marker or
-    ///   no marker.
-    /// - `loom:blocked`, `loom:needs-capability` and `loom:operator` veto the
-    ///   exemption outright, as does [`BUILDING_LABEL`] and any
-    ///   `extra_skip_labels` entry — the exemption only ever relaxes
-    ///   `loom:operator-only`, never any other reason to skip.
+    /// - A decision (a body decision block, or the retired decision label)
+    ///   stays hard-skipped unconditionally, marker or no marker.
+    /// - `loom:blocked` (under any name), `loom:frozen`, [`BUILDING_LABEL`] and
+    ///   any `extra_skip_labels` entry veto the exemption outright — it only
+    ///   ever relaxes the operator hold, never any other reason to skip.
     /// - No declaration, an unrecognized value, or a capability this worker does
     ///   not hold all leave the item skipped (fail-closed).
     ///
@@ -446,10 +440,11 @@ impl WorkItem {
             // Fast path: nothing to relax, or no worker declaration at all.
             return skipped;
         }
-        // The exemption may only cancel `loom:operator-only`. If any OTHER skip
-        // reason applies, the item stays skipped regardless of capabilities.
+        // The exemption may only cancel the operator hold (any of its names).
+        // If any OTHER skip reason applies, the item stays skipped.
         let other_skip_reason = self.labels.iter().any(|l| {
-            (SKIP_LABELS.contains(&l.as_str()) && l != crate::capability::OPERATOR_ONLY_LABEL)
+            (SKIP_LABELS.contains(&l.as_str())
+                && !labels::OPERATOR_HOLD_NAMES.contains(&l.as_str()))
                 || extra_skip_labels.iter().any(|e| e == l)
         });
         if other_skip_reason {
@@ -723,7 +718,7 @@ pub trait WorkDispatcher {
     }
 
     /// The capabilities **this worker/host declares it holds** (#6893), used to
-    /// decide whether a `loom:operator-mechanical` item's declared
+    /// decide whether a mechanical operator hold's declared
     /// `<!-- loom:capability=<name> -->` requirements are met — see
     /// [`WorkItem::is_skipped_with_capabilities`]. Read fresh each tick,
     /// alongside [`extra_skip_labels`](Self::extra_skip_labels).
@@ -842,22 +837,22 @@ pub trait WorkDispatcher {
 // Tick
 // ============================================================================
 
-/// Log — once per skipped candidate — *why* a `loom:operator-mechanical` item
+/// Log — once per skipped candidate — *why* a mechanical operator hold
 /// stayed parked, naming the capability gap (#6893 AC1/AC3).
 ///
 /// This is the daemon-side half of "turn a silent stall into a capability
 /// request": the item is still parked (it must be — nothing about it changed),
 /// but the reason is now stated instead of being invisible inside a
 /// `labeled-skip` tally. The forge-comment half of AC1 lives on the sweep side
-/// (`sweep.md`'s "Capability-aware `loom:operator-mechanical` lane"), which is
+/// (`sweep.md`'s capability-lane section), which is
 /// the surface that actually resolves these items: the daemon's own candidate
 /// listing is `loom:issue`-filtered and re-evaluates the same rows every tick,
 /// so commenting from here would either spam the issue or need a whole
 /// dedup-state mechanism to avoid it.
 ///
 /// Costs nothing on the overwhelmingly common path: [`MechanicalRouting::NotApplicable`]
-/// for every item that is not a `loom:operator-only` + `loom:operator-mechanical`
-/// pair, and the routing is short-circuited entirely when this host declared no
+/// for every item that is not an operator hold without a decision block, and
+/// the routing is short-circuited entirely when this host declared no
 /// capabilities.
 ///
 /// [`MechanicalRouting::NotApplicable`]: crate::capability::MechanicalRouting::NotApplicable
@@ -869,7 +864,7 @@ fn log_capability_gap(item: &WorkItem, held_capabilities: &BTreeSet<String>) {
     match item.mechanical_routing(held_capabilities) {
         MechanicalRouting::MissingCapabilities { missing } => {
             log::info!(
-            "work_finder: issue #{} is `loom:operator-mechanical` but this worker does not hold \
+            "work_finder: issue #{} is a mechanical operator hold but this worker does not hold \
              the capability it declares: {} (held: {}). It stays parked — file/comment a \
              capability request naming the gap rather than waiting (#6893)",
             item.number,
@@ -1136,7 +1131,7 @@ pub fn tick_with_lanes(
         }
         // 1. Defensive skip-label filter (stale forge cache), extended with
         //    this workspace's configured extra skip-label list (#6685) and made
-        //    capability-aware for the `loom:operator-mechanical` sub-kind
+        //    capability-aware for mechanical operator holds
         //    (#6893 — inert unless this host declared capabilities).
         if item.is_skipped_with_capabilities(&extra_skip_labels, &held_capabilities) {
             report.skipped_labeled += 1;
@@ -1686,7 +1681,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         .collect();
 
     // Snapshot each workspace's declared host capabilities (#6893), used by the
-    // capability-aware `loom:operator-mechanical` exemption in pass 1. Empty on
+    // capability-aware operator-hold exemption in pass 1. Empty on
     // every host that has not opted in, which leaves the filter unchanged.
     let held_capability_sets: Vec<BTreeSet<String>> = workspaces
         .iter()

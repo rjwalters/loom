@@ -74,17 +74,6 @@ pub const REPARK_MARKER_PREFIX: &str = "<!-- loom:stale-blocked-repark:";
 /// it can only prevent a write.
 pub const PERMANENT_BLOCK_MARKER: &str = "<!-- loom:permanent-block";
 
-/// Labels that mean a human decision is pending on the artifact itself.
-/// The priority labels (`loom:important` / `loom:very-important`) are
-/// deliberately absent: they are not holds.
-pub const OPERATOR_HOLD_LABELS: [&str; 5] = [
-    "loom:operator",
-    "loom:operator-only",
-    "loom:operator-blocked",
-    "loom:operator-mechanical",
-    "loom:operator-decision",
-];
-
 const ISSUE_LABEL: &str = "loom:issue";
 const REVIEW_REQUESTED: &str = "loom:review-requested";
 const CHANGES_REQUESTED: &str = "loom:changes-requested";
@@ -305,10 +294,11 @@ fn resolution(s: &RefState) -> Option<bool> {
     }
 }
 
+/// Whether a human decision is pending on the artifact itself: the operator
+/// hold under any of its names (#11795), the retired `loom:operator-*`
+/// labels included, so an unmigrated item is vetoed exactly as before.
 pub(super) fn has_operator_hold(labels: &[String]) -> bool {
-    labels
-        .iter()
-        .any(|l| OPERATOR_HOLD_LABELS.contains(&l.as_str()))
+    crate::work_finder::is_operator_hold(labels)
 }
 
 /// The pre-read vetoes visible in the body and labels alone.

@@ -76,7 +76,9 @@ fn detail_is_only_allowlisted_hold_labels_never_free_text() {
         ],
     )];
     let rows = blocked_rows(&repo(RepoVisibility::Private), &listing);
-    assert_eq!(rows[0].detail.as_deref(), Some("loom:operator, loom:needs-capability"));
+    // #11795: needs-capability folds into loom:blocked itself, so it no longer
+    // explains the row; it is still never exported as free text.
+    assert_eq!(rows[0].detail.as_deref(), Some("loom:operator"));
     assert_eq!(rows[0].visibility, RepoVisibility::Private);
     let wire = serde_json::to_string(&rows[0]).unwrap();
     for leaked in [

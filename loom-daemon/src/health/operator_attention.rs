@@ -1,7 +1,8 @@
 //! The operator-attention health section (Issue #8091): open PRs labeled
 //! `loom:operator` (the first-class "the engine has stopped acting on this
 //! artifact, a human is needed" hold, #5502) plus their `mergeable`/age
-//! breakdown, and open issues labeled `loom:operator-only` (the hard park),
+//! breakdown, and open issues held by `loom:operator` (the issue-dispatch
+//! park; the retired `loom:operator-only` counts until migrated, #11795),
 //! across every managed repo — answering "what is waiting on me?" without a
 //! separate `gh` query.
 //!
@@ -48,15 +49,15 @@ use super::{accumulate_observed, repo_label, HealthInputs, HealthSection, Verdic
 ///
 /// Until #11104 the star-liveness pass appended its escalated starred
 /// issues here. That pass is gone; the section is the plain list of
-/// human-gated items above (`loom:operator` PRs, `loom:operator-only`
-/// issues) and nothing else.
+/// human-gated items above (`loom:operator` PRs and issues) and nothing
+/// else.
 #[must_use]
 pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
     if let Some(gh) = &inputs.gh_unavailable {
         return HealthSection::new(
             "operator_attention",
             Verdict::Green,
-            format!("? held, ? operator-only — {}", gh.reason),
+            format!("? held, ? operator-held — {}", gh.reason),
             serde_json::json!({
                 "unavailable": "gh not found on PATH or not executable",
                 "gh_bin": gh.gh_bin,
@@ -72,7 +73,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
         return HealthSection::new(
             "operator_attention",
             Verdict::Green,
-            "? held, ? operator-only — forge snapshot not collected",
+            "? held, ? operator-held — forge snapshot not collected",
             serde_json::json!({
                 "unavailable": "forge snapshot not collected",
                 "held": null,
@@ -86,7 +87,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
         return HealthSection::new(
             "operator_attention",
             Verdict::Green,
-            "0 held, 0 operator-only (no managed repos)",
+            "0 held, 0 operator-held (no managed repos)",
             serde_json::json!({
                 "held": 0,
                 "held_conflicting": 0,
@@ -148,7 +149,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
     };
 
     let summary =
-        format!("{held_str} PR(s) held{breakdown_clause}, {issues_str} issue(s) operator-only{failed_clause}");
+        format!("{held_str} PR(s) held{breakdown_clause}, {issues_str} issue(s) operator-held{failed_clause}");
 
     HealthSection::new(
         "operator_attention",
@@ -220,7 +221,7 @@ mod tests {
         assert!(section.summary.contains("6 PR(s) held"), "{}", section.summary);
         assert!(section.summary.contains("1 conflicting"), "{}", section.summary);
         assert!(section.summary.contains("oldest 5d"), "{}", section.summary);
-        assert!(section.summary.contains("8 issue(s) operator-only"), "{}", section.summary);
+        assert!(section.summary.contains("8 issue(s) operator-held"), "{}", section.summary);
         assert_eq!(section.detail["held"], 6);
         assert_eq!(section.detail["held_conflicting"], 1);
         assert_eq!(section.detail["held_oldest_days"], 5);
@@ -395,6 +396,6 @@ mod tests {
         let section = assess_operator_attention(&inputs);
         assert_eq!(section.verdict, Verdict::Green);
         assert!(section.summary.contains("0 held"), "{}", section.summary);
-        assert!(section.summary.contains("0 operator-only"), "{}", section.summary);
+        assert!(section.summary.contains("0 operator-held"), "{}", section.summary);
     }
 }

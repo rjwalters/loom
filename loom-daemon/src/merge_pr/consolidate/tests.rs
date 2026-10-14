@@ -68,7 +68,7 @@ fn a_clean_overlapping_group_is_eligible() {
 
 #[test]
 fn every_operator_exclusion_and_hold_rejects() {
-    for label in INELIGIBLE_LABELS {
+    for label in INELIGIBLE_LABELS.iter() {
         let mut c = comp(1, H1, &["a.rs", "shared.rs"]);
         c.labels.push(label.to_string());
         let group = [c, comp(2, H2, &["b.rs", "shared.rs"])];

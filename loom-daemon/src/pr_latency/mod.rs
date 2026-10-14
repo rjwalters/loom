@@ -77,17 +77,17 @@ pub const VERDICT_LABELS: &[&str] = &[APPROVED, CHANGES_REQUESTED];
 /// therefore make an approved-but-unmerged PR's wait *expected* rather than a
 /// throughput failure.
 ///
-/// `loom:operator` and `loom:operator-only` are deliberately both here even
-/// though they differ for dispatch (the former is re-evaluable, the latter is a
-/// park — see [`crate::work_finder::OPERATOR_HOLD_LABEL`]): for the
-/// question *"is this PR waiting on a person?"* they are the same answer.
-/// `loom:needs-capability` joins them because it hard-skips identically
-/// (#5817). The four `loom:operator-*` sub-kinds are **not** listed — they
-/// always accompany `loom:operator-only` and so would only double-count; they
-/// are surfaced as detail on the row instead.
-/// Derived (#10013): the registry's `operator_gate` labels.
+/// Since #11795 that is `loom:operator` alone; its retired names
+/// (`loom:operator-only`, `-decision`, `-mechanical`) count until open items
+/// are migrated. The retired `loom:needs-capability` folds into
+/// `loom:blocked`, a wait on something named rather than on a person, so it is
+/// no longer a gate.
+/// Derived (#10013): the registry's `operator_gate` labels, plus the retired
+/// names that fold into one.
 pub static OPERATOR_GATE_LABELS: crate::label_registry::LabelSet =
-    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("operator_gate"));
+    crate::label_registry::LabelSet::new(|| {
+        crate::label_registry::embedded_set_with_retired("operator_gate")
+    });
 
 /// True when any label in `labels` is an operator gate.
 pub fn is_operator_gated<S: AsRef<str>>(labels: &[S]) -> bool {
@@ -96,19 +96,22 @@ pub fn is_operator_gated<S: AsRef<str>>(labels: &[S]) -> bool {
         .any(|l| OPERATOR_GATE_LABELS.contains(&l.as_ref()))
 }
 
-/// True when any label in `labels` takes the artifact out of the automation
-/// queue entirely ([`crate::work_finder::PARK_LABELS`]).
+/// True when any label in `labels` takes the PR out of the automation queue
+/// entirely ([`crate::work_finder::PR_LANE_PARK_LABELS`]).
 ///
-/// Reused rather than re-listed: a park set that drifts from the work finder's
-/// own would report a PR as reachable when nothing can reach it.
+/// Reused rather than re-listed: a park set that drifts from the PR lane's
+/// own would report a PR as reachable when nothing can reach it. The PR-lane
+/// set, not the issue-dispatch one: `loom:operator` parks an issue but a held
+/// PR is still re-evaluated (#11795).
 pub fn is_parked<S: AsRef<str>>(labels: &[S]) -> bool {
     labels
         .iter()
-        .any(|l| crate::work_finder::PARK_LABELS.contains(&l.as_ref()))
+        .any(|l| crate::work_finder::PR_LANE_PARK_LABELS.contains(&l.as_ref()))
 }
 
-static HOLD_SET: crate::label_registry::LabelSet =
-    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("hold"));
+static HOLD_SET: crate::label_registry::LabelSet = crate::label_registry::LabelSet::new(|| {
+    crate::label_registry::embedded_set_with_retired("hold")
+});
 
 /// Every operator-gate / park label present, for the detail column.
 ///
@@ -129,20 +132,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn operator_gate_covers_both_hold_flavours_but_not_sub_kinds() {
+    fn operator_gate_is_the_operator_hold_under_any_name() {
         assert!(is_operator_gated(&["loom:pr", "loom:operator"]));
+        // #11795: the retired names fold into loom:operator until migrated.
         assert!(is_operator_gated(&["loom:operator-only"]));
-        assert!(is_operator_gated(&["loom:needs-capability"]));
-        // A sub-kind alone is not a gate: it never appears without its base.
-        assert!(!is_operator_gated(&["loom:operator-decision"]));
+        assert!(is_operator_gated(&["loom:operator-decision"]));
+        // needs-capability folds into loom:blocked: a named wait, not a person.
+        assert!(!is_operator_gated(&["loom:needs-capability"]));
         assert!(!is_operator_gated(&["loom:pr", "loom:blocked"]));
     }
 
     #[test]
-    fn park_set_is_the_work_finders_own() {
+    fn park_set_is_the_pr_lanes_own() {
         assert!(is_parked(&["loom:blocked"]));
         assert!(is_parked(&["loom:operator-only"]));
-        // The re-evaluable hold is NOT a park, matching PARK_LABELS' contract.
+        // On a PR the operator hold is NOT a park (#11795, #7660).
         assert!(!is_parked(&["loom:operator"]));
     }
 
