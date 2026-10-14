@@ -30,6 +30,18 @@ pub(super) fn continues(
     prev.cause == cause && (now - prev.last_failure_at).num_seconds() <= max_secs
 }
 
+/// The ceiling a `cause` streak doubles up to (Issue #11854). A failed
+/// dispatch climbs to the configured `max` (6 h by default); an open-PR guard
+/// refusal stays capped at the open-PR memo's freshness window (900 s), as it
+/// was when `max` defaulted to 900 s — an issue waiting on review must not sit
+/// out hours after its PR closes.
+pub(super) fn cap(cause: DispatchBackoffCause, max: Duration) -> Duration {
+    match cause {
+        DispatchBackoffCause::Generic => max,
+        DispatchBackoffCause::OpenPrGuard => max.min(super::super::guards::OPEN_PR_MEMO_FRESH),
+    }
+}
+
 /// The INFO line for a window just armed for `issue`.
 pub(super) fn log_armed(
     issue: u32,
