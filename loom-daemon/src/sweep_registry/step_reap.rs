@@ -125,8 +125,9 @@ impl SweepRegistry {
     /// the roll window keeps it. Decided by lease identity, never label time:
     /// the role prompt applies `loom:reviewing` / `loom:treating` itself,
     /// after the daemon's lease, so a label time would strand a normal step.
-    /// `started_at` is kept for the signature's callers (Builder steps never
-    /// come here: they hold an issue, not a PR).
+    /// Builder steps never come here (they hold an issue, not a PR), so the
+    /// label-time path of the shared check, which needs a start time, is
+    /// never taken; `now` stands in for it.
     ///
     /// # Errors
     /// Why the claim is no longer this run's.
@@ -135,10 +136,8 @@ impl SweepRegistry {
         pr: u32,
         role: StepRole,
         sweep_id: &str,
-        started_at: Option<DateTime<Utc>>,
     ) -> std::result::Result<(), String> {
-        let started_at = started_at.unwrap_or_else(Utc::now);
-        if self.step_claim_held_elsewhere(pr, role, sweep_id, started_at) {
+        if self.step_claim_held_elsewhere(pr, role, sweep_id, Utc::now()) {
             return Err(format!("another sweep holds the live {role} claim"));
         }
         Ok(())
