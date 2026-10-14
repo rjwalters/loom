@@ -65,8 +65,8 @@ JSON
     git -C "$REPO" commit -qm "chore: install Loom v0.0.0" >/dev/null 2>&1
 }
 
-run() { # run <args...>; sets OUT, RC
-    OUT="$(cd "$REPO" && LOOM_DAEMON_BIN="$FAKE" bash "$RESYNC" "$@" 2>&1)"; RC=$?
+run() { # run resync with no args; sets OUT, RC
+    OUT="$(cd "$REPO" && LOOM_DAEMON_BIN="$FAKE" bash "$RESYNC" 2>&1)"; RC=$?
 }
 
 echo "Case 1: a stale .claude/agents file is updated, then stable"

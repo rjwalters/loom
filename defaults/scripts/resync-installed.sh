@@ -3411,19 +3411,19 @@ report_unwired_hooks() {
         lib=""
     done
     [[ -n "$lib" ]] || return 0
-    local i event matcher name missing=""
+    local i event matcher name unwired=""
     # The table is read in a subshell: the library only defines functions and arrays.
     while IFS=$'\037' read -r event matcher name; do
         jq -e --arg e "$event" --arg n "$name" \
             '[.hooks[$e][]?.hooks[]?.command | strings | select(contains($n))] | length > 0' \
-            "$settings" >/dev/null 2>&1 || missing+="    $event [$matcher] $name"$'\n'
+            "$settings" >/dev/null 2>&1 || unwired+="    $event [$matcher] $name"$'\n'
     done < <( ( source "$lib" 2>/dev/null || exit 0
                 for i in "${!_PHOOK_NAMES[@]}"; do
                     printf '%s\037%s\037%s\n' "${_PHOOK_TYPES[i]}" "${_PHOOK_MATCHERS[i]}" "${_PHOOK_NAMES[i]}"
                 done ) )
-    [[ -n "$missing" ]] || return 0
+    [[ -n "$unwired" ]] || return 0
     warn "upstream wires hook(s) that .claude/settings.json does not (the file is repo-owned and was NOT modified; add them, or run the installer's hook wiring):"
-    printf '%s' "$missing" >&2
+    printf '%s' "$unwired" >&2
 }
 report_unwired_hooks
 
