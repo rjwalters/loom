@@ -147,19 +147,19 @@ impl KeyRef {
     /// # Errors
     ///
     /// When the source cannot be read, or holds no plausible key.
-    pub fn read(&self, region: Option<&str>) -> Result<String, String> {
+    pub fn read(&self, aws: &AwsAccess<'_>) -> Result<String, String> {
         use crate::telemetry_join::{credential_source, Credential, CredentialSpec};
         let fetched = match self {
             Self::Ssm(p) => {
                 // An explicit region always: a daemon's environment often
                 // has none, and the AWS CLI would then fail or guess.
-                let region = region.ok_or_else(|| {
+                let region = aws.region.ok_or_else(|| {
                     format!(
                         "an ssm:// key ref needs a region: set {CONFIG_KEY}.region, or \
                          AWS_REGION / AWS_DEFAULT_REGION in the daemon's environment"
                     )
                 })?;
-                ssm_get(p, region)?
+                ssm_get(p, region, aws.profile)?
             }
             Self::File(p) => {
                 match credential_source(&CredentialSpec::File { path: p.clone() }, None)
@@ -181,30 +181,79 @@ impl KeyRef {
     }
 }
 
-/// `aws ssm get-parameter` for `parameter` in `region`, decrypted. Only the
-/// parameter's name and the region are on the command line, never a value;
-/// an error names the parameter and the exit, never the output.
-fn ssm_get(parameter: &str, region: &str) -> Result<String, String> {
+/// How an `ssm://` ref reaches AWS: the region (always explicit), and the
+/// named profile when `forge.gateway.awsProfile` asks for one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AwsAccess<'a> {
+    pub region: Option<&'a str>,
+    pub profile: Option<&'a str>,
+}
+
+/// AWS credential selectors removed from the `aws` child, so an `ssm://`
+/// read runs as the host's own (instance) role, not whatever identity the
+/// daemon's environment happens to name: a worker's daemon carries
+/// `AWS_PROFILE=sccache` for its build cache, which the per-host relay-key
+/// grant rightly refuses.
+pub const AWS_IDENTITY_ENV: &[&str] = &[
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+];
+
+/// The `aws ssm get-parameter` command for `parameter` (see [`ssm_args`]),
+/// with [`AWS_IDENTITY_ENV`] removed. Only names are on the command line,
+/// never a value.
+#[must_use]
+pub fn ssm_command(parameter: &str, region: &str, profile: Option<&str>) -> std::process::Command {
     let mut cmd = std::process::Command::new("aws");
-    cmd.args(ssm_args(parameter, region))
+    cmd.args(ssm_args(parameter, region, profile))
         .stdin(std::process::Stdio::null());
-    match crate::proc_exec::run_bounded(cmd, SSM_TIMEOUT) {
+    for key in AWS_IDENTITY_ENV {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
+/// `aws ssm get-parameter`, decrypted. An error names the parameter, the
+/// region, the exit code and the CLI's first stderr line (AWS error text
+/// carries no secret), never stdout.
+fn ssm_get(parameter: &str, region: &str, profile: Option<&str>) -> Result<String, String> {
+    match crate::proc_exec::run_bounded(ssm_command(parameter, region, profile), SSM_TIMEOUT) {
         Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         }
         Ok(crate::proc_exec::Completion::Exited(out)) => Err(format!(
-            "aws ssm get-parameter {parameter} ({region}) exited {}",
-            out.status.code().unwrap_or(-1)
+            "aws ssm get-parameter {parameter} ({region}{}) exited {}: {}",
+            profile
+                .map(|p| format!(", profile {p}"))
+                .unwrap_or_default(),
+            out.status.code().unwrap_or(-1),
+            first_line(&String::from_utf8_lossy(&out.stderr)),
         )),
         Ok(_) => Err(format!("aws ssm get-parameter {parameter} ({region}) timed out")),
         Err(e) => Err(format!("aws ssm get-parameter {parameter}: {e}")),
     }
 }
 
+/// The first non-empty line of `text`, at most 240 characters.
+#[must_use]
+pub fn first_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no stderr)");
+    line.chars().take(240).collect()
+}
+
 /// The `aws` argv of [`ssm_get`].
 #[must_use]
-pub fn ssm_args(parameter: &str, region: &str) -> Vec<String> {
-    [
+pub fn ssm_args(parameter: &str, region: &str, profile: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
         "ssm",
         "get-parameter",
         "--name",
@@ -219,7 +268,19 @@ pub fn ssm_args(parameter: &str, region: &str) -> Vec<String> {
     ]
     .iter()
     .map(|s| (*s).to_string())
-    .collect()
+    .collect();
+    if let Some(p) = profile {
+        args.extend(["--profile".to_string(), p.to_string()]);
+    }
+    args
+}
+
+/// A named AWS profile: letters, digits, `-`, `_`, `.`.
+#[must_use]
+pub fn valid_aws_profile(p: &str) -> bool {
+    (1..=64).contains(&p.len())
+        && p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// Deadline for one SSM read.
@@ -270,13 +331,17 @@ pub struct GatewayConfig {
     /// `forge.gateway.region`: the AWS region `ssm://` refs are read in,
     /// when set (else the environment's, [`resolve_region`]).
     pub region: Option<String>,
+    /// `forge.gateway.awsProfile`: a named profile for `ssm://` reads, for
+    /// a host whose relay-key grant is not its instance role. Unset, the
+    /// read runs as the instance role ([`AWS_IDENTITY_ENV`] removed).
+    pub aws_profile: Option<String>,
 }
 
 impl GatewayConfig {
     /// A stable digest of what the profiles depend on, keys excluded.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        format!("{}|{:?}|{:?}", self.api_host, self.key_refs, self.region)
+        format!("{}|{:?}|{:?}|{:?}", self.api_host, self.key_refs, self.region, self.aws_profile)
     }
 }
 
@@ -374,11 +439,22 @@ pub fn parse(effective: &Value) -> (Option<GatewayConfig>, Vec<String>) {
             None
         }
     };
+    let aws_profile = match block.get("awsProfile") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(p)) if valid_aws_profile(p.trim()) => Some(p.trim().to_string()),
+        Some(other) => {
+            warnings.push(format!(
+                "{CONFIG_KEY}.awsProfile must be a profile name, not {other}; ignored"
+            ));
+            None
+        }
+    };
     (
         Some(GatewayConfig {
             api_host,
             key_refs,
             region,
+            aws_profile,
         }),
         warnings,
     )
