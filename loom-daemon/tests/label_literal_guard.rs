@@ -342,8 +342,10 @@ fn verdict_staleness_guard_hold_set_is_bounded_by_the_registry() {
     );
 }
 
-/// `warn-operator-gated.sh` flags a dependency carrying one of two labels; both
-/// must stay operator-gate labels in the registry.
+/// `warn-operator-gated.sh`'s offline fallback flags a dependency carrying
+/// `loom:operator` or its retired base name (#11795); each must stay an
+/// operator-gate label in the registry (the retired one through its
+/// replacement).
 #[test]
 fn warn_operator_gated_dep_labels_are_operator_gate_labels() {
     let anchor = Regex::new(r"for dep_label in ").expect("regex");

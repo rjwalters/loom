@@ -25,8 +25,9 @@
 #      (the same restricted vocabulary #3759's --auto-stack and #3747's
 #      warn-out-of-set-deps.sh both reuse) and #A currently carries an
 #      operator-gate label — the registry's `operator_gate` property
-#      (`loom-daemon labels list --property operator_gate`, #10013), with
-#      OPERATOR_GATE_FALLBACK below for a host without a daemon that answers.
+#      (`loom-daemon labels list --property operator_gate --with-retired`,
+#      #10013/#11795), with the fallback loop in _operator_gate_labels for a
+#      host without a daemon that answers.
 #      The #87 -> #4 shape from the issue: the sweep would skip the
 #      prerequisite as held, then dispatch the dependent that needs it.
 #   3. Title-prefix match (#6391) — the title itself, after stripping leading
@@ -172,6 +173,13 @@ _operator_gate_title_prefix_match() {
 # with no loom-daemon, an older one, or a registry without the property — the
 # same shape as hard-exclusion-labels.sh. label_literal_guard.rs pins the
 # fallback's names to the registry's operator_gate set.
+#
+# `--with-retired` (#11795) adds the retired names that fold into a gate
+# label (loom:operator-only and its sub-kinds), so a dependency `labels
+# migrate` has not relabelled yet is still flagged. A daemon too old for the
+# flag is asked again without it (it then still calls loom:operator-only a
+# gate itself), and the fallback names the canonical label plus the one
+# retired base name every pre-fold operator hold carried.
 # Print the operator-gate labels, one per line. Resolved per call (not at
 # source time) so tests can swap the daemon on PATH.
 _operator_gate_labels() {
@@ -179,13 +187,17 @@ _operator_gate_labels() {
     [[ -n "$daemon" && -x "$daemon" ]] || daemon="$(command -v loom-daemon 2>/dev/null || true)"
     if [[ -n "$daemon" ]]; then
         # requires-daemon: labels optional   a missing or older binary falls back to the loop below
+        if queried="$("$daemon" labels list --property operator_gate --with-retired 2>/dev/null)" && [[ -n "$queried" ]]; then
+            printf '%s\n' "$queried"
+            return 0
+        fi
+        # requires-daemon: labels optional   pre-#11795 binary: no --with-retired
         if queried="$("$daemon" labels list --property operator_gate 2>/dev/null)" && [[ -n "$queried" ]]; then
             printf '%s\n' "$queried"
             return 0
         fi
     fi
-    # shellcheck disable=SC2043  # one name today; a list if the gate set grows
-    for dep_label in loom:operator; do printf '%s\n' "$dep_label"; done
+    for dep_label in loom:operator loom:operator-only; do printf '%s\n' "$dep_label"; done
 }
 
 # ---- dependency parser (reused vocabulary, restricted to Depends on / Requires) ----

@@ -136,18 +136,26 @@ exit 1
 STUB
 chmod +x "$STUB_DIR/gh"
 
-# Stub loom-daemon: `labels list --property operator_gate` prints
-# $LOOM_TEST_GATE_LABELS when set, else fails so the script uses its fallback.
+# Stub loom-daemon: `labels list --property operator_gate --with-retired`
+# prints $LOOM_TEST_GATE_LABELS when set; the same query without the flag
+# prints $LOOM_TEST_GATE_LABELS_OLD (a pre-#11795 daemon rejects the flag);
+# anything else fails so the script uses its fallback.
 cat > "$STUB_DIR/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
-if [[ "$1 $2 $3 $4" == "labels list --property operator_gate" && -n "${LOOM_TEST_GATE_LABELS:-}" ]]; then
+if [[ "$*" == "labels list --property operator_gate --with-retired" && -n "${LOOM_TEST_GATE_LABELS:-}" ]]; then
   printf '%s\n' "$LOOM_TEST_GATE_LABELS"
+  exit 0
+fi
+if [[ "$*" == "labels list --property operator_gate" && -n "${LOOM_TEST_GATE_LABELS_OLD:-}" ]]; then
+  printf '%s\n' "$LOOM_TEST_GATE_LABELS_OLD"
   exit 0
 fi
 exit 2
 STUB
 chmod +x "$STUB_DIR/loom-daemon"
-unset LOOM_DAEMON_BIN LOOM_TEST_GATE_LABELS
+# A real daemon from the caller (CI exports LOOM_DAEMON_BIN) checks the registry answer below.
+LOOM_TEST_REAL_DAEMON="${LOOM_TEST_REAL_DAEMON:-${LOOM_DAEMON_BIN:-}}"
+unset LOOM_DAEMON_BIN LOOM_TEST_GATE_LABELS LOOM_TEST_GATE_LABELS_OLD
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
 
@@ -293,6 +301,31 @@ assert_eq "" "$out" "loom:blocked is not in the fallback gate set"
 out="$(LOOM_TEST_GATE_LABELS=$'loom:operator\nloom:blocked' run_warn "92")"
 assert_contains "$out" $'92\t⚠ depends on #5, which is loom:blocked' \
     "a label the registry's operator_gate property names is flagged"
+
+# =====================================================================
+echo
+echo "--- Signal 2 (#11795 transition): an unmigrated loom:operator-only dependency is still flagged ---"
+
+echo 'Depends on #6 (parked for the operator before the fold)' > "$STUB_DIR/body-94.txt"
+echo 'loom:operator-only' > "$STUB_DIR/labels-6.txt"
+out="$(run_warn "94")"
+assert_contains "$out" $'94\t⚠ depends on #6, which is loom:operator-only' \
+    "the fallback set still names the retired base label"
+out="$(LOOM_TEST_GATE_LABELS=$'loom:operator\nloom:operator-only' run_warn "94")"
+assert_contains "$out" $'94\t⚠ depends on #6, which is loom:operator-only' \
+    "--with-retired: the registry's retired alias is flagged"
+out="$(LOOM_TEST_GATE_LABELS_OLD=$'loom:operator-only' run_warn "94")"
+assert_contains "$out" $'94\t⚠ depends on #6, which is loom:operator-only' \
+    "a pre-#11795 daemon (no --with-retired) is asked again without the flag"
+
+# The real registry, when a built daemon is available: --with-retired must
+# answer loom:operator plus its retired aliases, and only those.
+REAL_DAEMON="${LOOM_TEST_REAL_DAEMON:-}"
+if [[ -n "$REAL_DAEMON" && -x "$REAL_DAEMON" ]]; then
+    real="$("$REAL_DAEMON" labels list --property operator_gate --with-retired 2>/dev/null | sort | tr '\n' ' ')"
+    assert_eq "loom:operator loom:operator-blocked loom:operator-decision loom:operator-mechanical loom:operator-only " \
+        "$real" "the registry's operator_gate set (with retired aliases) is loom:operator and its folds"
+fi
 
 # =====================================================================
 echo

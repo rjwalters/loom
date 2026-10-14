@@ -775,7 +775,9 @@ boolean properties the daemon's label tables encode (`park`, `skip`,
 `human_gated` (the notifier contract, see "Two ways to reach a human"),
 `merge_hold`, `operator_hold`, `contradicts_approval`). It is embedded in `loom-daemon`; query
 it with `loom-daemon labels list --property park` / `labels get <name>`
-(non-zero exit on an unknown label or property).
+(non-zero exit on an unknown label or property). `--with-retired` adds each
+retired label whose replacement has the property (#11795): the set a script
+matches on while `labels migrate` has not yet relabelled open items.
 
 The Loom block of `.github/labels.yml` and `defaults/.github/labels.yml` is
 generated from it: edit the registry, then run `loom-daemon labels generate
