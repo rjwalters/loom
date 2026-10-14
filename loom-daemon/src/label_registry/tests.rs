@@ -104,6 +104,13 @@ fn every_retired_label_has_its_mapping_entry() {
         ("loom:urgent", None, true, "#11105"),
         ("loom:heavy", None, true, "#11105"),
         ("loom:operator-objective", None, true, "#11105"),
+        // 2AMLogic/2am#4345: legacy undeclared names the label-drift check
+        // found live; open items lose them (`--keep-labels`), closed keep them.
+        ("loom:ready", None, true, "2AMLogic/2am#4345"),
+        ("loom:approved", None, true, "2AMLogic/2am#4345"),
+        ("loom:in-progress", None, true, "2AMLogic/2am#4345"),
+        ("loom:pr-feedback", None, true, "2AMLogic/2am#4345"),
+        ("loom:worked-example", None, true, "2AMLogic/2am#4345"),
     ];
     let got: Vec<(&str, Option<&str>, bool, &str)> = reg()
         .retired
