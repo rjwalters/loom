@@ -2,6 +2,7 @@
 //! events budget, the persisted cache, and pruning.
 
 use super::*;
+use std::collections::BTreeMap;
 
 const REPO: &str = "acme/widgets";
 
@@ -27,6 +28,11 @@ fn item(number: u32, labels: &[&str], created: Option<&str>) -> RestIssue {
         .remove(0)
 }
 
+fn updated(mut row: RestIssue, at: &str) -> RestIssue {
+    row.updated_at = Some(at.to_string());
+    row
+}
+
 fn with_labels_at(mut row: RestIssue, times: &[(&str, &str)]) -> RestIssue {
     row.labels_at = Some(
         times
@@ -38,11 +44,15 @@ fn with_labels_at(mut row: RestIssue, times: &[(&str, &str)]) -> RestIssue {
 }
 
 /// A fake events read: canned label times per item, every read counted.
+/// Each read costs `pages` pages (`0` is taken as 1).
 #[derive(Default)]
 struct FakeEvents {
     times: BTreeMap<u32, BTreeMap<String, DateTime<Utc>>>,
     fail: bool,
+    pages: usize,
     reads: Vec<u32>,
+    /// The `max_pages` each read was allowed.
+    allowed: Vec<usize>,
 }
 
 impl FakeEvents {
@@ -61,13 +71,20 @@ impl EventsSource for FakeEvents {
         _root: &Path,
         slug: &str,
         number: u32,
-    ) -> Option<BTreeMap<String, DateTime<Utc>>> {
+        _label: &str,
+        max_pages: usize,
+    ) -> LabelTimes {
         assert_eq!(slug, REPO);
         self.reads.push(number);
+        self.allowed.push(max_pages);
+        let pages = self.pages.max(1).min(max_pages);
         if self.fail {
-            return None;
+            return LabelTimes { times: None, pages };
         }
-        Some(self.times.get(&number).cloned().unwrap_or_default())
+        LabelTimes {
+            times: Some(self.times.get(&number).cloned().unwrap_or_default()),
+            pages,
+        }
     }
 }
 
@@ -183,7 +200,7 @@ fn a_failed_read_is_not_cached_and_a_not_found_one_is_until_its_ttl() {
         Source::Created
     );
     assert_eq!(p.cached_len(), 0, "a failed or shed read proves nothing");
-    // Read, but the event lies past the first page: "not found" is cached.
+    // Read, but the event lies before the pages read: "not found" is cached.
     let mut f = FakeEvents::default();
     assert_eq!(ask(&mut p, &mut f, &row, "loom:issue").unwrap().source, Source::Created);
     assert_eq!(ask(&mut p, &mut f, &row, "loom:issue").unwrap().source, Source::Created);
@@ -252,6 +269,7 @@ fn the_cache_keeps_the_most_recent_reads_when_over_its_cap() {
             Cached {
                 at: Some(now()),
                 read_at,
+                updated_at: None,
             },
         );
     }
@@ -263,9 +281,73 @@ fn the_cache_keeps_the_most_recent_reads_when_over_its_cap() {
         .contains_key(&key(REPO, MAX_ENTRIES as u32 + 4, "loom:issue")));
 }
 
-/// The live read is the stage-dwell sampler's fetcher, not a second one.
+/// The live read is the shared page walk under the provider's own caller.
 #[test]
-fn the_live_events_read_is_the_stage_dwell_fetcher() {
+fn the_live_events_read_has_its_own_caller() {
     fn takes(_: &mut impl EventsSource) {}
-    takes(&mut crate::observability::ops::stage_dwell::GhStageFetcher);
+    takes(&mut GhEventsReader);
+    assert!(crate::gh_invocation::Operation::is_valid(EVENTS_CALLER));
+    assert_ne!(EVENTS_CALLER, crate::observability::ops::stage_dwell::EVENTS_CALLER);
+}
+
+#[test]
+fn every_events_page_counts_against_the_budget() {
+    let mut f = FakeEvents {
+        pages: 3,
+        ..FakeEvents::default()
+    }
+    .with(11, "loom:pr", "2026-10-11T00:00:00Z")
+    .with(12, "loom:pr", "2026-10-12T00:00:00Z");
+    let mut p = provider(4);
+    let a = item(11, &["loom:pr"], Some("2026-10-01T00:00:00Z"));
+    let b = item(12, &["loom:pr"], Some("2026-10-01T00:00:00Z"));
+    assert_eq!(ask(&mut p, &mut f, &a, "loom:pr").unwrap().source, Source::Events);
+    assert_eq!(p.budget_left(), 1, "a three-page read spent three");
+    ask(&mut p, &mut f, &b, "loom:pr");
+    assert_eq!(f.allowed, [4, 1], "a read is never allowed more than is left");
+    assert_eq!(p.budget_left(), 0);
+}
+
+#[test]
+fn an_item_updated_since_the_read_is_re_read_once_its_window_passes() {
+    let row = updated(
+        item(13, &["loom:review-requested"], Some("2026-10-01T00:00:00Z")),
+        "2026-10-10T00:00:00Z",
+    );
+    let mut f = FakeEvents::default().with(13, "loom:review-requested", "2026-10-09T00:00:00Z");
+    let mut p = provider(8);
+    let at = |p: &mut StageEntryProvider, f: &mut FakeEvents, row: &RestIssue, when| {
+        p.entry(f, Path::new("/x"), REPO, row, "loom:review-requested", when)
+            .unwrap()
+    };
+    assert_eq!(at(&mut p, &mut f, &row, now()).at, t("2026-10-09T00:00:00Z"));
+    // Unchanged item: served from the cache however long after.
+    let much_later = now() + Duration::days(3);
+    at(&mut p, &mut f, &row, much_later);
+    assert_eq!(f.reads, [13]);
+
+    // Removed and re-applied between two listings: only `updated_at` shows it.
+    let moved = updated(row.clone(), "2026-10-14T11:00:00Z");
+    f = f.with(13, "loom:review-requested", "2026-10-14T11:00:00Z");
+    let soon = now() + Duration::seconds(REVALIDATE_SECS - 1);
+    assert_eq!(
+        at(&mut p, &mut f, &moved, soon).at,
+        t("2026-10-09T00:00:00Z"),
+        "inside the window"
+    );
+    assert_eq!(f.reads, [13]);
+
+    // Past the window with no budget left, the old time stands (closer than
+    // `created`); with budget, it is re-read.
+    let past = now() + Duration::seconds(REVALIDATE_SECS);
+    let mut spent = provider(0);
+    spent.cache = p.cache.clone();
+    let e = at(&mut spent, &mut f, &moved, past);
+    assert_eq!((e.source, e.at), (Source::Events, t("2026-10-09T00:00:00Z")));
+    assert_eq!(f.reads, [13]);
+    assert_eq!(at(&mut p, &mut f, &moved, past).at, t("2026-10-14T11:00:00Z"));
+    assert_eq!(f.reads, [13, 13]);
+    // The new answer is keyed to the new `updated_at`.
+    at(&mut p, &mut f, &moved, past + Duration::days(1));
+    assert_eq!(f.reads, [13, 13]);
 }

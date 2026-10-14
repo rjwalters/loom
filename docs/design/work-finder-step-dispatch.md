@@ -129,7 +129,7 @@ Notes on the table:
 
 The stage-entry provider is a three-source adapter, tried in order:
 1. the mirror's per-item `labels_at`. The github-events mirror serves it, but `MirrorItem` (`forge_mirror/client.rs:127-152`) does not carry it yet; #11897 adds it;
-2. REST `issues/{n}/events`, with its own budget and a persisted cache;
+2. REST `issues/{n}/events`, with its own budget (each page one read) and a persisted cache. GitHub lists events oldest first, so the read takes the label's latest `labeled` event from the end: page 1 for the `Link` header, then back from the last page (#11924). A cached time is re-read when the item's `updated_at` has moved since, so a removal and re-application between two listings is not served the earlier time;
 3. `created_at`.
 
 `pick.decision` records which source answered, as `age_source`. The fleet captain's stage-dwell cache cannot serve dispatchers (`observability/ops/stage_dwell.rs:42-49, :86, :242-247`).

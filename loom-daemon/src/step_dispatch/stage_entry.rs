@@ -6,38 +6,55 @@
 //!
 //! 1. **`mirror`**: the row's `labels_at`, which only a GitHub state mirror
 //!    listing carries ([`crate::forge_listing::RestIssue::labels_at`]). Free.
-//! 2. **`events`**: the latest `labeled` event for the label on the first page
-//!    of `GET repos/{repo}/issues/{n}/events`, read with the stage-dwell
-//!    sampler's fetcher
-//!    ([`crate::observability::ops::stage_dwell::GhStageFetcher`]). Its
-//!    in-process cache is not shared: that one is the captain's, budgeted for
-//!    a 5-minute sample and skipped on dispatchers. This provider keeps its
-//!    own **persisted** cache, keyed `(repo, number, label)`, and its own
-//!    per-tick read budget ([`DEFAULT_EVENTS_BUDGET`]). One read caches the
-//!    times of every label the item carries. A read that finds no event for
-//!    the label (it lies past the first 100 events) is cached as "not found"
-//!    for [`NOT_FOUND_TTL_SECS`]; a failed or shed read is not cached at all.
+//! 2. **`events`**: the label's **latest** `labeled` event in
+//!    `GET repos/{repo}/issues/{n}/events`, read from the end
+//!    ([`crate::observability::ops::stage_events`], #11924: page 1 for the
+//!    `Link` header, then back from the last page; GitHub lists events
+//!    oldest first, so page 1 alone would give an earlier application). It
+//!    shares the stage-dwell sampler's page walk, not its in-process cache:
+//!    that one is the captain's, budgeted for a 5-minute sample and skipped
+//!    on dispatchers. Its reads are counted under their own caller,
+//!    [`EVENTS_CALLER`]. This provider keeps its own **persisted** cache,
+//!    keyed `(repo, number, label)`, and its own per-tick read budget
+//!    ([`DEFAULT_EVENTS_BUDGET`]), where **each page is one read**. One read
+//!    caches the times of every label the item carries. A read that finds no
+//!    event for the label (it lies further back than the pages read) is
+//!    cached as "not found" for [`NOT_FOUND_TTL_SECS`]; a failed or shed read
+//!    is not cached at all.
 //! 3. **`created`**: the item's `created_at`, when nothing better is known.
 //!    For the backlog this is the common answer until the mirror's
 //!    `labels_at` fills in (#11894 §4.3; the creation-age ruling).
 //!
 //! A cached time stays right only while the label stays on: a label removed
-//! and re-applied later has a newer entry time.
-//! [`StageEntryProvider::retain_present`] drops every cached
-//! `(number, label)` a complete listing no longer shows, so a re-application
-//! between two listings is the only one missed.
+//! and re-applied later has a newer entry time. Two guards keep the cache
+//! tied to the label's **current** application (#11924):
+//!
+//! - [`StageEntryProvider::retain_present`] drops every cached
+//!   `(number, label)` a complete listing no longer shows;
+//! - each entry remembers the item's `updated_at` when it was read. A
+//!   removal and re-application between two listings moves `updated_at`
+//!   (as any other change to the item does), so an entry whose item has
+//!   moved on is re-read, at most once per [`REVALIDATE_SECS`], whenever the
+//!   budget allows. Only with the budget spent is the old time served,
+//!   until a read is possible; it is still closer than `created`.
+//!
+//! What the events cannot tell: adding a label an item already carries
+//! records no `labeled` event (and leaves the label's time unchanged on
+//! GitHub), so a "re-application" that never took the label off is not a
+//! new entry and the original time is the right answer.
 //!
 //! Each answer is counted in `loom.stage_entry.lookups{repo, kind}` (`kind`
 //! is the source), so the coverage by source is visible before the draw
 //! depends on it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::forge_listing::RestIssue;
+use crate::observability::ops::stage_events::{self, LabelTimes};
 
 /// Events reads one tick may spend, across every repo.
 pub const DEFAULT_EVENTS_BUDGET: usize = 8;
@@ -45,6 +62,15 @@ pub const DEFAULT_EVENTS_BUDGET: usize = 8;
 /// How long an events read that found no `labeled` event for a label is
 /// believed before the label is read again.
 pub const NOT_FOUND_TTL_SECS: i64 = 6 * 3600;
+
+/// How long a found time is served without a re-read after its item's
+/// `updated_at` moved on: bounds the reads an often-updated item (a PR in
+/// review) can cost, at the price of serving a superseded time that long.
+pub const REVALIDATE_SECS: i64 = 10 * 60;
+
+/// The `caller` this provider's events reads are counted under in
+/// `loom.forge.calls`, apart from stage-dwell's.
+pub const EVENTS_CALLER: &str = "stage_entry.events";
 
 /// Most cached entries kept; past it the oldest reads are dropped first.
 pub const MAX_ENTRIES: usize = 20_000;
@@ -84,38 +110,48 @@ pub struct StageEntry {
 
 /// The per-item events read, injected so the provider is testable offline.
 pub trait EventsSource {
-    /// The latest `labeled` time of every label on the first events page of
-    /// item `number`, or `None` when the read failed or was shed.
+    /// The latest `labeled` time of `label` on item `number`, and of every
+    /// other label the pages read vouch for, in at most `max_pages` page
+    /// reads; `times` is `None` when the read failed or was shed.
     fn label_times(
         &mut self,
         root: &Path,
         slug: &str,
         number: u32,
-    ) -> Option<BTreeMap<String, DateTime<Utc>>>;
+        label: &str,
+        max_pages: usize,
+    ) -> LabelTimes;
 }
 
-/// The live read: the stage-dwell sampler's fetcher (one `gh api` call in
-/// the repo's own checkout, deferrable), without its cache.
-impl EventsSource for crate::observability::ops::stage_dwell::GhStageFetcher {
+/// The live read: the shared events page walk (`gh api` in the repo's own
+/// checkout, deferrable), counted under [`EVENTS_CALLER`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GhEventsReader;
+
+impl EventsSource for GhEventsReader {
     fn label_times(
         &mut self,
         root: &Path,
         slug: &str,
         number: u32,
-    ) -> Option<BTreeMap<String, DateTime<Utc>>> {
-        crate::observability::ops::stage_dwell::StageFetcher::label_times(self, root, slug, number)
+        label: &str,
+        max_pages: usize,
+    ) -> LabelTimes {
+        stage_events::read(EVENTS_CALLER, root, slug, number, label, max_pages)
     }
 }
 
 type Key = (String, u32, String);
 
 /// One cached events answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Cached {
     /// The label's latest `labeled` time; `None`: read, not found.
     at: Option<DateTime<Utc>>,
-    /// When the events page was read.
+    /// When the events were read.
     read_at: DateTime<Utc>,
+    /// The item's `updated_at` as listed when the events were read.
+    updated_at: Option<String>,
 }
 
 /// The cache file.
@@ -133,6 +169,10 @@ struct CacheRow {
     #[serde(default)]
     at: Option<DateTime<Utc>>,
     read_at: DateTime<Utc>,
+    /// Absent in a file written before #11924: such an entry is re-read
+    /// once its item's `updated_at` is known.
+    #[serde(default)]
+    updated_at: Option<String>,
 }
 
 /// `$HOME/.loom/step-dispatch/stage-entry.json`; `None` under `cfg(test)`
@@ -182,6 +222,7 @@ impl StageEntryProvider {
                 let cached = Cached {
                     at: r.at,
                     read_at: r.read_at,
+                    updated_at: r.updated_at,
                 };
                 ((r.repo, r.number, r.label), cached)
             })
@@ -254,7 +295,9 @@ impl StageEntryProvider {
     }
 
     /// The cached events time, else (budget permitting) one events read
-    /// that caches every carried label's time.
+    /// that caches every carried label's time. A found time whose item has
+    /// been updated since it was read is re-read when the budget allows (at
+    /// most once per [`REVALIDATE_SECS`]), else served as it stands.
     fn events_time(
         &mut self,
         events: &mut impl EventsSource,
@@ -265,24 +308,37 @@ impl StageEntryProvider {
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
         let wanted = key(slug, item.number, label);
+        let mut stale_time = None;
         if let Some(cached) = self.cache.get(&wanted) {
-            let fresh =
-                cached.at.is_some() || now - cached.read_at < Duration::seconds(NOT_FOUND_TTL_SECS);
+            let age = now - cached.read_at;
+            let fresh = match cached.at {
+                Some(_) => {
+                    item.updated_at.is_none()
+                        || cached.updated_at == item.updated_at
+                        || age < Duration::seconds(REVALIDATE_SECS)
+                }
+                None => age < Duration::seconds(NOT_FOUND_TTL_SECS),
+            };
             if fresh {
                 return cached.at;
             }
+            stale_time = cached.at;
         }
         if self.left == 0 {
-            return None;
+            return stale_time;
         }
-        self.left -= 1;
-        let times = events.label_times(root, slug, item.number)?;
+        let read = events.label_times(root, slug, item.number, label, self.left);
+        self.left = self.left.saturating_sub(read.pages.max(1));
+        let Some(times) = read.times else {
+            return stale_time;
+        };
         let carried: HashSet<String> = item.labels.iter().map(|l| l.to_ascii_lowercase()).collect();
         for (name, at) in &times {
             if carried.contains(&name.to_ascii_lowercase()) {
                 let cached = Cached {
                     at: Some(*at),
                     read_at: now,
+                    updated_at: item.updated_at.clone(),
                 };
                 self.cache.insert(key(slug, item.number, name), cached);
             }
@@ -296,6 +352,7 @@ impl StageEntryProvider {
             Cached {
                 at: found,
                 read_at: now,
+                updated_at: item.updated_at.clone(),
             },
         );
         self.dirty = true;
@@ -344,6 +401,7 @@ impl StageEntryProvider {
                 label: label.clone(),
                 at: c.at,
                 read_at: c.read_at,
+                updated_at: c.updated_at.clone(),
             })
             .collect();
         entries.sort_by(|a, b| (&a.repo, a.number, &a.label).cmp(&(&b.repo, b.number, &b.label)));
