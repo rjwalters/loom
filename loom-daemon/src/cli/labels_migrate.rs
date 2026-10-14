@@ -595,7 +595,7 @@ pub(crate) fn pace_delay(
 
 /// Block until the next write may go, process-wide (every target in an
 /// `--all-workspaces` run shares one pace: they share one write budget).
-fn pace_write() {
+pub(crate) fn pace_write() {
     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     let mut last = LAST
         .lock()
@@ -715,7 +715,7 @@ pub(crate) enum Scope {
     Here(PathBuf),
 }
 
-fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>), String> {
+pub(crate) fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>), String> {
     let cwd = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
     match scope {
         Scope::Repo(repo) => {
@@ -745,11 +745,36 @@ fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>), String> 
     }
 }
 
-fn write_gate(t: &Target) -> Result<(), String> {
+pub(crate) fn write_gate(t: &Target) -> Result<(), String> {
     match loom_daemon::write_scope::may_write_from(Path::new(&t.root), Some(&t.repo)) {
         loom_daemon::write_scope::Verdict::Allow(_) => Ok(()),
         loom_daemon::write_scope::Verdict::Deny(why) => Err(why),
     }
+}
+
+/// `labels migrate --holds [--repo R | --all-workspaces] [--apply] [--json]`
+/// (#11861): see [`super::labels_migrate_holds`].
+pub(crate) fn dispatch_holds(scope: Scope, apply: bool, json: bool) -> i32 {
+    let fleet = matches!(scope, Scope::AllWorkspaces);
+    let (targets, unresolved) = match resolve_targets(scope) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("labels migrate --holds: {e}");
+            return 2;
+        }
+    };
+    for root in &unresolved {
+        eprintln!("labels migrate --holds: UNRESOLVED {} (no GitHub origin)", root.display());
+    }
+    let forge_for = |t: &Target| -> Box<dyn super::labels_migrate_holds::HoldsForge> {
+        Box::new(super::labels_migrate_holds::GhHoldsForge {
+            repo: t.repo.clone(),
+            root: t.root.clone(),
+        })
+    };
+    let reports =
+        super::labels_migrate_holds::run_targets(&targets, apply, &forge_for, &write_gate);
+    super::labels_migrate_holds::finish(&reports, apply, fleet, json)
 }
 
 /// `labels migrate [--repo R | --all-workspaces] [--apply] [--json]`.

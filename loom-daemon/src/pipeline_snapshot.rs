@@ -74,8 +74,8 @@ pub struct RepoPipelineSnapshot {
     pub changes_requested: Option<usize>,
     /// The strict subset of [`Self::changes_requested`] that has **no
     /// owner** (Issue #5272): no active Doctor claim (`loom:treating`) and no
-    /// PR-lane park (`crate::work_finder::PR_LANE_PARK_LABELS` — `loom:blocked`
-    /// / `loom:frozen`). Before #5272's standalone Doctor dispatch, every
+    /// park (`crate::work_finder::PARK_LABELS` — `loom:blocked`,
+    /// `loom:operator`, `loom:frozen`). Before #5272's standalone Doctor dispatch, every
     /// row here was a PR permanently parked once its sweep ended — nothing in
     /// the fleet would ever pick it up again. A regression here (this count
     /// climbing and staying nonzero) is exactly the failure mode #5272 fixes,
@@ -89,8 +89,11 @@ pub struct RepoPipelineSnapshot {
     pub merged_24h: Option<usize>,
     /// Open PRs labeled `loom:operator` (Issue #8091) — the first-class
     /// "the engine has stopped acting on this artifact, a human is needed"
-    /// hold (#5502). On a PR it is not a park (#11795); the held issues are
-    /// tracked in [`Self::operator_only_issues`]. A fleet carrying several of
+    /// hold (#5502), a park for every role since #11861; the held issues are
+    /// tracked in [`Self::operator_only_issues`]. Champion's merge-risk and
+    /// critical-file holds moved to `loom:blocked` beside `loom:pr` (#11861),
+    /// so after the `labels migrate --holds` pass they are no longer counted
+    /// here. A fleet carrying several of
     /// these is normal steady state, not a fault — see
     /// `crate::health::assess_operator_attention`.
     pub operator_held: Option<usize>,
@@ -553,14 +556,14 @@ impl GhPipelineSource {
     /// The `--search` query for the `changes_requested_unclaimed` metric
     /// (Issue #5272): open `loom:changes-requested` PRs that are **owned by
     /// nothing** — no active Doctor claim (`loom:treating`) and no PR-lane
-    /// park ([`crate::work_finder::PR_LANE_PARK_LABELS`], the set Doctor
-    /// skips; `loom:operator` is Doctor work, #7660). Mirrors [`Self::queued_search_query`]'s
+    /// park ([`crate::work_finder::PARK_LABELS`], the set Doctor
+    /// skips; since #11861 that includes `loom:operator`). Mirrors [`Self::queued_search_query`]'s
     /// `--search`-negation shape for the identical reason: `gh pr list --label`
     /// only ANDs, it cannot express "and NOT this label".
     fn changes_requested_unclaimed_search_query() -> String {
         let mut query =
             "is:open is:pr label:loom:changes-requested -label:loom:treating".to_string();
-        for label in crate::work_finder::PR_LANE_PARK_LABELS.iter() {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             query.push_str(&format!(" -label:{label}"));
         }
         query
@@ -1048,7 +1051,7 @@ mod tests {
 
     /// The `changes_requested_unclaimed` query must exclude an active
     /// Doctor claim (`loom:treating`) *and* every park/hold label in
-    /// `work_finder::PR_LANE_PARK_LABELS` — the two conditions AC2/AC4 of
+    /// `work_finder::PARK_LABELS` — the two conditions AC2/AC4 of
     /// #5272 require for a `loom:changes-requested` PR to count as "no owner".
     #[test]
     fn changes_requested_unclaimed_search_query_excludes_claim_and_park_labels() {
@@ -1060,13 +1063,13 @@ mod tests {
             query.contains("-label:loom:treating"),
             "expected '-label:loom:treating' in query: {query}"
         );
-        for label in crate::work_finder::PR_LANE_PARK_LABELS.iter() {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             assert!(
                 query.contains(&format!("-label:{label}")),
                 "expected '-label:{label}' in query: {query}"
             );
         }
-        // #11795: a held PR is still Doctor's work (#7660).
-        assert!(!query.split(' ').any(|t| t == "-label:loom:operator"), "{query}");
+        // #11861: loom:operator parks a PR too; Doctor never acts on it.
+        assert!(query.split(' ').any(|t| t == "-label:loom:operator"), "{query}");
     }
 }

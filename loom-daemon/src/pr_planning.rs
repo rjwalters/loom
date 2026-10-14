@@ -110,6 +110,14 @@ fn joins_busy_queue(row: &Value, prefer: bool, trust: &TrustPolicy) -> bool {
         || (prefer && WorkOrigin::trusted_pr(row, trust) == WorkOrigin::Interactive)
 }
 
+/// Whether `park` is the one park Champion's queue keeps (#11861): the
+/// blocked hold beside `loom:pr` is Champion's own merge-risk or critical-file
+/// hold, which only Champion releases. The queue requires `loom:pr` for
+/// Champion, so a blocked PR without approval never reaches it.
+fn champion_reads_hold(role: PrRole, park: &str) -> bool {
+    role == PrRole::Champion && crate::work_finder::BLOCKED_HOLD_NAMES.contains(&park)
+}
+
 /// Stable role baseline followed by one shared preference. Inputs are REST
 /// pull objects, newest first, with `mergeable` resolved for Doctor conflicts.
 /// Deliberately retain `loom:reviewing` for Judge's existing stale-claim probe;
@@ -129,19 +137,20 @@ pub fn ordered_queue(
                 .is_some_and(|s| s.eq_ignore_ascii_case("open"))
                 && r["draft"] != true
                 && r["isDraft"] != true
-                // The PR-lane parks: `loom:blocked`, `loom:frozen` (#11743: no
-                // role reviews, treats or merges a frozen PR) and the retired
-                // `loom:operator-only`. Not `loom:operator` (#11795): Doctor
-                // drains a held PR (#7660); Judge skips it below.
-                && !crate::work_finder::PR_LANE_PARK_LABELS
+                // The parks: `loom:blocked`, `loom:operator` (#11861: no role
+                // acts on an item a human must decide, PR or issue) and
+                // `loom:frozen` (#11743), plus the retired names. One
+                // exception: Champion keeps a `loom:pr` + `loom:blocked` PR,
+                // the shape of its own merge-risk or critical-file hold, which
+                // it re-evaluates and releases (`crate::champion_hold`).
+                && !crate::work_finder::PARK_LABELS
                     .iter()
-                    .any(|l| has_label(r, l))
+                    .any(|l| has_label(r, l) && !champion_reads_hold(role, l))
         })
         .collect();
     candidates.retain(|r| match role {
         PrRole::Judge => {
-            !has_label(r, "loom:operator")
-                && !has_label(r, "loom:treating")
+            !has_label(r, "loom:treating")
                 && (has_label(r, "loom:review-requested")
                     || (fallback(r) && (!labeled_review || joins_busy_queue(r, prefer, trust))))
         }
@@ -149,7 +158,6 @@ pub fn ordered_queue(
             !has_label(r, "loom:treating")
                 && (has_label(r, "loom:changes-requested")
                     || (has_label(r, "loom:pr")
-                        && !has_label(r, "loom:operator")
                         && (r["mergeable"] == false || r["mergeable"] == "CONFLICTING")))
         }
         PrRole::Champion => has_label(r, "loom:pr"),

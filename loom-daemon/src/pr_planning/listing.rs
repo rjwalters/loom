@@ -103,9 +103,8 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
         for row in &mut rows {
             if has_label(row, "loom:pr")
                 && !has_label(row, "loom:changes-requested")
-                && !crate::work_finder::OPERATOR_HOLD_NAMES
+                && !crate::work_finder::PARK_LABELS
                     .iter()
-                    .chain(crate::work_finder::PR_LANE_PARK_LABELS.iter())
                     .chain(&["loom:treating"])
                     .any(|l| has_label(row, l))
             {

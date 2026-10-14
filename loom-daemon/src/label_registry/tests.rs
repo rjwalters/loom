@@ -224,20 +224,12 @@ const FOLDED: [&str; 5] = [
 #[test]
 fn derived_park_labels_equal_the_previous_literal_in_order() {
     // Order matters: the park guards report the first match in this order.
-    // #11795: loom:operator is an issue-dispatch park; the retired names
-    // follow the active ones so an unmigrated item stays parked.
+    // #11795: loom:operator is a park; #11861: on PRs too, there is no
+    // separate PR-lane set. The retired names follow the active ones so an
+    // unmigrated item stays parked.
     let mut want = vec!["loom:blocked", "loom:operator", "loom:frozen"];
     want.extend(FOLDED);
     assert_eq!(*crate::work_finder::PARK_LABELS, want);
-}
-
-#[test]
-fn derived_pr_lane_park_labels_leave_loom_operator_out() {
-    // #11795: on a PR loom:operator is not a park (#7660); the retired
-    // loom:operator-only keeps parking an unmigrated PR exactly as before.
-    let mut want = vec!["loom:blocked", "loom:frozen"];
-    want.extend(FOLDED);
-    assert_eq!(*crate::work_finder::PR_LANE_PARK_LABELS, want);
 }
 
 #[test]

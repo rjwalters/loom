@@ -256,6 +256,29 @@ count_label() {
     echo "$n"
 }
 
+# Count open issues carrying ANY of the given labels, deduplicated by number
+# (#11861). The Parked line counts a hold under every name that folds into
+# it, so it does not undercount while `labels migrate` has not relabelled the
+# retired names yet. $1 = issue|pr, $2.. = labels
+count_any_label() {
+    local kind="$1" label out=""
+    shift
+    command -v gh &>/dev/null || return 1
+    for label in "$@"; do
+        out+=$(gh "$kind" list --label "$label" --state open --limit 1000 --json number --jq '.[].number' 2>/dev/null) || return 1
+        out+=$'\n'
+    done
+    printf '%s' "$out" | { grep -E '^[0-9]+$' || true; } | sort -u | wc -l | tr -d ' '
+}
+
+# A hold's names (#11861): the active label plus the retired names that fold
+# into it, from the registry (`labels aliases`); the active name alone when
+# no daemon answers.
+# requires-daemon: labels optional   #11861 — without `labels aliases` the Parked line counts the active label only
+hold_names() {
+    "${LOOM_DAEMON_BIN:-loom-daemon}" labels aliases "$1" 2>/dev/null | grep . || echo "$1"
+}
+
 # Build the work-queue object as compact JSON, or "null" when gh/label counts
 # are unavailable (gh missing, unauthenticated, or a non-GitHub forge). Never
 # errors — a missing forge just yields null so the section is omitted.
@@ -290,8 +313,10 @@ work_queue_json() {
     hermit=$(count_label issue "loom:hermit") || { echo "null"; return 0; }
     curated=$(count_label issue "loom:curated") || { echo "null"; return 0; }
     auditor=$(count_label issue "loom:auditor") || { echo "null"; return 0; }
-    held_operator=$(count_label issue "loom:operator") || { echo "null"; return 0; }
-    held_blocked=$(count_label issue "loom:blocked") || { echo "null"; return 0; }
+    # shellcheck disable=SC2046  # one label per line, no spaces in label names
+    held_operator=$(count_any_label issue $(hold_names "loom:operator")) || { echo "null"; return 0; }
+    # shellcheck disable=SC2046
+    held_blocked=$(count_any_label issue $(hold_names "loom:blocked")) || { echo "null"; return 0; }
     held_frozen=$(count_label issue "loom:frozen") || { echo "null"; return 0; }
     jq -nc \
         --argjson issue "$issue" \

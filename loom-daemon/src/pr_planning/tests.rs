@@ -89,7 +89,7 @@ fn human_fallback_joins_a_busy_queue_only_when_enabled_without_enrollment() {
 }
 
 #[test]
-fn holds_and_drafts_do_not_block_other_work_and_doctor_keeps_held_feedback_route() {
+fn holds_and_drafts_do_not_block_other_work() {
     for (role, label) in [
         (PrRole::Judge, "loom:review-requested"),
         (PrRole::Doctor, "loom:changes-requested"),
@@ -99,22 +99,56 @@ fn holds_and_drafts_do_not_block_other_work_and_doctor_keeps_held_feedback_route
         draft["draft"] = json!(true);
         let rows = vec![
             draft,
-            pr(2, "interactive", &[label, "loom:blocked"]),
             pr(3, "interactive", &[label, "loom:operator-only"]),
             pr(4, "autonomous", &[label]),
+            pr(5, "interactive", &[label, "loom:operator"]),
+            pr(6, "interactive", &[label, "loom:frozen"]),
         ];
-        assert_eq!(ids(&ordered_queue(rows, role, true, &policy())), vec![4]);
+        assert_eq!(ids(&ordered_queue(rows, role, true, &policy())), vec![4], "{role:?}");
     }
     let mut conflict = pr(1, "autonomous", &["loom:pr"]);
     conflict["mergeable"] = json!(false);
     let mut held = conflict.clone();
     held["number"] = json!(2);
-    held["labels"] = json!([{"name":"loom:pr"},{"name":"loom:operator"}]);
-    let feedback = pr(3, "interactive", &["loom:changes-requested", "loom:operator"]);
+    held["labels"] = json!([{"name":"loom:pr"},{"name":"loom:blocked"}]);
+    let feedback = pr(3, "interactive", &["loom:changes-requested"]);
     let claimed = pr(4, "interactive", &["loom:changes-requested", "loom:treating"]);
-    let rows = vec![feedback, held, conflict, claimed];
+    let operator = pr(5, "interactive", &["loom:changes-requested", "loom:operator"]);
+    let rows = vec![feedback, held, conflict, claimed, operator];
     assert_eq!(ids(&ordered_queue(rows.clone(), PrRole::Doctor, true, &policy())), vec![3, 1]);
     assert_eq!(ids(&ordered_queue(rows, PrRole::Doctor, false, &policy())), vec![1, 3]);
+}
+
+/// #11861: no role's queue serves a `loom:operator` PR, and only Champion's
+/// serves a `loom:pr` + `loom:blocked` PR (its own merge-risk or critical-file
+/// hold, which it re-evaluates and releases).
+#[test]
+fn no_role_serves_an_operator_pr_and_only_champion_serves_its_hold() {
+    for (role, label) in [
+        (PrRole::Judge, "loom:review-requested"),
+        (PrRole::Doctor, "loom:changes-requested"),
+        (PrRole::Champion, "loom:pr"),
+    ] {
+        for hold in [
+            "loom:operator",
+            "loom:operator-only",
+            "loom:operator-decision",
+        ] {
+            let rows = vec![pr(1, "interactive", &[label, hold])];
+            assert!(ordered_queue(rows, role, true, &policy()).is_empty(), "{role:?} {hold}");
+        }
+    }
+    let held = || pr(7, "autonomous", &["loom:pr", "loom:blocked"]);
+    assert_eq!(ids(&ordered_queue(vec![held()], PrRole::Champion, true, &policy())), vec![7]);
+    let mut conflicted = held();
+    conflicted["mergeable"] = json!("CONFLICTING");
+    assert!(ordered_queue(vec![conflicted], PrRole::Doctor, true, &policy()).is_empty());
+    // A Champion hold a human also parked for a decision is not Champion's.
+    let both = pr(8, "autonomous", &["loom:pr", "loom:blocked", "loom:operator"]);
+    assert!(ordered_queue(vec![both], PrRole::Champion, true, &policy()).is_empty());
+    // Champion's exception needs `loom:pr`: a blocked PR without it is not served.
+    let unapproved = pr(9, "autonomous", &["loom:review-requested", "loom:blocked"]);
+    assert!(ordered_queue(vec![unapproved], PrRole::Champion, true, &policy()).is_empty());
 }
 
 #[test]

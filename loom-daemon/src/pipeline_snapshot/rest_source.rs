@@ -32,7 +32,7 @@ use anyhow::Result;
 
 use super::{GhPipelineSource, RepoPipelineSnapshot};
 use crate::forge_listing::{self, CachedListing, RestIssue};
-use crate::work_finder::{OPERATOR_HOLD_LABEL, PARK_LABELS, PR_LANE_PARK_LABELS};
+use crate::work_finder::{OPERATOR_HOLD_LABEL, PARK_LABELS};
 
 /// Whether a metric counts the issue rows or the PR rows of a REST listing
 /// (REST issue listings return both — [`RestIssue::is_pull_request`]).
@@ -241,7 +241,7 @@ pub(super) fn fetch(src: &GhPipelineSource, root: &Path) -> RepoPipelineSnapshot
                     snap.changes_requested_unclaimed = Some(
                         prs.iter()
                             .filter(|r| {
-                                !has_any(r, &["loom:treating"]) && !has_any(r, &PR_LANE_PARK_LABELS)
+                                !has_any(r, &["loom:treating"]) && !has_any(r, &PARK_LABELS)
                             })
                             .count(),
                     );

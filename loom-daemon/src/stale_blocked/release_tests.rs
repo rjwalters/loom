@@ -844,3 +844,67 @@ fn a_claimed_issue_does_not_get_loom_issue_back_on_release() {
     assert_eq!(r.released[0].restored, None);
     assert!(!w.labels(10).contains("loom:issue"));
 }
+
+// --- #11861: dependency-only escalations and Champion holds -------------------
+
+/// A dependency-only finding parked by `classify-dependency-block.sh
+/// --check-defer --apply` (or moved off `loom:operator` by `labels migrate
+/// --holds`) clears itself when its blocker closes: the park is released, the
+/// proposal keeps `loom:curated` for Champion's re-evaluation, and it never
+/// gains `loom:issue` it did not carry.
+#[test]
+fn a_dependency_only_escalation_clears_when_its_blocker_closes() {
+    let mut w = World::new();
+    let body = format!(
+        "A proposal.\n\n{}\n",
+        render_park(
+            &[3],
+            Some(crate::dep_classify::park::PARK_BY),
+            Some("2026-10-01T00:00:00Z"),
+            Some(crate::dep_classify::park::PARK_REASON),
+        )
+    );
+    w.with_body(10, false, &body, &["loom:curated"]);
+    w.state(3, "OPEN", false);
+    let r = w.run();
+    assert!(r.released.is_empty() && w.no_writes(), "still waiting: {}", r.summary());
+
+    let mut w = World::new();
+    w.with_body(10, false, &body, &["loom:curated"]);
+    w.state(3, "CLOSED", false);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].restored, None);
+    assert_eq!(w.park.writes, vec!["remove #10 loom:blocked"]);
+    let labels = w.labels(10);
+    assert!(
+        labels.contains("loom:curated") && !labels.contains("loom:blocked"),
+        "{labels:?}"
+    );
+}
+
+/// Champion's merge-risk and critical-file holds are a reason-only park
+/// record beside `loom:pr`: this pass never releases one. Only Champion (a
+/// release signal) or a human does.
+#[test]
+fn a_champion_hold_on_a_pr_is_never_released_here() {
+    for reason in [
+        crate::champion_hold::MERGE_RISK_HOLD_REASON,
+        crate::champion_hold::CRITICAL_FILE_HOLD_REASON,
+    ] {
+        let mut w = World::new();
+        let body = format!(
+            "A change.\n\n{}\n",
+            render_park(
+                &[],
+                Some(crate::champion_hold::HOLD_BY),
+                Some("2026-10-01T00:00:00Z"),
+                Some(reason),
+            )
+        );
+        w.with_body(30, true, &body, &["loom:pr"]);
+        let r = w.run();
+        assert_eq!(skipped(&r, "unstated"), 1, "{reason}: {}", r.summary());
+        assert!(r.released.is_empty() && w.no_writes(), "{reason}");
+    }
+}
