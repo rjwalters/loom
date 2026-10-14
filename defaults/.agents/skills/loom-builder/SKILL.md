@@ -244,7 +244,7 @@ Check for an argument passed via the slash command:
 
 If a number is provided (e.g., `/builder 42`):
 1. Treat that number as the target **issue** to work on; **skip** "Finding Work"
-2. **Guard before any write** (#11863): `loom-daemon forge check-claim <number>`. Exit `1`: claim. Exit `0` prints a token: `TARGET_IS_PR` (Builder is an issue role, #9929), `CLOSED`, `FROZEN` or `OPEN_PR` → refuse, writing nothing. `BUILDING` / `LEASE_ALREADY_HELD` / `BRANCH_EXISTS` → refuse unless your invoker holds this claim (`LOOM_SWEEP_CLAIM_OWNED` names the number, or the `/loom:sweep` that briefed you pre-flighted it). Any other exit is not an all-clear: stop. A hard-excluded label (Label Workflow) refuses too
+2. **Guard before any write** (#11863): `loom-daemon forge check-claim <number>`. Exit `1`: claim. Exit `0` prints a token: `TARGET_IS_PR` (Builder is an issue role, #9929), `CLOSED`, `FROZEN` or `OPEN_PR` → refuse, writing nothing. `BUILDING` / `LEASE_ALREADY_HELD` / `BRANCH_EXISTS` → refuse unless your invoker holds this claim (`LOOM_SWEEP_CLAIM_OWNED` names the number, or your brief says `This /loom:sweep pre-flighted #<number>`) or the operator explicitly told you to resume or force this claim (e.g. their own crashed run): that overrides these three, as `--force-claim` does, never the four above. Any other exit is not an all-clear: stop. A hard-excluded label (Label Workflow) refuses too
 3. Claim the issue: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"` (`worktree.sh` leases it)
 4. Proceed directly to implementation
 5. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=builder target=<n> class=<verdict|noop|refused|failed> reason=<token>`

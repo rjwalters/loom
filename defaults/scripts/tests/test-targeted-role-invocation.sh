@@ -85,6 +85,7 @@ check_judge() {
     expect "$where judge: an issue number refuses"     "$J" "\`false\` (an issue number; Judge is a PR role)"
     expect "$where judge: closed and frozen refuse"    "$J" "\`closed\`, \`loom:frozen\`, or a failed read"
     expect "$where judge: fallback PRs stay review-only" "$J" "\"Fallback Queue\" rules (guard, review only, never claim or label)"
+    expect "$where judge: a priority label alone is unlabelled" "$J" "Neither those nor a verdict label (e.g. only \`loom:important\`)"
     expect "$where judge: a judged PR is a no-op"      "$J" "A verdict label without \`loom:review-requested\` → no-op"
     expect "$where judge: outcome line"                "$J" "LOOM_STEP_OUTCOME role=judge"
     before "$where judge: probe precedes the claim"    "$J" "$PROBE" "claim exactly as Primary Queue step 2"
@@ -106,6 +107,8 @@ check_builder() {
         expect "$where builder: $tok refuses"          "$B" "\`$tok\`"
     done
     expect "$where builder: invoker's own claim allowed" "$B" "refuse unless your invoker holds this claim (\`LOOM_SWEEP_CLAIM_OWNED\`"
+    expect "$where builder: the sweep brief is an ownership signal" "$B" "your brief says \`This /loom:sweep pre-flighted #<number>\`"
+    expect "$where builder: operator override is claim-only" "$B" "that overrides these three, as \`--force-claim\` does, never the four above"
     expect "$where builder: other exits are not an all-clear" "$B" "Any other exit is not an all-clear"
     expect "$where builder: outcome line"              "$B" "LOOM_STEP_OUTCOME role=builder"
     before "$where builder: guard precedes the claim"  "$B" "forge check-claim <number>" "--add-label \"loom:building\""
@@ -123,7 +126,16 @@ check_curator "$(args "$SKILLS/loom-curator/SKILL.md")" "skill"
 check_builder "$(args "$SKILLS/loom-builder/SKILL.md")" "skill"
 
 echo ""
-echo "Test group 3: the outcome contract doc"
+echo "Test group 3: an attended sweep tells its Task Builders the claim is theirs"
+# worker run --role builder exports LOOM_SWEEP_CLAIM_OWNED itself (pinned by
+# worker_spawn::claim_owned's builder_worker_is_told_its_sweep_owns_the_claim); a Task
+# subagent cannot get a per-subagent env (#3719), so the brief must say it.
+SWL="$(cat "$CMDS/sweep-wave-lifecycle.md")"
+expect "sweep step 4 requires the ownership sentence"  "$SWL" "\`This /loom:sweep pre-flighted #N and holds its claim and lease.\`"
+before "the requirement sits in the Builder dispatch step" "$SWL" "### 4. Builder phase" "This /loom:sweep pre-flighted #N"
+
+echo ""
+echo "Test group 4: the outcome contract doc"
 D="$(cat "$DOC")"
 for cls in verdict noop refused failed; do
     expect "doc defines class $cls"                    "$D" "| \`$cls\` |"

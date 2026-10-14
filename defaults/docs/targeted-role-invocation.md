@@ -20,7 +20,7 @@ loads). This doc carries the reasoning, the outcome vocabulary, and the audit.
 | Role | 1. Pool gate | 2. Kind probe | 3. State and skip labels | 4. Claim + lease | Stale-claim check |
 |---|---|---|---|---|---|
 | Curator | `gh api rate_limit`, min(core, graphql) under ~500 or unreadable → refuse `pool_gate` | one live REST read of `issues/<N>`: `pull_request != null` → refuse `target_is_pr` | same read: `closed`, `loom:frozen`, a hard-exclusion label → refuse | `loom:curating`; **no lease yet** (see "Gaps") | `claim-staleness.sh check --label loom:curating` |
-| Judge | none (the role runner's pool gate runs before spawn) | one live REST read of `issues/<N>`: `pull_request == null` → refuse `target_is_issue` | same read: `closed` (also merged), `loom:frozen` → refuse; verdict label without `loom:review-requested` → `noop already_judged`; no `loom:` label → Fallback Queue rules (review only, never claim) | `lease pr claim --role judge`, then `loom:reviewing` | `claim-staleness.sh check --label loom:reviewing` |
+| Judge | none (the role runner's pool gate runs before spawn) | one live REST read of `issues/<N>`: `pull_request == null` → refuse `target_is_issue` | same read: `closed` (also merged), `loom:frozen` → refuse; verdict label without `loom:review-requested` → `noop already_judged`; no stage label (`loom:review-requested`, `loom:reviewing`, a verdict label; a priority label alone does not count) → Fallback Queue rules (review only, never claim) | `lease pr claim --role judge`, then `loom:reviewing` | `claim-staleness.sh check --label loom:reviewing` |
 | Builder | none (as Judge) | `forge check-claim <N>` → `TARGET_IS_PR` | same probe → `CLOSED`, `FROZEN`, `OPEN_PR`; a hard-exclusion label → refuse | `loom:issue` → `loom:building`; `worktree.sh` runs `lease ensure` | `check-claim`'s `BUILDING` / `LEASE_ALREADY_HELD` / `BRANCH_EXISTS`, unless the invoker holds the claim |
 
 Why each gate sits where it does:
@@ -45,12 +45,31 @@ Why each gate sits where it does:
 - **A dispatcher-held claim is the invoker's, not a peer's.** A daemon sweep
   flips `loom:issue → loom:building` and publishes a lease before it spawns
   the session, and says so through `LOOM_SWEEP_CLAIM_OWNED=<N>`. An in-session
-  `/loom:sweep` publishes the lease at pre-flight. A Builder briefed by either
+  `/loom:sweep` publishes the lease at pre-flight. A Builder launched by either
   sees its invoker's claim as `BUILDING` / `LEASE_ALREADY_HELD` /
-  `BRANCH_EXISTS` and must continue, not refuse. The never-overridable tokens
-  (`TARGET_IS_PR`, `CLOSED`, `FROZEN`, `OPEN_PR`) refuse whoever claimed. A
-  step engine that pre-claims a Builder step must export the same
-  `LOOM_SWEEP_CLAIM_OWNED=<N>`, or not pre-claim.
+  `BRANCH_EXISTS` and must continue, not refuse. The signal is mechanical on
+  every launch path:
+  - daemon sweep (Task subagent or `worker run`): the daemon exports
+    `LOOM_SWEEP_CLAIM_OWNED=<N>` and every child inherits it;
+  - attended sweep, `worker run --role builder --issue <N>`: the worker is
+    launched with `LOOM_SWEEP_CLAIM_OWNED=<N>` when none is inherited
+    (`worker_spawn/claim_owned.rs`). Its other readers agree for a
+    sweep-owned Builder: `build-gate.sh` arms the dispatch backoff for `<N>`,
+    `cpu-budget.sh` excludes the sweep's own count, and the containment
+    label names `<N>`;
+  - attended sweep, Task subagent: the Task tool cannot set a per-subagent
+    environment (#3719), so `sweep-wave-lifecycle.md` step 4 requires the
+    brief to say, verbatim, `This /loom:sweep pre-flighted #N and holds its
+    claim and lease.`
+
+  The never-overridable tokens (`TARGET_IS_PR`, `CLOSED`, `FROZEN`,
+  `OPEN_PR`) refuse whoever claimed. A step engine that pre-claims a Builder
+  step must export the same `LOOM_SWEEP_CLAIM_OWNED=<N>`, or not pre-claim.
+- **An operator's explicit word overrides a claim, never a category.** An
+  attended `/loom:builder <N>` told to resume or force a claim (the
+  operator's own crashed run, say) passes `BUILDING` / `LEASE_ALREADY_HELD` /
+  `BRANCH_EXISTS`, exactly as `check-claim --force-claim` does. It never
+  passes the four never-overridable tokens.
 
 ### Where the `loom:operator` skip goes
 
