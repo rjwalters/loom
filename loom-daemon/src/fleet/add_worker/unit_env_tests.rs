@@ -1,4 +1,4 @@
-//! 2AMLogic/2am#4484: the fleet worker's daemon unit carries only
+//! The fleet worker's daemon unit carries only
 //! supervisor-structural env, and no later provisioning step replaces it.
 //!
 //! The defect was not in `render_daemon_unit` (a static template) but in the

@@ -707,7 +707,7 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
     ));
 
     // 8b. Watchdog timer (#5343) via `--heal-watchdog-only`, which must never
-    //     replace the fleet unit above (2AMLogic/2am#4484). See
+    //     replace the fleet unit above. See
     //     render_daemon_watchdog's doc comment.
     plan.push_step(Step::new(
         "daemon-watchdog",
@@ -1313,7 +1313,7 @@ systemctl --user enable --now loom-daemon.service
 /// `LOOM_WORK_FINDER=0`, `LOOM_MAIN_HEALTH_GATE=0`, `LOOM_FORCE_SCOPE`,
 /// `LOOM_GUARD_DECISION_LOG`, `LOOM_PID_FILE`, `LOOM_WORKSPACE`,
 /// `LOOM_START_ARGV0` -- and env outranks the fleet config, so the worker came
-/// up with its work finder pinned off (2AMLogic/2am#4484).
+/// up with its work finder pinned off.
 ///
 /// `--heal-watchdog-only` never touches the pid file, the daemon or its unit,
 /// but it is a no-op until the autonomy-desired marker exists, and the daemon
@@ -1696,7 +1696,7 @@ mod feed_egress_tests;
 #[cfg(test)]
 mod invoker_tests;
 
-// 2AMLogic/2am#4484: the fleet unit carries no harvested env, same reason.
+// The fleet unit carries no harvested env, same reason.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod unit_env_tests;
