@@ -1,5 +1,16 @@
 //! The production [`ClaimResetter`] for `fleet drain` (moved out of
 //! `drain.rs`; #10089 routed its three `gh` spawns through the facade).
+//!
+//! # A frozen issue (#11743)
+//!
+//! `fleet drain` is an explicit operator command, but the operator names a
+//! *host*, not an issue: the reset is a blanket pass over every claim that
+//! host held. `loom:frozen` says a human wants this particular item left
+//! exactly as it is, so the drain honors it like every daemon path does. It
+//! makes no write, logs a `warn` (an operator running a drain reads its
+//! output), and reports the claim as not reset, so the drain still completes.
+//! The label read the reset already makes is the check; a failed read already
+//! fails the reset, so a frozen item is never written on an unverified read.
 
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
@@ -84,10 +95,25 @@ fn reset_claim_with(
     }
     let parsed: serde_json::Value =
         serde_json::from_slice(&view.stdout).context("parsing gh issue view --json labels")?;
-    let has_building = parsed["labels"]
+    let labels: Vec<String> = parsed["labels"]
         .as_array()
-        .is_some_and(|labels| labels.iter().any(|l| l["name"] == "loom:building"));
-    if !has_building {
+        .map(|ls| {
+            ls.iter()
+                .filter_map(|l| l["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    // #11743: even the operator's explicit drain leaves a frozen claim alone
+    // (see the module doc for why). Reported as "not reset", like a claim that
+    // already cleared.
+    if crate::work_finder::is_frozen(&labels) {
+        log::warn!(
+            "fleet drain: #{issue} in {repo} is `loom:frozen` — leaving its labels (including \
+             `loom:building`) as they are; a human who unfreezes it can reset the claim (#11743)"
+        );
+        return Ok(false);
+    }
+    if !labels.iter().any(|l| l == "loom:building") {
         return Ok(false);
     }
 

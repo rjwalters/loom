@@ -2449,7 +2449,9 @@ pub mod forge {
                 continue;
             }
             match crate::reclaim_pr_warning::reclaim_and_warn(gh_bin, root, issue_number) {
-                Ok(()) => {
+                // #11743: a frozen skip wrote nothing — not a reclaim.
+                Ok(crate::reclaim_pr_warning::Reclaim::Frozen) => {}
+                Ok(crate::reclaim_pr_warning::Reclaim::Released) => {
                     reclaimed += 1;
                     // #4348 acceptance criterion: WARN-level, with the
                     // issue number, last-known pid, and (when the evidence
@@ -2500,7 +2502,8 @@ pub mod forge {
     fn list_prs_with_label(gh_bin: &Path, root: &Path, label: &str) -> Result<Vec<ClaimedPr>> {
         // #10349: the ETag'd REST listing, filtered here (was GraphQL `gh pr list`).
         let rows = super::open_pr_listing::list_with_label(gh_bin, root, label)?;
-        Ok(rows
+        // #11743: a frozen PR is neither planned nor reclaimed.
+        Ok(super::pr_label_info::drop_frozen_claims(rows, label)
             .into_iter()
             .map(|r| {
                 // Issue #4638: activity is only worth fetching when there is a

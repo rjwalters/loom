@@ -1043,10 +1043,10 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
-        // Body park record first (#10161); a timeout stops here (park_hold.rs).
-        if self
-            .record_daemon_hold(issue, park_hold::QUARANTINE_HOLD_REASON)
-            .is_err()
+        // Body park record first (#10161); a timeout stops here (park_hold.rs),
+        // and so does a `loom:frozen` issue (#11743).
+        if self.record_daemon_hold(issue, park_hold::QUARANTINE_HOLD_REASON)
+            != Ok(park_hold::HoldGate::Proceed)
         {
             return;
         }
