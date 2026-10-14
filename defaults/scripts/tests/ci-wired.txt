@@ -54,6 +54,7 @@ test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
 test-champion-standing-authorization.sh
 test-check-ci-status.sh
+test-ci-suite-manifest-installed-layout.sh
 test-check-config-no-host-paths.sh
 test-check-conflict-markers.sh
 test-check-evaluating-staleness.sh
@@ -78,6 +79,7 @@ test-clean-stale-building-labels.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
 test-cpu-budget.sh
+test-create-issue-refuse-labels.sh
 test-create-pr-priority-labels.sh
 test-create-pr-provenance.sh
 test-create-pr-rate-limit-fallback.sh
@@ -176,6 +178,7 @@ test-repo-mismatch-fallback.sh
 test-require-daemon-bin.sh
 test-require-daemon-bin-provenance.sh
 test-resync-installed-agent-skills-guard.sh
+test-resync-installed-agents-hooks.sh
 test-resync-installed-gh-config-guard.sh
 test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh

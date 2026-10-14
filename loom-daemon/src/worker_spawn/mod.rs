@@ -673,6 +673,14 @@ fn run_preflight(
     if let Some(path) = path {
         command.env("PATH", path);
     }
+    // 2am#4367 P4: no gh update check, and the gateway profiles the front's
+    // classified reads use — exported only while the daemon has them live.
+    for (key, value) in crate::forge_gateway::agent_env() {
+        match value {
+            Some(v) => command.env(key, v),
+            None => command.env_remove(key),
+        };
+    }
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
     // item 1). Cargo keys a crate's incremental session state by the crate's
     // ABSOLUTE source path, and every Loom worktree is a new path — so state

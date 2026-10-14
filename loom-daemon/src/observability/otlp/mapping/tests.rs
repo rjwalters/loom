@@ -15,8 +15,8 @@ mod loom_kind;
 mod record_id;
 mod start_facts;
 use crate::telemetry::{
-    HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord, SweepDisposition,
-    SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
+    HostHealthRecord, MemoryPressureSummary, PhaseDuration, RoleTickResult, SweepCompletedRecord,
+    SweepDisposition, SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
     TokenSnapshotRecord,
 };
 

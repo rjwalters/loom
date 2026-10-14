@@ -2212,6 +2212,7 @@ a second resync at the same release writes nothing.
 | `.agents/skills/loom-<name>/SKILL.md` | written when absent or when the file carries the `<!-- loom-managed-skill -->` marker; one without the marker is never written or removed. A marker-carrying skill the release no longer generates is removed |
 | `.claude/README.md`, `.github/CONFIGURATION.md` | copied, only when the repo already has the file |
 | `.claude/biome.jsonc` | copied, created when absent |
+| `.claude/agents/<name>.md` | each shipped file copied, only when the repo has a real `.claude/agents/` directory (#11033). A symlinked one (this repo's dogfood link) is left alone; a file the release does not ship is the repo's |
 | `.gitignore` | only the Loom-managed block is merged (as `loom-daemon update-gitignore` does), and only when the file exists. The file is never listed in `installed_files` |
 | `.github/labels.yml` | only the block between `# BEGIN LOOM LABELS` and `# END LOOM LABELS` is replaced from the release (#11033); every byte outside it is kept, so a consumer's own labels above or below survive. With no markers the block is appended; with no file the release's file is written. Malformed markers (a second BEGIN or END, END before BEGIN, a lone or near-miss marker) leave the file untouched, log a warning, and make `resync-payload` and `resync-installed.sh` exit 1. The file is never listed in `installed_files`. Live forge labels are never deleted here: that is `loom-daemon labels migrate --apply` |
 | `.loom/CLAUDE.md`, `.loom/AGENTS.md` | re-rendered from the release's template with the install date the file already carries, so an unchanged template changes nothing. Only when the file exists and has an `**Installation Date**:` line |
@@ -2253,11 +2254,14 @@ from an older template is brought up to date.
 | `package.json` (`loom-workspace` stub) | The removal of its `version` field is a one-time migration (#4285) |
 | root `CLAUDE.md` | Repo-customized. Removing a leftover `**Loom Version**` header is a one-time migration (#6612, #8147) |
 | `.gitattributes` `merge=ours` block and the local `merge.ours.driver` | They resolve per-host resync commits that conflict on the stamp (#4528). The daemon resync has one writer per change. An existing block is left as it is, and local git config cannot be committed |
+| `.claude/settings.json` hook wiring | The repo's own file. `resync-installed.sh` only warns about a hook that `scripts/install/provision-hooks.sh` wires and the file does not (#11033), and never writes it; the payload carries no wiring table. A daemon-dispatched launch injects the roll-pause wiring itself (#11049) |
 | forge labels | The drift check against `.github/labels.yml` is a forge read and a report, not an installed file. Run `sync-labels.sh` |
 
 Also unchanged by a resync: the root `CLAUDE.md` / `AGENTS.md` pointer sections,
 `.github/labels.yml` outside its managed block, `.github/workflows/` and
-`.claude/agents/`.
+nothing else under `.claude/`. `.loom/hooks/tests/` rides the `.loom/hooks/`
+row; `resync-installed.sh` syncs it only when the repo already has the
+directory, and otherwise prints an `un-synced drift` line naming the files.
 
 Rollout: keep running `resync-installed.sh` (or a fleet wrapper around it) until
 a release with these surfaces is the fleet floor.
@@ -6420,6 +6424,7 @@ knobs not yet audited here.
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
 | `autonomous.roleRunner.onIdleMaxWait` | *(config only)* | *(unset — no promotion, today's idle-edge-only firing)* | **Per-role starvation guard for an `onIdle` role (#7511).** A `{"<role>": "<duration>"}` object (e.g. `{"hermit": "24h", "auditor": "72h"}`, duration strings `<n>s`/`<n>m`/`<n>h`/`<n>d`) naming the longest a role may go without a completed tick before it is **promoted** into the next interval-cadence pass — see [`onIdleMaxWait` — promoting a starved `onIdle` role](#onidlemaxwait--promoting-a-starved-onidle-role-7511) below |
 | `autonomous.roleRunner.architectMaxProposals` | `LOOM_ARCHITECT_MAX_PROPOSALS` | `5` | **Per-invocation** cap on how many proposal issues one `architect` dispatch may file (#5656) — the actuator-saturation limit of the idle-edge control loop. Passed to the session as `/loom:architect --max-proposals <n>`, which `architect.md` enforces as a hard ceiling. Per-repo on purpose (the workable cap grows with a repo's maturity — ~5 while work is narrow, 7+ once it fans out), so it is read from each root's own config. Zero/negative/non-integer at either tier drops to the next one (a cap of `0` would spend a whole session forbidden from producing anything). Ignored for every other role |
+| **`curator.backlogTarget`** (top-level `curator`, not `autonomous.*`) | *(config only)* | *(unset: step skipped)* | **How many open issues this repo should hold (#11819).** Read through the full config resolver, so any tier may set it (machine defaults < `.loom/config.json` < `.loom-project/project.json` < fleet `.loom-local/fleet-repo.json` < host `.loom-local/local.json`). When set, each role-runner Curator dispatch counts the repo's open issues (one REST `search/issues` call, PRs excluded) and passes `/loom:curator --backlog-level <lenient\|normal\|strict> --backlog-open <n> --backlog-target <n>` from `r = open / target` (`< 0.5` lenient, `0.5`–`1.0` normal, `> 1.0` strict), which runs `curator.md`'s keep-or-close admission step on `loom:triage` issues; a failed count passes `normal` (no `--backlog-open`) and logs a `WARN`. Each such dispatch exports one `backlog.level` OTLP log. Unset, zero, negative or non-integer: no count, no flags, no record. Attended `/curator`, `/curator <n>` and `/loom:sweep` pass no flags. Per-repo, live |
 | `autonomous.balance.idleGate` | `LOOM_BALANCE_IDLE_GATE` | `false` | **Pipeline-empty gate for hermit/architect idle generation (#10817, slice 4 of #10630).** Off: an `onIdle` edge means a host slot is free, exactly as before (no ledger read, no log line). On: `hermit` and `architect` additionally need this repo's pipeline empty -- no review/changes/merge debt in the demand ledger (`role_runner::demand`) and, where observed, no ready/building issues; any observed work denies the run even with free slots. Unobserved axes never deny nor newly grant (today's host-slot rule applies). Other idle roles are untouched; `architectMaxProposals` still caps a granted architect run. A grant logs `role_runner: idle grant root=<r> role=<role> trigger=idle reason=pipeline-empty`. Precedence env > config > default; truthy `1/true/yes/on`, falsy `0/false/no/off`, an invalid env value warns and falls back to config. Per-repo, live |
 | `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
 | `autonomous.roleRunner.collisionWindowSecs` | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | that role's tick interval | Lookback window for the #4623 probe, clamped to `[60, 3600]`. Zero/invalid dropped to the next tier |
@@ -7491,9 +7496,9 @@ sustain counter, because a rate-limit rejection is unambiguous:
   the failing response win when captured, and otherwise the probe runs with
   the failing call's workspace root / `gh` program / `GH_CONFIG_DIR`. A probe
   reading *healthy* during a primary-limit failure (ambient user token, or a
-  new installation's false-full `/rate_limit`) or carrying an expired reset
-  is distrusted: the trip takes `fallbackCooldownSecs` and the reading is not
-  shown as the budget.
+  new installation's false-full `/rate_limit`) is distrusted and takes the 60s
+  minimum (#10375; a dry bucket just re-trips); one carrying an expired reset
+  takes `fallbackCooldownSecs`. Neither reading is shown as the budget.
 - The dispatch path's `loom:building` label flip and lease comment, and
   safehouse's forge lookups, report rate-limited failures too (#8997), so the
   first authoritative failure trips the breaker; their probe runs off-thread.

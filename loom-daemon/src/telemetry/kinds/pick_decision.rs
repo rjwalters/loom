@@ -230,11 +230,37 @@ pub struct PickSkip {
     pub number: u32,
     pub reason: PickSkipReason,
     /// Daemon-templated specifics of the skip, when the reason has them.
-    /// Today only a work-finder file-overlap deferral (#9781) sets it: the
-    /// shared `## Affected Files` paths (`file overlap: a, b`, bounded to one
-    /// short line). Additive and optional; absent everywhere else.
+    /// Only work-finder rows set it: a file-overlap deferral (#9781) carries
+    /// the shared `## Affected Files` paths (`file overlap: a, b`, bounded to
+    /// one short line), and a `workspace_halted` row (#11811) its closed-
+    /// vocabulary halt cause (`main_red`, `drain`, ...). Additive and
+    /// optional; absent everywhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The work finder's own un-collapsed [`QueueDisposition`] (#11811), so a
+    /// reader can tell apart what `reason` lumps together (which cap, which
+    /// back-off). Work-finder rows only; absent on role ticks and older
+    /// records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<QueueDisposition>,
+    /// When the row's time-boxed hold clears (#11811, the `queue.snapshot`
+    /// `held_until` of #9311): set for the recheck, dispatch / open-PR
+    /// back-off, cooldown and retry windows the work finder tracks; absent
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_until: Option<DateTime<Utc>>,
+}
+
+/// A work-finder skip (#11811): the closed-set reason plus the row's own
+/// disposition, its exportable detail and its hold expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickQueueSkip {
+    pub reason: PickSkipReason,
+    pub disposition: QueueDisposition,
+    /// Only daemon-templated, closed or path-derived text (see
+    /// [`PickSkip::detail`]); never free-form dispatch-error text.
+    pub detail: Option<String>,
+    pub held_until: Option<DateTime<Utc>>,
 }
 
 /// One workspace in a [`PickDraw`], with its draw weight.
@@ -319,8 +345,8 @@ pub enum PickVerdict {
     Acted(&'static str),
     /// Skipped, with the closed-set reason.
     Skipped(PickSkipReason),
-    /// Skipped, with the reason and its [`PickSkip::detail`].
-    SkippedWithDetail(PickSkipReason, String),
+    /// Skipped by the work finder, with its disposition (#11811).
+    SkippedQueue(PickQueueSkip),
     /// Considered; the daemon cannot see what the role did with it (a role
     /// agent chooses among its queue itself).
     Undecided,
@@ -415,15 +441,17 @@ impl PickDecisionRecord {
                     number: candidate.number,
                     reason,
                     detail: None,
+                    disposition: None,
+                    held_until: None,
                 }),
-                PickVerdict::SkippedWithDetail(reason, detail) => {
-                    skipped.push(PickSkip {
-                        repo: candidate.repo.clone(),
-                        number: candidate.number,
-                        reason,
-                        detail: Some(detail),
-                    });
-                }
+                PickVerdict::SkippedQueue(skip) => skipped.push(PickSkip {
+                    repo: candidate.repo.clone(),
+                    number: candidate.number,
+                    reason: skip.reason,
+                    detail: skip.detail,
+                    disposition: Some(skip.disposition),
+                    held_until: skip.held_until,
+                }),
                 PickVerdict::Undecided => {}
             }
             candidates.push(candidate);
