@@ -269,9 +269,15 @@ review gate serve `loom:review-requested` + `loom:blocked` the same way
 (`judge_may_review`); both verdicts leave the label on, and the re-approval
 restores `loom:pr` + `loom:blocked` (the janitor exception) and the precheck re-judges the hold;
 the push is release signal (c). Champion never removes the label while the
-hold stands, so a removal is always a human's release. The Capped-PR Recovery
-Pass, which also reads `loom:blocked` + `loom:changes-requested`, skips a PR
-with a Champion hold marker.
+hold stands, so a removal is always a human's release.
+
+A held PR whose Doctor cycle is capped (`doctor_cycle_capped`) leaves
+automation's hands: Doctor skips it and Judge and Champion never see it. The
+Capped-PR Recovery Pass, which also reads `loom:blocked` +
+`loom:changes-requested`, never grants it a cycle or removes `loom:blocked`;
+it posts one comment (`<!-- champion:capped-hold-recommendation -->`) asking a
+human to review it, close it or remove the hold. Find such PRs with
+`gh pr list --label loom:blocked --label loom:changes-requested`.
 
 ### The out-of-band AC hold on an issue (#6883)
 

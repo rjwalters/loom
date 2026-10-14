@@ -304,7 +304,9 @@ pub fn has_judge_work(root: &Path, gh: &Path) -> Result<bool> {
 /// guard at all, and the first admitted row settles it.
 pub fn has_judge_fallback(root: &Path, gh: &Path) -> Result<bool> {
     let (prefer, trust) = (prefer_human_prs(root), TrustPolicy::for_root(root));
-    for row in ordered_queue(list_open(root, gh)?, PrRole::Judge, prefer, &trust) {
+    let mut rows = list_open(root, gh)?;
+    mark_champion_holds(root, gh, PrRole::Judge, &mut rows)?;
+    for row in ordered_queue(rows, PrRole::Judge, prefer, &trust) {
         if row["mode"] == "fallback"
             && joins_busy_queue(&row, prefer, &trust)
             && guard_admits(root, &row)?
