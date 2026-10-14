@@ -1042,7 +1042,7 @@ pub fn github_app_gh_config_dir(workspace_root: &Path) -> PathBuf {
 /// Static `config.yml` companion `hosts.yml` needs so `gh` skips its
 /// one-time multi-account migration (see module doc above for why that
 /// migration is fatal for a GitHub-App-only credential).
-const GH_CONFIG_YAML: &str = "version: 1\ngit_protocol: https\n";
+pub const GH_CONFIG_YAML: &str = "version: 1\ngit_protocol: https\n";
 
 /// Build the `hosts.yml` content `gh` expects for `token` on `github.com`.
 /// Split from the file I/O so it is unit-testable without touching disk

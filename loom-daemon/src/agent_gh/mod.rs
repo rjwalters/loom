@@ -44,6 +44,7 @@ pub mod go_sort;
 pub mod ledger;
 pub mod next_gh;
 pub mod pr_checks;
+pub mod read_route;
 pub mod session_env;
 
 #[cfg(test)]
@@ -71,6 +72,11 @@ pub const OPT_OUT_ENV: &str = "LOOM_GH_SHIM";
 /// / `loom-daemon gh-shim …` — run it and exit. Called before clap parsing,
 /// so `gh`'s own flags never meet `loom-daemon`'s parser.
 pub fn dispatch_if_front() {
+    // 2am#4367 P4: `gh`'s update check is a request to api.github.com on its
+    // own schedule. Off for every loom-daemon process — the daemon, its CLI
+    // and this front — and so for every `gh` they spawn or exec. This is the
+    // first thing a process runs, before any thread could read `environ`.
+    std::env::set_var(crate::forge_gateway::NO_UPDATE_NOTIFIER_ENV, "1");
     let argv: Vec<OsString> = std::env::args_os().collect();
     let Some(argv0) = argv.first() else { return };
     let code = if Path::new(argv0).file_name() == Some(OsStr::new("gh")) {
@@ -198,6 +204,9 @@ pub fn run(raw: &[OsString]) -> i32 {
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
         );
+        // 2am#4367 P4: the gateway profiles the daemon exported, if this
+        // front's `gh` is the one it version-checked.
+        crate::forge_gateway::enable_front(&next);
         if let Some(out) = serve(raw, &next) {
             record("revalidated", raw);
             let mut stdout = std::io::stdout().lock();
@@ -208,9 +217,26 @@ pub fn run(raw: &[OsString]) -> i32 {
             return out.code;
         }
         record("bypass", raw);
+        let cwd = std::env::current_dir().ok();
+        let route = passthrough_route(raw, cwd.as_deref());
         // W5: one ledger row per passthrough, written before the exec that
         // replaces this process. It can never fail or delay the call.
-        ledger::book(raw, std::env::current_dir().ok().as_deref());
+        ledger::book(raw, cwd.as_deref(), &route);
+        if let Some(dir) = &route.gateway {
+            // A classified read: that owner's gateway profile is the only
+            // credential `gh` sees (an env token would outrank it).
+            let err = crate::gh_invocation::transparent::exec_with(
+                &next,
+                raw,
+                &[
+                    (SENTINEL_ENV, OsString::from((depth + 1).to_string())),
+                    ("GH_CONFIG_DIR", dir.clone().into_os_string()),
+                ],
+                &crate::gh_invocation::TOKEN_ENV_VARS,
+            );
+            eprintln!("gh (loom front): failed to exec {}: {err}", next.display());
+            return 127;
+        }
     }
     let err = crate::gh_invocation::transparent::exec(
         &next,
@@ -278,6 +304,38 @@ fn serve(raw: &[OsString], next: &Path) -> Option<Served> {
         }
         Route::Passthrough => None,
     }
+}
+
+/// How a passthrough runs (2am#4367 P4, [`read_route`]): a read whose owner
+/// is certain goes to that owner's gateway profile; anything else, or any
+/// doubt, keeps the session's credential.
+fn passthrough_route(raw: &[OsString], cwd: Option<&Path>) -> read_route::FrontRoute {
+    let Some(args) = raw
+        .iter()
+        .map(|a| a.to_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+    else {
+        return read_route::FrontRoute::default();
+    };
+    if std::env::var("GH_HOST").is_ok_and(|h| !h.is_empty() && h != "github.com")
+        || crate::forge_cmd::detect_forge(None) == crate::forge_cmd::ForgeType::Gitea
+    {
+        return read_route::FrontRoute::default();
+    }
+    if !crate::forge_gateway::any_live() {
+        // Break-glass: no gateway, no `git` read of the remote, nothing new.
+        return read_route::FrontRoute {
+            gateway: None,
+            read: read_route::is_read(&args),
+        };
+    }
+    let gh_repo = std::env::var("GH_REPO").ok();
+    read_route::plan(
+        &args,
+        gh_repo.as_deref(),
+        || implicit_repo(&git_remote_config(cwd?)?),
+        &crate::forge_gateway::profile_for,
+    )
 }
 
 /// Environment that makes `gh` print something else off a TTY: a forced

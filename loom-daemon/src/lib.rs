@@ -211,6 +211,7 @@ pub mod forge_denial;
 pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
+pub mod forge_gateway;
 pub mod forge_host;
 pub mod forge_identity;
 pub mod forge_inventory;

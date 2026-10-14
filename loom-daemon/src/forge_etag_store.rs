@@ -309,7 +309,7 @@ pub(crate) fn fetch_conditional(
         return fetch_conditional_via(site, gh_bin, cwd, target, url, etag, &*route);
     }
     fetch_conditional_via(site, gh_bin, cwd, target, url, etag, &|req| {
-        crate::forge_identity::route_read(req, std::time::SystemTime::now())
+        crate::forge_gateway::route_read(req, std::time::SystemTime::now())
     })
 }
 
@@ -810,7 +810,7 @@ pub(crate) fn cached_read_pinned(
     pin: ReadPin,
 ) -> Result<CachedRead> {
     let route = |req: &crate::forge_identity::RouteRequest<'_>| {
-        crate::forge_identity::route_read(req, std::time::SystemTime::now())
+        crate::forge_gateway::route_read(req, std::time::SystemTime::now())
     };
     cached_read_via(site, gh_bin, cwd, (repo, url, prefix), pin, &route)
 }
