@@ -2,7 +2,7 @@
   "$comment": [
     "Single source of truth for Loom label semantics (#10013). Embedded in loom-daemon; the Loom block of .github/labels.yml and defaults/.github/labels.yml is GENERATED from this file by `loom-daemon labels generate`. Edit here, then run `loom-daemon labels generate --write`.",
     "stale_after_minutes and lifecycle are INERT: no consumer reads them yet (the daemon's own constants remain authoritative). contradicts_approval is the 1-based report order of labels that contradict loom:pr (null = does not contradict).",
-    "retired lists labels Loom no longer declares, with their old -> new mapping (#11513), consumed by the forge-side migration (#11511). It is NEVER rendered into labels.yml (sync-labels.sh is additive and would re-create it). replaced_by names an active label or null (remove, no replacement); owned=false means Loom never declared the label, so the migration only adds replaced_by and never removes or deletes it."
+    "retired lists labels Loom no longer declares, with their old -> new mapping (#11513), consumed by the forge-side migration (#11511). It is NEVER rendered into labels.yml (sync-labels.sh is additive and would re-create it). replaced_by names an active label or null (remove, no replacement); owned=false means Loom never declared the label, so the migration only adds replaced_by and never removes or deletes it. also_remove (optional, owned only) lists active labels the migration also strips from each relabelled item, for a label that meant a combination (#11860)."
   ],
   "yaml_header": [
     "# ============================================================================",
@@ -563,37 +563,6 @@
       "lifecycle": "active",
       "color_note": "emerald-500",
       "yaml_preamble": []
-    },
-    {
-      "name": "loom:needs-revision",
-      "description": "Champion asked for a revision: Curator revises the body, then removes this. Applied by: Champion.",
-      "color": "6EE7B7",
-      "kind": "workflow",
-      "applied_by": "Champion",
-      "removed_by": "Curator",
-      "park": false,
-      "skip": false,
-      "hold": false,
-      "operator_gate": false,
-      "blocked_colabel": false,
-      "hard_exclusion": false,
-      "champion_path": false,
-      "human_gated": false,
-      "merge_hold": false,
-      "operator_hold": false,
-      "contradicts_approval": null,
-      "stale_after_minutes": null,
-      "requires_base": null,
-      "remove_with": [],
-      "lifecycle": "active",
-      "color_note": "emerald-300 - one step back from loom:curated",
-      "yaml_preamble": [
-        "# loom:needs-revision (#10753): Champion's NEEDS REVISION verdict routes the",
-        "# issue to Curator instead of waiting for someone to edit it. Champion's",
-        "# discovery skips the label; Curator revises the body (a dated `## Revision`",
-        "# section) and removes it, and the changed body hash brings Champion back.",
-        "# Bounded: see .loom/docs/promotion-throughput.md."
-      ]
     },
     {
       "name": "loom:blocked",
@@ -1211,6 +1180,15 @@
       "replaced_by": "loom:blocked",
       "owned": true,
       "retired_in": "#11795"
+    },
+    {
+      "name": "loom:needs-revision",
+      "replaced_by": "loom:triage",
+      "owned": true,
+      "retired_in": "#11860",
+      "also_remove": [
+        "loom:curated"
+      ]
     }
   ]
 }

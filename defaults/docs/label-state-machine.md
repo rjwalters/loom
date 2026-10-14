@@ -175,7 +175,7 @@ the migration table in `priority-model.md`.
 | Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red (criterion #2) | `loom:blocked` (#11861) — `champion-pr-merge.md`, "Hold behavior" |
 | Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because criterion #3 matched a critical-file pattern | `loom:blocked` (#11861) — `champion-critical-file-hold.md` |
 | Champion (issue close) | Holds a merged PR's linked **issue** open because one of its acceptance criteria needs out-of-band verification and no `loom:ac-verified` marker attests it | `loom:operator` (#6883) — `champion-pr-merge.md`, Step 4 |
-| Champion (promotion) | A proposal's only recurring finding is an open dependency | `loom:blocked` + one park record per blocker (#11861) — `classify-dependency-block.sh --check-defer --apply` |
+| Champion (promotion) | A proposal's only recurring finding is an open dependency | `loom:blocked` + one park record per blocker (#11860, #11861) — Step 4 `park-record apply --blocked-by` |
 | Curator / Builder / Doctor / Judge | Encounters work that needs a ruling or a human's hands | `loom:operator` (#11795) — "Routing to a human" above |
 | Human | Applies the label directly to any issue or PR | Always available |
 
@@ -316,7 +316,7 @@ only by the retired `loom:operator-only` needs no `loom:blocked` pre-pass (the
 migration keeps it parked.
 
 After the migration, Champion's Pass 0 un-escalation is retired from the
-prompts: `--check-defer --apply` parks a new dependency-only finding on
+prompts: Step 4 blocks a new dependency-only finding (#11860) on
 `loom:blocked`, and `release-stale-blocked` lifts it when the blocker closes.
 `--check-unescalate` stays in the binary only for prompts installed before
 #11861 and as this migration's decider.
@@ -591,14 +591,18 @@ release, quarantine release, no-op hold lift, reclaim) re-adds `loom:issue`
 beside it or beside any other skip or lane-veto label (#11480's shared
 `restore_veto`).
 
-**`loom:needs-revision` (#10753)**: Champion adds it with a `NEEDS REVISION`
-verdict, routing the issue to Curator instead of waiting for someone to edit
-it. Champion's discovery skips it. Curator revises the body (a dated
-`## Revision` section) and removes it, and the new body hash brings Champion
-back. After at most two rounds plus one final round, Champion files a ranked
-decision with `operator-decision apply` when a preference or authority
-question is named (never a bare `loom:operator` hold); factual findings
-get one Curator disposition round instead. Contract and bound: [`promotion-throughput.md`](promotion-throughput.md).
+**Champion's revise verdict (#10753, #11860)**: a `NEEDS REVISION` verdict
+removes `loom:curated`, adds `loom:triage` and carries a
+`<!-- champion:revise:body-<HASH> -->` marker, so Curator curates the issue a
+second time against the findings and ends it at `loom:curated` again. Every
+Champion evaluation is terminal: promote, revise, block (`loom:blocked` + park
+record) or escalate (`loom:operator`). After at most two rounds plus one final
+round, Champion files a ranked decision with `operator-decision apply` when a
+preference or authority question is named (never a bare `loom:operator`
+hold); factual findings get one Curator disposition round first.
+`loom:needs-revision`, the label this used to set, is retired onto
+`loom:triage` (`labels migrate` also strips `loom:curated`). Contract and
+bound: [`promotion-throughput.md`](promotion-throughput.md).
 
 ## Fact-based de-escalation of a Champion `proposal-escalated` hold (#7650, retired by #11861)
 

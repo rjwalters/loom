@@ -146,7 +146,7 @@ the PR (`reason="champion merge-risk hold"` / `"champion critical-file hold"`,
 `by=champion`, `loom_daemon::champion_hold`), keep `loom:pr`, and add
 `loom:blocked`. The release pass skips it (`Unstated`): only Champion or a
 human releases it. A dependency-only promotion finding writes one record per
-open blocker (`by=champion reason="dependency-only finding"`,
+open blocker (`park-record apply --blocked-by --by champion`, #11860; or
 `classify-dependency-block.sh --check-defer --apply`), which the release pass
 lifts when the blockers close.
 
