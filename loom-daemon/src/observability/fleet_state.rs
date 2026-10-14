@@ -74,6 +74,7 @@ pub mod enrich;
 mod flow;
 pub mod history;
 pub mod outcomes;
+mod pre_ready_journal;
 mod sources;
 mod step_rows;
 pub use step_rows::step_stage;
@@ -987,6 +988,7 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
 /// view. The forge reads run off the event loop; `view` comes back as given
 /// when they fail.
 async fn record_outcomes(
+    workspace_root: &Path,
     sink: &FleetStateSink,
     input: &FleetInput,
     (curated, triage): (outcomes::Curated, outcomes::Curated),
@@ -1001,6 +1003,14 @@ async fn record_outcomes(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.outcomes.clone(), state.enrich.clone())
     };
+    // #11954: reload the persisted `pre_ready_done` once per process, before
+    // the first diff, so a restart does not re-emit already-emitted exits.
+    let journal = pre_ready_journal::path(workspace_root);
+    if !JOURNAL_LOADED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let loaded = pre_ready_journal::load(&journal, now);
+        memory.pre_ready_done.extend(loaded);
+    }
+    let done_before = memory.pre_ready_done.clone();
     memory.curated_now = Some(curated);
     memory.triage_now = Some(triage);
     let roots = sources::managed_roots(workspace_pool, slug_cache)
@@ -1040,6 +1050,7 @@ async fn record_outcomes(
             return original;
         }
     };
+    let done_after = memory.pre_ready_done.clone();
     {
         let mut state = STATE
             .lock()
@@ -1047,9 +1058,15 @@ async fn record_outcomes(
         state.outcomes = memory;
         state.enrich = enrich_memory;
     }
+    if done_after != done_before {
+        pre_ready_journal::save(&journal, &done_after);
+    }
     outcomes::offer(records, sink);
     view
 }
+
+/// Whether this process has reloaded the pre-ready journal (#11954).
+static JOURNAL_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Held for a whole pass, so a tick pass and a collector pass never diff
 /// against the same record.
@@ -1108,9 +1125,17 @@ pub(super) async fn record(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
-    let mut view =
-        record_outcomes(sink, &input, (curated, triage), view, now, workspace_pool, slug_cache)
-            .await;
+    let mut view = record_outcomes(
+        workspace_root,
+        sink,
+        &input,
+        (curated, triage),
+        view,
+        now,
+        workspace_pool,
+        slug_cache,
+    )
+    .await;
     {
         let mut live = STATE
             .lock()
