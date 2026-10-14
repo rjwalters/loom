@@ -55,8 +55,16 @@ fn render_and_parse_round_trip_and_garbage_is_ignored() {
 #[test]
 fn strip_removes_only_the_marker() {
     let body = "Body.\n\n<!-- loom:reeval step=champion_merge rung=0 next=2026-10-14T18:00:00Z -->";
-    assert_eq!(strip(body).as_deref(), Some("Body."));
-    assert_eq!(strip("Body."), None);
+    assert_eq!(strip(body, StepRole::ChampionMerge).as_deref(), Some("Body."));
+    assert_eq!(strip(body, StepRole::ChampionPromote), None, "another step's marker stays");
+    assert_eq!(strip("Body.", StepRole::ChampionMerge), None);
+
+    let both = format!(
+        "{body}\n<!-- loom:reeval step=champion_promote rung=1 next=2026-10-14T18:00:00Z -->"
+    );
+    let (advanced, _) = advance(&both, StepRole::ChampionMerge, t0());
+    assert_eq!(due(&advanced, StepRole::ChampionPromote), due(&both, StepRole::ChampionPromote));
+    assert_eq!(parse(&advanced).len(), 2, "advance strips only its own step");
 }
 
 #[derive(Default)]
@@ -90,9 +98,13 @@ fn record_and_clear_go_through_the_forge() {
     assert_eq!(r.rung, 0);
     assert_eq!(due(&forge.body, StepRole::ChampionPromote), Some(r.next));
 
-    assert!(clear(&mut forge, 12).unwrap());
+    assert!(!clear(&mut forge, 12, StepRole::ChampionMerge).unwrap(), "not its step");
+    assert!(clear(&mut forge, 12, StepRole::ChampionPromote).unwrap());
     assert_eq!(forge.body, "Body.");
-    assert!(!clear(&mut forge, 12).unwrap(), "no marker, no write");
+    assert!(
+        !clear(&mut forge, 12, StepRole::ChampionPromote).unwrap(),
+        "no marker, no write"
+    );
     assert_eq!(forge.writes.len(), 2);
 
     forge.fail_read = true;

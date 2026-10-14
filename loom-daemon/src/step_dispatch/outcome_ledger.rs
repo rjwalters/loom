@@ -19,7 +19,8 @@
 //! | `refused`, reason `pool_gate` or `claimed` | [`Effect::Cooldown`] for [`LedgerConfig::refusal_cooldown`] |
 //! | `refused`, reason `claim_lost` | [`Effect::Redraw`], counted ([`LedgerCounters::claim_lost`]) |
 //! | any other `refused` (a state refusal) | [`Effect::Reclassify`] |
-//! | `failed` inside the fast-fail window | [`Effect::FastFailLadder`]: the #11854/#11872 ladder |
+//! | `failed` inside the fast-fail window, issue step | [`Effect::FastFailLadder`]: the #11854/#11872 ladder |
+//! | `failed` inside the fast-fail window, PR step | [`Effect::FastFailWindow`]: a ledger-local doubling window, never the issue quarantine |
 //! | `failed` later | [`Effect::Failed`]: counted toward the repeat cap only |
 //! | Champion `held` / `blocked` | [`Effect::ForgeLadder`]: 6 h → 7 d, on the forge ([`super::reeval_ladder`]) |
 //!
@@ -30,21 +31,33 @@
 //!
 //! # The repeat cap
 //!
-//! Every non-verdict run of an `(item, step)` is remembered. When
-//! [`LedgerConfig::repeat_cap`] of them fall inside
+//! Every non-verdict run of an `(item, step)` that actually worked the item is
+//! remembered. When [`LedgerConfig::repeat_cap`] of them fall inside
 //! [`LedgerConfig::repeat_window`] (3 in 24 h), the pair cools down until the
-//! oldest of them leaves the window, so no `(item, step)` runs more than 3
-//! times in 24 h without a state change (the design's pilot-to-fleet gate). A
+//! oldest of them leaves the window (the design's pilot-to-fleet gate). A
 //! verdict on the item is a state change: it clears every step's history and
-//! cooldown for that item. A `claim_lost` redraw never ran, so it is not a run.
+//! cooldown for that item.
+//!
+//! Not runs ([`counts_as_run`]): every `refused` outcome (`pool_gate`,
+//! `claimed`, `claim_lost`, a state refusal: the step never worked the item)
+//! and a `noop` that waited on something outside the item (`ci_pending`), so
+//! a PR sitting in the CI queue does not lose its Judge for a day.
+//!
+//! **Scope.** The run history is per host and in memory: it is not broadcast
+//! and a restart or roll forgets it. The cap a host arms *is* broadcast, but
+//! across N hosts an `(item, step)` can run up to about `2N + 1` times in
+//! 24 h before any one host caps it. It enforces the gate exactly on one host
+//! (the pilot); fleet-wide it is a bound per host.
 //!
 //! # Durability
 //!
 //! The ledger is local, in-memory state. Every window it arms is at most
 //! [`MAX_SHORT_COOLDOWN`] (24 h, the landed cooldown's own ceiling), and the
 //! registry broadcasts each one on the peer channel
-//! (`ClaimKind::StepCooldownArmed`), so a restart loses at most what a peer
-//! still holds. Nothing longer rides the broadcast: the Champion ladder's
+//! (`ClaimKind::StepCooldownArmed`), so peers keep honouring a window after
+//! this host restarts. The restarted host itself does not get its own windows
+//! back (peers never re-send them, and a host ignores its own ads). Nothing
+//! longer rides the broadcast: the Champion ladder's
 //! rungs past 24 h live on the forge only (the item's body), and after a
 //! rollback `release-stale-blocked` owns those parks.
 //!
@@ -93,6 +106,18 @@ pub const CHAMPION_LINE_PREFIX: &str = "CHAMPION-STEP";
 /// The reason a step's outcome carries when nothing said one: a missing
 /// outcome line on an unchanged item, or a verdict the forge does not show.
 pub const UNCLASSIFIED: &str = "unclassified";
+
+/// The reason of a step whose forge post-state could not be read.
+pub const PROBE_FAILED: &str = "probe_failed";
+
+/// `noop` reasons that waited on something outside the item; they are not
+/// runs for the repeat cap.
+pub const EXTERNAL_WAIT_NOOPS: [&str; 1] = ["ci_pending"];
+
+/// Base of a PR step's fast-fail window, doubled per consecutive fast
+/// failure (the #4485 ladder's default base).
+pub const PR_FAST_FAIL_BASE: Duration =
+    Duration::from_secs(crate::sweep_registry::DEFAULT_DISPATCH_BACKOFF_BASE_SECS);
 
 /// #11868's four outcome classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -218,6 +243,8 @@ pub struct PostState {
 /// The step's outcome: the forge post-state decides, the outcome line only
 /// chooses between classes the post-state allows.
 ///
+/// - No post-state (`None`: the forge read failed) is `failed`, reason
+///   `probe_failed`: the session's own line is never trusted alone.
 /// - A claim still held after exit is `failed`.
 /// - A moved or closed item is a `verdict` (reason: the line's, else `closed`
 ///   for a closed item, else [`UNCLASSIFIED`]).
@@ -225,8 +252,11 @@ pub struct PostState {
 ///   the forge does not show is `failed`; no line at all is `failed`
 ///   ([`UNCLASSIFIED`]).
 #[must_use]
-pub fn classify(line: Option<&StepOutcome>, post: PostState) -> StepOutcome {
+pub fn classify(line: Option<&StepOutcome>, post: Option<PostState>) -> StepOutcome {
     let failed_unclassified = StepOutcome::new(OutcomeClass::Failed, UNCLASSIFIED);
+    let Some(post) = post else {
+        return StepOutcome::new(OutcomeClass::Failed, PROBE_FAILED);
+    };
     if post.claim_held {
         return match line {
             Some(l) if l.class == OutcomeClass::Failed => l.clone(),
@@ -259,8 +289,13 @@ pub enum Effect {
     Reclassify,
     /// A short `(item, step)` cooldown of this length.
     Cooldown(Duration),
-    /// A fast failure: charge the #11854 fast-fail ladder.
+    /// A fast failure on an issue step: charge the #11854 fast-fail ladder.
     FastFailLadder,
+    /// A fast failure on a PR step: a ledger-local window doubling per
+    /// consecutive fast failure from [`PR_FAST_FAIL_BASE`], capped at
+    /// [`MAX_SHORT_COOLDOWN`]. Never the issue quarantine, whose park and
+    /// release (`loom:issue` restored) are issue-only.
+    FastFailWindow,
     /// A slow failure: counted toward the repeat cap only (the watchdogs own
     /// slow deaths).
     Failed,
@@ -317,6 +352,9 @@ pub fn effect_of(
             "claim_lost" => Effect::Redraw,
             _ => Effect::Reclassify,
         },
+        OutcomeClass::Failed if ran_for < cfg.fast_fail_window && step.acts_on_pr() => {
+            Effect::FastFailWindow
+        }
         OutcomeClass::Failed if ran_for < cfg.fast_fail_window => Effect::FastFailLadder,
         OutcomeClass::Failed => Effect::Failed,
     }
@@ -350,6 +388,18 @@ struct Entry {
     runs: Vec<DateTime<Utc>>,
     /// The cooldown in force, if any.
     until: Option<(DateTime<Utc>, CooldownCause)>,
+    /// Consecutive fast failures of a PR step ([`Effect::FastFailWindow`]).
+    fast_fails: u32,
+}
+
+/// Whether `outcome` is a run for the repeat cap (module doc).
+#[must_use]
+pub fn counts_as_run(outcome: &StepOutcome) -> bool {
+    match outcome.class {
+        OutcomeClass::Refused => false,
+        OutcomeClass::Noop => !EXTERNAL_WAIT_NOOPS.contains(&outcome.reason.as_str()),
+        OutcomeClass::Verdict | OutcomeClass::Failed => true,
+    }
 }
 
 /// What [`OutcomeLedger::record`] did.
@@ -360,8 +410,8 @@ pub struct Recorded {
     pub cooling_until: Option<DateTime<Utc>>,
     /// The repeat cap armed (or extended) the cooldown.
     pub repeat_capped: bool,
-    /// Steps of the item whose cooldown a verdict lifted: peers should drop
-    /// their copies.
+    /// Steps of the item whose **local** cooldown a verdict lifted. The
+    /// registry lifts every step's cooldown fleet-wide regardless.
     pub lifted: Vec<StepRole>,
 }
 
@@ -412,6 +462,7 @@ impl OutcomeLedger {
         let effect = effect_of(step, outcome, ran_for, &self.cfg);
         let mut lifted = Vec::new();
         let mut repeat_capped = false;
+        let counted = counts_as_run(outcome);
         match &effect {
             Effect::Advance | Effect::Landed => {
                 let keys: Vec<_> = self
@@ -444,12 +495,22 @@ impl OutcomeLedger {
                 } else {
                     CooldownCause::Refused
                 };
-                repeat_capped = self.count_run(item, step, now);
                 self.arm(item, step, add(now, *d), cause, now);
             }
-            Effect::Reclassify | Effect::FastFailLadder | Effect::Failed | Effect::ForgeLadder => {
-                repeat_capped = self.count_run(item, step, now);
+            Effect::FastFailWindow => {
+                let entry = self.entries.entry((item, step)).or_default();
+                entry.fast_fails = entry.fast_fails.saturating_add(1);
+                let delay = crate::sweep_registry::backoff_delay(
+                    entry.fast_fails,
+                    PR_FAST_FAIL_BASE,
+                    MAX_SHORT_COOLDOWN,
+                );
+                self.arm(item, step, add(now, delay), CooldownCause::FastFail, now);
             }
+            Effect::Reclassify | Effect::FastFailLadder | Effect::Failed | Effect::ForgeLadder => {}
+        }
+        if counted && !matches!(effect, Effect::Advance | Effect::Landed) {
+            repeat_capped = self.count_run(item, step, now);
         }
         Recorded {
             effect,
