@@ -215,11 +215,10 @@ gh issue list --label "loom:evaluating" --state open --limit 200 \
   fi
 
   RECLAIM_MARKER="<!-- champion:evaluating-stale-reclaim -->"
-  # Raw JSON, filtered with a local `jq --arg` (NOT `gh ... --jq --arg ...` —
-  # `gh`'s own --jq takes a single literal filter string with no --arg support).
-  COMMENTS_JSON=$(gh issue view "$N" --json comments)
+  # TRUSTED authors only (#9548, #11899): a forged marker must not escalate.
+  COMMENTS_JSON=$(loom-daemon forge trusted-comments --fetch "$N" --gh-shape </dev/null) || { echo "#$N: comments unreadable, skip"; continue; }
   PRIOR_RECLAIMS=$(printf '%s\n' "$COMMENTS_JSON" \
-    | jq --arg m "$RECLAIM_MARKER" '[.comments[] | select((.body // "") | contains($m))] | length')
+    | jq --arg m "$RECLAIM_MARKER" '[.[] | select((.body // "") | contains($m))] | length')
 
   if [ "$PRIOR_RECLAIMS" -ge "$(( ${LOOM_MAX_EVALUATING_RECLAIMS:-3} - 1 ))" ]; then
     # This would be the Nth reclaim of the SAME issue — reclaiming again would
