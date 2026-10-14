@@ -424,6 +424,9 @@ struct Candidate {
 struct Scan {
     /// May this pass ask remotes and the forge at all?
     online: bool,
+    /// May this pass write into a checkout? Only a write-mode pass that is
+    /// not gated (autoApply on, not paused, rolling or a non-release build).
+    may_write: bool,
     /// The rate-limit breaker is open: this pass asked nothing.
     breaker_open: bool,
     head_queries: u32,
@@ -488,6 +491,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
     pass.online = online;
     let mut scan = Scan {
         online,
+        may_write: mode == Mode::Write && gate.is_ok(),
         ..Scan::default()
     };
     let count = roots.len();
@@ -704,6 +708,23 @@ fn classify(
         (report, None)
     };
     if crate::init::is_loom_source_repo(root) {
+        // Self-heal the gitignored dogfood symlinks (#11681): a source-repo
+        // checkout cloned without `loom-daemon init` would otherwise never get
+        // them. Idempotent; refuses to clobber local-only files.
+        // A pass that may not write (Check mode, or gated) leaves it to the
+        // next Write pass.
+        let lines = if scan.may_write {
+            crate::init::link_dogfood_symlinks(root)
+        } else {
+            Vec::new()
+        };
+        if lines.iter().any(|l| !l.is_empty()) {
+            log::info!(
+                "workspace_resync: {}: dogfood symlinks: {}",
+                root.display(),
+                lines.join("; ")
+            );
+        }
         return skip(report, "the Loom source repo installs from its own tree");
     }
     let Some(nwo) = nwo else {
