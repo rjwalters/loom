@@ -612,7 +612,7 @@ fn repo_withdrawals() -> &'static Mutex<std::collections::HashMap<(String, Strin
 /// re-probe of an uncovered repo is a guaranteed wasted call.
 pub const REPO_WITHDRAWAL: Duration = Duration::from_secs(3600);
 
-fn repo_withdrawn_at(app_id: &str, owner_repo: &str, now: SystemTime) -> bool {
+pub(crate) fn repo_withdrawn_at(app_id: &str, owner_repo: &str, now: SystemTime) -> bool {
     let Ok(map) = repo_withdrawals().lock() else {
         return false;
     };
@@ -1024,6 +1024,10 @@ pub fn refresh_reader_credentials(
 /// a cheap no-op, so the loop is safe to spawn on every host.
 pub fn spawn_reader_refresh(workspace_root: PathBuf, primary_owner_repo: Option<String>) {
     WORKSPACE_ROOT.get_or_init(|| workspace_root.clone());
+    // 2am#4367 P4: the gateway read profiles (a no-op while forge.gateway
+    // is unset). Its own loop: it re-reads the config every minute, so
+    // unsetting the key restores today's routing within one.
+    crate::forge_gateway::spawn_refresh(workspace_root.clone());
     tokio::spawn(async move {
         loop {
             let ws = workspace_root.clone();
