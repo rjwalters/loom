@@ -87,6 +87,7 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),
+    ("sweep_registry/fast_fail_park.rs", "writer (quarantine park comment, #11854)"),
     ("sweep_registry/quarantine.rs", "writer"),
     (
         "sweep_registry/outcome_journal/label_timeline.rs",
