@@ -117,10 +117,10 @@ Notes on the table:
 1. **List.** Use the shared all-open walk, or the mirror when `forge.mirror` is on. Join PRs to issues, classify each item, and compute zero weights from labels and local state.
 2. **Draw a workspace** with the existing workspace draw. Workspace holds, including maintain-only, keep the root out.
 3. **Draw an item** with weight `actionable × priority × age`:
-   - **`actionable` ∈ {0, 1}.** Set to 0 for each "none" row in §4.1, and for a Builder step in a repo whose build backoff is engaged. Red-main fixes are exempt (`work_finder/build_backoff.rs:594`).
+   - **`actionable` ∈ {0, 1}.** Set to 0 for each "none" row in §4.1, and for a Builder step in a repo whose build backoff is engaged. Red-main fixes are exempt (`work_finder/build_backoff.rs:594`). Also 0 for a step whose role's token pool is exhausted (the `record_role_tick_pool_exhausted` state): the spawn would be refused, so drawing it would only burn the redraw budget (#11896).
    - **`priority`:** red-main ×50, `loom:very-important` ×8, `loom:important` ×3. The `vi_cap` demotion (`work_finder/vi_cap.rs:1-24`) runs over the whole item list first.
    - **`age`** = `1 + min(stage_age_days, 90) / 30`.
-   - **Seed:** `loom-draw/v2` = `sha256("loom-draw/v2:"+minute+":"+host+":"+tick_counter+":"+workspace+":"+draw_index)`. Draws are without replacement and replayable from `pick.decision`.
+   - **Seed:** `loom-draw/v2` = `sha256("loom-draw/v2:"+minute+":"+host+":"+tick_counter+":"+workspace+":"+draw_index)`. Draws are without replacement and replayable from `pick.decision`, which logs each workspace's starting pool (in pool order, with weights) and every draw's roll and picked index.
    - The weights are numeric hyperparameters in the strict block.
 4. **Gate and claim** for the step's role: saturation, ramp cap, per-repo RAM/disk cap, then the claim (§5). **On a pass, draw again**, up to 8 redraws per slot and 32 per tick. Count each pass with its reason, including `claim_lost`.
 5. **Spawn** `/loom:<role> <N>` (§4.4).
