@@ -374,6 +374,14 @@ impl TickReport {
         self.halt_partial = self.halted && !covered;
     }
 
+    /// The hold covered this tick's work (#11857): [`Self::halted`] without
+    /// [`Self::halt_partial`]. Gate tick-level reactions on this, not on
+    /// `halted`, or one held repo silences them for its healthy neighbours.
+    #[must_use]
+    pub fn halted_fully(&self) -> bool {
+        self.halted && !self.halt_partial
+    }
+
     /// An empty report for a multi-workspace tick run under these admission
     /// knobs.
     #[must_use]

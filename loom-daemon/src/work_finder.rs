@@ -3217,7 +3217,9 @@ pub fn spawn_multi_work_finder_task(
             // #10624: which repos the build back-off deferred (INFO on change).
             build_backoff.log_deferred(&report.queue, &roots);
 
-            if !report.halted {
+            // #11857: a partial hold (say one maintain-only repo) must not
+            // silence the capacity advisory for the healthy repos beside it.
+            if !report.halted_fully() {
                 // #5305: see the single-workspace loop above — `token_bound`
                 // is now a pure starvation check, not a cross-axis comparison
                 // against disk/RAM/ceiling.
