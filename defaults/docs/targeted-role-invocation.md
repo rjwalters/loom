@@ -91,9 +91,9 @@ step-outcome ledger does next, so the four must be told apart:
 | Class | Meaning | Ledger effect (#11900) |
 |---|---|---|
 | `verdict` | The role reached a decision that moved the item: Judge approved or requested changes, Builder opened a PR or parked the issue, Curator curated, parked or closed it | none; the next step comes from the labels |
-| `noop` | The role took (or evaluated) the item and found nothing to do | the existing per-item no-op cooldown |
-| `refused` | The item was not this step's to act on: wrong kind, wrong state, a skip label, a fresh peer claim, or the pool gate | none for a state refusal (the item must be re-classified); a short cooldown for `pool_gate` and `claimed` |
-| `failed` | The step did not complete for a reason unrelated to the item's state: a crash, a probe that could not answer, a claim left held | the fast-fail ladder |
+| `noop` | The role took (or evaluated) the item and found nothing to do | a cooldown per `(item, step)`, of the issue-keyed no-op cooldown's default length (1 h); `ci_pending` does not count toward the repeat cap |
+| `refused` | The item was not this step's to act on: wrong kind, wrong state, a skip label, a fresh peer claim, or the pool gate | a short cooldown for `pool_gate` and `claimed`; `claim_lost` redraws (counted). A state refusal re-classifies the item; a second identical one in a row on the same `(item, step)` arms the refusal cooldown, doubling to 24 h. No refusal counts toward the repeat cap |
+| `failed` | The step did not complete for a reason unrelated to the item's state: a crash, a probe that could not answer, a claim left held | fast, issue step: the fast-fail ladder; fast, PR step: the ledger's own doubling window (never the issue quarantine); slow: counted toward the repeat cap only |
 
 ### How the daemon tells them apart
 

@@ -175,7 +175,7 @@ A Builder restore with a verified open linked PR writes no label: the issue keep
 | `refused`, `claim_lost` | Redraw; counted |
 | any other `refused` | Reclassify the item |
 
-No `(item, step)` runs more than 3 times in 24 h without a state change: the ledger's repeat cap. Short cooldowns are local and broadcast (`step_cooldown_armed`), bounded at 24 h on both ends (`step_dispatch/outcome_ledger.rs` `MAX_SHORT_COOLDOWN`, which the landed cooldown shares). The draw reads them, and the forge ladder's due times, as part of `actionable` (#11900).
+**Bounds on repeats.** The ledger's repeat cap allows at most 3 runs of one `(item, step)` in 24 h without a state change, counting only steps that worked the item: a verdict, a `noop` other than `ci_pending`, and a `failed` (#11900). The outcomes it excludes have their own brakes. `ci_pending` gets the 1 h noop window. `pool_gate` and `claimed` get the 10 min refusal cooldown. A state refusal costs nothing the first time, but a second identical one in a row arms the refusal cooldown, doubling to 24 h. A `claim_lost` redraw never ran. The cap's run history is per host and in memory, so across N hosts the fleet-wide bound is about 2N + 1 runs. Short cooldowns are local and broadcast (`step_cooldown_armed`), bounded at 24 h on both ends (`step_dispatch/outcome_ledger.rs` `MAX_SHORT_COOLDOWN`, which the landed cooldown shares). The draw reads them, and the forge ladder's due times, as part of `actionable` (#11900).
 
 ## 6. Champion: promotion and merge
 

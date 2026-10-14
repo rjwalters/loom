@@ -416,7 +416,8 @@ fn the_query_merges_extend_only() {
 }
 
 /// Only steps that worked the item count toward the cap: refusals and a
-/// CI-queue wait never arm it, however many there are.
+/// CI-queue wait never arm it, however many there are. (Each has its own
+/// brake: the refusal cooldown, the repeated-refusal guard, the noop window.)
 #[test]
 fn refusals_and_ci_waits_are_not_runs() {
     let mut l = OutcomeLedger::default();
@@ -444,6 +445,10 @@ fn refusals_and_ci_waits_are_not_runs() {
         }
     }
     assert_eq!(l.counters().repeat_capped, 0);
+    // Not a run, but not free either: the repeated identical state refusal
+    // (item 22, `open_pr` x5) has its own brake.
+    let last = now + mins(200 + 4 * 61);
+    assert_eq!(l.cooling_cause(22, StepRole::Judge, last), Some(CooldownCause::Refused));
     assert!(counts_as_run(&out(OutcomeClass::Noop, "already_judged")));
     assert!(counts_as_run(&out(OutcomeClass::Failed, "crashed")));
 }
@@ -479,4 +484,94 @@ fn a_pr_step_fast_failure_doubles_a_local_window_capped_at_24h() {
         60,
         "a verdict resets the streak"
     );
+}
+
+/// Judge re-review on #11962: a lasting classifier/role disagreement must not
+/// loop. The first state refusal only reclassifies; a second identical one
+/// arms the refusal cooldown, doubling to 24 h; a different reason, another
+/// outcome or a verdict resets the streak.
+#[test]
+fn a_repeated_identical_state_refusal_arms_a_doubling_cooldown() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let refuse = |reason: &str| out(OutcomeClass::Refused, reason);
+    let step = StepRole::ChampionMerge;
+
+    let first = l.record(60, step, &refuse("not_eligible"), SLOW, now);
+    assert_eq!(
+        (first.effect, first.cooling_until),
+        (Effect::Reclassify, None),
+        "a stale listing costs nothing"
+    );
+    let mut lengths = Vec::new();
+    for k in 1..12 {
+        let at = now + chrono::Duration::days(k);
+        let rec = l.record(60, step, &refuse("not_eligible"), SLOW, at);
+        assert_eq!(rec.effect, Effect::Reclassify);
+        lengths.push((rec.cooling_until.expect("cooling") - at).num_seconds());
+    }
+    assert_eq!(&lengths[..3], &[600, 1200, 2400], "10 min, doubling");
+    assert!(lengths.iter().all(|s| *s <= 24 * 3600), "{lengths:?}");
+    assert_eq!(*lengths.last().unwrap(), 24 * 3600, "capped at 24 h");
+    assert_eq!(
+        l.cooling_cause(60, step, now + chrono::Duration::days(11)),
+        Some(CooldownCause::Refused)
+    );
+
+    // Two different reasons in turn: never two identical in a row.
+    for (k, reason) in ["open_pr", "head_moved", "open_pr", "head_moved"]
+        .into_iter()
+        .enumerate()
+    {
+        let at = now + mins(i64::try_from(k).unwrap());
+        assert_eq!(l.record(61, step, &refuse(reason), SLOW, at).cooling_until, None, "{reason}");
+    }
+
+    // Another outcome in between resets the streak.
+    l.record(62, step, &refuse("not_eligible"), SLOW, now);
+    l.record(62, step, &refuse("claim_lost"), SLOW, now);
+    assert_eq!(
+        l.record(62, step, &refuse("not_eligible"), SLOW, now)
+            .cooling_until,
+        None
+    );
+
+    // So does a verdict.
+    l.record(63, step, &refuse("not_eligible"), SLOW, now);
+    l.record(63, step, &out(OutcomeClass::Verdict, "rejected"), SLOW, now);
+    assert_eq!(
+        l.record(63, step, &refuse("not_eligible"), SLOW, now)
+            .cooling_until,
+        None
+    );
+
+    // The streak survives a prune between ticks.
+    l.record(64, step, &refuse("not_eligible"), SLOW, now);
+    l.prune(now + mins(5));
+    assert!(l
+        .record(64, step, &refuse("not_eligible"), SLOW, now + mins(5))
+        .cooling_until
+        .is_some());
+}
+
+/// Any other outcome on the pair resets the PR fast-fail streak, so the
+/// window doubles only over consecutive fast failures.
+#[test]
+fn the_pr_fast_fail_streak_is_consecutive() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let quick = Duration::from_secs(20);
+    let fail = out(OutcomeClass::Failed, "crashed");
+    l.record(70, StepRole::Judge, &fail, quick, now);
+    l.record(70, StepRole::Judge, &fail, quick, now + chrono::Duration::hours(2));
+    l.record(
+        70,
+        StepRole::Judge,
+        &out(OutcomeClass::Failed, "crashed"),
+        SLOW,
+        now + chrono::Duration::hours(4),
+    );
+    let at = now + chrono::Duration::hours(30);
+    let rec = l.record(70, StepRole::Judge, &fail, quick, at);
+    assert_eq!((rec.cooling_until.unwrap() - at).num_seconds(), 60, "back to the base");
 }
