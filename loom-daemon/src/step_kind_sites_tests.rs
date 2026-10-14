@@ -193,3 +193,81 @@ fn a_prose_mention_does_not_count_as_handling() {
     let code = production_lines(prose).join("\n");
     assert!(!KIND_NEEDLES.iter().any(|n| code.contains(n)));
 }
+
+/// Every production `kind: SweepKind::Issue(…)`, a struct constructor or an
+/// `Event` field pattern, reviewed (#11898). These are the shapes the
+/// silent-drop scan allows, so a reconstruction that rebuilds a live step as
+/// an issue sweep (`locks.rs` before #11898) or an `Event` match whose
+/// `_ =>` drops a step dispatch hides in them. A new one, or one more in a
+/// listed file, fails until it is reviewed here.
+const ISSUE_KIND_FIELDS: &[(&str, usize, &str)] = &[
+    ("cli/dispatch.rs", 1, "the CLI dispatches an issue sweep"),
+    (
+        "sweep_registry/locks.rs",
+        2,
+        "checkpoint recovery and journal adoption rebuild issue sweeps only; a \
+         live step's lock is adopted as a step (step_adopt.rs)",
+    ),
+    (
+        "observability/collector.rs",
+        2,
+        "event_issue names Step (not sweep.* telemetry); map_event_to_records is only \
+         reached for an event event_issue keys",
+    ),
+    ("observability/collector/identity.rs", 1, "observe names Step"),
+    ("observability/session_output.rs", 1, "handle_event names Step"),
+    (
+        "observability/ops/turnaround.rs",
+        2,
+        "SlotLedger counts steps; TurnoverLedger is issue-only by design",
+    ),
+    ("safehouse/envelopes.rs", 1, "event_to_envelope names Step"),
+    (
+        "safehouse.rs",
+        1,
+        "digest batching of issue dispatches; any other dispatch goes to \
+         event_to_envelope, which names Step",
+    ),
+];
+
+#[test]
+fn every_issue_kind_field_is_reviewed() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_sources_under(&src, &mut files);
+    let mut found: Vec<(String, usize)> = Vec::new();
+    for path in files {
+        let rel = path
+            .strip_prefix(&src)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        if rel.contains("test") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let n = production_lines(&text)
+            .iter()
+            .filter(|l| {
+                l.contains("kind: SweepKind::Issue(")
+                    || l.contains("kind: crate::types::SweepKind::Issue(")
+            })
+            .count();
+        if n > 0 {
+            found.push((rel, n));
+        }
+    }
+    let mut unreviewed = Vec::new();
+    for (rel, n) in &found {
+        match ISSUE_KIND_FIELDS.iter().find(|(f, _, _)| f == rel) {
+            Some((_, allowed, _)) if n <= allowed => {}
+            _ => unreviewed.push(format!("{rel}: {n}")),
+        }
+    }
+    assert!(
+        unreviewed.is_empty(),
+        "new `kind: SweepKind::Issue(…)` sites: build a `Step` as a step and name it in every \
+         `Event` match, then list the site in ISSUE_KIND_FIELDS (#11898):\n{}",
+        unreviewed.join("\n")
+    );
+}

@@ -97,6 +97,38 @@ impl SweepRegistry {
         false
     }
 
+    /// Whether a PR step's claim on `pr` is still the paused run `sweep_id`'s
+    /// to give back after a roll (#11898): no other sweep holds the role's
+    /// earliest live lease, and the claim label was not re-applied after the
+    /// run started (`started_at`, with the clock-skew slack). A peer Judge or
+    /// Doctor that claimed the PR during the roll window keeps it.
+    ///
+    /// # Errors
+    /// Why the claim is no longer this run's.
+    pub(crate) fn roll_pr_step_claim_still_ours(
+        &self,
+        pr: u32,
+        role: StepRole,
+        sweep_id: &str,
+        started_at: Option<DateTime<Utc>>,
+    ) -> std::result::Result<(), String> {
+        if self.config.skip_label_flip {
+            return Ok(());
+        }
+        if self.step_lease_held_elsewhere(pr, role, sweep_id) {
+            return Err(format!("another sweep holds the live {role} lease"));
+        }
+        if let (Some(label), Some(started_at)) = (role.claim_label(), started_at) {
+            if self
+                .fetch_label_applied_at(pr, label)
+                .is_some_and(|at| label_reapplied_after(at, started_at))
+            {
+                return Err(format!("`{label}` was re-applied after this run started"));
+            }
+        }
+        Ok(())
+    }
+
     /// Publish a step's `(item, step)` peer claim (#11898): `Advertise` while
     /// it runs, `Retract` when it ends. Fail-open and a no-op without a
     /// publisher, like every peer-claim send. A Champion merge step's

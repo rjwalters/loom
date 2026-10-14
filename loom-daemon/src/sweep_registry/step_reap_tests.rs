@@ -156,3 +156,29 @@ fn a_judge_steps_claim_is_held_elsewhere_only_when_another_sweep_holds_the_lease
         crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), "", 1);
     assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, "anyone"));
 }
+
+/// Review item 5: a PR step's roll requeue gives back only its own claim. A
+/// peer that took the role's lease during the roll window keeps the PR.
+#[test]
+fn a_pr_step_requeue_after_a_roll_checks_the_claim_is_still_its_own() {
+    let mine = "step-doctor-22-1";
+    let dir = tempdir().unwrap();
+    let peer = format!(
+        "{}\n{}",
+        role_lease_row(3, "peer-doctor").replace("role=judge", "role=doctor"),
+        role_lease_row(5, mine).replace("role=judge", "role=doctor"),
+    );
+    let reg =
+        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &peer, 0);
+    assert!(reg
+        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine, Some(Utc::now()))
+        .is_err());
+
+    let dir = tempdir().unwrap();
+    let own = role_lease_row(5, mine).replace("role=judge", "role=doctor");
+    let reg =
+        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &own, 0);
+    assert!(reg
+        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine, Some(Utc::now()))
+        .is_ok());
+}

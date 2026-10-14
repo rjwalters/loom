@@ -151,8 +151,10 @@ pub(crate) mod roll_resume;
 mod spawn_process;
 mod stacking;
 mod start_facts;
+mod step_adopt;
 pub mod step_lease_owner;
 mod step_reap;
+mod step_story;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;
