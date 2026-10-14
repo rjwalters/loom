@@ -94,7 +94,7 @@ if [[ "$BODY" == "<!-- champion:capped-hold-recommendation -->"* ]]; then
 else
     fail "the comment must open with the marker: $BODY"
 fi
-assert_contains "$BODY" 'remove `loom:blocked` to release the hold' "names the release"
+assert_contains "$BODY" 'remove both `loom:blocked` and `loom:operator` to release the hold' "names the release"
 assert_lacks "$OUT" "loom:blocked" "never edits loom:blocked"
 
 echo "Test 3: the marker stands -> no comment, no label (idempotent)"

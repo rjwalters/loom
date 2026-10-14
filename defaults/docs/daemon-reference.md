@@ -3426,8 +3426,9 @@ managed repo, fetched *after* the IPC round-trip completes:
   retired `loom:operator-only` until `labels migrate` relabels them
   (`operator_only_issues`; the field keeps its pre-#11795 name, a wire
   contract the dashboard reads). Since #11905, `champion_held` counts open
-  PRs at `loom:pr` + `loom:blocked` with no operator hold (Champion's
-  merge-risk and critical-file holds after #11861), from the `loom:pr`
+  PRs at `loom:pr` + `loom:blocked` with no operator hold (the label shape of Champion's
+  merge-risk and critical-file holds after #11861; another actor's markerless
+  park at approval counts too until #11932), from the `loom:pr`
   listing; it never overlaps `operator_held`, and `health`'s
   `operator_attention` details carry it as `champion_held`.
 - **Module** — `loom_daemon::pipeline_snapshot`: `PipelineSource` is the forge

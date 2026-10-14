@@ -33,7 +33,7 @@ use anyhow::Result;
 
 use super::{GhPipelineSource, RepoPipelineSnapshot};
 use crate::forge_listing::{self, CachedListing, RestIssue};
-use crate::work_finder::{BLOCKED_HOLD_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS};
+use crate::work_finder::{OPERATOR_HOLD_LABEL, PARK_LABELS};
 
 /// Whether a metric counts the issue rows or the PR rows of a REST listing
 /// (REST issue listings return both — [`RestIssue::is_pull_request`]).
@@ -318,8 +318,8 @@ fn operator_held_issues(ctx: &Ctx<'_>) -> Result<usize> {
     Ok(held + legacy)
 }
 
-/// Open PRs Champion holds at `loom:pr` (#11905): `loom:pr` + `loom:blocked`
-/// without an operator hold. The `loom:pr` listing is shared with `approved`.
+/// Open PRs at the Champion-hold label shape (#11905): `loom:pr` +
+/// `loom:blocked` without an operator hold (markerless parks included). The `loom:pr` listing is shared with `approved`.
 fn champion_held(ctx: &Ctx<'_>) -> Result<usize> {
     ctx.count(
         "loom:pr",
@@ -332,7 +332,13 @@ fn champion_held(ctx: &Ctx<'_>) -> Result<usize> {
 /// The GraphQL fallback search for [`champion_held`] on a full REST page:
 /// every operator-hold name excluded, as the REST filter does.
 fn champion_held_search_query() -> String {
-    let mut q = format!("is:open label:loom:pr label:{BLOCKED_HOLD_LABEL}");
+    // A comma is OR in a label qualifier: the REST shape counts every
+    // `is_blocked_hold` name, the retired ones included.
+    let blocked: Vec<&str> = crate::work_finder::BLOCKED_HOLD_NAMES
+        .iter()
+        .copied()
+        .collect();
+    let mut q = format!("is:open label:loom:pr label:{}", blocked.join(","));
     for name in crate::work_finder::OPERATOR_HOLD_NAMES.iter() {
         q.push_str(&format!(" -label:{name}"));
     }

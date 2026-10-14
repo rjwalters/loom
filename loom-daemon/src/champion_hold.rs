@@ -222,9 +222,10 @@ pub fn body_declares_doctor_cap(body: &str) -> bool {
 
 /// The label shape of a Champion hold at `loom:pr` (#11905): the approval
 /// beside the blocked hold and no operator hold, so a count of it never
-/// overlaps a `loom:operator` count. The Verdict-State Janitor strips
-/// `loom:pr` from this pair unless a trusted hold marker stands
-/// ([`is_champion_hold`]), so the labels alone are the cheap census.
+/// overlaps a `loom:operator` count. This is the label shape only: no code
+/// strips `loom:pr` from the pair, so a markerless pair (another actor's park
+/// at approval, #11932) is counted too. Telling them apart needs the trusted
+/// hold marker ([`is_champion_hold`]), a per-PR comment read.
 #[must_use]
 pub fn held_approval_shape<L: AsRef<str>>(labels: &[L]) -> bool {
     labels.iter().any(|l| l.as_ref() == "loom:pr")

@@ -734,10 +734,13 @@ else
   #     critical-file "Hold Cleared") and never count, like (b). Computed even
   #     when (a)-(d) fired.
   HOLD_LABEL_NOW=$(jq -r '[.labels[].name] | any(. == "loom:blocked")' <<<"$PR_JSON")
+  # A `loom:operator` removal after the capped-hold recommendation (#11905) clears
+  # the inbox item, never the hold: only earlier removals can be a release.
+  REC_AT=$(jq -r '[.comments[] | select(.body | startswith("<!-- champion:capped-hold-recommendation -->"))] | last | .createdAt // ""' <<<"$PR_JSON")
   MANUAL_RELEASE_SINCE_HOLD=false; LABEL_REPAIR=false
   if [ "$HOLD_LABEL_NOW" = false ]; then
     if REMOVED_BY=$(gh api "repos/{owner}/{repo}/issues/$PR_NUMBER/events" --paginate --jq \
-      ".[] | select(.event == \"unlabeled\" and (.label.name == \"loom:blocked\" or .label.name == \"loom:operator\") and .created_at > \"$HOLD_AT\" and .actor.type == \"User\" and ((.actor.login // \"\") | length > 0 and (endswith(\"[bot]\") | not))) | \"\(.actor.login) at \(.created_at)\"" 2>/dev/null); then
+      ".[] | select(.event == \"unlabeled\" and (.label.name == \"loom:blocked\" or (.label.name == \"loom:operator\" and (\"$REC_AT\" == \"\" or .created_at <= \"$REC_AT\"))) and .created_at > \"$HOLD_AT\" and .actor.type == \"User\" and ((.actor.login // \"\") | length > 0 and (endswith(\"[bot]\") | not))) | \"\(.actor.login) at \(.created_at)\"" 2>/dev/null); then
       REMOVED_BY=$(tail -n 1 <<<"$REMOVED_BY")
       [ -z "$REMOVED_BY" ] && LABEL_REPAIR=true   # read OK, no removal on record
     else
@@ -2915,13 +2918,15 @@ it. Route it to the operator inbox once (#11905); never remove
 ```bash
 REC="<!-- champion:capped-hold-recommendation -->"  # once: a human may remove loom:operator
 if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$REC\"))")" != true ]; then
+  # Label first: a failed label write leaves no marker, so the next pass retries.
+  gh pr edit "$PR_NUMBER" --add-label "loom:operator" &&
   ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$REC
 **Champion: Held PR at the Doctor-cycle cap**
 
-<WHY_DOCTOR_CANNOT_FINISH_IT> A human should review it, close it, or remove \`loom:blocked\` to release the hold. Removing \`loom:operator\` only clears the inbox item.
+<WHY_DOCTOR_CANNOT_FINISH_IT> A human should review it, close it, or remove both \`loom:blocked\` and \`loom:operator\` to release the hold. Removing only \`loom:operator\` clears the inbox item and releases nothing.
 
 ---
-*Automated by Champion role*" && gh pr edit "$PR_NUMBER" --add-label "loom:operator"
+*Automated by Champion role*"
 fi
 ```
 
