@@ -66,6 +66,7 @@ pub mod reader_withdrawal;
 pub mod redate_chain;
 pub mod stage_dwell;
 pub mod stage_entry;
+pub mod stage_events;
 pub mod stage_queue;
 pub mod turnaround;
 
@@ -213,6 +214,10 @@ pub fn register_global_ops_sink(sink: OpsSink) {
 /// The registered sink, or `None` when ops signals are not exported.
 #[must_use]
 pub fn global_ops_sink() -> Option<&'static OpsSink> {
+    #[cfg(test)]
+    if capture::sinkless() {
+        return None;
+    }
     GLOBAL_OPS_SINK.get()
 }
 

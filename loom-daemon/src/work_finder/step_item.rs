@@ -380,7 +380,7 @@ pub enum Verdict {
 }
 
 /// One role session that advances an item by one stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
     Curator,
@@ -395,6 +395,22 @@ pub enum Step {
 }
 
 impl Step {
+    /// The snake_case wire name (identical to the serde form).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Step::Curator => "curator",
+            Step::CuratorKeepOrClose => "curator_keep_or_close",
+            Step::ChampionPromote => "champion_promote",
+            Step::ChampionReevaluate => "champion_reevaluate",
+            Step::Builder => "builder",
+            Step::Judge => "judge",
+            Step::Doctor => "doctor",
+            Step::ChampionMerge => "champion_merge",
+            Step::ChampionHoldReevaluate => "champion_hold_reevaluate",
+        }
+    }
+
     /// The role that runs the step.
     #[must_use]
     pub fn role(self) -> &'static str {
@@ -421,7 +437,7 @@ impl Step {
 }
 
 /// Why an item has no step this tick (weight 0).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PassReason {
     Frozen,
@@ -436,6 +452,27 @@ pub enum PassReason {
     Epic,
     Proposal,
     NoStage,
+}
+
+impl PassReason {
+    /// The snake_case wire name (identical to the serde form).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Frozen => "frozen",
+            Self::Operator => "operator",
+            Self::HardExclusion => "hard_exclusion",
+            Self::Claimed => "claimed",
+            Self::Queued => "queued",
+            Self::SharedPr => "shared_pr",
+            Self::Sequenced => "sequenced",
+            Self::Blocked => "blocked",
+            Self::CapabilityMissing => "capability_missing",
+            Self::Epic => "epic",
+            Self::Proposal => "proposal",
+            Self::NoStage => "no_stage",
+        }
+    }
 }
 
 /// The dispatch lane an item rides in.

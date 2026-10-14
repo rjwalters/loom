@@ -2010,8 +2010,8 @@ mod ready_queue;
 pub use ready_queue::{QueueDisposition, ReadyQueueRow};
 mod dispatch_plan;
 pub use dispatch_plan::{
-    DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, RepoCapView, RowPlan,
-    PLAN_SCOPE,
+    DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, PlanStep, RepoCapView,
+    RowPlan, PLAN_SCOPE,
 };
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};

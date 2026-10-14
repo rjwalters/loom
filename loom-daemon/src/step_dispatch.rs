@@ -8,9 +8,13 @@
 //!   mirror's `labels_at`, then the issue's events, then its creation time
 //!   (#11894 §4.3).
 //!
-//! Nothing dispatches from here yet: the item draw (#11896) is the first
-//! consumer. Both are compiled and tested now so the draw lands on a measured
-//! input rather than a new one.
+//! - [`item_draw`]: the seeded weighted item draw over one workspace's
+//!   classified items, `actionable × priority × age` (#11894 §4.2 step 3,
+//!   #11896).
+//!
+//! Nothing dispatches from here yet: the finder cutover (#11909) calls the
+//! draw.
 
+pub mod item_draw;
 pub mod listing;
 pub mod stage_entry;

@@ -10,6 +10,7 @@ use super::{
     closing_refs, parse_label_times, stage_points, DwellSample, RepoInput, Sampler, StageFetcher,
     StageItem, BUILDING, CURATED, FETCH_BUDGET, ISSUE, REVIEW_REQUESTED, STAGE_LABELS,
 };
+use crate::observability::ops::stage_events::LabelTimes;
 use crate::telemetry::ops::{bounded_labels, MetricName, MetricPoint};
 
 fn at(secs: i64) -> DateTime<Utc> {
@@ -29,9 +30,14 @@ impl StageFetcher for Fake {
         _root: &Path,
         _slug: &str,
         number: u32,
-    ) -> Option<BTreeMap<String, DateTime<Utc>>> {
+        _label: &str,
+        _max_pages: usize,
+    ) -> LabelTimes {
         self.reads += 1;
-        Some(self.labels.get(&number).cloned().unwrap_or_default())
+        LabelTimes {
+            times: Some(self.labels.get(&number).cloned().unwrap_or_default()),
+            pages: 1,
+        }
     }
     fn merged_at(
         &mut self,

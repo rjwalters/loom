@@ -168,16 +168,9 @@ pub fn check_env_enabled() -> Option<u64> {
 
 /// Validate workspace is a GitHub repository and extract owner/repo
 fn validate_github_workspace(workspace_path: &str) -> Result<(String, String)> {
-    let output = Command::new("git")
-        .args(["-C", workspace_path, "remote", "get-url", "origin"])
-        .output()
-        .context("Failed to get git remote URL")?;
-
-    if !output.status.success() {
-        return Err(anyhow!("Not a git repository"));
-    }
-
-    let remote_url = String::from_utf8(output.stdout).context("Invalid UTF-8 in git remote URL")?;
+    // Bounded (#9715): a hung `git` must not stall the collector.
+    let remote_url = crate::forge_cmd::get_remote_url(std::path::Path::new(workspace_path))
+        .ok_or_else(|| anyhow!("Not a git repository (no readable origin remote)"))?;
 
     // Parse owner/repo from various URL formats:
     // - https://github.com/owner/repo.git

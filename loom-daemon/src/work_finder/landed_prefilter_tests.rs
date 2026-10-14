@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde_json::json;
@@ -163,6 +164,8 @@ struct FakeForge {
     marked: HashSet<(u32, u32)>,
     asked: Vec<Vec<u32>>,
     writes: Vec<String>,
+    /// Every comment write fails (#11901).
+    comment_fails: bool,
 }
 
 impl FakeForge {
@@ -202,6 +205,9 @@ impl LandedForge for FakeForge {
         true
     }
     fn comment(&mut self, issue: u32, body: &str) -> bool {
+        if self.comment_fails {
+            return false;
+        }
         self.writes.push(format!("comment {issue} {body}"));
         true
     }
@@ -232,7 +238,8 @@ fn a_landed_issue_is_routed_to_curator_and_a_part_of_one_is_not() {
 
 /// At most once: when the issue's comments already carry the marker for the
 /// same PR, Curator saw this landing and put the issue back. It is not
-/// landed, nothing is written, and it is never asked about again.
+/// landed and nothing is written; asked again later, the same landing is
+/// still kept, without another comment read.
 #[test]
 fn an_issue_curator_kept_after_this_landing_is_dispatchable() {
     let mut forge = FakeForge::default().with_labels(5, &["loom:issue"]);
@@ -243,9 +250,110 @@ fn an_issue_curator_kept_after_this_landing_is_dispatchable() {
 
     assert!(detect(&mut forge, &mut cache, &[5], &[], now).is_empty());
     assert!(forge.writes.is_empty(), "{:?}", forge.writes);
+    assert!(detect(&mut forge, &mut cache, &[5], &[], now).is_empty());
+    assert_eq!(forge.asked.len(), 1, "a fresh kept verdict is served from the cache");
+    forge.marked.clear(); // the local record answers now, not the comments
     let much_later = now + LANDED_RECHECK * 4;
-    assert!(detect(&mut forge, &mut cache, &[5], &[5], much_later).is_empty());
-    assert_eq!(forge.asked.len(), 1, "a kept verdict is never asked again");
+    assert!(detect(&mut forge, &mut cache, &[5], &[], much_later).is_empty());
+    assert_eq!(forge.asked.len(), 2, "a kept verdict is re-asked once stale (#11901)");
+    assert!(forge.writes.is_empty(), "{:?}", forge.writes);
+}
+
+/// #11901 case 1: a kept issue is not kept forever. A second closing PR that
+/// merges while the issue stays open is a new landing: routed and landed,
+/// whether it is seen on the stale re-ask or the tick its open PR merges.
+#[test]
+fn a_second_landing_after_a_keep_is_routed() {
+    let mut forge = FakeForge::default().with_labels(5, &["loom:issue"]);
+    forge.graph.insert(5, Some(40));
+    forge.marked.insert((5, 40));
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+    assert!(detect(&mut forge, &mut cache, &[5], &[], t0).is_empty(), "kept");
+
+    // Stale re-ask: #41 merged meanwhile.
+    forge.graph.insert(5, Some(41));
+    let later = t0 + LANDED_RECHECK;
+    assert_eq!(detect(&mut forge, &mut cache, &[5], &[], later), HashMap::from([(5, 41)]));
+    assert!(forge.writes.iter().any(|w| w.contains(&route_marker(41))), "{:?}", forge.writes);
+
+    // Open-PR path: a kept issue shows an open PR, which merges the next tick.
+    let mut forge = FakeForge::default().with_labels(6, &["loom:issue"]);
+    forge.graph.insert(6, Some(40));
+    forge.marked.insert((6, 40));
+    let mut cache = LandedCache::default();
+    assert!(detect(&mut forge, &mut cache, &[6], &[], t0).is_empty(), "kept");
+    assert!(detect(&mut forge, &mut cache, &[], &[6], t0).is_empty(), "open PR #42");
+    forge.graph.insert(6, Some(42));
+    assert_eq!(detect(&mut forge, &mut cache, &[6], &[], t0), HashMap::from([(6, 42)]));
+    assert_eq!(forge.asked.len(), 2, "asked the tick the PR merged, not after the recheck");
+}
+
+/// #11901 case 2: a route whose comment failed leaves no marker on the forge,
+/// so this host records it. When Curator puts the issue back, the same
+/// landing is kept, not routed a second time.
+#[test]
+fn a_route_whose_comment_failed_is_not_routed_again() {
+    let mut forge = FakeForge {
+        comment_fails: true,
+        ..FakeForge::default()
+    }
+    .with_labels(5, &["loom:issue"]);
+    forge.graph.insert(5, Some(40));
+    let mut probe = FakeForge {
+        comment_fails: true,
+        ..FakeForge::default()
+    }
+    .with_labels(5, &["loom:issue"]);
+    assert_eq!(route_to_curator(&mut probe, 5, 40), Route::RoutedUnmarked);
+
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+    assert_eq!(detect(&mut forge, &mut cache, &[5], &[], t0), HashMap::from([(5, 40)]));
+    assert_eq!(forge.writes, vec!["+5 loom:triage", "-5 loom:issue"]);
+
+    // Curator keeps it: `loom:issue` is back, and still no marker.
+    forge.labels.insert(5, vec!["loom:issue".to_string()]);
+    let later = t0 + LANDED_RECHECK;
+    assert!(
+        detect(&mut forge, &mut cache, &[5], &[], later).is_empty(),
+        "kept, dispatchable"
+    );
+    assert_eq!(forge.writes.len(), 2, "not routed again: {:?}", forge.writes);
+}
+
+/// #11901 case 4: a listed issue under this host's landed cooldown. One this
+/// host routed is asked about the first time it is listed again, and lifted
+/// when Curator kept it; one reopened after the merge is lifted too; one
+/// still landed (left unrouted) keeps its cooldown and is not re-asked
+/// before [`LANDED_RECHECK`].
+#[test]
+fn a_kept_or_reopened_issue_lifts_its_landed_cooldown() {
+    let mut forge = FakeForge::default()
+        .with_labels(5, &["loom:issue"])
+        .with_labels(6, &["loom:issue"])
+        .with_labels(7, &["loom:issue", "loom:building"]);
+    forge.graph.insert(5, Some(40));
+    forge.graph.insert(6, Some(41));
+    forge.graph.insert(7, Some(42));
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+    let landed = detect(&mut forge, &mut cache, &[5, 6, 7], &[], t0);
+    assert_eq!(landed.len(), 3, "all three landed; 7 is claimed, so left unrouted");
+
+    // A minute later: Curator kept #5; #6 was reopened after #41 merged.
+    forge.graph.insert(6, None);
+    let t1 = t0 + Duration::from_secs(60);
+    let lifted = lift(&mut forge, &mut cache, &[5, 7], t1);
+    assert_eq!(lifted, vec![5], "#5 was routed here, so it is asked at once");
+    assert_eq!(forge.asked.last().unwrap(), &vec![5]);
+
+    let t2 = t0 + LANDED_RECHECK;
+    let lifted = lift(&mut forge, &mut cache, &[6, 7], t2);
+    assert_eq!(lifted, vec![6], "reopened after the merge: lifted; #7 still landed");
+    assert_eq!(forge.asked.last().unwrap(), &vec![6, 7]);
+    assert!(lift(&mut forge, &mut cache, &[7], t2).is_empty());
+    assert_eq!(forge.asked.len(), 3, "#7 is not re-asked before the recheck");
 }
 
 /// `loom:frozen`, a park label or a live claim: still landed (so the
@@ -407,4 +515,36 @@ fn a_landed_candidate_is_skipped_without_a_dispatch_attempt() {
     let row = rows(&report).into_iter().find(|r| r.issue == 2).unwrap();
     assert_eq!(row.disposition, QueueDisposition::AlreadyLanded);
     assert_eq!(row.detail.as_deref(), Some("merged closing PR #900"));
+}
+
+/// #11901: a listed candidate whose landed cooldown the dispatcher lifts is
+/// no longer skipped as backed off; one it does not lift still is.
+#[test]
+fn a_lifted_landed_cooldown_dispatches_this_tick() {
+    struct Lifting(Disp, HashSet<u32>);
+    impl WorkDispatcher for Lifting {
+        fn in_flight(&self) -> HashSet<u32> {
+            self.0.in_flight()
+        }
+        fn occupancy(&self) -> usize {
+            self.0.occupancy()
+        }
+        fn backed_off(&self) -> HashSet<u32> {
+            HashSet::from([1, 2])
+        }
+        fn lift_landed_cooldowns(&self, held: &[u32]) -> HashSet<u32> {
+            held.iter()
+                .copied()
+                .filter(|n| self.1.contains(n))
+                .collect()
+        }
+        fn dispatch(&mut self, issue: u32) -> Result<bool> {
+            self.0.dispatch(issue)
+        }
+    }
+    let disp = Lifting(Disp::default(), HashSet::from([1]));
+    let mut multi = vec![(OneShotSource(Some(items(&[1, 2]))), disp)];
+    let report = tick_multi(&mut multi, &[1], 2, &[false]);
+    assert_eq!(multi[0].1 .0.attempts, vec![1], "#1 lifted, #2 still backed off");
+    assert_eq!(report.skipped_backoff, 1);
 }

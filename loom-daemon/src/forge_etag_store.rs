@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -585,16 +585,8 @@ pub(crate) fn remote_identity(cwd: &Path) -> Option<(String, String)> {
     if let Some(hit) = memo.lock().ok().and_then(|m| m.get(cwd).cloned()) {
         return Some(hit);
     }
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let resolved = parse_remote_url(&String::from_utf8_lossy(&output.stdout))?;
+    // Bounded (#9715): a hung `git` must not stall the caller.
+    let resolved = parse_remote_url(&crate::forge_cmd::get_remote_url(cwd)?)?;
     if let Ok(mut m) = memo.lock() {
         m.insert(cwd.to_path_buf(), resolved.clone());
     }

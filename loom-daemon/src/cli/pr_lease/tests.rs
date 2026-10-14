@@ -494,14 +494,21 @@ const AUTHOR: &str =
     r#""user":{"login":"loom-fleet-dispatch[bot]","type":"Bot"},"author_association":"NONE""#;
 
 /// A fake `gh` keeping the PR's comments in `<dir>/rows` (NDJSON). A POST
-/// appends a row holding the body's marker line; rows in `<dir>/late` join
+/// appends a row holding the body's marker line, and a PATCH replaces that
+/// comment's row (marker line, `updated_at` now); rows in `<dir>/late` join
 /// the list after the first comments read (a peer racing the pre-check).
+/// `<dir>/pull` answers the PR read (already in its `--jq` shape) and
+/// `<dir>/checks` the head's check runs; without them both are unreadable.
+/// Every call runs under a lock, so claimants on several threads see one
+/// consistent comment list, as they would on the forge.
 fn fake_gh(dir: &Path) -> PathBuf {
     let d = dir.display();
     let script = format!(
         r#"#!/usr/bin/env bash
 D="{d}"
 [ -f "$D/fail" ] && {{ echo 'HTTP 502' >&2; exit 1; }}
+until mkdir "$D/lock" 2>/dev/null; do sleep 0.01; done
+trap 'rmdir "$D/lock"' EXIT
 case " $* " in
   *" POST "*)
     prev=""; body=""
@@ -511,8 +518,20 @@ case " $* " in
     printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows"
     echo "$first" >> "$D/posted"
     echo "$id" ;;
-  *" PATCH "*) echo "$*" >> "$D/patched" ;;
-  *"/pulls/"*) echo "" ;;
+  *" PATCH "*)
+    echo "$*" >> "$D/patched"
+    prev=""; body=""; cid=""
+    for a in "$@"; do
+      [ "$prev" = "-f" ] && body="${{a#body=}}"
+      case "$a" in */issues/comments/*) cid="${{a##*/}}" ;; esac
+      prev="$a"
+    done
+    first="${{body%%$'\n'*}}"
+    grep -v "^{{\"id\":$cid," "$D/rows" > "$D/rows.tmp" || true
+    printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$cid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows.tmp"
+    mv "$D/rows.tmp" "$D/rows" ;;
+  *"/check-runs"*) [ -f "$D/checks" ] || exit 1; cat "$D/checks" ;;
+  *"/pulls/"*) cat "$D/pull" 2>/dev/null || echo "" ;;
   *"/comments"*)
     n=$(cat "$D/reads" 2>/dev/null || echo 0); echo $((n + 1)) > "$D/reads"
     if [ "$n" -ge 1 ] && [ -f "$D/late" ]; then cat "$D/late" >> "$D/rows"; rm "$D/late"; fi
@@ -557,6 +576,7 @@ fn ctx(dir: &Path, me: Identity) -> Ctx {
         ttl: ttl(),
         now: Utc::now,
         manage_renewer: false,
+        lease_file: None,
     }
 }
 
@@ -644,6 +664,192 @@ fn claim_refuses_without_writing_when_write_scope_denies_the_repo() {
     c.gh.write_repo = Err("not a managed repository".to_string());
     assert_eq!(c.claim(), EXIT_UNVERIFIED);
     assert!(posted(dir.path()).is_empty(), "#9548: no write to an unvetted repo");
+}
+
+// ---- a timed-out Judge, reaped by the daemon (#11931) ---------------------
+
+const HEAD: &str = "3333333333333333333333333333333333333333";
+
+fn on(host: &str, sweep: &str) -> Identity {
+    Identity {
+        role: Role::Judge,
+        host: host.into(),
+        sweep: sweep.into(),
+        step: None,
+    }
+}
+
+/// The PR read the fake answers: open, waiting for review, claimed.
+fn waiting_pr(dir: &Path) {
+    let pull = format!(
+        r#"{{"state":"open","head":"{HEAD}","labels":["loom:review-requested","loom:reviewing"]}}"#
+    );
+    fs::write(dir.join("pull"), pull).unwrap();
+}
+
+fn stamp(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn row_at(id: u64, at: DateTime<Utc>, first_line: &str) -> String {
+    format!(r#"{{"id":{id},"updated_at":"{}","body":"{first_line}",{AUTHOR}}}"#, stamp(at)) + "\n"
+}
+
+fn patched(dir: &Path) -> String {
+    fs::read_to_string(dir.join("patched")).unwrap_or_default()
+}
+
+#[test]
+fn a_timed_out_judge_is_reaped_into_a_record_that_holds_the_pr_on_every_host() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    // The head's CI is still running, young: a release by the Judge itself
+    // would not be recorded, a reap after a timeout is.
+    let young = stamp(Utc::now() - chrono::Duration::minutes(10));
+    fs::write(
+        dir.path().join("checks"),
+        format!(r#"{{"total_count":1,"check_runs":[{{"status":"in_progress","started_at":"{young}"}}]}}"#),
+    )
+    .unwrap();
+    let dead = on("host-a", "run-1");
+    let lease_file = dir.path().join("run-1.leases");
+    let mut claimant = ctx(dir.path(), dead.clone());
+    claimant.lease_file = Some(lease_file.clone());
+    assert_eq!(claimant.claim(), EXIT_HELD);
+    // The won lease is listed for the daemon.
+    let listed = loom_daemon::pr_lease_reap::parse_file(&fs::read_to_string(&lease_file).unwrap());
+    assert_eq!(listed, vec![claimant.held()]);
+    // The run times out; the role runner reaps on the claimant's behalf.
+    assert_eq!(ctx(dir.path(), dead.clone()).reap("timeout"), EXIT_HELD);
+    let patch = patched(dir.path());
+    assert!(
+        patch.contains(&dead.released_marker_with(&format!(
+            " head={HEAD} verdict=none labels=review-requested reaped=timeout"
+        ))),
+        "{patch}"
+    );
+    // Every other host's Judge is now refused before writing anything.
+    for host in ["host-b", "host-c"] {
+        assert_eq!(ctx(dir.path(), on(host, "run-2")).claim(), backstop::EXIT_BACKSTOP);
+    }
+    assert_eq!(posted(dir.path()), vec![dead.lease_marker()], "no peer wrote a lease");
+    // A Doctor's claim is untouched by the Judge backstop.
+    let doctor = Identity {
+        role: Role::Doctor,
+        ..on("host-b", "run-3")
+    };
+    assert_eq!(ctx(dir.path(), doctor).claim(), EXIT_HELD);
+}
+
+#[test]
+fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let lease_file = dir.path().join("run.leases");
+    let mut c = ctx(dir.path(), on("host-a", "run-1"));
+    c.lease_file = Some(lease_file.clone());
+    assert_eq!(c.claim(), EXIT_HELD);
+    assert_eq!(c.release(), EXIT_HELD);
+    assert_eq!(fs::read_to_string(&lease_file).unwrap(), "", "nothing left to reap");
+    // A reap after a verdict landed frees the lease and records nothing.
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(
+        dir.path().join("pull"),
+        format!(r#"{{"state":"open","head":"{HEAD}","labels":["loom:pr","loom:reviewing"]}}"#),
+    )
+    .unwrap();
+    let a = on("host-a", "run-1");
+    assert_eq!(ctx(dir.path(), a.clone()).claim(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), a.clone()).reap("timeout"), EXIT_HELD);
+    assert!(patched(dir.path()).contains(&format!("body={}", a.released_marker())));
+    assert!(!patched(dir.path()).contains("verdict=none"));
+}
+
+/// Acceptance (#11931): a timed-out run counts toward the three Judge runs an
+/// unchanged PR gets per 24 h.
+#[test]
+fn a_timed_out_judge_run_counts_toward_the_three_per_day_cap() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    // Two earlier passes at this head ended without a verdict, 23 h and 6 h
+    // ago: the 4 h cool-off after the second is over, so a third Judge runs.
+    let fields = format!(" head={HEAD} verdict=none labels=review-requested");
+    let first = DateTime::parse_from_rfc3339(&stamp(Utc::now() - chrono::Duration::hours(23)))
+        .unwrap()
+        .with_timezone(&Utc);
+    let second = Utc::now() - chrono::Duration::hours(6);
+    let rows = row_at(10, first, &on("host-x", "s1").released_marker_with(&fields))
+        + &row_at(20, second, &on("host-y", "s2").released_marker_with(&fields));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    let third = on("host-a", "run-3");
+    assert_eq!(ctx(dir.path(), third.clone()).claim(), EXIT_HELD);
+    // It times out and is reaped: the third record.
+    assert_eq!(ctx(dir.path(), third).reap("timeout"), EXIT_HELD);
+    // No host gets a fourth run until the first record leaves the window.
+    let c = ctx(dir.path(), on("host-b", "run-4"));
+    assert_eq!(c.claim(), backstop::EXIT_BACKSTOP);
+    let rows = c.gh.read_rows(77, &c.policy).unwrap();
+    assert_eq!(
+        backstop::hold(&rows, c.gh.pr_head(77), Utc::now()),
+        Some(first + chrono::Duration::hours(loom_daemon::judge_backstop::WINDOW_HOURS))
+    );
+}
+
+/// Acceptance (#11931): two hosts reclaiming the same stale claim at once
+/// produce exactly one winner. The dead claimant's lease has aged out; both
+/// claimants pass the pre-check concurrently, and claim-then-verify-order
+/// on comment id leaves one holder.
+#[test]
+fn two_hosts_reclaiming_one_stale_judge_claim_produce_one_winner() {
+    for _ in 0..3 {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        waiting_pr(dir.path());
+        let dead = on("host-c", "run-dead");
+        let aged = Utc::now() - chrono::Duration::minutes(20);
+        fs::write(dir.path().join("rows"), row_at(50, aged, &dead.lease_marker())).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let racers: Vec<_> = [on("host-a", "run-a"), on("host-b", "run-b")]
+            .into_iter()
+            .map(|me| {
+                let root = dir.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (me.clone(), ctx(&root, me).claim())
+                })
+            })
+            .collect();
+        let results: Vec<(Identity, i32)> = racers.into_iter().map(|t| t.join().unwrap()).collect();
+        let winners: Vec<&Identity> = results
+            .iter()
+            .filter(|(_, c)| *c == EXIT_HELD)
+            .map(|(w, _)| w)
+            .collect();
+        assert_eq!(winners.len(), 1, "{results:?}");
+        assert!(
+            results
+                .iter()
+                .all(|(_, c)| *c == EXIT_HELD || *c == EXIT_PEER),
+            "{results:?}"
+        );
+        // The fences agree: only the winner may write a verdict.
+        for (me, _) in &results {
+            let want = if me == winners[0] {
+                EXIT_HELD
+            } else {
+                EXIT_PEER
+            };
+            assert_eq!(ctx(dir.path(), me.clone()).fence(), want, "{me:?}");
+        }
+        // A third host arriving later stands down without writing.
+        let before = posted(dir.path()).len();
+        assert_eq!(ctx(dir.path(), on("host-d", "run-d")).claim(), EXIT_PEER);
+        assert_eq!(posted(dir.path()).len(), before);
+    }
 }
 
 // ---- prompt gates ---------------------------------------------------------

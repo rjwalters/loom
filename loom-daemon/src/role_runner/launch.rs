@@ -315,6 +315,11 @@ pub(super) fn run_role_with_timeout(
     // while anything in it is alive.
     let mut run_target = crate::run_target_dir::RunDirGuard::plan(workspace_root, role, &item);
     run_target.apply(&mut cmd);
+    // #11931: the PR leases this run wins (`lease pr claim` lists them), so a
+    // run the timeout below terminates still releases them and, for a Judge,
+    // records its no-verdict pass for the backstop. The file goes on drop.
+    let lease_reap = crate::pr_lease_reap::Reaper::plan(workspace_root, &item);
+    lease_reap.apply(&mut cmd);
     let runtime = admission.map(|a| a.runtime.as_str());
     let session = match resume {
         None => sweep_registry::resume_handle::DispatchSession::new(&item, workspace_root, runtime),
@@ -511,6 +516,9 @@ pub(super) fn run_role_with_timeout(
                         load_per_core_override.or_else(crate::cpu_headroom::load_per_core);
                     let outcome =
                         terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
+                    // #11931: the agent never reached `lease pr release`; do
+                    // it on its behalf, before any peer can take the PR.
+                    lease_reap.reap_with_daemon(crate::pr_lease_reap::REASON_TIMEOUT);
                     // A load-saturated ceiling is `skipped_load`, not a failure.
                     if matches!(outcome, RoleTickOutcome::Failure(_)) {
                         hold.failure(failure_class::timed_out(timeout));

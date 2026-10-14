@@ -553,6 +553,9 @@ kind = "rust"
 path = "loom-daemon/src/observability/ops/stage_dwell.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/observability/ops/stage_events.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/stale_blocked/release_gh.rs"
 [[operation.callers]]
 kind = "rust"
