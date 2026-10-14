@@ -263,6 +263,25 @@ impl GhInvocation {
             if succeeded(&first) {
                 return Ok(first);
             }
+            if app_id == crate::forge_gateway::GATEWAY_APP_ID
+                && super::gateway_outage(&first, &self.args)
+            {
+                // 2am#4367 P4: the relay is down or unreachable, not the
+                // credential: take it out everywhere and go on to the
+                // readers, then the writer.
+                super::withdraw_gateway_outage(self.operation.as_str());
+                tried.insert(app_id.clone());
+                last_app = Some(app_id);
+                last_failure = None;
+                decision = match lookup(&request) {
+                    RouteDecision::NoPool => RouteDecision::Exhausted {
+                        until: now + crate::forge_read_pool::DEFAULT_WITHDRAWAL,
+                        cause: ExhaustCause::Unavailable,
+                    },
+                    other => other,
+                };
+                continue;
+            }
             let Some(failure) = failure_of(&first, resource) else {
                 // Not the credential's fault (a 5xx, a network error):
                 // neither another reader nor the writer would help.
