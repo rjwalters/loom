@@ -1023,7 +1023,9 @@ impl SweepRegistry {
                         self.shadow_owner_released(LockNs::Issue, issue, Some(&owner.sweep_id));
                     }
                     if let Some((role, item)) = step {
-                        self.restore_dead_step_at_startup(item, role, &owner.sweep_id);
+                        let started_at = chrono::DateTime::parse_from_rfc3339(&owner.acquired_at)
+                            .map_or_else(|_| Utc::now(), |t| t.with_timezone(&Utc));
+                        self.restore_dead_step_at_startup(item, role, &owner.sweep_id, started_at);
                     }
                     continue;
                 }

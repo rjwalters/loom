@@ -413,6 +413,9 @@ impl SweepRegistry {
         // dispatch-backoff window — otherwise a cleared quarantine could still
         // be held back for up to `DispatchBackoffConfig::max`, making the
         // operator command look like it did nothing.
+        // #11930: and the fleet's fast-failure streak, here and on the peers;
+        // otherwise the first failure after the clear re-parks on stale counts.
+        self.break_fleet_fast_fail_streak(issue);
         self.clear_dispatch_backoff(issue);
         // #6670: same reasoning for the no-op re-dispatch cooldown — an
         // operator clearing a quarantine wants the issue dispatchable NOW,

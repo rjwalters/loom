@@ -981,6 +981,8 @@ impl SweepRegistry {
         // Insta-crash quarantine TTL (#3939): release any issue whose quarantine
         // has aged past the configured window before this tick's work. Cheap
         // early-return when nothing is quarantined.
+        // #11930: first adopt any park the startup reconciliation kept.
+        self.adopt_restored_parks();
         self.expire_quarantine();
         // Retry any previously-failed quarantine label restores (Issue #4110)
         // and release no-op holds whose inputs changed (Issue #10156). Cheap
@@ -1262,6 +1264,9 @@ impl SweepRegistry {
                             // single retry, and arming a window there would risk
                             // burning that one retry on a refusal.
                             if checkpoint_progress {
+                                // #11930: progress breaks the fleet's streak (first:
+                                // the local streak lives in the record cleared next).
+                                self.break_fleet_fast_fail_streak(issue);
                                 self.clear_dispatch_backoff(issue);
                                 // #6670: real progress is conclusive proof the
                                 // candidate is no longer a no-op — clear any

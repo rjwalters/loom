@@ -25,14 +25,26 @@ use crate::step_role::StepRole;
 
 impl SweepRegistry {
     /// Release the claim of a step whose lock outlived its process across a
-    /// restart. Best-effort: a failed write only logs.
+    /// restart, unless another claimant holds it now (`started_at` is the
+    /// lock's `acquired_at`). Best-effort: a failed write only logs.
     pub(crate) fn restore_dead_step_at_startup(
         &mut self,
         item: u32,
         role: StepRole,
         sweep_id: &str,
+        started_at: DateTime<Utc>,
     ) {
         if self.config.skip_label_flip {
+            return;
+        }
+        // The daemon was down: a peer may have reclaimed the item since, and
+        // restoring over its live claim would stomp it (#11898).
+        if self.step_claim_held_elsewhere(item, role, sweep_id, started_at) {
+            log::info!(
+                "reconstruct: {role} step {sweep_id} on #{item} died while no daemon ran, but \
+                 its claim is held elsewhere now — leaving the labels alone (#11898)"
+            );
+            self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
             return;
         }
         match self.restore_step_claim(item, role, sweep_id) {
@@ -108,7 +120,9 @@ impl SweepRegistry {
                 if std::fs::remove_dir_all(&path).is_ok() {
                     self.shadow_owner_released(LockNs::Pr, pr, Some(&owner.sweep_id));
                 }
-                self.restore_dead_step_at_startup(item, role, &owner.sweep_id);
+                let started_at = chrono::DateTime::parse_from_rfc3339(&owner.acquired_at)
+                    .map_or_else(|_| Utc::now(), |t| t.with_timezone(&Utc));
+                self.restore_dead_step_at_startup(item, role, &owner.sweep_id, started_at);
                 continue;
             }
             let pgid = owner.pgid.filter(|&recorded| {

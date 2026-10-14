@@ -355,7 +355,7 @@ pub(crate) mod sweeps {
             return Ok(());
         };
         let ours = if role.acts_on_pr() {
-            sr.roll_pr_step_claim_still_ours(number, role, &item.id, item.run_started_at)
+            sr.roll_pr_step_claim_still_ours(number, role, &item.id)
         } else {
             sr.roll_claim_still_ours(number, &item.id)
         };

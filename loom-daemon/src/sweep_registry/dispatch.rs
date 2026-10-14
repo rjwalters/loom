@@ -1267,11 +1267,13 @@ impl SweepRegistry {
         // does not immediately re-attempt the same failing candidate this
         // host just backed off on — see `publish_peer_cooldown_claim`'s doc
         // comment for why this is one-shot rather than re-advertised.
-        self.publish_peer_cooldown_claim(
-            peer_claims::ClaimKind::DispatchBackoffArmed,
-            issue,
-            delay,
-        );
+        // #11930: and this host's fast-failure streak, which the park sums.
+        let streak = if cause == DispatchBackoffCause::FastFailure {
+            consecutive
+        } else {
+            0
+        };
+        self.publish_dispatch_backoff_claim(issue, delay, streak);
     }
 
     /// Clear `issue`'s dispatch-backoff record (Issue #4485) — called on any

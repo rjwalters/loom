@@ -159,6 +159,28 @@ fn an_unreadable_list_is_unknown_never_free() {
 
 // ---- fence --------------------------------------------------------------
 
+/// Judge blocker 2: a lease claimed with `--step X` is the same holder's when
+/// it fences or reads its state with no `--step`; the step is an attribute.
+#[test]
+fn a_stepped_claim_is_owned_by_the_same_session_without_the_step() {
+    let plain = who(Role::Champion, "sweep-a");
+    let stepped = Identity::new(
+        Role::Champion,
+        plain.host.clone(),
+        "sweep-a".into(),
+        Some(StepRole::ChampionPromote),
+    )
+    .unwrap();
+    let rows = [lease(10, 0, &stepped)];
+    assert_eq!(fence(Some(&rows), &plain, now(), ttl()), Fence::Pass);
+    assert!(matches!(state(&rows, &plain), ClaimState::HeldBySelf { id: 10 }));
+    // Aged out: still recognised as its own (expired, not a peer's).
+    assert_eq!(fence(Some(&[lease(10, 30, &stepped)]), &plain, now(), ttl()), Fence::Expired);
+    // A different sweep is still a peer.
+    let other = who(Role::Champion, "sweep-b");
+    assert_eq!(fence(Some(&rows), &other, now(), ttl()), Fence::Superseded(stepped.clone()));
+}
+
 #[test]
 fn fence_passes_the_holder_and_stops_everyone_else() {
     let a = who(Role::Doctor, "sweep-a");
@@ -945,6 +967,7 @@ fn the_step_token_is_additive() {
     let stepped =
         Identity::new(Role::Judge, old.host.clone(), "s".into(), Some(StepRole::Judge)).unwrap();
     assert_ne!(stepped, old);
+    assert!(stepped.same_holder(&old), "the step is not part of who holds the lease");
     let marker = stepped.lease_marker();
     let tokens: Vec<&str> = marker.split_whitespace().collect();
     assert_eq!(tokens[2..5], ["role=judge", "host=host-a1b2c3d4", "sweep=s"]);

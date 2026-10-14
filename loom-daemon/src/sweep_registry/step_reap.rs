@@ -36,6 +36,37 @@ pub(crate) fn label_reapplied_after(labeled_at: DateTime<Utc>, started_at: DateT
 }
 
 impl SweepRegistry {
+    /// Whether a dead step's claim on `item` has been taken over by another
+    /// claimant, judged by forge evidence rather than the local lock (#11898):
+    /// for a Builder step, `loom:building` re-applied more than
+    /// [`LABEL_CLOCK_SKEW_SECS`] after `started_at`; for every other step, the
+    /// role's earliest live lease on the item held by another sweep
+    /// ([`Self::step_lease_held_elsewhere`]; the label is no evidence there,
+    /// the role prompt applies it itself, later). Always `false` when label
+    /// flips are off. Shared by the reaper path and the startup restore so
+    /// neither stomps a peer's live claim.
+    pub(crate) fn step_claim_held_elsewhere(
+        &self,
+        item: u32,
+        role: StepRole,
+        sweep_id: &str,
+        started_at: DateTime<Utc>,
+    ) -> bool {
+        if self.config.skip_label_flip {
+            return false;
+        }
+        match role {
+            StepRole::Builder => self
+                .fetch_label_applied_at(item, "loom:building")
+                .is_some_and(|at| label_reapplied_after(at, started_at)),
+            StepRole::Curator
+            | StepRole::ChampionPromote
+            | StepRole::Judge
+            | StepRole::Doctor
+            | StepRole::ChampionMerge => self.step_lease_held_elsewhere(item, role, sweep_id),
+        }
+    }
+
     /// Release a finished step's claim. Returns `true` when the claim is held
     /// elsewhere, in which case no label is written:
     ///
@@ -64,20 +95,8 @@ impl SweepRegistry {
         } else {
             self.release_lock_owned(item, sweep_id).retained()
         };
-        let held_elsewhere = retained
-            || (!self.config.skip_label_flip
-                && match role {
-                    StepRole::Builder => self
-                        .fetch_label_applied_at(item, "loom:building")
-                        .is_some_and(|at| label_reapplied_after(at, started_at)),
-                    StepRole::Curator
-                    | StepRole::ChampionPromote
-                    | StepRole::Judge
-                    | StepRole::Doctor
-                    | StepRole::ChampionMerge => {
-                        self.step_lease_held_elsewhere(item, role, sweep_id)
-                    }
-                });
+        let held_elsewhere =
+            retained || self.step_claim_held_elsewhere(item, role, sweep_id, started_at);
         self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if held_elsewhere {
             log::info!(
@@ -106,9 +125,10 @@ impl SweepRegistry {
 
     /// Whether a PR step's claim on `pr` is still the paused run `sweep_id`'s
     /// to give back after a roll (#11898): no other sweep holds the role's
-    /// earliest live lease, and the claim label was not re-applied after the
-    /// run started (`started_at`, with the clock-skew slack). A peer Judge or
-    /// Doctor that claimed the PR during the roll window keeps it.
+    /// earliest live lease. A peer Judge or Doctor that claimed the PR during
+    /// the roll window keeps it. The claim label is no evidence here: the
+    /// daemon pre-takes only the lease and the role prompt applies the label
+    /// itself, later, so a step's own label is usually newer than its start.
     ///
     /// # Errors
     /// Why the claim is no longer this run's.
@@ -117,21 +137,9 @@ impl SweepRegistry {
         pr: u32,
         role: StepRole,
         sweep_id: &str,
-        started_at: Option<DateTime<Utc>>,
     ) -> std::result::Result<(), String> {
-        if self.config.skip_label_flip {
-            return Ok(());
-        }
-        if self.step_lease_held_elsewhere(pr, role, sweep_id) {
+        if !self.config.skip_label_flip && self.step_lease_held_elsewhere(pr, role, sweep_id) {
             return Err(format!("another sweep holds the live {role} lease"));
-        }
-        if let (Some(label), Some(started_at)) = (role.claim_label(), started_at) {
-            if self
-                .fetch_label_applied_at(pr, label)
-                .is_some_and(|at| label_reapplied_after(at, started_at))
-            {
-                return Err(format!("`{label}` was re-applied after this run started"));
-            }
         }
         Ok(())
     }

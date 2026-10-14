@@ -169,6 +169,14 @@ pub(crate) struct Identity {
 }
 
 impl Identity {
+    /// Whether `other` is the same holder: `(role, host, sweep)`. The step is
+    /// an attribute of the lease, not part of who holds it, so a session that
+    /// claimed with `--step X` still owns its lease when it fences or releases
+    /// without `--step` (#11898). Every ownership test uses this, never `==`.
+    pub(crate) fn same_holder(&self, other: &Self) -> bool {
+        self.role == other.role && self.host == other.host && self.sweep == other.sweep
+    }
+
     /// An identity for `role`, with `step` (or the role's default step).
     ///
     /// # Errors
@@ -352,7 +360,7 @@ pub(crate) fn live_leases(
         .filter(|l| {
             !yields
                 .iter()
-                .any(|(yid, who)| *yid > l.id && *who == l.holder)
+                .any(|(yid, who)| *yid > l.id && who.same_holder(&l.holder))
         })
         .collect();
     live.sort_by_key(|l| l.id);
@@ -395,7 +403,7 @@ pub(crate) fn claim_state(
     };
     match live_leases(rows, me.role, now, ttl).into_iter().next() {
         None => ClaimState::Free,
-        Some(l) if l.holder == *me => ClaimState::HeldBySelf { id: l.id },
+        Some(l) if l.holder.same_holder(me) => ClaimState::HeldBySelf { id: l.id },
         Some(l) => ClaimState::HeldByPeer {
             id: l.id,
             holder: l.holder,
@@ -433,7 +441,7 @@ pub(crate) fn fence(
         ClaimState::Free | ClaimState::Unknown => {
             let leased = rows
                 .iter()
-                .any(|r| parse_record(&r.body) == Some(Record::Lease(me.clone())));
+                .any(|r| matches!(parse_record(&r.body), Some(Record::Lease(who)) if who.same_holder(me)));
             if leased {
                 Fence::Expired
             } else {
@@ -1131,7 +1139,8 @@ impl Ctx {
         // #11855: a Judge leaving the PR still waiting for review records it.
         let mut extra = None;
         for row in rows {
-            if parse_record(&row.body) != Some(Record::Lease(self.me.clone())) {
+            if !matches!(parse_record(&row.body), Some(Record::Lease(who)) if who.same_holder(&self.me))
+            {
                 continue;
             }
             let extra = extra.get_or_insert_with(|| match reaped {

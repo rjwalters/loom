@@ -70,6 +70,15 @@
 //!    expiring cycle's own `quarantined_at` (already known in-memory by the
 //!    caller) as the recency anchor directly, instead of re-deriving it from
 //!    the forge.
+//!
+//! ## Releasing only an expired park (Issue #11930)
+//!
+//! "A fresh daemon's quarantine memory is always empty" stopped meaning "no
+//! one is holding this park" once several hosts share a queue: the pass
+//! released parks peers had just set, and every worker restart in a roll undid
+//! them. The startup pass now releases a marked park only once its TTL has
+//! run, and hands a younger one to this host's registry to hold until it has
+//! ([`restored`]).
 
 use chrono::{DateTime, Utc};
 
@@ -183,13 +192,15 @@ pub fn plan(issues: &[BlockedIssue]) -> Vec<(u32, ReconcileAction)> {
 }
 
 mod listing;
+pub(crate) mod restored;
+pub use restored::{decide_at_startup, StartupAction};
 
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::claim_reconciliation::forge`] / [`crate::work_finder::forge`]) —
 /// the decision logic above is the fully-covered surface; this module is a
 /// thin, best-effort `Command` wrapper.
 pub mod forge {
-    use super::{decide, plan, BlockedIssue, ReconcileAction};
+    use super::{decide, BlockedIssue, ReconcileAction, StartupAction};
     use crate::claim_reconciliation::gh_call;
     use crate::sweep_registry::{reap_gh_timeout, QUARANTINE_COMMENT_MARKER};
     use anyhow::{anyhow, Result};
@@ -400,14 +411,30 @@ pub mod forge {
             })
             .collect();
 
-        let decisions = plan(&issues);
-        let checked = decisions.len();
+        // #11930: release only a park whose TTL has run; hold a younger one.
+        let ttl = crate::sweep_registry::resolve_quarantine_config(root).ttl;
+        let now = Utc::now();
+        let checked = issues.len();
 
         let mut released = 0usize;
-        for (issue_number, action) in decisions {
-            let ReconcileAction::Release = action else {
-                continue;
-            };
+        for issue in &issues {
+            let issue_number = issue.number;
+            match super::decide_at_startup(issue, now, ttl) {
+                StartupAction::Keep => continue,
+                StartupAction::Restore { quarantined_at } => {
+                    super::restored::stash(root, issue_number, quarantined_at);
+                    log::info!(
+                        "quarantine_reconciliation: #{issue_number} in {} is parked inside its \
+                         {}s TTL (marked {}) — kept loom:blocked and restored in memory \
+                         (#11930)",
+                        root.display(),
+                        ttl.as_secs(),
+                        quarantined_at.to_rfc3339()
+                    );
+                    continue;
+                }
+                StartupAction::Release => {}
+            }
             match release(gh_bin, root, issue_number) {
                 Ok(()) => {
                     released += 1;

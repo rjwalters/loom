@@ -175,8 +175,9 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
 /// invisible to the work finder. Scans every registered workspace's open
 /// `loom:blocked` issues and releases the ones carrying a daemon-authored
 /// quarantine comment back to `loom:issue`; a human's manual `loom:blocked`
-/// (no such comment) is never touched. Byte-for-byte the pre-#7974 logic,
-/// just relocated off `daemon_service.rs`'s startup-blocking path.
+/// (no such comment) is never touched. Since #11930 a marked park still
+/// inside its TTL is kept on the forge and restored in memory instead (see
+/// `quarantine_reconciliation::restored`).
 fn run_startup_quarantine_pass(fallback_root: &Path) {
     if !crate::quarantine_reconciliation::reconciliation_enabled() {
         log::info!(
