@@ -407,6 +407,7 @@ fn test_config_reads_enabled_roles_and_interval() {
             role_efforts: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            champion_mode: None,
             on_idle_max_wait: None,
         }
     );
@@ -457,6 +458,7 @@ fn test_config_project_tier_only_is_honored_like_legacy() {
             role_efforts: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            champion_mode: None,
             on_idle_max_wait: None,
         }
     );
@@ -516,6 +518,7 @@ fn test_resolve_roles_empty_array_is_none() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     assert_eq!(resolve_roles(&config), Vec::new());
@@ -534,6 +537,7 @@ fn test_resolve_roles_filters_and_preserves_default_order() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -553,6 +557,7 @@ fn test_resolve_roles_ignores_unknown_names() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -584,6 +589,7 @@ fn test_missing_defaults_warns_for_default_absent_from_pinned_list() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let resolved = resolve_roles(&config);
@@ -620,6 +626,7 @@ fn test_resolve_roles_unknown_name_and_missing_default_fire_independently() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -917,6 +924,7 @@ fn test_resolve_enabled_config_can_enable() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     }));
 }
@@ -936,6 +944,7 @@ fn test_resolve_enabled_env_overrides_config() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     }));
     std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
@@ -950,6 +959,7 @@ fn test_resolve_enabled_env_overrides_config() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     }));
     std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
@@ -1183,6 +1193,7 @@ fn test_resolve_interval_for_role_precedence() {
                 role_efforts: BTreeMap::new(),
                 architect_max_proposals: None,
                 max_concurrent: None,
+                champion_mode: None,
                 on_idle_max_wait: None,
             }
         ),
@@ -1205,6 +1216,7 @@ fn test_resolve_interval_for_role_precedence() {
                 role_efforts: BTreeMap::new(),
                 architect_max_proposals: None,
                 max_concurrent: None,
+                champion_mode: None,
                 on_idle_max_wait: None,
             }
         ),
@@ -2193,6 +2205,7 @@ fn test_resolve_on_idle_roles_parses_and_preserves_order() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_on_idle_roles(&config);
@@ -2216,6 +2229,7 @@ fn test_resolve_on_idle_roles_ignores_unknown_names() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_on_idle_roles(&config);
@@ -2235,6 +2249,7 @@ fn test_resolve_on_idle_roles_empty_array_is_empty() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     assert_eq!(resolve_on_idle_roles(&config), Vec::new());
@@ -2668,6 +2683,7 @@ fn test_resolve_max_concurrent_precedence_env_over_config_over_default() {
     let unset = RoleRunnerConfig::default();
     let configured = RoleRunnerConfig {
         max_concurrent: Some(2),
+        champion_mode: None,
         on_idle_max_wait: None,
         ..RoleRunnerConfig::default()
     };
@@ -2807,6 +2823,7 @@ fn on_idle_config(enabled: Option<bool>, roles: Vec<&str>) -> RoleRunnerConfig {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     }
 }
@@ -2917,6 +2934,7 @@ fn test_plan_idle_runs_disabled_without_on_idle_does_not_warn() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let now = Instant::now();
@@ -4287,6 +4305,7 @@ fn tick_admitted(root: &Path) -> bool {
 }
 
 mod archived_gate;
+mod champion_mode;
 mod invoke;
 mod llm_gateway;
 mod model_resolution;

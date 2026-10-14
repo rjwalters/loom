@@ -29,10 +29,11 @@
 2686 defaults/.claude/commands/loom/champion-held-pr-staleness.md
 24052 defaults/.claude/commands/loom/champion-issue-promo.md
 1059 defaults/.claude/commands/loom/champion-merge-risk-shadow.md
-46425 defaults/.claude/commands/loom/champion-pr-merge.md
+46421 defaults/.claude/commands/loom/champion-pr-merge.md
 1072 defaults/.claude/commands/loom/champion-premise-false-evidence.md
 12272 defaults/.claude/commands/loom/champion-reference.md
-3615 defaults/.claude/commands/loom/champion.md
+1750 defaults/.claude/commands/loom/champion-targeted.md
+3420 defaults/.claude/commands/loom/champion.md
 736 defaults/.claude/commands/loom/ci-refusals-reference.md
 1067 defaults/.claude/commands/loom/comment-body-literal-path.md
 692 defaults/.claude/commands/loom/curator-estimate.md

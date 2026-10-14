@@ -1119,9 +1119,7 @@ produce. Never let a hold be the reason a conflict goes unreported.
 # but Champion ever touches has its own staleness clock reset by Champion's
 # own writes roughly every 10 minutes, so it never accumulates 24 real hours
 # of staleness and this criterion — the *only* automated route from `loom:pr`
-# to Doctor — never fires. Verified live: 21 open PRs carrying `loom:pr` +
-# `loom:operator`, all `CONFLICTING`, oldest 8 days, `updatedAt` exactly
-# matching Champion's own most recent comment timestamp.
+# to Doctor — never fires (the 21-PR pile in "Held-PR Health Pass").
 #
 # "Real activity" instead means either of two things actually changing the
 # PR: a new commit, or a TRUSTED comment (#9548) other than Champion's own.
@@ -1896,7 +1894,7 @@ echo "Attempting to merge PR #$PR_NUMBER..."
 git checkout main 2>/dev/null || true
 
 # Queue mode (#10256): only a DIRECT first stdout line + rc 0 falls through.
-HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)
+HEAD_SHA=${EXPECTED_HEAD:-$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)} # `--pr N` pins it (#11859)
 QE=$(mktemp); QOUT=$(loom-daemon forge merge-queue step "$PR_NUMBER" \
   --approved-sha "$HEAD_SHA" 2>"$QE"); QRC=$?; QWHY=$(head -n1 "$QE"); rm -f "$QE"
 MERGE_RC=0; QCOMPAT=
@@ -1923,9 +1921,9 @@ esac
 # Forge-API merge: --auto merges HERE (#8410), head-SHA precondition (#5579),
 # --redate-stale-checks = #8248's remedy (#8508). 420s < 600000 ms (above).
 [ "$MERGE_RC" -eq 0 ] && { LOOM_AUTO_MERGE_TIMEOUT=420 \
-  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?; }
+  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks ${EXPECTED_HEAD:+--expected-head "$EXPECTED_HEAD"} || MERGE_RC=$?; }
 
-if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ]; then
+if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ] || [ "$MERGE_RC" -eq 8 ]; then
   # Not failures: nothing merged, PR stays approved. See "exit codes 3-7" below.
   echo "PR #$PR_NUMBER not merged this pass (exit $MERGE_RC) — re-queuing instead of failing"
 elif [ "$MERGE_RC" -ne 0 ]; then
