@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Existing Dependabot label/manifest gate; behavior lives in the native command.
 # Usage: check-dependabot-labels.sh [ROOT]
-# requires-daemon: check-dependabot-labels required
+# requires-daemon: check-dependabot-labels >= 0.19.1154  Native checker introduced by #11816.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${1:-}"
