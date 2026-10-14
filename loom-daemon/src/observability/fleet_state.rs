@@ -983,26 +983,19 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
     },
 });
 
-/// The workspace handles `record_outcomes` reads the forge and journal through.
-struct OutcomeContext<'a> {
-    workspace_root: &'a Path,
-    workspace_pool: &'a crate::workspace_pool::WorkspacePool,
-    slug_cache: &'a mut std::collections::HashMap<String, String>,
-}
-
 /// Date `view`'s rows from the forge (#11391), emit this pass's outcome
 /// facts and remember the pass for the next diff, and return the enriched
 /// view. The forge reads run off the event loop; `view` comes back as given
 /// when they fail.
 async fn record_outcomes(
-    ctx: OutcomeContext<'_>,
+    ctx: pre_ready_journal::OutcomeContext<'_>,
     sink: &FleetStateSink,
     input: &FleetInput,
     (curated, triage): (outcomes::Curated, outcomes::Curated),
     view: FleetView,
     now: DateTime<Utc>,
 ) -> FleetView {
-    let OutcomeContext {
+    let pre_ready_journal::OutcomeContext {
         workspace_root,
         workspace_pool,
         slug_cache,
@@ -1013,14 +1006,7 @@ async fn record_outcomes(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.outcomes.clone(), state.enrich.clone())
     };
-    // #11954: reload the persisted `pre_ready_done` once per process, before
-    // the first diff, so a restart does not re-emit already-emitted exits.
-    let journal = pre_ready_journal::path(workspace_root);
-    let loaded_now = !JOURNAL_LOADED.swap(true, std::sync::atomic::Ordering::SeqCst);
-    if loaded_now {
-        let loaded = pre_ready_journal::load(&journal, now);
-        memory.pre_ready_done.extend(loaded);
-    }
+    let journal = pre_ready_journal::Journal::open(workspace_root, &mut memory.pre_ready_done, now);
     let done_before = memory.pre_ready_done.clone();
     memory.curated_now = Some(curated);
     memory.triage_now = Some(triage);
@@ -1058,10 +1044,7 @@ async fn record_outcomes(
         Ok(done) => done,
         Err(join_error) => {
             log::warn!("fleet.state: outcome diff panicked: {join_error}");
-            // The loaded entries never reached STATE; reload on the next pass.
-            if loaded_now {
-                JOURNAL_LOADED.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
+            journal.reload_next_pass();
             return original;
         }
     };
@@ -1073,15 +1056,10 @@ async fn record_outcomes(
         state.outcomes = memory;
         state.enrich = enrich_memory;
     }
-    if done_after != done_before {
-        pre_ready_journal::save(&journal, &done_after);
-    }
+    journal.save_if_changed(&done_before, &done_after);
     outcomes::offer(records, sink);
     view
 }
-
-/// Whether this process has reloaded the pre-ready journal (#11954).
-static JOURNAL_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Held for a whole pass, so a tick pass and a collector pass never diff
 /// against the same record.
@@ -1141,7 +1119,7 @@ pub(super) async fn record(
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
     let mut view = record_outcomes(
-        OutcomeContext {
+        pre_ready_journal::OutcomeContext {
             workspace_root,
             workspace_pool,
             slug_cache,

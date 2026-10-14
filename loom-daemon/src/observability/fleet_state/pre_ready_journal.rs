@@ -7,8 +7,9 @@
 //! gates whether an already-emitted exit is emitted again. All I/O is
 //! best-effort; a bad file is a warning and an empty or partial set.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,48 @@ struct Entry {
     issue: u32,
     stage: FleetStage,
     left_at: DateTime<Utc>,
+}
+
+/// Whether this process has reloaded the journal (#11954).
+static JOURNAL_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// The workspace handles `record_outcomes` reads the forge and journal through.
+pub(super) struct OutcomeContext<'a> {
+    pub(super) workspace_root: &'a Path,
+    pub(super) workspace_pool: &'a crate::workspace_pool::WorkspacePool,
+    pub(super) slug_cache: &'a mut HashMap<String, String>,
+}
+
+/// One pass's handle on the journal file.
+pub(super) struct Journal {
+    path: PathBuf,
+    loaded_now: bool,
+}
+
+impl Journal {
+    /// Reload the persisted set into `done` once per process, before the
+    /// first diff, so a restart does not re-emit already-emitted exits.
+    pub(super) fn open(workspace_root: &Path, done: &mut Done, now: DateTime<Utc>) -> Self {
+        let path = path(workspace_root);
+        let loaded_now = !JOURNAL_LOADED.swap(true, Ordering::SeqCst);
+        if loaded_now {
+            done.extend(load(&path, now));
+        }
+        Self { path, loaded_now }
+    }
+
+    /// The diff panicked: loaded entries never reached `STATE`, reload next pass.
+    pub(super) fn reload_next_pass(&self) {
+        if self.loaded_now {
+            JOURNAL_LOADED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn save_if_changed(&self, before: &Done, after: &Done) {
+        if after != before {
+            save(&self.path, after);
+        }
+    }
 }
 
 pub(super) fn path(workspace_root: &Path) -> PathBuf {
