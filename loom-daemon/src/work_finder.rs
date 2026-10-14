@@ -234,6 +234,7 @@ pub mod dispatch_plan;
 pub mod dispatch_plan_merge;
 pub mod halt_cause;
 mod labels;
+pub mod landed_prefilter;
 pub mod main_red_autofile;
 pub mod main_red_fix;
 pub mod open_pr_prefilter;
@@ -784,6 +785,16 @@ pub trait WorkDispatcher {
     /// anything not verified (unreadable listing included) must be left out,
     /// and still meets `dispatch()`'s own open-PR guard. Defaults to empty.
     fn open_pr_blocked(&self, _candidates: &[u32]) -> HashMap<u32, u32> {
+        HashMap::new()
+    }
+
+    /// The landed pre-filter (#11853, [`landed_prefilter`]): the issues in
+    /// `candidates` that are still open although a PR closing them merged,
+    /// each mapped to that PR. `open_pr` are the workspace's candidates the
+    /// open-PR pre-filter blocked this tick. Asked at most once per workspace
+    /// per tick, after [`open_pr_blocked`](Self::open_pr_blocked); like it,
+    /// it can only remove candidates. Defaults to empty.
+    fn landed_closing_prs(&self, _candidates: &[u32], _open_pr: &[u32]) -> HashMap<u32, u32> {
         HashMap::new()
     }
 

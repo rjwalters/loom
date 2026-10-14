@@ -260,6 +260,9 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::DispatchSlotTurnaroundSamples,
         MetricName::DispatchIdleSlots,
         MetricName::DispatchIdleSlotSeconds,
+        MetricName::DispatchBusySlots,
+        MetricName::DispatchRoleMaxConcurrent,
+        MetricName::DispatchRoleIdleSlots,
         MetricName::ForgeStageDwell,
         MetricName::ForgeStageDwellSamples,
         MetricName::ForgeStageItems,
@@ -414,6 +417,34 @@ fn tick_span_lists_halt_causes_only_when_held() {
     assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,disk_reservation");
     let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
     assert!(!idle.attributes.contains_key("loom.dispatch.halt_causes"));
+}
+
+/// #11857: a partial hold keeps its causes and held count on the span but
+/// does not name the result; `loom.dispatch.held_roots` is always present.
+#[test]
+fn partial_hold_keeps_its_causes_but_not_the_result() {
+    let partial = TickReport {
+        seen: 2,
+        halted: true,
+        halt_causes: vec![HaltCause::MaintainOnly],
+        held_roots: 1,
+        halt_partial: true,
+        ..TickReport::default()
+    };
+    let span = tick_span(&partial, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "all_skipped");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "maintain_only");
+    assert_eq!(span.attributes["loom.dispatch.held_roots"], "1");
+    let full = TickReport {
+        halt_partial: false,
+        held_roots: 2,
+        ..partial
+    };
+    let span = tick_span(&full, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "halted_maintain_only");
+    assert_eq!(span.attributes["loom.dispatch.held_roots"], "2");
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert_eq!(idle.attributes["loom.dispatch.held_roots"], "0");
 }
 
 /// #10624: the build back-off result keys on an actual deferral, ranks after

@@ -13,6 +13,9 @@ pub(super) mod child_env_markers;
 // Issue #11304: claim-unwind + post-claim closed-issue re-verification.
 mod claim_release;
 
+// Issue #11853: the long, fleet-wide window an already-landed issue gets.
+mod landed_cooldown;
+
 // Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
 mod lease_renewal_start;
 use lease_renewal_start::lease_renewal_start_command;
@@ -786,6 +789,8 @@ pub(crate) enum DispatchBackoffCause {
     /// The open-PR guard (#4123, step 2.5/2.6) refused dispatch because the
     /// issue already has a verified open linked PR (#7606).
     OpenPrGuard,
+    /// The issue's work already landed (#11853): see `landed_cooldown`.
+    Landed,
 }
 
 /// Per-issue dispatch-backoff bookkeeping (Issue #4485).

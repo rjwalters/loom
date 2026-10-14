@@ -1320,6 +1320,11 @@ pub struct RoleRunnerConfig {
     /// fleet host where the roots disagree, the effective ceiling for a given
     /// tick is that root's own — the tighter root simply refuses sooner.
     pub max_concurrent: Option<usize>,
+    /// `autonomous.roleRunner.championMode` (#11859) — `"all"` (absent) or
+    /// `"non-item"`: whether an interval Champion tick works every queue or
+    /// only the non-item ones. Per root, config only; see
+    /// [`champion_mode`] and [`resolve_role_prompt`].
+    pub champion_mode: Option<champion_mode::ChampionMode>,
 }
 
 /// Hand-rolled duration-string parser for
@@ -1491,6 +1496,7 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
+        champion_mode: champion_mode::parse_champion_mode(block),
     }
 }
 
@@ -2191,8 +2197,10 @@ pub fn resolve_max_concurrent_for(repo_root: &Path) -> usize {
 /// The prompt string actually passed to `claude -p` for one dispatch of
 /// `spec`.
 ///
-/// Every role but `architect` resolves to its static [`RoleSpec::prompt`]
-/// verbatim (byte-for-byte the pre-#5656 behavior). `architect` additionally
+/// Every role but `architect` (and `champion` under
+/// `championMode: "non-item"`, which appends `--non-item`, #11859) resolves
+/// to its static [`RoleSpec::prompt`] verbatim (byte-for-byte the pre-#5656
+/// behavior). `architect` additionally
 /// carries the resolved per-invocation proposal cap as a slash-command
 /// argument — `/loom:architect --max-proposals <n>` — which
 /// `architect.md`'s own "Argument Handling" section reads from `$ARGUMENTS`
@@ -2210,6 +2218,10 @@ pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String
             spec.prompt,
             resolve_architect_max_proposals(config)
         );
+    }
+    // #11859: `championMode: "non-item"` dispatches `/loom:champion --non-item`.
+    if let Some(arg) = champion_mode::prompt_arg(spec.name, config.champion_mode) {
+        return format!("{} {arg}", spec.prompt);
     }
     spec.prompt.to_string()
 }
@@ -2246,35 +2258,6 @@ pub fn new_in_progress_guard() -> InProgressGuard {
 #[must_use]
 pub fn active_run_count(set: &InProgressGuard) -> usize {
     set.lock().unwrap_or_else(PoisonError::into_inner).len()
-}
-
-/// The daemon's single [`InProgressGuard`], registered once at startup so
-/// out-of-band readers (`loom-daemon status` via [`crate::ipc`]) can sample the
-/// live role-agent count without threading the `Arc` through the IPC server —
-/// the same process-global read-back shape
-/// [`crate::admission_brake::register_global`] uses for the brake.
-static GLOBAL_IN_PROGRESS: OnceLock<InProgressGuard> = OnceLock::new();
-
-/// Register the process-global [`InProgressGuard`] handle. Idempotent: only the
-/// first registration wins (there is exactly one guard per daemon process).
-pub fn register_global_in_progress(set: InProgressGuard) {
-    let _ = GLOBAL_IN_PROGRESS.set(set);
-}
-
-/// Live count of role invocations in flight across every managed workspace,
-/// read from the process-global guard (#6102).
-///
-/// `0` when no guard has been registered (role runner never spawned, or a
-/// non-daemon process such as the `calibrate` CLI) — honestly "no role agents
-/// observed here", the same zero-behavior-change contract
-/// [`crate::admission_brake::global_is_holding`] has.
-///
-/// This is the count that [`crate::types::DaemonStatusReport::active_role_agents`]
-/// reports, so `loom-daemon status` shows total agent load — sweeps *and* role
-/// agents — from one place rather than making an operator run `pgrep`.
-#[must_use]
-pub fn global_active_run_count() -> usize {
-    GLOBAL_IN_PROGRESS.get().map_or(0, active_run_count)
 }
 
 /// Monotonic process-wide count of successfully started role invocations.
@@ -3922,6 +3905,12 @@ pub use model_resolution::{
 
 // Per-reason skipped-tick tallies, with a race-free per-thread view for
 // tests (#9409) — see `role_runner/skip_counters.rs`.
+// The process-global guard handle and its read-backs (#6102, #11847).
+mod in_progress_global;
+pub use in_progress_global::{
+    global_active_run_count, global_active_runs_by_role, register_global_in_progress,
+};
+
 mod skip_counters;
 pub use skip_counters::{
     load_skipped_count, model_runtime_mismatch_skip_count, no_token_pool_skip_count,
@@ -3931,6 +3920,10 @@ use skip_counters::{
     LOAD_SKIPPED_COUNT, MODEL_RUNTIME_MISMATCH_SKIP_COUNT, NO_TOKEN_POOL_SKIP_COUNT,
     POOL_EXHAUSTED_SKIP_COUNT,
 };
+
+// `autonomous.roleRunner.championMode` (#11859) — Champion's non-item-only
+// interval mode; see `role_runner/champion_mode.rs`.
+pub mod champion_mode;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

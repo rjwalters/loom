@@ -1112,25 +1112,17 @@ produce. Never let a hold be the reason a conflict goes unreported.
 ```bash
 # Get PR activity data. Plain `gh` — NOT "$GH_READ": merge-gating.
 #
-# #6843: do NOT use `updatedAt` here. GitHub bumps `updatedAt` on ANY write to
-# the PR, including a comment — and the Held-PR Health Pass below posts
-# comments on this very PR every tick a hold still binds (conflict notices,
-# `loom:operator` label reasserts). That means a held+conflicting PR nobody
-# but Champion ever touches has its own staleness clock reset by Champion's
-# own writes roughly every 10 minutes, so it never accumulates 24 real hours
-# of staleness and this criterion — the *only* automated route from `loom:pr`
-# to Doctor — never fires. Verified live: 21 open PRs carrying `loom:pr` +
-# `loom:operator`, all `CONFLICTING`, oldest 8 days, `updatedAt` exactly
-# matching Champion's own most recent comment timestamp.
+# #6843: do NOT use `updatedAt` here. GitHub bumps it on ANY write, and the
+# Held-PR Health Pass below comments on a held PR every tick, so Champion's
+# own writes would keep resetting it and this criterion — the *only*
+# automated route from `loom:pr` to Doctor — would never fire.
 #
 # "Real activity" instead means either of two things actually changing the
 # PR: a new commit, or a TRUSTED comment (#9548) other than Champion's own.
 # Commits are always real (a bot cannot push code on your behalf).
-# Comments are filtered with the same exclusion test the sticky-hold precheck
-# already uses for release signals above (`champion:|Automated by Champion
-# role` — matches the marker HTML comments and the `*Automated by Champion
-# role*` footer every Champion post carries), so a human/Judge comment still
-# counts as activity but Champion's own hold/conflict/stale notices never do.
+# Comments are filtered with the sticky-hold precheck's exclusion test
+# (`champion:|Automated by Champion role`: Champion's markers and footer), so
+# a human/Judge comment counts as activity but Champion's own notices never do.
 # `createdAt` is the floor, so a PR with no commits and no non-Champion
 # comments still ages from when it was opened rather than reading as
 # eternally fresh.
@@ -1895,8 +1887,11 @@ echo "Attempting to merge PR #$PR_NUMBER..."
 # merge-pr.sh may not exist on PR branches checked out via gh pr checkout
 git checkout main 2>/dev/null || true
 
+# `--pr N` (#11859): its live pin file means this block MUST set EXPECTED_HEAD=<sha>.
+PIN=$(find "$(git rev-parse --git-common-dir)/loom-champion-pin-pr-$PR_NUMBER" -mmin -60 -exec cat {} \; 2>/dev/null)
+if [ -n "$PIN" ] && [ "${EXPECTED_HEAD:-}" != "$PIN" ]; then MERGE_RC=1; echo "CHAMPION-PIN-MISSING pr=$PR_NUMBER: set EXPECTED_HEAD=$PIN in this block; not merging"; else
 # Queue mode (#10256): only a DIRECT first stdout line + rc 0 falls through.
-HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)
+HEAD_SHA=${EXPECTED_HEAD:-$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)}
 QE=$(mktemp); QOUT=$(loom-daemon forge merge-queue step "$PR_NUMBER" \
   --approved-sha "$HEAD_SHA" 2>"$QE"); QRC=$?; QWHY=$(head -n1 "$QE"); rm -f "$QE"
 MERGE_RC=0; QCOMPAT=
@@ -1919,13 +1914,14 @@ case "$MERGE_RC ${QOUT%%$'\n'*}" in "0 "*) ;; # direct: merge-pr.sh below
 
 $QM" >/dev/null ;;
 esac
+fi
 
 # Forge-API merge: --auto merges HERE (#8410), head-SHA precondition (#5579),
 # --redate-stale-checks = #8248's remedy (#8508). 420s < 600000 ms (above).
 [ "$MERGE_RC" -eq 0 ] && { LOOM_AUTO_MERGE_TIMEOUT=420 \
-  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?; }
+  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks ${EXPECTED_HEAD:+--expected-head "$EXPECTED_HEAD"} || MERGE_RC=$?; }
 
-if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ]; then
+if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ] || [ "$MERGE_RC" -eq 8 ]; then
   # Not failures: nothing merged, PR stays approved. See "exit codes 3-7" below.
   echo "PR #$PR_NUMBER not merged this pass (exit $MERGE_RC) — re-queuing instead of failing"
 elif [ "$MERGE_RC" -ne 0 ]; then
