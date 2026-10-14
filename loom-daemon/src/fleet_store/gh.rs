@@ -180,6 +180,9 @@ impl GhTransport {
             .program(&self.gh_bin)
             .current_dir(&self.workspace_root)
             .gh_config_dir(dir)
+            // 2am#4367 P4 break-glass: `fleet.json` is how a broken gateway
+            // is unset, so this fetch must never depend on it.
+            .gateway_exempt()
     }
 
     /// Run `inv` to an exit (any status); a spawn failure or timeout is `Err`.
@@ -417,3 +420,7 @@ fn writer_credential(workspace_root: &Path, repo: &str) -> Credential {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gh_gateway_tests.rs"]
+mod gateway_tests;

@@ -151,6 +151,7 @@ fn every_script_surface_is_covered_by_the_daemon_or_declared_install_time_only()
         ".gitignore",
         ".loom/CLAUDE.md",
         ".claude/biome.jsonc",
+        ".claude/agents",
     ] {
         assert!(EXTRA_SURFACES.iter().any(|s| s.path == covered), "{covered}");
     }

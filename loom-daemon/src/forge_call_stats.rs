@@ -577,7 +577,7 @@ pub struct CallAttribution {
     /// its directory's `identity.json` sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci: Option<String>,
-    /// Credential kind: `reader`, `writer`, `env` or `ambient`.
+    /// Credential kind: `reader`, `writer`, `gateway`, `env` or `ambient`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tk: Option<String>,
     /// The billed resource: `x-ratelimit-resource` when headers were seen,
@@ -599,6 +599,11 @@ pub struct CallAttribution {
     /// is still a row — a request was sent — but never a charged one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fr: Option<bool>,
+    /// How the call reached GitHub (2am#4367 P4): `gateway`, `direct_read`
+    /// (a read sent directly: a reader App or the writer), `direct`, or
+    /// `none` (nothing sent). Absent on rows from older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rt: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

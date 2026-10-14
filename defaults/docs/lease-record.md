@@ -750,6 +750,42 @@ the same lease semantics, **keyed by role**:
   waiting out the TTL.
 - **`check`** prints `PR_LEASE_STATE=free|held-self|held-peer|unknown`: the
   PR-phase shape of #11118's `claim_state(item)`.
+- **Judge no-verdict backstop (#11855).** A Judge `release` that finds the PR
+  open, still `loom:review-requested` and carrying neither `loom:pr` nor
+  `loom:changes-requested` appends `head=<sha> verdict=none labels=<digest>`
+  to the released marker (the digest is the sorted `loom:*` label set, claim
+  labels left out). It skips the record while the head has a check run in
+  progress that started under 6 h ago; a run stuck longer no longer exempts
+  the pass. Those records, from trusted authors and at the PR's current head
+  and digest, hold the PR out of `pr-queue --role judge`, the role runner's
+  Judge gate and a Judge `claim` (exit 6, nothing written): one hour after
+  the first, four after the second, and after the third until the oldest of
+  the last three is 24 h old, so an unchanged PR gets at most three Judge
+  runs a day. A push, or a change to the `loom:*` label set, releases the
+  hold at once. Removing and re-adding the same label does not (the set is
+  unchanged); to force a re-review, push or run with
+  `LOOM_JUDGE_BACKSTOP=0`, which turns the backstop off. An unreadable record
+  list serves the PR. Rules: `loom-daemon/src/judge_backstop.rs`.
+- **A Judge the timeout kills is still counted (#11931).** The role runner
+  ends a role run at its fixed 1800 s ceiling (`DEFAULT_ROLE_TIMEOUT` in
+  `loom-daemon/src/role_runner.rs`; there is no per-role or config knob),
+  and a killed Judge never reaches its `release`. Without a record its
+  stale `loom:reviewing` was reclaimed by the next host, which hit the same
+  wall: one PR took five Judge runs in two hours across three hosts. So the
+  daemon hands every role child a per-run file in `LOOM_ROLE_PR_LEASE_FILE`;
+  a won `claim` lists its identity there (`<pr> <role> <host> <sweep>`) and
+  `release` drops it. When the run times out, the daemon runs the hidden
+  `lease pr reap` for each lease still listed, right after the kill, while
+  the dead lease is still live, so no peer can have claimed the PR first.
+  `reap` is `release` on the dead claimant's behalf. For a Judge whose PR
+  still waits for a verdict, it writes the same no-verdict record with
+  `reaped=timeout` appended, and with no CI exemption: a pass that burned the
+  whole ceiling is the re-run the backstop exists to bound. Every host's next
+  Judge is then held (1 h, 4 h, then the window), so a PR that keeps timing
+  out gets at most three Judge runs a day. Who runs next is still decided by
+  the lease: concurrent reclaimers of the same stale claim each post a lease,
+  and the earliest comment `id` is the only winner. Rules:
+  `loom-daemon/src/pr_lease_reap.rs`.
 - **Provenance.** Lease and yield comments end with the `loom:provenance v1`
   line (`loom-daemon provenance`'s format). Its `host=` carries the published id
   rather than the raw hostname, so one comment never pairs an opaque id with

@@ -347,6 +347,7 @@ pub fn list_in_flight_sweeps(
         for info in sr.list(None).into_iter().filter(|i| !i.state.is_terminal()) {
             let what = match &info.kind {
                 crate::types::SweepKind::Issue(n) => format!("issue #{n}"),
+                crate::types::SweepKind::Step { item, role } => format!("{role} step #{item}"),
                 crate::types::SweepKind::PrSet(prs) => format!(
                     "PRs {}",
                     prs.iter()

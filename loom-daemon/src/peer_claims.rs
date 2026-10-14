@@ -97,10 +97,12 @@ pub use brakes::{
 };
 
 mod coordination_idle;
+mod fast_fail_tally;
 pub use coordination_idle::{
     resolve_advertise_activity_window, ADVERTISE_ACTIVITY_WINDOW_ENV,
     DEFAULT_ADVERTISE_ACTIVITY_WINDOW,
 };
+pub use fast_fail_tally::MAX_PEER_FAST_FAIL_STREAK_AGE;
 
 mod send_health;
 pub use send_health::{
@@ -512,8 +514,11 @@ pub struct ClaimAd {
     /// the full argument.
     pub pool_key: Option<String>,
     /// The advertising host's **own** consecutive tally at send time (Issue
-    /// #9292). `Some` only for [`ClaimKind::PrlessReleaseArmed`]; every other
-    /// kind leaves it `None`.
+    /// #9292). `Some` for [`ClaimKind::PrlessReleaseArmed`] and, since Issue
+    /// #11930, for a [`ClaimKind::DispatchBackoffArmed`] armed by the #4485
+    /// ladder, where it is the sender's own issue-attributable fast-failure
+    /// streak (`0` when the window was armed under another cause, which breaks
+    /// that streak). Every other kind leaves it `None`.
     ///
     /// Counts only that host's own releases — never a fleet total — so a
     /// receiver can sum one entry per peer host without double-counting its
@@ -1196,6 +1201,11 @@ pub struct PeerClaimView {
     /// construction, the interval after which the *next* host may claim; see
     /// [`brakes::PEER_PRLESS_STREAK_TTL`] for what collapsing them costs.
     prless_releases: HashMap<(String, u32, String), brakes::PeerPrlessRelease>,
+    /// Each peer host's own issue-attributable fast-failure streak (Issue
+    /// #11930), keyed by `(repo_slug, issue, advertising_host)` and valued by
+    /// `(count, received_at)`. Carried on the `DispatchBackoffArmed` ad; see
+    /// [`fast_fail_tally`] for why it is summed per host.
+    fast_fail_streaks: HashMap<(String, u32, String), (u32, Instant)>,
     /// Fleet-visible token-pool exhaustion holds armed by peer hosts (Issue
     /// #8001), keyed by `(pool_key, advertising_host)`, valued by the
     /// **local** [`Instant`] at which this daemon's copy of the hold expires
@@ -1269,6 +1279,7 @@ impl PeerClaimView {
             noop_cooldowns: HashMap::new(),
             dispatch_backoffs: HashMap::new(),
             prless_releases: HashMap::new(),
+            fast_fail_streaks: HashMap::new(),
             pool_holds: HashMap::new(),
             send_health: ClaimSendHealth::default(),
             last_coordination_reason: None,

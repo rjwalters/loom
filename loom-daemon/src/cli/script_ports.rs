@@ -364,7 +364,7 @@ pub(crate) enum ScriptPortCommand {
     /// The premise gate (#8396), one stage before Curator: is this issue in
     /// the gated population, and does a consistent premise record exist for
     /// it? Backs `premise-check.sh`. Exit 0 proceed, 10 record required, 11
-    /// route to `loom:operator-decision`, 12 record malformed, 13 premise
+    /// route to an operator decision, 12 record malformed, 13 premise
     /// false, 1 could not run — and 1 must be treated as 10, never as 0. Not
     /// a port either: same frozen-`main.rs` reason as `shell-budget` above.
     PremiseCheck(super::premise_check::PremiseCheckArgs),
@@ -372,7 +372,7 @@ pub(crate) enum ScriptPortCommand {
     /// The operator-decision helper (#9344): validate a ranked-options
     /// decision (2-4 options best -> worst, each with a why, recommended
     /// first) and write it onto an issue as a fenced `decision` block before
-    /// labelling it `loom:operator-decision`. Refuses, touching nothing, on
+    /// labelling it `loom:operator` (#11795). Refuses, touching nothing, on
     /// any contract failure. Same frozen-`main.rs` reason as `shell-budget`.
     #[command(subcommand)]
     OperatorDecision(super::operator_decision::OperatorDecisionCommand),
@@ -549,6 +549,13 @@ pub(crate) enum ScriptPortCommand {
     /// write. See `defaults/docs/park-record.md`.
     #[command(subcommand)]
     ParkRecord(super::park_record::ParkRecordCommand),
+
+    /// Classify a PR for Champion's Verdict-State Janitor and merge step
+    /// (#11932): Champion's own hold, another actor's `loom:blocked` park, a
+    /// verdict contradiction, or clear; and the once-per-head "Merge Failed"
+    /// marker. Reads trusted comments only.
+    #[command(subcommand)]
+    ChampionHold(super::champion_hold_cmd::ChampionHoldCommand),
 
     /// Validate the Curator's `<!-- loom:points=<N> -->` marker in one issue
     /// body read from stdin (#9056). The gate itself, which also reads
@@ -733,6 +740,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
+            ScriptPortCommand::ChampionHold(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
             ScriptPortCommand::RamScopeLimit(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),

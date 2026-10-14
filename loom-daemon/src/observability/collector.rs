@@ -761,6 +761,8 @@ fn terminal_records(
     };
     let (disposition, failure_class) = crate::telemetry::classify_disposition(&signals);
     let outcome_result = crate::telemetry::result_for_disposition(&signals, disposition);
+    // Issue #11854: a reported `failure` never goes out without a class.
+    let failure_class = crate::telemetry::ensure_failure_class(outcome_result, failure_class);
     vec![
         TelemetryRecord::SweepCompleted(crate::telemetry::SweepCompletedRecord {
             repo: repo.clone(),

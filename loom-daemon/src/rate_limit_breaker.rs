@@ -211,8 +211,9 @@ pub struct BudgetSnapshot {
 
 /// Compute when a cooldown started at `now` should release, from a probed
 /// budget alone: the **latest reset among exhausted resources** whose reset is
-/// still in the future, else `now + fallback_secs` (no budget, a secondary
-/// limit, or a stale/untrustworthy reading — see [`evidence::from_probe`]).
+/// still in the future, else `now + fallback_secs` (no budget or a stale
+/// reading), or the minimum when nothing is exhausted — with no error text that
+/// reading contradicts a primary failure (#10375, see [`evidence::from_probe`]).
 /// Always clamped to `[MIN_COOLDOWN_SECS, MAX_COOLDOWN_SECS]` from `now`.
 #[must_use]
 pub fn cooldown_until(
@@ -459,8 +460,8 @@ impl SharedRateLimitBreaker {
 
     /// Re-derive the release time of the window tripped at `tripped_at` from
     /// later `evidence` (a contextual probe, #8997). A fallback keeps the
-    /// provisional window; a trusted reset replaces it (clamped from
-    /// `tripped_at`). `reading` is cached for status only when trusted.
+    /// provisional window; a trusted reset or a contradicted reading
+    /// (minimum cooldown, #10375) replaces it (clamped from `tripped_at`). `reading` is cached for status only when trusted.
     /// Returns the window's release time, or `None` when that window is no
     /// longer the current one (released or superseded).
     pub fn refine(
@@ -478,7 +479,7 @@ impl SharedRateLimitBreaker {
             .cooldown
             .as_mut()
             .filter(|w| w.tripped_at == tripped_at)?;
-        if evidence.is_trusted() {
+        if evidence.replaces_provisional() {
             window.until = evidence.cooldown_until(tripped_at, fallback);
         }
         Some(window.until)
@@ -943,10 +944,11 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_falls_back_when_nothing_exhausted() {
-        // Secondary limit: signature fired but both primaries show remaining.
+    fn cooldown_is_minimal_when_nothing_exhausted() {
+        // Both primaries show remaining and no secondary text: the reading
+        // contradicts a primary failure → minimum cooldown (#10375).
         let b = budget(100, 500, 100, 800);
-        assert_eq!(cooldown_until(Some(&b), t(0), 900), t(900));
+        assert_eq!(cooldown_until(Some(&b), t(0), 900), t(MIN_COOLDOWN_SECS));
     }
 
     #[test]

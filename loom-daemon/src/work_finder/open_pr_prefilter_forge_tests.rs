@@ -195,7 +195,7 @@ impl Fixture {
             total: calls.len(),
             listing: count(&|c| c.contains("pulls?state=open")),
             issue: count(&|c| c.contains("/issues/")),
-            graphql: count(&|c| c.contains("graphql")),
+            graphql: count(&|c| is_guard_graphql(c)),
         }
     }
 
@@ -209,6 +209,12 @@ impl Fixture {
             .unwrap()
             .dispatch_backoff_issues(chrono::Utc::now())
     }
+}
+
+/// A GraphQL call of the open-PR guard, not the landed pre-filter's
+/// closes-graph query (#11853), the one that asks for the last reopen.
+fn is_guard_graphql(call: &str) -> bool {
+    call.contains("graphql") && !call.contains("REOPENED_EVENT")
 }
 
 /// `gh` calls of one kind made during a tick.
@@ -545,7 +551,7 @@ fn a_prefiltered_block_still_holds_when_every_probe_leg_fails() {
     assert_eq!((stale.skipped_pr_open, stale.pr_open_prefiltered), (1, 0));
     assert_eq!((stale.dispatched, stale.errors), (0, 0));
     let calls = fx.calls()[before..].to_vec();
-    assert!(calls.iter().any(|c| c.contains("graphql")), "the probe ran: {calls:?}");
+    assert!(calls.iter().any(|c| is_guard_graphql(c)), "the probe ran: {calls:?}");
     assert!(calls.iter().any(|c| c.contains("pulls/9951")), "the recheck ran: {calls:?}");
 
     // Control: the same outage with no pre-filtered tick before it has no

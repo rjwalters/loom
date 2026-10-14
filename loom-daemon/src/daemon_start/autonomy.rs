@@ -197,6 +197,12 @@ pub struct DowngradeCheck<'a> {
     pub want_health_gate: Want,
     pub prior: &'a PriorAutonomy,
     pub intent_marker: &'a Path,
+    /// The resolved config's `autonomous.workFinder.enabled` for the repo root
+    /// this start serves (#11934): `Some(true)` means the host's own config
+    /// asks for the work finder, so exporting the FLAGS-OFF `0` over it (env
+    /// beats config) is a downgrade even with no prior plist/unit value and no
+    /// marker to say so. `None`/`Some(false)` adds nothing.
+    pub config_work_finder: Option<bool>,
 }
 
 /// `check_autonomy_downgrade_key` + `warn_autonomy_downgrade`.
@@ -211,6 +217,7 @@ pub fn warn_autonomy_downgrade(c: &DowngradeCheck) -> bool {
         return false;
     }
     let mut detected = false;
+    detected |= check_config_work_finder(c);
     detected |= check_key(
         "LOOM_WORK_FINDER",
         c.work_finder.0,
@@ -238,8 +245,39 @@ pub fn print_downgrade_refusal() {
     out::err("--health-gate / --no-health-gate) to state the desired value for THIS");
     out::err("invocation, or --from-config to drive from .loom/config.json -> autonomous.");
     out::err("(This refusal fires only on a DETECTED downgrade -- prior plist/unit had the");
-    out::err("loop on, or the autonomy-desired marker is present. A genuinely fresh start");
-    out::err("with no prior signal, #3911, is unaffected and still defaults FLAGS-OFF.)");
+    out::err("loop on, the autonomy-desired marker (or its operator-stop record) is present,");
+    out::err("or this host's config enables the work finder. A genuinely fresh start with no");
+    out::err("prior signal, #3911, is unaffected and still defaults FLAGS-OFF.)");
+}
+
+/// `autonomous.workFinder.enabled: true` in the resolved config, about to be
+/// overridden by this start's own FLAGS-OFF `LOOM_WORK_FINDER=0` (#11934).
+///
+/// The daemon resolves the work finder env > config > default, so the `0` a
+/// plain start exports does not merely fail to enable the loop: it switches
+/// off a loop the host's config turned on. A config-driven host (its unit
+/// rendered by `--from-config`, or by `fleet add-worker`, carries no
+/// `LOOM_WORK_FINDER` line at all) gives [`check_key`] nothing to compare, and
+/// an operator stop moves the marker aside, so without this check a plain
+/// start after `restart --pause --then-exit` brought the daemon back with the
+/// work finder silently off.
+fn check_config_work_finder(c: &DowngradeCheck) -> bool {
+    let (new_val, pre_exported) = c.work_finder;
+    if c.config_work_finder != Some(true)
+        || new_val != "0"
+        || c.want_work_finder == Want::Off
+        || !pre_exported.is_empty()
+    {
+        return false;
+    }
+    out::warn("");
+    out::warn("WARNING: autonomy downgrade -- LOOM_WORK_FINDER renders 0 this start, but this");
+    out::warn("  host's config sets autonomous.workFinder.enabled: true. The daemon reads env");
+    out::warn("  before config, so this plain start would switch the work finder OFF over");
+    out::warn("  the config that enables it (#11934).");
+    out::warn("  Remediation: pass --from-config (let .loom/config.json -> autonomous decide),");
+    out::warn("  --work-finder to force it on, or --no-work-finder to confirm you want it off.");
+    true
 }
 
 fn check_key(
@@ -264,20 +302,26 @@ fn check_key(
     }
 
     let mut old_val = prior.value(key).unwrap_or_default();
-    let marker_present = intent_marker.exists();
+    // #11934: an operator stop (`restart --drain/--pause --then-exit`, #9588)
+    // MOVES the marker aside into `<marker>.stopped`, verbatim. The explicit
+    // start that follows is exactly when this check matters, so the record
+    // stands in for the marker: without it the prior autonomy was invisible
+    // and a plain start came back FLAGS-OFF with no warning.
+    let marker_file = prior_marker_file(intent_marker);
+    let marker_present = marker_file.is_some();
 
     // #5437: on the nohup fallback tier no plist/unit is ever rendered, so the
     // marker's own persisted field is the ONLY signal that can tell a prior
     // BARE start from a prior AUTONOMOUS one. Without it every bare restart
     // following any prior start looked like a downgrade.
-    if old_val.is_empty() && marker_present {
+    if let (true, Some(file)) = (old_val.is_empty(), marker_file.as_deref()) {
         let field = match key {
             "LOOM_WORK_FINDER" => Some("work_finder"),
             "LOOM_MAIN_HEALTH_GATE" => Some("health_gate"),
             _ => None,
         };
         if let Some(field) = field {
-            old_val = marker_field(intent_marker, field).unwrap_or_default();
+            old_val = marker_field(file, field).unwrap_or_default();
         }
     }
 
@@ -308,7 +352,7 @@ fn check_key(
         ));
         out::warn(&format!(
             "  value could be read -- but the autonomy-desired marker ({}) is",
-            intent_marker.display()
+            marker_file.as_deref().unwrap_or(intent_marker).display()
         ));
         out::warn("  present, meaning this host previously ran loom-daemon autonomously.");
         out::warn(
@@ -319,6 +363,25 @@ fn check_key(
         return true;
     }
     false
+}
+
+/// The file carrying the prior marker's fields: the marker itself, else the
+/// operator-stop record it was moved aside into (#9588, #11934), else `None`.
+///
+/// A record counts only when it actually holds a moved-aside marker. A stop
+/// recorded with no marker in place (an unsupervised daemon) carries just its
+/// own `operator_stop_*` fields, which say nothing about prior autonomy, so it
+/// must not turn the next plain start into a conservative refusal.
+fn prior_marker_file(intent_marker: &Path) -> Option<PathBuf> {
+    if intent_marker.exists() {
+        return Some(intent_marker.to_path_buf());
+    }
+    let record = crate::operator_stop::record_path(intent_marker);
+    let text = std::fs::read_to_string(&record).ok()?;
+    text.lines()
+        .map(str::trim)
+        .any(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("operator_stop_"))
+        .then_some(record)
 }
 
 /// `grep -E "^<field>=" "$INTENT_MARKER" | head -n1 | cut -d= -f2-`.
@@ -356,6 +419,7 @@ mod tests {
             want_health_gate: Want::Unset,
             prior: &no_prior(),
             intent_marker: &marker,
+            config_work_finder: None,
         }));
     }
 
@@ -373,6 +437,7 @@ mod tests {
                 want_health_gate: Want::Off,
                 prior: &no_prior(),
                 intent_marker: &marker,
+                config_work_finder: None,
             }),
             "--no-work-finder / --no-health-gate state the value explicitly"
         );
@@ -391,6 +456,7 @@ mod tests {
             want_health_gate: Want::Unset,
             prior: &no_prior(),
             intent_marker: &marker,
+            config_work_finder: None,
         }));
     }
 
@@ -410,6 +476,7 @@ mod tests {
             want_health_gate: Want::Unset,
             prior: &no_prior(),
             intent_marker: &marker,
+            config_work_finder: None,
         }));
     }
 
@@ -426,6 +493,7 @@ mod tests {
             want_health_gate: Want::Unset,
             prior: &no_prior(),
             intent_marker: &marker,
+            config_work_finder: None,
         }));
     }
 
@@ -443,6 +511,7 @@ mod tests {
             want_health_gate: Want::Unset,
             prior: &no_prior(),
             intent_marker: &marker,
+            config_work_finder: None,
         }));
     }
 
@@ -459,7 +528,87 @@ mod tests {
             want_health_gate: Want::Unset,
             prior: &no_prior(),
             intent_marker: &marker,
+            config_work_finder: None,
         }));
+    }
+
+    fn bare(marker: &Path, config_work_finder: Option<bool>) -> bool {
+        warn_autonomy_downgrade(&DowngradeCheck {
+            from_config: false,
+            work_finder: ("0", ""),
+            health_gate: ("0", ""),
+            want_work_finder: Want::Unset,
+            want_health_gate: Want::Unset,
+            prior: &no_prior(),
+            intent_marker: marker,
+            config_work_finder,
+        })
+    }
+
+    #[test]
+    fn an_operator_stop_record_stands_in_for_the_moved_aside_marker() {
+        // #11934: `restart --pause --then-exit` records an operator stop,
+        // which MOVES the marker aside. The explicit start that follows must
+        // still see the prior autonomous run, or it comes back FLAGS-OFF.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("autonomy-desired");
+        std::fs::write(&marker, "work_finder=1\nhealth_gate=0\n").expect("write");
+        crate::operator_stop::record(&marker, "pause-then-exit").expect("record");
+        assert!(!marker.exists(), "the stop moved the marker aside");
+        assert!(bare(&marker, None), "the record's work_finder=1 is a prior autonomous run");
+    }
+
+    #[test]
+    fn an_operator_stop_record_of_a_bare_run_stays_silent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("autonomy-desired");
+        std::fs::write(&marker, "work_finder=0\nhealth_gate=0\n").expect("write");
+        crate::operator_stop::record(&marker, "drain-then-exit").expect("record");
+        assert!(!bare(&marker, None), "a recorded bare run is no transition");
+    }
+
+    #[test]
+    fn a_stop_record_with_no_moved_aside_marker_is_no_signal() {
+        // An unsupervised daemon's stop has no marker to move aside; its record
+        // holds only the stop fields and must not refuse the next plain start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("autonomy-desired");
+        crate::operator_stop::record(&marker, "then-exit").expect("record");
+        assert!(crate::operator_stop::is_recorded(&marker));
+        assert!(!bare(&marker, None));
+    }
+
+    #[test]
+    fn config_enabling_the_work_finder_makes_a_plain_start_a_downgrade() {
+        // #11934: the unit of a config-driven host carries no LOOM_WORK_FINDER
+        // and the marker may be gone; the config itself is the prior signal.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("autonomy-desired");
+        assert!(bare(&marker, Some(true)));
+        assert!(!bare(&marker, Some(false)), "config off: FLAGS-OFF agrees with it");
+        assert!(!bare(&marker, None), "no config: a genuinely fresh start (#3911)");
+    }
+
+    #[test]
+    fn config_enabled_but_explicit_or_config_driven_starts_are_not_downgrades() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("autonomy-desired");
+        let with = |from_config: bool, wf: (&str, &str), want: Want| {
+            warn_autonomy_downgrade(&DowngradeCheck {
+                from_config,
+                work_finder: wf,
+                health_gate: ("0", ""),
+                want_work_finder: want,
+                want_health_gate: Want::Unset,
+                prior: &no_prior(),
+                intent_marker: &marker,
+                config_work_finder: Some(true),
+            })
+        };
+        assert!(!with(true, ("", ""), Want::Unset), "--from-config hands control to config");
+        assert!(!with(false, ("0", ""), Want::Off), "--no-work-finder is explicit");
+        assert!(!with(false, ("0", "0"), Want::Unset), "an exported 0 is explicit");
+        assert!(!with(false, ("1", ""), Want::On), "--work-finder keeps it on");
     }
 
     #[test]

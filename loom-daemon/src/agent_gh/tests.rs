@@ -143,3 +143,13 @@ fn status_classifies_front_and_bypass() {
     assert_eq!(session_env::classify_gh(&other), "bypassed");
     assert_eq!(session_env::first_gh(Some(OsStr::new("/nonexistent-dir"))), None);
 }
+
+/// A gateway attempt killed by a signal exits as a shell would report the
+/// exec'd `gh`: 128 + the signal, not a flat 1 (2am#4367 P4).
+#[test]
+fn a_signalled_gateway_attempt_reports_128_plus_the_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(super::exit_code(std::process::ExitStatus::from_raw(9)), 137);
+    assert_eq!(super::exit_code(std::process::ExitStatus::from_raw(15)), 143);
+    assert_eq!(super::exit_code(std::process::ExitStatus::from_raw(3 << 8)), 3);
+}

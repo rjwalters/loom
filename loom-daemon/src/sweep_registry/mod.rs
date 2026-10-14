@@ -118,6 +118,8 @@ pub use model::generate_sweep_id;
 mod config_paths;
 mod decline_cooldown;
 mod dispatch;
+mod fast_fail_fleet;
+mod fast_fail_park;
 mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
@@ -149,6 +151,7 @@ pub(crate) mod roll_resume;
 mod spawn_process;
 mod stacking;
 mod start_facts;
+mod step_reap;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;
@@ -169,6 +172,9 @@ pub use crash_signals::*;
 pub use decline_cooldown::*;
 #[allow(unused_imports)]
 pub use dispatch::*;
+pub use fast_fail_park::{
+    fast_fail_class, fast_fail_parks, is_fast_failure, FAST_FAIL_WINDOW_SECS,
+};
 #[allow(unused_imports)]
 pub use guards::*;
 #[allow(unused_imports)]
@@ -1293,7 +1299,8 @@ impl SweepRegistry {
     #[must_use]
     pub fn tracked_sweep_identity(&self, issue: u32) -> Option<TrackedSweepIdentity> {
         let mut candidates = self.entries.values().filter(|info| {
-            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(n) if n == issue)
+            // A step on the item is the item's tracked run (#11898).
+            !info.state.is_terminal() && info.kind.item_number() == Some(issue)
         });
         let found = candidates.next()?;
         if candidates.next().is_some() {
@@ -1468,11 +1475,16 @@ fn overlay_live_phase_at(checkpoint_dir: &Path, info: &mut SweepInfo) {
     if info.latest_phase.is_none()
         && matches!(info.state, SweepState::Running | SweepState::Pending)
     {
-        if let SweepKind::Issue(issue) = info.kind {
-            let checkpoint = checkpoint_dir.join(format!("issue-{issue}.json"));
-            if checkpoint_written_by_run(&checkpoint, info.started_at) {
-                info.latest_phase = read_checkpoint_phase(&checkpoint);
+        match info.kind {
+            SweepKind::Issue(issue) => {
+                let checkpoint = checkpoint_dir.join(format!("issue-{issue}.json"));
+                if checkpoint_written_by_run(&checkpoint, info.started_at) {
+                    info.latest_phase = read_checkpoint_phase(&checkpoint);
+                }
             }
+            // A step writes no sweep checkpoint: its role is its phase (#11898).
+            SweepKind::Step { role, .. } => info.latest_phase = Some(role.as_str().to_string()),
+            SweepKind::PrSet(_) => {}
         }
     }
 }
@@ -1556,9 +1568,9 @@ impl RegistrySnapshot {
     /// helper `unregistered_locked_issues` depends on.
     #[must_use]
     fn has_tracked_sweep_for(&self, issue: u32) -> bool {
-        self.entries.values().any(|info| {
-            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
-        })
+        self.entries
+            .values()
+            .any(|info| !info.state.is_terminal() && info.kind.issue_number() == Some(issue))
     }
 }
 

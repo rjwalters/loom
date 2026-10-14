@@ -2,6 +2,7 @@
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
 pub mod cargo_debuginfo;
+mod claim_owned;
 pub mod containment;
 // `pub(crate)` rather than private since #8436: `runtime_preference::
 // availability` mirrors `credential::resolve`'s ladder to decide whether a
@@ -672,6 +673,14 @@ fn run_preflight(
     let path = crate::agent_gh::session_path(current.as_deref());
     if let Some(path) = path {
         command.env("PATH", path);
+    }
+    // 2am#4367 P4: no gh update check, and the gateway profiles the front's
+    // classified reads use — exported only while the daemon has them live.
+    for (key, value) in crate::forge_gateway::agent_env() {
+        match value {
+            Some(v) => command.env(key, v),
+            None => command.env_remove(key),
+        };
     }
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
     // item 1). Cargo keys a crate's incremental session state by the crate's

@@ -75,6 +75,8 @@ mod flow;
 pub mod history;
 pub mod outcomes;
 mod sources;
+mod step_rows;
+pub use step_rows::step_stage;
 
 use flow::{QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
 
@@ -85,13 +87,20 @@ pub const REVIEW_LABELS: [&str; 3] = ["loom:review-requested", "loom:changes-req
 const TREATING: &str = "loom:treating";
 
 /// The operator holds that make an approved PR `merge_hold`: the label
-/// registry's `merge_hold` set.
+/// registry's `merge_hold` set, plus the retired names that fold into it
+/// (#11795), so label history and unmigrated PRs still read as held.
 static MERGE_HOLD_LABELS: crate::label_registry::LabelSet =
-    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("merge_hold"));
+    crate::label_registry::LabelSet::new(|| {
+        crate::label_registry::embedded_set_with_retired("merge_hold")
+    });
 
 /// The hold kind the hold labels in `labels` name on their own, or `None`
 /// when none holds. Labels alone cannot split `merge_risk` / `critical_file` /
 /// `ac_hold` out of `operator`; that refinement is left to the reader. Pure.
+///
+/// Reads PR labels only, with no body, so since #11795 `loom:operator` maps to
+/// `operator` here; the retired `loom:operator-decision` / `-only` /
+/// `-mechanical` keep their own kinds for unmigrated items and history.
 #[must_use]
 pub fn hold_kind(labels: &[String]) -> Option<FleetHoldKind> {
     let has = |label: &str| labels.iter().any(|l| l == label);
@@ -494,7 +503,7 @@ fn offer(candidates: &mut Candidates, repo: &str, source: Source, row: FleetStat
 #[must_use]
 pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Utc>) -> FleetView {
     let mut candidates = Candidates::new();
-    for sweep in &input.held {
+    for (sweep, issue) in input.held.iter().zip(step_rows::held_row_keys(input)) {
         let row = FleetStateRow {
             entered_at_lower_bound: sweep.entered_at_lower_bound,
             pr: sweep.pr,
@@ -506,7 +515,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             }),
             start: sweep.start.clone(),
             sweep_id: sweep.sweep_id.clone(),
-            ..FleetStateRow::new(sweep.issue, sweep.stage, sweep.entered_at)
+            ..FleetStateRow::new(issue, sweep.stage, sweep.entered_at)
         };
         offer(&mut candidates, &sweep.repo, Source::Held, row);
     }

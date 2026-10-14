@@ -9,16 +9,20 @@
 //! ([`crate::forge_listing::list_issues_cached`]). An unchanged listing is a
 //! free `304`. Per-item reads are rare and bounded:
 //!
-//! - one `issues/{n}/events` read gives an item's `labeled` times, and each
-//!   found time is cached for the life of the process;
+//! - one `issues/{n}/events` read gives an item's latest `labeled` times
+//!   ([`super::stage_events`]: page 1, then back from the last page, each
+//!   page one read), and each found time is cached for the life of the
+//!   process;
 //! - one `pulls/{n}` read tells whether a PR that left review merged.
 //!
 //! Both come out of one shared budget of [`FETCH_BUDGET`] reads per sample
 //! across all repos; sampling reads come first, cache warm-up only spends
 //! what is left. Work over the budget waits for the next sample, and nothing
-//! is ever read per tick or per issue per tick. Only the first events page
-//! (100 events) is read, so an item whose label event is further back has no
-//! time and is not sampled. The reads run on a detached task, so a slow forge
+//! is ever read per tick or per issue per tick. At most
+//! [`super::stage_events::MAX_PAGES`] events pages are read per item, so an
+//! item whose latest label event lies further back than that has no time
+//! and is not sampled; an earlier application is never taken for it
+//! (#11924). The reads run on a detached task, so a slow forge
 //! never stalls the collector; a sample still running when the next is due
 //! makes that next one a no-op.
 //!
@@ -35,8 +39,9 @@
 //! after start only records a baseline, so a restart never replays history
 //! as new entries. Every host that manages a repo samples it independently:
 //! sums scale with the host count, the mean (`dwell / samples`) does not.
-//! `loom.forge.stage_items{state}` counts the open items under each stage
-//! label, summed over this host's repos.
+//! `loom.forge.stage_items{state, repo}` counts the open items under each
+//! stage label per repo, plus the queue states of [`super::stage_queue`]
+//! (`triage`, `unlabeled`, …) from one open-items walk per repo (#11847).
 //!
 //! # One sampler per fleet (W12)
 //!
@@ -57,6 +62,7 @@ use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use chrono::{DateTime, Utc};
 
+use super::stage_events::LabelTimes;
 use crate::forge_listing::RestIssue;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::workspace_pool::WorkspacePool;
@@ -81,7 +87,8 @@ pub const STAGE_LABELS: [&str; 6] = [
 /// The labels a PR is "in review" under.
 pub const REVIEW_LABELS: [&str; 3] = [REVIEW_REQUESTED, CHANGES_REQUESTED, PR_APPROVED];
 
-/// Per-item forge reads allowed per sample, across all repos.
+/// Per-item forge reads allowed per sample, across all repos (each events
+/// page is one).
 pub const FETCH_BUDGET: usize = 8;
 
 /// Samples a pending PR lookup is retried before it is dropped.
@@ -164,6 +171,9 @@ pub struct RepoInput {
     pub slug: String,
     pub root: PathBuf,
     pub listings: BTreeMap<&'static str, Vec<StageItem>>,
+    /// The [`super::stage_queue`] state counts from this sample's open-items
+    /// walk; `None` when the walk did not complete (those states are absent).
+    pub queue: Option<BTreeMap<&'static str, usize>>,
 }
 
 impl RepoInput {
@@ -194,14 +204,17 @@ impl RepoInput {
 
 /// The per-item forge reads, injected so the sampler is testable offline.
 pub trait StageFetcher {
-    /// The latest `labeled` time of every label on issue/PR `number`, or
-    /// `None` when the read failed.
+    /// The latest `labeled` time of `label` on issue/PR `number`, and of
+    /// every other label the pages read vouch for, in at most `max_pages`
+    /// page reads ([`super::stage_events::walk`]).
     fn label_times(
         &mut self,
         root: &Path,
         slug: &str,
         number: u32,
-    ) -> Option<BTreeMap<String, DateTime<Utc>>>;
+        label: &str,
+        max_pages: usize,
+    ) -> LabelTimes;
     /// When PR `number` merged (`Some(None)`: not merged), or `None` when the
     /// read failed.
     fn merged_at(&mut self, root: &Path, slug: &str, number: u32) -> Option<Option<DateTime<Utc>>>;
@@ -271,8 +284,9 @@ impl Sampler {
         if *budget == 0 {
             return None;
         }
-        *budget -= 1;
-        let times = fetcher.label_times(&input.root, &input.slug, number)?;
+        let read = fetcher.label_times(&input.root, &input.slug, number, label, *budget);
+        *budget = budget.saturating_sub(read.pages.max(1));
+        let times = read.times?;
         for (name, at) in &times {
             self.label_times
                 .insert((input.slug.clone(), number, name.clone()), Some(*at));
@@ -527,7 +541,9 @@ impl Sampler {
 }
 
 /// The metric points for one sample: the dwell delta pair per stage with a
-/// sample, plus the item gauges per stage label.
+/// sample, plus the item gauges per repo (`repo`, lowercase `owner/name`,
+/// #11847): one per stage label, then the [`super::stage_queue`] states when
+/// that repo's walk completed.
 #[must_use]
 pub fn stage_points(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<MetricPoint> {
     let mut sums: BTreeMap<&'static str, (i64, i64)> = BTreeMap::new();
@@ -546,23 +562,45 @@ pub fn stage_points(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Metric
     if inputs.is_empty() {
         return points;
     }
-    for label in STAGE_LABELS {
-        let count: usize = inputs
-            .iter()
-            .map(|input| input.listings.get(label).map_or(0, Vec::len))
-            .sum();
-        let state = label.trim_start_matches("loom:").replace('-', "_");
-        points.push(
-            MetricPoint::int(MetricName::ForgeStageItems, i64::try_from(count).unwrap_or(i64::MAX))
-                .label("state", state),
-        );
+    let item = |count: usize, state: String, repo: &str| {
+        MetricPoint::int(MetricName::ForgeStageItems, i64::try_from(count).unwrap_or(i64::MAX))
+            .label("state", state)
+            .label("repo", repo)
+    };
+    for input in inputs {
+        let repo = input.slug.to_ascii_lowercase();
+        for label in STAGE_LABELS {
+            let count = input.listings.get(label).map_or(0, Vec::len);
+            let state = label.trim_start_matches("loom:").replace('-', "_");
+            points.push(item(count, state, &repo));
+        }
+        for (state, count) in input.queue.iter().flatten() {
+            points.push(item(*count, (*state).to_string(), &repo));
+        }
     }
     points
+}
+
+/// [`stage_points`] split into records of at most
+/// [`crate::telemetry::ops::MAX_POINTS_PER_RECORD`] points. One record would
+/// be truncated by `bounded_points` past that bound, and with per-repo states
+/// a host sampling a few dozen repos (the fleet captain) crosses it. The
+/// dwell delta pairs come first, so they always ride in the first batch.
+#[must_use]
+pub fn stage_batches(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Vec<MetricPoint>> {
+    stage_points(samples, inputs)
+        .chunks(crate::telemetry::ops::MAX_POINTS_PER_RECORD)
+        .map(<[MetricPoint]>::to_vec)
+        .collect()
 }
 
 /// The live forge reads, through `gh api` in the repo's own checkout (so a
 /// cross-owner repo uses its own owner's credential).
 pub struct GhStageFetcher;
+
+/// The `caller` stage-dwell's events reads are counted under in
+/// `loom.forge.calls` (the step engine's provider has its own).
+pub const EVENTS_CALLER: &str = "stage_dwell.events";
 
 pub(in crate::observability) fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
     let CmdOutcome::Ran(output) = GhInvocation::new(
@@ -584,7 +622,7 @@ pub(in crate::observability) fn gh_json(root: &Path, path: &str) -> Option<serde
     serde_json::from_slice(&output.stdout).ok()
 }
 
-/// The latest `labeled` time per label in an issue's events page.
+/// The latest `labeled` time per label in one events page.
 #[must_use]
 pub fn parse_label_times(events: &serde_json::Value) -> BTreeMap<String, DateTime<Utc>> {
     let mut times = BTreeMap::new();
@@ -612,9 +650,10 @@ impl StageFetcher for GhStageFetcher {
         root: &Path,
         slug: &str,
         number: u32,
-    ) -> Option<BTreeMap<String, DateTime<Utc>>> {
-        let events = gh_json(root, &format!("repos/{slug}/issues/{number}/events?per_page=100"))?;
-        Some(parse_label_times(&events))
+        label: &str,
+        max_pages: usize,
+    ) -> LabelTimes {
+        super::stage_events::read(EVENTS_CALLER, root, slug, number, label, max_pages)
     }
 
     fn merged_at(&mut self, root: &Path, slug: &str, number: u32) -> Option<Option<DateTime<Utc>>> {
@@ -624,6 +663,29 @@ impl StageFetcher for GhStageFetcher {
 }
 
 static SAMPLER: Mutex<Option<Sampler>> = Mutex::new(None);
+
+/// One stage listing from the GitHub state mirror, or `None` (read the forge
+/// as today). No thread hop while no mirror is live.
+async fn mirror_listing(root: &Path, slug: &str, label: &'static str) -> Option<Vec<RestIssue>> {
+    use crate::forge_mirror::discovery::{list_open, Caller, Pages};
+    if !crate::forge_mirror::is_active() {
+        return None;
+    }
+    let (root, slug) = (root.to_path_buf(), slug.to_string());
+    tokio::task::spawn_blocking(move || {
+        list_open(
+            crate::forge_events::poll_gate::ReadKind::Discovery,
+            Caller::StageDwell,
+            Some(&root),
+            Some(&slug),
+            Some(label),
+            Pages::First,
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
 /// Sample every managed repo's stage listings and export the dwell points.
 /// A no-op (no forge reads at all) without the OTLP ops sink.
@@ -656,12 +718,25 @@ pub(in crate::observability) async fn record(
             slug,
             root: root.clone(),
             listings: BTreeMap::new(),
+            queue: None,
         };
         let mut complete = true;
         for label in STAGE_LABELS {
-            match crate::observability::queue_blocked::list_open(root.clone(), label, "stage_dwell")
-                .await
-            {
+            // 2am#4367 P5: the state mirror first (a discovery read, first
+            // page like the REST listing), today's listing otherwise.
+            let mirrored = mirror_listing(&root, &input.slug, label).await;
+            let listing = match mirrored {
+                Some(rows) => Some(rows),
+                None => {
+                    crate::observability::queue_blocked::list_open(
+                        root.clone(),
+                        label,
+                        "stage_dwell",
+                    )
+                    .await
+                }
+            };
+            match listing {
                 Some(listing) => {
                     let items = listing.iter().map(StageItem::from_rest).collect();
                     input.listings.insert(label, items);
@@ -674,6 +749,8 @@ pub(in crate::observability) async fn record(
         }
         // A partial listing would read as mass exits; skip the repo instead.
         if complete {
+            // #11847: the states no label listing answers, from one walk.
+            input.queue = super::stage_queue::walk_counts(root.clone()).await;
             inputs.push(input);
         }
     }
@@ -694,7 +771,9 @@ pub(in crate::observability) async fn record(
         let previous = sampler.last_at();
         let samples = sampler.sample(&inputs, Utc::now(), &mut GhStageFetcher);
         drop(guard);
-        sink.emit_metrics_since(stage_points(&samples, &inputs), previous);
+        for batch in stage_batches(&samples, &inputs) {
+            sink.emit_metrics_since(batch, previous);
+        }
         let sampled = inputs.iter().map(|input| input.slug.clone());
         crate::observability::captain_gauges::note_produced(STAGE_JOB, sampled, Utc::now());
     }));

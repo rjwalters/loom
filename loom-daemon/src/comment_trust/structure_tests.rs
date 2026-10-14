@@ -31,6 +31,7 @@ const MARKERS: &[&str] = &[
     "loom:premise-check",
     "loom:unnamed-block-review",
     "closedByPullRequestsReferences",
+    "loom:landed-route",
 ];
 
 /// Every production file whose code names a covered marker.
@@ -87,12 +88,22 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),
+    ("sweep_registry/fast_fail_park.rs", "writer (quarantine park comment, #11854)"),
     ("sweep_registry/quarantine.rs", "writer"),
     (
         "sweep_registry/outcome_journal/label_timeline.rs",
         "#9062 timeline flag rows, trusted via policy.trusts_json in parse_label_events",
     ),
     ("worktree_ops/gh.rs", "linked-PR probe (FETCH_SITES)"),
+    (
+        "work_finder/landed_prefilter.rs",
+        "writer + reader of loom:landed-route in read_route_marked; closes-graph counts MERGED PRs \
+         only, which an outsider cannot produce (FETCH_SITES, #11853)",
+    ),
+    (
+        "work_finder/step_item.rs",
+        "pure parsers over TrustedComments, built only by TrustPolicy::filter (#11895)",
+    ),
 ];
 
 /// Per reviewed file: every function that fetches comments (or linked PRs),
@@ -197,6 +208,16 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // advisory comment and never edits a label.
     ("stale_blocked/batch.rs", "comments", ""),
     ("stale_blocked/batch.rs", "closing_refs_query", ""),
+    // #11853: the closes-graph query and parser count only MERGED PRs; the
+    // routing comment is a write.
+    ("work_finder/landed_prefilter.rs", "landed_query", ""),
+    ("work_finder/landed_prefilter.rs", "alias_verdict", ""),
+    ("work_finder/landed_prefilter.rs", "comment", ""),
+    (
+        "work_finder/landed_prefilter.rs",
+        "read_route_marked",
+        "TrustPolicy::for_root(&forge.root)",
+    ),
     ("stale_blocked/batch.rs", "parse_closing_refs", ""),
     // #10556's release pass: the raw listing goes to `release::execute`, which
     // trusts each comment through `policy.trusts_json` before reading a hold

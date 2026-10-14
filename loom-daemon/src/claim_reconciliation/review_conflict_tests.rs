@@ -122,7 +122,7 @@ fn mergeable_parse_treats_anything_unexpected_as_unknown() {
 
 #[test]
 fn held_prs_are_never_touched() {
-    for hold in VERDICT_HOLD_LABELS {
+    for hold in VERDICT_HOLD_LABELS.iter() {
         assert_eq!(
             decide_review_conflict(&pr(Mergeable::Conflicting, &[REVIEW_REQUESTED, hold])),
             ConflictAction::Keep(ConflictKeepReason::Held)

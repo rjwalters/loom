@@ -11,7 +11,8 @@
 //!   Doctor and Champion consume, with its sort keys — the same rows it prints.
 //! - the agent `gh` front's served `issue|pr list` ([`record_listing`]): the
 //!   rows a listing-driven role (Curator) read, in listing order, after its own
-//!   `--jq` filter.
+//!   `--jq` filter; and the `--json` listings it passes through to `gh`
+//!   (`--search`, `labels`: [`record_gh_listing`], #11858).
 //! - the agent `gh` front's argv ([`record_gh_actions`]): the forge writes the
 //!   agent issued (claim labels, verdict labels, merges), parsed from argv only.
 //!
@@ -367,6 +368,54 @@ pub fn record_listing(listing: &crate::forge_cached_list::Served) {
     });
 }
 
+/// Whether this process runs inside a role tick that keeps a journal.
+#[must_use]
+pub fn active() -> bool {
+    journal_path().is_some()
+}
+
+/// The journal rows of a passed-through `gh issue|pr list --json …` call's
+/// stdout (#11858), in the order `gh` printed them, served under `stage`.
+/// `None` when the output is not a JSON array of rows.
+#[must_use]
+pub fn gh_listing_rows(stage: &str, stdout: &str) -> Option<Vec<JournalRow>> {
+    let rows: Vec<Value> = serde_json::from_str(stdout.trim()).ok()?;
+    Some(
+        rows.iter()
+            .filter_map(|row| {
+                u32::try_from(row["number"].as_u64()?)
+                    .ok()
+                    .map(|n| (n, row))
+            })
+            .enumerate()
+            .map(|(position, (number, row))| JournalRow {
+                number,
+                stage: stage.to_string(),
+                labels: row_labels(row),
+                sort_key: Some(PickSortKey {
+                    name: "listing_order".to_string(),
+                    value: (position + 1).to_string(),
+                }),
+            })
+            .take(MAX_ROWS_PER_ENTRY)
+            .collect(),
+    )
+}
+
+/// Journal a listing the agent `gh` front passed through to `gh` (#11858).
+/// A no-op outside a role tick and for output that is not JSON rows.
+pub fn record_gh_listing(stage: &str, stdout: &str) {
+    if !active() {
+        return;
+    }
+    if let Some(rows) = gh_listing_rows(stage, stdout) {
+        append(&JournalEntry::Listing {
+            at: Utc::now(),
+            rows,
+        });
+    }
+}
+
 /// Journal the forge writes a `gh` argv issues. A no-op outside a role tick.
 pub fn record_gh_actions(raw: &[OsString]) {
     if journal_path().is_none() {
@@ -390,7 +439,8 @@ pub fn record_gh_actions(raw: &[OsString]) {
 // ---------------------------------------------------------------------------
 
 /// The role action a label write means (one of `ROLE_ACTIONS`), or `None`
-/// for a label that is not a Loom workflow label.
+/// for a label that is not a Loom workflow label. A retired hold name reads as
+/// the hold it folds into (#11795).
 #[must_use]
 pub fn action_for_label(label: &str) -> Option<&'static str> {
     Some(match label {
@@ -400,8 +450,8 @@ pub fn action_for_label(label: &str) -> Option<&'static str> {
         "loom:changes-requested" => "changes_requested",
         "loom:curated" => "curated",
         "loom:issue" => "promoted",
-        "loom:blocked" => "blocked",
-        "loom:operator" | "loom:operator-only" | "loom:operator-decision" => "escalated",
+        l if crate::work_finder::BLOCKED_HOLD_NAMES.contains(&l) => "blocked",
+        l if crate::work_finder::OPERATOR_HOLD_NAMES.contains(&l) => "escalated",
         l if l.starts_with("loom:") => "labeled",
         _ => return None,
     })
@@ -419,14 +469,9 @@ pub fn known_action(action: &str) -> Option<&'static str> {
 #[must_use]
 pub fn skip_reason_for_labels(labels: &[String]) -> Option<PickSkipReason> {
     let has = |set: &[&str]| labels.iter().any(|l| set.contains(&l.as_str()));
-    if has(&[
-        "loom:operator",
-        "loom:operator-only",
-        "loom:operator-decision",
-        "loom:operator-mechanical",
-    ]) {
+    if crate::work_finder::is_operator_hold(labels) {
         Some(PickSkipReason::OperatorHold)
-    } else if has(&["loom:blocked", "loom:ci-failure"]) {
+    } else if crate::work_finder::is_blocked_hold(labels) || has(&["loom:ci-failure"]) {
         Some(PickSkipReason::Blocked)
     } else if has(&["loom:sequenced"]) {
         Some(PickSkipReason::OverlapChain)

@@ -210,3 +210,19 @@ fn a_queue_line_written_before_the_total_field_still_parses() {
         other => panic!("unexpected {other:?}"),
     }
 }
+
+/// #11858: a passed-through `gh issue list --json …labels` call's rows, in
+/// `gh`'s order, with `gh`'s label objects read by name.
+#[test]
+fn a_passed_through_gh_listing_journals_its_rows() {
+    let stdout = r#"[{"labels":[{"id":"x","name":"loom:triage","color":"c"}],"number":12},
+        {"labels":[],"number":9},{"title":"no number"}]"#;
+    let rows = gh_listing_rows("loom:triage", stdout).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].number, 12);
+    assert_eq!(rows[0].stage, "loom:triage");
+    assert_eq!(rows[0].labels, vec!["loom:triage".to_string()]);
+    assert_eq!(rows[1].sort_key.as_ref().unwrap().value, "2");
+    assert_eq!(gh_listing_rows("search", "not json"), None);
+    assert_eq!(gh_listing_rows("search", "{\"number\":1}"), None, "an object is not rows");
+}

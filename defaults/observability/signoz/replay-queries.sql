@@ -421,7 +421,9 @@ forge AS (                      -- per instant and item: the stage the forge nam
                    i.target = 'issue' AND has(i.labels, 'loom:building'), 'building',
                    i.target = 'issue' AND has(i.labels, 'loom:issue'), 'ready_wait',
                    i.target = 'pr' AND review_labels = 1 AND has(i.labels, 'loom:pr')
-                       AND hasAny(i.labels, ['loom:operator', 'loom:operator-decision',
+                       AND hasAny(i.labels, ['loom:operator', 'loom:operator-blocked',
+                                             'loom:operator-decision',
+                                             'loom:operator-mechanical',
                                              'loom:operator-only']), 'merge_hold',
                    i.target = 'pr' AND review_labels = 1
                        AND has(i.labels, 'loom:review-requested'), 'review_wait',
