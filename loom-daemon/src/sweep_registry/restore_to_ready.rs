@@ -33,14 +33,13 @@
 //! not carry `loom:issue` when it was claimed does not gain it on release.
 //! See [`prior_label`].
 //!
-//! Issue #11852 adds the last one: an issue with a verified open linked PR
-//! does not regain `loom:issue` on release — the PR is the review lane's, and
-//! a queue label beside it is one the dispatcher must refuse every tick. See
-//! [`open_pr_veto`].
+//! Issue #11852 adds the last one, opt-in and default off: with
+//! `LOOM_RELEASE_OPEN_PR_VETO` set, an issue with a verified open linked PR
+//! does not regain `loom:issue` on release. See [`open_pr_veto`].
 
 use super::*;
 
-mod open_pr_veto;
+pub(crate) mod open_pr_veto;
 mod prior_label;
 
 /// What a claim release did (#11743).
@@ -120,10 +119,10 @@ impl SweepRegistry {
         // Only a positive "no" skips the re-add (see `prior_label`).
         let never_ready = !(veto.is_some() || is_pr || closed == Some(true))
             && self.claim_took_ready_label(issue) == Some(false);
-        // Issue #11852: and, only when the re-add would STILL happen, is the
-        // issue already being worked through an open linked PR? A verified
-        // `Open` (a fresh memo is fine: here it prevents a write) keeps
-        // `loom:issue` off; anything else restores as before (see `open_pr_veto`).
+        // Issue #11852 (opt-in, default off): and, only when the re-add would
+        // STILL happen, is the issue already being worked through an open
+        // linked PR? A verified `Open` keeps `loom:issue` off; anything else,
+        // and the flag being off, restores as before (see `open_pr_veto`).
         let open_pr = if veto.is_some() || is_pr || closed == Some(true) || never_ready {
             None
         } else {
@@ -399,6 +398,7 @@ exit 0
     #[test]
     #[serial_test::serial]
     fn an_open_linked_pr_keeps_the_queue_label_off_on_claim_release() {
+        let _veto = open_pr_veto::VetoEnabled::new();
         let dir = tempfile::tempdir().unwrap();
         let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
         let registry = registry_with(&fake_gh, dir.path());
@@ -420,6 +420,7 @@ exit 0
     #[test]
     #[serial_test::serial]
     fn a_failed_open_pr_probe_still_restores_the_queue_label() {
+        let _veto = open_pr_veto::VetoEnabled::new();
         let dir = tempfile::tempdir().unwrap();
         let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
         let registry = registry_with(&fake_gh, dir.path());
@@ -434,12 +435,32 @@ exit 0
         );
     }
 
+    /// #11852: with the flag unset (the default) a verified open PR changes
+    /// nothing — `loom:issue` is re-added exactly as before, and no probe runs.
+    #[test]
+    #[serial_test::serial]
+    fn the_open_pr_veto_is_off_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
+        let registry = registry_with(&fake_gh, dir.path());
+        registry.seed_open_pr_memo(11858, 11859, chrono::Utc::now());
+
+        registry.restore_label_to_ready(11858).unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(
+            calls.contains("issue edit 11858 --remove-label loom:building --add-label loom:issue"),
+            "the veto is opt-in; default release restores the queue label: {calls}"
+        );
+    }
+
     /// #11852: the open-PR probe is asked only when the re-add would otherwise
     /// happen — a closed issue is decided without it, even with a memo saying
     /// a PR is open.
     #[test]
     #[serial_test::serial]
     fn the_open_pr_probe_is_not_consulted_once_another_veto_decides() {
+        let _veto = open_pr_veto::VetoEnabled::new();
         let dir = tempfile::tempdir().unwrap();
         let (fake_gh, gh_log) = fake_gh(dir.path(), "closed");
         let registry = registry_with(&fake_gh, dir.path());

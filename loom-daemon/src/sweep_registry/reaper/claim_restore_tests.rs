@@ -766,7 +766,7 @@ fn cancel_prset_does_not_restore_label() {
     );
 }
 
-/// Issue #11852: a sweep that opened its PR and then died holding a
+/// Issue #11852 (veto enabled): a sweep that opened its PR and then died holding a
 /// checkpoint gets its stale `loom:building` claim removed, but NOT
 /// `loom:issue` re-added — the open PR is the review lane's, and a queue label
 /// beside it is one every dispatch tick must refuse. The crash resume (#4256)
@@ -775,6 +775,7 @@ fn cancel_prset_does_not_restore_label() {
 #[test]
 #[serial]
 fn reap_with_checkpoint_and_open_pr_does_not_requeue_but_still_resumes() {
+    let _veto = crate::sweep_registry::restore_to_ready::open_pr_veto::VetoEnabled::new();
     let tmp = tempdir().unwrap();
     let ws = tmp.path();
     std::env::set_var("LOOM_REPO", "rjwalters/loom");
@@ -806,6 +807,7 @@ fn reap_with_checkpoint_and_open_pr_does_not_requeue_but_still_resumes() {
 #[test]
 #[serial]
 fn reap_with_checkpoint_and_no_open_pr_still_requeues() {
+    let _veto = crate::sweep_registry::restore_to_ready::open_pr_veto::VetoEnabled::new();
     let tmp = tempdir().unwrap();
     let ws = tmp.path();
     std::env::set_var("LOOM_REPO", "rjwalters/loom");
