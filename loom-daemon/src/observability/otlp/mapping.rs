@@ -342,6 +342,11 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(gated_pool) = &r.gated_pool {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
+            // #12028: why a failed tick failed, from the closed vocabulary only.
+            if let Some(class) = &r.failure_class {
+                attributes
+                    .push(kv_string(crate::observability::lifecycle::FAILURE_CLASS, class.clone()));
+            }
             attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
             // #11906: a step-engine step, never a role-runner tick.
             if let Some(source) = &r.source {

@@ -143,16 +143,34 @@ pub fn lookup(name: Option<&str>, config: &Value) -> Result<(String, ModelProfil
             .unwrap_or_else(|| serde_json::json!({})),
     )
     .map_err(|_| LaunchError::config("invalid runtime model profile configuration"))?;
-    let name = name
-        .or(configured.default_model_profile.as_deref())
-        .unwrap_or("zai-flash")
-        .to_string();
-    let profile = configured
-        .model_profiles
-        .get(&name)
-        .cloned()
-        .or_else(|| bundled().remove(&name))
-        .ok_or_else(|| LaunchError::config("unknown model profile"))?;
+    let (name, source) = match (name, configured.default_model_profile.as_deref()) {
+        (Some(explicit), _) => {
+            let from_env = super::nonempty_env("LOOM_MODEL_PROFILE").as_deref() == Some(explicit);
+            (
+                explicit.to_string(),
+                if from_env {
+                    "LOOM_MODEL_PROFILE"
+                } else {
+                    "an explicit request (--profile, or a preference tap's modelProfile)"
+                },
+            )
+        }
+        (None, Some(default)) => (default.to_string(), "runtimes.defaultModelProfile"),
+        (None, None) => ("zai-flash".to_string(), "the built-in zai-flash fallback"),
+    };
+    let profile = match configured.model_profiles.get(&name).cloned() {
+        Some(profile) => profile,
+        None => bundled().remove(&name).ok_or_else(|| {
+            let mut known: Vec<String> = configured.model_profiles.keys().cloned().collect();
+            known.extend(bundled().into_keys());
+            known.sort();
+            known.dedup();
+            LaunchError::config(format!(
+                "unknown model profile `{name}` (from {source}); known profiles: {}",
+                known.join(", ")
+            ))
+        })?,
+    };
     if profile.model.trim().is_empty()
         || profile.effort.as_ref().is_some_and(|s| s.trim().is_empty())
     {
@@ -526,6 +544,40 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unknown_message(name: Option<&str>, config: &Value) -> String {
+        lookup(name, config)
+            .expect_err("profile must be unknown")
+            .message
+    }
+
+    #[test]
+    fn unknown_profile_error_names_source_and_known_profiles() {
+        let _g = env_lock();
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config =
+            serde_json::json!({"runtimes":{"modelProfiles":{"mine":{"model":"m","providers":{}}}}});
+
+        let explicit = unknown_message(Some("nope"), &config);
+        assert!(explicit.contains("unknown model profile `nope`"), "{explicit}");
+        assert!(explicit.contains("explicit request"), "{explicit}");
+        assert!(explicit.contains("mine") && explicit.contains("zai-flash"), "{explicit}");
+
+        std::env::set_var("LOOM_MODEL_PROFILE", "from-env");
+        let env = unknown_message(Some("from-env"), &config);
+        assert!(env.contains("from LOOM_MODEL_PROFILE"), "{env}");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+
+        let default =
+            unknown_message(None, &serde_json::json!({"runtimes":{"defaultModelProfile":"gone"}}));
+        assert!(default.contains("`gone` (from runtimes.defaultModelProfile)"), "{default}");
+        assert!(default.contains("zai-flash"), "{default}");
+
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
 
     /// Serialize env mutation across these two tests — `resolve` reads
     /// `missing()` against the process environment for a `Many` (required)
