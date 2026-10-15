@@ -693,6 +693,11 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "scripts/test-ci-image-inputs.sh",
             "scripts/ci-image-inputs.sh",
             ".dockerignore",
+            // The ci-daily timeout classifier tests ride here too (#11964);
+            // they drive the classifier script and parse ci-daily.yml.
+            "scripts/test-ci-daily-classify.sh",
+            "scripts/ci-daily-classify.sh",
+            ".github/workflows/ci-daily.yml",
             CI_WORKFLOW,
         ],
         scanned: SHELL,

@@ -80,12 +80,17 @@ pub(crate) const SWEEP_ID_ENV: &str = "LOOM_SWEEP_ID";
 /// under a clean parent environment.
 pub(crate) fn apply_issue_scoped_markers(cmd: &mut Command, kind: &SweepKind) {
     let issue = match kind {
-        SweepKind::Issue(n) => Some(*n),
-        SweepKind::Step { .. } => kind.issue_number(),
-        SweepKind::PrSet(_) => None,
+        SweepKind::Issue(n)
+        | SweepKind::Step {
+            item: n,
+            role: crate::step_role::StepRole::Builder,
+        } => Some(*n),
+        // Only a Builder step holds an issue claim and an issue lease; every
+        // other step holds the role-keyed lease alone (#11906).
+        SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
     };
     match issue {
-        // An issue step the daemon pre-claimed exports the same marker
+        // A Builder step the daemon pre-claimed exports the same marker
         // (`targeted-role-invocation.md`: "a step engine that pre-claims ...
         // must export the same `LOOM_SWEEP_CLAIM_OWNED=<N>`"), and the daemon
         // renews the step's lease as it does a sweep's (#11898, #11906).
@@ -93,8 +98,8 @@ pub(crate) fn apply_issue_scoped_markers(cmd: &mut Command, kind: &SweepKind) {
             cmd.env(CLAIM_OWNED_ENV, item.to_string());
             cmd.env(LEASE_RENEW_STARTED_ENV, item.to_string());
         }
-        // A PR step's item is a PR: both markers name an issue, and
-        // `build-gate.sh` would back off the PR number as one (#11906).
+        // A non-Builder step holds no issue claim (and a PR step's item is a
+        // PR, which `build-gate.sh` would back off as an issue, #11906).
         None => {
             cmd.env_remove(CLAIM_OWNED_ENV);
             cmd.env_remove(LEASE_RENEW_STARTED_ENV);
