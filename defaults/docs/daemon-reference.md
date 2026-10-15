@@ -229,6 +229,7 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `sweep.issue.{N}.resume_dispatched` | Daemon reaper (#4256) | `{pr, checkpoint_phase?, dispatched, repo?}` |
 | `sweep.global.dispatch`   | Daemon                          | `{sweep_id, kind}` |
 | `sweep.global.completed`  | Daemon                          | `{sweep_id, outcome}` |
+| `step.item.{N}.ended`     | Step tick settle pass (#12152)  | `{item, role, class, reason, ran_for_sec, repo?}`: one per ended step, after the step ledger classified it (`item` is the PR for a PR step); the narration sink's completion trigger for a merged Champion merge step |
 | `epic.issue.{N}.decompose` | Epic supervisor (#3842)        | `{epic, action, state}` |
 | `epic.issue.{N}.expand`    | Epic supervisor (#3842)        | `{epic, action, state}` |
 | `epic.issue.{N}.join`      | Epic supervisor (#3842)        | `{epic, action, state}` |
