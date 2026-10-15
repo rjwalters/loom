@@ -2464,13 +2464,13 @@ blocker is Loom-owned:
   `.loom/install-metadata.json` at HEAD, at the branch tip and at
   `origin/<default>`, plus the metadata file. Missing or unparseable metadata
   on any side means nothing is repaired. Because only the installer writes
-  `installed_files`, a file a later release added is missing from it, so the
-  surfaces the resync overwrites wholesale also count (#11989): anything under
-  `.loom/{roles,scripts,docs,runtimes,bin,hooks}/`, `.claude/commands/loom/`
-  and `.agents/skills/loom-*/`, and the single files `.loom/pricing.json`,
-  `.loom/biome.jsonc`, `.claude/biome.jsonc`, `.claude/README.md` and
-  `.github/CONFIGURATION.md`. A path pinned in `.loom/resync-ignore` is never
-  counted that way. Every local commit (and every commit
+  `installed_files`, a file a later release added is missing from it, so a
+  path also counts (#11989) when the payload embedded in the daemon ships a
+  file at that destination. A repo-local file the resync never touches
+  (`.loom/roles/custom-role.md`, `.claude/commands/loom/mine.md`) does not,
+  and a `.agents/skills/` file also needs the generation marker. A path pinned in `.loom/resync-ignore` (also as
+  `agents-skills/<rel>`) is never counted that way. A checkout on a named
+  branch other than the default is left alone. Every local commit (and every commit
   of an in-progress rebase, merge or cherry-pick) may change only those paths,
   and so may every dirty tracked path. Dirt counts only on a checkout that is
   behind. Untracked files are never touched; one where `origin` writes a file
@@ -2487,7 +2487,9 @@ blocker is Loom-owned:
   left alone: it already serves current files (2am's `provision.sh` keeps
   geode-fem detached at its newest green commit this way). The branch tip gets
   its `-branch` rescue ref, then `checkout -B <default> --track
-  origin/<default>`.
+  origin/<default>`. A pinned checkout that must stay detached while behind
+  (geode-fem while main is red) opts out with `git config --local
+  loom.checkoutFf.detached keep`.
 - **Repair, in order.** `refs/loom/rescue/<UTC ts>` at HEAD (and `<ts>-branch`
   at the branch tip when an operation moved HEAD); the lock; `stash push` of
   the dirty paths as `loom-rescue-<ts>` (not during an operation, whose abort
