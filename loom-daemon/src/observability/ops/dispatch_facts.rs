@@ -23,6 +23,11 @@
 //!   names the repo from the checkout's `origin` remote (the memoised read the
 //!   tick's listings already make), never a local path.
 //!
+//! - **How long the step gather took, and what it covered** (#12074).
+//!   `loom.dispatch.gather_ms`, `loom.dispatch.repos_gathered`,
+//!   `loom.dispatch.repos_skipped` and `loom.dispatch.gather_truncated`, so a
+//!   gather the tick deadline cut short is visible rather than silent.
+//!
 //! Everything here reads what the tick already computed; it adds no forge
 //! call.
 
@@ -101,6 +106,12 @@ pub fn tick_attributes(
     }
     if let Some(repos) = halted_repos {
         out.push(("loom.dispatch.halted_repos".into(), repos));
+    }
+    if let Some(g) = report.gather {
+        out.push(("loom.dispatch.gather_ms".into(), g.gather_ms.to_string()));
+        out.push(("loom.dispatch.repos_gathered".into(), g.repos_gathered.to_string()));
+        out.push(("loom.dispatch.repos_skipped".into(), g.repos_skipped.to_string()));
+        out.push(("loom.dispatch.gather_truncated".into(), g.truncated.to_string()));
     }
     out
 }
@@ -278,5 +289,25 @@ mod tests {
         let points = tick_points(&report, Some(cap));
         assert_eq!(points.len(), 2, "configured and ram only; no prefiltered counter at zero");
         assert!(tick_attributes(&report, None, None).len() == 1);
+    }
+
+    /// #12074: the step gather's figures ride the tick span.
+    #[test]
+    fn the_gather_figures_are_tick_attributes() {
+        let report = TickReport {
+            gather: Some(crate::step_dispatch::gather_budget::GatherStats {
+                gather_ms: 91_000,
+                repos_gathered: 40,
+                repos_skipped: 22,
+                truncated: true,
+            }),
+            ..TickReport::default()
+        };
+        let attrs = tick_attributes(&report, None, None);
+        let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("loom.dispatch.gather_ms"), Some("91000"));
+        assert_eq!(get("loom.dispatch.repos_gathered"), Some("40"));
+        assert_eq!(get("loom.dispatch.repos_skipped"), Some("22"));
+        assert_eq!(get("loom.dispatch.gather_truncated"), Some("true"));
     }
 }

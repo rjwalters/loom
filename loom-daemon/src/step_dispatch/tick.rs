@@ -140,6 +140,7 @@ pub fn disposition_of(reason: &str) -> Qd {
         | "model_runtime_mismatch"
         | "admission_refused" => Qd::HostConstraint,
         "roll_paused" => Qd::DeferredCapacity,
+        "workspace_commands_missing" => Qd::WorkspaceCommandsMissing,
         PASS_REPO_CAP => Qd::DeferredRepoCap,
         PASS_MERGE => Qd::PeerClaim,
         _ => Qd::DispatchError,
@@ -175,7 +176,7 @@ pub fn exclude_claimed(w: &mut Weighing, claims: &DrawClaims) {
 /// Take every Builder step out of `w`'s pool, as a `shared_pr` pass: the
 /// repo's open-PR listing failed, so a PR linked only by its branch is
 /// invisible and a Builder step could duplicate it. Pure.
-pub fn exclude_builders(w: &mut Weighing) {
+pub fn exclude_builders(w: &mut Weighing) -> usize {
     use super::item_draw::Exclusion;
     let before = w.pool.len();
     w.pool
@@ -186,6 +187,7 @@ pub fn exclude_builders(w: &mut Weighing) {
             .entry(Exclusion::Pass(PassReason::SharedPr))
             .or_default() += removed;
     }
+    removed
 }
 
 /// The closed-set skip reason a spawn refusal reads as on `pick.decision`.

@@ -367,6 +367,24 @@ impl SweepRegistryConfig {
             .join("sweep.md")
             .exists()
     }
+
+    /// The workspace file holding `role`'s slash command (`/loom:<role>`).
+    #[must_use]
+    pub fn role_command_path(&self, role: crate::step_role::StepRole) -> PathBuf {
+        self.workspace_root
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .join(format!("{}.md", role.role_name()))
+    }
+
+    /// Whether `role`'s command is absent from this workspace (#12048): the
+    /// step-dispatch counterpart of [`Self::has_sweep_command`]. One `stat`
+    /// that follows symlinks, so a dangling one counts as missing.
+    #[must_use]
+    pub fn role_command_missing(&self, role: crate::step_role::StepRole) -> bool {
+        !self.role_command_path(role).exists()
+    }
 }
 
 /// In-memory registry of dispatched sweeps.
@@ -697,7 +715,7 @@ pub struct SweepRegistry {
     /// #4256 resume decision, and its #4366 no-progress predicate) — none of
     /// which should be forced to `&mut self` for what is a pure read-through
     /// cache. Never held across a `gh` invocation.
-    open_pr_memo: Mutex<HashMap<u32, OpenPrMemoEntry>>,
+    open_pr_memo: Arc<Mutex<HashMap<u32, OpenPrMemoEntry>>>,
     /// When each *source* most recently observed `spawn-claude.sh`'s
     /// token-selection pre-flight step being unsatisfiable (exit 78 /
     /// `EX_CONFIG`), keyed by
@@ -825,7 +843,7 @@ pub struct SweepRegistry {
     /// env override is checked before this cache on every call — env reads
     /// are free and tests toggle the var directly, so caching it would only
     /// add a staleness hazard for zero benefit.
-    owner_repo_cache: Mutex<Option<(String, String)>>,
+    owner_repo_cache: Arc<Mutex<Option<(String, String)>>>,
     /// In-flight idempotency-key -> sweep-id map (Issue #9572).
     ///
     /// [`find_running_by_key`](Self::find_running_by_key) — the step-1 dedup
@@ -857,6 +875,10 @@ pub struct SweepRegistry {
     inflight_idempotency: HashMap<String, SweepId>,
     /// #10974: the dispatch gate a daemon roll closes (`roll_gate`).
     roll_gate: roll_gate::RollGate,
+    /// #12048: roles whose missing workspace command has already been WARNed
+    /// about, so the refusal logs once rather than every tick. A role leaves
+    /// the set when its command file is seen again.
+    missing_command_warned: HashSet<&'static str>,
 }
 
 /// Env var restoring the pre-#6322 behavior of publishing this host's RAW
@@ -1060,7 +1082,7 @@ impl SweepRegistry {
             decline_cooldown: HashMap::new(),
             prless_retry_config: PrlessRetryConfig::default(),
             prless_retry: PrlessTally::default(),
-            open_pr_memo: Mutex::new(HashMap::new()),
+            open_pr_memo: Arc::new(Mutex::new(HashMap::new())),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
@@ -1069,9 +1091,10 @@ impl SweepRegistry {
             start_facts: HashMap::new(),
             pending_group_reaps: HashMap::new(),
             activity_window: None,
-            owner_repo_cache: Mutex::new(None),
+            owner_repo_cache: Arc::new(Mutex::new(None)),
             inflight_idempotency: HashMap::new(),
             roll_gate: roll_gate::RollGate::default(),
+            missing_command_warned: HashSet::new(),
         }
     }
 

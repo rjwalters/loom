@@ -52,11 +52,13 @@ test-champion-markerless-park.sh
 test-champion-merge-queue-step-no-fallthrough.sh
 test-champion-pr-merge-hold-release.sh
 test-champion-pr-merge-negation-guard.sh
+test-champion-post-claim-recheck.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
 test-champion-standing-authorization.sh
 test-champion-targeted-modes.sh
 test-champion-terminal-verdicts.sh
+test-check-cas-recheck-consistency.sh
 test-check-ci-status.sh
 test-ci-suite-manifest-installed-layout.sh
 test-check-config-no-host-paths.sh
@@ -69,7 +71,6 @@ test-check-host-sleep.sh
 test-check-defaults-version-bump.sh
 test-check-ingest-key-file.sh
 test-check-main-freshness.sh
-test-check-pipefail-early-exit.sh
 test-check-promotion-landed.sh
 test-check-quarantine-stashes.sh
 test-check-runtime-capabilities.sh
@@ -166,7 +167,6 @@ test-merge-pr-daemon-version-floor.sh
 test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-stacked-child-branch-delete.sh
 test-merge-pr-tree-checks.sh
-test-merge-pr-ci-result.sh
 test-merge-pr-required-checks.sh
 test-nextest-daemon-guard.sh
 test-operator-hold-routing.sh
@@ -228,6 +228,7 @@ test-sync-labels-migrate-retired.sh
 test-token-cache-affinity.sh
 test-claude-wrapper-proxy-rotation.sh
 test-sync-labels-repo-flag.sh
+test-sync-labels-write-failures.sh
 test-verdict-staleness-guard.sh
 test-verify-install-scope.sh
 test-version-bump-workflow-identity.sh

@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
-use loom_daemon::telemetry::{TelemetryEnvelope, TelemetryRecord};
 use std::os::unix::fs::PermissionsExt;
 
 const ESTIMATE: &str = "<!-- loom:estimate lines=12 files=1 doctor_risk=0.1 -->";
@@ -141,33 +140,20 @@ fn invalid_newest_marker_never_falls_back_to_an_older_valid_one() {
 }
 
 #[test]
-fn trusted_comment_marker_projects_labels_and_journals_points() {
+fn trusted_comment_marker_projects_labels_and_writes_no_telemetry() {
     let forge = Forge::new(
         &issue(ESTIMATE, "OWNER", &["loom:curating", "points:3"]),
         &serde_json::json!([comment("<!-- loom:points=5 -->", "MEMBER")]),
     );
     let id = uuid::Uuid::new_v4().to_string();
-    let before = Utc::now();
     forge.run(&id).unwrap();
     let writes = forge.label_writes();
     assert_eq!(writes.len(), 2, "{writes:?}");
     assert!(writes[0].contains("-X POST") && writes[0].contains("labels[]=points:5"));
     assert!(writes[0].contains("labels[]=loom:curated"));
     assert!(writes[1].contains("-X DELETE") && writes[1].ends_with("labels/points%3A3 --silent"));
-    let journal = forge.journal();
-    assert_eq!(journal.len(), 1);
-    let saved: TelemetryEnvelope =
-        serde_json::from_slice(&std::fs::read(&journal[0]).unwrap()).unwrap();
-    let TelemetryRecord::IssueEstimate(r) = saved.record else {
-        panic!("wrong kind")
-    };
-    assert_eq!(r.points, Some(5));
-    assert_eq!((r.repo.as_str(), r.issue), ("fixture/repo", 42));
-    assert_eq!(r.model.as_deref(), Some("actual-curator-model"));
-    assert_eq!(r.runtime.as_deref(), Some("codex"));
-    assert_eq!(r.estimate.lines, 12);
-    // Dated after the forge read completed.
-    assert!(r.estimated_at >= before + chrono::Duration::milliseconds(40));
+    // The daemon emits `issue.estimate` (#12118); this command journals nothing.
+    assert!(forge.journal().is_empty());
 }
 
 #[test]
@@ -200,27 +186,17 @@ fn comment_beats_body_and_body_counts_only_for_a_trusted_author() {
 }
 
 #[test]
-fn retry_reapplies_journaled_labels_without_a_second_journal_file() {
+fn retry_after_a_failed_label_write_reresolves_points_and_journals_nothing() {
     let forge = Forge::new(
         &issue(ESTIMATE, "OWNER", &["points:13"]),
         &serde_json::json!([comment("<!-- loom:points=3 -->", "MEMBER")]),
     );
     let id = uuid::Uuid::new_v4().to_string();
-    // The journal lands, then the label write fails.
     std::fs::write(forge.dir.path().join("fail-writes"), b"").unwrap();
     assert!(forge.run(&id).is_err());
-    let journal = forge.journal();
-    assert_eq!(journal.len(), 1);
-    let original = std::fs::read(&journal[0]).unwrap();
-    // The marker changes, but a retry projects the journaled points.
-    std::fs::write(
-        forge.dir.path().join("comments.json"),
-        serde_json::json!([comment("<!-- loom:points=8 -->", "MEMBER")]).to_string(),
-    )
-    .unwrap();
+    assert!(forge.journal().is_empty());
     std::fs::remove_file(forge.dir.path().join("fail-writes")).unwrap();
     forge.run(&id).unwrap();
-    assert_eq!(forge.log().matches("/comments").count(), 1, "{}", forge.log());
     let writes = forge.label_writes();
     let last_post = writes.iter().rfind(|w| w.contains("-X POST")).unwrap();
     assert!(last_post.contains("labels[]=points:3"), "{writes:?}");
@@ -228,8 +204,7 @@ fn retry_reapplies_journaled_labels_without_a_second_journal_file() {
         .last()
         .unwrap()
         .ends_with("labels/points%3A13 --silent"));
-    assert_eq!(forge.journal(), journal);
-    assert_eq!(std::fs::read(&journal[0]).unwrap(), original);
+    assert!(forge.journal().is_empty());
 }
 
 #[test]

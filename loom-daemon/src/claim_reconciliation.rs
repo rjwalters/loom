@@ -2011,6 +2011,8 @@ pub(crate) mod open_pr_hold;
 pub(crate) mod open_pr_listing;
 /// The lease gate on PR-side reclaims (#11911).
 mod pr_lease_gate;
+/// The startup pass's zero-evidence reclaim stops at this daemon's own claims (#12222).
+mod startup_cutoff;
 
 /// The facade glue every `gh` call below goes through (#10089), and the
 /// version-keyed reuse of its per-PR reads — sibling files per the ratchet.
@@ -2338,6 +2340,12 @@ pub mod forge {
             now,
             is_startup,
         );
+        // #12222: the work finder may tick while this pass still runs.
+        let cutoff = is_startup
+            .then(crate::daemon_startup_reconciliation::claim_cutoff)
+            .flatten();
+        let decisions =
+            super::startup_cutoff::demote_post_cutoff_claims(decisions, &issues, cutoff, root);
         let checked = decisions.len();
 
         // Issue #6286 (Epic #6165 Phase 2): resolved once per pass, not per

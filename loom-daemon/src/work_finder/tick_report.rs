@@ -87,6 +87,10 @@ pub struct TickReport {
     /// an operator tells them apart by the admission span, which only an
     /// in-dispatch refusal has.
     pub pr_open_prefiltered: usize,
+    /// The step gather's cost and coverage this tick (#12074): how long it
+    /// took, how many repos it read and how many the tick deadline cut.
+    /// `None` when no step gather ran.
+    pub gather: Option<crate::step_dispatch::gather_budget::GatherStats>,
     /// Issues skipped because a **peer host** advertised a live soft claim over
     /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
     /// distinct reason — never folded into [`collisions`](Self::collisions)

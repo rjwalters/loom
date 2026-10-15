@@ -6,8 +6,7 @@
 //! item (Judge, Doctor, Champion merge) is a **PR** number, and keying on it
 //! would trace a Doctor step on PR #M under a story #M that does not exist,
 //! and stamp its commits with it. So a PR step is re-keyed to the issue its
-//! PR closes, the same linkage the held view applies
-//! (`observability/fleet_state/step_rows.rs`): one REST read of the PR body,
+//! PR closes: one REST read of the PR body,
 //! its single closing reference. No single closing reference, a failed read,
 //! or a fixture without forge access: `None`, an untraced story rather than
 //! a wrong one.

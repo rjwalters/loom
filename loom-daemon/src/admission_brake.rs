@@ -648,7 +648,7 @@ impl BrakeSnapshot {
 /// the pure [`decide`].
 #[derive(Debug)]
 pub struct SharedAdmissionBrake {
-    config: AdmissionBrakeConfig,
+    config: Mutex<AdmissionBrakeConfig>,
     inner: Mutex<BrakeRuntime>,
 }
 
@@ -659,14 +659,17 @@ impl SharedAdmissionBrake {
     #[must_use]
     pub fn new(config: AdmissionBrakeConfig) -> Self {
         Self {
-            config,
+            config: Mutex::new(config),
             inner: Mutex::new(BrakeRuntime::default()),
         }
     }
 
     #[must_use]
     pub fn config(&self) -> AdmissionBrakeConfig {
-        self.config
+        *self
+            .config
+            .lock()
+            .expect("admission brake config mutex poisoned")
     }
 
     /// Fold one load reading into the brake, returning the decision plus any
@@ -711,13 +714,14 @@ impl SharedAdmissionBrake {
         in_flight_sweeps: usize,
         active_role_agents: usize,
     ) -> (BrakeDecision, Option<Transition>) {
-        let mut raw = decide(&self.config, loadavg_1m, ncpu, cpu_idle_fraction);
+        let cfg = self.config();
+        let mut raw = decide(&cfg, loadavg_1m, ncpu, cpu_idle_fraction);
         let mut guard = self.inner.lock().expect("admission brake mutex poisoned");
         let was_held = guard.held;
         // ---- sustain gate (#11709): one noisy reading never holds ---------
         if raw.held {
             guard.over_ticks = guard.over_ticks.saturating_add(1);
-            if guard.over_ticks < self.config.sustain_ticks.max(1) {
+            if guard.over_ticks < cfg.sustain_ticks.max(1) {
                 raw.held = false;
             }
         } else {
@@ -732,9 +736,9 @@ impl SharedAdmissionBrake {
         );
         let bar = format!(
             "holds at ≥ {:.2}/core AND ≥ {:.0}% CPU busy for {} tick(s)",
-            self.config.load_per_core_threshold,
-            self.config.cpu_busy_threshold * 100.0,
-            self.config.sustain_ticks.max(1)
+            cfg.load_per_core_threshold,
+            cfg.cpu_busy_threshold * 100.0,
+            cfg.sustain_ticks.max(1)
         );
 
         // ---- starvation bookkeeping (#5715) --------------------------
@@ -763,7 +767,7 @@ impl SharedAdmissionBrake {
         let mut decision = raw;
         let mut starvation_transition = None;
         if let Some(secs) = starving_elapsed_secs {
-            if secs >= self.config.starvation_escape_secs {
+            if secs >= cfg.starvation_escape_secs {
                 // Escape hatch: yield this one tick regardless of load, so a
                 // brake that cannot itself reduce the load it is reacting to
                 // cannot starve sweep admission forever.
@@ -786,7 +790,7 @@ impl SharedAdmissionBrake {
                 guard.starving_since = None;
                 guard.starving_ticks = 0;
                 guard.starvation_phase = StarvationPhase::None;
-            } else if secs >= self.config.starvation_warn_secs
+            } else if secs >= cfg.starvation_warn_secs
                 && guard.starvation_phase == StarvationPhase::None
             {
                 guard.starvation_phase = StarvationPhase::Warned;
@@ -798,7 +802,7 @@ impl SharedAdmissionBrake {
                          is running for the brake to drain — the escape hatch admits one sweep \
                          anyway after {} (Issue #5715){role_clause}",
                         format_hms(secs),
-                        format_hms(self.config.starvation_escape_secs)
+                        format_hms(cfg.starvation_escape_secs)
                     ),
                 });
             }
@@ -851,7 +855,8 @@ impl SharedAdmissionBrake {
     /// Whether the brake is currently holding new admissions.
     #[must_use]
     pub fn is_holding(&self) -> bool {
-        if !self.config.enabled {
+        let cfg = self.config();
+        if !cfg.enabled {
             return false;
         }
         self.inner
@@ -863,70 +868,27 @@ impl SharedAdmissionBrake {
     /// A snapshot for the status surface.
     #[must_use]
     pub fn snapshot(&self) -> BrakeSnapshot {
+        let cfg = self.config();
         let guard = self.inner.lock().expect("admission brake mutex poisoned");
         BrakeSnapshot {
-            enabled: self.config.enabled,
-            held: self.config.enabled && guard.held,
+            enabled: cfg.enabled,
+            held: cfg.enabled && guard.held,
             load_per_core: guard.last_load_per_core,
-            load_per_core_threshold: self.config.load_per_core_threshold,
+            load_per_core_threshold: cfg.load_per_core_threshold,
             held_since: guard.held_since,
             held_ticks: guard.held_ticks,
             starving_since: guard.starving_since,
             starving_ticks: guard.starving_ticks,
             escape_hatch_grants: guard.escape_hatch_grants,
-            starvation_warn_secs: self.config.starvation_warn_secs,
-            starvation_escape_secs: self.config.starvation_escape_secs,
+            starvation_warn_secs: cfg.starvation_warn_secs,
+            starvation_escape_secs: cfg.starvation_escape_secs,
         }
     }
 }
 
-/// Render a duration in seconds as a compact `HhMMmSSs`-ish human string —
-/// e.g. `65` → `1m05s`, `3725` → `1h02m`, `42` → `42s` (Issue #5715). Used
-/// only in starvation log lines, where naming the elapsed hold duration is
-/// the whole point (a bare tick/second count reads as noise next to a
-/// multi-hour outage).
-fn format_hms(total_secs: i64) -> String {
-    let total_secs = total_secs.max(0);
-    let h = total_secs / 3600;
-    let m = (total_secs % 3600) / 60;
-    let s = total_secs % 60;
-    if h > 0 {
-        format!("{h}h{m:02}m")
-    } else if m > 0 {
-        format!("{m}m{s:02}s")
-    } else {
-        format!("{s}s")
-    }
-}
-
-/// The role-agent attribution clause appended to the starvation messages
-/// (Issue #6102). Empty when no role agent is in flight — the pre-#6102
-/// wording is then already accurate.
-///
-/// # Why the messages needed this
-///
-/// The brake's guarantee is narrower than its own text implied. It samples
-/// **host-wide** load, so a role agent's CPU absolutely pushes it over the hold
-/// threshold — but the only thing it can withhold is a NEW *sweep* admission.
-/// It has no authority over role-runner agents (they are admitted by
-/// [`crate::role_runner`]'s own loops, bounded by their share of the one host
-/// budget, #6102 and #11911, never by this brake), and it can shed nothing already
-/// running. So "held, 0 sweeps in flight" does **not** imply an idle host, and
-/// saying "nothing is running to relieve it" was wrong in exactly the case that
-/// matters: a host loaded entirely by role ticks.
-#[must_use]
-fn role_agent_clause(active_role_agents: usize) -> String {
-    if active_role_agents == 0 {
-        return String::new();
-    }
-    format!(
-        " — NOTE: {active_role_agents} role-runner agent(s) ARE running; the brake cannot hold \
-         those back (they are admitted outside it, within the one host budget — lower \
-         autonomous.workFinder.maxConcurrent to bound them) and cannot shed load already in \
-         flight, so this \
-         load may be role-driven rather than idle (#6102)"
-    )
-}
+// Starvation-message helpers (moved out under the file-size ratchet, #12090).
+mod messages;
+use messages::{format_hms, role_agent_clause};
 
 /// Process-global brake handle. The daemon registers one at startup (alongside
 /// the host breaker) so [`crate::ipc::build_daemon_status`] can read it without
@@ -1044,6 +1006,10 @@ pub fn global_observe(
 pub fn global_snapshot() -> Option<BrakeSnapshot> {
     GLOBAL.get().map(|b| b.snapshot())
 }
+
+// #12090: hot-reload of the thresholds (`set_config`, `global_reload`).
+mod live_reload;
+pub use live_reload::{global_reload, reload};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]

@@ -11,9 +11,11 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use chrono::Utc;
 
+use super::gather_budget::{deadline_passed, GatherWalk, Starvation, GUARANTEED_FLOOR};
 use super::item_draw::{weigh, ItemWeights, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
@@ -22,7 +24,7 @@ use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::repo_cap::{RepoCap, RepoLimits};
-use crate::work_finder::step_item::Lane;
+use crate::work_finder::step_item::{Lane, Step};
 use crate::work_finder::{workspace_draw, RedMainLane, RegistryDispatcher, TickReport};
 use crate::workspace_pool::WorkspacePool;
 
@@ -44,6 +46,9 @@ pub struct TickInputs<'a> {
     pub max_admissions: usize,
     pub saturation_held: bool,
     pub limits: RepoLimits,
+    /// The tick's wall-clock deadline (#12074): past it, no further repo is
+    /// gathered. `None`: gather every repo.
+    pub deadline: Option<Instant>,
 }
 
 /// What a workspace's listing said beyond its items.
@@ -63,18 +68,53 @@ pub struct ListingState {
 /// - A Builder claim is a blind label flip: no Builder step when the open-PR
 ///   listing failed (a branch-only PR is invisible) or the items are the
 ///   last good listing, not this tick's.
-/// - A red repo held for its fixes keeps only its red-main fixes.
+/// - A red repo held for its fixes keeps its red-main fixes and every step
+///   that adds no code to a red `main`: Builder and `ChampionMerge` run only
+///   for a red-main fix, so a fix PR can still be reviewed and repaired.
+///
+/// Returns how many Builder steps the listing held (#12025): the step path
+/// fails closed on a listing it cannot vouch for, and never falls back to a
+/// per-item open-PR probe.
 pub fn shape_pool(
     weighing: &mut super::item_draw::Weighing,
     claims: &crate::sweep_registry::step_spawn::draw_claims::DrawClaims,
     listing: ListingState,
-) {
+) -> usize {
     tick::exclude_claimed(weighing, claims);
-    if !listing.pulls_complete || listing.stale_listing {
-        tick::exclude_builders(weighing);
-    }
+    let held = if !listing.pulls_complete || listing.stale_listing {
+        tick::exclude_builders(weighing)
+    } else {
+        0
+    };
     if listing.fixes_only {
-        weighing.pool.retain(|c| c.item.lane == Lane::RedMain);
+        weighing.pool.retain(|c| {
+            c.item.lane == Lane::RedMain || !matches!(c.step, Step::Builder | Step::ChampionMerge)
+        });
+    }
+    held
+}
+
+/// Record on `report` what workspace `idx`'s listings cost this tick
+/// (#12025): a failed item listing is a listing failure with its error
+/// kind; items read from the last good listing are an incomplete listing;
+/// Builder steps held because a listing could not vouch for them are one
+/// `forge_listing` error, so `loom.dispatch.error_kind` names why the repo
+/// drew no Builder step. Pure.
+pub fn note_listing(
+    report: &mut TickReport,
+    idx: usize,
+    failed: Option<&anyhow::Error>,
+    listing: Option<ListingState>,
+    builders_held: usize,
+) {
+    if let Some(e) = failed {
+        report.note_listing_failure(idx, e);
+    }
+    if let Some(listing) = listing {
+        report.note_listing(idx, !listing.stale_listing);
+    }
+    if builders_held > 0 {
+        report.note_error(crate::work_finder::DispatchErrorKind::ForgeListing);
     }
 }
 
@@ -96,15 +136,20 @@ pub fn actionable_point(
     )
 }
 
-/// The step tick's state across ticks: the stage-entry provider's cache.
+/// The step tick's state across ticks: the stage-entry provider's cache,
+/// and where the next gather starts (#12074).
 pub struct StepDriver {
     provider: StageEntryProvider,
+    next_start: usize,
+    starvation: Starvation,
 }
 
 impl Default for StepDriver {
     fn default() -> Self {
         Self {
             provider: StageEntryProvider::load(default_cache_path(), DEFAULT_EVENTS_BUDGET),
+            next_start: 0,
+            starvation: Starvation::default(),
         }
     }
 }
@@ -172,11 +217,17 @@ impl StepDriver {
         let occupied: Vec<usize> = registries.iter().map(occupancy).collect();
         let held_capabilities = crate::capability::held_capabilities();
         let mut workspaces = Vec::new();
-        let mut listing_failed = Vec::new();
+        // Per workspace: (idx, failed listing, listing state, Builders held).
+        let mut notes: Vec<(usize, Option<anyhow::Error>, Option<ListingState>, usize)> =
+            Vec::new();
         // `loom.step.actionable{repo}`: the drawable depth the stalled and
         // idle alerts key on. Absent, never 0, for a repo not listed.
         let mut actionable = Vec::new();
-        for (idx, root) in input.roots.iter().enumerate() {
+        // #12074: walk from where the last truncated tick stopped; past the
+        // deadline, gather no further repo.
+        let mut walk = GatherWalk::new(input.roots.len(), self.next_start, Instant::now());
+        for idx in walk.order().collect::<Vec<_>>() {
+            let root = &input.roots[idx];
             // Record the steps that ended since the last tick first, so the
             // cooldowns they arm hold for this draw.
             super::step_end::settle(root, &registries[idx]);
@@ -202,6 +253,23 @@ impl StepDriver {
                 });
                 continue;
             }
+            if !walk.admit(idx, deadline_passed(input.deadline, Instant::now())) {
+                continue;
+            }
+            // The repo a tick always gathers gets a real read budget, even
+            // past the deadline; a repo starved for several ticks gets one
+            // tick on the writer (#12074).
+            let _floor = walk.is_guaranteed().then(|| {
+                crate::gh_invocation::read_deadline::at_least(Instant::now() + GUARANTEED_FLOOR)
+            });
+            let escalated = self.starvation.escalate(root);
+            let _writer = escalated.then(|| {
+                log::info!(
+                    "work_finder: {repo}: reads shed for several ticks; this tick may use the \
+                     writer (#12074)"
+                );
+                crate::gh_invocation::read_deadline::allow_writer()
+            });
             let registry = &registries[idx];
             let red = |fixes: Vec<crate::work_finder::WorkItem>| {
                 let mut fixes = fixes;
@@ -219,11 +287,17 @@ impl StepDriver {
                 Ok(Some(g)) => g,
                 Ok(None) => continue,
                 Err(e) => {
+                    self.starvation.record(root, true, escalated);
                     log::warn!("work_finder: {}: step listing failed: {e:#}", root.display());
-                    listing_failed.push(idx);
+                    notes.push((idx, Some(e), None, 0));
                     continue;
                 }
             };
+            self.starvation.record(
+                root,
+                gathered.stale_listing || !gathered.pulls_complete,
+                escalated,
+            );
             let (mut cooldowns, pool_exhausted_roles, claims) = registry.lock().map_or_else(
                 |_| (Default::default(), BTreeSet::new(), Default::default()),
                 |reg| (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims()),
@@ -239,15 +313,24 @@ impl StepDriver {
                 cooldowns,
             };
             let mut weighing = weigh(&gathered.inputs, &ctx, &ItemWeights::for_root(root));
-            shape_pool(
-                &mut weighing,
-                &claims,
-                ListingState {
-                    pulls_complete: gathered.pulls_complete,
-                    stale_listing: gathered.stale_listing,
-                    fixes_only,
-                },
-            );
+            let listing = ListingState {
+                pulls_complete: gathered.pulls_complete,
+                stale_listing: gathered.stale_listing,
+                fixes_only,
+            };
+            let held = shape_pool(&mut weighing, &claims, listing);
+            if held > 0 {
+                log::warn!(
+                    "work_finder: {repo}: {held} Builder step(s) held this tick: the {} cannot \
+                     vouch for them (fail closed, #12025)",
+                    if gathered.stale_listing {
+                        "item listing is the last good one"
+                    } else {
+                        "open-PR listing could not be read"
+                    }
+                );
+            }
+            notes.push((idx, None, Some(listing), held));
             actionable.extend(actionable_point(&repo, Some(&weighing)));
             workspaces.push(StepWorkspace {
                 idx,
@@ -258,6 +341,19 @@ impl StepDriver {
                 created_at: gathered.created_at,
             });
         }
+        let gather = walk.stats(Instant::now());
+        self.next_start = walk.next_start();
+        if gather.truncated {
+            log::warn!(
+                "work_finder: step gather truncated by the tick deadline after {}ms: {} repo(s) \
+                 gathered, {} skipped; the next tick starts at the first skipped (#12074)",
+                gather.gather_ms,
+                gather.repos_gathered,
+                gather.repos_skipped
+            );
+        }
+        // The draw keeps its workspace order whatever the walk's rotation.
+        workspaces.sort_by_key(|w| w.idx);
         crate::observability::ops::emit_metrics(actionable);
         if let Err(e) = self.provider.flush() {
             log::debug!("work_finder: stage-entry cache not written: {e}");
@@ -274,6 +370,9 @@ impl StepDriver {
             host: crate::sweep_registry::host_identity(),
             tick_counter: tick::next_tick_counter(),
         };
+        // The draw spawns from what was gathered: its pre-claim reads run
+        // normally, outside the gather's read deadline (#12074).
+        let _spawning = crate::gh_invocation::read_deadline::suspend();
         let result = tick::run(
             workspaces,
             StepTickLimits {
@@ -292,7 +391,10 @@ impl StepDriver {
             &mut spawner,
         );
         let mut report = result.report;
-        report.listing_failed = listing_failed;
+        report.gather = Some(gather);
+        for (idx, failed, listing, held) in &notes {
+            note_listing(&mut report, *idx, failed.as_ref(), *listing, *held);
+        }
         report.occupancy = Some(total + report.dispatched);
         report.note_halts(input.halted, Some(input.halt_causes), input.roots.len());
         if !result.passes.is_empty() {

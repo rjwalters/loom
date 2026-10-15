@@ -1,11 +1,12 @@
 //! Runtime admission and traced invocation for scheduled roles.
 use super::*;
+use crate::observability::lifecycle::pre_launch;
 
 impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
         let trace_root = self.workspace_root.clone();
-        let (outcome, context) =
-            crate::observability::lifecycle::role_invocation(&trace_root, role, || {
+        let (outcome, context, unlaunched) =
+            crate::observability::lifecycle::role_invocation_classified(&trace_root, role, || {
                 let script = match self.resolve_spawn_bin() {
                     Ok(p) => p,
                     Err(e) => {
@@ -14,6 +15,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                             role,
                             &format!("spawn-bin unresolved: {e}"),
                         );
+                        pre_launch::note(pre_launch::SPAWN_BIN_UNRESOLVED);
                         return RoleTickOutcome::Failure(e);
                     }
                 };
@@ -215,6 +217,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 )
             });
         self.trace_context = context;
+        self.unlaunched_failure = unlaunched;
         outcome
     }
 
@@ -224,5 +227,9 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
 
     fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
         self.trace_context.clone()
+    }
+
+    fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
+        self.unlaunched_failure.clone()
     }
 }

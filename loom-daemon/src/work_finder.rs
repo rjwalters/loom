@@ -193,12 +193,11 @@ pub const DEFAULT_WORK_FINDER_MAX_CONCURRENT: usize = 20;
 /// uncontrolled burst.
 ///
 /// Precedence is the standard **env > config
-/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default**, resolved once at
-/// daemon startup via [`read_work_finder_config`] → `config_resolver` — the
-/// same startup-capture pattern as `cpuUtilizationTarget` / `estCoresPerSweep`
-/// (#4032): the *inputs* (occupancy, live headroom) are re-read every tick, but
-/// this *knob* takes effect only on daemon restart unless a future change
-/// moves knob resolution into the tick loop itself. A zero/unparseable value is
+/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default**. Since #12090 the
+/// config layer is re-read every multi-workspace tick
+/// ([`ConfiguredMaxReloader::max_admissions_per_tick`]), so a fleet-store edit
+/// hot-applies; this env override, being process environment, is read only at
+/// daemon start. A zero/unparseable value is
 /// dropped (falls through to config/default) — a zero cap would silently
 /// freeze the loop at its current occupancy forever, which is a footgun, not a
 /// deliberate "pause" (use the main-health-gate halt or a scheduled drain for
@@ -236,6 +235,7 @@ pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
 mod recheck_interval;
+pub mod startup_gate;
 pub mod step_item;
 mod tick_line;
 mod tick_report;
@@ -1111,16 +1111,10 @@ fn env_max_admissions_per_tick() -> Option<usize> {
 }
 
 /// Resolve the per-tick admission (ramp) cap with precedence **env > config
-/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default** (#4234).
-/// Resolved once at daemon startup — the same startup-capture pattern as
-/// [`resolve_max_concurrent_with_config`] — and threaded through to
-/// [`spawn_work_finder_task`] / [`spawn_multi_work_finder_task`] as a plain
-/// `usize`. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for why this is a
-/// deliberate startup-capture, not a per-tick re-read: the ramp cap's whole
-/// purpose is to smooth admission *within* the live per-tick re-computation of
-/// `max_concurrent`, so it does not itself need to be live — an operator
-/// retuning it takes effect on the next daemon restart (unlike
-/// `configured_max`, which hot-applies since #9060).
+/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default** (#4234). The
+/// production multi-workspace loop re-reads it every tick since #12090 (via
+/// [`configured_max::resolve_admissions_with_source`]); the single-workspace
+/// reference loop still takes it as a fixed `usize`.
 #[must_use]
 pub fn resolve_max_admissions_per_tick_with_config(config: &WorkFinderConfig) -> usize {
     env_max_admissions_per_tick()
@@ -1329,7 +1323,6 @@ pub fn spawn_multi_work_finder_task(
     fallback_root: PathBuf,
     interval: Duration,
     configured_max: ConfiguredMax,
-    max_admissions_per_tick: usize,
     health_states: Arc<WorkspaceHealthStates>,
     suppress_dispatch_during_gate: bool,
     event_bus: Arc<EventBus>,
@@ -1341,11 +1334,18 @@ pub fn spawn_multi_work_finder_task(
     // actually finished. That pass now runs on a blocking thread rather than
     // blocking `run_daemon` itself, so this is what still guarantees no sweep
     // is admitted before a startup reclaim of a stale `loom:building` claim
-    // has landed.
-    mut startup_reconciliation_ready: tokio::sync::watch::Receiver<bool>,
+    // has landed. Since #12222 the wait is bounded: see `startup_gate`.
+    mut startup_reconciliation_ready: tokio::sync::watch::Receiver<
+        crate::daemon_startup_reconciliation::StartupPasses,
+    >,
 ) -> tokio::task::JoinHandle<()> {
-    configured_max::log_loop_start(interval, configured_max, max_admissions_per_tick);
+    configured_max::log_loop_start(interval, configured_max);
+    // #12222: about daemon start (spawned during `run_daemon` startup).
+    let spawned_at = std::time::Instant::now();
     tokio::spawn(async move {
+        // #12073: a per-host delay before the first gather, so a fleet that
+        // restarts together does not gather all at once. First run only.
+        crate::startup_jitter::wait_first_run(&fallback_root, "work_finder").await;
         // #9060: the operator ceiling is re-resolved every tick (see the
         // `configured_max` module) — no longer a frozen startup value.
         let mut configured_max_reload =
@@ -1364,12 +1364,17 @@ pub fn spawn_multi_work_finder_task(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;
-        // Block the loop's first REAL tick body until the startup
-        // reconciliation pass has finished (#6615/#7974). Already-`true`
-        // resolves instantly (the common case: the pass is almost always
-        // faster than one tick interval), so this never adds latency once the
-        // pass has completed — including on every tick after the first.
-        let _ = startup_reconciliation_ready.wait_for(|ready| *ready).await;
+        // Block the loop's first REAL tick body until the startup passes
+        // have finished (#6615/#7974) — but the forge-bound claim pass only
+        // up to a cap (#12222): it took 20–40+ min on a host with hundreds of
+        // open-PR claims. Ticking past the cap is safe; see `startup_gate`.
+        // Already-finished resolves instantly, and only the first tick waits.
+        let startup_outcome = startup_gate::wait(
+            &mut startup_reconciliation_ready,
+            startup_gate::wait_cap(&fallback_root),
+        )
+        .await;
+        let mut first_tick = startup_gate::FirstTick::new(spawned_at, startup_outcome);
         let mut was_halted = false;
         let mut was_pressured = false;
         // #9410/#10624: the build back-off's per-repo (and optional host
@@ -1402,6 +1407,8 @@ pub fn spawn_multi_work_finder_task(
         let mut step_driver = crate::step_dispatch::driver::StepDriver::default();
         loop {
             ticker.tick().await;
+            // #12074: one INFO line per tick body, and its wall-clock deadline.
+            let tick_budget = crate::step_dispatch::gather_budget::begin_tick(&fallback_root);
 
             // #8121: reload the registry and provision any newly-registered
             // root's `SweepRegistry` BEFORE the rate-limit breaker check
@@ -1458,6 +1465,8 @@ pub fn spawn_multi_work_finder_task(
             // `maxConcurrentPerRepo` hot-applies exactly as the ceiling does.
             // `None` (the default) leaves dispatch byte-for-byte pre-#9090.
             let max_concurrent_per_repo = configured_max_reload.per_repo();
+            // #12090: and the per-tick admission (ramp) cap, from the same read.
+            let max_admissions_per_tick = configured_max_reload.max_admissions_per_tick();
             // `fallback_root` (the daemon's own seeded default) may not itself
             // be a recognized Loom workspace — e.g. a machine-level daemon
             // started under systemd with a bare `$HOME` cwd — in which case
@@ -1500,6 +1509,11 @@ pub fn spawn_multi_work_finder_task(
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
             let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
+            // #12074: from here to the step tick nothing awaits, so every forge
+            // read in between is bounded by the tick deadline and fails fast
+            // past it; a listing does not fall through to the writer.
+            let tick_deadline = std::time::Instant::now() + tick_budget;
+            let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline, true);
 
             // `roots` was already resolved (registry reload + missing-root
             // filtering) by `refresh_local_workspace_state` above, before the
@@ -1711,7 +1725,9 @@ pub fn spawn_multi_work_finder_task(
                 max_admissions: max_admissions_per_tick,
                 saturation_held,
                 limits: (max_concurrent_per_repo, ram_budget, disk_budget).into(),
+                deadline: Some(tick_deadline),
             });
+            drop(read_scope);
 
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
@@ -1786,6 +1802,8 @@ pub fn spawn_multi_work_finder_task(
                     draining,
                 );
             }
+            // #12222: time from daemon start to the first completed tick.
+            first_tick.completed(&event_bus);
         }
     })
 }

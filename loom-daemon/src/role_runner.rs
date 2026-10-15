@@ -845,6 +845,13 @@ pub trait RoleInvocationRunner {
     fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
         None
     }
+
+    /// Why the most recent invocation failed before it launched, so no
+    /// `role_attempt` span (and no [`trace_context`](Self::trace_context))
+    /// carries the class (#12028).
+    fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
+        None
+    }
 }
 
 /// The concrete [`RoleInvocationRunner`]: shells out to
@@ -882,6 +889,7 @@ pub struct ScriptRoleInvocationRunner {
     /// [`invoke`]: RoleInvocationRunner::invoke
     resolved_launch: Option<crate::role_tick_telemetry::ResolvedLaunch>,
     trace_context: Option<crate::observability::lifecycle::RoleTrace>,
+    unlaunched_failure: Option<crate::observability::lifecycle::RoleFailure>,
     /// Set by [`roll_resume`] when this runner relaunches a session a daemon
     /// roll paused (#10832), instead of starting a fresh tick.
     roll_resume: Option<roll_resume::RoleRollResume>,
@@ -900,6 +908,7 @@ impl ScriptRoleInvocationRunner {
             gh_bin: None,
             resolved_launch: None,
             trace_context: None,
+            unlaunched_failure: None,
             roll_resume: None,
         }
     }

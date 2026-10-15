@@ -1815,6 +1815,10 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
         return;
     }
 
+    // #11194: report-only visibility for directories no cleanup class owns.
+    // Runs in `--dry-run` too; never removes, adopts, or feeds eligibility.
+    super::unrecognized_report::report(repo_root, &worktrees_dir);
+
     // #5895 (AC1): deregister worktrees whose directory is already gone
     // *before* enumerating and attempting removal, so a registration git can
     // already see is stale never reaches the removal loop as a candidate

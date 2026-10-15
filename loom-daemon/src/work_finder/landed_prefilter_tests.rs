@@ -423,5 +423,169 @@ fn an_unanswered_query_removes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// Cost (#12205)
+// ---------------------------------------------------------------------------
+
+/// The step gather hands every `loom:issue` item over, open PR or not. A
+/// candidate with an open PR is never asked about, so a workspace whose only
+/// unanswered candidate has a PR in review makes no query, tick after tick.
+/// Before #12205 its verdict was dropped and it was re-asked every tick.
+#[test]
+fn a_candidate_with_an_open_pr_is_never_asked_about() {
+    let mut forge = FakeForge::default();
+    forge.graph.insert(5, None);
+    forge.graph.insert(6, None);
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+    for tick in 0..10u64 {
+        let now = t0 + Duration::from_secs(60 * tick);
+        assert!(detect(&mut forge, &mut cache, &[5, 6], &[5], now).is_empty());
+    }
+    assert_eq!(forge.asked, vec![vec![6]], "one query, and never for #5");
+}
+
+/// A cached verdict makes no forge call: ticks inside the verdict's life
+/// cost nothing, and a candidate that turns up later brings the half-aged
+/// verdicts along, so the workspace's verdicts expire together and it pays
+/// one query per half [`LANDED_RECHECK`] at most, not one per tick.
+#[test]
+fn cached_verdicts_make_no_call_and_expiries_are_coalesced() {
+    let mut forge = FakeForge::default();
+    for n in [5, 6, 7] {
+        forge.graph.insert(n, None);
+    }
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+    let minute = Duration::from_secs(60);
+    detect(&mut forge, &mut cache, &[5], &[], t0);
+    for m in 1..20u32 {
+        detect(&mut forge, &mut cache, &[5], &[], t0 + minute * m);
+    }
+    assert_eq!(forge.asked, vec![vec![5]], "a cached verdict makes no forge call");
+
+    // #6 is new at minute 20: asked, and #5 (20 minutes old) rides along.
+    detect(&mut forge, &mut cache, &[5, 6], &[], t0 + minute * 20);
+    assert_eq!(forge.asked.last().unwrap(), &vec![6, 5]);
+    // #7 at minute 25: #5 and #6 are only 5 minutes old, so #7 goes alone.
+    detect(&mut forge, &mut cache, &[5, 6, 7], &[], t0 + minute * 25);
+    assert_eq!(forge.asked.last().unwrap(), &vec![7]);
+    // Up to minute 45 every verdict is fresh: no call at all.
+    for m in 26..45u32 {
+        detect(&mut forge, &mut cache, &[5, 6, 7], &[], t0 + minute * m);
+    }
+    assert_eq!(forge.asked.len(), 3, "{:?}", forge.asked);
+}
+
+/// An unanswered query is not repeated every tick: nothing is asked for
+/// [`LANDED_FAIL_BACKOFF`], then the question is asked again.
+#[test]
+fn an_unanswered_query_backs_off() {
+    struct Flaky {
+        up: bool,
+        asked: usize,
+    }
+    impl LandedForge for Flaky {
+        fn closing_verdicts(&mut self, issues: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
+            self.asked += 1;
+            self.up.then(|| issues.iter().map(|n| (*n, None)).collect())
+        }
+        fn labels(&mut self, _: u32) -> Result<Option<Vec<String>>> {
+            unreachable!()
+        }
+        fn route_marked(&mut self, _: u32, _: u32) -> Result<bool> {
+            unreachable!()
+        }
+        fn add_label(&mut self, _: u32, _: &str) -> bool {
+            unreachable!()
+        }
+        fn remove_label(&mut self, _: u32, _: &str) -> bool {
+            unreachable!()
+        }
+        fn comment(&mut self, _: u32, _: &str) -> bool {
+            unreachable!()
+        }
+    }
+    let mut forge = Flaky {
+        up: false,
+        asked: 0,
+    };
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+    for s in (0..LANDED_FAIL_BACKOFF.as_secs()).step_by(60) {
+        detect(&mut forge, &mut cache, &[1], &[], t0 + Duration::from_secs(s));
+        lift(&mut forge, &mut cache, &[1], t0 + Duration::from_secs(s));
+    }
+    assert_eq!(forge.asked, 1, "one query per backoff, not one per tick");
+    forge.up = true;
+    detect(&mut forge, &mut cache, &[1], &[], t0 + LANDED_FAIL_BACKOFF);
+    assert_eq!(forge.asked, 2);
+    detect(&mut forge, &mut cache, &[1], &[], t0 + LANDED_FAIL_BACKOFF);
+    assert_eq!(forge.asked, 2, "answered: cached again");
+}
+
+/// The pre-filter is off unless the live key says `true`.
+#[test]
+fn the_prefilter_is_off_unless_the_live_key_is_true() {
+    assert!(!prefilter_enabled_in(&json!({})));
+    assert!(!prefilter_enabled_in(&json!({ "autonomous": { "workFinder": {} } })));
+    assert!(!prefilter_enabled_in(
+        &json!({ "autonomous": { "workFinder": { "landedPrefilter": "yes" } } })
+    ));
+    assert!(!prefilter_enabled_in(
+        &json!({ "autonomous": { "workFinder": { "landedPrefilter": false } } })
+    ));
+    assert!(prefilter_enabled_in(
+        &json!({ "autonomous": { "workFinder": { "landedPrefilter": true } } })
+    ));
+
+    // Read live from the workspace's config: an edit applies on the next call.
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join(".loom/config.json");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    assert!(!prefilter_enabled(root.path()), "no config: off");
+    std::fs::write(&config, r#"{"autonomous":{"workFinder":{"landedPrefilter":true}}}"#).unwrap();
+    assert!(prefilter_enabled(root.path()));
+    std::fs::write(&config, r#"{"autonomous":{"workFinder":{"landedPrefilter":false}}}"#).unwrap();
+    assert!(!prefilter_enabled(root.path()));
+}
+
+/// The closes-graph read is a repo-targeted Hygiene read: the facade offers
+/// it to the reader pool, and with every reader out of budget it is shed
+/// (no request, no verdict) instead of spilling onto the dispatch App.
+#[test]
+fn the_closes_graph_read_goes_to_the_reader_pool_and_is_shed_not_spilled() {
+    use crate::forge_identity::{ExhaustCause, ReadClass, RouteDecision};
+    use crate::gh_invocation::test_routing::{install, seen, sheds, TestRouting};
+    let root = tempfile::tempdir().unwrap();
+    let _g = install(TestRouting {
+        decision: RouteDecision::Exhausted {
+            until: std::time::SystemTime::now() + Duration::from_secs(900),
+            cause: ExhaustCause::Budget,
+        },
+        env: Default::default(),
+        checkout: crate::gh_invocation::cwd_route::CwdAnswer::Sole("acme/shed".into()),
+        shed: true,
+    });
+    let mut forge = GhLandedForge {
+        gh_bin: PathBuf::from("gh"),
+        root: root.path().to_path_buf(),
+        slug: "acme/shed".to_string(),
+    };
+    assert_eq!(forge.closing_verdicts(&[5, 6]), None, "a shed is no verdict");
+    assert_eq!(sheds(), 1, "shed, never run on the writer");
+    let seen = seen();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].op, "work_finder.landed_closing_refs");
+    assert_eq!(seen[0].class, ReadClass::Hygiene);
+    let inv = closing_refs_invocation(std::path::Path::new("gh"), root.path(), "acme/shed", &[5])
+        .unwrap();
+    assert_eq!(inv.target().slug().as_deref(), Some("acme/shed"));
+    assert!(
+        closing_refs_invocation(std::path::Path::new("gh"), root.path(), "acme/x\"", &[5])
+            .is_none()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The tick seam
 // ---------------------------------------------------------------------------

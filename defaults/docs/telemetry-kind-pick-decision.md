@@ -25,8 +25,8 @@ A role record of a tick that launched carries that tick's trace and span id
 
 **No forge calls are added.** The work-finder record reads the
 `WorkFinderTickSummary` the tick already published. A role record reads the
-pick journal its agent wrote (rows `pr-queue` and the agent `gh` front had
-already fetched, and the argv of writes the agent was already issuing) and the
+pick journal (the PR queue the daemon fetched at dispatch, rows the agent `gh`
+front had already fetched, and the argv of writes the agent was already issuing) and the
 queue listing the role's own gate probe already fetched. Nothing is emitted, and
 no journal is created, when no OTLP exporter runs.
 
@@ -62,8 +62,8 @@ no journal is created, when no OTLP exporter runs.
   with a reason mapped from its `QueueDisposition`, and carries that
   disposition itself (`skipped[].disposition`, #11811).
 - **Judge, Doctor, Champion** (`candidate_source = serving_queue`). The rows of
-  the **latest** `loom-daemon pr-queue --role <role>` call the agent made during
-  the tick, in `pr_planning::ordered_queue` order (priority level,
+  the queue the daemon journaled when it launched the tick (#12119; the agent's
+  own `pr-queue` calls are not journaled), in `pr_planning::ordered_queue` order (priority level,
   interactive preference, fallback admission and each role's tie-breaks
   applied), so a fallback-only Judge queue is recorded even though the gate
   listing was empty. Earlier snapshots are not merged in: a refresh that
@@ -103,7 +103,7 @@ are no-ops:
 
 | Writer | Line | What it records |
 |---|---|---|
-| `loom-daemon pr-queue` (live mode) | `queue` | the ordered rows it prints, with labels and sort key; whether the agent's `gh` resolves to the agent `gh` front |
+| the daemon, at Judge/Doctor/Champion dispatch | `queue` | the ordered rows `pr-queue` would print, with labels and sort key; whether the agent's `gh` resolves to the agent `gh` front |
 | agent `gh` front, served `issue\|pr list` | `listing` | the rows served, after the caller's `--jq` |
 | agent `gh` front, every call | `act` | the forge writes in the argv: `issue\|pr edit --add-label`, `pr merge`, `pr review --approve\|--request-changes`, `gh api` label POSTs and merge PUTs |
 
@@ -113,13 +113,13 @@ record does not confirm the forge accepted them.
 
 A `queue` line keeps at most 200 rows but also records the queue's uncapped
 size, which becomes `candidates_total`. If the file is missing or unreadable
-(an agent that never ran `pr-queue` or the `gh` front writes none) nothing was
+(a tick whose launch journaled no queue and whose agent never used the `gh` front writes none) nothing was
 observed: `decisions_observed` is `false` and unexplained candidates stay
 undecided. A file that exists but is empty is an observed tick with no acts.
 
 A `queue` line keeps at most 200 rows but also records the queue's uncapped
 size, which becomes `candidates_total`. If the file is missing or unreadable
-(an agent that never ran `pr-queue` or the `gh` front writes none) nothing was
+(a tick whose launch journaled no queue and whose agent never used the `gh` front writes none) nothing was
 observed: `decisions_observed` is `false` and unexplained candidates stay
 undecided. A file that exists but is empty is an observed tick with no acts.
 
@@ -174,7 +174,7 @@ there. The step engine's weight-0 exclusions map through the parallel total matc
 ## Rank of an item in each role's latest candidate list
 
 For a record with `candidate_source = serving_queue` this is the item's rank in
-the role's own `pr-queue` order; for `listing`, in the order the role read it;
+the role's serving-queue order; for `listing`, in the order the role read it;
 for `gate_listing` (records before #11911), only the forge listing order (select
 `JSONExtractString(body, 'candidate_source')` to tell them apart).
 

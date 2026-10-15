@@ -444,7 +444,8 @@ fn tick_skip_reason(result: RoleTickResult) -> Option<PickSkipReason> {
         RoleTickResult::RuntimeRejected
         | RoleTickResult::SkippedModelRuntimeMismatch
         | RoleTickResult::SkippedLoad
-        | RoleTickResult::SkippedQueueEmpty => Some(PickSkipReason::TickSkipped),
+        | RoleTickResult::SkippedQueueEmpty
+        | RoleTickResult::SkippedDeferred => Some(PickSkipReason::TickSkipped),
     }
 }
 

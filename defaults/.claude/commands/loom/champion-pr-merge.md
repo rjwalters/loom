@@ -910,8 +910,8 @@ Keeping \`loom:pr\`. This PR stays in the queue and is re-checked each tick agai
   # per reason, the label only when missing), so safe every tick the hold
   # binds. Beside loom:pr with the marker it is Champion's own hold: the one
   # exception to the verdict-label invariant, served by `pr-queue --role
-  # champion`, so the release precheck still fires each tick. The stale-blocked
-  # release pass skips a reason-only record. Never applied in place of loom:pr.
+  # champion`, so the release precheck still fires each tick. Never applied in
+  # place of loom:pr.
   loom-daemon park-record apply --pr "$PR_NUMBER" --reason "champion merge-risk hold" \
     --by champion >/dev/null 2>&1 || true
 
@@ -1278,7 +1278,8 @@ echo "PASS: All CI checks passing"
 
 **A merge-risk hold governs *merging*. It does not suspend *health reporting*.**
 Before #6720 the sticky-hold bail-out skipped criteria #4/#5/#6 on a held PR,
-and #5's stale route is the only path from `loom:pr` to Doctor: 20 of 21 held
+and #5's stale route is the only path from `loom:pr` to Doctor (held: only if
+`HELD_CI_FAILING=true`, #6852): 20 of 21 held
 PRs sat `CONFLICTING` with Doctor's queue empty (2026-08-22).
 
 ### When this pass runs
@@ -1336,9 +1337,9 @@ The hold is unchanged and still governs the merge — this notice reports *healt
 
 **What happens next, without any human action:**
 - The hold keeps binding; Champion will not auto-merge a conflicted PR either way (criterion #4).
-- Once this PR passes the 24h recency window it is routed to Doctor (\`loom:pr\` → \`loom:changes-requested\`) for a rebase, **with the hold marker preserved** — a rebase does not launder a held PR into an unheld one.
+- The PR waits on the hold; it goes to Doctor (\`loom:changes-requested\`, hold kept) only if CI also fails (#6852).
 
-**What a human can do now**, if this should not wait for that window:
+**What a human can do now**, if this should not keep waiting:
 - Rebase it yourself, or
 - Clear the hold (start a comment with \`clear the hold — <why>\`) and let the normal conflict/Doctor flow take over.
 
@@ -1356,7 +1357,8 @@ queue is exactly "`loom:pr` + `CONFLICTING`", and it excludes every park —
 before (#5978) — so autonomous Finding Work never rebases and force-pushes a
 held PR. That exclusion is correct and this section does **not** reverse it: a
 held+conflicting PR is *surfaced* here, and only becomes Doctor's work through
-the recency route below, which lands it on `loom:changes-requested` (Doctor's
+the recency route below (only if `HELD_CI_FAILING=true`, #6852), which lands it
+on `loom:changes-requested` (Doctor's
 *Priority 2* queue, which serves `loom:changes-requested` + `loom:blocked` with
 a standing trusted Champion hold marker, #11861).
 Conflict alone is a report; conflict plus staleness is a route.
@@ -1884,10 +1886,10 @@ $QM" >/dev/null ;;
 esac
 fi
 
-# Forge-API merge: --auto merges HERE (#8410), head-SHA precondition (#5579),
-# --redate-stale-checks = #8248's remedy (#8508). 420s < 600000 ms (above).
+# Forge-API merge: --auto merges HERE (#8410), head-SHA precondition (#5579).
+# No re-date: a head whose checks are green is not re-tested because main moved (#12063). 420s < 600000 ms (above).
 [ "$MERGE_RC" -eq 0 ] && { LOOM_AUTO_MERGE_TIMEOUT=420 \
-  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks ${EXPECTED_HEAD:+--expected-head "$EXPECTED_HEAD"} || MERGE_RC=$?; }
+  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto ${EXPECTED_HEAD:+--expected-head "$EXPECTED_HEAD"} || MERGE_RC=$?; }
 
 if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ] || [ "$MERGE_RC" -eq 8 ] || [ "$MERGE_RC" -eq 9 ] || [ "$MERGE_RC" -eq 10 ]; then
   # Not failures: nothing merged, no "Merge Failed" comment. See "exit codes 3-7".
@@ -3152,14 +3154,13 @@ This PR met all safety criteria but the merge operation failed. A human will nee
 *Automated by Champion role*"
 ```
 
-### Exception: exit codes 3-7 — not merged, re-queue, not a failure (#5579, #8508, #8896, #10256)
+### Exception: exit codes 3-7 — not merged, re-queue, not a failure (#5579, #8896, #10256)
 
 Never the failure exit **1**; each means "the merge did not happen":
 
 - **3** — the head moved between the fresh head-SHA read and the merge call.
-- **4** — the #8248 freshness guard blocked the merge and `--redate-stale-checks`
-  ran that guard's own remedy (a tree-identical no-op commit). Nothing bypassed;
-  a spent budget (#9590) escalates to `loom:operator` and returns exit 1.
+- **4** — retired (#12063 slice 1): `merge-pr.sh` no longer re-dates checks, so
+  it never emits 4. Still re-queued if seen, for mixed versions mid-roll.
 - **5** — `--auto`'s bounded settle-wait expired; no required check went red.
   **Do not "fix" a recurring 5 by raising `LOOM_AUTO_MERGE_TIMEOUT`** (pinned
   under Step 3's own timeout, #9096); re-queuing is cheap.
@@ -3182,7 +3183,7 @@ Never the failure exit **1**; each means "the merge did not happen":
 - Leave `loom:pr`, move on. A later pass re-evaluates its safety criteria
   (`updatedAt`, CI) first.
 
-**`loom:pr` left after exit 3 or 4 does NOT carry the approval to the new head
+**`loom:pr` left after exit 3 does NOT carry the approval to the new head
 (#5686)**: the next pass's Verdict-State Janitor Part 2 resolves it; never
 re-merge on a later tick without it. Exits 5-7 move no head.
 
@@ -3193,7 +3194,7 @@ sentinel), once a re-read confirms it is not merged, gets one head-keyed
 never "Merge Failed" (an unobserved error that parks a mergeable PR on a
 human), and re-queues. It never fires on 3-7.
 
-Rationale (4's bound, 5's contract, why 3-7 stay silent, 7's old-daemon
+Rationale (5's contract, why 3-7 stay silent, 7's old-daemon
 path), the unknown-outcome recipe, and the merge-ancestry trap that defeats
 `git merge-base --is-ancestor` here:
 [`merge-pr-exit-code-exceptions.md`](../../../.loom/docs/merge-pr-exit-code-exceptions.md).

@@ -88,8 +88,8 @@ struct Fixture {
     registry: Arc<Mutex<SweepRegistry>>,
     log: PathBuf,
     /// The script the registry's `gh` runs; [`Self::reanswer`] rewrites it.
-    _inner: PathBuf,
-    _ws: WritableRoot,
+    inner: PathBuf,
+    ws: WritableRoot,
     _env: Env,
     _dir: tempfile::TempDir,
 }
@@ -128,11 +128,18 @@ impl Fixture {
         Self {
             registry: Arc::new(Mutex::new(SweepRegistry::new(config))),
             log,
-            _inner: inner,
-            _ws: ws,
+            inner,
+            ws,
             _env: env,
             _dir: dir,
         }
+    }
+
+    /// Rewrite the fake `gh`'s answers mid-test, keeping its call log.
+    fn reanswer(&self, pulls: impl FnOnce(&str) -> Pulls, legs: &str) {
+        let root = self.inner.parent().unwrap();
+        let script = fake_gh(root, &self.ws.repo, pulls(&self.ws.repo), legs);
+        write_executable(&self.inner, &script);
     }
 
     fn dispatcher(&self) -> RegistryDispatcher {
@@ -337,4 +344,27 @@ fn guards_off_means_no_prefilter_read() {
         .open_pr_blocked(&blocked_numbers())
         .is_empty());
     assert_eq!(fx.tally_from(before).total, 0, "{:?}", fx.calls());
+}
+
+/// #12025: one failed read does not blank the pre-filter. For
+/// `LISTING_REUSE_FOR` the last good listing answers; past it, nothing is
+/// verified. (Ported from the retired multi-workspace tick's test to the
+/// `open_pr_blocked` read that survives #11911.)
+#[test]
+#[serial]
+fn a_failed_read_reuses_the_last_good_listing_for_a_few_minutes() {
+    use crate::worktree_ops::linked_pr_listing::{age_good_listing, LISTING_REUSE_FOR};
+    let fx = Fixture::new(|repo| Pulls::Rows(vec![closing(repo, 9981, 8981)]), "");
+    let warm = fx.dispatcher().open_pr_blocked(&[8981, 8982]);
+    assert_eq!(warm.get(&8981), Some(&9981));
+
+    fx.reanswer(|_| Pulls::Failing, &fake_gh_graphql_arm("", 0));
+    let reused = fx.dispatcher().open_pr_blocked(&[8981, 8982]);
+    assert_eq!(reused.get(&8981), Some(&9981), "the last good listing answers");
+    assert!(!reused.contains_key(&8982), "{reused:?}");
+
+    let root = fx.inner.parent().unwrap().to_path_buf();
+    age_good_listing(&root, &fx.ws.repo, LISTING_REUSE_FOR + std::time::Duration::from_secs(1));
+    let expired = fx.dispatcher().open_pr_blocked(&[8981, 8983]);
+    assert!(expired.is_empty(), "past the window nothing is verified: {expired:?}");
 }

@@ -34,9 +34,12 @@
 //!   remove goes through `dispatch()`'s own guard chain, unchanged and still
 //!   authoritative; "not in the answer" is never cached as a permit.
 //! - **Remove on a guess.** Only a verified `Open` verdict from a listing that
-//!   was read removes a candidate. An unreadable listing, an unresolvable
-//!   repo, guards switched off, a poisoned lock: the answer is empty and every
-//!   candidate proceeds to `dispatch()` as on the pre-#8865 path.
+//!   was read removes a candidate. An unreadable listing (with no good
+//!   listing of the last
+//!   [`LISTING_REUSE_FOR`](crate::worktree_ops::linked_pr_listing::LISTING_REUSE_FOR)
+//!   to stand in, #12025), an unresolvable repo, guards switched off, a
+//!   poisoned lock: the answer is empty and every candidate proceeds to
+//!   `dispatch()` as on the pre-#8865 path.
 //! - **Reorder.** It runs at the dispatch point, after the #11103 workspace
 //!   draw and every admission gate, so the draw sees the same candidates and
 //!   makes the same rolls as without it. The candidates that survive are
@@ -62,7 +65,8 @@
 //! time a PR-blocked candidate was refused. Those candidates no longer reach
 //! 2.6, so [`blocked_in`] folds what the listing verified into the memo
 //! instead: `Open(pr)` records or refreshes the entry, a verified "no open
-//! PR" removes it, and an unreadable listing changes nothing. That keeps the
+//! PR" removes it, and an unreadable or reused (#12025) listing changes
+//! nothing. That keeps the
 //! guard's fallback alive for the tick the listing cannot be read: a fresh
 //! entry refuses at 2.5, and an entry of any age gives the known-PR recheck
 //! (`GET pulls/{pr}`) something to recheck when GraphQL and the timeline fail
@@ -95,21 +99,57 @@ use crate::worktree_ops::gh::OpenPrProbe;
 /// The conditional-read caller name of the pre-filter's listing read.
 const CALLER: &str = "work_finder.open_pr_prefilter";
 
+/// What a workspace's open-PR listing answered about its candidates
+/// ([`answer_in`], #12025).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenPrAnswer {
+    /// No listing was consulted (guards off, no resolvable repo, a dispatcher
+    /// without one): these are the verified-open candidates, if any, and
+    /// every other candidate goes to `dispatch()` as before #12025.
+    NotAsked(HashMap<u32, u32>),
+    /// A listing answered: `blocked` maps the candidates with a verified
+    /// open linked PR to it.
+    Listed { blocked: HashMap<u32, u32> },
+    /// The listing could not be read: no candidate is verified.
+    Unreadable,
+}
+
+impl OpenPrAnswer {
+    /// The verified-open candidates, each mapped to its PR.
+    #[must_use]
+    pub fn into_blocked(self) -> HashMap<u32, u32> {
+        match self {
+            Self::NotAsked(blocked) | Self::Listed { blocked } => blocked,
+            Self::Unreadable => HashMap::new(),
+        }
+    }
+}
+
 /// [`WorkDispatcher::open_pr_blocked`] for the production dispatcher: the
-/// issues in `candidates` with a verified open linked PR, from one read of the
-/// workspace's open-PR listing. Empty whenever that cannot be verified.
+/// verified-open part of [`answer_in`]. Empty whenever that cannot be
+/// verified.
+#[must_use]
+pub fn blocked_in(registry: &Arc<Mutex<SweepRegistry>>, candidates: &[u32]) -> HashMap<u32, u32> {
+    answer_in(registry, candidates).into_blocked()
+}
+
+/// The verdict for each of `candidates` from one read of the workspace's open-PR
+/// listing, or from the last good read of the past few minutes when this one
+/// fails (#12025). [`OpenPrAnswer::Unreadable`] when neither is there;
+/// [`OpenPrAnswer::NotAsked`] when the guards are off or the repo cannot be
+/// resolved, as `dispatch()`'s own 2.5/2.6 steps would not probe either.
 ///
 /// The registry lock is taken twice, briefly, and never across the listing
 /// read: once to copy the three inputs of the read
-/// (`SweepRegistry::open_pr_listing_target`), and once after it to fold the
-/// verified verdicts into the #6788 memo
+/// (`SweepRegistry::open_pr_listing_target`), and once after a fresh read to
+/// fold the verified verdicts into the #6788 memo
 /// (`SweepRegistry::fold_listing_verdicts`). Resolving the repo in the first
 /// can itself call `gh` (see that method); the listing read cannot stall a
 /// status IPC call the way the in-`dispatch()` guard chain can (#9573).
 #[must_use]
-pub fn blocked_in(registry: &Arc<Mutex<SweepRegistry>>, candidates: &[u32]) -> HashMap<u32, u32> {
+pub fn answer_in(registry: &Arc<Mutex<SweepRegistry>>, candidates: &[u32]) -> OpenPrAnswer {
     if candidates.is_empty() {
-        return HashMap::new();
+        return OpenPrAnswer::NotAsked(HashMap::new());
     }
     let target = match registry.lock() {
         Ok(reg) => reg.open_pr_listing_target(),
@@ -119,38 +159,47 @@ pub fn blocked_in(registry: &Arc<Mutex<SweepRegistry>>, candidates: &[u32]) -> H
         }
     };
     let Some((gh, root, owner_repo)) = target else {
-        return HashMap::new();
+        return OpenPrAnswer::NotAsked(HashMap::new());
     };
     let timeout = Some(crate::sweep_registry::reaper::reap_gh_timeout());
     let asked = (owner_repo.as_str(), candidates);
     let read_started = chrono::Utc::now();
     let listed =
         crate::worktree_ops::linked_pr_listing::probe_many(CALLER, &gh, &root, asked, timeout);
-    let Some(verdicts) = listed else {
+    let Some(listed) = listed else {
         log::debug!(
-            "work_finder: open-PR pre-filter for {owner_repo} has no listing this tick; all {} \
-             candidate(s) go to dispatch() and its own guard, and the open-PR memo is left as \
-             it was (#8865)",
+            "work_finder: open-PR pre-filter for {owner_repo} has no listing this tick and none \
+             recent; its {} candidate(s) fail closed, and the open-PR memo is left as it was \
+             (#8865, #12025)",
             candidates.len()
         );
-        return HashMap::new();
+        return OpenPrAnswer::Unreadable;
     };
-    // Keep the #6788 memo fed: these candidates no longer reach the 2.6 probe
-    // that used to write it. A second short lock, after the read, no forge
-    // call inside it.
-    match registry.lock() {
-        Ok(reg) => reg.fold_listing_verdicts(read_started, &verdicts),
-        Err(poisoned) => {
-            log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+    let verdicts = listed.verdicts;
+    if let Some(age) = listed.reused {
+        log::debug!(
+            "work_finder: open-PR pre-filter for {owner_repo}: listing read failed; using the \
+             last good listing, {}s old (#12025)",
+            age.as_secs()
+        );
+    } else {
+        // Keep the #6788 memo fed: these candidates no longer reach the 2.6
+        // probe that used to write it. A second short lock, after the read,
+        // no forge call inside it. Never from a reused listing: its verdicts
+        // are not as of `read_started`.
+        match registry.lock() {
+            Ok(reg) => reg.fold_listing_verdicts(read_started, &verdicts),
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+            }
         }
     }
-    let blocked: HashMap<u32, u32> = verdicts
-        .iter()
-        .filter_map(|(issue, verdict)| match verdict {
-            OpenPrProbe::Open(pr) => Some((*issue, *pr)),
-            OpenPrProbe::NoneOpen | OpenPrProbe::ProbeFailed => None,
-        })
-        .collect();
+    let mut blocked = HashMap::new();
+    for (issue, verdict) in &verdicts {
+        if let OpenPrProbe::Open(pr) = verdict {
+            blocked.insert(*issue, *pr);
+        }
+    }
     log::debug!(
         "work_finder: open-PR pre-filter for {owner_repo}: {} of {} candidate(s) have an open \
          linked PR, from one listing read (#8865)",
@@ -158,7 +207,7 @@ pub fn blocked_in(registry: &Arc<Mutex<SweepRegistry>>, candidates: &[u32]) -> H
         candidates.len()
     );
     log_changes(&root, &blocked);
-    blocked
+    OpenPrAnswer::Listed { blocked }
 }
 
 /// What the pre-filter last reported blocked, per workspace root.
