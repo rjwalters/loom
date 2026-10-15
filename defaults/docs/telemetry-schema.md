@@ -22,6 +22,7 @@ writing) will additionally push these records to a cloud backend.
 - [`/ingest` response (the bound-`host_id` echo)](#ingest-response-the-bound-host_id-echo)
 - [`RepoVisibility` contract — private by default](#repovisibility-contract--private-by-default)
 - [Exported-facts contract (external ETA consumers, #11098)](#exported-facts-contract-external-eta-consumers-11098)
+- [Span join-facts contract (external provenance join, #11982)](#span-join-facts-contract-external-provenance-join-11982)
 - [Record kinds](#record-kinds)
 - [Persistence & read surface (`sweep.outcome`, Issue #4704)](#persistence--read-surface-sweepoutcome-issue-4704)
 - [Refreshing the model rate card](#refreshing-the-model-rate-card)
@@ -259,6 +260,34 @@ unchanged, pinned by that module's serialization test.
 has that name. Stage exits were exported as `eta.stage_outcome`, from the
 stage journal until #11126 and from `fleet.state` views since.
 
+
+## Span join-facts contract (external provenance join, #11982)
+
+Provenance is moving out of Loom (parent #11776): an external join
+(2AMLogic/2am#4370) rebuilds story/build/sweep → PR linkage from telemetry
+instead of from stamps in commits, PR bodies and comments. This section is the
+stable contract for the plain span attributes that join reads. Changes are
+additive only; a key is never renamed, removed or re-meant without an issue the
+join's owner has agreed to. No `schema_version` bump is needed for a new key.
+
+| Fact | Key | On which spans | Notes |
+|---|---|---|---|
+| repo | `loom.repo` | sweep root, phase/role spans, role-tick root and story copies | GitHub's own `owner/name` spelling when `repo_id` resolved, else the `origin`-derived slug |
+| issue | `loom.issue` | sweep root (**even when `repo_id` does not resolve**), phase/role spans, story copies; role-tick root when the tick was assigned one | A role tick that picks its own target has `loom.issue` only on its story copy spans, never on its root |
+| sweep id | `loom.sweep_id` | every span of the execution | A role tick's id is `role-<role>-<instant>` |
+| PR number | `loom.pr_number` | phase/role spans once a PR exists; role-tick root of an assigned or claiming Judge/Doctor; story copies of PR targets | Absent before a PR exists |
+| head SHA | `loom.head_sha` | sweep root | Full 40-hex tip of `feature/issue-N` (local, else `origin`), read when the sweep closes. The branch does not exist at dispatch, so the root cannot carry it earlier. Absent if the branch never existed |
+| base SHA | `loom.base_sha` | sweep root | Full 40-hex tip of `origin/HEAD` (else `origin/main`) at dispatch |
+| build version | `loom.daemon.version` | every span | `CARGO_PKG_VERSION` of the binary that created the span |
+| build commit | `loom.daemon.revision` | every span | Full git SHA of that binary; `loom.daemon.tree_state` says whether it was clean |
+| host | `host.id` / `host.name` / `service.instance.id` | OTLP `Resource`, not a span attribute | One value per exporting host; see [Envelope](#envelope) |
+| role | `loom.role` | phase/role spans, role-tick root and story copies | |
+
+A fact that is not known when a span is created is attached when it first is,
+and an unresolvable fact is omitted rather than guessed. Every key above
+survives the daemon's span allow-list (`telemetry/trace/span.rs`) and the
+collector's span `keep_keys` (`defaults/observability/collector/config.yaml`); the
+sweep-root keys are asserted in `observability/lifecycle/tests.rs`.
 
 ## Record kinds
 

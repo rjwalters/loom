@@ -212,6 +212,8 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.story.key_version"
                     | "loom.issue"
                     | "loom.pr_number"
+                    | "loom.base_sha"
+                    | "loom.head_sha"
                     | "loom.role"
                     | "loom.phase"
                     | "loom.attempt"

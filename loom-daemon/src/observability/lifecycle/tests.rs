@@ -952,3 +952,45 @@ fn long_multibyte_admission_values_survive_the_export_allowlist() {
         assert_eq!(exported["loom.runtime"], "codex");
     }
 }
+
+/// #11982: the sweep root names its issue and base SHA even when `repo_id` did
+/// not resolve (no story), and gains the issue branch's head SHA at close.
+#[test]
+fn sweep_root_carries_issue_and_commit_facts_without_a_story() {
+    let (dir, base, head) = git_facts::tests::repo_with_branch();
+    let root_dir = dir.path();
+    std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
+    std::fs::write(
+        root_dir.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let mut command = Command::new("true");
+    TraceStore::new(root_dir)
+        .load_or_create_story(root_dir, "sweep-11982", None)
+        .unwrap();
+    prepare_execution(&mut command, root_dir, "sweep-11982", None, Some(42));
+    let journal = Journal::for_context(&TraceStore::new(root_dir).path(root_dir, "sweep-11982"));
+    let open = journal.active().unwrap();
+    let attrs = &open[0].record.attributes;
+    assert_eq!(attrs["loom.issue"], "42");
+    assert_eq!(attrs["loom.base_sha"], base);
+    assert!(!attrs.contains_key("loom.head_sha"), "no PR head at dispatch");
+    finish_execution(root_dir, "sweep-11982", "success", TraceAttributes::new()).unwrap();
+    let spans = drained_spans(&journal);
+    let sweep = spans.iter().find(|s| s.name == SpanName::Sweep).unwrap();
+    assert_eq!(sweep.attributes["loom.issue"], "42");
+    assert_eq!(sweep.attributes["loom.base_sha"], base);
+    assert_eq!(sweep.attributes["loom.head_sha"], head);
+    // Survives the export allowlist, so an external join can read it.
+    let exported = sweep.clone().bounded();
+    for key in [
+        "loom.issue",
+        "loom.base_sha",
+        "loom.head_sha",
+        "loom.sweep_id",
+        "loom.repo",
+    ] {
+        assert!(exported.attributes.contains_key(key), "{key} dropped at export");
+    }
+}
