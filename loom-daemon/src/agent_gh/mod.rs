@@ -38,8 +38,11 @@
 //! spend lands in the same per-bucket rollup (`loom-daemon forge calls`).
 //! Both kinds of row are stamped with the agent role and `served` /
 //! `passthrough` ([`crate::forge_call_stats::agent`], #10607).
-//! `forge_etag_store::fetch_conditional` already routes served reads to a
-//! repo's reader App when one is configured (#9537).
+//! `forge_etag_store::fetch_conditional` routes served reads through the
+//! gateway-first read router ([`crate::forge_gateway`]): the owner's gateway profile
+//! (`LOOM_GH_GATEWAY_DIR`), else a reader App from the daemon's root
+//! (`LOOM_GH_READER_ROOT`, #12207), else the session's credential. Writes and
+//! unclassified calls always keep the session's credential (the writer).
 
 pub mod classify;
 pub mod go_sort;
@@ -210,6 +213,9 @@ pub fn run(raw: &[OsString]) -> i32 {
         // 2am#4367 P4: the gateway profiles the daemon exported, if this
         // front's `gh` is the one it version-checked.
         crate::forge_gateway::enable_front(&next);
+        // #12207: and the daemon's reader pool, for the served reads no
+        // gateway profile answers (gateway, then readers, then the writer).
+        crate::forge_identity::enable_front_readers();
         if let Some(out) = serve(raw, &next) {
             record("revalidated", raw);
             let mut stdout = std::io::stdout().lock();

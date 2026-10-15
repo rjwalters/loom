@@ -228,6 +228,7 @@ test-sync-labels-migrate-retired.sh
 test-token-cache-affinity.sh
 test-claude-wrapper-proxy-rotation.sh
 test-sync-labels-repo-flag.sh
+test-sync-labels-write-failures.sh
 test-verdict-staleness-guard.sh
 test-verify-install-scope.sh
 test-version-bump-workflow-identity.sh

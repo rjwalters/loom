@@ -1416,6 +1416,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // shared `workspace_pool`. Empty registry ⇒ the single `sweep_workspace`.
         //
         // `startup_reconciliation_ready` (Issue #7974) is awaited internally
+        // (bounded since #12222, see `work_finder::startup_gate`)
         // before the loop's first real tick — see `spawn_startup_passes`'s doc
         // comment above for why this is what still keeps the
         // reconcile-before-dispatch invariant (#6615) intact now that the

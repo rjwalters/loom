@@ -541,3 +541,19 @@ fn a_stale_reader_token_yields_to_the_next_reader_not_the_writer() {
     let (_, app) = read_credential_in(tmp.path(), &r, repo, SystemTime::now()).unwrap();
     assert_eq!(app, second.app_id);
 }
+
+/// #12207: the reader root a session is given is a directory with a
+/// `.loom/` beside it, never a relative or blank value.
+#[test]
+fn a_reader_root_is_an_absolute_workspace_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(reader_root_from(Some(tmp.path().as_os_str().into())), None, "no .loom/");
+    std::fs::create_dir(tmp.path().join(".loom")).unwrap();
+    assert_eq!(
+        reader_root_from(Some(tmp.path().as_os_str().into())),
+        Some(tmp.path().to_path_buf())
+    );
+    assert_eq!(reader_root_from(Some("rel/ws".into())), None);
+    assert_eq!(reader_root_from(Some(std::ffi::OsString::new())), None);
+    assert_eq!(reader_root_from(None), None);
+}
