@@ -410,33 +410,71 @@ fn n_blocked_candidates_cost_one_listing_read_and_no_issue_read() {
     assert!(fx.backed_off().is_empty(), "no dispatch backoff armed");
 }
 
-/// AC3: with the listing unreadable the pre-filter skips nothing, and each
-/// candidate is refused by `dispatch()`'s own guard through its GraphQL
-/// fallback, exactly as on the pre-#8865 path.
+/// #12025: with the listing unreadable (and no recent good one) the
+/// workspace fails closed. No candidate reaches `dispatch()`, so no per-issue
+/// probe runs: no closes-graph, no timeline walk, no issue read. Each is one
+/// `forge_listing` error. The pre-#8865 path, for contrast, probed each one.
 #[test]
 #[serial]
-fn an_unreadable_listing_leaves_every_candidate_to_the_dispatch_guard() {
+fn an_unreadable_listing_fails_closed_with_no_per_issue_probe() {
     let numbers = [8701, 8702, 8703];
     let fx = Fixture::new(|_| Pulls::Failing, "9700");
     let (report, _) = tick_one(fx.dispatcher(), &numbers, 5);
 
     assert_eq!(report.pr_open_prefiltered, 0, "nothing verified, nothing pre-filtered");
-    assert_eq!(report.skipped_pr_open, 3, "the in-dispatch guard refused all three");
-    assert_eq!(report.admissions.len(), 3, "each was a real dispatch attempt");
-    assert_eq!((report.dispatched, report.errors), (0, 0));
+    assert_eq!(report.skipped_pr_open, 0, "no dispatch() guard ran");
+    assert!(report.admissions.is_empty(), "no dispatch attempt: {:?}", report.admissions);
+    assert_eq!((report.dispatched, report.errors), (0, 3));
+    assert_eq!(report.error_kind(), Some("forge_listing"));
+    for row in &report.queue {
+        assert_eq!(row.disposition, Some(crate::types::QueueDisposition::DispatchError));
+    }
     let calls = fx.tally_from(0);
-    assert!(
-        calls.graphql >= 3,
-        "the guard's closes-graph fallback ran per candidate: {calls:?}"
-    );
-    // The failed read backs off (`LISTING_RETRY_AFTER`): the outage costs one
-    // listing call, not one for the pre-filter plus one per candidate.
+    assert_eq!((calls.graphql, calls.issue), (0, 0), "no per-issue probe: {:?}", fx.calls());
     assert_eq!(calls.listing, 1, "{calls:?}");
+    for issue in numbers {
+        assert_eq!(fx.failure_count(issue), 0, "no backoff armed for #{issue}");
+    }
 
-    // The same tick through the pre-#8865 dispatcher is the same report.
+    // The same tick through the pre-#8865 dispatcher: one probe per candidate.
     let fx_before = Fixture::new(|_| Pulls::Failing, "9700");
     let (before, _) = tick_one(BeforePrefilter(fx_before.dispatcher()), &numbers, 5);
-    assert_eq!(report, before);
+    assert_eq!((before.skipped_pr_open, before.admissions.len()), (3, 3));
+    assert!(fx_before.tally_from(0).graphql >= 3, "{:?}", fx_before.calls());
+}
+
+/// #12025: one failed read does not blank the pre-filter. For
+/// `LISTING_REUSE_FOR` the last good listing answers: its `Open` candidate is
+/// pre-filtered, its `NoneOpen` one is dispatched. Past it, the workspace
+/// fails closed.
+#[test]
+#[serial]
+fn a_failed_read_reuses_the_last_good_listing_for_a_few_minutes() {
+    use crate::worktree_ops::linked_pr_listing::{age_good_listing, LISTING_REUSE_FOR};
+    let fx = Fixture::new(|repo| Pulls::Rows(vec![closing(repo, 9981, 8981)]), "");
+    // A good read, as the previous tick's.
+    let warm = fx.dispatcher().open_pr_blocked(&[8981, 8982]);
+    assert_eq!(warm.get(&8981), Some(&9981));
+
+    fx.reanswer(|_| Pulls::Failing, &fake_gh_graphql_arm("", 0));
+    let (reused, _) = tick_one(fx.dispatcher(), &[8981, 8982], 5);
+    assert_eq!((reused.pr_open_prefiltered, reused.skipped_pr_open), (1, 1));
+    assert_eq!((reused.dispatched, reused.errors), (1, 0), "{:?}", reused.queue);
+
+    let root = fx.inner.parent().unwrap().to_path_buf();
+    age_good_listing(&root, &fx.ws.repo, LISTING_REUSE_FOR + Duration::from_secs(1));
+    let before = fx.calls().len();
+    let (expired, _) = tick_one(fx.dispatcher(), &[8981, 8983], 5);
+    assert_eq!((expired.dispatched, expired.pr_open_prefiltered), (0, 0));
+    assert_eq!((expired.errors, expired.error_kind()), (2, Some("forge_listing")));
+    // (The sweep dispatched for #8982 above may still be talking to `gh`.)
+    let held = fx.calls()[before..].to_vec();
+    assert!(
+        !held
+            .iter()
+            .any(|c| c.contains("8981") || c.contains("8983")),
+        "no per-issue read for a held candidate: {held:?}"
+    );
 }
 
 /// What links and what does not is the guard's own classifier: a fork PR from
@@ -520,7 +558,10 @@ fn an_unblocked_candidate_is_dispatched_in_the_same_tick() {
 /// records the verified PR in the memo although the 2.6 probe never ran for
 /// it, so on a following tick where the listing, the closes-graph and the
 /// timeline all fail, `dispatch()` still refuses the issue: at 2.5 while the
-/// entry is fresh, and through the `pulls/<n>` recheck once it is not.
+/// entry is fresh, and through the `pulls/<n>` recheck once it is not. The
+/// outage ticks call `dispatch()` without the pre-filter (as every other
+/// dispatch route does): through it, the work finder now answers from the
+/// reused listing or fails closed (#12025) and never reaches the guard.
 #[test]
 #[serial]
 fn a_prefiltered_block_still_holds_when_every_probe_leg_fails() {
@@ -532,7 +573,7 @@ fn a_prefiltered_block_still_holds_when_every_probe_leg_fails() {
     // Outage, memo still fresh: refused at 2.5 without a probe.
     fx.reanswer(|_| Pulls::Failing, &only_the_pull_read_answers());
     let before = fx.calls().len();
-    let (fresh, _) = tick_one(fx.dispatcher(), &[8951], 5);
+    let (fresh, _) = tick_one(BeforePrefilter(fx.dispatcher()), &[8951], 5);
     assert_eq!((fresh.skipped_pr_open, fresh.pr_open_prefiltered), (1, 0));
     assert_eq!((fresh.dispatched, fresh.errors), (0, 0));
     assert_eq!(fresh.admissions.len(), 1, "refused by dispatch() itself");
@@ -547,7 +588,7 @@ fn a_prefiltered_block_still_holds_when_every_probe_leg_fails() {
     }
     assert_eq!(fx.fresh_memo(8951), None);
     let before = fx.calls().len();
-    let (stale, _) = tick_one(fx.dispatcher(), &[8951], 5);
+    let (stale, _) = tick_one(BeforePrefilter(fx.dispatcher()), &[8951], 5);
     assert_eq!((stale.skipped_pr_open, stale.pr_open_prefiltered), (1, 0));
     assert_eq!((stale.dispatched, stale.errors), (0, 0));
     let calls = fx.calls()[before..].to_vec();
@@ -558,7 +599,7 @@ fn a_prefiltered_block_still_holds_when_every_probe_leg_fails() {
     // entry to recheck, and the guard falls open (the documented contract).
     let cold = Fixture::new(|_| Pulls::Failing, "");
     cold.reanswer(|_| Pulls::Failing, &only_the_pull_read_answers());
-    let (open, _) = tick_one(cold.dispatcher(), &[8951], 5);
+    let (open, _) = tick_one(BeforePrefilter(cold.dispatcher()), &[8951], 5);
     assert_eq!((open.dispatched, open.skipped_pr_open), (1, 0));
 }
 
