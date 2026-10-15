@@ -142,16 +142,25 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "lockout.duration_seconds",
     "lockout.frozen_candidates_count",
     "lockout.frozen_points_sum",
-    // `loom.ratelimit.trip` spans (Issue #10022): the tripping job, the
-    // cooldown end and the trip-time own/external attribution per pool.
+    // `loom.ratelimit.trip` spans (Issues #10022, #12238): the tripping job,
+    // the cooldown end, the tripping credential, and per pool its `used`,
+    // this host's own calls on it (daemon and agent sessions apart) and the
+    // unattributed rest (other hosts or processes on the same credential).
     "loom.ratelimit.source",
     "loom.ratelimit.cooldown_until",
+    "github.account",
+    "github.cred_owner",
+    "github.installation",
     "github.ratelimit.core.used",
     "github.ratelimit.core.own",
-    "github.ratelimit.core.external",
+    "github.ratelimit.core.own_daemon",
+    "github.ratelimit.core.own_agent",
+    "github.ratelimit.core.unattributed",
     "github.ratelimit.graphql.used",
     "github.ratelimit.graphql.own",
-    "github.ratelimit.graphql.external",
+    "github.ratelimit.graphql.own_daemon",
+    "github.ratelimit.graphql.own_agent",
+    "github.ratelimit.graphql.unattributed",
     // `forge.reader.withdrawn` spans (W4-A): which reader App left which
     // (owner, resource) bucket, until when, and where that end came from.
     "forge.reader.app",

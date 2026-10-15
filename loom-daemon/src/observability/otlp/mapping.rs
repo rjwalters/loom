@@ -6,6 +6,7 @@ mod auto_update;
 mod backlog_level;
 mod checkout_external_change;
 mod ci;
+mod daemon_exit;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
@@ -611,6 +612,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::BacklogLevel(_)
+        | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
@@ -627,6 +629,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
                 .or_else(|| backlog_level::log_parts(r))
+                .or_else(|| daemon_exit::log_parts(r))
                 .or_else(|| scope_memory::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
