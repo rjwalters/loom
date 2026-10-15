@@ -1416,6 +1416,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // shared `workspace_pool`. Empty registry ⇒ the single `sweep_workspace`.
         //
         // `startup_reconciliation_ready` (Issue #7974) is awaited internally
+        // (bounded since #12222, see `work_finder::startup_gate`)
         // before the loop's first real tick — see `spawn_startup_passes`'s doc
         // comment above for why this is what still keeps the
         // reconcile-before-dispatch invariant (#6615) intact now that the
@@ -1555,14 +1556,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
     // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
     // is on; and the intake reconcile singleton (W7), a config read per tick
-    // unless `fleet.intakeReconcile.singleton` makes this host the producer;
-    // and the shard-owned `loom:blocked` release task (#10763).
-    // The release task serves only through a loop that actually started (#10763
-    // P2), so the role-runner decision is resolved here, once, and reused below.
+    // unless `fleet.intakeReconcile.singleton` makes this host the producer.
+    // (The `loom:blocked` release task that used to start here was retired,
+    // #11301.) The role-runner decision is resolved here, once, and reused below.
     let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
     let role_runner_on = role_runner::resolve_enabled(&role_runner_config);
-    let loops = (_work_finder_handle.is_some(), role_runner_on).into(); // (work finder, role runner)
-    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus, loops);
+    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus);
 
     // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
     let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);

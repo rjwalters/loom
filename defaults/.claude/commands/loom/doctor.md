@@ -1208,10 +1208,6 @@ Comment on the PR when pushing fixes ("Addressed: formatting, added tests for ed
 ### Quality Checks
 ```bash
 # Targeted only (CI is the test gate, #11690); Rust lint = each CI `cargo clippy` line verbatim, apart from tests; no clippy = unvalidated.
-# Production shell changed + CI runs shell-budget --check? After the final commit, before re-review:
-# `loom-daemon shell-budget --check --base <PR base, default origin/main>`; nonzero = this branch's
-# growth (never pre-existing): cut counted shell or move it to the daemon, rerun to exit 0.
-# Comments, follow-up issues or arbitrary trailers are not permission.
 
 # If review mentioned tests / style / types (scope to what you touched):
 pnpm test -- <touched specs>

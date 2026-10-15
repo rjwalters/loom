@@ -6,8 +6,7 @@ release/version helpers, and daemon dev-mode helpers. Scripts shipped *to
 consumer installs* live under `defaults/scripts/` (installed as `.loom/scripts/`),
 not here. Per the shell language policy
 (`defaults/docs/shell-language-policy.md`), new executable logic belongs in a
-`loom-daemon` subcommand; every script here is accounted for in
-`shell-allowlist.txt`.
+`loom-daemon` subcommand.
 
 ## Index
 
@@ -19,25 +18,15 @@ the same set CI's `Structural Checks` job runs.
 | Script | Guards |
 |--------|--------|
 | `check-structural.sh` | Runs all structural gates before anything expensive |
-| `check-claude-md-budget.sh` | `CLAUDE.md` line budget |
-| `check-markdown-token-budget.sh` | Agent-facing markdown token ratchet |
-| `check-role-prompt-budget.sh` | Whole per-role prompt prefix ratchet |
-| `check-shell-allowlist.sh` | Every tracked `.sh` is in `shell-allowlist.txt` |
-| `check-pipefail-early-exit.sh` | `pipefail` + early-exit SIGPIPE ratchet |
 | `check-dangling-links.sh` | Relative markdown links resolve |
-| `check-doc-anchors.sh` | Markdown `#anchor` links resolve |
-| `check-doc-tocs.sh` | Generated TOCs in large docs (`--fix` regenerates) |
-| `check-docs-defaults-parity.sh` | `.loom/docs` vs `defaults/docs` parity |
+| `check-doc-tocs.sh` | Generated TOCs in large docs (`--fix` regenerates; not run in CI) |
 | `check-hooks-defaults-parity.sh` | `defaults/hooks`/`scripts` vs installed copies |
 | `check-agents-md-sync.sh` | `defaults/.loom/AGENTS.md` is not stale |
 | `check-gitignore-convergence.sh` | Loom-managed `.gitignore` block is current |
 | `check-retired-list-drift.sh` | Deleted `defaults/` payloads are in `.loom-retired.list` |
-| `check-daemon-subcommand-versions.sh` | Scripts declare the minimum `loom-daemon` version they need |
+| `check-daemon-subcommand-versions.sh` | `--list` detects scripts' `loom-daemon` subcommand calls (read by `install-compat check`) |
 | `check-guard-scan-contracts.sh` | Consumer-tier contract on guard scan strings |
-| `check-guard-destructive-drift.sh` | Advisory drift check on the vendored destructive-command guard |
 | `check-vendored-private-refs.sh` | No private repo/host names in scanned trees |
-
-Baselines/allowlists: `*-baseline.txt`, `role-prompt-budget.txt`, `shell-allowlist.txt`.
 
 ### Install / release
 

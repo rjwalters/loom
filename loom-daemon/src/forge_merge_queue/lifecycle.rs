@@ -482,24 +482,3 @@ pub fn authorize_check(
     let store = CommentGrantStore::new(forge, "check", now);
     merge_group_check(&store, pr, pr_head, read_facts(forge, pr))
 }
-
-/// May the #8508 re-date remedy push for this repository? Never in queue
-/// mode: the queue validates against the latest base itself, so a
-/// tree-identical push would only move the head and invalidate the verdict.
-/// An unreadable mode refuses too.
-///
-/// # Errors
-///
-/// The refusal text.
-pub fn redate_permitted(root: &std::path::Path) -> Result<(), String> {
-    match super::mode::resolve_merge_mode(root) {
-        Ok(m) if m.mode == MergeMode::Direct => Ok(()),
-        Ok(m) => Err(format!(
-            "champion.mergeMode={} (from {}): queue mode never pushes a tree-identical re-date \
-             commit; the merge queue tests against the latest base itself (#10256)",
-            m.mode.as_str(),
-            m.source.as_str()
-        )),
-        Err(e) => Err(format!("champion.mergeMode could not be resolved: {e}")),
-    }
-}

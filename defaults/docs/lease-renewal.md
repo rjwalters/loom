@@ -204,9 +204,8 @@ runs multi-day sweeps.
 `defaults/scripts/sweep-run-registry.sh`**, between
 `# --- BEGIN shared pid-liveness block` / `# --- END …` delimiters.
 `sweep-run-registry.sh` calls `main "$@"` unguarded at the bottom of the
-file, so sourcing it would also run its CLI dispatch; and ADR-0018 /
-`scripts/shell-allowlist.txt` admits no category for a *new* shared shell
-library (`contract` is baseline-only). Test case `(q)` in
+file, so sourcing it would also run its CLI dispatch; and ADR-0018 rules
+out a *new* shared shell library. Test case `(q)` in
 `defaults/scripts/tests/test-sweep-lease-renew.sh` diffs the two copies and
 fails the suite on any drift — that machine check is what stands in for
 `source`.

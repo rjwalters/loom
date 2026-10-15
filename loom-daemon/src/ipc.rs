@@ -1083,11 +1083,17 @@ fn dispatch_error_response(kind: &crate::types::SweepKind, e: anyhow::Error) -> 
     match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
         Ok(rejection) => Response::RuntimeRejected(rejection),
         Err(e) => {
+            // #11928: a refusal into a held workspace is policy, not a fault.
+            let level = match e.downcast_ref::<crate::workspace_hold::WorkspaceHeldDispatchError>()
+            {
+                Some(held) => crate::workspace_hold::hold_log_level(held.kind),
+                None => log::Level::Warn,
+            };
             // Issue #5236/#5210: log the full error chain at WARN (not just
             // the caller-facing response) so an operator reading the
             // daemon's own log can diagnose a dispatch failure without
             // reproducing it.
-            log::warn!("dispatch_sweep: {kind:?} failed: {e:#}");
+            log::log!(level, "dispatch_sweep: {kind:?} failed: {e:#}");
             Response::Error {
                 message: format!("dispatch_sweep failed: {e:#}"),
             }
