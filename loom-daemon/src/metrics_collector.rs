@@ -122,22 +122,6 @@ struct Author {
     login: String,
 }
 
-/// GitHub API rate limit response
-#[derive(Debug, Deserialize)]
-struct RateLimitResponse {
-    resources: RateLimitResources,
-}
-
-#[derive(Debug, Deserialize)]
-struct RateLimitResources {
-    core: RateLimitInfo,
-}
-
-#[derive(Debug, Deserialize)]
-struct RateLimitInfo {
-    remaining: i32,
-}
-
 /// Check if GitHub CLI is installed
 fn check_gh_cli_installed() -> bool {
     Command::new("which")
@@ -281,43 +265,18 @@ fn collect_and_store_events(config: &MetricsConfig) -> Result<usize> {
 
 /// Check GitHub API rate limit.
 ///
-/// #5431: intentionally NOT wired through the per-owner `GH_CONFIG_DIR` helper.
-/// `gh api rate_limit` is an account/token-level probe with no `owner/repo`
-/// target and no checkout-root `current_dir` — it reports the limits of
-/// whatever token is ambient, which is exactly what a global pre-flight check
-/// wants. There is no cross-owner repo to key a credential off of here
-/// (the facade's `GhTarget::None` with no working directory applies none).
+/// #12204: reads the process-wide cached budget (header-refreshed) and makes
+/// no forge call of its own; with nothing cached it fails open, as a failed
+/// probe always did. The ambient credential, as before (#5431: no
+/// `owner/repo` target, no checkout-root working directory).
 fn check_rate_limit() -> bool {
-    let probe = GhInvocation::new(
-        Operation::new("api.rate_limit"),
-        AccessIntent::Read,
-        GhTarget::None,
-        GH_TIMEOUT,
-    )
-    .forge_op(crate::forge_call_stats::ops::QUOTA_RATE_LIMIT_READING)
-    .args(["api", "rate_limit"])
-    .run();
-    match probe {
-        CmdOutcome::Ran(output) if output.status.success() => {
-            match serde_json::from_slice::<RateLimitResponse>(&output.stdout) {
-                Ok(rate_info) => {
-                    let remaining = rate_info.resources.core.remaining;
-                    if remaining < 100 {
-                        log::warn!("⚠️  GitHub API rate limit low: {remaining} remaining");
-                        return false;
-                    }
-                    true
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse rate limit response: {e}");
-                    true // Assume OK if we can't parse
-                }
-            }
+    let ctx = crate::rate_limit_breaker::report::FailureContext::default();
+    match crate::rate_limit_breaker::forge::cached_budget_ctx(&ctx, chrono::Utc::now()) {
+        Some(b) if b.core_remaining < 100 => {
+            log::warn!("⚠️  GitHub API rate limit low: {} remaining", b.core_remaining);
+            false
         }
-        CmdOutcome::Ran(_) | CmdOutcome::Unavailable(_) => {
-            log::warn!("Failed to check rate limit, proceeding anyway");
-            true // Assume OK if command fails
-        }
+        _ => true,
     }
 }
 
