@@ -382,6 +382,17 @@ impl SweepRegistry {
         if let Some(selection) = selection {
             selection.apply(&mut cmd);
         }
+        // #11906: a step's lease file, pick journal and curation provenance.
+        if let SweepKind::Step { role, .. } = kind {
+            super::step_spawn::apply_step_env(
+                &mut cmd,
+                &self.config.workspace_root,
+                sweep_id,
+                *role,
+                model,
+                runtime_admission.map(|a| a.runtime.as_str()),
+            );
+        }
         // #10830: name this agent for pause-and-roll (item id, pause dir,
         // pinned Claude session id, scope unit). Inert until a roll asks.
         let session = match resume {

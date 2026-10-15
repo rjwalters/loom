@@ -200,6 +200,10 @@ first build, the whole release target matrix minus signing, every
 parallelism 1 and 8 and on macOS/bash 3.2, `nextest` three times over for
 flakes, Rust beta, the Docker smokes without their path filter, and the Docker-backed
 session-exec / private-workspace fixtures.
+Since #11966 `Release Build Check` runs on a PR only when image inputs
+changed, so a non-image PR's release-profile observation is owed by the
+`push` run of its merge commit and the daily `release-matrix` (and
+`merge_group` where a queue is enabled; dormant on `rjwalters/loom`).
 
 One job is not a speed trade-off paid back but a proof `ci.yml` cannot make
 (#10868): `Compatibility Floor (SUPPORTS_INSTALLED)` runs the compatibility

@@ -27,10 +27,16 @@
 //! (`/loom:sweep --prs`, dispatched only by hand) is in neither pool and is
 //! not counted. A step (`SweepKind::Step`, #11898) draws from the sweep pool
 //! (design #11894 §4.4), so it is in the tick's occupancy and counted under
-//! `role="sweep"`, one slot per step, whatever its role.
+//! `role="sweep"`, one slot per step, whatever its role. Those same slots are
+//! also broken down by the step's role (#11906) as
+//! `busy_slots{role=<role>, pool="step"}`, `0` included for every step role:
+//! a breakdown of the `sweep` total, never added to it, and never part of
+//! the role pool's `Σ busy_slots{role≠"sweep"}` (that sum reads only the
+//! points without a `pool` label). The registries publish their live steps
+//! ([`set_steps`]); with none published, no step point is emitted.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -97,6 +103,58 @@ pub fn busy_points(
     points
 }
 
+/// The `pool` label value of a step's per-role series (#11906).
+pub const STEP_POOL: &str = "step";
+
+/// The step points for live steps counted by role name: one per step role
+/// name, `0` included. Pure.
+#[must_use]
+pub fn step_points(running: &BTreeMap<&'static str, usize>) -> Vec<MetricPoint> {
+    let mut by_role: BTreeMap<&str, usize> = crate::step_role::StepRole::ALL
+        .iter()
+        .map(|role| (role.role_name(), 0))
+        .collect();
+    for (role, count) in running {
+        *by_role.entry(role).or_insert(0) += count;
+    }
+    by_role
+        .into_iter()
+        .map(|(role, count)| {
+            MetricPoint::int(MetricName::DispatchBusySlots, int(count))
+                .label("role", role)
+                .label("pool", STEP_POOL)
+        })
+        .collect()
+}
+
+/// Each registry's live steps by role name, keyed by workspace root.
+static STEPS: Mutex<BTreeMap<PathBuf, BTreeMap<&'static str, usize>>> = Mutex::new(BTreeMap::new());
+
+/// Record `root`'s live steps by role name (the sweep registry, on every
+/// spawn, end and reaper tick).
+pub fn set_steps(root: &Path, running: BTreeMap<&'static str, usize>) {
+    STEPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf(), running);
+}
+
+/// Every published registry's live steps, summed by role; `None` when no
+/// registry has published.
+fn published_steps() -> Option<BTreeMap<&'static str, usize>> {
+    let steps = STEPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if steps.is_empty() {
+        return None;
+    }
+    let mut total = BTreeMap::new();
+    for (role, count) in steps.values().flatten() {
+        *total.entry(*role).or_insert(0) += count;
+    }
+    Some(total)
+}
+
 /// How long a resolved role ceiling is reused before the roots' configs are
 /// read again. The ceiling is a config value, not load: re-reading every
 /// root's `.loom/config.json` on every tick buys nothing, while this bound
@@ -146,7 +204,11 @@ pub fn record_tick(report: &TickReport, roots: &[PathBuf]) {
     let roles = running
         .as_ref()
         .map(|running| (running, cached_role_ceiling(roots)));
-    super::emit_metrics(busy_points(report.occupancy, roles));
+    let mut points = busy_points(report.occupancy, roles);
+    if let Some(steps) = published_steps() {
+        points.extend(step_points(&steps));
+    }
+    super::emit_metrics(points);
 }
 
 #[cfg(test)]
