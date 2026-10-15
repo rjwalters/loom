@@ -176,14 +176,12 @@ _resolve_canonical_ref() {
   # argv: argv is readable by every process of the user (ps,
   # /proc/*/cmdline). printf is a builtin, so it reaches no argv here either.
   # With no token the config is empty and the request is anonymous, as before.
+  # The value is cut to the token alphabet so it cannot break out of the
+  # quoted config string.
   local token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-  token="${token//[$'\r\n']/}"
-  token="${token//\\/\\\\}"
-  token="${token//\"/\\\"}"
-
   local latest_tag
   latest_tag="$(curl -fsSL --max-time 15 \
-    --config <(if [[ -n "$token" ]]; then printf 'header = "Authorization: Bearer %s"\n' "$token"; fi) \
+    --config <([[ -n "$token" ]] && printf 'header = "Authorization: Bearer %s"\n' "${token//[^A-Za-z0-9_.-]/}") \
     "https://api.github.com/repos/${CANONICAL_OWNER_REPO}/tags" 2>/dev/null \
     | grep -m1 '"name":' | sed -E 's/.*"name":[[:space:]]*"([^"]+)".*/\1/')"
 

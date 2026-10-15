@@ -111,10 +111,10 @@ else
   pass "no token -> anonymous request"
 fi
 
-# --- 4. Quote and backslash in a token are escaped for curl's config syntax ---
-run_drift env GH_TOKEN='stub"tok\en' GITHUB_TOKEN=
-if grep -qF 'header = "Authorization: Bearer stub\"tok\\en"' "$WORK/cfg.log"; then
-  pass "quote/backslash escaped in the config line"
+# --- 4. Characters outside the token alphabet cannot reach the config ---
+run_drift env GH_TOKEN=$'stub"tok\\en\nheader = "X: y"' GITHUB_TOKEN=
+if [[ "$(cat "$WORK/cfg.log")" == 'header = "Authorization: Bearer stubtokenheaderXy"' ]]; then
+  pass "quote/backslash/newline stripped; no config line can be injected"
 else
   fail "config escaping wrong: $(cat "$WORK/cfg.log")"
 fi

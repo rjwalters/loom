@@ -200,7 +200,7 @@ assert_eq "_probe_gitea_api still detects Gitea with a token" "0" "$probe_rc"
 : >"$CURL_ARGV_LOG"; : >"$CURL_CFG_LOG"
 with_stub_curl _probe_gitea_api "https://gitea.example.com/api/v1" "" >/dev/null || true
 TOTAL=$((TOTAL + 1))
-if grep -q -- '--config\|Authorization' "$CURL_ARGV_LOG" "$CURL_CFG_LOG"; then
+if grep -q 'Authorization' "$CURL_ARGV_LOG" "$CURL_CFG_LOG"; then
   echo -e "${RED}FAIL${NC}: _probe_gitea_api without a token sent auth"
   FAIL=$((FAIL + 1))
 else
@@ -222,8 +222,8 @@ assert_eq "gitea_api output unchanged" $'{"version":"1.21.0"}\n200' "$api_out"
 : >"$CURL_ARGV_LOG"; : >"$CURL_CFG_LOG"
 FORGE_API_BASE="https://gitea.example.com/api/v1" FORGE_TOKEN='stub"tok\en' \
   with_stub_curl gitea_api GET /version >/dev/null || true
-assert_eq "gitea_api escapes quote/backslash in the config line" \
-  'header = "Authorization: token stub\"tok\\en"' "$(cat "$CURL_CFG_LOG")"
+assert_eq "gitea_api cuts the token to its alphabet in the config line" \
+  'header = "Authorization: token stubtoken"' "$(cat "$CURL_CFG_LOG")"
 
 rm -rf "$ARGV_WORK"
 unset CURL_ARGV_LOG CURL_CFG_LOG
