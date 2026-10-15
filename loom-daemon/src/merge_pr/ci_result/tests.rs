@@ -189,3 +189,162 @@ fn ci_result_failed_token_without_listable_jobs() {
     };
     assert_eq!(m.lines().last(), Some("LOOM-CI-RESULT-FAILED run=2 jobs=-"));
 }
+
+// #12039: a `CI` workflow registered only from another branch is listed by
+// `actions/workflows` but is no workflow this PR runs.
+fn wf_ci_at(path: &str) -> Result<Value, String> {
+    Ok(json!({"total_count": 2, "workflows": [
+        {"name": "CI", "state": "active", "path": path},
+        {"name": "Release", "state": "active", "path": ".github/workflows/release.yml"}
+    ]}))
+}
+
+fn no_runs() -> Value {
+    json!({"workflow_runs": []})
+}
+
+#[test]
+fn listed_ci_absent_at_base_and_head_is_no_ci_workflow() {
+    let p = ".github/workflows/ci.yml";
+    let v = assess_with(
+        "83",
+        "abc",
+        &no_runs(),
+        || wf_ci_at(p),
+        |path| workflow_applies(path, "main", "abc", |_, _| FileAt::Absent),
+        |_| panic!("no job read"),
+    );
+    let Verdict::NoCiWorkflow(m) = v else {
+        panic!("{v:?}")
+    };
+    assert!(m.contains(p) && m.contains("#12039"), "{m}");
+}
+
+#[test]
+fn listed_ci_present_at_base_keeps_unverified() {
+    let mut reads = Vec::new();
+    let v = assess_with(
+        "83",
+        "abc",
+        &no_runs(),
+        || wf_ci_at(".github/workflows/ci.yml"),
+        |path| {
+            workflow_applies(path, "main", "abc", |_, r| {
+                reads.push(r.to_string());
+                if r == "main" {
+                    FileAt::Present
+                } else {
+                    FileAt::Absent
+                }
+            })
+        },
+        |_| panic!("no job read"),
+    );
+    assert!(matches!(v, Verdict::Unverified(_)), "{v:?}");
+    assert_eq!(reads, ["main"], "base present short-circuits the head read");
+}
+
+#[test]
+fn listed_ci_present_only_at_head_keeps_unverified() {
+    let v = assess_with(
+        "83",
+        "abc",
+        &no_runs(),
+        || wf_ci_at(".github/workflows/ci.yml"),
+        |path| {
+            workflow_applies(path, "main", "abc", |_, r| {
+                if r == "abc" {
+                    FileAt::Present
+                } else {
+                    FileAt::Absent
+                }
+            })
+        },
+        |_| panic!("no job read"),
+    );
+    assert!(matches!(v, Verdict::Unverified(_)), "{v:?}");
+}
+
+#[test]
+fn existence_check_error_is_unverified_not_no_ci() {
+    for (base, head) in [
+        (FileAt::Unknown("HTTP 502".into()), FileAt::Absent),
+        (FileAt::Absent, FileAt::Unknown("HTTP 403".into())),
+    ] {
+        let v = assess_with(
+            "83",
+            "abc",
+            &no_runs(),
+            || wf_ci_at(".github/workflows/ci.yml"),
+            |path| {
+                workflow_applies(path, "main", "abc", |_, r| {
+                    if r == "main" {
+                        base.clone()
+                    } else {
+                        head.clone()
+                    }
+                })
+            },
+            |_| panic!("no job read"),
+        );
+        let Verdict::Unverified(m) = v else {
+            panic!("{v:?}")
+        };
+        assert!(m.contains("could not be read"), "{m}");
+    }
+    // The base ref itself could not be resolved.
+    let v = assess_with(
+        "83",
+        "abc",
+        &no_runs(),
+        || wf_ci_at(".github/workflows/ci.yml"),
+        |_| Err("could not read PR #83's base ref".into()),
+        |_| panic!("no job read"),
+    );
+    assert!(matches!(v, Verdict::Unverified(_)), "{v:?}");
+}
+
+#[test]
+fn ci_record_without_path_always_applies() {
+    let v = assess_with(
+        "83",
+        "abc",
+        &no_runs(),
+        || Ok(json!({"total_count": 1, "workflows": [{"name": "CI"}]})),
+        |_| panic!("a pathless record is never existence-checked"),
+        |_| panic!("no job read"),
+    );
+    assert!(matches!(v, Verdict::Unverified(_)), "{v:?}");
+}
+
+#[test]
+fn exact_head_run_skips_existence_check() {
+    let v = assess_with(
+        "7",
+        "abc",
+        &runs("success", "completed"),
+        || panic!("no wf read"),
+        |_| panic!("no existence read"),
+        |_| panic!("no job read"),
+    );
+    assert_eq!(v, Verdict::Clean);
+}
+
+#[test]
+fn contents_read_classification_only_not_found_is_absent() {
+    assert_eq!(classify_contents_read(&Ok("{}".into())), FileAt::Present);
+    assert_eq!(
+        classify_contents_read(&Err("gh api x failed: gh: Not Found (HTTP 404)".into())),
+        FileAt::Absent
+    );
+    assert!(matches!(
+        classify_contents_read(&Err(
+            "gh api x failed: gh: No commit found for the ref abc (HTTP 404)".into()
+        )),
+        FileAt::Unknown(_)
+    ));
+    assert!(matches!(
+        classify_contents_read(&Err("gh api x failed: HTTP 502".into())),
+        FileAt::Unknown(_)
+    ));
+}

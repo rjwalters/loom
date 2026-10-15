@@ -251,6 +251,14 @@ if [[ -n "$REAL" ]]; then
     assert_contains "$out" "LOOM-CI-RESULT-NO-CI-WORKFLOW" "real daemon: no-CI is its own sentinel"
     real '{"runs":{"workflow_runs":[]}}'
     assert_eq 2 "$rc" "real daemon: workflow list unreadable -> exit 2 (never a no-CI pass)"
+    # #12039: CI listed (registered from another branch) but its file is absent at base and head.
+    real '{"runs":{"workflow_runs":[]},"workflows":{"total_count":1,"workflows":[{"name":"CI","path":".github/workflows/ci.yml"}]},"workflow_files":{".github/workflows/ci.yml":false}}'
+    assert_eq 0 "$rc" "real daemon: listed CI absent at base+head -> exit 0 (#12039)"
+    assert_contains "$out" "LOOM-CI-RESULT-NO-CI-WORKFLOW" "real daemon: branch-only CI -> no-CI sentinel"
+    real '{"runs":{"workflow_runs":[]},"workflows":{"total_count":1,"workflows":[{"name":"CI","path":".github/workflows/ci.yml"}]},"workflow_files":{".github/workflows/ci.yml":true}}'
+    assert_eq 3 "$rc" "real daemon: CI file present at base/head, no run -> UNVERIFIED exit 3"
+    real '{"runs":{"workflow_runs":[]},"workflows":{"total_count":1,"workflows":[{"name":"CI","path":".github/workflows/ci.yml"}]},"workflow_files":{".github/workflows/ci.yml":"HTTP 502"}}'
+    assert_eq 3 "$rc" "real daemon: existence check errored -> UNVERIFIED exit 3 (never a no-CI pass)"
 else
     echo "  SKIP: no built loom-daemon with merge-pr ci-result (Rust unit tests cover the assessor)"
 fi

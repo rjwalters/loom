@@ -16,7 +16,7 @@
 //! | outcome | stdout | exit |
 //! |---|---|---|
 //! | latest `CI` run for EXACTLY this head concluded `success` | [`CLEAN`] | 0 |
-//! | the repository defines no `CI` workflow at all | [`NO_CI_WORKFLOW`] + reason | 0 |
+//! | the repository defines no `CI` workflow at all, or its listed `CI` workflow file is verifiably absent at both the PR's base and head (#12039) | [`NO_CI_WORKFLOW`] + reason | 0 |
 //! | a `CI` workflow exists but no run for this head / run still in progress | [`UNVERIFIED`] + reason | 3 |
 //! | latest run concluded anything else | the refusal (names the cancelled / failed jobs, hints `gh run rerun --failed`), ending in a [`FAILED`] line | 1 |
 //! | could not query the forge (runs or workflows) | the reason | 2 |
@@ -34,6 +34,19 @@
 //! truncated is exit 2, never a no-CI pass. A run counts only when its
 //! `head_sha` is exactly the requested head, so a run for an older head (the
 //! branch moved) is not evidence about this one.
+//!
+//! # A listed workflow is not necessarily one the PR runs (#12039)
+//!
+//! `GET actions/workflows` also lists workflows registered only from a
+//! non-default branch: a `ci.yml` pushed on a feature branch that never
+//! reached `main` stays listed as an active `CI` workflow forever. A PR off
+//! `main` never contains that file, so no `CI` run ever starts and the gate
+//! held such PRs UNVERIFIED on every pass. So a listed `CI` workflow counts
+//! only when its `path` exists at the PR's base ref or at its head
+//! ([`workflow_applies`]). Only a verified absence at BOTH refs (a contents
+//! read answering `Not Found`) drops it; any other read failure, or a record
+//! with no `path`, keeps today's behaviour (the workflow applies, so a missing
+//! run is UNVERIFIED and the merge holds).
 //!
 //! The remedy is `gh run rerun --failed <run>`: it re-runs in place, so no
 //! distinct commit's run is ever cancelled (ci-principles.md).
@@ -164,9 +177,80 @@ pub fn has_ci_workflow(workflows: &Value) -> Result<bool, String> {
     }
 }
 
+/// The `path` of every workflow named `CI` in a `GET actions/workflows`
+/// payload, `None` for a `CI` record without a string `path` (which cannot be
+/// checked, so it always applies). Empty when the list proves there is no `CI`
+/// workflow; `Err` exactly when [`has_ci_workflow`] errs.
+pub fn ci_workflow_paths(workflows: &Value) -> Result<Vec<Option<String>>, String> {
+    if !has_ci_workflow(workflows)? {
+        return Ok(Vec::new());
+    }
+    Ok(workflows
+        .get("workflows")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|w| w.get("name").and_then(Value::as_str) == Some(WORKFLOW_NAME))
+                .map(|w| w.get("path").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// What a contents read of one workflow file at one ref answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileAt {
+    Present,
+    /// The forge answered `Not Found` for this path at this ref.
+    Absent,
+    /// The read failed any other way: nothing is known.
+    Unknown(String),
+}
+
+/// Classify a `gh api repos/{o}/{r}/contents/{path}?ref=…` result. Only gh's
+/// `Not Found (HTTP 404)` is an absence; a 404 for any other reason (e.g. "No
+/// commit found for the ref") or any other failure is [`FileAt::Unknown`].
+#[must_use]
+pub fn classify_contents_read(read: &Result<String, String>) -> FileAt {
+    match read {
+        Ok(_) => FileAt::Present,
+        Err(e) if e.contains("Not Found (HTTP 404)") => FileAt::Absent,
+        Err(e) => FileAt::Unknown(e.clone()),
+    }
+}
+
+/// Whether the workflow file `path` applies to a PR (#12039): present at the
+/// base ref or at the head. `Ok(false)` only on a verified absence at BOTH;
+/// `Err` when either read is unknown and neither showed the file present.
+pub fn workflow_applies(
+    path: &str,
+    base_ref: &str,
+    head_sha: &str,
+    mut file_at: impl FnMut(&str, &str) -> FileAt,
+) -> Result<bool, String> {
+    let mut unknown = Vec::new();
+    for r in [base_ref, head_sha] {
+        if r.is_empty() {
+            unknown.push(format!("{path}: no ref to read it at"));
+            continue;
+        }
+        match file_at(path, r) {
+            FileAt::Present => return Ok(true),
+            FileAt::Absent => {}
+            FileAt::Unknown(e) => unknown.push(format!("{path}@{r}: {e}")),
+        }
+    }
+    if unknown.is_empty() {
+        Ok(false)
+    } else {
+        Err(unknown.join("; "))
+    }
+}
+
 /// Decide from the runs payload, a loader for the repository's workflow list
 /// (only called when no run for this head exists), and a loader for the chosen
 /// run's jobs payload (only called when the run is definitively non-green).
+/// Every listed `CI` workflow is taken to apply to the PR; see [`assess_with`].
 pub fn assess(
     pr: &str,
     sha: &str,
@@ -174,12 +258,56 @@ pub fn assess(
     workflows: impl FnOnce() -> Result<Value, String>,
     jobs_for: impl FnOnce(u64) -> Result<Value, String>,
 ) -> Verdict {
+    assess_with(pr, sha, runs, workflows, |_| Ok(true), jobs_for)
+}
+
+/// [`assess`], with `applies(path)` deciding whether a listed `CI` workflow
+/// (by its `path`) is one this PR would run (#12039). It is consulted only
+/// when no run for this head exists; a `CI` record without a `path` always
+/// applies. `Err` from it keeps the workflow applicable (UNVERIFIED, hold).
+pub fn assess_with(
+    pr: &str,
+    sha: &str,
+    runs: &Value,
+    workflows: impl FnOnce() -> Result<Value, String>,
+    mut applies: impl FnMut(&str) -> Result<bool, String>,
+    jobs_for: impl FnOnce(u64) -> Result<Value, String>,
+) -> Verdict {
     let Some((id, status, conclusion, url)) = latest_run(runs, sha) else {
-        return match workflows().and_then(|w| has_ci_workflow(&w)) {
-            Ok(true) => Verdict::Unverified(format!(
+        let listed = workflows().and_then(|w| ci_workflow_paths(&w));
+        let mut unchecked = Vec::new();
+        let mut absent = Vec::new();
+        let decided = listed.map(|paths| {
+            let any = !paths.is_empty();
+            let applicable = paths.iter().any(|p| match p {
+                None => true,
+                Some(p) => match applies(p) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        absent.push(p.clone());
+                        false
+                    }
+                    Err(e) => {
+                        unchecked.push(e);
+                        true
+                    }
+                },
+            });
+            (any, applicable)
+        });
+        return match decided {
+            Ok((_, true)) if !unchecked.is_empty() => Verdict::Unverified(format!(
+                "no `{WORKFLOW_NAME}` workflow run found for head {sha}, and whether the listed `{WORKFLOW_NAME}` workflow file exists at the PR's base or head could not be read: {}",
+                unchecked.join("; ")
+            )),
+            Ok((_, true)) => Verdict::Unverified(format!(
                 "no `{WORKFLOW_NAME}` workflow run found for head {sha}, but the repository defines a `{WORKFLOW_NAME}` workflow"
             )),
-            Ok(false) => Verdict::NoCiWorkflow(format!(
+            Ok((true, false)) => Verdict::NoCiWorkflow(format!(
+                "the repository lists a `{WORKFLOW_NAME}` workflow ({}) but its file exists at neither the PR's base nor head {sha} (registered from another branch, #12039), so there is no CI run to gate on",
+                absent.join(", ")
+            )),
+            Ok((false, _)) => Verdict::NoCiWorkflow(format!(
                 "the repository defines no `{WORKFLOW_NAME}` workflow, so there is no CI run to gate head {sha} on"
             )),
             Err(e) => Verdict::Unreadable(format!(
