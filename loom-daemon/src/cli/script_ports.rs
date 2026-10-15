@@ -445,6 +445,13 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
 
+    /// Shared command-lexer verdicts for the guard hooks (#12236): `gh-pr-merge`
+    /// exits 0 when a command line would execute it, 1 when not (a heredoc body
+    /// or quoted argument is data). Any other exit means unanswered; the hook
+    /// fails closed.
+    #[command(subcommand)]
+    CommandAnalysis(super::command_analysis::CommandAnalysisCommand),
+
     /// Per-stage runtime selection views (#11726): `roles draw --explain`
     /// prints each stage's effective weighted, per-attempt draw table on this
     /// host and the config tier that set it.
@@ -711,6 +718,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::CommandAnalysis(cmd) => cmd.run(),
             ScriptPortCommand::Roles(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),

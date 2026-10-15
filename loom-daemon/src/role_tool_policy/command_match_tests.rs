@@ -746,3 +746,24 @@ fn substitutions_inside_parameter_expansions_are_analyzed() {
     assert_clean(r#"echo "${v:-$(echo hi)}" ${w:-fallback} ${#x} "${y%.txt}""#);
     assert_clean(r#"echo "${v:-`date`}""#);
 }
+
+#[test]
+fn heredoc_body_is_data_unless_a_shell_or_file_takes_it() {
+    assert_clean("cat <<'EOF'\nssh host\nEOF");
+    assert_clean("cat <<-EOF\n\tssh host\n\tEOF");
+    assert!(hits_cap("bash <<EOF\nssh host\nEOF", "remote-shell"));
+    assert!(hits_cap("cat > /tmp/x <<EOF\nssh host\nEOF", "remote-shell"));
+    assert!(hits_cap("cat <<EOF\nhi\nEOF\nssh host", "remote-shell"));
+    // Unterminated: the body runs to the end of input and stays data.
+    assert_clean("cat <<EOF\nssh host");
+}
+
+#[test]
+fn gh_pr_merge_detection_is_not_a_role_capability() {
+    assert!(executes_gh_pr_merge("gh pr merge 1"));
+    assert!(executes_gh_pr_merge("gh -R o/r pr merge 1"));
+    assert!(executes_gh_pr_merge("bash -c 'gh pr merge 1'"));
+    assert!(!executes_gh_pr_merge("echo 'gh pr merge 1'"));
+    assert!(!executes_gh_pr_merge("gh pr view 1"));
+    assert_clean("gh pr merge 1");
+}

@@ -37,6 +37,7 @@ pub(crate) mod cleanup_ops;
 pub(crate) mod codex_hooks;
 pub(crate) mod codex_sandbox_noop_cli;
 pub(crate) mod codex_usage_cli;
+pub(crate) mod command_analysis;
 pub(crate) mod common;
 mod daemon_start;
 mod daemon_update;
