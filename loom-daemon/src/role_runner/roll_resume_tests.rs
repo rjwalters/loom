@@ -109,7 +109,7 @@ fn a_paused_role_run_is_resumed_with_its_guard_mutex_and_breadcrumb_seeded() {
     assert!(in_progress
         .lock()
         .unwrap()
-        .contains(&(root.clone(), "champion", 0)));
+        .contains(&(root.clone(), "champion")));
     let second = launch(&spec, &in_progress, Duration::from_secs(5)).unwrap_err();
     assert_eq!(second.reason, "guard-refused:role-in-progress", "{second}");
     // Nor an issue-creating burst interleave with the one it was in.
@@ -164,13 +164,13 @@ fn a_paused_role_run_is_resumed_with_its_guard_mutex_and_breadcrumb_seeded() {
 fn a_resumed_role_run_that_fails_reports_how() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
-    enabled(&root, r#""judge""#);
+    enabled(&root, r#""guide""#);
     let ws = crate::write_scope_test_support::WritableRoot::register(&root);
     let (record, release) = (root.join("record.log"), root.join("release"));
     std::fs::write(&release, "").unwrap(); // exits at once
     let script = spawn_script(&root, &record, &release, 3);
     let in_progress = new_in_progress_guard();
-    match launch(&spec(&root, "judge", &script, &ws.gh), &in_progress, Duration::from_secs(60)) {
+    match launch(&spec(&root, "guide", &script, &ws.gh), &in_progress, Duration::from_secs(60)) {
         // Either the poll saw the live run first, or it had already ended.
         Ok(mut handle) => {
             assert!(wait_for_condition(60_000, || handle.state() != RoleResumeState::Running));
@@ -191,19 +191,26 @@ fn a_role_that_is_no_longer_enabled_is_not_resumed() {
         return; // the host-wide switch would decide instead of the config
     }
     write_config(&root, r#"{"autonomous":{"roleRunner":{"enabled":false}}}"#);
-    let off = enabled_role(&root, "judge").unwrap_err();
+    let off = enabled_role(&root, "guide").unwrap_err();
     assert_eq!(off.reason, REASON_ROLE_DISABLED, "{off}");
-    enabled(&root, r#""curator""#);
-    let unlisted = enabled_role(&root, "judge").unwrap_err();
+    enabled(&root, r#""auditor""#);
+    let unlisted = enabled_role(&root, "guide").unwrap_err();
     assert_eq!(unlisted.reason, REASON_ROLE_DISABLED, "{unlisted}");
-    assert_eq!(enabled_role(&root, "curator").unwrap(), "curator");
-    assert_eq!(enabled_role(&root, "Curator").unwrap(), "curator", "the static name");
+    assert_eq!(enabled_role(&root, "auditor").unwrap(), "auditor");
+    assert_eq!(enabled_role(&root, "Auditor").unwrap(), "auditor", "the static name");
+    // #11911: a paused role-runner Judge, Doctor or Curator (from a binary
+    // before the cutover) is requeued, never resumed beside the steps.
+    enabled(&root, r#""auditor","judge","doctor","curator""#);
+    for step_role in ["judge", "doctor", "curator"] {
+        let refused = enabled_role(&root, step_role).unwrap_err();
+        assert_eq!(refused.reason, REASON_ROLE_DISABLED, "{step_role}: {refused}");
+    }
 
     // A disabled role is refused before anything is seeded or spawned.
     let in_progress = new_in_progress_guard();
     let script = root.join("never-run.sh");
     let refusal =
-        launch(&spec(&root, "judge", &script, &script), &in_progress, Duration::from_secs(5))
+        launch(&spec(&root, "guide", &script, &script), &in_progress, Duration::from_secs(5))
             .unwrap_err();
     assert_eq!(refusal.reason, REASON_ROLE_DISABLED);
     assert!(in_progress.lock().unwrap().is_empty());

@@ -12,16 +12,12 @@
 
 use super::*;
 
-use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use anyhow::Result;
 use serial_test::serial;
 use tempfile::TempDir;
-
-use crate::work_finder::{tick, TickReport, WorkDispatcher, WorkItem, WorkSource};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -224,133 +220,6 @@ fn a_wrapper_observed_hold_expires_on_its_own_ttl() {
 // ---------------------------------------------------------------------------
 // The incident-shaped regression test (Issue #7708 acceptance criterion)
 // ---------------------------------------------------------------------------
-
-/// One ready issue, and nothing else to dispatch.
-struct OneReadyIssue {
-    issue: u32,
-}
-
-impl WorkSource for OneReadyIssue {
-    fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
-        Ok(vec![WorkItem::new(self.issue, vec!["loom:issue".to_string()])])
-    }
-}
-
-/// Counts every dispatch attempt. A dispatch attempt is exactly the
-/// `loom:issue -> loom:building` label flip plus the `loom:lease` record
-/// comment in production, so "zero dispatches" here IS "zero label flips and
-/// zero lease comments" — the AC's forge-side claim, asserted without a forge.
-#[derive(Default)]
-struct CountingDispatcher {
-    attempts: usize,
-}
-
-impl WorkDispatcher for CountingDispatcher {
-    fn in_flight(&self) -> HashSet<u32> {
-        HashSet::new()
-    }
-    fn dispatch(&mut self, _issue: u32) -> Result<bool> {
-        self.attempts += 1;
-        Ok(true)
-    }
-}
-
-/// Run `ticks` work-finder ticks for one host against `root` and return how
-/// many dispatch attempts it made.
-///
-/// `host = Some(..)` is the post-fix path (the tick consults that host's own
-/// pool hold). `host = None` reproduces the PRE-fix work finder exactly: the
-/// `halted` slice carried the main-health / drain / breaker / #5030 terms and
-/// nothing that could see `.bad_tokens`, so a dead pool was invisible to it.
-fn ticks_for_host(host: Option<&PoolHoldState>, root: &Path, issue: u32, ticks: usize) -> usize {
-    let mut source = OneReadyIssue { issue };
-    let mut dispatcher = CountingDispatcher::default();
-    for _ in 0..ticks {
-        let halted = host.is_some_and(|h| h.observe_root(root, chrono::Utc::now()));
-        let report: TickReport = tick(&mut source, &mut dispatcher, 4, halted).unwrap();
-        assert_eq!(report.seen, 1, "the issue stays ready the whole time");
-    }
-    dispatcher.attempts
-}
-
-/// **The #7708 incident, reproduced.** Four hosts, one ready issue, a pool
-/// with zero usable accounts. Before this change each host re-dispatched on
-/// its own cadence (the #4485 ladder being per-issue and therefore incapable
-/// of damping a pool-wide fault), producing 20 dispatches of one issue in
-/// 4.3 h across four hosts — 39 permanent lease comments and 40 label flips
-/// on a single public issue, for zero work.
-///
-/// With the pre-flight the correct number is not "≤ 1 per host per TTL" but
-/// **zero**: no host ever reaches the dispatch path at all, because each one
-/// reads the dead pool before flipping anything.
-#[test]
-fn four_hosts_one_ready_issue_and_a_dead_pool_dispatch_nothing() {
-    let ws = workspace_with_pool(&["agent2", "agent3", "agent8", "robb", "rjwalters"]);
-    bad_mark_all(ws.path(), &["agent2", "agent3", "agent8", "robb", "rjwalters"]);
-
-    // Control — the PRE-fix work finder, whose `halted` slice had no term
-    // that could see `.bad_tokens`. This is the storm: every tick of every
-    // host dispatches into a pool that cannot spawn anything.
-    let unbraked: usize = (0..4)
-        .map(|_| ticks_for_host(None, ws.path(), 6704, 20))
-        .sum();
-    assert_eq!(
-        unbraked, 80,
-        "precondition: without the pre-flight, 4 hosts x 20 ticks = 80 doomed dispatches"
-    );
-
-    // Four independent daemons = four hosts, all sharing one pool directory.
-    let hosts = [
-        PoolHoldState::new(),
-        PoolHoldState::new(),
-        PoolHoldState::new(),
-        PoolHoldState::new(),
-    ];
-
-    let total: usize = hosts
-        .iter()
-        .map(|host| ticks_for_host(Some(host), ws.path(), 6704, 20))
-        .sum();
-
-    assert_eq!(
-        total, 0,
-        "80 ticks across 4 hosts into a 0/5-spawnable pool must produce ZERO dispatch \
-         attempts — no label flip, no lease comment"
-    );
-    for host in &hosts {
-        assert_eq!(host.held_pool_count(), 1, "every host holds the dead pool");
-    }
-}
-
-/// The other half of the same test: the instant the pool recovers, all four
-/// hosts resume on their next tick. A brake that needs an operator to release
-/// it would just be a different outage.
-#[test]
-fn all_four_hosts_resume_on_the_tick_after_the_pool_recovers() {
-    let ws = workspace_with_pool(&["a", "b"]);
-    bad_mark_all(ws.path(), &["a", "b"]);
-
-    let hosts = [
-        PoolHoldState::new(),
-        PoolHoldState::new(),
-        PoolHoldState::new(),
-        PoolHoldState::new(),
-    ];
-    for host in &hosts {
-        assert_eq!(ticks_for_host(Some(host), ws.path(), 6704, 5), 0);
-    }
-
-    readmit_all(ws.path());
-
-    for host in &hosts {
-        assert_eq!(
-            ticks_for_host(Some(host), ws.path(), 6704, 1),
-            1,
-            "one tick, one dispatch — no restart, no manual release"
-        );
-        assert_eq!(host.held_pool_count(), 0);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // #8554: preference-aware hold — arms on the WHOLE list, not just Claude

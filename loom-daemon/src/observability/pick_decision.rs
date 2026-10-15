@@ -7,20 +7,20 @@
 //! [`WorkFinderTickSummary`] the tick already published. The role side reads
 //! the agent's pick journal ([`super::pick_journal`], #10432: the serving
 //! queue `pr-queue` printed, the listings the agent `gh` front served, the
-//! writes the agent issued) and, as a fallback, the queue listing the role's
-//! own gate probe (`forge_queue_probe` / `forge_merge_probe`) already fetched,
-//! stashed in a thread-local by [`record_gate_listing`]. The probe, the launch
-//! and the end-of-tick emit run on the same blocking thread, and
-//! [`emit_role_tick`] drains both, so a tick can never see a previous tick's.
+//! writes the agent issued). The launch and the end-of-tick emit run on the
+//! same blocking thread; [`clear_role_tick_stash`] runs at the start of each
+//! run and [`emit_role_tick`] drains the journal, so a tick can never see a
+//! previous tick's. (The role runner's own gate listings, the old fallback,
+//! went with the Judge/Doctor queue gate and Champion's merge-debt listing,
+//! #11911.)
 //!
-//! The daemon gates on a role's queue but the role agent chooses among its
-//! items, so role candidates and decisions come from the journal whenever one
-//! was written; `candidate_source` / `decisions_observed` say what was seen.
+//! The role agent chooses among its items, so role candidates and decisions
+//! come from the journal; `candidate_source` / `decisions_observed` say what
+//! was seen.
 //!
 //! Records go to the OTLP exporters' queues through the ops sink; with no OTLP
 //! exporter nothing is built.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -30,13 +30,12 @@ use chrono::{DateTime, Utc};
 use super::pick_journal::{
     known_action, skip_reason_for_labels, Journal, JournalEntry, JournalRow,
 };
-use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
 use crate::step_dispatch::item_draw::{Candidate, DrawRecord, Exclusion, ITEM_DRAW_SEED_SCHEME};
 use crate::telemetry::kinds::pick_decision::{
     source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
     PickDrawCandidate, PickItemDraw, PickItemDrawStep, PickItemExclusion, PickItemPoolEntry,
-    PickLane, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion,
+    PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion,
     PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
@@ -49,83 +48,9 @@ use crate::work_finder::workspace_draw::{self, DrawLog};
 /// `repo` value when no forge slug is known. Never a local path (#9442).
 pub const REPO_UNRESOLVED: &str = "repo_unresolved";
 
-/// A queue-listing row kept for the end-of-tick record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GateRow {
-    pub number: u32,
-    pub labels: Vec<String>,
-}
-
-thread_local! {
-    /// `(root, label, rows)` listings this thread's tick read, in read order.
-    static GATE_LISTINGS: RefCell<Vec<(std::path::PathBuf, String, Vec<GateRow>)>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-thread_local! {
-    /// The lane plan the admission of this thread's run computed (#10630).
-    static LANE_PLAN: RefCell<Vec<crate::role_runner::concurrent_dispatch::lane_rule::RepoLane>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-/// Stash the per-repository lane plan the admission computed, for the run's
-/// end-of-tick record (#10630).
-pub fn stash_lane_plan(
-    _root: &Path,
-    plan: Vec<crate::role_runner::concurrent_dispatch::lane_rule::RepoLane>,
-) {
-    LANE_PLAN.with(|s| *s.borrow_mut() = plan);
-}
-
-fn take_lane_plan() -> Vec<PickLane> {
-    LANE_PLAN.with(|s| {
-        std::mem::take(&mut *s.borrow_mut())
-            .into_iter()
-            .take(MAX_PICK_LANES)
-            .map(|r| PickLane {
-                repo: repo_label(&r.root),
-                debt: r.debt,
-                wanted: r.wanted,
-                lanes: r.lanes,
-            })
-            .collect()
-    })
-}
-
-/// Most repositories one record lists lanes for.
-const MAX_PICK_LANES: usize = 32;
-
-/// Stash the open PR rows of a gate listing the role runner already made.
-pub fn record_gate_listing(root: &Path, label: &str, rows: &[RestIssue]) {
-    let rows: Vec<GateRow> = rows
-        .iter()
-        .filter(|r| r.is_pull_request && r.state.eq_ignore_ascii_case("open"))
-        .map(|r| GateRow {
-            number: r.number,
-            labels: r.labels.clone(),
-        })
-        .collect();
-    GATE_LISTINGS.with(|s| {
-        s.borrow_mut()
-            .push((root.to_path_buf(), label.to_string(), rows))
-    });
-}
-
-/// Drop anything stashed by an earlier tick on this (reused) blocking thread.
-pub fn clear_gate_listings() {
-    GATE_LISTINGS.with(|s| s.borrow_mut().clear());
-    LANE_PLAN.with(|s| s.borrow_mut().clear());
+/// Drop a journal an earlier tick left on this (reused) blocking thread.
+pub fn clear_role_tick_stash() {
     super::pick_journal::discard();
-}
-
-fn take_gate_listings(root: &Path) -> Vec<(String, Vec<GateRow>)> {
-    GATE_LISTINGS.with(|s| {
-        std::mem::take(&mut *s.borrow_mut())
-            .into_iter()
-            .filter(|(r, _, _)| r == root)
-            .map(|(_, label, rows)| (label, rows))
-            .collect()
-    })
 }
 
 /// The forge slug for `root`, from its `origin` remote (a local git call,
@@ -162,18 +87,6 @@ fn emit_in(record: PickDecisionRecord, context: Option<&crate::telemetry::trace:
         for chunk in split_into_chunks(record, CHUNK_BYTES) {
             sink.emit_record_in(TelemetryRecord::PickDecision(chunk), context.cloned());
         }
-    }
-}
-
-/// Always drains the stash (it must not leak into the next tick on this
-/// thread); converts it (a cached local `git` read per repository) only with an
-/// exporter running.
-fn take_lane_plan_if_exporting() -> Vec<PickLane> {
-    if exporting() {
-        take_lane_plan()
-    } else {
-        LANE_PLAN.with(|s| s.borrow_mut().clear());
-        Vec::new()
     }
 }
 
@@ -577,13 +490,11 @@ fn tick_skip_reason(result: RoleTickResult) -> Option<PickSkipReason> {
 }
 
 /// What a role tick saw and did: the journal its agent wrote (when one was
-/// attached) and the gate listings the daemon itself read.
+/// attached).
 #[derive(Debug, Clone, Default)]
 pub struct RoleObservation {
     /// The agent's pick journal; `None` when none was attached.
     pub journal: Option<Journal>,
-    /// The admission gate's listings, in read order.
-    pub gate: Vec<(String, Vec<GateRow>)>,
 }
 
 /// Rows deduplicated by number, first occurrence (its first rank) kept.
@@ -596,7 +507,7 @@ fn dedup(rows: impl IntoIterator<Item = JournalRow>) -> Vec<JournalRow> {
 ///
 /// Candidates come from the agent's **serving queue** (the latest `pr-queue`
 /// snapshot) when it read one, else from the listings it read through the agent `gh` front
-/// (Curator), else from the daemon's gate listing. A candidate the agent wrote
+/// (Curator), else there are none. A candidate the agent wrote
 /// to is *acted*; the rest are *skipped* with a label-derived reason or
 /// `not_selected` when the agent's writes were observed, and otherwise
 /// undecided (only a hold label then names a reason).
@@ -657,33 +568,7 @@ pub fn role_record(
     } else if let Some(rows) = listing {
         (source::LISTING, dedup(rows))
     } else {
-        let mut rank = 0u32;
-        let rows: Vec<JournalRow> = observed
-            .gate
-            .into_iter()
-            .flat_map(|(stage, rows)| rows.into_iter().map(move |r| (stage.clone(), r)))
-            .map(|(stage, row)| {
-                rank += 1;
-                JournalRow {
-                    number: row.number,
-                    stage,
-                    labels: row.labels,
-                    sort_key: Some(PickSortKey {
-                        name: "listing_order".to_string(),
-                        value: rank.to_string(),
-                    }),
-                }
-            })
-            .collect();
-        let rows = dedup(rows);
-        (
-            if rows.is_empty() {
-                source::NONE
-            } else {
-                source::GATE_LISTING
-            },
-            rows,
-        )
+        (source::NONE, Vec::new())
     };
     let ranked = rows
         .into_iter()
@@ -739,10 +624,8 @@ pub fn emit_role_tick(
     outcome: &RoleTickOutcome,
     trace: Option<&super::lifecycle::RoleTrace>,
 ) {
-    let gate = take_gate_listings(root);
     let journal = super::pick_journal::take(root);
     let step = super::step_verdict::take_staged_step();
-    let lane_plan = take_lane_plan_if_exporting();
     if !exporting() {
         return;
     }
@@ -776,11 +659,16 @@ pub fn emit_role_tick(
             &journal.entries,
         );
     }
-    let holds: &[&str] = crate::role_runner::demand::DebtAxis::for_role(role)
-        .map_or(&[], crate::role_runner::demand::axis_park_labels);
-    let observed = RoleObservation { journal, gate };
-    let mut record = role_record(tick, result, observed, &repo_label(root), holds);
-    record.lanes = lane_plan;
+    // The hold labels of the PR queue `role` drains, if it drains one.
+    let axis = match role {
+        "judge" => Some(crate::pr_debt::DebtAxis::Review),
+        "doctor" => Some(crate::pr_debt::DebtAxis::Changes),
+        "champion" => Some(crate::pr_debt::DebtAxis::Merge),
+        _ => None,
+    };
+    let holds: &[&str] = axis.map_or(&[], crate::pr_debt::axis_park_labels);
+    let observed = RoleObservation { journal };
+    let record = role_record(tick, result, observed, &repo_label(root), holds);
     emit_in(record, trace.map(|t| &t.context));
 }
 

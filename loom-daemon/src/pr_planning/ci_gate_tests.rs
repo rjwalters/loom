@@ -102,8 +102,8 @@ fn set_checks(root: &Path, page: &Value) {
     std::fs::write(root.join("checks.json"), serde_json::to_vec(page).unwrap()).unwrap();
 }
 
-/// The acceptance case, through the real `pr-queue --role judge` path and
-/// the real spawn gate: pending at the head is neither served nor gated; the
+/// The acceptance case, through the real `pr-queue --role judge` path:
+/// pending at the head is not served; the
 /// same head is served once CI concludes; CI stuck past the cap is served.
 #[cfg(unix)]
 #[test]
@@ -115,16 +115,16 @@ fn a_pr_with_ci_pending_at_its_head_is_not_served_to_judge() {
         clear_cache();
         let queue = fetch_queue(root, &gh, PrRole::Judge).map(|q| q.len());
         clear_cache();
-        (queue.unwrap(), has_judge_work(root, &gh).unwrap())
+        queue.unwrap()
     };
     let ago = |h: i64| Some((Utc::now() - Duration::hours(h)).to_rfc3339());
 
     set_checks(root, &runs("in_progress", ago(1)));
-    assert_eq!(served(), (0, false), "CI pending at the head");
+    assert_eq!(served(), 0, "CI pending at the head");
     set_checks(root, &runs("completed", ago(1)));
-    assert_eq!(served(), (1, true), "CI concluded at the same head");
+    assert_eq!(served(), 1, "CI concluded at the same head");
     set_checks(root, &runs("queued", ago(7)));
-    assert_eq!(served(), (1, true), "pending past the 6 h cap");
+    assert_eq!(served(), 1, "pending past the 6 h cap");
 }
 
 /// Only the head of the queue is read: past [`CI_SCREENED_ROWS`] CI-clear
@@ -140,12 +140,4 @@ fn only_the_rows_about_to_be_served_are_read() {
     assert_eq!(fetch_queue(root, &gh, PrRole::Judge).unwrap().len(), 5);
     let log = std::fs::read_to_string(root.join("calls.log")).unwrap();
     assert_eq!(log.matches("check-runs").count(), CI_SCREENED_ROWS);
-    clear_cache();
-    assert!(has_judge_work(root, &gh).unwrap());
-    let log = std::fs::read_to_string(root.join("calls.log")).unwrap();
-    assert_eq!(
-        log.matches("check-runs").count(),
-        CI_SCREENED_ROWS + 1,
-        "the gate stops at the first servable row"
-    );
 }

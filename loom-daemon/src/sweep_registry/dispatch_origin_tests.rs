@@ -61,8 +61,6 @@ fn every_origin_is_recorded_and_only_an_operator_redispatch_says_so() {
     let (mut registry, _rec) = fixture_registry(dir.path());
     let origins = [
         DispatchOrigin::Operator,
-        DispatchOrigin::WorkFinder,
-        DispatchOrigin::EpicSupervisor,
         DispatchOrigin::Watchdog,
         DispatchOrigin::ReaperRetry,
         DispatchOrigin::Unknown,
@@ -153,38 +151,6 @@ fn the_outcome_reports_the_start_origin_and_trigger() {
         (Some("operator".to_string()), Some(trigger::OPERATOR_REDISPATCH.to_string()))
     );
     assert_eq!((outcome.dispatch_origin, outcome.trigger), started);
-}
-
-/// The work finder's production dispatcher records `work_finder`.
-#[test]
-#[serial]
-fn the_work_finder_records_its_origin() {
-    use crate::work_finder::WorkDispatcher;
-    let dir = tempdir().unwrap();
-    let (registry, _rec) = fixture_registry(dir.path());
-    let registry = Arc::new(Mutex::new(registry));
-    let mut dispatcher = crate::work_finder::RegistryDispatcher::new(registry.clone());
-    assert!(dispatcher.dispatch(1_144_430).unwrap());
-
-    let registry = registry.lock().unwrap();
-    assert_eq!(recorded_for_issue(&registry, 1_144_430).0.as_deref(), Some("work_finder"));
-}
-
-/// The epic supervisor's production dispatcher records `epic_supervisor`.
-#[test]
-#[serial]
-fn the_epic_supervisor_records_its_origin() {
-    use crate::epic_supervisor::EpicDispatcher;
-    let dir = tempdir().unwrap();
-    let (registry, _rec) = fixture_registry(dir.path());
-    let spawn_bin = registry.config().spawn_bin.clone().unwrap();
-    let registry = Arc::new(Mutex::new(registry));
-    let mut dispatcher =
-        crate::epic_supervisor::forge::SpawnDispatcher::new(spawn_bin, registry.clone());
-    dispatcher.dispatch_sweep(1_144_400, 1_144_440).unwrap();
-
-    let registry = registry.lock().unwrap();
-    assert_eq!(recorded_for_issue(&registry, 1_144_440).0.as_deref(), Some("epic_supervisor"));
 }
 
 /// A watchdog recovery (here the mid-build-death watchdog) records

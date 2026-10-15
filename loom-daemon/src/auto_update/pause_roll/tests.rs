@@ -247,6 +247,7 @@ pub(super) fn cand(dir: &Path, id: &str, issue: u32, age_secs: i64) -> Candidate
         holds_issue_creation_mutex: false,
         pr: None,
         step: None,
+        dispatch_origin: None,
     }
 }
 
@@ -919,6 +920,8 @@ pub(super) fn register(
 ) -> (String, PathBuf) {
     let sweep_id =
         test_support::insert_running_with_pid_at(registry, issue, 1, agent.pid(), Utc::now());
+    // An operator's sweep: attended, so a roll resumes it (#11911).
+    test_support::mark_dispatch_origin(registry, &sweep_id, "operator");
     let lock = test_support::write_lock_owner(registry, issue, &sweep_id, agent.pid());
     let session =
         crate::sweep_registry::resume_handle::DispatchSession::new(&sweep_id, root, Some("claude"))

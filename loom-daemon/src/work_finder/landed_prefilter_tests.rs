@@ -1,17 +1,13 @@
 //! Issue #11853: the landed pre-filter — the closes-graph verdict, the
 //! Curator routing, the verdict cache, and the tick seam.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde_json::json;
 
-use super::super::*;
 use super::*;
-use crate::types::{QueueDisposition, ReadyQueueRow};
 
 // ---------------------------------------------------------------------------
 // The verdict
@@ -593,122 +589,3 @@ fn the_closes_graph_read_goes_to_the_reader_pool_and_is_shed_not_spilled() {
 // ---------------------------------------------------------------------------
 // The tick seam
 // ---------------------------------------------------------------------------
-
-struct OneShotSource(Option<Vec<WorkItem>>);
-
-impl WorkSource for OneShotSource {
-    fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
-        Ok(self.0.take().unwrap_or_default())
-    }
-}
-
-/// A dispatcher whose forge knows open linked PRs and merged closing PRs.
-#[derive(Default)]
-struct Disp {
-    open_pr: HashMap<u32, u32>,
-    landed: HashMap<u32, u32>,
-    in_flight: HashSet<u32>,
-    asked: RefCell<Vec<(Vec<u32>, Vec<u32>)>>,
-    attempts: Vec<u32>,
-}
-
-impl WorkDispatcher for Disp {
-    fn in_flight(&self) -> HashSet<u32> {
-        self.in_flight.clone()
-    }
-    fn occupancy(&self) -> usize {
-        self.in_flight.len()
-    }
-    fn open_pr_blocked(&self, candidates: &[u32]) -> HashMap<u32, u32> {
-        candidates
-            .iter()
-            .filter_map(|n| self.open_pr.get(n).map(|p| (*n, *p)))
-            .collect()
-    }
-    fn landed_closing_prs(&self, candidates: &[u32], open_pr: &[u32]) -> HashMap<u32, u32> {
-        let mut c = candidates.to_vec();
-        let mut o = open_pr.to_vec();
-        c.sort_unstable();
-        o.sort_unstable();
-        self.asked.borrow_mut().push((c, o));
-        candidates
-            .iter()
-            .filter_map(|n| self.landed.get(n).map(|p| (*n, *p)))
-            .collect()
-    }
-    fn dispatch(&mut self, issue: u32) -> Result<bool> {
-        self.attempts.push(issue);
-        self.in_flight.insert(issue);
-        Ok(true)
-    }
-}
-
-fn items(numbers: &[u32]) -> Vec<WorkItem> {
-    numbers
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            let created = format!("2026-09-{:02}T00:00:00Z", i + 1);
-            WorkItem::with_created_at(*n, vec!["loom:issue".to_string()], Some(created))
-        })
-        .collect()
-}
-
-fn rows(report: &TickReport) -> Vec<ReadyQueueRow> {
-    ready_queue::finish(&report.queue, &[PathBuf::from("/repo/a")])
-}
-
-/// A landed candidate is never offered to `dispatch()`: it is resolved
-/// `AlreadyLanded` with the PR named, the next candidate takes the slot, and
-/// the workspace is asked once, without its open-PR candidates.
-#[test]
-fn a_landed_candidate_is_skipped_without_a_dispatch_attempt() {
-    let disp = Disp {
-        open_pr: HashMap::from([(1, 801)]),
-        landed: HashMap::from([(2, 900)]),
-        ..Disp::default()
-    };
-    let mut multi = vec![(OneShotSource(Some(items(&[1, 2, 3, 4]))), disp)];
-    let report = tick_multi(&mut multi, &[1], 1, &[false]);
-
-    let disp = &multi[0].1;
-    assert_eq!(disp.attempts, vec![3], "2 is landed, 1 has an open PR");
-    assert_eq!(disp.asked.borrow().clone(), vec![(vec![2, 3, 4], vec![1])]);
-    assert_eq!(report.skipped_already_landed, 1);
-    assert_eq!(report.skipped_pr_open, 1);
-    let row = rows(&report).into_iter().find(|r| r.issue == 2).unwrap();
-    assert_eq!(row.disposition, QueueDisposition::AlreadyLanded);
-    assert_eq!(row.detail.as_deref(), Some("merged closing PR #900"));
-}
-
-/// #11901: a listed candidate whose landed cooldown the dispatcher lifts is
-/// no longer skipped as backed off; one it does not lift still is.
-#[test]
-fn a_lifted_landed_cooldown_dispatches_this_tick() {
-    struct Lifting(Disp, HashSet<u32>);
-    impl WorkDispatcher for Lifting {
-        fn in_flight(&self) -> HashSet<u32> {
-            self.0.in_flight()
-        }
-        fn occupancy(&self) -> usize {
-            self.0.occupancy()
-        }
-        fn backed_off(&self) -> HashSet<u32> {
-            HashSet::from([1, 2])
-        }
-        fn lift_landed_cooldowns(&self, held: &[u32]) -> HashSet<u32> {
-            held.iter()
-                .copied()
-                .filter(|n| self.1.contains(n))
-                .collect()
-        }
-        fn dispatch(&mut self, issue: u32) -> Result<bool> {
-            self.0.dispatch(issue)
-        }
-    }
-    let disp = Lifting(Disp::default(), HashSet::from([1]));
-    let mut multi = vec![(OneShotSource(Some(items(&[1, 2]))), disp)];
-    let report = tick_multi(&mut multi, &[1], 2, &[false]);
-    assert_eq!(multi[0].1 .0.attempts, vec![1], "#1 lifted, #2 still backed off");
-    assert_eq!(report.skipped_backoff, 1);
-}

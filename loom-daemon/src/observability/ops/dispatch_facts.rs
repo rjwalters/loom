@@ -236,7 +236,7 @@ mod tests {
             pr_open_prefiltered: 2,
             ..TickReport::default()
         };
-        let cap = CapView::from_terms(12, 4, 9);
+        let cap = CapView::from_terms(12, 0, 9);
         let attrs = tick_attributes(&report, Some(cap), Some("o/a=main_red".into()));
         let get = |k: &str| {
             attrs
@@ -246,7 +246,7 @@ mod tests {
         };
         assert_eq!(get("loom.dispatch.cap_limiter"), Some("disk"));
         assert_eq!(get("loom.dispatch.cap_configured"), Some("12"));
-        assert_eq!(get("loom.dispatch.cap_disk"), Some("4"));
+        assert_eq!(get("loom.dispatch.cap_disk"), Some("0"));
         assert_eq!(get("loom.dispatch.cap_ram"), Some("9"));
         assert_eq!(get("loom.dispatch.pr_open_prefiltered"), Some("2"));
         assert_eq!(get("loom.dispatch.halted_repos"), Some("o/a=main_red"));
@@ -267,7 +267,7 @@ mod tests {
                 })
                 .map(|p| p.value)
         };
-        assert_eq!(term("disk"), Some(MetricValue::Int(4)));
+        assert_eq!(term("disk"), Some(MetricValue::Int(0)));
         assert_eq!(term("ram"), Some(MetricValue::Int(9)));
         assert_eq!(term("configured"), Some(MetricValue::Int(12)));
         let prefiltered = points
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn an_unmeasured_term_is_absent_not_zero() {
         let report = TickReport::default();
-        let cap = CapView::from_terms(8, usize::MAX, 6);
+        let cap = CapView::from_terms(8, usize::MAX, 0);
         let attrs = tick_attributes(&report, Some(cap), None);
         assert!(attrs.iter().all(|(k, _)| k != "loom.dispatch.cap_disk"));
         assert!(attrs

@@ -1,4 +1,5 @@
-//! Tests for the curator/auditor/guide event triggers (#10816).
+//! Tests for the auditor/guide event triggers (#10816). Curator's trigger was
+//! retired with its interval (#11911): it is a step role.
 //!
 //! The decision ([`should_launch`]) is pure, so most cases drive it directly.
 //! The gate ([`run_with_trigger_gate`]) and the dispatcher wiring are driven
@@ -7,7 +8,7 @@
 
 use super::*;
 use crate::role_runner::concurrent_dispatch::{
-    admit_root_tick, DecideFn, QueueProbe, RoleDispatcher, RunnerFactory,
+    admit_root_tick, DecideFn, RoleDispatcher, RunnerFactory,
 };
 use crate::role_runner::triggers::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -130,59 +131,18 @@ fn auditor_failed_run_does_not_advance_the_last_audited_sha() {
     assert!(ran, "a changed main launches");
 }
 
-// -- curator ----------------------------------------------------------------
+// -- curator (retired, #11911) ------------------------------------------------
 
+/// Curator is a step role: it has no trigger, and the gate runs it (were it
+/// ever dispatched) without reading anything.
 #[test]
-fn curator_skips_with_zero_untriaged_issues() {
-    let d = should_launch("curator", &inputs(Observation::Count(0), None));
-    assert!(!d.launches(), "{d:?}");
-    assert_eq!(trigger_of(&d), Trigger::Debt(UNTRIAGED_AXIS));
-}
-
-#[test]
-fn curator_work_observation_counts_triage_including_revise_send_backs() {
-    // Champion's revise verdict sets `loom:triage` (#11860), so the triage
-    // listing is what observes a pending revision. Every label here must be a
-    // declared registry label: a retired one would count nothing once
-    // `labels migrate` has run.
-    assert!(CURATOR_WORK_LABELS.contains(&"loom:triage"));
-    let reg = crate::label_registry::Registry::embedded();
-    for l in CURATOR_WORK_LABELS {
-        assert!(reg.get(l).is_some(), "{l} is not a declared label");
-    }
-}
-
-#[test]
-fn curator_work_observation_counts_the_blocked_unnamed_queue() {
-    // A repository whose only pending Curator work is `loom:blocked-unnamed`
-    // (#10558) must be observed, or event triggers wait out the quiet ceiling.
-    assert!(CURATOR_WORK_LABELS.contains(&"loom:blocked-unnamed"));
-    let d = should_launch("curator", &inputs(Observation::Count(1), None));
-    assert!(d.launches(), "{d:?}");
-}
-
-#[test]
-fn curator_launches_with_untriaged_issues() {
-    let d = should_launch("curator", &inputs(Observation::Count(3), None));
-    assert!(d.launches(), "{d:?}");
-    assert_eq!(trigger_of(&d), Trigger::Debt(UNTRIAGED_AXIS));
-}
-
-#[test]
-fn curator_unobserved_listing_fails_open_with_floor() {
-    let d = should_launch("curator", &inputs(unobserved(), None));
-    assert!(d.launches(), "{d:?}");
-    assert_eq!(trigger_of(&d), Trigger::Floor);
-}
-
-#[test]
-fn curator_gate_skip_spawns_nothing_and_is_not_a_failure() {
-    let (p, calls) = probe(Observation::Count(0));
+fn curator_has_no_trigger() {
+    assert!(!is_triggered_role("curator"));
+    let (p, calls) = probe(fingerprint(SHA_A));
     let (out, ran) = gate(enabled(), &p, ledger(), "curator", RoleTickOutcome::Success);
-    assert!(!ran);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(out, RoleTickOutcome::QueueEmpty);
-    assert!(!crate::role_tick_telemetry::classify(&out).0.spawned());
+    assert!(ran);
+    assert_eq!(out, RoleTickOutcome::Success);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no probe read for an untriggered role");
 }
 
 // -- guide ------------------------------------------------------------------
@@ -235,7 +195,6 @@ fn set_fingerprint_ignores_order_and_duplicates() {
 fn quiet_ceiling_launches_with_floor_whatever_the_input() {
     for (role, obs, last) in [
         ("auditor", fingerprint(SHA_A), Some(SHA_A)),
-        ("curator", Observation::Count(0), None),
         ("guide", fingerprint("s"), Some("s")),
     ] {
         let mut i = inputs(obs, last);
@@ -251,11 +210,11 @@ fn ledger_quiet_clock_starts_at_first_sighting_and_resets_on_success() {
     let l = TriggerLedger::default();
     let root = Path::new("/r/repo");
     let t0 = Instant::now();
-    assert_eq!(l.read(root, "curator", t0), (None, Duration::ZERO));
+    assert_eq!(l.read(root, "guide", t0), (None, Duration::ZERO));
     let t1 = t0 + Duration::from_secs(90);
-    assert_eq!(l.read(root, "curator", t1).1, Duration::from_secs(90));
-    l.record_success(root, "curator", None, t1);
-    assert_eq!(l.read(root, "curator", t1 + Duration::from_secs(5)).1, Duration::from_secs(5));
+    assert_eq!(l.read(root, "guide", t1).1, Duration::from_secs(90));
+    l.record_success(root, "guide", None, t1);
+    assert_eq!(l.read(root, "guide", t1 + Duration::from_secs(5)).1, Duration::from_secs(5));
     // A success without a fingerprint keeps the previous one.
     l.record_success(root, "auditor", Some(SHA_A.to_string()), t1);
     l.record_success(root, "auditor", None, t1);
@@ -264,10 +223,10 @@ fn ledger_quiet_clock_starts_at_first_sighting_and_resets_on_success() {
 
 #[test]
 fn flag_off_runs_every_role_with_no_probe_read() {
-    let (p, calls) = probe(Observation::Count(0));
+    let (p, calls) = probe(fingerprint(SHA_A));
     let off = EventTriggerConfig::default();
     assert!(!off.enabled, "default is off");
-    for role in ["curator", "auditor", "guide", "judge"] {
+    for role in ["auditor", "guide", "champion"] {
         let (out, ran) = gate(off, &p, ledger(), role, RoleTickOutcome::Success);
         assert!(ran, "{role} runs with the flag off");
         assert_eq!(out, RoleTickOutcome::Success);
@@ -277,8 +236,8 @@ fn flag_off_runs_every_role_with_no_probe_read() {
 
 #[test]
 fn untriggered_roles_are_never_gated() {
-    let (p, calls) = probe(Observation::Count(0));
-    for role in ["judge", "doctor", "champion", "hermit"] {
+    let (p, calls) = probe(fingerprint(SHA_A));
+    for role in ["curator", "judge", "doctor", "champion", "hermit"] {
         assert!(!is_triggered_role(role));
         let (_, ran) = gate(enabled(), &p, ledger(), role, RoleTickOutcome::Success);
         assert!(ran, "{role}");
@@ -288,13 +247,13 @@ fn untriggered_roles_are_never_gated() {
 
 #[test]
 fn decision_log_line_names_role_root_trigger_and_reason() {
-    let d = should_launch("curator", &inputs(Observation::Count(0), None));
-    let line = decision_log_line("curator", Path::new("/r/repo"), &d);
+    let d = should_launch("auditor", &inputs(fingerprint(SHA_A), Some(SHA_A)));
+    let line = decision_log_line("auditor", Path::new("/r/repo"), &d);
     for part in [
         "skip",
-        "role=curator",
+        "role=auditor",
         "root=/r/repo",
-        "trigger=debt:untriaged",
+        "trigger=event",
         "reason=",
     ] {
         assert!(line.contains(part), "{part} missing from {line}");
@@ -368,7 +327,7 @@ impl RoleInvocationRunner for CountingRunner {
     }
 }
 
-fn dispatch_curator_once(config: &str, obs: Observation) -> (RoleTickOutcome, usize) {
+fn dispatch_auditor_once(config: &str, obs: Observation) -> (RoleTickOutcome, usize) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -383,21 +342,19 @@ fn dispatch_curator_once(config: &str, obs: Observation) -> (RoleTickOutcome, us
         let invoked = Arc::clone(&invoked);
         Arc::new(move |_| Box::new(CountingRunner(Arc::clone(&invoked))))
     };
-    let queue: QueueProbe = Arc::new(|_, _| Ok(true));
     let decide: DecideFn = Box::new(|root, in_progress, _| {
         admit_root_tick(
             root,
-            "curator",
-            "/loom:curator".to_string(),
+            "auditor",
+            "/loom:auditor".to_string(),
             in_progress,
             &read_role_runner_config(root),
         )
     });
-    let spec = *DEFAULT_ROLES.iter().find(|s| s.name == "curator").unwrap();
+    let spec = *DEFAULT_ROLES.iter().find(|s| s.name == "auditor").unwrap();
     let (p, _) = probe(obs);
-    let mut d =
-        RoleDispatcher::with_decide(spec, Duration::from_secs(300), factory, queue, None, decide)
-            .with_triggers(p, ledger());
+    let mut d = RoleDispatcher::with_decide(spec, Duration::from_secs(300), factory, None, decide)
+        .with_triggers(p, ledger());
     let in_progress = new_in_progress_guard();
     let tick = d.dispatch_tick(vec![tmp.path().to_path_buf()], &in_progress);
     assert_eq!(tick.spawned.len(), 1, "the root is admitted; the gate runs inside the run");
@@ -410,18 +367,18 @@ fn dispatch_curator_once(config: &str, obs: Observation) -> (RoleTickOutcome, us
 }
 
 #[test]
-fn dispatcher_skips_an_enabled_curator_with_no_untriaged_issues() {
+fn dispatcher_runs_the_auditor_gate_inside_the_admitted_run() {
     let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"eventTriggers":{"enabled":true}}}}"#;
-    let (outcome, invoked) = dispatch_curator_once(cfg, Observation::Count(0));
-    assert_eq!(outcome, RoleTickOutcome::QueueEmpty);
-    assert_eq!(invoked, 0);
-    let (outcome, invoked) = dispatch_curator_once(cfg, Observation::Count(2));
+    // A fresh ledger per dispatch: the first sighting of a SHA launches.
+    let (outcome, invoked) = dispatch_auditor_once(cfg, fingerprint(SHA_A));
     assert_eq!((outcome, invoked), (RoleTickOutcome::Success, 1));
+    let (outcome, invoked) = dispatch_auditor_once(cfg, unobserved());
+    assert_eq!((outcome, invoked), (RoleTickOutcome::Success, 1), "unobserved fails open");
 }
 
 #[test]
-fn dispatcher_with_the_flag_off_launches_curator_as_before() {
+fn dispatcher_with_the_flag_off_launches_auditor_as_before() {
     let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true}}}"#;
-    let (outcome, invoked) = dispatch_curator_once(cfg, Observation::Count(0));
+    let (outcome, invoked) = dispatch_auditor_once(cfg, fingerprint(SHA_A));
     assert_eq!((outcome, invoked), (RoleTickOutcome::Success, 1));
 }

@@ -2090,17 +2090,15 @@ fn review_stall_watchdog_restarts_stalled_sweep_once_then_gives_up() {
     let _ = reg.cancel(&second_id, Duration::from_secs(2));
 }
 
-// --- review_stall_watchdog_once: open-linked-PR handoff (Issue #7649) ---
+// --- review_stall_watchdog_once: open linked PR (#7649, #11911) ---
 
-/// Core acceptance criterion: a review-stalled sweep whose issue already
-/// has a CONFIRMED open linked PR converts its recovery to
-/// `SweepKind::PrSet` instead of restarting `Issue` work — no second
-/// Builder/Curator spawn, the issue's own worktree (and any uncommitted
-/// bytes in it) is left completely untouched, and the returned/dispatched
-/// kind is `PrSet`, not `Issue`.
+/// A review-stalled sweep whose issue already has a CONFIRMED open linked
+/// PR is not restarted as `Issue` work (no second Builder/Curator spawn, the
+/// worktree untouched), and since #11911 not converted to a daemon-spawned
+/// `SweepKind::PrSet` sweep either: the step engine draws the PR at its stage.
 #[test]
 #[serial]
-fn review_stall_watchdog_converts_open_pr_recovery_to_prset() {
+fn review_stall_watchdog_leaves_an_open_pr_recovery_to_the_step_engine() {
     let tmp = tempdir().unwrap();
     let ws = tmp.path();
     std::env::set_var("LOOM_REPO", "rjwalters/loom");
@@ -2126,11 +2124,10 @@ fn review_stall_watchdog_converts_open_pr_recovery_to_prset() {
     );
 
     // 3. Zero timeout forces the stall verdict. The Issue-keyed recovery
-    //    re-dispatch hits the real #4123 open-PR guard (PR #9200 is
-    //    open) and is refused — the fix converts that refusal into a
-    //    `PrSet([9200])` dispatch instead of stranding the recovery.
+    //    re-dispatch hits the real #4123 open-PR guard (PR #9200 is open)
+    //    and is refused; nothing else is spawned.
     let restarts = reg.review_stall_watchdog_once(Duration::ZERO);
-    assert_eq!(restarts, 1, "the conversion counts as one recovered sweep");
+    assert_eq!(restarts, 0, "a refused recovery is not a restart");
 
     // No Issue-kind sweep for 9100 is running — no Builder/Curator was
     // re-spawned for it.
@@ -2138,10 +2135,13 @@ fn review_stall_watchdog_converts_open_pr_recovery_to_prset() {
         running_issue_sweep_id(&reg, 9100).is_none(),
         "the Issue-keyed recovery must not run — its open PR already exists"
     );
-    // A PrSet([9200]) sweep IS running — Judge/Doctor -> Merge picks up
-    // the existing PR directly.
-    let prset_id = running_prset_sweep_id(&reg, &[9200])
-        .expect("the recovery must convert to a PrSet([9200]) dispatch");
+    // No PrSet sweep either: the daemon spawns no `/loom:sweep` (#11911).
+    assert!(
+        reg.entries
+            .values()
+            .all(|i| !matches!(i.kind, SweepKind::PrSet(_))),
+        "the PrSet conversion is retired"
+    );
 
     // Bounded retry bookkeeping unchanged: the single allowed attempt for
     // issue 9100 is consumed exactly like an ordinary Issue-kind restart.
@@ -2152,7 +2152,7 @@ fn review_stall_watchdog_converts_open_pr_recovery_to_prset() {
     assert_eq!(
         std::fs::read_to_string(wt.join("dirty.txt")).unwrap(),
         "uncommitted Builder output\n",
-        "the PrSet conversion must never touch the issue's worktree"
+        "the refused recovery must never touch the issue's worktree"
     );
 
     // `cancel()` left the issue at loom:building (its PR is open, #11852 —
@@ -2178,8 +2178,6 @@ fn review_stall_watchdog_converts_open_pr_recovery_to_prset() {
              recovery; got: {calls:?}"
     );
 
-    // Cleanup: cancel the lingering PrSet child + release its PR lock.
-    let _ = reg.cancel(&prset_id, Duration::from_secs(2));
     std::env::remove_var("LOOM_REPO");
 }
 
@@ -2215,53 +2213,6 @@ fn review_stall_watchdog_retains_issue_recovery_when_no_linked_pr() {
     );
 
     let _ = reg.cancel(&second_id, Duration::from_secs(2));
-    std::env::remove_var("LOOM_REPO");
-}
-
-/// A live peer sweep already owns the PR-set claim lock for the open
-/// linked PR (the "existing PR owner deduplicates" acceptance criterion):
-/// the conversion attempt must fail closed (PR lock collision), never
-/// invent a duplicate PrSet sweep, and must not panic or otherwise crash
-/// the watchdog tick — the issue is simply left recoverable for the next
-/// pass (bounded: the single retry for THIS issue is still consumed, so
-/// it does not loop).
-#[test]
-#[serial]
-fn review_stall_watchdog_prset_conversion_dedupes_against_existing_pr_owner() {
-    let tmp = tempdir().unwrap();
-    let ws = tmp.path();
-    std::env::set_var("LOOM_REPO", "rjwalters/loom");
-    let (mut reg, _gh_log) = open_pr_review_stall_registry(ws, "9300", 0);
-
-    // A peer sweep already holds PR #9300's claim lock.
-    reg.acquire_pr_lock(9300, "peer-sweep-already-running")
-        .unwrap();
-
-    let out = reg
-        .dispatch(&SweepKind::Issue(9102), None, None, None, None)
-        .unwrap();
-    assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
-    let wt = ws.join(".loom").join("worktrees").join("issue-9102");
-    std::fs::create_dir_all(&wt).unwrap();
-
-    // The conversion is attempted but the PR lock collision refuses it —
-    // no sweep recovered this tick, and no duplicate PrSet spawned.
-    let restarts = reg.review_stall_watchdog_once(Duration::ZERO);
-    assert_eq!(restarts, 0, "a PR-lock collision must not be counted as a recovery");
-    assert!(
-        running_issue_sweep_id(&reg, 9102).is_none(),
-        "no Issue-keyed sweep should be running either — the guard still refuses it"
-    );
-    assert!(
-        running_prset_sweep_id(&reg, &[9300]).is_none(),
-        "must not spawn a duplicate PrSet sweep for a PR another sweep already owns"
-    );
-    // Bounded: the single retry is still consumed even though the
-    // conversion attempt itself failed, so this issue never loops.
-    assert!(reg.review_stall_retried.contains(&9102));
-
-    // Cleanup: release the peer's lock.
-    let _ = reg.release_pr_lock_owned(9300, "peer-sweep-already-running");
     std::env::remove_var("LOOM_REPO");
 }
 

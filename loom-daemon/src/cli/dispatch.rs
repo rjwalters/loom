@@ -1,4 +1,9 @@
 //! `loom-daemon dispatch` handler (Issue #4712 — split out of `main.rs`).
+//!
+//! An attended surface, like the `dispatch_sweep` MCP tool and Safehouse
+//! ChatOps `dispatch`: since #11911 the daemon spawns no `/loom:sweep` of its
+//! own (its work finder draws steps, #11909), and a `DispatchSweep` request is
+//! how an operator or an attended `/loom:sweep` (Stage -1) still runs one.
 
 use anyhow::Result;
 use serde::Deserialize;

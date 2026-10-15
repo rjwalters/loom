@@ -1,26 +1,24 @@
 //! Busy agent slots by role, per host (Issue #11847).
 //!
-//! A daemon runs two agent pools, each under its own ceiling:
+//! A daemon runs two kinds of agent under **one** host budget (#11911,
+//! [`crate::host_budget`]), `loom.dispatch.max_concurrent`:
 //!
-//! - the **sweep pool**: the work finder's issue sweeps, bounded by
-//!   `autonomous.workFinder.maxConcurrent` (`loom.dispatch.max_concurrent`);
-//! - the **role pool**: role-runner agents (Curator, Champion, Judge, Doctor,
-//!   …), bounded by `autonomous.roleRunner.maxConcurrent`.
+//! - the **registry slots**: the work finder's steps (and any sweep an
+//!   attended session dispatched);
+//! - the **role-runner agents** (Champion non-item, Guide, Auditor, Hermit,
+//!   Architect), whose ceiling is what the steps leave of the budget.
 //!
 //! `loom.dispatch.busy_slots{role}` reports both, sampled on every work-finder
 //! tick: `role="sweep"` is the tick's own occupancy reading, the same one
 //! `loom.dispatch.idle_slots` is computed from, so for one tick
 //! `busy_slots{role="sweep"} + idle_slots = max_concurrent` (more only while
-//! occupancy is over the cap). Each role-runner role has its own series, `0`
-//! included for every built-in role, with `loom.dispatch.role_max_concurrent`
-//! the pool's ceiling and `loom.dispatch.role_idle_slots` what is left under
-//! it, so `Σ busy_slots{role≠"sweep"} + role_idle_slots = role_max_concurrent`.
-//! The host's whole agent capacity is the sum of the two ceilings.
-//!
-//! The role ceiling is the largest among the tick's repos with the role
-//! runner enabled (admission resolves it per repo), re-read at most every
-//! [`CEILING_TTL`]. `loom-daemon status` resolves it from the primary
-//! workspace only, so on a host whose repos disagree the two can differ.
+//! occupancy is over the cap; `idle_slots` is kept one more release for the
+//! dashboards that have not moved to `busy_slots`). Each role-runner role has
+//! its own series, `0` included for every built-in role, with
+//! `loom.dispatch.role_max_concurrent` the role runner's share (the budget
+//! less the occupancy) and `loom.dispatch.role_idle_slots` what is left under
+//! it, so `Σ busy_slots{role≠"sweep"} + role_idle_slots = role_max_concurrent`,
+//! and the host's whole capacity is `max_concurrent`.
 //!
 //! Absent, never a guessed zero: no occupancy reading, no `sweep` point; no
 //! role-runner guard in the process, no role points. A PR-set sweep
@@ -38,7 +36,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::TickReport;
@@ -49,20 +46,6 @@ pub const SWEEP_ROLE: &str = "sweep";
 
 fn int(count: usize) -> i64 {
     i64::try_from(count).unwrap_or(i64::MAX)
-}
-
-/// The role-runner pool's ceiling for this host: the largest
-/// `autonomous.roleRunner.maxConcurrent` among `roots` whose role runner is
-/// enabled (admission resolves the ceiling per root, so the largest is the
-/// most any root admits to), `0` when none is. Pure given the configs.
-#[must_use]
-pub fn role_ceiling(configs: &[crate::role_runner::RoleRunnerConfig]) -> usize {
-    configs
-        .iter()
-        .filter(|config| crate::role_runner::resolve_enabled(config))
-        .map(crate::role_runner::resolve_max_concurrent)
-        .max()
-        .unwrap_or(0)
 }
 
 /// The tick's busy-slot points. `occupancy` is the tick's sweep occupancy;
@@ -155,55 +138,23 @@ fn published_steps() -> Option<BTreeMap<&'static str, usize>> {
     Some(total)
 }
 
-/// How long a resolved role ceiling is reused before the roots' configs are
-/// read again. The ceiling is a config value, not load: re-reading every
-/// root's `.loom/config.json` on every tick buys nothing, while this bound
-/// still picks up an operator's `maxConcurrent` edit within minutes.
-pub const CEILING_TTL: Duration = Duration::from_secs(300);
-
-/// The last resolved ceiling, with the roots it was resolved for.
-struct CeilingCache {
-    roots: Vec<PathBuf>,
-    at: Instant,
-    ceiling: usize,
+/// The role runner's share of the host budget this tick: the budget less the
+/// tick's occupancy (#11911). Pure.
+#[must_use]
+pub fn role_share(max_concurrent: usize, occupancy: Option<usize>) -> usize {
+    max_concurrent.saturating_sub(occupancy.unwrap_or(0))
 }
 
-static CEILING: Mutex<Option<CeilingCache>> = Mutex::new(None);
-
-/// [`role_ceiling`] of `roots`' configs, cached for [`CEILING_TTL`] and
-/// re-resolved at once when the root set changes.
-fn cached_role_ceiling(roots: &[PathBuf]) -> usize {
-    let mut cache = CEILING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(hit) = cache
-        .as_ref()
-        .filter(|c| c.roots == roots && c.at.elapsed() < CEILING_TTL)
-    {
-        return hit.ceiling;
-    }
-    let configs: Vec<_> = roots
-        .iter()
-        .map(|root| crate::role_runner::read_role_runner_config(root))
-        .collect();
-    let ceiling = role_ceiling(&configs);
-    *cache = Some(CeilingCache {
-        roots: roots.to_vec(),
-        at: Instant::now(),
-        ceiling,
-    });
-    ceiling
-}
-
-/// Export the tick's busy slots. A no-op without an ops sink.
-pub fn record_tick(report: &TickReport, roots: &[PathBuf]) {
+/// Export the tick's busy slots. A no-op without an ops sink. Role points
+/// are emitted only while this process runs a role runner.
+pub fn record_tick(report: &TickReport, max_concurrent: usize) {
     if super::global_ops_sink().is_none() {
         return;
     }
     let running = crate::role_runner::global_active_runs_by_role();
     let roles = running
         .as_ref()
-        .map(|running| (running, cached_role_ceiling(roots)));
+        .map(|running| (running, role_share(max_concurrent, report.occupancy)));
     let mut points = busy_points(report.occupancy, roles);
     if let Some(steps) = published_steps() {
         points.extend(step_points(&steps));

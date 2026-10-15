@@ -2009,6 +2009,8 @@ mod building_listing;
 pub(crate) mod open_pr_hold;
 /// The ETag-cached REST open-PR listing the PR-side passes share (#10349).
 pub(crate) mod open_pr_listing;
+/// The lease gate on PR-side reclaims (#11911).
+mod pr_lease_gate;
 /// The startup pass's zero-evidence reclaim stops at this daemon's own claims (#12222).
 mod startup_cutoff;
 
@@ -2908,6 +2910,9 @@ pub mod forge {
                 let PrReconcileAction::Reclaim(reason) = action else {
                     continue;
                 };
+                if super::pr_lease_gate::lease_keeps_pr_claim(gh_bin, root, pr_number, kind) {
+                    continue;
+                }
                 let reclaimed = if recover {
                     match reclaim_pr(gh_bin, root, pr_number, label) {
                         Ok(()) => {

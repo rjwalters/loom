@@ -252,6 +252,8 @@ pub mod health_monitor;
 pub mod hooks_home;
 pub mod host_affinity;
 pub mod host_breaker;
+/// One host budget shared by steps and role-runner agents (#11911).
+pub mod host_budget;
 pub mod host_identity;
 pub mod host_optout;
 pub mod host_pressure;
@@ -303,6 +305,8 @@ pub mod phase_join;
 pub mod pi_usage;
 pub mod pipeline_snapshot;
 pub mod points_marker;
+/// Open-PR debt per repository, fed by the step tick (#9392, #11911).
+pub mod pr_debt;
 pub mod pr_latency;
 // #11931: a terminated role run's PR leases are released on its behalf.
 pub mod pr_lease_reap;
@@ -339,6 +343,8 @@ pub mod repo_root;
 pub mod restart_verify;
 /// Fork-point provenance for `.loom/resync-ignore` pins (#8726).
 pub mod resync_pin;
+/// Config keys retired with the old dispatch paths, parsed only to warn (#11911).
+pub mod retired_config;
 pub mod retry_classify;
 /// The `sweep.outcome` rework-event marker protocol (#9444): where the file
 /// lives, the `kind` vocabulary, the substantive/environmental table, and the

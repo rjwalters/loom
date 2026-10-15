@@ -4,45 +4,13 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
-use super::super::{tick_multi_with_repo_cap, WorkDispatcher, WorkItem, WorkSource};
 use super::{causes_per_root, HaltCause};
 use crate::main_health_gate::WorkspaceHealthStates;
 use crate::types::QueueDisposition;
 
 // ---- minimal fakes (same shape as `ready_queue_tests.rs`) -----------------
-
-struct OneShotSource(Option<Vec<WorkItem>>);
-
-impl WorkSource for OneShotSource {
-    fn list_ready_issues(&mut self) -> anyhow::Result<Vec<WorkItem>> {
-        Ok(self.0.take().unwrap_or_default())
-    }
-}
-
-fn item(n: u32) -> WorkItem {
-    WorkItem::with_created_at(n, vec!["loom:issue".to_string()], None)
-}
-
-#[derive(Default)]
-struct Disp {
-    dispatched: Vec<u32>,
-}
-
-impl WorkDispatcher for Disp {
-    fn in_flight(&self) -> HashSet<u32> {
-        HashSet::new()
-    }
-    fn occupancy(&self) -> usize {
-        self.dispatched.len()
-    }
-    fn dispatch(&mut self, issue: u32) -> anyhow::Result<bool> {
-        self.dispatched.push(issue);
-        Ok(true)
-    }
-}
 
 // ---- vocabulary -----------------------------------------------------------
 
@@ -189,70 +157,6 @@ fn cause_presence_matches_the_bool_fold() {
 
 // ---- the row the operator sees ---------------------------------------------
 
-fn halted_row(halt_causes: Option<&[Option<HaltCause>]>) -> crate::types::ReadyQueueRow {
-    let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[],
-        10.into(),
-        &[true],
-        halt_causes,
-        usize::MAX,
-        false,
-        None,
-        &[],
-    );
-    assert_eq!(report.queue.len(), 1);
-    let rows = super::super::ready_queue::finish(&report.queue, &[]);
-    rows.into_iter().next().unwrap()
-}
-
-/// **The AC.** A `workspace_halted` row names its cause in `detail`, one
-/// token per hold source, on the closed vocabulary.
-#[test]
-fn workspace_halted_row_names_its_cause_in_detail() {
-    for (cause, token) in [
-        (HaltCause::MainRed, "main_red"),
-        (HaltCause::GatePending, "gate_pending"),
-        (HaltCause::TokenPool, "token_pool"),
-        (HaltCause::PreflightAdvisory, "preflight_advisory"),
-        (HaltCause::Drain, "drain"),
-        (HaltCause::Breaker, "breaker"),
-    ] {
-        let row = halted_row(Some(&[Some(cause)]));
-        assert_eq!(row.disposition, QueueDisposition::WorkspaceHalted, "{token}");
-        assert_eq!(row.detail.as_deref(), Some(token), "{token}");
-    }
-}
-
-/// Legacy callers (no cause slice) keep a cause-less row byte-for-byte.
-#[test]
-fn workspace_halted_row_without_causes_keeps_a_empty_detail() {
-    let row = halted_row(None);
-    assert_eq!(row.disposition, QueueDisposition::WorkspaceHalted);
-    assert_eq!(row.detail, None);
-}
-
-/// A cause at a not-held index is inert: `halted` stays authoritative for
-/// routing, so the row is dispatched, not halted.
-#[test]
-fn a_cause_at_a_not_held_index_never_halts_the_workspace() {
-    let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[],
-        10.into(),
-        &[false],
-        Some(&[Some(HaltCause::MainRed)]),
-        usize::MAX,
-        false,
-        None,
-        &[],
-    );
-    assert_eq!(report.dispatched, 1);
-    assert_eq!(multi[0].1.dispatched, vec![9]);
-}
-
 /// The cause is safe on public views: `exportable_detail` passes a
 /// `workspace_halted` row's detail through (closed vocabulary, #9017).
 #[test]
@@ -302,103 +206,7 @@ fn disk_reservation_is_a_pinned_lowest_precedence_cause() {
     assert_eq!(super::with_disk_holds(vec![None, None], None), vec![None, None]);
 }
 
-#[test]
-fn pass_two_defers_a_heavy_repo_on_disk_and_admits_a_light_one() {
-    let mut multi = vec![
-        (OneShotSource(Some(vec![item(1)])), Disp::default()),
-        (OneShotSource(Some(vec![item(2), item(3)])), Disp::default()),
-    ];
-    let report = super::super::tick_multi_with_build_backoff(
-        &mut multi,
-        &[1000, 1],
-        10.into(),
-        &[false, false],
-        None,
-        usize::MAX,
-        false,
-        (None, None, Some(disk_budget(14))),
-        &[],
-        &[],
-    );
-    assert!(multi[0].1.dispatched.is_empty(), "28 GB does not fit 14 GB");
-    assert_eq!(multi[1].1.dispatched, vec![2, 3], "a light repo still admits");
-    assert_eq!((report.dispatched, report.deferred_capacity), (2, 1));
-    let rows = super::super::ready_queue::finish(&report.queue, &[]);
-    let heavy = rows.iter().find(|r| r.issue == 1).unwrap();
-    assert_eq!(heavy.disposition, QueueDisposition::DeferredCapacity);
-    let detail = heavy.detail.as_deref().unwrap_or_default();
-    assert!(
-        detail.contains("disk: heavy charge 28GB (observed) exceeds remaining 14GB"),
-        "{detail}"
-    );
-}
-
-#[test]
-fn pass_two_debits_each_disk_admission() {
-    // 30 GB: one heavy sweep fits (28), the second does not, and the 2 GB
-    // left then admits two light sweeps but not a third.
-    let mut multi = vec![
-        (OneShotSource(Some(vec![item(1), item(2)])), Disp::default()),
-        (OneShotSource(Some(vec![item(3), item(4), item(5)])), Disp::default()),
-    ];
-    let report = super::super::tick_multi_with_build_backoff(
-        &mut multi,
-        &[1000, 1],
-        10.into(),
-        &[false, false],
-        None,
-        usize::MAX,
-        false,
-        (None, None, Some(disk_budget(30))),
-        &[],
-        &[],
-    );
-    assert_eq!(multi[0].1.dispatched, vec![1]);
-    assert_eq!(multi[1].1.dispatched, vec![3, 4]);
-    assert_eq!(report.deferred_capacity, 2);
-}
-
 // ---- the tick's own result (#11649) ----------------------------------------
-
-/// **#11649.** The tick report carries the distinct causes of the workspaces
-/// it held — not just "something was halted" — so the `loom.dispatch.tick`
-/// result can say `halted_disk_reservation` instead of `halted_main_red`.
-/// Duplicates fold, the order is `HaltCause::ALL`, and a cause at a not-held
-/// index is ignored.
-#[test]
-fn tick_report_carries_the_held_workspaces_distinct_causes() {
-    let mut multi: Vec<_> = (0..4)
-        .map(|n| (OneShotSource(Some(vec![item(n + 1)])), Disp::default()))
-        .collect();
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[],
-        10.into(),
-        &[true, true, true, false],
-        Some(&[
-            Some(HaltCause::DiskReservation),
-            Some(HaltCause::Drain),
-            Some(HaltCause::DiskReservation),
-            Some(HaltCause::MainRed),
-        ]),
-        usize::MAX,
-        false,
-        None,
-        &[],
-    );
-    assert!(report.halted);
-    assert_eq!(report.halt_causes, vec![HaltCause::Drain, HaltCause::DiskReservation]);
-    // The not-held workspace still dispatched, and that outranks the hold.
-    let tick = crate::observability::ops::dispatch::tick_result_with(&report, false);
-    assert_eq!((report.dispatched, tick), (1, "dispatched"));
-
-    // A cause-less caller holds without naming a cause.
-    let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
-    let report =
-        tick_multi_with_repo_cap(&mut multi, &[], 10.into(), &[true], None, 1, false, None, &[]);
-    assert!(report.halted);
-    assert!(report.halt_causes.is_empty());
-}
 
 /// #11649: the single-workspace loop's cause follows `causes_per_root`'s
 /// precedence, and is `None` exactly when nothing holds the root.
@@ -413,112 +221,4 @@ fn single_root_names_the_highest_precedence_hold() {
     assert_eq!(cause((false, false, true, false)), Some(HaltCause::TokenPool));
 }
 
-/// #11742: a held workspace keeps its own hold's cause even at weight 0 (a
-/// weightless `fleet: maintain` repo reads `maintain_only`, not
-/// `weight_zero`); an unheld weight-0 workspace reads `weight_zero`.
-#[test]
-fn a_hold_cause_wins_over_weight_zero() {
-    let row = |held: bool| {
-        let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
-        let report = tick_multi_with_repo_cap(
-            &mut multi,
-            &[0],
-            10.into(),
-            &[held],
-            Some(&[held.then_some(HaltCause::MaintainOnly)]),
-            usize::MAX,
-            false,
-            None,
-            &[],
-        );
-        let rows = super::super::ready_queue::finish(&report.queue, &[]);
-        rows.into_iter().next().unwrap()
-    };
-    assert_eq!(row(true).detail.as_deref(), Some("maintain_only"));
-    assert_eq!(row(false).detail.as_deref(), Some("weight_zero"));
-    assert_eq!(row(false).disposition, QueueDisposition::WorkspaceHalted);
-}
-
 // ---- a partial hold does not name the tick (#11857) ------------------------
-
-/// Run one multi-workspace tick over `backlogs` (one ready list per root) with
-/// `held[i]` holding root `i` as maintain-only, and return the report plus
-/// its `loom.dispatch.tick` result.
-fn held_tick(
-    backlogs: Vec<Vec<WorkItem>>,
-    held: &[bool],
-) -> (super::super::TickReport, &'static str) {
-    let mut multi: Vec<_> = backlogs
-        .into_iter()
-        .map(|ready| (OneShotSource(Some(ready)), Disp::default()))
-        .collect();
-    let causes: Vec<Option<HaltCause>> = held
-        .iter()
-        .map(|&h| h.then_some(HaltCause::MaintainOnly))
-        .collect();
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[],
-        10.into(),
-        held,
-        Some(&causes),
-        usize::MAX,
-        false,
-        None,
-        &[],
-    );
-    let result = crate::observability::ops::dispatch::tick_result_with(&report, false);
-    (report, result)
-}
-
-/// **#11857 acceptance.** One maintain-only root beside healthy roots that
-/// have nothing dispatchable: the hold does not cover the tick's work, so the
-/// tick reads its per-candidate result, not `halted_maintain_only`. The cause
-/// and the held count stay on the report for the span.
-#[test]
-fn one_held_root_beside_healthy_idle_roots_does_not_name_the_tick() {
-    // The healthy roots' candidates are all skipped (parked), so nothing was
-    // dispatchable there: that, not the hold, is why nothing started.
-    let parked = |n| WorkItem::with_created_at(n, vec!["loom:blocked".to_string()], None);
-    let (report, result) = held_tick(
-        vec![vec![item(1), item(2)], vec![parked(3)], vec![parked(4)]],
-        &[true, false, false],
-    );
-    assert!(report.halted, "the hold is still recorded");
-    assert!(report.halt_partial);
-    assert_eq!(report.halt_causes, vec![HaltCause::MaintainOnly]);
-    assert_eq!(report.held_roots, 1);
-    assert_eq!(result, "all_skipped");
-
-    // Nothing ready anywhere, one root of three held: an idle tick.
-    let (report, result) = held_tick(vec![vec![], vec![], vec![]], &[true, false, false]);
-    assert_eq!((report.held_roots, report.halt_partial), (1, true));
-    assert_eq!(result, "no_eligible_work");
-    assert!(!report.halted_fully(), "a partial hold leaves tick-level reactions on");
-}
-
-/// #11857: the hold names the tick when it covers the work — every root with
-/// candidates held (a healthy empty root does not dilute it), or every root
-/// held when none has any.
-#[test]
-fn a_hold_covering_every_root_with_work_names_the_tick() {
-    let (report, result) = held_tick(vec![vec![item(1)], vec![item(2)]], &[true, true]);
-    assert_eq!((report.held_roots, report.halt_partial), (2, false));
-    assert_eq!(result, "halted_maintain_only");
-    assert!(report.halted_fully());
-
-    // The held root is the only one with work: the hold explains the tick.
-    let (report, result) = held_tick(vec![vec![item(1)], vec![]], &[true, false]);
-    assert_eq!((report.held_roots, report.halt_partial), (1, false));
-    assert_eq!(result, "halted_maintain_only");
-
-    // Nothing ready anywhere and every root held.
-    let (report, result) = held_tick(vec![vec![], vec![]], &[true, true]);
-    assert_eq!((report.held_roots, report.halt_partial), (2, false));
-    assert_eq!(result, "halted_maintain_only");
-
-    // No hold at all: nothing counted, nothing partial.
-    let (report, result) = held_tick(vec![vec![], vec![]], &[false, false]);
-    assert_eq!((report.halted, report.held_roots, report.halt_partial), (false, 0, false));
-    assert_eq!(result, "no_eligible_work");
-}

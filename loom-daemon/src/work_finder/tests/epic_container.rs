@@ -28,17 +28,6 @@ fn labelled(n: u32, extra: &[&str]) -> WorkItem {
     WorkItem::new(n, labels)
 }
 
-/// An epic, a sub-epic phase (a container too), a plain phase child and an
-/// ordinary issue, all carrying `loom:issue`.
-fn rows() -> Vec<WorkItem> {
-    vec![
-        labelled(1, &[EPIC]),
-        labelled(2, &[EPIC_PHASE, EPIC]),
-        labelled(3, &[EPIC_PHASE]),
-        issue(4),
-    ]
-}
-
 #[test]
 fn an_epic_carrying_loom_issue_is_a_skipped_candidate() {
     assert!(labelled(1, &[EPIC]).is_skipped(), "default config, no extraSkipLabels");
@@ -56,53 +45,6 @@ fn an_epic_phase_child_is_not_skipped() {
     assert!(!SKIP_LABELS.contains(&EPIC_PHASE));
     assert!(!labelled(3, &[EPIC_PHASE]).is_skipped());
     assert!(!labelled(3, &[EPIC_PHASE]).is_skipped_with_capabilities(&[], &BTreeSet::new()));
-}
-
-#[test]
-fn a_tick_dispatches_the_phase_child_and_counts_the_epics_as_labeled_skips() {
-    let mut dispatcher = RecordingDispatcher::default();
-    let report = tick(&mut FakeSource::once(rows()), &mut dispatcher, 10, false).unwrap();
-    assert_eq!(dispatcher.dispatched, vec![3, 4], "neither epic row is dispatched");
-    assert_eq!(report.skipped_labeled, 2);
-    assert_eq!(report.dispatched, 2);
-    assert_eq!(report.errors, 0);
-}
-
-#[test]
-fn a_multi_workspace_tick_shows_the_epic_as_a_skipped_row_naming_the_label() {
-    let mut multi = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
-    let report = tick_multi(&mut multi, &[1], 10, &[false]);
-    assert_eq!(multi[0].1.dispatched, vec![3, 4]);
-    assert_eq!(report.skipped_labeled, 2);
-
-    // The row stays in the ready queue with its reason, so an operator can
-    // see why the epic is not being built. It does not silently vanish.
-    let queue = ready_queue::finish(&report.queue, &[]);
-    for epic in [1, 2] {
-        let row = queue
-            .iter()
-            .find(|r| r.issue == epic)
-            .unwrap_or_else(|| panic!("#{epic} must keep its ready-queue row: {queue:?}"));
-        assert_eq!(row.disposition, Qd::Parked, "{row:?}");
-        assert_eq!(row.detail.as_deref(), Some(EPIC), "{row:?}");
-    }
-    for built in [3, 4] {
-        let row = queue.iter().find(|r| r.issue == built).unwrap();
-        assert_eq!(row.disposition, Qd::Dispatched, "{row:?}");
-    }
-}
-
-#[test]
-fn repeated_ticks_never_dispatch_the_epic() {
-    // The pre-#11399 loop re-offered the epic every time the reaper restored
-    // `loom:issue`. With the skip there is no first dispatch to restore from.
-    let mut dispatcher = RecordingDispatcher::default();
-    for _ in 0..4 {
-        let mut source = FakeSource::once(vec![labelled(1, &[EPIC])]);
-        let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
-        assert_eq!(report.skipped_labeled, 1);
-    }
-    assert!(dispatcher.dispatched.is_empty());
 }
 
 #[test]
@@ -146,28 +88,11 @@ fn a_priority_epic_is_still_dropped_from_the_side_listing() {
 }
 
 #[test]
-fn a_promoted_proposal_on_a_loom_issue_row_stays_dispatchable() {
-    // Only `loom:epic` is a skip. The other Champion-path labels can sit on a
-    // promoted `loom:issue` legitimately and must keep dispatching.
-    let rows: Vec<WorkItem> = ["loom:architect", "loom:hermit", "loom:auditor"]
-        .iter()
-        .zip(30..)
-        .map(|(label, n)| labelled(n, &[label]))
-        .collect();
-    assert!(rows.iter().all(|r| !r.is_skipped()));
-    let mut dispatcher = RecordingDispatcher::default();
-    let report = tick(&mut FakeSource::once(rows), &mut dispatcher, 10, false).unwrap();
-    assert_eq!(dispatcher.dispatched, vec![30, 31, 32]);
-    assert_eq!(report.skipped_labeled, 0);
-}
-
-#[test]
-fn the_epic_supervisor_still_plans_builds_for_an_epics_ready_children() {
-    // The supervisor lists `loom:epic` issues itself and dispatches their
-    // open `loom:epic-phase` + `loom:issue` children through the registry. It
-    // never goes through the finder's candidate filter, so the skip above
-    // changes nothing for it.
+fn the_epic_supervisor_builds_nothing_for_an_epics_ready_children() {
+    // An active epic's open `loom:epic-phase` + `loom:issue` children are
+    // Builder steps the work finder draws (#11909); the supervisor's own
+    // per-child sweep dispatch is gone (#11911), so it plans nothing for them.
     let body = "# Epic\n\n### Phase 1: one\ndetails\n\n### Phase 2: two\ndetails\n";
-    let snapshot = EpicSnapshot::new(9, body, vec![PhaseChild::new(1, true)], vec![101, 102]);
-    assert_eq!(plan_epic_transition(&snapshot), EpicTransition::BuildChildren(vec![101, 102]));
+    let snapshot = EpicSnapshot::new(9, body, vec![PhaseChild::new(1, true)]);
+    assert_eq!(plan_epic_transition(&snapshot), EpicTransition::Noop);
 }

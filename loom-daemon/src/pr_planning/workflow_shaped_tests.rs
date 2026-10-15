@@ -164,94 +164,14 @@ fn a_fully_labeled_queue_is_unchanged_by_head_metadata() {
     }
 }
 
-/// The real role-runner gate, on an empty `loom:review-requested` listing.
-/// The guard logs each invocation so the cheap early-out is observable.
-#[cfg(unix)]
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn real_role_runner_gate_opens_for_a_guard_admitted_workflow_shaped_pr() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    std::fs::create_dir_all(root.join(".loom/scripts")).unwrap();
-    let script = |name: &str, body: &str| {
-        let path = root.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    };
-    let gh = script(
-        "gh",
-        r#"printf 'HTTP/2 200 OK\r\n\r\n'
-case "$*" in *issues*) echo '[]';; *) cat pulls.json;; esac"#,
-    );
-    script(
-        ".loom/scripts/judge-fallback-guard.sh",
-        "echo \"$1\" >> guard.log; test ! -f skip || exit 12; exit 0",
-    );
-    let list = |rows: Vec<Value>| {
-        std::fs::write(root.join("pulls.json"), serde_json::to_vec(&rows).unwrap()).unwrap();
-        let _ = std::fs::remove_file(root.join("guard.log"));
-    };
-    let guarded = || std::fs::read_to_string(root.join("guard.log")).unwrap_or_default();
-    let prefer = |on: bool| {
-        let config = format!(r#"{{"planning":{{"preferHumanPrs":{on}}}}}"#);
-        std::fs::write(root.join(".loom/config.json"), config).unwrap();
-    };
-    let old = std::env::var_os("LOOM_GH_BIN");
-    std::env::set_var("LOOM_GH_BIN", &gh);
-    let probe = crate::role_runner::concurrent_dispatch::forge_queue_probe();
-    let gate = || probe(root, &["loom:review-requested"]);
-
-    // (case, gate result, guard invocations) against the expectation.
-    let mut seen = Vec::new();
-    let mut run = |case: String, rows: Vec<Value>, want: bool, want_log: &'static str| {
-        list(rows);
-        let got = gate();
-        seen.push((case, got, guarded(), Ok(want), want_log));
-    };
-    for on in [true, false] {
-        prefer(on);
-        run(format!("shaped prefer={on}"), vec![shaped(2, "autonomous")], true, "2\n");
-        std::fs::write(root.join("skip"), "").unwrap();
-        run(format!("guard skip prefer={on}"), vec![shaped(2, "autonomous")], false, "2\n");
-        std::fs::remove_file(root.join("skip")).unwrap();
-        // Unlabeled, but neither workflow-shaped nor interactive: no guard run.
-        let unshaped = vec![
-            pr(3, "unknown", &[], "topic", repo(BASE_ID, "acme/widgets")),
-            pr(4, "unknown", &[], "feature/issue-7", repo(FORK_ID, "mallory/widgets")),
-        ];
-        run(format!("unshaped prefer={on}"), unshaped, false, "");
-        // Every PR labeled (approved, so not review work): no guard run.
-        let approved = vec![pr(
-            5,
-            "unknown",
-            &["loom:pr"],
-            "feature/issue-5",
-            repo(BASE_ID, "acme/widgets"),
-        )];
-        run(format!("labeled prefer={on}"), approved, false, "");
-    }
-    if let Some(old) = old {
-        std::env::set_var("LOOM_GH_BIN", old);
-    } else {
-        std::env::remove_var("LOOM_GH_BIN");
-    }
-    for (case, got, log, want, want_log) in seen {
-        assert_eq!(got, want, "{case}");
-        assert_eq!(log, want_log, "{case}: guard invocations");
-    }
-}
-
 /// #11861 review: a Champion-held PR that Doctor handed back
-/// (`loom:review-requested` + `loom:blocked`, standing trusted marker) must
-/// open the real Judge gate even when it is the only review work — the gate
-/// reads the same annotated queue `fetch_queue` serves. Without the trusted
-/// marker, neither serves it.
+/// (`loom:review-requested` + `loom:blocked`, standing trusted marker) is
+/// served to Judge even when it is the only review work. Without the trusted
+/// marker, it is not.
 #[cfg(unix)]
 #[test]
 #[serial_test::serial(loom_config_env)]
-fn real_judge_gate_opens_for_a_held_pr_handed_back_and_agrees_with_fetch_queue() {
+fn judge_is_served_a_held_pr_handed_back_only_with_a_trusted_marker() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -290,7 +210,6 @@ esac
 
     let old = std::env::var_os("LOOM_GH_BIN");
     std::env::set_var("LOOM_GH_BIN", &gh);
-    let probe = crate::role_runner::concurrent_dispatch::forge_queue_probe();
     let mut seen = Vec::new();
     for (case, body, want) in [
         ("standing marker", crate::champion_hold::MERGE_RISK_HOLD_MARKER, true),
@@ -298,18 +217,14 @@ esac
     ] {
         marker(body);
         let served = fetch_queue(root, &gh, PrRole::Judge).map(|q| !q.is_empty());
-        let gate = probe(root, &["loom:review-requested"]);
-        let work = has_judge_work(root, &gh).map_err(|e| e.to_string());
-        seen.push((case, want, served.map_err(|e| e.to_string()), work, gate));
+        seen.push((case, want, served.map_err(|e| e.to_string())));
     }
     if let Some(old) = old {
         std::env::set_var("LOOM_GH_BIN", old);
     } else {
         std::env::remove_var("LOOM_GH_BIN");
     }
-    for (case, want, served, work, gate) in seen {
+    for (case, want, served) in seen {
         assert_eq!(served, Ok(want), "{case}: fetch_queue");
-        assert_eq!(work, Ok(want), "{case}: has_judge_work");
-        assert_eq!(gate, Ok(want), "{case}: forge_queue_probe");
     }
 }

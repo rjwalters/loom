@@ -23,7 +23,7 @@
 //! | [`NeedsDecomp`] | [`DesignInPlace`] | **Architect-on-epic** — enrich the epic body in place with `### Phase` structure, **no PR** |
 //! | [`Designed`] | [`ExpandFirstPhase`] | **Champion** expand phase-1 children (under the #3707 mutex) |
 //! | [`PhaseJoin`] | [`AdvancePhase`] | **Champion** expand phase N+1 children (under the #3707 mutex, barrier-gated by [`epic_join_ready`]) |
-//! | [`Active`] | [`BuildChildren`] | nothing: the children flow as Builder steps (#11909) |
+//! | [`Active`] | [`Noop`] | nothing: the work finder draws each child as a Builder step (#11909, #11911) |
 //! | [`Done`] | [`CloseEpic`] | **Champion** close-epic |
 //!
 //! [`NeedsDecomp`]: EpicState::NeedsDecomp
@@ -34,7 +34,7 @@
 //! [`DesignInPlace`]: EpicTransition::DesignInPlace
 //! [`ExpandFirstPhase`]: EpicTransition::ExpandFirstPhase
 //! [`AdvancePhase`]: EpicTransition::AdvancePhase
-//! [`BuildChildren`]: EpicTransition::BuildChildren
+//! [`Noop`]: EpicTransition::Noop
 //! [`CloseEpic`]: EpicTransition::CloseEpic
 //! [`derive_epic_state`]: crate::epic_state::derive_epic_state
 //! [`epic_join_ready`]: crate::phase_join::epic_join_ready
@@ -61,8 +61,7 @@
 //!    records the transition it dispatched per epic and treats a re-selection
 //!    of the *same* transition as a no-op until the state advances (the ledger
 //!    entry is cleared) or a TTL elapses (so a crashed role dispatch cannot
-//!    wedge an epic forever). Sweeps dispatched for `active` children are
-//!    deduplicated per child issue number.
+//!    wedge an epic forever).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -133,25 +132,16 @@ pub struct EpicSnapshot {
     /// The epic's `loom:epic-phase` children, reduced to phase + open status —
     /// the Phase 1 input to [`derive_epic_state`].
     pub phase_children: Vec<PhaseChild>,
-    /// The issue numbers of the epic's currently-open, build-ready
-    /// `loom:issue` children (the wave the `active` transition sweeps).
-    pub open_issue_children: Vec<u32>,
 }
 
 impl EpicSnapshot {
     /// Convenience constructor.
     #[must_use]
-    pub fn new(
-        number: u32,
-        body: impl Into<String>,
-        phase_children: Vec<PhaseChild>,
-        open_issue_children: Vec<u32>,
-    ) -> Self {
+    pub fn new(number: u32, body: impl Into<String>, phase_children: Vec<PhaseChild>) -> Self {
         Self {
             number,
             body: body.into(),
             phase_children,
-            open_issue_children,
         }
     }
 
@@ -196,10 +186,6 @@ pub enum EpicTransition {
     /// serialized under the #3707 mutex **and** gated by the phase-join
     /// barrier ([`epic_join_ready`](crate::phase_join::epic_join_ready)).
     AdvancePhase,
-    /// `active`: the open `loom:issue` children to build. Gated off since
-    /// #11909: the work finder draws each child as a Builder step, so the
-    /// supervisor dispatches nothing for it.
-    BuildChildren(Vec<u32>),
     /// `done`: dispatch Champion to close the epic.
     CloseEpic,
     /// No transition is enabled this tick.
@@ -217,8 +203,6 @@ pub enum TransitionKind {
     ExpandFirstPhase,
     /// [`EpicTransition::AdvancePhase`].
     AdvancePhase,
-    /// [`EpicTransition::BuildChildren`].
-    BuildChildren,
     /// [`EpicTransition::CloseEpic`].
     CloseEpic,
     /// [`EpicTransition::Noop`].
@@ -233,7 +217,6 @@ impl EpicTransition {
             EpicTransition::DesignInPlace => TransitionKind::DesignInPlace,
             EpicTransition::ExpandFirstPhase => TransitionKind::ExpandFirstPhase,
             EpicTransition::AdvancePhase => TransitionKind::AdvancePhase,
-            EpicTransition::BuildChildren(_) => TransitionKind::BuildChildren,
             EpicTransition::CloseEpic => TransitionKind::CloseEpic,
             EpicTransition::Noop => TransitionKind::Noop,
         }
@@ -251,9 +234,8 @@ impl TransitionKind {
     /// `None` for transitions with no action-class topic.
     ///
     /// The four singleton lifecycle transitions each map to one action class
-    /// (decompose / expand / join / close). [`BuildChildren`](Self::BuildChildren)
-    /// and [`Noop`](Self::Noop) have none — per-child sweeps already surface on
-    /// `sweep.global.dispatch`, and a no-op fires nothing.
+    /// (decompose / expand / join / close). [`Noop`](Self::Noop) has none: a
+    /// no-op fires nothing.
     #[must_use]
     pub fn action_class(self) -> Option<EpicActionClass> {
         match self {
@@ -261,7 +243,7 @@ impl TransitionKind {
             TransitionKind::ExpandFirstPhase => Some(EpicActionClass::Expand),
             TransitionKind::AdvancePhase => Some(EpicActionClass::Join),
             TransitionKind::CloseEpic => Some(EpicActionClass::Close),
-            TransitionKind::BuildChildren | TransitionKind::Noop => None,
+            TransitionKind::Noop => None,
         }
     }
 }
@@ -272,24 +254,16 @@ impl TransitionKind {
 ///
 /// The phase-boundary states route through the barrier so phase N+1 (or close)
 /// never fires while a current-phase child is still open — if the barrier is
-/// held the plan degrades to [`EpicTransition::Noop`], and `active` with no
-/// build-ready children is likewise a no-op.
+/// held the plan degrades to [`EpicTransition::Noop`]. `active` is always a
+/// no-op: its build-ready children are Builder steps the work finder draws
+/// (#11909); the epic `BuildChildren` sweep dispatch was deleted (#11911).
 #[must_use]
 pub fn plan_epic_transition(snapshot: &EpicSnapshot) -> EpicTransition {
     let state = snapshot.state();
     match state {
         EpicState::NeedsDecomp => EpicTransition::DesignInPlace,
         EpicState::Designed => EpicTransition::ExpandFirstPhase,
-        EpicState::Active => {
-            if snapshot.open_issue_children.is_empty() {
-                // The phase is in flight but its build-ready children are not
-                // yet materialized (or all already dispatched upstream); the
-                // supervisor waits rather than inventing work.
-                EpicTransition::Noop
-            } else {
-                EpicTransition::BuildChildren(snapshot.open_issue_children.clone())
-            }
-        }
+        EpicState::Active => EpicTransition::Noop,
         EpicState::PhaseJoin => match barrier_admits(state, &snapshot.phase_children) {
             Some(PhaseBoundary::AdvanceToNextPhase) => EpicTransition::AdvancePhase,
             // Barrier holds (a current-phase child is still open) — do not
@@ -406,7 +380,7 @@ pub trait EpicSource {
 ///
 /// The supervisor owns *when* and *whether* (scheduling + the #3707 mutex +
 /// the phase-join barrier); the dispatcher owns *how* (spawning the role
-/// process / dispatching the sweep). Methods are synchronous — the supervisor
+/// process). Methods are synchronous — the supervisor
 /// holds the async #3707 guard across the (returning) `dispatch_role` call so
 /// the mutex genuinely serializes the burst; a concrete issue-creating
 /// dispatcher must therefore not return until its `gh issue create` burst has
@@ -414,9 +388,6 @@ pub trait EpicSource {
 pub trait EpicDispatcher {
     /// Dispatch a role with the given [`DispatchShape`] for epic `epic`.
     fn dispatch_role(&mut self, epic: u32, shape: &DispatchShape) -> Result<()>;
-
-    /// Dispatch a `/loom:sweep` for one open `loom:issue` child of `epic`.
-    fn dispatch_sweep(&mut self, epic: u32, child: u32) -> Result<()>;
 }
 
 // ============================================================================
@@ -438,9 +409,6 @@ pub struct TickReport {
     pub epics_seen: usize,
     /// Singleton role transitions actually dispatched.
     pub roles_dispatched: usize,
-    /// Individual `/loom:sweep` dispatches issued for `active` children:
-    /// always 0 since #11909 (the children are Builder steps).
-    pub sweeps_dispatched: usize,
     /// Transitions skipped because the same transition was already in flight.
     pub skipped_in_flight: usize,
     /// Epics with no enabled transition this tick.
@@ -614,10 +582,6 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             EpicTransition::Noop => {
                 report.noop += 1;
             }
-            // #11909: the children are Builder steps; nothing to dispatch.
-            EpicTransition::BuildChildren(_) => {
-                report.noop += 1;
-            }
             EpicTransition::DesignInPlace => {
                 if self.singleton_in_flight(epic, kind) {
                     report.skipped_in_flight += 1;
@@ -770,8 +734,8 @@ fn resolve_inflight_ttl() -> Duration {
 /// preserved; this layer adds the *cross-workspace* isolation.
 ///
 /// Unlike the work-finder there is no shared concurrency budget here — the epic
-/// supervisor dispatches at most one singleton transition per epic per tick and
-/// deduplicates sweeps per child, so no global cap is needed.
+/// supervisor dispatches at most one singleton transition per epic per tick, so
+/// no global cap is needed.
 pub async fn tick_multi<S: EpicSource, D: EpicDispatcher>(
     supervisors: &mut [EpicSupervisor<S, D>],
 ) -> TickReport {
@@ -781,7 +745,6 @@ pub async fn tick_multi<S: EpicSource, D: EpicDispatcher>(
             Ok(report) => {
                 agg.epics_seen += report.epics_seen;
                 agg.roles_dispatched += report.roles_dispatched;
-                agg.sweeps_dispatched += report.sweeps_dispatched;
                 agg.skipped_in_flight += report.skipped_in_flight;
                 agg.noop += report.noop;
                 agg.errors += report.errors;
@@ -968,16 +931,12 @@ where
                 }
                 match rt.block_on(supervisor.tick()) {
                     Ok(report) => {
-                        if report.roles_dispatched > 0
-                            || report.sweeps_dispatched > 0
-                            || report.errors > 0
-                        {
+                        if report.roles_dispatched > 0 || report.errors > 0 {
                             log::info!(
                                 "epic_supervisor: tick — {} epic(s) seen, {} role(s), \
-                                 {} sweep(s), {} skipped, {} error(s)",
+                                 {} skipped, {} error(s)",
                                 report.epics_seen,
                                 report.roles_dispatched,
-                                report.sweeps_dispatched,
                                 report.skipped_in_flight,
                                 report.errors
                             );
@@ -1152,15 +1111,13 @@ pub fn spawn_multi_supervisor_thread(
                     continue;
                 }
                 let report = rt.block_on(tick_multi(&mut supervisors));
-                if report.roles_dispatched > 0 || report.sweeps_dispatched > 0 || report.errors > 0
-                {
+                if report.roles_dispatched > 0 || report.errors > 0 {
                     log::info!(
                         "epic_supervisor: tick — {} workspace(s), {} epic(s) seen, {} role(s), \
-                         {} sweep(s), {} skipped, {} error(s)",
+                         {} skipped, {} error(s)",
                         supervisors.len(),
                         report.epics_seen,
                         report.roles_dispatched,
-                        report.sweeps_dispatched,
                         report.skipped_in_flight,
                         report.errors
                     );
@@ -1193,7 +1150,6 @@ mod role_spawn;
 pub mod forge {
     use super::{DispatchShape, EpicDispatcher, EpicSnapshot, EpicSource, PhaseChild};
     use crate::sweep_registry::SweepRegistry;
-    use crate::types::SweepKind;
     use anyhow::{anyhow, Context, Result};
     use serde::Deserialize;
     use std::path::PathBuf;
@@ -1229,21 +1185,11 @@ pub mod forge {
         body: String,
         #[serde(default)]
         state: String,
-        #[serde(default)]
-        labels: Vec<GhLabel>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct GhLabel {
-        name: String,
     }
 
     impl GhIssue {
         fn is_open(&self) -> bool {
             self.state.eq_ignore_ascii_case("open")
-        }
-        fn has_label(&self, name: &str) -> bool {
-            self.labels.iter().any(|l| l.name == name)
         }
     }
 
@@ -1316,7 +1262,6 @@ pub mod forge {
                     // an absent body to empty, so keep that semantics.
                     body: r.body.unwrap_or_default(),
                     state: r.state,
-                    labels: r.labels.into_iter().map(|name| GhLabel { name }).collect(),
                 })
                 .collect())
         }
@@ -1342,7 +1287,6 @@ pub mod forge {
                 .into_iter()
                 .map(|epic| {
                     let mut phase_children = Vec::new();
-                    let mut open_issue_children = Vec::new();
                     for child in &children {
                         let Some((parent, phase)) = parse_epic_phase_marker(&child.body) else {
                             continue;
@@ -1351,12 +1295,8 @@ pub mod forge {
                             continue;
                         }
                         phase_children.push(PhaseChild::new(phase, child.is_open()));
-                        // Build-ready children are open and carry loom:issue.
-                        if child.is_open() && child.has_label("loom:issue") {
-                            open_issue_children.push(child.number);
-                        }
                     }
-                    EpicSnapshot::new(epic.number, epic.body, phase_children, open_issue_children)
+                    EpicSnapshot::new(epic.number, epic.body, phase_children)
                 })
                 .collect();
             Ok(snapshots)
@@ -1364,14 +1304,13 @@ pub mod forge {
     }
 
     /// A concrete [`EpicDispatcher`] that spawns role processes for singleton
-    /// transitions and dispatches sweeps through the daemon [`SweepRegistry`].
+    /// transitions.
     ///
     /// Singleton role dispatches (`dispatch_role`) **spawn-and-wait**: the
     /// child role process runs to completion before the method returns. This is
     /// deliberate — the supervisor holds the #3707 issue-creation mutex across
     /// the call, so an issue-creating expand burst must finish before the guard
-    /// is dropped. Sweeps are fire-and-forget via the registry (long-running
-    /// builds), deduplicated by the registry's own claim locks.
+    /// is dropped.
     pub struct SpawnDispatcher {
         spawn_bin: PathBuf,
         registry: Arc<Mutex<SweepRegistry>>,
@@ -1379,8 +1318,7 @@ pub mod forge {
 
     impl SpawnDispatcher {
         /// Construct a dispatcher spawning role processes via `spawn_bin`
-        /// (typically `spawn-claude.sh`) and dispatching sweeps through
-        /// `registry`.
+        /// (typically `spawn-claude.sh`) in `registry`'s workspace.
         #[must_use]
         pub fn new(spawn_bin: PathBuf, registry: Arc<Mutex<SweepRegistry>>) -> Self {
             Self {
@@ -1405,8 +1343,7 @@ pub mod forge {
                 reg.config().workspace_root.clone()
             };
             // #10719: `spawn_bin` is this checkout's own script, and this path
-            // never reaches the registry guard `dispatch_sweep` passes. The
-            // tick skips a held workspace first; this is the refusal at the
+            // never reaches a registry guard. The tick skips a held workspace first; this is the refusal at the
             // spawn itself, for a hold set mid-tick or any other caller.
             crate::workspace_hold::guard(&repo_root)?;
             let (model, source) = crate::sweep_registry::resolve_dispatch_model(&repo_root, None);
@@ -1433,27 +1370,6 @@ pub mod forge {
                 ));
             }
             Ok(())
-        }
-
-        fn dispatch_sweep(&mut self, _epic: u32, child: u32) -> Result<()> {
-            let mut reg = self
-                .registry
-                .lock()
-                .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
-            // Request-time model resolution follows the admitted runtime;
-            // issue complexity is fetched only for an eligible experiment.
-            // Idempotency key + the registry's claim lock make a re-dispatch of
-            // an already-running child a no-op.
-            let key = format!("epic-child-{child}");
-            reg.dispatch_with_model(
-                &SweepKind::Issue(child),
-                Some(key),
-                crate::sweep_registry::DispatchModel::Request(None),
-                None,
-                None,
-                crate::sweep_registry::DispatchOrigin::EpicSupervisor,
-            )
-            .map(|_| ())
         }
     }
 
@@ -1513,30 +1429,23 @@ mod tests {
 
     #[test]
     fn test_plan_needs_decomp() {
-        let snap = EpicSnapshot::new(1, "no phases here", vec![], vec![]);
+        let snap = EpicSnapshot::new(1, "no phases here", vec![]);
         assert_eq!(snap.state(), EpicState::NeedsDecomp);
         assert_eq!(plan_epic_transition(&snap), EpicTransition::DesignInPlace);
     }
 
     #[test]
     fn test_plan_designed() {
-        let snap = EpicSnapshot::new(2, body_with_phases(3), vec![], vec![]);
+        let snap = EpicSnapshot::new(2, body_with_phases(3), vec![]);
         assert_eq!(snap.state(), EpicState::Designed);
         assert_eq!(plan_epic_transition(&snap), EpicTransition::ExpandFirstPhase);
     }
 
     #[test]
-    fn test_plan_active_with_build_ready_children() {
-        let snap = EpicSnapshot::new(3, body_with_phases(3), vec![open(1)], vec![101, 102]);
-        assert_eq!(snap.state(), EpicState::Active);
-        assert_eq!(plan_epic_transition(&snap), EpicTransition::BuildChildren(vec![101, 102]));
-    }
-
-    #[test]
-    fn test_plan_active_without_build_ready_children_is_noop() {
-        // Phase in flight (an open epic-phase marker) but no build-ready
-        // loom:issue children yet.
-        let snap = EpicSnapshot::new(4, body_with_phases(3), vec![open(1)], vec![]);
+    fn test_plan_active_is_noop_children_are_steps() {
+        // Phase in flight: its build-ready children are Builder steps the work
+        // finder draws (#11909, #11911), so the supervisor plans nothing.
+        let snap = EpicSnapshot::new(4, body_with_phases(3), vec![open(1)]);
         assert_eq!(snap.state(), EpicState::Active);
         assert_eq!(plan_epic_transition(&snap), EpicTransition::Noop);
     }
@@ -1544,7 +1453,7 @@ mod tests {
     #[test]
     fn test_plan_phase_join_advances() {
         // Phase 1 closed, body has 3 phases ⇒ phase_join, barrier ready.
-        let snap = EpicSnapshot::new(5, body_with_phases(3), vec![closed(1)], vec![]);
+        let snap = EpicSnapshot::new(5, body_with_phases(3), vec![closed(1)]);
         assert_eq!(snap.state(), EpicState::PhaseJoin);
         assert_eq!(plan_epic_transition(&snap), EpicTransition::AdvancePhase);
     }
@@ -1552,7 +1461,7 @@ mod tests {
     #[test]
     fn test_plan_done_closes() {
         // Body has 2 phases; both materialized and closed ⇒ done.
-        let snap = EpicSnapshot::new(6, body_with_phases(2), vec![closed(1), closed(2)], vec![]);
+        let snap = EpicSnapshot::new(6, body_with_phases(2), vec![closed(1), closed(2)]);
         assert_eq!(snap.state(), EpicState::Done);
         assert_eq!(plan_epic_transition(&snap), EpicTransition::CloseEpic);
     }
@@ -1562,7 +1471,6 @@ mod tests {
         assert_eq!(EpicTransition::DesignInPlace.kind(), TransitionKind::DesignInPlace);
         assert_eq!(EpicTransition::ExpandFirstPhase.kind(), TransitionKind::ExpandFirstPhase);
         assert_eq!(EpicTransition::AdvancePhase.kind(), TransitionKind::AdvancePhase);
-        assert_eq!(EpicTransition::BuildChildren(vec![1]).kind(), TransitionKind::BuildChildren);
         assert_eq!(EpicTransition::CloseEpic.kind(), TransitionKind::CloseEpic);
         assert_eq!(EpicTransition::Noop.kind(), TransitionKind::Noop);
         assert!(EpicTransition::Noop.is_noop());
@@ -1614,9 +1522,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingDispatcher {
         roles: Vec<(u32, DispatchShape)>,
-        sweeps: Vec<(u32, u32)>,
         fail_role: bool,
-        fail_sweep_child: Option<u32>,
     }
 
     impl EpicDispatcher for RecordingDispatcher {
@@ -1625,13 +1531,6 @@ mod tests {
                 anyhow::bail!("forced role failure");
             }
             self.roles.push((epic, shape.clone()));
-            Ok(())
-        }
-        fn dispatch_sweep(&mut self, epic: u32, child: u32) -> Result<()> {
-            if self.fail_sweep_child == Some(child) {
-                anyhow::bail!("forced sweep failure for #{child}");
-            }
-            self.sweeps.push((epic, child));
             Ok(())
         }
     }
@@ -1659,7 +1558,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tick_needs_decomp_dispatches_architect_enrich() {
-        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![])]);
         let report = sup.tick().await.unwrap();
         assert_eq!(report.roles_dispatched, 1);
         assert_eq!(sup.dispatcher.roles.len(), 1);
@@ -1678,23 +1577,21 @@ mod tests {
         let health = Arc::new(MainHealthState::new());
         health.set_halted(true);
         // An epic that WOULD dispatch an Architect enrich if not halted.
-        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![])])
             .with_health_gate(health.clone());
 
         let report = sup.tick().await.unwrap();
         assert!(report.halted, "tick must report halted");
         assert_eq!(report.epics_seen, 0, "halted tick must not even list epics");
         assert_eq!(report.roles_dispatched, 0);
-        assert_eq!(report.sweeps_dispatched, 0);
         assert!(sup.dispatcher.roles.is_empty(), "no role dispatched while halted");
-        assert!(sup.dispatcher.sweeps.is_empty(), "no sweep dispatched while halted");
     }
 
     #[tokio::test]
     async fn test_tick_resumes_dispatch_after_halt_clears() {
         let health = Arc::new(MainHealthState::new());
         health.set_halted(true);
-        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![])])
             .with_health_gate(health.clone());
 
         // Halted ⇒ nothing dispatched.
@@ -1716,7 +1613,7 @@ mod tests {
     #[tokio::test]
     async fn test_tick_skips_dispatch_while_draining() {
         let drain = Arc::new(AtomicBool::new(true));
-        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![])])
             .with_drain_flag(drain.clone());
 
         let report = sup.tick().await.unwrap();
@@ -1734,7 +1631,7 @@ mod tests {
     #[tokio::test]
     async fn test_tick_without_health_gate_is_never_halted() {
         // No health gate attached (the default) ⇒ dispatch as before, zero change.
-        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![])]);
         let report = sup.tick().await.unwrap();
         assert!(!report.halted);
         assert_eq!(report.roles_dispatched, 1);
@@ -1742,7 +1639,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tick_designed_dispatches_champion_expand_under_mutex() {
-        let mut sup = supervisor(vec![EpicSnapshot::new(2, body_with_phases(3), vec![], vec![])]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(2, body_with_phases(3), vec![])]);
         let mutex = sup.mutex();
         let report = sup.tick().await.unwrap();
         assert_eq!(report.roles_dispatched, 1);
@@ -1754,26 +1651,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_tick_active_dispatches_nothing_children_are_steps() {
-        let mut sup = supervisor(vec![EpicSnapshot::new(
-            3,
-            body_with_phases(3),
-            vec![open(1)],
-            vec![301, 302, 303],
-        )]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(3, body_with_phases(3), vec![open(1)])]);
         let report = sup.tick().await.unwrap();
-        assert_eq!(report.sweeps_dispatched, 0);
         assert_eq!(report.noop, 1);
-        assert!(sup.dispatcher.sweeps.is_empty());
+        assert!(sup.dispatcher.roles.is_empty());
     }
 
     #[tokio::test]
     async fn test_tick_phase_join_dispatches_advance_under_mutex() {
-        let mut sup = supervisor(vec![EpicSnapshot::new(
-            5,
-            body_with_phases(3),
-            vec![closed(1)],
-            vec![],
-        )]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(5, body_with_phases(3), vec![closed(1)])]);
         let mutex = sup.mutex();
         let report = sup.tick().await.unwrap();
         assert_eq!(report.roles_dispatched, 1);
@@ -1788,7 +1674,6 @@ mod tests {
             6,
             body_with_phases(2),
             vec![closed(1), closed(2)],
-            vec![],
         )]);
         let report = sup.tick().await.unwrap();
         assert_eq!(report.roles_dispatched, 1);
@@ -1807,8 +1692,7 @@ mod tests {
         assert_eq!(TransitionKind::ExpandFirstPhase.action_class(), Some(EpicActionClass::Expand));
         assert_eq!(TransitionKind::AdvancePhase.action_class(), Some(EpicActionClass::Join));
         assert_eq!(TransitionKind::CloseEpic.action_class(), Some(EpicActionClass::Close));
-        // BuildChildren is covered by sweep.global.dispatch; Noop fires nothing.
-        assert_eq!(TransitionKind::BuildChildren.action_class(), None);
+        // Noop fires nothing.
         assert_eq!(TransitionKind::Noop.action_class(), None);
     }
 
@@ -1816,8 +1700,8 @@ mod tests {
     async fn test_tick_publishes_decompose_event() {
         let bus = Arc::new(EventBus::new());
         let mut sub = bus.subscribe(["epic.issue"]);
-        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
-            .with_event_bus(bus.clone());
+        let mut sup =
+            supervisor(vec![EpicSnapshot::new(1, "flat body", vec![])]).with_event_bus(bus.clone());
 
         let _ = sup.tick().await.unwrap();
 
@@ -1842,7 +1726,7 @@ mod tests {
         // designed → expand
         let bus = Arc::new(EventBus::new());
         let mut sub = bus.subscribe::<[&str; 0], &str>([]);
-        let mut sup = supervisor(vec![EpicSnapshot::new(2, body_with_phases(3), vec![], vec![])])
+        let mut sup = supervisor(vec![EpicSnapshot::new(2, body_with_phases(3), vec![])])
             .with_event_bus(bus.clone());
         let _ = sup.tick().await.unwrap();
         assert_eq!(sub.try_recv().unwrap().topic(), "epic.issue.2.expand");
@@ -1854,7 +1738,6 @@ mod tests {
             6,
             body_with_phases(2),
             vec![closed(1), closed(2)],
-            vec![],
         )])
         .with_event_bus(bus2.clone());
         let _ = sup2.tick().await.unwrap();
@@ -1865,13 +1748,8 @@ mod tests {
     async fn test_tick_publishes_join_event() {
         let bus = Arc::new(EventBus::new());
         let mut sub = bus.subscribe(["epic.issue.5.join"]);
-        let mut sup = supervisor(vec![EpicSnapshot::new(
-            5,
-            body_with_phases(3),
-            vec![closed(1)],
-            vec![],
-        )])
-        .with_event_bus(bus.clone());
+        let mut sup = supervisor(vec![EpicSnapshot::new(5, body_with_phases(3), vec![closed(1)])])
+            .with_event_bus(bus.clone());
 
         let _ = sup.tick().await.unwrap();
 
@@ -1887,31 +1765,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_children_publishes_no_epic_action_event() {
-        // active → BuildChildren must NOT emit an epic.issue.*.{action} event;
-        // per-child sweeps surface on sweep.global.dispatch instead.
+    async fn test_active_epic_publishes_no_epic_action_event() {
+        // active plans a no-op, which must NOT emit an epic.issue.*.{action}
+        // event.
         let bus = Arc::new(EventBus::new());
         let mut sub = bus.subscribe(["epic.issue"]);
-        let mut sup = supervisor(vec![EpicSnapshot::new(
-            3,
-            body_with_phases(3),
-            vec![open(1)],
-            vec![301],
-        )])
-        .with_event_bus(bus.clone());
+        let mut sup = supervisor(vec![EpicSnapshot::new(3, body_with_phases(3), vec![open(1)])])
+            .with_event_bus(bus.clone());
 
         let report = sup.tick().await.unwrap();
-        assert_eq!(report.sweeps_dispatched, 0);
+        assert_eq!(report.noop, 1);
         assert!(
             matches!(sub.try_recv(), Err(crate::event_bus::RecvError::Empty)),
-            "BuildChildren must not publish an epic-action event"
+            "an active epic must not publish an epic-action event"
         );
     }
 
     #[tokio::test]
     async fn test_no_bus_is_silent_and_still_dispatches() {
         // Without an attached bus the supervisor still dispatches normally.
-        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![])]);
         let report = sup.tick().await.unwrap();
         assert_eq!(report.roles_dispatched, 1);
     }
@@ -1924,7 +1797,7 @@ mod tests {
     async fn test_singleton_transition_dedups_across_ticks() {
         // needs_decomp: first tick dispatches Architect, second tick (same
         // unchanged forge state) must NOT re-dispatch.
-        let snap = EpicSnapshot::new(1, "flat body", vec![], vec![]);
+        let snap = EpicSnapshot::new(1, "flat body", vec![]);
         let mut sup = supervisor(vec![snap]);
 
         let r1 = sup.tick().await.unwrap();
@@ -1943,7 +1816,7 @@ mod tests {
     #[tokio::test]
     async fn test_state_advance_clears_ledger_and_fires_next_transition() {
         // Tick 1: needs_decomp → Architect enrich (in flight).
-        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat", vec![], vec![])]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat", vec![])]);
         let r1 = sup.tick().await.unwrap();
         assert_eq!(r1.roles_dispatched, 1);
         assert_eq!(sup.in_flight_len(), 1);
@@ -1951,7 +1824,7 @@ mod tests {
         // The Architect landed its body edit: the epic is now designed. The
         // supervisor must recognise the advanced state, clear the stale
         // in-flight marker, and dispatch the Champion expand.
-        sup.source.epics = vec![EpicSnapshot::new(1, body_with_phases(3), vec![], vec![])];
+        sup.source.epics = vec![EpicSnapshot::new(1, body_with_phases(3), vec![])];
         let r2 = sup.tick().await.unwrap();
         assert_eq!(r2.roles_dispatched, 1);
         assert_eq!(sup.dispatcher.roles.len(), 2);
@@ -1962,7 +1835,7 @@ mod tests {
     async fn test_ttl_expiry_allows_redispatch_after_crash() {
         // A dispatched role that never lands its mutation (crash) must be
         // re-dispatched once the TTL elapses. Use a zero TTL to force it.
-        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat", vec![], vec![])])
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat", vec![])])
             .with_inflight_ttl(Duration::from_secs(0));
         let r1 = sup.tick().await.unwrap();
         assert_eq!(r1.roles_dispatched, 1);
@@ -1979,22 +1852,22 @@ mod tests {
     #[tokio::test]
     async fn test_tick_over_many_epics_fires_each() {
         let mut sup = supervisor(vec![
-            EpicSnapshot::new(1, "flat", vec![], vec![]), // needs_decomp
-            EpicSnapshot::new(2, body_with_phases(2), vec![], vec![]), // designed
-            EpicSnapshot::new(3, body_with_phases(2), vec![open(1)], vec![301]), // active
-            EpicSnapshot::new(4, body_with_phases(2), vec![closed(1), closed(2)], vec![]), // done
+            EpicSnapshot::new(1, "flat", vec![]), // needs_decomp
+            EpicSnapshot::new(2, body_with_phases(2), vec![]), // designed
+            EpicSnapshot::new(3, body_with_phases(2), vec![open(1)]), // active
+            EpicSnapshot::new(4, body_with_phases(2), vec![closed(1), closed(2)]), // done
         ]);
         let report = sup.tick().await.unwrap();
         assert_eq!(report.epics_seen, 4);
         assert_eq!(report.roles_dispatched, 3); // architect, champion-expand, champion-close
-        assert_eq!(report.sweeps_dispatched, 0);
+        assert_eq!(report.noop, 1); // the active epic
     }
 
     #[tokio::test]
     async fn test_dispatch_error_is_isolated_and_counted() {
         let mut sup = EpicSupervisor::new(
             FixedSource {
-                epics: vec![EpicSnapshot::new(1, "flat", vec![], vec![])],
+                epics: vec![EpicSnapshot::new(1, "flat", vec![])],
             },
             RecordingDispatcher {
                 fail_role: true,
@@ -2015,10 +1888,10 @@ mod tests {
 
     #[test]
     fn test_barrier_holds_when_current_phase_child_open() {
-        // derive_epic_state returns Active (open child), so plan is
-        // BuildChildren/Noop — never AdvancePhase. Confirm the phase-boundary
+        // derive_epic_state returns Active (open child), so plan is Noop —
+        // never AdvancePhase. Confirm the phase-boundary
         // is not taken while a child is open.
-        let snap = EpicSnapshot::new(5, body_with_phases(3), vec![open(2), closed(1)], vec![]);
+        let snap = EpicSnapshot::new(5, body_with_phases(3), vec![open(2), closed(1)]);
         assert_eq!(snap.state(), EpicState::Active);
         assert_eq!(plan_epic_transition(&snap), EpicTransition::Noop);
     }
@@ -2058,7 +1931,7 @@ mod tests {
     async fn test_tick_multi_single_workspace_matches_single_tick() {
         // Empty-registry equivalence: one workspace behaves like a lone tick().
         let mut sups = vec![multi_supervisor(
-            vec![EpicSnapshot::new(1, "flat body", vec![], vec![])],
+            vec![EpicSnapshot::new(1, "flat body", vec![])],
             false,
         )];
         let report = tick_multi(&mut sups).await;
@@ -2073,8 +1946,8 @@ mod tests {
         // Two workspaces each with a needs_decomp epic ⇒ each dispatches its own
         // Architect enrich; the aggregate report sums both.
         let mut sups = vec![
-            multi_supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])], false),
-            multi_supervisor(vec![EpicSnapshot::new(2, "flat body", vec![], vec![])], false),
+            multi_supervisor(vec![EpicSnapshot::new(1, "flat body", vec![])], false),
+            multi_supervisor(vec![EpicSnapshot::new(2, "flat body", vec![])], false),
         ];
         let report = tick_multi(&mut sups).await;
         assert_eq!(report.epics_seen, 2);
@@ -2088,9 +1961,9 @@ mod tests {
     async fn test_tick_multi_one_workspace_errors_others_proceed() {
         // Middle workspace's list fails; the other two still tick and dispatch.
         let mut sups = vec![
-            multi_supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])], false),
-            multi_supervisor(vec![EpicSnapshot::new(2, "flat body", vec![], vec![])], true),
-            multi_supervisor(vec![EpicSnapshot::new(3, "flat body", vec![], vec![])], false),
+            multi_supervisor(vec![EpicSnapshot::new(1, "flat body", vec![])], false),
+            multi_supervisor(vec![EpicSnapshot::new(2, "flat body", vec![])], true),
+            multi_supervisor(vec![EpicSnapshot::new(3, "flat body", vec![])], false),
         ];
         let report = tick_multi(&mut sups).await;
         assert_eq!(report.errors, 1, "the failing workspace is counted, not fatal");
@@ -2146,7 +2019,6 @@ mod tests {
     /// test can observe progress of the loop running on another thread.
     struct CountingDispatcher {
         roles: Arc<AtomicUsize>,
-        sweeps: Arc<AtomicUsize>,
         /// The thread id the blocking dispatch actually ran on — proves the
         /// dispatch executes off the caller's thread.
         dispatch_thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
@@ -2155,10 +2027,6 @@ mod tests {
         fn dispatch_role(&mut self, _epic: u32, _shape: &DispatchShape) -> Result<()> {
             *self.dispatch_thread.lock().unwrap() = Some(std::thread::current().id());
             self.roles.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        fn dispatch_sweep(&mut self, _epic: u32, _child: u32) -> Result<()> {
-            self.sweeps.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2178,17 +2046,15 @@ mod tests {
     #[test]
     fn test_spawn_supervisor_thread_ticks_then_shuts_down() {
         let roles = Arc::new(AtomicUsize::new(0));
-        let sweeps = Arc::new(AtomicUsize::new(0));
         let dispatch_thread = Arc::new(Mutex::new(None));
         let dispatcher = CountingDispatcher {
             roles: roles.clone(),
-            sweeps: sweeps.clone(),
             dispatch_thread: dispatch_thread.clone(),
         };
         // A single needs_decomp epic: the first tick dispatches the Architect
         // enrich, subsequent ticks dedup (in-flight), so `roles` settles at 1.
         let source = SharedSource {
-            epics: vec![EpicSnapshot::new(1, "flat body", vec![], vec![])],
+            epics: vec![EpicSnapshot::new(1, "flat body", vec![])],
         };
         let sup = EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new());
 
@@ -2206,9 +2072,8 @@ mod tests {
         assert!(!handle.is_running(), "handle reports stopped after shutdown");
 
         // Exactly one role dispatched (idempotent dedup across the many ticks
-        // that ran before shutdown); no sweeps for a needs_decomp epic.
+        // that ran before shutdown).
         assert_eq!(roles.load(Ordering::SeqCst), 1, "singleton dedup held across ticks");
-        assert_eq!(sweeps.load(Ordering::SeqCst), 0);
 
         // The blocking dispatch ran on the dedicated supervisor thread, NOT the
         // test's (caller's) thread — the core #3872 guarantee.

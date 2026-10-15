@@ -28,7 +28,10 @@ fn workspace(config: &str) -> tempfile::TempDir {
     tmp
 }
 
-const ENABLED: &str = r#"{"autonomous":{"roleRunner":{"enabled":true}}}"#;
+/// The role runner on, under a host budget of 8 (#11911): no step is in
+/// flight in a unit test, so the role runner's ceiling is the whole budget.
+const ENABLED: &str =
+    r#"{"autonomous":{"roleRunner":{"enabled":true},"workFinder":{"maxConcurrent":8}}}"#;
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -52,19 +55,8 @@ fn admit_only(role: &'static str) -> DecideFn {
     })
 }
 
-fn queue_has_work() -> QueueProbe {
-    Arc::new(|_, _| Ok(true))
-}
-
 fn dispatcher(role: &'static str, factory: RunnerFactory, decide: DecideFn) -> RoleDispatcher {
-    RoleDispatcher::with_decide(
-        spec(role),
-        Duration::from_secs(300),
-        factory,
-        queue_has_work(),
-        None,
-        decide,
-    )
+    RoleDispatcher::with_decide(spec(role), Duration::from_secs(300), factory, None, decide)
 }
 
 fn join_one(
@@ -173,7 +165,7 @@ fn latch_factory(parties: usize, timeout: Duration) -> RunnerFactory {
     })
 }
 
-/// AC1: three enabled roots' judge runs are all in flight at once. The runner
+/// AC1: three enabled roots' guide runs are all in flight at once. The runner
 /// is a 3-party latch, so a serial loop (await each root before the next)
 /// would leave the first run alone until its latch timed out — see the
 /// control test below.
@@ -183,7 +175,7 @@ fn ac1_one_tick_runs_three_repositories_concurrently() {
     let _enter = rt.enter();
     let roots: Vec<tempfile::TempDir> = (0..3).map(|_| workspace(ENABLED)).collect();
     let factory = latch_factory(3, Duration::from_secs(10));
-    let mut d = dispatcher("judge", factory, admit_only("judge"));
+    let mut d = dispatcher("guide", factory, admit_only("guide"));
     let in_progress = new_in_progress_guard();
 
     let report =
@@ -211,7 +203,7 @@ fn ac1_control_the_latch_times_out_under_serial_dispatch() {
     let _enter = rt.enter();
     let roots: Vec<tempfile::TempDir> = (0..3).map(|_| workspace(ENABLED)).collect();
     let factory = latch_factory(3, Duration::from_millis(300));
-    let mut d = dispatcher("judge", factory, admit_only("judge"));
+    let mut d = dispatcher("guide", factory, admit_only("guide"));
     let in_progress = new_in_progress_guard();
     let mut outcomes = Vec::new();
     for root in &roots {
@@ -226,7 +218,7 @@ fn ac1_control_the_latch_times_out_under_serial_dispatch() {
 
 // -- AC2: one instance per (repository, role) -------------------------------
 
-/// AC2, through the production decision: while root A's judge run is still
+/// AC2, through the production decision: while root A's guide run is still
 /// in flight, the next tick refuses A as in progress and admits B and C again.
 #[test]
 #[serial]
@@ -243,12 +235,11 @@ fn ac2_a_root_still_in_flight_is_refused_and_the_others_are_admitted() {
     ];
     let gate = Gate::default();
     let mut d = RoleDispatcher::with_decide(
-        spec("judge"),
+        spec("guide"),
         Duration::from_secs(300),
         gated_factory(vec![a.path().to_path_buf()], gate.clone()),
-        queue_has_work(),
         None,
-        production_decide(spec("judge")),
+        production_decide(spec("guide")),
     );
     let in_progress = new_in_progress_guard();
 
@@ -277,50 +268,50 @@ fn ac2_a_root_still_in_flight_is_refused_and_the_others_are_admitted() {
 
 // -- AC3: different roles in the same repository ----------------------------
 
-/// AC3: judge and doctor on the same root are admitted at the same time — the
+/// AC3: guide and hermit on the same root are admitted at the same time — the
 /// guard key is `(root, role)` and no role declares exclusivity.
 #[test]
 fn ac3_judge_and_doctor_run_in_the_same_repository_at_once() {
     let root = workspace(ENABLED);
     let in_progress = new_in_progress_guard();
     let config = read_role_runner_config(root.path());
-    let judge = admit_root_tick(root.path(), "judge", "/loom:judge".into(), &in_progress, &config);
-    let doctor =
-        admit_root_tick(root.path(), "doctor", "/loom:doctor".into(), &in_progress, &config);
-    assert!(matches!(judge, RootTickDecision::Admit { .. }));
-    assert!(matches!(doctor, RootTickDecision::Admit { .. }));
+    let guide = admit_root_tick(root.path(), "guide", "/loom:guide".into(), &in_progress, &config);
+    let hermit =
+        admit_root_tick(root.path(), "hermit", "/loom:hermit".into(), &in_progress, &config);
+    assert!(matches!(guide, RootTickDecision::Admit { .. }));
+    assert!(matches!(hermit, RootTickDecision::Admit { .. }));
     assert_eq!(active_run_count(&in_progress), 2);
 }
 
 // -- AC4: per-role budget ----------------------------------------------------
 
-/// AC4: with `roleMaxConcurrent.judge = 2`, the third judge is refused with
+/// AC4: with `roleMaxConcurrent.guide = 2`, the third guide is refused with
 /// `RoleBudgetReached` while curator on another root is still admitted; the
 /// host ceiling still binds across every role together.
 #[test]
 fn ac4_role_budget_refuses_the_third_judge_but_not_another_role() {
     let set = new_in_progress_guard();
     let root = |n: u8| PathBuf::from(format!("/tmp/loom-9391-budget-{n}"));
-    let _j1 = RoleRunGuard::admit_with_role_budget(set.clone(), root(1), "judge", 4, 2)
+    let _j1 = RoleRunGuard::admit_with_role_budget(set.clone(), root(1), "guide", 4, 2)
         .into_guard()
         .unwrap();
-    let _j2 = RoleRunGuard::admit_with_role_budget(set.clone(), root(2), "judge", 4, 2)
+    let _j2 = RoleRunGuard::admit_with_role_budget(set.clone(), root(2), "guide", 4, 2)
         .into_guard()
         .unwrap();
-    match RoleRunGuard::admit_with_role_budget(set.clone(), root(3), "judge", 4, 2) {
+    match RoleRunGuard::admit_with_role_budget(set.clone(), root(3), "guide", 4, 2) {
         RoleAdmission::RoleBudgetReached {
             role,
             active,
             budget,
         } => {
-            assert_eq!((role, active, budget), ("judge", 2, 2));
+            assert_eq!((role, active, budget), ("guide", 2, 2));
         }
         other => panic!("expected RoleBudgetReached, got {other:?}"),
     }
-    let _c = RoleRunGuard::admit_with_role_budget(set.clone(), root(4), "curator", 4, 2)
+    let _c = RoleRunGuard::admit_with_role_budget(set.clone(), root(4), "auditor", 4, 2)
         .into_guard()
         .expect("curator has its own budget");
-    let _d = RoleRunGuard::admit_with_role_budget(set.clone(), root(5), "doctor", 4, 2)
+    let _d = RoleRunGuard::admit_with_role_budget(set.clone(), root(5), "hermit", 4, 2)
         .into_guard()
         .expect("fourth run fits the host ceiling of 4");
     // Host ceiling (4) now full: checked before the role budget.
@@ -333,26 +324,26 @@ fn ac4_role_budget_refuses_the_third_judge_but_not_another_role() {
     ));
     // InProgress is checked first of all.
     assert!(matches!(
-        RoleRunGuard::admit_with_role_budget(set, root(1), "judge", 4, 2),
+        RoleRunGuard::admit_with_role_budget(set, root(1), "guide", 4, 2),
         RoleAdmission::InProgress
     ));
 }
 
-/// AC4 through config: `roleMaxConcurrent.judge = 2` read from the root's own
-/// config becomes a `Refused(RoleBudget)` decision for the third judge.
+/// AC4 through config: `roleMaxConcurrent.guide = 2` read from the root's own
+/// config becomes a `Refused(RoleBudget)` decision for the third guide.
 #[test]
 fn ac4_role_budget_is_read_from_config_by_the_tick_decision() {
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":2}}}}"#;
+    let cfg = r#"{"autonomous":{"workFinder":{"maxConcurrent":8},"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":2}}}}"#;
     let roots: Vec<tempfile::TempDir> = (0..4).map(|_| workspace(cfg)).collect();
     let in_progress = new_in_progress_guard();
     let mut held = Vec::new();
     for t in &roots[..2] {
         let config = read_role_runner_config(t.path());
-        held.push(admit_root_tick(t.path(), "judge", "/loom:judge".into(), &in_progress, &config));
+        held.push(admit_root_tick(t.path(), "guide", "/loom:guide".into(), &in_progress, &config));
     }
     let config = read_role_runner_config(roots[2].path());
     let third =
-        admit_root_tick(roots[2].path(), "judge", "/loom:judge".into(), &in_progress, &config);
+        admit_root_tick(roots[2].path(), "guide", "/loom:guide".into(), &in_progress, &config);
     assert!(matches!(
         third,
         RootTickDecision::Refused(LimitRefusal::RoleBudget {
@@ -361,7 +352,7 @@ fn ac4_role_budget_is_read_from_config_by_the_tick_decision() {
         })
     ));
     let curator =
-        admit_root_tick(roots[3].path(), "curator", "/loom:curator".into(), &in_progress, &config);
+        admit_root_tick(roots[3].path(), "auditor", "/loom:auditor".into(), &in_progress, &config);
     assert!(matches!(curator, RootTickDecision::Admit { .. }));
 }
 
@@ -372,13 +363,13 @@ fn ac4_role_budget_is_read_from_config_by_the_tick_decision() {
 fn ac4_idle_edge_runs_count_against_the_role_budget() {
     let prev = std::env::var(ROLE_RUNNER_ENABLE_ENV).ok();
     std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
-    let root = workspace(r#"{"autonomous":{"roleRunner":{"roleMaxConcurrent":{"judge":1}}}}"#);
+    let root = workspace(r#"{"autonomous":{"roleRunner":{"roleMaxConcurrent":{"guide":1}}}}"#);
     let set = new_in_progress_guard();
-    // An interval judge run elsewhere already holds the whole budget of 1.
+    // An interval guide run elsewhere already holds the whole budget of 1.
     let _held = RoleRunGuard::admit_with_role_budget(
         set.clone(),
         PathBuf::from("/tmp/loom-9391-idle-other"),
-        "judge",
+        "guide",
         7,
         1,
     )
@@ -386,7 +377,7 @@ fn ac4_idle_edge_runs_count_against_the_role_budget() {
     .unwrap();
     let config = RoleRunnerConfig {
         enabled: Some(true),
-        on_idle: Some(vec!["judge".to_string()]),
+        on_idle: Some(vec!["guide".to_string()]),
         ..RoleRunnerConfig::default()
     };
     let mut trigger = IdleTrigger::new();
@@ -397,7 +388,7 @@ fn ac4_idle_edge_runs_count_against_the_role_budget() {
         Some(v) => std::env::set_var(ROLE_RUNNER_ENABLE_ENV, v),
         None => std::env::remove_var(ROLE_RUNNER_ENABLE_ENV),
     }
-    assert!(fired.is_empty(), "the idle judge must be refused by the judge budget of 1");
+    assert!(fired.is_empty(), "the idle guide must be refused by the guide budget of 1");
     assert_eq!(active_run_count(&set), 1);
 }
 
@@ -473,130 +464,6 @@ fn ac5_role_max_concurrent_is_read_from_the_roots_config() {
     assert!(read_role_max_concurrent(absent.path()).is_empty());
 }
 
-// -- AC6: empty-queue gating ---------------------------------------------------
-
-fn gate_outcome(role: &'static str, probe: QueueProbe) -> (RoleTickOutcome, usize) {
-    let root = workspace(ENABLED);
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut runner = FixedRunner(RoleTickOutcome::Success, Arc::clone(&calls));
-    let outcome = run_gated(
-        &mut runner,
-        &probe,
-        root.path(),
-        role,
-        "/loom:x",
-        Duration::from_secs(300),
-        None,
-    );
-    (outcome, calls.load(Ordering::SeqCst))
-}
-
-#[test]
-fn ac6_judge_with_an_empty_queue_spawns_nothing() {
-    let (outcome, invoked) = gate_outcome("judge", Arc::new(|_, _| Ok(false)));
-    assert_eq!(outcome, RoleTickOutcome::QueueEmpty);
-    assert_eq!(invoked, 0, "no agent spawned for an empty queue");
-    assert!(!outcome.is_success());
-    assert_eq!(
-        crate::role_tick_telemetry::classify(&outcome).0,
-        crate::telemetry::RoleTickResult::SkippedQueueEmpty
-    );
-    assert!(!crate::telemetry::RoleTickResult::SkippedQueueEmpty.spawned());
-}
-
-#[test]
-fn ac6_a_non_empty_queue_dispatches_and_a_listing_error_fails_open() {
-    let (outcome, invoked) = gate_outcome("doctor", Arc::new(|_, _| Ok(true)));
-    assert_eq!((outcome, invoked), (RoleTickOutcome::Success, 1));
-    let (outcome, invoked) = gate_outcome("judge", Arc::new(|_, _| Err("gh: 502".to_string())));
-    assert_eq!((outcome, invoked), (RoleTickOutcome::Success, 1), "listing error ⇒ dispatch");
-}
-
-#[test]
-fn ac6_ungated_roles_ignore_the_queue_probe() {
-    assert_eq!(work_queue_labels("judge"), Some(&["loom:review-requested"][..]));
-    assert_eq!(work_queue_labels("doctor"), Some(&["loom:changes-requested"][..]));
-    for role in ["curator", "champion", "auditor", "hermit", "guide"] {
-        assert_eq!(work_queue_labels(role), None, "{role} is ungated in Phase 1");
-        let (outcome, invoked) = gate_outcome(role, Arc::new(|_, _| Ok(false)));
-        assert_eq!((outcome, invoked), (RoleTickOutcome::Success, 1), "{role} dispatched");
-    }
-}
-
-// -- queue kind: a REST issues listing returns PRs too (#9929) -------------
-
-/// A listing row, PR or issue, carrying `labels`.
-fn row(number: u32, is_pr: bool, labels: &[&str]) -> crate::forge_listing::RestIssue {
-    crate::forge_listing::RestIssue {
-        number,
-        title: None,
-        labels: labels.iter().map(|l| (*l).to_string()).collect(),
-        created_at: None,
-        updated_at: None,
-        closed_at: None,
-        state: "open".to_string(),
-        body: None,
-        author: None,
-        author_association: None,
-        is_pull_request: is_pr,
-        comments: 0,
-        open_sub_issues: None,
-        labels_at: None,
-    }
-}
-
-#[test]
-fn queue_label_kinds_follow_the_pr_lifecycle_labels() {
-    for label in ["loom:review-requested", "loom:changes-requested", "loom:pr"] {
-        assert!(queue_label_holds_prs(label), "{label} is a PR queue");
-    }
-    for label in [
-        "loom:issue",
-        "loom:triage",
-        "loom:curated",
-        "loom:curating",
-        "loom:building",
-        "loom:blocked",
-    ] {
-        assert!(!queue_label_holds_prs(label), "{label} is an issue queue");
-    }
-}
-
-/// Regression for #9929: the queue gate reads the REST issues listing, which
-/// returns pull requests alongside issues. A row of the WRONG lifecycle must
-/// never satisfy the gate — the same issue/PR conflation that let a pull
-/// request be picked up as a curation candidate and labeled `loom:curating` /
-/// `loom:curated`.
-#[test]
-fn queue_work_is_decided_on_rows_of_the_queues_own_kind() {
-    // Judge's queue is PRs: a PR row counts, an ISSUE row carrying the same
-    // label does not.
-    assert!(queue_rows_have_work(
-        "loom:review-requested",
-        &[row(306, true, &["loom:review-requested"])]
-    ));
-    assert!(!queue_rows_have_work(
-        "loom:review-requested",
-        &[row(42, false, &["loom:review-requested"])]
-    ));
-
-    // An issue queue is the mirror: a PR row must not stand in for issue work.
-    assert!(!queue_rows_have_work("loom:issue", &[row(306, true, &["loom:issue"])]));
-    assert!(queue_rows_have_work("loom:issue", &[row(42, false, &["loom:issue"])]));
-
-    // A mixed listing is satisfied by the row of the right kind, either way.
-    let mixed = [
-        row(42, false, &["loom:issue"]),
-        row(306, true, &["loom:pr"]),
-    ];
-    assert!(queue_rows_have_work("loom:review-requested", &mixed));
-    assert!(queue_rows_have_work("loom:issue", &mixed));
-
-    // An empty listing is empty for every queue.
-    assert!(!queue_rows_have_work("loom:review-requested", &[]));
-    assert!(!queue_rows_have_work("loom:issue", &[]));
-}
-
 /// AC6: `QueueEmpty` never enters the #4349 fail/recover edge — a root that
 /// was failing stays failing (no false "recovered"), and one that was not
 /// does not become failing.
@@ -619,7 +486,7 @@ fn ac6_queue_empty_is_not_a_failure_and_leaves_the_fail_edge_alone() {
     let mut failing = HashMap::from([(root.clone(), true)]);
     let (mut a, mut b, mut c) = (HashMap::new(), HashMap::new(), HashMap::new());
     log_outcome_for_root_deduped(
-        "judge",
+        "guide",
         &root,
         &RoleTickOutcome::QueueEmpty,
         Duration::ZERO,
@@ -663,7 +530,7 @@ fn ac7_reaped_runs_log_the_fail_and_recover_edges_once() {
         let script = Arc::clone(&script);
         Arc::new(move |_| Box::new(ScriptedRunner(Arc::clone(&script))))
     };
-    let mut d = dispatcher("curator", factory, admit_only("curator"));
+    let mut d = dispatcher("auditor", factory, admit_only("auditor"));
     let in_progress = new_in_progress_guard();
     let mut levels = Vec::new();
     for _ in 0..3 {
@@ -708,12 +575,11 @@ fn ac7_reaped_pool_exhausted_run_feeds_the_observer() {
         ))
     });
     let mut d = RoleDispatcher::with_decide(
-        spec("curator"),
+        spec("auditor"),
         Duration::from_secs(300),
         factory,
-        queue_has_work(),
         Some(observer.clone() as Arc<dyn PoolExhaustedObserver>),
-        admit_only("curator"),
+        admit_only("auditor"),
     );
     let in_progress = new_in_progress_guard();
     d.dispatch_tick(vec![root.path().to_path_buf()], &in_progress);
@@ -738,7 +604,7 @@ fn ac7_a_panicking_run_logs_its_root_and_the_loop_keeps_ticking() {
     let _enter = rt.enter();
     let root = workspace(ENABLED);
     let mut d =
-        dispatcher("curator", Arc::new(|_| Box::new(PanickingRunner)), admit_only("curator"));
+        dispatcher("auditor", Arc::new(|_| Box::new(PanickingRunner)), admit_only("auditor"));
     let in_progress = new_in_progress_guard();
     d.dispatch_tick(vec![root.path().to_path_buf()], &in_progress);
     let joined = join_one(&rt, &mut d);
@@ -766,7 +632,7 @@ fn refusal_tick(config: &str, roots: usize) -> (TickReport, Vec<(log::Level, Str
     let paths: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
     let gate = Gate::default();
     let mut d =
-        dispatcher("judge", gated_factory(paths.clone(), gate.clone()), admit_only("judge"));
+        dispatcher("guide", gated_factory(paths.clone(), gate.clone()), admit_only("guide"));
     let in_progress = new_in_progress_guard();
     let mut report = TickReport::default();
     let records = crate::test_log_capture::capture_logs(|| {
@@ -789,27 +655,30 @@ fn refusal_lines(records: &[(log::Level, String)]) -> Vec<&(log::Level, String)>
         .collect()
 }
 
+/// A host budget of 2 (#11911: `workFinder.maxConcurrent`), with Guide's own
+/// budget raised to it, so the host ceiling is what refuses.
+const CEILING_2: &str = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":2}},"workFinder":{"maxConcurrent":2}}}"#;
+
 #[test]
 fn ac8_a_ceiling_refusal_logs_one_line_per_tick_not_one_per_root() {
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"maxConcurrent":1}}}"#;
-    let (report, records) = refusal_tick(cfg, 5);
-    assert_eq!(report.spawned.len(), 1);
+    let (report, records) = refusal_tick(CEILING_2, 5);
+    assert_eq!(report.spawned.len(), 2);
     assert_eq!(
         report.refusal,
         Some(LimitRefusal::Ceiling {
-            active: 1,
-            ceiling: 1
+            active: 2,
+            ceiling: 2
         })
     );
-    assert_eq!(report.deferred, 4);
+    assert_eq!(report.deferred, 3);
     let lines = refusal_lines(&records);
     assert_eq!(lines.len(), 1, "one aggregated line: {records:?}");
-    assert!(lines[0].1.contains("4 root(s) deferred"), "{}", lines[0].1);
+    assert!(lines[0].1.contains("3 root(s) deferred"), "{}", lines[0].1);
 }
 
 #[test]
 fn ac8_a_role_budget_refusal_logs_one_line_per_tick() {
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":2}}}}"#;
+    let cfg = r#"{"autonomous":{"workFinder":{"maxConcurrent":8},"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":2}}}}"#;
     let (report, records) = refusal_tick(cfg, 5);
     assert_eq!(report.spawned.len(), 2);
     assert_eq!(
@@ -838,7 +707,7 @@ fn spawns_per_root(config: &str, roots: usize, ticks: usize) -> Vec<usize> {
     let factory: RunnerFactory = Arc::new(|_| {
         Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
     });
-    let mut d = dispatcher("judge", factory, admit_only("judge"));
+    let mut d = dispatcher("guide", factory, admit_only("guide"));
     let in_progress = new_in_progress_guard();
     let mut counts = vec![0usize; roots];
     for _ in 0..ticks {
@@ -859,25 +728,24 @@ fn assert_fair(counts: &[usize], label: &str) {
     assert!(max - min <= 1, "{label}: runs must rotate evenly, got {counts:?}");
 }
 
-/// The Judge's repro on 98e313a7e: 4 roots, `roleMaxConcurrent.judge = 1`,
+/// The Judge's repro on 98e313a7e: 4 roots, `roleMaxConcurrent.guide = 1`,
 /// instant runs, 6 ticks gave `[6, 0, 0, 0]`. With the cursor every root runs
 /// within `ceil(4 / 1) = 4` ticks and 6 ticks split `[2, 2, 1, 1]`.
 #[test]
 fn fairness_role_budget_rotates_through_every_root() {
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
+    let cfg = r#"{"autonomous":{"workFinder":{"maxConcurrent":8},"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":1}}}}"#;
     assert_fair(&spawns_per_root(cfg, 4, 4), "budget 1, 4 ticks");
     assert_eq!(spawns_per_root(cfg, 4, 6), vec![2, 2, 1, 1], "budget 1, 6 ticks");
     // Budget 2 over 5 roots: ceil(5 / 2) = 3 ticks reach everyone.
-    let cfg2 = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":2}}}}"#;
+    let cfg2 = r#"{"autonomous":{"workFinder":{"maxConcurrent":8},"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":2}}}}"#;
     assert_fair(&spawns_per_root(cfg2, 5, 3), "budget 2, 3 ticks");
 }
 
 /// The same rotation when the host ceiling (`maxConcurrent`) is what refuses.
 #[test]
 fn fairness_host_ceiling_rotates_through_every_root() {
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"maxConcurrent":1}}}"#;
-    assert_fair(&spawns_per_root(cfg, 4, 4), "ceiling 1, 4 ticks");
-    assert_eq!(spawns_per_root(cfg, 4, 6), vec![2, 2, 1, 1], "ceiling 1, 6 ticks");
+    assert_fair(&spawns_per_root(CEILING_2, 4, 2), "ceiling 2, 2 ticks");
+    assert_eq!(spawns_per_root(CEILING_2, 4, 3), vec![2, 2, 1, 1], "ceiling 2, 3 ticks");
 }
 
 /// While the admitted run is still going, the next tick's walk starts just
@@ -888,12 +756,12 @@ fn fairness_host_ceiling_rotates_through_every_root() {
 fn fairness_cursor_survives_long_runs_and_registry_changes() {
     let rt = runtime();
     let _enter = rt.enter();
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
+    let cfg = r#"{"autonomous":{"workFinder":{"maxConcurrent":8},"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":1}}}}"#;
     let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| workspace(cfg)).collect();
     let p: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
     let gate = Gate::default();
     let mut d =
-        dispatcher("judge", gated_factory(vec![p[0].clone()], gate.clone()), admit_only("judge"));
+        dispatcher("guide", gated_factory(vec![p[0].clone()], gate.clone()), admit_only("guide"));
     let in_progress = new_in_progress_guard();
 
     assert_eq!(d.dispatch_tick(p.clone(), &in_progress).spawned, vec![p[0].clone()]);
@@ -912,35 +780,52 @@ fn fairness_cursor_survives_long_runs_and_registry_changes() {
     let _ = join_one(&rt, &mut d);
 }
 
-/// Recommended fix: a root whose queue is empty, sitting at the cursor, must
-/// not use up the tick. Its run returns `QueueEmpty` without spawning an
-/// agent, and the reap resumes the walk so the root with work is admitted in
-/// the same tick — before any second `dispatch_tick`.
+/// A root whose trigger is absent, sitting at the cursor, must not use up the
+/// tick. Its run returns `QueueEmpty` without spawning an agent (the guide's
+/// ready/backlog set is unchanged since its last run, #10816), and the reap
+/// resumes the walk so the root with work is admitted in the same tick —
+/// before any second `dispatch_tick`.
 #[test]
 #[serial(role_tick_ring)]
-fn fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work() {
+fn fairness_a_skipped_trigger_at_the_cursor_does_not_block_a_root_with_work() {
     let rt = runtime();
     let _enter = rt.enter();
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
+    let cfg = r#"{"autonomous":{"workFinder":{"maxConcurrent":8},"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":1},"eventTriggers":{"enabled":true}}}}"#;
     let (empty, full) = (workspace(cfg), workspace(cfg));
     let empty_path = empty.path().to_path_buf();
-    let probe: QueueProbe = {
-        let empty_path = empty_path.clone();
-        Arc::new(move |root, _| Ok(root != empty_path.as_path()))
+    // Both roots see the same set; only the empty one already ran on it.
+    let ledger: &'static triggers::TriggerLedger =
+        Box::leak(Box::new(triggers::TriggerLedger::default()));
+    ledger.record_success(&empty_path, "guide", Some("set".to_string()), Instant::now());
+    // The empty root's probe waits on `gate`, so its run (and its `guide`
+    // slot) is still in flight while `dispatch_tick` walks to the second
+    // root. Without it, the QueueEmpty run can return and free the slot
+    // before the walk gets there on a loaded host, and both roots spawn.
+    let gate = Gate::default();
+    let probe: triggers::TriggerProbe = {
+        let (gate, empty_path) = (gate.clone(), empty_path.clone());
+        Arc::new(move |root, _| {
+            if root == empty_path.as_path() {
+                gate.wait();
+            }
+            triggers::Observation::Fingerprint("set".to_string())
+        })
     };
     let invoked = Arc::new(AtomicUsize::new(0));
     let factory: RunnerFactory = {
         let invoked = Arc::clone(&invoked);
         Arc::new(move |_| Box::new(FixedRunner(RoleTickOutcome::Success, Arc::clone(&invoked))))
     };
+    let prev = std::env::var(triggers::EVENT_TRIGGERS_ENV).ok();
+    std::env::remove_var(triggers::EVENT_TRIGGERS_ENV);
     let mut d = RoleDispatcher::with_decide(
-        spec("judge"),
+        spec("guide"),
         Duration::from_secs(300),
         factory,
-        probe,
         None,
-        admit_only("judge"),
-    );
+        admit_only("guide"),
+    )
+    .with_triggers(probe, ledger);
     let in_progress = new_in_progress_guard();
     let roots = vec![empty_path.clone(), full.path().to_path_buf()];
 
@@ -948,6 +833,7 @@ fn fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work() {
     assert_eq!(tick.spawned, vec![empty_path.clone()], "the empty root holds the cursor");
     assert_eq!(tick.deferred, 1, "the root with work is deferred by the budget");
     assert!(!d.resume_due(), "nothing has finished yet");
+    gate.open();
 
     let joined = join_one(&rt, &mut d);
     assert_eq!(joined.as_ref().unwrap().1.outcome, RoleTickOutcome::QueueEmpty);
@@ -961,6 +847,9 @@ fn fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work() {
     assert_eq!(run.outcome, RoleTickOutcome::Success);
     assert_eq!(invoked.load(Ordering::SeqCst), 1, "only the root with work spawned an agent");
     assert!(d.resume_after_queue_empty(&in_progress).is_none(), "each root once per tick");
+    if let Some(v) = prev {
+        std::env::set_var(triggers::EVENT_TRIGGERS_ENV, v);
+    }
 }
 
 /// A run that did real work does not resume the walk: the budget still bounds
@@ -970,98 +859,24 @@ fn fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work() {
 fn fairness_a_real_run_does_not_resume_and_a_new_tick_replaces_pending() {
     let rt = runtime();
     let _enter = rt.enter();
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
+    let cfg = r#"{"autonomous":{"workFinder":{"maxConcurrent":8},"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":1}}}}"#;
     let (a, b) = (workspace(cfg), workspace(cfg));
-    let factory: RunnerFactory = Arc::new(|_| {
-        Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
-    });
-    let mut d = dispatcher("judge", factory, admit_only("judge"));
+    // Root a's run waits on `gate`, so it still holds the `guide` slot when
+    // the walk reaches b; an instant run could free it first on a loaded host.
+    let gate = Gate::default();
+    let factory = gated_factory(vec![a.path().to_path_buf()], gate.clone());
+    let mut d = dispatcher("guide", factory, admit_only("guide"));
     let in_progress = new_in_progress_guard();
     let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
-    assert_eq!(d.dispatch_tick(roots.clone(), &in_progress).deferred, 1);
+    let tick = d.dispatch_tick(roots.clone(), &in_progress);
+    assert_eq!(tick.spawned, vec![a.path().to_path_buf()]);
+    assert_eq!(tick.deferred, 1);
+    gate.open();
     let joined = join_one(&rt, &mut d);
+    assert_eq!(joined.as_ref().unwrap().1.outcome, RoleTickOutcome::Success);
     d.handle_joined(joined);
     assert!(!d.resume_due(), "a Success run spent an agent — no resume");
     assert!(d.resume_after_queue_empty(&in_progress).is_none());
     assert_eq!(d.dispatch_tick(roots, &in_progress).spawned, vec![b.path().to_path_buf()]);
     let _ = join_one(&rt, &mut d);
-}
-
-// -- curator untriaged-count ordering (#9000) -------------------------------
-
-fn curator_order(ledger: &'static triggers::TriggerLedger, paths: &[PathBuf]) -> Vec<PathBuf> {
-    let factory: RunnerFactory = Arc::new(|_| {
-        Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
-    });
-    let d = dispatcher("curator", factory, admit_only("curator"))
-        .with_triggers(triggers::no_trigger_probe(), ledger);
-    let mut order: VecDeque<(usize, PathBuf)> = paths.iter().cloned().enumerate().collect();
-    d.order_by_untriaged(&mut order);
-    order.into_iter().map(|(_, p)| p).collect()
-}
-
-#[test]
-fn curator_visits_the_largest_untriaged_backlog_first() {
-    let ledger: &'static triggers::TriggerLedger =
-        Box::leak(Box::new(triggers::TriggerLedger::default()));
-    let (a, b, c) = (PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c"));
-    let paths = vec![b.clone(), a.clone(), c.clone()];
-    // Nothing observed: round-robin order is untouched.
-    assert_eq!(curator_order(ledger, &paths), paths);
-    ledger.record_untriaged(&a, 40);
-    ledger.record_untriaged(&b, 0);
-    // `c` is unobserved and keeps its slot; A (40) outranks B (0).
-    assert_eq!(curator_order(ledger, &paths), vec![a, b, c]);
-}
-
-#[test]
-fn curator_keeps_round_robin_for_unobserved_roots() {
-    let ledger: &'static triggers::TriggerLedger =
-        Box::leak(Box::new(triggers::TriggerLedger::default()));
-    let (a, b) = (PathBuf::from("/a"), PathBuf::from("/b"));
-    let paths = vec![a.clone(), b.clone()];
-    // Only B is observed: unobserved A keeps its round-robin slot ahead of
-    // B's backlog rather than being pushed behind it.
-    ledger.record_untriaged(&b, 40);
-    assert_eq!(curator_order(ledger, &paths), vec![a, b]);
-}
-
-/// #11905: an ordinary Doctor-cycle-capped PR (`loom:changes-requested` +
-/// `loom:blocked`, a cap park record, no Champion hold record) no longer
-/// sends the gate to Doctor's queue; a Champion hold on its round trip still
-/// does, capped or not (its queue decides from the trusted marker).
-#[test]
-fn a_capped_pr_with_no_hold_record_skips_the_doctor_queue_read() {
-    use crate::champion_hold::{CRITICAL_FILE_HOLD_REASON, DOCTOR_CYCLE_CAP_MARKER};
-    let record = |reason: &str| {
-        crate::park_record::render_park(&[], Some("x"), Some("2026-10-14T00:00:00Z"), Some(reason))
-    };
-    let with_body = |body: String| {
-        let mut r = row(1, true, &["loom:changes-requested", "loom:blocked"]);
-        r.body = Some(body);
-        r
-    };
-    let label = "loom:changes-requested";
-    let capped = with_body(record("doctor cycle exhausted"));
-    assert_eq!(round_trip_role(label, std::slice::from_ref(&capped)), None);
-    assert_eq!(
-        round_trip_role(label, &[with_body(format!("x\n{DOCTOR_CYCLE_CAP_MARKER}"))]),
-        None
-    );
-    let held = with_body(record(CRITICAL_FILE_HOLD_REASON));
-    assert_eq!(
-        round_trip_role(label, std::slice::from_ref(&held)),
-        Some(crate::pr_planning::PrRole::Doctor)
-    );
-    let both =
-        with_body(format!("{}\n{}", record(CRITICAL_FILE_HOLD_REASON), record("doctor cap")));
-    assert_eq!(round_trip_role(label, &[both]), Some(crate::pr_planning::PrRole::Doctor));
-    // No record at all: the label shape alone still asks (a hold whose body
-    // record a human edited away).
-    let bare = row(2, true, &["loom:changes-requested", "loom:blocked"]);
-    assert_eq!(round_trip_role(label, &[bare]), Some(crate::pr_planning::PrRole::Doctor));
-    assert_eq!(
-        round_trip_role(label, &[capped, held]),
-        Some(crate::pr_planning::PrRole::Doctor)
-    );
 }

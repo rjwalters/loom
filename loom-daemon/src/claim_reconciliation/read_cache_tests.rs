@@ -178,8 +178,10 @@ fn unchanged_claimed_prs_read_their_label_timeline_once() {
     // No activity was found, so that read is never cached (a failed read
     // looks the same and must not hide a heartbeat) — but it is bounded to
     // comments since the claim label.
-    // Two uncached scans per pass on an aged claim: claim-activity + (#10235) Judge-progress.
-    assert_eq!(calls_matching(&log, "issues/7/comments"), 6);
+    // Two uncached scans per pass on an aged claim: claim-activity + (#10235)
+    // Judge-progress, plus (#11911) the lease gate's read of the Judge
+    // `pr-lease` before a reclaim (no lease here, so the reclaim stands).
+    assert_eq!(calls_matching(&log, "issues/7/comments"), 9);
     assert_eq!(calls_matching(&log, "since=2026-10-03T09:30:00Z"), 6);
 }
 

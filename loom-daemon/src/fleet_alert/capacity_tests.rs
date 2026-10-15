@@ -63,7 +63,7 @@ fn status(cap: CapView, ready: u32) -> DaemonStatusReport {
 fn disk_limited() -> CapView {
     CapView {
         configured: 6,
-        disk: Some(2),
+        disk: Some(0),
         ram: Some(30),
     }
 }
@@ -95,7 +95,7 @@ fn a_disk_limited_cap_names_the_numbers_and_a_priority_backlog_is_no_ask() {
     assert!(cap.headline.contains("Disk headroom"), "{}", cap.headline);
     assert!(cap
         .headline
-        .contains("capping concurrency at 2, below the configured 6"));
+        .contains("capping concurrency at 0, below the configured 6"));
     assert!(cap.headline.contains("106 ready issue(s) are waiting"));
     assert!(cap.fix.contains("Free disk"));
 }

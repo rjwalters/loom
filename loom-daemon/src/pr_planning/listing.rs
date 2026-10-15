@@ -278,27 +278,9 @@ fn backstop_holds(root: &Path, gh: &Path, row: &Value, trust: &TrustPolicy) -> b
     }
 }
 
-/// The Judge role-runner gate on a non-empty labeled listing (#11855): is
-/// there a row `pr-queue --role judge` would actually serve — a labeled row
-/// the no-verdict backstop does not hold, or a guard-admitted fallback row?
-/// Stops at the first one, so a repository with servable work pays for one
-/// row's record read.
-pub fn has_judge_work(root: &Path, gh: &Path) -> Result<bool> {
-    let (prefer, trust) = (prefer_human_prs(root), TrustPolicy::for_root(root));
-    let mut rows = list_open(root, gh)?;
-    // #11861: a Champion hold handed back by Doctor is Judge work.
-    mark_champion_holds(root, gh, PrRole::Judge, &mut rows)?;
-    for row in ordered_queue(rows, PrRole::Judge, prefer, &trust) {
-        if judge_admits(root, gh, &row, &trust)? && !ci_pending_at_head(root, gh, &row) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Whether Judge's queue admits an ordered row before the CI read: a
 /// fallback row its guard admits, or a workflow row the no-verdict backstop
-/// does not hold. One rule for `fetch_queue` and [`has_judge_work`].
+/// does not hold. The rule `fetch_queue` applies.
 fn judge_admits(root: &Path, gh: &Path, row: &Value, trust: &TrustPolicy) -> Result<bool> {
     if row["mode"] == "fallback" {
         guard_admits(root, row)
@@ -335,24 +317,4 @@ pub fn ci_pending_at_sha(root: &Path, gh: &Path, sha: &str) -> bool {
             read(root, gh, ops::CI_CHECK_RUNS_FOR_SHA, path).ok()
         })
     })
-}
-
-/// Judge's role-runner gate on an empty labeled listing (#9389): is there a
-/// guard-admitted fallback PR that joins a busy queue — trusted interactive
-/// (preference on) or [`workflow_shaped`] (always)? The predicate runs on the
-/// one cached listing before the guard, so a repo with no such PR runs no
-/// guard at all, and the first admitted row settles it.
-pub fn has_judge_fallback(root: &Path, gh: &Path) -> Result<bool> {
-    let (prefer, trust) = (prefer_human_prs(root), TrustPolicy::for_root(root));
-    let mut rows = list_open(root, gh)?;
-    mark_champion_holds(root, gh, PrRole::Judge, &mut rows)?;
-    for row in ordered_queue(rows, PrRole::Judge, prefer, &trust) {
-        if row["mode"] == "fallback"
-            && joins_busy_queue(&row, prefer, &trust)
-            && guard_admits(root, &row)?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }

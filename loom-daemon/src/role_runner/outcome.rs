@@ -307,11 +307,12 @@ pub enum RoleTickOutcome {
         /// would carry, retained here purely for diagnostic value.
         detail: String,
     },
-    /// A queue-gated role (#9391, see
-    /// `concurrent_dispatch::work_queue_labels`) found its work queue empty,
-    /// so no agent was spawned. Not a failure and not a skip that needs an
-    /// operator: the next tick re-checks, and a listing *error* never
-    /// produces this (the gate fails open and dispatches).
+    /// An event-triggered role (#10816, `triggers`) found its trigger
+    /// absent, so no agent was spawned. Not a failure and not a skip that
+    /// needs an operator: the next tick re-checks, and an unobserved input
+    /// never produces this (the gate fails open and dispatches). The
+    /// Judge/Doctor queue gate (#9391) that also produced it was retired
+    /// with those roles' intervals (#11911).
     QueueEmpty,
 }
 

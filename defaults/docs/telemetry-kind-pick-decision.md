@@ -46,7 +46,7 @@ no journal is created, when no OTLP exporter runs.
 | `candidates[]` | array | in the ranker's order, **every candidate, uncapped** (#11567): `rank` (1-based), `repo` (forge slug, or `repo_unresolved`; never a local path), `number`, `stage`, `sort_key` (`name`, `value`) |
 | `acted[]` | array | `repo`, `number`, `action`, uncapped. Work finder: `dispatched`. Roles: one entry per distinct observed write, from the closed set below; may name an item outside `candidates` |
 | `skipped[]` | array | one `{repo, number, reason}` per skipped candidate listed in `candidates`, plus optional fields set only on work-finder rows. `detail`: a `deferred_file_overlap` row's shared `## Affected Files` paths (`file overlap: a, b`, one line, truncated at 160 chars, #9781), or a `workspace_halted` row's halt cause, only when it is a closed-vocabulary `work_finder::halt_cause` token (`main_red`, `drain`, `weight_zero`, ...; #11811), or an `already_landed` row's evidence (`forge_closed`, `forge_closed_not_planned`, `journal_landed`; #11858); no other disposition's detail (e.g. dispatch-error text) is carried. `disposition` (#11811): the row's own un-collapsed `QueueDisposition` wire name (e.g. `deferred_ramp_cap` vs `deferred_repo_cap`, both `reason = cap`), so a reader can name which cap, back-off or hold skipped it. `held_until` (#11811): RFC 3339 instant the row's time-boxed hold clears, as in `queue.snapshot` (#9311): set for the recheck, dispatch / open-PR back-off, cooldown and retry windows the work finder tracks. All additive (absent otherwise and on older daemons), so `schema_version` stays `2` |
-| `candidate_source` | string | `ready_queue` (work finder), `serving_queue` (the role's `pr-queue` result), `listing` (the issue/PR listings the role read, e.g. Curator), `gate_listing` (fallback: the daemon's gate listing), `none` (nothing observed) |
+| `candidate_source` | string | `ready_queue` (work finder), `serving_queue` (the role's `pr-queue` result), `listing` (the issue/PR listings the role read, e.g. Curator), `none` (nothing observed). `gate_listing` (the daemon's own gate listing, a fallback) appears only on records from before #11911, which retired the role runner's queue gate |
 | `decisions_observed` | boolean | `true` when the agent's writes were observed, so every candidate without an action is a real skip; `false` when only a ranking was seen, and an unexplained candidate is then in neither `acted` nor `skipped` |
 | `workspace_draw` | object, optional | work finder only (#11103), absent when nothing was drawn: `seed` (decimal string), `draws_total`, optional `seed_scheme` / `seed_minute` / `seed_host` (#11683; absent when the seed was pinned: `seed` = first 8 bytes, big-endian, of `sha256(seed_scheme + ":" + seed_minute + ":" + seed_host)` for `seed_scheme` `"loom-draw/v1"`, `seed_minute` a decimal string of `floor(unix_utc_secs/60)`), and `draws[]` (every draw, in order; `seed`, `draws_total` and the three `seed_*` fields repeat on each chunk), each `{candidates[{repo, weight, base_weight, bonus}], total_weight, roll, picked, number}`. Since #11742 `weight` = `base_weight` (the repo's roster weight) + `bonus` (points for a verified red-main fix, very-important or important work), and the draw picked the repo with probability `weight / total_weight`. Records from before #11742 also carry a per-tick `temperature` and per-draw `pool` / `p_min`, with softmax weights on a 1,000,000 scale and no `base_weight` / `bonus`; readers must tolerate both, so `schema_version` stays `2`. Replaying the draws from `seed` and the logged weights reproduces the dispatch order; see [`priority-model.md`](priority-model.md) |
 | `item_draw` | object, optional | step engine only (#11896), absent elsewhere: the item draws of a tick, `actionable × priority × age`. Header (repeats on every chunk): `seed_scheme` (`loom-draw/v2`), `seed_minute`, `seed_host`, `tick_counter` (decimal strings), `draws_total`, and `excluded[]`, one `{repo, reason, skip_reason, count}` per workspace and weight-0 reason (`reason` is the classifier's pass reason, e.g. `claimed`, `blocked`, `no_stage`, or `pool_exhausted` (the step's role has no spawnable account) or `build_backoff`; `skip_reason` is its closed-set mapping, `PickSkipReason::from_exclusion`). `pools[]` (chunked in order): each drawn workspace's pool before its first draw, `{repo, index, number, issue, pr, step, weight, priority, age_permille, age_source}` in pool order. `draws[]` (chunked in order): `{repo, draw_index, seed, pool_size, total_weight, roll, picked_index, number, issue, pr, step, weight, actionable, priority, level, lane, age_permille, age_minutes, age_source}`. Draw `i` of a workspace is seeded `sha256("loom-draw/v2:" + seed_minute + ":" + seed_host + ":" + tick_counter + ":" + repo + ":" + draw_index)`, first 8 bytes big-endian; `weight` = `priority × (divisor_min + min(age_minutes, cap_min))`, so P = `weight / total_weight` and draws are without replacement. The roll is `PickRng(seed)` values with rejection of the low `2^64 mod total_weight` ones, then `% total_weight` (no modulo bias). Replay: per repo, start from `pools[]`; for each draw, `roll` selects the first row whose cumulative weight exceeds it over the pool minus earlier picks, and that row's position is `picked_index` (`step_dispatch::item_draw::replay_record`). The tick counter is per process, so a restart within a minute reuses that minute's seeds; replay is unaffected. `age_source` is `mirror`, `events`, `created` or `none`. Additive, so `schema_version` stays `2` |
@@ -87,11 +87,11 @@ no journal is created, when no OTLP exporter runs.
   it runs captured and its printed rows are journaled the same way (#11858;
   `stage` is the `--label` value(s), else `search`). A pass-through listing with
   `--jq`, `--template` or `--web` stays unobserved.
-- **Fallback** (`candidate_source = gate_listing`): no journal was read (the
-  agent's runtime does not inherit it, or the queue was never read). The gate's
-  listing in **forge listing order**, which can differ from the serving order.
-  A Judge/Doctor tick whose queue was empty was never spawned and carries
-  `outcome = skipped_queue_empty`.
+- **No journal** (`candidate_source = none`): no journal was read (the agent's
+  runtime does not inherit it, or the queue was never read), so no candidates
+  are recorded. Before #11911 the role runner's own Judge/Doctor gate listing
+  filled in here (`gate_listing`, in forge listing order); the gate went with
+  those roles' intervals.
 
 ### The pick journal
 
@@ -154,7 +154,7 @@ it, only a hold label names a reason; other candidates are undecided.
 | `host_constraint` | not for this host | `host_constraint`, `peer_claim` |
 | `blocked` | blocked by something specific to the item | `workspace_commands_missing`, `quarantined`, `labelled_blocked`, `unknown`; roles: `loom:blocked`, `loom:ci-failure` |
 | `error` | the dispatch attempt failed | `dispatch_error` |
-| `tick_skipped` | the role tick did not run for another reason | roles: runtime rejected, model/runtime mismatch, load, queue gate |
+| `tick_skipped` | the role tick did not run for another reason | roles: runtime rejected, model/runtime mismatch, load, an absent event trigger |
 | `not_selected` | the role ran, its writes were observed, and it did not act on this candidate | roles only, with `decisions_observed` |
 | `already_landed` | the item's work already landed: the issue is closed, or this host recorded a `landed` sweep for it in the last 30 minutes (#11429) | `already_landed` |
 | `already_closed` | the issue is closed as not planned (#11429) | `already_closed` |
@@ -175,7 +175,7 @@ there. The step engine's weight-0 exclusions map through the parallel total matc
 
 For a record with `candidate_source = serving_queue` this is the item's rank in
 the role's serving-queue order; for `listing`, in the order the role read it;
-for `gate_listing`, only the forge listing order (select
+for `gate_listing` (records before #11911), only the forge listing order (select
 `JSONExtractString(body, 'candidate_source')` to tell them apart).
 
 Run against `signoz_logs.distributed_logs_v2` (ClickHouse). Substitute the repo,
@@ -232,11 +232,12 @@ Derived from the shipped default cadences, **not measured on a live fleet**:
 | guide | 900 s | up to 96 |
 | architect | 3600 s | up to 24 |
 
-The cadences above are the defaults with `autonomous.roleRunner.eventTriggers.enabled` off
-and demand-weighted width at its defaults. Turning event triggers on lowers curator, auditor
-and guide record volume (a quiet role launches only on a new input, or at `maxQuietSecs`),
-and `demandWidth` can run several judge, doctor or champion lanes at once, which raises it.
-The figures below do not model either.
+The cadences above are the defaults with `autonomous.roleRunner.eventTriggers.enabled` off.
+Since #11909 judge, doctor and curator do not tick on the role runner (they are steps, with
+their own records), and since #11911 `demandWidth`, which could run several of their lanes
+at once, is retired. Turning event triggers on lowers auditor and guide record volume (a
+quiet role launches only on a new input, or at `maxQuietSecs`). The figures below do not
+model it.
 
 A role record is only written for a tick that was admitted and run; a root held
 back at admission writes none. With 1 root and the default roles, that is about

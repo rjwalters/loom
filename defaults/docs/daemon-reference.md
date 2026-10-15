@@ -4500,7 +4500,7 @@ epic lane (#3841):
 |---------------|-----------|--------------------|
 | `epic:needs_decomp` | body has `< 2` `### Phase` sections | **decompose** — Architect enriches the body in place (no PR) |
 | `epic:designed` | `≥ 2` phases, no `epic-phase` children yet | **expand** — Champion materializes phase-1 children (under the #3707 mutex) |
-| `epic:active` | a current-phase child is open | per-child `/loom:sweep` dispatch (`BuildChildren`) |
+| `epic:active` | a current-phase child is open | nothing: the children are Builder steps the work finder draws (#11909; the `BuildChildren` sweep dispatch was deleted, #11911) |
 | `epic:phase_join` | current phase's children all closed, more phases remain | **join** — Champion materializes phase N+1 children (mutex + barrier-gated) |
 | `epic:done` | all phases' children closed, no phases remain | **close** — Champion closes the epic (terminal) |
 
@@ -4564,9 +4564,8 @@ supervisor's decisions are tailable via `subscribe_to_events` /
 | `epic.issue.{N}.join`      | `epic:phase_join`   | `{epic, action: "join", state: "epic:phase_join"}` |
 | `epic.issue.{N}.close`     | `epic:done`         | `{epic, action: "close", state: "epic:done"}` |
 
-The `BuildChildren` transition (per-child `/loom:sweep` dispatch) has **no**
-epic-action topic — those dispatches already surface on the frozen
-`sweep.global.dispatch` topic. Subscribe to `epic.issue` to receive every
+An `active` epic plans nothing (its children are Builder steps, #11911), so it
+has **no** epic-action topic. Subscribe to `epic.issue` to receive every
 epic-supervisor action across all epics, or `epic.issue.{N}` for one epic
 (segment-aligned prefix match, same routing rule as the sweep topics).
 
@@ -4719,15 +4718,15 @@ fleet-gitops can retune a live daemon without a restart:
 `loom-daemon fleet-config render` classifies a changed path from the same
 table in code (`fleet_store::reload`).
 
-> **This cap bounds SWEEP dispatch only (#6102).** Role-runner agents
-> (Curator / Judge / Doctor / Champion / Guide / …) are spawned by the role
-> runner's own interval and idle-edge loops and **never pass through this
-> admission path**, so none of the three terms above — including
-> `maxConcurrent` — has ever bounded them. Since #6102 they have their own
-> ceiling, `autonomous.roleRunner.maxConcurrent` (default: the number of
-> interval-cadence default roles); this host's worst-case agent count is
-> `dynamic_cap + roleRunner.maxConcurrent`. See
-> [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102). **#5270 removed the token axis from this formula entirely**, on any
+> **Since #11911 this cap is one configured number, the whole host's agent
+> budget (default 20, 2am#4463); disk and RAM headroom only halt it at
+> exhaustion.** Steps and the role
+> runner's agents (Champion non-item, Guide, Auditor, Hermit, Architect) draw
+> from it together: steps get the cap less the role agents in flight, and the
+> role runner gets it less the steps in flight. Until #11911 it bounded sweeps
+> only and the role runner had its own ceiling beside it (#6102,
+> `autonomous.roleRunner.maxConcurrent`, now retired). See
+> [One host budget](#one-host-budget-steps-and-role-runner-agents-6102-11911). **#5270 removed the token axis from this formula entirely**, on any
 auth path (API key or subscription pool, overage-enabled or not) — operator
 direction: "we should only ever limit parallelism based on the machine
 disk/RAM/CPU." A metered `ANTHROPIC_API_KEY` has no 5h/7d subscription window,
@@ -4824,8 +4823,9 @@ default charge: set `diskChargeGb` to its real per-sweep footprint.
 - Every other dispatch route: the check also runs inside
   `begin_prepared_issue_dispatch`, after the other guards and before any
   claim, label or spawn — so the review-stall watchdog's re-dispatch
-  (#3910), its PR-set conversion (#7649), the reaper's resume (#4256),
-  IPC/CLI dispatch and the epic supervisor are gated by the same rule. A
+  (#3910), the reaper's resume (#4256) and IPC/CLI dispatch are gated by the
+  same rule. (The watchdog's PR-set conversion, #7649, and the epic
+  supervisor's sweep dispatch were retired, #11911.) A
   refusal is a typed `DiskAdmissionRefused` error naming every figure, logged
   at WARN. An admitted dispatch is recorded as a *pending* unit, so the next
   admission reserves for it before any sample has seen it (dropped after 180 s
@@ -4970,9 +4970,9 @@ actually is**:
    #5270) RAM headroom — stay because they meter genuinely *exhaustible*
    resources (bytes), not an estimate. (The token axis sat here too until
    #5270 removed it — see the section above.) **It is not the whole *host*
-   policy**: role-runner agents are admitted outside this formula entirely and
-   carry their own ceiling since #6102 — see
-   [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102).
+   policy**: role-runner agents are admitted outside this formula, but they
+   draw from the same budget since #11911 — see
+   [One host budget](#one-host-budget-steps-and-role-runner-agents-6102-11911).
 2. **The genuinely heavy stages serialize where they occur**, via the
    [machine-wide build slot](#machine-wide-build-slot-4512). N sweeps run
    concurrently; at most `LOOM_BUILD_SLOTS` of them hold the slot while running
@@ -5215,7 +5215,7 @@ deciding what to tune:
 |---|---|
 | **It samples** | host-wide load-per-core. A role agent's CPU absolutely counts toward the hold threshold |
 | **It can hold back** | a **new sweep admission**, and nothing else |
-| **It cannot hold back** | a role-runner agent — those are admitted by the role runner's own loops, bounded only by `autonomous.roleRunner.maxConcurrent` (#6102) |
+| **It cannot hold back** | a role-runner agent — those are admitted by the role runner's own loops, bounded by their share of the host budget (#6102, #11911) |
 | **It cannot shed** | anything already running. In-flight sweeps and in-flight role agents both run to completion; the brake is an *admission* gate, never a preemption mechanism |
 
 Two practical consequences:
@@ -5225,66 +5225,53 @@ Two practical consequences:
   is one (`… — NOTE: 3 role-runner agent(s) ARE running; the brake cannot hold
   those back …`). Before #6102 they asserted "nothing is running to relieve
   it", which was false in exactly the case that matters.
-- **If load is high while few sweeps are in flight, lowering `maxConcurrent`
-  will not reach that load.** Lower the role-agent ceiling instead.
+- **If load is high while few steps are in flight, lowering `maxConcurrent`
+  still reaches it** since #11911: role agents share that budget.
 
-#### The other half of the agent budget: role-runner agents (#6102)
+#### One host budget: steps and role-runner agents (#6102, #11911)
 
 `autonomous.workFinder.maxConcurrent` is the knob an operator reaches for after
-a load-induced crash — and until #6102 it delivered materially less protection
-than its own documentation implied, because **it bounds sweep dispatch only**.
-
-On `studio-host` (Mac Studio M3 Ultra, 28 logical cores) an overnight hard halt
+a load-induced crash. Until #6102 it delivered materially less protection than
+its own documentation implied, because **it bounded sweep dispatch only**: on
+`studio-host` (Mac Studio M3 Ultra, 28 logical cores) an overnight hard halt
 under 1m load averages of **126–136** was remediated by lowering
-`maxConcurrent` from 16 to 8. Afterwards the host still measured:
+`maxConcurrent` from 16 to 8, and the host still measured 1.15 load-per-core
+with a single sweep in flight, because ten role-runner agents ran outside it.
+#6102 gave those agents a second ceiling, `autonomous.roleRunner.maxConcurrent`,
+so a host's worst-case agent count was the sum of the two.
 
-```
-In-flight sweeps: 1
-Dynamic concurrency cap: 8
-host cpu: 28 logical cores, 8% idle (~25.8 cores consumed), 1m loadavg 32.41
-$ pgrep -f "claude-wrapper.sh" | wc -l
-11
-```
+**Since #11911 there is one budget, one configured number** (operator ruling,
+2am#4463: "just have a single number set in fleet-gitops based on experience").
+Step dispatch moved every item role into the work finder, and the role runner
+keeps only the roles with no item to draw. Both draw from
+`autonomous.workFinder.maxConcurrent`, **default 20**, set per host in the
+fleet store (`crate::host_budget`). Disk and RAM headroom no longer size it: an
+exhausted disk or RAM (headroom `0`) still halts admission, and the disk
+reservation (`disk_admission`), the per-repo caps, the saturation brake and the
+host-distress breaker are unchanged. The daemon logs `host_budget: one host
+budget = N` at start and on a change.
 
-1.15 load-per-core — above the `0.95` brake threshold — with a *single* sweep
-in flight against a cap of 8. The other ten agents were role-runner ticks
-(25 registered workspaces × 7 interval roles = up to 175 potentially
-concurrent), admitted entirely outside `min(disk, ram, maxConcurrent)`.
-
-**The fix is a distinct ceiling for the distinct population.**
-
-| | Value |
+| | |
 |---|---|
-| Config | `autonomous.roleRunner.maxConcurrent` |
-| Env | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` |
-| Default | the count of interval-cadence default roles (`role_runner::default_max_concurrent`) — **7** today |
-| Precedence | env > config > default, re-read every tick (a config edit hot-applies, as `workFinder.maxConcurrent` does since #9060) |
-| Scope | **process-wide across every managed workspace**, because the resource it protects (host CPU/RAM) is shared by all of them |
+| Budget | `autonomous.workFinder.maxConcurrent` (or `hyperparameters.dispatch.maxConcurrent`, or `LOOM_WORK_FINDER_MAX_CONCURRENT`), default 20; `0` while disk or RAM is exhausted |
+| Steps get | the budget less the role-runner agents in flight |
+| The role runner gets | the budget less the registry occupancy (steps, plus any sweep an attended session dispatched) the last work-finder tick saw |
+| Before the first tick, or with the work finder off | the role runner falls back to the root's configured `workFinder.maxConcurrent`, less the occupancy the startup adoption found |
+| Retired | `autonomous.roleRunner.maxConcurrent` and `LOOM_ROLE_RUNNER_MAX_CONCURRENT`: parsed and ignored with one warning each, never rejected |
 
 Design notes:
 
-- **Counted across roots, resolved per root.** The count compared against the
-  ceiling spans every managed workspace — a per-root ceiling would have bounded
-  nothing on a 25-workspace host. The *value* comes from whichever root's tick
-  is asking, exactly like `architectMaxProposals`; where roots disagree, the
-  tighter root simply refuses sooner.
-- **A derived default, not a magic number.** Defaulting to the number of
-  interval-cadence default roles bounds role-agent load at roughly *one wave of
-  distinct roles* instead of letting it scale with workspace count, and adding a
-  role raises the ceiling by exactly one rather than silently squeezing the
-  others.
+- **Counted across roots.** The role-agent count spans every managed
+  workspace, like the registry occupancy.
 - **Refusals are `WARN`, and distinct from cadence overlap.** Once an interval
-  tick hits the ceiling it stops admitting for that tick and logs **one** line
-  per role: `role_runner: <role> tick stopped admitting — N role agent(s)
-  already in flight at the host ceiling of M …; K root(s) deferred to the next
-  tick` (#9391; before, every refused root logged its own line). An idle-edge
-  refusal still logs per root. The per-`(root, role)` overlap skip (#4364) stays
-  at `debug!` — it is routine cadence overlap, not a resource limit, and
-  conflating the two is what made role-agent load invisible.
-- **Not folded into `dynamic_cap`.** Sweeps and role agents are admitted by
-  different subsystems against different queues; one `min(...)` over both would
-  misreport which is actually binding. They are reported as two ceilings whose
-  sum is the host's worst-case agent count.
+  tick hits the role runner's share it stops admitting for that tick and logs
+  **one** line per role: `role_runner: <role> tick stopped admitting — N role
+  agent(s) already in flight at the role runner's share of the host budget, M
+  …; K root(s) deferred to the next tick` (#9391). An idle-edge refusal still
+  logs per root. The per-`(root, role)` overlap skip (#4364) stays at `debug!`.
+- **A deep step backlog can hold role runs back.** When steps fill the budget,
+  the role runner admits nothing until a step ends. That is the one-budget
+  trade: the operator's one number bounds every agent.
 
 #### Concurrent across repositories, one instance per `(repository, role)` (#9391)
 
@@ -5297,27 +5284,19 @@ repository is now the parallelism boundary:
   `(root, role)` run starts on its own blocking task and holds its in-progress
   entry until it finishes; the tick does not wait for it. A run still going at
   the next tick is refused by the per-`(root, role)` overlap check (#4364), so a
-  repository never has two instances of one role — except doctor on a
-  repository deep in its own changes debt (per-repository doctor lanes, below). Finished runs are reaped as
+  repository never has two instances of one role. Finished runs are reaped as
   they complete, where the fail/recover log dedup (#4349) and the empty-pool
   brake feed (#7607) run as before.
 - **Different roles run in the same repository at once.** The in-progress key
-  is `(root, role)`; judge (`loom:review-requested`), doctor
-  (`loom:changes-requested`), champion (`loom:pr`) and curator act on disjoint
-  label states and claim what they take (`loom:reviewing`, `loom:treating`), so
-  the label state machine arbitrates between them as it already does between
-  hosts. **No role declares repository exclusivity**; a mechanism for that will
-  be added only when a concrete conflict is observed.
-- **Two limits, checked under one lock.** The host ceiling above still counts
-  every role together. Under it, **`autonomous.roleRunner.roleMaxConcurrent`**
-  (`{"<role>": N}`) bounds each role, so a burst of one role cannot take every
-  slot. The default is `max(1, ceiling / 2)` — **3** at the default ceiling of
-  7 — clamped to the ceiling. Idle-edge runs count against the same budget. A
-  budget refusal is reported the same way as a ceiling refusal: one line per
-  tick naming `roleMaxConcurrent`. Like `maxConcurrent`, `roleMaxConcurrent`
-  is read from the config of the root being admitted but counts that role's
-  runs host-wide, so if roots configure different values, each root's own
-  value governs its own admission.
+  is `(root, role)`. **No role declares repository exclusivity.**
+- **Two limits, checked under one lock.** The role runner's share of the host
+  budget (above) counts every role together. Under it,
+  **`autonomous.roleRunner.roleMaxConcurrent`** (`{"<role>": N}`) bounds each
+  role, so a burst of one role cannot take every slot. The default is
+  `max(1, share / 2)`, clamped to the share. Idle-edge runs count against the
+  same budget. A budget refusal is reported the same way as a ceiling refusal:
+  one line per tick naming `roleMaxConcurrent`. It is read from the config of
+  the root being admitted but counts that role's runs host-wide.
 - **Round-robin across repositories.** A tick stops at the first refusal, and
   no run can finish while the tick is walking the roots. So a walk that always
   began at the head of the registry would serve only the first `budget` roots
@@ -5326,136 +5305,36 @@ repository is now the parallelism boundary:
   gets a turn within `ceil(N / B)` ticks. If the last-admitted root is removed
   from the registry, the walk continues from the root that followed it rather
   than going back to the head.
-- **Queue-gated roles.** `judge` is dispatched to a repository only when its
-  `loom:review-requested` queue is non-empty, and `doctor` only when its
-  `loom:changes-requested` queue is. The check uses the ETag-cached forge
-  listing (an unchanged queue is a free `304`), runs inside the admitted run
-  before any agent is spawned, and records the non-failure outcome
-  `QueueEmpty` (`skipped_queue_empty` in `role_tick.outcome`). A listing
-  **error fails open**: the role is dispatched as if the queue had work.
-  **An empty queue does not use up the tick.** When a run ends `QueueEmpty`,
-  it spent no agent. On that reap, the walk resumes over the roots this tick
-  deferred, so a host where only one late repository has PRs still reviews
-  them in the same interval. Each root is decided at most once per tick. A run
-  that did real work never triggers a resume, so the budget still bounds agent
-  runs per interval. A drain or the rate-limit cooldown suppresses the resume
-  just as it suppresses a tick.
-  Every other role is ungated — champion also promotes `loom:curated` issues
-  and curator works unlabeled issues, so a single-label gate would starve part
-  of their work; the per-role budget bounds them instead. Idle-edge roles
-  (hermit, architect) keep their idle trigger.
-- **Demand-weighted width and Champion-first reservation (#9392).** Admission
-  also reads a per-host **demand ledger** of open PRs per repository on three
-  axes: `loom:review-requested` (judge), `loom:changes-requested` (doctor) and
-  `loom:pr` (champion). The ledger is fed only by listings the role runner
-  already makes — the queue-gate listing above, plus one ETag-cached `loom:pr`
-  count (`forge_call_stats` caller `role_demand`) after each **admitted**
-  champion run — so it adds no forge query per tick per repository. Only PR
-  rows count, and the `loom:pr` count leaves out PRs held for a human —
-  those also carrying `loom:blocked`, `loom:operator` or `loom:frozen`
-  (the set `champion-pr-merge.md` names as not merge-eligible; Champion's
-  merge-risk and critical-file holds are among them, via `loom:blocked`,
-  #11861) — because Champion cannot drain them (#9410). Likewise the
-  `loom:changes-requested` and `loom:review-requested` counts leave out PRs
-  Doctor or Judge will not drain — every park, `loom:blocked`,
-  `loom:operator` (#11861: no role acts on it) and `loom:frozen` (this
-  includes the Doctor-cycle-cap park) — but still count `loom:treating` (a
-  live Doctor claim) (#9421). The labels come from the same listing rows. A failed listing records nothing, and an entry older than
-  `demandWidth.staleSecs` is ignored, so an axis nobody has observed recently is
-  **unobserved** and changes nothing. An axis has **two** readings (#9414): the
-  **fresh** sum (only entries younger than `staleSecs`), which the reservation
-  below and the #9410 build back-off use; and the **width** sum, which adds in
-  every stale entry's *last-known* count and is unobserved only when the axis
-  has no fresh entry at all **or** its total is zero. A judge/doctor entry
-  refreshes only when that role *runs* in that repository, and width is what
-  decides how often it does, so a fresh-only sum made width its own input:
-  a few stale repositories read as `0`, width dropped, fewer repositories were
-  visited, more entries went stale — which could hold judge at width 1 while
-  the real host review debt justified the whole Phase 1 budget. Over-counting
-  is safe on the width side only: width is clamped at
-  `min(max, roleMaxConcurrent budget)`, so its worst case is exactly the Phase
-  1 budget, and judge/doctor are queue-gated, so a wider budget cannot start a
-  run on a repository whose queue is actually empty (an empty queue returns
-  without spawning and does not use up the tick's budget). For a PR role,
-  `width = clamp(ceil(debt / perRun), 1, min(max, roleMaxConcurrent budget))`
-  (the Phase 1 budget when unobserved). Judge and doctor use that width as their
-  effective budget, and a refusal at it is logged naming the width and the
-  queue depth. Champion's budget is never lowered — it also promotes issues —
-  so its width only sizes the reservation: each PR role wants
-  `min(width, repositories with debt)` slots, and admitting a role holds back
-  the unfilled wants of every PR role ranked above it (champion > judge >
-  doctor > every other role), capped at `ceiling − nonPrFloor`. Champion is
-  never refused by a reservation, and non-PR roles always keep `nonPrFloor`
-  slots. A reservation refusal is one summary line per tick naming the reserved
-  count and the roles it is held for, and the round-robin cursor still moves
-  only on an admission, so every repository with debt is still reached within a
-  bounded number of ticks. One `INFO` line is logged when a role's width or
-  reservation changes, naming the debt, `perRun`, `max` and the Phase 1 budget.
-  It reports **both** readings as `debt <last-known> (fresh <fresh>)`, so a
-  drained host (`debt unobserved (fresh 0)`) is distinguishable from an
-  unvisited one (`debt unobserved (fresh unobserved)`) and the gap between the
-  two sums — how far behind the fresh sum has fallen — is visible (#9414).
-  Idle-edge runs keep the Phase 1 budget. `demandWidth.enabled: false` restores
-  exactly the Phase 1 admission (no ledger reads, no reservation, no `loom:pr`
-  count).
-- **Per-repository judge and doctor lanes (#10632, #10630).** The rule is
-  `lanes(repo, role) = clamp(ceil(debt / laneK), 1, cap)` when `debt > 0`: judge
-  reads the repository's review debt (cap `perRepoCap`), doctor its
-  changes-requested debt (cap `doctorMaxPerRepo`, default `perRepoCap`); defaults
-  `laneK = 10`, `perRepoCap = 3`, so 60 PRs gets 3 lanes and 2 PRs gets 1. When
-  the repositories' lanes sum past `min(host ceiling, role budget)`, extra lanes
-  are trimmed lowest-debt repository first (ties by workspace path), then whole
-  repositories only if still over; a repository's first lane is never trimmed
-  by this rule (the usual walk and host limits arbitrate it). Each judge/doctor
-  `pick.decision` carries a `lanes` list (`repo`, `debt`, `wanted`, `lanes` per
-  observed repository), so "why only one Doctor?" is one query. Judge lanes
-  take distinct PRs exactly as described below, without the stale-verdict
-  guard (dispatched as `/loom:judge <PR>`). The rest of this entry describes
-  the mechanism (written for doctor; it applies to judge). One doctor per repository, fixing
-  one PR per run, cannot drain a repository with dozens of
-  `loom:changes-requested` PRs, however much host budget is idle. So a
-  repository's doctor may hold up to
-  `lanes = clamp(ceil(repo changes debt / perRun), 1, doctorMaxPerRepo)` runs at
-  once, sized from **that repository's own** ledger entry (not the host total;
-  an unobserved or stale entry is `1`). Each run occupies a lane of the
-  in-progress key `(root, role, lane)` and counts against the host ceiling,
-  doctor's (demand-width) budget and the Champion-first reservation like any
-  other run, so lanes only let one hot repository use doctor slots the host
-  already allows. A walk still decides each repository once per tick, so a hot
-  repository gains at most one lane per tick and other repositories keep their
-  round-robin turn. When `lanes > 1`, every doctor run for that repository is
-  **assigned a different PR** instead of taking the queue head: before any
-  agent starts, the run reads the shared Doctor queue (the same ordering as
-  `loom-daemon pr-queue --role doctor`, which already skips `loom:treating`,
-  `loom:blocked` and `loom:frozen`), reserves the first row no other lane
-  on this host holds, runs `verdict-staleness-guard.sh <PR> --clear` on it
-  (exit `0`/`11` take it; `10`/`12`/error skip it; at most 3 rows per run), and
-  dispatches `/loom:doctor <PR>` — PR Fix Mode, which still runs the stale
-  `loom:treating` claim check. A lane with nothing assignable ends `QueueEmpty`
-  without spawning an agent. If the queue cannot be read, lane `0` falls back to
-  the classic `/loom:doctor` (fail open) and extra lanes stand down. Each
-  multi-lane admission logs one `INFO` line naming the lane and
-  `doctorMaxPerRepo`. Every other role, and idle-edge runs, keep one instance
-  per `(repository, role)`; `doctorMaxPerRepo: 1` restores that for doctor too.
+- **A skipped run does not use up the tick.** An event-triggered role whose
+  trigger is absent ([below](#event-driven-auditor-and-guide-triggers-10816))
+  ends `QueueEmpty` without spawning an agent. On that reap, the walk resumes
+  over the roots this tick deferred. Each root is decided at most once per
+  tick, and a run that did real work never triggers a resume. A drain or the
+  rate-limit cooldown suppresses the resume just as it suppresses a tick.
+- **Retired with the item roles' intervals (#11911).** The Judge/Doctor queue
+  gate (#9391), the demand-weighted width and Champion-first reservation
+  (#9392) and the per-repository Judge and Doctor lanes (#10630, #10632) sized
+  roles that are steps now. `autonomous.roleRunner.demandWidth` is parsed and
+  ignored with one warning. The PR-debt ledger they read survives as
+  `crate::pr_debt`, fed by the step tick, for the build back-off and the idle
+  gate below.
 
 **Observability.** `loom-daemon status` prints the live count and its ceiling
 immediately under the in-flight sweep table, plus the total:
 
 ```
-Role-runner agents in flight: 3 (ceiling 7)
-  (a SEPARATE ceiling from the sweep cap below — autonomous.workFinder.maxConcurrent
-   bounds sweep dispatch only; tune these agents with
-   autonomous.roleRunner.maxConcurrent / LOOM_ROLE_RUNNER_MAX_CONCURRENT, #6102)
-  total agents on this host = 1 sweep(s) + 3 role agent(s) = 4
+Role-runner agents in flight: 3 (ceiling 5)
+  (one host budget: role agents and steps share autonomous.workFinder.maxConcurrent;
+   the ceiling is what the steps in flight leave, #11911)
+  total agents on this host = 3 sweep(s) + 3 role agent(s) = 6
 ```
 
 `--json` carries the same under a `role_agents` object (`active`,
 `max_concurrent`, `total_with_sweeps`,
-`bounded_by_work_finder_max_concurrent: false`); a pre-#6102 daemon sends
-neither field, which parses as `0` active and a `null` ceiling — read `null` as
-**unknown**, not as "unbounded". `loom-daemon calibrate` reports the ceiling
-next to `maxConcurrent` in its "Currently configured" block, and its one-line
-reading appends the worst-case agent sum whenever the role runner is enabled.
+`bounded_by_work_finder_max_concurrent: true` since #11911); a pre-#6102 daemon
+sends neither field, which parses as `0` active and a `null` ceiling — read
+`null` as **unknown**, not as "unbounded". `loom-daemon calibrate` states the
+one budget next to `maxConcurrent` in its "Currently configured" block.
 
 #### Build back-off on review and merge debt (#9410)
 
@@ -5466,9 +5345,8 @@ are not draining. The **build back-off** is a WIP limit on that debt (Phase 2b
 of #9391), **per repository** since #10624. While a repo's back-off is
 **engaged**, the work finder admits no new unstarred issue build **in that
 repo**; other repos keep building, sweeps already in flight are untouched, and
-the freed slots go to whatever else is ready, including the role runner's
-judge / doctor / champion runs, which #9392 already sizes to the same debt. It
-adds no PR dispatch path of its own.
+the freed slots go to whatever else is ready, including the Judge, Doctor and
+Champion steps that drain the debt. It adds no PR dispatch path of its own.
 
 - **Per repo (#10624).** Each registered repo has its own hysteresis state,
   fed by that repo's own debt, and `high` / `low` apply to each repo
@@ -5485,24 +5363,21 @@ adds no PR dispatch path of its own.
   half-set pair leaves the ceiling off with one `WARN` per distinct bad pair.
 
 - **Input.** Once per repo per multi-workspace tick (plus once for the host
-  total when the ceiling is set), the work finder reads the role
-  runner's in-memory demand ledger (see [Concurrent across
-  repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391))
-  with `autonomous.roleRunner.demandWidth.staleSecs`:
-  `debt = review + changes + merge` over the axes with a fresh entry — the
-  **fresh** sum only, never the width reading that counts stale entries at
-  their last-known value (#9414), because an over-count here would keep new
-  builds held off. **No forge call** is added. Each axis leaves out the PRs its role will not
+  total when the ceiling is set), the work finder reads the in-memory PR-debt
+  ledger (`crate::pr_debt`, 30-minute freshness):
+  `debt = review + changes + merge` over the axes with a fresh entry. **No
+  forge call** is added: since #11911 the step tick records every axis for a
+  repo from its own all-open listing (before, the role runner's Judge/Doctor
+  queue-gate listings and Champion's `loom:pr` count fed it). Each axis leaves out the PRs its role will not
   drain: merge excludes operator-held PRs (`loom:blocked` / `loom:operator` /
   `loom:frozen`), changes excludes parked PRs (`loom:blocked` /
   `loom:frozen` — not `loom:operator`, which Doctor still drains;
   #9421), and review is unfiltered. An axis whose every PR is excluded reads
-  as observed zero, not unobserved. The ledger covers
-  only the repositories whose roles this host runs, so two hosts can
-  disagree about the same repo.
-- **The ledger comes from the role runner. With the role runner off (or
-  `demandWidth.enabled: false`), the ledger stays empty and the back-off is
-  inert.**
+  as observed zero, not unobserved. The ledger covers only the repositories
+  this host's step tick has listed recently, so two hosts can disagree about
+  the same repo.
+- **The ledger comes from the step tick.** A repo no step tick has listed in
+  the last 30 minutes is unobserved, and the back-off fails open for it.
 - **Fail open.** A repo (or, for the ceiling, a host) with no fresh entry on
   any axis never engages, and
   releases an engaged back-off (logged as `debt unobserved — failing open`). A
@@ -5570,7 +5445,7 @@ on its first tick after upgrade and stops admitting unstarred builds until its
 debt falls below `low`; that is the intended WIP limit. The escape hatches are
 `buildBackoff.enabled: false` and starring an issue.
 
-#### Event-driven curator, auditor and guide triggers (#10816)
+#### Event-driven auditor and guide triggers (#10816)
 
 Opt-in (`autonomous.roleRunner.eventTriggers.enabled`, default `false`; env
 `LOOM_ROLE_EVENT_TRIGGERS` overrides, env > config > default; resolved per root,
@@ -5581,22 +5456,21 @@ is re-checked, and the trigger decides whether an agent launches:
 | Role | Launches when | Input (no new forge write) |
 |---|---|---|
 | `auditor` | `origin/main` differs from the SHA its last **successful** run for this root saw | `git rev-parse refs/remotes/origin/main` on the already-fetched ref; no fetch |
-| `curator` | at least one open `loom:triage` issue (trigger `debt:untriaged`) | one ETag-cached `loom:triage` listing page |
 | `guide` | the open `loom:issue` + `loom:curated` issue-number set differs from the set its last successful run saw | the two ETag-cached label listings, every page |
 
 - **Fail open.** An input that cannot be read (git error, listing failure)
   launches with trigger `floor`; the gate never skips on missing information.
 - **Quiet ceiling.** A role that has not launched successfully for a root in
   `eventTriggers.maxQuietSecs` (default `86400`) launches with trigger `floor`,
-  so curator's approved-but-uncurated and blocked re-check passes, and a
-  primary clone nobody fetches, still get a daily pass.
+  so a primary clone nobody fetches still gets a daily pass. (Curator's
+  trigger went with its interval, #11911: untriaged issues are Curator steps.)
 - **A failed run advances nothing.** The SHA / set is recorded only after a
   run ends in success, so a failed audit retries on the next tick.
 - **Skips are not failures.** A skipped tick ends `QueueEmpty` (no agent spent,
   `skipped_queue_empty` telemetry), never feeds the failure sentinel, and lets
-  the dispatcher hand its slot to a deferred root, like the judge/doctor queue
-  gate. Each gated tick logs one line with `role=`, `root=`, `trigger=`
-  (`event` / `debt:<axis>` / `idle` / `floor`) and `reason=`: launches at INFO,
+  the dispatcher hand its slot to a deferred root. Each gated tick logs one
+  line with `role=`, `root=`, `trigger=` (`event` / `idle` / `floor`) and
+  `reason=`: launches at INFO,
   skips at DEBUG. Idle-edge runs are never held back and log `trigger=idle`.
 - The last-seen state is in memory per `(root, role)`: a daemon restart forgets
   it, so the first tick after a restart launches.
@@ -5753,8 +5627,8 @@ loom-daemon calibrate --write         # DEPRECATED, ignored (prints a notice)
   1m loadavg, disk headroom, ram headroom, healthy/total accounts — informational
   only, build slots), the currently resolved knobs, the `min(disk, ram,
   maxConcurrent)` breakdown (#5270 — no token term), which term binds (`disk` /
-  `ram` / `ceiling`), the **role-agent ceiling** and this host's worst-case
-  agent count (#6102), and one line of advice.
+  `ram` / `ceiling`), whether the role runner is on (its agents share the
+  budget since #11911), and one line of advice.
 - **How to read it** (this is the tuning loop that replaces the old
   recommendation):
   - binds on `ceiling` **while the host sits idle** ⇒ raise `maxConcurrent`;
@@ -5763,13 +5637,10 @@ loom-daemon calibrate --write         # DEPRECATED, ignored (prints a notice)
     sustains — leave it or lower it;
   - binds on `disk` / `ram` ⇒ raising `maxConcurrent` changes nothing; free
     scratch space or memory.
-- **`maxConcurrent` is only half the budget (#6102).** Every reading above
-  concerns **sweep** dispatch. When the role runner is enabled, the advice line
-  appends the role-agent ceiling and the worst-case sum
-  (`maxConcurrent + roleRunner.maxConcurrent`) — because a host that is
-  saturated with *few sweeps in flight* is not telling you to lower
-  `maxConcurrent`; lowering it cannot reach role-driven load. Use
-  `loom-daemon status`'s live role-agent count to tell the two apart.
+- **`maxConcurrent` is the whole budget (#11911).** Steps and role-runner
+  agents share it, so lowering it reaches role-driven load too. (From #6102
+  until #11911 it was only the sweep half, and the advice line appended the
+  role-agent ceiling and the worst-case sum.)
 - **Deprecation surface**: `calibrate` also prints the retired-knob notice to
   **stderr** — an operator running it to size a host is exactly who needs to hear
   that a stale `estCoresPerSweep` is doing nothing (see the previous
@@ -6411,7 +6282,7 @@ knobs not yet audited here.
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop. **Restart required** — read once, before the loop is spawned; flipping it in config alone does not start/stop an already-running daemon's loop (#5963) |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default. **Restart required** — it also seeds the forge-event poll gate's base cadence and the armed early-tick registration, which a ticker-only re-arm would leave stale (#12090 follow-up) |
-| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
+| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `20` (since #11911; was `3`) | The per-machine **agent budget** since #4512 — **since #11911 one budget for steps and role-runner agents together** ([One host budget](#one-host-budget-steps-and-role-runner-agents-6102-11911)) — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
 | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default. **Live** since #12090 — re-read every tick on the same path as `maxConcurrent` (#9060); a change logs `maxAdmissionsPerTick OLD -> NEW (source=…)` once at INFO. The env override is read only at daemon start |
 | `autonomous.workFinder.maxConcurrentPerRepo` | `LOOM_WORK_FINDER_MAX_CONCURRENT_PER_REPO` | *(absent = uncapped)* | How many of the shared `maxConcurrent` budget's slots ONE repo may hold (#9090). **Absent is uncapped, not a number**: this is opt-in, so an upgrade throttles nothing. Setting it also turns on **track affinity** (a repo with a live sweep sorts ahead of a cold repo — ordering only, always subordinate to the cap). A candidate whose repo is at the cap is *deferred*, never dropped (`deferred_repo_cap` / the `repo_cap` decision reason), and the slot goes to another repo's candidate in the same tick. Zero/invalid → absent (a literal cap of `0` would deadlock every repo). A value above `maxConcurrent` is harmless. **Hot-applies (#9090)** — re-read every multi-workspace tick on the same path as `maxConcurrent`, transition logged once. See [Per-repo dispatch cap + track affinity](#per-repo-dispatch-cap--track-affinity-9090) |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Live** since #12090 — every `saturationBrake.*` key is re-resolved each tick and pushed into the process-global handle (a change logs once at INFO as `admission_brake: saturationBrake … -> …`); env overrides are read only at daemon start. See [Saturation admission brake](#saturation-admission-brake-4903) below |
@@ -6420,7 +6291,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.saturationBrake.sustainTicks` | `LOOM_ADMISSION_BRAKE_SUSTAIN_TICKS` | `3` | Consecutive over-threshold work-finder ticks required before the brake holds (#11709); any tick under either bar resets the count. `0`/invalid → default. **Live** (#12090) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
 | `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` | Seconds of continuous held+0-in-flight before the escape hatch yields one tick despite the raw load still being over threshold, logged at `ERROR` (#5715). `<= 0`/invalid → default |
-| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410), per repo (#10624). While a repo's is engaged, no new issue build is admitted in that repo whatever its priority; only a verified red-main fix bypasses it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
+| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410), per repo (#10624). While a repo's is engaged, no new issue build is admitted in that repo whatever its priority; only a verified red-main fix bypasses it. Reads the PR-debt ledger the step tick feeds (#11911), so a repo no step tick has listed recently is unobserved. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
 | `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage a repo's back-off when **its own** `review + changes + merge` debt is **strictly above** this (#10624). Zero, negative or non-integer → default. **Live** |
 | `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release a repo's back-off when its debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
 | `autonomous.workFinder.buildBackoff.hostHigh` | *(config only)* | absent (off) | Optional host-wide ceiling (#10624): engage when the **host total** debt is strictly above this; while engaged, every repo's unstarred builds are held. Needs `hostLow` too. **Live** |
@@ -6477,26 +6348,18 @@ knobs not yet audited here.
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table. **Live** — every `roleRunner.*` key (`enabled`, `roles`, `onIdle`, `model`, …) is re-read from that root's config on every role-runner tick, not cached at daemon startup; no restart needed for a config-only change (#5963) |
 | `autonomous.roleRunner.roles` | *(config only)* | the 7 **interval-default** roles (`architect` excluded, #5656) | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide`/`hermit`/`architect` to dispatch on the interval cadence; explicit empty array runs none. **The absent-key default is the interval-default subset, not the whole table**: `architect` is idle-addressable-only (see `onIdle` below) and is never swept in by the "unset ⇒ all defaults" fallback — naming it here explicitly is the deliberate opt-in to a timer-driven architect (1h cadence). **Allowlist, not an addition** — must be updated by hand when a new interval-default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing an interval-default entry warns, once per resolved-config change, in one workspace-named aggregated line (#6163) (omitting `architect` never warns — that is correct, not stale; neither does omitting a role named in `onIdle`, which dispatches on the idle edge instead). Also resolved from each root's own config |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in — curator/judge/doctor 300s, champion/auditor/hermit 600s, guide 900s (5–15 min); `architect` 3600s, idle-addressable-only | Uniform override applied to every enabled role's cadence — **when either tier is set, every role logs the same interval and the per-role built-ins are entirely inert.** The boot log names which tier won: `role_runner: <role> interval=<n>s source=built-in|config:…|env:…` (#6204). Zero/invalid env → next tier |
-| `autonomous.roleRunner.maxConcurrent` | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | the 7 interval-default roles | **The ceiling on concurrently-running role agents (#6102)** — the role-runner counterpart of `workFinder.maxConcurrent`, which bounds sweep dispatch **only**. Counted **process-wide across every managed workspace and every role** (the host is shared; a per-root ceiling would bound nothing on a 25-workspace box) but resolved from each root's own config, like `architectMaxProposals`. Since #9391 role loops dispatch repositories **concurrently** (one instance per `(repository, role)`), bounded by this ceiling plus the per-role `roleMaxConcurrent` budgets. A tick that reaches it stops admitting and logs one `WARN` summary line per role; the deferred roots retry next tick — distinct from the `debug!`-level per-`(root, role)` overlap skip (#4364). Zero/non-integer at either tier drops to the next (a `0` ceiling is `enabled: false` spelled confusingly). **Live** — re-read every tick. See [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102) |
-| `autonomous.roleRunner.roleMaxConcurrent` | *(config only)* | `max(1, maxConcurrent / 2)` per role — **3** at the default ceiling | **Per-role budget under the host ceiling (#9391).** A `{"<role>": N}` object (e.g. `{"judge": 3, "champion": 3, "curator": 2}`) bounding how many runs of one role may be in flight across every workspace, so one role cannot take every slot. Keys are trimmed and lower-cased; a zero, negative or non-integer value is dropped per entry to the default; a value above the ceiling is clamped to it. Idle-edge runs count against it. Resolved from each root's own config and **live** (re-read every tick). See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
-| `autonomous.roleRunner.eventTriggers.enabled` | `LOOM_ROLE_EVENT_TRIGGERS` | `false` | **Event-driven curator/auditor/guide launches (#10816).** `true`: the interval fires as before but auditor launches only on a new `origin/main`, curator only with open `loom:triage` issues, guide only on a changed ready/backlog set; unobserved inputs fail open. A non-bool value drops to the default. Resolved per root, **live**. See [Event-driven curator, auditor and guide triggers](#event-driven-curator-auditor-and-guide-triggers-10816) |
+| `autonomous.roleRunner.maxConcurrent` | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | *(retired)* | **Retired by #11911.** The role runner's ceiling (#6102) is its share of the one host budget, `autonomous.workFinder.maxConcurrent` less the steps in flight. The key and the env var are parsed and ignored with one warning each, never rejected. See [One host budget](#one-host-budget-steps-and-role-runner-agents-6102-11911) |
+| `autonomous.roleRunner.roleMaxConcurrent` | *(config only)* | `max(1, share / 2)` per role, `share` being the role runner's part of the host budget | **Per-role budget under the role runner's share (#9391, #11911).** A `{"<role>": N}` object (e.g. `{"champion": 2, "guide": 1}`) bounding how many runs of one role may be in flight across every workspace, so one role cannot take every slot. Keys are trimmed and lower-cased; a zero, negative or non-integer value is dropped per entry to the default; a value above the ceiling is clamped to it. Idle-edge runs count against it. Resolved from each root's own config and **live** (re-read every tick). See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
+| `autonomous.roleRunner.eventTriggers.enabled` | `LOOM_ROLE_EVENT_TRIGGERS` | `false` | **Event-driven auditor/guide launches (#10816).** `true`: the interval fires as before but auditor launches only on a new `origin/main`, guide only on a changed ready/backlog set; unobserved inputs fail open. (Curator's trigger went with its interval, #11911.) A non-bool value drops to the default. Resolved per root, **live**. See [Event-driven auditor and guide triggers](#event-driven-auditor-and-guide-triggers-10816) |
 | `autonomous.roleRunner.eventTriggers.maxQuietSecs` | *(config only)* | `86400` | Quiet ceiling: a gated role that has not launched successfully for a root in this long launches anyway (trigger `floor`). Zero, negative or non-integer drops to the default. **Live** |
-| `autonomous.roleRunner.demandWidth.enabled` | *(config only)* | `true` | **Demand-weighted role admission (#9392).** `false` restores exactly the Phase 1 (#9391) admission: no demand-ledger reads, no reservation, no champion `loom:pr` count. A non-bool value drops to the default. Resolved per root, **live**. See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
-| `autonomous.roleRunner.demandWidth.perRun` | *(config only)* | `3` | `k` in the PR-role width `clamp(ceil(debt / k), 1, min(max, roleMaxConcurrent budget))`: queued PRs per role run. Zero, negative or non-integer drops to the default. **Live** |
-| `autonomous.roleRunner.demandWidth.max` | *(config only)* | `4` | Upper clamp on judge, doctor and champion width. Still capped by the role's `roleMaxConcurrent` budget, so at the default ceiling of 7 (budget 3) it binds only where the budget is 4 or more — demand never raises a role above its budget. Zero, negative or non-integer drops to the default. **Live** |
-| `autonomous.roleRunner.demandWidth.reserve` | *(config only)* | `true` | Champion-first ceiling reservation: admitting a role leaves free the unfilled `min(width, repositories with debt)` of each higher-priority PR role (champion > judge > doctor > others). `false` keeps the width but reserves nothing. **Live** |
-| `autonomous.roleRunner.demandWidth.nonPrFloor` | *(config only)* | `1` | Ceiling slots the reservation always leaves for non-PR roles: the reservation never exceeds `maxConcurrent − nonPrFloor`. Zero, negative or non-integer drops to the default. **Live** |
-| `autonomous.roleRunner.demandWidth.laneK` | *(config only)* | `10` | **Per-repository lane rule (#10630).** Debt items per lane: `lanes = clamp(ceil(repo debt / laneK), 1, cap)` for judge (review debt) and doctor (changes debt). Zero or non-integer drops to the default. Live. |
-| `autonomous.roleRunner.demandWidth.perRepoCap` | *(config only)* | `3` | **Per-repository lane cap (#10630).** Most judge runs (and doctor runs, unless `doctorMaxPerRepo` is set) one repository may hold at once; clamped to `8`. Live. |
-| `autonomous.roleRunner.demandWidth.doctorMaxPerRepo` | *(config only)* | `perRepoCap` | **Doctor-only cap override (#10632).** The most doctor runs one repository may hold at once: `clamp(ceil(repo changes debt / laneK), 1, doctorMaxPerRepo)`, from that repository's own ledger entry. Each lane is dispatched as `/loom:doctor <PR>` on a different assigned PR and counts against the host ceiling, doctor's budget and the reservation. `1` is the classic one doctor per repository. Zero, negative or non-integer drops to the default; values above `8` are clamped to `8`. Resolved per root, **live**. See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
-| `autonomous.roleRunner.demandWidth.staleSecs` | *(config only)* | `1800` | Demand-ledger entries older than this many seconds are stale; an axis with no fresh entry is unobserved and falls back to Phase 1 behaviour. The reservation and the #9410 build back-off sum only fresh entries; the PR-role **width** adds in every stale entry's last-known count (#9414), so it is unobserved only when the axis has no fresh entry or a zero total. Zero, negative or non-integer drops to the default. **Live** |
+| `autonomous.roleRunner.demandWidth` | *(config only)* | *(retired)* | **Retired by #11911**, the whole block (`enabled`, `perRun`, `max`, `reserve`, `nonPrFloor`, `laneK`, `perRepoCap`, `doctorMaxPerRepo`, `staleSecs`). It sized the Judge/Doctor demand width, the Champion-first reservation (#9392) and the per-repository lanes (#10630, #10632), for roles that are steps now. Parsed and ignored with one warning, never rejected |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
 | `autonomous.roleRunner.onIdleMaxWait` | *(config only)* | *(unset — no promotion, today's idle-edge-only firing)* | **Per-role starvation guard for an `onIdle` role (#7511).** A `{"<role>": "<duration>"}` object (e.g. `{"hermit": "24h", "auditor": "72h"}`, duration strings `<n>s`/`<n>m`/`<n>h`/`<n>d`) naming the longest a role may go without a completed tick before it is **promoted** into the next interval-cadence pass — see [`onIdleMaxWait` — promoting a starved `onIdle` role](#onidlemaxwait--promoting-a-starved-onidle-role-7511) below |
 | `autonomous.roleRunner.architectMaxProposals` | `LOOM_ARCHITECT_MAX_PROPOSALS` | `5` | **Per-invocation** cap on how many proposal issues one `architect` dispatch may file (#5656) — the actuator-saturation limit of the idle-edge control loop. Passed to the session as `/loom:architect --max-proposals <n>`, which `architect.md` enforces as a hard ceiling. Per-repo on purpose (the workable cap grows with a repo's maturity — ~5 while work is narrow, 7+ once it fans out), so it is read from each root's own config. Zero/negative/non-integer at either tier drops to the next one (a cap of `0` would spend a whole session forbidden from producing anything). Ignored for every other role |
-| `autonomous.roleRunner.championMode` | *(config only)* | *(retired)* | **Retired by #11909.** Every role-runner Champion launch is `/loom:champion --non-item`: proposals (architect/hermit/auditor), epics, Doctor-cap parked PRs, rollout checks and the batch-wide Pass 0 / held-PR census. Curated-issue promotion and `loom:pr` merges are work-finder steps (`/loom:champion --issue N` / `--pr N`, `champion-targeted.md`). Any value is ignored with a warning |
+| `autonomous.roleRunner.championMode` | *(config only)* | *(retired)* | **Retired by #11909; the mode itself deleted by #11911.** Every role-runner Champion launch is `/loom:champion --non-item`: proposals (architect/hermit/auditor), epics, Doctor-cap parked PRs, rollout checks and the batch-wide Pass 0 / held-PR census. Curated-issue promotion and `loom:pr` merges are work-finder steps (`/loom:champion --issue N` / `--pr N`, `champion-targeted.md`). `"non-item"` is accepted silently; any other value is ignored with one warning, never rejected |
 | **`curator.backlogTarget`** (top-level `curator`, not `autonomous.*`) | *(config only)* | *(unset: step skipped)* | **How many open issues this repo should hold (#11819).** Read through the full config resolver, so any tier may set it (machine defaults < `.loom/config.json` < `.loom-project/project.json` < fleet `.loom-local/fleet-repo.json` < host `.loom-local/local.json`). When set, each role-runner Curator dispatch counts the repo's open issues (one REST `search/issues` call, PRs excluded) and passes `/loom:curator --backlog-level <lenient\|normal\|strict> --backlog-open <n> --backlog-target <n>` from `r = open / target` (`< 0.5` lenient, `0.5`–`1.0` normal, `> 1.0` strict), which runs `curator.md`'s keep-or-close admission step on `loom:triage` issues; a failed count passes `normal` (no `--backlog-open`) and logs a `WARN`. Each such dispatch exports one `backlog.level` OTLP log. Unset, zero, negative or non-integer: no count, no flags, no record. Attended `/curator`, `/curator <n>` and `/loom:sweep` pass no flags. Per-repo, live |
-| `autonomous.balance.idleGate` | `LOOM_BALANCE_IDLE_GATE` | `false` | **Pipeline-empty gate for hermit/architect idle generation (#10817, slice 4 of #10630).** Off: an `onIdle` edge means a host slot is free, exactly as before (no ledger read, no log line). On: `hermit` and `architect` additionally need this repo's pipeline empty -- no review/changes/merge debt in the demand ledger (`role_runner::demand`) and, where observed, no ready/building issues; any observed work denies the run even with free slots. Unobserved axes never deny nor newly grant (today's host-slot rule applies). Other idle roles are untouched; `architectMaxProposals` still caps a granted architect run. A grant logs `role_runner: idle grant root=<r> role=<role> trigger=idle reason=pipeline-empty`. Precedence env > config > default; truthy `1/true/yes/on`, falsy `0/false/no/off`, an invalid env value warns and falls back to config. Per-repo, live |
+| `autonomous.balance.idleGate` | `LOOM_BALANCE_IDLE_GATE` | `false` | **Pipeline-empty gate for hermit/architect idle generation (#10817, slice 4 of #10630).** Off: an `onIdle` edge means a host slot is free, exactly as before (no ledger read, no log line). On: `hermit` and `architect` additionally need this repo's pipeline empty -- no review/changes/merge debt in the PR-debt ledger (`pr_debt`, fed by the step tick since #11911) and, where observed, no ready/building issues; any observed work denies the run even with free slots. Unobserved axes never deny nor newly grant (today's host-slot rule applies). Other idle roles are untouched; `architectMaxProposals` still caps a granted architect run. A grant logs `role_runner: idle grant root=<r> role=<role> trigger=idle reason=pipeline-empty`. Precedence env > config > default; truthy `1/true/yes/on`, falsy `0/false/no/off`, an invalid env value warns and falls back to config. Per-repo, live |
 | `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
 | `autonomous.roleRunner.collisionWindowSecs` | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | that role's tick interval | Lookback window for the #4623 probe, clamped to `[60, 3600]`. Zero/invalid dropped to the next tier |
 | *(host-local tiers only — see below)* | `LOOM_ROLE_RUNNER_SHARD_INDEX` | *(unset)* | **This host's** 0-based role-runner shard index (#6374). Must **differ** per host, so it belongs in the service unit next to `LOOM_ROLE_RUNNER`, never in the tracked `.loom/config.json` — a committed `autonomous.roleRunner.shardIndex` gives every host the same index and leaves every other slice with zero owners fleet-wide, so the daemon **refuses** it (logs `error!`, falls back to unsharded). Requires `shardCount`; out-of-range/malformed → unsharded. See [Role-runner host sharding](#role-runner-host-sharding-6374) |
@@ -8471,8 +8334,7 @@ copies of one fact. With `fleet.captainGauges` configured, the declared
 captain produces it for the fleet and a dispatcher stops producing it for the
 repos the captain covers, **only while the captain's output is fresh**.
 Assigned, not elected: there is no standby producer. Per-host gauges and
-dispatch gates (`role_queue_gate`, `role_demand`, the work finder's listings)
-are unchanged on every host. Code: `observability/captain_gauges.rs`.
+dispatch gates (the work finder's listings) are unchanged on every host. Code: `observability/captain_gauges.rs`.
 
 **The stage-dwell sampler is off by default (#12203).** Every host listing
 every repo's stage labels every 5 minutes cost about 8.9k billable GitHub
@@ -10924,7 +10786,7 @@ yields `not-running`.
 
 ### Autonomous periodic support-role runner (#4015)
 
-> **Step dispatch (#11894, live since #11909).** The item roles (Curator, Champion promote and merge, Judge, Doctor) are dispatched as steps by the work finder, never on these intervals: Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning, and `demandWidth` doesn't apply to them. Champion runs here as `/loom:champion --non-item` only; `championMode` is retired and ignored with a warning. The two concurrency budgets merge in #11911. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12. The Judge CI gate (#12003) lives on the step path too (#12042): a Judge step whose PR head has CI running is a `ci_pending` pass until CI concludes, and a `ci_pending` no-op cools down for 10 min, not the 1 h no-op window ([`pr-planning.md`](pr-planning.md)).
+> **Step dispatch (#11894, live since #11909).** The item roles (Curator, Champion promote and merge, Judge, Doctor) are dispatched as steps by the work finder, never on these intervals: Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning. Champion runs here as `/loom:champion --non-item` only; `championMode` is retired and ignored with a warning unless it says `"non-item"`. Since #11911 the role runner shares one host budget with the steps, and `demandWidth` and `roleRunner.maxConcurrent` are retired. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12. The Judge CI gate (#12003) lives on the step path too (#12042): a Judge step whose PR head has CI running is a `ci_pending` pass until CI concludes, and a `ci_pending` no-op cools down for 10 min, not the 1 h no-op window ([`pr-planning.md`](pr-planning.md)).
 
 Before this loop, the periodic **standalone** support roles — Champion,
 Curator, Judge, Auditor, Guide — ran ONLY via GitHub Actions cron
@@ -11005,16 +10867,10 @@ leaves the daemon's behavior byte-for-byte unchanged:
 |---------|-----------|------------|---------|
 | `LOOM_ROLE_RUNNER` | `autonomous.roleRunner.enabled` | env > config > default | `false` (off) |
 | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | `autonomous.roleRunner.intervalSecs` | env > config > default | per-role built-in (see above) |
-| `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | `autonomous.roleRunner.maxConcurrent` | env > config > default | the 7 interval-default roles (concurrent role-agent ceiling, #6102 — bounds the agents `workFinder.maxConcurrent` does not) |
+| `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | `autonomous.roleRunner.maxConcurrent` | *(retired by #11911)* | ignored with a warning: role agents share `workFinder.maxConcurrent` with the steps |
 | — | `autonomous.roleRunner.roles` | config only | the 7 interval-default roles (`architect` excluded, #5656) |
-| — | `autonomous.roleRunner.roleMaxConcurrent` | config only | `max(1, maxConcurrent / 2)` per role (per-role budget under the host ceiling, #9391) |
-| — | `autonomous.roleRunner.demandWidth.enabled` | config only | `true` (demand-weighted width + Champion-first reservation, #9392; `false` = Phase 1 admission) |
-| — | `autonomous.roleRunner.demandWidth.perRun` | config only | `3` (queued PRs per role run in the width formula) |
-| — | `autonomous.roleRunner.demandWidth.max` | config only | `4` (width clamp, still capped by the role budget) |
-| — | `autonomous.roleRunner.demandWidth.reserve` | config only | `true` (Champion-first ceiling reservation) |
-| — | `autonomous.roleRunner.demandWidth.nonPrFloor` | config only | `1` (slots always left for non-PR roles) |
-| — | `autonomous.roleRunner.demandWidth.doctorMaxPerRepo` | config only | `3` (most doctor runs one repository may hold at once, each on its own assigned PR, #10632; `1` = one per repository) |
-| — | `autonomous.roleRunner.demandWidth.staleSecs` | config only | `1800` (ledger entries older than this are stale: unobserved for the reservation and the #9410 back-off, counted at their last-known value for PR-role width, #9414) |
+| — | `autonomous.roleRunner.roleMaxConcurrent` | config only | `max(1, share / 2)` per role (per-role budget under the role runner's share of the host budget, #9391, #11911) |
+| — | `autonomous.roleRunner.demandWidth` | config only | *(retired by #11911: parsed and ignored with a warning)* |
 | — | `autonomous.roleRunner.onIdle` | config only | `[]` (none; may name any of the 8 shipped roles, `architect` included) |
 | — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |
 | — | `autonomous.roleRunner.effort` | config only (`roleRunner.roleEfforts.<role>` > `roleRunner.effort` > unset) | *(unset ⇒ **no** `--effort` argument; the runtime CLI's own session default, #8054)* |

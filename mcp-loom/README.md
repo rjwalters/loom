@@ -115,7 +115,7 @@ These tools front the Rust `loom-daemon` (Tier 2) over its Unix-socket IPC and b
 
 | Tool | Description |
 |------|-------------|
-| `dispatch_sweep` | Dispatch a `/loom:sweep <N>` for an issue (multi-account token rotation) |
+| `dispatch_sweep` | Dispatch a `/loom:sweep <N>` for an issue (multi-account token rotation). An attended surface: the daemon never spawns a sweep of its own (#11911) |
 | `list_sweeps` | Enumerate running sweeps in the daemon registry: issue sweeps, PR sets, and steps (`{"type":"Step","value":{"item":N,"role":"judge"}}`, one role session on one item, spawned by the daemon's step engine, #11898) |
 | `get_sweep_status` | Inspect a running sweep's state |
 | `tail_sweep_log` | Tail a per-sweep log file |

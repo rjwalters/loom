@@ -739,6 +739,16 @@ pub(crate) fn insert_running_with_pid_at(
     sweep_id
 }
 
+/// Re-kind a registered sweep as a step (#11911: only steps resume on a roll).
+pub(crate) fn make_step(
+    registry: &mut SweepRegistry,
+    sweep_id: &str,
+    item: u32,
+    role: crate::step_role::StepRole,
+) {
+    registry.entries.get_mut(sweep_id).unwrap().kind = SweepKind::Step { item, role };
+}
+
 /// Write a checkpoint JSON file for `issue` under `registry`'s checkpoint
 /// dir, then set its mtime explicitly (so tests can position it before or
 /// after a run's `started_at`).
@@ -1388,19 +1398,6 @@ pub(crate) fn running_issue_sweep_id(reg: &SweepRegistry, issue: u32) -> Option<
         .find(|i| {
             matches!(i.state, SweepState::Running | SweepState::Pending)
                 && matches!(i.kind, SweepKind::Issue(n) if n == issue)
-        })
-        .map(|i| i.sweep_id.clone())
-}
-
-/// The `PrSet` counterpart of [`running_issue_sweep_id`] (Issue #7649): finds
-/// a live sweep whose kind is exactly `PrSet(prs)` (order-sensitive, mirroring
-/// how `SweepKind::PrSet` dispatch is always called with a specific ordering).
-pub(crate) fn running_prset_sweep_id(reg: &SweepRegistry, prs: &[u32]) -> Option<String> {
-    reg.entries
-        .values()
-        .find(|i| {
-            matches!(i.state, SweepState::Running | SweepState::Pending)
-                && matches!(&i.kind, SweepKind::PrSet(set) if set.as_slice() == prs)
         })
         .map(|i| i.sweep_id.clone())
 }
@@ -2385,4 +2382,16 @@ pub(crate) fn write_local_cfg(dir: &Path, body: &str) {
     let full = dir.join(crate::config_resolver::LOCAL_CONFIG_REL);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, body).unwrap();
+}
+
+/// Record `origin` as `sweep_id`'s dispatch origin (#11444), as a real
+/// dispatch would: a roll resumes an attended sweep (#11911).
+pub(crate) fn mark_dispatch_origin(reg: &mut SweepRegistry, sweep_id: &str, origin: &str) {
+    reg.start_facts.insert(
+        sweep_id.to_string(),
+        crate::telemetry::SweepStartFacts {
+            dispatch_origin: Some(origin.to_string()),
+            ..Default::default()
+        },
+    );
 }

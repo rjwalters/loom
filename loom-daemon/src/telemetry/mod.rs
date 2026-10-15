@@ -1273,8 +1273,8 @@ pub struct RoleTickOutcomeRecord {
     /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_id: Option<String>,
-    /// Which host limit deferred this repo's tick (#12084): `ceiling`,
-    /// `role_budget`, `demand_width` or `reservation`. Present exactly on
+    /// Which host limit deferred this repo's tick (#12084): `ceiling` or
+    /// `role_budget`. Present exactly on
     /// [`RoleTickResult::SkippedDeferred`]. Additive, no `schema_version`
     /// bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]

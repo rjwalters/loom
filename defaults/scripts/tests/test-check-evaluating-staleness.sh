@@ -84,8 +84,28 @@ esac
 STUB
 chmod +x "$STUB_DIR/gh"
 
+# #11911: `loom-daemon lease pr check` stub. Unset $LOOM_TEST_LEASE_STATE
+# answers as a binary predating the verb; the real binary is never reached.
+cat > "$STUB_DIR/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1 $2 $3" == "lease pr check" ]]; then
+    printf '%s\n' "$*" > "$LOOM_TEST_STUB_DIR/lease-args"
+    [[ -n "${LOOM_TEST_LEASE_STATE:-}" ]] || exit 64
+    echo "PR_LEASE_STATE=$LOOM_TEST_LEASE_STATE"
+    case "$LOOM_TEST_LEASE_STATE" in held-peer) exit 4 ;; unknown) exit 5 ;; *) exit 0 ;; esac
+fi
+echo "stub loom-daemon: $*" >&2
+exit 64
+STUB
+chmod +x "$STUB_DIR/loom-daemon"
+
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+export LOOM_DAEMON_BIN="$STUB_DIR/loom-daemon"
+# Deterministic default threshold, whatever the shipped default (#11909 raised
+# it to 45): the cases below are written against 15.
+export LOOM_STALE_EVALUATING_MINUTES=15
+unset LOOM_TEST_LEASE_STATE
 
 labels_json() {
     # labels_json [label ...] -> the `{"labels":[...]}` doc for gh issue view
@@ -247,6 +267,31 @@ CLAIMED_AT="$(now_minus_minutes 45)"
 printf '[%s]' "$(labeled_event "$CLAIMED_AT" "loom:evaluating")" > "$STUB_DIR/timeline-111.json"
 run_sut --issue 111
 assert_eq "12" "$RC" "(m) exactly 45m old at default 45m threshold -> STALE (>=)"
+
+# (n) #11911: a live Champion promotion step's lease keeps an aged claim FRESH.
+reset_state
+labels_json "loom:evaluating" > "$STUB_DIR/labels-112.json"
+CLAIMED_AT="$(now_minus_minutes 30)"
+printf '[%s]' "$(labeled_event "$CLAIMED_AT" "loom:evaluating")" > "$STUB_DIR/timeline-112.json"
+LOOM_TEST_LEASE_STATE=held-peer run_sut --issue 112
+assert_eq "0" "$RC" "(n) 30m old but a live step lease -> FRESH (exit 0)"
+assert_eq "FRESH" "$(get_field "$OUT" DECISION)" "(n) DECISION=FRESH"
+assert_eq "1" "$(grep -c -- '--role champion --step champion_promote' "$STUB_DIR/lease-args")" \
+    "(n) the lease read is the Champion promotion step's"
+LOOM_TEST_LEASE_STATE=unknown run_sut --issue 112
+assert_eq "0" "$RC" "(n2) an unreadable lease list fails safe -> FRESH"
+LOOM_TEST_LEASE_STATE=free run_sut --issue 112
+assert_eq "12" "$RC" "(n3) no live lease -> the age rule stands (STALE)"
+run_sut --issue 112
+assert_eq "12" "$RC" "(n4) a binary without the verb keeps the age rule"
+
+# (o) The lease is read only for loom:evaluating, the claim it backs.
+reset_state
+labels_json "loom:reviewing" > "$STUB_DIR/labels-113.json"
+CLAIMED_AT="$(now_minus_minutes 30)"
+printf '[%s]' "$(labeled_event "$CLAIMED_AT" "loom:reviewing")" > "$STUB_DIR/timeline-113.json"
+LOOM_TEST_LEASE_STATE=held-peer run_sut --issue 113 --label loom:reviewing
+assert_eq "12" "$RC" "(o) another label is classified by age alone"
 
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

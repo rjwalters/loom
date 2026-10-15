@@ -28,21 +28,6 @@ impl WorkItem {
     }
 }
 
-/// The queue-row detail for a tracking-parent skip.
-#[must_use]
-pub(super) fn skip_detail(open: u32) -> String {
-    format!("tracking parent: {open} open sub-issue(s)")
-}
-
-/// The skip log line, naming the parent and its open-child count.
-#[must_use]
-pub(super) fn skip_line(issue: u32, open: u32) -> String {
-    format!(
-        "work_finder: #{issue} skipped: tracking parent with {open} open sub-issue(s); \
-         it is eligible again once they close (#11483)"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,15 +38,5 @@ mod tests {
         assert_eq!(item(Some(2)).open_sub_issues_blocking(), Some(2));
         assert_eq!(item(Some(0)).open_sub_issues_blocking(), None);
         assert_eq!(item(None).open_sub_issues_blocking(), None);
-    }
-
-    #[test]
-    fn skip_line_names_parent_and_open_count() {
-        let line = skip_line(11441, 2);
-        assert!(
-            line.contains("#11441 skipped: tracking parent with 2 open sub-issue(s)"),
-            "{line}"
-        );
-        assert_eq!(skip_detail(2), "tracking parent: 2 open sub-issue(s)");
     }
 }

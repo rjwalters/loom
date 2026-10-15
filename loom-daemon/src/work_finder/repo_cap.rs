@@ -54,9 +54,7 @@
 
 use serde_json::Value;
 
-use super::{
-    ready_queue, PriorityCandidate, TickReport, WorkDispatcher, WorkFinderConfig, WorkSource,
-};
+use super::{ready_queue, PriorityCandidate, TickReport, WorkFinderConfig};
 use crate::types::QueueDisposition as Qd;
 
 /// Env override for the per-repo dispatch cap (#9090) — `None` when unset,
@@ -383,31 +381,6 @@ fn shape(candidates: Vec<PriorityCandidate>, cap: &RepoCap) -> Vec<PriorityCandi
         .into_iter()
         .partition(|c| cap.is_hot(c.workspace_idx));
     hot.into_iter().chain(cold).collect()
-}
-
-/// Like [`tick_multi_with_repo_cap`](super::tick_multi_with_repo_cap) with no
-/// per-repo cap — the pre-#9090 entry point, kept so its many test callers
-/// are unchanged. The name is historical: its `preferred_slice` argument went
-/// with the dispatch slice (#11682), and nothing here shards.
-pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
-    workspaces: &mut [(S, D)],
-    priorities: &[u32],
-    max_concurrent: usize,
-    halted: &[bool],
-    max_admissions_per_tick: usize,
-    saturation_held: bool,
-) -> TickReport {
-    super::tick_multi_with_repo_cap(
-        workspaces,
-        priorities,
-        max_concurrent.into(),
-        halted,
-        None,
-        max_admissions_per_tick,
-        saturation_held,
-        None,
-        &[],
-    )
 }
 
 #[cfg(test)]

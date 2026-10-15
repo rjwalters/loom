@@ -9,24 +9,16 @@
 //! - **One instance per `(repository, role)`.** Each admitted run is spawned
 //!   into a [`JoinSet`] and holds its [`RoleRunGuard`] until it finishes. The
 //!   tick does not wait for it; a run still going at the next tick is refused
-//!   by the existing `RoleAdmission::InProgress` check (#4364), which is what
-//!   keeps a repository to one instance of a role. The one exception is
-//!   doctor on a repository deep in its own changes debt, which may hold a
-//!   few *lanes*, each on a different assigned PR ([`lanes`], #10632).
+//!   by the existing `RoleAdmission::InProgress` check (#4364).
 //! - **Different roles in one repository run at once.** The guard key is
-//!   `(root, role)`, and the label state machine (`loom:reviewing`,
-//!   `loom:treating`, ...) arbitrates between roles, as it already does
-//!   between hosts. No role declares repository exclusivity.
-//! - **Budgets.** The host ceiling (`autonomous.roleRunner.maxConcurrent`)
-//!   still counts every role together; the per-role budget
+//!   `(root, role)`. No role declares repository exclusivity.
+//! - **Budgets.** The role runner's ceiling is its share of the one host
+//!   budget ([`crate::host_budget`], #11911): the work finder's
+//!   `maxConcurrent` less the steps in flight. The per-role budget
 //!   (`autonomous.roleRunner.roleMaxConcurrent`, default
 //!   [`default_role_max_concurrent`]) stops one role from taking every slot.
 //!   Both are checked under one lock in
 //!   [`RoleRunGuard::admit_with_role_budget`].
-//! - **Queue gating.** A role with a label-defined work queue
-//!   ([`work_queue_labels`]) is not spawned for a repository whose queue is
-//!   empty; the tick records [`RoleTickOutcome::QueueEmpty`]. A listing error
-//!   fails open.
 //! - **One refusal line per tick.** Once a tick hits the ceiling or the
 //!   budget it stops admitting and logs a single summary line naming the
 //!   limit and how many roots were deferred, instead of a WARN per root.
@@ -35,19 +27,15 @@
 //!   registry would serve only the first `budget` roots forever. Each tick
 //!   therefore starts just after the last root admitted (wrapping), so every
 //!   root gets a turn within `ceil(roots / budget)` ticks.
-//! - **Empty queues do not spend the tick.** The queue probe is a blocking
-//!   forge listing, so it runs inside the admitted run rather than in the
-//!   synchronous walk. The roots a tick deferred are kept, and when a run
-//!   ends [`RoleTickOutcome::QueueEmpty`] (no agent was spent) the walk
-//!   resumes over them in the same interval
-//!   ([`RoleDispatcher::resume_after_queue_empty`]). Each root is decided at
-//!   most once per tick, and a run that did real work does not trigger a
-//!   resume, so the budget still bounds agent runs per interval.
-//! - **Demand (#9392).** Admission reads the [`super::demand`] ledger: judge
-//!   and doctor run at a width that follows their queue depth, and the PR
-//!   roles get a Champion-first share of the ceiling held for them. The
-//!   ledger is fed by the queue-gate listing below and one `loom:pr` count
-//!   per admitted champion run, never by a query in this walk.
+//! - **Skipped runs do not spend the tick.** An event-triggered role whose
+//!   trigger is absent ends [`RoleTickOutcome::QueueEmpty`] (no agent was
+//!   spent), and the walk resumes over the roots the tick deferred in the
+//!   same interval ([`RoleDispatcher::resume_after_queue_empty`]).
+//!
+//! The item roles (Curator, Judge, Doctor) and Champion's item work are
+//! steps the work finder draws (#11909), so the Judge/Doctor queue gate, the
+//! demand width and Champion-first reservation (#9392) and the per-repository
+//! Doctor lanes (#10630, #10632) that sized them are gone (#11911).
 //!
 //! Finished runs are reaped on the loop's own task ([`RoleDispatcher::handle_joined`]),
 //! so the #4349 fail/recover dedup maps and the #7607 pool-exhausted feed stay
@@ -55,53 +43,6 @@
 
 use super::*;
 use tokio::task::{Id, JoinError, JoinSet};
-
-/// `forge_call_stats` caller name for the queue-gate listing.
-pub const QUEUE_GATE_CALLER: &str = "role_queue_gate";
-
-/// The work-queue labels a role is gated on, or `None` for an ungated role
-/// (dispatched every tick, as before #9391).
-///
-/// Only judge and doctor are gated in Phase 1: each has exactly one queue
-/// label. Champion also promotes `loom:curated` issues and curator works
-/// unlabeled issues, so a single-label gate would starve part of their work
-/// (`role_collision::probe_target_for_role` is deliberately not reused — its
-/// curator target is the in-flight marker, not the queue).
-#[must_use]
-pub fn work_queue_labels(role: &str) -> Option<&'static [&'static str]> {
-    match role {
-        "judge" => Some(&["loom:review-requested"]),
-        "doctor" => Some(&["loom:changes-requested"]),
-        _ => None,
-    }
-}
-
-/// Whether `label`'s work queue is a queue of **pull requests** (#9929).
-///
-/// The three PR-lifecycle labels are the queues the PR roles drain —
-/// `loom:review-requested` (Judge), `loom:changes-requested` (Doctor),
-/// `loom:pr` (Champion's merge queue). Every other `loom:` workflow label
-/// belongs to the *issue* lifecycle.
-///
-/// This distinction has to be made explicitly because the queue probe reads
-/// the REST issues listing, which returns **both** kinds (see
-/// [`crate::forge_listing::issues_only`]): without it, a row of the wrong kind
-/// satisfies the gate, which is the same confusion that let a pull request be
-/// treated as a curation candidate in #9929.
-#[must_use]
-pub fn queue_label_holds_prs(label: &str) -> bool {
-    matches!(label, "loom:review-requested" | "loom:changes-requested" | "loom:pr")
-}
-
-/// Whether a REST issues listing for `label` contains work for that queue:
-/// at least one row of the queue's **own** kind (#9929).
-///
-/// Pure, so the kind decision is unit-testable without a forge.
-#[must_use]
-pub fn queue_rows_have_work(label: &str, rows: &[crate::forge_listing::RestIssue]) -> bool {
-    let want_pr = queue_label_holds_prs(label);
-    rows.iter().any(|r| r.is_pull_request == want_pr)
-}
 
 /// Parse `autonomous.roleRunner.roleMaxConcurrent` (`{"<role>": N}`).
 ///
@@ -130,7 +71,7 @@ pub fn parse_role_max_concurrent(block: &serde_json::Value) -> BTreeMap<String, 
 }
 
 /// The per-role budget when `roleMaxConcurrent` names no value for a role:
-/// half the host ceiling, at least 1 (3 at the default ceiling of 7).
+/// half the role runner's ceiling, at least 1.
 ///
 /// A default of 1 would change nothing (the old serial loop was one run per
 /// role); a default equal to the ceiling would let one role take every slot.
@@ -177,7 +118,7 @@ pub fn resolve_role_max_concurrent(
 /// A host-level limit that refused an admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitRefusal {
-    /// The host ceiling (`maxConcurrent`, all roles together).
+    /// The role runner's share of the host budget, all roles together.
     Ceiling {
         /// Role runs in flight across every workspace.
         active: usize,
@@ -191,28 +132,6 @@ pub enum LimitRefusal {
         /// The budget compared against.
         budget: usize,
     },
-    /// Judge's or doctor's demand width (#9392), below its Phase 1 budget.
-    DemandWidth {
-        /// Runs of this role in flight across every workspace.
-        active: usize,
-        /// The width compared against.
-        width: usize,
-        /// The Phase 1 budget the width is capped by.
-        budget: usize,
-        /// The queue depth the width was computed from.
-        debt: usize,
-    },
-    /// The Champion-first ceiling reservation (#9392).
-    Reservation {
-        /// Role runs in flight across every workspace.
-        active: usize,
-        /// The host ceiling.
-        ceiling: usize,
-        /// Slots held for higher-priority PR roles.
-        reserved: usize,
-        /// The PR roles they are held for.
-        held_for: demand::HeldFor,
-    },
 }
 
 impl LimitRefusal {
@@ -223,8 +142,6 @@ impl LimitRefusal {
         match self {
             Self::Ceiling { .. } => "ceiling",
             Self::RoleBudget { .. } => "role_budget",
-            Self::DemandWidth { .. } => "demand_width",
-            Self::Reservation { .. } => "reservation",
         }
     }
 }
@@ -236,14 +153,8 @@ pub enum RootTickDecision {
     Admit {
         /// The `claude -p` prompt.
         prompt: String,
-        /// The `(root, role, lane)` in-progress entry.
+        /// The `(root, role)` in-progress entry.
         guard: RoleRunGuard,
-        /// The run takes an assigned PR rather than the queue head: the
-        /// repository's doctor width was above 1 at admission ([`lanes`]).
-        assign: bool,
-        /// Every observed repository's lanes and debt for this role (#10630),
-        /// recorded on the run's `pick.decision`. Empty for other roles.
-        lane_plan: Vec<lane_rule::RepoLane>,
     },
     /// Nothing to do for this root (disabled, sharded away, not configured,
     /// ...); the decision already logged why.
@@ -259,97 +170,34 @@ impl RootTickDecision {
     #[must_use]
     pub fn into_admitted(self) -> Option<(String, RoleRunGuard)> {
         match self {
-            Self::Admit { prompt, guard, .. } => Some((prompt, guard)),
+            Self::Admit { prompt, guard } => Some((prompt, guard)),
             Self::Skip | Self::InProgress | Self::Refused(_) => None,
         }
     }
 }
 
-/// Admit `(root, role)` against `config`'s host ceiling and `role`'s budget.
-/// The tail of `decide_root_tick_detailed`, shared so tests can drive
-/// admission without the enablement/sharding prefix.
+/// Admit `(root, role)` against the role runner's share of the host budget
+/// and `role`'s budget. The tail of `decide_root_tick_detailed`, shared so
+/// tests can drive admission without the enablement/sharding prefix.
 #[must_use]
 pub fn admit_root_tick(
     root: &Path,
     role: &'static str,
     prompt: String,
     in_progress: &InProgressGuard,
-    config: &RoleRunnerConfig,
+    _config: &RoleRunnerConfig,
 ) -> RootTickDecision {
-    admit_root_tick_with(root, role, prompt, in_progress, config, demand::global())
-}
-
-/// [`admit_root_tick`] against an explicit demand `ledger` (tests inject
-/// their own). With `demandWidth.enabled` the effective budget and the
-/// Champion-first reservation come from the ledger (#9392); without it this
-/// is exactly the Phase 1 admission and the ledger is not read.
-#[must_use]
-pub fn admit_root_tick_with(
-    root: &Path,
-    role: &'static str,
-    prompt: String,
-    in_progress: &InProgressGuard,
-    config: &RoleRunnerConfig,
-    ledger: &demand::DemandLedger,
-) -> RootTickDecision {
-    let ceiling = resolve_max_concurrent(config);
-    let block = role_runner_block(root);
-    let budgets = parse_role_max_concurrent(&block);
+    let ceiling = resolve_ceiling(root);
+    let budgets = read_role_max_concurrent(root);
     let budget = resolve_role_max_concurrent(&budgets, role, ceiling);
-    let demand_cfg = demand::parse_demand_config(&block);
-    let mut lanes = 1;
-    let mut lane_plan = Vec::new();
-    let (admission, debt) = if demand_cfg.enabled {
-        let host = ledger.host_debt(demand_cfg.stale());
-        let decision = demand::decide(role, &budgets, ceiling, &host, &demand_cfg);
-        demand::log_if_changed(ledger, &decision, &demand_cfg);
-        if matches!(role, "doctor" | "judge") {
-            // Per-repository width from this root's own debt on the role's axis
-            // (#10632, #10630), trimmed lowest-debt-first to the host capacity.
-            let repo = ledger.repo_debt(root, demand_cfg.stale());
-            let wanted = demand::repo_lanes(role, &repo, &demand_cfg);
-            lane_plan =
-                lane_rule::plan_for(role, ledger, &demand_cfg, ceiling.min(decision.budget));
-            lanes = lane_rule::lanes_for(&lane_plan, root, wanted);
-        }
-        let admission = RoleRunGuard::admit_lane_with_demand(
-            in_progress.clone(),
-            root.to_path_buf(),
-            role,
-            lanes,
-            ceiling,
-            decision.budget,
-            &decision.plan,
-        );
-        (admission, decision.debt)
-    } else {
-        let admission = RoleRunGuard::admit_with_role_budget(
-            in_progress.clone(),
-            root.to_path_buf(),
-            role,
-            ceiling,
-            budget,
-        );
-        (admission, None)
-    };
-    match admission {
-        RoleAdmission::Admitted(guard) => {
-            if lanes > 1 {
-                log::info!(
-                    "role_runner: {role} lane {} of {lanes} admitted for {} — its own debt \
-                     sizes a per-repository width above 1; the run takes an assigned PR \
-                     (autonomous.roleRunner.demandWidth.laneK/perRepoCap, #10630)",
-                    guard.lane(),
-                    root.display()
-                );
-            }
-            RootTickDecision::Admit {
-                prompt,
-                guard,
-                assign: lanes > 1,
-                lane_plan,
-            }
-        }
+    match RoleRunGuard::admit_with_role_budget(
+        in_progress.clone(),
+        root.to_path_buf(),
+        role,
+        ceiling,
+        budget,
+    ) {
+        RoleAdmission::Admitted(guard) => RootTickDecision::Admit { prompt, guard },
         RoleAdmission::InProgress => {
             log::debug!(
                 "role_runner: {role} tick for {} skipped — a run is already in progress (#4364)",
@@ -360,30 +208,9 @@ pub fn admit_root_tick_with(
         RoleAdmission::CeilingReached { active, ceiling } => {
             RootTickDecision::Refused(LimitRefusal::Ceiling { active, ceiling })
         }
-        RoleAdmission::RoleBudgetReached {
-            active,
-            budget: width,
-            ..
-        } if width < budget => RootTickDecision::Refused(LimitRefusal::DemandWidth {
-            active,
-            width,
-            budget,
-            debt: debt.unwrap_or(0),
-        }),
         RoleAdmission::RoleBudgetReached { active, budget, .. } => {
             RootTickDecision::Refused(LimitRefusal::RoleBudget { active, budget })
         }
-        RoleAdmission::ReservationHeld {
-            active,
-            ceiling,
-            reserved,
-            held_for,
-        } => RootTickDecision::Refused(LimitRefusal::Reservation {
-            active,
-            ceiling,
-            reserved,
-            held_for,
-        }),
     }
 }
 
@@ -393,43 +220,17 @@ pub fn refusal_summary_line(role: &str, refusal: LimitRefusal, deferred: usize) 
     match refusal {
         LimitRefusal::Ceiling { active, ceiling } => format!(
             "role_runner: {role} tick stopped admitting — {active} role agent(s) already in \
-             flight at the host ceiling of {ceiling} (autonomous.roleRunner.maxConcurrent / \
-             {ROLE_RUNNER_MAX_CONCURRENT_ENV}, #6102); {deferred} root(s) deferred to the next \
-             tick"
+             flight at the role runner's share of the host budget, {ceiling} \
+             (autonomous.workFinder.maxConcurrent less the steps in flight, #6102, #11911); \
+             {deferred} root(s) deferred to the next tick"
         ),
         LimitRefusal::RoleBudget { active, budget } => format!(
             "role_runner: {role} tick stopped admitting — {active} {role} run(s) already in \
              flight at its budget of {budget} (autonomous.roleRunner.roleMaxConcurrent, #9391); \
              {deferred} root(s) deferred to the next tick"
         ),
-        LimitRefusal::DemandWidth {
-            active,
-            width,
-            budget,
-            debt,
-        } => format!(
-            "role_runner: {role} tick stopped admitting — {active} {role} run(s) already in \
-             flight at its demand width of {width} for {debt} queued PR(s) (Phase 1 budget \
-             {budget}; autonomous.roleRunner.demandWidth, #9392); {deferred} root(s) deferred to \
-             the next tick"
-        ),
-        LimitRefusal::Reservation {
-            active,
-            ceiling,
-            reserved,
-            held_for,
-        } => format!(
-            "role_runner: {role} tick stopped admitting — {active} role agent(s) in flight and \
-             {reserved} of the host ceiling of {ceiling} reserved for {held_for} (Champion-first \
-             reservation, autonomous.roleRunner.demandWidth, #9392); {deferred} root(s) deferred \
-             to the next tick"
-        ),
     }
 }
-
-/// Whether `root`'s queue for any of `labels` has an open item. `Err` means
-/// the listing failed, and the caller dispatches anyway (fail open).
-pub type QueueProbe = Arc<dyn Fn(&Path, &[&str]) -> Result<bool, String> + Send + Sync>;
 
 /// Builds the invocation runner for one root.
 pub type RunnerFactory = Arc<dyn Fn(PathBuf) -> Box<dyn RoleInvocationRunner + Send> + Send + Sync>;
@@ -469,146 +270,14 @@ pub fn script_runner_factory() -> RunnerFactory {
     Arc::new(|root| Box::new(ScriptRoleInvocationRunner::new(root)))
 }
 
-/// The production queue probe: the ETag-cached REST listing, so an unchanged
-/// queue costs a free `304`. REST issue listings include pull requests, which
-/// is what judge and doctor queues hold — the gate therefore decides emptiness
-/// on rows of the queue's own kind ([`queue_rows_have_work`], #9929), never on the
-/// raw row count. The PR rows it saw are recorded in
-/// the demand ledger (#9392) — the same listing, no second call. Changes debt
-/// leaves out PRs Doctor will not drain (the PR-lane parks, e.g.
-/// `loom:blocked`, #9421); review debt is unfiltered
-/// ([`demand::count_axis_rows`]). The gate opens on
-/// [`demand::listing_has_work`], so an all-parked Doctor queue stays shut
-/// (#9435).
-#[must_use]
-pub fn forge_queue_probe() -> QueueProbe {
-    Arc::new(|root, labels| {
-        let gh_bin = gate_gh_bin();
-        for label in labels {
-            let rows = crate::forge_listing::list_issues_cached_as(
-                QUEUE_GATE_CALLER,
-                &gh_bin,
-                Some(root),
-                None,
-                label,
-                "open",
-            )
-            .map_err(|e| e.to_string())?;
-            // The ledger wants the whole listing (it counts PR rows itself).
-            demand::record_listing(demand::global(), root, label, &rows);
-            crate::observability::pick_decision::record_gate_listing(root, label, &rows);
-            // The GATE, though, must only be satisfied by a row of this
-            // queue's own kind (#9929) — a REST issues listing returns PRs
-            // alongside issues, so an unfiltered emptiness test lets an item
-            // of the wrong lifecycle stand in for real queue work.
-            let own_kind: Vec<_> = rows
-                .iter()
-                .filter(|r| queue_rows_have_work(label, std::slice::from_ref(*r)))
-                .cloned()
-                .collect();
-            if demand::listing_has_work(label, &own_kind) {
-                // #11855: a review listing whose every PR the Judge
-                // no-verdict backstop holds is no work — dispatching would
-                // only start a Judge whose `pr-queue` serves nothing.
-                if *label == "loom:review-requested" {
-                    return crate::pr_planning::has_judge_work(root, &gh_bin)
-                        .map_err(|e| e.to_string());
-                }
-                return Ok(true);
-            }
-            // #11861: a Champion hold on its round trip is parked by label
-            // (`loom:blocked`) and the listing hint is the body's park record,
-            // which a human may have edited away. When a row has the shape,
-            // ask the role's own queue, which reads the trusted hold marker:
-            // one decision for the gate and the queue.
-            if let Some(role) = round_trip_role(label, &own_kind) {
-                let served = match role {
-                    crate::pr_planning::PrRole::Judge => {
-                        crate::pr_planning::has_judge_work(root, &gh_bin)
-                    }
-                    _ => {
-                        crate::pr_planning::fetch_queue(root, &gh_bin, role).map(|q| !q.is_empty())
-                    }
-                };
-                if served.map_err(|e| e.to_string())? {
-                    return Ok(true);
-                }
-            }
-        }
-        if labels.contains(&"loom:review-requested") {
-            return crate::pr_planning::has_judge_fallback(root, &gh_bin)
-                .map_err(|e| e.to_string());
-        }
-        Ok(false)
-    })
-}
-
-/// The PR role whose queue may serve a Champion hold on its round trip in
-/// `rows` of queue `label` (#11861), when any row has that shape.
-///
-/// A Doctor-shaped row whose body declares a Doctor-cycle-cap park and no
-/// Champion hold record is an ordinary capped PR (#11905): Doctor's queue
-/// never serves it, so it must not cost a cached queue read every tick.
-fn round_trip_role(
-    label: &str,
-    rows: &[crate::forge_listing::RestIssue],
-) -> Option<crate::pr_planning::PrRole> {
-    use crate::champion_hold::{body_declares_doctor_cap, body_declares_hold};
-    use crate::champion_hold::{doctor_shape, judge_shape};
-    use crate::forge_listing::RestIssue;
-    use crate::pr_planning::PrRole;
-    let (role, shape): (PrRole, fn(&RestIssue) -> bool) = match label {
-        "loom:changes-requested" => (PrRole::Doctor, |r| {
-            let body = r.body.as_deref().unwrap_or("");
-            doctor_shape(&r.labels) && (body_declares_hold(body) || !body_declares_doctor_cap(body))
-        }),
-        "loom:review-requested" => (PrRole::Judge, |r| judge_shape(&r.labels)),
-        _ => return None,
-    };
-    rows.iter().any(shape).then_some(role)
-}
-
-/// The `gh` binary the gate listings use: `LOOM_GH_BIN` when set, else the
-/// resolved default.
+/// The `gh` binary the trigger listings use: `LOOM_GH_BIN` when set, else
+/// the resolved default.
 #[must_use]
 pub fn gate_gh_bin() -> PathBuf {
     std::env::var("LOOM_GH_BIN")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()), PathBuf::from)
-}
-
-/// Run one admitted invocation on the blocking thread: the queue gate, then
-/// the collision-probed invocation. Returns without spawning an agent when a
-/// gated role's queue is empty.
-fn run_gated<R: RoleInvocationRunner + ?Sized>(
-    runner: &mut R,
-    probe: &QueueProbe,
-    root: &Path,
-    role: &'static str,
-    prompt: &str,
-    interval: Duration,
-    lane: Option<(&lanes::LaneProbe, usize)>,
-) -> RoleTickOutcome {
-    if let Some(labels) = work_queue_labels(role) {
-        match probe(root, labels) {
-            Ok(false) => return RoleTickOutcome::QueueEmpty,
-            Ok(true) => {}
-            Err(e) => log::debug!(
-                "role_runner: {role} queue probe for {} failed ({e}) — dispatching anyway \
-                 (fail open, #9391)",
-                root.display()
-            ),
-        }
-    }
-    // Held for the whole invocation, so no other lane takes the same PR.
-    let target = lane.map(|(lane_probe, lane)| lanes::assign(lane_probe, role, root, lane));
-    let prompt = match &target {
-        Some(lanes::LaneTarget::Nothing) => return RoleTickOutcome::QueueEmpty,
-        Some(lanes::LaneTarget::Pr(hold)) => format!("{prompt} {}", hold.pr()),
-        Some(lanes::LaneTarget::Unassigned) | None => prompt.to_string(),
-    };
-    invoke_with_collision_probe(runner, root, role, &prompt, interval)
 }
 
 /// One finished run, as returned by its task.
@@ -640,18 +309,10 @@ pub struct RoleDispatcher {
     spec: RoleSpec,
     interval: Duration,
     runner_factory: RunnerFactory,
-    queue_probe: QueueProbe,
     observer: Option<Arc<dyn PoolExhaustedObserver>>,
     decide: DecideFn,
     decide_state: DecideState,
-    /// The demand ledger admitted champion runs record `loom:pr` into
-    /// (#9392), and the probe that counts it.
-    ledger: &'static demand::DemandLedger,
-    merge_probe: demand::DemandProbe,
-    /// The Doctor-queue read and stale-verdict guard an assigned lane uses
-    /// (#10632).
-    lane_probe: lanes::LaneProbe,
-    /// The curator/auditor/guide event-trigger probe and ledger (#10816).
+    /// The auditor/guide event-trigger probe and ledger (#10816).
     trigger_probe: triggers::TriggerProbe,
     trigger_ledger: &'static triggers::TriggerLedger,
     in_flight: JoinSet<FinishedRun>,
@@ -685,20 +346,10 @@ impl RoleDispatcher {
         spec: RoleSpec,
         interval: Duration,
         runner_factory: RunnerFactory,
-        queue_probe: QueueProbe,
         observer: Option<Arc<dyn PoolExhaustedObserver>>,
     ) -> Self {
-        Self::with_decide(
-            spec,
-            interval,
-            runner_factory,
-            queue_probe,
-            observer,
-            production_decide(spec),
-        )
-        .with_demand(demand::global(), demand::forge_merge_probe())
-        .with_lane_probe(lanes::LaneProbe::forge())
-        .with_triggers(triggers::forge_trigger_probe(), triggers::global())
+        Self::with_decide(spec, interval, runner_factory, observer, production_decide(spec))
+            .with_triggers(triggers::forge_trigger_probe(), triggers::global())
     }
 
     /// Use `probe` and `ledger` for the event triggers (#10816).
@@ -715,35 +366,12 @@ impl RoleDispatcher {
         self
     }
 
-    /// Use `lane_probe` for assigned doctor lanes (#10632). [`Self::with_decide`]
-    /// defaults to [`lanes::LaneProbe::none`], which never reads the forge.
-    #[must_use]
-    pub fn with_lane_probe(mut self, lane_probe: lanes::LaneProbe) -> Self {
-        self.lane_probe = lane_probe;
-        self
-    }
-
-    /// Use `ledger` and `merge_probe` for champion's merge-debt count (#9392).
-    /// [`Self::with_decide`] defaults to the global ledger and a probe that
-    /// never lists, so a test dispatcher never touches the forge.
-    #[must_use]
-    pub fn with_demand(
-        mut self,
-        ledger: &'static demand::DemandLedger,
-        merge_probe: demand::DemandProbe,
-    ) -> Self {
-        self.ledger = ledger;
-        self.merge_probe = merge_probe;
-        self
-    }
-
     /// A dispatcher with an injected per-root decision (tests).
     #[must_use]
     pub fn with_decide(
         spec: RoleSpec,
         interval: Duration,
         runner_factory: RunnerFactory,
-        queue_probe: QueueProbe,
         observer: Option<Arc<dyn PoolExhaustedObserver>>,
         decide: DecideFn,
     ) -> Self {
@@ -751,13 +379,9 @@ impl RoleDispatcher {
             spec,
             interval,
             runner_factory,
-            queue_probe,
             observer,
             decide,
             decide_state: DecideState::default(),
-            ledger: demand::global(),
-            merge_probe: demand::no_merge_probe(),
-            lane_probe: lanes::LaneProbe::none(),
             trigger_probe: triggers::no_trigger_probe(),
             trigger_ledger: triggers::global(),
             in_flight: JoinSet::new(),
@@ -793,14 +417,9 @@ impl RoleDispatcher {
         roots: Vec<PathBuf>,
         in_progress: &InProgressGuard,
     ) -> TickReport {
-        // A root that left the registry stops holding reserved slots (#9392).
-        self.ledger.retain_roots(&roots);
         let start = self.rotation_start(&roots);
         let mut order: VecDeque<(usize, PathBuf)> = roots.into_iter().enumerate().collect();
         order.rotate_left(start);
-        if self.spec.name == "curator" {
-            self.order_by_untriaged(&mut order);
-        }
         // A new tick replaces whatever the previous one left undecided.
         self.resume_requested = false;
         let report = self.walk(order, in_progress);
@@ -826,28 +445,6 @@ impl RoleDispatcher {
                 crate::role_tick_telemetry::deferred::emit_deferred(root, role, kind);
             }
         });
-    }
-
-    /// Curator demand axis (#9000): among roots with a last-known untriaged
-    /// count, visit the largest backlog first. The observed roots are
-    /// re-sorted within the slots they already occupy, so unobserved roots keep
-    /// their round-robin position and a failing listing never starves a root.
-    /// Counts exist only when `eventTriggers` is on, so otherwise this is a
-    /// no-op.
-    fn order_by_untriaged(&self, order: &mut VecDeque<(usize, PathBuf)>) {
-        let mut slots: Vec<usize> = Vec::new();
-        let mut observed: Vec<((usize, PathBuf), usize)> = Vec::new();
-        for (slot, entry) in order.iter().enumerate() {
-            if let Some(n) = self.trigger_ledger.last_untriaged(&entry.1) {
-                slots.push(slot);
-                observed.push((entry.clone(), n));
-            }
-        }
-        // Stable: equal counts keep round-robin order.
-        observed.sort_by_key(|o| std::cmp::Reverse(o.1));
-        for (slot, (entry, _)) in slots.into_iter().zip(observed) {
-            order[slot] = entry;
-        }
     }
 
     /// Resume this tick's deferred roots after a run returned
@@ -921,13 +518,8 @@ impl RoleDispatcher {
                 }
             };
             match decision {
-                RootTickDecision::Admit {
-                    prompt,
-                    guard,
-                    assign,
-                    lane_plan,
-                } => {
-                    self.spawn(root.clone(), prompt, guard, assign, lane_plan);
+                RootTickDecision::Admit { prompt, guard } => {
+                    self.spawn(root.clone(), prompt, guard);
                     self.last_admitted = Some(root.clone());
                     self.last_admitted_index = index;
                     report.spawned.push(root);
@@ -949,20 +541,10 @@ impl RoleDispatcher {
         report
     }
 
-    fn spawn(
-        &mut self,
-        root: PathBuf,
-        prompt: String,
-        guard: RoleRunGuard,
-        assign: bool,
-        lane_plan: Vec<lane_rule::RepoLane>,
-    ) {
+    fn spawn(&mut self, root: PathBuf, prompt: String, guard: RoleRunGuard) {
         let name = self.spec.name;
-        let lane = assign.then(|| (self.lane_probe.clone(), guard.lane()));
         let interval = self.interval;
         let factory = Arc::clone(&self.runner_factory);
-        let probe = Arc::clone(&self.queue_probe);
-        let (ledger, merge_probe) = (self.ledger, Arc::clone(&self.merge_probe));
         let (trigger_probe, trigger_ledger) =
             (Arc::clone(&self.trigger_probe), self.trigger_ledger);
         let task_root = root.clone();
@@ -972,12 +554,10 @@ impl RoleDispatcher {
             let _guard = guard;
             let tick_start = Instant::now();
             let started_at = chrono::Utc::now();
-            crate::observability::pick_decision::clear_gate_listings();
-            crate::observability::pick_decision::stash_lane_plan(&task_root, lane_plan);
+            crate::observability::pick_decision::clear_role_tick_stash();
             let mut runner = factory(task_root.clone());
-            let lane = lane.as_ref().map(|(p, l)| (p, *l));
-            // Curator/auditor/guide event trigger (#10816); a no-op unless
-            // this root enables `eventTriggers`.
+            // Auditor/guide event trigger (#10816); a no-op unless this root
+            // enables `eventTriggers`.
             let triggers_cfg = if triggers::is_triggered_role(name) {
                 triggers::read_event_trigger_config(&task_root)
             } else {
@@ -989,12 +569,8 @@ impl RoleDispatcher {
                 trigger_ledger,
                 &task_root,
                 name,
-                || run_gated(&mut *runner, &probe, &task_root, name, &prompt, interval, lane),
+                || invoke_with_collision_probe(&mut *runner, &task_root, name, &prompt, interval),
             );
-            if name == "champion" {
-                // Count-only, after the run: it never gates champion (#9392).
-                demand::record_merge_debt(&merge_probe, ledger, &task_root);
-            }
             // Durable `role_tick.outcome` record (#8056), best-effort.
             crate::role_tick_telemetry::emit_for_tick_correlated(
                 &task_root,
@@ -1068,21 +644,7 @@ impl RoleDispatcher {
     }
 }
 
-// Per-repository doctor lanes, each on its own assigned PR (#10632) — see
-// `role_runner/lanes.rs`.
-#[path = "lanes.rs"]
-pub mod lanes;
-
-// The per-repository lane formula's host plan and trim order (#10630).
-#[path = "lane_rule.rs"]
-pub mod lane_rule;
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 #[path = "tests/concurrent_dispatch.rs"]
 mod tests;
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-#[path = "tests/demand_dispatch.rs"]
-mod demand_tests;

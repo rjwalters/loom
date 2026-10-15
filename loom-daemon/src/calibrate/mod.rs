@@ -120,16 +120,15 @@ pub struct HostMeasurements {
     /// [`Self::ranking_present`] is `false`).
     pub total_accounts: usize,
     /// The currently resolved `autonomous.workFinder.maxConcurrent` — the
-    /// per-machine **sweep-dispatch** admission knob (env > config > default —
+    /// per-machine agent budget (env > config > default —
     /// [`crate::work_finder::resolve_max_concurrent_with_config`]).
     ///
-    /// **It bounds sweeps only (#6102).** Role-runner agents are spawned by
-    /// [`crate::role_runner`]'s own interval / idle loops and never pass
-    /// through work-finder admission, so this number is only half of this
-    /// host's agent budget — see [`Self::role_agent_max_concurrent`]. Calibrate
-    /// used to call it "**the** per-machine tuning term", which is what led an
-    /// operator to lower it from 16 to 8 after a load-induced hard halt and
-    /// still measure 1.15 load-per-core with a single sweep in flight.
+    /// **One budget since #11911.** Steps and role-runner agents both draw
+    /// from it ([`crate::host_budget`]). Before #11911 it bounded sweeps only
+    /// and the role runner had its own ceiling beside it (#6102), which is
+    /// what led an operator to lower it from 16 to 8 after a load-induced
+    /// hard halt and still measure 1.15 load-per-core with a single sweep in
+    /// flight.
     pub configured_max_concurrent: usize,
     /// Whether `LOOM_WORK_FINDER_MAX_CONCURRENT` is set in the environment —
     /// when `true`, editing `.loom/config.json` has no effect until the env var
@@ -166,23 +165,9 @@ pub struct HostMeasurements {
     /// registered brake state (which this process cannot see).
     pub cpu_admission_brake_held: bool,
     /// Whether the role runner is enabled for this workspace
-    /// ([`crate::role_runner::resolve_enabled`], #6102). When `true`, this host
-    /// carries a second population of agents that
-    /// [`Self::configured_max_concurrent`] does not bound, and the advice below
-    /// says so instead of attributing all host busy-ness to sweeps.
+    /// ([`crate::role_runner::resolve_enabled`], #6102). Its agents share
+    /// [`Self::configured_max_concurrent`] with the steps (#11911).
     pub role_runner_enabled: bool,
-    /// The resolved concurrent role-agent ceiling
-    /// ([`crate::role_runner::resolve_max_concurrent`], #6102) — the second
-    /// half of this host's agent budget, tuned by
-    /// `autonomous.roleRunner.maxConcurrent` /
-    /// `LOOM_ROLE_RUNNER_MAX_CONCURRENT`.
-    ///
-    /// Deliberately **not** a term in [`Self::dynamic_cap`]: role agents and
-    /// sweeps are admitted by different subsystems against different queues, so
-    /// folding them into one `min(...)` would misreport which one is actually
-    /// binding. They are reported as two ceilings that sum to a worst-case
-    /// agent count, which is the number an operator sizing a host needs.
-    pub role_agent_max_concurrent: usize,
 }
 
 impl HostMeasurements {
@@ -262,12 +247,10 @@ impl HostMeasurements {
                 // prints.
                 "holds": "new sweep admissions only",
             },
-            // The other half of this host's agent budget (#6102) — a separate
-            // ceiling, not a term in `dynamic_cap`.
+            // Role-runner agents share the one host budget (#11911).
             "role_runner": {
                 "enabled": self.role_runner_enabled,
-                "max_concurrent": self.role_agent_max_concurrent,
-                "bounded_by_work_finder_max_concurrent": false,
+                "bounded_by_work_finder_max_concurrent": true,
             },
         })
     }
@@ -325,10 +308,12 @@ impl BindingTerm {
 /// tie-break order [`BindingTerm`] documents.
 #[must_use]
 pub fn binding_term(disk_headroom: usize, ram_headroom: usize, ceiling: usize) -> BindingTerm {
-    let min_val = disk_headroom.min(ram_headroom).min(ceiling);
-    if disk_headroom == min_val {
+    // #11911 (2am#4463): the cap is the configured number; disk or RAM binds
+    // only when exhausted, which halts admission.
+    let _ = ceiling;
+    if disk_headroom == 0 {
         BindingTerm::Disk
-    } else if ram_headroom == min_val {
+    } else if ram_headroom == 0 {
         BindingTerm::Ram
     } else {
         BindingTerm::Ceiling
@@ -399,8 +384,8 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
     let brake_decision =
         crate::admission_brake::decide(&brake_config, loadavg_1m, logical_cpus, cpu_idle_fraction);
 
-    // Role-runner agent budget (#6102) — read from the same root's config as
-    // every other knob above.
+    // Whether the role runner is on (#6102) — read from the same root's config
+    // as every other knob above.
     let role_runner_config = crate::role_runner::read_role_runner_config(workspace_root);
 
     HostMeasurements {
@@ -423,14 +408,7 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
         cpu_admission_brake_enabled: brake_config.enabled,
         cpu_admission_brake_threshold: brake_config.load_per_core_threshold,
         cpu_admission_brake_held: brake_decision.held,
-        // Role-runner agent budget (#6102): resolved the same way the daemon's
-        // own role loops resolve it, so calibrate can never print a ceiling
-        // different from the one that will actually refuse a tick. NOT the live
-        // in-flight count — `calibrate` is a separate one-shot process with no
-        // view of the running daemon's guard (`loom-daemon status` is where the
-        // live count is reported, exactly as it is for sweeps).
         role_runner_enabled: crate::role_runner::resolve_enabled(&role_runner_config),
-        role_agent_max_concurrent: crate::role_runner::resolve_max_concurrent(&role_runner_config),
     }
 }
 
@@ -468,36 +446,32 @@ pub fn advice(m: &HostMeasurements) -> String {
             "the CPU saturation admission brake is HOLDING new SWEEP admissions right now \
              (load-per-core ≥ {:.2}) — this is the actual limiter this instant, ahead of the \
              disk/RAM/maxConcurrent cap below; in-flight sweeps are untouched and it releases the \
-             moment load drops back under the threshold (#5270, #4903).{}",
+             moment load drops back under the threshold (#5270, #4903).",
             m.cpu_admission_brake_threshold,
-            role_agent_caveat(m)
         );
     }
     match m.binding_term() {
         BindingTerm::Ceiling => match m.cpu_idle_fraction {
             Some(idle) if idle >= IDLE_HEADROOM_FRACTION => format!(
-                "maxConcurrent={} binds sweep dispatch while the host is {:.0}% idle — this \
+                "maxConcurrent={} binds agent dispatch while the host is {:.0}% idle — this \
                  machine looks under-subscribed; raise autonomous.workFinder.maxConcurrent (a \
                  step at a time) and re-measure. The host-distress breaker is the safety net if \
-                 you overshoot.{}",
+                 you overshoot.",
                 m.configured_max_concurrent,
                 idle * 100.0,
-                role_agent_caveat(m)
             ),
             Some(idle) => format!(
-                "maxConcurrent={} binds sweep dispatch and the host is only {:.0}% idle — it is \
+                "maxConcurrent={} binds agent dispatch and the host is only {:.0}% idle — it is \
                  already close to what this machine sustains; do not raise it further without \
-                 freeing CPU.{}",
+                 freeing CPU.",
                 m.configured_max_concurrent,
                 idle * 100.0,
-                role_agent_caveat(m)
             ),
             None => format!(
-                "maxConcurrent={} binds sweep dispatch, but no CPU idle sample is available on \
+                "maxConcurrent={} binds agent dispatch, but no CPU idle sample is available on \
                  this host — run this again (or read `loom-daemon status`) once the daemon has \
-                 sampled, then tune.{}",
+                 sampled, then tune.",
                 m.configured_max_concurrent,
-                role_agent_caveat(m)
             ),
         },
         BindingTerm::Disk => format!(
@@ -513,36 +487,6 @@ pub fn advice(m: &HostMeasurements) -> String {
             m.per_worktree_ram_gb
         ),
     }
-}
-
-/// The sentence appended to every `maxConcurrent`-centric reading when the role
-/// runner is enabled (#6102): a warning that the knob being discussed does not
-/// bound the other population of agents on this host.
-///
-/// Empty when the role runner is disabled — there is no second population to
-/// warn about, and the pre-#6102 advice text is then exactly right.
-///
-/// This exists because the advice is what an operator acts on after a
-/// load-induced crash. Saying "maxConcurrent=16 binds and the host is only 41%
-/// idle — do not raise it further" while silently omitting that up to N more
-/// role agents are admitted outside that number is not a wording problem: it
-/// sends the operator to tune a knob that cannot deliver the relief implied.
-fn role_agent_caveat(m: &HostMeasurements) -> String {
-    if !m.role_runner_enabled {
-        return String::new();
-    }
-    format!(
-        " NOTE (#6102): this knob bounds SWEEP dispatch only. The role runner is enabled here \
-         and admits up to {} more concurrent agent(s) outside it \
-         (autonomous.roleRunner.maxConcurrent / LOOM_ROLE_RUNNER_MAX_CONCURRENT), so this host's \
-         worst-case agent count is {} + {} = {}. If load is high with few sweeps in flight, \
-         lower the role-agent ceiling — lowering maxConcurrent will not reach that load.",
-        m.role_agent_max_concurrent,
-        m.configured_max_concurrent,
-        m.role_agent_max_concurrent,
-        m.configured_max_concurrent
-            .saturating_add(m.role_agent_max_concurrent)
-    )
 }
 
 /// Idle fraction at or above which a host is treated as clearly
@@ -602,8 +546,7 @@ pub fn report_human(m: &HostMeasurements) -> String {
     // in flight. Both limits caused real confusion on the incident host.
     out.push_str(
         "                  (what the brake can hold back: NEW sweep admissions only. It cannot \
-         refuse a role-runner agent, and it cannot shed load already in flight — see the \
-         role-agent ceiling below, #6102)\n",
+         refuse a role-runner agent, and it cannot shed load already in flight, #6102)\n",
     );
     match (m.disk_free_gb, m.disk_headroom) {
         (Some(free), headroom) if headroom != usize::MAX => {
@@ -688,23 +631,17 @@ pub fn report_human(m: &HostMeasurements) -> String {
         ),
         (None, true) => String::new(),
     });
-    // #6102 AC1: report the OTHER agent ceiling right next to `maxConcurrent`,
-    // so an operator reading "Currently configured" sees this host's whole
-    // agent budget rather than the sweep half of it.
+    // #11911: one budget. Say so right next to `maxConcurrent`, so an
+    // operator reading "Currently configured" knows it bounds every agent.
     out.push_str(&format!(
-        "  autonomous.roleRunner.maxConcurrent = {} (role runner is {})\n",
-        m.role_agent_max_concurrent,
+        "                  (one host budget: steps and role-runner agents share it, #11911; \
+         role runner is {})\n",
         if m.role_runner_enabled {
             "ENABLED"
         } else {
-            "disabled — no role agents run"
+            "disabled"
         }
     ));
-    out.push_str(
-        "                  (SEPARATE from maxConcurrent above: role agents are spawned by the \
-         role runner's own interval/idle loops and never pass through work-finder admission, so \
-         maxConcurrent has never bounded them — #6102)\n",
-    );
 
     out.push_str(&format!("\nDynamic concurrency cap: {}\n", m.dynamic_cap()));
     out.push_str(&format!(
@@ -713,16 +650,7 @@ pub fn report_human(m: &HostMeasurements) -> String {
         display_headroom(m.ram_headroom),
         m.configured_max_concurrent,
     ));
-    out.push_str("  bounds: SWEEP dispatch only (#6102)\n");
-    if m.role_runner_enabled {
-        out.push_str(&format!(
-            "  worst-case agents on this host: {} sweep(s) + {} role agent(s) = {}\n",
-            m.configured_max_concurrent,
-            m.role_agent_max_concurrent,
-            m.configured_max_concurrent
-                .saturating_add(m.role_agent_max_concurrent)
-        ));
-    }
+    out.push_str("  bounds: every agent, steps and role-runner agents together (#11911)\n");
     out.push_str(&format!("  cap binds on: {}\n", m.binding_term().as_str()));
     out.push_str(&format!(
         "  admission blocked by (max/disk/ram/cpu, #5270 AC4): {}\n",
@@ -782,13 +710,8 @@ mod tests {
             cpu_admission_brake_enabled: true,
             cpu_admission_brake_threshold: 0.95,
             cpu_admission_brake_held: false,
-            // #6102: the base fixture keeps the role runner OFF so every
-            // pre-#6102 advice assertion below reads the unchanged text (the
-            // caveat sentence is appended only when there is a second agent
-            // population to warn about). `role_runner_enabled_host()` is the
-            // fixture that turns it on.
+            // `role_runner_enabled_host()` is the fixture that turns it on.
             role_runner_enabled: false,
-            role_agent_max_concurrent: 7,
         }
     }
 
@@ -805,8 +728,8 @@ mod tests {
     /// Plenty of CPU/RAM/tokens, nearly-full scratch volume.
     fn disk_bound_host() -> HostMeasurements {
         HostMeasurements {
-            disk_headroom: 2,
-            disk_free_gb: Some(5),
+            disk_headroom: 0,
+            disk_free_gb: Some(1),
             configured_max_concurrent: 10,
             ..idle_worker_host()
         }
@@ -815,8 +738,8 @@ mod tests {
     /// Plenty of CPU/tokens/disk, critically low available RAM (#5270).
     fn ram_bound_host() -> HostMeasurements {
         HostMeasurements {
-            ram_headroom: 1,
-            ram_free_gb: Some(2),
+            ram_headroom: 0,
+            ram_free_gb: Some(1),
             configured_max_concurrent: 10,
             ..idle_worker_host()
         }
@@ -845,12 +768,11 @@ mod tests {
     }
 
     /// The #6102 incident shape: a busy host whose `maxConcurrent` binds while
-    /// the role runner is ALSO enabled, so a second population of agents is
-    /// admitted entirely outside that knob.
+    /// the role runner is ALSO enabled. Since #11911 its agents share that
+    /// budget.
     fn role_runner_enabled_host() -> HostMeasurements {
         HostMeasurements {
             role_runner_enabled: true,
-            role_agent_max_concurrent: 7,
             cpu_idle_fraction: Some(0.05),
             loadavg_1m: Some(32.4),
             ..idle_worker_host()
@@ -900,7 +822,7 @@ mod tests {
         // #5270 AC3: critically-low RAM caps the dynamic concurrency the same
         // way disk headroom already did.
         let m = ram_bound_host();
-        assert_eq!(m.dynamic_cap(), 1, "min(disk 36, ram 1, maxConcurrent 10)");
+        assert_eq!(m.dynamic_cap(), 0, "exhausted RAM halts (#11911)");
         assert_eq!(m.binding_term(), BindingTerm::Ram);
     }
 
@@ -910,13 +832,12 @@ mod tests {
 
     #[test]
     fn binding_term_prefers_disk_then_ram_then_ceiling() {
-        assert_eq!(binding_term(2, 9, 9), BindingTerm::Disk);
-        assert_eq!(binding_term(9, 2, 9), BindingTerm::Ram);
-        assert_eq!(binding_term(9, 9, 2), BindingTerm::Ceiling);
-        // A tie between disk and ram resolves to disk, matching `status`'s
-        // tie-break order.
-        assert_eq!(binding_term(3, 3, 9), BindingTerm::Disk);
-        assert_eq!(binding_term(9, 3, 3), BindingTerm::Ram);
+        // #11911: headroom binds only when exhausted.
+        assert_eq!(binding_term(0, 9, 9), BindingTerm::Disk);
+        assert_eq!(binding_term(9, 0, 9), BindingTerm::Ram);
+        assert_eq!(binding_term(2, 2, 9), BindingTerm::Ceiling);
+        // A tie between disk and ram resolves to disk.
+        assert_eq!(binding_term(0, 0, 9), BindingTerm::Disk);
     }
 
     #[test]
@@ -999,78 +920,37 @@ mod tests {
     }
 
     // ========================================================================
-    // Role-agent budget (#6102) — maxConcurrent bounds sweeps only
+    // One host budget (#11911) — maxConcurrent bounds every agent
     // ========================================================================
 
-    /// AC1: `calibrate`'s reading is what an operator acts on after a
-    /// load-induced crash. When the role runner is enabled it must say that
-    /// `maxConcurrent` bounds sweep dispatch only, and name the ceiling that
-    /// does bound the other agents — otherwise it sends the operator to tune a
-    /// knob that cannot deliver the relief implied (exactly what happened when
-    /// this host's `maxConcurrent` went 16 → 8 and load stayed at 1.15/core).
+    /// Since #11911 role-runner agents share `maxConcurrent` with the steps, so
+    /// the reading no longer appends the #6102 caveat that sent an operator to
+    /// a second knob: there is no second knob.
     #[test]
-    fn advice_warns_that_max_concurrent_does_not_bound_role_agents() {
-        let text = advice(&role_runner_enabled_host());
-        assert!(
-            text.contains("bounds SWEEP dispatch only"),
-            "the reading must scope the knob it is discussing: {text}"
-        );
-        assert!(
-            text.contains("autonomous.roleRunner.maxConcurrent"),
-            "the reading must name the knob that DOES bound role agents: {text}"
-        );
-        // 3 (fixture maxConcurrent) + 7 (role ceiling) = 10 worst-case agents.
-        assert!(
-            text.contains("3 + 7 = 10"),
-            "the reading must state this host's worst-case agent count: {text}"
-        );
-    }
-
-    /// The caveat is appended only when there IS a second agent population —
-    /// with the role runner off, the pre-#6102 advice is already accurate and
-    /// must not grow a spurious warning.
-    #[test]
-    fn advice_omits_the_role_agent_caveat_when_the_role_runner_is_disabled() {
+    fn advice_names_no_second_ceiling() {
         for m in [
             idle_worker_host(),
             saturated_host(),
             disk_bound_host(),
             cpu_brake_held_host(),
+            role_runner_enabled_host(),
         ] {
             let text = advice(&m);
-            assert!(!text.contains("#6102"), "role runner disabled ⇒ no role-agent caveat: {text}");
+            assert!(!text.contains("roleRunner.maxConcurrent"), "{text}");
+            assert!(!text.contains("worst-case"), "{text}");
         }
     }
 
-    /// The caveat rides along even when the CPU brake is the reported limiter
-    /// — that branch returns early, and it is precisely the branch an operator
-    /// reads on a saturated host, so omitting it there would miss the case
-    /// that matters most.
     #[test]
-    fn advice_carries_the_caveat_on_the_brake_held_branch_too() {
-        let text = advice(&HostMeasurements {
-            cpu_admission_brake_held: true,
-            ..role_runner_enabled_host()
-        });
-        assert!(text.contains("HOLDING"), "{text}");
-        assert!(text.contains("#6102"), "{text}");
-    }
-
-    #[test]
-    fn human_report_lists_the_role_agent_ceiling_next_to_max_concurrent() {
+    fn human_report_states_the_one_budget() {
         let text = report_human(&role_runner_enabled_host());
+        assert!(text.contains("one host budget"), "{text}");
+        assert!(text.contains("role runner is ENABLED"), "{text}");
         assert!(
-            text.contains("autonomous.roleRunner.maxConcurrent = 7"),
-            "the configured section must show both ceilings: {text}"
-        );
-        assert!(
-            text.contains("bounds: SWEEP dispatch only"),
-            "the dynamic-cap block must scope itself: {text}"
-        );
-        assert!(
-            text.contains("worst-case agents on this host: 3 sweep(s) + 7 role agent(s) = 10"),
+            text.contains("bounds: every agent, steps and role-runner agents together"),
             "{text}"
         );
+        assert!(!text.contains("autonomous.roleRunner.maxConcurrent"), "{text}");
     }
 
     /// AC4: the brake's stated guarantee must be accurate wherever it is
@@ -1088,15 +968,12 @@ mod tests {
     fn json_reports_the_role_runner_block_and_the_brake_scope() {
         let json = role_runner_enabled_host().to_json();
         assert_eq!(json["role_runner"]["enabled"], true);
-        assert_eq!(json["role_runner"]["max_concurrent"], 7);
+        assert!(json["role_runner"].get("max_concurrent").is_none(), "one budget (#11911)");
         assert_eq!(
-            json["role_runner"]["bounded_by_work_finder_max_concurrent"], false,
-            "machine consumers must get the #6102 fact too, not just the prose"
+            json["role_runner"]["bounded_by_work_finder_max_concurrent"], true,
+            "machine consumers must get the #11911 fact too, not just the prose"
         );
         assert_eq!(json["cpu_admission_brake"]["holds"], "new sweep admissions only");
-        // Role agents are deliberately NOT a term in the `min(...)` cap — the
-        // two populations are admitted by different subsystems, so folding
-        // them into one number would misreport which is binding.
         assert_eq!(
             report_json(&role_runner_enabled_host())["dynamic_cap"],
             role_runner_enabled_host().dynamic_cap()

@@ -1552,7 +1552,7 @@ pub fn build_daemon_status_for(
         // report from the daemon's own workspace root — the index/count knobs
         // describe the HOST, so a single resolution is the right shape even
         // though the config that carries them is read per-root (the same
-        // asymmetry `autonomous.roleRunner.maxConcurrent` already has). The
+        // asymmetry `roleRunner.roleMaxConcurrent` has). The
         // per-root `role_runner_shard` fields above carry the actual
         // per-workspace verdicts.
         role_runner_shard: status_scope::host_shard_posture(fallback_root, sections),
@@ -1695,18 +1695,11 @@ pub fn build_daemon_status_for(
         // #6201: the never-evicted last-tick-per-pair companion to the ring
         // above — see `RoleLastTick`'s doc comment for why both are needed.
         role_last_tick: crate::role_runner::last_role_tick_snapshot(),
-        // Live role-agent load + its ceiling (#6102). Same process-global
-        // read-back shape as the ring above, and reported for the same reason:
-        // `autonomous.workFinder.maxConcurrent` bounds sweep dispatch only, so
-        // an operator reading "1 in flight, cap 8" off this report while the
-        // host runs 11 agents had no in-band way to see the other ten. The
-        // count is process-global (the host is shared); the ceiling is resolved
-        // from the primary workspace's config, the same root every other
-        // dynamic-cap field on this report is resolved against.
+        // Live role-agent load + its ceiling (#6102). Since #11911 the ceiling
+        // is the role runner's share of the one host budget: the budget less
+        // the steps the last work-finder tick saw in flight.
         active_role_agents: crate::role_runner::global_active_run_count(),
-        role_agent_max_concurrent: Some(crate::role_runner::resolve_max_concurrent_for(
-            workspace_root,
-        )),
+        role_agent_max_concurrent: Some(crate::role_runner::resolve_ceiling(workspace_root)),
         // Restart-survivorship seed (#6262): how many still-running sweeps this
         // daemon had to adopt from the machine journal at startup because their
         // claim locks did not survive the restart. Process-global, set once by

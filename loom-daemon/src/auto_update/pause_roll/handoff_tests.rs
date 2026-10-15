@@ -66,6 +66,8 @@ fn h5_resumes_and_releases_from_the_manifest_h4_wrote() {
     let (paused_id, paused_dir) = register(&mut registry, &root, &paused, 101, 900);
     let (young_id, _) = register(&mut registry, &root, &young, 102, 5);
     let (missed_id, _) = register(&mut registry, &root, &missed, 103, 900);
+    // Only a step resumes (#11911): the paused agent is a Builder step.
+    test_support::make_step(&mut registry, &paused_id, 101, crate::step_role::StepRole::Builder);
     let hook = spawn_parking_agent(paused_dir);
 
     // ---- H4, PR 2's code ------------------------------------------------------

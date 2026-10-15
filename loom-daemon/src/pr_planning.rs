@@ -17,7 +17,7 @@ mod tests;
 #[cfg(test)]
 mod workflow_shaped_tests;
 pub use ci_gate::{cached_answer as ci_pending_cached, ci_pending};
-pub use listing::{ci_pending_at_sha, fetch_queue, has_judge_fallback, has_judge_work};
+pub use listing::{ci_pending_at_sha, fetch_queue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PrRole {

@@ -60,7 +60,7 @@ fn dispatch_starts_the_curator_with_the_sweeps_start_facts() {
                 None,
                 None,
                 None,
-                DispatchOrigin::WorkFinder,
+                DispatchOrigin::Watchdog,
             )
             .unwrap()
             .sweep_id
@@ -76,7 +76,7 @@ fn dispatch_starts_the_curator_with_the_sweeps_start_facts() {
     assert_eq!(r.sweep_id, sweep_id);
     assert_eq!(r.attempt_index, Some(1));
     assert_eq!(r.stage_attempt, 1);
-    assert_eq!(r.dispatch_origin.as_deref(), Some("work_finder"));
+    assert_eq!(r.dispatch_origin.as_deref(), Some("watchdog"));
     assert_eq!(r.source, "sweep_dispatch");
     assert_eq!(
         r.started_at, registry.entries[&sweep_id].started_at,

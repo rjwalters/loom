@@ -220,8 +220,7 @@ fn review_stall_recovery_converts_to_prset_after_a_landed_cancel() {
 
     // 3. Zero timeout forces the stall verdict. The Issue-keyed recovery
     //    re-dispatch hits the real #4123 open-PR guard (PR #9200 is
-    //    open) and is refused — the fix converts that refusal into a
-    //    `PrSet([9200])` dispatch instead of stranding the recovery.
+    //    open) and is refused; the step engine draws the PR (#11911).
     let restarts = reg.review_stall_watchdog_once(Duration::ZERO);
 
     let tel =
@@ -230,7 +229,7 @@ fn review_stall_recovery_converts_to_prset_after_a_landed_cancel() {
         tel.contains(r#""disposition":"landed""#) && tel.contains(r#""pr_number":9200"#),
         "the cancelled sweep journalled a landing: {tel}"
     );
-    assert_eq!(restarts, 1, "the conversion counts as one recovered sweep");
+    assert_eq!(restarts, 0, "a refused recovery is not a restart");
 
     // No Issue-kind sweep for 9100 is running — no Builder/Curator was
     // re-spawned for it.
@@ -238,10 +237,13 @@ fn review_stall_recovery_converts_to_prset_after_a_landed_cancel() {
         running_issue_sweep_id(&reg, 9100).is_none(),
         "the Issue-keyed recovery must not run — its open PR already exists"
     );
-    // A PrSet([9200]) sweep IS running — Judge/Doctor -> Merge picks up
-    // the existing PR directly.
-    let prset_id = running_prset_sweep_id(&reg, &[9200])
-        .expect("the recovery must convert to a PrSet([9200]) dispatch");
+    // No PrSet sweep either: the conversion is retired (#11911).
+    assert!(
+        reg.entries
+            .values()
+            .all(|i| !matches!(i.kind, SweepKind::PrSet(_))),
+        "the PrSet conversion is retired"
+    );
 
     // Bounded retry bookkeeping unchanged: the single allowed attempt for
     // issue 9100 is consumed exactly like an ordinary Issue-kind restart.
@@ -252,7 +254,7 @@ fn review_stall_recovery_converts_to_prset_after_a_landed_cancel() {
     assert_eq!(
         std::fs::read_to_string(wt.join("dirty.txt")).unwrap(),
         "uncommitted Builder output\n",
-        "the PrSet conversion must never touch the issue's worktree"
+        "the refused recovery must never touch the issue's worktree"
     );
 
     // `cancel()` left the issue at loom:building (its PR is open, #11852 —
@@ -278,7 +280,5 @@ fn review_stall_recovery_converts_to_prset_after_a_landed_cancel() {
              recovery; got: {calls:?}"
     );
 
-    // Cleanup: cancel the lingering PrSet child + release its PR lock.
-    let _ = reg.cancel(&prset_id, Duration::from_secs(2));
     std::env::remove_var("LOOM_REPO");
 }

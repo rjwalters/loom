@@ -1,7 +1,6 @@
 //! `pick.decision` emitter tests (#10212): work-finder and role-tick records,
-//! the thread-local gate stash, and routing through the ops sink.
+//! and routing through the ops sink.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{TimeZone, Utc};
@@ -229,7 +228,7 @@ fn a_role_skip_carries_no_disposition() {
     let r = role_record(
         tick("judge"),
         RoleTickResult::SkippedLoad,
-        gate_only(vec![("loom:review-requested".into(), vec![row(7, &[])])]),
+        listed(vec![("loom:review-requested".into(), vec![row(7, &[])])]),
         "o/r",
         &[],
     );
@@ -258,10 +257,13 @@ fn tick(role: &str) -> PickTick {
     }
 }
 
-fn row(number: u32, labels: &[&str]) -> GateRow {
-    GateRow {
+/// A listing row; [`listed`] gives it its listing's label as its stage.
+fn row(number: u32, labels: &[&str]) -> JournalRow {
+    JournalRow {
         number,
+        stage: String::new(),
         labels: labels.iter().map(|l| (*l).to_string()).collect(),
+        sort_key: None,
     }
 }
 
@@ -274,17 +276,17 @@ fn role_record_ranks_in_listing_order_and_marks_held_rows() {
     let r = role_record(
         tick("champion"),
         RoleTickResult::Success,
-        gate_only(listings),
+        listed(listings),
         "o/r",
-        &crate::role_runner::demand::MERGE_HOLD_LABELS,
+        &crate::pr_debt::MERGE_HOLD_LABELS,
     );
     let order: Vec<u32> = r.candidates.iter().map(|c| c.number).collect();
     assert_eq!(order, vec![5, 3, 9]);
     assert_eq!(r.candidates[1].rank, 2);
     assert_eq!(r.skipped.len(), 1);
     assert_eq!((r.skipped[0].number, r.skipped[0].reason), (3, PickSkipReason::OperatorHold));
-    assert!(r.acted.is_empty(), "no journal: the agent's pick was not observed");
-    assert_eq!(r.candidate_source, "gate_listing");
+    assert!(r.acted.is_empty(), "an unread journal: the agent's pick was not observed");
+    assert_eq!(r.candidate_source, "listing");
     assert!(!r.decisions_observed);
 }
 
@@ -294,7 +296,7 @@ fn a_tick_that_never_ran_skips_every_candidate_with_a_reason() {
     let r = role_record(
         tick("judge"),
         RoleTickResult::SkippedPoolExhausted,
-        gate_only(listings),
+        listed(listings),
         "o/r",
         &[],
     );
@@ -304,7 +306,8 @@ fn a_tick_that_never_ran_skips_every_candidate_with_a_reason() {
 
 #[test]
 fn an_empty_role_tick_records_cadence_with_no_candidates() {
-    let r = role_record(tick("curator"), RoleTickResult::Success, gate_only(vec![]), "o/r", &[]);
+    let none = RoleObservation { journal: None };
+    let r = role_record(tick("curator"), RoleTickResult::Success, none, "o/r", &[]);
     assert_eq!(r.candidates_total, 0);
     assert_eq!(r.role, "curator");
     assert_eq!(r.candidate_source, "none", "nothing observed");
@@ -313,10 +316,29 @@ fn an_empty_role_tick_records_cadence_with_no_candidates() {
     assert_eq!(r.repo.as_deref(), Some("o/r"));
 }
 
-fn gate_only(gate: Vec<(String, Vec<GateRow>)>) -> RoleObservation {
+/// The agent's listings, from a journal whose acts were not read: candidates
+/// in listing order, every decision unobserved. (The role runner's own gate
+/// listing, the old fallback, is gone with the queue gate, #11911.)
+fn listed(listings: Vec<(String, Vec<JournalRow>)>) -> RoleObservation {
+    let entries = listings
+        .into_iter()
+        .map(|(stage, rows)| JournalEntry::Listing {
+            at: at(),
+            rows: rows
+                .into_iter()
+                .map(|r| JournalRow {
+                    stage: stage.clone(),
+                    ..r
+                })
+                .collect(),
+        })
+        .collect();
     RoleObservation {
-        journal: None,
-        gate,
+        journal: Some(Journal {
+            entries,
+            front_expected: true,
+            read: false,
+        }),
     }
 }
 
@@ -339,11 +361,6 @@ fn journal(entries: Vec<JournalEntry>) -> RoleObservation {
             front_expected: true,
             read: true,
         }),
-        // The gate saw listing order 1, 2, 3; the serving queue differs.
-        gate: vec![(
-            "loom:review-requested".to_string(),
-            vec![row(1, &[]), row(2, &[]), row(3, &[])],
-        )],
     }
 }
 
@@ -366,7 +383,7 @@ fn act(number: u32, action: &str) -> JournalEntry {
 }
 
 #[test]
-fn the_serving_queue_order_wins_over_the_gate_listing_order() {
+fn the_serving_queue_order_is_the_candidate_order() {
     // pr-queue put the important #3 first, then #1; #2 is not in the queue.
     let obs = journal(vec![queue(vec![
         qrow(3, "loom:review-requested", &["loom:important"], "level=1"),
@@ -380,14 +397,13 @@ fn the_serving_queue_order_wins_over_the_gate_listing_order() {
 }
 
 #[test]
-fn a_fallback_only_queue_is_recorded_though_the_gate_saw_nothing() {
+fn a_fallback_only_queue_is_recorded() {
     let obs = RoleObservation {
         journal: Some(Journal {
             entries: vec![queue(vec![qrow(42, "fallback", &[], "mode=fallback")])],
             front_expected: true,
             read: true,
         }),
-        gate: vec![("loom:review-requested".to_string(), vec![])],
     };
     let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
     assert_eq!(r.candidates.len(), 1);
@@ -455,9 +471,9 @@ fn an_observed_empty_queue_differs_from_an_unobserved_tick() {
     assert_eq!((r.candidate_source.as_str(), r.decisions_observed), ("serving_queue", true));
     assert_eq!(r.candidates_total, 0);
 
-    let unobserved = gate_only(vec![("loom:changes-requested".to_string(), vec![row(4, &[])])]);
+    let unobserved = listed(vec![("loom:changes-requested".to_string(), vec![row(4, &[])])]);
     let r = role_record(tick("doctor"), RoleTickResult::Success, unobserved, "o/r", &[]);
-    assert_eq!((r.candidate_source.as_str(), r.decisions_observed), ("gate_listing", false));
+    assert_eq!((r.candidate_source.as_str(), r.decisions_observed), ("listing", false));
     assert!(r.skipped.is_empty(), "unobserved rows are undecided, not skipped");
 }
 
@@ -493,7 +509,6 @@ fn curator_candidates_come_from_its_listings() {
             front_expected: false,
             read: true,
         }),
-        gate: vec![],
     };
     let r = role_record(tick("curator"), RoleTickResult::Success, obs, "o/r", &[]);
     assert_eq!(r.candidate_source, "listing");
@@ -502,43 +517,6 @@ fn curator_candidates_come_from_its_listings() {
     assert_eq!(order, vec![11, 12]);
     assert_eq!(r.acted.len(), 3);
     assert_eq!((r.skipped[0].number, r.skipped[0].reason), (11, PickSkipReason::NotSelected));
-}
-
-#[test]
-fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
-    clear_gate_listings();
-    let pr = |n: u32, state: &str, is_pr: bool| RestIssue {
-        comments: 0,
-        number: n,
-        title: None,
-        labels: vec![],
-        created_at: None,
-        updated_at: None,
-        closed_at: None,
-        state: state.to_string(),
-        body: None,
-        author: None,
-        author_association: None,
-        is_pull_request: is_pr,
-        open_sub_issues: None,
-        labels_at: None,
-    };
-    let root = Path::new("/stash-test/a");
-    record_gate_listing(
-        root,
-        "loom:review-requested",
-        &[
-            pr(1, "open", true),
-            pr(2, "open", false),
-            pr(3, "closed", true),
-        ],
-    );
-    record_gate_listing(Path::new("/stash-test/b"), "loom:pr", &[pr(4, "open", true)]);
-    let taken = take_gate_listings(root);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].1.iter().map(|r| r.number).collect::<Vec<_>>(), vec![1]);
-    // Drained: nothing carries into the next tick.
-    assert!(take_gate_listings(root).is_empty());
 }
 
 #[test]
@@ -584,29 +562,18 @@ fn a_queue_line_without_a_total_falls_back_to_its_rows() {
 
 #[test]
 fn an_unread_journal_leaves_decisions_unobserved() {
-    let gate = vec![("loom:review-requested".to_string(), vec![row(1, &[]), row(2, &[])])];
-    let unread = RoleObservation {
-        journal: Some(Journal {
-            entries: vec![],
-            front_expected: true,
-            read: false,
-        }),
-        gate: gate.clone(),
-    };
-    let r = role_record(tick("judge"), RoleTickResult::Success, unread, "o/r", &[]);
-    assert_eq!(r.candidate_source, "gate_listing");
+    let unread =
+        listed(vec![("loom:review-requested".to_string(), vec![row(1, &[]), row(2, &[])])]);
+    let r = role_record(tick("judge"), RoleTickResult::Success, unread.clone(), "o/r", &[]);
+    assert_eq!(r.candidate_source, "listing");
     assert!(!r.decisions_observed, "nothing was read, so nothing was observed");
     assert!(r.skipped.is_empty(), "unread rows are undecided, not not_selected");
 
-    // A journal that was read and is genuinely empty is an observed "no act".
-    let observed = RoleObservation {
-        journal: Some(Journal {
-            entries: vec![],
-            front_expected: true,
-            read: true,
-        }),
-        gate,
-    };
+    // The same journal, read, with no act in it: an observed "no act".
+    let mut observed = unread;
+    if let Some(journal) = observed.journal.as_mut() {
+        journal.read = true;
+    }
     let r = role_record(tick("judge"), RoleTickResult::Success, observed, "o/r", &[]);
     assert!(r.decisions_observed);
     assert_eq!(r.skipped.len(), 2);
@@ -748,25 +715,6 @@ fn work_finder_record_carries_the_very_important_demotions() {
         .unwrap()
         .get("very_important_demoted")
         .is_none());
-}
-
-#[test]
-fn lane_plan_is_stashed_converted_and_drained_once() {
-    use crate::role_runner::concurrent_dispatch::lane_rule::RepoLane;
-    stash_lane_plan(
-        Path::new("/tmp/loom-10630-obs"),
-        vec![RepoLane {
-            root: "/tmp/loom-10630-obs".into(),
-            debt: 60,
-            wanted: 3,
-            lanes: 2,
-        }],
-    );
-    let lanes = take_lane_plan();
-    assert_eq!((lanes.len(), lanes[0].debt, lanes[0].wanted, lanes[0].lanes), (1, 60, 3, 2));
-    assert!(take_lane_plan().is_empty(), "drained");
-    let json = serde_json::to_value(&lanes).unwrap();
-    assert_eq!(json[0]["debt"], 60);
 }
 
 #[test]

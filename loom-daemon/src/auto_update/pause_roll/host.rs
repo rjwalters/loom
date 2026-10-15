@@ -54,6 +54,8 @@ pub struct Candidate {
     pub pr: Option<u32>,
     /// The step role of a `SweepKind::Step` sweep (#11898).
     pub step: Option<crate::step_role::StepRole>,
+    /// A sweep's dispatch origin (#11444), when the registry knows it.
+    pub dispatch_origin: Option<String>,
 }
 
 impl Candidate {
@@ -295,6 +297,7 @@ fn role_candidate(run: &roll_pause::live_runs::LiveRun, holders: &[String]) -> C
         holds_issue_creation_mutex: holders.iter().any(|r| r.eq_ignore_ascii_case(&run.role)),
         pr: None,
         step: None,
+        dispatch_origin: None,
     }
 }
 
@@ -365,6 +368,7 @@ pub(crate) fn sweep_candidates(
                 holds_issue_creation_mutex: false,
                 pr,
                 step,
+                dispatch_origin: sr.dispatch_origin_of(&info.sweep_id),
             }
         })
         .collect()

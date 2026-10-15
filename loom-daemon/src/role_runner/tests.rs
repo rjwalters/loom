@@ -406,8 +406,6 @@ fn test_config_reads_enabled_roles_and_interval() {
             effort: None,
             role_efforts: BTreeMap::new(),
             architect_max_proposals: None,
-            max_concurrent: None,
-            champion_mode: None,
             on_idle_max_wait: None,
         }
     );
@@ -457,8 +455,6 @@ fn test_config_project_tier_only_is_honored_like_legacy() {
             effort: None,
             role_efforts: BTreeMap::new(),
             architect_max_proposals: None,
-            max_concurrent: None,
-            champion_mode: None,
             on_idle_max_wait: None,
         }
     );
@@ -501,7 +497,7 @@ fn test_resolve_roles_absent_is_the_interval_default_subset() {
             .iter()
             .map(|r| r.name)
             .collect::<Vec<_>>(),
-        vec!["champion", "curator", "judge", "doctor", "auditor", "hermit", "guide"]
+        vec!["champion", "auditor", "hermit", "guide"]
     );
 }
 
@@ -517,8 +513,6 @@ fn test_resolve_roles_empty_array_is_none() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     assert_eq!(resolve_roles(&config), Vec::new());
@@ -536,8 +530,6 @@ fn test_resolve_roles_filters_and_preserves_default_order() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -548,7 +540,7 @@ fn test_resolve_roles_filters_and_preserves_default_order() {
 fn test_resolve_roles_ignores_unknown_names() {
     let config = RoleRunnerConfig {
         enabled: None,
-        roles: Some(vec!["curator".to_string(), "not-a-role".to_string()]),
+        roles: Some(vec!["guide".to_string(), "not-a-role".to_string()]),
         interval_secs: None,
         on_idle: None,
         model: None,
@@ -556,12 +548,10 @@ fn test_resolve_roles_ignores_unknown_names() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
-    assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
+    assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["guide"]);
 }
 
 // ===================================================================
@@ -570,13 +560,11 @@ fn test_resolve_roles_ignores_unknown_names() {
 
 #[test]
 fn test_missing_defaults_warns_for_default_absent_from_pinned_list() {
-    // A pinned `roles: ["curator"]` predates `doctor` joining
-    // DEFAULT_ROLES (#5272/#5291) — every other default is silently
-    // missing from the resolved set too, but this asserts the specific
-    // regression from the issue.
-    let names = vec!["curator".to_string()];
+    // A pinned `roles: ["guide"]` leaves every other default (here hermit)
+    // silently missing from the resolved set (#5339).
+    let names = vec!["guide".to_string()];
     let missing = missing_defaults(&names);
-    assert!(missing.contains(&"doctor"), "expected \"doctor\" in {missing:?}");
+    assert!(missing.contains(&"hermit"), "expected \"hermit\" in {missing:?}");
     // And resolve_roles's actual output omits it, per the allowlist semantics.
     let config = RoleRunnerConfig {
         enabled: None,
@@ -588,12 +576,10 @@ fn test_missing_defaults_warns_for_default_absent_from_pinned_list() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let resolved = resolve_roles(&config);
-    assert!(!resolved.iter().any(|r| r.name == "doctor"));
+    assert!(!resolved.iter().any(|r| r.name == "hermit"));
 }
 
 #[test]
@@ -617,7 +603,7 @@ fn test_resolve_roles_unknown_name_and_missing_default_fire_independently() {
     // asserted here via each function's independent, testable output.
     let config = RoleRunnerConfig {
         enabled: None,
-        roles: Some(vec!["curator".to_string(), "not-a-role".to_string()]),
+        roles: Some(vec!["guide".to_string(), "not-a-role".to_string()]),
         interval_secs: None,
         on_idle: None,
         model: None,
@@ -625,14 +611,12 @@ fn test_resolve_roles_unknown_name_and_missing_default_fire_independently() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
-    assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
-    let names = vec!["curator".to_string(), "not-a-role".to_string()];
-    assert!(missing_defaults(&names).contains(&"doctor"));
+    assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["guide"]);
+    let names = vec!["guide".to_string(), "not-a-role".to_string()];
+    assert!(missing_defaults(&names).contains(&"hermit"));
 }
 
 // ===================================================================
@@ -651,7 +635,10 @@ fn test_default_roles_snapshot_id_is_stable_and_content_derived() {
     for spec in DEFAULT_ROLES {
         assert!(id.contains(spec.name), "expected {:?} in snapshot id {id:?}", spec.name);
     }
-    assert!(id.contains("doctor"), "doctor must be part of the snapshot id: {id}");
+    // Curator, Judge and Doctor are steps, not role-runner roles (#11911).
+    for step_role in ["curator", "judge", "doctor"] {
+        assert!(!id.contains(step_role), "{step_role} must not be in the snapshot id: {id}");
+    }
     // Deterministic across calls (pure function of the static list).
     assert_eq!(id, default_roles_snapshot_id());
 }
@@ -667,7 +654,7 @@ fn test_missing_defaults_warning_embeds_snapshot_id_via_resolve_roles() {
     // `test_missing_defaults_warning_line_names_workspace_and_snapshot`
     // below for a direct assertion against the built line's content.
     let id = default_roles_snapshot_id();
-    assert!(id.contains("doctor"), "snapshot id must name doctor: {id}");
+    assert!(id.contains("hermit"), "snapshot id must name hermit: {id}");
 }
 
 // ===================================================================
@@ -811,18 +798,14 @@ fn test_roles_source_label_names_the_per_repo_fleet_tier_over_project() {
 fn test_missing_defaults_for_loom_repos_own_pinned_list_names_only_auditor_and_hermit() {
     // The exact pinned list from this repo's own `.loom/config.json`
     // (`["curator","champion","judge","doctor","guide"]`) — missing only
-    // auditor and hermit, not doctor, per the issue's own "Verified
-    // corrections" trace.
+    // auditor and hermit. Curator, Judge and Doctor are steps since #11911,
+    // so naming them changes nothing here.
     let names: Vec<String> = ["curator", "champion", "judge", "doctor", "guide"]
         .iter()
         .map(|s| s.to_string())
         .collect();
     let missing = missing_defaults(&names);
     assert_eq!(missing, vec!["auditor", "hermit"]);
-    assert!(
-        !missing.contains(&"doctor"),
-        "doctor is present in this pinned list: {missing:?}"
-    );
 }
 
 #[test]
@@ -842,7 +825,7 @@ fn test_resolved_roles_log_line_reports_full_default_roles_with_default_source()
     let resolved = resolve_roles(&config);
     let line = resolved_roles_log_line(tmp.path(), &resolved);
     std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
-    assert!(line.contains("doctor"), "expected doctor in resolved roles line: {line}");
+    assert!(line.contains("hermit"), "expected hermit in resolved roles line: {line}");
     assert!(
         line.contains("source=default (no tier sets roles)"),
         "expected default source label: {line}"
@@ -877,7 +860,8 @@ fn test_resolved_roles_log_line_reports_pinned_list_with_its_source() {
     let line = resolved_roles_log_line(tmp.path(), &resolved);
     std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
     let names: Vec<&str> = resolved.iter().map(|r| r.name).collect();
-    assert_eq!(names, vec!["champion", "curator", "judge", "doctor", "guide"]);
+    // Curator, Judge and Doctor are steps (#11911): the pinned names drop out.
+    assert_eq!(names, vec!["champion", "guide"]);
     // The resolved-list portion of the line (before `source=`) must omit
     // auditor/hermit — they're correctly absent from *this* pinned
     // list's resolution. (The trailing `default_roles=` segment of the
@@ -893,7 +877,7 @@ fn test_resolved_roles_log_line_reports_pinned_list_with_its_source() {
         !resolved_segment.contains("hermit"),
         "hermit must be absent from the resolved-roles segment: {resolved_segment}"
     );
-    assert!(line.contains("doctor"), "{line}");
+    assert!(!resolved_segment.contains("doctor"), "a step role is dropped: {line}");
     assert!(line.starts_with(&format!("role_runner: {} resolved roles=", tmp.path().display())));
     assert!(line.contains("source=legacy ("), "expected legacy-tier source: {line}");
 }
@@ -923,8 +907,6 @@ fn test_resolve_enabled_config_can_enable() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     }));
 }
@@ -943,8 +925,6 @@ fn test_resolve_enabled_env_overrides_config() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     }));
     std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
@@ -958,8 +938,6 @@ fn test_resolve_enabled_env_overrides_config() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     }));
     std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
@@ -1192,8 +1170,6 @@ fn test_resolve_interval_for_role_precedence() {
                 effort: None,
                 role_efforts: BTreeMap::new(),
                 architect_max_proposals: None,
-                max_concurrent: None,
-                champion_mode: None,
                 on_idle_max_wait: None,
             }
         ),
@@ -1215,8 +1191,6 @@ fn test_resolve_interval_for_role_precedence() {
                 effort: None,
                 role_efforts: BTreeMap::new(),
                 architect_max_proposals: None,
-                max_concurrent: None,
-                champion_mode: None,
                 on_idle_max_wait: None,
             }
         ),
@@ -1247,9 +1221,6 @@ fn test_builtin_intervals_are_per_role_not_uniform() {
         resolved,
         vec![
             ("champion", 600),
-            ("curator", 300),
-            ("judge", 300),
-            ("doctor", 300),
             ("auditor", 600),
             ("hermit", 600),
             ("guide", 900),
@@ -1689,41 +1660,22 @@ fn test_default_roles_prompts_are_namespaced() {
 }
 
 // ===================================================================
-// Doctor in DEFAULT_ROLES — regression guard for #5272 (before this,
-// a `loom:changes-requested` PR whose sweep ended had no role left to
-// pick it up standalone, ever).
+// Curator, Judge and Doctor left DEFAULT_ROLES with their intervals (#11911):
+// they are work-finder steps, so a config naming one resolves to nothing.
 // ===================================================================
 
 #[test]
-fn test_default_roles_includes_doctor_with_no_pr_number() {
-    let doctor = DEFAULT_ROLES
-        .iter()
-        .find(|s| s.name == "doctor")
-        .expect("#5272: DEFAULT_ROLES must include doctor as a standalone role");
-    assert_eq!(
-        doctor.prompt, "/loom:doctor",
-        "must invoke Doctor's own Finding Work queue scan, not PR Fix Mode \
-             (no PR number appended to the prompt)"
-    );
-    // Same cadence as `judge` — its paired stage in the PR lifecycle: a
-    // fresh Judge rejection should not sit unaddressed materially longer
-    // than a fresh Judge review sits unclaimed.
-    let judge = DEFAULT_ROLES
-        .iter()
-        .find(|s| s.name == "judge")
-        .expect("judge is default");
-    assert_eq!(doctor.default_interval_secs, judge.default_interval_secs);
-}
-
-#[test]
-fn test_resolve_roles_can_select_doctor_alone() {
-    let config = RoleRunnerConfig {
-        roles: Some(vec!["doctor".to_string()]),
-        ..Default::default()
-    };
-    let resolved = resolve_roles(&config);
-    assert_eq!(resolved.len(), 1);
-    assert_eq!(resolved[0].name, "doctor");
+fn test_step_roles_are_not_role_runner_roles() {
+    for role in ["curator", "judge", "doctor"] {
+        assert!(DEFAULT_ROLES.iter().all(|s| s.name != role), "{role}");
+        let config = RoleRunnerConfig {
+            roles: Some(vec![role.to_string()]),
+            on_idle: Some(vec![role.to_string()]),
+            ..Default::default()
+        };
+        assert!(resolve_roles(&config).is_empty(), "{role}");
+        assert!(resolve_on_idle_roles(&config).is_empty(), "{role}");
+    }
 }
 
 // ===================================================================
@@ -1854,11 +1806,11 @@ fn test_missing_defaults_never_reports_architect() {
     // A pinned allowlist omitting architect is correct, not stale — so it
     // must not be nagged into adding it (which would reintroduce the
     // flood this carve-out prevents).
-    let names = vec!["curator".to_string()];
+    let names = vec!["guide".to_string()];
     let missing = missing_defaults(&names);
     assert!(!missing.contains(&"architect"), "expected no \"architect\" in {missing:?}");
     // The #5339 staleness warning still fires for real interval defaults.
-    assert!(missing.contains(&"doctor"));
+    assert!(missing.contains(&"hermit"));
 }
 
 #[test]
@@ -2207,8 +2159,6 @@ fn test_resolve_on_idle_roles_parses_and_preserves_order() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_on_idle_roles(&config);
@@ -2231,8 +2181,6 @@ fn test_resolve_on_idle_roles_ignores_unknown_names() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_on_idle_roles(&config);
@@ -2251,8 +2199,6 @@ fn test_resolve_on_idle_roles_empty_array_is_empty() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     assert_eq!(resolve_on_idle_roles(&config), Vec::new());
@@ -2646,63 +2592,37 @@ fn test_try_acquire_remains_unbounded() {
     assert_eq!(active_run_count(&set), 5);
 }
 
-/// The shipped default is derived from the interval-default role table, not
-/// hard-coded — so adding a role raises the ceiling by one instead of
-/// silently squeezing every other role.
-#[test]
-fn test_default_max_concurrent_is_derived_from_interval_default_roles() {
-    assert_eq!(default_max_concurrent(), interval_default_roles().len());
-    assert!(default_max_concurrent() >= 1, "a 0 ceiling would admit nothing");
-}
-
+/// One host budget (#11911): before any work-finder tick has published, the
+/// role runner's ceiling is the root's `workFinder.maxConcurrent`; a retired
+/// `roleRunner.maxConcurrent` changes nothing (2am#4463).
 #[test]
 #[serial(loom_config_env)]
-fn test_config_max_concurrent_parses_and_rejects_zero() {
+fn test_the_role_ceiling_is_the_one_host_budget() {
     std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
-    let tmp = tempfile::tempdir().unwrap();
-    write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"maxConcurrent": 3}}}"#);
-    let parsed = read_role_runner_config(tmp.path()).max_concurrent;
-
-    let tmp0 = tempfile::tempdir().unwrap();
-    // 0 soft-fails to `None` (falls through to env/default) rather than
-    // being honored as "admit nothing" — that is `enabled: false`.
-    write_config(tmp0.path(), r#"{"autonomous": {"roleRunner": {"maxConcurrent": 0}}}"#);
-    let zero = read_role_runner_config(tmp0.path()).max_concurrent;
-
-    let tmp_bad = tempfile::tempdir().unwrap();
-    write_config(tmp_bad.path(), r#"{"autonomous": {"roleRunner": {"maxConcurrent": "8"}}}"#);
-    let bad = read_role_runner_config(tmp_bad.path()).max_concurrent;
+    let prev = std::env::var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV).ok();
+    std::env::remove_var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV);
+    if crate::host_budget::published().is_some() {
+        return; // a work-finder tick in this process owns the ceiling
+    }
+    let budget = tempfile::tempdir().unwrap();
+    write_config(budget.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 6}}}"#);
+    let retired = tempfile::tempdir().unwrap();
+    write_config(
+        retired.path(),
+        r#"{"autonomous": {"workFinder": {"maxConcurrent": 6}, "roleRunner": {"maxConcurrent": 2, "demandWidth": {"enabled": false}}}}"#,
+    );
+    let (b, r) = (resolve_ceiling(budget.path()), resolve_ceiling(retired.path()));
+    // Parsing a block full of retired keys still yields a config.
+    let config = read_role_runner_config(retired.path());
     std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
-
-    assert_eq!(parsed, Some(3));
-    assert_eq!(zero, None, "0 must soft-fail to None");
-    assert_eq!(bad, None, "a non-integer must soft-fail to None");
-}
-
-#[test]
-#[serial(loom_role_runner_max_concurrent_env)]
-fn test_resolve_max_concurrent_precedence_env_over_config_over_default() {
-    std::env::remove_var(ROLE_RUNNER_MAX_CONCURRENT_ENV);
-    let unset = RoleRunnerConfig::default();
-    let configured = RoleRunnerConfig {
-        max_concurrent: Some(2),
-        champion_mode: None,
-        on_idle_max_wait: None,
-        ..RoleRunnerConfig::default()
-    };
-    assert_eq!(resolve_max_concurrent(&unset), default_max_concurrent());
-    assert_eq!(resolve_max_concurrent(&configured), 2);
-
-    std::env::set_var(ROLE_RUNNER_MAX_CONCURRENT_ENV, "9");
-    assert_eq!(resolve_max_concurrent(&configured), 9, "env must outrank config");
-
-    // A zero / unparseable env value drops to the next tier rather than
-    // being honored — same contract as `architectMaxProposals`.
-    std::env::set_var(ROLE_RUNNER_MAX_CONCURRENT_ENV, "0");
-    assert_eq!(resolve_max_concurrent(&configured), 2);
-    std::env::set_var(ROLE_RUNNER_MAX_CONCURRENT_ENV, "lots");
-    assert_eq!(resolve_max_concurrent(&unset), default_max_concurrent());
-    std::env::remove_var(ROLE_RUNNER_MAX_CONCURRENT_ENV);
+    if let Some(v) = prev {
+        std::env::set_var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV, v);
+    }
+    // One budget, summing the old role-runner ceiling (default 7) for this
+    // release so the cutover cuts no capacity.
+    assert_eq!(b, 6);
+    assert_eq!(r, 6, "roleRunner.maxConcurrent is retired and ignored");
+    assert_eq!(config, RoleRunnerConfig::default());
 }
 
 /// The status surface's read path (#6102 AC3): after the daemon registers
@@ -2825,8 +2745,6 @@ fn on_idle_config(enabled: Option<bool>, roles: Vec<&str>) -> RoleRunnerConfig {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     }
 }
@@ -2936,8 +2854,6 @@ fn test_plan_idle_runs_disabled_without_on_idle_does_not_warn() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let now = Instant::now();
@@ -3246,7 +3162,7 @@ async fn test_interval_loop_skips_while_guard_held() {
     in_progress
         .lock()
         .unwrap()
-        .insert((root.clone(), "champion", 0));
+        .insert((root.clone(), "champion"));
     let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = spawn_role_task(
         runner,
@@ -3266,7 +3182,7 @@ async fn test_interval_loop_skips_while_guard_held() {
     );
 
     // Release the guard — dispatch resumes, proving the gate (not a dead loop).
-    in_progress.lock().unwrap().remove(&(root, "champion", 0));
+    in_progress.lock().unwrap().remove(&(root, "champion"));
     wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
 
     handle.abort();
@@ -3925,13 +3841,13 @@ async fn test_multi_role_task_skips_missing_registered_root() {
 // decide_root_tick + its catch_unwind isolation (#6201 AC2)
 // ===================================================================
 
-fn curator_spec() -> RoleSpec {
-    RoleSpec {
-        name: "curator",
-        prompt: "/loom:curator",
-        default_interval_secs: 300,
-        interval_default: true,
-    }
+/// An interval-default role (Guide). Curator was this seam until it became a
+/// step (#11911).
+fn guide_spec() -> RoleSpec {
+    *DEFAULT_ROLES
+        .iter()
+        .find(|s| s.name == "guide")
+        .expect("guide is an interval-default role")
 }
 
 /// Put [`ROLE_RUNNER_ENABLE_ENV`] back exactly as it was found — set to
@@ -3955,7 +3871,7 @@ fn decide_root_tick_skips_a_disabled_root_and_warns_once() {
 
     let decision = decide_root_tick(
         tmp.path(),
-        &curator_spec(),
+        &guide_spec(),
         &in_progress,
         &mut disabled_warned,
         &mut resolved_logged,
@@ -3978,7 +3894,7 @@ fn decide_root_tick_skips_a_role_not_in_the_resolved_list() {
 
     let decision = decide_root_tick(
         tmp.path(),
-        &curator_spec(),
+        &guide_spec(),
         &in_progress,
         &mut disabled_warned,
         &mut resolved_logged,
@@ -4010,7 +3926,7 @@ fn decide_root_tick_admits_and_returns_a_guard_when_configured() {
 
     let decision = decide_root_tick(
         tmp.path(),
-        &curator_spec(),
+        &guide_spec(),
         &in_progress,
         &mut disabled_warned,
         &mut resolved_logged,
@@ -4021,8 +3937,8 @@ fn decide_root_tick_admits_and_returns_a_guard_when_configured() {
     // test's scoped value into the rest of the suite.
     restore_role_runner_env(prev_env);
 
-    let (prompt, _guard) = decision.expect("curator is enabled and in the default role set");
-    assert_eq!(prompt, "/loom:curator");
+    let (prompt, _guard) = decision.expect("guide is enabled and in the default role set");
+    assert_eq!(prompt, "/loom:guide");
     // The guard holds the (root, role) pair in-progress until dropped.
     assert_eq!(active_run_count(&in_progress), 1);
 }
@@ -4040,7 +3956,7 @@ fn decide_root_tick_promotes_an_overdue_on_idle_role() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(
         tmp.path(),
-        r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["judge"],"onIdle":["hermit"],"onIdleMaxWait":{"hermit":"1s"}}}}"#,
+        r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["guide"],"onIdle":["hermit"],"onIdleMaxWait":{"hermit":"1s"}}}}"#,
     );
     let in_progress = new_in_progress_guard();
 
@@ -4074,7 +3990,7 @@ fn decide_root_tick_still_skips_an_on_idle_role_with_no_max_wait_configured() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(
         tmp.path(),
-        r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["judge"],"onIdle":["hermit"]}}}"#,
+        r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["guide"],"onIdle":["hermit"]}}}"#,
     );
     let in_progress = new_in_progress_guard();
 
@@ -4094,7 +4010,7 @@ fn decide_root_tick_still_skips_an_on_idle_role_with_no_max_wait_configured() {
 
 /// #7511 AC: a promoted role is admitted through the SAME
 /// `RoleRunGuard::admit` ceiling as any interval role — proven here by
-/// saturating a `maxConcurrent: 1` ceiling with one promoted root's guard
+/// saturating a ceiling of 2 (one unrelated run, one promoted root's guard)
 /// and showing a second, equally-overdue promotable root is refused, not
 /// waved through.
 #[test]
@@ -4103,13 +4019,19 @@ fn decide_root_tick_promotion_respects_the_concurrency_ceiling() {
     let prev_env = std::env::var(ROLE_RUNNER_ENABLE_ENV).ok();
     std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
 
-    let config_body = r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["judge"],"onIdle":["hermit"],"onIdleMaxWait":{"hermit":"1s"},"maxConcurrent":1}}}"#;
+    let config_body = r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["guide"],"onIdle":["hermit"],"onIdleMaxWait":{"hermit":"1s"}},"workFinder":{"maxConcurrent":2}}}"#;
     let root_a = tempfile::tempdir().unwrap();
     write_config(root_a.path(), config_body);
     let root_b = tempfile::tempdir().unwrap();
     write_config(root_b.path(), config_body);
 
     let in_progress = new_in_progress_guard();
+    // The one host budget is workFinder 1 + roleRunner 1 = 2 (#11911); an
+    // unrelated run already holds one slot of it.
+    in_progress
+        .lock()
+        .unwrap()
+        .insert((PathBuf::from("/tmp/loom-7511-other"), "champion"));
 
     let decision_a = decide_root_tick(
         root_a.path(),
@@ -4121,11 +4043,11 @@ fn decide_root_tick_promotion_respects_the_concurrency_ceiling() {
     );
     let (_prompt_a, guard_a) =
         decision_a.expect("root_a's hermit has never ticked — promotable, ceiling has room");
-    assert_eq!(active_run_count(&in_progress), 1);
+    assert_eq!(active_run_count(&in_progress), 2);
 
     // root_b's hermit is EQUALLY overdue (never ticked) and would also be
-    // promoted in isolation — but the process-wide ceiling of 1 is
-    // already saturated by root_a's guard, so this must be refused
+    // promoted in isolation — but the process-wide ceiling of 2 is
+    // already saturated by root_a's guard and the unrelated run, so this must be refused
     // exactly like an ordinary interval role hitting the same ceiling
     // (#6102) — promotion is not a bypass.
     let decision_b = decide_root_tick(
@@ -4190,7 +4112,7 @@ fn root_tick_decision_panic_is_isolated_and_does_not_propagate() {
     let in_progress = new_in_progress_guard();
     let decision = decide_root_tick(
         tmp.path(),
-        &curator_spec(),
+        &guide_spec(),
         &in_progress,
         &mut disabled_warned,
         &mut resolved_logged,
@@ -4298,7 +4220,7 @@ fn tick_admitted(root: &Path) -> bool {
     let in_progress = new_in_progress_guard();
     let decision = decide_root_tick(
         root,
-        &curator_spec(),
+        &guide_spec(),
         &in_progress,
         &mut HashSet::new(),
         &mut HashMap::new(),

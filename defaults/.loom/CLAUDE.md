@@ -99,11 +99,11 @@ generate its own work when enabled. Start/stop it with the wrapper scripts:
 
 ### 5. Scheduled Support Roles
 
-Run the periodic support roles (Champion, Curator, Judge, Doctor, Auditor,
-Guide) via the daemon-native role runner: `autonomous.roleRunner.enabled=true`
-in `.loom/config.json` (preferred — dispatches host-side via `spawn-claude.sh`
-on the same rotated token pool sweeps use) or the `.loom/bin/loom` tmux pool
-above. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
+Curator, Judge, Doctor and Champion's item work are steps the daemon's work
+finder draws (#11909). Run Champion `--non-item`, Auditor, Guide and Hermit
+via the daemon-native role runner: `autonomous.roleRunner.enabled=true` in
+`.loom/config.json` (preferred; one host budget with the steps, #11911) or
+the `.loom/bin/loom` tmux pool above. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
 for the full autonomous config surface and event taxonomy.
 
 ## Agent Roles

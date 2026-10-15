@@ -141,6 +141,14 @@ if [[ "$1 $2" == "forge claim-liveness" ]]; then
   [[ -z "${LOOM_TEST_EXTRA_LIVENESS_REPO:-}" || "$want" == "$LOOM_TEST_EXTRA_LIVENESS_REPO" ]] && printf '%s' "${LOOM_TEST_EXTRA_LIVENESS:-}"
   exit 0
 fi
+# #11911: `lease pr check` reports the claim's role lease. Unset
+# $LOOM_TEST_LEASE_STATE answers as a binary predating the verb.
+if [[ "$1 $2 $3" == "lease pr check" ]]; then
+  printf '%s\n' "$*" >"$LOOM_TEST_STUB_DIR/lease-args"
+  [[ -n "${LOOM_TEST_LEASE_STATE:-}" ]] || { echo "stub loom-daemon: $*" >&2; exit 64; }
+  echo "PR_LEASE_STATE=$LOOM_TEST_LEASE_STATE"
+  case "$LOOM_TEST_LEASE_STATE" in held-peer) exit 4 ;; unknown) exit 5 ;; *) exit 0 ;; esac
+fi
 [[ "$1 $2" == "forge trusted-comments" ]] || { echo "stub loom-daemon: $*" >&2; exit 64; }
 [[ "${LOOM_TEST_NO_TRUST_VERB:-}" == "1" ]] && exit 2
 exec jq -c '[.[] | select(((.author_association // "") | IN("OWNER","MEMBER","COLLABORATOR"))
@@ -515,6 +523,32 @@ assert_eq "target/other" "$(cat "$STUB_DIR/liveness-repo")" "T22a: claim-livenes
 assert_eq "fresh" "$(field "$out" CLAIM_STATE)" "T22b: target-repo activity keeps the claim fresh"
 out="$(LOOM_TEST_EXTRA_LIVENESS_REPO=checkout/repo LOOM_TEST_EXTRA_LIVENESS="$(ago 5)" "$TARGET_SCRIPT" check --repo target/other --number 6513 --label loom:reviewing)"
 assert_eq "stale" "$(field "$out" CLAIM_STATE)" "T22c: the checkout repo's activity is not borrowed"
+
+# --- T23: a live step lease keeps an aged claim fresh (#11911) -------------
+# The step engine claims with a role lease renewed while the step runs; a claim
+# it backs is never stale, however old its label. `--repo` naming another repo
+# cannot be checked (the lease read is the checkout's), so the age rule stands.
+reset
+set_claim loom:reviewing "$(ago 40)"
+out="$(LOOM_TEST_LEASE_STATE=held-peer "$TARGET_SCRIPT" check --number 6513 --label loom:reviewing)"
+assert_eq "fresh" "$(field "$out" CLAIM_STATE)" "T23a: a peer's live lease keeps a 40m-old claim fresh"
+assert_contains "$(cat "$STUB_DIR/lease-args")" "--role judge" "T23c: loom:reviewing is a judge lease"
+out="$(LOOM_TEST_LEASE_STATE=held-self "$TARGET_SCRIPT" check --number 6513 --label loom:reviewing)"
+assert_eq "fresh" "$(field "$out" CLAIM_STATE)" "T23d: the caller's own live lease is not stale either"
+out="$(LOOM_TEST_LEASE_STATE=free "$TARGET_SCRIPT" check --number 6513 --label loom:reviewing)"
+assert_eq "stale" "$(field "$out" CLAIM_STATE)" "T23e: no live lease -> the age rule stands"
+out="$(LOOM_TEST_LEASE_STATE=unknown "$TARGET_SCRIPT" check --number 6513 --label loom:reviewing)"
+assert_eq "unknown" "$(field "$out" CLAIM_STATE)" "T23f: an unreadable lease list fails safe"
+out="$("$TARGET_SCRIPT" check --number 6513 --label loom:reviewing)"
+assert_eq "stale" "$(field "$out" CLAIM_STATE)" "T23g: a binary without the verb keeps the age rule"
+out="$(LOOM_TEST_LEASE_STATE=held-peer "$TARGET_SCRIPT" check --repo target/other --number 6513 --label loom:reviewing)"
+assert_eq "stale" "$(field "$out" CLAIM_STATE)" "T23h: --repo for another repo is not lease-checked"
+reset
+set_labels "loom:curating"
+set_claim loom:curating "$(ago 40)"
+out="$(LOOM_TEST_LEASE_STATE=held-peer "$TARGET_SCRIPT" check --number 6513 --label loom:curating)"
+assert_eq "fresh" "$(field "$out" CLAIM_STATE)" "T23i: a Curator step's lease keeps loom:curating fresh"
+assert_contains "$(cat "$STUB_DIR/lease-args")" "--role curator" "T23j: loom:curating is a curator lease"
 
 # --- Summary ---
 echo ""

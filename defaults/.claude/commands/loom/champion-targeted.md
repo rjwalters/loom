@@ -117,8 +117,8 @@ the next step, after a fresh evaluation.
 ## `--non-item`: the interval run without item queues
 
 The role runner launches every interval and idle-edge Champion run this way
-(#11909). Item work (curated issues, `loom:pr` PRs) arrives as `--issue` /
-`--pr` steps; this pass must not act on it.
+(#11909; `championMode` is retired). Item work (curated issues, `loom:pr` PRs)
+arrives as `--issue` / `--pr` steps; this pass must not act on it.
 
 | Runs | Source |
 |---|---|

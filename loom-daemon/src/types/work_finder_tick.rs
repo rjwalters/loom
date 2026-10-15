@@ -245,23 +245,24 @@ impl CapView {
         }
     }
 
-    /// The effective cap.
+    /// The effective cap: the configured number (#11911, 2am#4463), or `0`
+    /// while disk or RAM is exhausted.
     #[must_use]
     pub fn effective(&self) -> usize {
-        self.configured
-            .min(self.disk.unwrap_or(usize::MAX))
-            .min(self.ram.unwrap_or(usize::MAX))
+        crate::work_finder::resolve_dynamic_max_concurrent(
+            self.disk.unwrap_or(usize::MAX),
+            self.ram.unwrap_or(usize::MAX),
+            self.configured,
+        )
     }
 
-    /// The term that binds. A headroom term binds only when it is strictly
-    /// below the configured cap; disk wins a disk / RAM tie.
+    /// The term that binds: an exhausted disk (it wins a tie) or RAM, else
+    /// the configured number. Headroom no longer sizes the cap (#11911).
     #[must_use]
     pub fn limiter(&self) -> CapLimiter {
-        let disk = self.disk.unwrap_or(usize::MAX);
-        let ram = self.ram.unwrap_or(usize::MAX);
-        if disk < self.configured && disk <= ram {
+        if self.disk == Some(0) {
             CapLimiter::Disk
-        } else if ram < self.configured {
+        } else if self.ram == Some(0) {
             CapLimiter::Ram
         } else {
             CapLimiter::Configured
