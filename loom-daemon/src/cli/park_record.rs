@@ -166,8 +166,10 @@ impl ApplyArgs {
             remove_labels: self.remove_label,
             dry_run: self.dry_run,
         };
+        let is_pr = self.issue.is_none() && self.pr.is_some();
         let mut forge = GhForge::new(default_repo_root(), self.repo);
         let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
+        loom_daemon::park_record::apply::journal_applied(&req, is_pr, code);
         std::process::exit(code)
     }
 }
