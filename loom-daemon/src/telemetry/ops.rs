@@ -61,6 +61,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // 2am#4367 P4: `loom.forge.calls`' route (gateway | direct_read |
     // direct | none), a closed vocabulary.
     "route",
+    // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
+    // engine's per-role slots beside the sweep total.
+    "pool",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -113,6 +116,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // `loom.dispatch.admission` spans (Issue #8907).
     "loom.dispatch.admission_result",
     "loom.dispatch.reason",
+    // `loom.dispatch.step` spans (Issue #11906), beside the two above.
+    "loom.step.item",
+    "loom.step.role",
+    "loom.step.draw_attempt",
+    "loom.step.age_source",
+    "loom.step.resumed",
     // `loom.dispatch.disposition` spans (Issue #9222).
     "loom.queue.disposition",
     "loom.queue.state",
@@ -745,7 +754,9 @@ impl MetricName {
             }
             Self::DispatchIdleSlots => "Concurrency slots idle at the end of a work-finder tick.",
             Self::DispatchIdleSlotSeconds => "Slot-seconds left idle while ready work waited.",
-            Self::DispatchBusySlots => "Busy agent slots, by role (sweep or role-runner role).",
+            Self::DispatchBusySlots => {
+                "Busy agent slots, by role (sweep, role-runner role, or step role with pool=step)."
+            }
             Self::DispatchRoleMaxConcurrent => "The role-runner concurrent agent ceiling.",
             Self::DispatchRoleIdleSlots => "Role-runner agent slots idle under the ceiling.",
             Self::ForgeStageDwell => "Seconds items spent in a forge label stage, by state.",
