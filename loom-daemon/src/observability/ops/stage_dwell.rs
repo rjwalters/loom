@@ -843,7 +843,7 @@ pub(in crate::observability) async fn record(
             let listing = match mirrored {
                 Some(rows) => Some(rows),
                 None => {
-                    crate::observability::queue_blocked::list_open(
+                    crate::observability::queue_blocked::list_open_observability(
                         root.clone(),
                         label,
                         "stage_dwell",

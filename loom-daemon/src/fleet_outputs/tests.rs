@@ -145,7 +145,6 @@ fn far_future_timestamp_does_not_mask_an_outage() {
 fn captain_gauges_tolerate_one_missed_publish() {
     for kind in [
         "captain-gauges/v1:stage-dwell",
-        "captain-gauges/v1:star-facts",
         "captain-gauges/v1:queue-blocked",
     ] {
         let row = row_for(kind);
@@ -171,7 +170,6 @@ fn captain_gauge_deadlines_cover_the_heartbeat_contract() {
     for (job, bound) in [
         (STAGE_DWELL_JOB, gauges::DEFAULT_MAX_AGE_SECS),
         (QUEUE_BLOCKED_JOB, gauges::DEFAULT_MAX_AGE_SECS),
-        (STAR_FACTS_JOB, gauges::DEFAULT_STAR_FACTS_MAX_AGE_SECS),
     ] {
         let row = SINGLETON_OUTPUTS.iter().find(|o| o.job == job).unwrap();
         assert!(row.deadline().as_secs() >= bound.unsigned_abs(), "{job}");
@@ -193,7 +191,7 @@ fn disabled_opt_in_jobs_do_not_fire() {
             f.fleet.remove(o.record_kind);
         }
     }
-    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 5);
+    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 4);
     f.disabled = BTreeSet::from([
         gauges::ENABLED_KEY,
         CI_TELEMETRY_KEY,
@@ -202,11 +200,7 @@ fn disabled_opt_in_jobs_do_not_fire() {
     assert!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).is_empty());
     // Only the sub-switches off: stage-dwell is still owed, and so is the
     // intake pass (gated by the singleton key alone).
-    f.disabled = BTreeSet::from([
-        gauges::STAR_FACTS_KEY,
-        gauges::QUEUE_BLOCKED_KEY,
-        CI_TELEMETRY_KEY,
-    ]);
+    f.disabled = BTreeSet::from([gauges::QUEUE_BLOCKED_KEY, CI_TELEMETRY_KEY]);
     assert_eq!(
         kinds(&evaluate(SINGLETON_OUTPUTS, &f, &r, now())),
         ["captain-gauges/v1:stage-dwell", PASS_HEARTBEAT_KIND]
