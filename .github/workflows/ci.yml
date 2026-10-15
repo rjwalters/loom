@@ -2666,7 +2666,7 @@ jobs:
 
   codex-adapter-smoke:
     name: Codex Adapter Smoke (mocked)
-    needs: changes
+    needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
     # Tier-2 admission gate for the Codex runtime adapter (epic #4167 Phase 2,
     # issue #4468): a green leg here is what admits the adapter per
@@ -2677,18 +2677,21 @@ jobs:
     # shim on a temp PATH, so the real Codex CLI is never installed or invoked
     # and no credential is required. `codex` is deliberately NOT on PATH here,
     # which also exercises the missing-binary (exit 127) path.
+    #
+    # The Docker-backed session-exec / private-workspace fixtures moved to
+    # ci-daily.yml's docker-fixtures job (#11965).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # Built once by build-daemon (#9065). download-artifact FAILS when the
+      # artifact is missing, so a broken build turns this job red rather than
+      # letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build native worker dispatcher
-        run: cargo build --package loom-daemon
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Syntax-check the Codex adapter and its test
         run: |
           bash -n defaults/scripts/spawn-codex.sh
@@ -2743,36 +2746,6 @@ jobs:
           grep -q '## Residual gaps' defaults/docs/guardrail-parity-codex.md
       - name: Run the mocked Codex adapter test suite
         run: bash defaults/scripts/tests/test-spawn-codex.sh
-      - name: Verify persistent-session cancellation with fake workers
-        # #11232 / #11755: no `docker pull` here. The test pulls ubuntu:24.04
-        # through tests/common/hub_image.rs at the digest .github/ci-images.txt
-        # pins (GHCR copy first, then mirror.gcr.io, Docker Hub with bounded
-        # retry last) and tags it `ubuntu:24.04`, which the fixture build in
-        # the next step also consumes.
-        env:
-          LOOM_TEST_SESSION_IMAGE: ubuntu:24.04
-        run: cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
-      - name: Verify account-private clones and exclusive jobs with Docker fixtures
-        # Builds a small ubuntu:24.04 fixture image (apt from archive.ubuntu.com);
-        # capped so a mirror stall fails here, not at the 30-min job limit (#10822).
-        timeout-minutes: 10
-        # Owner-only synthetic profiles must belong to the session image's UID.
-        # Build as runner; execute only this fixture as UID 1000 with Docker access.
-        # Stage public inputs outside the runner's owner-only home. Account
-        # profiles and the checkout's .git directory are never shared.
-        run: |
-          fixture_source="$(mktemp -d /tmp/loom-private-ci.XXXXXX)"
-          chmod 0755 "$fixture_source"
-          git archive HEAD | tar -x -C "$fixture_source"
-          mkdir "$fixture_source/target"
-          sudo --non-interactive mount --bind "$PWD/target" "$fixture_source/target"
-          trap 'sudo --non-interactive umount "$fixture_source/target"' EXIT
-          cd "$fixture_source"
-          cargo test -p loom-daemon --test private_workspace_docker --no-run --message-format=json > fixture-artifacts.json
-          fixture_test="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "private_workspace_docker" and .executable != null) | .executable' fixture-artifacts.json)"
-          namei -l "$PWD/defaults/scripts" "$PWD/defaults/runtimes" "$PWD/defaults/roles" "$PWD/defaults/.claude/commands/loom" "$PWD/target/debug/loom-daemon"
-          sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env -- sh -c 'id && test -x "$1" && test -r "$PWD/target/debug/loom-daemon" && test -x "$PWD/target/debug/loom-daemon" && tar -cf /dev/null "$PWD/defaults"' sh "$fixture_test"
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
 
   shell-suite-tests:
     name: Shell Test Suites (hermetic, ${{ matrix.shard }}/${{ strategy.job-total }})

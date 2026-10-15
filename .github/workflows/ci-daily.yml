@@ -683,6 +683,51 @@ jobs:
         run: ./docker/native/test-image.sh loom-worker-native:ci-daily
 
   # ===========================================================================
+  # Docker-backed session-exec / private-workspace fixtures (#11965), moved off
+  # ci.yml's Codex Adapter Smoke (mocked) PR leg -- rule 10's slow run.
+  # ===========================================================================
+  docker-fixtures:
+    name: Session and Private-Workspace Docker Fixtures (unfiltered)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Verify persistent-session cancellation with fake workers
+        # #11232 / #11755: no `docker pull` here. The test pulls ubuntu:24.04
+        # through tests/common/hub_image.rs at the digest .github/ci-images.txt
+        # pins (GHCR copy first, then mirror.gcr.io, Docker Hub with bounded
+        # retry last) and tags it `ubuntu:24.04`, which the fixture build in
+        # the next step also consumes.
+        env:
+          LOOM_TEST_SESSION_IMAGE: ubuntu:24.04
+        run: cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
+      - name: Verify account-private clones and exclusive jobs with Docker fixtures
+        if: ${{ !cancelled() }}
+        # Builds a small ubuntu:24.04 fixture image (apt from archive.ubuntu.com);
+        # capped so a mirror stall fails here, not at the 30-min job limit (#10822).
+        timeout-minutes: 10
+        # Owner-only synthetic profiles must belong to the session image's UID.
+        # Build as runner; execute only this fixture as UID 1000 with Docker access.
+        # Stage public inputs outside the runner's owner-only home. Account
+        # profiles and the checkout's .git directory are never shared.
+        run: |
+          fixture_source="$(mktemp -d /tmp/loom-private-ci.XXXXXX)"
+          chmod 0755 "$fixture_source"
+          git archive HEAD | tar -x -C "$fixture_source"
+          mkdir "$fixture_source/target"
+          sudo --non-interactive mount --bind "$PWD/target" "$fixture_source/target"
+          trap 'sudo --non-interactive umount "$fixture_source/target"' EXIT
+          cd "$fixture_source"
+          cargo test -p loom-daemon --test private_workspace_docker --no-run --message-format=json > fixture-artifacts.json
+          fixture_test="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "private_workspace_docker" and .executable != null) | .executable' fixture-artifacts.json)"
+          namei -l "$PWD/defaults/scripts" "$PWD/defaults/runtimes" "$PWD/defaults/roles" "$PWD/defaults/.claude/commands/loom" "$PWD/target/debug/loom-daemon"
+          sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env -- sh -c 'id && test -x "$1" && test -r "$PWD/target/debug/loom-daemon" && test -x "$PWD/target/debug/loom-daemon" && tar -cf /dev/null "$PWD/defaults"' sh "$fixture_test"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
+
+  # ===========================================================================
   # Item 8 -- the compatibility floor itself (#10868).
   # ===========================================================================
   compat-floor:
@@ -758,6 +803,7 @@ jobs:
       - flake-shell
       - beta-toolchain
       - docker-smokes
+      - docker-fixtures
       - compat-floor
     # `always()` would also run after the operator cancels the run, and a
     # cancelled job is not a failing job. `!cancelled()` runs after failures
