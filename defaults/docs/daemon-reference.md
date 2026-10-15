@@ -7709,8 +7709,9 @@ reported"), so a vacuous `GREEN` would be a false pass.
 By default a failing check is `RED` as soon as it is terminal, even while other
 checks still run — right for a caller that only *refuses* on it (the approval
 gate in `post-verdict.sh`, `merge-pr.sh`, Champion). Under `--settle-red` a
-failure is `RED` only once nothing observed is pending, the required set is
-known and every required context has registered; until then the wait stays
+failure is `RED` only once nothing observed is pending — the required set
+does not hold it back, so a failed required-context lookup cannot hide a
+finished red (#12022); until then the wait stays
 pending (`TIMEOUT <sha> <pending>` at the deadline, plus a stderr note
 `wait-checks: --settle-red: already failing: <names>`). The Judge uses it before
 a changes-requested CI verdict, which must name the failing test from
