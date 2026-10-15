@@ -1176,7 +1176,7 @@ This PR has merge conflicts with main that could not be resolved automatically.
 
 Please bring the branch up to date and resolve them: `git fetch origin && git merge origin/main`, then a plain `git push` (rebase only if `loom-daemon branch-update strategy` prints `rebase`, then push with a pinned `--force-with-lease=<branch>:<sha>`).
 
-I'll re-evaluate once conflicts are resolved, or the Doctor role will handle this.
+Will re-evaluate once conflicts are resolved, or the Doctor role will handle this.
 EOF
 )" && \
         gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
