@@ -807,7 +807,7 @@ POST_CLAIM=$(gh issue view "$ISSUE_NUMBER" --json state,labels \
   --jq '[.state, ([.labels[].name] | join(","))] | @tsv')
 if ! printf '%s\n' "$POST_CLAIM" | awk -F'\t' '
      $1 != "OPEN" { exit 1 }
-     $2 ~ /(^|,)loom:(issue|building|operator)(,|$)/ { exit 1 }
+     $2 ~ /(^|,)loom:(issue|building|operator|blocked|frozen)(,|$)/ { exit 1 }
      $2 !~ /(^|,)loom:(curated|architect|hermit|auditor)(,|$)/ { exit 1 }'; then
   gh issue edit "$ISSUE_NUMBER" --remove-label "loom:evaluating"
   echo "#$ISSUE_NUMBER was decided since discovery ($POST_CLAIM) — claim released, skipping"
@@ -835,7 +835,7 @@ RECHECK_LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels --jq '[.labels[].na
 
 If `loom:evaluating` is no longer present (reclaimed as stale by a concurrent Champion pass while you were evaluating), **abort**: do not comment, do not write any label. A later pass will pick this issue up cleanly.
 
-Abort the same way if `RECHECK_LABELS` already carries `loom:issue`, `loom:building` or `loom:operator`: another pass wrote a verdict while you evaluated (#11989), and a second one would only duplicate or contradict it. Release your claim first (`gh issue edit "$ISSUE_NUMBER" --remove-label "loom:evaluating"`), then move on.
+Abort the same way if `RECHECK_LABELS` already carries `loom:issue`, `loom:building`, `loom:operator`, `loom:blocked` or `loom:frozen`: another pass wrote a verdict (or a human placed a hold) while you evaluated (#11989), and a second verdict would only duplicate or contradict it, or override the hold. Release your claim first (`gh issue edit "$ISSUE_NUMBER" --remove-label "loom:evaluating"`), then move on.
 
 ---
 
