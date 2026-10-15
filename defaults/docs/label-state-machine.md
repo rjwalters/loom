@@ -763,11 +763,16 @@ mapping the forge-side migration (#11511) applies. It is never rendered into
 
 ## No-op hold (#10156)
 
-A sweep that ends as a no-op (the `noop-cooldown record` IPC, or a Curator-only
-stop the reaper classifies) is counted per issue against a fingerprint of what
-the sweep's conclusion depends on: labels minus claim churn, non-bot comments,
+A Builder step that ends `noop` (the step ledger's outcome, except a
+`ci_pending` wait), a sweep that self-reports a no-op (the `noop-cooldown
+record` IPC), or a Curator-only stop the reaper classifies is counted per issue
+against a fingerprint of what the conclusion depends on: labels minus lane
+churn (`loom:issue`, `loom:curated`, the claim labels), non-bot comments,
 linked-PR state and `## Dependencies` state. An unchanged fingerprint extends
-the streak; a changed one restarts it.
+the streak; a changed one restarts it. The streak lives outside the step
+ledger, so Champion's promotion verdict, which clears every step cooldown on
+the item, does not reset it: a promote / Builder-no-op cycle parks at the
+threshold (#12024).
 
 **The streak is the fleet's (#12024).** Each host advertises its own count,
 with the fingerprint's digest, on the peer-claim channel (a `noop_streak` ad),
