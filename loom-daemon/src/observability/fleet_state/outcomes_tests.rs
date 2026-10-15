@@ -116,6 +116,7 @@ impl ForgeReads for Forge {
                 .filter(|(at, _)| clock.is_none_or(|now| *at <= now))
                 .cloned()
                 .collect(),
+            ..LabelHistory::default()
         })
     }
 }

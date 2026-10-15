@@ -73,6 +73,7 @@ use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, Telem
 pub mod enrich;
 mod flow;
 pub mod history;
+mod operator_recency;
 pub mod outcomes;
 mod pending_queue;
 mod pre_ready_journal;
@@ -388,6 +389,8 @@ pub struct RepoView {
     /// The repo's pending-human queue depth (#11955). Absent = unknown, never
     /// zero.
     pub pending_queue: Option<FleetQueueDepth>,
+    /// The repo's operator-action recency (#11956). Absent = unknown.
+    pub operator_recency: Option<crate::telemetry::kinds::fleet_state::FleetOperatorRecency>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -764,6 +767,7 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         triage_flow: state.and_then(|r| r.triage_flow),
         curator: state.and_then(|r| r.curator.clone()),
         pending_queue: state.and_then(|r| r.pending_queue),
+        operator_recency: state.and_then(|r| r.operator_recency),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -868,6 +872,7 @@ pub fn decide(
             && now_state.triage_flow == was.triage_flow
             && now_state.curator == was.curator
             && now_state.pending_queue == was.pending_queue
+            && now_state.operator_recency == was.operator_recency
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -1145,7 +1150,7 @@ pub(super) async fn record(
         annotate_triage(&mut view, &mut live.triage_flow, Some(&triage_sets), now);
     }
     // A repo whose listing was incomplete this pass drops out: unknown.
-    pending_queue::observe(&mut view, eligible);
+    pending_queue::observe(&mut view, eligible, now);
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;
@@ -1181,7 +1186,7 @@ async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_po
         // last collector-pass observation (#11642).
         annotate_triage(&mut view, &mut live.triage_flow, None, now);
     }
-    pending_queue::restamp(&mut view);
+    pending_queue::restamp(&mut view, now);
     send(sink, workspace_root, view, state, now, &reused);
 }
 
