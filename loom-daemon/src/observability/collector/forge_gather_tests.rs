@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{forge_gather_loop, AbortOnDrop};
+use super::{forge_gather_loop, supervise_forge_gathers, AbortOnDrop};
 
 const PERIOD: Duration = Duration::from_secs(300);
 
@@ -112,4 +112,33 @@ fn run_collector_never_awaits_a_forge_gather_inline() {
         "run_collector must spawn the forge gathers (spawn_forge_gathers), never await them in its select"
     );
     assert!(body.contains("spawn_forge_gathers("), "run_collector spawns the forge gathers");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_gather_is_restarted_after_one_interval() {
+    let boot = Instant::now();
+    let starts: Starts = Arc::default();
+    let shared = Arc::clone(&starts);
+    let _task = AbortOnDrop(tokio::spawn(supervise_forge_gathers(
+        boot,
+        PERIOD,
+        move || Arc::clone(&shared),
+        |s: &mut Starts| {
+            let s = Arc::clone(s);
+            Box::pin(async move {
+                let pass = {
+                    let mut v = s.lock().unwrap();
+                    v.push(Instant::now());
+                    v.len()
+                };
+                assert!(pass != 1, "pass 1 panics");
+            })
+        },
+    )));
+
+    tokio::time::sleep(PERIOD * 3 + Duration::from_secs(10)).await;
+    let offsets: Vec<Duration> = starts.lock().unwrap().iter().map(|t| *t - boot).collect();
+    // Pass 1 panics at 0; the supervisor waits one interval, then the
+    // restarted loop gathers at P, 2P, 3P.
+    assert_eq!(offsets, vec![Duration::ZERO, PERIOD, PERIOD * 2, PERIOD * 3]);
 }

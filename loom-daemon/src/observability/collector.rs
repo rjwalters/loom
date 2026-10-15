@@ -1048,19 +1048,77 @@ impl Drop for AbortOnDrop {
 }
 
 /// Spawn the collector's forge gathers on a task of their own (see
-/// [`forge_gather_loop`]). The task keeps its own slug memo: the cache is
-/// only a `gh repo view` memoization, so a second copy costs at most one
-/// extra lookup per workspace and shares no lock with the host samples.
+/// [`forge_gather_loop`]), under [`supervise_forge_gathers`] so a panic in a
+/// gather is logged and the loop restarts instead of ending silently. The
+/// task keeps its own slug memo: the cache is only a `gh repo view`
+/// memoization, so a second copy costs at most one extra lookup per
+/// workspace and shares no lock with the host samples.
 fn spawn_forge_gathers(
     first: tokio::time::Instant,
     period: Duration,
     workspace_root: PathBuf,
     workspace_pool: Arc<WorkspacePool>,
 ) -> AbortOnDrop {
-    let state = (workspace_root, workspace_pool, HashMap::<String, String>::new());
-    AbortOnDrop(tokio::spawn(forge_gather_loop(first, period, state, |(root, pool, cache)| {
-        Box::pin(forge_gathers(root, pool, cache))
-    })))
+    AbortOnDrop(tokio::spawn(supervise_forge_gathers(
+        first,
+        period,
+        move || {
+            (
+                workspace_root.clone(),
+                Arc::clone(&workspace_pool),
+                HashMap::<String, String>::new(),
+            )
+        },
+        |(root, pool, cache)| Box::pin(forge_gathers(root, pool, cache)),
+    )))
+}
+
+/// Run [`forge_gather_loop`] as a child task and restart it if it dies. On a
+/// panic the payload is logged at ERROR, the supervisor waits one `period`,
+/// then restarts the loop with fresh state from `make` (a fresh slug memo in
+/// production). Dropping the supervisor drops the child's guard, aborting it.
+async fn supervise_forge_gathers<S, G, M>(
+    first: tokio::time::Instant,
+    period: Duration,
+    mut make: M,
+    gather: G,
+) where
+    M: FnMut() -> S,
+    S: Send + 'static,
+    G: for<'a> FnMut(
+            &'a mut S,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+        + Clone
+        + Send
+        + 'static,
+{
+    let mut start = first;
+    loop {
+        let mut child =
+            AbortOnDrop(tokio::spawn(forge_gather_loop(start, period, make(), gather.clone())));
+        match (&mut child.0).await {
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                log::error!(
+                    "observability: forge gather panicked ({msg}); restarting the forge gathers in {}s",
+                    period.as_secs()
+                );
+            }
+            Err(_) => return, // cancelled: the collector is shutting down
+            Ok(()) => log::error!(
+                "observability: forge gather loop exited unexpectedly; restarting in {}s",
+                period.as_secs()
+            ),
+        }
+        tokio::time::sleep(period).await;
+        start = tokio::time::Instant::now();
+    }
 }
 
 /// The forge-gather schedule: first pass at `first` (when the startup-jitter
