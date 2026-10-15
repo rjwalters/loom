@@ -35,8 +35,16 @@ fn defaults() -> Config {
     Config::from_effective(&json!({}), &no_env)
 }
 
+/// A `fleet.captainGauges` block, with the stage-dwell sampler switched on
+/// (#12203) so `stage-dwell` is among the jobs.
 fn config(block: Value) -> Config {
-    Config::from_effective(&json!({ "fleet": { "captainGauges": block } }), &no_env)
+    Config::from_effective(
+        &json!({
+            "fleet": { "captainGauges": block },
+            "observability": { "stageDwell": { "enabled": true } },
+        }),
+        &no_env,
+    )
 }
 
 fn facts(as_of: DateTime<Utc>, repos: &[&str]) -> JobFacts {
@@ -434,6 +442,19 @@ fn dispatcher() -> Role {
     Role::Dispatcher {
         captain: CAPTAIN.into(),
     }
+}
+
+#[test]
+fn stage_dwell_is_not_a_job_while_its_sampler_is_off() {
+    // #12203: the default, so the captain arms nothing and no dispatcher
+    // reports a `stage-dwell` fallback.
+    let off = Config::from_effective(
+        &json!({ "fleet": { "captainGauges": { "enabled": true, "standDown": true } } }),
+        &no_env,
+    );
+    assert!(!off.stage_dwell);
+    assert!(off.jobs().is_empty());
+    assert!(defaults().jobs().is_empty());
 }
 
 #[test]

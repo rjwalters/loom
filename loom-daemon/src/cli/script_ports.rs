@@ -764,23 +764,11 @@ pub(crate) enum MergePrCommand {
     /// Refuse a PR carrying `loom:pr` alongside a contradicting label.
     VerdictContradiction(super::merge_pr_labels::VerdictContradictionArgs),
 
-    /// Refuse a merge whose required checks ran before the base branch's
-    /// current tip (#8248): a stale green ratchet result is evidence about a
-    /// tree that no longer exists. Exit 0+CLEAN = fresh, 1 = stale, 2 =
-    /// could not determine (must also refuse).
-    StaleChecks(super::merge_pr_stale_checks::StaleChecksArgs),
-
     /// Run the repo's `merge.treeChecks` against the merge tree (base + PR
     /// head) in a temp dir (#10026). Exit 0+CLEAN = pass/none declared (or
     /// BYPASSED under --allow-red-tree), 1 = a check failed (comment posted),
     /// 2 = could not run (must also refuse).
     TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
-
-    /// Refuse a merge whose head's latest `CI` workflow run did not conclude
-    /// `success` (#10444), naming the cancelled/failed jobs. Exit 0+CLEAN =
-    /// success, 0+UNVERIFIED = no definite verdict (caller warns), 1 = refuse,
-    /// 2 = forge unreachable (caller warns).
-    CiResult(super::merge_pr_ci_result::CiResultArgs),
 
     /// Refuse a plain (non-`--auto`) merge whose head has a required context
     /// that concluded red (#10688); hold (exit 3) on a missing/pending one.
@@ -801,17 +789,6 @@ pub(crate) enum MergePrCommand {
     /// freshly-read head. Exit 0 + sentinel = retry authorized, 1 = foreign
     /// head move (re-queue), 2 = attribution undeterminable (also re-queue).
     HeadSyncRetry(super::merge_pr_head_sync::HeadSyncRetryArgs),
-
-    /// The automated remedy for a merge the #8248 freshness guard blocked:
-    /// first re-run the workflow runs holding the stale required checks IN
-    /// PLACE (#8914, needs Actions: write; no commit, verdict kept), else push
-    /// a tree-identical no-op commit so CI re-dates every check (#8508).
-    /// Exit 5 = re-ran in place and fresh (only with --allow-proceed), 0 =
-    /// re-running in place / fresh without opt-in / pushed (re-queue), 3 =
-    /// head already moved (not a failure, re-evaluate fresh), 4 = push remedy
-    /// already spent on this head, so the PR was escalated to a durable
-    /// `loom:operator` hold, 1 = could not produce fresh evidence.
-    RedateChecks(super::merge_pr_redate::RedateChecksArgs),
 
     /// Read-only report of which required checks and paths forced the #8508
     /// re-dates (#9746), from the trailers on the re-date commits reachable
@@ -1155,12 +1132,9 @@ impl MergePrCommand {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::MergeableRecheck(args) => args.run(),
-            MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
-            MergePrCommand::CiResult(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
-            MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::LoomPrOverrideComment(args) => args.run(),
