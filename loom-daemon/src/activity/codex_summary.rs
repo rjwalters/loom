@@ -11,8 +11,16 @@
 //!
 //! The adapter reads timestamps, ids, the model name, token counters and tool
 //! *names* — never a prompt, a tool's arguments or its output. Files are opened
-//! only through [`crate::codex_usage::read_rollouts`], whose guard refuses
-//! everything but `sessions/**/rollout-*.jsonl`.
+//! only through [`crate::codex_usage::RolloutPath::read_capped`], whose guard
+//! refuses everything but `sessions/**/rollout-*.jsonl`.
+//!
+//! # Memory discipline
+//!
+//! The same as the Claude pass: each rollout is `stat`ed first, an unchanged
+//! one (ledger size+mtime) is skipped without being opened, one over
+//! [`IngestOptions::max_transcript_bytes`] is skipped and counted in
+//! `skipped_oversize`, and only then is one file read, under that same byte
+//! ceiling. At most one rollout is held in memory at a time.
 //!
 //! # What stays absent
 //!
@@ -104,7 +112,9 @@ pub fn parse_rollout(lines: &[String]) -> Option<ParsedTranscript> {
 }
 
 /// Summarize every changed Codex rollout in the pass window, once per file
-/// version (the same size+mtime ledger the Claude pass uses).
+/// version (the same size+mtime ledger the Claude pass uses). Codex rollouts
+/// count into the pass's shared `skipped_by_window` / `skipped_unchanged` /
+/// `skipped_oversize` counters.
 ///
 /// # Errors
 ///
@@ -114,30 +124,60 @@ pub fn ingest_codex(db: &ActivityDb, opts: &IngestOptions, stats: &mut IngestSta
         return Ok(());
     }
     let window = opts.since.map(|since| (since, Utc::now()));
-    for rollout in crate::codex_usage::read_rollouts(opts.codex_home_dir.as_deref(), window) {
-        let Ok(meta) = std::fs::metadata(&rollout.path) else {
+    for rollout in crate::codex_usage::rollout_paths(opts.codex_home_dir.as_deref(), window) {
+        let path = rollout.path();
+        let Ok(meta) = std::fs::metadata(path) else {
             continue;
         };
         let modified: DateTime<Utc> = meta.modified().map_or_else(|_| Utc::now(), Into::into);
         if opts.since.is_some_and(|since| modified < since) {
+            stats.skipped_by_window += 1;
             continue;
         }
         let size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
         let mtime = modified.timestamp();
-        let key = ledger_key(&rollout.path);
+        let key = ledger_key(path);
         let previous = lookup_ledger(db, &key)?;
         if !opts.force
             && previous
                 .as_ref()
                 .is_some_and(|p| p.file_size == size && p.file_mtime == mtime)
         {
+            stats.skipped_unchanged += 1;
             continue;
         }
-        let Some(parsed) = parse_rollout(&rollout.lines) else {
+        if meta.len() > opts.max_transcript_bytes {
+            log::warn!(
+                "transcript-ingest: skipping oversized Codex rollout {} ({} bytes)",
+                path.display(),
+                meta.len()
+            );
+            stats.skipped_oversize += 1;
+            continue;
+        }
+        // Bounded by the same ceiling, so a rollout that grew past it since
+        // the stat above is still not loaded whole.
+        let Some(lines) = rollout.read_capped(opts.max_transcript_bytes) else {
+            log::warn!(
+                "transcript-ingest: skipping Codex rollout {} (unreadable or over {} bytes)",
+                path.display(),
+                opts.max_transcript_bytes
+            );
+            stats.skipped_oversize += 1;
             continue;
         };
-        emit_session_records(opts, stats, &rollout.path, &parsed, RUNTIME);
-        let session = parsed.session_id.clone().unwrap_or_else(|| key.clone());
+        let parsed = parse_rollout(&lines);
+        drop(lines);
+        let session = match parsed {
+            Some(parsed) => {
+                emit_session_records(opts, stats, path, &parsed, RUNTIME);
+                parsed.session_id.unwrap_or_else(|| key.clone())
+            }
+            // Remembered anyway, like the Claude pass's usage-free
+            // transcripts, so an unsummarizable rollout is not re-read every
+            // pass; it is re-read once it changes.
+            None => key.clone(),
+        };
         upsert_ledger(&db.conn, &key, &session, None, size, mtime, 0)?;
     }
     Ok(())

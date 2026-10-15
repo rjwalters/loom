@@ -168,3 +168,108 @@ fn ingest_emits_once_per_rollout_version_and_reads_nothing_outside_sessions() {
     ingest_codex(&db, &opts, &mut stats).unwrap();
     assert_eq!(stats.session_summaries, 1);
 }
+
+/// A Codex home under `tmp` with one fixture rollout; returns its path.
+fn write_fixture_rollout(tmp: &Path) -> std::path::PathBuf {
+    let day = tmp.join(".codex/sessions/2026/09/21");
+    std::fs::create_dir_all(&day).unwrap();
+    let path = day.join("rollout-2026-09-21T02-06-31-sess-1.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    for l in rollout() {
+        writeln!(file, "{l}").unwrap();
+    }
+    path
+}
+
+fn summary_opts(tmp: &Path) -> IngestOptions {
+    let sink = SessionSummarySink::new(
+        std::sync::Arc::new(DurableQueue::open(tmp.join("queue.jsonl"), 100)),
+        "host-test",
+    );
+    IngestOptions {
+        summary_sink: Some(sink),
+        include_codex: true,
+        codex_home_dir: Some(tmp.to_path_buf()),
+        ..IngestOptions::default()
+    }
+}
+
+#[test]
+fn an_unchanged_rollout_is_skipped_without_being_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write_fixture_rollout(tmp.path());
+    let db = ActivityDb::new(tmp.path().join("activity.db")).unwrap();
+    let opts = summary_opts(tmp.path());
+
+    let mut first = IngestStats::default();
+    ingest_codex(&db, &opts, &mut first).unwrap();
+    assert_eq!(first.session_summaries, 1);
+    assert_eq!(first.skipped_unchanged, 0);
+
+    // Unreadable from here on: a pass that opened it would fail to read it
+    // and count it oversize/unreadable. Size and mtime are untouched, so the
+    // ledger must skip it on the stat alone.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let mut second = IngestStats::default();
+    ingest_codex(&db, &opts, &mut second).unwrap();
+    assert_eq!(second.skipped_unchanged, 1, "{second:?}");
+    assert_eq!(second.skipped_oversize, 0, "never opened: {second:?}");
+    assert_eq!(second.session_summaries, 0);
+}
+
+#[test]
+fn an_unsummarizable_rollout_is_ledgered_and_not_reread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let day = tmp.path().join(".codex/sessions/2026/09/21");
+    std::fs::create_dir_all(&day).unwrap();
+    // Meta and tools, no token usage: no summary, but no re-read either.
+    let mut file = std::fs::File::create(day.join("rollout-2026-09-21T02-06-31-x.jsonl")).unwrap();
+    for l in rollout().into_iter().take(7) {
+        writeln!(file, "{l}").unwrap();
+    }
+    drop(file);
+    let db = ActivityDb::new(tmp.path().join("activity.db")).unwrap();
+    let opts = summary_opts(tmp.path());
+    let mut stats = IngestStats::default();
+    ingest_codex(&db, &opts, &mut stats).unwrap();
+    assert_eq!(stats.session_summaries, 0);
+    ingest_codex(&db, &opts, &mut stats).unwrap();
+    assert_eq!(stats.skipped_unchanged, 1, "{stats:?}");
+}
+
+#[test]
+fn an_oversized_rollout_is_skipped_and_counted_not_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write_fixture_rollout(tmp.path());
+    let len = std::fs::metadata(&path).unwrap().len();
+    let db = ActivityDb::new(tmp.path().join("activity.db")).unwrap();
+    let opts = IngestOptions {
+        max_transcript_bytes: len - 1,
+        ..summary_opts(tmp.path())
+    };
+    let mut stats = IngestStats::default();
+    ingest_codex(&db, &opts, &mut stats).unwrap();
+    assert_eq!(stats.skipped_oversize, 1, "{stats:?}");
+    assert_eq!(stats.session_summaries, 0);
+    // Not ledgered: raising the ceiling later lets it through.
+    let mut stats = IngestStats::default();
+    ingest_codex(&db, &summary_opts(tmp.path()), &mut stats).unwrap();
+    assert_eq!(stats.session_summaries, 1, "{stats:?}");
+}
+
+#[test]
+fn the_capped_reader_refuses_a_file_over_the_ceiling() {
+    // The read itself is bounded too, for a rollout that grows past the
+    // ceiling between the stat and the read.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write_fixture_rollout(tmp.path());
+    let len = std::fs::metadata(&path).unwrap().len();
+    let rollouts = crate::codex_usage::rollout_paths(Some(tmp.path()), None);
+    assert_eq!(rollouts.len(), 1);
+    assert!(rollouts[0].read_capped(len - 1).is_none());
+    assert_eq!(rollouts[0].read_capped(len).unwrap().len(), rollout().len());
+}
