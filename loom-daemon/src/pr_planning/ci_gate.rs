@@ -44,7 +44,7 @@ pub(super) const CACHE_TTL: Duration = Duration::from_secs(60);
 /// every check-run page up to [`backstop::MAX_CHECK_RUN_PAGES`], then the
 /// legacy commit statuses. Stops at the first read that is pending, so the
 /// usual cost is one call; an unreadable read counts as not pending.
-pub(super) fn ci_pending(
+pub fn ci_pending(
     sha: &str,
     now: DateTime<Utc>,
     mut get: impl FnMut(&str) -> Option<Value>,
@@ -96,6 +96,15 @@ pub(super) fn cached(root: &Path, sha: &str, read: impl FnOnce() -> bool) -> boo
         c.insert(key, (pending, now));
     }
     pending
+}
+
+/// The cached answer for head `sha` of the repository at `root`, when one is
+/// still fresh; never reads. Lets a budgeted caller (the step draw's Judge
+/// hold, #12042) spend its reads on heads it has no answer for.
+pub fn cached_answer(root: &Path, sha: &str) -> Option<bool> {
+    let key = (root.to_path_buf(), sha.to_string());
+    let hit = cache().lock().ok().and_then(|c| c.get(&key).copied())?;
+    (hit.1.elapsed() < CACHE_TTL).then_some(hit.0)
 }
 
 /// Forget every cached answer (tests that change CI under one head).
