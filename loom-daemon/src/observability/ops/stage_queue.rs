@@ -146,6 +146,15 @@ pub(super) async fn walk_counts(
         );
         if let Ok(rows) = &rows {
             reconcile_refusals(&root, &slug, rows);
+            // #12118: the same complete walk journals `issue.estimate` for
+            // freshly curated issues, so no Curator CLI call is needed.
+            crate::telemetry::kinds::issue_estimate::observe::observe(
+                &root,
+                &slug,
+                rows,
+                &crate::comment_trust::TrustPolicy::for_root(&root),
+                chrono::Utc::now(),
+            );
         }
         rows
     })
