@@ -477,6 +477,8 @@ fn record(
         labels_removed: Vec::new(),
         mode: PassMode::On,
         applied: p.wrote,
+        unevaluated_reason: None,
+        budget: None,
         at: evaluated_at,
         step: StepFacts {
             head_sha: p.head_sha,

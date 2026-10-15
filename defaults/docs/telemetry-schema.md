@@ -2616,6 +2616,8 @@ and `INFO` otherwise.
 | `examined` | integer | artifacts listed |
 | `verdicts` | object | artifacts per verdict, every verdict present |
 | `skipped` | object | skipped artifacts per reason (exported flattened as `loom.pass.skip_reasons`, `name=count,…`) |
+| `unevaluated_reasons` | object | unevaluated artifacts per `unevaluated_reason`, every reason present, zeros included (exported flattened as `loom.pass.unevaluated_reasons`, `name=count,…`) |
+| `budget` | object? | `{core_start, core_end, graphql_start, graphql_end, core_floor, graphql_floor}` (`loom.pass.budget.*`, ints). `*_start` is the probe the pass already makes; `*_end` is the latest reading the pass saw with an answer it already received, **not a fresh probe**. A reading the pass never took is absent, never `0` |
 | `write_cap_hit` | bool | `LOOM_RELEASE_STALE_BLOCKED_MAX_WRITES` left work for the next pass |
 | `github` | object | `{calls, writes, not_modified}` inside the pass's caller scope |
 | `verdicts_emitted` / `verdicts_unchanged` | integer | verdict records emitted, and held back as unchanged |
@@ -2630,7 +2632,9 @@ and `INFO` otherwise.
 | `repo` / `number` / `artifact` | string / integer / string | `artifact` is `issue` or `pr` |
 | `verdict` | string | release pass: `released`, `reparked`, `still_blocked`, `skipped`, `unevaluated`, `failed` |
 | `reason` | string? | for `skipped`, the pass's skip reason: `no-park-record`, `unstated`, `cross-repo`, `closed-unmerged-pr`, `other-open-reference`, `open-closing-pr`, `unticked-checklist`, `superseded`, `operator-hold`, `permanent`, `daemon-hold`, `concurrent-edit`, `write-cap` |
-| `detail` | string? | why it was unevaluated, or why a write failed. Sanitized and truncated, and in the body only |
+| `detail` | string? | why it was unevaluated, or why a write failed. Sanitized and truncated, and in the body only. A cut detail backs off to the last whole word and ends `...` |
+| `unevaluated_reason` | string? | for `unevaluated`: `budget_floor_core`, `budget_floor_graphql`, `read_failed` or `other` (`loom.pass.unevaluated_reason`). Typed where the cause arises; never parse `detail` |
+| `budget` | object? | for a floor reason: `{bucket, remaining, floor}` (`loom.pass.budget.bucket/remaining/floor`) |
 | `blockers` | array | `{ref, state}` per declared blocker: `ref` is `#12` or `owner/repo#12`; `state` is `open`, `closed`, `merged`, `closed_unmerged`, `unread` (the read failed) or `not_read` |
 | `labels_added` / `labels_removed` | string[] | a release's restored lane label and `loom:blocked` (planned, under dry-run) |
 | `mode` / `applied` | string / bool | `applied`: every write landed (`false` under dry-run) |
@@ -2716,6 +2720,28 @@ row under "GitHub rate limit" above): `github.caller` inside a caller scope,
 (passes per repo with skips by reason and calls by operation, why each
 artifact is still held, and which mechanism removed each `loom:blocked`):
 `defaults/observability/signoz/pass-queries.sql`.
+
+Two queries for the unevaluated pile (#12036), no regex needed:
+
+```sql
+-- Unevaluated items by cause, last 6 h.
+SELECT attributes_string['loom.pass.unevaluated_reason'] AS reason, count() AS items
+FROM signoz_logs.distributed_logs_v2
+WHERE attributes_string['loom.pass.verdict'] = 'unevaluated'
+  AND timestamp > now() - INTERVAL 6 HOUR
+GROUP BY reason ORDER BY items DESC;
+
+-- Core budget at the end of each pass against its floor, next to its calls.
+SELECT toStartOfFiveMinute(fromUnixTimestamp64Nano(toInt64(timestamp))) AS t,
+       attributes_string['loom.repo'] AS repo,
+       attributes_number['loom.pass.budget.core_end'] AS core_end,
+       attributes_number['loom.pass.budget.core_floor'] AS core_floor,
+       attributes_number['loom.pass.github_calls'] AS github_calls
+FROM signoz_logs.distributed_logs_v2
+WHERE attributes_string['loom.pass.mechanism'] = 'stale_blocked_release'
+  AND attributes_string['loom.kind'] = 'pass.summary'
+ORDER BY t;
+```
 
 ### `fleet.state`
 
