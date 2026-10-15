@@ -312,7 +312,9 @@ refresh path, no second round counter.
   wall-clock bound hit. The caller re-runs the **identical** command (same
   pin, same 600000 ms tool timeout) only on `next=reinvoke`.
 - **Re-check after the wait.** In auto-refresh mode `_revalidate_merge_guards`
-  re-runs the #8248 guard on the head about to be merged, so a base move during
+  re-runs the #8248 guard on the head about to be merged as its LAST gate,
+  after the `loom:pr`, contradiction and settled-CI re-checks (a revoked
+  approval or red run is refused before any push), so a base move during
   the refreshed head's CI refreshes again instead of merging on stale evidence
   (the #8410 residual). The input-scoped predicate (#8919) refuses only when
   the move touches this PR's inputs.
@@ -322,7 +324,8 @@ refresh path, no second round counter.
   head, or `verdict_equivalence` (the implementation
   `verdict-staleness-guard.sh` uses) answers `tree` or `clean-merge`.
   `rebase-patch-identical`, changed, indeterminate, or no trusted marker:
-  exit **3** with `next=judge`, nothing merged.
+  exit **3** with `next=judge`, nothing merged. A failed forge read here is
+  exit **5** (re-queue), never a "Merge Failed" (#9096).
 
 | Setting | env (wins) | `.loom/config.json` | default |
 |---|---|---|---|

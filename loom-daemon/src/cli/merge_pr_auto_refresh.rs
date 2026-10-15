@@ -11,7 +11,8 @@
 //! | `stale` | backoff deferral / sync conflict | `LOOM-AUTO-REFRESH next=requeue …` | 4 |
 //! | `stale` | rounds and sync handoffs spent (`loom:operator` kept) | `LOOM-AUTO-REFRESH-EXHAUSTED pr=N spent=k budget=B` | 6 |
 //! | `stale` | branch moved before the push | `LOOM-AUTO-REFRESH-HEAD-MOVED current=S` | 3 |
-//! | `stale`/`verdict` | remedy or forge read failed | `LOOM-AUTO-REFRESH-FAILED` + reason | 1 |
+//! | `stale` | remedy failed | `LOOM-AUTO-REFRESH-FAILED` + reason | 1 |
+//! | `verdict` | forge read failed (re-queue, #9096) | `LOOM-AUTO-REFRESH-FAILED` + reason | 5 |
 //! | `verdict` | not a Loom refresh head, or the approval carries (`tree`/`clean-merge`) | `LOOM-AUTO-REFRESH-CLEAR` | 0 |
 //! | `verdict` | the approval does not carry | `LOOM-AUTO-REFRESH next=judge …` | 3 |
 //! | `timeout` | Loom refresh head, CI pending | `LOOM-AUTO-REFRESH next=reinvoke\|requeue …` | 0 |

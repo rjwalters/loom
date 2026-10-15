@@ -81,10 +81,10 @@
 //! forges evidence — it only produces a new commit for CI to run against for
 //! real. The #8248 guard is left completely unweakened: the NEXT merge attempt
 //! still requires a check that actually started at/after the (possibly
-//! still-moving) base tip. It also moves the head SHA, which — correctly, per
-//! #5686 — invalidates any standing Judge approval; the PR is expected to
-//! cycle back through Judge once CI on the new head is green, exactly as any
-//! other push would.
+//! still-moving) base tip. It also moves the head SHA: the standing approval
+//! carries to the new head only through a `tree` equivalence (#9416/#9576)
+//! against a trusted verdict-sha marker; an approval with no such marker
+//! (#9258) cycles back through Judge, exactly as after any other push.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -276,9 +276,9 @@ check's green result predates the current base-branch tip, and this repo's merge
 has no `actions:write` to re-run that check directly. Pushed a **tree-identical** no-op \
 commit (`{short}`) instead — the diff is byte-for-byte unchanged, but every required \
 check now re-runs against a current timestamp.\n\n\
-This moves the head SHA, which invalidates the standing Judge approval (#5686). Expect \
-this PR to cycle back through `loom:review-requested` once CI on `{short}` completes, \
-then merge normally once re-approved.\n\n\
+The standing Judge approval carries to `{short}` only through a `tree` equivalence \
+(#9416/#9576) against its trusted verdict-sha marker; an approval with no such marker \
+(#9258) cycles back through `loom:review-requested` before this PR merges.\n\n\
 The #8248 guard itself is unchanged and still applies to the next merge attempt. This is \
 re-date {n} of a budget of {budget} for this chain of tree-identical heads (#9590); once the \
 budget is spent, a further block escalates to `{HOLD_LABEL}`.",

@@ -255,6 +255,9 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // #10581: parses markers out of bodies `forge_verdict_cmd` already read
         // through `fetch_trusted_comments`; it fetches nothing itself.
         ("verdict_gate.rs", "parses already-filtered bodies"),
+        // #12014: `trusted_listing` reads the PR's comments through
+        // `TrustPolicy::trusted_listing` before any marker is parsed.
+        ("merge_pr/auto_refresh.rs", "reader via TrustPolicy::trusted_listing (#12014)"),
         ("verdict_gate/tests.rs", "test"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),

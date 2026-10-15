@@ -155,7 +155,7 @@ fn redate_comment_body_records_the_marker_and_explains_the_re_review() {
     assert!(body.starts_with(&redate_marker("abc1234def")));
     assert!(body.contains(&budget::attempt_marker("abc1234def", 2)), "{body}");
     assert!(body.contains("2 of 3"), "{body}");
-    for needle in ["#8248", "#8508", "tree-identical", "#5686", "abc1234"] {
+    for needle in ["#8248", "#8508", "tree-identical", "#9416", "abc1234"] {
         assert!(body.contains(needle), "body should mention {needle:?}: {body}");
     }
 }

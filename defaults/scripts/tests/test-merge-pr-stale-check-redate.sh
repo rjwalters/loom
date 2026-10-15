@@ -378,17 +378,18 @@ AUTO_MERGE=false
 
 # --- #12014: the post-wait gate in _revalidate_merge_guards ----------------
 #
-# After the settle-wait the verdict gate runs, and on CLEAR the #8248 guard
-# re-runs on the head about to merge: a base move during the wait must
-# refresh again (exit 4), never merge on stale evidence.
+# After the settle-wait and the loom:pr / CI re-checks, the verdict gate runs
+# LAST, and on CLEAR the #8248 guard re-runs on the head about to merge: a
+# base move during the wait must refresh again (exit 4), never merge on stale
+# evidence; a revoked approval or a red run must refuse before any push.
 REVAL_FILE="$STUB_DIR/reval.sh"
 awk '/^_revalidate_merge_guards\(\) \{/ {on=1} on {print} on && /^}/ {exit}' "$MERGE_PR_SRC" > "$REVAL_FILE"
 # shellcheck disable=SC1090
 source "$REVAL_FILE"
 forge_get_pr_nocache() { echo '{"head":{"sha":"deadbeef"},"labels":[{"name":"loom:pr"}]}'; }
-_check_loom_pr_label() { echo "LABEL-CHECKED"; }
+_check_loom_pr_label() { echo "LABEL-CHECKED"; [ "${LABEL:-ok}" = ok ] || { echo "ERROR: loom:pr gone" >&2; exit 1; }; }
 _check_verdict_label_contradiction() { :; }
-_check_ci_result() { :; }
+_check_ci_result() { [ "${CI:-ok}" = ok ] || { echo "ERROR: CI red" >&2; exit 1; }; }
 GH=gh; MERGE_PRECONDITION_SHA="deadbeef"
 # A stub that answers revalidate-head CLEAR, auto-refresh per phase
 # ($AR_VERDICT for verdict, $AR_MODE for stale) and stale-checks per $STALE.
@@ -405,6 +406,7 @@ case "$2" in
           clear) echo LOOM-AUTO-REFRESH-CLEAR ;;
           judge) printf 'LOOM-AUTO-REFRESH next=judge pr=8493 round=1/3 head=deadbeef\nnot equivalent\n'; exit 3 ;;
           off) echo LOOM-AUTO-REFRESH-OFF ;;
+          readfail) printf 'LOOM-AUTO-REFRESH-FAILED\ncould not read comments\n'; exit 5 ;;
           *) exit 2 ;;
         esac ;;
       stale) printf 'LOOM-AUTO-REFRESH next=reinvoke pr=8493 round=2/3 head=cafe1234\npushed\n'; exit 4 ;;
@@ -424,7 +426,24 @@ STALE=stale AR_VERDICT=clear LOOM_DAEMON_BIN="$REVAL_STUB" run_reval
 assert_eq "4" "$LAST_RC" "base moved during the wait -> next round (exit 4), never a merge"
 assert_contains "$LAST_OUT" "LOOM-AUTO-REFRESH next=reinvoke pr=8493 round=2/3" "the next round's sentinel is printed"
 assert_contains "$(cat "$STUB_DIR/argv-stale-checks" 2>/dev/null)" "--head-sha deadbeef" "the re-check runs on the head about to merge"
-assert_not_contains "$LAST_OUT" "LABEL-CHECKED" "nothing past the re-check runs"
+assert_contains "$LAST_OUT" "LABEL-CHECKED" "the loom:pr re-check runs BEFORE the refreshing re-check"
+
+# T25b: loom:pr revoked (or CI red) during the wait -> refused, and no
+# refresh push: neither the verdict gate nor the freshness re-check is asked.
+for gate in LABEL CI; do
+    reset_argv
+    if [[ $gate == LABEL ]]; then LABEL=revoked STALE=stale AR_VERDICT=clear LOOM_DAEMON_BIN="$REVAL_STUB" run_reval
+    else CI=red STALE=stale AR_VERDICT=clear LOOM_DAEMON_BIN="$REVAL_STUB" run_reval; fi
+    assert_eq "1" "$LAST_RC" "$gate revoked during the wait -> refused (exit 1)"
+    assert_eq "" "$(ar_calls)" "$gate revoked during the wait -> the auto-refresh verb is never asked"
+    assert_eq "no" "$([[ -f "$STUB_DIR/argv-stale-checks" ]] && echo yes || echo no)" "$gate revoked during the wait -> no refresh push"
+done
+
+# T25c: the verdict gate's forge read failed -> exit 5 (re-queue), never a merge or a failure.
+reset_argv
+STALE=stale AR_VERDICT=readfail LOOM_DAEMON_BIN="$REVAL_STUB" run_reval
+assert_eq "5" "$LAST_RC" "verdict-phase read failure -> exit 5 (re-queue, #9096)"
+assert_contains "$LAST_OUT" "could not read comments" "the read failure is named"
 
 # T26: fresh after the wait -> falls through to the label re-check (merge).
 reset_argv

@@ -159,7 +159,8 @@
 #       or a required context is missing/pending on a plain merge (#10688).
 #       On a Loom-refreshed head --auto also prints `LOOM-AUTO-REFRESH
 #       next=reinvoke|requeue …` (#12014; reinvoke within
-#       merge.autoRefreshMaxWaitSecs, default 2700, of the refresh).
+#       merge.autoRefreshMaxWaitSecs, default 2700, of the refresh). Also
+#       (#12014) the post-wait verdict gate's forge read failed (re-queue).
 #   7 = held by a sequencing order (#11330): the PR carries loom:pr +
 #       loom:sequenced and no other blocker. Prints `LOOM-SEQUENCED-HOLD
 #       pr=<N> after=<M>`; the predecessor landing clears it (#9378). Re-queue
@@ -2216,14 +2217,14 @@ _revalidate_merge_guards() {
   case "${v%%$'\n'*}" in "LOOM-REVALIDATE MERGED") return 0 ;; "LOOM-REVALIDATE CLEAR") ;;
     "LOOM-REVALIDATE MOVED "*) error_head_moved "PR #$PR_NUMBER: head moved while --auto waited for this head's checks to settle (#8410)" "$MERGE_PRECONDITION_SHA" "${v#LOOM-REVALIDATE MOVED }" ;;
     *) error "Merge blocked: could not re-read PR #$PR_NUMBER after --auto's settle-wait — the uncached re-read returned no usable payload (no head SHA), so neither the head nor the label set could be re-validated against current state. This is a forge read failure, NOT a missing \`loom:pr\` label: refusing to merge rather than treating an unreadable response as a verdict. Re-run once the forge API is healthy." ;; esac
-  # #12014: on a Loom-refreshed head the approval must carry (tree/clean-merge, else exit 3 next=judge); then the #8248 guard re-runs on the head about to merge, so a base move during the wait refreshes again (exit 4/6), never merges. OFF / no answer = pre-#12014.
-  if _mp_ar verdict "$MERGE_PRECONDITION_SHA"; then case "$_AR_RC:${_AR_OUT%%[[:space:]]*}" in 0:LOOM-AUTO-REFRESH-CLEAR) PR_HEAD_SHA="$MERGE_PRECONDITION_SHA" _check_required_check_freshness ;; 3:LOOM-AUTO-REFRESH) printf '%s\n' "$_AR_OUT"; exit 3 ;; *) error "Merge blocked: PR #$PR_NUMBER's auto-refresh verdict gate (#12014) could not run: ${_AR_OUT#*$'\n'}" ;; esac; fi
   PR_LABELS=""; [[ "$v" != *$'\n'* ]] || PR_LABELS="${v#*$'\n'}"
   _check_loom_pr_label
   # #10567: the CI-run conclusion gate (deferred above while the run was still
   # in flight) is decided here against the head about to be merged. Joined onto
   # one line as a file-size/shell-budget offset.
   _check_verdict_label_contradiction; _check_ci_result settled
+  # #12014, LAST (after the loom:pr / CI gates, so a revoked approval or a red run never leads to a refresh push): on a Loom-refreshed head the approval must carry (tree/clean-merge, else exit 3 next=judge); then the #8248 guard re-runs on the head about to merge, so a base move during the wait refreshes again (exit 4/6), never merges. A failed read is exit 5 (re-queue, #9096). OFF / no answer = pre-#12014.
+  if _mp_ar verdict "$MERGE_PRECONDITION_SHA"; then case "$_AR_RC:${_AR_OUT%%[[:space:]]*}" in 0:LOOM-AUTO-REFRESH-CLEAR) PR_HEAD_SHA="$MERGE_PRECONDITION_SHA" _check_required_check_freshness ;; 3:LOOM-AUTO-REFRESH) printf '%s\n' "$_AR_OUT"; exit 3 ;; 5:LOOM-AUTO-REFRESH-FAILED) warning "PR #$PR_NUMBER: the auto-refresh verdict gate (#12014) could not read the forge: ${_AR_OUT#*$'\n'}. Exiting 5: re-queue, not a failure."; exit 5 ;; *) error "Merge blocked: PR #$PR_NUMBER's auto-refresh verdict gate (#12014) could not run: ${_AR_OUT#*$'\n'}" ;; esac; fi
 }
 
 if [[ "$AUTO_MERGE" == "true" ]]; then

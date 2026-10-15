@@ -25,16 +25,19 @@
 //!   `next=requeue` (exit 4); exhaustion is the new exit **6**, with the
 //!   existing `loom:operator` escalation unchanged (it is the only cross-pass
 //!   bound).
-//! - **`verdict`** — after the settle-wait, before the merge: on a head Loom
-//!   itself refreshed, the standing approval carries only when
-//!   [`crate::verdict_equivalence`] (the implementation
+//! - **`verdict`** — the LAST gate before the merge, after the settle-wait
+//!   and the `loom:pr` / CI re-checks (so a revoked approval or a red run
+//!   never leads to a refresh push): on a head Loom itself refreshed, the
+//!   standing approval carries only when [`crate::verdict_equivalence`] (the
+//!   implementation
 //!   `verdict-staleness-guard.sh` shells out to) answers `tree` or
 //!   `clean-merge` against the TRUSTED verdict-sha marker
 //!   ([`verdict_gate`]). Anything else — `rebase-patch-identical`, changed,
 //!   indeterminate, no trusted marker — is `next=judge` (exit 3), never a
 //!   merge. A `CLEAR` answer tells the shell to re-run the freshness guard on
 //!   the head about to be merged, so a base move during the refreshed head's
-//!   CI refreshes again instead of merging on stale evidence.
+//!   CI refreshes again instead of merging on stale evidence. A failed forge
+//!   read here is exit 5 (re-queue), never a "Merge Failed".
 //! - **`timeout`** — `merge-pr.sh` is about to exit 5 (CI still running at
 //!   the 420 s pin): on a Loom-refreshed head whose refresh record is younger
 //!   than `merge.autoRefreshMaxWaitSecs` it prints `next=reinvoke`, else
@@ -59,6 +62,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use super::redate::{self, budget, sync_handoff, BudgetConfig, RemedyOutcome};
+use crate::claim_reconciliation::gh_call;
 use crate::claim_reconciliation::{extract_latest_verdict_sha, VerdictKind};
 use crate::verdict_equivalence::{Equivalence, EquivalenceKind};
 
@@ -94,6 +98,8 @@ pub const EXIT_REFRESHED: i32 = 4;
 pub const EXIT_EXHAUSTED: i32 = 6;
 /// `merge-pr.sh`'s exit when the verdict does not carry (re-queue to Judge).
 pub const EXIT_JUDGE: i32 = 3;
+/// `merge-pr.sh`'s exit when the verdict gate's forge read failed (re-queue).
+pub const EXIT_READ_FAILED: i32 = 5;
 
 /// The resolved auto-refresh settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,40 +400,46 @@ pub fn run_stale(ctx: &Ctx) -> Decision {
     stale_decision(&outcome, &ctx.pr, &ctx.head, BudgetConfig::for_root(&root).budget)
 }
 
-/// The PR's trusted comment listing.
+/// The PR's trusted comment listing (#9548), read through the gh facade so
+/// each page is a counted request (W5). `per_page=100`: the markers are among
+/// the newest comments, so a long thread must be walked to its end.
 fn trusted_listing(gh: &str, ctx: &Ctx, root: &Path) -> Result<Vec<Value>, String> {
-    let raw = redate::gh_api_with(
-        gh,
-        &[
-            &format!("repos/{}/issues/{}/comments", ctx.nwo, ctx.pr),
-            "--paginate",
-        ],
-    )
+    let path = format!("repos/{}/issues/{}/comments?per_page=100", ctx.nwo, ctx.pr);
+    let out = gh_call::output(gh_call::read("verdict.pr_comments", Path::new(gh), root).args([
+        "api",
+        &path,
+        "--paginate",
+    ]))
     .map_err(|e| format!("could not read PR #{}'s comments: {e}", ctx.pr))?;
+    if !out.status.success() {
+        let why = gh_call::stderr(&out);
+        return Err(format!("could not read PR #{}'s comments: {why}", ctx.pr));
+    }
     crate::comment_trust::TrustPolicy::for_root(root)
-        .trusted_listing(raw.as_bytes())
+        .trusted_listing(&out.stdout)
         .ok_or_else(|| format!("PR #{}'s comment listing did not parse", ctx.pr))
 }
 
 /// The refresh mark for `ctx.head`, reading the head's first parent only
-/// when a base sync was ever recorded on the PR.
-fn mark_for(gh: &str, ctx: &Ctx, trusted: &[Value]) -> Option<RefreshMark> {
+/// when a base sync was ever recorded on the PR. A failed parent read is an
+/// error, never "not a refresh head": that would skip the verdict gate.
+fn mark_for(gh: &str, ctx: &Ctx, trusted: &[Value]) -> Result<Option<RefreshMark>, String> {
     let bodies = crate::comment_trust::records::bodies(trusted).join("\n");
-    let parent = (sync_handoff::handoffs_used(&bodies) > 0
-        && crate::verdict_equivalence::is_sha(&ctx.head))
-    .then(|| {
-        redate::gh_api_with(
-            gh,
-            &[
-                &format!("repos/{}/commits/{}", ctx.nwo, ctx.head),
-                "--jq",
-                ".parents[0].sha",
-            ],
-        )
-        .ok()
-    })
-    .flatten();
-    refresh_mark(trusted, &ctx.head, parent.as_deref())
+    let parent = if sync_handoff::handoffs_used(&bodies) > 0
+        && crate::verdict_equivalence::is_sha(&ctx.head)
+    {
+        let args = [
+            &format!("repos/{}/commits/{}", ctx.nwo, ctx.head),
+            "--jq",
+            ".parents[0].sha",
+        ];
+        let sha = redate::gh_api_with(gh, &args)
+            .map_err(|e| format!("could not read {}'s first parent: {e}", ctx.head))?;
+        Some(sha.trim().to_string())
+    } else {
+        None
+    };
+    Ok(refresh_mark(trusted, &ctx.head, parent.as_deref()))
 }
 
 /// `verdict`: the post-wait gate on a Loom-refreshed head.
@@ -438,12 +450,17 @@ pub fn run_verdict(ctx: &Ctx) -> Decision {
         return off();
     }
     let gh = crate::gh_invocation::gh_bin();
+    // A forge read that did not happen is a re-queue (exit 5), never a
+    // "Merge Failed" that parks a mergeable PR on a human (#9096).
+    let read_failed = |why: String| Decision::new(EXIT_READ_FAILED, format!("{FAILED}\n{why}"));
     let trusted = match trusted_listing(&gh, ctx, &root) {
         Ok(t) => t,
-        Err(why) => return Decision::new(1, format!("{FAILED}\n{why}")),
+        Err(why) => return read_failed(why),
     };
-    let Some(mark) = mark_for(&gh, ctx, &trusted) else {
-        return Decision::new(0, CLEAR.to_string());
+    let mark = match mark_for(&gh, ctx, &trusted) {
+        Ok(Some(mark)) => mark,
+        Ok(None) => return Decision::new(0, CLEAR.to_string()),
+        Err(why) => return read_failed(why),
     };
     let bodies = crate::comment_trust::records::bodies(&trusted);
     let marker = extract_latest_verdict_sha(&bodies, VerdictKind::Approved);
@@ -483,16 +500,14 @@ pub fn run_timeout(ctx: &Ctx, now: DateTime<Utc>) -> Decision {
         return Decision::new(0, String::new());
     };
     let gh = crate::gh_invocation::gh_bin();
-    let trusted = match trusted_listing(&gh, ctx, &root) {
-        Ok(t) => t,
+    let mark = trusted_listing(&gh, ctx, &root).and_then(|t| mark_for(&gh, ctx, &t));
+    match mark {
         Err(why) => {
             eprintln!("merge-pr auto-refresh: {why}; no re-invoke advice (re-queue)");
-            return Decision::new(1, String::new());
+            Decision::new(1, String::new())
         }
-    };
-    match mark_for(&gh, ctx, &trusted) {
-        None => Decision::new(0, String::new()),
-        Some(mark) => Decision::new(
+        Ok(None) => Decision::new(0, String::new()),
+        Ok(Some(mark)) => Decision::new(
             0,
             sentinel(
                 timeout_next(&mark, now, cfg.max_wait_secs),
