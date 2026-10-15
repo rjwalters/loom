@@ -239,7 +239,7 @@ fn the_new_kind_gate_is_above_every_frozen_gate() {
 /// not a `#[test]`: the offending bump then fails to *compile*, which is earlier
 /// than a test failure and cannot be skipped by a filtered test run. (A runtime
 /// `assert!` on two `const`s is also what `clippy::assertions_on_constants`
-/// rejects under the OTLP job's `--all-targets -D warnings`.)
+/// rejects under the lint job's `--all-targets -D warnings`.)
 ///
 /// It has to be a `const _` item rather than an inline `const { … }` block
 /// inside a test fn: an inline block in a never-called `#[test]` body is *not*

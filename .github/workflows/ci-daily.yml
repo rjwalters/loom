@@ -67,7 +67,7 @@ jobs:
     name: Full Suite (clean, unpartitioned)
     runs-on: ubuntu-latest
     # Generous on purpose: no cache, full debuginfo, every test in one process
-    # per test, plus four Docker-backed --ignored suites.
+    # per test, plus fifteen Docker-backed --ignored suites.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -128,6 +128,80 @@ jobs:
       - name: "Ignored: session filelog redaction contract"
         if: ${{ !cancelled() }}
         run: cargo test --package loom-daemon --features otlp --test collector_filelog -- --ignored --nocapture
+      # --- moved from ci.yml's former `Rust OTLP Feature Build & Test` job
+      # (#11967). Each runs committed SigNoz/ClickHouse SQL verbatim against a
+      # real pinned ClickHouse started via tests/common/hub_image.rs. The PR gate
+      # no longer runs them: a PR that breaks one of these artifacts is caught
+      # here within a day (ci-principles.md "The daily backstop").
+      - name: "Ignored: measured-usage queries against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528: the committed measured-usage SQL, run verbatim. Only this run shows
+        # that reading a counter from the wrong attribute map returns 0 on every row
+        # instead of erroring, and that scope resolution, unpriced-model exclusion
+        # and absence-vs-measured-zero behave as the artifact's header claims.
+        run: cargo test --package loom-daemon --features otlp --test signoz_usage_queries -- --ignored --nocapture
+      - name: "Ignored: SigNoz cycle-time extraction against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #8665: signoz/cycle-time-extract.sql plus the shared rollup and
+        # CT1-CT8 queries, run verbatim over a fixture seeded to match the SigNoz
+        # ingester's attributes_string/attributes_number split.
+        run: cargo test --package loom-daemon --features otlp --test signoz_cycle_time -- --ignored --nocapture
+      - name: "Ignored: SigNoz queue/quota gauge queries against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #8856 / #9005: queue-dwell.sql and quota-utilization.sql. Only this
+        # run shows max() absorbs time_series_v4's duplicate per-hour rows where sum()
+        # doubles, that a provider with no utilization source reads NULL rather than
+        # a fully-idle 0, and that an over-100% reading clamps to zero headroom.
+        run: cargo test --package loom-daemon --features otlp --test signoz_queue_quota_queries -- --ignored --nocapture
+      - name: "Ignored: SigNoz GitHub shadow-spend queries against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #10343: github-shadow.sql must charge each quota window once; stale host
+        # readings, interleaved buckets and reset jitter must not re-charge it.
+        run: cargo test --package loom-daemon --features otlp --test signoz_github_shadow_queries -- --ignored --nocapture
+      - name: "Ignored: SigNoz queue-starvation alert rule against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #8856: alerts/queue-starvation.json. An alert that returns no rows
+        # is silently healthy forever; only this run shows the committed rule
+        # separates a sustainedly starved host from a measured-zero healthy one and
+        # from a flapping one, without double-counting the window boundary.
+        run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
+      - name: "Ignored: SigNoz disk and work-finder alert rules against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #10973: replay of the host-disk and work-finder-stale alert rules.
+        run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
+      - name: "Ignored: SigNoz host-export queries and silent-host alert against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #11198: host-export-queries.sql queries 1-3 and the host-export-silent
+        # alert, run verbatim (roster substituted) over a fixture.
+        run: cargo test --package loom-daemon --features otlp --test signoz_host_export_queries -- --ignored --nocapture
+      - name: "Ignored: SigNoz replay reconstruction against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #11125: replay-queries.sql queries 1-3. Only this run shows an issue
+        # removed, re-added and removed again stays deleted, and that a lost delta or
+        # missing anchor/chunk makes that host unknown instead of rebuilding wrong state.
+        run: cargo test --package loom-daemon --features otlp --test signoz_replay_queries -- --ignored --nocapture
+      - name: "Ignored: telemetry-replay against the replay fixture store"
+        if: ${{ !cancelled() }}
+        # #11127: `telemetry-replay --as-of` runs the same committed queries with its
+        # own parameter binding and reader; only this run shows an uncovered host is
+        # reported `unknown`, not empty.
+        run: cargo test --package loom-daemon --features otlp --test telemetry_replay_fixture_store -- --ignored --nocapture
+      - name: "Ignored: SigNoz CI failed-run log join against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #8826: section 5 of ci-queries.sql ("Failed run -> logs"). Only
+        # this run shows a startup_failure run is distinguishable from a failed job
+        # whose log never arrived, that uniqExact() and the run-level dedupe absorb
+        # replayed chunks/records, and that both asymmetric join keys are load-bearing.
+        run: cargo test --package loom-daemon --features otlp --test signoz_ci_failed_run_logs -- --ignored --nocapture
+      - name: "Ignored: SigNoz retention statements against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #9904: retention.sql, the one artifact that MUTATES the operator's
+        # deployment. Needs a single-node ClickHouse with an embedded Keeper (`ON
+        # CLUSTER` requires a real distributed-DDL queue). Only this run shows a
+        # retention OUTCOME: e.g. that dropping the `/ 1000` from a millisecond
+        # statement deletes every row, and that one failing statement aborts the file
+        # leaving the metric statements unapplied.
+        run: cargo test --package loom-daemon --features otlp --test signoz_retention_ttl -- --ignored --nocapture
 
   # ===========================================================================
   # Item 2 -- the release matrix, minus signing and publishing.
