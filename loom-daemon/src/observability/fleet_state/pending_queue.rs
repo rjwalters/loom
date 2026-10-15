@@ -53,23 +53,29 @@ pub(super) fn operator_held(repo: &RepoView) -> Option<u32> {
 /// the pass lock, so access is already serialised.
 static LAST_ELIGIBLE: Mutex<BTreeMap<String, (u32, u32)>> = Mutex::new(BTreeMap::new());
 
-/// Collector pass: record this pass's eligible counts — a repo whose triage or
+/// Collector pass (also diffing operator recency, #11956): record this pass's eligible counts — a repo whose triage or
 /// curated listing was incomplete drops out (unknown, never zero) — then stamp
 /// the view.
-pub(super) fn observe(view: &mut FleetView, eligible: BTreeMap<String, (u32, u32)>) {
+pub(super) fn observe(
+    view: &mut FleetView,
+    eligible: BTreeMap<String, (u32, u32)>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
     let mut last = LAST_ELIGIBLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *last = eligible;
     annotate_pending(view, &last);
+    super::operator_recency::observe(view, now);
 }
 
 /// Tick pass: re-stamp from the last collector-pass counts (no forge read).
-pub(super) fn restamp(view: &mut FleetView) {
+pub(super) fn restamp(view: &mut FleetView, now: chrono::DateTime<chrono::Utc>) {
     let last = LAST_ELIGIBLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     annotate_pending(view, &last);
+    super::operator_recency::restamp(view, now);
 }
 
 /// Stamp each repo with its pending-human queue depth (#11955) from the last

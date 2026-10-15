@@ -25,6 +25,7 @@ use crate::telemetry::kinds::fleet_state::{
     FleetCapacity, FleetEligibleReason, FleetHaltReason, FleetRepoHalt, FleetSlots, MainCi,
     PlannerStamps,
 };
+use crate::telemetry::kinds::pick_decision::PickSkipReason;
 use crate::telemetry::RepoVisibility;
 use crate::types::{ReadyQueueRow, RepoLimitView, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
@@ -433,6 +434,7 @@ fn ready_from_tick(
                 eligible_at: FleetEligibleReason::from_disposition(row.disposition)
                     .filter(|reason| reason.has_clock())
                     .and(row.plan.held_until),
+                dispatch_blocked_reason: PickSkipReason::from_disposition(row.disposition),
             })
         })
         .collect();

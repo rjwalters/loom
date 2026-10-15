@@ -247,7 +247,7 @@ pub use labels::*;
 pub use main_red_fix::RedMainLane;
 pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};
-pub use tick_report::{Admission, TickReport};
+pub use tick_report::{error_kind::DispatchErrorKind, Admission, TickReport};
 #[cfg(test)]
 use tick_summary::reset_last_tick_summary;
 pub use tick_summary::{

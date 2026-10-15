@@ -341,6 +341,7 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
         fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
             Some(LabelHistory {
                 events: vec![(self.0, HistoryEvent::Labeled("loom:pr".to_string()))],
+                ..LabelHistory::default()
             })
         }
     }
@@ -426,6 +427,7 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
                     (self.0, HistoryEvent::Unlabeled(label("loom:issue"))),
                     (self.0, HistoryEvent::Labeled(label("loom:building"))),
                 ],
+                ..LabelHistory::default()
             })
         }
     }
@@ -462,6 +464,7 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
                     main_red_fix: false,
                     eligible_reason: None,
                     eligible_at: None,
+                    dispatch_blocked_reason: None,
                 })
                 .into_iter()
                 .collect(),
