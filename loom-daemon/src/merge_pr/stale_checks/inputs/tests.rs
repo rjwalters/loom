@@ -275,10 +275,20 @@ fn the_table_covers_exactly_mains_required_contexts() {
     let listed: BTreeSet<&str> = REQUIRED_CONTEXTS.iter().copied().collect();
     let checks: BTreeSet<&str> = REQUIRED_CHECKS.iter().map(|r| r.context).collect();
     assert_eq!(listed.len(), REQUIRED_CONTEXTS.len(), "duplicate in REQUIRED_CONTEXTS");
-    assert_eq!(
-        listed, checks,
-        "REQUIRED_CONTEXTS and REQUIRED_CHECKS must name the same contexts"
+    assert!(
+        listed.is_subset(&checks),
+        "every REQUIRED_CONTEXTS entry needs a REQUIRED_CHECKS entry"
     );
+    // A REQUIRED_CHECKS entry that is not itself required exists only to be
+    // judged component by component inside an aggregate (#12106: `Lint`).
+    for extra in checks.difference(&listed) {
+        assert!(
+            REQUIRED_CHECKS
+                .iter()
+                .any(|r| listed.contains(r.context) && r.aggregates.contains(extra)),
+            "{extra:?} is in REQUIRED_CHECKS but neither required nor aggregated by a required context"
+        );
+    }
     // Every component has a spec, and every spec is a component of exactly one
     // required check: an orphan spec is dead weight, and a gate in two
     // contexts would be judged twice from two different logs.
@@ -379,7 +389,14 @@ fn every_script_a_required_job_runs_is_a_global_input() {
             // `daemon_surface_tests.rs`.
             assert!(
                 !refs.is_empty()
-                    || matches!(*component, "Secret Scan" | "MCP Guard Wiring Contract"),
+                    || matches!(
+                        *component,
+                        "Secret Scan"
+                            | "MCP Guard Wiring Contract"
+                            | "Stale Model Pin Check"
+                            | "Fresh Install Link Check"
+                            | "Compatibility Contract"
+                    ),
                 "{component}: no script references found — the parser probably broke"
             );
             for script in refs {
@@ -400,8 +417,8 @@ guard will not notice when `main` changes that script.",
 
 #[test]
 fn a_composite_context_is_stale_when_any_component_is() {
-    let specs = specs_for("Structural Checks").expect("composite resolves");
-    assert_eq!(specs.len(), 9);
+    let specs = specs_for("Lint").expect("composite resolves");
+    assert_eq!(specs.len(), 16);
     // main changes the scrub checker; the PR edits a scanned file.
     let d = set(&["scripts/check-vendored-private-refs.sh"]);
     let p = set(&["defaults/docs/lib.md"]);
@@ -417,9 +434,9 @@ fn a_composite_context_is_not_stale_on_cross_component_terms() {
     // The UNION of all the specs would call this stale (main moved a global
     // input; the PR touches some input). Per-component OR does not: no single
     // gate's verdict could have changed.
-    let specs = specs_for("Structural Checks").expect("composite resolves");
+    let specs = specs_for("Lint").expect("composite resolves");
     let d = set(&["defaults/scripts/check-config-no-host-paths.sh"]);
-    let p = set(&["defaults/roles/curator.md"]);
+    let p = set(&["docs/guides/development.md"]);
     let union_global: Vec<&str> = specs
         .iter()
         .flat_map(|s| s.global.iter().copied())
@@ -432,7 +449,7 @@ fn a_composite_context_is_not_stale_on_cross_component_terms() {
         spec("Config Host-Path Guard")
             .scanned
             .iter()
-            .all(|pat| !glob_match(pat, "defaults/roles/curator.md")),
+            .all(|pat| !glob_match(pat, "docs/guides/development.md")),
         "precondition: the moved gate does not read the PR's file"
     );
     let stale = composite_stale_reason(&specs, &d, &p, &CiScopes::unscoped());

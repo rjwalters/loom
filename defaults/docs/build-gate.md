@@ -349,7 +349,11 @@ belonged to `Install Surface Checks`, outside the mirrored job. This section is
 the audit that says what the gate does and does not predict.
 
 **Audited at** `9ca463f06afa2864aa58f3adbeb8e1a4d743a2ad` (`main`, workflow
-`.github/workflows/ci.yml`). Re-audit when the jobs below change. The set of
+`.github/workflows/ci.yml`). Re-audit when the jobs below change. Since
+#12106, `Structural Checks`, `Daemon Checks`, `Install Surface Checks` and
+`Repo Hygiene Checks` are one `Lint` job (which `check-structural.sh` now
+mirrors), and the one required context is `CI Result`; the rows below predate
+that merge. The set of
 required status contexts is `REQUIRED_CONTEXTS` in
 [`stale_checks/inputs.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/merge_pr/stale_checks/inputs.rs):
 `Structural Checks`, `Shell Syntax (macos-latest)`, `Daemon Checks`, `CI Result`.

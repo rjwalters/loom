@@ -169,7 +169,7 @@ pub struct Component {
 /// One `jobs:` entry: where it is, what it is called, and what it needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
-    /// The `jobs:` mapping key (`structural-checks`), which `needs:` names.
+    /// The `jobs:` mapping key (`lint`), which `needs:` names.
     pub key: String,
     /// The rendered `name:` values — the status-check contexts this job
     /// reports as. More than one when the name interpolates `matrix.os`.

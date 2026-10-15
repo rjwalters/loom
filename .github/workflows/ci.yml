@@ -9,7 +9,7 @@ on:
   # tree. Dormant until a repository enables a merge queue -- GitHub only
   # emits this event for a queue-enabled branch, and this repository is
   # user-owned, so today it never fires here. Every job a merge group needs
-  # runs on `merge_group` with no path filter (the `changes` job is PR-only):
+  # runs on `merge_group` with no path filter (`changes` skips merge_group):
   # the full suite, a superset of `push`, which path-filters only the image
   # jobs (#10825). `loom-daemon merge-group-ci audit` proves that statically;
   # see defaults/docs/merge-queue-ci.md.
@@ -90,33 +90,44 @@ env:
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
 jobs:
-  # Detect Changes: path groups for the filtered jobs below, plus (first step,
-  # PR events only) the belt-and-suspenders cancellation of superseded runs
-  # (#6683), folded in from its own job by #9065. The native
-  # `cancel-in-progress` above does NOT reliably cancel a superseded run that
-  # is still `queued`: observed 2026-08-21 on PR #6680, a force-pushed rebase's
-  # new run sat `pending` ~20 minutes behind the old queued one. The cancel
-  # step is scoped strictly by `--branch`, and continue-on-error keeps a cancel
-  # hiccup from failing the path filter every filtered job `needs`.
+  # Detect Changes: one job for every change decision a run makes.
+  #   - (PR) cancel superseded queued/in_progress runs of this PR (#6683);
+  #   - (PR) path groups for the filtered jobs (`backend`, `mcp`, `scripts`);
+  #   - `daemon`: whether the shared debug daemon is needed (always true);
+  #   - `docker` (PR and push): whether the image jobs run (#10825), from
+  #     scripts/ci-image-inputs.sh, which fails CLOSED to docker=true.
+  # Three separate jobs until #12106.
+  #
+  # Token safety. This job holds `actions: write` for the cancel step, so it
+  # must never run PR-head code. The image script and `.dockerignore` are
+  # therefore checked out from the PR's BASE commit (main's reviewed code), not
+  # the merge ref. That loses nothing: `.dockerignore`, the script itself and
+  # ci.yml are static image inputs, so a PR editing any of them is docker=true
+  # whatever the base copy says.
+  #
+  # On push the image decision diffs against the last GREEN push run, never
+  # `github.event.before` (see the script header). If this job fails or is
+  # cancelled on push the image jobs run anyway (their `if:` reads
+  # `result != 'success'`) and `CI Result` goes red. merge_group runs every
+  # job unconditionally, so this job does not run there.
   changes:
-    # merge-group-audit: pr-only -- path groups exist only to trim PR runs; merge_group runs every filtered job unconditionally, and push does too except the image jobs (changes-push, #10825)
+    # merge-group-audit: pr-only -- path groups and image inputs only trim PR and push runs; merge_group runs every job unconditionally
     name: Detect Changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     permissions:
-      pull-requests: read
       actions: write
+      contents: read
+      pull-requests: read
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
-      # Whether anything in this PR can be measured by a gate that runs the
-      # shared debug daemon. Computed below, not a raw paths-filter output.
-      daemon: ${{ steps.daemon.outputs.needed }}
+      docker: ${{ steps.images.outputs.docker }}
     steps:
-      # Folded in from the former Cancel Superseded Runs job (#9065). It still
-      # runs first and only on pull_request (this job's own `if`), and
+      # Folded in from the former Cancel Superseded Runs job (#9065). It runs
+      # first and only on pull_request (its own step `if:`), and
       # continue-on-error keeps a cancel hiccup from failing the path filter
       # every other job reads.
       # PR events only (#7779). The rationale above is entirely about a
@@ -133,6 +144,7 @@ jobs:
       # concurrency stanza superseded before they started (zero jobs), by
       # design: one running (oldest) + the newest pending.
       - name: Cancel older queued/in_progress runs for this ref
+        if: github.event_name == 'pull_request'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -165,8 +177,9 @@ jobs:
                 fi
               done
 
-  # Detect which file groups changed to skip irrelevant jobs on PRs
+      # Path groups trim PR runs only; on push every filtered job runs.
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        if: github.event_name == 'pull_request'
         id: filter
         with:
           filters: |
@@ -215,47 +228,10 @@ jobs:
               - 'renovate.json5'
               - '.github/workflows/ci.yml'
 
-      # Does this run need the shared debug daemon built at all? (#9113)
-      #
-      # Always true now that `dashboard/` (the one path group that could make
-      # it false) moved to `2AMLogic/loom-ui` (#9104). The output is kept so
-      # the ten consumers keep asking one question; they read `!= 'false'`,
-      # so every ambiguous state still fails CLOSED.
-      - name: Decide whether the shared debug daemon is needed
-        id: daemon
-        run: |
-          set -euo pipefail
-          echo "daemon needed=true"
-          echo "needed=true" >> "$GITHUB_OUTPUT"
-
-  # Detect Image Inputs (PR): do the image jobs run on this pull request?
-  # (#10825) The same script `changes-push` runs on main, so PR and push agree
-  # on what an image input is: docker/**, the .dockerignore-allowlisted
-  # private-control files under defaults/ (which the former `docker` paths
-  # group missed), the run-job seam (#7853) and ci.yml. A failed listing fails
-  # CLOSED (docker=true).
-  #
-  # A job of its own, deliberately NOT a step of `changes`: on a PR the
-  # checkout below is the merge ref, so scripts/ci-image-inputs.sh is
-  # UNMERGED PR CODE, and `changes` holds `actions: write` for its
-  # superseded-run cancellation. Running a PR-head script there would hand a
-  # same-repository contributor a write-capable Actions token. This job's token
-  # is read-only (contents + pull-requests); keep it that way, and never run
-  # PR-head code in a job that retains a write permission.
-  changes-images:
-    # merge-group-audit: pr-only -- the image-input decision only trims PR runs; push is decided by changes-push and merge_group runs every image job unconditionally
-    name: Detect Image Inputs (PR)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      docker: ${{ steps.images.outputs.docker }}
-    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The PR's base commit, never the merge ref (see the job header).
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           sparse-checkout: |
             /.dockerignore
             /scripts/ci-image-inputs.sh
@@ -266,48 +242,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: scripts/ci-image-inputs.sh pr --repo "$REPO" --pr "$PR_NUMBER" >> "$GITHUB_OUTPUT"
-
-  # Detect Image Inputs (push): the ONE path filter on a push to main, and the
-  # operator-approved exception to ci-principles rule 3 (#10825). It decides
-  # only whether `worker-base-image` and the three image smokes run; every
-  # other job still runs unconditionally on push. The base is the head of the
-  # last GREEN `CI` push run on main, never `github.event.before`: main's
-  # concurrency (one running + newest pending) cancels pending runs in a
-  # burst, so `before` can be an unverified commit, and a red smoke run must
-  # not be forgotten by the next clean diff. Fails CLOSED to docker=true, and
-  # if this job itself fails or is cancelled the image jobs run anyway (their
-  # `if:` reads `result != 'success'`) and `CI Result` goes red. Daemon-source
-  # changes are deliberately not image inputs; ci-daily.yml's `docker-smokes`
-  # runs every smoke unfiltered each day (rule 10). Push-only, so it is not a
-  # job the merge-group audit relies on: `merge_group` never path-filters.
-  changes-push:
-    name: Detect Image Inputs (push)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.event_name == 'push'
-    permissions:
-      actions: read
-      contents: read
-    outputs:
-      docker: ${{ steps.images.outputs.docker }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          sparse-checkout: |
-            /.dockerignore
-            /scripts/ci-image-inputs.sh
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
-      - name: Decide whether the image jobs run (diff since the last green push run)
-        id: images
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
           BRANCH: ${{ github.ref_name }}
-        run: scripts/ci-image-inputs.sh push --repo "$REPO" --sha "$SHA" --branch "$BRANCH" --workflow ci.yml >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            scripts/ci-image-inputs.sh pr --repo "$REPO" --pr "$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          else
+            scripts/ci-image-inputs.sh push --repo "$REPO" --sha "$SHA" --branch "$BRANCH" --workflow ci.yml >> "$GITHUB_OUTPUT"
+          fi
 
   build-daemon:
     name: Build loom-daemon (debug, shared)
@@ -317,21 +261,11 @@ jobs:
     # the jobs themselves dropped to 9-24s once they downloaded the binary
     # instead.
     #
-    # `changes.daemon` is now always true (the `dashboard/`-only skip of #9113
-    # left with `dashboard/`, #9104); consumers still read `!= 'false'`.
-    #
-    # This does NOT make the gates it feeds skippable, which is the trap
-    # #9113's original proposal walked into. Daemon Checks is a REQUIRED
-    # context and keeps `if: ${{ !cancelled() }}`, so it runs and reports on
-    # every PR; a `needs:` failure would SKIP it instead, and a skipped
-    # required check counts as passing (ci-principles.md rule 6). What is
-    # gated is its daemon-dependent STEPS, under the SAME `daemon != 'false'`
-    # predicate as this job -- so the artifact exists whenever a step wants
-    # it, and the job reports success having honestly run nothing.
-    needs: changes
-    # `!cancelled()` (not `success()`): `changes` does not run on push, and a
-    # skipped `needs:` would otherwise skip this job on every merge to main.
-    if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+    # Runs on every event with no condition: every run needs the daemon
+    # (the `changes.daemon` output that once gated it was constant `true`
+    # after `dashboard/` left for 2AMLogic/loom-ui, #9104, and was removed by
+    # #12106). Lint keeps `if: ${{ !cancelled() }}`, so a failed build turns
+    # it red rather than skipping it (ci-principles.md rule 6).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -352,8 +286,8 @@ jobs:
 
   release-build:
     name: Release Build Check
-    needs: [changes, changes-images]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
+    needs: changes
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
     # The same `cargo build --release --features otlp` the release workflow
     # runs. Until #9065 the three binary-running checks each built --release,
     # which caught release-profile-only breakage (cfg(debug_assertions) code,
@@ -375,11 +309,11 @@ jobs:
     # smokes'): if the base image runs while this job skipped, the artifact
     # download fails and the smokes go red for no reason. Today it is: this job
     # runs unconditionally on push and merge_group, where #10825 path-filters
-    # the image jobs on push only via `changes-push`, and on a PR its term is
-    # byte-identical to the image gate's (`changes-images.docker == 'true'`),
-    # so the two are EQUAL on PRs. Keep `always()`: `changes`/`changes-images`
-    # skip on push, which would otherwise skip this job and starve
-    # `worker-buildcache` and `worker-base-image`. Narrowing this gate below
+    # the image jobs on push only via `changes.docker`, and on a PR its term is
+    # byte-identical to the image gate's (`changes.docker == 'true'`),
+    # so the two are EQUAL on PRs. Keep `always()`: `changes` skips on
+    # merge_group, which would otherwise skip this job and starve
+    # `worker-base-image`. Narrowing this gate below
     # the image gate is not allowed.
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -527,30 +461,43 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  structural-checks:
-    name: Structural Checks
-    # ONE required context for the formerly separate structural gates plus
-    # the ubuntu Shell Syntax leg (#9065). Each took a runner for 5-22s; as
-    # separate jobs they were 17 of ~45 jobs per run and competed for the
-    # account's concurrent-job cap. Every step runs even when an earlier one
-    # failed (`!cancelled()`), so one red gate never hides another; the step
-    # names say which gate failed.
+  lint:
+    name: Lint
+    # ONE job for every cheap structural, hygiene and daemon-run gate (#12106;
+    # formerly Structural Checks, Repo Hygiene Checks, Daemon Checks and
+    # Install Surface Checks). Every step runs even when an earlier one failed
+    # (`!cancelled()`), so one red gate never hides another; the step names
+    # say which gate failed.
     #
     # `# component: <name>` marks each gate's steps. The required-check
-    # freshness guard judges staleness per component, with the same input specs
-    # as when they were separate jobs (stale_checks/inputs.rs REQUIRED_CHECKS), and
-    # its pin test fails if a component's steps run a script missing from that
-    # component's spec. Keep the markers accurate.
+    # freshness guard judges staleness per component
+    # (stale_checks/inputs.rs REQUIRED_CHECKS), and its pin test fails if a
+    # component's steps run a script missing from that component's spec. Keep
+    # the markers accurate. scripts/check-structural.sh runs this job's
+    # `bash <script>` gates locally.
     #
-    # Always runs: never behind `needs: changes` (ci-principles.md rule 3).
-    # fetch-depth: 0 because the version-bump check diffs the PR's
-    # merge-base..head.
+    # Always runs: never behind a path filter (ci-principles.md rule 3).
+    # `if: !cancelled()` keeps the job running and RED when build-daemon
+    # failed (a skipped job would otherwise count as passing, rule 6). fetch-depth: 0 for the merge-base diffs (version bump,
+    # retired list, control version) and the release tags the compatibility
+    # contract reads.
+    needs: build-daemon
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # download-artifact FAILS when the artifact is missing, so a broken build
+      # turns the daemon gates red rather than letting them pass on nothing.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - if: ${{ !cancelled() }}
+        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
 
       # component: Conflict Marker Check
       # Cheap structural check; always runs, on every path group. #6499: an
@@ -915,274 +862,7 @@ jobs:
         # ~830 scripts, ~3s.
         run: bash defaults/scripts/check-shell-syntax.sh --quiet --dir .
 
-  daemon-checks:
-    name: Daemon Checks
-    # ONE required context for the required gates that run the shared debug
-    # daemon (#9065), each marked `# component:` exactly like Structural Checks.
-    # `changes` is here only so the steps can read `changes.daemon` (#9113).
-    # It does NOT gate the job: the `if:` below is unchanged, so this required
-    # context still runs and reports on every single PR.
-    needs: [build-daemon, changes]
-    # Runs (and goes RED) when build-daemon failed: a needs-failure would
-    # otherwise SKIP this job, and GitHub counts a skipped required check as
-    # passing (ci-principles.md rule 6).
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      # download-artifact FAILS when the artifact is missing, so a broken build
-      # turns this job red rather than letting it pass on nothing.
-      #
-      # `daemon != 'false'` is build-daemon's OWN predicate (#9113), so the
-      # artifact exists whenever this step runs. On a dashboard-only PR both
-      # are false: nothing is downloaded, the gates below do not run, and this
-      # required context reports success having honestly measured nothing it
-      # could have failed on. It is never SKIPPED -- a skipped required check
-      # counts as passing (ci-principles.md rule 6) and would void the gate.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        with:
-          name: loom-daemon-debug
-          path: target/debug
-      - if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
-
-      # component: .gitignore Convergence Check
-      # Not gated on backend changes — a drifted .gitignore is detectable
-      # regardless of which file group a PR touches. It runs under
-      # `daemon != 'false'` (#9113), which is false only for a PR entirely
-      # inside `dashboard/`; `.gitignore` and the EPHEMERAL_PATTERNS source
-      # both sit outside it, so such a PR cannot make this gate fail. Generalizes #5014 (the
-      # managed gitignore block was missing .loom/account-health.json, found by
-      # hand well after the pattern was added to EPHEMERAL_PATTERNS) into a
-      # pre-merge gate. `loom-daemon update-gitignore` is already idempotent
-      # when the block is converged, so this needs zero new Rust code: build
-      # the binary, run update-gitignore against the checked-out repo, then
-      # diff .gitignore against the PR's committed version.
-      - name: Check .gitignore matches the current EPHEMERAL_PATTERNS set
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
-
-      # component: MCP Guard Wiring Contract
-      # #9108: `check-guard-scan-contracts.sh` (Structural Checks) answers
-      # "does the guard read the right copy of the command?". This answers the
-      # prior question — "is the guard on the tool call's path at all?" — which
-      # nothing asserted until #9108, and which is how every `mcp__loom__*`
-      # call came to run with no PreToolUse matcher covering it while
-      # `get_agent_metrics` built a shell command line from its raw arguments
-      # (fixed server-side in #9107). A matcher that matches nothing does not
-      # error; it just never fires, so the wiring has to be asserted.
-      #
-      # It lives HERE rather than next to its sibling in Structural Checks
-      # because that job is deliberately toolchain-free (no cargo, no daemon
-      # binary) and this check is a daemon subcommand — new executable logic
-      # goes into the daemon, not into `contract`-category shell
-      # (.loom/docs/shell-language-policy.md, epic #7810). Behind
-      # `daemon != 'false'` like its siblings: that predicate is false only for
-      # a PR entirely inside `dashboard/`, which cannot touch the settings
-      # file, the installer, or the hook this reads.
-      - name: Check the mcp__loom__.* PreToolUse matcher is wired and fails closed (#9108)
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: ./target/debug/loom-daemon check-guard-wiring --repo-root .
-
-      # component: Secret Scan
-      # Refuses any commit that ADDS a credential-shaped value, whatever its
-      # path (#9133): the same `loom-daemon secret-scan` the PreToolUse guard
-      # and .githooks/ run, so there is one pattern list. Each commit in the
-      # event is scanned on its own, not the net diff, because a value added
-      # and then deleted on a branch is still published by the push.
-      # Runs on push to main too: a commit that reaches main through a
-      # ruleset bypass never runs PR checks (#9136), which is how the
-      # 2026-09-26 leak arrived. There it cannot prevent anything; it turns a
-      # silent disclosure into a red run. Behind `daemon != 'false'` like its
-      # siblings, so a dashboard-only PR is not scanned here; the guard and
-      # hooks still cover that path.
-      - name: Refuse commits that add a credential-shaped value (#9133)
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        env:
-          EVENT: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PUSH_BEFORE: ${{ github.event.before }}
-          PUSH_AFTER: ${{ github.sha }}
-          # #10257: a merge group scans every commit the combined tree adds
-          # over its base, not just its head commit.
-          MG_BASE: ${{ github.event.merge_group.base_sha }}
-          MG_HEAD: ${{ github.event.merge_group.head_sha }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = pull_request ]; then
-            range="$PR_BASE..$PR_HEAD"
-          elif [ "$EVENT" = merge_group ]; then
-            range="$MG_BASE..$MG_HEAD"
-          elif [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
-            range="$PUSH_BEFORE..$PUSH_AFTER"
-          else
-            range="$PUSH_AFTER^!"
-          fi
-          echo "Scanning $range"
-          ./target/debug/loom-daemon secret-scan --range "$range"
-
-      # #8858: a semantic change to the private-control POLICY map in
-      # bundle.rs must come with a strictly greater CONTROL_VERSION, measured
-      # against the MERGE BASE of base and head (not the moving base tip).
-      # Needs history, hence this job's `fetch-depth: 0`; reads git objects
-      # only, no network. Explicit refs per event so it is reproducible locally:
-      #   loom-daemon check-private-control-version --base origin/main --head HEAD
-      - name: Require a CONTROL_VERSION bump when the private-control POLICY changes (#8858)
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        env:
-          EVENT: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PUSH_BEFORE: ${{ github.event.before }}
-          PUSH_AFTER: ${{ github.sha }}
-          MG_BASE: ${{ github.event.merge_group.base_sha }}
-          MG_HEAD: ${{ github.event.merge_group.head_sha }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = pull_request ]; then
-            base="$PR_BASE"; head="$PR_HEAD"
-          elif [ "$EVENT" = merge_group ]; then
-            base="$MG_BASE"; head="$MG_HEAD"
-          elif [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
-            base="$PUSH_BEFORE"; head="$PUSH_AFTER"
-          else
-            base="$PUSH_AFTER^"; head="$PUSH_AFTER"
-          fi
-          ./target/debug/loom-daemon check-private-control-version --repo-root . --base "$base" --head "$head"
-
-  install-surface-checks:
-    name: Install Surface Checks
-    # Fresh Install Link Check on the shared debug daemon (#9065), plus the
-    # Compatibility Contract (#10716). NOT required:
-    # they were not required as separate jobs either; CI Result aggregates
-    # this job. The job itself runs on every PR; its two gates are behind
-    # `daemon != 'false'` (#9113), never behind a file-group filter (path
-    # filtering is an optimisation, ci-principles.md rule 3). Both read only
-    # `defaults/`, which a dashboard-only PR cannot touch.
-    # `changes` is here only so the steps can read `changes.daemon` (#9113);
-    # the `if:` below is unchanged, so the job still runs on every PR.
-    needs: [build-daemon, changes]
-    # Runs (and goes RED) when build-daemon failed: a needs-failure would
-    # otherwise SKIP this job, and GitHub counts a skipped required check as
-    # passing (ci-principles.md rule 6).
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      # download-artifact FAILS when the artifact is missing, so a broken build
-      # turns this job red rather than letting it pass on nothing.
-      #
-      # Same `daemon != 'false'` predicate build-daemon uses (#9113): on a
-      # dashboard-only PR the binary is never built, so the two gates below --
-      # both of which read only defaults/ -- have nothing they could fail on.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        with:
-          name: loom-daemon-debug
-          path: target/debug
-      - if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
-
-      # component: Fresh Install Link Check
-      # Deliberately NOT behind a file-group filter (see
-      # .loom/docs/ci-principles.md — path-filtering is an optimisation, not a
-      # correctness tool); only behind `daemon != 'false'` (#9113). It
-      # materialises an install of `defaults/`, so a PR confined to
-      # `dashboard/` changes nothing it reads.
-      #
-      # Why a REAL install instead of another static checker (#8270): every
-      # existing link gate reasons about ONE destination for each source file.
-      # `check-dangling-links.sh` maps `defaults/.claude/commands/loom/X.md` to
-      # its installed `.claude/commands/loom/X.md`.
-      # It does not model the fact that a handful of those command files are ALSO
-      # installed — one directory shallower — as `.loom/roles/X.md`, because
-      # `defaults/roles/X.md` is a symlink to them. A `../../../.loom/docs/…`
-      # link resolves correctly from the first destination and escapes the repo
-      # root from the second, so it was invisible to both gates while failing
-      # `install-loom.sh` Step 3 on every fresh consumer repo. Nor does either
-      # gate see backtick-only references (`` `.loom/docs/foo.md` ``), which is
-      # how a shipped file came to reference a doc that is deliberately never
-      # shipped.
-      #
-      # Materialising the install and running the installer's own check against
-      # it needs no model of the destination map at all — it IS the destination
-      # map. This is the exact command sequence that failed in #8270.
-      - name: Initialize Loom into an empty two-commit fixture repo
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: |
-          set -euo pipefail
-          FIXTURE="$(mktemp -d)"
-          echo "FIXTURE=$FIXTURE" >> "$GITHUB_ENV"
-          git init -q -b main "$FIXTURE"
-          git -C "$FIXTURE" config user.email "loom-ci@example.com"
-          git -C "$FIXTURE" config user.name "Loom CI"
-          printf '# fixture\n' > "$FIXTURE/README.md"
-          git -C "$FIXTURE" add README.md
-          git -C "$FIXTURE" commit -q -m "initial commit"
-          git -C "$FIXTURE" commit -q --allow-empty -m "second commit"
-          ./target/debug/loom-daemon init \
-            --defaults "$GITHUB_WORKSPACE/defaults" "$FIXTURE" 2>&1 | tee /tmp/fresh-init.log
-      - name: Manifest generation succeeded on the fresh init
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: |
-          set -euo pipefail
-          if grep -q 'Manifest generation failed\|Could not run verify-install.sh' /tmp/fresh-init.log; then
-            echo "::error::loom-daemon init reported a manifest-generation failure on a fresh repo" >&2
-            grep -n 'Manifest\|verify-install' /tmp/fresh-init.log >&2 || true
-            exit 1
-          fi
-          test -s "$FIXTURE/.loom/manifest.json"
-      # The installer treats a dangling link as fatal (install-loom.sh Step 3),
-      # so reproduce it verbatim rather than paraphrasing the check.
-      - name: Check intra-repo links in the freshly installed tree
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: cd "$FIXTURE" && bash .loom/scripts/verify-install.sh check-links
-
-      # component: Compatibility Contract
-      # #10716 (tracker #10698 D3/D4): prove the two claims across adjacent
-      # releases. A: the previous release's installed files against this
-      # daemon (skipped when SUPPORTS_INSTALLED declares the break). B: this
-      # tree's installed files against the oldest PUBLISHED release at or
-      # above REQUIRES_DAEMON (releases skip versions, so not always
-      # v$REQUIRES_DAEMON itself), downloaded by --fetch-old-daemon; while
-      # none is published the new daemon stands in. A violated claim exits 1.
-      # All of it, the release lookup included, is
-      # `loom-daemon install-compat check`. fetch-depth: 0 above supplies the
-      # release tags. Not
-      # path-filtered: a change to `defaults/` alone can break claim B. Here,
-      # not in the required Daemon Checks, because its verdict also depends on
-      # release tags and assets, which no stale-check input set can model.
-      - name: Compatibility contract across adjacent releases (#10716)
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          ./target/debug/loom-daemon install-compat check --repo-root . \
-            --fetch-old-daemon --release-repo "$GITHUB_REPOSITORY" \
-            --asset loom-daemon-x86_64-unknown-linux-gnu
-
-  repo-hygiene:
-    name: Repo Hygiene Checks
-    # Two non-required checks that each took a runner for under 10s (#9065):
-    # Retired List Drift and Stale Model Pin Check. Every step runs even when
-    # an earlier one failed (`!cancelled()`), so one red check never hides
-    # another. Their original job-level comments follow above each group.
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      # fetch-depth: 0 for Retired List Drift (it diffs against history).
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      # --- Retired List Drift ---
+      # component: Retired List Drift
       # Cheap structural check; always runs, and deliberately NOT path-filtered.
       # A deletion under defaults/ is exactly what this gate exists to catch, and
       # a `defaults/**` filter would be a false economy
@@ -1213,7 +893,7 @@ jobs:
       - name: Check defaults/ deletions are recorded in .loom-retired.list
         if: ${{ !cancelled() }}
         run: bash scripts/check-retired-list-drift.sh
-      # --- Stale Model Pin Check ---
+      # component: Stale Model Pin Check
       # Cheap structural check; always runs, and deliberately NOT path-filtered:
       # the things it guards are workflow files and dispatching scripts, so a
       # filter keyed on anything else would skip it on exactly the PR that
@@ -1331,10 +1011,181 @@ jobs:
           fi
           echo "No stale pinned model IDs in .github/workflows/ or defaults/scripts/"
 
+      # component: .gitignore Convergence Check
+      # Not gated on backend changes — a drifted .gitignore is detectable
+      # regardless of which file group a PR touches. Generalizes #5014 (the
+      # managed gitignore block was missing .loom/account-health.json, found by
+      # hand well after the pattern was added to EPHEMERAL_PATTERNS) into a
+      # pre-merge gate. `loom-daemon update-gitignore` is already idempotent
+      # when the block is converged, so this needs zero new Rust code: build
+      # the binary, run update-gitignore against the checked-out repo, then
+      # diff .gitignore against the PR's committed version.
+      - name: Check .gitignore matches the current EPHEMERAL_PATTERNS set
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
+
+      # component: MCP Guard Wiring Contract
+      # #9108: `check-guard-scan-contracts.sh` (above) answers
+      # "does the guard read the right copy of the command?". This answers the
+      # prior question — "is the guard on the tool call's path at all?" — which
+      # nothing asserted until #9108, and which is how every `mcp__loom__*`
+      # call came to run with no PreToolUse matcher covering it while
+      # `get_agent_metrics` built a shell command line from its raw arguments
+      # (fixed server-side in #9107). A matcher that matches nothing does not
+      # error; it just never fires, so the wiring has to be asserted.
+      #
+      # It is a daemon subcommand rather than more shell in its sibling's
+      # script — new executable logic
+      # goes into the daemon, not into `contract`-category shell
+      # (.loom/docs/shell-language-policy.md, epic #7810).
+      - name: Check the mcp__loom__.* PreToolUse matcher is wired and fails closed (#9108)
+        if: ${{ !cancelled() }}
+        run: ./target/debug/loom-daemon check-guard-wiring --repo-root .
+
+      # component: Secret Scan
+      # Refuses any commit that ADDS a credential-shaped value, whatever its
+      # path (#9133): the same `loom-daemon secret-scan` the PreToolUse guard
+      # and .githooks/ run, so there is one pattern list. Each commit in the
+      # event is scanned on its own, not the net diff, because a value added
+      # and then deleted on a branch is still published by the push.
+      # Runs on push to main too: a commit that reaches main through a
+      # ruleset bypass never runs PR checks (#9136), which is how the
+      # 2026-09-26 leak arrived. There it cannot prevent anything; it turns a
+      # silent disclosure into a red run.
+      - name: Refuse commits that add a credential-shaped value (#9133)
+        if: ${{ !cancelled() }}
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          # #10257: a merge group scans every commit the combined tree adds
+          # over its base, not just its head commit.
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ "$EVENT" = merge_group ]; then
+            range="$MG_BASE..$MG_HEAD"
+          elif [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            range="$PUSH_BEFORE..$PUSH_AFTER"
+          else
+            range="$PUSH_AFTER^!"
+          fi
+          echo "Scanning $range"
+          ./target/debug/loom-daemon secret-scan --range "$range"
+
+      # #8858: a semantic change to the private-control POLICY map in
+      # bundle.rs must come with a strictly greater CONTROL_VERSION, measured
+      # against the MERGE BASE of base and head (not the moving base tip).
+      # Needs history, hence this job's `fetch-depth: 0`; reads git objects
+      # only, no network. Explicit refs per event so it is reproducible locally:
+      #   loom-daemon check-private-control-version --base origin/main --head HEAD
+      - name: Require a CONTROL_VERSION bump when the private-control POLICY changes (#8858)
+        if: ${{ !cancelled() }}
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          elif [ "$EVENT" = merge_group ]; then
+            base="$MG_BASE"; head="$MG_HEAD"
+          elif [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE"; head="$PUSH_AFTER"
+          else
+            base="$PUSH_AFTER^"; head="$PUSH_AFTER"
+          fi
+          ./target/debug/loom-daemon check-private-control-version --repo-root . --base "$base" --head "$head"
+
+      # component: Fresh Install Link Check
+      # Deliberately NOT behind a file-group filter (see
+      # .loom/docs/ci-principles.md — path-filtering is an optimisation, not a
+      # correctness tool).
+      #
+      # Why a REAL install instead of another static checker (#8270): every
+      # existing link gate reasons about ONE destination for each source file.
+      # `check-dangling-links.sh` maps `defaults/.claude/commands/loom/X.md` to
+      # its installed `.claude/commands/loom/X.md`.
+      # It does not model the fact that a handful of those command files are ALSO
+      # installed — one directory shallower — as `.loom/roles/X.md`, because
+      # `defaults/roles/X.md` is a symlink to them. A `../../../.loom/docs/…`
+      # link resolves correctly from the first destination and escapes the repo
+      # root from the second, so it was invisible to both gates while failing
+      # `install-loom.sh` Step 3 on every fresh consumer repo. Nor does either
+      # gate see backtick-only references (`` `.loom/docs/foo.md` ``), which is
+      # how a shipped file came to reference a doc that is deliberately never
+      # shipped.
+      #
+      # Materialising the install and running the installer's own check against
+      # it needs no model of the destination map at all — it IS the destination
+      # map. This is the exact command sequence that failed in #8270.
+      - name: Initialize Loom into an empty two-commit fixture repo
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          FIXTURE="$(mktemp -d)"
+          echo "FIXTURE=$FIXTURE" >> "$GITHUB_ENV"
+          git init -q -b main "$FIXTURE"
+          git -C "$FIXTURE" config user.email "loom-ci@example.com"
+          git -C "$FIXTURE" config user.name "Loom CI"
+          printf '# fixture\n' > "$FIXTURE/README.md"
+          git -C "$FIXTURE" add README.md
+          git -C "$FIXTURE" commit -q -m "initial commit"
+          git -C "$FIXTURE" commit -q --allow-empty -m "second commit"
+          ./target/debug/loom-daemon init \
+            --defaults "$GITHUB_WORKSPACE/defaults" "$FIXTURE" 2>&1 | tee /tmp/fresh-init.log
+      - name: Manifest generation succeeded on the fresh init
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          if grep -q 'Manifest generation failed\|Could not run verify-install.sh' /tmp/fresh-init.log; then
+            echo "::error::loom-daemon init reported a manifest-generation failure on a fresh repo" >&2
+            grep -n 'Manifest\|verify-install' /tmp/fresh-init.log >&2 || true
+            exit 1
+          fi
+          test -s "$FIXTURE/.loom/manifest.json"
+      # The installer treats a dangling link as fatal (install-loom.sh Step 3),
+      # so reproduce it verbatim rather than paraphrasing the check.
+      - name: Check intra-repo links in the freshly installed tree
+        if: ${{ !cancelled() }}
+        run: cd "$FIXTURE" && bash .loom/scripts/verify-install.sh check-links
+
+      # component: Compatibility Contract
+      # #10716 (tracker #10698 D3/D4): prove the two claims across adjacent
+      # releases. A: the previous release's installed files against this
+      # daemon (skipped when SUPPORTS_INSTALLED declares the break). B: this
+      # tree's installed files against the oldest PUBLISHED release at or
+      # above REQUIRES_DAEMON (releases skip versions, so not always
+      # v$REQUIRES_DAEMON itself), downloaded by --fetch-old-daemon; while
+      # none is published the new daemon stands in. A violated claim exits 1.
+      # All of it, the release lookup included, is
+      # `loom-daemon install-compat check`. fetch-depth: 0 above supplies the
+      # release tags. Not
+      # path-filtered: a change to `defaults/` alone can break claim B. Its
+      # verdict also depends on release tags and assets, which no stale-check
+      # input set can model, so its spec's G is the whole tracked tree.
+      - name: Compatibility contract across adjacent releases (#10716)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./target/debug/loom-daemon install-compat check --repo-root . \
+            --fetch-old-daemon --release-repo "$GITHUB_REPOSITORY" \
+            --asset loom-daemon-x86_64-unknown-linux-gnu
+
   shell-syntax:
     name: Shell Syntax (macos-latest)
-    # The ubuntu leg of this former matrix now runs inside Structural Checks
-    # (#9065). This job stays separate because it needs a macOS runner: it is
+    # The ubuntu leg of this former matrix now runs inside Lint (#9065). This job stays separate because it needs a macOS runner: it is
     # the bash 3.2 leg. Its steps are unchanged.
     # #7728: `check-shell-syntax.sh` existed since #6162 but was never wired
     # into CI -- the only match for it in this file was a COMMENT. The single
@@ -1402,69 +1253,29 @@ jobs:
         # `.sh`, inside this job's `**/*.sh` scanned set. ~4s.
         run: bash defaults/hooks/tests/test-guard-installed-file-writes.sh
 
-  dep-classification-suites:
+  native-suites:
     name: Native Port Suites
     needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
-    # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
-    # reaches the download (#9113). `changes.daemon` OR-s `backend` and
-    # `scripts` in precisely so this stays true: whenever this job runs,
-    # build-daemon ran too and the artifact exists.
-    # The equivalence evidence for epic #7810. Every suite here carries
-    # assertions written against a SHELL implementation that is now a thin stub
-    # over a `loom-daemon` subcommand, so each needs a BUILT binary — which
-    # shell-suite-tests deliberately has no Rust toolchain for.
+    # Shell suites whose assertions need a BUILT loom-daemon: most are the
+    # equivalence evidence for epic #7810 (assertions written against a shell
+    # implementation that is now a thin stub over a subcommand), the rest
+    # drive the daemon directly. They live here rather than in
+    # shell-suite-tests because that job has no Rust toolchain. Each suite
+    # FAILS (not SKIPs) when no binary resolves.
     #
-    # The original three suites' assertions were written against
-    # classify-dependency-block.sh / detect-dependency-cycle.sh /
-    # detect-startable-subset.sh; those are now thin stubs over
-    # `loom-daemon classify-dependency-block` et al., and the same assertions
-    # run unchanged against the Rust port. That is what makes deleting hundreds
-    # of lines of decision logic checkable rather than asserted. Epic #7810's
-    # later phases added more suites the same way: dep-recheck-fingerprint.sh
-    # (PR 4, `loom-daemon/src/dep_recheck/`), the premise-false interaction
-    # suite (#7904), and loom-daemon-update --resolve-json (#7609/#7977).
+    # Two runners split the suites by family (#11968, merged from five jobs by
+    # #12106): this one holds dep-classify, worktree.sh, issue tooling and the
+    # daemon lifecycle/watchdog suites; `native-suites-agents` holds merge-pr /
+    # verdict / check-runs, spawn-* / tokens / daemon-update, and the mocked
+    # Codex adapter smoke. Wire a NEW suite by family; a new leg's job id
+    # must also go in `ci-result`'s needs.
     #
-    # NOT every step in this family is a thin-stub-over-native-port suite:
-    # #8069 added test-spawn-claude.sh (now in `native-port-spawn`, #11968),
-    # which CALLS `loom-daemon tokens select` rather than
-    # being a stub over it. It is here for the same operational reason — it
-    # needs a built binary — not because it is equivalence evidence. Keep this
-    # distinction; a universal that quietly stopped being true is what #8069
-    # was filed about.
-    #
-    # They live here rather than in shell-suite-tests because they need a BUILT
-    # loom-daemon, and that job deliberately has no Rust toolchain. Each suite
-    # FAILS (not SKIPs) when no binary resolves, so this job cannot report green
-    # by quietly running nothing.
-    #
-    # The slowest suites run in the sibling job `native-port-daemon-lifecycle`
-    # (#9065, consolidated by #9093) so that no one runner carries all ~420s
-    # of them. #11968 then split the remaining ~8 min of suites by FAMILY into
-    # this job plus two siblings below; the steps were moved, not changed.
-    # Wire a NEW suite by its family, not by which leg is currently shortest:
-    #   - merge-pr.sh / verdict / check-runs suites -> `native-port-merge-pr`
-    #   - spawn-* / token / claude-wrapper / loom-daemon-update suites
-    #     -> `native-port-spawn`
-    #   - everything else (dep-classify, worktree.sh, issue tooling, ...) -> here
-    # Rebalance by moving a whole family, and only when a leg becomes the pole;
-    # a new leg's job id must also go in `ci-result`'s needs.
-    #
-    # Every suite step (everything after the binary download/--version
-    # check) runs under
+    # Every suite step runs under
     # `if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}`
-    # (#9356), so one red suite cannot hide the others — a later suite still
-    # runs and reports its own verdict. `!cancelled()` alone would drop the
-    # implicit success() and let suites run after a FAILED setup, so each
-    # guard also requires the last setup step (`daemon-bin`, the --version
-    # check) to have succeeded; any earlier setup failure skips it, so its
-    # outcome covers all of setup. The setup steps themselves (checkout, git
-    # identity, download-artifact, --version) stay unguarded and fail-fast.
+    # (#9356), so one red suite cannot hide the others, yet no suite runs
+    # after a failed setup. The setup steps stay unguarded and fail-fast.
     # Give a new suite step the same guard.
-    #
-    # Triggered by `backend` as well as `scripts`: a Rust-only change to
-    # loom-daemon/src/dep_classify/ or loom-daemon/src/dep_recheck/ is exactly
-    # the change that can break these suites, and it touches no shell at all.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1779,26 +1590,78 @@ jobs:
       - name: mcp__loom__.* PreToolUse argument guard (#9107, #9108)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/hooks/tests/test-guard-mcp-tools.sh
+      # Moved out of shell-suite-tests by #8087, the same move #8086 made for
+      # the watchdog (now further down this job) and for the same
+      # reason: cli/loom-daemon-start.sh is now a thin stub over `loom-daemon
+      # daemon-start`, so these three suites need the binary this job downloads.
+      # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
+      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this caller starts or
+      # probes" — the fake-daemon seam every launch-path case drives — and each
+      # FAILS (never SKIPs) without a binary, so this job cannot report green
+      # while running nothing.
+      #
+      # All three, not just the start suite: test-loom-daemon-launchd-plist.sh
+      # renders every plist by invoking the real start script, and
+      # test-loom-daemon-update.sh builds its fixtures from
+      # lib/daemon-update-fixtures.sh, which copies that script in and execs it
+      # on the restart / --relaunch / full-update flows.
+      #
+      # Running them here rather than in shell-suite-tests also means the
+      # live-daemon guard (#6386) no longer covers the two that are
+      # LIVE_DAEMON_GUARDED_SUITES members. Same reasoning as the watchdog's:
+      # safe on THIS runner and only here — a GitHub runner has no
+      # daemon, no pid file and nothing to bootout. On a developer host, run
+      # them through run-ci-suites.sh, which still names both in that guard.
+      #
+      # This job's steps are sequential, so the pair also gets the isolation
+      # run-ci-suites.sh's SERIAL_LANE_SUITES pin (#6622 AC5, #6639/#7391) was
+      # giving them inside its concurrent pool — by construction rather than by
+      # quarantine list.
+      - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-loom-daemon-start.sh
+      # #11934: a relaunch must not switch the work finder off (split out of
+      # the frozen test-loom-daemon-start.sh).
+      - name: loom-daemon-start keeps the work finder (#11934)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-loom-daemon-start-work-finder.sh
+      - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
+      - name: loom-daemon-update (#4078, #6639, #8087)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-loom-daemon-update.sh
+      # #11934: --relaunch keeps a config-driven unit config-driven (split
+      # out of the frozen test-loom-daemon-update.sh).
+      - name: loom-daemon-update --relaunch keeps config-driven loops (#11934)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-loom-daemon-update-relaunch-config.sh
+      # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
+      # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
+      # (188 + 27 assertions, unchanged from the shell implementation apart
+      # from four explicitly-retired cases) need the binary this job downloads.
+      # They pin it via loom_test_require_daemon_bin --self-only, which leaves
+      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this watchdog probes"
+      # — the mock seam every IPC-probe case drives.
+      #
+      # Running them here rather than in shell-suite-tests also means the
+      # live-daemon guard (#6386) no longer covers them. That is safe on THIS
+      # runner and only here: a GitHub runner has no daemon, no pid file and
+      # nothing to bootout. On a developer host, run them through
+      # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
+      - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
 
-  native-port-merge-pr:
-    name: Native Port Suites (merge-pr, verdict)
+  native-suites-agents:
+    name: Native Port Suites (merge-pr, spawn, codex)
     needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
-    # Same trigger as Native Port Suites, for the same reason: it SKIPS
-    # whole on a dashboard-only PR and never reaches the download (#9113),
-    # and whenever it runs, build-daemon ran too and the artifact exists.
-    # Split out of Native Port Suites by #11968, which see (and that job's
-    # header) for everything else about this family: that job ran ~8 min
-    # of suites back to back, the longest leg of PR CI. The steps are
-    # unchanged; only which runner runs them moved. Same build, and the
-    # same FAIL-never-SKIP contract without a binary.
-    # This leg holds the merge-pr.sh / verdict / check-runs family: wire a
-    # new suite of that family here.
-    # As in Native Port Suites (#9356), every suite step runs under
-    # `!cancelled() && steps.daemon-bin.outcome == 'success'`, so one red
-    # suite cannot hide the others yet no suite runs after a failed setup;
-    # the setup steps (checkout, git identity, download-artifact, --version)
-    # are unguarded and fail-fast. Give a new suite step the same guard.
+    # The second native-suite leg; see `native-suites` for the contract.
+    # The Codex adapter smoke (#4468) is the tier-2 admission gate for the
+    # Codex runtime adapter and makes NO live OpenAI call: spawn-codex.sh's
+    # LOOM_CODEX_NO_EXEC hook plus a fake `codex` shim, with no real `codex`
+    # on PATH. Its Docker fixtures run in ci-daily.yml (#11965).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1991,45 +1854,6 @@ jobs:
       - name: merge-pr pending-vs-failing check-runs classification (#3664, #8191)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-unstable-fallback.sh
-
-  native-port-spawn:
-    name: Native Port Suites (spawn, tokens, daemon-update)
-    needs: [changes, build-daemon]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
-    # Same trigger as Native Port Suites, for the same reason: it SKIPS
-    # whole on a dashboard-only PR and never reaches the download (#9113),
-    # and whenever it runs, build-daemon ran too and the artifact exists.
-    # Split out of Native Port Suites by #11968, which see (and that job's
-    # header) for everything else about this family: that job ran ~8 min
-    # of suites back to back, the longest leg of PR CI. The steps are
-    # unchanged; only which runner runs them moved. Same build, and the
-    # same FAIL-never-SKIP contract without a binary.
-    # This leg holds the spawn-* / token / claude-wrapper / loom-daemon-update
-    # family: wire a new suite of that family here.
-    # As in Native Port Suites (#9356), every suite step runs under
-    # `!cancelled() && steps.daemon-bin.outcome == 'success'`, so one red
-    # suite cannot hide the others yet no suite runs after a failed setup;
-    # the setup steps (checkout, git identity, download-artifact, --version)
-    # are unguarded and fail-fast. Give a new suite step the same guard.
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Configure git identity for suite fixtures
-        # These suites create fixture commits; a fresh runner has no global
-        # identity. Same step shell-suite-tests carries, for the same reason.
-        run: |
-          git config --global user.email "ci@loom.test"
-          git config --global user.name "Loom CI"
-      # Built once by build-daemon (#9065). download-artifact FAILS
-      # when the artifact is missing, so a broken build turns this job red
-      # rather than letting it pass on nothing (ci-principles.md rule 6).
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: loom-daemon-debug
-          path: target/debug
-      - id: daemon-bin
-        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
       # codex-hooks verify`; the suite pins this job's shared build.
       - name: provision-codex-hooks (#4495, #5005, #9390)
@@ -2153,117 +1977,70 @@ jobs:
       - name: tier-3 manifest launch shape (#8671)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-generic-launch.sh
-
-  native-port-daemon-lifecycle:
-    name: Native Port Suites (daemon lifecycle, watchdog)
-    needs: [changes, build-daemon]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
-    # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
-    # reaches the download (#9113). `changes.daemon` OR-s `backend` and
-    # `scripts` in precisely so this stays true: whenever this job runs,
-    # build-daemon ran too and the artifact exists.
-    # Split out of Native Port Suites by #9065, which see for everything else
-    # about this family: that job ran ~420s of suites back to back, the
-    # longest pole in CI. The steps are unchanged; only which runner runs
-    # them moved. Same trigger, same build, and the same FAIL-never-SKIP
-    # contract without a binary.
-    # The spawn-claude suite moved back to Native Port Suites (#9065 follow-up):
-    # with it, this job was the critical path (build-daemon, then 265s). In
-    # this job, as in Native Port Suites (#9356), every suite step runs under
-    # `!cancelled() && steps.daemon-bin.outcome == 'success'`, so one red
-    # suite cannot hide the others yet no suite runs after a failed setup;
-    # the setup steps (checkout, git identity, download-artifact, --version)
-    # are unguarded and fail-fast.
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Configure git identity for suite fixtures
-        # These suites create fixture commits; a fresh runner has no global
-        # identity. Same step shell-suite-tests carries, for the same reason.
+      - name: Syntax-check the Codex adapter and its test
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: |
-          git config --global user.email "ci@loom.test"
-          git config --global user.name "Loom CI"
-      # Built once by build-daemon (#9065). download-artifact FAILS
-      # when the artifact is missing, so a broken build turns this job red
-      # rather than letting it pass on nothing (ci-principles.md rule 6).
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: loom-daemon-debug
-          path: target/debug
-      - id: daemon-bin
-        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
-      # Moved out of shell-suite-tests by #8087, the same move #8086 made for
-      # the watchdog (now further down this job) and for the same
-      # reason: cli/loom-daemon-start.sh is now a thin stub over `loom-daemon
-      # daemon-start`, so these three suites need the binary this job downloads.
-      # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
-      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this caller starts or
-      # probes" — the fake-daemon seam every launch-path case drives — and each
-      # FAILS (never SKIPs) without a binary, so this job cannot report green
-      # while running nothing.
-      #
-      # All three, not just the start suite: test-loom-daemon-launchd-plist.sh
-      # renders every plist by invoking the real start script, and
-      # test-loom-daemon-update.sh builds its fixtures from
-      # lib/daemon-update-fixtures.sh, which copies that script in and execs it
-      # on the restart / --relaunch / full-update flows.
-      #
-      # Running them here rather than in shell-suite-tests also means the
-      # live-daemon guard (#6386) no longer covers the two that are
-      # LIVE_DAEMON_GUARDED_SUITES members. Same reasoning as the watchdog's:
-      # safe on THIS runner and only here — a GitHub runner has no
-      # daemon, no pid file and nothing to bootout. On a developer host, run
-      # them through run-ci-suites.sh, which still names both in that guard.
-      #
-      # This job's steps are sequential, so the pair also gets the isolation
-      # run-ci-suites.sh's SERIAL_LANE_SUITES pin (#6622 AC5, #6639/#7391) was
-      # giving them inside its concurrent pool — by construction rather than by
-      # quarantine list.
-      - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
+          bash -n defaults/scripts/spawn-codex.sh
+          bash -n defaults/scripts/tests/test-spawn-codex.sh
+      - name: Assert the suite cannot reach a real Codex CLI
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-loom-daemon-start.sh
-      # #11934: a relaunch must not switch the work finder off (split out of
-      # the frozen test-loom-daemon-start.sh).
-      - name: loom-daemon-start keeps the work finder (#11934)
+        # Structural guard: the test must never install, download, or otherwise
+        # obtain the real Codex CLI. Combined with `codex` being absent from
+        # this runner's PATH, that makes a live OpenAI call impossible.
+        run: |
+          if grep -nE '(npm|brew|pipx?|curl|wget) .*(codex|openai)' \
+              defaults/scripts/tests/test-spawn-codex.sh; then
+            echo "::error::test-spawn-codex.sh must not install or fetch a real Codex CLI"
+            exit 1
+          fi
+          # This leg is expected to run on a runner with no Codex CLI at all.
+          # A warning rather than a failure: if a future runner image ships
+          # `codex`, the suite is still hermetic (every dispatch test prepends
+          # its own mock to PATH, and the argv tests never exec anything), so a
+          # hard failure here would be spurious rather than protective.
+          if command -v codex >/dev/null 2>&1; then
+            echo "::warning::a real 'codex' is on PATH; the suite still mocks every dispatch, but verify no test bypasses the mock"
+          fi
+      - name: Validate the Codex runtime capability manifest
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-loom-daemon-start-work-finder.sh
-      - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
+        run: |
+          # Valid JSON with the tri-state schema check-runtime-capabilities.sh reads.
+          jq -e '.runtime == "codex" and (.capabilities | type == "object")' \
+            defaults/runtimes/codex.json > /dev/null
+          bad="$(jq -r '.capabilities | to_entries[]
+                        | select(.value != "yes" and .value != "no" and .value != "partial")
+                        | .key' defaults/runtimes/codex.json)"
+          if [[ -n "$bad" ]]; then
+            echo "::error::codex.json capability value outside yes|no|partial: $bad"
+            exit 1
+          fi
+          # Codex declares worktreeIsolation=partial, so the Builder role (which
+          # requires it) must fail closed with EX_CONFIG (78). This pins the
+          # guardrail-parity doc's residual gap 2 to an executable assertion.
+          rc=0
+          bash defaults/scripts/check-runtime-capabilities.sh \
+            --role builder --runtime codex --dir defaults >/dev/null 2>&1 || rc=$?
+          if [[ "$rc" != "78" ]]; then
+            echo "::error::builder+codex must be incompatible (expected 78, got $rc)"
+            exit 1
+          fi
+          # Judge requires only mcp (declared "yes"), so it must be compatible.
+          bash defaults/scripts/check-runtime-capabilities.sh \
+            --role judge --runtime codex --dir defaults >/dev/null
+      - name: Assert the guardrail-parity doc exists (contract point 6)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
-      - name: loom-daemon-update (#4078, #6639, #8087)
+        # No runtime is admitted without a parity doc naming its residual gaps.
+        run: |
+          test -f defaults/docs/guardrail-parity-codex.md
+          grep -q '## Residual gaps' defaults/docs/guardrail-parity-codex.md
+      - name: Run the mocked Codex adapter test suite
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-loom-daemon-update.sh
-      # #11934: --relaunch keeps a config-driven unit config-driven (split
-      # out of the frozen test-loom-daemon-update.sh).
-      - name: loom-daemon-update --relaunch keeps config-driven loops (#11934)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-loom-daemon-update-relaunch-config.sh
-      # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
-      # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
-      # (188 + 27 assertions, unchanged from the shell implementation apart
-      # from four explicitly-retired cases) need the binary this job downloads.
-      # They pin it via loom_test_require_daemon_bin --self-only, which leaves
-      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this watchdog probes"
-      # — the mock seam every IPC-probe case drives.
-      #
-      # Running them here rather than in shell-suite-tests also means the
-      # live-daemon guard (#6386) no longer covers them. That is safe on THIS
-      # runner and only here: a GitHub runner has no daemon, no pid file and
-      # nothing to bootout. On a developer host, run them through
-      # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
-      - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
+        run: bash defaults/scripts/tests/test-spawn-codex.sh
 
   installer-tests:
     name: Installer Integration Tests
     needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
-    # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
-    # reaches the download (#9113). `changes.daemon` OR-s `backend` and
-    # `scripts` in precisely so this stays true: whenever this job runs,
-    # build-daemon ran too and the artifact exists.
     # Portable across GNU/BSD sed (temp-file + mv idiom) — runs on ubuntu (#3515)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -2304,89 +2081,6 @@ jobs:
         run: bash scripts/test-install-local-mode.sh
       - name: Run migrate-consumer tests (#5276)
         run: bash scripts/test-migrate-consumer.sh
-
-  codex-adapter-smoke:
-    name: Codex Adapter Smoke (mocked)
-    needs: [changes, build-daemon]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
-    # Tier-2 admission gate for the Codex runtime adapter (epic #4167 Phase 2,
-    # issue #4468): a green leg here is what admits the adapter per
-    # defaults/docs/runtime-adapters.md's tier policy.
-    #
-    # NO LIVE OpenAI CALLS. The suite is hermetic by construction — it uses
-    # spawn-codex.sh's LOOM_CODEX_NO_EXEC argv-only hook plus a fake `codex`
-    # shim on a temp PATH, so the real Codex CLI is never installed or invoked
-    # and no credential is required. `codex` is deliberately NOT on PATH here,
-    # which also exercises the missing-binary (exit 127) path.
-    #
-    # The Docker-backed session-exec / private-workspace fixtures moved to
-    # ci-daily.yml's docker-fixtures job (#11965).
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Built once by build-daemon (#9065). download-artifact FAILS when the
-      # artifact is missing, so a broken build turns this job red rather than
-      # letting it pass on nothing (ci-principles.md rule 6).
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: loom-daemon-debug
-          path: target/debug
-      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
-      - name: Syntax-check the Codex adapter and its test
-        run: |
-          bash -n defaults/scripts/spawn-codex.sh
-          bash -n defaults/scripts/tests/test-spawn-codex.sh
-      - name: Assert the suite cannot reach a real Codex CLI
-        # Structural guard: the test must never install, download, or otherwise
-        # obtain the real Codex CLI. Combined with `codex` being absent from
-        # this runner's PATH, that makes a live OpenAI call impossible.
-        run: |
-          if grep -nE '(npm|brew|pipx?|curl|wget) .*(codex|openai)' \
-              defaults/scripts/tests/test-spawn-codex.sh; then
-            echo "::error::test-spawn-codex.sh must not install or fetch a real Codex CLI"
-            exit 1
-          fi
-          # This leg is expected to run on a runner with no Codex CLI at all.
-          # A warning rather than a failure: if a future runner image ships
-          # `codex`, the suite is still hermetic (every dispatch test prepends
-          # its own mock to PATH, and the argv tests never exec anything), so a
-          # hard failure here would be spurious rather than protective.
-          if command -v codex >/dev/null 2>&1; then
-            echo "::warning::a real 'codex' is on PATH; the suite still mocks every dispatch, but verify no test bypasses the mock"
-          fi
-      - name: Validate the Codex runtime capability manifest
-        run: |
-          # Valid JSON with the tri-state schema check-runtime-capabilities.sh reads.
-          jq -e '.runtime == "codex" and (.capabilities | type == "object")' \
-            defaults/runtimes/codex.json > /dev/null
-          bad="$(jq -r '.capabilities | to_entries[]
-                        | select(.value != "yes" and .value != "no" and .value != "partial")
-                        | .key' defaults/runtimes/codex.json)"
-          if [[ -n "$bad" ]]; then
-            echo "::error::codex.json capability value outside yes|no|partial: $bad"
-            exit 1
-          fi
-          # Codex declares worktreeIsolation=partial, so the Builder role (which
-          # requires it) must fail closed with EX_CONFIG (78). This pins the
-          # guardrail-parity doc's residual gap 2 to an executable assertion.
-          rc=0
-          bash defaults/scripts/check-runtime-capabilities.sh \
-            --role builder --runtime codex --dir defaults >/dev/null 2>&1 || rc=$?
-          if [[ "$rc" != "78" ]]; then
-            echo "::error::builder+codex must be incompatible (expected 78, got $rc)"
-            exit 1
-          fi
-          # Judge requires only mcp (declared "yes"), so it must be compatible.
-          bash defaults/scripts/check-runtime-capabilities.sh \
-            --role judge --runtime codex --dir defaults >/dev/null
-      - name: Assert the guardrail-parity doc exists (contract point 6)
-        # No runtime is admitted without a parity doc naming its residual gaps.
-        run: |
-          test -f defaults/docs/guardrail-parity-codex.md
-          grep -q '## Residual gaps' defaults/docs/guardrail-parity-codex.md
-      - name: Run the mocked Codex adapter test suite
-        run: bash defaults/scripts/tests/test-spawn-codex.sh
 
   shell-suite-tests:
     name: Shell Test Suites (hermetic, ${{ matrix.shard }}/${{ strategy.job-total }})
@@ -2509,9 +2203,9 @@ jobs:
     # tarball it uploads, under the exact tags they used before
     # (`loom-worker:ci-smoke` and `ghcr.io/rjwalters/loom-worker:ci-smoke`, the
     # overlays' BASE_IMAGE). Same `if:` as the smokes, so it runs exactly when
-    # they do: always on merge_group; on push only when `changes-push` found an
+    # they do: always on merge_group; on push only when `changes` found an
     # image input since the last green push run, or did not succeed (fails
-    # closed); on a PR when `changes-images.docker` is true (#10825). `release-build`'s
+    # closed); on a PR when `changes.docker` is true (#10825). `release-build`'s
     # gate must stay a superset of this one (equal on PRs; see its comment).
     #
     # Layer cache: a REGISTRY cache at ghcr.io/rjwalters/loom-worker:buildcache,
@@ -2530,11 +2224,11 @@ jobs:
     # same-repo PR must not be able to seed the cache main builds from. The
     # published `:latest` is not used as cache-from: CI passes APT_MIRROR and
     # release does not, so its apt layers never match.
-    needs: [changes, changes-images, changes-push, release-build]
+    needs: [changes, release-build]
     if: >-
       always() && (github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
-      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
+      (github.event_name == 'push' && (needs.changes.result != 'success' || needs.changes.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -2601,7 +2295,7 @@ jobs:
     # Nothing `needs:` it except `ci-result` (off the image critical path).
     # The binary comes from the same staging seam as `worker-base-image`
     # (#10824; `release-build` runs unconditionally on push). On push it uses
-    # the same `changes-push` filter as `worker-base-image` (#10825): skipped
+    # the same `changes.docker` filter as `worker-base-image` (#10825): skipped
     # only when that detector SUCCEEDED with docker=false (no image input
     # changed, so the cache would be unchanged), run otherwise (fails
     # closed). `ignore-error=true` keeps a registry hiccup on export from
@@ -2612,11 +2306,11 @@ jobs:
     # needed; it is push-only, not pr-only). `ci-result` passes its PR-time
     # `skipped` because Detect Changes succeeded, and its merge_group skip
     # because merge_group has no path filter (scripts/ci-result-gate.sh).
-    needs: [changes-push, release-build]
+    needs: [changes, release-build]
     if: >-
       always() && needs.release-build.result == 'success' &&
       github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rjwalters/loom' &&
-      (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')
+      (needs.changes.result != 'success' || needs.changes.outputs.docker != 'false')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -2665,14 +2359,14 @@ jobs:
     # this job RUNNING when that producer failed, so the first step turns it
     # red instead of skipped (ci-principles rule 7). The image gate (#10825,
     # shared by all four image jobs): `merge_group` FIRST, so the merge-group
-    # audit proves it runs there unconditionally; on push, `changes-push`'s
-    # diff since the last green push run, run anyway unless that job
-    # succeeded with docker=false; on a PR, `changes-images.docker`.
-    needs: [changes, changes-images, changes-push, worker-base-image]
+    # audit proves it runs there unconditionally; on push and on a PR,
+    # `changes.docker`, run anyway on push unless `changes` succeeded with
+    # docker=false.
+    needs: [changes, worker-base-image]
     if: >-
       always() && (github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
-      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
+      (github.event_name == 'push' && (needs.changes.result != 'success' || needs.changes.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2716,11 +2410,11 @@ jobs:
     # `worker-base-image` built from the PR's own Dockerfile (#10822), loaded
     # under ghcr.io/rjwalters/loom-worker:ci-smoke -- never a pull of the
     # published image, which a PR's Dockerfile changes are not in.
-    needs: [changes, changes-images, changes-push, worker-base-image]
+    needs: [changes, worker-base-image]
     if: >-
       always() && (github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
-      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
+      (github.event_name == 'push' && (needs.changes.result != 'success' || needs.changes.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2765,11 +2459,11 @@ jobs:
     # equality assertions in docker/native/Dockerfile and
     # docker/native/test-image.sh fail HERE, on the PR that changes a pin,
     # instead of during a release.
-    needs: [changes, changes-images, changes-push, worker-base-image]
+    needs: [changes, worker-base-image]
     if: >-
       always() && (github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
-      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
+      (github.event_name == 'push' && (needs.changes.result != 'success' || needs.changes.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2801,21 +2495,17 @@ jobs:
       - name: Run the smoke test
         run: ./docker/native/test-image.sh loom-worker-native:ci-smoke
 
-  # Aggregate gate (#10444). A cancelled / never-acquired `Detect Changes`
-  # skips every path-filtered job behind it, and the three always-run required
-  # contexts stay green, so #10403 merged with no Rust lint or tests run.
-  # This job runs `if: always()`, needs EVERY other job, and fails when
-  # `Detect Changes` is not `success` on a PR, when any job failed/cancelled,
-  # or when a job was skipped only because its upstream did not succeed. A
-  # skip the path filter actually decided stays a pass. On push the only
-  # filter is `changes-push` (#10825): the image jobs skip only when it
-  # SUCCEEDED with docker=false; if it fails or is cancelled they run anyway
-  # and its own result fails this gate, so it fails closed. Rule:
-  # scripts/ci-result-gate.sh. Making it a
-  # REQUIRED context is a ruleset change applied by an operator AFTER this job
-  # has reported on `main` (setup-branch-protection.sh); a required context
-  # that never reports blocks every merge. The remedy for a red result is
-  # `gh run rerun --failed <run>` -- never cancel a distinct commit's run.
+  # Aggregate gate (#10444) and, since #12106, the ONE required check. A
+  # cancelled / never-acquired `Detect Changes` skips every path-filtered job
+  # behind it, so #10403 merged with no Rust lint or tests run. This job runs
+  # `if: always()`, needs EVERY other job, and fails when `Detect Changes` is
+  # not `success` on a PR or push, when any job failed/cancelled, or when a
+  # job was skipped only because its upstream did not succeed. A skip the
+  # path filter actually decided stays a pass. Rule: scripts/ci-result-gate.sh.
+  # The ruleset requires it by name (.loom/config.json requiredStatusChecks,
+  # applied by setup-branch-protection.sh); never rename it. The remedy for a
+  # red result is `gh run rerun --failed <run>` -- never cancel a distinct
+  # commit's run.
   ci-result:
     # No `merge-group-audit: pr-only` marker: `if: always()` runs this on every
     # event, merge_group included, so the audit must count it as relied-on.
@@ -2823,24 +2513,16 @@ jobs:
     if: always()
     needs:
       - changes
-      - changes-images
-      - changes-push
       - build-daemon
       - release-build
       - node-packages
       - backend-lint-and-check
       - backend-tests
-      - structural-checks
-      - daemon-checks
-      - install-surface-checks
-      - repo-hygiene
+      - lint
       - shell-syntax
-      - dep-classification-suites
-      - native-port-merge-pr
-      - native-port-spawn
-      - native-port-daemon-lifecycle
+      - native-suites
+      - native-suites-agents
       - installer-tests
-      - codex-adapter-smoke
       - shell-suite-tests
       - worker-base-image
       - worker-buildcache

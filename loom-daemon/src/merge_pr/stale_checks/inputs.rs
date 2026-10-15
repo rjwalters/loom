@@ -475,13 +475,11 @@ const MARKDOWN: &[&str] = &["**/*.md"];
 /// `main`'s required status-check contexts, as branch protection names them
 /// (`.loom/config.json` `branchProtection.requiredStatusChecks`, applied by
 /// `scripts/install/setup-branch-protection.sh`). The pin test asserts each has
-/// a [`RequiredCheck`] and each names a real `ci.yml` job.
-pub const REQUIRED_CONTEXTS: &[&str] = &[
-    "Structural Checks",
-    "Shell Syntax (macos-latest)",
-    "Daemon Checks",
-    "CI Result",
-];
+/// a [`RequiredCheck`] and each names a real `ci.yml` job. Since #12106 the
+/// one required context is the `CI Result` aggregate; `Lint` and the macOS
+/// `Shell Syntax` leg are [`REQUIRED_CHECKS`] entries only so the aggregate
+/// can judge their components one by one.
+pub const REQUIRED_CONTEXTS: &[&str] = &["CI Result"];
 
 /// One required context and the component checks its job runs as steps.
 ///
@@ -514,8 +512,10 @@ pub struct RequiredCheck {
 
 /// Required context → component gates. See [`RequiredCheck`].
 pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
+    // The `Lint` job (#12106): the former Structural Checks, Repo Hygiene,
+    // Daemon Checks and Install Surface Checks jobs, one component per gate.
     RequiredCheck {
-        context: "Structural Checks",
+        context: "Lint",
         components: &[
             "Conflict Marker Check",
             "AGENTS.md Sync Check",
@@ -526,6 +526,13 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
             "Dangling Link Check",
             "PRs Must Not Hand-Edit Version-Bearing Files",
             "Shell Syntax (ubuntu-latest)",
+            "Retired List Drift",
+            "Stale Model Pin Check",
+            ".gitignore Convergence Check",
+            "Secret Scan",
+            "MCP Guard Wiring Contract",
+            "Fresh Install Link Check",
+            "Compatibility Contract",
         ],
         aggregates: &[],
     },
@@ -534,27 +541,15 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
         components: &["Shell Syntax (macos-latest)"],
         aggregates: &[],
     },
-    RequiredCheck {
-        context: "Daemon Checks",
-        components: &[
-            ".gitignore Convergence Check",
-            "Secret Scan",
-            "MCP Guard Wiring Contract",
-        ],
-        aggregates: &[],
-    },
-    // The always-run aggregate (#10444): it fails when any job it `needs:`
-    // failed or was cancelled. Its own component covers the gate script and
-    // every job no other required context runs; the three required contexts
-    // it also aggregates contribute their components unchanged.
+    // The always-run aggregate (#10444) and the one required context
+    // (#12106): it fails when any job it `needs:` failed or was cancelled. Its
+    // own component covers the gate script and every job no granular entry
+    // runs; the two granular entries it aggregates contribute their components
+    // unchanged.
     RequiredCheck {
         context: "CI Result",
         components: &["CI Result"],
-        aggregates: &[
-            "Structural Checks",
-            "Shell Syntax (macos-latest)",
-            "Daemon Checks",
-        ],
+        aggregates: &["Lint", "Shell Syntax (macos-latest)"],
     },
 ];
 
@@ -780,10 +775,58 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         coupled: &[],
         removal_sensitive: false,
     },
+    // Diffs `defaults/` deletions since the merge-base against the retired
+    // list, so a deletion on one side and a list edit on the other interact.
+    CheckSpec {
+        context: "Retired List Drift",
+        global: &[
+            "scripts/check-retired-list-drift.sh",
+            "defaults/scripts/resync-installed.sh",
+            CI_WORKFLOW,
+        ],
+        scanned: &[],
+        coupled: &["defaults/**"],
+        removal_sensitive: true,
+    },
+    // An inline grep over the dispatching workflows and top-level scripts;
+    // per-file.
+    CheckSpec {
+        context: "Stale Model Pin Check",
+        global: &[CI_WORKFLOW],
+        scanned: &[".github/workflows/*.yml", "defaults/scripts/*.sh"],
+        coupled: &[],
+        removal_sensitive: false,
+    },
+    // `loom-daemon init` of the whole `defaults/` tree into a fixture, then the
+    // installer's own link check: the daemon's init path and every shipped
+    // file are inputs, and a deletion anywhere can break a link.
+    CheckSpec {
+        context: "Fresh Install Link Check",
+        global: &[
+            "loom-daemon/**",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            CI_WORKFLOW,
+        ],
+        scanned: &[],
+        coupled: &["defaults/**"],
+        removal_sensitive: true,
+    },
+    // `loom-daemon install-compat check` (#10716) also reads release tags and
+    // assets, which no input set can model, so every tracked input is global.
+    CheckSpec {
+        context: "Compatibility Contract",
+        global: CI_RESULT_GLOBAL,
+        scanned: &[],
+        coupled: &[],
+        removal_sensitive: false,
+    },
     // `CI Result`'s own component (#10444): the gate script plus the inputs of
     // every job it `needs:` that no other required context runs — the Rust
     // build/lint/test jobs, `node-packages`, the installer/codex/dep suites,
-    // `shell-suite-tests`, `install-surface-checks`, `repo-hygiene` and the
+    // `shell-suite-tests` and the
     // image smokes. Global: a Rust or shell suite's verdict can hinge on any
     // file it compiles or reads, so any interaction refuses.
     //
@@ -814,7 +857,7 @@ pub const SPECS: &[CheckSpec<'static>] = &[
 /// `assets/**`, `.vscode/**` and the editor/bot dotfiles. (`WORK_PLAN.md` IS
 /// read — by two `shell-suite-tests` suites — and is in the spec's `coupled`
 /// set rather than here; see the `CI Result` `CheckSpec`.) The
-/// markdown among them is still judged by the `Structural Checks` components
+/// markdown among them is still judged by the `Lint` components
 /// (`Dangling Link Check`, `Conflict Marker Check`, …) this aggregate composes.
 /// So an edit to `README.md` on `main` does not, on its own, refuse every PR.
 const CI_RESULT_GLOBAL: &[&str] = &[

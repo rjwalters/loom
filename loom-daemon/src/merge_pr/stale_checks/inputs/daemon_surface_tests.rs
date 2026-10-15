@@ -543,7 +543,16 @@ fn spec(ctx: &str) -> &'static CheckSpec<'static> {
 fn the_9543_pair_is_fresh_for_every_daemon_checks_component() {
     // The observed refusal: base moved `cli/forge_action.rs`, the PR touched
     // `init/post_init.rs` (plus, as such PRs do, a shell script).
-    let specs = specs_for("Daemon Checks").expect("composite resolves");
+    // The three daemon-subcommand components of `Lint` (#12106 merged the
+    // former Daemon Checks job into it).
+    let specs: Vec<_> = [
+        ".gitignore Convergence Check",
+        "Secret Scan",
+        "MCP Guard Wiring Contract",
+    ]
+    .iter()
+    .map(|c| spec(c))
+    .collect();
     let d = set(&["loom-daemon/src/cli/forge_action.rs"]);
     let p = set(&[
         "loom-daemon/src/init/post_init.rs",

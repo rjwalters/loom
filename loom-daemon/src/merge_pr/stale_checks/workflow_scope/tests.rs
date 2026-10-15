@@ -93,8 +93,8 @@ fn component_ranges_are_disjoint_and_inside_their_job() {
 #[test]
 fn needs_are_read_from_the_key_indented_line_only() {
     let wf = workflow();
-    let daemon = wf.job_named("Daemon Checks").expect("Daemon Checks");
-    assert_eq!(daemon.needs, vec!["build-daemon".to_string(), "changes".to_string()]);
+    let daemon = wf.job_named("Lint").expect("Lint");
+    assert_eq!(daemon.needs, vec!["build-daemon".to_string()]);
     // `shell-syntax`'s prose says "it needs a macOS runner"; that is not a
     // `needs:` key and must not be read as one.
     let macos = wf
@@ -139,11 +139,11 @@ fn a_base_move_editing_a_job_only_the_aggregate_needs_affects_only_ci_result() {
 
 #[test]
 fn the_aggregate_does_not_re_own_the_jobs_it_folds_in() {
-    // An edit inside `structural-checks` is attributed to that job's
+    // An edit inside `lint` is attributed to that job's
     // components, which `specs_for("CI Result")` already judges — so it must
     // NOT also land on `CI Result`'s own, much broader, component (#10444).
     let wf = workflow();
-    let job = wf.job_named("Structural Checks").expect("job");
+    let job = wf.job_named("Lint").expect("job");
     let target = job
         .components
         .iter()
@@ -164,9 +164,7 @@ fn the_aggregate_does_not_re_own_the_jobs_it_folds_in() {
 #[test]
 fn a_base_move_inside_one_component_block_affects_only_that_component() {
     let wf = workflow();
-    let job = wf
-        .job_named("Structural Checks")
-        .expect("Structural Checks");
+    let job = wf.job_named("Lint").expect("Lint");
     let target = job
         .components
         .iter()
@@ -186,14 +184,12 @@ fn a_base_move_inside_one_component_block_affects_only_that_component() {
 #[test]
 fn a_base_move_in_a_composite_jobs_setup_affects_all_its_components() {
     let wf = workflow();
-    let job = wf
-        .job_named("Structural Checks")
-        .expect("Structural Checks");
+    let job = wf.job_named("Lint").expect("Lint");
     let first = job.components.first().expect("markers").start;
     let hit = affected(&add_at(first - 1));
     let expected: BTreeSet<String> = REQUIRED_CHECKS
         .iter()
-        .find(|r| r.context == "Structural Checks")
+        .find(|r| r.context == "Lint")
         .expect("entry")
         .components
         .iter()
@@ -204,12 +200,12 @@ fn a_base_move_in_a_composite_jobs_setup_affects_all_its_components() {
 
 #[test]
 fn a_base_move_in_a_needed_job_affects_the_components_that_need_it() {
-    // `daemon-checks` needs `build-daemon`; `structural-checks` does not.
+    // `lint` needs `build-daemon`; `lint` does not.
     let line = line_of("  build-daemon:") + 2;
     let hit = affected(&add_at(line));
     let daemon: BTreeSet<String> = REQUIRED_CHECKS
         .iter()
-        .find(|r| r.context == "Daemon Checks")
+        .find(|r| r.context == "Lint")
         .expect("entry")
         .components
         .iter()
@@ -226,7 +222,7 @@ fn a_component_name_in_the_scope_always_names_a_real_spec() {
     // narrowing drop a real global-input move.
     let wf = workflow();
     let line = wf
-        .job_named("Structural Checks")
+        .job_named("Lint")
         .expect("job")
         .components
         .first()
@@ -270,7 +266,7 @@ fn an_ordinary_deletion_is_attributed_not_refused() {
     // line is charged to the block it sat in.
     let wf = workflow();
     let target = wf
-        .job_named("Structural Checks")
+        .job_named("Lint")
         .expect("job")
         .components
         .iter()
@@ -370,7 +366,7 @@ fn a_required_job_whose_markers_disagree_with_the_table_is_unscoped() {
     // never run against the PR's tree. An unrecognised marker set therefore
     // restores the whole-file meaning instead.
     let wf = workflow();
-    let job = wf.job_named("Structural Checks").expect("job");
+    let job = wf.job_named("Lint").expect("job");
     // Splice the new marker in immediately after an existing one, so the file
     // still parses as a workflow and only the marker SET changes.
     let anchor = job.components.first().expect("markers").start;
@@ -379,7 +375,7 @@ fn a_required_job_whose_markers_disagree_with_the_table_is_unscoped() {
     let spliced = parse(&lines.join("\n"));
     assert!(
         spliced
-            .job_named("Structural Checks")
+            .job_named("Lint")
             .expect("job")
             .components
             .iter()
@@ -484,7 +480,7 @@ fn the_pr_side_is_attributed_by_the_same_machinery_as_the_base_side() {
     );
 
     let own_block = wf
-        .job_named("Structural Checks")
+        .job_named("Lint")
         .expect("job")
         .components
         .iter()

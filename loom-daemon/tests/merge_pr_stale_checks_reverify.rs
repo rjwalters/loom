@@ -23,8 +23,8 @@ const CLEAN: &str = "LOOM-STALE-CHECKS-CLEAN";
 
 /// The fixture's ci.yml: one allowlisted component, run as CI would.
 const CI_YML: &str = "jobs:
-  structural-checks:
-    name: Structural Checks
+  lint:
+    name: Lint
     steps:
       # component: Conflict Marker Check
       - name: Check no tracked file carries git conflict markers
@@ -162,15 +162,15 @@ impl Fixture {
         let mut v = serde_json::json!({
             "tip_sha": self.base,
             "base_tip": "2026-10-05T07:00:00Z",
-            "required": ["Structural Checks"],
+            "required": ["Lint"],
             "check_runs": [{
-                "name": "Structural Checks",
+                "name": "Lint",
                 "status": "completed",
                 "conclusion": "success",
                 "started_at": "2026-10-05T06:00:00Z"
             }],
             "pr_files": [{"filename": "notes/plan.txt", "status": "modified"}],
-            "base_moves": {"Structural Checks": {
+            "base_moves": {"Lint": {
                 "tested_base": self.root,
                 "files": [{"filename": "notes/plan.txt", "status": "modified"}]
             }}

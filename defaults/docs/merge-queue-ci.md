@@ -126,9 +126,10 @@ A missing or `null` field means "unknown".
   ([ci-principles](ci-principles.md) rule 2).
 - The PR-only steps that guard the merged tree also run on `merge_group`, over
   `merge_group.base_sha..head_sha`. These are the version-bearing-file check
-  in `Structural Checks` and the secret scan in `Daemon Checks`.
-- No checkout sets `ref:`, so every checkout lands on `github.sha`, which is
-  the merge-group head.
+  and the secret scan, both in `Lint`.
+- No checkout that runs on `merge_group` sets `ref:`, so every such checkout
+  lands on `github.sha`, which is the merge-group head. (`Detect Changes`
+  checks out the PR base, and does not run on `merge_group`.)
 - Regression tests in `loom-daemon/src/merge_group_ci/tests.rs` audit this
   repository's own workflows against `.loom/config.json`'s required checks.
   They also assert that every job still runs on `push` and may still run on a

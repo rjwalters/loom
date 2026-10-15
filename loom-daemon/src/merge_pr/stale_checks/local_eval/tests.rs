@@ -45,18 +45,19 @@ fn evidence(pr: &[&str], moves: Vec<(&str, BaseMove)>) -> ScopedEvidence {
     }
 }
 
-const STRUCT: &str = "Structural Checks";
-const DAEMON: &str = "Daemon Checks";
+const STRUCT: &str = "Lint";
+const DAEMON: &str = "CI Result";
 
 fn req(names: &[&str]) -> Vec<String> {
     names.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// The 2026-10-04/05 shape: a fleet merge and this PR both touched the role
-/// prompt surface. Only cheap content/link gates go stale.
+/// A merge and this PR both touched the same guide: only the cheap
+/// content/link gates go stale. (A `defaults/` file would also stale the
+/// install-surface components, which need the daemon.)
 fn prompt_surface_evidence() -> ScopedEvidence {
-    const JUDGE: &str = "defaults/.claude/commands/loom/judge.md";
-    evidence(&[JUDGE], vec![(STRUCT, mv(&[JUDGE]))])
+    const GUIDE: &str = "docs/guides/testing.md";
+    evidence(&[GUIDE], vec![(STRUCT, mv(&[GUIDE]))])
 }
 
 #[test]
@@ -86,18 +87,18 @@ fn a_stale_expensive_component_in_the_same_context_still_blocks() {
 
 #[test]
 fn mixed_cheap_and_expensive_contexts_still_block() {
-    // Structural Checks stale only on cheap components; Daemon Checks stale
-    // because the base moved Cargo.lock (a global input of the Rust gates).
+    // Lint stale only on cheap components; CI Result stale because the base
+    // moved Cargo.lock (a global input of its own Rust-suite component).
     let ev = evidence(
-        &["defaults/docs/eta.md", "loom-daemon/src/secret_scan.rs"],
+        &["docs/guides/testing.md", "loom-daemon/src/secret_scan.rs"],
         vec![
-            (STRUCT, mv(&["defaults/docs/eta.md"])),
+            (STRUCT, mv(&["docs/guides/testing.md"])),
             (DAEMON, mv(&["Cargo.lock"])),
         ],
     );
     let runs = vec![green(STRUCT), green(DAEMON)];
     let (v, _) = assess_scoped(tip(), &req(&[DAEMON]), &runs, Some(&ev));
-    assert!(matches!(v, Verdict::StaleInputs { .. }), "fixture: Daemon Checks stale: {v:?}");
+    assert!(matches!(v, Verdict::StaleInputs { .. }), "fixture: CI Result stale: {v:?}");
     assert_eq!(locally_evaluable(tip(), &req(&[STRUCT, DAEMON]), &runs, Some(&ev)), None);
     // ...and the cheap context alone would have qualified.
     assert!(locally_evaluable(tip(), &req(&[STRUCT]), &runs, Some(&ev)).is_some());
@@ -131,8 +132,8 @@ fn a_pr_that_edits_check_code_is_never_evaluated_locally() {
         ".github/workflows/ci.yml",
     ] {
         let ev = evidence(
-            &["defaults/docs/eta.md", code],
-            vec![(STRUCT, mv(&["defaults/docs/eta.md"]))],
+            &["docs/guides/testing.md", code],
+            vec![(STRUCT, mv(&["docs/guides/testing.md"]))],
         );
         let runs = vec![green(STRUCT)];
         assert_eq!(locally_evaluable(tip(), &req(&[STRUCT]), &runs, Some(&ev)), None, "{code}");
@@ -198,8 +199,8 @@ test \"$(wc -l < items)\" -le \"$(cat limit)\"\n";
 
 /// The fixture's ci.yml: the merge tree's own steps are what runs.
 const FIXTURE_CI: &str = "jobs:
-  structural-checks:
-    name: Structural Checks
+  lint:
+    name: Lint
     steps:
       # component: Conflict Marker Check
       - name: Check the ratchet
@@ -528,7 +529,7 @@ fn a_pr_script_edit_missing_from_the_api_delta_is_still_never_run() {
     let pwned = t.path().join("pwned");
     let evil = format!("touch '{}'\n", pwned.display());
     let f = fixture_pr(&unrelated, &|w: &Path| std::fs::write(w.join("check.sh"), &evil).unwrap());
-    let ev = evidence(&["defaults/docs/eta.md"], vec![(STRUCT, mv(&["defaults/docs/eta.md"]))]);
+    let ev = evidence(&["docs/guides/testing.md"], vec![(STRUCT, mv(&["docs/guides/testing.md"]))]);
     assert!(
         locally_evaluable(tip(), &req(&[STRUCT]), &[green(STRUCT)], Some(&ev)).is_some(),
         "fixture: the truncated API delta passes the fast-path screen"
