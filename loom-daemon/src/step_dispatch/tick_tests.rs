@@ -333,3 +333,28 @@ fn a_refused_draw_is_counted_on_the_record() {
     assert_eq!((refused.repo.as_str(), refused.count), ("acme/one", 1));
     assert_eq!(refused.skip_reason, PickSkipReason::InFlight);
 }
+
+/// A failed open-PR listing, or a stale fallback listing, draws no Builder
+/// step: the Builder claim is a blind label flip (#11909).
+#[test]
+fn no_builder_step_is_drawn_without_a_fresh_pr_listing() {
+    let mut ws = workspace(0, "acme/one", &forge());
+    assert!(ws
+        .weighing
+        .pool
+        .iter()
+        .any(|c| c.step == crate::work_finder::step_item::Step::Builder));
+    let before = ws.weighing.pool.len();
+    exclude_builders(&mut ws.weighing);
+    assert!(ws
+        .weighing
+        .pool
+        .iter()
+        .all(|c| c.step != crate::work_finder::step_item::Step::Builder));
+    assert_eq!(ws.weighing.pool.len(), before - 1, "only #3 was a Builder step");
+    assert_eq!(
+        ws.weighing.excluded
+            [&crate::step_dispatch::item_draw::Exclusion::Pass(PassReason::SharedPr)],
+        1
+    );
+}

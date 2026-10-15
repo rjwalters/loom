@@ -19,6 +19,7 @@ use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
 use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest};
 use crate::sweep_registry::SweepRegistry;
+use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::repo_cap::{RepoCap, RepoLimits};
 use crate::work_finder::step_item::Lane;
@@ -119,6 +120,9 @@ impl StepDriver {
         let held_capabilities = crate::capability::held_capabilities();
         let mut workspaces = Vec::new();
         let mut listing_failed = Vec::new();
+        // `loom.step.actionable{repo}`: the drawable depth the stalled and
+        // idle alerts key on. Absent, never 0, for a repo not listed.
+        let mut actionable = Vec::new();
         for (idx, root) in input.roots.iter().enumerate() {
             // Record the steps that ended since the last tick first, so the
             // cooldowns they arm hold for this draw.
@@ -182,12 +186,22 @@ impl StepDriver {
             let mut weighing = weigh(&gathered.inputs, &ctx, &ItemWeights::for_root(root));
             // This host's and the peers' live claims (B1, M5).
             tick::exclude_claimed(&mut weighing, &claims);
-            if !gathered.pulls_complete {
+            // A Builder claim is a blind label flip: no Builder step when the
+            // open-PR listing failed (a branch-only PR is invisible) or the
+            // items are the last good listing, not this tick's.
+            if !gathered.pulls_complete || gathered.stale_listing {
                 tick::exclude_builders(&mut weighing);
             }
             if fixes_only {
                 weighing.pool.retain(|c| c.item.lane == Lane::RedMain);
             }
+            actionable.push(
+                MetricPoint::int(
+                    MetricName::StepActionable,
+                    i64::try_from(weighing.pool.len()).unwrap_or(i64::MAX),
+                )
+                .label("repo", repo.clone()),
+            );
             workspaces.push(StepWorkspace {
                 idx,
                 repo,
@@ -197,6 +211,7 @@ impl StepDriver {
                 created_at: gathered.created_at,
             });
         }
+        crate::observability::ops::emit_metrics(actionable);
         if let Err(e) = self.provider.flush() {
             log::debug!("work_finder: stage-entry cache not written: {e}");
         }
