@@ -146,13 +146,14 @@ fn an_undeclared_sibling_context_still_refuses_on_any_move() {
 
 #[test]
 fn built_in_specs_win_over_a_declaration_for_the_same_context() {
-    // Declares File Size Ratchet as reading nothing the base move touched.
-    let decl = r#"{"version": 1, "checks": {"File Size Ratchet": {"global": ["nothing.txt"]}}}"#;
-    let ctx = "File Size Ratchet";
+    // Declares Markdown Token Ratchet as reading nothing the base move touched.
+    let decl =
+        r#"{"version": 1, "checks": {"Markdown Token Ratchet": {"global": ["nothing.txt"]}}}"#;
+    let ctx = "Markdown Token Ratchet";
     let ev = evidence(
         &[ctx],
-        &["scripts/file-size-baseline.txt"],
-        &["loom-daemon/src/main_health_gate.rs"],
+        &["scripts/markdown-token-baseline.txt"],
+        &["defaults/.claude/commands/loom/builder.md"],
         RepoSpecs::parse(decl),
     );
     assert_eq!(stale_check(&verdict(&[ctx], &ev).0), Some(ctx));

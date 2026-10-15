@@ -148,10 +148,14 @@ fn a_pure_restamp_move_is_discounted_entirely() {
 #[test]
 fn a_real_change_alongside_a_restamp_survives() {
     let mut files = restamp_set();
-    files.push(f("scripts/file-size-baseline.txt", "modified", Some("@@\n-1845 x\n+1815 x\n")));
+    files.push(f(
+        "scripts/markdown-token-baseline.txt",
+        "modified",
+        Some("@@\n-1845 x\n+1815 x\n"),
+    ));
     let kept = strip_validated_restamps(&files);
     assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].path, "scripts/file-size-baseline.txt");
+    assert_eq!(kept[0].path, "scripts/markdown-token-baseline.txt");
 }
 
 #[test]
