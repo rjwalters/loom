@@ -1618,6 +1618,7 @@ pub fn force_refresh_owner_credential(repo_root: &Path) -> bool {
     force_refresh_owner_credential_with(workspace_root, repo_root, &minter)
 }
 
+pub mod cross_owner;
 pub mod loom_ui;
 pub mod pool;
 pub use pool::attach as attach_pool;
