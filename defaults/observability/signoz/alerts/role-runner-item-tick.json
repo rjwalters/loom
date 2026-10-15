@@ -1,0 +1,34 @@
+{
+  "alert": "Loom role-runner item tick after the cutover",
+  "alertType": "LOGS_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "30m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "WITH\n  toInt64({{.end_timestamp_nano}}) AS end_ns,\n  ticks AS (\n    SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,\n           attributes_string['loom.role'] AS role,\n           count() AS n\n    FROM signoz_logs.distributed_logs_v2\n    WHERE timestamp >= {{.start_timestamp_nano}}\n      AND timestamp < {{.end_timestamp_nano}}\n      AND attributes_string['loom.kind'] = 'role_tick.outcome'\n      AND attributes_string['loom.role'] IN ('curator', 'judge', 'doctor')\n      AND attributes_string['loom.role_tick.source'] != 'step'\n    GROUP BY host, role\n  )\nSELECT toDateTime(intDiv(end_ns, 1000000000)) AS ts,\n       host,\n       role,\n       toFloat64(n) AS value\nFROM ticks\nWHERE host != ''\nORDER BY host, role",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "1",
+    "target": 0
+  },
+  "labels": {
+    "severity": "warning",
+    "loom_signal": "role_runner_item_tick"
+  },
+  "annotations": {
+    "summary": "Loom role-runner item tick after the cutover",
+    "description": "Host {{$labels.host}} ran {{$value}} {{$labels.role}} role_tick.outcome records in 30 min that are not step-engine steps (loom.role_tick.source != step, #11988). Since #11909 Curator, Judge and Doctor run only as work-finder steps; a role-runner tick of one means the host still runs a pre-cutover daemon, or an interval loop survived, and it double-acts with the steps on the same items. Check the host's loom-daemon version and its role_runner log. Issue rjwalters/loom#11909."
+  },
+  "disabled": false
+}

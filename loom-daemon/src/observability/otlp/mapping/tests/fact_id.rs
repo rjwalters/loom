@@ -464,6 +464,7 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
                     main_red_fix: false,
                     eligible_reason: None,
                     eligible_at: None,
+                    dispatch_blocked_reason: None,
                 })
                 .into_iter()
                 .collect(),

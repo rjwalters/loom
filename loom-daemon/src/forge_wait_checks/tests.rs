@@ -1000,3 +1000,60 @@ fn settle_red_waits_for_the_run_to_finish_then_is_red() {
     assert_eq!(o.sentinel(), format!("LOOM-CHECKS-RED {SHA} Rust Unit Tests (2/3)"));
     assert_eq!(f.polls(), 4);
 }
+
+/// #12022: under `--settle-red` a finished red does not wait on the required
+/// set. A failing lookup (the #11837 403) used to hold it as `TIMEOUT …
+/// (required-contexts-unknown)` on every pass — or, given time, `ERROR
+/// required-lookup-failed` — so it never reached the Doctor. The lookup is
+/// not even made.
+#[test]
+fn settle_red_finished_red_does_not_depend_on_the_required_lookup() {
+    for timeout in [0, 1800] {
+        let f = Forge::new();
+        f.required_fails();
+        f.runs(SHA, &[run("lint", "completed", Some("failure"))]);
+        let o = go(&f, Selector::Pr(42), &settle(timeout), &mut FakeClock::new());
+        assert!(matches!(o, Outcome::Red { .. }), "{o:?}");
+        assert_eq!(o.sentinel(), format!("LOOM-CHECKS-RED {SHA} lint"));
+        assert_eq!(f.lookups(), 0, "{:#?}", f.calls());
+    }
+}
+
+/// #12022: the `--settle-red: already failing` note belongs to that flag
+/// alone. `--required-only` without it, with a non-required failure and a
+/// required check still running, is a plain TIMEOUT with no such note.
+#[test]
+fn required_only_alone_emits_no_settle_red_note() {
+    let rows = [
+        run("lint", "completed", Some("failure")),
+        run("Backend", "in_progress", None),
+    ];
+    let f = Forge::new();
+    f.required(&["Backend"]);
+    f.runs(SHA, &rows);
+    let mut o = opts(0);
+    o.required_only = true;
+    let (out, notes) = wait(&mut f.reads(), &Selector::Pr(42), &o, &mut FakeClock::new());
+    assert_eq!(
+        out,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["Backend".into()]
+        }
+    );
+    assert!(!notes.iter().any(|n| n.contains("--settle-red")), "{notes:?}");
+
+    // With the flag, the same snapshot still carries the note.
+    let f = Forge::new();
+    f.required(&["Backend"]);
+    f.runs(SHA, &rows);
+    let mut o = settle(0);
+    o.required_only = true;
+    let (_, notes) = wait(&mut f.reads(), &Selector::Pr(42), &o, &mut FakeClock::new());
+    assert!(
+        notes
+            .iter()
+            .any(|n| n == "wait-checks: --settle-red: already failing: lint"),
+        "{notes:?}"
+    );
+}

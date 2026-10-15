@@ -56,6 +56,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::telemetry::kinds::pick_decision::PickSkipReason;
 use crate::telemetry::{RepoVisibility, SweepStartFacts};
 use crate::types::QueueDisposition;
 use crate::work_finder::halt_cause::HaltCause;
@@ -596,6 +597,17 @@ pub struct FleetStateRow {
     /// on every row the work finder held under one, `eligible_at` or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_reason: Option<FleetEligibleReason>,
+    /// `ready_wait` only (#11960): the closed-set reason (`pick.decision`
+    /// skip reason) the work finder skipped this eligible item on its last
+    /// tick. Absent when it was not skipped. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_blocked_reason: Option<PickSkipReason>,
+    /// `ready_wait` only (#11960): the first pass of the current continuous
+    /// skip for `dispatch_blocked_reason` (like `held_since`); resets when the
+    /// reason changes or the item stops being skipped. Present exactly when
+    /// the reason is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_blocked_since: Option<DateTime<Utc>>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -632,6 +644,8 @@ impl FleetStateRow {
             merge_blocked_reason: None,
             eligible_at: None,
             eligible_reason: None,
+            dispatch_blocked_reason: None,
+            dispatch_blocked_since: None,
         }
     }
 }

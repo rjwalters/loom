@@ -663,11 +663,17 @@ impl OutcomeLedger {
         let window = self.cfg.repeat_window;
         self.entries.retain(|_, e| {
             e.runs.retain(|at| add(*at, window) > now);
+            // A refusal streak outlives its own cooldown by one full window
+            // (#11909): its cooldown can reach the 24 h cap, the same as the
+            // window, so dropping it at `at + window` would restart the
+            // doubling at 10 min just before the next draw.
+            let streak_until = e.refusals.as_ref().map(|(_, _, at)| {
+                let after = e.until.map_or(*at, |(u, _)| u.max(*at));
+                add(after, window)
+            });
             !e.runs.is_empty()
                 || e.until.is_some_and(|(u, _)| u > now)
-                || e.refusals
-                    .as_ref()
-                    .is_some_and(|(_, _, at)| add(*at, window) > now)
+                || streak_until.is_some_and(|keep| keep > now)
         });
     }
 

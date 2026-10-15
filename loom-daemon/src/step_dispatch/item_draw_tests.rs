@@ -275,6 +275,7 @@ fn replay_from_the_pick_decision_record_gives_the_same_picks() {
             excluded: &excluded,
             pool: &start,
             draws: &draws,
+            overflow: false,
         }],
     )
     .unwrap();
@@ -300,6 +301,109 @@ fn replay_from_the_pick_decision_record_gives_the_same_picks() {
     let mut bad = parsed;
     bad.pools[0].weight += 1;
     assert!(replay_record(&bad).is_err());
+}
+
+/// Two workspaces' draws, interleaved as a tick takes them, through a record
+/// split into chunks and reassembled: the replay reads only the wire (#11909).
+#[test]
+fn a_chunked_two_workspace_record_replays() {
+    use crate::observability::pick_decision::{item_draw_record, ItemDrawWorkspace};
+    use crate::telemetry::kinds::pick_decision::{
+        split_into_chunks, PickDecisionRecord, PickItemDraw, PickTick,
+    };
+    let ka = key(9);
+    let kb = SeedKey {
+        workspace: "acme/gadgets".into(),
+        ..key(9)
+    };
+    let mut a = ItemDraw::new(pool_of(30), ka.clone());
+    let mut b = ItemDraw::new(pool_of(20), kb.clone());
+    let (start_a, start_b) = (a.starting_pool().to_vec(), b.starting_pool().to_vec());
+    let mut draws_a = Vec::new();
+    let mut draws_b = Vec::new();
+    for i in 0..18 {
+        if i % 3 == 0 {
+            draws_b.push(b.try_next().unwrap().unwrap());
+        } else {
+            draws_a.push(a.try_next().unwrap().unwrap());
+        }
+    }
+    let excluded = BTreeMap::new();
+    let ws = |repo, pool, draws| ItemDrawWorkspace {
+        repo,
+        excluded: &excluded,
+        pool,
+        draws,
+        overflow: false,
+    };
+    let record = item_draw_record(
+        ka.minute,
+        &ka.host,
+        ka.tick_counter,
+        &[
+            ws(&ka.workspace, &start_a, &draws_a),
+            ws(&kb.workspace, &start_b, &draws_b),
+        ],
+    )
+    .unwrap();
+    let tick = PickTick {
+        role: "work_finder".into(),
+        host: "host-a".into(),
+        tick_id: "work_finder-1".into(),
+        started_at: now(),
+        ended_at: now(),
+        outcome: "dispatched".into(),
+    };
+    let whole = PickDecisionRecord::build(tick, Vec::new()).with_item_draw(Some(record));
+    let chunks = split_into_chunks(whole, 2_000);
+    assert!(chunks.len() > 2, "{} chunks", chunks.len());
+    // Reassemble from the wire: the header from chunk 0, the lists in order.
+    let mut parsed: Vec<PickItemDraw> = chunks
+        .iter()
+        .map(|c| {
+            let text = serde_json::to_string(c).unwrap();
+            serde_json::from_str::<PickDecisionRecord>(&text)
+                .unwrap()
+                .item_draw
+                .unwrap()
+        })
+        .collect();
+    let mut joined = parsed.remove(0);
+    for chunk in parsed {
+        joined.pools.extend(chunk.pools);
+        joined.draws.extend(chunk.draws);
+    }
+    let replayed = replay_record(&joined).unwrap();
+    let expect = |draws: &[DrawRecord]| -> Vec<Option<u32>> {
+        draws.iter().map(|d| d.picked.item.issue).collect()
+    };
+    let got = |repo: &str| -> Vec<Option<u32>> {
+        replayed
+            .iter()
+            .filter(|p| p.repo == repo)
+            .map(|p| p.issue)
+            .collect()
+    };
+    assert_eq!(got("acme/widgets"), expect(&draws_a));
+    assert_eq!(got("acme/gadgets"), expect(&draws_b));
+
+    // A dropped draw breaks the consecutive indices; a wrong pool size and a
+    // gap in the logged pool are caught too.
+    let mut gap = joined.clone();
+    let first_b = gap
+        .draws
+        .iter()
+        .position(|d| d.repo == "acme/gadgets")
+        .unwrap();
+    gap.draws.remove(first_b);
+    assert!(replay_record(&gap).unwrap_err().contains("skips draw 0"));
+    let mut size = joined.clone();
+    size.draws[1].pool_size += 1;
+    assert!(replay_record(&size).unwrap_err().contains("pool_size"));
+    let mut hole = joined;
+    hole.pools
+        .retain(|p| !(p.repo == "acme/widgets" && p.index == 4));
+    assert!(replay_record(&hole).unwrap_err().contains("not indexed"));
 }
 
 #[test]
