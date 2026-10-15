@@ -921,6 +921,7 @@ fn role_tick_outcome_envelope(
             effort: None,
             detail: Some("codex-account-pool-exhausted: no account provisioned".to_string()),
             gated_pool: gated_pool.map(str::to_string),
+            failure_class: None,
             // Issue #8599: no preference list decided this tick.
             preference_tier: None,
             preference_tap: None,
@@ -1002,6 +1003,38 @@ fn role_tick_outcome_maps_the_gated_pool_attribute_only_when_a_pool_gated_it() {
         None,
         "an unobserved field stays an ABSENT attribute"
     );
+}
+
+/// #12028: a failed tick exports its closed-vocabulary `loom.failure_class`;
+/// a tick with no class (a success, a pre-#12028 record) leaves it absent.
+#[test]
+fn role_tick_outcome_maps_the_failure_class_only_when_one_was_recorded() {
+    use crate::telemetry::RoleTickResult;
+    let mut classed = role_tick_outcome_envelope(RoleTickResult::Failure, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut classed.record {
+        r.failure_class = Some("write-scope-refused".to_string());
+    }
+    let batch = vec![
+        classed,
+        role_tick_outcome_envelope(RoleTickResult::Failure, None),
+    ];
+    let request = build_logs_request(&batch).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let class = |record: &LogRecord| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "loom.failure_class")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    assert_eq!(
+        class(&records[0]),
+        Some(any_value::Value::StringValue("write-scope-refused".to_string()))
+    );
+    assert_eq!(class(&records[1]), None);
+    let text = format!("{records:?}");
+    assert!(!text.contains("codex-account-pool-exhausted"), "detail must not be exported");
 }
 
 #[test]

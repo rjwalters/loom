@@ -20,6 +20,7 @@ fn tick(result: RoleTickResult) -> RoleTickTelemetry {
         effort: Some("high".to_string()),
         detail: None,
         gated_pool: None,
+        failure_class: None,
         preference_tier: None,
         preference_tap: None,
         role_draw: None,
@@ -882,4 +883,39 @@ fn a_tick_record_is_exported_without_a_local_path() {
     assert_eq!(exported.len(), 1, "{:?}", captured.records);
     assert_eq!(exported[0].result, RoleTickResult::SkippedQueueEmpty);
     assert_eq!(exported[0].repo, crate::observability::pick_decision::REPO_UNRESOLVED);
+}
+
+/// #12028: a failed tick's class is the span's when it launched, else the
+/// site's, else an explicit fallback; no other result carries one.
+#[test]
+fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
+    use crate::observability::lifecycle::{
+        RoleFailure, UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP,
+    };
+    let failed = RoleTickOutcome::Failure("free-form detail".into());
+    let site = RoleFailure::new("resume-refused", None, "m");
+    assert_eq!(
+        failure_class_of(&failed, None, Some(site.clone()), false).as_deref(),
+        Some("resume-refused")
+    );
+    assert_eq!(
+        failure_class_of(&failed, None, None, false).as_deref(),
+        Some(UNCLASSIFIED_PRE_LAUNCH)
+    );
+    assert_eq!(failure_class_of(&failed, None, None, true).as_deref(), Some(UNCLASSIFIED_STEP));
+    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(site), false), None);
+}
+
+#[test]
+fn only_a_failure_record_keeps_a_failure_class() {
+    let mut t = tick(RoleTickResult::Failure);
+    t.failure_class = Some("logs-dir-failed".into());
+    let record = build_record(&t, "o/r".into(), RepoVisibility::Private, None);
+    assert_eq!(record.failure_class.as_deref(), Some("logs-dir-failed"));
+    let mut t = tick(RoleTickResult::Success);
+    t.failure_class = Some("logs-dir-failed".into());
+    assert_eq!(
+        build_record(&t, "o/r".into(), RepoVisibility::Private, None).failure_class,
+        None
+    );
 }

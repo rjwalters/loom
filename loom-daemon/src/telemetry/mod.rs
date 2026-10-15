@@ -1190,6 +1190,14 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Why a [`RoleTickResult::Failure`] tick failed (#12028): the closed-
+    /// vocabulary `loom.failure_class` the tick's `role_attempt` span carries
+    /// when it launched, or the fixed pre-launch class of the site that
+    /// refused it. Never `detail`'s text. Present only on a failure; absent on
+    /// every other result and on every record written before #12028 —
+    /// additive, no `schema_version` bump, exactly as [`Self::gated_pool`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
     /// Which tier of the ordered runtime-preference list this tick launched on
     /// (Issue #8599): `0` is the most-preferred tap — nothing fell through —
     /// and any higher value is a fall-through, so "how much work went to the

@@ -111,6 +111,9 @@ pub struct RoleTickTelemetry {
     /// Which credential pool gated a pre-spawn pool skip (Issue #8408) — see
     /// [`RoleTickOutcome::gated_pool`]. `None` for every other result.
     pub gated_pool: Option<String>,
+    /// The closed-vocabulary class of a failed tick (#12028); `None` for
+    /// every other result.
+    pub failure_class: Option<String>,
     /// Tier of the ordered-preference list this tick launched on (Issue
     /// #8599), when a list chose its tap. `None` on the static path.
     pub preference_tier: Option<u32>,
@@ -270,7 +273,7 @@ pub fn emit_for_tick(
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
 ) {
-    emit_for_tick_correlated(root, role, started_at, outcome, resolved, None);
+    emit_for_tick_correlated(root, role, started_at, outcome, resolved, None, None);
 }
 
 pub fn emit_for_tick_correlated(
@@ -280,8 +283,9 @@ pub fn emit_for_tick_correlated(
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
+    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
 ) {
-    emit_tick(root, role, started_at, outcome, resolved, trace, None);
+    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None);
 }
 
 /// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
@@ -295,9 +299,48 @@ pub fn emit_for_step(
     resolved: Option<ResolvedLaunch>,
     sweep_id: &str,
 ) {
-    emit_tick(root, role, started_at, outcome, resolved, None, Some(sweep_id.to_string()));
+    emit_tick(
+        root,
+        role,
+        started_at,
+        outcome,
+        resolved,
+        None,
+        None,
+        Some(sweep_id.to_string()),
+    );
 }
 
+/// The `loom.failure_class` of a failed tick (#12028), `None` for any other
+/// result. A launched tick reuses the class its `role_attempt` span closed
+/// with (`trace.failure`, no second classifier); a tick refused before launch
+/// uses the class its site noted; a failure with neither falls back to an
+/// explicit `unclassified:*` label, never an absent attribute.
+fn failure_class_of(
+    outcome: &RoleTickOutcome,
+    trace: Option<&crate::observability::lifecycle::RoleTrace>,
+    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+    is_step: bool,
+) -> Option<String> {
+    use crate::observability::lifecycle::{UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP};
+    if !matches!(outcome, RoleTickOutcome::Failure(_)) {
+        return None;
+    }
+    let class = trace
+        .and_then(|t| t.failure.as_ref())
+        .or(unlaunched.as_ref())
+        .map(|f| f.class().to_string());
+    Some(class.unwrap_or_else(|| {
+        if is_step {
+            UNCLASSIFIED_STEP
+        } else {
+            UNCLASSIFIED_PRE_LAUNCH
+        }
+        .to_string()
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_tick(
     root: &Path,
     role: &str,
@@ -305,6 +348,7 @@ fn emit_tick(
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
+    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
     step_sweep_id: Option<String>,
 ) {
     // #10212: the gate listing this tick read, as a ranked `pick.decision`.
@@ -338,6 +382,12 @@ fn emit_tick(
             effort,
             detail,
             gated_pool: outcome.gated_pool().map(str::to_string),
+            failure_class: failure_class_of(
+                outcome,
+                trace.as_ref(),
+                unlaunched,
+                step_sweep_id.is_some(),
+            ),
             preference_tier: preference
                 .as_ref()
                 .and_then(|stamp| u32::try_from(stamp.tier).ok()),
@@ -643,6 +693,10 @@ pub fn build_record(
         effort: tick.effort.clone().filter(|e| !e.is_empty()),
         detail: tick.detail.clone().filter(|d| !d.is_empty()),
         gated_pool: tick.gated_pool.clone().filter(|p| !p.is_empty()),
+        failure_class: tick
+            .failure_class
+            .clone()
+            .filter(|c| !c.is_empty() && matches!(tick.result, RoleTickResult::Failure)),
         preference_tier: tick.preference_tier,
         preference_tap: tick.preference_tap.clone().filter(|t| !t.is_empty()),
         role_draw: tick.role_draw.clone(),
