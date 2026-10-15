@@ -160,3 +160,7 @@ scripts/tests/test-merge-pr-stale-required-checks.sh
 scripts/check-dependabot-labels.sh
 scripts/tests/test-check-dependabot-labels.sh
 scripts/tests/test-check-pipefail-early-exit.sh
+
+# #12121 (2026-10-15) — operator presence moves into the daemon; the shell
+# presence-beat hook is replaced by daemon-derived presence facts.
+hooks/presence-beat.sh
