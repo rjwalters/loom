@@ -98,11 +98,11 @@ run_step3() { # [EXPECTED_HEAD]
 }
 
 run_step3
-check "batch: merge-pr.sh argv is exactly today's" eval '[[ "$MARGV" == "42 --auto --redate-stale-checks" ]]'
+check "batch: merge-pr.sh argv is exactly today's" eval '[[ "$MARGV" == "42 --auto" ]]'
 check "batch: the head comes from Step 3's own read" eval '[[ -s "$TMP/gh-calls" ]] && [[ "$QARGV" == *"--approved-sha 1111111111111111111111111111111111111111"* ]]'
 
 run_step3 "$EVAL_SHA"
-check "--pr N: merge-pr.sh gets --expected-head <evaluated sha>" eval '[[ "$MARGV" == "42 --auto --redate-stale-checks --expected-head $EVAL_SHA" ]]'
+check "--pr N: merge-pr.sh gets --expected-head <evaluated sha>" eval '[[ "$MARGV" == "42 --auto --expected-head $EVAL_SHA" ]]'
 check "--pr N: the queue authorizes the evaluated sha, not a fresh read" eval '[[ "$QARGV" == *"--approved-sha $EVAL_SHA"* ]] && [[ ! -s "$TMP/gh-calls" ]]'
 check "--pr N, merged: outcome rc=0" has "CHAMPION-MERGE-OUTCOME pr=42 rc=0"
 
@@ -129,11 +129,11 @@ run_step3 1111111111111111111111111111111111111111
 check "pin file + a DIFFERENT EXPECTED_HEAD: no merge" eval '[[ ! -e "$TMP/merge-argv" ]] && has CHAMPION-PIN-MISSING'
 run_step3 "$EVAL_SHA"
 check "pin file + the literal pinned SHA: merges pinned" \
-  eval '[[ "$MARGV" == "42 --auto --redate-stale-checks --expected-head $EVAL_SHA" ]] && hasnt CHAMPION-PIN-MISSING'
+  eval '[[ "$MARGV" == "42 --auto --expected-head $EVAL_SHA" ]] && hasnt CHAMPION-PIN-MISSING'
 touch -t 202001010000 "$PIN_FILE"
 run_step3
 check "a pin file over 60 minutes old (a crashed step) no longer blocks the batch merge" \
-  eval '[[ "$MARGV" == "42 --auto --redate-stale-checks" ]] && hasnt CHAMPION-PIN-MISSING'
+  eval '[[ "$MARGV" == "42 --auto" ]] && hasnt CHAMPION-PIN-MISSING'
 # #11902: the pin records its step's agent process ($PPID); while that runs, a
 # step longer than 60 minutes keeps its backstop (up to 24h).
 sleep 600 & LIVE_PID=$!
@@ -145,15 +145,15 @@ check "a 2h-old pin whose step process still runs (a long --pr step) still refus
   eval '[[ ! -e "$TMP/merge-argv" ]] && has "CHAMPION-PIN-MISSING pr=42: set EXPECTED_HEAD=$EVAL_SHA"'
 run_step3 "$EVAL_SHA"
 check "the long step's literal pin still merges pinned" \
-  eval '[[ "$MARGV" == "42 --auto --redate-stale-checks --expected-head $EVAL_SHA" ]]'
+  eval '[[ "$MARGV" == "42 --auto --expected-head $EVAL_SHA" ]]'
 printf '%s %s\n' "$EVAL_SHA" "$DEAD_PID" > "$PIN_FILE"; two_hours_ago
 run_step3
 check "a 2h-old pin whose step process is gone (a crashed step) does not block the batch merge" \
-  eval '[[ "$MARGV" == "42 --auto --redate-stale-checks" ]] && hasnt CHAMPION-PIN-MISSING'
+  eval '[[ "$MARGV" == "42 --auto" ]] && hasnt CHAMPION-PIN-MISSING'
 printf '%s %s\n' "$EVAL_SHA" "$LIVE_PID" > "$PIN_FILE"; touch -t 202001010000 "$PIN_FILE"
 run_step3
 check "a live process cannot hold a pin past 24h (pid reuse)" \
-  eval '[[ "$MARGV" == "42 --auto --redate-stale-checks" ]] && hasnt CHAMPION-PIN-MISSING'
+  eval '[[ "$MARGV" == "42 --auto" ]] && hasnt CHAMPION-PIN-MISSING'
 printf '%s %s\n' "$EVAL_SHA" "$LIVE_PID" > "$PIN_FILE"
 run_step3
 check "a fresh pin with a recorded pid reads the SHA alone" \
@@ -204,8 +204,10 @@ check "--issue: the four terminal verdicts plus closed and not-eligible, no defe
   eval '[[ "$VERDICTS" == "promoted revise blocked operator closed not-eligible " ]]'
 check "--issue: revise sends the issue to Curator as loom:triage without loom:curated (#11860)" \
   doc_has "$TARGETED_MD" '`loom:curated` and the claim removed, `loom:triage` added'
-check "--issue: a blocked issue is re-evaluated only once its blocker has closed (#11860)" \
-  doc_has "$TARGETED_MD" 'or a merged PR, remove `loom:blocked` and go on; else outcome `blocked`'
+check "--issue: a blocked issue is lifted only once its blocker has closed (#11860)" \
+  doc_has "$TARGETED_MD" 'body is a closed issue or a merged PR, remove `loom:blocked` and go on.'
+check "--issue: a still-blocked issue is left untouched, outcome blocked (#12078)" \
+  doc_has "$TARGETED_MD" 'Otherwise leave the issue exactly as it is (no comment, no label change,'
 # --non-item
 NONITEM="$(awk '/^## `--non-item`/{on=1} on' "$TARGETED_MD")"
 out="$NONITEM"

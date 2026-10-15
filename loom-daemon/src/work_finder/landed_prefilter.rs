@@ -68,9 +68,11 @@
 //!
 //! # Cost
 //!
-//! One aliased GraphQL query (≈1 point) per workspace per tick, and only on
-//! a tick with a candidate whose verdict is unknown or older than
-//! [`LANDED_RECHECK`]. A verdict is dropped as soon as the candidate shows an
+//! At most one aliased GraphQL query (≈1 point) per workspace per tick, and
+//! only on a tick with a candidate (without an open PR) whose verdict is
+//! unknown or older than [`LANDED_RECHECK`]; the verdicts past half their
+//! life ride along, so in steady state a workspace asks about once per
+//! `LANDED_RECHECK / 2` (#12205). A verdict is dropped as soon as the candidate shows an
 //! open PR, so the tick its PR merges, the issue is asked about again. The
 //! comment read and label writes happen only for a landed issue. Nothing is
 //! asked while the rate-limit breaker is open.
@@ -79,7 +81,36 @@
 //!
 //! Fail open. An unreadable answer, an issue alias the forge did not answer,
 //! or a truncated closes-graph is no verdict: the candidate goes to
-//! `dispatch()` as before. Only a verified merged closing PR removes it.
+//! `dispatch()` as before. Only a verified merged closing PR removes it. An
+//! unanswered query is not repeated for [`LANDED_FAIL_BACKOFF`] (#12205), so
+//! a forge that cannot answer costs one query per backoff, not one per tick.
+//!
+//! # Off by default (#12205)
+//!
+//! [`ENABLED_KEY`] (`autonomous.workFinder.landedPrefilter`, read live from
+//! the workspace's effective config on every call) gates the whole
+//! pre-filter, and defaults to **off**. Off, [`landed_in`] and [`lift_in`]
+//! make no forge call and return nothing: every candidate goes to
+//! `dispatch()` exactly as before #11853. What that costs: an open issue
+//! whose closing PR merged is not routed to Curator, so it can be dispatched
+//! to a Builder again. Such a sweep finds the work done; the #11429 journal
+//! check (on the host that landed it), the 2.5 closed-issue guard and the
+//! no-op cooldown still bound how often that happens. Landed cooldowns
+//! already armed keep running out on their own.
+//!
+//! # Who pays (#12205)
+//!
+//! The closes-graph query is a read of the workspace's repository, so it is
+//! offered to the reader pool (and the gateway) like any other repo read,
+//! never pinned to the dispatch App. It is a
+//! [`crate::forge_identity::ReadClass::Hygiene`] read: when the readers are
+//! out of budget it is shed, which is no verdict (fail open), rather than
+//! spending the dispatch App's GraphQL budget.
+//!
+//! Only candidates **without** an open linked PR are asked about. The step
+//! gather hands over every `loom:issue` item; before #12205 one with an open
+//! PR had its verdict dropped and was then re-asked on every tick, so nearly
+//! every workspace with a PR in review paid one query per tick.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -107,6 +138,27 @@ const CLOSING_FIRST: usize = 20;
 
 /// Deadline of the closes-graph query.
 const GRAPHQL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// After an unanswered closes-graph query, no query for this long (#12205).
+pub const LANDED_FAIL_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// The live config key that turns the pre-filter on (#12205). Absent or
+/// anything but `true` is off.
+pub const ENABLED_KEY: &str = "autonomous.workFinder.landedPrefilter";
+
+/// Whether the pre-filter is on in an already-resolved effective config.
+#[must_use]
+pub fn prefilter_enabled_in(effective: &Value) -> bool {
+    crate::config_resolver::get_path(effective, ENABLED_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the pre-filter is on for the workspace at `root`, read live.
+#[must_use]
+pub fn prefilter_enabled(root: &std::path::Path) -> bool {
+    prefilter_enabled_in(&crate::config_resolver::resolve_effective_config(root))
+}
 
 /// The hidden marker the routing comment carries, naming the merged PR.
 #[must_use]
@@ -331,6 +383,9 @@ pub struct LandedCache {
     /// Issues this host routed whose return to the queue has not been asked
     /// about yet: [`lift`] asks at once, not after [`LANDED_RECHECK`].
     routed: HashSet<u32>,
+    /// When the last closes-graph query went unanswered: nothing is asked
+    /// until [`LANDED_FAIL_BACKOFF`] after it (#12205).
+    failed_at: Option<Instant>,
 }
 
 impl LandedCache {
@@ -340,19 +395,53 @@ impl LandedCache {
             .is_none_or(|(at, _)| now.saturating_duration_since(*at) >= LANDED_RECHECK)
     }
 
+    /// Whether an unanswered query at or after `now - LANDED_FAIL_BACKOFF`
+    /// holds every question back.
+    fn backing_off(&self, now: Instant) -> bool {
+        self.failed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < LANDED_FAIL_BACKOFF)
+    }
+
     /// The candidates to ask about at `now`: no verdict, or one older than
-    /// [`LANDED_RECHECK`], at most [`LANDED_BATCH`]. Forgets the verdict of
-    /// every issue in `open_pr`, so the tick its PR merges asks again.
+    /// [`LANDED_RECHECK`], at most [`LANDED_BATCH`]. A candidate in `open_pr`
+    /// is never asked (its PR is open, so its landing is not this filter's
+    /// question), and its verdict is forgotten, so the tick its PR merges
+    /// asks again (#12205: the step gather lists such candidates too).
+    ///
+    /// When anything is due, the candidates whose verdict is past half its
+    /// life ride along in the same query, so verdicts expire together and a
+    /// workspace pays one query per [`LANDED_RECHECK`] / 2 at most, not one
+    /// per tick as staggered verdicts would cost (#12205).
     fn due(&mut self, candidates: &[u32], open_pr: &[u32], now: Instant) -> Vec<u32> {
         for issue in open_pr {
             self.verdicts.remove(issue);
         }
-        candidates
+        if self.backing_off(now) {
+            return Vec::new();
+        }
+        let open: HashSet<u32> = open_pr.iter().copied().collect();
+        let asked: Vec<u32> = candidates
+            .iter()
+            .copied()
+            .filter(|n| !open.contains(n))
+            .collect();
+        if !asked.iter().any(|n| self.stale(*n, now)) {
+            return Vec::new();
+        }
+        let half = LANDED_RECHECK / 2;
+        let mut ask: Vec<u32> = asked
             .iter()
             .copied()
             .filter(|n| self.stale(*n, now))
-            .take(LANDED_BATCH)
-            .collect()
+            .collect();
+        ask.extend(asked.iter().copied().filter(|n| {
+            self.verdicts
+                .get(n)
+                .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= half)
+                && !self.stale(*n, now)
+        }));
+        ask.truncate(LANDED_BATCH);
+        ask
     }
 
     fn landed(&self, issue: u32) -> Option<u32> {
@@ -376,7 +465,12 @@ fn settle<F: LandedForge + ?Sized>(
     }
     let mut answered = Vec::new();
     let mut fresh: Vec<(u32, u32)> = Vec::new();
-    for (issue, verdict) in forge.closing_verdicts(ask).unwrap_or_default() {
+    let Some(verdicts) = forge.closing_verdicts(ask) else {
+        cache.failed_at = Some(now);
+        return Vec::new();
+    };
+    cache.failed_at = None;
+    for (issue, verdict) in verdicts {
         answered.push(issue);
         let verdict = match verdict {
             None => Verdict::NotLanded,
@@ -440,6 +534,9 @@ pub fn lift<F: LandedForge + ?Sized>(
     held: &[u32],
     now: Instant,
 ) -> Vec<u32> {
+    if cache.backing_off(now) {
+        return Vec::new();
+    }
     let ask: Vec<u32> = held
         .iter()
         .copied()
@@ -487,6 +584,9 @@ pub fn landed_in(
     let Some((gh_bin, root, slug)) = target else {
         return HashMap::new();
     };
+    if !prefilter_enabled(&root) {
+        return HashMap::new();
+    }
     let mut forge = GhLandedForge {
         gh_bin,
         root: root.clone(),
@@ -531,6 +631,9 @@ pub fn lift_in(registry: &Arc<Mutex<SweepRegistry>>, held: &[u32]) -> HashSet<u3
     let Some((gh_bin, root, slug)) = target.filter(|_| !mine.is_empty()) else {
         return HashSet::new();
     };
+    if !prefilter_enabled(&root) {
+        return HashSet::new();
+    }
     let mut forge = GhLandedForge {
         gh_bin,
         root: root.clone(),
@@ -609,25 +712,46 @@ fn owner_name(slug: &str) -> Option<(&str, &str)> {
     slug.split_once('/').filter(|(o, n)| safe(o) && safe(n))
 }
 
-impl LandedForge for GhLandedForge {
-    fn closing_verdicts(&mut self, issues: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
-        use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-        if crate::rate_limit_breaker::global_skip_pass(CALLER) {
-            return None;
-        }
-        let (owner, name) = owner_name(&self.slug)?;
-        let field = format!("query={}", landed_query(owner, name, issues));
-        let inv = GhInvocation::new(
+/// The closes-graph read of `issues` in `slug`, run from `root` (#12205): a
+/// repo-targeted [`crate::forge_identity::ReadClass::Hygiene`] read, so the
+/// facade offers it to the reader pool (and the gateway) rather than the
+/// dispatch App, and sheds it rather than spill it onto the writer when the
+/// readers are out of budget.
+/// `None` when `slug` cannot be named safely in the query.
+#[must_use]
+pub fn closing_refs_invocation(
+    gh_bin: &std::path::Path,
+    root: &std::path::Path,
+    slug: &str,
+    issues: &[u32],
+) -> Option<crate::gh_invocation::GhInvocation> {
+    use crate::forge_identity::ReadClass;
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let (owner, name) = owner_name(slug)?;
+    let target = GhTarget::repo(slug).ok()?;
+    let field = format!("query={}", landed_query(owner, name, issues));
+    Some(
+        GhInvocation::new(
             Operation::new("work_finder.landed_closing_refs"),
             AccessIntent::Read,
-            GhTarget::None,
+            target,
             GRAPHQL_TIMEOUT,
         )
         .forge_op(crate::forge_call_stats::ops::ISSUE_CLOSED_BY_PULL_REQUESTS)
-        .identity_scope(None, Some(&self.slug))
-        .program(&self.gh_bin)
-        .current_dir(&self.root)
-        .args(["api", "graphql", "-f", field.as_str()]);
+        .read_class(ReadClass::Hygiene)
+        .identity_scope(None, Some(slug))
+        .program(gh_bin)
+        .current_dir(root)
+        .args(["api", "graphql", "-f", field.as_str()]),
+    )
+}
+
+impl LandedForge for GhLandedForge {
+    fn closing_verdicts(&mut self, issues: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
+        if crate::rate_limit_breaker::global_skip_pass(CALLER) {
+            return None;
+        }
+        let inv = closing_refs_invocation(&self.gh_bin, &self.root, &self.slug, issues)?;
         // `gh` exits non-zero when any alias errored but still prints the
         // partial `data`: parse first, judge per alias.
         let out = gh_call::output(inv).ok()?;

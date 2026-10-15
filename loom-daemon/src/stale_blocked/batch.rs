@@ -140,8 +140,9 @@ pub trait StaleBlockedForge {
     /// The whole batch did not answer.
     fn closing_refs_batch(&mut self, issues: &[u32]) -> Result<HashMap<u32, Vec<ClosingRef>>>;
 
-    /// The live budget from the free `/rate_limit` + GraphQL `rateLimit`
-    /// probe; `None` when it did not answer.
+    /// The budget from the process-wide cache / response-header readings,
+    /// else one free `/rate_limit` probe (#12204: never a standalone GraphQL
+    /// `rateLimit` query); `None` when nothing answered.
     fn budget(&mut self) -> Option<Budget>;
 
     /// Whether the rate-limit breaker is suppressing forge calls.

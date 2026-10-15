@@ -16,10 +16,8 @@
 //!
 //! Everything a kind registers now lives in the one-row-per-kind table below,
 //! and that table is the only shared line a new kind touches. The row is
-//! append-only and self-contained, so `.gitattributes` marks this file
-//! `merge=union`: two branches that each append a row merge cleanly with no
-//! conflict and no lost row (see the `kind_registry` tests, which assert both
-//! the attribute and the merge behaviour).
+//! append-only and self-contained; two branches that each append a row hit an
+//! ordinary merge conflict, resolved by keeping both rows.
 //!
 //! # Adding a record kind
 //!
@@ -152,8 +150,9 @@ pub struct TelemetryKindMeta {
 // ============================================================================
 //
 // Declared HERE (not in `telemetry/mod.rs`) so a new family costs zero lines
-// in a shared file: this file is `merge=union`, so two branches each adding a
-// `pub mod` line merge cleanly. Files live at `telemetry/kinds/<family>.rs`.
+// in a shared file: two branches each adding a `pub mod` line here conflict
+// like any shared file, resolved by keeping both. Files live at
+// `telemetry/kinds/<family>.rs`.
 // (None yet — the pre-#8921 families stay where they are, declared in
 // `telemetry/mod.rs`; moving them would churn every in-flight PR that touches
 // them for no schema benefit.)
@@ -163,11 +162,20 @@ pub mod auto_update_tick;
 
 pub mod backlog_level;
 
+/// `daemon.exit` (#11839) — why the daemon process ended.
+pub mod daemon_exit;
+
 /// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
 pub mod checkout_external_change;
 
 /// `host.export` (#11124).
 pub mod host_export;
+
+/// Per-kind silence thresholds for `otlp_export` health (#12120).
+pub mod kind_silence;
+
+/// `scope.memory` (#12241) — one agent scope's memory limit, peak and OOM kills.
+pub mod scope_memory;
 
 /// `operator.presence` (#11563) — an operator session's keyboard presence.
 pub mod operator_presence;
@@ -471,6 +479,18 @@ macro_rules! telemetry_kind_table {
             /// (#11819): open count, target, level. OTLP-only. See
             /// [`backlog_level`].
             BacklogLevel = "backlog.level" => $crate::telemetry::kinds::backlog_level::BacklogLevelRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// Why the daemon process ended (#11839): signal / exit code, who asked,
+            /// whether a relaunch is expected, and the in-flight sweeps. OTLP-only.
+            /// See [`daemon_exit`].
+            DaemonExit = "daemon.exit" => $crate::telemetry::kinds::daemon_exit::DaemonExitRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One agent scope's applied memory limit, its source, the peak
+            /// and the OOM kills, when the scope ends (#12241). OTLP-only.
+            /// See [`scope_memory`].
+            ScopeMemory = "scope.memory" => $crate::telemetry::kinds::scope_memory::ScopeMemoryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

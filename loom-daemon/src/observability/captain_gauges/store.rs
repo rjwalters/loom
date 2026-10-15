@@ -24,11 +24,6 @@
 //!   "published_at": "<rfc3339>",
 //!   "jobs": {
 //!     "stage-dwell": { "as_of": "<rfc3339>", "repos": ["owner/repo", ...] },
-//!     "star-facts": {
-//!       "as_of": "<rfc3339>", "repos": ["owner/repo", ...],
-//!       "labels": ["loom:important", ...],
-//!       "counts": { "owner/repo": 2 }
-//!     },
 //!     "queue-blocked": {
 //!       "as_of": "<rfc3339>", "repos": ["owner/repo", ...],
 //!       "blocked": { "owner/repo": [ { "n": 12, "c": "<rfc3339>", "l": ["loom:blocked"] } ] }
@@ -43,11 +38,12 @@
 //! job and repo the declared captain covered within the staleness bound
 //! ([`Heartbeat::fresh`]).
 //!
-//! `labels`, `counts` and `blocked` are the part 2 fact fields
-//! ([`super::facts`]). They are optional and additive: a reader that predates
-//! them ignores them, and a captain that predates them publishes no such job,
-//! so the schema tag stays `v1`. A covered repo absent from `counts` has no
-//! open starred issue; one absent from `blocked` has no blocked row.
+//! `blocked` is the part 2 fact field ([`super::facts`]). It is optional and
+//! additive: a reader that predates it ignores it, and a captain that predates
+//! it publishes no such job, so the schema tag stays `v1`. A covered repo
+//! absent from `blocked` has no blocked row. A job this reader does not know,
+//! such as one a captain that predates a retirement still publishes, parses
+//! and is never consulted.
 //!
 //! # Cost
 //!
@@ -112,12 +108,6 @@ pub struct JobFacts {
     /// Lowercased `owner/repo` slugs that pass covered.
     #[serde(default)]
     pub repos: BTreeSet<String>,
-    /// `star-facts`: every operator label the captain listed.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub labels: BTreeSet<String>,
-    /// `star-facts`: open starred issues per covered repo (absent: zero).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub counts: BTreeMap<String, u32>,
     /// `queue-blocked`: the blocked rows per covered repo (absent: none).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub blocked: BTreeMap<String, Vec<BlockedFact>>,
