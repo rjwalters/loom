@@ -4,9 +4,19 @@
 //! scalars ride as `loom.scope.*` attributes.
 
 use super::session_output::LogParts;
-use super::{kv_int, kv_string, nanos};
+use super::{kv, kv_int, kv_string, nanos};
 use crate::telemetry::TelemetryRecord;
+use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
+
+fn kv_bool(key: &str, value: bool) -> KeyValue {
+    kv(
+        key,
+        AnyValue {
+            value: Some(any_value::Value::BoolValue(value)),
+        },
+    )
+}
 
 fn int(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
@@ -27,7 +37,7 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
         kv_int("loom.scope.peak_bytes", int(r.peak_bytes)),
         kv_int("loom.scope.events_max", int(r.events_max)),
         kv_int("loom.scope.oom_kills", int(r.oom_kills)),
-        kv_string("loom.scope.clipped", if r.clipped { "true" } else { "false" }),
+        kv_bool("loom.scope.clipped", r.clipped),
     ];
     if let Some(repo) = &r.repo {
         attributes.push(kv_string("loom.repo", repo));
@@ -130,6 +140,17 @@ mod tests {
         for absent in ["loom.scope.limit_bytes", "loom.repo", "loom.issue"] {
             assert!(!keys.iter().any(|k| k == absent), "{absent} omitted");
         }
+    }
+
+    #[test]
+    fn clipped_is_a_bool_attribute() {
+        let log = log(record());
+        let clipped = log
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "loom.scope.clipped")
+            .and_then(|kv| kv.value.as_ref()?.value.clone());
+        assert_eq!(clipped, Some(any_value::Value::BoolValue(true)));
     }
 
     #[test]

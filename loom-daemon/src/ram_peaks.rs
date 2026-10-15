@@ -41,12 +41,12 @@
 //! `loom-daemon ram-scope-limit` put on it, or none) and the `max` /
 //! `oom_kill` counters of `memory.events`. When the scope ends they are
 //! exported with its peak (`scope.memory` record, `loom.agent_scope.oom_kills`
-//! counter). A scope whose peak reached its limit, or that hit the limit at
-//! all (`memory.events max > 0`), is **clipped**: `memory.peak` cannot exceed
-//! `memory.max`, so its peak is the cap, not the build's real need. A clipped
-//! peak is never folded into the history; feeding it back made the next cap
-//! at most 2x the last one and the cap never learned the real compile peak
-//! (#11094).
+//! counter). A scope with a limit whose peak reached it, or that hit it at
+//! all (`memory.events` `max` or `oom_kill`), is **clipped**: `memory.peak`
+//! cannot exceed `memory.max`, so its peak is the cap, not the build's real
+//! need. The flag is a signal only: a clipped peak is still folded into the
+//! history (a lower bound that lets the derived cap grow), and how history
+//! should treat it is #11094's to decide.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -168,12 +168,14 @@ pub fn parse_memory_events(contents: &str) -> MemoryEvents {
     out
 }
 
-/// A scope's peak is **clipped** when it reached its limit, or when the scope
-/// hit the limit at all (`max` or `oom_kill` events): the kernel kept usage at
-/// or under `memory.max`, so `memory.peak` is the cap, not the real need.
+/// A scope's peak is **clipped** when a limit applied and the peak reached it,
+/// or the scope hit it at all (`max` or `oom_kill` events): the kernel kept
+/// usage at or under `memory.max`, so `memory.peak` is the cap, not the real
+/// need. Without a limit it is never clipped: cgroup v2 `oom_kill` also counts
+/// kills by the global OOM killer, and such a scope's peak is genuine.
 #[must_use]
 pub fn is_clipped(peak_bytes: u64, limit_bytes: Option<u64>, events: MemoryEvents) -> bool {
-    limit_bytes.is_some_and(|l| peak_bytes >= l) || events.max > 0 || events.oom_kill > 0
+    limit_bytes.is_some_and(|l| peak_bytes >= l || events.max > 0 || events.oom_kill > 0)
 }
 
 /// One read of a scope's cgroup memory files.
@@ -272,24 +274,15 @@ pub fn classify_limit_from_env(limit_bytes: Option<u64>) -> LimitSource {
     classify_limit(limit_bytes, explicit, floor)
 }
 
-/// The role an ended scope ran: the attached role, else the role in a step
-/// scope's unit name (`loom-agent-step-<role>-…`), else `sweep` for an
-/// issue-lock or `loom-agent-sweep-…` scope, else `unknown`.
+/// The role an ended scope ran: the live role run's role
+/// ([`attach_roles`]), else `sweep` for an issue-lock scope, else `unknown`.
+/// Never parsed from the unit name, so a label value is always a known role.
 #[must_use]
-pub fn scope_role(scope: &str, role: Option<&str>, issue: Option<u32>) -> String {
-    if let Some(r) = role.filter(|r| !r.is_empty()) {
-        return r.to_string();
-    }
-    let rest = scope.strip_prefix(AGENT_SCOPE_PREFIX).unwrap_or(scope);
-    if let Some(step) = rest.strip_prefix("step-") {
-        if let Some(r) = step.split('-').next().filter(|r| !r.is_empty()) {
-            return r.to_string();
-        }
-    }
-    if issue.is_some() || rest.starts_with("sweep-") {
-        "sweep".to_string()
-    } else {
-        "unknown".to_string()
+pub fn scope_role(role: Option<&str>, issue: Option<u32>) -> String {
+    match role.filter(|r| !r.is_empty()) {
+        Some(r) => r.to_string(),
+        None if issue.is_some() => "sweep".to_string(),
+        None => "unknown".to_string(),
     }
 }
 
@@ -489,10 +482,8 @@ fn push_sample(hist: &mut Vec<u64>, peak: u64) {
 
 /// Fold a scope's peak into history: role agents with a known role go to
 /// `roles[repo][role]`, sweeps and role-unknown scopes to `repos[repo]`.
-/// A clipped peak ([`InFlight::clipped`]) is the cap, not the scope's real
-/// need, so it is left out (#11094, #12241).
 fn fold_history(store: &mut Store, f: &InFlight) {
-    if f.peak_bytes == 0 || f.clipped() {
+    if f.peak_bytes == 0 {
         return;
     }
     match (&f.role, f.issue) {
@@ -1369,12 +1360,39 @@ mod tests {
         ));
         assert!(is_clipped(
             GIB,
+            Some(8 * GIB),
+            MemoryEvents {
+                max: 0,
+                oom_kill: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn no_limit_is_never_clipped_even_with_global_oom_kills() {
+        // cgroup v2 `oom_kill` also counts the global OOM killer's kills.
+        assert!(!is_clipped(
+            13 * GIB,
             None,
             MemoryEvents {
                 max: 0,
                 oom_kill: 1
             }
         ));
+        assert!(!is_clipped(
+            13 * GIB,
+            None,
+            MemoryEvents {
+                max: 5,
+                oom_kill: 3
+            }
+        ));
+        let f = InFlight {
+            peak_bytes: 13 * GIB,
+            oom_kills: 2,
+            ..InFlight::default()
+        };
+        assert!(!f.clipped());
     }
 
     #[test]
@@ -1389,12 +1407,12 @@ mod tests {
     }
 
     #[test]
-    fn scope_role_prefers_the_attached_role_then_the_unit_name() {
-        assert_eq!(scope_role("loom-agent-1-2.scope", Some("judge"), None), "judge");
-        assert_eq!(scope_role("loom-agent-step-builder-42-17.scope", None, Some(42)), "builder");
-        assert_eq!(scope_role("loom-agent-sweep-issue-7-1.scope", None, None), "sweep");
-        assert_eq!(scope_role("loom-agent-1-2.scope", None, Some(7)), "sweep");
-        assert_eq!(scope_role("loom-agent-1-2.scope", None, None), "unknown");
+    fn scope_role_prefers_the_attached_role_then_the_issue_lock() {
+        assert_eq!(scope_role(Some("judge"), None), "judge");
+        assert_eq!(scope_role(Some("doctor"), Some(7)), "doctor");
+        assert_eq!(scope_role(None, Some(7)), "sweep");
+        assert_eq!(scope_role(Some(""), None), "unknown");
+        assert_eq!(scope_role(None, None), "unknown");
     }
 
     #[test]
@@ -1431,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn ended_scope_carries_limit_and_events_and_a_clipped_peak_is_not_history() {
+    fn ended_scope_carries_limit_and_events_and_a_clipped_peak_is_still_history() {
         let mut store = Store::default();
         store.repos.insert("r".into(), vec![3 * GIB]);
         let l = [live("a.scope", "r")];
@@ -1461,7 +1479,11 @@ mod tests {
             }
         );
         assert!(e.clipped());
-        assert_eq!(store.repos["r"], vec![3 * GIB], "clipped peak not folded");
+        assert_eq!(
+            store.repos["r"],
+            vec![3 * GIB, 4 * GIB],
+            "a clipped peak is still history (a lower bound the cap grows from)"
+        );
     }
 
     #[test]

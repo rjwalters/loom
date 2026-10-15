@@ -3880,9 +3880,9 @@ The JSON body contains:
   `(unattributed)`.
 - `repo` / `repo_visibility`: `owner/repo` and `public` / `private`, when the
   workspace's slug is already resolved (never fetched for this record).
-- `role`: the role the scope ran. This is the live role run's role, else the
-  `<role>` of a `loom-agent-step-<role>-…` unit name, else `sweep` for an
-  issue-lock or `loom-agent-sweep-…` scope, else `unknown`.
+- `role`: the role the scope ran. This is the live role run's role, else
+  `sweep` for an issue-lock scope, else `unknown`. It is never parsed from the
+  unit name.
 - `issue`: the claimed issue, for an issue-lock scope.
 - `limit_bytes`: the applied `MemoryMax` (the scope's `memory.max`); absent when
   the scope had none.
@@ -3901,20 +3901,26 @@ The JSON body contains:
 - `peak_bytes`: the scope's `memory.peak`.
 - `events_max`, `oom_kills`: the scope's `memory.events` `max` (times usage hit
   the limit) and `oom_kill` (processes the kernel OOM-killed inside it).
-- `clipped`: `true` when `peak_bytes >= limit_bytes`, or `events_max` or
-  `oom_kills` is non-zero. `memory.peak` cannot exceed `memory.max`, so a
-  clipped peak is the cap, not the scope's real need. **A clipped peak is not
-  recorded in the peak history** (`~/.loom/ram-peaks.json`). Before #12241 it
-  was, and the next derived cap could grow by at most 2x per killed build
-  (#11094).
+- `clipped`: `true` only when a limit applied and `peak_bytes >= limit_bytes`,
+  or `events_max` or `oom_kills` is non-zero. `memory.peak` cannot exceed
+  `memory.max`, so a clipped peak is the cap, not the scope's real need. With
+  no limit it is always `false`: cgroup v2 `oom_kill` also counts kills by the
+  global OOM killer, and such a scope's peak is genuine. The flag is a signal
+  only. The peak history (`~/.loom/ram-peaks.json`) still records every peak,
+  clipped or not; how it should treat a clipped peak is #11094's to decide.
 - `observed_at`, and standard `loom` build provenance. A record whose
   provenance does not validate is not exported. Both OTLP timestamps are
   `observed_at`.
 
+The counters are sampled once per work-finder tick, so an event in the last
+interval before the scope exits is not seen. That mostly under-counts kills at
+the very end of a scope; with `OOMPolicy=continue` a scope usually outlives a
+kill inside it.
+
 **OTLP.** Attributes: `loom.role`, `loom.repo` / `loom.repo.visibility` and
 `loom.issue` (when known), and `loom.scope.unit` / `workspace` / `limit_bytes`
 (when a limit applied) / `limit_source` / `peak_bytes` / `events_max` /
-`oom_kills` / `clipped` (`SCOPE_MEMORY_LOG_ATTRIBUTE_KEYS`, kept by the
+`oom_kills` / `clipped` (a bool) (`SCOPE_MEMORY_LOG_ATTRIBUTE_KEYS`, kept by the
 collector's `transform/privacy` `keep_keys`, contract-tested).
 
 

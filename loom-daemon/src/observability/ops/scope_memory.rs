@@ -43,7 +43,7 @@ pub fn record(
         workspace: e.repo.clone(),
         repo,
         repo_visibility,
-        role: scope_role(&e.scope, e.role.as_deref(), e.issue),
+        role: scope_role(e.role.as_deref(), e.issue),
         issue: e.issue,
         limit_bytes: e.limit_bytes,
         limit_source: source,
@@ -110,7 +110,8 @@ mod tests {
 
     #[test]
     fn a_killed_capped_scope_is_clipped_and_counted() {
-        let e = ended(Some(8 * GIB), 8 * GIB, 12, 4);
+        let mut e = ended(Some(8 * GIB), 8 * GIB, 12, 4);
+        e.role = Some("builder".into());
         let r = record(
             &e,
             LimitSource::History,
@@ -133,8 +134,16 @@ mod tests {
         let r = record(&ended(None, 3 * GIB, 0, 0), LimitSource::None, None, Utc::now());
         assert!(!r.clipped);
         assert_eq!(r.limit_bytes, None);
+        assert_eq!(r.role, "unknown");
         assert!(r.repo.is_none() && r.repo_visibility.is_none());
         assert!(oom_kill_point(&r).is_none());
+    }
+
+    #[test]
+    fn a_global_oom_kill_without_a_limit_is_counted_but_not_clipped() {
+        let r = record(&ended(None, 13 * GIB, 0, 1), LimitSource::None, None, Utc::now());
+        assert!(!r.clipped);
+        assert_eq!(oom_kill_point(&r).unwrap().labels["role"], "unknown");
     }
 
     #[test]
