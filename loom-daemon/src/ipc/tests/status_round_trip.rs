@@ -163,6 +163,7 @@ fn test_daemon_status_request_response_round_trip() {
         daemon_build_commit: Some("18887b5c".to_string()),
         daemon_built_at_raw: Some("2026-08-02T03:09:51Z".to_string()),
         work_finder_interval_secs: Some(60),
+        startup_jitter_delay_secs: Some(437),
         observability_host_id_mismatch: Some(crate::types::ObservabilityHostIdMismatch {
             daemon_host_id: "robb-studio".to_string(),
             ingest_host_id: "robb-pro".to_string(),
@@ -250,6 +251,7 @@ fn test_daemon_status_request_response_round_trip() {
     match back {
         Response::DaemonStatus(r) => {
             assert_eq!(r.token_pool_size, 4);
+            assert_eq!(r.startup_jitter_delay_secs, Some(437));
             let sessions = r
                 .session_containers
                 .as_ref()

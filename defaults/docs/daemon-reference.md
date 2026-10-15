@@ -6571,7 +6571,9 @@ environment unchanged. The paths above re-render it.
 
 There is no roll window, no per-host offset and no jitter. On startup and on
 every tick the self-update loop compares the fleet floor (`loom_min_version`,
-above) with the version it is running, and acts on that tick.
+above) with the version it is running, and acts on that tick. (The *first
+gathers after* a roll are jittered per host; see "Post-restart jitter for the
+first fleet-wide gather (#12073)".)
 
 What it does depends on whether the host reads a fleet store (`fleet.repo`).
 **This applies to every fleet host, whatever `autonomous.autoUpdate.enabled`
@@ -7684,7 +7686,13 @@ start`.
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `LOOM_STARTUP_JITTER_WINDOW_SECS` (env) > `autonomous.startupJitterWindowSecs` (any config tier) | `600` | Window in seconds; `0` disables the delay |
+| `LOOM_STARTUP_JITTER_WINDOW_SECS` (env) > `autonomous.startupJitterWindowSecs` (any config tier) | `600` on a fleet host (a fleet store is configured: `fleet.repo` / `LOOM_FLEET_REPO`), `0` otherwise | Window in seconds; `0` disables the delay |
+
+The default only delays fleet hosts, where the herd exists: a single-host or
+dev daemon dispatches from boot as before. `status --json` reports the armed
+delay as `startup_jitter_delay_secs`, and `loom-daemon health` adds it to the
+work finder's first-tick grace (2 × interval), so a host still inside its
+window reads "warming up", not "no work-finder tick observed".
 
 Not covered: the startup claim-reconciliation pass (it gates the first
 admission and is per-repo `loom:building` only) and the stale-blocked release

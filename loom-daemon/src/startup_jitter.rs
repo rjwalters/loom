@@ -16,8 +16,13 @@
 //!   so a host always lands on the same offset and the fleet's hosts spread
 //!   across the window.
 //! - The window is `LOOM_STARTUP_JITTER_WINDOW_SECS` (env) >
-//!   `autonomous.startupJitterWindowSecs` (any config tier) >
-//!   [`DEFAULT_WINDOW_SECS`]. `0` disables the delay.
+//!   `autonomous.startupJitterWindowSecs` (any config tier) > a default of
+//!   [`FLEET_DEFAULT_WINDOW_SECS`] on a fleet host (`fleet.repo` configured,
+//!   where the herd exists) and `0` everywhere else, so a single-host or dev
+//!   daemon never waits. `0` disables the delay.
+//! - `health` reads the armed delay from `status --json`
+//!   (`startup_jitter_delay_secs`) and extends its first-tick grace by it, so
+//!   a host inside its window reads as warming up, not as a dead work finder.
 //! - A loop calls [`wait_first_run`] before its first tick (arms, then
 //!   sleeps until the gate opens), or arms with [`arm`] and checks
 //!   [`is_open`] where it cannot sleep. [`is_open`] never arms: an unarmed
@@ -34,10 +39,20 @@ use tokio::time::Instant;
 pub const WINDOW_ENV: &str = "LOOM_STARTUP_JITTER_WINDOW_SECS";
 /// Dotted config key for the window, in seconds (`0` disables).
 pub const WINDOW_KEY: &str = "autonomous.startupJitterWindowSecs";
-/// Default window: about the time the fleet's buckets need to absorb nine
-/// first gathers. `0` in this crate's unit tests, which spawn the loops
-/// in-process and would otherwise share a closed gate for minutes.
-pub const DEFAULT_WINDOW_SECS: u64 = if cfg!(test) { 0 } else { 600 };
+/// Default window on a fleet host: about the time the fleet's buckets need
+/// to absorb nine first gathers.
+pub const FLEET_DEFAULT_WINDOW_SECS: u64 = 600;
+
+/// The default window when neither env nor config sets one: the fleet
+/// default on a fleet host, `0` (no delay) on any other daemon.
+#[must_use]
+pub fn default_window_secs(fleet_host: bool) -> u64 {
+    if fleet_host {
+        FLEET_DEFAULT_WINDOW_SECS
+    } else {
+        0
+    }
+}
 
 /// This host's delay inside `window`: FNV-1a 64 of `host_id`, modulo the
 /// window in milliseconds. Pure and stable across builds (no std hasher,
@@ -57,8 +72,12 @@ pub fn delay_for(host_id: &str, window: Duration) -> Duration {
     Duration::from_millis(hash % window_ms)
 }
 
-/// The configured window: env > config > default. An unparsable value at a
-/// tier falls through to the next one.
+/// The configured window: env > config > [`default_window_secs`]. An
+/// unparsable value at a tier falls through to the next one. A host is a
+/// fleet host when it names a fleet store (`fleet.repo` / `LOOM_FLEET_REPO`),
+/// valid or not, the same test `fleet_sync::FloorKnowledge` makes. In this
+/// crate's unit tests the default is always `0`: they spawn the loops
+/// in-process, share the one gate, and may run on a fleet host.
 #[must_use]
 pub fn window(root: &Path) -> Duration {
     let env = std::env::var(WINDOW_ENV)
@@ -68,7 +87,17 @@ pub fn window(root: &Path) -> Duration {
         let effective = crate::config_resolver::resolve_effective_config(root);
         crate::config_resolver::get_path(&effective, WINDOW_KEY)
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(DEFAULT_WINDOW_SECS)
+            .unwrap_or_else(|| {
+                let fleet_host = !matches!(
+                    crate::fleet_store::resolve_location(&effective, &|k| std::env::var(k).ok()),
+                    Ok(None)
+                );
+                if cfg!(test) {
+                    0
+                } else {
+                    default_window_secs(fleet_host)
+                }
+            })
     });
     Duration::from_secs(secs)
 }
@@ -77,6 +106,7 @@ pub fn window(root: &Path) -> Duration {
 #[derive(Debug, Clone, Copy)]
 pub struct Gate {
     opens_at: Instant,
+    delay: Duration,
 }
 
 impl Gate {
@@ -84,7 +114,14 @@ impl Gate {
     pub fn new(armed_at: Instant, delay: Duration) -> Self {
         Self {
             opens_at: armed_at + delay,
+            delay,
         }
+    }
+
+    /// The delay the gate was armed with.
+    #[must_use]
+    pub fn delay(&self) -> Duration {
+        self.delay
     }
 
     /// The instant the gate opens.
@@ -131,6 +168,15 @@ pub fn is_open() -> bool {
         .is_none_or(|gate| gate.remaining(Instant::now()).is_zero())
 }
 
+/// The armed delay in whole seconds, rounded up, for `status --json`
+/// (`health` extends its first-tick grace by it). `None` while unarmed.
+#[must_use]
+pub fn armed_delay_secs() -> Option<u64> {
+    GATE.get()
+        .map(|gate| gate.delay().as_millis().div_ceil(1000))
+        .map(|secs| u64::try_from(secs).unwrap_or(u64::MAX))
+}
+
 /// Arm the gate, then sleep until it opens. Call once before a gathering
 /// loop's first tick.
 pub async fn wait_first_run(root: &Path, loop_name: &str) {
@@ -165,11 +211,33 @@ mod tests {
 
     #[test]
     fn delays_spread_across_the_window() {
-        let delays: Vec<Duration> = (0..9)
+        // Nine sequential ids, the size of the 2026-10-15 herd: no two land
+        // within 10 s of each other and no minute takes more than two.
+        let mut delays: Vec<Duration> = (0..9)
             .map(|i| delay_for(&format!("loom-worker-{i}"), WINDOW))
             .collect();
-        let distinct: std::collections::BTreeSet<_> = delays.iter().collect();
-        assert_eq!(distinct.len(), delays.len(), "{delays:?}");
+        delays.sort();
+        for pair in delays.windows(2) {
+            assert!(pair[1] - pair[0] >= Duration::from_secs(10), "{delays:?}");
+        }
+        let mut per_minute = std::collections::BTreeMap::<u64, u32>::new();
+        for d in &delays {
+            *per_minute.entry(d.as_secs() / 60).or_default() += 1;
+        }
+        assert!(per_minute.values().all(|n| *n <= 2), "{per_minute:?}");
+    }
+
+    #[test]
+    fn production_default_is_ten_minutes_on_a_fleet_host_and_off_elsewhere() {
+        assert_eq!(FLEET_DEFAULT_WINDOW_SECS, 600);
+        assert_eq!(default_window_secs(true), 600);
+        assert_eq!(default_window_secs(false), 0);
+    }
+
+    #[test]
+    fn gate_reports_its_delay() {
+        let gate = Gate::new(Instant::now(), Duration::from_millis(1500));
+        assert_eq!(gate.delay(), Duration::from_millis(1500));
     }
 
     #[test]
@@ -211,7 +279,8 @@ mod tests {
     fn window_reads_env_then_config_then_default() {
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var(WINDOW_ENV);
-        assert_eq!(window(dir.path()), Duration::from_secs(DEFAULT_WINDOW_SECS));
+        // No env, no config key: the unit-test default.
+        assert_eq!(window(dir.path()), Duration::ZERO);
         std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
         std::fs::write(
             dir.path().join(".loom/config.json"),

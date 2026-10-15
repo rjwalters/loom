@@ -1717,6 +1717,7 @@ pub fn build_daemon_status_for(
         // process from the on-disk binary.
         daemon_built_at_raw: Some(crate::self_update::BUILT_AT_RAW.to_string()),
         work_finder_interval_secs,
+        startup_jitter_delay_secs: crate::startup_jitter::armed_delay_secs(),
     };
 
     // #7513/#8163: hand the phase breakdown to the shared cost model, which

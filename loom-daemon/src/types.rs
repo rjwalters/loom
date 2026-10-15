@@ -1835,6 +1835,12 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data compatible.
     #[serde(default)]
     pub work_finder_interval_secs: Option<u64>,
+    /// The per-host post-restart delay before this process's first
+    /// fleet-wide gather (#12073, [`crate::startup_jitter`]). `health` adds it
+    /// to the first-tick grace window, so a host still inside its jitter reads
+    /// as warming up. `None` when the gate is unarmed or for an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_jitter_delay_secs: Option<u64>,
     /// An observability-exporter host-identity mismatch detected this process
     /// (Issue #4830): the ingest key installed on this host is bound to a
     /// *different* `host_id` than the one this daemon reports for itself, so
