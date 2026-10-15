@@ -43,7 +43,11 @@
 #      entry run that copy — the project copy WINS until Phase 6 strips it, so a
 #      transition repo runs each guard exactly ONCE (no double-fire, no
 #      duplicated decision-log lines).
-#   4. Otherwise exec the machine-checkout hook
+#   4. Otherwise exec `$LOOM_HOOKS_HOME/defaults/hooks/<name>` when that is
+#      executable (the running daemon's own release, unpacked from its binary
+#      and exported to every session it spawns: hooks track the daemon by
+#      construction, 2am#4501, see loom-daemon/src/hooks_home.rs),
+#      else the machine-checkout hook
 #      `${LOOM_HOME:-$HOME/.local/share/loom}/defaults/hooks/<name>`, passing the
 #      resolved repo root through `LOOM_PROJECT_ROOT` (so guard-destructive.sh's
 #      dispatcher resolves the consuming repo's canonical Repo-Skills guard from
@@ -233,7 +237,7 @@ _PHOOK_WRAPPER_MARKER='ROOT=$(cd "$(git rev-parse --git-common-dir'
 _phook_cmd() {
     local name="$1"
     # shellcheck disable=SC2016  # literal $-expansions are intentional (per-user, at hook time)
-    printf '%s' "bash -c 'ROOT=\$(cd \"\$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd); [ -n \"\$ROOT\" ] || exit 0; { [ -f \"\$ROOT/.loom-project/project.json\" ] || [ -f \"\$ROOT/.loom/config.json\" ]; } || exit 0; [ -x \"\$ROOT/.loom/hooks/${name}\" ] && [ -f \"\$ROOT/.claude/settings.json\" ] && case \"\$(<\"\$ROOT/.claude/settings.json\")\" in *\".loom/hooks/${name}\"*) exit 0 ;; esac; H=\"\${LOOM_HOME:-\$HOME/.local/share/loom}/defaults/hooks/${name}\"; [ -x \"\$H\" ] && LOOM_PROJECT_ROOT=\"\$ROOT\" exec \"\$H\" || exit 0'"
+    printf '%s' "bash -c 'ROOT=\$(cd \"\$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd); [ -n \"\$ROOT\" ] || exit 0; { [ -f \"\$ROOT/.loom-project/project.json\" ] || [ -f \"\$ROOT/.loom/config.json\" ]; } || exit 0; [ -x \"\$ROOT/.loom/hooks/${name}\" ] && [ -f \"\$ROOT/.claude/settings.json\" ] && case \"\$(<\"\$ROOT/.claude/settings.json\")\" in *\".loom/hooks/${name}\"*) exit 0 ;; esac; H=\"\${LOOM_HOOKS_HOME:+\$LOOM_HOOKS_HOME/defaults/hooks/${name}}\"; [ -x \"\$H\" ] || H=\"\${LOOM_HOME:-\$HOME/.local/share/loom}/defaults/hooks/${name}\"; [ -x \"\$H\" ] && LOOM_PROJECT_ROOT=\"\$ROOT\" exec \"\$H\" || exit 0'"
 }
 
 # ── Operator presence (#11563, #11713) ────────────────────────────────────────

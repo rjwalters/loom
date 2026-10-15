@@ -660,6 +660,13 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
 
+    /// Print the directory this release's sessions run their wired
+    /// user-scope hooks from (2am#4501): the payload embedded in
+    /// this binary, unpacked once per release. Exit 1 with nothing on stdout
+    /// when there is none. Not a port: brand-new logic, native per the
+    /// shell-language policy.
+    HooksHome(super::hooks_home_cmd::HooksHomeArgs),
+
     /// Print this host's identity (#11530): `fleet.hostId` > `LOOM_HOST_ID` >
     /// the persisted `~/.loom/host-id`, never the hostname. One line on
     /// stdout, exit 0; exits non-zero (nothing on stdout) on `unknown-host`.
@@ -753,6 +760,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
             ScriptPortCommand::ResyncPayload(args) => args.run(),
             ScriptPortCommand::HostId(args) => args.run(),
+            ScriptPortCommand::HooksHome(args) => args.run(),
         }
     }
 }
