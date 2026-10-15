@@ -126,6 +126,12 @@ pub struct RoleTickTelemetry {
     /// The step's sweep id when a step-engine step, not a role tick, ran
     /// (#11906); the record then carries `source = "step"`.
     pub step_sweep_id: Option<String>,
+    /// The host limit that deferred this repo's tick (#12084); `Some` exactly
+    /// when `result` is [`RoleTickResult::SkippedDeferred`].
+    pub deferred_by: Option<String>,
+    /// `<index>/<count>` of the shard that owns this repo (#12084), when the
+    /// host is sharded.
+    pub shard_owner: Option<String>,
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -394,6 +400,8 @@ fn emit_tick(
             preference_tap: preference.map(|stamp| stamp.tap),
             role_draw,
             step_sweep_id,
+            deferred_by: None,
+            shard_owner: None,
         },
         trace,
     );
@@ -714,6 +722,8 @@ pub fn build_record(
             .as_ref()
             .map(|_| crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string()),
         sweep_id: tick.step_sweep_id.clone(),
+        deferred_by: tick.deferred_by.clone().filter(|d| !d.is_empty()),
+        shard_owner: tick.shard_owner.clone().filter(|s| !s.is_empty()),
     }
 }
 
@@ -1023,6 +1033,7 @@ pub fn label_spawned(label: &str) -> Option<bool> {
         .map(RoleTickResult::spawned)
 }
 
+pub mod deferred;
 pub mod story;
 pub mod targets;
 pub mod usage;
