@@ -87,6 +87,29 @@ LOOM_FORGE_CALL_STATS_DIR = { value = "", force = true }
 # to `cargo run`, so an in-repo dev daemon (start-daemon.sh, daemon:preview)
 # ignores the machine defaults file too, even with the variable exported.
 LOOM_CONFIG_DEFAULTS_FILE = { value = "", force = true }
+# #9851: every Loom agent session is spawned with its admitted runtime pinned
+# (`launch_env::apply_launch_env`), and `runtime_admission::resolve_binding`
+# reads LOOM_RUNTIME_<ROLE> / LOOM_RUNTIME before any `runtimes.*` fixture a
+# test writes, so a native pin reddened ~110 dispatch-path tests in buildGate.
+# Same shape as LOOM_FORGE_CALL_STATS_DIR above: empty counts as unset
+# (`choose_runtime`'s `nonempty`), and a test that wants a pin sets its own via
+# set_var, which overrides this. The per-role list is one entry per
+# `runtime_admission::KNOWN_ROLE_KEYS` (the canonical_role outputs); a unit
+# test there fails if a role is missing here. `force = true` also applies to
+# `cargo run`: with no pin exported a dev daemon is unchanged; with one
+# exported it is ignored and the daemon resolves from `runtimes.*` config.
+LOOM_RUNTIME = { value = "", force = true }
+LOOM_RUNTIME_ARCHITECT = { value = "", force = true }
+LOOM_RUNTIME_AUDITOR = { value = "", force = true }
+LOOM_RUNTIME_BUILDER = { value = "", force = true }
+LOOM_RUNTIME_CHAMPION = { value = "", force = true }
+LOOM_RUNTIME_CURATOR = { value = "", force = true }
+LOOM_RUNTIME_DOCTOR = { value = "", force = true }
+LOOM_RUNTIME_DRIVER = { value = "", force = true }
+LOOM_RUNTIME_GUIDE = { value = "", force = true }
+LOOM_RUNTIME_HERMIT = { value = "", force = true }
+LOOM_RUNTIME_JUDGE = { value = "", force = true }
+LOOM_RUNTIME_SWEEP_LIFECYCLE = { value = "", force = true }
 
 [alias]
 # Convenient aliases for common tasks

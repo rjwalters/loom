@@ -47,6 +47,38 @@ assert_deny "SQL malformed-config: block DROP TABLE (fall through to on)" \
 assert_deny "SQL malformed-config: block DELETE FROM without WHERE" \
     "psql -c 'DELETE FROM users;'" "$SQL_BAD_REPO"
 
+# --- #11007: deny only when the phrase reaches something that executes it ---
+assert_allow "SQL exec-gate: sed -i source edit containing DROP TABLE" \
+    "sed -i 's/x/c.execute(\"DROP TABLE IF EXISTS decisions\")/' src/archive.py" "$SQL_ABSENT_REPO"
+assert_allow "SQL exec-gate: interpreter heredoc writing a file with DROP TABLE" \
+    "python3 - <<'EOF'
+open('src/x.py','a').write('DROP TABLE t')
+EOF" "$SQL_ABSENT_REPO"
+assert_allow "SQL exec-gate: git log -S pickaxe" \
+    "git log -S 'DROP TABLE' --oneline" "$SQL_ABSENT_REPO"
+assert_allow "SQL exec-gate: git grep" \
+    "git grep -n 'DROP TABLE' -- src" "$SQL_ABSENT_REPO"
+assert_allow "SQL exec-gate: rg" \
+    "rg 'TRUNCATE TABLE' src" "$SQL_ABSENT_REPO"
+assert_allow "SQL exec-gate: jq --arg mention" \
+    "jq -n --arg c 'run DROP TABLE t' '{command:\$c}'" "$SQL_ABSENT_REPO"
+assert_allow "SQL exec-gate: git commit -m mention" \
+    "git commit -m 'fix DROP TABLE handling'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate: sqlite3 positional" \
+    "sqlite3 db 'DROP TABLE t'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate: python -c" \
+    "python -c 'import sqlite3; sqlite3.connect(\"d\").execute(\"DROP TABLE t\")'" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate: bash -c wrapping sqlite3" \
+    "bash -c \"sqlite3 db 'DROP TABLE t'\"" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate: ssh remote psql" \
+    "ssh host \"psql -c 'DROP TABLE t'\"" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate: pipeline feeding sqlite3" \
+    "echo 'DROP TABLE t;' | sqlite3 db" "$SQL_ABSENT_REPO"
+assert_deny "SQL exec-gate: sqlite3 heredoc body" \
+    "sqlite3 db <<EOF
+DROP TABLE t;
+EOF" "$SQL_ABSENT_REPO"
+
 # --- Opt-out via config: all five SQL cases pass through as allow ---
 assert_allow "SQL config-off: allow DROP DATABASE" \
     "psql -c 'DROP DATABASE mydb;'" "$SQL_OFF_REPO"

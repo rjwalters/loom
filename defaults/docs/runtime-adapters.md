@@ -1347,6 +1347,16 @@ entry is recorded as skipped with reason `not-admitted(worktreeIsolation)`, whic
 is materially different from "Codex had no credential" and should be read that
 way.
 
+**Model-profile resolution and the unknown-profile failure (#11638).** A launch
+resolves its profile name from, in order: an explicit request (`--profile`, or a
+preference tap's `modelProfile`), `LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`,
+then the built-in `zai-flash` fallback. The name is then looked up in
+`runtimes.modelProfiles` (which shadows) and the bundled set. A name found in
+neither is a **hard exit 78**, never a fallback to `zai-flash`: the message names
+the profile looked up, where the name came from, and the sorted known profile
+names (names only, never credential values). `loom-daemon worker profile-check
+<name>` reproduces it.
+
 **Model-profile role exclusion (`excludedRoles`, #11400).** A model profile may
 list roles it must never run, e.g. `"excludedRoles": ["judge", "curator"]` on the
 shipped `zai-flash` profile (review and triage stay off GLM). Admission enforces

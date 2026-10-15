@@ -294,6 +294,8 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::ForgeMirrorChanges,
         MetricName::ForgeMirrorWakeLatency,
         MetricName::StageEntryLookups,
+        MetricName::FeedCompletions,
+        MetricName::FeedReconcilePasses,
         MetricName::EgressRequests,
         MetricName::EgressTokens,
         MetricName::EgressLatency,

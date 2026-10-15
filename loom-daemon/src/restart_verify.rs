@@ -1455,8 +1455,17 @@ com.rjwalters.loom-daemon = {
         // reported live; stub it rather than depend on a real pid 55555.
         write_stub(stub_dir.path(), "kill", "#!/bin/sh\nexit 0\n");
 
-        let (pid, alive) =
-            with_path_prefix(stub_dir.path(), || supervised_pid(Supervisor::Launchd));
+        // The probes are bounded by the production `PROBE_TIMEOUT`; on a
+        // starved host a stub can miss it, which reads as "no pid". Ask again
+        // until a pid is reported, with a generous bound. Only the answer is
+        // asserted, never how long it took.
+        let give_up = std::time::Instant::now() + Duration::from_secs(90);
+        let (pid, alive) = loop {
+            let answer = with_path_prefix(stub_dir.path(), || supervised_pid(Supervisor::Launchd));
+            if answer.0.is_some() || std::time::Instant::now() >= give_up {
+                break answer;
+            }
+        };
         std::env::remove_var("LOOM_LAUNCHD_LABEL");
 
         assert_eq!(

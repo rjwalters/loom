@@ -38,9 +38,9 @@
 //! no rate-limit breaker (it exists only in the running daemon), so a refusal
 //! stops nothing here and reaches no later invocation.
 //! `.loom/docs/github-authentication.md` -> "Secondary rate limits and
-//! hand-rolled loops" has the caller-side rules. The daemon's own walk of
-//! every registered workspace is the *write* pass, `release-stale-blocked`,
-//! which runs in one process behind the breaker.
+//! hand-rolled loops" has the caller-side rules. Nothing removes
+//! `loom:blocked` automatically: the daemon's release pass was retired
+//! (#11301), so a blocked item stays blocked until a role or a human clears it.
 //!
 //! # Why every failure is still exit 0
 //!
