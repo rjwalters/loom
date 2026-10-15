@@ -113,21 +113,30 @@ _extract_host() {
   fi
 }
 
+# _forge_token_cfg TOKEN -> one curl config line carrying the Gitea token
+# header. Used as `curl --config <(_forge_token_cfg "$t")` so the credential
+# never appears in curl's argv, which every process of the user can read
+# (ps, /proc/*/cmdline). printf is a builtin, so the token is in no argv
+# here either. The value is escaped for curl's double-quoted config syntax
+# (backslash and quote escaped, CR/LF stripped).
+_forge_token_cfg() {
+  local t="${1//[$'\r\n']/}"
+  t="${t//\\/\\\\}"
+  t="${t//\"/\\\"}"
+  printf 'header = "Authorization: token %s"\n' "$t"
+}
+
 # Probe whether a URL responds like a Gitea API.
 # Returns 0 if it looks like Gitea, 1 otherwise.
 _probe_gitea_api() {
   local api_base="$1"
   local token="$2"
 
-  local auth_header=""
-  if [[ -n "$token" ]]; then
-    auth_header="Authorization: token $token"
-  fi
-
   # Try the Gitea version endpoint — lightweight and always available
   local response=""
-  if [[ -n "$auth_header" ]]; then
-    response=$(curl -s -m 5 -H "$auth_header" "${api_base}/version" 2>/dev/null || echo "")
+  if [[ -n "$token" ]]; then
+    # The token rides a curl config on a /dev/fd pipe, never argv.
+    response=$(curl -s -m 5 --config <(_forge_token_cfg "$token") "${api_base}/version" 2>/dev/null || echo "")
   else
     response=$(curl -s -m 5 "${api_base}/version" 2>/dev/null || echo "")
   fi
@@ -163,15 +172,16 @@ gitea_api() {
     -w "\n%{http_code}"
   )
 
-  if [[ -n "$FORGE_TOKEN" ]]; then
-    curl_args+=(-H "Authorization: token $FORGE_TOKEN")
-  fi
-
   if [[ -n "$body" ]]; then
     curl_args+=(-d "$body")
   fi
 
-  curl "${curl_args[@]}" "$url"
+  if [[ -n "$FORGE_TOKEN" ]]; then
+    # The token rides a curl config on a /dev/fd pipe, never argv.
+    curl "${curl_args[@]}" --config <(_forge_token_cfg "$FORGE_TOKEN") "$url"
+  else
+    curl "${curl_args[@]}" "$url"
+  fi
 }
 
 # Detect which merge strategy the target repository actually allows (#7844).

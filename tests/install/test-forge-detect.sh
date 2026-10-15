@@ -138,6 +138,98 @@ else
 fi
 
 # ============================================================================
+# The Gitea token never reaches curl's argv
+#
+# argv is readable by every process of the user (ps, /proc/*/cmdline), so
+# _probe_gitea_api and gitea_api must hand the token to curl through a config
+# read from a pipe. A stub `curl` first on PATH records its argv and the
+# contents of any --config file. Stub values only.
+# ============================================================================
+echo ""
+echo "=== Testing the token stays out of curl argv ==="
+
+ARGV_WORK="$(mktemp -d)"
+mkdir -p "$ARGV_WORK/bin"
+cat >"$ARGV_WORK/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CURL_ARGV_LOG"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config|-K) [[ -r "$2" ]] && cat "$2" >>"$CURL_CFG_LOG"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '{"version":"1.21.0"}\n200'
+STUB
+chmod +x "$ARGV_WORK/bin/curl"
+STUB_FORGE_TOKEN='stub-gitea-token-0123456789-not-real'
+export CURL_ARGV_LOG="$ARGV_WORK/argv.log" CURL_CFG_LOG="$ARGV_WORK/cfg.log"
+
+# with_stub_curl CMD... -> run CMD with the recording curl first on PATH.
+# bash scopes a VAR=value prefix on a function call to that call.
+with_stub_curl() {
+  PATH="$ARGV_WORK/bin:$PATH" "$@"
+}
+
+# assert_token_off_argv DESC EXPECTED_CFG_LINE
+assert_token_off_argv() {
+  local desc="$1" want="$2"
+  TOTAL=$((TOTAL + 1))
+  if [[ ! -s "$CURL_ARGV_LOG" ]]; then
+    echo -e "${RED}FAIL${NC}: $desc: stub curl never invoked"
+    FAIL=$((FAIL + 1))
+  elif grep -qF "$STUB_FORGE_TOKEN" "$CURL_ARGV_LOG" || grep -q 'Authorization' "$CURL_ARGV_LOG"; then
+    echo -e "${RED}FAIL${NC}: $desc: credential in curl argv: $(cat "$CURL_ARGV_LOG")"
+    FAIL=$((FAIL + 1))
+  elif ! grep -qF "$want" "$CURL_CFG_LOG"; then
+    echo -e "${RED}FAIL${NC}: $desc: token not delivered via config: $(cat "$CURL_CFG_LOG")"
+    FAIL=$((FAIL + 1))
+  else
+    echo -e "${GREEN}PASS${NC}: $desc"
+    PASS=$((PASS + 1))
+  fi
+}
+
+: >"$CURL_ARGV_LOG"; : >"$CURL_CFG_LOG"
+probe_rc=0
+with_stub_curl _probe_gitea_api "https://gitea.example.com/api/v1" "$STUB_FORGE_TOKEN" || probe_rc=$?
+assert_token_off_argv "_probe_gitea_api: token via config, not argv" \
+  "header = \"Authorization: token $STUB_FORGE_TOKEN\""
+assert_eq "_probe_gitea_api still detects Gitea with a token" "0" "$probe_rc"
+
+: >"$CURL_ARGV_LOG"; : >"$CURL_CFG_LOG"
+with_stub_curl _probe_gitea_api "https://gitea.example.com/api/v1" "" >/dev/null || true
+TOTAL=$((TOTAL + 1))
+if grep -q -- '--config\|Authorization' "$CURL_ARGV_LOG" "$CURL_CFG_LOG"; then
+  echo -e "${RED}FAIL${NC}: _probe_gitea_api without a token sent auth"
+  FAIL=$((FAIL + 1))
+else
+  echo -e "${GREEN}PASS${NC}: _probe_gitea_api without a token is anonymous"
+  PASS=$((PASS + 1))
+fi
+
+: >"$CURL_ARGV_LOG"; : >"$CURL_CFG_LOG"
+api_out="$(FORGE_API_BASE="https://gitea.example.com/api/v1" FORGE_TOKEN="$STUB_FORGE_TOKEN" \
+  with_stub_curl gitea_api POST /repos/o/r/labels '{"name":"x"}')" || true
+assert_token_off_argv "gitea_api: token via config, not argv" \
+  "header = \"Authorization: token $STUB_FORGE_TOKEN\""
+assert_eq "gitea_api still passes method and body" "1" \
+  "$(grep -cF -- '-X POST -H Content-Type: application/json -w' "$CURL_ARGV_LOG" | tr -d ' ')"
+assert_eq "gitea_api still passes the JSON body" "1" \
+  "$(grep -cF -- '-d {"name":"x"}' "$CURL_ARGV_LOG" | tr -d ' ')"
+assert_eq "gitea_api output unchanged" $'{"version":"1.21.0"}\n200' "$api_out"
+
+: >"$CURL_ARGV_LOG"; : >"$CURL_CFG_LOG"
+FORGE_API_BASE="https://gitea.example.com/api/v1" FORGE_TOKEN='stub"tok\en' \
+  with_stub_curl gitea_api GET /version >/dev/null || true
+assert_eq "gitea_api escapes quote/backslash in the config line" \
+  'header = "Authorization: token stub\"tok\\en"' "$(cat "$CURL_CFG_LOG")"
+
+rm -rf "$ARGV_WORK"
+unset CURL_ARGV_LOG CURL_CFG_LOG
+unset -f with_stub_curl
+
+# ============================================================================
 # Test detect_merge_method (issue #7844)
 #
 # The installer's FORCE_AUTO_MERGE path must merge with a strategy the target

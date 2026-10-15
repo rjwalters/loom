@@ -316,6 +316,10 @@ tests/hermit/test-stateless-ceremony.sh
 # repo under mktemp -d with its own identity, no network, no gh.
 scripts/test-changelog.sh
 
+# #11991: check-guard-destructive-drift.sh keeps GH_TOKEN off curl argv.
+# Hermetic: recording curl stub on PATH under mktemp -d; no network or forge.
+scripts/test-check-guard-destructive-drift-argv.sh
+
 # #11790: spawn-claude.sh's container gh credentials and
 # `gh-shim container-mount` sink mount. Hermetic: stub docker + stub daemon
 # under mktemp -d; no network, forge or real daemon binary.
