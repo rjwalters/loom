@@ -413,6 +413,8 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
     assert_eq!(records.len(), 1, "{journal:?}");
     assert_eq!(records[0].role, "champion");
     assert_eq!(records[0].model.as_deref(), Some("opus"));
+    assert_eq!(records[0].source.as_deref(), Some(crate::telemetry::ROLE_TICK_SOURCE_STEP));
+    assert_eq!(records[0].sweep_id.as_deref(), Some("step-champion_merge-8-1"));
 }
 
 /// Review item 4: a step found dead at startup runs the step end too, so the
@@ -434,17 +436,29 @@ fn a_step_found_dead_at_startup_runs_its_end() {
     );
 }
 
-/// An issue step's child is told the claim is its invoker's; a PR step's is
-/// not (its item is a PR, never an issue claim).
+/// Only a Builder step's child is told the issue claim is its invoker's:
+/// every other step holds the role-keyed lease alone.
 #[test]
 #[serial]
-fn only_an_issue_step_names_its_item_as_the_owned_claim() {
+fn only_a_builder_step_names_its_item_as_the_owned_claim() {
     let dir = tempdir().unwrap();
     let (mut reg, record) = fixture_registry(dir.path());
-    let out = reg
-        .spawn_step(&StepSpawnRequest::new(9_105, StepRole::Curator))
+    let builder = reg
+        .spawn_step(&StepSpawnRequest::new(9_105, StepRole::Builder))
         .unwrap();
-    let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", out.sweep_id));
+    let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", builder.sweep_id));
     assert!(recorded.contains("LOOM_SWEEP_CLAIM_OWNED=9105"), "{recorded}");
+    let curator = reg
+        .spawn_step(&StepSpawnRequest::new(9_106, StepRole::Curator))
+        .unwrap();
+    let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", curator.sweep_id));
+    // This launch's own record: from its `argv:` line to its sweep id.
+    let block = recorded[..recorded
+        .find(&format!("LOOM_SWEEP_ID={}", curator.sweep_id))
+        .unwrap()]
+        .rsplit("argv:")
+        .next()
+        .unwrap_or_default();
+    assert!(block.contains("LOOM_SWEEP_CLAIM_OWNED=unset"), "{block}");
     cancel_all(&mut reg);
 }
