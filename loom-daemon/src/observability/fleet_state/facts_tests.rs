@@ -33,6 +33,7 @@ fn ready_item(
         main_red_fix: false,
         eligible_reason: eligible.map(|(reason, _)| reason),
         eligible_at: eligible.map(|(_, at)| at),
+        dispatch_blocked_reason: None,
     }
 }
 
