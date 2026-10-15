@@ -51,11 +51,14 @@
 //! runs counts, up to [`MAX_CHECK_RUN_PAGES`] (#11903).
 //!
 //! A pass that stood down *because* CI was pending says so on its release
-//! (`--skip-reason` [`SKIP_CI_PENDING`], #11972) and is never recorded, even
-//! if CI finished between its check and its release: re-reading CI at release
-//! time once found a green head 12 s after the pass skipped, recorded
-//! `verdict=none` and held the PR from Judge for an hour. A release without a
-//! skip reason (an older prompt) keeps the re-read.
+//! (`--skip-reason` [`SKIP_CI_PENDING`], #11972), and is not recorded if CI
+//! finished between its check and its release: re-reading CI at release time
+//! once found a green head 12 s after the pass skipped, recorded
+//! `verdict=none` and held the PR from Judge for an hour. Its release still
+//! reads CI, for the age bound alone: if everything still pending is past
+//! [`PENDING_EXEMPT_HOURS`] or has no start stamp (stuck, not settling, the
+//! CI the PR planner serves, #12003) the pass is recorded as before. A
+//! release without a skip reason (an older prompt) is unchanged.
 //!
 //! Only trusted authors' records count (the caller filters): a record
 //! suppresses review, so an outsider must not be able to post one.
@@ -106,11 +109,12 @@ pub fn pending_exempts(started: &[String], now: DateTime<Utc>) -> bool {
 /// because the head's CI was still pending (#11972).
 pub const SKIP_CI_PENDING: &str = "ci-pending";
 
-/// Whether a release's own skip reason exempts its pass from the no-verdict
-/// record without reading CI again: only [`SKIP_CI_PENDING`]. No reason, or
-/// one this binary does not know, keeps the default (CI re-read at release).
+/// Whether a release's own skip reason says the pass stood down for pending
+/// CI ([`SKIP_CI_PENDING`]), which also exempts it once CI has concluded (but
+/// never on stuck CI; module docs). No reason, or one this binary does not
+/// know, keeps the default.
 #[must_use]
-pub fn skip_exempts(reason: Option<&str>) -> bool {
+pub fn skipped_for_pending_ci(reason: Option<&str>) -> bool {
     reason.map(str::trim) == Some(SKIP_CI_PENDING)
 }
 

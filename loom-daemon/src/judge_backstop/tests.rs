@@ -214,13 +214,13 @@ fn reaped_timeout_records_count_toward_the_window() {
     assert!(reaped_fields(HEAD, &labels, "  ").ends_with(" reaped=unknown"));
 }
 
-/// #11972: only the pass's own `ci-pending` skip exempts it at release; no
-/// reason, or an unknown one, keeps the CI re-read.
+/// #11972: only the pass's own `ci-pending` is a pending-CI skip; no reason,
+/// or an unknown one, keeps the default.
 #[test]
-fn only_a_ci_pending_skip_reason_exempts_the_release() {
-    assert!(skip_exempts(Some(SKIP_CI_PENDING)));
-    assert!(skip_exempts(Some(" ci-pending\n")));
-    assert!(!skip_exempts(None));
-    assert!(!skip_exempts(Some("")));
-    assert!(!skip_exempts(Some("timeout")));
+fn only_ci_pending_is_a_pending_ci_skip() {
+    assert!(skipped_for_pending_ci(Some(SKIP_CI_PENDING)));
+    assert!(skipped_for_pending_ci(Some(" ci-pending\n")));
+    assert!(!skipped_for_pending_ci(None));
+    assert!(!skipped_for_pending_ci(Some("")));
+    assert!(!skipped_for_pending_ci(Some("timeout")));
 }

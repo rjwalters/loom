@@ -767,86 +767,6 @@ fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() 
     assert!(!patched(dir.path()).contains("verdict=none"));
 }
 
-/// Acceptance (#11972): a Judge pass that skipped because CI was pending
-/// writes no no-verdict record, even when CI completed (green) between its
-/// check and its release; without the skip reason the release re-reads CI and
-/// records the pass, as before.
-#[test]
-fn a_ci_pending_skip_is_never_recorded_even_if_ci_finished_before_release() {
-    let green = r#"{"total_count":1,"check_runs":[{"status":"completed","started_at":"2026-10-14T05:00:00Z"}]}"#;
-    let judge = on("host-a", "run-1");
-    // With the pass's own reason: nothing recorded, no PR or CI read.
-    let dir = TempDir::new().unwrap();
-    fake_gh(dir.path());
-    waiting_pr(dir.path());
-    fs::write(dir.path().join("checks"), green).unwrap();
-    assert_eq!(ctx(dir.path(), judge.clone()).claim(), EXIT_HELD);
-    // The claim's backstop check read the head; only the release's read counts.
-    let _ = fs::remove_file(dir.path().join("pulled"));
-    assert_eq!(
-        ctx(dir.path(), judge.clone()).release(Some(loom_daemon::judge_backstop::SKIP_CI_PENDING)),
-        EXIT_HELD
-    );
-    let patch = patched(dir.path());
-    assert!(patch.contains(&format!("body={}", judge.released_marker())), "{patch}");
-    assert!(!patch.contains("verdict=none"), "{patch}");
-    assert!(!dir.path().join("pulled").exists(), "no PR head read for a ci-pending skip");
-    assert_eq!(ctx(dir.path(), on("host-b", "run-2")).claim(), EXIT_HELD, "not held");
-    // No reason (an older prompt), or one this binary does not know: the
-    // default, CI re-read at release; green now, so the pass is recorded.
-    for reason in [None, Some("other")] {
-        let dir = TempDir::new().unwrap();
-        fake_gh(dir.path());
-        waiting_pr(dir.path());
-        fs::write(dir.path().join("checks"), green).unwrap();
-        assert_eq!(ctx(dir.path(), judge.clone()).claim(), EXIT_HELD);
-        assert_eq!(ctx(dir.path(), judge.clone()).release(reason), EXIT_HELD);
-        let patch = patched(dir.path());
-        assert!(
-            patch.contains(&judge.released_marker_with(&format!(
-                " head={HEAD} verdict=none labels=review-requested"
-            ))),
-            "{reason:?}: {patch}"
-        );
-        assert_eq!(
-            ctx(dir.path(), on("host-b", "run-2")).claim(),
-            backstop::EXIT_BACKSTOP,
-            "{reason:?}"
-        );
-    }
-}
-
-/// The `lease pr release` CLI takes `--skip-reason`, and omits it by default.
-#[test]
-fn release_parses_an_optional_skip_reason() {
-    use clap::Parser;
-    #[derive(clap::Parser)]
-    struct Cli {
-        #[command(subcommand)]
-        action: PrLeaseAction,
-    }
-    let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().action {
-        PrLeaseAction::Release(r) => (r.common.pr, r.skip_reason),
-        _ => panic!("not a release"),
-    };
-    let base = [
-        "lease",
-        "release",
-        "12",
-        "--role",
-        "judge",
-        "--watch-pid",
-        "7",
-    ];
-    assert_eq!(parse(&base), (12, None));
-    let skipped: Vec<&str> = base
-        .iter()
-        .copied()
-        .chain(["--skip-reason", "ci-pending"])
-        .collect();
-    assert_eq!(parse(&skipped), (12, Some("ci-pending".to_string())));
-}
-
 /// Acceptance (#11931): a timed-out run counts toward the three Judge runs an
 /// unchanged PR gets per 24 h.
 #[test]
@@ -988,37 +908,6 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
     }
 }
 
-/// #11972: the Judge prompt's pending-CI skip releases its lease with the
-/// pass's own reason, so the release never records it as a no-verdict pass.
-#[test]
-fn the_judge_prompt_releases_a_pending_ci_skip_with_its_reason() {
-    let prompts = [
-        ("judge.md", include_str!("../../../../defaults/.claude/commands/loom/judge.md")),
-        (
-            "loom-judge/SKILL.md",
-            include_str!("../../../../defaults/.agents/skills/loom-judge/SKILL.md"),
-        ),
-    ];
-    let flag = format!("--skip-reason {}", loom_daemon::judge_backstop::SKIP_CI_PENDING);
-    for (name, text) in prompts {
-        let lines: Vec<&str> = text.lines().collect();
-        let case = lines
-            .iter()
-            .position(|l| l.trim_start().starts_with("LOOM-CHECKS-TIMEOUT*)"))
-            .unwrap_or_else(|| panic!("{name}: no pending-CI skip case"));
-        let arm: Vec<&str> = lines[case..]
-            .iter()
-            .copied()
-            .take_while(|l| l.trim() != ";;")
-            .collect();
-        assert!(
-            arm.iter()
-                .any(|l| l.contains("loom-daemon lease pr release") && l.contains(&flag)),
-            "{name}: the pending-CI skip must release with `{flag}`: {arm:?}"
-        );
-    }
-}
-
 // ---- step claims (#11898) -------------------------------------------------
 
 #[test]
@@ -1112,6 +1001,11 @@ fn the_lib_role_lease_reader_agrees_with_parse_record() {
 
 #[path = "step_claim_tests.rs"]
 mod step_claim;
+
+// ---- the pass's own skip reason on release (#11972) ---------------------
+
+#[path = "release_skip_tests.rs"]
+mod release_skip;
 /// #11950 review: a Champion that claimed with `--step champion_promote`
 /// fences and releases its own lease with plain `--role champion` (default
 /// step `champion_merge`) from the same host and sweep.

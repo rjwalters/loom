@@ -805,8 +805,9 @@ pub(crate) struct ReleaseArgs {
     pub(crate) common: Common,
     /// Why this pass stood down without a verdict, as the pass itself saw it
     /// (#11972). `ci-pending` (the head's CI was still running): a Judge's
-    /// release writes no no-verdict record and does not re-read CI, which may
-    /// have finished since. Absent or unknown: the default (CI re-read).
+    /// release writes no no-verdict record if CI has finished since, and
+    /// records the pass only if CI is stuck (everything pending past the
+    /// exemption window or unstamped). Absent or unknown: the default.
     #[arg(long, value_name = "REASON")]
     pub(crate) skip_reason: Option<String>,
 }
@@ -1167,8 +1168,8 @@ impl Ctx {
     /// `release`: stop the renewer, then rewrite every live lease of this
     /// identity to the released marker. Best-effort; always 0. `skip_reason`
     /// is the pass's own `--skip-reason` (#11972): a Judge pass that stood
-    /// down for pending CI ([`loom_daemon::judge_backstop::skip_exempts`]) is
-    /// not recorded, whatever CI did since.
+    /// down for pending CI is not recorded if CI has settled since, only if
+    /// it is stuck ([`backstop::CiState::exempts`]).
     pub(crate) fn release(&self, skip_reason: Option<&str>) -> i32 {
         if let Some(path) = &self.lease_file {
             loom_daemon::pr_lease_reap::forget_in(path, &self.held());
@@ -1209,22 +1210,20 @@ impl Ctx {
             let extra = extra.get_or_insert_with(|| {
                 // Only a Judge's release records anything from the PR head
                 // (#11855); an issue-scoped lease (Curator, Champion promote)
-                // has no PR to read, and a pass that skipped for pending CI
-                // is never recorded, so it reads nothing either (#11972).
-                let skipped =
-                    reaped.is_none() && loom_daemon::judge_backstop::skip_exempts(skip_reason);
-                if skipped && self.me.role == Role::Judge {
-                    self.say("skipped for pending CI: no no-verdict record (#11972)");
-                }
-                let head = if self.me.role == Role::Judge && !skipped {
+                // has no PR to read.
+                let head = if self.me.role == Role::Judge {
                     self.gh.pr_head(self.pr())
                 } else {
                     None
                 };
                 match reaped {
-                    None => backstop::release_fields(self.me.role, head, |sha| {
-                        self.gh.checks_pending(sha)
-                    }),
+                    None => {
+                        let skipped =
+                            loom_daemon::judge_backstop::skipped_for_pending_ci(skip_reason);
+                        backstop::release_fields(self.me.role, head, |sha| {
+                            self.gh.ci_state(sha).exempts(skipped)
+                        })
+                    }
                     Some(reason) => backstop::reaped_release_fields(self.me.role, head, reason),
                 }
             });
