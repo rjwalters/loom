@@ -1138,12 +1138,7 @@ pub(super) async fn record(
     let (input, mut reused, curated, triage, eligible) =
         sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
     // #11301: a repo another host now lists stops being observed here.
-    shard_scope::forget(
-        &mut STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        &reused.unowned,
-    );
+    shard_scope::forget_global(&reused.unowned);
     // The complete `loom:triage` sets this pass read, before `triage` is moved
     // into the outcome diff (#11642). Every repo present was read whole.
     let triage_sets: BTreeMap<String, BTreeSet<u32>> = triage

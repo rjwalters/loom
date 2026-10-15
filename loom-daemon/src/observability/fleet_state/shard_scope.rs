@@ -81,6 +81,17 @@ pub(super) fn forget(state: &mut PassState, unowned: &BTreeSet<String>) {
     forget_parts(state.prev.as_mut(), &mut state.outcomes, unowned);
 }
 
+/// [`forget`] over the process-wide pass state: a repo another host now lists
+/// stops being observed here.
+pub(super) fn forget_global(unowned: &BTreeSet<String>) {
+    forget(
+        &mut super::STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        unowned,
+    );
+}
+
 /// [`forget`] over its parts. Pure.
 pub(super) fn forget_parts(
     prev: Option<&mut FleetView>,
