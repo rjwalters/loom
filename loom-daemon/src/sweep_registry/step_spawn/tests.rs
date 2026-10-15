@@ -202,6 +202,8 @@ fn a_lost_or_unreadable_pre_claim_refuses_the_step() {
     assert_eq!(claim_verdict(Some(0)), Ok(()));
     assert_eq!(claim_verdict(Some(4)).unwrap_err().reason, "claim_lost");
     assert_eq!(claim_verdict(Some(6)).unwrap_err().reason, "backstop_hold");
+    // #12105: a Doctor that found another actor active on the PR.
+    assert_eq!(claim_verdict(Some(7)).unwrap_err().reason, "peer_active");
     assert_eq!(claim_verdict(Some(5)).unwrap_err().reason, "claim_unverified");
     assert_eq!(claim_verdict(None).unwrap_err().reason, "claim_unverified");
 }

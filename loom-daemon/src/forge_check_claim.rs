@@ -546,9 +546,9 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
 
 /// One lease or lease-yield comment row as read off the forge (NDJSON).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LeaseRow {
-    pub(crate) updated_at: DateTime<Utc>,
-    pub(crate) body: String,
+pub struct LeaseRow {
+    pub updated_at: DateTime<Utc>,
+    pub body: String,
 }
 
 /// Parse the `gh api --paginate --jq` NDJSON of leg 3's read (one
@@ -556,7 +556,7 @@ pub(crate) struct LeaseRow {
 /// `--paginate` would corrupt, #4637). Malformed lines are dropped rather
 /// than failing the batch, mirroring `SweepRegistry::parse_lease_comments_json`.
 #[must_use]
-pub(crate) fn parse_lease_rows(ndjson: &str) -> Vec<LeaseRow> {
+pub fn parse_lease_rows(ndjson: &str) -> Vec<LeaseRow> {
     ndjson
         .lines()
         .filter_map(|line| {
@@ -596,18 +596,52 @@ pub(crate) fn freshest_live_lease(
     now: DateTime<Utc>,
     ttl_minutes: f64,
 ) -> Option<(String, String)> {
+    live_leases_by_freshness(rows, now, ttl_minutes)
+        .into_iter()
+        .next()
+}
+
+/// Every distinct live `(host, sweep)` among `rows`, freshest first: the
+/// same freshness and yield rules as [`freshest_live_lease`], for a reader
+/// that has to set its own claimant aside before asking whether anyone else
+/// holds one (the Doctor's activity guard, #12105). Pure.
+#[must_use]
+pub fn live_leases_by_freshness(
+    rows: &[LeaseRow],
+    now: DateTime<Utc>,
+    ttl_minutes: f64,
+) -> Vec<(String, String)> {
     let yielded: std::collections::BTreeSet<(String, String)> = rows
         .iter()
         .filter_map(|r| parse_yield_marker_line(&r.body))
         .collect();
-    rows.iter()
+    let mut live: Vec<(DateTime<Utc>, (String, String))> = rows
+        .iter()
         .filter(|r| crate::claim_reconciliation::lease_is_fresh(r.updated_at, now, ttl_minutes))
         .filter_map(|r| {
             SweepRegistry::parse_lease_marker_line(&r.body).map(|pair| (r.updated_at, pair))
         })
         .filter(|(_, pair)| !yielded.contains(pair))
-        .max_by_key(|(updated_at, _)| *updated_at)
+        .collect();
+    // Ascending then reversed, so among equal stamps the later row comes
+    // first: exactly the one `max_by_key` picked before this was shared.
+    live.sort_by_key(|(updated_at, _)| *updated_at);
+    live.reverse();
+    let mut seen = std::collections::BTreeSet::new();
+    live.into_iter()
         .map(|(_, pair)| pair)
+        .filter(|pair| seen.insert(pair.clone()))
+        .collect()
+}
+
+/// The `gh api --paginate --jq` filter for an issue's lease and lease-yield
+/// comments, author attached for the trust filter: the one read leg 3 makes,
+/// shared with the Doctor's activity guard (#12105).
+#[must_use]
+pub fn issue_lease_comments_jq() -> String {
+    format!(
+        r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
+    )
 }
 
 /// Leg 3: read the issue's lease and lease-yield comments (one round trip,
@@ -624,9 +658,7 @@ pub(crate) fn read_freshest_live_lease(
 ) -> LeaseLeg {
     // #10089: counted via the facade (`claim.lease_comments`); it applies the
     // #5401 GH_CONFIG_DIR and the #8263 `LOOM_REPO` -> GH_REPO env contract.
-    let jq = format!(
-        r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
-    );
+    let jq = issue_lease_comments_jq();
     // W4-C: the lease being checked may be the caller's own, just written.
     let inv = crate::claim_reconciliation::gh_call::read("claim.lease_comments", gh_bin, root)
         .writer_identity()
