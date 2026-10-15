@@ -96,6 +96,8 @@ struct FakeSpawner {
     asked: Vec<(usize, u32, StepRole, u32)>,
     /// Each round's batch, as `(workspace, item)` (#12298).
     batches: Vec<Vec<(usize, u32)>>,
+    /// Hold the spawns once this many batches ran (#12298).
+    hold_after: Option<usize>,
 }
 
 impl StepSpawner for FakeSpawner {
@@ -110,6 +112,12 @@ impl StepSpawner for FakeSpawner {
             return SpawnResult::Refused(reason.to_string());
         }
         SpawnResult::Spawned
+    }
+
+    fn held(&mut self) -> Option<&'static str> {
+        self.hold_after
+            .is_some_and(|n| self.batches.len() >= n)
+            .then_some("rate_limit_breaker")
     }
 
     fn spawn_batch(&mut self, batch: &[(usize, StepSpawnRequest)]) -> Vec<SpawnResult> {
@@ -587,4 +595,40 @@ fn a_concurrency_of_one_or_one_repo_is_the_serial_tick() {
     let mut cap = RepoCap::new(None, vec![0; 3]);
     run_with(repos(3), concurrent(6, 1), &mut cap, &mut spawner);
     assert!(spawner.batches.iter().all(|b| b.len() == 1));
+}
+
+#[test]
+fn a_breaker_tripped_mid_tick_stops_the_next_round() {
+    let mut spawner = FakeSpawner {
+        hold_after: Some(1),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0; 4]);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    // One round ran; the second was drawn but never spawned.
+    assert_eq!(spawner.batches.len(), 1);
+    assert_eq!(tick.report.dispatched, spawner.batches[0].len());
+    assert_eq!(tick.report.spawn_hold.as_deref(), Some("rate_limit_breaker"));
+    let held = tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.detail.as_deref() == Some("rate_limit_breaker"))
+        .count();
+    assert!(held > 0);
+    assert!(tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.detail.as_deref() == Some("rate_limit_breaker"))
+        .all(|r| r.disposition == Some(Qd::DeferredCapacity)));
+    // Held before the first round: nothing is spawned at all.
+    let mut spawner = FakeSpawner {
+        hold_after: Some(0),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0; 4]);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    assert!(spawner.asked.is_empty());
+    assert_eq!(tick.report.dispatched, 0);
 }

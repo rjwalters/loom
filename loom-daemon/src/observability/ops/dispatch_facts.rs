@@ -116,6 +116,9 @@ pub fn tick_attributes(
     if let Some(p) = report.phases {
         out.extend(phase_attributes(&p));
     }
+    if let Some(hold) = &report.spawn_hold {
+        out.push(("loom.dispatch.spawn_hold".into(), hold.clone()));
+    }
     out
 }
 
@@ -235,6 +238,7 @@ mod tests {
                 },
             }),
             gather: Some(crate::step_dispatch::gather_budget::GatherStats::default()),
+            spawn_hold: Some("rate_limit_breaker".to_string()),
             ..TickReport::default()
         };
         let attrs = tick_attributes(&report, None, None);
@@ -244,6 +248,7 @@ mod tests {
         assert_eq!(get("loom.dispatch.spawn_attempts"), Some("5"));
         assert_eq!(get("loom.dispatch.gather_concurrency"), Some("8"));
         assert_eq!(get("loom.dispatch.spawn_concurrency"), Some("4"));
+        assert_eq!(get("loom.dispatch.spawn_hold"), Some("rate_limit_breaker"));
         assert_eq!(get("loom.dispatch.phase.spawn_claim_ms"), Some("6000"));
         assert_eq!(get("loom.dispatch.phase.spawn_account_ms"), Some("11000"));
         // Every tick attribute survives export (#12256: the #12074 gather

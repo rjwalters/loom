@@ -132,6 +132,14 @@ pub trait StepSpawner {
     /// answer **in `batch` order**. The tick applies the answers in that
     /// order, so a spawner may run them concurrently. The default runs them
     /// one after another.
+    /// Whether spawning must stop for the rest of the tick (#12298): the
+    /// shared GitHub rate-limit breaker tripped since the tick started, so
+    /// every pre-claim would be a failed forge call. Asked before each
+    /// round's batch. The default never stops.
+    fn held(&mut self) -> Option<&'static str> {
+        None
+    }
+
     fn spawn_batch(&mut self, batch: &[(usize, StepSpawnRequest)]) -> Vec<SpawnResult> {
         batch
             .iter()
@@ -505,6 +513,30 @@ pub fn run(
             .iter()
             .map(|p| (p.ws_idx, p.request.clone()))
             .collect();
+        // A breaker that tripped mid-tick ends the spawns (#12298): the
+        // drawn candidates wait for a later tick, named by the hold, and
+        // no further round runs. Checked per round, so concurrent spawns
+        // cannot burst failed calls into an exhausted budget.
+        if !requests.is_empty() {
+            if let Some(hold) = spawner.held() {
+                log::info!(
+                    "work_finder: step spawns stopped for this tick — {hold}; {} drawn \
+                     candidate(s) wait",
+                    batch.len()
+                );
+                for p in &batch {
+                    resolve(
+                        &mut report.queue,
+                        &p.key,
+                        Qd::DeferredCapacity,
+                        Some(hold.to_string()),
+                    );
+                    report.deferred_capacity += 1;
+                }
+                report.spawn_hold = Some(hold.to_string());
+                break;
+            }
+        }
         let results = if requests.is_empty() {
             Vec::new()
         } else {

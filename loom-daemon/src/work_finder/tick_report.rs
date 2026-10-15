@@ -103,6 +103,10 @@ pub struct TickReport {
     /// Where the step tick's wall time went, by phase (#12256). `None` when
     /// no step tick ran.
     pub phases: Option<crate::step_dispatch::gather_budget::TickPhases>,
+    /// Why the step tick stopped spawning before its slots were filled
+    /// (#12298): `rate_limit_breaker` when the breaker tripped mid-tick.
+    /// `None` when it never stopped.
+    pub spawn_hold: Option<String>,
     /// Issues skipped because a **peer host** advertised a live soft claim over
     /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
     /// distinct reason — never folded into [`collisions`](Self::collisions)

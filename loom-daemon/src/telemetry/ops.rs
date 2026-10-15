@@ -107,6 +107,7 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.gather_concurrency",
     // #12298: the spawn half's concurrency and its sub-phases.
     "loom.dispatch.spawn_concurrency",
+    "loom.dispatch.spawn_hold",
     "loom.dispatch.phase.spawn_resolve_ms",
     "loom.dispatch.phase.spawn_claim_ms",
     "loom.dispatch.phase.spawn_launch_ms",

@@ -181,6 +181,13 @@ fn refusal_reason(e: &anyhow::Error) -> String {
 }
 
 impl StepSpawner for RegistrySpawner {
+    fn held(&mut self) -> Option<&'static str> {
+        let now = Utc::now();
+        crate::rate_limit_breaker::global()
+            .is_some_and(|rl| rl.skip_if_suppressed("work_finder", now))
+            .then_some("rate_limit_breaker")
+    }
+
     fn spawn(&mut self, idx: usize, request: &StepSpawnRequest) -> SpawnResult {
         let started = Instant::now();
         let (result, parts) = self.spawn_one(idx, request);

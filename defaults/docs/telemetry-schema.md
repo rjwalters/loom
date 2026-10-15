@@ -2046,6 +2046,7 @@ with concurrent spawns they can add up to more than `phase.spawn_ms`):
 | `loom.dispatch.phase.spawn_resolve_ms` | The role's resolvers: the roll gate, runtime admission, the pool preflight, containment |
 | `loom.dispatch.phase.spawn_claim_ms` | The claim: the item's lock and peer advertisement, the pre-claim subprocess (`lease pr claim`), or a Builder's label flip and lease comment |
 | `loom.dispatch.phase.spawn_launch_ms` | The launch: the second roll gate, the dispatch stagger and the child's spawn |
+| `loom.dispatch.spawn_hold` | Why the draw stopped spawning before its slots were filled: `rate_limit_breaker` when the shared GitHub rate-limit breaker tripped mid-tick (checked before each round's batch). Absent when it never stopped |
 | `loom.dispatch.phase.spawn_account_ms` | The account-selection poll (up to 5 s per spawn) and recording the step |
 
 The `invoke github` spans the tick's own thread and its gather workers open
