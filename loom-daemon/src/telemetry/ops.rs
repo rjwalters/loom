@@ -378,6 +378,10 @@ pub enum MetricName {
     /// Open items carrying a stage label, labelled `state`.
     #[serde(rename = "loom.forge.stage_items")]
     ForgeStageItems,
+    /// Seconds since the oldest item of a `stage_items` state entered it,
+    /// labelled `state`, `reason`, `repo` (#12027: `pr_refused`).
+    #[serde(rename = "loom.forge.stage_oldest_age_seconds")]
+    ForgeStageOldestAgeSeconds,
     /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
     /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
     /// (over the per-call row cap) — Issue #9222.
@@ -569,6 +573,7 @@ impl MetricName {
             Self::ForgeStageDwell => "loom.forge.stage_dwell",
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
+            Self::ForgeStageOldestAgeSeconds => "loom.forge.stage_oldest_age_seconds",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
             Self::GithubRateLimitUsed => "github.ratelimit.used",
@@ -678,7 +683,7 @@ impl MetricName {
             Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
-            Self::GithubRateLimitReset => "s",
+            Self::GithubRateLimitReset | Self::ForgeStageOldestAgeSeconds => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
             Self::ForgeCalls => "{request}",
             Self::ForgeFacadeEvents => "{event}",
@@ -766,6 +771,9 @@ impl MetricName {
             Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
             Self::ForgeStageItems => {
                 "Open items per repo by state: stage labels and queue states (overlapping)."
+            }
+            Self::ForgeStageOldestAgeSeconds => {
+                "Age of the oldest item in a stage_items state, by reason (pr_refused)."
             }
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."

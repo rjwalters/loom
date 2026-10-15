@@ -206,9 +206,19 @@ impl SweepRegistry {
         // Hermetic fixtures (no forge) keep their tests free of the detached
         // transcript scan; the capture itself is tested directly.
         if !self.config.skip_label_flip {
+            // #12027: the step's verdict record reads its log at the drain.
+            let staged = crate::observability::step_verdict::StagedStep {
+                sweep_id: sweep_id.to_string(),
+                step: role,
+                item,
+                log: log_path,
+            };
             let spawned = std::thread::Builder::new()
                 .name("step-capture".to_string())
-                .spawn(move || emit_step_capture(&capture));
+                .spawn(move || {
+                    crate::observability::step_verdict::stage_step(staged);
+                    emit_step_capture(&capture);
+                });
             if let Err(e) = spawned {
                 log::warn!("sweep_registry: {sweep_id}: no capture thread ({e})");
             }
