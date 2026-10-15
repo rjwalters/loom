@@ -7745,8 +7745,8 @@ delay as `startup_jitter_delay_secs`, and `loom-daemon health` adds it to the
 work finder's first-tick grace (2 × interval), so a host still inside its
 window reads "warming up", not "no work-finder tick observed".
 
-Not covered: the startup claim-reconciliation pass (it gates the first
-admission and is per-repo `loom:building` only). The stale-blocked release and
+Not covered: the startup claim-reconciliation pass (it holds the first
+tick only up to its cap, below, and is per-repo `loom:building` only). The stale-blocked release and
 fleet-state passes were removed by #11301.
 
 ### Startup reconciliation: a bounded wait (#12222)
@@ -7768,6 +7768,12 @@ start bumps the issue's `updatedAt`, so it is never mistaken for an orphan of
 the previous process. Every other reclaim is the periodic pass's, which always
 runs alongside the work finder.
 
+The comparison allows for clocks (#12230): `updatedAt` is GitHub's clock, to
+the second, and the pass start is this host's. So a claim counts as possibly
+this daemon's if it was updated at or after the pass start rounded down to the
+second, less 60 s. A claim the previous process flipped in its last minute is
+then left to the periodic pass's age gate rather than reclaimed at once.
+
 | Knob | Default | Meaning |
 |---|---|---|
 | `LOOM_STARTUP_RECONCILE_WAIT_SECS` (env) > `autonomous.startupReconcileWaitSecs` (any config tier) | `90` | Longest wait, in seconds, for the startup claim and quarantine passes before the first tick |
@@ -7775,7 +7781,14 @@ runs alongside the work finder.
 The first completed tick logs `work_finder: first tick completed Ns after
 daemon start (startup reconciliation cap fired: …)` and publishes the
 `daemon.work_finder.first_tick` `daemon.event` record (`secs_since_start`,
-`startup_reconcile_cap_fired`).
+`gate_wait_secs`, `jitter_delay_secs`, `startup_reconcile_cap_fired`). On the
+OTLP path it is a `daemon.event` log record with `loom.topic =
+daemon.work_finder.first_tick`, the host in the `host.name` resource
+attribute, and the payload's scalars also as typed `loom.payload.*`
+attributes (#12230), so the duration can be filtered and aggregated per host
+without parsing `loom.payload`. On a fleet host `secs_since_start` includes
+the startup jitter (up to the jitter window), up to one work-finder interval
+and the first tick's own run time, so several minutes is normal.
 
 ### Agent CI wait: `forge wait-checks` (#10330)
 

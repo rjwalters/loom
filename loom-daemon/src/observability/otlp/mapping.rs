@@ -6,6 +6,7 @@ mod auto_update;
 mod backlog_level;
 mod checkout_external_change;
 mod ci;
+mod daemon_event;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
@@ -542,10 +543,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // already-reviewed, small, operator-facing JSON (never
             // free-form transcript content), so it is carried whole as one
             // compact-JSON string attribute rather than re-typed per topic.
-            let attributes = vec![
-                kv_string("loom.topic", r.topic.clone()),
-                kv_string("loom.payload", serde_json::to_string(&r.payload).unwrap_or_default()),
-            ];
+            // #12230: listed payload scalars also ride typed.
+            let attributes = daemon_event::attributes(r);
             (
                 "daemon.event",
                 SeverityNumber::Info,
