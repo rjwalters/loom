@@ -10,6 +10,7 @@
 //! | No-op cooldown | [`ClaimKind::NoopCooldownArmed`] | one issue | #7477 |
 //! | Dispatch backoff | [`ClaimKind::DispatchBackoffArmed`] | one issue | #7477 |
 //! | PR-less retry tally | [`ClaimKind::PrlessReleaseArmed`] | one issue | #9292 |
+//! | Step cooldown | [`ClaimKind::StepCooldownArmed`] | one `(item, step)` | #11900 |
 //! | Pool-exhaustion hold | [`ClaimKind::PoolHoldArmed`]/[`ClaimKind::PoolHoldCleared`] | one **token pool**, every issue on it | #8001 |
 //!
 //! They share three properties, which is why they share a module:
@@ -165,6 +166,10 @@ pub fn observe_brake_ad(view: &mut PeerClaimView, ad: &ClaimAd, now: Instant) {
         ClaimKind::PoolHoldArmed | ClaimKind::PoolHoldCleared => {
             view.observe_pool_hold_at(ad, now);
             view.prune_expired_pool_holds(now);
+        }
+        ClaimKind::StepCooldownArmed => {
+            view.observe_step_cooldown_at(ad, now);
+            view.prune_expired_step_cooldowns(now);
         }
         _ => {}
     }

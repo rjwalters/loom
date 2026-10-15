@@ -36,7 +36,8 @@ use crate::sweep_registry::SweepRegistry;
 
 /// Ceiling on one landed cooldown: a caller's mistake costs a day, not an
 /// issue that never dispatches again.
-const MAX_LANDED_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+/// The step-outcome ledger's short cooldowns share it (#11900).
+const MAX_LANDED_COOLDOWN: Duration = crate::step_dispatch::outcome_ledger::MAX_SHORT_COOLDOWN;
 
 impl SweepRegistry {
     /// Arm `issue`'s landed cooldown for `window` here and on every peer

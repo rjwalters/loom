@@ -154,6 +154,7 @@ mod stacking;
 mod start_facts;
 mod step_adopt;
 pub mod step_lease_owner;
+pub mod step_ledger;
 mod step_reap;
 pub mod step_spawn;
 mod step_story;
@@ -638,6 +639,9 @@ pub struct SweepRegistry {
     /// quarantining. This map counts *every* no-progress outcome, so the retry
     /// cadence is bounded regardless of blame.
     dispatch_backoff: HashMap<u32, DispatchBackoffState>,
+    /// The step-outcome ledger (#11900): per-`(item, step)` outcomes and
+    /// short cooldowns. See [`step_ledger`].
+    step_ledger: crate::step_dispatch::outcome_ledger::OutcomeLedger,
     /// No-op re-dispatch cooldown parameters (Issue #6670). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -1049,6 +1053,7 @@ impl SweepRegistry {
             preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
+            step_ledger: Default::default(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
