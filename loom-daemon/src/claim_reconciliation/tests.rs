@@ -2591,7 +2591,7 @@ fn decide_pr_reclaims_when_only_unrelated_comments_since_the_claim() {
     // claim is reclaimed. Before #6523 that Builder note refreshed the
     // anchor and bought the dead claim another full 30-minute window.
     let now = Utc::now();
-    let claimed_at = now - Duration::minutes(35);
+    let claimed_at = now - Duration::minutes(50);
     let scanned = most_recent_claim_activity_at(
         &[
             comment(now - Duration::minutes(20), "Pushed the fix, CI running."),
@@ -2625,7 +2625,7 @@ fn decide_pr_keeps_when_a_marked_claimant_heartbeat_is_recent() {
     // posted a marked heartbeat 2 minutes ago -- that IS liveness, so the
     // claim is kept.
     let now = Utc::now();
-    let claimed_at = now - Duration::minutes(35);
+    let claimed_at = now - Duration::minutes(50);
     let heartbeat_at = now - Duration::minutes(2);
     let scanned = most_recent_claim_activity_at(
         &[
@@ -2675,7 +2675,7 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
     };
 
     // Just inside the window from the heartbeat: kept.
-    let inside = heartbeat_at + Duration::minutes(29);
+    let inside = heartbeat_at + Duration::minutes(44);
     assert_eq!(
         decide_pr(&pr, None, None, &|_| true, DEFAULT_STALE_REVIEWING_MINUTES, inside),
         PrReconcileAction::Keep,
@@ -2684,12 +2684,12 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
 
     // One minute past it: reclaimed. A single heartbeat cannot pin the
     // claim, however old the claim itself gets.
-    let outside = heartbeat_at + Duration::minutes(31);
+    let outside = heartbeat_at + Duration::minutes(46);
     match decide_pr(&pr, None, None, &|_| true, DEFAULT_STALE_REVIEWING_MINUTES, outside) {
         PrReconcileAction::Reclaim(PrReclaimReason::Aged { age_minutes }) => {
             assert!(
-                (age_minutes - 31.0).abs() < 0.5,
-                "age must be measured from the heartbeat (~31m), got {age_minutes}"
+                (age_minutes - 46.0).abs() < 0.5,
+                "age must be measured from the heartbeat (~46m), got {age_minutes}"
             );
         }
         other => {
@@ -2701,7 +2701,7 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
     assert_eq!(
         decide_pr(&pr, None, None, &|_| true, DEFAULT_STALE_TREATING_MINUTES, outside),
         PrReconcileAction::Keep,
-        "60m treating window is not yet exhausted 31m after the heartbeat"
+        "60m treating window is not yet exhausted 46m after the heartbeat"
     );
     match decide_pr(
         &pr,
@@ -2720,12 +2720,12 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
 fn decide_pr_age_floor_vetoes_reclaim_regardless_of_comment_activity() {
     // SAFETY (#4790/#4618 double-claim race): #6523 narrows what counts as
     // activity, which can only make a reclaim happen SOONER -- never
-    // sooner than the 30m/60m age floor, which stays the veto no
+    // sooner than the 45m/60m age floor, which stays the veto no
     // comment-activity outcome can bypass. A claim younger than its floor
     // with NO claimant activity at all (the most reclaim-favourable
     // evidence this pass can see) must still be kept -- including when a
     // dead joined pid is also on the table.
-    assert!((DEFAULT_STALE_REVIEWING_MINUTES - 30.0).abs() < f64::EPSILON);
+    assert!((DEFAULT_STALE_REVIEWING_MINUTES - 45.0).abs() < f64::EPSILON);
     assert!((DEFAULT_STALE_TREATING_MINUTES - 60.0).abs() < f64::EPSILON);
     let now = Utc::now();
     let dead = journal_entry("/repo/a", 6523, 4618);

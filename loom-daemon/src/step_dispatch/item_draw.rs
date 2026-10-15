@@ -664,8 +664,10 @@ pub struct ReplayedPick {
 /// start from its logged `pools[]` (in `index` order), and for each of its
 /// draws, re-derive the seed from the header, check the logged seed, total
 /// and roll against it, select by the roll over the pool minus earlier picks,
-/// and check the logged picked index and item. Returns the picks in draw
-/// order. Reassemble a chunked record first.
+/// and check the logged picked index and item. Each workspace's logged pool
+/// must be indexed `0..n`, its draws must be numbered consecutively from 0,
+/// and each draw's `pool_size` must be the pool left at that draw. Returns
+/// the picks in draw order. Reassemble a chunked record first.
 ///
 /// # Errors
 /// A description of the first draw that does not replay.
@@ -686,11 +688,40 @@ pub fn replay_record(
     for rows in pools.values_mut() {
         rows.sort_by_key(|r| r.index);
     }
+    for (repo, rows) in &pools {
+        if rows
+            .iter()
+            .zip(0u32..)
+            .any(|(row, expected)| row.index != expected)
+        {
+            return Err(format!("the logged pool of {repo} is not indexed 0..n"));
+        }
+    }
+    // The next draw index each workspace must log: draws are consecutive
+    // from 0 within a workspace, or an earlier pick is missing.
+    let mut next_index: BTreeMap<&str, u32> = BTreeMap::new();
     let mut picks = Vec::new();
     for d in &record.draws {
         let pool = pools
             .get_mut(d.repo.as_str())
             .ok_or_else(|| format!("draw {} of {}: no logged pool", d.draw_index, d.repo))?;
+        let expected = next_index.entry(d.repo.as_str()).or_insert(0);
+        if d.draw_index != *expected {
+            return Err(format!(
+                "draw {} of {}: the record skips draw {expected}",
+                d.draw_index, d.repo
+            ));
+        }
+        *expected += 1;
+        if d.pool_size != pool.len() {
+            return Err(format!(
+                "draw {} of {}: pool_size {} != {} items left in the logged pool",
+                d.draw_index,
+                d.repo,
+                d.pool_size,
+                pool.len()
+            ));
+        }
         let key = SeedKey {
             minute,
             host: record.seed_host.clone(),

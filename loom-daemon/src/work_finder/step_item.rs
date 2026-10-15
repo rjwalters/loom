@@ -452,6 +452,11 @@ pub enum PassReason {
     Epic,
     Proposal,
     NoStage,
+    /// A Judge step whose PR head has CI still running (#12042). The
+    /// classifier never answers it: the step tick's gather applies it from a
+    /// forge read (`step_dispatch::gather::hold_ci_pending`), the step path's
+    /// copy of the #12003 Judge gate.
+    CiPending,
 }
 
 impl PassReason {
@@ -471,6 +476,7 @@ impl PassReason {
             Self::Epic => "epic",
             Self::Proposal => "proposal",
             Self::NoStage => "no_stage",
+            Self::CiPending => "ci_pending",
         }
     }
 }
