@@ -7752,9 +7752,8 @@ work finder's first-tick grace (2 × interval), so a host still inside its
 window reads "warming up", not "no work-finder tick observed".
 
 Not covered: the startup claim-reconciliation pass (it gates the first
-admission and is per-repo `loom:building` only) and the stale-blocked release
-and fleet-state passes being retired by #11301 (fleet state is covered while it
-remains, through the collector's forge timer).
+admission and is per-repo `loom:building` only). The stale-blocked release and
+fleet-state passes were removed by #11301.
 
 ### Agent CI wait: `forge wait-checks` (#10330)
 

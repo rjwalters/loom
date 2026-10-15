@@ -803,8 +803,7 @@ comment, a label, a linked PR, a dependency closing), removes `loom:blocked`,
 restores `loom:issue` (unless another hold or lane veto is on it) and posts a
 `kind=released` notice. Any host adopts a no-op park it finds on the forge (the
 park record plus the notice) once per process, so the hold outlives the host
-that applied it. The stale-blocked release pass skips this record as a daemon
-hold. A human can also remove `loom:blocked` by hand; the next no-op then starts
+that applied it. A human can also remove `loom:blocked` by hand; the next no-op then starts
 a fresh streak.
 
 **Holds applied before #12024** sit on `loom:operator` with the notice above.
