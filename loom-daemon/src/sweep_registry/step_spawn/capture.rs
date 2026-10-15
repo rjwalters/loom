@@ -218,6 +218,18 @@ impl SweepRegistry {
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
         };
+        // #12253: the step's `loom.sweep` span ends here, with the outcome
+        // its `role_tick.outcome` reports, not at the next restart's orphan
+        // recovery. Local journal writes only, so it runs under the lock.
+        let (result, close) = super::span::sweep_close(
+            end,
+            line.as_ref(),
+            &capture.outcome,
+            role,
+            info.and_then(|i| i.model.as_deref()),
+            info.and_then(|i| i.effort.as_deref()),
+        );
+        self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached
         // transcript scan; the capture itself is tested directly.
         if !self.config.skip_label_flip {

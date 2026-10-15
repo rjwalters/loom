@@ -50,6 +50,7 @@ pub fn deferred_tick(
         step_sweep_id: None,
         deferred_by: Some(deferred_by.to_string()),
         shard_owner,
+        failure_class: None,
     }
 }
 
