@@ -76,6 +76,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "intake.remove_label",
         "intake.demote_comment",
         "intake.label_events",
+        "champion.label_events",
         "intake.recheck",
         "verdict.clear_labels",
         "verdict.requeue_unanchored",

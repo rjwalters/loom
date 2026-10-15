@@ -579,6 +579,10 @@ pub struct HealthInputs {
     /// The last fleet-sync pass snapshot ([`crate::fleet_sync::probe_status`]),
     /// rendered by [`fleet_identity_section::assess_fleet_identity`] (#11740).
     pub fleet_sync: Option<crate::fleet_sync::FleetSyncStatus>,
+    /// Each managed root's `.loom/resync-ignore` pins, `(root, labels)`
+    /// ([`crate::resync_pin::read_pins`]), for
+    /// [`review_role_pins_section::assess_review_role_pins`] (#11970).
+    pub resync_pins: Vec<(String, Vec<String>)>,
 }
 
 // ============================================================================
@@ -2727,6 +2731,12 @@ mod fleet_identity_section;
 
 pub use fleet_identity_section::assess_fleet_identity;
 
+/// The `review_role_pins` section (#11970): Degraded when a managed repo pins
+/// a Champion, Judge or Doctor prompt in `.loom/resync-ignore`.
+mod review_role_pins_section;
+
+pub use review_role_pins_section::{assess_review_role_pins, is_review_role_pin};
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2801,6 +2811,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_tmpfs_visibility(inputs));
     sections.extend(assess_ci_telemetry(inputs));
     sections.extend(assess_fleet_identity(inputs));
+    sections.extend(assess_review_role_pins(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {
