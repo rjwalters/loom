@@ -120,7 +120,7 @@ fn a_live_manifest_blocks_recovery_until_h5_resumes_or_requeues_each_item() {
     let mut reg = real_registry(
         &root,
         Some(gh),
-        "case \"$LOOM_SWEEP_ID\" in *issue-102-*) exit 3 ;; esac\nsleep 300",
+        "case \"$LOOM_SWEEP_ID\" in *-102-*) exit 3 ;; esac\nsleep 300",
     );
     let ok = paused_on_disk(&reg, &root, 101, Some("builder"));
     let dies = paused_on_disk(&reg, &root, 102, Some("builder"));
@@ -197,16 +197,8 @@ fn a_live_manifest_blocks_recovery_until_h5_resumes_or_requeues_each_item() {
         !calls.lines().any(|l| l.starts_with("issue edit 101")),
         "the kept claim is never re-flipped: {calls}"
     );
-    assert_eq!(
-        calls
-            .lines()
-            .filter(|l| l.starts_with("issue comment 102 "))
-            .count(),
-        1,
-        "{calls}"
-    );
-    assert!(calls.contains("`session-resume-failed`"), "{calls}");
-    assert!(calls.contains("could not resume it afterwards"), "{calls}");
+    // A step's requeue restores its ready label and posts no comment (#11898).
+    assert!(!calls.lines().any(|l| l.starts_with("issue comment 102 ")), "{calls}");
     assert!(
         calls
             .lines()

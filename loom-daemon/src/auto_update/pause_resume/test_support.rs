@@ -128,6 +128,8 @@ pub(crate) fn fake_gh(root: &Path, labels: &str) -> (PathBuf, PathBuf) {
              if [[ \"$1\" == issue && \"$2\" == view ]]; then echo false; exit 0; fi\n\
              if [[ \"$1\" == api && \"$*\" == */comments* ]]; then exit 0; fi\n\
              if [[ \"$1\" == api && \"$*\" == *is_pr* ]]; then echo '{state}'; exit 0; fi\n\
+             if [[ \"$1\" == api && \"$*\" == *closed_at* ]]; then \
+             echo '{{\"state\":\"open\",\"closed_at\":null,\"labels\":[\"'{labels}'\"]}}'; exit 0; fi\n\
              if [[ \"$1\" == api && \"$2\" == repos/* ]]; then printf '%s\\n' {labels}; exit 0; fi\n\
              exit 0\n",
             log = log.display(),

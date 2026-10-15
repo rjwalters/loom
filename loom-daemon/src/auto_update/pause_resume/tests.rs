@@ -88,7 +88,7 @@ fn sweep(dir: &Path, id: &str, issue: u32) -> ManifestItem {
         timeout_remaining_secs: None,
         holds_issue_creation_mutex: false,
         stopped_at: Some(Utc::now()),
-        step: None,
+        step: Some(crate::step_role::StepRole::Builder),
     }
 }
 
