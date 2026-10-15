@@ -2467,7 +2467,8 @@ blocker is Loom-owned:
   `installed_files`, a file a later release added is missing from it, so a
   path also counts (#11989) when the payload embedded in the daemon ships a
   file at that destination. A repo-local file the resync never touches
-  (`.loom/roles/custom-role.md`, `.claude/commands/loom/mine.md`) does not,
+  (a repo-local role file under `.loom/roles/` or a repo-local command under
+  `.claude/commands/loom/`) does not,
   and a `.agents/skills/` file also needs the generation marker. A path pinned in `.loom/resync-ignore` (also as
   `agents-skills/<rel>`) is never counted that way. A checkout on a named
   branch other than the default is left alone. Every local commit (and every commit
