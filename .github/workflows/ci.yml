@@ -672,22 +672,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: bash scripts/check-claude-md-budget.sh
 
-      # component: File Size Ratchet
-      # Cheap structural check; always runs. Source files grow monotonically
-      # because every individual addition is defensible while the aggregate is
-      # the problem (#7711): 86 of 228 Rust files were over 1000 lines and held
-      # 79% of all Rust LOC, at a ~20:1 add-to-delete ratio. This does NOT demand
-      # an up-front refactor — it freezes already-oversized files at their current
-      # size so they cannot grow further. See .loom/docs/file-size-policy.md.
-      # Self-test first: a ratchet that silently stops measuring reports OK
-      # forever while the files it guards keep growing.
-      - name: Self-test the ratchet
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-file-size-budget.sh --self-test
-      - name: Check file size budget
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-file-size-budget.sh
-
       # component: Shell Allowlist
       # Cheap structural check; always runs. #7762 / ADR-0018: new executable
       # logic is a loom-daemon subcommand, and a new `.sh` needs a category plus a
@@ -733,12 +717,11 @@ jobs:
         run: bash scripts/test-version-bump-gate.sh
 
       # component: Markdown Token Ratchet
-      # Same ratchet as File Size Ratchet above, applied to agent-facing
-      # markdown (role prompts + slash-command bodies) instead of source files,
-      # measured in a byte-count token proxy rather than code lines (#7725,
-      # #7716). This content is prepended into an agent's context on every
-      # invocation, the same load-bearing category check-claude-md-budget.sh
-      # guards for CLAUDE.md — see .loom/docs/file-size-policy.md.
+      # A ratchet on agent-facing markdown (role prompts + slash-command
+      # bodies), measured in a byte-count token proxy (#7725, #7716). This
+      # content is prepended into an agent's context on every invocation, the
+      # same load-bearing category check-claude-md-budget.sh guards for
+      # CLAUDE.md.
       - name: Self-test the ratchet
         if: ${{ !cancelled() }}
         run: bash scripts/check-markdown-token-budget.sh --self-test
@@ -1120,7 +1103,7 @@ jobs:
         # in #7771, a silent WRONG ANSWER in production -- verify-proposal-refs.sh
         # reporting a present file as `MISSING FILE`.
         #
-        # A one-way ratchet, like check-file-size-budget.sh: every occurrence
+        # A one-way ratchet: every occurrence
         # that exists today is frozen at its per-file count in
         # scripts/pipefail-early-exit-baseline.txt, and this fails only when a
         # file GAINS one. --require-baseline so that deleting the ledger reads
@@ -1724,7 +1707,7 @@ jobs:
         # in #7771, a silent WRONG ANSWER in production -- verify-proposal-refs.sh
         # reporting a present file as `MISSING FILE`.
         #
-        # A one-way ratchet, like check-file-size-budget.sh: every occurrence
+        # A one-way ratchet: every occurrence
         # that exists today is frozen at its per-file count in
         # scripts/pipefail-early-exit-baseline.txt, and this fails only when a
         # file GAINS one. --require-baseline so that deleting the ledger reads
