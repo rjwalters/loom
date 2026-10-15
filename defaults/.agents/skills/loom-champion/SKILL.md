@@ -87,7 +87,7 @@ NOT used for it, #4966):
 > `champion-issue-promo.md` → "Pass 0b: Stale `loom:evaluating` Claim Re-Scan"
 > runs immediately after Pass 0, before this discovery query, and removes the
 > label from any issue whose claim has gone stale (the labeled event's age
-> exceeds `LOOM_STALE_EVALUATING_MINUTES`, default 15 — a prior Champion pass
+> exceeds `LOOM_STALE_EVALUATING_MINUTES`, default 45 — a prior Champion pass
 > that died mid-evaluation without writing a verdict). Those issues then match
 > the query below in the same pass. Without that scan, a stale claim would be
 > permanent: the only actor that could notice the claim was abandoned is the

@@ -4000,7 +4000,7 @@ Thresholds are minutes-scale, not hours, and env-overridable:
 
 | Claim label | Env var | Default |
 |-------------|---------|---------|
-| `loom:reviewing` | `LOOM_STALE_REVIEWING_MINUTES` | 30 — the SAME env var `.claude/commands/loom/judge.md`'s "Stale `loom:reviewing` Claim Check" already established, so the agent-side fast path and this always-on daemon backstop share one convention |
+| `loom:reviewing` | `LOOM_STALE_REVIEWING_MINUTES` | 45 (30 before #11909; longer than a Judge step's 30-minute timeout) — the SAME env var `.claude/commands/loom/judge.md`'s "Stale `loom:reviewing` Claim Check" already established, so the agent-side fast path and this always-on daemon backstop share one convention |
 | `loom:treating` | `LOOM_STALE_TREATING_MINUTES` | 60 — a Doctor's fix cycle legitimately runs longer than a single Judge review pass; the SAME env var `.claude/commands/loom/doctor.md`'s "Stale `loom:treating` Claim Check" fast path uses (#4527) |
 
 Reclaiming removes only the stale claim label — the PR's state label (still
@@ -4079,7 +4079,7 @@ explicit `/curator <number>` naming it) and runs the stale-claim check —
 there is no periodic sweep that reclaims it in the background the way
 `reconcile_pr_claims` does for `loom:reviewing`/`loom:treating` or
 `reconcile_workspace` does for `loom:building`. `LOOM_STALE_CURATING_MINUTES`
-(default 30, matching `LOOM_STALE_REVIEWING_MINUTES`) and
+(default 45, matching `LOOM_STALE_REVIEWING_MINUTES`) and
 `LOOM_MAX_STANDDOWN_STREAK` are shared with the Judge/Doctor convention
 above. Extending `claim_reconciliation` to cover `loom:curating` as a fourth
 surface (mirroring `reconcile_pr_claims`'s `decide_pr`, keyed off the same
@@ -6452,7 +6452,7 @@ knobs not yet audited here.
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
 | `autonomous.roleRunner.onIdleMaxWait` | *(config only)* | *(unset — no promotion, today's idle-edge-only firing)* | **Per-role starvation guard for an `onIdle` role (#7511).** A `{"<role>": "<duration>"}` object (e.g. `{"hermit": "24h", "auditor": "72h"}`, duration strings `<n>s`/`<n>m`/`<n>h`/`<n>d`) naming the longest a role may go without a completed tick before it is **promoted** into the next interval-cadence pass — see [`onIdleMaxWait` — promoting a starved `onIdle` role](#onidlemaxwait--promoting-a-starved-onidle-role-7511) below |
 | `autonomous.roleRunner.architectMaxProposals` | `LOOM_ARCHITECT_MAX_PROPOSALS` | `5` | **Per-invocation** cap on how many proposal issues one `architect` dispatch may file (#5656) — the actuator-saturation limit of the idle-edge control loop. Passed to the session as `/loom:architect --max-proposals <n>`, which `architect.md` enforces as a hard ceiling. Per-repo on purpose (the workable cap grows with a repo's maturity — ~5 while work is narrow, 7+ once it fans out), so it is read from each root's own config. Zero/negative/non-integer at either tier drops to the next one (a cap of `0` would spend a whole session forbidden from producing anything). Ignored for every other role |
-| `autonomous.roleRunner.championMode` | *(config only)* | `"all"` | **Which of Champion's queues a role-runner Champion tick works (#11859).** `"all"` (or absent) dispatches `/loom:champion`, the batch pass, byte-for-byte unchanged. `"non-item"` dispatches `/loom:champion --non-item`: proposals (architect/hermit/auditor), epics, Doctor-cap parked PRs, rollout checks and the batch-wide Pass 0 / held-PR census, but **no** curated-issue promotion and **no** `loom:pr` merge; those arrive as targeted `/loom:champion --issue N` / `--pr N` steps (`champion-targeted.md`). Set it on a root whose item work has moved to step dispatch, so the interval Champion keeps its other queues without double-acting on an item. Applies to the interval and idle-edge launches alike; `roles` membership is unaffected (keep `champion` listed). Per root and live (re-read every tick). No env override on purpose: it must differ per root during a staged rollout. Case-insensitive; any other value warns and runs `"all"`. Ignored for every other role |
+| `autonomous.roleRunner.championMode` | *(config only)* | *(retired)* | **Retired by #11909.** Every role-runner Champion launch is `/loom:champion --non-item`: proposals (architect/hermit/auditor), epics, Doctor-cap parked PRs, rollout checks and the batch-wide Pass 0 / held-PR census. Curated-issue promotion and `loom:pr` merges are work-finder steps (`/loom:champion --issue N` / `--pr N`, `champion-targeted.md`). Any value is ignored with a warning |
 | **`curator.backlogTarget`** (top-level `curator`, not `autonomous.*`) | *(config only)* | *(unset: step skipped)* | **How many open issues this repo should hold (#11819).** Read through the full config resolver, so any tier may set it (machine defaults < `.loom/config.json` < `.loom-project/project.json` < fleet `.loom-local/fleet-repo.json` < host `.loom-local/local.json`). When set, each role-runner Curator dispatch counts the repo's open issues (one REST `search/issues` call, PRs excluded) and passes `/loom:curator --backlog-level <lenient\|normal\|strict> --backlog-open <n> --backlog-target <n>` from `r = open / target` (`< 0.5` lenient, `0.5`–`1.0` normal, `> 1.0` strict), which runs `curator.md`'s keep-or-close admission step on `loom:triage` issues; a failed count passes `normal` (no `--backlog-open`) and logs a `WARN`. Each such dispatch exports one `backlog.level` OTLP log. Unset, zero, negative or non-integer: no count, no flags, no record. Attended `/curator`, `/curator <n>` and `/loom:sweep` pass no flags. Per-repo, live |
 | `autonomous.balance.idleGate` | `LOOM_BALANCE_IDLE_GATE` | `false` | **Pipeline-empty gate for hermit/architect idle generation (#10817, slice 4 of #10630).** Off: an `onIdle` edge means a host slot is free, exactly as before (no ledger read, no log line). On: `hermit` and `architect` additionally need this repo's pipeline empty -- no review/changes/merge debt in the demand ledger (`role_runner::demand`) and, where observed, no ready/building issues; any observed work denies the run even with free slots. Unobserved axes never deny nor newly grant (today's host-slot rule applies). Other idle roles are untouched; `architectMaxProposals` still caps a granted architect run. A grant logs `role_runner: idle grant root=<r> role=<role> trigger=idle reason=pipeline-empty`. Precedence env > config > default; truthy `1/true/yes/on`, falsy `0/false/no/off`, an invalid env value warns and falls back to config. Per-repo, live |
 | `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
@@ -10793,7 +10793,7 @@ yields `not-running`.
 
 ### Autonomous periodic support-role runner (#4015)
 
-> **Step dispatch (accepted design, #11894; not yet implemented).** For a root with `autonomous.workFinder.stepDispatch: on`, the item roles (Curator, Champion promote and merge, Judge, Doctor) are dispatched as steps by the work finder rather than on these intervals, and `demandWidth` doesn't apply. Champion's non-item passes keep running here under `championMode: "non-item"`. The two concurrency budgets merge in the design's last phase. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
+> **Step dispatch (#11894, live since #11909).** The item roles (Curator, Champion promote and merge, Judge, Doctor) are dispatched as steps by the work finder, never on these intervals: Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning, and `demandWidth` doesn't apply to them. Champion runs here as `/loom:champion --non-item` only; `championMode` is retired and ignored with a warning. The two concurrency budgets merge in #11911. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
 
 Before this loop, the periodic **standalone** support roles — Champion,
 Curator, Judge, Auditor, Guide — ran ONLY via GitHub Actions cron
@@ -11090,16 +11090,11 @@ naming it in `roles` (1h default cadence). Both paths pass the resolved
 per-invocation cap through as `/loom:architect --max-proposals <n>`; see
 `architectMaxProposals` in the config table above.
 
-**Champion's non-item mode (#11859).** A root whose curated issues and
-`loom:pr` PRs are worked as per-item steps (`/loom:champion --issue N` /
-`--pr N`) keeps its interval Champion for everything else:
-
-```json
-{ "autonomous": { "roleRunner": { "enabled": true, "championMode": "non-item" } } }
-```
-
-Every Champion launch on that root is then `/loom:champion --non-item`; see
-`championMode` in the config table above and `champion-targeted.md`.
+**Champion runs non-item only (#11859, #11909).** Curated issues and `loom:pr`
+PRs are worked as per-item steps the work finder draws (`/loom:champion
+--issue N` / `--pr N`), so every interval and idle-edge Champion launch is
+`/loom:champion --non-item`. `championMode` is retired; see the config table
+above and `champion-targeted.md`.
 
 
 `onIdle` (#4364) lists the subset of the shipped roles to *also* fire on the
