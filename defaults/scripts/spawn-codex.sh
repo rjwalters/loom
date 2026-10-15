@@ -1179,9 +1179,8 @@ fi
 # case — an operator at the keyboard needs it. A prompt run with
 # LOOM_CODEX_NO_CAPTURE is headless, so it gets /dev/null like the capture path.
 if [[ "$HAS_PROMPT" != "true" || -n "${LOOM_CODEX_NO_CAPTURE:-}" ]]; then
-    echo "# LOOM_CLI_START runtime=codex" >&2
-    if [[ "$HAS_PROMPT" != "true" ]]; then exec "${CODEX_INVOKE[@]}"; fi
-    exec "${CODEX_INVOKE[@]}" </dev/null
+    echo "# LOOM_CLI_START runtime=codex" >&2; [[ "$HAS_PROMPT" == "true" ]] && exec </dev/null
+    exec "${CODEX_INVOKE[@]}"
 fi
 
 # Headless run. Two live-CLI behaviors force a child (not `exec`) here:
