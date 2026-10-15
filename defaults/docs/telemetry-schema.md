@@ -2636,6 +2636,80 @@ and `INFO` otherwise.
 | `mode` / `applied` | string / bool | `applied`: every write landed (`false` under dry-run) |
 | `at` | RFC3339 | when it was decided |
 
+#### Role step verdicts: `step:<role>` (#12027)
+
+A role step also emits `pass.verdict`, with `mechanism=step:<role>` (today
+`step:champion`; the judge row is #12029). The daemon builds the records from
+facts the run already produced, so there is no new GitHub call and no prompt
+change: a `Marker` entry that `loom-daemon forge comment` appends to the pick
+journal (the body's first-line `<!-- ns:kind[:…] -->`), the agent gh front's
+`Act` entries (merge PUT, `loom:issue` added), `park-record apply --by
+champion` and `operator-decision apply` journal appends, and the step's last
+`CHAMPION-STEP` / `LOOM_STEP_OUTCOME` line. They are projected at step end
+(`step_verdict::records_for`). The outcome ledger's `classify` /
+`champion_outcome` run **record-only** for `ledger_class` / `ledger_reason`;
+`effect_of` and `OutcomeLedger::record` are never called, so nothing changes in
+routing, cooldowns, labels or claims. Runs with no daemon (attended sessions,
+GitHub Actions cron) have no journal and emit nothing.
+
+Extra `pass.verdict` fields (all absent on a `stale_blocked_release` record,
+which serializes exactly as before; `verdict` carries `class` and `reason` the
+projected reason, so `passVerdictQuery` still parses both):
+
+| Field (`loom.pass.*`) | Notes |
+|---|---|
+| `head_sha` | the head evaluated, when the run recorded it (the Champion pin file, else the mirror); absent otherwise |
+| `step` | `champion_pr` or `champion_issue` |
+| `class` | `verdict`, `noop`, `refused` or `failed` |
+| `reason_set` | `champion_merge_v1` or `champion_promotion_v1` |
+| `ledger_class` / `ledger_reason` | the outcome ledger's own classification. It can differ from `class` / `reason`: a red-CI rejection keeps `loom:pr`, so the ledger says `failed unclassified` where the projection says `refused ci_failing`. `probe_failed` when the mirror was not fresh |
+| `criterion` (+ `reason_key` in the body) | the raw `champion:reject:<criterion>:<reason_key>` tokens |
+| `first_refused_at` | when this refusal identity was first seen on this head |
+| `proposal_label`, `body_hash` | promotion rows: which proposal label, and the `proposal-verdict:body-<hash>` |
+| `pre_labels`, `evaluated_at` | labels as read before acting; when the decision was knowable |
+| `fact_id` | derived, never random: `derived_hex(["loom.pass.verdict", mechanism, repo, number, head_sha, criterion_key, reason_key, evaluated_at hour], 32)`. A duplicate from another host dedups on read |
+| `version` / `revision` | the deciding build |
+
+**Champion merge gate (`champion_merge_v1`, `step=champion_pr`).**
+`merged` is `verdict`. `refused` carries `ci_failing`, `conflict`, `label`,
+`size`, `critical_file`, `stale`, `head_moved`, `not_eligible` or `unknown`
+(an unnamed criterion). `noop` carries `ci_pending` or `held`. `failed` carries
+`failed` or `unclassified`. A rejection whose duplicate comment the guard
+suppressed keeps the stored identity's reason and `first_refused_at`.
+
+**Champion promotion (`champion_promotion_v1`, `step=champion_issue`,
+`artifact=issue`).** One record per evaluated proposal. `promoted` is
+`verdict`. `refused` carries `not_obviously_beneficial` (a `champion:revise`),
+`needs_operator` (`champion:proposal-escalated`), `premise_false` or
+`blocked_dependency` (a park record). `noop` carries `evaluating_claimed` (a
+peer held a fresh `loom:evaluating`) or `not_eligible`. `failed` carries
+`failed` or `unclassified`. There is no `duplicate`: Champion has no duplicate
+close.
+
+**Why is this issue still `curated`?** Join two sources. Evaluated:
+`pass.verdict` with `step=champion_issue` (this record). Not evaluated, which
+is the bulk: the Champion tick's `pick.decision` skip reasons (level cap,
+`tier2Cap`, not selected). A cap stop that `pick.decision` does not yet
+attribute for Champion's curated rows is a follow-up, not emitted here.
+Un-evaluated issues get no record by design (about 650 rows per tick).
+
+**Volume.** The step path emits one record per step end, no-ops included. The
+role-tick path emits one per marker or merge act. There is no heartbeat.
+
+**Gauge (D2).** `loom.forge.stage_items{state="pr_refused", reason}` counts open
+`loom:pr` PRs on a still-current head that Champion is refusing, and
+`loom.forge.stage_oldest_age_seconds{state="pr_refused", reason, repo}` is
+`now - min(first_refused_at)`. The refusal store is per host (a host-local JSON
+file), so each host that holds entries reports its own, outside the captain
+skip, tagged with the host. `max by (repo, reason)` across hosts is a **lower
+bound**; the exact PR list is the `pass.verdict` query
+(`mechanism="step:champion"`, `class="refused"`). Both are absent, never `0`,
+when the walk was shed. The entry clears on a merge, a head change, or when the
+PR no longer shows open with `loom:pr`.
+
+**Leakage.** A record carries only what was knowable at `evaluated_at`. Never
+`merged_at`, `resolved_at` or a later head.
+
 The `invoke github` span gains three attributes in the same change (see its
 row under "GitHub rate limit" above): `github.caller` inside a caller scope,
 `github.repo`, and `github.number` on a write. Ready-made queries
