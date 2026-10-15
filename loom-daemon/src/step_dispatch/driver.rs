@@ -103,8 +103,14 @@ fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
 }
 
 impl StepDriver {
-    /// Run one step tick (module docs).
+    /// Run one step tick (module docs). Its forge reads and spawns block, so
+    /// on the daemon's multi-thread runtime it runs under `block_in_place`
+    /// rather than stalling a worker.
     pub fn tick(&mut self, input: &TickInputs<'_>) -> TickReport {
+        crate::sweep_registry::step_spawn::blocking(|| self.tick_blocking(input))
+    }
+
+    fn tick_blocking(&mut self, input: &TickInputs<'_>) -> TickReport {
         let now = Utc::now();
         self.provider.begin_tick();
         let registries: Vec<_> = input
@@ -179,6 +185,9 @@ impl StepDriver {
             let mut weighing = weigh(&gathered.inputs, &ctx, &ItemWeights::for_root(root));
             // This host's and the peers' live claims (B1, M5).
             tick::exclude_claimed(&mut weighing, &claims);
+            if !gathered.pulls_complete {
+                tick::exclude_builders(&mut weighing);
+            }
             if fixes_only {
                 weighing.pool.retain(|c| c.item.lane == Lane::RedMain);
             }

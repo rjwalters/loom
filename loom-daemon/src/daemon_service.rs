@@ -1921,13 +1921,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
         );
         let handles: Vec<_> = role_runner::DEFAULT_ROLES
             .iter()
+            // #11909: Curator, Judge and Doctor run as work-finder steps only.
+            .filter(|spec| !role_runner::champion_mode::is_step_role(spec.name))
             .map(|spec| {
                 // #6204: log the resolved cadence *with the tier that supplied
-                // it* (built-in / config / env). A uniform interval across
-                // every role is the expected shape of an override — but with
-                // no source in the line it reads as the per-role built-ins
-                // having silently stopped applying, which is how #6204 was
-                // filed against an inherited `LOOM_ROLE_RUNNER_INTERVAL_SECS`.
+                // it* (built-in / config / env). A uniform interval across every
+                // role is the expected shape of an override — but with no source
+                // in the line it reads as the per-role built-ins having silently
+                // stopped applying (#6204, an inherited `LOOM_ROLE_RUNNER_INTERVAL_SECS`).
                 let interval = role_runner::resolve_interval_for_role(spec, &role_runner_config);
                 log::info!(
                     "{}",

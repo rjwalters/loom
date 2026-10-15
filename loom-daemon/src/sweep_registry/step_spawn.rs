@@ -56,6 +56,7 @@ pub(crate) mod lease;
 mod pool_state;
 pub(crate) mod timeout;
 mod unlocked;
+pub(crate) use unlocked::blocking;
 
 pub use timeout::step_timeout;
 

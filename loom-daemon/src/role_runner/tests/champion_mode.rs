@@ -48,22 +48,20 @@ fn champion_resolves_to_its_non_item_prompt() {
     );
 }
 
-/// The item roles never tick on the role runner (#11909): not by default, not
-/// when a config names them.
+/// The item roles never fire on the idle edge (#11909); their interval loops
+/// are never spawned (`daemon_service`).
 #[test]
-fn item_roles_never_resolve_for_the_interval_or_the_idle_edge() {
-    let names = |specs: Vec<RoleSpec>| specs.iter().map(|s| s.name).collect::<Vec<_>>();
+fn item_roles_never_resolve_for_the_idle_edge() {
     for role in crate::role_runner::champion_mode::STEP_ROLES {
-        assert!(!names(interval_default_roles()).contains(&role), "{role}");
+        assert!(crate::role_runner::champion_mode::is_step_role(role));
         let cfg = RoleRunnerConfig {
-            roles: Some(vec![role.to_string(), "guide".to_string()]),
-            on_idle: Some(vec![role.to_string()]),
+            on_idle: Some(vec![role.to_string(), "guide".to_string()]),
             ..Default::default()
         };
-        assert_eq!(names(resolve_roles(&cfg)), vec!["guide"]);
-        assert!(resolve_on_idle_roles(&cfg).is_empty());
+        let names: Vec<&str> = resolve_on_idle_roles(&cfg).iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["guide"], "{role}");
     }
-    assert!(names(interval_default_roles()).contains(&"champion"));
+    assert!(!crate::role_runner::champion_mode::is_step_role("champion"));
 }
 
 /// A root that still sets `championMode`, to any value, keeps resolving its

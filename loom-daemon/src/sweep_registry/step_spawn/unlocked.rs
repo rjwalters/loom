@@ -13,8 +13,9 @@
 //! 3. **locked**: the sweep id, the item's lock, the peer advertisement, and
 //!    the pre-claim command;
 //! 4. **unlocked**: the pre-claim (non-Builder roles);
-//! 5. **locked**: a Builder's claim flip and lease comment (the same phase a
-//!    sweep takes it in), the stagger and the spawn;
+//! 5. **locked**: the roll gate again (a roll may have paused spawns while the
+//!    lock was released), a Builder's claim flip and lease comment (the same
+//!    phase a sweep takes it in), the stagger and the spawn;
 //! 6. **unlocked**: the account-selection poll;
 //! 7. **locked**: [`SweepRegistry::finish_step_spawn`].
 //!
@@ -29,9 +30,13 @@ fn locked(registry: &Arc<Mutex<SweepRegistry>>) -> std::sync::MutexGuard<'_, Swe
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Run `f` off the async runtime's worker when called from one.
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
-    if tokio::runtime::Handle::try_current().is_ok() {
+/// Run `f` off the async runtime's worker when called from a multi-thread
+/// one; `block_in_place` panics on a current-thread runtime, where `f` just
+/// runs inline (B8).
+pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    let multi = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi {
         tokio::task::block_in_place(f)
     } else {
         f()
@@ -70,7 +75,15 @@ impl SweepRegistry {
         };
         let launch = match blocking(|| Self::resolve_step_launch(&config, role, &kind)) {
             Ok(launch) => launch,
-            Err(refusal) => return Err(refuse(refusal)),
+            Err(refusal) => {
+                // The draw excludes a role whose pool is exhausted only from
+                // this registry's `RoleTick` entries (B4): record the
+                // preflight's refusals there, as a token-selection death is.
+                if matches!(refusal.reason, "pool_exhausted" | "no_token_pool") {
+                    locked(registry).record_role_tick_pool_exhausted(role.role_name());
+                }
+                return Err(refuse(refusal));
+            }
         };
         let sweep_id = generate_sweep_id(&kind);
         let claim_cmd = {
@@ -96,6 +109,14 @@ impl SweepRegistry {
         }
         let mut prepared = {
             let mut reg = locked(registry);
+            // A roll may have paused spawns while the lock was released (B5):
+            // admit again before the child, under the same lock the spawn's
+            // `MidSpawn` is entered under.
+            if let Err(e) = reg.roll_gate.admit(&kind) {
+                reg.unwind_step_claim(item, role, &sweep_id, role != StepRole::Builder);
+                drop(reg);
+                return Err(refuse(StepRefusal::new("roll_paused", e)));
+            }
             if role == StepRole::Builder {
                 if let Err(refusal) = reg.pre_claim_step(item, role, &sweep_id) {
                     reg.unwind_step_claim(item, role, &sweep_id, false);
