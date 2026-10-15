@@ -199,12 +199,11 @@ pub const DEFAULT_WORK_FINDER_MAX_CONCURRENT: usize = 3;
 /// uncontrolled burst.
 ///
 /// Precedence is the standard **env > config
-/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default**, resolved once at
-/// daemon startup via [`read_work_finder_config`] → `config_resolver` — the
-/// same startup-capture pattern as `cpuUtilizationTarget` / `estCoresPerSweep`
-/// (#4032): the *inputs* (occupancy, live headroom) are re-read every tick, but
-/// this *knob* takes effect only on daemon restart unless a future change
-/// moves knob resolution into the tick loop itself. A zero/unparseable value is
+/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default**. Since #12090 the
+/// config layer is re-read every multi-workspace tick
+/// ([`ConfiguredMaxReloader::max_admissions_per_tick`]), so a fleet-store edit
+/// hot-applies; this env override, being process environment, is read only at
+/// daemon start. A zero/unparseable value is
 /// dropped (falls through to config/default) — a zero cap would silently
 /// freeze the loop at its current occupancy forever, which is a footgun, not a
 /// deliberate "pause" (use the main-health-gate halt or a scheduled drain for
@@ -789,6 +788,15 @@ pub trait WorkDispatcher {
     /// and still meets `dispatch()`'s own open-PR guard. Defaults to empty.
     fn open_pr_blocked(&self, _candidates: &[u32]) -> HashMap<u32, u32> {
         HashMap::new()
+    }
+
+    /// What the pre-filter asks (#12025): [`open_pr_blocked`](Self::open_pr_blocked)
+    /// plus whether a listing was read at all. An
+    /// [`OpenPrAnswer::Unreadable`](open_pr_prefilter::OpenPrAnswer::Unreadable)
+    /// workspace's unverified candidates are not dispatched this tick (fail
+    /// closed). Defaults to `NotAsked(open_pr_blocked(..))`: the pre-#12025 path.
+    fn open_pr_answer(&self, candidates: &[u32]) -> open_pr_prefilter::OpenPrAnswer {
+        open_pr_prefilter::OpenPrAnswer::NotAsked(self.open_pr_blocked(candidates))
     }
 
     /// The landed pre-filter (#11853, [`landed_prefilter`]): the issues in
@@ -2205,16 +2213,10 @@ fn env_max_admissions_per_tick() -> Option<usize> {
 }
 
 /// Resolve the per-tick admission (ramp) cap with precedence **env > config
-/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default** (#4234).
-/// Resolved once at daemon startup — the same startup-capture pattern as
-/// [`resolve_max_concurrent_with_config`] — and threaded through to
-/// [`spawn_work_finder_task`] / [`spawn_multi_work_finder_task`] as a plain
-/// `usize`. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for why this is a
-/// deliberate startup-capture, not a per-tick re-read: the ramp cap's whole
-/// purpose is to smooth admission *within* the live per-tick re-computation of
-/// `max_concurrent`, so it does not itself need to be live — an operator
-/// retuning it takes effect on the next daemon restart (unlike
-/// `configured_max`, which hot-applies since #9060).
+/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default** (#4234). The
+/// production multi-workspace loop re-reads it every tick since #12090 (via
+/// [`configured_max::resolve_admissions_with_source`]); the single-workspace
+/// reference loop still takes it as a fixed `usize`.
 #[must_use]
 pub fn resolve_max_admissions_per_tick_with_config(config: &WorkFinderConfig) -> usize {
     env_max_admissions_per_tick()
@@ -2800,7 +2802,6 @@ pub fn spawn_multi_work_finder_task(
     fallback_root: PathBuf,
     interval: Duration,
     configured_max: ConfiguredMax,
-    max_admissions_per_tick: usize,
     health_states: Arc<WorkspaceHealthStates>,
     suppress_dispatch_during_gate: bool,
     event_bus: Arc<EventBus>,
@@ -2815,7 +2816,7 @@ pub fn spawn_multi_work_finder_task(
     // has landed.
     mut startup_reconciliation_ready: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
-    configured_max::log_loop_start(interval, configured_max, max_admissions_per_tick);
+    configured_max::log_loop_start(interval, configured_max);
     tokio::spawn(async move {
         // #9060: the operator ceiling is re-resolved every tick (see the
         // `configured_max` module) — no longer a frozen startup value.
@@ -2863,11 +2864,6 @@ pub fn spawn_multi_work_finder_task(
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
-        // Workspace-commands-missing tripwire (#6440): tracks which roots are
-        // currently missing .claude/commands/loom/sweep.md so the loud WARN
-        // below fires once per transition (into AND out of the condition),
-        // never every tick — mirroring `missing_roots_warned`.
-        let mut commands_missing_warned: HashSet<PathBuf> = HashSet::new();
         // Idle-edge role triggering (#4364): per-root idle level + per-(root,
         // role) debounce state. Fed one post-tick idle observation per root; on
         // the non-idle → idle edge it fire-and-forgets each configured on-idle
@@ -2875,6 +2871,7 @@ pub fn spawn_multi_work_finder_task(
         // fires.
         let mut idle_trigger = crate::role_runner::IdleTrigger::new();
         let mut was_rate_limited = false;
+        let mut step_driver = crate::step_dispatch::driver::StepDriver::default();
         loop {
             ticker.tick().await;
 
@@ -2931,6 +2928,8 @@ pub fn spawn_multi_work_finder_task(
             // `maxConcurrentPerRepo` hot-applies exactly as the ceiling does.
             // `None` (the default) leaves dispatch byte-for-byte pre-#9090.
             let max_concurrent_per_repo = configured_max_reload.per_repo();
+            // #12090: and the per-tick admission (ramp) cap, from the same read.
+            let max_admissions_per_tick = configured_max_reload.max_admissions_per_tick();
             // `fallback_root` (the daemon's own seeded default) may not itself
             // be a recognized Loom workspace — e.g. a machine-level daemon
             // started under systemd with a bare `$HOME` cwd — in which case
@@ -3148,36 +3147,6 @@ pub fn spawn_multi_work_finder_task(
                 draining || breaker_suppressed,
             );
 
-            let mut pairs = forge::dispatcher_pairs(&pool, &roots);
-
-            // Workspace-commands-missing tripwire (#6440): a loud, ONE-TIME
-            // WARN per root on the transition into (and recovery from) the
-            // condition — never every tick. `tick_multi_with_saturation_brake`
-            // below independently re-checks this per root to decide whether
-            // to skip its candidates; this is purely the log-once concern,
-            // mirroring `filter_missing_roots`' `missing_roots_warned` dedup.
-            for (root, (_src, dispatcher)) in roots.iter().zip(pairs.iter()) {
-                let missing = dispatcher.workspace_commands_missing();
-                if missing && commands_missing_warned.insert(root.clone()) {
-                    log::warn!(
-                        "work_finder: workspace {} is missing \
-                         .claude/commands/loom/sweep.md — every dispatch to it is refused \
-                         (#4027 guard). Its ready issues will be skipped in one batch per tick \
-                         rather than retried individually (#6440). Run `loom-daemon init {}` \
-                         there. `loom-daemon status` reports this repo's HEALTH-GATE as `no-sweep` \
-                         until fixed.",
-                        root.display(),
-                        root.display()
-                    );
-                } else if !missing && commands_missing_warned.remove(root) {
-                    log::info!(
-                        "work_finder: workspace {} now has .claude/commands/loom/sweep.md — \
-                         dispatch resuming (#6440)",
-                        root.display()
-                    );
-                }
-            }
-
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
@@ -3189,7 +3158,7 @@ pub fn spawn_multi_work_finder_task(
                  build_backoff_held={build_backoff_held} (#9410), \
                  observed_idle={}, workspaces={}, priorities={priorities:?})",
                 format_idle(idle),
-                pairs.len()
+                roots.len()
             );
             if was_max_concurrent != Some(max_concurrent) {
                 log::info!("{axis_line}");
@@ -3199,18 +3168,20 @@ pub fn spawn_multi_work_finder_task(
             }
 
             let tick_started = chrono::Utc::now();
-            let report = tick_multi_with_build_backoff(
-                &mut pairs,
-                &priorities,
-                CapTerms::observed(configured_max, disk, ram),
-                &halted,
-                Some(&halt_causes),
-                max_admissions_per_tick,
+            // #11909: the step tick is the only item dispatch path.
+            let report = step_driver.tick(&crate::step_dispatch::driver::TickInputs {
+                pool: &pool,
+                roots: &roots,
+                weights: &priorities,
+                halted: &halted,
+                halt_causes: &halt_causes,
+                lanes: &lanes,
+                build_backoff: &build_backoff_held.per_workspace,
+                max_concurrent,
+                max_admissions: max_admissions_per_tick,
                 saturation_held,
-                (max_concurrent_per_repo, ram_budget, disk_budget),
-                &lanes,
-                &build_backoff_held.per_workspace,
-            );
+                limits: (max_concurrent_per_repo, ram_budget, disk_budget).into(),
+            });
 
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
@@ -3237,7 +3208,7 @@ pub fn spawn_multi_work_finder_task(
                 ram,
                 configured_max,
                 max_admissions_per_tick,
-                workspaces: pairs.len(),
+                workspaces: roots.len(),
                 disk_note: &disk_note,
             };
             tick_line::log(&report, &tick_line);
@@ -3269,8 +3240,11 @@ pub fn spawn_multi_work_finder_task(
             // on-idle role (never awaited here — the tick must not block on a
             // multi-minute role session). `draining` (#4090) suppresses firing;
             // per-root config gating (enabled + `onIdle`) is applied inside.
-            for (root, (_src, dispatcher)) in roots.iter().zip(pairs.iter()) {
-                let idle_now = dispatcher.in_flight().is_empty();
+            for root in &roots {
+                let idle_now = pool.get_or_provision(root).lock().map_or(true, |mut reg| {
+                    reg.reap_liveness();
+                    reg.occupied_issues().is_empty()
+                });
                 crate::role_runner::observe_and_fire_idle(
                     &mut idle_trigger,
                     &role_in_progress,

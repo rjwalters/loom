@@ -455,9 +455,10 @@ pub fn resolve_no_progress_grace_minutes() -> f64 {
 /// convention rather than drifting into two knobs for the same concept.
 pub const STALE_REVIEWING_MINUTES_ENV: &str = "LOOM_STALE_REVIEWING_MINUTES";
 
-/// Default `loom:reviewing` staleness threshold: 30 minutes, matching
-/// judge.md's default exactly.
-pub const DEFAULT_STALE_REVIEWING_MINUTES: f64 = 30.0;
+/// Default `loom:reviewing` staleness threshold: 45 minutes, matching
+/// judge.md's default exactly. Longer than a Judge step's 30-minute timeout
+/// (#11909), so a running step's claim never reads as stale.
+pub const DEFAULT_STALE_REVIEWING_MINUTES: f64 = 45.0;
 
 /// Env var overriding the `loom:treating` staleness threshold, in minutes
 /// (Issue #4367).

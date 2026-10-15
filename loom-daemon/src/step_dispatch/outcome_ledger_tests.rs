@@ -284,6 +284,31 @@ fn a_verdict_clears_the_items_history_and_cooldowns() {
     assert!(l.cooling_until(5, StepRole::Judge, now).is_some(), "another item is untouched");
 }
 
+/// #12042: a Judge step that stood down for pending CI cools down for the
+/// short refusal window, not the no-op hour, so a PR whose CI concludes in
+/// minutes gets its Judge back in minutes.
+#[test]
+fn a_ci_pending_noop_takes_the_short_window() {
+    let cfg = LedgerConfig::default();
+    let noop = out(OutcomeClass::Noop, "ci_pending");
+    assert_eq!(
+        effect_of(StepRole::Judge, &noop, SLOW, &cfg),
+        Effect::Cooldown(cfg.refusal_cooldown)
+    );
+    assert!(cfg.refusal_cooldown < cfg.noop_cooldown);
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let rec = l.record(9, StepRole::Judge, &noop, SLOW, now);
+    assert_eq!(rec.cooling_until, Some(now + mins(10)));
+    assert!(!l
+        .snapshot(now)
+        .is_cooling(9, StepRole::Judge, now + mins(11)));
+    // Every other no-op keeps the hour.
+    let rec =
+        l.record(9, StepRole::Builder, &out(OutcomeClass::Noop, "no_changes_needed"), SLOW, now);
+    assert_eq!(rec.cooling_until, Some(now + chrono::Duration::hours(1)));
+}
+
 #[test]
 fn noop_cools_the_item_step_for_the_noop_window() {
     let mut l = OutcomeLedger::default();
@@ -618,6 +643,45 @@ fn a_repeated_identical_state_refusal_arms_a_doubling_cooldown() {
         .record(64, step, &refuse("not_eligible"), SLOW, now + mins(5))
         .cooling_until
         .is_some());
+}
+
+/// #11909: the reaper prunes every tick. A prune just before each draw must
+/// not drop a refusal streak whose cooldown reached the 24 h cap (the same
+/// length as the prune window): the next identical refusal keeps the 24 h
+/// cooldown instead of restarting at 10 min.
+#[test]
+fn a_prune_inside_the_refusal_loop_keeps_the_streak_capped() {
+    let mut l = OutcomeLedger::default();
+    let step = StepRole::ChampionMerge;
+    let refuse = out(OutcomeClass::Refused, "not_eligible");
+    let mut at = t0();
+    let mut lengths = Vec::new();
+    for _ in 0..16 {
+        let rec = l.record(70, step, &refuse, SLOW, at);
+        if let Some(until) = rec.cooling_until {
+            lengths.push((until - at).num_seconds());
+            // The next draw is just after the cooldown ends, with a reaper
+            // prune in between.
+            at = until + mins(1);
+        } else {
+            at += mins(1);
+        }
+        l.prune(at);
+    }
+    let capped: Vec<i64> = lengths
+        .iter()
+        .copied()
+        .skip_while(|s| *s < 24 * 3600)
+        .collect();
+    assert!(capped.len() >= 4, "{lengths:?}");
+    assert!(capped.iter().all(|s| *s == 24 * 3600), "the streak restarted: {lengths:?}");
+    // A full window past the cooldown with no refusal: the streak is gone.
+    l.prune(at + chrono::Duration::days(2));
+    assert_eq!(
+        l.record(70, step, &refuse, SLOW, at + chrono::Duration::days(2))
+            .cooling_until,
+        None
+    );
 }
 
 /// #11969: a Curator or Champion-promote fast failure takes the ledger-local

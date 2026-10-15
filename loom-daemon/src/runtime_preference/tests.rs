@@ -599,6 +599,11 @@ fn an_exhausted_claude_pool_falls_through_instead_of_holding() {
 fn a_wholly_unavailable_list_still_yields_no_choice() {
     let _env = ClearedRuntimeEnv::new();
     let dir = fixture();
+    // #9806: pin the Claude pool state through the production seam (the
+    // per-repo `.loom/tokens/` that `tokens::token_pool_size` reads) instead of
+    // inheriting whatever this host has. Zero accounts = Unprovisioned, so the
+    // api-key pool below stays the only thing under test.
+    provision_claude_pool(dir.path(), 0);
     let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());
     crate::api_keys_pool::registry::add(&pool, "zai", "alpha", "ZAI_API_KEY", "fake", false)
         .unwrap();
@@ -912,6 +917,11 @@ fn claude_availability_agrees_with_the_preflight_gate() {
 fn a_pooled_native_provider_is_gated_on_its_api_key_pool() {
     let _env = ClearedRuntimeEnv::new();
     let dir = fixture();
+    // #9806: pin the Claude pool state through the production seam (the
+    // per-repo `.loom/tokens/` that `tokens::token_pool_size` reads) instead of
+    // inheriting whatever this host has. Zero accounts = Unprovisioned, so the
+    // api-key pool below stays the only thing under test.
+    provision_claude_pool(dir.path(), 0);
     let admitted = resolve_and_admit(dir.path(), "builder", Some("opencode")).unwrap();
     let tap = Tap::runtime("opencode");
     let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());

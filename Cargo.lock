@@ -1257,7 +1257,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "loom-api"
-version = "0.19.1161"
+version = "0.19.1162"
 dependencies = [
  "anyhow",
  "axum",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "loom-daemon"
-version = "0.19.1161"
+version = "0.19.1162"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1919,9 +1919,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",

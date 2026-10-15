@@ -50,8 +50,13 @@ use crate::step_role::StepRole;
 use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 
 pub(crate) mod capture;
+pub mod draw_claims;
+pub mod ended;
 pub(crate) mod lease;
+mod pool_state;
 pub(crate) mod timeout;
+mod unlocked;
+pub(crate) use unlocked::blocking;
 
 pub use timeout::step_timeout;
 
@@ -198,7 +203,7 @@ impl SweepRegistry {
         self.roll_gate
             .admit(&kind)
             .map_err(|e| StepRefusal::new("roll_paused", e))?;
-        let launch = self.resolve_step_launch(role, &kind)?;
+        let launch = Self::resolve_step_launch(&self.config, role, &kind)?;
         let sweep_id = generate_sweep_id(&kind);
         let locked = if role.acts_on_pr() {
             self.acquire_pr_lock(item, &sweep_id)
@@ -212,6 +217,19 @@ impl SweepRegistry {
             self.unwind_step_claim(item, role, &sweep_id, false);
             return Err(refusal);
         }
+        self.spawn_prepared_step(request, &sweep_id, launch)
+    }
+
+    /// The claimed step's launch: the stagger and the child. A failed spawn
+    /// undoes the claim.
+    fn spawn_prepared_step(
+        &mut self,
+        request: &StepSpawnRequest,
+        sweep_id: &str,
+        launch: StepLaunch,
+    ) -> std::result::Result<PreparedStep, StepRefusal> {
+        let (item, role, kind) = (request.item, request.role, request.kind());
+        let sweep_id = sweep_id.to_string();
         self.apply_dispatch_stagger();
         let log_path = self.compute_step_log_path(item, role);
         match self.spawn_child_process(
@@ -238,114 +256,6 @@ impl SweepRegistry {
                 Err(StepRefusal::new("spawn_failed", format!("{e:#}")))
             }
         }
-    }
-
-    /// The role's resolvers' answer for a step of `role` (module docs).
-    fn resolve_step_launch(
-        &self,
-        role: StepRole,
-        kind: &SweepKind,
-    ) -> std::result::Result<StepLaunch, StepRefusal> {
-        use crate::role_runner::model_resolution as models;
-        let root = &self.config.workspace_root;
-        let name = role.role_name();
-        let effort = non_empty(models::resolve_role_runner_effort(root, name).0);
-        if self.config.skip_label_flip {
-            // Hermetic fixtures install no runtime manifests.
-            let model = match role {
-                StepRole::Builder => DispatchModel::Autonomous.resolve(&self.config, kind, None),
-                _ => non_empty(models::resolve_role_runner_model(root, name).0),
-            };
-            return Ok(StepLaunch {
-                admission: crate::runtime_preference::DispatchAdmission::none(),
-                model,
-                effort,
-                selection: None,
-            });
-        }
-        // #8787: a binding whose only unmet requirement is repository
-        // isolation (a Codex Doctor, say) may be admitted on verified
-        // private-clone containment, exactly as the role runner admits a role
-        // run. The selection the preparer holds is the one the launch uses.
-        let hint = match role {
-            StepRole::Builder => None,
-            _ => Some(models::resolve_role_runner_model(root, name)),
-        };
-        let config = &self.config;
-        let (job, issue) = match role {
-            StepRole::Builder => (JobKind::Sweep, Some(u64::from(kind.item_number().unwrap_or(0)))),
-            _ => (JobKind::Role, None),
-        };
-        let mut containment = Preparer::new(
-            root,
-            job,
-            issue,
-            format!("step-{role}-{}", uuid::Uuid::new_v4()),
-            Box::new(move |runtime: &str| match &hint {
-                None => DispatchModel::Autonomous.resolve_for_runtime(config, kind, Some(runtime)),
-                Some((model, source)) => {
-                    let (model, _) = models::reconcile_unpinned_model_with_runtime(
-                        runtime,
-                        model.clone(),
-                        source.clone(),
-                    );
-                    non_empty(model)
-                }
-            }),
-        );
-        let statically = match crate::runtime_admission::resolve_and_admit(root, name, None) {
-            Err(rejection) if rejection.containment_eligible() => {
-                use crate::runtime_preference::ContainmentPreparer;
-                containment.contain(name, None, rejection)
-            }
-            other => other,
-        };
-        let logs = root.join(".loom").join("logs");
-        let chosen = crate::role_runner::runtime_preflight::check(
-            root,
-            &logs,
-            name,
-            Some(&statically),
-            &mut containment,
-        )
-        .map_err(|outcome| {
-            if matches!(outcome, crate::role_runner::RoleTickOutcome::PoolExhausted { .. }) {
-                log::info!("sweep_registry: the {name} pool is exhausted; steps refused (#11906)");
-            }
-            refusal_of(&outcome)
-        })?;
-        let selection = containment.take().map(|(selection, _)| selection);
-        let admitted = match chosen.admitted.map_or(statically, Ok) {
-            Ok(admitted) => admitted,
-            Err(rejection) => return Err(StepRefusal::new("runtime_rejected", rejection.reason)),
-        };
-        let model = match role {
-            StepRole::Builder => {
-                DispatchModel::Autonomous.resolve(&self.config, kind, Some(&admitted))
-            }
-            _ => {
-                let drawn = admitted.preference.as_ref().and_then(|p| p.model.clone());
-                let (model, source) = match drawn {
-                    Some(drawn) => (drawn, "role-draw".to_string()),
-                    None => models::resolve_role_runner_model(root, name),
-                };
-                let (model, _) =
-                    models::reconcile_unpinned_model_with_runtime(&admitted.runtime, model, source);
-                if let Some(why) = model_runtime_mismatch(&admitted.runtime, &model) {
-                    return Err(StepRefusal::new("model_runtime_mismatch", why));
-                }
-                non_empty(model)
-            }
-        };
-        Ok(StepLaunch {
-            admission: crate::runtime_preference::DispatchAdmission {
-                admitted: Some(admitted),
-                backstop: chosen.backstop,
-            },
-            model,
-            effort,
-            selection,
-        })
     }
 
     /// Take the step's claim on the forge (B1, module docs).
@@ -477,6 +387,10 @@ impl SweepRegistry {
         self.start_step_lease_renewal(item, role, &sweep_id, pid, &log_path);
         self.publish_step_slots();
         self.emit_dispatch(&sweep_id, &launch.admission, None, None);
+        // A named account proves the role's pool works again (#11909).
+        if token_name != crate::sweep_registry::UNKNOWN_TOKEN_NAME {
+            self.clear_role_tick_pool_exhausted(role.role_name());
+        }
         self.record_step_dispatch(&request, dispatch_step::RESULT_SPAWNED, "ok", Some(&sweep_id));
         log::info!(
             "sweep_registry: {role} step {sweep_id} on #{item} spawned (pid {pid}, model {}, \
@@ -527,6 +441,115 @@ impl SweepRegistry {
             }
         }
         crate::observability::ops::busy_slots::set_steps(&self.config.workspace_root, running);
+    }
+}
+
+impl SweepRegistry {
+    /// The role's resolvers' answer for a step of `role` (module docs). Reads
+    /// only the configuration, so it runs with the registry lock released
+    /// (the containment preparation, #8787, can call Docker).
+    pub(crate) fn resolve_step_launch(
+        config: &SweepRegistryConfig,
+        role: StepRole,
+        kind: &SweepKind,
+    ) -> std::result::Result<StepLaunch, StepRefusal> {
+        use crate::role_runner::model_resolution as models;
+        let root = &config.workspace_root;
+        let name = role.role_name();
+        let effort = non_empty(models::resolve_role_runner_effort(root, name).0);
+        if config.skip_label_flip {
+            // Hermetic fixtures install no runtime manifests.
+            let model = match role {
+                StepRole::Builder => DispatchModel::Autonomous.resolve(config, kind, None),
+                _ => non_empty(models::resolve_role_runner_model(root, name).0),
+            };
+            return Ok(StepLaunch {
+                admission: crate::runtime_preference::DispatchAdmission::none(),
+                model,
+                effort,
+                selection: None,
+            });
+        }
+        // #8787: a binding whose only unmet requirement is repository
+        // isolation (a Codex Doctor, say) may be admitted on verified
+        // private-clone containment, exactly as the role runner admits a role
+        // run. The selection the preparer holds is the one the launch uses.
+        let hint = match role {
+            StepRole::Builder => None,
+            _ => Some(models::resolve_role_runner_model(root, name)),
+        };
+        let (job, issue) = match role {
+            StepRole::Builder => (JobKind::Sweep, Some(u64::from(kind.item_number().unwrap_or(0)))),
+            _ => (JobKind::Role, None),
+        };
+        let mut containment = Preparer::new(
+            root,
+            job,
+            issue,
+            format!("step-{role}-{}", uuid::Uuid::new_v4()),
+            Box::new(move |runtime: &str| match &hint {
+                None => DispatchModel::Autonomous.resolve_for_runtime(config, kind, Some(runtime)),
+                Some((model, source)) => {
+                    let (model, _) = models::reconcile_unpinned_model_with_runtime(
+                        runtime,
+                        model.clone(),
+                        source.clone(),
+                    );
+                    non_empty(model)
+                }
+            }),
+        );
+        let statically = match crate::runtime_admission::resolve_and_admit(root, name, None) {
+            Err(rejection) if rejection.containment_eligible() => {
+                use crate::runtime_preference::ContainmentPreparer;
+                containment.contain(name, None, rejection)
+            }
+            other => other,
+        };
+        let logs = root.join(".loom").join("logs");
+        let chosen = crate::role_runner::runtime_preflight::check(
+            root,
+            &logs,
+            name,
+            Some(&statically),
+            &mut containment,
+        )
+        .map_err(|outcome| {
+            if matches!(outcome, crate::role_runner::RoleTickOutcome::PoolExhausted { .. }) {
+                log::info!("sweep_registry: the {name} pool is exhausted; steps refused (#11906)");
+            }
+            refusal_of(&outcome)
+        })?;
+        let selection = containment.take().map(|(selection, _)| selection);
+        let admitted = match chosen.admitted.map_or(statically, Ok) {
+            Ok(admitted) => admitted,
+            Err(rejection) => return Err(StepRefusal::new("runtime_rejected", rejection.reason)),
+        };
+        let model = match role {
+            StepRole::Builder => DispatchModel::Autonomous.resolve(config, kind, Some(&admitted)),
+            _ => {
+                let drawn = admitted.preference.as_ref().and_then(|p| p.model.clone());
+                let (model, source) = match drawn {
+                    Some(drawn) => (drawn, "role-draw".to_string()),
+                    None => models::resolve_role_runner_model(root, name),
+                };
+                let (model, _) =
+                    models::reconcile_unpinned_model_with_runtime(&admitted.runtime, model, source);
+                if let Some(why) = model_runtime_mismatch(&admitted.runtime, &model) {
+                    return Err(StepRefusal::new("model_runtime_mismatch", why));
+                }
+                non_empty(model)
+            }
+        };
+        Ok(StepLaunch {
+            admission: crate::runtime_preference::DispatchAdmission {
+                admitted: Some(admitted),
+                backstop: chosen.backstop,
+            },
+            model,
+            effort,
+            selection,
+        })
     }
 }
 
