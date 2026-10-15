@@ -116,7 +116,7 @@ pub fn missing_message(snapshot: &Snapshot) -> String {
 
 /// Resolve `host`'s desired state from a parsed run-state document.
 /// `source_name` names the document in messages.
-fn resolve_value(doc: &Value, host: &str, source_name: &str) -> Result<HostState> {
+pub(crate) fn resolve_value(doc: &Value, host: &str, source_name: &str) -> Result<HostState> {
     let top = doc
         .as_object()
         .ok_or_else(|| anyhow!("{source_name}: top level must be a mapping"))?;

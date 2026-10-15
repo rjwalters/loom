@@ -1800,8 +1800,9 @@ pub struct ManagedRepoEntry {
 /// One repo's `loom:blocked` release-pass tallies on one host (#10763),
 /// carried on [`ManagedRepoEntry`] so a fleet where the pass never acts is
 /// diagnosable without host logs: `ticks` counts every per-repo tick by
-/// outcome (`ran`, `not_due`, `skipped_shard`, `denied_scope`, `not_served`,
-/// `rate_limited`, `skipped_off`, `dry_run`, `archived`, `enumerate_error`).
+/// outcome (`ran`, `not_due`, `skipped_shard`, `skipped_pass_shard`,
+/// `denied_scope`, `not_served`, `rate_limited`, `skipped_off`, `dry_run`,
+/// `archived`, `enumerate_error`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StaleBlockedReleaseCounters {
     /// Artifacts released (applied writes only).

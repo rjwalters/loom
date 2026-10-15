@@ -1031,6 +1031,8 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // #10885: a floor that differs from the previous pass's wakes the
     // self-update loop, so it acts now and not at its next interval.
     floor_knowledge::record_floor(&floor);
+    // #11301: the pass-shard ring, from the same cached snapshot, offline.
+    crate::pass_shard::refresh(&inputs.cache, &inputs.location, &host, now);
     // J3 shadow (#11349): config as resolved after this pass (deduplicated).
     crate::config_journal::record_resolved(&inputs.workspace);
     FleetSyncStatus {

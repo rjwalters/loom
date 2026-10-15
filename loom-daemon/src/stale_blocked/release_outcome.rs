@@ -43,6 +43,9 @@ pub enum Outcome {
     NotDue,
     /// Another host owns this workspace's shard (or the roster is yielding).
     SkippedShard,
+    /// Another host owns this repo's pass under pass sharding (#11301), or
+    /// this host is its backup and this due slot is not one it runs.
+    SkippedPassShard,
     /// The root is outside the forge-write scope (#9548).
     DeniedScope,
     /// `LOOM_RELEASE_STALE_BLOCKED=dry-run`: planned, wrote nothing.
@@ -64,6 +67,7 @@ impl Outcome {
             Self::RateLimited => "rate_limited",
             Self::NotDue => "not_due",
             Self::SkippedShard => "skipped_shard",
+            Self::SkippedPassShard => "skipped_pass_shard",
             Self::DeniedScope => "denied_scope",
             Self::DryRun => "dry_run",
             Self::Archived => "archived",
@@ -78,6 +82,7 @@ impl Outcome {
             self,
             Self::NotDue
                 | Self::SkippedShard
+                | Self::SkippedPassShard
                 | Self::SkippedOff
                 | Self::NotServed
                 | Self::RateLimited

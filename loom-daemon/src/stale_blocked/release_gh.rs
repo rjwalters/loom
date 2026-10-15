@@ -25,6 +25,10 @@
 //!    workspace.
 //! 4. Shard ownership: [`crate::role_shard::decide`] — one host of a sharded
 //!    fleet acts on a given workspace.
+//!
+//!    Pass sharding (#11301): [`crate::pass_shard::admits_due_slot`] — with
+//!    `autonomous.passShard` on, only the repo's owner host runs it (its
+//!    backup every `backupEvery`-th due slot); `skipped_pass_shard` otherwise.
 //! 5. Forge-write scope (#9548): [`crate::write_scope::gate_root_with`].
 //!
 //! `LOOM_RELEASE_STALE_BLOCKED_MAX_WRITES` (default 20) caps the artifacts
@@ -158,6 +162,11 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
     let owned = due_now && crate::role_shard::decide(root).admits_role_tick();
     if let Some(outcome) = classify_gate(mode, due_now, owned) {
         record(root, outcome, None);
+        return None;
+    }
+    // #11301: one host per repo across the fleet, behind `autonomous.passShard`.
+    if !crate::pass_shard::admits_due_slot(root) {
+        record(root, super::release_outcome::Outcome::SkippedPassShard, None);
         return None;
     }
     // #10752: every GitHub call of the pass carries `github.caller`, and the

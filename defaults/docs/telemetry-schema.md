@@ -3130,8 +3130,8 @@ bump.
 **`managed_repos[].stale_blocked_release` (#10763).** This host's
 `loom:blocked` release-pass tallies for the repo since the daemon started:
 `released` and `reparked` (applied writes only), `last_outcome`, and `ticks`, a
-count per outcome key (`ran`, `not_due`, `skipped_shard`, `denied_scope`,
-`not_served`, `rate_limited`, `skipped_off`, `dry_run`, `archived`,
+count per outcome key (`ran`, `not_due`, `skipped_shard`, `skipped_pass_shard`
+(#11301), `denied_scope`, `not_served`, `rate_limited`, `skipped_off`, `dry_run`, `archived`,
 `enumerate_error`). Omitted before the pass first ticks the repo on this host,
 never a fabricated zero. A repo whose `ran` stays at zero on every host is
 diagnosable from these keys alone. Additive, no `schema_version` bump.

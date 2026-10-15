@@ -1002,6 +1002,7 @@ fn three_ticks_in_one_five_minute_window_that_change_a_rank_send_three_records()
         slugs: [("/src/anvil".to_string(), OTHER.to_string())].into(),
         roots: Vec::new(),
         visibility: BTreeMap::new(),
+        unowned: BTreeSet::new(),
     };
     let pass_at = |rows: &[(u32, u32)]| FleetInput {
         ready: Some(super::sources::ready_input(&tick(rows), &reused)),

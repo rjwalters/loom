@@ -68,6 +68,9 @@ const TABLE: &[(&str, Reloadability)] = &[
     // inside the tick loop body (`loom-daemon/src/role_runner.rs`), and
     // `loom-daemon status` already reports the live per-root value.
     ("autonomous.roleRunner", Reloadability::Live),
+    // Recomputed from the store snapshot after every fleet-sync pass
+    // (`pass_shard::refresh`, #11301), for every host at once.
+    ("autonomous.passShard", Reloadability::Live),
     // Per-repo approval/merge policy (#11674): `merge_policy::declared` is
     // read from the effective config on every `fleet.state` export.
     ("repos", Reloadability::Live),
@@ -149,6 +152,12 @@ mod tests {
         assert_eq!(classify("autonomous.roleRunner"), Reloadability::Live);
         assert_eq!(classify("autonomous.roleRunner.enabled"), Reloadability::Live);
         assert_eq!(classify("autonomous.roleRunner.onIdle.judge"), Reloadability::Live);
+    }
+
+    #[test]
+    fn pass_shard_subtree_is_live() {
+        assert_eq!(classify("autonomous.passShard.enabled"), Reloadability::Live);
+        assert_eq!(classify("autonomous.passShard.backupEvery"), Reloadability::Live);
     }
 
     #[test]

@@ -299,6 +299,7 @@ pub mod orphan_process_reaper;
 pub mod overlap_replay;
 pub mod parent_link;
 pub mod park_record;
+pub mod pass_shard;
 pub mod peer_claims;
 pub mod phase_join;
 pub mod pi_usage;

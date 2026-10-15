@@ -1894,6 +1894,48 @@ reports `hold`, not `stop`. `status --json` carries `fleet_store.state`
 (`proceed` / `hold` / `stop`); a transition — never the steady state — is also
 published on the event bus as `fleet.sync.state`.
 
+### Pass sharding (`autonomous.passShard`, #11301)
+
+Two per-repo read loops say the same thing on every host: the `loom:blocked`
+release pass (with the unnamed-queue pass that rides it) and the `fleet.state`
+collector's label listings. On N hosts each runs N times. With pass sharding on,
+each repo's pass runs on **one** host.
+
+| Key (machine tier, per host) | Default | Meaning |
+|---|---|---|
+| `autonomous.passShard.enabled` | `false` | This host takes part. |
+| `autonomous.passShard.backupEvery` | `6` | A backup runs the release pass every Nth due slot. |
+| `autonomous.passShard.maxStaleSecs` | `21600` | Past this age (since the forge last confirmed the store snapshot) the host unshards. |
+
+Set it in the fleet store, per host (`config.hosts.<host>.defaults`), never
+in a tracked `.loom/config.json`: every host reads every peer's flag from the
+same compiled `fleet.json`.
+
+- **Members.** A host is a member when its machine tier sets `enabled` and
+  `fleet.autoApply` (so it registers the whole store roster), and its run state
+  is `running`. A `paused` or `stopped` host leaves the ring at once. The ring is
+  recomputed from the cached snapshot after every fleet-sync pass, offline, so
+  a store change takes effect within one sync interval with no restart.
+- **Repos.** Only store-roster repos (`fleet: true|maintain`, not `firewall`)
+  are sharded. A root registered only locally runs unsharded.
+- **Owner and backup.** Rendezvous hashing (`pass_shard::rank`) orders the
+  members for each repo; rank 1 owns it, rank 2 is its backup. A leaving host
+  moves only its own repos, each to its backup. The release pass runs on the
+  owner, on the backup every `backupEvery`-th due slot (so a host that died
+  without a store change costs at most that many cadences, about 30 min), and
+  nowhere else (`skipped_pass_shard` in `stale_blocked_release.ticks`).
+  `fleet.state` lists only owned repos; held and ready rows are unchanged.
+- **Fail direction.** No ring, fewer than two members, this host not a member,
+  a ring older than `maxStaleSecs`, or `LOOM_PASS_SHARD=0` all run the pass, as
+  without sharding. `LOOM_PASS_SHARD` can only turn sharding off: peers cannot
+  see it.
+- **Only set it on hosts that run the work finder.** A member that serves no
+  release pass leaves the repos it owns unswept; such a host logs an `error!`.
+
+Rollout and rollback are fleet-store changes: set the key on a few hosts (they
+split the repos between them, the rest still run everything), then on the rest;
+remove it to roll back.
+
 ### Workspace resync (#10718)
 
 The same timer also keeps each registered repo's installed Loom at the version

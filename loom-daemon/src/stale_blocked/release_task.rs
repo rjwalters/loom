@@ -90,7 +90,12 @@ pub fn tick_once(loops: Loops, roots: &[PathBuf]) {
         let root_rr =
             crate::role_runner::resolve_enabled(&crate::role_runner::read_role_runner_config(root));
         match pre_gate(mode, served(loops, root_rr), rate_limited) {
-            Some(outcome) => record(root, outcome, None),
+            Some(outcome) => {
+                if outcome == Outcome::NotServed {
+                    crate::pass_shard::warn_if_member_not_serving(root);
+                }
+                record(root, outcome, None);
+            }
             None => {
                 let _ = release_gh::maybe_run(&gh_bin, root);
             }

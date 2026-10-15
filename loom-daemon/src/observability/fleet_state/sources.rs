@@ -619,6 +619,8 @@ pub(super) struct Reused {
     pub roots: Vec<(PathBuf, String)>,
     /// Lowercased slug to visibility. A repo missing here is private.
     pub visibility: BTreeMap<String, RepoVisibility>,
+    /// Managed repos another host lists under pass sharding (#11301).
+    pub unowned: BTreeSet<String>,
 }
 
 impl Reused {
@@ -659,10 +661,13 @@ pub(super) async fn gather(
     let held = held_sweeps(&workspace_pool.provisioned_registries(), |root| {
         slug_cache.get(root).map(|s| s.to_ascii_lowercase())
     });
-    let listings = review_listings(&roots).await;
-    let (curated, curated_eligible) = label_listings(&roots, super::outcomes::CURATED_LABEL).await;
+    // #11301: the label listings run only where this host owns the repo.
+    let (listing_roots, unowned) = super::shard_scope::split(&roots);
+    let listings = review_listings(&listing_roots).await;
+    let (curated, curated_eligible) =
+        label_listings(&listing_roots, super::outcomes::CURATED_LABEL).await;
     let (triage, triage_eligible) =
-        label_listings(&roots, super::outcomes::close::TRIAGE_LABEL).await;
+        label_listings(&listing_roots, super::outcomes::close::TRIAGE_LABEL).await;
     // `(awaiting_curation, awaiting_approval)` for each repo whose triage AND
     // curated listings were both read whole (#11955).
     let eligible: BTreeMap<String, (u32, u32)> = triage_eligible
@@ -693,6 +698,7 @@ pub(super) async fn gather(
             .map(|(root, slug)| (root.clone(), slug.to_ascii_lowercase()))
             .collect(),
         visibility: BTreeMap::new(),
+        unowned,
     };
     let champion = champion_by_slug(&reused.roots);
     let curator = curator_by_slug(&reused.roots);

@@ -228,7 +228,10 @@ What the rows cover is exactly what the host's reads saw:
 - **PRs under review**: every open PR under a review label. Each label's
   listing is walked page by page; a walk that fails, hits its page limit or
   sees the listing shift is a failed listing, so the repo's `census` is absent
-  and its earlier PR rows are kept, never sent as `removed`.
+  and its earlier PR rows are kept, never sent as `removed`. A repo another
+  host owns under pass sharding (`autonomous.passShard`, #11301) is not listed
+  here at all: it has no PR rows or `census` from this host, and when it moves
+  away its rows are sent once as `removed`, with no outcome facts.
 - **Ready queue**: every row the planner saw on the host's last work-finder
   tick. A repo whose ready listing the work finder walked to its last page is
   `ready_complete: true` and its `ready_wait` rows are diffed (#11139). A repo
