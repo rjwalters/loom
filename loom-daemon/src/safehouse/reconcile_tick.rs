@@ -160,7 +160,7 @@ impl ReconcileState {
         if forge_gate::suppressed("pr list (reconcile)", Path::new(&workspace_root)) {
             if self.deferred_since.is_none() {
                 log::info!(
-                    "safehouse: merge reconciliation deferred — rate-limit breaker cooling;                      each workspace catches up from its watermark once it clears (#12152)"
+                    "safehouse: merge reconciliation deferred — rate-limit breaker cooling; each workspace catches up from its watermark once it clears (#12152)"
                 );
                 self.deferred_since = Some(Utc::now());
             }
@@ -169,7 +169,7 @@ impl ReconcileState {
         }
         if let Some(since) = self.deferred_since.take() {
             log::info!(
-                "safehouse: rate-limit breaker cleared after {}s; merge reconciliation resuming                  (#12152)",
+                "safehouse: rate-limit breaker cleared after {}s; merge reconciliation resuming (#12152)",
                 (Utc::now() - since).num_seconds().max(0)
             );
         }
@@ -195,7 +195,7 @@ impl ReconcileState {
         .await
         else {
             log::info!(
-                "safehouse: reconcile pass over {workspace_root} got no forge answer;                  its watermark holds for the next pass (#12152)"
+                "safehouse: reconcile pass over {workspace_root} got no forge answer; its watermark holds for the next pass (#12152)"
             );
             feed::record_reconcile_pass(PassOutcome::Failed);
             return out;
@@ -210,7 +210,7 @@ impl ReconcileState {
         }
         feed::record_completions(Trigger::Reconcile, seed_only, found);
         log::info!(
-            "safehouse: reconcile pass over {workspace_root}: {} merged row(s) {}, {found} new              completion(s){} (#12152)",
+            "safehouse: reconcile pass over {workspace_root}: {} merged row(s) {}, {found} new completion(s){} (#12152)",
             pass.rows,
             since.map_or_else(
                 || "in the newest page".to_owned(),
@@ -224,7 +224,7 @@ impl ReconcileState {
         );
         if pass.saturated {
             log::warn!(
-                "safehouse: reconcile pass over {workspace_root} filled its page ({} rows);                  merges past it in this window are not narrated (#12152)",
+                "safehouse: reconcile pass over {workspace_root} filled its page ({} rows); merges past it in this window are not narrated (#12152)",
                 pass.rows
             );
         }
