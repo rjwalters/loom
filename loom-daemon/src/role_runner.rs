@@ -193,7 +193,7 @@ pub const DEFAULT_ARCHITECT_MAX_PROPOSALS: u64 = 5;
 /// session) before killing it. Generous — a role tick can involve several
 /// forge round-trips (list/enrich/label issues, review PRs) — but bounded so
 /// a wedged session can't block that role's loop forever.
-const DEFAULT_ROLE_TIMEOUT: Duration = Duration::from_secs(1800);
+pub(crate) const DEFAULT_ROLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Load-per-core (issue #6637) at or above which a ceiling-hit tick is
 /// classified as [`RoleTickOutcome::LoadSkipped`] instead of
@@ -878,6 +878,13 @@ pub trait RoleInvocationRunner {
     fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
         None
     }
+
+    /// Why the most recent invocation failed before it launched, so no
+    /// `role_attempt` span (and no [`trace_context`](Self::trace_context))
+    /// carries the class (#12028).
+    fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
+        None
+    }
 }
 
 /// The concrete [`RoleInvocationRunner`]: shells out to
@@ -915,6 +922,7 @@ pub struct ScriptRoleInvocationRunner {
     /// [`invoke`]: RoleInvocationRunner::invoke
     resolved_launch: Option<crate::role_tick_telemetry::ResolvedLaunch>,
     trace_context: Option<crate::observability::lifecycle::RoleTrace>,
+    unlaunched_failure: Option<crate::observability::lifecycle::RoleFailure>,
     /// Set by [`roll_resume`] when this runner relaunches a session a daemon
     /// roll paused (#10832), instead of starting a fresh tick.
     roll_resume: Option<roll_resume::RoleRollResume>,
@@ -933,6 +941,7 @@ impl ScriptRoleInvocationRunner {
             gh_bin: None,
             resolved_launch: None,
             trace_context: None,
+            unlaunched_failure: None,
             roll_resume: None,
         }
     }
@@ -1320,6 +1329,9 @@ pub struct RoleRunnerConfig {
     /// fleet host where the roots disagree, the effective ceiling for a given
     /// tick is that root's own — the tighter root simply refuses sooner.
     pub max_concurrent: Option<usize>,
+    /// `autonomous.roleRunner.championMode` (#11859), retired by #11909:
+    /// parsed only to warn. Champion always runs non-item ([`champion_mode`]).
+    pub champion_mode: Option<champion_mode::ChampionMode>,
 }
 
 /// Hand-rolled duration-string parser for
@@ -1491,6 +1503,7 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
+        champion_mode: champion_mode::parse_champion_mode(block),
     }
 }
 
@@ -1834,7 +1847,7 @@ pub fn resolve_on_idle_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
             );
         }
     }
-    out
+    champion_mode::without_step_roles(out, Some("onIdle"))
 }
 
 /// Age since `role`'s last completed tick at `root`, per
@@ -2191,8 +2204,10 @@ pub fn resolve_max_concurrent_for(repo_root: &Path) -> usize {
 /// The prompt string actually passed to `claude -p` for one dispatch of
 /// `spec`.
 ///
-/// Every role but `architect` resolves to its static [`RoleSpec::prompt`]
-/// verbatim (byte-for-byte the pre-#5656 behavior). `architect` additionally
+/// Every role but `architect` (and `champion`, which always appends
+/// `--non-item` since #11909) resolves
+/// to its static [`RoleSpec::prompt`] verbatim (byte-for-byte the pre-#5656
+/// behavior). `architect` additionally
 /// carries the resolved per-invocation proposal cap as a slash-command
 /// argument — `/loom:architect --max-proposals <n>` — which
 /// `architect.md`'s own "Argument Handling" section reads from `$ARGUMENTS`
@@ -2210,6 +2225,10 @@ pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String
             spec.prompt,
             resolve_architect_max_proposals(config)
         );
+    }
+    // #11909: Champion's item work is steps; its interval run is non-item.
+    if let Some(arg) = champion_mode::prompt_arg(spec.name) {
+        return format!("{} {arg}", spec.prompt);
     }
     spec.prompt.to_string()
 }
@@ -2246,35 +2265,6 @@ pub fn new_in_progress_guard() -> InProgressGuard {
 #[must_use]
 pub fn active_run_count(set: &InProgressGuard) -> usize {
     set.lock().unwrap_or_else(PoisonError::into_inner).len()
-}
-
-/// The daemon's single [`InProgressGuard`], registered once at startup so
-/// out-of-band readers (`loom-daemon status` via [`crate::ipc`]) can sample the
-/// live role-agent count without threading the `Arc` through the IPC server —
-/// the same process-global read-back shape
-/// [`crate::admission_brake::register_global`] uses for the brake.
-static GLOBAL_IN_PROGRESS: OnceLock<InProgressGuard> = OnceLock::new();
-
-/// Register the process-global [`InProgressGuard`] handle. Idempotent: only the
-/// first registration wins (there is exactly one guard per daemon process).
-pub fn register_global_in_progress(set: InProgressGuard) {
-    let _ = GLOBAL_IN_PROGRESS.set(set);
-}
-
-/// Live count of role invocations in flight across every managed workspace,
-/// read from the process-global guard (#6102).
-///
-/// `0` when no guard has been registered (role runner never spawned, or a
-/// non-daemon process such as the `calibrate` CLI) — honestly "no role agents
-/// observed here", the same zero-behavior-change contract
-/// [`crate::admission_brake::global_is_holding`] has.
-///
-/// This is the count that [`crate::types::DaemonStatusReport::active_role_agents`]
-/// reports, so `loom-daemon status` shows total agent load — sweeps *and* role
-/// agents — from one place rather than making an operator run `pgrep`.
-#[must_use]
-pub fn global_active_run_count() -> usize {
-    GLOBAL_IN_PROGRESS.get().map_or(0, active_run_count)
 }
 
 /// Monotonic process-wide count of successfully started role invocations.
@@ -2901,7 +2891,10 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
 ) -> RoleTickOutcome {
     crate::role_collision::probe_before_tick(root, role, interval);
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
-    let outcome = runner.invoke(role, prompt);
+    // #11819: a Curator on a repo with `curator.backlogTarget` carries the
+    // daemon-computed backlog level; every other dispatch is unchanged.
+    let outcome =
+        backlog::invoke_with_backlog(runner, root, role, prompt, backlog::count_open_issues);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
     outcome
 }
@@ -3874,6 +3867,10 @@ fn log_outcome_for_root_deduped(
     model_mismatch.insert(root.to_path_buf(), action.is_model_mismatch());
 }
 
+// The Curator's backlog level at dispatch (#11819) — see
+// `role_runner/backlog.rs`.
+pub mod backlog;
+
 // Concurrent per-(repository, role) dispatch, per-role budgets and queue
 // gating (#9391) — see `role_runner/concurrent_dispatch.rs`.
 pub mod concurrent_dispatch;
@@ -3906,7 +3903,7 @@ pub use roster::spawn_roster_heartbeat_task;
 
 // Model resolution + runtime reconciliation (#4501/#5001/#7894) —
 // see `role_runner/model_resolution.rs`.
-mod model_resolution;
+pub(crate) mod model_resolution;
 use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
     is_cli_default_model_sentinel, resolve_role_runner_effort, resolve_role_runner_model,
@@ -3915,6 +3912,12 @@ pub use model_resolution::{
 
 // Per-reason skipped-tick tallies, with a race-free per-thread view for
 // tests (#9409) — see `role_runner/skip_counters.rs`.
+// The process-global guard handle and its read-backs (#6102, #11847).
+mod in_progress_global;
+pub use in_progress_global::{
+    global_active_run_count, global_active_runs_by_role, register_global_in_progress,
+};
+
 mod skip_counters;
 pub use skip_counters::{
     load_skipped_count, model_runtime_mismatch_skip_count, no_token_pool_skip_count,
@@ -3924,6 +3927,10 @@ use skip_counters::{
     LOAD_SKIPPED_COUNT, MODEL_RUNTIME_MISMATCH_SKIP_COUNT, NO_TOKEN_POOL_SKIP_COUNT,
     POOL_EXHAUSTED_SKIP_COUNT,
 };
+
+// Champion non-item only, item roles off the interval (#11909); see
+// `role_runner/champion_mode.rs`.
+pub mod champion_mode;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

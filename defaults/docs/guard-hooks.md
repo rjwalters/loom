@@ -32,6 +32,27 @@ from the tracked `.loom-project/project.json` (or legacy `.loom/config.json`)
 through the tiered resolver. Implementation vs. policy are split: scripts machine-
 level, config per-repo.
 
+**Daemon-spawned sessions run the daemon's own release (2am#4501).** A host
+that updates `loom-daemon` from release artifacts never moves the machine checkout, so
+hooks run from it lagged the daemon that launched the session. The binary embeds
+its `defaults/` tree. On first use, `loom-daemon` unpacks the hook-runtime part of it
+(everything but `tests/`) once per distinct payload into
+`~/.local/share/loom-daemon/hooks-home/<version>-<sha>/`. It exports that path to
+every session it spawns as `LOOM_HOOKS_HOME`, and the wrapper prefers
+`$LOOM_HOOKS_HOME/defaults/hooks/<name>`. When the variable is unset or blank (an
+attended session), or the file is missing there, the wrapper falls back to the
+checkout, so nothing fails open that did not before. `loom-daemon hooks-home`
+prints the directory. `LOOM_HOOKS_HOME` set in the daemon's own environment is a
+pin, and set empty it turns the export off. Older copies are pruned only when they
+are outside the newest three and more than three days past their last use
+(`hooks_home.rs`). The tree is private to the user: the base is `0700`, no file or
+directory in it is group- or world-writable whatever the umask, and a copy that
+fails that check, or is not owned by the user, is unpacked again rather than
+reused. Hooks that log beside their own tree write `hook-errors.log` and the
+decision logs to `<hooks-home>/<key>/.loom/logs`, which moves with each release.
+`guard-background-subagents.sh` resolves its root as `/` there and stays enabled
+(stricter, not fail-open).
+
 Each user-scope entry is a **fail-open, self-gating** command wrapper, because a
 user-scope hook fires in *every* repo the operator opens:
 
@@ -175,7 +196,7 @@ outside that array for parsing reasons:
   (`guards.forceScope`), worktree/Bash write confinement
   (`guards.worktreeIsolation`), the stash-stack ask (`guards.stashScope`), the
   unowned cargo target dir deny (`guards.cargoTargetDir`, #11582), the shared
-  cargo target dir ask (`guards.cargoSharedTarget`, #10646), and the
+  cargo target dir deny (`guards.cargoSharedTarget`, #10646, #11625), and the
   remote-fleet-exec ask (`guards.remoteFleetExec`, #11568 — an ask, never a
   deny, so it is above the floor by construction). Each
   is off-able **by design** because each has a legitimate repo class for which it
@@ -922,7 +943,7 @@ env CARGO_TARGET_DIR="$(mktemp -d)" cargo nextest run       # DENIED ($TMPDIR)
 CARGO_TARGET_DIR=.loom/target-9 cargo check                 # DENIED (.loom/target-*)
 ```
 
-### Shared Cargo Target Dir Ask (`guards.cargoSharedTarget` / `LOOM_GUARD_CARGO_SHARED_TARGET`)
+### Shared Cargo Target Dir Deny (`guards.cargoSharedTarget` / `LOOM_GUARD_CARGO_SHARED_TARGET`)
 
 The deny above allows a build with **no** explicit target dir, because that
 normally means `<worktree>/target`. On a host whose `~/.cargo/config.toml` sets
@@ -933,21 +954,31 @@ artifacts outlive it and nothing reclaims them (#10646: 427 GB of
 `CARGO_TARGET_DIR`; an in-session Task subagent never goes through it.
 
 So the same verb (`loom-daemon cargo-target-dir guard`, tag
-`loom:cargo-shared-target`) **asks** when all of these hold: the cwd is in a
+`loom:cargo-shared-target`) **denies** when all of these hold: the cwd is in a
 Loom-managed worktree (`.loom-managed`); the build sets no `CARGO_TARGET_DIR`
 or `--target-dir` and the session carries none; and cargo's configured target
 dir lies outside the worktree, its per-worktree dir and `<repo>/.loom/targets/`.
 The configured dir is resolved the way cargo does: `CARGO_BUILD_TARGET_DIR`,
 then the closest `.cargo/config.toml` (or `.cargo/config`) from the cwd up,
 then `$CARGO_HOME/config.toml` (`~/.cargo` by default). A relative value is
-anchored at the parent of its `.cargo` dir. `make` never asks. The prompt names
+anchored at the parent of its `.cargo` dir. `make` never denies. The denial names
 the dir, where the setting came from, and the prefix to use instead:
 `CARGO_TARGET_DIR="<per-worktree marker dir>"` when the worktree has one
 (#8458), else `CARGO_TARGET_DIR="<worktree>/target"`.
 
-It is an ask, not a deny, because sharing a target dir is sometimes deliberate
-(with sccache, say). The verb prints the ask on exit 0, so a hook older than
-the ask treats it as an allow. Toggle (default on):
+It is a deny, not an ask (#11625), by the #7795 per-site rule (as with
+`cargo-clean-scope-outside-repo`). An ask has no answerer in a headless
+`claude -p` started outside `spawn-worker`, so it acts as a silent deny, and in
+an in-session sweep Claude Code shows an ask's reason to the human, not the
+model, so the agent never sees the prefix and hits the same ask again. A deny
+puts the reason in front of the model, which reruns the command with the
+prefix; nothing is lost, since nothing ran. Sharing a target dir is sometimes
+deliberate (with sccache, say), so that case keeps the toggle below. The verb
+prints `BLOCKED [cargo-shared-target]: …` and exits 1; a daemon that still
+prints the older `ASK [cargo-shared-target]` with exit 0 is treated as an
+allow (the rule is inert). `cargo --config build.target-dir=…` and an inline
+`CARGO_BUILD_TARGET_DIR=…` are not read and still fall through. Toggle
+(default on):
 
 1. **`LOOM_GUARD_CARGO_SHARED_TARGET` env var** (Claude Code settings `env`):
    `0`/`false`/`no` disables; `1`/`true`/`yes` forces on. Overrides config.

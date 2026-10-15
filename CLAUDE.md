@@ -5,8 +5,7 @@ This repository uses **Loom** for AI-powered development orchestration.
 **Installation Date**: 2026-04-21
 
 > **Operating core:** keep immediate dispatch instructions here. Put reference
-> details in `.loom/docs/*`, with a one-line pointer here; CI enforces the
-> instruction budget (`scripts/check-claude-md-budget.sh`). Completed migration
+> details in `.loom/docs/*`, with a one-line pointer here. Completed migration
 > history belongs in `docs/migration/` and ADRs.
 
 ## What is Loom?
@@ -95,9 +94,9 @@ label documents its own `Applied by:` owner). State transitions:
 - **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
   `loom:epic-phase` issues.
 
-`loom:frozen` means not now: every agent and daemon path ignores it; only a human removes it (#11743).
-`loom:operator` means "a human is needed" (engine stops, re-evaluable, unlike
-`loom:operator-only`; set by Champion's merge-risk hold). `loom:very-important` /
+Holds (#11795): `loom:blocked` (waiting; self-releases), `loom:operator` (a human must act or decide),
+`loom:frozen` (not now; only a human removes it).
+`loom:very-important` /
 `loom:important` reorder (not holds, not approval); every stage takes them first. Your
 queue: the pinned hold digest (#6877) and label queries in
 [`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
@@ -108,8 +107,8 @@ queue: the pinned hold digest (#6877) and label queries in
 
 ### Issues Are Suggestions (Role Autonomy)
 
-Filed issues are the *input queue*, not mandates. In autonomous mode **Curator, Builder, and Judge** may **close** (rationale commented first, then `--reason "not planned"`) or **rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no longer matches) an issue rather than build it as filed, when it is obsolete, duplicate, low value, or the wrong approach. **Never** close an issue that encodes a still-pending human decision — use `loom:blocked`/`loom:operator-only` instead. Guardrails: each role prompt's "Issues Are Suggestions" section (`.loom/roles/curator.md`, `builder.md`, `judge.md`).
-**Champion** gets one narrow addition (#7657): it may close a Hermit/Architect/Auditor proposal for the `premise-false` kind only — every recurring finding across its N=2 unrevised evaluations re-verified false on current `main` — `--reason "not planned"` after a rationale comment; any mixed finding set still escalates to `loom:operator-only` as before.
+Filed issues are the *input queue*, not mandates. In autonomous mode **Curator, Builder, and Judge** may **close** (rationale commented first, then `--reason "not planned"`) or **rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no longer matches) an issue rather than build it as filed, when it is obsolete, duplicate, low value, or the wrong approach. **Never** close an issue that encodes a still-pending human decision — use `loom:blocked`/`loom:operator` instead. Guardrails: each role prompt's "Issues Are Suggestions" section (`.loom/roles/curator.md`, `builder.md`, `judge.md`).
+**Champion** gets one narrow addition (#7657): it may close a Hermit/Architect/Auditor proposal for the `premise-false` kind only — every recurring finding across its N=2 unrevised evaluations re-verified false on current `main` — `--reason "not planned"` after a rationale comment; any mixed finding set still escalates to `loom:operator` as before.
 
 ## Git Worktree Workflow
 
@@ -235,8 +234,8 @@ Configuration lives in `.loom/config.json` (committed): a `terminals` array
 - **Runtime dispatch (`runtimes`)** — `spawn-worker.sh` selects the worker runtime
   (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
   [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).
-- **File size policy** — over-threshold files, agent-facing markdown, and each role's whole prompt prefix are ratcheted (may shrink, not grow), NOT refactor-on-touch: [`.loom/docs/file-size-policy.md`](.loom/docs/file-size-policy.md).
-- **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh`; a new script needs a category + reason in `scripts/shell-allowlist.txt` (CI-enforced, `contract` is baseline-only): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
+- **Large files** — no size gate; Hermit may propose splits.
+- **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh` (a review standard, not a CI gate): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
 - **Role-prompt authoring discipline** — pressure-test a non-trivial role-prompt/operator-dispatch-brief change against a resisting scenario, audit it for rule conflicts, and load-gate by default: [`.loom/docs/role-prompt-authoring.md`](.loom/docs/role-prompt-authoring.md).
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).
 - **Branch rulesets & repository settings** — at install, or via `scripts/install/setup-{branch-protection,repository-settings}.sh`.

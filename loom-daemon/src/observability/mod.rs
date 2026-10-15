@@ -110,10 +110,10 @@ pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;
 pub mod daemon_event;
+pub mod daemon_exit;
 pub mod daemon_lifecycle;
 pub mod endpoint_policy;
 pub mod exporter;
-pub mod fleet_state;
 mod ingest_key;
 pub mod lifecycle;
 pub mod llm_billing;
@@ -136,6 +136,7 @@ pub mod session_analysis;
 pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
+pub mod step_verdict;
 pub mod tracing;
 pub mod work_started;
 
@@ -659,6 +660,20 @@ pub fn global_export_statuses(
             (name.clone(), snapshot)
         })
         .collect()
+}
+
+/// The OTLP exporter's per-kind last-export times (Issue #12120); empty when
+/// no `otlp` exporter registered.
+#[must_use]
+pub fn global_otlp_kind_exports(
+) -> std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> {
+    GLOBAL_EXPORT_STATUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|map| map.get(ExporterKind::Otlp.name()))
+        .map(|status| status.kind_last_export())
+        .unwrap_or_default()
 }
 
 /// Process-global per-exporter queues (Issue #11124), keyed like
@@ -1250,14 +1265,6 @@ pub fn spawn_task(
         ingest_key.as_deref(),
         &relay_sinks,
     ));
-    // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
-    // built after every work-finder tick (#11161) and on the collector's
-    // snapshot pass.
-    fleet_state::register_sink(otlp_queues.clone(), &host_id);
-    if !otlp_queues.is_empty() {
-        ops_handles
-            .extend(fleet_state::spawn_tick_task(workspace_root.clone(), workspace_pool.clone()));
-    }
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless
     // `observability.liveOutput.enabled` is set. Registered over the

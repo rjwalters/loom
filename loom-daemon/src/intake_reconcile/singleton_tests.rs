@@ -194,6 +194,10 @@ struct Fake {
     /// `loom:triage`).
     post_answers: std::collections::BTreeMap<u32, Vec<String>>,
     remove_fails: bool,
+    /// Issue number → its `labeled` events (absent = events read failure).
+    events: std::collections::BTreeMap<u32, Vec<LabelEvent>>,
+    /// Labels whose removal fails.
+    remove_label_fails: bool,
     calls: Vec<String>,
 }
 
@@ -211,17 +215,24 @@ impl IntakeForge for Fake {
         Ok(self.listing.clone())
     }
 
+    fn may_write(&mut self, _: &Repo) -> bool {
+        self.calls.push("scope".into());
+        !self.write_denied
+    }
+
+    fn remove_triage(&mut self, _: &Repo, number: u32) -> bool {
+        self.calls.push(format!("delete {number}"));
+        !self.remove_fails
+    }
+}
+
+impl DemoteForge<Repo> for Fake {
     fn current_labels(&mut self, _: &Repo, number: u32) -> Result<Option<Vec<String>>> {
         self.calls.push(format!("reread {number}"));
         self.current
             .get(&number)
             .cloned()
             .ok_or_else(|| anyhow!("HTTP 502"))
-    }
-
-    fn may_write(&mut self, _: &Repo) -> bool {
-        self.calls.push("scope".into());
-        !self.write_denied
     }
 
     fn add_triage(&mut self, _: &Repo, number: u32) -> Option<Vec<String>> {
@@ -234,9 +245,22 @@ impl IntakeForge for Fake {
         })
     }
 
-    fn remove_triage(&mut self, _: &Repo, number: u32) -> bool {
-        self.calls.push(format!("delete {number}"));
-        !self.remove_fails
+    fn label_events(&mut self, _: &Repo, number: u32) -> Result<Vec<LabelEvent>> {
+        self.calls.push(format!("events {number}"));
+        self.events
+            .get(&number)
+            .cloned()
+            .ok_or_else(|| anyhow!("HTTP 502"))
+    }
+
+    fn remove_label(&mut self, _: &Repo, number: u32, label: &str) -> bool {
+        self.calls.push(format!("unlabel {number} {label}"));
+        !self.remove_label_fails
+    }
+
+    fn comment(&mut self, _: &Repo, number: u32, _: &str) -> bool {
+        self.calls.push(format!("comment {number}"));
+        true
     }
 }
 
@@ -245,6 +269,7 @@ fn row(number: u32, labels: &[&str]) -> IntakeRow {
         number,
         created_at: Some("2026-09-01T00:00:00Z".parse().unwrap()),
         labels: labels.iter().map(|s| (*s).to_string()).collect(),
+        author: None,
     }
 }
 
@@ -500,17 +525,29 @@ impl IntakeForge for Scoped {
     fn list_open(&mut self, repo: &Repo) -> Result<Vec<IntakeRow>> {
         self.0.list_open(repo)
     }
-    fn current_labels(&mut self, repo: &Repo, number: u32) -> Result<Option<Vec<String>>> {
-        self.0.current_labels(repo, number)
-    }
     fn may_write(&mut self, _: &Repo) -> bool {
         true
+    }
+    fn remove_triage(&mut self, repo: &Repo, number: u32) -> bool {
+        self.0.remove_triage(repo, number)
+    }
+}
+
+impl DemoteForge<Repo> for Scoped {
+    fn current_labels(&mut self, repo: &Repo, number: u32) -> Result<Option<Vec<String>>> {
+        self.0.current_labels(repo, number)
     }
     fn add_triage(&mut self, repo: &Repo, number: u32) -> Option<Vec<String>> {
         self.0.add_triage(repo, number)
     }
-    fn remove_triage(&mut self, repo: &Repo, number: u32) -> bool {
-        self.0.remove_triage(repo, number)
+    fn label_events(&mut self, repo: &Repo, number: u32) -> Result<Vec<LabelEvent>> {
+        self.0.label_events(repo, number)
+    }
+    fn remove_label(&mut self, repo: &Repo, number: u32, label: &str) -> bool {
+        self.0.remove_label(repo, number, label)
+    }
+    fn comment(&mut self, repo: &Repo, number: u32, body: &str) -> bool {
+        self.0.comment(repo, number, body)
     }
 }
 
@@ -786,4 +823,157 @@ fn the_inline_pass_asks_the_resolved_mode_before_its_cadence() {
     }
     assert!(!super::super::inline_pass_due(false, || false, || true), "disabled");
     set(None);
+}
+
+// ===== demotion of issues opened past intake (#11820) =====
+
+fn fresh(number: u32, labels: &[&str]) -> IntakeRow {
+    IntakeRow {
+        number,
+        created_at: Some("2026-10-03T10:00:00Z".parse().unwrap()),
+        labels: labels.iter().map(|s| (*s).to_string()).collect(),
+        author: Some("alice".into()),
+    }
+}
+
+fn labeled(label: &str, actor: &str, at: &str) -> LabelEvent {
+    LabelEvent {
+        label: label.into(),
+        actor: Some(actor.into()),
+        created_at: Some(at.parse().unwrap()),
+    }
+}
+
+/// Through `run_repo`: an issue opened with `loom:issue` and one with
+/// `loom:curated` are demoted; a later promotion is untouched; the ordinary
+/// unlabelled issue is labelled as before, with no raced/reverted count.
+#[test]
+fn run_repo_demotes_issues_opened_past_intake_and_leaves_promotions() {
+    let mut forge = Fake {
+        listing: vec![
+            fresh(1, &["loom:issue"]),
+            fresh(2, &["loom:curated"]),
+            fresh(3, &["loom:issue"]),
+            row(4, &[]),
+        ],
+        ..Fake::default()
+    };
+    forge
+        .events
+        .insert(1, vec![labeled("loom:issue", "alice", "2026-10-03T10:00:00Z")]);
+    forge
+        .events
+        .insert(2, vec![labeled("loom:curated", "alice", "2026-10-03T10:00:05Z")]);
+    forge
+        .events
+        .insert(3, vec![labeled("loom:issue", "rjwalters", "2026-10-03T11:00:00Z")]);
+    forge.current.insert(1, labels(&["loom:issue"]));
+    forge.current.insert(2, labels(&["loom:curated"]));
+    forge.current.insert(4, labels(&[]));
+    let report = run_repo(&mut forge, &repo("acme/demote-a"), now(), 50);
+    assert_eq!(
+        (report.demoted, report.labelled, report.raced, report.reverted),
+        (2, 1, 0, 0),
+        "{report:?}"
+    );
+    assert_eq!(
+        forge.calls,
+        [
+            "list acme/demote-a",
+            "scope",
+            "events 1",
+            "reread 1",
+            "post 1",
+            "unlabel 1 loom:issue",
+            "comment 1",
+            "events 2",
+            "reread 2",
+            "post 2",
+            "unlabel 2 loom:curated",
+            "comment 2",
+            "events 3",
+            "reread 4",
+            "post 4",
+        ]
+    );
+    // The pass folds it in.
+    let pass = run_pass(&mut Fake::default(), &[], now(), 50, &|| false);
+    assert_eq!(pass.demoted, 0);
+}
+
+/// Events reads share the cap: with cap 2 and two candidates, the unlabelled
+/// step gets nothing this pass (oldest candidates first).
+#[test]
+fn demotion_events_reads_count_against_the_cap() {
+    let mut forge = Fake {
+        listing: vec![
+            fresh(1, &["loom:issue"]),
+            fresh(2, &["loom:issue"]),
+            fresh(3, &["loom:issue"]),
+            row(4, &[]),
+        ],
+        ..Fake::default()
+    };
+    for n in [1, 2, 3] {
+        forge
+            .events
+            .insert(n, vec![labeled("loom:issue", "bob", "2026-10-03T10:00:00Z")]);
+    }
+    let report = run_repo(&mut forge, &repo("acme/demote-cap"), now(), 2);
+    assert_eq!((report.demoted, report.labelled), (0, 0));
+    assert_eq!(forge.calls, ["list acme/demote-cap", "scope", "events 1", "events 2"]);
+    // Both are remembered promotions; the next pass reads #3, then labels #4.
+    forge.calls.clear();
+    forge.current.insert(4, labels(&[]));
+    let report = run_repo(&mut forge, &repo("acme/demote-cap"), now(), 2);
+    assert_eq!(report.labelled, 1);
+    assert_eq!(
+        forge.calls,
+        [
+            "list acme/demote-cap",
+            "scope",
+            "events 3",
+            "reread 4",
+            "post 4"
+        ]
+    );
+}
+
+/// A failed events read stops the repo's pass with nothing written; a
+/// write-scope refusal writes nothing either.
+#[test]
+fn demotion_fails_closed() {
+    let mut shed = Fake {
+        listing: vec![fresh(1, &["loom:issue"]), row(4, &[])],
+        ..Fake::default()
+    };
+    let report = run_repo(&mut shed, &repo("acme/demote-shed"), now(), 50);
+    assert_eq!((report.demoted, report.labelled), (0, 0));
+    assert_eq!(shed.calls, ["list acme/demote-shed", "scope", "events 1"]);
+
+    let mut denied = Fake {
+        listing: vec![fresh(1, &["loom:issue"])],
+        write_denied: true,
+        ..Fake::default()
+    };
+    let report = run_repo(&mut denied, &repo("acme/demote-denied"), now(), 50);
+    assert!(report.denied);
+    assert_eq!(denied.calls, ["list acme/demote-denied", "scope"]);
+}
+
+/// The heartbeat carries the count and still reads a record written before
+/// the field existed.
+#[test]
+fn the_heartbeat_counts_demotions_and_reads_old_records() {
+    let pass = PassReport {
+        repos: 1,
+        demoted: 2,
+        ..PassReport::default()
+    };
+    let hb = next_heartbeat(None, "cap", now(), &pass, 1);
+    assert_eq!(hb.demoted, 2);
+    let mut old = serde_json::to_value(&hb).unwrap();
+    old.as_object_mut().unwrap().remove("demoted");
+    let back: PassHeartbeat = serde_json::from_value(old).unwrap();
+    assert_eq!(back.demoted, 0);
 }

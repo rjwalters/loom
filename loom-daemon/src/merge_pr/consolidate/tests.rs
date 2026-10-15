@@ -68,7 +68,7 @@ fn a_clean_overlapping_group_is_eligible() {
 
 #[test]
 fn every_operator_exclusion_and_hold_rejects() {
-    for label in INELIGIBLE_LABELS {
+    for label in INELIGIBLE_LABELS.iter() {
         let mut c = comp(1, H1, &["a.rs", "shared.rs"]);
         c.labels.push(label.to_string());
         let group = [c, comp(2, H2, &["b.rs", "shared.rs"])];
@@ -308,6 +308,7 @@ fn a_released_reservation_does_not_block_a_later_consolidation() {
         crate::claim_reconciliation::merge_sequence::release_comment_body(
             &old,
             crate::claim_reconciliation::merge_sequence::HoldAction::Release,
+            None,
         ),
     ];
     assert_eq!(crate::merge_pr::sequence::parse_live(&history), None);
@@ -780,7 +781,7 @@ fn the_ordering_pass_landing_release_retires_a_reservation() {
     use crate::claim_reconciliation::merge_sequence::{release_comment_body, HoldAction};
     let (source, mut bodies) = reserved(12, H2);
     let m = reservation_marker(99, CAND, &source, ATTEMPT);
-    bodies.push(release_comment_body(&m, HoldAction::Release));
+    bodies.push(release_comment_body(&m, HoldAction::Release, None));
     assert_eq!(live_marker(&source, &bodies), None);
 }
 

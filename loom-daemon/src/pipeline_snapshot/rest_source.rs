@@ -19,7 +19,8 @@
 //!   `gh pr list --label loom:operator` call runs **only when the REST
 //!   `loom:operator` count is non-zero**, which is usually not the case.
 //!
-//! So an unchanged root costs at most ~2 *billable* (non-`304`) calls.
+//! So an unchanged root costs at most ~2 *billable* (non-`304`) calls. The
+//! Champion-held count (#11905) reads the `loom:pr` listing `approved` uses.
 //!
 //! **Truncation:** the REST listing is a single 100-row page. When a label's
 //! page comes back full it may be truncated, and a capped `100` would be read
@@ -32,7 +33,7 @@ use anyhow::Result;
 
 use super::{GhPipelineSource, RepoPipelineSnapshot};
 use crate::forge_listing::{self, CachedListing, RestIssue};
-use crate::work_finder::PARK_LABELS;
+use crate::work_finder::{OPERATOR_HOLD_LABEL, PARK_LABELS};
 
 /// Whether a metric counts the issue rows or the PR rows of a REST listing
 /// (REST issue listings return both — [`RestIssue::is_pull_request`]).
@@ -92,18 +93,26 @@ struct Ctx<'a> {
     /// can never point every root's listing at one repo. `None` (not a git
     /// checkout) lets `gh` resolve the `{owner}/{repo}` placeholder from cwd.
     repo: Option<String>,
+    /// Listings already read this fetch, so two metrics over one label (the
+    /// `loom:operator` PR and issue counts, #11795) cost one read.
+    seen: std::cell::RefCell<std::collections::HashMap<String, CachedListing>>,
 }
 
 impl Ctx<'_> {
     /// The open rows carrying `label`, via the disk-persistent ETag cache.
     fn listing(&self, label: &str) -> Result<CachedListing> {
-        forge_listing::list_issues_cached_persistent(
+        if let Some(l) = self.seen.borrow().get(label) {
+            return Ok(l.clone());
+        }
+        let l = forge_listing::list_issues_cached_persistent(
             &self.src.gh_bin,
             Some(self.root),
             self.repo.as_deref(),
             label,
             "open",
-        )
+        )?;
+        self.seen.borrow_mut().insert(label.to_string(), l.clone());
+        Ok(l)
     }
 
     /// The pre-#9253 GraphQL count of open `side` rows labeled `label` — the
@@ -184,6 +193,7 @@ pub(super) fn fetch(src: &GhPipelineSource, root: &Path) -> RepoPipelineSnapshot
         src,
         root,
         repo: crate::credential_preflight::nwo_from_git_remote(root),
+        seen: std::cell::RefCell::default(),
     };
     let m = src.metrics;
     let mut rec = Recorder::default();
@@ -275,18 +285,64 @@ pub(super) fn fetch(src: &GhPipelineSource, root: &Path) -> RepoPipelineSnapshot
     }
     if m.operator_held {
         fetch_operator_held(&ctx, &mut rec, &mut snap);
+        snap.champion_held = rec.take(champion_held(&ctx));
     }
     if m.operator_only_issues {
-        snap.operator_only_issues = rec.take(ctx.count(
-            "loom:operator-only",
-            Side::Issue,
-            |_| true,
-            || ctx.graphql_label_count(Side::Issue, "loom:operator-only"),
-        ));
+        snap.operator_only_issues = rec.take(operator_held_issues(&ctx));
     }
 
     snap.error = rec.first_err;
     snap
+}
+
+/// Open issues held for a human (#8091, #11795): `loom:operator` issues, plus
+/// issues still carrying the retired `loom:operator-only` without it (not yet
+/// migrated), so the count neither drops nor doubles across the migration.
+fn operator_held_issues(ctx: &Ctx<'_>) -> Result<usize> {
+    const LEGACY: &str = "loom:operator-only";
+    let held = ctx.count(
+        OPERATOR_HOLD_LABEL,
+        Side::Issue,
+        |_| true,
+        || ctx.graphql_label_count(Side::Issue, OPERATOR_HOLD_LABEL),
+    )?;
+    let legacy = ctx.count(
+        LEGACY,
+        Side::Issue,
+        |r| !has_any(r, &[OPERATOR_HOLD_LABEL]),
+        || {
+            let search = format!("is:open label:{LEGACY} -label:{OPERATOR_HOLD_LABEL}");
+            ctx.graphql_search_count(Side::Issue, &search)
+        },
+    )?;
+    Ok(held + legacy)
+}
+
+/// Open PRs at the Champion-hold label shape (#11905): `loom:pr` +
+/// `loom:blocked` without an operator hold (markerless parks included). The `loom:pr` listing is shared with `approved`.
+fn champion_held(ctx: &Ctx<'_>) -> Result<usize> {
+    ctx.count(
+        "loom:pr",
+        Side::Pr,
+        |r| crate::champion_hold::held_approval_shape(&r.labels),
+        || ctx.graphql_search_count(Side::Pr, &champion_held_search_query()),
+    )
+}
+
+/// The GraphQL fallback search for [`champion_held`] on a full REST page:
+/// every operator-hold name excluded, as the REST filter does.
+fn champion_held_search_query() -> String {
+    // A comma is OR in a label qualifier: the REST shape counts every
+    // `is_blocked_hold` name, the retired ones included.
+    let blocked: Vec<&str> = crate::work_finder::BLOCKED_HOLD_NAMES
+        .iter()
+        .copied()
+        .collect();
+    let mut q = format!("is:open label:loom:pr label:{}", blocked.join(","));
+    for name in crate::work_finder::OPERATOR_HOLD_NAMES.iter() {
+        q.push_str(&format!(" -label:{name}"));
+    }
+    q
 }
 
 /// The three `loom:operator` metrics (Issue #8091). Count and age come from

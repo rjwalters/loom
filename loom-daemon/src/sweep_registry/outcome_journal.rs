@@ -977,6 +977,8 @@ impl SweepRegistry {
                 .map(ParkKind::failure_class),
             exit_code == Some(0),
         );
+        // Issue #11854: a reported `failure` never goes out without a class.
+        let failure_class = telemetry::ensure_failure_class(reported_result, failure_class);
         let process_result = result;
         let result = reported_result;
 
@@ -1233,8 +1235,11 @@ impl SweepRegistry {
         kind: &SweepKind,
         started_at: DateTime<Utc>,
     ) {
-        let SweepKind::Issue(issue) = kind else {
-            return;
+        let issue = match kind {
+            SweepKind::Issue(issue) => issue,
+            // A step writes no sweep checkpoint, so it has no phase to sample;
+            // its role is its phase (#11898).
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => return,
         };
         let checkpoint = self
             .config

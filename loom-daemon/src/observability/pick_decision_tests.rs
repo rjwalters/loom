@@ -181,6 +181,48 @@ fn a_halted_skip_carries_only_a_closed_vocabulary_cause() {
         && k.disposition == Some(QueueDisposition::WorkspaceHalted)));
 }
 
+/// #11858: an already-landed skip names its evidence, closed vocabulary only.
+#[test]
+fn an_already_landed_skip_carries_only_its_evidence_token() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::AlreadyLanded),
+        (2, QueueDisposition::AlreadyLanded),
+        (3, QueueDisposition::AlreadyLanded),
+    ]);
+    s.queue[0].detail = Some("journal_landed".to_string());
+    s.queue[1].detail = Some("forge_closed".to_string());
+    s.queue[2].detail = Some("landed by a free-text reason".to_string());
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    let details: Vec<Option<&str>> = r.skipped.iter().map(|k| k.detail.as_deref()).collect();
+    assert_eq!(details, vec![Some("journal_landed"), Some("forge_closed"), None]);
+}
+
+/// #11857: the outcome agrees with the tick result. A hold that covered the
+/// tick's work reads `halted`; one held root beside a healthy repo with
+/// candidates is a partial hold and the outcome follows the rows.
+#[test]
+fn a_partial_hold_is_not_a_halted_outcome() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::WorkspaceHalted),
+        (2, QueueDisposition::OpenPr),
+    ]);
+    s.halted = true;
+    s.held_roots = 1;
+    s.halt_partial = true;
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "none_dispatched");
+
+    s.queue.clear();
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "idle");
+
+    // A full hold still reads `halted`, as does a pre-#11857 summary that
+    // carries no `halt_partial` (the old meaning of `halted`).
+    s.halt_partial = false;
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "halted");
+}
+
 /// Role ticks have no work-finder disposition: the fields stay absent.
 #[test]
 fn a_role_skip_carries_no_disposition() {
@@ -267,6 +309,8 @@ fn an_empty_role_tick_records_cadence_with_no_candidates() {
     assert_eq!(r.role, "curator");
     assert_eq!(r.candidate_source, "none", "nothing observed");
     assert!(!r.decisions_observed);
+    // #11858: an empty queue still names its repo.
+    assert_eq!(r.repo.as_deref(), Some("o/r"));
 }
 
 fn gate_only(gate: Vec<(String, Vec<GateRow>)>) -> RoleObservation {
@@ -477,6 +521,7 @@ fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
         author_association: None,
         is_pull_request: is_pr,
         open_sub_issues: None,
+        labels_at: None,
     };
     let root = Path::new("/stash-test/a");
     record_gate_listing(
@@ -703,4 +748,98 @@ fn work_finder_record_carries_the_very_important_demotions() {
         .unwrap()
         .get("very_important_demoted")
         .is_none());
+}
+
+#[test]
+fn lane_plan_is_stashed_converted_and_drained_once() {
+    use crate::role_runner::concurrent_dispatch::lane_rule::RepoLane;
+    stash_lane_plan(
+        Path::new("/tmp/loom-10630-obs"),
+        vec![RepoLane {
+            root: "/tmp/loom-10630-obs".into(),
+            debt: 60,
+            wanted: 3,
+            lanes: 2,
+        }],
+    );
+    let lanes = take_lane_plan();
+    assert_eq!((lanes.len(), lanes[0].debt, lanes[0].wanted, lanes[0].lanes), (1, 60, 3, 2));
+    assert!(take_lane_plan().is_empty(), "drained");
+    let json = serde_json::to_value(&lanes).unwrap();
+    assert_eq!(json[0]["debt"], 60);
+}
+
+#[test]
+fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
+    use crate::step_dispatch::item_draw::{
+        weight_terms, AgeSource, Candidate, DrawRecord, Exclusion, ItemWeights,
+    };
+    use crate::work_finder::step_item::{Item, ItemState, Lane, PassReason, Step, Verdict};
+    assert!(item_draw_record(1, "h", 2, &[]).is_none());
+    let picked = Candidate {
+        item: Item {
+            issue: Some(7),
+            pr: Some(8),
+            state: ItemState::ReviewRequested,
+            verdict: Verdict::Step(Step::Judge),
+            lane: Lane::Normal,
+            send_back: false,
+        },
+        step: Step::Judge,
+        terms: weight_terms(
+            &ItemWeights::default(),
+            Lane::Normal,
+            crate::priority_pick::Level::Important,
+            30 * 1440,
+            AgeSource::Mirror,
+        ),
+    };
+    let draws = [DrawRecord {
+        draw_index: 0,
+        seed: 99,
+        pool_size: 3,
+        total_weight: 1_000_000,
+        roll: 5,
+        picked_index: 0,
+        picked: picked.clone(),
+    }];
+    let excluded = std::collections::BTreeMap::from([
+        (Exclusion::Pass(PassReason::Claimed), 2),
+        (Exclusion::PoolExhausted, 1),
+    ]);
+    let d = item_draw_record(
+        29_000_000,
+        "host-a",
+        17,
+        &[ItemDrawWorkspace {
+            repo: "o/r",
+            excluded: &excluded,
+            pool: std::slice::from_ref(&picked),
+            draws: &draws,
+            overflow: false,
+        }],
+    )
+    .unwrap();
+    assert_eq!(d.seed_scheme, "loom-draw/v2");
+    assert_eq!(d.tick_counter, "17");
+    assert_eq!(
+        (d.pools.len(), d.pools[0].pr, d.pools[0].weight),
+        (1, Some(8), d.draws[0].weight)
+    );
+    let step = &d.draws[0];
+    assert_eq!(step.number, 8, "a Judge step acts on the PR");
+    assert_eq!((step.priority, step.age_permille), (3, 2000));
+    assert_eq!((step.age_source.as_str(), step.step.as_str()), ("mirror", "judge"));
+    let counts: Vec<(&str, PickSkipReason, usize)> = d
+        .excluded
+        .iter()
+        .map(|e| (e.reason.as_str(), e.skip_reason, e.count))
+        .collect();
+    assert_eq!(
+        counts,
+        vec![
+            ("claimed", PickSkipReason::InFlight, 2),
+            ("pool_exhausted", PickSkipReason::Quota, 1)
+        ]
+    );
 }

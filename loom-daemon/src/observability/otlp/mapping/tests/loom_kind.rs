@@ -157,6 +157,13 @@ fn samples() -> Vec<TelemetryRecord> {
                     "stage": "doctor", "role": "doctor", "sweep_id": "s",
                     "stage_attempt": 1, "started_at": AT, "source": "sweep_checkpoint",
                     "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "backlog.level", "repo": "rjwalters/loom", "open": 412,
+                    "target": 140, "level": "strict", "dispatch_id": "role-curator-x",
+                    "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "daemon.exit", "exit_code": 143, "requested_by": "unknown",
+                    "relaunch_expected": false, "supervisor": "systemd",
+                    "in_flight_sweeps": [], "in_flight_fate": "die_with_cgroup",
+                    "observed_at": AT, "loom": p})),
     ]
 }
 

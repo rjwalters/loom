@@ -43,6 +43,11 @@
 //! - the agent `gh` front sends the reads it can classify to the gateway
 //!   profile ([`crate::agent_gh::read_route`]); everything else stays on the
 //!   session's credential (the writer);
+//! - a CLI subcommand that calls [`enable_cli`] (`labels undeclared`,
+//!   `labels migrate`) routes its facade reads like the daemon's when it runs
+//!   with [`DIR_ENV`] set to the daemon's published directory: how a host job
+//!   (the fleet captain's label-drift) reads through the gateway while
+//!   holding no GitHub credential of its own;
 //! - the writer profile is untouched: its token, no `api_host`.
 //!
 //! # Break-glass
@@ -63,7 +68,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::forge_identity::{Placement, RouteDecision, RouteRequest};
+use crate::forge_identity::{ExhaustCause, Placement, RouteDecision, RouteRequest};
 
 #[path = "forge_gateway/outage.rs"]
 pub mod outage;
@@ -87,7 +92,8 @@ pub const CONFIG_KEY: &str = "forge.gateway";
 pub const GATEWAY_APP_ID: &str = "gateway";
 
 /// Exported to agent sessions while the gateway is active: the directory
-/// holding the per-owner profiles. Absent (or removed) otherwise.
+/// holding the per-owner profiles. Absent (or removed) otherwise. Dispatched
+/// roles get it from [`crate::launch_env::apply_launch_env`] (#12207).
 pub const DIR_ENV: &str = "LOOM_GH_GATEWAY_DIR";
 
 /// `gh`'s update check is a request to `api.github.com` on its own schedule;
@@ -106,159 +112,14 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// never be committed, even by a stale install (#7818).
 pub const DIR_NAME: &str = "gh-config-gateway";
 
-/// Where an owner's key is read from. Holds a location, never a key.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyRef {
-    /// `ssm://<parameter>`.
-    Ssm(String),
-    /// `file:<path>`.
-    File(PathBuf),
-}
-
-impl KeyRef {
-    /// Parse `ssm://<parameter>` or `file:<path>`.
-    ///
-    /// # Errors
-    ///
-    /// Any other shape, or an empty location.
-    pub fn parse(spec: &str) -> Result<Self, String> {
-        let spec = spec.trim();
-        if let Some(p) = spec.strip_prefix("ssm://") {
-            let p = p.trim();
-            return if p.is_empty() {
-                Err("ssm:// needs a parameter name".into())
-            } else {
-                Ok(Self::Ssm(p.to_string()))
-            };
-        }
-        if let Some(p) = spec.strip_prefix("file:") {
-            let p = p.trim();
-            return if p.is_empty() {
-                Err("file: needs a path".into())
-            } else {
-                Ok(Self::File(PathBuf::from(p)))
-            };
-        }
-        Err("use file:<path> or ssm://<parameter>".into())
-    }
-
-    /// Read the key. The error names the source, never the value.
-    ///
-    /// # Errors
-    ///
-    /// When the source cannot be read, or holds no plausible key.
-    pub fn read(&self, region: Option<&str>) -> Result<String, String> {
-        use crate::telemetry_join::{credential_source, Credential, CredentialSpec};
-        let fetched = match self {
-            Self::Ssm(p) => {
-                // An explicit region always: a daemon's environment often
-                // has none, and the AWS CLI would then fail or guess.
-                let region = region.ok_or_else(|| {
-                    format!(
-                        "an ssm:// key ref needs a region: set {CONFIG_KEY}.region, or \
-                         AWS_REGION / AWS_DEFAULT_REGION in the daemon's environment"
-                    )
-                })?;
-                ssm_get(p, region)?
-            }
-            Self::File(p) => {
-                match credential_source(&CredentialSpec::File { path: p.clone() }, None)
-                    .credential()
-                {
-                    Ok(Credential::Bearer(key)) => key,
-                    Ok(_) => {
-                        return Err("the source does not hold a single-line gateway key".into())
-                    }
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-        };
-        if valid_key(&fetched) {
-            Ok(fetched)
-        } else {
-            Err("the source does not hold a single-line gateway key".into())
-        }
-    }
-}
-
-/// `aws ssm get-parameter` for `parameter` in `region`, decrypted. Only the
-/// parameter's name and the region are on the command line, never a value;
-/// an error names the parameter and the exit, never the output.
-fn ssm_get(parameter: &str, region: &str) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("aws");
-    cmd.args(ssm_args(parameter, region))
-        .stdin(std::process::Stdio::null());
-    match crate::proc_exec::run_bounded(cmd, SSM_TIMEOUT) {
-        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        }
-        Ok(crate::proc_exec::Completion::Exited(out)) => Err(format!(
-            "aws ssm get-parameter {parameter} ({region}) exited {}",
-            out.status.code().unwrap_or(-1)
-        )),
-        Ok(_) => Err(format!("aws ssm get-parameter {parameter} ({region}) timed out")),
-        Err(e) => Err(format!("aws ssm get-parameter {parameter}: {e}")),
-    }
-}
-
-/// The `aws` argv of [`ssm_get`].
-#[must_use]
-pub fn ssm_args(parameter: &str, region: &str) -> Vec<String> {
-    [
-        "ssm",
-        "get-parameter",
-        "--name",
-        parameter,
-        "--with-decryption",
-        "--region",
-        region,
-        "--query",
-        "Parameter.Value",
-        "--output",
-        "text",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect()
-}
-
-/// Deadline for one SSM read.
-const SSM_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The region an `ssm://` ref is read in: `forge.gateway.region`, else
-/// `AWS_REGION`, else `AWS_DEFAULT_REGION` (the AWS CLI's own order), each
-/// only when it is a plausible region name. `None` refuses `ssm://` refs.
-#[must_use]
-pub fn resolve_region(
-    configured: Option<&str>,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Option<String> {
-    configured
-        .map(str::to_string)
-        .or_else(|| env("AWS_REGION"))
-        .or_else(|| env("AWS_DEFAULT_REGION"))
-        .map(|r| r.trim().to_string())
-        .filter(|r| valid_region(r))
-}
-
-/// `us-east-1`-shaped: lowercase letters, digits and dashes.
-#[must_use]
-pub fn valid_region(r: &str) -> bool {
-    (4..=32).contains(&r.len())
-        && r.contains('-')
-        && r.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-/// A key is one token of URL-safe characters: anything else could not be
-/// written into `hosts.yml` as-is.
-#[must_use]
-pub fn valid_key(key: &str) -> bool {
-    (16..=512).contains(&key.len())
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.~+/=".contains(&b))
-}
+// The key ref and the SSM read are shared with `forge.mirror`
+// (crate::key_ref, crate::aws_ssm); re-exported so this module's callers and
+// tests keep their paths.
+pub use crate::aws_ssm::{
+    first_line, parse_aws_profile, resolve_region, ssm_args, ssm_command, valid_aws_profile,
+    valid_region, AwsAccess, AwsProfile, AWS_IDENTITY_ENV,
+};
+pub use crate::key_ref::{valid_key, KeyRef};
 
 /// `forge.gateway`, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,13 +131,18 @@ pub struct GatewayConfig {
     /// `forge.gateway.region`: the AWS region `ssm://` refs are read in,
     /// when set (else the environment's, [`resolve_region`]).
     pub region: Option<String>,
+    /// `forge.gateway.awsProfile`: a named profile for `ssm://` reads, for
+    /// a host whose relay-key grant is not its instance role. Unset, the
+    /// read runs as the instance role; invalid, `ssm://` refs are refused
+    /// ([`crate::aws_ssm`]).
+    pub aws_profile: AwsProfile,
 }
 
 impl GatewayConfig {
     /// A stable digest of what the profiles depend on, keys excluded.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        format!("{}|{:?}|{:?}", self.api_host, self.key_refs, self.region)
+        format!("{}|{:?}|{:?}|{:?}", self.api_host, self.key_refs, self.region, self.aws_profile)
     }
 }
 
@@ -288,27 +154,7 @@ impl GatewayConfig {
 ///
 /// A reason the origin is refused.
 pub fn api_host_of(origin: &str) -> Result<String, String> {
-    let o = origin.trim();
-    let host = match o.split_once("://") {
-        Some(("https", rest)) => rest,
-        Some((scheme, _)) => return Err(format!("origin must be https, not {scheme}")),
-        None => o,
-    };
-    let host = host.strip_suffix('/').unwrap_or(host).to_ascii_lowercase();
-    // `github.com.` is GitHub too: compare and store without the root dot.
-    let host = host.strip_suffix('.').unwrap_or(&host).to_string();
-    let ok = host.contains('.')
-        && !host.starts_with(['.', '-'])
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
-    if !ok {
-        return Err("origin must be a bare host name or https://<host>".into());
-    }
-    if host == "github.com" || host.ends_with(".github.com") {
-        return Err("origin must be the gateway, not GitHub".into());
-    }
-    Ok(host)
+    crate::key_ref::https_host(origin, "the gateway")
 }
 
 /// Parse `forge.gateway` from the effective config. `None` when it is
@@ -374,11 +220,13 @@ pub fn parse(effective: &Value) -> (Option<GatewayConfig>, Vec<String>) {
             None
         }
     };
+    let aws_profile = parse_aws_profile(block, CONFIG_KEY, &mut warnings);
     (
         Some(GatewayConfig {
             api_host,
             key_refs,
             region,
+            aws_profile,
         }),
         warnings,
     )
@@ -435,12 +283,63 @@ pub fn active() -> Option<Active> {
 /// The front's half: honour [`DIR_ENV`] only when the `gh` this front execs
 /// (`next_gh`) is the one the daemon version-checked. Once per process.
 pub fn enable_front(next_gh: &Path) {
-    let base = std::env::var_os(DIR_ENV)
+    let _ = FRONT.set(front_base(std::env::var_os(DIR_ENV), next_gh, SystemTime::now()));
+}
+
+/// A CLI subcommand's half (2AMLogic/2am#4367 P4): a `loom-daemon
+/// <subcommand>` run by a host job (the fleet captain's label-drift job) is
+/// neither the daemon nor the agent front, so without this its reads never
+/// see the gateway and go to whatever `GH_CONFIG_DIR` it inherited. It
+/// honours [`DIR_ENV`] on the front's terms: only when the `gh` the facade
+/// will exec ([`crate::gh_invocation::resolver::resolve`]) is the one the
+/// daemon version-checked, and not during a front outage, from a checked base
+/// ([`publish::safe_base`]). The variable
+/// names a directory, never a key. A no-op in the daemon, whose own
+/// published set always wins ([`profile_for`]), and once per process (also a
+/// no-op after [`enable_front`] ran in the same process); unset,
+/// nothing changes. A CLI that makes forge reads calls it before the first.
+/// A gateway outage it hits is recorded beside the profiles
+/// ([`note_outage_from_front`]).
+pub fn enable_cli() {
+    if DAEMON.get().is_some() {
+        return;
+    }
+    let program = crate::gh_invocation::resolver::resolve().program;
+    let _ = FRONT.set(cli_base(std::env::var_os(DIR_ENV), &program, SystemTime::now()));
+}
+
+/// [`enable_cli`]'s decision: `program` is a path or a bare name looked up
+/// on `PATH`, as the facade will run it.
+fn cli_base(dir_env: Option<OsString>, program: &str, now: SystemTime) -> Option<PathBuf> {
+    let gh = publish::canonical_program(program)?;
+    front_base(dir_env, &gh, now)
+}
+
+/// The base directory a non-daemon process may route through: [`DIR_ENV`]'s
+/// value, when set, a [`publish::safe_base`], its marker names `gh` and no
+/// front outage holds.
+fn front_base(dir_env: Option<OsString>, gh: &Path, now: SystemTime) -> Option<PathBuf> {
+    dir_env
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .filter(|base| publish::gh_marker_matches(base, next_gh))
-        .filter(|base| !outage::front_outage_active(base, SystemTime::now()));
-    let _ = FRONT.set(base);
+        .filter(|base| publish::safe_base(base))
+        .filter(|base| publish::gh_marker_matches(base, gh))
+        .filter(|base| !outage::front_outage_active(base, now))
+}
+
+/// After the facade withdrew the gateway for an outage in a non-daemon
+/// process (the agent front's facade reads, a CLI): record it beside the
+/// profiles, as the front's own passthrough does
+/// ([`outage::note_front_outage`]), so the next process (a timer's next
+/// `labels` run) skips the gateway for the window instead of retrying it
+/// once per owner. A no-op in the daemon and with no adopted base.
+pub(crate) fn note_outage_from_front() {
+    if DAEMON.get().is_some() {
+        return;
+    }
+    if let Some(Some(base)) = FRONT.get() {
+        outage::note_front_outage(base);
+    }
 }
 
 /// Whether any gateway profile can route in this process. `false` while
@@ -469,18 +368,54 @@ pub fn profile_for(owner: &str) -> Option<PathBuf> {
         FRONT.get()?.clone()?
     };
     let dir = base.join(&owner);
-    dir.join("hosts.yml").is_file().then_some(dir)
+    if !dir.join("hosts.yml").is_file() {
+        return None;
+    }
+    // A front or CLI takes the base from its environment: check the profile
+    // too. The daemon routes only what it published itself.
+    (DAEMON.get().is_some() || publish::safe_profile(&dir)).then_some(dir)
 }
 
 /// The variables an agent session gets: `GH_NO_UPDATE_NOTIFIER=1` always,
-/// and [`DIR_ENV`] set while the gateway is active, removed (`None`)
-/// otherwise so an inherited value can never route.
+/// [`DIR_ENV`] while the gateway is active, and the reader root
+/// ([`crate::forge_identity::FRONT_ROOT_ENV`]) the front's served reads fall
+/// back to. `None` removes a variable.
+///
+/// In the daemon, [`DIR_ENV`] is what it published, so an inherited value can
+/// never route. Anywhere else (the `loom-daemon worker` process
+/// `spawn-worker.sh` starts and then `exec`s into the agent) it is the value
+/// this process inherited from the daemon, when that is still a
+/// [`publish::safe_base`]. Before #12207 such a process computed `None`
+/// here, having published nothing itself, and stripped the variable from
+/// every dispatched agent: the front's reads then all went to the writer.
 #[must_use]
 pub fn agent_env() -> Vec<(&'static str, Option<OsString>)> {
+    let gateway = match DAEMON.get() {
+        Some(_) => active().map(|a| a.base.into_os_string()),
+        None => inherited_base(std::env::var_os(DIR_ENV)),
+    };
     vec![
         (NO_UPDATE_NOTIFIER_ENV, Some(OsString::from("1"))),
-        (DIR_ENV, active().map(|a| a.base.into_os_string())),
+        (DIR_ENV, gateway),
+        (
+            crate::forge_identity::FRONT_ROOT_ENV,
+            crate::forge_identity::agent_reader_root(),
+        ),
     ]
+}
+
+/// A non-daemon spawner's [`DIR_ENV`]: `inherited` when it names a
+/// [`publish::safe_base`], else `None`.
+fn inherited_base(inherited: Option<OsString>) -> Option<OsString> {
+    inherited.filter(|v| !v.is_empty() && publish::safe_base(Path::new(v)))
+}
+
+/// Whether the front may trust a profile directory it was pointed at by its
+/// environment (a gateway or a reader `GH_CONFIG_DIR`): see
+/// [`publish::safe_profile`].
+#[must_use]
+pub fn trusted_profile(dir: &Path) -> bool {
+    publish::safe_profile(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -490,9 +425,54 @@ pub fn agent_env() -> Vec<(&'static str, Option<OsString>)> {
 /// The read router the facade and the conditional reads use: the gateway
 /// profile for the repo's owner when one is live and not withdrawn, else
 /// [`crate::forge_identity::route_read`] unchanged.
+///
+/// A withdrawn gateway with no reader pool behind it is
+/// [`ExhaustCause::Withdrawn`], not [`RouteDecision::NoPool`]: "no pool"
+/// sends every read to the writer, and the gateway's outage withdrawal
+/// (#12101) would then put a gateway-only host's deferrable reads on the
+/// dispatch App for as long as it lasts (2026-10-15).
 #[must_use]
 pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
-    decide(req, now, &profile_for).unwrap_or_else(|| crate::forge_identity::route_read(req, now))
+    if let Some(decision) = decide(req, now, &profile_for) {
+        return decision;
+    }
+    let pool = crate::forge_identity::route_read(req, now);
+    let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo).to_ascii_lowercase();
+    let gateway_until = if owner.is_empty() || profile_for(&owner).is_none() {
+        None
+    } else {
+        withdrawn_until(&owner, req, now)
+    };
+    past_withdrawn_gateway(pool, gateway_until)
+}
+
+/// The reader pool's answer `pool`, unless it is [`RouteDecision::NoPool`]
+/// while the owner's gateway is withdrawn until `gateway_until`: then an
+/// [`ExhaustCause::Withdrawn`] exhaustion until then.
+#[must_use]
+pub fn past_withdrawn_gateway(
+    pool: RouteDecision,
+    gateway_until: Option<SystemTime>,
+) -> RouteDecision {
+    match (pool, gateway_until) {
+        (RouteDecision::NoPool, Some(until)) => RouteDecision::Exhausted {
+            until,
+            cause: ExhaustCause::Withdrawn,
+        },
+        (pool, _) => pool,
+    }
+}
+
+/// When the gateway's App-wide or scoped withdrawal for `owner` ends, if one
+/// is live (a coverage withdrawal from one repo is not counted).
+fn withdrawn_until(owner: &str, req: &RouteRequest<'_>, now: SystemTime) -> Option<SystemTime> {
+    [
+        crate::forge_read_pool::withdrawn_until(GATEWAY_APP_ID, now),
+        crate::forge_read_pool::scoped_withdrawal_until(GATEWAY_APP_ID, owner, req.resource, now),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 /// The gateway's answer for `req`, with the profile lookup injected.
@@ -518,6 +498,24 @@ pub fn decide(
         app_id: GATEWAY_APP_ID.to_string(),
         placement: Placement::Home,
     })
+}
+
+/// `decision`, unless it is the gateway: then the reader pool's answer for
+/// `req`. For a read rerunning past a gateway fault that did not withdraw it
+/// ([`outage::Fault::Rerun`]), so the rerun reaches the readers before the
+/// writer.
+#[must_use]
+pub fn past_gateway(
+    decision: RouteDecision,
+    req: &RouteRequest<'_>,
+    now: SystemTime,
+) -> RouteDecision {
+    match decision {
+        RouteDecision::Reader { ref app_id, .. } if app_id == GATEWAY_APP_ID => {
+            crate::forge_identity::route_read(req, now)
+        }
+        other => other,
+    }
 }
 
 /// A gateway failure withdraws it through the reader tables

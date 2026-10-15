@@ -363,7 +363,7 @@ fn a_stalled_chain_escalates_once_naming_head_action_and_held_prs() {
         "no star-liveness marker (#11104)"
     );
     assert!(body.contains("**Operator needed**"), "{body}");
-    assert!(body.contains("merge decision on #5"), "{body}");
+    assert!(body.contains("decide #5"), "{body}");
     assert!(body.contains("#12") && body.contains("#11"), "{body}");
     assert!(body.contains("36h"), "{body}");
     assert!(chain.key().starts_with("sequence-stall:5:"));

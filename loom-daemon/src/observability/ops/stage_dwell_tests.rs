@@ -10,6 +10,7 @@ use super::{
     closing_refs, parse_label_times, stage_points, DwellSample, RepoInput, Sampler, StageFetcher,
     StageItem, BUILDING, CURATED, FETCH_BUDGET, ISSUE, REVIEW_REQUESTED, STAGE_LABELS,
 };
+use crate::observability::ops::stage_events::LabelTimes;
 use crate::telemetry::ops::{bounded_labels, MetricName, MetricPoint};
 
 fn at(secs: i64) -> DateTime<Utc> {
@@ -29,9 +30,14 @@ impl StageFetcher for Fake {
         _root: &Path,
         _slug: &str,
         number: u32,
-    ) -> Option<BTreeMap<String, DateTime<Utc>>> {
+        _label: &str,
+        _max_pages: usize,
+    ) -> LabelTimes {
         self.reads += 1;
-        Some(self.labels.get(&number).cloned().unwrap_or_default())
+        LabelTimes {
+            times: Some(self.labels.get(&number).cloned().unwrap_or_default()),
+            pages: 1,
+        }
     }
     fn merged_at(
         &mut self,
@@ -67,6 +73,7 @@ fn repo(listings: &[(&'static str, Vec<StageItem>)]) -> RepoInput {
         slug: "acme/app".into(),
         root: PathBuf::from("/w/app"),
         listings: STAGE_LABELS.iter().map(|l| (*l, Vec::new())).collect(),
+        queue: None,
     };
     for (label, items) in listings {
         input.listings.insert(label, items.clone());
@@ -271,7 +278,7 @@ fn a_captain_that_lost_a_repo_past_the_bound_baselines_it_instead_of_replaying()
 }
 
 #[test]
-fn points_are_delta_pairs_and_gauges_labelled_by_state_only() {
+fn points_are_delta_pairs_and_gauges_labelled_by_state_and_repo() {
     let samples = [
         DwellSample {
             stage: "created_to_curated",
@@ -291,15 +298,21 @@ fn points_are_delta_pairs_and_gauges_labelled_by_state_only() {
         &MetricPoint::int(MetricName::ForgeStageDwellSamples, 2)
             .label("state", "created_to_curated")
     ));
-    assert!(points
-        .contains(&MetricPoint::int(MetricName::ForgeStageItems, 2).label("state", "curated")));
-    assert!(points.contains(
-        &MetricPoint::int(MetricName::ForgeStageItems, 0).label("state", "review_requested")
-    ));
+    let items = |n, state: &str| {
+        MetricPoint::int(MetricName::ForgeStageItems, n)
+            .label("state", state)
+            .label("repo", "acme/app")
+    };
+    assert!(points.contains(&items(2, "curated")));
+    assert!(points.contains(&items(0, "review_requested")));
     for point in &points {
         assert_eq!(bounded_labels(&point.labels), point.labels);
-        assert!(point.labels.keys().all(|k| k == "state"));
+        assert!(point.labels.keys().all(|k| k == "state" || k == "repo"));
     }
+    // No completed open-items walk: the queue states are absent, not 0.
+    assert!(!points
+        .iter()
+        .any(|p| p.labels.get("state").is_some_and(|s| s == "triage")));
     assert!(stage_points(&[], &[]).is_empty(), "no repos listed: no gauges");
 }
 
@@ -388,4 +401,60 @@ fn prs_waiting_on_budget_are_not_dropped_as_failures() {
         total += stage(&samples, "building_to_review_requested").len();
     }
     assert_eq!(total, n, "every PR is sampled once the budget reaches it");
+}
+
+/// 2026-10-15: the per-item Observability read is named (never the generic
+/// `api.rest`, which hid per-item history reads in the writer's spend) and
+/// carries the Observability class, which never routes to the writer while a
+/// reader pool exists. (The `fleet_state.*` reads went with their producer,
+/// #11301.)
+#[test]
+fn per_item_observability_reads_are_named_and_observability_class() {
+    use crate::gh_invocation::{Operation, ReadClass};
+    let root = Path::new("/nonexistent");
+    let op = super::MERGED_AT_OP;
+    assert!(Operation::is_valid(op), "{op}");
+    assert_ne!(op, "api.rest");
+    let inv = super::gh_json_invocation(root, op, "repos/acme/widget/issues/7/events");
+    assert_eq!(inv.operation().as_str(), op);
+    assert_eq!(inv.class(), ReadClass::Observability, "{op}");
+}
+
+// #12203: the kill switch. Off (the default) a pass makes no forge call.
+
+#[test]
+fn the_sampler_is_off_by_default_and_never_due() {
+    let off = super::Settings::from_effective(&serde_json::json!({}));
+    assert_eq!(off, super::Settings::default());
+    assert!(!off.enabled);
+    assert!(!off.due(None, at(0)));
+    assert!(!off.due(Some(at(0)), at(100_000)));
+    // Malformed is off too.
+    let junk = super::Settings::from_effective(
+        &serde_json::json!({"observability": {"stageDwell": {"enabled": "yes"}}}),
+    );
+    assert!(!junk.enabled);
+    // `claim_pass` refuses an off pass before any listing is attempted.
+    assert!(!super::claim_pass(off, at(0)));
+}
+
+#[test]
+fn switched_on_it_samples_every_pass_or_every_interval() {
+    let on = super::Settings::from_effective(
+        &serde_json::json!({"observability": {"stageDwell": {"enabled": true}}}),
+    );
+    assert!(on.enabled && on.interval_secs.is_none());
+    assert!(on.due(None, at(0)));
+    assert!(on.due(Some(at(0)), at(1)));
+    let spaced = super::Settings::from_effective(&serde_json::json!({
+        "observability": {"stageDwell": {"enabled": true, "intervalSecs": 900}}
+    }));
+    assert_eq!(spaced.interval_secs, Some(900));
+    assert!(spaced.due(None, at(0)));
+    assert!(!spaced.due(Some(at(0)), at(899)));
+    assert!(spaced.due(Some(at(0)), at(900)));
+    let zero = super::Settings::from_effective(&serde_json::json!({
+        "observability": {"stageDwell": {"enabled": true, "intervalSecs": 0}}
+    }));
+    assert_eq!(zero.interval_secs, None);
 }

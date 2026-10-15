@@ -140,6 +140,7 @@ pub mod agent_skills;
 pub mod api_keys_pool;
 pub mod auto_update;
 pub mod autonomy_marker;
+pub mod aws_ssm;
 pub mod branch_update;
 pub mod build_slot;
 pub mod calibrate;
@@ -147,7 +148,10 @@ pub mod capability;
 pub mod capacity;
 /// The `loom:cargo-target-dir` guard: deny a cargo build into an unowned target dir (#11582).
 pub mod cargo_target_guard;
+pub mod champion_hold;
 pub mod ci_telemetry;
+/// Claim liveness from the label registry's `stale_after_minutes` (#11898).
+pub mod claim_liveness;
 pub mod claim_reconciliation;
 pub mod classify_error;
 pub mod cmd_out;
@@ -173,7 +177,6 @@ pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
-pub mod dependabot_labels;
 pub mod disk_admission;
 pub mod disk_footprint;
 pub mod disk_full_halt;
@@ -219,6 +222,7 @@ pub mod forge_listing;
 pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_merge_queue;
+pub mod forge_mirror;
 pub mod forge_parser;
 pub mod forge_pr_congestion;
 pub mod forge_priority_labels;
@@ -245,6 +249,7 @@ pub mod guards_status;
 pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;
+pub mod hooks_home;
 pub mod host_affinity;
 pub mod host_breaker;
 pub mod host_identity;
@@ -262,7 +267,10 @@ pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
+// #11855: bound Judge re-runs on a PR whose passes end without a verdict.
 pub mod journal;
+pub mod judge_backstop;
+pub mod key_ref;
 pub mod kimi_usage;
 pub mod label_registry;
 pub mod launch_env;
@@ -296,6 +304,8 @@ pub mod pi_usage;
 pub mod pipeline_snapshot;
 pub mod points_marker;
 pub mod pr_latency;
+// #11931: a terminated role run's PR leases are released on its behalf.
+pub mod pr_lease_reap;
 pub mod pr_planning;
 pub mod preflight;
 pub mod premise_check;
@@ -360,12 +370,12 @@ pub mod self_update;
 pub mod serve;
 pub mod session_reconcile;
 pub mod session_status;
-pub mod shell_budget;
 pub mod short_hash;
 pub mod signoz_read;
 pub mod stale_blocked;
 pub(crate) mod stale_token_retry;
 pub mod startup_adoption;
+pub mod startup_jitter;
 pub mod stash_issue_state;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
@@ -378,6 +388,10 @@ pub mod status_budget;
 /// needs (#10787): one list for `--section` parsing, `--help`, the wire request
 /// and the renderer's key filter.
 pub mod status_section;
+pub mod step_dispatch;
+/// The role a step runs and the claim it holds (#11898): `SweepKind::Step`'s
+/// role, its claim label and its restore stage.
+pub mod step_role;
 /// `points:*` story-point size labels (#9432, epic #9429) — the one parser both
 /// telemetry consumers (`sweep.started` at dispatch, `sweep.outcome` at the
 /// terminal transition) resolve points through, including the daemon-side
@@ -439,6 +453,7 @@ pub mod watchdog;
 pub mod watchdog_provisioning_guard;
 pub mod weighted_draw;
 pub mod work_finder;
+pub mod work_finder_guard;
 pub mod worker_spawn;
 pub mod workspace_hold;
 pub mod workspace_pool;

@@ -90,8 +90,6 @@ impl WorkSource for GhWorkSource {
         // A label-transition write, so it runs on every tick, outside the gate.
         if let Some(root) = self.cwd.as_deref() {
             crate::intake_reconcile::maybe_run(&self.gh_bin, root);
-            // The `loom:blocked` release pass (#10556) has its own task since
-            // #10763: `crate::stale_blocked::release_task`.
         }
         // Event-gated polling (#9255, opt-in `forgeEvents.pollGating`, default
         // off): while the feed is `healthy`, a repo with no event since its
@@ -126,6 +124,15 @@ impl WorkSource for GhWorkSource {
     fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
         let label = crate::priority_pick::VERY_IMPORTANT_LABEL;
+        // 2am#4367 P5: a discovery listing, so the mirror may serve it.
+        if let Some(rows) = mirror_rows(cwd, repo, label, true) {
+            return Some(
+                rows.into_iter()
+                    .filter(|r| !r.is_pull_request)
+                    .map(|r| WorkItem::with_created_at(r.number, r.labels, r.created_at))
+                    .collect(),
+            );
+        }
         match crate::forge_listing::list_issues_cached_paged_as(
             "work_finder",
             gh,
@@ -224,7 +231,15 @@ impl GhWorkSource {
     /// 1 failing is an error. Without `all_pages`, page 1 alone.
     fn list_label(&mut self, label: &str, all_pages: bool) -> Result<Vec<WorkItem>> {
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
-        let listing = if all_pages {
+        // 2am#4367 P5: the candidate listing from the state mirror when the
+        // repo's watermark is within its bound; else today's REST path. The
+        // claim itself (`dispatch`) re-reads the forge and never the mirror.
+        let listing = if let Some(rows) = mirror_rows(cwd, repo, label, all_pages) {
+            crate::forge_listing::PagedListing {
+                rows,
+                incomplete: None,
+            }
+        } else if all_pages {
             crate::forge_listing::list_issues_cached_paged_as(
                 "work_finder",
                 gh,
@@ -278,6 +293,32 @@ impl GhWorkSource {
     }
 }
 
+/// A candidate listing from the GitHub state mirror (2am#4367 P5), or `None`
+/// (read the forge as today): no mirror live, the repo stale or unknown to
+/// it, or any error. Always a [`ReadKind::Discovery`] read.
+///
+/// [`ReadKind::Discovery`]: crate::forge_events::poll_gate::ReadKind::Discovery
+fn mirror_rows(
+    cwd: Option<&Path>,
+    repo: Option<&str>,
+    label: &str,
+    all_pages: bool,
+) -> Option<Vec<crate::forge_listing::RestIssue>> {
+    use crate::forge_mirror::discovery::{list_open, Caller, Pages};
+    if !crate::forge_mirror::is_active() {
+        return None;
+    }
+    let pages = if all_pages { Pages::All } else { Pages::First };
+    list_open(
+        crate::forge_events::poll_gate::ReadKind::Discovery,
+        Caller::WorkFinder,
+        cwd,
+        repo,
+        Some(label),
+        pages,
+    )
+}
+
 /// A concrete [`WorkDispatcher`] backed by the daemon [`SweepRegistry`].
 ///
 /// `dispatch()` calls the registry's own `dispatch()` — reusing its
@@ -324,7 +365,8 @@ impl WorkDispatcher for RegistryDispatcher {
         let mut set = HashSet::new();
         for state in [SweepState::Running, SweepState::Pending] {
             for info in reg.list(Some(&state)) {
-                if let SweepKind::Issue(n) = info.kind {
+                // A step holds its item's slot like a sweep (#11898).
+                if let Some(n) = info.kind.item_number() {
                     set.insert(n);
                 }
             }
@@ -606,6 +648,24 @@ impl WorkDispatcher for RegistryDispatcher {
     /// for every candidate (#8865); see [`super::open_pr_prefilter::blocked_in`].
     fn open_pr_blocked(&self, candidates: &[u32]) -> std::collections::HashMap<u32, u32> {
         super::open_pr_prefilter::blocked_in(&self.registry, candidates)
+    }
+
+    /// The same read with its outcome (#12025); see
+    /// [`super::open_pr_prefilter::answer_in`].
+    fn open_pr_answer(&self, candidates: &[u32]) -> super::open_pr_prefilter::OpenPrAnswer {
+        super::open_pr_prefilter::answer_in(&self.registry, candidates)
+    }
+
+    /// Open candidates whose closing PR merged (#11853); see
+    /// [`super::landed_prefilter::landed_in`].
+    fn landed_closing_prs(&self, candidates: &[u32], open_pr: &[u32]) -> HashMap<u32, u32> {
+        super::landed_prefilter::landed_in(&self.registry, candidates, open_pr)
+    }
+
+    /// Landed cooldowns to lift early (#11901); see
+    /// [`super::landed_prefilter::lift_in`].
+    fn lift_landed_cooldowns(&self, held: &[u32]) -> HashSet<u32> {
+        super::landed_prefilter::lift_in(&self.registry, held)
     }
 
     /// Whether a live sweep in this registry is the host's overflow sweep

@@ -3,8 +3,10 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod auto_update;
+mod backlog_level;
 mod checkout_external_change;
 mod ci;
+mod daemon_exit;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
@@ -20,12 +22,13 @@ mod pick_decision;
 mod role_draw;
 mod session_output;
 mod token_ranking;
+mod tokens_snapshot;
 mod work_started;
 
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
 pub(super) use host_resource::resource_for_host;
-use metadata::visibility_str;
+use metadata::{role_tick_result_str, severity_for_role_tick, visibility_str};
 
 use std::collections::BTreeMap;
 
@@ -42,8 +45,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 
 use crate::telemetry::{
-    AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryKindOtlp,
-    TelemetryRecord,
+    AnomalyFlag, RepoVisibility, SweepResult, TelemetryEnvelope, TelemetryKindOtlp, TelemetryRecord,
 };
 
 // ============================================================================
@@ -104,36 +106,6 @@ fn severity_for_result(result: SweepResult) -> SeverityNumber {
         SweepResult::Failure => SeverityNumber::Error,
         SweepResult::Blocked => SeverityNumber::Warn,
         SweepResult::Success | SweepResult::Cancelled => SeverityNumber::Info,
-    }
-}
-
-/// The wire string for a role-tick result (Issue #8056) — the serde
-/// `rename_all = "snake_case"` spelling, restated here so the OTLP attribute
-/// value matches the JSON one exactly.
-fn role_tick_result_str(result: RoleTickResult) -> &'static str {
-    match result {
-        RoleTickResult::Success => "success",
-        RoleTickResult::Failure => "failure",
-        RoleTickResult::RuntimeRejected => "runtime_rejected",
-        RoleTickResult::SkippedNoTokenPool => "skipped_no_token_pool",
-        RoleTickResult::SkippedPoolExhausted => "skipped_pool_exhausted",
-        RoleTickResult::SkippedModelRuntimeMismatch => "skipped_model_runtime_mismatch",
-        RoleTickResult::SkippedLoad => "skipped_load",
-        RoleTickResult::SkippedQueueEmpty => "skipped_queue_empty",
-    }
-}
-
-/// Only an outright `failure` is an error; every *skip* is `Info` (Issue
-/// #8056/#7607 — a fleet-wide exhausted pool's identical skips must not page
-/// as hundreds of broken roles), and a fail-closed runtime rejection is a
-/// `Warn` config signal.
-fn severity_for_role_tick(result: RoleTickResult) -> SeverityNumber {
-    match result {
-        RoleTickResult::Failure => SeverityNumber::Error,
-        RoleTickResult::RuntimeRejected | RoleTickResult::SkippedModelRuntimeMismatch => {
-            SeverityNumber::Warn
-        }
-        _ => SeverityNumber::Info,
     }
 }
 
@@ -370,7 +342,19 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(gated_pool) = &r.gated_pool {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
+            // #12028: why a failed tick failed, from the closed vocabulary only.
+            if let Some(class) = &r.failure_class {
+                attributes
+                    .push(kv_string(crate::observability::lifecycle::FAILURE_CLASS, class.clone()));
+            }
             attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
+            // #11906: a step-engine step, never a role-runner tick.
+            if let Some(source) = &r.source {
+                attributes.push(kv_string("loom.role_tick.source", source.clone()));
+            }
+            if let Some(sweep_id) = &r.sweep_id {
+                attributes.push(kv_string("loom.sweep_id", sweep_id.clone()));
+            }
             if let Some(models) = metadata::models(r.models_used.as_deref()) {
                 attributes.push(models);
             }
@@ -626,6 +610,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SessionOutput(_)
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
+        | TelemetryRecord::BacklogLevel(_)
+        | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
@@ -639,7 +625,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             let parts = session_output::log_parts(r)
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
-                .or_else(|| work_started::log_parts(r))?;
+                .or_else(|| work_started::log_parts(r))
+                .or_else(|| backlog_level::log_parts(r))
+                .or_else(|| daemon_exit::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
@@ -1008,49 +996,7 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             }
             samples
         }
-        TelemetryRecord::TokensSnapshot(r) => {
-            let mut samples = Vec::new();
-            for account in &r.accounts {
-                let mut attributes = vec![
-                    kv_string("account", account.account.clone()),
-                    kv_string("provider", account.provider.clone()),
-                ];
-                if let Some(rank) = account.rank {
-                    attributes.push(kv_int("rank", i64::from(rank)));
-                }
-                if let Some(usage_fraction) = account.usage_fraction {
-                    samples.push(MetricSample {
-                        name: "loom.tokens.usage_fraction",
-                        description: "Fraction of the current limit window consumed (0..1).",
-                        unit: "1",
-                        attributes: attributes.clone(),
-                        value: number_data_point::Value::AsDouble(usage_fraction),
-                        time_unix_nano,
-                    });
-                }
-                // Issue #9005: the rolling 7-day axis beside the 5h one. Same
-                // absent-not-zero rule — no source, no series.
-                if let Some(weekly) = account.usage_fraction_weekly {
-                    samples.push(MetricSample {
-                        name: "loom.tokens.usage_fraction_weekly",
-                        description: "Fraction of the rolling 7-day limit window consumed (0..1).",
-                        unit: "1",
-                        attributes: attributes.clone(),
-                        value: number_data_point::Value::AsDouble(weekly),
-                        time_unix_nano,
-                    });
-                }
-                samples.push(MetricSample {
-                    name: "loom.tokens.exhausted",
-                    description: "Whether the account is currently excluded from the usable pool (1 = exhausted).",
-                    unit: "1",
-                    attributes,
-                    value: number_data_point::Value::AsInt(i64::from(account.exhausted)),
-                    time_unix_nano,
-                });
-            }
-            samples
-        }
+        TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),
         // Every kind that is not declared `otlp: Gauges` in
         // `telemetry/kinds.rs` produces no gauge here:
         //   - every lifecycle-shaped kind — including `role_tick.outcome`

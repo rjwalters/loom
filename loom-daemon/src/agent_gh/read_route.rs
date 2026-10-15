@@ -4,8 +4,9 @@
 //! through the facade, whose router offers the gateway first
 //! ([`crate::forge_gateway::route_read`]). Every other call is exec'd. This
 //! module decides which of those execs is a read it can name the owner of,
-//! and so may run under that owner's gateway read profile instead of the
-//! session's credential (the writer).
+//! and so may run under that owner's gateway read profile, or failing that a
+//! reader App from the daemon's pool (#12245), instead of the session's
+//! credential (the writer).
 //!
 //! **Unclassified means direct.** A call is a read only when its shape says
 //! so: `issue|pr view|list`, `pr checks|diff`, `repo view`,
@@ -30,11 +31,16 @@ use std::path::PathBuf;
 
 use super::classify::is_slug;
 
-/// How the front routed one passthrough, for its ledger row.
+/// How the front may run one passthrough: the gateway profile, then a reader
+/// App (#12245), then the session's credential (the writer). A read with
+/// neither is booked on the writer as `direct_read`, so every read that
+/// reaches the writer is counted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrontRoute {
-    /// The gateway profile the call runs under, when it does.
+    /// The owner's gateway profile, tried first.
     pub gateway: Option<PathBuf>,
+    /// A reader App's `GH_CONFIG_DIR` for the repo, tried next.
+    pub reader: Option<PathBuf>,
     /// The call was classified as a read.
     pub read: bool,
 }
@@ -137,10 +143,9 @@ fn spec(cmd: &str, verb: &str) -> Option<Spec> {
             ],
             &["-a", "--all"],
         ),
-        ("run", "view") => (
-            &["-j", "--job", "--attempt"],
-            &["--log", "--log-failed", "--exit-status", "-v", "--verbose"],
-        ),
+        // No `--log` / `--log-failed`: a log dump can be large, and the
+        // front buffers a gateway attempt, so it stays direct.
+        ("run", "view") => (&["-j", "--job", "--attempt"], &["--exit-status", "-v", "--verbose"]),
         ("workflow", "list") => (&["-L", "--limit"], &["-a", "--all"]),
         ("workflow", "view") => (&["-r", "--ref"], &["-y", "--yaml"]),
         ("label", "list") => (&["-L", "--limit", "-S", "--search", "--order", "--sort"], &[]),
@@ -338,42 +343,109 @@ fn argv_repo(args: &[String]) -> Result<Option<String>, ()> {
     Ok(first)
 }
 
-/// The owner of the repo a read targets, if certain. `gh_repo` is
-/// `GH_REPO`; `remote` is the checkout's implicit repo (asked last).
+/// The `owner/repo` a read targets, if certain. `gh_repo` is `GH_REPO`;
+/// `remote` is the checkout's implicit repo (asked last).
+#[must_use]
+pub fn target_repo(
+    args: &[String],
+    gh_repo: Option<&str>,
+    remote: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match argv_repo(args) {
+        Err(()) => None,
+        Ok(Some(r)) => Some(r),
+        Ok(None) => match gh_repo.filter(|r| !r.is_empty()) {
+            Some(r) => is_slug(r).then(|| r.to_string()),
+            None => remote(),
+        },
+    }
+}
+
+/// The owner of the repo a read targets, if certain ([`target_repo`]).
 #[must_use]
 pub fn target_owner(
     args: &[String],
     gh_repo: Option<&str>,
     remote: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    let repo = match argv_repo(args) {
-        Err(()) => return None,
-        Ok(Some(r)) => r,
-        Ok(None) => match gh_repo.filter(|r| !r.is_empty()) {
-            Some(r) => is_slug(r).then(|| r.to_string())?,
-            None => remote()?,
-        },
-    };
+    let repo = target_repo(args, gh_repo, remote)?;
     let owner = crate::credential_preflight::owner_of_nwo(&repo);
     (!owner.is_empty()).then(|| owner.to_ascii_lowercase())
 }
 
-/// How to run `args`, with the gateway lookup injected.
+/// How to run `args`, with the lookups injected: `gateway` maps an owner to
+/// its live gateway profile, `reader` maps an `owner/repo` to a reader App's
+/// directory. A read whose repo is not certain gets neither.
 #[must_use]
 pub fn plan(
     args: &[String],
     gh_repo: Option<&str>,
     remote: impl FnOnce() -> Option<String>,
-    lookup: &dyn Fn(&str) -> Option<PathBuf>,
+    gateway: &dyn Fn(&str) -> Option<PathBuf>,
+    reader: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> FrontRoute {
     if !is_read(args) {
         return FrontRoute::default();
     }
-    let gateway = target_owner(args, gh_repo, remote).and_then(|o| lookup(&o));
+    let read_only = FrontRoute {
+        read: true,
+        ..FrontRoute::default()
+    };
+    let Some(repo) = target_repo(args, gh_repo, remote) else {
+        return read_only;
+    };
+    let owner = crate::credential_preflight::owner_of_nwo(&repo).to_ascii_lowercase();
+    if owner.is_empty() {
+        return read_only;
+    }
     FrontRoute {
-        gateway,
+        gateway: gateway(&owner),
+        reader: reader(&repo),
         read: true,
     }
+}
+
+/// The rate-limit bucket a passthrough read spends, from the argv
+/// classifier the ledger uses: graphql for `issue|pr|repo`, search, else
+/// core.
+#[must_use]
+pub fn resource_of(raw: &[std::ffi::OsString]) -> crate::forge_bucket_book::Resource {
+    use crate::forge_bucket_book::Resource;
+    match crate::gh_invocation::accounting::static_pool(raw) {
+        crate::forge_call_stats::Pool::Graphql => Resource::Graphql,
+        crate::forge_call_stats::Pool::Search => Resource::Search,
+        _ => Resource::Core,
+    }
+}
+
+/// A reader App's `GH_CONFIG_DIR` for a classified read of `repo` (#12245):
+/// the reader pool's answer for a gate read, the same router (and the same
+/// trust check on a directory the front found in its environment) the
+/// served reads use. `None` sends the read to the writer. Only [`plan`]'s
+/// caller asks, and only for a read whose repo is certain.
+#[must_use]
+pub fn pool_reader(repo: &str, resource: crate::forge_bucket_book::Resource) -> Option<PathBuf> {
+    let req = crate::forge_identity::RouteRequest::gate(repo, None, resource);
+    match crate::forge_identity::route_read(&req, std::time::SystemTime::now()) {
+        crate::forge_identity::RouteDecision::Reader { dir, .. } => Some(dir),
+        _ => None,
+    }
+}
+
+/// Whether a reader's failed answer is the reader's own refusal — coverage
+/// (403/404, not accessible by integration), a refused token (401) or a
+/// rate limit — so the read goes on to the writer, as
+/// [`crate::forge_identity::reader_then_writer`] does for served reads.
+/// `http_status` is the response's status when `gh` printed headers; the
+/// stderr's `HTTP <nnn>` otherwise.
+#[must_use]
+pub fn reader_refused(
+    stderr: &str,
+    http_status: Option<u16>,
+    resource: crate::forge_bucket_book::Resource,
+) -> bool {
+    let status = http_status.or_else(|| crate::forge_gateway::outage::http_status_in(stderr));
+    crate::forge_identity::classify_failure(stderr, status, None, resource).is_some()
 }
 
 #[cfg(test)]

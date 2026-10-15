@@ -27,7 +27,8 @@
 //! `resync-installed.sh` refreshes more than the payload step writes. Those
 //! surfaces, and the one table that names them, are in [`surfaces`] (#10895):
 //! `.agents/skills/` (marker-gated), `.claude/README.md`,
-//! `.github/CONFIGURATION.md`, `.claude/biome.jsonc`, the Loom-managed block
+//! `.github/CONFIGURATION.md`, `.claude/biome.jsonc`, the files of an existing
+//! `.claude/agents/` directory (#11033), the Loom-managed block
 //! of `.gitignore`, the two template-substituted guides (`.loom/CLAUDE.md`,
 //! `.loom/AGENTS.md`, re-rendered with the install date they already carry)
 //! and the retired-payload sweep. Each is a step over the same staging tree,
@@ -114,6 +115,13 @@ use crate::install_compat::{
 /// The packed `defaults/` tree this binary was built from (see `build.rs`).
 static EMBEDDED_PAYLOAD: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/install-payload.tar.zst"));
+
+/// The packed `defaults/` tree itself, for [`crate::hooks_home`], which
+/// unpacks the hook-runtime part of it for the sessions this daemon spawns.
+#[must_use]
+pub fn embedded_archive() -> &'static [u8] {
+    EMBEDDED_PAYLOAD
+}
 
 /// The `.loom/` directories [`super::install_payload_files`] syncs by name.
 /// `payload_surface_covers_everything_the_installer_writes` (tests) fails if

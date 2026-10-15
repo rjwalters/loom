@@ -137,7 +137,7 @@ pub(crate) enum ForgeAction {
         max_points: u32,
     },
 
-    /// `forge wait-checks <PR|SHA> [--timeout SECS] [--required-only]`
+    /// `forge wait-checks <PR|SHA> [--timeout SECS] [--required-only] [--settle-red]`
     /// (#10330) — wait for a PR's (or commit's) CI with ETag'd REST reads
     /// (an unchanged poll is a free `304`) backing off 30s → 120s.
     ///
@@ -170,6 +170,12 @@ pub(crate) enum ForgeAction {
         /// Settle on the base branch's required contexts only.
         #[arg(long)]
         required_only: bool,
+
+        /// No early RED (#12011): a failing check is RED only once nothing
+        /// is still pending; until then the wait stays pending (→ TIMEOUT).
+        /// For a changes-requested verdict that must name the failing test.
+        #[arg(long)]
+        settle_red: bool,
 
         /// First poll interval, seconds (env `LOOM_WAIT_CHECKS_MIN`, default 30).
         #[arg(long, value_name = "SECS")]
@@ -217,11 +223,13 @@ pub(crate) enum ForgeAction {
     /// lease (`LOOM_LEASE_TTL_MINUTES`), remote `feature/issue-N` branch.
     ///
     /// Exits `0` BLOCKED with the reason token on stdout (`OPEN_PR #X` /
-    /// `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` /
+    /// `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `BUILDING` /
+    /// `LEASE_ALREADY_HELD <host> <sweep-id>` /
     /// `BRANCH_EXISTS feature/issue-N`), `1` verified safe to claim, `5`
     /// fail closed (a leg could not answer — NOT an all-clear), `3` Gitea
     /// decline. `--force-claim` overrides the label/lease/branch legs only —
-    /// it never overrides the `OPEN_PR` leg.
+    /// it never overrides `OPEN_PR`, `TARGET_IS_PR`, `CLOSED`, `FROZEN` or
+    /// `OPERATOR`.
     #[command(name = "check-claim")]
     CheckClaim {
         /// Issue number you are about to claim.
@@ -360,7 +368,7 @@ pub(crate) enum ForgeAction {
         audit_comment: bool,
 
         /// The explicit-hold label found on the PR (`loom:operator`,
-        /// `loom:blocked`, `loom:operator-only`), if any. Shapes the audit
+        /// `loom:blocked`, or a retired hold name), if any. Shapes the audit
         /// comment's wording only — it never suppresses the disarm, which can
         /// only prevent a merge and therefore enforces a hold rather than
         /// undoing it. An empty value means "not held".
@@ -1024,6 +1032,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             base,
             timeout,
             required_only,
+            settle_red,
             min_interval,
             max_interval,
         } => loom_daemon::forge_wait_checks::cli_entrypoint(
@@ -1033,6 +1042,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 base,
                 timeout,
                 required_only,
+                settle_red,
                 min_interval,
                 max_interval,
             },

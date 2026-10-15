@@ -56,6 +56,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::telemetry::kinds::pick_decision::PickSkipReason;
 use crate::telemetry::{RepoVisibility, SweepStartFacts};
 use crate::types::QueueDisposition;
 use crate::work_finder::halt_cause::HaltCause;
@@ -163,11 +164,14 @@ pub enum FleetSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetHoldKind {
-    /// `loom:operator`.
+    /// `loom:operator` (since #11795 also the folded operator holds, when the
+    /// body is not read).
     Operator,
-    /// `loom:operator-only` (or `-mechanical`).
+    /// The retired `loom:operator-only` (or `-mechanical`): unmigrated items
+    /// and history (#11795).
     OperatorOnly,
-    /// `loom:operator-decision`.
+    /// A decision: the retired `loom:operator-decision`, or `loom:operator`
+    /// with a decision block where the body is read (#11795).
     OperatorDecision,
     /// Champion's merge-risk hold.
     MergeRisk,
@@ -593,6 +597,17 @@ pub struct FleetStateRow {
     /// on every row the work finder held under one, `eligible_at` or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_reason: Option<FleetEligibleReason>,
+    /// `ready_wait` only (#11960): the closed-set reason (`pick.decision`
+    /// skip reason) the work finder skipped this eligible item on its last
+    /// tick. Absent when it was not skipped. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_blocked_reason: Option<PickSkipReason>,
+    /// `ready_wait` only (#11960): the first pass of the current continuous
+    /// skip for `dispatch_blocked_reason` (like `held_since`); resets when the
+    /// reason changes or the item stops being skipped. Present exactly when
+    /// the reason is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_blocked_since: Option<DateTime<Utc>>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -629,6 +644,8 @@ impl FleetStateRow {
             merge_blocked_reason: None,
             eligible_at: None,
             eligible_reason: None,
+            dispatch_blocked_reason: None,
+            dispatch_blocked_since: None,
         }
     }
 }
@@ -646,6 +663,51 @@ pub struct FleetPrCensus {
     /// and `held` for a PR whose labels name no single stage.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_stage: BTreeMap<String, u32>,
+}
+
+/// A repo's pending-human queue depth (#11955): how much work waits on a
+/// curator or a human right now. Discrete sub-counts, not a pre-composed total,
+/// so a reader chooses how to combine them. The input to the human-gated ETA
+/// stages (`triage_wait`, `approval_wait`, `merge_hold`) and to the pre-ready
+/// `eligible_ahead` hurdle.
+///
+/// "Eligible" excludes issues labelled `loom:skip`, `loom:park` or a proposal
+/// label (`loom:architect`, `loom:hermit`, `loom:auditor`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetQueueDepth {
+    /// Eligible open `loom:triage` issues, awaiting curation.
+    pub awaiting_curation: u32,
+    /// Eligible open `loom:curated` issues, awaiting human approval.
+    pub awaiting_approval: u32,
+    /// Distinct items under an operator hold (operator-kind hold rows plus
+    /// `merge_hold` PRs, without double-counting). Absent when the repo's PR
+    /// census was not read whole this pass: unknown, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_held: Option<u32>,
+}
+
+/// A repo's operator-action recency (#11956), derived from the delta between
+/// consecutive passes' operator-held sets. Approximate: a release cannot be
+/// attributed to a human, and the tracker is in memory (resets on restart).
+/// Hours since the last release is `as_of - last_hold_release_at`; the instant
+/// is carried instead so an idle repo's record does not change every tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetOperatorRecency {
+    /// The latest observed hold release.
+    pub last_hold_release_at: DateTime<Utc>,
+    /// Set only while at least a threshold of releases fall in the trailing
+    /// window (a purge burst).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_release_burst: Option<FleetHoldReleaseBurst>,
+}
+
+/// A burst of hold releases (#11956).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetHoldReleaseBurst {
+    /// Releases observed inside the window.
+    pub count_in_window: u32,
+    /// The trailing window, in minutes.
+    pub window_minutes: u32,
 }
 
 /// Decode a present field, `null` included, as `Some(..)`; an absent field
@@ -819,6 +881,16 @@ pub struct FleetStateRepo {
     /// emitter). Additive on `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curator: Option<CuratorState>,
+    /// The repo's pending-human queue depth (#11955). Absent when its
+    /// `loom:triage` or `loom:curated` listing was incomplete (or not yet read
+    /// by this host): unknown, never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_queue: Option<FleetQueueDepth>,
+    /// The repo's operator-action recency (#11956). Absent = unknown (no
+    /// release observed since this host started, or the census was unread),
+    /// never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_recency: Option<FleetOperatorRecency>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]

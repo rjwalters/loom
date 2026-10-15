@@ -714,8 +714,9 @@ impl SweepRegistry {
         // both containerized dispatch shapes stamp `loom.sweep.issue=<N>` +
         // `loom.dispatch=container`, and no container / no docker / a docker
         // failure inside is a logged no-op.
-        if let SweepKind::Issue(issue) = &kind {
-            container_stop::begin_container_stop(sweep_id, *issue, grace);
+        // A step's container is labelled with its item (#11898).
+        if let Some(item) = kind.item_number() {
+            container_stop::begin_container_stop(sweep_id, item, grace);
         }
 
         let term_sent = self.signal_sweep(sweep_id, pid, 15);
@@ -780,8 +781,8 @@ impl SweepRegistry {
         // container teardown — `docker kill` whatever is still running for
         // this issue (a stop client that died before dockerd acted, a wedged
         // stop). Clean debug-level no-op when nothing is left.
-        if let SweepKind::Issue(issue) = kind {
-            container_stop::finish_container_stop(sweep_id, *issue, !exited_within_grace);
+        if let Some(item) = kind.item_number() {
+            container_stop::finish_container_stop(sweep_id, item, !exited_within_grace);
         }
 
         // Reap the retained handle so the killed leader does not linger as a
@@ -811,7 +812,17 @@ impl SweepRegistry {
                 at: now,
             };
         }
-        if let SweepKind::Issue(issue) = kind {
+        let issue = match kind {
+            SweepKind::Issue(issue) => Some(issue),
+            // A cancelled step releases its claim per role (#11898).
+            SweepKind::Step { item, role } => {
+                let end = super::step_spawn::capture::StepEnd::Cancelled;
+                self.release_dead_step(sweep_id, *item, *role, started_at, end);
+                None
+            }
+            SweepKind::PrSet(_) => None,
+        };
+        if let Some(issue) = issue {
             // Ownership-checked release (#4463): if a newer sweep re-acquired
             // this issue's lock after the sweep being cancelled died, leave its
             // live lock intact and skip the label restore below — the newer
@@ -970,6 +981,8 @@ impl SweepRegistry {
         // Insta-crash quarantine TTL (#3939): release any issue whose quarantine
         // has aged past the configured window before this tick's work. Cheap
         // early-return when nothing is quarantined.
+        // #11930: first adopt any park the startup reconciliation kept.
+        self.adopt_restored_parks();
         self.expire_quarantine();
         // Retry any previously-failed quarantine label restores (Issue #4110)
         // and release no-op holds whose inputs changed (Issue #10156). Cheap
@@ -979,6 +992,10 @@ impl SweepRegistry {
         // crash-path SIGTERM (Issue #4980). Cheap early-return when nothing is
         // pending; never blocks (the grace is deadline-based, not slept).
         self.escalate_pending_group_reaps();
+        // #11906 (B3): a step past its role's timeout is killed and released.
+        changes += self.reap_step_timeouts();
+        // #11909: the outcome ledger's lapsed entries go each tick.
+        self.prune_step_ledger();
 
         // Snapshot keys + pids first so we can borrow mutably below.
         // Capture started_at so we can compute durations for Exited events.
@@ -1039,11 +1056,14 @@ impl SweepRegistry {
                 // live until a later tick finds the group empty; one owner of
                 // the session's lifetime, never daemon-released + still running.
                 // Immediate when the group is already empty (the ordinary case).
-                let issue = match &kind {
-                    SweepKind::Issue(n) => Some(*n),
-                    SweepKind::PrSet(_) => None,
+                let (issue, step) = match &kind {
+                    SweepKind::Issue(n) => (Some(*n), None),
+                    SweepKind::Step { item, role } => (None, Some((*item, *role))),
+                    SweepKind::PrSet(_) => (None, None),
                 };
-                let exit_code = match self.await_group_drain(&sweep_id, issue, pgid, exit_code) {
+                let drain_item = issue.or(step.map(|(item, _)| item));
+                let exit_code = match self.await_group_drain(&sweep_id, drain_item, pgid, exit_code)
+                {
                     GroupDrain::Draining => continue,
                     GroupDrain::Drained(code) => code,
                 };
@@ -1052,6 +1072,13 @@ impl SweepRegistry {
                 // #4493: account health must be updated before any bounded
                 // re-dispatch path below asks the selector for another profile.
                 self.apply_provider_health_feedback(&sweep_id, exit_code);
+                // A step has its own terminal path (`step_reap.rs`, #11898).
+                if let Some((item, role)) = step {
+                    changes += 1;
+                    let event = self.finish_dead_step(&sweep_id, item, role, started_at, exit_code);
+                    events_to_emit.push(event);
+                    continue;
+                }
                 {
                     changes += 1;
                     let now = Utc::now();
@@ -1090,7 +1117,10 @@ impl SweepRegistry {
                             .join(format!("issue-{issue}.json"));
                         if checkpoint.exists() {
                             // #4463: never restore the label when a newer sweep
-                            // owns the lock — it is actively building.
+                            // owns the lock — it is actively building. #11852:
+                            // when this sweep already opened its PR, the issue
+                            // keeps `loom:building` while that PR is open (no
+                            // label write); the resume below re-claims it.
                             if !self.config.skip_label_flip && !superseded {
                                 let _ = self.restore_label_after_reap(issue, &sweep_id);
                                 self.note_label_flip(issue); // #4485 flap detection
@@ -1147,6 +1177,13 @@ impl SweepRegistry {
                             // POOL-level fault — see this branch's use below.
                             let pool_dead =
                                 classification.as_deref() == Some(NO_USABLE_ACCOUNT_CLASS);
+                            // #11854: the class a ladder park would name.
+                            let fast_class = self.fast_fail_class_for(
+                                issue,
+                                &sweep_id,
+                                death_class.as_deref(),
+                                classification.as_deref(),
+                            );
                             // Captured before `checkpoint_phase` moves into the
                             // `SweepCrashed` event below — needed for the
                             // reaper-driven resume check further down (#4256).
@@ -1229,6 +1266,9 @@ impl SweepRegistry {
                             // single retry, and arming a window there would risk
                             // burning that one retry on a refusal.
                             if checkpoint_progress {
+                                // #11930: progress breaks the fleet's streak (first:
+                                // the local streak lives in the record cleared next).
+                                self.break_fleet_fast_fail_streak(issue);
                                 self.clear_dispatch_backoff(issue);
                                 // #6670: real progress is conclusive proof the
                                 // candidate is no longer a no-op — clear any
@@ -1267,8 +1307,14 @@ impl SweepRegistry {
                                         &self.config.workspace_root,
                                     ),
                                 );
-                            } else if insta_crash {
-                                self.charge_dispatch_failure(&sweep_id, issue);
+                            } else if is_fast_failure(
+                                duration_sec,
+                                exit_code,
+                                self.quarantine_config.insta_crash_secs,
+                            ) {
+                                // #11854: a 2-minute window; the third
+                                // issue-attributable one in a row parks.
+                                self.charge_fast_failure(&sweep_id, issue, &fast_class, false);
                             }
                             if checkpoint_progress {
                                 self.record_terminal_outcome(issue, false);
@@ -1424,14 +1470,15 @@ impl SweepRegistry {
                                     // attempt: a human-gated pause is not a failed
                                     // attempt, so clearing the hold leaves the
                                     // issue's full resume runway intact. Nor does
-                                    // it strand the work — `restore_label_to_ready`
-                                    // has already returned the issue to
-                                    // `loom:issue`, where the #4123 open-PR guard
-                                    // correctly refuses ordinary re-dispatch and
-                                    // the periodic Judge/Champion roles own the
-                                    // open PR. That is exactly the resting state
-                                    // `MAX_RESUME_ATTEMPTS` exhaustion already
-                                    // produces, reached without burning the
+                                    // it strand the work — the periodic
+                                    // Judge/Champion roles own the open PR, and
+                                    // the issue keeps `loom:building` while that
+                                    // PR is open (#11852: `loom:issue` beside an
+                                    // open PR is not a resting state, it is a
+                                    // candidate the #4123 guard must refuse
+                                    // every tick). That is the state
+                                    // `MAX_RESUME_ATTEMPTS` exhaustion also
+                                    // leaves, reached without burning the
                                     // attempts first.
                                     let clean_no_progress_exit =
                                         exit_code == Some(0) && !checkpoint_progress;
@@ -1461,10 +1508,9 @@ impl SweepRegistry {
                                              {resume_phase_check:?}, open PR #{pr}) — a deliberate \
                                              no-op, not a crash; NOT resuming (resuming would \
                                              re-run the same decision and flap \
-                                             loom:issue/loom:building, #5614). The issue is back \
-                                             at loom:issue with the #4123 open-PR guard in force; \
-                                             the open PR is the periodic Judge/Champion roles' \
-                                             remit."
+                                             loom:issue/loom:building, #5614). The issue keeps \
+                                             loom:building while the PR is open (#11852); the PR \
+                                             is the periodic Judge/Champion roles' remit."
                                         );
                                         true
                                     } else if attempts >= MAX_RESUME_ATTEMPTS {
@@ -1501,13 +1547,10 @@ impl SweepRegistry {
                                         // full #4256 runway survives for the
                                         // Champion-lifted resume the retained
                                         // `doctor-done` checkpoint exists to
-                                        // serve. `restore_label_to_ready` above
-                                        // already returned the issue to
-                                        // `loom:issue` (the park is on the PR,
-                                        // not the issue), where the #4123
-                                        // open-PR guard refuses ordinary
-                                        // re-dispatch and the periodic
-                                        // Judge/Champion roles own the PR.
+                                        // serve. The issue keeps `loom:building`
+                                        // while its PR is open (#11852), and the
+                                        // periodic Judge/Champion roles own the
+                                        // PR.
                                         self.linked_pr_parked(issue, pr, &resume_phase_check)
                                     };
                                     if skip_resume {
@@ -1885,6 +1928,17 @@ impl SweepRegistry {
                             // crashed branch above, so both need the carve-out.
                             let pool_dead =
                                 classification.as_deref() == Some(NO_USABLE_ACCOUNT_CLASS);
+                            let fast_class = self.fast_fail_class_for(
+                                issue,
+                                &sweep_id,
+                                death_class.as_deref(),
+                                classification.as_deref(),
+                            );
+                            let fast_fail = is_fast_failure(
+                                duration_sec,
+                                exit_code,
+                                self.quarantine_config.insta_crash_secs,
+                            );
                             // Telemetry `result` classification (#4704),
                             // strongest signal first:
                             //   1. An observed `merge-done` means the sweep
@@ -1963,8 +2017,16 @@ impl SweepRegistry {
                                         &self.config.workspace_root,
                                     ),
                                 );
-                            } else if insta_crash || no_progress || yielded_open_pr {
-                                self.charge_dispatch_failure(&sweep_id, issue);
+                            } else if fast_fail || no_progress || yielded_open_pr {
+                                // #11854: an open-PR yield backs off under the
+                                // open-PR cause (900 s cap) and never parks.
+                                let open_pr_yield = !(fast_fail || no_progress);
+                                self.charge_fast_failure(
+                                    &sweep_id,
+                                    issue,
+                                    &fast_class,
+                                    open_pr_yield,
+                                );
                             } else {
                                 self.clear_dispatch_backoff(issue);
                             }

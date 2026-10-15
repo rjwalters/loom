@@ -153,6 +153,8 @@ pub async fn try_flush<E: Exporter>(
     status.record_signals(&outcome.signals);
     if outcome.exported > 0 {
         status.record_success(outcome.exported);
+        // Per-kind liveness (#12120): the acked prefix is what landed.
+        status.record_kinds(batch[..acknowledged].iter().map(|e| e.record.kind()));
     }
     if let Some(error) = outcome.error {
         log::warn!(
@@ -294,11 +296,24 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    /// A fixed instant with non-zero nanoseconds (#11981). chrono serializes a
+    /// `DateTime<Utc>` with 0, 3, 6 or 9 fractional digits depending on its
+    /// trailing zero nanos, so a `Utc::now()` stamp makes two fixtures differ in
+    /// JSON length and breaks the exact byte-budget assertions below. Nine
+    /// non-zero digits match the production serialized width.
+    fn fixed_instant() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc
+            .timestamp_opt(1_700_000_000, 123_456_789)
+            .single()
+            .expect("fixed fixture instant is valid")
+    }
+
     fn envelope() -> TelemetryEnvelope {
-        TelemetryEnvelope::new(
+        let mut envelope = TelemetryEnvelope::new(
             "host-test",
             TelemetryRecord::HostHealth(HostHealthRecord {
-                captured_at: chrono::Utc::now(),
+                captured_at: fixed_instant(),
                 daemon_version: "0.16.0".to_string(),
                 build_commit: "deadbeef".to_string(),
                 built_at: None,
@@ -323,7 +338,11 @@ mod tests {
                 otlp_export: None,
                 memory: None,
             }),
-        )
+        );
+        // `TelemetryEnvelope::new` stamps `emitted_at` with `Utc::now()`; pin it
+        // too, or its serialized width still varies between fixtures.
+        envelope.emitted_at = fixed_instant();
+        envelope
     }
 
     /// A toggleable in-memory exporter: [`FakeExporter::set_up`] flips

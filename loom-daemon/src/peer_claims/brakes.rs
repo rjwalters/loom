@@ -10,6 +10,7 @@
 //! | No-op cooldown | [`ClaimKind::NoopCooldownArmed`] | one issue | #7477 |
 //! | Dispatch backoff | [`ClaimKind::DispatchBackoffArmed`] | one issue | #7477 |
 //! | PR-less retry tally | [`ClaimKind::PrlessReleaseArmed`] | one issue | #9292 |
+//! | Step cooldown | [`ClaimKind::StepCooldownArmed`] | one `(item, step)` | #11900 |
 //! | Pool-exhaustion hold | [`ClaimKind::PoolHoldArmed`]/[`ClaimKind::PoolHoldCleared`] | one **token pool**, every issue on it | #8001 |
 //!
 //! They share three properties, which is why they share a module:
@@ -166,6 +167,13 @@ pub fn observe_brake_ad(view: &mut PeerClaimView, ad: &ClaimAd, now: Instant) {
             view.observe_pool_hold_at(ad, now);
             view.prune_expired_pool_holds(now);
         }
+        ClaimKind::StepCooldownArmed => {
+            view.observe_step_cooldown_at(ad, now);
+            view.prune_expired_step_cooldowns(now);
+        }
+        ClaimKind::NoopStreak => {
+            view.observe_noop_streak_at(ad, now);
+        }
         _ => {}
     }
 }
@@ -199,6 +207,9 @@ impl ClaimAd {
             remaining_secs: Some(remaining_secs),
             pool_key: Some(pool_key),
             consecutive: None,
+            step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -232,6 +243,9 @@ impl ClaimAd {
             remaining_secs: Some(remaining_secs),
             pool_key: None,
             consecutive: Some(consecutive),
+            step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -258,6 +272,9 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: Some(pool_key),
             consecutive: None,
+            step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 }
@@ -305,20 +322,57 @@ impl PeerClaimView {
     }
 
     /// [`Self::observe_noop_cooldown_at`]'s sibling for
-    /// [`ClaimKind::DispatchBackoffArmed`] (Issue #7477) — identical
-    /// contract, including leaving the `#6157` coordination-health
-    /// bookkeeping untouched.
+    /// [`ClaimKind::DispatchBackoffArmed`] (Issue #7477) — the same
+    /// self-ad recognition, and the same untouched `#6157` coordination-health
+    /// bookkeeping, with two differences (Issue #11901):
+    ///
+    /// - **Extend-only.** A positive window never shortens one already in
+    ///   force for the same `(repo, issue)`: the ad carries no cause, so a
+    ///   later, shorter ladder window from another host would otherwise cut a
+    ///   6 h landed cooldown down to minutes.
+    /// - **Zero is a clear.** A missing/zero `remaining_secs` drops the entry.
+    ///   That is what the overwrite used to do with it anyway (an expired
+    ///   window), so an old peer and a new one read the clear the same way;
+    ///   [`crate::sweep_registry::SweepRegistry::clear_landed_cooldown`] sends
+    ///   it when a landed issue is reopened or kept. The exception is a
+    ///   fast-fail streak break marked as one (#11952): it resets the
+    ///   fast-fail tally and leaves every window alone (see
+    ///   `peer_claims::fast_fail_tally`).
     pub fn observe_dispatch_backoff_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
         debug_assert_eq!(ad.kind, ClaimKind::DispatchBackoffArmed);
         let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
         if ad.host == self.self_host && !is_unresolved_identity {
             return false; // never back off on our own backoff
         }
+        // Issue #11930: the ladder's ad also carries the sender's fast-failure
+        // streak, which the fast-fail park sums across hosts.
+        let is_break = self.observe_fast_fail_streak_at(ad, now);
+        // #11952: an explicitly marked break is about the fast-fail tally
+        // only. It never clears a window another cause armed here (a peer's
+        // landed cooldown, another host's ladder window). An unmarked
+        // pre-#11952 break still clears the window, as its sender meant.
+        if is_break && ad.streak_break == Some(true) {
+            return true;
+        }
+        let key = (ad.repo.clone(), ad.issue);
         let remaining = ad.remaining_secs.unwrap_or(0);
+        if remaining == 0 {
+            self.dispatch_backoffs.remove(&key);
+            return true;
+        }
         let expiry = now + Duration::from_secs(remaining);
-        self.dispatch_backoffs
-            .insert((ad.repo.clone(), ad.issue), expiry);
+        let entry = self.dispatch_backoffs.entry(key).or_insert(expiry);
+        *entry = (*entry).max(expiry);
         true
+    }
+
+    /// Drop the peer dispatch-backoff window for `repo`/`issue`, if any
+    /// (Issue #11901): this host verified on the forge that the landing
+    /// behind a landed cooldown no longer holds. Returns whether one existed.
+    pub fn clear_dispatch_backoff(&mut self, repo: &str, issue: u32) -> bool {
+        self.dispatch_backoffs
+            .remove(&(repo.to_string(), issue))
+            .is_some()
     }
 
     /// Every issue in `repo` with a live (non-expired) fleet-wide no-op

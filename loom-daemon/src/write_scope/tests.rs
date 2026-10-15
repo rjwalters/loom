@@ -244,6 +244,7 @@ fn a_fork_checkout_with_an_upstream_remote_is_refused() {
 #[serial_test::serial(write_scope_cache)]
 fn the_cache_answers_repeat_questions_without_a_second_probe() {
     let dir = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
     // SAFETY-free: the variable is read only by this module's cache.
     std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
     probe::clear_memory();
@@ -324,6 +325,7 @@ pub(super) fn seed_disk_for(
 #[serial_test::serial(write_scope_cache)]
 fn an_unanswerable_reprobe_keeps_a_recent_write_but_not_an_old_one() {
     let dir = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
     std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("g"));
     probe::clear_memory();
     let hour = std::time::Duration::from_secs(3600);
@@ -444,11 +446,24 @@ fn daemon_write_paths_are_scoped() {
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
-        ("stale_blocked/release_gh.rs", Gated),
+        (
+            "intake_reconcile/demote.rs",
+            Via(
+                "intake_reconcile.rs",
+                "demotion step (#11820): the inline pass behind gate_root_with, and the \
+                 singleton's run_repo behind may_write (gate_repo_with)",
+            ),
+        ),
         ("work_finder/main_red_autofile.rs", Gated),
+        // #11853: label swap + routing comment, each behind gate_repo_with.
+        ("work_finder/landed_prefilter.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
+        ),
+        (
+            "sweep_registry/lease_step.rs",
+            Via(DISPATCH, "the lease record of a dispatched sweep or step (moved from guards.rs, #11898)"),
         ),
         (
             "sweep_registry/dispatch/claim_release.rs",
@@ -460,9 +475,14 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
+            "sweep_registry/restore_to_ready/step_restore.rs",
+            Via(DISPATCH, "releases the claim of a dispatched step sweep via run_claim_release_edit"),
+        ),
+        (
             "sweep_registry/roll_requeue.rs",
             Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
         ),
+        ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
             "sweep_registry/prless_retry/hold.rs",
@@ -485,8 +505,6 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
         ("forge_rerun.rs", Gated),
-        ("merge_pr/redate.rs", ShellVetted("merge-pr.sh")),
-        ("merge_pr/redate/sync_handoff.rs", ShellVetted("merge-pr.sh")),
         (
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
@@ -546,6 +564,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("operator_decision/cli.rs", Gated),
         ("cli/labels_migrate.rs", Gated),
+        (
+            "cli/labels_migrate_holds.rs",
+            Via("cli/labels_migrate.rs", "labels migrate --holds, gated by its write_gate"),
+        ),
         ("cli/curation_complete.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
@@ -631,7 +653,6 @@ fn daemon_write_paths_are_scoped() {
             "observability/pick_journal.rs",
             NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
         ),
-        ("terminal.rs", NotAWrite("tmux flags")),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
         (
             "merge_group_ci/eligibility.rs",

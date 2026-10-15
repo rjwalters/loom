@@ -122,7 +122,7 @@ fn mergeable_parse_treats_anything_unexpected_as_unknown() {
 
 #[test]
 fn held_prs_are_never_touched() {
-    for hold in VERDICT_HOLD_LABELS {
+    for hold in VERDICT_HOLD_LABELS.iter() {
         assert_eq!(
             decide_review_conflict(&pr(Mergeable::Conflicting, &[REVIEW_REQUESTED, hold])),
             ConflictAction::Keep(ConflictKeepReason::Held)
@@ -329,11 +329,11 @@ fn one_unfiltered_listing_per_workspace() {
     assert!(calls.lines().all(|l| !l.starts_with("pr list")), "{calls}");
 }
 
-/// Client-side filter: only PRs carrying either label are decided on, and a
-/// PR carrying both is one candidate. `mergeable` is read only for a
+/// Client-side filter: only PRs carrying one of the three labels are decided
+/// on (#12041 added `loom:pr`), and a PR carrying several is one candidate. `mergeable` is read only for a
 /// candidate whose decision it can change (not a held or in-flight one).
 #[test]
-fn conflict_candidates_keeps_only_the_two_labels() {
+fn conflict_candidates_keeps_only_the_three_labels() {
     use super::open_pr_listing::test_support::{listing, row};
     let rows = crate::forge_pull_listing::parse_rest_pulls(&listing(&[
         row(1, &["loom:pr"]),
@@ -349,8 +349,8 @@ fn conflict_candidates_keeps_only_the_two_labels() {
         read.push(n);
         (Mergeable::Conflicting, Some(format!("{n:040x}")))
     });
-    assert_eq!(got.keys().copied().collect::<Vec<_>>(), vec![2, 3, 5, 6]);
-    assert_eq!(read, vec![2, 3], "held / in-flight PRs are never read");
+    assert_eq!(got.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3, 5, 6]);
+    assert_eq!(read, vec![1, 2, 3], "held / in-flight PRs are never read");
     assert_eq!(got[&2].mergeable, Mergeable::Conflicting);
     assert_eq!(got[&5].mergeable, Mergeable::Unknown);
     assert_eq!(got[&2].head_sha.as_deref(), Some(format!("{:040x}", 2).as_str()));

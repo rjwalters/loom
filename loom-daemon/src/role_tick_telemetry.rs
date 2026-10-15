@@ -111,6 +111,9 @@ pub struct RoleTickTelemetry {
     /// Which credential pool gated a pre-spawn pool skip (Issue #8408) — see
     /// [`RoleTickOutcome::gated_pool`]. `None` for every other result.
     pub gated_pool: Option<String>,
+    /// The closed-vocabulary class of a failed tick (#12028); `None` for
+    /// every other result.
+    pub failure_class: Option<String>,
     /// Tier of the ordered-preference list this tick launched on (Issue
     /// #8599), when a list chose its tap. `None` on the static path.
     pub preference_tier: Option<u32>,
@@ -120,6 +123,15 @@ pub struct RoleTickTelemetry {
     /// The role draw's decision record when `runtimes.roleDraw` chose the
     /// tap (#11726).
     pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
+    /// The step's sweep id when a step-engine step, not a role tick, ran
+    /// (#11906); the record then carries `source = "step"`.
+    pub step_sweep_id: Option<String>,
+    /// The host limit that deferred this repo's tick (#12084); `Some` exactly
+    /// when `result` is [`RoleTickResult::SkippedDeferred`].
+    pub deferred_by: Option<String>,
+    /// `<index>/<count>` of the shard that owns this repo (#12084), when the
+    /// host is sharded.
+    pub shard_owner: Option<String>,
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -267,7 +279,7 @@ pub fn emit_for_tick(
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
 ) {
-    emit_for_tick_correlated(root, role, started_at, outcome, resolved, None);
+    emit_for_tick_correlated(root, role, started_at, outcome, resolved, None, None);
 }
 
 pub fn emit_for_tick_correlated(
@@ -277,6 +289,73 @@ pub fn emit_for_tick_correlated(
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
+    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+) {
+    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None);
+}
+
+/// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
+/// record marked `source = "step"` with the step's sweep id, so it is never
+/// counted as a role-runner tick.
+pub fn emit_for_step(
+    root: &Path,
+    role: &str,
+    started_at: DateTime<Utc>,
+    outcome: &RoleTickOutcome,
+    resolved: Option<ResolvedLaunch>,
+    sweep_id: &str,
+) {
+    emit_tick(
+        root,
+        role,
+        started_at,
+        outcome,
+        resolved,
+        None,
+        None,
+        Some(sweep_id.to_string()),
+    );
+}
+
+/// The `loom.failure_class` of a failed tick (#12028), `None` for any other
+/// result. A launched tick reuses the class its `role_attempt` span closed
+/// with (`trace.failure`, no second classifier); a tick refused before launch
+/// uses the class its site noted; a failure with neither falls back to an
+/// explicit `unclassified:*` label, never an absent attribute.
+fn failure_class_of(
+    outcome: &RoleTickOutcome,
+    trace: Option<&crate::observability::lifecycle::RoleTrace>,
+    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+    is_step: bool,
+) -> Option<String> {
+    use crate::observability::lifecycle::{UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP};
+    if !matches!(outcome, RoleTickOutcome::Failure(_)) {
+        return None;
+    }
+    let class = trace
+        .and_then(|t| t.failure.as_ref())
+        .or(unlaunched.as_ref())
+        .map(|f| f.class().to_string());
+    Some(class.unwrap_or_else(|| {
+        if is_step {
+            UNCLASSIFIED_STEP
+        } else {
+            UNCLASSIFIED_PRE_LAUNCH
+        }
+        .to_string()
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tick(
+    root: &Path,
+    role: &str,
+    started_at: DateTime<Utc>,
+    outcome: &RoleTickOutcome,
+    resolved: Option<ResolvedLaunch>,
+    trace: Option<crate::observability::lifecycle::RoleTrace>,
+    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+    step_sweep_id: Option<String>,
 ) {
     // #10212: the gate listing this tick read, as a ranked `pick.decision`.
     crate::observability::pick_decision::emit_role_tick(
@@ -284,7 +363,7 @@ pub fn emit_for_tick_correlated(
         role,
         started_at,
         outcome,
-        trace.as_ref().map(|t| t.execution.clone()),
+        trace.as_ref(),
     );
     let (result, detail) = classify(outcome);
     let (model, effort) = match &resolved {
@@ -309,11 +388,20 @@ pub fn emit_for_tick_correlated(
             effort,
             detail,
             gated_pool: outcome.gated_pool().map(str::to_string),
+            failure_class: failure_class_of(
+                outcome,
+                trace.as_ref(),
+                unlaunched,
+                step_sweep_id.is_some(),
+            ),
             preference_tier: preference
                 .as_ref()
                 .and_then(|stamp| u32::try_from(stamp.tier).ok()),
             preference_tap: preference.map(|stamp| stamp.tap),
             role_draw,
+            step_sweep_id,
+            deferred_by: None,
+            shard_owner: None,
         },
         trace,
     );
@@ -613,6 +701,10 @@ pub fn build_record(
         effort: tick.effort.clone().filter(|e| !e.is_empty()),
         detail: tick.detail.clone().filter(|d| !d.is_empty()),
         gated_pool: tick.gated_pool.clone().filter(|p| !p.is_empty()),
+        failure_class: tick
+            .failure_class
+            .clone()
+            .filter(|c| !c.is_empty() && matches!(tick.result, RoleTickResult::Failure)),
         preference_tier: tick.preference_tier,
         preference_tap: tick.preference_tap.clone().filter(|t| !t.is_empty()),
         role_draw: tick.role_draw.clone(),
@@ -625,6 +717,13 @@ pub fn build_record(
         tokens_by_model,
         models_used,
         actions,
+        source: tick
+            .step_sweep_id
+            .as_ref()
+            .map(|_| crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string()),
+        sweep_id: tick.step_sweep_id.clone(),
+        deferred_by: tick.deferred_by.clone().filter(|d| !d.is_empty()),
+        shard_owner: tick.shard_owner.clone().filter(|s| !s.is_empty()),
     }
 }
 
@@ -798,6 +897,10 @@ fn emit_correlated(
             path.display()
         );
     }
+    // #11858: the record also goes to SigNoz, joined to the tick's trace, so
+    // a tick that never spawned (pool exhausted, runtime rejected, queue
+    // empty) is visible there. The journal above stays the local copy.
+    export(&envelope);
     // #9168: join the story of every issue/PR this tick wrote to — after the
     // durable record, so a slow forge lookup can never cost the tick record.
     if let (Some(trace), Some(rows)) = (&trace, &tokens_by_model) {
@@ -838,6 +941,30 @@ fn emit_correlated(
         };
         story::emit(&tick.root, &facts, &targets);
     }
+}
+
+/// Offer a `role_tick.outcome` envelope to the OTLP exporters (#11858). A
+/// no-op with no OTLP exporter; the record's mapping exports no free-form
+/// `detail`.
+fn export(envelope: &TelemetryEnvelope) {
+    if crate::observability::ops::records_exported() {
+        crate::observability::ops::emit_record_in(
+            exportable(envelope.record.clone()),
+            envelope.trace_context.clone(),
+        );
+    }
+}
+
+/// The exported copy of a record: a repo that is not a forge `owner/repo`
+/// (the local journal's path fallback) reads `repo_unresolved`, so no local
+/// path reaches the wire (#9442).
+fn exportable(mut record: TelemetryRecord) -> TelemetryRecord {
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut record {
+        if !crate::agent_gh::classify::is_slug(&r.repo) {
+            r.repo = crate::observability::pick_decision::REPO_UNRESOLVED.to_string();
+        }
+    }
+    record
 }
 
 /// Whether the role log's last preference marker records a metered-backstop
@@ -906,6 +1033,7 @@ pub fn label_spawned(label: &str) -> Option<bool> {
         .map(RoleTickResult::spawned)
 }
 
+pub mod deferred;
 pub mod story;
 pub mod targets;
 pub mod usage;

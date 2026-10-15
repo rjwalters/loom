@@ -1,0 +1,1879 @@
+{
+  "_comment": [
+    "Issue #11895: the step engine's state -> step classifier (design #11894, §4.1),",
+    "pinned once for loom-daemon's work_finder::step_item::classify",
+    "(loom-daemon/src/work_finder/step_item_tests.rs) and for a TypeScript twin to come.",
+    "Each case's `inputs` deserialize directly into step_item::Inputs; `expected` is the",
+    "classified item list in order: issue items by issue number, then PR-only items by PR",
+    "number. `lane` defaults to \"normal\" and `send_back` to false.",
+    "Park kinds, merged-link kinds, merge-queue membership and markers are computed by the",
+    "caller (from the body parsers and trusted comments); the classifier never reads the forge."
+  ],
+  "cases": [
+    {
+      "name": "unlabeled issue: Curator",
+      "inputs": {
+        "issues": [
+          {
+            "number": 1,
+            "labels": [
+              "points:3"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 1,
+          "pr": null,
+          "state": "unlabeled",
+          "verdict": {
+            "step": "curator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:triage: Curator",
+      "inputs": {
+        "issues": [
+          {
+            "number": 2,
+            "labels": [
+              "loom:triage"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 2,
+          "pr": null,
+          "state": "triage",
+          "verdict": {
+            "step": "curator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "retired revise label reads as loom:triage (and drops loom:curated); a trusted send-back is flagged",
+      "inputs": {
+        "issues": [
+          {
+            "number": 3,
+            "labels": [
+              "loom:needs-revision",
+              "loom:curated"
+            ],
+            "markers": {
+              "send_back": true
+            }
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 3,
+          "pr": null,
+          "state": "triage",
+          "verdict": {
+            "step": "curator"
+          },
+          "send_back": true
+        }
+      ]
+    },
+    {
+      "name": "loom:decision-malformed: Curator repairs it",
+      "inputs": {
+        "issues": [
+          {
+            "number": 4,
+            "labels": [
+              "loom:decision-malformed"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 4,
+          "pr": null,
+          "state": "decision_malformed",
+          "verdict": {
+            "step": "curator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "landed: a merged closing PR, issue still open: Curator keep-or-close",
+      "inputs": {
+        "issues": [
+          {
+            "number": 10,
+            "labels": [
+              "loom:issue"
+            ],
+            "merged_links": [
+              {
+                "pr": 900,
+                "kind": "closes"
+              }
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 10,
+          "pr": null,
+          "state": "landed",
+          "verdict": {
+            "step": "curator_keep_or_close"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a merged Part-of PR does not land the issue: Builder",
+      "inputs": {
+        "issues": [
+          {
+            "number": 11,
+            "labels": [
+              "loom:issue"
+            ],
+            "merged_links": [
+              {
+                "pr": 901,
+                "kind": "part_of"
+              }
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 11,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a landing Curator already kept is not routed again",
+      "inputs": {
+        "issues": [
+          {
+            "number": 12,
+            "labels": [
+              "loom:issue"
+            ],
+            "merged_links": [
+              {
+                "pr": 902,
+                "kind": "closes"
+              }
+            ],
+            "markers": {
+              "landed_kept": [
+                902
+              ]
+            }
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 12,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a parked issue is never routed as landed",
+      "inputs": {
+        "issues": [
+          {
+            "number": 13,
+            "labels": [
+              "loom:issue",
+              "loom:blocked"
+            ],
+            "park": "dependency",
+            "merged_links": [
+              {
+                "pr": 903,
+                "kind": "closes"
+              }
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 13,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:curated: Champion promote",
+      "inputs": {
+        "issues": [
+          {
+            "number": 20,
+            "labels": [
+              "loom:curated"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 20,
+          "pr": null,
+          "state": "curated",
+          "verdict": {
+            "step": "champion_promote"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a proposal label (loom:architect) stays on Champion's non-item run: pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 21,
+            "labels": [
+              "loom:architect"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 21,
+          "pr": null,
+          "state": "proposal",
+          "verdict": {
+            "pass": "proposal"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a proposal that is also loom:curated is curated work: Champion promote",
+      "inputs": {
+        "issues": [
+          {
+            "number": 29,
+            "labels": [
+              "loom:hermit",
+              "loom:curated"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 29,
+          "pr": null,
+          "state": "curated",
+          "verdict": {
+            "step": "champion_promote"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a proposal already promoted to loom:issue (legacy label left on) is ready work: Builder",
+      "inputs": {
+        "issues": [
+          {
+            "number": 30,
+            "labels": [
+              "loom:auditor",
+              "loom:issue"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 30,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        }
+      ]
+    },
+    {
+      "name": "curated + blocked, dependency park: Champion re-evaluate (Champion re-checks the blockers on every draw, #12078)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 22,
+            "labels": [
+              "loom:curated",
+              "loom:blocked"
+            ],
+            "park": "dependency"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 22,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "step": "champion_reevaluate"
+          }
+        }
+      ]
+    },
+    {
+      "name": "curated + blocked, dependency park, a blocker still open: still a Champion re-evaluate (the classifier does not read blockers, #12078)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 23,
+            "labels": [
+              "loom:curated",
+              "loom:blocked"
+            ],
+            "park": "dependency"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 23,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "step": "champion_reevaluate"
+          }
+        }
+      ]
+    },
+    {
+      "name": "fast-fail park (quarantine record) is not a dependency park",
+      "inputs": {
+        "issues": [
+          {
+            "number": 24,
+            "labels": [
+              "loom:curated",
+              "loom:blocked"
+            ],
+            "park": "quarantine"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 24,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "PR-less hold record is not a dependency park",
+      "inputs": {
+        "issues": [
+          {
+            "number": 25,
+            "labels": [
+              "loom:curated",
+              "loom:blocked"
+            ],
+            "park": "prless_hold"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 25,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Champion hold record is not a dependency park",
+      "inputs": {
+        "issues": [
+          {
+            "number": 26,
+            "labels": [
+              "loom:curated",
+              "loom:blocked"
+            ],
+            "park": "champion_hold"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 26,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "unstated park is not a dependency park",
+      "inputs": {
+        "issues": [
+          {
+            "number": 27,
+            "labels": [
+              "loom:curated",
+              "loom:blocked"
+            ],
+            "park": "unstated"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 27,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:issue + blocked dependency park: stays blocked, not a step (#11301)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 28,
+            "labels": [
+              "loom:issue",
+              "loom:blocked"
+            ],
+            "park": "dependency"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 28,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "promoted (curated + issue) + blocked dependency park: stays blocked, not a Champion step (curated survives promotion, #12078)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 536,
+            "labels": [
+              "loom:curated",
+              "loom:issue",
+              "loom:blocked"
+            ],
+            "park": "dependency"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 536,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:issue without a PR: Builder",
+      "inputs": {
+        "issues": [
+          {
+            "number": 30,
+            "labels": [
+              "loom:issue"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 30,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:building without a PR is a claim: pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 31,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 31,
+          "pr": null,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "capability-only park, capability held: Builder in the capability lane",
+      "inputs": {
+        "issues": [
+          {
+            "number": 32,
+            "labels": [
+              "loom:issue",
+              "loom:blocked"
+            ],
+            "park": "capability",
+            "capabilities": [
+              "host-sudo"
+            ]
+          }
+        ],
+        "pulls": [],
+        "host": {
+          "held_capabilities": [
+            "host-sudo"
+          ]
+        }
+      },
+      "expected": [
+        {
+          "issue": 32,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "step": "builder"
+          },
+          "lane": "capability"
+        }
+      ]
+    },
+    {
+      "name": "capability-only park, capability not held on this host: weight 0",
+      "inputs": {
+        "issues": [
+          {
+            "number": 33,
+            "labels": [
+              "loom:issue",
+              "loom:blocked"
+            ],
+            "park": "capability",
+            "capabilities": [
+              "host-sudo",
+              "tailnet-access"
+            ]
+          }
+        ],
+        "pulls": [],
+        "host": {
+          "held_capabilities": [
+            "host-sudo"
+          ]
+        }
+      },
+      "expected": [
+        {
+          "issue": 33,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "capability_missing"
+          }
+        }
+      ]
+    },
+    {
+      "name": "unmigrated loom:needs-capability reads as loom:blocked",
+      "inputs": {
+        "issues": [
+          {
+            "number": 34,
+            "labels": [
+              "loom:issue",
+              "loom:needs-capability"
+            ],
+            "park": "capability",
+            "capabilities": [
+              "host-sudo"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 34,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "capability_missing"
+          }
+        }
+      ]
+    },
+    {
+      "name": "linked PR loom:review-requested: Judge (the issue's loom:building is not a claim once a PR is open)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 40,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 500,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "## Summary\n\nCloses #40"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 40,
+          "pr": 500,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "linked PR loom:changes-requested: Doctor",
+      "inputs": {
+        "issues": [
+          {
+            "number": 41,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 501,
+            "labels": [
+              "loom:changes-requested"
+            ],
+            "same_repo": true,
+            "body": "## Summary\n\nCloses #41"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 41,
+          "pr": 501,
+          "state": "changes_requested",
+          "verdict": {
+            "step": "doctor"
+          }
+        }
+      ]
+    },
+    {
+      "name": "linked PR loom:pr: Champion merge",
+      "inputs": {
+        "issues": [
+          {
+            "number": 42,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 502,
+            "labels": [
+              "loom:pr"
+            ],
+            "same_repo": true,
+            "body": "## Summary\n\nCloses #42"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 42,
+          "pr": 502,
+          "state": "approved",
+          "verdict": {
+            "step": "champion_merge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:pr beside loom:changes-requested: loom:pr loses, Doctor",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 503,
+            "labels": [
+              "loom:pr",
+              "loom:changes-requested"
+            ],
+            "same_repo": true,
+            "body": "no link"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 503,
+          "state": "changes_requested",
+          "verdict": {
+            "step": "doctor"
+          }
+        }
+      ]
+    },
+    {
+      "name": "held PR: loom:pr + loom:blocked + trusted Champion hold marker: hold re-evaluation",
+      "inputs": {
+        "issues": [
+          {
+            "number": 43,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 504,
+            "labels": [
+              "loom:pr",
+              "loom:blocked"
+            ],
+            "same_repo": true,
+            "body": "## Summary\n\nCloses #43",
+            "markers": {
+              "champion_hold": true
+            }
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 43,
+          "pr": 504,
+          "state": "held",
+          "verdict": {
+            "step": "champion_hold_reevaluate"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:pr + loom:blocked without a trusted hold marker: pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 44,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 505,
+            "labels": [
+              "loom:pr",
+              "loom:blocked"
+            ],
+            "same_repo": true,
+            "body": "## Summary\n\nCloses #44"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 44,
+          "pr": 505,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "held PR sent to Doctor: Doctor while the cycle cap is not hit",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 506,
+            "labels": [
+              "loom:changes-requested",
+              "loom:blocked"
+            ],
+            "same_repo": true,
+            "body": "x",
+            "markers": {
+              "champion_hold": true
+            }
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 506,
+          "state": "held",
+          "verdict": {
+            "step": "doctor"
+          }
+        }
+      ]
+    },
+    {
+      "name": "held PR, Doctor cycle capped: pass",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 507,
+            "labels": [
+              "loom:changes-requested",
+              "loom:blocked"
+            ],
+            "same_repo": true,
+            "body": "x",
+            "markers": {
+              "champion_hold": true,
+              "doctor_cycle_capped": true
+            }
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 507,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "held PR handed back for review: Judge",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 508,
+            "labels": [
+              "loom:review-requested",
+              "loom:blocked"
+            ],
+            "same_repo": true,
+            "body": "x",
+            "markers": {
+              "champion_hold": true
+            }
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 508,
+          "state": "held",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "queued: a PR in GitHub's merge queue is never drawn again",
+      "inputs": {
+        "issues": [
+          {
+            "number": 45,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 509,
+            "labels": [
+              "loom:pr"
+            ],
+            "same_repo": true,
+            "body": "## Summary\n\nCloses #45",
+            "queued": true
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 45,
+          "pr": 509,
+          "state": "queued",
+          "verdict": {
+            "pass": "queued"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:sequenced PR: pass",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 510,
+            "labels": [
+              "loom:pr",
+              "loom:sequenced"
+            ],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 510,
+          "state": "sequenced",
+          "verdict": {
+            "pass": "sequenced"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a PR with no stage label: pass",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 511,
+            "labels": [],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 511,
+          "state": "no_stage",
+          "verdict": {
+            "pass": "no_stage"
+          }
+        }
+      ]
+    },
+    {
+      "name": "PR claims (loom:reviewing, loom:treating): pass",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 512,
+            "labels": [
+              "loom:review-requested",
+              "loom:reviewing"
+            ],
+            "same_repo": true,
+            "body": "x"
+          },
+          {
+            "number": 513,
+            "labels": [
+              "loom:changes-requested",
+              "loom:treating"
+            ],
+            "same_repo": true,
+            "body": "y"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 512,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        },
+        {
+          "issue": null,
+          "pr": 513,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a Part-of PR joins its issue (open-PR guard link rule)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 50,
+            "labels": [
+              "loom:blocked"
+            ],
+            "park": "dependency"
+          }
+        ],
+        "pulls": [
+          {
+            "number": 514,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Part of #50 (phase 2)"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 50,
+          "pr": 514,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "the Builder branch links without a phrase",
+      "inputs": {
+        "issues": [
+          {
+            "number": 51,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 515,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "no phrase",
+            "head_ref": "feature/issue-51"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 51,
+          "pr": 515,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a fork PR by a known-untrusted author does not join",
+      "inputs": {
+        "issues": [
+          {
+            "number": 52,
+            "labels": [
+              "loom:issue"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 516,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": false,
+            "body": "## Summary\n\nCloses #52",
+            "author_untrusted": true
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 52,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        },
+        {
+          "issue": null,
+          "pr": 516,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "two PRs on one issue: the lowest joins, the other is its own item",
+      "inputs": {
+        "issues": [
+          {
+            "number": 53,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 518,
+            "labels": [
+              "loom:pr"
+            ],
+            "same_repo": true,
+            "body": "## Summary\n\nCloses #53"
+          },
+          {
+            "number": 517,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Part of #53 (phase 2)"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 53,
+          "pr": 517,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        },
+        {
+          "issue": null,
+          "pr": 518,
+          "state": "approved",
+          "verdict": {
+            "step": "champion_merge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "one PR closing two issues: the lower issue owns it, the other shares it",
+      "inputs": {
+        "issues": [
+          {
+            "number": 54,
+            "labels": [
+              "loom:building"
+            ]
+          },
+          {
+            "number": 55,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 519,
+            "labels": [
+              "loom:pr"
+            ],
+            "same_repo": true,
+            "body": "Closes #54\nCloses #55"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 54,
+          "pr": 519,
+          "state": "approved",
+          "verdict": {
+            "step": "champion_merge"
+          }
+        },
+        {
+          "issue": 55,
+          "pr": 519,
+          "state": "shared_pr",
+          "verdict": {
+            "pass": "shared_pr"
+          }
+        }
+      ]
+    },
+    {
+      "name": "phase PR (Closes #child, Part of #epic, epic lower): the PR joins the child it closes; the epic shares it",
+      "inputs": {
+        "issues": [
+          {
+            "number": 80,
+            "labels": [
+              "loom:epic"
+            ]
+          },
+          {
+            "number": 81,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 530,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Closes #81\nPart of #80"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 80,
+          "pr": 530,
+          "state": "shared_pr",
+          "verdict": {
+            "pass": "shared_pr"
+          }
+        },
+        {
+          "issue": 81,
+          "pr": 530,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "phase PR, a hold on the child: the item passes",
+      "inputs": {
+        "issues": [
+          {
+            "number": 82,
+            "labels": [
+              "loom:epic"
+            ]
+          },
+          {
+            "number": 83,
+            "labels": [
+              "loom:building",
+              "loom:operator"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 531,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Part of #82\nCloses #83"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 82,
+          "pr": 531,
+          "state": "shared_pr",
+          "verdict": {
+            "pass": "shared_pr"
+          }
+        },
+        {
+          "issue": 83,
+          "pr": 531,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "phase PR, a hold on the epic: the child's item passes too",
+      "inputs": {
+        "issues": [
+          {
+            "number": 84,
+            "labels": [
+              "loom:epic",
+              "loom:frozen"
+            ]
+          },
+          {
+            "number": 85,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 532,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Closes #85\nPart of #84"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 84,
+          "pr": 532,
+          "state": "frozen",
+          "verdict": {
+            "pass": "frozen"
+          }
+        },
+        {
+          "issue": 85,
+          "pr": 532,
+          "state": "frozen",
+          "verdict": {
+            "pass": "frozen"
+          }
+        }
+      ]
+    },
+    {
+      "name": "phase PR, a claim on the epic (not loom:building): the child's item passes",
+      "inputs": {
+        "issues": [
+          {
+            "number": 86,
+            "labels": [
+              "loom:epic",
+              "loom:curating"
+            ]
+          },
+          {
+            "number": 87,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 533,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Closes #87\nPart of #86"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 86,
+          "pr": 533,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        },
+        {
+          "issue": 87,
+          "pr": 533,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a zero-padded or signed branch name links no issue",
+      "inputs": {
+        "issues": [
+          {
+            "number": 88,
+            "labels": [
+              "loom:issue"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 534,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "x",
+            "head_ref": "feature/issue-088"
+          },
+          {
+            "number": 535,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "x",
+            "head_ref": "feature/issue-+88"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 88,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        },
+        {
+          "issue": null,
+          "pr": 534,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        },
+        {
+          "issue": null,
+          "pr": 535,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a PR whose issue is not open is its own item",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 520,
+            "labels": [
+              "loom:pr"
+            ],
+            "same_repo": true,
+            "body": "## Summary\n\nCloses #9999"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 520,
+          "state": "approved",
+          "verdict": {
+            "step": "champion_merge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:operator: pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 60,
+            "labels": [
+              "loom:issue",
+              "loom:operator"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 60,
+          "pr": null,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "retired loom:operator-only folds into loom:operator: pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 61,
+            "labels": [
+              "loom:curated",
+              "loom:operator-only"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 61,
+          "pr": null,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:operator on the PR: pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 62,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 521,
+            "labels": [
+              "loom:pr",
+              "loom:operator"
+            ],
+            "same_repo": true,
+            "body": "## Summary\n\nCloses #62"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 62,
+          "pr": 521,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:frozen: pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 63,
+            "labels": [
+              "loom:triage",
+              "loom:frozen"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 63,
+          "pr": null,
+          "state": "frozen",
+          "verdict": {
+            "pass": "frozen"
+          }
+        }
+      ]
+    },
+    {
+      "name": "external (hard exclusion): pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 64,
+            "labels": [
+              "external"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 64,
+          "pr": null,
+          "state": "excluded",
+          "verdict": {
+            "pass": "hard_exclusion"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:curating / loom:evaluating claims: pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 65,
+            "labels": [
+              "loom:triage",
+              "loom:curating"
+            ]
+          },
+          {
+            "number": 66,
+            "labels": [
+              "loom:curated",
+              "loom:evaluating"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 65,
+          "pr": null,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        },
+        {
+          "issue": 66,
+          "pr": null,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "loom:epic: pass",
+      "inputs": {
+        "issues": [
+          {
+            "number": 67,
+            "labels": [
+              "loom:epic"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 67,
+          "pr": null,
+          "state": "epic",
+          "verdict": {
+            "pass": "epic"
+          }
+        }
+      ]
+    },
+    {
+      "name": "red-main fix on a red repo keeps its lane; its step is still its stage's",
+      "inputs": {
+        "issues": [
+          {
+            "number": 70,
+            "labels": [
+              "loom:triage"
+            ],
+            "red_fix": true
+          },
+          {
+            "number": 71,
+            "labels": [
+              "loom:issue"
+            ],
+            "red_fix": true
+          },
+          {
+            "number": 72,
+            "labels": [
+              "loom:issue"
+            ]
+          }
+        ],
+        "pulls": [],
+        "repo": {
+          "main_red": true
+        }
+      },
+      "expected": [
+        {
+          "issue": 70,
+          "pr": null,
+          "state": "triage",
+          "verdict": {
+            "step": "curator"
+          },
+          "lane": "red_main"
+        },
+        {
+          "issue": 71,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          },
+          "lane": "red_main"
+        },
+        {
+          "issue": 72,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        }
+      ]
+    },
+    {
+      "name": "red-main marker on a green repo is inert",
+      "inputs": {
+        "issues": [
+          {
+            "number": 73,
+            "labels": [
+              "loom:issue"
+            ],
+            "red_fix": true
+          }
+        ],
+        "pulls": [],
+        "repo": {
+          "main_red": false
+        }
+      },
+      "expected": [
+        {
+          "issue": 73,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        }
+      ]
+    }
+  ]
+}

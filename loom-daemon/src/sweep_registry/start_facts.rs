@@ -1,6 +1,6 @@
 //! A sweep's dispatch-time facts (Issue #11280): model, effort, runtime and
-//! attempt lineage, put on `sweep.global.dispatch` (so on `sweep.started`)
-//! and kept for `fleet.state`'s running rows. No forge read: the repo slug
+//! attempt lineage, put on `sweep.global.dispatch` (so on `sweep.started`).
+//! No forge read: the repo slug
 //! comes from the cache the park-label guard already filled, and the lineage
 //! from this host's outcome journal, exactly as `sweep.outcome` derives it.
 
@@ -11,6 +11,7 @@ use crate::telemetry::SweepStartFacts;
 
 impl SweepRegistry {
     /// The start facts of every sweep this daemon dispatched and still holds.
+    #[cfg(test)]
     pub(crate) fn start_facts_snapshot(&self) -> HashMap<SweepId, SweepStartFacts> {
         self.start_facts.clone()
     }
@@ -93,11 +94,12 @@ impl SweepRegistry {
                 self.start_facts.insert(sweep_id.clone(), facts.clone());
                 Some(Box::new(facts))
             }
-            _ => None,
+            // A step's start facts are the step spawn's (#11906).
+            (SweepKind::Issue(_) | SweepKind::Step { .. } | SweepKind::PrSet(_), _) => None,
         };
         let curator_issue = match (&kind, &start) {
             (SweepKind::Issue(issue), Some(_)) => Some(*issue),
-            _ => None,
+            (SweepKind::Issue(_) | SweepKind::Step { .. } | SweepKind::PrSet(_), _) => None,
         };
         self.emit_event(Event::SweepGlobalDispatch {
             sweep_id: sweep_id.clone(),

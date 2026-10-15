@@ -5,11 +5,46 @@ use super::{
     RepoVisibility,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
-use crate::telemetry::{PhaseDuration, PhaseTapUsageRow, SweepOutcomeRecord, SweepStartFacts};
+use crate::telemetry::{
+    PhaseDuration, PhaseTapUsageRow, RoleTickResult, SweepOutcomeRecord, SweepStartFacts,
+};
+use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
+
 pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
     match visibility {
         RepoVisibility::Public => "public",
         RepoVisibility::Private => "private",
+    }
+}
+
+/// The wire string for a role-tick result (Issue #8056) — the serde
+/// `rename_all = "snake_case"` spelling, restated here so the OTLP attribute
+/// value matches the JSON one exactly.
+pub(super) fn role_tick_result_str(result: RoleTickResult) -> &'static str {
+    match result {
+        RoleTickResult::Success => "success",
+        RoleTickResult::Failure => "failure",
+        RoleTickResult::RuntimeRejected => "runtime_rejected",
+        RoleTickResult::SkippedNoTokenPool => "skipped_no_token_pool",
+        RoleTickResult::SkippedPoolExhausted => "skipped_pool_exhausted",
+        RoleTickResult::SkippedModelRuntimeMismatch => "skipped_model_runtime_mismatch",
+        RoleTickResult::SkippedLoad => "skipped_load",
+        RoleTickResult::SkippedQueueEmpty => "skipped_queue_empty",
+        RoleTickResult::SkippedDeferred => "skipped_deferred",
+    }
+}
+
+/// Only an outright `failure` is an error; every *skip* is `Info` (Issue
+/// #8056/#7607 — a fleet-wide exhausted pool's identical skips must not page
+/// as hundreds of broken roles), and a fail-closed runtime rejection is a
+/// `Warn` config signal.
+pub(super) fn severity_for_role_tick(result: RoleTickResult) -> SeverityNumber {
+    match result {
+        RoleTickResult::Failure => SeverityNumber::Error,
+        RoleTickResult::RuntimeRejected | RoleTickResult::SkippedModelRuntimeMismatch => {
+            SeverityNumber::Warn
+        }
+        _ => SeverityNumber::Info,
     }
 }
 

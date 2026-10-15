@@ -41,18 +41,18 @@ impl SweepRegistry {
             let Some(park) = ParkKind::from_tag(&h.park) else {
                 continue;
             };
+            // A pre-#12024 file stored the whole fingerprint; the streak now
+            // compares its digest.
+            let fingerprint = if is_digest(&h.fingerprint) {
+                h.fingerprint
+            } else {
+                legacy_digest(&h.fingerprint)
+            };
+            let count = self.noop_cooldown_config.hold_threshold;
             self.noop_cooldown
                 .streaks
                 .entry(issue)
-                .or_insert(NoopStreak {
-                    count: self.noop_cooldown_config.hold_threshold,
-                    fingerprint: h.fingerprint,
-                    last_sweep: None,
-                    park,
-                    held: true,
-                    failure_notice_posted: false,
-                    checked_at: None,
-                });
+                .or_insert_with(|| NoopStreak::recovered(count, fingerprint, park));
         }
         self.noop_cooldown.persisted = raw;
     }
@@ -66,7 +66,7 @@ impl SweepRegistry {
             .noop_cooldown
             .streaks
             .iter()
-            .filter(|(_, s)| s.held)
+            .filter(|(_, s)| s.held && !s.adopted)
             .map(|(i, s)| {
                 (
                     *i,

@@ -5,7 +5,7 @@
 # completes. This script is the pure decision behind its `resolve` job: the
 # workflow gathers the facts (event fields, VERSION at the tested commit, the
 # existing tags, ancestry against `main`) and acts on the answer; nothing here
-# touches the network, so every case is unit-tested by test-release-decision.sh.
+# touches the network.
 #
 # Inputs (environment):
 #   WR_CONCLUSION    github.event.workflow_run.conclusion

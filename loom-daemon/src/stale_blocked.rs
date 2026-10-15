@@ -66,15 +66,9 @@ pub mod batch;
 pub mod budget;
 pub mod hold;
 pub mod notify;
-pub mod release;
-pub mod release_gh;
-pub mod release_outcome;
-pub mod release_task;
-pub mod unnamed;
 
-// The release pass's per-artifact verdicts and their SigNoz export (#10752).
-pub mod release_items;
-pub mod release_telemetry;
+// Why an artifact could not be read (#12036).
+pub mod unreadable;
 
 // Champion's merge-risk hold digest is exempt from the gather (#9397).
 pub mod digest;
@@ -107,9 +101,9 @@ impl Artifact {
 /// The PR-side transposition of `guide.md`'s `has_superseding_block` (#4634,
 /// extended #7267), and the transposition is where the care is:
 ///
-/// - `loom:operator` / `loom:operator-only` belong here. A human decision is
-///   pending on this exact artifact, so reporting it as ready to unpark invites
-///   an agent to walk over that decision.
+/// - `loom:operator` (and the retired names that fold into it, #11795) belong
+///   here. A human decision is pending on this exact artifact, so reporting it
+///   as ready to unpark invites an agent to walk over that decision.
 /// - `loom:changes-requested`, `loom:review-requested`, `loom:ci-failure`
 ///   deliberately do **not**. On an *issue*, an open linked PR carrying
 ///   `loom:changes-requested` is a superseding block because it means the
@@ -120,7 +114,7 @@ impl Artifact {
 ///   re-create the stall this check exists to surface.
 /// - `loom:blocked` itself is obviously excluded — it is the label under
 ///   evaluation.
-const PR_SELF_BLOCK_LABELS: [&str; 2] = ["loom:operator", "loom:operator-only"];
+use crate::work_finder::OPERATOR_HOLD_NAMES as PR_SELF_BLOCK_LABELS;
 
 /// What one issue's three re-checks found, in `dep_recheck`'s own types.
 ///
@@ -498,13 +492,7 @@ mod batch_tests;
 mod budget_tests;
 
 #[cfg(test)]
-mod release_tests;
-
-#[cfg(test)]
 mod notify_tests;
 
 #[cfg(test)]
 mod archived_tests;
-
-#[cfg(test)]
-mod unnamed_tests;

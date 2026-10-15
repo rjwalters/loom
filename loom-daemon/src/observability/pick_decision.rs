@@ -32,14 +32,17 @@ use super::pick_journal::{
 };
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
+use crate::step_dispatch::item_draw::{Candidate, DrawRecord, Exclusion, ITEM_DRAW_SEED_SCHEME};
 use crate::telemetry::kinds::pick_decision::{
     source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
-    PickDrawCandidate, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict,
-    PickViDemotion, PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
+    PickDrawCandidate, PickItemDraw, PickItemDrawStep, PickItemExclusion, PickItemPoolEntry,
+    PickLane, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion,
+    PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
 use crate::work_finder::halt_cause::HaltCause;
+use crate::work_finder::step_item::Lane;
 use crate::work_finder::vi_cap::ViDemotion;
 use crate::work_finder::workspace_draw::{self, DrawLog};
 
@@ -58,6 +61,39 @@ thread_local! {
     static GATE_LISTINGS: RefCell<Vec<(std::path::PathBuf, String, Vec<GateRow>)>> =
         const { RefCell::new(Vec::new()) };
 }
+
+thread_local! {
+    /// The lane plan the admission of this thread's run computed (#10630).
+    static LANE_PLAN: RefCell<Vec<crate::role_runner::concurrent_dispatch::lane_rule::RepoLane>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Stash the per-repository lane plan the admission computed, for the run's
+/// end-of-tick record (#10630).
+pub fn stash_lane_plan(
+    _root: &Path,
+    plan: Vec<crate::role_runner::concurrent_dispatch::lane_rule::RepoLane>,
+) {
+    LANE_PLAN.with(|s| *s.borrow_mut() = plan);
+}
+
+fn take_lane_plan() -> Vec<PickLane> {
+    LANE_PLAN.with(|s| {
+        std::mem::take(&mut *s.borrow_mut())
+            .into_iter()
+            .take(MAX_PICK_LANES)
+            .map(|r| PickLane {
+                repo: repo_label(&r.root),
+                debt: r.debt,
+                wanted: r.wanted,
+                lanes: r.lanes,
+            })
+            .collect()
+    })
+}
+
+/// Most repositories one record lists lanes for.
+const MAX_PICK_LANES: usize = 32;
 
 /// Stash the open PR rows of a gate listing the role runner already made.
 pub fn record_gate_listing(root: &Path, label: &str, rows: &[RestIssue]) {
@@ -78,6 +114,7 @@ pub fn record_gate_listing(root: &Path, label: &str, rows: &[RestIssue]) {
 /// Drop anything stashed by an earlier tick on this (reused) blocking thread.
 pub fn clear_gate_listings() {
     GATE_LISTINGS.with(|s| s.borrow_mut().clear());
+    LANE_PLAN.with(|s| s.borrow_mut().clear());
     super::pick_journal::discard();
 }
 
@@ -93,7 +130,7 @@ fn take_gate_listings(root: &Path) -> Vec<(String, Vec<GateRow>)> {
 
 /// The forge slug for `root`, from its `origin` remote (a local git call,
 /// cached per root), or [`REPO_UNRESOLVED`].
-fn repo_label(root: &Path) -> String {
+pub(crate) fn repo_label(root: &Path) -> String {
     static CACHE: OnceLock<Mutex<HashMap<std::path::PathBuf, String>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = cache
@@ -113,12 +150,30 @@ fn repo_label(root: &Path) -> String {
 }
 
 fn emit(record: PickDecisionRecord) {
+    emit_in(record, None);
+}
+
+/// [`emit`] joined to a role tick's trace (#11858), so every chunk's log
+/// record carries the tick's trace id.
+fn emit_in(record: PickDecisionRecord, context: Option<&crate::telemetry::trace::TraceContext>) {
     if let Some(sink) = super::ops::global_ops_sink() {
         // A record over the byte budget is split, never truncated (#11567):
         // the chunks share `tick_id` and their union is the original.
         for chunk in split_into_chunks(record, CHUNK_BYTES) {
-            sink.emit_record(TelemetryRecord::PickDecision(chunk));
+            sink.emit_record_in(TelemetryRecord::PickDecision(chunk), context.cloned());
         }
+    }
+}
+
+/// Always drains the stash (it must not leak into the next tick on this
+/// thread); converts it (a cached local `git` read per repository) only with an
+/// exporter running.
+fn take_lane_plan_if_exporting() -> Vec<PickLane> {
+    if exporting() {
+        take_lane_plan()
+    } else {
+        LANE_PLAN.with(|s| s.borrow_mut().clear());
+        Vec::new()
     }
 }
 
@@ -129,7 +184,8 @@ fn exporting() -> bool {
 /// The part of a ready-queue row's `detail` a record may carry: a
 /// file-overlap deferral's shared paths (#9781, daemon-templated from parsed
 /// paths) and a halted row's cause token, only when it is in the closed
-/// [`HaltCause`] vocabulary (#11811). Every other detail (e.g. free-form
+/// [`HaltCause`] vocabulary (#11811), and an `already_landed` row's
+/// evidence token (#11858). Every other detail (e.g. free-form
 /// dispatch-error text) is dropped.
 fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
     let detail = detail?;
@@ -138,6 +194,11 @@ fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Opt
         QueueDisposition::WorkspaceHalted => {
             HaltCause::from_wire(detail).map(|c| c.as_str().to_string())
         }
+        // #11858: an already-landed row's evidence, closed vocabulary only.
+        QueueDisposition::AlreadyLanded => super::ops::queue::LANDED_EVIDENCE
+            .iter()
+            .find(|e| **e == detail)
+            .map(|e| (*e).to_string()),
         _ => None,
     }
 }
@@ -171,7 +232,13 @@ pub fn work_finder_record(
                 rank: u32::try_from(row.rank).unwrap_or(u32::MAX),
                 repo: resolve(&row.repo),
                 number: row.issue,
-                stage: "loom:issue".to_string(),
+                // A step-tick row names its step (#11909); an issue-sweep
+                // row is a `loom:issue` build.
+                stage: row
+                    .plan
+                    .step
+                    .as_ref()
+                    .map_or_else(|| "loom:issue".to_string(), crate::types::PlanStep::name),
                 sort_key: Some(PickSortKey {
                     name: "candidate_cmp".to_string(),
                     value,
@@ -193,7 +260,10 @@ pub fn work_finder_record(
         .collect();
     let outcome = if summary.dispatched > 0 {
         "dispatched"
-    } else if summary.halted {
+    } else if summary.halted_fully() {
+        // #11857: a partial hold (one held root among healthy ones with
+        // candidates) is not a halt; the outcome follows the rows, as the
+        // `loom.dispatch.tick` result does.
         "halted"
     } else if summary.queue.is_empty() {
         "idle"
@@ -253,6 +323,120 @@ pub fn workspace_draw_record(
     }
 }
 
+/// One workspace's item draws (#11896), as [`item_draw_record`] reads them.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemDrawWorkspace<'a> {
+    /// The forge slug: the `repo` the record names and the seed's
+    /// `workspace` input.
+    pub repo: &'a str,
+    /// [`Weighing::excluded`](crate::step_dispatch::item_draw::Weighing::excluded).
+    pub excluded: &'a std::collections::BTreeMap<Exclusion, usize>,
+    /// The pool before the first draw ([`crate::step_dispatch::item_draw::ItemDraw::starting_pool`]).
+    pub pool: &'a [Candidate],
+    /// The draws taken, in order.
+    pub draws: &'a [DrawRecord],
+    /// The draw stopped on a `WeightOverflow` (#11909).
+    pub overflow: bool,
+}
+
+/// The step engine's item draws for one tick (#11896) as `pick.decision`
+/// carries them: the `loom-draw/v2` seed inputs shared by every workspace,
+/// the weight-0 counts by reason and every draw's weight terms. `None` when
+/// no workspace was drawn.
+#[must_use]
+pub fn item_draw_record(
+    minute: u64,
+    host: &str,
+    tick_counter: u64,
+    workspaces: &[ItemDrawWorkspace<'_>],
+) -> Option<PickItemDraw> {
+    if workspaces.is_empty() {
+        return None;
+    }
+    let excluded = workspaces
+        .iter()
+        .flat_map(|w| {
+            w.excluded
+                .iter()
+                .map(|(&reason, &count)| PickItemExclusion {
+                    repo: w.repo.to_string(),
+                    reason: reason.as_str().to_string(),
+                    skip_reason: PickSkipReason::from_exclusion(reason),
+                    count,
+                })
+        })
+        .collect();
+    let draws: Vec<PickItemDrawStep> = workspaces
+        .iter()
+        .flat_map(|w| {
+            w.draws.iter().map(|d| {
+                let c = &d.picked;
+                PickItemDrawStep {
+                    repo: w.repo.to_string(),
+                    draw_index: d.draw_index,
+                    seed: d.seed.to_string(),
+                    pool_size: d.pool_size,
+                    total_weight: d.total_weight,
+                    roll: d.roll,
+                    picked_index: d.picked_index,
+                    number: c.target(),
+                    issue: c.item.issue,
+                    pr: c.item.pr,
+                    step: c.step.as_str().to_string(),
+                    weight: c.terms.weight,
+                    actionable: c.terms.actionable,
+                    priority: c.terms.priority,
+                    level: c.terms.level.as_str().to_string(),
+                    lane: lane_name(c.item.lane).to_string(),
+                    age_permille: c.terms.age_permille,
+                    age_minutes: c.terms.age_minutes,
+                    age_source: c.terms.age_source.as_str().to_string(),
+                }
+            })
+        })
+        .collect();
+    let pools = workspaces
+        .iter()
+        .flat_map(|w| {
+            w.pool.iter().enumerate().map(|(i, c)| PickItemPoolEntry {
+                repo: w.repo.to_string(),
+                index: u32::try_from(i).unwrap_or(u32::MAX),
+                number: c.target(),
+                issue: c.item.issue,
+                pr: c.item.pr,
+                step: c.step.as_str().to_string(),
+                weight: c.terms.weight,
+                priority: c.terms.priority,
+                age_permille: c.terms.age_permille,
+                age_source: c.terms.age_source.as_str().to_string(),
+            })
+        })
+        .collect();
+    Some(PickItemDraw {
+        seed_scheme: ITEM_DRAW_SEED_SCHEME.to_string(),
+        seed_minute: minute.to_string(),
+        seed_host: host.to_string(),
+        tick_counter: tick_counter.to_string(),
+        draws_total: draws.len(),
+        excluded,
+        pools,
+        draws,
+        weight_overflow: workspaces
+            .iter()
+            .filter(|w| w.overflow)
+            .map(|w| w.repo.to_string())
+            .collect(),
+    })
+}
+
+fn lane_name(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Normal => "normal",
+        Lane::RedMain => "red_main",
+        Lane::Capability => "capability",
+    }
+}
+
 /// The tick's flood-cap demotions (#11509) as `pick.decision` carries them.
 /// `resolve` maps a workspace index to the `repo` the record names.
 #[must_use]
@@ -283,17 +467,47 @@ fn resolve_repo(repo: &str) -> String {
 /// exporter). Called from the shared end-of-tick seam, so empty ticks count.
 /// `draw` is the tick's workspace-draw log (#11103) and `roots[i]` workspace
 /// `i`'s repo root, which names the draw's workspaces. `demoted` is the
-/// tick's `loom:very-important` flood-cap demotions (#11509).
+/// tick's `loom:very-important` flood-cap demotions (#11509). `dispatch_result`
+/// is the tick's canonical `loom.dispatch.result` (#11840), classified once by
+/// the caller from the tick's own report; it rides beside the legacy
+/// `outcome`, which is unchanged.
 pub fn emit_work_finder(
     summary: &WorkFinderTickSummary,
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
-    (draw, demoted): (Option<&DrawLog>, &[ViDemotion]),
+    (draw, demoted, item_draw): (Option<&DrawLog>, &[ViDemotion], Option<&PickItemDraw>),
     roots: &[std::path::PathBuf],
+    dispatch_result: &str,
 ) {
     if !exporting() {
         return;
     }
+    emit(
+        completed_work_finder_record(
+            summary,
+            &crate::sweep_registry::host_identity(),
+            (started_at, ended_at),
+            (draw, demoted),
+            roots,
+            dispatch_result,
+        )
+        .with_item_draw(item_draw.cloned()),
+    );
+}
+
+/// The record [`emit_work_finder`] emits for a completed tick: the ranked
+/// rows, the draws, the demotions and the caller's canonical
+/// `dispatch_result` (#11840), decided by `host`. Reads only the cached repo
+/// slug of `roots`.
+#[must_use]
+pub fn completed_work_finder_record(
+    summary: &WorkFinderTickSummary,
+    host: &str,
+    (started_at, ended_at): (DateTime<Utc>, DateTime<Utc>),
+    (draw, demoted): (Option<&DrawLog>, &[ViDemotion]),
+    roots: &[std::path::PathBuf],
+    dispatch_result: &str,
+) -> PickDecisionRecord {
     let name = |idx: usize| {
         roots
             .get(idx)
@@ -301,17 +515,50 @@ pub fn emit_work_finder(
     };
     let draw = draw.map(|log| workspace_draw_record(log, name));
     let demoted = vi_demotion_records(demoted, name);
-    emit(
-        work_finder_record(
-            summary,
-            &crate::sweep_registry::host_identity(),
-            started_at,
-            ended_at,
-            resolve_repo,
-        )
+    work_finder_record(summary, host, started_at, ended_at, resolve_repo)
         .with_workspace_draw(draw)
-        .with_very_important_demoted(demoted),
+        .with_very_important_demoted(demoted)
+        .with_dispatch_result(Some(dispatch_result))
+}
+
+/// `dispatch_result` of a work-finder tick skipped whole because the shared
+/// GitHub rate-limit breaker (#4429) was suppressing forge polling (#12083).
+pub const RATE_LIMIT_HELD: &str = "rate_limit_held";
+
+/// A tick the work finder skipped before listing anything (#12083): an empty,
+/// unobserved record so a breaker-skipped tick reads as a tick with a named
+/// `dispatch_result`, not as silence. `outcome` stays `skipped`.
+#[must_use]
+pub fn skipped_work_finder_record(
+    host: &str,
+    at: DateTime<Utc>,
+    dispatch_result: &str,
+) -> PickDecisionRecord {
+    PickDecisionRecord::build(
+        PickTick {
+            role: WORK_FINDER_ROLE.to_string(),
+            host: host.to_string(),
+            tick_id: format!("{WORK_FINDER_ROLE}-{}", crate::telemetry::trace::instant(at)),
+            started_at: at,
+            ended_at: at,
+            outcome: "skipped".to_string(),
+        },
+        Vec::new(),
     )
+    .with_source(source::READY_QUEUE, false)
+    .with_dispatch_result(Some(dispatch_result))
+}
+
+/// Emit [`skipped_work_finder_record`] for a tick skipped at `at`; a no-op
+/// unless an OTLP exporter is running.
+pub fn emit_skipped_work_finder(dispatch_result: &str, at: DateTime<Utc>) {
+    if exporting() {
+        emit(skipped_work_finder_record(
+            &crate::sweep_registry::host_identity(),
+            at,
+            dispatch_result,
+        ));
+    }
 }
 
 /// The reason every candidate of a tick that never ran the role was skipped.
@@ -324,7 +571,8 @@ fn tick_skip_reason(result: RoleTickResult) -> Option<PickSkipReason> {
         RoleTickResult::RuntimeRejected
         | RoleTickResult::SkippedModelRuntimeMismatch
         | RoleTickResult::SkippedLoad
-        | RoleTickResult::SkippedQueueEmpty => Some(PickSkipReason::TickSkipped),
+        | RoleTickResult::SkippedQueueEmpty
+        | RoleTickResult::SkippedDeferred => Some(PickSkipReason::TickSkipped),
     }
 }
 
@@ -391,6 +639,8 @@ pub fn role_record(
                     acts.push((number, action));
                 }
             }
+            // #12027: read by `step_verdict`, not by the pick record.
+            JournalEntry::Marker { .. } | JournalEntry::Applied { .. } => {}
         }
     }
     // Decisions are observed when the agent ran with a journal that was read
@@ -467,6 +717,8 @@ pub fn role_record(
         .collect();
     let mut record =
         PickDecisionRecord::build(tick, ranked).with_source(source, decisions_observed);
+    // #11858: the record names its repo even when no candidate does.
+    record.repo = Some(repo.to_string());
     record.raise_candidates_total(total);
     record.add_actions(acts.into_iter().map(|(number, action)| PickAction {
         repo: repo.to_string(),
@@ -477,24 +729,40 @@ pub fn role_record(
 }
 
 /// Emit one role tick's decision. Always drains this thread's stashed
-/// listings; builds and emits only with an OTLP exporter running.
+/// listings; builds and emits only with an OTLP exporter running. `trace` is
+/// the tick's root span when it launched: it names the tick and (#11858) the
+/// record joins its trace.
 pub fn emit_role_tick(
     root: &Path,
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
-    tick_id: Option<String>,
+    trace: Option<&super::lifecycle::RoleTrace>,
 ) {
     let gate = take_gate_listings(root);
     let journal = super::pick_journal::take(root);
+    let step = super::step_verdict::take_staged_step();
+    let lane_plan = take_lane_plan_if_exporting();
     if !exporting() {
         return;
     }
+    // #12027: the role's per-item verdicts, from the same journal.
+    super::step_verdict::emit_drain(
+        root,
+        role,
+        &repo_label(root),
+        started_at,
+        step,
+        journal.as_ref(),
+    );
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let tick = PickTick {
         role: role.to_string(),
         host: crate::sweep_registry::host_identity(),
-        tick_id: tick_id.unwrap_or_else(|| super::lifecycle::role_execution_id(role, started_at)),
+        tick_id: trace.map_or_else(
+            || super::lifecycle::role_execution_id(role, started_at),
+            |t| t.execution.clone(),
+        ),
         started_at,
         ended_at: Utc::now(),
         outcome: crate::role_tick_telemetry::result_label(result),
@@ -511,10 +779,17 @@ pub fn emit_role_tick(
     let holds: &[&str] = crate::role_runner::demand::DebtAxis::for_role(role)
         .map_or(&[], crate::role_runner::demand::axis_park_labels);
     let observed = RoleObservation { journal, gate };
-    emit(role_record(tick, result, observed, &repo_label(root), holds));
+    let mut record = role_record(tick, result, observed, &repo_label(root), holds);
+    record.lanes = lane_plan;
+    emit_in(record, trace.map(|t| &t.context));
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 #[path = "pick_decision_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "pick_decision_result_tests.rs"]
+mod result_tests;
