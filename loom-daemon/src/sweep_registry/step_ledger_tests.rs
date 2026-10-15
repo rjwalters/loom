@@ -64,7 +64,7 @@ fn a_noop_cools_locally_and_is_broadcast_per_item_step() {
     let dir = tempdir().unwrap();
     let (mut reg, mut rx) = registry(dir.path());
     let rec = reg.record_step_outcome(
-        &run(9, StepRole::Judge, OutcomeClass::Noop, "ci_pending", 600),
+        &run(9, StepRole::Judge, OutcomeClass::Noop, "no_changes_needed", 600),
         &mut FakeForge::default(),
     );
     assert!(rec.cooling_until.is_some());
@@ -75,6 +75,22 @@ fn a_noop_cools_locally_and_is_broadcast_per_item_step() {
     assert_eq!(ads.len(), 1);
     assert_eq!((ads[0].0, ads[0].1), (9, Some(StepRole::Judge)));
     assert!((3590..=3600).contains(&ads[0].2), "{ads:?}");
+}
+
+/// #12042: a `ci_pending` no-op waited on CI, not on the item, so it cools
+/// for the short refusal window (10 min), and peers get that window too.
+#[test]
+fn a_ci_pending_noop_is_broadcast_with_the_short_window() {
+    let dir = tempdir().unwrap();
+    let (mut reg, mut rx) = registry(dir.path());
+    reg.record_step_outcome(
+        &run(9, StepRole::Judge, OutcomeClass::Noop, "ci_pending", 600),
+        &mut FakeForge::default(),
+    );
+    let ads = step_ads(&drain(&mut rx));
+    assert_eq!(ads.len(), 1);
+    assert_eq!((ads[0].0, ads[0].1), (9, Some(StepRole::Judge)));
+    assert!((590..=600).contains(&ads[0].2), "{ads:?}");
 }
 
 /// The refusal cooldown is in the draw's query as soon as the step is

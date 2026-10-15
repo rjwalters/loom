@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use super::batch::RefState;
+use super::budget::{Bucket, FloorStop};
 use super::release::{Acted, Report, Unread};
 use crate::forge_listing::RestIssue;
 use crate::park_record::apply::BLOCKED_LABEL;
@@ -25,8 +26,129 @@ use crate::park_record::{blockers, BlockerRef};
 
 /// At most this many blockers are kept per item.
 const MAX_BLOCKERS: usize = 20;
-/// Free-text detail is cut to this many characters.
-const MAX_DETAIL: usize = 240;
+/// `forge_call_stats::sanitize` caps a field at this many characters; a
+/// detail that reaches it was cut (#12036).
+const SANITIZE_CAP: usize = 96;
+
+/// Why an artifact went [`ItemVerdict::Unevaluated`], typed where the cause
+/// is created so no consumer parses `detail` (#12036).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnevaluatedReason {
+    /// The REST core budget floor.
+    BudgetFloorCore,
+    /// The GraphQL budget floor.
+    BudgetFloorGraphql,
+    /// A forge read failed (404, no state, comment or label-event read).
+    ReadFailed,
+    /// Anything else (no evidence gathered, body unknown).
+    Other,
+}
+
+impl UnevaluatedReason {
+    /// Every reason, in a stable order.
+    pub const ALL: [Self; 4] = [
+        Self::BudgetFloorCore,
+        Self::BudgetFloorGraphql,
+        Self::ReadFailed,
+        Self::Other,
+    ];
+
+    /// The exported snake_case key.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BudgetFloorCore => "budget_floor_core",
+            Self::BudgetFloorGraphql => "budget_floor_graphql",
+            Self::ReadFailed => "read_failed",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// The budget reading that stopped an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BudgetReading {
+    pub bucket: Bucket,
+    pub remaining: u64,
+    pub floor: u64,
+}
+
+/// Why one artifact could not be read: the typed cause plus the text the
+/// pass has always reported (`Display` is exactly `text`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    pub reason: UnevaluatedReason,
+    pub budget: Option<BudgetReading>,
+    pub text: String,
+}
+
+impl Unreadable {
+    /// A forge read that failed.
+    #[must_use]
+    pub fn read_failed(text: impl Into<String>) -> Self {
+        Self {
+            reason: UnevaluatedReason::ReadFailed,
+            budget: None,
+            text: text.into(),
+        }
+    }
+
+    /// Neither a floor nor a failed read.
+    #[must_use]
+    pub fn other(text: impl Into<String>) -> Self {
+        Self {
+            reason: UnevaluatedReason::Other,
+            budget: None,
+            text: text.into(),
+        }
+    }
+
+    /// A floor stop with its own `text` (the phase-1 probe words it itself).
+    #[must_use]
+    pub fn floor(stop: &FloorStop, text: impl Into<String>) -> Self {
+        Self {
+            reason: match stop.bucket {
+                Bucket::Core => UnevaluatedReason::BudgetFloorCore,
+                Bucket::Graphql => UnevaluatedReason::BudgetFloorGraphql,
+            },
+            budget: Some(BudgetReading {
+                bucket: stop.bucket,
+                remaining: stop.remaining,
+                floor: stop.floor,
+            }),
+            text: text.into(),
+        }
+    }
+
+    /// The same cause under a longer `text`.
+    #[must_use]
+    pub fn with_text(mut self, text: String) -> Self {
+        self.text = text;
+        self
+    }
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl From<FloorStop> for Unreadable {
+    fn from(stop: FloorStop) -> Self {
+        let text = stop.to_string();
+        Self::floor(&stop, text)
+    }
+}
+
+/// A bare message is a failed read: every `String` error the gatherer
+/// produces is one.
+impl From<String> for Unreadable {
+    fn from(text: String) -> Self {
+        Self::read_failed(text)
+    }
+}
 
 /// What the pass decided for one artifact. Every listed artifact gets exactly
 /// one.
@@ -109,6 +231,12 @@ pub struct Item {
     /// Why it went unevaluated, or why a write failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Why it went unevaluated (#12036).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unevaluated_reason: Option<UnevaluatedReason>,
+    /// The budget reading behind a floor stop (#12036).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetReading>,
     pub blockers: Vec<BlockerCheck>,
     /// Labels added (a release's restored lane label).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -136,7 +264,7 @@ struct Listed {
 
 /// The [`blocker_state`] a [`RefState`] read means.
 #[must_use]
-pub fn state_of(read: &Result<RefState, String>) -> &'static str {
+pub fn state_of<E>(read: &Result<RefState, E>) -> &'static str {
     match read {
         Err(_) => blocker_state::UNREAD,
         Ok(s) => match (s.state.as_str(), s.is_pr) {
@@ -148,8 +276,29 @@ pub fn state_of(read: &Result<RefState, String>) -> &'static str {
     }
 }
 
+/// The text as `forge_call_stats::sanitize` leaves it, but never cut
+/// mid-word: a cut detail backs off to the last whitespace and ends `...`.
 fn detail(why: &str) -> Option<String> {
-    crate::forge_call_stats::sanitize(why).map(|d| d.chars().take(MAX_DETAIL).collect())
+    let d = crate::forge_call_stats::sanitize(why)?;
+    let ascii = why
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .count();
+    let n = d.chars().count();
+    if n + 1 < SANITIZE_CAP || ascii <= n {
+        return Some(d);
+    }
+    Some(match d.rfind(' ') {
+        Some(i) => format!("{}...", d[..i].trim_end()),
+        None => format!("{d}..."),
+    })
+}
+
+/// [`detail`] for the telemetry tests.
+#[cfg(test)]
+pub(super) fn detail_for_test(why: &str) -> Option<String> {
+    detail(why)
 }
 
 impl Report {
@@ -166,7 +315,7 @@ impl Report {
     }
 
     /// Note the state read for declared blocker `number`.
-    pub(super) fn blocker_read(&mut self, number: u64, read: &Result<RefState, String>) {
+    pub(super) fn blocker_read<E>(&mut self, number: u64, read: &Result<RefState, E>) {
         self.context.states.insert(number, state_of(read));
     }
 
@@ -212,6 +361,8 @@ impl Report {
             verdict,
             reason,
             detail: why.and_then(detail),
+            unevaluated_reason: None,
+            budget: None,
             blockers,
             labels_added: Vec::new(),
             labels_removed: Vec::new(),

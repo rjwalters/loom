@@ -50,6 +50,7 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
 use super::budget::{self, Budget, Floor, ForgeCost, Guard, Meter};
+use super::release_items::Unreadable;
 use super::{classify, park_self_block, Artifact, Evidence, RemoteRef, Verdict};
 use crate::dep_recheck::{extract, named, premise, recheck};
 use crate::forge_call_stats::{ops, ForgeOp};
@@ -164,6 +165,8 @@ pub struct Gathered {
     pub number: i64,
     pub title: String,
     pub evidence: Result<Evidence, String>,
+    /// The typed cause when `evidence` is an `Err` (#12036).
+    pub cause: Option<Unreadable>,
 }
 
 /// Which artifacts to examine.
@@ -202,7 +205,7 @@ struct Pending {
     declared: Vec<crate::park_record::BlockerRef>,
     held: Option<super::Held>,
     closing: Vec<ClosingRef>,
-    failed: Option<String>,
+    failed: Option<Unreadable>,
 }
 
 /// A blocker reference: `(repo, number)`, `None` meaning the invoking repo.
@@ -296,12 +299,15 @@ pub fn gather_filtered(
     // Nothing to gather, nothing to probe.
     if !selected.is_empty() {
         cost.projected = budget::project(&selected);
-        let refused = if forge.breaker_open() {
-            Some("rate-limit breaker is suppressing forge calls — not evaluated this run".into())
+        let refused: Option<Unreadable> = if forge.breaker_open() {
+            Some(Unreadable::read_failed(
+                "rate-limit breaker is suppressing forge calls — not evaluated this run",
+            ))
         } else {
             cost.budget_before = forge.budget();
             cost.budget_before
-                .and_then(|b| budget::refusal(&b, cost.projected, opts.floor))
+                .and_then(|b| budget::refusal_stop(&b, cost.projected, opts.floor))
+                .map(Unreadable::from)
         };
         if let Some(why) = refused {
             let items = selected
@@ -310,10 +316,11 @@ pub fn gather_filtered(
                     kind,
                     number: i64::from(row.number),
                     title: row.title.unwrap_or_default(),
-                    evidence: Err(why.clone()),
+                    evidence: Err(why.to_string()),
+                    cause: Some(why.clone()),
                 })
                 .collect();
-            cost.budget_refused = Some(why);
+            cost.budget_refused = Some(why.to_string());
             cost.meter = forge.meter();
             return Gathering {
                 items,
@@ -374,19 +381,19 @@ fn read_text(
     let comments = if p.row.comments == 0 {
         Vec::new()
     } else {
-        if let Err(why) = guard.core(&forge.meter()) {
-            p.failed = Some(why);
+        if let Err(stop) = guard.core_stop(&forge.meter()) {
+            p.failed = Some(stop.into());
             return (p, None);
         }
         match forge.comments(p.row.number) {
             Ok(c) => c,
             Err(e) => {
-                p.failed = Some(format!(
+                p.failed = Some(Unreadable::read_failed(format!(
                     "comment read for {} #{} failed — cannot assess a park from a failed read \
                      (fail safe: never guess 'no refs' on missing data): {e}",
                     kind.label(),
                     p.row.number
-                ));
+                )));
                 return (p, None);
             }
         }
@@ -434,19 +441,21 @@ fn read_closing(forge: &mut dyn StaleBlockedForge, pending: &mut [Pending], guar
         .map(|p| p.row.number)
         .collect();
     let mut answers: HashMap<u32, Vec<ClosingRef>> = HashMap::new();
-    let mut batch_errors: HashMap<u32, String> = HashMap::new();
+    let mut batch_errors: HashMap<u32, Unreadable> = HashMap::new();
     for chunk in issues.chunks(CLOSING_BATCH) {
         // Re-checked between batches, from the previous batch's own
         // `rateLimit.remaining`.
-        let answer = match guard.graphql(&forge.meter()) {
-            Ok(()) => forge.closing_refs_batch(chunk),
-            Err(why) => Err(anyhow!(why)),
+        let answer = match guard.graphql_stop(&forge.meter()) {
+            Ok(()) => forge
+                .closing_refs_batch(chunk)
+                .map_err(|e| Unreadable::read_failed(e.to_string())),
+            Err(stop) => Err(Unreadable::from(stop)),
         };
         match answer {
             Ok(map) => answers.extend(map),
-            Err(e) => {
+            Err(cause) => {
                 for n in chunk {
-                    batch_errors.insert(*n, e.to_string());
+                    batch_errors.insert(*n, cause.clone());
                 }
             }
         }
@@ -459,13 +468,14 @@ fn read_closing(forge: &mut dyn StaleBlockedForge, pending: &mut [Pending], guar
         match answers.remove(&n) {
             Some(refs) => p.closing = refs,
             None => {
-                let why = batch_errors
-                    .remove(&n)
-                    .unwrap_or_else(|| "no complete answer for this issue".to_string());
-                p.failed = Some(format!(
+                let why = batch_errors.remove(&n).unwrap_or_else(|| {
+                    Unreadable::read_failed("no complete answer for this issue")
+                });
+                let text = format!(
                     "closing-PR read for issue #{n} failed — never guess 'no closing PRs' on a \
                      failed read: {why}"
-                ));
+                );
+                p.failed = Some(why.with_text(text));
             }
         }
     }
@@ -488,7 +498,7 @@ fn read_states(
     forge: &mut dyn StaleBlockedForge,
     pending: &[Pending],
     guard: &mut Guard,
-) -> HashMap<RefKey, Result<RefState, String>> {
+) -> HashMap<RefKey, Result<RefState, Unreadable>> {
     let mut keys: BTreeSet<RefKey> = BTreeSet::new();
     for p in pending.iter().filter(|p| p.failed.is_none()) {
         keys.extend(p.prose.iter().map(|n| (None, *n)));
@@ -510,14 +520,14 @@ fn read_states(
     }
     keys.into_iter()
         .map(|key| {
-            if let Err(why) = guard.core(&forge.meter()) {
-                return (key, Err(why));
+            if let Err(stop) = guard.core_stop(&forge.meter()) {
+                return (key, Err(stop.into()));
             }
             let state = match forge.ref_state(key.0.as_deref(), key.1) {
                 Ok(Some(s)) if !s.state.is_empty() => Ok(s),
-                Ok(Some(_)) => Err("the forge returned no state".to_string()),
-                Ok(None) => Err("not found (HTTP 404)".to_string()),
-                Err(e) => Err(e.to_string()),
+                Ok(Some(_)) => Err("the forge returned no state".to_string().into()),
+                Ok(None) => Err("not found (HTTP 404)".to_string().into()),
+                Err(e) => Err(e.to_string().into()),
             };
             (key, state)
         })
@@ -528,32 +538,41 @@ fn read_states(
 fn assemble(
     forge: &mut dyn StaleBlockedForge,
     p: Pending,
-    states: &HashMap<RefKey, Result<RefState, String>>,
+    states: &HashMap<RefKey, Result<RefState, Unreadable>>,
     guard: &mut Guard,
 ) -> Gathered {
-    let evidence = match p.failed.clone() {
+    let outcome = match p.failed.clone() {
         Some(why) => Err(why),
         None => evidence_for(forge, &p, states, guard),
+    };
+    let (evidence, cause) = match outcome {
+        Ok(ev) => (Ok(ev), None),
+        Err(why) => (Err(why.to_string()), Some(why)),
     };
     Gathered {
         kind: p.kind,
         number: i64::from(p.row.number),
         title: p.row.title.clone().unwrap_or_default(),
         evidence,
+        cause,
     }
 }
 
 fn evidence_for(
     forge: &mut dyn StaleBlockedForge,
     p: &Pending,
-    states: &HashMap<RefKey, Result<RefState, String>>,
+    states: &HashMap<RefKey, Result<RefState, Unreadable>>,
     guard: &mut Guard,
-) -> Result<Evidence, String> {
-    let lookup = |key: RefKey, what: String| -> Result<RefState, String> {
+) -> Result<Evidence, Unreadable> {
+    let lookup = |key: RefKey, what: String| -> Result<RefState, Unreadable> {
         match states.get(&key) {
             Some(Ok(s)) => Ok(s.clone()),
-            Some(Err(why)) => Err(format!("could not read state for {what}: {why}")),
-            None => Err(format!("could not read state for {what}: never requested")),
+            Some(Err(why)) => Err(why
+                .clone()
+                .with_text(format!("could not read state for {what}: {why}"))),
+            None => Err(Unreadable::read_failed(format!(
+                "could not read state for {what}: never requested"
+            ))),
         }
     };
     let prose = p
@@ -578,7 +597,7 @@ fn evidence_for(
                         state: s.state,
                     })
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, Unreadable>>()?;
     let named = p
         .named
         .iter()
@@ -593,7 +612,7 @@ fn evidence_for(
                 ..d.clone()
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, Unreadable>>()?;
     let closing = if all_resolved(&p.closing) {
         p.closing
             .iter()
@@ -606,7 +625,7 @@ fn evidence_for(
                     ..recheck::Pr::default()
                 })
             })
-            .collect::<Result<Vec<_>, String>>()?
+            .collect::<Result<Vec<_>, Unreadable>>()?
     } else {
         p.closing
             .iter()
@@ -628,7 +647,7 @@ fn evidence_for(
         held: p.held.clone(),
     };
     if p.kind == Artifact::Pr && matches!(classify(&evidence), Verdict::Stale(_)) {
-        guard.core(&forge.meter())?;
+        guard.core_stop(&forge.meter())?;
         evidence.self_block = self_block(forge, &p.row)?;
     }
     Ok(evidence)
