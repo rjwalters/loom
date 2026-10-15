@@ -34,7 +34,7 @@ use loom_daemon::forge_call_stats::{ops, ForgeOp};
 use loom_daemon::forge_check_claim::{
     issue_lease_comments_jq, live_leases_by_freshness, parse_lease_rows, LeaseRow,
 };
-use loom_daemon::gh_invocation::AccessIntent;
+use loom_daemon::gh_invocation::{AccessIntent, GhInvocation};
 
 use super::{live_leases, Ctx, Gh, Identity, LiveLease, Role, Row};
 
@@ -231,8 +231,12 @@ impl Gh {
         number: u64,
         policy: &loom_daemon::comment_trust::TrustPolicy,
     ) -> Option<Vec<LeaseRow>> {
-        let out = self
-            .inv("pr_lease.issue_leases", AccessIntent::Read, ops::COMMENT_LIST)
+        // Built through the gh facade (`Gh::inv` -> `GhInvocation`), so the
+        // `--paginate` read is counted and page-walkable; the explicit type
+        // also lets the per-file paginate-site lint see the facade.
+        let read: GhInvocation =
+            self.inv("pr_lease.issue_leases", AccessIntent::Read, ops::COMMENT_LIST);
+        let out = read
             .args([
                 "api",
                 &format!("repos/{{owner}}/{{repo}}/issues/{number}/comments"),
