@@ -99,3 +99,20 @@ marker stands (`fetch_queue` reads the comments), so a held PR Champion routes
 for repair keeps its hold through the whole round trip. Pending/failing checks can
 block a merge while still leaving actionable repair work. The queue is a plan;
 fresh claim, CI, dependency and merge guards remain mandatory before acting.
+
+**Judge is not served while CI is pending at the head (#12003).** Judge's own
+pre-check releases a PR whose checks are still running, so serving one buys only
+a claim, a spawn and a release. `pr-queue --role judge` and the Judge spawn gate
+(the role runner's demand probe calls it) therefore skip a PR whose head has
+pending CI, and serve it once CI concludes. Both go through one admission helper,
+so the queue and the gate agree row for row. "Pending" is the no-verdict
+backstop's rule: a check run or legacy commit status not yet concluded that
+started under 6 h ago. A run stuck longer, or one with no start stamp, does not
+hold the PR, so a head with no runner is still reviewed; an unreadable CI read
+counts as not pending, so the skip can only save a spawn, never starve a PR. The
+read happens only for a row already admitted, the queue screens only its first
+three CI-clear rows (Judge's own pre-check still catches any further down), the
+read is conditional (ETag), and the daemon's per-tick gate caches each
+(repo, head) answer for 60 s. A push is a new head and so a fresh read. See
+[`lease-record.md`](lease-record.md) for how a Judge pass that stood down for
+pending CI is released.
