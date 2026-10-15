@@ -154,9 +154,23 @@ async fn run_collector(
     // The pass's forge gathers (captain facts, stage dwell, fleet state) on
     // the snapshot cadence, first fired after this host's startup jitter
     // (#12073) so a fleet that restarts together does not gather at once.
+    //
+    // They run on their OWN task, never as an arm of the `select!` below: a
+    // gather is forge-bound (shed reads, breaker waits, label-history
+    // pages) and can take longer than `snapshot_interval`. Awaited inline,
+    // a gather that outlasted its period left the `Delay`-mode forge timer
+    // ready again the moment it returned, and the `biased` select — which
+    // polls arms in order — took it again before ever reaching the
+    // snapshot arm, so host.health / tokens / host.export stopped while
+    // fleet.state kept flowing (the 0.19.1163 regression). The guard
+    // aborts the task when the collector stops.
     let first_gather = crate::startup_jitter::arm(&workspace_root).opens_at();
-    let mut forge_timer = tokio::time::interval_at(first_gather, snapshot_interval);
-    forge_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let _forge_task = spawn_forge_gathers(
+        first_gather,
+        snapshot_interval,
+        workspace_root.clone(),
+        Arc::clone(&workspace_pool),
+    );
 
     // First-boot backfill (Issue #5084): run once immediately, before the
     // first snapshot tick, so a sweep adopted across a daemon restart does
@@ -200,10 +214,6 @@ async fn run_collector(
 
             _ = ratelimit_timer.tick() => {
                 super::ops::ratelimit::record(&workspace_root).await;
-            }
-
-            _ = forge_timer.tick() => {
-                forge_gathers(&workspace_root, &workspace_pool, &mut slug_cache).await;
             }
 
             _ = snapshot_timer.tick() => {
@@ -1027,9 +1037,58 @@ async fn sample_snapshots(
     super::ops::codex_session::record();
 }
 
-/// The collector's fleet-wide forge gathers, on their own timer so the first
-/// one can wait out the startup jitter (#12073) while the host samples above
-/// run from boot.
+/// Aborts the wrapped task when dropped, so the forge-gather task never
+/// outlives the collector that spawned it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn the collector's forge gathers on a task of their own (see
+/// [`forge_gather_loop`]). The task keeps its own slug memo: the cache is
+/// only a `gh repo view` memoization, so a second copy costs at most one
+/// extra lookup per workspace and shares no lock with the host samples.
+fn spawn_forge_gathers(
+    first: tokio::time::Instant,
+    period: Duration,
+    workspace_root: PathBuf,
+    workspace_pool: Arc<WorkspacePool>,
+) -> AbortOnDrop {
+    let state = (workspace_root, workspace_pool, HashMap::<String, String>::new());
+    AbortOnDrop(tokio::spawn(forge_gather_loop(first, period, state, |(root, pool, cache)| {
+        Box::pin(forge_gathers(root, pool, cache))
+    })))
+}
+
+/// The forge-gather schedule: first pass at `first` (when the startup-jitter
+/// gate opens), then every `period`. One pass at a time — a pass that runs
+/// long delays the next (`MissedTickBehavior::Delay`) rather than stacking
+/// passes behind it. Generic over the pass so tests can drive the schedule
+/// with a gather that hangs.
+async fn forge_gather_loop<S, G>(
+    first: tokio::time::Instant,
+    period: Duration,
+    mut state: S,
+    mut gather: G,
+) where
+    G: for<'a> FnMut(
+        &'a mut S,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>,
+{
+    let mut timer = tokio::time::interval_at(first, period);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        timer.tick().await;
+        gather(&mut state).await;
+    }
+}
+
+/// The collector's fleet-wide forge gathers, on their own task and timer so
+/// the first one can wait out the startup jitter (#12073), and so a slow one
+/// never delays the host samples above, which run from boot.
 async fn forge_gathers(
     workspace_root: &Path,
     workspace_pool: &WorkspacePool,
@@ -1716,6 +1775,10 @@ mod story_points_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod terminal_records_tests;
+// The forge gathers' own task: a slow gather never delays host samples.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod forge_gather_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
