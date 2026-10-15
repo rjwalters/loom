@@ -71,7 +71,7 @@ use serde::Serialize;
 use super::db::ActivityDb;
 use super::resource_usage::{detect_provider, ModelPricing};
 use super::session_analysis::build_session_analysis;
-use super::session_summary::build_session_summary;
+use super::session_summary::build_session_summary_for;
 use super::transcript_parse::{parse_transcript, ParsedTranscript};
 use crate::observability::session_analysis::SessionAnalysisSink;
 use crate::observability::session_summary::SessionSummarySink;
@@ -107,6 +107,13 @@ pub struct IngestOptions {
     /// a config that supplies one but not the other still gets exactly the
     /// record kind(s) it asked for.
     pub analysis_sink: Option<SessionAnalysisSink>,
+    /// Also summarize Codex rollouts (Issue #11862). Off by default so a test
+    /// or CLI pass never reads the host's real `$CODEX_HOME`; the daemon's
+    /// background pass ([`run_once`]) turns it on.
+    pub include_codex: bool,
+    /// Injectable home for the Codex rollout scan (see
+    /// [`crate::codex_usage::codex_home`]); `None` resolves it normally.
+    pub codex_home_dir: Option<PathBuf>,
 }
 
 impl Default for IngestOptions {
@@ -120,6 +127,8 @@ impl Default for IngestOptions {
             max_transcript_bytes: MAX_TRANSCRIPT_BYTES,
             summary_sink: None,
             analysis_sink: None,
+            include_codex: false,
+            codex_home_dir: None,
         }
     }
 }
@@ -343,39 +352,57 @@ pub fn ingest(db: &ActivityDb, opts: &IngestOptions) -> Result<IngestStats> {
             // `parsed` transcript — independent of `summary_sink`, so a
             // config that only wants one of the two record kinds gets
             // exactly that.
-            if opts.summary_sink.is_some() || opts.analysis_sink.is_some() {
-                // The record's join keys — repo slug, issue, PR, session
-                // kind (#9445). Resolved once here, where the pass may
-                // touch the filesystem, and shared by both records.
-                let context = crate::activity::session_context::SessionContext::resolve(&parsed);
-                let summary = build_session_summary(&path, &parsed, &context);
-                if let Some(sink) = &opts.analysis_sink {
-                    sink.push(build_session_analysis(&summary, &parsed));
-                    stats.session_analyses += 1;
-                }
-                if let Some(sink) = &opts.summary_sink {
-                    // #8908: join the log to its execution's trace, when
-                    // exactly one traced sweep of this issue covers it — or,
-                    // for a session that names no issue, exactly one traced
-                    // role-runner tick of the role this session launched as
-                    // (#9231). `parsed.slash_role`, never `parsed.role`: the
-                    // latter's keyword scan reads a subagent's dispatch prose
-                    // ("You are the Loom Judge…"), which must not become a
-                    // join key.
-                    let trace = crate::observability::runtime_usage::join::context_for_session(
-                        parsed.cwd.as_deref(),
-                        summary.issue,
-                        parsed.slash_role.as_deref(),
-                        parsed.first_timestamp,
-                    );
-                    sink.push_traced(summary, trace);
-                    stats.session_summaries += 1;
-                }
-            }
+            emit_session_records(opts, &mut stats, &path, &parsed, "claude");
         }
     }
 
+    if opts.include_codex && !opts.dry_run {
+        super::codex_summary::ingest_codex(db, opts, &mut stats)?;
+    }
+
     Ok(stats)
+}
+
+/// Build and push one session's `session.summary` / `session.analysis`
+/// records (Issues #8757, #8760) — shared by the Claude transcript pass and
+/// the Codex rollout pass ([`super::codex_summary`]), which differ only in the
+/// `runtime` label they stamp.
+pub(super) fn emit_session_records(
+    opts: &IngestOptions,
+    stats: &mut IngestStats,
+    path: &Path,
+    parsed: &ParsedTranscript,
+    runtime: &str,
+) {
+    if opts.summary_sink.is_some() || opts.analysis_sink.is_some() {
+        // The record's join keys — repo slug, issue, PR, session
+        // kind (#9445). Resolved once here, where the pass may
+        // touch the filesystem, and shared by both records.
+        let context = crate::activity::session_context::SessionContext::resolve(parsed);
+        let summary = build_session_summary_for(runtime, path, parsed, &context);
+        if let Some(sink) = &opts.analysis_sink {
+            sink.push(build_session_analysis(&summary, parsed));
+            stats.session_analyses += 1;
+        }
+        if let Some(sink) = &opts.summary_sink {
+            // #8908: join the log to its execution's trace, when
+            // exactly one traced sweep of this issue covers it — or,
+            // for a session that names no issue, exactly one traced
+            // role-runner tick of the role this session launched as
+            // (#9231). `parsed.slash_role`, never `parsed.role`: the
+            // latter's keyword scan reads a subagent's dispatch prose
+            // ("You are the Loom Judge…"), which must not become a
+            // join key.
+            let trace = crate::observability::runtime_usage::join::context_for_session(
+                parsed.cwd.as_deref(),
+                summary.issue,
+                parsed.slash_role.as_deref(),
+                parsed.first_timestamp,
+            );
+            sink.push_traced(summary, trace);
+            stats.session_summaries += 1;
+        }
+    }
 }
 
 fn bucket_cost(bucket: &super::transcript_parse::UsageBucket) -> f64 {
@@ -388,13 +415,13 @@ fn bucket_cost(bucket: &super::transcript_parse::UsageBucket) -> f64 {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct LedgerEntry {
-    input_id: Option<i64>,
-    file_size: i64,
-    file_mtime: i64,
+pub(super) struct LedgerEntry {
+    pub(super) input_id: Option<i64>,
+    pub(super) file_size: i64,
+    pub(super) file_mtime: i64,
 }
 
-fn lookup_ledger(db: &ActivityDb, key: &str) -> Result<Option<LedgerEntry>> {
+pub(super) fn lookup_ledger(db: &ActivityDb, key: &str) -> Result<Option<LedgerEntry>> {
     let row = db
         .conn
         .query_row(
@@ -665,6 +692,7 @@ pub fn run_once(db_path: &Path, window_hours: i64) -> Result<IngestStats> {
         // Same registration pattern, one slice later (Issue #8760).
         analysis_sink: crate::observability::session_analysis::global_session_analysis_sink()
             .cloned(),
+        include_codex: true,
         ..IngestOptions::default()
     };
     ingest(&db, &opts)
@@ -788,7 +816,7 @@ fn age_hours(then: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
     ((now - then).num_seconds() as f64 / 3600.0).max(0.0)
 }
 
-fn upsert_ledger(
+pub(super) fn upsert_ledger(
     conn: &rusqlite::Connection,
     key: &str,
     session: &str,

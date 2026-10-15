@@ -543,6 +543,32 @@ fn read_rollout(codex_home: &Path, path: &Path) -> Option<Vec<String>> {
     Some(reader.lines().map_while(Result::ok).collect())
 }
 
+/// One authorized rollout file, read whole — what [`read_rollouts`] returns.
+#[derive(Debug, Clone)]
+pub struct RolloutFile {
+    pub path: PathBuf,
+    pub lines: Vec<String>,
+}
+
+/// Every readable rollout across every [`codex_homes`] store that could hold a
+/// session inside `window`, for consumers that need the raw lines (the
+/// `session.summary` adapter, [`crate::activity::codex_summary`]). Reads only
+/// through [`read_rollout`], so the guard that refuses every non-rollout
+/// sibling applies unchanged.
+#[must_use]
+pub fn read_rollouts(
+    home: Option<&Path>,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Vec<RolloutFile> {
+    discover_home_rollouts(home, window)
+        .into_iter()
+        .filter_map(|(root, path)| {
+            let lines = read_rollout(&root, &path)?;
+            Some(RolloutFile { path, lines })
+        })
+        .collect()
+}
+
 /// Fold one rollout's lines into per-model rows.
 ///
 /// The whole of this module's arithmetic, split out so it can be driven
