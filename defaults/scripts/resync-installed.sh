@@ -402,6 +402,12 @@
 #   ./.loom/scripts/resync-installed.sh            # sync; report what changed
 #   ./.loom/scripts/resync-installed.sh --dry-run  # preview only; make no changes
 #   ./.loom/scripts/resync-installed.sh --quiet    # only report updated/skipped
+#   ./.loom/scripts/resync-installed.sh --sync-labels
+#                                                  # ALSO apply the additive forge label
+#                                                  # create/refresh (a REMOTE write, #10770).
+#                                                  # Without it a real run only reports label
+#                                                  # drift and prints this command; --dry-run
+#                                                  # lists the set it would create/refresh
 #   ./.loom/scripts/resync-installed.sh --allow-worktree
 #                                                  # permit running from a linked
 #                                                  # worktree (still writes the MAIN
@@ -433,6 +439,9 @@
 #   LOOM_RESYNC_BASE=<ref>        - same as --base <ref> (#9550). Only consulted
 #                                   in --output mode; an explicit --base wins.
 #   LOOM_RESYNC_FORCE=1           - same as --force (for non-interactive callers).
+#   LOOM_RESYNC_SYNC_LABELS=1     - same as --sync-labels (for non-interactive
+#                                   callers; the daemon's post-roll resync passes
+#                                   the flag so fleet label auto-heal, #6716, stays).
 #
 # Exit codes:
 #   0 - Success. Sync applied (or already in sync); or --dry-run found no drift.
@@ -479,6 +488,9 @@ ALLOW_WORKTREE=0
 # locally-diverged installed file (see "LOCAL-DIVERGENCE PROTECTION" above).
 FORCE=0
 [[ "${LOOM_RESYNC_FORCE:-}" == "1" ]] && FORCE=1
+# #10770: the forge label create/refresh is a remote write, so it is opt-in.
+SYNC_LABELS=0
+[[ "${LOOM_RESYNC_SYNC_LABELS:-}" == "1" ]] && SYNC_LABELS=1
 # #6106: generate a complete resync in an isolated staging worktree instead of
 # writing to the primary checkout. Empty means "not requested".
 OUTPUT_DIR="${LOOM_RESYNC_OUTPUT:-}"
@@ -502,6 +514,7 @@ while [[ $# -gt 0 ]]; do
         --quiet|-q)       QUIET=1; shift ;;
         --allow-worktree) ALLOW_WORKTREE=1; shift ;;
         --force)          FORCE=1; shift ;;
+        --sync-labels)    SYNC_LABELS=1; shift ;;
         --output)
             if [[ $# -lt 2 || -z "$2" ]]; then
                 err "--output requires a directory argument (try --help)"
@@ -3468,7 +3481,10 @@ fi
 # alongside this) is read-only: it reports every declared label that is
 # MISSING or STALE (present, wrong color/description), plus any UNKNOWN
 # EXTRA -- a live loom:-prefixed label absent from labels.yml, reported but
-# NEVER deleted. When drift is found on a real (non---dry-run) resync, this
+# NEVER deleted. The fix is a FORGE (remote) write, so it is opt-in (#10770):
+# drift is always reported, but the mutating run happens only with
+# --sync-labels / LOOM_RESYNC_SYNC_LABELS=1; otherwise the exact command is
+# printed. When opted in on a real (non---dry-run) resync, this
 # invokes the ALREADY-EXISTING mutating sync-labels.sh run to fix it --
 # additive-only (no --prune-defaults passed), so nothing is ever deleted or
 # renamed; it only creates what's missing and refreshes what's stale.
@@ -3511,9 +3527,13 @@ if [[ -f "$WRITE_ROOT/.github/labels.yml" && -x "$LABELS_SYNC_SCRIPT" ]]; then
         3)
             printf '%b\n' "${YELLOW}[resync] Forge label drift detected (.github/labels.yml vs live):${NC}"
             printf '%b\n' "$check_output" | sed 's/^/    /'
-            if [[ "$DRY_RUN" -eq 1 ]]; then
-                printf '%b\n' "  ${BOLD}would run${NC} sync-labels.sh to create the missing/refresh the stale labels (additive only, never deletes)"
+            if [[ "$DRY_RUN" -eq 1 && "$SYNC_LABELS" -eq 1 ]]; then
+                printf '%b\n' "  ${BOLD}would run${NC} sync-labels.sh (FORGE/remote write) to create the missing/refresh the stale labels listed above (additive only, never deletes)"
                 N_UPDATED=$((N_UPDATED + 1))
+            elif [[ "$DRY_RUN" -eq 1 ]]; then
+                printf '%b\n' "  ${BOLD}not applied${NC} -- a real run would NOT write to the forge without ${BOLD}--sync-labels${NC} (it would create/refresh the labels listed above, additive only)"
+            elif [[ "$SYNC_LABELS" -ne 1 ]]; then
+                printf '%b\n' "  ${BOLD}not applied${NC} -- forge label writes are opt-in; nothing was changed on the forge. apply with: ${BOLD}./.loom/scripts/sync-labels.sh${NC}  (or re-run resync with ${BOLD}--sync-labels${NC})"
             else
                 sync_output=""
                 sync_rc=0
