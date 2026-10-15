@@ -68,7 +68,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::forge_identity::{Placement, RouteDecision, RouteRequest};
+use crate::forge_identity::{ExhaustCause, Placement, RouteDecision, RouteRequest};
 
 #[path = "forge_gateway/outage.rs"]
 pub mod outage;
@@ -393,9 +393,54 @@ pub fn agent_env() -> Vec<(&'static str, Option<OsString>)> {
 /// The read router the facade and the conditional reads use: the gateway
 /// profile for the repo's owner when one is live and not withdrawn, else
 /// [`crate::forge_identity::route_read`] unchanged.
+///
+/// A withdrawn gateway with no reader pool behind it is
+/// [`ExhaustCause::Withdrawn`], not [`RouteDecision::NoPool`]: "no pool"
+/// sends every read to the writer, and the gateway's outage withdrawal
+/// (#12101) would then put a gateway-only host's deferrable reads on the
+/// dispatch App for as long as it lasts (2026-10-15).
 #[must_use]
 pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
-    decide(req, now, &profile_for).unwrap_or_else(|| crate::forge_identity::route_read(req, now))
+    if let Some(decision) = decide(req, now, &profile_for) {
+        return decision;
+    }
+    let pool = crate::forge_identity::route_read(req, now);
+    let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo).to_ascii_lowercase();
+    let gateway_until = if owner.is_empty() || profile_for(&owner).is_none() {
+        None
+    } else {
+        withdrawn_until(&owner, req, now)
+    };
+    past_withdrawn_gateway(pool, gateway_until)
+}
+
+/// The reader pool's answer `pool`, unless it is [`RouteDecision::NoPool`]
+/// while the owner's gateway is withdrawn until `gateway_until`: then an
+/// [`ExhaustCause::Withdrawn`] exhaustion until then.
+#[must_use]
+pub fn past_withdrawn_gateway(
+    pool: RouteDecision,
+    gateway_until: Option<SystemTime>,
+) -> RouteDecision {
+    match (pool, gateway_until) {
+        (RouteDecision::NoPool, Some(until)) => RouteDecision::Exhausted {
+            until,
+            cause: ExhaustCause::Withdrawn,
+        },
+        (pool, _) => pool,
+    }
+}
+
+/// When the gateway's App-wide or scoped withdrawal for `owner` ends, if one
+/// is live (a coverage withdrawal from one repo is not counted).
+fn withdrawn_until(owner: &str, req: &RouteRequest<'_>, now: SystemTime) -> Option<SystemTime> {
+    [
+        crate::forge_read_pool::withdrawn_until(GATEWAY_APP_ID, now),
+        crate::forge_read_pool::scoped_withdrawal_until(GATEWAY_APP_ID, owner, req.resource, now),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 /// The gateway's answer for `req`, with the profile lookup injected.

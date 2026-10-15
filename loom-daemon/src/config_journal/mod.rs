@@ -6,7 +6,7 @@
 //! journal core ([`crate::journal`]):
 //!
 //! - `config.resolved` (C8): the effective-config hash
-//!   ([`planner_config_hash`], the same function `fleet.state` uses), the
+//!   ([`planner_config_hash`]), the
 //!   tier path/sha256-or-absent metadata, and the **redacted** body only the
 //!   first time a hash is seen.
 //! - `config.rendered` (C6): a render (`event: rendered`), and the
@@ -208,6 +208,25 @@ pub fn record_resolved(repo_root: &Path) {
     });
 }
 
+/// 12 hex of sha256 over the canonical JSON (sorted keys, no whitespace) of
+/// the planner-relevant effective config: `autonomous.workFinder` (which
+/// carries the slot and per-repo caps) and `autonomous.mergeSequencing`.
+/// Unrelated config never changes it. Pure.
+#[must_use]
+pub(crate) fn planner_config_hash(effective: &Value) -> String {
+    let pick = |key: &str| {
+        crate::config_resolver::get_path(effective, &format!("autonomous.{key}"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let mut slice = serde_json::Map::new();
+    slice.insert("mergeSequencing".to_string(), pick("mergeSequencing"));
+    slice.insert("workFinder".to_string(), pick("workFinder"));
+    let text = crate::tokens_pool::profile_merge::canonical_json(&Value::Object(slice));
+    let digest = Sha256::digest(text.as_bytes());
+    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Two concerns, kept apart:
 ///
 /// - **Transitions** (current state): a record is appended whenever the
@@ -224,7 +243,7 @@ pub(crate) fn append_resolved(
     effective: &Value,
     tiers: Vec<Value>,
 ) -> Result<(), JournalError> {
-    let hash = crate::observability::fleet_state::planner_config_hash(effective);
+    let hash = planner_config_hash(effective);
     let tiers_digest = sha256_hex(Value::Array(tiers.clone()).to_string().as_bytes());
     if latest_state(s, workspace).is_some_and(|(h, t)| h == hash && t == tiers_digest) {
         return Ok(());
