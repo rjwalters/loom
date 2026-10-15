@@ -340,3 +340,99 @@ fn a_refused_draw_is_counted_on_the_record() {
 fn a_missing_role_command_reads_as_workspace_commands_missing() {
     assert_eq!(disposition_of("workspace_commands_missing"), Qd::WorkspaceCommandsMissing);
 }
+
+/// #12260: an unverifiable claim means the owner's writer cannot claim
+/// anything this tick, so no other workspace of that owner is drawn; another
+/// owner's workspaces still are.
+#[test]
+fn an_unverified_claim_ends_the_owners_draws_for_the_tick() {
+    let rows: Vec<RestIssue> = (1..=10)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_all: Some(REFUSAL_CLAIM_UNVERIFIED),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0, 0]);
+    let tick = run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "ACME/two", &rows),
+        ],
+        limits(10),
+        &mut cap,
+        &mut spawner,
+    );
+    // One draw, not MAX_PASSES_PER_TICK: both repos share the owner.
+    assert_eq!(spawner.asked.len(), 1, "{:?}", spawner.asked);
+    assert_eq!(tick.passes.get(REFUSAL_CLAIM_UNVERIFIED), Some(&1));
+    assert_eq!(tick.report.dispatched, 0);
+
+    // A second owner keeps drawing after the first owner's refusal.
+    // Find the first acme draw, then refuse it.
+    let mut spawner = FakeSpawner::default();
+    let mut cap = RepoCap::new(None, vec![0, 0, 0]);
+    run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "acme/two", &rows),
+            workspace(2, "other/three", &rows),
+        ],
+        limits(4),
+        &mut cap,
+        &mut spawner,
+    );
+    let first_acme = spawner.asked.iter().find(|a| a.0 != 2).copied().unwrap();
+    let mut spawner = FakeSpawner {
+        refuse: vec![(first_acme.1, REFUSAL_CLAIM_UNVERIFIED)],
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0, 0, 0]);
+    let tick = run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "acme/two", &rows),
+            workspace(2, "other/three", &rows),
+        ],
+        limits(4),
+        &mut cap,
+        &mut spawner,
+    );
+    // The refused acme draw is the only acme draw that follows it.
+    let refused_at = spawner
+        .asked
+        .iter()
+        .position(|a| a.0 == first_acme.0 && a.1 == first_acme.1)
+        .unwrap();
+    assert!(spawner.asked[refused_at + 1..].iter().all(|a| a.0 == 2), "{:?}", spawner.asked);
+    // `other/three` fills every slot the refusal left.
+    assert_eq!(tick.report.dispatched, 4);
+}
+
+#[test]
+fn other_refusals_still_redraw_in_the_same_owner() {
+    let rows: Vec<RestIssue> = (1..=10)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_all: Some("claim_lost"),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0, 0]);
+    run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "acme/two", &rows),
+        ],
+        limits(1),
+        &mut cap,
+        &mut spawner,
+    );
+    assert_eq!(spawner.asked.len(), MAX_DRAWS_PER_SLOT as usize);
+}
+
+#[test]
+fn forge_owner_is_the_lowercased_slug_prefix() {
+    assert_eq!(forge_owner("AcMe/one"), "acme");
+    assert_eq!(forge_owner("bare"), "bare");
+}
