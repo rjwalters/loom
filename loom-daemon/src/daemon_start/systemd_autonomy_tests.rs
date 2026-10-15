@@ -265,6 +265,34 @@ fn the_marker_prefers_the_running_daemons_own_env() {
         .spawn()
         .expect("spawn sleep");
     let pid = child.id().to_string();
+    // spawn() returns once exec has begun, before the kernel publishes the new
+    // environ in /proc (#12060). Wait, bounded, until it shows the child's env.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while proc_env_value(&pid, "LOOM_WORK_FINDER").as_deref() != Some("1") {
+        if std::time::Instant::now() >= deadline {
+            let raw = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+            // Key names only: the child inherits the runner's env (tokens).
+            let keys: Vec<String> = raw
+                .split(|b| *b == 0)
+                .filter(|e| !e.is_empty())
+                .map(|e| {
+                    String::from_utf8_lossy(e)
+                        .split('=')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
+            let last = proc_env_value(&pid, "LOOM_WORK_FINDER");
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "child {pid} environ never showed LOOM_WORK_FINDER=1 within 2s; \
+                 last value {last:?}, keys seen {keys:?}"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let dropin_off = layer([Some("0"), None], [None, None]);
     let seen = effective_marker_value(Some(&pid), &dropin_off, "LOOM_WORK_FINDER");
     let unset = proc_env_value(&pid, "LOOM_NOT_SET_11951");
