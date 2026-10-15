@@ -196,8 +196,8 @@ The findings:
   to the merge-group head, so the `push` run on `main` re-tests an identical
   SHA. Removing that `push` run would be a separate, evidence-gated change and
   is **not** made here: `main` verification stays (rule 2).
-- **Interaction to watch in the pilot:** `version-bump-on-merge.yml` pushes
-  directly to `main`, at most once per `RELEASE_MIN_INTERVAL` (24 h by
+- **Interaction to watch in the pilot:** `version-bump-on-merge.yml` lands
+  its bump commit directly on `main` (through the fleet publisher, not a PR), at most once per `RELEASE_MIN_INTERVAL` (24 h by
   default, #11174; see [`release-cadence.md`](release-cadence.md)). In a
   queue-enabled repository, each such push moves the base under every queued
   entry. The pilot repository must
