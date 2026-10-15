@@ -161,7 +161,8 @@ The stage-entry provider is a three-source adapter, tried in order:
 - **The lock.** The spawn (`SweepRegistry::spawn_step_unlocked`) releases the registry lock around the runtime admission's private-clone containment (#8787), a non-Builder step's pre-claim and the account-selection poll, as `private_dispatch::prepare` does for sweeps.
 - **Capture.** A step keeps the role-tick capture from #11877.
 - **Registry.** Steps run in the sweep registry as `SweepKind::Step { item, role }` (`types.rs`). Every consumer that matches on `SweepKind` is exhaustive (#11898).
-- **The end.** A step's end is queued (`sweep_registry/step_spawn/ended.rs`); the next tick reads the item's forge post-state with the lock released, classifies it with the session's outcome line and records it in the ledger (`step_dispatch::step_end`). A failed read is `failed` / `probe_failed`, never a default.
+- **The end.** A step's end is queued (`sweep_registry/step_spawn/ended.rs`); the next tick takes the post-state its claim release read before writing (or reads the item once when nothing was released), classifies it with the session's outcome line and records it in the ledger (`step_dispatch::step_end`). A failed read is `failed` / `probe_failed`, never a default. A refusal's cooldown (the pool gate, a claim race, a failed launch) stays local to the host; every other window is broadcast.
+- **Listing failures.** A failed item listing falls back to the repo's last good one for up to 10 minutes; a failed open-PR listing draws no Builder step in the repo that tick, since a PR linked only by its branch would be invisible.
 - **The role runner** runs Guide, Auditor, Hermit, Architect and Champion `--non-item`. Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning; `championMode` is retired and its `all` mode deleted (`role_runner/champion_mode.rs`); Curator has no event trigger. The Judge/Doctor queue gate, `demandWidth` and the per-repo lanes are deleted (#11911); the PR-debt ledger they fed survives as `pr_debt`, fed by the step listing, for the build back-off and the idle gate.
 - **No daemon path spawns `/loom:sweep`** (#11911). Epic `BuildChildren` is deleted (an active epic plans nothing; its children are Builder steps), the review-stall watchdog's `PrSet` conversion is retired, and a roll requeues an `Issue` sweep (label restore, lock release) instead of resuming it. `DispatchSweep` IPC stays for attended callers only: the `dispatch_sweep` MCP tool that attended `/loom:sweep` Stage -1 uses, `loom-daemon dispatch` and Safehouse ChatOps.
 
@@ -228,9 +229,14 @@ A step that wrote its verdict and died still holding its claim only loses the cl
 
 | Rule | Fires when |
 |---|---|
-| `step-dispatch-stalled.json` | a dispatching host has `loom.forge.stage_items` > 0 in a work state and no spawned `loom.dispatch.step` for 15 min |
+| `step-dispatch-stalled.json` | a repo shows `loom.forge.stage_items` > 0 in a work state, a host dispatching for it has a free slot, and no `loom.dispatch.step` was spawned for the repo for 15 min |
 | `step-draw-pass-rate.json` | pool-gate plus claim refusals are above 80% of a host's `loom.dispatch.step` attempts for 30 min |
-| `step-slots-idle.json` | a host's busy slots stay below 50% of `maxConcurrent` for 30 min while stage depth stays > 0 |
+| `step-slots-idle.json` | a repo had work waiting for 30 min while the busiest host dispatching for it stayed below 50% of `maxConcurrent` |
+| `role-runner-item-tick.json` | a Curator, Judge or Doctor `role_tick.outcome` that is not a step (`loom.role_tick.source` != `step`) appears: a pre-cutover daemon or a surviving interval loop |
+
+`loom.forge.stage_items` is the captain's per-repo gauge, so the stalled and idle rules are keyed by repo and join it to the hosts that dispatch for the repo (their step and disposition spans in the last 24 h).
+
+**Holds.** A held workspace is not listed, so it has no queue rows on the tick (only a red-main repo that admits its fixes is listed, for those fixes).
 
 ## 8. Rollout and rollback
 
