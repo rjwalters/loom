@@ -289,3 +289,57 @@ fn an_escalated_tick_sends_a_budget_exhausted_listing_to_the_writer() {
     assert!(is_shed(&r), "the next ordinary tick sheds again");
     assert_eq!(calls(&log), ["writer"]);
 }
+
+/// 2026-10-15: an Observability conditional read is shed for every cause,
+/// and a Hygiene one waits out a withdrawal (a mix of budget and non-budget
+/// withdrawals, or a withdrawn gateway with no reader pool behind it):
+/// neither reaches the writer. A Hygiene read still takes the writer for a
+/// cause that may never clear (`Unavailable`).
+#[test]
+fn withdrawn_or_unavailable_readers_never_send_an_observability_read_to_the_writer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gh, log) = stub(tmp.path());
+    let until = SystemTime::now() + Duration::from_secs(600);
+    let withdrawn = |_: &RouteRequest<'_>| RouteDecision::Exhausted {
+        until,
+        cause: ExhaustCause::Withdrawn,
+    };
+    let gateway_only = |_: &RouteRequest<'_>| {
+        crate::forge_gateway::past_withdrawn_gateway(RouteDecision::NoPool, Some(until))
+    };
+    let unavailable = |_: &RouteRequest<'_>| RouteDecision::Exhausted {
+        until,
+        cause: ExhaustCause::Unavailable,
+    };
+    for class in [ReadClass::Hygiene, ReadClass::Observability] {
+        for route in [
+            &withdrawn as &dyn Fn(&RouteRequest<'_>) -> RouteDecision,
+            &gateway_only,
+        ] {
+            let r = fetch_conditional_via(site(class), &gh, None, &target(), URL, None, route);
+            assert!(is_shed(&r), "{class:?}");
+        }
+    }
+    let r = fetch_conditional_via(
+        site(ReadClass::Observability),
+        &gh,
+        None,
+        &target(),
+        URL,
+        None,
+        &unavailable,
+    );
+    assert!(is_shed(&r), "observability sheds on Unavailable too");
+    assert!(calls(&log).is_empty(), "{:?}", calls(&log));
+    let r = fetch_conditional_via(
+        site(ReadClass::Hygiene),
+        &gh,
+        None,
+        &target(),
+        URL,
+        None,
+        &unavailable,
+    );
+    assert!(r.is_ok());
+    assert_eq!(calls(&log), ["writer"]);
+}

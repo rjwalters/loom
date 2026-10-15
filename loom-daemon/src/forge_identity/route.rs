@@ -81,6 +81,28 @@ pub enum ReadClass {
     Observability,
 }
 
+impl ReadClass {
+    /// Whether a read of this class, with no reader left for `cause`, is
+    /// shed instead of sent to the writer (2026-10-15):
+    ///
+    /// - `Gate`: never shed;
+    /// - `Hygiene`: shed while the readers are out for a time-bounded
+    ///   reason ([`ExhaustCause::Budget`] or [`ExhaustCause::Withdrawn`]);
+    ///   the writer only for a cause that may never clear on its own
+    ///   ([`ExhaustCause::Unavailable`]: a stale or unpublished token
+    ///   directory, or no reader covering the repo);
+    /// - `Observability`: always shed — telemetry may go dark for a pass,
+    ///   the writer's budget is the fleet's dispatch budget.
+    #[must_use]
+    pub fn sheds(self, cause: ExhaustCause) -> bool {
+        match self {
+            Self::Gate => false,
+            Self::Hygiene => matches!(cause, ExhaustCause::Budget | ExhaustCause::Withdrawn),
+            Self::Observability => true,
+        }
+    }
+}
+
 /// Why a reader was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
@@ -167,9 +189,13 @@ pub enum RouteDecision {
 /// because the readers' **budget** is spent and the writer's must be kept
 /// for decision-gating reads. A reader that cannot see the repo, holds a
 /// stale or refused token, or is withdrawn App-wide says nothing about
-/// budget — shedding on those would stop a repo's housekeeping for as long
-/// as the condition lasts (a coverage miss is an hour; an unpublished token
-/// directory is forever), so those reads go to the writer like a Gate read.
+/// budget. A withdrawal (App-wide, a refused credential, a gateway outage)
+/// ends on its own, so it is [`ExhaustCause::Withdrawn`] and a Hygiene read
+/// waits it out; a stale or unpublished token directory, or no reader
+/// covering the repo, may never clear, so it is
+/// [`ExhaustCause::Unavailable`] and a Hygiene read goes to the writer like a
+/// Gate read. An Observability read is shed on every cause
+/// ([`ReadClass::sheds`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExhaustCause {
     /// Every reader that could serve the repo is out of budget: a live
@@ -177,8 +203,12 @@ pub enum ExhaustCause {
     /// above the headroom reserve. At least one such reader exists and no
     /// reader is excluded for any other reason.
     Budget,
-    /// Some reader is excluded for a reason other than budget (stale or
-    /// unpublished token, refused credential, App-wide withdrawal), or no
+    /// Every reader that could serve the repo is withdrawn or out of budget,
+    /// and at least one withdrawal is not a rate limit (App-wide, a refused
+    /// credential, the gateway's outage withdrawal). Every exclusion ends on
+    /// its own.
+    Withdrawn,
+    /// Some reader holds a stale or unpublished token directory, or no
     /// reader covers the repo at all.
     Unavailable,
 }
@@ -188,6 +218,7 @@ impl ExhaustCause {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Budget => "budget",
+            Self::Withdrawn => "withdrawn",
             Self::Unavailable => "unavailable",
         }
     }
@@ -857,8 +888,9 @@ pub fn route_read_in(
     // - a reader withdrawn from this repo (coverage) is not part of the
     //   repo's pool at all and counts as neither;
     // - a live rate-limit withdrawal is budget;
-    // - an App-wide withdrawal, a refused credential or a stale/unpublished
-    //   token directory is not;
+    // - an App-wide withdrawal or a refused credential is a (time-bounded)
+    //   withdrawal;
+    // - a stale/unpublished token directory is neither;
     // - a deferrable read (not [`ReadClass::Gate`]) also needs headroom: on
     //   the first reader that could serve it (its placement, or the first
     //   one past readers that cannot) below `shedPct`, the headroom
@@ -871,11 +903,11 @@ pub fn route_read_in(
         bucket_key(&r.app_id, owner, req.resource)
             .and_then(|k| forge_bucket_book::projected_used_pct(&k, now_epoch))
     };
-    let (mut budget, mut other, mut first_seen) = (0_usize, 0_usize, false);
+    let (mut budget, mut withdrawn, mut other, mut first_seen) = (0_usize, 0_usize, 0_usize, false);
     for off in 0..n {
         let r = readers[(start + off) % n];
         if forge_read_pool::is_withdrawn_at(&r.app_id, now) {
-            other += 1;
+            withdrawn += 1;
             continue;
         }
         if super::repo_withdrawn_at(&r.app_id, req.owner_repo, now) {
@@ -886,7 +918,7 @@ pub fn route_read_in(
                 budget += 1;
                 first_seen = true;
             } else {
-                other += 1;
+                withdrawn += 1;
             }
             continue;
         }
@@ -917,10 +949,12 @@ pub fn route_read_in(
             },
         );
     }
-    let cause = if budget > 0 && other == 0 {
-        ExhaustCause::Budget
-    } else {
+    let cause = if other > 0 || budget + withdrawn == 0 {
         ExhaustCause::Unavailable
+    } else if withdrawn > 0 {
+        ExhaustCause::Withdrawn
+    } else {
+        ExhaustCause::Budget
     };
     RouteDecision::Exhausted {
         until: exhausted_until(&readers, req, owner, legacy, now),

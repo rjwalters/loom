@@ -402,3 +402,31 @@ fn prs_waiting_on_budget_are_not_dropped_as_failures() {
     }
     assert_eq!(total, n, "every PR is sampled once the budget reaches it");
 }
+
+/// 2026-10-15: every per-item Observability read is named (never the generic
+/// `api.rest`, which hid the fleet.state history reads in the writer's
+/// spend) and carries the Observability class, which never routes to the
+/// writer while a reader pool exists.
+#[test]
+fn per_item_observability_reads_are_named_and_observability_class() {
+    use crate::gh_invocation::{Operation, ReadClass};
+    use crate::observability::fleet_state::outcomes::{
+        CLOSE_EVENTS_OP, CLOSE_TIMELINE_OP, ISSUE_OP, LABEL_EVENTS_OP, PULL_OP,
+    };
+    let root = Path::new("/nonexistent");
+    for op in [
+        super::MERGED_AT_OP,
+        PULL_OP,
+        ISSUE_OP,
+        CLOSE_EVENTS_OP,
+        CLOSE_TIMELINE_OP,
+        LABEL_EVENTS_OP,
+    ] {
+        assert!(Operation::is_valid(op), "{op}");
+        assert_ne!(op, "api.rest");
+        let inv = super::gh_json_invocation(root, op, "repos/acme/widget/issues/7/events");
+        assert_eq!(inv.operation().as_str(), op);
+        assert_eq!(inv.class(), ReadClass::Observability, "{op}");
+    }
+    assert_eq!(LABEL_EVENTS_OP, "fleet_state.label_events");
+}
