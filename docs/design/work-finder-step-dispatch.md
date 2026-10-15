@@ -236,7 +236,7 @@ A step that wrote its verdict and died still holding its claim only loses the cl
 
 The stalled and idle rules key on `loom.step.actionable{repo}`, which every dispatching host emits per listed repo each tick: the items with weight > 0 after the live claims. `loom.forge.stage_items` would count parked, held, operator, frozen and epic work the tick never draws, and it is the captain's gauge, not the dispatcher's.
 
-**Holds.** A held workspace is not listed, so it has no queue rows on the tick (only a red-main repo that admits its fixes is listed, for those fixes).
+**Holds.** A held workspace is not listed, so it has no queue rows on the tick (only a red-main repo that admits its fixes is listed). A listed red repo keeps every step that adds no code to `main` (Curator, Champion promote, re-evaluate and hold re-evaluate, Judge, Doctor) for any item, so a fix PR can be reviewed and repaired; Builder and `ChampionMerge` run only for a red-main fix, so Champion merges a fix PR only when its issue carries the `<!-- loom:main-red-fix -->` marker.
 
 ## 8. Rollout and rollback
 
