@@ -405,6 +405,49 @@ pub fn plan(
     }
 }
 
+/// The rate-limit bucket a passthrough read spends, from the argv
+/// classifier the ledger uses: graphql for `issue|pr|repo`, search, else
+/// core.
+#[must_use]
+pub fn resource_of(raw: &[std::ffi::OsString]) -> crate::forge_bucket_book::Resource {
+    use crate::forge_bucket_book::Resource;
+    match crate::gh_invocation::accounting::static_pool(raw) {
+        crate::forge_call_stats::Pool::Graphql => Resource::Graphql,
+        crate::forge_call_stats::Pool::Search => Resource::Search,
+        _ => Resource::Core,
+    }
+}
+
+/// A reader App's `GH_CONFIG_DIR` for a classified read of `repo` (#12245):
+/// the reader pool's answer for a gate read, the same router (and the same
+/// trust check on a directory the front found in its environment) the
+/// served reads use. `None` sends the read to the writer. Only [`plan`]'s
+/// caller asks, and only for a read whose repo is certain.
+#[must_use]
+pub fn pool_reader(repo: &str, resource: crate::forge_bucket_book::Resource) -> Option<PathBuf> {
+    let req = crate::forge_identity::RouteRequest::gate(repo, None, resource);
+    match crate::forge_identity::route_read(&req, std::time::SystemTime::now()) {
+        crate::forge_identity::RouteDecision::Reader { dir, .. } => Some(dir),
+        _ => None,
+    }
+}
+
+/// Whether a reader's failed answer is the reader's own refusal — coverage
+/// (403/404, not accessible by integration), a refused token (401) or a
+/// rate limit — so the read goes on to the writer, as
+/// [`crate::forge_identity::reader_then_writer`] does for served reads.
+/// `http_status` is the response's status when `gh` printed headers; the
+/// stderr's `HTTP <nnn>` otherwise.
+#[must_use]
+pub fn reader_refused(
+    stderr: &str,
+    http_status: Option<u16>,
+    resource: crate::forge_bucket_book::Resource,
+) -> bool {
+    let status = http_status.or_else(|| crate::forge_gateway::outage::http_status_in(stderr));
+    crate::forge_identity::classify_failure(stderr, status, None, resource).is_some()
+}
+
 #[cfg(test)]
 #[path = "read_route_tests.rs"]
 mod tests;

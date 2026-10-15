@@ -206,3 +206,19 @@ fn plan_offers_a_reader_for_a_read_after_the_gateway_and_never_for_a_write() {
     );
     assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());
 }
+
+#[test]
+fn a_reader_refusal_is_coverage_credential_or_rate_limit_only() {
+    use crate::forge_bucket_book::Resource;
+    let refused = |e: &str| reader_refused(e, None, Resource::Core);
+    assert!(refused("HTTP 404: Not Found (https://api.github.com/repos/a/b/pulls/1)"));
+    assert!(refused("HTTP 403: Resource not accessible by integration"));
+    assert!(refused("HTTP 403: API rate limit exceeded for installation ID 70."));
+    assert!(refused("HTTP 401: Bad credentials"));
+    assert!(refused("GraphQL: Could not resolve to a Repository with the name 'a/b'."));
+    assert!(reader_refused("", Some(404), Resource::Core));
+    // A real answer of another kind is the agent's to see.
+    assert!(!refused("HTTP 422: Validation Failed"));
+    assert!(!refused("unknown flag: --what"));
+    assert!(!refused(""));
+}

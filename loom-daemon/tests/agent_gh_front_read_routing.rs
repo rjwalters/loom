@@ -15,12 +15,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 /// `issue 42` answers `200` with an ETag; everything else succeeds quietly,
-/// except under `$STUB_FAIL_DIR`, where every call fails with an edge `530`.
+/// except under `$STUB_FAIL_DIR`, where every call fails with
+/// `$STUB_FAIL_MSG` on stderr (default an edge `530`).
 /// Each call logs `<GH_CONFIG_DIR>|<argv>`.
 const STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$GH_CONFIG_DIR" "$*" >> "$STUB_LOG"
 if [ -n "$STUB_FAIL_DIR" ] && [ "$GH_CONFIG_DIR" = "$STUB_FAIL_DIR" ]; then
-  echo 'HTTP 530' >&2
+  echo "${STUB_FAIL_MSG:-HTTP 530}" >&2
   exit 1
 fi
 case "$*" in
@@ -157,6 +158,7 @@ impl Sandbox {
             "LOOM_GH_GATEWAY_DIR",
             "LOOM_GH_READER_ROOT",
             "STUB_FAIL_DIR",
+            "STUB_FAIL_MSG",
         ] {
             cmd.env_remove(k);
         }
@@ -273,6 +275,31 @@ fn a_reader_fault_reruns_the_read_on_the_writer_and_withdraws_no_gateway() {
     assert_eq!(sb.dirs_for("pr diff"), [reader.clone(), sb.p("writer")]);
     // The gateway's outage marker is never written beside a reader.
     assert!(!reader.parent().unwrap().join("outage-until").exists());
+}
+
+#[test]
+fn a_readers_own_refusal_reruns_the_read_on_the_writer() {
+    for msg in [
+        "HTTP 404: Not Found (https://api.github.com/repos/acme/widget/pulls/42)",
+        "HTTP 403: Resource not accessible by integration",
+        "HTTP 403: API rate limit exceeded for installation ID 70.",
+        "HTTP 401: Bad credentials",
+    ] {
+        let sb = Sandbox::new();
+        let reader = sb.publish_reader("acme");
+        let ws = sb.p("ws");
+        let env = [
+            ("LOOM_GH_READER_ROOT", ws.as_path()),
+            ("STUB_FAIL_DIR", reader.as_path()),
+            ("STUB_FAIL_MSG", Path::new(msg)),
+        ];
+
+        let diff = sb.gh(DIFF, &env);
+        ok(&diff);
+        assert_eq!(String::from_utf8_lossy(&diff.stdout), "ok\n", "{msg}");
+        assert_eq!(String::from_utf8_lossy(&diff.stderr), "", "{msg}");
+        assert_eq!(sb.dirs_for("pr diff"), [reader.clone(), sb.p("writer")], "{msg}");
+    }
 }
 
 #[test]

@@ -355,7 +355,19 @@ fn run_on_profile(
     } else {
         crate::forge_gateway::outage::fault(response.as_ref(), &stdout, &stderr)
     };
-    if fault.reruns() {
+    // A reader also hands the read on when it is the reader's own refusal —
+    // not covering the repo, a refused token, a spent bucket — as the
+    // served reads' reader-then-writer chain does. The front is a new
+    // process per call, so no withdrawal remembers it: this is decided on
+    // every call.
+    let refused = !gateway
+        && !out.status.success()
+        && read_route::reader_refused(
+            &stderr,
+            response.as_ref().map(|r| r.status),
+            read_route::resource_of(raw),
+        );
+    if fault.reruns() || refused {
         // Any 5xx or transport error is run again on the next credential.
         // Only a fault the gateway itself signalled keeps the next calls off
         // it.
@@ -430,24 +442,13 @@ fn passthrough_route(raw: &[OsString], cwd: Option<&Path>) -> read_route::FrontR
         return direct_read;
     }
     let gh_repo = std::env::var("GH_REPO").ok();
-    let resource = match crate::gh_invocation::accounting::static_pool(raw) {
-        crate::forge_call_stats::Pool::Graphql => crate::forge_bucket_book::Resource::Graphql,
-        crate::forge_call_stats::Pool::Search => crate::forge_bucket_book::Resource::Search,
-        _ => crate::forge_bucket_book::Resource::Core,
-    };
-    let reader = |repo: &str| {
-        let req = crate::forge_identity::RouteRequest::gate(repo, None, resource);
-        match crate::forge_identity::route_read(&req, std::time::SystemTime::now()) {
-            crate::forge_identity::RouteDecision::Reader { dir, .. } => Some(dir),
-            _ => None,
-        }
-    };
+    let resource = read_route::resource_of(raw);
     read_route::plan(
         &args,
         gh_repo.as_deref(),
         || implicit_repo(&git_remote_config(cwd?)?),
         &crate::forge_gateway::profile_for,
-        &reader,
+        &|repo| read_route::pool_reader(repo, resource),
     )
 }
 
@@ -479,17 +480,25 @@ fn pin_repo(mut args: Vec<String>, cwd: Option<&Path>) -> Option<Vec<String>> {
     Some(args)
 }
 
-/// `git config --get-regexp ^remote\.` in `cwd`.
+/// Longest the front waits for the local `git` read of the remotes. A
+/// healthy read takes a few milliseconds.
+const GIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `git config --get-regexp ^remote\.` in `cwd`, killed after
+/// [`GIT_BUDGET`]: a `git` that does not answer leaves the repo unknown (the
+/// call then keeps the session's credential), never the agent waiting.
 fn git_remote_config(cwd: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["config", "--get-regexp", r"^remote\."])
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["config", "--get-regexp", r"^remote\."])
         .current_dir(cwd)
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null());
+    match crate::proc_exec::run_bounded(cmd, GIT_BUDGET) {
+        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+        _ => None,
+    }
 }
 
 /// The `owner/name` `gh` resolves from a checkout's remotes, when that is
