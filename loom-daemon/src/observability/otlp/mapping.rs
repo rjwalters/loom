@@ -21,6 +21,7 @@ mod pick_decision;
 mod role_draw;
 mod session_output;
 mod token_ranking;
+mod tokens_snapshot;
 mod work_started;
 
 // The shared host `Resource` constructor; traces and the relay re-import it
@@ -987,49 +988,7 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             }
             samples
         }
-        TelemetryRecord::TokensSnapshot(r) => {
-            let mut samples = Vec::new();
-            for account in &r.accounts {
-                let mut attributes = vec![
-                    kv_string("account", account.account.clone()),
-                    kv_string("provider", account.provider.clone()),
-                ];
-                if let Some(rank) = account.rank {
-                    attributes.push(kv_int("rank", i64::from(rank)));
-                }
-                if let Some(usage_fraction) = account.usage_fraction {
-                    samples.push(MetricSample {
-                        name: "loom.tokens.usage_fraction",
-                        description: "Fraction of the current limit window consumed (0..1).",
-                        unit: "1",
-                        attributes: attributes.clone(),
-                        value: number_data_point::Value::AsDouble(usage_fraction),
-                        time_unix_nano,
-                    });
-                }
-                // Issue #9005: the rolling 7-day axis beside the 5h one. Same
-                // absent-not-zero rule — no source, no series.
-                if let Some(weekly) = account.usage_fraction_weekly {
-                    samples.push(MetricSample {
-                        name: "loom.tokens.usage_fraction_weekly",
-                        description: "Fraction of the rolling 7-day limit window consumed (0..1).",
-                        unit: "1",
-                        attributes: attributes.clone(),
-                        value: number_data_point::Value::AsDouble(weekly),
-                        time_unix_nano,
-                    });
-                }
-                samples.push(MetricSample {
-                    name: "loom.tokens.exhausted",
-                    description: "Whether the account is currently excluded from the usable pool (1 = exhausted).",
-                    unit: "1",
-                    attributes,
-                    value: number_data_point::Value::AsInt(i64::from(account.exhausted)),
-                    time_unix_nano,
-                });
-            }
-            samples
-        }
+        TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),
         // Every kind that is not declared `otlp: Gauges` in
         // `telemetry/kinds.rs` produces no gauge here:
         //   - every lifecycle-shaped kind — including `role_tick.outcome`

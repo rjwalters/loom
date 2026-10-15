@@ -81,6 +81,9 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.halt_causes",
     // #11857: how many workspaces a hold gated this tick (`0` when none).
     "loom.dispatch.held_roots",
+    // #11973: why a tick counted errors — one token of a fixed set, or
+    // `mixed` (`work_finder::tick_report::error_kind`).
+    "loom.dispatch.error_kind",
     // #11858: the held repos with their causes, the cap's binding term and
     // terms, and the open-PR pre-filter's skips (`ops::dispatch_facts`).
     "loom.dispatch.halted_repos",

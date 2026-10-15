@@ -72,6 +72,15 @@ runner = ".cargo/macos-test-runner.sh"
 # default under TMPDIR", what these tests saw before W5; a test that wants a
 # sink sets its own.
 LOOM_FORGE_CALL_STATS_DIR = { value = "", force = true }
+# #9720: `config_resolver::private_defaults_path()` returns None only under
+# `cfg(test)`, and the bin target compiles the lib without it, so bin-target
+# tests (fleet_captain_cmd, attend_hook) read the host's machine-tier
+# `~/.local/share/loom/config/defaults.json` and fail on a host whose file
+# names a captain. Empty disables that tier; a test that wants a defaults file
+# sets its own via set_var, which overrides this. `force = true` also applies
+# to `cargo run`, so an in-repo dev daemon (start-daemon.sh, daemon:preview)
+# ignores the machine defaults file too, even with the variable exported.
+LOOM_CONFIG_DEFAULTS_FILE = { value = "", force = true }
 
 [alias]
 # Convenient aliases for common tasks

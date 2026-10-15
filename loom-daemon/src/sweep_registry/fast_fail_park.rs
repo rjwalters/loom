@@ -152,12 +152,15 @@ impl SweepRegistry {
     }
 
     /// The issue-attributable fast-failure streak the park counts: the ladder's
-    /// streak when [`DispatchBackoffCause::FastFailure`] armed it, else 0.
+    /// streak when [`DispatchBackoffCause::FastFailure`] armed it, else 0. A
+    /// streak a peer's progress has broken since it was recorded reads as 0
+    /// (#11952); the record's window is untouched.
     #[must_use]
     pub(crate) fn fast_failure_streak(&self, issue: u32) -> u32 {
         self.dispatch_backoff
             .get(&issue)
             .filter(|s| s.cause == DispatchBackoffCause::FastFailure)
+            .filter(|s| !self.peer_broke_fast_fail_streak(issue, s))
             .map_or(0, |s| s.consecutive)
     }
 

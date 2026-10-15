@@ -799,6 +799,72 @@ fn tokens_snapshot_weekly_axis_is_a_separate_gauge_absent_when_unknown() {
     assert_eq!(points[0].value, Some(number_data_point::Value::AsDouble(0.37)));
 }
 
+/// Issue #11992: the reset instant reaches OTLP as two per-account gauges —
+/// the absolute Unix time and the signed countdown from `captured_at` —
+/// emitted only where the instant is known (agent-2 has none: no point, not 0).
+#[test]
+fn tokens_snapshot_reset_instant_is_a_countdown_gauge_absent_when_unknown() {
+    let reset_at = ts() + chrono::Duration::hours(30);
+    let mut exhausted = tokens_snapshot_envelope();
+    let TelemetryRecord::TokensSnapshot(snapshot) = &mut exhausted.record else {
+        unreachable!()
+    };
+    snapshot.accounts[0].limit_window_reset_at = Some(reset_at);
+    snapshot.accounts[0].exhausted = true;
+    let request = build_metrics_request(&[exhausted]).unwrap();
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    let points = |name: &str| {
+        let metric = metrics
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("{name} metric must exist"));
+        assert_eq!(metric.unit, "s");
+        match &metric.data {
+            Some(metric::Data::Gauge(gauge)) => gauge.data_points.clone(),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    };
+    let account = |point: &NumberDataPoint| {
+        point
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "account")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+
+    let absolute = points("loom.tokens.limit_window_reset_at");
+    assert_eq!(absolute.len(), 1, "only the account with a known reset instant");
+    assert_eq!(account(&absolute[0]), Some(any_value::Value::StringValue("agent-1".into())));
+    assert_eq!(absolute[0].value, Some(number_data_point::Value::AsInt(reset_at.timestamp())));
+
+    let countdown = points("loom.tokens.seconds_until_reset");
+    assert_eq!(countdown.len(), 1);
+    assert_eq!(account(&countdown[0]), Some(any_value::Value::StringValue("agent-1".into())));
+    assert_eq!(countdown[0].value, Some(number_data_point::Value::AsInt(30 * 3600)));
+}
+
+/// A reset instant already behind `captured_at` stays visibly stale
+/// (negative), never clamped into a false "capacity is free now".
+#[test]
+fn tokens_snapshot_stale_reset_instant_yields_a_negative_countdown() {
+    let mut stale = tokens_snapshot_envelope();
+    let TelemetryRecord::TokensSnapshot(snapshot) = &mut stale.record else {
+        unreachable!()
+    };
+    snapshot.accounts[0].limit_window_reset_at = Some(ts() - chrono::Duration::minutes(5));
+    let request = build_metrics_request(&[stale]).unwrap();
+    let countdown = request.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .find(|m| m.name == "loom.tokens.seconds_until_reset")
+        .expect("countdown metric must exist");
+    let Some(metric::Data::Gauge(gauge)) = &countdown.data else {
+        panic!("expected Gauge")
+    };
+    assert_eq!(gauge.data_points[0].value, Some(number_data_point::Value::AsInt(-300)));
+}
+
 #[test]
 fn metrics_are_grouped_by_host_id() {
     let batch = vec![host_health_envelope(), sweep_started_envelope()];
