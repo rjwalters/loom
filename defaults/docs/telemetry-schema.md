@@ -2016,6 +2016,26 @@ large `gather_ms`, not a silent host. Every work-finder tick body also logs
 `work_finder: tick N start` at INFO, so a tick that never reaches its
 dispatch line can be placed in the host log.
 
+Since #12256 these four keys are also on the export allowlist (they were
+emitted but dropped before it), and the tick span records where its wall
+time went, all in milliseconds unless noted (absent when no step tick ran):
+
+| Attribute | Meaning |
+|---|---|
+| `loom.dispatch.phase.listing_ms` | The gather's forge half: item and open-PR listings, hold markers, blocker states, the landed pre-filter, CI at Judge heads. Runs `gather_concurrency` repos at once |
+| `loom.dispatch.phase.filter_ms` | Stage-entry lookups (events reads, budgeted per tick), weighing and pool shaping. Serial, in walk order |
+| `loom.dispatch.phase.draw_ms` | The draw loop outside spawns |
+| `loom.dispatch.phase.spawn_ms` | Time inside spawns: resolvers and containment, the pre-claim, the claim flip and lease comment, the spawn and the account-selection poll |
+| `loom.dispatch.spawn_attempts` | Spawn attempts the draw made, spawned or refused (count) |
+| `loom.dispatch.gather_concurrency` | How many repos the listings read at once (`autonomous.workFinder.gatherConcurrency`) (count) |
+
+The `invoke github` spans the tick's own thread and its gather workers open
+are children of the `loom.dispatch.tick` span (`context_source=parent`).
+Before #12256 each was the root of its own trace, so which calls a tick waited
+on could not be read from the trace. Forge calls made in a separate process,
+such as the pre-claim's `loom-daemon lease pr claim`, are still separate
+traces.
+
 #### `loom.dispatch.disposition` (Issue #9222): per-issue "why is it waiting"
 
 Every ready-queue row the work finder ranked on its most recent tick

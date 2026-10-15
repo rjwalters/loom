@@ -386,20 +386,26 @@ fn blocker_cache() -> &'static Mutex<BlockerCache> {
 fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, PullMarkers> {
     let mut out = HashMap::new();
     let mut reads = 0usize;
-    let mut cache = marker_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = || {
+        marker_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
     for row in rows
         .iter()
         .filter(|r| r.is_pull_request && crate::work_finder::is_blocked_hold(&r.labels))
     {
         let key = (slug.to_string(), row.number);
-        if let Some((at, markers)) = cache.get(&key) {
-            if *at == row.updated_at {
-                out.insert(row.number, markers.clone());
-                continue;
-            }
+        // The lock is held only for the lookup and the insert, never across
+        // the comment read: several repos are gathered at once (#12256).
+        let cached = cache()
+            .get(&key)
+            .filter(|(at, _)| *at == row.updated_at)
+            .map(|(_, m)| m.clone());
+        if let Some(markers) = cached {
+            out.insert(row.number, markers);
+            continue;
         }
         if reads >= MAX_MARKER_READS {
             continue;
@@ -414,7 +420,7 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
             continue;
         };
         let markers = PullMarkers::from_trusted(&TrustedComments::filtered(&policy, trusted));
-        cache.insert(key, (row.updated_at.clone(), markers.clone()));
+        cache().insert(key, (row.updated_at.clone(), markers.clone()));
         out.insert(row.number, markers);
     }
     out
@@ -500,6 +506,32 @@ pub fn gather(
     provider: &mut StageEntryProvider,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<Gathered>> {
+    Ok(list(root, registry, main_red, held_capabilities)?.map(|l| finish(l, root, provider, now)))
+}
+
+/// One workspace's forge half of [`gather`] (#12256): the listings, the
+/// facts and the classification, everything but the stage-entry lookups.
+/// It touches no state shared across repos but the process caches (each
+/// behind its own lock), so the driver runs it for several repos at once.
+#[derive(Debug, Clone)]
+pub struct Listed {
+    pub slug: String,
+    rows: Vec<RestIssue>,
+    items: Vec<Item>,
+    pulls_complete: bool,
+    stale_listing: bool,
+}
+
+/// [`gather`]'s forge half (module docs, [`Listed`]).
+///
+/// # Errors
+/// The listing's: the set is all-or-nothing.
+pub fn list(
+    root: &Path,
+    registry: &Arc<Mutex<SweepRegistry>>,
+    main_red: impl FnOnce(Vec<crate::work_finder::WorkItem>) -> bool,
+    held_capabilities: &BTreeSet<String>,
+) -> anyhow::Result<Option<Listed>> {
     let target = registry
         .lock()
         .ok()
@@ -601,6 +633,32 @@ pub fn gather(
     if held > 0 {
         log::debug!("work_finder: {slug}: {held} Judge step(s) held while CI runs at the head");
     }
+    Ok(Some(Listed {
+        slug,
+        rows,
+        items,
+        pulls_complete,
+        stale_listing,
+    }))
+}
+
+/// [`gather`]'s serial half: the stage-entry lookups (one provider, one
+/// per-tick events budget, spent in the driver's walk order so it is
+/// deterministic) and the draw inputs. Its events reads are bounded by the
+/// provider's budget.
+pub fn finish(
+    listed: Listed,
+    root: &Path,
+    provider: &mut StageEntryProvider,
+    now: DateTime<Utc>,
+) -> Gathered {
+    let Listed {
+        slug,
+        rows,
+        items,
+        pulls_complete,
+        stale_listing,
+    } = listed;
     let mut events = GhEventsReader;
     let draw = draw_inputs(items, &rows, |row, label| {
         provider.entry(&mut events, root, &slug, row, label, now)
@@ -608,7 +666,7 @@ pub fn gather(
     if !stale_listing {
         provider.retain_present(&slug, &rows);
     }
-    Ok(Some(Gathered {
+    Gathered {
         ladder: ladder_due(&rows),
         created_at: rows
             .iter()
@@ -618,7 +676,7 @@ pub fn gather(
         inputs: draw,
         pulls_complete,
         stale_listing,
-    }))
+    }
 }
 
 #[cfg(test)]

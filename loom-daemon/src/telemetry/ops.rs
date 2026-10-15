@@ -92,6 +92,19 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.cap_disk",
     "loom.dispatch.cap_ram",
     "loom.dispatch.pr_open_prefiltered",
+    // #12074: the step gather's cost and coverage. Emitted since #12074 but
+    // missing here until #12256, so export dropped them.
+    "loom.dispatch.gather_ms",
+    "loom.dispatch.repos_gathered",
+    "loom.dispatch.repos_skipped",
+    "loom.dispatch.gather_truncated",
+    // #12256: where the tick's wall time went (`ops::dispatch_facts`).
+    "loom.dispatch.phase.listing_ms",
+    "loom.dispatch.phase.filter_ms",
+    "loom.dispatch.phase.draw_ms",
+    "loom.dispatch.phase.spawn_ms",
+    "loom.dispatch.spawn_attempts",
+    "loom.dispatch.gather_concurrency",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",

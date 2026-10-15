@@ -11,6 +11,7 @@
 //! pre-dispatch section used the whole budget still makes progress (its reads
 //! then fail fast and fall back to the last good listing).
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The cost and coverage of one tick's gather, for the tick report.
@@ -24,6 +25,105 @@ pub struct GatherStats {
     pub repos_skipped: usize,
     /// The deadline cut the gather short.
     pub truncated: bool,
+}
+
+/// Where one step tick's wall time went (#12256), for the tick span: the
+/// listings (the forge half of the gather, run concurrently), the filter
+/// (stage entry, weighing and pool shaping, serial), and the draw loop split
+/// into the time spent inside spawns (claims, containment, the
+/// account-selection poll) and the rest (the draw itself).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TickPhases {
+    pub listing_ms: u64,
+    pub filter_ms: u64,
+    pub draw_ms: u64,
+    pub spawn_ms: u64,
+    /// Spawn attempts the draw made (spawned or refused).
+    pub spawn_attempts: usize,
+    /// How many repos the listings read at once.
+    pub gather_concurrency: usize,
+}
+
+/// Milliseconds in `d`, saturating. Pure.
+#[must_use]
+pub fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The default number of repos the step gather lists at once (#12256).
+pub const DEFAULT_GATHER_CONCURRENCY: usize = 8;
+/// The most repos the step gather lists at once, whatever the config says.
+pub const MAX_GATHER_CONCURRENCY: usize = 32;
+
+/// `autonomous.workFinder.gatherConcurrency` from an effective config: a
+/// positive integer (at most [`MAX_GATHER_CONCURRENCY`]), else
+/// [`DEFAULT_GATHER_CONCURRENCY`]. `1` restores the serial gather. Pure.
+#[must_use]
+pub fn gather_concurrency_from(effective: &serde_json::Value) -> usize {
+    crate::config_resolver::get_path(effective, "autonomous.workFinder.gatherConcurrency")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| *n > 0)
+        .map_or(DEFAULT_GATHER_CONCURRENCY, |n| {
+            usize::try_from(n).map_or(MAX_GATHER_CONCURRENCY, |n| n.min(MAX_GATHER_CONCURRENCY))
+        })
+}
+
+/// The gather concurrency for the daemon rooted at `root`, read live.
+#[must_use]
+pub fn gather_concurrency(root: &std::path::Path) -> usize {
+    gather_concurrency_from(&crate::config_resolver::resolve_effective_config(root))
+}
+
+/// Run `work` over `jobs` on at most `workers` threads, each started with
+/// `setup` (the caller's thread-local scopes carried over), and return the
+/// results **in job order**, whatever order they finished in (#12256): the
+/// tick's draw must not depend on which listing answered first. Jobs are
+/// taken in order, one at a time, so `work` sees them start in job order
+/// too. `work` returning `None` is a job not run (a deadline skip).
+pub fn run_ordered<J, R, G>(
+    jobs: Vec<J>,
+    workers: usize,
+    setup: impl Fn() -> G + Sync,
+    work: impl Fn(usize, J) -> Option<R> + Sync,
+) -> Vec<(usize, R)>
+where
+    J: Send,
+    R: Send,
+{
+    let n = jobs.len();
+    let workers = workers.clamp(1, n.max(1));
+    let queue = Mutex::new(jobs.into_iter().enumerate());
+    let results: Mutex<Vec<(usize, R)>> = Mutex::new(Vec::with_capacity(n));
+    let run = || {
+        let _scope = setup();
+        loop {
+            let next = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next();
+            let Some((pos, job)) = next else { break };
+            if let Some(r) = work(pos, job) {
+                results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((pos, r));
+            }
+        }
+    };
+    if workers == 1 {
+        run();
+    } else {
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(run);
+            }
+        });
+    }
+    let mut out = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    out.sort_by_key(|(pos, _)| *pos);
+    out
 }
 
 /// One tick's walk over `n` repos from `start`.

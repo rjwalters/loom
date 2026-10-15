@@ -100,6 +100,9 @@ pub struct TickReport {
     /// took, how many repos it read and how many the tick deadline cut.
     /// `None` when no step gather ran.
     pub gather: Option<crate::step_dispatch::gather_budget::GatherStats>,
+    /// Where the step tick's wall time went, by phase (#12256). `None` when
+    /// no step tick ran.
+    pub phases: Option<crate::step_dispatch::gather_budget::TickPhases>,
     /// Issues skipped because a **peer host** advertised a live soft claim over
     /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
     /// distinct reason — never folded into [`collisions`](Self::collisions)
