@@ -66,7 +66,7 @@ fn notice_fingerprint(body: &str) -> Option<String> {
         return is_digest(d).then(|| d.to_string());
     }
     let full = body.split(LEGACY_FP_PREFIX).nth(1)?.split('`').next()?;
-    Some(digest(full))
+    Some(legacy_digest(full))
 }
 
 /// Whether `body` carries the no-op hold's daemon park record.
@@ -192,7 +192,7 @@ mod tests {
     fn a_pre_12024_notice_is_read_from_its_full_fingerprint() {
         let full = "labels=[loom:curated];open=true;comments=[];pr=none;deps=[]";
         let old = notice(&format!("Fingerprint compared: `{full}`"));
-        assert_eq!(standing_noop_hold_fingerprint(&[old]), Some(digest(full)));
+        assert_eq!(standing_noop_hold_fingerprint(&[old]), Some(legacy_digest(full)));
     }
 
     #[test]

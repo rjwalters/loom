@@ -78,7 +78,7 @@
 //! notice ([`adopt`]), so a hold outlives the host that applied it.
 
 use super::fingerprint::{
-    choose_park, digest, is_digest, IssueSnapshot, ParkKind, MAX_DEPENDENCY_READS,
+    choose_park, digest, is_digest, legacy_digest, IssueSnapshot, ParkKind, MAX_DEPENDENCY_READS,
 };
 use super::*;
 use crate::sweep_registry::park_hold::{self, HoldGate};

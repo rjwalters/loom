@@ -46,7 +46,7 @@ impl SweepRegistry {
             let fingerprint = if is_digest(&h.fingerprint) {
                 h.fingerprint
             } else {
-                digest(&h.fingerprint)
+                legacy_digest(&h.fingerprint)
             };
             let count = self.noop_cooldown_config.hold_threshold;
             self.noop_cooldown

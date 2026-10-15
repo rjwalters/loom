@@ -9,9 +9,15 @@
 /// hold must not mistake for a change in what the sweep depends on: a claim
 /// (`loom:building`), its release (`loom:issue`), and the Curator / Doctor
 /// working markers.
+///
+/// `loom:curated` is churn too (#12024): Champion's promotion and a Builder
+/// step's release move an issue between `loom:curated` and `loom:issue`, and
+/// that cycle is exactly the loop the hold must count through, not a change
+/// that restarts it.
 const DAEMON_CHURN_LABELS: &[&str] = &[
     "loom:building",
     "loom:issue",
+    "loom:curated",
     "loom:curating",
     "loom:treating",
 ];
@@ -87,6 +93,29 @@ pub(crate) fn digest(fingerprint: &str) -> String {
     use sha2::{Digest, Sha256};
     let full = hex::encode(Sha256::digest(fingerprint.as_bytes()));
     full[..16].to_string()
+}
+
+/// The digest of a full fingerprint written by an older daemon (a
+/// pre-#12024 hold notice or holds file), after dropping the labels this
+/// version counts as churn from its `labels=[…]` segment. Without this a
+/// legacy hold would never match a fresh read once `loom:curated` became
+/// churn, and would be released on its first reconciliation.
+#[must_use]
+pub(crate) fn legacy_digest(full: &str) -> String {
+    let normalized = full
+        .strip_prefix("labels=[")
+        .and_then(|rest| rest.split_once("];"))
+        .map_or_else(
+            || full.to_string(),
+            |(labels, tail)| {
+                let kept: Vec<&str> = labels
+                    .split(',')
+                    .filter(|l| !l.is_empty() && !DAEMON_CHURN_LABELS.contains(l))
+                    .collect();
+                format!("labels=[{}];{tail}", kept.join(","))
+            },
+        );
+    digest(&normalized)
 }
 
 /// Whether `s` is already a [`digest`] (a pre-#12024 persisted hold stored
@@ -297,5 +326,17 @@ mod tests {
         assert_eq!(d, digest(&base().fingerprint()));
         assert_ne!(d, digest("something else"));
         assert!(!is_digest(&base().fingerprint()));
+    }
+
+    #[test]
+    fn a_legacy_fingerprint_digests_like_a_fresh_read_of_the_same_state() {
+        let mut s = base();
+        s.labels = vec!["loom:curated".into(), "loom:important".into()];
+        let full = s.fingerprint();
+        assert!(full.starts_with("labels=[loom:important];"), "curated is churn: {full}");
+        // What an older daemon recorded for the same state.
+        let recorded = full.replace("labels=[", "labels=[loom:curated,");
+        assert_ne!(digest(&recorded), digest(&full));
+        assert_eq!(legacy_digest(&recorded), digest(&full));
     }
 }

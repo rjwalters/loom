@@ -935,3 +935,78 @@ fn checkpointless_curator_only_exit_skips_external_kills() {
     reg.note_prless_exit_outcome(ISSUE, "sweep-c", None, Some(1), 60);
     assert_eq!(reg.noop_streak_count(ISSUE), 1);
 }
+
+// --- #12024 on the step path (#12009's cutover) -----------------------------
+
+#[derive(Default)]
+struct BodyOnly(String);
+
+impl crate::step_dispatch::reeval_ladder::BodyForge for BodyOnly {
+    fn body(&mut self, _number: u64) -> Result<String, String> {
+        Ok(self.0.clone())
+    }
+    fn set_body(&mut self, _number: u64, body: &str) -> Result<(), String> {
+        self.0 = body.to_string();
+        Ok(())
+    }
+}
+
+fn step_run(
+    step: crate::step_role::StepRole,
+    n: u32,
+    class: crate::step_dispatch::outcome_ledger::OutcomeClass,
+    reason: &str,
+) -> crate::sweep_registry::step_ledger::StepRun {
+    crate::sweep_registry::step_ledger::StepRun {
+        item: ISSUE,
+        step,
+        sweep_id: format!("step-{step}-{ISSUE}-{n}"),
+        outcome: crate::step_dispatch::outcome_ledger::StepOutcome::new(class, reason),
+        ran_for: Duration::from_secs(300),
+        failure_class: None,
+    }
+}
+
+/// The promote / Builder-no-op cycle is bounded: Champion's promotion is a
+/// verdict and clears every step cooldown on the item, but the hold's
+/// streak survives it, so the third Builder no-op on an unchanged issue
+/// parks it on `loom:blocked` (never `loom:operator`), and the step draw
+/// passes a blocked issue.
+#[test]
+#[serial]
+fn a_promote_and_builder_noop_cycle_parks_at_the_threshold() {
+    use crate::step_dispatch::outcome_ledger::OutcomeClass;
+    use crate::step_role::StepRole;
+    let (mut reg, forge, _dir) = forge_registry(3);
+    let mut body = BodyOnly::default();
+    for n in 1..=3 {
+        // Champion promotes: curated -> issue, a verdict.
+        forge.set_issue(ISSUE, "open", "", &["loom:curated", "loom:issue", "loom:important"]);
+        let promoted = step_run(StepRole::ChampionPromote, n, OutcomeClass::Verdict, "promoted");
+        reg.record_step_outcome(&promoted, &mut body);
+        assert!(
+            reg.step_cooldowns(Utc::now())
+                .until(ISSUE, StepRole::Builder)
+                .is_none(),
+            "the verdict cleared the Builder cooldown: the ledger alone has no brake"
+        );
+        // Builder no-ops; its release leaves the issue curated-only.
+        forge.set_issue(ISSUE, "open", "", &["loom:curated", "loom:important"]);
+        let noop = step_run(StepRole::Builder, n, OutcomeClass::Noop, "no_build_work");
+        reg.record_step_outcome(&noop, &mut body);
+        assert_eq!(reg.noop_hold_applied(ISSUE), n == 3, "parked exactly at the third no-op");
+    }
+    let edit = edit_args(&forge);
+    assert!(edit.contains("--add-label loom:blocked"), "{edit}");
+    assert_no_operator_write(&forge);
+    // A Builder step that also self-reported over IPC is counted once.
+    let (mut reg2, _forge2, _dir2) = forge_registry(3);
+    let noop = step_run(StepRole::Builder, 9, OutcomeClass::Noop, "no_build_work");
+    reg2.note_noop_for_hold(ISSUE, Some(&noop.sweep_id), None);
+    reg2.record_step_outcome(&noop, &mut body);
+    assert_eq!(reg2.noop_streak_count(ISSUE), 1);
+    // A CI wait is not a loop.
+    let wait = step_run(StepRole::Builder, 10, OutcomeClass::Noop, "ci_pending");
+    reg2.record_step_outcome(&wait, &mut body);
+    assert_eq!(reg2.noop_streak_count(ISSUE), 1);
+}
