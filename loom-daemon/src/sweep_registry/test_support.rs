@@ -739,6 +739,16 @@ pub(crate) fn insert_running_with_pid_at(
     sweep_id
 }
 
+/// Re-kind a registered sweep as a step (#11911: only steps resume on a roll).
+pub(crate) fn make_step(
+    registry: &mut SweepRegistry,
+    sweep_id: &str,
+    item: u32,
+    role: crate::step_role::StepRole,
+) {
+    registry.entries.get_mut(sweep_id).unwrap().kind = SweepKind::Step { item, role };
+}
+
 /// Write a checkpoint JSON file for `issue` under `registry`'s checkpoint
 /// dir, then set its mtime explicitly (so tests can position it before or
 /// after a run's `started_at`).
