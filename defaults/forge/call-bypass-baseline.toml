@@ -9,7 +9,7 @@
 # Eliminating these entries is the caller-migration issue's job, not this
 # ledger's — see `removal_epic` below and each entry's `removal_issue`.
 #
-# 82 file(s), 253 direct call site(s) at baseline.
+# 81 file(s), 252 direct call site(s) at baseline.
 
 removal_epic = 9769
 
@@ -34,12 +34,6 @@ removal_issue = 9799
 [[bypass]]
 path = ".github/workflows/security.yml"
 calls = 2
-owner = "ci-workflows"
-removal_issue = 9799
-
-[[bypass]]
-path = ".github/workflows/version-bump-on-merge.yml"
-calls = 1
 owner = "ci-workflows"
 removal_issue = 9799
 

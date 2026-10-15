@@ -52,6 +52,18 @@
 //! so taking the repo back after a stale heartbeat starts from a baseline.
 //! See [`crate::observability::captain_gauges`]. Unconfigured, every host
 //! samples as before.
+//!
+//! # Off by default (#12203)
+//!
+//! Every host sampling every repo cost about 8.9k billable GitHub calls an
+//! hour fleet-wide and tripped `rate_limit_breaker`, which halts dispatch. So
+//! the whole sampler sits behind [`ENABLED_KEY`]
+//! (`observability.stageDwell.enabled`, default `false`): off, a pass makes no
+//! listing, no per-item read and no `merged_at` read, emits no
+//! `loom.forge.stage_dwell` / `loom.forge.stage_items` point, and the captain
+//! does not arm the `stage-dwell` job. [`INTERVAL_KEY`]
+//! (`observability.stageDwell.intervalSecs`) spaces passes further apart than
+//! the collector's forge-gather period. Both are re-read every pass (live).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -93,6 +105,88 @@ pub const FETCH_BUDGET: usize = 8;
 
 /// Samples a pending PR lookup is retried before it is dropped.
 pub const MAX_TRIES: u8 = 3;
+/// Config key: the sampler's master switch (#12203). Default `false`.
+pub const ENABLED_KEY: &str = "observability.stageDwell.enabled";
+/// Config key: the minimum seconds between two samples (#12203). Unset or
+/// non-positive: every forge-gather pass.
+pub const INTERVAL_KEY: &str = "observability.stageDwell.intervalSecs";
+
+/// The resolved `observability.stageDwell` block, re-read every pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// `enabled` (default `false`).
+    pub enabled: bool,
+    /// `intervalSecs`, when positive.
+    pub interval_secs: Option<u64>,
+}
+
+impl Settings {
+    /// Resolve from an effective config. A missing or malformed value is its
+    /// default: off, no extra spacing.
+    #[must_use]
+    pub fn from_effective(effective: &serde_json::Value) -> Self {
+        let get = |key: &str| crate::config_resolver::get_path(effective, key);
+        Self {
+            enabled: get(ENABLED_KEY)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            interval_secs: get(INTERVAL_KEY)
+                .and_then(serde_json::Value::as_u64)
+                .filter(|s| *s > 0),
+        }
+    }
+
+    /// Whether a pass at `now` samples: switched on, and `intervalSecs` (if
+    /// set) has elapsed since `last` began. Pure.
+    #[must_use]
+    pub fn due(&self, last: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match (self.interval_secs, last) {
+            (Some(secs), Some(last)) => {
+                (now - last).num_seconds() >= i64::try_from(secs).unwrap_or(i64::MAX)
+            }
+            _ => true,
+        }
+    }
+}
+
+/// When the last sampling pass began (for [`INTERVAL_KEY`]).
+static LAST_PASS: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
+/// The switch state last logged: 0 none yet, 1 on, 2 off.
+static LOGGED_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Log the switch at INFO on the first pass and whenever it flips.
+fn log_switch(enabled: bool) {
+    let state = if enabled { 1 } else { 2 };
+    if LOGGED_STATE.swap(state, std::sync::atomic::Ordering::Relaxed) == state {
+        return;
+    }
+    if enabled {
+        log::info!("stage-dwell sampler on ({ENABLED_KEY}=true)");
+    } else {
+        log::info!(
+            "stage-dwell sampler off: no stage listings or loom.forge.stage_dwell gauges \
+             (set {ENABLED_KEY}=true to sample; #12203)"
+        );
+    }
+}
+
+/// Gate one pass: log the switch, and claim the pass when it is due. `false`
+/// means the pass makes no forge call at all.
+fn claim_pass(settings: Settings, now: DateTime<Utc>) -> bool {
+    log_switch(settings.enabled);
+    let mut last = match LAST_PASS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !settings.due(*last, now) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
 
 /// This sampler's fleet-captain singleton job (W12,
 /// [`crate::observability::captain_gauges`]).
@@ -602,17 +696,18 @@ pub struct GhStageFetcher;
 /// `loom.forge.calls` (the step engine's provider has its own).
 pub const EVENTS_CALLER: &str = "stage_dwell.events";
 
-pub(in crate::observability) fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
-    let CmdOutcome::Ran(output) = GhInvocation::new(
-        Operation::new("api.rest"),
-        AccessIntent::Read,
-        GhTarget::None,
-        GH_TIMEOUT,
-    )
-    .read_class(crate::gh_invocation::ReadClass::Observability)
-    .args(["api", path])
-    .current_dir(root)
-    .run() else {
+/// The `github.operation` of stage-dwell's `pulls/{n}` read.
+pub const MERGED_AT_OP: &str = "stage_dwell.merged_at";
+
+/// One Observability `gh api` GET of `path` in `root`, as JSON, named
+/// `operation` (never the generic `api.rest`: 2026-10-15, the fleet.state
+/// history reads were invisible in the writer's spend under that name).
+pub(in crate::observability) fn gh_json(
+    root: &Path,
+    operation: &'static str,
+    path: &str,
+) -> Option<serde_json::Value> {
+    let CmdOutcome::Ran(output) = gh_json_invocation(root, operation, path).run() else {
         return None;
     };
     if !output.status.success() {
@@ -620,6 +715,18 @@ pub(in crate::observability) fn gh_json(root: &Path, path: &str) -> Option<serde
         return None;
     }
     serde_json::from_slice(&output.stdout).ok()
+}
+
+/// The invocation [`gh_json`] runs (split out so a test can inspect it).
+pub(in crate::observability) fn gh_json_invocation(
+    root: &Path,
+    operation: &'static str,
+    path: &str,
+) -> GhInvocation {
+    GhInvocation::new(Operation::new(operation), AccessIntent::Read, GhTarget::None, GH_TIMEOUT)
+        .read_class(crate::gh_invocation::ReadClass::Observability)
+        .args(["api", path])
+        .current_dir(root)
 }
 
 /// The latest `labeled` time per label in one events page.
@@ -657,7 +764,7 @@ impl StageFetcher for GhStageFetcher {
     }
 
     fn merged_at(&mut self, root: &Path, slug: &str, number: u32) -> Option<Option<DateTime<Utc>>> {
-        let pull = gh_json(root, &format!("repos/{slug}/pulls/{number}"))?;
+        let pull = gh_json(root, MERGED_AT_OP, &format!("repos/{slug}/pulls/{number}"))?;
         Some(pull["merged_at"].as_str().and_then(parse_time))
     }
 }
@@ -688,11 +795,16 @@ async fn mirror_listing(root: &Path, slug: &str, label: &'static str) -> Option<
 }
 
 /// Sample every managed repo's stage listings and export the dwell points.
-/// A no-op (no forge reads at all) without the OTLP ops sink.
+/// A no-op (no forge reads at all) without the OTLP ops sink, or while
+/// `settings` says off or not yet due (#12203).
 pub(in crate::observability) async fn record(
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
+    settings: Settings,
 ) {
+    if !claim_pass(settings, Utc::now()) {
+        return;
+    }
     let Some(sink) = super::global_ops_sink() else {
         return;
     };

@@ -137,6 +137,9 @@ struct Recording {
     inner: ScriptRoleInvocationRunner,
     calls: Arc<AtomicUsize>,
     ticks: Ticks,
+    /// The role-draw attempt counter right after each tick (#11782).
+    attempts: Arc<Mutex<Vec<u32>>>,
+    root: std::path::PathBuf,
     limit: usize,
 }
 
@@ -156,6 +159,10 @@ impl RoleInvocationRunner for Recording {
             .lock()
             .unwrap()
             .push((outcome.clone(), tap, marker));
+        self.attempts
+            .lock()
+            .unwrap()
+            .push(crate::runtime_preference::role_draw::attempts::current(&self.root, role));
         self.calls.fetch_add(1, Ordering::SeqCst);
         outcome
     }
@@ -163,7 +170,7 @@ impl RoleInvocationRunner for Recording {
 
 async fn drive_four_ticks(
     opencode_output: &str,
-) -> (tempfile::TempDir, Vec<(RoleTickOutcome, Option<String>, String)>) {
+) -> (tempfile::TempDir, Vec<(RoleTickOutcome, Option<String>, String)>, Vec<u32>) {
     let _env = Env::new();
     let workspace = tempfile::tempdir().unwrap();
     doctor_workspace_with(workspace.path(), opencode_output);
@@ -174,6 +181,8 @@ async fn drive_four_ticks(
     let _claude = crate::write_scope_test_support::SharedTokenPool::one_account();
     let calls = Arc::new(AtomicUsize::new(0));
     let ticks: Ticks = Arc::default();
+    let attempts: Arc<Mutex<Vec<u32>>> = Arc::default();
+    crate::runtime_preference::role_draw::attempts::reset_for_tests();
     let runner = Recording {
         inner: ScriptRoleInvocationRunner::new(workspace.path().to_path_buf())
             .with_timeout(Duration::from_secs(60))
@@ -181,6 +190,8 @@ async fn drive_four_ticks(
             .with_gh_bin(ws.gh.clone()),
         calls: calls.clone(),
         ticks: ticks.clone(),
+        attempts: attempts.clone(),
+        root: workspace.path().to_path_buf(),
         limit: 4,
     };
     let spec = RoleSpec {
@@ -210,13 +221,14 @@ async fn drive_four_ticks(
     handle.abort();
 
     let ticks = ticks.lock().unwrap().clone();
-    (workspace, ticks)
+    let attempts = attempts.lock().unwrap().clone();
+    (workspace, ticks, attempts)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn deterministic_launch_failures_trip_the_tap_not_the_role() {
-    let (workspace, ticks) = drive_four_ticks(TOOLLESS_STREAM).await;
+    let (workspace, ticks, _) = drive_four_ticks(TOOLLESS_STREAM).await;
     // N = 2 toolless launches on the preferred tap...
     for (outcome, tap, _) in &ticks[..2] {
         assert_eq!(tap.as_deref(), Some("opencode:zai-flash"), "{ticks:?}");
@@ -250,7 +262,11 @@ const HOOK_DENIED_STREAM: &str = "exec\n/bin/bash -lc 'cat SKILL.md' in /w\n exi
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn a_hook_denied_run_falls_back_to_the_next_runtime() {
-    let (workspace, ticks) = drive_four_ticks(HOOK_DENIED_STREAM).await;
+    let (workspace, ticks, attempts) = drive_four_ticks(HOOK_DENIED_STREAM).await;
+    // #11782: the two hook-denied exits (child exit 0) reach
+    // `attempts::record_failure` through `HoldFeed::failure` — attempt 2, then
+    // 3 — and the first success on the fallback resets to attempt 1.
+    assert_eq!(attempts, [2, 3, 1, 1], "{ticks:?}");
     for (outcome, tap, _) in &ticks[..2] {
         assert_eq!(tap.as_deref(), Some("opencode:zai-flash"), "{ticks:?}");
         let RoleTickOutcome::Failure(detail) = outcome else {

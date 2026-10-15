@@ -1071,6 +1071,17 @@ pub fn guard(root: &Path) -> Result<(), WorkspaceHeldDispatchError> {
     }
 }
 
+/// Severity for a log line about a standing hold. `maintain-only` is a
+/// configured policy refusal, not a fault (#11928), so it is informational;
+/// the W3/W4 holds stay warnings.
+#[must_use]
+pub fn hold_log_level(kind: HoldKind) -> log::Level {
+    match kind {
+        HoldKind::MaintainOnly => log::Level::Info,
+        HoldKind::InstallIncompatible | HoldKind::DaemonTooOld => log::Level::Warn,
+    }
+}
+
 /// Drop held roots from a role runner's tick, logging each hold once when it
 /// starts and once when it ends. `logged` carries the roots currently known
 /// held across ticks.
@@ -1092,7 +1103,8 @@ pub fn filter_held(
             continue;
         };
         if !logged.contains(&root) {
-            log::warn!(
+            log::log!(
+                hold_log_level(hold.kind),
                 "role_runner: workspace {} is held ({}): {}; no role tick starts there until it \
                  clears (running roles are not touched)",
                 root.display(),

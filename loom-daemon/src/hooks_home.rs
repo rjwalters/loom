@@ -62,6 +62,8 @@
 //! `LOOM_HOOKS_HOME` set in the daemon's own environment is passed through
 //! unchanged (an operator pin, never written to). Set to the empty string it
 //! disables the export, and sessions run hooks from the checkout as before.
+//! A pin skips the trust check, so using one logs a warning naming the path and
+//! saying whether it would have passed (informational; the pin is never refused).
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -166,7 +168,11 @@ pub fn resolve(
 ) -> Option<PathBuf> {
     match env {
         Some(pin) if pin.is_empty() => return None,
-        Some(pin) => return Some(PathBuf::from(pin)),
+        Some(pin) => {
+            let pin = PathBuf::from(pin);
+            log::warn!("{}", pin_warning(&pin, is_trusted(&pin)));
+            return Some(pin);
+        }
         None => {}
     }
     let base = home?.join(BASE_REL);
@@ -180,6 +186,20 @@ pub fn resolve(
             None
         }
     }
+}
+
+/// The warning logged when a `LOOM_HOOKS_HOME` pin is used: the pin skips the
+/// [`is_trusted`] check, so say whether it would have passed.
+fn pin_warning(pin: &Path, trusted: bool) -> String {
+    let verdict = if trusted {
+        "would pass"
+    } else {
+        "would NOT pass"
+    };
+    format!(
+        "hooks-home: LOOM_HOOKS_HOME pin {} is used as-is without the trust check; it {verdict} that check (owned by this user, not a symlink, no group/other write)",
+        pin.display()
+    )
 }
 
 /// The directory name for `archive` at `version`.

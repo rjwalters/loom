@@ -88,7 +88,7 @@
 //! back (peers never re-send them, and a host ignores its own ads). Nothing
 //! longer rides the broadcast: the Champion ladder's
 //! rungs past 24 h live on the forge only (the item's body), and after a
-//! rollback `release-stale-blocked` owns those parks.
+//! rollback those parks stay parked until a role or a human clears them.
 //!
 //! # The draw's query
 //!
