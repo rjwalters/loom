@@ -238,3 +238,42 @@ fn the_open_walk_is_shed_when_readers_are_out_of_budget() {
     assert!(drain_calls(d).is_empty(), "no request at all");
     assert_eq!(*classes.borrow(), [ReadClass::Hygiene]);
 }
+
+/// #12193: `stage_dwell`'s two listing reads (the per-label listing and the
+/// open-items walk) are Observability class, so with every reader withdrawn
+/// they are shed (not one request, so not one on the writer) where a Hygiene
+/// walk would wait for the writer on a withdrawal that may never clear.
+#[test]
+fn the_observability_listings_are_shed_when_readers_are_withdrawn() {
+    use crate::forge_identity::{ExhaustCause, ReadClass, RouteDecision};
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let repo = format!("test-owner/obs-listing-shed-{}", std::process::id());
+    set_page(d, 1, "a1", &page(1..3, &[]));
+    let gh = stub(d);
+    let classes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = classes.clone();
+    let _route = store::install_test_route(move |req| {
+        seen.borrow_mut().push(req.class);
+        RouteDecision::Exhausted {
+            until: std::time::SystemTime::now() + std::time::Duration::from_secs(600),
+            cause: ExhaustCause::Withdrawn,
+        }
+    });
+    let walk =
+        list_open_issues_cached_all_observability_as("stage_dwell", &gh, Some(d), Some(&repo))
+            .expect_err("a shed walk is no listing");
+    assert!(walk.downcast_ref::<store::ReadShed>().is_some(), "{walk:#}");
+    let listing = list_issues_cached_observability_as(
+        "stage_dwell",
+        &gh,
+        Some(d),
+        Some(&repo),
+        "loom:issue",
+        "open",
+    )
+    .expect_err("a shed listing is no listing");
+    assert!(listing.downcast_ref::<store::ReadShed>().is_some(), "{listing:#}");
+    assert!(drain_calls(d).is_empty(), "no request at all");
+    assert_eq!(*classes.borrow(), [ReadClass::Observability; 2]);
+}
