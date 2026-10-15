@@ -854,6 +854,45 @@ fn a_migrated_hold_is_adopted_from_the_forge_and_released_on_change() {
     assert_no_operator_write(&forge);
 }
 
+/// #12073: the once-per-process forge adoption is a post-restart burst
+/// (a `loom:blocked` listing plus comment reads), so it waits for the
+/// startup-jitter gate like the re-checks, and runs once the gate opens.
+#[test]
+#[serial]
+fn forge_adoption_waits_for_the_startup_jitter_gate() {
+    let (_reg, forge, dir) = forge_registry(2);
+    let record = crate::sweep_registry::park_hold::render_hold_record(
+        crate::sweep_registry::park_hold::NOOP_HOLD_REASON,
+        "2026-10-14T00:00:00Z",
+    );
+    let body = format!("The work.\n\n{record}\n");
+    forge.set_issue(ISSUE, "open", &body, &["loom:curated", "loom:blocked"]);
+    let full = "labels=[loom:curated];open=true;comments=[];pr=none;deps=[]";
+    let notice = format!(
+        "{NOOP_HOLD_COMMENT_MARKER}\n{NOOP_HOLD_APPLIED_COMMENT_MARKER}\nFingerprint compared: `{full}`"
+    );
+    std::fs::write(
+        forge.ws.join("comments-raw.json"),
+        serde_json::json!([{"body": notice, "author_association": "MEMBER",
+                            "user": {"login": "someone", "type": "User"}}])
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        forge.ws.join("listing.txt"),
+        format!("{}\n", serde_json::json!({"number": ISSUE, "body": body})),
+    )
+    .unwrap();
+    let mut reg = registry_over(dir.path(), 2);
+    crate::startup_jitter::test_hold_closed(true);
+    reg.reconcile_noop_holds(std::time::Instant::now());
+    assert!(!reg.noop_hold_applied(ISSUE), "no adoption inside the jitter window");
+    crate::startup_jitter::test_hold_closed(false);
+    reg.reconcile_noop_holds(std::time::Instant::now());
+    assert!(reg.noop_hold_applied(ISSUE), "adopted once the gate opens");
+    assert!(forge.calls("issue edit").is_empty());
+}
+
 /// The checkpointed crash wrapper (what `reap_once` calls) feeds the hold for a
 /// Curator-only death, and skips an externally-killed one.
 #[test]

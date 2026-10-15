@@ -550,13 +550,15 @@ assert_contains "gate rejection names the reason" "$out14" "not a compiled binar
 assert_eq "gate rejection installs nothing" "0" "$( [[ -e "$DEST14/loom-daemon" ]] && echo 1 || echo 0 )"
 
 # ---------- test 15: binary-format gate (#4397) — accepts a REAL compiled
-# executable (a copy of /bin/cat, standing in for a real Mach-O/ELF daemon
-# binary) even without the bypass. Also runs with the pinned file(1) stub
+# executable (a copy of the running bash, standing in for a real Mach-O/ELF
+# daemon binary) even without the bypass. Not `cat`: the gate runs
+# `<bin> --version` and needs rc 0 + output, and BSD `cat` rejects
+# `--version` (#12045). Also runs with the pinned file(1) stub
 # (#6662) — see test 37 for the live-tool assertion.
 # ---------------------------------------------------------------------------
 SRC15="$WORKDIR/src15/loom-daemon"
 mkdir -p "$WORKDIR/src15"
-copy_fixture_bin "$(command -v cat)" "$SRC15"
+copy_fixture_bin "$BASH" "$SRC15"
 chmod +x "$SRC15"
 DEST15="$WORKDIR/dest15"
 _out15=$( ( unset LOOM_PROVISION_ALLOW_SCRIPT

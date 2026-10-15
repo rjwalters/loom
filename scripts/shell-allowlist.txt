@@ -83,9 +83,8 @@
 #     that did not exist yet. A new `.sh` must be bootstrap, hook-entry,
 #     vendored, stub, or test — or it is a loom-daemon subcommand.
 #
-# The ratchet on the SIZE of the files listed here is a separate mechanism
-# (#7711, scripts/check-file-size-budget.sh). This file says nothing about how
-# big any of them may be, and nothing here is a migration mandate.
+# This file says nothing about how big any of them may be, and nothing here is
+# a migration mandate.
 
 # @section baseline
 .cargo/macos-test-runner.sh                                                    contract    Invocation contract: named by the `runner =` key in .cargo/config.toml; cargo invokes this path directly.
@@ -546,7 +545,6 @@ scripts/check-dangling-links.sh                                                c
 scripts/check-doc-anchors.sh                                                   contract    Invocation contract: invoked as `scripts/check-doc-anchors.sh` from CI workflows, build-gate.sh, or an operator. The name stays; new logic goes behind it into loom-daemon.
 scripts/check-doc-tocs.sh                                                      settled     Settled (#8237): deliberately kept shell — zero fix-commits in the trailing six months and no irreversible operations, both machine-re-checked on every run. Descoped from the port target; may shrink, never grow.
 scripts/check-docs-defaults-parity.sh                                          contract    Invocation contract: invoked as `scripts/check-docs-defaults-parity.sh` from CI workflows, build-gate.sh, or an operator. The name stays; new logic goes behind it into loom-daemon.
-scripts/check-file-size-budget.sh                                              contract    Invocation contract: invoked as `scripts/check-file-size-budget.sh` from CI workflows, build-gate.sh, or an operator. The name stays; new logic goes behind it into loom-daemon.
 scripts/check-gitignore-convergence.sh                                         contract    Invocation contract: invoked as `scripts/check-gitignore-convergence.sh` from CI workflows, build-gate.sh, or an operator. The name stays; new logic goes behind it into loom-daemon.
 scripts/check-guard-destructive-drift.sh                                       contract    Invocation contract: invoked as `scripts/check-guard-destructive-drift.sh` from CI workflows, build-gate.sh, or an operator. The name stays; new logic goes behind it into loom-daemon.
 scripts/check-guard-scan-contracts.sh                                          contract    Invocation contract: invoked as `scripts/check-guard-scan-contracts.sh` from CI workflows, build-gate.sh, or an operator. The name stays; new logic goes behind it into loom-daemon.
@@ -588,6 +586,7 @@ scripts/start-daemon.sh                                                        c
 scripts/stop-daemon.sh                                                         contract    Invocation contract: invoked as `scripts/stop-daemon.sh` from CI workflows, build-gate.sh, or an operator. The name stays; new logic goes behind it into loom-daemon.
 scripts/test-changelog.sh                                                      test        Tests `changelog` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 scripts/test-daemon-liveness.sh                                                test        Tests `daemon-liveness` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
+scripts/test-check-guard-destructive-drift-argv.sh                               test        Tests `check-guard-destructive-drift` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 scripts/test-install-local-mode.sh                                             test        Tests `install-local-mode` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 scripts/test-installer.sh                                                      test        Tests `installer` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 scripts/test-migrate-consumer.sh                                               test        Tests `migrate-consumer` — shell because its subject is shell; follows its subject, never an independent reason (#7758).

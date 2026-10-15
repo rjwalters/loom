@@ -55,7 +55,7 @@
 # NOT a demand that every existing invocation be annotated first. There are
 # dozens of them and most predate the convention; a gate nobody can satisfy gets
 # disabled. So this is a ONE-WAY RATCHET, the same shape as
-# check-pipefail-early-exit.sh (#7790) and check-file-size-budget.sh (#7711):
+# check-pipefail-early-exit.sh (#7790):
 # every (file, subcommand) pair that exists today is recorded in
 # scripts/daemon-subcommand-baseline.txt and grandfathered. A file may drop a
 # pair freely; it may not gain a NEW one without declaring the floor. The gate
