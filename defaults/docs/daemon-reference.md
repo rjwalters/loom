@@ -7752,8 +7752,8 @@ delay as `startup_jitter_delay_secs`, and `loom-daemon health` adds it to the
 work finder's first-tick grace (2 × interval), so a host still inside its
 window reads "warming up", not "no work-finder tick observed".
 
-Not covered: the startup claim-reconciliation pass (it gates the first
-admission and is per-repo `loom:building` only). The stale-blocked release and
+Not covered: the startup claim-reconciliation pass (it holds the first
+tick only up to its cap, below, and is per-repo `loom:building` only). The stale-blocked release and
 fleet-state passes were removed by #11301.
 
 ### Startup reconciliation: a bounded wait (#12222)
@@ -7775,6 +7775,12 @@ start bumps the issue's `updatedAt`, so it is never mistaken for an orphan of
 the previous process. Every other reclaim is the periodic pass's, which always
 runs alongside the work finder.
 
+The comparison allows for clocks (#12230): `updatedAt` is GitHub's clock, to
+the second, and the pass start is this host's. So a claim counts as possibly
+this daemon's if it was updated at or after the pass start rounded down to the
+second, less 60 s. A claim the previous process flipped in its last minute is
+then left to the periodic pass's age gate rather than reclaimed at once.
+
 | Knob | Default | Meaning |
 |---|---|---|
 | `LOOM_STARTUP_RECONCILE_WAIT_SECS` (env) > `autonomous.startupReconcileWaitSecs` (any config tier) | `90` | Longest wait, in seconds, for the startup claim and quarantine passes before the first tick |
@@ -7782,7 +7788,47 @@ runs alongside the work finder.
 The first completed tick logs `work_finder: first tick completed Ns after
 daemon start (startup reconciliation cap fired: …)` and publishes the
 `daemon.work_finder.first_tick` `daemon.event` record (`secs_since_start`,
-`startup_reconcile_cap_fired`).
+`gate_wait_secs`, `jitter_delay_secs`, `startup_reconcile_cap_fired`). On the
+OTLP path it is a `daemon.event` log record with `loom.topic =
+daemon.work_finder.first_tick`, the host in the `host.name` resource
+attribute, and the payload's scalars also as typed `loom.payload.*`
+attributes (#12230), so the duration can be filtered and aggregated per host
+without parsing `loom.payload`. On a fleet host `secs_since_start` includes
+the startup jitter (up to the jitter window), up to one work-finder interval
+and the first tick's own run time, so several minutes is normal.
+
+### Per-agent scope MemoryMax (#11094, #12246)
+
+On a systemd host each agent's `--user` scope gets a `MemoryMax`, so an
+over-budget build is OOM-killed inside its own cgroup rather than by the
+kernel's global OOM killer. `spawn-claude.sh` asks `loom-daemon
+ram-scope-limit` for the value on every spawn; by default it is derived from
+the repo's observed memory peak (`~/.loom/ram-peaks.json`), and a repo with no
+history gets no limit.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `LOOM_SWEEP_MEMORY_MAX` (env) > `autonomous.agentMemoryMax` (any config tier) | `auto` | `"off"` disables the limit; `"auto"` derives it from history as `max(floor, peak * pct / 100)`; a positive integer (string or JSON number) is an explicit limit in MiB |
+| `LOOM_SWEEP_MEMORY_MAX_PCT` (env) > `autonomous.agentMemoryMaxPct` | `200` | Multiple of the observed peak, in percent; values under 100 are ignored |
+| `LOOM_SWEEP_MEMORY_MAX_MIN_MB` (env) > `autonomous.agentMemoryMaxMinMb` | `4096` | Floor for a derived limit, MiB |
+
+Each key resolves on its own: a non-empty env var, then the config tiers
+highest first, then the default. A value that does not parse at a level is
+skipped, so garbage behaves as if unset. The tiers are the repo's own, plus
+the **daemon workspace's** `.loom-local/local.json`, which is where the fleet
+sync writes the host-local tier: the daemon exports its workspace to its
+children as `LOOM_DAEMON_WORKSPACE`, and `ram-scope-limit` slots that file in
+directly below the repo's own `.loom-local/local.json` (above the repo's
+fleet, project and `.loom/config.json` tiers and the machine tier). So a fleet
+turns the limit off everywhere with `"agentMemoryMax": "off"` in the machine
+tier, or on one host in that host's local tier.
+
+The keys are live: every spawn runs a fresh `ram-scope-limit`, so a change
+applies to the next agent without a daemon restart. The subcommand prints one
+stderr line, kept in the agent's spawn log next to the `scope MemoryMax=` line,
+naming the value and the source that decided it, e.g.
+`ram-scope-limit: no MemoryMax (off); agentMemoryMax from config
+autonomous.agentMemoryMax in <workspace>/.loom-local/local.json`.
 
 ### Agent CI wait: `forge wait-checks` (#10330)
 

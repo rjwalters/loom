@@ -2850,12 +2850,14 @@ pub fn spawn_multi_work_finder_task(
         // up to a cap (#12222): it took 20–40+ min on a host with hundreds of
         // open-PR claims. Ticking past the cap is safe; see `startup_gate`.
         // Already-finished resolves instantly, and only the first tick waits.
+        let gate_started = std::time::Instant::now();
         let startup_outcome = startup_gate::wait(
             &mut startup_reconciliation_ready,
             startup_gate::wait_cap(&fallback_root),
         )
         .await;
-        let mut first_tick = startup_gate::FirstTick::new(spawned_at, startup_outcome);
+        let mut first_tick =
+            startup_gate::FirstTick::new(spawned_at, startup_outcome, gate_started.elapsed());
         let mut was_halted = false;
         let mut was_pressured = false;
         // #9410/#10624: the build back-off's per-repo (and optional host

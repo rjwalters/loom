@@ -115,6 +115,12 @@ const TABLE: &[(&str, Reloadability)] = &[
     // (`captain_gauges::resolve` → `stage_dwell::Settings::from_effective`),
     // never cached.
     ("observability.stageDwell", Reloadability::Live),
+    // #12246: the per-agent-scope `MemoryMax` knobs are resolved by
+    // `loom-daemon ram-scope-limit`, a fresh process per agent spawn
+    // (`ram_scope_limit::resolve`), never cached by the daemon.
+    ("autonomous.agentMemoryMax", Reloadability::Live),
+    ("autonomous.agentMemoryMaxPct", Reloadability::Live),
+    ("autonomous.agentMemoryMaxMinMb", Reloadability::Live),
     // Everything else under `autonomous.workFinder` is resolved once at
     // daemon bring-up in `daemon_service.rs`'s work-finder startup block,
     // before the loop is spawned: `enabled` (gates whether the loop is
