@@ -358,7 +358,7 @@ pub(crate) fn stop(ctx: &Ctx) -> usize {
         &repo_of(&ctx.gh.root),
         ctx.common.pr,
         Some(&ctx.me.host),
-        &sweep_key(&ctx.me),
+        Some(&sweep_key(&ctx.me)),
         &lease_renewer::owner_is_live,
         &signal,
     )

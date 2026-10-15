@@ -136,7 +136,7 @@ fn release_tombstones_exactly_its_key_and_signals_live_owners() {
 
     let signalled = RefCell::new(Vec::new());
     let sig = |pid: u32| signalled.borrow_mut().push(pid);
-    let n = release(&s, "acme/widget", 7, None, "s", &all_live, &sig).unwrap();
+    let n = release(&s, "acme/widget", 7, None, Some("s"), &all_live, &sig).unwrap();
     assert_eq!(n, 1);
     assert_eq!(*signalled.borrow(), vec![100]);
     assert_eq!(check(&s, &mine, "t1", Some("open")).0, EXIT_STOP, "tombstone stops the loop");
@@ -151,9 +151,9 @@ fn release_tombstones_exactly_its_key_and_signals_live_owners() {
 fn release_is_idempotent_and_never_signals_a_dead_or_recycled_pid() {
     let (_d, s) = store();
     let sig = |_: u32| panic!("must not signal");
-    assert_eq!(release(&s, "acme/widget", 7, None, "s", &all_live, &sig).unwrap(), 0);
+    assert_eq!(release(&s, "acme/widget", 7, None, Some("s"), &all_live, &sig).unwrap(), 0);
     claim(&s, &key("acme/widget", "h", "s", 7), 100, "t", &ident, &all_live).unwrap();
-    assert_eq!(release(&s, "acme/widget", 7, None, "s", &none_live, &sig).unwrap(), 1);
+    assert_eq!(release(&s, "acme/widget", 7, None, Some("s"), &none_live, &sig).unwrap(), 1);
 }
 
 #[test]
@@ -161,8 +161,14 @@ fn release_host_filter_is_exact_when_given() {
     let (_d, s) = store();
     claim(&s, &key("acme/widget", "h1", "s", 7), 100, "t", &ident, &all_live).unwrap();
     let sig = |_: u32| {};
-    assert_eq!(release(&s, "acme/widget", 7, Some("h2"), "s", &all_live, &sig).unwrap(), 0);
-    assert_eq!(release(&s, "acme/widget", 7, Some("h1"), "s", &all_live, &sig).unwrap(), 1);
+    assert_eq!(
+        release(&s, "acme/widget", 7, Some("h2"), Some("s"), &all_live, &sig).unwrap(),
+        0
+    );
+    assert_eq!(
+        release(&s, "acme/widget", 7, Some("h1"), Some("s"), &all_live, &sig).unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -170,7 +176,7 @@ fn release_is_a_local_exact_key_signal_never_a_pre_emptive_stop() {
     let (_d, s) = store();
     let sig = |_: u32| {};
     // Releasing a key nobody owns leaves no tombstone behind...
-    assert_eq!(release(&s, "acme/widget", 7, Some("h"), "s", &all_live, &sig).unwrap(), 0);
+    assert_eq!(release(&s, "acme/widget", 7, Some("h"), Some("s"), &all_live, &sig).unwrap(), 0);
     assert!(s.all().is_empty(), "no record is created by an unmatched release");
     // ...so a later start of that same key is a normal owner and keeps renewing.
     let k = key("acme/widget", "h", "s", 7);
@@ -178,11 +184,11 @@ fn release_is_a_local_exact_key_signal_never_a_pre_emptive_stop() {
     assert_eq!(check(&s, &k, "t", Some("open")).0, EXIT_RENEW);
     // A release for another sweep's or issue's key never stops this loop.
     for (issue, sweep) in [(8, "s"), (7, "other")] {
-        release(&s, "acme/widget", issue, Some("h"), sweep, &all_live, &sig).unwrap();
+        release(&s, "acme/widget", issue, Some("h"), Some(sweep), &all_live, &sig).unwrap();
         assert_eq!(check(&s, &k, "t", Some("open")).0, EXIT_RENEW);
     }
     // An unverified state after a release still stops: a release is never "skipped".
-    release(&s, "acme/widget", 7, Some("h"), "s", &all_live, &sig).unwrap();
+    release(&s, "acme/widget", 7, Some("h"), Some("s"), &all_live, &sig).unwrap();
     assert_eq!(check(&s, &k, "t", Some("")).0, EXIT_STOP);
     assert_eq!(check(&s, &k, "t", None).0, EXIT_STOP);
 }

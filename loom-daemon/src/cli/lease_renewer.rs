@@ -233,7 +233,7 @@ impl Store {
         Ok(())
     }
 
-    fn all(&self) -> Vec<(PathBuf, OwnerRecord)> {
+    pub(crate) fn all(&self) -> Vec<(PathBuf, OwnerRecord)> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
@@ -330,20 +330,21 @@ pub(crate) fn check(
 }
 
 /// Tombstone (and signal, when `is_live` confirms it) every owner of
-/// `(repo, issue, sweep)` — and `host`, when given. Returns how many matched.
+/// `(repo, issue, sweep)` — and `host`, when given. `sweep: None` matches any
+/// sweep (`lease release`, #12103). Returns how many matched.
 pub(crate) fn release(
     store: &Store,
     repo: &str,
     issue: u64,
     host: Option<&str>,
-    sweep: &str,
+    sweep: Option<&str>,
     is_live: LiveProbe<'_>,
     signal: &dyn Fn(u32),
 ) -> Result<usize> {
     let _lock = store.lock()?;
     let mut n = 0;
     for (path, mut rec) in store.all() {
-        if rec.repo != repo || rec.issue != issue || rec.sweep != sweep {
+        if rec.repo != repo || rec.issue != issue || sweep.is_some_and(|s| s != rec.sweep) {
             continue;
         }
         if host.is_some_and(|h| h != rec.host) {
@@ -488,7 +489,7 @@ impl RenewerAction {
                     &repo,
                     key.issue,
                     key.host.as_deref(),
-                    &sweep,
+                    Some(&sweep),
                     &owner_is_live,
                     &signal,
                 )?;
