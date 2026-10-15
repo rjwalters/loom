@@ -376,7 +376,7 @@ if [[ "$CLAIM_STATE" == "stale" || "$CLAIM_STATE" == "stale-bounded-fallback" ]]
     [[ "$LABEL" == "loom:evaluating" ]] && LEASE_STEP=(--step champion_promote)
     # requires-daemon: lease optional   Without `lease pr check` (absent or older binary) the lease is not read: only the age rule decides, as before #11911.
     LEASE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease pr check "$NUMBER" --role "$(_lease_role)" ${LEASE_STEP[@]+"${LEASE_STEP[@]}"} 2>/dev/null)" || true
-    LEASE_STATE="$(sed -n 's/^PR_LEASE_STATE=//p' <<<"$LEASE_OUT" | head -n 1)"
+    LEASE_STATE="$(sed -n '/^PR_LEASE_STATE=/{s///;p;q;}' <<<"$LEASE_OUT")"
     case "$LEASE_STATE" in
         held-peer | held-self) CLAIM_STATE="fresh" ;;
         unknown) CLAIM_STATE="unknown" ;;
