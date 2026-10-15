@@ -2,10 +2,12 @@
 //! forge state is a handful of files the test can edit between no-ops.
 
 use super::*;
+use crate::peer_claims::{ClaimAd, PeerClaimView};
 use crate::sweep_registry::test_support::fake_gh_graphql_arm;
 use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
 use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 const ISSUE: u32 = 694;
@@ -19,6 +21,7 @@ impl Forge {
     fn set_issue(&self, n: u32, state: &str, body: &str, labels: &[&str]) {
         let labels: Vec<String> = labels.iter().map(|l| format!("\"{l}\"")).collect();
         let json = serde_json::json!({
+            "number": n,
             "state": state,
             "body": body,
             "labels": labels.iter().map(|l| l.trim_matches('"')).collect::<Vec<_>>(),
@@ -97,6 +100,18 @@ fn forge_registry(threshold: u32) -> (SweepRegistry, Forge, tempfile::TempDir) {
          exit 0\n\
          fi\n\
          {gql}\
+         if [[ \"$1\" == \"api\" && \"$2\" == \"-X\" && \"$3\" == \"PATCH\" ]]; then\n\
+         cp \"$6\" \"{ws}/patched-body.json\"\n\
+         exit 0\n\
+         fi\n\
+         if [[ \"$1\" == \"api\" && \"$*\" == *issues\\?state=open* ]]; then\n\
+         cat \"{ws}/listing.txt\" 2>/dev/null\n\
+         exit 0\n\
+         fi\n\
+         if [[ \"$1\" == \"api\" && \"$*\" == *comments\\?per_page* ]]; then\n\
+         cat \"{ws}/comments-raw.json\" 2>/dev/null || printf '[]'\n\
+         exit 0\n\
+         fi\n\
          if [[ \"$1\" == \"api\" && \"$*\" == */comments* ]]; then\n\
          cat \"{ws}/comments.txt\" 2>/dev/null\n\
          exit 0\n\
@@ -161,9 +176,9 @@ fn important_human_gate_issue_is_parked_after_k_dispatches() {
     }
     assert_eq!(dispatches, K, "at most K dispatches before the hold");
     let edit = edit_args(&forge);
-    // #11795: the human gate is loom:operator alone; no retired name.
-    assert!(edit.contains("--add-label loom:operator"), "{edit}");
-    assert!(!edit.contains("loom:operator-"), "{edit}");
+    // #12024: even a human gate parks on loom:blocked, never loom:operator.
+    assert!(edit.contains("--add-label loom:blocked"), "{edit}");
+    assert_no_operator_write(&forge);
     assert!(edit.contains("--remove-label loom:issue"), "{edit}");
     assert!(!edit.contains("loom:important"), "the priority label is never touched: {edit}");
     assert!(!edit.contains("loom:building"), "the claim is never touched: {edit}");
@@ -270,7 +285,7 @@ fn a_changed_input_releases_an_applied_park_without_a_manual_label_edit() {
     reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
     reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
     assert!(reg.noop_hold_applied(ISSUE));
-    let parked = ["loom:important", "loom:operator"];
+    let parked = ["loom:important", "loom:blocked"];
     reflect_park(&forge, &parked);
     let t0 = std::time::Instant::now();
     let edits = forge.calls("issue edit").len();
@@ -290,9 +305,9 @@ fn a_changed_input_releases_an_applied_park_without_a_manual_label_edit() {
     assert!(!reg.noop_hold_applied(ISSUE));
     assert_eq!(reg.noop_streak_count(ISSUE), 0, "the streak is dropped");
     let lift = forge.calls("issue edit").pop().unwrap();
-    assert!(lift.contains("--remove-label loom:operator"), "{lift}");
-    assert!(!lift.contains("loom:operator-"), "only labels present are removed: {lift}");
+    assert!(lift.contains("--remove-label loom:blocked"), "{lift}");
     assert!(lift.contains("--add-label loom:issue"), "{lift}");
+    assert_no_operator_write(&forge);
     assert!(!lift.contains("loom:important"), "the priority label is never touched: {lift}");
     assert!(forge
         .comment_bodies()
@@ -450,7 +465,8 @@ fn clean_phaseless_reaper_outcomes_feed_the_hold() {
     assert!(reg.noop_loop_kind(ISSUE, "sweep-3").is_some(), "the next outcome is a loop");
     reg.note_clean_phaseless_exit_outcome(ISSUE, "sweep-3", Some(OpenPrProbe::NoneOpen), Some(0));
     assert!(reg.noop_hold_applied(ISSUE));
-    assert!(edit_args(&forge).contains("--add-label loom:operator"));
+    assert!(edit_args(&forge).contains("--add-label loom:blocked"));
+    assert_no_operator_write(&forge);
 }
 
 /// A sweep that DID self-report was already counted at IPC time
@@ -488,7 +504,8 @@ fn curator_only_reaper_outcomes_are_counted_without_the_ipc_call() {
     assert!(reg.noop_loop_kind(ISSUE, "sweep-3").is_some(), "the next outcome is a loop");
     reg.note_curator_only_outcome(ISSUE, "sweep-3", Some("curator-done"));
     assert!(reg.noop_hold_applied(ISSUE));
-    assert!(edit_args(&forge).contains("--add-label loom:operator"));
+    assert!(edit_args(&forge).contains("--add-label loom:blocked"));
+    assert_no_operator_write(&forge);
 }
 
 #[test]
@@ -573,6 +590,21 @@ fn a_dependency_beyond_the_sixth_releases_an_applied_hold() {
     assert!(!reg.noop_hold_applied(ISSUE), "an omitted-prefix dependency closing releases");
 }
 
+/// A registry over `forge`'s existing workspace: a restarted daemon, or
+/// another host sharing the same forge.
+fn registry_over(dir: &Path, threshold: u32) -> SweepRegistry {
+    let mut config = SweepRegistryConfig::new(dir.to_path_buf());
+    config.gh_bin = Some(dir.join("fake-gh-noop-hold.sh"));
+    config.skip_label_flip = false;
+    config.journal_path = Some(dir.join("journal.json"));
+    let mut reg = SweepRegistry::new(config);
+    reg.set_noop_cooldown_config(NoopCooldownConfig {
+        hold_threshold: threshold,
+        ..NoopCooldownConfig::default()
+    });
+    reg
+}
+
 #[test]
 #[serial]
 fn an_applied_hold_is_released_after_a_daemon_restart() {
@@ -580,25 +612,10 @@ fn an_applied_hold_is_released_after_a_daemon_restart() {
     reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
     reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
     assert!(reg.noop_hold_applied(ISSUE));
-    let parked = [
-        "loom:important",
-        "loom:operator-only",
-        "loom:operator-decision",
-    ];
-    // #11795 transition: a hold an older daemon applied under the retired
-    // names, recovered from disk, still lifts cleanly.
-    reflect_park(&forge, &parked);
+    reflect_park(&forge, &["loom:important", "loom:blocked"]);
 
     // A fresh registry over the same logs dir: the in-memory table is empty.
-    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
-    config.gh_bin = Some(dir.path().join("fake-gh-noop-hold.sh"));
-    config.skip_label_flip = false;
-    config.journal_path = Some(dir.path().join("journal.json"));
-    let mut restarted = SweepRegistry::new(config);
-    restarted.set_noop_cooldown_config(NoopCooldownConfig {
-        hold_threshold: 2,
-        ..NoopCooldownConfig::default()
-    });
+    let mut restarted = registry_over(dir.path(), 2);
     assert!(!restarted.noop_hold_applied(ISSUE));
 
     // Unchanged inputs: the recovered hold stays.
@@ -611,9 +628,230 @@ fn an_applied_hold_is_released_after_a_daemon_restart() {
     restarted.reconcile_noop_holds(t0 + RECONCILE_INTERVAL * 2);
     assert!(!restarted.noop_hold_applied(ISSUE));
     let lift = forge.calls("issue edit").pop().unwrap();
-    assert!(lift.contains("--remove-label loom:operator-only"), "{lift}");
-    assert!(lift.contains("--remove-label loom:operator-decision"), "{lift}");
+    assert!(lift.contains("--remove-label loom:blocked"), "{lift}");
     assert!(lift.contains("--add-label loom:issue"), "{lift}");
+    assert_no_operator_write(&forge);
+}
+
+/// No `issue edit` the daemon made adds or removes an operator hold, under
+/// any of its names (#12024, the #11861 rule).
+fn assert_no_operator_write(forge: &Forge) {
+    let edits = edit_args(forge);
+    assert!(
+        !edits.contains("loom:operator"),
+        "the no-op hold touched loom:operator: {edits}"
+    );
+}
+
+// --- #12024: the hold parks on loom:blocked, counted across the fleet -------
+
+/// One simulated host: a registry over the shared fake forge, with its own
+/// peer view and its own outbound ad queue.
+struct Host {
+    reg: SweepRegistry,
+    name: String,
+    view: Arc<Mutex<PeerClaimView>>,
+    rx: tokio::sync::mpsc::Receiver<ClaimAd>,
+}
+
+fn host(dir: &Path, name: &str, threshold: u32) -> Host {
+    let mut reg = registry_over(dir, threshold);
+    let view = Arc::new(Mutex::new(PeerClaimView::new(name.into(), Duration::from_secs(120))));
+    reg.set_peer_claims(Arc::clone(&view));
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    reg.set_peer_claim_publisher(tx);
+    Host {
+        reg,
+        name: name.into(),
+        view,
+        rx,
+    }
+}
+
+/// Deliver every ad each host published to every other host, stamped with
+/// the sender's name (one process has one `host_identity()`).
+fn relay(hosts: &mut [Host]) {
+    let mut sent = Vec::new();
+    for h in hosts.iter_mut() {
+        while let Ok(mut ad) = h.rx.try_recv() {
+            ad.host.clone_from(&h.name);
+            sent.push(ad);
+        }
+    }
+    for ad in &sent {
+        for h in hosts.iter() {
+            crate::peer_claims::observe_brake_ad(
+                &mut h.view.lock().unwrap(),
+                ad,
+                std::time::Instant::now(),
+            );
+        }
+    }
+}
+
+/// The #12024 acceptance case: three no-ops on three different hosts park
+/// the issue at the threshold, although no host saw more than one.
+#[test]
+#[serial]
+fn no_ops_across_hosts_park_the_item_at_the_threshold() {
+    let (_reg, forge, dir) = forge_registry(3);
+    let reason = Some("remaining work is an operator decision".to_string());
+    let mut hosts: Vec<Host> = ["host-a", "host-b", "host-c"]
+        .iter()
+        .map(|n| host(dir.path(), n, 3))
+        .collect();
+    for i in 0..2 {
+        hosts[i].reg.record_noop_release(ISSUE, reason.clone());
+        relay(&mut hosts);
+        assert!(!hosts[i].reg.noop_hold_applied(ISSUE), "host {i} saw only {}", i + 1);
+    }
+    assert!(forge.calls("issue edit").is_empty(), "nothing parked below the threshold");
+    hosts[2].reg.record_noop_release(ISSUE, reason.clone());
+    assert!(hosts[2].reg.noop_hold_applied(ISSUE), "1 here + 2 on peers = 3");
+    assert_eq!(hosts[2].reg.noop_streak_count(ISSUE), 1, "this host's own count is 1");
+    let edit = edit_args(&forge);
+    assert!(edit.contains("--add-label loom:blocked"), "{edit}");
+    assert_no_operator_write(&forge);
+    // The park record went into the body before the label.
+    let patched = std::fs::read_to_string(forge.ws.join("patched-body.json")).unwrap();
+    assert!(patched.contains("reason=\\\"no-op hold\\\""), "{patched}");
+    assert!(patched.contains("by=daemon"), "{patched}");
+    // The notice records the digest any host can adopt it from.
+    assert!(forge.comment_bodies()[0].contains(NOOP_HOLD_FP_MARKER_PREFIX));
+
+    // The park broke the fleet streak: a human lifts the park, and host A's
+    // stale count does not re-park on the next no-op anywhere.
+    relay(&mut hosts);
+    reflect_park(&forge, &["loom:issue", "loom:important"]);
+    hosts[0].reg.record_noop_release(ISSUE, reason.clone());
+    relay(&mut hosts);
+    assert_eq!(hosts[0].reg.noop_streak_count(ISSUE), 1, "the break reset host A");
+    assert!(!hosts[0].reg.noop_hold_applied(ISSUE));
+    assert_eq!(forge.calls("issue edit").len(), 1, "no immediate re-park");
+}
+
+/// A peer count taken against another state of the issue is not part of the
+/// streak: a fingerprint change restarts the fleet streak too.
+#[test]
+#[serial]
+fn a_peer_count_on_another_fingerprint_does_not_add_up() {
+    let (_reg, forge, dir) = forge_registry(3);
+    let mut hosts: Vec<Host> = ["host-a", "host-b"]
+        .iter()
+        .map(|n| host(dir.path(), n, 3))
+        .collect();
+    hosts[0].reg.record_noop_release(ISSUE, None);
+    hosts[0].reg.record_noop_release(ISSUE, None);
+    relay(&mut hosts);
+    // A human comment lands: host A's two no-ops were on the old state.
+    forge.set_comments("5:2026-10-14T00:00:00Z\n");
+    hosts[1].reg.record_noop_release(ISSUE, None);
+    assert!(!hosts[1].reg.noop_hold_applied(ISSUE), "1, not 1 + 2");
+    hosts[1].reg.record_noop_release(ISSUE, None);
+    hosts[1].reg.record_noop_release(ISSUE, None);
+    assert!(hosts[1].reg.noop_hold_applied(ISSUE), "three on the new state park");
+}
+
+/// A parked item is not offered again until its fingerprint changes: the
+/// park is a skip label, an unchanged reconciliation writes nothing, and
+/// only a change lifts it (and restores `loom:issue`).
+#[test]
+#[serial]
+fn a_parked_item_is_not_repromoted_until_its_fingerprint_changes() {
+    let (mut reg, forge, _dir) = forge_registry(2);
+    forge.set_issue(ISSUE, "open", "", &["loom:curated", "loom:important"]);
+    reg.record_noop_release(ISSUE, None);
+    reg.record_noop_release(ISSUE, None);
+    assert!(
+        reg.noop_hold_applied(ISSUE),
+        "a curated-only item is parked, not left promotable"
+    );
+    let parked = ["loom:curated", "loom:important", "loom:blocked"];
+    assert!(crate::work_finder::SKIP_LABELS.contains(&"loom:blocked"));
+    assert!(crate::work_finder::is_blocked_hold(&parked));
+    reflect_park(&forge, &parked);
+    let edits = forge.calls("issue edit").len();
+    let t0 = std::time::Instant::now();
+    for k in 1..=4 {
+        reg.reconcile_noop_holds(t0 + RECONCILE_INTERVAL * k);
+        assert!(reg.noop_hold_applied(ISSUE));
+    }
+    assert_eq!(forge.calls("issue edit").len(), edits, "unchanged: nothing re-offers it");
+    // The fingerprint changes (a linked PR appears): the hold releases.
+    forge.set_linked_prs(&[(12, "open", false)]);
+    reg.reconcile_noop_holds(t0 + RECONCILE_INTERVAL * 6);
+    assert!(!reg.noop_hold_applied(ISSUE));
+    let lift = forge.calls("issue edit").pop().unwrap();
+    assert!(lift.contains("--remove-label loom:blocked"), "{lift}");
+    assert!(lift.contains("--add-label loom:issue"), "{lift}");
+    assert_no_operator_write(&forge);
+}
+
+/// A hold an older daemon applied as `loom:operator`, recovered from its
+/// holds file, is never edited by the daemon: only a human (or `labels
+/// migrate --holds`) removes that label (#11861, #12024).
+#[test]
+#[serial]
+fn a_legacy_operator_hold_is_never_lifted_by_the_daemon() {
+    let (_reg, forge, dir) = forge_registry(2);
+    let full = "labels=[loom:important];open=true;comments=[];pr=none;deps=[]";
+    std::fs::create_dir_all(dir.path().join(".loom/logs")).unwrap();
+    let file =
+        serde_json::json!({ ISSUE.to_string(): {"park": "human-gate", "fingerprint": full} });
+    let mut reg = registry_over(dir.path(), 2);
+    std::fs::create_dir_all(reg.config().logs_dir()).unwrap();
+    std::fs::write(reg.config().logs_dir().join("noop-holds.json"), file.to_string()).unwrap();
+    reflect_park(&forge, &["loom:important", "loom:operator"]);
+    forge.set_comments("9:2026-10-08T00:00:00Z\n");
+    reg.reconcile_noop_holds(std::time::Instant::now());
+    assert!(!reg.noop_hold_applied(ISSUE), "the daemon lets go of it");
+    assert!(forge.calls("issue edit").is_empty(), "and writes nothing");
+}
+
+/// The migrated shape (#12024): `loom:blocked` + the no-op park record + a
+/// pre-#12024 notice. A host that never applied it adopts it from the forge
+/// and releases it on a fingerprint change.
+#[test]
+#[serial]
+fn a_migrated_hold_is_adopted_from_the_forge_and_released_on_change() {
+    let (_reg, forge, dir) = forge_registry(2);
+    let record = crate::sweep_registry::park_hold::render_hold_record(
+        crate::sweep_registry::park_hold::NOOP_HOLD_REASON,
+        "2026-10-14T00:00:00Z",
+    );
+    let body = format!("The work.\n\n{record}\n");
+    forge.set_issue(ISSUE, "open", &body, &["loom:curated", "loom:blocked"]);
+    // The fingerprint the old notice recorded: pre-park labels.
+    let full = "labels=[loom:curated];open=true;comments=[];pr=none;deps=[]";
+    let notice = format!(
+        "{NOOP_HOLD_COMMENT_MARKER}\n{NOOP_HOLD_APPLIED_COMMENT_MARKER}\nFingerprint compared: `{full}`"
+    );
+    std::fs::write(
+        forge.ws.join("comments-raw.json"),
+        serde_json::json!([{"body": notice, "author_association": "MEMBER",
+                            "user": {"login": "someone", "type": "User"}}])
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        forge.ws.join("listing.txt"),
+        format!("{}\n", serde_json::json!({"number": ISSUE, "body": body})),
+    )
+    .unwrap();
+    let mut reg = registry_over(dir.path(), 2);
+    assert_eq!(reg.adopt_forge_noop_holds(), 1);
+    assert!(reg.noop_hold_applied(ISSUE));
+    assert_eq!(reg.adopt_forge_noop_holds(), 0, "once per process");
+    let t0 = std::time::Instant::now();
+    reg.reconcile_noop_holds(t0);
+    assert!(reg.noop_hold_applied(ISSUE), "unchanged since the old notice");
+    assert!(forge.calls("issue edit").is_empty());
+    forge.set_comments("9:2026-10-15T00:00:00Z\n");
+    reg.reconcile_noop_holds(t0 + adopt::ADOPTED_RECONCILE_INTERVAL);
+    assert!(!reg.noop_hold_applied(ISSUE), "a new comment releases it");
+    let lift = forge.calls("issue edit").pop().unwrap();
+    assert!(lift.contains("--remove-label loom:blocked"), "{lift}");
+    assert_no_operator_write(&forge);
 }
 
 /// The checkpointed crash wrapper (what `reap_once` calls) feeds the hold for a
