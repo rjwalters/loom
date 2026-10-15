@@ -29,6 +29,19 @@ use super::*;
 /// a peer that predates the explicit marker.
 pub(crate) const MIN_LADDER_AD_WINDOW: Duration = Duration::from_secs(1);
 
+/// Whether a configured dispatch-backoff base is usable (#11952). A zero base
+/// arms zero-length windows, which a peer older than the explicit break marker
+/// reads as a fleet-wide fast-fail streak break, so it is refused, loudly.
+pub(super) fn positive_base_secs(secs: u64, source: &str) -> bool {
+    if secs == 0 {
+        log::warn!(
+            "sweep_registry: {source}=0 ignored — the dispatch backoff base must be positive \
+             (#11952)"
+        );
+    }
+    secs > 0
+}
+
 impl SweepRegistry {
     /// Publish the #4485 ladder's window for `issue`, carrying this host's own
     /// fast-failure streak (`0` under any other cause). Fail-open, like
@@ -80,6 +93,21 @@ impl SweepRegistry {
                  backoff and streak unaffected (#7477, #11930)"
             );
         }
+    }
+
+    /// Whether an event of `cause` at `now` extends `prev`'s backoff streak
+    /// for `issue`: [`backoff_cause::continues`], unless a peer's fast-fail
+    /// break has reset it since (#11952).
+    pub(super) fn backoff_streak_continues(
+        &self,
+        issue: u32,
+        prev: &DispatchBackoffState,
+        cause: DispatchBackoffCause,
+        now: DateTime<Utc>,
+        max_secs: i64,
+    ) -> bool {
+        dispatch::backoff_cause::continues(prev, cause, now, max_secs)
+            && !self.peer_broke_fast_fail_streak(issue, prev)
     }
 
     /// Whether a peer's fast-fail streak break for `issue` arrived at or after
