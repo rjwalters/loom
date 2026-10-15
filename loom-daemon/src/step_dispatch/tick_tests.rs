@@ -333,3 +333,10 @@ fn a_refused_draw_is_counted_on_the_record() {
     assert_eq!((refused.repo.as_str(), refused.count), ("acme/one", 1));
     assert_eq!(refused.skip_reason, PickSkipReason::InFlight);
 }
+
+/// #12048: a workspace missing the role's command reads as blocked in the
+/// pick decision, not as a dispatch error.
+#[test]
+fn a_missing_role_command_reads_as_workspace_commands_missing() {
+    assert_eq!(disposition_of("workspace_commands_missing"), Qd::WorkspaceCommandsMissing);
+}
