@@ -191,3 +191,8 @@ fn the_same_issue_number_in_two_repositories_stays_separate_under_concurrency_an
         "no span id may be shared across repositories"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

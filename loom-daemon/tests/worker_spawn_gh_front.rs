@@ -110,3 +110,8 @@ fn the_worker_env_names_the_spawners_sink_dir() {
     let (named, _) = env_of(&[("LOOM_FORGE_CALL_STATS_DIR", "off")]);
     assert_eq!(named, "off", "an off host sink is exported as off, never a fallback");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

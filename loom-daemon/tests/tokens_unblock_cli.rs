@@ -358,3 +358,8 @@ fn unblock_all_pools_with_nothing_registered_reports_no_pools() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("No token pools found"), "stderr: {stderr}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

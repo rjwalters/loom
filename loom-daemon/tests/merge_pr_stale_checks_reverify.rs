@@ -414,3 +414,8 @@ fn no_verdict_keeps_the_refusal_without_a_comment() {
     assert!(!stderr.contains("loom:merge-tree-reverify"), "no evidence comment: {stderr}");
     f.assert_tmp_empty("unknown");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

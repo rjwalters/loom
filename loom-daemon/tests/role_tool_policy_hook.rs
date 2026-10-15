@@ -339,3 +339,8 @@ fn no_usable_daemon_fails_closed_for_read_only_roles_only() {
         }
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

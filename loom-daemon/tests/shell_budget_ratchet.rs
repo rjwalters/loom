@@ -500,3 +500,8 @@ fn an_external_diff_command_does_not_refuse_a_valid_call_site() {
 fn git_external_diff_in_the_environment_does_not_refuse_a_valid_call_site() {
     assert_the_call_site_still_passes(&[("GIT_EXTERNAL_DIFF".to_string(), "true".to_string())]);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

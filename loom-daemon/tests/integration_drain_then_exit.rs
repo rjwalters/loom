@@ -188,3 +188,8 @@ async fn test_drain_then_exit_exits_143_and_stays_down() {
         "a then-exit drain must write the operator-stop record"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
