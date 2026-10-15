@@ -133,14 +133,27 @@ if [[ -s "$probe_dir/probe.txt" ]]; then
         fail "occupied-worktree probe prints processes for a nonexistent worktree"
     fi
     mkdir -p "$probe_dir/.loom/worktrees/pr-1"
-    (cd "$probe_dir/.loom/worktrees/pr-1" && setsid sleep 30 >/dev/null 2>&1 &)
+    # `setsid` is util-linux; macOS does not ship it (#12045). The subshell
+    # exiting right after the `&` already reparents the sleeper, which is the
+    # property the probe needs, so fall back to that rather than starting
+    # nothing. The sleeper outlives the probe by a wide margin: the probe runs
+    # `lsof` once per user process on macOS, which on a busy host took >30s
+    # and let the old `sleep 30` exit before the probe reached its pid.
+    sleeper_cmd="sleep 600"
+    launcher=()
+    command -v setsid >/dev/null 2>&1 && launcher=(setsid)
+    (cd "$probe_dir/.loom/worktrees/pr-1" && {
+        ${launcher[@]+"${launcher[@]}"} $sleeper_cmd >/dev/null 2>&1 &
+        echo $! >"$probe_dir/sleeper.pid"
+    })
     sleep 0.3
-    if run_probe pr-1 | grep -q "sleep 30"; then
+    if run_probe pr-1 | grep -q "$sleeper_cmd"; then
         pass "occupied-worktree probe reports a live process inside an existing worktree"
     else
         fail "occupied-worktree probe misses a live process inside an existing worktree"
     fi
-    pkill -u "$(id -u)" -f "^sleep 30$" 2>/dev/null || true
+    kill "$(cat "$probe_dir/sleeper.pid" 2>/dev/null)" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "^$sleeper_cmd\$" 2>/dev/null || true
 else
     fail "could not extract the occupied-worktree probe snippet from doctor.md"
 fi

@@ -9,7 +9,7 @@
 # Eliminating these entries is the caller-migration issue's job, not this
 # ledger's — see `removal_epic` below and each entry's `removal_issue`.
 #
-# 82 file(s), 253 direct call site(s) at baseline.
+# 80 file(s), 250 direct call site(s) at baseline.
 
 removal_epic = 9769
 
@@ -28,18 +28,6 @@ removal_issue = 9799
 [[bypass]]
 path = ".github/workflows/harness-pins.yml"
 calls = 5
-owner = "ci-workflows"
-removal_issue = 9799
-
-[[bypass]]
-path = ".github/workflows/security.yml"
-calls = 2
-owner = "ci-workflows"
-removal_issue = 9799
-
-[[bypass]]
-path = ".github/workflows/version-bump-on-merge.yml"
-calls = 1
 owner = "ci-workflows"
 removal_issue = 9799
 
@@ -443,12 +431,6 @@ removal_issue = 9799
 path = "loom-daemon/src/write_scope/target.rs"
 calls = 2
 owner = "daemon-other"
-removal_issue = 9799
-
-[[bypass]]
-path = "scripts/cleanup-branches.sh"
-calls = 1
-owner = "repo-tooling"
 removal_issue = 9799
 
 [[bypass]]

@@ -559,7 +559,7 @@ impl BreakerSnapshot {
 /// decisions delegate to the pure [`step`].
 #[derive(Debug)]
 pub struct SharedHostBreaker {
-    config: HostBreakerConfig,
+    config: Mutex<HostBreakerConfig>,
     inner: Mutex<BreakerRuntime>,
 }
 
@@ -571,7 +571,7 @@ impl SharedHostBreaker {
     #[must_use]
     pub fn new(config: HostBreakerConfig) -> Self {
         Self {
-            config,
+            config: Mutex::new(config),
             inner: Mutex::new(BreakerRuntime::default()),
         }
     }
@@ -586,7 +586,10 @@ impl SharedHostBreaker {
 
     #[must_use]
     pub fn config(&self) -> HostBreakerConfig {
-        self.config
+        *self
+            .config
+            .lock()
+            .expect("host breaker config mutex poisoned")
     }
 
     /// Fold one load-per-core sample into the breaker, returning any phase
@@ -595,8 +598,9 @@ impl SharedHostBreaker {
         // Disk-full self-protection (#10973) rides the same per-tick sample; a
         // no-op unless the daemon registered a guard.
         crate::disk_full_halt::global_sample();
+        let cfg = self.config();
         let mut guard = self.inner.lock().expect("host breaker mutex poisoned");
-        let result = step(&guard, &self.config, load_per_core, now);
+        let result = step(&guard, &cfg, load_per_core, now);
         *guard = result.next;
         result.transition
     }
@@ -604,10 +608,11 @@ impl SharedHostBreaker {
     /// Whether the breaker is currently suppressing new dispatch.
     #[must_use]
     pub fn is_suppressed(&self) -> bool {
+        let cfg = self.config();
         if crate::disk_full_halt::global_halt_reason().is_some() {
             return true;
         }
-        if !self.config.enabled {
+        if !cfg.enabled {
             return false;
         }
         let guard = self.inner.lock().expect("host breaker mutex poisoned");
@@ -617,14 +622,15 @@ impl SharedHostBreaker {
     /// A snapshot for the status surface.
     #[must_use]
     pub fn snapshot(&self) -> BreakerSnapshot {
+        let cfg = self.config();
         let guard = self.inner.lock().expect("host breaker mutex poisoned");
-        let load_suppressed = self.config.enabled && guard.phase.suppresses_dispatch();
+        let load_suppressed = cfg.enabled && guard.phase.suppresses_dispatch();
         // A disk-full halt (#10973) surfaces as an Open breaker with a
         // `disk_full: ...` reason unless the load breaker already holds.
         let disk_reason = crate::disk_full_halt::global_halt_reason().filter(|_| !load_suppressed);
         let suppressed = load_suppressed || disk_reason.is_some();
         BreakerSnapshot {
-            enabled: self.config.enabled || disk_reason.is_some(),
+            enabled: cfg.enabled || disk_reason.is_some(),
             phase: if disk_reason.is_some() {
                 BreakerPhase::Open
             } else {
@@ -635,9 +641,9 @@ impl SharedHostBreaker {
             tripped_at: guard.tripped_at,
             releases_at: guard.releases_at,
             last_load_per_core: guard.last_load_per_core,
-            load_per_core_threshold: self.config.load_per_core_threshold,
-            sustain_ticks: self.config.sustain_ticks,
-            cooldown_secs: self.config.cooldown_secs,
+            load_per_core_threshold: cfg.load_per_core_threshold,
+            sustain_ticks: cfg.sustain_ticks,
+            cooldown_secs: cfg.cooldown_secs,
             consecutive_over: guard.consecutive_over,
         }
     }
@@ -675,6 +681,10 @@ pub fn global_is_suppressed() -> bool {
 pub fn global_snapshot() -> Option<BreakerSnapshot> {
     GLOBAL.get().map(|b| b.snapshot())
 }
+
+// #12090: hot-reload of the thresholds (`set_config`, `global_reload`).
+mod live_reload;
+pub use live_reload::{global_reload, reload};
 
 /// Emit the operator log line + the state-change-deduped
 /// `daemon.host_breaker.state` [`Generic`](crate::types::Event::Generic) event

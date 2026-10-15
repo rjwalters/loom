@@ -45,7 +45,7 @@ Loom has three hold labels, each with one meaning:
 
 | Label | Meaning | Release |
 |---|---|---|
-| `loom:blocked` | Waiting on something automation will resolve: another change merging, a capability, a dependency. The park record or a `Blocked by #N` line says what. Also Champion's own merge-risk and critical-file PR holds (#11861, "Champion's PR holds" below) | Automatic once the blocker resolves (`release-stale-blocked`, `check-stale-blocked`, `merge-pr.sh`'s cleared-blocker notice); see [`park-record.md`](park-record.md). Champion releases its own PR holds |
+| `loom:blocked` | Waiting on something outside the item: another change merging, a capability, a dependency. The park record or a `Blocked by #N` line says what. Also Champion's own merge-risk and critical-file PR holds (#11861, "Champion's PR holds" below) | A role or a human, once the blocker resolves. Nothing lifts it automatically: the daemon's release pass was retired (#11301). `check-stale-blocked` and `merge-pr.sh`'s cleared-blocker notice report cleared blockers; see [`park-record.md`](park-record.md). Champion releases its own PR holds |
 | `loom:operator` | A human must act or decide. The body says which: a ```` ```decision ```` block is a ruling ([`operator-decision.md`](operator-decision.md)); otherwise the comment names the step; a `Blocked by #N` line says the human action waits on something named | A human removes it. Nothing else does |
 | `loom:frozen` | Not now; don't touch (#11743). No agent or daemon path reads it as work, comments on it or relabels it | A human removes it |
 
@@ -76,7 +76,8 @@ moves open items (closed items keep their labels):
 
 Three queue labels sit next to the holds and are not holds:
 `loom:blocked-unnamed` (the Curator's queue of `loom:blocked` issues naming no
-blocker, [`unnamed-block-review.md`](unnamed-block-review.md)),
+blocker, [`unnamed-block-review.md`](unnamed-block-review.md); no longer
+applied since #11301, drained where it remains),
 `loom:decision-malformed` (the Curator's repair queue for a bad decision
 block, below) and `loom:sequenced` (PR merge ordering, #11708).
 
@@ -189,9 +190,8 @@ all-role rule they moved to `loom:blocked`:
 - `loom:pr` is **kept**: the Judge's approval stands.
 - `loom:blocked` is added by `loom-daemon park-record apply --pr N --reason
   "champion merge-risk hold" --by champion` (or `"champion critical-file
-  hold"`), which also writes a reason-only park record into the PR body. The
-  stale-blocked release pass skips a reason-only record (`Skip::Unstated`), so
-  only Champion or a human releases the hold.
+  hold"`), which also writes a reason-only park record into the PR body. Only
+  Champion or a human releases the hold.
 - The hold-state marker comment (`<!-- champion:merge-risk-hold -->` /
   `<!-- champion:critical-file-hold -->`, carrying `champion:hold-state
   head=<sha>`) is unchanged and remains the record of the hold.
@@ -322,10 +322,14 @@ run unless `--apply`; writes are paced under the shared secondary write limit
 |---|---|
 | A PR carrying an operator-hold name and a **standing** trusted Champion hold marker, at `loom:pr` or out at Doctor (`loom:changes-requested`) | A reason-only park record and `loom:blocked`, then `loom:operator` itself removed. **`loom:pr` is never touched**, so the approval survives; a PR at `loom:changes-requested` stays Doctor work (Doctor serves a trusted-marker Champion hold) |
 | A proposal (`loom:curated` / `loom:architect` / `loom:hermit` / `loom:auditor`) carrying `loom:operator` that Champion escalated for a dependency-only finding (`<!-- champion:proposal-escalated -->`, every recurring finding a dependency with a reference) | Blockers still open: one park record per blocker, `loom:blocked`, `loom:operator` removed, a comment. Every blocker closed: `loom:operator` removed (the #5664 un-escalation, one last time). A cross-repo blocker: left on `loom:operator` |
+| An issue carrying `loom:operator` that the daemon's no-op hold parked before #12024 (a trusted `<!-- loom:noop-hold-kind=hold (#10156) -->` notice with no `kind=released` notice after it) | The daemon's `no-op hold` park record (`by=daemon`) and `loom:blocked`, then `loom:operator` removed. A daemon adopts the park from the forge and releases it when the issue's fingerprint changes ([No-op hold](#no-op-hold-10156)). Checked before the escalation row, since such an issue is usually `loom:curated` |
 | Anything else, and every retired name (`loom:operator-only`, `-decision`, `-mechanical`, `-blocked`) | Untouched here. The retired names may be a human's: the retired-name migration maps them to `loom:operator`, a park |
 
 Only `loom:operator` itself is ever removed, and only where a trusted Champion
-marker (or escalation record) says a role applied it.
+marker, escalation record or no-op hold notice says a role or the daemon
+applied it. A no-op hold applied before #11795 under `loom:operator-only` +
+`loom:operator-decision` is picked up by rerunning `--holds` after the
+retired-name migration.
 
 **Order and rollout gate.**
 
@@ -344,7 +348,8 @@ the #11795 Q1 ruling (option 2) and is recorded for the operator there.
 
 After the migration, Champion's Pass 0 un-escalation is retired from the
 prompts: Step 4 blocks a new dependency-only finding (#11860) on
-`loom:blocked`, and `release-stale-blocked` lifts it when the blocker closes.
+`loom:blocked`, where it stays until a role or a human lifts it once the
+blocker closes (#11301).
 `--check-unescalate` stays in the binary only for prompts installed before
 #11861 and as this migration's decider.
 
@@ -520,8 +525,8 @@ item with a decision block on every later pass.
 
 A `loom:blocked` item that also names a blocker in a park record is **not**
 lane-eligible: it waits on another change, which no capability satisfies.
-Nor does the stale-blocked release pass lift a capability-only park (it has no
-named blocker to resolve): it stays parked until a capable host proposes it or
+Nothing lifts a capability-only park automatically (it has no named blocker
+to resolve): it stays parked until a capable host proposes it or
 a human releases it, and the linked capability-request issue says which host
 setting would unblock it.
 
@@ -759,7 +764,54 @@ mapping the forge-side migration (#11511) applies. It is never rendered into
 
 ## No-op hold (#10156)
 
-A sweep that ends as a no-op (the `noop-cooldown record` IPC, or a Curator-only stop the reaper classifies) is counted per issue. After `autonomous.workFinder.noopCooldown.holdThreshold` consecutive no-ops (default 3, env `LOOM_WORK_FINDER_NOOP_HOLD_THRESHOLD`, `0` disables) with an unchanged fingerprint (labels minus claim churn, non-bot comments, linked-PR state, `## Dependencies` state), the daemon parks the issue: `loom:blocked` when dependencies are named, otherwise `loom:operator`, with one `<!-- loom:noop-hold (#10156) -->` comment. A priority label does not exempt an issue and is never touched. To unpark, remove the park labels and re-add `loom:issue`; any new comment, label change, linked-PR change or dependency change also restarts the count.
+A Builder step that ends `noop` (the step ledger's outcome, except a
+`ci_pending` wait), a sweep that self-reports a no-op (the `noop-cooldown
+record` IPC), or a Curator-only stop the reaper classifies is counted per issue
+against a fingerprint of what the conclusion depends on: labels minus lane
+churn (`loom:issue`, `loom:curated`, the claim labels), non-bot comments,
+linked-PR state and `## Dependencies` state. An unchanged fingerprint extends
+the streak; a changed one restarts it. The streak lives outside the step
+ledger, so Champion's promotion verdict, which clears every step cooldown on
+the item, does not reset it: a promote / Builder-no-op cycle parks at the
+threshold (#12024).
+
+**The streak is the fleet's (#12024).** Each host advertises its own count,
+with the fingerprint's digest, on the peer-claim channel (a `noop_streak` ad),
+and the hold compares this host's count **plus every peer's count on the same
+fingerprint** with `autonomous.workFinder.noopCooldown.holdThreshold` (default
+3, env `LOOM_WORK_FINDER_NOOP_HOLD_THRESHOLD`, `0` disables). Three no-ops on
+three dispatchers park an issue as surely as three on one. Parking or releasing
+publishes a streak break that resets every host's count. Without peer
+coordination (`safehouse.enabled` false) the streak is the host's own.
+
+**The park is `loom:blocked`, never `loom:operator`.** At the threshold the
+daemon writes a daemon-hold park record into the body
+(`<!-- loom:park Blocked by: (unstated) by=daemon at=… reason="no-op hold" -->`),
+adds `loom:blocked` (removing `loom:issue`), and posts one
+`<!-- loom:noop-hold (#10156) -->` notice that records the fingerprint digest
+(`<!-- loom:noop-hold-fp=… -->`). This holds whether the remaining work looks
+like a dependency or a human decision: the daemon must be able to release its
+own hold, and `loom:operator` is only removed by a human (#11861). A `loom:curated`
+issue that no-ops is parked the same way, so Champion does not re-promote it
+while nothing has changed. A priority label does not exempt an issue and is
+never touched; a `loom:frozen` issue gets no write.
+
+**Release is by fingerprint change.** The daemon re-reads each held issue
+(every 5 minutes on the host that parked it, every 30 minutes on a host that
+adopted it from the forge) and, once anything in the fingerprint changes (a
+comment, a label, a linked PR, a dependency closing), removes `loom:blocked`,
+restores `loom:issue` (unless another hold or lane veto is on it) and posts a
+`kind=released` notice. Any host adopts a no-op park it finds on the forge (the
+park record plus the notice) once per process, so the hold outlives the host
+that applied it. A human can also remove `loom:blocked` by hand; the next no-op then starts
+a fresh streak.
+
+**Holds applied before #12024** sit on `loom:operator` with the notice above.
+The daemon no longer lifts them (it never removes `loom:operator`); move them
+with `loom-daemon labels migrate --holds` (dry run, then `--apply`), which
+swaps `loom:operator` for the park record and `loom:blocked`; a daemon then
+adopts and releases them as above. See
+[Migrating the holds a role applied](#migrating-the-holds-a-role-applied-11861).
 
 ## Partial-increment remainder hold (#9264)
 

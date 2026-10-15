@@ -151,6 +151,26 @@ async fn run_collector(
     // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
     let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
     ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The pass's forge gathers (captain facts, stage dwell, fleet state) on
+    // the snapshot cadence, first fired after this host's startup jitter
+    // (#12073) so a fleet that restarts together does not gather at once.
+    //
+    // They run on their OWN task, never as an arm of the `select!` below: a
+    // gather is forge-bound (shed reads, breaker waits, label-history
+    // pages) and can take longer than `snapshot_interval`. Awaited inline,
+    // a gather that outlasted its period left the `Delay`-mode forge timer
+    // ready again the moment it returned, and the `biased` select — which
+    // polls arms in order — took it again before ever reaching the
+    // snapshot arm, so host.health / tokens / host.export stopped while
+    // fleet.state kept flowing (the 0.19.1163 regression). The guard
+    // aborts the task when the collector stops.
+    let first_gather = crate::startup_jitter::arm(&workspace_root).opens_at();
+    let _forge_task = spawn_forge_gathers(
+        first_gather,
+        snapshot_interval,
+        workspace_root.clone(),
+        Arc::clone(&workspace_pool),
+    );
 
     // First-boot backfill (Issue #5084): run once immediately, before the
     // first snapshot tick, so a sweep adopted across a daemon restart does
@@ -1003,11 +1023,6 @@ async fn sample_snapshots(
     // The work finder's ranked ready queue (Issue #8852, phase 2) — native
     // HTTPS only, and only when the work finder has ticked since last time.
     super::queue_snapshot::record(workspace_pool, slug_cache).await;
-    // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
-    // listings plus a bounded per-item budget; a no-op without the ops sink.
-    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
-    // skips the repos a fresh captain covers (`captain_gauges`).
-    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
     // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
     // reads, no forge call; a no-op without the ops sink.
     super::ops::redate_chain::record(workspace_pool).await;
@@ -1020,11 +1035,128 @@ async fn sample_snapshots(
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot
     // stall this pass; the WARN lives in the watch and runs without telemetry.
     super::ops::codex_session::record();
-    // This host's view of its held sweeps, review PRs and ready queue over
-    // OTLP (Issue #10196), independent of ETA. 5-minute anchor, deltas only
-    // on change; its review listings are ETag-cached (warm after stage_dwell)
-    // and reused by the pass after each work-finder tick (#11161).
-    super::fleet_state::record(workspace_root, workspace_pool, slug_cache).await;
+}
+
+/// Aborts the wrapped task when dropped, so the forge-gather task never
+/// outlives the collector that spawned it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn the collector's forge gathers on a task of their own (see
+/// [`forge_gather_loop`]), under [`supervise_forge_gathers`] so a panic in a
+/// gather is logged and the loop restarts instead of ending silently. The
+/// task keeps its own slug memo: the cache is only a `gh repo view`
+/// memoization, so a second copy costs at most one extra lookup per
+/// workspace and shares no lock with the host samples.
+fn spawn_forge_gathers(
+    first: tokio::time::Instant,
+    period: Duration,
+    workspace_root: PathBuf,
+    workspace_pool: Arc<WorkspacePool>,
+) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(supervise_forge_gathers(
+        first,
+        period,
+        move || {
+            (
+                workspace_root.clone(),
+                Arc::clone(&workspace_pool),
+                HashMap::<String, String>::new(),
+            )
+        },
+        |(root, pool, cache)| Box::pin(forge_gathers(root, pool, cache)),
+    )))
+}
+
+/// Run [`forge_gather_loop`] as a child task and restart it if it dies. On a
+/// panic the payload is logged at ERROR, the supervisor waits one `period`,
+/// then restarts the loop with fresh state from `make` (a fresh slug memo in
+/// production). Dropping the supervisor drops the child's guard, aborting it.
+async fn supervise_forge_gathers<S, G, M>(
+    first: tokio::time::Instant,
+    period: Duration,
+    mut make: M,
+    gather: G,
+) where
+    M: FnMut() -> S,
+    S: Send + 'static,
+    G: for<'a> FnMut(
+            &'a mut S,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+        + Clone
+        + Send
+        + 'static,
+{
+    let mut start = first;
+    loop {
+        let mut child =
+            AbortOnDrop(tokio::spawn(forge_gather_loop(start, period, make(), gather.clone())));
+        match (&mut child.0).await {
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                log::error!(
+                    "observability: forge gather panicked ({msg}); restarting the forge gathers in {}s",
+                    period.as_secs()
+                );
+            }
+            Err(_) => return, // cancelled: the collector is shutting down
+            Ok(()) => log::error!(
+                "observability: forge gather loop exited unexpectedly; restarting in {}s",
+                period.as_secs()
+            ),
+        }
+        tokio::time::sleep(period).await;
+        start = tokio::time::Instant::now();
+    }
+}
+
+/// The forge-gather schedule: first pass at `first` (when the startup-jitter
+/// gate opens), then every `period`. One pass at a time — a pass that runs
+/// long delays the next (`MissedTickBehavior::Delay`) rather than stacking
+/// passes behind it. Generic over the pass so tests can drive the schedule
+/// with a gather that hangs.
+async fn forge_gather_loop<S, G>(
+    first: tokio::time::Instant,
+    period: Duration,
+    mut state: S,
+    mut gather: G,
+) where
+    G: for<'a> FnMut(
+        &'a mut S,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>,
+{
+    let mut timer = tokio::time::interval_at(first, period);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        timer.tick().await;
+        gather(&mut state).await;
+    }
+}
+
+/// The collector's fleet-wide forge gathers, on their own task and timer so
+/// the first one can wait out the startup jitter (#12073), and so a slow one
+/// never delays the host samples above, which run from boot.
+async fn forge_gathers(
+    workspace_root: &Path,
+    workspace_pool: &WorkspacePool,
+    slug_cache: &mut HashMap<String, String>,
+) {
+    // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
+    // listings plus a bounded per-item budget; a no-op without the ops sink.
+    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
+    // skips the repos a fresh captain covers (`captain_gauges`).
+    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
@@ -1617,14 +1749,10 @@ where
             }
         };
         let weight = weights.get(&root).copied();
-        // #10763: this host's release-pass tallies for the repo, if it ticked.
-        let stale_blocked_release =
-            crate::stale_blocked::release_outcome::counters(&root).map(|c| c.to_telemetry());
         entries.push(ManagedRepoEntry {
             slug,
             visibility,
             weight,
-            stale_blocked_release,
         });
     }
     // Deterministic order (the dashboard renders this list directly) and
@@ -1696,6 +1824,10 @@ mod story_points_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod terminal_records_tests;
+// The forge gathers' own task: a slow gather never delays host samples.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod forge_gather_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;

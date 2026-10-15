@@ -1113,7 +1113,7 @@ pub(super) fn reconcile_merge_sequences_with(
 ) -> MergeSequenceStats {
     // #10634: one host per workspace plans and posts — the role-runner shard
     // (#6374/#6704) that already makes one host of a sharded fleet own a
-    // workspace's other forge-writing passes (`stale_blocked`). Unsharded
+    // workspace's role ticks. Unsharded
     // hosts own everything, so a lone daemon is unaffected. Releasing an
     // existing hold is not gated (see `reconcile_merge_sequences_gated`).
     let owned = cfg!(test) || crate::role_shard::decide(root).admits_role_tick();

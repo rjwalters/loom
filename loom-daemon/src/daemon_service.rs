@@ -704,18 +704,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 if primary_minted && cross_owner_retry.due() {
                     let (ws, repo, script) =
                         (pass_workspace.clone(), owner_repo.clone(), pass_script.clone());
-                    let pass = tokio::task::spawn_blocking(move || {
-                        credential_preflight::cross_owner::establish_for_workspace(
-                            &ws, &repo, &script,
+                    let pass =
+                        credential_preflight::cross_owner::establish_for_workspace_off_thread(
+                            ws, repo, script,
                         )
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
-                        credential_preflight::cross_owner::CrossOwnerPass {
-                            failed: vec![format!("per-owner pass join error: {e}")],
-                            ..Default::default()
-                        }
-                    });
+                        .await;
                     cross_owner_retry.record(&pass);
                 }
             }
@@ -1013,6 +1006,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // dispatch backoff above.
     let noop_cooldown_config = sweep_registry::resolve_noop_cooldown_config(&sweep_workspace);
     sweep.set_noop_cooldown_config(noop_cooldown_config);
+    // #11481: re-arm windows a restart would otherwise drop.
+    sweep.replay_noop_cooldown_from_journal(chrono::Utc::now());
     log::info!(
         "sweep_registry: no-op re-dispatch cooldown {} (cooldown={}s) (#6670)",
         if noop_cooldown_config.enabled {
@@ -1097,6 +1092,15 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let workspace_pool =
         Arc::new(WorkspacePool::new(event_bus.clone(), tokio::runtime::Handle::current()));
     workspace_pool.seed(sweep_workspace.clone(), sweep_registry.clone());
+    // #11839: let the exit funnel list in-flight sweeps for `daemon.exit`.
+    loom_daemon::observability::daemon_exit::mark_started();
+    {
+        let pool = workspace_pool.clone();
+        let root = sweep_workspace.clone();
+        loom_daemon::observability::daemon_exit::register_in_flight_lister(move || {
+            loom_daemon::ipc::in_flight_sweep_ids(&pool, &root)
+        });
+    }
 
     // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
     // connection that advertises this daemon's dispatch claims and consumes peer
@@ -1351,15 +1355,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // once, here at startup, naming exactly what is being ignored and what
         // to tune instead.
         work_finder::warn_deprecated_cpu_knobs(&work_finder_config);
-        // Per-tick admission (ramp) cap (#4234): resolved once at startup from
-        // the same `work_finder_config`, precedence env > config > default —
-        // the same startup-capture pattern as the CPU knobs above. Bounds how
-        // many *new* sweeps a single tick may admit, independent of how large
-        // the dynamic cap computes to that tick — see
-        // `work_finder::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV` for the full
-        // ramp-lag rationale (#4231's second wave).
-        let max_admissions_per_tick =
-            work_finder::resolve_max_admissions_per_tick_with_config(&work_finder_config);
+        // The per-tick admission (ramp) cap (#4234) rides in `configured_max`
+        // and, like it, is re-read every tick since #12090.
+        let max_admissions_per_tick = configured_max.max_admissions_per_tick.0;
         // #4084: hold new dispatch off a root while its build-gate run is in
         // flight, so a fresh sweep build does not race the gate's own build for
         // cores (the contention that timed the gate out under #4073's mild
@@ -1416,8 +1414,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
              max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
              dynamic cap = min(disk, ram, configured_max) — token axis is \
              selection-only, not a cap, since #5270, \
-             global across workspaces; configured_max is re-read every tick — \
-             a config edit hot-applies, an env override needs a restart, #9060)",
+             global across workspaces; configured_max, max_admissions_per_tick and the \
+             brake/breaker thresholds are re-read every tick — a config edit hot-applies, \
+             an env override needs a restart, #9060/#12090)",
             interval.as_secs(),
             configured_max.value,
             configured_max.source,
@@ -1428,6 +1427,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // shared `workspace_pool`. Empty registry ⇒ the single `sweep_workspace`.
         //
         // `startup_reconciliation_ready` (Issue #7974) is awaited internally
+        // (bounded since #12222, see `work_finder::startup_gate`)
         // before the loop's first real tick — see `spawn_startup_passes`'s doc
         // comment above for why this is what still keeps the
         // reconcile-before-dispatch invariant (#6615) intact now that the
@@ -1437,7 +1437,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             sweep_workspace.clone(),
             interval,
             configured_max,
-            max_admissions_per_tick,
             workspace_health_states.clone(),
             suppress_dispatch_during_gate,
             event_bus.clone(),
@@ -1568,14 +1567,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
     // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
     // is on; and the intake reconcile singleton (W7), a config read per tick
-    // unless `fleet.intakeReconcile.singleton` makes this host the producer;
-    // and the shard-owned `loom:blocked` release task (#10763).
-    // The release task serves only through a loop that actually started (#10763
-    // P2), so the role-runner decision is resolved here, once, and reused below.
+    // unless `fleet.intakeReconcile.singleton` makes this host the producer.
+    // (The `loom:blocked` release task that used to start here was retired,
+    // #11301.) The role-runner decision is resolved here, once, and reused below.
     let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
     let role_runner_on = role_runner::resolve_enabled(&role_runner_config);
-    let loops = (_work_finder_handle.is_some(), role_runner_on).into(); // (work finder, role runner)
-    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus, loops);
+    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus);
 
     // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
     let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);
@@ -2054,7 +2051,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::info!(
             "Socket cleaned up, exiting {code} ({signal_name} received — no supervised relaunch)"
         );
-        loom_daemon::observability::shutdown::exit(code).await;
+        loom_daemon::observability::shutdown::exit(
+            code,
+            loom_daemon::observability::daemon_exit::ExitCause::Signal(signal_name),
+        )
+        .await;
     });
 
     log::info!("Loom daemon starting...");

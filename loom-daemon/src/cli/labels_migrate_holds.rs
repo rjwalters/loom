@@ -22,8 +22,18 @@
 //!    a timing finding is handed to
 //!    [`loom_daemon::dep_classify::cli::migrate_escalation`]: blockers closed
 //!    → the hold comes off (Pass 0's un-escalation, one last time); blockers
-//!    still open → `loom:blocked` + one park record per blocker, and the
-//!    stale-blocked release pass lifts it when they close.
+//!    still open → `loom:blocked` + one park record per blocker, which stays
+//!    until a human, Guide or Champion lifts it once they close (#11301).
+//! 3. **No-op holds (#12024).** An issue the daemon's no-op hold (#10156)
+//!    parked as a human gate, before #12024, carries `loom:operator` and a
+//!    trusted hold notice (`<!-- loom:noop-hold-kind=hold (#10156) -->`) with
+//!    no release notice after it
+//!    ([`loom_daemon::sweep_registry::standing_noop_hold_fingerprint`]). It
+//!    gains the daemon's `no-op hold` park record and `loom:blocked`, then
+//!    loses `loom:operator`. A daemon then adopts the park from the forge and
+//!    releases it when the issue's fingerprint changes, exactly like a hold
+//!    applied since #12024. Checked before the escalation shape: a no-op hold
+//!    usually sits on a `loom:curated` issue.
 //!
 //! Every other operator-held item is a human's hold and is left alone, and so
 //! is a held PR the Capped-PR Recovery Pass routed to a human (#11905). That
@@ -49,6 +59,8 @@ use std::time::Duration;
 use loom_daemon::champion_hold::{capped_hold_routed, standing_hold, HoldKind, HOLD_BY};
 use loom_daemon::dep_classify::cli::EscalationMigration;
 use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use loom_daemon::sweep_registry::park_hold::{DAEMON_HOLD_BY, NOOP_HOLD_REASON};
+use loom_daemon::sweep_registry::standing_noop_hold_fingerprint;
 use serde::Serialize;
 
 use super::labels_migrate::{classify, enc, pace_write, ForgeError, Target, PER_PAGE};
@@ -80,6 +92,9 @@ pub(crate) trait HoldsForge {
     fn trusted_comments(&self, number: u64) -> Result<Vec<String>, ForgeError>;
     /// Write the hold's reason-only park record, then add `loom:blocked`.
     fn park_hold(&self, number: u64, kind: HoldKind) -> Result<(), ForgeError>;
+    /// Write the daemon's `no-op hold` park record, then add `loom:blocked`
+    /// (#12024).
+    fn park_noop_hold(&self, number: u64) -> Result<(), ForgeError>;
     /// Remove `label` from one item ([`ForgeError::NotFound`]: not there).
     fn remove_label(&self, number: u64, label: &str) -> Result<(), ForgeError>;
     /// Hand one escalated proposal to the dependency classifier.
@@ -96,6 +111,11 @@ pub(crate) enum Event {
         item: u64,
         hold: &'static str,
         removed: Vec<String>,
+    },
+    /// A daemon no-op hold moved (or would move) off `loom:operator` onto
+    /// `loom:blocked` + its park record (#12024).
+    NoopHold {
+        item: u64,
     },
     /// An escalation whose blockers closed: the operator hold comes off.
     Release {
@@ -132,6 +152,10 @@ impl fmt::Display for Event {
                 "HOLD #{item} {hold} -> loom:blocked + park record (loom:pr kept; removes {})",
                 removed.join(", ")
             ),
+            Event::NoopHold { item } => write!(
+                f,
+                "NOOP-HOLD #{item} loom:operator -> loom:blocked + no-op park record (#12024)"
+            ),
             Event::Release { item } => {
                 write!(f, "RELEASE #{item} (dependency-only, blockers closed)")
             }
@@ -151,6 +175,8 @@ impl fmt::Display for Event {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Summary {
     pub holds: usize,
+    /// No-op holds moved off `loom:operator` (#12024).
+    pub noop_holds: usize,
     pub released: usize,
     pub parked: usize,
     pub left: usize,
@@ -184,8 +210,9 @@ impl Report {
         }
         let s = &self.summary;
         out.push_str(&format!(
-            "SUMMARY holds={} released={} parked={} left={} untouched={} writes={} remaining={}\n",
-            s.holds, s.released, s.parked, s.left, s.untouched, s.writes, s.remaining
+            "SUMMARY holds={} noop_holds={} released={} parked={} left={} untouched={} writes={} \
+             remaining={}\n",
+            s.holds, s.noop_holds, s.released, s.parked, s.left, s.untouched, s.writes, s.remaining
         ));
     }
 }
@@ -271,6 +298,9 @@ fn one(forge: &dyn HoldsForge, item: &HoldItem, apply: bool, r: &mut Report) -> 
     if item.is_pr {
         return pr_hold(forge, item, apply, r);
     }
+    if has(loom_daemon::work_finder::OPERATOR_HOLD_LABEL) && noop_hold(forge, item, apply, r)? {
+        return Ok(());
+    }
     // An escalation is moved only off `loom:operator` itself; a retired name
     // stays for the retired-name migration (#11861 review).
     if !ESCALATION_LABELS.iter().any(|l| has(l))
@@ -311,6 +341,65 @@ fn one(forge: &dyn HoldsForge, item: &HoldItem, apply: bool, r: &mut Report) -> 
         }
     }
     Ok(())
+}
+
+/// An issue the daemon's no-op hold parked on `loom:operator` before #12024:
+/// move it to `loom:blocked` + the `no-op hold` park record, then remove
+/// `loom:operator`. Returns `Ok(true)` when the item was this shape (handled,
+/// or failed and counted), `Ok(false)` to let the other shapes look at it.
+fn noop_hold(
+    forge: &dyn HoldsForge,
+    item: &HoldItem,
+    apply: bool,
+    r: &mut Report,
+) -> Result<bool, Stop> {
+    let n = item.number;
+    let comments = match forge.trusted_comments(n) {
+        Ok(c) => c,
+        Err(e) => {
+            stop_on_limit(r, &e)?;
+            r.events.push(Event::Failed {
+                item: n,
+                why: format!("comments unreadable: {e}"),
+            });
+            r.summary.remaining += 1;
+            return Ok(true);
+        }
+    };
+    if standing_noop_hold_fingerprint(&comments).is_none() {
+        return Ok(false);
+    }
+    r.events.push(Event::NoopHold { item: n });
+    r.summary.noop_holds += 1;
+    if !apply {
+        r.summary.remaining += 1;
+        return Ok(true);
+    }
+    // Add before remove: an interrupted run leaves the issue held twice,
+    // never released.
+    if let Err(e) = forge.park_noop_hold(n) {
+        stop_on_limit(r, &e)?;
+        r.events.push(Event::Failed {
+            item: n,
+            why: format!("park failed, operator hold left in place: {e}"),
+        });
+        r.summary.remaining += 1;
+        return Ok(true);
+    }
+    r.summary.writes += 1;
+    match forge.remove_label(n, loom_daemon::work_finder::OPERATOR_HOLD_LABEL) {
+        Ok(()) => r.summary.writes += 1,
+        Err(ForgeError::NotFound(_)) => {}
+        Err(e) => {
+            stop_on_limit(r, &e)?;
+            r.events.push(Event::Failed {
+                item: n,
+                why: format!("remove loom:operator failed: {e}"),
+            });
+            r.summary.remaining += 1;
+        }
+    }
+    Ok(true)
 }
 
 /// A dry run leaves the work pending; an applied step counts as written.
@@ -479,29 +568,11 @@ impl HoldsForge for GhHoldsForge {
     }
 
     fn park_hold(&self, number: u64, kind: HoldKind) -> Result<(), ForgeError> {
-        // Two writes at most: the body record, then the label.
-        pace_write();
-        pace_write();
-        let req = loom_daemon::park_record::apply::ApplyRequest {
-            number,
-            repo: Some(self.repo.clone()),
-            blocked_by: Vec::new(),
-            reason: Some(kind.reason().to_string()),
-            by: Some(HOLD_BY.to_string()),
-            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            remove_labels: Vec::new(),
-            dry_run: false,
-        };
-        let mut forge = loom_daemon::operator_decision::cli::GhForge::new(
-            self.root.clone(),
-            Some(self.repo.clone()),
-        );
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = loom_daemon::park_record::apply::apply(&mut forge, &req, &mut out, &mut err);
-        if code == loom_daemon::park_record::apply::exit::OK {
-            return Ok(());
-        }
-        Err(classify(String::from_utf8_lossy(&err).trim().to_string()))
+        self.park_reason_only(number, kind.reason(), HOLD_BY)
+    }
+
+    fn park_noop_hold(&self, number: u64) -> Result<(), ForgeError> {
+        self.park_reason_only(number, NOOP_HOLD_REASON, DAEMON_HOLD_BY)
     }
 
     fn remove_label(&self, number: u64, label: &str) -> Result<(), ForgeError> {
@@ -523,6 +594,35 @@ impl HoldsForge for GhHoldsForge {
             pace_write();
         }
         loom_daemon::dep_classify::cli::migrate_escalation(&self.root, &self.repo, n, true)
+    }
+}
+
+impl GhHoldsForge {
+    /// A reason-only park record, then `loom:blocked`.
+    fn park_reason_only(&self, number: u64, reason: &str, by: &str) -> Result<(), ForgeError> {
+        // Two writes at most: the body record, then the label.
+        pace_write();
+        pace_write();
+        let req = loom_daemon::park_record::apply::ApplyRequest {
+            number,
+            repo: Some(self.repo.clone()),
+            blocked_by: Vec::new(),
+            reason: Some(reason.to_string()),
+            by: Some(by.to_string()),
+            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            remove_labels: Vec::new(),
+            dry_run: false,
+        };
+        let mut forge = loom_daemon::operator_decision::cli::GhForge::new(
+            self.root.clone(),
+            Some(self.repo.clone()),
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = loom_daemon::park_record::apply::apply(&mut forge, &req, &mut out, &mut err);
+        if code == loom_daemon::park_record::apply::exit::OK {
+            return Ok(());
+        }
+        Err(classify(String::from_utf8_lossy(&err).trim().to_string()))
     }
 }
 

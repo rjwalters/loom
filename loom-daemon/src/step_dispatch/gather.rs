@@ -10,15 +10,12 @@
 //! - **the items**: [`super::listing::list_all_open`] (mirror, else the
 //!   shared ETag walk);
 //! - **the PRs' head and author**: the open-PR listing
-//!   (`forge_pull_listing`, ETag-cached), so the Builder branch links as it
+//!   (`forge_pull_listing`, ETag-cached, a Gate read; its last good copy
+//!   stands in on a failure, #12074), so the Builder branch links as it
 //!   does in the open-PR guard. When it cannot be read, a PR row links by its
 //!   body alone;
 //! - **hold markers** on `loom:blocked` PRs: their trusted comments, cached
 //!   per `(repo, PR, updated_at)`, at most [`MAX_MARKER_READS`] per tick;
-//! - **dependency parks**: whether every named blocker is a closed issue or a
-//!   merged PR, for curated parked issues only, cached for
-//!   [`BLOCKER_TTL`], at most [`MAX_BLOCKER_READS`] per tick. A blocker in the
-//!   open listing is open without a read;
 //! - **landed** `loom:issue` items: the landed pre-filter's batched,
 //!   cached verdicts (`work_finder::landed_prefilter`);
 //! - **stage entry**: the provider (`super::stage_entry`), for stepped
@@ -31,9 +28,13 @@
 //!   tick; the reads are conditional.
 //!
 //! A read that fails or runs out of budget leaves its fact at the value that
-//! passes the item (a held PR without its marker reads as `blocked`, an
-//! unread dependency park stays parked): never a step the forge did not
-//! vouch for.
+//! passes the item (a held PR without its marker reads as `blocked`): never a
+//! step the forge did not vouch for.
+//!
+//! A dependency park's blockers are **not** read here (#12078): a curated,
+//! dependency-parked issue is a Champion re-evaluate on every draw, and
+//! Champion re-checks the blockers itself (`champion-targeted.md`, `--issue`
+//! step 1).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -57,10 +58,6 @@ use crate::worktree_ops::linked_pr_listing::linked_issues;
 /// At most this many PRs' comments are read for hold markers per repo per
 /// tick.
 pub const MAX_MARKER_READS: usize = 8;
-/// At most this many blocker states are read per repo per tick.
-pub const MAX_BLOCKER_READS: usize = 8;
-/// How long a blocker's state is believed.
-pub const BLOCKER_TTL: Duration = Duration::from_secs(10 * 60);
 /// Pages of the open-PR listing read per tick.
 pub const PULL_PAGES: usize = 10;
 /// At most this many Judge-step heads without a cached CI answer are read
@@ -77,8 +74,6 @@ const CURATED: &str = concat!("loom", ":curated");
 pub struct IssueFacts {
     /// Issue → its merged closing PR (landed, not yet kept by Curator).
     pub landed: HashMap<u32, u32>,
-    /// Dependency-parked issues whose every blocker is closed or merged.
-    pub blockers_closed: HashSet<u32>,
     /// Issues whose red-main-fix marker counts: promoted, or filed by a
     /// trusted author.
     pub red_fix: HashSet<u32>,
@@ -145,6 +140,38 @@ fn listing_or_last_good(
     }
 }
 
+type LastGoodPulls = HashMap<String, (Instant, Vec<RestPull>)>;
+
+fn last_good_pulls() -> &'static Mutex<LastGoodPulls> {
+    static CACHE: OnceLock<Mutex<LastGoodPulls>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The open-PR listing, or on its failure the last good one while it is
+/// fresh (#12074), and whether this tick's listing answered. A shed listing
+/// (a reader back-off) then keeps the PR set (heads for the CI hold, branch
+/// links, authors) instead of emptying it. It never vouches for a Builder
+/// step: the second value stays `false`, so [`super::driver::shape_pool`]
+/// still holds Builders (#12025).
+pub fn pulls_or_last_good(
+    slug: &str,
+    listing: anyhow::Result<Vec<RestPull>>,
+) -> (Vec<RestPull>, bool) {
+    let mut cache = last_good_pulls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match listing {
+        Ok(pulls) => {
+            cache.insert(slug.to_string(), (Instant::now(), pulls.clone()));
+            (pulls, true)
+        }
+        Err(_) => match cache.get(slug) {
+            Some((at, pulls)) if at.elapsed() < LAST_GOOD_TTL => (pulls.clone(), false),
+            _ => (Vec::new(), false),
+        },
+    }
+}
+
 fn has(labels: &[String], label: &str) -> bool {
     labels.iter().any(|l| l == label)
 }
@@ -201,7 +228,6 @@ pub fn build_inputs(
                 number: r.number,
                 labels: r.labels.clone(),
                 park,
-                blockers_closed: facts.blockers_closed.contains(&r.number),
                 capabilities: match (park, r.body.as_deref()) {
                     (ParkKind::Capability, Some(body)) => step_item::declared_capabilities(body),
                     _ => Vec::new(),
@@ -336,15 +362,9 @@ pub fn hold_ci_pending(
 // ---------------------------------------------------------------------------
 
 type MarkerCache = HashMap<(String, u32), (Option<String>, PullMarkers)>;
-type BlockerCache = HashMap<(String, String), (Instant, bool)>;
 
 fn marker_cache() -> &'static Mutex<MarkerCache> {
     static CACHE: OnceLock<Mutex<MarkerCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn blocker_cache() -> &'static Mutex<BlockerCache> {
-    static CACHE: OnceLock<Mutex<BlockerCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -387,70 +407,6 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
     out
 }
 
-/// Whether one blocker is a closed issue or a merged PR; `None` unknown.
-fn blocker_closed(slug: &str, root: &Path, repo: &str, number: u64) -> Option<bool> {
-    let key = (slug.to_string(), format!("{repo}#{number}"));
-    if let Some((at, closed)) = blocker_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-    {
-        if at.elapsed() < BLOCKER_TTL {
-            return Some(*closed);
-        }
-    }
-    let v =
-        crate::comment_trust::records::fetch_issue_object(repo, &number.to_string(), root, true)?;
-    let closed = v.get("state").and_then(|s| s.as_str()) == Some("closed")
-        && v.get("pull_request")
-            .is_none_or(|pr| pr.get("merged_at").is_some_and(|m| !m.is_null()));
-    blocker_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, (Instant::now(), closed));
-    Some(closed)
-}
-
-/// The curated, dependency-parked issues among `rows` whose every blocker is
-/// closed or merged.
-fn blockers_closed(slug: &str, root: &Path, rows: &[RestIssue]) -> HashSet<u32> {
-    let open: HashSet<u32> = rows.iter().map(|r| r.number).collect();
-    let mut reads = 0usize;
-    let mut out = HashSet::new();
-    for row in rows.iter().filter(|r| {
-        !r.is_pull_request
-            && has(&r.labels, CURATED)
-            && crate::work_finder::is_blocked_hold(&r.labels)
-    }) {
-        let Some(body) = row.body.as_deref() else {
-            continue;
-        };
-        if step_item::park_kind(&row.labels, Some(body)) != ParkKind::Dependency {
-            continue;
-        }
-        let blockers: Vec<_> = crate::park_record::parse(body)
-            .into_iter()
-            .filter_map(|r| r.blocker)
-            .collect();
-        let all_closed = blockers.iter().all(|b| {
-            let repo = b.repo.clone().unwrap_or_else(|| slug.to_string());
-            let local = repo.eq_ignore_ascii_case(slug);
-            if local && u32::try_from(b.number).is_ok_and(|n| open.contains(&n)) {
-                return false;
-            }
-            if reads >= MAX_BLOCKER_READS {
-                return false;
-            }
-            reads += 1;
-            blocker_closed(slug, root, &repo, b.number).unwrap_or(false)
-        });
-        if !blockers.is_empty() && all_closed {
-            out.insert(row.number);
-        }
-    }
-    out
-}
-
 /// One workspace's items, read from the forge (module docs). `Ok(None)` when
 /// the workspace has no forge target (a hermetic fixture). `main_red` gets
 /// the repo's red-main-fix issues (trusted or promoted) and answers whether
@@ -486,10 +442,8 @@ pub fn gather(
         Some(&slug),
         PULL_PAGES,
     );
-    let pulls_complete = pull_listing.is_ok();
-    let full: HashMap<u32, RestPull> = pull_listing
-        .map(|pulls| pulls.into_iter().map(|p| (p.number, p)).collect())
-        .unwrap_or_default();
+    let (pulls, pulls_complete) = pulls_or_last_good(&slug, pull_listing);
+    let full: HashMap<u32, RestPull> = pulls.into_iter().map(|p| (p.number, p)).collect();
     let markers = pull_markers(&slug, root, &rows);
     let pulls: Vec<PullInput> = rows
         .iter()
@@ -518,7 +472,6 @@ pub fn gather(
         landed: crate::work_finder::landed_prefilter::landed_in(registry, &ready, &linked_by_pr)
             .into_iter()
             .collect(),
-        blockers_closed: blockers_closed(&slug, root, &rows),
         red_fix: rows
             .iter()
             .filter(|r| !r.is_pull_request && has_red_fix_marker(r.body.as_deref()))

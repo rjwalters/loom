@@ -82,9 +82,14 @@ the next step, after a fresh evaluation.
    `/pull/` URL, a failed read, or a closed issue: outcome `not-eligible`. It
    must carry a proposal label (`loom:curated`, `loom:architect`, `loom:hermit`
    or `loom:auditor`) and neither `loom:issue` nor `loom:building`; otherwise
-   `not-eligible`; so is `loom:operator`. `loom:blocked` (#11860): when every
-   blocker `loom-daemon park-record parse` reads from the body is a closed issue
-   or a merged PR, remove `loom:blocked` and go on; else outcome `blocked`.
+   `not-eligible`; so is `loom:operator`. `loom:blocked` (#11860, #12078): the
+   work finder draws a curated, dependency-parked issue every time it comes up,
+   without checking the blockers first, so this check is the only one. Re-read
+   them now: when every blocker `loom-daemon park-record parse` reads from the
+   body is a closed issue or a merged PR, remove `loom:blocked` and go on.
+   Otherwise leave the issue exactly as it is (no comment, no label change,
+   no park-record edit) and end with outcome `blocked`; the daemon spaces the
+   next draw.
 2. **Run `champion-issue-promo.md`'s per-issue order for this issue only**
    ("Issue Promotion Batch Processing" → "Per-issue order in the loop"): the
    Dependency-Defer Fast Path, the Idempotency check, the Claim with `loom:evaluating`

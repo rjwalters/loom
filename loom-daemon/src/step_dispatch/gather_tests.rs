@@ -65,16 +65,17 @@ fn facts_reach_the_classifier() {
     ];
     let facts = IssueFacts {
         landed: HashMap::from([(5, 50)]),
-        blockers_closed: HashSet::from([6]),
         red_fix: HashSet::new(),
     };
     let items = classify_rows(&rows, &facts);
     assert_eq!(items[0].verdict, Verdict::Step(Step::CuratorKeepOrClose));
     assert_eq!(items[1].verdict, Verdict::Step(Step::ChampionReevaluate));
-    // Unread facts pass the same items.
+    // Without the landed fact the issue is a plain Builder step. The
+    // dependency park needs no fact: Champion re-checks its blockers on every
+    // draw (#12078).
     let items = classify_rows(&rows, &IssueFacts::default());
     assert_eq!(items[0].verdict, Verdict::Step(Step::Builder));
-    assert!(matches!(items[1].verdict, Verdict::Pass(_)));
+    assert_eq!(items[1].verdict, Verdict::Step(Step::ChampionReevaluate));
 }
 
 #[test]
@@ -207,4 +208,23 @@ mod ci_hold {
         let held = hold_ci_pending(&mut items, &HashMap::new(), 4, |_| None, |_| panic!("no read"));
         assert_eq!(held, 0, "a PR with no known head is drawn unread");
     }
+}
+
+/// #12074: a failed open-PR listing keeps the last good PR set but never
+/// vouches for a Builder step (the flag stays false); with nothing cached it
+/// is empty, as before.
+#[test]
+fn a_failed_pull_listing_keeps_the_last_good_set_unvouched() {
+    let slug = format!("acme/pulls-last-good-{}", std::process::id());
+    let (none, ok) = pulls_or_last_good(&slug, Err(anyhow::anyhow!("shed")));
+    assert!(none.is_empty() && !ok);
+    let pull = RestPull {
+        number: 7,
+        ..RestPull::default()
+    };
+    let (fresh, ok) = pulls_or_last_good(&slug, Ok(vec![pull.clone()]));
+    assert_eq!((fresh.len(), ok), (1, true));
+    let (kept, ok) = pulls_or_last_good(&slug, Err(anyhow::anyhow!("shed")));
+    assert_eq!(kept, vec![pull]);
+    assert!(!ok, "a last good PR listing never vouches for a Builder step");
 }

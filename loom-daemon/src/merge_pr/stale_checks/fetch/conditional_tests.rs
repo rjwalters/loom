@@ -1,14 +1,11 @@
-//! The guard's reads are conditional, memoised, paced and held on a
+//! The surviving reads are conditional, paced and held on a
 //! secondary limit (#11418), against a stub `gh` that speaks `--include`,
 //! honours `If-None-Match` like the forge, and logs every request it gets as
 //! `<status> <inm|-> <url>`.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 
-use super::{
-    branch_protection_contexts, budget, compare_memoised, fetch_base_tip, fetch_check_runs,
-    fetch_required, tested_base,
-};
+use super::{branch_protection_contexts, budget, fetch_check_runs, fetch_required};
 use crate::forge_wait_checks::reads::GhReads;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -203,27 +200,20 @@ fn the_guard_revalidates_the_entry_forge_wait_checks_wrote() {
 }
 
 #[test]
-fn the_base_tip_and_rulesets_reads_are_conditional_and_graphql_is_not() {
+fn the_rulesets_read_is_conditional_and_graphql_is_not() {
     let f = Forge::new();
-    f.serve(
-        "repos/o/r/commits/main",
-        r#"{"sha":"abc1234","commit":{"committer":{"date":"2026-09-18T11:45:21Z"}}}"#,
-    );
     f.serve(
         "repos/o/r/rules/branches/main",
         r#"[{"type":"deletion"},{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Backend"},{"context":"Docs"}]}}]"#,
     );
     f.out("graphql", "Docs\nLegacy\n");
     for _ in 0..2 {
-        let (sha, _) = fetch_base_tip(f.gh(), "o/r", "main", Some(f.store())).unwrap();
-        assert_eq!(sha, "abc1234");
         let (required, notices) = fetch_required(f.gh(), "o/r", "main", Some(f.store())).unwrap();
         assert_eq!(required, ["Backend", "Docs", "Legacy"]);
         assert!(notices.is_empty());
     }
     let calls = f.calls();
-    assert_eq!(calls[3], "304 inm repos/o/r/commits/main", "{calls:#?}");
-    assert_eq!(calls[4], "304 inm repos/o/r/rules/branches/main", "{calls:#?}");
+    assert_eq!(calls[2], "304 inm repos/o/r/rules/branches/main", "{calls:#?}");
     assert_eq!(calls.iter().filter(|c| c.ends_with(" graphql")).count(), 2);
 }
 
@@ -294,35 +284,6 @@ fn the_branch_summary_parser_reads_ruleset_only_and_unprotected_branches_as_none
     assert!(branch_protection_contexts("not json").is_err());
 }
 
-// ---- memos ----------------------------------------------------------------
-
-#[test]
-fn a_tested_base_is_read_from_its_log_once() {
-    let f = Forge::new();
-    let log = "repos/o/r/actions/jobs/7/logs";
-    f.out(log, "HEAD is now at 8536533 Merge f8f004b17 into c3db84070\n");
-    for _ in 0..2 {
-        assert_eq!(tested_base(f.gh(), "o/r", 7, "f8f004b17").unwrap(), "c3db84070");
-    }
-    assert_eq!(f.calls(), vec![format!("OUT - {log}")]);
-    // A different head is a different question.
-    assert!(tested_base(f.gh(), "o/r", 7, "aaaaaaaaa").is_err());
-    assert_eq!(f.calls().len(), 2);
-}
-
-#[test]
-fn a_compare_between_two_shas_is_read_once() {
-    let f = Forge::new();
-    let url = "repos/o/r/compare/c3db84070...abc1234";
-    f.out(url, r#"{"status":"ahead","files":[{"filename":"a.rs","status":"modified","previous_filename":null,"patch":"@@"}]}"#);
-    for _ in 0..2 {
-        let (status, files) = compare_memoised(f.gh(), "o/r", "c3db84070", "abc1234").unwrap();
-        assert_eq!((status.as_str(), files.len()), ("ahead", 1));
-        assert_eq!(files[0].patch.as_deref(), Some("@@"));
-    }
-    assert_eq!(f.calls().len(), 1);
-}
-
 // ---- secondary limits and pacing -----------------------------------------
 
 #[test]
@@ -337,7 +298,7 @@ fn a_secondary_limit_holds_every_later_request_until_retry_after() {
 
     // The next read is refused without spawning gh at all.
     let sent = f.calls().len();
-    let error = fetch_base_tip(f.gh(), "o/r", "main", Some(f.store())).unwrap_err();
+    let error = fetch_required(f.gh(), "o/r", "main", Some(f.store())).unwrap_err();
     assert!(error.contains("#11418"), "{error}");
     assert_eq!(f.calls().len(), sent, "nothing was sent");
 
@@ -349,13 +310,15 @@ fn a_secondary_limit_holds_every_later_request_until_retry_after() {
 #[test]
 fn a_secondary_limit_on_a_plain_read_holds_too() {
     let f = Forge::new();
-    let log = "repos/o/r/actions/jobs/7/logs";
-    f.refuse(log, 403, "", SECONDARY);
-    assert!(tested_base(f.gh(), "o/r", 7, "f8f004b17").is_err());
+    f.serve("repos/o/r/rules/branches/main", "[]");
+    // The classic-protection read is a plain (GraphQL) `gh api` call.
+    f.refuse("graphql", 403, "", SECONDARY);
+    assert!(fetch_required(f.gh(), "o/r", "main", Some(f.store())).is_err());
     let now = chrono::Utc::now().timestamp();
     assert!(budget::hold_until(&budget::scope("o/r"), now).is_some_and(|t| t > now + 50));
-    assert!(tested_base(f.gh(), "o/r", 8, "f8f004b17").is_err());
-    assert_eq!(f.calls().len(), 1, "the second log was never asked for");
+    let sent = f.calls().len();
+    assert!(fetch_required(f.gh(), "o/r", "main", Some(f.store())).is_err());
+    assert_eq!(f.calls().len(), sent, "nothing more was asked for");
 }
 
 #[test]
@@ -395,7 +358,7 @@ fn a_hold_on_one_credential_or_owner_does_not_block_another() {
     // Another owner (its own reader App installation) is not held.
     assert_eq!(budget::hold_until(&budget::scope("p/r"), now), None);
     let sent = f.calls().len();
-    let _ = fetch_base_tip(f.gh(), "p/r", "main", Some(f.store()));
+    let _ = fetch_required(f.gh(), "p/r", "main", Some(f.store()));
     assert!(f.calls().len() > sent, "the other owner's read was sent");
 
     // Another token on the same owner is not held either.
@@ -438,6 +401,9 @@ fn a_stored_hold_past_the_cap_is_read_as_the_cap() {
 #[test]
 fn later_check_runs_pages_are_spaced() {
     let f = Forge::new();
+    // Page 1's stub exec can outlast the real 200 ms gap (macOS scans a fresh
+    // script), leaving page 2 nothing to wait out; an hour cannot elapse.
+    budget::set_gap_for_test(std::time::Duration::from_secs(3600));
     f.serve(&runs_url(SHA), &page(150, 100, 0));
     f.serve(&format!("{}&page=2", runs_url(SHA)), &page(150, 50, 100));
     fetch_check_runs(f.gh(), "o/r", SHA).unwrap();
