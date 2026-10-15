@@ -32,7 +32,14 @@
 //! the head commit message. A stderr hint says so. See [`no_run`].
 //!
 //! `--timeout 0` takes exactly one poll (a snapshot). A RED is reported as
-//! soon as a failing check is terminal, without waiting for the rest.
+//! soon as a failing check is terminal, without waiting for the rest —
+//! unless `--settle-red` (#12011): then RED only once nothing observed is
+//! pending (the required set does not hold it back, #12022); a failure seen while
+//! the run is still going keeps the wait pending (→ `TIMEOUT`, with a
+//! `wait-checks: --settle-red: already failing: …` stderr note). The Judge
+//! uses it before a changes-requested verdict, which must name the failing
+//! test from a finished log; refusing callers (approval, merge) keep the
+//! early RED. See [`verdict::decide_settled`].
 //!
 //! # Zero rows
 //!
@@ -184,6 +191,8 @@ impl Clock for RealClock {
 pub struct Opts {
     pub timeout: Duration,
     pub required_only: bool,
+    /// `--settle-red` (#12011): no RED while anything is still pending.
+    pub settle_red: bool,
     /// Base branch for the required-context lookup in SHA mode; `None` =
     /// the repository's default branch.
     pub base: Option<String>,
@@ -203,6 +212,7 @@ pub struct WaitArgs {
     pub base: Option<String>,
     pub timeout: u64,
     pub required_only: bool,
+    pub settle_red: bool,
     pub min_interval: Option<u64>,
     pub max_interval: Option<u64>,
 }
@@ -240,6 +250,7 @@ fn run_cli(args: &WaitArgs) -> (Outcome, Vec<String>) {
     let opts = Opts {
         timeout: Duration::from_secs(args.timeout),
         required_only: args.required_only,
+        settle_red: args.settle_red,
         base: args.base.clone(),
         min_interval,
         max_interval: args
@@ -301,6 +312,9 @@ struct State {
     /// permission, once it has been (#10633). From then on the wait reads
     /// check-runs only and never asks again.
     statuses_denied: Option<String>,
+    /// `--settle-red`: failures already seen on the latest poll while the
+    /// run was still going, for the stderr note on `TIMEOUT`.
+    early_red: Vec<String>,
     notes: Vec<String>,
 }
 
@@ -319,6 +333,7 @@ pub fn wait<C: Clock>(
         lookup_error: String::new(),
         zero_polls: 0,
         statuses_denied: None,
+        early_red: Vec::new(),
         notes: Vec::new(),
     };
     let mut backoff = Backoff::new(opts.min_interval, opts.max_interval);
@@ -360,6 +375,13 @@ pub fn wait<C: Clock>(
         };
         if deadline_reached {
             let sha = sha.unwrap_or_default();
+            if !st.early_red.is_empty() {
+                let line = format!(
+                    "wait-checks: --settle-red: already failing: {}",
+                    st.early_red.join(",")
+                );
+                note(&mut st, line);
+            }
             return (
                 Outcome::Timeout {
                     sha,
@@ -446,8 +468,11 @@ fn poll(
     st.zero_polls = 0;
 
     // Required contexts are looked up only when a verdict needs them.
+    // A failure needs no required set, `--settle-red` included (#12022): it
+    // waits only on observed pending checks, so a failed lookup (#11837)
+    // cannot hide a finished red.
     let needs_required =
-        opts.required_only || (rollup.failing.is_empty() && rollup.pending.is_empty());
+        opts.required_only || (rollup.pending.is_empty() && rollup.failing.is_empty());
     let required = if needs_required {
         resolve_required(reads, st)?
     } else {
@@ -470,7 +495,17 @@ fn poll(
             ),
         );
     }
-    Ok(match verdict::decide(&rollup, required.as_deref(), opts.required_only) {
+    let decision = if opts.settle_red {
+        verdict::decide_settled(&rollup, required.as_deref(), opts.required_only)
+    } else {
+        verdict::decide(&rollup, required.as_deref(), opts.required_only)
+    };
+    st.early_red = if opts.settle_red && matches!(decision, Decision::Pending(_)) {
+        rollup.failing.clone()
+    } else {
+        Vec::new()
+    };
+    Ok(match decision {
         Decision::Green => Poll::Done(Outcome::Green { sha }),
         Decision::Red(names) => {
             let failed = rollup

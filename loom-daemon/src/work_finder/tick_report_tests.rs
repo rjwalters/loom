@@ -208,6 +208,47 @@ fn collisions_and_claim_lock_contention_get_their_own_reasons() {
     assert_eq!(results, ["refused", "refused", "error"]);
 }
 
+/// #11973: every counted dispatch error notes its kind, so the tick's
+/// `loom.dispatch.error_kind` is never missing when `errors` is non-zero.
+#[test]
+fn every_counted_dispatch_error_notes_its_kind() {
+    use super::DispatchErrorKind as K;
+    let now = Utc::now();
+    let cases: Vec<(Result<bool>, K)> = vec![
+        (Err(token_selection(1)), K::TokenSelection),
+        (
+            Err(CollisionDispatchError {
+                issue: 2,
+                source: CollisionSource::PeerClaim,
+            }
+            .into()),
+            K::ClaimCollision,
+        ),
+        (
+            Err(ClaimLockDispatchError {
+                issue: 3,
+                lock: PathBuf::from("/tmp/locks/issue-3"),
+            }
+            .into()),
+            K::ClaimLock,
+        ),
+        (Err(anyhow!("ENOENT").context("failed to spawn sweep child")), K::DispatchSpawn),
+        (Err(anyhow!("gh: API rate limit exceeded (HTTP 403)")), K::RateLimited),
+        (Err(anyhow!("something else")), K::Other),
+    ];
+    for (outcome, kind) in cases {
+        let mut report = TickReport::default();
+        record_dispatch_outcome(&mut report, 1, 0, now, &outcome);
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.error_kinds, vec![kind]);
+        assert_eq!(report.error_kind(), Some(kind.as_str()));
+    }
+    // A refusal that is not an error notes no kind.
+    let mut report = TickReport::default();
+    record_dispatch_outcome(&mut report, 1, 0, now, &Err(lease_order(1)));
+    assert_eq!((report.errors, report.error_kind()), (0, None));
+}
+
 #[test]
 fn the_claim_lock_error_keeps_its_text() {
     let e = ClaimLockDispatchError {

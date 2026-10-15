@@ -84,7 +84,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "outcome.label_timeline"
         | "restore.label_timeline"
         | "sequence.label_timeline"
-        | "intake.label_events" => ops::TIMELINE_READ,
+        | "intake.label_events"
+        | "champion.label_events" => ops::TIMELINE_READ,
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"
         | "guard.lease_comments"

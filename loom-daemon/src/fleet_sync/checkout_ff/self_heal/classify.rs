@@ -335,7 +335,8 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     // `git checkout origin/main` or of a PR head in the main checkout). During
     // a rebase HEAD is detached by design; a merge or cherry-pick on a
     // detached HEAD is not one this repair knows how to put back.
-    let detached = git::current_branch(root, local(env))?.is_none();
+    let current = git::current_branch(root, local(env))?;
+    let detached = current.is_none();
     if detached && matches!(op, Some(Op::Merge | Op::CherryPick)) {
         return Err("a merge or cherry-pick is in progress on a detached HEAD".to_string());
     }
@@ -355,6 +356,11 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     if lock.is_none() && op.is_none() && commits.is_empty() && !blocking_dirt && !stray_behind {
         return Ok(Verdict::Clean);
     }
+    // The repair resets whatever HEAD is on. A checkout someone has on another
+    // named branch is theirs, however Loom-like its commits look.
+    if let Some(on) = current.as_deref().filter(|on| *on != branch) {
+        return Err(format!("the checkout is on `{on}`, not `{branch}`"));
+    }
     if commits.len() > MAX_COMMITS {
         return Err(format!("{} local commits are more than are read", commits.len()));
     }
@@ -363,7 +369,28 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     let revs = ["HEAD".to_string(), own_ref.clone(), tracking.clone()];
     let listed = owned_paths(env, root, &revs)?;
     let pins = managed::pins(root);
-    let owned = |p: &str| listed.contains(p) || managed::resync_owned(p, &pins);
+    // `rev` is the commit the path was changed in; `None` is the working tree.
+    // A skill the payload ships is the resync's only while it carries the
+    // generation marker (`resync_agent_skills`); a consumer's own, or one
+    // detached from generation by stripping it, is not.
+    let owned = |rev: Option<&str>, p: &str| {
+        if listed.contains(p) {
+            return true;
+        }
+        if !managed::resync_owned(p, &pins) {
+            return false;
+        }
+        if !managed::is_skill(p) {
+            return true;
+        }
+        let content = match rev {
+            None => std::fs::read_to_string(root.join(p)).ok(),
+            Some(sha) => read(env, root, &["show", &format!("{sha}:{p}")])
+                .or_else(|_| read(env, root, &["show", &format!("{sha}^:{p}")]))
+                .ok(),
+        };
+        content.is_some_and(|c| managed::has_marker(&c))
+    };
     let mut judged: Vec<String> = commits.iter().cloned().collect();
     if op == Some(Op::Rebase) {
         let head_name =
@@ -386,12 +413,12 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     for sha in &judged {
         if let Some(path) = commit_paths(env, root, sha)?
             .into_iter()
-            .find(|p| !owned(p))
+            .find(|p| !owned(Some(sha), p))
         {
             return Err(format!("commit {sha} changes `{path}`, which Loom does not manage"));
         }
     }
-    if let Some(path) = dirty.iter().find(|p| !owned(p)) {
+    if let Some(path) = dirty.iter().find(|p| !owned(None, p)) {
         return Err(format!("`{path}` has an uncommitted change and Loom does not manage it"));
     }
 
@@ -410,6 +437,15 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     // Re-attached only when the repair resets anyway, or the HEAD is behind.
     let reattach = stray && (stray_behind || !commits.is_empty() || blocking_dirt);
     if reattach {
+        // A tool that pins a checkout to a commit on purpose (2am's
+        // `provision.sh` keeps geode-fem at the newest green one) says so here;
+        // while main is red such a HEAD is detached, behind and unmoved, which
+        // is exactly the shape this repair puts back.
+        let keep = read(env, root, &["config", "--local", "--get", "loom.checkoutFf.detached"])
+            .unwrap_or_default();
+        if keep.trim().eq_ignore_ascii_case("keep") {
+            return Err("HEAD is detached on purpose (loom.checkoutFf.detached=keep)".to_string());
+        }
         let moved = managed::head_moved_at(gd);
         if !moved.is_some_and(|at| {
             now.signed_duration_since(at)

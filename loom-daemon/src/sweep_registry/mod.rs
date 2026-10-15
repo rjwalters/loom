@@ -697,7 +697,7 @@ pub struct SweepRegistry {
     /// #4256 resume decision, and its #4366 no-progress predicate) — none of
     /// which should be forced to `&mut self` for what is a pure read-through
     /// cache. Never held across a `gh` invocation.
-    open_pr_memo: Mutex<HashMap<u32, OpenPrMemoEntry>>,
+    open_pr_memo: Arc<Mutex<HashMap<u32, OpenPrMemoEntry>>>,
     /// When each *source* most recently observed `spawn-claude.sh`'s
     /// token-selection pre-flight step being unsatisfiable (exit 78 /
     /// `EX_CONFIG`), keyed by
@@ -825,7 +825,7 @@ pub struct SweepRegistry {
     /// env override is checked before this cache on every call — env reads
     /// are free and tests toggle the var directly, so caching it would only
     /// add a staleness hazard for zero benefit.
-    owner_repo_cache: Mutex<Option<(String, String)>>,
+    owner_repo_cache: Arc<Mutex<Option<(String, String)>>>,
     /// In-flight idempotency-key -> sweep-id map (Issue #9572).
     ///
     /// [`find_running_by_key`](Self::find_running_by_key) — the step-1 dedup
@@ -1060,7 +1060,7 @@ impl SweepRegistry {
             decline_cooldown: HashMap::new(),
             prless_retry_config: PrlessRetryConfig::default(),
             prless_retry: PrlessTally::default(),
-            open_pr_memo: Mutex::new(HashMap::new()),
+            open_pr_memo: Arc::new(Mutex::new(HashMap::new())),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
@@ -1069,7 +1069,7 @@ impl SweepRegistry {
             start_facts: HashMap::new(),
             pending_group_reaps: HashMap::new(),
             activity_window: None,
-            owner_repo_cache: Mutex::new(None),
+            owner_repo_cache: Arc::new(Mutex::new(None)),
             inflight_idempotency: HashMap::new(),
             roll_gate: roll_gate::RollGate::default(),
         }
@@ -1140,7 +1140,23 @@ impl SweepRegistry {
     /// and the workspace pool call this once at provision time with the
     /// resolved env > config > default value, mirroring
     /// [`set_quarantine_config`](Self::set_quarantine_config).
-    pub fn set_dispatch_backoff_config(&mut self, config: DispatchBackoffConfig) {
+    ///
+    /// A zero `base` or `max` is clamped to one second with a warning
+    /// (#11952): a zero window on a ladder ad is the old encoding of a
+    /// fleet-wide fast-fail streak break, and the resolver already refuses a
+    /// zero from env or config, so only a hand-built config reaches this.
+    pub fn set_dispatch_backoff_config(&mut self, mut config: DispatchBackoffConfig) {
+        let floor = Duration::from_secs(1);
+        if config.base < floor || config.max < floor {
+            log::warn!(
+                "sweep_registry: dispatch backoff base={}s max={}s clamped to at least 1s — a \
+                 zero window would read as a fleet-wide fast-fail streak break (#11952)",
+                config.base.as_secs(),
+                config.max.as_secs()
+            );
+            config.base = config.base.max(floor);
+            config.max = config.max.max(config.base);
+        }
         self.dispatch_backoff_config = config;
     }
 

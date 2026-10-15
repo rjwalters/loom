@@ -63,6 +63,10 @@ use crate::types::{Event, SweepKind};
 /// file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
 mod completion_runtime;
 mod forge_gate;
+mod reconcile_tick;
+#[cfg(test)]
+use reconcile_tick::ReconcileWatermarks;
+use reconcile_tick::{reconcile_merges_since, ReconcileState};
 pub mod loom_ui_watch;
 
 // ============================================================================
@@ -1327,7 +1331,8 @@ fn event_repo(event: &Event) -> Option<&str> {
         | Event::SweepExited { repo, .. }
         | Event::SweepCrashed { repo, .. }
         | Event::SweepResumeDispatched { repo, .. }
-        | Event::SweepGlobalDispatch { repo, .. } => repo.as_deref(),
+        | Event::SweepGlobalDispatch { repo, .. }
+        | Event::StepEnded { repo, .. } => repo.as_deref(),
         _ => None,
     }
 }
@@ -2213,9 +2218,11 @@ async fn completion_for_exit(
     .await
 }
 
-/// Shared envelope-build/dedup-insert core behind **both** completion trigger
-/// paths (issue #4583): the `SweepExited` emit point above
-/// ([`completion_for_exit`]) and the periodic merge-reconciliation pass below
+/// Shared envelope-build/dedup-insert core behind **every** completion
+/// trigger path (issue #4583): the `SweepExited` emit point above
+/// ([`completion_for_exit`]), a Champion merge step's end
+/// ([`completion_for_merged_step`], #12152: a step emits no `SweepExited`),
+/// and the periodic merge-reconciliation pass below
 /// ([`reconcile_recent_merges`]), which exists precisely because a
 /// champion-tick merge — landing well after the sweep process (and its one
 /// `SweepExited`) already exited — is never observed by the first path alone.
@@ -2407,97 +2414,245 @@ fn reconcile_max_age() -> chrono::Duration {
 /// network, unauthenticated, timeout, malformed JSON, an unparsable row —
 /// degrades that row (or the whole call) to being silently skipped; a
 /// best-effort reconciliation pass must never panic or block the sink.
+// The unwatermarked form; production goes through the watermarked one (#12152).
+#[cfg_attr(not(test), allow(dead_code))]
 async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedPr> {
-    if forge_gate::suppressed("pr list (reconcile)", workspace_root) {
-        return Vec::new();
-    }
-    let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
-    let limit = RECONCILE_PR_LIMIT.to_string();
-    let args = [
+    fetch_merged_prs_since(workspace_root, None)
+        .await
+        .map(|(rows, _)| rows)
+        .unwrap_or_default()
+}
+
+/// How far before a workspace's watermark a catch-up query starts (#12152).
+/// GitHub's search index trails a merge by seconds to minutes, so a query
+/// cut exactly at the last pass could miss a merge that landed just before
+/// it; the overlap costs nothing, because every row it re-reads is already
+/// in the dedup set.
+const RECONCILE_WATERMARK_SLACK: chrono::Duration = chrono::Duration::hours(1);
+
+/// Row cap of a watermarked (`merged:>=`) reconciliation query (#12152). A
+/// full page means the window may hold more merges than one pass read; the
+/// pass says so ([`reconcile_tick::ReconcilePass::saturated`]) and the watermark still
+/// advances, so the cap bounds one pass rather than wedging the next.
+const RECONCILE_CATCHUP_LIMIT: u32 = 100;
+
+/// The `gh pr list` arguments for one reconciliation query. With no
+/// watermark (a workspace's first pass in this process) this is the #4583
+/// query: the newest [`RECONCILE_PR_LIMIT`] merged PRs. With one (#12152) it
+/// asks for **every** PR merged since `since` (up to
+/// [`RECONCILE_CATCHUP_LIMIT`]), so a window the rate-limit breaker kept the
+/// pass out of is read in full once it clears, whatever the listing's order
+/// and however many PRs merged meanwhile. Pure.
+fn reconcile_query_args(since: Option<DateTime<Utc>>) -> (Vec<String>, u32) {
+    let limit = if since.is_some() {
+        RECONCILE_CATCHUP_LIMIT
+    } else {
+        RECONCILE_PR_LIMIT
+    };
+    let mut args: Vec<String> = [
         "pr",
         "list",
         "--state",
         "merged",
         "--json",
         RECONCILE_PR_FIELDS,
-        "--limit",
-        &limit,
-    ];
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect();
+    if let Some(since) = since {
+        args.push("--search".to_owned());
+        args.push(format!("merged:>={}", since.to_rfc3339_opts(SecondsFormat::Secs, true)));
+    }
+    args.push("--limit".to_owned());
+    args.push(limit.to_string());
+    (args, limit)
+}
+
+/// The bulk reconciliation query (#4583), optionally watermarked (#12152,
+/// see [`reconcile_query_args`]). `None` when the forge did not answer — the
+/// breaker was cooling, `gh` failed, timed out, or printed something that is
+/// not a JSON array — so a caller can tell "nothing merged" from "could not
+/// look" and keep its watermark on the latter. `Some((rows, saturated))`
+/// otherwise; `saturated` is a full page.
+async fn fetch_merged_prs_since(
+    workspace_root: &Path,
+    since: Option<DateTime<Utc>>,
+) -> Option<(Vec<ReconciledMergedPr>, bool)> {
+    if forge_gate::suppressed("pr list (reconcile)", workspace_root) {
+        return None;
+    }
+    let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
+    let (owned_args, limit) = reconcile_query_args(since);
+    let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
     let call = "pr list (reconcile)";
     let op = "safehouse.recent_merged";
-    let Some(output) =
-        run_sink_gh(call, op, &gh_bin, &args, workspace_root, MERGE_CHECK_TIMEOUT).await
-    else {
-        return Vec::new();
-    };
+    let output = run_sink_gh(call, op, &gh_bin, &args, workspace_root, MERGE_CHECK_TIMEOUT).await?;
     if !output.status.success() {
         // The #6596 symptom for the reconciliation pass — a whole workspace's
         // merges silently absent from the feed, with nothing in the log.
         forge_gate::failed("pr list (reconcile)", workspace_root, &gh_bin, &output.stderr);
-        return Vec::new();
+        return None;
     }
     log_gh_recovery_once("pr list (reconcile)", workspace_root);
-    let Ok(rows) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return Vec::new();
-    };
-    let Some(array) = rows.as_array() else {
-        return Vec::new();
-    };
+    let rows = serde_json::from_slice::<Value>(&output.stdout).ok()?;
+    let array = rows.as_array()?;
+    let saturated = u32::try_from(array.len()).is_ok_and(|n| n >= limit);
     let cutoff = Utc::now() - reconcile_max_age();
-    array
+    let rows = array
         .iter()
-        .filter_map(|row| {
-            let head_ref = row.get("headRefName")?.as_str()?;
-            let issue = crate::worktree_ops::naming::issue_from_branch(head_ref)?;
-            let merged_at_str = row
-                .get("mergedAt")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())?;
-            let merged_at = DateTime::parse_from_rfc3339(merged_at_str)
-                .ok()?
-                .with_timezone(&Utc);
-            // Outside the lookback window: never narrated, and now too old to
-            // start (see `DEFAULT_RECONCILE_MAX_AGE_SECS`).
-            if merged_at < cutoff {
-                return None;
-            }
-            let created_at = row
-                .get("createdAt")
-                .and_then(Value::as_str)
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-                // A missing/unparsable `createdAt` degrades to a zero-duration
-                // proxy rather than losing the whole row — the feed cares far
-                // more about the completion existing than about its duration
-                // figure being exact for a merge with no sweep clock anyway.
-                .unwrap_or(merged_at);
-            let number = u32::try_from(row.get("number")?.as_u64()?).ok()?;
-            let url = row.get("url")?.as_str()?.to_owned();
-            if url.is_empty() {
-                return None;
-            }
-            let title = row
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(ToOwned::to_owned);
-            let additions = row.get("additions").and_then(Value::as_u64);
-            let deletions = row.get("deletions").and_then(Value::as_u64);
-            Some(ReconciledMergedPr {
-                issue,
-                merged: MergedPr {
-                    number,
-                    url,
-                    title,
-                    additions,
-                    deletions,
-                },
-                created_at,
-                merged_at,
-            })
-        })
-        .collect()
+        .filter_map(|row| reconciled_row(row, cutoff))
+        .collect();
+    Some((rows, saturated))
+}
+
+/// One merged-PR row (from `gh pr list` or `gh pr view`, same fields:
+/// [`RECONCILE_PR_FIELDS`]) as a completion's inputs. `None` for a PR that
+/// is not merged, is not on an issue branch, merged before `cutoff` (see
+/// `DEFAULT_RECONCILE_MAX_AGE_SECS`), or lacks a field the completion needs.
+/// Pure.
+fn reconciled_row(row: &Value, cutoff: DateTime<Utc>) -> Option<ReconciledMergedPr> {
+    let head_ref = row.get("headRefName")?.as_str()?;
+    let issue = crate::worktree_ops::naming::issue_from_branch(head_ref)?;
+    let merged_at_str = row
+        .get("mergedAt")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())?;
+    let merged_at = DateTime::parse_from_rfc3339(merged_at_str)
+        .ok()?
+        .with_timezone(&Utc);
+    // Outside the lookback window: never narrated, and now too old to
+    // start (see `DEFAULT_RECONCILE_MAX_AGE_SECS`).
+    if merged_at < cutoff {
+        return None;
+    }
+    let created_at = row
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        // A missing/unparsable `createdAt` degrades to a zero-duration
+        // proxy rather than losing the whole row — the feed cares far
+        // more about the completion existing than about its duration
+        // figure being exact for a merge with no sweep clock anyway.
+        .unwrap_or(merged_at);
+    let number = u32::try_from(row.get("number")?.as_u64()?).ok()?;
+    let url = row.get("url")?.as_str()?.to_owned();
+    if url.is_empty() {
+        return None;
+    }
+    let title = row
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(ToOwned::to_owned);
+    let additions = row.get("additions").and_then(Value::as_u64);
+    let deletions = row.get("deletions").and_then(Value::as_u64);
+    Some(ReconciledMergedPr {
+        issue,
+        merged: MergedPr {
+            number,
+            url,
+            title,
+            additions,
+            deletions,
+        },
+        created_at,
+        merged_at,
+    })
+}
+
+// ============================================================================
+// Step completions (#12152) — a Champion merge step's merged PR
+// ============================================================================
+
+/// Whether a step that ended with this ledger classification may have merged
+/// its PR, so the sink should look (#12152). Only a Champion merge step
+/// merges: Builder opens a PR (an open PR is unfinished work, never a
+/// `completion` — `completion_for_exit` holds sweeps to the same rule), and
+/// Judge, Doctor, Curator and promotion move labels. Of the merge step's
+/// outcomes only a `verdict` can be a merge, and its one non-merge verdict,
+/// `rejected`, is ruled out without a forge call; `noop`, `refused` and
+/// `failed` never narrate. A `verdict` with another reason (`closed`, or
+/// `unclassified` when the session's line was missing) is still looked up:
+/// the forge's `mergedAt`, not the reason, decides. Pure.
+#[must_use]
+pub(crate) fn step_narrates_completion(
+    role: crate::step_role::StepRole,
+    class: &str,
+    reason: &str,
+) -> bool {
+    role == crate::step_role::StepRole::ChampionMerge && class == "verdict" && reason != "rejected"
+}
+
+/// `gh pr view <pr> --json` [`RECONCILE_PR_FIELDS`]: the merged PR a merge
+/// step ran on, with the head branch that names its issue. `None` when the
+/// PR is not merged, is not on an issue branch, or the forge did not answer
+/// (the breaker was cooling included): nothing is recorded as narrated then,
+/// so the reconciliation pass still finds the merge.
+async fn fetch_merged_pr_by_number(workspace_root: &Path, pr: u32) -> Option<ReconciledMergedPr> {
+    let call = "pr view (step)";
+    if forge_gate::suppressed(call, workspace_root) {
+        return None;
+    }
+    let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
+    let number = pr.to_string();
+    let args = ["pr", "view", &number, "--json", RECONCILE_PR_FIELDS];
+    let output = run_sink_gh(
+        call,
+        "safehouse.step_merged_pr",
+        &gh_bin,
+        &args,
+        workspace_root,
+        MERGE_CHECK_TIMEOUT,
+    )
+    .await?;
+    if !output.status.success() {
+        forge_gate::failed(call, workspace_root, &gh_bin, &output.stderr);
+        return None;
+    }
+    log_gh_recovery_once(call, workspace_root);
+    let row: Value = serde_json::from_slice(&output.stdout).ok()?;
+    reconciled_row(&row, Utc::now() - reconcile_max_age())
+}
+
+/// The step emit point (#12152): a Champion merge step on `pr` ended with a
+/// verdict ([`step_narrates_completion`]), so verify the merge on the forge
+/// and narrate its `completion` through [`build_and_narrate_completion`] —
+/// the same dedup set (and peer dedup) as the `SweepExited` path and the
+/// reconciliation pass, so whichever finds the merge first narrates it and
+/// the others are no-ops.
+///
+/// Timing is the forge's `createdAt` → `mergedAt`, the reconciliation pass's
+/// own clock, so the two paths build the same envelope for one merge. (A
+/// merge step's session clock is the minutes Champion spent merging, not
+/// the work's duration.)
+#[allow(clippy::too_many_arguments)]
+async fn completion_for_merged_step(
+    persona: &str,
+    workspace_root: &str,
+    pr: u32,
+    slug_cache: &mut HashMap<String, RepoIdentity>,
+    already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
+    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+    peer_completions: Option<&PeerCompletionHandle>,
+) -> Option<Envelope> {
+    let row = fetch_merged_pr_by_number(Path::new(workspace_root), pr).await?;
+    let duration_sec = (row.merged_at - row.created_at).num_seconds().max(0);
+    build_and_narrate_completion(
+        persona,
+        workspace_root,
+        row.issue,
+        row.merged,
+        duration_sec,
+        row.merged_at,
+        slug_cache,
+        already_narrated,
+        activity_db,
+        peer_completions,
+    )
+    .await
 }
 
 /// The periodic reconciliation pass itself (issue #4583): bulk-lists recently
@@ -2518,6 +2673,8 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
 /// the daemon itself was down, **provided** the dedup set survives the
 /// restart; see [`load_persisted_completed`] / [`persist_completed_best_effort`]
 /// for that half of the story (the in-memory set alone does not survive one).
+// The unwatermarked form; production goes through the watermarked one (#12152).
+#[cfg_attr(not(test), allow(dead_code))]
 async fn reconcile_recent_merges(
     persona: &str,
     workspace_root: &str,
@@ -2526,36 +2683,18 @@ async fn reconcile_recent_merges(
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
 ) -> Vec<Envelope> {
-    let rows = fetch_recent_merged_prs(Path::new(workspace_root)).await;
-    // #6619: answers "did reconciliation run for repo X, and did it see
-    // anything" from the log alone — independent of whether any row was new
-    // enough to actually narrate below (that's a separate, per-row dedup
-    // decision `build_and_narrate_completion` makes).
-    log::debug!(
-        "safehouse: reconcile visited {workspace_root}, {} rows within lookback window",
-        rows.len()
-    );
-    let mut out = Vec::new();
-    for row in rows {
-        let duration_sec = (row.merged_at - row.created_at).num_seconds().max(0);
-        if let Some(envelope) = build_and_narrate_completion(
-            persona,
-            workspace_root,
-            row.issue,
-            row.merged,
-            duration_sec,
-            row.merged_at,
-            slug_cache,
-            already_narrated,
-            activity_db,
-            peer_completions,
-        )
-        .await
-        {
-            out.push(envelope);
-        }
-    }
-    out
+    reconcile_merges_since(
+        persona,
+        workspace_root,
+        None,
+        slug_cache,
+        already_narrated,
+        activity_db,
+        peer_completions,
+    )
+    .await
+    .map(|pass| pass.envelopes)
+    .unwrap_or_default()
 }
 
 /// Reconciliation-pass cadence (issue #4583). Test/operator override mirrors
@@ -3113,19 +3252,12 @@ async fn run_sink(
     // `reconciliation_targets`) so a registered-but-quiet workspace is still
     // scanned right after a restart, before any new event repopulates this set.
     let mut known_workspaces: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Workspaces that have already had their one-time seed-only reconciliation
-    // pass (#4649, only consulted when `dedup_state_was_fresh`) — each
-    // workspace's *first* reconciliation tick on a fresh host seeds
-    // `completed` without narrating, so a backlog of in-window merges never
-    // bursts onto the feed at once; every later tick for that workspace (or
-    // any tick at all when the dedup file was not fresh) narrates normally.
-    let mut seeded_fresh_workspaces: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    // Round-robins one workspace per reconciliation tick (see
-    // `reconciliation_targets`) rather than sweeping every known workspace in
-    // one tick, so one slow/offline `gh` cannot delay every other workspace's
-    // narration behind it.
-    let mut reconcile_cursor: usize = 0;
+    // The reconciliation tick's cross-tick state: the round-robin cursor,
+    // the #4649 seed-only bookkeeping (each workspace's *first* tick on a
+    // fresh host seeds `completed` without narrating, so a backlog of
+    // in-window merges never bursts onto the feed at once), and the #12152
+    // per-workspace watermarks that let a pass the breaker deferred catch up.
+    let mut reconcile = ReconcileState::new(dedup_state_was_fresh);
     let mut reconcile_timer = tokio::time::interval(reconcile_interval());
     reconcile_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // First tick fires immediately; skip it here so a freshly-started sink
@@ -3232,6 +3364,51 @@ async fn run_sink(
                     {
                         outbox.push(completion);
                         persist_completed_best_effort(completions_path.as_deref(), &completed);
+                        crate::observability::ops::feed::record_completions(
+                            crate::observability::ops::feed::Trigger::SweepExit,
+                            false,
+                            1,
+                        );
+                    }
+                }
+
+                // Step completion (#12152): a step is not an issue sweep and
+                // never emits `SweepExited`, so a Champion merge step's end is
+                // this path's trigger. Same dedup set as the two paths around
+                // it; a noop/refused/failed step never reaches the forge.
+                if let Event::StepEnded {
+                    item,
+                    role,
+                    class,
+                    reason,
+                    repo: Some(workspace_root),
+                    ..
+                } = &event
+                {
+                    if step_narrates_completion(*role, class, reason) {
+                        if let Some(completion) = completion_for_merged_step(
+                            &config.persona,
+                            workspace_root,
+                            *item,
+                            &mut slug_cache,
+                            &mut completed,
+                            activity_db.as_ref(),
+                            peer_completions.as_ref(),
+                        )
+                        .await
+                        {
+                            log::info!(
+                                "safehouse: narrating the completion of merged PR #{item} \
+                                 from its {role} step (#12152)"
+                            );
+                            outbox.push(completion);
+                            persist_completed_best_effort(completions_path.as_deref(), &completed);
+                            crate::observability::ops::feed::record_completions(
+                                crate::observability::ops::feed::Trigger::Step,
+                                false,
+                                1,
+                            );
+                        }
                     }
                 }
 
@@ -3239,52 +3416,25 @@ async fn run_sink(
             }
 
             _ = reconcile_timer.tick() => {
-                // Merge-reconciliation pass (#4583): covers a champion-tick
-                // merge, which has no live sweep — and so no `SweepExited` —
-                // to trigger the path above. One workspace per tick (see
-                // `reconcile_cursor`'s doc comment).
+                // Merge-reconciliation pass (#4583): covers a merge no live
+                // trigger saw (a champion-tick merge, or one the step path
+                // could not verify while the breaker cooled). One workspace
+                // per tick; a tick the breaker defers is not spent (#12152).
                 let targets = reconciliation_targets(&known_workspaces);
-                // #8997: while the rate-limit breaker cools, skip the tick
-                // without advancing the cursor or spending a seed-only slot.
-                if let Some(workspace_root) = (!targets.is_empty())
-                    .then(|| targets[reconcile_cursor % targets.len()].clone())
-                    .filter(|root| !forge_gate::suppressed("pr list (reconcile)", Path::new(root)))
-                {
-                    reconcile_cursor = reconcile_cursor.wrapping_add(1);
-                    // Seed-only first pass (#4649): this workspace's very
-                    // first reconciliation tick on a host with no reliable
-                    // persisted dedup state seeds `completed` (and persists
-                    // it) but drops the resulting envelopes instead of
-                    // narrating them — otherwise every in-window merge (up
-                    // to `RECONCILE_PR_LIMIT`) would burst onto the feed at
-                    // once. `insert` returns `false` on a repeat visit, so
-                    // this only ever suppresses one tick per workspace.
-                    let seed_only = dedup_state_was_fresh
-                        && seeded_fresh_workspaces.insert(workspace_root.clone());
-                    let new_completions = reconcile_recent_merges(
+                let tick = reconcile
+                    .tick(
+                        &targets,
                         &config.persona,
-                        &workspace_root,
                         &mut slug_cache,
                         &mut completed,
                         activity_db.as_ref(),
                         peer_completions.as_ref(),
+                        completions_path.as_deref(),
                     )
                     .await;
-                    if !new_completions.is_empty() {
-                        persist_completed_best_effort(completions_path.as_deref(), &completed);
-                    }
-                    if seed_only {
-                        if !new_completions.is_empty() {
-                            log::info!(
-                                "safehouse: seeded {} completion(s) for {workspace_root} from a \
-                                 fresh dedup file without narrating them (issue #4649)",
-                                new_completions.len()
-                            );
-                        }
-                    } else {
-                        outbox.extend(new_completions);
-                        narrated_repo = Some(workspace_root);
-                    }
+                outbox.extend(tick.envelopes);
+                if tick.workspace_root.is_some() {
+                    narrated_repo = tick.workspace_root;
                 }
             }
 
@@ -3894,3 +4044,7 @@ mod heartbeat_tests;
 // Issue #8997: rate-limit breaker gating of the sink's forge lookups.
 #[cfg(test)]
 mod rate_limit_tests;
+
+// Issue #12152: step completions and the watermarked reconciliation backstop.
+#[cfg(test)]
+mod step_completion_tests;

@@ -31,6 +31,7 @@ fn row(number: u32, disposition: QueueDisposition) -> TickQueueRow {
         updated_at: None,
         held_until: None,
         story_points: None,
+        step: None,
     }
 }
 
@@ -259,6 +260,6 @@ fn the_result_is_exported_only_through_a_configured_sink() {
     let summary = crate::work_finder::tick_summary(&report, 4, at(), &[], None);
     crate::observability::ops::capture::without_global_sink(|| {
         assert!(!exporting());
-        emit_work_finder(&summary, at(), at(), (None, &[]), &[], "dispatched");
+        emit_work_finder(&summary, at(), at(), (None, &[], None), &[], "dispatched");
     });
 }

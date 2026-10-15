@@ -415,6 +415,14 @@ async fn collect(window: Duration) -> HealthReport {
     //     this always collects rather than pre-filtering.
     let tmpfs_visibility_status = Some(loom_daemon::tmpfs_visibility::collect());
 
+    // 13. Each managed root's `.loom/resync-ignore` pins (#11970) — local
+    //     file reads, from the roots the daemon reported.
+    let resync_pins = status
+        .iter()
+        .flat_map(|r| r.per_repo.iter())
+        .map(|r| (r.root.display().to_string(), loom_daemon::resync_pin::read_pins(&r.root)))
+        .collect();
+
     health::assess(&HealthInputs {
         at: chrono::Utc::now(),
         window,
@@ -445,6 +453,7 @@ async fn collect(window: Duration) -> HealthReport {
         ci_telemetry: Some(loom_daemon::ci_telemetry::collect_health(&transcript_ingest_repo_root)),
         // 12. The last fleet-sync snapshot (#11740) — local file read.
         fleet_sync: loom_daemon::fleet_sync::probe_status(),
+        resync_pins,
     })
 }
 

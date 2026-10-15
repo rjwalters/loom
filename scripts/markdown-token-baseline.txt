@@ -8,7 +8,7 @@
 #
 # This is a debt ledger, not a target. The numbers should only ever go DOWN.
 # A diff that raises a number needs a clear reason in the PR description —
-# see .loom/docs/file-size-policy.md.
+# see .loom/docs/prompt-budget-policy.md.
 #
 # <token-estimate> <path>
 4328 defaults/.claude/commands/loom/architect-patterns.md
@@ -45,10 +45,11 @@
 32418 defaults/.claude/commands/loom/guide.md
 1906 defaults/.claude/commands/loom/help.md
 9898 defaults/.claude/commands/loom/hermit-patterns.md
-5823 defaults/.claude/commands/loom/hermit.md
+5871 defaults/.claude/commands/loom/hermit.md
 4072 defaults/.claude/commands/loom/imagine.md
+1487 defaults/.claude/commands/loom/judge-ci-red.md
 2162 defaults/.claude/commands/loom/judge-reference.md
-39873 defaults/.claude/commands/loom/judge.md
+39694 defaults/.claude/commands/loom/judge.md
 316 defaults/.claude/commands/loom/loom-iteration.md
 254 defaults/.claude/commands/loom/loom-parent.md
 9432 defaults/.claude/commands/loom/loom.md

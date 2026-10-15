@@ -541,11 +541,14 @@ fn much_later() -> DateTime<Utc> {
 /// last full install: none of them is in `installed_files`.
 fn commit_unlisted_surfaces(fx: &Fixture) {
     for path in [
-        ".agents/skills/loom-new/SKILL.md",
-        ".loom/scripts/tests/test-new.sh",
-        ".loom/docs/new.md",
+        ".agents/skills/loom-builder/SKILL.md",
+        ".loom/scripts/tests/check-ci-suite-manifest.sh",
+        ".loom/docs/blame-issue.md",
     ] {
-        write(&fx.host.join(path), "resynced locally\n");
+        write(
+            &fx.host.join(path),
+            &format!("{}\nresynced locally\n", crate::agent_skills::MARKER),
+        );
     }
     git(&fx.host, &["add", "-A"]);
     git(
@@ -576,7 +579,10 @@ fn a_stranded_resync_commit_on_surfaces_installed_files_misses_is_repaired() {
 #[test]
 fn a_surface_path_pinned_in_resync_ignore_is_not_touched() {
     let fx = loom_fixture();
-    fx.push(".loom/resync-ignore", "# deliberate\nscripts/tests/test-new.sh\n");
+    fx.push(
+        ".loom/resync-ignore",
+        "# deliberate\nscripts/tests/check-ci-suite-manifest.sh\n",
+    );
     git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
     commit_unlisted_surfaces(&fx);
     fx.push("README.md", "two\n");
@@ -679,5 +685,68 @@ fn a_checkout_on_another_branch_is_not_this_repair() {
     git(&fx.host, &["checkout", "--quiet", "-b", "pr6597"]);
     fx.push("README.md", "two\n");
     git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+/// Commit `files` on the host's branch, ahead of an origin that has moved on.
+fn commit_files_behind_origin(fx: &Fixture, files: &[(&str, &str)]) -> String {
+    for (path, body) in files {
+        write(&fx.host.join(path), body);
+    }
+    git(&fx.host, &["add", "-A"]);
+    git(&fx.host, &["commit", "--quiet", "-m", "local"]);
+    let local = fx.head();
+    fx.push("README.md", "two\n");
+    local
+}
+
+#[test]
+fn a_repo_local_file_in_a_managed_directory_is_not_loom_owned() {
+    for path in [
+        ".loom/roles/custom-role.md",
+        ".loom/scripts/my-local-helper.sh",
+        ".claude/commands/loom/mine.md",
+    ] {
+        let fx = loom_fixture();
+        commit_files_behind_origin(&fx, &[(path, "mine\n")]);
+        assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged, "{path}");
+    }
+}
+
+#[test]
+fn a_skill_without_the_generation_marker_is_not_loom_owned() {
+    let fx = loom_fixture();
+    // A shipped name, but detached from generation: the resync skips it.
+    commit_files_behind_origin(
+        &fx,
+        &[(".agents/skills/loom-builder/SKILL.md", "consumer's own\n")],
+    );
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+#[test]
+fn a_skill_pinned_in_the_agents_skills_form_is_not_touched() {
+    let fx = loom_fixture();
+    fx.push(".loom/resync-ignore", "agents-skills/loom-builder/SKILL.md\n");
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    let marked = format!("{}\nlocal\n", crate::agent_skills::MARKER);
+    commit_files_behind_origin(&fx, &[(".agents/skills/loom-builder/SKILL.md", &marked)]);
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+#[test]
+fn another_named_branch_with_loom_only_commits_is_not_reset() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "loom/my-work"]);
+    commit_files_behind_origin(&fx, &[(".loom/scripts/tests/check-ci-suite-manifest.sh", "x\n")]);
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_detached_head_pinned_to_keep_is_not_put_back() {
+    let fx = loom_fixture();
+    detached_behind(&fx);
+    git(&fx.host, &["config", "--local", "loom.checkoutFf.detached", "keep"]);
     assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
 }

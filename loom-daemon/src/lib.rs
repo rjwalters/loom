@@ -250,6 +250,7 @@ pub mod guards_status;
 pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;
+pub mod hooks_home;
 pub mod host_affinity;
 pub mod host_breaker;
 pub mod host_identity;
@@ -376,6 +377,7 @@ pub mod signoz_read;
 pub mod stale_blocked;
 pub(crate) mod stale_token_retry;
 pub mod startup_adoption;
+pub mod startup_jitter;
 pub mod stash_issue_state;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/

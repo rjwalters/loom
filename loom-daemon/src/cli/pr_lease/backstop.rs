@@ -38,11 +38,9 @@ impl Gh {
         Some((open, head, labels))
     }
 
-    /// Whether `sha` has CI still in progress that is young enough to
-    /// exempt this pass ([`ci_pending`]). Unreadable counts as not pending:
-    /// the backstop stays a best-effort bound.
-    pub(crate) fn checks_pending(&self, sha: &str) -> bool {
-        ci_pending(sha, Utc::now(), |op, path| {
+    /// `sha`'s CI as the backstop sees it ([`ci_state`]).
+    pub(crate) fn ci_state(&self, sha: &str) -> CiState {
+        ci_state(sha, Utc::now(), |op, path| {
             let out = self
                 .inv(op, AccessIntent::Read, ops::CI_CHECK_RUNS_FOR_SHA)
                 .args(["api", path])
@@ -52,20 +50,52 @@ impl Gh {
     }
 }
 
-/// Whether `sha`'s CI is still pending young enough to exempt a pass
-/// ([`backstop::pending_exempts`]), read through `get(op, path)`: every page
-/// of its check runs, up to [`backstop::MAX_CHECK_RUN_PAGES`], then its
-/// legacy commit statuses (#11903). Stops at the first read that exempts,
-/// so the usual cost is one call; an unreadable read counts as not pending.
-pub(crate) fn ci_pending(
+/// A head's CI as the release reads it (#11972).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CiState {
+    /// Something still pending started inside the exemption window
+    /// ([`backstop::pending_exempts`]).
+    Young,
+    /// Something is still pending, but every pending run or status is past
+    /// the window or has no start stamp: CI that is stuck, not settling.
+    Stuck,
+    /// Nothing pending was read: CI concluded (or could not be read).
+    Settled,
+}
+
+impl CiState {
+    /// Whether a Judge pass that ended without a verdict at this CI is
+    /// exempt from the no-verdict record. By default only young pending CI
+    /// exempts. A pass that said it stood down for pending CI
+    /// (`--skip-reason ci-pending`) is also exempt once CI has settled since
+    /// (the race #11972 fixes), but never on stuck CI: `forge wait-checks`
+    /// has no age cap, so stuck CI would exempt every pass, and the PR
+    /// planner serves exactly those PRs (#12003); recording them keeps the
+    /// loop bounded.
+    #[must_use]
+    pub(crate) fn exempts(self, skipped_for_pending_ci: bool) -> bool {
+        match self {
+            Self::Young => true,
+            Self::Settled => skipped_for_pending_ci,
+            Self::Stuck => false,
+        }
+    }
+}
+
+/// `sha`'s [`CiState`], read through `get(op, path)`: every page of its check
+/// runs, up to [`backstop::MAX_CHECK_RUN_PAGES`], then its legacy commit
+/// statuses (#11903). Stops at the first read that is [`CiState::Young`], so
+/// the usual cost is one call; an unreadable read contributes nothing.
+pub(crate) fn ci_state(
     sha: &str,
     now: DateTime<Utc>,
     mut get: impl FnMut(&'static str, &str) -> Option<serde_json::Value>,
-) -> bool {
+) -> CiState {
     let base = format!(
         "repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page={}",
         backstop::CI_PAGE
     );
+    let mut stuck = false;
     let mut read = 0;
     for page in 1..=backstop::MAX_CHECK_RUN_PAGES {
         let path = if page == 1 {
@@ -76,9 +106,11 @@ pub(crate) fn ci_pending(
         let Some(v) = get("pr_lease.checks_pending", &path) else {
             break;
         };
-        if backstop::pending_exempts(&backstop::pending_check_runs(&v), now) {
-            return true;
+        let pending = backstop::pending_check_runs(&v);
+        if backstop::pending_exempts(&pending, now) {
+            return CiState::Young;
         }
+        stuck |= !pending.is_empty();
         read += backstop::check_runs_listed(&v);
         if !backstop::more_check_runs(&v, read) {
             break;
@@ -86,27 +118,48 @@ pub(crate) fn ci_pending(
     }
     let status =
         format!("repos/{{owner}}/{{repo}}/commits/{sha}/status?per_page={}", backstop::CI_PAGE);
-    get("pr_lease.commit_status", &status)
-        .is_some_and(|v| backstop::pending_exempts(&backstop::pending_statuses(&v), now))
+    if let Some(v) = get("pr_lease.commit_status", &status) {
+        let pending = backstop::pending_statuses(&v);
+        if backstop::pending_exempts(&pending, now) {
+            return CiState::Young;
+        }
+        stuck |= !pending.is_empty();
+    }
+    if stuck {
+        CiState::Stuck
+    } else {
+        CiState::Settled
+    }
+}
+
+/// Whether `sha`'s CI is still pending young enough to exempt a pass: its
+/// [`ci_state`] is [`CiState::Young`].
+#[cfg(test)]
+pub(crate) fn ci_pending(
+    sha: &str,
+    now: DateTime<Utc>,
+    get: impl FnMut(&'static str, &str) -> Option<serde_json::Value>,
+) -> bool {
+    ci_state(sha, now, get) == CiState::Young
 }
 
 /// The fields a Judge release appends to its marker: the no-verdict record
 /// when the PR is still waiting for review with no verdict, else nothing (a
 /// verdict landed, the PR closed, or its state could not be read). A pass that
-/// deferred because the head's checks are still running (`checks_pending`,
-/// asked only once a record is otherwise due) is not a blocked pass: CI
-/// settling changes neither the head nor the labels, so a record would hold
-/// the PR from Judge long after CI went green.
+/// deferred because the head's checks are still running (`ci_exempts`, asked
+/// only once a record is otherwise due; [`CiState::exempts`]) is not a
+/// blocked pass: CI settling changes neither the head nor the labels, so a
+/// record would hold the PR from Judge long after CI went green.
 pub(crate) fn release_fields(
     role: Role,
     state: Option<(bool, String, Vec<String>)>,
-    checks_pending: impl FnOnce(&str) -> bool,
+    ci_exempts: impl FnOnce(&str) -> bool,
 ) -> String {
     match state {
         Some((open, head, labels))
             if role == Role::Judge
                 && backstop::ended_without_verdict(open, &labels)
-                && !checks_pending(&head) =>
+                && !ci_exempts(&head) =>
         {
             backstop::released_fields(&head, &labels)
         }
@@ -307,6 +360,44 @@ mod tests {
         // A short page ends the paging even when total_count says more.
         let (_, asked) = read_ci(&[runs(500, 40, None)], None, now);
         assert_eq!(asked.len(), 2);
+    }
+
+    /// #11972: stuck CI (pending, but all of it past the window or
+    /// unstamped) is told apart from settled CI, and only a `ci-pending`
+    /// skip is exempted by settled CI.
+    #[test]
+    fn ci_state_tells_stuck_from_settled() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 14, 6, 0, 0).unwrap();
+        let one =
+            |run: serde_json::Value| serde_json::json!({"total_count": 1, "check_runs": [run]});
+        let state = |page: serde_json::Value, combined: Option<serde_json::Value>| {
+            ci_state(HEAD, now, |_, path| {
+                if path.contains("/status?") {
+                    combined.clone()
+                } else {
+                    Some(page.clone())
+                }
+            })
+        };
+        let queued = one(serde_json::json!({"status": "queued", "started_at": null}));
+        assert_eq!(state(queued, None), CiState::Stuck);
+        let stale =
+            one(serde_json::json!({"status": "in_progress", "started_at": "2026-10-13T20:00:00Z"}));
+        assert_eq!(state(stale, None), CiState::Stuck);
+        let young =
+            one(serde_json::json!({"status": "in_progress", "started_at": "2026-10-14T05:30:00Z"}));
+        assert_eq!(state(young, None), CiState::Young);
+        assert_eq!(state(runs(1, 1, None), None), CiState::Settled);
+        // A stale pending legacy status is stuck too.
+        let stale_status = status(serde_json::json!([
+            {"state": "pending", "context": "b", "created_at": "2026-10-13T20:00:00Z"},
+        ]));
+        assert_eq!(state(runs(1, 1, None), Some(stale_status)), CiState::Stuck);
+        for skipped in [false, true] {
+            assert!(CiState::Young.exempts(skipped));
+            assert!(!CiState::Stuck.exempts(skipped));
+            assert_eq!(CiState::Settled.exempts(skipped), skipped);
+        }
     }
 
     #[test]

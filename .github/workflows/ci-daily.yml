@@ -6,7 +6,7 @@
 # time in five deliberate ways. Each is correct for a merge gate; none should
 # be the only verification the repo ever gets:
 #
-#   1. nextest is PARTITIONED three ways, so a cross-test interaction between
+#   1. nextest is PARTITIONED five ways, so a cross-test interaction between
 #      tests in different legs can no longer occur -- and therefore can no
 #      longer be observed.
 #   2. The shell suites are SHARDED two ways and run 4-wide inside each shard,
@@ -67,7 +67,7 @@ jobs:
     name: Full Suite (clean, unpartitioned)
     runs-on: ubuntu-latest
     # Generous on purpose: no cache, full debuginfo, every test in one process
-    # per test, plus fifteen Docker-backed --ignored suites.
+    # per test, plus sixteen Docker-backed --ignored suites.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -100,7 +100,7 @@ jobs:
       - name: nextest, whole workspace, UNPARTITIONED
         if: ${{ !cancelled() }}
         # The one place the full cross-test interaction surface exists. Under
-        # ci.yml's `--partition count:k/3` two tests that collide can never
+        # ci.yml's `--partition count:k/N` two tests that collide can never
         # land in the same process tree, so the collision is unobservable.
         # Since #10700 the OTLP exporter is compiled unconditionally, so this
         # run already covers what a separate `--features otlp` run did.
@@ -169,6 +169,10 @@ jobs:
         if: ${{ !cancelled() }}
         # #10973: replay of the host-disk and work-finder-stale alert rules.
         run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
+      - name: "Ignored: SigNoz step-dispatch alert rules against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #11909: replay of the step-dispatch-stalled and step-slots-idle rules.
+        run: cargo test --package loom-daemon --features otlp --test signoz_step_alerts -- --ignored --nocapture
       - name: "Ignored: SigNoz host-export queries and silent-host alert against a real pinned ClickHouse"
         if: ${{ !cancelled() }}
         # #11198: host-export-queries.sql queries 1-3 and the host-export-silent

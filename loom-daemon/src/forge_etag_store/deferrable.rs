@@ -14,13 +14,20 @@
 //!    the site's class, so the router's headroom reserve applies;
 //! 2. a rate-limited or refused reader is withdrawn and the router is asked
 //!    again, so the next eligible reader serves the read;
-//! 3. when the readers are out of **budget** ([`ExhaustCause::Budget`], or
-//!    the last reader tried answered with a rate limit) the read is **shed**:
-//!    no request, an `o=shed` accounting row, and the error [`ReadShed`];
-//! 4. only when there is no reader pool at all, or the readers are out for a
-//!    reason that is not budget (a coverage miss, a stale or refused token),
-//!    does the writer serve it. Shedding there would stop the caller's
-//!    housekeeping for as long as the condition lasts.
+//! 3. when no reader is left the read is **shed** for the causes its class
+//!    waits out ([`ReadClass::sheds`]): no request, an `o=shed` accounting
+//!    row, and the error [`ReadShed`]. A Hygiene read waits out budget
+//!    ([`ExhaustCause::Budget`], or a last reader that answered with a rate
+//!    limit) and withdrawals ([`ExhaustCause::Withdrawn`]); an
+//!    Observability read waits out every cause;
+//! 4. only when there is no reader pool at all, or (Hygiene) the readers are
+//!    out for a reason that may never clear (a coverage miss, a stale token
+//!    directory), does the writer serve it. Shedding there would stop the
+//!    caller's housekeeping for as long as the condition lasts.
+//!
+//! A starved repo's escalated work-finder tick
+//! ([`crate::gh_invocation::read_deadline::allow_writer`], #12074) lifts the
+//! shed: its reads go to the writer, once every few ticks at most.
 //!
 //! `LOOM_READ_SHED=0` ([`crate::gh_invocation::READ_SHED_ENV`]) turns this
 //! off: every conditional read is routed as `Gate` again.
@@ -33,9 +40,18 @@ use anyhow::Result;
 use super::{reader_failure, run_fetch_with, ConditionalRead, FetchResult, Target};
 use crate::forge_bucket_book::Resource;
 use crate::forge_identity::{
-    served, ExhaustCause, Failure, IdentityRole, RouteDecision, RouteRequest,
+    served, ExhaustCause, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest,
 };
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+
+/// Whether a read of `class` with no reader left for `cause` is shed
+/// ([`ReadClass::sheds`]). A starved repo's escalated tick (#12074) lifts
+/// the shed, except for an Observability read, which never reaches the
+/// writer while a reader pool exists (2026-10-15).
+fn sheds(class: ReadClass, cause: ExhaustCause) -> bool {
+    class.sheds(cause)
+        && (class == ReadClass::Observability || !crate::gh_invocation::read_deadline::escalated())
+}
 
 /// A deferrable conditional read that was not sent: every reader that can
 /// serve the repo is out of budget until about `until`. The caller skips its
@@ -120,19 +136,29 @@ pub(super) fn fetch(
                 (dir, app_id)
             }
             // The router offered a reader this read already failed on: no
-            // reader is left. Budget only if what it failed on was a rate
-            // limit.
+            // reader is left, for the cause of what it failed on.
             RouteDecision::Reader { app_id, .. } => {
-                if matches!(last_failure, Some(Failure::RateLimited { .. })) {
+                let cause = match last_failure {
+                    Some(Failure::RateLimited { .. }) => ExhaustCause::Budget,
+                    Some(Failure::Credential) => ExhaustCause::Withdrawn,
+                    _ => ExhaustCause::Unavailable,
+                };
+                if sheds(site.class, cause) {
                     let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
                     return Err(shed(site, gh_bin, target, repo, until, Some(&app_id)));
                 }
                 return on_writer(IdentityRole::WriterFallback);
             }
-            RouteDecision::Exhausted {
-                until,
-                cause: ExhaustCause::Budget,
-            } => {
+            RouteDecision::Exhausted { until, cause } if sheds(site.class, cause) => {
+                let app = tried.last().map(String::as_str);
+                return Err(shed(site, gh_bin, target, repo, until, app));
+            }
+            // The pool went away after a reader (the gateway) was tried: a
+            // withdrawal, not "no pool".
+            RouteDecision::NoPool
+                if !tried.is_empty() && sheds(site.class, ExhaustCause::Withdrawn) =>
+            {
+                let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
                 let app = tried.last().map(String::as_str);
                 return Err(shed(site, gh_bin, target, repo, until, app));
             }

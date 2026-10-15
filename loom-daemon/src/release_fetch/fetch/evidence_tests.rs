@@ -475,7 +475,8 @@ fn journal_appends_round_trips_rotates_and_skips_non_loom_checkouts() {
     assert_eq!(evidence::read_all(&path).len(), 1);
 
     // Env override wins.
-    let custom = tempdir().join("nested/evidence.jsonl");
+    let custom_root = tempdir();
+    let custom = custom_root.join("nested/evidence.jsonl");
     std::env::set_var(EVIDENCE_JOURNAL_PATH_ENV, &custom);
     assert_eq!(evidence::record(&bare, &sample("v4")), Some(custom.clone()));
     std::env::remove_var(EVIDENCE_JOURNAL_PATH_ENV);

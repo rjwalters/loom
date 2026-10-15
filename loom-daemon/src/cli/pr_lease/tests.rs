@@ -650,7 +650,7 @@ fn release_rewrites_the_marker_so_the_claim_frees_at_once() {
     fake_gh(dir.path());
     let a = who(Role::Doctor, "sweep-a");
     fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
-    assert_eq!(ctx(dir.path(), a.clone()).release(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), a.clone()).release(None), EXIT_HELD);
     let patched = fs::read_to_string(dir.path().join("patched")).unwrap();
     assert!(patched.contains("repos/acme/widgets/issues/comments/100"), "{patched}");
     assert!(patched.contains(&a.released_marker()), "{patched}");
@@ -750,7 +750,7 @@ fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() 
     let mut c = ctx(dir.path(), on("host-a", "run-1"));
     c.lease_file = Some(lease_file.clone());
     assert_eq!(c.claim(), EXIT_HELD);
-    assert_eq!(c.release(), EXIT_HELD);
+    assert_eq!(c.release(None), EXIT_HELD);
     assert_eq!(fs::read_to_string(&lease_file).unwrap(), "", "nothing left to reap");
     // A reap after a verdict landed frees the lease and records nothing.
     let dir = TempDir::new().unwrap();
@@ -870,7 +870,7 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         (
             "judge.md",
             include_str!("../../../../defaults/.claude/commands/loom/judge.md"),
-            8,
+            7, // the BEHIND push and its fence are gone (#12063 D6)
         ),
         (
             "loom-doctor/SKILL.md",
@@ -880,7 +880,7 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         (
             "loom-judge/SKILL.md",
             include_str!("../../../../defaults/.agents/skills/loom-judge/SKILL.md"),
-            8,
+            7, // the BEHIND push and its fence are gone (#12063 D6)
         ),
     ];
     for (name, text, gates) in prompts {
@@ -1001,6 +1001,11 @@ fn the_lib_role_lease_reader_agrees_with_parse_record() {
 
 #[path = "step_claim_tests.rs"]
 mod step_claim;
+
+// ---- the pass's own skip reason on release (#11972) ---------------------
+
+#[path = "release_skip_tests.rs"]
+mod release_skip;
 /// #11950 review: a Champion that claimed with `--step champion_promote`
 /// fences and releases its own lease with plain `--role champion` (default
 /// step `champion_merge`) from the same host and sweep.
@@ -1020,7 +1025,7 @@ fn a_step_less_fence_and_release_find_the_sessions_stepped_lease() {
     assert_eq!(plain.step, Some(StepRole::ChampionMerge), "the default step differs");
     assert_eq!(ctx(dir.path(), plain.clone()).fence(), EXIT_HELD, "own lease, not a peer's");
     assert_eq!(ctx(dir.path(), plain.clone()).check(), EXIT_HELD);
-    assert_eq!(ctx(dir.path(), plain).release(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), plain).release(None), EXIT_HELD);
     // The released marker keeps the lease's own step.
     assert!(
         patched(dir.path()).contains(&claimed.released_marker()),
@@ -1057,7 +1062,7 @@ fn an_issue_scoped_release_reads_no_pr_head() {
     fake_gh(dir.path());
     let curator = Identity::new(Role::Curator, "host-a".into(), "run-1".into(), None).unwrap();
     fs::write(dir.path().join("rows"), live_row(100, &curator)).unwrap();
-    assert_eq!(ctx(dir.path(), curator.clone()).release(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), curator.clone()).release(None), EXIT_HELD);
     assert!(patched(dir.path()).contains(&curator.released_marker()));
     assert!(!dir.path().join("pulled").exists(), "no PR read for a Curator lease");
 }

@@ -64,7 +64,7 @@ fn a_noop_cools_locally_and_is_broadcast_per_item_step() {
     let dir = tempdir().unwrap();
     let (mut reg, mut rx) = registry(dir.path());
     let rec = reg.record_step_outcome(
-        &run(9, StepRole::Judge, OutcomeClass::Noop, "ci_pending", 600),
+        &run(9, StepRole::Judge, OutcomeClass::Noop, "no_changes_needed", 600),
         &mut FakeForge::default(),
     );
     assert!(rec.cooling_until.is_some());
@@ -75,6 +75,22 @@ fn a_noop_cools_locally_and_is_broadcast_per_item_step() {
     assert_eq!(ads.len(), 1);
     assert_eq!((ads[0].0, ads[0].1), (9, Some(StepRole::Judge)));
     assert!((3590..=3600).contains(&ads[0].2), "{ads:?}");
+}
+
+/// #12042: a `ci_pending` no-op waited on CI, not on the item, so it cools
+/// for the short refusal window (10 min), and peers get that window too.
+#[test]
+fn a_ci_pending_noop_is_broadcast_with_the_short_window() {
+    let dir = tempdir().unwrap();
+    let (mut reg, mut rx) = registry(dir.path());
+    reg.record_step_outcome(
+        &run(9, StepRole::Judge, OutcomeClass::Noop, "ci_pending", 600),
+        &mut FakeForge::default(),
+    );
+    let ads = step_ads(&drain(&mut rx));
+    assert_eq!(ads.len(), 1);
+    assert_eq!((ads[0].0, ads[0].1), (9, Some(StepRole::Judge)));
+    assert!((590..=600).contains(&ads[0].2), "{ads:?}");
 }
 
 /// The refusal cooldown is in the draw's query as soon as the step is
@@ -91,8 +107,10 @@ fn a_pool_gate_refusal_is_in_the_query_before_the_next_tick() {
     assert!(reg
         .step_cooldowns(now)
         .is_cooling(3, StepRole::Curator, now));
-    let ads = step_ads(&drain(&mut rx));
-    assert!(ads.iter().any(|a| a.0 == 3 && a.2 <= 600 && a.2 > 500), "{ads:?}");
+    // #11909: a refusal is this host's own (its pool, its claim race); a
+    // peer with a healthy pool must not cool the item, so nothing is
+    // broadcast.
+    assert!(step_ads(&drain(&mut rx)).is_empty());
 }
 
 #[test]
@@ -315,7 +333,7 @@ fn claim_lost_is_counted() {
 /// #11969: a second consecutive lost claim arms the 10-min refusal cooldown,
 /// in the draw's query and broadcast like every window.
 #[test]
-fn a_second_claim_lost_cools_and_is_broadcast() {
+fn a_second_claim_lost_cools_locally() {
     let dir = tempdir().unwrap();
     let (mut reg, mut rx) = registry(dir.path());
     let lost = run(5, StepRole::Curator, OutcomeClass::Refused, "claim_lost", 1);
@@ -328,10 +346,8 @@ fn a_second_claim_lost_cools_and_is_broadcast() {
     assert!(reg
         .step_cooldowns(now)
         .is_cooling(5, StepRole::Curator, now));
-    let ads = step_ads(&drain(&mut rx));
-    assert_eq!(ads.len(), 1, "{ads:?}");
-    assert_eq!((ads[0].0, ads[0].1), (5, Some(StepRole::Curator)));
-    assert!((590..=600).contains(&ads[0].2), "{ads:?}");
+    // Local only (#11909): a lost claim race is this host's.
+    assert!(step_ads(&drain(&mut rx)).is_empty());
     assert_eq!(reg.step_ledger_counters().claim_lost, 2);
 }
 
@@ -362,4 +378,49 @@ fn peer_step_cooldowns_join_the_query() {
         .unwrap();
     assert!(until <= now + chrono::Duration::hours(24), "a peer's window is capped too");
     assert!(until > now + chrono::Duration::hours(23));
+}
+
+/// #12152: a finished step's terminal bus event carries the ledger's
+/// classification and the registry's workspace, on its own topic.
+#[test]
+fn emit_step_ended_publishes_the_ledger_classification() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _rx) = registry(dir.path());
+    let bus = Arc::new(crate::event_bus::EventBus::new());
+    let mut sub = bus.subscribe(["step.item"]);
+    registry.set_event_bus(Arc::clone(&bus));
+    registry.emit_step_ended(&run(
+        42,
+        StepRole::ChampionMerge,
+        OutcomeClass::Verdict,
+        "merged",
+        90,
+    ));
+    let event = sub.try_recv().unwrap();
+    assert_eq!(event.topic(), "step.item.42.ended");
+    let crate::types::Event::StepEnded {
+        item,
+        role,
+        class,
+        reason,
+        ran_for_sec,
+        repo,
+    } = event
+    else {
+        panic!("expected StepEnded, got {event:?}");
+    };
+    assert_eq!((item, role), (42, StepRole::ChampionMerge));
+    assert_eq!((class.as_str(), reason.as_str(), ran_for_sec), ("verdict", "merged", 90));
+    assert_eq!(
+        repo.as_deref(),
+        Some(
+            registry
+                .config()
+                .workspace_root
+                .display()
+                .to_string()
+                .as_str()
+        )
+    );
+    assert!(sub.try_recv().is_err(), "exactly one event per ended step");
 }

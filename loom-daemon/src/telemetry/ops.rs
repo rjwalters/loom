@@ -81,6 +81,9 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.halt_causes",
     // #11857: how many workspaces a hold gated this tick (`0` when none).
     "loom.dispatch.held_roots",
+    // #11973: why a tick counted errors — one token of a fixed set, or
+    // `mixed` (`work_finder::tick_report::error_kind`).
+    "loom.dispatch.error_kind",
     // #11858: the held repos with their causes, the cap's binding term and
     // terms, and the open-PR pre-filter's skips (`ops::dispatch_facts`).
     "loom.dispatch.halted_repos",
@@ -375,6 +378,14 @@ pub enum MetricName {
     /// Open items carrying a stage label, labelled `state`.
     #[serde(rename = "loom.forge.stage_items")]
     ForgeStageItems,
+    /// Seconds since the oldest item of a `stage_items` state entered it,
+    /// labelled `state`, `reason`, `repo` (#12027: `pr_refused`).
+    #[serde(rename = "loom.forge.stage_oldest_age_seconds")]
+    ForgeStageOldestAgeSeconds,
+    /// Items the step tick could draw (weight > 0, after the live claims),
+    /// labelled `repo`, sampled every work-finder tick (#11909).
+    #[serde(rename = "loom.step.actionable")]
+    StepActionable,
     /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
     /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
     /// (over the per-call row cap) — Issue #9222.
@@ -516,6 +527,15 @@ pub enum MetricName {
     /// (`mirror`, `events`, `created`, `none`), #11897: the step engine's stage-age coverage.
     #[serde(rename = "loom.stage_entry.lookups")]
     StageEntryLookups,
+    /// Public-feed `completion` envelopes the narration sink built, by
+    /// `kind` (the trigger: `sweep_exit`, `step`, `reconcile`) and `outcome`
+    /// (`narrated`, or `seeded` for a fresh host's silent first pass), #12152.
+    #[serde(rename = "loom.feed.completions")]
+    FeedCompletions,
+    /// Merge-reconciliation passes, by `outcome` (`ran`, `deferred` while the
+    /// rate-limit breaker cools, `failed` when the forge read failed), #12152.
+    #[serde(rename = "loom.feed.reconcile_passes")]
+    FeedReconcilePasses,
 }
 
 impl MetricName {
@@ -566,6 +586,8 @@ impl MetricName {
             Self::ForgeStageDwell => "loom.forge.stage_dwell",
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
+            Self::ForgeStageOldestAgeSeconds => "loom.forge.stage_oldest_age_seconds",
+            Self::StepActionable => "loom.step.actionable",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
             Self::GithubRateLimitUsed => "github.ratelimit.used",
@@ -596,6 +618,8 @@ impl MetricName {
             Self::ForgeMirrorChanges => "loom.forge.mirror.changes",
             Self::ForgeMirrorWakeLatency => "loom.forge.mirror.wake_latency",
             Self::StageEntryLookups => "loom.stage_entry.lookups",
+            Self::FeedCompletions => "loom.feed.completions",
+            Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
         }
     }
 
@@ -635,7 +659,9 @@ impl MetricName {
             | Self::ForgeMirrorReads
             | Self::ForgeMirrorChanges
             | Self::ForgeMirrorWakeLatency
-            | Self::StageEntryLookups => MetricKind::DeltaCounter,
+            | Self::StageEntryLookups
+            | Self::FeedCompletions
+            | Self::FeedReconcilePasses => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -672,10 +698,10 @@ impl MetricName {
             | Self::DispatchBusySlots
             | Self::DispatchRoleMaxConcurrent
             | Self::DispatchRoleIdleSlots => "{slot}",
-            Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
+            Self::ForgeStageDwellSamples | Self::ForgeStageItems | Self::StepActionable => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
-            Self::GithubRateLimitReset => "s",
+            Self::GithubRateLimitReset | Self::ForgeStageOldestAgeSeconds => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
             Self::ForgeCalls => "{request}",
             Self::ForgeFacadeEvents => "{event}",
@@ -699,6 +725,8 @@ impl MetricName {
             Self::ForgeMirrorChanges => "{change}",
             Self::ForgeMirrorWakeLatency => "s",
             Self::StageEntryLookups => "{lookup}",
+            Self::FeedCompletions => "{completion}",
+            Self::FeedReconcilePasses => "{pass}",
             _ => "By",
         }
     }
@@ -764,6 +792,10 @@ impl MetricName {
             Self::ForgeStageItems => {
                 "Open items per repo by state: stage labels and queue states (overlapping)."
             }
+            Self::ForgeStageOldestAgeSeconds => {
+                "Age of the oldest item in a stage_items state, by reason (pr_refused)."
+            }
+            Self::StepActionable => "Items the step tick could draw this tick, per repo.",
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }
@@ -824,6 +856,12 @@ impl MetricName {
             }
             Self::StageEntryLookups => {
                 "Stage-entry times the step engine looked up, by repo and answering source (kind)."
+            }
+            Self::FeedCompletions => {
+                "Public-feed completions the narration sink built, by trigger (kind) and outcome."
+            }
+            Self::FeedReconcilePasses => {
+                "Merge-reconciliation passes of the narration sink, by outcome."
             }
         }
     }

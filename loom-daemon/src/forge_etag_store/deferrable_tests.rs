@@ -207,3 +207,139 @@ fn a_gate_read_keeps_its_writer_fallback() {
     assert_eq!(resp.unwrap().status, 200);
     assert_eq!(calls(&log), ["reader-limited", "writer"]);
 }
+
+/// #12074 review: inside a work-finder tick's read scope a listing still
+/// reaches the writer when the readers are out for a cause that is not
+/// budget (only a rate-limit back-off is shed), so a degraded pool never
+/// starves the tick.
+#[test]
+fn a_tick_scoped_listing_still_reaches_the_writer_for_a_non_budget_cause() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gh, log) = stub(tmp.path());
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let _scope = crate::gh_invocation::read_deadline::enter(deadline, true);
+    let unavailable = |_: &RouteRequest<'_>| RouteDecision::Exhausted {
+        until: SystemTime::now(),
+        cause: ExhaustCause::Unavailable,
+    };
+    let r = fetch_conditional_via(
+        site(ReadClass::Hygiene),
+        &gh,
+        None,
+        &target(),
+        URL,
+        None,
+        &unavailable,
+    );
+    assert!(r.is_ok());
+    assert_eq!(calls(&log), ["writer"]);
+}
+
+/// #12074: past the tick deadline a listing page is not sent at all; the
+/// error is a shed, which the step gather answers with its last good listing.
+#[test]
+fn a_listing_past_the_tick_deadline_is_shed_with_no_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gh, log) = stub(tmp.path());
+    let past = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap();
+    let _scope = crate::gh_invocation::read_deadline::enter(past, true);
+    let no_pool = |_: &RouteRequest<'_>| RouteDecision::NoPool;
+    let r =
+        fetch_conditional_via(site(ReadClass::Hygiene), &gh, None, &target(), URL, None, &no_pool);
+    assert!(is_shed(&r), "{:?}", r.map(|x| x.0));
+    assert!(calls(&log).is_empty(), "{:?}", calls(&log));
+}
+
+/// #12074 review: a starved repo's escalated tick really reaches the writer.
+/// With every reader out of budget the router answers before any reader is
+/// tried; a deferrable listing is shed on the ordinary ticks and served by
+/// the writer on the escalated one.
+#[test]
+fn an_escalated_tick_sends_a_budget_exhausted_listing_to_the_writer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gh, log) = stub(tmp.path());
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let _scope = crate::gh_invocation::read_deadline::enter(deadline, true);
+    let route = |_: &RouteRequest<'_>| RouteDecision::Exhausted {
+        until: SystemTime::now() + Duration::from_secs(1800),
+        cause: ExhaustCause::Budget,
+    };
+    let r =
+        fetch_conditional_via(site(ReadClass::Hygiene), &gh, None, &target(), URL, None, &route);
+    assert!(is_shed(&r), "an ordinary tick sheds");
+    assert!(calls(&log).is_empty());
+    {
+        let _escalated = crate::gh_invocation::read_deadline::allow_writer();
+        let r = fetch_conditional_via(
+            site(ReadClass::Hygiene),
+            &gh,
+            None,
+            &target(),
+            URL,
+            None,
+            &route,
+        );
+        assert!(r.is_ok(), "the escalated tick is served");
+        assert_eq!(calls(&log), ["writer"]);
+    }
+    let r =
+        fetch_conditional_via(site(ReadClass::Hygiene), &gh, None, &target(), URL, None, &route);
+    assert!(is_shed(&r), "the next ordinary tick sheds again");
+    assert_eq!(calls(&log), ["writer"]);
+}
+
+/// 2026-10-15: an Observability conditional read is shed for every cause,
+/// and a Hygiene one waits out a withdrawal (a mix of budget and non-budget
+/// withdrawals, or a withdrawn gateway with no reader pool behind it):
+/// neither reaches the writer. A Hygiene read still takes the writer for a
+/// cause that may never clear (`Unavailable`).
+#[test]
+fn withdrawn_or_unavailable_readers_never_send_an_observability_read_to_the_writer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gh, log) = stub(tmp.path());
+    let until = SystemTime::now() + Duration::from_secs(600);
+    let withdrawn = |_: &RouteRequest<'_>| RouteDecision::Exhausted {
+        until,
+        cause: ExhaustCause::Withdrawn,
+    };
+    let gateway_only = |_: &RouteRequest<'_>| {
+        crate::forge_gateway::past_withdrawn_gateway(RouteDecision::NoPool, Some(until))
+    };
+    let unavailable = |_: &RouteRequest<'_>| RouteDecision::Exhausted {
+        until,
+        cause: ExhaustCause::Unavailable,
+    };
+    for class in [ReadClass::Hygiene, ReadClass::Observability] {
+        for route in [
+            &withdrawn as &dyn Fn(&RouteRequest<'_>) -> RouteDecision,
+            &gateway_only,
+        ] {
+            let r = fetch_conditional_via(site(class), &gh, None, &target(), URL, None, route);
+            assert!(is_shed(&r), "{class:?}");
+        }
+    }
+    let r = fetch_conditional_via(
+        site(ReadClass::Observability),
+        &gh,
+        None,
+        &target(),
+        URL,
+        None,
+        &unavailable,
+    );
+    assert!(is_shed(&r), "observability sheds on Unavailable too");
+    assert!(calls(&log).is_empty(), "{:?}", calls(&log));
+    let r = fetch_conditional_via(
+        site(ReadClass::Hygiene),
+        &gh,
+        None,
+        &target(),
+        URL,
+        None,
+        &unavailable,
+    );
+    assert!(r.is_ok());
+    assert_eq!(calls(&log), ["writer"]);
+}

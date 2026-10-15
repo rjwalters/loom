@@ -12,39 +12,30 @@
 //! read `installed_files` only left every such commit alone, and the
 //! checkouts stayed `diverged` for days (loom-worker-1/2/3, 2026-10-15).
 //!
-//! The surfaces below are the ones `resync-installed.sh` copies wholesale
-//! (its header lists them). A hand edit there does not survive the next
-//! resync anyway. A path pinned in `.loom/resync-ignore` is the exception: a
-//! pin is a deliberate local divergence, so it is never counted here.
+//! A path is Loom's here only when the payload embedded in this binary ships
+//! a file at that destination. The resync never touches a file with no
+//! upstream counterpart (a repo's `.loom/roles/custom-role.md`), so a
+//! directory prefix would call the repo's own work Loom's. A path pinned in
+//! `.loom/resync-ignore` is the other exception: a pin is a deliberate local
+//! divergence, so it is never counted here.
 
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 
-/// Directories `resync-installed.sh` overwrites wholesale.
-const MANAGED_DIRS: &[&str] = &[
-    ".loom/roles/",
-    ".loom/scripts/",
-    ".loom/docs/",
-    ".loom/runtimes/",
-    ".loom/bin/",
-    ".loom/hooks/",
-    ".claude/commands/loom/",
-];
+use crate::agent_skills::MARKER;
+use crate::init::payload::{materialize_with, Payload};
 
-/// Single files it overwrites (or stamps, for the metadata).
-const MANAGED_FILES: &[&str] = &[
-    ".loom/install-metadata.json",
-    ".loom/pricing.json",
-    ".loom/biome.jsonc",
-    ".claude/biome.jsonc",
-    ".claude/README.md",
-    ".github/CONFIGURATION.md",
-];
+/// The Codex skill mirror. A skill file is the resync's only when it carries
+/// [`MARKER`] (`resync_agent_skills`); the classifier checks that per file.
+const SKILLS_PREFIX: &str = ".agents/skills/";
 
-/// The Codex skill mirror: `.agents/skills/loom-<name>/…`, Loom's namespace.
-const SKILLS_PREFIX: &str = ".agents/skills/loom-";
+/// Surfaces the resync refreshes only where the repo already has the file.
+/// Pre-created in the empty destination so the payload reports them.
+const COPY_IF_PRESENT: &[&str] = &[".claude/README.md", ".github/CONFIGURATION.md"];
 
 /// How long a detached HEAD must sit unmoved before it is re-attached.
 const DETACHED_ENV: &str = "LOOM_CHECKOUT_DETACHED_AFTER_MINUTES";
@@ -66,23 +57,56 @@ pub(super) fn pins(root: &Path) -> Vec<String> {
 
 /// Is `path` pinned? A pin names the file in the resync's report form, which
 /// is relative to `.loom/` (`scripts/x.sh`) or `.claude/`
-/// (`commands/loom/judge.md`), or in full.
+/// (`commands/loom/judge.md`), `agents-skills/<rel>` for `.agents/skills/<rel>`,
+/// or in full.
 fn pinned(path: &str, pins: &[String]) -> bool {
     pins.iter().any(|pin| {
         path == pin
             || path.strip_prefix(".loom/") == Some(pin.as_str())
             || path.strip_prefix(".claude/") == Some(pin.as_str())
+            || path
+                .strip_prefix(SKILLS_PREFIX)
+                .is_some_and(|rest| pin.strip_prefix("agents-skills/") == Some(rest))
     })
 }
 
-/// Does the resync overwrite `path` wholesale, and is it not pinned?
+/// Every destination the embedded payload ships a file at. `None` when the
+/// payload cannot be staged: nothing is then owned beyond `installed_files`.
+fn shipped() -> Option<&'static BTreeSet<String>> {
+    static SHIPPED: OnceLock<Option<BTreeSet<String>>> = OnceLock::new();
+    SHIPPED
+        .get_or_init(|| {
+            let payload = Payload::embedded().ok()?;
+            let dest = tempfile::Builder::new()
+                .prefix("loom-shipped-")
+                .tempdir()
+                .ok()?;
+            for rel in COPY_IF_PRESENT {
+                let file = dest.path().join(rel);
+                std::fs::create_dir_all(file.parent()?).ok()?;
+                std::fs::write(file, "").ok()?;
+            }
+            let diff = materialize_with(&payload, dest.path()).ok()?;
+            Some(diff.added.iter().chain(&diff.changed).cloned().collect())
+        })
+        .as_ref()
+}
+
+/// Does the payload ship `path`, and is it not pinned? A skill also needs
+/// its generation marker: see [`is_skill`] and [`has_marker`].
 pub(super) fn resync_owned(path: &str, pins: &[String]) -> bool {
-    let surface = MANAGED_DIRS.iter().any(|d| path.starts_with(d))
-        || MANAGED_FILES.contains(&path)
-        || path
-            .strip_prefix(SKILLS_PREFIX)
-            .is_some_and(|rest| rest.contains('/'));
-    surface && !pinned(path, pins)
+    shipped().is_some_and(|set| set.contains(path)) && !pinned(path, pins)
+}
+
+/// Is `path` in the Codex skill mirror?
+pub(super) fn is_skill(path: &str) -> bool {
+    path.starts_with(SKILLS_PREFIX)
+}
+
+/// Does `content` carry the generation marker that makes a skill the
+/// resync's?
+pub(super) fn has_marker(content: &str) -> bool {
+    content.contains(MARKER)
 }
 
 /// How long a detached HEAD must sit before the self-heal re-attaches it.
@@ -121,27 +145,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resync_surfaces_are_owned_and_other_paths_are_not() {
+    fn only_what_the_payload_ships_is_owned() {
         let none: Vec<String> = Vec::new();
+        assert!(resync_owned(".loom/scripts/worktree.sh", &none));
+        assert!(resync_owned(".loom/roles/builder.md", &none));
+        assert!(resync_owned(".claude/commands/loom/builder.md", &none));
+        assert!(resync_owned(".agents/skills/loom-builder/SKILL.md", &none));
         for p in [
-            ".loom/scripts/tests/test-new.sh",
-            ".loom/docs/daemon-reference.md",
-            ".loom/hooks/guard.sh",
-            ".claude/commands/loom/builder.md",
-            ".agents/skills/loom-builder-complexity/SKILL.md",
-            ".loom/install-metadata.json",
-            ".github/CONFIGURATION.md",
-        ] {
-            assert!(resync_owned(p, &none), "{p}");
-        }
-        for p in [
+            ".loom/roles/custom-role.md",
+            ".loom/scripts/my-local-helper.sh",
+            ".claude/commands/loom/mine.md",
+            ".agents/skills/loom-custom/SKILL.md",
             ".loom/config.json",
-            ".loom/resync-ignore",
-            ".claude/commands/repo/scrub.md",
             ".claude/settings.json",
-            ".agents/skills/custom/SKILL.md",
-            ".agents/skills/loom-",
-            ".github/labels.yml",
             ".github/workflows/ci.yml",
             "CLAUDE.md",
             "src/lib.rs",
@@ -153,14 +169,24 @@ mod tests {
     #[test]
     fn a_pinned_path_is_not_owned_in_any_spelling() {
         let pins = vec![
-            "scripts/merge-pr.sh".to_string(),
-            "commands/loom/judge.md".to_string(),
-            ".loom/docs/x.md".to_string(),
+            "scripts/worktree.sh".to_string(),
+            "commands/loom/builder.md".to_string(),
+            "agents-skills/loom-builder/SKILL.md".to_string(),
+            ".loom/roles/judge.md".to_string(),
         ];
-        assert!(!resync_owned(".loom/scripts/merge-pr.sh", &pins));
-        assert!(!resync_owned(".claude/commands/loom/judge.md", &pins));
-        assert!(!resync_owned(".loom/docs/x.md", &pins));
-        assert!(resync_owned(".loom/scripts/worktree.sh", &pins));
+        assert!(!resync_owned(".loom/scripts/worktree.sh", &pins));
+        assert!(!resync_owned(".claude/commands/loom/builder.md", &pins));
+        assert!(!resync_owned(".agents/skills/loom-builder/SKILL.md", &pins));
+        assert!(!resync_owned(".loom/roles/judge.md", &pins));
+        assert!(resync_owned(".loom/roles/builder.md", &pins));
+    }
+
+    #[test]
+    fn the_skill_marker_is_what_makes_a_skill_the_resyncs() {
+        assert!(is_skill(".agents/skills/loom-x/SKILL.md"));
+        assert!(!is_skill(".loom/scripts/x.sh"));
+        assert!(has_marker(&format!("---\n---\n{MARKER}\nbody")));
+        assert!(!has_marker("---\n---\nbody"));
     }
 
     #[test]

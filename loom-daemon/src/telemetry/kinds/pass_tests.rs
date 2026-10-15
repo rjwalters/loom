@@ -40,6 +40,8 @@ fn summary() -> PassSummaryRecord {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
+        unevaluated_reasons: std::collections::BTreeMap::new(),
+        budget: None,
         write_cap_hit: false,
         github: GithubSpend {
             calls: 9,
@@ -63,6 +65,8 @@ fn verdict() -> PassVerdictRecord {
         verdict: "released".to_string(),
         reason: None,
         detail: None,
+        unevaluated_reason: None,
+        budget: None,
         blockers: vec![BlockerState {
             reference: "#10753".to_string(),
             state: "closed".to_string(),
@@ -72,6 +76,7 @@ fn verdict() -> PassVerdictRecord {
         mode: PassMode::On,
         applied: true,
         at: Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 1).unwrap(),
+        step: Default::default(),
     }
 }
 
@@ -155,4 +160,32 @@ fn the_saved_queries_read_only_exported_keys() {
     for kind in ["'pass.summary'", "'pass.verdict'", "'invoke github'"] {
         assert!(QUERIES.contains(kind), "pass-queries.sql no longer reads {kind}");
     }
+}
+
+/// #12027: the step facts are additive. A daemon pass's verdict serializes
+/// exactly as before they existed (golden), and reads back unchanged.
+#[test]
+fn a_release_pass_verdict_is_byte_identical_to_before_the_step_facts() {
+    const GOLDEN: &str = r##"{"pass_id":"0123456789abcdef0123456789abcdef","mechanism":"stale_blocked_release","repo":"rjwalters/loom","number":10752,"artifact":"issue","verdict":"released","blockers":[{"ref":"#10753","state":"closed"}],"labels_added":["loom:issue"],"labels_removed":["loom:blocked"],"mode":"on","applied":true,"at":"2026-10-07T12:00:01Z"}"##;
+    assert_eq!(serde_json::to_string(&verdict()).unwrap(), GOLDEN);
+    let back: PassVerdictRecord = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(back, verdict());
+    assert_eq!(back.step, StepFacts::default());
+}
+
+#[test]
+fn a_step_verdict_round_trips_its_facts() {
+    let mut v = verdict();
+    v.step = StepFacts {
+        class: Some("refused".to_string()),
+        first_refused_at: Some(v.at),
+        pre_labels: vec!["loom:pr".to_string()],
+        loom: Some(provenance()),
+        ..StepFacts::default()
+    };
+    let record = TelemetryRecord::PassVerdict(v);
+    let envelope = TelemetryEnvelope::new("loom-worker-1", record.clone());
+    let back: TelemetryEnvelope =
+        serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+    assert_eq!(back.record, record);
 }

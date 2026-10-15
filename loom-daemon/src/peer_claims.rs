@@ -98,12 +98,14 @@ pub use brakes::{
 
 mod coordination_idle;
 mod fast_fail_tally;
+mod noop_streak_tally;
 mod steps;
 pub use coordination_idle::{
     resolve_advertise_activity_window, ADVERTISE_ACTIVITY_WINDOW_ENV,
     DEFAULT_ADVERTISE_ACTIVITY_WINDOW,
 };
 pub use fast_fail_tally::MAX_PEER_FAST_FAIL_STREAK_AGE;
+pub use noop_streak_tally::MAX_PEER_NOOP_STREAK_AGE;
 pub use steps::MAX_PEER_STEP_COOLDOWN;
 
 mod send_health;
@@ -357,6 +359,12 @@ pub enum ClaimKind {
     /// (#11900): the step-outcome ledger's short window, keyed by the ad's
     /// `step`. Zero is a clear. See `steps.rs`.
     StepCooldownArmed,
+    /// "I have now seen `consecutive` no-ops in a row on issue #N against the
+    /// forge fingerprint `fingerprint`" (#12024): the no-op hold's streak,
+    /// summed across hosts like the fast-fail streak. A `streak_break` of
+    /// `Some(true)` resets every host's count. Carries no window. See
+    /// `noop_streak_tally`.
+    NoopStreak,
     /// "I am alive" (Issue #8736) — a periodic liveness signal published
     /// every reaper tick **regardless of live-sweep count**, unlike
     /// [`ClaimKind::Advertise`] (entirely dispatch-gated). Closes the
@@ -403,6 +411,7 @@ impl ClaimKind {
             ClaimKind::PoolHoldArmed => "pool_hold_armed",
             ClaimKind::PoolHoldCleared => "pool_hold_cleared",
             ClaimKind::StepCooldownArmed => "step_cooldown_armed",
+            ClaimKind::NoopStreak => "noop_streak",
             ClaimKind::Heartbeat => "heartbeat",
         }
     }
@@ -421,6 +430,7 @@ impl ClaimKind {
             "pool_hold_armed" => Some(ClaimKind::PoolHoldArmed),
             "pool_hold_cleared" => Some(ClaimKind::PoolHoldCleared),
             "step_cooldown_armed" => Some(ClaimKind::StepCooldownArmed),
+            "noop_streak" => Some(ClaimKind::NoopStreak),
             "heartbeat" => Some(ClaimKind::Heartbeat),
             _ => None,
         }
@@ -456,6 +466,7 @@ impl ClaimKind {
                 | ClaimKind::DispatchBackoffArmed
                 | ClaimKind::PrlessReleaseArmed
                 | ClaimKind::StepCooldownArmed
+                | ClaimKind::NoopStreak
         )
     }
 
@@ -543,6 +554,23 @@ pub struct ClaimAd {
     /// every other lane. Additive: an older peer ignores the key and reads the
     /// ad as a claim on `issue`, which is the item the step holds.
     pub step: Option<crate::step_role::StepRole>,
+    /// Whether a [`ClaimKind::DispatchBackoffArmed`] ad is a **fast-fail
+    /// streak break** (#11952): `Some(true)` from
+    /// [`crate::sweep_registry::SweepRegistry::break_fleet_fast_fail_streak`],
+    /// `Some(false)` on every ordinary ladder window, `None` on every other
+    /// ad (and on any ad from a peer older than #11952). Before this marker a
+    /// break was encoded only as "zero window and zero streak", which an
+    /// ordinary failure could also produce; see `peer_claims::fast_fail_tally`
+    /// for how the two encodings are read. Additive: an older peer ignores
+    /// the key, and a new sender's break still has the zero window and zero
+    /// streak such a peer reads as one.
+    pub streak_break: Option<bool>,
+    /// The digest of the forge fingerprint a [`ClaimKind::NoopStreak`] count
+    /// was taken against (#12024): a receiver sums only the peer counts taken
+    /// against the fingerprint it reads itself, so a changed issue restarts
+    /// the fleet streak. `None` on every other ad. Additive: an older peer
+    /// drops the whole `NoopStreak` kind as unknown.
+    pub fingerprint: Option<String>,
 }
 
 impl ClaimAd {
@@ -560,6 +588,8 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -577,6 +607,8 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -605,6 +637,8 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -628,6 +662,8 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -647,6 +683,8 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -676,6 +714,8 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -702,6 +742,8 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -725,6 +767,8 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -744,6 +788,8 @@ impl ClaimAd {
             "pool_key": self.pool_key,
             "consecutive": self.consecutive,
             "step": self.step,
+            "streak_break": self.streak_break,
+            "fingerprint": self.fingerprint,
         })
         .to_string()
     }
@@ -820,6 +866,15 @@ impl ClaimAd {
             .get("step")
             .and_then(Value::as_str)
             .and_then(|s| s.parse().ok());
+        // `streak_break` is new as of #11952: absent (any older peer, any
+        // ad but a fast-fail ladder window) degrades to `None`, which the
+        // tally reads under the pre-#11952 "zero window and zero streak" rule.
+        let streak_break = obj.get("streak_break").and_then(Value::as_bool);
+        // `fingerprint` is new as of #12024 (the no-op streak lane only).
+        let fingerprint = obj
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -835,6 +890,8 @@ impl ClaimAd {
             pool_key,
             consecutive,
             step,
+            streak_break,
+            fingerprint,
         })
     }
 
@@ -1240,6 +1297,13 @@ pub struct PeerClaimView {
     /// `(count, received_at)`. Carried on the `DispatchBackoffArmed` ad; see
     /// [`fast_fail_tally`] for why it is summed per host.
     fast_fail_streaks: HashMap<(String, u32, String), (u32, Instant)>,
+    /// When a peer's fast-fail streak **break** for `(repo_slug, issue)` last
+    /// arrived, on this host's wall clock (#11952): what lets the sweep
+    /// registry break this host's own streak too. See [`fast_fail_tally`].
+    fast_fail_breaks: HashMap<(String, u32), chrono::DateTime<chrono::Utc>>,
+    /// Each peer host's own no-op streak and the fleet's streak breaks
+    /// (#12024). See [`noop_streak_tally`].
+    noop_streaks: noop_streak_tally::NoopStreakTally,
     /// Fleet-visible token-pool exhaustion holds armed by peer hosts (Issue
     /// #8001), keyed by `(pool_key, advertising_host)`, valued by the
     /// **local** [`Instant`] at which this daemon's copy of the hold expires
@@ -1316,6 +1380,8 @@ impl PeerClaimView {
             dispatch_backoffs: HashMap::new(),
             prless_releases: HashMap::new(),
             fast_fail_streaks: HashMap::new(),
+            fast_fail_breaks: HashMap::new(),
+            noop_streaks: noop_streak_tally::NoopStreakTally::default(),
             pool_holds: HashMap::new(),
             step_cooldowns: HashMap::new(),
             send_health: ClaimSendHealth::default(),
@@ -1496,6 +1562,7 @@ impl PeerClaimView {
             | ClaimKind::PoolHoldArmed
             | ClaimKind::PoolHoldCleared
             | ClaimKind::StepCooldownArmed
+            | ClaimKind::NoopStreak
             | ClaimKind::Heartbeat => {
                 unreachable!("returned above")
             }
@@ -2174,6 +2241,8 @@ mod tests {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
+            fingerprint: None,
         }
     }
 

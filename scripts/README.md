@@ -22,7 +22,6 @@ the same set CI's `Structural Checks` job runs.
 | `check-claude-md-budget.sh` | `CLAUDE.md` line budget |
 | `check-markdown-token-budget.sh` | Agent-facing markdown token ratchet |
 | `check-role-prompt-budget.sh` | Whole per-role prompt prefix ratchet |
-| `check-file-size-budget.sh` | Oversized source file ratchet |
 | `check-shell-allowlist.sh` | Every tracked `.sh` is in `shell-allowlist.txt` |
 | `check-pipefail-early-exit.sh` | `pipefail` + early-exit SIGPIPE ratchet |
 | `check-dangling-links.sh` | Relative markdown links resolve |
@@ -59,8 +58,9 @@ Baselines/allowlists: `*-baseline.txt`, `role-prompt-budget.txt`, `shell-allowli
 | `dev-daemon.sh`, `start-daemon.sh`, `stop-daemon.sh`, `restart-daemon.sh`, `daemon-headless.sh`, `daemon-build.sh` | Daemon dev-mode helpers (detailed below) |
 | `worktree.sh` | Worktree helper |
 | `cargo-target-dir.sh` | Cargo target directory resolution |
-| `cleanup-branches.sh`, `clean-tmux.sh` | Stale branch / tmux session cleanup |
-| `archive-logs.sh` | Archive task outputs and daemon logs with retention |
+| `clean-tmux.sh` | Stale tmux session cleanup |
+
+Branch cleanup and log archival are the shipped `.loom/scripts/cleanup-branches.sh` and `.loom/scripts/archive-logs.sh` (sources in `defaults/scripts/`); the stale root-level forks were retired in #12068.
 
 ## Daemon dev scripts
 
@@ -226,32 +226,6 @@ Usage:
 ./clean.sh --aggressive --dry-run   # Preview vestigial-worktree cleanup
 loom-clean                  # Direct invocation (PATH shim to `loom-daemon clean`, no venv required)
 ```
-
-### cleanup-branches.sh
-**Removes feature branches for closed issues**
-
-Automatically cleans up stale feature branches by:
-1. Scanning all `feature/issue-*` branches
-2. Checking GitHub issue status (`gh issue view`)
-3. Deleting branches for `CLOSED` issues
-4. Preserving branches for `OPEN` issues
-
-Usage:
-```bash
-# Preview what would be deleted
-./scripts/cleanup-branches.sh --dry-run
-
-# Actually delete stale branches
-./scripts/cleanup-branches.sh
-```
-
-Features:
-- Color-coded output (green=deleted, blue=kept, yellow=error)
-- Summary statistics
-- Safe: Only deletes confirmed closed issues
-- Fast: Checks all branches in one run
-
-**When to use**: After merging several PRs to keep branch list clean.
 
 ## Development Notes
 

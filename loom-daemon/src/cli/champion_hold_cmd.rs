@@ -7,6 +7,7 @@
 //! | verb | stdout | exit |
 //! |---|---|---|
 //! | `classify --pr N` | `LOOM-CHAMPION-HOLD state=<s> pr=<N> detail=<d>` | 0 |
+//! | `classify`, a hold with `loom:operator`, events unreadable | `state=champion-hold` (no repair this pass) | 0 |
 //! | `classify`, labels or (blocked PR) comments unreadable | (nothing) | 3 |
 //! | `merge-failed-marker --pr N --head SHA`, notice due | the marker line | 0 |
 //! | `merge-failed-marker`, notice already posted for this head | (nothing) | 1 |
@@ -22,7 +23,10 @@
 //! on a failed read it skips the PR.
 
 use anyhow::Result;
-use loom_daemon::champion_hold::classify::{classify, merge_failed_notice_due, needs_comments};
+use loom_daemon::champion_hold::classify::{
+    classify_operator, fetch_operator_adder, merge_failed_notice_due, needs_comments,
+    stray_operator_candidate,
+};
 use serde_json::Value;
 
 #[derive(clap::Subcommand)]
@@ -31,7 +35,9 @@ pub(crate) enum ChampionHoldCommand {
     /// `champion-hold` (Champion's own hold: leave it), `foreign-park`
     /// (`loom:blocked` from another actor: skip, no merge, no comment), or
     /// `contradiction` (`loom:pr` beside a contradicting verdict label: the
-    /// janitor strips `loom:pr`). Exit 3 with no stdout when a read failed.
+    /// janitor strips `loom:pr`), or `stray-operator` (a hold the fleet App
+    /// labelled `loom:operator`, #11970: the janitor removes `loom:operator`).
+    /// Exit 3 with no stdout when a read failed.
     Classify(TargetArgs),
 
     /// Print the marker to post a "Merge Failed" notice under, when no trusted
@@ -107,7 +113,10 @@ impl ChampionHoldCommand {
                 } else {
                     Vec::new()
                 };
-                println!("{}", classify(&labels, &trusted).line(t.pr));
+                let adder = stray_operator_candidate(&labels, &trusted)
+                    .then(|| fetch_operator_adder(t.repo(), t.pr, &root))
+                    .flatten();
+                println!("{}", classify_operator(&labels, &trusted, adder).line(t.pr));
                 Ok(())
             }
             ChampionHoldCommand::MergeFailedMarker { target, head } => {

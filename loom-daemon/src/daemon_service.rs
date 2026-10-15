@@ -504,130 +504,32 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let credential_preflight = credential_preflight::attach_pool(github_app_preflight.report);
     credential_preflight::loom_ui::startup(&credential_preflight); // #11295
 
-    // Per-owner managed-repo credentials (#5401). The GitHub App mechanism
-    // above mints exactly ONE installation token, keyed on this daemon's
-    // *workspace root* owner (`github_app_owner_repo`) and delivered via the
-    // process-global `GH_CONFIG_DIR`. An installation token is scoped to its
-    // own installation's repos, so every managed repo owned by a DIFFERENT
-    // account/org (the reporter's fleet spans `rjwalters/*` and `2AMLogic/*`)
-    // is unreachable for private data under it — public reads succeed
-    // anonymously while private reads and writes silently 404, which is what
-    // made a wrong-owner fleet look uniformly healthy (#5401's evidence).
+    // Per-owner managed-repo credentials (#5401). The App preflight above
+    // mints ONE installation token, for the workspace-root owner; every
+    // managed repo owned by another account/org needs its own, published into
+    // a per-owner `GH_CONFIG_DIR` and registered against its checkout roots
+    // (`credential_preflight::cross_owner`). Only when the App is the active
+    // credential this run; a single-owner fleet plans nothing.
     //
-    // The fix: mint a SECOND (third, …) installation token — one per distinct
-    // owner among the managed repos — and publish each into its own per-owner
-    // `GH_CONFIG_DIR` (reusing #4458's tested delivery path), registering
-    // every cross-owner checkout root against it so the daemon's per-repo
-    // `gh`/`git` call sites (`credential_preflight::apply_gh_config_for_root`)
-    // select the right credential per child. The `mint(owner_repo)` machinery
-    // already resolves the correct installation per owner/repo; it was simply
-    // never called per owner before now.
-    //
-    // Only runs when the App mechanism is actually the active credential this
-    // run (`minted.is_some()`) — an ambient `gh` auth / PAT host is
-    // not subject to the single-installation limit. A single-owner fleet
-    // yields no plans, registers nothing, and is byte-identical to pre-#5401.
-    // Each established plan is registered into
-    // `credential_preflight::register_owner_refresh_source` (#6171), the
-    // shared registry the refresh task below re-reads every tick — rather
-    // than a `Vec` captured once here — so an owner discovered dynamically
-    // after startup (via `force_refresh_owner_credential`'s 404-recovery
-    // path) is picked up by the SAME periodic freshness tick as one
-    // established here, with no separate task to spawn or track.
+    // #11957: a startup mint that fails (a timeout on a saturated host) skips
+    // this pass, and `cross_owner_retry` makes the primary refresh tick below
+    // run it once its own mint succeeds, then with bounded backoff while any
+    // owner still fails — instead of leaving every cross-owner root on the
+    // root owner's credential, refused by the write-scope gate, until restart.
+    let mut cross_owner_retry =
+        credential_preflight::cross_owner::CrossOwnerRetry::after_startup(None);
     if let (Some(root_owner_repo), Some(script_path), true) = (
         &github_app_owner_repo,
         &github_app_script,
         github_app_preflight.minted.is_some(),
     ) {
-        let root_owner = credential_preflight::owner_of_nwo(root_owner_repo).to_string();
-        let cross_owner_registry =
-            loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
-        let managed: Vec<(std::path::PathBuf, String)> = cross_owner_registry
-            .effective_roots(&sweep_workspace)
-            .into_iter()
-            .filter_map(|root| {
-                credential_preflight::nwo_from_git_remote(&root).map(|nwo| (root, nwo))
-            })
-            .collect();
-        let plans = credential_preflight::plan_cross_owner_credentials(&root_owner, &managed);
-        if !plans.is_empty() {
-            let minter = credential_preflight::RealGithubAppMinter {
-                script_path: script_path.clone(),
-                cwd: sweep_workspace.clone(),
-            };
-            for plan in plans {
-                let owner_dir = credential_preflight::github_app_gh_config_dir_for_owner(
-                    &sweep_workspace,
-                    &plan.owner,
-                );
-                let repo = &plan.representative_owner_repo;
-                match credential_preflight::GithubAppMinter::mint(&minter, repo) {
-                    ref outcome @ credential_preflight::GithubAppOutcome::Minted {
-                        ref installation_id,
-                        ref app_id,
-                        ..
-                    } => match credential_preflight::publish_outcome(&owner_dir, outcome, repo) {
-                        Ok(()) => {
-                            for root in &plan.roots {
-                                credential_preflight::register_root_gh_config_dir(root, &owner_dir);
-                            }
-                            // #5431: also register the owner slug so call sites
-                            // that target the repo by `--repo <owner/repo>`
-                            // (fleet::drain) or an `owner/repo`-in-path `gh api`
-                            // (telemetry::visibility) — with no checkout-root
-                            // `current_dir` to key off — select this owner's
-                            // credential too.
-                            credential_preflight::register_owner_gh_config_dir(
-                                &plan.owner,
-                                &owner_dir,
-                            );
-                            // #6171: also register this owner as a periodic
-                            // refresh source — see the comment on the
-                            // registration loop above.
-                            credential_preflight::register_owner_refresh_source(
-                                &plan.representative_owner_repo,
-                                &owner_dir,
-                            );
-                            log::info!(
-                                "credential_preflight: per-owner github-app credential established \
-                                 for {} ({} managed repo(s), app {app_id} installation \
-                                 {installation_id}) — those cross-owner repos are now reachable \
-                                 (#5401)",
-                                plan.owner,
-                                plan.roots.len()
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "credential_preflight: minted a per-owner github-app token for {} \
-                                 but could not publish it to {} ({e}); its {} managed repo(s) \
-                                 remain unreachable — #5401",
-                                plan.owner,
-                                owner_dir.display(),
-                                plan.roots.len()
-                            );
-                        }
-                    },
-                    credential_preflight::GithubAppOutcome::Error(reason) => {
-                        log::warn!(
-                            "credential_preflight: could not mint a per-owner github-app token for \
-                             {} ({reason}); its {} managed repo(s) ({:?}) remain unreachable — the \
-                             app may not be installed on {}'s account/org (public reads may still \
-                             work; private reads and writes will 404) — #5401",
-                            plan.owner,
-                            plan.roots.len(),
-                            plan.roots,
-                            plan.owner
-                        );
-                    }
-                    credential_preflight::GithubAppOutcome::NotConfigured => {
-                        // Unreachable in practice: `minted.is_some()`
-                        // above already proved the app is configured. Treat as
-                        // a no-op rather than a failure.
-                    }
-                }
-            }
-        }
+        let pass = credential_preflight::cross_owner::establish_for_workspace(
+            &sweep_workspace,
+            root_owner_repo,
+            script_path,
+        );
+        cross_owner_retry =
+            credential_preflight::cross_owner::CrossOwnerRetry::after_startup(Some(&pass));
     }
 
     // Fleet-store sync (#9596). HERE, and not earlier or later, for two hard
@@ -672,6 +574,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         let config_dir = github_app_config_dir.clone();
         let mut current_token = github_app_preflight.minted.map(|m| m.token);
         let mut config_dir_active = github_app_gh_config_dir_active;
+        let (pass_workspace, pass_script) = (cwd.clone(), script_path.clone());
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
@@ -683,6 +586,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     credential_preflight::GithubAppMinter::mint(&minter, &repo)
                 })
                 .await;
+                let primary_minted =
+                    matches!(outcome, Ok(credential_preflight::GithubAppOutcome::Minted { .. }));
                 match outcome {
                     Ok(
                         ref minted @ credential_preflight::GithubAppOutcome::Minted {
@@ -791,6 +696,20 @@ pub(crate) async fn run_daemon() -> Result<()> {
                             "credential_preflight: github-app refresh task join error: {e} — #4430"
                         );
                     }
+                }
+                // #11957: run the per-owner pass startup skipped or could not
+                // finish, once the App mints again. After the primary publish
+                // above, so the cached refusals it expires are filed under
+                // the process credential as it now stands.
+                if primary_minted && cross_owner_retry.due() {
+                    let (ws, repo, script) =
+                        (pass_workspace.clone(), owner_repo.clone(), pass_script.clone());
+                    let pass =
+                        credential_preflight::cross_owner::establish_for_workspace_off_thread(
+                            ws, repo, script,
+                        )
+                        .await;
+                    cross_owner_retry.record(&pass);
                 }
             }
         });
@@ -1425,15 +1344,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // once, here at startup, naming exactly what is being ignored and what
         // to tune instead.
         work_finder::warn_deprecated_cpu_knobs(&work_finder_config);
-        // Per-tick admission (ramp) cap (#4234): resolved once at startup from
-        // the same `work_finder_config`, precedence env > config > default —
-        // the same startup-capture pattern as the CPU knobs above. Bounds how
-        // many *new* sweeps a single tick may admit, independent of how large
-        // the dynamic cap computes to that tick — see
-        // `work_finder::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV` for the full
-        // ramp-lag rationale (#4231's second wave).
-        let max_admissions_per_tick =
-            work_finder::resolve_max_admissions_per_tick_with_config(&work_finder_config);
+        // The per-tick admission (ramp) cap (#4234) rides in `configured_max`
+        // and, like it, is re-read every tick since #12090.
+        let max_admissions_per_tick = configured_max.max_admissions_per_tick.0;
         // #4084: hold new dispatch off a root while its build-gate run is in
         // flight, so a fresh sweep build does not race the gate's own build for
         // cores (the contention that timed the gate out under #4073's mild
@@ -1490,8 +1403,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
              max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
              dynamic cap = min(disk, ram, configured_max) — token axis is \
              selection-only, not a cap, since #5270, \
-             global across workspaces; configured_max is re-read every tick — \
-             a config edit hot-applies, an env override needs a restart, #9060)",
+             global across workspaces; configured_max, max_admissions_per_tick and the \
+             brake/breaker thresholds are re-read every tick — a config edit hot-applies, \
+             an env override needs a restart, #9060/#12090)",
             interval.as_secs(),
             configured_max.value,
             configured_max.source,
@@ -1502,6 +1416,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // shared `workspace_pool`. Empty registry ⇒ the single `sweep_workspace`.
         //
         // `startup_reconciliation_ready` (Issue #7974) is awaited internally
+        // (bounded since #12222, see `work_finder::startup_gate`)
         // before the loop's first real tick — see `spawn_startup_passes`'s doc
         // comment above for why this is what still keeps the
         // reconcile-before-dispatch invariant (#6615) intact now that the
@@ -1511,7 +1426,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             sweep_workspace.clone(),
             interval,
             configured_max,
-            max_admissions_per_tick,
             workspace_health_states.clone(),
             suppress_dispatch_during_gate,
             event_bus.clone(),
@@ -1642,14 +1556,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
     // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
     // is on; and the intake reconcile singleton (W7), a config read per tick
-    // unless `fleet.intakeReconcile.singleton` makes this host the producer;
-    // and the shard-owned `loom:blocked` release task (#10763).
-    // The release task serves only through a loop that actually started (#10763
-    // P2), so the role-runner decision is resolved here, once, and reused below.
+    // unless `fleet.intakeReconcile.singleton` makes this host the producer.
+    // (The `loom:blocked` release task that used to start here was retired,
+    // #11301.) The role-runner decision is resolved here, once, and reused below.
     let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
     let role_runner_on = role_runner::resolve_enabled(&role_runner_config);
-    let loops = (_work_finder_handle.is_some(), role_runner_on).into(); // (work finder, role runner)
-    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus, loops);
+    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus);
 
     // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
     let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);
@@ -1921,13 +1833,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
         );
         let handles: Vec<_> = role_runner::DEFAULT_ROLES
             .iter()
+            // #11909: Curator, Judge and Doctor run as work-finder steps only.
+            .filter(|spec| !role_runner::champion_mode::is_step_role(spec.name))
             .map(|spec| {
                 // #6204: log the resolved cadence *with the tier that supplied
-                // it* (built-in / config / env). A uniform interval across
-                // every role is the expected shape of an override — but with
-                // no source in the line it reads as the per-role built-ins
-                // having silently stopped applying, which is how #6204 was
-                // filed against an inherited `LOOM_ROLE_RUNNER_INTERVAL_SECS`.
+                // it* (built-in / config / env). A uniform interval across every
+                // role is the expected shape of an override — but with no source
+                // in the line it reads as the per-role built-ins having silently
+                // stopped applying (#6204, an inherited `LOOM_ROLE_RUNNER_INTERVAL_SECS`).
                 let interval = role_runner::resolve_interval_for_role(spec, &role_runner_config);
                 log::info!(
                     "{}",
