@@ -188,13 +188,11 @@ fi
 # must actually route through post-verdict.sh with the right verdict token —
 # the section existing while the commands agents copy do not is the
 # regression that matters most.
-if ! grep -qF 'post-verdict.sh <number> approved' "$JUDGE_MD"; then
-  fail "judge.md's approval command in Label Workflow no longer posts through post-verdict.sh (#6382) — the loom:verdict-sha marker could be typed as prose again, and dropped"
-fi
-
-if ! grep -qF 'post-verdict.sh <number> changes-requested' "$JUDGE_MD"; then
-  fail "judge.md's changes-requested command in Label Workflow no longer posts through post-verdict.sh (#6382) — the loom:verdict-sha marker could be typed as prose again, and dropped"
-fi
+# Written as `grep || fail` one-liners (like 5c below) so this contract-category
+# guard does not grow epic #7810's portable-shell pool; a Shell-Budget-Growth
+# trailer covers only FLOOR growth, never portable.
+grep -qF 'post-verdict.sh <number> approved' "$JUDGE_MD" || fail "judge.md's approval command in Label Workflow no longer posts through post-verdict.sh (#6382) — the loom:verdict-sha marker could be typed as prose again, and dropped"
+grep -qF 'post-verdict.sh <number> changes-requested' "$JUDGE_MD" || fail "judge.md's changes-requested command in Label Workflow no longer posts through post-verdict.sh (#6382) — the loom:verdict-sha marker could be typed as prose again, and dropped"
 
 # --- 5c: post-verdict.sh is the SOLE merge-gating verdict writer (#12136) ----
 # #9258 correctly made a markerless/unanchored approval unable to gate a merge.
@@ -209,13 +207,8 @@ fi
 # makes such a regression fail CI loudly rather than silently reopen the stall.
 # This does NOT re-check #9258's merge-time rejection — that stays in
 # verdict-staleness-guard.sh/merge-pr.sh and is an additional, earlier guard.
-if ! grep -qF 'SOLE merge-gating verdict writer' "$JUDGE_MD"; then
-  fail "judge.md no longer names post-verdict.sh the SOLE merge-gating verdict writer (#12136) — a bare 'gh pr edit --add-label loom:pr' approval could drop the verdict-sha marker and HARD-STALL the PR (#6319 × #9258)"
-fi
-
-if ! grep -qF 'bare `gh pr edit --add-label "loom:pr"`' "$JUDGE_MD"; then
-  fail "judge.md no longer forbids the bare 'gh pr edit --add-label loom:pr' approval bypass (#12136) — that path drops the verdict-sha marker ~1 in 4 (#6319), and post-#9258 a markerless loom:pr never merges"
-fi
+grep -qF 'SOLE merge-gating verdict writer' "$JUDGE_MD" || fail "judge.md no longer names post-verdict.sh the SOLE merge-gating verdict writer (#12136) — a bare 'gh pr edit --add-label loom:pr' approval could drop the verdict-sha marker and HARD-STALL the PR (#6319 × #9258)"
+grep -qF 'bare `gh pr edit --add-label "loom:pr"`' "$JUDGE_MD" || fail "judge.md no longer forbids the bare 'gh pr edit --add-label loom:pr' approval bypass (#12136) — that path drops the verdict-sha marker ~1 in 4 (#6319), and post-#9258 a markerless loom:pr never merges"
 
 if ! grep -q "verdict-staleness-guard.sh" "$CHAMPION_MERGE_MD"; then
   fail "champion-pr-merge.md no longer runs verdict-staleness-guard.sh before merging — a stale loom:pr approval could auto-merge an unreviewed tree (#5686)"

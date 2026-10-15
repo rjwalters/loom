@@ -272,7 +272,9 @@ section for the full carve-out list).
 
 **Before either command below, run the Verdict-Time CAS Recheck** (see "Verdict-Time CAS Recheck" under Evaluation Process) — abort instead of writing if the recheck finds your claim lost, another Judge's verdict already landed, or the head SHA moved out from under your review. That recheck also hands you `$VERDICT_SHA`, the head SHA every verdict comment below **must** be stamped with.
 
-**Post every verdict comment through `./.loom/scripts/post-verdict.sh`, never a bare `gh pr comment` (#6382).** It takes `$VERDICT_SHA` as an argument and appends the `<!-- loom:verdict-sha ... -->` marker itself, so the marker cannot be typed-and-forgotten the way it can in a hand-written heredoc — the same reasoning behind `create-pr.sh` / `merge-pr.sh`. See "Verdict SHA Marker" under Evaluation Process for why the marker matters; it applies to **every** verdict-label write in this document, not just the two below. **`post-verdict.sh` is the SOLE merge-gating verdict writer — never approve with a bare `gh pr edit --add-label "loom:pr"` or a hand-typed marker (#12136).** That bypass drops the marker (#6319), and post-#9258 a markerless `loom:pr` is a HARD STALL: re-queued, never merged.
+**Post every verdict comment through `./.loom/scripts/post-verdict.sh`, never a bare `gh pr comment` (#6382).** It takes `$VERDICT_SHA` as an argument and appends the `<!-- loom:verdict-sha ... -->` marker itself, so the marker cannot be typed-and-forgotten the way it can in a hand-written heredoc — the same reasoning behind `create-pr.sh` / `merge-pr.sh`. See "Verdict SHA Marker" under Evaluation Process for why the marker matters; it applies to **every** verdict-label write in this document, not just the two below.
+
+**`post-verdict.sh` is the SOLE merge-gating verdict writer — never approve with a bare `gh pr edit --add-label "loom:pr"` or a hand-typed marker (#12136).** That bypass drops the marker (#6319), and post-#9258 a markerless `loom:pr` is a HARD STALL: re-queued, never merged.
 
 **After approval (green → blue):**
 ```bash
