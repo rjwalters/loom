@@ -35,6 +35,24 @@ pub(crate) fn label_reapplied_after(labeled_at: DateTime<Utc>, started_at: DateT
     labeled_at > started_at + chrono::Duration::seconds(LABEL_CLOCK_SKEW_SECS)
 }
 
+/// Whether a non-Builder step's claim label, stamped `labeled_at`, belongs
+/// to another claimant (#11969). The role prompt applies the label itself,
+/// after the daemon's lease, so a label later than the step's start is not
+/// enough on its own (B1): it is this step's while this step's own lease was
+/// live (`own_lease_end`, with the same [`LABEL_CLOCK_SKEW_SECS`] slack), and
+/// someone else's when it came after that lease was released, yielded or
+/// aged out, or when the step has no lease record at all. Pure.
+#[must_use]
+pub(crate) fn label_claimed_elsewhere(
+    labeled_at: DateTime<Utc>,
+    started_at: DateTime<Utc>,
+    own_lease_end: Option<DateTime<Utc>>,
+) -> bool {
+    label_reapplied_after(labeled_at, started_at)
+        && !own_lease_end
+            .is_some_and(|end| labeled_at <= end + chrono::Duration::seconds(LABEL_CLOCK_SKEW_SECS))
+}
+
 impl SweepRegistry {
     /// Release a finished step's claim. Returns `true` when the claim is held
     /// elsewhere, in which case no label is written:
@@ -45,9 +63,9 @@ impl SweepRegistry {
     ///   cross-host check, with slack for the forge's whole-second stamps and
     ///   host drift);
     /// - for every other step, the role's earliest live lease on the item
-    ///   held by another sweep ([`Self::step_lease_held_elsewhere`]). The
-    ///   label is no evidence there: the daemon pre-takes only the role-keyed
-    ///   lease, and the role prompt applies the label itself, later.
+    ///   held by another sweep, or the claim label applied after the step
+    ///   started while no lease of this step's was live: a label-only
+    ///   claimant ([`Self::step_lease_held_elsewhere`]).
     ///
     /// Either way the step's end runs ([`Self::end_step`], #11906): its
     /// leftover leases are reaped and its role-tick capture emitted.
@@ -99,8 +117,11 @@ impl SweepRegistry {
     /// - Builder: `loom:building` re-applied more than
     ///   [`LABEL_CLOCK_SKEW_SECS`] after the step started;
     /// - every other role: the role's earliest live lease held by another
-    ///   sweep. Its label is no evidence: the daemon pre-takes only the lease,
-    ///   and the role prompt applies the label itself, later.
+    ///   sweep, or (#11969) its claim label applied more than
+    ///   [`LABEL_CLOCK_SKEW_SECS`] after the step started and outside this
+    ///   step's own lease ([`label_claimed_elsewhere`]): an attended session
+    ///   that claims by label alone. A label applied inside the step's own
+    ///   lease is the step's: the role prompt applies it after the lease.
     ///
     /// Fail-open (`false`) when the forge cannot answer, and with forge
     /// writes off.
@@ -122,7 +143,9 @@ impl SweepRegistry {
             | StepRole::ChampionPromote
             | StepRole::Judge
             | StepRole::Doctor
-            | StepRole::ChampionMerge => self.step_lease_held_elsewhere(item, role, sweep_id),
+            | StepRole::ChampionMerge => {
+                self.step_lease_held_elsewhere(item, role, sweep_id, started_at)
+            }
         }
     }
 
@@ -132,9 +155,9 @@ impl SweepRegistry {
     /// the roll window keeps it. Decided by lease identity, never label time:
     /// the role prompt applies `loom:reviewing` / `loom:treating` itself,
     /// after the daemon's lease, so a label time would strand a normal step.
-    /// Builder steps never come here (they hold an issue, not a PR), so the
-    /// label-time path of the shared check, which needs a start time, is
-    /// never taken; `now` stands in for it.
+    /// `now` stands in for the start time, so the shared check's label path
+    /// (#11969), which only reads a label applied after the start, never
+    /// fires here.
     ///
     /// # Errors
     /// Why the claim is no longer this run's.
