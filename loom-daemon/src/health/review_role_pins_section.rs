@@ -8,9 +8,12 @@
 //! `health` to say why. This section names the repo and the pinned files.
 //!
 //! Conditional: no section unless a managed repo pins one of these files, so
-//! a host without such pins renders exactly what it did before. Degraded, not
-//! Unknown: the pin is a known fact with a known remedy (lift it, or upstream
-//! the change and resync).
+//! a host without such pins renders exactly what it did before. A **warning**,
+//! never a verdict: the section is Green and never moves `health`'s exit code,
+//! because a repo may pin these files deliberately (a re-ported Champion under
+//! an operator ruling), and a permanently Degraded host drowns the signal.
+//! The daemon also logs one WARN per such repo at startup
+//! ([`pinned_review_roles`], `daemon_startup_reconciliation`).
 
 use super::{HealthInputs, HealthSection, Verdict};
 
@@ -30,8 +33,18 @@ pub fn is_review_role_pin(label: &str) -> bool {
         && REVIEW_ROLES.iter().any(|r| name.starts_with(r))
 }
 
+/// The review-role pins in `root`'s `.loom/resync-ignore`, in file order.
+#[must_use]
+pub fn pinned_review_roles(root: &std::path::Path) -> Vec<String> {
+    crate::resync_pin::read_pins(root)
+        .into_iter()
+        .filter(|p| is_review_role_pin(p))
+        .collect()
+}
+
 /// Assess the `review_role_pins` section from each managed root's pins:
-/// `Some` (Degraded) only when one pins a review role file.
+/// `Some` (a Green warning, `detail.warning = true`) only when one pins a
+/// review role file.
 #[must_use]
 pub fn assess_review_role_pins(inputs: &HealthInputs) -> Option<HealthSection> {
     let hits: Vec<(&str, Vec<&str>)> = inputs
@@ -56,13 +69,14 @@ pub fn assess_review_role_pins(inputs: &HealthInputs) -> Option<HealthSection> {
         .join("; ");
     Some(HealthSection::new(
         "review_role_pins",
-        Verdict::Degraded,
+        Verdict::Green,
         format!(
-            "{} repo(s) pin Champion/Judge/Doctor prompts in .loom/resync-ignore, so they run \
+            "WARNING: {} repo(s) pin Champion/Judge/Doctor prompts in .loom/resync-ignore, so they run \
              stale against this daemon (#11970); lift the pin or upstream the change: {named}",
             hits.len()
         ),
         serde_json::json!({
+            "warning": true,
             "repos": hits
                 .iter()
                 .map(|(root, pins)| serde_json::json!({"root": root, "pins": pins}))
@@ -112,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_champion_prompt_is_degraded_and_named() {
+    fn a_pinned_champion_prompt_is_a_named_warning_that_keeps_the_exit_code() {
         let s = assess_review_role_pins(&inputs(&[
             ("/w/a", &["hooks/guard.sh"]),
             (
@@ -125,8 +139,9 @@ mod tests {
             ),
         ]))
         .unwrap();
-        assert_eq!(s.verdict, Verdict::Degraded);
-        assert!(s.summary.starts_with("1 repo(s)"), "{}", s.summary);
+        assert_eq!(s.verdict, Verdict::Green, "a warning, never a verdict");
+        assert_eq!(s.detail["warning"], true);
+        assert!(s.summary.starts_with("WARNING: 1 repo(s)"), "{}", s.summary);
         assert!(
             s.summary
                 .contains("/w/b: commands/loom/champion-pr-merge.md, roles/judge.md"),
@@ -135,6 +150,36 @@ mod tests {
         );
         assert!(!s.summary.contains("/w/a") && !s.summary.contains("builder"), "{}", s.summary);
         assert_eq!(s.detail["repos"][0]["pins"][1], "roles/judge.md");
+    }
+
+    #[test]
+    fn the_warning_never_changes_the_health_exit_code() {
+        let pinned = inputs(&[("/w/b", &["commands/loom/champion-pr-merge.md"])]);
+        let with = super::super::assess(&pinned);
+        let without = super::super::assess(&inputs(&[]));
+        assert!(with.section("review_role_pins").is_some());
+        assert!(without.section("review_role_pins").is_none());
+        assert_eq!(with.overall, without.overall);
+        assert_eq!(with.exit_code(), without.exit_code());
+    }
+
+    #[test]
+    fn pinned_review_roles_reads_the_ignore_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(pinned_review_roles(dir.path()).is_empty(), "no ignore file");
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/resync-ignore"),
+            "hooks/guard.sh
+.loom/commands/loom/champion-pr-merge.md # local port
+roles/judge.md
+",
+        )
+        .unwrap();
+        assert_eq!(
+            pinned_review_roles(dir.path()),
+            vec!["commands/loom/champion-pr-merge.md", "roles/judge.md"]
+        );
     }
 
     #[test]

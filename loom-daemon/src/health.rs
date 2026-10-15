@@ -2731,11 +2731,14 @@ mod fleet_identity_section;
 
 pub use fleet_identity_section::assess_fleet_identity;
 
-/// The `review_role_pins` section (#11970): Degraded when a managed repo pins
-/// a Champion, Judge or Doctor prompt in `.loom/resync-ignore`.
+/// The `review_role_pins` section (#11970): a warning (Green, exit code
+/// unchanged) when a managed repo pins a Champion, Judge or Doctor prompt in
+/// `.loom/resync-ignore`.
 mod review_role_pins_section;
 
-pub use review_role_pins_section::{assess_review_role_pins, is_review_role_pin};
+pub use review_role_pins_section::{
+    assess_review_role_pins, is_review_role_pin, pinned_review_roles,
+};
 
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
