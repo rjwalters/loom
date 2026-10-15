@@ -387,9 +387,9 @@ awk '/^_revalidate_merge_guards\(\) \{/ {on=1} on {print} on && /^}/ {exit}' "$M
 # shellcheck disable=SC1090
 source "$REVAL_FILE"
 forge_get_pr_nocache() { echo '{"head":{"sha":"deadbeef"},"labels":[{"name":"loom:pr"}]}'; }
-_check_loom_pr_label() { echo "LABEL-CHECKED"; [ "${LABEL:-ok}" = ok ] || { echo "ERROR: loom:pr gone" >&2; exit 1; }; }
+_check_loom_pr_label() { echo "LABEL-CHECKED"; [ "${STUB_LABEL:-ok}" = ok ] || { echo "ERROR: loom:pr gone" >&2; exit 1; }; }
 _check_verdict_label_contradiction() { :; }
-_check_ci_result() { [ "${CI:-ok}" = ok ] || { echo "ERROR: CI red" >&2; exit 1; }; }
+_check_ci_result() { [ "${STUB_CI:-ok}" = ok ] || { echo "ERROR: CI red" >&2; exit 1; }; }
 GH=gh; MERGE_PRECONDITION_SHA="deadbeef"
 # A stub that answers revalidate-head CLEAR, auto-refresh per phase
 # ($AR_VERDICT for verdict, $AR_MODE for stale) and stale-checks per $STALE.
@@ -432,8 +432,8 @@ assert_contains "$LAST_OUT" "LABEL-CHECKED" "the loom:pr re-check runs BEFORE th
 # refresh push: neither the verdict gate nor the freshness re-check is asked.
 for gate in LABEL CI; do
     reset_argv
-    if [[ $gate == LABEL ]]; then LABEL=revoked STALE=stale AR_VERDICT=clear LOOM_DAEMON_BIN="$REVAL_STUB" run_reval
-    else CI=red STALE=stale AR_VERDICT=clear LOOM_DAEMON_BIN="$REVAL_STUB" run_reval; fi
+    if [[ $gate == LABEL ]]; then STUB_LABEL=revoked STALE=stale AR_VERDICT=clear LOOM_DAEMON_BIN="$REVAL_STUB" run_reval
+    else STUB_CI=red STALE=stale AR_VERDICT=clear LOOM_DAEMON_BIN="$REVAL_STUB" run_reval; fi
     assert_eq "1" "$LAST_RC" "$gate revoked during the wait -> refused (exit 1)"
     assert_eq "" "$(ar_calls)" "$gate revoked during the wait -> the auto-refresh verb is never asked"
     assert_eq "no" "$([[ -f "$STUB_DIR/argv-stale-checks" ]] && echo yes || echo no)" "$gate revoked during the wait -> no refresh push"
