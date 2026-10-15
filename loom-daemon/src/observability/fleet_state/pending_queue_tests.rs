@@ -38,6 +38,7 @@ fn skip_park_and_proposal_labels_are_ineligible() {
         "loom:frozen",
         "loom:operator-only",
         "loom:epic",
+        "loom:building",
         "loom:architect",
         "loom:hermit",
         "loom:auditor",

@@ -277,6 +277,11 @@ type LabelListing = BTreeMap<u32, Option<DateTime<Utc>>>;
 /// [`crate::work_finder::SKIP_LABELS`], a superset of `PARK_LABELS`, so the
 /// holds under every name) and no proposal label
 /// ([`crate::premise_check::scope::PROPOSAL_LABELS`]). Pure.
+///
+/// `SKIP_LABELS` also covers `loom:building` and `loom:epic`, so both are
+/// excluded on purpose: a `loom:building` issue is already claimed by a
+/// Builder (not waiting on a human), and `loom:epic` is a tracking container
+/// no one curates or approves as work.
 pub(super) fn is_eligible<S: AsRef<str>>(labels: &[S]) -> bool {
     !labels.iter().any(|l| {
         let l = l.as_ref();
