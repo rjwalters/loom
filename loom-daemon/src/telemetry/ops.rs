@@ -125,6 +125,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.draw_attempt",
     "loom.step.age_source",
     "loom.step.resumed",
+    // `loom.dispatch.step` claim facts (Issue #12183).
+    "loom.dispatch.claim_outcome",
+    "loom.dispatch.claim_exit_code",
+    "loom.dispatch.claim_ms",
+    "loom.dispatch.claim_stderr_tail",
     // `loom.dispatch.disposition` spans (Issue #9222).
     "loom.queue.disposition",
     "loom.queue.state",

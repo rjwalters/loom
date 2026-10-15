@@ -7,7 +7,7 @@ use super::capture::{
     emit_step_capture, parse_outcome_line, read_outcome_line, tick_outcome, StepCapture, StepEnd,
     StepOutcomeClass,
 };
-use super::lease::{claim_args, claim_verdict};
+use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
 use super::*;
 use crate::observability::ops::capture::capture;
@@ -199,11 +199,14 @@ fn the_pre_claim_is_the_role_keyed_lease_with_the_step() {
 
 #[test]
 fn a_lost_or_unreadable_pre_claim_refuses_the_step() {
-    assert_eq!(claim_verdict(Some(0)), Ok(()));
-    assert_eq!(claim_verdict(Some(4)).unwrap_err().reason, "claim_lost");
-    assert_eq!(claim_verdict(Some(6)).unwrap_err().reason, "backstop_hold");
-    assert_eq!(claim_verdict(Some(5)).unwrap_err().reason, "claim_unverified");
-    assert_eq!(claim_verdict(None).unwrap_err().reason, "claim_unverified");
+    assert_eq!(claim_verdict(&ClaimRun::Exited(0)), Ok(()));
+    let reason = |run: ClaimRun| claim_verdict(&run).unwrap_err().reason;
+    assert_eq!(reason(ClaimRun::Exited(4)), "claim_lost");
+    assert_eq!(reason(ClaimRun::Exited(6)), "backstop_hold");
+    assert_eq!(reason(ClaimRun::Exited(5)), "claim_unverified");
+    assert_eq!(reason(ClaimRun::TimedOut), "claim_unverified");
+    assert_eq!(reason(ClaimRun::SpawnFailed), "claim_unverified");
+    assert_eq!(reason(ClaimRun::Signaled), "claim_unverified");
 }
 
 // ---- B3: the timeout ------------------------------------------------------

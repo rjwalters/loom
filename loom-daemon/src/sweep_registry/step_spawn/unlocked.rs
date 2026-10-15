@@ -56,7 +56,13 @@ impl SweepRegistry {
     ) -> Result<DispatchOutcome> {
         let refuse = |refusal: StepRefusal| -> anyhow::Error {
             let reg = locked(registry);
-            reg.record_step_dispatch(request, dispatch_step::RESULT_REFUSED, refusal.reason, None);
+            reg.record_step_dispatch(
+                request,
+                dispatch_step::RESULT_REFUSED,
+                refusal.reason,
+                None,
+                refusal.claim.as_ref(),
+            );
             log::info!(
                 "sweep_registry: {} step on #{} not spawned — {refusal}",
                 request.role,
@@ -101,10 +107,14 @@ impl SweepRegistry {
             (role != StepRole::Builder && !config.skip_label_flip)
                 .then(|| reg.step_claim_command(item, role, &sweep_id))
         };
+        let mut claim = None;
         if let Some(cmd) = claim_cmd {
-            if let Err(refusal) = blocking(|| super::lease::run_step_claim(cmd)) {
-                locked(registry).unwind_step_claim(item, role, &sweep_id, false);
-                return Err(refuse(refusal));
+            match blocking(|| super::lease::run_step_claim(cmd)) {
+                Ok(facts) => claim = Some(facts),
+                Err(refusal) => {
+                    locked(registry).unwind_step_claim(item, role, &sweep_id, false);
+                    return Err(refuse(refusal));
+                }
             }
         }
         let mut prepared = {
@@ -132,6 +142,7 @@ impl SweepRegistry {
                 }
             }
         };
+        prepared.claim = claim;
         let (token_name, runtime, death) = blocking(|| {
             poll_and_classify_spawned_child(
                 &mut prepared.child,
