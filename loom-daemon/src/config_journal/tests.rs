@@ -258,6 +258,11 @@ fn render_and_restart_lifecycle_projects_without_divergence() {
     let env = Env::new(true);
     let loom_dir = env.dir.path();
     let keys = vec!["daemon.x".to_string()];
+    // One instant for every marker: the divergence check compares
+    // `renderedAt` at whole-second precision, so two `Utc::now()` calls that
+    // straddle a second boundary on a loaded runner added a spurious
+    // `renderedAt` divergence (#11660).
+    let rendered_at = Utc.with_ymd_and_hms(2026, 10, 11, 1, 2, 3).unwrap();
     append_rendered(
         "machine",
         Path::new("/m/defaults.json"),
@@ -265,7 +270,7 @@ fn render_and_restart_lifecycle_projects_without_divergence() {
         Some("c0ffee"),
         &keys,
     );
-    crate::fleet_store::pending_restart::record(keys.clone(), 4242, Utc::now()).unwrap();
+    crate::fleet_store::pending_restart::record(keys.clone(), 4242, rendered_at).unwrap();
     let recs = env.records();
     assert_eq!(recs[0].envelope.data["store_commit"], "c0ffee");
     assert_eq!(recs[0].envelope.data["backup"], "/m/b");
@@ -278,14 +283,14 @@ fn render_and_restart_lifecycle_projects_without_divergence() {
     assert!(divergence(&env.root(), loom_dir).is_clean());
 
     // A legacy marker the journal does not know about is a divergence.
-    crate::fleet_store::pending_restart::record(keys, 1, Utc::now()).unwrap();
+    crate::fleet_store::pending_restart::record(keys, 1, rendered_at).unwrap();
     std::fs::write(
         loom_dir.join(crate::fleet_store::pending_restart::FILENAME),
-        json!({"paths": ["other"], "observedPid": 1, "renderedAt": Utc::now()}).to_string(),
+        json!({"paths": ["other"], "observedPid": 1, "renderedAt": rendered_at}).to_string(),
     )
     .unwrap();
     let report = divergence(&env.root(), loom_dir);
-    assert_eq!(report.total, 1);
+    assert_eq!(report.total, 1, "{:?}", report.divergences);
     assert_eq!(report.divergences[0].field, "paths");
 }
 
