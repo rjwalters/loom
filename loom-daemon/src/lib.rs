@@ -250,6 +250,7 @@ pub mod guards_status;
 pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;
+pub mod hooks_home;
 pub mod host_affinity;
 pub mod host_breaker;
 pub mod host_identity;

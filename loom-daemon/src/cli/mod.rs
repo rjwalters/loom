@@ -64,6 +64,7 @@ mod git_blob_lines;
 mod guard_mcp_tools;
 mod guards_status;
 pub(crate) mod health;
+mod hooks_home_cmd;
 pub(crate) mod host;
 mod host_id_cmd;
 pub(crate) mod inflight;
