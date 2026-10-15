@@ -218,13 +218,23 @@ impl GhInvocation {
         let mut decision = lookup(&request);
         loop {
             let (dir, app_id) = match decision {
-                RouteDecision::NoPool => {
+                RouteDecision::NoPool if tried.is_empty() => {
                     // No reader pool at all: the writer, as before W4.
-                    return if tried.is_empty() {
-                        self.execute_direct()
-                    } else {
-                        self.writer_fallback()
-                    };
+                    return self.execute_direct();
+                }
+                RouteDecision::NoPool => {
+                    let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
+                    // Nothing says budget: the writer serves it, as before
+                    // (except inside a tick's read scope, #12074).
+                    return self.no_reader_left(
+                        class,
+                        ExhaustCause::Unavailable,
+                        &owner,
+                        resource,
+                        until,
+                        last_app.as_deref(),
+                        true,
+                    );
                 }
                 RouteDecision::Exhausted { until, cause } => {
                     return self.no_reader_left(
@@ -355,7 +365,20 @@ impl GhInvocation {
         app: Option<&str>,
         tried: bool,
     ) -> Result<GhCompletion, ExecError> {
-        if class == ReadClass::Gate || cause != ExhaustCause::Budget {
+        // #12074: inside a work-finder tick's read scope, a read whose
+        // readers are out of BUDGET is shed whatever its class: the tick
+        // answers it from its caches, and the writer's (dispatch App's)
+        // budget is left to the claims and merges during a rate-limit
+        // back-off. Any other cause (a failing gateway, a coverage miss)
+        // still reaches the writer, bounded by the deadline's clamp; and a
+        // repo starved for several ticks lifts the rule for one
+        // ([`super::super::read_deadline::writer_fallback_allowed`]).
+        let in_tick = tried
+            && cause == ExhaustCause::Budget
+            && !super::super::read_deadline::writer_fallback_allowed();
+        // A starved repo's escalated tick lifts every budget shed.
+        let escalated = super::super::read_deadline::escalated();
+        if escalated || (!in_tick && (class == ReadClass::Gate || cause != ExhaustCause::Budget)) {
             return if tried {
                 self.writer_fallback()
             } else {
