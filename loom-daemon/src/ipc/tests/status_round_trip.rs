@@ -107,6 +107,10 @@ fn test_daemon_status_request_response_round_trip() {
         auto_update_artifact_published_at: Some("2026-09-13T12:00:00Z".to_string()),
         auto_update_stale_repo_ticks: 0,
         auto_update_stale_repo: None,
+        auto_update_floor_not_rolling: Some(
+            crate::auto_update::not_rolling::FloorNotRolling::Unsupervised,
+        ),
+        auto_update_config_enabled: Some(false),
         task_liveness: Vec::new(),
         session_containers: Some(crate::session_status::SessionContainersReport {
             observation: "available".into(),
@@ -163,6 +167,7 @@ fn test_daemon_status_request_response_round_trip() {
         daemon_build_commit: Some("18887b5c".to_string()),
         daemon_built_at_raw: Some("2026-08-02T03:09:51Z".to_string()),
         work_finder_interval_secs: Some(60),
+        startup_jitter_delay_secs: Some(437),
         observability_host_id_mismatch: Some(crate::types::ObservabilityHostIdMismatch {
             daemon_host_id: "robb-studio".to_string(),
             ingest_host_id: "robb-pro".to_string(),
@@ -250,6 +255,7 @@ fn test_daemon_status_request_response_round_trip() {
     match back {
         Response::DaemonStatus(r) => {
             assert_eq!(r.token_pool_size, 4);
+            assert_eq!(r.startup_jitter_delay_secs, Some(437));
             let sessions = r
                 .session_containers
                 .as_ref()
@@ -265,6 +271,11 @@ fn test_daemon_status_request_response_round_trip() {
                 Some("fleet floor only (autoUpdate.enabled=false)")
             );
             assert_eq!(r.auto_update_consecutive_failures, 2);
+            assert_eq!(
+                r.auto_update_floor_not_rolling,
+                Some(crate::auto_update::not_rolling::FloorNotRolling::Unsupervised)
+            );
+            assert_eq!(r.auto_update_config_enabled, Some(false));
             assert_eq!(r.auto_update_backoff_secs, Some(120));
             assert_eq!(r.auto_update_note.as_deref(), Some("within settle window"));
             assert_eq!(r.loadavg_1m, Some(1.25));

@@ -446,12 +446,6 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
-path = "scripts/cleanup-branches.sh"
-calls = 1
-owner = "repo-tooling"
-removal_issue = 9799
-
-[[bypass]]
 path = "scripts/install/create-pr.sh"
 calls = 6
 owner = "installer"

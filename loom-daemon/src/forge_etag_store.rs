@@ -449,7 +449,11 @@ pub(crate) fn gateway_fault(
     if app != Some(crate::forge_gateway::GATEWAY_APP_ID) || r.0.success() {
         return crate::forge_gateway::outage::Fault::None;
     }
-    crate::forge_gateway::outage::fault(r.1.as_ref(), "", &r.2)
+    crate::forge_gateway::outage::escalate(crate::forge_gateway::outage::fault(
+        r.1.as_ref(),
+        "",
+        &r.2,
+    ))
 }
 
 pub(crate) fn reader_failure(r: &FetchResult) -> Option<crate::forge_identity::Failure> {
@@ -534,6 +538,8 @@ fn run_fetch_with(
         .execute()
     {
         Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+        // #12074: the tick deadline passed; nothing was sent.
+        Ok(GhCompletion::Shed { until, .. }) => return Err(anyhow::Error::new(ReadShed { until })),
         Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", timeout.as_secs()),
         Err(e) => return Err(e).with_context(|| format!("failed to invoke {}", gh_bin.display())),
     };

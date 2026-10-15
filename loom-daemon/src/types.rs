@@ -1568,6 +1568,17 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
+    /// #11042: why a host below the fleet floor is not rolling (typed:
+    /// `unsupervised`, `backoff`, `unsatisfiable`, …), or `None` when it is
+    /// not below the floor or is rolling. Absent from an older daemon.
+    #[serde(default)]
+    pub auto_update_floor_not_rolling: Option<crate::auto_update::not_rolling::FloorNotRolling>,
+    /// #11042: what `autonomous.autoUpdate.enabled` resolved to. Since #10954
+    /// `auto_update_enabled` means "the loop runs", which a fleet host's loop
+    /// does for the floor alone; this is the setting beside it. `None` before
+    /// the spawn decision and from an older daemon.
+    #[serde(default)]
+    pub auto_update_config_enabled: Option<bool>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
@@ -1835,6 +1846,12 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data compatible.
     #[serde(default)]
     pub work_finder_interval_secs: Option<u64>,
+    /// The per-host post-restart delay before this process's first
+    /// fleet-wide gather (#12073, [`crate::startup_jitter`]). `health` adds it
+    /// to the first-tick grace window, so a host still inside its jitter reads
+    /// as warming up. `None` when the gate is unarmed or for an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_jitter_delay_secs: Option<u64>,
     /// An observability-exporter host-identity mismatch detected this process
     /// (Issue #4830): the ingest key installed on this host is bound to a
     /// *different* `host_id` than the one this daemon reports for itself, so

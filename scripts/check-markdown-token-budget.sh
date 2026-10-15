@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # check-markdown-token-budget.sh — ratchet agent-facing markdown so it stops
-# growing, measured in tokens rather than lines (#7725, the markdown sibling
-# of scripts/check-file-size-budget.sh — see #7716/#7711).
+# growing, measured in tokens rather than lines (#7725, #7716).
 #
 # Why: role prompts and slash-command bodies are prepended into an agent's
 # context on every invocation, the same load-bearing category CLAUDE.md's own
 # check-claude-md-budget.sh guards (#4014). Unlike CLAUDE.md there is no single
 # 320-line budget to enforce — there are dozens of independently-growing files
-# — so this mirrors check-file-size-budget.sh's ratchet instead: freeze each
+# — so this is a ratchet instead: freeze each
 # file at its CURRENT size, let it shrink, never let it grow. See
-# .loom/docs/file-size-policy.md for the shared ratchet philosophy.
+# .loom/docs/prompt-budget-policy.md for the shared ratchet philosophy.
 #
 # Token proxy: no real LLM tokenizer is available in CI as of 2026-09-16, so
 # tokens are approximated from raw byte count: tokens = ceil(bytes / 4). This
@@ -37,8 +36,7 @@
 # Explicitly OUT of scope: defaults/docs/*.md and its .loom/docs/*.md install
 # mirror (reference documentation, never inlined into a prompt), and every
 # .loom/* installed mirror generally (resync copies of defaults/, measured at
-# their defaults/ source — same reasoning check-file-size-budget.sh uses for
-# .loom/hooks, .loom/scripts, .loom/docs).
+# their defaults/ source).
 #
 # Usage:
 #   check-markdown-token-budget.sh              Check the tree against the baseline.
@@ -49,14 +47,13 @@
 #   check-markdown-token-budget.sh --help
 #
 # The baseline (scripts/markdown-token-baseline.txt) records EVERY file in the
-# measured set at its current size, unconditionally — unlike
-# check-file-size-budget.sh's baseline (which only lists files already over
-# threshold), there is no reason to filter here: the measured set is small and
+# measured set at its current size, unconditionally — there is no reason to
+# filter: the measured set is small and
 # fully enumerable, so tracking all of it costs nothing and catches growth in
 # every file, not just the biggest ones. --threshold only matters for a file
 # that is NOT yet in the baseline (e.g. a brand new slash command added since
 # the last --update) — such a file fails immediately if it is already over
-# threshold, the same "newly crossed" case check-file-size-budget.sh has.
+# threshold.
 #
 # --update is for two legitimate cases: (1) recording shrinkage after a real
 # trim, so the ratchet tightens; (2) admitting a new file's current size after
@@ -177,7 +174,7 @@ write_baseline() {
     echo "#"
     echo "# This is a debt ledger, not a target. The numbers should only ever go DOWN."
     echo "# A diff that raises a number needs a clear reason in the PR description —"
-    echo "# see .loom/docs/file-size-policy.md."
+    echo "# see .loom/docs/prompt-budget-policy.md."
     echo "#"
     echo "# <token-estimate> <path>"
     measure_all
@@ -189,7 +186,7 @@ write_baseline() {
 # Exercises discovery (dedup of the defaults/roles/ symlink vs. its
 # defaults/.claude/commands/loom/ target, README.md exclusion, .loom/ and
 # defaults/docs/ exemption) and all three verdicts against synthetic fixtures
-# in a throwaway repo. Mirrors check-file-size-budget.sh --self-test.
+# in a throwaway repo.
 self_test() {
   local tmp rc=0 out S T
   tmp="$(mktemp -d)"
@@ -363,7 +360,7 @@ if (( ${#grew[@]} > 0 || ${#crossed[@]} > 0 )); then
     echo "run --update and say so in the PR description."
     echo ""
     echo "Do NOT hand-edit the baseline upward — that is the ratchet slipping. See"
-    echo ".loom/docs/file-size-policy.md."
+    echo ".loom/docs/prompt-budget-policy.md."
   } >&2
   exit 1
 fi

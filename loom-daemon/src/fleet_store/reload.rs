@@ -78,6 +78,18 @@ const TABLE: &[(&str, Reloadability)] = &[
     // `spawn_multi_work_finder_task`'s tick body.
     ("autonomous.workFinder.maxConcurrent", Reloadability::Live),
     ("autonomous.workFinder.maxConcurrentPerRepo", Reloadability::Live),
+    // #12090: the per-tick admission (ramp) cap rides the same per-tick read
+    // (`ConfiguredMaxReloader::max_admissions_per_tick`), as does its
+    // `hyperparameters.dispatch` home (`apply_hyperparams` overlays it, and
+    // `maxConcurrent`, inside that same `read_work_finder_config` call).
+    ("autonomous.workFinder.maxAdmissionsPerTick", Reloadability::Live),
+    ("hyperparameters.dispatch.maxAdmissionsPerTick", Reloadability::Live),
+    ("hyperparameters.dispatch.maxConcurrent", Reloadability::Live),
+    // #12090: the brake's and breaker's thresholds are pushed into their
+    // process-global handles every tick by `ConfiguredMaxReloader::refresh()`
+    // (`admission_brake::global_reload`, `host_breaker::global_reload`).
+    ("autonomous.workFinder.saturationBrake", Reloadability::Live),
+    ("autonomous.hostBreaker", Reloadability::Live),
     // Re-read fresh on every candidate-list call —
     // `WorkDispatcher::extra_skip_labels` in
     // `loom-daemon/src/work_finder/forge.rs` reads
@@ -86,16 +98,17 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from config each time a red-main fix is waiting (#10118) —
     // `main_red_fix::escalate_after`, never cached.
     ("autonomous.workFinder.redFixEscalateAfterSecs", Reloadability::Live),
-    // Everything else under `autonomous.workFinder` — `enabled` (gates
-    // whether the loop is spawned at all), `intervalSecs` (the ticker's
-    // fixed period), `maxAdmissionsPerTick`, `saturationBrake.*` — is
-    // resolved once at daemon
-    // bring-up in `daemon_service.rs`'s work-finder startup block, before
-    // the loop is spawned.
+    // Read from config at the start of every work-finder tick (#12074) —
+    // `step_dispatch::gather_budget::begin_tick`, never cached.
+    ("autonomous.workFinder.tickDeadlineSecs", Reloadability::Live),
+    // Everything else under `autonomous.workFinder` is resolved once at
+    // daemon bring-up in `daemon_service.rs`'s work-finder startup block,
+    // before the loop is spawned: `enabled` (gates whether the loop is
+    // spawned at all) and `intervalSecs` (the ticker's period, which also
+    // seeds the forge-event poll gate's base cadence and the armed early-tick
+    // registration — re-arming only the ticker would leave those stale, so it
+    // stays restart-required until they can follow it; #12090).
     ("autonomous.workFinder", Reloadability::RestartRequired),
-    // Resolved once at startup and registered as a process-global handle
-    // (`host_breaker::register_global`, `daemon_service.rs`).
-    ("autonomous.hostBreaker", Reloadability::RestartRequired),
     // Resolved once at startup, before any loop is spawned
     // (`rate_limit_breaker::register_global`, `daemon_service.rs`).
     ("autonomous.rateLimitBreaker", Reloadability::RestartRequired),
@@ -160,22 +173,40 @@ mod tests {
     }
 
     #[test]
-    fn work_finder_enabled_and_admissions_are_restart_required() {
+    fn work_finder_enabled_and_interval_are_restart_required() {
         assert_eq!(classify("autonomous.workFinder.enabled"), Reloadability::RestartRequired);
-        assert_eq!(
-            classify("autonomous.workFinder.maxAdmissionsPerTick"),
-            Reloadability::RestartRequired
-        );
         assert_eq!(classify("autonomous.workFinder.intervalSecs"), Reloadability::RestartRequired);
         assert_eq!(
-            classify("autonomous.workFinder.saturationBrake.enabled"),
+            classify("hyperparameters.dispatch.tickIntervalSecs"),
             Reloadability::RestartRequired
         );
     }
 
+    /// #12090: the work-finder tuning keys hot-reload like `maxConcurrent`.
     #[test]
-    fn breakers_and_health_gate_are_restart_required() {
-        assert_eq!(classify("autonomous.hostBreaker.enabled"), Reloadability::RestartRequired);
+    fn work_finder_tuning_keys_are_live() {
+        for path in [
+            "autonomous.workFinder.maxAdmissionsPerTick",
+            "hyperparameters.dispatch.maxAdmissionsPerTick",
+            "hyperparameters.dispatch.maxConcurrent",
+            "autonomous.workFinder.saturationBrake",
+            "autonomous.workFinder.saturationBrake.enabled",
+            "autonomous.workFinder.saturationBrake.loadPerCoreHold",
+            "autonomous.workFinder.saturationBrake.cpuBusyHold",
+            "autonomous.workFinder.saturationBrake.sustainTicks",
+            "autonomous.workFinder.saturationBrake.starvationWarnSecs",
+            "autonomous.workFinder.saturationBrake.starvationEscapeSecs",
+            "autonomous.hostBreaker.enabled",
+            "autonomous.hostBreaker.loadPerCoreTrip",
+            "autonomous.hostBreaker.sustainTicks",
+            "autonomous.hostBreaker.cooldownSecs",
+        ] {
+            assert_eq!(classify(path), Reloadability::Live, "{path}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_breaker_and_health_gate_are_restart_required() {
         assert_eq!(classify("autonomous.rateLimitBreaker.enabled"), Reloadability::RestartRequired);
         assert_eq!(classify("autonomous.mainHealthGate.enabled"), Reloadability::RestartRequired);
         assert_eq!(classify("autonomous.transcriptIngest.enabled"), Reloadability::RestartRequired);
@@ -207,7 +238,7 @@ mod tests {
     fn partition_splits_and_preserves_order() {
         let paths = vec![
             "autonomous.roleRunner.enabled".to_string(),
-            "autonomous.hostBreaker.enabled".to_string(),
+            "autonomous.rateLimitBreaker.enabled".to_string(),
             "autonomous.workFinder.maxConcurrent".to_string(),
         ];
         let (live, restart_required) = partition(&paths);
@@ -218,6 +249,6 @@ mod tests {
                 "autonomous.workFinder.maxConcurrent".to_string(),
             ]
         );
-        assert_eq!(restart_required, vec!["autonomous.hostBreaker.enabled".to_string()]);
+        assert_eq!(restart_required, vec!["autonomous.rateLimitBreaker.enabled".to_string()]);
     }
 }
