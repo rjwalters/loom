@@ -204,7 +204,7 @@ if [[ -s "$FIXTURE_DIR/p2.sh" ]]; then
 fi
 
 echo ""
-echo "Test 1c: a loom:curated proposal or epic has one owner -- Priority 2, never Priority 3/4 (#11922)"
+echo "Test 1c: a loom:curated proposal has one owner -- Priority 2, never Priority 3; a curated epic stays in Priority 4 (#11922)"
 # `--non-item` runs Priority 3 and 4 but never Priority 2; under step dispatch
 # a curated proposal is a `--issue` Champion step. A curated issue that the
 # Priority 3/4 queries also return would be evaluated by both.
@@ -225,10 +225,12 @@ if [[ ! -s "$FIXTURE_DIR/p3.sh" || ! -s "$FIXTURE_DIR/p4.sh" ]]; then
 else
     assert_eq "#40" "$(run_query p3.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
         "Priority 3 skips curated architect, hermit and auditor proposals"
-    assert_eq "#44" "$(run_query p4.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
-        "Priority 4 skips a curated epic"
+    # step_item.rs `decide_issue` passes every epic before the curated row, so
+    # under `--non-item` Priority 4 is a curated epic's only owner.
+    assert_eq "#44 #45" "$(run_query p4.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
+        "Priority 4 keeps a curated epic (its only --non-item owner)"
     assert_eq "#41 #42 #43 #45" "$(run_query p2.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
-        "Priority 2 still owns every curated proposal and epic (none is orphaned)"
+        "Priority 2 still owns every curated proposal and epic in batch mode"
 fi
 
 # ---------------------------------------------------------------------------

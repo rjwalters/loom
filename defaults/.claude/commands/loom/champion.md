@@ -131,7 +131,8 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-issu
 ### Priority 4: Epic Proposals Ready to Evaluate
 
 If no individual proposals need promotion, check for epic proposals (a
-`loom:curated` epic is Priority 2's, as in Priority 3, #11922):
+`loom:curated` epic stays in this query: step dispatch never draws an epic
+for `--issue`, so under `--non-item` this is its only owner, #11922):
 
 ```bash
 # Epic proposals, highest priority level first (#11103)
@@ -140,7 +141,7 @@ gh issue list \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments \
-  --jq 'sort_by([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end) | .[] | select(any(.labels[]?.name; . == "loom:frozen" or . == "loom:curated") | not) | "#\(.number) \(.title) [epic]"'
+  --jq 'sort_by([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "#\(.number) \(.title) [epic]"'
 ```
 
 If found, **read and follow instructions in `.claude/commands/loom/champion-epic.md`**. Epics have their own evaluation criteria focused on structure and phase decomposition.

@@ -216,10 +216,10 @@ for q in "Pass 0b, Pass 0c" "Priority 3: architect, hermit and auditor proposals
 done
 check "--non-item skips Priority 1 (loom:pr merges) and Priority 2 (curated)" \
   has '**Skipped:** Priority 1 (`pr-queue --role champion`, every merge, the Held-PR'
-check "--non-item: never claims, evaluates or writes a verdict on a curated issue; writes nothing on a loom:pr PR" \
+check "--non-item: never claims, evaluates or writes a verdict on a curated proposal (epics stay Priority 4's); writes nothing on a loom:pr PR" \
   has 'It never
-claims, evaluates or writes a verdict on one, and it writes nothing on a
-`loom:pr` PR'
+claims, evaluates or writes a verdict on a curated proposal (epics are
+Priority 4'"'"'s), and it writes nothing on a `loom:pr` PR'
 check "--non-item: the census line is still mandatory" has '`Merge-risk holds:` line is still mandatory'
 
 echo "Results: $PASS passed, $FAIL failed"
