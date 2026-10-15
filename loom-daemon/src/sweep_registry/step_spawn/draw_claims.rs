@@ -10,13 +10,14 @@
 //! - every item this registry runs (a live sweep or step);
 //! - every item a peer advertises a live claim on
 //!   (`PeerClaimView::claimed_issues_at`);
-//! - every other Champion merge in the repo while a peer is merging there
-//!   (`PeerClaimView::merge_in_flight_at`, the best-effort per-repo merge
-//!   serialisation of design §6).
+//! - every other Champion merge in the repo while this host or a peer is
+//!   merging there (`PeerClaimView::merge_in_flight_at`, the best-effort
+//!   per-repo merge serialisation of design §6).
 
 use std::collections::HashSet;
 
 use super::*;
+use crate::step_role::StepRole;
 
 /// The items the draw skips, and a peer's merge in flight in this repo.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -40,11 +41,26 @@ impl SweepRegistry {
             })
             .collect();
         items.extend(self.peer_claimed_issues());
-        let merge_in_flight = self.peer_claims.as_ref().and_then(|view| {
-            let repo = peer_claims::repo_slug(&self.config.workspace_root);
-            view.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .merge_in_flight_at(&repo, Instant::now())
+        // This host's own live merge serialises the repo too, not only a
+        // peer's.
+        let own_merge = self
+            .entries
+            .values()
+            .filter(|i| matches!(i.state, SweepState::Running | SweepState::Pending))
+            .find_map(|i| match i.kind {
+                SweepKind::Step {
+                    item,
+                    role: StepRole::ChampionMerge,
+                } => Some((item, host_identity())),
+                _ => None,
+            });
+        let merge_in_flight = own_merge.or_else(|| {
+            self.peer_claims.as_ref().and_then(|view| {
+                let repo = peer_claims::repo_slug(&self.config.workspace_root);
+                view.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .merge_in_flight_at(&repo, Instant::now())
+            })
         });
         DrawClaims {
             items,

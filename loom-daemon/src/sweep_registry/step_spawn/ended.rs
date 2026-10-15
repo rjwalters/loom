@@ -84,7 +84,7 @@ fn queue() -> &'static Mutex<Queue> {
 /// At most this many ended steps wait per root; older ones are dropped.
 const MAX_QUEUED: usize = 256;
 
-pub(crate) fn push(root: &Path, step: EndedStep) {
+pub fn push(root: &Path, step: EndedStep) {
     let mut q = queue()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

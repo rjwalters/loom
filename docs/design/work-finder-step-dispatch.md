@@ -140,7 +140,8 @@ Notes on the table:
    - **`age`** = `1 + min(stage_age_days, 90) / 30`.
    - **Seed:** `loom-draw/v2` = `sha256("loom-draw/v2:"+minute+":"+host+":"+tick_counter+":"+workspace+":"+draw_index)`. Draws are without replacement and replayable from `pick.decision`, which logs each workspace's starting pool (in pool order, with weights) and every draw's roll and picked index.
    - The weights are numeric hyperparameters in the strict block.
-4. **Gate and claim** for the step's role: saturation, ramp cap, per-repo RAM/disk cap, then the claim (§5). **On a pass, draw again**, up to 8 redraws per slot and 32 per tick. Count each pass with its reason, including `claim_lost`.
+4. **Gate and claim** for the step's role: saturation, ramp cap, per-repo RAM/disk cap, then the claim (§5). **On a pass, draw again**: at most 8 draws fill one slot and at most 32 passes are taken in one tick (`step_dispatch/tick.rs`, `MAX_DRAWS_PER_SLOT`, `MAX_PASSES_PER_TICK`). Saturation and the ramp cap are host-wide, so they bound how many slots the tick fills rather than refusing one draw; a repo over its RAM, disk or count cap leaves the draw for the rest of the tick. Each pass is counted by its reason, including `claim_lost`, on `pick.decision` (`refused_<reason>` beside the weight-0 counts) and, for the pool gate and the claim, in the outcome ledger.
+   - Before the draw, an item this host runs (a live sweep or step) or a peer advertises a live claim on is a `claimed` pass, and while a peer's Champion merge is in flight in the repo every other merge step there is too (`SweepRegistry::draw_claims`, `PeerClaimView::merge_in_flight_at`). The classifier's `claimed` row reads labels only, and a non-Builder step labels its item late.
 5. **Spawn** `/loom:<role> <N>` (§4.4).
 
 ### 4.3 Stage-entry time
@@ -160,19 +161,20 @@ The stage-entry provider is a three-source adapter, tried in order:
 - **The lock.** The spawn (`SweepRegistry::spawn_step_unlocked`) releases the registry lock around the runtime admission's private-clone containment (#8787), a non-Builder step's pre-claim and the account-selection poll, as `private_dispatch::prepare` does for sweeps.
 - **Capture.** A step keeps the role-tick capture from #11877.
 - **Registry.** Steps run in the sweep registry as `SweepKind::Step { item, role }` (`types.rs`). Every consumer that matches on `SweepKind` is exhaustive (#11898).
-- **The end.** A step's end is queued (`sweep_registry/step_spawn/ended.rs`); the next tick reads the item's forge post-state with the lock released, classifies it with the session's outcome line and records it in the ledger (`step_dispatch::step_end`). A failed read is `failed` / `probe_failed`, never a default.
+- **The end.** A step's end is queued (`sweep_registry/step_spawn/ended.rs`); the next tick takes the post-state its claim release read before writing (or reads the item once when nothing was released), classifies it with the session's outcome line and records it in the ledger (`step_dispatch::step_end`). A failed read is `failed` / `probe_failed`, never a default. A refusal's cooldown (the pool gate, a claim race, a failed launch) stays local to the host; every other window is broadcast.
+- **Listing failures.** A failed item listing falls back to the repo's last good one for up to 10 minutes; a failed open-PR listing draws no Builder step in the repo that tick, since a PR linked only by its branch would be invisible.
 - **The role runner** runs Guide, Auditor, Hermit, Architect and Champion `--non-item`. Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning; `championMode` is retired and its `all` mode deleted (`role_runner/champion_mode.rs`); Curator has no event trigger. The Judge/Doctor queue gate, `demandWidth` and the per-repo lanes are deleted (#11911); the PR-debt ledger they fed survives as `pr_debt`, fed by the step listing, for the build back-off and the idle gate.
 - **No daemon path spawns `/loom:sweep`** (#11911). Epic `BuildChildren` is deleted (an active epic plans nothing; its children are Builder steps), the review-stall watchdog's `PrSet` conversion is retired, and a roll requeues an `Issue` sweep (label restore, lock release) instead of resuming it. `DispatchSweep` IPC stays for attended callers only: the `dispatch_sweep` MCP tool that attended `/loom:sweep` Stage -1 uses, `loom-daemon dispatch` and Safehouse ChatOps.
 
 ## 5. Claims, restore and the outcome ledger
 
 **Claims.**
-- Builder: the issue lease plus `loom:building`.
-- Judge and Doctor: `lease pr` plus `loom:reviewing` / `loom:treating`.
-- Curator and Champion promote: a lease with a `step` field plus `loom:curating` / `loom:evaluating`.
+- Builder: the daemon takes the issue lease and flips `loom:issue` to `loom:building` before the spawn.
+- Every other step: the daemon takes **only** the role-keyed lease (`lease pr claim --role <role> --step <step>`); the prompt applies its claim label itself (`loom:reviewing`, `loom:treating`, `loom:curating`, `loom:evaluating`; a Champion merge has none).
 - Champion merge: `lease pr`, with `step=champion_merge`.
 - Peer claims gain an additive `(item, step)` shape (`peer_claims.rs:239-244`).
-- `labels.json` `stale_after_minutes` becomes live for all five claim labels. Builder liveness stays the renewed lease.
+- `labels.json` `stale_after_minutes` is live for all five claim labels. Builder liveness stays the renewed lease. Curating, evaluating and reviewing are 45 minutes, longer than the 30-minute step timeout, so a running step's claim never reads as stale; treating is 60.
+- **Timeouts.** Every non-Builder step has the role runner's 30-minute timeout and a Builder step the sweep's; the reaper kills a step past it and releases its claim (`sweep_registry/step_spawn/timeout.rs`).
 
 **Restore when a step dies.** Each claim is released back to its role's ready stage:
 
@@ -184,7 +186,9 @@ The stage-entry provider is a three-source adapter, tried in order:
 | `loom:reviewing` | `loom:review-requested` |
 | `loom:treating` | `loom:changes-requested` |
 
-A Builder restore with a verified open linked PR writes no label: the issue keeps `loom:building` while its PR is open, through the existing open-PR release hold (`ClaimRelease::HeldByOpenPr`). The item join then classifies the item by its PR.
+A Builder restore with a verified open linked PR writes no label: the issue keeps `loom:building` while its PR is open, through the existing open-PR release hold (`ClaimRelease::HeldByOpenPr`). A step's restore keeps that hold even when `LOOM_RELEASE_OPEN_PR_VETO=0` switches the hold off for sweeps. The item join then classifies the item by its PR.
+
+**Post-state.** The ledger's post-state comes from the one read the claim release takes, before its restore write; a read after the write would always see the claim gone. A step whose claim was not released (another claimant holds the item, a merge step) is read once at the next tick (`step_dispatch::step_end`).
 
 No restore runs when the item is held elsewhere. For a Builder step that means `loom:building` re-applied more than 60 s after the step started. For every other step it means either of two things. The first is that the role's earliest live lease belongs to another sweep. The second is that the claim label was applied more than 60 s after the step started and outside the step's own lease (#11969): after that lease was released, yielded or aged out, or when the step has no lease. That second case is an attended session that claims by label alone, such as Doctor or the Curator path. A label applied while the step's own lease was live belongs to the step, because the role prompt applies it after the daemon's lease.
 
@@ -219,15 +223,20 @@ A step that wrote its verdict and died still holding its claim only loses the cl
 **Signals.**
 - `loom.dispatch.step` span: repo, item, role, admission result, reason, draw attempt, `age_source`, resumed (`observability/ops/dispatch_step.rs`). One per spawn attempt, spawned or refused.
 - `pick.decision`'s `item_draw`: the `loom-draw/v2` seed inputs, the weight-0 counts by reason, each drawn workspace's starting pool and every draw, enough to replay the tick (`item_draw::replay_record`), and the workspaces whose draw stopped on a `WeightOverflow`. Work-finder rows carry their step as `stage` and in the dispatch plan's `step` field.
-- The baseline: `loom.forge.stage_items{repo,state}` and `loom.dispatch.busy_slots{role}`.
+- The baseline: `loom.forge.stage_items{repo,state}`, sampled per repo by the captain's stage-dwell sampler, and `loom.dispatch.busy_slots{role}`. Steps count under `role="sweep"` (one slot each) and are broken down by step role as `busy_slots{role=<role>, pool="step"}`, never added to the total.
 
 **Alerts** (`defaults/observability/signoz/alerts/`, shipped with the cutover so a fix-forward rollout is watched from its first minute):
 
 | Rule | Fires when |
 |---|---|
-| `step-dispatch-stalled.json` | a dispatching host has `loom.forge.stage_items` > 0 in a work state and no spawned `loom.dispatch.step` for 15 min |
+| `step-dispatch-stalled.json` | a repo shows `loom.forge.stage_items` > 0 in a work state, a host dispatching for it has a free slot, and no `loom.dispatch.step` was spawned for the repo for 15 min |
 | `step-draw-pass-rate.json` | pool-gate plus claim refusals are above 80% of a host's `loom.dispatch.step` attempts for 30 min |
-| `step-slots-idle.json` | a host's busy slots stay below 50% of `maxConcurrent` for 30 min while stage depth stays > 0 |
+| `step-slots-idle.json` | a repo had work waiting for 30 min while the busiest host dispatching for it stayed below 50% of `maxConcurrent` |
+| `role-runner-item-tick.json` | a Curator, Judge or Doctor `role_tick.outcome` that is not a step (`loom.role_tick.source` != `step`) appears: a pre-cutover daemon or a surviving interval loop |
+
+`loom.forge.stage_items` is the captain's per-repo gauge, so the stalled and idle rules are keyed by repo and join it to the hosts that dispatch for the repo (their step and disposition spans in the last 24 h).
+
+**Holds.** A held workspace is not listed, so it has no queue rows on the tick (only a red-main repo that admits its fixes is listed, for those fixes).
 
 ## 8. Rollout and rollback
 

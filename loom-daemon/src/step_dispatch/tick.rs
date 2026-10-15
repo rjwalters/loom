@@ -53,6 +53,8 @@ pub const MAX_PASSES_PER_TICK: u32 = 32;
 
 /// The pass reason of a draw the per-repo cap refused.
 pub const PASS_REPO_CAP: &str = "repo_cap";
+/// The pass reason of a second Champion merge in one repo in one tick.
+pub const PASS_MERGE: &str = "merge_in_flight";
 
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -139,6 +141,7 @@ pub fn disposition_of(reason: &str) -> Qd {
         | "admission_refused" => Qd::HostConstraint,
         "roll_paused" => Qd::DeferredCapacity,
         PASS_REPO_CAP => Qd::DeferredRepoCap,
+        PASS_MERGE => Qd::PeerClaim,
         _ => Qd::DispatchError,
     }
 }
@@ -165,6 +168,22 @@ pub fn exclude_claimed(w: &mut Weighing, claims: &DrawClaims) {
     if removed > 0 {
         *w.excluded
             .entry(Exclusion::Pass(PassReason::Claimed))
+            .or_default() += removed;
+    }
+}
+
+/// Take every Builder step out of `w`'s pool, as a `shared_pr` pass: the
+/// repo's open-PR listing failed, so a PR linked only by its branch is
+/// invisible and a Builder step could duplicate it. Pure.
+pub fn exclude_builders(w: &mut Weighing) {
+    use super::item_draw::Exclusion;
+    let before = w.pool.len();
+    w.pool
+        .retain(|c| c.step != crate::work_finder::step_item::Step::Builder);
+    let removed = before - w.pool.len();
+    if removed > 0 {
+        *w.excluded
+            .entry(Exclusion::Pass(PassReason::SharedPr))
             .or_default() += removed;
     }
 }
@@ -223,6 +242,8 @@ struct Drawing {
     ws: StepWorkspace,
     draw: ItemDraw,
     draws: Vec<DrawRecord>,
+    /// A Champion merge was spawned in this repo this tick.
+    merging: bool,
     /// Draws the spawn or the per-repo cap refused, by reason.
     refused: BTreeMap<String, usize>,
     /// Out of the draw for the rest of the tick (empty, capped, overflowed).
@@ -294,6 +315,7 @@ pub fn run(
             draw,
             draws: Vec::new(),
             refused: BTreeMap::new(),
+            merging: false,
             closed,
             overflow: false,
         });
@@ -367,6 +389,20 @@ pub fn run(
                 *d.refused.entry(PASS_REPO_CAP.to_string()).or_default() += 1;
                 continue;
             }
+            // One Champion merge per repo at a time (design §6): a second
+            // merge drawn in a repo that spawned one this tick passes.
+            let merge = matches!(
+                picked.step,
+                crate::work_finder::step_item::Step::ChampionMerge
+                    | crate::work_finder::step_item::Step::ChampionHoldReevaluate
+            );
+            if merge && d.merging {
+                passes += 1;
+                resolve(&mut report.queue, &key, Qd::PeerClaim, Some(PASS_MERGE.to_string()));
+                *d.refused.entry(PASS_MERGE.to_string()).or_default() += 1;
+                *pass_counts.entry(PASS_MERGE.to_string()).or_default() += 1;
+                continue;
+            }
             let request = StepSpawnRequest {
                 item: key.number,
                 role: StepRole::from(picked.step),
@@ -376,6 +412,7 @@ pub fn run(
             };
             match spawner.spawn(d.ws.idx, &request) {
                 SpawnResult::Spawned => {
+                    d.merging |= merge;
                     resolve(&mut report.queue, &key, Qd::Dispatched, None);
                     report.dispatched += 1;
                     repo_cap.admit_candidate(&key);

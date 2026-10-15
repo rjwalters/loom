@@ -83,6 +83,53 @@ pub struct Gathered {
     pub ladder: Vec<(u32, StepRole, DateTime<Utc>)>,
     /// Creation times by number.
     pub created_at: HashMap<u32, String>,
+    /// The open-PR listing answered. When it did not, a PR linked only by
+    /// its Builder branch is invisible, so the tick draws no Builder step in
+    /// the repo (a duplicate build is worse than a tick's wait).
+    pub pulls_complete: bool,
+    /// The item listing failed and the rows are the last good one
+    /// ([`LAST_GOOD_TTL`] old at most).
+    pub stale_listing: bool,
+}
+
+/// How old a last good listing may be and still stand in for a failed one.
+/// A fleet-wide forge outage (a secondary rate limit) would otherwise stop
+/// every item dispatch everywhere; a short window rides it out, and every
+/// claim still re-reads the forge.
+pub const LAST_GOOD_TTL: Duration = Duration::from_secs(10 * 60);
+
+type LastGood = HashMap<String, (Instant, Vec<RestIssue>)>;
+
+fn last_good() -> &'static Mutex<LastGood> {
+    static CACHE: OnceLock<Mutex<LastGood>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The listing, or on its failure the last good one while it is fresh.
+fn listing_or_last_good(
+    slug: &str,
+    listing: anyhow::Result<super::listing::OpenItems>,
+) -> anyhow::Result<(Vec<RestIssue>, bool)> {
+    let mut cache = last_good()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match listing {
+        Ok(items) => {
+            cache.insert(slug.to_string(), (Instant::now(), items.rows.clone()));
+            Ok((items.rows, false))
+        }
+        Err(e) => match cache.get(slug) {
+            Some((at, rows)) if at.elapsed() < LAST_GOOD_TTL => {
+                log::warn!(
+                    "work_finder: {slug}: step listing failed ({e:#}); using the listing from \
+                     {}s ago",
+                    at.elapsed().as_secs()
+                );
+                Ok((rows.clone(), true))
+            }
+            _ => Err(e),
+        },
+    }
 }
 
 fn has(labels: &[String], label: &str) -> bool {
@@ -377,21 +424,25 @@ pub fn gather(
     let Some((gh_bin, root_dir, slug)) = target else {
         return Ok(None);
     };
-    let listing = super::listing::list_all_open(&gh_bin, Some(&root_dir), Some(&slug))?;
-    let rows = listing.rows;
+    let (rows, stale_listing) = listing_or_last_good(
+        &slug,
+        super::listing::list_all_open(&gh_bin, Some(&root_dir), Some(&slug)),
+    )?;
     // The PR debt the build back-off and the idle gate read (#11911): this
     // listing already holds every open PR with its labels.
     crate::pr_debt::record_open_listing(crate::pr_debt::global(), root, &rows);
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
-    let full: HashMap<u32, RestPull> = crate::forge_pull_listing::list_open_pulls_cached_as(
+    let pull_listing = crate::forge_pull_listing::list_open_pulls_cached_as(
         super::listing::CALLER,
         &gh_bin,
         Some(&root_dir),
         Some(&slug),
         PULL_PAGES,
-    )
-    .map(|pulls| pulls.into_iter().map(|p| (p.number, p)).collect())
-    .unwrap_or_default();
+    );
+    let pulls_complete = pull_listing.is_ok();
+    let full: HashMap<u32, RestPull> = pull_listing
+        .map(|pulls| pulls.into_iter().map(|p| (p.number, p)).collect())
+        .unwrap_or_default();
     let markers = pull_markers(&slug, root, &rows);
     let pulls: Vec<PullInput> = rows
         .iter()
@@ -462,7 +513,9 @@ pub fn gather(
     let draw = draw_inputs(items, &rows, |row, label| {
         provider.entry(&mut events, root, &slug, row, label, now)
     });
-    provider.retain_present(&slug, &rows);
+    if !stale_listing {
+        provider.retain_present(&slug, &rows);
+    }
     Ok(Some(Gathered {
         ladder: ladder_due(&rows),
         created_at: rows
@@ -471,6 +524,8 @@ pub fn gather(
             .collect(),
         slug,
         inputs: draw,
+        pulls_complete,
+        stale_listing,
     }))
 }
 

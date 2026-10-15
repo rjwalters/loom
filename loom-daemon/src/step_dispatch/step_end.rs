@@ -18,23 +18,16 @@
 //!
 //! # The post-state per role
 //!
-//! `moved` is "the item left the stage that called for this role": no read
-//! of the item before the step is needed, so a step adopted after a restart
-//! classifies the same way.
-//!
-//! | Role | moved when the item |
-//! |---|---|
-//! | Curator | carries `loom:curated`, `loom:issue`, `loom:blocked` or `loom:operator` |
-//! | Champion promote | lost `loom:curated`, or carries `loom:issue`, `loom:triage` or `loom:operator` |
-//! | Builder | lost `loom:issue` |
-//! | Judge | lost `loom:review-requested` |
-//! | Doctor | lost `loom:changes-requested` |
-//! | Champion merge | lost `loom:pr` |
-//!
-//! A closed item is `closed` for every role. `claim_held` is the role's claim
-//! label still on an item that did not move: a claim left beside a verdict
-//! is that verdict's own state (a Builder's `loom:building` stays while its
-//! PR is open, #6199).
+//! `SweepRegistry::step_post_state`, the release's own rule: each claim
+//! label replaces its role's ready label, so the ready label's absence proves
+//! nothing (a crashed step leaves exactly that). The item moved only when it
+//! carries a label the role moves it *to* (`advanced_labels`: Curator
+//! `loom:curated` / `loom:issue`, Champion promote `loom:issue` /
+//! `loom:triage`, Judge `loom:pr` / `loom:changes-requested`, Doctor
+//! `loom:review-requested`), a Builder's PR is open (the release's open-PR
+//! hold), or a merge step's PR left `loom:pr`. A claim label still on an item
+//! that did not move is held: the step died mid-work, which classifies as
+//! `failed` and takes the fast-fail ladder, never a verdict.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -45,35 +38,13 @@ use crate::sweep_registry::step_ledger::StepRun;
 use crate::sweep_registry::step_spawn::ended::{self, EndedStep};
 use crate::sweep_registry::SweepRegistry;
 
-const TRIAGE: &str = concat!("loom", ":triage");
-const CURATED: &str = concat!("loom", ":curated");
-const READY: &str = concat!("loom", ":issue");
-const BLOCKED: &str = concat!("loom", ":blocked");
-const OPERATOR: &str = concat!("loom", ":operator");
-const REVIEW_REQUESTED: &str = concat!("loom", ":review-requested");
-const CHANGES_REQUESTED: &str = concat!("loom", ":changes-requested");
-const APPROVED: &str = concat!("loom", ":pr");
-
-/// The role's post-state from one read of the item (module docs). Pure.
+/// The role's post-state from one read of the item: the claim release's own
+/// rule ([`SweepRegistry::step_post_state`]). A read taken here, after
+/// nothing released the claim, cannot see a Builder's PR, so a Builder read
+/// here moved only by its labels. Pure.
 #[must_use]
 pub fn post_state(role: StepRole, labels: &[String], closed: bool) -> PostState {
-    let has = |l: &str| labels.iter().any(|x| x == l);
-    let moved = match role {
-        StepRole::Curator => [CURATED, READY, BLOCKED, OPERATOR].iter().any(|l| has(l)),
-        StepRole::ChampionPromote => {
-            !has(CURATED) || [READY, TRIAGE, OPERATOR].iter().any(|l| has(l))
-        }
-        StepRole::Builder => !has(READY),
-        StepRole::Judge => !has(REVIEW_REQUESTED),
-        StepRole::Doctor => !has(CHANGES_REQUESTED),
-        StepRole::ChampionMerge => !has(APPROVED),
-    };
-    let moved = moved && !closed;
-    PostState {
-        moved,
-        closed,
-        claim_held: !moved && !closed && role.claim_label().is_some_and(has),
-    }
+    SweepRegistry::step_post_state(role, labels, closed, false)
 }
 
 /// The item's labels and closed state from a REST issue object (a PR is an
@@ -128,6 +99,10 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     match spawn_reason {
         "pool_exhausted" | "no_token_pool" | "token_selection_failed" => Some("pool_gate"),
         "claimed" | "claim_unverified" | "backstop_hold" => Some("claimed"),
+        // A launch this host cannot make (a missing `/loom:<role>` command,
+        // a failed spawn) cools down like a gate, so it is not respawned on
+        // every tick.
+        "spawn_failed" | "label_flip_failed" => Some("pool_gate"),
         "claim_lost" => Some("claim_lost"),
         _ => None,
     }
@@ -171,6 +146,11 @@ pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
         .ok()
         .and_then(|reg| reg.open_pr_listing_target());
     let Some((_, _, slug)) = target else {
+        // No forge target this tick (the repo slug did not resolve): keep
+        // the steps for the next tick rather than drop their outcomes.
+        for step in steps {
+            ended::push(root, step);
+        }
         return;
     };
     for step in steps {
@@ -215,33 +195,44 @@ mod tests {
     }
 
     #[test]
-    fn each_role_moves_off_its_own_stage() {
+    fn each_role_moves_only_to_its_advanced_labels() {
         let moved = |role, ls: &[&str]| post_state(role, &labels(ls), false).moved;
         assert!(moved(StepRole::Curator, &["loom:curated"]));
-        assert!(!moved(StepRole::Curator, &["loom:triage"]));
+        assert!(!moved(StepRole::Curator, &["loom:curating"]));
         assert!(moved(StepRole::ChampionPromote, &["loom:issue"]));
         assert!(moved(StepRole::ChampionPromote, &["loom:triage"]));
         assert!(!moved(StepRole::ChampionPromote, &["loom:curated", "loom:blocked"]));
-        assert!(moved(StepRole::Builder, &["loom:building"]));
-        assert!(!moved(StepRole::Builder, &["loom:issue"]));
         assert!(moved(StepRole::Judge, &["loom:pr"]));
         assert!(!moved(StepRole::Doctor, &["loom:changes-requested"]));
         assert!(moved(StepRole::ChampionMerge, &["loom:blocked"]));
+        // A Builder whose PR is open moved, whatever its labels say.
+        let p = SweepRegistry::step_post_state(
+            StepRole::Builder,
+            &labels(&["loom:building"]),
+            false,
+            true,
+        );
+        assert!(p.moved && !p.claim_held);
     }
 
+    /// A crashed or timed-out step left its claim label where its ready label
+    /// was: not a verdict, a held claim, which classifies as `failed`.
     #[test]
-    fn a_claim_beside_a_verdict_is_not_held_and_a_stale_one_is() {
-        // Builder's PR is open: `loom:building` stays, the step moved.
-        let p = post_state(StepRole::Builder, &labels(&["loom:building"]), false);
-        assert!(p.moved && !p.claim_held);
-        // A Judge that left its claim on an unchanged PR.
-        let p = post_state(
-            StepRole::Judge,
-            &labels(&["loom:review-requested", "loom:reviewing"]),
-            false,
-        );
-        assert!(!p.moved && p.claim_held);
-        let p = post_state(StepRole::Judge, &labels(&["loom:review-requested"]), true);
+    fn a_crashed_builder_and_a_crashed_judge_classify_as_failed() {
+        let builder = post_state(StepRole::Builder, &labels(&["loom:building"]), false);
+        assert!(!builder.moved && builder.claim_held);
+        let judge = post_state(StepRole::Judge, &labels(&["loom:reviewing"]), false);
+        assert!(!judge.moved && judge.claim_held);
+        let line = outcome_ledger::StepOutcome::new(OutcomeClass::Verdict, "approved");
+        for post in [builder, judge] {
+            assert_eq!(
+                outcome_ledger::classify(Some(&line), Some(post)).class,
+                OutcomeClass::Failed
+            );
+            assert_eq!(outcome_ledger::classify(None, Some(post)).class, OutcomeClass::Failed);
+        }
+        // Closed is closed, never a held claim.
+        let p = post_state(StepRole::Judge, &labels(&["loom:reviewing"]), true);
         assert!(p.closed && !p.moved && !p.claim_held);
     }
 
@@ -253,7 +244,7 @@ mod tests {
         assert_eq!(ledger_reason("claim_unverified"), Some("claimed"));
         assert_eq!(ledger_reason("claim_lost"), Some("claim_lost"));
         assert_eq!(ledger_reason("roll_paused"), None);
-        assert_eq!(ledger_reason("spawn_failed"), None);
+        assert_eq!(ledger_reason("spawn_failed"), Some("pool_gate"));
     }
 
     #[test]
