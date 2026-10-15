@@ -815,6 +815,9 @@ rules. A genuinely session-global `CARGO_TARGET_DIR` — an operator redirecting
 *all* builds — is still honored for the main workspace, unchanged. Both are
 pinned by `tests/hooks/test-post-worktree-target-dir.sh`.
 
+When no main-workspace binary exists the hook prints a skip line and exits; it
+never runs `cargo build` (#11329), so a new worktree creates no release build.
+
 **Two attribution rules are relaxed for these directories, and only for these.**
 `<root>/wt/<the worktree's own directory name>` is checked *structurally*, so
 matching it is itself the proof the path belongs to one worktree:

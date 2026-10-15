@@ -96,15 +96,16 @@ pub fn run_of(
 /// (`sweep_registry::step_spawn::StepRefusal::reason`): the pool gate and a
 /// claim held elsewhere cool the `(item, step)` down; a lost claim is a
 /// counted redraw. `None` for a refusal that says nothing about the item (a
-/// roll pause, a failed spawn).
+/// roll pause, a workspace missing the role's command).
 #[must_use]
 pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     match spawn_reason {
         "pool_exhausted" | "no_token_pool" | "token_selection_failed" => Some("pool_gate"),
         "claimed" | "claim_unverified" | "backstop_hold" => Some("claimed"),
-        // A launch this host cannot make (a missing `/loom:<role>` command,
-        // a failed spawn) cools down like a gate, so it is not respawned on
-        // every tick.
+        // A failed spawn cools down like a gate, so it is not respawned on
+        // every tick. A missing `/loom:<role>` command is refused before the
+        // spawn (`workspace_commands_missing`) and says nothing about the
+        // item, so it falls through to `None`.
         "spawn_failed" | "label_flip_failed" => Some("pool_gate"),
         "claim_lost" => Some("claim_lost"),
         _ => None,
@@ -251,6 +252,8 @@ mod tests {
         assert_eq!(ledger_reason("claim_lost"), Some("claim_lost"));
         assert_eq!(ledger_reason("roll_paused"), None);
         assert_eq!(ledger_reason("spawn_failed"), Some("pool_gate"));
+        // #12048: says nothing about the item, so no window doubles against it.
+        assert_eq!(ledger_reason("workspace_commands_missing"), None);
     }
 
     #[test]

@@ -234,3 +234,31 @@ fn consecutive_gateway_reruns_withdraw_it() {
         assert_eq!(super::gateway_fault(&timed_out()), expected, "attempt {attempt}");
     }
 }
+
+/// #12124: the parsed HTTP status decides whether the gateway answered, ahead
+/// of the exit code, so an exit-0 run carrying a 5xx never resets the count.
+#[test]
+fn exit_zero_with_parsed_5xx_is_not_an_answer() {
+    use crate::forge_gateway::outage::{answered, escalate, note_answered, Fault};
+    use std::os::unix::process::ExitStatusExt;
+    let run = |code: i32, stdout: &str, stderr: &str| std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    };
+    assert!(!answered(&run(0, "HTTP/2.0 502 Bad Gateway\r\n\r\n", "")));
+    assert!(!answered(&run(0, "", "gh: Bad Gateway (HTTP 502)")));
+    assert!(answered(&run(0, "HTTP/2.0 304 Not Modified\r\n\r\n", "")));
+    assert!(answered(&run(0, "", "")));
+    assert!(!answered(&run(1, "", "")));
+
+    // The count survives an exit-0 502 and still withdraws on the third rerun.
+    note_answered();
+    assert_eq!(escalate(Fault::Rerun), Fault::Rerun);
+    assert_eq!(escalate(Fault::Rerun), Fault::Rerun);
+    let masked = run(0, "HTTP/2.0 502 Bad Gateway\r\n\r\n", "");
+    if answered(&masked) {
+        note_answered();
+    }
+    assert_eq!(escalate(Fault::Rerun), Fault::Withdraw);
+}
