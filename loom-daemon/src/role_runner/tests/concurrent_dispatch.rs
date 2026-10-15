@@ -797,8 +797,20 @@ fn fairness_a_skipped_trigger_at_the_cursor_does_not_block_a_root_with_work() {
     let ledger: &'static triggers::TriggerLedger =
         Box::leak(Box::new(triggers::TriggerLedger::default()));
     ledger.record_success(&empty_path, "guide", Some("set".to_string()), Instant::now());
-    let probe: triggers::TriggerProbe =
-        Arc::new(|_, _| triggers::Observation::Fingerprint("set".to_string()));
+    // The empty root's probe waits on `gate`, so its run (and its `guide`
+    // slot) is still in flight while `dispatch_tick` walks to the second
+    // root. Without it, the QueueEmpty run can return and free the slot
+    // before the walk gets there on a loaded host, and both roots spawn.
+    let gate = Gate::default();
+    let probe: triggers::TriggerProbe = {
+        let (gate, empty_path) = (gate.clone(), empty_path.clone());
+        Arc::new(move |root, _| {
+            if root == empty_path.as_path() {
+                gate.wait();
+            }
+            triggers::Observation::Fingerprint("set".to_string())
+        })
+    };
     let invoked = Arc::new(AtomicUsize::new(0));
     let factory: RunnerFactory = {
         let invoked = Arc::clone(&invoked);
@@ -821,6 +833,7 @@ fn fairness_a_skipped_trigger_at_the_cursor_does_not_block_a_root_with_work() {
     assert_eq!(tick.spawned, vec![empty_path.clone()], "the empty root holds the cursor");
     assert_eq!(tick.deferred, 1, "the root with work is deferred by the budget");
     assert!(!d.resume_due(), "nothing has finished yet");
+    gate.open();
 
     let joined = join_one(&rt, &mut d);
     assert_eq!(joined.as_ref().unwrap().1.outcome, RoleTickOutcome::QueueEmpty);
@@ -848,14 +861,19 @@ fn fairness_a_real_run_does_not_resume_and_a_new_tick_replaces_pending() {
     let _enter = rt.enter();
     let cfg = r#"{"autonomous":{"workFinder":{"maxConcurrent":8},"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":1}}}}"#;
     let (a, b) = (workspace(cfg), workspace(cfg));
-    let factory: RunnerFactory = Arc::new(|_| {
-        Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
-    });
+    // Root a's run waits on `gate`, so it still holds the `guide` slot when
+    // the walk reaches b; an instant run could free it first on a loaded host.
+    let gate = Gate::default();
+    let factory = gated_factory(vec![a.path().to_path_buf()], gate.clone());
     let mut d = dispatcher("guide", factory, admit_only("guide"));
     let in_progress = new_in_progress_guard();
     let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
-    assert_eq!(d.dispatch_tick(roots.clone(), &in_progress).deferred, 1);
+    let tick = d.dispatch_tick(roots.clone(), &in_progress);
+    assert_eq!(tick.spawned, vec![a.path().to_path_buf()]);
+    assert_eq!(tick.deferred, 1);
+    gate.open();
     let joined = join_one(&rt, &mut d);
+    assert_eq!(joined.as_ref().unwrap().1.outcome, RoleTickOutcome::Success);
     d.handle_joined(joined);
     assert!(!d.resume_due(), "a Success run spent an agent — no resume");
     assert!(d.resume_after_queue_empty(&in_progress).is_none());

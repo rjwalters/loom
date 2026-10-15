@@ -1,94 +1,52 @@
-//! The work finder's batched open-PR pre-filter (Issue #8865).
+//! The batched open-PR read (Issue #8865): which of a workspace's issues have
+//! a verified open linked PR, from one read of its open-PR listing.
 //!
-//! # The problem
+//! # Where it is used
 //!
-//! The #4123 open-PR guard lives inside `dispatch()` (steps 2.5/2.6 of
-//! `begin_prepared_issue_dispatch`), deliberately: one check covers every
-//! dispatch route. For the finder that placement made every PR-blocked
-//! candidate cost a whole serialized dispatch attempt — runtime and model
-//! resolution, account selection, then under the registry mutex a
-//! closed-issue read and a walk of the repo's open-PR listing — only to be
-//! refused. The listing is the same for every candidate of a workspace, and
-//! it was walked once per candidate. Each refusal also armed the issue's
-//! #4485 dispatch backoff, as a "failed dispatch".
+//! It was built for the multi-workspace tick's dispatch point, where a
+//! PR-blocked candidate used to cost a whole serialized dispatch attempt
+//! before the #4123 guard refused it. That tick was retired with the
+//! Builder-only finder path (#11911). Since then the read serves
+//! [`WorkDispatcher::open_pr_blocked`](super::WorkDispatcher::open_pr_blocked),
+//! whose production implementation ([`blocked_in`]) the red-main auto-filed
+//! fix (#11766, `RegistryDispatcher::autofile_red_main` →
+//! `main_red_autofile::tick`) asks which of its issues already have an open
+//! PR. The step path reads its own listing in `step_dispatch::gather`.
 //!
-//! # What this does
+//! # What it answers
 //!
-//! Pass 2 of the multi-workspace tick calls [`OpenPrPrefilter::dispatch`]
-//! where it used to call `dispatch_with`. The first time a candidate of a
-//! workspace reaches that point in a tick, the pre-filter asks the
-//! workspace's dispatcher ONCE for every candidate of that workspace that has
-//! a verified open linked PR ([`WorkDispatcher::open_pr_blocked`]; in
-//! production one read of the ETag-cached open-PR listing, see
-//! [`blocked_in`]). A candidate in that answer is resolved exactly as the
-//! in-`dispatch()` refusal resolves it — `QueueDisposition::OpenPr`, detail
-//! `open PR #X`, counted in `skipped_pr_open` — without `dispatch_with` being
-//! called. Every other candidate goes to `dispatch_with` as before, unless
-//! the landed pre-filter (#11853, [`super::landed_prefilter`], asked once per
-//! workspace per tick about the candidates without an open PR) finds its
-//! closing PR already merged: that one is resolved `AlreadyLanded`.
+//! [`answer_in`] reads the workspace's ETag-cached open-PR listing once for
+//! every asked issue and classifies each with the open-PR guard's own
+//! classifier. [`blocked_in`] keeps the verified-open part: issue to its open
+//! linked PR.
 //!
-//! # What it cannot do
-//!
-//! - **Admit.** It only ever removes a candidate. A candidate it does not
-//!   remove goes through `dispatch()`'s own guard chain, unchanged and still
-//!   authoritative; "not in the answer" is never cached as a permit.
-//! - **Remove on a guess.** Only a verified `Open` verdict from a listing that
-//!   was read removes a candidate. An unreadable listing (with no good
-//!   listing of the last
-//!   [`LISTING_REUSE_FOR`](crate::worktree_ops::linked_pr_listing::LISTING_REUSE_FOR)
-//!   to stand in, #12025), an unresolvable repo, guards switched off, a
-//!   poisoned lock: the answer is empty and every candidate proceeds to
-//!   `dispatch()` as on the pre-#8865 path.
-//! - **Reorder.** It runs at the dispatch point, after the #11103 workspace
-//!   draw and every admission gate, so the draw sees the same candidates and
-//!   makes the same rolls as without it. The candidates that survive are
-//!   attempted in the order they would have been attempted anyway; the
-//!   removed ones are the ones `dispatch()` would have refused in place.
-//! - **Outlive the tick.** The answer is held for one tick. A PR that closes
-//!   unmerged frees its issue on the next tick whose listing read shows it.
-//! - **Arm a backoff.** No dispatch was attempted, so nothing is recorded
-//!   against the issue: no #4485 window, no peer claim.
-//!
-//! # The one change in precedence
-//!
-//! `dispatch()` runs its `prepare` phase and the 2.4 workspace-commands guard
-//! before the open-PR guard, so a PR-blocked candidate that would also have
-//! failed one of those (an empty token pool, a rejected runtime) used to be
-//! reported under that failure. It is now reported `OpenPr`, which is true of
-//! it either way, and it no longer arms the failure's backoff. Candidates
-//! without an open PR still meet those checks unchanged.
+//! - **Only verified `Open` verdicts.** An unresolvable repo, guards switched
+//!   off or a poisoned lock asks nothing
+//!   ([`OpenPrAnswer::NotAsked`]); an unreadable listing is
+//!   [`OpenPrAnswer::Unreadable`]. Both leave [`blocked_in`] empty, and "not
+//!   in the answer" is never a permit.
+//! - **Listing reuse (#12025).** When a read fails, the last good listing of
+//!   the same root and repo answers instead for up to
+//!   [`LISTING_REUSE_FOR`](crate::worktree_ops::linked_pr_listing::LISTING_REUSE_FOR),
+//!   so one failed page does not blank the answer. Past that it is
+//!   `Unreadable`.
+//! - **One read per call.** However many issues are asked, and no
+//!   per-issue read.
 //!
 //! # The #6788 memo
 //!
-//! The guard's verified-open-PR memo used to be written by the 2.6 probe each
-//! time a PR-blocked candidate was refused. Those candidates no longer reach
-//! 2.6, so [`blocked_in`] folds what the listing verified into the memo
-//! instead: `Open(pr)` records or refreshes the entry, a verified "no open
-//! PR" removes it, and an unreadable or reused (#12025) listing changes
-//! nothing. That keeps the
-//! guard's fallback alive for the tick the listing cannot be read: a fresh
-//! entry refuses at 2.5, and an entry of any age gives the known-PR recheck
-//! (`GET pulls/{pr}`) something to recheck when GraphQL and the timeline fail
-//! too. Removal is what frees an issue on the tick its PR is gone, rather
-//! than up to 900 s later.
+//! A fresh read folds its verdicts into the open-PR guard's
+//! verified-open-PR memo: `Open(pr)` records or refreshes the entry, a
+//! verified "no open PR" removes it. An unreadable or reused listing changes
+//! nothing, since its verdicts are not as of this read. That keeps the
+//! guard's fallback fed for a tick the listing cannot be read: a fresh entry
+//! refuses at step 2.5, and an entry of any age gives the known-PR recheck
+//! (`GET pulls/{pr}`) something to recheck.
 //!
-//! # Cost
+//! # Logging
 //!
-//! No forge read at all on a tick where no candidate reaches the dispatch
-//! point (idle, halted, saturated, at capacity): the read is lazy. Otherwise
-//! one listing read per workspace per tick, however many of its candidates
-//! are blocked, and no per-candidate issue read for the removed ones.
-//!
-//! # Telemetry
-//!
-//! A pre-filtered candidate keeps its `OpenPr` ready-queue row on every tick
-//! it reaches the dispatch point, so the #9674 lockout metrics (which key on
-//! `OpenPr` rows) and the `pr-open-skip` tick counter keep reporting it. It
-//! gets no `loom.dispatch.admission` span: that span is one per `dispatch()`
-//! attempt, and none was made. [`TickReport::pr_open_prefiltered`] counts
-//! these skips apart from the refusals `dispatch()` still makes itself.
-
+//! [`log_changes`] logs a skip line when an issue becomes blocked or its PR
+//! changes, not on every read while it stays blocked.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -125,9 +83,9 @@ impl OpenPrAnswer {
     }
 }
 
-/// [`WorkDispatcher::open_pr_blocked`] for the production dispatcher: the
-/// verified-open part of [`answer_in`]. Empty whenever that cannot be
-/// verified.
+/// [`WorkDispatcher::open_pr_blocked`](super::WorkDispatcher::open_pr_blocked)
+/// for the production dispatcher: the verified-open part of [`answer_in`].
+/// Empty whenever that cannot be verified.
 #[must_use]
 pub fn blocked_in(registry: &Arc<Mutex<SweepRegistry>>, candidates: &[u32]) -> HashMap<u32, u32> {
     answer_in(registry, candidates).into_blocked()
