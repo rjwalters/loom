@@ -209,7 +209,7 @@ check "--issue: a blocked issue is re-evaluated only once its blocker has closed
 # --non-item
 NONITEM="$(awk '/^## `--non-item`/{on=1} on' "$TARGETED_MD")"
 out="$NONITEM"
-check "--non-item: names the role-runner knob that launches it" has 'autonomous.roleRunner.championMode: "non-item"'
+check "--non-item: says the role runner launches every interval run this way" has 'The role runner launches every interval and idle-edge Champion run this way'
 for q in "Pass 0b, Pass 0c" "Priority 3: architect, hermit and auditor proposals" "Priority 4: epic proposals" \
          "Priority 5: Doctor-cycle-capped PRs" "Rollout Check Pass" "Held-PR Census and Per-PR Digest"; do
   check "--non-item runs: $q" has "$q"

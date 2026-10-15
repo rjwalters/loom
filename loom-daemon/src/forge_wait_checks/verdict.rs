@@ -205,10 +205,16 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
 }
 
 /// [`decide`] under `--settle-red` (#12011): a `Red` stands only once the
-/// run has finished — nothing observed is still pending, the required set is
-/// known, and every required context has registered. Until then it is
-/// `Pending` on what is still outstanding (so the wait ends `TIMEOUT`, never
-/// an early `RED`). Every other decision is [`decide`]'s, unchanged.
+/// run has finished — nothing observed is still pending. Until then it is
+/// `Pending` on what is still running (so the wait ends `TIMEOUT`, never an
+/// early `RED`). Every other decision is [`decide`]'s, unchanged.
+///
+/// Only observed pending checks hold a `Red` back (#12022): the job log is
+/// readable once they finish, whatever the required set. An unknown or
+/// unregistered required set must not — nothing would ever resolve it once
+/// the run is over, so a finished red would `TIMEOUT` on every pass and never
+/// reach the Doctor. The required-set fail-closed rules stay in [`decide`],
+/// where they keep `Green` honest.
 ///
 /// Why opt-in: an early `RED` is right for a caller that only *refuses* on it
 /// (the approval gate, `merge-pr.sh`, Champion), but wrong as the trigger for
@@ -221,15 +227,10 @@ pub fn decide_settled(r: &Rollup, required: Option<&[String]>, required_only: bo
     if !matches!(d, Decision::Red(_)) {
         return d;
     }
-    let mut waiting = r.pending.clone();
-    match required {
-        None => waiting.push(REQUIRED_UNKNOWN.to_string()),
-        Some(req) => waiting.extend(req.iter().filter(|c| !r.seen.contains(*c)).cloned()),
-    }
-    if waiting.is_empty() {
+    if r.pending.is_empty() {
         d
     } else {
-        Decision::Pending(waiting)
+        Decision::Pending(r.pending.clone())
     }
 }
 
@@ -521,24 +522,29 @@ mod tests {
         );
     }
 
-    /// Under `--settle-red` an unknown required set, or a required context
-    /// that has not registered, also keeps a failure from being RED yet.
+    /// #12022: under `--settle-red` an unknown or unregistered required set
+    /// does not hold back a finished red — nothing would ever resolve it, so
+    /// the wait would `TIMEOUT` every pass. It still keeps `Green` from
+    /// standing (the fail-closed rules live in `decide`).
     #[test]
-    fn settle_red_waits_on_an_unknown_or_unregistered_required_context() {
+    fn settle_red_is_red_once_nothing_is_pending_even_with_an_unknown_or_unregistered_required_set()
+    {
         let r = fold(&runs(vec![run("lint", "completed", Some("failure"))]), &no_status()).unwrap();
         assert_eq!(decide(&r, None, false), Decision::Red(vec!["lint".into()]));
-        assert_eq!(
-            decide_settled(&r, None, false),
-            Decision::Pending(vec![REQUIRED_UNKNOWN.into()])
-        );
+        assert_eq!(decide_settled(&r, None, false), Decision::Red(vec!["lint".into()]));
         let req = vec!["Backend".to_string()];
         assert_eq!(
             decide_settled(&r, Some(req.as_slice()), false),
-            Decision::Pending(vec!["Backend".into()])
+            Decision::Red(vec!["lint".into()])
         );
         // Non-RED decisions are untouched.
         let ok = fold(&runs(vec![run("ci", "completed", Some("success"))]), &no_status()).unwrap();
         assert_eq!(decide_settled(&ok, Some(&[][..]), false), Decision::Green);
+        // Fail-closed side: a green-only rollup with an unknown set still waits.
+        assert_eq!(
+            decide_settled(&ok, None, false),
+            Decision::Pending(vec![REQUIRED_UNKNOWN.into()])
+        );
     }
 
     #[test]

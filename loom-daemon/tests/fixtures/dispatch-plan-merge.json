@@ -16,7 +16,10 @@
     "Issue #11910: rows may carry a `step` (the classifier's Step names: builder, judge,",
     "champion_merge, ...). The fold key is repo#issue + step, and a row with no `step` folds",
     "as `builder`. An expected item with no `step` means `builder`; an unknown step name is",
-    "its own fold key, kept verbatim."
+    "its own fold key, kept verbatim.",
+    "",
+    "2AMLogic/loom-ui#4141: the last case (step as the final ordering tie-break) was added in",
+    "loom-ui's pinned copy first; the Rust order already satisfies it (FleetKey ends in `step`)."
   ],
   "cases": [
     {
@@ -247,6 +250,23 @@
         { "repo": "acme/one", "issue": 1100, "step": "someday_step", "plan_state": "queued", "primary": "host-a", "others": [] },
         { "repo": "acme/one", "issue": 1100, "step": "another_step", "plan_state": "queued", "primary": "host-b", "others": [] },
         { "repo": "acme/one", "issue": 1100, "step": "builder", "plan_state": "blocked", "primary": "host-b", "others": [] }
+      ]
+    },
+    {
+      "name": "step is the final tie-break: one host, one issue at two steps, same state and position",
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "shard": { "configured": false },
+          "rows": [
+            { "repo": "acme/one", "issue": 1200, "position": 1, "plan_state": "queued", "gate": "capacity", "step": "judge" },
+            { "repo": "acme/one", "issue": 1200, "position": 1, "plan_state": "queued", "gate": "capacity" }
+          ]
+        }
+      ],
+      "expected": [
+        { "repo": "acme/one", "issue": 1200, "step": "builder", "plan_state": "queued", "primary": "host-a", "others": [] },
+        { "repo": "acme/one", "issue": 1200, "step": "judge", "plan_state": "queued", "primary": "host-a", "others": [] }
       ]
     }
   ]

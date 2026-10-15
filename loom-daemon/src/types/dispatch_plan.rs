@@ -74,11 +74,28 @@ pub enum PlanGate {
 /// A row with **no** `step` field means `builder` (see [`RowPlan::step`]):
 /// every plan published before step dispatch was a Builder plan, so older
 /// plans and older readers keep working (an additive wire change).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// A `step` that is not a string at all (a number, an object, …) is kept as
+/// an unknown step named by its JSON text rather than rejecting the row, the
+/// same tolerance [`PlanState`] gives a value it does not know (#11909).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(untagged)]
 pub enum PlanStep {
     Known(Step),
     Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for PlanStep {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(d)?;
+        if let Ok(step) = serde_json::from_value::<Step>(value.clone()) {
+            return Ok(PlanStep::Known(step));
+        }
+        Ok(PlanStep::Unknown(match value {
+            serde_json::Value::String(name) => name,
+            other => other.to_string(),
+        }))
+    }
 }
 
 impl Default for PlanStep {
@@ -242,6 +259,20 @@ mod tests {
         assert_eq!(row.plan_state, PlanState::Unknown);
         let ctx: DispatchPlanContext = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(ctx, DispatchPlanContext::default());
+    }
+
+    /// A non-string `step` is an unknown step, never a rejected row (#11909).
+    #[test]
+    fn a_non_string_step_parses_as_unknown() {
+        let row: RowPlan = serde_json::from_value(serde_json::json!({ "step": 7 })).unwrap();
+        assert_eq!(row.step(), PlanStep::Unknown("7".to_string()));
+        let row: RowPlan =
+            serde_json::from_value(serde_json::json!({ "step": { "x": 1 } })).unwrap();
+        assert_eq!(row.step(), PlanStep::Unknown("{\"x\":1}".to_string()));
+        let row: RowPlan = serde_json::from_value(serde_json::json!({ "step": "judge" })).unwrap();
+        assert_eq!(row.step(), PlanStep::Known(Step::Judge));
+        let row: RowPlan = serde_json::from_value(serde_json::json!({ "step": "scout" })).unwrap();
+        assert_eq!(row.step(), PlanStep::Unknown("scout".to_string()));
     }
 
     #[test]

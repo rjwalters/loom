@@ -15,7 +15,9 @@
 //! | `Reclassify` | nothing for the first; a second identical state refusal in a row arms the ledger's doubling refusal cooldown, broadcast. Not a repeat-cap run |
 //! | `Failed` (slow) | counted toward the repeat cap |
 //!
-//! Whenever the repeat cap arms, its window is broadcast like any other.
+//! Whenever the repeat cap arms, its window is broadcast like any other,
+//! except a refusal's: a pool gate or a claim race is this host's own, so a
+//! `Refused` outcome's window stays local (#11909).
 //! Nothing broadcast is longer than 24 h: the peer receiver caps it too.
 
 use std::time::{Duration, Instant};
@@ -25,7 +27,7 @@ use chrono::{DateTime, Utc};
 use super::{host_identity, SweepRegistry, LANDED_COOLDOWN};
 use crate::peer_claims::{self, ClaimAd};
 use crate::step_dispatch::outcome_ledger::{
-    CooldownCause, Effect, LedgerCounters, Recorded, StepCooldowns, StepOutcome,
+    CooldownCause, Effect, LedgerCounters, OutcomeClass, Recorded, StepCooldowns, StepOutcome,
 };
 use crate::step_dispatch::reeval_ladder::{self, BodyForge};
 use crate::step_role::StepRole;
@@ -118,7 +120,12 @@ impl SweepRegistry {
             | Effect::Reclassify
             | Effect::Failed => {}
         }
-        self.broadcast_step_cooldown(item, step, now);
+        // A refusal is host-local (#11909): this host's exhausted pool or its
+        // claim race says nothing about a peer's, so its cooldown is not
+        // broadcast. Every other window is.
+        if run.outcome.class != OutcomeClass::Refused {
+            self.broadcast_step_cooldown(item, step, now);
+        }
         let cooling_until = self.step_ledger.cooling_until(item, step, now);
         Recorded {
             cooling_until,

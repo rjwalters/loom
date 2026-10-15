@@ -816,6 +816,7 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
             excluded: &excluded,
             pool: std::slice::from_ref(&picked),
             draws: &draws,
+            overflow: false,
         }],
     )
     .unwrap();

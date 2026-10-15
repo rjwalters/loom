@@ -994,6 +994,8 @@ impl SweepRegistry {
         self.escalate_pending_group_reaps();
         // #11906 (B3): a step past its role's timeout is killed and released.
         changes += self.reap_step_timeouts();
+        // #11909: the outcome ledger's lapsed entries go each tick.
+        self.prune_step_ledger();
 
         // Snapshot keys + pids first so we can borrow mutably below.
         // Capture started_at so we can compute durations for Exited events.

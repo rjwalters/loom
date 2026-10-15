@@ -91,8 +91,10 @@ fn a_pool_gate_refusal_is_in_the_query_before_the_next_tick() {
     assert!(reg
         .step_cooldowns(now)
         .is_cooling(3, StepRole::Curator, now));
-    let ads = step_ads(&drain(&mut rx));
-    assert!(ads.iter().any(|a| a.0 == 3 && a.2 <= 600 && a.2 > 500), "{ads:?}");
+    // #11909: a refusal is this host's own (its pool, its claim race); a
+    // peer with a healthy pool must not cool the item, so nothing is
+    // broadcast.
+    assert!(step_ads(&drain(&mut rx)).is_empty());
 }
 
 #[test]
@@ -315,7 +317,7 @@ fn claim_lost_is_counted() {
 /// #11969: a second consecutive lost claim arms the 10-min refusal cooldown,
 /// in the draw's query and broadcast like every window.
 #[test]
-fn a_second_claim_lost_cools_and_is_broadcast() {
+fn a_second_claim_lost_cools_locally() {
     let dir = tempdir().unwrap();
     let (mut reg, mut rx) = registry(dir.path());
     let lost = run(5, StepRole::Curator, OutcomeClass::Refused, "claim_lost", 1);
@@ -328,10 +330,8 @@ fn a_second_claim_lost_cools_and_is_broadcast() {
     assert!(reg
         .step_cooldowns(now)
         .is_cooling(5, StepRole::Curator, now));
-    let ads = step_ads(&drain(&mut rx));
-    assert_eq!(ads.len(), 1, "{ads:?}");
-    assert_eq!((ads[0].0, ads[0].1), (5, Some(StepRole::Curator)));
-    assert!((590..=600).contains(&ads[0].2), "{ads:?}");
+    // Local only (#11909): a lost claim race is this host's.
+    assert!(step_ads(&drain(&mut rx)).is_empty());
     assert_eq!(reg.step_ledger_counters().claim_lost, 2);
 }
 
