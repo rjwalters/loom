@@ -214,6 +214,7 @@ fn opts(timeout: u64) -> Opts {
     Opts {
         timeout: Duration::from_secs(timeout),
         required_only: false,
+        settle_red: false,
         base: None,
         min_interval: DEFAULT_MIN_INTERVAL,
         max_interval: DEFAULT_MAX_INTERVAL,
@@ -934,4 +935,68 @@ fn superseded_twin_run_residue_is_dropped() {
     f.runs(SHA, &[twin(1, "failure")]);
     go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
     assert!(!f.calls().iter().any(|c| c.contains("actions/runs")), "{:?}", f.calls());
+}
+
+fn settle(timeout: u64) -> Opts {
+    Opts {
+        settle_red: true,
+        ..opts(timeout)
+    }
+}
+
+/// #12011, the PR #11974 replay: one leg is red while the rest still run.
+/// Without `--settle-red` that is RED on the first poll; with it, a snapshot
+/// is TIMEOUT naming what still runs, plus a stderr note naming the failure.
+#[test]
+fn settle_red_snapshot_of_a_partial_run_is_timeout_with_an_already_failing_note() {
+    let partial = [
+        run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+        run("Rust Unit Tests (1/3)", "in_progress", None),
+    ];
+    let f = Forge::new();
+    f.runs(SHA, &partial);
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Red { .. }), "{o:?}");
+
+    let f = Forge::new();
+    f.runs(SHA, &partial);
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &settle(0), &mut FakeClock::new());
+    assert_eq!(
+        o,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["Rust Unit Tests (1/3)".into()]
+        }
+    );
+    assert_eq!(
+        notes,
+        vec!["wait-checks: --settle-red: already failing: Rust Unit Tests (2/3)".to_string()]
+    );
+}
+
+/// Under `--settle-red` the wait keeps polling past the first failure and
+/// reports RED once the run has finished, naming the run id for the log.
+#[test]
+fn settle_red_waits_for_the_run_to_finish_then_is_red() {
+    let f = Forge::new();
+    f.required(&[]);
+    f.runs(
+        SHA,
+        &[
+            run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+            run("Rust Unit Tests (1/3)", "in_progress", None),
+        ],
+    );
+    let mut clock = FakeClock::new().at(100, || {
+        f.runs(
+            SHA,
+            &[
+                run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+                run("Rust Unit Tests (1/3)", "completed", Some("success")),
+            ],
+        );
+    });
+    let o = go(&f, Selector::Pr(42), &settle(1800), &mut clock);
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-RED {SHA} Rust Unit Tests (2/3)"));
+    assert_eq!(f.polls(), 4);
 }
