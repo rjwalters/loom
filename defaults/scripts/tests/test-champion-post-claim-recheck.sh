@@ -4,7 +4,7 @@
 #
 # THE FAILURE THIS GUARDS AGAINST
 #
-#   2AMLogic/2run#205, 2026-10-15: one host's Champion claimed, promoted and
+#   example-org/tool-repo#205, 2026-10-15: one host's Champion claimed, promoted and
 #   released the issue at 00:01:58-59Z; a second host's Champion, working from
 #   a candidate list read before that, found no claim at 00:02:00Z, claimed it
 #   and promoted it again, posting a second approval comment. The claim step
@@ -99,7 +99,7 @@ run_case() {
   fi
 }
 
-run_case "already promoted (2run#205)" OPEN "loom:issue,loom:evaluating" release
+run_case "already promoted (example-org/tool-repo#205)" OPEN "loom:issue,loom:evaluating" release
 run_case "promoted, proposal label still on" OPEN "loom:curated,loom:issue,loom:evaluating" release
 run_case "already building" OPEN "loom:building,loom:evaluating" release
 run_case "escalated to the operator" OPEN "loom:architect,loom:operator,loom:evaluating" release

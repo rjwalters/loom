@@ -796,7 +796,7 @@ gh issue edit "$ISSUE_NUMBER" --add-label "loom:evaluating"
 **Post-claim candidacy recheck (#11989).** The claim only says nobody else is
 evaluating *right now*. Your candidate list was read earlier, so another
 Champion (this host's next tick, or a peer host's) may have claimed, decided
-and released this issue in between: on 2run#205 (2026-10-15) one host promoted
+and released this issue in between: on one issue (2026-10-15) one host promoted
 the issue and released its claim at 00:01:59Z, and a second host, working from
 the same stale list, claimed it at 00:02:00Z and promoted it again, with a
 second approval comment. Right after claiming, re-read the issue **uncached**
