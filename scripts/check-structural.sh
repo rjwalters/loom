@@ -52,9 +52,8 @@
 #     splits on whitespace and will not `eval`;
 #   - a gate whose script is not present in this tree (a consumer repo, or a
 #     workflow ahead of the checkout);
-#   - a gate that exited 78 (`EX_CONFIG`), the REQUIRED-TOOL-ABSENT sentinel.
-#     `check-doc-anchors.sh` exits it deliberately when `lychee` is absent, and
-#     CI installs a pinned lychee that a dev host has no reason to have. A
+#   - a gate that exited 78 (`EX_CONFIG`), the REQUIRED-TOOL-ABSENT sentinel,
+#     for a gate that needs a tool CI installs and a dev host may lack. A
 #     missing tool is "could not check", not "checked and failed" — reporting it
 #     as a red gate forever would train a Builder to ignore the phase, which is
 #     worse than the gap. CI still enforces it for real.
@@ -459,16 +458,15 @@ YAML
     else
       echo "  ok: $n gate(s) derived from the real job"
     fi
-    # The four #9137 failures that opened #9140, by name. If the workflow stops
-    # running one of these the assertion should be updated deliberately — it is
-    # not allowed to lapse by accident.
+    # Gates the job must keep running, by name. If the workflow stops running
+    # one of these the assertion should be updated deliberately — it is not
+    # allowed to lapse by accident.
     local probe
-    for probe in check-markdown-token-budget.sh check-role-prompt-budget.sh \
-                 check-dangling-links.sh check-docs-defaults-parity.sh; do
+    for probe in check-conflict-markers.sh check-dangling-links.sh; do
       if printf '%s\n' "$live" | grep -F "$probe" >/dev/null; then
         echo "  ok: $probe is in the derived set"
       else
-        echo "SELF-TEST FAIL: $probe is not in the derived set (it is one of PR #9137's five CI failures)." >&2
+        echo "SELF-TEST FAIL: $probe is not in the derived set." >&2
         fails=$((fails + 1))
       fi
     done

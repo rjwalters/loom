@@ -560,8 +560,7 @@ stop. `--output` does not help either: it stages a copy of the *primary's*
 `defaults/`, not your unmerged edits.
 
 In `rjwalters/loom` the installed mirrors are tracked and CI requires them current
-before merge (`check-hooks-defaults-parity.sh`, `check-docs-defaults-parity.sh`,
-`check-dangling-links.sh`). So when your diff touches one, update it by hand
+before merge (`check-hooks-defaults-parity.sh`, `check-dangling-links.sh`). So when your diff touches one, update it by hand
 **inside your worktree** (paths via `$WORKTREE_ABS`):
 
 - `defaults/hooks/X.sh` -> `cp -p defaults/hooks/X.sh .loom/hooks/X.sh`

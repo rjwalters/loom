@@ -29,7 +29,7 @@ This repository uses several automated tools to detect security issues:
 
 - **Renovate**: Scheduled dependency-version updates for npm, Cargo, and GitHub Actions, gated by a 14-day release-age quarantine
 - **Dependabot**: Security-fix PRs from vulnerability alerts (scheduled version updates are disabled in favor of Renovate)
-- **Cargo Audit**: Scans Rust dependencies for known security vulnerabilities
+- **Cargo Audit**: Scans Rust dependencies for known security vulnerabilities, daily (`.github/workflows/ci-daily.yml`)
 - **NPM Audit**: Scans JavaScript dependencies for known security vulnerabilities
 - **CodeQL**: Static analysis to detect security issues in JavaScript/TypeScript and Rust code, run daily and on demand (`.github/workflows/codeql.yml`)
 - **Cargo Deny**: Supply chain security checks for Rust dependencies
