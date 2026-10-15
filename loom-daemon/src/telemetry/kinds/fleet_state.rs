@@ -462,6 +462,19 @@ pub enum MergeBlockedReason {
     OperatorHold,
 }
 
+/// Why a `doctor` row is, or is not, draining (#12085), from the row's own
+/// labels. Closed set; `drainable` is the only one a Doctor lane can pick up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorGate {
+    /// An operator or `loom:blocked` hold: the Doctor lane skips the PR.
+    Parked,
+    /// A live `loom:treating` claim: a Doctor is working it now.
+    Treating,
+    /// No hold and no claim: waiting for the Doctor lane to drain it.
+    Drainable,
+}
+
 impl MergeBlockedReason {
     /// Every reason, strongest precedence last.
     pub const ALL: [MergeBlockedReason; 7] = [
@@ -608,6 +621,16 @@ pub struct FleetStateRow {
     /// the reason is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_blocked_since: Option<DateTime<Utc>>,
+    /// `doctor` only (#12085): whether the PR is parked, under a live Doctor
+    /// claim, or drainable. Absent on any other stage and on an older emitter.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor_gate: Option<DoctorGate>,
+    /// `doctor` only (#12085): the first pass this host saw `loom:treating` on
+    /// the PR in its current continuous claim (a lower bound, like `held_since`
+    /// without the flag). Present exactly when `doctor_gate` is `treating`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treating_since: Option<DateTime<Utc>>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -646,6 +669,8 @@ impl FleetStateRow {
             eligible_reason: None,
             dispatch_blocked_reason: None,
             dispatch_blocked_since: None,
+            doctor_gate: None,
+            treating_since: None,
         }
     }
 }

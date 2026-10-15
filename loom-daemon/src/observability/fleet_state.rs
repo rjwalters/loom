@@ -66,7 +66,7 @@ use serde_json::Value;
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
-    split_into_chunks, CuratorState, FleetCapacity, FleetEligibleReason, FleetHoldKind,
+    split_into_chunks, CuratorState, DoctorGate, FleetCapacity, FleetEligibleReason, FleetHoldKind,
     FleetPrCensus, FleetQueueDepth, FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots,
     FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason,
     PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
@@ -212,6 +212,8 @@ struct PrFacts {
     holds: Vec<String>,
     conflict: bool,
     ci_fail: bool,
+    /// A live `loom:treating` claim (#12085).
+    treating: bool,
     level: u8,
 }
 
@@ -223,6 +225,7 @@ impl PrFacts {
             holds: hold_names(labels),
             conflict: has("loom:merge-conflict"),
             ci_fail: has("loom:ci-failure"),
+            treating: has(TREATING),
             level: crate::priority_pick::Level::of(labels).rank(),
         }
     }
@@ -232,6 +235,8 @@ impl PrFacts {
         row.holds.clone_from(&self.holds);
         row.conflict = self.conflict;
         row.ci_fail = self.ci_fail;
+        // Provisional: `build_view` settles the gate once stage and hold are final.
+        row.doctor_gate = self.treating.then_some(DoctorGate::Treating);
         row.level = row.level.max(self.level);
     }
 }
@@ -657,6 +662,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 row.holds.clone_from(&was.holds);
                 row.conflict = was.conflict;
                 row.ci_fail = was.ci_fail;
+                row.doctor_gate = was.doctor_gate.filter(|g| *g == DoctorGate::Treating);
             }
         }
         // Facts a row carries from the item's earlier rows (#11391): the
@@ -709,6 +715,25 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 _ => Some(now),
             };
         }
+        // Doctor queue state (#12085): parked beats a claim beats drainable.
+        // The claim, when held, was left on the row provisionally above.
+        let treating = row.doctor_gate == Some(DoctorGate::Treating);
+        row.doctor_gate = (row.stage == FleetStage::Doctor).then(|| {
+            if row.hold_kind.is_some() {
+                DoctorGate::Parked
+            } else if treating {
+                DoctorGate::Treating
+            } else {
+                DoctorGate::Drainable
+            }
+        });
+        row.treating_since = match (row.doctor_gate, was) {
+            (Some(DoctorGate::Treating), Some(was)) if was.doctor_gate == row.doctor_gate => {
+                was.treating_since.or(Some(now))
+            }
+            (Some(DoctorGate::Treating), _) => Some(now),
+            _ => None,
+        };
         // Roll the row's own label-derived facts up into the merge-readiness
         // reason (#11644). Computed last, so it reflects the final stage, hold
         // and flags, whatever source set them.
@@ -1334,3 +1359,8 @@ mod triage_flow_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state/dispatch_blocked_tests.rs"]
 mod dispatch_blocked_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/doctor_gate_tests.rs"]
+mod doctor_gate_tests;
