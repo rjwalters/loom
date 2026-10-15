@@ -952,3 +952,77 @@ fn long_multibyte_admission_values_survive_the_export_allowlist() {
         assert_eq!(exported["loom.runtime"], "codex");
     }
 }
+
+/// Collects the spans a backfill pass exports (#12253).
+#[derive(Default)]
+struct SpanSink(std::sync::Mutex<Vec<crate::telemetry::trace::SpanRecord>>);
+
+impl super::super::queue::QueueSink for SpanSink {
+    fn offer(&self, _: TelemetryEnvelope) {}
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        if let TelemetryRecord::Span(span) = envelope.record {
+            self.0.lock().unwrap().push(span);
+        }
+        Ok(())
+    }
+}
+
+/// #12253: orphan recovery leaves a step's `loom.sweep` span open while the
+/// step still runs (its lock names it and its process lives), even when the
+/// journal's owner and supervisor pids are gone; once the step is gone it
+/// closes it as before.
+#[cfg(unix)]
+#[test]
+fn recovery_leaves_a_running_steps_sweep_span_to_the_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::write(
+        root.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let sweep_id = "step-builder-60-1";
+    let span =
+        begin(root, sweep_id, SpanName::Sweep, attributes(&[("loom.sweep_id", sweep_id)])).unwrap();
+    let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    span.journal.set_owner(span.context(), dead).unwrap();
+    span.journal.set_supervisor(span.context(), dead).unwrap();
+    assert_eq!(step_sweep_id(&span.journal.active().unwrap()), Some(sweep_id));
+
+    // The step's lock names it and its leader (this process) lives.
+    let lock = root.join(".loom/locks/issue-60");
+    std::fs::create_dir_all(&lock).unwrap();
+    let owner = crate::sweep_registry::LockOwner::new(60, std::process::id(), sweep_id);
+    std::fs::write(lock.join("owner.json"), serde_json::to_string(&owner).unwrap()).unwrap();
+    let sink = SpanSink::default();
+    backfill(root, &sink);
+    assert_eq!(span.journal.active().unwrap().len(), 1, "a running step keeps its span");
+    assert!(sink.0.lock().unwrap().is_empty());
+
+    // The step is gone: its lock is released.
+    std::fs::remove_dir_all(&lock).unwrap();
+    backfill(root, &sink);
+    let spans = sink.0.lock().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].attributes["loom.result"], "process_lost");
+}
+
+#[test]
+fn only_a_steps_sweep_id_marks_a_step_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    journal
+        .start(
+            TraceContext::root(true),
+            None,
+            SpanName::Sweep,
+            Utc::now(),
+            attributes(&[("loom.sweep_id", "sweep-issue-7-1")]),
+        )
+        .unwrap();
+    assert_eq!(step_sweep_id(&journal.active().unwrap()), None);
+    assert!(!running_step(dir.path(), &journal));
+}

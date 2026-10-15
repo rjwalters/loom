@@ -155,7 +155,10 @@ pub struct StepTick {
 #[must_use]
 pub fn disposition_of(reason: &str) -> Qd {
     match reason {
-        "claimed" | "claim_lost" => Qd::PeerClaim,
+        // #12105: a Doctor standing down on another actor's work
+        // (`peer_active`), or a step held by the Judge no-verdict backstop
+        // (`backstop_hold`), is someone else's claim, not a dispatch error.
+        "claimed" | "claim_lost" | "peer_active" | "backstop_hold" => Qd::PeerClaim,
         "pool_exhausted"
         | "no_token_pool"
         | "token_selection_failed"

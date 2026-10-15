@@ -1877,6 +1877,11 @@ new config key: `paused` and `stopped` both go through the drain machinery
   `restart --drain` and an auto-update roll all keep their own pause and their
   own release path. Conversely `restart --abort-drain` on a `paused` host
   resumes dispatch only until the next sync pass re-reads the store, and says so.
+  So a host paused in the store **and** held by a local operator stop (for
+  example a supervisor-environment hold re-armed at startup) stays held after
+  the store returns to `running`: `status` then reads `desired running … -> no
+  fleet-store hold (dispatch may still be held locally; see Drain)` while the
+  Drain line says `HELD`, and `loom-daemon restart --abort-drain` releases it.
 - **Unset `fleet.repo` is unchanged.** No state is read, nothing is held, and
   nothing can refuse to start.
 
@@ -8491,9 +8496,7 @@ first forge-gather pass, and again whenever the switch flips.
 | `fleet.captainGauges.maxAgeSecs` | `1800` | A job's published `as_of` older than this is stale and the dispatcher produces locally again. Two publish intervals plus two collector passes, the fleet refresh's own liveness rule |
 | `fleet.captainGauges.publishIntervalSecs` | `600` | How often the captain writes the heartbeat |
 | `fleet.captainGauges.ref` | `eta-fit` (legacy fallback: `fleet.etaFitRef`) | The fleet-store branch the heartbeat lives on. Never the store's reviewed branch or `main` |
-| `fleet.captainGauges.starFacts` | `false` | Part 2 job **`star-facts`**, **inert since #11104** (its only reader, the star-liveness pass, was removed). Captain (with `enabled`): list every operator label per repo and publish how many open starred issues each has; nothing reads the counts |
 | `fleet.captainGauges.queueBlocked` | `false` | Part 2 job **`queue-blocked`**. Captain: list `loom:blocked` per repo and publish number, creation time and label names. Dispatcher: build its `queue.snapshot` blocked rows from that instead of listing |
-| `fleet.captainGauges.starFactsMaxAgeSecs` | `900` | The staleness bound for `star-facts` alone, in place of `maxAgeSecs`: two collector passes plus slack. A believed "no star here" is a skipped liveness pass, so this bounds how long a new star can go unevaluated when the captain stops reporting. While it produces `star-facts`, the captain republishes at least every `starFactsMaxAgeSecs − 600` s (300 s at the default) so its facts stay inside the bound |
 
 **How a dispatcher knows the captain is fresh.** Hosts have no channel to
 each other's telemetry, so the captain publishes a heartbeat to the fleet
@@ -8503,7 +8506,7 @@ per job the `as_of` of the captain's last finished pass (its points handed to
 the OTLP sink) and the repos it covered. A dispatcher reads it once per
 collector pass with `If-None-Match` (a `304` when unchanged) and stands down
 for a job and repo only when the heartbeat names the declared captain and the
-`as_of` is within `maxAgeSecs` (`starFactsMaxAgeSecs` for `star-facts`). A
+`as_of` is within `maxAgeSecs`. A
 read failure keeps the last heartbeat, which keeps ageing against the same
 bound; a missing or malformed one counts as absent. Without
 `fleet.repo` there is no heartbeat and every host produces locally. When a
@@ -8512,7 +8515,7 @@ transitions the captain already sampled are not replayed.
 
 | Gate | `fleet.captainGauges` | What the pass does |
 |---|---|---|
-| `Armed` | `enabled` | Arms `stage-dwell` (and `star-facts` / `queue-blocked` when switched on), produces, and publishes the heartbeat every `publishIntervalSecs` (shorter while `star-facts` is produced, see `starFactsMaxAgeSecs`) and at once when its content changes |
+| `Armed` | `enabled` | Arms `stage-dwell` (and `queue-blocked` when switched on), produces, and publishes the heartbeat every `publishIntervalSecs` and at once when its content changes |
 | `Refused` | `standDown`, store configured | Skips the repos the fresh heartbeat covers; produces the rest |
 | anything else | | Produces locally, exactly as before |
 
@@ -8528,15 +8531,15 @@ passing the bound. See [`telemetry-schema.md`](telemetry-schema.md#metricpoints)
 A captain that could not list a repo for longer than `maxAgeSecs` baselines
 it on recovery too, because the dispatchers have sampled it meanwhile.
 
-**Part 2: forge facts.** Two more per-host reads say the same thing on every
-host. Each has its own switch, so a fleet running only part 1 is unchanged.
+**Part 2: forge facts.** One more per-host read says the same thing on every
+host. It has its own switch, so a fleet running only part 1 is unchanged.
 Code: `observability/captain_gauges/facts.rs`.
 
-- **`star-facts`.** **Inert since #11104**: it let a dispatcher skip the
-  star-liveness pass for repos with no open starred issue, and that pass is
-  gone. A captain with `starFacts` on still lists the operator labels and
-  publishes the counts; nothing reads them. Leave it off (#11579 retires the
-  job).
+- **Retired (#11579).** The `star-facts` job and its two keys, `starFacts` and
+  `starFactsMaxAgeSecs`, are gone with the star-liveness pass (#11104). A host
+  config that still carries them is ignored with one startup warning, and a
+  heartbeat from an older captain that still lists the job parses and is
+  never consulted.
 - **`queue-blocked`.** The captain publishes each repo's open `loom:blocked`
   issues as number, creation time and `loom:*` / `tier:*` label names (no
   title, body or author). A dispatcher runs them through the same row
@@ -8547,31 +8550,30 @@ The captain lists **the repo it publishes under**: each listing names the
 slug the collector resolves for the checkout (as `gh` does: an `upstream`
 remote first, renames followed), never the checkout's `origin` or a
 `LOOM_REPO` in the daemon's environment. On a fork checkout those differ,
-and a listing of the fork would publish its star count under the upstream's
+and a listing of the fork would publish its rows under the upstream's
 name. Checkouts that resolve to the same slug are listed once.
 
-A repo is covered for a job only when every listing it needs succeeded on the
+A repo is covered for a job only when its listing succeeded on the
 captain; a failed listing (a rate-limited or withdrawn reader included)
 leaves the repo out, the dispatchers read it themselves, and nothing is
 reported to the host-wide rate-limit breaker. The captain's reads are
-recorded under the callers they replace (`queue_blocked`; the inert
-`star-facts` listings under `star_facts`), so `loom-daemon forge calls --by
-caller` shows the same reads on one host. Per dispatcher with R covered repos,
+recorded under the caller they replace (`queue_blocked`), so
+`loom-daemon forge calls --by caller` shows the same reads on one host. Per dispatcher with R covered repos,
 that is up to `12 × R` fewer `queue_blocked` listings an hour.
 
-**Mixed-version safety.** Both switches default off and older daemons ignore
-the keys, so an unconfigured or older host keeps today's behaviour. A
+**Mixed-version safety.** The switch defaults off and older daemons ignore
+the key, so an unconfigured or older host keeps today's behaviour. A
 dispatcher stands down only on fresh data from the current captain, so an
 older captain (no heartbeat) leaves every dispatcher producing. The part 2
-fields are additive under the same `captain-gauges/v1` tag: an older
-dispatcher ignores them, and an older captain publishes no `star-facts` or
-`queue-blocked` job, which every newer dispatcher reads as "not covered".
+field is additive under the same `captain-gauges/v1` tag: an older
+dispatcher ignores it, and an older captain publishes no `queue-blocked`
+job, which every newer dispatcher reads as "not covered".
 
 **Rollout order**: deploy everywhere; set `fleet.captainGauges.enabled` and
 confirm the captain's `loom.captain.gauge_age_seconds` stays under
 `maxAgeSecs`; then set `fleet.captainGauges.standDown`. For part 2, set
-`starFacts` / `queueBlocked` on the captain first, watch
-`gauge_age_seconds{task="star-facts"}`, then set the same key on the
+`queueBlocked` on the captain first, watch
+`gauge_age_seconds{task="queue-blocked"}`, then set the same key on the
 dispatchers. The captain needs the
 OTLP exporter, the fleet repos provisioned, and the writer App's
 `contents:write` on the store's publication branch .

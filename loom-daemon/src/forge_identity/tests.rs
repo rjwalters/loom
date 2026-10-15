@@ -354,6 +354,10 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // tests compare the two); the gateway itself is a reviewed read path.
         "forge_gateway.rs",
         "forge_gateway/tests.rs",
+        // #12245: the agent `gh` front's passthrough reads. `pool_reader` is
+        // asked only for an argv `is_read` classifies as a read whose repo is
+        // certain; writes and unclassified calls never reach it.
+        "agent_gh/read_route.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let re = regex::Regex::new(
