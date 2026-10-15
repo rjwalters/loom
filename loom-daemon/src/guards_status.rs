@@ -199,7 +199,7 @@ const CATEGORIES: &[Category] = &[
         tags: &["loom:remote-fleet-exec"],
     },
     Category {
-        // Read by the same verb (#10646), only once a shared-target ask is
+        // Read by the same verb (#10646), only once a shared-target deny is
         // about to fire.
         key: "cargoSharedTarget",
         env: "LOOM_GUARD_CARGO_SHARED_TARGET",
