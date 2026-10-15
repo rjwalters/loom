@@ -2,18 +2,16 @@
 //!
 //! This is also the points gate (#11663, `docs/design/issue-sizing.md` §5d):
 //! it resolves the story points from the issue body and its trusted comments,
-//! refuses with no label and no journal entry when they are missing or
-//! invalid, and otherwise journals the completion, then projects `points:N`
-//! (removing any other `points:*` label) and applies `loom:curated`.
+//! refuses with no label when they are missing or invalid, and otherwise
+//! projects `points:N` (removing any other `points:*` label) and applies
+//! `loom:curated`. It writes no telemetry: the daemon emits `issue.estimate`
+//! from the curated issue it observes (#12118).
 use anyhow::{Context, Result};
-use chrono::Utc;
 use loom_daemon::comment_trust::TrustPolicy;
 use loom_daemon::forge_call_stats::ops::{self, ForgeOp};
 use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use loom_daemon::points_marker::resolve_points;
 use loom_daemon::story_points::POINTS_LABEL_PREFIX;
-use loom_daemon::telemetry::kinds::issue_estimate::completion::{self, Completion};
-use loom_daemon::telemetry::TelemetryRecord;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -23,13 +21,15 @@ pub(crate) struct CurationCompleteArgs {
     repo: String,
     #[arg(long)]
     issue: u32,
-    /// Actual Curator model, never the Builder model.
+    /// Accepted for compatibility; ignored since the daemon emits the fact (#12118).
     #[arg(long)]
+    #[allow(dead_code)]
     model: String,
-    /// Actual Curator runtime.
+    /// Accepted for compatibility; ignored since the daemon emits the fact (#12118).
     #[arg(long)]
+    #[allow(dead_code)]
     runtime: String,
-    /// UUID for this completion. Keep it on retry; new UUID on re-curation.
+    /// Accepted for compatibility; echoed in the output, otherwise ignored.
     #[arg(long)]
     completion_id: String,
     /// Main workspace monitored by the daemon, not an issue worktree.
@@ -145,33 +145,8 @@ impl CurationCompleteArgs {
         policy: &TrustPolicy,
         may_write: &dyn Fn() -> std::result::Result<(), String>,
     ) -> Result<()> {
-        // Refuse before anything is journaled or labeled.
+        // Refuse before anything is labeled.
         may_write().map_err(|why| anyhow::anyhow!("refusing to label {}: {why}", self.repo))?;
-        let host = loom_daemon::sweep_registry::host_identity();
-        let mut request = Completion {
-            repo: &self.repo,
-            issue: self.issue,
-            model: &self.model,
-            runtime: &self.runtime,
-            id: &self.completion_id,
-            host_id: &host,
-            at: Utc::now(),
-            points: None,
-        };
-        if let Some(saved) = completion::existing(&self.workspace_root, &request)? {
-            // Retry: re-project the journaled points; never re-resolve them.
-            if let TelemetryRecord::IssueEstimate(r) = &saved.record {
-                if let Some(points) = r.points {
-                    let issue = self.issue_json(gh)?;
-                    self.project_labels(gh, &issue, points)?;
-                }
-            }
-            println!(
-                "{}",
-                serde_json::json!({"recorded":true,"retry":true,"completion_id":self.completion_id})
-            );
-            return Ok(());
-        }
         let issue = self.issue_json(gh)?;
         let path = format!("repos/{}/issues/{}/comments", self.repo, self.issue);
         let listing = self
@@ -189,11 +164,6 @@ impl CurationCompleteArgs {
         let body = issue.get("body").and_then(|v| v.as_str()).unwrap_or("");
         let points = resolve_points(body, policy.trusts_json(&issue), &comments)
             .map_err(|e| anyhow::anyhow!("issue {}#{}: {e}", self.repo, self.issue))?;
-        request.points = Some(points);
-        // The current marker is knowable only after the forge read completed.
-        request.at = Utc::now();
-        let saved = completion::record(&self.workspace_root, body, &request)?;
-        anyhow::ensure!(saved.is_some(), "new curation requires a concrete estimate marker");
         self.project_labels(gh, &issue, points)?;
         println!(
             "{}",

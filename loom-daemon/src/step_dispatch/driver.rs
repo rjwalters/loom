@@ -24,7 +24,7 @@ use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::repo_cap::{RepoCap, RepoLimits};
-use crate::work_finder::step_item::Lane;
+use crate::work_finder::step_item::{Lane, Step};
 use crate::work_finder::{workspace_draw, RedMainLane, RegistryDispatcher, TickReport};
 use crate::workspace_pool::WorkspacePool;
 
@@ -65,7 +65,9 @@ pub struct ListingState {
 /// - A Builder claim is a blind label flip: no Builder step when the open-PR
 ///   listing failed (a branch-only PR is invisible) or the items are the
 ///   last good listing, not this tick's.
-/// - A red repo held for its fixes keeps only its red-main fixes.
+/// - A red repo held for its fixes keeps its red-main fixes and every step
+///   that adds no code to a red `main`: Builder and `ChampionMerge` run only
+///   for a red-main fix, so a fix PR can still be reviewed and repaired.
 ///
 /// Returns how many Builder steps the listing held (#12025): the step path
 /// fails closed on a listing it cannot vouch for, and never falls back to a
@@ -82,7 +84,9 @@ pub fn shape_pool(
         0
     };
     if listing.fixes_only {
-        weighing.pool.retain(|c| c.item.lane == Lane::RedMain);
+        weighing.pool.retain(|c| {
+            c.item.lane == Lane::RedMain || !matches!(c.step, Step::Builder | Step::ChampionMerge)
+        });
     }
     held
 }

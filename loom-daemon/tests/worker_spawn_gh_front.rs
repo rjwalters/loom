@@ -111,6 +111,48 @@ fn the_worker_env_names_the_spawners_sink_dir() {
     assert_eq!(named, "off", "an off host sink is exported as off, never a fallback");
 }
 
+/// #12207: `spawn-worker` is not the daemon and publishes nothing, so it
+/// must pass on the read routing the daemon gave it rather than strip it:
+/// before, every dispatched agent ran without `LOOM_GH_GATEWAY_DIR` and its
+/// front's reads all went to the writer. A base that is not the shape the
+/// daemon publishes is still removed.
+#[test]
+fn the_worker_passes_on_the_daemons_read_routing() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let ws = d.path().join("daemon-ws");
+    let base = ws.join(".loom").join("gh-config-gateway");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = base.join("gh-ok");
+    std::fs::write(&marker, "/usr/bin/gh").unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let run = |gateway: &Path| {
+        let out = worker(d.path(), &d.path().join("shim-base"))
+            .env("LOOM_GH_GATEWAY_DIR", gateway)
+            .env("LOOM_GH_READER_ROOT", &ws)
+            .env("FIXTURE_PRINT_ENV", "LOOM_GH_GATEWAY_DIR,LOOM_GH_READER_ROOT")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let get = |name: &str| {
+            let prefix = format!("child_env {name}=");
+            stdout
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix.as_str()))
+                .unwrap()
+                .to_string()
+        };
+        (get("LOOM_GH_GATEWAY_DIR"), get("LOOM_GH_READER_ROOT"))
+    };
+    let (gateway, readers) = run(&base);
+    assert_eq!(gateway, base.display().to_string());
+    assert_eq!(readers, ws.display().to_string());
+    let (gateway, _) = run(&ws);
+    assert_eq!(gateway, "", "not a published base: removed");
+}
+
 // Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]

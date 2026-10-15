@@ -3397,6 +3397,31 @@ pub enum Event {
         sweep_id: SweepId,
         outcome: SweepOutcome,
     },
+    /// `step.item.{N}.ended` — a step session's outcome, as the step ledger
+    /// classified it (Issue #12152). Published once per ended step by the
+    /// step tick's settle pass (`step_dispatch::step_end::settle`), after
+    /// [`crate::sweep_registry::SweepRegistry::record_step_outcome`].
+    ///
+    /// A step never emits `sweep.issue.{N}.exited` (it is not an issue
+    /// sweep), so this is the step's terminal event on the bus. The narration
+    /// sink reads it to narrate a public-feed `completion` for a Champion
+    /// merge step whose PR merged; nothing else in the event makes a write.
+    /// `item` is the number the step ran on: the PR for a PR step
+    /// (`StepRole::acts_on_pr`), else the issue. `class` and `reason` are the
+    /// ledger's (`outcome_ledger::classify`): `class` is one of `verdict`,
+    /// `noop`, `refused`, `failed`.
+    StepEnded {
+        item: u32,
+        role: crate::step_role::StepRole,
+        class: String,
+        reason: String,
+        /// How long the session ran, in seconds.
+        ran_for_sec: i64,
+        /// Owning managed-workspace root (Issue #3929's pattern). Stamped by
+        /// `SweepRegistry::emit_event` -> [`Self::set_repo_if_absent`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
     /// `epic.issue.{N}.{action}` — the epic supervisor (#3842) fired one of its
     /// four action-class transitions for epic `{N}`. Published by the epic
     /// supervisor loop; authorized by #3873 (epic #3842 Phase 4).
@@ -3544,6 +3569,7 @@ impl Event {
     /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
     /// | `SweepGlobalRuntimeRejected {..}` | `sweep.global.runtime_rejected` |
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
+    /// | `StepEnded {item, ..}` | `step.item.{item}.ended` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
     /// | `PreflightAdvisory {..}` | `daemon.preflight.advisory` |
@@ -3570,6 +3596,7 @@ impl Event {
             Self::SweepGlobalDispatch { .. } => "sweep.global.dispatch".to_string(),
             Self::SweepGlobalRuntimeRejected { .. } => "sweep.global.runtime_rejected".to_string(),
             Self::SweepGlobalCompleted { .. } => "sweep.global.completed".to_string(),
+            Self::StepEnded { item, .. } => format!("step.item.{item}.ended"),
             Self::EpicAction { epic, action, .. } => {
                 format!("epic.issue.{epic}.{}", action.as_str())
             }
@@ -3602,7 +3629,8 @@ impl Event {
             | Self::SweepCrashed { repo, .. }
             | Self::SweepResumeDispatched { repo, .. }
             | Self::SweepGlobalDispatch { repo, .. }
-            | Self::SweepGlobalRuntimeRejected { repo, .. } => repo,
+            | Self::SweepGlobalRuntimeRejected { repo, .. }
+            | Self::StepEnded { repo, .. } => repo,
             _ => return,
         };
         if slot.is_none() {

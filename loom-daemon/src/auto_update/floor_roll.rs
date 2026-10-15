@@ -14,7 +14,7 @@
 //! | no fleet store | n/a | Opt-in `autoUpdate`, unchanged: artifact path and source path behind the settle gate and its ceiling. `target_source = autoupdate`. |
 //! | unknown | n/a | No version roll. The note says the floor is not known and why. Fail closed. |
 //! | set | below; the newest release is at or above it | Floor roll now, no settle, pinned to that release's exact tag (#10709). `target_source = floor`. |
-//! | set | below; the newest release is below it | The typed stall ([`FloorStallReport`]), alerted at ERROR. No roll; dispatch continues. |
+//! | set | below; the newest release is below it | The typed stall ([`FloorStallReport`]), alerted at ERROR. No roll; dispatch continues. Re-checked every 2 min for the first hour of the stall (#12072), so a roll starts minutes after the asset lands. |
 //! | set | below; no comparable release resolved | No roll; the next tick asks again. A standing stall is kept (#10866). |
 //! | set | at or above | **No roll**, whatever newer release, re-published artifact or source HEAD exists. |
 //! | set, but a version does not parse | n/a | No version roll, one WARN. |

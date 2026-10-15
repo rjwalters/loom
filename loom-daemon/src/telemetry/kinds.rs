@@ -163,11 +163,17 @@ pub mod auto_update_tick;
 
 pub mod backlog_level;
 
+/// `daemon.exit` (#11839) — why the daemon process ended.
+pub mod daemon_exit;
+
 /// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
 pub mod checkout_external_change;
 
 /// `host.export` (#11124).
 pub mod host_export;
+
+/// Per-kind silence thresholds for `otlp_export` health (#12120).
+pub mod kind_silence;
 
 /// `operator.presence` (#11563) — an operator session's keyboard presence.
 pub mod operator_presence;
@@ -471,6 +477,12 @@ macro_rules! telemetry_kind_table {
             /// (#11819): open count, target, level. OTLP-only. See
             /// [`backlog_level`].
             BacklogLevel = "backlog.level" => $crate::telemetry::kinds::backlog_level::BacklogLevelRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// Why the daemon process ended (#11839): signal / exit code, who asked,
+            /// whether a relaunch is expected, and the in-flight sweeps. OTLP-only.
+            /// See [`daemon_exit`].
+            DaemonExit = "daemon.exit" => $crate::telemetry::kinds::daemon_exit::DaemonExitRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

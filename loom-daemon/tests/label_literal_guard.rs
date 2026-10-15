@@ -33,7 +33,6 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("merge_pr/consolidate.rs", "loom:consolidation"),
     ("merge_pr/consolidate.rs", "loom:consolidation-abort"),
     ("merge_pr/sequence.rs", "loom:sequence"),
-    ("merge_pr/stale_checks/local_eval.rs", "loom:merge-tree-reverify"),
     ("observability/captain_gauges/facts.rs", "loom:"),
     ("observability/ops/stage_dwell.rs", "loom:"),
     ("observability/pick_journal.rs", "loom:"),

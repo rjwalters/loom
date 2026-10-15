@@ -241,6 +241,7 @@ pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
 mod recheck_interval;
+pub mod startup_gate;
 pub mod step_item;
 mod tick_line;
 mod tick_report;
@@ -2479,6 +2480,7 @@ where
                         );
                     }
                     was_rate_limited = true;
+                    tick_summary::publish_rate_limit_skip(now); // #12083
                     continue;
                 }
                 was_rate_limited = false;
@@ -2813,10 +2815,14 @@ pub fn spawn_multi_work_finder_task(
     // actually finished. That pass now runs on a blocking thread rather than
     // blocking `run_daemon` itself, so this is what still guarantees no sweep
     // is admitted before a startup reclaim of a stale `loom:building` claim
-    // has landed.
-    mut startup_reconciliation_ready: tokio::sync::watch::Receiver<bool>,
+    // has landed. Since #12222 the wait is bounded: see `startup_gate`.
+    mut startup_reconciliation_ready: tokio::sync::watch::Receiver<
+        crate::daemon_startup_reconciliation::StartupPasses,
+    >,
 ) -> tokio::task::JoinHandle<()> {
     configured_max::log_loop_start(interval, configured_max);
+    // #12222: about daemon start (spawned during `run_daemon` startup).
+    let spawned_at = std::time::Instant::now();
     tokio::spawn(async move {
         // #12073: a per-host delay before the first gather, so a fleet that
         // restarts together does not gather all at once. First run only.
@@ -2839,12 +2845,17 @@ pub fn spawn_multi_work_finder_task(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;
-        // Block the loop's first REAL tick body until the startup
-        // reconciliation pass has finished (#6615/#7974). Already-`true`
-        // resolves instantly (the common case: the pass is almost always
-        // faster than one tick interval), so this never adds latency once the
-        // pass has completed — including on every tick after the first.
-        let _ = startup_reconciliation_ready.wait_for(|ready| *ready).await;
+        // Block the loop's first REAL tick body until the startup passes
+        // have finished (#6615/#7974) — but the forge-bound claim pass only
+        // up to a cap (#12222): it took 20–40+ min on a host with hundreds of
+        // open-PR claims. Ticking past the cap is safe; see `startup_gate`.
+        // Already-finished resolves instantly, and only the first tick waits.
+        let startup_outcome = startup_gate::wait(
+            &mut startup_reconciliation_ready,
+            startup_gate::wait_cap(&fallback_root),
+        )
+        .await;
+        let mut first_tick = startup_gate::FirstTick::new(spawned_at, startup_outcome);
         let mut was_halted = false;
         let mut was_pressured = false;
         // #9410/#10624: the build back-off's per-repo (and optional host
@@ -2920,6 +2931,7 @@ pub fn spawn_multi_work_finder_task(
                         );
                     }
                     was_rate_limited = true;
+                    tick_summary::publish_rate_limit_skip(now); // #12083
                     continue;
                 }
                 was_rate_limited = false;
@@ -3265,6 +3277,8 @@ pub fn spawn_multi_work_finder_task(
                     draining,
                 );
             }
+            // #12222: time from daemon start to the first completed tick.
+            first_tick.completed(&event_bus);
         }
     })
 }

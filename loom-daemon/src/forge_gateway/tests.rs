@@ -356,7 +356,8 @@ fn with_the_gateway_unset_routing_is_byte_identical_to_today() {
     }
     assert_eq!(profile_for("gwt-bg"), None);
     assert!(!any_live(), "the agent front does no gateway work at all");
-    assert_eq!(agent_env(), vec![(NO_UPDATE_NOTIFIER_ENV, Some("1".into())), (DIR_ENV, None)]);
+    assert_eq!(agent_env()[..2], [(NO_UPDATE_NOTIFIER_ENV, Some("1".into())), (DIR_ENV, None)]);
+    assert_eq!(agent_env()[2].0, crate::forge_identity::FRONT_ROOT_ENV);
 }
 
 #[test]
@@ -799,4 +800,28 @@ fn an_ssm_failure_names_the_exit_and_the_first_stderr_line() {
     );
     assert_eq!(first_line(""), "(no stderr)");
     assert_eq!(first_line(&"x".repeat(1000)).len(), 240);
+}
+
+/// #12207: a spawner that is not the daemon (`loom-daemon worker`) passes on
+/// the gateway base it inherited, when it is still the shape the daemon
+/// publishes, instead of stripping it from the agent it execs.
+#[test]
+fn a_non_daemon_spawner_passes_on_an_inherited_safe_base_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join(".loom").join(DIR_NAME);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = base.join("gh-ok");
+    std::fs::write(&marker, "/usr/bin/gh").unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let inherited = Some(base.clone().into_os_string());
+    assert_eq!(inherited_base(inherited.clone()), inherited);
+    assert_eq!(inherited_base(None), None);
+    assert_eq!(inherited_base(Some(OsString::new())), None);
+    // Not the published shape: never passed on.
+    assert_eq!(inherited_base(Some(tmp.path().as_os_str().to_os_string())), None);
+    // A base another user could write to is not passed on either.
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert_eq!(inherited_base(inherited), None);
 }
