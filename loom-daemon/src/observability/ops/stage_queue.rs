@@ -138,7 +138,7 @@ pub(super) async fn walk_counts(
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
-        let rows = crate::forge_listing::list_open_issues_cached_all_as(
+        let rows = crate::forge_listing::list_open_issues_cached_all_observability_as(
             "stage_dwell",
             &gh,
             Some(&root),
