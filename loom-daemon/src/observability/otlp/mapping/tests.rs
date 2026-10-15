@@ -934,6 +934,8 @@ fn role_tick_outcome_envelope(
             actions: None,
             source: None,
             sweep_id: None,
+            deferred_by: None,
+            shard_owner: None,
         }),
     )
 }

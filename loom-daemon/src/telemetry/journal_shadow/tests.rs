@@ -342,6 +342,8 @@ fn role_tick(root: &Path) -> crate::role_tick_telemetry::RoleTickTelemetry {
         preference_tap: None,
         role_draw: None,
         step_sweep_id: None,
+        deferred_by: None,
+        shard_owner: None,
     }
 }
 

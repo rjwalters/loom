@@ -1348,6 +1348,7 @@ gradeable by a model or prompt experiment.
 | `skipped_pool_exhausted` | no | The credential pool the admitted runtime draws from has zero spawnable accounts (#7607) — `gated_pool` says which pool (#8408). |
 | `skipped_model_runtime_mismatch` | no | The resolved model provably conflicts with the admitted runtime (#5028). |
 | `skipped_queue_empty` | no | A queue-gated role (judge, doctor) found its work queue empty and spawned nothing (#9391). |
+| `skipped_deferred` | no | A host limit stopped the round-robin walk before this repo's turn, so the role did not run for it this tick (#12084). `deferred_by` names the limit (`ceiling`, `role_budget`, `demand_width`, `reservation`); `shard_owner` (`<index>/<count>`) is present on a sharded host. Its next chance is a later tick, so a repo's effective cadence is the interval times the ticks between its non-deferred records. |
 
 Folding the skips into `failure` is the exact mis-read #7607 documents: one
 fleet-wide exhausted pool produces hundreds of identical exit-78 skips, which

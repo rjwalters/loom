@@ -215,6 +215,20 @@ pub enum LimitRefusal {
     },
 }
 
+impl LimitRefusal {
+    /// The stable wire name of the limit (`role_tick.outcome`'s
+    /// `deferred_by`, #12084).
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Ceiling { .. } => "ceiling",
+            Self::RoleBudget { .. } => "role_budget",
+            Self::DemandWidth { .. } => "demand_width",
+            Self::Reservation { .. } => "reservation",
+        }
+    }
+}
+
 /// The per-root decision of one tick.
 #[derive(Debug)]
 pub enum RootTickDecision {
@@ -792,8 +806,26 @@ impl RoleDispatcher {
         let report = self.walk(order, in_progress);
         if let Some(refusal) = report.refusal {
             log::warn!("{}", refusal_summary_line(self.spec.name, refusal, report.deferred));
+            self.emit_deferred(refusal);
         }
         report
+    }
+
+    /// Record each root this tick left in `pending` as deferred (#12084). Only
+    /// the tick calls it: a resume re-walks the same roots and would repeat
+    /// the fact. Off the async loop, because it resolves each repo's slug and
+    /// shard.
+    fn emit_deferred(&self, refusal: LimitRefusal) {
+        let roots: Vec<PathBuf> = self.pending.iter().map(|(_, root)| root.clone()).collect();
+        if roots.is_empty() {
+            return;
+        }
+        let (role, kind) = (self.spec.name, refusal.kind());
+        tokio::task::spawn_blocking(move || {
+            for root in &roots {
+                crate::role_tick_telemetry::deferred::emit_deferred(root, role, kind);
+            }
+        });
     }
 
     /// Curator demand axis (#9000): among roots with a last-known untriaged
