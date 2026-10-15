@@ -149,6 +149,66 @@ pub(crate) fn soft_read_json_object(path: &Path) -> Value {
     }
 }
 
+/// Run `git -C root <args>`, returning stdout on success (`None` on any
+/// failure: not a repo, missing ref, non-zero exit, non-UTF-8).
+fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// Text of a **tracked** tier file as it stands on the default branch (#10352).
+///
+/// A main checkout that nothing has fast-forwarded silently governs every
+/// worktree's config (a stale `forge.trustedCommenters` dropped an operator
+/// verdict). When `repo_root` is itself a git toplevel whose `HEAD` is a
+/// strict ancestor of `origin/HEAD` **and** `rel` has no local modification
+/// against `HEAD`, this returns the file's text at `origin/HEAD` (`Some("")`
+/// if the ref lacks the path, so a file the default branch removed stops
+/// contributing). Any other case — non-git root, no `origin/HEAD`, diverged
+/// or detached-ahead `HEAD`, local edit — returns `None` and the caller reads
+/// the working copy exactly as before.
+fn default_branch_tier_text(repo_root: &Path, rel: &str) -> Option<String> {
+    let top = git_stdout(repo_root, &["rev-parse", "--show-toplevel"])?;
+    if std::fs::canonicalize(top.trim()).ok()? != std::fs::canonicalize(repo_root).ok()? {
+        return None;
+    }
+    let head = git_stdout(repo_root, &["rev-parse", "--verify", "-q", "HEAD"])?;
+    let remote = git_stdout(repo_root, &["rev-parse", "--verify", "-q", "origin/HEAD"])?;
+    if head.trim() == remote.trim() {
+        return None;
+    }
+    git_stdout(repo_root, &["merge-base", "--is-ancestor", "HEAD", "origin/HEAD"])?;
+    // `diff --quiet` exits 1 on a modification; `git_stdout` maps that to None.
+    git_stdout(repo_root, &["diff", "--quiet", "HEAD", "--", rel])?;
+    // Untracked-at-HEAD working-copy files are local edits too.
+    if repo_root.join(rel).exists()
+        && git_stdout(repo_root, &["cat-file", "-e", &format!("HEAD:{rel}")]).is_none()
+    {
+        return None;
+    }
+    Some(git_stdout(repo_root, &["show", &format!("origin/HEAD:{rel}")]).unwrap_or_default())
+}
+
+/// [`soft_read_json_object`] for a tracked tier, preferring the default
+/// branch's copy when the checkout is strictly behind and clean (#10352).
+fn soft_read_tracked_tier(repo_root: &Path, rel: &str) -> Value {
+    if let Some(text) = default_branch_tier_text(repo_root, rel) {
+        return match serde_json::from_str::<Value>(&text) {
+            Ok(v @ Value::Object(_)) => v,
+            _ => Value::Object(Map::new()),
+        };
+    }
+    soft_read_json_object(&repo_root.join(rel))
+}
+
 /// A loud, top-of-boot-block diagnosis of the **legacy** `.loom/config.json`
 /// tier only (#6499) — the one tier every existing repo actually has
 /// populated, and the one a host-local patch (e.g. `safehouse.socket`,
@@ -257,8 +317,8 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
         effective = deep_merge(&effective, &soft_read_json_object(&defaults_path));
     }
 
-    effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LEGACY_CONFIG_REL)));
-    effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(PROJECT_CONFIG_REL)));
+    effective = deep_merge(&effective, &soft_read_tracked_tier(repo_root, LEGACY_CONFIG_REL));
+    effective = deep_merge(&effective, &soft_read_tracked_tier(repo_root, PROJECT_CONFIG_REL));
     effective =
         deep_merge(&effective, &soft_read_json_object(&repo_root.join(FLEET_REPO_CONFIG_REL)));
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LOCAL_CONFIG_REL)));
@@ -773,6 +833,51 @@ mod tests {
         // `shared` was overridden by project but not local -> project's
         // value wins over legacy's.
         assert_eq!(effective.get("shared"), Some(&json!(2)));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_resolve_reads_tracked_tier_from_origin_head_when_checkout_is_behind() {
+        use std::process::Command;
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        write(&root.join(LEGACY_CONFIG_REL), r#"{"a": 1}"#);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "one"]);
+        write(
+            &root.join(LEGACY_CONFIG_REL),
+            r#"{"a": 1, "forge": {"trustedCommenters": ["turian"]}}"#,
+        );
+        git(&["commit", "-q", "-am", "two"]);
+        // Publish the newer commit as origin/HEAD, then lag the checkout.
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        git(&["reset", "-q", "--hard", "HEAD~1"]);
+
+        let effective = resolve_effective_config(root);
+        assert_eq!(effective.pointer("/forge/trustedCommenters"), Some(&json!(["turian"])));
+
+        // A local uncommitted edit wins: the working copy is read as today.
+        write(&root.join(LEGACY_CONFIG_REL), r#"{"a": 9}"#);
+        let edited = resolve_effective_config(root);
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(edited, json!({"a": 9}));
     }
 
     #[test]
