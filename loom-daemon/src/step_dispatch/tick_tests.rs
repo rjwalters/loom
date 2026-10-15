@@ -340,3 +340,28 @@ fn a_refused_draw_is_counted_on_the_record() {
 fn a_missing_role_command_reads_as_workspace_commands_missing() {
     assert_eq!(disposition_of("workspace_commands_missing"), Qd::WorkspaceCommandsMissing);
 }
+
+/// #12105: a Doctor that stands down because another actor is working the PR
+/// (`peer_active`), and a step the Judge backstop holds (`backstop_hold`),
+/// read as a peer's claim: not a dispatch error, an in-flight skip.
+#[test]
+fn peer_active_and_backstop_hold_read_as_a_peer_claim() {
+    for reason in ["peer_active", "backstop_hold"] {
+        assert_eq!(disposition_of(reason), Qd::PeerClaim, "{reason}");
+    }
+    let mut spawner = FakeSpawner {
+        refuse: vec![(3, "peer_active")],
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0]);
+    let tick =
+        run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut cap, &mut spawner);
+    assert_eq!(tick.report.errors, 0, "a stand-down is not a dispatch error");
+    let record = tick.report.item_draw.unwrap();
+    let refused = record
+        .excluded
+        .iter()
+        .find(|e| e.reason == "refused_peer_active")
+        .unwrap();
+    assert_eq!(refused.skip_reason, PickSkipReason::InFlight);
+}
