@@ -200,6 +200,7 @@ impl SweepRegistry {
         request: &StepSpawnRequest,
     ) -> std::result::Result<PreparedStep, StepRefusal> {
         let (item, role, kind) = (request.item, request.role, request.kind());
+        self.check_role_command(role)?;
         self.roll_gate
             .admit(&kind)
             .map_err(|e| StepRefusal::new("roll_paused", e))?;
@@ -218,6 +219,32 @@ impl SweepRegistry {
             return Err(refusal);
         }
         self.spawn_prepared_step(request, &sweep_id, launch)
+    }
+
+    /// Refuse a step whose `/loom:<role>` command is not installed in the
+    /// workspace (#12048, the step-dispatch counterpart of #4027/#6440): the
+    /// child would die on `Unknown command` and cool the item down as a failed
+    /// spawn. Runs before any lock or forge write; WARNs once per role until the
+    /// file appears. Hermetic fixtures (`skip_label_flip`) are exempt.
+    fn check_role_command(&mut self, role: StepRole) -> std::result::Result<(), StepRefusal> {
+        if self.config.skip_label_flip {
+            return Ok(());
+        }
+        let name = role.role_name();
+        if !self.config.role_command_missing(role) {
+            self.missing_command_warned.remove(name);
+            return Ok(());
+        }
+        let path = self.config.role_command_path(role);
+        let detail = format!(
+            "workspace {} is missing {} (run `loom-daemon init`)",
+            self.config.workspace_root.display(),
+            path.display()
+        );
+        if self.missing_command_warned.insert(name) {
+            log::warn!("sweep_registry: step refused — {detail}");
+        }
+        Err(StepRefusal::new("workspace_commands_missing", detail))
     }
 
     /// The claimed step's launch: the stagger and the child. A failed spawn

@@ -462,3 +462,52 @@ fn only_a_builder_step_names_its_item_as_the_owned_claim() {
     assert!(block.contains("LOOM_SWEEP_CLAIM_OWNED=unset"), "{block}");
     cancel_all(&mut reg);
 }
+
+// ---- workspace role command (#12048) ----------------------------------------
+
+/// A non-hermetic registry refuses a step whose `/loom:<role>` command is not
+/// installed, before any lock; once the file exists the step spawns.
+#[test]
+#[serial]
+fn a_step_without_its_role_command_is_refused_before_any_lock() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _record) = fixture_registry(dir.path());
+    reg.config.skip_label_flip = false;
+    let request = StepSpawnRequest::new(9_200, StepRole::Judge);
+
+    let (result, signals) = capture(|| reg.spawn_step(&request));
+    let refusal = result.unwrap_err();
+    let refusal = refusal.downcast_ref::<StepRefusal>().unwrap();
+    assert_eq!(refusal.reason, "workspace_commands_missing");
+    assert!(!reg.config.locks_dir().join("pr-9200").exists(), "no lock may be left behind");
+    assert!(reg.entries.is_empty());
+    assert_eq!(
+        step_span_reason(&signals.spans),
+        vec![("refused".into(), "workspace_commands_missing".into())]
+    );
+
+    // A second refusal records the span again but does not WARN again.
+    assert!(reg.missing_command_warned.contains("judge"));
+    let _ = reg.spawn_step(&request).unwrap_err();
+    assert_eq!(reg.missing_command_warned.len(), 1);
+
+    let commands = dir.path().join(".claude").join("commands").join("loom");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(commands.join("judge.md"), "# judge").unwrap();
+    let outcome = reg.spawn_step(&request).unwrap();
+    assert!(outcome.sweep_id.starts_with("step-judge-9200-"));
+    assert!(reg.missing_command_warned.is_empty(), "the WARN re-arms once the file is seen");
+    cancel_all(&mut reg);
+}
+
+/// Champion's promote and merge steps share `champion.md`.
+#[test]
+fn champion_steps_resolve_the_same_command_file() {
+    let dir = tempdir().unwrap();
+    let config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    assert_eq!(
+        config.role_command_path(StepRole::ChampionPromote),
+        config.role_command_path(StepRole::ChampionMerge)
+    );
+    assert!(config.role_command_missing(StepRole::ChampionMerge));
+}
