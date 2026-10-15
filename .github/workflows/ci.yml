@@ -1760,6 +1760,16 @@ jobs:
         run: bash scripts/check-daemon-subcommand-versions.sh --quiet --require-baseline
       - name: Self-test the daemon-subcommand version gate
         run: bash scripts/check-daemon-subcommand-versions.sh --self-test
+      - name: Run the installed-file write guard suite under bash 3.2
+        if: ${{ !cancelled() }}
+        # #12043. Every `bash -n` above passed while this guard FAILED OPEN on
+        # bash 3.2: a `$'\001…'` sentinel inside an array assignment is stored
+        # doubled (CTLESC), so loom_bash_write_targets missed every `>`/`>>`
+        # and every non-solo tee/cp/mv/sed -i write into installed .loom/
+        # files. Parse-clean, runtime-wrong -- only executing the suite under
+        # the 3.2 PATH bash asserted above catches it. All its inputs are
+        # `.sh`, inside this job's `**/*.sh` scanned set. ~4s.
+        run: bash defaults/hooks/tests/test-guard-installed-file-writes.sh
 
   dep-classification-suites:
     name: Native Port Suites
