@@ -467,8 +467,8 @@ fn emit_chunked(sink: &super::OpsSink, points: Vec<MetricPoint>, since: Option<D
     }
 }
 
-/// The collector's rate-limit tick: one free `gh api rate_limit` probe and
-/// one skip-counter flush per interval.
+/// The collector's rate-limit tick: one cached budget read (no forge call,
+/// #12204) and one skip-counter flush per interval.
 pub const TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The credential identity the probe runs as: resolved once when known;
@@ -589,10 +589,11 @@ pub fn fresh_fallback(
 }
 
 /// One rate-limit tick: flush the skip counter, ingest agent `gh` front rows
-/// (#10607), probe the budget (booking it
-/// on an App host, else falling back to the breaker's trip-time reading)
-/// and export the gauges — the bucket book's once, after the probe. Returns
-/// before any probe when no OTLP exporter is running.
+/// (#10607), read the cached budget (booking it on an App host, else falling
+/// back to the breaker's trip-time reading) and export the gauges — the
+/// bucket book's once, after that read. Since #12204 the tick makes no
+/// `/rate_limit` or GraphQL `rateLimit` call of its own: it reads the
+/// process-wide probe cache and the response-header readings only.
 pub async fn record(workspace_root: &Path) {
     let Some(sink) = super::global_ops_sink() else {
         return;
@@ -619,7 +620,12 @@ pub async fn record(workspace_root: &Path) {
         let host = probe_host(&root);
         let points = probe_points(
             &host,
-            crate::rate_limit_breaker::forge::probe_budget(now),
+            // #12204: a gauge tick never pays for a probe — the cached
+            // reading (header-refreshed) or nothing, then the breaker's.
+            crate::rate_limit_breaker::forge::cached_budget_ctx(
+                &crate::rate_limit_breaker::report::FailureContext::default(),
+                now,
+            ),
             || {
                 fresh_fallback(
                     crate::rate_limit_breaker::global().and_then(|b| b.last_budget()),

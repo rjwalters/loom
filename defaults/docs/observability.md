@@ -806,8 +806,10 @@ job that tripped it (`loom.ratelimit.source`), the cooldown end and, per pool,
 the probe's `used` split into this host's own share and the external share
 (`github.ratelimit.{core,graphql}.{used,own,external}`) — the `attribution:`
 line from `daemon.log`, now queryable fleet-wide. Every 60 s the collector
-probes `gh api rate_limit` (free: it does not count against the quota). On a
-GitHub App host the reading is booked into the bucket book below as the
+reads the process-wide budget cache (#12204: no forge call of its own — one
+`gh api rate_limit` per credential per reset window, made by a budget check on
+a cold start or by a breaker trip, refreshed between probes from response
+headers). On a GitHub App host the reading is booked into the bucket book below as the
 writer App's bucket for the workspace's own owner; on an ambient-login host it
 is exported as `github.ratelimit.{remaining,used,reset}` gauges labelled
 `resource` (`core`|`graphql`), `account` (the `gh` login, else `unknown` —
@@ -820,8 +822,9 @@ OTLP exporter exports none of this; its evidence stays in `daemon.log`.
 installation separately, so the daemon also keeps a *bucket book*: the newest
 reading of every `(account, owner, resource)` pool it spends, from the free
 `x-ratelimit-*` headers of `gh api --include` calls and from one free
-`gh api rate_limit` probe per published credential directory after every
-reader-refresh pass, plus the 60 s probe above. Each believed reading is
+`gh api rate_limit` probe per published credential directory whose bucket it
+does not already hold for the current window (checked after every
+reader-refresh pass, #12204), plus the 60 s cached reading above. Each believed reading is
 exported once per tick as `github.ratelimit.{remaining,used,reset}` labelled
 `resource`, `account`, `owner`, `installation` and `role` (`writer`|`reader`)
 — since #10343 no point leaves without `owner`, and since #10571 `account`/
