@@ -66,7 +66,7 @@ row is one drawn `(item, step)` (`step_dispatch/tick.rs`, #11909).
 
 The dashboard port (`mergeFleetQueue`, below) folds by the same
 `repo#issue` + `step` key and breaks the final ordering tie on `step`, as
-the Rust merge does (2AMLogic/loom-ui#4182). The fixture's last case pins
+the Rust merge does. The fixture's last case pins
 that tie-break: one host, one issue at two steps, the same state and
 position.
 
@@ -154,7 +154,7 @@ They are pinned to the same JSON fixture, kept as two identical copies:
   `include_str!`;
 - `2AMLogic/loom-ui:web/test/fixtures/dispatch-plan-merge.json`, which
   `loom-ui:web/test/workQueue.test.ts` reads. loom-ui ported the full merge
-  rule and added its copy in 2AMLogic/loom-ui#4182; before that its port
+  rule and added its copy; before that its port
   folded by `repo#issue` alone and pinned no fixture.
 
 The two copies must stay byte-identical. Neither side owns the fixture: a
