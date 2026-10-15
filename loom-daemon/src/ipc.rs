@@ -275,21 +275,31 @@ pub use drain_supervisor::{
 // panic must never turn a single fault into a permanent drain/status outage.
 #[must_use]
 pub fn count_in_flight_sweeps(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Path) -> usize {
+    in_flight_sweep_ids(workspace_pool, fallback_root).len()
+}
+
+/// The ids of the sweeps [`count_in_flight_sweeps`] counts (#11839).
+#[must_use]
+pub fn in_flight_sweep_ids(
+    workspace_pool: &Arc<WorkspacePool>,
+    fallback_root: &Path,
+) -> Vec<String> {
     let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
-    let mut count = 0;
+    let mut ids = Vec::new();
     for root in &roots {
         let registry = workspace_pool.get_or_provision(root);
         let sr = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        count += sr
-            .list(None)
-            .into_iter()
-            .filter(|info| !info.state.is_terminal())
-            .count();
+        ids.extend(
+            sr.list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .map(|info| info.sweep_id),
+        );
     }
-    count
+    ids
 }
 
 /// Cancel every in-flight sweep across all managed roots via the existing
@@ -867,7 +877,11 @@ async fn handle_client(
                     "RestartDaemon: supervised — exiting {EXIT_RESTART}. {ack_message} \
                      The stale socket is reclaimed by the relaunched daemon's singleton guard."
                 );
-                crate::observability::shutdown::exit(EXIT_RESTART).await;
+                crate::observability::shutdown::exit(
+                    EXIT_RESTART,
+                    crate::observability::daemon_exit::ExitCause::IpcRestart,
+                )
+                .await;
             }
             continue;
         }
