@@ -67,6 +67,23 @@ pub fn managed_roots(workspace_root: &Path) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
+/// [`establish_for_workspace`] on a blocking thread, for the refresh tick's
+/// #11957 retry; a join error is reported as a failed pass so it retries.
+pub async fn establish_for_workspace_off_thread(
+    workspace_root: PathBuf,
+    root_owner_repo: String,
+    script_path: PathBuf,
+) -> CrossOwnerPass {
+    tokio::task::spawn_blocking(move || {
+        establish_for_workspace(&workspace_root, &root_owner_repo, &script_path)
+    })
+    .await
+    .unwrap_or_else(|e| CrossOwnerPass {
+        failed: vec![format!("per-owner pass join error: {e}")],
+        ..Default::default()
+    })
+}
+
 /// [`establish_cross_owner_credentials`] for the daemon's real workspace:
 /// its registry's roots, minted through `github-app-token.sh` at
 /// `script_path`. Blocking (git remote reads and mint subprocesses).
