@@ -47,6 +47,16 @@
 #   was; only the accidental "any stranger's comment pins the claim" behaviour
 #   is removed.
 #
+#   3. LEASE-AWARE (#11911). The step engine claims Curator, Judge, Doctor and
+#      Champion work with a role lease (`loom-daemon lease pr`, #11898) that is
+#      renewed for as long as the step runs. Before a claim is reported
+#      `stale` / `stale-bounded-fallback`, the lease is read: a LIVE lease of
+#      the claim's role (held by a peer, or by this caller) keeps the claim
+#      `fresh` whatever its label's age, so this script can never strip a
+#      running step's claim. An unreadable lease list is `unknown` (fail safe).
+#      Without `lease pr` (an older binary), or with `--repo` naming another
+#      repository, only the age rule above applies.
+#
 # Usage:
 #   claim-staleness.sh check     --number N --label LABEL [options]
 #   claim-staleness.sh standdown --number N --label LABEL [options] [--dry-run]
@@ -78,7 +88,8 @@
 #
 # CLAIM_STATE values:
 #   unclaimed              The item does not currently carry LABEL -> claim it.
-#   fresh                  A claimant is plausibly alive -> stand down.
+#   fresh                  A claimant is plausibly alive (or holds a live
+#                          lease) -> stand down.
 #   stale                  Idle >= threshold with no claimant activity -> reclaim.
 #   stale-bounded-fallback Stand-down streak >= cap AND claim age >= threshold
 #                          -> force-reclaim (livelock breaker).
@@ -104,8 +115,8 @@ ACTIVITY_PREFIX="<!-- loom:claim-activity claim="
 
 _usage() {
     # Keep this range in sync with the header comment block above
-    # (currently lines 50-96: "Usage:" through the gh-cached caveat).
-    sed -n '50,96p' "$0" | sed 's/^# \{0,1\}//'
+    # (currently lines 60-107: "Usage:" through the gh-cached caveat).
+    sed -n '60,107p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 _die() {
@@ -344,6 +355,35 @@ if [[ -z "$CLAIM_STATE" ]]; then
     fi
 fi
 
+# --- live step lease (#11911) -------------------------------------------------
+# The claim's role lease, keyed by the label it backs. A live one keeps the
+# claim fresh: the step engine's claims are lease-backed, and a running step
+# must never lose its claim to an age rule.
+_lease_role() {
+    case "$LABEL" in
+        loom:reviewing) echo "judge" ;;
+        loom:treating) echo "doctor" ;;
+        loom:curating) echo "curator" ;;
+        loom:evaluating) echo "champion" ;;
+        *) echo "" ;;
+    esac
+}
+
+LEASE_STATE=""
+if [[ "$CLAIM_STATE" == "stale" || "$CLAIM_STATE" == "stale-bounded-fallback" ]] &&
+    [[ -z "$REPO_ARG" && -n "$(_lease_role)" ]]; then
+    LEASE_STEP=()
+    [[ "$LABEL" == "loom:evaluating" ]] && LEASE_STEP=(--step champion_promote)
+    # requires-daemon: lease optional   Without `lease pr check` (absent or older binary) the lease is not read: only the age rule decides, as before #11911.
+    LEASE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease pr check "$NUMBER" --role "$(_lease_role)" ${LEASE_STEP[@]+"${LEASE_STEP[@]}"} 2>/dev/null)" || true
+    LEASE_STATE="$(sed -n 's/^PR_LEASE_STATE=//p' <<<"$LEASE_OUT" | head -n 1)"
+    case "$LEASE_STATE" in
+        held-peer | held-self) CLAIM_STATE="fresh" ;;
+        unknown) CLAIM_STATE="unknown" ;;
+        *) ;; # free, or no reading: the age rule stands
+    esac
+fi
+
 _emit_evaluation() {
     local extra_key="${1:-}" extra_val="${2:-}"
     if [[ "$JSON_OUTPUT" == true ]]; then
@@ -357,6 +397,7 @@ _emit_evaluation() {
             --argjson standdown "${STANDDOWN_COUNT:-0}" \
             --argjson stale_minutes "$STALE_MINUTES" \
             --argjson max_streak "$MAX_STREAK" \
+            --arg lease_state "$LEASE_STATE" \
             --arg claim_label "$LABEL" \
             --arg extra_key "$extra_key" \
             --arg extra_val "$extra_val" \
@@ -370,7 +411,8 @@ _emit_evaluation() {
                activity_count: $activity,
                standdown_count: $standdown,
                stale_minutes: $stale_minutes,
-               max_standdown_streak: $max_streak
+               max_standdown_streak: $max_streak,
+               lease_state: $lease_state
              }
              + (if $extra_key == "" then {} else {($extra_key | ascii_downcase): $extra_val} end)'
     else
@@ -384,6 +426,7 @@ _emit_evaluation() {
         echo "STANDDOWN_COUNT=${STANDDOWN_COUNT:-0}"
         echo "STALE_MINUTES=$STALE_MINUTES"
         echo "MAX_STANDDOWN_STREAK=$MAX_STREAK"
+        echo "LEASE_STATE=$LEASE_STATE"
         [[ -n "$extra_key" ]] && echo "$extra_key=$extra_val"
     fi
     return 0

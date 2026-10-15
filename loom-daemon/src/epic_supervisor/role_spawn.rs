@@ -246,7 +246,7 @@ mod tests {
         struct OneFlatEpic;
         impl EpicSource for OneFlatEpic {
             fn list_open_epics(&mut self) -> anyhow::Result<Vec<EpicSnapshot>> {
-                Ok(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+                Ok(vec![EpicSnapshot::new(1, "flat body", vec![])])
             }
         }
         let _guard = EnvGuard::clear();
@@ -305,7 +305,7 @@ mod tests {
         struct OneFlatEpic;
         impl EpicSource for OneFlatEpic {
             fn list_open_epics(&mut self) -> anyhow::Result<Vec<EpicSnapshot>> {
-                Ok(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+                Ok(vec![EpicSnapshot::new(1, "flat body", vec![])])
             }
         }
         let _guard = EnvGuard::clear();

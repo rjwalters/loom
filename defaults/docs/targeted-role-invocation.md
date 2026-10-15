@@ -2,10 +2,10 @@
 
 A **targeted** invocation hands a role one item number instead of letting it
 discover its own work: `/loom:judge <PR>`, `/loom:curator <issue>`,
-`/loom:builder <issue>`, `/loom:doctor <PR>`. The daemon already invokes
-Doctor (#10632) and Judge (#10630) this way through the per-repository lanes
-in `role_runner/lanes.rs`. Step dispatch (one role session moves one item one
-stage) will invoke every item role this way. That makes the targeted path a
+`/loom:builder <issue>`, `/loom:doctor <PR>`. Step dispatch (one role session
+moves one item one stage, #11909) invokes every item role this way; the
+role runner's per-repository Doctor and Judge lanes (#10632, #10630), which
+did so first, were retired with those roles' intervals (#11911). That makes the targeted path a
 daemon contract, not just an operator convenience, and this doc is the
 contract:
 

@@ -1710,16 +1710,9 @@ pub struct DaemonStatusReport {
     /// compatible (an absent field parses as `0`).
     #[serde(default)]
     pub active_role_agents: usize,
-    /// The concurrent role-agent ceiling this daemon resolved for its primary
-    /// workspace (#6102) — env > `autonomous.roleRunner.maxConcurrent` >
-    /// [`crate::role_runner::default_max_concurrent`], via
-    /// [`crate::role_runner::resolve_max_concurrent`].
-    ///
-    /// This is a **separate** ceiling from the sweep dynamic cap
-    /// ([`Self::dynamic_cap`]): `autonomous.workFinder.maxConcurrent` bounds
-    /// sweep dispatch only, and role agents are never routed through
-    /// work-finder admission. Both numbers are reported so `status` can state
-    /// the total agent budget instead of implying one knob covers it.
+    /// The role runner's ceiling right now (#6102): since #11911 its share of
+    /// the one host budget, the work finder's dynamic cap less the steps in
+    /// flight ([`crate::role_runner::resolve_ceiling`]).
     ///
     /// `None` for a pre-#6102 wire payload / an older daemon that does not
     /// report one — never conflate that with "unbounded".
@@ -3685,9 +3678,8 @@ impl Event {
 /// | [`Join`](Self::Join)           | `epic:phase_join`   | Champion advances: materializes phase N+1's children (barrier-gated) |
 /// | [`Close`](Self::Close)         | `epic:done`         | Champion closes the completed epic |
 ///
-/// The `BuildChildren` transition (per-child `/loom:sweep` dispatch) is **not**
-/// an action class here — those dispatches already surface on the frozen
-/// `sweep.global.dispatch` topic.
+/// An `active` epic plans nothing (its children are Builder steps, #11911), so
+/// it has no action class.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EpicActionClass {

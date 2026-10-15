@@ -1,7 +1,7 @@
 //! The pipeline-empty gate on hermit / architect idle generation (#10817).
 
 use super::*;
-use crate::role_runner::demand::{AxisDebt, DebtAxis, HostDebt};
+use crate::pr_debt::{self, AxisDebt, DebtAxis, HostDebt};
 use crate::role_runner::idle_gate::{self, IdleGateDecision, PipelineView, IDLE_GATE_ENV};
 
 fn debt(review: Option<usize>) -> HostDebt {
@@ -82,7 +82,7 @@ fn debt_denies_hermit_and_architect_but_not_other_roles() {
     let _env = ShardEnvGuard::capture();
     std::env::remove_var(IDLE_GATE_ENV);
     let ws = gated_workspace(Some(true));
-    demand::global().record(ws.path(), DebtAxis::Review, 3);
+    pr_debt::global().record(ws.path(), DebtAxis::Review, 3);
     assert_eq!(plan(ws.path()), vec!["champion"]);
 }
 
@@ -93,7 +93,7 @@ fn empty_pipeline_grants() {
     std::env::remove_var(IDLE_GATE_ENV);
     let ws = gated_workspace(Some(true));
     for axis in DebtAxis::ALL {
-        demand::global().record(ws.path(), axis, 0);
+        pr_debt::global().record(ws.path(), axis, 0);
     }
     let names = plan(ws.path());
     assert!(names.contains(&"hermit") && names.contains(&"architect"), "{names:?}");
@@ -111,7 +111,7 @@ fn flag_off_is_unchanged_even_with_debt() {
     std::env::remove_var(IDLE_GATE_ENV);
     for flag in [None, Some(false)] {
         let ws = gated_workspace(flag);
-        demand::global().record(ws.path(), DebtAxis::Review, 3);
+        pr_debt::global().record(ws.path(), DebtAxis::Review, 3);
         assert_eq!(idle_gate::gate(ws.path(), "hermit"), None);
         let mut names = plan(ws.path());
         names.sort_unstable();

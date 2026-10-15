@@ -154,14 +154,15 @@ The stage-entry provider is a three-source adapter, tried in order:
 
 ### 4.4 Slots and spawn
 
-- **Slots.** Steps draw from `workFinder.maxConcurrent` on every root: the tick fills `maxConcurrent - occupancy` slots, at most `max_admissions_per_tick` of them, none while the saturation brake holds. The role runner keeps its own ceiling for the non-item roles until the two budgets merge (#11911).
+- **Slots.** Steps and role-runner agents share one host budget, the work finder's dynamic cap over `workFinder.maxConcurrent` (`host_budget`, #11911): the tick fills `maxConcurrent - role agents - occupancy` slots, at most `max_admissions_per_tick` of them, none while the saturation brake holds, and the role runner's ceiling is `maxConcurrent - occupancy` as the last tick saw it. `roleRunner.maxConcurrent` is retired. `loom.dispatch.idle_slots` stays `maxConcurrent - occupancy` for one release.
 - **The tick** is `step_dispatch::driver::StepDriver::tick`, called from the work-finder loop in place of the `loom:issue` finder. Per root it lists and classifies (`step_dispatch::gather`), weighs with the registry's live state (`step_cooldowns`, the Champion ladder's due times, `pool_exhausted_roles`), and runs `step_dispatch::tick::run`. The seed's `workspace` input is the forge slug `pick.decision` names as `repo`.
 - **Resolvers.** A step uses the role runner's resolvers for its role (`role_runner/model_resolution.rs`, `resolve_role_runner_model` and `resolve_role_runner_effort`) and admits against the pool of the resolved runtime. Only Builder steps keep the per-issue experiment arm (`sweep_registry/model_dispatch.rs`).
 - **The lock.** The spawn (`SweepRegistry::spawn_step_unlocked`) releases the registry lock around the runtime admission's private-clone containment (#8787), a non-Builder step's pre-claim and the account-selection poll, as `private_dispatch::prepare` does for sweeps.
 - **Capture.** A step keeps the role-tick capture from #11877.
 - **Registry.** Steps run in the sweep registry as `SweepKind::Step { item, role }` (`types.rs`). Every consumer that matches on `SweepKind` is exhaustive (#11898).
 - **The end.** A step's end is queued (`sweep_registry/step_spawn/ended.rs`); the next tick reads the item's forge post-state with the lock released, classifies it with the session's outcome line and records it in the ledger (`step_dispatch::step_end`). A failed read is `failed` / `probe_failed`, never a default.
-- **The role runner** runs Guide, Auditor, Hermit, Architect and Champion `--non-item`. Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning; `championMode` is retired (`role_runner/champion_mode.rs`). Epic `BuildChildren` dispatches nothing: the children are Builder steps.
+- **The role runner** runs Guide, Auditor, Hermit, Architect and Champion `--non-item`. Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning; `championMode` is retired and its `all` mode deleted (`role_runner/champion_mode.rs`); Curator has no event trigger. The Judge/Doctor queue gate, `demandWidth` and the per-repo lanes are deleted (#11911); the PR-debt ledger they fed survives as `pr_debt`, fed by the step listing, for the build back-off and the idle gate.
+- **No daemon path spawns `/loom:sweep`** (#11911). Epic `BuildChildren` is deleted (an active epic plans nothing; its children are Builder steps), the review-stall watchdog's `PrSet` conversion is retired, and a roll requeues an `Issue` sweep (label restore, lock release) instead of resuming it. `DispatchSweep` IPC stays for attended callers only: the `dispatch_sweep` MCP tool that attended `/loom:sweep` Stage -1 uses, `loom-daemon dispatch` and Safehouse ChatOps.
 
 ## 5. Claims, restore and the outcome ledger
 
@@ -276,7 +277,7 @@ Each owner doc carries a short pointer to this section. Since #11909 every depar
 | `defaults/docs/promotion-throughput.md` | Promotion is per-item and terminal. `prSlice`, `promotionSlice` and `tier2Cap` don't apply. |
 | `defaults/docs/dispatch-plan.md` | Plan rows gain a `step` field, with the shared fixture changed first |
 | `defaults/docs/telemetry-kind-pick-decision.md` | Work-finder rows gain step, weight terms and `age_source`. The per-role cadence volume table no longer holds for item roles. |
-| `defaults/docs/daemon-reference.md` (role runner) | The item roles do not run on intervals and `demandWidth` doesn't apply to them; Champion runs `--non-item`. The two concurrency budgets merge in #11911. |
+| `defaults/docs/daemon-reference.md` (role runner) | The item roles do not run on intervals; Champion runs `--non-item`. `demandWidth` and `roleRunner.maxConcurrent` are retired, and the two concurrency budgets are one (#11911). |
 | `defaults/docs/label-state-machine.md` | The `queued` item state. `stale_after_minutes` becomes live. Per-role restore. |
 | `defaults/labels.json` (header) | `stale_after_minutes` is no longer INERT. #11898 changes the header together with the values it makes live; until then the header stays accurate. |
 | `mcp-loom/src/tools/sweeps.ts` and `mcp-loom/README.md` | The sweep tools learn `SweepKind::Step` (its role and item). #11898 changes them together with the Rust type. |

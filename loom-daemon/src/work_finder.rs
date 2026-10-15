@@ -3057,9 +3057,10 @@ pub fn spawn_multi_work_finder_task(
                 in_flight_sweeps,
                 crate::role_runner::global_active_run_count(),
             );
-            // #9410/#10624: in-memory reads of the role runner's demand ledger,
-            // one per root — no forge call; fails open when unobserved.
-            let ledger = crate::role_runner::demand::global();
+            // #9410/#10624: in-memory reads of the PR-debt ledger the step
+            // tick feeds, one per root; fails open when unobserved.
+            let ledger = crate::pr_debt::global();
+            ledger.retain_roots(&roots);
             let build_backoff_held = build_backoff.step(&fallback_root, &roots, ledger);
             // Per-root claude-wrapper pre-flight-advisory hold (#5030): consult
             // each root's own SweepRegistry breaker. A workspace that has
@@ -3176,6 +3177,8 @@ pub fn spawn_multi_work_finder_task(
                 lanes: &lanes,
                 build_backoff: &build_backoff_held.per_workspace,
                 max_concurrent,
+                // #11911: role-runner agents draw from the same budget.
+                role_runs: crate::role_runner::active_run_count(&role_in_progress),
                 max_admissions: max_admissions_per_tick,
                 saturation_held,
                 limits: (max_concurrent_per_repo, ram_budget, disk_budget).into(),
@@ -3183,6 +3186,9 @@ pub fn spawn_multi_work_finder_task(
 
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
+            if let Some(occupancy) = report.occupancy {
+                crate::host_budget::publish(max_concurrent, occupancy);
+            }
             let plan = dispatch_plan::PlanInputs::new(max_concurrent, interval, &shard_decisions);
             publish_tick(&report, max_concurrent, tick_started, &roots, Some(&plan));
 

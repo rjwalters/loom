@@ -3,8 +3,8 @@
 //!
 //! Today an `onIdle` edge means "a host slot is free". With
 //! `autonomous.balance.idleGate` on it additionally means "this repo's
-//! pipeline is empty": no review / changes / merge debt (from the demand
-//! ledger) and, when observed, no ready or building issues. Only the
+//! pipeline is empty": no review / changes / merge debt (from the PR-debt
+//! ledger, [`crate::pr_debt`], which the step tick feeds) and, when observed, no ready or building issues. Only the
 //! proposal-generating roles ([`GATED_ROLES`]) are gated; every other idle
 //! role, and every call with the flag off, takes the unchanged path.
 //!
@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use super::demand::{self, HostDebt};
+use crate::pr_debt::{self, HostDebt};
 
 /// Env override for `autonomous.balance.idleGate` (env > config > default).
 pub const IDLE_GATE_ENV: &str = "LOOM_BALANCE_IDLE_GATE";
@@ -36,7 +36,7 @@ pub enum IdleGateDecision {
 /// Per-repo pipeline readings; `None` is unobserved.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PipelineView {
-    /// Review / changes / merge debt from the demand ledger.
+    /// Review / changes / merge debt from the PR-debt ledger.
     pub debt: HostDebt,
     /// Open `loom:issue` count, if known.
     pub ready: Option<usize>,
@@ -114,9 +114,8 @@ pub fn gate(root: &Path, role: &str) -> Option<IdleGateDecision> {
     if !is_gated_role(role) || !idle_gate_enabled(root) {
         return None;
     }
-    let stale = demand::read_demand_config(root).stale();
     let view = PipelineView {
-        debt: demand::global().repo_debt(root, stale),
+        debt: pr_debt::global().repo_debt(root, pr_debt::STALE_AFTER),
         ready: None,
         building: None,
     };

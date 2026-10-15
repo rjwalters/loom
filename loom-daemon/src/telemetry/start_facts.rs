@@ -46,13 +46,13 @@ pub enum DispatchOrigin {
     Operator,
     /// The daemon's autonomous work finder picked the issue.
     WorkFinder,
-    /// The epic supervisor dispatched the next phase.
-    EpicSupervisor,
     /// A registry watchdog re-dispatched after a stall or early exit.
     Watchdog,
     /// The reaper resumed a crashed sweep from its checkpoint.
     ReaperRetry,
-    /// The requester did not say, or named a value this daemon does not know.
+    /// The requester did not say, or named a value this daemon does not know
+    /// (including `epic_supervisor`, retired with the epic supervisor's
+    /// per-child sweep dispatch, #11911).
     #[serde(other)]
     Unknown,
 }
@@ -64,7 +64,6 @@ impl DispatchOrigin {
         match self {
             Self::Operator => "operator",
             Self::WorkFinder => "work_finder",
-            Self::EpicSupervisor => "epic_supervisor",
             Self::Watchdog => "watchdog",
             Self::ReaperRetry => "reaper_retry",
             Self::Unknown => "unknown",

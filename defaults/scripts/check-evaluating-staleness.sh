@@ -21,6 +21,14 @@
 #     issues directly (bypassing champion.md's exclusion) and un-claims the
 #     stale ones so they re-enter normal discovery
 #
+# LEASE-AWARE (#11911). The step engine claims a Champion promotion with a
+# role lease (`loom-daemon lease pr`, role `champion`, step `champion_promote`,
+# #11898) renewed for as long as the step runs. A label old enough to read as
+# stale is reported FRESH while that lease is live, so neither call site can
+# strip a running step's claim; an unreadable lease list is FRESH too (fail
+# safe). Without `lease pr` (an older binary) only the age rule decides. The
+# lease is read only for `loom:evaluating`, the one claim the lease backs.
+#
 # This script only CLASSIFIES — it never writes a label or a comment. Both
 # call sites own their own label/comment writes (posting an audit-trail
 # comment before a reclaim, or escalating after repeated staleness), exactly
@@ -166,6 +174,19 @@ fi
 if [[ "$AGE_MIN" -lt "$THRESHOLD_MIN" ]]; then
   emit "FRESH" "$AGE_MIN" "$CLAIMED_AT"
   exit 0
+fi
+
+# --- Step 4: a live step lease keeps an aged claim (#11911) ------------------
+if [[ "$LABEL" == "loom:evaluating" ]]; then
+  # requires-daemon: lease optional   Without `lease pr check` (absent or older binary) the lease is not read: only the age rule decides, as before #11911.
+  LEASE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease pr check "$ISSUE" --role champion --step champion_promote 2>/dev/null)" || true
+  case "$(sed -n 's/^PR_LEASE_STATE=//p' <<<"$LEASE_OUT" | head -n 1)" in
+    held-peer | held-self | unknown)
+      emit "FRESH" "$AGE_MIN" "$CLAIMED_AT"
+      exit 0
+      ;;
+    *) ;; # free, or no reading: the age rule stands
+  esac
 fi
 
 emit "STALE" "$AGE_MIN" "$CLAIMED_AT"

@@ -3,8 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use super::{busy_points, role_ceiling, SWEEP_ROLE};
-use crate::role_runner::{RoleRunnerConfig, DEFAULT_ROLES};
+use super::{busy_points, role_share, SWEEP_ROLE};
+use crate::role_runner::DEFAULT_ROLES;
 use crate::telemetry::ops::{bounded_labels, MetricName, MetricPoint, MetricValue};
 use crate::work_finder::TickReport;
 
@@ -93,28 +93,19 @@ fn nothing_measured_emits_nothing() {
     assert!(busy_points(None, None).is_empty());
 }
 
+/// One host budget (#11911): the role runner's share is what the registry
+/// occupancy leaves, so role busy + role idle + occupancy is the budget.
 #[test]
-fn the_role_ceiling_is_the_largest_enabled_roots() {
-    let root = |enabled: Option<bool>, max: Option<usize>| RoleRunnerConfig {
-        enabled,
-        max_concurrent: max,
-        ..RoleRunnerConfig::default()
-    };
-    if std::env::var_os(crate::role_runner::ROLE_RUNNER_ENABLE_ENV).is_some()
-        || std::env::var_os(crate::role_runner::ROLE_RUNNER_MAX_CONCURRENT_ENV).is_some()
-    {
-        return; // the env tier would override the configs under test
-    }
-    assert_eq!(role_ceiling(&[]), 0);
-    assert_eq!(role_ceiling(&[root(Some(false), Some(9))]), 0, "disabled roots hold no slots");
-    assert_eq!(
-        role_ceiling(&[
-            root(Some(true), Some(3)),
-            root(Some(true), Some(5)),
-            root(None, Some(9))
-        ]),
-        5
-    );
+fn the_role_share_is_the_budget_less_the_occupancy() {
+    assert_eq!(role_share(8, Some(5)), 3);
+    assert_eq!(role_share(8, None), 8, "no occupancy reading: the whole budget");
+    assert_eq!(role_share(2, Some(5)), 0, "never negative");
+    let running = BTreeMap::from([("champion", 1)]);
+    let points = busy_points(Some(5), Some((&running, role_share(8, Some(5)))));
+    let occupancy = sum(&points, MetricName::DispatchBusySlots, |r| r == SWEEP_ROLE);
+    let roles = sum(&points, MetricName::DispatchBusySlots, |r| r != SWEEP_ROLE);
+    let idle = sum(&points, MetricName::DispatchRoleIdleSlots, |_| true);
+    assert_eq!(occupancy + roles + idle, 8);
 }
 
 /// #11906: a step's slots, broken down by its role under `pool="step"`,

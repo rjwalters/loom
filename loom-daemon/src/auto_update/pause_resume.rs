@@ -122,8 +122,14 @@ pub const REASON_SESSION_DOWN: &str = "session-down";
 pub const REASON_TIMEOUT: &str = "resume-timeout";
 /// Requeue reason: no resumable session was recorded.
 pub const REASON_NOT_RESUMABLE: &str = super::pause_classify::REASON_NOT_RESUMABLE;
-/// Requeue reason: a PR-set sweep, which this path never resumes.
+/// Requeue reason: a PR-set sweep, or a step on a PR, which this path never
+/// resumes.
 pub const REASON_PR_SET: &str = "guard-refused:pr-set-sweep";
+/// Requeue reason: a whole-lifecycle `Issue` sweep from before the daemon
+/// stopped spawning them (#11911). Requeued (claim label restored, lock
+/// released) for one release so a roll leaves nothing in `loom:building`;
+/// never resumed.
+pub const REASON_SWEEP_RETIRED: &str = "sweep-retired";
 
 /// Roll resumes one session may have (design §7).
 pub const MAX_ROLL_RESUMES: u32 = 3;
@@ -333,6 +339,10 @@ fn plan_item(item: &mut ManifestItem, stale: bool, safe_point: Option<SafePointR
     }
     if item.kind == ItemKind::Sweep && item.issue.is_none() {
         return requeue(item, REASON_PR_SET);
+    }
+    // #11911: only steps resume. An `Issue` sweep is requeued, never resumed.
+    if item.kind == ItemKind::Sweep && item.step.is_none() {
+        return requeue(item, REASON_SWEEP_RETIRED);
     }
     if stale {
         return requeue(item, REASON_STALE);

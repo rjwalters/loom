@@ -208,7 +208,7 @@ fn role_agents_json(report: &DaemonStatusReport) -> serde_json::Value {
         "active": report.active_role_agents,
         "max_concurrent": report.role_agent_max_concurrent,
         "total_with_sweeps": report.in_flight.len() + report.active_role_agents,
-        "bounded_by_work_finder_max_concurrent": false,
+        "bounded_by_work_finder_max_concurrent": true,
     })
 }
 
@@ -1522,9 +1522,8 @@ fn render_role_agent_line(report: &DaemonStatusReport) -> String {
     );
     let _ = writeln!(
         out,
-        "  (a SEPARATE ceiling from the sweep cap below — autonomous.workFinder.maxConcurrent \
-         bounds sweep dispatch only; tune these agents with \
-         autonomous.roleRunner.maxConcurrent / LOOM_ROLE_RUNNER_MAX_CONCURRENT, #6102)"
+        "  (one host budget: role agents and steps share autonomous.workFinder.maxConcurrent; \
+         the ceiling is what the steps in flight leave, #11911)"
     );
     let _ = writeln!(
         out,
@@ -4490,19 +4489,19 @@ mod role_agent_render_tests {
         );
     }
 
-    /// The misreading #6102 is about: `maxConcurrent` looks like the
-    /// per-machine agent knob. The line must say, in band, that it is not.
+    /// Since #11911 `maxConcurrent` IS the per-machine agent knob: role
+    /// agents and steps share it. The line says so in band.
     #[test]
-    fn human_line_states_that_max_concurrent_does_not_bound_these() {
+    fn human_line_states_the_one_host_budget() {
         let line = render_role_agent_line(&report_with(3, Some(7)));
         assert!(
-            line.contains("autonomous.workFinder.maxConcurrent bounds sweep dispatch only"),
-            "must disclaim the sweep knob: {line}"
+            line.contains(
+                "one host budget: role agents and steps share \
+                 autonomous.workFinder.maxConcurrent"
+            ),
+            "must name the one budget: {line}"
         );
-        assert!(
-            line.contains("autonomous.roleRunner.maxConcurrent"),
-            "must name the knob that DOES bound role agents: {line}"
-        );
+        assert!(!line.contains("autonomous.roleRunner.maxConcurrent"), "retired: {line}");
     }
 
     /// A pre-#6102 daemon sends no ceiling. Render it as `unknown`, never as
@@ -4528,8 +4527,8 @@ mod role_agent_render_tests {
             "scripted consumers get the sum without re-deriving it"
         );
         assert_eq!(
-            ra["bounded_by_work_finder_max_concurrent"], false,
-            "the payload must state the #6102 fact machine-readably too"
+            ra["bounded_by_work_finder_max_concurrent"], true,
+            "the payload must state the #11911 fact machine-readably too"
         );
     }
 

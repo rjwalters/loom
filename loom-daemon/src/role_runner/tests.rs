@@ -406,8 +406,6 @@ fn test_config_reads_enabled_roles_and_interval() {
             effort: None,
             role_efforts: BTreeMap::new(),
             architect_max_proposals: None,
-            max_concurrent: None,
-            champion_mode: None,
             on_idle_max_wait: None,
         }
     );
@@ -457,8 +455,6 @@ fn test_config_project_tier_only_is_honored_like_legacy() {
             effort: None,
             role_efforts: BTreeMap::new(),
             architect_max_proposals: None,
-            max_concurrent: None,
-            champion_mode: None,
             on_idle_max_wait: None,
         }
     );
@@ -517,8 +513,6 @@ fn test_resolve_roles_empty_array_is_none() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     assert_eq!(resolve_roles(&config), Vec::new());
@@ -536,8 +530,6 @@ fn test_resolve_roles_filters_and_preserves_default_order() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -556,8 +548,6 @@ fn test_resolve_roles_ignores_unknown_names() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -588,8 +578,6 @@ fn test_missing_defaults_warns_for_default_absent_from_pinned_list() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let resolved = resolve_roles(&config);
@@ -625,8 +613,6 @@ fn test_resolve_roles_unknown_name_and_missing_default_fire_independently() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -923,8 +909,6 @@ fn test_resolve_enabled_config_can_enable() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     }));
 }
@@ -943,8 +927,6 @@ fn test_resolve_enabled_env_overrides_config() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     }));
     std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
@@ -958,8 +940,6 @@ fn test_resolve_enabled_env_overrides_config() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     }));
     std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
@@ -1192,8 +1172,6 @@ fn test_resolve_interval_for_role_precedence() {
                 effort: None,
                 role_efforts: BTreeMap::new(),
                 architect_max_proposals: None,
-                max_concurrent: None,
-                champion_mode: None,
                 on_idle_max_wait: None,
             }
         ),
@@ -1215,8 +1193,6 @@ fn test_resolve_interval_for_role_precedence() {
                 effort: None,
                 role_efforts: BTreeMap::new(),
                 architect_max_proposals: None,
-                max_concurrent: None,
-                champion_mode: None,
                 on_idle_max_wait: None,
             }
         ),
@@ -2204,8 +2180,6 @@ fn test_resolve_on_idle_roles_parses_and_preserves_order() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_on_idle_roles(&config);
@@ -2228,8 +2202,6 @@ fn test_resolve_on_idle_roles_ignores_unknown_names() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_on_idle_roles(&config);
@@ -2248,8 +2220,6 @@ fn test_resolve_on_idle_roles_empty_array_is_empty() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     assert_eq!(resolve_on_idle_roles(&config), Vec::new());
@@ -2643,63 +2613,35 @@ fn test_try_acquire_remains_unbounded() {
     assert_eq!(active_run_count(&set), 5);
 }
 
-/// The shipped default is derived from the interval-default role table, not
-/// hard-coded — so adding a role raises the ceiling by one instead of
-/// silently squeezing every other role.
-#[test]
-fn test_default_max_concurrent_is_derived_from_interval_default_roles() {
-    assert_eq!(default_max_concurrent(), interval_default_roles().len());
-    assert!(default_max_concurrent() >= 1, "a 0 ceiling would admit nothing");
-}
-
+/// One host budget (#11911): the role runner's ceiling is the root's
+/// `workFinder.maxConcurrent` before any work-finder tick has published, and
+/// a retired `roleRunner.maxConcurrent` changes nothing, of any value.
 #[test]
 #[serial(loom_config_env)]
-fn test_config_max_concurrent_parses_and_rejects_zero() {
+fn test_the_role_ceiling_is_the_host_budget_and_role_runner_max_concurrent_is_retired() {
     std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
-    let tmp = tempfile::tempdir().unwrap();
-    write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"maxConcurrent": 3}}}"#);
-    let parsed = read_role_runner_config(tmp.path()).max_concurrent;
-
-    let tmp0 = tempfile::tempdir().unwrap();
-    // 0 soft-fails to `None` (falls through to env/default) rather than
-    // being honored as "admit nothing" — that is `enabled: false`.
-    write_config(tmp0.path(), r#"{"autonomous": {"roleRunner": {"maxConcurrent": 0}}}"#);
-    let zero = read_role_runner_config(tmp0.path()).max_concurrent;
-
-    let tmp_bad = tempfile::tempdir().unwrap();
-    write_config(tmp_bad.path(), r#"{"autonomous": {"roleRunner": {"maxConcurrent": "8"}}}"#);
-    let bad = read_role_runner_config(tmp_bad.path()).max_concurrent;
+    let prev = std::env::var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV).ok();
+    std::env::remove_var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV);
+    if crate::host_budget::published().is_some() {
+        return; // a work-finder tick in this process owns the ceiling
+    }
+    let budget = tempfile::tempdir().unwrap();
+    write_config(budget.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 6}}}"#);
+    let retired = tempfile::tempdir().unwrap();
+    write_config(
+        retired.path(),
+        r#"{"autonomous": {"workFinder": {"maxConcurrent": 6}, "roleRunner": {"maxConcurrent": 2, "demandWidth": {"enabled": false}}}}"#,
+    );
+    let (b, r) = (resolve_ceiling(budget.path()), resolve_ceiling(retired.path()));
+    // Parsing a block full of retired keys still yields a config.
+    let config = read_role_runner_config(retired.path());
     std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
-
-    assert_eq!(parsed, Some(3));
-    assert_eq!(zero, None, "0 must soft-fail to None");
-    assert_eq!(bad, None, "a non-integer must soft-fail to None");
-}
-
-#[test]
-#[serial(loom_role_runner_max_concurrent_env)]
-fn test_resolve_max_concurrent_precedence_env_over_config_over_default() {
-    std::env::remove_var(ROLE_RUNNER_MAX_CONCURRENT_ENV);
-    let unset = RoleRunnerConfig::default();
-    let configured = RoleRunnerConfig {
-        max_concurrent: Some(2),
-        champion_mode: None,
-        on_idle_max_wait: None,
-        ..RoleRunnerConfig::default()
-    };
-    assert_eq!(resolve_max_concurrent(&unset), default_max_concurrent());
-    assert_eq!(resolve_max_concurrent(&configured), 2);
-
-    std::env::set_var(ROLE_RUNNER_MAX_CONCURRENT_ENV, "9");
-    assert_eq!(resolve_max_concurrent(&configured), 9, "env must outrank config");
-
-    // A zero / unparseable env value drops to the next tier rather than
-    // being honored — same contract as `architectMaxProposals`.
-    std::env::set_var(ROLE_RUNNER_MAX_CONCURRENT_ENV, "0");
-    assert_eq!(resolve_max_concurrent(&configured), 2);
-    std::env::set_var(ROLE_RUNNER_MAX_CONCURRENT_ENV, "lots");
-    assert_eq!(resolve_max_concurrent(&unset), default_max_concurrent());
-    std::env::remove_var(ROLE_RUNNER_MAX_CONCURRENT_ENV);
+    if let Some(v) = prev {
+        std::env::set_var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV, v);
+    }
+    assert_eq!(b, 6);
+    assert_eq!(r, 6, "roleRunner.maxConcurrent is retired");
+    assert_eq!(config, RoleRunnerConfig::default());
 }
 
 /// The status surface's read path (#6102 AC3): after the daemon registers
@@ -2822,8 +2764,6 @@ fn on_idle_config(enabled: Option<bool>, roles: Vec<&str>) -> RoleRunnerConfig {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     }
 }
@@ -2933,8 +2873,6 @@ fn test_plan_idle_runs_disabled_without_on_idle_does_not_warn() {
         effort: None,
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
-        max_concurrent: None,
-        champion_mode: None,
         on_idle_max_wait: None,
     };
     let now = Instant::now();
@@ -3243,7 +3181,7 @@ async fn test_interval_loop_skips_while_guard_held() {
     in_progress
         .lock()
         .unwrap()
-        .insert((root.clone(), "champion", 0));
+        .insert((root.clone(), "champion"));
     let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = spawn_role_task(
         runner,
@@ -3263,7 +3201,7 @@ async fn test_interval_loop_skips_while_guard_held() {
     );
 
     // Release the guard — dispatch resumes, proving the gate (not a dead loop).
-    in_progress.lock().unwrap().remove(&(root, "champion", 0));
+    in_progress.lock().unwrap().remove(&(root, "champion"));
     wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
 
     handle.abort();

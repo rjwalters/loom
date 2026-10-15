@@ -6,7 +6,7 @@
 //! orchestrator with a scripted host, and with real registries and real
 //! process trees behind a fake `gh`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -132,13 +132,15 @@ fn pause_dir(item: &ManifestItem) -> PathBuf {
     roll_pause::item_dir(&roll_pause::default_pause_root(Path::new(&item.repo)), &item.id)
 }
 
-/// The sweep-registry resume spec of a sweep item. `None` for anything else.
+/// The sweep-registry resume spec of an issue step. `None` for anything else:
+/// a PR step (no `issue`) is requeued instead (#11898), and so is a
+/// whole-lifecycle `Issue` sweep (no `step`), which is never resumed (#11911).
 pub(crate) fn sweep_spec(item: &ManifestItem, launch: &RollResumeLaunch) -> Option<RollResumeSpec> {
     let handle = item.resume_handle.as_ref()?;
-    // A PR step (no `issue`) is not resumed: requeued instead (#11898).
+    let step = item.step?;
     Some(RollResumeSpec {
         issue: item.issue?,
-        step: item.step,
+        step: Some(step),
         old_sweep_id: item.id.clone(),
         launch: launch.clone(),
         model: handle.model.clone(),
@@ -263,7 +265,7 @@ pub(crate) mod sweeps {
         launch: &RollResumeLaunch,
     ) -> Result<(), RollResumeRefusal> {
         let Some(spec) = sweep_spec(item, launch) else {
-            return Err(RollResumeRefusal::new(super::super::REASON_PR_SET, "not an issue sweep"));
+            return Err(RollResumeRefusal::new(not_resumable(item), "not an issue step"));
         };
         locked(registry).roll_resume_checks(&spec)
     }
@@ -274,7 +276,7 @@ pub(crate) mod sweeps {
         launch: &RollResumeLaunch,
     ) -> Result<Launched, RollResumeRefusal> {
         let Some(spec) = sweep_spec(item, launch) else {
-            return Err(RollResumeRefusal::new(super::super::REASON_PR_SET, "not an issue sweep"));
+            return Err(RollResumeRefusal::new(not_resumable(item), "not an issue step"));
         };
         let mut prepared = locked(registry).begin_roll_resume(&spec)?;
         // The account-selection poll runs without the registry lock (#6592).
@@ -381,15 +383,31 @@ pub(crate) mod sweeps {
         Ok(())
     }
 
+    /// Why `item` has no resume spec: a PR step or PR-set sweep, else a
+    /// retired `Issue` sweep.
+    fn not_resumable(item: &ManifestItem) -> &'static str {
+        if item.issue.is_none() {
+            super::super::REASON_PR_SET
+        } else {
+            super::super::REASON_SWEEP_RETIRED
+        }
+    }
+
+    /// An `Issue` sweep whose requeue failed: release its lock here, and
+    /// leave the forge claim to claim reconciliation, which restores a dead
+    /// claim's label. It is never re-adopted as a running sweep (#11911): the
+    /// daemon no longer resumes or adopts the whole-lifecycle sweeps it
+    /// retired. A step is not one (#11898).
     pub(crate) fn recover(registry: &Arc<Mutex<SweepRegistry>>, item: &ManifestItem) {
-        // Restart recovery rebuilds issue sweeps; a step is not one (#11898).
         let (Some(issue), None) = (item.issue, item.step) else {
             return;
         };
-        let only = HashSet::from([issue]);
-        if let Err(e) = locked(registry).reconstruct_issues(Some(&only)) {
-            log::warn!("pause_resume: {}: restart recovery failed: {e:#}", item.id);
-        }
+        locked(registry).release_roll_item(issue, &[&item.id]);
+        log::info!(
+            "pause_resume: {}: released issue #{issue}'s lock; its claim is left to claim \
+             reconciliation (#11911)",
+            item.id
+        );
     }
 }
 

@@ -47,7 +47,7 @@ below. Types/ranges are strict **on this surface** (see Validation).
 | Group | Key | Default | Range | Governs | Legacy home | Single-knob env |
 |---|---|---|---|---|---|---|
 | `dispatch` | `tickIntervalSecs` | 60 | 5–3600 | Work-finder tick cadence | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` |
-| `dispatch` | `maxConcurrent` | 3 | 1–256 | Sweep concurrency ceiling (dynamic cap stays bounded by disk/RAM) | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` |
+| `dispatch` | `maxConcurrent` | 3 | 1–256 | The host's one agent budget: steps and role-runner agents together since #11911 (dynamic cap stays bounded by disk/RAM) | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` |
 | `dispatch` | `maxAdmissionsPerTick` | 3 | 1–64 | Ramp cap: new sweeps admitted per tick (#4234) | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` |
 | `dispatch` | `weightBonusRedMainFix` | 400 | 0–1000000 (integer) | Points added to a repo's draw `weight` while it holds a verified red-main fix (#11742; [`priority-model.md`](priority-model.md)). Re-read every tick (hot-applies) | — | — |
 | `dispatch` | `weightBonusVeryImportant` | 100 | 0–1000000 (integer) | Points added while the repo has dispatchable `loom:very-important` work (#11742). Hot-applies | — | — |
@@ -89,18 +89,16 @@ semantics, is in [`daemon-reference.md`](daemon-reference.md) (search for
 | Key | Default | Governs |
 |---|---|---|
 | `enabled` | `false` | Periodic standalone support-role runner on/off (#4015) |
-| `maxConcurrent` | the 7 interval-default roles | Host-wide ceiling on concurrently-running role agents (#6102) |
-| `roleMaxConcurrent` | `max(1, maxConcurrent / 2)` per role | Per-role budget under the ceiling (#9391) |
-| `eventTriggers.enabled` | `false` | Event-driven curator/auditor/guide launches instead of every interval (#10816) |
+| `roleMaxConcurrent` | `max(1, share / 2)` per role | Per-role budget under the role runner's share of the host budget (#9391, #11911) |
+| `eventTriggers.enabled` | `false` | Event-driven auditor/guide launches instead of every interval (#10816) |
 | `eventTriggers.maxQuietSecs` | 86400 | A gated role that has not launched in this long launches anyway |
-| `demandWidth.enabled` | `true` | Demand-weighted role admission (#9392); `false` restores Phase 1 admission |
-| `demandWidth.perRun` | 3 | Queued PRs per role run in the PR-role width |
-| `demandWidth.max` | 4 | Upper clamp on judge, doctor and champion width (still capped by the role budget) |
-| `demandWidth.reserve` / `nonPrFloor` | `true` / 1 | Champion-first ceiling reservation, and the slots it always leaves for non-PR roles |
-| `demandWidth.laneK` / `perRepoCap` / `doctorMaxPerRepo` | 10 / 3 / `perRepoCap` | Per-repository judge and doctor lanes (#10630, #10632) |
-| `demandWidth.staleSecs` | 1800 | Demand-ledger entries older than this are stale (unobserved axis) |
 
-`eventTriggers` and `demandWidth` change how many role records are written; see
+Since #11911 role-runner agents and steps share one host budget,
+`dispatch.maxConcurrent` / `autonomous.workFinder.maxConcurrent`.
+`roleRunner.maxConcurrent` and the `roleRunner.demandWidth` block are retired:
+parsed and ignored with one warning, never rejected.
+
+`eventTriggers` changes how many role records are written; see
 [`telemetry-kind-pick-decision.md`](telemetry-kind-pick-decision.md).
 
 ## Precedence

@@ -392,10 +392,11 @@ unknown, never guessed. They come from the dispatch itself, with no forge read.
   |---|---|
   | `operator` | `loom-daemon dispatch`, the `dispatch_sweep` MCP tool, Safehouse ChatOps `dispatch` |
   | `work_finder` | the autonomous work finder |
-  | `epic_supervisor` | the epic supervisor's next-phase dispatch |
   | `watchdog` | a registry watchdog re-dispatch (startup, mid-build death, review stall) |
   | `reaper_retry` | the reaper's resume of a crashed sweep |
   | `unknown` | an IPC `DispatchSweep` request that did not name an origin (a legacy client), or named one this daemon does not know |
+
+  `epic_supervisor` was retired with the epic supervisor's per-child sweep dispatch (#11911): an older record carrying it reads as `unknown`.
 
   Every production dispatch path names its origin; none defaults to
   `operator`. The origin on an IPC request is what the client says (telemetry,
@@ -1163,7 +1164,7 @@ a previous attempt exists, and the journal inference never produces it.
 
 **`dispatch_origin`** (Issue #11444): who asked for this sweep, one of the
 [`sweep.started` values](#sweepstarted) (`operator`, `work_finder`,
-`epic_supervisor`, `watchdog`, `reaper_retry`, `unknown`). Copied from the
+`watchdog`, `reaper_retry`, `unknown`; `epic_supervisor` before #11911). Copied from the
 sweep's start facts, so it and `trigger` equal what `sweep.started` reported.
 Exported as `loom.dispatch_origin` on the OTLP log and the trace metadata.
 Absent on lines written before #11444 and on sweeps this daemon did not
@@ -1345,7 +1346,7 @@ gradeable by a model or prompt experiment.
 | `skipped_no_token_pool` | no | No token pool provisioned for this workspace (#4642). |
 | `skipped_pool_exhausted` | no | The credential pool the admitted runtime draws from has zero spawnable accounts (#7607) — `gated_pool` says which pool (#8408). |
 | `skipped_model_runtime_mismatch` | no | The resolved model provably conflicts with the admitted runtime (#5028). |
-| `skipped_queue_empty` | no | A queue-gated role (judge, doctor) found its work queue empty and spawned nothing (#9391). |
+| `skipped_queue_empty` | no | An event-triggered role (auditor, guide) found its trigger absent and spawned nothing (#10816). Before #11911 the Judge/Doctor queue gate (#9391) produced it too. |
 
 Folding the skips into `failure` is the exact mis-read #7607 documents: one
 fleet-wide exhausted pool produces hundreds of identical exit-78 skips, which

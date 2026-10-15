@@ -1,5 +1,7 @@
-//! Event-driven launch triggers for curator, auditor and guide (issue #10816,
-//! slice 3 of #10630).
+//! Event-driven launch triggers for auditor and guide (issue #10816, slice 3
+//! of #10630). Curator had one too until #11911: it is a step role now (the
+//! work finder draws each untriaged issue as a Curator step), so it never runs
+//! on the role runner and has nothing to gate.
 //!
 //! Before this slice those three roles launched an agent on every interval
 //! tick whether or not anything had changed: a quiet repository rebuilt and
@@ -11,8 +13,6 @@
 //! - **auditor**: launches when `origin/main` (the already-fetched local
 //!   remote-tracking ref, no forge call) differs from the last SHA a run of
 //!   it completed successfully on, for this root.
-//! - **curator**: launches when the repository has at least one open
-//!   `loom:triage` issue (the raw intake queue; one ETag-cached listing page).
 //! - **guide**: launches when the set of open ready (`loom:issue`) and backlog
 //!   (`loom:curated`) issue numbers differs from the set its last successful
 //!   run saw.
@@ -25,14 +25,12 @@
 //! - **Quiet ceiling.** A role that has not launched for a root in
 //!   `eventTriggers.maxQuietSecs` (default one day) launches with trigger
 //!   [`Trigger::Floor`] whatever its input says, so work outside the trigger
-//!   (curator's approved-but-uncurated and blocked re-check passes, a primary
-//!   clone that is never fetched) still gets a periodic pass.
+//!   (a primary clone that is never fetched) still gets a periodic pass.
 //!
 //! A skipped tick ends [`RoleTickOutcome::QueueEmpty`]: no agent is spent, it
 //! is not a failure, it never reaches the failure sentinel, and the dispatcher
-//! may give its slot to a deferred root, exactly like the judge/doctor queue
-//! gate (#9391). The last-seen state lives in a small per-`(root, role)`
-//! [`TriggerLedger`], kept apart from the demand ledger's `DebtAxis` set.
+//! may give its slot to a deferred root. The last-seen state lives in a small
+//! per-`(root, role)` [`TriggerLedger`].
 //! With the flag off (the default) nothing here runs and dispatch is unchanged.
 
 use super::{concurrent_dispatch, RoleTickOutcome};
@@ -51,15 +49,6 @@ pub const DEFAULT_MAX_QUIET_SECS: u64 = 86_400;
 
 /// `forge_call_stats` caller name for the trigger listings.
 pub const TRIGGER_CALLER: &str = "role_event_trigger";
-
-/// The curator's debt axis name, as it appears in a trigger label.
-pub const UNTRIAGED_AXIS: &str = "untriaged";
-
-/// Labels that mean Curator has queued work: new issues, which include
-/// Champion's revise send-backs (`loom:triage` since #11860), and the
-/// undocumented-`loom:blocked` hand-off queue (#10558), which does not carry
-/// `loom:triage`.
-pub const CURATOR_WORK_LABELS: [&str; 2] = ["loom:triage", "loom:blocked-unnamed"];
 
 /// The resolved `autonomous.roleRunner.eventTriggers` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +128,7 @@ pub fn read_event_trigger_config(root: &Path) -> EventTriggerConfig {
 /// exactly as before.
 #[must_use]
 pub fn is_triggered_role(role: &str) -> bool {
-    matches!(role, "curator" | "auditor" | "guide")
+    matches!(role, "auditor" | "guide")
 }
 
 /// Why a role launched (or which trigger a skip found absent).
@@ -148,8 +137,6 @@ pub enum Trigger {
     /// Something the role watches changed (auditor: `main`; guide: the
     /// ready/backlog set).
     Event,
-    /// The role has queued work on a debt axis (curator: `untriaged`).
-    Debt(&'static str),
     /// An idle-edge run (#4364), which the gate never holds back.
     Idle,
     /// The re-check floor: an unobserved input (fail open) or the quiet
@@ -161,7 +148,6 @@ impl std::fmt::Display for Trigger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Event => f.write_str("event"),
-            Self::Debt(axis) => write!(f, "debt:{axis}"),
             Self::Idle => f.write_str("idle"),
             Self::Floor => f.write_str("floor"),
         }
@@ -174,8 +160,6 @@ pub enum Observation {
     /// A state fingerprint (auditor: the `origin/main` SHA; guide: the
     /// ready/backlog set).
     Fingerprint(String),
-    /// A queue count (curator: open `loom:triage` issues).
-    Count(usize),
     /// The input could not be read; the payload says why.
     Unobserved(String),
 }
@@ -289,14 +273,6 @@ pub fn should_launch(role: &str, inputs: &TriggerInputs) -> TriggerDecision {
                 format!("no ready/backlog set recorded; now {set}"),
             ),
         },
-        ("curator", Observation::Count(n)) => {
-            let axis = Trigger::Debt(UNTRIAGED_AXIS);
-            if *n > 0 {
-                TriggerDecision::launch(axis, format!("{n} untriaged issue(s) open"))
-            } else {
-                TriggerDecision::skip(axis, "no untriaged issues open")
-            }
-        }
         (role, observation) => TriggerDecision::launch(
             Trigger::Floor,
             format!("no trigger rule for {role} with {observation:?}; failing open"),
@@ -318,9 +294,6 @@ struct LedgerEntry {
 #[derive(Debug, Default)]
 pub struct TriggerLedger {
     entries: Mutex<HashMap<(PathBuf, &'static str), LedgerEntry>>,
-    /// Last-known untriaged count per root (#9000), kept whatever its age so a
-    /// root's own curator output cannot starve it of its next admission.
-    counts: Mutex<HashMap<PathBuf, usize>>,
 }
 
 impl TriggerLedger {
@@ -356,24 +329,6 @@ impl TriggerLedger {
         self.with_entry(root, role, now, |e| {
             (e.fingerprint.clone(), now.saturating_duration_since(e.quiet_since))
         })
-    }
-
-    /// Record the untriaged count a curator probe observed for `root`.
-    pub fn record_untriaged(&self, root: &Path, count: usize) {
-        self.counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.to_path_buf(), count);
-    }
-
-    /// The last untriaged count observed for `root`, if any (any age).
-    #[must_use]
-    pub fn last_untriaged(&self, root: &Path) -> Option<usize> {
-        self.counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root)
-            .copied()
     }
 
     /// Record a successful launch: reset the quiet clock and, when given,
@@ -415,12 +370,11 @@ pub fn no_trigger_probe() -> TriggerProbe {
 }
 
 /// The production probe: `git rev-parse` for auditor, ETag-cached REST
-/// listings for curator and guide.
+/// listings for guide.
 #[must_use]
 pub fn forge_trigger_probe() -> TriggerProbe {
     Arc::new(|root, role| match role {
         "auditor" => observe_origin_main(root),
-        "curator" => observe_untriaged(root),
         "guide" => observe_ready_backlog(root),
         other => Observation::Unobserved(format!("{other} has no trigger probe")),
     })
@@ -456,35 +410,6 @@ pub fn observe_origin_main(root: &Path) -> Observation {
         )),
         Err(e) => Observation::Unobserved(format!("could not run git rev-parse: {e}")),
     }
-}
-
-/// Open `loom:triage` issues (pull requests excluded) on the first listing
-/// page: a count of at least one is all the curator gate needs, so one
-/// ETag-cached page per tick, usually a free `304`.
-fn observe_untriaged(root: &Path) -> Observation {
-    let gh = concurrent_dispatch::gate_gh_bin();
-    let mut total = 0;
-    // Champion's revise send-backs carry `loom:triage` (#11860); the
-    // `loom:blocked-unnamed` queue (#10558) does not, so it counts too.
-    for label in CURATOR_WORK_LABELS {
-        match crate::forge_listing::list_issues_cached_as(
-            TRIGGER_CALLER,
-            &gh,
-            Some(root),
-            None,
-            label,
-            "open",
-        ) {
-            Ok(rows) => total += count_issue_rows(rows.iter().map(|r| r.is_pull_request)),
-            Err(e) => return Observation::Unobserved(format!("{label} listing failed: {e}")),
-        }
-    }
-    Observation::Count(total)
-}
-
-/// Issues (not pull requests) among the listed rows.
-fn count_issue_rows(is_pull_request: impl Iterator<Item = bool>) -> usize {
-    is_pull_request.filter(|pr| !pr).count()
 }
 
 /// The open ready (`loom:issue`) and backlog (`loom:curated`) issue-number
@@ -559,13 +484,10 @@ pub fn run_with_trigger_gate(
         return run();
     }
     let observation = probe(root, role);
-    if let ("curator", Observation::Count(n)) = (role, &observation) {
-        ledger.record_untriaged(root, *n);
-    }
     let (last_fingerprint, quiet_for) = ledger.read(root, role, Instant::now());
     let fingerprint = match &observation {
         Observation::Fingerprint(f) => Some(f.clone()),
-        Observation::Count(_) | Observation::Unobserved(_) => None,
+        Observation::Unobserved(_) => None,
     };
     let decision = should_launch(
         role,

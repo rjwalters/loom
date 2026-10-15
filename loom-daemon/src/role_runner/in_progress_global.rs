@@ -37,8 +37,8 @@ pub fn global_active_run_count() -> usize {
     GLOBAL_IN_PROGRESS.get().map_or(0, active_run_count)
 }
 
-/// Role invocations in flight per role across every managed workspace (each
-/// lane counts once), or `None` when no guard is registered: no role runner
+/// Role invocations in flight per role across every managed workspace, or
+/// `None` when no guard is registered: no role runner
 /// in this process, so there is nothing measured to report (#11847).
 #[must_use]
 pub fn global_active_runs_by_role() -> Option<BTreeMap<&'static str, usize>> {
@@ -49,7 +49,7 @@ pub fn global_active_runs_by_role() -> Option<BTreeMap<&'static str, usize>> {
 #[must_use]
 pub fn runs_by_role(set: &InProgressGuard) -> BTreeMap<&'static str, usize> {
     let mut counts = BTreeMap::new();
-    for (_, role, _) in set.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+    for (_, role) in set.lock().unwrap_or_else(PoisonError::into_inner).iter() {
         *counts.entry(*role).or_insert(0) += 1;
     }
     counts
@@ -62,22 +62,22 @@ mod tests {
     use super::runs_by_role;
 
     #[test]
-    fn runs_are_counted_per_role_across_roots_and_lanes() {
+    fn runs_are_counted_per_role_across_roots() {
         let set = crate::role_runner::new_in_progress_guard();
         {
             let mut held = set
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            held.insert((PathBuf::from("/w/a"), "judge", 0));
-            held.insert((PathBuf::from("/w/b"), "judge", 0));
-            held.insert((PathBuf::from("/w/a"), "doctor", 0));
-            held.insert((PathBuf::from("/w/a"), "doctor", 1));
-            held.insert((PathBuf::from("/w/a"), "curator", 0));
+            held.insert((PathBuf::from("/w/a"), "champion"));
+            held.insert((PathBuf::from("/w/b"), "champion"));
+            held.insert((PathBuf::from("/w/a"), "guide"));
+            held.insert((PathBuf::from("/w/b"), "guide"));
+            held.insert((PathBuf::from("/w/a"), "auditor"));
         }
         let counts = runs_by_role(&set);
-        assert_eq!(counts.get("judge"), Some(&2));
-        assert_eq!(counts.get("doctor"), Some(&2));
-        assert_eq!(counts.get("curator"), Some(&1));
+        assert_eq!(counts.get("champion"), Some(&2));
+        assert_eq!(counts.get("guide"), Some(&2));
+        assert_eq!(counts.get("auditor"), Some(&1));
         assert_eq!(counts.values().sum::<usize>(), crate::role_runner::active_run_count(&set));
     }
 }

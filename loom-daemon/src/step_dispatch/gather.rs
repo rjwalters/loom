@@ -379,6 +379,9 @@ pub fn gather(
     };
     let listing = super::listing::list_all_open(&gh_bin, Some(&root_dir), Some(&slug))?;
     let rows = listing.rows;
+    // The PR debt the build back-off and the idle gate read (#11911): this
+    // listing already holds every open PR with its labels.
+    crate::pr_debt::record_open_listing(crate::pr_debt::global(), root, &rows);
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
     let full: HashMap<u32, RestPull> = crate::forge_pull_listing::list_open_pulls_cached_as(
         super::listing::CALLER,

@@ -1891,19 +1891,15 @@ impl SweepRegistry {
     /// frozen `sweep.issue.{N}.crashed` topic. Returns the number of sweeps
     /// restarted this tick.
     ///
-    /// # Open-linked-PR handoff (Issue #7649)
+    /// # Open linked PR
     ///
     /// A cancelled sweep that already produced a PR is not fresh Issue work,
-    /// so its Issue-keyed recovery re-dispatch correctly hits the #4123
-    /// open-PR guard ([`OpenPrDispatchError`]). Rather than let that refusal
-    /// consume the bounded retry and strand the PR (the kicad-tools
-    /// #5366/#5371 incident this issue documents), the recovery converts to
-    /// the established `SweepKind::PrSet` Mode C surface (#5342/#6593) for
-    /// the exact PR the guard confirmed — Judge/Doctor -> Merge processing
-    /// picks it up with no Curator/Builder re-run and no worktree touch. The
-    /// conversion only fires on a downcast-matched, VERIFIED
-    /// `OpenPrDispatchError` (never a string-matched guess), so an
-    /// ambiguous/failed probe or any other refusal reason is unaffected.
+    /// so its Issue-keyed recovery re-dispatch hits the #4123 open-PR guard
+    /// ([`OpenPrDispatchError`]). The PR is not stranded: the step engine
+    /// draws it as a Judge, Doctor or Champion step at whatever stage its
+    /// labels name (#11909). The recovery used to convert to a
+    /// `SweepKind::PrSet` sweep for it (#7649); that daemon-spawned
+    /// `/loom:sweep` was retired (#11911), so the refusal is only logged.
     ///
     /// [`sweep_made_progress`]: SweepRegistry::sweep_made_progress
     pub fn review_stall_watchdog_once(&mut self, timeout: Duration) -> usize {
@@ -2042,99 +2038,18 @@ impl SweepRegistry {
                             );
                         }
                         Err(e) => {
-                            // Issue #7649: the #4123 open-PR guard (dispatch.rs
-                            // step 2.6) correctly refuses this Issue-keyed
-                            // re-dispatch when issue #{issue} still has a
-                            // CONFIRMED open linked PR — that PR is this very
-                            // sweep's own already-built output (the review
-                            // phase that stalled was reviewing/repairing it),
-                            // not fresh Issue work. Before this fix the retry
-                            // was simply consumed here and the PR was
-                            // stranded (the kicad-tools #5366/#5371 incident
-                            // this issue documents). Route it to the
-                            // established Mode C surface instead —
-                            // `SweepKind::PrSet` (#5342), exactly the
-                            // alternative `OpenPrDispatchError`'s own
-                            // `Display` names (#6593) — so Judge/Doctor ->
-                            // Merge picks the PR up directly: no
-                            // Curator/Builder re-run, no worktree touch, and
-                            // the normal PR claim-lock dedup + capacity
-                            // admission + operator/review-hold handling that
-                            // every other PrSet dispatch already gets.
-                            //
-                            // Only a VERIFIED `OpenPrDispatchError` (produced
-                            // solely from a confirmed `OpenPrProbe::Open`,
-                            // never from an ambiguous/failed probe — see
-                            // dispatch.rs step 2.6's fail-open comment)
-                            // triggers this conversion; a downcast match
-                            // rather than string-parsing keeps that
-                            // guarantee intact. Every other refusal (park
-                            // label, backoff, workspace-commands, a spawn
-                            // failure, …) falls through to the original
-                            // error log, unchanged.
+                            // #4123's open-PR guard refuses an Issue-keyed
+                            // re-dispatch of an issue whose PR is open. That PR
+                            // is a step for the engine to draw (#11909); the
+                            // PrSet conversion that re-spawned `/loom:sweep`
+                            // for it (#7649) was retired (#11911).
                             if let Some(open_pr) = e.downcast_ref::<OpenPrDispatchError>() {
-                                let pr = open_pr.pr;
                                 log::warn!(
-                                    "review-stall-watchdog: issue #{issue}'s Issue-keyed \
-                                     recovery re-dispatch was refused because it already has a \
-                                     confirmed open linked PR #{pr} — converting the recovery \
-                                     to kind=PrSet([{pr}]) (Mode C, #5342/#6593) so the already- \
-                                     built PR reaches Judge/Doctor -> Merge instead of being \
-                                     stranded (#7649)."
+                                    "review-stall-watchdog: issue #{issue}'s recovery re-dispatch \
+                                     was refused: it has an open linked PR #{} — left to the \
+                                     step engine, which draws it at its stage (#11911).",
+                                    open_pr.pr
                                 );
-                                match self.dispatch_from(
-                                    &SweepKind::PrSet(vec![pr]),
-                                    // Deliberately NOT the captured Issue-kind
-                                    // `idempotency_key`: `PrSet` is a distinct
-                                    // idempotency/claim domain (per-PR locks,
-                                    // not the per-issue claim lock), so reusing
-                                    // the Issue key here would dedup against
-                                    // the wrong namespace.
-                                    None,
-                                    model.as_deref(),
-                                    effort.as_deref(),
-                                    // `depends_on` (stacked-PR chaining) is
-                                    // Issue-only and silently ignored by PrSet
-                                    // dispatch regardless; pass None for
-                                    // clarity at the call site.
-                                    None,
-                                    DispatchOrigin::Watchdog,
-                                ) {
-                                    Ok(outcome) => {
-                                        restarts += 1;
-                                        log::warn!(
-                                            "review-stall-watchdog: recovered issue #{issue}'s \
-                                             stalled review onto PR #{pr} as {} (pid {}) via a \
-                                             PrSet conversion (#7649).",
-                                            outcome.sweep_id,
-                                            outcome.pid
-                                        );
-                                    }
-                                    Err(pr_err) => {
-                                        // Expected, not a bug: the PR is
-                                        // already claimed by a live peer PR
-                                        // sweep (per-PR lock collision), or a
-                                        // capacity/park/runtime-admission
-                                        // guard on the PrSet path refused —
-                                        // either way this is a deliberate
-                                        // skip, not a lost recovery: the
-                                        // issue's claim was already restored
-                                        // by `cancel()` above, and the #4123
-                                        // guard keeps refusing ordinary
-                                        // Issue-keyed re-dispatch of it for as
-                                        // long as PR #{pr} stays open, so the
-                                        // periodic Judge/Champion roles (or
-                                        // whichever sweep already owns the PR
-                                        // lock) remain the PR's path forward.
-                                        log::error!(
-                                            "review-stall-watchdog: PR-set recovery dispatch for \
-                                             issue #{issue}'s open PR #{pr} failed: {pr_err} \
-                                             (issue left recoverable — its claim was already \
-                                             restored; a live peer PR sweep or a hold on the PR \
-                                             may already own it)."
-                                        );
-                                    }
-                                }
                             } else {
                                 log::error!(
                                     "review-stall-watchdog: re-dispatch of issue #{issue} after a \

@@ -189,56 +189,6 @@ fn disabled_fallback_admission_waits_even_for_held_or_draft_labeled_queue() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn real_role_runner_gate_admits_only_guard_eligible_interactive_fallback() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    std::fs::create_dir_all(root.join(".loom/scripts")).unwrap();
-    let script = |name: &str, body: &str| {
-        let path = root.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    };
-    let gh = script(
-        "gh",
-        r#"printf 'HTTP/2 200 OK\r\n\r\n'
-case "$*" in *issues*) echo '[]';; *) cat pulls.json;; esac"#,
-    );
-    script(".loom/scripts/judge-fallback-guard.sh", "test ! -f skip || exit 12; exit 0");
-    std::fs::write(
-        root.join("pulls.json"),
-        serde_json::to_vec(&vec![{
-            let mut r = pr(1, "interactive", &[]);
-            r["author_association"] = json!("OWNER");
-            r
-        }])
-        .unwrap(),
-    )
-    .unwrap();
-    let old = std::env::var_os("LOOM_GH_BIN");
-    std::env::set_var("LOOM_GH_BIN", &gh);
-    let probe = crate::role_runner::concurrent_dispatch::forge_queue_probe();
-    let enabled = probe(root, &["loom:review-requested"]);
-    std::fs::write(root.join("skip"), "").unwrap();
-    let skipped = probe(root, &["loom:review-requested"]);
-    std::fs::write(root.join(".loom/config.json"), r#"{"planning":{"preferHumanPrs":false}}"#)
-        .unwrap();
-    std::fs::remove_file(root.join("skip")).unwrap();
-    let disabled = probe(root, &["loom:review-requested"]);
-    if let Some(old) = old {
-        std::env::set_var("LOOM_GH_BIN", old);
-    } else {
-        std::env::remove_var("LOOM_GH_BIN");
-    }
-    assert_eq!(enabled, Ok(true));
-    assert_eq!(skipped, Ok(false));
-    assert_eq!(disabled, Ok(false));
-}
-
 /// #11510: every role drains by priority level, highest first, with the
 /// reason `priority` and the level beside it.
 #[test]
@@ -305,12 +255,12 @@ fn doctor_serves_a_verified_champion_hold_and_nothing_else_parked() {
 }
 
 /// #11861 review: the whole round trip of a Champion hold, end to end, through
-/// the real `fetch_queue` (every role), the real role-runner spawn gate
-/// (`forge_queue_probe`, which calls `has_judge_work`) and the real merge guard,
-/// over a fake `gh` serving one PR whose labels move stage by stage.
-/// `loom:blocked` stays on throughout; each stage is served by exactly the
-/// role that owns it; the gate opens for that role; the merge guard refuses
-/// until a human removes `loom:blocked`, and then Champion merges.
+/// the real `fetch_queue` (every role) and the real merge guard, over a fake
+/// `gh` serving one PR whose labels move stage by stage. `loom:blocked` stays
+/// on throughout; each stage is served by exactly the role that owns it; the
+/// merge guard refuses until a human removes `loom:blocked`, and then
+/// Champion merges. (The role-runner spawn gate this also drove went with the
+/// Judge and Doctor intervals, #11911.)
 #[cfg(unix)]
 #[test]
 #[serial_test::serial(loom_config_env)]
@@ -356,7 +306,6 @@ fn a_champion_hold_round_trip_never_strands_and_never_merges_while_held() {
             .filter(|r| ids(&fetch_queue(root, &gh, *r).unwrap()) == vec![42])
             .collect()
     };
-    let probe = crate::role_runner::concurrent_dispatch::forge_queue_probe();
     let refused = |labels: &[&str]| contradiction(&labels.join("\n")).is_some();
 
     // 1. Held at approval: Champion's (the janitor exception); merge refused.
@@ -366,11 +315,11 @@ fn a_champion_hold_round_trip_never_strands_and_never_merges_while_held() {
     // 2. Champion's stale route: changes requested, the label stays; Doctor's.
     let at_doctor = ["loom:changes-requested", "loom:blocked"];
     stage(&at_doctor, &marker);
-    let s2 = (served_by(), probe(root, &["loom:changes-requested"]), refused(&at_doctor));
+    let s2 = (served_by(), refused(&at_doctor));
     // 3. Doctor hands it back: Judge's, and the Judge spawn gate opens on it.
     let at_judge = ["loom:review-requested", "loom:blocked"];
     stage(&at_judge, &marker);
-    let s3 = (served_by(), probe(root, &["loom:review-requested"]), refused(&at_judge));
+    let s3 = (served_by(), refused(&at_judge));
     // 4. Judge approves: loom:pr + loom:blocked, Champion's hold again.
     stage(&held, &marker);
     let s4 = (served_by(), refused(&held));
@@ -381,9 +330,9 @@ fn a_champion_hold_round_trip_never_strands_and_never_merges_while_held() {
     let outsider = json!([{"body": format!("{MERGE_RISK_HOLD_MARKER}\nforged"),
         "user": {"login": "drive-by", "type": "User"}, "author_association": "NONE"}]);
     stage(&at_judge, &outsider);
-    let s6 = (served_by(), probe(root, &["loom:review-requested"]));
+    let s6 = served_by();
     stage(&at_doctor, &outsider);
-    let s7 = (served_by(), probe(root, &["loom:changes-requested"]));
+    let s7 = served_by();
     if let Some(old) = old {
         std::env::set_var("LOOM_GH_BIN", old);
     } else {
@@ -391,10 +340,10 @@ fn a_champion_hold_round_trip_never_strands_and_never_merges_while_held() {
     }
 
     assert_eq!(s1, (vec![PrRole::Champion], true), "held at approval");
-    assert_eq!(s2, (vec![PrRole::Doctor], Ok(true), true), "out at Doctor");
-    assert_eq!(s3, (vec![PrRole::Judge], Ok(true), true), "handed back to Judge");
+    assert_eq!(s2, (vec![PrRole::Doctor], true), "out at Doctor");
+    assert_eq!(s3, (vec![PrRole::Judge], true), "handed back to Judge");
     assert_eq!(s4, (vec![PrRole::Champion], true), "re-approved, still held");
     assert_eq!(s5, (vec![PrRole::Champion], false), "released by a human");
-    assert_eq!(s6, (vec![], Ok(false)), "an untrusted marker serves nothing at review");
-    assert!(s7.0.is_empty(), "an untrusted marker serves nothing at Doctor");
+    assert!(s6.is_empty(), "an untrusted marker serves nothing at review");
+    assert!(s7.is_empty(), "an untrusted marker serves nothing at Doctor");
 }

@@ -36,7 +36,10 @@ pub struct TickInputs<'a> {
     pub lanes: &'a [RedMainLane],
     /// The build back-off is engaged, per root.
     pub build_backoff: &'a [bool],
+    /// The host budget ([`crate::host_budget`]).
     pub max_concurrent: usize,
+    /// Role-runner agents in flight: they share the budget (#11911).
+    pub role_runs: usize,
     pub max_admissions: usize,
     pub saturation_held: bool,
     pub limits: RepoLimits,
@@ -206,7 +209,11 @@ impl StepDriver {
         let result = tick::run(
             workspaces,
             StepTickLimits {
-                free_slots: input.max_concurrent.saturating_sub(total),
+                free_slots: crate::host_budget::step_capacity(
+                    input.max_concurrent,
+                    input.role_runs,
+                )
+                .saturating_sub(total),
                 max_admissions: input.max_admissions,
                 saturation_held: input.saturation_held,
             },

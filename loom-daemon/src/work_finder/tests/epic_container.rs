@@ -162,12 +162,11 @@ fn a_promoted_proposal_on_a_loom_issue_row_stays_dispatchable() {
 }
 
 #[test]
-fn the_epic_supervisor_still_plans_builds_for_an_epics_ready_children() {
-    // The supervisor lists `loom:epic` issues itself and dispatches their
-    // open `loom:epic-phase` + `loom:issue` children through the registry. It
-    // never goes through the finder's candidate filter, so the skip above
-    // changes nothing for it.
+fn the_epic_supervisor_builds_nothing_for_an_epics_ready_children() {
+    // An active epic's open `loom:epic-phase` + `loom:issue` children are
+    // Builder steps the work finder draws (#11909); the supervisor's own
+    // per-child sweep dispatch is gone (#11911), so it plans nothing for them.
     let body = "# Epic\n\n### Phase 1: one\ndetails\n\n### Phase 2: two\ndetails\n";
-    let snapshot = EpicSnapshot::new(9, body, vec![PhaseChild::new(1, true)], vec![101, 102]);
-    assert_eq!(plan_epic_transition(&snapshot), EpicTransition::BuildChildren(vec![101, 102]));
+    let snapshot = EpicSnapshot::new(9, body, vec![PhaseChild::new(1, true)]);
+    assert_eq!(plan_epic_transition(&snapshot), EpicTransition::Noop);
 }

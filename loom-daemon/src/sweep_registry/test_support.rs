@@ -1396,19 +1396,6 @@ pub(crate) fn running_issue_sweep_id(reg: &SweepRegistry, issue: u32) -> Option<
         .map(|i| i.sweep_id.clone())
 }
 
-/// The `PrSet` counterpart of [`running_issue_sweep_id`] (Issue #7649): finds
-/// a live sweep whose kind is exactly `PrSet(prs)` (order-sensitive, mirroring
-/// how `SweepKind::PrSet` dispatch is always called with a specific ordering).
-pub(crate) fn running_prset_sweep_id(reg: &SweepRegistry, prs: &[u32]) -> Option<String> {
-    reg.entries
-        .values()
-        .find(|i| {
-            matches!(i.state, SweepState::Running | SweepState::Pending)
-                && matches!(&i.kind, SweepKind::PrSet(set) if set.as_slice() == prs)
-        })
-        .map(|i| i.sweep_id.clone())
-}
-
 // --- closed-issue dispatch guard (Issue #4088, AC6; widened by #4504) ---
 
 /// Render the post-`--jq` payload of the #4504 issue-state probe

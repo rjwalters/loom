@@ -10,22 +10,21 @@
 //!
 //! - **Per repo (#10624).** Each registered root has its own hysteresis state
 //!   ([`BuildBackoffs`]), fed by that root's own debt
-//!   ([`DemandLedger::repo_debt`]). One repo's backlog never holds another's
+//!   ([`crate::pr_debt::DebtLedger::repo_debt`]). One repo's backlog never holds another's
 //!   builds — the #9410 host-wide total did, starving zero-debt repos.
 //! - **Optional host ceiling.** `hostHigh` / `hostLow` (absent = off) apply
 //!   the pre-#10624 host-total rule on top: while engaged, every repo's
 //!   builds are held. For an operator who wants the fleet to spend
 //!   more effort reviewing than building.
-//! - **Input.** The #9392 demand ledger
-//!   ([`crate::role_runner::demand::global`]), read once per root per tick
-//!   with `autonomous.roleRunner.demandWidth.staleSecs`. `debt = review +
+//! - **Input.** The PR-debt ledger ([`crate::pr_debt::global`]), read once
+//!   per root per tick with [`crate::pr_debt::STALE_AFTER`]. `debt = review +
 //!   changes + merge` over the axes that have a fresh entry. **No forge call**
-//!   is made here: the ledger is filled only by listings the role runner
-//!   already does.
+//!   is made here: the ledger is filled by the step tick's all-open listing
+//!   (#11911; before it, by the role runner's queue listings).
 //! - **Hysteresis.** Engage when `debt > high`; release when `debt < low`;
 //!   between the two the previous state holds ([`BuildBackoff::observe`]).
 //! - **Fail open.** An unobserved repo (or host, for the ceiling) — role
-//!   runner off, demand width disabled, every entry older than `staleSecs` —
+//!   listed by no recent step tick, every entry older than `STALE_AFTER` —
 //!   never engages, and releases an engaged back-off. A partly observed one
 //!   sums what it has, which can only err toward not engaging.
 //! - **No priority bypass.** Priority changes order, never admission
@@ -45,7 +44,7 @@ use serde_json::Value;
 
 use super::ready_queue::{self, TickQueueRow};
 use super::PriorityCandidate;
-use crate::role_runner::demand::{self, DemandLedger, HostDebt};
+use crate::pr_debt::{self, DebtLedger, HostDebt};
 use crate::types::QueueDisposition;
 
 /// Default `high` (`W`): engage when the debt is strictly above it.
@@ -464,9 +463,9 @@ impl BuildBackoffs {
     /// One production tick: read the config from `primary` (warning once per
     /// distinct bad pair), drop the state of roots no longer registered, read
     /// each root's own debt — and the host total, when the ceiling is set —
-    /// from `ledger` with the demand ledger's own `staleSecs`, advance, log any
+    /// from `ledger` with [`pr_debt::STALE_AFTER`], advance, log any
     /// edge at INFO, and return the verdict parallel to `roots`.
-    pub fn step(&mut self, primary: &Path, roots: &[PathBuf], ledger: &DemandLedger) -> Holds {
+    pub fn step(&mut self, primary: &Path, roots: &[PathBuf], ledger: &DebtLedger) -> Holds {
         let parsed = BuildBackoffConfig::read(primary);
         self.warn(&parsed);
         let cfg = parsed.config;
@@ -483,9 +482,7 @@ impl BuildBackoffs {
             keep
         });
         // Disabled: no ledger read at all, exactly the pre-#9410 admission.
-        let stale = cfg
-            .enabled
-            .then(|| demand::read_demand_config(primary).stale());
+        let stale = cfg.enabled.then_some(pr_debt::STALE_AFTER);
         let mut per_workspace = Vec::with_capacity(roots.len());
         for root in roots {
             let debt = stale.and_then(|s| debt_from(&ledger.repo_debt(root, s)));

@@ -9,9 +9,9 @@
 //! - **Champion** is dispatched as `/loom:champion --non-item`
 //!   (`champion-targeted.md`): proposals, epics, Doctor-cap parked PRs,
 //!   rollout checks and the batch-wide census, which have no item to draw.
-//!   `autonomous.roleRunner.championMode` (#11859) is retired: `"non-item"`
-//!   is the only behaviour, and `"all"` (or any other value) is ignored with
-//!   a warning.
+//!   `autonomous.roleRunner.championMode` (#11859) is retired (#11911):
+//!   there is no other mode, `"non-item"` is accepted silently, and any other
+//!   value is ignored with one warning.
 //! - **Curator, Judge and Doctor** ([`STEP_ROLES`]) never tick on an
 //!   interval or on the idle edge. Naming one in `autonomous.roleRunner.roles`
 //!   or `onIdle` is ignored with a warning, once per name.
@@ -38,52 +38,29 @@ pub const NON_ITEM_ARG: &str = "--non-item";
 /// tick on the role runner.
 pub const STEP_ROLES: [&str; 3] = ["curator", "judge", "doctor"];
 
-/// The value `championMode` was configured to, kept only so its retirement
-/// can be warned about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ChampionMode {
-    /// `"all"`: retired, ignored.
-    #[default]
-    All,
-    /// `"non-item"`: the only behaviour.
-    NonItem,
-}
-
-impl ChampionMode {
-    /// The config spelling.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::NonItem => "non-item",
-        }
+/// Warn about a configured `championMode` (#11859), retired by #11911:
+/// Champion runs its non-item queues only, so the key changes nothing.
+/// `"non-item"` (any case, surrounding whitespace ignored) is that behaviour
+/// already and stays quiet; any other value, of any type, is ignored with one
+/// warning per distinct value ([`crate::retired_config::warn_once`]). Never
+/// an error: a host whose config still sets it keeps starting.
+pub fn warn_champion_mode(block: &serde_json::Value) {
+    let Some(raw) = block.get(CHAMPION_MODE_KEY) else {
+        return;
+    };
+    if raw
+        .as_str()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("non-item"))
+    {
+        return;
     }
-
-    /// Parse a config value. Case and surrounding whitespace are ignored;
-    /// nothing else is accepted.
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "all" => Some(Self::All),
-            "non-item" => Some(Self::NonItem),
-            _ => None,
-        }
-    }
-}
-
-/// Read `championMode` from an `autonomous.roleRunner` block. Any value but
-/// `"non-item"` is ignored with a warning: Champion runs non-item only.
-#[must_use]
-pub fn parse_champion_mode(block: &serde_json::Value) -> Option<ChampionMode> {
-    let raw = block.get(CHAMPION_MODE_KEY)?;
-    let parsed = raw.as_str().and_then(ChampionMode::parse);
-    if parsed != Some(ChampionMode::NonItem) {
-        log::warn!(
+    crate::retired_config::warn_once(
+        &format!("autonomous.roleRunner.{CHAMPION_MODE_KEY}={raw}"),
+        &format!(
             "role_runner: autonomous.roleRunner.{CHAMPION_MODE_KEY} = {raw} is retired and \
-             ignored: Champion runs its non-item queues only (#11909)"
-        );
-    }
-    parsed
+             ignored: Champion runs its non-item queues only (#11911)"
+        ),
+    );
 }
 
 /// The argument to append to `role`'s slash command, if any: Champion's

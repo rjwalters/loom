@@ -109,7 +109,7 @@ fn a_paused_role_run_is_resumed_with_its_guard_mutex_and_breadcrumb_seeded() {
     assert!(in_progress
         .lock()
         .unwrap()
-        .contains(&(root.clone(), "champion", 0)));
+        .contains(&(root.clone(), "champion")));
     let second = launch(&spec, &in_progress, Duration::from_secs(5)).unwrap_err();
     assert_eq!(second.reason, "guard-refused:role-in-progress", "{second}");
     // Nor an issue-creating burst interleave with the one it was in.

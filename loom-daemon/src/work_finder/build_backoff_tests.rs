@@ -1,8 +1,8 @@
 //! Unit tests for the build back-off state machine and config (#9410).
-//! None touches the global demand ledger or the network.
+//! None touches the global PR-debt ledger or the network.
 
 use super::*;
-use crate::role_runner::demand::{AxisDebt, DebtAxis};
+use crate::pr_debt::{AxisDebt, DebtAxis};
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -92,7 +92,7 @@ fn an_unobserved_ledger_never_engages_and_releases_an_engaged_backoff() {
 
 #[test]
 fn a_stale_ledger_reads_as_unobserved_and_a_partial_one_sums_what_it_has() {
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let root = PathBuf::from("/tmp/loom-9410-backoff");
     let stale = Duration::from_secs(1800);
     let t0 = Instant::now();
@@ -114,7 +114,7 @@ fn a_stale_ledger_reads_as_unobserved_and_a_partial_one_sums_what_it_has() {
 
 #[test]
 fn debt_sums_review_changes_and_merge() {
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let root = PathBuf::from("/tmp/loom-9410-axes");
     ledger.record(&root, DebtAxis::Review, 20);
     ledger.record(&root, DebtAxis::Changes, 10);
@@ -229,7 +229,7 @@ fn step_warns_once_per_distinct_bad_pair_and_reads_the_given_ledger() {
     let write =
         |cfg: &str| std::fs::write(tmp.path().join(".loom").join("config.json"), cfg).unwrap();
     write(r#"{"autonomous":{"workFinder":{"buildBackoff":{"high":5,"low":9}}}}"#);
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let roots = [tmp.path().to_path_buf()];
     let mut b = BuildBackoffs::default();
     assert!(!b.step(tmp.path(), &roots, &ledger).any(), "empty ledger: fail open");
@@ -329,7 +329,7 @@ fn repos(n: usize) -> Vec<PathBuf> {
 }
 
 /// Record `debt` as `root`'s whole (changes-axis) debt, observed now.
-fn debt(ledger: &DemandLedger, root: &Path, debt: usize) {
+fn debt(ledger: &DebtLedger, root: &Path, debt: usize) {
     for axis in [DebtAxis::Review, DebtAxis::Merge] {
         ledger.record(root, axis, 0);
     }
@@ -338,7 +338,7 @@ fn debt(ledger: &DemandLedger, root: &Path, debt: usize) {
 
 #[test]
 fn repo_debt_reads_only_that_roots_fresh_entries() {
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let [a, b] = [
         PathBuf::from("/tmp/loom-10624-a"),
         PathBuf::from("/tmp/loom-10624-b"),
@@ -367,7 +367,7 @@ fn repo_debt_reads_only_that_roots_fresh_entries() {
 #[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
 fn a_high_debt_repo_does_not_hold_a_zero_debt_repo() {
     let cfg = primary("{}");
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let roots = repos(3);
     debt(&ledger, &roots[0], 60);
     debt(&ledger, &roots[1], 0);
@@ -384,7 +384,7 @@ fn a_high_debt_repo_does_not_hold_a_zero_debt_repo() {
 #[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
 fn hysteresis_is_per_repo() {
     let cfg = primary("{}");
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let roots = repos(2);
     let mut b = BuildBackoffs::default();
     let mut tick = |a: usize, c: usize| {
@@ -403,7 +403,7 @@ fn hysteresis_is_per_repo() {
 fn the_host_ceiling_is_off_by_default() {
     // 4 repos at 30 each: 120 host-wide, which engaged the pre-#10624 back-off.
     let cfg = primary("{}");
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let roots = repos(4);
     roots.iter().for_each(|r| debt(&ledger, r, 30));
     let mut b = BuildBackoffs::default();
@@ -417,7 +417,7 @@ fn the_host_ceiling_is_off_by_default() {
 #[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
 fn an_engaged_host_ceiling_holds_every_repo_and_releases_below_host_low() {
     let cfg = primary(r#"{"hostHigh": 50, "hostLow": 20}"#);
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let roots = repos(3);
     debt(&ledger, &roots[0], 30);
     debt(&ledger, &roots[1], 30);
@@ -467,7 +467,7 @@ fn a_crossed_or_half_set_host_pair_leaves_the_ceiling_off() {
 
     // `step` warns once per distinct bad host pair and runs with no ceiling.
     let cfg = primary(r#"{"hostHigh": 10, "hostLow": 50}"#);
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let roots = repos(2);
     roots.iter().for_each(|r| debt(&ledger, r, 30));
     let mut b = BuildBackoffs::default();
@@ -479,7 +479,7 @@ fn a_crossed_or_half_set_host_pair_leaves_the_ceiling_off() {
 #[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
 fn a_departed_root_loses_its_state() {
     let cfg = primary("{}");
-    let ledger = DemandLedger::default();
+    let ledger = DebtLedger::default();
     let roots = repos(2);
     debt(&ledger, &roots[0], 60);
     let mut b = BuildBackoffs::default();
