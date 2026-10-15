@@ -699,6 +699,8 @@ pub(in crate::observability) async fn record(
     let mut inputs = Vec::new();
     let mut seen = BTreeSet::new();
     let mut left_to_captain = Vec::new();
+    // #12027: the repos whose `pr_refused` this host reports (stage_queue).
+    let mut refused = Vec::new();
     for root in crate::observability::collector::provisioned_roots(workspace_pool) {
         let root_str = root.to_string_lossy().to_string();
         let Some(slug) =
@@ -711,6 +713,7 @@ pub(in crate::observability) async fn record(
         }
         // W12: the fleet captain samples this repo and its data is fresh.
         if crate::observability::captain_gauges::captain_covers(STAGE_JOB, &slug) {
+            refused.push((root.clone(), slug.clone()));
             left_to_captain.push(slug);
             continue;
         }
@@ -750,7 +753,10 @@ pub(in crate::observability) async fn record(
         // A partial listing would read as mass exits; skip the repo instead.
         if complete {
             // #11847: the states no label listing answers, from one walk.
-            input.queue = super::stage_queue::walk_counts(root.clone()).await;
+            input.queue = super::stage_queue::walk_counts(root.clone(), input.slug.clone()).await;
+            if input.queue.is_some() {
+                refused.push((root.clone(), input.slug.clone()));
+            }
             inputs.push(input);
         }
     }
@@ -773,6 +779,10 @@ pub(in crate::observability) async fn record(
         drop(guard);
         for batch in stage_batches(&samples, &inputs) {
             sink.emit_metrics_since(batch, previous);
+        }
+        let refused = super::stage_queue::refused_points_for(&refused, Utc::now());
+        for batch in refused.chunks(crate::telemetry::ops::MAX_POINTS_PER_RECORD) {
+            sink.emit_metrics(batch.to_vec());
         }
         let sampled = inputs.iter().map(|input| input.slug.clone());
         crate::observability::captain_gauges::note_produced(STAGE_JOB, sampled, Utc::now());

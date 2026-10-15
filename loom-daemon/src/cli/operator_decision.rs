@@ -98,7 +98,10 @@ impl OperatorDecisionCommand {
                             remove_labels: remove_label,
                             dry_run,
                         };
-                        apply(&mut forge, &text, &req, &mut out, &mut err)
+                        let code = apply(&mut forge, &text, &req, &mut out, &mut err);
+                        // #12027: best-effort, never the exit code.
+                        loom_daemon::operator_decision::cli::journal_applied(&req, code);
+                        code
                     }
                     Err(e) => {
                         eprintln!("ERROR: {e}");

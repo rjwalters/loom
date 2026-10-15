@@ -90,6 +90,29 @@ pub enum JournalEntry {
         number: u32,
         action: String,
     },
+    /// A comment posted through `loom-daemon forge comment` whose body opens
+    /// with Loom markers (#12027): one entry per leading
+    /// `<!-- <ns>:<kind>[:…] -->` line ([`leading_markers`]).
+    Marker {
+        at: DateTime<Utc>,
+        number: u32,
+        is_pr: bool,
+        marker: String,
+        /// The head the role pinned when it wrote (Champion's pin file),
+        /// read locally; never a forge read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+    },
+    /// A write a daemon subcommand made with its own forge calls, which the
+    /// agent `gh` front never sees (#12027): `park-record apply` (`blocked`)
+    /// and `operator-decision apply` (`escalated`). `by` names the command.
+    Applied {
+        at: DateTime<Utc>,
+        number: u32,
+        is_pr: bool,
+        action: String,
+        by: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +267,24 @@ pub fn parse(raw: &str) -> Vec<JournalEntry> {
 // Writer side (the agent's process tree)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds: a journal path for this thread's writers, so a writer's
+    /// caller can be tested without setting the process-wide env.
+    static TEST_JOURNAL: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Test builds: make `path` (or nothing) this thread's writer journal.
+#[cfg(test)]
+pub(crate) fn set_test_journal(path: Option<PathBuf>) {
+    TEST_JOURNAL.with(|j| *j.borrow_mut() = path);
+}
+
 fn journal_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_JOURNAL.with(|j| j.borrow().clone()) {
+        return Some(path);
+    }
     let path = PathBuf::from(std::env::var_os(PICK_JOURNAL_ENV)?);
     path.is_absolute().then_some(path)
 }
@@ -462,6 +502,103 @@ pub fn record_gh_actions(raw: &[OsString]) {
     }
 }
 
+/// A marker line longer than this is cut to it (#12027).
+pub const MAX_MARKER_LEN: usize = 160;
+
+/// Leading marker lines read from one comment body.
+const MAX_MARKERS_PER_COMMENT: usize = 3;
+
+/// The leading `<!-- <ns>:<kind>[:…] -->` lines of a comment body, in order,
+/// each cut to [`MAX_MARKER_LEN`] characters. Reading stops at the first line
+/// that is not one. Pure.
+#[must_use]
+pub fn leading_markers(body: &str) -> Vec<String> {
+    body.lines()
+        .map(str::trim)
+        .take_while(|line| is_marker(line))
+        .take(MAX_MARKERS_PER_COMMENT)
+        .map(|line| line.chars().take(MAX_MARKER_LEN).collect())
+        .collect()
+}
+
+fn is_marker(line: &str) -> bool {
+    let Some(inner) = line
+        .strip_prefix("<!-- ")
+        .and_then(|l| l.strip_suffix(" -->"))
+    else {
+        return false;
+    };
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    let head = inner.split_whitespace().next().unwrap_or_default();
+    matches!(head.split_once(':'), Some((ns, rest))
+        if token(ns) && token(rest.split(':').next().unwrap_or_default()))
+}
+
+/// The head Champion pinned for PR `number`, from its pin file
+/// (`$(git rev-parse --git-common-dir)/loom-champion-pin-pr-N`, first token;
+/// `champion-targeted.md` step 1). A local read; `None` when there is none.
+fn champion_pin_head(number: u32) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let text = std::fs::read_to_string(dir.join(format!("loom-champion-pin-pr-{number}"))).ok()?;
+    let sha = text.split_whitespace().next()?;
+    (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
+/// Journal the markers a comment just posted on `number` opens with
+/// (#12027). A no-op outside a journaled run, and for a body with no leading
+/// marker. Best-effort, like every writer here.
+pub fn record_marker(number: u64, is_pr: bool, body: &str) {
+    if journal_path().is_none() {
+        return;
+    }
+    let Ok(number) = u32::try_from(number) else {
+        return;
+    };
+    let markers = leading_markers(body);
+    if markers.is_empty() {
+        return;
+    }
+    let head_sha = (is_pr && markers.iter().any(|m| m.starts_with("<!-- champion:")))
+        .then(|| champion_pin_head(number))
+        .flatten();
+    let at = Utc::now();
+    for marker in markers {
+        append(&JournalEntry::Marker {
+            at,
+            number,
+            is_pr,
+            marker,
+            head_sha: head_sha.clone(),
+        });
+    }
+}
+
+/// Journal a write a daemon subcommand made on `number` (#12027). A no-op
+/// outside a journaled run.
+pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
+    if journal_path().is_none() {
+        return;
+    }
+    if let Ok(number) = u32::try_from(number) {
+        append(&JournalEntry::Applied {
+            at: Utc::now(),
+            number,
+            is_pr,
+            action: action.to_string(),
+            by: by.to_string(),
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------
@@ -655,3 +792,8 @@ fn api_actions(args: &[String]) -> Vec<(u32, &'static str)> {
 #[allow(clippy::unwrap_used)]
 #[path = "pick_journal_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "pick_journal_marker_tests.rs"]
+mod marker_tests;

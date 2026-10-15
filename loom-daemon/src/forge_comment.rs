@@ -411,6 +411,9 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
         &body,
     )
     .map_err(anyhow::Error::msg)?;
+    // #12027: journal the markers the comment opens with (a no-op outside a
+    // journaled role run; best-effort, never the exit code or output).
+    crate::observability::pick_journal::record_marker(number, args.is_pr, &body);
     // The response is the new comment's JSON; `html_url` is the friendliest
     // one-line confirmation. A shape change must never fail the POST, so a
     // parse miss just echoes the raw response.

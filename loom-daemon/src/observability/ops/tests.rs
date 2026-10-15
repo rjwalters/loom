@@ -266,6 +266,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::ForgeStageDwell,
         MetricName::ForgeStageDwellSamples,
         MetricName::ForgeStageItems,
+        MetricName::ForgeStageOldestAgeSeconds,
         MetricName::StepActionable,
         MetricName::QueueDispositionRowsDropped,
         MetricName::MergeRedatePrs,
