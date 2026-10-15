@@ -40,6 +40,14 @@
 //! `../scripts/lib/*`, `guard-loom-workflow.sh` reaches `../scripts/` and
 //! `../roles`, and the tests are most of the bytes and none of the runtime.
 //!
+//! # Permissions
+//!
+//! These files are executed by every spawned session, so the tree is private
+//! to the daemon's user whatever the umask: the base is `0700`, group/other
+//! write is stripped from the staged tree before the rename, and a directory
+//! found already in place is reused only if it is a real directory owned by
+//! the current euid with no group/other write bit; otherwise it is replaced.
+//!
 //! # Overrides
 //!
 //! `LOOM_HOOKS_HOME` set in the daemon's own environment is passed through
@@ -47,6 +55,7 @@
 //! disables the export, and sessions run hooks from the checkout as before.
 
 use std::ffi::OsString;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -152,11 +161,13 @@ pub fn key(archive: &[u8], version: &str) -> String {
 /// copy in place.
 pub fn materialize(base: &Path, archive: &[u8], version: &str) -> Result<PathBuf> {
     let dest = base.join(key(archive, version));
-    if is_complete(&dest) {
+    if is_usable(&dest) {
         prune(base, &dest, SystemTime::now());
         return Ok(dest);
     }
     std::fs::create_dir_all(base).with_context(|| format!("create {}", base.display()))?;
+    std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restrict {}", base.display()))?;
     let staging = tempfile::Builder::new()
         .prefix(STAGING_PREFIX)
         .tempdir_in(base)
@@ -168,15 +179,17 @@ pub fn materialize(base: &Path, archive: &[u8], version: &str) -> Result<PathBuf
     );
     std::fs::write(staging.path().join(COMPLETE_MARKER), format!("{version}\n"))
         .context("write the completion marker")?;
-    if dest.exists() && !is_complete(&dest) {
-        // A crashed unpack under this key: replace it.
-        let _ = std::fs::remove_dir_all(&dest);
+    restrict_tree(staging.path()).context("restrict the staged tree")?;
+    if dest.symlink_metadata().is_ok() {
+        // A crashed unpack, or a copy that is not ours / is writable by
+        // others, under this key: replace it.
+        remove_any(&dest);
     }
     let staged = staging.keep();
     if let Err(e) = std::fs::rename(&staged, &dest) {
         let _ = std::fs::remove_dir_all(&staged);
         // Another process won the race with the same bytes.
-        if !is_complete(&dest) {
+        if !is_usable(&dest) {
             return Err(anyhow!(e)).with_context(|| format!("rename into {}", dest.display()));
         }
     }
@@ -186,6 +199,51 @@ pub fn materialize(base: &Path, archive: &[u8], version: &str) -> Result<PathBuf
 
 fn is_complete(dir: &Path) -> bool {
     dir.join(COMPLETE_MARKER).is_file() && dir.join("defaults/hooks").is_dir()
+}
+
+/// A complete copy that is safe to execute hooks from: a real directory (not
+/// a symlink) owned by the current euid with no group/other write bit.
+fn is_usable(dir: &Path) -> bool {
+    let Ok(meta) = dir.symlink_metadata() else {
+        return false;
+    };
+    // SAFETY: geteuid only reads the caller's effective user id.
+    let owned = meta.uid() == unsafe { libc::geteuid() };
+    meta.is_dir() && owned && meta.permissions().mode() & 0o022 == 0 && is_complete(dir)
+}
+
+fn remove_any(path: &Path) {
+    let is_dir = path.symlink_metadata().is_ok_and(|m| m.is_dir());
+    let _ = if is_dir {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+}
+
+/// Clear group/other write on `root` and everything under it (symlinks are
+/// left alone: their mode is not consulted), and make `root` itself `0700`.
+fn restrict_tree(root: &Path) -> Result<()> {
+    fn walk(dir: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let meta = path.symlink_metadata()?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let mode = meta.permissions().mode();
+            if mode & 0o022 != 0 {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & !0o022))?;
+            }
+            if meta.is_dir() {
+                walk(&path)?;
+            }
+        }
+        Ok(())
+    }
+    walk(root)?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 
 /// Whether `path` (archive-relative) is unpacked: under `defaults/`, and in

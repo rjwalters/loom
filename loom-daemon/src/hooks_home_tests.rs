@@ -155,30 +155,169 @@ fn resolve_without_a_home_is_none() {
     assert_eq!(resolve(None, None, &sample(), "1.2.3"), None);
 }
 
+/// No entry under `root` (itself included) has a group/other write bit.
+fn assert_private(root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = path.symlink_metadata().unwrap();
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        assert_eq!(
+            meta.permissions().mode() & 0o022,
+            0,
+            "{} is group/other writable",
+            path.display()
+        );
+        if meta.is_dir() {
+            for e in std::fs::read_dir(&path).unwrap() {
+                stack.push(e.unwrap().path());
+            }
+        }
+    }
+}
+
+/// An archive whose entries ask for group/world write, as a permissive
+/// umask or a loose packing environment would produce.
+fn loose() -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for dir in ["defaults/", "defaults/hooks/"] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o777);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, dir, std::io::empty())
+            .unwrap();
+    }
+    let body = "#!/bin/bash\nexit 0\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o777);
+    header.set_size(body.len() as u64);
+    builder
+        .append_data(&mut header, "defaults/hooks/guard-destructive.sh", body.as_bytes())
+        .unwrap();
+    zstd::encode_all(builder.into_inner().unwrap().as_slice(), 3).unwrap()
+}
+
+#[test]
+fn the_unpacked_tree_is_private_whatever_the_archive_or_base_asks_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("hooks-home");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let dir = materialize(&base, &loose(), "1.2.3").unwrap();
+    assert_private(&base);
+    assert_private(&dir);
+    let hook = dir.join("defaults/hooks/guard-destructive.sh");
+    assert_eq!(
+        std::fs::metadata(&hook).unwrap().permissions().mode() & 0o111,
+        0o111,
+        "stripping write must not drop the executable bit"
+    );
+    assert_eq!(base.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+}
+
+#[test]
+fn a_group_writable_copy_in_place_is_replaced_not_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("hooks-home");
+    let dir = materialize(&base, &sample(), "1.2.3").unwrap();
+    let hook = dir.join("defaults/hooks/guard-destructive.sh");
+    std::fs::write(&hook, "tampered").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+    assert_eq!(materialize(&base, &sample(), "1.2.3").unwrap(), dir);
+    assert_ne!(std::fs::read_to_string(&hook).unwrap(), "tampered");
+    assert_private(&dir);
+}
+
+#[test]
+fn a_symlink_in_place_of_the_copy_is_replaced_not_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("hooks-home");
+    let real = materialize(&base, &sample(), "1.2.3").unwrap();
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::rename(&real, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &real).unwrap();
+
+    let dir = materialize(&base, &sample(), "1.2.3").unwrap();
+    assert_eq!(dir, real);
+    assert!(!dir.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(dir.join("defaults/hooks/guard-destructive.sh").is_file());
+}
+
+/// Every `_PHOOK_NAMES` entry of the installer, plus `presence-beat.sh`
+/// (wired separately).
+fn wired_hooks(repo: &Path) -> Vec<String> {
+    let src = std::fs::read_to_string(repo.join("scripts/install/provision-hooks.sh")).unwrap();
+    let start = src
+        .find("_PHOOK_NAMES=(")
+        .expect("_PHOOK_NAMES in provision-hooks.sh");
+    let body = &src[start + "_PHOOK_NAMES=(".len()..];
+    let body = &body[..body.find(')').unwrap()];
+    let mut names: Vec<String> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.ends_with(".sh"))
+        .map(str::to_owned)
+        .collect();
+    names.push("presence-beat.sh".to_owned());
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Every `scripts/lib/<x>.sh` a hook under `defaults/hooks/` names.
+fn sourced_libs(repo: &Path) -> Vec<String> {
+    let mut libs = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(repo.join("defaults/hooks")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "sh") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (at, _) in text.match_indices("scripts/lib/") {
+            let rest = &text[at + "scripts/lib/".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                .collect();
+            if name.ends_with(".sh") {
+                libs.insert(name);
+            }
+        }
+    }
+    libs.into_iter().collect()
+}
+
 /// The real embedded payload carries what the wired hooks execute and
 /// source: if a hook moved or a library it sources fell out of the payload,
 /// the session would fall back to a stale checkout without anyone noticing.
+/// Both lists are derived from the repo, so a newly wired hook or a newly
+/// sourced library is covered without editing this test.
 #[test]
 fn the_embedded_payload_carries_the_wired_hooks_and_their_libraries() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let hooks = wired_hooks(&repo);
+    let libs = sourced_libs(&repo);
+    assert!(hooks.len() >= 11, "wired hooks not parsed: {hooks:?}");
+    assert!(libs.len() >= 6, "sourced libs not found: {libs:?}");
+
     let tmp = tempfile::tempdir().unwrap();
     let archive = crate::init::payload::embedded_archive();
     let dir = materialize(tmp.path(), archive, env!("CARGO_PKG_VERSION")).unwrap();
-    for rel in [
-        "defaults/hooks/guard-destructive.sh",
-        "defaults/hooks/guard-destructive-generic.sh",
-        "defaults/hooks/guard-loom-workflow.sh",
-        "defaults/hooks/guard-worktree-paths.sh",
-        "defaults/hooks/guard-mcp-tools.sh",
-        "defaults/hooks/guard-uncommitted-work.sh",
-        "defaults/hooks/roll-pause.sh",
-        "defaults/hooks/gh-front-env.sh",
-        "defaults/hooks/hook-wiring.sh",
-        "defaults/scripts/lib/locate-daemon-bin.sh",
-        "defaults/scripts/lib/config-resolver.sh",
-    ] {
-        assert!(dir.join(rel).is_file(), "{rel} missing from the hooks home");
+    for rel in hooks
+        .iter()
+        .map(|h| format!("defaults/hooks/{h}"))
+        .chain(libs.iter().map(|l| format!("defaults/scripts/lib/{l}")))
+    {
+        assert!(dir.join(&rel).is_file(), "{rel} missing from the hooks home");
     }
     assert!(!dir.join("defaults/scripts/tests").exists());
+    assert_private(&dir);
 }
 
 #[test]
