@@ -20,8 +20,9 @@
 //! anything the peer broadcast may carry (24 h), and it must survive a restart
 //! and a host change. The registry mirrors the due time locally, capped at
 //! 24 h, only so the next tick does not redraw the item before the listing
-//! shows the new body. The park itself is untouched: after a rollback
-//! `release-stale-blocked` owns it exactly as before, and the marker is inert
+//! shows the new body. The park itself is untouched: after a rollback it
+//! stays parked until a role or a human clears it (nothing releases
+//! `loom:blocked` automatically since #11301), and the marker is inert
 //! to every other reader (it is not a `loom:park` record).
 //!
 //! A Champion verdict that moves the item (`merged`, `rejected`, `promoted`,

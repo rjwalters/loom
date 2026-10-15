@@ -171,7 +171,7 @@ prove a claim *dead on this host* (`worktree_ops/orphan_recovery.rs:15-18`).
 | C5 | Fleet-store cache | `~/.loom/fleet-store/<owner>/<repo>/{manifest.json, blobs/<sha>}` (`fleet_store/mod.rs:224`, `fleet_store/fetch.rs:58-60`) | `fleet_store/fetch.rs:438` (atomic). Blobs are written before the manifest. | `fleet-config`, `fleet_sync` | **Cache** of the forge-hosted store; the forge is authoritative | `MANIFEST_VERSION` 1 (`fleet_store/fetch.rs:60`, checked `:402`) | Version mismatch or missing blob → refetch | **RETAIN** (cache, rebuildable from the forge) |
 | C6 | Pending-restart marker | `<loom_dir>/fleet-config-pending-restart.json` (`fleet_store/pending_restart.rs:39`) | `fleet_store/pending_restart.rs:85` | `fleet-config status`, `loom-daemon status` | Derived: rendered-at PID compared with the current PID | Unversioned | Missing → nothing pending | **J3** `config.rendered` + **PROJECTION → DELETE** |
 | C7 | Fleet sync status | `<loom_dir>/fleet-sync-status.json` (`fleet_sync.rs:121`, written `:770`) | `fleet_sync::publish` | `loom-daemon status` | Last-pass snapshot | Unversioned | Best effort | **J3** `fleet.sync` + **PROJECTION → DELETE** |
-| C8 | Effective-config snapshot | **Does not exist.** Only hashes are persisted: `planner_config_hash` / `fleet_config_hash` on `fleet.state` telemetry (`observability/fleet_state.rs:634`, `telemetry/kinds/fleet_state.rs:420`, `:424`) | — | Backend | No local authority. A hash cannot be resolved back to a config. | — | — | **J3** `config.resolved` (new, content-addressed) |
+| C8 | Effective-config snapshot | **Does not exist.** Only hashes are persisted: `planner_config_hash` / `fleet_config_hash` on `fleet.state` telemetry (`telemetry/kinds/fleet_state.rs`; no producer since #11301) | — | Backend | No local authority. A hash cannot be resolved back to a config. | — | — | **J3** `config.resolved` (new, content-addressed) |
 | C9 | Install metadata | `<ws>/.loom/install-metadata.json` (`install_compat.rs:68`) | `scripts/install-loom.sh`, `defaults/scripts/resync-installed.sh` | Version gates, `create-pr.sh`, `check-main-freshness.sh` | Authoritative install record | Fields | — | **RETAIN** (install contract) |
 | C10 | MCP state / command files | `~/.loom/state.json`, `~/.loom/mcp-command.json` (`mcp-loom/src/shared/config.ts:25`, `:28`) | `mcp-loom/src/shared/config.ts:189`, `mcp-loom/src/shared/ipc.ts:43` | `mcp-loom` | MCP-local | — | — | **RETAIN** (out of daemon scope) |
 
@@ -192,7 +192,7 @@ enum (`:148`), and temp + fsync + rename + directory fsync (`:207`).
 | H7 | Watch registry + results | `~/.loom/watches.json`, `~/.loom/logs/watch-results.log` (`watch_registry.rs:273`, `:285`) | `watch_registry.rs:326`, `:354` | `WATCHES_VERSION` (`:69`) | **RETAIN** |
 | H8 | Fleet host roster | `~/.loom/fleet.json` (`fleet/mod.rs:710`) | `fleet/mod.rs:797` | Fields | **RETAIN** |
 | H9 | Daemon liveness markers | autonomy-desired marker (`daemon_start/marker.rs`), pidfile (`daemon_pidfile.rs`), heartbeat (`daemon_heartbeat.rs`), `.daemon.pid` (`autonomy_marker.rs:65`), operator-stop record (`operator_stop.rs:50`), host opt-out (`host_optout.rs`), idle-exit marker (`idle_exit.rs:20`) | Their modules | Text / JSON | **RETAIN** (OS-level supervision contract) |
-| H10 | Dispatch / admission ledgers | drain-paused ledger (`ipc/drain_ledger.rs:47`), `ram-peaks.json` (`ram_peaks.rs:264-271`), `disk-footprints.json` (`disk_footprint.rs:632-642`), bucket book (`forge_bucket_book.rs:62`), stale-blocked release status (`stale_blocked/release_outcome.rs:27`), fleet-captain arm registry (`fleet_captain.rs:374`), fleet-alert state (`fleet_alert/task.rs:147`), safehouse completed (`safehouse.rs:2599`, being deleted by #11112) | Their modules | Mostly unversioned | **RETAIN** (each is the sole authority for its own observation) |
+| H10 | Dispatch / admission ledgers | drain-paused ledger (`ipc/drain_ledger.rs:47`), `ram-peaks.json` (`ram_peaks.rs:264-271`), `disk-footprints.json` (`disk_footprint.rs:632-642`), bucket book (`forge_bucket_book.rs:62`), fleet-captain arm registry (`fleet_captain.rs:374`), fleet-alert state (`fleet_alert/task.rs:147`), safehouse completed (`safehouse.rs:2599`, being deleted by #11112) | Their modules | Mostly unversioned | **RETAIN** (each is the sole authority for its own observation) |
 
 ## 7. Adjacent stores (catalogued, out of consolidation scope)
 
@@ -355,7 +355,7 @@ start and on live reload, from `fleet_store::render`, and from `fleet_sync`.
 
 | Kind | `data` |
 |------|--------|
-| `config.resolved` | `effective_hash` (the same function as `planner_config_hash`, `observability/fleet_state.rs:634`); `tiers[{tier, path, sha256\|absent}]`; `body`, redacted and included **only** the first time a hash is seen (content-addressed) |
+| `config.resolved` | `effective_hash` (`planner_config_hash`, `config_journal/mod.rs`); `tiers[{tier, path, sha256\|absent}]`; `body`, redacted and included **only** the first time a hash is seen (content-addressed) |
 | `config.rendered` | `target`, `backup`, `store_commit`, `restart_required_keys[]`, `daemon_pid_at_render` (replaces C6) |
 | `fleet.sync` | the `FleetSyncStatus` fields (replaces C7) |
 
