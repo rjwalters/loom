@@ -43,6 +43,8 @@ pub(super) fn role_tick_outcome() -> TelemetryRecord {
             prs_merged: 1,
             comments_posted: 4,
         }),
+        source: None,
+        sweep_id: None,
     })
 }
 
@@ -108,6 +110,8 @@ fn role_tick_outcome_omits_every_unobserved_field() {
         tokens_by_model: None,
         models_used: None,
         actions: None,
+        source: None,
+        sweep_id: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for key in [
