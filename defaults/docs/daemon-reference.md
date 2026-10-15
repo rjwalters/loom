@@ -36,6 +36,7 @@
 - [Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)](#stacked-pr-dependency--3729-v1-3747-v2-item-1)
 - [Epic supervisor (#3842)](#epic-supervisor-3842)
 - [Curator intake reconcile (#10041)](#curator-intake-reconcile-10041)
+- [Retired loops: the `loom:blocked` release pass and `fleet.state` (#11301)](#retired-loops-the-loomblocked-release-pass-and-fleetstate-11301)
 - [Autonomous work finder (#3810)](#autonomous-work-finder-3810)
 - [Operability — config, start/stop, E2E (Phase D, #3813)](#operability--config-startstop-e2e-phase-d-3813)
 - [Reader withdrawal kill switch (`LOOM_READ_ROUTING`)](#reader-withdrawal-kill-switch-loom_read_routing)
