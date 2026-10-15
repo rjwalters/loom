@@ -196,6 +196,24 @@ pub fn escalate(fault: Fault) -> Fault {
     })
 }
 
+/// Every captured `gh` run passes through here (`GhInvocation::execute_once`,
+/// the one choke point, so no read path can miss it): a run under a gateway
+/// profile that GitHub answered (exit 0, or an HTTP status below 500, a
+/// `304` included) resets the consecutive-rerun count (#12074 review).
+pub fn note_attempt(config_dir: Option<&Path>, out: &std::process::Output) {
+    let Some(dir) = config_dir else { return };
+    if super::owner_of_profile_dir(dir).is_none() {
+        return;
+    }
+    let answered = out.status.success()
+        || crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
+            .is_some_and(|r| r.status < 500)
+        || http_status_in(&String::from_utf8_lossy(&out.stderr)).is_some_and(|s| s < 500);
+    if answered {
+        note_answered();
+    }
+}
+
 /// The gateway answered: reset the consecutive-rerun count.
 pub fn note_answered() {
     with_reruns(|r| r.store(0, std::sync::atomic::Ordering::Relaxed));

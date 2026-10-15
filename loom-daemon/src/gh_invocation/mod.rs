@@ -818,6 +818,9 @@ impl GhInvocation {
                 };
                 let billing = accounting::record(&self, outcome, captured);
                 span.finish(&self, source, outcome, code, &billing);
+                if let Ok(Completion::Exited(out)) = &result {
+                    crate::forge_gateway::outage::note_attempt(self.config_dir.as_deref(), out);
+                }
                 result.map(GhCompletion::Captured)
             }
             OutputContract::Passthrough => {

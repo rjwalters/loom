@@ -296,4 +296,43 @@ mod tests {
         assert!(matches!(out, CmdOutcome::Ran(_)), "{out:?}");
         assert!(marker.exists(), "the guaranteed repo's read ran");
     }
+
+    /// #12074 review: every gateway answer resets the consecutive-rerun count
+    /// at the one choke point all captured runs pass through, whatever read
+    /// path made them: two failures, many answers, one failure is not a
+    /// withdrawal. A `304` is an answer too.
+    #[test]
+    fn every_gateway_answer_resets_the_rerun_count() {
+        use crate::forge_gateway::outage::{escalate, note_answered, Fault};
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp
+            .path()
+            .join(".loom")
+            .join("gh-config-gateway")
+            .join("acme");
+        std::fs::create_dir_all(&profile).unwrap();
+        let ok = stub(tmp.path(), "echo '{}'");
+        note_answered();
+        for answer in [0, 1] {
+            assert_eq!(escalate(Fault::Rerun), Fault::Rerun);
+            assert_eq!(escalate(Fault::Rerun), Fault::Rerun);
+            for _ in 0..20 {
+                let out = if answer == 0 {
+                    run_retrying(|| inv(TIMEOUT).gh_config_dir(Some(&profile)), &ok)
+                } else {
+                    let not_modified =
+                        stub(tmp.path(), "printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 1");
+                    run_retrying(|| inv(TIMEOUT).gh_config_dir(Some(&profile)), &not_modified)
+                };
+                assert!(matches!(out, CmdOutcome::Ran(_)), "{out:?}");
+            }
+            assert_eq!(escalate(Fault::Rerun), Fault::Rerun, "answers reset the count");
+            note_answered();
+        }
+        // A run outside a gateway profile is not a gateway answer.
+        assert_eq!(escalate(Fault::Rerun), Fault::Rerun);
+        assert_eq!(escalate(Fault::Rerun), Fault::Rerun);
+        let _ = run_retrying(|| inv(TIMEOUT), &ok);
+        assert_eq!(escalate(Fault::Rerun), Fault::Withdraw);
+    }
 }

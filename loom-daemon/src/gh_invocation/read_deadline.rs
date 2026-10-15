@@ -40,6 +40,8 @@ use std::time::{Duration, Instant};
 struct Scope {
     deadline: Instant,
     no_writer_fallback: bool,
+    /// A starved repo's escalated tick ([`allow_writer`]).
+    escalated: bool,
 }
 
 thread_local! {
@@ -81,6 +83,7 @@ pub fn enter(deadline: Instant, no_writer_fallback: bool) -> Guard {
         s.replace(Some(Scope {
             deadline,
             no_writer_fallback,
+            escalated: false,
         }))
     });
     Guard {
@@ -111,15 +114,25 @@ pub fn at_least(floor: Instant) -> Guard {
     })
 }
 
-/// Let the reads until the guard drops fall through to the writer again
-/// (#12074): a repo whose reads were shed for several ticks in a row gets one
-/// tick on the writer, so a long back-off can never stop it for good. A
+/// Let the reads until the guard drops reach the writer (#12074): a repo
+/// whose reads were shed for several ticks in a row gets one tick on the
+/// writer, so a long back-off can never stop it for good. It lifts every
+/// budget shed, not just the in-tick rule: a read whose readers are all out
+/// of budget, deferrable or not, goes to the writer ([`escalated`]). A
 /// no-op with no scope.
 pub fn allow_writer() -> Guard {
     adjust(|s| Scope {
         no_writer_fallback: false,
+        escalated: true,
         ..s
     })
+}
+
+/// Whether this read runs in a starved repo's escalated tick
+/// ([`allow_writer`]): a budget shed must send it to the writer instead.
+#[must_use]
+pub fn escalated() -> bool {
+    SCOPE.with(Cell::get).is_some_and(|s| s.escalated)
 }
 
 /// Lift the scope until the guard drops.
@@ -223,9 +236,11 @@ mod tests {
             let _floor = at_least(now + Duration::from_secs(20));
             assert!(matches!(budget(), Budget::Left(d) if d > Duration::from_secs(15)));
             assert!(!writer_fallback_allowed(), "the writer rule is kept");
+            assert!(!escalated());
             {
                 let _w = allow_writer();
                 assert!(writer_fallback_allowed());
+                assert!(escalated());
                 assert!(!passed(), "the deadline is kept");
             }
             assert!(!writer_fallback_allowed());

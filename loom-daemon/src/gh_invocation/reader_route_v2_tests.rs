@@ -542,3 +542,32 @@ fn a_tick_scoped_gate_read_is_shed_not_moved_to_the_writer() {
     assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
     assert_eq!(p.who(), vec![Who::R2, Who::R1, Who::Writer]);
 }
+
+/// #12074 review: a starved repo's escalated tick lifts the budget shed in
+/// the facade chain too: a Hygiene read whose readers are all out of budget
+/// reaches the writer.
+#[test]
+fn an_escalated_tick_sends_a_budget_exhausted_hygiene_read_to_the_writer() {
+    let p = pool(OK, OK, OK);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let scope = super::super::read_deadline::enter(deadline, true);
+    let (out, _, _) = p.run(
+        p.read("esc-a", ReadClass::Hygiene),
+        &["app-1", "app-2"],
+        SHED_ON,
+        SystemTime::now(),
+    );
+    assert!(matches!(out, GhCompletion::Shed { .. }), "an ordinary tick sheds: {out:?}");
+    assert!(p.who().is_empty());
+    let escalated = super::super::read_deadline::allow_writer();
+    let (out, _, _) = p.run(
+        p.read("esc-b", ReadClass::Hygiene),
+        &["app-1", "app-2"],
+        SHED_ON,
+        SystemTime::now(),
+    );
+    drop(escalated);
+    drop(scope);
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert_eq!(p.who(), vec![Who::Writer]);
+}

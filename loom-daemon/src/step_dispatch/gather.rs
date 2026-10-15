@@ -10,7 +10,8 @@
 //! - **the items**: [`super::listing::list_all_open`] (mirror, else the
 //!   shared ETag walk);
 //! - **the PRs' head and author**: the open-PR listing
-//!   (`forge_pull_listing`, ETag-cached, deferrable since #12074), so the Builder branch links as it
+//!   (`forge_pull_listing`, ETag-cached, a Gate read; its last good copy
+//!   stands in on a failure, #12074), so the Builder branch links as it
 //!   does in the open-PR guard. When it cannot be read, a PR row links by its
 //!   body alone;
 //! - **hold markers** on `loom:blocked` PRs: their trusted comments, cached
@@ -511,7 +512,7 @@ pub fn gather(
         super::listing::list_all_open(&gh_bin, Some(&root_dir), Some(&slug)),
     )?;
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
-    let pull_listing = crate::forge_pull_listing::list_open_pulls_deferrable_as(
+    let pull_listing = crate::forge_pull_listing::list_open_pulls_cached_as(
         super::listing::CALLER,
         &gh_bin,
         Some(&root_dir),

@@ -22,6 +22,10 @@
 //!    does the writer serve it. Shedding there would stop the caller's
 //!    housekeeping for as long as the condition lasts.
 //!
+//! A starved repo's escalated work-finder tick
+//! ([`crate::gh_invocation::read_deadline::allow_writer`], #12074) lifts the
+//! shed: its reads go to the writer, once every few ticks at most.
+//!
 //! `LOOM_READ_SHED=0` ([`crate::gh_invocation::READ_SHED_ENV`]) turns this
 //! off: every conditional read is routed as `Gate` again.
 
@@ -123,11 +127,24 @@ pub(super) fn fetch(
             // reader is left. Budget only if what it failed on was a rate
             // limit.
             RouteDecision::Reader { app_id, .. } => {
-                if matches!(last_failure, Some(Failure::RateLimited { .. })) {
+                if matches!(last_failure, Some(Failure::RateLimited { .. }))
+                    && !crate::gh_invocation::read_deadline::escalated()
+                {
                     let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
                     return Err(shed(site, gh_bin, target, repo, until, Some(&app_id)));
                 }
                 return on_writer(IdentityRole::WriterFallback);
+            }
+            // #12074: a starved repo's escalated tick reads on the writer.
+            RouteDecision::Exhausted {
+                cause: ExhaustCause::Budget,
+                ..
+            } if crate::gh_invocation::read_deadline::escalated() => {
+                return on_writer(if tried.is_empty() {
+                    IdentityRole::Writer
+                } else {
+                    IdentityRole::WriterFallback
+                });
             }
             RouteDecision::Exhausted {
                 until,
@@ -158,9 +175,6 @@ pub(super) fn fetch(
             Some(&bucket),
         )?;
         if answered(&first) {
-            if app_id == crate::forge_gateway::GATEWAY_APP_ID {
-                crate::forge_gateway::outage::note_answered();
-            }
             if matches!(first.1.as_ref().map(|h| h.status), Some(200 | 304)) {
                 served::note_reader_served(&app_id, repo, family, SystemTime::now());
             }

@@ -271,9 +271,6 @@ impl GhInvocation {
                 .without_token_env()
                 .execute_direct()?;
             if succeeded(&first) {
-                if app_id == crate::forge_gateway::GATEWAY_APP_ID {
-                    crate::forge_gateway::outage::note_answered();
-                }
                 return Ok(first);
             }
             let fault = if app_id == crate::forge_gateway::GATEWAY_APP_ID {
@@ -379,7 +376,9 @@ impl GhInvocation {
         let in_tick = tried
             && cause == ExhaustCause::Budget
             && !super::super::read_deadline::writer_fallback_allowed();
-        if !in_tick && (class == ReadClass::Gate || cause != ExhaustCause::Budget) {
+        // A starved repo's escalated tick lifts every budget shed.
+        let escalated = super::super::read_deadline::escalated();
+        if escalated || (!in_tick && (class == ReadClass::Gate || cause != ExhaustCause::Budget)) {
             return if tried {
                 self.writer_fallback()
             } else {
