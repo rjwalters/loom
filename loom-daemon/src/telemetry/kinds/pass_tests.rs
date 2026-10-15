@@ -40,6 +40,8 @@ fn summary() -> PassSummaryRecord {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
+        unevaluated_reasons: std::collections::BTreeMap::new(),
+        budget: None,
         write_cap_hit: false,
         github: GithubSpend {
             calls: 9,
@@ -63,6 +65,8 @@ fn verdict() -> PassVerdictRecord {
         verdict: "released".to_string(),
         reason: None,
         detail: None,
+        unevaluated_reason: None,
+        budget: None,
         blockers: vec![BlockerState {
             reference: "#10753".to_string(),
             state: "closed".to_string(),

@@ -52,7 +52,7 @@ fn summary_severity(r: &PassSummaryRecord) -> SeverityNumber {
 }
 
 fn summary(r: &PassSummaryRecord) -> (&'static str, SeverityNumber, u64, Vec<KeyValue>, String) {
-    let attributes = vec![
+    let mut attributes = vec![
         kv_string("loom.repo", r.repo.clone()),
         kv_string("loom.pass.id", r.pass_id.clone()),
         kv_string("loom.pass.mechanism", r.mechanism.clone()),
@@ -72,6 +72,24 @@ fn summary(r: &PassSummaryRecord) -> (&'static str, SeverityNumber, u64, Vec<Key
         kv_string("loom.pass.version", r.loom.version.clone()),
         kv_string("loom.pass.revision", r.loom.revision.clone()),
     ];
+    if !r.unevaluated_reasons.is_empty() {
+        attributes
+            .push(kv_string("loom.pass.unevaluated_reasons", flatten(&r.unevaluated_reasons)));
+    }
+    if let Some(b) = &r.budget {
+        for (key, v) in [
+            ("loom.pass.budget.core_start", b.core_start),
+            ("loom.pass.budget.core_end", b.core_end),
+            ("loom.pass.budget.graphql_start", b.graphql_start),
+            ("loom.pass.budget.graphql_end", b.graphql_end),
+            ("loom.pass.budget.core_floor", Some(b.core_floor)),
+            ("loom.pass.budget.graphql_floor", Some(b.graphql_floor)),
+        ] {
+            if let Some(v) = v {
+                attributes.push(kv_int(key, int(v)));
+            }
+        }
+    }
     let body = serde_json::to_string(r).unwrap_or_default();
     ("pass.summary", summary_severity(r), nanos(r.ended_at), attributes, body)
 }
@@ -120,6 +138,14 @@ fn verdict(r: &PassVerdictRecord) -> (&'static str, SeverityNumber, u64, Vec<Key
     }
     if let Some(reason) = &r.reason {
         attributes.push(kv_string("loom.pass.reason", reason.clone()));
+    }
+    if let Some(reason) = &r.unevaluated_reason {
+        attributes.push(kv_string("loom.pass.unevaluated_reason", reason.clone()));
+    }
+    if let Some(b) = &r.budget {
+        attributes.push(kv_string("loom.pass.budget.bucket", b.bucket.clone()));
+        attributes.push(kv_int("loom.pass.budget.remaining", int(b.remaining)));
+        attributes.push(kv_int("loom.pass.budget.floor", int(b.floor)));
     }
     if !r.blockers.is_empty() {
         let blockers = r
