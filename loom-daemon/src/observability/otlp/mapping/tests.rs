@@ -867,8 +867,38 @@ fn role_tick_outcome_envelope(
             tokens_by_model: None,
             models_used: None,
             actions: None,
+            source: None,
+            sweep_id: None,
         }),
     )
+}
+
+/// #11906: a step's `role_tick.outcome` carries `loom.role_tick.source=step`
+/// and its sweep id; a role-runner tick carries neither, so a "role ticks
+/// still running" query never counts steps.
+#[test]
+fn a_steps_role_tick_outcome_is_marked_as_a_step() {
+    let mut step = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut step.record {
+        r.source = Some(crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string());
+        r.sweep_id = Some("step-judge-7-1".to_string());
+    }
+    let tick = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    let request = build_logs_request(&[step, tick]).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let attr = |record: &LogRecord, key: &str| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    let s = |v: &str| Some(any_value::Value::StringValue(v.to_string()));
+    assert_eq!(attr(&records[0], "loom.role_tick.source"), s("step"));
+    assert_eq!(attr(&records[0], "loom.sweep_id"), s("step-judge-7-1"));
+    assert_eq!(attr(&records[1], "loom.role_tick.source"), None);
+    assert_eq!(attr(&records[1], "loom.sweep_id"), None);
 }
 
 /// Issue #8408 shipped `loom.gated_pool` with no assertion behind it (#8444):

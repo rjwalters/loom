@@ -67,7 +67,7 @@ jobs:
     name: Full Suite (clean, unpartitioned)
     runs-on: ubuntu-latest
     # Generous on purpose: no cache, full debuginfo, every test in one process
-    # per test, plus four Docker-backed --ignored suites.
+    # per test, plus fifteen Docker-backed --ignored suites.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -128,6 +128,80 @@ jobs:
       - name: "Ignored: session filelog redaction contract"
         if: ${{ !cancelled() }}
         run: cargo test --package loom-daemon --features otlp --test collector_filelog -- --ignored --nocapture
+      # --- moved from ci.yml's former `Rust OTLP Feature Build & Test` job
+      # (#11967). Each runs committed SigNoz/ClickHouse SQL verbatim against a
+      # real pinned ClickHouse started via tests/common/hub_image.rs. The PR gate
+      # no longer runs them: a PR that breaks one of these artifacts is caught
+      # here within a day (ci-principles.md "The daily backstop").
+      - name: "Ignored: measured-usage queries against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528: the committed measured-usage SQL, run verbatim. Only this run shows
+        # that reading a counter from the wrong attribute map returns 0 on every row
+        # instead of erroring, and that scope resolution, unpriced-model exclusion
+        # and absence-vs-measured-zero behave as the artifact's header claims.
+        run: cargo test --package loom-daemon --features otlp --test signoz_usage_queries -- --ignored --nocapture
+      - name: "Ignored: SigNoz cycle-time extraction against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #8665: signoz/cycle-time-extract.sql plus the shared rollup and
+        # CT1-CT8 queries, run verbatim over a fixture seeded to match the SigNoz
+        # ingester's attributes_string/attributes_number split.
+        run: cargo test --package loom-daemon --features otlp --test signoz_cycle_time -- --ignored --nocapture
+      - name: "Ignored: SigNoz queue/quota gauge queries against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #8856 / #9005: queue-dwell.sql and quota-utilization.sql. Only this
+        # run shows max() absorbs time_series_v4's duplicate per-hour rows where sum()
+        # doubles, that a provider with no utilization source reads NULL rather than
+        # a fully-idle 0, and that an over-100% reading clamps to zero headroom.
+        run: cargo test --package loom-daemon --features otlp --test signoz_queue_quota_queries -- --ignored --nocapture
+      - name: "Ignored: SigNoz GitHub shadow-spend queries against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #10343: github-shadow.sql must charge each quota window once; stale host
+        # readings, interleaved buckets and reset jitter must not re-charge it.
+        run: cargo test --package loom-daemon --features otlp --test signoz_github_shadow_queries -- --ignored --nocapture
+      - name: "Ignored: SigNoz queue-starvation alert rule against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #8856: alerts/queue-starvation.json. An alert that returns no rows
+        # is silently healthy forever; only this run shows the committed rule
+        # separates a sustainedly starved host from a measured-zero healthy one and
+        # from a flapping one, without double-counting the window boundary.
+        run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
+      - name: "Ignored: SigNoz disk and work-finder alert rules against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #10973: replay of the host-disk and work-finder-stale alert rules.
+        run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
+      - name: "Ignored: SigNoz host-export queries and silent-host alert against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #11198: host-export-queries.sql queries 1-3 and the host-export-silent
+        # alert, run verbatim (roster substituted) over a fixture.
+        run: cargo test --package loom-daemon --features otlp --test signoz_host_export_queries -- --ignored --nocapture
+      - name: "Ignored: SigNoz replay reconstruction against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #11125: replay-queries.sql queries 1-3. Only this run shows an issue
+        # removed, re-added and removed again stays deleted, and that a lost delta or
+        # missing anchor/chunk makes that host unknown instead of rebuilding wrong state.
+        run: cargo test --package loom-daemon --features otlp --test signoz_replay_queries -- --ignored --nocapture
+      - name: "Ignored: telemetry-replay against the replay fixture store"
+        if: ${{ !cancelled() }}
+        # #11127: `telemetry-replay --as-of` runs the same committed queries with its
+        # own parameter binding and reader; only this run shows an uncovered host is
+        # reported `unknown`, not empty.
+        run: cargo test --package loom-daemon --features otlp --test telemetry_replay_fixture_store -- --ignored --nocapture
+      - name: "Ignored: SigNoz CI failed-run log join against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #8826: section 5 of ci-queries.sql ("Failed run -> logs"). Only
+        # this run shows a startup_failure run is distinguishable from a failed job
+        # whose log never arrived, that uniqExact() and the run-level dedupe absorb
+        # replayed chunks/records, and that both asymmetric join keys are load-bearing.
+        run: cargo test --package loom-daemon --features otlp --test signoz_ci_failed_run_logs -- --ignored --nocapture
+      - name: "Ignored: SigNoz retention statements against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #8528 / #9904: retention.sql, the one artifact that MUTATES the operator's
+        # deployment. Needs a single-node ClickHouse with an embedded Keeper (`ON
+        # CLUSTER` requires a real distributed-DDL queue). Only this run shows a
+        # retention OUTCOME: e.g. that dropping the `/ 1000` from a millisecond
+        # statement deletes every row, and that one failing statement aborts the file
+        # leaving the metric statements unapplied.
+        run: cargo test --package loom-daemon --features otlp --test signoz_retention_ttl -- --ignored --nocapture
 
   # ===========================================================================
   # Item 2 -- the release matrix, minus signing and publishing.
@@ -477,6 +551,15 @@ jobs:
           git config --global user.name "Loom CI"
       - name: Assert the wired/excluded manifest invariant (#4455)
         run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
+      - name: Ensure a per-suite timeout wrapper (#11964)
+        # run-ci-suites.sh bounds each suite only through `timeout`/`gtimeout`
+        # and, in CI, now refuses to run without one: with neither, one hung
+        # suite silently ate this leg's whole 180-min cap. macOS ships neither
+        # by default; coreutils provides `gtimeout`.
+        if: runner.os == 'macOS'
+        run: |
+          command -v timeout || command -v gtimeout || brew install coreutils
+          command -v timeout || command -v gtimeout
       - name: Run the CI-wired shell test suites (UNSHARDED)
         # No LOOM_CI_SHARD: every suite runs in this one job. LOOM_CI_PARALLELISM
         # is the axis under test. LOOM_TEST_ALLOW_SYSTEMD only on Linux -- macOS
@@ -609,6 +692,51 @@ jobs:
         run: ./docker/native/test-image.sh loom-worker-native:ci-daily
 
   # ===========================================================================
+  # Docker-backed session-exec / private-workspace fixtures (#11965), moved off
+  # ci.yml's Codex Adapter Smoke (mocked) PR leg -- rule 10's slow run.
+  # ===========================================================================
+  docker-fixtures:
+    name: Session and Private-Workspace Docker Fixtures (unfiltered)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Verify persistent-session cancellation with fake workers
+        # #11232 / #11755: no `docker pull` here. The test pulls ubuntu:24.04
+        # through tests/common/hub_image.rs at the digest .github/ci-images.txt
+        # pins (GHCR copy first, then mirror.gcr.io, Docker Hub with bounded
+        # retry last) and tags it `ubuntu:24.04`, which the fixture build in
+        # the next step also consumes.
+        env:
+          LOOM_TEST_SESSION_IMAGE: ubuntu:24.04
+        run: cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
+      - name: Verify account-private clones and exclusive jobs with Docker fixtures
+        if: ${{ !cancelled() }}
+        # Builds a small ubuntu:24.04 fixture image (apt from archive.ubuntu.com);
+        # capped so a mirror stall fails here, not at the 30-min job limit (#10822).
+        timeout-minutes: 10
+        # Owner-only synthetic profiles must belong to the session image's UID.
+        # Build as runner; execute only this fixture as UID 1000 with Docker access.
+        # Stage public inputs outside the runner's owner-only home. Account
+        # profiles and the checkout's .git directory are never shared.
+        run: |
+          fixture_source="$(mktemp -d /tmp/loom-private-ci.XXXXXX)"
+          chmod 0755 "$fixture_source"
+          git archive HEAD | tar -x -C "$fixture_source"
+          mkdir "$fixture_source/target"
+          sudo --non-interactive mount --bind "$PWD/target" "$fixture_source/target"
+          trap 'sudo --non-interactive umount "$fixture_source/target"' EXIT
+          cd "$fixture_source"
+          cargo test -p loom-daemon --test private_workspace_docker --no-run --message-format=json > fixture-artifacts.json
+          fixture_test="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "private_workspace_docker" and .executable != null) | .executable' fixture-artifacts.json)"
+          namei -l "$PWD/defaults/scripts" "$PWD/defaults/runtimes" "$PWD/defaults/roles" "$PWD/defaults/.claude/commands/loom" "$PWD/target/debug/loom-daemon"
+          sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env -- sh -c 'id && test -x "$1" && test -r "$PWD/target/debug/loom-daemon" && test -x "$PWD/target/debug/loom-daemon" && tar -cf /dev/null "$PWD/defaults"' sh "$fixture_test"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
+
+  # ===========================================================================
   # Item 8 -- the compatibility floor itself (#10868).
   # ===========================================================================
   compat-floor:
@@ -684,6 +812,7 @@ jobs:
       - flake-shell
       - beta-toolchain
       - docker-smokes
+      - docker-fixtures
       - compat-floor
     # `always()` would also run after the operator cancels the run, and a
     # cancelled job is not a failing job. `!cancelled()` runs after failures
@@ -695,8 +824,14 @@ jobs:
       contents: read
       issues: write
       actions: read   # reading this run's own job list and completed-job logs
+      checks: read    # a cancelled job's check-run annotations (timeout vs cancel, #11964)
       id-token: write # the loom-ui step's OIDC token (2AMLogic/loom-ui#3319)
     steps:
+      # Only the classifier is needed: the step below is otherwise all inline.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci-daily-classify.sh
+          sparse-checkout-cone-mode: false
       - name: Open, update and close tracking issues
         env:
           GH_TOKEN: ${{ github.token }}
@@ -767,6 +902,22 @@ jobs:
                 continue ;;
             esac
 
+            # A job cut off by its own `timeout-minutes` concludes `cancelled`,
+            # which the case below leaves alone; only its check-run annotation
+            # tells it from a hand cancel (#11964). Fetched for cancelled jobs
+            # only, so normally zero or one extra REST call per night. A failed
+            # fetch leaves it `cancelled` (scripts/ci-daily-classify.sh).
+            annotations='[]'
+            if [ "$conclusion" = "cancelled" ]; then
+              annotations="$(gh api --paginate "repos/$REPO/check-runs/$job_id/annotations?per_page=100" 2>/dev/null \
+                | jq -s 'add // []' 2>/dev/null)" || annotations='[]'
+            fi
+            conclusion="$(CONCLUSION="$conclusion" ANNOTATIONS_JSON="$annotations" scripts/ci-daily-classify.sh)"
+            how="failed"
+            if [ "$conclusion" = "timed_out" ]; then
+              how="was cut off by its \`timeout-minutes\` cap"
+            fi
+
             title="${TITLE_PREFIX}${job_name}"
             number="$(jq -r --arg t "$title" \
               'map(select(.title == $t)) | (.[0].number // empty)' /tmp/open-tracking.json)"
@@ -775,8 +926,8 @@ jobs:
               failure|timed_out)
                 body_excerpt="$(excerpt "$job_id")"
                 if [ -n "$number" ]; then
-                  jq -n --arg run "$RUN_URL" --arg job "$job_url" --arg ex "$body_excerpt" \
-                    '{body: ("Still failing.\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>")}' \
+                  jq -n --arg run "$RUN_URL" --arg job "$job_url" --arg ex "$body_excerpt" --arg how "$how" \
+                    '{body: ("Still failing (the job \($how)).\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>")}' \
                     > /tmp/payload.json
                   gh api -X POST "repos/$REPO/issues/$number/comments" --input /tmp/payload.json >/dev/null
                   echo "updated #$number -- $title"
@@ -784,8 +935,8 @@ jobs:
                   updated=$((updated + 1))
                 else
                   jq -n --arg t "$title" --arg run "$RUN_URL" --arg job "$job_url" \
-                        --arg ex "$body_excerpt" --arg label "$TRACKING_LABEL" \
-                    '{title: $t, labels: [$label], body: ("The nightly `ci-daily.yml` job failed.\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>\n\nThis issue is opened, updated and closed by `.github/workflows/ci-daily.yml`. It closes itself on the next daily run in which this job is green. **Keep the title unchanged**: the workflow finds this issue by its exact title (whatever labels it carries), so a renamed issue is orphaned and a duplicate opens the next night.")}' \
+                        --arg ex "$body_excerpt" --arg label "$TRACKING_LABEL" --arg how "$how" \
+                    '{title: $t, labels: [$label], body: ("The nightly `ci-daily.yml` job \($how).\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>\n\nThis issue is opened, updated and closed by `.github/workflows/ci-daily.yml`. It closes itself on the next daily run in which this job is green. **Keep the title unchanged**: the workflow finds this issue by its exact title (whatever labels it carries), so a renamed issue is orphaned and a duplicate opens the next night.")}' \
                     > /tmp/payload.json
                   # REST, not `gh issue create`: that is GraphQL-backed, and
                   # this path also has no business going through
@@ -812,7 +963,8 @@ jobs:
                 fi
                 ;;
               *)
-                # skipped, cancelled, neutral, still-running. NOT a pass:
+                # skipped, cancelled (by hand -- a timeout is `timed_out` by
+                # now), neutral, still-running. NOT a pass:
                 # ci-principles.md rule 6. Leave any open tracking issue
                 # exactly as it is rather than closing it on a non-result.
                 echo "no result ($conclusion), leaving alone: $job_name"

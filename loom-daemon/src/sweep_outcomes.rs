@@ -1191,6 +1191,8 @@ mod tests {
                 tokens_by_model: None,
                 models_used: None,
                 actions: None,
+                source: None,
+                sweep_id: None,
             }),
         )
     }

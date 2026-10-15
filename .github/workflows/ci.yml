@@ -454,8 +454,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
-      - run: cargo check --workspace --all-targets
+      # --all-targets (#11967) so test code, benches and examples are linted
+      # too; it covers every target `cargo check --workspace --all-targets`
+      # did (the workspace is exactly these two crates), so that step is gone.
+      # Keep the allow-list in exact sync with .cargo/config.toml (#3837).
+      - run: cargo clippy --package loom-daemon --package loom-api --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       # Folded in from the former Rust Doctests job (#9065): nextest does not
       # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
       # clippy failure above does not hide a doctest failure.
@@ -569,136 +572,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Lint every workflow for cancellation of a started main run
         run: cargo test -p loom-daemon --lib merge_group_ci
-
-  backend-otlp-feature:
-    name: Rust OTLP Feature Build & Test
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The OTLP exporter (#4858, Epic #4702 Phase 4) is compiled
-      # unconditionally since #10700; `--features otlp` is a no-op alias kept
-      # for CLI compatibility (see loom-daemon/Cargo.toml), so this job's flags
-      # are harmless. --all-targets is required here (unlike
-      # backend-lint-and-check's default job) so the exporter's own unit tests
-      # (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not just its
-      # non-test code paths.
-      - run: cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
-      # The exporter's full nextest run lives in the partitioned Rust Unit
-      # Tests job (#10823): the whole workspace runs once. Since #10700 there is
-      # one build configuration, so there is no separate default-feature leg.
-      - name: Verify OTLP with a real pinned Collector
-        run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
-      # #8665: executes the committed cycle-time SQL verbatim against a real
-      # pinned ClickHouse, on rows written by the real ClickHouse exporter.
-      # Static contract checks cannot see how a nested attribute is serialized,
-      # nor whether the rollup still answers once the raw rows expire.
-      - name: Verify the cycle-time artifacts against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
-      # #8528: executes the committed measured-usage SQL verbatim against the
-      # same pinned ClickHouse. The static contract can assert that a counter is
-      # read from `attributes_string`; only this run demonstrates that the wrong
-      # container returns 0 on every row instead of erroring, and that scope
-      # resolution, unpriced-model exclusion and absence-vs-measured-zero come
-      # out of the engine the way the artifact's header claims.
-      - name: Verify the measured-usage queries against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_usage_queries -- --ignored --nocapture
-      # #8528 / #8665: executes signoz/cycle-time-extract.sql (and the shared
-      # rollup + CT1-CT8 queries) verbatim against the same pinned ClickHouse,
-      # over a fixture seeded to match the SigNoz ingester's own
-      # attributes_string/attributes_number split. Closes the "NOT yet
-      # executed against a live SigNoz deployment" status the extract view
-      # carried since #8665 landed — the ClickStack side was already covered
-      # by cycle_time_clickhouse.rs above.
-      - name: Verify the SigNoz cycle-time extraction against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_cycle_time -- --ignored --nocapture
-      # #8528 / #8856 / #9005: the same technique for the trial's two METRIC-signal
-      # artifacts (queue-dwell.sql, quota-utilization.sql). signoz_trial_artifacts.rs
-      # already guards their metric/label vocabulary in ordinary CI; only this run
-      # shows that `max()` absorbs time_series_v4's duplicate per-hour rows while
-      # `sum()` doubles, that maxOrNullIf() answers NULL instead of a fully-idle 0
-      # for a provider with no utilization source, and that an over-100% reading
-      # clamps to zero headroom rather than negative.
-      - name: Verify the SigNoz queue/quota gauge queries against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_queue_quota_queries -- --ignored --nocapture
-      # #10343: github-shadow.sql's bill must charge each quota window once --
-      # stale host readings, interleaved buckets and reset jitter must not
-      # re-charge (the PR #10565 review's live 61k-in-2h inflation).
-      - name: Verify the SigNoz GitHub shadow-spend queries against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_github_shadow_queries -- --ignored --nocapture
-      # #8528 / #8856: the same technique for the trial's one saved ALERT RULE
-      # (alerts/queue-starvation.json), the last query artifact in this trial
-      # with only a vocabulary guard. An alert that returns no rows -- or rows
-      # its threshold can never cross -- is silently healthy forever, because
-      # the absence of a page is what a working queue looks like. Only this run
-      # shows that the committed op/matchType/target separate a sustainedly
-      # starved host from a healthy one reporting a measured zero and from a
-      # flapping one, that the half-open window excludes the boundary point two
-      # overlapping evaluations would otherwise double-count, and that the
-      # zero rows survive the SQL so SigNoz can see a series recover.
-      - name: Verify the SigNoz queue-starvation alert rule against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
-      # #10973: replay of the host-disk and work-finder-stale alert rules
-      - name: Verify the SigNoz disk and work-finder alert rules against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
-      # #11198: host-export-queries.sql queries 1-3 and the host-export-silent
-      # alert, run verbatim (roster substituted) over a fixture.
-      - name: Verify the SigNoz host-export queries and silent-host alert against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_host_export_queries -- --ignored --nocapture
-      # #11125: the same technique for the replay reconstruction
-      # (replay-queries.sql queries 1-3). Only this run shows that an issue
-      # removed, re-added and removed again stays deleted, and that a lost
-      # delta, a missing anchor or delta chunk, or a chain whose anchor never
-      # arrived makes that host unknown instead of rebuilding wrong state.
-      - name: Verify the SigNoz replay reconstruction against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_replay_queries -- --ignored --nocapture
-      # #11127: `telemetry-replay --as-of` runs those same committed queries
-      # with its own parameter binding and reader over the same fixture store;
-      # only this run shows an uncovered host is reported `unknown`, not empty.
-      - name: Verify telemetry-replay against the replay fixture store
-        run: cargo test --package loom-daemon --features otlp --test telemetry_replay_fixture_store -- --ignored --nocapture
-      # #8528 / #8826: the same technique for section 5 of ci-queries.sql
-      # ("Failed run -> logs"), the one standing CI view whose chunk join no
-      # deployment has ever exercised -- the live trial capture returned 60 rows
-      # all reading `0 of 0`, so everything downstream of the job->log join was
-      # unexecuted code in a view operators act on. Only this run shows that a
-      # failed run with NO non-successful job (a startup_failure) came back
-      # byte-identical in shape to "a failed job whose log never arrived" --
-      # `job_id` 0, `truncated` false, `0 of 0`, and a Logs Explorer filter of
-      # `loom.ci.job_id = 0` that silently matches nothing -- that a replayed
-      # chunk reports 4 of 3 without uniqExact(), that a replayed ci.run record
-      # doubles every job of that run without the run-level dedupe, and that the
-      # asymmetric run_attempt/attempts join keys are both load-bearing.
-      - name: Verify the SigNoz CI failed-run log join against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_ci_failed_run_logs -- --ignored --nocapture
-      # #8528 / #9904: the same technique for retention.sql, the trial's last
-      # artifact with no guard of any kind -- and the only one that MUTATES the
-      # operator's deployment. It needs a single-node ClickHouse with an
-      # embedded Keeper rather than `clickhouse local`, because `ON CLUSTER
-      # cluster` requires a real distributed-DDL queue (`clickhouse local`
-      # answers QUERY_IS_PROHIBITED). The live record for this file is "all 16
-      # statements reported status 0" plus an effective TTL per table; neither
-      # can show a retention OUTCOME. Only this run shows that dropping the
-      # `/ 1000` from a millisecond statement deletes every row in the table
-      # rather than nothing (toDateTime saturates at the DateTime maximum and
-      # the interval overflows past it), that `ttl_only_drop_parts` keeps an
-      # over-age row alive indefinitely in a part it shares with an in-window
-      # row, that `MODIFY TTL` silently drops a table-level DELETE WHERE
-      # qualification while keeping column TTLs, that re-widening a shortened
-      # window restores the policy and not the data, and that one failing
-      # statement aborts the file leaving exactly the metric statements -- the
-      # ones that restore 30 days -- unapplied.
-      - name: Verify the SigNoz retention statements against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_retention_ttl -- --ignored --nocapture
 
   structural-checks:
     name: Structural Checks
@@ -849,6 +722,9 @@ jobs:
       - name: Test the CI Result aggregate gate (#10444)
         if: ${{ !cancelled() }}
         run: bash scripts/test-ci-result-gate.sh
+      - name: Test the ci-daily timeout classifier and report wiring (#11964)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-ci-daily-classify.sh
       - name: Test the image-input detection and the image gate wiring (#10825)
         if: ${{ !cancelled() }}
         run: bash scripts/test-ci-image-inputs.sh
@@ -2793,7 +2669,7 @@ jobs:
 
   codex-adapter-smoke:
     name: Codex Adapter Smoke (mocked)
-    needs: changes
+    needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
     # Tier-2 admission gate for the Codex runtime adapter (epic #4167 Phase 2,
     # issue #4468): a green leg here is what admits the adapter per
@@ -2804,18 +2680,21 @@ jobs:
     # shim on a temp PATH, so the real Codex CLI is never installed or invoked
     # and no credential is required. `codex` is deliberately NOT on PATH here,
     # which also exercises the missing-binary (exit 127) path.
+    #
+    # The Docker-backed session-exec / private-workspace fixtures moved to
+    # ci-daily.yml's docker-fixtures job (#11965).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # Built once by build-daemon (#9065). download-artifact FAILS when the
+      # artifact is missing, so a broken build turns this job red rather than
+      # letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build native worker dispatcher
-        run: cargo build --package loom-daemon
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Syntax-check the Codex adapter and its test
         run: |
           bash -n defaults/scripts/spawn-codex.sh
@@ -2870,36 +2749,6 @@ jobs:
           grep -q '## Residual gaps' defaults/docs/guardrail-parity-codex.md
       - name: Run the mocked Codex adapter test suite
         run: bash defaults/scripts/tests/test-spawn-codex.sh
-      - name: Verify persistent-session cancellation with fake workers
-        # #11232 / #11755: no `docker pull` here. The test pulls ubuntu:24.04
-        # through tests/common/hub_image.rs at the digest .github/ci-images.txt
-        # pins (GHCR copy first, then mirror.gcr.io, Docker Hub with bounded
-        # retry last) and tags it `ubuntu:24.04`, which the fixture build in
-        # the next step also consumes.
-        env:
-          LOOM_TEST_SESSION_IMAGE: ubuntu:24.04
-        run: cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
-      - name: Verify account-private clones and exclusive jobs with Docker fixtures
-        # Builds a small ubuntu:24.04 fixture image (apt from archive.ubuntu.com);
-        # capped so a mirror stall fails here, not at the 30-min job limit (#10822).
-        timeout-minutes: 10
-        # Owner-only synthetic profiles must belong to the session image's UID.
-        # Build as runner; execute only this fixture as UID 1000 with Docker access.
-        # Stage public inputs outside the runner's owner-only home. Account
-        # profiles and the checkout's .git directory are never shared.
-        run: |
-          fixture_source="$(mktemp -d /tmp/loom-private-ci.XXXXXX)"
-          chmod 0755 "$fixture_source"
-          git archive HEAD | tar -x -C "$fixture_source"
-          mkdir "$fixture_source/target"
-          sudo --non-interactive mount --bind "$PWD/target" "$fixture_source/target"
-          trap 'sudo --non-interactive umount "$fixture_source/target"' EXIT
-          cd "$fixture_source"
-          cargo test -p loom-daemon --test private_workspace_docker --no-run --message-format=json > fixture-artifacts.json
-          fixture_test="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "private_workspace_docker" and .executable != null) | .executable' fixture-artifacts.json)"
-          namei -l "$PWD/defaults/scripts" "$PWD/defaults/runtimes" "$PWD/defaults/roles" "$PWD/defaults/.claude/commands/loom" "$PWD/target/debug/loom-daemon"
-          sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env -- sh -c 'id && test -x "$1" && test -r "$PWD/target/debug/loom-daemon" && test -x "$PWD/target/debug/loom-daemon" && tar -cf /dev/null "$PWD/defaults"' sh "$fixture_test"
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
 
   shell-suite-tests:
     name: Shell Test Suites (hermetic, ${{ matrix.shard }}/${{ strategy.job-total }})
@@ -3344,7 +3193,6 @@ jobs:
       - backend-lint-and-check
       - backend-tests
       - workflow-cancel-lint
-      - backend-otlp-feature
       - structural-checks
       - daemon-checks
       - install-surface-checks

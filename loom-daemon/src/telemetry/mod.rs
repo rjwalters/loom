@@ -1260,7 +1260,18 @@ pub struct RoleTickOutcomeRecord {
     /// records written before #11989 — additive, no `schema_version` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<crate::role_tick_telemetry::prompt_tree::PromptTree>,
+    /// What ran the tick (#11906): absent for a role-runner tick, `"step"`
+    /// ([`ROLE_TICK_SOURCE_STEP`]) for a step-engine step, so a "role ticks
+    /// still running" query never counts steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
 }
+
+/// [`RoleTickOutcomeRecord::source`] of a step-engine step (#11906).
+pub const ROLE_TICK_SOURCE_STEP: &str = "step";
 
 /// One account's slice of a `tokens.snapshot` — the per-account usage /
 /// limit-window state matching what `loom-daemon tokens check --ranking` knows.
