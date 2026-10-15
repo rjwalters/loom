@@ -546,9 +546,9 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
 
 /// One lease or lease-yield comment row as read off the forge (NDJSON).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LeaseRow {
-    pub(crate) updated_at: DateTime<Utc>,
-    pub(crate) body: String,
+pub struct LeaseRow {
+    pub updated_at: DateTime<Utc>,
+    pub body: String,
 }
 
 /// Parse the `gh api --paginate --jq` NDJSON of leg 3's read (one
@@ -556,7 +556,7 @@ pub(crate) struct LeaseRow {
 /// `--paginate` would corrupt, #4637). Malformed lines are dropped rather
 /// than failing the batch, mirroring `SweepRegistry::parse_lease_comments_json`.
 #[must_use]
-pub(crate) fn parse_lease_rows(ndjson: &str) -> Vec<LeaseRow> {
+pub fn parse_lease_rows(ndjson: &str) -> Vec<LeaseRow> {
     ndjson
         .lines()
         .filter_map(|line| {
@@ -589,25 +589,63 @@ fn parse_yield_marker_line(body: &str) -> Option<(String, String)> {
 /// ([`crate::claim_reconciliation::lease_is_fresh`]'s TTL semantics —
 /// `LOOM_LEASE_TTL_MINUTES`, default 15), trusted (the caller already
 /// filtered), and not excluded by a matching `loom:lease-yield` (#5331/
-/// #6485: a yielded claimant already stood down). Pure.
+/// #6485: a yielded claimant already stood down) and not published by the
+/// caller's own sweep (`own_sweep`, #11635: the sweep pre-flight publishes the
+/// lease before its Builder runs this guard, so it is not a peer's claim).
+/// Pure.
 #[must_use]
 pub(crate) fn freshest_live_lease(
     rows: &[LeaseRow],
     now: DateTime<Utc>,
     ttl_minutes: f64,
+    own_sweep: Option<&str>,
 ) -> Option<(String, String)> {
+    live_leases_by_freshness(rows, now, ttl_minutes)
+        .into_iter()
+        .find(|(_, sweep)| own_sweep != Some(sweep.as_str()))
+}
+
+/// Every distinct live `(host, sweep)` among `rows`, freshest first: the
+/// same freshness and yield rules as [`freshest_live_lease`], for a reader
+/// that has to set its own claimant aside before asking whether anyone else
+/// holds one (the Doctor's activity guard, #12105). Pure.
+#[must_use]
+pub fn live_leases_by_freshness(
+    rows: &[LeaseRow],
+    now: DateTime<Utc>,
+    ttl_minutes: f64,
+) -> Vec<(String, String)> {
     let yielded: std::collections::BTreeSet<(String, String)> = rows
         .iter()
         .filter_map(|r| parse_yield_marker_line(&r.body))
         .collect();
-    rows.iter()
+    let mut live: Vec<(DateTime<Utc>, (String, String))> = rows
+        .iter()
         .filter(|r| crate::claim_reconciliation::lease_is_fresh(r.updated_at, now, ttl_minutes))
         .filter_map(|r| {
             SweepRegistry::parse_lease_marker_line(&r.body).map(|pair| (r.updated_at, pair))
         })
         .filter(|(_, pair)| !yielded.contains(pair))
-        .max_by_key(|(updated_at, _)| *updated_at)
+        .collect();
+    // Ascending then reversed, so among equal stamps the later row comes
+    // first: exactly the one `max_by_key` picked before this was shared.
+    live.sort_by_key(|(updated_at, _)| *updated_at);
+    live.reverse();
+    let mut seen = std::collections::BTreeSet::new();
+    live.into_iter()
         .map(|(_, pair)| pair)
+        .filter(|pair| seen.insert(pair.clone()))
+        .collect()
+}
+
+/// The `gh api --paginate --jq` filter for an issue's lease and lease-yield
+/// comments, author attached for the trust filter: the one read leg 3 makes,
+/// shared with the Doctor's activity guard (#12105).
+#[must_use]
+pub fn issue_lease_comments_jq() -> String {
+    format!(
+        r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
+    )
 }
 
 /// Leg 3: read the issue's lease and lease-yield comments (one round trip,
@@ -624,9 +662,7 @@ pub(crate) fn read_freshest_live_lease(
 ) -> LeaseLeg {
     // #10089: counted via the facade (`claim.lease_comments`); it applies the
     // #5401 GH_CONFIG_DIR and the #8263 `LOOM_REPO` -> GH_REPO env contract.
-    let jq = format!(
-        r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
-    );
+    let jq = issue_lease_comments_jq();
     // W4-C: the lease being checked may be the caller's own, just written.
     let inv = crate::claim_reconciliation::gh_call::read("claim.lease_comments", gh_bin, root)
         .writer_identity()
@@ -647,7 +683,10 @@ pub(crate) fn read_freshest_live_lease(
     // neither block a claim here nor excuse a peer's live lease.
     let policy = TrustPolicy::for_root(root);
     let rows = parse_lease_rows(&String::from_utf8_lossy(&policy.trusted_ndjson(&out.stdout)));
-    match freshest_live_lease(&rows, now, ttl_minutes) {
+    let own_sweep = std::env::var("LOOM_SWEEP_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    match freshest_live_lease(&rows, now, ttl_minutes, own_sweep.as_deref()) {
         Some((host, sweep_id)) => LeaseLeg::Held { host, sweep_id },
         None => LeaseLeg::NoneFresh,
     }
@@ -1087,17 +1126,30 @@ mod tests {
             mk(2, "freshest-host", "freshest-sweep", 4, false),
         ];
         assert_eq!(
-            freshest_live_lease(&rows, now, ttl),
+            freshest_live_lease(&rows, now, ttl, None),
             Some(("freshest-host".to_string(), "freshest-sweep".to_string()))
+        );
+
+        // #11635: the caller's own sweep is not a blocker, even when its lease
+        // is the newest row; a peer's older live lease is still found.
+        assert_eq!(
+            freshest_live_lease(&rows, now, ttl, Some("freshest-sweep")),
+            Some(("live-host".to_string(), "live-sweep".to_string()))
+        );
+        let own_only = vec![mk(1, "h", "mine", 7, false)];
+        assert_eq!(freshest_live_lease(&own_only, now, ttl, Some("mine")), None);
+        assert_eq!(
+            freshest_live_lease(&own_only, now, ttl, Some("other")),
+            Some(("h".to_string(), "mine".to_string()))
         );
 
         // The yielded row alone: not a live lease even though fresh.
         let yielded_only = vec![mk(1, "y-host", "y-sweep", 5, true)];
-        assert_eq!(freshest_live_lease(&yielded_only, now, ttl), None);
+        assert_eq!(freshest_live_lease(&yielded_only, now, ttl, None), None);
 
         // Exactly at the TTL boundary is NOT fresh (age < ttl is the rule).
         let boundary = vec![mk(15, "b-host", "b-sweep", 6, false)];
-        assert_eq!(freshest_live_lease(&boundary, now, ttl), None);
+        assert_eq!(freshest_live_lease(&boundary, now, ttl, None), None);
     }
 
     #[test]

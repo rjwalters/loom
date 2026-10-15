@@ -2480,6 +2480,7 @@ where
                         );
                     }
                     was_rate_limited = true;
+                    tick_summary::publish_rate_limit_skip(now); // #12083
                     continue;
                 }
                 was_rate_limited = false;
@@ -2932,6 +2933,7 @@ pub fn spawn_multi_work_finder_task(
                         );
                     }
                     was_rate_limited = true;
+                    tick_summary::publish_rate_limit_skip(now); // #12083
                     continue;
                 }
                 was_rate_limited = false;

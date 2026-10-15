@@ -404,7 +404,14 @@ pub(super) async fn supervise(
                      recorded agents.",
                     crate::ipc::drain_exit_code(true)
                 );
-                crate::observability::shutdown::exit(crate::ipc::drain_exit_code(true)).await;
+                crate::observability::shutdown::exit(
+                    crate::ipc::drain_exit_code(true),
+                    crate::observability::daemon_exit::ExitCause::Drain {
+                        then_exit: true,
+                        origin: crate::ipc::drain_state::DrainOrigin::Operator,
+                    },
+                )
+                .await;
             }
             let sup = crate::restart_verify::detect_and_spawn_verifier(std::process::id());
             log::warn!(
@@ -412,7 +419,14 @@ pub(super) async fn supervise(
                  {sup}-supervised relaunch onto the staged binary",
                 crate::ipc::drain_exit_code(false)
             );
-            crate::observability::shutdown::exit(crate::ipc::drain_exit_code(false)).await;
+            crate::observability::shutdown::exit(
+                crate::ipc::drain_exit_code(false),
+                crate::observability::daemon_exit::ExitCause::Drain {
+                    then_exit: false,
+                    origin: crate::ipc::drain_state::DrainOrigin::PauseRoll,
+                },
+            )
+            .await;
         }
         H4Outcome::StoodDown { promoted: true } => {
             // Rule 1 of the operator interplay: the drain is now an operator

@@ -127,6 +127,67 @@ fn gateway_collector_keeps_every_role_failure_attribute() {
     }
 }
 
+/// #12028: `role_tick.outcome` is a log record; the same key must survive the
+/// gateway's log `keep_keys`.
+#[test]
+fn gateway_collector_keeps_the_failure_class_on_log_records() {
+    let mut in_log = false;
+    let mut kept = false;
+    for line in COLLECTOR_CONFIG.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("- context:") {
+            in_log = rest.trim() == "log";
+        }
+        if in_log && trimmed.contains("keep_keys(") {
+            kept |= trimmed.contains(&format!("\"{FAILURE_CLASS}\""));
+        }
+    }
+    assert!(kept, "collector log keep_keys lacks {FAILURE_CLASS}");
+}
+
+#[test]
+fn every_pre_launch_site_has_its_own_bounded_non_fallback_class() {
+    let mut seen = std::collections::BTreeSet::new();
+    for site in pre_launch::ALL {
+        assert!(!site.class.starts_with("unclassified"), "{}", site.class);
+        assert!(
+            site.class
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'-'),
+            "{} is not kebab-case",
+            site.class
+        );
+        assert!(seen.insert(site.class), "duplicate class {}", site.class);
+        let failure = RoleFailure::new(site.class, None, site.message);
+        assert!(failure.message().len() <= 256);
+        assert!(!failure.message().chars().any(char::is_control));
+    }
+}
+
+#[test]
+fn a_tick_refused_before_launch_returns_the_class_its_site_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, trace, unlaunched) =
+        super::super::role_invocation_classified(dir.path(), "judge", || {
+            pre_launch::note(pre_launch::WRITE_SCOPE_REFUSED);
+            RoleTickOutcome::Failure("write scope refused".into())
+        });
+    assert!(matches!(outcome, RoleTickOutcome::Failure(_)));
+    assert!(trace.is_none(), "a pre-launch refusal journals no span");
+    assert_eq!(unlaunched.as_ref().map(RoleFailure::class), Some("write-scope-refused"));
+
+    let (_, _, unnoted) = super::super::role_invocation_classified(dir.path(), "judge", || {
+        RoleTickOutcome::Failure("no site noted".into())
+    });
+    assert_eq!(unnoted.as_ref().map(RoleFailure::class), Some(UNCLASSIFIED_PRE_LAUNCH));
+
+    let (_, _, skip) = super::super::role_invocation_classified(dir.path(), "judge", || {
+        pre_launch::note(pre_launch::WRITE_SCOPE_REFUSED);
+        RoleTickOutcome::QueueEmpty
+    });
+    assert_eq!(skip, None, "a skip carries no failure class");
+}
+
 mod role_invocation_close {
     use super::super::super::{
         role_child_exited, role_child_spawned, role_command, role_invocation, RoleTrace,
