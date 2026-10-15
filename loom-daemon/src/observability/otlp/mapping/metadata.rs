@@ -67,6 +67,58 @@ fn row(values: Vec<KeyValue>) -> AnyValue {
     }
 }
 
+/// `role_tick.outcome`'s #12029 facts (found work, verdicts, a step's own
+/// class). An unobserved fact is an absent attribute; free text is bounded.
+pub(super) fn tick_observed(o: &crate::telemetry::RoleTickObserved) -> Vec<KeyValue> {
+    let mut attrs = Vec::new();
+    if let Some(found) = o.found_work {
+        attrs.push(kv(
+            "loom.found_work",
+            AnyValue {
+                value: Some(any_value::Value::BoolValue(found)),
+            },
+        ));
+    }
+    let strings = [
+        ("loom.noop_reason", &o.noop_reason),
+        ("loom.head_sha", &o.head_sha),
+        ("loom.judge_verdict", &o.verdict),
+        ("loom.step.class", &o.step_class),
+        ("loom.step.reason", &o.step_reason),
+    ];
+    for (key, value) in strings {
+        if let Some(value) = value.as_deref().filter(|v| text(v)) {
+            attrs.push(kv_string(key, value));
+        }
+    }
+    if let Some(pr) = o.pr_number.and_then(|n| i64::try_from(n).ok()) {
+        attrs.push(kv_int("loom.pr_number", pr));
+    }
+    if let Some(verdicts) = o.verdicts.as_deref() {
+        if !verdicts.is_empty()
+            && verdicts.len() <= MAX_GROUPS
+            && verdicts
+                .iter()
+                .all(|v| text(&v.head_sha) && text(&v.verdict))
+        {
+            attrs.push(array(
+                "loom.tick_verdicts",
+                verdicts
+                    .iter()
+                    .map(|v| {
+                        row(vec![
+                            kv_int("pr_number", i64::try_from(v.pr_number).unwrap_or(0)),
+                            kv_string("head_sha", v.head_sha.clone()),
+                            kv_string("verdict", v.verdict.clone()),
+                        ])
+                    })
+                    .collect(),
+            ));
+        }
+    }
+    attrs
+}
+
 /// `sweep.started`'s dispatch facts (#11280), under `sweep.outcome`'s key
 /// names. An absent fact is an absent attribute.
 pub(super) fn start_facts(facts: &SweepStartFacts) -> Vec<KeyValue> {

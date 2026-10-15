@@ -114,7 +114,7 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
             | "doctor-route"
             | "doctor-clear"
     ) {
-        return Err(invalid("usage: sweep-checkpoint doctor-attempt ISSUE|- --pr N --head SHA --runtime RT [--profile P] [--kind fix|rebase]; doctor-rejection ISSUE|- --pr N --head SHA; doctor-route ISSUE|- --pr N --attempt A --cap C; doctor-clear ISSUE|- --pr N; write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; begin ISSUE ROLE [--attempt N] [--model M]; read/phase/attempt/model/exists ISSUE; delete ISSUE [--pr P]; list"));
+        return Err(invalid("usage: sweep-checkpoint doctor-attempt ISSUE|- --pr N --head SHA --runtime RT [--profile P] [--kind fix|rebase]; doctor-rejection ISSUE|- --pr N --head SHA; doctor-route ISSUE|- --pr N --attempt A --cap C; doctor-clear ISSUE|- --pr N; write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; begin ISSUE ROLE [--attempt N] [--model M] [--pr-number N]; read/phase/attempt/model/exists ISSUE; delete ISSUE [--pr P]; list"));
     }
     let issue_text = args.get(1).ok_or_else(|| invalid("issue is required"))?;
     if let Some(verb) = command.strip_prefix("doctor-") {
@@ -132,8 +132,10 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
     if command == "begin" {
         // Telemetry only (#9935): the checkpoint file, which drives resume,
         // is never read or written, and tracing stays best effort.
-        let (role, attempt, model) = parse_begin(&args[2..])?;
-        loom_daemon::observability::lifecycle::checkpoint_begun(root, issue, role, attempt, model);
+        let (role, attempt, model, pr) = parse_begin(&args[2..])?;
+        loom_daemon::observability::lifecycle::checkpoint_begun(
+            root, issue, role, attempt, model, pr,
+        );
         return Ok(());
     }
     if command == "write" {
@@ -262,13 +264,15 @@ fn model_value(value: &str) -> Result<&str> {
     }
 }
 
-/// `sweep-checkpoint begin ISSUE ROLE [--attempt N] [--model M]` (#9935).
-fn parse_begin(args: &[String]) -> Result<(&str, Option<u32>, Option<&str>)> {
+/// `sweep-checkpoint begin ISSUE ROLE [--attempt N] [--model M] [--pr-number N]`
+/// (#9935, `--pr-number` #12029).
+#[allow(clippy::type_complexity)]
+fn parse_begin(args: &[String]) -> Result<(&str, Option<u32>, Option<&str>, Option<u32>)> {
     let role = args.first().map(String::as_str).unwrap_or("");
     if !matches!(role, "curator" | "builder" | "judge" | "doctor" | "merge") {
         return Err((2, format!("invalid role '{role}'")));
     }
-    let (mut attempt, mut model) = (None, None);
+    let (mut attempt, mut model, mut pr) = (None, None, None);
     let mut options = args[1..].iter();
     while let Some(flag) = options.next() {
         let value = options
@@ -279,10 +283,12 @@ fn parse_begin(args: &[String]) -> Result<(&str, Option<u32>, Option<&str>)> {
             "--attempt" => attempt = Some(attempt_value(value)?),
             "--model" if value.is_empty() => {}
             "--model" => model = Some(model_value(value)?),
+            "--pr-number" if value.is_empty() || value == "null" => {}
+            "--pr-number" => pr = Some(number(value)?),
             _ => return Err(invalid("unknown option")),
         }
     }
-    Ok((role, attempt, model))
+    Ok((role, attempt, model, pr))
 }
 
 fn persist(dir: &Path, target: &Path, record: &Value) -> Result<()> {

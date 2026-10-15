@@ -130,6 +130,26 @@ pub fn tick_outcome(end: StepEnd, line: Option<&StepOutcomeLine>) -> RoleTickOut
     }
 }
 
+/// The step's own outcome class and reason as the additive `role_tick.outcome`
+/// fields (#12029). `None` (no line) stays absent; `noop` is also the
+/// Judge's `found_work=false` with the session's own reason. Pure.
+#[must_use]
+pub fn step_observed(line: Option<&StepOutcomeLine>) -> crate::telemetry::RoleTickObserved {
+    let Some(line) = line else {
+        return crate::telemetry::RoleTickObserved::default();
+    };
+    let reason = (!line.reason.is_empty()).then(|| line.reason.clone());
+    let noop_judge = line.role == "judge" && line.class == StepOutcomeClass::Noop;
+    crate::telemetry::RoleTickObserved {
+        step_class: Some(line.class.as_str().to_string()),
+        step_reason: reason.clone(),
+        found_work: (line.role == "judge").then_some(!noop_judge),
+        noop_reason: noop_judge.then(|| reason.unwrap_or_else(|| "noop".to_string())),
+        pr_number: (line.role == "judge").then_some(u64::from(line.target)),
+        ..crate::telemetry::RoleTickObserved::default()
+    }
+}
+
 /// Everything the end-of-step emit needs, read out of the registry.
 #[derive(Debug, Clone)]
 pub(crate) struct StepCapture {
@@ -140,6 +160,9 @@ pub(crate) struct StepCapture {
     pub(crate) outcome: RoleTickOutcome,
     pub(crate) model: String,
     pub(crate) effort: String,
+    /// The session's own outcome class/reason (#12029); `result` still
+    /// follows [`tick_outcome`].
+    pub(crate) observed: crate::telemetry::RoleTickObserved,
 }
 
 /// Emit the role tick's capture for one finished step: its journal drained
@@ -156,6 +179,7 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
         &capture.outcome,
         Some(crate::role_tick_telemetry::ResolvedLaunch::new(&capture.model, &capture.effort)),
         &capture.sweep_id,
+        capture.observed.clone(),
     );
 }
 
@@ -217,6 +241,7 @@ impl SweepRegistry {
             outcome: tick_outcome(end, line.as_ref()),
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
+            observed: step_observed(line.as_ref()),
         };
         // Hermetic fixtures (no forge) keep their tests free of the detached
         // transcript scan; the capture itself is tested directly.

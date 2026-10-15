@@ -135,7 +135,7 @@ pub(crate) fn verdict_reconcile(
 }
 
 /// `forge verdict-labels`.
-pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
+pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&str>) -> Result<()> {
     let kind = verdict_or_exit("verdict-labels", verdict);
     let root = super::forge_identity_cmd::workspace();
     let (add, remove) = gate::transition(kind);
@@ -174,6 +174,12 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
         None => vec!["the labels could not be re-read to verify the transition".to_string()],
     };
     if problems.is_empty() {
+        // #12029: hand the verified verdict back for telemetry. Local files
+        // only; never changes what this command prints or returns.
+        if let Some(sha) = sha {
+            loom_daemon::observability::lifecycle::verdict_handoff::record(pr, sha, verdict);
+            loom_daemon::observability::pick_journal::record_verdict(pr, sha, verdict);
+        }
         println!("{} OK {}", gate::LABELS_SENTINEL, add.join(","));
         return Ok(());
     }

@@ -355,6 +355,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(usage) = metadata::usage(r.tokens_by_model.as_deref()) {
                 attributes.push(usage);
             }
+            attributes.extend(metadata::tick_observed(&r.observed));
             if let Some(actions) = &r.actions {
                 attributes
                     .push(kv_int("loom.actions.issues_labeled", i64::from(actions.issues_labeled)));

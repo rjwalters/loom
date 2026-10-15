@@ -328,6 +328,7 @@ worktree-contains open -
 worktree-preserve open -
 discovered-worktree open -
 retries-used open -
+record-result open -
 pr-state open -
 poll-wait open -
 merge-route open -

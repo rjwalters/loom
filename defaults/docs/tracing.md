@@ -182,7 +182,7 @@ Phase timing has three explicit forms, distinguished by `loom.timing_source`
 - **Begun sweep phase** (`checkpoint_begin_observed`, #9935): a role performed
   as a subagent inside one orchestrator CLI session — every `/loom:sweep`
   curator, builder, judge, doctor and merge phase — is opened at its dispatch
-  instant by `sweep-checkpoint begin ISSUE ROLE [--attempt N] [--model M]`.
+  instant by `sweep-checkpoint begin ISSUE ROLE [--attempt N] [--model M] [--pr-number P]`.
   That call is telemetry only: it never reads or writes the checkpoint file, so
   resume (which keys on the file's `phase`) is unaffected. The phase's later
   `*-done`/`judge-rejected` write completes the same attempt, which closes as
@@ -192,6 +192,20 @@ Phase timing has three explicit forms, distinguished by `loom.timing_source`
   the same phase closes the earlier still-open begin as `loom.result=superseded`
   (`worked` absent); a begin never followed by its checkpoint is closed at
   execution end as `exit_unobserved` / `terminal_observed` (`worked` absent).
+  A Judge checkpoint's `loom.judge_verdict` (`approved` / `changes_requested`)
+  and `loom.head_sha` are the verdict `post-verdict.sh` wrote for that PR,
+  handed back by `forge verdict-labels --sha` (#12029) — never derived from the
+  checkpoint phase; with no handoff they are absent. A `merge` attempt begun
+  with `--pr-number` is closed by `merge-pr.sh` through `loom-daemon merge-pr
+  record-result` with `loom.pr_number`, `loom.head_sha`, `loom.result`
+  (`merged` / `refused` / `failed`), `loom.exit_code` and `loom.merge.reason`,
+  so in the normal case it no longer ends `exit_unobserved`.
+- **Role-runner Judge ticks** (#12029): a spawned Judge `loom.role_attempt`
+  always carries `loom.found_work` (`true` when the tick won a claim, was
+  assigned a PR or wrote a verdict, else `false` with `loom.noop_reason`,
+  `no_claim_no_verdict`), and, when it wrote a verdict, `loom.judge_verdict`,
+  `loom.head_sha` and `loom.pr_number` (the newest verdict's PR). Sum the
+  duration of `loom.found_work=false` spans per repo for idle agent-hours.
 - **Completion only** (`checkpoint_write_observed` / `checkpoint_poll_observed`):
   a checkpoint with no observed start — an older orchestrator prompt or binary
   without `begin`, a phase skipped without a dispatch (e.g. an already-curated

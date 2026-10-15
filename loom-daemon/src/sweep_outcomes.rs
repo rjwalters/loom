@@ -1192,6 +1192,7 @@ mod tests {
                 actions: None,
                 source: None,
                 sweep_id: None,
+                observed: Default::default(),
             }),
         )
     }

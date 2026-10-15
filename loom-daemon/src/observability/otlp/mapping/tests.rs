@@ -14,6 +14,7 @@ mod host_name;
 mod loom_kind;
 mod record_id;
 mod start_facts;
+mod tick_observed;
 use crate::telemetry::{
     HostHealthRecord, MemoryPressureSummary, PhaseDuration, RoleTickResult, SweepCompletedRecord,
     SweepDisposition, SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
@@ -934,6 +935,7 @@ fn role_tick_outcome_envelope(
             actions: None,
             source: None,
             sweep_id: None,
+            observed: Default::default(),
         }),
     )
 }

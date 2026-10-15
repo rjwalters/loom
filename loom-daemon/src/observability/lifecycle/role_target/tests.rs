@@ -135,4 +135,78 @@ mod role_invocation_close {
         let pr = pr_on_root_span(dir.path(), || launch());
         assert_eq!(pr, None, "an earlier tick's note never describes this one");
     }
+
+    fn root_span(
+        root: &std::path::Path,
+        run: impl FnOnce(),
+    ) -> (crate::observability::lifecycle::RoleTrace, crate::telemetry::trace::SpanRecord) {
+        let (_, trace) = role_invocation(root, "judge", || {
+            run();
+            RoleTickOutcome::Success
+        });
+        let trace = trace.unwrap();
+        let store = TraceStore::new(root);
+        let journal = Journal::for_context(&store.path(root, &trace.execution));
+        let mut spans = Vec::new();
+        journal
+            .drain(|s| {
+                spans.push(s);
+                Ok(())
+            })
+            .unwrap();
+        let span = spans
+            .into_iter()
+            .find(|s| s.context == trace.context)
+            .unwrap();
+        (trace, span)
+    }
+
+    /// #12029: a spawned Judge tick that claimed nothing and wrote no verdict
+    /// says so explicitly; a claim only is found work without a verdict; a
+    /// handed-back verdict names its PR, head and verdict (all the exported
+    /// allowlist keeps).
+    #[test]
+    #[serial_test::serial]
+    fn a_judge_tick_records_whether_it_found_work() {
+        let dir = traced_root();
+        let (trace, span) = root_span(dir.path(), launch);
+        assert_eq!(span.attributes["loom.found_work"], "false");
+        assert_eq!(span.attributes["loom.noop_reason"], "no_claim_no_verdict");
+        assert_eq!(trace.observed.found_work, Some(false));
+        assert!(!span.attributes.contains_key("loom.judge_verdict"));
+        let kept = span.clone().bounded().attributes;
+        assert_eq!(kept["loom.found_work"], "false");
+
+        let (trace, span) = root_span(dir.path(), || {
+            note_prompt("judge", "/loom:judge 31");
+            launch();
+        });
+        assert_eq!(span.attributes["loom.found_work"], "true");
+        assert_eq!(span.attributes["loom.pr_number"], "31");
+        assert!(!span.attributes.contains_key("loom.noop_reason"));
+        assert_eq!(trace.observed.verdict, None);
+
+        let root = dir.path().to_path_buf();
+        let (trace, span) = root_span(dir.path(), || {
+            let mut command = Command::new("sh");
+            let sh = format!(
+                "echo '{{\"pr_number\":5,\"head_sha\":\"aaaaaaa\",\"verdict\":\"changes_requested\",\"at\":\"2026-10-15T00:00:00Z\"}}' > \"${{{PR_FILE_ENV}%.pr}}.verdicts\"; echo '{{\"pr_number\":6,\"head_sha\":\"bbbbbbb\",\"verdict\":\"approved\",\"at\":\"2026-10-15T00:01:00Z\"}}' >> \"${{{PR_FILE_ENV}%.pr}}.verdicts\""
+            );
+            command.args(["-c", &sh]);
+            let execution = role_command(&mut command).unwrap();
+            export(&mut command, &root, &execution);
+            std::fs::create_dir_all(root.join(".loom/state/role-target")).unwrap();
+            let mut child = command.spawn().unwrap();
+            role_child_spawned(child.id());
+            child.wait().unwrap();
+            role_child_exited("success");
+        });
+        assert_eq!(span.attributes["loom.found_work"], "true");
+        assert_eq!(span.attributes["loom.judge_verdict"], "approved");
+        assert_eq!(span.attributes["loom.head_sha"], "bbbbbbb");
+        assert_eq!(span.attributes["loom.pr_number"], "6");
+        let verdicts = trace.observed.verdicts.unwrap();
+        assert_eq!(verdicts.len(), 2, "both verdicts reach role_tick.outcome");
+        assert_eq!(verdicts[0].verdict, "changes_requested");
+    }
 }

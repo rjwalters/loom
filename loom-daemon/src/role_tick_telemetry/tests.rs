@@ -24,6 +24,7 @@ fn tick(result: RoleTickResult) -> RoleTickTelemetry {
         preference_tap: None,
         role_draw: None,
         step_sweep_id: None,
+        observed: Default::default(),
     }
 }
 

@@ -247,6 +247,11 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.effort"
                     | "loom.doctor_cycles"
                     | "loom.judge_verdict"
+                    // Issue #12029: found-work signal, head and merge result.
+                    | "loom.found_work"
+                    | "loom.noop_reason"
+                    | "loom.head_sha"
+                    | "loom.merge.reason"
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"

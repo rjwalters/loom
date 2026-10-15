@@ -492,6 +492,7 @@ pub fn checkpoint_begun(
     role: &str,
     attempt: Option<u32>,
     model: Option<&str>,
+    pr: Option<u32>,
 ) {
     let primary = checkpoint_workspace(root);
     let root = primary.as_path();
@@ -509,9 +510,11 @@ pub fn checkpoint_begun(
         role,
         attempt,
         model,
+        pr,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checkpoint_begin_observation(
     journal: &Journal,
     root: &TraceContext,
@@ -520,6 +523,7 @@ fn checkpoint_begin_observation(
     role: &str,
     attempt: Option<u32>,
     model: Option<&str>,
+    pr: Option<u32>,
 ) -> Option<ActiveSpan> {
     if !CHECKPOINT_ROLES.contains(&role) {
         return None;
@@ -538,6 +542,8 @@ fn checkpoint_begin_observation(
     if let Some(model) = model {
         metadata.insert("loom.configured_model".into(), model.into());
     }
+    // #12029: a merge/judge/doctor attempt names its PR from its start.
+    merge_result::stamp_pr(&mut metadata, pr);
     let at = Utc::now();
     let active = journal.active().ok()?;
     metadata.extend(execution_scope(&active, root));
@@ -677,17 +683,7 @@ fn checkpoint_observation(
     // The owned-start branch below overwrites this with `true`: there the
     // checkpoint completes an attempt whose begin Loom itself recorded.
     insert_worked(&mut metadata, Some(!SYNTHETIC_TIMING_SOURCES.contains(&source)));
-    if role == "judge" {
-        metadata.insert(
-            "loom.judge_verdict".into(),
-            if result == "success" {
-                "approved"
-            } else {
-                "rejected"
-            }
-            .into(),
-        );
-    }
+    verdict_handoff::stamp_checkpoint(&mut metadata, journal, role, pr);
     if let Some(attempt) = attempt {
         metadata.insert("loom.attempt".into(), attempt.to_string());
     }
@@ -837,6 +833,8 @@ pub fn finish_execution(
     let store = TraceStore::new(root);
     let saved = TraceStore::load(&store.path(root, execution)).ok()?;
     let journal = Journal::for_context(&store.path(root, execution));
+    // #12029: a sweep's verdict handoff lives only as long as its execution.
+    verdict_handoff::remove_for(&store.path(root, execution));
     // Host memory state at the moment this call records the terminal close,
     // attached to every span the call actually closes — the observed root and
     // any child runtime span whose exit Loom did not observe separately
@@ -1148,6 +1146,9 @@ pub struct RoleTrace {
     /// Why the tick failed, when it did (#10640) — the same class, code and
     /// message its root span closed with, for the story copies.
     pub failure: Option<RoleFailure>,
+    /// What a spawned Judge tick found and decided (#12029); default for any
+    /// other role.
+    pub observed: crate::telemetry::RoleTickObserved,
 }
 
 /// Run one role tick under its `loom.role_attempt` root span — **if it
@@ -1179,16 +1180,19 @@ pub fn role_invocation(
     let drawn = role_draw::take();
     let resumed_from = roll_interruption::take_resumed_from();
     let pr = role_target::take().or_else(|| role_target::take_handoff(root, &execution));
+    let verdicts = verdict_handoff::take_tick(root, &execution);
     let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
         return (outcome, None);
     };
     let roll = roll_interruption::stopped(&span);
+    let observed = verdict_handoff::observation_for(role, pr, &verdicts);
     let failure = role_failure::for_outcome(&outcome, noted).filter(|_| roll.is_none());
     let trace = Some(RoleTrace {
         context: span.context().clone(),
         execution: execution.clone(),
         started_at: span.active.record.started_at,
         failure: failure.clone(),
+        observed: observed.clone(),
     });
     let (result, _) = crate::role_tick_telemetry::classify(&outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -1210,6 +1214,7 @@ pub fn role_invocation(
     if let Some(pr) = pr {
         close.insert(role_target::PR_NUMBER.into(), pr.to_string());
     }
+    close.extend(verdict_handoff::span_attributes(&observed));
     let result = roll.map_or(result, |roll| {
         roll.apply(&mut close);
         roll_interruption::RESULT.to_owned()
@@ -1218,10 +1223,12 @@ pub fn role_invocation(
     (outcome, trace)
 }
 
+pub mod merge_result;
 pub mod role_draw;
 mod role_failure;
 pub mod role_target;
 pub mod roll_interruption;
+pub mod verdict_handoff;
 pub use role_failure::{
     note_role_failure, RoleFailure, EXIT_CODE, FAILURE_CLASS, ROLE_FAILURE_ATTRIBUTE_KEYS,
     UNCLASSIFIED,

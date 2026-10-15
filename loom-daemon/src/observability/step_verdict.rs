@@ -17,8 +17,8 @@
 //! # Projections
 //!
 //! A role registers a projection ([`projector`]): the evidence about one
-//! item to a closed, versioned `(class, reason)`. This change registers
-//! `champion` only ([`champion`]); other roles add theirs (#12029).
+//! item to a closed, versioned `(class, reason)`: `champion` ([`champion`],
+//! #12027) and `judge` ([`judge`], #12029).
 //!
 //! # The ledger's view, record-only
 //!
@@ -59,6 +59,7 @@ use crate::telemetry::kinds::pass::{PassMode, PassVerdictRecord, StepFacts};
 use crate::telemetry::provenance::Provenance;
 
 pub mod champion;
+pub mod judge;
 pub mod refusals;
 
 use refusals::{Observed, RefusalStore};
@@ -146,6 +147,7 @@ pub struct Projector {
 pub fn projector(role: &str) -> Option<Projector> {
     match role {
         "champion" => Some(champion::PROJECTOR),
+        "judge" => Some(judge::PROJECTOR),
         _ => None,
     }
 }

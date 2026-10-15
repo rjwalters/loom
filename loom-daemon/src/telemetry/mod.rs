@@ -1261,6 +1261,54 @@ pub struct RoleTickOutcomeRecord {
     /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_id: Option<String>,
+    /// What the tick found and decided (#12029) — see [`RoleTickObserved`].
+    #[serde(flatten)]
+    pub observed: RoleTickObserved,
+}
+
+/// One verdict a Judge tick wrote, as `post-verdict.sh` →
+/// `forge verdict-labels --sha` handed it back (#12029): the PR, the head it
+/// was written against and the marker's vocabulary in snake_case
+/// (`approved` / `changes_requested`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleTickVerdict {
+    pub pr_number: u64,
+    pub head_sha: String,
+    pub verdict: String,
+}
+
+/// The additive optional fields #12029 puts on `role_tick.outcome` (flattened
+/// into the record, so no `schema_version` bump). Every field is absent when
+/// not observed, never a default: `found_work` is set only on a spawned
+/// Judge tick, the step class/reason only on a step-sourced record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleTickObserved {
+    /// A spawned Judge tick won a claim, named a PR or wrote a verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found_work: Option<bool>,
+    /// Why `found_work` is `false`: the session's own `LOOM_STEP_OUTCOME`
+    /// reason, else the daemon-observed `no_claim_no_verdict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noop_reason: Option<String>,
+    /// The PR the tick worked (assigned, claimed, or the newest verdict's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    /// The head of the newest verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// The newest verdict (`approved` / `changes_requested`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    /// Every verdict the tick wrote, one per PR/head, oldest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdicts: Option<Vec<RoleTickVerdict>>,
+    /// A step's own `LOOM_STEP_OUTCOME` class (`verdict|noop|refused|failed`);
+    /// the record's `result` still follows `tick_outcome`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_class: Option<String>,
+    /// A step's own `LOOM_STEP_OUTCOME` reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_reason: Option<String>,
 }
 
 /// [`RoleTickOutcomeRecord::source`] of a step-engine step (#11906).

@@ -599,6 +599,32 @@ pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
     }
 }
 
+/// The marker token a verdict write journals under (#12029): the same
+/// `<!-- loom:verdict-sha sha=… verdict=… -->` the PR carries.
+pub const VERDICT_MARKER_KIND: &str = "loom:verdict-sha";
+
+/// Journal a verified Judge verdict on PR `number` as the marker the PR
+/// carries, pinned to the head it was written against (#12029). A no-op
+/// outside a journaled run and for an unknown verdict. Best-effort.
+pub fn record_verdict(number: u64, head_sha: &str, verdict: &str) {
+    if journal_path().is_none() {
+        return;
+    }
+    let (Ok(number), Some(token)) = (
+        u32::try_from(number),
+        matches!(verdict, "approved" | "changes-requested").then_some(verdict),
+    ) else {
+        return;
+    };
+    append(&JournalEntry::Marker {
+        at: Utc::now(),
+        number,
+        is_pr: true,
+        marker: format!("<!-- {VERDICT_MARKER_KIND} sha={head_sha} verdict={token} -->"),
+        head_sha: Some(head_sha.to_ascii_lowercase()),
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------

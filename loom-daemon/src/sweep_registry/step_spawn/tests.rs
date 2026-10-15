@@ -407,6 +407,7 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
         outcome: RoleTickOutcome::Success,
         model: "opus".into(),
         effort: "high".into(),
+        observed: Default::default(),
     });
     let journal = crate::sweep_outcomes::default_role_tick_telemetry_path(dir.path());
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
@@ -461,4 +462,24 @@ fn only_a_builder_step_names_its_item_as_the_owned_claim() {
         .unwrap_or_default();
     assert!(block.contains("LOOM_SWEEP_CLAIM_OWNED=unset"), "{block}");
     cancel_all(&mut reg);
+}
+
+/// #12029: a Judge step's `noop already_judged` line reaches the step-sourced
+/// record as class/reason and `found_work=false`, while `tick_outcome` still
+/// maps it to `Success`.
+#[test]
+fn a_judge_noop_line_is_observed_while_the_result_stays_success() {
+    use super::capture::{parse_outcome_line, step_observed, tick_outcome, StepEnd};
+    let line = parse_outcome_line(
+        "LOOM_STEP_OUTCOME role=judge target=77 class=noop reason=already_judged",
+    )
+    .unwrap();
+    let observed = step_observed(Some(&line));
+    assert_eq!(observed.step_class.as_deref(), Some("noop"));
+    assert_eq!(observed.step_reason.as_deref(), Some("already_judged"));
+    assert_eq!(observed.found_work, Some(false));
+    assert_eq!(observed.noop_reason.as_deref(), Some("already_judged"));
+    assert_eq!(observed.pr_number, Some(77));
+    assert_eq!(tick_outcome(StepEnd::Exited(Some(0)), Some(&line)), RoleTickOutcome::Success);
+    assert_eq!(step_observed(None), crate::telemetry::RoleTickObserved::default());
 }

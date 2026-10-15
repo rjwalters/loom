@@ -629,6 +629,7 @@ assert_eq "0" "$EXIT_CODE" "gate PROCEED + labels OK -> exit 0"
 CALLS="$(cat "$STUB_DIR/daemon-calls.log" 2>/dev/null || true)"
 assert_contains "$CALLS" "forge verdict-gate 300 --repo owner/repo --verdict approved --sha abc1234 --overrules-prior each prior point" "gate gets PR, repo, verdict, sha, overrule"
 assert_contains "$CALLS" "forge verdict-labels 300 --repo owner/repo --verdict approved" "label transition runs after the post"
+assert_contains "$CALLS" "forge verdict-labels 300 --repo owner/repo --verdict approved --sha abc1234" "the verdict write hands its head to verdict-labels for telemetry (#12029)"
 assert_contains "$CALLS" "forge verdict-lock acquire 300 --repo owner/repo" "the per-PR lock is taken before the gate"
 assert_contains "$CALLS" "forge verdict-lock release 300 --repo owner/repo" "the per-PR lock is released at exit"
 
@@ -705,6 +706,7 @@ run_pv 321 approved abc1234 --body "ok"
 assert_eq "7" "$EXIT_CODE" "superseded approval -> exit 7"
 assert_contains "$OUTPUT" "SUPERSEDED" "the loss is announced"
 assert_contains "$(cat "$STUB_DIR/daemon-calls.log")" "forge verdict-labels 321 --repo owner/repo --verdict changes-requested" "labels flipped to changes-requested"
+assert_eq "0" "$(grep -c 'forge verdict-labels 321 .*--sha' "$STUB_DIR/daemon-calls.log")" "a superseded approval hands no head back: it is never recorded as a verdict (#12029)"
 assert_contains "$(cat "$STUB_DIR/last-body.txt" 2>/dev/null || true)" "verdict=changes-requested" "a superseding changes-requested marker is posted"
 
 # The reconcile runs BEFORE the labels: an approval is never live while arbitration is pending.

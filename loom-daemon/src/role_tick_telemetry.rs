@@ -123,6 +123,9 @@ pub struct RoleTickTelemetry {
     /// The step's sweep id when a step-engine step, not a role tick, ran
     /// (#11906); the record then carries `source = "step"`.
     pub step_sweep_id: Option<String>,
+    /// What the tick found and decided (#12029): a Judge tick's found-work
+    /// signal, or a step's own outcome class/reason.
+    pub observed: crate::telemetry::RoleTickObserved,
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -281,7 +284,7 @@ pub fn emit_for_tick_correlated(
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
 ) {
-    emit_tick(root, role, started_at, outcome, resolved, trace, None);
+    emit_tick(root, role, started_at, outcome, resolved, trace, None, None);
 }
 
 /// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
@@ -294,10 +297,21 @@ pub fn emit_for_step(
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
     sweep_id: &str,
+    observed: crate::telemetry::RoleTickObserved,
 ) {
-    emit_tick(root, role, started_at, outcome, resolved, None, Some(sweep_id.to_string()));
+    emit_tick(
+        root,
+        role,
+        started_at,
+        outcome,
+        resolved,
+        None,
+        Some(sweep_id.to_string()),
+        Some(observed),
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_tick(
     root: &Path,
     role: &str,
@@ -306,7 +320,12 @@ fn emit_tick(
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
     step_sweep_id: Option<String>,
+    observed: Option<crate::telemetry::RoleTickObserved>,
 ) {
+    // #12029: a step carries its own class/reason; a tick, its trace's.
+    let observed = observed
+        .or_else(|| trace.as_ref().map(|t| t.observed.clone()))
+        .unwrap_or_default();
     // #10212: the gate listing this tick read, as a ranked `pick.decision`.
     crate::observability::pick_decision::emit_role_tick(
         root,
@@ -344,6 +363,7 @@ fn emit_tick(
             preference_tap: preference.map(|stamp| stamp.tap),
             role_draw,
             step_sweep_id,
+            observed,
         },
         trace,
     );
@@ -660,6 +680,7 @@ pub fn build_record(
             .as_ref()
             .map(|_| crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string()),
         sweep_id: tick.step_sweep_id.clone(),
+        observed: tick.observed.clone(),
     }
 }
 

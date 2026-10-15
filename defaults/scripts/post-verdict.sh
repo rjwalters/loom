@@ -544,7 +544,7 @@ case "$RC_RC:$RC_OUT" in
   *) printf 'post-verdict.sh: %s verdict on PR #%s posted, but the cross-host reconcile was unconfirmed (#10581): %s\n' "$VERDICT" "$PR" "${RC_OUT:0:300}" >&2
      [[ "$VERDICT" == "approved" ]] && { echo "The approval is NOT live (no loom:pr applied). Re-run this command; the gate dedupes the comment and retries the arbitration." >&2; exit 8; } ;; # changes-requested: labels below, the safe side
 esac
-VL_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-labels "$PR" --repo "$REPO" --verdict "$VERDICT" 2>&1)" || { printf 'post-verdict.sh: the %s verdict on PR #%s is posted, but its label transition did not complete (#10581):\n%s\nRe-run: loom-daemon forge verdict-labels %s --repo %s --verdict %s\n' "$VERDICT" "$PR" "$VL_OUT" "$PR" "$REPO" "$VERDICT" >&2; exit 8; }
+VL_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-labels "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" 2>&1)" || { printf 'post-verdict.sh: the %s verdict on PR #%s is posted, but its label transition did not complete (#10581):\n%s\nRe-run: loom-daemon forge verdict-labels %s --repo %s --verdict %s\n' "$VERDICT" "$PR" "$VL_OUT" "$PR" "$REPO" "$VERDICT" >&2; exit 8; }
 # Post-label re-arbitration (#10581): the reconcile above ran BEFORE the label
 # write, and another host can post a changes-requested verdict in between. Re-read
 # once the approval's labels are on: a rival that landed since then supersedes it

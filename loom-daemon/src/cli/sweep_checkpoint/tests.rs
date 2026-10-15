@@ -139,6 +139,11 @@ fn begin_is_telemetry_only_and_never_touches_the_checkpoint() {
     for role in ["curator", "builder", "judge", "doctor", "merge"] {
         invoke(dir.path(), &["begin", "42", role, "--attempt", "2", "--model", "opus"]).unwrap();
     }
+    // #12029: `--pr-number` is accepted (and `null`/empty read as absent) and
+    // is as telemetry-only as the rest.
+    invoke(dir.path(), &["begin", "42", "merge", "--pr-number", "7"]).unwrap();
+    invoke(dir.path(), &["begin", "42", "merge", "--pr-number", ""]).unwrap();
+    invoke(dir.path(), &["begin", "42", "merge", "--pr-number", "null"]).unwrap();
     assert_eq!(invoke(dir.path(), &["read", "42"]).unwrap(), before);
     assert_eq!(invoke(dir.path(), &["phase", "42"]).unwrap(), "curator-done\n");
     assert_eq!(
@@ -153,6 +158,7 @@ fn begin_is_telemetry_only_and_never_touches_the_checkpoint() {
         &["begin", "42", "builder", "--model", "a b"],
         &["begin", "42", "builder", "--task-id", "x"],
         &["begin", "42", "builder", "--attempt"],
+        &["begin", "42", "merge", "--pr-number", "x"],
         &["begin", "x", "builder"],
     ] {
         assert_eq!(invoke(dir.path(), bad).unwrap_err().0, 1, "{bad:?}");

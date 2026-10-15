@@ -28,6 +28,7 @@ fn facts(role: &str) -> TickFacts {
             execution,
             started_at,
             failure: None,
+            observed: Default::default(),
         },
         role: role.to_string(),
         ended_at: started_at + chrono::Duration::seconds(90),

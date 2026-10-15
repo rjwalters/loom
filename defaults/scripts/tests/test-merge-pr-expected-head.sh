@@ -196,6 +196,39 @@ assert_contains "$LAST_OUT" "the --expected-head pin forbids the #8164 retry" "p
 assert_contains "$LAST_OUT" "new head $SHA_B was never evaluated" "pinned: the refusal names the unevaluated head"
 assert_not_contains "$LAST_OUT" "already spent" "pinned: a first retry is never reported as an already-spent budget (#11902)"
 
+# ---------------------------------------------------------------------------
+echo "Part 6: the exit trap records the merge result once, never changing the exit code (#12029)"
+REC="$WORK/record.sh"
+{ grep -E '^_mp_record_result\(\) \{' "$MERGE_PR_SRC"; grep -E "^trap '_mp_record_result" "$MERGE_PR_SRC"; } > "$REC"
+if [[ $(wc -l < "$REC") -ne 2 ]]; then echo "FATAL: could not extract the record-result trap" >&2; exit 2; fi
+cat > "$WORK/rec-daemon" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$REC_LOG"
+exit "${REC_RC:-0}"
+STUB
+chmod +x "$WORK/rec-daemon"
+run_rec() { # <exit code> <dry-run> [daemon rc]
+    : > "$WORK/rec.log"
+    set +e
+    ( set -euo pipefail; PR_NUMBER=42; PR_HEAD_SHA="$SHA_A"; DRY_RUN="$2"
+      export REC_LOG="$WORK/rec.log" REC_RC="${3:-0}" LOOM_DAEMON_BIN="$WORK/rec-daemon"
+      # shellcheck disable=SC1090
+      source "$REC"; exit "$1" ) >/dev/null 2>&1
+    LAST_RC=$?
+    set -e
+    LAST_OUT="$(cat "$WORK/rec.log")"
+}
+run_rec 0 false;  assert_eq 0 "$LAST_RC" "success keeps exit 0";  assert_contains "$LAST_OUT" "merge-pr record-result --pr 42 --head $SHA_A --result merged --exit-code 0" "exit 0 records merged"
+run_rec 1 false;  assert_eq 1 "$LAST_RC" "failure keeps exit 1";  assert_contains "$LAST_OUT" "--result failed --exit-code 1" "exit 1 records failed"
+run_rec 3 false;  assert_eq 3 "$LAST_RC" "re-queue keeps exit 3"; assert_contains "$LAST_OUT" "--result refused --exit-code 3 --reason head-mismatch" "exit 3 records refused + head-mismatch"
+for rc in 4 5 7 8; do run_rec "$rc" false; assert_eq "$rc" "$LAST_RC" "exit $rc is preserved"; assert_contains "$LAST_OUT" "--result refused --exit-code $rc" "exit $rc records refused"; done
+assert_eq 1 "$(wc -l < "$WORK/rec.log")" "exactly one record per terminal path"
+run_rec 0 true;   assert_eq "" "$LAST_OUT" "dry-run records nothing"
+run_rec 5 false 9; assert_eq 5 "$LAST_RC" "a failing record-result never changes the exit code"
+( set +e; export REC_LOG="$WORK/rec.log" LOOM_DAEMON_BIN="$WORK/nonexistent"; : > "$WORK/rec.log"
+  PR_NUMBER=42; DRY_RUN=false; source "$REC"; exit 6 ) >/dev/null 2>&1 && MISSING_RC=0 || MISSING_RC=$?
+assert_eq 6 "$MISSING_RC" "a missing daemon is skipped, exit code kept"
+
 echo
 echo "Tests run: $TESTS_RUN, passed: $TESTS_PASSED, failed: $TESTS_FAILED"
 [[ $TESTS_FAILED -eq 0 ]]

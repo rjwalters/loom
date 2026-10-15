@@ -45,6 +45,7 @@ pub(super) fn role_tick_outcome() -> TelemetryRecord {
         }),
         source: None,
         sweep_id: None,
+        observed: Default::default(),
     })
 }
 
@@ -112,6 +113,7 @@ fn role_tick_outcome_omits_every_unobserved_field() {
         actions: None,
         source: None,
         sweep_id: None,
+        observed: Default::default(),
     };
     let value = serde_json::to_value(&record).unwrap();
     for key in [
@@ -290,4 +292,51 @@ fn role_tick_outcome_preference_tier_round_trips_and_older_records_still_parse()
     let parsed: RoleTickOutcomeRecord = serde_json::from_value(older).unwrap();
     assert_eq!(parsed.preference_tier, None);
     assert_eq!(parsed.preference_tap, None);
+}
+
+/// #12029: the found-work / verdict / step-class fields are additive and
+/// flattened onto the record: omitted when unobserved (never `null`, never a
+/// zero), round-trip when set, and an older record still parses.
+#[test]
+fn role_tick_outcome_observed_fields_are_flat_additive_and_omitted_when_absent() {
+    use crate::telemetry::{RoleTickObserved, RoleTickVerdict};
+    let mut record = match role_tick_outcome() {
+        TelemetryRecord::RoleTickOutcome(r) => r,
+        other => panic!("fixture changed: {other:?}"),
+    };
+    let bare = serde_json::to_value(&record).unwrap();
+    for key in [
+        "found_work",
+        "noop_reason",
+        "pr_number",
+        "head_sha",
+        "verdict",
+        "verdicts",
+        "step_class",
+        "step_reason",
+    ] {
+        assert!(bare.get(key).is_none(), "{key} must be absent, not null");
+    }
+    record.observed = RoleTickObserved {
+        found_work: Some(false),
+        noop_reason: Some("no_claim_no_verdict".into()),
+        pr_number: Some(7),
+        head_sha: Some("abcdef1".into()),
+        verdict: Some("approved".into()),
+        verdicts: Some(vec![RoleTickVerdict {
+            pr_number: 7,
+            head_sha: "abcdef1".into(),
+            verdict: "approved".into(),
+        }]),
+        step_class: Some("noop".into()),
+        step_reason: Some("already_judged".into()),
+    };
+    let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(value["found_work"], false, "an explicit false is kept");
+    assert_eq!(value["pr_number"], 7);
+    assert_eq!(value["verdicts"][0]["verdict"], "approved");
+    let back: RoleTickOutcomeRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(back, record);
+    let older: RoleTickOutcomeRecord = serde_json::from_value(bare).unwrap();
+    assert_eq!(older.observed, RoleTickObserved::default());
 }

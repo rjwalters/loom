@@ -1335,6 +1335,11 @@ gradeable by a model or prompt experiment.
 | `actions` | object | no | Forge-mutating work observed in the transcripts: `issues_labeled`, `prs_merged`, `comments_posted`. |
 | `source` | string | no | `step` when a step-engine step ran, not a role-runner tick (#11906). Mapped to `loom.role_tick.source`; absent on a role tick. Additive. |
 | `sweep_id` | string | no | The step's sweep id (`step-<role>-<item>-<ts>`), with `source`. Mapped to `loom.sweep_id`. |
+| `found_work` | bool | no | (#12029) Set on a spawned Judge tick (and a Judge step with an outcome line), never absent there: `true` when it won a PR claim, was assigned a PR, or wrote a verdict; `false` when it did none of those. Mapped to `loom.found_work`. Additive. |
+| `noop_reason` | string | no | Why `found_work` is `false`: the session's own `LOOM_STEP_OUTCOME` reason (a step, e.g. `already_judged`), else the daemon-observed `no_claim_no_verdict`. Mapped to `loom.noop_reason`. |
+| `pr_number`, `head_sha`, `verdict` | int, string, string | no | The newest verdict a Judge tick wrote, from the `post-verdict.sh` → `forge verdict-labels --sha` write (never a re-read of the PR): the PR, the head it was written against, and `approved` / `changes_requested` (the `loom:verdict-sha` marker's vocabulary in snake_case). A claim or assigned prompt alone gives `pr_number` and no verdict. Mapped to `loom.pr_number`, `loom.head_sha`, `loom.judge_verdict`. |
+| `verdicts` | array | no | Every verdict the tick wrote, oldest first: `{pr_number, head_sha, verdict}`. Mapped to `loom.tick_verdicts`. |
+| `step_class`, `step_reason` | string | no | A step's own `LOOM_STEP_OUTCOME` class (`verdict` / `noop` / `refused` / `failed`) and reason. `result` still follows `tick_outcome` (a `noop` or `refused` line is `success`). Mapped to `loom.step.class`, `loom.step.reason`. |
 
 #### `result` — seven values, and why a skip is not a failure
 
@@ -2638,8 +2643,8 @@ and `INFO` otherwise.
 
 #### Role step verdicts: `step:<role>` (#12027)
 
-A role step also emits `pass.verdict`, with `mechanism=step:<role>` (today
-`step:champion`; the judge row is #12029). The daemon builds the records from
+A role step also emits `pass.verdict`, with `mechanism=step:<role>` (`step:champion`,
+`step:judge`). The daemon builds the records from
 facts the run already produced, so there is no new GitHub call and no prompt
 change: a `Marker` entry that `loom-daemon forge comment` appends to the pick
 journal (the body's first-line `<!-- ns:kind[:…] -->`), the agent gh front's
@@ -2676,6 +2681,30 @@ projected reason, so `passVerdictQuery` still parses both):
 (an unnamed criterion). `noop` carries `ci_pending` or `held`. `failed` carries
 `failed` or `unclassified`. A rejection whose duplicate comment the guard
 suppressed keeps the stored identity's reason and `first_refused_at`.
+
+**Judge verdict (`judge_verdict_v1`, `step=judge_pr`, `artifact=pr`, #12029).**
+`verdict` carries `approved` or `changes_requested`, from the
+`<!-- loom:verdict-sha sha=… verdict=… -->` marker that `forge verdict-labels
+--sha` journals once the label transition has verified (so `head_sha` is the
+head the verdict was written against, and a refused approval is not a
+verdict). A step with no verdict write projects its `LOOM_STEP_OUTCOME` line:
+`noop` carries `already_judged` (else `unclassified`), `refused` carries
+`not_eligible` (else `unclassified`), `failed` carries `failed`; a `verdict`
+line with no observed write, and a step with no line at all, read
+`failed unclassified`. A role-runner tick emits one record per PR it wrote a
+verdict on and nothing for a tick that wrote none: its no-op signal is
+`role_tick.outcome`'s `found_work=false` / `noop_reason`, not a `pass.verdict`
+row (there is no item to key it on).
+
+**Sweep merge phase (not a `pass.verdict` row).** The merge phase is driven
+by `/loom:sweep`, not the step engine, so no daemon drain sees it and the
+CLI process that observes the merge (`merge-pr.sh`) has no OTLP sink. It is
+recorded on its `loom.role_attempt` span instead: `sweep-checkpoint begin N
+merge --pr-number P` opens it with `loom.pr_number`, and `loom-daemon merge-pr
+record-result` (called from `merge-pr.sh`'s exit trap) closes it with
+`loom.result` = `merged` / `refused` / `failed`, `loom.head_sha`,
+`loom.exit_code` and, for a head-mismatch refusal, `loom.merge.reason`. A
+`step:merge` `pass.verdict` row is a follow-up.
 
 **Champion promotion (`champion_promotion_v1`, `step=champion_issue`,
 `artifact=issue`).** One record per evaluated proposal. `promoted` is

@@ -41,9 +41,11 @@ fn completion_markers_preserve_each_repair_attempt_without_invented_duration() {
         .filter(|s| s.name == SpanName::RoleAttempt && s.attributes["loom.role"] == "judge")
         .collect();
     assert_eq!(judges.len(), 2);
-    assert_eq!(judges[0].attributes["loom.judge_verdict"], "rejected");
+    // #12029: the verdict is never inferred from the checkpoint phase.
+    assert!(!judges[0].attributes.contains_key("loom.judge_verdict"));
+    assert_eq!(judges[0].attributes["loom.result"], "rejected");
     assert_eq!(judges[0].status, SpanStatus::Error);
-    assert_eq!(judges[1].attributes["loom.judge_verdict"], "approved");
+    assert!(!judges[1].attributes.contains_key("loom.judge_verdict"));
     assert_eq!(judges[1].status, SpanStatus::Ok);
     assert_ne!(judges[0].context.span_id, judges[1].context.span_id);
     for span in &spans {
@@ -754,9 +756,17 @@ fn a_begun_phase_completes_with_its_real_duration() {
         .start(root.clone(), None, SpanName::Sweep, Utc::now(), scope)
         .unwrap();
     for role in ["curator", "builder", "judge", "doctor"] {
-        let begun =
-            checkpoint_begin_observation(&journal, &root, None, 9935, role, Some(1), Some("opus"))
-                .unwrap();
+        let begun = checkpoint_begin_observation(
+            &journal,
+            &root,
+            None,
+            9935,
+            role,
+            Some(1),
+            Some("opus"),
+            None,
+        )
+        .unwrap();
         assert_eq!(begun.record.attributes["loom.timing_source"], CHECKPOINT_BEGIN_SOURCE);
         assert!(!begun.record.attributes.contains_key(ATTEMPT_WORKED));
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -802,8 +812,17 @@ fn a_begun_phase_with_no_completion_closes_unobserved_at_execution_end() {
     )
     .unwrap();
     let span = begin(root_dir, "sweep-9935", SpanName::Sweep, TraceAttributes::new()).unwrap();
-    checkpoint_begin_observation(&span.journal, span.context(), None, 9935, "builder", None, None)
-        .unwrap();
+    checkpoint_begin_observation(
+        &span.journal,
+        span.context(),
+        None,
+        9935,
+        "builder",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(span.journal.active().unwrap().len(), 3, "root, phase, attempt all open");
     finish_execution(root_dir, "sweep-9935", "failure", TraceAttributes::new()).unwrap();
     let spans = drained_spans(&span.journal);
@@ -825,10 +844,13 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
     let journal = Journal::for_context(&dir.path().join("root.json"));
     let root = TraceContext::root(true);
     let first_a =
-        checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None).unwrap();
-    let b = checkpoint_begin_observation(&journal, &root, None, 2, "builder", None, None).unwrap();
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None, None)
+            .unwrap();
+    let b = checkpoint_begin_observation(&journal, &root, None, 2, "builder", None, None, None)
+        .unwrap();
     let second_a =
-        checkpoint_begin_observation(&journal, &root, None, 1, "builder", Some(2), None).unwrap();
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", Some(2), None, None)
+            .unwrap();
     for issue in [1, 2] {
         checkpoint_observation(
             &journal,
@@ -872,7 +894,9 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
     assert_eq!(synthetic.started_at, synthetic.ended_at);
     assert_eq!(synthetic.attributes["loom.timing_source"], "checkpoint_write_observed");
     assert_eq!(synthetic.attributes[ATTEMPT_WORKED], "false");
-    assert!(checkpoint_begin_observation(&journal, &root, None, 1, "sweep", None, None).is_none());
+    assert!(
+        checkpoint_begin_observation(&journal, &root, None, 1, "sweep", None, None, None).is_none()
+    );
 }
 
 /// #9510: the value `insert_nonempty_bounded` would stamp for `value`.
@@ -951,4 +975,77 @@ fn long_multibyte_admission_values_survive_the_export_allowlist() {
         assert!(!value.is_empty() && value.len() <= 256, "{key}: {} bytes", value.len());
         assert_eq!(exported["loom.runtime"], "codex");
     }
+}
+
+/// #12029: a Judge checkpoint takes `loom.judge_verdict` / `loom.head_sha`
+/// from the verdict `post-verdict.sh` handed back for that PR, in the marker's
+/// vocabulary; a PR with no handoff, or another PR's, leaves them absent.
+#[test]
+fn a_judge_checkpoint_carries_the_observed_verdict_not_the_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    let entry = |pr, sha: &str, verdict: &str| {
+        serde_json::to_string(&verdict_handoff::Entry {
+            pr_number: pr,
+            head_sha: sha.into(),
+            verdict: verdict.into(),
+            at: Utc::now(),
+        })
+        .unwrap()
+    };
+    std::fs::write(
+        journal.path().with_extension("verdicts"),
+        format!(
+            "{}\n{}\n{}\n",
+            entry(42, "aaaaaaa", "changes_requested"),
+            entry(42, "bbbbbbb", "approved"),
+            entry(43, "ccccccc", "approved")
+        ),
+    )
+    .unwrap();
+    for (issue, pr, phase) in [
+        (18, 42, "judge-rejected"),
+        (19, 44, "judge-done"),
+        (20, 43, "judge-done"),
+    ] {
+        checkpoint_observation(
+            &journal,
+            &root,
+            None,
+            issue,
+            phase,
+            Some(1),
+            None,
+            Some(pr),
+            "checkpoint_write_observed",
+        );
+    }
+    let spans = drained_spans(&journal);
+    let attempt = |pr: &str| {
+        spans
+            .iter()
+            .find(|s| s.name == SpanName::RoleAttempt && s.attributes["loom.pr_number"] == pr)
+            .unwrap()
+    };
+    let observed = attempt("42");
+    assert_eq!(observed.attributes["loom.judge_verdict"], "approved", "the newest verdict");
+    assert_eq!(observed.attributes["loom.head_sha"], "bbbbbbb");
+    assert_eq!(observed.attributes["loom.result"], "rejected", "the phase stays on the result");
+    assert!(!attempt("44").attributes.contains_key("loom.judge_verdict"));
+    assert_eq!(attempt("43").attributes["loom.head_sha"], "ccccccc");
+}
+
+/// #12029: `begin ... --pr-number` puts the PR on the attempt from its start.
+#[test]
+fn a_begun_attempt_can_name_its_pr() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    let with = checkpoint_begin_observation(&journal, &root, None, 5, "merge", None, None, Some(7))
+        .unwrap();
+    assert_eq!(with.record.attributes["loom.pr_number"], "7");
+    let without =
+        checkpoint_begin_observation(&journal, &root, None, 6, "merge", None, None, None).unwrap();
+    assert!(!without.record.attributes.contains_key("loom.pr_number"));
 }

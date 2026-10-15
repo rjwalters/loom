@@ -1053,6 +1053,11 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_response`.
     ClassifyResponse(super::merge_pr_response::ClassifyResponseArgs),
 
+    /// Close the sweep merge phase's open `merge` attempt with `merge-pr.sh`'s
+    /// terminal result (#12029). Telemetry only: no-op with no open attempt,
+    /// always exit 0 — see `cli::merge_pr_record_result`.
+    RecordResult(super::merge_pr_record_result::RecordResultArgs),
+
     /// The post-merge closed-issue `loom:building` cleanup decision (#6199):
     /// from the fresh body of an issue THIS merge closed, on stdin, either
     /// `STRIP` (the claim label is stale — remove it) or `SKIP<TAB><reason>`.
@@ -1198,6 +1203,7 @@ impl MergePrCommand {
             MergePrCommand::PartialConflict(args) => args.run(),
             MergePrCommand::PartialComment(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
+            MergePrCommand::RecordResult(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
             MergePrCommand::ClosedByMerge(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),
