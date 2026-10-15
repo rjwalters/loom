@@ -91,6 +91,30 @@ fn disable_writes_marker_stops_daemon_and_clears_desired() {
 }
 
 #[test]
+fn disable_discards_the_record_a_running_stop_writes() {
+    // #9957: stopping a live daemon records an operator stop; `host disable`
+    // discards that record after the stop, not before it.
+    let h = Host::new();
+    std::fs::write(h.desired(), "started_at=x\n").unwrap();
+    let record = h.p().join("autonomy-desired.stopped");
+    let stop = h.p().join("recording-stop.sh");
+    std::fs::write(&stop, format!("#!/bin/sh\ntouch {}\n", record.display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stop, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let o = h
+        .cmd(&["host", "disable", "--reason", "cost freeze"])
+        .env("LOOM_HOST_STOP_SCRIPT", &stop)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(h.disabled().exists());
+    assert!(!record.exists(), "the stop's operator-stop record is discarded");
+}
+
+#[test]
 fn disable_requires_reason() {
     let h = Host::new();
     assert!(!h.run(&["host", "disable"]).status.success());

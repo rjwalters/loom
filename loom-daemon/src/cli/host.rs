@@ -99,7 +99,6 @@ fn disable(reason: &str) -> Result<()> {
         Err(e) => fail(&e),
     }
     let _ = std::fs::remove_file(&desired);
-    let _ = loom_daemon::operator_stop::discard(&desired);
 
     // Stop the daemon and tear down its supervisor job through the existing
     // stop path - one implementation of that teardown. Since #9957 the stop
@@ -123,6 +122,11 @@ fn disable(reason: &str) -> Result<()> {
             false
         }
     };
+    // Discard any operator-stop record AFTER the stop (#9957 review): a stop
+    // of a running daemon records one unconditionally, and the opt-out marker
+    // already outranks it, so a disabled host should not keep a body-less
+    // `.stopped` record that this command meant to remove.
+    let _ = loom_daemon::operator_stop::discard(&desired);
     println!("{}", host_optout::summary(&host_optout::read_at(&disabled)));
     if !ok {
         fail("the marker is written (starts are refused) but the daemon/jobs may still be running; fix the above and re-run `host disable`");
