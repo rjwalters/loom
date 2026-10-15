@@ -38,6 +38,11 @@ impl SweepRegistry {
         started_at: DateTime<Utc>,
     ) {
         self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
+        // The step's end, as the reaper runs it for a step it saw die
+        // (#11906): its listed leases reaped (a Judge's no-verdict record
+        // included, and the lease file removed), its capture emitted.
+        let end = super::step_spawn::capture::StepEnd::Exited(None);
+        self.end_step(sweep_id, item, role, started_at, end);
         if self.config.skip_label_flip {
             return;
         }

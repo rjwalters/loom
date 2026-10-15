@@ -376,8 +376,8 @@ before configuring another workspace; there is no automatic destructive
 migration or volume cleanup. Shared caches and extra jobs per account are
 explicitly deferred to #8788.
 
-The ignored `private_workspace_docker` integration target is explicitly run in
-CI. It builds synthetic credential-free fixtures and proves clone/worktree
+The ignored `private_workspace_docker` integration target is explicitly run by the
+daily `ci-daily.yml` backstop. It builds synthetic credential-free fixtures and proves clone/worktree
 operations, persistence, host/peer write denial, job exclusion, and retained
 dirty/unpublished work. On macOS, supply a Linux build of the worker endpoint
 with `LOOM_TEST_LINUX_BIN`; `LOOM_TEST_HOST_BIN` optionally selects the host build.

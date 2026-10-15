@@ -14,6 +14,7 @@ impl EnvGuard {
     pub(crate) fn clear() -> Self {
         let keys = [
             HOST_ID_ENV,
+            LEASE_HOST_ID_ENV,
             HOST_ID_FILE_ENV,
             "HOSTNAME",
             crate::config_resolver::PRIVATE_DEFAULTS_ENV,
@@ -414,5 +415,25 @@ fn hostname_candidates_are_short_and_deduplicated() {
     assert!(got.iter().all(|c| !c.is_empty() && !c.contains('.')), "{got:?}");
     for (i, a) in got.iter().enumerate() {
         assert!(!got[i + 1..].iter().any(|b| b.eq_ignore_ascii_case(a)), "{got:?}");
+    }
+}
+
+env_test! {
+    /// `LOOM_LEASE_HOST_ID` pins only the lease chain (#11906): a step child
+    /// that carries it keeps the telemetry `host_identity()` of the daemon.
+    fn lease_pin_leaves_the_telemetry_identity_alone() {
+        let _guard = EnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let id_file = dir.path().join("host-id");
+        std::fs::write(&id_file, "persisted-studio\n").unwrap();
+        std::env::set_var(HOST_ID_FILE_ENV, &id_file);
+        std::env::set_var("HOSTNAME", "container-9f2c");
+        let before = host_identity();
+        assert_eq!(before, "persisted-studio");
+        std::env::set_var(LEASE_HOST_ID_ENV, "daemon-host");
+        assert_eq!(lease_host_identity(), "daemon-host");
+        assert_eq!(host_identity(), before, "the lease pin never reaches host.id");
+        std::env::set_var(HOST_ID_ENV, "explicit");
+        assert_eq!(lease_host_identity(), "daemon-host", "lease pin beats LOOM_HOST_ID");
     }
 }

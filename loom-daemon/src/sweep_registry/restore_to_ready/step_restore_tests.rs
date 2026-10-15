@@ -269,3 +269,24 @@ fn a_builder_step_with_a_failed_read_writes_nothing() {
     assert_eq!(release, ClaimRelease::Untouched);
     assert!(edits.is_empty(), "{edits:?}");
 }
+
+/// #11969: a promote that wrote `revise` (`loom:triage`) and died before
+/// removing `loom:evaluating` only drops its claim: no `loom:curated` back
+/// beside the `loom:triage` it moved the issue to. A promote that wrote
+/// nothing still restores `loom:curated`.
+#[test]
+#[serial_test::serial]
+fn a_revised_promote_that_died_holding_its_claim_does_not_restore_curated() {
+    let promote = StepRole::ChampionPromote;
+    assert_eq!(
+        plan_step_release(promote, &labels(&["loom:evaluating", "loom:triage"]), Some(false)),
+        StepReleasePlan::RemoveClaim
+    );
+    assert_eq!(
+        plan_step_release(promote, &labels(&["loom:evaluating"]), Some(false)),
+        StepReleasePlan::Restore
+    );
+    let (release, edits) = release_with(promote, 607, Some(r#""loom:evaluating","loom:triage""#));
+    assert_eq!(release, ClaimRelease::Released);
+    assert_eq!(edits, vec!["issue edit 607 --remove-label loom:evaluating".to_string()]);
+}

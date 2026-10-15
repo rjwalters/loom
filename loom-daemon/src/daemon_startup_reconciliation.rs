@@ -155,6 +155,7 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
             run_startup_quarantine_pass(&quarantine_root);
             run_startup_profile_provisioning_pass(&quarantine_root);
             run_startup_trace_join_reconciliation_pass(&quarantine_root);
+            run_startup_review_role_pins_pass(&quarantine_root);
             if let Some(dir) = gate_dir.as_deref() {
                 let _ = std::fs::write(dir.join(TEST_GATE_COMPLETED_FILE), b"done\n");
             }
@@ -166,6 +167,25 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
         let _ = tx.send(true);
     });
     rx
+}
+
+/// One WARN per registered workspace that pins a Champion, Judge or Doctor
+/// prompt in `.loom/resync-ignore` (#11970): that copy runs stale against
+/// this daemon. Local file reads only; the same fact is the `review_role_pins`
+/// warning in `loom-daemon health`.
+fn run_startup_review_role_pins_pass(fallback_root: &Path) {
+    let registry = crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    for root in registry.effective_roots(fallback_root) {
+        let pins = crate::health::pinned_review_roles(&root);
+        if !pins.is_empty() {
+            log::warn!(
+                "review_role_pins: {} pins review-role prompt(s) in .loom/resync-ignore, which \
+                 run stale against this daemon (#11970): {}",
+                root.display(),
+                pins.join(", ")
+            );
+        }
+    }
 }
 
 /// The stranded-quarantine half of the startup pass (Issue #4110): the
