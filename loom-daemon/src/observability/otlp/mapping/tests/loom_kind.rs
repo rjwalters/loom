@@ -160,6 +160,10 @@ fn samples() -> Vec<TelemetryRecord> {
         wire(json!({"kind": "backlog.level", "repo": "rjwalters/loom", "open": 412,
                     "target": 140, "level": "strict", "dispatch_id": "role-curator-x",
                     "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "scope.memory", "scope": "loom-agent-1.scope",
+                    "workspace": "loom", "role": "builder", "limit_source": "none",
+                    "peak_bytes": 1, "events_max": 0, "oom_kills": 0, "clipped": false,
+                    "observed_at": AT, "loom": p})),
     ]
 }
 

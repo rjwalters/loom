@@ -172,6 +172,9 @@ pub mod host_export;
 /// Per-kind silence thresholds for `otlp_export` health (#12120).
 pub mod kind_silence;
 
+/// `scope.memory` (#12241) — one agent scope's memory limit, peak and OOM kills.
+pub mod scope_memory;
+
 /// `operator.presence` (#11563) — an operator session's keyboard presence.
 pub mod operator_presence;
 
@@ -474,6 +477,12 @@ macro_rules! telemetry_kind_table {
             /// (#11819): open count, target, level. OTLP-only. See
             /// [`backlog_level`].
             BacklogLevel = "backlog.level" => $crate::telemetry::kinds::backlog_level::BacklogLevelRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One agent scope's applied memory limit, its source, the peak
+            /// and the OOM kills, when the scope ends (#12241). OTLP-only.
+            /// See [`scope_memory`].
+            ScopeMemory = "scope.memory" => $crate::telemetry::kinds::scope_memory::ScopeMemoryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
