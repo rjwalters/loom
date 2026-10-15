@@ -248,7 +248,7 @@ The stalled and idle rules key on `loom.step.actionable{repo}`, which every disp
 
 ## 9. Open items
 
-- **Stage term.** Ruled out (ruling 2): the weight is `actionable × priority × stage-age`. The `step-slots-idle` alert and `pick.decision` show whether a stage starves.
+- **Stage term.** None today (ruling 2): the weight is `actionable × priority × stage-age`. Whether one is ever added is decided on production data, by the operator; the `step-slots-idle` alert and `pick.decision` show whether a stage starves.
 - **Sessions.** Should Doctor resume the author's session or its own? What is the resume TTL? Both wait on the resume-vs-fresh experiment.
 - **Merge queue.** Phase C's live verification (#10257) runs on the live fleet.
 
@@ -263,7 +263,7 @@ The stalled and idle rules key on `loom.step.actionable{repo}`, which every disp
 | #11898 | `SweepKind::Step`, step claims, per-role restore (§4.4, §5) |
 | #11900 | Step-outcome ledger (§5) |
 | #11906 | Step spawn (§4.4) |
-| #11908 | Shadow mode and comparison: closed, ruled out; its telemetry moved to #11909 |
+| #11908 | Shadow mode and comparison: closed, superseded by #11909, which carries its telemetry |
 | #11909 | The cutover: the step tick as the only item dispatch path, the alerts (§4.4, §7, §8) |
 | #11910 | Dispatch-plan `step` field |
 | #11911 | Finish Sweep retirement and merge the budgets |
@@ -287,12 +287,12 @@ Each owner doc carries a short pointer to this section. Since #11909 every depar
 
 | Owner doc | Departure |
 |---|---|
-| `defaults/docs/priority-model.md` | The within-workspace pick (`main_red_fix → level → created_at → number`) becomes the seeded weighted item draw (§4.2) |
-| `defaults/docs/promotion-throughput.md` | Promotion is per-item and terminal. `prSlice`, `promotionSlice` and `tier2Cap` don't apply. |
-| `defaults/docs/dispatch-plan.md` | Plan rows gain a `step` field, with the shared fixture changed first |
-| `defaults/docs/telemetry-kind-pick-decision.md` | Work-finder rows gain step, weight terms and `age_source`. The per-role cadence volume table no longer holds for item roles. |
+| `defaults/docs/priority-model.md` | The within-workspace pick (`main_red_fix → level → created_at → number`) is the seeded weighted item draw (§4.2) |
+| `defaults/docs/promotion-throughput.md` | Promotion is a per-item, terminal Champion step. `prSlice`, `promotionSlice` and `tier2Cap` don't drive it. |
+| `defaults/docs/dispatch-plan.md` | Every plan row carries its `step`; the fleet merge folds by `repo#issue` + `step`, pinned by the shared fixture |
+| `defaults/docs/telemetry-kind-pick-decision.md` | Work-finder records carry `item_draw` (step, weight terms, `age_source`). The per-role cadence volume table does not hold for item roles. |
 | `defaults/docs/daemon-reference.md` (role runner) | The item roles do not run on intervals; Champion runs `--non-item`. `demandWidth` and `roleRunner.maxConcurrent` are retired, and the two concurrency budgets are one (#11911). |
-| `defaults/docs/label-state-machine.md` | The `queued` item state. `stale_after_minutes` becomes live. Per-role restore. |
-| `defaults/labels.json` (header) | `stale_after_minutes` is no longer INERT. #11898 changes the header together with the values it makes live; until then the header stays accurate. |
-| `mcp-loom/src/tools/sweeps.ts` and `mcp-loom/README.md` | The sweep tools learn `SweepKind::Step` (its role and item). #11898 changes them together with the Rust type. |
-| `loom-daemon/src/forge_merge_queue/mod.rs:30-32` | The comment saying no prompt invokes the handoff is stale. Champion's merge step has called it since #10256 Phase B3. Corrected in this change. |
+| `defaults/docs/label-state-machine.md` | The `queued` item state. `stale_after_minutes` is live (curating, evaluating and reviewing 45 min). Per-role restore. |
+| `defaults/labels.json` (header) | `stale_after_minutes` is live for the five claim labels (#11898). |
+| `mcp-loom/src/tools/sweeps.ts` and `mcp-loom/README.md` | The sweep tools know `SweepKind::Step` (its role and item), since #11898. |
+| `loom-daemon/src/forge_merge_queue/mod.rs` | Champion's merge step calls the merge-queue handoff (since #10256 Phase B3); the module comment says so. |
