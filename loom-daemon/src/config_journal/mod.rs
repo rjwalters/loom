@@ -9,8 +9,8 @@
 //!   ([`planner_config_hash`], the same function `fleet.state` uses), the
 //!   tier path/sha256-or-absent metadata, and the **redacted** body only the
 //!   first time a hash is seen.
-//! - `config.rendered` (C6): a render (`event: rendered`), and the
-//!   pending-restart marker lifecycle (`pending_restart` / `pending_cleared`).
+//! - `config.rendered` (C6): a render (`event: rendered`), a removal of a
+//!   rendered file (`event: removed`), and the pending-restart marker lifecycle (`pending_restart` / `pending_cleared`).
 //! - `fleet.sync` (C7): the `FleetSyncStatus` snapshot (`published`) or its
 //!   removal (`cleared`).
 //!
@@ -326,6 +326,45 @@ pub fn append_rendered(
                 "store_commit": store_commit,
                 "restart_required_keys": restart_required_keys,
                 "daemon_pid_at_render": Value::Null,
+            }),
+        )
+        .map(|_| ())
+    });
+}
+
+/// Shadow-record that the fleet sync removed a rendered file (`removed`), after
+/// the legacy removal. `backup` is where `render::remove` moved it. Same
+/// shadow / no-op-when-disabled behaviour as [`record_rendered`].
+pub fn record_removed(
+    removed: bool,
+    tier: &str,
+    path: &Path,
+    backup: Option<std::path::PathBuf>,
+    store_commit: &Option<String>,
+) {
+    if removed {
+        append_removed(tier, path, backup.as_deref(), store_commit.as_deref());
+    }
+}
+
+/// [`record_removed`] with the pieces spelled out (tests).
+pub fn append_removed(
+    tier: &str,
+    target: &Path,
+    backup: Option<&Path>,
+    store_commit: Option<&str>,
+) {
+    shadow("config.removed", |s| {
+        s.append(
+            KIND_RENDERED,
+            None,
+            json!({
+                "schema": SCHEMA,
+                "event": "removed",
+                "tier": tier,
+                "target": target.display().to_string(),
+                "backup": backup.map(|b| b.display().to_string()),
+                "store_commit": store_commit,
             }),
         )
         .map(|_| ())
