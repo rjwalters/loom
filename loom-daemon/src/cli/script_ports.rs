@@ -773,22 +773,11 @@ pub(crate) enum MergePrCommand {
     /// Refuse a PR carrying `loom:pr` alongside a contradicting label.
     VerdictContradiction(super::merge_pr_labels::VerdictContradictionArgs),
 
-    /// Retired (#12063 slice 1): the #8248 freshness guard. Hidden; answers
-    /// CLEAN for an older `merge-pr.sh`. See `cli::merge_pr_retired`.
-    #[command(hide = true)]
-    StaleChecks(super::merge_pr_retired::RetiredArgs),
-
     /// Run the repo's `merge.treeChecks` against the merge tree (base + PR
     /// head) in a temp dir (#10026). Exit 0+CLEAN = pass/none declared (or
     /// BYPASSED under --allow-red-tree), 1 = a check failed (comment posted),
     /// 2 = could not run (must also refuse).
     TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
-
-    /// Retired (#12063 slice 1): the #10444 CI-run gate. Hidden; answers an
-    /// older `merge-pr.sh` with the `required-checks` verdict in `ci-result`'s
-    /// old contract. See `cli::merge_pr_retired`.
-    #[command(hide = true)]
-    CiResult(super::merge_pr_retired::CiResultArgs),
 
     /// Refuse a plain (non-`--auto`) merge whose head has a required context
     /// that concluded red (#10688); hold (exit 3) on a missing/pending one.
@@ -809,11 +798,6 @@ pub(crate) enum MergePrCommand {
     /// freshly-read head. Exit 0 + sentinel = retry authorized, 1 = foreign
     /// head move (re-queue), 2 = attribution undeterminable (also re-queue).
     HeadSyncRetry(super::merge_pr_head_sync::HeadSyncRetryArgs),
-
-    /// Retired (#12063 slice 1): the #8508 re-date remedy. Hidden; never
-    /// pushes, exits 1. See `cli::merge_pr_retired`.
-    #[command(hide = true)]
-    RedateChecks(super::merge_pr_retired::RetiredArgs),
 
     /// Read-only report of which required checks and paths forced the #8508
     /// re-dates (#9746), from the trailers on the re-date commits reachable
@@ -1157,12 +1141,9 @@ impl MergePrCommand {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::MergeableRecheck(args) => args.run(),
-            MergePrCommand::StaleChecks(args) => args.run_stale_checks(),
             MergePrCommand::TreeChecks(args) => args.run(),
-            MergePrCommand::CiResult(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
-            MergePrCommand::RedateChecks(args) => args.run_redate_checks(),
             MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::LoomPrOverrideComment(args) => args.run(),

@@ -60,7 +60,7 @@ mod tests {
         // after `$(...)` strips it, so a second one would print a blank line.
         assert!(USAGE.ends_with('\n'));
         assert!(!USAGE.ends_with("\n\n"));
-        assert_eq!(USAGE.lines().count(), 159);
+        assert_eq!(USAGE.lines().count(), 157);
     }
 
     #[test]

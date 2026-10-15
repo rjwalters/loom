@@ -295,20 +295,6 @@ pub fn live_inputs(nwo: &str, base_ref: &str, sha: &str) -> Result<Inputs, Strin
     Ok((required, runs, parse_statuses(&combined)?))
 }
 
-/// The base branch of PR `pr` (`.base.ref` of `GET repos/{nwo}/pulls/{pr}`).
-/// The retired `ci-result` verb (#12063 slice 1) evaluates this gate for an
-/// older `merge-pr.sh`, whose call never named a base ref.
-pub fn pr_base_ref(nwo: &str, pr: &str) -> Result<String, String> {
-    let raw = gh_get(&format!("repos/{nwo}/pulls/{pr}"))?;
-    let v: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("unparseable PR #{pr} response: {e}"))?;
-    v.pointer("/base/ref")
-        .and_then(Value::as_str)
-        .filter(|r| !r.is_empty())
-        .map(String::from)
-        .ok_or_else(|| format!("PR #{pr} response has no base.ref"))
-}
-
 /// `gh api <path>` (REST, read-only) through the counted `gh` facade. It
 /// lived in the deleted `ci_result` gate (#10444, #12063 slice 1) and keeps its
 /// ledger caller name so the operation inventory does not move.

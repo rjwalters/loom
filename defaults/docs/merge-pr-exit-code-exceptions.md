@@ -78,9 +78,11 @@ decision (the ruleset's required contexts), and a PR whose head and green
 checks are unchanged is no longer re-dated because `main` moved. The accepted
 cost is the occasional semantic conflict, caught by CI on `main` and reverted.
 
-`merge-pr.sh` never exits 4 now. `--redate-stale-checks` is accepted as a
-deprecated no-op with a one-line warning, so an older Champion prompt keeps
-working mid-roll, and callers may keep treating 4 as a re-queue.
+`merge-pr.sh` never exits 4 now, and callers may keep treating 4 as a
+re-queue. `--redate-stale-checks` and the `stale-checks`, `ci-result` and
+`redate-checks` verbs are removed outright, with no deprecated stand-in: a
+Champion prompt or `merge-pr.sh` that still uses them refuses the merge
+(fails closed) until its repo resyncs `.loom/`.
 `loom-daemon merge-pr redate-report` and the `loom.merge.redate_*` gauges
 remain for the #10888 before/after measurement.
 

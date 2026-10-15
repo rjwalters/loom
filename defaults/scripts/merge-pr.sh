@@ -422,7 +422,6 @@ while [[ $# -gt 0 ]]; do
     --allow-unapproved) ALLOW_UNAPPROVED=true; shift ;;
     --allow-red-tree) ALLOW_RED_TREE=true; shift ;;
     --allow-red-required) [[ $# -lt 2 || -z "$2" ]] && error "--allow-red-required requires a context name"; ALLOW_RED_REQUIRED+=("$2"); shift 2 ;;
-    --redate-stale-checks) warning "--redate-stale-checks is a deprecated no-op (#12063): the #8248 freshness guard and its re-date remedy are gone" >&2; shift ;;
     # #8845's --merge-method arm is paid for by flattening the `*)` positional
     # arm below onto one line — the shell-budget ratchet's option 2
     # (.loom/docs/shell-language-policy.md), same offsetting convention

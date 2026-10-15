@@ -85,8 +85,6 @@ Options:
                          The bypass is always logged as a warning and, on a
                          real (non-dry-run) merge, best-effort recorded as a
                          PR comment audit trail too.
-  --redate-stale-checks  Deprecated no-op (#12063): prints one warning. The
-                         #8248 freshness guard and its re-date remedy are gone.
   --merge-method M       Request squash|merge|rebase instead of auto-detect; validated via loom-daemon against the repo's actually-allowed strategies — fails rather than silently falling back to squash if disallowed (#8845).
   --no-cleanup-primary   Skip automatic primary-checkout branch cleanup (#5015).
                          When the merged branch is checked out in the PRIMARY
