@@ -327,7 +327,11 @@ pub async fn enforce_at_boot(pass: &StatePass, host: &str, repo: &str) -> Option
             let message = refusal_message(pass, host, repo);
             log::warn!("{message}");
             eprintln!("{message}");
-            crate::observability::shutdown::exit(EXIT_FLEET_STOPPED).await
+            crate::observability::shutdown::exit(
+                EXIT_FLEET_STOPPED,
+                crate::observability::daemon_exit::ExitCause::FleetState,
+            )
+            .await
         }
     }
 }
