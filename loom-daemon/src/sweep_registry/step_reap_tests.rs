@@ -314,7 +314,7 @@ fn a_dead_doctor_step_leaves_an_attended_label_only_claim_alone() {
     let (mut reg, log) =
         registry_with_label_time(dir.path(), &rows, released + chrono::Duration::minutes(10));
     assert!(reg.step_claim_held_elsewhere(41, StepRole::Doctor, mine, start));
-    assert!(reg.release_dead_step(mine, 41, StepRole::Doctor, start));
+    assert!(reg.release_dead_step(mine, 41, StepRole::Doctor, start, StepEnd::Exited(None)));
     assert!(
         std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
         "the attended Doctor's label is not stripped"
@@ -324,7 +324,7 @@ fn a_dead_doctor_step_leaves_an_attended_label_only_claim_alone() {
     let (mut reg, log) =
         registry_with_label_time(dir.path(), &rows, start + chrono::Duration::minutes(2));
     assert!(!reg.step_claim_held_elsewhere(41, StepRole::Doctor, mine, start));
-    assert!(!reg.release_dead_step(mine, 41, StepRole::Doctor, start));
+    assert!(!reg.release_dead_step(mine, 41, StepRole::Doctor, start, StepEnd::Exited(None)));
     assert!(
         !std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
         "its own label, applied under its lease, is released"
