@@ -33,6 +33,7 @@ use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_collision;
 use loom_daemon::role_runner;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
+use loom_daemon::task_dump;
 use loom_daemon::terminal::TerminalManager;
 use loom_daemon::token_ranking_refresh;
 use loom_daemon::watch_registry;
@@ -1996,6 +1997,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // independent detached processes and survive a daemon restart by design
     // (killing the dispatcher must not kill dispatched work). This is the
     // documented "survive, don't drain" decision (see daemon-reference.md).
+    // SIGUSR1 dumps the async task tree to the log for a hung tick (#12079).
+    task_dump::spawn_signal_listener();
+
     let socket_path_clone = socket_path.clone();
     tokio::spawn(async move {
         let signal_name = wait_for_shutdown_signal().await;

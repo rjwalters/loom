@@ -57,6 +57,12 @@ rustflags = [
     # Warn (not deny) on dead code so it surfaces locally without aborting
     # iterative builds. CI's `-D warnings` denies it — see the note above.
     "-W", "dead_code",
+
+    # #12079: tokio's `Handle::dump()` (SIGUSR1 task dump for a hung daemon
+    # tick) needs this cfg plus tokio's `taskdump` feature
+    # (loom-daemon/Cargo.toml). CI's per-triple RUSTFLAGS env is joined with
+    # this list, not a replacement, so it needs no repeat.
+    "--cfg", "tokio_unstable",
 ]
 
 [target.aarch64-apple-darwin]

@@ -14577,6 +14577,32 @@ to a fixture (`isolate_daemon_state`: `LOOM_WORKSPACES_PATH`,
 plus the cwd), so a test daemon has no managed workspace to reconcile or
 dispatch against.
 
+## A tick appears hung — dump the async task tree (`kill -USR1`, #12079)
+
+First step when a daemon tick (work finder, role runner, …) stops logging and
+you need to know **which await it is parked on**. Hosts restrict ptrace (yama
+`ptrace_scope=1`), so gdb/strace need root; this needs neither.
+
+```bash
+pgrep -u "$USER" -x loom-daemon          # the daemon's pid
+kill -USR1 <pid>                         # as the daemon's own user
+tail -n 200 ~/.loom/daemon.log           # "SIGUSR1 task dump: N task(s)" + one trace per task
+```
+
+- The daemon keeps running; each signal writes a fresh dump. The handler runs
+  on its own thread with its own runtime, so it works while the IPC accept loop
+  or the main runtime is wedged.
+- The dump is bounded to 10s. A task that never yields to the runtime (a
+  blocking call on a worker thread) stalls tokio's dump; the log then gets
+  `SIGUSR1 task dump timed out after 10s` instead — that itself says a worker
+  is blocked rather than awaiting.
+- Availability: needs tokio's `taskdump` feature (on in `loom-daemon/Cargo.toml`)
+  and `--cfg tokio_unstable` (set in `.cargo/config.toml`), Linux
+  x86/x86_64/aarch64 only. A build without them, or a non-Linux host, logs
+  `SIGUSR1 task dump unavailable` and keeps running — SIGUSR1 never kills the
+  daemon. A build that overrides `RUSTFLAGS` outright drops the cfg and gets the
+  "unavailable" line.
+
 ## What this page does NOT describe
 
 The legacy schema and tuning advice that historically lived here — the
