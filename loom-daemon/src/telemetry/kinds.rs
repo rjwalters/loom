@@ -16,10 +16,8 @@
 //!
 //! Everything a kind registers now lives in the one-row-per-kind table below,
 //! and that table is the only shared line a new kind touches. The row is
-//! append-only and self-contained, so `.gitattributes` marks this file
-//! `merge=union`: two branches that each append a row merge cleanly with no
-//! conflict and no lost row (see the `kind_registry` tests, which assert both
-//! the attribute and the merge behaviour).
+//! append-only and self-contained; two branches that each append a row hit an
+//! ordinary merge conflict, resolved by keeping both rows.
 //!
 //! # Adding a record kind
 //!
@@ -152,8 +150,9 @@ pub struct TelemetryKindMeta {
 // ============================================================================
 //
 // Declared HERE (not in `telemetry/mod.rs`) so a new family costs zero lines
-// in a shared file: this file is `merge=union`, so two branches each adding a
-// `pub mod` line merge cleanly. Files live at `telemetry/kinds/<family>.rs`.
+// in a shared file: two branches each adding a `pub mod` line here conflict
+// like any shared file, resolved by keeping both. Files live at
+// `telemetry/kinds/<family>.rs`.
 // (None yet — the pre-#8921 families stay where they are, declared in
 // `telemetry/mod.rs`; moving them would churn every in-flight PR that touches
 // them for no schema benefit.)

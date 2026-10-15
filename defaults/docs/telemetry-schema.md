@@ -287,10 +287,8 @@ correct. The contract now is:
 
 1. **One row in `loom-daemon/src/telemetry/kinds.rs`** — the only shared line.
    That row generates the enum variant, the wire tag, the gate version, the OTLP
-   routing class, and the native-ingest scope. The file is marked `merge=union`
-   in `.gitattributes`, so two branches that each append a row merge cleanly
-   instead of conflicting (asserted against real `git` by
-   `telemetry::tests::kind_registry::two_branches_each_adding_a_record_kind_merge_cleanly`).
+   routing class, and the native-ingest scope. Concurrent appends conflict like
+   any shared file; resolve by keeping both rows.
 2. **`gate: NEW_KIND_SCHEMA_VERSION`** — never a fresh integer. See the Version
    history note above.
 3. **Payload struct in its own module** — a new family belongs at
@@ -304,18 +302,6 @@ correct. The contract now is:
    reference may instead ship its own `defaults/docs/telemetry-kind-<kind>.md`
    file (symlinked into `.loom/docs/` like every other shipped doc) and link it
    from its section here, which costs zero shared lines.
-
-**What `merge=union` does and does not buy you.** The attribute is read by the
-`git` that performs the merge, so it applies to every merge, rebase or
-`git pull` you run locally and to the merge commit `merge-pr.sh` produces — the
-row append resolves itself, with no hand-editing. It is **not** a guarantee that
-the forge's *mergeability indicator* will stay green: a forge is free to compute
-that status with a plain three-way merge and show `CONFLICTING`. If it does, the
-fix is a `git merge origin/main` in the worktree, which under this attribute
-produces both rows and needs no conflict resolution — the cost is one push, not
-a rebase cycle spent reconstructing two hand-maintained ladders. Reducing the
-*work* a collision costs is the goal; the `kind_registry` merge test asserts
-exactly that property against real `git`.
 
 ### `sweep.started`
 
