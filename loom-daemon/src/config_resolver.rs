@@ -392,6 +392,73 @@ pub fn source_of(repo_root: &Path, dotted: &str) -> Option<PathBuf> {
         .find(|path| get_path(&soft_read_json_object(path), dotted).is_some_and(|v| !v.is_null()))
 }
 
+/// One leaf config key that two or more tiers set to different values, where at
+/// least one of those tiers is a fleet tier (#11703).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierConflict {
+    /// Dotted path of the leaf key, e.g. `buildGate.enabled`.
+    pub key: String,
+    /// Every non-null value found, highest-precedence tier first.
+    pub values: Vec<(PathBuf, Value)>,
+}
+
+impl TierConflict {
+    /// The tier whose value is in effect (the highest-precedence one).
+    #[must_use]
+    pub fn winner(&self) -> &(PathBuf, Value) {
+        &self.values[0]
+    }
+}
+
+fn collect_leaves(prefix: &str, value: &Value, out: &mut Vec<(String, Value)>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                collect_leaves(&key, v, out);
+            }
+        }
+        Value::Null => {}
+        leaf => out.push((prefix.to_string(), leaf.clone())),
+    }
+}
+
+/// Leaf keys on which a fleet tier (the private defaults or
+/// [`FLEET_REPO_CONFIG_REL`]) disagrees with another tier (#11703). Equal values
+/// are not reported; neither are disagreements among non-fleet tiers (normal
+/// layering). Each conflict lists every value highest-precedence first, so the
+/// first entry is the one in effect — this follows [`tier_paths_by_precedence`]
+/// and so tracks any change to the merge order. Arrays are leaves. Soft-fails
+/// like the merge: an unreadable tier contributes nothing.
+#[must_use]
+pub fn tier_conflicts(repo_root: &Path) -> Vec<TierConflict> {
+    let fleet_repo = repo_root.join(FLEET_REPO_CONFIG_REL);
+    let defaults = private_defaults_path();
+    let is_fleet = |p: &Path| p == fleet_repo || defaults.as_deref() == Some(p);
+
+    let mut by_key: std::collections::BTreeMap<String, Vec<(PathBuf, Value)>> =
+        std::collections::BTreeMap::new();
+    for path in tier_paths_by_precedence(repo_root) {
+        let mut leaves = Vec::new();
+        collect_leaves("", &soft_read_json_object(&path), &mut leaves);
+        for (key, val) in leaves {
+            by_key.entry(key).or_default().push((path.clone(), val));
+        }
+    }
+
+    by_key
+        .into_iter()
+        .filter(|(_, vals)| {
+            vals.iter().any(|(p, _)| is_fleet(p)) && vals.iter().any(|(_, v)| *v != vals[0].1)
+        })
+        .map(|(key, values)| TierConflict { key, values })
+        .collect()
+}
+
 /// Look up a dotted key path (e.g. `"autonomous.workFinder.enabled"`) in an
 /// already-resolved effective config tree. Returns `None` on any missing
 /// segment or when a non-object value is indexed further.
@@ -1267,6 +1334,55 @@ mod tests {
     // effective config from Rust and Bash. See that directory's README.md for
     // what each tier exercises. Bash:
     // `defaults/scripts/tests/test-config-resolver.sh`.
+
+    // ===== tier_conflicts (#11703) =====
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_tier_conflicts_reports_fleet_vs_repo_with_winner() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join(LEGACY_CONFIG_REL),
+            r#"{"buildGate":{"enabled":true},"same":1}"#,
+        );
+        write(
+            &root.path().join(FLEET_REPO_CONFIG_REL),
+            r#"{"buildGate":{"enabled":false},"same":1}"#,
+        );
+        let conflicts = tier_conflicts(root.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].key, "buildGate.enabled");
+        assert_eq!(conflicts[0].values.len(), 2);
+        let effective = resolve_effective_config(root.path());
+        assert_eq!(get_path(&effective, "buildGate.enabled"), Some(&conflicts[0].winner().1));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_tier_conflicts_ignores_non_fleet_disagreement_and_equal_values() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(&root.path().join(LEGACY_CONFIG_REL), r#"{"a":1,"b":2}"#);
+        write(&root.path().join(LOCAL_CONFIG_REL), r#"{"a":9}"#);
+        write(&root.path().join(FLEET_REPO_CONFIG_REL), r#"{"b":2}"#);
+        let conflicts = tier_conflicts(root.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_tier_conflicts_soft_fails_on_malformed_tier() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(&root.path().join(LEGACY_CONFIG_REL), r#"{"a":1}"#);
+        write(&root.path().join(FLEET_REPO_CONFIG_REL), "{not json");
+        let conflicts = tier_conflicts(root.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert!(conflicts.is_empty());
+    }
 
     // ===== source_of / tier_paths_by_precedence (#4512) =====
 
