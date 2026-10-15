@@ -4,6 +4,7 @@ use chrono::{Duration, TimeZone, Utc};
 
 use super::super::{FleetPrCensus, FleetStage, FleetStateRow, RepoView};
 use super::{Track, BURST_MIN_RELEASES, BURST_WINDOW_MINUTES};
+use crate::telemetry::kinds::fleet_state::FleetHoldChurn;
 
 fn t0() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap()
@@ -31,6 +32,8 @@ fn first_pass_has_no_markers() {
     let mut track = Track::default();
     track.observe(&repo(&[1, 2], &[], true), t0());
     assert_eq!(track.markers(t0()), None);
+    // No churn is observable until a second pass diffs against the baseline.
+    assert_eq!(track.churn(), None);
 }
 
 #[test]
@@ -43,6 +46,14 @@ fn a_release_after_a_hold_sets_recency_without_a_burst() {
     let markers = track.markers(later + Duration::hours(2)).unwrap();
     assert_eq!(markers.last_hold_release_at, later);
     assert_eq!(markers.hold_release_burst, None);
+    // The release is counted as an operator action, not a left-census event.
+    assert_eq!(
+        track.churn(),
+        Some(FleetHoldChurn {
+            releases: 1,
+            left_census: 0,
+        })
+    );
 }
 
 #[test]
@@ -89,4 +100,38 @@ fn a_row_that_left_the_view_merged_or_closed_is_not_a_release() {
     track.observe(&repo(&[1], &[], true), t0());
     track.observe(&repo(&[], &[], true), t0() + Duration::minutes(1));
     assert_eq!(track.markers(t0() + Duration::minutes(1)), None);
+    // It is still observable as a left-census event, so the "operator release
+    // vs. merge/close" ambiguity is diagnosable even with no release (#12059).
+    assert_eq!(
+        track.churn(),
+        Some(FleetHoldChurn {
+            releases: 0,
+            left_census: 1,
+        })
+    );
+}
+
+#[test]
+fn releases_and_left_census_accumulate_independently() {
+    let mut track = Track::default();
+    track.observe(&repo(&[1, 2, 3], &[], true), t0());
+    // Issue 1 released (still an open row), issues 2 and 3 left the census.
+    track.observe(&repo(&[], &[1], true), t0() + Duration::minutes(1));
+    assert_eq!(
+        track.churn(),
+        Some(FleetHoldChurn {
+            releases: 1,
+            left_census: 2,
+        })
+    );
+    // A later release adds to the running release count, census count unchanged.
+    track.observe(&repo(&[4], &[1], true), t0() + Duration::minutes(2));
+    track.observe(&repo(&[], &[1, 4], true), t0() + Duration::minutes(3));
+    assert_eq!(
+        track.churn(),
+        Some(FleetHoldChurn {
+            releases: 2,
+            left_census: 2,
+        })
+    );
 }

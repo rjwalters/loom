@@ -710,6 +710,24 @@ pub struct FleetHoldReleaseBurst {
     pub window_minutes: u32,
 }
 
+/// Cumulative per-repo hold-churn counts since this host started (#12059): why
+/// each item left the operator-held set, so the "operator released a hold" vs
+/// "item left the census (the PR merged or the issue closed)" ambiguity is
+/// observable even while [`FleetOperatorRecency`] stays absent — a repo whose
+/// only churn was merges never records a release, so `operator_recency` alone
+/// cannot tell "no churn" from "churn, but no operator action". A reader diffs
+/// consecutive records to see which count moved. In memory, so it resets on
+/// restart like the recency tracker; emit-only, never a routing input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetHoldChurn {
+    /// Items that left the held set but kept an open row: operator releases,
+    /// the same transitions that drive `operator_recency`.
+    pub releases: u32,
+    /// Items that left the held set because their row left the view (the PR
+    /// merged or the issue closed): not operator actions.
+    pub left_census: u32,
+}
+
 /// Decode a present field, `null` included, as `Some(..)`; an absent field
 /// stays `None` through `#[serde(default)]` (#11606: uncapped vs unknown).
 fn observed_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
@@ -891,6 +909,12 @@ pub struct FleetStateRepo {
     /// never zero. Additive on `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_recency: Option<FleetOperatorRecency>,
+    /// The repo's cumulative hold-churn counts since this host started
+    /// (#12059), distinguishing operator releases from items that left the
+    /// census. Absent = unknown (no churn observed yet, or the census was
+    /// unread), never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_churn: Option<FleetHoldChurn>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]

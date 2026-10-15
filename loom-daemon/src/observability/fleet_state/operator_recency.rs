@@ -14,7 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use super::{FleetView, RepoView};
 use crate::telemetry::kinds::fleet_state::{
-    FleetHoldKind, FleetHoldReleaseBurst, FleetOperatorRecency, FleetStage,
+    FleetHoldChurn, FleetHoldKind, FleetHoldReleaseBurst, FleetOperatorRecency, FleetStage,
 };
 
 /// Releases within [`BURST_WINDOW_MINUTES`] that make a burst.
@@ -32,6 +32,12 @@ struct Track {
     last_release: Option<DateTime<Utc>>,
     /// Release instants inside the burst window, oldest first.
     recent: Vec<DateTime<Utc>>,
+    /// Cumulative operator releases observed since this track was seeded
+    /// (#12059): items that left the held set but kept an open row.
+    releases_total: u32,
+    /// Cumulative items that left the held set because their row left the view
+    /// (#12059): merges/closes, not operator actions.
+    left_census_total: u32,
 }
 
 static TRACKS: Mutex<BTreeMap<String, Track>> = Mutex::new(BTreeMap::new());
@@ -61,20 +67,39 @@ fn held_set(repo: &RepoView) -> Option<BTreeSet<u32>> {
 
 impl Track {
     /// Fold one pass: items that left the held set but are still open rows are
-    /// releases at `now`.
+    /// releases at `now`; those whose row also left the view (merged/closed)
+    /// are left-census events, not releases (#12059). Both are counted so the
+    /// two causes of a held-count drop are distinguishable.
     fn observe(&mut self, repo: &RepoView, now: DateTime<Utc>) {
         let held = held_set(repo);
         if let (Some(prev), Some(held)) = (&self.prev, &held) {
-            let released = prev
-                .iter()
-                .filter(|issue| !held.contains(issue) && repo.rows.contains_key(issue))
-                .count();
+            let (mut released, mut left_census) = (0u32, 0u32);
+            for issue in prev.iter().filter(|issue| !held.contains(issue)) {
+                if repo.rows.contains_key(issue) {
+                    released += 1;
+                } else {
+                    left_census += 1;
+                }
+            }
             if released > 0 {
                 self.last_release = Some(now);
-                self.recent.extend(std::iter::repeat_n(now, released));
+                self.recent
+                    .extend(std::iter::repeat_n(now, released as usize));
             }
+            self.releases_total = self.releases_total.saturating_add(released);
+            self.left_census_total = self.left_census_total.saturating_add(left_census);
         }
         self.prev = held;
+    }
+
+    /// The cumulative hold-churn counts (#12059); `None` until any churn (a
+    /// release or a left-census event) was observed, so an idle repo's record
+    /// does not carry a pair of zeros.
+    fn churn(&self) -> Option<FleetHoldChurn> {
+        (self.releases_total > 0 || self.left_census_total > 0).then_some(FleetHoldChurn {
+            releases: self.releases_total,
+            left_census: self.left_census_total,
+        })
     }
 
     /// The markers as of `now`; `None` while no release was ever observed.
@@ -103,6 +128,7 @@ pub(super) fn observe(view: &mut FleetView, now: DateTime<Utc>) {
         let track = tracks.entry(name.clone()).or_default();
         track.observe(repo, now);
         repo.operator_recency = track.markers(now);
+        repo.hold_churn = track.churn();
     }
 }
 
@@ -113,6 +139,7 @@ pub(super) fn restamp(view: &mut FleetView, now: DateTime<Utc>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for (name, repo) in &mut view.repos {
         repo.operator_recency = tracks.get_mut(name).and_then(|t| t.markers(now));
+        repo.hold_churn = tracks.get(name).and_then(Track::churn);
     }
 }
 

@@ -50,8 +50,9 @@ pub(super) fn log_parts(
 mod tests {
     use super::super::log_record_for;
     use crate::telemetry::kinds::fleet_state::{
-        FleetPrCensus, FleetSlot, FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow,
-        PlannerStamps, FLEET_STATE_LOG_ATTRIBUTE_KEYS, FLEET_STATE_SCHEMA,
+        FleetHoldChurn, FleetOperatorRecency, FleetPrCensus, FleetSlot, FleetStage,
+        FleetStateRecord, FleetStateRepo, FleetStateRow, PlannerStamps,
+        FLEET_STATE_LOG_ATTRIBUTE_KEYS, FLEET_STATE_SCHEMA,
     };
     use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
     use chrono::{TimeZone, Utc};
@@ -92,6 +93,7 @@ mod tests {
                 curator: None,
                 pending_queue: None,
                 operator_recency: None,
+                hold_churn: None,
                 ready_complete: false,
                 ready_replace: true,
                 census: Some(FleetPrCensus {
@@ -139,6 +141,35 @@ mod tests {
             Some(Value::StringValue(body)) => body,
             other => panic!("body must be the record JSON, got {other:?}"),
         };
+        let back: FleetStateRecord = serde_json::from_str(&body).unwrap();
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn operator_recency_and_hold_churn_reach_the_exported_body() {
+        // #12059: the field is `None` on an idle repo, so prove that once a
+        // release/churn is observed the fleet.state export carries it to SigNoz
+        // in the body JSON (the actual export path is not dropping the field).
+        let mut record = record(false);
+        let as_of = record.as_of;
+        record.repos[0].operator_recency = Some(FleetOperatorRecency {
+            last_hold_release_at: as_of,
+            hold_release_burst: None,
+        });
+        record.repos[0].hold_churn = Some(FleetHoldChurn {
+            releases: 1,
+            left_census: 2,
+        });
+        let envelope =
+            TelemetryEnvelope::new("robb-studio", TelemetryRecord::FleetState(record.clone()));
+        let log = log_record_for(&envelope).expect("fleet.state is a log kind");
+        let body = match log.body.and_then(|b| b.value) {
+            Some(Value::StringValue(body)) => body,
+            other => panic!("body must be the record JSON, got {other:?}"),
+        };
+        assert!(body.contains("\"operator_recency\""), "{body}");
+        assert!(body.contains("\"hold_churn\""), "{body}");
+        assert!(body.contains("\"left_census\":2"), "{body}");
         let back: FleetStateRecord = serde_json::from_str(&body).unwrap();
         assert_eq!(back, record);
     }

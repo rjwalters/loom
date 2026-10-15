@@ -397,6 +397,9 @@ pub struct RepoView {
     pub pending_queue: Option<FleetQueueDepth>,
     /// The repo's operator-action recency (#11956). Absent = unknown.
     pub operator_recency: Option<crate::telemetry::kinds::fleet_state::FleetOperatorRecency>,
+    /// The repo's cumulative hold-churn counts since this host started
+    /// (#12059). Absent = unknown.
+    pub hold_churn: Option<crate::telemetry::kinds::fleet_state::FleetHoldChurn>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -786,6 +789,7 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         curator: state.and_then(|r| r.curator.clone()),
         pending_queue: state.and_then(|r| r.pending_queue),
         operator_recency: state.and_then(|r| r.operator_recency),
+        hold_churn: state.and_then(|r| r.hold_churn),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -891,6 +895,7 @@ pub fn decide(
             && now_state.curator == was.curator
             && now_state.pending_queue == was.pending_queue
             && now_state.operator_recency == was.operator_recency
+            && now_state.hold_churn == was.hold_churn
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
