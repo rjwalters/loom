@@ -1837,6 +1837,8 @@ carries a `repo` (#11847):
 | `loom.dispatch.role_idle_slots` | `Gauge` | `{slot}` | — | `role_max_concurrent − Σ busy_slots{role≠"sweep"}`, floored at `0`. The host's agent capacity is `max_concurrent + role_max_concurrent` = `Σ busy_slots + idle_slots + role_idle_slots` |
 | `loom.forge.stage_dwell`, `.samples` | delta `Sum` | `s`, `{item}` | `state` ∈ `created_to_curated`, `curated_to_issue`, `building_to_review_requested`, `review_requested_to_merged` | time spent in a forge label stage the work finder never lists; mean = ratio. **Off by default** (#12203): absent unless `observability.stageDwell.enabled` is `true` |
 | `loom.forge.stage_items` | `Gauge` | `{item}` | `state`, `repo` (lowercase `owner/name`) | open items per repo, by state. The label states (`curated`, `issue`, `building`, `review_requested`, `changes_requested`, `pr`) count each stage label's first listing page. The queue states (#11847) come from one complete walk of the repo's open issues and PRs: `triage` (`loom:triage`), `unlabeled` (no `loom:` label), `curated_not_promoted` (`loom:curated` without `loom:issue` or `loom:building`), `issue_open_pr` / `issue_no_pr` (`loom:issue`, split by whether an open PR's body closes it), `parked` (a registry `park` label) and `pr_held` (**PRs** with a registry `hold` label, e.g. `loom:pr` under `loom:operator`) and `pr_champion_held` (#11905: **PRs** at `loom:pr` + `loom:blocked` with no operator hold, the label shape of Champion's merge-risk and critical-file holds since #11861, read without the hold marker, so another actor's markerless park counts too; a subset of `pr_held`, disjoint from operator-held approvals). States overlap; they are not a partition, so summing across `state` double-counts. Since `repo` was added (#11847) a per-state host total is `sum by (state)`. **Off by default** (#12203): absent unless `observability.stageDwell.enabled` is `true` |
+| `loom.forge.hold_items` | `Gauge` | `{item}` | `repo`, `artifact` (`issue` \| `pr`), `hold`, `basis` (`labels_at` \| `unknown`) | open items carrying a hold or park label (#12038), counted under each hold label they carry (an item with two is counted twice). `basis=labels_at` items have a known hold start; `basis=unknown` items do not and are left out of `loom.forge.hold_age_seconds`. **Off by default** with the rest of the stage sampler (`observability.stageDwell.enabled`, #12203) |
+| `loom.forge.hold_age_seconds` | `Gauge` | `s` | `repo`, `artifact`, `hold`, `stat` (`oldest` \| `p50` \| `p90`) | seconds since the hold label was last applied (#12038), nearest-rank over the `basis=labels_at` items of that `(repo, artifact, hold)`; absent when none has a known start |
 
 The stage dwell reads the stage labels' listings with the ETag-cached REST
 listing (a `304` costs no rate limit) every 5 minutes, plus at most 8 per-item
@@ -1859,6 +1861,35 @@ samples it: sums scale with the host count, means do not. With
 while its published data is fresh, and a dispatcher samples it again only when
 that data goes stale (see "Fleet gauges produced by the captain" below).
 Completed sweeps' own phase durations remain the cycle-time rollup's (#8692).
+
+**Hold age (#12038).** `loom.forge.hold_items` and `loom.forge.hold_age_seconds`
+(`observability/ops/hold_age.rs`) say how long items have been held. The
+population is every open issue or PR carrying a registry `park` or `hold` label
+(`loom:blocked`, `loom:operator`, `loom:frozen`, and the retired names that fold
+into them). `hold` is the label with `loom:` stripped and `-` turned into `_`.
+The hold start is the GitHub state mirror's `labels_at[<hold label>]`, never
+`updatedAt` (Champion's own notices bump it, #9534). The gauges cost **no
+GitHub calls**: they are labelled mirror discovery reads
+(`caller=stage_dwell`, all pages), and a repo the mirror cannot serve fresh
+emits **no hold points** (absent, never `0`; there is no REST fallback).
+Captain gating and the off-by-default switch are the stage sampler's.
+
+Count, oldest and p90 age per repo and hold over time:
+
+```promql
+max by (repo, hold) ({"__name__"="loom.forge.hold_items", basis="labels_at"})
+max by (repo, hold) ({"__name__"="loom.forge.hold_age_seconds", stat="oldest"})
+max by (repo, hold) ({"__name__"="loom.forge.hold_age_seconds", stat="p90"})
+```
+
+The oldest `hold=blocked` issue per repo, in days:
+
+```promql
+max by (repo) ({"__name__"="loom.forge.hold_age_seconds", hold="blocked", artifact="issue", stat="oldest"}) / 86400
+```
+
+Every host that samples a repo reports it, so aggregate with `max by (repo)`,
+not `sum`.
 
 The queue states of `loom.forge.stage_items` (#11847,
 `observability/ops/stage_queue.rs`) cost one unfiltered open-items walk per
