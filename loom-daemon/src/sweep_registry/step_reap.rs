@@ -15,6 +15,7 @@
 //!    restores the claim per role ([`SweepRegistry::restore_step_claim`]);
 //! 3. marks the entry `Exited` and reports `sweep.global.completed`.
 
+use super::step_spawn::capture::StepEnd;
 use super::*;
 use crate::step_role::StepRole;
 
@@ -65,12 +66,16 @@ impl SweepRegistry {
     ///   held by another sweep, or the claim label applied after the step
     ///   started while no lease of this step's was live: a label-only
     ///   claimant ([`Self::step_lease_held_elsewhere`]).
+    ///
+    /// Either way the step's end runs ([`Self::end_step`], #11906): its
+    /// leftover leases are reaped and its role-tick capture emitted.
     pub(crate) fn release_dead_step(
         &mut self,
         sweep_id: &str,
         item: u32,
         role: StepRole,
         started_at: DateTime<Utc>,
+        end: StepEnd,
     ) -> bool {
         let retained = if role.acts_on_pr() {
             self.release_pr_lock_owned(item, sweep_id).retained()
@@ -85,6 +90,7 @@ impl SweepRegistry {
                 "sweep_registry: {role} step {sweep_id} on #{item} ended, but its claim is held \
                  elsewhere now — leaving the labels alone (#11898)"
             );
+            self.end_step(sweep_id, item, role, started_at, end);
             return true;
         }
         if !self.config.skip_label_flip {
@@ -100,6 +106,7 @@ impl SweepRegistry {
             }
             self.note_label_flip(item);
         }
+        self.end_step(sweep_id, item, role, started_at, end);
         false
     }
 
@@ -223,13 +230,14 @@ impl SweepRegistry {
         started_at: DateTime<Utc>,
         exit_code: Option<i32>,
     ) -> Event {
-        self.release_dead_step(sweep_id, item, role, started_at);
+        self.release_dead_step(sweep_id, item, role, started_at, StepEnd::Exited(exit_code));
         if let Some(info) = self.entries.get_mut(sweep_id) {
             info.state = SweepState::Exited {
                 code: exit_code,
                 at: Utc::now(),
             };
         }
+        self.publish_step_slots();
         Event::SweepGlobalCompleted {
             sweep_id: sweep_id.to_string(),
             outcome: SweepOutcome::Exited,

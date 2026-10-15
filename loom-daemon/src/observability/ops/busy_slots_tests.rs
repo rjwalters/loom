@@ -116,3 +116,25 @@ fn the_role_ceiling_is_the_largest_enabled_roots() {
         5
     );
 }
+
+/// #11906: a step's slots, broken down by its role under `pool="step"`,
+/// with a zero for every step role and labels that survive the policy.
+#[test]
+fn step_slots_are_counted_by_role_under_the_step_pool() {
+    let running = BTreeMap::from([("judge", 2), ("champion", 1)]);
+    let points = super::step_points(&running);
+    let by_role: BTreeMap<String, i64> = points
+        .iter()
+        .map(|p| {
+            assert_eq!(p.labels.get("pool").map(String::as_str), Some(super::STEP_POOL));
+            assert_eq!(bounded_labels(&p.labels), p.labels, "labels survive the policy");
+            (p.labels["role"].clone(), value(p))
+        })
+        .collect();
+    assert_eq!(by_role["judge"], 2);
+    assert_eq!(by_role["champion"], 1);
+    for role in ["curator", "builder", "doctor"] {
+        assert_eq!(by_role[role], 0, "{role} reads 0, not absent");
+    }
+    assert_eq!(by_role.len(), 5);
+}
