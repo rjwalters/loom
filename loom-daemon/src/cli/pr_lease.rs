@@ -109,6 +109,11 @@ const READ_RETRY_DELAY: Duration = Duration::from_millis(300);
 /// give a slower-propagating peer comment time to appear).
 const CONFIRM_ATTEMPTS: u32 = 2;
 const CONFIRM_DELAY: Duration = Duration::from_millis(500);
+/// A `--step` claim's extra read-backs once [`READ_ATTEMPTS`] left its
+/// ordering [`Ordering::Unverified`] (#12252): one more read after each
+/// pause. The pauses back off past a throttled read's burst while staying a
+/// small part of the step engine's claim deadline (`CLAIM_TIMEOUT`, 150 s).
+const STEP_VERIFY_BACKOFF: &[Duration] = &[Duration::from_secs(2), Duration::from_secs(5)];
 /// Per-call deadline for every `gh` call here.
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -462,7 +467,8 @@ pub(crate) fn fence(
 pub(crate) enum Ordering {
     Won,
     Lost(Identity),
-    /// Own lease not visible or list unreadable: proceed (fail-open, #6287).
+    /// Own lease not visible or list unreadable. A stepless claim proceeds
+    /// (fail-open, #6287); a `--step` claim refuses (#12252).
     Unverified,
 }
 
@@ -771,8 +777,10 @@ pub(crate) enum PrLeaseAction {
     /// Publish this role's lease on a PR and run claim-then-verify-order.
     /// Exit 0 = held (add the claim label now); 4 = a peer holds it (a yield
     /// record is posted if this call had written a lease); 5 = the lease list
-    /// was unreadable, nothing written; 6 = a Judge held by the no-verdict
-    /// backstop (#11855), nothing written. Stand down on 4, 5 or 6.
+    /// was unreadable, nothing written (with `--step`, also: the order of
+    /// the lease just posted stayed unverifiable, and that lease was
+    /// released, #12252); 6 = a Judge held by the no-verdict backstop
+    /// (#11855), nothing written. Stand down on 4, 5 or 6.
     Claim(Common),
     /// Pre-push / pre-verdict fence. Exit 0 = proceed; 3 = this claimant's
     /// lease is no longer live; 4 = a peer holds this role's lease.
@@ -880,6 +888,8 @@ pub(crate) struct Ctx {
     /// The launching role run's lease file (`LOOM_ROLE_PR_LEASE_FILE`,
     /// #11931): `claim` lists a won lease there, `release` drops it.
     pub(crate) lease_file: Option<PathBuf>,
+    /// A `--step` claim's extra read-back pauses (#12252); tests shorten it.
+    pub(crate) step_verify_backoff: &'static [Duration],
 }
 
 fn with_context(
@@ -944,6 +954,7 @@ fn with_context_as(
         now: Utc::now,
         manage_renewer: true,
         lease_file: loom_daemon::pr_lease_reap::file_from_env(),
+        step_verify_backoff: STEP_VERIFY_BACKOFF,
         common: common.clone(),
     };
     f(&ctx)
@@ -962,7 +973,9 @@ impl Ctx {
         eprintln!("lease pr {} #{}: {line}", self.me.role.as_str(), self.pr());
     }
 
-    /// `claim`: pre-check, publish, verify order, start renewal.
+    /// `claim`: pre-check, publish, verify order, start renewal. With
+    /// `--step`, an ordering that stays unverifiable is refused (exit 5)
+    /// rather than held ([`verify_claim_order`](Self::verify_claim_order)).
     pub(crate) fn claim(&self) -> i32 {
         if let Err(why) = &self.gh.write_repo {
             self.say(&format!("refusing to write here (#9548): {why} — stand down"));
@@ -1013,7 +1026,11 @@ impl Ctx {
             self.say("could not post the lease comment; no claim taken — stand down");
             return EXIT_UNVERIFIED;
         };
-        match self.verify_order() {
+        match self.verify_claim_order() {
+            Ordering::Unverified if self.common.step.is_some() => {
+                self.withdraw_unverified(own_id, &body);
+                EXIT_UNVERIFIED
+            }
             Ordering::Lost(winner) => {
                 let yield_body = format!(
                     "{}\nThis {role}'s PR lease (sweep `{sweep}`, host `{host}`) was not the \
@@ -1100,6 +1117,60 @@ impl Ctx {
             host: self.me.host.clone(),
             sweep: self.me.sweep.clone(),
         }
+    }
+
+    /// [`verify_order`](Self::verify_order), with a `--step` claim's bounded
+    /// extra read-backs when it is still [`Ordering::Unverified`] (#12252).
+    ///
+    /// The step engine spawns an unattended session on an exit 0, so a step
+    /// claim must not run on an ordering nobody saw. Refusing it costs one
+    /// item: the engine records `claim_unverified`, cools that `(item, step)`
+    /// down and draws the next item, as it already does for the pre-check's
+    /// unreadable list. The extra reads (a few seconds, well inside the
+    /// engine's claim deadline) keep a brief throttle burst or a slow
+    /// read-after-write from turning a good claim into that refusal; they
+    /// never retry the post, so a throttled forge sees at most two more
+    /// reads per claim. A stepless claim (a role prompt's own `lease pr
+    /// claim`) keeps #6287's fail-open: its session fences before every push
+    /// and verdict (`lease pr fence`), and a refusal there would stand a
+    /// running session down on one read blip.
+    fn verify_claim_order(&self) -> Ordering {
+        let seen = self.verify_order();
+        if seen != Ordering::Unverified || self.common.step.is_none() {
+            return seen;
+        }
+        for pause in self.step_verify_backoff {
+            std::thread::sleep(*pause);
+            let rows = self.gh.read_rows(self.pr(), &self.policy);
+            match ordering(&self.state_of(rows.as_deref())) {
+                Ordering::Unverified => {}
+                Ordering::Lost(winner) => return Ordering::Lost(winner),
+                // Seen at last: confirm it as the first read-back would.
+                Ordering::Won => return self.verify_order(),
+            }
+        }
+        Ordering::Unverified
+    }
+
+    /// A `--step` claim whose ordering stayed unverified (#12252): mark the
+    /// lease it just posted released, so no peer waits out the TTL behind a
+    /// claim that never ran. One PATCH of the known comment, no read, and no
+    /// Judge no-verdict record (the step never started). If the write fails
+    /// too, the lease ages out at the TTL.
+    fn withdraw_unverified(&self, own_id: u64, body: &str) {
+        let mut lines = body.lines();
+        lines.next();
+        let rest: Vec<&str> = lines.collect();
+        let released = format!("{}\n{}", self.me.released_marker_with(""), rest.join("\n"));
+        let withdrawn = if self.gh.patch(own_id, &released).is_ok() {
+            "released it"
+        } else {
+            "could not release it; it ages out at the TTL"
+        };
+        self.say(&format!(
+            "could not verify the order of lease {own_id} after posting it; {withdrawn} — \
+             claim_unverified, stand down"
+        ));
     }
 
     /// Read back until this claimant's own lease is visible, then confirm.
