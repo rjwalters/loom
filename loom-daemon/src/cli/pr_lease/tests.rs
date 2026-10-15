@@ -997,6 +997,10 @@ fn the_lib_role_lease_reader_agrees_with_parse_record() {
     }
 }
 
+// ---- a daemon step's pre-taken lease (#11906) ---------------------------
+
+#[path = "step_claim_tests.rs"]
+mod step_claim;
 /// #11950 review: a Champion that claimed with `--step champion_promote`
 /// fences and releases its own lease with plain `--role champion` (default
 /// step `champion_merge`) from the same host and sweep.

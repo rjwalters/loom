@@ -154,6 +154,34 @@ fn attach_in(command: &mut Command, root: &Path, role: &str, dir: &Path) {
     command.env(PICK_JOURNAL_ENV, &path);
 }
 
+/// A step's journal file (#11906). A step runs detached from the tick that
+/// drew it, not on a role tick's blocking thread, so its journal is named by
+/// its sweep id rather than held thread-locally until the step ends.
+#[must_use]
+pub fn step_path(sweep_id: &str) -> PathBuf {
+    let name: String = sweep_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    journal_dir().join(format!("step-{name}.jsonl"))
+}
+
+/// Give a step's launch its journal ([`step_path`]). A no-op without an
+/// OTLP exporter, like [`attach`].
+pub fn attach_step(command: &mut Command, sweep_id: &str) {
+    if super::ops::global_ops_sink().is_some()
+        && crate::forge_etag_store::private_dir(&journal_dir(), true)
+    {
+        command.env(PICK_JOURNAL_ENV, step_path(sweep_id));
+    }
+}
+
+/// Make `path` this thread's journal for `root`, so the end of a step drains
+/// it through the role tick's own emit ([`take`]).
+pub fn adopt(root: &Path, path: PathBuf) {
+    ACTIVE.with(|a| *a.borrow_mut() = Some((root.to_path_buf(), path)));
+}
+
 fn prune(dir: &Path) {
     let now = std::time::SystemTime::now();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {

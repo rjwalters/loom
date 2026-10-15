@@ -338,7 +338,7 @@ pub fn is_cli_default_model_sentinel(value: &str) -> bool {
 /// refusal of a genuinely mismatched explicit pin is preserved verbatim: an
 /// operator who pinned `sonnet` onto a Codex runtime still gets the refusal and
 /// the log line, because that pin is a statement of intent that is wrong.
-pub(super) fn reconcile_unpinned_model_with_runtime(
+pub(crate) fn reconcile_unpinned_model_with_runtime(
     runtime: &str,
     model: String,
     model_source: String,
