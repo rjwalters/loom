@@ -148,8 +148,7 @@ check_branch_name() {
     # no collation, so the match is ASCII-only under any LC_ALL/LANG without
     # touching the locale (a function-scoped `local LC_ALL=C` intermittently
     # SIGSEGV'd bash 5.3 on restore, #10127).
-    local _alnum='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-    local name="${1-}" what="${2:-branch name}" why=""
+    local name="${1-}" what="${2:-branch name}" why="" _alnum='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
     if   [[ -z "$name" ]];                                     then why="it is empty"
     elif [[ "$name" == -* || "$name" == *=* ]];                then why="it starts with '-' or contains '=' — the switch and option-argument forms git re-parses instead of treating the name as a ref (e.g. --upload-pack=/tmp/x)"
     elif ! [[ "$name" =~ ^[${_alnum}][${_alnum}._/-]*$ ]];     then why="it is outside the allowlist ^[A-Za-z0-9][A-Za-z0-9._/-]*\$"
