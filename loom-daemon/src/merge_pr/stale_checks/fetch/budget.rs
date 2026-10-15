@@ -1,4 +1,6 @@
-//! How fast the freshness guard may ask GitHub (#11418).
+//! How fast the required-context reads may ask GitHub (#11418). The
+//! freshness guard they were built for is gone (#12063 slice 1); `required-checks`
+//! still reads through them.
 //!
 //! GitHub's secondary limits trip on bursts, not on hourly totals. So the
 //! guard spaces its own requests ([`before_request`]) and, once GitHub
@@ -103,7 +105,7 @@ pub(crate) fn before_request(scope: &str) -> Result<(), String> {
     let now = now();
     if let Some(until) = hold_until(scope, now) {
         return Err(format!(
-            "GitHub answered a secondary rate limit; the freshness guard sends no request \
+            "GitHub answered a secondary rate limit; the required-context read sends no request \
              on this credential for another {}s (until epoch {until}) rather than retrying \
              into it (#11418)",
             until - now

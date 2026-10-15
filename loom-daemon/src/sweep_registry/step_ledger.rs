@@ -146,6 +146,25 @@ impl SweepRegistry {
         }
     }
 
+    /// Publish `step.item.{N}.ended` for a finished step (#12152): the
+    /// step's terminal event on the bus, carrying the ledger's
+    /// classification. A step emits no `sweep.issue.{N}.exited`, so this is
+    /// what the narration sink reads to narrate a merged PR's public-feed
+    /// `completion` (`safehouse::step_narrates_completion` decides which ends
+    /// qualify). Called once per ended step by the settle pass, never for a
+    /// spawn-time refusal (`record_refusal`: no session ran). A no-op without
+    /// a bus.
+    pub fn emit_step_ended(&self, run: &StepRun) {
+        self.emit_event(crate::types::Event::StepEnded {
+            item: run.item,
+            role: run.step,
+            class: run.outcome.class.as_str().to_string(),
+            reason: run.outcome.reason.clone(),
+            ran_for_sec: i64::try_from(run.ran_for.as_secs()).unwrap_or(i64::MAX),
+            repo: None,
+        });
+    }
+
     /// Feed a Builder step's `noop` on issue `item` to the no-op hold
     /// (#12024): the fleet-wide streak, and the `loom:blocked` park at the
     /// threshold. A `noop` that waited on something outside the item

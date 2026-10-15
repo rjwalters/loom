@@ -6,8 +6,7 @@
 # the next eligible run (a push, the hourly schedule, or a forced dispatch)
 # ships them all in one +1 patch. This script is the pure decision: it reads
 # local git history only (no forge calls; the workflow's bypass ledger pins it
-# at one API call), so every case is unit-tested by test-version-bump-gate.sh
-# against fixture repos with a fixed --now.
+# at one API call).
 #
 # "Last bump" = the newest FIRST-PARENT commit on --ref that changed VERSION,
 # timed by its COMMITTER time (%ct). PRs cannot change VERSION
