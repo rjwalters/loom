@@ -194,10 +194,30 @@ pub(super) async fn list_open_in(
     label: &'static str,
     caller: &'static str,
 ) -> Option<Vec<RestIssue>> {
+    list_open_classed(root, repo, label, caller, false).await
+}
+
+/// [`list_open`] as an Observability read (#12193): shed, not retried on the
+/// writer, when no reader can serve it. `None` then, like any failure.
+pub(super) async fn list_open_observability(
+    root: PathBuf,
+    label: &'static str,
+    caller: &'static str,
+) -> Option<Vec<RestIssue>> {
+    list_open_classed(root, None, label, caller, true).await
+}
+
+async fn list_open_classed(
+    root: PathBuf,
+    repo: Option<String>,
+    label: &'static str,
+    caller: &'static str,
+    observability: bool,
+) -> Option<Vec<RestIssue>> {
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
-        list_open_with(&gh, &root, repo.as_deref(), label, caller)
+        list_open_with(&gh, &root, repo.as_deref(), label, caller, observability)
     })
     .await;
     match result {
@@ -220,8 +240,20 @@ fn list_open_with(
     repo: Option<&str>,
     label: &str,
     caller: &'static str,
+    observability: bool,
 ) -> anyhow::Result<Vec<RestIssue>> {
-    crate::forge_listing::list_issues_cached_as(caller, gh, Some(root), repo, label, "open")
+    if observability {
+        crate::forge_listing::list_issues_cached_observability_as(
+            caller,
+            gh,
+            Some(root),
+            repo,
+            label,
+            "open",
+        )
+    } else {
+        crate::forge_listing::list_issues_cached_as(caller, gh, Some(root), repo, label, "open")
+    }
 }
 
 #[cfg(test)]
