@@ -340,3 +340,47 @@ fn the_per_repo_fleet_tier_beats_the_committed_config_and_loses_to_local() {
     assert_eq!(cfg.roles["judge"][&1].layer, Layer::FleetRepo);
     assert_eq!(Layer::FleetRepo.as_str(), "fleet-repo");
 }
+
+#[test]
+fn an_empty_attempt_one_table_falls_through_to_attempt_two() {
+    // #11782: `excludeProviders: ["codex"]` empties the attempt-1 table; a skip
+    // before spawn never advances the counter, so the draw must move on itself.
+    let config = layers(&[(
+        Layer::RepoConfig,
+        json!({"runtimes": {"excludeProviders": ["codex"], "roleDraw": {"judge": [
+            {"attempt": 1, "draw": {"codex": 100}},
+            {"attempt": 2, "draw": {"claude": 100}},
+        ]}}}),
+    )]);
+    let table = config.effective_for("judge", 1).unwrap();
+    assert_eq!(table.attempt, 2);
+    assert_eq!(table.active[0].0.key, "claude");
+    let drawn = plan("judge", 1, &table, 1, None);
+    assert_eq!(drawn.order.len(), 1);
+    assert_eq!(drawn.record.attempt, 1);
+    assert_eq!(drawn.record.table_attempt, 2);
+
+    // Every table empty: the named table comes back empty, so the skip still
+    // reports EMPTY.
+    let config = layers(&[(
+        Layer::RepoConfig,
+        json!({"runtimes": {"excludeProviders": ["codex"], "roleDraw": {"judge": [
+            {"attempt": 1, "draw": {"codex": 100}},
+            {"attempt": 2, "draw": {"codex": 5, "claude": 0}},
+        ]}}}),
+    )]);
+    let table = config.effective_for("judge", 1).unwrap();
+    assert_eq!(table.attempt, 1);
+    assert!(table.active.is_empty());
+}
+
+#[test]
+fn overflowing_weights_saturate_and_are_not_reported_empty() {
+    let config = judge_config(&json!([{"attempt": 1, "draw":
+        {"claude": u64::MAX, "codex": 1}}]));
+    let table = config.effective_for("judge", 1).unwrap();
+    assert_eq!(table.total(), u64::MAX);
+    let drawn = plan("judge", 1, &table, 9, None);
+    assert!(!drawn.record.diagnostic_suffix().contains("EMPTY"));
+    assert_eq!(drawn.order.len(), 2);
+}

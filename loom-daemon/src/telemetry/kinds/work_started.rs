@@ -117,8 +117,7 @@ pub struct WorkStartedRecord {
 
 /// The role a sweep checkpoint marker hands the item to, and that role's
 /// stage. `None` (no marker) is the Curator in `sweep.curator`; `merge-done`
-/// starts no work, and an unknown marker is never guessed at. The stage agrees
-/// with `fleet_state::held_stage` for every known marker (tested).
+/// starts no work, and an unknown marker is never guessed at.
 #[must_use]
 pub fn sweep_role_for_marker(marker: Option<&str>) -> Option<(FleetStage, &'static str)> {
     Some(match marker {
@@ -148,19 +147,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sweep_stage_agrees_with_fleet_state_for_every_marker() {
-        let at = Utc::now();
-        for marker in [
-            None,
-            Some("curator-done"),
-            Some("builder-done"),
-            Some("doctor-done"),
-            Some("judge-rejected"),
-            Some("judge-done"),
+    fn every_known_marker_maps_to_its_stage() {
+        for (marker, want) in [
+            (None, FleetStage::SweepCurator),
+            (Some("curator-done"), FleetStage::SweepBuilder),
+            (Some("builder-done"), FleetStage::ReviewWait),
+            (Some("doctor-done"), FleetStage::ReviewWait),
+            (Some("judge-rejected"), FleetStage::Doctor),
+            (Some("judge-done"), FleetStage::MergeWait),
         ] {
             let (stage, _) = sweep_role_for_marker(marker).unwrap_or_else(|| panic!("{marker:?}"));
-            let (held, ..) = crate::observability::fleet_state::held_stage(marker, Some(at), at);
-            assert_eq!(stage, held, "{marker:?}");
+            assert_eq!(stage, want, "{marker:?}");
         }
         assert_eq!(sweep_role_for_marker(Some("merge-done")), None);
         assert_eq!(sweep_role_for_marker(Some("future-marker")), None);
