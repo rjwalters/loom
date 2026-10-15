@@ -47,12 +47,6 @@ const UNCOUNTED: &[(&str, usize, &str)] = &[
          walk follows REST `Link` headers only, and the call is not a facade row at all",
     ),
     (
-        "merge_pr/redate.rs",
-        1,
-        "`gh_api_with` is a raw `Command` spawn (it pipes a request body on stdin) outside the \
-         facade: no ledger row, so no page count; the choke-point ratchet owns its migration",
-    ),
-    (
         "cli/pr_latency_cmd.rs",
         1,
         "operator report CLI through the raw `script_helpers::run_gh` spawn: not a facade row; \

@@ -1,7 +1,7 @@
 # Merge-Queue CI Qualification
 
 **Issue #10257** (Phase C of #9978). With GitHub's merge queue, Loom would
-enqueue a Judge-approved PR rather than re-dating and merging it directly. That
+enqueue a Judge-approved PR rather than merging it directly. That
 only protects `main` if every suite Loom relies on validates the **combined
 merge-group tree**, meaning the base plus every PR queued ahead of this one. A
 workflow can list `merge_group` as a trigger and still skip the suites that
@@ -190,8 +190,9 @@ The findings:
   together. They do not reduce Loom's per-PR run count, and this design does
   not assume they do.
 - **Expected cost shape.** Per merged PR, queue mode adds one full
-  `merge_group` run of about 86 runner-minutes and removes the re-date reruns
-  that direct mode pays whenever `main` moves under an approved PR. Whether
+  `merge_group` run of about 86 runner-minutes, and in exchange tests the
+  combined tree that direct mode merges untested when `main` moves under an
+  approved PR (#12063 removed direct mode's re-date reruns). Whether
   that nets out positive is the pilot's question. GitHub fast-forwards `main`
   to the merge-group head, so the `push` run on `main` re-tests an identical
   SHA. Removing that `push` run would be a separate, evidence-gated change and

@@ -147,3 +147,10 @@ scripts/tests/test-classify-capacity-defer.sh
 # #9782 (2026-10-15) — every suite now registers a real write-scope fixture
 # (write-scope-fixture.sh); the allow-all forge may-write stub goes.
 scripts/tests/lib/write-scope-stub.sh
+
+# #12063 (2026-10-15) — merge-pr's freshness guard, re-date remedy and
+# ci-result gate removed (slice 1); their doc and shell suites go with them.
+docs/stale-check-inputs.md
+scripts/tests/test-merge-pr-ci-result.sh
+scripts/tests/test-merge-pr-stale-check-redate.sh
+scripts/tests/test-merge-pr-stale-required-checks.sh

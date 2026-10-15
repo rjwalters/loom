@@ -1853,7 +1853,7 @@ workspace's, so on a host whose repos disagree the two can differ. The sample's
 points are sent in records of at most 256 (`MAX_POINTS_PER_RECORD`), dwell
 pairs first, so a many-repo sample is never truncated.
 
-Merge-chain re-date pressure (Issue #10163, `observability/ops/redate_chain.rs`).
+Merge-chain re-date pressure (Issue #10163, `observability/ops/redate_chain.rs`). The re-date remedy itself is retired (#12063); these gauges remain to measure it reaching zero (#10888).
 These are `Gauge`s over a trailing 24 h window, sampled on the `host.health`
 cadence from local `git log` only, with no forge call. They are never labelled
 by PR or repo. Read them with `max` across hosts:
