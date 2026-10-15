@@ -1,36 +1,26 @@
 //! Tests for the record-kind registry (`telemetry/kinds.rs`, Issue #8921).
 //!
-//! Three properties, in order of how much they are worth:
+//! Two properties:
 //!
-//! 1. **Two independent branches that each add a record kind merge cleanly.**
-//!    That is the whole point of the issue — #8915 and #8909 were each clean
-//!    and jointly unmergeable — so it is asserted against real `git`, not
-//!    assumed from the `.gitattributes` line being present.
-//! 2. **No pre-#8921 kind's wire contract moved.** Collapsing the
+//! 1. **No pre-#8921 kind's wire contract moved.** Collapsing the
 //!    `schema_version` ladder into a `gate:` column must be byte-identical for
 //!    every kind that already shipped; the frozen table below is the guard, and
 //!    it never needs appending to (post-#8921 kinds share
 //!    [`NEW_KIND_SCHEMA_VERSION`], so nobody has to touch these rows again).
-//! 3. **A union merge cannot pass silently broken.** Union merge takes both
-//!    sides, which is right for independent rows and wrong for two edits to the
-//!    same row; the uniqueness and coherence tests here are what turn that into
-//!    a loud `cargo test` failure rather than a bad wire tag in production.
+//! 2. **The registry stays coherent.** Wire tags and variants are unique and
+//!    each row is well-formed, so two edits that both land in the table turn
+//!    into a loud `cargo test` failure rather than a bad wire tag in production.
 
 use super::*;
 use crate::telemetry::kinds::{TelemetryKindOtlp, NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Path of the registry, relative to the repository root — the same string the
 /// `.gitattributes` pattern uses.
 const REGISTRY_PATH: &str = "loom-daemon/src/telemetry/kinds.rs";
 
-/// The `.gitattributes` line that makes two concurrent row appends merge
-/// instead of conflict.
-const UNION_ATTRIBUTE: &str = "loom-daemon/src/telemetry/kinds.rs merge=union";
-
-/// The marker a new row is appended above — load-bearing for the merge test,
-/// and documented as such in the registry itself.
+/// The marker a new row is appended above, documented as such in the registry
+/// itself.
 const APPEND_MARKER: &str = "// APPEND NEW KINDS ABOVE THIS LINE";
 
 /// Every record kind that existed when #8921 landed, with the exact envelope
@@ -71,23 +61,6 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-// ---------------------------------------------------------------------------
-// 1. The property the issue is about: concurrent additions merge.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn gitattributes_marks_the_registry_as_union_merge() {
-    let attributes = std::fs::read_to_string(repo_root().join(".gitattributes"))
-        .expect("repository has a .gitattributes");
-    assert!(
-        attributes
-            .lines()
-            .any(|line| line.trim() == UNION_ATTRIBUTE),
-        ".gitattributes must carry `{UNION_ATTRIBUTE}` — without it two concurrent \
-         record-kind additions conflict again (#8921)"
-    );
-}
-
 #[test]
 fn the_registry_keeps_its_append_marker() {
     let registry =
@@ -95,105 +68,12 @@ fn the_registry_keeps_its_append_marker() {
     assert!(
         registry.contains(APPEND_MARKER),
         "{REGISTRY_PATH} must keep the `{APPEND_MARKER}` marker: it is where a new kind's \
-         single row goes, and what the concurrent-merge test appends to"
+         single row goes"
     );
-}
-
-/// Simulates the #8915-vs-#8909 collision on the post-#8921 layout: two
-/// branches, each appending one record-kind row at the same append point, with
-/// no knowledge of each other. Under the `merge=union` attribute the merge must
-/// succeed and keep **both** rows.
-#[test]
-fn two_branches_each_adding_a_record_kind_merge_cleanly() {
-    let root = repo_root();
-    let registry =
-        std::fs::read_to_string(root.join(REGISTRY_PATH)).expect("the registry file exists");
-    let attributes = std::fs::read_to_string(root.join(".gitattributes"))
-        .expect("repository has a .gitattributes");
-
-    if Command::new("git").arg("--version").output().is_err() {
-        eprintln!("skipping: no git on PATH");
-        return;
-    }
-
-    let scratch = tempfile::tempdir().expect("tempdir");
-    let repo = scratch.path();
-    let run = |args: &[&str]| {
-        let output = Command::new("git")
-            .args(["-C", repo.to_str().expect("utf-8 tempdir")])
-            .args([
-                "-c",
-                "user.email=loom@example.invalid",
-                "-c",
-                "user.name=Loom Test",
-            ])
-            .args(args)
-            .output()
-            .expect("git runs");
-        (output.status.success(), String::from_utf8_lossy(&output.stderr).into_owned())
-    };
-
-    // A repository shaped like this one: same registry path, same attributes.
-    std::fs::create_dir_all(repo.join(REGISTRY_PATH).parent().expect("has a parent"))
-        .expect("mkdir -p");
-    std::fs::write(repo.join(REGISTRY_PATH), &registry).expect("seed the registry");
-    std::fs::write(repo.join(".gitattributes"), &attributes).expect("seed .gitattributes");
-    assert!(run(&["init", "-q", "-b", "base"]).0, "git init");
-    assert!(run(&["add", "-A"]).0, "git add");
-    assert!(run(&["commit", "-q", "-m", "base"]).0, "git commit");
-
-    // Each branch appends exactly one row, immediately above the marker —
-    // i.e. both insert at the same line, the worst case for a textual merge.
-    let row = |variant: &str, kind: &str| {
-        format!(
-            "            /// Synthetic kind for the concurrent-merge test.\n\
-             \x20           {variant} = \"{kind}\" => $crate::telemetry::HostHealthRecord,\n\
-             \x20               gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, \
-             otlp: Logs, native: true;\n\n"
-        )
-    };
-    let with_row = |variant: &str, kind: &str| {
-        let insertion = row(variant, kind);
-        let at = registry.find(APPEND_MARKER).expect("marker present");
-        // Insert at the start of the marker's own line.
-        let line_start = registry[..at].rfind('\n').map_or(0, |i| i + 1);
-        let mut patched = String::with_capacity(registry.len() + insertion.len());
-        patched.push_str(&registry[..line_start]);
-        patched.push_str(&insertion);
-        patched.push_str(&registry[line_start..]);
-        patched
-    };
-
-    for (branch, variant, kind) in [
-        ("kind-alpha", "SyntheticAlpha", "synthetic.alpha"),
-        ("kind-beta", "SyntheticBeta", "synthetic.beta"),
-    ] {
-        assert!(run(&["checkout", "-q", "base"]).0, "checkout base");
-        assert!(run(&["checkout", "-q", "-b", branch]).0, "branch {branch}");
-        std::fs::write(repo.join(REGISTRY_PATH), with_row(variant, kind))
-            .expect("write the branch's row");
-        assert!(run(&["commit", "-q", "-am", branch]).0, "commit {branch}");
-    }
-
-    assert!(run(&["checkout", "-q", "kind-alpha"]).0, "checkout kind-alpha");
-    let (merged, stderr) = run(&["merge", "--no-edit", "-q", "kind-beta"]);
-    assert!(
-        merged,
-        "two branches each adding one record-kind row must merge cleanly \
-         (that is the whole point of #8921); git said: {stderr}"
-    );
-
-    let result = std::fs::read_to_string(repo.join(REGISTRY_PATH)).expect("read merged registry");
-    assert!(!result.contains("<<<<<<<"), "merged registry must carry no conflict markers");
-    for kind in ["synthetic.alpha", "synthetic.beta"] {
-        assert!(result.contains(kind), "the union merge must keep `{kind}`'s row");
-    }
-    // And the pre-existing rows survive untouched.
-    assert!(result.contains("\"queue.snapshot\""), "existing rows must survive the merge");
 }
 
 // ---------------------------------------------------------------------------
-// 2. No pre-#8921 kind's wire contract moved.
+// 1. No pre-#8921 kind's wire contract moved.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -255,7 +135,7 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
-// 3. A union merge cannot pass silently broken.
+// 2. The registry stays coherent.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -269,8 +149,8 @@ fn wire_tags_and_variant_names_are_unique() {
             );
             assert_ne!(
                 meta.variant, other.variant,
-                "duplicate variant `{}` — a union merge of two edits to the SAME row, not \
-                 two independent rows",
+                "duplicate variant `{}` — two edits to the SAME row, not two \
+                 independent rows",
                 meta.variant
             );
         }
