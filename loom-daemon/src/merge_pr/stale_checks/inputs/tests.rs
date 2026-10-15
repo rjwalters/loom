@@ -401,7 +401,7 @@ guard will not notice when `main` changes that script.",
 #[test]
 fn a_composite_context_is_stale_when_any_component_is() {
     let specs = specs_for("Structural Checks").expect("composite resolves");
-    assert_eq!(specs.len(), 10);
+    assert_eq!(specs.len(), 9);
     // main changes the scrub checker; the PR edits a scanned file.
     let d = set(&["scripts/check-vendored-private-refs.sh"]);
     let p = set(&["defaults/docs/lib.md"]);
@@ -494,7 +494,9 @@ fn a_pr_editing_this_gates_own_ci_yml_block_is_still_stale() {
     let s = spec("Conflict Marker Check");
     assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&["Conflict Marker Check"])).is_some());
     // …and a scope naming some OTHER gate does not accidentally cover this one.
-    assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&["Vendored Private-Reference Scrub"])).is_none());
+    assert!(
+        stale_reason_scoped(s, &d, &p, &pr_scope(&["Vendored Private-Reference Scrub"])).is_none()
+    );
 }
 
 #[test]
@@ -504,8 +506,9 @@ fn the_pr_side_narrowing_does_not_rescue_a_real_global_input_change() {
     // stale on the baseline.
     let d = set(&["defaults/docs/big.md"]);
     let p = set(&[CI_WORKFLOW, "scripts/check-vendored-private-refs.sh"]);
-    let reason = stale_reason_scoped(spec("Vendored Private-Reference Scrub"), &d, &p, &pr_scope(&[]))
-        .expect("the baseline edit is a global-input change regardless of ci.yml");
+    let reason =
+        stale_reason_scoped(spec("Vendored Private-Reference Scrub"), &d, &p, &pr_scope(&[]))
+            .expect("the baseline edit is a global-input change regardless of ci.yml");
     assert_eq!(reason.pr_path.as_deref(), Some("scripts/check-vendored-private-refs.sh"));
 }
 

@@ -55,7 +55,8 @@ fn incident_timeline_green_run_predating_the_tightened_tip_is_stale() {
 fn incident_message_names_the_check_and_both_timestamps() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let started: DateTime<Utc> = INCIDENT_RUN_STARTED.parse().unwrap();
-    let msg = stale_message("8078", "Vendored Private-Reference Scrub", started, base_tip, "abc123");
+    let msg =
+        stale_message("8078", "Vendored Private-Reference Scrub", started, base_tip, "abc123");
     // chrono's Display renders RFC3339 as "2026-09-17 22:54:20 UTC" — assert
     // the rendered form, which is what an operator actually reads.
     for needle in [
@@ -79,7 +80,10 @@ fn run_started_after_the_tip_is_fresh() {
         Some("success"),
         Some("2026-09-18T12:00:00Z"),
     )];
-    assert_eq!(assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs), Verdict::Fresh);
+    assert_eq!(
+        assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs),
+        Verdict::Fresh
+    );
 }
 
 #[test]
@@ -93,7 +97,10 @@ fn run_started_exactly_at_the_tip_is_fresh() {
         Some("success"),
         Some(INCIDENT_BASE_TIP),
     )];
-    assert_eq!(assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs), Verdict::Fresh);
+    assert_eq!(
+        assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs),
+        Verdict::Fresh
+    );
 }
 
 #[test]
@@ -115,7 +122,10 @@ fn a_fresh_re_run_shadows_an_older_stale_one() {
             Some("2026-09-18T13:00:00Z"),
         ),
     ];
-    assert_eq!(assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs), Verdict::Fresh);
+    assert_eq!(
+        assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs),
+        Verdict::Fresh
+    );
 }
 
 #[test]
@@ -148,7 +158,10 @@ fn required_context_with_no_run_is_left_to_the_forge() {
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
-    assert_eq!(assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs), Verdict::Fresh);
+    assert_eq!(
+        assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs),
+        Verdict::Fresh
+    );
 }
 
 #[test]
@@ -189,7 +202,10 @@ fn green_run_without_started_at_is_unknown() {
     )];
     match assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs) {
         Verdict::Unknown(why) => {
-            assert!(why.contains("Vendored Private-Reference Scrub"), "reason names the check: {why}");
+            assert!(
+                why.contains("Vendored Private-Reference Scrub"),
+                "reason names the check: {why}"
+            );
         }
         v => panic!("expected Unknown, got {v:?}"),
     }
@@ -415,7 +431,12 @@ fn the_incident_stays_refused_after_an_in_place_re_run() {
             Some("success"),
             Some(INCIDENT_RUN_STARTED),
         ),
-        run("Vendored Private-Reference Scrub", "completed", Some("success"), Some(rerun_started)),
+        run(
+            "Vendored Private-Reference Scrub",
+            "completed",
+            Some("success"),
+            Some(rerun_started),
+        ),
     ];
     assert_eq!(
         assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs),
@@ -524,7 +545,11 @@ fn a_ci_yml_move_in_this_checks_own_block_is_still_stale() {
         Some(INCIDENT_RUN_STARTED),
     )];
     for scope in [
-        CiScope::Scoped(["Vendored Private-Reference Scrub".to_string()].into_iter().collect()),
+        CiScope::Scoped(
+            ["Vendored Private-Reference Scrub".to_string()]
+                .into_iter()
+                .collect(),
+        ),
         // …and an unattributable edit keeps the pre-#9065 whole-file meaning.
         CiScope::Unscoped,
     ] {
@@ -588,7 +613,11 @@ fn a_pr_editing_this_checks_own_ci_yml_block_is_still_stale() {
         Some(INCIDENT_RUN_STARTED),
     )];
     for scope in [
-        CiScope::Scoped(["Vendored Private-Reference Scrub".to_string()].into_iter().collect()),
+        CiScope::Scoped(
+            ["Vendored Private-Reference Scrub".to_string()]
+                .into_iter()
+                .collect(),
+        ),
         // …and an unattributable PR-side edit keeps the whole-file meaning.
         CiScope::Unscoped,
     ] {
@@ -653,7 +682,12 @@ fn no_evidence_at_all_is_byte_for_byte_the_old_time_rule() {
             Some("success"),
             None,
         )],
-        vec![run("Vendored Private-Reference Scrub", "queued", None, None)],
+        vec![run(
+            "Vendored Private-Reference Scrub",
+            "queued",
+            None,
+            None,
+        )],
     ] {
         let required = ctx(&["Vendored Private-Reference Scrub"]);
         let (scoped, _) = assess_scoped(base_tip, &required, &runs, None);
@@ -708,7 +742,13 @@ fn the_input_scoped_refusal_names_the_base_and_not_a_timestamp() {
         base_path: Some("scripts/check-vendored-private-refs.sh".to_string()),
         pr_path: Some("defaults/.claude/commands/loom/builder.md".to_string()),
     };
-    let msg = stale_inputs_message("8078", "Vendored Private-Reference Scrub", "803f0c7d", &reason, "abc123");
+    let msg = stale_inputs_message(
+        "8078",
+        "Vendored Private-Reference Scrub",
+        "803f0c7d",
+        &reason,
+        "abc123",
+    );
     for needle in [
         "Merge blocked",
         "Vendored Private-Reference Scrub",

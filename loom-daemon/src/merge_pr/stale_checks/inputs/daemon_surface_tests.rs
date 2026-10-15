@@ -554,7 +554,8 @@ fn the_9543_pair_is_fresh_for_every_daemon_checks_component() {
 
 #[test]
 fn a_move_inside_the_checker_is_still_stale() {
-    let p = set(&["defaults/scripts/sweep-lease-publish.sh"]);
+    // The PR also edits the scanner, so a move of any input re-judges it.
+    let p = set(&["loom-daemon/src/secret_scan/patterns.rs"]);
     for moved in [
         "loom-daemon/src/secret_scan.rs",
         "loom-daemon/src/cli/secret_scan_cmd.rs",

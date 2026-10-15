@@ -351,7 +351,11 @@ fn only_a_modified_ci_yml_with_a_patch_is_narrowed() {
 fn unscoped_affects_everything_and_scoped_affects_only_its_members() {
     assert!(CiScope::Unscoped.affects("anything at all"));
     assert_eq!(CiScope::default(), CiScope::Unscoped);
-    let scope = CiScope::Scoped(["Vendored Private-Reference Scrub".to_string()].into_iter().collect());
+    let scope = CiScope::Scoped(
+        ["Vendored Private-Reference Scrub".to_string()]
+            .into_iter()
+            .collect(),
+    );
     assert!(scope.affects("Vendored Private-Reference Scrub"));
     assert!(!scope.affects("Dangling Link Check"));
     assert!(!CiScope::Scoped(BTreeSet::new()).affects("Vendored Private-Reference Scrub"));

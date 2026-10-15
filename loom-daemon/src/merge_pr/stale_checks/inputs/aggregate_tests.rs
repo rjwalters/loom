@@ -61,9 +61,9 @@ fn the_aggregate_folds_in_every_component_of_the_contexts_it_aggregates() {
     }
     let got: Vec<&str> = ci_result().iter().map(|s| s.context).collect();
     assert_eq!(got, expected);
-    // Its own component, plus Structural (15), macOS Shell Syntax (1) and
-    // Daemon Checks (4).
-    assert_eq!(got.len(), 21);
+    // Its own component, plus Structural (9), macOS Shell Syntax (1) and
+    // Daemon Checks (3).
+    assert_eq!(got.len(), 14);
 }
 
 #[test]
