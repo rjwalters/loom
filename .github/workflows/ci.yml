@@ -429,7 +429,17 @@ jobs:
       - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
         with:
           tool: nextest
+      # Compile apart from running so the run step below can carry a tight
+      # timeout (#11121). A leg once hung in nextest test discovery (the
+      # per-binary `--list` pass) and ate the whole 30-minute job budget;
+      # `.config/nextest.toml`'s `slow-timeout` only bounds running tests, not
+      # discovery. Compile time varies with cache state, so it stays under the
+      # job-level timeout.
+      - name: Compile tests (no run)
+        run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --no-run
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        # Healthy discovery plus execution is about 80s per leg (#11121).
+        timeout-minutes: 10
         run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
       - name: Upload per-test timings (#9456)
         # The JUnit XML `.config/nextest.toml`'s `[profile.ci.junit]` writes is
