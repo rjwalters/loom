@@ -560,8 +560,10 @@ claimant cannot hold it forever) is ≥ `LOOM_STALE_REVIEWING_MINUTES`. Use this
 reclaim comment:
 
 ```bash
+# Fail closed: an empty $CLAIMED_AT means the check's `eval` ran in another shell. Re-run it here, never post a blank claim.
+[[ -n "$CLAIMED_AT" ]] || eval "$(./.loom/scripts/claim-staleness.sh check --number "$N" --label loom:reviewing)"
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
-loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
+[[ -n "$CLAIMED_AT" ]] && loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:reviewing" &&
 gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT consecutive stand-down passes have accumulated against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_REVIEWING_MINUTES:-45}m) with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
 gh pr edit $N --add-label "loom:reviewing"
@@ -571,8 +573,10 @@ gh pr edit $N --add-label "loom:reviewing"
 **Reclaiming a stale claim** (the ordinary idle-clock path):
 
 ```bash
+# Fail closed: an empty $CLAIMED_AT means the check's `eval` ran in another shell. Re-run it here, never post a blank claim.
+[[ -n "$CLAIMED_AT" ]] || eval "$(./.loom/scripts/claim-staleness.sh check --number "$N" --label loom:reviewing)"
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
-loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
+[[ -n "$CLAIMED_AT" ]] && loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:reviewing" &&
 gh pr comment $N --body "Reclaiming stale loom:reviewing claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_REVIEWING_MINUTES:-45}m with no claimant activity) — a prior Judge's parent sweep likely died mid-review." &&
 gh pr edit $N --add-label "loom:reviewing"
