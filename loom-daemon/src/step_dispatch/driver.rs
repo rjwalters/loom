@@ -61,17 +61,48 @@ pub struct ListingState {
 ///   listing failed (a branch-only PR is invisible) or the items are the
 ///   last good listing, not this tick's.
 /// - A red repo held for its fixes keeps only its red-main fixes.
+///
+/// Returns how many Builder steps the listing held (#12025): the step path
+/// fails closed on a listing it cannot vouch for, and never falls back to a
+/// per-item open-PR probe.
 pub fn shape_pool(
     weighing: &mut super::item_draw::Weighing,
     claims: &crate::sweep_registry::step_spawn::draw_claims::DrawClaims,
     listing: ListingState,
-) {
+) -> usize {
     tick::exclude_claimed(weighing, claims);
-    if !listing.pulls_complete || listing.stale_listing {
-        tick::exclude_builders(weighing);
-    }
+    let held = if !listing.pulls_complete || listing.stale_listing {
+        tick::exclude_builders(weighing)
+    } else {
+        0
+    };
     if listing.fixes_only {
         weighing.pool.retain(|c| c.item.lane == Lane::RedMain);
+    }
+    held
+}
+
+/// Record on `report` what workspace `idx`'s listings cost this tick
+/// (#12025): a failed item listing is a listing failure with its error
+/// kind; items read from the last good listing are an incomplete listing;
+/// Builder steps held because a listing could not vouch for them are one
+/// `forge_listing` error, so `loom.dispatch.error_kind` names why the repo
+/// drew no Builder step. Pure.
+pub fn note_listing(
+    report: &mut TickReport,
+    idx: usize,
+    failed: Option<&anyhow::Error>,
+    listing: Option<ListingState>,
+    builders_held: usize,
+) {
+    if let Some(e) = failed {
+        report.note_listing_failure(idx, e);
+    }
+    if let Some(listing) = listing {
+        report.note_listing(idx, !listing.stale_listing);
+    }
+    if builders_held > 0 {
+        report.note_error(crate::work_finder::DispatchErrorKind::ForgeListing);
     }
 }
 
@@ -169,7 +200,9 @@ impl StepDriver {
         let occupied: Vec<usize> = registries.iter().map(occupancy).collect();
         let held_capabilities = crate::capability::held_capabilities();
         let mut workspaces = Vec::new();
-        let mut listing_failed = Vec::new();
+        // Per workspace: (idx, failed listing, listing state, Builders held).
+        let mut notes: Vec<(usize, Option<anyhow::Error>, Option<ListingState>, usize)> =
+            Vec::new();
         // `loom.step.actionable{repo}`: the drawable depth the stalled and
         // idle alerts key on. Absent, never 0, for a repo not listed.
         let mut actionable = Vec::new();
@@ -217,7 +250,7 @@ impl StepDriver {
                 Ok(None) => continue,
                 Err(e) => {
                     log::warn!("work_finder: {}: step listing failed: {e:#}", root.display());
-                    listing_failed.push(idx);
+                    notes.push((idx, Some(e), None, 0));
                     continue;
                 }
             };
@@ -236,15 +269,24 @@ impl StepDriver {
                 cooldowns,
             };
             let mut weighing = weigh(&gathered.inputs, &ctx, &ItemWeights::for_root(root));
-            shape_pool(
-                &mut weighing,
-                &claims,
-                ListingState {
-                    pulls_complete: gathered.pulls_complete,
-                    stale_listing: gathered.stale_listing,
-                    fixes_only,
-                },
-            );
+            let listing = ListingState {
+                pulls_complete: gathered.pulls_complete,
+                stale_listing: gathered.stale_listing,
+                fixes_only,
+            };
+            let held = shape_pool(&mut weighing, &claims, listing);
+            if held > 0 {
+                log::warn!(
+                    "work_finder: {repo}: {held} Builder step(s) held this tick: the {} cannot \
+                     vouch for them (fail closed, #12025)",
+                    if gathered.stale_listing {
+                        "item listing is the last good one"
+                    } else {
+                        "open-PR listing could not be read"
+                    }
+                );
+            }
+            notes.push((idx, None, Some(listing), held));
             actionable.extend(actionable_point(&repo, Some(&weighing)));
             workspaces.push(StepWorkspace {
                 idx,
@@ -285,7 +327,9 @@ impl StepDriver {
             &mut spawner,
         );
         let mut report = result.report;
-        report.listing_failed = listing_failed;
+        for (idx, failed, listing, held) in &notes {
+            note_listing(&mut report, *idx, failed.as_ref(), *listing, *held);
+        }
         report.occupancy = Some(total + report.dispatched);
         report.note_halts(input.halted, Some(input.halt_causes), input.roots.len());
         if !result.passes.is_empty() {
