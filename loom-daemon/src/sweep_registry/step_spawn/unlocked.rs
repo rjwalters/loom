@@ -9,7 +9,8 @@
 //! status surface. So, as `private_dispatch::prepare` does for sweeps:
 //!
 //! 1. **locked**: the roll gate, and a copy of the configuration;
-//! 2. **unlocked**: the role's resolvers, containment included;
+//! 2. **unlocked**: a Builder step's landed check ([`landed_at_spawn`],
+//!    #12251), then the role's resolvers, containment included;
 //! 3. **locked**: the sweep id, the item's lock, the peer advertisement, and
 //!    the pre-claim command;
 //! 4. **unlocked**: the pre-claim (non-Builder roles);
@@ -65,14 +66,21 @@ impl SweepRegistry {
             anyhow::Error::new(refusal)
         };
         let (item, role, kind) = (request.item, request.role, request.kind());
-        let config = {
+        let (config, target) = {
             let reg = locked(registry);
             if let Err(e) = reg.roll_gate.admit(&kind) {
                 drop(reg);
                 return Err(refuse(StepRefusal::new("roll_paused", e)));
             }
-            reg.config.clone()
+            let target = (role == StepRole::Builder)
+                .then(|| reg.open_pr_listing_target())
+                .flatten();
+            (reg.config.clone(), target)
         };
+        if let Some(pr) = target.and_then(|t| blocking(|| landed_at_spawn(&t, item))) {
+            locked(registry).hold_landed_builder(item);
+            return Err(refuse(landed_refusal(item, pr)));
+        }
         let launch = match blocking(|| Self::resolve_step_launch(&config, role, &kind)) {
             Ok(launch) => launch,
             Err(refusal) => {
