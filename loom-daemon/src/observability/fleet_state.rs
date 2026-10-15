@@ -68,6 +68,7 @@ use crate::telemetry::kinds::fleet_state::{
     FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason,
     PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
+use crate::telemetry::kinds::pick_decision::PickSkipReason;
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
 pub mod enrich;
@@ -293,6 +294,8 @@ pub struct ReadyItem {
     pub eligible_reason: Option<FleetEligibleReason>,
     /// When that clock ends, when the work finder knows (#11564).
     pub eligible_at: Option<DateTime<Utc>>,
+    /// The closed-set reason the tick skipped this eligible item (#11960).
+    pub dispatch_blocked_reason: Option<PickSkipReason>,
 }
 
 /// One repo's dispatch limits from the work finder's last tick (#11606).
@@ -587,6 +590,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 main_red_fix: item.main_red_fix,
                 eligible_reason: item.eligible_reason,
                 eligible_at: item.eligible_at,
+                dispatch_blocked_reason: item.dispatch_blocked_reason,
                 ..FleetStateRow::new(item.issue, FleetStage::ReadyWait, now)
             };
             offer(&mut candidates, &item.repo, Source::Ready, row);
@@ -690,6 +694,17 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             }
             (None, Some(was)) => row.hold_released_at = was.hold_released_at,
             (None, None) => {}
+        }
+        // Dispatch-block timing (#11960), like hold timing: the first pass of
+        // the current continuous skip for one reason; a new reason restarts
+        // it, and an item no longer skipped carries none.
+        if let Some(reason) = row.dispatch_blocked_reason {
+            row.dispatch_blocked_since = match was {
+                Some(was) if was.dispatch_blocked_reason == Some(reason) => {
+                    was.dispatch_blocked_since.or(Some(now))
+                }
+                _ => Some(now),
+            };
         }
         // Roll the row's own label-derived facts up into the merge-readiness
         // reason (#11644). Computed last, so it reflects the final stage, hold

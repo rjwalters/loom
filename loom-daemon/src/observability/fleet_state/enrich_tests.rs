@@ -128,6 +128,7 @@ fn a_ready_row_is_dated_by_its_issue_history() {
             main_red_fix: false,
             eligible_reason: None,
             eligible_at: None,
+            dispatch_blocked_reason: None,
         }],
         ..ReadyQueue::default()
     });

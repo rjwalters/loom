@@ -67,6 +67,7 @@ fn ready(repo: &str, issue: u32, rank: u32) -> ReadyItem {
         main_red_fix: false,
         eligible_reason: None,
         eligible_at: None,
+        dispatch_blocked_reason: None,
     }
 }
 
@@ -1164,4 +1165,33 @@ fn build_view_prefers_local_slots_over_plan_slots() {
     assert_eq!(build_view(&with_ready(Some(local)), None, t0()).slots, Some(local));
     // Local slots absent → fall back to the plan's.
     assert_eq!(build_view(&with_ready(None), None, t0()).slots, Some(plan));
+}
+
+#[test]
+fn dispatch_blocked_since_keeps_first_skip_and_resets_on_change() {
+    use crate::telemetry::kinds::pick_decision::PickSkipReason as R;
+    let with = |reason: Option<R>| {
+        let mut i = input();
+        i.ready.as_mut().unwrap().items[0].dispatch_blocked_reason = reason;
+        i
+    };
+    let row = |v: &FleetView| v.repos[OTHER].rows[&5].clone();
+    let (t1, t2, t3, t4) = (
+        t0() + Duration::minutes(1),
+        t0() + Duration::minutes(2),
+        t0() + Duration::minutes(3),
+        t0() + Duration::minutes(4),
+    );
+    let v1 = build_view(&with(Some(R::Cap)), None, t1);
+    assert_eq!(row(&v1).dispatch_blocked_since, Some(t1));
+    // Same reason: the first-skip instant is kept.
+    let v2 = build_view(&with(Some(R::Cap)), Some(&v1), t2);
+    assert_eq!(row(&v2).dispatch_blocked_since, Some(t1));
+    // New reason: restarts.
+    let v3 = build_view(&with(Some(R::Backoff)), Some(&v2), t3);
+    assert_eq!(row(&v3).dispatch_blocked_since, Some(t3));
+    // No longer skipped: cleared.
+    let v4 = build_view(&with(None), Some(&v3), t4);
+    assert_eq!(row(&v4).dispatch_blocked_reason, None);
+    assert_eq!(row(&v4).dispatch_blocked_since, None);
 }
