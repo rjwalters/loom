@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(DispatchErrorKind::of_dispatch(&spawn), DispatchErrorKind::DispatchSpawn);
         let prset = anyhow!("EAGAIN").context("failed to spawn PrSet sweep child");
         assert_eq!(DispatchErrorKind::of_dispatch(&prset), DispatchErrorKind::DispatchSpawn);
-        let limited = anyhow!("secondary rate limit").context("gh issue edit failed");
+        let limited = anyhow!("secondary rate limit").context("issue edit failed");
         assert_eq!(DispatchErrorKind::of_dispatch(&limited), DispatchErrorKind::RateLimited);
         let other = anyhow!("refusing to dispatch an empty PrSet");
         assert_eq!(DispatchErrorKind::of_dispatch(&other), DispatchErrorKind::Other);
