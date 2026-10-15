@@ -1877,6 +1877,11 @@ new config key: `paused` and `stopped` both go through the drain machinery
   `restart --drain` and an auto-update roll all keep their own pause and their
   own release path. Conversely `restart --abort-drain` on a `paused` host
   resumes dispatch only until the next sync pass re-reads the store, and says so.
+  So a host paused in the store **and** held by a local operator stop (for
+  example a supervisor-environment hold re-armed at startup) stays held after
+  the store returns to `running`: `status` then reads `desired running … -> no
+  fleet-store hold (dispatch may still be held locally; see Drain)` while the
+  Drain line says `HELD`, and `loom-daemon restart --abort-drain` releases it.
 - **Unset `fleet.repo` is unchanged.** No state is read, nothing is held, and
   nothing can refuse to start.
 
