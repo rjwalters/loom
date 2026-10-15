@@ -208,7 +208,8 @@ chmod +x "$FAKE_FILE_DIR/file"
 # host has installed. Used by test 36 to assert the soft-pass contract.
 NO_FILE_DIR="$WORKDIR/no-file-bin"
 mkdir -p "$NO_FILE_DIR"
-for tool in uname mkdir install cp mv chmod rm ln readlink env bash sh head; do
+# sleep: _pmd_verify_binary_loadable (#8843) polls with `sleep 1`; without it the 10s cap collapses to ~10 instant spins and a slow-starting fresh binary fails with exit 124 (#9720).
+for tool in uname mkdir install cp mv chmod rm ln readlink env bash sh head sleep; do
   tool_path="$(command -v "$tool" 2>/dev/null || true)"
   [[ -n "$tool_path" ]] && ln -sf "$tool_path" "$NO_FILE_DIR/$tool"
 done
@@ -351,7 +352,8 @@ assert_eq "non-Darwin: codesign is never invoked" "0" "$( [[ -e "$CODESIGN_MARKE
 # and never attempt to invoke a missing codesign.
 NO_CODESIGN_DIR="$WORKDIR/no-codesign-bin"
 mkdir -p "$NO_CODESIGN_DIR"
-for tool in uname mkdir install cp mv rm chmod env bash sh; do
+# sleep: _pmd_verify_binary_loadable (#8843) polls with `sleep 1`; without it the 10s cap collapses to ~10 instant spins and a slow-starting fresh binary fails with exit 124 (#9720).
+for tool in uname mkdir install cp mv rm chmod env bash sh sleep; do
   tool_path="$(command -v "$tool" 2>/dev/null || true)"
   [[ -n "$tool_path" ]] && ln -sf "$tool_path" "$NO_CODESIGN_DIR/$tool"
 done
