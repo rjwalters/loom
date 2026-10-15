@@ -205,12 +205,22 @@ pub fn note_attempt(config_dir: Option<&Path>, out: &std::process::Output) {
     if super::owner_of_profile_dir(dir).is_none() {
         return;
     }
-    let answered = out.status.success()
-        || crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
-            .is_some_and(|r| r.status < 500)
-        || http_status_in(&String::from_utf8_lossy(&out.stderr)).is_some_and(|s| s < 500);
-    if answered {
+    if answered(out) {
         note_answered();
+    }
+}
+
+/// Whether GitHub answered this run. The parsed HTTP status decides first: a
+/// status of 500 or above is a gateway failure whatever the exit code (a relay
+/// quirk or a future `gh` could exit 0 on one). Only with no parsed status
+/// does the exit code decide.
+pub(crate) fn answered(out: &std::process::Output) -> bool {
+    let status = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
+        .map(|r| r.status)
+        .or_else(|| http_status_in(&String::from_utf8_lossy(&out.stderr)));
+    match status {
+        Some(s) => s < 500,
+        None => out.status.success(),
     }
 }
 

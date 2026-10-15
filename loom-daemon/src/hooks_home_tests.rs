@@ -152,6 +152,31 @@ fn resolve_honours_a_pin_and_an_empty_opt_out() {
 }
 
 #[test]
+fn resolve_warns_whether_a_pin_would_pass_the_trust_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let trusted = tmp.path().join("trusted");
+    std::fs::create_dir(&trusted).unwrap();
+    std::fs::set_permissions(&trusted, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+    for (pin, ok) in [
+        (&trusted, true),
+        (&shared, false),
+        (&tmp.path().join("missing"), false),
+    ] {
+        assert_eq!(is_trusted(pin), ok);
+        let msg = pin_warning(pin, is_trusted(pin));
+        assert!(msg.contains(&pin.display().to_string()));
+        assert_eq!(msg.contains("would NOT pass"), !ok, "{msg}");
+        // The pin is still passed through unchanged.
+        let got = resolve(Some(pin.display().to_string()), None, &sample(), "1.2.3");
+        assert_eq!(got.as_deref(), Some(pin.as_path()));
+    }
+}
+
+#[test]
 fn resolve_without_a_home_is_none() {
     assert_eq!(resolve(None, None, &sample(), "1.2.3"), None);
 }

@@ -233,6 +233,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("claim_reconciliation/read_cache_tests.rs", "test"),
         ("claim_reconciliation/read_cache_passes_tests.rs", "test"),
         ("claim_reconciliation/open_pr_listing_tests.rs", "test"),
+        // #12041: fixture only. Feeds a Judge-authored verdict marker to the
+        // base-conflict pass to prove it never clears a flag it did not write;
+        // it reads no forge comments.
+        ("claim_reconciliation/review_conflict_approved_tests.rs", "test fixture"),
         // #9258: WRITES the anchor marker (moved here from claim_reconciliation.rs)
         // and acts on `decide_anchor`; it reads no comment bodies itself.
         ("claim_reconciliation/unanchored_verdict.rs", "writer, never a reader"),
