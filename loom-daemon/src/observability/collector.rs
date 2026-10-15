@@ -151,6 +151,12 @@ async fn run_collector(
     // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
     let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
     ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The pass's forge gathers (captain facts, stage dwell, fleet state) on
+    // the snapshot cadence, first fired after this host's startup jitter
+    // (#12073) so a fleet that restarts together does not gather at once.
+    let first_gather = crate::startup_jitter::arm(&workspace_root).opens_at();
+    let mut forge_timer = tokio::time::interval_at(first_gather, snapshot_interval);
+    forge_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // First-boot backfill (Issue #5084): run once immediately, before the
     // first snapshot tick, so a sweep adopted across a daemon restart does
@@ -194,6 +200,10 @@ async fn run_collector(
 
             _ = ratelimit_timer.tick() => {
                 super::ops::ratelimit::record(&workspace_root).await;
+            }
+
+            _ = forge_timer.tick() => {
+                forge_gathers(&workspace_root, &workspace_pool, &mut slug_cache).await;
             }
 
             _ = snapshot_timer.tick() => {
@@ -1003,11 +1013,6 @@ async fn sample_snapshots(
     // The work finder's ranked ready queue (Issue #8852, phase 2) — native
     // HTTPS only, and only when the work finder has ticked since last time.
     super::queue_snapshot::record(workspace_pool, slug_cache).await;
-    // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
-    // listings plus a bounded per-item budget; a no-op without the ops sink.
-    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
-    // skips the repos a fresh captain covers (`captain_gauges`).
-    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
     // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
     // reads, no forge call; a no-op without the ops sink.
     super::ops::redate_chain::record(workspace_pool).await;
@@ -1020,6 +1025,21 @@ async fn sample_snapshots(
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot
     // stall this pass; the WARN lives in the watch and runs without telemetry.
     super::ops::codex_session::record();
+}
+
+/// The collector's fleet-wide forge gathers, on their own timer so the first
+/// one can wait out the startup jitter (#12073) while the host samples above
+/// run from boot.
+async fn forge_gathers(
+    workspace_root: &Path,
+    workspace_pool: &WorkspacePool,
+    slug_cache: &mut HashMap<String, String>,
+) {
+    // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
+    // listings plus a bounded per-item budget; a no-op without the ops sink.
+    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
+    // skips the repos a fresh captain covers (`captain_gauges`).
+    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
     // This host's view of its held sweeps, review PRs and ready queue over
     // OTLP (Issue #10196), independent of ETA. 5-minute anchor, deltas only
     // on change; its review listings are ETag-cached (warm after stage_dwell)

@@ -658,6 +658,12 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
             }
         }
         let p = self.inner.permission(repo);
+        // #12074: an Unknown because the work-finder tick's read deadline
+        // passed says nothing about the credential; caching it would make
+        // passes outside the tick read Deny for a minute.
+        if matches!(p, Permission::Unknown(_)) && crate::gh_invocation::read_deadline::passed() {
+            return with_grace(p, last_write, now);
+        }
         match &p {
             Permission::Write => last_write = Some(now),
             Permission::Insufficient(_) => last_write = None,

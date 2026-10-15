@@ -180,3 +180,57 @@ fn a_gh_usage_error_is_neither_rerun_nor_an_outage() {
     assert_eq!(s.calls(), ["gateway"]);
     assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
 }
+
+/// #12074 review: inside a work-finder tick's read scope, a gateway that
+/// keeps failing without signalling an outage (a relayed 5xx, a timeout) must
+/// not starve a Gate read. The readers are not out of budget, so the writer
+/// still serves it, on every tick.
+#[test]
+fn a_scoped_read_past_a_failing_gateway_still_reaches_the_writer() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let _scope = super::super::read_deadline::enter(deadline, true);
+    for tick in 0..2 {
+        let s = stub(RELAYED_502, OK, OK);
+        let (out, _) = s.run(false);
+        assert!(ok(&out), "tick {tick}: {out:?}");
+        assert_eq!(s.calls(), ["gateway", "writer"], "tick {tick}");
+    }
+}
+
+/// #12074 review: the third consecutive rerun fault withdraws the gateway,
+/// so a hung gateway stops charging every read its full timeout; an answer
+/// in between starts the count again.
+#[test]
+fn consecutive_gateway_reruns_withdraw_it() {
+    use crate::forge_gateway::outage::{
+        escalate, note_answered, take_test_outages, Fault, RERUNS_BEFORE_WITHDRAW,
+    };
+    let _ = take_test_outages();
+    for _ in 1..RERUNS_BEFORE_WITHDRAW {
+        assert_eq!(escalate(Fault::Rerun), Fault::Rerun);
+    }
+    note_answered();
+    for _ in 1..RERUNS_BEFORE_WITHDRAW {
+        assert_eq!(escalate(Fault::Rerun), Fault::Rerun, "an answer reset the count");
+    }
+    assert_eq!(escalate(Fault::Rerun), Fault::Withdraw);
+    assert_eq!(escalate(Fault::Rerun), Fault::Rerun, "a withdrawal starts over");
+
+    // Through the chain's classifier: the third timed-out gateway attempt in
+    // a row withdraws it (a timeout alone used to rerun forever).
+    note_answered();
+    let timed_out = || {
+        GhCompletion::Captured(Completion::TimedOut {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    };
+    for attempt in 1..=RERUNS_BEFORE_WITHDRAW {
+        let expected = if attempt < RERUNS_BEFORE_WITHDRAW {
+            Fault::Rerun
+        } else {
+            Fault::Withdraw
+        };
+        assert_eq!(super::gateway_fault(&timed_out()), expected, "attempt {attempt}");
+    }
+}

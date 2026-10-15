@@ -99,6 +99,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         daemon_build_commit: Some("18887b5c".to_string()),
         daemon_built_at_raw: Some("2026-08-02T03:09:51Z".to_string()),
         work_finder_interval_secs: Some(60),
+        startup_jitter_delay_secs: None,
         observability_host_id_mismatch: None,
         observability_export: None,
         observability_exports: std::collections::BTreeMap::new(),

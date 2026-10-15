@@ -11,8 +11,7 @@
 # can then still be written — it just cannot be written *silently*.
 #
 # WHAT THIS IS NOT: a rewrite mandate, and not a size limit. Nothing listed in
-# the baseline has to move. The size of these files is a separate, already-built
-# mechanism (#7711, check-file-size-budget.sh). This gate fires only when a
+# the baseline has to move, and file size is not gated (#12099). This gate fires only when a
 # tracked `.sh` appears that nobody classified.
 #
 # The invariant, mirroring check-ci-suite-manifest.sh's "exactly one of
@@ -152,8 +151,7 @@ list_tracked() {
 }
 
 # --- Shape-A stub measurement ------------------------------------------------
-# Code lines = lines that are neither blank nor comment-only, the same counting
-# rule check-file-size-budget.sh uses.
+# Code lines = lines that are neither blank nor comment-only.
 code_line_count() { # <abs path>
   grep -cvE '^[[:space:]]*(#|$)' "$1" 2>/dev/null || true
 }
@@ -389,7 +387,7 @@ run_list() {
 # --- Self-test ---------------------------------------------------------------
 # A gate that silently stops checking reports OK forever. Every rule above is
 # exercised against a synthetic fixture tree, per the convention
-# check-docs-defaults-parity.sh and check-file-size-budget.sh already follow.
+# check-docs-defaults-parity.sh already follows.
 self_test() {
   local tmp rc=0 out got i
   tmp="$(mktemp -d)"

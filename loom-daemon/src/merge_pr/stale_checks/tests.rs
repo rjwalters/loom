@@ -1,7 +1,7 @@
 //! Unit tests for the required-check freshness guard (#8248).
 //!
 //! The two timeline tests reproduce the 2026-09-18 incident exactly — a green
-//! `File Size Ratchet` run 22h before a baseline-tightening merge — because a
+//! `Markdown Token Ratchet` run 22h before a baseline-tightening merge — because a
 //! guard about *freshness* is exactly the kind of thing that regresses by
 //! someone "simplifying" a comparison, and the incident's timestamps are the
 //! sharpest pin available.
@@ -25,7 +25,7 @@ fn ctx(names: &[&str]) -> Vec<String> {
 
 // --- The incident, replayed -------------------------------------------------
 
-// 2026-09-17T22:54:20Z: #8078's File Size Ratchet runs green.
+// 2026-09-17T22:54:20Z: #8078's Markdown Token Ratchet runs green.
 const INCIDENT_RUN_STARTED: &str = "2026-09-17T22:54:20Z";
 // 2026-09-18T11:45:21Z: #8204's merge tightens the baseline; this is main's tip.
 const INCIDENT_BASE_TIP: &str = "2026-09-18T11:45:21Z";
@@ -34,16 +34,16 @@ const INCIDENT_BASE_TIP: &str = "2026-09-18T11:45:21Z";
 fn incident_timeline_green_run_predating_the_tightened_tip_is_stale() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
-    let verdict = assess(base_tip, &ctx(&["File Size Ratchet"]), &runs);
+    let verdict = assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs);
     assert_eq!(
         verdict,
         Verdict::Stale {
-            check: "File Size Ratchet".to_string(),
+            check: "Markdown Token Ratchet".to_string(),
             started_at: INCIDENT_RUN_STARTED.parse().unwrap(),
             base_tip,
         },
@@ -55,11 +55,11 @@ fn incident_timeline_green_run_predating_the_tightened_tip_is_stale() {
 fn incident_message_names_the_check_and_both_timestamps() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let started: DateTime<Utc> = INCIDENT_RUN_STARTED.parse().unwrap();
-    let msg = stale_message("8078", "File Size Ratchet", started, base_tip, "abc123");
+    let msg = stale_message("8078", "Markdown Token Ratchet", started, base_tip, "abc123");
     // chrono's Display renders RFC3339 as "2026-09-17 22:54:20 UTC" — assert
     // the rendered form, which is what an operator actually reads.
     for needle in [
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "2026-09-17 22:54:20 UTC",
         "2026-09-18 11:45:21 UTC",
         "abc123",
@@ -74,12 +74,12 @@ fn incident_message_names_the_check_and_both_timestamps() {
 fn run_started_after_the_tip_is_fresh() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some("2026-09-18T12:00:00Z"),
     )];
-    assert_eq!(assess(base_tip, &ctx(&["File Size Ratchet"]), &runs), Verdict::Fresh);
+    assert_eq!(assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs), Verdict::Fresh);
 }
 
 #[test]
@@ -88,12 +88,12 @@ fn run_started_exactly_at_the_tip_is_fresh() {
     // verified the world the merge will produce, not a older one.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_BASE_TIP),
     )];
-    assert_eq!(assess(base_tip, &ctx(&["File Size Ratchet"]), &runs), Verdict::Fresh);
+    assert_eq!(assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs), Verdict::Fresh);
 }
 
 #[test]
@@ -102,17 +102,27 @@ fn a_fresh_re_run_shadows_an_older_stale_one() {
     // evaluate the LATEST run per context, so the guard must too.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![
-        run("File Size Ratchet", "completed", Some("success"), Some(INCIDENT_RUN_STARTED)),
-        run("File Size Ratchet", "completed", Some("success"), Some("2026-09-18T13:00:00Z")),
+        run(
+            "Markdown Token Ratchet",
+            "completed",
+            Some("success"),
+            Some(INCIDENT_RUN_STARTED),
+        ),
+        run(
+            "Markdown Token Ratchet",
+            "completed",
+            Some("success"),
+            Some("2026-09-18T13:00:00Z"),
+        ),
     ];
-    assert_eq!(assess(base_tip, &ctx(&["File Size Ratchet"]), &runs), Verdict::Fresh);
+    assert_eq!(assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs), Verdict::Fresh);
 }
 
 #[test]
 fn no_required_checks_is_fresh() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
@@ -138,7 +148,7 @@ fn required_context_with_no_run_is_left_to_the_forge() {
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
-    assert_eq!(assess(base_tip, &ctx(&["File Size Ratchet"]), &runs), Verdict::Fresh);
+    assert_eq!(assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs), Verdict::Fresh);
 }
 
 #[test]
@@ -171,10 +181,15 @@ fn green_run_without_started_at_is_unknown() {
     // cannot be determined. Failing open here is precisely how a degraded API
     // day would re-open the incident.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
-    let runs = vec![run("File Size Ratchet", "completed", Some("success"), None)];
-    match assess(base_tip, &ctx(&["File Size Ratchet"]), &runs) {
+    let runs = vec![run(
+        "Markdown Token Ratchet",
+        "completed",
+        Some("success"),
+        None,
+    )];
+    match assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs) {
         Verdict::Unknown(why) => {
-            assert!(why.contains("File Size Ratchet"), "reason names the check: {why}");
+            assert!(why.contains("Markdown Token Ratchet"), "reason names the check: {why}");
         }
         v => panic!("expected Unknown, got {v:?}"),
     }
@@ -237,13 +252,13 @@ fn timestamps_with_fractional_seconds_parse() {
     // timestamp class it exists to compare.
     let base_tip: DateTime<Utc> = "2026-09-18T11:45:21.500Z".parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some("2026-09-18T11:45:21.000Z"),
     )];
     assert!(matches!(
-        assess(base_tip, &ctx(&["File Size Ratchet"]), &runs),
+        assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs),
         Verdict::Stale { .. }
     ));
 }
@@ -315,7 +330,7 @@ fn a_plan_gated_repo_has_no_required_checks_so_a_green_run_is_fresh() {
     // DEFINITE answer on a plan-gated repo (not a guess).
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
@@ -337,13 +352,13 @@ fn fset(paths: &[&str]) -> FileSet {
 /// file.
 fn incident_evidence() -> ScopedEvidence {
     ScopedEvidence {
-        pr_delta: fset(&["loom-daemon/src/main_health_gate.rs"]),
+        pr_delta: fset(&["defaults/.claude/commands/loom/builder.md"]),
         pr_ci_scope: CiScope::Unscoped,
         base_moves: [(
-            "File Size Ratchet".to_string(),
+            "Markdown Token Ratchet".to_string(),
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
-                files: fset(&["scripts/file-size-baseline.txt"]),
+                files: fset(&["scripts/markdown-token-baseline.txt"]),
                 ci_scope: CiScope::Unscoped,
             },
         )]
@@ -358,20 +373,24 @@ fn incident_evidence() -> ScopedEvidence {
 fn the_incident_is_refused_by_the_input_scoped_predicate() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
-    let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&incident_evidence()));
+    let (verdict, warnings) = assess_scoped(
+        base_tip,
+        &ctx(&["Markdown Token Ratchet"]),
+        &runs,
+        Some(&incident_evidence()),
+    );
     match verdict {
         Verdict::StaleInputs {
             check,
             tested_base,
             reason,
         } => {
-            assert_eq!(check, "File Size Ratchet");
+            assert_eq!(check, "Markdown Token Ratchet");
             assert_eq!(tested_base, "803f0c7d");
             assert!(reason.clause.contains("global input"), "{reason:?}");
         }
@@ -390,16 +409,25 @@ fn the_incident_stays_refused_after_an_in_place_re_run() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let rerun_started = "2026-09-18T16:26:47Z"; // after the tip: time rule says fresh
     let runs = vec![
-        run("File Size Ratchet", "completed", Some("success"), Some(INCIDENT_RUN_STARTED)),
-        run("File Size Ratchet", "completed", Some("success"), Some(rerun_started)),
+        run(
+            "Markdown Token Ratchet",
+            "completed",
+            Some("success"),
+            Some(INCIDENT_RUN_STARTED),
+        ),
+        run("Markdown Token Ratchet", "completed", Some("success"), Some(rerun_started)),
     ];
     assert_eq!(
-        assess(base_tip, &ctx(&["File Size Ratchet"]), &runs),
+        assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs),
         Verdict::Fresh,
         "the TIME rule is fooled by the re-run — this is the bug #8919 fixes"
     );
-    let (verdict, _) =
-        assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&incident_evidence()));
+    let (verdict, _) = assess_scoped(
+        base_tip,
+        &ctx(&["Markdown Token Ratchet"]),
+        &runs,
+        Some(&incident_evidence()),
+    );
     assert!(
         matches!(verdict, Verdict::StaleInputs { .. }),
         "the input-scoped predicate must still refuse it, got {verdict:?}"
@@ -411,7 +439,7 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
     // The other half: PR #8641 lost three races on base moves like this one.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
@@ -420,7 +448,7 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
         pr_delta: fset(&["defaults/docs/some-doc.md"]),
         pr_ci_scope: CiScope::Unscoped,
         base_moves: [(
-            "File Size Ratchet".to_string(),
+            "Markdown Token Ratchet".to_string(),
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
                 files: fset(&["loom-daemon/src/unrelated.rs"]),
@@ -433,12 +461,12 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
         repo_specs: repo_specs::RepoSpecs::Absent,
     };
     let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
+        assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
     assert_eq!(verdict, Verdict::Fresh, "{verdict:?}");
     assert!(warnings.is_empty());
     // The time rule alone would have refused it.
     assert!(matches!(
-        assess(base_tip, &ctx(&["File Size Ratchet"]), &runs),
+        assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs),
         Verdict::Stale { .. }
     ));
 }
@@ -447,10 +475,10 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
 /// the #9065 shape: `main` edited the workflow, the PR touches ordinary files.
 fn ci_yml_move(scope: CiScope) -> ScopedEvidence {
     ScopedEvidence {
-        pr_delta: fset(&["loom-daemon/src/lib.rs"]),
+        pr_delta: fset(&["defaults/.claude/commands/loom/judge.md"]),
         pr_ci_scope: CiScope::Unscoped,
         base_moves: [(
-            "File Size Ratchet".to_string(),
+            "Markdown Token Ratchet".to_string(),
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
                 files: fset(&[".github/workflows/ci.yml"]),
@@ -471,14 +499,14 @@ fn a_ci_yml_move_in_a_job_this_check_does_not_run_is_fresh() {
     // every open PR that touched anything at all.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
     let ev = ci_yml_move(CiScope::Scoped(std::collections::BTreeSet::new()));
     let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
+        assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
     assert_eq!(verdict, Verdict::Fresh, "{verdict:?}");
     assert!(warnings.is_empty(), "a narrowing is not a degradation: {warnings:?}");
 }
@@ -490,18 +518,19 @@ fn a_ci_yml_move_in_this_checks_own_block_is_still_stale() {
     // longer exists in that form.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
     for scope in [
-        CiScope::Scoped(["File Size Ratchet".to_string()].into_iter().collect()),
+        CiScope::Scoped(["Markdown Token Ratchet".to_string()].into_iter().collect()),
         // …and an unattributable edit keeps the pre-#9065 whole-file meaning.
         CiScope::Unscoped,
     ] {
         let ev = ci_yml_move(scope.clone());
-        let (verdict, _) = assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
+        let (verdict, _) =
+            assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
         assert!(matches!(verdict, Verdict::StaleInputs { .. }), "{scope:?}: {verdict:?}");
     }
 }
@@ -513,10 +542,10 @@ fn pr_edits_ci_yml(pr_ci_scope: CiScope) -> ScopedEvidence {
         pr_delta: fset(&[".github/workflows/ci.yml"]),
         pr_ci_scope,
         base_moves: [(
-            "File Size Ratchet".to_string(),
+            "Markdown Token Ratchet".to_string(),
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
-                files: fset(&["loom-daemon/src/unrelated.rs"]),
+                files: fset(&["defaults/.claude/commands/loom/unrelated.md"]),
                 ci_scope: CiScope::Unscoped,
             },
         )]
@@ -535,14 +564,14 @@ fn a_pr_editing_a_ci_yml_job_this_check_does_not_run_is_fresh() {
     // permanently, on a `main` that moves every ~11 minutes.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
     let ev = pr_edits_ci_yml(CiScope::Scoped(std::collections::BTreeSet::new()));
     let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
+        assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
     assert_eq!(verdict, Verdict::Fresh, "{verdict:?}");
     assert!(warnings.is_empty(), "a narrowing is not a degradation: {warnings:?}");
 }
@@ -553,18 +582,19 @@ fn a_pr_editing_this_checks_own_ci_yml_block_is_still_stale() {
     // and `main` brought a file for the rewritten gate to judge.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
     for scope in [
-        CiScope::Scoped(["File Size Ratchet".to_string()].into_iter().collect()),
+        CiScope::Scoped(["Markdown Token Ratchet".to_string()].into_iter().collect()),
         // …and an unattributable PR-side edit keeps the whole-file meaning.
         CiScope::Unscoped,
     ] {
         let ev = pr_edits_ci_yml(scope.clone());
-        let (verdict, _) = assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
+        let (verdict, _) =
+            assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
         assert!(matches!(verdict, Verdict::StaleInputs { .. }), "{scope:?}: {verdict:?}");
     }
 }
@@ -573,7 +603,7 @@ fn a_pr_editing_this_checks_own_ci_yml_block_is_still_stale() {
 fn a_context_without_evidence_falls_back_to_the_time_rule_and_warns() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
@@ -582,16 +612,19 @@ fn a_context_without_evidence_falls_back_to_the_time_rule_and_warns() {
         pr_delta: fset(&["a.rs"]),
         pr_ci_scope: CiScope::Unscoped,
         base_moves: std::collections::BTreeMap::new(),
-        fallbacks: [("File Size Ratchet".to_string(), "its job log could not be read".to_string())]
-            .into_iter()
-            .collect(),
+        fallbacks: [(
+            "Markdown Token Ratchet".to_string(),
+            "its job log could not be read".to_string(),
+        )]
+        .into_iter()
+        .collect(),
         repo_specs: repo_specs::RepoSpecs::Absent,
     };
     let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
+        assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
     assert!(matches!(verdict, Verdict::Stale { .. }), "{verdict:?}");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("File Size Ratchet"), "{}", warnings[0]);
+    assert!(warnings[0].contains("Markdown Token Ratchet"), "{}", warnings[0]);
     assert!(warnings[0].contains("job log could not be read"), "{}", warnings[0]);
     assert!(warnings[0].contains("#8248"), "{}", warnings[0]);
 }
@@ -603,21 +636,26 @@ fn no_evidence_at_all_is_byte_for_byte_the_old_time_rule() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     for runs in [
         vec![run(
-            "File Size Ratchet",
+            "Markdown Token Ratchet",
             "completed",
             Some("success"),
             Some(INCIDENT_RUN_STARTED),
         )],
         vec![run(
-            "File Size Ratchet",
+            "Markdown Token Ratchet",
             "completed",
             Some("success"),
             Some("2026-09-18T12:00:00Z"),
         )],
-        vec![run("File Size Ratchet", "completed", Some("success"), None)],
-        vec![run("File Size Ratchet", "queued", None, None)],
+        vec![run(
+            "Markdown Token Ratchet",
+            "completed",
+            Some("success"),
+            None,
+        )],
+        vec![run("Markdown Token Ratchet", "queued", None, None)],
     ] {
-        let required = ctx(&["File Size Ratchet"]);
+        let required = ctx(&["Markdown Token Ratchet"]);
         let (scoped, _) = assess_scoped(base_tip, &required, &runs, None);
         assert_eq!(
             scoped,
@@ -667,17 +705,17 @@ fn an_unmapped_required_context_with_a_moved_base_is_refused() {
 fn the_input_scoped_refusal_names_the_base_and_not_a_timestamp() {
     let reason = inputs::StaleReason {
         clause: "the base move changed a global input of this check",
-        base_path: Some("scripts/file-size-baseline.txt".to_string()),
-        pr_path: Some("loom-daemon/src/main_health_gate.rs".to_string()),
+        base_path: Some("scripts/markdown-token-baseline.txt".to_string()),
+        pr_path: Some("defaults/.claude/commands/loom/builder.md".to_string()),
     };
-    let msg = stale_inputs_message("8078", "File Size Ratchet", "803f0c7d", &reason, "abc123");
+    let msg = stale_inputs_message("8078", "Markdown Token Ratchet", "803f0c7d", &reason, "abc123");
     for needle in [
         "Merge blocked",
-        "File Size Ratchet",
+        "Markdown Token Ratchet",
         "803f0c7d",
         "abc123",
-        "scripts/file-size-baseline.txt",
-        "loom-daemon/src/main_health_gate.rs",
+        "scripts/markdown-token-baseline.txt",
+        "defaults/.claude/commands/loom/builder.md",
         // It must say plainly that a re-run will NOT clear it.
         "re-running the job in place will not clear it",
     ] {

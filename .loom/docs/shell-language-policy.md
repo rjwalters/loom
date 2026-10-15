@@ -16,11 +16,8 @@ ruling on issue #7762.
 - **Not a rewrite mandate.** Nothing on the baseline list has to move. The
   ~500 scripts that exist today are recorded, not conscripted. Migration order
   is epic #7810's problem, one phase at a time.
-- **Not a size limit.** How large an existing file may grow is a separate,
-  already-built mechanism — the #7711 ratchet in
-  [`file-size-policy.md`](file-size-policy.md) and
-  `scripts/check-file-size-budget.sh`. This policy is unchanged by, and does
-  not change, that one.
+- **Not a size limit.** File size is not gated (#12099); Hermit may propose
+  splitting a very large file.
 - **Not a ban on shell.** Five of the six categories remain open to new files.
   What is no longer possible is adding a `.sh` without saying which one it is.
 
@@ -199,8 +196,7 @@ The checked set is `git ls-files '*.sh'`, minus `.loom/**` and build output
   `defaults/hooks/*.sh`, kept byte-identical by
   `scripts/check-hooks-defaults-parity.sh`. Listing either would double-count
   every entry against its `defaults/` source and churn the manifest on every
-  `chore: resync installed Loom surfaces` commit. This is the same exemption
-  `check-file-size-budget.sh` already makes, for the same reason.
+  `chore: resync installed Loom surfaces` commit.
 - **Untracked files are out of scope**, because CI checks out a commit —
   anything that can reach `main` is tracked by the time the gate sees it.
 - **`git ls-files` rather than `find`**, so a stray build artifact or a local
@@ -519,5 +515,4 @@ is the #8154 defect one level down.
 - [ADR-0018](https://github.com/rjwalters/loom/blob/main/docs/adr/0018-rust-owns-behavior-shell-reaches-it.md) — the accepted architectural decision this narrows.
 - #7810 — the migration epic for shell that already exists.
 - #7758 — the categorical verdicts used as this taxonomy, and the irreducible bootstrap core.
-- [`file-size-policy.md`](file-size-policy.md) — the #7711 ratchet on existing files, unchanged by this policy.
 - #8084 — the aggregate shell-volume ratchet above, the companion to this per-file allowlist.

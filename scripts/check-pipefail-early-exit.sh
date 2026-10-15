@@ -29,8 +29,7 @@
 # sees SIGPIPE. Flagging all of them would be several hundred findings that
 # cannot be triaged, and a gate nobody can satisfy gets disabled.
 #
-# WHAT THIS IS: a one-way ratchet, the same shape as
-# scripts/check-file-size-budget.sh (#7711). Every occurrence that exists today
+# WHAT THIS IS: a one-way ratchet. Every occurrence that exists today
 # is recorded in scripts/pipefail-early-exit-baseline.txt as a per-file count and
 # frozen. A file may shed occurrences freely; it may not gain one, and a file
 # with no recorded count may not gain its first. So the gate fires at exactly the
@@ -135,7 +134,7 @@ BASELINE="${BASELINE_OVERRIDE:-$ROOT/scripts/pipefail-early-exit-baseline.txt}"
 #      source under defaults/ is measured instead.
 #   2. VENDORED — guard-destructive{,-generic}.sh and resync-installed.sh are
 #      re-vendored from rjwalters/repo at release time, so a local edit is
-#      reverted by the next re-vendor. Same list check-file-size-budget.sh uses.
+#      reverted by the next re-vendor.
 #   3. Build output git may track in some checkouts.
 is_exempt() {
   case "$1" in

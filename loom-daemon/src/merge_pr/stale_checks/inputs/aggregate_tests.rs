@@ -61,9 +61,9 @@ fn the_aggregate_folds_in_every_component_of_the_contexts_it_aggregates() {
     }
     let got: Vec<&str> = ci_result().iter().map(|s| s.context).collect();
     assert_eq!(got, expected);
-    // Its own component, plus Structural (16), macOS Shell Syntax (1) and
+    // Its own component, plus Structural (15), macOS Shell Syntax (1) and
     // Daemon Checks (4).
-    assert_eq!(got.len(), 22);
+    assert_eq!(got.len(), 21);
 }
 
 #[test]
@@ -174,9 +174,9 @@ fn shell_suite_and_node_inputs_refuse_the_aggregate() {
 
 #[test]
 fn a_granular_components_refusal_carries_into_the_aggregate() {
-    // The #8078 shape: main tightens the file-size baseline under a Rust PR.
-    // `File Size Ratchet` refuses; so must the aggregate that folds it in.
-    let d = set(&["scripts/file-size-baseline.txt"]);
+    // The #8078 shape: main tightens a ratchet baseline under a PR it measures.
+    // `Markdown Token Ratchet` refuses; so must the aggregate that folds it in.
+    let d = set(&["scripts/markdown-token-baseline.txt"]);
     let p = set(&["docs/adr/0020-something.md"]);
     // A doc-only PR gives neither the own component nor the ratchet anything
     // to re-judge…
@@ -187,13 +187,13 @@ fn a_granular_components_refusal_carries_into_the_aggregate() {
         .into_iter()
         .filter(|s| s.context != "CI Result")
         .collect();
-    let p2 = set(&["loom-daemon/src/main_health_gate.rs"]);
+    let p2 = set(&["defaults/.claude/commands/loom/builder.md"]);
     let (component, _) =
         composite_stale_reason(&folded, &d, &p2, &CiScopes::unscoped()).expect("stale");
-    assert_eq!(component, "File Size Ratchet");
+    assert_eq!(component, "Markdown Token Ratchet");
     let p = set(&[
         "docs/adr/0020-something.md",
-        "loom-daemon/src/main_health_gate.rs",
+        "defaults/.claude/commands/loom/builder.md",
     ]);
     let stale = composite_stale_reason(&ci_result(), &d, &p, &CiScopes::unscoped());
     assert!(stale.is_some(), "the ratchet's refusal must surface through CI Result");

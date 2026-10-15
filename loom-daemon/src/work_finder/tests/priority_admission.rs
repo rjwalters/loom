@@ -124,3 +124,53 @@ fn the_published_row_keys_are_main_red_fix_level_created_at_number() {
         ]
     );
 }
+
+/// #12090: the per-tick admission (ramp) cap is re-read every tick, like
+/// `maxConcurrent`, so a fleet-store edit between ticks changes how many new
+/// sweeps the NEXT tick admits — no daemon restart.
+mod live_admission_cap {
+    use super::*;
+
+    fn write_admissions(root: &std::path::Path, n: usize) {
+        std::fs::create_dir_all(root.join(".loom")).unwrap();
+        let body = format!(
+            r#"{{"autonomous":{{"workFinder":{{"maxConcurrent":10,"maxAdmissionsPerTick":{n}}}}}}}"#
+        );
+        std::fs::write(root.join(".loom/config.json"), body).unwrap();
+    }
+
+    fn admitted_this_tick(reloader: &mut ConfiguredMaxReloader) -> usize {
+        let cap = reloader.refresh();
+        let admissions = reloader.max_admissions_per_tick();
+        let mut source = FakeSource::once((1..=8).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+        let report =
+            tick_with_admission_cap(&mut source, &mut disp, cap, false, admissions).unwrap();
+        report.dispatched
+    }
+
+    #[test]
+    #[serial]
+    fn a_config_edit_between_ticks_changes_the_next_ticks_admissions() {
+        std::env::remove_var(WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV);
+        std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        write_admissions(dir.path(), 2);
+        let initial = ConfiguredMax::resolve(&read_work_finder_config(dir.path()));
+        assert_eq!(initial.max_admissions_per_tick, (2, ConfigSource::Config));
+        let mut reloader = ConfiguredMaxReloader::new(dir.path().to_path_buf(), initial);
+        assert_eq!(admitted_this_tick(&mut reloader), 2);
+
+        write_admissions(dir.path(), 5);
+        assert_eq!(admitted_this_tick(&mut reloader), 5, "raised on the next tick");
+
+        write_admissions(dir.path(), 1);
+        assert_eq!(admitted_this_tick(&mut reloader), 1, "and lowered");
+
+        // An env override still wins over a config edit (read at start only).
+        std::env::set_var(WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV, "3");
+        write_admissions(dir.path(), 6);
+        assert_eq!(admitted_this_tick(&mut reloader), 3);
+        std::env::remove_var(WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV);
+    }
+}
