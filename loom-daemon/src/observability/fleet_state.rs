@@ -37,7 +37,10 @@
 //! The same tick also gives the ETA facts (#11564): each `ready_wait` row's
 //! `eligible_reason` / `eligible_at` (the clock holding it back and its end)
 //! and each held repo's `halt` (`work_finder::halt_cause::since`). Neither is
-//! capped.
+//! capped. Each ready row also carries the dispatch facts (#11960):
+//! `dispatch_blocked_reason` (why the last pick skipped it, in the
+//! `pick.decision` `skip_reason` vocabulary) and `dispatch_blocked_since` (the
+//! first tick it was skipped for that reason, kept while the reason holds).
 //!
 //! The same two consecutive views also give the outcome facts
 //! `eta.stage_outcome` and `pr.resolved` ([`outcomes`], #11126).
@@ -1326,3 +1329,8 @@ mod queue_flow_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state/triage_flow_tests.rs"]
 mod triage_flow_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/dispatch_blocked_tests.rs"]
+mod dispatch_blocked_tests;
