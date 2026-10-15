@@ -50,6 +50,13 @@
 //! head nor labels); one stuck longer is. Every page of the head's check
 //! runs counts, up to [`MAX_CHECK_RUN_PAGES`] (#11903).
 //!
+//! A pass that stood down *because* CI was pending says so on its release
+//! (`--skip-reason` [`SKIP_CI_PENDING`], #11972) and is never recorded, even
+//! if CI finished between its check and its release: re-reading CI at release
+//! time once found a green head 12 s after the pass skipped, recorded
+//! `verdict=none` and held the PR from Judge for an hour. A release without a
+//! skip reason (an older prompt) keeps the re-read.
+//!
 //! Only trusted authors' records count (the caller filters): a record
 //! suppresses review, so an outsider must not be able to post one.
 //!
@@ -93,6 +100,18 @@ pub fn pending_exempts(started: &[String], now: DateTime<Utc>) -> bool {
         DateTime::parse_from_rfc3339(s.trim())
             .is_ok_and(|t| now - t.with_timezone(&Utc) < Duration::hours(PENDING_EXEMPT_HOURS))
     })
+}
+
+/// The `lease pr release --skip-reason` of a Judge pass that stood down
+/// because the head's CI was still pending (#11972).
+pub const SKIP_CI_PENDING: &str = "ci-pending";
+
+/// Whether a release's own skip reason exempts its pass from the no-verdict
+/// record without reading CI again: only [`SKIP_CI_PENDING`]. No reason, or
+/// one this binary does not know, keeps the default (CI re-read at release).
+#[must_use]
+pub fn skip_exempts(reason: Option<&str>) -> bool {
+    reason.map(str::trim) == Some(SKIP_CI_PENDING)
 }
 
 /// The page size of the check-run and commit-status reads (GitHub's max).

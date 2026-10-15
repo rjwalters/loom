@@ -778,7 +778,7 @@ pub(crate) enum PrLeaseAction {
     /// lease is no longer live; 4 = a peer holds this role's lease.
     Fence(Common),
     /// Stop the renewer and mark this claimant's lease released. Always 0.
-    Release(Common),
+    Release(ReleaseArgs),
     /// Print `PR_LEASE_STATE=free|held-self|held-peer|unknown` (+ holder).
     /// Exit 0 free/held-self, 4 held-peer, 5 unknown.
     Check(Common),
@@ -796,6 +796,19 @@ pub(crate) enum PrLeaseAction {
     /// Always 0.
     #[command(hide = true)]
     Reap(ReapArgs),
+}
+
+/// `release`'s arguments: the shared flags plus the pass's own skip reason.
+#[derive(clap::Args, Debug, Clone)]
+pub(crate) struct ReleaseArgs {
+    #[command(flatten)]
+    pub(crate) common: Common,
+    /// Why this pass stood down without a verdict, as the pass itself saw it
+    /// (#11972). `ci-pending` (the head's CI was still running): a Judge's
+    /// release writes no no-verdict record and does not re-read CI, which may
+    /// have finished since. Absent or unknown: the default (CI re-read).
+    #[arg(long, value_name = "REASON")]
+    pub(crate) skip_reason: Option<String>,
 }
 
 /// `reap`'s arguments: the dead claimant's exact identity, as its own
@@ -830,7 +843,9 @@ impl PrLeaseAction {
             Self::Claim(c) => with_context(&c, EXIT_UNVERIFIED, true, |ctx| ctx.claim()),
             Self::Fence(c) => with_context(&c, EXIT_HELD, false, |ctx| ctx.fence()),
             Self::Attach(c) => with_context(&c, EXIT_UNVERIFIED, false, |ctx| ctx.attach()),
-            Self::Release(c) => with_context(&c, EXIT_HELD, true, |ctx| ctx.release()),
+            Self::Release(r) => with_context(&r.common, EXIT_HELD, true, |ctx| {
+                ctx.release(r.skip_reason.as_deref())
+            }),
             Self::Check(c) => with_context(&c, EXIT_UNVERIFIED, false, |ctx| ctx.check()),
             Self::Reap(r) => {
                 let common = Common {
@@ -1150,22 +1165,25 @@ impl Ctx {
     }
 
     /// `release`: stop the renewer, then rewrite every live lease of this
-    /// identity to the released marker. Best-effort; always 0.
-    pub(crate) fn release(&self) -> i32 {
+    /// identity to the released marker. Best-effort; always 0. `skip_reason`
+    /// is the pass's own `--skip-reason` (#11972): a Judge pass that stood
+    /// down for pending CI ([`loom_daemon::judge_backstop::skip_exempts`]) is
+    /// not recorded, whatever CI did since.
+    pub(crate) fn release(&self, skip_reason: Option<&str>) -> i32 {
         if let Some(path) = &self.lease_file {
             loom_daemon::pr_lease_reap::forget_in(path, &self.held());
         }
-        self.release_with(None)
+        self.release_with(None, skip_reason)
     }
 
     /// `reap`: [`release`](Self::release) on behalf of a claimant the role
     /// runner terminated (#11931). A Judge's reap records the no-verdict pass
     /// whatever the head's CI is doing ([`backstop::reaped_release_fields`]).
     pub(crate) fn reap(&self, reason: &str) -> i32 {
-        self.release_with(Some(reason))
+        self.release_with(Some(reason), None)
     }
 
-    fn release_with(&self, reaped: Option<&str>) -> i32 {
+    fn release_with(&self, reaped: Option<&str>, skip_reason: Option<&str>) -> i32 {
         let stopped = if self.manage_renewer {
             renew::stop(self)
         } else {
@@ -1191,8 +1209,14 @@ impl Ctx {
             let extra = extra.get_or_insert_with(|| {
                 // Only a Judge's release records anything from the PR head
                 // (#11855); an issue-scoped lease (Curator, Champion promote)
-                // has no PR to read.
-                let head = if self.me.role == Role::Judge {
+                // has no PR to read, and a pass that skipped for pending CI
+                // is never recorded, so it reads nothing either (#11972).
+                let skipped =
+                    reaped.is_none() && loom_daemon::judge_backstop::skip_exempts(skip_reason);
+                if skipped && self.me.role == Role::Judge {
+                    self.say("skipped for pending CI: no no-verdict record (#11972)");
+                }
+                let head = if self.me.role == Role::Judge && !skipped {
                     self.gh.pr_head(self.pr())
                 } else {
                     None
