@@ -377,6 +377,11 @@ impl SweepRegistry {
             return;
         }
         self.restore_noop_holds();
+        // #12073: after a restart every restored hold is due at once; hold
+        // the first re-checks until this host's startup jitter has elapsed.
+        if !crate::startup_jitter::is_open() {
+            return;
+        }
         let mut due: Vec<u32> = self
             .noop_cooldown
             .streaks

@@ -2826,6 +2826,9 @@ pub fn spawn_multi_work_finder_task(
 ) -> tokio::task::JoinHandle<()> {
     configured_max::log_loop_start(interval, configured_max, max_admissions_per_tick);
     tokio::spawn(async move {
+        // #12073: a per-host delay before the first gather, so a fleet that
+        // restarts together does not gather all at once. First run only.
+        crate::startup_jitter::wait_first_run(&fallback_root, "work_finder").await;
         // #9060: the operator ceiling is re-resolved every tick (see the
         // `configured_max` module) — no longer a frozen startup value.
         let mut configured_max_reload =

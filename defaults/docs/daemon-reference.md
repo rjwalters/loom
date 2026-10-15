@@ -7661,6 +7661,36 @@ The cache is in-memory, per (workspace, query), for the daemon's lifetime; a
 restart re-fetches each listing once. PR-side claim listings stay on
 `gh pr list` (they need `headRefName`, which REST issue rows do not carry).
 
+### Post-restart jitter for the first fleet-wide gather (#12073)
+
+That re-fetch is a burst when the fleet restarts together: a floor raise rolls
+every dispatcher at about the same moment, and on 2026-10-15 nine daemons'
+first full gathers drained every gateway App within one five-minute window.
+So after a start, the **first run** of each loop that gathers across the fleet
+waits a per-host delay, then runs on its normal cadence:
+
+- the work finder's first tick (step gather, discovery listings, inline
+  intake);
+- the collector's forge gathers (captain facts, stage dwell, fleet state),
+  which now run on their own snapshot-cadence timer whose first tick is the
+  delay; host-local samples (`host.health`, tokens, disk) still run from boot;
+- the no-op hold re-checks on the reaper tick.
+
+The delay is a stable hash (FNV-1a) of the host id modulo the window, so a
+host always takes the same offset and the fleet spreads across the window. It
+counts from the first of those loops to start (`startup_jitter::arm`), and the
+boot log names it: `startup_jitter: first fleet-wide gathers wait Ns after
+start`.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `LOOM_STARTUP_JITTER_WINDOW_SECS` (env) > `autonomous.startupJitterWindowSecs` (any config tier) | `600` | Window in seconds; `0` disables the delay |
+
+Not covered: the startup claim-reconciliation pass (it gates the first
+admission and is per-repo `loom:building` only) and the stale-blocked release
+and fleet-state passes being retired by #11301 (fleet state is covered while it
+remains, through the collector's forge timer).
+
 ### Agent CI wait: `forge wait-checks` (#10330)
 
 `loom-daemon forge wait-checks <PR|SHA> [--timeout SECS] [--required-only]
