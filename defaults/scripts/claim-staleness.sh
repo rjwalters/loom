@@ -376,7 +376,7 @@ if [[ "$CLAIM_STATE" == "stale" || "$CLAIM_STATE" == "stale-bounded-fallback" ]]
     [[ "$LABEL" == "loom:evaluating" ]] && LEASE_STEP=(--step champion_promote)
     # requires-daemon: lease optional   Without `lease pr check` (absent or older binary) the lease is not read: only the age rule decides, as before #11911.
     LEASE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease pr check "$NUMBER" --role "$(_lease_role)" ${LEASE_STEP[@]+"${LEASE_STEP[@]}"} 2>/dev/null)" || true
-    LEASE_STATE="$(awk -F= '/^PR_LEASE_STATE=/ { print $2; exit }' <<<"$LEASE_OUT")"
+    LEASE_STATE="$(sed -n '/^PR_LEASE_STATE=/{s///;p;q;}' <<<"$LEASE_OUT")"
     case "$LEASE_STATE" in
         held-peer | held-self) CLAIM_STATE="fresh" ;;
         unknown) CLAIM_STATE="unknown" ;;
@@ -397,7 +397,6 @@ _emit_evaluation() {
             --argjson standdown "${STANDDOWN_COUNT:-0}" \
             --argjson stale_minutes "$STALE_MINUTES" \
             --argjson max_streak "$MAX_STREAK" \
-            --arg lease_state "$LEASE_STATE" \
             --arg claim_label "$LABEL" \
             --arg extra_key "$extra_key" \
             --arg extra_val "$extra_val" \
@@ -411,8 +410,7 @@ _emit_evaluation() {
                activity_count: $activity,
                standdown_count: $standdown,
                stale_minutes: $stale_minutes,
-               max_standdown_streak: $max_streak,
-               lease_state: $lease_state
+               max_standdown_streak: $max_streak
              }
              + (if $extra_key == "" then {} else {($extra_key | ascii_downcase): $extra_val} end)'
     else
@@ -426,7 +424,6 @@ _emit_evaluation() {
         echo "STANDDOWN_COUNT=${STANDDOWN_COUNT:-0}"
         echo "STALE_MINUTES=$STALE_MINUTES"
         echo "MAX_STANDDOWN_STREAK=$MAX_STREAK"
-        echo "LEASE_STATE=$LEASE_STATE"
         [[ -n "$extra_key" ]] && echo "$extra_key=$extra_val"
     fi
     return 0

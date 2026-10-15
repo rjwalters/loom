@@ -431,8 +431,11 @@ pub fn gather(
         super::listing::list_all_open(&gh_bin, Some(&root_dir), Some(&slug)),
     )?;
     // The PR debt the build back-off and the idle gate read (#11911): this
-    // listing already holds every open PR with its labels.
-    crate::pr_debt::record_open_listing(crate::pr_debt::global(), root, &rows);
+    // listing already holds every open PR with its labels. A last-good
+    // fallback is not a fresh read, so it is not re-recorded.
+    if !stale_listing {
+        crate::pr_debt::record_open_listing(crate::pr_debt::global(), root, &rows);
+    }
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
     let pull_listing = crate::forge_pull_listing::list_open_pulls_cached_as(
         super::listing::CALLER,
