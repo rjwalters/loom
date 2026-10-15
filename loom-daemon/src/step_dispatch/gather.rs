@@ -22,7 +22,13 @@
 //! - **landed** `loom:issue` items: the landed pre-filter's batched,
 //!   cached verdicts (`work_finder::landed_prefilter`);
 //! - **stage entry**: the provider (`super::stage_entry`), for stepped
-//!   items only (a pass needs no age).
+//!   items only (a pass needs no age);
+//! - **CI at a Judge step's head** (#12042): a Judge step whose PR head has
+//!   CI pending becomes a [`PassReason::CiPending`] pass ([`hold_ci_pending`]),
+//!   the step path's copy of the #12003 role-runner gate (`pr_planning`'s
+//!   `has_judge_work`), with its rule (started under 6 h ago) and its per-head
+//!   60 s cache. At most [`MAX_CI_READS`] uncached heads are read per repo per
+//!   tick; the reads are conditional.
 //!
 //! A read that fails or runs out of budget leaves its fact at the value that
 //! passes the item (a held PR without its marker reads as `blocked`, an
@@ -44,7 +50,7 @@ use crate::step_role::StepRole;
 use crate::sweep_registry::SweepRegistry;
 use crate::work_finder::step_item::{
     self, HostInput, Inputs, IssueInput, IssueMarkers, Item, ItemState, LinkKind, MergedLink,
-    ParkKind, PullInput, PullMarkers, RepoInput, TrustedComments,
+    ParkKind, PassReason, PullInput, PullMarkers, RepoInput, Step, TrustedComments, Verdict,
 };
 use crate::worktree_ops::linked_pr_listing::linked_issues;
 
@@ -57,6 +63,11 @@ pub const MAX_BLOCKER_READS: usize = 8;
 pub const BLOCKER_TTL: Duration = Duration::from_secs(10 * 60);
 /// Pages of the open-PR listing read per tick.
 pub const PULL_PAGES: usize = 10;
+/// At most this many Judge-step heads without a cached CI answer are read
+/// per repo per tick (#12042). A head past the budget is drawn unread: Judge's
+/// own pre-check still stands it down, and a `ci_pending` no-op only cools
+/// down for the short window (`outcome_ledger::EXTERNAL_WAIT_NOOPS`).
+pub const MAX_CI_READS: usize = 4;
 
 const ISSUE: &str = concat!("loom", ":issue");
 const CURATED: &str = concat!("loom", ":curated");
@@ -283,6 +294,43 @@ pub fn ladder_due(rows: &[RestIssue]) -> Vec<(u32, StepRole, DateTime<Utc>)> {
         .collect()
 }
 
+/// Turn every Judge step whose PR head has CI pending into a
+/// [`PassReason::CiPending`] pass (#12042), and return how many it held.
+/// `heads` maps a PR to its head SHA (a PR with none is drawn unread);
+/// `known` is a cached answer, free; `read` asks the forge and is called at
+/// most `max_reads` times. A head past the budget is drawn. Pure.
+pub fn hold_ci_pending(
+    items: &mut [Item],
+    heads: &HashMap<u32, String>,
+    max_reads: usize,
+    mut known: impl FnMut(&str) -> Option<bool>,
+    mut read: impl FnMut(&str) -> bool,
+) -> usize {
+    let mut reads = 0usize;
+    let mut held = 0usize;
+    for item in items.iter_mut() {
+        if item.step() != Some(Step::Judge) {
+            continue;
+        }
+        let Some(head) = item.target().and_then(|pr| heads.get(&pr)) else {
+            continue;
+        };
+        let pending = known(head).unwrap_or_else(|| {
+            if reads < max_reads {
+                reads += 1;
+                read(head)
+            } else {
+                false
+            }
+        });
+        if pending {
+            item.verdict = Verdict::Pass(PassReason::CiPending);
+            held += 1;
+        }
+    }
+    held
+}
+
 // ---------------------------------------------------------------------------
 // The forge half
 // ---------------------------------------------------------------------------
@@ -507,7 +555,21 @@ pub fn gather(
             held_capabilities: held_capabilities.clone(),
         },
     );
-    let items = step_item::classify(&inputs);
+    let mut items = step_item::classify(&inputs);
+    let heads: HashMap<u32, String> = full
+        .iter()
+        .filter_map(|(n, p)| p.head_sha.clone().map(|sha| (*n, sha)))
+        .collect();
+    let held = hold_ci_pending(
+        &mut items,
+        &heads,
+        MAX_CI_READS,
+        |sha| crate::pr_planning::ci_pending_cached(&root_dir, sha),
+        |sha| crate::pr_planning::ci_pending_at_sha(&root_dir, &gh_bin, sha),
+    );
+    if held > 0 {
+        log::debug!("work_finder: {slug}: {held} Judge step(s) held while CI runs at the head");
+    }
     let mut events = GhEventsReader;
     let draw = draw_inputs(items, &rows, |row, label| {
         provider.entry(&mut events, root, &slug, row, label, now)

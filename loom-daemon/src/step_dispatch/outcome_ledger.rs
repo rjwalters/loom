@@ -15,7 +15,8 @@
 //! |---|---|
 //! | `verdict`, reason `closed` (landed), on an issue | [`Effect::Landed`]: reclassify; never a Builder step again |
 //! | any other `verdict` | [`Effect::Advance`]: the next step comes from the labels |
-//! | `noop` | [`Effect::Cooldown`] for [`LedgerConfig::noop_cooldown`], per `(item, step)` |
+//! | `noop`, reason `ci_pending` ([`EXTERNAL_WAIT_NOOPS`]) | [`Effect::Cooldown`] for [`LedgerConfig::refusal_cooldown`] (#12042) |
+//! | any other `noop` | [`Effect::Cooldown`] for [`LedgerConfig::noop_cooldown`], per `(item, step)` |
 //! | `refused`, reason `pool_gate` or `claimed` | [`Effect::Cooldown`] for [`LedgerConfig::refusal_cooldown`] |
 //! | `refused`, reason `claim_lost` | [`Effect::Redraw`], counted ([`LedgerCounters::claim_lost`]); a **second** one in a row arms a cooldown (below) |
 //! | any other `refused` (a state refusal) | [`Effect::Reclassify`]; a **second identical** one in a row arms a cooldown (below) |
@@ -139,7 +140,11 @@ pub const UNCLASSIFIED: &str = "unclassified";
 pub const PROBE_FAILED: &str = "probe_failed";
 
 /// `noop` reasons that waited on something outside the item; they are not
-/// runs for the repeat cap.
+/// runs for the repeat cap, and they cool down for
+/// [`LedgerConfig::refusal_cooldown`] rather than the no-op hour (#12042):
+/// CI that concludes in minutes should get its Judge back in minutes. The
+/// draw normally keeps such a step out already (`gather`'s CI hold); this is
+/// the backstop for a pending read the hold missed or that started after it.
 pub const EXTERNAL_WAIT_NOOPS: [&str; 1] = ["ci_pending"];
 
 /// Base of a PR step's fast-fail window, doubled per consecutive fast
@@ -378,6 +383,9 @@ pub fn effect_of(
     match outcome.class {
         OutcomeClass::Verdict if reason == "closed" && !step.acts_on_pr() => Effect::Landed,
         OutcomeClass::Verdict => Effect::Advance,
+        OutcomeClass::Noop if EXTERNAL_WAIT_NOOPS.contains(&reason) => {
+            Effect::Cooldown(cfg.refusal_cooldown)
+        }
         OutcomeClass::Noop => Effect::Cooldown(cfg.noop_cooldown),
         OutcomeClass::Refused => match reason {
             "pool_gate" | "claimed" => Effect::Cooldown(cfg.refusal_cooldown),

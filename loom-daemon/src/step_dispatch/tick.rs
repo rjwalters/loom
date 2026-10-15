@@ -210,7 +210,7 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 &mut report.skipped_host_constraint
             }
             E::BuildBackoff => &mut report.deferred_build_backoff,
-            E::CoolingDown => &mut report.skipped_noop_cooldown,
+            E::CoolingDown | E::Pass(PassReason::CiPending) => &mut report.skipped_noop_cooldown,
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(
                 PassReason::Frozen
