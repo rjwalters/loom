@@ -59,7 +59,7 @@
 //! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 //! | the same, a capability not held | pass `capability_missing` |
-//! | `loom:curated` + `loom:blocked`, **dependency park** | Champion re-evaluate |
+//! | `loom:curated` (not `loom:issue`) + `loom:blocked`, **dependency park** | Champion re-evaluate |
 //! | any other blocked issue | pass `blocked` |
 //! | landed: a merged **closing** PR, issue still open | Curator keep-or-close |
 //! | `loom:decision-malformed` | Curator |
@@ -722,7 +722,7 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
                 pass(ItemState::Blocked, PassReason::CapabilityMissing)
             };
         }
-        if has(labels, CURATED) && issue.park == ParkKind::Dependency {
+        if has(labels, CURATED) && !has(labels, READY) && issue.park == ParkKind::Dependency {
             return step(ItemState::Blocked, Step::ChampionReevaluate);
         }
         return pass(ItemState::Blocked, PassReason::Blocked);

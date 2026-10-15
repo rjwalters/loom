@@ -519,6 +519,33 @@
       ]
     },
     {
+      "name": "promoted (curated + issue) + blocked dependency park: stays blocked, not a Champion step (curated survives promotion, #12078)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 536,
+            "labels": [
+              "loom:curated",
+              "loom:issue",
+              "loom:blocked"
+            ],
+            "park": "dependency"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 536,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
       "name": "loom:issue without a PR: Builder",
       "inputs": {
         "issues": [
