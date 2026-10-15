@@ -145,7 +145,7 @@ fn step_run_and_assigned_value_read_a_skipped_install_step() {
 }
 
 #[test]
-fn the_real_ci_yml_pins_a_lychee_version_the_local_run_can_read() {
+fn every_pinned_install_step_in_the_real_ci_yml_is_readable() {
     for k in CHEAP_CHECKS {
         for pin in k.pins {
             let body = step_run(CI_YML, k.component, pin.step)
@@ -164,10 +164,4 @@ fn the_real_ci_yml_pins_a_lychee_version_the_local_run_can_read() {
             );
         }
     }
-    assert!(
-        CHEAP_CHECKS
-            .iter()
-            .any(|k| k.pins.iter().any(|p| p.tool == "lychee")),
-        "Dangling Link Check's lychee must be version-pinned"
-    );
 }

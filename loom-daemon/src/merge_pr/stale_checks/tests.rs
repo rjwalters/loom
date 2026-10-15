@@ -1,7 +1,7 @@
 //! Unit tests for the required-check freshness guard (#8248).
 //!
 //! The two timeline tests reproduce the 2026-09-18 incident exactly — a green
-//! `Markdown Token Ratchet` run 22h before a baseline-tightening merge — because a
+//! `Vendored Private-Reference Scrub` run 22h before a baseline-tightening merge — because a
 //! guard about *freshness* is exactly the kind of thing that regresses by
 //! someone "simplifying" a comparison, and the incident's timestamps are the
 //! sharpest pin available.
@@ -25,7 +25,7 @@ fn ctx(names: &[&str]) -> Vec<String> {
 
 // --- The incident, replayed -------------------------------------------------
 
-// 2026-09-17T22:54:20Z: #8078's Markdown Token Ratchet runs green.
+// 2026-09-17T22:54:20Z: #8078's Vendored Private-Reference Scrub runs green.
 const INCIDENT_RUN_STARTED: &str = "2026-09-17T22:54:20Z";
 // 2026-09-18T11:45:21Z: #8204's merge tightens the baseline; this is main's tip.
 const INCIDENT_BASE_TIP: &str = "2026-09-18T11:45:21Z";
@@ -34,16 +34,16 @@ const INCIDENT_BASE_TIP: &str = "2026-09-18T11:45:21Z";
 fn incident_timeline_green_run_predating_the_tightened_tip_is_stale() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
-    let verdict = assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs);
+    let verdict = assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs);
     assert_eq!(
         verdict,
         Verdict::Stale {
-            check: "Markdown Token Ratchet".to_string(),
+            check: "Vendored Private-Reference Scrub".to_string(),
             started_at: INCIDENT_RUN_STARTED.parse().unwrap(),
             base_tip,
         },
@@ -55,11 +55,11 @@ fn incident_timeline_green_run_predating_the_tightened_tip_is_stale() {
 fn incident_message_names_the_check_and_both_timestamps() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let started: DateTime<Utc> = INCIDENT_RUN_STARTED.parse().unwrap();
-    let msg = stale_message("8078", "Markdown Token Ratchet", started, base_tip, "abc123");
+    let msg = stale_message("8078", "Vendored Private-Reference Scrub", started, base_tip, "abc123");
     // chrono's Display renders RFC3339 as "2026-09-17 22:54:20 UTC" — assert
     // the rendered form, which is what an operator actually reads.
     for needle in [
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "2026-09-17 22:54:20 UTC",
         "2026-09-18 11:45:21 UTC",
         "abc123",
@@ -74,12 +74,12 @@ fn incident_message_names_the_check_and_both_timestamps() {
 fn run_started_after_the_tip_is_fresh() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some("2026-09-18T12:00:00Z"),
     )];
-    assert_eq!(assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs), Verdict::Fresh);
+    assert_eq!(assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs), Verdict::Fresh);
 }
 
 #[test]
@@ -88,12 +88,12 @@ fn run_started_exactly_at_the_tip_is_fresh() {
     // verified the world the merge will produce, not a older one.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_BASE_TIP),
     )];
-    assert_eq!(assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs), Verdict::Fresh);
+    assert_eq!(assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs), Verdict::Fresh);
 }
 
 #[test]
@@ -103,26 +103,26 @@ fn a_fresh_re_run_shadows_an_older_stale_one() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![
         run(
-            "Markdown Token Ratchet",
+            "Vendored Private-Reference Scrub",
             "completed",
             Some("success"),
             Some(INCIDENT_RUN_STARTED),
         ),
         run(
-            "Markdown Token Ratchet",
+            "Vendored Private-Reference Scrub",
             "completed",
             Some("success"),
             Some("2026-09-18T13:00:00Z"),
         ),
     ];
-    assert_eq!(assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs), Verdict::Fresh);
+    assert_eq!(assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs), Verdict::Fresh);
 }
 
 #[test]
 fn no_required_checks_is_fresh() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
@@ -148,7 +148,7 @@ fn required_context_with_no_run_is_left_to_the_forge() {
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
-    assert_eq!(assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs), Verdict::Fresh);
+    assert_eq!(assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs), Verdict::Fresh);
 }
 
 #[test]
@@ -182,14 +182,14 @@ fn green_run_without_started_at_is_unknown() {
     // day would re-open the incident.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         None,
     )];
-    match assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs) {
+    match assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs) {
         Verdict::Unknown(why) => {
-            assert!(why.contains("Markdown Token Ratchet"), "reason names the check: {why}");
+            assert!(why.contains("Vendored Private-Reference Scrub"), "reason names the check: {why}");
         }
         v => panic!("expected Unknown, got {v:?}"),
     }
@@ -252,13 +252,13 @@ fn timestamps_with_fractional_seconds_parse() {
     // timestamp class it exists to compare.
     let base_tip: DateTime<Utc> = "2026-09-18T11:45:21.500Z".parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some("2026-09-18T11:45:21.000Z"),
     )];
     assert!(matches!(
-        assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs),
+        assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs),
         Verdict::Stale { .. }
     ));
 }
@@ -330,7 +330,7 @@ fn a_plan_gated_repo_has_no_required_checks_so_a_green_run_is_fresh() {
     // DEFINITE answer on a plan-gated repo (not a guess).
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
@@ -355,10 +355,10 @@ fn incident_evidence() -> ScopedEvidence {
         pr_delta: fset(&["defaults/.claude/commands/loom/builder.md"]),
         pr_ci_scope: CiScope::Unscoped,
         base_moves: [(
-            "Markdown Token Ratchet".to_string(),
+            "Vendored Private-Reference Scrub".to_string(),
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
-                files: fset(&["scripts/markdown-token-baseline.txt"]),
+                files: fset(&["scripts/check-vendored-private-refs.sh"]),
                 ci_scope: CiScope::Unscoped,
             },
         )]
@@ -373,14 +373,14 @@ fn incident_evidence() -> ScopedEvidence {
 fn the_incident_is_refused_by_the_input_scoped_predicate() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
     let (verdict, warnings) = assess_scoped(
         base_tip,
-        &ctx(&["Markdown Token Ratchet"]),
+        &ctx(&["Vendored Private-Reference Scrub"]),
         &runs,
         Some(&incident_evidence()),
     );
@@ -390,7 +390,7 @@ fn the_incident_is_refused_by_the_input_scoped_predicate() {
             tested_base,
             reason,
         } => {
-            assert_eq!(check, "Markdown Token Ratchet");
+            assert_eq!(check, "Vendored Private-Reference Scrub");
             assert_eq!(tested_base, "803f0c7d");
             assert!(reason.clause.contains("global input"), "{reason:?}");
         }
@@ -410,21 +410,21 @@ fn the_incident_stays_refused_after_an_in_place_re_run() {
     let rerun_started = "2026-09-18T16:26:47Z"; // after the tip: time rule says fresh
     let runs = vec![
         run(
-            "Markdown Token Ratchet",
+            "Vendored Private-Reference Scrub",
             "completed",
             Some("success"),
             Some(INCIDENT_RUN_STARTED),
         ),
-        run("Markdown Token Ratchet", "completed", Some("success"), Some(rerun_started)),
+        run("Vendored Private-Reference Scrub", "completed", Some("success"), Some(rerun_started)),
     ];
     assert_eq!(
-        assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs),
+        assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs),
         Verdict::Fresh,
         "the TIME rule is fooled by the re-run — this is the bug #8919 fixes"
     );
     let (verdict, _) = assess_scoped(
         base_tip,
-        &ctx(&["Markdown Token Ratchet"]),
+        &ctx(&["Vendored Private-Reference Scrub"]),
         &runs,
         Some(&incident_evidence()),
     );
@@ -439,7 +439,7 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
     // The other half: PR #8641 lost three races on base moves like this one.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
@@ -448,7 +448,7 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
         pr_delta: fset(&["defaults/docs/some-doc.md"]),
         pr_ci_scope: CiScope::Unscoped,
         base_moves: [(
-            "Markdown Token Ratchet".to_string(),
+            "Vendored Private-Reference Scrub".to_string(),
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
                 files: fset(&["loom-daemon/src/unrelated.rs"]),
@@ -461,12 +461,12 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
         repo_specs: repo_specs::RepoSpecs::Absent,
     };
     let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
+        assess_scoped(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs, Some(&ev));
     assert_eq!(verdict, Verdict::Fresh, "{verdict:?}");
     assert!(warnings.is_empty());
     // The time rule alone would have refused it.
     assert!(matches!(
-        assess(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs),
+        assess(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs),
         Verdict::Stale { .. }
     ));
 }
@@ -478,7 +478,7 @@ fn ci_yml_move(scope: CiScope) -> ScopedEvidence {
         pr_delta: fset(&["defaults/.claude/commands/loom/judge.md"]),
         pr_ci_scope: CiScope::Unscoped,
         base_moves: [(
-            "Markdown Token Ratchet".to_string(),
+            "Vendored Private-Reference Scrub".to_string(),
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
                 files: fset(&[".github/workflows/ci.yml"]),
@@ -499,14 +499,14 @@ fn a_ci_yml_move_in_a_job_this_check_does_not_run_is_fresh() {
     // every open PR that touched anything at all.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
     let ev = ci_yml_move(CiScope::Scoped(std::collections::BTreeSet::new()));
     let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
+        assess_scoped(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs, Some(&ev));
     assert_eq!(verdict, Verdict::Fresh, "{verdict:?}");
     assert!(warnings.is_empty(), "a narrowing is not a degradation: {warnings:?}");
 }
@@ -518,19 +518,19 @@ fn a_ci_yml_move_in_this_checks_own_block_is_still_stale() {
     // longer exists in that form.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
     for scope in [
-        CiScope::Scoped(["Markdown Token Ratchet".to_string()].into_iter().collect()),
+        CiScope::Scoped(["Vendored Private-Reference Scrub".to_string()].into_iter().collect()),
         // …and an unattributable edit keeps the pre-#9065 whole-file meaning.
         CiScope::Unscoped,
     ] {
         let ev = ci_yml_move(scope.clone());
         let (verdict, _) =
-            assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
+            assess_scoped(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs, Some(&ev));
         assert!(matches!(verdict, Verdict::StaleInputs { .. }), "{scope:?}: {verdict:?}");
     }
 }
@@ -542,7 +542,7 @@ fn pr_edits_ci_yml(pr_ci_scope: CiScope) -> ScopedEvidence {
         pr_delta: fset(&[".github/workflows/ci.yml"]),
         pr_ci_scope,
         base_moves: [(
-            "Markdown Token Ratchet".to_string(),
+            "Vendored Private-Reference Scrub".to_string(),
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
                 files: fset(&["defaults/.claude/commands/loom/unrelated.md"]),
@@ -564,14 +564,14 @@ fn a_pr_editing_a_ci_yml_job_this_check_does_not_run_is_fresh() {
     // permanently, on a `main` that moves every ~11 minutes.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
     let ev = pr_edits_ci_yml(CiScope::Scoped(std::collections::BTreeSet::new()));
     let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
+        assess_scoped(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs, Some(&ev));
     assert_eq!(verdict, Verdict::Fresh, "{verdict:?}");
     assert!(warnings.is_empty(), "a narrowing is not a degradation: {warnings:?}");
 }
@@ -582,19 +582,19 @@ fn a_pr_editing_this_checks_own_ci_yml_block_is_still_stale() {
     // and `main` brought a file for the rewritten gate to judge.
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
     )];
     for scope in [
-        CiScope::Scoped(["Markdown Token Ratchet".to_string()].into_iter().collect()),
+        CiScope::Scoped(["Vendored Private-Reference Scrub".to_string()].into_iter().collect()),
         // …and an unattributable PR-side edit keeps the whole-file meaning.
         CiScope::Unscoped,
     ] {
         let ev = pr_edits_ci_yml(scope.clone());
         let (verdict, _) =
-            assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
+            assess_scoped(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs, Some(&ev));
         assert!(matches!(verdict, Verdict::StaleInputs { .. }), "{scope:?}: {verdict:?}");
     }
 }
@@ -603,7 +603,7 @@ fn a_pr_editing_this_checks_own_ci_yml_block_is_still_stale() {
 fn a_context_without_evidence_falls_back_to_the_time_rule_and_warns() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     let runs = vec![run(
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "completed",
         Some("success"),
         Some(INCIDENT_RUN_STARTED),
@@ -613,7 +613,7 @@ fn a_context_without_evidence_falls_back_to_the_time_rule_and_warns() {
         pr_ci_scope: CiScope::Unscoped,
         base_moves: std::collections::BTreeMap::new(),
         fallbacks: [(
-            "Markdown Token Ratchet".to_string(),
+            "Vendored Private-Reference Scrub".to_string(),
             "its job log could not be read".to_string(),
         )]
         .into_iter()
@@ -621,10 +621,10 @@ fn a_context_without_evidence_falls_back_to_the_time_rule_and_warns() {
         repo_specs: repo_specs::RepoSpecs::Absent,
     };
     let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["Markdown Token Ratchet"]), &runs, Some(&ev));
+        assess_scoped(base_tip, &ctx(&["Vendored Private-Reference Scrub"]), &runs, Some(&ev));
     assert!(matches!(verdict, Verdict::Stale { .. }), "{verdict:?}");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("Markdown Token Ratchet"), "{}", warnings[0]);
+    assert!(warnings[0].contains("Vendored Private-Reference Scrub"), "{}", warnings[0]);
     assert!(warnings[0].contains("job log could not be read"), "{}", warnings[0]);
     assert!(warnings[0].contains("#8248"), "{}", warnings[0]);
 }
@@ -636,26 +636,26 @@ fn no_evidence_at_all_is_byte_for_byte_the_old_time_rule() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     for runs in [
         vec![run(
-            "Markdown Token Ratchet",
+            "Vendored Private-Reference Scrub",
             "completed",
             Some("success"),
             Some(INCIDENT_RUN_STARTED),
         )],
         vec![run(
-            "Markdown Token Ratchet",
+            "Vendored Private-Reference Scrub",
             "completed",
             Some("success"),
             Some("2026-09-18T12:00:00Z"),
         )],
         vec![run(
-            "Markdown Token Ratchet",
+            "Vendored Private-Reference Scrub",
             "completed",
             Some("success"),
             None,
         )],
-        vec![run("Markdown Token Ratchet", "queued", None, None)],
+        vec![run("Vendored Private-Reference Scrub", "queued", None, None)],
     ] {
-        let required = ctx(&["Markdown Token Ratchet"]);
+        let required = ctx(&["Vendored Private-Reference Scrub"]);
         let (scoped, _) = assess_scoped(base_tip, &required, &runs, None);
         assert_eq!(
             scoped,
@@ -705,16 +705,16 @@ fn an_unmapped_required_context_with_a_moved_base_is_refused() {
 fn the_input_scoped_refusal_names_the_base_and_not_a_timestamp() {
     let reason = inputs::StaleReason {
         clause: "the base move changed a global input of this check",
-        base_path: Some("scripts/markdown-token-baseline.txt".to_string()),
+        base_path: Some("scripts/check-vendored-private-refs.sh".to_string()),
         pr_path: Some("defaults/.claude/commands/loom/builder.md".to_string()),
     };
-    let msg = stale_inputs_message("8078", "Markdown Token Ratchet", "803f0c7d", &reason, "abc123");
+    let msg = stale_inputs_message("8078", "Vendored Private-Reference Scrub", "803f0c7d", &reason, "abc123");
     for needle in [
         "Merge blocked",
-        "Markdown Token Ratchet",
+        "Vendored Private-Reference Scrub",
         "803f0c7d",
         "abc123",
-        "scripts/markdown-token-baseline.txt",
+        "scripts/check-vendored-private-refs.sh",
         "defaults/.claude/commands/loom/builder.md",
         // It must say plainly that a re-run will NOT clear it.
         "re-running the job in place will not clear it",
@@ -735,173 +735,4 @@ fn latest_run_picks_max_started_at() {
     let queued = run("J", "queued", None, None);
     let green = run("J", "completed", Some("success"), Some("2026-09-16T00:00:00Z"));
     assert_eq!(latest_run(&[queued, green.clone()], "J"), Some(&green));
-}
-
-// --- Role Prompt Prefix Ratchet inside the full structural composite (#9748) --
-
-/// Evidence for the "Structural Checks" composite: every component tested the
-/// same base, so one `BaseMove` per component context is not needed — the
-/// composite is keyed on the required context.
-fn structural_evidence(base: &[&str], pr: &[&str]) -> ScopedEvidence {
-    ScopedEvidence {
-        pr_delta: fset(pr),
-        pr_ci_scope: CiScope::Unscoped,
-        base_moves: [(
-            "Structural Checks".to_string(),
-            BaseMove {
-                tested_base: "803f0c7d".to_string(),
-                files: fset(base),
-                ci_scope: CiScope::Unscoped,
-            },
-        )]
-        .into_iter()
-        .collect(),
-        fallbacks: std::collections::BTreeMap::new(),
-        repo_specs: repo_specs::RepoSpecs::Absent,
-    }
-}
-
-/// How `assess_scoped` names a composite component: `"{ctx} ({component})"`.
-const ROLE_PREFIX_COMPOSITE: &str = "Structural Checks (Role Prompt Prefix Ratchet)";
-
-fn structural_verdict(base: &[&str], pr: &[&str]) -> Verdict {
-    let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
-    // Green and re-dated after the tip: only the input predicate can refuse.
-    let runs = vec![run(
-        "Structural Checks",
-        "completed",
-        Some("success"),
-        Some("2026-09-18T20:00:00Z"),
-    )];
-    let ev = structural_evidence(base, pr);
-    let (verdict, warnings) =
-        assess_scoped(base_tip, &ctx(&["Structural Checks"]), &runs, Some(&ev));
-    assert!(warnings.is_empty(), "{warnings:?}");
-    verdict
-}
-
-#[test]
-fn role_prefix_false_coupling_no_longer_stales_the_structural_composite() {
-    // Measured tuples: base daemon-reference vs PR eta docs, ETA docs vs the
-    // Judge prompt, plus the installed mirror and CLAUDE.md. The Role Prompt
-    // Prefix Ratchet no longer couples them, but the composite still refuses
-    // each one via a later component (Docs/Defaults Parity or Dangling Link).
-    // Pinning that component makes a future narrowing of those checks a
-    // visible, deliberate test change rather than a silent one.
-    for (base, pr, component) in [
-        (
-            &["defaults/docs/daemon-reference.md"][..],
-            &["defaults/docs/eta.md"][..],
-            "Docs/Defaults Parity Check",
-        ),
-        (
-            &["defaults/docs/eta.md"][..],
-            &["defaults/.claude/commands/loom/judge.md"][..],
-            "Dangling Link Check",
-        ),
-        (
-            &[".loom/docs/eta.md"][..],
-            &["defaults/.claude/commands/loom/judge.md"][..],
-            "Dangling Link Check",
-        ),
-        (&["defaults/docs/eta.md"][..], &["CLAUDE.md"][..], "Dangling Link Check"),
-    ] {
-        let v = structural_verdict(base, pr);
-        match v {
-            Verdict::StaleInputs { check, .. } => {
-                assert_eq!(check, format!("Structural Checks ({component})"), "{base:?} vs {pr:?}");
-            }
-            v => panic!("{base:?} vs {pr:?}: expected StaleInputs, got {v:?}"),
-        }
-    }
-}
-
-#[test]
-fn a_genuinely_interacting_role_prompt_pair_still_stales_the_composite() {
-    let v = structural_verdict(
-        &["defaults/.claude/commands/loom/builder.md"],
-        &["defaults/.claude/commands/loom/judge.md"],
-    );
-    assert!(matches!(v, Verdict::StaleInputs { .. }), "{v:?}");
-}
-
-#[test]
-fn clearing_the_role_prefix_false_component_does_not_clear_another_stale_one() {
-    // `defaults/docs/eta.md` on both sides is (a) no longer a Role Prefix
-    // coupling but (b) the same file for Conflict Marker Check, which scans
-    // every file per-file: the same-file pair must stay stale.
-    let v = structural_verdict(&["defaults/docs/eta.md"], &["defaults/docs/eta.md"]);
-    match v {
-        Verdict::StaleInputs { check, reason, .. } => {
-            assert_ne!(check, ROLE_PREFIX_COMPOSITE);
-            assert!(reason.clause.contains("same scanned file"), "{reason:?}");
-        }
-        v => panic!("a same-file pair must stay stale, got {v:?}"),
-    }
-    // Same for a same-file daemon-reference pair.
-    let v = structural_verdict(
-        &["defaults/docs/daemon-reference.md"],
-        &["defaults/docs/daemon-reference.md"],
-    );
-    assert!(matches!(v, Verdict::StaleInputs { .. }), "{v:?}");
-
-    // Mixed: the role-prefix false pair is cleared, yet an unrelated genuine
-    // coupling in the same delta (shell allowlist vs a script) still refuses.
-    let v = structural_verdict(
-        &[
-            "defaults/docs/daemon-reference.md",
-            "scripts/shell-allowlist.txt",
-        ],
-        &["defaults/docs/eta.md", "scripts/new-helper.sh"],
-    );
-    match v {
-        Verdict::StaleInputs { check, .. } => assert_ne!(check, ROLE_PREFIX_COMPOSITE),
-        v => panic!("another stale component must still refuse, got {v:?}"),
-    }
-}
-
-#[test]
-fn role_prefix_missing_evidence_applies_time_rule_and_red_ci_is_left_to_the_forge() {
-    let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
-    // No evidence: the time rule applies and a pre-tip run is stale.
-    let old = vec![run(
-        "Structural Checks",
-        "completed",
-        Some("success"),
-        Some(INCIDENT_RUN_STARTED),
-    )];
-    let (v, _) = assess_scoped(base_tip, &ctx(&["Structural Checks"]), &old, None);
-    assert!(matches!(v, Verdict::Stale { .. }), "{v:?}");
-    // A red run is never accepted as evidence (left to the forge): not Fresh-by-scope.
-    let red = vec![run(
-        "Structural Checks",
-        "completed",
-        Some("failure"),
-        Some("2026-09-18T20:00:00Z"),
-    )];
-    let ev = structural_evidence(&["defaults/docs/eta.md"], &["CLAUDE.md"]);
-    let (v, _) = assess_scoped(base_tip, &ctx(&["Structural Checks"]), &red, Some(&ev));
-    assert_eq!(v, Verdict::Fresh, "failing runs are ignored here and refused by the forge");
-}
-
-#[test]
-fn a_nested_role_json_against_a_shared_prefix_edit_stales_the_composite_via_role_prefix() {
-    // The checker discovers roles with `git ls-files -- 'defaults/roles/*.json'`,
-    // whose `*` crosses `/`: a JSON under `defaults/roles/extra/` adds a role
-    // whose whole prefix (both CLAUDE.md files included) is now summed and
-    // budget-checked. `main` editing CLAUDE.md under it is a genuine
-    // interaction, and no other structural component couples the pair — so
-    // only the Role Prompt Prefix spec can refuse it.
-    for (base, pr) in [
-        (&["CLAUDE.md"][..], &["defaults/roles/extra/nested.json"][..]),
-        (&["defaults/roles/extra/nested.json"][..], &["CLAUDE.md"][..]),
-    ] {
-        match structural_verdict(base, pr) {
-            Verdict::StaleInputs { check, reason, .. } => {
-                assert_eq!(check, ROLE_PREFIX_COMPOSITE, "{base:?} vs {pr:?}");
-                assert!(reason.clause.contains("coupled"), "{reason:?}");
-            }
-            v => panic!("{base:?} vs {pr:?}: expected the Role Prefix refusal, got {v:?}"),
-        }
-    }
 }

@@ -87,12 +87,12 @@ esac
     path
 }
 
-/// The check-runs rollup: one green `Markdown Token Ratchet` that started 22h
+/// The check-runs rollup: one green `Vendored Private-Reference Scrub` that started 22h
 /// BEFORE the base tip — the #8248 incident's own evidence. Using the stale
 /// payload throughout is deliberate: if the plan-gate path ever started
 /// reporting phantom required contexts, these tests would go red instead of
 /// passing for the wrong reason.
-const STALE_GREEN_RUNS: &str = r#"{"total_count":1,"check_runs":[{"name":"Markdown Token Ratchet","status":"completed","conclusion":"success","started_at":"2026-09-17T22:54:20Z"}]}"#;
+const STALE_GREEN_RUNS: &str = r#"{"total_count":1,"check_runs":[{"name":"Vendored Private-Reference Scrub","status":"completed","conclusion":"success","started_at":"2026-09-17T22:54:20Z"}]}"#;
 
 /// The exact stderr `gh` prints for the plan-gated 403.
 const PLAN_GATED: &str =
@@ -211,11 +211,11 @@ fn a_plan_gated_source_does_not_silence_the_other_ones_required_check() {
     let out = run(&[
         ("MOCK_RULES_RC", "1"),
         ("MOCK_RULES_STDERR", PLAN_GATED),
-        ("MOCK_CLASSIC_OUT", "Markdown Token Ratchet\n"),
+        ("MOCK_CLASSIC_OUT", "Vendored Private-Reference Scrub\n"),
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "stdout: {stdout}");
-    assert!(stdout.contains("Markdown Token Ratchet"), "stdout: {stdout}");
+    assert!(stdout.contains("Vendored Private-Reference Scrub"), "stdout: {stdout}");
     assert!(stdout.contains("Merge blocked"), "stdout: {stdout}");
 }
 
@@ -225,9 +225,9 @@ fn a_plan_gated_source_does_not_silence_the_other_ones_required_check() {
 fn the_ungated_path_is_unchanged() {
     let out = run(&[(
         "MOCK_RULES_OUT",
-        r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Markdown Token Ratchet"}]}}]"#,
+        r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Vendored Private-Reference Scrub"}]}}]"#,
     )]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "stdout: {stdout}");
-    assert!(stdout.contains("Markdown Token Ratchet"), "stdout: {stdout}");
+    assert!(stdout.contains("Vendored Private-Reference Scrub"), "stdout: {stdout}");
 }

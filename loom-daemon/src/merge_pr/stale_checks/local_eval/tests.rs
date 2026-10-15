@@ -53,8 +53,7 @@ fn req(names: &[&str]) -> Vec<String> {
 }
 
 /// The 2026-10-04/05 shape: a fleet merge and this PR both touched the role
-/// prompt surface. Only prompt/doc gates go stale. (A shared command prompt,
-/// not a doc: since #9748 Role Prompt Prefix no longer reads `defaults/docs`.)
+/// prompt surface. Only cheap content/link gates go stale.
 fn prompt_surface_evidence() -> ScopedEvidence {
     const JUDGE: &str = "defaults/.claude/commands/loom/judge.md";
     evidence(&[JUDGE], vec![(STRUCT, mv(&[JUDGE]))])
@@ -70,7 +69,7 @@ fn only_cheap_stale_components_are_locally_evaluable() {
 
     let got = locally_evaluable(tip(), &req(&[STRUCT]), &runs, Some(&ev))
         .expect("every stale component is cheap");
-    assert!(got.contains(&"Role Prompt Prefix Ratchet"), "{got:?}");
+    assert!(got.contains(&"Dangling Link Check"), "{got:?}");
     assert!(got.contains(&"Conflict Marker Check"), "same file both sides: {got:?}");
     assert!(got.iter().all(|c| cheap(c).is_some()), "{got:?}");
 }
@@ -80,7 +79,7 @@ fn a_stale_expensive_component_in_the_same_context_still_blocks() {
     let ev = prompt_surface_evidence();
     let runs = vec![green(STRUCT)];
     let got = locally_evaluable_with(tip(), &req(&[STRUCT]), &runs, Some(&ev), |c| {
-        c != "Role Prompt Prefix Ratchet"
+        c != "Dangling Link Check"
     });
     assert_eq!(got, None, "one non-allowlisted stale component refuses the whole context");
 }
@@ -128,7 +127,7 @@ fn a_pr_that_edits_check_code_is_never_evaluated_locally() {
     // (or ci.yml): running it locally would execute the PR's code on the
     // merging host, so the CI path keeps it.
     for code in [
-        "scripts/check-role-prompt-budget.sh",
+        "scripts/check-dangling-links.sh",
         ".github/workflows/ci.yml",
     ] {
         let ev = evidence(
@@ -153,7 +152,6 @@ fn an_unmapped_context_is_not_vouched_for() {
 #[test]
 fn expensive_components_are_not_on_the_allowlist() {
     for c in [
-        "Shell Budget Ratchet",
         "Secret Scan",
         "MCP Guard Wiring Contract",
         ".gitignore Convergence Check",

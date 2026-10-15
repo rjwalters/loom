@@ -86,9 +86,8 @@
 //!
 //! # Gates implemented inside the daemon binary
 //!
-//! Four components (`Shell Budget Ratchet`, `.gitignore Convergence Check`,
-//! `Secret Scan`, `MCP Guard Wiring Contract`)
-//! run a `loom-daemon` subcommand rather than a script. Their `G` used to be `loom-daemon/**`, which nearly
+//! Three components (`.gitignore Convergence Check`, `Secret Scan`,
+//! `MCP Guard Wiring Contract`) run a `loom-daemon` subcommand rather than a script. Their `G` used to be `loom-daemon/**`, which nearly
 //! every base move and nearly every PR touches, so they read as stale almost
 //! always and the guard stopped distinguishing anything (PRs #9543/#9544,
 //! 2026-09-29: refused on `cli/forge_action.rs` vs `init/post_init.rs`).
@@ -462,43 +461,6 @@ pub fn composite_stale_reason(
 /// Every tracked shell script (the pool the shell gates measure and parse).
 const SHELL: &[&str] = &["**/*.sh"];
 
-/// The agent-facing markdown + role JSON the prompt-size ratchets read.
-const PROMPT_SURFACE: &[&str] = &[
-    "CLAUDE.md",
-    "AGENTS.md",
-    "defaults/.loom/CLAUDE.md",
-    "defaults/.loom/AGENTS.md",
-    ".loom/CLAUDE.md",
-    "defaults/roles/**",
-    "defaults/.claude/commands/loom/**",
-    "defaults/docs/**",
-    ".loom/roles/**",
-    ".loom/docs/**",
-    ".claude/commands/loom/**",
-];
-
-/// Everything `scripts/check-role-prompt-budget.sh` reads (#9748): the two
-/// shared prefixes (`SHARED_PREFIX`), role discovery (`git ls-files
-/// 'defaults/roles/*.json'`) and the command directory (`CMD_DIR`) whose entry
-/// points and transitively linked bare siblings are summed. It never reads
-/// `defaults/docs`, installed `.loom/docs`, or the installed mirrors. The
-/// command-directory set is conservative (every markdown file there, not a
-/// per-role graph). A test runs the real checker's `--files` and fails if its
-/// read surface outgrows this set (ci-principles rule 9: refine what a result
-/// covers from the checker's own source; the check still runs on every PR).
-///
-/// Role discovery is `defaults/roles/**/*.json`, not `*.json`: a git pathspec
-/// without `:(glob)` magic matches `*` across `/`, so the checker also
-/// discovers a role from a JSON in a subdirectory. A one-segment glob would
-/// silently drop that read — narrowing on a surface the checker does not
-/// actually have, which rule 9 forbids.
-const ROLE_PROMPT_PREFIX_READS: &[&str] = &[
-    "CLAUDE.md",
-    "defaults/.loom/CLAUDE.md",
-    "defaults/roles/**/*.json",
-    "defaults/.claude/commands/loom/*.md",
-];
-
 /// The two mirrored trees the resync-parity gate pairs up.
 const RESYNC_PAIRS: &[&str] = &[
     "defaults/hooks/**",
@@ -556,15 +518,9 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
         context: "Structural Checks",
         components: &[
             "Conflict Marker Check",
-            "CLAUDE.md Line Budget",
-            "Shell Allowlist",
-            "Markdown Token Ratchet",
-            "Role Prompt Prefix Ratchet",
             "AGENTS.md Sync Check",
             "Config Host-Path Guard",
-            "Docs/Defaults Parity Check",
             "Guard Scan-String Tier Contracts",
-            "Doc Table-of-Contents Freshness",
             "Hooks/Scripts Defaults Parity Check",
             "Vendored Private-Reference Scrub",
             "Dangling Link Check",
@@ -581,7 +537,6 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
     RequiredCheck {
         context: "Daemon Checks",
         components: &[
-            "Shell Budget Ratchet",
             ".gitignore Convergence Check",
             "Secret Scan",
             "MCP Guard Wiring Contract",
@@ -606,117 +561,6 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
 /// The hand-maintained input table. **Adding a step to a required job means
 /// updating the matching entry here** — `tests.rs`'s pin test fails otherwise.
 pub const SPECS: &[CheckSpec<'static>] = &[
-    // Reads exactly one file's line count.
-    CheckSpec {
-        context: "CLAUDE.md Line Budget",
-        global: &["scripts/check-claude-md-budget.sh", CI_WORKFLOW],
-        scanned: &["CLAUDE.md"],
-        coupled: &[],
-        removal_sensitive: false,
-    },
-    // `loom-daemon shell-budget --check` — the measuring logic is Rust, and
-    // the allowlist supplies each script's category.
-    //
-    // Rust surface: the handler (`cli/shell_budget.rs`), the `shell_budget`
-    // module tree it calls, and the binary's top-level subcommand registry —
-    // the handler reads `crate::Cli`'s subcommand names to validate
-    // `Shell-Budget-Callout:` trailers, so `main.rs` and every enum it
-    // `#[command(flatten)]`s (`cli/telemetry.rs`, `cli/script_ports.rs`,
-    // `cli/dep_classify.rs`) are inputs too. MUST grow if the checker starts
-    // using another module — `daemon_surface_tests.rs` fails until it does.
-    CheckSpec {
-        context: "Shell Budget Ratchet",
-        global: &[
-            "loom-daemon/src/cli/shell_budget.rs",
-            "loom-daemon/src/shell_budget.rs",
-            "loom-daemon/src/shell_budget/**",
-            "loom-daemon/src/main.rs",
-            "loom-daemon/src/daemon_service.rs",
-            "loom-daemon/src/cli/script_ports.rs",
-            "loom-daemon/src/cli/telemetry.rs",
-            "loom-daemon/src/cli/dep_classify.rs",
-            "scripts/shell-allowlist.txt",
-            "scripts/shell-budget-baseline.txt",
-            "Cargo.toml",
-            "Cargo.lock",
-            "rust-toolchain.toml",
-            ".cargo/config.toml",
-            "loom-daemon/Cargo.toml",
-            "loom-daemon/build.rs",
-            CI_WORKFLOW,
-        ],
-        scanned: SHELL,
-        coupled: &[],
-        removal_sensitive: false,
-    },
-    // Every tracked `.sh` must carry an allowlist entry, so a deletion on one
-    // side and an entry edit on the other interact.
-    CheckSpec {
-        context: "Shell Allowlist",
-        global: &[
-            "scripts/check-shell-allowlist.sh",
-            "scripts/shell-allowlist.txt",
-            // The CI Result gate's tests ride in this component's step group
-            // (#10444); the test drives the gate script, so both are inputs.
-            "scripts/test-ci-result-gate.sh",
-            "scripts/ci-result-gate.sh",
-            // The release-decision tests also ride in this step group
-            // (#10826); they drive the decision script and parse release.yml.
-            "scripts/test-release-decision.sh",
-            "scripts/release-decision.sh",
-            ".github/workflows/release.yml",
-            // The version-bump cadence gate tests ride here too (#11174); they
-            // drive the gate script and grep version-bump-on-merge.yml.
-            "scripts/test-version-bump-gate.sh",
-            "scripts/version-bump-gate.sh",
-            ".github/workflows/version-bump-on-merge.yml",
-            // The image-input tests ride here too (#10825); they drive the
-            // detection script, which reads .dockerignore, and parse ci.yml.
-            "scripts/test-ci-image-inputs.sh",
-            "scripts/ci-image-inputs.sh",
-            ".dockerignore",
-            // The ci-daily timeout classifier tests ride here too (#11964);
-            // they drive the classifier script and parse ci-daily.yml.
-            "scripts/test-ci-daily-classify.sh",
-            "scripts/ci-daily-classify.sh",
-            ".github/workflows/ci-daily.yml",
-            CI_WORKFLOW,
-        ],
-        scanned: SHELL,
-        coupled: &["scripts/shell-allowlist.txt", "**/*.sh"],
-        removal_sensitive: true,
-    },
-    // Per-file byte-count proxy against a baseline ledger.
-    CheckSpec {
-        context: "Markdown Token Ratchet",
-        global: &[
-            "scripts/check-markdown-token-budget.sh",
-            "scripts/markdown-token-baseline.txt",
-            CI_WORKFLOW,
-        ],
-        scanned: PROMPT_SURFACE,
-        coupled: &[],
-        removal_sensitive: false,
-    },
-    // An AGGREGATE over each role's whole prompt file set — split a file in two
-    // and every per-file number drops while this one rises. Purely coupled.
-    //
-    // `ci.yml` runs `--self-test` first, which executes
-    // `check-markdown-token-budget.sh --list` on the REAL tree and fails the
-    // step when its estimator disagrees with this one — so that script is a
-    // global input too.
-    CheckSpec {
-        context: "Role Prompt Prefix Ratchet",
-        global: &[
-            "scripts/check-role-prompt-budget.sh",
-            "scripts/role-prompt-budget.txt",
-            "scripts/check-markdown-token-budget.sh",
-            CI_WORKFLOW,
-        ],
-        scanned: &[],
-        coupled: ROLE_PROMPT_PREFIX_READS,
-        removal_sensitive: true,
-    },
     // A content scan of every tracked file, strictly per-file.
     CheckSpec {
         context: "Conflict Marker Check",
@@ -725,12 +569,7 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         coupled: &[],
         removal_sensitive: false,
     },
-    // `bash -n` over every script, plus the pipefail and daemon-subcommand
-    // ratchets. VERSION is a global input: `check-daemon-subcommand-versions.sh`
-    // fails when a `requires-daemon >= X` has X > VERSION. A VALIDATED
-    // increasing restamp is discounted from D before matching (that condition
-    // can only clear, never appear, as VERSION rises); any other VERSION change
-    // lands here.
+    // `bash -n` over every script.
     CheckSpec {
         context: "Shell Syntax (ubuntu-latest)",
         global: SHELL_SYNTAX_GLOBAL,
@@ -774,14 +613,6 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         coupled: &[],
         removal_sensitive: false,
     },
-    // Pairs `.loom/docs/*` against `defaults/docs/*` (orphans, should-be-symlinks).
-    CheckSpec {
-        context: "Docs/Defaults Parity Check",
-        global: &["scripts/check-docs-defaults-parity.sh", CI_WORKFLOW],
-        scanned: &[],
-        coupled: &[".loom/docs/**", "defaults/docs/**", "docs/adr/**"],
-        removal_sensitive: true,
-    },
     // Pairs the guard's scan-string tiers against their doc + ADR + suites.
     CheckSpec {
         context: "Guard Scan-String Tier Contracts",
@@ -793,14 +624,6 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "docs/adr/0016-*.md",
             "tests/hooks/test-guard-destructive*.sh",
         ],
-        removal_sensitive: false,
-    },
-    // A generated TOC is a function of its own file's headings — per-file.
-    CheckSpec {
-        context: "Doc Table-of-Contents Freshness",
-        global: &["scripts/check-doc-tocs.sh", CI_WORKFLOW],
-        scanned: &["defaults/docs/*.md", "defaults/.claude/commands/loom/*.md"],
-        coupled: &[],
         removal_sensitive: false,
     },
     // Byte-identity between `defaults/` and its installed `.loom/` copies:
@@ -829,11 +652,7 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     // deletion anywhere can break a link from anywhere.
     CheckSpec {
         context: "Dangling Link Check",
-        global: &[
-            "scripts/check-dangling-links.sh",
-            "scripts/check-doc-anchors.sh",
-            CI_WORKFLOW,
-        ],
+        global: &["scripts/check-dangling-links.sh", CI_WORKFLOW],
         scanned: &[],
         coupled: MARKDOWN,
         removal_sensitive: true,
@@ -1046,17 +865,7 @@ const CI_RESULT_GLOBAL: &[&str] = &[
 ];
 
 /// Shared by both `Shell Syntax` matrix legs, which run identical steps.
-const SHELL_SYNTAX_GLOBAL: &[&str] = &[
-    "defaults/scripts/check-shell-syntax.sh",
-    "scripts/check-shell-allowlist.sh",
-    "scripts/shell-allowlist.txt",
-    "scripts/check-pipefail-early-exit.sh",
-    "scripts/pipefail-early-exit-baseline.txt",
-    "scripts/check-daemon-subcommand-versions.sh",
-    "scripts/daemon-subcommand-baseline.txt",
-    "VERSION",
-    CI_WORKFLOW,
-];
+const SHELL_SYNTAX_GLOBAL: &[&str] = &["defaults/scripts/check-shell-syntax.sh", CI_WORKFLOW];
 
 // --- Glob matching -----------------------------------------------------------
 

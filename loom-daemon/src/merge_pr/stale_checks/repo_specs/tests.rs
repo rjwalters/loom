@@ -146,13 +146,13 @@ fn an_undeclared_sibling_context_still_refuses_on_any_move() {
 
 #[test]
 fn built_in_specs_win_over_a_declaration_for_the_same_context() {
-    // Declares Markdown Token Ratchet as reading nothing the base move touched.
+    // Declares Vendored Private-Reference Scrub as reading nothing the base move touched.
     let decl =
-        r#"{"version": 1, "checks": {"Markdown Token Ratchet": {"global": ["nothing.txt"]}}}"#;
-    let ctx = "Markdown Token Ratchet";
+        r#"{"version": 1, "checks": {"Vendored Private-Reference Scrub": {"global": ["nothing.txt"]}}}"#;
+    let ctx = "Vendored Private-Reference Scrub";
     let ev = evidence(
         &[ctx],
-        &["scripts/markdown-token-baseline.txt"],
+        &["scripts/check-vendored-private-refs.sh"],
         &["defaults/.claude/commands/loom/builder.md"],
         RepoSpecs::parse(decl),
     );

@@ -62,11 +62,6 @@ struct Surface {
 
 const SURFACES: &[Surface] = &[
     Surface {
-        component: "Shell Budget Ratchet",
-        roots: &[Root::File("cli/shell_budget.rs")],
-        entry_symbol: "ShellBudgetArgs",
-    },
-    Surface {
         component: ".gitignore Convergence Check",
         roots: &[Root::Fn(
             "cli/misc_cmds.rs",
@@ -241,7 +236,6 @@ struct Patterns {
     path: Regex,
     child_mod: Regex,
     include: Regex,
-    flatten: Regex,
 }
 
 fn patterns() -> Patterns {
@@ -255,10 +249,6 @@ fn patterns() -> Patterns {
         )
         .unwrap(),
         include: Regex::new(r#"include_(?:str|bytes)!\(\s*"([^"]+)""#).unwrap(),
-        flatten: Regex::new(
-            r"#\[command\(flatten\)\]\s*(?:#\[[^\]]*\]\s*)*[A-Z][A-Za-z0-9_]*\(\s*([A-Za-z0-9_:]+)\s*\)",
-        )
-        .unwrap(),
     }
 }
 
@@ -539,42 +529,6 @@ fn every_file_that_dispatches_to_a_daemon_gate_is_a_global_input() {
     }
 }
 
-#[test]
-fn every_file_feeding_the_top_level_subcommand_registry_is_a_shell_budget_input() {
-    // `cli/shell_budget.rs` validates `Shell-Budget-Callout:` trailers against
-    // `crate::Cli`'s top-level subcommand names, and `#[command(flatten)]`
-    // lifts another enum's variants to the top level. So every file on that
-    // flatten chain decides part of the verdict.
-    let pats = patterns();
-    let spec = spec("Shell Budget Ratchet");
-    let mut seen = BTreeSet::new();
-    let mut stack = vec!["main.rs".to_string()];
-    while let Some(f) = stack.pop() {
-        if !seen.insert(f.clone()) {
-            continue;
-        }
-        let code = code_of(&read(&f));
-        for cap in pats.flatten.captures_iter(&code) {
-            let segs: Vec<String> = cap[1].split("::").map(str::to_string).collect();
-            let target = resolve(&f, &segs)
-                .or_else(|| module_file(&segs))
-                .unwrap_or_else(|| panic!("{f}: cannot resolve flattened `{}`", &cap[1]));
-            stack.push(target);
-        }
-    }
-    assert!(
-        seen.len() > 2,
-        "the flatten walk found only {seen:?} — the parser probably broke"
-    );
-    for f in &seen {
-        assert!(
-            covered(spec, &format!("{SRC}{f}")),
-            "`{f}` contributes top-level subcommands (via `#[command(flatten)]`), which the \
-Shell Budget Ratchet reads; add it to that spec's G set"
-        );
-    }
-}
-
 // --- Regressions: the #9543/#9544 refusals ------------------------------------
 
 fn set(paths: &[&str]) -> FileSet {
@@ -583,13 +537,6 @@ fn set(paths: &[&str]) -> FileSet {
 
 fn spec(ctx: &str) -> &'static CheckSpec<'static> {
     spec_for(ctx).unwrap_or_else(|| panic!("{ctx} must have a spec"))
-}
-
-#[test]
-fn an_unrelated_daemon_file_on_main_no_longer_stales_the_shell_budget() {
-    let d = set(&["loom-daemon/src/cli/forge_action.rs"]);
-    let p = set(&["defaults/scripts/sweep-lease-publish.sh"]);
-    assert_eq!(stale_reason(spec("Shell Budget Ratchet"), &d, &p), None);
 }
 
 #[test]
@@ -609,14 +556,13 @@ fn the_9543_pair_is_fresh_for_every_daemon_checks_component() {
 fn a_move_inside_the_checker_is_still_stale() {
     let p = set(&["defaults/scripts/sweep-lease-publish.sh"]);
     for moved in [
-        "loom-daemon/src/shell_budget/churn.rs",
-        "loom-daemon/src/shell_budget.rs",
-        "loom-daemon/src/cli/shell_budget.rs",
+        "loom-daemon/src/secret_scan.rs",
+        "loom-daemon/src/cli/secret_scan_cmd.rs",
         "loom-daemon/src/main.rs",
         "loom-daemon/Cargo.toml",
     ] {
-        let reason = stale_reason(spec("Shell Budget Ratchet"), &set(&[moved]), &p);
-        assert!(reason.is_some(), "{moved} is a Shell Budget input");
+        let reason = stale_reason(spec("Secret Scan"), &set(&[moved]), &p);
+        assert!(reason.is_some(), "{moved} is a Secret Scan input");
     }
     // …and the gitignore gate still sees its own pattern source.
     let reason = stale_reason(

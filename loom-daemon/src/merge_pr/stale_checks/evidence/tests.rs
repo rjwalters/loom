@@ -149,13 +149,13 @@ fn a_pure_restamp_move_is_discounted_entirely() {
 fn a_real_change_alongside_a_restamp_survives() {
     let mut files = restamp_set();
     files.push(f(
-        "scripts/markdown-token-baseline.txt",
+        "scripts/check-vendored-private-refs.sh",
         "modified",
         Some("@@\n-1845 x\n+1815 x\n"),
     ));
     let kept = strip_validated_restamps(&files);
     assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].path, "scripts/markdown-token-baseline.txt");
+    assert_eq!(kept[0].path, "scripts/check-vendored-private-refs.sh");
 }
 
 #[test]

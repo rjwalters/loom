@@ -45,9 +45,9 @@ fn docs_only_pr() -> FileSet {
     file_set([("docs/adr/0020-something.md", false)])
 }
 
-/// A PR delta that touches a shell script, so every gate that scans `**/*.sh`
-/// (Shell Budget Ratchet in `Daemon Checks`, Shell Syntax in `Structural
-/// Checks`) has something to re-judge if a global input moves under it.
+/// A PR delta that touches a shell script, so every gate that reads `**/*.sh`
+/// (Shell Syntax in `Structural Checks`, the `CI Result` aggregate) has
+/// something to re-judge if a global input moves under it.
 fn shell_pr() -> FileSet {
     file_set([("defaults/scripts/merge-pr.sh", false)])
 }
@@ -180,10 +180,10 @@ fn an_unrelated_merge_plus_its_bump_stales_nothing_for_a_non_overlapping_pr() {
 // --- Negative: fail closed -------------------------------------------------
 
 #[test]
-fn a_bump_that_smuggles_a_dependency_edit_stales_daemon_checks() {
+fn a_bump_that_smuggles_a_dependency_edit_stales_ci_result() {
     // A Cargo.lock line carrying some OTHER package's version is a real
     // dependency change. It survives the discount and, as a global input of
-    // Shell Budget Ratchet, stales `Daemon Checks` for a PR with a script.
+    // the `CI Result` aggregate, stales it for a PR with a script.
     let mut moved = real_bump(OLD, NEW);
     replace(
         &mut moved,
@@ -201,7 +201,7 @@ fn a_bump_that_smuggles_a_dependency_edit_stales_daemon_checks() {
     let kept_paths: Vec<&str> = kept.iter().map(|c| c.path.as_str()).collect();
     assert_eq!(kept_paths, vec!["Cargo.lock"]);
     let stale = stale_contexts(&moved, &shell_pr());
-    assert!(stale.contains(&"Daemon Checks".to_string()), "{stale:?}");
+    assert!(stale.contains(&"CI Result".to_string()), "{stale:?}");
 }
 
 #[test]
@@ -210,9 +210,8 @@ fn a_version_decrease_is_not_a_restamp_and_stales() {
     let kept = strip_validated_restamps(&moved);
     assert_eq!(kept.len(), moved.len(), "nothing is discounted: {kept:?}");
     let stale = stale_contexts(&moved, &shell_pr());
-    // VERSION is a global input of Shell Syntax; Cargo.lock of Shell Budget.
-    assert!(stale.contains(&"Structural Checks".to_string()), "{stale:?}");
-    assert!(stale.contains(&"Daemon Checks".to_string()), "{stale:?}");
+    // VERSION and Cargo.lock are global inputs of the `CI Result` aggregate.
+    assert!(stale.contains(&"CI Result".to_string()), "{stale:?}");
 }
 
 #[test]

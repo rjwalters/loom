@@ -67,7 +67,7 @@ pub struct CheapCheck {
     /// Must exist in the merge tree, or the evaluation is unknown.
     pub script: &'static str,
     /// Binaries the steps need on `PATH`; one missing is unknown, never a
-    /// pass (`check-doc-anchors.sh` exits 78 without `lychee`).
+    /// pass.
     pub requires: &'static [&'static str],
     /// Step names NOT run locally: tool installs that `requires` replaces.
     pub skip_steps: &'static [&'static str],
@@ -101,34 +101,6 @@ pub const CHEAP_CHECKS: &[CheapCheck] = &[
         pins: &[],
     },
     CheapCheck {
-        component: "Markdown Token Ratchet",
-        script: "scripts/check-markdown-token-budget.sh",
-        requires: &["bash", "git"],
-        skip_steps: &[],
-        pins: &[],
-    },
-    CheapCheck {
-        component: "Role Prompt Prefix Ratchet",
-        script: "scripts/check-role-prompt-budget.sh",
-        requires: &["bash", "git"],
-        skip_steps: &[],
-        pins: &[],
-    },
-    CheapCheck {
-        component: "Docs/Defaults Parity Check",
-        script: "scripts/check-docs-defaults-parity.sh",
-        requires: &["bash", "git"],
-        skip_steps: &[],
-        pins: &[],
-    },
-    CheapCheck {
-        component: "Doc Table-of-Contents Freshness",
-        script: "scripts/check-doc-tocs.sh",
-        requires: &["bash", "git"],
-        skip_steps: &[],
-        pins: &[],
-    },
-    CheapCheck {
         component: "Vendored Private-Reference Scrub",
         script: "scripts/check-vendored-private-refs.sh",
         requires: &["bash", "git", "grep"],
@@ -138,18 +110,11 @@ pub const CHEAP_CHECKS: &[CheapCheck] = &[
     CheapCheck {
         component: "Dangling Link Check",
         script: "scripts/check-dangling-links.sh",
-        requires: &["bash", "git", "lychee"],
-        skip_steps: &[LYCHEE_INSTALL_STEP],
-        pins: &[ToolPin {
-            tool: "lychee",
-            step: LYCHEE_INSTALL_STEP,
-            var: "VER",
-        }],
+        requires: &["bash", "git"],
+        skip_steps: &[],
+        pins: &[],
     },
 ];
-
-/// `ci.yml`'s lychee install step (skipped locally; read for its pin).
-const LYCHEE_INSTALL_STEP: &str = "Install lychee (pinned, checksum-verified)";
 
 pub mod ci_steps;
 pub use ci_steps::ci_steps;

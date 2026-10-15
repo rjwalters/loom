@@ -111,7 +111,6 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
-      workflows: ${{ steps.filter.outputs.workflows }}
       # Whether anything in this PR can be measured by a gate that runs the
       # shared debug daemon. Computed below, not a raw paths-filter output.
       daemon: ${{ steps.daemon.outputs.needed }}
@@ -211,24 +210,10 @@ jobs:
               # so a config-only PR must run them: #7799 flipped guards.sqlDdl
               # with shell-suite-tests SKIPPED on the PR and turned main red (#7808).
               - '.loom/config.json'
-              # check-dependabot-labels.sh (#7577) asserts that every
-              # lockfile-bearing package manifest is covered by a labeled
-              # .github/dependabot.yml entry. Both sides of that invariant have
-              # to re-trigger this suite on the PR that breaks it — otherwise
-              # adding a package.json (or editing dependabot.yml) only turns
-              # main red after the merge.
-              - '.github/dependabot.yml'
-              - '**/package.json'
-              # Same for the Renovate side (#9418): `loom-daemon
-              # check-renovate-labels` runs next to it in installer-tests.
+              # `loom-daemon check-renovate-labels` runs in installer-tests
+              # (#9418), so a Renovate-config-only PR must trigger it.
               - 'renovate.json5'
               - '.github/workflows/ci.yml'
-            # Every workflow file, for the Workflow Cancellation Lint job
-            # (#10670). The `backend` group lists only ci.yml, so without this
-            # a security.yml-only (or new-workflow) PR would merge with the
-            # main_cancel lint never having run.
-            workflows:
-              - '.github/workflows/**'
 
       # Does this run need the shared debug daemon built at all? (#9113)
       #
@@ -395,7 +380,7 @@ jobs:
     # so the two are EQUAL on PRs. Keep `always()`: `changes`/`changes-images`
     # skip on push, which would otherwise skip this job and starve
     # `worker-buildcache` and `worker-base-image`. Narrowing this gate below
-    # the image gate is not allowed; scripts/test-ci-image-inputs.sh pins it.
+    # the image gate is not allowed.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -542,40 +527,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # Workflow Cancellation Lint (#10670). The `main_cancel` lint, the
-  # every-workflow parse check and the merge-group audit are Rust unit tests in
-  # `merge_group_ci`, so `backend-tests` runs them -- but only when the
-  # `backend` group matches, and of the workflow files that group lists only
-  # ci.yml. This repo has no merge queue, so the PR run is the only check before
-  # merge: a PR touching only security.yml, codeql.yml, release.yml or a new
-  # workflow would otherwise land with the lint unrun, and the first run to
-  # catch a cancel regression would be the main push it can already cancel.
-  # This job runs just that test module on any `.github/workflows/**` change
-  # (a lib-test build of one crate, not the three-leg suite), and on every push
-  # and merge_group like every other filtered job. On a PR that also matches
-  # `backend` the module runs twice (here and in a backend-tests leg); the
-  # price is one more runner doing a cache-restored lib-test build of one
-  # crate, in parallel, so it adds no wall-clock time to the run.
-  workflow-cancel-lint:
-    name: Workflow Cancellation Lint
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.workflows == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Lint every workflow for cancellation of a started main run
-        run: cargo test -p loom-daemon --lib merge_group_ci
-
   structural-checks:
     name: Structural Checks
-    # ONE required context for fifteen formerly separate structural gates plus
+    # ONE required context for the formerly separate structural gates plus
     # the ubuntu Shell Syntax leg (#9065). Each took a runner for 5-22s; as
     # separate jobs they were 17 of ~45 jobs per run and competed for the
     # account's concurrent-job cap. Every step runs even when an earlier one
@@ -589,8 +543,8 @@ jobs:
     # component's spec. Keep the markers accurate.
     #
     # Always runs: never behind `needs: changes` (ci-principles.md rule 3).
-    # fetch-depth: 0 because Shell Allowlist measures history (#8237) and the
-    # version-bump check diffs the PR's merge-base..head.
+    # fetch-depth: 0 because the version-bump check diffs the PR's
+    # merge-base..head.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -668,91 +622,6 @@ jobs:
           sys.exit(1 if bad else 0)
           EOF
 
-      # component: CLAUDE.md Line Budget
-      # Cheap structural check; always runs (CLAUDE.md is prepended to every
-      # agent's context, so its size is load-bearing — see #4014).
-      - name: Check CLAUDE.md line budget
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-claude-md-budget.sh
-
-      # component: Shell Allowlist
-      # Cheap structural check; always runs. #7762 / ADR-0018: new executable
-      # logic is a loom-daemon subcommand, and a new `.sh` needs a category plus a
-      # one-line reason in scripts/shell-allowlist.txt. A prose-only version of
-      # that policy would rot — #7755 is this repo's own receipt for a safety
-      # contract written as a comment and silently violated.
-      #
-      # Must NOT be path-filtered, for the same reason conflict-markers and
-      # shell-syntax are not: a new `.sh` appearing in a directory nobody thought
-      # was in scope is precisely the case this exists to catch, and a filter on
-      # 'scripts/**' + 'defaults/**' would miss it.
-      #
-      # Needs no toolchain: this is a shell/grep scan over `git ls-files`, with no
-      # cargo step and no loom-daemon binary (objection 3 in the #7762 ruling).
-      # fetch-depth: 0 because the `settled` category's first admission half
-      # (#8237) is "zero fix-commits in the trailing six months", and a depth-1
-      # checkout has no window to measure that in. The gate refuses to run on a
-      # shallow clone rather than reporting OK on a check it could not perform —
-      # a gate that cannot tell "checked, fine" from "could not check" reports
-      # OK forever. Same reason the Shell Budget job above takes full history.
-      # Self-test first: a gate that silently stops checking reports OK forever
-      # while unjustified shell keeps landing.
-      - name: Self-test the gate
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-shell-allowlist.sh --self-test
-      - name: Check every tracked .sh is accounted for
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-shell-allowlist.sh
-      - name: Test the CI Result aggregate gate (#10444)
-        if: ${{ !cancelled() }}
-        run: bash scripts/test-ci-result-gate.sh
-      - name: Test the ci-daily timeout classifier and report wiring (#11964)
-        if: ${{ !cancelled() }}
-        run: bash scripts/test-ci-daily-classify.sh
-      - name: Test the image-input detection and the image gate wiring (#10825)
-        if: ${{ !cancelled() }}
-        run: bash scripts/test-ci-image-inputs.sh
-      - name: Test the release decision and release.yml wiring (#10826)
-        if: ${{ !cancelled() }}
-        run: bash scripts/test-release-decision.sh
-      - name: Test the version-bump cadence gate (#11174)
-        if: ${{ !cancelled() }}
-        run: bash scripts/test-version-bump-gate.sh
-
-      # component: Markdown Token Ratchet
-      # A ratchet on agent-facing markdown (role prompts + slash-command
-      # bodies), measured in a byte-count token proxy (#7725, #7716). This
-      # content is prepended into an agent's context on every invocation, the
-      # same load-bearing category check-claude-md-budget.sh guards for
-      # CLAUDE.md.
-      - name: Self-test the ratchet
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-markdown-token-budget.sh --self-test
-      - name: Check markdown token budget
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-markdown-token-budget.sh
-
-      # component: Role Prompt Prefix Ratchet
-      # The aggregate the per-file Markdown Token Ratchet above cannot see
-      # (#8053): the SUM of everything ONE spawned role session injects before it
-      # reads a line of its issue — the role prompt, every sibling that prompt
-      # always loads, and both CLAUDE.md files. Measured over 28 days of
-      # transcripts, ~91% of fleet cost-equivalent is cache writes + cache reads
-      # of exactly that prefix (output is ~9%), at 50-170k fresh tokens/session.
-      # A per-file ratchet is blind to it: split a 3k file into three 1k files and
-      # every per-file number goes DOWN while the role's total goes UP.
-      #
-      # Needs no toolchain, same as the sibling budget jobs: a grep/wc scan over
-      # `git ls-files` with no cargo step and no loom-daemon binary.
-      # Self-test first: a ratchet that silently stops resolving a role's file
-      # set reports OK forever while the prefix it guards keeps growing.
-      - name: Self-test the ratchet
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-role-prompt-budget.sh --self-test
-      - name: Check per-role prompt prefix budget
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-role-prompt-budget.sh
-
       # component: AGENTS.md Sync Check
       # Cheap structural check; always runs. defaults/.loom/AGENTS.md is generated
       # from defaults/.loom/CLAUDE.md's agents-md:include marker ranges — this
@@ -778,21 +647,6 @@ jobs:
       - name: Check tracked config carries no home-directory absolute paths (#6504)
         if: ${{ !cancelled() }}
         run: bash defaults/scripts/check-config-no-host-paths.sh
-
-      # component: Docs/Defaults Parity Check
-      # Cheap structural check; always runs. Consumer repos populate .loom/docs/
-      # FROM defaults/docs/ (resync-installed.sh), so a doc authored only in
-      # .loom/docs/ never ships, and a defaults/docs/ link to a sibling that only
-      # exists in .loom/docs/ is a dead link in every install — this happened
-      # twice (safehouse.md, token-pool.md) before anything caught it (#4841).
-      # The self-test step regression-tests the checker itself against a
-      # synthetic fixture reproducing that exact case.
-      - name: Self-test the checker against a synthetic fixture
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-docs-defaults-parity.sh --self-test
-      - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-docs-defaults-parity.sh
 
       # component: Guard Scan-String Tier Contracts
       # Cheap structural check; always runs. guard-destructive-generic.sh decides
@@ -820,17 +674,6 @@ jobs:
       - name: Check guard-destructive-generic.sh's scan-string tier contracts
         if: ${{ !cancelled() }}
         run: bash scripts/check-guard-scan-contracts.sh
-
-      # component: Doc Table-of-Contents Freshness
-      # Cheap structural check; always runs. Claude PREVIEWS a doc reached through
-      # a reference (e.g. `head -100`) rather than reading it whole, so the TOC is
-      # what tells it which sections exist; daemon-reference.md has 27 top-level
-      # sections across ~9k lines and had none (#7739). A stale TOC is worse than
-      # no TOC, because it claims a section is absent when it is not — hence
-      # generated-and-checked rather than hand-maintained.
-      - name: Check generated TOCs are current
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-doc-tocs.sh
 
       # component: Hooks/Scripts Defaults Parity Check
       # Cheap structural check; always runs. .loom/hooks/ and .loom/scripts/ are
@@ -877,16 +720,10 @@ jobs:
       #     WORK_LOG.md carried 127 occurrences of two real EC2 private
       #     hostnames, disclosing this fleet's subnet and host count from a
       #     public repo. No scoped root list would ever have covered it.
-      #   * In this job, but NOT inside check-vendored-private-refs.sh. It
-      #     belongs to the same concern, so it must not become a second job or a
-      #     second script — but the script is `contract`-category portable shell,
-      #     and `loom-daemon shell-budget --check` refuses ANY net growth of that
-      #     pool (epic #7810), with no override. Adding the logic there is
-      #     therefore not available; the sanctioned alternative is the daemon,
-      #     and a ~15-line grep does not justify putting a cargo build in front
+      #   * In this job, as a ~15-line grep, rather than a cargo build in front
       #     of a job that is otherwise toolchain-free and runs in seconds. If
       #     this check ever grows past a grep, port it to a loom-daemon
-      #     subcommand rather than back into the script.
+      #     subcommand.
       #
       # Findings report file:line and a class, NEVER the matched text: this log
       # is public, and echoing the match would re-publish exactly what the check
@@ -993,7 +830,7 @@ jobs:
       # internal links shipped in Loom's own docs, caught only by a periodic
       # filer well after the introducing PR merged) into a pre-merge gate:
       # every git-tracked *.md file outside defaults/ (an install-time template
-      # tree checked separately by docs-defaults-parity above) must have
+      # tree checked by the fresh-install link check) must have
       # relative markdown links that resolve to a real file/dir in the repo.
       # The self-test step regression-tests the checker itself against a
       # synthetic fixture (dangling link, fenced-code-block example, valid
@@ -1004,26 +841,6 @@ jobs:
       - name: Check for dangling internal markdown links
         if: ${{ !cancelled() }}
         run: bash scripts/check-dangling-links.sh
-      # Anchor fragments are the other half of a link's contract and were never
-      # checked (#7801): "doc.md#section" stayed green after the heading moved.
-      # lychee implements GitHub's slug rule correctly and checks ~1500 links in
-      # under a second, so this rides in THIS job rather than adding a 26th one
-      # — the job is ~9s against a ~350s critical path, so it is free in wall
-      # clock, whereas a new job would cost a whole billable minute (GitHub
-      # rounds every job up) and widen the fan-out.
-      - name: Install lychee (pinned, checksum-verified)
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          VER=v0.24.2
-          SHA=1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a
-          curl -fsSL "https://github.com/lycheeverse/lychee/releases/download/lychee-${VER}/lychee-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/lychee.tgz
-          echo "${SHA}  /tmp/lychee.tgz" | sha256sum -c -
-          tar xzf /tmp/lychee.tgz -C /tmp
-          sudo install -m 0755 /tmp/lychee-x86_64-unknown-linux-gnu/lychee /usr/local/bin/lychee
-      - name: Check markdown anchor fragments resolve
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-doc-anchors.sh
 
       # component: PRs Must Not Hand-Edit Version-Bearing Files
       # PR-only: needs the PR's base commit to diff against, which only exists
@@ -1097,56 +914,11 @@ jobs:
         # and builds nothing -- so the tree is exactly what is tracked.
         # ~830 scripts, ~3s.
         run: bash defaults/scripts/check-shell-syntax.sh --quiet --dir .
-      - name: Ratchet the pipefail + early-exit-consumer SIGPIPE class
-        if: ${{ !cancelled() }}
-        # #7790 (parent #7789). `set -o pipefail` plus a consumer that exits
-        # before reading all input (head, grep -q, grep -m, read) lets the
-        # producer take SIGPIPE, and pipefail reports the pipeline as failed.
-        # One idiom produced four CI flakes (#7060, #7285, #7540, #7736) and,
-        # in #7771, a silent WRONG ANSWER in production -- verify-proposal-refs.sh
-        # reporting a present file as `MISSING FILE`.
-        #
-        # A one-way ratchet: every occurrence
-        # that exists today is frozen at its per-file count in
-        # scripts/pipefail-early-exit-baseline.txt, and this fails only when a
-        # file GAINS one. --require-baseline so that deleting the ledger reads
-        # as a failure rather than as "all clear".
-        #
-        # Runs on BOTH legs on purpose: the scan is one awk pass, and ubuntu and
-        # macOS ship different awks. If they ever disagree on the count, that is
-        # a portability bug in a script operators run locally, and this is where
-        # it should surface. Adds ~0.4s.
-        run: bash scripts/check-pipefail-early-exit.sh --quiet --require-baseline
-      - name: Ratchet undeclared loom-daemon subcommand dependencies
-        if: ${{ !cancelled() }}
-        # #8285. A shell script that shells out to `loom-daemon <subcommand>`
-        # acquires a fleet-wide VERSION FLOOR the moment that subcommand is
-        # added, and every host whose binary predates it stops. On 2026-09-18
-        # that took out merges on a host running 0.19.161 against a `main` that
-        # had moved to 0.19.170+, and the refusal could name neither the version
-        # to roll to nor the command to roll with.
-        #
-        # The gate makes the floor declarable (`# requires-daemon: <sub> >= <v>`)
-        # and then enforces that a NEW dependency cannot land undeclared. Same
-        # one-way-ratchet shape as the two gates above: everything that exists
-        # today is frozen in scripts/daemon-subcommand-baseline.txt, so this
-        # fires only on a newly added dependency. --require-baseline so deleting
-        # the ledger reads as a failure rather than as "all clear".
-        #
-        # Both legs, for the same reason as the pipefail ratchet: detection is
-        # an awk pass, ubuntu and macOS ship different awks, and the gate is
-        # bash-3.2-clean by construction (no `declare -A`) so the macOS leg is
-        # real coverage of that claim rather than a formality. Adds ~1s.
-        run: bash scripts/check-daemon-subcommand-versions.sh --quiet --require-baseline
-      - name: Self-test the daemon-subcommand version gate
-        if: ${{ !cancelled() }}
-        run: bash scripts/check-daemon-subcommand-versions.sh --self-test
 
   daemon-checks:
     name: Daemon Checks
-    # ONE required context for the two required gates that run the shared debug
-    # daemon (#9065): Shell Budget Ratchet and .gitignore Convergence Check,
-    # each marked `# component:` exactly like Structural Checks.
+    # ONE required context for the required gates that run the shared debug
+    # daemon (#9065), each marked `# component:` exactly like Structural Checks.
     # `changes` is here only so the steps can read `changes.daemon` (#9113).
     # It does NOT gate the job: the `if:` below is unchanged, so this required
     # context still runs and reports on every single PR.
@@ -1177,32 +949,6 @@ jobs:
           path: target/debug
       - if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
-
-      # component: Shell Budget Ratchet
-      # NOT behind the `backend` paths filter, and #9113 did not put it there.
-      # The first cut of this gate lived inside `Rust Unit Tests`, which is
-      # gated on `backend`; that filter covers `loom-daemon/**` but not
-      # `scripts/**` or `defaults/**`, so a PR that ADDED a shell script
-      # skipped the job entirely and the ratchet first fired on the push to
-      # `main`. A gate skipped on exactly the changes it targets is not a gate.
-      # See .loom/docs/ci-principles.md: path-filtering is an optimisation, not
-      # a correctness tool.
-      #
-      # `daemon != 'false'` is the one predicate it is allowed to sit behind,
-      # because that predicate is built from this gate's own reach rather than
-      # from a file group (it is now always true; the `dashboard/`-only skip
-      # case left with `dashboard/` for `2AMLogic/loom-ui`, #9104).
-      #
-      # It measures the pool epic #7810 is retiring — `contract` + `hook-entry`,
-      # whose logic moves into the daemon behind a stub — rather than total
-      # production shell, a quarter of which is `bootstrap`/`vendored` and
-      # correctly permanent. See .loom/docs/shell-language-policy.md.
-      # fetch-depth: 0 because the gate compares against the MERGE-BASE, and the
-      # default depth-1 checkout has no history to find one in. Without this the
-      # comparison degrades to "no merge-base found" and measures the wrong tree.
-      - name: Shell budget
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: ./target/debug/loom-daemon shell-budget --check
 
       # component: .gitignore Convergence Check
       # Not gated on backend changes — a drifted .gitignore is detectable
@@ -1311,8 +1057,8 @@ jobs:
 
   install-surface-checks:
     name: Install Surface Checks
-    # Agent Skills Sync Check and Fresh Install Link Check on the shared debug
-    # daemon (#9065), plus the Compatibility Contract (#10716). NOT required:
+    # Fresh Install Link Check on the shared debug daemon (#9065), plus the
+    # Compatibility Contract (#10716). NOT required:
     # they were not required as separate jobs either; CI Result aggregates
     # this job. The job itself runs on every PR; its two gates are behind
     # `daemon != 'false'` (#9113), never behind a file-group filter (path
@@ -1345,21 +1091,6 @@ jobs:
       - if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
 
-      # component: Agent Skills Sync Check
-      # Not behind a file-group filter (see ci-principles.md — path-filtering
-      # is an optimisation, not a correctness tool); only behind
-      # `daemon != 'false'` (#9113), and its inputs are all under `defaults/`. Every defaults/.agents/skills/loom-<name>/SKILL.md is generated by
-      # `loom-daemon generate-agent-skills` from defaults/roles/<name>.md — this
-      # fails if a checked-in SKILL.md is stale, keeping the cross-vendor
-      # skill-discovery surface (Codex, Kimi Code, Mistral Vibe, Grok)
-      # single-source with the .claude/commands/loom/ prompts Claude Code reads
-      # (#8673, contract point 5). This is native Rust from the start (per the
-      # shell-language policy, #7762) rather than a `bash scripts/*.sh` check, so
-      # it needs a build step first — same shape as the Shell Budget Ratchet job.
-      - name: Check .agents/skills/ is in sync with its source
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: ./target/debug/loom-daemon generate-agent-skills --check
-
       # component: Fresh Install Link Check
       # Deliberately NOT behind a file-group filter (see
       # .loom/docs/ci-principles.md — path-filtering is an optimisation, not a
@@ -1370,9 +1101,8 @@ jobs:
       # Why a REAL install instead of another static checker (#8270): every
       # existing link gate reasons about ONE destination for each source file.
       # `check-dangling-links.sh` maps `defaults/.claude/commands/loom/X.md` to
-      # its installed `.claude/commands/loom/X.md`, and
-      # `check-docs-defaults-parity.sh` only looks inside `defaults/docs/`.
-      # Neither models the fact that a handful of those command files are ALSO
+      # its installed `.claude/commands/loom/X.md`.
+      # It does not model the fact that a handful of those command files are ALSO
       # installed — one directory shallower — as `.loom/roles/X.md`, because
       # `defaults/roles/X.md` is a symlink to them. A `../../../.loom/docs/…`
       # link resolves correctly from the first destination and escapes the repo
@@ -1441,12 +1171,10 @@ jobs:
 
   repo-hygiene:
     name: Repo Hygiene Checks
-    # Three non-required checks that each took a runner for under 10s (#9065):
-    # Retired List Drift, Stale Model Pin Check, and the advisory
-    # Guard-Destructive drift diff. Every step runs even when an earlier one
-    # failed (`!cancelled()`), so one red check never hides another; the
-    # advisory step keeps its continue-on-error. Their original job-level
-    # comments follow, unchanged, above each group of steps.
+    # Two non-required checks that each took a runner for under 10s (#9065):
+    # Retired List Drift and Stale Model Pin Check. Every step runs even when
+    # an earlier one failed (`!cancelled()`), so one red check never hides
+    # another. Their original job-level comments follow above each group.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1457,9 +1185,9 @@ jobs:
       # --- Retired List Drift ---
       # Cheap structural check; always runs, and deliberately NOT path-filtered.
       # A deletion under defaults/ is exactly what this gate exists to catch, and
-      # a `defaults/**` filter would be the same false economy the Shell Budget
-      # job already paid for once (.loom/docs/ci-principles.md: path-filtering is
-      # an optimisation, not a correctness tool).
+      # a `defaults/**` filter would be a false economy
+      # (.loom/docs/ci-principles.md: path-filtering is an optimisation, not a
+      # correctness tool).
       #
       # resync-installed.sh only ever WALKS files that still exist under
       # defaults/, so a payload file deleted there is never noticed and survives
@@ -1602,35 +1330,6 @@ jobs:
             exit 1
           fi
           echo "No stale pinned model IDs in .github/workflows/ or defaults/scripts/"
-      # --- Guard-Destructive Vendored/Canonical Drift Check (advisory) ---
-      # ADVISORY ONLY — never blocks the PR (continue-on-error, and the script
-      # itself always exits 0). defaults/hooks/guard-destructive-generic.sh is
-      # a documented VENDORED COPY of Repo Skills' canonical
-      # hooks/repo/guard-destructive.sh (rjwalters/repo) — its own header says
-      # "DO NOT hand-edit generic pattern behavior here — send fixes upstream",
-      # but that convention went unenforced and the vendored copy drifted
-      # ~2,200+ lines ahead of upstream before anyone noticed (issue #5660).
-      # Two of #5660's three resolutions have already shipped (the dispatcher's
-      # capability probe, #4894/#5916; the reconciliation of the known drift,
-      # rjwalters/repo#188/#192) — this job is the third: fetch the canonical
-      # file from rjwalters/repo and diff its top-level function-name set and
-      # pattern-table set against the vendored copy, posting the delta as a job
-      # summary so the *next* multi-thousand-line drift is visible in weeks,
-      # not months. Runs on every push/PR (cheap: one network fetch + a local
-      # diff, no build step) but is explicitly non-blocking on both axes: a
-      # fetch failure (rate limit, outage) is reported "inconclusive" rather
-      # than failing, and continue-on-error covers any other unexpected script
-      # failure.
-      - name: Self-test the drift-check extraction logic
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        run: bash scripts/check-guard-destructive-drift.sh --self-test
-      - name: Diff vendored guard-destructive-generic.sh against its canonical upstream
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/check-guard-destructive-drift.sh
 
   shell-syntax:
     name: Shell Syntax (macos-latest)
@@ -1692,57 +1391,6 @@ jobs:
         # and builds nothing -- so the tree is exactly what is tracked.
         # ~830 scripts, ~3s.
         run: bash defaults/scripts/check-shell-syntax.sh --quiet --dir .
-      - name: Run the shell-allowlist gate's self-test under bash 3.2
-        if: runner.os == 'macOS'
-        # #7762 requires check-shell-allowlist.sh to be bash-3.2-clean, and
-        # `bash -n` above only proves it PARSES. The self-test actually executes
-        # every rule, so running it here is the only thing that proves the gate
-        # guarding against the bash 3.2 class (#7717/#7728/#7730/#7749/#7751)
-        # does not itself belong to it. The invariant check proper runs once, in
-        # the ubuntu-only `Shell Allowlist` job -- this leg is portability
-        # coverage, not a second copy of the gate.
-        run: bash scripts/check-shell-allowlist.sh --self-test
-      - name: Ratchet the pipefail + early-exit-consumer SIGPIPE class
-        # #7790 (parent #7789). `set -o pipefail` plus a consumer that exits
-        # before reading all input (head, grep -q, grep -m, read) lets the
-        # producer take SIGPIPE, and pipefail reports the pipeline as failed.
-        # One idiom produced four CI flakes (#7060, #7285, #7540, #7736) and,
-        # in #7771, a silent WRONG ANSWER in production -- verify-proposal-refs.sh
-        # reporting a present file as `MISSING FILE`.
-        #
-        # A one-way ratchet: every occurrence
-        # that exists today is frozen at its per-file count in
-        # scripts/pipefail-early-exit-baseline.txt, and this fails only when a
-        # file GAINS one. --require-baseline so that deleting the ledger reads
-        # as a failure rather than as "all clear".
-        #
-        # Runs on BOTH legs on purpose: the scan is one awk pass, and ubuntu and
-        # macOS ship different awks. If they ever disagree on the count, that is
-        # a portability bug in a script operators run locally, and this is where
-        # it should surface. Adds ~0.4s.
-        run: bash scripts/check-pipefail-early-exit.sh --quiet --require-baseline
-      - name: Ratchet undeclared loom-daemon subcommand dependencies
-        # #8285. A shell script that shells out to `loom-daemon <subcommand>`
-        # acquires a fleet-wide VERSION FLOOR the moment that subcommand is
-        # added, and every host whose binary predates it stops. On 2026-09-18
-        # that took out merges on a host running 0.19.161 against a `main` that
-        # had moved to 0.19.170+, and the refusal could name neither the version
-        # to roll to nor the command to roll with.
-        #
-        # The gate makes the floor declarable (`# requires-daemon: <sub> >= <v>`)
-        # and then enforces that a NEW dependency cannot land undeclared. Same
-        # one-way-ratchet shape as the two gates above: everything that exists
-        # today is frozen in scripts/daemon-subcommand-baseline.txt, so this
-        # fires only on a newly added dependency. --require-baseline so deleting
-        # the ledger reads as a failure rather than as "all clear".
-        #
-        # Both legs, for the same reason as the pipefail ratchet: detection is
-        # an awk pass, ubuntu and macOS ship different awks, and the gate is
-        # bash-3.2-clean by construction (no `declare -A`) so the macOS leg is
-        # real coverage of that claim rather than a formality. Adds ~1s.
-        run: bash scripts/check-daemon-subcommand-versions.sh --quiet --require-baseline
-      - name: Self-test the daemon-subcommand version gate
-        run: bash scripts/check-daemon-subcommand-versions.sh --self-test
       - name: Run the installed-file write guard suite under bash 3.2
         if: ${{ !cancelled() }}
         # #12043. Every `bash -n` above passed while this guard FAILED OPEN on
@@ -2641,13 +2289,7 @@ jobs:
         run: bash defaults/scripts/check-label-descriptions.sh
       - name: Check Verdict-Time CAS Recheck sections are intact (#4570)
         run: bash defaults/scripts/check-cas-recheck-consistency.sh
-      - name: Check every package manifest has a labeled dependabot entry (#7577)
-        run: bash defaults/scripts/check-dependabot-labels.sh
-      # The script is a thin wrapper over `loom-daemon check-dependabot-labels`
-      # (#11828), so its fixture suite needs the build downloaded above.
-      - name: Test the dependabot label check (#7577, #11828)
-        run: bash defaults/scripts/tests/test-check-dependabot-labels.sh
-      # #9418: the Renovate-side counterpart — every `labels` array in
+      # #9418: every `labels` array in
       # renovate.json5 (top-level and every packageRules / vulnerabilityAlerts /
       # lockFileMaintenance override, which REPLACE rather than merge) carries
       # loom:review-requested. A daemon subcommand, not more lines in that
@@ -3168,8 +2810,8 @@ jobs:
   # skip the path filter actually decided stays a pass. On push the only
   # filter is `changes-push` (#10825): the image jobs skip only when it
   # SUCCEEDED with docker=false; if it fails or is cancelled they run anyway
-  # and its own result fails this gate, so it fails closed. Rule + tests:
-  # scripts/ci-result-gate.sh, scripts/test-ci-result-gate.sh. Making it a
+  # and its own result fails this gate, so it fails closed. Rule:
+  # scripts/ci-result-gate.sh. Making it a
   # REQUIRED context is a ruleset change applied by an operator AFTER this job
   # has reported on `main` (setup-branch-protection.sh); a required context
   # that never reports blocks every merge. The remedy for a red result is
@@ -3188,7 +2830,6 @@ jobs:
       - node-packages
       - backend-lint-and-check
       - backend-tests
-      - workflow-cancel-lint
       - structural-checks
       - daemon-checks
       - install-surface-checks

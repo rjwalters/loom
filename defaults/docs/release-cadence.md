@@ -16,8 +16,7 @@ day, each starting its own `main` CI run and then a release, which queued PR
 CI behind it and moved every non-fleet `autoUpdate` host. The operator
 direction (2026-10-09) is **at most one release a day**.
 
-- **The gate.** `scripts/version-bump-gate.sh` (unit-tested by
-  `scripts/test-version-bump-gate.sh`) runs before any toolchain setup. The
+- **The gate.** `scripts/version-bump-gate.sh` runs before any toolchain setup. The
   last bump is the newest **first-parent** `main` commit that changed
   `VERSION`, timed by its **committer** time (PRs cannot change `VERSION`, so
   only bump commits match; tags and Release dates are never read). A run bumps
@@ -68,8 +67,7 @@ direction (2026-10-09) is **at most one release a day**.
   `v<VERSION>` is created at that commit, and every build job checks the tag
   out, so the tag, the binary's `--version` (`Cargo.toml` at that tree) and the
   tested tree are the same thing.
-- **When it publishes** (`scripts/release-decision.sh`, unit-tested by
-  `scripts/test-release-decision.sh`): only if no tag or Release `v<VERSION>`
+- **When it publishes** (`scripts/release-decision.sh`): only if no tag or Release `v<VERSION>`
   exists yet, no **newer** version has already been released (a late re-run of
   an old green CI run never publishes an older version after a newer one), and
   `head_sha` is still reachable from `main` (rewritten history never

@@ -1,5 +1,5 @@
-//! Epic #7810's subcommands: those that back a retired shell script, plus the
-//! epic's own instrumentation (`shell-budget`).
+//! Epic #7810's subcommands: those that back a retired shell script, plus
+//! newer native subcommands kept here so `main.rs` stays short.
 //!
 //! Every variant here is the implementation behind a `defaults/scripts/*.sh`
 //! entry point that is now a thin stub. The stubs' names, flags, stdout and
@@ -103,12 +103,6 @@ pub(crate) enum ScriptPortCommand {
     /// 0 = clean, 2 = the guard could not run — and 2 must refuse the merge.
     #[command(subcommand)]
     MergePr(MergePrCommand),
-
-    /// How far the epic actually is: portable shell remaining, the permanent
-    /// floor, and the net change since the first port. Not a port itself — it
-    /// lives here because `main.rs` is frozen by the file-size ratchet and this
-    /// flattened enum is what keeps a new top-level subcommand free.
-    ShellBudget(super::shell_budget::ShellBudgetArgs),
 
     /// `merge-pr.sh`'s closing-reference / partial-increment analysis (#8191,
     /// slice 1). Reads the PR body on stdin — it is untrusted external content
@@ -348,8 +342,7 @@ pub(crate) enum ScriptPortCommand {
     /// What a dispatched agent actually left behind (#8267): commits on the
     /// branch vs. deliverables still sitting uncommitted in the worktree, plus
     /// the `Stop`/`SubagentStop` hook that refuses a clean completion when the
-    /// two disagree. Not a port either — same frozen-`main.rs` reason as
-    /// `shell-budget` above.
+    /// two disagree. Not a port; it lives here so `main.rs` stays short.
     #[command(subcommand)]
     WorktreeState(super::worktree_state::WorktreeStateCommand),
 
@@ -366,14 +359,14 @@ pub(crate) enum ScriptPortCommand {
     /// it? Backs `premise-check.sh`. Exit 0 proceed, 10 record required, 11
     /// route to an operator decision, 12 record malformed, 13 premise
     /// false, 1 could not run — and 1 must be treated as 10, never as 0. Not
-    /// a port either: same frozen-`main.rs` reason as `shell-budget` above.
+    /// a port; it lives here so `main.rs` stays short.
     PremiseCheck(super::premise_check::PremiseCheckArgs),
 
     /// The operator-decision helper (#9344): validate a ranked-options
     /// decision (2-4 options best -> worst, each with a why, recommended
     /// first) and write it onto an issue as a fenced `decision` block before
     /// labelling it `loom:operator` (#11795). Refuses, touching nothing, on
-    /// any contract failure. Same frozen-`main.rs` reason as `shell-budget`.
+    /// any contract failure. Lives here so `main.rs` stays short.
     #[command(subcommand)]
     OperatorDecision(super::operator_decision::OperatorDecisionCommand),
 
@@ -446,8 +439,7 @@ pub(crate) enum ScriptPortCommand {
     /// half: the `--disallowedTools` spec list `spawn-claude.sh` injects, and
     /// the "is this role restricted" predicate `spawn-codex.sh` needs to warn
     /// that the guard hook is the ONLY enforcement on its path. Ported out of
-    /// both `contract`-category scripts because inlining it there is exactly
-    /// the portable-shell growth `shell-budget --check` refuses. Exit 0 =
+    /// both `contract`-category scripts per the shell-language policy. Exit 0 =
     /// a restriction applies, 1 = none does — an answer, not an error, landing
     /// on the same no-op branch as an unavailable binary.
     #[command(subcommand)]
@@ -500,7 +492,7 @@ pub(crate) enum ScriptPortCommand {
     /// floor the `Bash` / `Edit|Write` entries carry. Exit 1 on any violation.
     /// Not a port of working shell: the check's first cut lived inside
     /// `contract`-category `check-guard-scan-contracts.sh`, which the
-    /// shell-language policy and the #7810 shell-budget gate both send here.
+    /// shell-language policy sends here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
 
     /// CI gate (#8858): the private-control `POLICY` map in `bundle.rs` may only
@@ -515,15 +507,8 @@ pub(crate) enum ScriptPortCommand {
     /// The Renovate-side routing contract (#9418): every `labels` array in the
     /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
     /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
-    /// any violation; no Renovate config is a clean no-op. Counterpart of
-    /// `check-dependabot-labels.sh` (#7577), in Rust per the shell policy.
+    /// any violation; no Renovate config is a clean no-op.
     CheckRenovateLabels(super::check_renovate_labels::CheckRenovateLabelsArgs),
-
-    /// The Dependabot-side routing contract (#7577): every
-    /// `.github/dependabot.yml` entry carries `loom:review-requested` and every
-    /// lockfile-bearing npm manifest is covered. The logic behind
-    /// `check-dependabot-labels.sh`. Exit 1 on any problem; no config is a no-op.
-    CheckDependabotLabels(super::check_dependabot_labels::CheckDependabotLabelsArgs),
 
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
@@ -646,17 +631,16 @@ pub(crate) enum ScriptPortCommand {
     /// manifest. Not a port: brand-new logic, native from the start per the
     /// shell-language policy — and native specifically so the gate can be a
     /// real ratchet rather than a grep in a `contract`-category script. It
-    /// lives in this flattened enum for the same frozen-`main.rs` reason as
-    /// `shell-budget`, which keeps `forge-inventory` a real nested subcommand
-    /// at zero cost to that file. Makes no forge call.
+    /// lives in this flattened enum so `main.rs` stays short, which keeps
+    /// `forge-inventory` a real nested subcommand at zero cost to that file.
+    /// Makes no forge call.
     #[command(subcommand)]
     ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
 
     /// Combined-tree CI qualification for the merge queue (#10257): `audit`
     /// reports relied-on suites that do not validate the merge-group commit;
     /// `eligibility` decides whether a repository may pilot queue mode.
-    /// Read-only. Lives here for the same frozen-`main.rs` reason as
-    /// `shell-budget`.
+    /// Read-only. Lives here so `main.rs` stays short.
     #[command(subcommand)]
     MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
 
@@ -694,7 +678,6 @@ impl ScriptPortCommand {
             ScriptPortCommand::AgentResume(cmd) => cmd.run(),
             ScriptPortCommand::InstallCompat(cmd) => cmd.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
-            ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::CargoTargetDir(cmd) => cmd.run(),
@@ -743,7 +726,6 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
             ScriptPortCommand::CheckPrivateControlVersion(args) => args.run(),
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
-            ScriptPortCommand::CheckDependabotLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),

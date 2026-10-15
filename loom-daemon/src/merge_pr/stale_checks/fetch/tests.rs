@@ -193,10 +193,10 @@ fn a_prs_ci_yml_edit_is_attributed_against_the_head_workflow() {
     // …and a block that IS a required gate's own definition.
     let dir = tempfile::tempdir().unwrap();
     let gh =
-        pr_gh_stub(dir.path(), &pr_entry(line_of("      # component: Markdown Token Ratchet") + 2));
+        pr_gh_stub(dir.path(), &pr_entry(line_of("      # component: Vendored Private-Reference Scrub") + 2));
     assert!(
         pr_ci_scope(gh.to_str().unwrap(), "o/r", "9065", "deadbeef", &[pr_file(CI_WORKFLOW)])
-            .affects("Markdown Token Ratchet"),
+            .affects("Vendored Private-Reference Scrub"),
     );
 }
 

@@ -175,8 +175,8 @@ fn shell_suite_and_node_inputs_refuse_the_aggregate() {
 #[test]
 fn a_granular_components_refusal_carries_into_the_aggregate() {
     // The #8078 shape: main tightens a ratchet baseline under a PR it measures.
-    // `Markdown Token Ratchet` refuses; so must the aggregate that folds it in.
-    let d = set(&["scripts/markdown-token-baseline.txt"]);
+    // `Vendored Private-Reference Scrub` refuses; so must the aggregate that folds it in.
+    let d = set(&["scripts/check-vendored-private-refs.sh"]);
     let p = set(&["docs/adr/0020-something.md"]);
     // A doc-only PR gives neither the own component nor the ratchet anything
     // to re-judge…
@@ -190,7 +190,7 @@ fn a_granular_components_refusal_carries_into_the_aggregate() {
     let p2 = set(&["defaults/.claude/commands/loom/builder.md"]);
     let (component, _) =
         composite_stale_reason(&folded, &d, &p2, &CiScopes::unscoped()).expect("stale");
-    assert_eq!(component, "Markdown Token Ratchet");
+    assert_eq!(component, "Vendored Private-Reference Scrub");
     let p = set(&[
         "docs/adr/0020-something.md",
         "defaults/.claude/commands/loom/builder.md",

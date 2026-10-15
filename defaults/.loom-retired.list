@@ -147,3 +147,9 @@ scripts/tests/test-classify-capacity-defer.sh
 # #9782 (2026-10-15) — every suite now registers a real write-scope fixture
 # (write-scope-fixture.sh); the allow-all forge may-write stub goes.
 scripts/tests/lib/write-scope-stub.sh
+
+# #12106 (2026-10-15) — CI simplification: the Dependabot manifest-label check
+# and the pipefail ratchet's suite leave the PR path with their checkers.
+scripts/check-dependabot-labels.sh
+scripts/tests/test-check-dependabot-labels.sh
+scripts/tests/test-check-pipefail-early-exit.sh
