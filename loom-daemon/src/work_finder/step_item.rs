@@ -27,9 +27,8 @@
 //! # Pure
 //!
 //! No forge call, no environment read, no clock. Everything the classifier
-//! reads arrives in [`Inputs`]; the facts that need the forge (whether a
-//! dependency park's blockers have closed, which merged PRs close an issue,
-//! whether a PR sits in the merge queue, trusted comment markers) are computed
+//! reads arrives in [`Inputs`]; the facts that need the forge (which merged
+//! PRs close an issue, whether a PR sits in the merge queue, trusted comment markers) are computed
 //! by the caller. The adapters at the bottom of this file derive the
 //! body-borne facts with the parsers that already own them, so a caller never
 //! re-implements one. The fixture `loom-daemon/tests/fixtures/
@@ -60,7 +59,7 @@
 //! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 //! | the same, a capability not held | pass `capability_missing` |
-//! | `loom:curated` + `loom:blocked`, **dependency park**, every blocker closed | Champion re-evaluate |
+//! | `loom:curated` + `loom:blocked`, **dependency park** | Champion re-evaluate |
 //! | any other blocked issue | pass `blocked` |
 //! | landed: a merged **closing** PR, issue still open | Curator keep-or-close |
 //! | `loom:decision-malformed` | Curator |
@@ -85,7 +84,11 @@
 //!   already saw and kept (the trusted route marker naming that PR) does not
 //!   route it again.
 //! - **Park kinds.** Only a *dependency* park — a park record naming a blocker
-//!   — is re-evaluable when its blockers close. A quarantine (and the
+//!   — is re-evaluable. Champion re-checks its blockers on every draw and
+//!   lifts the park or leaves it (#12078); the classifier does not ask the
+//!   forge first, and the Champion re-evaluation ladder
+//!   (`step_dispatch::reeval_ladder`) spaces the draws of a park that stays.
+//!   A quarantine (and the
 //!   fast-fail park, which parks through the quarantine, #11854), the PR-less
 //!   hold, a Champion hold record and an unstated park name no blocker, so
 //!   Champion `--issue`'s "every blocker closed" check would be vacuously true
@@ -168,11 +171,6 @@ pub struct IssueInput {
     /// The kind of `loom:blocked` park the body declares ([`park_kind`]).
     #[serde(default)]
     pub park: ParkKind,
-    /// A [`ParkKind::Dependency`] park whose every named blocker is a closed
-    /// issue or a merged PR (the caller reads the forge). Ignored for every
-    /// other kind.
-    #[serde(default)]
-    pub blockers_closed: bool,
     /// The capabilities a [`ParkKind::Capability`] park declares
     /// ([`declared_capabilities`]). ANDed.
     #[serde(default)]
@@ -724,7 +722,7 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
                 pass(ItemState::Blocked, PassReason::CapabilityMissing)
             };
         }
-        if has(labels, CURATED) && issue.park == ParkKind::Dependency && issue.blockers_closed {
+        if has(labels, CURATED) && issue.park == ParkKind::Dependency {
             return step(ItemState::Blocked, Step::ChampionReevaluate);
         }
         return pass(ItemState::Blocked, PassReason::Blocked);

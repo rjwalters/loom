@@ -1132,7 +1132,7 @@ Continue evaluating issues until all have been processed or all applicable level
 ### When NOT to Promote
 
 Regardless of quality, do NOT promote an issue if any of the following holds. The holds are already terminal; the rest get a Step 4 verdict, never a skip (#11860):
-- Issue has `loom:blocked` label. A block is re-evaluated once its blocker closes and it is lifted: by a targeted step that finds every park-record blocker closed (`champion-targeted.md`), or by a human (nothing lifts it automatically since #11301). Departs from `champion.md` Priority 2's "outside Champion's promotion authority" (#11860)
+- Issue has `loom:blocked` label. A block is re-evaluated once its blocker closes and it is lifted: by a targeted step that finds every park-record blocker closed (`champion-targeted.md`; the work finder draws a curated, dependency-parked issue for that step each time it comes up, #12078), or by a human (nothing lifts it automatically since #11301). Departs from `champion.md` Priority 2's "outside Champion's promotion authority" (#11860)
 - Issue has `loom:operator` label (a human must act or decide — credentials, infra rotations, manual deploys, hardware access, a ruling; sweep will skip these in pre-flight, so promoting to `loom:issue` would only stall the queue). This is also the terminal state the N=2 escalation in Step 4 routes to, so an escalated proposal is automatically excluded from every future pass. No exception (#11861): only a human removes it; while it is present, nothing here acts on it.
 - Issue title contains "DISCUSSION" or "RFC" (requires human input: escalate)
 - Issue mentions breaking changes without migration plan (revise)
