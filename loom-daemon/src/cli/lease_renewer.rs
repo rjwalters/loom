@@ -355,14 +355,13 @@ pub(crate) fn check(
 }
 
 /// Tombstone (and signal, when `is_live` confirms it) every owner of
-/// `(repo, issue, sweep)` — and `host`, when given. `sweep: None` matches any
-/// sweep (`lease release`, #12103). Returns how many matched.
+/// `(repo, issue, sweep)` — and `host`, when given. Returns how many matched.
 pub(crate) fn release(
     store: &Store,
     repo: &str,
     issue: u64,
     host: Option<&str>,
-    sweep: Option<&str>,
+    sweep: &str,
     is_live: LiveProbe<'_>,
     signal: &dyn Fn(u32),
 ) -> Result<usize> {
@@ -717,7 +716,7 @@ impl RenewerAction {
                     &repo,
                     key.issue,
                     key.host.as_deref(),
-                    Some(&sweep),
+                    &sweep,
                     &owner_is_live,
                     &signal,
                 )?;

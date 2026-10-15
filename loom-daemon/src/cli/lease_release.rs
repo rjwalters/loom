@@ -18,7 +18,7 @@
 //! 2. Refuses, naming the host, when any live lease belongs to another host:
 //!    nothing is stopped or posted.
 //! 3. Stops this host's renewer(s) for the issue whatever their sweep id
-//!    (`lease_renewer::release`).
+//!    (`lease_renewer::end_owners`).
 //! 4. Posts a `loom:lease-yield` record per released pair — the existing
 //!    "this claimant stood down" signal `forge check-claim` already honours —
 //!    instead of deleting the lease comment, which would lose the audit trail.
@@ -115,7 +115,8 @@ pub(crate) fn release_lease(
     }
     let mut renewers = 0;
     for host in mine {
-        renewers += lease_renewer::release(store, repo, issue, Some(host), None, is_live, signal)?;
+        renewers +=
+            lease_renewer::end_owners(store, repo, issue, Some(host), None, is_live, signal)?;
     }
     for (host, sweep) in &plan.own {
         if !post(&yield_body(host, sweep)) {
