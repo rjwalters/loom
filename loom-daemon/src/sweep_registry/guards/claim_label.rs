@@ -326,7 +326,7 @@ impl LeaseOrderDecision {
     /// yield variant never has to be re-plumbed through the dispatch path.
     pub(crate) fn yield_identity(self) -> Option<(String, String)> {
         match self {
-            Self::Proceed => None,
+            Self::Proceed | Self::Unverified => None,
             Self::Yield {
                 earliest_host,
                 earliest_sweep_id,

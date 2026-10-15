@@ -36,6 +36,15 @@ impl PrRole {
             Self::Champion => "champion",
         }
     }
+
+    /// The role spelled as [`Self::as_str`] spells it; `None` for a role
+    /// without a PR queue.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Judge, Self::Doctor, Self::Champion]
+            .into_iter()
+            .find(|r| r.as_str() == name)
+    }
 }
 
 pub fn prefer_human_prs(root: &Path) -> bool {

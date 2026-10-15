@@ -42,6 +42,7 @@
 //! predicate, since a stored render that partly failed does not describe the
 //! files on disk.
 
+#[cfg(not(test))]
 use std::sync::{Mutex, OnceLock};
 
 use super::FleetSyncStatus;
@@ -74,11 +75,28 @@ impl AppliedSha {
     }
 }
 
-/// `None` = nothing established in this process yet (try the status file);
-/// `Some(state)` = the last word from `publish`/`clear_status`.
-fn cell() -> &'static Mutex<Option<AppliedSha>> {
+/// Run `f` on the cell. `None` = nothing established in this process yet
+/// (try the status file); `Some(state)` = the last word from
+/// `publish`/`clear_status`.
+#[cfg(not(test))]
+fn with_cell<R>(f: impl FnOnce(&mut Option<AppliedSha>) -> R) -> Option<R> {
     static CELL: OnceLock<Mutex<Option<AppliedSha>>> = OnceLock::new();
-    CELL.get_or_init(|| Mutex::new(None))
+    let mut guard = CELL.get_or_init(|| Mutex::new(None)).lock().ok()?;
+    Some(f(&mut guard))
+}
+
+/// Test builds hold the cell **per thread** (#11841): under plain
+/// `cargo test` every test shares one process, so a process-wide cell lets one
+/// test's forced or status-file-seeded value leak into another. (CI's nextest
+/// runs one process per test, which hid the race.) Each test thread gets its
+/// own cell; code under test that hops to another thread sees a fresh, empty
+/// cell there.
+#[cfg(test)]
+fn with_cell<R>(f: impl FnOnce(&mut Option<AppliedSha>) -> R) -> Option<R> {
+    thread_local! {
+        static CELL: std::cell::RefCell<Option<AppliedSha>> = const { std::cell::RefCell::new(None) };
+    }
+    Some(CELL.with(|c| f(&mut c.borrow_mut())))
 }
 
 /// The applied fleet-config SHA for **this host right now**.
@@ -88,15 +106,13 @@ fn cell() -> &'static Mutex<Option<AppliedSha>> {
 /// successful seed so the file is not re-read per export batch.
 #[must_use]
 pub fn applied_config_sha() -> AppliedSha {
-    if let Ok(guard) = cell().lock() {
-        if let Some(held) = guard.as_ref() {
-            return held.clone();
-        }
+    if let Some(held) = with_cell(|cell| cell.clone()).flatten() {
+        return held;
     }
     let probed = super::probe_status();
     let seeded = probed.as_ref().and_then(applied_sha_of).map(str::to_string);
-    if let (Ok(mut guard), Some(sha)) = (cell().lock(), seeded.clone()) {
-        *guard = Some(AppliedSha::Sha(sha));
+    if let Some(sha) = seeded.clone() {
+        with_cell(|cell| *cell = Some(AppliedSha::Sha(sha)));
     }
     seeded.map_or(AppliedSha::Unknown, AppliedSha::Sha)
 }
@@ -120,34 +136,26 @@ pub(crate) fn record_pass(status: &FleetSyncStatus) {
     let Some(sha) = applied_sha_of(status) else {
         return;
     };
-    if let Ok(mut guard) = cell().lock() {
-        *guard = Some(AppliedSha::Sha(sha.to_string()));
-    }
+    with_cell(|cell| *cell = Some(AppliedSha::Sha(sha.to_string())));
 }
 
 /// Forget the store (called from [`clear_status`](super::clear_status), i.e.
 /// `fleet.repo` unset): the resource reports `none` from here on.
 pub(crate) fn clear() {
-    if let Ok(mut guard) = cell().lock() {
-        *guard = Some(AppliedSha::NoStore);
-    }
+    with_cell(|cell| *cell = Some(AppliedSha::NoStore));
 }
 
 /// Test seam for the sibling `applied` module's tests and the OTLP resource
-/// tests: force or empty the process-wide cell (#11197). Never call outside
+/// tests: force or empty the calling thread's cell (#11197, #11841). Never call outside
 /// `#[cfg(test)]` code — the honest writers are [`record_pass`] and [`clear`].
 #[cfg(test)]
 pub(crate) fn force_for_tests(sha: AppliedSha) {
-    *cell()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sha);
+    with_cell(|cell| *cell = Some(sha));
 }
 
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
-    *cell()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    with_cell(|cell| *cell = None);
 }
 
 #[cfg(test)]

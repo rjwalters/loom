@@ -1,5 +1,5 @@
-//! Epic #7810's subcommands: those that back a retired shell script, plus the
-//! epic's own instrumentation (`shell-budget`).
+//! Epic #7810's subcommands: those that back a retired shell script, plus
+//! newer native subcommands kept here so `main.rs` stays short.
 //!
 //! Every variant here is the implementation behind a `defaults/scripts/*.sh`
 //! entry point that is now a thin stub. The stubs' names, flags, stdout and
@@ -103,12 +103,6 @@ pub(crate) enum ScriptPortCommand {
     /// 0 = clean, 2 = the guard could not run — and 2 must refuse the merge.
     #[command(subcommand)]
     MergePr(MergePrCommand),
-
-    /// How far the epic actually is: portable shell remaining, the permanent
-    /// floor, and the net change since the first port. Not a port itself — it
-    /// lives here because `main.rs` is frozen by the file-size ratchet and this
-    /// flattened enum is what keeps a new top-level subcommand free.
-    ShellBudget(super::shell_budget::ShellBudgetArgs),
 
     /// `merge-pr.sh`'s closing-reference / partial-increment analysis (#8191,
     /// slice 1). Reads the PR body on stdin — it is untrusted external content
@@ -348,8 +342,7 @@ pub(crate) enum ScriptPortCommand {
     /// What a dispatched agent actually left behind (#8267): commits on the
     /// branch vs. deliverables still sitting uncommitted in the worktree, plus
     /// the `Stop`/`SubagentStop` hook that refuses a clean completion when the
-    /// two disagree. Not a port either — same frozen-`main.rs` reason as
-    /// `shell-budget` above.
+    /// two disagree. Not a port; it lives here so `main.rs` stays short.
     #[command(subcommand)]
     WorktreeState(super::worktree_state::WorktreeStateCommand),
 
@@ -366,14 +359,14 @@ pub(crate) enum ScriptPortCommand {
     /// it? Backs `premise-check.sh`. Exit 0 proceed, 10 record required, 11
     /// route to an operator decision, 12 record malformed, 13 premise
     /// false, 1 could not run — and 1 must be treated as 10, never as 0. Not
-    /// a port either: same frozen-`main.rs` reason as `shell-budget` above.
+    /// a port; it lives here so `main.rs` stays short.
     PremiseCheck(super::premise_check::PremiseCheckArgs),
 
     /// The operator-decision helper (#9344): validate a ranked-options
     /// decision (2-4 options best -> worst, each with a why, recommended
     /// first) and write it onto an issue as a fenced `decision` block before
     /// labelling it `loom:operator` (#11795). Refuses, touching nothing, on
-    /// any contract failure. Same frozen-`main.rs` reason as `shell-budget`.
+    /// any contract failure. Lives here so `main.rs` stays short.
     #[command(subcommand)]
     OperatorDecision(super::operator_decision::OperatorDecisionCommand),
 
@@ -446,8 +439,7 @@ pub(crate) enum ScriptPortCommand {
     /// half: the `--disallowedTools` spec list `spawn-claude.sh` injects, and
     /// the "is this role restricted" predicate `spawn-codex.sh` needs to warn
     /// that the guard hook is the ONLY enforcement on its path. Ported out of
-    /// both `contract`-category scripts because inlining it there is exactly
-    /// the portable-shell growth `shell-budget --check` refuses. Exit 0 =
+    /// both `contract`-category scripts per the shell-language policy. Exit 0 =
     /// a restriction applies, 1 = none does — an answer, not an error, landing
     /// on the same no-op branch as an unavailable binary.
     #[command(subcommand)]
@@ -500,7 +492,7 @@ pub(crate) enum ScriptPortCommand {
     /// floor the `Bash` / `Edit|Write` entries carry. Exit 1 on any violation.
     /// Not a port of working shell: the check's first cut lived inside
     /// `contract`-category `check-guard-scan-contracts.sh`, which the
-    /// shell-language policy and the #7810 shell-budget gate both send here.
+    /// shell-language policy sends here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
 
     /// CI gate (#8858): the private-control `POLICY` map in `bundle.rs` may only
@@ -515,15 +507,8 @@ pub(crate) enum ScriptPortCommand {
     /// The Renovate-side routing contract (#9418): every `labels` array in the
     /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
     /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
-    /// any violation; no Renovate config is a clean no-op. Counterpart of
-    /// `check-dependabot-labels.sh` (#7577), in Rust per the shell policy.
+    /// any violation; no Renovate config is a clean no-op.
     CheckRenovateLabels(super::check_renovate_labels::CheckRenovateLabelsArgs),
-
-    /// The Dependabot-side routing contract (#7577): every
-    /// `.github/dependabot.yml` entry carries `loom:review-requested` and every
-    /// lockfile-bearing npm manifest is covered. The logic behind
-    /// `check-dependabot-labels.sh`. Exit 1 on any problem; no config is a no-op.
-    CheckDependabotLabels(super::check_dependabot_labels::CheckDependabotLabelsArgs),
 
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
@@ -586,14 +571,6 @@ pub(crate) enum ScriptPortCommand {
     /// `CheckStaleBlocked` it WRITES (a comment, never a label); `--dry-run`
     /// previews. Always exits 0.
     NotifyClearedBlockers(super::notify_cleared_blockers::NotifyClearedBlockersArgs),
-    /// The deterministic `loom:blocked` release pass (#10556): every open
-    /// `loom:blocked` artifact whose body park records name only resolved
-    /// blockers is released (prior lane label restored), one with some
-    /// resolved is re-parked to the still-open records. No LLM pass. Unlike
-    /// `CheckStaleBlocked` it WRITES (audit comment, then label/body edit);
-    /// `--dry-run` prints the plan. The daemon tick runs the same pass when
-    /// `LOOM_RELEASE_STALE_BLOCKED` is on.
-    ReleaseStaleBlocked(super::release_stale_blocked::ReleaseStaleBlockedArgs),
     /// `sync-labels.sh`'s duplicate-declared-name scan (#8875): a
     /// `labels.yml` that carries two `- name:` entries for the same label
     /// (the pre-#4187-upgrade shape `merge_labels_block` now absorbs on
@@ -646,17 +623,16 @@ pub(crate) enum ScriptPortCommand {
     /// manifest. Not a port: brand-new logic, native from the start per the
     /// shell-language policy — and native specifically so the gate can be a
     /// real ratchet rather than a grep in a `contract`-category script. It
-    /// lives in this flattened enum for the same frozen-`main.rs` reason as
-    /// `shell-budget`, which keeps `forge-inventory` a real nested subcommand
-    /// at zero cost to that file. Makes no forge call.
+    /// lives in this flattened enum so `main.rs` stays short, which keeps
+    /// `forge-inventory` a real nested subcommand at zero cost to that file.
+    /// Makes no forge call.
     #[command(subcommand)]
     ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
 
     /// Combined-tree CI qualification for the merge queue (#10257): `audit`
     /// reports relied-on suites that do not validate the merge-group commit;
     /// `eligibility` decides whether a repository may pilot queue mode.
-    /// Read-only. Lives here for the same frozen-`main.rs` reason as
-    /// `shell-budget`.
+    /// Read-only. Lives here so `main.rs` stays short.
     #[command(subcommand)]
     MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
 
@@ -694,7 +670,6 @@ impl ScriptPortCommand {
             ScriptPortCommand::AgentResume(cmd) => cmd.run(),
             ScriptPortCommand::InstallCompat(cmd) => cmd.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
-            ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::CargoTargetDir(cmd) => cmd.run(),
@@ -743,7 +718,6 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
             ScriptPortCommand::CheckPrivateControlVersion(args) => args.run(),
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
-            ScriptPortCommand::CheckDependabotLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
@@ -752,7 +726,6 @@ impl ScriptPortCommand {
             ScriptPortCommand::RamScopeLimit(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
-            ScriptPortCommand::ReleaseStaleBlocked(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
@@ -773,23 +746,11 @@ pub(crate) enum MergePrCommand {
     /// Refuse a PR carrying `loom:pr` alongside a contradicting label.
     VerdictContradiction(super::merge_pr_labels::VerdictContradictionArgs),
 
-    /// Refuse a merge whose required checks ran before the base branch's
-    /// current tip (#8248): a stale green ratchet result is evidence about a
-    /// tree that no longer exists. Exit 0+CLEAN = fresh, 1 = stale, 2 =
-    /// could not determine (must also refuse).
-    StaleChecks(super::merge_pr_stale_checks::StaleChecksArgs),
-
     /// Run the repo's `merge.treeChecks` against the merge tree (base + PR
     /// head) in a temp dir (#10026). Exit 0+CLEAN = pass/none declared (or
     /// BYPASSED under --allow-red-tree), 1 = a check failed (comment posted),
     /// 2 = could not run (must also refuse).
     TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
-
-    /// Refuse a merge whose head's latest `CI` workflow run did not conclude
-    /// `success` (#10444), naming the cancelled/failed jobs. Exit 0+CLEAN =
-    /// success, 0+UNVERIFIED = no definite verdict (caller warns), 1 = refuse,
-    /// 2 = forge unreachable (caller warns).
-    CiResult(super::merge_pr_ci_result::CiResultArgs),
 
     /// Refuse a plain (non-`--auto`) merge whose head has a required context
     /// that concluded red (#10688); hold (exit 3) on a missing/pending one.
@@ -810,17 +771,6 @@ pub(crate) enum MergePrCommand {
     /// freshly-read head. Exit 0 + sentinel = retry authorized, 1 = foreign
     /// head move (re-queue), 2 = attribution undeterminable (also re-queue).
     HeadSyncRetry(super::merge_pr_head_sync::HeadSyncRetryArgs),
-
-    /// The automated remedy for a merge the #8248 freshness guard blocked:
-    /// first re-run the workflow runs holding the stale required checks IN
-    /// PLACE (#8914, needs Actions: write; no commit, verdict kept), else push
-    /// a tree-identical no-op commit so CI re-dates every check (#8508).
-    /// Exit 5 = re-ran in place and fresh (only with --allow-proceed), 0 =
-    /// re-running in place / fresh without opt-in / pushed (re-queue), 3 =
-    /// head already moved (not a failure, re-evaluate fresh), 4 = push remedy
-    /// already spent on this head, so the PR was escalated to a durable
-    /// `loom:operator` hold, 1 = could not produce fresh evidence.
-    RedateChecks(super::merge_pr_redate::RedateChecksArgs),
 
     /// Read-only report of which required checks and paths forced the #8508
     /// re-dates (#9746), from the trailers on the re-date commits reachable
@@ -1164,12 +1114,9 @@ impl MergePrCommand {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::MergeableRecheck(args) => args.run(),
-            MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
-            MergePrCommand::CiResult(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
-            MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::LoomPrOverrideComment(args) => args.run(),

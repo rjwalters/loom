@@ -77,6 +77,7 @@ use loom_daemon::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
 use loom_daemon::forge_call_stats::{ops, ForgeOp};
 use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
+pub(crate) mod activity;
 pub(crate) mod backstop;
 pub(crate) mod renew;
 
@@ -772,7 +773,10 @@ pub(crate) enum PrLeaseAction {
     /// Exit 0 = held (add the claim label now); 4 = a peer holds it (a yield
     /// record is posted if this call had written a lease); 5 = the lease list
     /// was unreadable, nothing written; 6 = a Judge held by the no-verdict
-    /// backstop (#11855), nothing written. Stand down on 4, 5 or 6.
+    /// backstop (#11855), nothing written; 7 = a Doctor refused because
+    /// another actor is active on the PR (a live lease of any other kind, or
+    /// a recent push by another login, #12105), nothing written. Stand down
+    /// on 4, 5, 6 or 7.
     Claim(Common),
     /// Pre-push / pre-verdict fence. Exit 0 = proceed; 3 = this claimant's
     /// lease is no longer live; 4 = a peer holds this role's lease.
@@ -1001,6 +1005,9 @@ impl Ctx {
             ClaimState::Free => {}
         }
         if let Some(code) = rows.as_deref().and_then(|r| self.backstop_refusal(r)) {
+            return code;
+        }
+        if let Some(code) = rows.as_deref().and_then(|r| self.activity_refusal(r)) {
             return code;
         }
         let story = self.gh.story_issue(self.pr());

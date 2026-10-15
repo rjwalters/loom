@@ -32,7 +32,7 @@ pub const DEFAULT_FAILURE_WINDOW_MINUTES: u64 = 15;
 /// The exporter name the OTLP cell is keyed by in the status maps.
 const OTLP_EXPORTER: &str = "otlp";
 
-/// The four OTLP-export health states.
+/// The OTLP-export health states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OtlpExportState {
@@ -42,6 +42,9 @@ pub enum OtlpExportState {
     /// An OTLP exporter is configured but no batch succeeded within the
     /// window, or `dropped_total` is growing.
     Failing,
+    /// Exporting, but at least one record kind that should arrive has not for
+    /// longer than its threshold (Issue #12120). See [`OtlpExportHealth::kinds`].
+    SilentKinds,
     /// The last successful export is recent.
     Ok,
     /// The operator opted out (`observability.otlp_required: false`) with a
@@ -56,6 +59,7 @@ impl OtlpExportState {
         match self {
             Self::NoExporter => "no_exporter",
             Self::Failing => "failing",
+            Self::SilentKinds => "silent_kinds",
             Self::Ok => "ok",
             Self::Exempt => "exempt",
         }
@@ -75,13 +79,45 @@ pub struct OtlpExportHealth {
     /// [`OtlpHealthMonitor`]; [`evaluate`] alone leaves it `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<DateTime<Utc>>,
+    /// Per-kind last-export time for every kind the `otlp` exporter carries
+    /// (Issue #12120). Empty when no `otlp` exporter runs (`no_exporter`,
+    /// `exempt`), so an older record without it decodes unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<KindExport>,
+}
+
+/// One exported record kind's liveness (Issue #12120).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KindExport {
+    /// The wire `kind` tag.
+    pub kind: String,
+    /// Last acked export this process; `None` = none yet (not "never": the
+    /// map is in memory, so after a restart it is "since start").
+    #[serde(default)]
+    pub last_export_at: Option<DateTime<Utc>>,
+    /// Silent for longer than [`silence_threshold`](crate::telemetry::kinds::kind_silence::silence_threshold).
+    #[serde(default)]
+    pub silent: bool,
 }
 
 impl OtlpExportHealth {
+    /// The kinds currently flagged silent, in registry (sorted) order.
+    #[must_use]
+    pub fn silent_kinds(&self) -> Vec<&str> {
+        self.kinds
+            .iter()
+            .filter(|k| k.silent)
+            .map(|k| k.kind.as_str())
+            .collect()
+    }
+
     /// True for the states that mean "facts are not reaching SigNoz".
     #[must_use]
     pub fn needs_attention(&self) -> bool {
-        matches!(self.state, OtlpExportState::NoExporter | OtlpExportState::Failing)
+        matches!(
+            self.state,
+            OtlpExportState::NoExporter | OtlpExportState::Failing | OtlpExportState::SilentKinds
+        )
     }
 
     /// `otlp: failing since <T> (<reason>)` for an attention state; `None` for
@@ -121,15 +157,22 @@ pub struct OtlpHealthInputs {
     /// `last_failure_detail`), appended to a `failing` detail. When the cell
     /// is `misconfigured` this is why the exporter never started.
     pub last_failure_detail: Option<String>,
+    /// Wire kind -> last acked export, from the OTLP exporter's status cell.
+    pub kind_last_export: std::collections::BTreeMap<String, DateTime<Utc>>,
 }
 
 /// The pure rule. `now` is injected.
 #[must_use]
 pub fn evaluate(inputs: &OtlpHealthInputs, now: DateTime<Utc>) -> OtlpExportHealth {
+    with_kinds(evaluate_export(inputs, now), inputs, now)
+}
+
+fn evaluate_export(inputs: &OtlpHealthInputs, now: DateTime<Utc>) -> OtlpExportHealth {
     let health = |state, detail: Option<String>| OtlpExportHealth {
         state,
         detail,
         since: None,
+        kinds: Vec::new(),
     };
     if let Some(reason) = &inputs.exempt_reason {
         return health(OtlpExportState::Exempt, Some(reason.clone()));
@@ -171,6 +214,40 @@ pub fn evaluate(inputs: &OtlpHealthInputs, now: DateTime<Utc>) -> OtlpExportHeal
         }
     }
     health(OtlpExportState::Ok, None)
+}
+
+/// Fold per-kind liveness (Issue #12120) into the verdict of [`evaluate_export`].
+/// The baseline is a kind's last export or, before it has one, the exporter
+/// start, so a restart never reads as "never exported" and cannot flag a host
+/// inside a threshold of starting.
+fn with_kinds(
+    mut health: OtlpExportHealth,
+    inputs: &OtlpHealthInputs,
+    now: DateTime<Utc>,
+) -> OtlpExportHealth {
+    if !matches!(health.state, OtlpExportState::Ok | OtlpExportState::Failing) {
+        return health;
+    }
+    health.kinds = crate::telemetry::kinds::exported_kinds_for(&[OTLP_EXPORTER.to_string()])
+        .into_iter()
+        .map(|kind| {
+            let last = inputs.kind_last_export.get(&kind).copied();
+            let silent = crate::telemetry::kinds::kind_silence::silence_threshold(&kind)
+                .zip(last.or(inputs.started_at))
+                .is_some_and(|(limit, baseline)| now.signed_duration_since(baseline) > limit);
+            KindExport {
+                kind,
+                last_export_at: last,
+                silent,
+            }
+        })
+        .collect();
+    let silent = health.silent_kinds().join(", ");
+    if health.state == OtlpExportState::Ok && !silent.is_empty() {
+        health.state = OtlpExportState::SilentKinds;
+        health.detail = Some(format!("no export for 24h+ from: {silent}"));
+    }
+    health
 }
 
 /// Validate the exemption: `otlp_required == false` needs a non-empty reason.
@@ -268,6 +345,12 @@ impl OtlpHealthMonitor {
 #[must_use]
 pub fn warn_line(health: &OtlpExportHealth) -> Option<String> {
     health.summary().map(|summary| {
+        if health.state == OtlpExportState::SilentKinds {
+            return format!(
+                "observability: {summary}; these kinds have stopped reaching SigNoz while the \
+                 exporter is otherwise healthy"
+            );
+        }
         format!(
             "observability: {summary}; this daemon's facts are not reaching SigNoz. Declare \
              an `otlp` exporter or set observability.otlp_required=false with \
@@ -363,6 +446,7 @@ fn observe_global(config: &ObservabilityConfig) -> (Observation, Option<String>)
         last_failure_detail: otlp
             .and_then(|s| s.last_failure_detail.as_deref())
             .map(sanitize_failure_detail),
+        kind_last_export: super::global_otlp_kind_exports(),
     };
     let observation = MONITOR
         .lock()
