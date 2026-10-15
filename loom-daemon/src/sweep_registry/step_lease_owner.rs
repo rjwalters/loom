@@ -15,8 +15,16 @@
 //! yield record names the same identity. The bin crate's tests pin this
 //! parser to `pr_lease::parse_record`.
 //!
+//! The lease alone misses one claimant: an attended session that claims by
+//! label only (Doctor, `doctor.md`; the Curator path, `curator.md`) takes no
+//! lease. So the same read also bounds this step's **own** lease
+//! ([`own_lease_end`]), and a claim label applied after the step started
+//! that this lease does not cover is someone else's (#11969,
+//! [`super::step_reap::label_claimed_elsewhere`]).
+//!
 //! Fail-open, like every release-path probe: an unreadable list, or no live
-//! lease of the role, is "not held elsewhere", so the claim is restored.
+//! lease of the role and no foreign label, is "not held elsewhere", so the
+//! claim is restored.
 
 use super::*;
 use crate::gh_invocation::AccessIntent;
@@ -130,6 +138,45 @@ pub fn earliest_live_holder(
         .map(|(_, p)| p.sweep.clone())
 }
 
+/// When `sweep`'s own `role` lease stopped covering the item, among `rows`:
+/// a released (or reaped) record's time, a later yield record's time, or else
+/// the last renewal plus `ttl` (a lease still live ends in the future). The
+/// latest over the sweep's records; `None` when it has none. Pure.
+#[must_use]
+pub fn own_lease_end(
+    rows: &[RoleLeaseRow],
+    role: &str,
+    sweep: &str,
+    ttl: chrono::Duration,
+) -> Option<DateTime<Utc>> {
+    let ours: Vec<(&RoleLeaseRow, RoleLeaseKind)> = rows
+        .iter()
+        .filter_map(|r| parse_role_lease(&r.body).map(|p| (r, p)))
+        .filter(|(_, p)| p.role == role && p.sweep == sweep)
+        .map(|(r, p)| (r, p.kind))
+        .collect();
+    ours.iter()
+        .filter_map(|(r, kind)| match kind {
+            RoleLeaseKind::Released => Some(r.updated_at),
+            RoleLeaseKind::Yield => None,
+            RoleLeaseKind::Lease => Some(
+                ours.iter()
+                    .filter(|(y, k)| *k == RoleLeaseKind::Yield && y.id > r.id)
+                    .map(|(y, _)| y.updated_at)
+                    .min()
+                    .unwrap_or(r.updated_at + ttl),
+            ),
+        })
+        .max()
+}
+
+/// The lease TTL (`LOOM_LEASE_TTL_MINUTES`, the bin crate's liveness rule).
+fn lease_ttl() -> chrono::Duration {
+    let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
+    #[allow(clippy::cast_possible_truncation)]
+    chrono::Duration::seconds((ttl_minutes * 60.0) as i64)
+}
+
 impl SweepRegistry {
     /// Every trusted role-lease comment on `item`; `None` when unreadable.
     pub(crate) fn read_role_lease_rows(&self, item: u32) -> Option<Vec<RoleLeaseRow>> {
@@ -157,23 +204,36 @@ impl SweepRegistry {
         Some(parse_role_lease_rows(&policy.trusted_ndjson(&output.stdout)))
     }
 
-    /// Whether `role`'s earliest live lease on `item` belongs to another
-    /// sweep than `sweep_id` (#11898). Fail-open: unreadable, or no live
-    /// lease of the role, is `false`.
+    /// Whether a non-Builder step `sweep_id` that started at `started_at`
+    /// no longer holds `item`, from one read of the role leases:
+    ///
+    /// - `role`'s earliest live lease belongs to another sweep (#11898); or
+    /// - the role's claim label was applied after the step started and while
+    ///   no lease of this step's was live (#11969): a label-only claimant.
+    ///
+    /// Fail-open: an unreadable lease list or label time is `false`.
     pub(crate) fn step_lease_held_elsewhere(
         &self,
         item: u32,
         role: StepRole,
         sweep_id: &str,
+        started_at: DateTime<Utc>,
     ) -> bool {
         let Some(rows) = self.read_role_lease_rows(item) else {
             return false;
         };
-        let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
-        #[allow(clippy::cast_possible_truncation)]
-        let ttl = chrono::Duration::seconds((ttl_minutes * 60.0) as i64);
-        earliest_live_holder(&rows, role.role_name(), Utc::now(), ttl)
+        let ttl = lease_ttl();
+        if earliest_live_holder(&rows, role.role_name(), Utc::now(), ttl)
             .is_some_and(|holder| holder != sweep_id)
+        {
+            return true;
+        }
+        let Some(claim) = role.claim_label() else {
+            return false;
+        };
+        let own_end = own_lease_end(&rows, role.role_name(), sweep_id, ttl);
+        self.fetch_label_applied_at(item, claim)
+            .is_some_and(|at| super::step_reap::label_claimed_elsewhere(at, started_at, own_end))
     }
 }
 
@@ -238,6 +298,40 @@ mod tests {
             row(3, 1, "<!-- loom:pr-lease-released role=doctor host=b sweep=second -->"),
         ];
         assert_eq!(earliest_live_holder(&rows, "doctor", Utc::now(), ttl()), None);
+    }
+
+    /// #11969: the step's own lease ends at its release, at a later yield, or
+    /// at the last renewal plus the TTL; other sweeps and roles do not count.
+    #[test]
+    fn own_lease_end_reads_release_yield_or_ttl() {
+        let at = |id: u64, age: i64, body: &str| row(id, age, body);
+        let rows = [
+            at(1, 20, "<!-- loom:pr-lease-released role=doctor host=a sweep=mine -->"),
+            at(2, 1, "<!-- loom:pr-lease role=doctor host=b sweep=peer -->"),
+            at(3, 1, "<!-- loom:pr-lease role=judge host=a sweep=mine -->"),
+        ];
+        let end = own_lease_end(&rows, "doctor", "mine", ttl()).unwrap();
+        assert_eq!(end, rows[0].updated_at, "released: the release time");
+        assert_eq!(own_lease_end(&rows, "doctor", "nobody", ttl()), None);
+
+        let live = [at(
+            1,
+            2,
+            "<!-- loom:pr-lease role=curator host=a sweep=mine -->",
+        )];
+        let end = own_lease_end(&live, "curator", "mine", ttl()).unwrap();
+        assert_eq!(end, live[0].updated_at + ttl(), "live: renewal plus TTL");
+        assert!(end > Utc::now());
+
+        let yielded = [
+            at(1, 10, "<!-- loom:pr-lease role=curator host=a sweep=mine -->"),
+            at(2, 9, "<!-- loom:pr-lease-yield role=curator host=a sweep=mine earliest_host=b earliest_sweep=x -->"),
+        ];
+        assert_eq!(
+            own_lease_end(&yielded, "curator", "mine", ttl()),
+            Some(yielded[1].updated_at),
+            "yielded: the yield time"
+        );
     }
 
     #[test]

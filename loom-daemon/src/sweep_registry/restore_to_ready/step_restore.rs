@@ -56,12 +56,15 @@ use super::*;
 use crate::step_role::StepRole;
 
 /// The labels `role` moves its item to on success. Seeing one at release means
-/// the step got that far.
+/// the step got that far. Champion promotion moves an issue to `loom:issue`
+/// (`promoted`) or back to `loom:triage` (`revise`, #11969): a revise that
+/// died before removing `loom:evaluating` must not get `loom:curated` back
+/// beside its `loom:triage`.
 #[must_use]
 pub(crate) fn advanced_labels(role: StepRole) -> &'static [&'static str] {
     match role {
         StepRole::Curator => &["loom:curated", "loom:issue"],
-        StepRole::ChampionPromote => &["loom:issue"],
+        StepRole::ChampionPromote => &["loom:issue", "loom:triage"],
         StepRole::Builder => &["loom:review-requested"],
         StepRole::Judge => &["loom:pr", "loom:changes-requested"],
         StepRole::Doctor => &["loom:review-requested"],

@@ -123,7 +123,8 @@ fn role_lease_row(id: u64, sweep: &str) -> String {
 }
 
 /// B1: a non-Builder step's claim is judged by the role-keyed lease's sweep
-/// identity, never by label time.
+/// identity. (The fixture's `gh` cannot read the timeline, so the #11969
+/// label path fails open here.)
 #[test]
 fn a_judge_steps_claim_is_held_elsewhere_only_when_another_sweep_holds_the_lease() {
     let dir = tempdir().unwrap();
@@ -133,10 +134,10 @@ fn a_judge_steps_claim_is_held_elsewhere_only_when_another_sweep_holds_the_lease
         &role_lease_row(5, mine),
         0,
     );
-    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, mine));
-    assert!(reg.step_lease_held_elsewhere(21, StepRole::Judge, "step-judge-21-0"));
+    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, mine, Utc::now()));
+    assert!(reg.step_lease_held_elsewhere(21, StepRole::Judge, "step-judge-21-0", Utc::now()));
     // No live lease of the role on the item (a Doctor asking): not held.
-    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Doctor, mine));
+    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Doctor, mine, Utc::now()));
 
     let dir = tempdir().unwrap();
     let peer_first = format!("{}\n{}", role_lease_row(4, "peer"), role_lease_row(5, mine));
@@ -146,7 +147,7 @@ fn a_judge_steps_claim_is_held_elsewhere_only_when_another_sweep_holds_the_lease
         0,
     );
     assert!(
-        reg.step_lease_held_elsewhere(21, StepRole::Judge, mine),
+        reg.step_lease_held_elsewhere(21, StepRole::Judge, mine, Utc::now()),
         "the earlier lease wins"
     );
 
@@ -154,7 +155,7 @@ fn a_judge_steps_claim_is_held_elsewhere_only_when_another_sweep_holds_the_lease
     let dir = tempdir().unwrap();
     let reg =
         crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), "", 1);
-    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, "anyone"));
+    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, "anyone", Utc::now()));
 }
 
 /// Review item 5: a PR step's roll requeue gives back only its own claim. A
@@ -242,4 +243,109 @@ fn a_pr_step_roll_requeue_ignores_label_time() {
     assert!(reg
         .roll_pr_step_claim_still_ours(23, StepRole::Doctor, mine)
         .is_ok());
+}
+
+/// #11969: a non-Builder claim label is the step's own while its lease was
+/// live, whenever after the start the prompt applied it (B1); a label applied
+/// after that lease ended, or with no lease of the step's at all, is another
+/// claimant's. Within the start's clock-skew slack it is always the step's.
+#[test]
+fn a_non_builder_label_is_foreign_only_outside_the_steps_own_lease() {
+    let start = Utc::now() - chrono::Duration::hours(1);
+    let m = chrono::Duration::minutes;
+    let released = start + m(20);
+    // The prompt's own label, minutes after the start, inside the lease.
+    assert!(!label_claimed_elsewhere(start + m(3), start, Some(released)));
+    // Inside the skew slack at either end.
+    assert!(!label_claimed_elsewhere(start + chrono::Duration::seconds(30), start, None));
+    assert!(!label_claimed_elsewhere(
+        released + chrono::Duration::seconds(30),
+        start,
+        Some(released)
+    ));
+    // After the lease was released or reaped: an attended Doctor or Curator.
+    assert!(label_claimed_elsewhere(released + m(5), start, Some(released)));
+    // No lease record of the step's at all.
+    assert!(label_claimed_elsewhere(start + m(5), start, None));
+}
+
+/// A registry whose fake `gh` serves `lease_rows` for the comments read and
+/// `labeled_at` for the claim label's timeline read, and logs every other
+/// call (the writes).
+fn registry_with_label_time(
+    dir: &std::path::Path,
+    lease_rows: &str,
+    labeled_at: DateTime<Utc>,
+) -> (SweepRegistry, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut reg, log) = registry_logging_writes(dir, lease_rows);
+    let fake_gh = dir.join("fake-gh-timeline.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         if [[ \"$1\" == \"api\" && \"$*\" == *\"/timeline\"* ]]; then printf '%s\\n' '{at}'; exit 0; fi\n\
+         exec '{inner}' \"$@\"\n",
+        at = labeled_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        inner = dir.join("fake-gh-logging.sh").display(),
+    );
+    std::fs::write(&fake_gh, script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    reg.config.gh_bin = Some(fake_gh);
+    (reg, log)
+}
+
+fn released_doctor_row(id: u64, sweep: &str, released_at: DateTime<Utc>) -> String {
+    let at = released_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    format!(
+        r#"{{"id":{id},"updated_at":"{at}","body":"<!-- loom:pr-lease-released role=doctor host=h sweep={sweep} -->"}}"#
+    )
+}
+
+/// #11969: a dead daemon Doctor step whose PR an attended Doctor has since
+/// claimed by label alone (no lease) leaves that label alone; its own label,
+/// applied while its lease was live, is still released.
+#[test]
+fn a_dead_doctor_step_leaves_an_attended_label_only_claim_alone() {
+    let mine = "step-doctor-41-1";
+    let start = Utc::now() - chrono::Duration::minutes(40);
+    let released = start + chrono::Duration::minutes(20);
+    let rows = released_doctor_row(5, mine, released);
+
+    let dir = tempdir().unwrap();
+    let (mut reg, log) =
+        registry_with_label_time(dir.path(), &rows, released + chrono::Duration::minutes(10));
+    assert!(reg.step_claim_held_elsewhere(41, StepRole::Doctor, mine, start));
+    assert!(reg.release_dead_step(mine, 41, StepRole::Doctor, start, StepEnd::Exited(None)));
+    assert!(
+        std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "the attended Doctor's label is not stripped"
+    );
+
+    let dir = tempdir().unwrap();
+    let (mut reg, log) =
+        registry_with_label_time(dir.path(), &rows, start + chrono::Duration::minutes(2));
+    assert!(!reg.step_claim_held_elsewhere(41, StepRole::Doctor, mine, start));
+    assert!(!reg.release_dead_step(mine, 41, StepRole::Doctor, start, StepEnd::Exited(None)));
+    assert!(
+        !std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "its own label, applied under its lease, is released"
+    );
+}
+
+/// #11969: the same for a Curator step, whose lease is issue-scoped, and a
+/// startup restore after downtime: the lease aged out, and the label came
+/// after it.
+#[test]
+fn a_startup_curator_restore_leaves_a_later_label_only_claim_alone() {
+    let mine = "step-curator-42-1";
+    let start = Utc::now() - chrono::Duration::hours(3);
+    let renewed =
+        (start + chrono::Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let rows = format!(
+        r#"{{"id":5,"updated_at":"{renewed}","body":"<!-- loom:pr-lease role=curator host=h sweep={mine} -->"}}"#
+    );
+    let dir = tempdir().unwrap();
+    let (mut reg, log) =
+        registry_with_label_time(dir.path(), &rows, Utc::now() - chrono::Duration::minutes(30));
+    reg.restore_dead_step_at_startup(42, StepRole::Curator, mine, start);
+    assert!(std::fs::read_to_string(&log).unwrap_or_default().is_empty());
 }

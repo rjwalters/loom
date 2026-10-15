@@ -5,9 +5,11 @@
 //! tick, and a step is not one: it runs detached in the sweep registry. So a
 //! step carries a journal of its own from the spawn (`pick_journal::
 //! attach_step`), and its end emits both through the role tick's own emit
-//! (`role_tick_telemetry::emit_for_tick`, which drains the journal into the
+//! (`role_tick_telemetry::emit_for_step`, which drains the journal into the
 //! role's `pick.decision`), on a detached thread: the transcript scan behind
-//! `role_tick.outcome` must not hold the registry lock.
+//! `role_tick.outcome` must not hold the registry lock. The record is marked
+//! `source = "step"` with the step's sweep id, so it never counts as a
+//! role-runner tick.
 //!
 //! The session's own word on its step is its last
 //! `LOOM_STEP_OUTCOME role=… target=… class=… reason=…` line
@@ -147,12 +149,13 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
         &capture.root,
         crate::observability::pick_journal::step_path(&capture.sweep_id),
     );
-    crate::role_tick_telemetry::emit_for_tick(
+    crate::role_tick_telemetry::emit_for_step(
         &capture.root,
         capture.role.role_name(),
         capture.started_at,
         &capture.outcome,
         Some(crate::role_tick_telemetry::ResolvedLaunch::new(&capture.model, &capture.effort)),
+        &capture.sweep_id,
     );
 }
 
