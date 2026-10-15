@@ -21,14 +21,20 @@
 //! `/repos/{owner}/{repo}/issues` returns **pull requests too** (marked with
 //! a `pull_request` key). [`RestIssue::is_pull_request`] carries the marker
 //! and every converted call site filters on it, so consumers see the same
-//! issue-only (or PR-only) sets as before.
+//! issue-only (or PR-only) sets as before. Say which you want by name —
+//! [`list_issues_only_cached_as`] / [`issues_only`] for issue candidates,
+//! [`pull_requests_only`] for a PR queue — rather than re-deriving the
+//! predicate inline; a call site that forgets it feeds PR numbers to an
+//! issue-targeting consumer (Issue #9929), and
+//! `forge_listing_tests::every_raw_listing_call_site_decides_about_pull_requests`
+//! fails CI when a new one does.
 //!
 //! Scope: single page, `per_page=100` (the old `gh issue list --limit`
 //! ceilings were 100–200; a repo with >100 simultaneously-labeled items is
 //! far outside normal operation). A full page logs a truncation warning
 //! rather than silently capping.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -79,6 +85,58 @@ pub struct RestIssue {
     /// forge omitted the summary or sent a malformed one (Gitea, older
     /// payloads), which keeps the pre-#11483 behaviour.
     pub open_sub_issues: Option<u32>,
+    /// When each current label was last applied (label name → RFC-3339), as
+    /// the GitHub state mirror serves it (`labels_at`, #11897): the first
+    /// source of an item's stage-entry time
+    /// ([`crate::step_dispatch::stage_entry`]). `None` on every REST row (the
+    /// listing carries no label times) and on a mirror row that sent none.
+    pub labels_at: Option<BTreeMap<String, String>>,
+}
+
+/// Keep only the real issues in a REST issues listing (Issue #9929).
+///
+/// `GET /repos/{owner}/{repo}/issues` returns pull requests alongside issues —
+/// a PR row is marked by [`RestIssue::is_pull_request`] and is otherwise
+/// shaped exactly like an issue row. A candidate-selection path that forgets
+/// to drop them hands **PR numbers to an issue-targeting consumer**, and
+/// nothing downstream can tell the difference: issues and PRs share one number
+/// namespace, and `gh issue edit <pr-number>` happily labels a PR. That is not
+/// hypothetical — it is the #9929 incident, where a pull request picked up the
+/// issue-lifecycle labels `loom:curating` → `loom:curated` (plus a `tier:`
+/// label) from a Curator run that had been pointed at it as a curation
+/// candidate, stranding it outside both the issue and the PR pipelines.
+///
+/// Call this (or [`list_issues_only_cached_as`]) rather than repeating the
+/// predicate inline, so the exclusion is one named, tested thing instead of a
+/// convention each new call site has to remember.
+#[must_use]
+pub fn issues_only(rows: Vec<RestIssue>) -> Vec<RestIssue> {
+    rows.into_iter().filter(|r| !r.is_pull_request).collect()
+}
+
+/// The mirror of [`issues_only`]: keep only the pull-request rows, for a
+/// consumer whose queue is PRs (Judge's `loom:review-requested`, Doctor's
+/// `loom:changes-requested`, Champion's `loom:pr`). Stated positively for the
+/// same reason — so the call site's intent is readable and greppable.
+#[must_use]
+pub fn pull_requests_only(rows: Vec<RestIssue>) -> Vec<RestIssue> {
+    rows.into_iter().filter(|r| r.is_pull_request).collect()
+}
+
+/// [`list_issues_cached_as`] with pull requests already excluded
+/// ([`issues_only`]) — the listing every **issue**-targeting
+/// candidate-selection path should use (Issue #9929).
+///
+/// Errors are those of [`list_issues_cached_as`], unchanged.
+pub fn list_issues_only_cached_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<Vec<RestIssue>> {
+    list_issues_cached_as(caller, gh_bin, cwd, repo_override, label, state).map(issues_only)
 }
 
 /// List open/closed issues carrying `label`, via the ETag cache.
@@ -114,6 +172,25 @@ pub fn list_issues_cached_as(
     state: &str,
 ) -> Result<Vec<RestIssue>> {
     list_issues_cached_retrying(issue_list(caller), gh_bin, cwd, repo_override, label, state, None)
+        .map(|page| page.rows)
+}
+
+/// [`list_issues_cached_as`] as an **Observability** read
+/// ([`crate::forge_identity::ReadClass::Observability`], #12193): when no
+/// reader can serve it the read is shed, not retried on the writer, and the
+/// call fails with [`store::ReadShed`] (downcast the error to tell it from a
+/// failure). For telemetry samplers only; a gating read keeps
+/// [`list_issues_cached_as`].
+pub fn list_issues_cached_observability_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<Vec<RestIssue>> {
+    let site = issue_list(caller).deferrable(crate::forge_identity::ReadClass::Observability);
+    list_issues_cached_retrying(site, gh_bin, cwd, repo_override, label, state, None)
         .map(|page| page.rows)
 }
 
@@ -199,7 +276,42 @@ pub fn list_open_issues_cached_all_as(
     cwd: Option<&Path>,
     repo_override: Option<&str>,
 ) -> Result<Vec<RestIssue>> {
-    let site = issue_list(caller).deferrable(crate::forge_identity::ReadClass::Hygiene);
+    list_open_issues_walk(
+        caller,
+        gh_bin,
+        cwd,
+        repo_override,
+        crate::forge_identity::ReadClass::Hygiene,
+    )
+}
+
+/// [`list_open_issues_cached_all_as`] as an **Observability** read (#12193):
+/// shed on every exhaust cause while a reader pool exists, never retried on
+/// the writer. For telemetry samplers (`stage_dwell`); the intake pass keeps
+/// the Hygiene class.
+pub fn list_open_issues_cached_all_observability_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+) -> Result<Vec<RestIssue>> {
+    list_open_issues_walk(
+        caller,
+        gh_bin,
+        cwd,
+        repo_override,
+        crate::forge_identity::ReadClass::Observability,
+    )
+}
+
+fn list_open_issues_walk(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    class: crate::forge_identity::ReadClass,
+) -> Result<Vec<RestIssue>> {
+    let site = issue_list(caller).deferrable(class);
     walk_pages(
         site,
         gh_bin,
@@ -647,6 +759,19 @@ pub struct HttpResponse {
     pub ratelimit: RateLimitHeaders,
     /// A `Link` header names a `rel="next"` page (#11139).
     pub next_page: bool,
+    /// The forge gateway's own marks (2am#4367 P4): `x-github-proxy-refusal`
+    /// (a response the gateway itself refused or failed), and whether
+    /// `x-github-proxy-version` says the gateway answered at all.
+    pub gateway: GatewayMark,
+}
+
+/// See [`HttpResponse::gateway`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayMark {
+    /// `x-github-proxy-refusal`: the gateway's own refusal code.
+    pub refusal: Option<String>,
+    /// `x-github-proxy-version` was present.
+    pub answered: bool,
 }
 
 /// Parse `gh api --include` output. Returns `None` when the first line is not
@@ -665,6 +790,7 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
     let mut etag = None;
     let mut next_page = false;
     let mut ratelimit = RateLimitHeaders::default();
+    let mut gateway = GatewayMark::default();
     for line in lines {
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
@@ -675,6 +801,10 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
                 etag = Some(value.trim().to_string());
             } else if name.eq_ignore_ascii_case("link") {
                 next_page = value.contains("rel=\"next\"");
+            } else if name.eq_ignore_ascii_case("x-github-proxy-refusal") {
+                gateway.refusal = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("x-github-proxy-version") {
+                gateway.answered = true;
             } else {
                 ratelimit.absorb(name, value);
             }
@@ -700,6 +830,7 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
         body,
         ratelimit,
         next_page,
+        gateway,
     })
 }
 
@@ -760,6 +891,7 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
             author_association: r.author_association,
             is_pull_request: r.pull_request.is_some(),
             open_sub_issues: r.sub_issues_summary.as_ref().and_then(open_sub_issues),
+            labels_at: None,
         })
         .collect())
 }
@@ -972,3 +1104,8 @@ mod tests;
 #[allow(clippy::unwrap_used)]
 #[path = "forge_listing_open_pages_tests.rs"]
 mod open_pages_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "forge_listing_pr_rows_tests.rs"]
+mod pr_rows_tests;

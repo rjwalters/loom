@@ -56,6 +56,9 @@ pub fn plan(
                 "local"
             }
             Tier::Machine => "defaults",
+            // `render` never emits the per-repo tier (#11738); its source is
+            // `repos[].config`, not a host's config.
+            Tier::Repo => continue,
         };
         let Some(current) = on_disk(&t.path)? else {
             continue;

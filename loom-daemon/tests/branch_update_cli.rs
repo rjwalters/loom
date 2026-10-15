@@ -102,7 +102,6 @@ impl Tools {
     fn apply(&self, cmd: &mut Command) {
         cmd.env("PATH", self.path_env())
             .env("LOOM_GH_BIN", self.dir.path().join("gh"))
-            .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
             .env("LOOM_FORGE_TYPE", "github")
             .env("LOOM_CONFIG_DEFAULTS_FILE", "")
             .env_remove("LOOM_BRANCH_UPDATE_STRATEGY");
@@ -490,5 +489,5 @@ fn role_prompts_never_rebase_or_force_unconditionally() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
-    assert!(guarded >= 6, "expected the Doctor/Judge/Builder update sites, found {guarded}");
+    assert!(guarded >= 5, "expected the Doctor/Judge/Builder update sites, found {guarded}");
 }

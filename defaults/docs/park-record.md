@@ -142,6 +142,17 @@ These writers differ from `apply` in two documented ways:
   the body. Readers key on `loom:blocked` first, so a leftover record on an
   unblocked issue declares nothing.
 
+### Champion's PR holds (#11861)
+
+Champion's merge-risk and critical-file holds write a reason-only record on
+the PR (`reason="champion merge-risk hold"` / `"champion critical-file hold"`,
+`by=champion`, `loom_daemon::champion_hold`), keep `loom:pr`, and add
+`loom:blocked`. Only Champion or a human releases it. A dependency-only promotion finding writes one record per
+open blocker (`park-record apply --blocked-by --by champion`, #11860; or
+`classify-dependency-block.sh --check-defer --apply`). Nothing lifts it
+automatically when the blockers close: the daemon's release pass was retired
+(#11301), so a role or a human clears it.
+
 ## Who reads one
 
 - `loom-daemon check-stale-blocked` (`defaults/scripts/check-stale-blocked.sh`,
@@ -163,12 +174,12 @@ These writers differ from `apply` in two documented ways:
   `rateLimit.cost`, `rest_requests`, `rest_not_modified`, `budget_before`,
   `projected`, `floor`, `budget_refused`, `budget_stopped`). It first reads
   the repository's `archived` flag (#10562, one REST + ETag read shared with
-  `release-stale-blocked` and the role runner): an archived repository is
+  the role runner): an archived repository is
   read-only, so nothing is listed, `--json` reports `archived: true` and the
   human report is one line. A probe that fails is NOT EVALUATED, never
   archived and never clear (`archived: null`). Champion's merge-risk hold
   digest issue (exact title, or body starting with its marker) is exempt from
-  this pass, the notifier and the release pass: it is `loom:blocked` only to
+  this pass and the notifier: it is `loom:blocked` only to
   stay out of curation and has no blocker to cite (#9397).
   **Do not loop it over many repositories by hand.** The budget floor reads
   the hourly buckets, which a secondary rate limit never shows in, and a
@@ -289,7 +300,7 @@ pr_has_superseding_block() {
   fi
 
   local pr_hold=$(printf '%s\n' "$pr_json" | jq -r \
-    '[.labels[].name] | any(. == "loom:operator" or . == "loom:operator-only")')
+    '[.labels[].name] | any(. == "loom:operator" or . == "loom:frozen")')
   if [ "$pr_hold" = "true" ]; then
     echo "true"
     return
@@ -357,6 +368,6 @@ job (issues) and `check-stale-blocked`'s advisory report (both issues and
 PRs) — this document defines the wire format both sit on top of, nothing more.
 
 See also: [`label-state-machine.md`](label-state-machine.md) for where
-`loom:blocked` sits relative to `loom:operator`/`loom:operator-only`, and
+`loom:blocked` sits relative to `loom:operator`/`loom:frozen`, and
 [`lease-record.md`](lease-record.md) for the sibling HTML-comment-marker
 convention this format's shape was co-designed with.

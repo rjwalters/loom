@@ -28,6 +28,7 @@
 //! | `sweep.global.dispatch`   | Daemon | `{sweep_id, kind, runtime?, runtime_source?}` |
 //! | `sweep.global.runtime_rejected` | Daemon | `{kind, role, runtime, runtime_source, unmet_capabilities, reason}` |
 //! | `sweep.global.completed`  | Daemon | `{sweep_id, outcome}` |
+//! | `step.item.{N}.ended`     | Step tick settle pass | `{item, role, class, reason, ran_for_sec, repo?}` |
 //! | `epic.issue.{N}.decompose` | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.expand`    | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.join`      | Epic supervisor | `{epic, action, state}` |
@@ -39,7 +40,7 @@
 //! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
 //! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, ram_headroom, token_axis_limit, message}` |
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
-//! | `forge.event` | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
+//! | `forge.event` | `forge_events.rs` feed consumer (#8765); `forge_mirror/wake.rs` change-stream puller (2am#4367 P5) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}`; mirror: `{source: "github-events-mirror", count, types, repos, missed}` |
 //! | `operator_priority.escalation` | `fleet_alert` (#10164; the star-liveness publisher, #9321, was removed by #11104) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
@@ -68,6 +69,12 @@
 //! needed its own structured, secret-free representation rather than being
 //! invisible on the bus. It is emitted once per refused dispatch attempt (not
 //! on a state-change/dedup schedule) because each attempt is itself the event.
+//! The `step.item.{N}.ended` topic was authorized by **#12152**: a step
+//! (#11898) is not an issue sweep and never emits `sweep.issue.{N}.exited`,
+//! so after the step-dispatch cutover nothing on the bus said a step had
+//! ended, and the narration sink's public-feed `completion` (which keyed on
+//! `.exited`) went quiet. It is published once per ended step, after the
+//! step ledger classified it, and carries the ledger's `class` / `reason`.
 //! Per-death classification (`death_class`) rides the existing frozen
 //! `sweep.issue.{N}.exited` / `.crashed` topics as an additive payload field
 //! rather than a new topic (#4386). The bus accepts arbitrary topic

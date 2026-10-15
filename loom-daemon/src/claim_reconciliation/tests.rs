@@ -1086,6 +1086,52 @@ fn reconcile_workspace_skips_reclaim_when_issue_closed_concurrently() {
     std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
 }
 
+/// #11743: an issue frozen after this pass listed it (so the listing still
+/// shows a plain claim) reaches `reclaim_and_warn`'s frozen veto, which writes
+/// nothing. That skip must not be counted as a reclaim, and the journal entry
+/// stays.
+#[test]
+#[serial]
+fn reconcile_workspace_does_not_count_a_frozen_skip_as_a_reclaim() {
+    let dir = tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let repo_str = repo_root.display().to_string();
+    let journal_path = dir.path().join("sweeps.json");
+    std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+    let mut journal = SweepJournal::default();
+    journal.entries.push(journal_entry(&repo_str, 99, 0));
+    sweep_journal::save(&journal_path, &journal).unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = dir.path().join("fake-gh-frozen-race.sh");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+case "$*" in
+  api*--include*) printf 'HTTP/2.0 200 OK\r\n\r\n'
+    echo '[{{"number":99,"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{now}"}}]' ;;
+  *"issues/99 --jq .state"*) echo open ;;
+  *"issues/99 --jq"*) echo '["loom:building","loom:frozen"]' ;;
+esac
+exit 0
+"#,
+        log = gh_log.display(),
+        now = Utc::now().to_rfc3339(),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
+
+    std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    assert_eq!((checked, reclaimed), (1, 0), "a frozen skip is not a reclaim");
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(!gh_calls.contains("issue edit"), "{gh_calls}");
+    assert!(gh_calls.contains("issues/99 --jq [(.labels"), "the veto read ran: {gh_calls}");
+    let after = sweep_journal::load(&journal_path);
+    assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
+}
+
 /// #6263 regression: a single `gh issue edit --remove-label
 /// loom:building --add-label loom:issue` invocation can exit 0 while
 /// only *partially* applying the swap — root cause: `gh` implements
@@ -2545,7 +2591,7 @@ fn decide_pr_reclaims_when_only_unrelated_comments_since_the_claim() {
     // claim is reclaimed. Before #6523 that Builder note refreshed the
     // anchor and bought the dead claim another full 30-minute window.
     let now = Utc::now();
-    let claimed_at = now - Duration::minutes(35);
+    let claimed_at = now - Duration::minutes(50);
     let scanned = most_recent_claim_activity_at(
         &[
             comment(now - Duration::minutes(20), "Pushed the fix, CI running."),
@@ -2579,7 +2625,7 @@ fn decide_pr_keeps_when_a_marked_claimant_heartbeat_is_recent() {
     // posted a marked heartbeat 2 minutes ago -- that IS liveness, so the
     // claim is kept.
     let now = Utc::now();
-    let claimed_at = now - Duration::minutes(35);
+    let claimed_at = now - Duration::minutes(50);
     let heartbeat_at = now - Duration::minutes(2);
     let scanned = most_recent_claim_activity_at(
         &[
@@ -2629,7 +2675,7 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
     };
 
     // Just inside the window from the heartbeat: kept.
-    let inside = heartbeat_at + Duration::minutes(29);
+    let inside = heartbeat_at + Duration::minutes(44);
     assert_eq!(
         decide_pr(&pr, None, None, &|_| true, DEFAULT_STALE_REVIEWING_MINUTES, inside),
         PrReconcileAction::Keep,
@@ -2638,12 +2684,12 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
 
     // One minute past it: reclaimed. A single heartbeat cannot pin the
     // claim, however old the claim itself gets.
-    let outside = heartbeat_at + Duration::minutes(31);
+    let outside = heartbeat_at + Duration::minutes(46);
     match decide_pr(&pr, None, None, &|_| true, DEFAULT_STALE_REVIEWING_MINUTES, outside) {
         PrReconcileAction::Reclaim(PrReclaimReason::Aged { age_minutes }) => {
             assert!(
-                (age_minutes - 31.0).abs() < 0.5,
-                "age must be measured from the heartbeat (~31m), got {age_minutes}"
+                (age_minutes - 46.0).abs() < 0.5,
+                "age must be measured from the heartbeat (~46m), got {age_minutes}"
             );
         }
         other => {
@@ -2655,7 +2701,7 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
     assert_eq!(
         decide_pr(&pr, None, None, &|_| true, DEFAULT_STALE_TREATING_MINUTES, outside),
         PrReconcileAction::Keep,
-        "60m treating window is not yet exhausted 31m after the heartbeat"
+        "60m treating window is not yet exhausted 46m after the heartbeat"
     );
     match decide_pr(
         &pr,
@@ -2674,12 +2720,12 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
 fn decide_pr_age_floor_vetoes_reclaim_regardless_of_comment_activity() {
     // SAFETY (#4790/#4618 double-claim race): #6523 narrows what counts as
     // activity, which can only make a reclaim happen SOONER -- never
-    // sooner than the 30m/60m age floor, which stays the veto no
+    // sooner than the 45m/60m age floor, which stays the veto no
     // comment-activity outcome can bypass. A claim younger than its floor
     // with NO claimant activity at all (the most reclaim-favourable
     // evidence this pass can see) must still be kept -- including when a
     // dead joined pid is also on the table.
-    assert!((DEFAULT_STALE_REVIEWING_MINUTES - 30.0).abs() < f64::EPSILON);
+    assert!((DEFAULT_STALE_REVIEWING_MINUTES - 45.0).abs() < f64::EPSILON);
     assert!((DEFAULT_STALE_TREATING_MINUTES - 60.0).abs() < f64::EPSILON);
     let now = Utc::now();
     let dead = journal_entry("/repo/a", 6523, 4618);
@@ -2917,6 +2963,38 @@ fn reconcile_pr_claims_reclaims_stale_reviewing_and_backfills_state_label() {
     std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
     std::env::remove_var(STALE_TREATING_MINUTES_ENV);
+}
+
+/// #11743: a stale claim on a `loom:frozen` PR is never reclaimed — no
+/// `pr edit` at all, and nothing counted as checked or reclaimed.
+#[test]
+#[serial]
+fn reconcile_pr_claims_leaves_a_frozen_pr_alone() {
+    let dir = tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, dir.path().join("sweeps.json"));
+    std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "30");
+    let gh_log = dir.path().join("gh-invocations.log");
+    let old = (Utc::now() - Duration::minutes(90)).to_rfc3339();
+    let fake_gh = dir.path().join("fake-gh-frozen-pr.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\n{pulls}exit 0\n",
+        log = gh_log.display(),
+        pulls = pulls_arm(&[row(502, &["loom:reviewing", "loom:frozen"])
+            .head("some-random-branch")
+            .updated(&old)]),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (checked, reclaimed) = forge::reconcile_pr_claims(&fake_gh, &repo_root);
+
+    std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+    assert_eq!((checked, reclaimed), (0, 0));
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(!gh_calls.contains("pr edit"), "{gh_calls}");
 }
 
 #[test]

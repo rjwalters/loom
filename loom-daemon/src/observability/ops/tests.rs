@@ -15,6 +15,7 @@ use crate::telemetry::ops::{
 };
 use crate::telemetry::trace::{SpanName, SpanStatus, TraceContext};
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
+use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::TickReport;
 
 #[derive(Default)]
@@ -259,9 +260,14 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::DispatchSlotTurnaroundSamples,
         MetricName::DispatchIdleSlots,
         MetricName::DispatchIdleSlotSeconds,
+        MetricName::DispatchBusySlots,
+        MetricName::DispatchRoleMaxConcurrent,
+        MetricName::DispatchRoleIdleSlots,
         MetricName::ForgeStageDwell,
         MetricName::ForgeStageDwellSamples,
         MetricName::ForgeStageItems,
+        MetricName::ForgeStageOldestAgeSeconds,
+        MetricName::StepActionable,
         MetricName::QueueDispositionRowsDropped,
         MetricName::MergeRedatePrs,
         MetricName::MergeRedatesMax,
@@ -284,6 +290,12 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::CaptainGaugeAgeSeconds,
         MetricName::CaptainGaugeFallback,
         MetricName::AgentScopePeakMemoryBytes,
+        MetricName::ForgeMirrorReads,
+        MetricName::ForgeMirrorChanges,
+        MetricName::ForgeMirrorWakeLatency,
+        MetricName::StageEntryLookups,
+        MetricName::FeedCompletions,
+        MetricName::FeedReconcilePasses,
         MetricName::EgressRequests,
         MetricName::EgressTokens,
         MetricName::EgressLatency,
@@ -336,19 +348,108 @@ fn tick_result_precedence() {
         }),
         "dispatched"
     );
-    assert_eq!(with(|r| r.halted = true), "halted_main_red");
-    // #10113: the same hold, attributed to a billing block, is its own result.
+    assert_eq!(
+        with(|r| {
+            r.halted = true;
+            r.halt_causes = vec![HaltCause::MainRed];
+        }),
+        "halted_main_red"
+    );
+    // #11649: a hold with no named cause no longer guesses `main_red`.
+    assert_eq!(with(|r| r.halted = true), "halted");
+    // #10113: a cause-less hold while an owner is billing-blocked keeps its
+    // own result.
     let held = TickReport {
         seen: 3,
         halted: true,
         ..TickReport::default()
     };
     assert_eq!(super::dispatch::tick_result_with(&held, true), "halted_ci_billing");
-    assert_eq!(super::dispatch::tick_result_with(&held, false), "halted_main_red");
+    assert_eq!(super::dispatch::tick_result_with(&held, false), "halted");
+    // The hold outranks saturation, as before.
+    assert_eq!(
+        with(|r| {
+            r.halted = true;
+            r.halt_causes = vec![HaltCause::Drain];
+            r.saturation_held = true;
+        }),
+        "halted_drain"
+    );
     assert_eq!(with(|r| r.saturation_held = true), "saturation_held");
     assert_eq!(with(|r| r.errors = 1), "error");
     assert_eq!(with(|r| r.deferred_ramp_cap = 2), "capacity_full");
     assert_eq!(with(|r| r.skipped_backoff = 3), "all_skipped");
+}
+
+/// #11649: a held tick's result names the hold its workspaces recorded — a
+/// disk-held tick is not a red `main` — and several causes read `halted`.
+#[test]
+fn halted_tick_result_names_the_recorded_cause() {
+    use super::dispatch::{halted_result, tick_result_with};
+    let held = |causes: Vec<HaltCause>, billing: bool| {
+        let report = TickReport {
+            seen: 3,
+            halted: true,
+            halt_causes: causes,
+            ..TickReport::default()
+        };
+        tick_result_with(&report, billing)
+    };
+    assert_eq!(held(vec![HaltCause::DiskReservation], false), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::TokenPool], false), "halted_token_pool");
+    assert_eq!(held(vec![HaltCause::CiBilling], false), "halted_ci_billing");
+    // A global billing block does not relabel another root's named cause.
+    assert_eq!(held(vec![HaltCause::DiskReservation], true), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::MainRed], true), "halted_main_red");
+    assert_eq!(held(vec![HaltCause::MainRed, HaltCause::DiskReservation], false), "halted");
+    // Every single cause maps to `halted_` + its wire token.
+    for cause in HaltCause::ALL {
+        assert_eq!(halted_result(&[cause], false), format!("halted_{}", cause.as_str()));
+    }
+}
+
+/// #11649: a held tick's span lists its causes; an unheld one omits the key.
+#[test]
+fn tick_span_lists_halt_causes_only_when_held() {
+    let held = TickReport {
+        seen: 2,
+        halted: true,
+        halt_causes: vec![HaltCause::Drain, HaltCause::DiskReservation],
+        ..TickReport::default()
+    };
+    let span = tick_span(&held, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "halted");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,disk_reservation");
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert!(!idle.attributes.contains_key("loom.dispatch.halt_causes"));
+}
+
+/// #11857: a partial hold keeps its causes and held count on the span but
+/// does not name the result; `loom.dispatch.held_roots` is always present.
+#[test]
+fn partial_hold_keeps_its_causes_but_not_the_result() {
+    let partial = TickReport {
+        seen: 2,
+        halted: true,
+        halt_causes: vec![HaltCause::MaintainOnly],
+        held_roots: 1,
+        halt_partial: true,
+        ..TickReport::default()
+    };
+    let span = tick_span(&partial, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "all_skipped");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "maintain_only");
+    assert_eq!(span.attributes["loom.dispatch.held_roots"], "1");
+    let full = TickReport {
+        halt_partial: false,
+        held_roots: 2,
+        ..partial
+    };
+    let span = tick_span(&full, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "halted_maintain_only");
+    assert_eq!(span.attributes["loom.dispatch.held_roots"], "2");
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert_eq!(idle.attributes["loom.dispatch.held_roots"], "0");
 }
 
 /// #10624: the build back-off result keys on an actual deferral, ranks after
@@ -561,7 +662,7 @@ fn queue_summary(
                 rank: i + 1,
                 repo: "/r".into(),
                 issue: u32::try_from(i).unwrap(),
-                workspace_priority: 100,
+                workspace_weight: 100,
                 urgent: false,
                 level: Default::default(),
                 main_red_fix: false,
@@ -590,7 +691,9 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     summary.listing_failed = vec!["/r2".into()];
     summary.listing_incomplete = vec!["/r3".into(), "/r4".into()];
     let points = super::queue::queue_points(&summary);
-    assert_eq!(points.len(), Qd::ALL.len() + 2);
+    // + listing_failed, listing_incomplete and the four already_landed
+    // evidence points (#11858).
+    assert_eq!(points.len(), Qd::ALL.len() + 2 + 4);
     let value = |reason: &str| {
         points
             .iter()
@@ -627,9 +730,70 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     }
 }
 
+/// #11858: `already_landed` rows split by the landed guard's evidence, with
+/// a row naming none read as `unknown` and free text never a label.
+#[test]
+fn queue_points_split_already_landed_by_evidence() {
+    use crate::types::QueueDisposition as Qd;
+    let mut summary = queue_summary(&[Qd::AlreadyLanded; 4]);
+    let details = [
+        Some("forge_closed"),
+        Some("journal_landed"),
+        Some("journal_landed"),
+        Some("free text"),
+    ];
+    for (row, detail) in summary.queue.iter_mut().zip(details) {
+        row.detail = detail.map(str::to_string);
+    }
+    let points = super::queue::queue_points(&summary);
+    let landed = |reason: &str| {
+        points
+            .iter()
+            .find(|p| {
+                p.name == MetricName::QueueAlreadyLanded
+                    && p.labels.get("reason").map(String::as_str) == Some(reason)
+            })
+            .map(|p| p.value)
+    };
+    assert_eq!(landed("forge_closed"), Some(MetricValue::Int(1)));
+    assert_eq!(landed("journal_landed"), Some(MetricValue::Int(2)));
+    assert_eq!(landed("forge_closed_not_planned"), Some(MetricValue::Int(0)));
+    assert_eq!(landed("unknown"), Some(MetricValue::Int(1)));
+    assert_eq!(landed("free text"), None);
+}
+
 #[test]
 fn an_empty_queue_reads_as_zeros_not_as_missing() {
     let points = super::queue::queue_points(&queue_summary(&[]));
     assert!(!points.is_empty());
     assert!(points.iter().all(|p| p.value == MetricValue::Int(0)));
+}
+
+/// #11973: a tick that counted errors names their kind from the fixed set;
+/// several kinds read `mixed`; a clean tick omits the key.
+#[test]
+fn tick_span_names_the_error_kind_only_when_it_counted_errors() {
+    use crate::work_finder::DispatchErrorKind as K;
+    let mut listing = TickReport::default();
+    listing.note_listing_failure(0, &anyhow::anyhow!("gh: HTTP 502 Bad Gateway"));
+    let span = tick_span(&listing, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "error");
+    assert_eq!(span.attributes["loom.dispatch.error_kind"], "forge_listing");
+    assert_eq!(listing.listing_failed, vec![0]);
+
+    let mut limited = TickReport::default();
+    limited.note_listing_failure(1, &anyhow::anyhow!("API rate limit exceeded (HTTP 403)"));
+    limited.note_listing_failure(2, &anyhow::anyhow!("API rate limit exceeded (HTTP 403)"));
+    let span = tick_span(&limited, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.errors"], "2");
+    assert_eq!(span.attributes["loom.dispatch.error_kind"], "rate_limited");
+
+    let mut mixed = limited.clone();
+    mixed.note_error(K::DispatchSpawn);
+    let span = tick_span(&mixed, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.error_kind"], "mixed");
+
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert!(!idle.attributes.contains_key("loom.dispatch.error_kind"));
+    assert!(OPS_SPAN_ATTRIBUTE_KEYS.contains(&"loom.dispatch.error_kind"));
 }

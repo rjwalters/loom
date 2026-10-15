@@ -523,6 +523,80 @@ fn ac6_ungated_roles_ignore_the_queue_probe() {
     }
 }
 
+// -- queue kind: a REST issues listing returns PRs too (#9929) -------------
+
+/// A listing row, PR or issue, carrying `labels`.
+fn row(number: u32, is_pr: bool, labels: &[&str]) -> crate::forge_listing::RestIssue {
+    crate::forge_listing::RestIssue {
+        number,
+        title: None,
+        labels: labels.iter().map(|l| (*l).to_string()).collect(),
+        created_at: None,
+        updated_at: None,
+        closed_at: None,
+        state: "open".to_string(),
+        body: None,
+        author: None,
+        author_association: None,
+        is_pull_request: is_pr,
+        comments: 0,
+        open_sub_issues: None,
+        labels_at: None,
+    }
+}
+
+#[test]
+fn queue_label_kinds_follow_the_pr_lifecycle_labels() {
+    for label in ["loom:review-requested", "loom:changes-requested", "loom:pr"] {
+        assert!(queue_label_holds_prs(label), "{label} is a PR queue");
+    }
+    for label in [
+        "loom:issue",
+        "loom:triage",
+        "loom:curated",
+        "loom:curating",
+        "loom:building",
+        "loom:blocked",
+    ] {
+        assert!(!queue_label_holds_prs(label), "{label} is an issue queue");
+    }
+}
+
+/// Regression for #9929: the queue gate reads the REST issues listing, which
+/// returns pull requests alongside issues. A row of the WRONG lifecycle must
+/// never satisfy the gate — the same issue/PR conflation that let a pull
+/// request be picked up as a curation candidate and labeled `loom:curating` /
+/// `loom:curated`.
+#[test]
+fn queue_work_is_decided_on_rows_of_the_queues_own_kind() {
+    // Judge's queue is PRs: a PR row counts, an ISSUE row carrying the same
+    // label does not.
+    assert!(queue_rows_have_work(
+        "loom:review-requested",
+        &[row(306, true, &["loom:review-requested"])]
+    ));
+    assert!(!queue_rows_have_work(
+        "loom:review-requested",
+        &[row(42, false, &["loom:review-requested"])]
+    ));
+
+    // An issue queue is the mirror: a PR row must not stand in for issue work.
+    assert!(!queue_rows_have_work("loom:issue", &[row(306, true, &["loom:issue"])]));
+    assert!(queue_rows_have_work("loom:issue", &[row(42, false, &["loom:issue"])]));
+
+    // A mixed listing is satisfied by the row of the right kind, either way.
+    let mixed = [
+        row(42, false, &["loom:issue"]),
+        row(306, true, &["loom:pr"]),
+    ];
+    assert!(queue_rows_have_work("loom:review-requested", &mixed));
+    assert!(queue_rows_have_work("loom:issue", &mixed));
+
+    // An empty listing is empty for every queue.
+    assert!(!queue_rows_have_work("loom:review-requested", &[]));
+    assert!(!queue_rows_have_work("loom:issue", &[]));
+}
+
 /// AC6: `QueueEmpty` never enters the #4349 fail/recover edge — a root that
 /// was failing stays failing (no false "recovered"), and one that was not
 /// does not become failing.
@@ -950,4 +1024,44 @@ fn curator_keeps_round_robin_for_unobserved_roots() {
     // B's backlog rather than being pushed behind it.
     ledger.record_untriaged(&b, 40);
     assert_eq!(curator_order(ledger, &paths), vec![a, b]);
+}
+
+/// #11905: an ordinary Doctor-cycle-capped PR (`loom:changes-requested` +
+/// `loom:blocked`, a cap park record, no Champion hold record) no longer
+/// sends the gate to Doctor's queue; a Champion hold on its round trip still
+/// does, capped or not (its queue decides from the trusted marker).
+#[test]
+fn a_capped_pr_with_no_hold_record_skips_the_doctor_queue_read() {
+    use crate::champion_hold::{CRITICAL_FILE_HOLD_REASON, DOCTOR_CYCLE_CAP_MARKER};
+    let record = |reason: &str| {
+        crate::park_record::render_park(&[], Some("x"), Some("2026-10-14T00:00:00Z"), Some(reason))
+    };
+    let with_body = |body: String| {
+        let mut r = row(1, true, &["loom:changes-requested", "loom:blocked"]);
+        r.body = Some(body);
+        r
+    };
+    let label = "loom:changes-requested";
+    let capped = with_body(record("doctor cycle exhausted"));
+    assert_eq!(round_trip_role(label, std::slice::from_ref(&capped)), None);
+    assert_eq!(
+        round_trip_role(label, &[with_body(format!("x\n{DOCTOR_CYCLE_CAP_MARKER}"))]),
+        None
+    );
+    let held = with_body(record(CRITICAL_FILE_HOLD_REASON));
+    assert_eq!(
+        round_trip_role(label, std::slice::from_ref(&held)),
+        Some(crate::pr_planning::PrRole::Doctor)
+    );
+    let both =
+        with_body(format!("{}\n{}", record(CRITICAL_FILE_HOLD_REASON), record("doctor cap")));
+    assert_eq!(round_trip_role(label, &[both]), Some(crate::pr_planning::PrRole::Doctor));
+    // No record at all: the label shape alone still asks (a hold whose body
+    // record a human edited away).
+    let bare = row(2, true, &["loom:changes-requested", "loom:blocked"]);
+    assert_eq!(round_trip_role(label, &[bare]), Some(crate::pr_planning::PrRole::Doctor));
+    assert_eq!(
+        round_trip_role(label, &[capped, held]),
+        Some(crate::pr_planning::PrRole::Doctor)
+    );
 }

@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { handleTerminalTool } from "../tools/terminals.js";
 import {
   deepMerge,
+  FLEET_REPO_CONFIG_REL,
   getPath,
   hasNonLegacyTier,
   LEGACY_CONFIG_REL,
@@ -76,6 +77,7 @@ function disableDefaultsTier(): void {
 async function makeRepo(tiers: {
   legacy?: string;
   project?: string;
+  fleetRepo?: string;
   local?: string;
 }): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "loom-cfg-"));
@@ -87,6 +89,10 @@ async function makeRepo(tiers: {
   if (tiers.project !== undefined) {
     await mkdir(join(root, ".loom-project"), { recursive: true });
     await writeFile(join(root, PROJECT_CONFIG_REL), tiers.project);
+  }
+  if (tiers.fleetRepo !== undefined) {
+    await mkdir(join(root, ".loom-local"), { recursive: true });
+    await writeFile(join(root, FLEET_REPO_CONFIG_REL), tiers.fleetRepo);
   }
   if (tiers.local !== undefined) {
     await mkdir(join(root, ".loom-local"), { recursive: true });
@@ -213,6 +219,22 @@ describe("resolveEffectiveConfig", () => {
     expect(effective.shared).toBe(2);
   });
 
+  it("puts the per-repo fleet tier above project and below local (#11738)", async () => {
+    disableDefaultsTier();
+    const root = await makeRepo({
+      legacy: '{"a": "legacy", "b": "legacy", "c": "legacy", "g": {"x": true, "y": 1}}',
+      project: '{"a": "project", "b": "project"}',
+      fleetRepo: '{"a": "fleet-repo", "b": "fleet-repo", "g": {"x": null}}',
+      local: '{"a": "local"}',
+    });
+    expect(await resolveEffectiveConfig(root)).toEqual({
+      a: "local",
+      b: "fleet-repo",
+      c: "legacy",
+      g: { x: null, y: 1 },
+    });
+  });
+
   it("unions disjoint keys across tiers", async () => {
     disableDefaultsTier();
     const root = await makeRepo({
@@ -309,6 +331,12 @@ describe("configure_terminal write policy", () => {
     expect(legacyAfter).toBe(legacy);
     expect(legacyAfter).not.toContain("projectOnly");
     expect(legacyAfter).not.toContain("perTokenConcurrency");
+  });
+
+  it("hasNonLegacyTier is true with a per-repo fleet tier (#11738)", async () => {
+    disableDefaultsTier();
+    const withFleetRepo = await makeRepo({ legacy: "{}", fleetRepo: '{"a": 1}' });
+    expect(await hasNonLegacyTier(withFleetRepo)).toBe(true);
   });
 
   it("hasNonLegacyTier is true with a project tier and false without", async () => {

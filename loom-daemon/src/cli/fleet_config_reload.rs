@@ -165,7 +165,7 @@ mod tests {
         let lines = render_lines(
             Path::new("/repo/a"),
             &["autonomous.roleRunner.enabled".to_string()],
-            &["autonomous.hostBreaker.enabled".to_string()],
+            &["autonomous.rateLimitBreaker.enabled".to_string()],
             None,
         );
         assert!(lines[0].starts_with("live-reloadable"), "{lines:?}");
@@ -230,7 +230,7 @@ mod tests {
         RepoStatus {
             root: PathBuf::new(),
             maintain_only: None,
-            priority: 0,
+            weight: 0,
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],

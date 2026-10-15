@@ -5,7 +5,7 @@ pub(super) fn base_config() -> AddWorkerConfig {
     AddWorkerConfig {
         ssh_host: "worker-1".to_string(),
         repos: vec!["rjwalters/anvil".to_string()],
-        priority: 50,
+        weight: 50,
         dry_run: false,
         loom_repo_url: DEFAULT_LOOM_REPO_URL.to_string(),
         pat_file: None,
@@ -590,7 +590,7 @@ fn verify_rendered_script_is_valid_shell() {
 }
 
 #[test]
-fn daemon_watchdog_step_reruns_loom_daemon_start_from_the_workspace_root() {
+fn daemon_watchdog_step_heals_only_from_the_workspace_root() {
     // #5343: the step must cd into the SAME workspace root `daemon-unit`
     // pinned as WorkingDirectory=, then re-run the already-cloned
     // loom-daemon-start.sh (never a second hand-rolled watchdog
@@ -601,8 +601,8 @@ fn daemon_watchdog_step_reruns_loom_daemon_start_from_the_workspace_root() {
         "daemon-watchdog must cd into the primary workspace root:\n{script}"
     );
     assert!(
-        script.contains("$HOME/.local/share/loom/defaults/scripts/cli/loom-daemon-start.sh"),
-        "daemon-watchdog must re-run the already-cloned loom-daemon-start.sh:\n{script}"
+        script.contains("/defaults/scripts/cli/loom-daemon-start.sh\" --heal-watchdog-only"),
+        "daemon-watchdog must run loom-daemon-start.sh --heal-watchdog-only (2am#4484):\n{script}"
     );
 }
 
@@ -1668,9 +1668,9 @@ fn no_python_loom_tools_or_pip_step_anywhere() {
 }
 
 #[test]
-fn workspace_register_uses_the_priority() {
+fn workspace_register_uses_the_weight() {
     let mut config = base_config();
-    config.priority = 7;
+    config.weight = 7;
     config.repos = vec!["a/anvil".to_string(), "b/repo2".to_string()];
     let plan = build_plan(&config, &Secrets::default());
     let step = plan
@@ -1681,7 +1681,7 @@ fn workspace_register_uses_the_priority() {
             _ => None,
         })
         .unwrap();
-    assert!(step.apply.contains("--priority 7"));
+    assert!(step.apply.contains("--weight 7"));
     assert!(step.apply.contains("loom-workspaces/anvil"));
     assert!(step.apply.contains("loom-workspaces/repo2"));
 }

@@ -258,7 +258,7 @@ pub use drain_status::{DrainRollStatus, PauseRollStatus, MAX_DRAIN_PENDING_BUDGE
 pub mod drain_state;
 pub use drain_state::{
     evaluate_drain_tick, AbortOutcome, DrainBegin, DrainDescriptor, DrainOrigin, DrainState,
-    DrainTick, PauseOwnership, ResumeHold,
+    DrainTick, MaintenanceBegin, PauseOwnership, ResumeHold, TookOver,
 };
 /// `DrainAndRestartDaemon` handling and the drain supervisor — see the module doc.
 pub mod drain_supervisor;
@@ -275,21 +275,31 @@ pub use drain_supervisor::{
 // panic must never turn a single fault into a permanent drain/status outage.
 #[must_use]
 pub fn count_in_flight_sweeps(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Path) -> usize {
+    in_flight_sweep_ids(workspace_pool, fallback_root).len()
+}
+
+/// The ids of the sweeps [`count_in_flight_sweeps`] counts (#11839).
+#[must_use]
+pub fn in_flight_sweep_ids(
+    workspace_pool: &Arc<WorkspacePool>,
+    fallback_root: &Path,
+) -> Vec<String> {
     let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
-    let mut count = 0;
+    let mut ids = Vec::new();
     for root in &roots {
         let registry = workspace_pool.get_or_provision(root);
         let sr = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        count += sr
-            .list(None)
-            .into_iter()
-            .filter(|info| !info.state.is_terminal())
-            .count();
+        ids.extend(
+            sr.list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .map(|info| info.sweep_id),
+        );
     }
-    count
+    ids
 }
 
 /// Cancel every in-flight sweep across all managed roots via the existing
@@ -781,6 +791,22 @@ async fn handle_client(
             continue;
         }
 
+        // #11812: host maintenance. Acked at once; H4 runs on its supervisor.
+        if let Request::PauseThenExit = request {
+            let response = crate::auto_update::pause_roll::maintenance::handle_request(
+                &drain_state,
+                &workspace_pool,
+                &fallback_root,
+                &event_bus,
+            );
+            writer
+                .write_all(serde_json::to_string(&response)?.as_bytes())
+                .await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            continue;
+        }
+
         if let Request::AbortDrain = request {
             let outcome = drain_state.abort_checked();
             let was_draining = outcome == AbortOutcome::Aborted;
@@ -851,7 +877,11 @@ async fn handle_client(
                     "RestartDaemon: supervised — exiting {EXIT_RESTART}. {ack_message} \
                      The stale socket is reclaimed by the relaunched daemon's singleton guard."
                 );
-                crate::observability::shutdown::exit(EXIT_RESTART).await;
+                crate::observability::shutdown::exit(
+                    EXIT_RESTART,
+                    crate::observability::daemon_exit::ExitCause::IpcRestart,
+                )
+                .await;
             }
             continue;
         }
@@ -1067,11 +1097,17 @@ fn dispatch_error_response(kind: &crate::types::SweepKind, e: anyhow::Error) -> 
     match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
         Ok(rejection) => Response::RuntimeRejected(rejection),
         Err(e) => {
+            // #11928: a refusal into a held workspace is policy, not a fault.
+            let level = match e.downcast_ref::<crate::workspace_hold::WorkspaceHeldDispatchError>()
+            {
+                Some(held) => crate::workspace_hold::hold_log_level(held.kind),
+                None => log::Level::Warn,
+            };
             // Issue #5236/#5210: log the full error chain at WARN (not just
             // the caller-facing response) so an operator reading the
             // daemon's own log can diagnose a dispatch failure without
             // reproducing it.
-            log::warn!("dispatch_sweep: {kind:?} failed: {e:#}");
+            log::log!(level, "dispatch_sweep: {kind:?} failed: {e:#}");
             Response::Error {
                 message: format!("dispatch_sweep failed: {e:#}"),
             }
@@ -1387,7 +1423,7 @@ pub fn build_daemon_status_for(
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             maintain_only: workspace_registry.maintain_only_of(root),
-            priority: workspace_registry.priority_of(root),
+            weight: workspace_registry.weight_of(root),
             in_flight_count,
             health_gate_halted: health_states.is_halted(root),
             quarantined_issues,
@@ -1443,14 +1479,10 @@ pub fn build_daemon_status_for(
         + phase_stash_git_shellout
         + phase_sweep_command_check;
 
-    // Present the per-repo breakdown in dispatch-priority order (#3946) — the
-    // same order the autonomous loops drain — so the highest-priority repos are
-    // listed first. Stable within a tier (tiebreak on root path) for determinism.
-    per_repo.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| a.root.cmp(&b.root))
-    });
+    // Present the per-repo breakdown heaviest draw weight first (#11742), so
+    // the repos drawn most are listed first. Ties break on root path for
+    // determinism.
+    per_repo.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.root.cmp(&b.root)));
     // #7513: everything from here to the report literal is machine-level
     // (computed once, not per root) — timed as one "tail" phase so the
     // slow-build log below can rule it in or out as a contributor distinct
@@ -1555,6 +1587,9 @@ pub fn build_daemon_status_for(
         auto_update_artifact_published_at: au.artifact_published_at,
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
+        auto_update_floor_not_rolling: au.floor_not_rolling, // #11042
+        auto_update_config_enabled: crate::auto_update::loop_mode::current()
+            .map(crate::auto_update::loop_mode::LoopMode::config_enabled),
         // Long-running task liveness (#10414): every registered loop's
         // last beat and whether it is inside its staleness window.
         task_liveness: crate::task_liveness::snapshot(),
@@ -1705,13 +1740,13 @@ pub fn build_daemon_status_for(
         // process from the on-disk binary.
         daemon_built_at_raw: Some(crate::self_update::BUILT_AT_RAW.to_string()),
         work_finder_interval_secs,
+        startup_jitter_delay_secs: crate::startup_jitter::armed_delay_secs(),
     };
 
     // #7513/#8163: hand the phase breakdown to the shared cost model, which
     // owns both the one-time per-root INFO line and the slow-build WARN (and
     // names the root-scaled budget each is judged against). Logging policy
     // lives there, not here — see `crate::status_budget`.
-    let phase_tail = phase_start.elapsed();
     crate::status_budget::record_status_build(
         build_started.elapsed(),
         roots.len(),
@@ -1724,7 +1759,7 @@ pub fn build_daemon_status_for(
             token_pool: phase_token_pool,
             stash_git_shellout: phase_stash_git_shellout,
             sweep_command_check: phase_sweep_command_check,
-            tail: phase_tail,
+            tail: phase_start.elapsed(),
             slowest_root,
         },
     );
@@ -3390,7 +3425,7 @@ fn handle_request(
         Request::ReadIssueState { .. } => Response::Error {
             message: "internal: ReadIssueState is handled by handle_client".to_string(),
         },
-        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
+        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain | Request::PauseThenExit => {
             // Structurally unreachable: `handle_client` intercepts both drain
             // requests (#4090) before dispatching here, because a drain must ack
             // immediately and exit from a background supervisor task minutes

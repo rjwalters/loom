@@ -437,7 +437,28 @@ enum Divergence {
     /// out literally in this file rather than imported from the renderer, so a
     /// later change to the supervision block cannot ride in under this class.
     SupervisionPolicy11058,
+    /// The systemd unit stopped carrying the dispatcher's autonomy env on
+    /// purpose (#11951): the host's supervisor env (a drop-in) or its config
+    /// owns `LOOM_WORK_FINDER`, `LOOM_MAIN_HEALTH_GATE`, `LOOM_FORCE_SCOPE` and
+    /// `LOOM_GUARD_DECISION_LOG` on Linux. The plist is untouched.
+    ///
+    /// Recognised only on a unit document, by replaying that exact edit over
+    /// the SHELL's answer ([`replay_11951`]): its four `Environment=` lines are
+    /// removed (rendered or carried forward alike), and its carry-forward
+    /// warning no longer lists them, since the port purges them instead. The
+    /// port's own `(#11951)` advisory blocks are removed by their fixed grammar
+    /// ([`strip_11951_blocks`]). Everything else must then match, alone or
+    /// composed with the other classes. What those advisories say, and when the
+    /// guard refuses, is pinned by `daemon_start::systemd_autonomy`'s unit tests,
+    /// because the retired shell has no answer to compare them with.
+    SystemdAutonomyEnv11951,
 }
+
+// The #11951 replay lives in a sibling: this file is over the size ratchet's
+// threshold. The explicit `#[path]` keeps it out of Cargo's test-crate scan.
+#[path = "differential_daemon_start/replay_11951.rs"]
+mod replay_11951;
+use replay_11951::{replay_11951, strip_11951_blocks};
 
 /// Unit `[Service]` lines the retired shell rendered, replaced by #11058.
 const OLD_UNIT_SUPERVISION: &str = "Restart=on-success\nKillMode=mixed\nTimeoutStopSec=20\n\
@@ -612,6 +633,18 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
         return Err(());
     }
     let mut found = Vec::new();
+    // #11951 is replayed before everything else: it removes lines from the
+    // unit and from both sides' stderr, and the remaining classes are judged
+    // on what is left.
+    let replayed = replay_11951(shell);
+    let stripped = Answer {
+        stderr: strip_11951_blocks(&port.stderr),
+        ..port.clone()
+    };
+    if replayed != *shell || stripped != *port {
+        found.push(Divergence::SystemdAutonomyEnv11951);
+    }
+    let (shell, port) = (&replayed, &stripped);
     if shell.stderr != port.stderr {
         found.push(classify_stderr(shell, port).ok_or(())?);
     }
@@ -704,18 +737,6 @@ fn classify_stdout(shell: &Answer, port: &Answer) -> Option<Vec<Divergence>> {
 
 #[test]
 fn port_matches_the_frozen_shell_oracle() {
-    // #9987: a machine forge egress policy puts its managed `gh` launcher
-    // directory first on the rendered PATH, which the frozen (policy-free)
-    // shell oracle cannot reproduce. That is the intended behaviour, not a
-    // divergence; `env_clear()` already removes an env-origin policy.
-    use loom_daemon::forge_egress::policy::{DEPLOYMENT_POLICY_PATH, MACHINE_POLICY_PATH};
-    if [MACHINE_POLICY_PATH, DEPLOYMENT_POLICY_PATH]
-        .iter()
-        .any(|p| Path::new(p).exists())
-    {
-        eprintln!("skip: this host has a machine forge egress policy");
-        return;
-    }
     let (meta, cases) = load_oracle();
     assert_eq!(
         meta["argv0"].as_str(),

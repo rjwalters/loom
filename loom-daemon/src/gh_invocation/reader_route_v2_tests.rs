@@ -263,7 +263,7 @@ fn a_hygiene_read_no_reader_can_serve_for_a_non_budget_cause_runs_on_the_writer(
     const BAD: &str = "echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1";
     let p = pool(BAD, BAD, OK);
     let (out, withdrawn, _) = p.run_as(
-        p.read("unseen-b", ReadClass::Observability),
+        p.read("unseen-b", ReadClass::Hygiene),
         &[],
         SHED_ON,
         SystemTime::now(),
@@ -272,6 +272,138 @@ fn a_hygiene_read_no_reader_can_serve_for_a_non_budget_cause_runs_on_the_writer(
     assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
     assert_eq!(p.who(), vec![Who::R2, Who::R1, Who::Writer]);
     assert!(withdrawn.iter().all(|w| w.2 == Failure::Credential), "{withdrawn:?}");
+}
+
+#[test]
+fn an_observability_read_never_reaches_the_writer_whatever_the_cause() {
+    // 2026-10-15: the `fleet.state` history reads (Observability) drained the
+    // writer App while the router answered `Unavailable` (a mix of budget
+    // and non-budget withdrawals). Up front: shed, no request at all.
+    let p = pool(OK, OK, OK);
+    let (out, _, _) = p.run_as(
+        p.read("obs-a", ReadClass::Observability),
+        &["app-1", "app-2"],
+        SHED_ON,
+        SystemTime::now(),
+        ExhaustCause::Unavailable,
+    );
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert!(p.who().is_empty(), "writer stub NOT invoked: {:?}", p.who());
+
+    // After the readers refused the credential: still shed, never the writer.
+    const BAD: &str = "echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1";
+    let p = pool(BAD, BAD, OK);
+    let (out, _, _) = p.run_as(
+        p.read("obs-b", ReadClass::Observability),
+        &[],
+        SHED_ON,
+        SystemTime::now(),
+        ExhaustCause::Unavailable,
+    );
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1], "writer stub NOT invoked");
+
+    // After rate limits (budget): shed, as before.
+    let p = pool(LIMITED, LIMITED, OK);
+    let (out, _, _) =
+        p.run(p.read("obs-c", ReadClass::Observability), &[], SHED_ON, SystemTime::now());
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1], "writer stub NOT invoked");
+
+    // The kill switch still restores the writer fallback.
+    let p = pool(OK, OK, OK);
+    let (out, _, _) = p.run_as(
+        p.read("obs-d", ReadClass::Observability),
+        &["app-1", "app-2"],
+        SHED_OFF,
+        SystemTime::now(),
+        ExhaustCause::Unavailable,
+    );
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert_eq!(p.who(), vec![Who::Writer]);
+}
+
+#[test]
+fn a_mix_of_withdrawn_and_budget_exhausted_readers_never_calls_the_writer() {
+    // reader-2 rate limited (budget), reader-1 refuses the credential
+    // (withdrawn): the router answers `Withdrawn` — every exclusion ends on
+    // its own — and neither deferrable class reaches the writer.
+    const BAD: &str = "echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1";
+    for class in [ReadClass::Hygiene, ReadClass::Observability] {
+        let p = pool(BAD, LIMITED, OK);
+        let (out, withdrawn, _) = p.run_as(
+            p.read("mix-a", class),
+            &[],
+            SHED_ON,
+            SystemTime::now(),
+            ExhaustCause::Withdrawn,
+        );
+        assert!(matches!(out, GhCompletion::Shed { .. }), "{class:?}: {out:?}");
+        assert_eq!(p.who(), vec![Who::R2, Who::R1], "{class:?}: writer stub NOT invoked");
+        assert_eq!(withdrawn.len(), 2);
+
+        // Up front (both already out): no request at all.
+        let p = pool(OK, OK, OK);
+        let (out, _, _) = p.run_as(
+            p.read("mix-b", class),
+            &["app-1", "app-2"],
+            SHED_ON,
+            SystemTime::now(),
+            ExhaustCause::Withdrawn,
+        );
+        assert!(matches!(out, GhCompletion::Shed { .. }), "{class:?}: {out:?}");
+        assert!(p.who().is_empty(), "{class:?}: {:?}", p.who());
+    }
+    // A Gate read still takes the writer.
+    let p = pool(OK, OK, OK);
+    let (out, _, _) = p.run_as(
+        p.read("mix-c", ReadClass::Gate),
+        &["app-1", "app-2"],
+        SHED_ON,
+        SystemTime::now(),
+        ExhaustCause::Withdrawn,
+    );
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert_eq!(p.who(), vec![Who::Writer]);
+}
+
+#[test]
+fn a_withdrawn_gateway_with_no_reader_pool_never_calls_the_writer() {
+    // #12101 withdraws the gateway after repeated timeouts / 5xx. On a host
+    // whose only reader is the gateway the pool then answers NoPool, which
+    // used to mean "the writer". The gateway-first router now answers
+    // `Withdrawn` until the gateway is back.
+    let until = SystemTime::now() + Duration::from_secs(600);
+    let gateway_only = |_: &RouteRequest<'_>| {
+        crate::forge_gateway::past_withdrawn_gateway(RouteDecision::NoPool, Some(until))
+    };
+    assert_eq!(
+        gateway_only(&RouteRequest::gate("acme/gw", None, Resource::Core)),
+        RouteDecision::Exhausted {
+            until,
+            cause: ExhaustCause::Withdrawn
+        }
+    );
+    for class in [ReadClass::Hygiene, ReadClass::Observability] {
+        let p = pool(OK, OK, OK);
+        let out = p
+            .read("gw-only", class)
+            .execute_routed_v2_at(
+                &gateway_only,
+                &|_: &str, _: &str, _: Failure, _: &str| {},
+                SHED_ON,
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert!(matches!(out, GhCompletion::Shed { .. }), "{class:?}: {out:?}");
+        assert!(p.who().is_empty(), "{class:?}: writer stub NOT invoked: {:?}", p.who());
+    }
+    // No gateway withdrawal: NoPool stays NoPool (a host with no readers at
+    // all reads on the writer, as before).
+    assert_eq!(
+        crate::forge_gateway::past_withdrawn_gateway(RouteDecision::NoPool, None),
+        RouteDecision::NoPool
+    );
 }
 
 #[test]
@@ -512,4 +644,62 @@ fn the_legacy_path_keeps_the_pre_change_fallback() {
     assert!(matches!(out, GhCompletion::Captured(_)));
     assert_eq!(p.who(), vec![Who::R2, Who::Writer], "the pre-change reader → writer");
     assert_eq!(withdrawn.borrow().len(), 1);
+}
+
+/// #12074: inside a work-finder tick's read scope a read every reader has
+/// rate-limited is shed at once, even a Gate read: no writer call, so the
+/// tick answers from its caches and the dispatch App's budget is kept.
+#[test]
+fn a_tick_scoped_gate_read_is_shed_not_moved_to_the_writer() {
+    let p = pool(LIMITED, LIMITED, OK);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let scope = super::super::read_deadline::enter(deadline, true);
+    let (out, _, _) = p.run(p.read("tick-gate", ReadClass::Gate), &[], SHED_ON, SystemTime::now());
+    drop(scope);
+    assert_eq!(p.who(), vec![Who::R2, Who::R1], "writer stub NOT invoked");
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+
+    // #12074 review: readers out for a cause that is not budget still reach
+    // the writer inside a tick: only a rate-limit back-off is shed.
+    let p = pool(LIMITED, LIMITED, OK);
+    let scope = super::super::read_deadline::enter(deadline, true);
+    let (out, _, _) = p.run_as(
+        p.read("tick-unavail", ReadClass::Gate),
+        &[],
+        SHED_ON,
+        SystemTime::now(),
+        ExhaustCause::Unavailable,
+    );
+    drop(scope);
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1, Who::Writer]);
+}
+
+/// #12074 review: a starved repo's escalated tick lifts the budget shed in
+/// the facade chain too: a Hygiene read whose readers are all out of budget
+/// reaches the writer.
+#[test]
+fn an_escalated_tick_sends_a_budget_exhausted_hygiene_read_to_the_writer() {
+    let p = pool(OK, OK, OK);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let scope = super::super::read_deadline::enter(deadline, true);
+    let (out, _, _) = p.run(
+        p.read("esc-a", ReadClass::Hygiene),
+        &["app-1", "app-2"],
+        SHED_ON,
+        SystemTime::now(),
+    );
+    assert!(matches!(out, GhCompletion::Shed { .. }), "an ordinary tick sheds: {out:?}");
+    assert!(p.who().is_empty());
+    let escalated = super::super::read_deadline::allow_writer();
+    let (out, _, _) = p.run(
+        p.read("esc-b", ReadClass::Hygiene),
+        &["app-1", "app-2"],
+        SHED_ON,
+        SystemTime::now(),
+    );
+    drop(escalated);
+    drop(scope);
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert_eq!(p.who(), vec![Who::Writer]);
 }

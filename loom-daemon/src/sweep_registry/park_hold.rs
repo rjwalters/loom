@@ -60,6 +60,15 @@
 //!   reports `LabelWriteFailed` (fail closed, #9239), and the next PR-less
 //!   release retries it. Quarantine keeps its in-memory pause.
 //!
+//! # A frozen issue (#11743)
+//!
+//! The body read already returns the labels, so it is the frozen check for
+//! both writers: a `loom:frozen` issue gets no record, and
+//! [`SweepRegistry::record_daemon_hold`] answers [`HoldGate::Frozen`], so the
+//! writer skips its label edit and comment too. A failed read is the
+//! **Rejected** case above (the label still follows): a frozen check cannot be
+//! stricter than the read it rides on without changing #9239's rule.
+//!
 //! # Re-applying a hold
 //!
 //! A released hold leaves its record in the body. Releases only flip labels,
@@ -88,6 +97,9 @@ pub const QUARANTINE_HOLD_REASON: &str = "insta-crash quarantine";
 /// `reason=` on the PR-less retry hold's park record (#7972, #9239).
 pub const PRLESS_HOLD_REASON: &str = "pr-less hold";
 
+/// `reason=` on the no-op hold's park record (#10156, written since #12024).
+pub const NOOP_HOLD_REASON: &str = "no-op hold";
+
 /// Telemetry name of the body read (#10089). Mapped to `issue.view-state`.
 pub(crate) const VIEW_OP: &str = "park_hold.issue_view";
 /// Telemetry name of the body write (#10089). Mapped to `issue.edit-body`.
@@ -97,7 +109,7 @@ pub(crate) const BODY_OP: &str = "park_hold.issue_body";
 pub(crate) const LABELS_OP: &str = "park_hold.issue_labels";
 
 /// Whether `record` is a daemon hold: no numbered blocker, `by=daemon`, and
-/// one of the two daemon hold reasons.
+/// one of the daemon hold reasons (the no-op hold's since #12024).
 ///
 /// The release tick (#10556) and the undocumented-block queue (#10558) key on
 /// this rather than on comment prose.
@@ -105,7 +117,10 @@ pub(crate) const LABELS_OP: &str = "park_hold.issue_labels";
 pub fn is_daemon_hold(record: &ParkRecord) -> bool {
     record.blocker.is_none()
         && record.by.as_deref() == Some(DAEMON_HOLD_BY)
-        && matches!(record.reason.as_deref(), Some(QUARANTINE_HOLD_REASON | PRLESS_HOLD_REASON))
+        && matches!(
+            record.reason.as_deref(),
+            Some(QUARANTINE_HOLD_REASON | PRLESS_HOLD_REASON | NOOP_HOLD_REASON)
+        )
 }
 
 /// The record line this module writes for `reason` at `at`.
@@ -163,6 +178,18 @@ pub(crate) enum HoldRecord {
     /// A call timed out: `gh` is wedged, so the writer must not spend a second
     /// timeout on its label edit (#3973).
     TimedOut(String),
+    /// The read found `loom:frozen` (#11743): nothing was written, and the
+    /// writer must not follow with its label edit or comment.
+    Frozen,
+}
+
+/// What a daemon hold's writer may do after its record step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldGate {
+    /// Apply the label (the record landed, or the documented fallback).
+    Proceed,
+    /// The issue is `loom:frozen` (#11743): write nothing at all.
+    Frozen,
 }
 
 /// Read `issue`'s body and write it back with this hold's record. Every call
@@ -184,6 +211,11 @@ pub(crate) fn record_hold<F: BoundedParkForge + ?Sized>(
         Ok(s) => s,
         Err(e) => return classify(forge, format!("could not read #{issue}: {e}")),
     };
+    // #11743: the read the record already makes is the frozen check. A failed
+    // read keeps the documented fallback above (the label still follows).
+    if crate::work_finder::is_frozen(&state.labels) {
+        return HoldRecord::Frozen;
+    }
     let body = compose_hold_body(&state.body, reason, at);
     if body == state.body {
         return HoldRecord::Written;
@@ -357,11 +389,13 @@ impl SweepRegistry {
     /// Write the body park record for a daemon hold on `issue`, ahead of the
     /// writer's own `loom:blocked` edit (#10161).
     ///
-    /// `Ok(())` means the label edit may run: the record landed, or it was
-    /// refused and the documented fallback applies (logged at `warn`). `Err`
-    /// means a call timed out, and the writer must stop before its label edit
-    /// (#3973). See the module docs.
-    pub(crate) fn record_daemon_hold(&self, issue: u32, reason: &str) -> Result<(), String> {
+    /// `Ok(HoldGate::Proceed)` means the label edit may run: the record
+    /// landed, or it was refused and the documented fallback applies (logged
+    /// at `warn`). `Ok(HoldGate::Frozen)` means the issue is `loom:frozen`
+    /// and the writer makes no write at all (#11743). `Err` means a call
+    /// timed out, and the writer must stop before its label edit (#3973). See
+    /// the module docs.
+    pub(crate) fn record_daemon_hold(&self, issue: u32, reason: &str) -> Result<HoldGate, String> {
         let at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         let mut forge = RegistryParkForge::new(self);
         let outcome = record_hold(&mut forge, u64::from(issue), reason, &at);
@@ -377,10 +411,15 @@ impl SweepRegistry {
                 "sweep_registry: `{reason}` park record for #{issue} timed out ({e}); `gh` \
                  looks wedged, so the `loom:blocked` edit is skipped this time (#3973, #10161)"
             ),
+            HoldRecord::Frozen => log::info!(
+                "sweep_registry: #{issue} is `loom:frozen` — the `{reason}` writes nothing \
+                 (no record, label or comment) (#11743)"
+            ),
         }
         match outcome {
             HoldRecord::TimedOut(e) => Err(e),
-            _ => Ok(()),
+            HoldRecord::Frozen => Ok(HoldGate::Frozen),
+            _ => Ok(HoldGate::Proceed),
         }
     }
 }

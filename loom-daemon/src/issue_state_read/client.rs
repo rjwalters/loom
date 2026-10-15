@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use super::standalone;
 use super::{IssueStateReply, ReadOutcome};
-use crate::forge_egress::policy::PolicySources;
 use crate::stash_retirement::IssueStateLookup;
 use crate::types::{Request, Response};
 
@@ -119,15 +118,14 @@ pub trait StandaloneRead {
     fn read(&self, issue: u64) -> standalone::StandaloneRead;
 }
 
-/// Production standalone read: policy sources resolved once per run.
+/// Production standalone read.
 pub struct LocalRead {
     pub root: PathBuf,
-    pub sources: PolicySources,
 }
 
 impl StandaloneRead for LocalRead {
     fn read(&self, issue: u64) -> standalone::StandaloneRead {
-        standalone::read(&self.root, &self.sources, issue)
+        standalone::read(&self.root, issue)
     }
 }
 

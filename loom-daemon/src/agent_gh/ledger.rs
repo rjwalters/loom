@@ -238,6 +238,8 @@ pub fn plan(
         rd: None,
         // `gh api rate_limit` is a request GitHub does not charge.
         fr: (caller == "agent.gh.api" && pool == Pool::Other).then_some(true),
+        // Set by [`book`], which knows how the front routed the call.
+        rt: None,
     };
     Some(Row {
         caller,
@@ -247,9 +249,11 @@ pub fn plan(
     })
 }
 
-/// Book the passthrough of `args` (see the module docs). Never fails, never
-/// panics into the caller.
-pub fn book(args: &[OsString], cwd: Option<&Path>) {
+/// Book the passthrough of `args` (see the module docs), run under `profile`
+/// — a gateway profile or a reader App's directory — or, when `None`, the
+/// session's own credential. `read` is the front's classification. Never
+/// fails, never panics into the caller.
+pub fn book(args: &[OsString], cwd: Option<&Path>, profile: Option<&Path>, read: bool) {
     let _ = std::panic::catch_unwind(|| {
         if std::env::var_os(crate::gh_invocation::BOOKED_ENV).is_some_and(|v| v == "1") {
             return;
@@ -260,15 +264,23 @@ pub fn book(args: &[OsString], cwd: Option<&Path>) {
             host: var("GH_HOST"),
             gh_repo: var("GH_REPO"),
         };
-        let dir = std::env::var_os("GH_CONFIG_DIR")
-            .filter(|d| !d.is_empty())
-            .map(std::path::PathBuf::from);
-        let env_token = ["GH_TOKEN", "GITHUB_TOKEN"]
-            .iter()
-            .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+        // A gateway- or reader-routed read runs under that directory with
+        // every env token removed (2am#4367 P4, #12245); anything else under
+        // the session's own.
+        let dir = profile.map(Path::to_path_buf).or_else(|| {
+            std::env::var_os("GH_CONFIG_DIR")
+                .filter(|d| !d.is_empty())
+                .map(std::path::PathBuf::from)
+        });
+        let env_token = profile.is_none()
+            && ["GH_TOKEN", "GITHUB_TOKEN"]
+                .iter()
+                .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
         let cred = accounting::cred_of_with(dir.as_deref(), env_token);
         let remote = || cwd.and_then(|dir| bounded_remote("git", dir, REMOTE_BUDGET));
-        if let Some(row) = plan(args, &session, &cred, remote) {
+        if let Some(mut row) = plan(args, &session, &cred, remote) {
+            row.attribution.rt =
+                Some(crate::forge_gateway::route_label(cred.kind, read).to_string());
             forge_call_stats::record_attributed(
                 row.caller,
                 &row.identity,

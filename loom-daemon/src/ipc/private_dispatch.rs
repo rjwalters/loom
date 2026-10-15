@@ -110,15 +110,13 @@ pub(super) async fn dispatch_sweep_nonblocking(
         Ok(Err(error)) => return dispatch_error_response(&kind, error),
         Err(error) => return dispatch_error_response(&kind, error.into()),
     };
-    // Phase 1 (lock-scoped): headroom advisory + model resolution (both
-    // unchanged from the previous arm) + `begin_issue_dispatch` — the FULL
-    // guard chain, claim lock, label flip, dispatch stagger, and
-    // `Command::spawn()`. Everything here is either cheap in-memory/local-fs
-    // work or (for `Issue` guards) the SAME `gh` round trips the previous
-    // single-call `dispatch()` already made under this same lock — this
-    // split changes WHEN the lock is released, not what runs under it up to
-    // this point.
-    let begin_outcome = {
+    // Phase 1: headroom advisory + model resolution (both unchanged from the
+    // previous arm) under a short registry lock, then `begin_issue_dispatch`
+    // — the guard chain, claim lock, label flip, dispatch stagger and
+    // `Command::spawn()` — which takes the registry lock only for its
+    // in-memory/local steps and releases it around every forge `gh` call and
+    // sleep (#9573; lock-scope audit in `sweep_registry::dispatch::registry_access`).
+    {
         let mut sr = target
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -145,17 +143,29 @@ pub(super) async fn dispatch_sweep_nonblocking(
             headroom.ram_headroom,
             headroom.token_axis_limit
         );
-
-        sr.begin_prepared_issue_dispatch(
-            &kind,
-            idempotency_key,
-            crate::sweep_registry::DispatchModel::Request(model.as_deref()),
-            effort.as_deref(),
-            depends_on,
-            None,
-            prepared_launch,
-            origin,
-        )
+    }
+    let begin_outcome = {
+        let begin_target = target.clone();
+        let begin_kind = kind.clone();
+        let begin_model = model.clone();
+        let begin_effort = effort.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::sweep_registry::SweepRegistry::begin_prepared_issue_dispatch_shared(
+                &begin_target,
+                &begin_kind,
+                idempotency_key,
+                crate::sweep_registry::DispatchModel::Request(begin_model.as_deref()),
+                begin_effort.as_deref(),
+                depends_on,
+                prepared_launch,
+                origin,
+            )
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return dispatch_error_response(&kind, error.into()),
+        }
     };
 
     let prepared = match begin_outcome {

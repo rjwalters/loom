@@ -5,13 +5,16 @@
 //!
 //! The daemon creates one journal file per launched role tick ([`attach`]) and
 //! hands its path to the agent as [`PICK_JOURNAL_ENV`]. Three writers, all in
-//! the agent's own process tree, append JSON lines to it:
+//! the agent's own process tree, append JSON lines to it. A fourth writer, the
+//! daemon itself, journals the Judge/Doctor/Champion queue at dispatch:
 //!
-//! - `loom-daemon pr-queue` ([`record_pr_queue`]): the ordered queue Judge,
-//!   Doctor and Champion consume, with its sort keys — the same rows it prints.
+//! - the daemon, at launch ([`record_queue_at_dispatch`], #12119): the ordered
+//!   queue Judge, Doctor and Champion consume, with its sort keys. It does not
+//!   depend on the agent calling `loom-daemon pr-queue`, which is a pure read.
 //! - the agent `gh` front's served `issue|pr list` ([`record_listing`]): the
 //!   rows a listing-driven role (Curator) read, in listing order, after its own
-//!   `--jq` filter.
+//!   `--jq` filter; and the `--json` listings it passes through to `gh`
+//!   (`--search`, `labels`: [`record_gh_listing`], #11858).
 //! - the agent `gh` front's argv ([`record_gh_actions`]): the forge writes the
 //!   agent issued (claim labels, verdict labels, merges), parsed from argv only.
 //!
@@ -89,6 +92,29 @@ pub enum JournalEntry {
         number: u32,
         action: String,
     },
+    /// A comment posted through `loom-daemon forge comment` whose body opens
+    /// with Loom markers (#12027): one entry per leading
+    /// `<!-- <ns>:<kind>[:…] -->` line ([`leading_markers`]).
+    Marker {
+        at: DateTime<Utc>,
+        number: u32,
+        is_pr: bool,
+        marker: String,
+        /// The head the role pinned when it wrote (Champion's pin file),
+        /// read locally; never a forge read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+    },
+    /// A write a daemon subcommand made with its own forge calls, which the
+    /// agent `gh` front never sees (#12027): `park-record apply` (`blocked`)
+    /// and `operator-decision apply` (`escalated`). `by` names the command.
+    Applied {
+        at: DateTime<Utc>,
+        number: u32,
+        is_pr: bool,
+        action: String,
+        by: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +179,34 @@ fn attach_in(command: &mut Command, root: &Path, role: &str, dir: &Path) {
     command.env(PICK_JOURNAL_ENV, &path);
 }
 
+/// A step's journal file (#11906). A step runs detached from the tick that
+/// drew it, not on a role tick's blocking thread, so its journal is named by
+/// its sweep id rather than held thread-locally until the step ends.
+#[must_use]
+pub fn step_path(sweep_id: &str) -> PathBuf {
+    let name: String = sweep_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    journal_dir().join(format!("step-{name}.jsonl"))
+}
+
+/// Give a step's launch its journal ([`step_path`]). A no-op without an
+/// OTLP exporter, like [`attach`].
+pub fn attach_step(command: &mut Command, sweep_id: &str) {
+    if super::ops::global_ops_sink().is_some()
+        && crate::forge_etag_store::private_dir(&journal_dir(), true)
+    {
+        command.env(PICK_JOURNAL_ENV, step_path(sweep_id));
+    }
+}
+
+/// Make `path` this thread's journal for `root`, so the end of a step drains
+/// it through the role tick's own emit ([`take`]).
+pub fn adopt(root: &Path, path: PathBuf) {
+    ACTIVE.with(|a| *a.borrow_mut() = Some((root.to_path_buf(), path)));
+}
+
 fn prune(dir: &Path) {
     let now = std::time::SystemTime::now();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -215,7 +269,24 @@ pub fn parse(raw: &str) -> Vec<JournalEntry> {
 // Writer side (the agent's process tree)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds: a journal path for this thread's writers, so a writer's
+    /// caller can be tested without setting the process-wide env.
+    static TEST_JOURNAL: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Test builds: make `path` (or nothing) this thread's writer journal.
+#[cfg(test)]
+pub(crate) fn set_test_journal(path: Option<PathBuf>) {
+    TEST_JOURNAL.with(|j| *j.borrow_mut() = path);
+}
+
 fn journal_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_JOURNAL.with(|j| j.borrow().clone()) {
+        return Some(path);
+    }
     let path = PathBuf::from(std::env::var_os(PICK_JOURNAL_ENV)?);
     path.is_absolute().then_some(path)
 }
@@ -313,19 +384,45 @@ pub fn front_on_path(path: Option<OsString>) -> bool {
         .is_some_and(|exe| exe.file_name() == Some(std::ffi::OsStr::new("loom-daemon")))
 }
 
-/// Journal a `pr-queue` result (the role's serving queue). A no-op outside a
-/// role tick.
-pub fn record_pr_queue(role: &str, rows: &[Value]) {
-    if journal_path().is_none() {
+/// Journal the serving PR queue for a Judge, Doctor or Champion tick (#12119),
+/// from the daemon, before the agent is spawned. `command` is the agent
+/// launch, already carrying its journal ([`attach`]): without one (no
+/// exporter) nothing is fetched. A role without a PR queue, or a failed
+/// listing, journals nothing and never fails the launch.
+pub fn record_queue_at_dispatch(command: &Command, root: &Path, role: &str) {
+    let gh = std::env::var_os("LOOM_GH_BIN").map_or_else(|| PathBuf::from("gh"), PathBuf::from);
+    record_queue_with(command, role, |r| crate::pr_planning::fetch_queue(root, &gh, r));
+}
+
+fn record_queue_with<F>(command: &Command, role: &str, fetch: F)
+where
+    F: FnOnce(crate::pr_planning::PrRole) -> anyhow::Result<Vec<Value>>,
+{
+    let env_of = |name: &str| {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(name))
+            .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+    };
+    let Some(Some(path)) = env_of(PICK_JOURNAL_ENV) else {
         return;
-    }
-    append(&JournalEntry::Queue {
-        at: Utc::now(),
-        role: role.to_string(),
-        acts_observable: front_on_path(std::env::var_os("PATH")),
-        total: rows.len(),
-        rows: pr_queue_rows(rows),
-    });
+    };
+    let Some(role) = crate::pr_planning::PrRole::from_name(role) else {
+        return;
+    };
+    let Ok(rows) = fetch(role) else { return };
+    // The PATH the agent will receive: its own override, else the daemon's.
+    let path_env = env_of("PATH").unwrap_or_else(|| std::env::var_os("PATH"));
+    append_to(
+        Path::new(&path),
+        &JournalEntry::Queue {
+            at: Utc::now(),
+            role: role.as_str().to_string(),
+            acts_observable: front_on_path(path_env),
+            total: rows.len(),
+            rows: pr_queue_rows(&rows),
+        },
+    );
 }
 
 /// The journal rows for a served listing: the rows its `--jq` prints, in the
@@ -367,6 +464,54 @@ pub fn record_listing(listing: &crate::forge_cached_list::Served) {
     });
 }
 
+/// Whether this process runs inside a role tick that keeps a journal.
+#[must_use]
+pub fn active() -> bool {
+    journal_path().is_some()
+}
+
+/// The journal rows of a passed-through `gh issue|pr list --json …` call's
+/// stdout (#11858), in the order `gh` printed them, served under `stage`.
+/// `None` when the output is not a JSON array of rows.
+#[must_use]
+pub fn gh_listing_rows(stage: &str, stdout: &str) -> Option<Vec<JournalRow>> {
+    let rows: Vec<Value> = serde_json::from_str(stdout.trim()).ok()?;
+    Some(
+        rows.iter()
+            .filter_map(|row| {
+                u32::try_from(row["number"].as_u64()?)
+                    .ok()
+                    .map(|n| (n, row))
+            })
+            .enumerate()
+            .map(|(position, (number, row))| JournalRow {
+                number,
+                stage: stage.to_string(),
+                labels: row_labels(row),
+                sort_key: Some(PickSortKey {
+                    name: "listing_order".to_string(),
+                    value: (position + 1).to_string(),
+                }),
+            })
+            .take(MAX_ROWS_PER_ENTRY)
+            .collect(),
+    )
+}
+
+/// Journal a listing the agent `gh` front passed through to `gh` (#11858).
+/// A no-op outside a role tick and for output that is not JSON rows.
+pub fn record_gh_listing(stage: &str, stdout: &str) {
+    if !active() {
+        return;
+    }
+    if let Some(rows) = gh_listing_rows(stage, stdout) {
+        append(&JournalEntry::Listing {
+            at: Utc::now(),
+            rows,
+        });
+    }
+}
+
 /// Journal the forge writes a `gh` argv issues. A no-op outside a role tick.
 pub fn record_gh_actions(raw: &[OsString]) {
     if journal_path().is_none() {
@@ -385,12 +530,110 @@ pub fn record_gh_actions(raw: &[OsString]) {
     }
 }
 
+/// A marker line longer than this is cut to it (#12027).
+pub const MAX_MARKER_LEN: usize = 160;
+
+/// Leading marker lines read from one comment body.
+const MAX_MARKERS_PER_COMMENT: usize = 3;
+
+/// The leading `<!-- <ns>:<kind>[:…] -->` lines of a comment body, in order,
+/// each cut to [`MAX_MARKER_LEN`] characters. Reading stops at the first line
+/// that is not one. Pure.
+#[must_use]
+pub fn leading_markers(body: &str) -> Vec<String> {
+    body.lines()
+        .map(str::trim)
+        .take_while(|line| is_marker(line))
+        .take(MAX_MARKERS_PER_COMMENT)
+        .map(|line| line.chars().take(MAX_MARKER_LEN).collect())
+        .collect()
+}
+
+fn is_marker(line: &str) -> bool {
+    let Some(inner) = line
+        .strip_prefix("<!-- ")
+        .and_then(|l| l.strip_suffix(" -->"))
+    else {
+        return false;
+    };
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    let head = inner.split_whitespace().next().unwrap_or_default();
+    matches!(head.split_once(':'), Some((ns, rest))
+        if token(ns) && token(rest.split(':').next().unwrap_or_default()))
+}
+
+/// The head Champion pinned for PR `number`, from its pin file
+/// (`$(git rev-parse --git-common-dir)/loom-champion-pin-pr-N`, first token;
+/// `champion-targeted.md` step 1). A local read; `None` when there is none.
+fn champion_pin_head(number: u32) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let text = std::fs::read_to_string(dir.join(format!("loom-champion-pin-pr-{number}"))).ok()?;
+    let sha = text.split_whitespace().next()?;
+    (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
+/// Journal the markers a comment just posted on `number` opens with
+/// (#12027). A no-op outside a journaled run, and for a body with no leading
+/// marker. Best-effort, like every writer here.
+pub fn record_marker(number: u64, is_pr: bool, body: &str) {
+    if journal_path().is_none() {
+        return;
+    }
+    let Ok(number) = u32::try_from(number) else {
+        return;
+    };
+    let markers = leading_markers(body);
+    if markers.is_empty() {
+        return;
+    }
+    let head_sha = (is_pr && markers.iter().any(|m| m.starts_with("<!-- champion:")))
+        .then(|| champion_pin_head(number))
+        .flatten();
+    let at = Utc::now();
+    for marker in markers {
+        append(&JournalEntry::Marker {
+            at,
+            number,
+            is_pr,
+            marker,
+            head_sha: head_sha.clone(),
+        });
+    }
+}
+
+/// Journal a write a daemon subcommand made on `number` (#12027). A no-op
+/// outside a journaled run.
+pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
+    if journal_path().is_none() {
+        return;
+    }
+    if let Ok(number) = u32::try_from(number) {
+        append(&JournalEntry::Applied {
+            at: Utc::now(),
+            number,
+            is_pr,
+            action: action.to_string(),
+            by: by.to_string(),
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------
 
 /// The role action a label write means (one of `ROLE_ACTIONS`), or `None`
-/// for a label that is not a Loom workflow label.
+/// for a label that is not a Loom workflow label. A retired hold name reads as
+/// the hold it folds into (#11795).
 #[must_use]
 pub fn action_for_label(label: &str) -> Option<&'static str> {
     Some(match label {
@@ -400,8 +643,8 @@ pub fn action_for_label(label: &str) -> Option<&'static str> {
         "loom:changes-requested" => "changes_requested",
         "loom:curated" => "curated",
         "loom:issue" => "promoted",
-        "loom:blocked" => "blocked",
-        "loom:operator" | "loom:operator-only" | "loom:operator-decision" => "escalated",
+        l if crate::work_finder::BLOCKED_HOLD_NAMES.contains(&l) => "blocked",
+        l if crate::work_finder::OPERATOR_HOLD_NAMES.contains(&l) => "escalated",
         l if l.starts_with("loom:") => "labeled",
         _ => return None,
     })
@@ -419,14 +662,9 @@ pub fn known_action(action: &str) -> Option<&'static str> {
 #[must_use]
 pub fn skip_reason_for_labels(labels: &[String]) -> Option<PickSkipReason> {
     let has = |set: &[&str]| labels.iter().any(|l| set.contains(&l.as_str()));
-    if has(&[
-        "loom:operator",
-        "loom:operator-only",
-        "loom:operator-decision",
-        "loom:operator-mechanical",
-    ]) {
+    if crate::work_finder::is_operator_hold(labels) {
         Some(PickSkipReason::OperatorHold)
-    } else if has(&["loom:blocked", "loom:ci-failure"]) {
+    } else if crate::work_finder::is_blocked_hold(labels) || has(&["loom:ci-failure"]) {
         Some(PickSkipReason::Blocked)
     } else if has(&["loom:sequenced"]) {
         Some(PickSkipReason::OverlapChain)
@@ -582,3 +820,8 @@ fn api_actions(args: &[String]) -> Vec<(u32, &'static str)> {
 #[allow(clippy::unwrap_used)]
 #[path = "pick_journal_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "pick_journal_marker_tests.rs"]
+mod marker_tests;

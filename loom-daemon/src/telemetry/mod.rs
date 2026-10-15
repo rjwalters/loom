@@ -71,15 +71,16 @@ pub mod queue_snapshot;
 pub mod repo_identity;
 mod start_facts;
 pub use start_facts::{
-    effort_source, model_source, DispatchOrigin, SweepStartFacts,
-    SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+    effort_source, model_source, DispatchOrigin, SweepRoleDraw, SweepStartFacts,
+    SWEEP_ROLE_DRAW_LOG_ATTRIBUTE_KEYS, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
 };
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{
-    apply_noop_loop_class, classify_disposition, result_for_disposition, DispositionSignals,
-    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS, SPAWN_DEATH_CLASS,
+    apply_noop_loop_class, classify_disposition, ensure_failure_class, result_for_disposition,
+    DispositionSignals, IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS, SPAWN_DEATH_CLASS,
+    UNCLASSIFIED_CLASS,
 };
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
@@ -958,6 +959,12 @@ pub struct SweepOutcomeRecord {
     /// fabricated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_origin: Option<String>,
+    /// The weighted agent draw that chose this sweep's tap (#11726;
+    /// 2AMLogic/2am#4393), copied from the sweep's start facts. Absent when no
+    /// `roleDraw` table decided the sweep, on journal lines that predate it,
+    /// and on sweeps this daemon did not dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_draw: Option<SweepRoleDraw>,
     /// In-sweep rework events (Issue #9444) observed by the paths that
     /// performed them, in event order. Absent (never `[]`) when none were
     /// observed for this sweep.
@@ -1068,6 +1075,10 @@ pub enum RoleTickResult {
     SkippedLoad,
     /// Skipped pre-spawn: a queue-gated role's work queue was empty (#9391).
     SkippedQueueEmpty,
+    /// Not reached this tick: a host-level limit (ceiling, role budget,
+    /// demand width, reservation) stopped the round-robin walk before this
+    /// repo's turn, so its next chance is a later tick (#12084).
+    SkippedDeferred,
 }
 
 /// Whether a `repo` string is a local filesystem path (or empty) rather than
@@ -1183,6 +1194,14 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Why a [`RoleTickResult::Failure`] tick failed (#12028): the closed-
+    /// vocabulary `loom.failure_class` the tick's `role_attempt` span carries
+    /// when it launched, or the fixed pre-launch class of the site that
+    /// refused it. Never `detail`'s text. Present only on a failure; absent on
+    /// every other result and on every record written before #12028 —
+    /// additive, no `schema_version` bump, exactly as [`Self::gated_pool`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
     /// Which tier of the ordered runtime-preference list this tick launched on
     /// (Issue #8599): `0` is the most-preferred tap — nothing fell through —
     /// and any higher value is a fall-through, so "how much work went to the
@@ -1201,6 +1220,12 @@ pub struct RoleTickOutcomeRecord {
     /// [`Self::preference_tier`] is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preference_tap: Option<String>,
+    /// The weighted role draw that chose this tick's tap (#11726): role,
+    /// attempt, the table and the tier that set it, the seed and its inputs,
+    /// every roll, and the pick. Absent when no `runtimes.roleDraw` table
+    /// decided the launch — additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
     /// Runtime adapter this tick actually launched on (Issue #8507), read off
     /// the tick's own `# LOOM_LAUNCH` record — same source and the same
     /// "absent, never a fabricated `claude` default" contract as
@@ -1240,7 +1265,30 @@ pub struct RoleTickOutcomeRecord {
     /// optional unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<RoleTickActions>,
+    /// What ran the tick (#11906): absent for a role-runner tick, `"step"`
+    /// ([`ROLE_TICK_SOURCE_STEP`]) for a step-engine step, so a "role ticks
+    /// still running" query never counts steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
+    /// Which host limit deferred this repo's tick (#12084): `ceiling`,
+    /// `role_budget`, `demand_width` or `reservation`. Present exactly on
+    /// [`RoleTickResult::SkippedDeferred`]. Additive, no `schema_version`
+    /// bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_by: Option<String>,
+    /// Which shard owns this repo's role ticks (#12084), `<index>/<count>`
+    /// (zero-based index), as [`crate::role_shard`] resolved it. Present only
+    /// on a [`RoleTickResult::SkippedDeferred`] record of a sharded host;
+    /// absent when unsharded, never a guessed `0/1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_owner: Option<String>,
 }
+
+/// [`RoleTickOutcomeRecord::source`] of a step-engine step (#11906).
+pub const ROLE_TICK_SOURCE_STEP: &str = "step";
 
 /// One account's slice of a `tokens.snapshot` — the per-account usage /
 /// limit-window state matching what `loom-daemon tokens check --ranking` knows.
@@ -1760,38 +1808,12 @@ pub struct ManagedRepoEntry {
     /// `Private`, never `Public`.
     #[serde(default)]
     pub visibility: RepoVisibility,
-    /// The repo's cross-repo dispatch priority tier from the machine-level
-    /// workspace registry (`Workspace.priority`, lower dispatches first;
-    /// #9244, loom-ui#153). Absent for a root that is not a registered
-    /// workspace (the empty-registry cwd fallback) and on older daemons.
+    /// The repo's draw weight from the machine-level workspace registry
+    /// (`Workspace.weight`, higher draws more; #11742). Absent for a root that
+    /// is not a registered workspace (the empty-registry cwd fallback) and on
+    /// older daemons, which sent a `priority` tier instead (#9244).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority: Option<u32>,
-    /// This host's `loom:blocked` release-pass tallies for the repo since the
-    /// daemon started (#10763). Absent before the pass's first tick for the
-    /// repo on this host and on older daemons.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stale_blocked_release: Option<StaleBlockedReleaseCounters>,
-}
-
-/// One repo's `loom:blocked` release-pass tallies on one host (#10763),
-/// carried on [`ManagedRepoEntry`] so a fleet where the pass never acts is
-/// diagnosable without host logs: `ticks` counts every per-repo tick by
-/// outcome (`ran`, `not_due`, `skipped_shard`, `denied_scope`, `not_served`,
-/// `rate_limited`, `skipped_off`, `dry_run`, `archived`, `enumerate_error`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StaleBlockedReleaseCounters {
-    /// Artifacts released (applied writes only).
-    #[serde(default)]
-    pub released: u64,
-    /// Artifacts re-parked (applied writes only).
-    #[serde(default)]
-    pub reparked: u64,
-    /// The most recent tick's outcome key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_outcome: Option<String>,
-    /// Ticks per outcome key.
-    #[serde(default)]
-    pub ticks: std::collections::BTreeMap<String, u64>,
+    pub weight: Option<u32>,
 }
 
 /// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many

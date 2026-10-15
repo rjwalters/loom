@@ -35,8 +35,8 @@
 //!
 //! | | Admission brake (this module, #4903) | Host breaker ([`crate::host_breaker`], #4235) |
 //! |---|---|---|
-//! | Nature | **Point-in-time** — one reading, one decision | **Stateful** — trips only on N consecutive over-threshold ticks |
-//! | Default threshold | `0.95` load/core (see [`DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE`]; `4.0` before #5270) | `2.5` load/core |
+//! | Nature | **Short sustain** — [`DEFAULT_ADMISSION_BRAKE_SUSTAIN_TICKS`] consecutive readings (since #11709; one reading before) | **Stateful** — trips only on N consecutive over-threshold ticks |
+//! | Default threshold | `0.95` load/core (see [`DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE`]; `4.0` before #5270) **and** `90%` measured CPU busy ([`DEFAULT_ADMISSION_BRAKE_CPU_BUSY_HOLD`], #11709) | `2.5` load/core |
 //! | Release | Immediate, the first tick load drops back under | After a 5-minute cool-down |
 //! | Explicit `dispatch_sweep` | **Never blocks it** (an operator asking by hand is not autonomous admission) | Hard-blocks unless `force` |
 //! | Purpose | Stop *adding* to a full host | Remember a *meltdown* so a load dip cannot re-admit a whole wave |
@@ -50,10 +50,22 @@
 //! direction: hold admission at ≥95% few-minute load-per-core), so it now
 //! engages well before the breaker's higher, sustained-distress trip.
 //!
+//! # Load average alone never holds (Issue #11709)
+//!
+//! Load average counts runnable threads (and, on macOS, threads blocked on
+//! I/O), so a host busy with network-bound `gh`/`git` processes reads
+//! "saturated" while its CPUs idle — robb-pro held every admission at 1.66
+//! load/core, 0 sweeps in flight, 62% idle. [`decide`] therefore also requires
+//! the measured CPU-busy fraction
+//! ([`crate::cpu_headroom::cached_cpu_idle_fraction`]) to be over
+//! [`AdmissionBrakeConfig::cpu_busy_threshold`], and
+//! [`SharedAdmissionBrake::observe`] holds only after
+//! [`AdmissionBrakeConfig::sustain_ticks`] consecutive such readings.
+//!
 //! # Fail-safe
 //!
 //! A missing load reading (`None` from [`crate::cpu_headroom::read_loadavg_1m`],
-//! or a zero CPU count) means **no hold** — [`crate::cpu_headroom::is_host_saturated`]
+//! a zero CPU count, or no CPU-utilisation sample yet) means **no hold** — [`crate::cpu_headroom::is_host_saturated`]
 //! returns `None` on absent evidence and this module treats that as "not
 //! saturated", exactly the contract the build gate's load-aware deferral (#4259)
 //! follows. Absent evidence must never look like load.
@@ -128,6 +140,14 @@ pub const ADMISSION_BRAKE_ENABLE_ENV: &str = "LOOM_ADMISSION_BRAKE";
 /// falls through to config/default.
 pub const ADMISSION_BRAKE_LOAD_PER_CORE_ENV: &str = "LOOM_ADMISSION_BRAKE_LOAD_PER_CORE";
 
+/// Env var overriding [`DEFAULT_ADMISSION_BRAKE_CPU_BUSY_HOLD`] (Issue
+/// #11709). A value outside `(0, 1]`/invalid falls through to config/default.
+pub const ADMISSION_BRAKE_CPU_BUSY_ENV: &str = "LOOM_ADMISSION_BRAKE_CPU_BUSY";
+
+/// Env var overriding [`DEFAULT_ADMISSION_BRAKE_SUSTAIN_TICKS`] (Issue
+/// #11709). A `0`/invalid value falls through to config/default.
+pub const ADMISSION_BRAKE_SUSTAIN_TICKS_ENV: &str = "LOOM_ADMISSION_BRAKE_SUSTAIN_TICKS";
+
 /// Env var overriding [`DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS`]. A
 /// `<= 0`/invalid value falls through to config/default.
 pub const ADMISSION_BRAKE_STARVATION_WARN_SECS_ENV: &str =
@@ -173,6 +193,27 @@ pub const DEFAULT_ADMISSION_BRAKE_ENABLED: bool = true;
 /// mechanisms.
 pub const DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE: f64 = 0.95;
 
+/// Default measured CPU-busy fraction (`1 - idle`, `0.0..=1.0`) at/above which
+/// the brake may hold (Issue #11709). **Both** this and
+/// [`DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE`] must be over threshold — load
+/// average alone never holds.
+///
+/// Load average counts runnable threads, and on macOS threads blocked on I/O
+/// too, so a host full of short `gh`/`git` processes waiting on the network
+/// reads "saturated" while its CPUs are mostly idle. Observed 2026-10-13 on
+/// robb-pro (18 cores): load 1.66/core held every admission with **0** sweeps
+/// in flight and `top` at **62% idle**. The incident the brake was built for
+/// (#4903: loom-worker-1, load 95 on 8 cores) was at `0.07%` idle — 99.9%
+/// busy — so `0.90` still holds that case while releasing the I/O-wait one.
+pub const DEFAULT_ADMISSION_BRAKE_CPU_BUSY_HOLD: f64 = 0.90;
+
+/// Default number of **consecutive** over-threshold work-finder ticks before
+/// the brake holds (Issue #11709). A single noisy reading — a burst of role
+/// ticks, one `iostat` second that caught a link step — no longer holds the
+/// host; at the default 60s tick this is ~3 minutes of sustained saturation.
+/// Release is still immediate on the first tick back under either threshold.
+pub const DEFAULT_ADMISSION_BRAKE_SUSTAIN_TICKS: u32 = 3;
+
 /// Default: how long the brake may hold admission with **zero** sweeps in
 /// flight before it escalates its per-tick `deferred (host saturated)` INFO
 /// counter to a standalone `WARN`-level `STARVING` log line naming the
@@ -204,6 +245,12 @@ pub struct AdmissionBrakeConfig {
     pub enabled: bool,
     /// Load-per-core at/above which new admissions are held this tick.
     pub load_per_core_threshold: f64,
+    /// Measured CPU-busy fraction at/above which the brake may hold (Issue
+    /// #11709). See [`DEFAULT_ADMISSION_BRAKE_CPU_BUSY_HOLD`].
+    pub cpu_busy_threshold: f64,
+    /// Consecutive over-threshold ticks required before holding (Issue
+    /// #11709). See [`DEFAULT_ADMISSION_BRAKE_SUSTAIN_TICKS`].
+    pub sustain_ticks: u32,
     /// Seconds of continuous "held, 0 sweeps in flight" before the starvation
     /// `WARN` log fires once (Issue #5715). See
     /// [`DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS`].
@@ -219,6 +266,8 @@ impl Default for AdmissionBrakeConfig {
         Self {
             enabled: DEFAULT_ADMISSION_BRAKE_ENABLED,
             load_per_core_threshold: DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE,
+            cpu_busy_threshold: DEFAULT_ADMISSION_BRAKE_CPU_BUSY_HOLD,
+            sustain_ticks: DEFAULT_ADMISSION_BRAKE_SUSTAIN_TICKS,
             starvation_warn_secs: DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS,
             starvation_escape_secs: DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS,
         }
@@ -232,6 +281,10 @@ impl Default for AdmissionBrakeConfig {
 pub struct AdmissionBrakeConfigFile {
     pub enabled: Option<bool>,
     pub load_per_core_threshold: Option<f64>,
+    /// `cpuBusyHold` (Issue #11709).
+    pub cpu_busy_threshold: Option<f64>,
+    /// `sustainTicks` (Issue #11709).
+    pub sustain_ticks: Option<u32>,
     /// `starvationWarnSecs` (Issue #5715).
     pub starvation_warn_secs: Option<i64>,
     /// `starvationEscapeSecs` (Issue #5715).
@@ -262,6 +315,15 @@ pub fn read_admission_brake_config(repo_root: &std::path::Path) -> AdmissionBrak
             .and_then(|b| b.get("loadPerCoreHold"))
             .and_then(serde_json::Value::as_f64)
             .filter(|&f| f > 0.0),
+        cpu_busy_threshold: brake
+            .and_then(|b| b.get("cpuBusyHold"))
+            .and_then(serde_json::Value::as_f64)
+            .filter(|&f| f > 0.0 && f <= 1.0),
+        sustain_ticks: brake
+            .and_then(|b| b.get("sustainTicks"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&n| n > 0)
+            .and_then(|n| u32::try_from(n).ok()),
         starvation_warn_secs: brake
             .and_then(|b| b.get("starvationWarnSecs"))
             .and_then(serde_json::Value::as_i64)
@@ -291,6 +353,20 @@ fn env_load_per_core() -> Option<f64> {
         .filter(|&f| f > 0.0)
 }
 
+fn env_cpu_busy() -> Option<f64> {
+    std::env::var(ADMISSION_BRAKE_CPU_BUSY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|&f| f > 0.0 && f <= 1.0)
+}
+
+fn env_sustain_ticks() -> Option<u32> {
+    std::env::var(ADMISSION_BRAKE_SUSTAIN_TICKS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+}
+
 fn env_starvation_warn_secs() -> Option<i64> {
     std::env::var(ADMISSION_BRAKE_STARVATION_WARN_SECS_ENV)
         .ok()
@@ -316,6 +392,12 @@ pub fn resolve_config(file: &AdmissionBrakeConfigFile) -> AdmissionBrakeConfig {
         load_per_core_threshold: env_load_per_core()
             .or(file.load_per_core_threshold)
             .unwrap_or(DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE),
+        cpu_busy_threshold: env_cpu_busy()
+            .or(file.cpu_busy_threshold)
+            .unwrap_or(DEFAULT_ADMISSION_BRAKE_CPU_BUSY_HOLD),
+        sustain_ticks: env_sustain_ticks()
+            .or(file.sustain_ticks)
+            .unwrap_or(DEFAULT_ADMISSION_BRAKE_SUSTAIN_TICKS),
         starvation_warn_secs: env_starvation_warn_secs()
             .or(file.starvation_warn_secs)
             .unwrap_or(DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS),
@@ -345,6 +427,9 @@ pub struct BrakeDecision {
     pub held: bool,
     /// The observed load-per-core, or `None` when no load source was available.
     pub load_per_core: Option<f64>,
+    /// The measured CPU-busy fraction (`1 - idle`), or `None` when no
+    /// utilisation sample was available (Issue #11709).
+    pub cpu_busy: Option<f64>,
     /// The threshold the decision was taken against (echoed for the log/status
     /// line so an operator never has to guess which knob was in force).
     pub threshold: f64,
@@ -358,31 +443,49 @@ pub struct BrakeDecision {
     pub starvation_escape: bool,
 }
 
-/// The pure decision function: is this host too saturated to admit new work?
+/// The pure decision function: is this host too saturated to admit new work
+/// **on this one reading**? ([`SharedAdmissionBrake::observe`] then requires
+/// [`AdmissionBrakeConfig::sustain_ticks`] consecutive such readings before it
+/// actually holds — Issue #11709.)
 ///
-/// Delegates the ratio and the comparison to
-/// [`crate::cpu_headroom::is_host_saturated`] so the brake, the build gate's
-/// load-aware deferral (#4259), and the host breaker (#4235) all agree on one
-/// definition of load-per-core.
+/// Over threshold means **both**:
+/// - load-per-core ≥ [`AdmissionBrakeConfig::load_per_core_threshold`]
+///   (via [`crate::cpu_headroom::is_host_saturated`], the definition the build
+///   gate (#4259) and host breaker (#4235) share), **and**
+/// - measured CPU busy (`1 - cpu_idle_fraction`, from
+///   [`crate::cpu_headroom::cached_cpu_idle_fraction`]) ≥
+///   [`AdmissionBrakeConfig::cpu_busy_threshold`] (Issue #11709).
+///
+/// Load average alone never holds: it counts threads blocked on I/O (macOS)
+/// and short-lived network-bound processes, so it reads "saturated" on hosts
+/// whose CPUs are mostly idle.
 ///
 /// Fail-safe in two directions:
-/// - `enabled: false` ⇒ never held (the reading is still reported, so the status
-///   surface stays honest about *why* nothing is being held).
-/// - Missing load / zero CPUs ⇒ `is_host_saturated` yields `None` ⇒ not held.
+/// - `enabled: false` ⇒ never held (the readings are still reported, so the
+///   status surface stays honest about *why* nothing is being held).
+/// - Missing load / zero CPUs / missing utilisation sample ⇒ not held.
 ///   Absent evidence is never treated as load.
 #[must_use]
 pub fn decide(
     config: &AdmissionBrakeConfig,
     loadavg_1m: Option<f64>,
     ncpu: usize,
+    cpu_idle_fraction: Option<f64>,
 ) -> BrakeDecision {
     let load_per_core = crate::cpu_headroom::load_per_core_from(loadavg_1m, ncpu);
-    let held = config.enabled
-        && crate::cpu_headroom::is_host_saturated(loadavg_1m, ncpu, config.load_per_core_threshold)
+    let cpu_busy = cpu_idle_fraction
+        .filter(|f| (0.0..=1.0).contains(f))
+        .map(|idle| 1.0 - idle);
+    let load_over =
+        crate::cpu_headroom::is_host_saturated(loadavg_1m, ncpu, config.load_per_core_threshold)
             .unwrap_or(false);
+    // A tiny epsilon so `1.0 - 0.1` (0.8999…) still counts as "at" a 0.90 bar.
+    let cpu_over = cpu_busy.is_some_and(|b| b + 1e-9 >= config.cpu_busy_threshold);
+    let held = config.enabled && load_over && cpu_over;
     BrakeDecision {
         held,
         load_per_core,
+        cpu_busy,
         threshold: config.load_per_core_threshold,
         starvation_escape: false,
     }
@@ -404,6 +507,11 @@ pub struct BrakeRuntime {
     pub held_ticks: u32,
     /// The most recent load-per-core sample observed.
     pub last_load_per_core: Option<f64>,
+    /// Consecutive ticks [`decide`] has read over threshold (Issue #11709).
+    /// The brake holds only once this reaches
+    /// [`AdmissionBrakeConfig::sustain_ticks`]; any tick under threshold
+    /// resets it to `0`.
+    pub over_ticks: u32,
     /// When the current **starvation** streak began — the brake has held
     /// admission AND zero sweeps have been in flight, continuously, since
     /// this timestamp. `None` whenever that is not true this tick (Issue
@@ -540,7 +648,7 @@ impl BrakeSnapshot {
 /// the pure [`decide`].
 #[derive(Debug)]
 pub struct SharedAdmissionBrake {
-    config: AdmissionBrakeConfig,
+    config: Mutex<AdmissionBrakeConfig>,
     inner: Mutex<BrakeRuntime>,
 }
 
@@ -551,14 +659,17 @@ impl SharedAdmissionBrake {
     #[must_use]
     pub fn new(config: AdmissionBrakeConfig) -> Self {
         Self {
-            config,
+            config: Mutex::new(config),
             inner: Mutex::new(BrakeRuntime::default()),
         }
     }
 
     #[must_use]
     pub fn config(&self) -> AdmissionBrakeConfig {
-        self.config
+        *self
+            .config
+            .lock()
+            .expect("admission brake config mutex poisoned")
     }
 
     /// Fold one load reading into the brake, returning the decision plus any
@@ -588,20 +699,47 @@ impl SharedAdmissionBrake {
     /// Curators mid-tick, and the brake has no authority to hold those back.
     /// Diagnosing the incident behind #6102 required `pgrep` precisely because
     /// this number never appeared in the brake's own messages.
+    ///
+    /// `cpu_idle_fraction` (Issue #11709) is the measured idle fraction
+    /// ([`crate::cpu_headroom::cached_cpu_idle_fraction`]); `None` means no
+    /// sample, which never holds. A reading over both thresholds only holds
+    /// once it has persisted for [`AdmissionBrakeConfig::sustain_ticks`]
+    /// consecutive observations.
     pub fn observe(
         &self,
         loadavg_1m: Option<f64>,
         ncpu: usize,
+        cpu_idle_fraction: Option<f64>,
         now: DateTime<Utc>,
         in_flight_sweeps: usize,
         active_role_agents: usize,
     ) -> (BrakeDecision, Option<Transition>) {
-        let raw = decide(&self.config, loadavg_1m, ncpu);
+        let cfg = self.config();
+        let mut raw = decide(&cfg, loadavg_1m, ncpu, cpu_idle_fraction);
         let mut guard = self.inner.lock().expect("admission brake mutex poisoned");
         let was_held = guard.held;
-        let load_str = raw
-            .load_per_core
-            .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
+        // ---- sustain gate (#11709): one noisy reading never holds ---------
+        if raw.held {
+            guard.over_ticks = guard.over_ticks.saturating_add(1);
+            if guard.over_ticks < cfg.sustain_ticks.max(1) {
+                raw.held = false;
+            }
+        } else {
+            guard.over_ticks = 0;
+        }
+        let load_str = format!(
+            "{}/core, cpu {} busy",
+            raw.load_per_core
+                .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}")),
+            raw.cpu_busy
+                .map_or_else(|| "n/a".to_string(), |b| format!("{:.0}%", b * 100.0)),
+        );
+        let bar = format!(
+            "holds at ≥ {:.2}/core AND ≥ {:.0}% CPU busy for {} tick(s)",
+            cfg.load_per_core_threshold,
+            cfg.cpu_busy_threshold * 100.0,
+            cfg.sustain_ticks.max(1)
+        );
 
         // ---- starvation bookkeeping (#5715) --------------------------
         // Held + zero in flight, continuously, is never healthy backpressure
@@ -629,7 +767,7 @@ impl SharedAdmissionBrake {
         let mut decision = raw;
         let mut starvation_transition = None;
         if let Some(secs) = starving_elapsed_secs {
-            if secs >= self.config.starvation_escape_secs {
+            if secs >= cfg.starvation_escape_secs {
                 // Escape hatch: yield this one tick regardless of load, so a
                 // brake that cannot itself reduce the load it is reacting to
                 // cannot starve sweep admission forever.
@@ -640,11 +778,10 @@ impl SharedAdmissionBrake {
                     kind: TransitionKind::StarvationEscape,
                     reason: format!(
                         "STARVATION ESCAPE HATCH — held admission for {} with 0 sweeps in \
-                         flight (load {load_str}/core ≥ {:.2}); admitting new work this tick \
+                         flight (load {load_str}; {bar}); admitting new work this tick \
                          despite saturation, because no sweep is running for the brake to drain \
                          (Issue #5715){role_clause}",
                         format_hms(secs),
-                        self.config.load_per_core_threshold
                     ),
                 });
                 // Reset the streak: the next escape needs its own full grace
@@ -653,7 +790,7 @@ impl SharedAdmissionBrake {
                 guard.starving_since = None;
                 guard.starving_ticks = 0;
                 guard.starvation_phase = StarvationPhase::None;
-            } else if secs >= self.config.starvation_warn_secs
+            } else if secs >= cfg.starvation_warn_secs
                 && guard.starvation_phase == StarvationPhase::None
             {
                 guard.starvation_phase = StarvationPhase::Warned;
@@ -661,12 +798,11 @@ impl SharedAdmissionBrake {
                     kind: TransitionKind::Starving,
                     reason: format!(
                         "STARVING — held admission for {} with 0 sweeps in flight (load \
-                         {load_str}/core ≥ {:.2}); this is not healthy backpressure — no sweep \
+                         {load_str}; {bar}); this is not healthy backpressure — no sweep \
                          is running for the brake to drain — the escape hatch admits one sweep \
                          anyway after {} (Issue #5715){role_clause}",
                         format_hms(secs),
-                        self.config.load_per_core_threshold,
-                        format_hms(self.config.starvation_escape_secs)
+                        format_hms(cfg.starvation_escape_secs)
                     ),
                 });
             }
@@ -685,9 +821,9 @@ impl SharedAdmissionBrake {
                 Some(Transition {
                     kind: TransitionKind::Engaged,
                     reason: format!(
-                        "host saturated (load {load_str}/core ≥ {:.2}) — holding NEW sweep \
-                         admissions; in-flight sweeps are untouched and will drain",
-                        decision.threshold
+                        "host saturated (load {load_str}; {bar}) — holding NEW sweep \
+                         admissions with {in_flight_sweeps} sweep(s) in flight; in-flight sweeps \
+                         are untouched and will drain"
                     ),
                 })
             }
@@ -703,9 +839,8 @@ impl SharedAdmissionBrake {
                 Some(Transition {
                     kind: TransitionKind::Released,
                     reason: format!(
-                        "host recovered (load {load_str}/core < {:.2} after {ticks} held tick(s)) \
-                         — resuming admissions",
-                        decision.threshold
+                        "host recovered (load {load_str}; {bar}; released after {ticks} held \
+                         tick(s)) — resuming admissions"
                     ),
                 })
             } else {
@@ -720,7 +855,8 @@ impl SharedAdmissionBrake {
     /// Whether the brake is currently holding new admissions.
     #[must_use]
     pub fn is_holding(&self) -> bool {
-        if !self.config.enabled {
+        let cfg = self.config();
+        if !cfg.enabled {
             return false;
         }
         self.inner
@@ -732,70 +868,27 @@ impl SharedAdmissionBrake {
     /// A snapshot for the status surface.
     #[must_use]
     pub fn snapshot(&self) -> BrakeSnapshot {
+        let cfg = self.config();
         let guard = self.inner.lock().expect("admission brake mutex poisoned");
         BrakeSnapshot {
-            enabled: self.config.enabled,
-            held: self.config.enabled && guard.held,
+            enabled: cfg.enabled,
+            held: cfg.enabled && guard.held,
             load_per_core: guard.last_load_per_core,
-            load_per_core_threshold: self.config.load_per_core_threshold,
+            load_per_core_threshold: cfg.load_per_core_threshold,
             held_since: guard.held_since,
             held_ticks: guard.held_ticks,
             starving_since: guard.starving_since,
             starving_ticks: guard.starving_ticks,
             escape_hatch_grants: guard.escape_hatch_grants,
-            starvation_warn_secs: self.config.starvation_warn_secs,
-            starvation_escape_secs: self.config.starvation_escape_secs,
+            starvation_warn_secs: cfg.starvation_warn_secs,
+            starvation_escape_secs: cfg.starvation_escape_secs,
         }
     }
 }
 
-/// Render a duration in seconds as a compact `HhMMmSSs`-ish human string —
-/// e.g. `65` → `1m05s`, `3725` → `1h02m`, `42` → `42s` (Issue #5715). Used
-/// only in starvation log lines, where naming the elapsed hold duration is
-/// the whole point (a bare tick/second count reads as noise next to a
-/// multi-hour outage).
-fn format_hms(total_secs: i64) -> String {
-    let total_secs = total_secs.max(0);
-    let h = total_secs / 3600;
-    let m = (total_secs % 3600) / 60;
-    let s = total_secs % 60;
-    if h > 0 {
-        format!("{h}h{m:02}m")
-    } else if m > 0 {
-        format!("{m}m{s:02}s")
-    } else {
-        format!("{s}s")
-    }
-}
-
-/// The role-agent attribution clause appended to the starvation messages
-/// (Issue #6102). Empty when no role agent is in flight — the pre-#6102
-/// wording is then already accurate.
-///
-/// # Why the messages needed this
-///
-/// The brake's guarantee is narrower than its own text implied. It samples
-/// **host-wide** load, so a role agent's CPU absolutely pushes it over the hold
-/// threshold — but the only thing it can withhold is a NEW *sweep* admission.
-/// It has no authority over role-runner agents (they are admitted by
-/// [`crate::role_runner`]'s own loops, bounded since #6102 by
-/// `autonomous.roleRunner.maxConcurrent`, never by this brake or by
-/// `autonomous.workFinder.maxConcurrent`), and it can shed nothing already
-/// running. So "held, 0 sweeps in flight" does **not** imply an idle host, and
-/// saying "nothing is running to relieve it" was wrong in exactly the case that
-/// matters: a host loaded entirely by role ticks.
-#[must_use]
-fn role_agent_clause(active_role_agents: usize) -> String {
-    if active_role_agents == 0 {
-        return String::new();
-    }
-    format!(
-        " — NOTE: {active_role_agents} role-runner agent(s) ARE running; the brake cannot hold \
-         those back (they are admitted outside it — bound them with \
-         autonomous.roleRunner.maxConcurrent) and cannot shed load already in flight, so this \
-         load may be role-driven rather than idle (#6102)"
-    )
-}
+// Starvation-message helpers (moved out under the file-size ratchet, #12090).
+mod messages;
+use messages::{format_hms, role_agent_clause};
 
 /// Process-global brake handle. The daemon registers one at startup (alongside
 /// the host breaker) so [`crate::ipc::build_daemon_status`] can read it without
@@ -863,8 +956,19 @@ pub fn global_observe(
     let Some(brake) = GLOBAL.get() else {
         return false;
     };
-    let (decision, transition) =
-        brake.observe(loadavg_1m, ncpu, now, in_flight_sweeps, active_role_agents);
+    // #11709: the measured utilisation comes from the memoized idle sample the
+    // work-finder loop (and the status/telemetry paths) already refresh every
+    // tick — a pure cache read, never a blocking probe here. An unwarmed cache
+    // (`None`) never holds.
+    let cpu_idle_fraction = crate::cpu_headroom::cached_cpu_idle_fraction();
+    let (decision, transition) = brake.observe(
+        loadavg_1m,
+        ncpu,
+        cpu_idle_fraction,
+        now,
+        in_flight_sweeps,
+        active_role_agents,
+    );
     if let Some(t) = transition {
         match t.kind {
             TransitionKind::Engaged => {
@@ -903,6 +1007,10 @@ pub fn global_snapshot() -> Option<BrakeSnapshot> {
     GLOBAL.get().map(|b| b.snapshot())
 }
 
+// #12090: hot-reload of the thresholds (`set_config`, `global_reload`).
+mod live_reload;
+pub use live_reload::{global_reload, reload};
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
@@ -912,6 +1020,9 @@ mod tests {
         AdmissionBrakeConfig {
             enabled,
             load_per_core_threshold: threshold,
+            cpu_busy_threshold: DEFAULT_ADMISSION_BRAKE_CPU_BUSY_HOLD,
+            // Pre-#11709 tests exercise point-in-time hold/release edges.
+            sustain_ticks: 1,
             starvation_warn_secs: DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS,
             starvation_escape_secs: DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS,
         }
@@ -928,6 +1039,9 @@ mod tests {
         AdmissionBrakeConfig {
             enabled,
             load_per_core_threshold: threshold,
+            cpu_busy_threshold: DEFAULT_ADMISSION_BRAKE_CPU_BUSY_HOLD,
+            // Pre-#11709 tests exercise point-in-time hold/release edges.
+            sustain_ticks: 1,
             starvation_warn_secs,
             starvation_escape_secs,
         }
@@ -944,7 +1058,7 @@ mod tests {
     #[test]
     fn saturated_host_holds_new_admissions() {
         // The reported incident: load 95 on 8 cores = 11.9/core, far over 4.0.
-        let d = decide(&cfg(true, 4.0), Some(95.29), 8);
+        let d = decide(&cfg(true, 4.0), Some(95.29), 8, Some(0.0));
         assert!(d.held);
         assert!((d.load_per_core.unwrap() - 11.911_25).abs() < 1e-6);
         assert_eq!(d.threshold, 4.0);
@@ -953,33 +1067,33 @@ mod tests {
     #[test]
     fn threshold_is_inclusive_at_the_boundary() {
         // Exactly at the threshold holds (`is_host_saturated` uses `>=`).
-        assert!(decide(&cfg(true, 4.0), Some(32.0), 8).held);
+        assert!(decide(&cfg(true, 4.0), Some(32.0), 8, Some(0.0)).held);
         // A hair under does not.
-        assert!(!decide(&cfg(true, 4.0), Some(31.9), 8).held);
+        assert!(!decide(&cfg(true, 4.0), Some(31.9), 8, Some(0.0)).held);
     }
 
     #[test]
     fn healthy_host_never_holds() {
         // A busy-but-fine 8-core host: load 6 = 0.75/core.
-        assert!(!decide(&cfg(true, 4.0), Some(6.0), 8).held);
+        assert!(!decide(&cfg(true, 4.0), Some(6.0), 8, Some(0.0)).held);
         // Even a heavy burst well above 1.0/core stays under the generous bar.
-        assert!(!decide(&cfg(true, 4.0), Some(24.0), 8).held);
+        assert!(!decide(&cfg(true, 4.0), Some(24.0), 8, Some(0.0)).held);
         // An idle host, obviously.
-        assert!(!decide(&cfg(true, 4.0), Some(0.05), 8).held);
+        assert!(!decide(&cfg(true, 4.0), Some(0.05), 8, Some(0.0)).held);
     }
 
     #[test]
     fn missing_load_fails_safe_to_no_hold() {
-        let d = decide(&cfg(true, 4.0), None, 8);
+        let d = decide(&cfg(true, 4.0), None, 8, Some(0.0));
         assert!(!d.held, "absent evidence must never read as load");
         assert_eq!(d.load_per_core, None);
         // A zero CPU count is the other missing-data shape.
-        assert!(!decide(&cfg(true, 4.0), Some(95.0), 0).held);
+        assert!(!decide(&cfg(true, 4.0), Some(95.0), 0, Some(0.0)).held);
     }
 
     #[test]
     fn disabled_brake_never_holds_but_still_reports_the_reading() {
-        let d = decide(&cfg(false, 4.0), Some(95.29), 8);
+        let d = decide(&cfg(false, 4.0), Some(95.29), 8, Some(0.0));
         assert!(!d.held);
         assert!(d.load_per_core.is_some(), "status must stay honest when disabled");
     }
@@ -993,13 +1107,13 @@ mod tests {
         assert_eq!(default_cfg.load_per_core_threshold, 0.95);
 
         // 8 cores at load 7.6 = 0.95/core exactly at the boundary -> held.
-        assert!(decide(&default_cfg, Some(7.6), 8).held);
+        assert!(decide(&default_cfg, Some(7.6), 8, Some(0.0)).held);
         // A hair under 95% -> not held.
-        assert!(!decide(&default_cfg, Some(7.59), 8).held);
+        assert!(!decide(&default_cfg, Some(7.59), 8, Some(0.0)).held);
         // A comfortably busy host well under the gate -> not held.
-        assert!(!decide(&default_cfg, Some(4.0), 8).held);
+        assert!(!decide(&default_cfg, Some(4.0), 8, Some(0.0)).held);
         // Fully idle -> not held.
-        assert!(!decide(&default_cfg, Some(0.0), 8).held);
+        assert!(!decide(&default_cfg, Some(0.0), 8, Some(0.0)).held);
     }
 
     #[test]
@@ -1034,20 +1148,22 @@ mod tests {
         let now = t0();
 
         // Tick 1: saturated → engage edge.
-        let (d, tr) = brake.observe(Some(95.0), 8, now, 1, 0);
+        let (d, tr) = brake.observe(Some(95.0), 8, Some(0.0), now, 1, 0);
         assert!(d.held);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Engaged));
         assert!(brake.is_holding());
 
         // Tick 2: still saturated → no repeated edge (no per-tick log spam).
-        let (d, tr) = brake.observe(Some(90.0), 8, now + chrono::Duration::seconds(60), 1, 0);
+        let (d, tr) =
+            brake.observe(Some(90.0), 8, Some(0.0), now + chrono::Duration::seconds(60), 1, 0);
         assert!(d.held);
         assert!(tr.is_none());
         assert_eq!(brake.snapshot().held_ticks, 2);
         assert_eq!(brake.snapshot().held_since, Some(now));
 
         // Tick 3: recovered → release edge, streak state cleared.
-        let (d, tr) = brake.observe(Some(4.0), 8, now + chrono::Duration::seconds(120), 1, 0);
+        let (d, tr) =
+            brake.observe(Some(4.0), 8, Some(0.0), now + chrono::Duration::seconds(120), 1, 0);
         assert!(!d.held);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Released));
         assert!(!brake.is_holding());
@@ -1056,7 +1172,8 @@ mod tests {
         assert_eq!(snap.held_since, None);
 
         // Tick 4: still healthy → no edge.
-        let (_, tr) = brake.observe(Some(3.0), 8, now + chrono::Duration::seconds(180), 1, 0);
+        let (_, tr) =
+            brake.observe(Some(3.0), 8, Some(0.0), now + chrono::Duration::seconds(180), 1, 0);
         assert!(tr.is_none());
     }
 
@@ -1065,16 +1182,16 @@ mod tests {
         // The brake is point-in-time by design: it re-checks every tick and does
         // NOT hold through a cool-down (that is the host breaker's job).
         let brake = SharedAdmissionBrake::new(cfg(true, 4.0));
-        brake.observe(Some(95.0), 8, t0(), 1, 0);
+        brake.observe(Some(95.0), 8, Some(0.0), t0(), 1, 0);
         assert!(brake.is_holding());
-        brake.observe(Some(1.0), 8, t0() + chrono::Duration::seconds(60), 1, 0);
+        brake.observe(Some(1.0), 8, Some(0.0), t0() + chrono::Duration::seconds(60), 1, 0);
         assert!(!brake.is_holding());
     }
 
     #[test]
     fn disabled_handle_never_holds_and_snapshot_says_so() {
         let brake = SharedAdmissionBrake::new(cfg(false, 4.0));
-        let (d, tr) = brake.observe(Some(95.0), 8, t0(), 1, 0);
+        let (d, tr) = brake.observe(Some(95.0), 8, Some(0.0), t0(), 1, 0);
         assert!(!d.held);
         assert!(tr.is_none());
         assert!(!brake.is_holding());
@@ -1087,7 +1204,7 @@ mod tests {
     #[test]
     fn snapshot_maps_onto_the_wire_status_type() {
         let brake = SharedAdmissionBrake::new(cfg(true, 4.0));
-        brake.observe(Some(95.0), 8, t0(), 1, 0);
+        brake.observe(Some(95.0), 8, Some(0.0), t0(), 1, 0);
         let status = brake.snapshot().into_status();
         assert!(status.enabled);
         assert!(status.held);
@@ -1105,8 +1222,14 @@ mod tests {
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 4.0, 60, 120));
         let now = t0();
         for i in 0..10 {
-            let (d, tr) =
-                brake.observe(Some(95.0), 8, now + chrono::Duration::seconds(i * 60), 3, 0);
+            let (d, tr) = brake.observe(
+                Some(95.0),
+                8,
+                Some(0.0),
+                now + chrono::Duration::seconds(i * 60),
+                3,
+                0,
+            );
             assert!(d.held, "tick {i}: still held (host is genuinely saturated)");
             assert!(!d.starvation_escape, "tick {i}: never an escape — sweeps are in flight");
             assert!(
@@ -1132,18 +1255,20 @@ mod tests {
         let now = t0();
 
         // Tick 1: engages, under the warn window — plain Engaged edge.
-        let (d, tr) = brake.observe(Some(20.0), 8, now, 0, 0);
+        let (d, tr) = brake.observe(Some(20.0), 8, Some(0.0), now, 0, 0);
         assert!(d.held);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Engaged));
 
         // Tick 2 (t+301s): past the warn window, still under escape — Starving.
-        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(301), 0, 0);
+        let (d, tr) =
+            brake.observe(Some(20.0), 8, Some(0.0), now + chrono::Duration::seconds(301), 0, 0);
         assert!(d.held, "still held — the warn is an escalation, not a release");
         assert!(!d.starvation_escape);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Starving));
 
         // Tick 3 (t+400s): still past warn, under escape — no repeat WARN.
-        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(400), 0, 0);
+        let (d, tr) =
+            brake.observe(Some(20.0), 8, Some(0.0), now + chrono::Duration::seconds(400), 0, 0);
         assert!(d.held);
         assert!(tr.is_none(), "the WARN line must fire once per streak, not every tick");
 
@@ -1161,11 +1286,12 @@ mod tests {
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 300, 900));
         let now = t0();
 
-        brake.observe(Some(20.0), 8, now, 0, 0); // engage
-        brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(301), 0, 0); // warn
+        brake.observe(Some(20.0), 8, Some(0.0), now, 0, 0); // engage
+        brake.observe(Some(20.0), 8, Some(0.0), now + chrono::Duration::seconds(301), 0, 0); // warn
 
         // t+901s: past the escape window — the brake yields this one tick.
-        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(901), 0, 0);
+        let (d, tr) =
+            brake.observe(Some(20.0), 8, Some(0.0), now + chrono::Duration::seconds(901), 0, 0);
         assert!(!d.held, "escape hatch must admit this tick");
         assert!(d.starvation_escape, "flagged as an escape, not a real recovery");
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::StarvationEscape));
@@ -1177,7 +1303,8 @@ mod tests {
         // have started yet (an escape does not itself change load), so the
         // brake re-engages immediately — but the starvation clock restarts
         // from zero, it does not escape again immediately.
-        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(961), 0, 0);
+        let (d, tr) =
+            brake.observe(Some(20.0), 8, Some(0.0), now + chrono::Duration::seconds(961), 0, 0);
         assert!(d.held, "re-engages once load is sampled saturated again");
         assert!(!d.starvation_escape);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Engaged));
@@ -1188,14 +1315,14 @@ mod tests {
         // Disabled brake: `decide` never holds, so starvation bookkeeping
         // never engages regardless of in-flight count or elapsed time.
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(false, 0.95, 1, 1));
-        let (d, tr) = brake.observe(Some(95.0), 8, t0(), 0, 0);
+        let (d, tr) = brake.observe(Some(95.0), 8, Some(0.0), t0(), 0, 0);
         assert!(!d.held);
         assert!(!d.starvation_escape);
         assert!(tr.is_none());
 
         // Healthy host: never holds, so never starves either.
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 1, 1));
-        let (d, tr) = brake.observe(Some(0.1), 8, t0(), 0, 0);
+        let (d, tr) = brake.observe(Some(0.1), 8, Some(0.0), t0(), 0, 0);
         assert!(!d.held);
         assert!(!d.starvation_escape);
         assert!(tr.is_none());
@@ -1222,7 +1349,7 @@ mod tests {
         for (i, load) in loads.iter().enumerate() {
             // Ticks every 90s, matching a plausible work-finder interval.
             let now = now + chrono::Duration::seconds(i as i64 * 90);
-            let (d, _tr) = brake.observe(Some(*load * 28.0), 28, now, 0, 0);
+            let (d, _tr) = brake.observe(Some(*load * 28.0), 28, Some(0.0), now, 0, 0);
             if d.starvation_escape {
                 escaped = true;
                 break;
@@ -1247,8 +1374,9 @@ mod tests {
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 300, 900));
         let now = t0();
         // Engage, then cross the warn threshold with 0 sweeps and 3 role agents.
-        brake.observe(Some(28.0), 8, now, 0, 3);
-        let (_, tr) = brake.observe(Some(28.0), 8, now + chrono::Duration::seconds(301), 0, 3);
+        brake.observe(Some(28.0), 8, Some(0.0), now, 0, 3);
+        let (_, tr) =
+            brake.observe(Some(28.0), 8, Some(0.0), now + chrono::Duration::seconds(301), 0, 3);
         let warn = tr.expect("starvation warn transition");
         assert_eq!(warn.kind, TransitionKind::Starving);
         assert!(
@@ -1268,7 +1396,8 @@ mod tests {
         );
 
         // The escape-hatch message carries the same attribution.
-        let (d, tr) = brake.observe(Some(28.0), 8, now + chrono::Duration::seconds(901), 0, 3);
+        let (d, tr) =
+            brake.observe(Some(28.0), 8, Some(0.0), now + chrono::Duration::seconds(901), 0, 3);
         let escape = tr.expect("starvation escape transition");
         assert!(d.starvation_escape);
         assert!(
@@ -1285,8 +1414,9 @@ mod tests {
     fn starvation_messages_omit_the_clause_when_no_role_agents() {
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 300, 900));
         let now = t0();
-        brake.observe(Some(28.0), 8, now, 0, 0);
-        let (_, tr) = brake.observe(Some(28.0), 8, now + chrono::Duration::seconds(301), 0, 0);
+        brake.observe(Some(28.0), 8, Some(0.0), now, 0, 0);
+        let (_, tr) =
+            brake.observe(Some(28.0), 8, Some(0.0), now + chrono::Duration::seconds(301), 0, 0);
         let warn = tr.expect("starvation warn transition");
         assert!(
             !warn.reason.contains("role-runner agent"),
@@ -1308,8 +1438,8 @@ mod tests {
 
         for (i, offset) in [0_i64, 301, 901, 961].iter().enumerate() {
             let at = now + chrono::Duration::seconds(*offset);
-            let (a, ta) = with_roles.observe(Some(28.0), 8, at, 0, 5);
-            let (b, tb) = without_roles.observe(Some(28.0), 8, at, 0, 0);
+            let (a, ta) = with_roles.observe(Some(28.0), 8, Some(0.0), at, 0, 5);
+            let (b, tb) = without_roles.observe(Some(28.0), 8, Some(0.0), at, 0, 0);
             assert_eq!(a.held, b.held, "held differs at step {i}");
             assert_eq!(a.starvation_escape, b.starvation_escape, "escape differs at step {i}");
             assert_eq!(
@@ -1416,5 +1546,125 @@ mod tests {
         let resolved = resolve_config(&file);
         assert_eq!(resolved.starvation_warn_secs, DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS);
         assert_eq!(resolved.starvation_escape_secs, DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS);
+    }
+
+    // ---- utilisation + sustain gate (#11709) -------------------------------
+
+    /// The robb-pro incident, 2026-10-13: 18 cores, load 1.66/core, `top` at
+    /// 62% idle, 0 sweeps in flight. Load average alone read "saturated"; the
+    /// CPUs were not. The default brake must NOT hold, however many ticks the
+    /// reading persists.
+    #[test]
+    fn high_loadavg_low_cpu_never_holds() {
+        let cfg = AdmissionBrakeConfig::default();
+        let d = decide(&cfg, Some(1.66 * 18.0), 18, Some(0.62));
+        assert!(!d.held, "loadavg over threshold with 62% idle must not hold");
+        assert!((d.cpu_busy.unwrap() - 0.38).abs() < 1e-9);
+
+        let brake = SharedAdmissionBrake::new(cfg);
+        let now = t0();
+        for i in 0..20 {
+            let (d, tr) = brake.observe(
+                Some(1.66 * 18.0),
+                18,
+                Some(0.62),
+                now + chrono::Duration::seconds(i * 60),
+                0,
+                0,
+            );
+            assert!(!d.held, "tick {i}: held on loadavg alone");
+            assert!(tr.is_none(), "tick {i}: no edge expected, got {tr:?}");
+        }
+        assert!(!brake.is_holding());
+    }
+
+    #[test]
+    fn missing_cpu_sample_never_holds_on_loadavg_alone() {
+        let d = decide(&AdmissionBrakeConfig::default(), Some(95.0), 8, None);
+        assert!(!d.held, "an unwarmed utilisation cache is absent evidence");
+        assert_eq!(d.cpu_busy, None);
+        // Out-of-range idle readings are treated as absent too.
+        assert!(!decide(&AdmissionBrakeConfig::default(), Some(95.0), 8, Some(1.5)).held);
+    }
+
+    #[test]
+    fn cpu_busy_threshold_is_inclusive_and_needs_load_too() {
+        let cfg = AdmissionBrakeConfig::default(); // 0.95/core, 90% busy
+        assert!(decide(&cfg, Some(16.0), 8, Some(0.10)).held, "exactly 90% busy holds");
+        assert!(!decide(&cfg, Some(16.0), 8, Some(0.11)).held, "89% busy does not");
+        // CPU pegged but load under the per-core bar: still no hold.
+        assert!(!decide(&cfg, Some(4.0), 8, Some(0.0)).held);
+    }
+
+    /// The #4903 incident (loom-worker-1, load 95 on 8 cores, 0.07% idle) is
+    /// still caught by the default config — after the sustain window.
+    #[test]
+    fn genuine_saturation_holds_after_sustain_ticks_and_releases_immediately() {
+        let cfg = AdmissionBrakeConfig::default();
+        assert_eq!(cfg.sustain_ticks, DEFAULT_ADMISSION_BRAKE_SUSTAIN_TICKS);
+        assert_eq!(cfg.sustain_ticks, 3);
+        let brake = SharedAdmissionBrake::new(cfg);
+        let now = t0();
+        let at = |i: i64| now + chrono::Duration::seconds(i * 60);
+
+        let (d, tr) = brake.observe(Some(95.0), 8, Some(0.0007), at(0), 3, 0);
+        assert!(!d.held && tr.is_none(), "tick 1 of 3: one reading never holds");
+        let (d, tr) = brake.observe(Some(95.0), 8, Some(0.0007), at(1), 3, 0);
+        assert!(!d.held && tr.is_none(), "tick 2 of 3");
+        let (d, tr) = brake.observe(Some(95.0), 8, Some(0.0007), at(2), 3, 0);
+        assert!(d.held, "tick 3 of 3: sustained saturation holds");
+        let tr = tr.expect("engage edge");
+        assert_eq!(tr.kind, TransitionKind::Engaged);
+        assert!(tr.reason.contains("CPU busy"), "reason names the CPU bar: {}", tr.reason);
+        assert!(tr.reason.contains("3 sweep(s) in flight"), "{}", tr.reason);
+
+        // CPU drops to mostly idle while loadavg (a 1-minute decaying average)
+        // is still high: release on the very first such tick.
+        let (d, tr) = brake.observe(Some(90.0), 8, Some(0.70), at(3), 3, 0);
+        assert!(!d.held);
+        assert_eq!(tr.unwrap().kind, TransitionKind::Released);
+    }
+
+    #[test]
+    fn a_dip_under_threshold_resets_the_sustain_streak() {
+        let brake = SharedAdmissionBrake::new(AdmissionBrakeConfig::default());
+        let now = t0();
+        let at = |i: i64| now + chrono::Duration::seconds(i * 60);
+        brake.observe(Some(95.0), 8, Some(0.0), at(0), 1, 0);
+        brake.observe(Some(95.0), 8, Some(0.0), at(1), 1, 0);
+        // One idle-CPU tick breaks the streak...
+        brake.observe(Some(95.0), 8, Some(0.5), at(2), 1, 0);
+        // ...so two more over-threshold ticks are not yet enough.
+        brake.observe(Some(95.0), 8, Some(0.0), at(3), 1, 0);
+        let (d, _) = brake.observe(Some(95.0), 8, Some(0.0), at(4), 1, 0);
+        assert!(!d.held);
+        let (d, _) = brake.observe(Some(95.0), 8, Some(0.0), at(5), 1, 0);
+        assert!(d.held);
+    }
+
+    #[test]
+    fn config_reads_cpu_busy_and_sustain_knobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+        std::fs::write(
+            tmp.path().join(".loom/config.json"),
+            r#"{"autonomous":{"workFinder":{"saturationBrake":
+                 {"cpuBusyHold":0.8,"sustainTicks":5}}}}"#,
+        )
+        .unwrap();
+        let file = read_admission_brake_config(tmp.path());
+        assert_eq!(file.cpu_busy_threshold, Some(0.8));
+        assert_eq!(file.sustain_ticks, Some(5));
+
+        // Out-of-range values are treated as absent.
+        std::fs::write(
+            tmp.path().join(".loom/config.json"),
+            r#"{"autonomous":{"workFinder":{"saturationBrake":
+                 {"cpuBusyHold":1.5,"sustainTicks":0}}}}"#,
+        )
+        .unwrap();
+        let file = read_admission_brake_config(tmp.path());
+        assert_eq!(file.cpu_busy_threshold, None);
+        assert_eq!(file.sustain_ticks, None);
     }
 }

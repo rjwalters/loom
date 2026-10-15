@@ -95,11 +95,20 @@ pub(crate) fn resolve(repo_root: &std::path::Path) -> Vec<String> {
 /// Render `labels` as the `--jq-not` fragment: a jq boolean, TRUE when an
 /// issue's `.labels[].name` array contains none of them. Multiple labels are
 /// ANDed, matching `hard-exclusion-labels.sh`'s rendering exactly.
+///
+/// Membership is exact equality (#11366). jq `contains` on strings is a
+/// substring test, so the earlier `contains(["loom:epic"])` also hid every
+/// `loom:epic-phase` issue. Each label is rendered as a JSON string literal
+/// (a valid jq string), so a configured label holding `"` or `\` cannot
+/// break or alter the expression.
 #[must_use]
 pub(crate) fn render_jq_not(labels: &[String]) -> String {
     labels
         .iter()
-        .map(|l| format!("([.labels[].name] | contains([\"{l}\"]) | not)"))
+        .map(|l| {
+            let lit = serde_json::to_string(l).unwrap_or_else(|_| format!("\"{l}\""));
+            format!("(any(.labels[].name; . == {lit}) | not)")
+        })
         .collect::<Vec<_>>()
         .join(" and ")
 }
@@ -211,8 +220,8 @@ mod tests {
         let rendered = render_jq_not(&labels);
         assert_eq!(
             rendered,
-            "([.labels[].name] | contains([\"external\"]) | not) and \
-             ([.labels[].name] | contains([\"journal\"]) | not)"
+            "(any(.labels[].name; . == \"external\") | not) and \
+             (any(.labels[].name; . == \"journal\") | not)"
         );
     }
 
@@ -220,5 +229,19 @@ mod tests {
     fn search_rendering_quotes_every_label() {
         let labels = vec!["external".to_string(), "journal".to_string()];
         assert_eq!(render_search(&labels), "-label:\"external\" -label:\"journal\"");
+    }
+
+    /// #11366: a configured label is a JSON string literal, so a `"` or `\`
+    /// in it is escaped instead of ending or altering the jq program, and the
+    /// test is equality (`==`), never jq's substring `contains`.
+    #[test]
+    fn jq_not_is_exact_and_escapes_the_label() {
+        let out = render_jq_not(&["a\"b\\c".to_string(), "loom:epic".to_string()]);
+        assert_eq!(
+            out,
+            "(any(.labels[].name; . == \"a\\\"b\\\\c\") | not) and \
+             (any(.labels[].name; . == \"loom:epic\") | not)"
+        );
+        assert!(!out.contains("contains("));
     }
 }

@@ -23,6 +23,9 @@
 //! tests read (`check_export.jsonl`) must equal this live run.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -48,7 +51,7 @@ fn run_on(fixture: &str, params: &[(String, String)], sql: &str) -> String {
         "-i",
         "--entrypoint",
         "clickhouse",
-        CLICKHOUSE_IMAGE,
+        &hub_image::resolve(CLICKHOUSE_IMAGE),
         "local",
         "--multiquery",
         "--format=JSONEachRow",
@@ -93,6 +96,9 @@ fn replay(repo: &str) -> Replay {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn telemetry_replay_reports_fixture_state_with_uncovered_hosts_unknown() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let r = replay("");
     let issues: Vec<u64> = r.state.iter().map(|s| s.issue).collect();
     assert_eq!(issues, [3, 30, 31, 32, 50, 60, 98], "{r:#?}");
@@ -132,6 +138,9 @@ fn telemetry_replay_reports_fixture_state_with_uncovered_hosts_unknown() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn telemetry_replay_repo_scope_binds_through_to_the_state_query() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     assert!(replay("other/repo").state.is_empty());
     assert_eq!(replay("rjwalters/loom").state.len(), 7);
 }
@@ -164,6 +173,9 @@ fn run_check(params: &CheckParams) -> check::Check {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn telemetry_replay_check_fails_on_the_covered_host_past_the_threshold_only() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let params = check_params("", 600);
     let c = run_check(&params);
     assert_eq!(c.exit_code(), EXIT_DISAGREE);
@@ -181,6 +193,9 @@ fn telemetry_replay_check_fails_on_the_covered_host_past_the_threshold_only() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn telemetry_replay_check_agrees_when_only_uncovered_or_short_disagreements_remain() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // Scoped to rjwalters/loom: h-gap's identical stale row is unknown, and
     // h-lag's 300 s lag is under the threshold.
     let c = run_check(&check_params("rjwalters/loom", 600));

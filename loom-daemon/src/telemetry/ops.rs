@@ -58,6 +58,12 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // #10607: `loom.forge.calls` ingested from agent `gh` fronts — the agent
     // role (closed vocabulary), `-` on the daemon's own rows.
     "agent",
+    // 2am#4367 P4: `loom.forge.calls`' route (gateway | direct_read |
+    // direct | none), a closed vocabulary.
+    "route",
+    // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
+    // engine's per-role slots beside the sweep total.
+    "pool",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -71,6 +77,21 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.dispatched",
     "loom.dispatch.errors",
     "loom.dispatch.max_concurrent",
+    // #11649: a held tick's distinct halt causes, comma-joined.
+    "loom.dispatch.halt_causes",
+    // #11857: how many workspaces a hold gated this tick (`0` when none).
+    "loom.dispatch.held_roots",
+    // #11973: why a tick counted errors — one token of a fixed set, or
+    // `mixed` (`work_finder::tick_report::error_kind`).
+    "loom.dispatch.error_kind",
+    // #11858: the held repos with their causes, the cap's binding term and
+    // terms, and the open-PR pre-filter's skips (`ops::dispatch_facts`).
+    "loom.dispatch.halted_repos",
+    "loom.dispatch.cap_limiter",
+    "loom.dispatch.cap_configured",
+    "loom.dispatch.cap_disk",
+    "loom.dispatch.cap_ram",
+    "loom.dispatch.pr_open_prefiltered",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",
@@ -98,6 +119,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // `loom.dispatch.admission` spans (Issue #8907).
     "loom.dispatch.admission_result",
     "loom.dispatch.reason",
+    // `loom.dispatch.step` spans (Issue #11906), beside the two above.
+    "loom.step.item",
+    "loom.step.role",
+    "loom.step.draw_attempt",
+    "loom.step.age_source",
+    "loom.step.resumed",
     // `loom.dispatch.disposition` spans (Issue #9222).
     "loom.queue.disposition",
     "loom.queue.state",
@@ -115,16 +142,25 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "lockout.duration_seconds",
     "lockout.frozen_candidates_count",
     "lockout.frozen_points_sum",
-    // `loom.ratelimit.trip` spans (Issue #10022): the tripping job, the
-    // cooldown end and the trip-time own/external attribution per pool.
+    // `loom.ratelimit.trip` spans (Issues #10022, #12238): the tripping job,
+    // the cooldown end, the tripping credential, and per pool its `used`,
+    // this host's own calls on it (daemon and agent sessions apart) and the
+    // unattributed rest (other hosts or processes on the same credential).
     "loom.ratelimit.source",
     "loom.ratelimit.cooldown_until",
+    "github.account",
+    "github.cred_owner",
+    "github.installation",
     "github.ratelimit.core.used",
     "github.ratelimit.core.own",
-    "github.ratelimit.core.external",
+    "github.ratelimit.core.own_daemon",
+    "github.ratelimit.core.own_agent",
+    "github.ratelimit.core.unattributed",
     "github.ratelimit.graphql.used",
     "github.ratelimit.graphql.own",
-    "github.ratelimit.graphql.external",
+    "github.ratelimit.graphql.own_daemon",
+    "github.ratelimit.graphql.own_agent",
+    "github.ratelimit.graphql.unattributed",
     // `forge.reader.withdrawn` spans (W4-A): which reader App left which
     // (owner, resource) bucket, until when, and where that end came from.
     "forge.reader.app",
@@ -172,12 +208,18 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.build_gate.outcome",
     "loom.build_gate.duration_ms",
     "loom.build_gate.attempt",
+    // `main_red.autofile` spans (#11766): one change to a red `main`'s
+    // auto-filed fix issue — the SHA, the action and the verdict's source.
+    "loom.main_red.sha",
+    "loom.main_red.action",
+    "loom.main_red.source",
 ];
 
 /// Longest label value kept, in bytes.
 pub const MAX_LABEL_VALUE_BYTES: usize = 128;
-/// Most labels kept on one point (`loom.forge.calls` carries ten, #10607).
-pub const MAX_LABELS_PER_POINT: usize = 10;
+/// Most labels kept on one point (`loom.forge.calls` carries eleven: #10607's
+/// ten plus 2am#4367's `route`).
+pub const MAX_LABELS_PER_POINT: usize = 11;
 /// Most points kept in one record.
 pub const MAX_POINTS_PER_RECORD: usize = 256;
 
@@ -203,6 +245,15 @@ pub enum MetricName {
     /// The dynamic concurrency cap the tick ran under.
     #[serde(rename = "loom.dispatch.max_concurrent")]
     DispatchMaxConcurrent,
+    /// The terms the tick's cap is the minimum of, labelled `kind`
+    /// (`configured`, `disk`, `ram`; #11858). A headroom term that was not
+    /// measured is not emitted.
+    #[serde(rename = "loom.dispatch.cap_term")]
+    DispatchCapTerm,
+    /// The subset of `loom.dispatch.decisions{reason=pr_open}` the open-PR
+    /// pre-filter skipped with no `dispatch()` attempt (#11858).
+    #[serde(rename = "loom.dispatch.pr_open_prefiltered")]
+    DispatchPrOpenPrefiltered,
     /// Age of the oldest waiting ready-queue row, labelled `state` (#8856).
     #[serde(rename = "loom.queue.oldest_wait")]
     QueueOldestWait,
@@ -252,6 +303,11 @@ pub enum MetricName {
     /// backlog.
     #[serde(rename = "loom.queue.listing_incomplete_repos")]
     QueueListingIncompleteRepos,
+    /// `already_landed` rows on the last tick by evidence, labelled `reason`
+    /// (`forge_closed`, `forge_closed_not_planned`, `journal_landed`,
+    /// `unknown`; #11858).
+    #[serde(rename = "loom.queue.already_landed")]
+    QueueAlreadyLanded,
     // ---- Quota burn and pool state (Issue #8857) ------------------------
     /// Uncached input tokens consumed since the previous sample.
     #[serde(rename = "loom.llm.tokens.input")]
@@ -312,6 +368,16 @@ pub enum MetricName {
     /// Slot-seconds left idle while dispatchable ready work waited.
     #[serde(rename = "loom.dispatch.idle_slot_seconds")]
     DispatchIdleSlotSeconds,
+    /// Busy agent slots, labelled `role` (#11847): `sweep` for the work
+    /// finder's issue sweeps, the role name for role-runner agents.
+    #[serde(rename = "loom.dispatch.busy_slots")]
+    DispatchBusySlots,
+    /// The role-runner agent ceiling (`autonomous.roleRunner.maxConcurrent`).
+    #[serde(rename = "loom.dispatch.role_max_concurrent")]
+    DispatchRoleMaxConcurrent,
+    /// Role-runner agent slots idle: the ceiling minus agents in flight.
+    #[serde(rename = "loom.dispatch.role_idle_slots")]
+    DispatchRoleIdleSlots,
     /// Seconds items spent in a forge label stage, summed, labelled `state`.
     #[serde(rename = "loom.forge.stage_dwell")]
     ForgeStageDwell,
@@ -321,6 +387,14 @@ pub enum MetricName {
     /// Open items carrying a stage label, labelled `state`.
     #[serde(rename = "loom.forge.stage_items")]
     ForgeStageItems,
+    /// Seconds since the oldest item of a `stage_items` state entered it,
+    /// labelled `state`, `reason`, `repo` (#12027: `pr_refused`).
+    #[serde(rename = "loom.forge.stage_oldest_age_seconds")]
+    ForgeStageOldestAgeSeconds,
+    /// Items the step tick could draw (weight > 0, after the live claims),
+    /// labelled `repo`, sampled every work-finder tick (#11909).
+    #[serde(rename = "loom.step.actionable")]
+    StepActionable,
     /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
     /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
     /// (over the per-call row cap) — Issue #9222.
@@ -445,6 +519,32 @@ pub enum MetricName {
     /// (#11094).
     #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
     AgentScopePeakMemoryBytes,
+    // ---- The GitHub state mirror (2am#4367 P5) ----------------------------
+    /// Discovery listings and change-stream pulls that asked the mirror, by
+    /// `caller`, `repo` and `outcome` (`hit`, `stale`, `unknown`, `error`,
+    /// `skipped`; every non-`hit` listing fell back to the forge).
+    #[serde(rename = "loom.forge.mirror.reads")]
+    ForgeMirrorReads,
+    /// Changes the mirror's change stream delivered, by `repo` and `kind`.
+    #[serde(rename = "loom.forge.mirror.changes")]
+    ForgeMirrorChanges,
+    /// Summed seconds from a change at the mirror to the pull that saw it,
+    /// by `repo` (mean = this / `loom.forge.mirror.changes`).
+    #[serde(rename = "loom.forge.mirror.wake_latency")]
+    ForgeMirrorWakeLatency,
+    /// Stage-entry answers by `repo` and `kind`, the answering source
+    /// (`mirror`, `events`, `created`, `none`), #11897: the step engine's stage-age coverage.
+    #[serde(rename = "loom.stage_entry.lookups")]
+    StageEntryLookups,
+    /// Public-feed `completion` envelopes the narration sink built, by
+    /// `kind` (the trigger: `sweep_exit`, `step`, `reconcile`) and `outcome`
+    /// (`narrated`, or `seeded` for a fresh host's silent first pass), #12152.
+    #[serde(rename = "loom.feed.completions")]
+    FeedCompletions,
+    /// Merge-reconciliation passes, by `outcome` (`ran`, `deferred` while the
+    /// rate-limit breaker cools, `failed` when the forge read failed), #12152.
+    #[serde(rename = "loom.feed.reconcile_passes")]
+    FeedReconcilePasses,
 }
 
 impl MetricName {
@@ -455,6 +555,8 @@ impl MetricName {
             Self::DispatchDecisions => "loom.dispatch.decisions",
             Self::DispatchCandidates => "loom.dispatch.candidates",
             Self::DispatchMaxConcurrent => "loom.dispatch.max_concurrent",
+            Self::DispatchCapTerm => "loom.dispatch.cap_term",
+            Self::DispatchPrOpenPrefiltered => "loom.dispatch.pr_open_prefiltered",
             Self::QueueOldestWait => "loom.queue.oldest_wait",
             Self::QueueStarved => "loom.queue.starved",
             Self::QueueStarvedByReason => "loom.queue.starved.by_reason",
@@ -469,6 +571,7 @@ impl MetricName {
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
             Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
+            Self::QueueAlreadyLanded => "loom.queue.already_landed",
             Self::LlmTokensInput => "loom.llm.tokens.input",
             Self::LlmTokensOutput => "loom.llm.tokens.output",
             Self::LlmTokensCacheRead => "loom.llm.tokens.cache_read",
@@ -486,9 +589,14 @@ impl MetricName {
             Self::DispatchSlotTurnaroundSamples => "loom.dispatch.slot_turnaround.samples",
             Self::DispatchIdleSlots => "loom.dispatch.idle_slots",
             Self::DispatchIdleSlotSeconds => "loom.dispatch.idle_slot_seconds",
+            Self::DispatchBusySlots => "loom.dispatch.busy_slots",
+            Self::DispatchRoleMaxConcurrent => "loom.dispatch.role_max_concurrent",
+            Self::DispatchRoleIdleSlots => "loom.dispatch.role_idle_slots",
             Self::ForgeStageDwell => "loom.forge.stage_dwell",
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
+            Self::ForgeStageOldestAgeSeconds => "loom.forge.stage_oldest_age_seconds",
+            Self::StepActionable => "loom.step.actionable",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
             Self::GithubRateLimitUsed => "github.ratelimit.used",
@@ -515,6 +623,12 @@ impl MetricName {
             Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
             Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
             Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
+            Self::ForgeMirrorReads => "loom.forge.mirror.reads",
+            Self::ForgeMirrorChanges => "loom.forge.mirror.changes",
+            Self::ForgeMirrorWakeLatency => "loom.forge.mirror.wake_latency",
+            Self::StageEntryLookups => "loom.stage_entry.lookups",
+            Self::FeedCompletions => "loom.feed.completions",
+            Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
         }
     }
 
@@ -523,6 +637,7 @@ impl MetricName {
     pub fn kind(self) -> MetricKind {
         match self {
             Self::DispatchDecisions
+            | Self::DispatchPrOpenPrefiltered
             | Self::LlmTokensInput
             | Self::LlmTokensOutput
             | Self::LlmTokensCacheRead
@@ -549,7 +664,13 @@ impl MetricName {
             | Self::DaemonTaskFaults
             | Self::DaemonIpcLatency
             | Self::DaemonIpcRequests
-            | Self::DaemonIpcStatusBuilds => MetricKind::DeltaCounter,
+            | Self::DaemonIpcStatusBuilds
+            | Self::ForgeMirrorReads
+            | Self::ForgeMirrorChanges
+            | Self::ForgeMirrorWakeLatency
+            | Self::StageEntryLookups
+            | Self::FeedCompletions
+            | Self::FeedReconcilePasses => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -563,8 +684,10 @@ impl MetricName {
             | Self::QueueStarved
             | Self::QueueStarvedByReason
             | Self::QueueDispatchWaitSamples => "{issue}",
-            Self::DispatchMaxConcurrent => "{sweep}",
-            Self::QueueIssues => "{issue}",
+            Self::DispatchMaxConcurrent | Self::DispatchCapTerm => "{sweep}",
+            Self::QueueIssues | Self::QueueAlreadyLanded | Self::DispatchPrOpenPrefiltered => {
+                "{issue}"
+            }
             Self::QueueListingFailedRepos | Self::QueueListingIncompleteRepos => "{repository}",
             Self::LlmTokensInput
             | Self::LlmTokensOutput
@@ -579,11 +702,15 @@ impl MetricName {
             Self::DispatchSlotTurnaround
             | Self::DispatchIdleSlotSeconds
             | Self::ForgeStageDwell => "s",
-            Self::DispatchSlotTurnaroundSamples | Self::DispatchIdleSlots => "{slot}",
-            Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
+            Self::DispatchSlotTurnaroundSamples
+            | Self::DispatchIdleSlots
+            | Self::DispatchBusySlots
+            | Self::DispatchRoleMaxConcurrent
+            | Self::DispatchRoleIdleSlots => "{slot}",
+            Self::ForgeStageDwellSamples | Self::ForgeStageItems | Self::StepActionable => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
-            Self::GithubRateLimitReset => "s",
+            Self::GithubRateLimitReset | Self::ForgeStageOldestAgeSeconds => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
             Self::ForgeCalls => "{request}",
             Self::ForgeFacadeEvents => "{event}",
@@ -603,6 +730,12 @@ impl MetricName {
             Self::CodexSessionMountDrift => "{path}",
             Self::CaptainGaugeAgeSeconds => "s",
             Self::CaptainGaugeFallback => "1",
+            Self::ForgeMirrorReads => "{request}",
+            Self::ForgeMirrorChanges => "{change}",
+            Self::ForgeMirrorWakeLatency => "s",
+            Self::StageEntryLookups => "{lookup}",
+            Self::FeedCompletions => "{completion}",
+            Self::FeedReconcilePasses => "{pass}",
             _ => "By",
         }
     }
@@ -614,6 +747,10 @@ impl MetricName {
             Self::DispatchDecisions => "Work-finder candidate outcomes per tick, by reason.",
             Self::DispatchCandidates => "Ready candidates seen by one work-finder tick.",
             Self::DispatchMaxConcurrent => "Dynamic concurrency cap for the work-finder tick.",
+            Self::DispatchCapTerm => "The configured, disk and RAM terms of the tick's cap.",
+            Self::DispatchPrOpenPrefiltered => {
+                "Open-PR skips the pre-filter made with no dispatch attempt."
+            }
             Self::QueueOldestWait => "Age of the oldest waiting ready-queue issue, by state.",
             Self::QueueStarved => "Waiting ready-queue issues past the starvation threshold.",
             Self::QueueStarvedByReason => "Starved ready-queue issues by queue disposition.",
@@ -630,6 +767,7 @@ impl MetricName {
             Self::QueueListingIncompleteRepos => {
                 "Repos whose ready-issue listing came back partial last tick."
             }
+            Self::QueueAlreadyLanded => "Already-landed ready issues last tick, by evidence.",
             Self::LlmTokensInput => "Uncached input tokens consumed, by provider and model.",
             Self::LlmTokensOutput => "Output tokens produced, by provider and model.",
             Self::LlmTokensCacheRead => "Cache-read input tokens, by provider and model.",
@@ -653,9 +791,20 @@ impl MetricName {
             }
             Self::DispatchIdleSlots => "Concurrency slots idle at the end of a work-finder tick.",
             Self::DispatchIdleSlotSeconds => "Slot-seconds left idle while ready work waited.",
+            Self::DispatchBusySlots => {
+                "Busy agent slots, by role (sweep, role-runner role, or step role with pool=step)."
+            }
+            Self::DispatchRoleMaxConcurrent => "The role-runner concurrent agent ceiling.",
+            Self::DispatchRoleIdleSlots => "Role-runner agent slots idle under the ceiling.",
             Self::ForgeStageDwell => "Seconds items spent in a forge label stage, by state.",
             Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
-            Self::ForgeStageItems => "Open items carrying a stage label, by state.",
+            Self::ForgeStageItems => {
+                "Open items per repo by state: stage labels and queue states (overlapping)."
+            }
+            Self::ForgeStageOldestAgeSeconds => {
+                "Age of the oldest item in a stage_items state, by reason (pr_refused)."
+            }
+            Self::StepActionable => "Items the step tick could draw this tick, per repo.",
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }
@@ -706,6 +855,22 @@ impl MetricName {
             }
             Self::AgentScopePeakMemoryBytes => {
                 "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."
+            }
+            Self::ForgeMirrorReads => {
+                "Reads that asked the GitHub state mirror, by caller, repo and outcome."
+            }
+            Self::ForgeMirrorChanges => "Changes the state mirror's change stream delivered.",
+            Self::ForgeMirrorWakeLatency => {
+                "Summed seconds from a change at the state mirror to the pull that saw it."
+            }
+            Self::StageEntryLookups => {
+                "Stage-entry times the step engine looked up, by repo and answering source (kind)."
+            }
+            Self::FeedCompletions => {
+                "Public-feed completions the narration sink built, by trigger (kind) and outcome."
+            }
+            Self::FeedReconcilePasses => {
+                "Merge-reconciliation passes of the narration sink, by outcome."
             }
         }
     }

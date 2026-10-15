@@ -553,6 +553,7 @@ impl Run<'_> {
             "role": item.role,
             "from_version": self.manifest.roll.from_version,
             "to_version": self.manifest.roll.to_version,
+            "trigger": self.manifest.roll.target_source.as_ref().map(|t| t.as_str().to_string()),
             "running_version": self.plan.running_version,
             "resumed_on": self.status.resumed_on,
             "verify_probation_secs": self.plan.tuning.verify_probation.as_secs(),
@@ -1182,6 +1183,7 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
             "phase": run.manifest.phase.as_str(),
             "from_version": run.manifest.roll.from_version,
             "to_version": run.manifest.roll.to_version,
+            "trigger": run.manifest.roll.target_source.as_ref().map(|t| t.as_str().to_string()),
             "running_version": plan.running_version,
             "resumed_on": on,
             "items": run.status.items,
@@ -1215,3 +1217,7 @@ pub(crate) mod test_support;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "pause_resume/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pause_resume/step_tests.rs"]
+mod step_tests;

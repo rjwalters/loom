@@ -34,7 +34,7 @@ fn ready_row(issue: u32, rank: u32) -> FleetStateRow {
         entered_at_lower_bound: true,
         rank: Some(rank),
         level: 2,
-        fleet_priority: Some(100),
+        weight: Some(100),
         created_at: Some(at(8, 0) - Duration::days(30)),
         ..FleetStateRow::new(issue, FleetStage::ReadyWait, at(10, 0))
     }
@@ -79,6 +79,8 @@ fn record() -> FleetStateRecord {
             triage_depth: None,
             triage_flow: None,
             curator: None,
+            pending_queue: None,
+            operator_recency: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus {
@@ -111,6 +113,8 @@ fn anchor_with(n: u32) -> FleetStateRecord {
             triage_depth: None,
             triage_flow: None,
             curator: None,
+            pending_queue: None,
+            operator_recency: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -233,7 +237,7 @@ fn a_listed_row_omits_host_and_slot_and_flags_a_lower_bound_entry() {
 }
 
 /// A `ready_wait` row carries this host's planner rank and the planner's
-/// inputs: level, fleet priority and the age instant (no retired `star` /
+/// inputs: level, draw weight and the age instant (no retired `star` /
 /// `star_at`, #11510).
 #[test]
 fn a_ready_row_carries_rank_and_the_planner_inputs() {
@@ -244,17 +248,17 @@ fn a_ready_row_carries_rank_and_the_planner_inputs() {
             "created_at",
             "entered_at",
             "entered_at_lower_bound",
-            "fleet_priority",
             "issue",
             "level",
             "rank",
-            "stage"
+            "stage",
+            "weight"
         ]
     );
     assert_eq!(wire["stage"], "ready_wait");
     assert_eq!(wire["rank"], 3);
     assert_eq!(wire["level"], 2);
-    assert_eq!(wire["fleet_priority"], 100);
+    assert_eq!(wire["weight"], 100);
 }
 
 /// The neutral stage enum keeps the replay contract's wire strings.
@@ -413,6 +417,8 @@ fn removals_and_census_only_repos_survive_a_split() {
             triage_depth: None,
             triage_flow: None,
             curator: None,
+            pending_queue: None,
+            operator_recency: None,
             ready_complete: true,
             ready_replace: false,
             census: None,
@@ -433,6 +439,8 @@ fn removals_and_census_only_repos_survive_a_split() {
             triage_depth: None,
             triage_flow: None,
             curator: None,
+            pending_queue: None,
+            operator_recency: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -483,6 +491,8 @@ fn ready_replace_is_additive_and_rides_every_chunk() {
         triage_depth: None,
         triage_flow: None,
         curator: None,
+        pending_queue: None,
+        operator_recency: None,
         ready_complete: false,
         ready_replace: true,
         census: None,

@@ -7,7 +7,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use super::{compose_path, implicit_repo, next_gh, prepend_path, session_env};
+use super::{implicit_repo, next_gh, prepend_path, session_env};
 
 #[test]
 fn implicit_repo_is_the_lone_github_origin() {
@@ -84,24 +84,6 @@ fn next_gh_skips_this_binary_and_any_loom_daemon_front() {
     assert_eq!(next_gh::resolve_from(None, &path[..2], Some(&me)), None);
 }
 
-/// #10516: one ordering for workers and sessions — launcher, front, then the
-/// caller's PATH (the 2am shim / real gh stay behind the front).
-#[test]
-fn compose_path_puts_launcher_then_front_then_current() {
-    let (front, launcher) = (Path::new("/f"), Path::new("/l"));
-    let current = std::env::join_paths(["/2am-shim", "/f", "/usr/bin"]).unwrap();
-    let split = |p: std::ffi::OsString| std::env::split_paths(&p).collect::<Vec<PathBuf>>();
-    let both = compose_path(Some(front), Some(launcher), Some(&current)).unwrap();
-    assert_eq!(split(both), ["/l", "/f", "/2am-shim", "/usr/bin"].map(PathBuf::from));
-    let front_only = compose_path(Some(front), None, Some(&current)).unwrap();
-    assert_eq!(split(front_only), ["/f", "/2am-shim", "/usr/bin"].map(PathBuf::from));
-    let launcher_only = compose_path(None, Some(launcher), Some(&current)).unwrap();
-    assert_eq!(split(launcher_only), ["/l", "/2am-shim", "/f", "/usr/bin"].map(PathBuf::from));
-    assert_eq!(compose_path(None, None, Some(&current)), None);
-    // The session-env prefix is the same composition with no current PATH.
-    assert_eq!(compose_path(Some(front), Some(launcher), None).unwrap(), OsStr::new("/l:/f"));
-}
-
 #[cfg(unix)]
 #[test]
 fn session_env_line_is_written_once_and_prepends_once_when_sourced() {
@@ -141,7 +123,7 @@ fn session_env_skips_a_path_that_already_starts_with_the_prefix() {
 
 #[cfg(unix)]
 #[test]
-fn status_classifies_front_launcher_and_bypass() {
+fn status_classifies_front_and_bypass() {
     use std::os::unix::fs::PermissionsExt;
     let d = tempfile::tempdir().unwrap();
     let daemon = d.path().join("bin").join("loom-daemon");
@@ -157,8 +139,17 @@ fn status_classifies_front_launcher_and_bypass() {
     let path = std::env::join_paths([d.path().join("empty"), front.clone()]).unwrap();
     let gh = session_env::first_gh(Some(&path)).unwrap();
     assert_eq!(gh, front.join("gh"));
-    assert_eq!(session_env::classify_gh(&gh, None), "front");
-    assert_eq!(session_env::classify_gh(&other, Some(&other)), "launcher");
-    assert_eq!(session_env::classify_gh(&other, None), "bypassed");
+    assert_eq!(session_env::classify_gh(&gh), "front");
+    assert_eq!(session_env::classify_gh(&other), "bypassed");
     assert_eq!(session_env::first_gh(Some(OsStr::new("/nonexistent-dir"))), None);
+}
+
+/// A gateway attempt killed by a signal exits as a shell would report the
+/// exec'd `gh`: 128 + the signal, not a flat 1 (2am#4367 P4).
+#[test]
+fn a_signalled_gateway_attempt_reports_128_plus_the_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(super::exit_code(std::process::ExitStatus::from_raw(9)), 137);
+    assert_eq!(super::exit_code(std::process::ExitStatus::from_raw(15)), 143);
+    assert_eq!(super::exit_code(std::process::ExitStatus::from_raw(3 << 8)), 3);
 }

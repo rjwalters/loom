@@ -140,8 +140,7 @@ on:
 #   - Ineligible `workflow_run` (red/cancelled CI, PR or fork run): a unique
 #     per-run group. Its jobs are all skipped by `resolve`'s `if:`, and it must
 #     not enter `release-main`, where it would displace a green pending run.
-# The eligibility test here and in `resolve`'s `if:` must stay identical;
-# scripts/test-release-decision.sh checks that they do.
+# The eligibility test here and in `resolve`'s `if:` must stay identical.
 concurrency:
   group: release-${{ github.event.inputs.gate_sha || github.event.release.tag_name || github.event.inputs.tag || (github.event_name == 'workflow_run' && (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && 'main' || format('ineligible-{0}', github.run_id))) || github.sha }}
   cancel-in-progress: false

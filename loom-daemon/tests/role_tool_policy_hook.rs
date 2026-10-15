@@ -85,7 +85,6 @@ impl Fixture {
             .env("LOOM_CONFIG_DEFAULTS_FILE", "")
             .env_remove("LOOM_ROLE")
             .env_remove("LOOM_WORKTREE_PATH")
-            .env_remove("LOOM_FORGE_EGRESS_POLICY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

@@ -45,6 +45,10 @@ pub struct TickQueueRow {
     /// exporter can sum the frozen backlog's weight without reading the
     /// forge.
     pub story_points: Option<u32>,
+    /// The step the row's item is drawn for (#11909): every step-tick row
+    /// names one; `None` on the issue-sweep rows, which the plan reads as
+    /// `builder`.
+    pub step: Option<crate::work_finder::step_item::Step>,
 }
 
 /// The quiet resolution of `item`'s story points: [`PointsLabels::value`] —
@@ -70,13 +74,13 @@ fn points_of(item: &WorkItem) -> Option<u32> {
 #[must_use]
 pub fn key_of(
     idx: usize,
-    workspace_priority: u32,
+    workspace_weight: u32,
     item: &WorkItem,
     repo_red: bool,
 ) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: idx,
-        workspace_priority,
+        workspace_weight,
         created_at: item.created_at.clone(),
         number: item.number,
         level: crate::priority_pick::Level::of(&item.labels),
@@ -156,6 +160,7 @@ pub fn record_skip_held(
         updated_at: item.updated_at.clone(),
         held_until,
         story_points: points_of(item),
+        step: None,
     });
 }
 
@@ -171,6 +176,7 @@ pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, i
         updated_at: item.updated_at.clone(),
         held_until: None,
         story_points: points_of(item),
+        step: None,
     });
 }
 
@@ -244,7 +250,7 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 rank: i + 1,
                 repo: repo_name(r.key.workspace_idx, roots),
                 issue: r.key.number,
-                workspace_priority: r.key.workspace_priority,
+                workspace_weight: r.key.workspace_weight,
                 // Deprecated by #9244 (its label deleted in #11105): always
                 // false, kept only for wire compatibility.
                 urgent: false,

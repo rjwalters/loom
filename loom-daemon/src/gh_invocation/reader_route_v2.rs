@@ -10,14 +10,20 @@
 //! 3. when no reader is left, a [`ReadClass::Gate`] read goes to the writer
 //!    exactly as before. A [`ReadClass::Hygiene`] /
 //!    [`ReadClass::Observability`] read is **shed** — it returns
-//!    [`GhCompletion::Shed`] without a request — only when the readers are
-//!    out of **budget** ([`ExhaustCause::Budget`]: live rate-limit
-//!    withdrawals, or the router's headroom reserve). When they are out for
-//!    any other reason (a coverage miss, a stale or unpublished token, a
-//!    refused credential) the read goes to the writer like a Gate read:
-//!    shedding there would stop the repo's housekeeping for as long as the
-//!    condition lasts, which may be forever. The same holds when the router
-//!    answers [`RouteDecision::Exhausted`] up front.
+//!    [`GhCompletion::Shed`] without a request ([`ReadClass::sheds`]). A
+//!    Hygiene read is shed while the readers are out of **budget**
+//!    ([`ExhaustCause::Budget`]: live rate-limit withdrawals, or the
+//!    router's headroom reserve) or **withdrawn** ([`ExhaustCause::Withdrawn`]:
+//!    App-wide, a refused credential, the gateway's outage withdrawal — all
+//!    time-bounded); when they are out for a reason that may never clear (a
+//!    coverage miss, a stale or unpublished token directory) it goes to the
+//!    writer like a Gate read: shedding there would stop the repo's
+//!    housekeeping for as long as the condition lasts. An Observability read
+//!    is shed for **every** cause: telemetry may go dark, the writer's budget
+//!    is the fleet's dispatch budget. The same holds when the router answers
+//!    [`RouteDecision::Exhausted`] up front. Only a host with no reader pool
+//!    at all ([`RouteDecision::NoPool`] before any reader was tried) serves
+//!    an Observability read on the writer.
 //!
 //! A 403/404 keeps today's rule (re-run on the writer; withdraw the reader
 //! for the repo only if the writer could read it). When both answer 404, the
@@ -157,10 +163,12 @@ fn shed_log_due(op: &str, now: SystemTime) -> bool {
 }
 
 /// The cause of running out of readers after `failure`: a rate limit is
-/// budget, anything else is not.
+/// budget, a refused credential a (time-bounded) withdrawal, anything else
+/// neither.
 fn cause_after(failure: Option<Failure>) -> ExhaustCause {
     match failure {
         Some(Failure::RateLimited { .. }) => ExhaustCause::Budget,
+        Some(Failure::Credential) => ExhaustCause::Withdrawn,
         _ => ExhaustCause::Unavailable,
     }
 }
@@ -218,13 +226,23 @@ impl GhInvocation {
         let mut decision = lookup(&request);
         loop {
             let (dir, app_id) = match decision {
-                RouteDecision::NoPool => {
+                RouteDecision::NoPool if tried.is_empty() => {
                     // No reader pool at all: the writer, as before W4.
-                    return if tried.is_empty() {
-                        self.execute_direct()
-                    } else {
-                        self.writer_fallback()
-                    };
+                    return self.execute_direct();
+                }
+                RouteDecision::NoPool => {
+                    let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
+                    // Nothing says budget: the writer serves it, as before
+                    // (except inside a tick's read scope, #12074).
+                    return self.no_reader_left(
+                        class,
+                        ExhaustCause::Unavailable,
+                        &owner,
+                        resource,
+                        until,
+                        last_app.as_deref(),
+                        true,
+                    );
                 }
                 RouteDecision::Exhausted { until, cause } => {
                     return self.no_reader_left(
@@ -263,6 +281,31 @@ impl GhInvocation {
             if succeeded(&first) {
                 return Ok(first);
             }
+            let fault = if app_id == crate::forge_gateway::GATEWAY_APP_ID {
+                super::gateway_fault(&first)
+            } else {
+                crate::forge_gateway::outage::Fault::None
+            };
+            if fault.reruns() {
+                // 2am#4367 P4: the gateway failed, not the credential: run
+                // the read once more on the readers, then the writer, and
+                // take the gateway out only when it signalled the fault.
+                if fault == crate::forge_gateway::outage::Fault::Withdraw {
+                    super::withdraw_gateway_outage(self.operation.as_str());
+                }
+                tried.insert(app_id.clone());
+                last_app = Some(app_id);
+                last_failure = None;
+                decision = match crate::forge_gateway::past_gateway(lookup(&request), &request, now)
+                {
+                    RouteDecision::NoPool => RouteDecision::Exhausted {
+                        until: now + crate::forge_read_pool::DEFAULT_WITHDRAWAL,
+                        cause: ExhaustCause::Unavailable,
+                    },
+                    other => other,
+                };
+                continue;
+            }
             let Some(failure) = failure_of(&first, resource) else {
                 // Not the credential's fault (a 5xx, a network error):
                 // neither another reader nor the writer would help.
@@ -289,7 +332,13 @@ impl GhInvocation {
             tried.insert(app_id.clone());
             last_app = Some(app_id);
             last_failure = Some(failure);
-            decision = match lookup(&request) {
+            let next = lookup(&request);
+            let next = if tried.contains(crate::forge_gateway::GATEWAY_APP_ID) {
+                crate::forge_gateway::past_gateway(next, &request, now)
+            } else {
+                next
+            };
+            decision = match next {
                 // The pool went away under us: nothing says budget, so the
                 // writer serves it (a fallback, since a reader was tried).
                 RouteDecision::NoPool => RouteDecision::Exhausted {
@@ -308,11 +357,12 @@ impl GhInvocation {
             .execute_direct()
     }
 
-    /// No reader can serve this read. A deferrable read whose readers are
-    /// out of budget is shed; everything else — every `Gate` read, and a
-    /// deferrable read whose readers are out for any other cause — goes to
-    /// the writer (as a fallback when a reader was tried, else as the plain
-    /// writer read it was before W4).
+    /// No reader can serve this read. An Observability read is always shed;
+    /// a Hygiene read whose readers are out of budget or withdrawn is shed;
+    /// everything else — every `Gate` read, and a Hygiene read whose readers
+    /// are [`ExhaustCause::Unavailable`] — goes to the writer (as a fallback
+    /// when a reader was tried, else as the plain writer read it was before
+    /// W4).
     #[allow(clippy::too_many_arguments)]
     fn no_reader_left(
         &self,
@@ -324,7 +374,28 @@ impl GhInvocation {
         app: Option<&str>,
         tried: bool,
     ) -> Result<GhCompletion, ExecError> {
-        if class == ReadClass::Gate || cause != ExhaustCause::Budget {
+        // #12074: inside a work-finder tick's read scope, a read whose
+        // readers are out of BUDGET is shed whatever its class: the tick
+        // answers it from its caches, and the writer's (dispatch App's)
+        // budget is left to the claims and merges during a rate-limit
+        // back-off. Any other cause (a failing gateway, a coverage miss)
+        // still reaches the writer, bounded by the deadline's clamp; and a
+        // repo starved for several ticks lifts the rule for one
+        // ([`super::super::read_deadline::writer_fallback_allowed`]).
+        let in_tick = tried
+            && cause == ExhaustCause::Budget
+            && !super::super::read_deadline::writer_fallback_allowed();
+        // A starved repo's escalated tick lifts every budget shed.
+        let escalated = super::super::read_deadline::escalated();
+        // [`ReadClass::sheds`]: an Observability read never reaches the
+        // writer once a reader pool exists, whatever the cause (and an
+        // escalated tick does not lift that); a Hygiene read waits out a
+        // budget exhaustion or a withdrawal. 2026-10-15: the `fleet.state`
+        // history reads drained the writer when a mix of budget and
+        // non-budget withdrawals made the router answer `Unavailable`.
+        // `LOOM_READ_SHED=0` still maps every class to `Gate` before this.
+        let sheds = class.sheds(cause);
+        if class != ReadClass::Observability && (escalated || (!in_tick && !sheds)) {
             return if tried {
                 self.writer_fallback()
             } else {

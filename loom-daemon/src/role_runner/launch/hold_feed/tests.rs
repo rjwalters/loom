@@ -85,7 +85,7 @@ fn write_executable(path: &Path, body: &str) {
 /// The bundled role/runtime manifests, an enabled `zai` seat,
 /// `rolePreference.doctor = [opencode:zai-flash, claude]`, and the fake
 /// spawn script described in the module doc.
-fn doctor_workspace(root: &Path) {
+fn doctor_workspace_with(root: &Path, opencode_output: &str) {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     for (from, to) in [
         ("defaults/roles", ".loom/roles"),
@@ -109,7 +109,7 @@ fn doctor_workspace(root: &Path) {
         &scripts.join("spawn-worker.sh"),
         &format!(
             "#!/bin/sh\necho \"$LOOM_RUNTIME\" >> '{}'\n\
-             if [ \"$LOOM_RUNTIME\" = opencode ]; then printf '%s\\n' '{TOOLLESS_STREAM}'; fi\n\
+             if [ \"$LOOM_RUNTIME\" = opencode ]; then printf '%s\\n' '{opencode_output}'; fi\n\
              exit 0\n",
             launches.display()
         ),
@@ -137,6 +137,9 @@ struct Recording {
     inner: ScriptRoleInvocationRunner,
     calls: Arc<AtomicUsize>,
     ticks: Ticks,
+    /// The role-draw attempt counter right after each tick (#11782).
+    attempts: Arc<Mutex<Vec<u32>>>,
+    root: std::path::PathBuf,
     limit: usize,
 }
 
@@ -156,17 +159,21 @@ impl RoleInvocationRunner for Recording {
             .lock()
             .unwrap()
             .push((outcome.clone(), tap, marker));
+        self.attempts
+            .lock()
+            .unwrap()
+            .push(crate::runtime_preference::role_draw::attempts::current(&self.root, role));
         self.calls.fetch_add(1, Ordering::SeqCst);
         outcome
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial_test::serial]
-async fn deterministic_launch_failures_trip_the_tap_not_the_role() {
+async fn drive_four_ticks(
+    opencode_output: &str,
+) -> (tempfile::TempDir, Vec<(RoleTickOutcome, Option<String>, String)>, Vec<u32>) {
     let _env = Env::new();
     let workspace = tempfile::tempdir().unwrap();
-    doctor_workspace(workspace.path());
+    doctor_workspace_with(workspace.path(), opencode_output);
     let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
     // A registered root is a git checkout, which refuses an in-tree token
     // pool (#9135): Claude's account lives in the shared pool, as it does on
@@ -174,6 +181,8 @@ async fn deterministic_launch_failures_trip_the_tap_not_the_role() {
     let _claude = crate::write_scope_test_support::SharedTokenPool::one_account();
     let calls = Arc::new(AtomicUsize::new(0));
     let ticks: Ticks = Arc::default();
+    let attempts: Arc<Mutex<Vec<u32>>> = Arc::default();
+    crate::runtime_preference::role_draw::attempts::reset_for_tests();
     let runner = Recording {
         inner: ScriptRoleInvocationRunner::new(workspace.path().to_path_buf())
             .with_timeout(Duration::from_secs(60))
@@ -181,6 +190,8 @@ async fn deterministic_launch_failures_trip_the_tap_not_the_role() {
             .with_gh_bin(ws.gh.clone()),
         calls: calls.clone(),
         ticks: ticks.clone(),
+        attempts: attempts.clone(),
+        root: workspace.path().to_path_buf(),
         limit: 4,
     };
     let spec = RoleSpec {
@@ -210,6 +221,14 @@ async fn deterministic_launch_failures_trip_the_tap_not_the_role() {
     handle.abort();
 
     let ticks = ticks.lock().unwrap().clone();
+    let attempts = attempts.lock().unwrap().clone();
+    (workspace, ticks, attempts)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn deterministic_launch_failures_trip_the_tap_not_the_role() {
+    let (workspace, ticks, _) = drive_four_ticks(TOOLLESS_STREAM).await;
     // N = 2 toolless launches on the preferred tap...
     for (outcome, tap, _) in &ticks[..2] {
         assert_eq!(tap.as_deref(), Some("opencode:zai-flash"), "{ticks:?}");
@@ -232,4 +251,34 @@ async fn deterministic_launch_failures_trip_the_tap_not_the_role() {
     let launches: Vec<&str> = launches.lines().collect();
     assert_eq!(launches[..2], ["opencode", "opencode"], "{launches:?}");
     assert!(launches[2..].iter().all(|r| *r == "claude"), "{launches:?}");
+}
+
+/// #11727: the exact shape of the 2026-10-12 outage. Every tool call is denied
+/// by the role-tool-policy hook because `check` exited 2; the child exits 0.
+const HOOK_DENIED_STREAM: &str = "exec\n/bin/bash -lc 'cat SKILL.md' in /w\n exited 1 in 0ms:\n\
+    BLOCKED [role-tool-policy]: role 'doctor' is restricted, and loom-daemon role-tool-policy \
+    check could not answer (exit 2), so this command is denied (#8256).";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn a_hook_denied_run_falls_back_to_the_next_runtime() {
+    let (workspace, ticks, attempts) = drive_four_ticks(HOOK_DENIED_STREAM).await;
+    // #11782: the two hook-denied exits (child exit 0) reach
+    // `attempts::record_failure` through `HoldFeed::failure` — attempt 2, then
+    // 3 — and the first success on the fallback resets to attempt 1.
+    assert_eq!(attempts, [2, 3, 1, 1], "{ticks:?}");
+    for (outcome, tap, _) in &ticks[..2] {
+        assert_eq!(tap.as_deref(), Some("opencode:zai-flash"), "{ticks:?}");
+        let RoleTickOutcome::Failure(detail) = outcome else {
+            panic!("a hook-denied run is a failed tick: {ticks:?}");
+        };
+        assert!(detail.contains("guard hook denied every tool call"), "{detail}");
+    }
+    for (outcome, tap, marker) in &ticks[2..] {
+        assert_eq!(tap.as_deref(), Some("claude"), "{ticks:?}");
+        assert_eq!(*outcome, RoleTickOutcome::Success, "{ticks:?}");
+        assert!(marker.contains("launch-failure-hold: hook-denied x2"), "{marker}");
+    }
+    let launches = fs::read_to_string(workspace.path().join("launches")).unwrap();
+    assert!(launches.lines().skip(2).all(|r| r == "claude"), "{launches:?}");
 }

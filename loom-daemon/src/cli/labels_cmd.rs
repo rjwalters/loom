@@ -28,10 +28,19 @@ pub(crate) enum LabelsCommand {
         /// merge_hold, operator_hold, contradicts_approval (report order).
         #[arg(long, conflicts_with = "kind")]
         property: Option<String>,
+        /// With `--property`: also print each retired label whose replacement
+        /// has the property (#11795), so a script still matches items that
+        /// `labels migrate` has not relabelled yet.
+        #[arg(long, requires = "property")]
+        with_retired: bool,
         /// A label kind (workflow, claim, pr-lane, proposal, hold, ...).
         #[arg(long)]
         kind: Option<String>,
     },
+    /// Print a label and the retired names that fold into it (#11861), one
+    /// per line: the set a script counts while `labels migrate` has not
+    /// relabelled open items. Exit 1 for an unknown label.
+    Aliases { name: String },
     /// Print one label as JSON, or a single field with `--field`.
     Get {
         name: String,
@@ -81,6 +90,18 @@ pub(crate) enum LabelsCommand {
         /// Make the forge writes (default: dry run, reads only).
         #[arg(long)]
         apply: bool,
+        /// Migrate open items only; never delete a retired label's
+        /// definition (deleting strips it from every closed item).
+        #[arg(long)]
+        keep_labels: bool,
+        /// Instead of the retired labels, move the `loom:operator` holds a
+        /// role applied to `loom:blocked` (#11861): Champion-held PRs (a
+        /// reason-only park record; `loom:pr` kept) and dependency-only
+        /// escalations (a park record per open blocker, or released when they
+        /// all closed), and daemon no-op holds applied before #12024 (the
+        /// `no-op hold` park record). Run it BEFORE the retired-label migration.
+        #[arg(long, conflicts_with = "keep_labels")]
+        holds: bool,
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
@@ -118,6 +139,10 @@ fn load(root: &Path) -> Result<Registry> {
 }
 
 pub(crate) fn dispatch(args: LabelsArgs) -> Result<()> {
+    // 2AMLogic/2am#4367: `undeclared` and `migrate` read the forge; run by a
+    // host job with LOOM_GH_GATEWAY_DIR set, those reads use the daemon's
+    // published gateway profiles. A no-op without the variable.
+    loom_daemon::forge_gateway::enable_cli();
     let code = run(args.action)?;
     if code != 0 {
         std::process::exit(code);
@@ -127,10 +152,17 @@ pub(crate) fn dispatch(args: LabelsArgs) -> Result<()> {
 
 fn run(cmd: LabelsCommand) -> Result<i32> {
     match cmd {
-        LabelsCommand::List { property, kind } => {
+        LabelsCommand::List {
+            property,
+            with_retired,
+            kind,
+        } => {
             let reg = Registry::embedded();
             let names: Vec<&str> = match (property, kind) {
                 (Some(p), None) => match reg.with_property(&p) {
+                    Some(_) if with_retired => {
+                        loom_daemon::label_registry::embedded_set_with_retired(&p)
+                    }
                     Some(n) => n,
                     None => {
                         eprintln!("unknown property '{p}'; known: {}", BOOL_PROPERTIES.join(", "));
@@ -147,6 +179,17 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
                 _ => reg.labels.iter().map(|l| l.name.as_str()).collect(),
             };
             for n in names {
+                println!("{n}");
+            }
+            Ok(0)
+        }
+        LabelsCommand::Aliases { name } => {
+            let reg = Registry::embedded();
+            let Some(label) = reg.get(&name) else {
+                eprintln!("unknown label '{name}'");
+                return Ok(1);
+            };
+            for n in loom_daemon::label_registry::embedded_aliases(label.name.as_str()) {
                 println!("{n}");
             }
             Ok(0)
@@ -194,16 +237,21 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
             repo,
             all_workspaces,
             apply,
+            keep_labels,
+            holds,
             json,
         } => {
-            use super::labels_migrate::{dispatch, Scope};
+            use super::labels_migrate::{dispatch, dispatch_holds, Scope};
             let root = root_of(None);
             let scope = match (repo, all_workspaces) {
                 (Some(r), _) => Scope::Repo(r),
                 (None, true) => Scope::AllWorkspaces,
                 (None, false) => Scope::Here(root.clone()),
             };
-            Ok(dispatch(&load(&root)?.retired, scope, apply, json))
+            if holds {
+                return Ok(dispatch_holds(scope, apply, json));
+            }
+            Ok(dispatch(&load(&root)?.retired, scope, apply, keep_labels, json))
         }
         LabelsCommand::Check { root } => {
             let root = root_of(root);

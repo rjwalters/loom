@@ -138,6 +138,10 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         in_flight,
     };
     let decision = state.decide(now, &inputs, settle, defer_deadline);
+    // #11042: an unsupervised host does not re-fetch a target it already
+    // installed and could not roll to.
+    let decision = not_rolling::gate(state, trigger, decision);
+    let unsupervised = trigger.unsupervised().is_some();
     let (kind, outcome, note) = match decision {
         TickDecision::Skip(reason) => {
             // Issue #7608: name the offending paths behind a dirty-tree
@@ -196,6 +200,10 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             let drain_accepted = matches!(outcome, RebuildOutcome::Success)
                 && trigger.trigger_pause_roll(&RollTarget::repo_ahead());
             summary.roll_armed = drain_accepted;
+            let tracked = state.tracked_target.as_deref();
+            state
+                .unsupervised
+                .record(tracked, &outcome, drain_accepted, unsupervised);
             let mut note = state.record_rebuild(now, &outcome, drain_accepted);
             if low_priority {
                 note = format!(
@@ -262,6 +270,10 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
                 state.attempt.undo(previous);
             }
             summary.roll_armed = drain_accepted;
+            let tracked = state.tracked_target.as_deref();
+            state
+                .unsupervised
+                .record(tracked, &outcome, drain_accepted, unsupervised);
             state.attempt.note_outcome(now, &outcome);
             let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
             if matches!(outcome, RebuildOutcome::Terminal(_))
@@ -341,7 +353,19 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         summary.floor_stall.get_or_insert(stall);
     }
 
-    status.publish(state.snapshot(true, last_check, note.clone(), &artifact));
+    // #11042: below the floor and not rolling — say why, typed.
+    summary.floor_not_rolling = not_rolling::classify(&not_rolling::TickFacts {
+        verdict: state.floor.verdict(),
+        decision: kind,
+        outcome,
+        roll_armed: summary.roll_armed,
+        terminal: state.terminal_reason.is_some(),
+        backing_off: state.backoff_until.is_some_and(|until| now < until),
+        unsupervised,
+    });
+    let mut snapshot = state.snapshot(true, last_check, note.clone(), &artifact);
+    snapshot.floor_not_rolling = summary.floor_not_rolling;
+    status.publish(snapshot);
     summary.finish(kind, note, &artifact, outcome)
 }
 
@@ -534,6 +558,10 @@ impl FloorFeed {
 /// ([`crate::fleet_sync::FloorWake`]) and restarts the interval from that
 /// tick. The wake fires on a change of value only, so a floor roll that keeps
 /// failing is paced by its backoff.
+///
+/// #12072: while the floor is unsatisfiable the next tick is
+/// [`stall_recheck::STALL_RECHECK`] away, not `tuning.interval`, for the first
+/// [`stall_recheck::STALL_WINDOW`] of the stall.
 pub(super) async fn run_loop<P, T>(
     mut state: AutoUpdateState,
     mut probe: P,
@@ -572,6 +600,17 @@ pub(super) async fn run_loop<P, T>(
                 probe = p;
                 trigger = t;
                 task_liveness::beat(AUTO_UPDATE, tuning.interval);
+                // #12072: a standing unsatisfiable floor is re-checked soon,
+                // so the roll starts minutes after the asset lands.
+                let delay =
+                    stall_recheck::delay_after_tick(&state.floor, Utc::now(), tuning.interval);
+                if delay < tuning.interval {
+                    ticker = tokio::time::interval_at(
+                        tokio::time::Instant::now() + delay,
+                        tuning.interval,
+                    );
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                }
             }
             Err(e) => {
                 // Unreachable for a panic (`guarded_tick` catches it); a

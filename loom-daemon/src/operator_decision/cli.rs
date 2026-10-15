@@ -123,9 +123,20 @@ fn push_unique(v: &mut Vec<String>, s: &str) {
     }
 }
 
+/// `label` with a retired name read as its replacement (#11795): an
+/// `--also-label loom:operator-only` from a not-yet-updated caller adds
+/// `loom:operator`, never a retired name. A retired label with no replacement
+/// maps to `""`, which `push_unique` drops.
+fn current_name(label: &str) -> &str {
+    match crate::label_registry::Registry::embedded().get_retired(label) {
+        Some(r) => r.replaced_by.as_deref().unwrap_or(""),
+        None => label,
+    }
+}
+
 /// `apply`. Refuses before ANY forge call when the input is invalid; writes
 /// the body before applying any label, so a failed body edit never leaves a
-/// `loom:operator-decision` label on a free-prose body.
+/// `loom:operator` decision label on a free-prose body.
 pub fn apply(
     forge: &mut dyn Forge,
     input: &str,
@@ -139,7 +150,7 @@ pub fn apply(
     };
     let mut wanted = vec![DECISION_LABEL.to_string()];
     for l in &req.also_labels {
-        push_unique(&mut wanted, l);
+        push_unique(&mut wanted, current_name(l.trim()));
     }
 
     match &req.target {
@@ -226,6 +237,20 @@ pub fn apply(
             let _ = writeln!(out, "LABELS_REMOVE={}", remove.join(","));
             exit::OK
         }
+    }
+}
+
+/// Journal a decision [`apply`] filed on an existing issue (exit `0`, not a
+/// dry run) for the role run's verdict record (#12027). Best-effort and a
+/// no-op outside a journaled run: it never changes output or exit.
+pub fn journal_applied(req: &ApplyRequest, code: i32) {
+    if let (exit::OK, false, Target::Existing(issue)) = (code, req.dry_run, &req.target) {
+        crate::observability::pick_journal::record_applied(
+            *issue,
+            false,
+            "escalated",
+            "operator_decision",
+        );
     }
 }
 
@@ -490,4 +515,49 @@ impl Forge for GhForge {
 #[must_use]
 pub fn default_repo_root() -> PathBuf {
     crate::repo_root::find_repo_root_from_cwd().unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod journal_tests {
+    use super::*;
+    use crate::observability::pick_journal::{parse, set_test_journal, JournalEntry};
+
+    fn journaled(req: &ApplyRequest, code: i32) -> Vec<JournalEntry> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        set_test_journal(Some(path.clone()));
+        journal_applied(req, code);
+        set_test_journal(None);
+        parse(&std::fs::read_to_string(&path).unwrap_or_default())
+    }
+
+    #[test]
+    fn a_landed_decision_on_an_issue_journals_one_escalated_write() {
+        let req = ApplyRequest {
+            target: Target::Existing(42),
+            also_labels: Vec::new(),
+            remove_labels: Vec::new(),
+            dry_run: false,
+        };
+        assert!(matches!(
+            journaled(&req, exit::OK).as_slice(),
+            [JournalEntry::Applied { number: 42, action, by, .. }]
+                if action == "escalated" && by == "operator_decision"
+        ));
+        assert!(journaled(&req, exit::FORGE).is_empty(), "a failed apply");
+        assert!(journaled(&req, exit::REFUSED).is_empty(), "a refused apply");
+        let dry = ApplyRequest {
+            dry_run: true,
+            ..req.clone()
+        };
+        assert!(journaled(&dry, exit::OK).is_empty(), "a dry run wrote nothing");
+        let new = ApplyRequest {
+            target: Target::New {
+                title: "t".to_string(),
+            },
+            ..req
+        };
+        assert!(journaled(&new, exit::OK).is_empty(), "a new filing is no verdict");
+    }
 }

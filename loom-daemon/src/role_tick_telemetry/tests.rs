@@ -20,8 +20,13 @@ fn tick(result: RoleTickResult) -> RoleTickTelemetry {
         effort: Some("high".to_string()),
         detail: None,
         gated_pool: None,
+        failure_class: None,
         preference_tier: None,
         preference_tap: None,
+        role_draw: None,
+        step_sweep_id: None,
+        deferred_by: None,
+        shard_owner: None,
     }
 }
 
@@ -811,6 +816,8 @@ fn a_preference_resolved_tick_records_the_chosen_tier_and_tap() {
                          tier=2 tap=opencode:zai-metered source=preference"
                         .to_string(),
                     model_profile: Some("zai-metered".to_string()),
+                    model: None,
+                    draw: None,
                 },
             )),
         ),
@@ -848,4 +855,69 @@ fn an_unconfigured_tick_records_no_preference_tier() {
     assert_eq!(records[0].model.as_deref(), Some("claude-sonnet-5"));
     assert_eq!(records[0].preference_tier, None);
     assert_eq!(records[0].preference_tap, None);
+}
+
+/// #11858: a tick's record is also offered to the OTLP exporters — a
+/// pre-spawn skip included, which is the case only this export makes
+/// visible — with a non-slug repo read as `repo_unresolved`, never a path.
+#[test]
+#[serial_test::serial]
+fn a_tick_record_is_exported_without_a_local_path() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let journal = stage_tick_env(dir.path(), &root, "curator", "");
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        emit_for_tick(&root, "curator", Utc::now(), &RoleTickOutcome::QueueEmpty, None);
+    });
+    let local = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+    assert_eq!(local.len(), 1, "the journal still gets its record");
+    assert_eq!(local[0].repo, root.display().to_string());
+    let exported: Vec<_> = captured
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            TelemetryRecord::RoleTickOutcome(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exported.len(), 1, "{:?}", captured.records);
+    assert_eq!(exported[0].result, RoleTickResult::SkippedQueueEmpty);
+    assert_eq!(exported[0].repo, crate::observability::pick_decision::REPO_UNRESOLVED);
+}
+
+/// #12028: a failed tick's class is the span's when it launched, else the
+/// site's, else an explicit fallback; no other result carries one.
+#[test]
+fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
+    use crate::observability::lifecycle::{
+        RoleFailure, UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP,
+    };
+    let failed = RoleTickOutcome::Failure("free-form detail".into());
+    let site = RoleFailure::new("resume-refused", None, "m");
+    assert_eq!(
+        failure_class_of(&failed, None, Some(site.clone()), false).as_deref(),
+        Some("resume-refused")
+    );
+    assert_eq!(
+        failure_class_of(&failed, None, None, false).as_deref(),
+        Some(UNCLASSIFIED_PRE_LAUNCH)
+    );
+    assert_eq!(failure_class_of(&failed, None, None, true).as_deref(), Some(UNCLASSIFIED_STEP));
+    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(site), false), None);
+}
+
+#[test]
+fn only_a_failure_record_keeps_a_failure_class() {
+    let mut t = tick(RoleTickResult::Failure);
+    t.failure_class = Some("logs-dir-failed".into());
+    let record = build_record(&t, "o/r".into(), RepoVisibility::Private, None);
+    assert_eq!(record.failure_class.as_deref(), Some("logs-dir-failed"));
+    let mut t = tick(RoleTickResult::Success);
+    t.failure_class = Some("logs-dir-failed".into());
+    assert_eq!(
+        build_record(&t, "o/r".into(), RepoVisibility::Private, None).failure_class,
+        None
+    );
 }

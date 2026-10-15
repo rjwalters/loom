@@ -12,7 +12,11 @@
 //!
 //! # The rule
 //!
-//! **Fold** by `repo#issue`. Among the hosts that list the same issue, the
+//! **Fold** by `repo#issue` + `step` (Issue #11910): the same issue at two
+//! different steps — a Builder row on one host, a Judge row on another — is
+//! two fleet items, because they are two different pieces of work. A row
+//! with no `step` folds as `builder`, so pre-step plans fold exactly as they
+//! always did. Among the hosts that list the same issue and step, the
 //! **primary** — the observation that classifies the item for the fleet — is
 //! the one that wins, in order:
 //!
@@ -32,9 +36,9 @@
 //!
 //! # What is deliberately not compared
 //!
-//! `workspace_priority` is **per-host and unsynced** — it comes from each
-//! host's own `.loom/config.json`, so host A's `priority: 100` and host B's
-//! `priority: 100` are different repos' operators making unrelated
+//! `workspace_weight` is **per-host and unsynced** — it comes from each
+//! host's own `.loom/config.json`, so host A's `weight: 6` and host B's
+//! `weight: 6` are different repos' operators making unrelated
 //! statements. Comparing them across hosts would let one host's local
 //! numbering reorder another's queue. It is not a merge input, here or in the
 //! dashboard port. Within a host it already shaped `position`, which is what
@@ -45,7 +49,7 @@
 
 use std::collections::HashMap;
 
-use crate::types::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, RowPlan};
+use crate::types::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, PlanStep, RowPlan};
 
 /// Fold `hosts` into one fleet plan. Pure, total, and deterministic: the
 /// output depends only on the input slice, and never on its order (host id
@@ -60,7 +64,7 @@ pub fn merge_plans(hosts: &[HostPlan]) -> FleetPlan {
     host_ids.dedup();
     FleetPlan {
         hosts: host_ids,
-        items: order_fleet(fold_by_issue(hosts)),
+        items: order_fleet(fold_by_item_and_step(hosts)),
     }
 }
 
@@ -100,14 +104,18 @@ impl Candidate {
     }
 }
 
-/// Fold every host's rows by `repo#issue`, picking each item's primary.
-/// Returned in first-seen order; [`order_fleet`] does the ordering.
-fn fold_by_issue(hosts: &[HostPlan]) -> Vec<FleetPlanItem> {
-    let mut seen: Vec<(String, u32)> = Vec::new();
-    let mut folded: HashMap<(String, u32), Vec<Candidate>> = HashMap::new();
+/// The fold key: `repo`, `issue`, and the row's step with an absent `step`
+/// resolved to `builder`.
+type FoldKey = (String, u32, PlanStep);
+
+/// Fold every host's rows by `repo#issue` + `step`, picking each item's
+/// primary. Returned in first-seen order; [`order_fleet`] does the ordering.
+fn fold_by_item_and_step(hosts: &[HostPlan]) -> Vec<FleetPlanItem> {
+    let mut seen: Vec<FoldKey> = Vec::new();
+    let mut folded: HashMap<FoldKey, Vec<Candidate>> = HashMap::new();
     for host in hosts {
         for row in &host.rows {
-            let key = (row.repo.clone(), row.issue);
+            let key = (row.repo.clone(), row.issue, row.plan.step());
             folded
                 .entry(key.clone())
                 .or_insert_with(|| {
@@ -133,6 +141,7 @@ fn fold_by_issue(hosts: &[HostPlan]) -> Vec<FleetPlanItem> {
             FleetPlanItem {
                 repo: key.0,
                 issue: key.1,
+                step: key.2,
                 plan_state: primary.plan.plan_state,
                 primary,
                 others: observations.collect(),
@@ -151,6 +160,7 @@ struct FleetKey {
     position: u32,
     repo: String,
     issue: u32,
+    step: String,
 }
 
 impl FleetKey {
@@ -162,13 +172,14 @@ impl FleetKey {
             position: item.primary.plan.position.unwrap_or(u32::MAX),
             repo: item.repo.clone(),
             issue: item.issue,
+            step: item.step.name(),
         }
     }
 
     /// One host's own order within a state band — what the rounds are handed
-    /// out along. `repo`/`issue` only break a tie between two rows of the
-    /// same host with the same position, which a well-formed plan does not
-    /// contain; they are here so the result is total regardless.
+    /// out along. `repo`/`issue`/`step` only break a tie between two rows of
+    /// the same host with the same position, which a well-formed plan does
+    /// not contain; they are here so the result is total regardless.
     fn cmp_within_host(&self, other: &Self) -> std::cmp::Ordering {
         self.state
             .cmp(&other.state)
@@ -176,6 +187,7 @@ impl FleetKey {
             .then_with(|| self.position.cmp(&other.position))
             .then_with(|| self.repo.cmp(&other.repo))
             .then_with(|| self.issue.cmp(&other.issue))
+            .then_with(|| self.step.cmp(&other.step))
     }
 
     fn cmp_fleet(&self, other: &Self) -> std::cmp::Ordering {
@@ -186,6 +198,7 @@ impl FleetKey {
             .then_with(|| self.position.cmp(&other.position))
             .then_with(|| self.repo.cmp(&other.repo))
             .then_with(|| self.issue.cmp(&other.issue))
+            .then_with(|| self.step.cmp(&other.step))
     }
 }
 

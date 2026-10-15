@@ -6,6 +6,38 @@ use std::path::Path;
 
 use super::gh_call;
 
+/// The PR holds every PR-side pass leaves alone; re-exported as
+/// [`super::VERDICT_HOLD_LABELS`] (defined here because `claim_reconciliation.rs`
+/// is size-frozen). #11743 adds `loom:frozen`: review-conflict flagging, stale-
+/// verdict clearing and anchoring, and merge-order planning must not write to
+/// a frozen PR. Derived (#11795): [`crate::work_finder::HOLD_NAMES`], so the
+/// retired hold names still count until open items are migrated.
+pub use crate::work_finder::HOLD_NAMES as VERDICT_HOLDS;
+
+/// The PR-side claim pass's listing less every `loom:frozen` PR (#11743):
+/// `reconcile_pr_claims` must not remove a stale `loom:reviewing` /
+/// `loom:treating` from a frozen PR, nor backfill `loom:review-requested`.
+/// It decides on the listing's own labels, so it adds no read. Defined here
+/// because `claim_reconciliation.rs` is size-frozen.
+pub(super) fn drop_frozen_claims(
+    rows: Vec<crate::forge_pull_listing::RestPull>,
+    claim_label: &str,
+) -> Vec<crate::forge_pull_listing::RestPull> {
+    rows.into_iter()
+        .filter(|r| {
+            let frozen = crate::work_finder::is_frozen(&r.labels);
+            if frozen {
+                log::info!(
+                    "claim_reconciliation: PR #{} is `loom:frozen` — leaving its {claim_label} \
+                     claim alone (#11743)",
+                    r.number
+                );
+            }
+            !frozen
+        })
+        .collect()
+}
+
 /// The PR's currently-applied state labels plus its draft status (a
 /// best-effort subset of the REST `pulls/{n}` body — `labels[].name` and
 /// `draft` — used only to decide whether [`super::forge::reclaim_pr`]'s

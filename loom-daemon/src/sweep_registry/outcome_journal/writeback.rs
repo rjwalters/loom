@@ -47,6 +47,15 @@
 //! risking a duplicate: the comment is informational and best-effort, so a
 //! rare missed post is cheaper than a rare duplicate.
 //!
+//! # Never on a frozen issue (#11743)
+//!
+//! No daemon path writes to a `loom:frozen` item. The outcome record is built
+//! from one REST issue read ([`super::complexity_signal`]'s `IssueSignals`),
+//! which carries the labels, so [`writeback_admitted`] decides on that read and
+//! adds no call. It fails CLOSED, like the idempotency check: when that read
+//! did not answer, frozen-ness is unknown and the informational comment is
+//! skipped.
+//!
 //! # Never blocks or fails the terminal transition
 //!
 //! Every step here is the same best-effort shape as
@@ -211,6 +220,19 @@ pub(crate) fn format_sweep_outcome_comment(record: &telemetry::SweepOutcomeRecor
     )
 }
 
+/// Whether the issue read behind an outcome record admits the write-back
+/// comment (#11743): the read answered and the issue is not `loom:frozen`.
+/// Fails closed on a failed read (see the module doc).
+pub(crate) fn writeback_admitted(issue: u32, signals: &complexity_signal::IssueSignals) -> bool {
+    if crate::work_finder::is_frozen(&signals.labels) {
+        log::info!(
+            "sweep_outcomes: issue #{issue} is `loom:frozen` — no sweep-outcome write-back (#11743)"
+        );
+        return false;
+    }
+    signals.closed.is_some()
+}
+
 impl SweepRegistry {
     /// Best-effort, opt-in write-back of `record` onto its issue (Issue
     /// #9056). No-op when: forge writes are disabled (`skip_label_flip`), the
@@ -352,6 +374,21 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    /// #11743: frozen refuses; an unanswered read fails closed; an open,
+    /// unfrozen issue is admitted.
+    #[test]
+    fn writeback_admission_refuses_frozen_and_unread_issues() {
+        use complexity_signal::IssueSignals;
+        let read = |labels: &[&str]| IssueSignals {
+            closed: Some(false),
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            ..IssueSignals::default()
+        };
+        assert!(writeback_admitted(1, &read(&["points:3"])));
+        assert!(!writeback_admitted(1, &read(&["points:3", "loom:frozen"])));
+        assert!(!writeback_admitted(1, &IssueSignals::default()), "fail closed");
+    }
+
     fn fixture_record() -> telemetry::SweepOutcomeRecord {
         telemetry::SweepOutcomeRecord {
             story_points: Some(8),
@@ -395,6 +432,7 @@ mod tests {
             previous_sweep_id: None,
             trigger: None,
             dispatch_origin: None,
+            role_draw: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,

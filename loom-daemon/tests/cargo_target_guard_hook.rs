@@ -64,7 +64,6 @@ impl Fixture {
             .env_remove("LOOM_TRACEPARENT")
             .env_remove("LOOM_TRACE_CONTEXT_FILE")
             .env_remove("LOOM_ROLE")
-            .env_remove("LOOM_FORGE_EGRESS_POLICY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -226,11 +225,12 @@ fn shared_fixture() -> (Fixture, PathBuf) {
 }
 
 #[test]
-fn shared_build_target_dir_asks_with_the_per_worktree_prefix() {
+fn shared_build_target_dir_denies_with_the_per_worktree_prefix() {
     let (f, shared) = shared_fixture();
     let (decision, reason) = f.run("cargo test -p loom-daemon", &[]);
-    assert_eq!(decision, "ask", "{reason}");
-    assert!(reason.starts_with("ASK [cargo-shared-target]"), "{reason}");
+    assert_eq!(decision, "deny", "{reason}");
+    assert!(reason.starts_with("BLOCKED [cargo-shared-target]"), "{reason}");
+    assert!(reason.contains("LOOM_GUARD_CARGO_SHARED_TARGET=0"), "{reason}");
     assert!(reason.contains(&shared.display().to_string()), "{reason}");
     assert!(
         reason.contains(&format!("CARGO_TARGET_DIR=\"{}/target\"", f.repo().display())),
@@ -245,7 +245,7 @@ fn shared_build_target_dir_asks_with_the_per_worktree_prefix() {
     std::fs::write(f.repo().join(".loom-cargo-target-dir"), format!("{}\n", per_wt.display()))
         .unwrap();
     let (decision, reason) = f.run("cargo build", &[]);
-    assert_eq!(decision, "ask", "{reason}");
+    assert_eq!(decision, "deny", "{reason}");
     assert!(
         reason.contains(&format!("CARGO_TARGET_DIR=\"{}\"", per_wt.display())),
         "{reason}"
@@ -253,7 +253,7 @@ fn shared_build_target_dir_asks_with_the_per_worktree_prefix() {
 }
 
 #[test]
-fn shared_ask_is_silent_with_an_explicit_dir_outside_a_worktree_or_unconfigured() {
+fn shared_deny_is_silent_with_an_explicit_dir_outside_a_worktree_or_unconfigured() {
     let (f, _) = shared_fixture();
     let repo = f.repo();
     f.assert_allowed(&format!("CARGO_TARGET_DIR={}/target cargo test", repo.display()), &[]);
@@ -273,7 +273,7 @@ fn shared_ask_is_silent_with_an_explicit_dir_outside_a_worktree_or_unconfigured(
 }
 
 #[test]
-fn shared_ask_toggle_off_allows() {
+fn shared_deny_toggle_off_allows() {
     let (f, _) = shared_fixture();
     f.assert_allowed("cargo test", &[("LOOM_GUARD_CARGO_SHARED_TARGET", Path::new("0"))]);
     std::fs::write(f.repo().join(".loom/config.json"), r#"{"guards":{"cargoSharedTarget":false}}"#)

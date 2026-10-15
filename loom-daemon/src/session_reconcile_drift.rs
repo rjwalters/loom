@@ -391,6 +391,10 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
         None => (label.to_path_buf(), account_mem.image.clone()),
     };
     let mem = &mut account_mem.drift;
+    if let Err(error) = super::skew::guard_image(inputs, image.as_deref()) {
+        let why = format!("recreating from the recorded image is refused: {error:#}");
+        return Ok(unachievable(&container, name, drift, &why, mem));
+    }
     let refused = refusal(&workspace, inputs).err();
     if let Some(error) = &refused {
         if denied.is_empty() {

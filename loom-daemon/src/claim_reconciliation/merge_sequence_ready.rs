@@ -57,10 +57,15 @@
 //! 1-3 above all become transitive. Hard (human) holds are untouched, as
 //! before: only the predicate for *predecessors* changes.
 //!
-//! "Ready" is read from labels only: CI state and mergeability are not in the
-//! open-PR listing, and fetching them per PR per tick would spend the API
-//! budget #10332 is reducing. `loom:ci-failure` is the CI proxy the fleet
-//! already maintains.
+//! **Landable now (#12010).** Labels alone miss an approved PR that later
+//! goes red or conflicting (the Judge's `loom:ci-failure` is only applied
+//! during a review). [`super::landable::tag_unlandable`] reads each ready
+//! PR's CI on its current head and its mergeability (conditional, ETag'd
+//! reads) and tags a definite failure or conflict in memory
+//! ([`super::landable::CI_RED_LABEL`], [`super::landable::CONFLICTING_LABEL`]),
+//! so every rule above treats it as not ready. Pending or unknown CI and
+//! unknown mergeability change nothing, and [`release_reason`] names the
+//! concrete cause.
 
 use std::collections::BTreeMap;
 
@@ -74,14 +79,16 @@ use super::{
 pub const APPROVED_LABEL: &str = "loom:pr";
 
 /// Labels that make an approved PR not ready to land: a review finding, a
-/// red CI run, or a block.
-pub const NOT_READY_LABELS: [&str; 5] = [
+/// red CI run, or a block, plus the in-memory "not landable now" tags.
+pub const NOT_READY_LABELS: [&str; 7] = [
     "loom:changes-requested",
     "loom:ci-failure",
     "loom:blocked",
     // Parked for a human; a re-date budget that ran out lands here (#10465).
     "loom:operator",
     NOT_LANDABLE_LABEL,
+    super::landable::CI_RED_LABEL,
+    super::landable::CONFLICTING_LABEL,
 ];
 
 /// In-memory only (never written to the forge): set by [`demote_unlandable`]
@@ -207,9 +214,18 @@ pub fn with_readiness(
     }
 }
 
-/// The release reason for [`HoldAction::ReleaseNotReady`].
+/// The release reason for [`HoldAction::ReleaseNotReady`]. `head` is the
+/// predecessor's row as this tick read it: a live red or conflicting head is
+/// named concretely (#12010).
 #[must_use]
-pub fn release_reason(marker: &SequenceMarker) -> String {
+pub fn release_reason(marker: &SequenceMarker, head: Option<&SequencePr>) -> String {
+    if let Some(cause) = head.and_then(super::landable::cause) {
+        return format!(
+            "#{} is not landable now: {cause} — ready work is not held behind it (#12010), \
+             and the order is re-derived from current readiness on the next tick",
+            marker.after
+        );
+    }
     format!(
         "#{} is not ready to land (no `loom:pr` verdict, it carries `loom:changes-requested`, \
          `loom:ci-failure`, `loom:blocked` or `loom:operator`, or it is itself sequenced behind a \

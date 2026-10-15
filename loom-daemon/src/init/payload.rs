@@ -27,7 +27,8 @@
 //! `resync-installed.sh` refreshes more than the payload step writes. Those
 //! surfaces, and the one table that names them, are in [`surfaces`] (#10895):
 //! `.agents/skills/` (marker-gated), `.claude/README.md`,
-//! `.github/CONFIGURATION.md`, `.claude/biome.jsonc`, the Loom-managed block
+//! `.github/CONFIGURATION.md`, `.claude/biome.jsonc`, the files of an existing
+//! `.claude/agents/` directory (#11033), the Loom-managed block
 //! of `.gitignore`, the two template-substituted guides (`.loom/CLAUDE.md`,
 //! `.loom/AGENTS.md`, re-rendered with the install date they already carry)
 //! and the retired-payload sweep. Each is a step over the same staging tree,
@@ -99,6 +100,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tempfile::TempDir;
 
+pub(crate) mod labels_block;
 pub mod standalone;
 pub(crate) mod surfaces;
 
@@ -113,6 +115,13 @@ use crate::install_compat::{
 /// The packed `defaults/` tree this binary was built from (see `build.rs`).
 static EMBEDDED_PAYLOAD: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/install-payload.tar.zst"));
+
+/// The packed `defaults/` tree itself, for [`crate::hooks_home`], which
+/// unpacks the hook-runtime part of it for the sessions this daemon spawns.
+#[must_use]
+pub fn embedded_archive() -> &'static [u8] {
+    EMBEDDED_PAYLOAD
+}
 
 /// The `.loom/` directories [`super::install_payload_files`] syncs by name.
 /// `payload_surface_covers_everything_the_installer_writes` (tests) fails if
@@ -536,6 +545,15 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         .map_err(|e| anyhow!("stage the extra surfaces: {e}"))?;
 
     let ownership = OwnershipBoundary::load(dest);
+    // A surface the repo pinned in `.loom/resync-ignore` is its own to keep,
+    // so a step's complaint about it is not ours to report (the script checks
+    // the pin first). Otherwise a repo that pins `.github/labels.yml` because
+    // its markers are non-standard would fail every run (#11033).
+    skipped_surfaces.retain(|skip| {
+        !surfaces::pin_names(&skip.path)
+            .iter()
+            .any(|name| ownership.is_declared_repo_owned(name))
+    });
     let mut diff = PayloadDiff {
         added: Vec::new(),
         changed: Vec::new(),

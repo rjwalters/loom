@@ -13,7 +13,7 @@ use crate::types::{PlanGate, PlanShard, PlanState, QueueDisposition as Qd, RepoC
 fn key(ws: usize, prio: u32, number: u32) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: ws,
-        workspace_priority: prio,
+        workspace_weight: prio,
         number,
         ..PriorityCandidate::default()
     }
@@ -38,6 +38,7 @@ fn qrow_held(
         updated_at: None,
         held_until,
         story_points: None,
+        step: None,
     }
 }
 

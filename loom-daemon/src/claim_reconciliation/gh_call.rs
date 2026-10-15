@@ -83,7 +83,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "guard.open_pr_timeline"
         | "outcome.label_timeline"
         | "restore.label_timeline"
-        | "sequence.label_timeline" => ops::TIMELINE_READ,
+        | "sequence.label_timeline"
+        | "intake.label_events"
+        | "champion.label_events" => ops::TIMELINE_READ,
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"
         | "guard.lease_comments"
@@ -91,11 +93,15 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "verdict.pr_comments"
         | "quarantine.issue_comments"
         | "sequence.trusted_bodies"
-        | "roster.comments" => ops::COMMENT_LIST,
+        | "roster.comments"
+        | "landed.route_marker" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
-        "park_hold.issue_view" => ops::ISSUE_VIEW_STATE,
+        "park_hold.issue_view"
+        | "release_veto.issue_labels"
+        | "intake.recheck"
+        | "landed.issue_labels" => ops::ISSUE_VIEW_STATE,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
-        "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
+        "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"
         | "claim.pr_add_label"
         | "claim.pr_reclaim"
@@ -103,6 +109,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "heal.issue_add_label"
         | "intake.add_triage"
         | "intake.remove_triage"
+        | "intake.remove_label"
+        | "landed.add_triage"
+        | "landed.remove_issue"
         | "verdict.clear_labels"
         | "verdict.requeue_unanchored"
         | "sequence.pr_edit"
@@ -125,7 +134,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "watchdog.gaveup_comment"
         | "watchdog.stale_comment"
         | "outcome.writeback_comment"
-        | "prless.comment" => ops::COMMENT_CREATE,
+        | "prless.comment"
+        | "intake.demote_comment"
+        | "landed.comment" => ops::COMMENT_CREATE,
         "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
             ops::COMMENT_EDIT_DELETE
         }

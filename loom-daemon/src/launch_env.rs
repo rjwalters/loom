@@ -54,6 +54,11 @@ pub fn apply_launch_env(cmd: &mut Command, admission: Option<&ResolvedRuntime>, 
     };
     cmd.env("LOOM_RUNTIME", &admission.runtime);
     cmd.env("LOOM_ROLE", &admission.role);
+    // #12207: the agent `gh` front's read routing (the gateway profiles and
+    // the reader root). The child is `spawn-worker.sh`, whose `loom-daemon
+    // worker` passes these on to the agent it execs; without them here every
+    // dispatched agent's reads went to the writer.
+    apply_vars(cmd, crate::forge_gateway::agent_env());
     // Set ONLY when the ordered preference walk actually decided this launch.
     // On the static path the variable is never set, so a child's log stays
     // byte-identical to its pre-#8599 output (#8554's absent-config
@@ -79,6 +84,16 @@ pub fn apply_launch_env(cmd: &mut Command, admission: Option<&ResolvedRuntime>, 
         crate::runtime_admission::suggested_worker_type_mismatch_warning(admission)
     {
         log::warn!("{message}");
+    }
+}
+
+/// Set each `Some` and remove each `None` (an inherited value never stands).
+fn apply_vars(cmd: &mut Command, vars: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+    for (key, value) in vars {
+        match value {
+            Some(v) => cmd.env(key, v),
+            None => cmd.env_remove(key),
+        };
     }
 }
 
@@ -112,6 +127,8 @@ mod tests {
                      tap=opencode:zai-metered source=preference"
                 .into(),
             model_profile: Some("zai-metered".into()),
+            model: None,
+            draw: None,
         }
     }
 
@@ -125,6 +142,8 @@ mod tests {
                      source=preference"
                 .into(),
             model_profile: None,
+            model: None,
+            draw: None,
         }
     }
 
@@ -206,5 +225,39 @@ mod tests {
         let mut opted_out = Command::new("/bin/true");
         apply_launch_env(&mut opted_out, None, "test");
         assert!(env_of(&opted_out).is_empty(), "{:?}", env_of(&opted_out));
+    }
+
+    /// #12207: an admitted launch carries the front's read routing, set or
+    /// removed, so `spawn-worker.sh` hands it on to the agent; before, no
+    /// dispatched agent ever saw the gateway.
+    #[test]
+    fn an_admitted_launch_carries_the_front_read_routing() {
+        let mut cmd = Command::new("/bin/true");
+        apply_launch_env(&mut cmd, Some(&admitted(None)), "test");
+        let names: Vec<String> = cmd
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for key in [
+            crate::forge_gateway::DIR_ENV,
+            crate::forge_identity::FRONT_ROOT_ENV,
+        ] {
+            assert!(names.iter().any(|n| n == key), "{key}: {names:?}");
+        }
+
+        let mut set = Command::new("/bin/true");
+        apply_vars(
+            &mut set,
+            vec![
+                ("LOOM_GH_GATEWAY_DIR", Some("/w/.loom/gh-config-gateway".into())),
+                ("X", None),
+            ],
+        );
+        let envs: Vec<_> = set.get_envs().collect();
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("LOOM_GH_GATEWAY_DIR"),
+            Some(std::ffi::OsStr::new("/w/.loom/gh-config-gateway"))
+        )));
+        assert!(envs.contains(&(std::ffi::OsStr::new("X"), None)), "None removes: {envs:?}");
     }
 }

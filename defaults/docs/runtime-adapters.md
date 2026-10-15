@@ -312,7 +312,12 @@ tiering is the seed for how a non-Claude runtime should choose which concrete
 model a tier maps to.
 
 **The Codex adapter deliberately does NOT do this yet (#4468).** It ships
-*model-mapping minimalism*: `LOOM_MODEL` is forwarded verbatim to `codex -m`, an
+*model-mapping minimalism*: `LOOM_MODEL` is forwarded to `codex -m` (split on the first
+`@`: a `model@effort` rung suffix, #8387, is never forwarded; the base becomes `-m` and
+the suffix becomes `-c model_reasoning_effort=<suffix>` at the lowest precedence:
+explicit `-c` > `--effort` > `LOOM_EFFORT` > suffix; an empty base falls through to
+`LOOM_CODEX_MODEL`/no `-m`, an empty suffix is ignored; the same split applies to
+`LOOM_CODEX_MODEL`, and an explicit `-m foo@high` arg is passed through unchanged), an
 explicit `-m`/`--model` wins, `LOOM_CODEX_MODEL` supplies an optional static
 adapter default, and with none of those set **no `-m` flag is emitted at all** so
 the Codex CLI/profile default is preserved (exactly `spawn-claude.sh`'s
@@ -1262,6 +1267,24 @@ sweep, role-runner and epic dispatch surfaces strip them from any child that
 cannot use them. Contract, per-runtime mapping and the red line:
 [`llm-gateway.md`](llm-gateway.md).
 
+### Weighted per-stage, per-attempt draw (`runtimes.roleDraw`, issue #11726)
+
+`runtimes.roleDraw.<role>` replaces the ordered `rolePreference` list for a
+stage with a seeded, weighted draw per attempt, for example
+`"judge": [{"attempt": 1, "draw": {"claude/opus": 80, "claude/fable": 10,
+"codex": 10}}, {"attempt": 2, "draw": {"claude/fable": 100}}]`, plus
+`runtimes.excludeProviders` to drop a runtime from every table on a host. The
+draw orders the candidates by weight and runs the walk below over that order,
+so admission, availability, the launch-failure hold and the ceiling apply
+unchanged, and an unavailable candidate is excluded with the rest
+renormalised. A failed or blocked role tick moves the role to the next
+attempt's table. A role with no table keeps `rolePreference`; an operator pin
+still wins. A candidate key is `<runtime>[:<profile>][/<model-or-profile>]`:
+`claude` ≡ the `"claude"` entry, `opencode:zai-flash` ≡
+`{"runtime":"opencode","modelProfile":"zai-flash"}`, and `claude/opus` adds a
+`--model` pin. The full contract, the per-tier merge, telemetry and `loom-daemon
+roles draw --explain` are in [role-draw.md](role-draw.md).
+
 ### Ordered runtime preference with fall-through (issue #8436)
 
 The precedence chain above is **static**: it picks a runtime without asking
@@ -1323,6 +1346,16 @@ or Doctor**, however high it sits in the list. For build work
 entry is recorded as skipped with reason `not-admitted(worktreeIsolation)`, which
 is materially different from "Codex had no credential" and should be read that
 way.
+
+**Model-profile resolution and the unknown-profile failure (#11638).** A launch
+resolves its profile name from, in order: an explicit request (`--profile`, or a
+preference tap's `modelProfile`), `LOOM_MODEL_PROFILE`, `runtimes.defaultModelProfile`,
+then the built-in `zai-flash` fallback. The name is then looked up in
+`runtimes.modelProfiles` (which shadows) and the bundled set. A name found in
+neither is a **hard exit 78**, never a fallback to `zai-flash`: the message names
+the profile looked up, where the name came from, and the sorted known profile
+names (names only, never credential values). `loom-daemon worker profile-check
+<name>` reproduces it.
 
 **Model-profile role exclusion (`excludedRoles`, #11400).** A model profile may
 list roles it must never run, e.g. `"excludedRoles": ["judge", "curator"]` on the

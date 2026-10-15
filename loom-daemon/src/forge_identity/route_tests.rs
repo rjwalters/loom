@@ -43,7 +43,6 @@ fn workspace(r: &Roster, owners: &[&str]) -> tempfile::TempDir {
 fn v2(cfg: &RoutingConfig) -> RouteEnv<'_> {
     RouteEnv {
         mode: RoutingMode::Scoped,
-        egress_forbidden: false,
         cfg,
     }
 }
@@ -154,12 +153,12 @@ fn every_reader_withdrawn_is_exhausted_until_the_earliest_return() {
     let d = route_read_in(ws.path(), &r, &req("acme/dry", None), &v2(&cfg), now);
     // 81021 is out of budget, but 81022's withdrawal is not a rate limit
     // (a plain scoped withdrawal, as a refused credential records): not a
-    // budget exhaustion, so nothing may be shed on it.
+    // budget exhaustion, but a time-bounded withdrawal (2026-10-15).
     assert_eq!(
         d,
         RouteDecision::Exhausted {
             until: soon,
-            cause: ExhaustCause::Unavailable
+            cause: ExhaustCause::Withdrawn
         }
     );
     assert_eq!(d.into_credential(), None, "a Gate caller goes to the writer");
@@ -187,33 +186,6 @@ fn an_empty_roster_a_foreign_host_or_no_owner_is_no_pool() {
         route_read_in(ws.path(), &r, &req("", None), &v2(&cfg), now),
         RouteDecision::NoPool
     );
-}
-
-#[test]
-fn a_forbidden_egress_is_no_pool_in_v2_and_ignored_in_legacy() {
-    let r = roster(vec![reader("81041", None), reader("81042", None)]);
-    let ws = workspace(&r, &["acme"]);
-    let cfg = RoutingConfig::default();
-    let now = SystemTime::now();
-    let forbidden = RouteEnv {
-        mode: RoutingMode::Scoped,
-        egress_forbidden: true,
-        cfg: &cfg,
-    };
-    assert_eq!(
-        route_read_in(ws.path(), &r, &req("acme/egress", None), &forbidden, now),
-        RouteDecision::NoPool,
-        "NoPool, not Exhausted: nothing is shed"
-    );
-    // Legacy read_credential never checked egress: same answer as pre-change.
-    let legacy = RouteEnv {
-        mode: RoutingMode::Legacy,
-        egress_forbidden: true,
-        cfg: &cfg,
-    };
-    let home = forge_read_pool::assignment_index("acme/egress", 2).unwrap();
-    let d = route_read_in(ws.path(), &r, &req("acme/egress", None), &legacy, now);
-    assert_eq!(app_of(&d), r.readers[home].app_id);
 }
 
 // ---- owners filter -------------------------------------------------------------
@@ -315,7 +287,6 @@ fn split_falls_back_to_home_without_a_key_or_when_disabled() {
     }
     let legacy = RouteEnv {
         mode: RoutingMode::Legacy,
-        egress_forbidden: false,
         cfg: &cfg,
     };
     for url in urls("acme/hot2", 20) {
@@ -770,7 +741,7 @@ fn no_fresh_reader_dir_is_not_a_budget_exhaustion() {
 }
 
 #[test]
-fn a_credential_withdrawal_beside_a_budget_one_is_not_a_budget_exhaustion() {
+fn a_credential_withdrawal_beside_a_budget_one_is_a_withdrawn_exhaustion() {
     let r = roster(vec![reader("81321", None), reader("81322", None)]);
     let ws = workspace(&r, &["acme"]);
     let cfg = RoutingConfig::default();
@@ -790,7 +761,40 @@ fn a_credential_withdrawal_beside_a_budget_one_is_not_a_budget_exhaustion() {
         until,
     );
     let d = route_read_in(ws.path(), &r, &hygiene("acme/mixed"), &v2(&cfg), now);
+    // 2026-10-15: this mix was `Unavailable`, which sent every Hygiene and
+    // Observability read to the writer. Both exclusions end on their own.
+    assert_eq!(cause_of(&d), ExhaustCause::Withdrawn);
+    assert!(ReadClass::Hygiene.sheds(cause_of(&d)));
+    assert!(ReadClass::Observability.sheds(cause_of(&d)));
+    assert!(!ReadClass::Gate.sheds(cause_of(&d)));
+}
+
+#[test]
+fn an_app_wide_withdrawal_beside_a_budget_one_is_withdrawn_and_a_stale_dir_unavailable() {
+    let r = roster(vec![reader("81391", None), reader("81392", None)]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = RoutingConfig::default();
+    let now = SystemTime::now();
+    let until = now + Duration::from_secs(600);
+    forge_read_pool::withdraw_scoped_budget_until(
+        "81391",
+        "acme",
+        forge_read_pool::ResourceScope::Core,
+        until,
+    );
+    forge_read_pool::withdraw_until("81392", until);
+    let d = route_read_in(ws.path(), &r, &hygiene("acme/app-wide"), &v2(&cfg), now);
+    assert_eq!(cause_of(&d), ExhaustCause::Withdrawn);
+
+    // A stale token directory may never clear: Unavailable, even beside a
+    // withdrawal. Hygiene goes to the writer; Observability still sheds.
+    let r = roster(vec![reader("81393", None), reader("81394", None)]);
+    let ws = workspace(&r, &["other"]);
+    forge_read_pool::withdraw_until("81393", until);
+    let d = route_read_in(ws.path(), &r, &hygiene("acme/stale"), &v2(&cfg), now);
     assert_eq!(cause_of(&d), ExhaustCause::Unavailable);
+    assert!(!ReadClass::Hygiene.sheds(cause_of(&d)));
+    assert!(ReadClass::Observability.sheds(cause_of(&d)));
 }
 
 #[test]
@@ -894,4 +898,18 @@ fn shed_pct_is_validated_between_target_and_full() {
         "targetMaxPct": 50, "spillProjectedPct": 60, "spillFullPct": 75
     }));
     assert_eq!((cfg.shed_pct, w.len()), (75.0, 0));
+}
+
+/// #12207: in the agent front a reader directory comes from the environment,
+/// so a reader decision stands only for a private directory.
+#[test]
+fn the_front_uses_a_reader_only_when_its_directory_is_private() {
+    let reader = RouteDecision::Reader {
+        dir: PathBuf::from("/ws/.loom/gh-config-by-owner/acme/7"),
+        app_id: "7".into(),
+        placement: Placement::Home,
+    };
+    assert_eq!(trusted_in_front(reader.clone(), &|_| true), reader);
+    assert_eq!(trusted_in_front(reader, &|_| false), RouteDecision::NoPool);
+    assert_eq!(trusted_in_front(RouteDecision::NoPool, &|_| false), RouteDecision::NoPool);
 }

@@ -3,7 +3,7 @@
 //! Runs inside the process that owns the forge credentials and routing, so
 //! the read uses exactly the identity every other daemon `gh` call uses. All
 //! environment access goes through [`Backend`] so the handler's decisions are
-//! testable without a forge, a registry file or a policy on disk.
+//! testable without a forge or a registry file.
 
 use std::path::{Path, PathBuf};
 
@@ -17,9 +17,6 @@ const ROUTE_PREFIX: &str = "daemon-gh";
 pub trait Backend {
     /// `owner/repo` from `root`'s `origin` remote on the supported forge host.
     fn remote_slug(&self, root: &Path) -> Option<String>;
-    /// `Some(codes)` when the effective forge-egress policy refuses forge work
-    /// for `root`. Codes are non-secret policy finding identifiers.
-    fn admission_refusal(&self, root: &Path) -> Option<String>;
     /// Run the one `gh issue view` for `slug`/`issue` from `root`.
     fn read(&self, root: &Path, slug: &str, issue: u64) -> GhRead;
 }
@@ -28,7 +25,7 @@ pub trait Backend {
 pub struct GhRead {
     /// Stdout, only when the process ran and exited zero.
     pub stdout: Option<Vec<u8>>,
-    /// The launcher rung that ran it (`policy`, `path`, ...).
+    /// The launcher rung that ran it (`env_override`, `path`, ...).
     pub source: &'static str,
 }
 
@@ -38,11 +35,6 @@ pub struct LiveBackend;
 impl Backend for LiveBackend {
     fn remote_slug(&self, root: &Path) -> Option<String> {
         crate::release_resolve::host::repo_slug(root)
-    }
-
-    fn admission_refusal(&self, root: &Path) -> Option<String> {
-        let sources = crate::forge_egress::policy::PolicySources::from_process(Some(root));
-        crate::forge_egress::gate::dispatch_refusal_with(&sources, root).map(|r| r.codes.join(","))
     }
 
     fn read(&self, root: &Path, slug: &str, issue: u64) -> GhRead {
@@ -84,9 +76,6 @@ pub fn serve(
     match backend.remote_slug(&root) {
         Some(own) if own.eq_ignore_ascii_case(repo) => {}
         _ => return unknown("identity-mismatch"),
-    }
-    if let Some(codes) = backend.admission_refusal(&root) {
-        return unknown(&format!("routing-refused:{codes}"));
     }
     let read = backend.read(&root, repo, issue);
     let route = format!("{ROUTE_PREFIX}/{}", read.source);

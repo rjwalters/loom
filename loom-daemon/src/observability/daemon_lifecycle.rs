@@ -42,6 +42,10 @@ pub fn start_record(supervisor: &str) -> TelemetryRecord {
             "supervisor": supervisor,
             "config_sha": crate::fleet_sync::applied::applied_config_sha().as_resource_value(),
             "pid": std::process::id(),
+            // #11934: how the work finder resolved at startup (null when the
+            // daemon has not evaluated it). `forced_off: true` is a configured
+            // dispatcher whose env switched its work finder off.
+            "work_finder": crate::work_finder_guard::startup_verdict(),
         }),
     })
 }
@@ -95,6 +99,8 @@ mod tests {
             "config_sha must be a SHA or an explicit sentinel, got {sha:?}"
         );
         assert_eq!(p["pid"], std::process::id());
+        // #11934: present on every record; null until the daemon evaluated it.
+        assert!(p.get("work_finder").is_some(), "daemon.start carries work_finder");
     }
 
     #[test]

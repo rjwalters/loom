@@ -13,6 +13,7 @@ mod host_health;
 mod host_health_omissions;
 mod kind_registry;
 mod retired_complexity;
+mod role_draw;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
@@ -135,6 +136,7 @@ pub(super) fn sweep_outcome() -> TelemetryRecord {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -164,14 +166,12 @@ fn host_health() -> TelemetryRecord {
             ManagedRepoEntry {
                 slug: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
-                priority: Some(0),
-                stale_blocked_release: None,
+                weight: Some(0),
             },
             ManagedRepoEntry {
                 slug: "2AMLogic/gf180-pll".to_string(),
                 visibility: RepoVisibility::Private,
-                priority: None,
-                stale_blocked_release: None,
+                weight: None,
             },
         ],
         roles: RoleTickHealth {
@@ -293,6 +293,7 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -429,6 +430,7 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -494,6 +496,7 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -815,6 +818,7 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,

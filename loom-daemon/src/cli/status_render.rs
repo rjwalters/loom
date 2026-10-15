@@ -12,7 +12,6 @@ mod capacity_line;
 mod drain_render;
 mod fleet_store_line;
 mod forge_calls_render;
-mod forge_egress_line;
 mod forge_events_line;
 mod holds;
 mod last_tick_line;
@@ -484,7 +483,7 @@ pub(crate) fn build_status_json_value_for(
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
             "root": r.root,
-            "priority": r.priority,
+            "weight": r.weight,
             "in_flight_count": r.in_flight_count,
             "health_gate_halted": r.health_gate_halted,
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
@@ -616,6 +615,8 @@ pub(crate) fn build_status_json_value_for(
         "auto_update": {
             "enabled": report.auto_update_enabled,
             "mode": report.auto_update_mode, // #10954
+            "config_enabled": report.auto_update_config_enabled, // #11042
+            "floor_not_rolling": report.auto_update_floor_not_rolling, // #11042
             "last_check": report.auto_update_last_check,
             "last_roll": report.auto_update_last_roll,
             "consecutive_failures": report.auto_update_consecutive_failures,
@@ -806,14 +807,6 @@ pub(crate) fn build_status_json_value_for(
         if !pending_restart.is_null() {
             value["pending_restart"] = pending_restart;
         }
-    }
-    // Forge egress routing (#9984): fresh assert + the daemon's last doctor;
-    // always present; unconfigured hosts carry the policy.unconfigured notice.
-    let forge_egress = sections
-        .has(Section::ForgeEgress)
-        .then(forge_egress_line::json);
-    if let Some(forge_egress) = forge_egress.filter(|v| !v.is_null()) {
-        value["forge_egress"] = forge_egress;
     }
     sections.retain_keys(&mut value);
     value
@@ -1480,11 +1473,16 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
         let _ = writeln!(out, "  {:-<100}", "");
         for s in &report.in_flight {
             let issue = match &s.kind {
-                SweepKind::Issue(n) => format!("#{n}"),
+                SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => format!("#{n}"),
                 SweepKind::PrSet(_) => "prs".to_string(),
             };
             let repo = format_repo_column(s.repo.as_deref());
-            let mut phase = s.latest_phase.as_deref().unwrap_or("-").to_string();
+            // A step has no sweep phases; its role is its phase (#11898).
+            let fallback = s
+                .kind
+                .role()
+                .map_or("-", loom_daemon::step_role::StepRole::as_str);
+            let mut phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
             if s.overflow {
                 // #9244: the host's single over-limit starred sweep.
                 phase.push_str(" [overflow]");
@@ -2273,8 +2271,6 @@ pub(crate) fn print_status_human(
     // render` change this daemon's pid has not yet picked up. Nothing at all
     // once the daemon that saw the drift has restarted (or if none ever did).
     pending_restart_line::print(report.daemon_pid);
-    // Forge egress routing (#9984): an unconfigured host prints the notice (#10168).
-    forge_egress_line::print();
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before
@@ -2554,7 +2550,7 @@ pub(crate) fn print_status_human(
     // workspace; with `loom-daemon workspace add <path>` it lists every managed
     // repo, its in-flight count, and its own gate state.
     println!(
-        "\nManaged repos: {} (priority: lower = higher dispatch priority)",
+        "\nManaged repos: {} (weight: relative share of repo draws, higher = more)",
         report.per_repo.len()
     );
     if report.per_repo.is_empty() {
@@ -2569,7 +2565,7 @@ pub(crate) fn print_status_human(
         // the separator below) is unchanged.
         println!(
             "  {:>4}  {:>9}  {:<13}  {:<5}  REPO",
-            "PRIO", "IN-FLIGHT", "HEALTH-GATE", "ROLES"
+            "WGHT", "IN-FLIGHT", "HEALTH-GATE", "ROLES"
         );
         println!("  {:-<68}", "");
         for r in &report.per_repo {
@@ -2592,7 +2588,7 @@ pub(crate) fn print_status_human(
             let roles = if r.role_runner_enabled { "on" } else { "off" };
             println!(
                 "  {:>4}  {:>9}  {:<13}  {:<5}  {}{}",
-                r.priority,
+                r.weight,
                 r.in_flight_count,
                 gate,
                 roles,
@@ -2812,6 +2808,9 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
+        if let Some(why) = report.auto_update_floor_not_rolling {
+            println!("  Below the fleet floor, NOT rolling ({}): {}", why.as_str(), why.describe());
+        }
         last_tick_line::print(report);
     }
     task_liveness_line::print(&report.task_liveness);
@@ -3184,7 +3183,7 @@ mod status_render_tests {
         // row is `2 + 4 + 2 + 9 + 2 + 13 + 2 + 5 + 2` of fixed columns before
         // the variable-width REPO column, and the separator is `2 + 68`.
         let header_row =
-            format!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "PRIO", "IN-FLIGHT", HEADER, "ROLES");
+            format!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "WGHT", "IN-FLIGHT", HEADER, "ROLES");
         let separator = format!("  {:-<68}", "");
         assert!(
             header_row.len() <= separator.len(),
@@ -4689,7 +4688,7 @@ mod stash_status_render_tests {
         loom_daemon::types::RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             maintain_only: None,
-            priority: 100,
+            weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],
@@ -4938,7 +4937,7 @@ mod role_runner_diagnostic_source_render_tests {
         RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             maintain_only: None,
-            priority: 100,
+            weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],

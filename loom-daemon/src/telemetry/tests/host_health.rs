@@ -102,10 +102,10 @@ fn host_health_serializes_managed_repos_with_slug_and_visibility() {
             .and_then(serde_json::Value::as_str),
         Some("private")
     );
-    // #9244: a registered repo's dispatch priority ships; an unknown one is
+    // #11742: a registered repo's draw weight ships; an unknown one is
     // omitted.
-    assert_eq!(repos[0]["priority"], 0);
-    assert!(repos[1].get("priority").is_none());
+    assert_eq!(repos[0]["weight"], 0);
+    assert!(repos[1].get("weight").is_none());
 }
 
 #[test]
@@ -138,58 +138,42 @@ fn managed_repo_entry_with_missing_visibility_defaults_to_private() {
     assert_eq!(decoded.visibility, RepoVisibility::Private);
     assert_eq!(decoded.slug, "owner/repo");
     // No `priority` either (an older daemon): it decodes as absent.
-    assert_eq!(decoded.priority, None);
+    assert_eq!(decoded.weight, None);
 }
 
 #[test]
-fn managed_repo_entry_priority_is_on_the_wire_only_when_known() {
-    // #9244 / loom-ui#153: `priority` ships for a registered workspace and is
+fn managed_repo_entry_weight_is_on_the_wire_only_when_known() {
+    // #11742 (was `priority`, #9244 / loom-ui#153): `weight` ships for a registered workspace and is
     // omitted (never a fabricated default) for one that is not.
     let known = ManagedRepoEntry {
         slug: "rjwalters/loom".to_string(),
         visibility: RepoVisibility::Public,
-        priority: Some(0),
-        stale_blocked_release: None,
+        weight: Some(0),
     };
     let wire = serde_json::to_value(&known).unwrap();
-    assert_eq!(wire["priority"], 0);
+    assert_eq!(wire["weight"], 0);
     let unknown = ManagedRepoEntry {
-        priority: None,
+        weight: None,
         ..known
     };
     let wire = serde_json::to_value(&unknown).unwrap();
-    assert!(wire.get("priority").is_none(), "{wire}");
+    assert!(wire.get("weight").is_none(), "{wire}");
 }
 
 #[test]
-fn managed_repo_entry_carries_release_counters_only_once_ticked() {
-    // #10763: the release pass's per-repo tallies ride `managed_repos`, and
-    // are omitted (never a fabricated zero) before the pass ticked the repo.
-    let mut entry = ManagedRepoEntry {
-        slug: "2AMLogic/loom-ui".to_string(),
-        visibility: RepoVisibility::Private,
-        priority: None,
-        stale_blocked_release: None,
-    };
-    let wire = serde_json::to_value(&entry).unwrap();
+fn managed_repo_entry_from_a_daemon_with_the_release_pass_still_decodes() {
+    // #11301 retired the `loom:blocked` release pass and its per-repo
+    // `stale_blocked_release` tallies (#10763). An entry from an older daemon
+    // still carries them; the field is ignored, never a decode error.
+    let old: ManagedRepoEntry = serde_json::from_value(serde_json::json!({
+        "slug": "o/r",
+        "visibility": "private",
+        "stale_blocked_release": {"released": 3, "reparked": 2, "ticks": {"ran": 1}},
+    }))
+    .unwrap();
+    assert_eq!(old.slug, "o/r");
+    let wire = serde_json::to_value(&old).unwrap();
     assert!(wire.get("stale_blocked_release").is_none(), "{wire}");
-    entry.stale_blocked_release = Some(StaleBlockedReleaseCounters {
-        released: 3,
-        reparked: 2,
-        last_outcome: Some("ran".to_string()),
-        ticks: std::collections::BTreeMap::from([("ran".to_string(), 1)]),
-    });
-    let wire = serde_json::to_value(&entry).unwrap();
-    assert_eq!(wire["stale_blocked_release"]["released"], 3);
-    assert_eq!(wire["stale_blocked_release"]["reparked"], 2);
-    assert_eq!(wire["stale_blocked_release"]["ticks"]["ran"], 1);
-    let back: ManagedRepoEntry = serde_json::from_value(wire).unwrap();
-    assert_eq!(back, entry);
-    // A pre-#10763 entry still decodes.
-    let old: ManagedRepoEntry =
-        serde_json::from_value(serde_json::json!({"slug": "o/r", "visibility": "private"}))
-            .unwrap();
-    assert!(old.stale_blocked_release.is_none());
 }
 
 // ------------------------------------------------------------------

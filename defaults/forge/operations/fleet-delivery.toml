@@ -160,45 +160,6 @@ notes = "Never record a token value in evidence. The accounting layer records pr
 kind = "script"
 path = "defaults/scripts/lib/github-app-token.sh"
 
-[[operation]]
-id = "identity.prohibited-unmanaged-egress"
-group = "identity-authentication"
-summary = "Typed bypasses of the managed gh launcher (`gh api https://…`, `gh auth login|setup-git|refresh`, a GH_HOST override) — prohibited under an enforcing routing policy."
-profile = "required-coordination"
-disposition = "prohibition"
-class = "write"
-inputs = []
-outputs = []
-required_fields = []
-actor = "operator"
-permissions = ["metadata:read"]
-pagination = "not-paginated"
-consistency = "fresh-read"
-idempotency = "not-idempotent"
-retry = "no-auto-retry"
-version_support = { github = "0" }
-test_id = "forge-probe::fleet-delivery::identity-prohibited-unmanaged-egress"
-test_status = "declared"
-owner = "daemon-forge"
-risk = "normal"
-github = { commands = [
-  "gh api https://",
-  "gh auth login",
-  "gh auth setup-git",
-  "gh auth refresh",
-], routes = [] }
-platform_support = "documented"
-adapter_coverage = "none"
-caller_integration = "none"
-unknowns = []
-notes = "Classified as a PROHIBITION, not an active operation (#9989, C6 of epic #9983): each form reaches the forge with an unmanaged origin or credential, outside the managed launcher's routing. The callers below are the `loom:forge-egress` guard classifier and the role tool-policy deny-spec table (`role_tool_policy/forge_egress.rs`), which name these commands only in order to DENY them and to point at the managed alternative — the opposite of a caller, listed here so the forge-inventory gate resolves their `gh api` / `gh auth` text to this decision."
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/forge_egress/guard.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/role_tool_policy/forge_egress.rs"
-
 # --- quota-caching-errors ----------------------------------------------------
 
 [[operation]]
@@ -396,9 +357,6 @@ path = "loom-daemon/src/gh_repo_env.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_wait_checks/reads.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/stale_blocked/release_gh.rs"
 
 [[operation]]
 id = "repo.list-for-owner"
@@ -634,15 +592,12 @@ platform_support = "documented"
 adapter_coverage = "partial"
 caller_integration = "partial"
 unknowns = [
-  "whether a ref update can be made non-fast-forward-safe only with an expected-SHA precondition; redate and fleet-config propose both rely on losing a race rather than overwriting",
+  "whether a ref update can be made non-fast-forward-safe only with an expected-SHA precondition; fleet-config propose relies on losing a race rather than overwriting",
 ]
 notes = "Native Git can replace these, but only if the branch/SHA guards are preserved — an unguarded push is not an equivalent implementation."
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet_store/propose/mod.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/merge_pr/redate.rs"
 
 # --- ci-diagnostics-remediation ----------------------------------------------
 

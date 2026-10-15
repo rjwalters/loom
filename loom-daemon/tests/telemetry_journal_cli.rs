@@ -142,6 +142,13 @@ fn append_then_verify_round_trips_and_reports_divergence() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// Six writers race for one stream's lock. The journal's contract is a
+/// bounded lock retry ([`loom_daemon::journal::DEFAULT_LOCK_RETRY`]): past it
+/// a writer exits `1` with `journal busy` and writes **nothing**. On a loaded
+/// runner (the unpartitioned CI Full Suite, every holder fsyncing under the
+/// lock) five queued holders can outlast that budget (#11660), so a busy
+/// writer is retried once, uncontended. A busy writer that leaked a partial
+/// record would still break the gapless assertion below.
 #[test]
 fn concurrent_append_processes_produce_a_gapless_stream() {
     let ws = TempDir::new().unwrap();
@@ -152,6 +159,7 @@ fn concurrent_append_processes_produce_a_gapless_stream() {
                 .env("LOOM_TELEMETRY_JOURNAL", "1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
             child
@@ -160,11 +168,26 @@ fn concurrent_append_processes_produce_a_gapless_stream() {
                 .unwrap()
                 .write_all(envelope(i).to_string().as_bytes())
                 .unwrap();
-            child
+            (i, child)
         })
         .collect();
-    for mut child in children {
-        assert!(child.wait().unwrap().success());
+    let mut busy = Vec::new();
+    for (i, child) in children {
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() == Some(1) && stderr.contains("journal busy") {
+            busy.push(i);
+            continue;
+        }
+        assert!(out.status.success(), "writer {i} exited {}: {stderr}", out.status);
+    }
+    for &i in &busy {
+        let out = append(ws.path(), &[], true, envelope(i).to_string().as_bytes());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "busy writer {i} retried, exited {}: {stderr}", out.status);
+    }
+    if !busy.is_empty() {
+        eprintln!("writers {busy:?} hit the lock retry budget and were retried");
     }
     let seqs: Vec<u64> = Journal::open(root_of(ws.path()))
         .stream("shell")

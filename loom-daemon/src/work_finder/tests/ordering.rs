@@ -43,7 +43,7 @@ fn test_tick_multi_higher_priority_repo_dispatches_first_under_cap() {
             RecordingDispatcher::default(),
         ),
     ];
-    let report = tick_multi(&mut multi, &[100, 0], 2, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 10], 2, &[false, false]);
 
     assert_eq!(report.dispatched, 2, "the global cap of 2 is filled");
     assert_eq!(report.deferred_capacity, 4, "the low-priority repo's 4 are deferred");
@@ -68,7 +68,7 @@ fn very_important_in_a_priority_100_repo_beats_a_priority_0_repo() {
             RecordingDispatcher::default(),
         ),
     ];
-    let report = tick_multi(&mut multi, &[100, 0], 1, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 10], 1, &[false, false]);
     assert_eq!(report.dispatched, 1);
     assert_eq!(multi[0].1.dispatched, vec![7], "the very-important issue dispatches first");
     assert!(multi[1].1.dispatched.is_empty());
@@ -87,7 +87,7 @@ fn two_important_issues_order_by_age() {
         ]),
         RecordingDispatcher::default(),
     )];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
+    let report = tick_multi(&mut multi, &[1], 1, &[false]);
     assert_eq!(report.dispatched, 1);
     assert_eq!(multi[0].1.dispatched, vec![3], "the oldest lands first");
 }
@@ -103,7 +103,7 @@ fn test_tick_multi_oldest_first_within_same_tier() {
         ]),
         RecordingDispatcher::default(),
     )];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
+    let report = tick_multi(&mut multi, &[1], 1, &[false]);
     assert_eq!(report.dispatched, 1);
     assert_eq!(multi[0].1.dispatched, vec![7], "the older issue dispatches first");
 }
@@ -217,11 +217,11 @@ fn test_candidate_cmp_ordering() {
     // 4. Workspace priority is not a key: two candidates differing only in it
     //    compare equal.
     let a = PriorityCandidate {
-        workspace_priority: 0,
+        workspace_weight: 0,
         ..mk(Level::Important, None, 4)
     };
     let b = PriorityCandidate {
-        workspace_priority: 100,
+        workspace_weight: 100,
         ..mk(Level::Important, None, 4)
     };
     assert_eq!(candidate_cmp(&a, &b), Ordering::Equal);

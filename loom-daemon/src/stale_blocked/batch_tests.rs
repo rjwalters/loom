@@ -26,8 +26,6 @@ pub(super) struct Fake {
     pub(super) archived: Option<Result<bool, String>>,
     pub(super) archived_calls: usize,
     pub(super) rows: Vec<RestIssue>,
-    /// What the `loom:blocked-unnamed` listing returns (#10558).
-    pub(super) unnamed: Vec<RestIssue>,
     pub(super) list_fails: bool,
     pub(super) comments: HashMap<u32, Vec<extract::Comment>>,
     pub(super) states: HashMap<Key, RefState>,
@@ -66,10 +64,6 @@ impl StaleBlockedForge for Fake {
             return Err(anyhow!("HTTP 502"));
         }
         Ok(self.rows.clone())
-    }
-
-    fn list_unnamed(&mut self) -> Result<Vec<RestIssue>> {
-        Ok(self.unnamed.clone())
     }
 
     fn comments(&mut self, number: u32) -> Result<Vec<extract::Comment>> {
@@ -140,6 +134,7 @@ pub(super) fn row(number: u32, body: &str, comments: u32, pr: bool, labels: &[&s
         is_pull_request: pr,
         comments,
         open_sub_issues: None,
+        labels_at: None,
     }
 }
 

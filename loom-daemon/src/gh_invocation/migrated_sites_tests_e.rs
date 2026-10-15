@@ -35,16 +35,16 @@ use std::path::{Path, PathBuf};
 /// walkable argv.
 const UNCOUNTED: &[(&str, usize, &str)] = &[
     (
+        "agent_gh/read_route.rs",
+        1,
+        "not a call site: the agent front's classifier names `--paginate` as a flag a `gh api` \
+         read may carry (2am#4367 P4); the agent's own call is booked by the front's ledger",
+    ),
+    (
         "premise_check/cli.rs",
         1,
         "GraphQL cursor pagination issued through the raw `script_helpers::run_gh` spawn: the \
          walk follows REST `Link` headers only, and the call is not a facade row at all",
-    ),
-    (
-        "merge_pr/redate.rs",
-        1,
-        "`gh_api_with` is a raw `Command` spawn (it pipes a request body on stdin) outside the \
-         facade: no ledger row, so no page count; the choke-point ratchet owns its migration",
     ),
     (
         "cli/pr_latency_cmd.rs",

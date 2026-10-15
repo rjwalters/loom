@@ -43,7 +43,8 @@
 //!
 //! Tranche 1 fields (each a real consumed tunable — see the field docs):
 //! `dispatch.{tickIntervalSecs,maxConcurrent,maxAdmissionsPerTick}` (plus
-//! `dispatch.drawTemperature`, #11684),
+//! the workspace draw's `dispatch.weightBonus{RedMainFix,VeryImportant,Important}`,
+//! #11742),
 //! `lifecycle.{leaseTtlMinutes,idleExitMinutes}`, and
 //! `rework.{buildBackoffHigh,buildBackoffLow}`. The `champion` group (#10753)
 //! carries Champion's promotion-throughput knobs
@@ -64,7 +65,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::config_resolver;
-use crate::priority_pick::{DEFAULT_DRAW_TEMPERATURE, DRAW_TEMPERATURE_RANGE};
+use crate::priority_pick::{
+    DEFAULT_BONUS_IMPORTANT, DEFAULT_BONUS_RED_MAIN_FIX, DEFAULT_BONUS_VERY_IMPORTANT,
+    WEIGHT_BONUS_RANGE,
+};
+use crate::step_dispatch::item_draw;
 use crate::work_finder::{
     build_backoff::{BuildBackoffConfig, DEFAULT_HIGH, DEFAULT_LOW},
     DEFAULT_MAX_ADMISSIONS_PER_TICK, DEFAULT_WORK_FINDER_INTERVAL_SECS,
@@ -120,14 +125,34 @@ pub struct DispatchParams {
     /// `autonomous.workFinder.maxAdmissionsPerTick`; env:
     /// `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK`. Range `[1, 64]`.
     pub max_admissions_per_tick: usize,
-    /// Temperature of the workspace draw's softmax over `fleet_priority`
-    /// (#11684), in priority units: small means nearly strict priority
-    /// order, large means nearly uniform. Source:
-    /// `priority_pick::DEFAULT_DRAW_TEMPERATURE` (80). No legacy config home
-    /// and no single-knob env. Range `[1, 100000]`; an integer because the
-    /// draw records derive `Eq`. Appended last: field order is the digest's
-    /// canonical serialization.
-    pub draw_temperature: u32,
+    /// Points the workspace draw adds to a repo's `weight` while its next
+    /// candidate is a verified red-main fix (`dispatch.weightBonusRedMainFix`,
+    /// #11742). Source: `priority_pick::DEFAULT_BONUS_RED_MAIN_FIX` (400). No
+    /// legacy config home and no single-knob env. Range `[0, 1000000]`.
+    /// Appended last: field order is the digest's canonical serialization.
+    pub weight_bonus_red_main_fix: u32,
+    /// Points added while the repo has dispatchable `loom:very-important`
+    /// work (`dispatch.weightBonusVeryImportant`, #11742). Default 100.
+    pub weight_bonus_very_important: u32,
+    /// Points added while the repo has dispatchable `loom:important` work
+    /// (`dispatch.weightBonusImportant`, #11742). Default 20.
+    pub weight_bonus_important: u32,
+    /// The step engine's item-draw priority factor for a red-main fix
+    /// (`dispatch.itemWeightRedMain`, #11896). Default 50. Range
+    /// `[1, 1000000]`. No legacy home, no single-knob env.
+    pub item_weight_red_main: u32,
+    /// Item-draw factor for `loom:very-important`
+    /// (`dispatch.itemWeightVeryImportant`, #11896). Default 8.
+    pub item_weight_very_important: u32,
+    /// Item-draw factor for `loom:important` (`dispatch.itemWeightImportant`,
+    /// #11896). Default 3.
+    pub item_weight_important: u32,
+    /// Days of stage age the item-draw age term counts at most
+    /// (`dispatch.itemAgeCapDays`, #11896). Default 90. Range `[0, 3650]`.
+    pub item_age_cap_days: u32,
+    /// Divisor of the item-draw age term, `1 + min(age, cap) / divisor`
+    /// (`dispatch.itemAgeDivisorDays`, #11896). Default 30. Range `[1, 3650]`.
+    pub item_age_divisor_days: u32,
 }
 
 /// Lifecycle timeout tunables — how long Loom waits before treating work or
@@ -213,7 +238,14 @@ impl Default for Hyperparameters {
                 tick_interval_secs: DEFAULT_WORK_FINDER_INTERVAL_SECS,
                 max_concurrent: DEFAULT_WORK_FINDER_MAX_CONCURRENT,
                 max_admissions_per_tick: DEFAULT_MAX_ADMISSIONS_PER_TICK,
-                draw_temperature: DEFAULT_DRAW_TEMPERATURE,
+                weight_bonus_red_main_fix: DEFAULT_BONUS_RED_MAIN_FIX,
+                weight_bonus_very_important: DEFAULT_BONUS_VERY_IMPORTANT,
+                weight_bonus_important: DEFAULT_BONUS_IMPORTANT,
+                item_weight_red_main: item_draw::DEFAULT_WEIGHT_RED_MAIN,
+                item_weight_very_important: item_draw::DEFAULT_WEIGHT_VERY_IMPORTANT,
+                item_weight_important: item_draw::DEFAULT_WEIGHT_IMPORTANT,
+                item_age_cap_days: item_draw::DEFAULT_AGE_CAP_DAYS,
+                item_age_divisor_days: item_draw::DEFAULT_AGE_DIVISOR_DAYS,
             },
             lifecycle: LifecycleParams {
                 lease_ttl_minutes: crate::claim_reconciliation::DEFAULT_LEASE_TTL_MINUTES,
@@ -450,7 +482,20 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
     for (key, _) in group.as_object().into_iter().flatten() {
         if !matches!(
             key.as_str(),
-            "tickIntervalSecs" | "maxConcurrent" | "maxAdmissionsPerTick" | "drawTemperature"
+            "tickIntervalSecs"
+                | "maxConcurrent"
+                | "maxAdmissionsPerTick"
+                | "weightBonusRedMainFix"
+                | "weightBonusVeryImportant"
+                | "weightBonusImportant"
+                | "itemWeightRedMain"
+                | "itemWeightVeryImportant"
+                | "itemWeightImportant"
+                | "itemAgeCapDays"
+                | "itemAgeDivisorDays"
+                // Retired with the softmax (#11742). Still accepted, and
+                // ignored, so a host config that set it keeps starting.
+                | "drawTemperature"
         ) {
             violations.push(Violation::new(format!("dispatch.{key}"), "unknown key"));
         }
@@ -464,7 +509,16 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
         MAX_ADMISSIONS_PER_TICK_RANGE,
         violations,
     );
-    check_u64(group, "dispatch", "drawTemperature", DRAW_TEMPERATURE_RANGE, violations);
+    for key in [
+        "weightBonusRedMainFix",
+        "weightBonusVeryImportant",
+        "weightBonusImportant",
+    ] {
+        check_u64(group, "dispatch", key, WEIGHT_BONUS_RANGE, violations);
+    }
+    for (key, range) in item_draw::HYPERPARAM_KEYS {
+        check_u64(group, "dispatch", key, range, violations);
+    }
 }
 
 fn validate_lifecycle(group: &Value, violations: &mut Vec<Violation>) {
@@ -677,6 +731,21 @@ pub fn resolve_effective(root: &Path) -> Resolved {
     let idle_legacy = crate::idle_exit::parse_effective(&effective);
 
     let mut sources = BTreeMap::new();
+    // The item draw's knobs (#11896): no legacy tier, like the bonuses.
+    let mut item_sources = BTreeMap::new();
+    let mut pick_item = |i: usize, default: u32| -> u32 {
+        let key = item_draw::HYPERPARAM_KEYS[i].0;
+        u32::try_from(pick_u64(
+            vector.as_ref(),
+            &block,
+            "dispatch",
+            key,
+            None,
+            u64::from(default),
+            &mut item_sources,
+        ))
+        .unwrap_or(default)
+    };
     let params = Hyperparameters {
         dispatch: DispatchParams {
             tick_interval_secs: pick_u64(
@@ -706,17 +775,42 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 DEFAULT_MAX_ADMISSIONS_PER_TICK as u64,
                 &mut sources,
             ) as usize,
-            // No legacy tier: the key is new with #11684.
-            draw_temperature: u32::try_from(pick_u64(
+            // No legacy tier: the keys are new with #11742.
+            weight_bonus_red_main_fix: u32::try_from(pick_u64(
                 vector.as_ref(),
                 &block,
                 "dispatch",
-                "drawTemperature",
+                "weightBonusRedMainFix",
                 None,
-                u64::from(DEFAULT_DRAW_TEMPERATURE),
+                u64::from(DEFAULT_BONUS_RED_MAIN_FIX),
                 &mut sources,
             ))
-            .unwrap_or(DEFAULT_DRAW_TEMPERATURE),
+            .unwrap_or(DEFAULT_BONUS_RED_MAIN_FIX),
+            weight_bonus_very_important: u32::try_from(pick_u64(
+                vector.as_ref(),
+                &block,
+                "dispatch",
+                "weightBonusVeryImportant",
+                None,
+                u64::from(DEFAULT_BONUS_VERY_IMPORTANT),
+                &mut sources,
+            ))
+            .unwrap_or(DEFAULT_BONUS_VERY_IMPORTANT),
+            weight_bonus_important: u32::try_from(pick_u64(
+                vector.as_ref(),
+                &block,
+                "dispatch",
+                "weightBonusImportant",
+                None,
+                u64::from(DEFAULT_BONUS_IMPORTANT),
+                &mut sources,
+            ))
+            .unwrap_or(DEFAULT_BONUS_IMPORTANT),
+            item_weight_red_main: pick_item(0, item_draw::DEFAULT_WEIGHT_RED_MAIN),
+            item_weight_very_important: pick_item(1, item_draw::DEFAULT_WEIGHT_VERY_IMPORTANT),
+            item_weight_important: pick_item(2, item_draw::DEFAULT_WEIGHT_IMPORTANT),
+            item_age_cap_days: pick_item(3, item_draw::DEFAULT_AGE_CAP_DAYS),
+            item_age_divisor_days: pick_item(4, item_draw::DEFAULT_AGE_DIVISOR_DAYS),
         },
         lifecycle: LifecycleParams {
             lease_ttl_minutes: {
@@ -809,6 +903,7 @@ pub fn resolve_effective(root: &Path) -> Resolved {
             }
         },
     };
+    sources.extend(item_sources);
     Resolved { params, sources }
 }
 
@@ -1001,10 +1096,33 @@ impl HyperparamsArgs {
             resolved.sources["dispatch.maxAdmissionsPerTick"].as_str()
         );
         println!(
-            "dispatch.drawTemperature       = {:>6}  [{}]",
-            resolved.params.dispatch.draw_temperature,
-            resolved.sources["dispatch.drawTemperature"].as_str()
+            "dispatch.weightBonusRedMainFix    = {:>6}  [{}]",
+            resolved.params.dispatch.weight_bonus_red_main_fix,
+            resolved.sources["dispatch.weightBonusRedMainFix"].as_str()
         );
+        println!(
+            "dispatch.weightBonusVeryImportant = {:>6}  [{}]",
+            resolved.params.dispatch.weight_bonus_very_important,
+            resolved.sources["dispatch.weightBonusVeryImportant"].as_str()
+        );
+        println!(
+            "dispatch.weightBonusImportant     = {:>6}  [{}]",
+            resolved.params.dispatch.weight_bonus_important,
+            resolved.sources["dispatch.weightBonusImportant"].as_str()
+        );
+        let d = &resolved.params.dispatch;
+        for (key, value) in [
+            ("itemWeightRedMain", d.item_weight_red_main),
+            ("itemWeightVeryImportant", d.item_weight_very_important),
+            ("itemWeightImportant", d.item_weight_important),
+            ("itemAgeCapDays", d.item_age_cap_days),
+            ("itemAgeDivisorDays", d.item_age_divisor_days),
+        ] {
+            println!(
+                "dispatch.{key:<24}= {value:>6}  [{}]",
+                resolved.sources[&format!("dispatch.{key}")].as_str()
+            );
+        }
         println!(
             "lifecycle.leaseTtlMinutes      = {:>6}  [{}]",
             resolved.params.lifecycle.lease_ttl_minutes,

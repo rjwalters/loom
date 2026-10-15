@@ -69,28 +69,10 @@ loom_test_require_daemon_bin "$HELPERS_DIR" merge-pr-refs "merge-pr partial-rese
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-fixture.sh"
 
 # Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
+# shellcheck source=lib/assert.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 YELLOW='\033[0;33m'  # retired() below
-NC='\033[0m'
 
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-assert_eq() {
-    local expected="$1" actual="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$expected" == "$actual" ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected: '$expected'"
-        echo "    Actual:   '$actual'"
-    fi
-}
 
 # An assertion that CANNOT survive the port to Rust, retired under the
 # three-part test in defaults/docs/verification-recipes.md §6. Printed, not
@@ -248,14 +230,14 @@ if [[ "$1" == "api" ]]; then
       exit 0
       ;;
     */comments)
-      # #9774: a POST to the comments endpoint is the daemon chokepoint's
-      # shape (forge comment -> gh api --input -). This suite's subject is
-      # the partial-increment flow over the gh ladder, and LOOM_DAEMON_SELF_BIN
-      # is pinned to the real binary above — so fail the daemon's POST here
-      # and let forge_gh_comment_rl_safe fall back to the recorded `issue
-      # comment` shape. A silent exit 0 would succeed without recording
-      # anything, which is exactly what the assertions below must not allow.
-      exit 1
+      # #9774/#9865: a POST to the comments endpoint is the daemon chokepoint's
+      # shape (forge comment -> gh api --input FILE), and it is the ONLY comment
+      # path now. Record it in the `issue comment` shape the assertions below
+      # read, so a comment that never lands still fails them.
+      _rest="${path#repos/}"; _repo="${_rest%%/issues/*}"
+      _num="${_rest#*/issues/}"; _num="${_num%%/*}"
+      echo "issue comment $_num --repo $_repo --body $(jq -r .body "$3" 2>/dev/null)" >> "$LOG"
+      exit 0
       ;;
   esac
 

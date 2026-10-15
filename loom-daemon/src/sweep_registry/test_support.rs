@@ -1229,10 +1229,6 @@ pub(crate) use git_worktree_fixture::make_dirty_git_worktree;
 // It is an inherent method, so there is nothing to re-export here.
 mod activity_window;
 
-// `SweepRegistry::seed_entry_for_test` (Issue #11123) likewise lives in a child
-// module, `seed_entry`, to keep it out of the over-threshold `mod.rs`.
-mod seed_entry;
-
 /// [`make_dirty_git_worktree`] plus the other half of what a fixture worktree
 /// has always meant: **dirty and QUIET** (Issue #8487).
 ///
@@ -1916,6 +1912,10 @@ pub(crate) fn park_guard_registry(
              printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"{{state: .state\"* ]]; then\n\
+             printf '%s\\n' '{signals}'\n\
+             exit {rest_exit}\n\
+             fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$2\" != */issues/{linked_pr} ]]; then\n\
              printf '%s\\n' {labels}\n\
              exit {rest_exit}\n\
@@ -1930,6 +1930,13 @@ pub(crate) fn park_guard_registry(
         gql = fake_gh_graphql_arm(graphql_pr, 0),
         state = state_probe_json("open", false),
         labels = rest_labels,
+        // #11480: the claim release reads labels through the issue-signals
+        // projection (`release_issue_signals`), not a one-label probe.
+        signals = serde_json::json!({
+            "state": "open",
+            "closed_at": null,
+            "labels": rest_labels.split_whitespace().collect::<Vec<_>>(),
+        }),
         rest_exit = rest_exit,
         // `rest_labels` model the ISSUE's labels; the linked open PR reports
         // none, so the reaper's PR-side park check (#8689) does not mask the

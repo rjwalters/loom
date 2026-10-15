@@ -247,3 +247,58 @@ fn drifted_paths_is_empty_for_a_missing_or_unparseable_file() {
     std::fs::write(&p.machine, "{ <<<<<<< HEAD").unwrap();
     assert!(drifted_paths(&targets[0]).is_empty(), "unparseable file");
 }
+
+// ===== per-repo fleet tier (#11738) =====
+
+fn repo_target(dir: &Path, value: Option<Value>) -> RepoTarget {
+    RepoTarget {
+        name: "app".into(),
+        path: dir.join(crate::config_resolver::FLEET_REPO_CONFIG_REL),
+        value,
+    }
+}
+
+#[test]
+fn repo_target_with_a_value_drifts_and_writes_like_any_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = repo_target(dir.path(), Some(json!({"a": {"b": 1}})));
+    assert_eq!(repo_drift(&t), Drift::Missing);
+    let target = t.target().unwrap();
+    assert_eq!(target.tier, Tier::Repo);
+    assert_eq!(write(&target, "20260101T000000Z").unwrap(), (true, None));
+    assert_eq!(repo_drift(&t), Drift::InSync);
+    // Semantic, not textual.
+    std::fs::write(&t.path, r#"{"a":{"b":1}}"#).unwrap();
+    assert_eq!(repo_drift(&t), Drift::InSync);
+    std::fs::write(&t.path, r#"{"a":{"b":2}}"#).unwrap();
+    assert_eq!(repo_drift(&t), Drift::Differs(vec!["~ a.b: 2 -> 1".to_string()]));
+}
+
+#[test]
+fn repo_target_without_a_value_is_drift_only_when_the_file_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = repo_target(dir.path(), None);
+    assert!(t.target().is_none());
+    assert_eq!(repo_drift(&t), Drift::InSync);
+    std::fs::create_dir_all(t.path.parent().unwrap()).unwrap();
+    std::fs::write(&t.path, "{}").unwrap();
+    assert!(matches!(repo_drift(&t), Drift::Differs(_)));
+}
+
+#[test]
+fn remove_keeps_the_file_as_the_one_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fleet-repo.json");
+    assert_eq!(remove(&path, "20260101T000000Z").unwrap(), (false, None));
+    std::fs::write(&path, r#"{"a": 1}"#).unwrap();
+    let old = dir
+        .path()
+        .join("fleet-repo.json.fleet-store-bak-20250101T000000Z");
+    std::fs::write(&old, "{}").unwrap();
+    let (removed, backup) = remove(&path, "20260101T000000Z").unwrap();
+    assert!(removed);
+    let backup = backup.unwrap();
+    assert!(!path.exists());
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), r#"{"a": 1}"#);
+    assert!(!old.exists(), "older backups of this file are pruned to one");
+}

@@ -26,6 +26,17 @@
 //! legitimately orphaned by a crash between the label flip and the journal
 //! write could otherwise race a fresh dispatch of the very issue it names.
 //!
+//! # Bounded since #12222
+//!
+//! The work finder no longer waits for the whole pass: it waits for the local
+//! passes ([`StartupPasses::LocalDone`]) without limit and for the rest at
+//! most `work_finder::startup_gate::wait_cap`. The claim pass took 20–40+
+//! minutes on hosts with hundreds of open-PR `loom:building` claims. The
+//! reconcile-before-dispatch invariant is now held by the pass itself: its
+//! zero-evidence reclaim applies only to issues last updated before
+//! [`claim_cutoff`], so a claim the work finder makes meanwhile is never
+//! reclaimed as an orphan.
+//!
 //! # Not gated on this
 //!
 //! The periodic reconciliation task
@@ -132,40 +143,112 @@ fn block_on_test_gate(gate_dir: &Path) {
     );
 }
 
-/// Spawn the startup claim-reconciliation pass (`is_startup = true`) and the
-/// stranded-quarantine reconciliation pass on a blocking thread, returning a
-/// [`watch::Receiver<bool>`] that flips to `true` exactly once, when both
-/// have finished.
+/// How far the startup passes have got (#12222). Ordered: a receiver may wait
+/// for "at least" a phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StartupPasses {
+    /// Nothing has finished yet.
+    Running,
+    /// The local, dispatch-sensitive passes have finished: the trace-join
+    /// close (which closes EVERY open entry, so it must run before this
+    /// process starts its first session), pooled-profile provisioning, and
+    /// the review-role pin warning. All local file work, so this is seconds.
+    /// The work finder always waits for this phase, uncapped.
+    LocalDone,
+    /// Every pass has finished, including the forge-bound claim
+    /// reconciliation and stranded-quarantine passes. The work finder waits
+    /// for this phase only up to `work_finder::startup_gate`'s cap.
+    Done,
+}
+
+/// When this process's startup claim-reconciliation pass began (#12222);
+/// see [`claim_cutoff`].
+static CLAIM_CUTOFF: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> =
+    std::sync::Mutex::new(None);
+
+/// The instant this daemon's startup passes began, or `None` before
+/// [`spawn_startup_passes`] ran (tests, CLI). The startup claim pass reclaims
+/// a zero-evidence `loom:building` claim (#6615) only when the issue was last
+/// updated before it: since #12222 the work finder may already be ticking,
+/// and a claim it just made looks exactly like an orphan for a moment.
+#[must_use]
+pub fn claim_cutoff() -> Option<chrono::DateTime<chrono::Utc>> {
+    *CLAIM_CUTOFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Set (or clear) [`claim_cutoff`]. Production sets it once, from
+/// [`spawn_startup_passes`]; tests clear it after spawning the passes so it
+/// does not leak into other tests in the same binary.
+pub fn set_claim_cutoff(at: Option<chrono::DateTime<chrono::Utc>>) {
+    *CLAIM_CUTOFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = at;
+}
+
+/// Spawn the startup passes on a blocking thread, returning a
+/// [`watch::Receiver`] that moves from [`StartupPasses::Running`] to
+/// [`StartupPasses::LocalDone`] once the local passes have finished, and to
+/// [`StartupPasses::Done`] once the forge-bound startup claim-reconciliation
+/// (`is_startup = true`) and stranded-quarantine passes have finished too.
 ///
-/// The returned receiver's initial value is `false`; [`watch::Receiver::wait_for`]
-/// resolves immediately once the value has flipped, so a caller with no
-/// ordering dependency on the passes can simply drop the receiver, and a
-/// caller that awaits it before its own first tick (the work finder) never
-/// waits longer than the pass itself actually takes.
-pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
-    let (tx, rx) = watch::channel(false);
+/// The local passes run first (#12222): the claim pass makes several forge
+/// calls per `loom:building` claim and took 20–40 minutes on a host with
+/// hundreds of open-PR claims, so the work finder now waits for it only up to
+/// a cap. What it may not skip is the local work, hence the separate phase.
+///
+/// [`watch::Receiver::wait_for`] resolves immediately once the value has
+/// reached the awaited phase, so a caller that awaits it before its own first
+/// tick (the work finder) never waits longer than the passes take. A pass
+/// that panics still releases both phases.
+pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<StartupPasses> {
+    let (tx, rx) = watch::channel(StartupPasses::Running);
+    let tx = std::sync::Arc::new(tx);
+    set_claim_cutoff(Some(chrono::Utc::now()));
     tokio::spawn(async move {
         let quarantine_root = fallback_root.clone();
+        let local_tx = tx.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let gate_dir = std::env::var_os(TEST_STARTUP_GATE_DIR_ENV).map(PathBuf::from);
             if let Some(dir) = gate_dir.as_deref() {
                 block_on_test_gate(dir);
             }
+            run_startup_trace_join_reconciliation_pass(&quarantine_root);
+            run_startup_profile_provisioning_pass(&quarantine_root);
+            run_startup_review_role_pins_pass(&quarantine_root);
+            local_tx.send_replace(StartupPasses::LocalDone);
             crate::claim_reconciliation::run_reconciliation_pass(&fallback_root, true);
             run_startup_quarantine_pass(&quarantine_root);
-            run_startup_profile_provisioning_pass(&quarantine_root);
-            run_startup_trace_join_reconciliation_pass(&quarantine_root);
             if let Some(dir) = gate_dir.as_deref() {
                 let _ = std::fs::write(dir.join(TEST_GATE_COMPLETED_FILE), b"done\n");
             }
         })
         .await;
-        // A `send` error just means every receiver — including the one this
-        // function returned — was already dropped, i.e. no caller ever cared
-        // about the completion signal. Nothing to log or recover from.
-        let _ = tx.send(true);
+        // `send_replace` never fails, even with every receiver dropped (no
+        // caller cared about the completion signal).
+        tx.send_replace(StartupPasses::Done);
     });
     rx
+}
+
+/// One WARN per registered workspace that pins a Champion, Judge or Doctor
+/// prompt in `.loom/resync-ignore` (#11970): that copy runs stale against
+/// this daemon. Local file reads only; the same fact is the `review_role_pins`
+/// warning in `loom-daemon health`.
+fn run_startup_review_role_pins_pass(fallback_root: &Path) {
+    let registry = crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    for root in registry.effective_roots(fallback_root) {
+        let pins = crate::health::pinned_review_roles(&root);
+        if !pins.is_empty() {
+            log::warn!(
+                "review_role_pins: {} pins review-role prompt(s) in .loom/resync-ignore, which \
+                 run stale against this daemon (#11970): {}",
+                root.display(),
+                pins.join(", ")
+            );
+        }
+    }
 }
 
 /// The stranded-quarantine half of the startup pass (Issue #4110): the
@@ -175,8 +258,11 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
 /// invisible to the work finder. Scans every registered workspace's open
 /// `loom:blocked` issues and releases the ones carrying a daemon-authored
 /// quarantine comment back to `loom:issue`; a human's manual `loom:blocked`
-/// (no such comment) is never touched. Byte-for-byte the pre-#7974 logic,
-/// just relocated off `daemon_service.rs`'s startup-blocking path.
+/// (no such comment) is never touched. Since #11930 a marked park still
+/// inside its TTL is kept on the forge and restored in memory instead (see
+/// `quarantine_reconciliation::restored`). A workspace the rate-limit breaker
+/// skipped is retried once after the breaker clears (#11973,
+/// `quarantine_reconciliation::deferred`).
 fn run_startup_quarantine_pass(fallback_root: &Path) {
     if !crate::quarantine_reconciliation::reconciliation_enabled() {
         log::info!(
@@ -189,14 +275,16 @@ fn run_startup_quarantine_pass(fallback_root: &Path) {
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
     let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
-    let mut total_checked = 0usize;
-    let mut total_released = 0usize;
-    for root in &roots {
-        let (checked, released) =
-            crate::quarantine_reconciliation::forge::reconcile_workspace(&gh_bin, root);
-        total_checked += checked;
-        total_released += released;
-    }
+    let crate::quarantine_reconciliation::deferred::Sweep {
+        checked: total_checked,
+        released: total_released,
+        skipped,
+    } = crate::quarantine_reconciliation::deferred::sweep(&roots, |root| {
+        crate::quarantine_reconciliation::forge::reconcile_workspace_pass(&gh_bin, root)
+    });
+    // #11973: a root the rate-limit breaker skipped is retried once, after
+    // the breaker clears, instead of waiting for the next restart.
+    crate::quarantine_reconciliation::deferred::schedule(gh_bin.clone(), skipped);
     if total_released > 0 {
         log::info!(
             "quarantine_reconciliation: startup pass checked {total_checked} loom:blocked \
@@ -471,14 +559,20 @@ mod tests {
 
         let fallback_root = std::env::temp_dir();
         let mut rx = spawn_startup_passes(fallback_root);
+        // #12222: the cutoff is process-global; don't leak it into other tests.
+        set_claim_cutoff(None);
 
         // Immediately after spawning, the pass cannot possibly have finished.
-        assert!(!*rx.borrow(), "completion signal must start false — the pass has not run yet");
+        assert_eq!(
+            *rx.borrow(),
+            StartupPasses::Running,
+            "completion signal must start Running — the pass has not run yet"
+        );
 
         let observed_ready: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let observed_ready_task = observed_ready.clone();
         let waiter = tokio::spawn(async move {
-            let _ = rx.wait_for(|ready| *ready).await;
+            let _ = rx.wait_for(|p| *p == StartupPasses::Done).await;
             observed_ready_task.store(true, Ordering::SeqCst);
         });
 

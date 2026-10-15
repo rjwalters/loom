@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use crate::forge_call_stats::Pool;
 pub use crate::observability::ops::ratelimit::{Job, TripAttribution};
 
+pub mod budget_cache;
 pub mod evidence;
 pub mod report;
 #[cfg(test)]
@@ -211,8 +212,9 @@ pub struct BudgetSnapshot {
 
 /// Compute when a cooldown started at `now` should release, from a probed
 /// budget alone: the **latest reset among exhausted resources** whose reset is
-/// still in the future, else `now + fallback_secs` (no budget, a secondary
-/// limit, or a stale/untrustworthy reading — see [`evidence::from_probe`]).
+/// still in the future, else `now + fallback_secs` (no budget or a stale
+/// reading), or the minimum when nothing is exhausted — with no error text that
+/// reading contradicts a primary failure (#10375, see [`evidence::from_probe`]).
 /// Always clamped to `[MIN_COOLDOWN_SECS, MAX_COOLDOWN_SECS]` from `now`.
 #[must_use]
 pub fn cooldown_until(
@@ -459,8 +461,8 @@ impl SharedRateLimitBreaker {
 
     /// Re-derive the release time of the window tripped at `tripped_at` from
     /// later `evidence` (a contextual probe, #8997). A fallback keeps the
-    /// provisional window; a trusted reset replaces it (clamped from
-    /// `tripped_at`). `reading` is cached for status only when trusted.
+    /// provisional window; a trusted reset or a contradicted reading
+    /// (minimum cooldown, #10375) replaces it (clamped from `tripped_at`). `reading` is cached for status only when trusted.
     /// Returns the window's release time, or `None` when that window is no
     /// longer the current one (released or superseded).
     pub fn refine(
@@ -478,7 +480,7 @@ impl SharedRateLimitBreaker {
             .cooldown
             .as_mut()
             .filter(|w| w.tripped_at == tripped_at)?;
-        if evidence.is_trusted() {
+        if evidence.replaces_provisional() {
             window.until = evidence.cooldown_until(tripped_at, fallback);
         }
         Some(window.until)
@@ -639,24 +641,28 @@ pub fn global_skip_pass(job: &str) -> bool {
 }
 
 /// Export one fresh trip as a `loom.ratelimit.trip` span (Issue #10022) and,
-/// when a probe reading exists, log its attribution (Issue #9855): the
-/// probe's pool-wide `used` minus this host's own ledger says whether this
-/// daemon exhausted its own pool or an external client sharing the
-/// credential did. `ledger` (`forge_call_stats::consumed_in_window`) is read
-/// only when there is a reading. An untrusted reading (#8997 — possibly
-/// another credential's budget) is logged with a marker but kept off the
-/// span, whose attribution attributes are then omitted rather than wrong.
+/// when a probe reading exists, log its attribution (Issues #9855, #12238):
+/// the tripping `credential`'s `used` minus this host's own ledger on that
+/// same credential leaves the share this host did not record — other hosts
+/// or processes on the credential. `ledger`
+/// (`forge_call_stats::consumed_in_window_for`) is read only when there is a
+/// reading. An untrusted reading (#8997 — possibly another credential's
+/// budget) is logged with a marker but kept off the span, whose attribution
+/// attributes are then omitted rather than wrong; the credential is still
+/// named, since it comes from the failing call, not the reading.
 pub fn export_trip(
     source: &str,
     tripped_at: DateTime<Utc>,
     cooldown_until: Option<DateTime<Utc>>,
     reading: Option<(&BudgetSnapshot, bool)>,
-    ledger: impl FnOnce() -> Option<BTreeMap<Pool, u64>>,
+    credential: Option<crate::observability::ops::ratelimit::TripCredential>,
+    ledger: impl FnOnce() -> Option<BTreeMap<Pool, crate::forge_call_stats::CredentialSpend>>,
 ) {
     let attribution = reading.map_or_else(TripAttribution::default, |(budget, trusted)| {
         let attribution = TripAttribution::from_budget(Some(budget), ledger().as_ref());
         log::warn!(
-            "rate_limit_breaker: attribution: core {} · graphql {} — external is other clients of this credential{}",
+            "rate_limit_breaker: attribution ({}): core {} · graphql {} — unattributed is other hosts or processes on the same credential{}",
+            credential.as_ref().map_or("credential unknown", |c| c.account.as_str()),
             attribution.core.log_text(),
             attribution.graphql.log_text(),
             if trusted { "" } else { " (reading untrusted, see #8997)" },
@@ -667,6 +673,10 @@ pub fn export_trip(
             TripAttribution::default()
         }
     });
+    let attribution = TripAttribution {
+        credential,
+        ..attribution
+    };
     crate::observability::ops::ratelimit::record_trip(
         source,
         tripped_at,
@@ -711,68 +721,115 @@ pub fn emit_transition_event(event_bus: &Arc<crate::event_bus::EventBus>, transi
 // Forge glue (probe)
 // ============================================================================
 
-/// `gh api rate_limit` glue. Not unit-tested directly (mirrors the other
-/// `forge` modules); the parse half is the tested [`parse_budget`].
+/// `gh api rate_limit` glue. The cache half is unit-tested in
+/// [`budget_cache`]; the parse half is the tested [`parse_rate_limit_body`].
+///
+/// #12204: one `GET /rate_limit` per credential per reset window, shared by
+/// the whole process, and no standalone GraphQL `rateLimit` query at all —
+/// the `graphql` figure is `/rate_limit`'s own `.resources.graphql`,
+/// overlaid with the enforced bucket's `x-ratelimit-*` headers whenever an
+/// ordinary GraphQL response has reported them (the bucket book). That
+/// accepts #10038's caveat (the two can disagree) in exchange for about
+/// 1.9k fewer GraphQL-point-spending queries an hour on the writer App; the
+/// breaker's trip evidence still prefers the failing response's own headers.
 pub mod forge {
+    use super::budget_cache::{self, CacheKey, Lookup};
     use super::report::FailureContext;
-    use super::{parse_budget, parse_graphql_probe, BudgetSnapshot, GRAPHQL_PROBE_QUERY};
+    use super::{parse_rate_limit_body, BudgetSnapshot};
     use crate::cmd_out::CmdOutcome;
+    use crate::forge_bucket_book::{self as book, BucketKey, Resource};
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     use chrono::{DateTime, Utc};
+    use std::path::PathBuf;
     use std::time::Duration;
 
     /// Deadline for the probe. It runs inside a gh error arm, so a wedged
     /// `gh` must not hang that caller (#9985: it used to have no deadline).
     const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Probe the live budget through the `gh` facade (which resolves the
-    /// executable, honouring `LOOM_GH_BIN`). Returns `None` on any failure
-    /// (spawn error, timeout, non-zero exit, unparseable JSON) — the caller
-    /// falls back to the configured cooldown. `GET /rate_limit` does not
-    /// count against the primary rate limit, so this probe is safe to run
-    /// *during* exhaustion.
+    /// The ambient credential's budget, from the process-wide cache
+    /// ([`probe_budget_ctx`] with the default context).
     #[must_use]
     pub fn probe_budget(now: DateTime<Utc>) -> Option<BudgetSnapshot> {
         probe_budget_ctx(&FailureContext::default(), now)
     }
 
-    /// [`probe_budget`] under the failing call's context (#8997): same
-    /// working directory (→ per-owner `GH_CONFIG_DIR`), same `gh` program,
-    /// same explicit credential dir — so an exhausted App installation is
-    /// measured instead of the host's ambient (often healthy user) token.
+    /// The budget of the credential `ctx` names (#8997: same working
+    /// directory → per-owner `GH_CONFIG_DIR`, same `gh` program, same
+    /// explicit credential dir), in order of cost:
+    ///
+    /// 1. the process-wide cached probe, while its window is open, refreshed
+    ///    by any later `x-ratelimit-*` headers;
+    /// 2. a reading composed from those headers alone (the bucket book, or
+    ///    in a short-lived CLI process the daemon's persisted snapshot of it);
+    /// 3. only then one `GET /rate_limit` (a true cold start, or the window
+    ///    reset), whose answer is cached. A failed probe is not retried for
+    ///    [`budget_cache::NEGATIVE_TTL_SECS`].
     #[must_use]
     pub fn probe_budget_ctx(ctx: &FailureContext, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
-        let core_body = run_probe(ctx, "api.rate_limit", &["api", "rate_limit"], false)?;
-        // `/rate_limit`'s `.resources.graphql` can disagree with the bucket
-        // the GraphQL endpoint actually enforces (#10038), so the graphql
-        // figure comes from the GraphQL endpoint itself (`-i` for the
-        // `X-RateLimit-*` fallback). A refused query still prints headers on
-        // stdout, so a non-zero exit is tolerated here.
-        let gql_out = run_probe(
-            ctx,
-            "api.graphql_rate_limit",
-            &["api", "-i", "graphql", "-f", GRAPHQL_PROBE_QUERY],
-            true,
-        )?;
-        parse_budget(&core_body, parse_graphql_probe(&gql_out, now), now)
+        let inv = probe_invocation(ctx);
+        let key = cache_key(&inv, ctx);
+        match budget_cache::lookup(&key, now) {
+            Lookup::Hit(b) => Some(overlay_headers(b, &inv, now)),
+            Lookup::RecentlyFailed => cached_from_headers(&inv, now),
+            Lookup::Miss => cached_from_headers(&inv, now).or_else(|| {
+                let b = run_probe(inv.clone(), now);
+                budget_cache::store(key, b, now);
+                b.map(|b| overlay_headers(b, &inv, now))
+            }),
+        }
     }
 
-    fn run_probe(
+    /// What is known about `ctx`'s budget **without any forge call**: the
+    /// cached reading (header-refreshed), else one composed from the bucket
+    /// book's header readings alone, else `None`. For loops that can fail
+    /// open (#12204: a non-essential gate never pays for a probe).
+    #[must_use]
+    pub fn cached_budget_ctx(ctx: &FailureContext, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+        let inv = probe_invocation(ctx);
+        match budget_cache::lookup(&cache_key(&inv, ctx), now) {
+            Lookup::Hit(b) => Some(overlay_headers(b, &inv, now)),
+            Lookup::RecentlyFailed | Lookup::Miss => cached_from_headers(&inv, now),
+        }
+    }
+
+    /// Always one `GET /rate_limit` under `ctx`, replacing the cached
+    /// reading — the breaker's trip path (a 403/429 is when the cache has
+    /// stopped being true, and the trip needs the real reset epoch).
+    #[must_use]
+    pub fn refresh_budget_ctx(ctx: &FailureContext, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+        let inv = probe_invocation(ctx);
+        let key = cache_key(&inv, ctx);
+        let b = run_probe(inv, now);
+        budget_cache::store(key, b, now);
+        b
+    }
+
+    /// The credential a probe under `ctx` reads — the one the failing call
+    /// ran under — as the trip span names it (#12238). Local only: path
+    /// shapes and the directory's `identity.json`, never a forge call.
+    #[must_use]
+    pub fn credential_ctx(
         ctx: &FailureContext,
-        op: &'static str,
-        args: &[&str],
-        tolerate_failure: bool,
-    ) -> Option<String> {
+    ) -> crate::observability::ops::ratelimit::TripCredential {
+        let cred = crate::gh_invocation::accounting::cred_of(&probe_invocation(ctx));
+        crate::observability::ops::ratelimit::TripCredential {
+            account: cred.account,
+            owner: cred.owner,
+            installation: cred.installation,
+        }
+    }
+
+    fn probe_invocation(ctx: &FailureContext) -> GhInvocation {
         let mut inv = GhInvocation::new(
-            Operation::new(op),
+            Operation::new("api.rate_limit"),
             AccessIntent::Read,
             GhTarget::None,
             PROBE_TIMEOUT,
         )
-        .args(args.iter().copied())
+        .args(["api", "rate_limit"])
         .gh_config_dir(ctx.config_dir.as_deref())
-        // #10089: both legs (REST `rate_limit`, GraphQL `rateLimit`) are
-        // budget readings, never `unknown`.
+        // #10089: a budget reading, never `unknown`.
         .forge_op(crate::forge_call_stats::ops::QUOTA_RATE_LIMIT_READING);
         if let Some(root) = &ctx.root {
             inv = inv.current_dir(root);
@@ -780,23 +837,123 @@ pub mod forge {
         if let Some(program) = &ctx.program {
             inv = inv.program(program);
         }
-        let outcome = inv.run();
-        let CmdOutcome::Ran(output) = outcome else {
+        inv
+    }
+
+    /// The credential `inv` would run under: its effective `GH_CONFIG_DIR`
+    /// (explicit, per-owner from the working directory, else the process's)
+    /// and its `gh` program.
+    fn cache_key(inv: &GhInvocation, ctx: &FailureContext) -> CacheKey {
+        let config_dir = inv
+            .env_plan(None)
+            .into_iter()
+            .find(|e| e.key == "GH_CONFIG_DIR")
+            .and_then(|e| e.value)
+            .or_else(|| std::env::var_os("GH_CONFIG_DIR"))
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
+        CacheKey {
+            config_dir,
+            program: ctx.program.clone(),
+        }
+    }
+
+    /// Seed an empty in-process bucket book, once per process, from the
+    /// snapshot the daemon persists into the host's forge-call sink — so a
+    /// short-lived CLI (`check-stale-blocked`) reads the daemon's header
+    /// readings instead of paying for its own probe. A no-op in the daemon
+    /// (its book is live) and wherever no snapshot is readable.
+    fn prime_book_from_host(now: i64) {
+        static PRIMED: std::sync::Once = std::sync::Once::new();
+        PRIMED.call_once(|| {
+            if !book::snapshot(now).is_empty() {
+                return;
+            }
+            let Some(dir) = crate::forge_call_stats::host_sink_dir() else {
+                return;
+            };
+            for (key, reading) in book::load(&dir, now) {
+                book::insert(key, reading);
+            }
+        });
+    }
+
+    /// The bucket book's believed reading for `inv`'s App credential and
+    /// `resource` (from response headers, a refusal, or a per-directory
+    /// probe), when it has a remaining count.
+    fn header_reading(inv: &GhInvocation, resource: Resource, now: i64) -> Option<book::Reading> {
+        prime_book_from_host(now);
+        let cred = crate::gh_invocation::accounting::cred_of(inv);
+        if !cred.is_app() {
+            return None;
+        }
+        let owner = cred.owner.as_deref()?;
+        let key = BucketKey::new(&cred.account, owner, resource)
+            .with_installation(cred.installation.as_deref());
+        book::reading(&key, now).filter(|r| r.remaining.is_some())
+    }
+
+    /// `b` with each bucket replaced by a header reading observed after it.
+    fn overlay_headers(
+        mut b: BudgetSnapshot,
+        inv: &GhInvocation,
+        now: DateTime<Utc>,
+    ) -> BudgetSnapshot {
+        let ts = now.timestamp();
+        let after = b.probed_at.timestamp();
+        if let Some(r) = header_reading(inv, Resource::Core, ts).filter(|r| r.observed_at > after) {
+            if let (Some(rem), Some(reset)) =
+                (r.remaining, DateTime::from_timestamp(r.reset_epoch, 0))
+            {
+                b.core_remaining = rem;
+                b.core_reset = reset;
+                b.core_used = r.used.or(b.core_used);
+            }
+        }
+        if let Some(r) =
+            header_reading(inv, Resource::Graphql, ts).filter(|r| r.observed_at > after)
+        {
+            if let (Some(rem), Some(reset)) =
+                (r.remaining, DateTime::from_timestamp(r.reset_epoch, 0))
+            {
+                b.graphql_remaining = rem;
+                b.graphql_reset = reset;
+                b.graphql_used = r.used.or(b.graphql_used);
+            }
+        }
+        b
+    }
+
+    /// A snapshot composed from header readings alone (both buckets needed).
+    fn cached_from_headers(inv: &GhInvocation, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+        let ts = now.timestamp();
+        let core = header_reading(inv, Resource::Core, ts)?;
+        let gql = header_reading(inv, Resource::Graphql, ts)?;
+        Some(BudgetSnapshot {
+            core_remaining: core.remaining?,
+            core_reset: DateTime::from_timestamp(core.reset_epoch, 0)?,
+            graphql_remaining: gql.remaining?,
+            graphql_reset: DateTime::from_timestamp(gql.reset_epoch, 0)?,
+            core_used: core.used,
+            graphql_used: gql.used,
+            probed_at: DateTime::from_timestamp(core.observed_at.min(gql.observed_at), 0)?,
+        })
+    }
+
+    fn run_probe(inv: GhInvocation, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+        let CmdOutcome::Ran(output) = inv.run() else {
             return None;
         };
-        if !output.status.success() && !tolerate_failure {
+        if !output.status.success() {
             log::debug!(
                 "rate_limit_breaker: budget probe failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
             return None;
         }
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        parse_rate_limit_body(&String::from_utf8_lossy(&output.stdout), now)
     }
 }
-
-/// GraphQL query whose `rateLimit` node reports the enforced GraphQL bucket.
-pub const GRAPHQL_PROBE_QUERY: &str = "query=query{rateLimit{limit used remaining resetAt}}";
 
 /// The enforced GraphQL bucket: `(remaining, reset, used)`.
 pub type GraphqlReading = (u64, DateTime<Utc>, Option<u64>);
@@ -872,6 +1029,22 @@ pub fn parse_budget(
     })
 }
 
+/// Compose a [`BudgetSnapshot`] from one `GET /rate_limit` body alone
+/// (#12204): `core` and `graphql` both from `.resources`, so the budget
+/// costs one free request and no GraphQL points. `None` when either bucket
+/// is missing or malformed.
+#[must_use]
+pub fn parse_rate_limit_body(body: &str, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+    let json: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let g = json.get("resources")?.get("graphql")?;
+    let graphql = (
+        g.get("remaining")?.as_u64()?,
+        DateTime::from_timestamp(g.get("reset")?.as_i64()?, 0)?,
+        g.get("used").and_then(serde_json::Value::as_u64),
+    );
+    parse_budget(body.trim(), Some(graphql), now)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -943,10 +1116,11 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_falls_back_when_nothing_exhausted() {
-        // Secondary limit: signature fired but both primaries show remaining.
+    fn cooldown_is_minimal_when_nothing_exhausted() {
+        // Both primaries show remaining and no secondary text: the reading
+        // contradicts a primary failure → minimum cooldown (#10375).
         let b = budget(100, 500, 100, 800);
-        assert_eq!(cooldown_until(Some(&b), t(0), 900), t(900));
+        assert_eq!(cooldown_until(Some(&b), t(0), 900), t(MIN_COOLDOWN_SECS));
     }
 
     #[test]

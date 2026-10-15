@@ -120,3 +120,43 @@ scripts/tests/test-resolve-tier-model.sh
 # #11707 (PR #11724, 2026-10-13) — the chain-head merge lock (#10428/#10478)
 # removed from merge-pr.sh; its dedicated shell suite goes with it.
 scripts/tests/test-merge-pr-chain-lock.sh
+
+# #11790 (2026-10-13) — the forge egress policy
+# (forge_egress/: reader, guard, doctor, managed-launcher wiring) removed; its
+# doc and the shell suites that pinned its shell halves go with it.
+docs/forge-egress.md
+scripts/tests/test-resync-installed-egress-doctor.sh
+scripts/tests/test-spawn-claude-managed-gh.sh
+hooks/tests/test-guard-forge-egress.sh
+
+# #11795 (2026-10-14) — hold-taxonomy collapse: the shell suites named for the
+# retired loom:operator-only label were renamed for the three holds.
+scripts/tests/test-guide-operator-only-exclude.sh
+scripts/tests/test-guide-work-plan-operator-only-exclude.sh
+scripts/tests/test-operator-only-subkind.sh
+
+# #11860 (2026-10-14) — terminal promotion verdicts retire the revise label;
+# its routing suite was renamed for what it now covers.
+scripts/tests/test-champion-needs-revision-routing.sh
+
+# #11904 (2026-10-14) — Champion's capacity deferral was removed in #11885, so
+# its idempotency classifier has no caller; the script and its suite go.
+scripts/classify-capacity-defer.sh
+scripts/tests/test-classify-capacity-defer.sh
+
+# #9782 (2026-10-15) — every suite now registers a real write-scope fixture
+# (write-scope-fixture.sh); the allow-all forge may-write stub goes.
+scripts/tests/lib/write-scope-stub.sh
+
+# #12063 (2026-10-15) — merge-pr's freshness guard, re-date remedy and
+# ci-result gate removed (slice 1); their doc and shell suites go with them.
+docs/stale-check-inputs.md
+scripts/tests/test-merge-pr-ci-result.sh
+scripts/tests/test-merge-pr-stale-check-redate.sh
+scripts/tests/test-merge-pr-stale-required-checks.sh
+
+# #12106 (2026-10-15) — CI simplification: the Dependabot manifest-label check
+# and the pipefail ratchet's suite leave the PR path with their checkers.
+scripts/check-dependabot-labels.sh
+scripts/tests/test-check-dependabot-labels.sh
+scripts/tests/test-check-pipefail-early-exit.sh

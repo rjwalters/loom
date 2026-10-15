@@ -902,14 +902,12 @@ async fn collect_managed_repos_reports_every_provisioned_registrys_repo_even_whe
             ManagedRepoEntry {
                 slug: "loom-test-fixture/repo-a".to_string(),
                 visibility: RepoVisibility::Public,
-                priority: Some(0),
-                stale_blocked_release: None,
+                weight: Some(0),
             },
             ManagedRepoEntry {
                 slug: "loom-test-fixture/repo-b".to_string(),
                 visibility: RepoVisibility::Private,
-                priority: None,
-                stale_blocked_release: None,
+                weight: None,
             },
         ],
         "both registered repos are in the roster, each with its derived visibility, \
@@ -1052,6 +1050,8 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         // not about the `tmpfs_visibility` axis.
         tmpfs_visibility: None,
         ci_telemetry: None,
+        fleet_sync: None,
+        resync_pins: Vec::new(),
     }
 }
 

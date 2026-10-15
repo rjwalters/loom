@@ -65,6 +65,11 @@ pub enum SpanName {
     /// tick's [`Self::DispatchTick`] span when the tick is still known.
     #[serde(rename = "loom.dispatch.disposition")]
     DispatchDisposition,
+    /// One step spawn attempt by the step engine (Issue #11906): repo, item,
+    /// role, admission result and reason, draw attempt, `age_source` and
+    /// whether it resumed. Its own root trace.
+    #[serde(rename = "loom.dispatch.step")]
+    DispatchStep,
     /// One `gh` invocation through the `gh_invocation` facade (Issue #9985):
     /// the client-side "caller operation" span of the forge egress trace
     /// tree. A child of the caller's execution when it has one, else its own
@@ -104,6 +109,11 @@ pub enum SpanName {
     /// attempt only — never the command or its output.
     #[serde(rename = "build_gate.run")]
     BuildGateRun,
+    /// One change to a red `main`'s auto-filed fix issue (Issue #11766): an
+    /// instant span, its own root, naming the repo, the SHA, the action
+    /// (`created` / `reused` / `closed` / `closed_duplicate`) and the issue.
+    #[serde(rename = "main_red.autofile")]
+    MainRedAutofile,
 }
 
 impl SpanName {
@@ -126,6 +136,7 @@ impl SpanName {
             Self::PoolHold => "loom.pool.hold",
             Self::DispatchAdmission => "loom.dispatch.admission",
             Self::DispatchDisposition => "loom.dispatch.disposition",
+            Self::DispatchStep => "loom.dispatch.step",
             Self::GithubInvoke => "invoke github",
             Self::RateLimitTrip => "loom.ratelimit.trip",
             Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
@@ -134,6 +145,7 @@ impl SpanName {
             Self::EgressRequest => "loom.egress.request",
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
             Self::BuildGateRun => "build_gate.run",
+            Self::MainRedAutofile => "main_red.autofile",
         }
     }
 }
@@ -243,6 +255,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                 || crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::observability::llm_billing::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::roll_interruption::KEYS.contains(&key.as_str())
+                || crate::observability::lifecycle::role_draw::KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)

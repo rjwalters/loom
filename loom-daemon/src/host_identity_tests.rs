@@ -14,6 +14,7 @@ impl EnvGuard {
     pub(crate) fn clear() -> Self {
         let keys = [
             HOST_ID_ENV,
+            LEASE_HOST_ID_ENV,
             HOST_ID_FILE_ENV,
             "HOSTNAME",
             crate::config_resolver::PRIVATE_DEFAULTS_ENV,
@@ -335,5 +336,104 @@ env_test! {
         assert_ne!(fallback, "");
         assert_ne!(fallback, "roster-name");
         assert_ne!(fallback, "persisted-id");
+    }
+}
+
+env_test! {
+    /// #11740: a generated persisted id is replaced by the roster name, and the
+    /// new id is what later resolutions (and a restart) return.
+    fn adopt_roster_name_replaces_only_a_generated_id() {
+        let _guard = EnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(HOST_ID_FILENAME);
+        std::env::set_var(HOST_ID_FILE_ENV, &path);
+
+        let generated = host_identity();
+        assert!(generated.starts_with(GENERATED_PREFIX));
+        assert!(adopt_roster_name("robb-pro").unwrap());
+        assert_eq!(host_identity(), "robb-pro");
+        clear_cache();
+        assert_eq!(resolve().id, "robb-pro");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "robb-pro\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // Already a roster name: never replaced again.
+        assert!(!adopt_roster_name("robb-studio").unwrap());
+        assert_eq!(host_identity(), "robb-pro");
+    }
+}
+
+env_test! {
+    /// #11740: an explicit identity (env, config, operator-written file) is
+    /// never second-guessed by a hostname match.
+    fn adopt_roster_name_never_overrides_an_explicit_identity() {
+        let _guard = EnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(HOST_ID_FILENAME);
+        std::env::set_var(HOST_ID_FILE_ENV, &path);
+
+        std::env::set_var(HOST_ID_ENV, "loom-worker-1");
+        assert!(!adopt_roster_name("robb-pro").unwrap());
+        assert_eq!(host_identity(), "loom-worker-1");
+        std::env::remove_var(HOST_ID_ENV);
+
+        std::fs::write(&path, "joseph-superset\n").unwrap();
+        clear_cache();
+        assert!(!adopt_roster_name("robb-pro").unwrap());
+        assert_eq!(host_identity(), "joseph-superset");
+        assert!(!adopt_roster_name("bad name").unwrap(), "invalid ids are refused");
+    }
+}
+
+#[test]
+fn adopt_at_refuses_when_the_file_changed_underneath() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(HOST_ID_FILENAME);
+    std::fs::write(&path, "loom-host-1111111111111111\n").unwrap();
+    // The caller resolved a different generated id than the file now holds.
+    assert!(!adopt_at(&path, "loom-host-2222222222222222", "robb-pro").unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "loom-host-1111111111111111\n");
+    assert!(adopt_at(&path, "loom-host-1111111111111111", "robb-pro").unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "robb-pro\n");
+}
+
+#[test]
+#[serial]
+fn hostname_candidates_are_short_and_deduplicated() {
+    let saved = std::env::var("HOSTNAME").ok();
+    std::env::set_var("HOSTNAME", "robb-pro.local");
+    let got = hostname_candidates();
+    match saved {
+        Some(v) => std::env::set_var("HOSTNAME", v),
+        None => std::env::remove_var("HOSTNAME"),
+    }
+    assert_eq!(got.first().map(String::as_str), Some("robb-pro"), "{got:?}");
+    assert!(got.iter().all(|c| !c.is_empty() && !c.contains('.')), "{got:?}");
+    for (i, a) in got.iter().enumerate() {
+        assert!(!got[i + 1..].iter().any(|b| b.eq_ignore_ascii_case(a)), "{got:?}");
+    }
+}
+
+env_test! {
+    /// `LOOM_LEASE_HOST_ID` pins only the lease chain (#11906): a step child
+    /// that carries it keeps the telemetry `host_identity()` of the daemon.
+    fn lease_pin_leaves_the_telemetry_identity_alone() {
+        let _guard = EnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let id_file = dir.path().join("host-id");
+        std::fs::write(&id_file, "persisted-studio\n").unwrap();
+        std::env::set_var(HOST_ID_FILE_ENV, &id_file);
+        std::env::set_var("HOSTNAME", "container-9f2c");
+        let before = host_identity();
+        assert_eq!(before, "persisted-studio");
+        std::env::set_var(LEASE_HOST_ID_ENV, "daemon-host");
+        assert_eq!(lease_host_identity(), "daemon-host");
+        assert_eq!(host_identity(), before, "the lease pin never reaches host.id");
+        std::env::set_var(HOST_ID_ENV, "explicit");
+        assert_eq!(lease_host_identity(), "daemon-host", "lease pin beats LOOM_HOST_ID");
     }
 }

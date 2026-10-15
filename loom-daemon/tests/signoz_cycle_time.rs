@@ -35,6 +35,9 @@
 //! that happen to both pass.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -70,7 +73,7 @@ fn clickhouse(script: &str, format: &str) -> String {
             "-i",
             "--entrypoint",
             "clickhouse",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
             "local",
             "--multiquery",
             &format!("--param_since={SINCE}"),
@@ -182,6 +185,9 @@ fn by<'a>(rows: &'a [Row], key: &str, value: &str) -> &'a Row {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_cycle_time_artifacts_answer_the_canonical_questions_on_signoz_schema() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // ---- the whole pipeline runs verbatim, as one pass, exactly as documented
     let verbatim = format!("{FIXTURE}\n{EXTRACT}\n{ROLLUP}\n{QUERIES}");
     clickhouse(&verbatim, "TSV");
@@ -305,6 +311,9 @@ fn committed_cycle_time_artifacts_answer_the_canonical_questions_on_signoz_schem
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn extraction_falls_back_to_the_string_map_and_preserves_true_absence() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let probe = format!(
         "{FIXTURE}\n{EXTRACT}\n\
          SELECT issue, total_duration_sec, pr_number, doctor_cycles\n\

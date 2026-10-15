@@ -85,10 +85,6 @@ Options:
                          The bypass is always logged as a warning and, on a
                          real (non-dry-run) merge, best-effort recorded as a
                          PR comment audit trail too.
-  --redate-stale-checks  On an #8248 freshness block, re-run the stale checks in
-                         place and merge once fresh (#8914), else push a tree-
-                         identical no-op commit and exit 4 (#8508) — never a
-                         bypass; a repeat push block escalates to loom:operator.
   --merge-method M       Request squash|merge|rebase instead of auto-detect; validated via loom-daemon against the repo's actually-allowed strategies — fails rather than silently falling back to squash if disallowed (#8845).
   --no-cleanup-primary   Skip automatic primary-checkout branch cleanup (#5015).
                          When the merged branch is checked out in the PRIMARY
@@ -98,6 +94,11 @@ Options:
                          stash entries, tip matches the merged PR head SHA).
                          Pass this to always print manual instructions instead.
   --cleanup-primary      (no-op, primary-checkout cleanup is the default)
+  --expected-head <sha>  Fail-closed head pin (#11859): refuse with exit 8 unless
+                         the PR head is exactly this full commit SHA, and gate
+                         the forge merge call on it. Any later head move exits
+                         3 (the #8164 self-sync retry is declined under the
+                         pin). A targeted Champion passes the head it evaluated.
   -h, --help             Show this help and exit
 
 By default, the local worktree AND the local branch it held are cleaned up
@@ -151,9 +152,10 @@ Precedence (highest wins):
 
 Exit codes:
   0 = merged (or --help) · 1 = failed
-  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896), or no concluded CI run for this exact head yet (#10567) — neither is a failure; retry later
-  4 = stale required checks re-dated by a no-op push (#8508) under --redate-stale-checks; the #8914 in-place re-run is gone (#8919) — not a failure; retry later
+  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896) — neither is a failure; retry later
+  4 = retired (#12063): no longer emitted
   7 = held by a sequencing order, loom:pr + loom:sequenced only (#11330; prints LOOM-SEQUENCED-HOLD pr=N after=M) — nothing written; retry later
+  8 = --expected-head refused: the PR head is not the SHA the caller evaluated (#11859; prints LOOM-EXPECTED-HEAD-MISMATCH pr=N expected=S actual=S) — nothing written; re-evaluate, never retry blind
 
 Examples:
   ./.loom/scripts/merge-pr.sh 123

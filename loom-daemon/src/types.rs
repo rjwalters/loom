@@ -599,6 +599,16 @@ pub enum Request {
     /// fires — even if the in-flight count subsequently reaches zero on its own.
     /// A no-op (idempotent) when no drain is in progress.
     AbortDrain,
+    /// Host maintenance (#11812, `loom-daemon restart --pause --then-exit`):
+    /// run the version roll's H4 pause (same safe points, manifest and lease
+    /// refresh, `trigger = host-maintenance`), then exit and **stay down**. The
+    /// next start's H5 resumes the manifest. Takes over an operator drain (in
+    /// progress or timed out), a startup hold or a fleet hold without
+    /// reopening dispatch; escalates a pause roll already in H4 to stay down;
+    /// refused while H5 is resuming or a live manifest exists. A new variant,
+    /// not a flag on [`Request::DrainAndRestartDaemon`]: an older daemon must
+    /// reject it, never silently run a wait-for-zero drain instead.
+    PauseThenExit,
     Shutdown,
 }
 
@@ -783,6 +793,24 @@ pub enum Response {
         supervisor: Option<String>,
         message: String,
     },
+    /// Reply to [`Request::PauseThenExit`] (#11812), sent before H4 finishes.
+    /// `manifest_id` is the pause's (`None` when an escalated roll has not
+    /// written one yet); `manifest_path` is where the CLI waits for it.
+    /// `max_age_secs` is the manifest's staleness bound (the lease TTL) and
+    /// `resume_window_secs` what H5 needs inside it (probation + resume).
+    HostMaintenancePause {
+        accepted: bool,
+        manifest_id: Option<String>,
+        manifest_path: Option<String>,
+        took_over: Option<String>,
+        escalated: bool,
+        in_flight: usize,
+        pause_budget_secs: u64,
+        h4_deadline_secs: u64,
+        max_age_secs: u64,
+        resume_window_secs: u64,
+        message: String,
+    },
     /// Result of a `DrainAndRestartDaemon` / `AbortDrain` request (Issue #4090).
     ///
     /// `accepted` is `true` when the drain was scheduled (or the abort took
@@ -914,6 +942,14 @@ pub enum AgentStatus {
 /// label and is tracked via a per-PR claim lock (`.loom/locks/pr-<N>/`,
 /// distinct from `Issue`'s `.loom/locks/issue-<N>/`) rather than the
 /// issue-keyed guard chain `Issue` dispatch uses.
+///
+/// `Step` (#11898, design #11894 §4.4) is one role session advancing one item
+/// by one stage: `claude -p "/loom:<role> <item>"`. `item` is the number the
+/// role is invoked on (the PR for a PR step, else the issue). It is additive on
+/// the wire: `{"type":"Step","value":{"item":N,"role":"builder"}}`, and the
+/// `Issue` / `PrSet` shapes are unchanged. Every consumer matches the kind
+/// exhaustively; `step_kind_sites` (in `step_kind_sites_tests.rs`) fails CI on
+/// a new `let`-`else` / `if let` that would drop it silently.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "value")]
 pub enum SweepKind {
@@ -921,6 +957,46 @@ pub enum SweepKind {
     Issue(u32),
     /// PR-set sweep: `claude -p "/loom:sweep --prs <n1> <n2> ..."`.
     PrSet(Vec<u32>),
+    /// One step: `claude -p "/loom:<role> <item>"` (#11898).
+    Step {
+        item: u32,
+        role: crate::step_role::StepRole,
+    },
+}
+
+impl SweepKind {
+    /// The single item this sweep holds: the issue of an `Issue` sweep, the
+    /// item of a `Step` (an issue or a PR, see [`StepRole::acts_on_pr`]).
+    /// `None` for a `PrSet`, which holds several.
+    ///
+    /// [`StepRole::acts_on_pr`]: crate::step_role::StepRole::acts_on_pr
+    #[must_use]
+    pub fn item_number(&self) -> Option<u32> {
+        match self {
+            SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => Some(*n),
+            SweepKind::PrSet(_) => None,
+        }
+    }
+
+    /// The step role, for a `Step`.
+    #[must_use]
+    pub fn role(&self) -> Option<crate::step_role::StepRole> {
+        match self {
+            SweepKind::Step { role, .. } => Some(*role),
+            SweepKind::Issue(_) | SweepKind::PrSet(_) => None,
+        }
+    }
+
+    /// The issue this sweep works on as an issue: an `Issue` sweep's, or an
+    /// issue step's item. `None` for a `PrSet` and for a PR step.
+    #[must_use]
+    pub fn issue_number(&self) -> Option<u32> {
+        match self {
+            SweepKind::Issue(n) => Some(*n),
+            SweepKind::Step { item, role } if !role.acts_on_pr() => Some(*item),
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
+        }
+    }
 }
 
 /// Lifecycle state of a tracked sweep.
@@ -1492,6 +1568,17 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
+    /// #11042: why a host below the fleet floor is not rolling (typed:
+    /// `unsupervised`, `backoff`, `unsatisfiable`, …), or `None` when it is
+    /// not below the floor or is rolling. Absent from an older daemon.
+    #[serde(default)]
+    pub auto_update_floor_not_rolling: Option<crate::auto_update::not_rolling::FloorNotRolling>,
+    /// #11042: what `autonomous.autoUpdate.enabled` resolved to. Since #10954
+    /// `auto_update_enabled` means "the loop runs", which a fleet host's loop
+    /// does for the floor alone; this is the setting beside it. `None` before
+    /// the spawn decision and from an older daemon.
+    #[serde(default)]
+    pub auto_update_config_enabled: Option<bool>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
@@ -1759,6 +1846,12 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data compatible.
     #[serde(default)]
     pub work_finder_interval_secs: Option<u64>,
+    /// The per-host post-restart delay before this process's first
+    /// fleet-wide gather (#12073, [`crate::startup_jitter`]). `health` adds it
+    /// to the first-tick grace window, so a host still inside its jitter reads
+    /// as warming up. `None` when the gate is unarmed or for an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_jitter_delay_secs: Option<u64>,
     /// An observability-exporter host-identity mismatch detected this process
     /// (Issue #4830): the ingest key installed on this host is bound to a
     /// *different* `host_id` than the one this daemon reports for itself, so
@@ -1934,8 +2027,8 @@ mod ready_queue;
 pub use ready_queue::{QueueDisposition, ReadyQueueRow};
 mod dispatch_plan;
 pub use dispatch_plan::{
-    DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, RepoCapView, RowPlan,
-    PLAN_SCOPE,
+    DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, PlanStep, RepoCapView,
+    RowPlan, PLAN_SCOPE,
 };
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
@@ -2715,13 +2808,13 @@ pub struct RepoStatus {
     /// a normal workspace, and from a daemon that predates the mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintain_only: Option<crate::workspace_registry::MaintainOnly>,
-    /// This repo's cross-repo dispatch priority tier (Issue #3946): lower = higher
-    /// priority, default [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`].
-    /// Surfaced so `loom-daemon status` shows which repos the autonomous loops
-    /// drain first. `#[serde(default)]` keeps pre-#3946 wire data compatible (an
-    /// absent field parses as the default tier).
-    #[serde(default = "crate::workspace_registry::default_priority")]
-    pub priority: u32,
+    /// This repo's cross-repo draw weight (#11742): higher = drawn more,
+    /// default [`crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT`].
+    /// Surfaced so `loom-daemon status` shows how the autonomous loops share
+    /// dispatch. `#[serde(default)]` keeps older wire data parsing (an absent
+    /// field parses as the default weight).
+    #[serde(default = "crate::workspace_registry::default_weight")]
+    pub weight: u32,
     /// Count of non-terminal (`Pending` / `Running`) sweeps live in this repo's
     /// own [`crate::sweep_registry::SweepRegistry`] at snapshot time.
     pub in_flight_count: usize,
@@ -3304,6 +3397,31 @@ pub enum Event {
         sweep_id: SweepId,
         outcome: SweepOutcome,
     },
+    /// `step.item.{N}.ended` — a step session's outcome, as the step ledger
+    /// classified it (Issue #12152). Published once per ended step by the
+    /// step tick's settle pass (`step_dispatch::step_end::settle`), after
+    /// [`crate::sweep_registry::SweepRegistry::record_step_outcome`].
+    ///
+    /// A step never emits `sweep.issue.{N}.exited` (it is not an issue
+    /// sweep), so this is the step's terminal event on the bus. The narration
+    /// sink reads it to narrate a public-feed `completion` for a Champion
+    /// merge step whose PR merged; nothing else in the event makes a write.
+    /// `item` is the number the step ran on: the PR for a PR step
+    /// (`StepRole::acts_on_pr`), else the issue. `class` and `reason` are the
+    /// ledger's (`outcome_ledger::classify`): `class` is one of `verdict`,
+    /// `noop`, `refused`, `failed`.
+    StepEnded {
+        item: u32,
+        role: crate::step_role::StepRole,
+        class: String,
+        reason: String,
+        /// How long the session ran, in seconds.
+        ran_for_sec: i64,
+        /// Owning managed-workspace root (Issue #3929's pattern). Stamped by
+        /// `SweepRegistry::emit_event` -> [`Self::set_repo_if_absent`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
     /// `epic.issue.{N}.{action}` — the epic supervisor (#3842) fired one of its
     /// four action-class transitions for epic `{N}`. Published by the epic
     /// supervisor loop; authorized by #3873 (epic #3842 Phase 4).
@@ -3451,6 +3569,7 @@ impl Event {
     /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
     /// | `SweepGlobalRuntimeRejected {..}` | `sweep.global.runtime_rejected` |
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
+    /// | `StepEnded {item, ..}` | `step.item.{item}.ended` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
     /// | `PreflightAdvisory {..}` | `daemon.preflight.advisory` |
@@ -3477,6 +3596,7 @@ impl Event {
             Self::SweepGlobalDispatch { .. } => "sweep.global.dispatch".to_string(),
             Self::SweepGlobalRuntimeRejected { .. } => "sweep.global.runtime_rejected".to_string(),
             Self::SweepGlobalCompleted { .. } => "sweep.global.completed".to_string(),
+            Self::StepEnded { item, .. } => format!("step.item.{item}.ended"),
             Self::EpicAction { epic, action, .. } => {
                 format!("epic.issue.{epic}.{}", action.as_str())
             }
@@ -3509,7 +3629,8 @@ impl Event {
             | Self::SweepCrashed { repo, .. }
             | Self::SweepResumeDispatched { repo, .. }
             | Self::SweepGlobalDispatch { repo, .. }
-            | Self::SweepGlobalRuntimeRejected { repo, .. } => repo,
+            | Self::SweepGlobalRuntimeRejected { repo, .. }
+            | Self::StepEnded { repo, .. } => repo,
             _ => return,
         };
         if slot.is_none() {

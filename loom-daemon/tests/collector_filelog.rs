@@ -14,6 +14,9 @@
 //! output, model replies, and the malformed line) never appearing anywhere
 //! in the exported record — not even in `body`, which `keep_keys` does not
 //! touch.
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::{
     fs,
     process::Command,
@@ -162,7 +165,7 @@ impl Trial {
             &format!("{}:/run/secrets:ro", secrets.display()),
             "-v",
             &format!("{}:/var/lib/otelcol", out.display()),
-            IMAGE,
+            &hub_image::resolve(IMAGE),
             "--config=/etc/otelcol/config.yaml",
         ]);
         self.started = true;
@@ -254,6 +257,9 @@ fn write_fixtures(trial: &Trial) {
 #[test]
 #[ignore = "requires Docker; starts one isolated pinned Collector container"]
 fn interactive_session_filelogs_normalize_to_loom_attrs_and_never_leak_raw_content() {
+    if !hub_image::available(IMAGE) {
+        return;
+    }
     let mut trial = Trial::new();
     write_fixtures(&trial);
     trial.start();

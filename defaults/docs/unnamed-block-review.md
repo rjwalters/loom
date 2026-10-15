@@ -7,12 +7,13 @@ Procedure for Curator's "Draining `loom:blocked-unnamed`" section.
 `loom-daemon check-stale-blocked` classifies a `loom:blocked` issue that names
 no blocker and states no reason as **Undocumented**. Guide's unblock sweep skips
 it and Curator's discovery queries exclude `loom:blocked`, so it never re-enters
-any queue. The daemon tick (beside `release-stale-blocked`, #10556) therefore
-applies `loom:blocked-unnamed` to each such **issue** (never a PR), and Curator
-drains it.
+any queue. A daemon tick used to apply `loom:blocked-unnamed` to each such
+**issue** (never a PR) for Curator to drain. That tick was retired with the
+release pass (#11301): nothing applies the label any more, and Curator drains
+the issues that still carry it.
 
-The tick never labels an issue that carries: a `loom:operator`,
-`loom:operator-only` or other operator-hold label; `loom:curating` or
+The tick never labels an issue that carries: `loom:operator` or
+`loom:frozen`; `loom:curating` or
 `loom:building`; a `<!-- loom:permanent-block` marker (#8742); a current
 daemon-hold body record (#10161); or, with no such current record, a trusted
 legacy PR-less-retry / quarantine hold comment. It removes the label once the issue is
@@ -38,7 +39,7 @@ before it gained a hold or a claim, so recheck eligibility live, from a fresh
 again immediately before any write (`park-record apply`, label removal,
 comment). **Skip the issue and write nothing** if it carries:
 
-- a `loom:operator`, `loom:operator-only` or other operator-hold label, or
+- `loom:operator` or `loom:frozen`, or
   `<!-- loom:permanent-block` in its body or a trusted comment. Do not remove
   `loom:blocked`; the daemon strips the queue label on its next tick.
 - `loom:building`, or a `loom:curating` claim that is not yours. Run Curator's
@@ -79,7 +80,7 @@ the per-outcome count source for the dashboard.
 - A blocker named only in a comment (`waiting on #123`, still open): **named**.
 - "Needs the vendor's answer": a human/external step with no number: **kept**
   with the reason; if it is a real operator ruling, route it instead.
-- Queued, then an operator adds `loom:operator-only` or a Builder adds
+- Queued, then an operator adds `loom:operator` or a Builder adds
   `loom:building` before you run: **skip**, no write, even though the body and
   documentation verdict are unchanged.
 - Queued, then the daemon adds a current legacy quarantine / PR-less-retry hold

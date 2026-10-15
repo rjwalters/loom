@@ -50,7 +50,7 @@ pub(crate) fn sample_files() -> BTreeMap<String, String> {
     );
     f.insert(
         "repos.yml".to_string(),
-        "root: /srv/src\nrepos:\n  - name: app\n    dir: app\n    fleet: true\n    fleet_priority: 5\n"
+        "root: /srv/src\nrepos:\n  - name: app\n    dir: app\n    fleet: true\n    weight: 5\n"
             .to_string(),
     );
     // Outside the contract: must not be fetched.

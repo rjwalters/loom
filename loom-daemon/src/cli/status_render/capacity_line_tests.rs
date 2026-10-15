@@ -43,7 +43,7 @@ fn breaker(phase: &str) -> HostBreakerStatus {
 fn repo(root: &str, halted: bool) -> RepoStatus {
     RepoStatus {
         root: PathBuf::from(root),
-        priority: 100,
+        weight: 100,
         in_flight_count: 0,
         health_gate_halted: halted,
         maintain_only: None,

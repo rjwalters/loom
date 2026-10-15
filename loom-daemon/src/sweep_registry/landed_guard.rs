@@ -22,15 +22,26 @@
 //! refused by the journal check: its own landed record is the reason to
 //! resume, and the 2.6 open-PR guard already decides that case.
 //!
-//! The journal is per host. Another host can still dispatch the issue inside
-//! the window while it is open and its PR is merged; the 2.5 read stops it
-//! once the issue closes.
+//! The journal is per host, so each refusal also arms the issue's landed
+//! cooldown (#11853), which is broadcast to every peer like the #4485
+//! dispatch backoff: a journal refusal for the rest of
+//! [`LANDED_REDISPATCH_WINDOW`], a closed issue for [`LANDED_COOLDOWN`]. The
+//! work finder then skips the issue before `dispatch()` on every host, so it
+//! is refused once per landing, not once per tick. An open issue whose
+//! closing PR merged is caught earlier still, at the dispatch point, by
+//! `work_finder::landed_prefilter`, which routes it to Curator.
 
 use super::*;
 use crate::telemetry::{SweepDisposition, TelemetryEnvelope, TelemetryRecord};
 
 /// How long after a `landed` outcome this host refuses to dispatch the issue.
 pub const LANDED_REDISPATCH_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// The fleet-wide dispatch cooldown an issue gets once its work is known to
+/// have landed (#11853): a closed issue refused at 2.5, or an open one whose
+/// closing PR merged. Hours, not the #4485 ladder's 900 s: what ends it is a
+/// person or Curator acting on the issue, not a retry.
+pub const LANDED_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
 
 /// The `pick.decision` skip reason and `loom.dispatch.decisions` reason.
 pub const ALREADY_LANDED_REASON: &str = "already_landed";
@@ -132,29 +143,59 @@ pub(crate) fn recent_landing(
     })
 }
 
+/// A guard refusal, split from the registry write it implies so the check can
+/// run lock-free on the `&self` forge twin (#9573) and the cooldown arm under
+/// the lock afterwards.
+pub(super) struct LandedRefusal {
+    /// The window to arm the landed cooldown for; `None` arms nothing.
+    cooldown: Option<Duration>,
+    error: anyhow::Error,
+}
+
 impl SweepRegistry {
+    /// Arm the cooldown a [`LandedRefusal`] carries and yield its error.
+    pub(super) fn apply_landed_refusal(
+        &mut self,
+        issue: u32,
+        refusal: Option<LandedRefusal>,
+    ) -> Result<()> {
+        let Some(LandedRefusal { cooldown, error }) = refusal else {
+            return Ok(());
+        };
+        if let Some(window) = cooldown {
+            self.arm_landed_cooldown(issue, window);
+        }
+        Err(error)
+    }
+
     /// Refuse `issue` when this host's journal shows it landed inside
-    /// [`LANDED_REDISPATCH_WINDOW`] before `now`. Fails open: an unresolved
-    /// repo or an unreadable journal never refuses.
-    pub(super) fn refuse_recent_landing(&self, issue: u32, now: DateTime<Utc>) -> Result<()> {
-        let Some(repo) = self.journal_repo_slug() else {
-            return Ok(());
-        };
+    /// [`LANDED_REDISPATCH_WINDOW`] before `now`, and arm its landed cooldown
+    /// for the rest of that window, fleet-wide (#11853). Fails open: an
+    /// unresolved repo or an unreadable journal never refuses.
+    #[cfg(test)]
+    pub(super) fn refuse_recent_landing(&mut self, issue: u32, now: DateTime<Utc>) -> Result<()> {
+        let refusal = self.recent_landing_refusal(issue, now);
+        self.apply_landed_refusal(issue, refusal)
+    }
+
+    /// The read-only half of [`Self::refuse_recent_landing`].
+    pub(super) fn recent_landing_refusal(
+        &self,
+        issue: u32,
+        now: DateTime<Utc>,
+    ) -> Option<LandedRefusal> {
+        let repo = self.journal_repo_slug()?;
         let path = self.config.resolve_outcome_telemetry_path();
-        let Ok(journal) = std::fs::read_to_string(&path) else {
-            return Ok(());
-        };
+        let journal = std::fs::read_to_string(&path).ok()?;
         // Runs on every dispatch attempt: parse only the lines that can match.
         let envelopes: Vec<TelemetryEnvelope> = journal
             .lines()
             .filter(|line| line.contains("\"landed\""))
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
-        let Some((sweep_id, pr_number, age_secs)) =
-            recent_landing(&envelopes, &repo, issue, now, LANDED_REDISPATCH_WINDOW)
-        else {
-            return Ok(());
-        };
+        let (sweep_id, pr_number, age_secs) =
+            recent_landing(&envelopes, &repo, issue, now, LANDED_REDISPATCH_WINDOW)?;
+        let rest = LANDED_REDISPATCH_WINDOW.saturating_sub(Duration::from_secs(age_secs));
         let refusal = AlreadyLandedDispatchError {
             issue,
             evidence: LandedEvidence::JournalLanded {
@@ -164,27 +205,39 @@ impl SweepRegistry {
             },
         };
         log::info!("sweep_registry: {refusal}");
-        Err(refusal.into())
+        Some(LandedRefusal {
+            cooldown: Some(rest),
+            error: refusal.into(),
+        })
     }
 
     /// Step 2.5: refuse a closed issue as `already_landed`, and a number that
-    /// resolves to a pull request as before (#4088/#4504). Fails open.
-    pub(super) fn refuse_closed_issue(&self, issue: u32) -> Result<()> {
+    /// resolves to a pull request as before (#4088/#4504). A closed issue
+    /// also arms its [`LANDED_COOLDOWN`], fleet-wide (#11853). Fails open.
+    /// Read-only; the caller applies it with [`Self::apply_landed_refusal`].
+    pub(super) fn closed_issue_refusal(&self, issue: u32) -> Option<LandedRefusal> {
         let evidence = match self.guard_issue_gate(issue) {
             Some(IssueGate::Closed) => LandedEvidence::ForgeClosed,
             Some(IssueGate::ClosedNotPlanned) => LandedEvidence::ForgeClosedNotPlanned,
             Some(IssueGate::PullRequest) => {
-                return Err(anyhow!(
-                    "refusing to dispatch issue #{issue}: the number resolves to a pull request \
-                     rather than an open issue (#4088/#4504 closed-issue guard). A watchdog \
-                     re-dispatch must not re-claim a closed/merged issue or a PR number."
-                ))
+                return Some(LandedRefusal {
+                    cooldown: None,
+                    error: anyhow!(
+                        "refusing to dispatch issue #{issue}: the number resolves to a pull \
+                         request rather than an open issue (#4088/#4504 closed-issue guard). A \
+                         watchdog re-dispatch must not re-claim a closed/merged issue or a PR \
+                         number."
+                    ),
+                })
             }
-            Some(IssueGate::Open) | None => return Ok(()),
+            Some(IssueGate::Open) | None => return None,
         };
         let refusal = AlreadyLandedDispatchError { issue, evidence };
         log::info!("sweep_registry: {refusal}");
-        Err(refusal.into())
+        Some(LandedRefusal {
+            cooldown: Some(LANDED_COOLDOWN),
+            error: refusal.into(),
+        })
     }
 }
 

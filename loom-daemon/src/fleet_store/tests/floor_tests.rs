@@ -7,7 +7,7 @@ use serde_json::json;
 use super::*;
 use crate::fleet_store::test_support::snapshot_of;
 
-const ROSTER_BODY: &str = "root: /srv/src\nrepos:\n  - name: app\n    fleet: true\n";
+const ROSTER_BODY: &str = "root: /srv/src\nrepos:\n  - name: app\n    fleet: true\n    weight: 1\n";
 
 fn store(fleet_json: Option<&str>, repos_yml: Option<&str>) -> Snapshot {
     let mut files = BTreeMap::new();

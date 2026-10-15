@@ -228,6 +228,16 @@ _gitea_validate_basic_auth() {
 
 # --- Gitea API Helper ---
 
+# _gitea_auth_cfg -> curl config line carrying the Gitea credential (values
+# escaped for a double-quoted config string; backslash/quote escaped, CR/LF
+# stripped). Used with `curl --config <(_gitea_auth_cfg)` so credentials never
+# reach curl's argv (#10463).
+_gitea_auth_cfg() {
+  local t="${_GITEA_TOKEN//[$'\r\n']/}" u="${_GITEA_USERNAME//[$'\r\n']/}"
+  t="${t//\\/\\\\}"; t="${t//\"/\\\"}"; u="${u//\\/\\\\}"; u="${u//\"/\\\"}"
+  if [[ -n "$u" ]]; then printf 'user = "%s:%s"\n' "$u" "$t"; else printf 'header = "Authorization: token %s"\n' "$t"; fi
+}
+
 # Make a Gitea API request using curl.
 # Usage: gitea_api METHOD path [curl-args...]
 # Returns: response body on stdout, exit code 0 on 2xx, 1 on error
@@ -259,26 +269,14 @@ gitea_api() {
   local http_code
   local response
 
-  if [[ -n "$_GITEA_USERNAME" ]]; then
-    # HTTP Basic Auth (username + password). curl handles base64 encoding
-    # of "user:pass" internally; we never echo the password to the log.
-    response=$(curl -s -w "\n%{http_code}" \
-      -X "$method" \
-      -u "${_GITEA_USERNAME}:${_GITEA_TOKEN}" \
-      -H "Content-Type: application/json" \
-      -H "Accept: application/json" \
-      "$@" \
-      "$url" 2>/dev/null)
-  else
-    # Token auth (existing behavior, unchanged).
-    response=$(curl -s -w "\n%{http_code}" \
-      -X "$method" \
-      -H "Authorization: token $_GITEA_TOKEN" \
-      -H "Content-Type: application/json" \
-      -H "Accept: application/json" \
-      "$@" \
-      "$url" 2>/dev/null)
-  fi
+  # Basic Auth (username set) or token auth; credential rides a curl config, not argv.
+  response=$(curl -s -w "\n%{http_code}" \
+    -X "$method" \
+    --config <(_gitea_auth_cfg) \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    "$@" \
+    "$url" 2>/dev/null)
 
   http_code=$(echo "$response" | tail -1)
   local body
@@ -1159,7 +1157,6 @@ _forge_cmd_attempt() {
       # credential in-process. GH_TOKEN/GITHUB_TOKEN are dropped so they
       # cannot outrank the directory's own stored credential the same way
       # personal-token/personal-ambient already drop them for their swaps.
-      # loom:egress-allowlisted (#9988): per-token credential dir, selects a credential not a host.
       env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$token" gh "$@" >"$out_file" 2>"$err_file" || rc=$?
       ;;
   esac
@@ -1403,43 +1400,25 @@ forge_gh_repo_safe() {
   return "$rc"
 }
 
-# Post a comment on an issue OR a pull request via `gh issue comment`, falling
-# back to the REST comments endpoint on a GraphQL rate-limit rejection. The
-# REST endpoint (`repos/{nwo}/issues/{n}/comments`) is shared by issues and
-# PRs on GitHub (a PR IS an issue for labels/comments/state), so one function
-# safely serves both `gh issue comment` and `gh pr comment` call sites.
-# Usage: forge_gh_comment_rl_safe NWO NUMBER BODY
-# Returns 0 on success (either path), 1 on failure (message on stderr).
+# Post a comment on an issue OR a pull request through the daemon's comment
+# chokepoint (`loom-daemon forge comment`, #9818), which owns the posting
+# semantics and the dashboard footer (#9774). There is no gh fallback (#9865):
+# a comment posted without the daemon would ship unfootered, which is exactly
+# what #9774 exists to prevent, so a missing binary is a loud failure.
+# Usage: forge_gh_comment_rl_safe NWO NUMBER BODY [IS_PR]
+# Returns 0 on success, 1 on failure (daemon stderr or the minimum-version
+# message on stderr).
 forge_gh_comment_rl_safe() {
   local nwo="$1" number="$2" body="$3" is_pr="${4:-0}"
-  local out; nwo="$(loom_write_repo "$nwo")" || return 1  # #9548
-  # #9774: the daemon's comment chokepoint (forge comment, #9818) is the
-  # poster whenever a binary resolves — one posting path, dashboard footer
-  # included. The gh paths below are the binary-absent fallback (an
-  # unfootered comment on a host with no loom-daemon at all; the fleet
-  # premise is that every host has one).
+  nwo="$(loom_write_repo "$nwo")" || return 1  # #9548
   local self_bin="${LOOM_DAEMON_SELF_BIN:-$(loom_resolve_self_daemon_bin "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" 2>/dev/null || true)}"
-  if [[ -n "$self_bin" ]]; then
-    local daemon_args=(forge comment "$number" --repo "$nwo" --body "$body")
-    [[ "$is_pr" == "1" ]] && daemon_args+=(--pr)
-    if "$self_bin" "${daemon_args[@]}" >/dev/null 2>&1; then
-      return 0
-    fi
-    # The daemon could not post (absent verb, stale binary, forge refusal):
-    # fall through to the gh ladder rather than swallowing the comment.
-  fi
-  if out=$(forge_gh_perm_safe issue comment "$number" --repo "$nwo" --body "$body" 2>&1); then
-    return 0
-  fi
-  if is_rate_limit_error "$out"; then
-    if gh api "repos/$nwo/issues/$number/comments" -f "body=$body" >/dev/null 2>&1; then
-      return 0
-    fi
-    echo "gh issue comment rate-limited on #$number, and the REST fallback also failed: $out" >&2
+  if [[ -z "$self_bin" ]]; then
+    echo "comment posting requires loom-daemon >= 0.19.598 (#9865)" >&2
     return 1
   fi
-  echo "$out" >&2
-  return 1
+  local daemon_args=(forge comment "$number" --repo "$nwo" --body "$body")
+  [[ "$is_pr" == "1" ]] && daemon_args+=(--pr)
+  "$self_bin" "${daemon_args[@]}" >/dev/null || return 1
 }
 
 # Reopen a closed issue via `gh issue reopen`, falling back to a REST PATCH
@@ -1988,19 +1967,11 @@ forge_get_required_status_check_contexts() {
 
     local url="${_GITEA_BASE_URL}/api/v1/repos/${FORGE_OWNER}/${FORGE_REPO}/branch_protections/${branch}"
     local response
-    if [[ -n "$_GITEA_USERNAME" ]]; then
-      response=$(curl -s -w "\n%{http_code}" \
-        -X GET \
-        -u "${_GITEA_USERNAME}:${_GITEA_TOKEN}" \
-        -H "Accept: application/json" \
-        "$url" 2>/dev/null) || return 1
-    else
-      response=$(curl -s -w "\n%{http_code}" \
-        -X GET \
-        -H "Authorization: token $_GITEA_TOKEN" \
-        -H "Accept: application/json" \
-        "$url" 2>/dev/null) || return 1
-    fi
+    response=$(curl -s -w "\n%{http_code}" \
+      -X GET \
+      --config <(_gitea_auth_cfg) \
+      -H "Accept: application/json" \
+      "$url" 2>/dev/null) || return 1
 
     local http_code body
     http_code=$(echo "$response" | tail -1)
@@ -2062,6 +2033,15 @@ forge_get_required_status_check_contexts() {
   # configures no required checks, with a stderr warning so the relaxation is
   # never silent; any other failure still fails the whole lookup closed.
   #
+  # #11855: the GraphQL `branchProtectionRule` field needs `Administration:
+  # read`, which a read-only App token lacks ("Resource not accessible by
+  # integration"). On ANY GraphQL failure the classic source is re-read from
+  # the REST branch summary (`GET .../branches/<b>`, read access alone), the
+  # same answer as Rust `stale_checks::fetch::classic_from_branch`. A reply
+  # with no `protected` flag, a protected branch whose summary (or its
+  # `required_status_checks`) is withheld, or a REST failure, still fails closed,
+  # reporting the GraphQL error (so the plan-gate check below still sees it).
+  #
   # `$branch` goes through url_encode_path_segment for the REST call because
   # it lands in a URL path there (#9109). The GraphQL call below deliberately
   # does NOT encode it: `-F ref=refs/heads/$branch` is a typed variable VALUE
@@ -2070,7 +2050,7 @@ forge_get_required_status_check_contexts() {
   local ruleset_rc=0 classic_rc=0 ruleset_out="" classic_out="" _pg
   local query='query($owner: String!, $name: String!, $ref: String!) { repository(owner: $owner, name: $name) { ref(qualifiedName: $ref) { branchProtectionRule { requiredStatusCheckContexts } } } }'
   ruleset_out="$("$gh_cmd" api "repos/${FORGE_OWNER}/${FORGE_REPO}/rules/branches/$(url_encode_path_segment "${branch}")" --jq '.[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context' 2>&1)" || ruleset_rc=1
-  classic_out="$("$gh_cmd" api graphql -f "query=$query" -F "owner=$FORGE_OWNER" -F "name=$FORGE_REPO" -F "ref=refs/heads/$branch" --jq '.data.repository.ref.branchProtectionRule.requiredStatusCheckContexts // [] | .[]' 2>&1)" || classic_rc=1
+  classic_out="$("$gh_cmd" api graphql -f "query=$query" -F "owner=$FORGE_OWNER" -F "name=$FORGE_REPO" -F "ref=refs/heads/$branch" --jq '.data.repository.ref.branchProtectionRule.requiredStatusCheckContexts // [] | .[]' 2>&1)" || { _pg="$classic_out"; classic_out="$("$gh_cmd" api "repos/${FORGE_OWNER}/${FORGE_REPO}/branches/$(url_encode_path_segment "${branch}")" --jq 'if (.protected | type) != "boolean" then error("no protected flag") elif .protected and (((.protection | type) != "object") or ((.protection.required_status_checks | type) != "object")) then error("protection summary withheld") else ((.protection.required_status_checks // {}) | ((.contexts // []) + [(.checks // [])[].context]) | .[]) end' 2>&1)" || { classic_out="$_pg"; classic_rc=1; }; }
   [[ "$ruleset_rc" -eq 0 ]] || { _pg=$(printf '%s' "$ruleset_out" | tr '[:upper:]' '[:lower:]'); [[ "$_pg" == *"upgrade to github"* && "$_pg" == *"make this repository public"* ]] && { echo "forge-helpers: ruleset required-checks lookup for '$branch' is plan-gated (#8872) -- treating as no required checks: $ruleset_out" >&2; ruleset_out=""; } || return 1; }; [[ "$classic_rc" -eq 0 ]] || { _pg=$(printf '%s' "$classic_out" | tr '[:upper:]' '[:lower:]'); [[ "$_pg" == *"upgrade to github"* && "$_pg" == *"make this repository public"* ]] && { echo "forge-helpers: classic branch-protection required-checks lookup for '$branch' is plan-gated (#8872) -- treating as no required checks: $classic_out" >&2; classic_out=""; } || return 1; }
   # Union, order-preserving, de-duplicated: a context can legitimately be
   # required by BOTH a ruleset and a classic rule, and the callers' `comm`

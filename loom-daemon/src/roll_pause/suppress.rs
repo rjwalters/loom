@@ -136,6 +136,23 @@ pub fn held_issue(root: &Path, issue: u32) -> Option<String> {
     })
 }
 
+/// The manifest holding the item whose id (its sweep id) is `id`, in the
+/// workspace at `root`, if any. A PR step has no `issue`, so startup adoption
+/// asks by id (#11898).
+#[must_use]
+pub fn held_item(root: &Path, id: &str) -> Option<String> {
+    if !is_armed() {
+        return None;
+    }
+    let root = canon(root);
+    live().iter().find_map(|(manifest, items)| {
+        items
+            .iter()
+            .any(|i| i.id == id && i.repo == root)
+            .then(|| manifest.clone())
+    })
+}
+
 /// Every issue of the workspace at `root` that a live manifest holds.
 #[must_use]
 pub fn held_issues(root: &Path) -> Vec<u32> {

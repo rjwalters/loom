@@ -60,6 +60,26 @@ pub fn vars(config_dir: &Path) -> Vec<(&'static str, String)> {
         ("TMPDIR", config_dir.join("tmp").to_string_lossy().into_owned()),
     ];
     vars.extend(ledger_vars());
+    // 2am#4367 P4: no gh update check; the gateway profile directory while
+    // the daemon has it live, else blank (the front reads blank as unset).
+    for (key, value) in crate::forge_gateway::agent_env() {
+        vars.push((
+            key,
+            value
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ));
+    }
+    // 2am#4501: the hooks of this release, which the wired user-scope hook
+    // command prefers over the machine checkout; blank when there is none.
+    for (key, value) in crate::hooks_home::agent_env() {
+        vars.push((
+            key,
+            value
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ));
+    }
     vars
 }
 

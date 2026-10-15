@@ -815,6 +815,9 @@ rules. A genuinely session-global `CARGO_TARGET_DIR` — an operator redirecting
 *all* builds — is still honored for the main workspace, unchanged. Both are
 pinned by `tests/hooks/test-post-worktree-target-dir.sh`.
 
+When no main-workspace binary exists the hook prints a skip line and exits; it
+never runs `cargo build` (#11329), so a new worktree creates no release build.
+
 **Two attribution rules are relaxed for these directories, and only for these.**
 `<root>/wt/<the worktree's own directory name>` is checked *structurally*, so
 matching it is itself the proof the path belongs to one worktree:
@@ -1136,68 +1139,6 @@ they find one — scoped to a symlink whose target resolves through a
 `loom-tools` path segment and no longer exists, so a same-named script you
 authored yourself is never touched. No manual action needed on either path.
 
-### Every merge re-stales every open PR in a consumer repo (#9589)
-
-**Symptom**: in a repo other than loom itself, each merge makes every other
-open PR's green required check (a lint job, a ratchet) stale:
-`Merge blocked: … this required check has no entry in the input-scope table
-and no declaration in .loom/stale-check-inputs.json`. Each PR then needs a
-re-date push and a fresh CI run before it can merge.
-
-**Cause**: loom's freshness guard only knows its own checks' inputs, and an
-unknown check is stale on any base move. **Fix**: commit
-`.loom/stale-check-inputs.json` on the default branch, declaring what each
-required check reads. See [stale-check-inputs](stale-check-inputs.md). If the
-refusal persists, look for a `Warning: … ignoring .loom/stale-check-inputs.json`
-line, which means the declaration was rejected and names why.
-
-### Every merge blocked by the freshness guard on a private free-plan repo (#8844)
-
-**Symptom**: on a **private** repository owned by a GitHub Free account or
-org, every `merge-pr.sh` run stops at the #8248 required-check freshness
-guard, whatever the PR looks like:
-
-```
-Error: Merge blocked: PR #N's required-check freshness guard (#8248) could not run —
-'loom-daemon merge-pr stale-checks' exited 2 without the LOOM-STALE-CHECKS-CLEAN signal.
-[...]
-
-What it reported: Merge blocked: PR #N's required-check freshness guard (#8248) could not
-determine whether the green required checks predate the base tip — ruleset lookup failed:
-gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)
-```
-
-`merge-pr.sh` wraps the subcommand's own refusal under `What it reported:`
-(#8873); a host whose script predates that fix prints only the outer "could
-not run" paragraph, and you have to re-run the `gh api` call below to see
-which failure it was.
-
-No flag helps: `--allow-unapproved` overrides a missing review and
-`--redate-stale-checks` re-dates a stale check; neither is this condition.
-
-**Root cause**: rulesets and branch protection are paid features for private
-repositories. `GET /repos/{owner}/{repo}/rules/branches/{branch}` answers 403
-with that message, and the guard — correctly fail-closed on any lookup it
-cannot complete — refused every merge.
-
-**Fixed in `loom-daemon merge-pr stale-checks`**: that ONE message is now read
-as "this repository's plan has no rulesets, so nothing can be a *required*
-check", the lookup yields no required contexts, and the guard returns its
-`LOOM-STALE-CHECKS-CLEAN` sentinel while printing a `Warning:` on stderr
-naming the gated source. The match is on the message, never on the status
-code — a token missing a scope, SSO enforcement and a rate-limit refusal are
-all 403s too, and there required checks may genuinely exist. Every one of
-those still exits 2 and still refuses the merge.
-
-**If you still see a block here**, read the forge error quoted under `What it
-reported:`: it is a different failure (network, auth scope, rate limit, 404,
-5xx), and the refusal names it rather than telling you to rebuild a binary
-that ran fine (#8873 — the build/install remedy is offered only when the
-subcommand printed nothing at all, i.e. it is missing or too old). Fix the
-lookup — `gh api "repos/{owner}/{repo}/rules/branches/main"` reproduces it in
-one call — rather than reaching for a `LOOM_DAEMON_BIN` shim. And if the host's
-binary predates the fix, roll it (next section).
-
 ### `merge-pr.sh` refuses after a `git pull` — roll the daemon (#8285)
 
 **Symptom**: merges on ONE host stop dead, immediately after pulling `main`,
@@ -1265,20 +1206,17 @@ Do **not** work around it by reverting the pull or by hand-editing the refusal
 out. The guard is the only thing standing between a stale binary and a silently
 mis-closed issue.
 
-**Preventing the next one**: `scripts/check-daemon-subcommand-versions.sh`
-fails CI when a shell script gains a NEW `loom-daemon <subcommand>` dependency
-without declaring its floor:
+**Preventing the next one**: declare the floor when a shell script gains a NEW
+`loom-daemon <subcommand>` dependency:
 
 ```
 # requires-daemon: <subcommand> >= <version>   <which PR added it>
 # requires-daemon: <subcommand> optional       <how it degrades>
 ```
 
-It is a one-way ratchet over `scripts/daemon-subcommand-baseline.txt` — every
-dependency that predates the convention is grandfathered, so the gate fires
-only at the moment someone moves the floor. Run
-`scripts/check-daemon-subcommand-versions.sh --help` for the full convention,
-and `--list` to see every daemon dependency in the tree.
+In the Loom source tree, `scripts/check-daemon-subcommand-versions.sh --help`
+documents the convention and `--list` shows every daemon dependency (the
+`install-compat check` CI step reads that list).
 
 #### The same refusal, from any stub (#8385)
 
@@ -1298,9 +1236,8 @@ found, exactly like the `tokens select --model` capability probe next to it.
 The behaviour is identical whether the stub delegates its exec to
 `loom_exec_script_helper` (`lib/script-helper.sh`, which execs through
 `loom_daemon_exec_checked`) or calls `loom_daemon_version_preflight <sub>
-"$BIN"` itself one line above its own `exec` (which is what a Shape-A `stub`
-in `scripts/shell-allowlist.txt` must do to keep that category — the cap
-requires the last code line to *be* the `exec`).
+"$BIN"` itself one line above its own `exec` (the Shape-A stub pattern, whose
+last code line *is* the `exec`).
 
 Two properties are worth knowing when you meet one:
 
@@ -1478,40 +1415,29 @@ Run the sync script — or create the one label directly — to reconcile:
 
 ```bash
 gh label list --search operator                      # empty => not provisioned
-gh label create "loom:operator-only" --color F97316 \
-  --description "Requires human action or ruling outside automation (creds, infra, hardware); sweep skips"
+gh label create "loom:operator" --color EA580C \
+  --description "A human must act or decide; the body says which"
 ```
 
 **GitHub caps label descriptions at 100 characters.** A `labels.yml` entry with a
 longer description fails to sync (HTTP 422 "description is too long") and the label
 silently never gets created. Keep descriptions at or under 100 chars.
 
-#### `loom:blocked` vs `loom:operator-only` vs `loom:needs-capability`
+#### `loom:blocked` vs `loom:operator` vs `loom:frozen`
 
-These status labels look similar but mean different things to the automation:
+The three holds (`.loom/docs/label-state-machine.md` → "The three holds"):
 
-- **`loom:blocked`** — work is *automatable* but currently waiting on a dependency
-  (another issue, an unmerged PR, missing context). The intent is "unblock it, then
-  a Builder can proceed."
-- **`loom:operator-only`** — work requires a *human to act or rule outside
-  automation entirely* (rotating credentials, infra changes, hardware access,
-  manual deploys — or an owner-gated decision: an issue the code owner filed as a
-  TODO on owner-tracked code, where the design direction is the owner's call).
-  Sweep skips these in pre-flight rather than attempting them; a human must
-  do the work off-automation before the issue can proceed.
-- **`loom:needs-capability`** (#5817) — a narrower claim than `loom:operator-only`:
-  blocked on a missing tool/agent capability, not an operator-by-right decision.
-  Sweep skips these identically to `loom:operator-only` in pre-flight today; the
-  filed capability-request issue should be linked (`Depends on #N` / `Requires
-  #N`). See `.loom/docs/label-state-machine.md` § "`loom:needs-capability` — a
-  narrower claim than `loom:operator-only`" for the full split rationale.
+- **`loom:blocked`** — waiting on something automation resolves (another
+  issue, an unmerged PR, a missing capability with its capability marker). It
+  self-releases once the blocker resolves.
+- **`loom:operator`** — a human must act or decide: credentials, infra,
+  hardware, a ruling. The body says which (a `decision` block, a capability
+  marker, a `Blocked by #N` line). Sweep skips these issues in pre-flight.
+- **`loom:frozen`** — not now; only a human removes it.
 
-Reaching for `loom:blocked` when you mean `loom:operator-only` (or
-`loom:needs-capability`) conflates "waiting on a dependency" with "needs a human
-action outside automation," which muddies the daemon/sweep skip semantics. Use
-`loom:operator-only` for the human-must-act-off-automation case, and
-`loom:needs-capability` specifically when the blocker is missing tooling rather
-than a human ruling.
+The retired `loom:operator-only` / `-decision` / `-mechanical` /
+`-blocked` and `loom:needs-capability` labels map onto these (#11795; table in
+`label-state-machine.md`).
 
 ### An operator edit to `.loom/config.json` disappeared (#4641)
 
@@ -2202,23 +2128,19 @@ stderr naming the one that was used:
    checkout, `stashes` sends it one read-only `ReadIssueState` request: the
    repo root, its `owner/repo`, and an issue number. The daemon accepts it only
    for a root in `~/.loom/workspaces.json`, re-derives the slug from that
-   root's `origin` itself (a mismatch is *unknown*), applies the forge-egress
-   admission gate, and runs the single `gh issue view` through its own
-   `GhInvocation` routing (per-owner App credential, managed launcher). Only
-   `OPEN`/`CLOSED`/unknown and a non-secret route label come back; the daemon
+   root's `origin` itself (a mismatch is *unknown*), and runs the single
+   `gh issue view` through its own `GhInvocation` routing (per-owner App
+   credential). Only `OPEN`/`CLOSED`/unknown and a non-secret route label
+   come back; the daemon
    may live anywhere, including outside every managed root. Once the daemon
    has answered, its answer is final for the run: an *unknown* from it is
    never retried under ambient credentials.
 2. **Standalone (`standalone-gh/<launcher>`).** With no daemon (absent, down,
    an untrusted socket, a daemon too old to know the request) or a repo the
    daemon does not manage, the read runs in the CLI process through the same
-   `GhInvocation` facade, behind the same admission gate. An unconfigured host
-   keeps its ambient `gh` login, unchanged. A governed host uses the policy's
-   managed launcher, and a routing refusal (`standalone-refused:<codes>`) is
-   *unknown*, never a direct request.
+   `GhInvocation` facade, with the ambient `gh` login.
 
-Whenever no policy-compliant path exists the answer is *unknown*, and unknown
-never retires a stash.
+A read that fails is *unknown*, and unknown never retires a stash.
 
 **A blind run is an error, not "0 retirable" (#8876).** When at least one issue was looked up and
 *every* lookup failed, the run prints one line ahead of the per-stash verdicts

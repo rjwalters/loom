@@ -70,6 +70,15 @@
 //!    expiring cycle's own `quarantined_at` (already known in-memory by the
 //!    caller) as the recency anchor directly, instead of re-deriving it from
 //!    the forge.
+//!
+//! ## Releasing only an expired park (Issue #11930)
+//!
+//! "A fresh daemon's quarantine memory is always empty" stopped meaning "no
+//! one is holding this park" once several hosts share a queue: the pass
+//! released parks peers had just set, and every worker restart in a roll undid
+//! them. The startup pass now releases a marked park only once its TTL has
+//! run, and hands a younger one to this host's registry to hold until it has
+//! ([`restored`]).
 
 use chrono::{DateTime, Utc};
 
@@ -182,14 +191,17 @@ pub fn plan(issues: &[BlockedIssue]) -> Vec<(u32, ReconcileAction)> {
         .collect()
 }
 
+pub(crate) mod deferred;
 mod listing;
+pub(crate) mod restored;
+pub use restored::{decide_at_startup, StartupAction};
 
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::claim_reconciliation::forge`] / [`crate::work_finder::forge`]) —
 /// the decision logic above is the fully-covered surface; this module is a
 /// thin, best-effort `Command` wrapper.
 pub mod forge {
-    use super::{decide, plan, BlockedIssue, ReconcileAction};
+    use super::{decide, BlockedIssue, ReconcileAction, StartupAction};
     use crate::claim_reconciliation::gh_call;
     use crate::sweep_registry::{reap_gh_timeout, QUARANTINE_COMMENT_MARKER};
     use anyhow::{anyhow, Result};
@@ -316,10 +328,25 @@ pub mod forge {
 
     fn release(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
         let n = issue.to_string();
+        // #11480: never hand the item back to the queue past another hold.
+        let veto = crate::release_veto::quarantine_veto(gh_bin, root, issue);
+        if veto.as_deref() == Some(crate::work_finder::FROZEN_LABEL) {
+            log::info!("quarantine_reconciliation: #{issue} is `loom:frozen` — no write (#11743)");
+            return Ok(());
+        }
+        let add: &[&str] = if let Some(label) = &veto {
+            log::info!(
+                "quarantine_reconciliation: #{issue} carries `{label}` — removing the \
+                 quarantine's `loom:blocked` only, NOT re-adding `loom:issue` (#11480)"
+            );
+            &[]
+        } else {
+            &["--add-label", "loom:issue"]
+        };
         let out = gh_call::output(
             gh_call::write("quarantine.issue_release", gh_bin, root)
                 .args(["issue", "edit", &n, "--remove-label", "loom:blocked"])
-                .args(["--add-label", "loom:issue"])
+                .args(add)
                 .args(gh_call::loom_repo_flag()),
         )?;
         if !out.status.success() {
@@ -339,6 +366,15 @@ pub mod forge {
     /// inspected and the number actually released, for the caller's summary
     /// log line.
     pub fn reconcile_workspace(gh_bin: &Path, root: &Path) -> (usize, usize) {
+        reconcile_workspace_pass(gh_bin, root).unwrap_or((0, 0))
+    }
+
+    /// [`reconcile_workspace`], but `None` when the shared rate-limit breaker
+    /// kept the pass from reading the forge (#11973): it was already cooling,
+    /// or the listing itself hit the limit. The startup pass defers such a
+    /// root to [`super::deferred`] instead of dropping it until the next
+    /// restart.
+    pub fn reconcile_workspace_pass(gh_bin: &Path, root: &Path) -> Option<(usize, usize)> {
         // Shared GitHub rate limit exhausted (#4429): the listing (and the
         // per-candidate timeline probes below) would all fail — skip.
         if crate::rate_limit_breaker::global_skip_pass("quarantine_reconciliation") {
@@ -347,12 +383,12 @@ pub mod forge {
                  exhausted (#4429)",
                 root.display()
             );
-            return (0, 0);
+            return None;
         }
         // #9548: this pass only exists to strip labels and comment; skip a
         // root this installation may not write to.
         if !crate::write_scope::gate_root_with(root, gh_bin, "quarantine reconciliation") {
-            return (0, 0);
+            return Some((0, 0));
         }
         let listed = match super::listing::list_blocked(gh_bin, root) {
             Ok(v) => v,
@@ -362,11 +398,15 @@ pub mod forge {
                     &e.to_string(),
                     "quarantine_reconciliation",
                 );
-                return (0, 0);
+                // #11973: a listing whose refusal tripped (or met) a cooling
+                // breaker is a breaker skip, deferred like the one above.
+                let limited = crate::rate_limit_breaker::indicates_rate_limit(&e.to_string())
+                    && crate::rate_limit_breaker::global_is_suppressed();
+                return (!limited).then_some((0, 0));
             }
         };
         if listed.is_empty() {
-            return (0, 0);
+            return Some((0, 0));
         }
 
         // Issue #4206: augment with the timeline recency signal, but only
@@ -385,14 +425,30 @@ pub mod forge {
             })
             .collect();
 
-        let decisions = plan(&issues);
-        let checked = decisions.len();
+        // #11930: release only a park whose TTL has run; hold a younger one.
+        let ttl = crate::sweep_registry::resolve_quarantine_config(root).ttl;
+        let now = Utc::now();
+        let checked = issues.len();
 
         let mut released = 0usize;
-        for (issue_number, action) in decisions {
-            let ReconcileAction::Release = action else {
-                continue;
-            };
+        for issue in &issues {
+            let issue_number = issue.number;
+            match super::decide_at_startup(issue, now, ttl) {
+                StartupAction::Keep => continue,
+                StartupAction::Restore { quarantined_at } => {
+                    super::restored::stash(root, issue_number, quarantined_at);
+                    log::info!(
+                        "quarantine_reconciliation: #{issue_number} in {} is parked inside its \
+                         {}s TTL (marked {}) — kept loom:blocked and restored in memory \
+                         (#11930)",
+                        root.display(),
+                        ttl.as_secs(),
+                        quarantined_at.to_rfc3339()
+                    );
+                    continue;
+                }
+                StartupAction::Release => {}
+            }
             match release(gh_bin, root, issue_number) {
                 Ok(()) => {
                     released += 1;
@@ -411,7 +467,7 @@ pub mod forge {
             }
         }
 
-        (checked, released)
+        Some((checked, released))
     }
 }
 
@@ -697,6 +753,44 @@ exit 0
         );
     }
 
+    /// #11480: the startup pass releases the quarantine's own `loom:blocked`
+    /// but does not re-arm `loom:issue` beside another veto.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_keeps_the_queue_label_off_past_a_veto() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let script = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> "{log}"
+case "$*" in *issues?labels=loom:blocked*)
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":99,"state":"open","updated_at":"2026-01-01T00:00:00Z","labels":[{{"name":"loom:blocked"}}]}}]'
+  exit 0 ;; esac
+case "$*" in
+*/issues/99/comments*)
+  echo '[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times","user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}}}}]'
+  exit 0 ;;
+*"/issues/99 --jq"*)
+  echo '["loom:blocked","loom:needs-capability"]'
+  exit 0 ;;
+esac
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        let fake_gh = write_fake_gh(dir.path(), &script);
+
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        assert_eq!(forge::reconcile_workspace(&ws.gh, &repo_root), (1, 1));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(gh_calls.contains("issue edit 99 --remove-label loom:blocked"), "{gh_calls}");
+        assert!(!gh_calls.contains("--add-label loom:issue"), "{gh_calls}");
+    }
+
     /// #10089: N unchanged passes over a re-parked `loom:blocked` issue cost
     /// ONE comments walk and ONE timeline walk, not one per pass; the cheap
     /// listing runs every pass. A new `updatedAt` re-reads.
@@ -880,6 +974,49 @@ exit 0
         );
         let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
         assert_eq!((checked, released), (0, 0));
+    }
+
+    /// #11973: a pass the breaker keeps off the forge reports itself skipped
+    /// (`None`), so the startup pass can defer the root, and makes no `gh`
+    /// call; a listing whose rate-limit refusal trips the breaker is skipped
+    /// the same way, while an ordinary listing failure is not.
+    #[test]
+    #[serial]
+    fn a_breaker_skip_is_reported_for_the_deferred_retry() {
+        use crate::rate_limit_breaker::{
+            with_test_global, RateLimitBreakerConfig, SharedRateLimitBreaker,
+        };
+        let fresh =
+            || std::sync::Arc::new(SharedRateLimitBreaker::new(RateLimitBreakerConfig::default()));
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let limited = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+             echo 'gh: API rate limit exceeded (HTTP 403)' >&2\nexit 1\n",
+            gh_log.display()
+        );
+        let fake_gh = write_fake_gh(dir.path(), &limited);
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+
+        let tripped = fresh();
+        tripped.observe_failure("API rate limit exceeded", "test", None, Utc::now());
+        let out = with_test_global(tripped, || forge::reconcile_workspace_pass(&ws.gh, &repo_root));
+        assert_eq!(out, None);
+        assert!(!gh_log.exists(), "a cooling breaker makes no gh call");
+
+        let breaker = fresh();
+        let out = with_test_global(breaker.clone(), || {
+            forge::reconcile_workspace_pass(&ws.gh, &repo_root)
+        });
+        assert_eq!(out, None, "the refusal tripped the breaker: deferred");
+        assert!(breaker.is_suppressed(Utc::now()));
+
+        let down = write_fake_gh(dir.path(), "#!/bin/bash\necho 'HTTP 502' >&2\nexit 1\n");
+        let ws = WritableRoot::register_with_gh(&repo_root, &down);
+        let out = with_test_global(fresh(), || forge::reconcile_workspace_pass(&ws.gh, &repo_root));
+        assert_eq!(out, Some((0, 0)), "an ordinary failure is not a breaker skip");
     }
 
     /// #9243: an unchanged `loom:blocked` set (same `updatedAt`) costs ZERO

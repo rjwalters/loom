@@ -950,6 +950,29 @@ fn warming_up_outranks_build_skew() {
     );
 }
 
+/// #12073: a host inside its startup-jitter window (delay 400 s, up 300 s)
+/// has not ticked because its first tick waits the jitter. It is warming
+/// up, with the grace window extended by the delay, not a dead work finder.
+#[test]
+fn a_host_inside_its_startup_jitter_is_warming_up_not_dead() {
+    let mut inputs = missing_tick_inputs();
+    inputs.status.as_mut().unwrap().startup_jitter_delay_secs = Some(400);
+    let mut report = install_report(InstallState::AliveButUnresponsive);
+    report.process_age_secs = Some(300);
+    inputs.install_state = Some(report);
+    assert_eq!(
+        classify_missing_tick(&inputs, inputs.status.as_ref().unwrap()),
+        MissingTick::WarmingUp {
+            age_secs: 300,
+            grace_secs: 520
+        }
+    );
+    assert_ne!(assess_dispatch(&inputs).verdict, Verdict::Degraded);
+    // Past delay + 2 x interval with no tick, it is a fault again.
+    inputs.install_state.as_mut().unwrap().process_age_secs = Some(600);
+    assert_eq!(assess_dispatch(&inputs).verdict, Verdict::Degraded);
+}
+
 // -------------------------------------------------------------------
 // #4824 — build-skew classification
 // -------------------------------------------------------------------
@@ -1043,6 +1066,24 @@ fn dispatch_flags_a_halted_gate() {
     let section = assess_dispatch(&inputs);
     assert_eq!(section.verdict, Verdict::Degraded);
     assert!(section.summary.contains("HALTED"));
+}
+
+/// #11857: the tick line says HALTED only for a hold that covered the tick's
+/// work; a partial hold reads as a count of held roots.
+#[test]
+fn tick_line_names_a_partial_hold_by_its_held_roots() {
+    let mut tick = crate::types::WorkFinderTickSummary {
+        seen: 5,
+        halted: true,
+        held_roots: 1,
+        halt_partial: true,
+        ..Default::default()
+    };
+    let line = tick.reason_summary();
+    assert!(line.ends_with("1 root(s) held"), "{line}");
+    assert!(!line.contains("HALTED"), "{line}");
+    tick.halt_partial = false;
+    assert!(tick.reason_summary().ends_with("HALTED"));
 }
 
 #[test]
@@ -1148,7 +1189,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/loom"),
             maintain_only: None,
-            priority: crate::workspace_registry::default_priority(),
+            weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],
@@ -1181,7 +1222,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/anvil"),
             maintain_only: None,
-            priority: crate::workspace_registry::default_priority(),
+            weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],
@@ -1252,7 +1293,7 @@ fn tokens_per_repo_missing_ranking_counts_as_affected() {
     status.per_repo = vec![crate::types::RepoStatus {
         root: PathBuf::from("/repos/never-bootstrapped"),
         maintain_only: None,
-        priority: crate::workspace_registry::default_priority(),
+        weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
         quarantined_issues: vec![],
@@ -1690,7 +1731,7 @@ fn role_liveness_repo_with_intervals(
     crate::types::RepoStatus {
         root: PathBuf::from(root),
         maintain_only: None,
-        priority: crate::workspace_registry::default_priority(),
+        weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
         quarantined_issues: vec![],

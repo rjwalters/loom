@@ -562,6 +562,7 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
     cmd.env_remove(crate::launch_env::PREFERENCE_MARKER_ENV)
         .env_remove("LOOM_MODEL_PROFILE");
     crate::launch_env::apply_launch_env(&mut cmd, Some(&admitted), "worker_run");
+    super::claim_owned::apply(&mut cmd, role, issue);
     report.log_path = Some(log.display().to_string());
 
     // An operator/watchdog SIGTERM/SIGINT is forwarded to the worker's own

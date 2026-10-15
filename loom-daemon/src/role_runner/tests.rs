@@ -407,6 +407,7 @@ fn test_config_reads_enabled_roles_and_interval() {
             role_efforts: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            champion_mode: None,
             on_idle_max_wait: None,
         }
     );
@@ -457,6 +458,7 @@ fn test_config_project_tier_only_is_honored_like_legacy() {
             role_efforts: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            champion_mode: None,
             on_idle_max_wait: None,
         }
     );
@@ -516,6 +518,7 @@ fn test_resolve_roles_empty_array_is_none() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     assert_eq!(resolve_roles(&config), Vec::new());
@@ -534,6 +537,7 @@ fn test_resolve_roles_filters_and_preserves_default_order() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -553,6 +557,7 @@ fn test_resolve_roles_ignores_unknown_names() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -584,6 +589,7 @@ fn test_missing_defaults_warns_for_default_absent_from_pinned_list() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let resolved = resolve_roles(&config);
@@ -620,6 +626,7 @@ fn test_resolve_roles_unknown_name_and_missing_default_fire_independently() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_roles(&config);
@@ -787,6 +794,20 @@ fn test_roles_source_label_names_the_project_tier_over_legacy() {
 }
 
 #[test]
+fn test_roles_source_label_names_the_per_repo_fleet_tier_over_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_project_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"roles": ["curator"]}}}"#);
+    let fleet = tmp
+        .path()
+        .join(crate::config_resolver::FLEET_REPO_CONFIG_REL);
+    std::fs::create_dir_all(fleet.parent().unwrap()).unwrap();
+    std::fs::write(&fleet, r#"{"autonomous": {"roleRunner": {"roles": ["judge"]}}}"#).unwrap();
+    let label = roles_source_label(tmp.path());
+    assert!(label.starts_with("per-repo fleet tier ("), "{label}");
+    assert!(label.contains("fleet-repo.json"), "{label}");
+}
+
+#[test]
 fn test_missing_defaults_for_loom_repos_own_pinned_list_names_only_auditor_and_hermit() {
     // The exact pinned list from this repo's own `.loom/config.json`
     // (`["curator","champion","judge","doctor","guide"]`) — missing only
@@ -903,6 +924,7 @@ fn test_resolve_enabled_config_can_enable() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     }));
 }
@@ -922,6 +944,7 @@ fn test_resolve_enabled_env_overrides_config() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     }));
     std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
@@ -936,6 +959,7 @@ fn test_resolve_enabled_env_overrides_config() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     }));
     std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
@@ -1169,6 +1193,7 @@ fn test_resolve_interval_for_role_precedence() {
                 role_efforts: BTreeMap::new(),
                 architect_max_proposals: None,
                 max_concurrent: None,
+                champion_mode: None,
                 on_idle_max_wait: None,
             }
         ),
@@ -1191,6 +1216,7 @@ fn test_resolve_interval_for_role_precedence() {
                 role_efforts: BTreeMap::new(),
                 architect_max_proposals: None,
                 max_concurrent: None,
+                champion_mode: None,
                 on_idle_max_wait: None,
             }
         ),
@@ -1951,9 +1977,12 @@ fn test_resolve_role_prompt_carries_the_cap_for_architect_only() {
         resolve_role_prompt(architect, &config),
         "/loom:architect --max-proposals 7".to_string()
     );
-    // Every other role's prompt is byte-for-byte its static spec prompt.
+    // Every other role's prompt is its static spec prompt; Champion's runs
+    // non-item (#11909).
     for spec in DEFAULT_ROLES.iter().filter(|s| s.name != "architect") {
-        assert_eq!(resolve_role_prompt(spec, &config), spec.prompt.to_string());
+        let want = crate::role_runner::champion_mode::prompt_arg(spec.name)
+            .map_or_else(|| spec.prompt.to_string(), |a| format!("{} {a}", spec.prompt));
+        assert_eq!(resolve_role_prompt(spec, &config), want);
     }
 }
 
@@ -2179,6 +2208,7 @@ fn test_resolve_on_idle_roles_parses_and_preserves_order() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_on_idle_roles(&config);
@@ -2202,6 +2232,7 @@ fn test_resolve_on_idle_roles_ignores_unknown_names() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let roles = resolve_on_idle_roles(&config);
@@ -2221,6 +2252,7 @@ fn test_resolve_on_idle_roles_empty_array_is_empty() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     assert_eq!(resolve_on_idle_roles(&config), Vec::new());
@@ -2654,6 +2686,7 @@ fn test_resolve_max_concurrent_precedence_env_over_config_over_default() {
     let unset = RoleRunnerConfig::default();
     let configured = RoleRunnerConfig {
         max_concurrent: Some(2),
+        champion_mode: None,
         on_idle_max_wait: None,
         ..RoleRunnerConfig::default()
     };
@@ -2793,6 +2826,7 @@ fn on_idle_config(enabled: Option<bool>, roles: Vec<&str>) -> RoleRunnerConfig {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     }
 }
@@ -2903,6 +2937,7 @@ fn test_plan_idle_runs_disabled_without_on_idle_does_not_warn() {
         role_efforts: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
+        champion_mode: None,
         on_idle_max_wait: None,
     };
     let now = Instant::now();
@@ -4273,6 +4308,7 @@ fn tick_admitted(root: &Path) -> bool {
 }
 
 mod archived_gate;
+mod champion_mode;
 mod invoke;
 mod llm_gateway;
 mod model_resolution;
