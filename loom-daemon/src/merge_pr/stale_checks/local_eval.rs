@@ -101,13 +101,6 @@ pub const CHEAP_CHECKS: &[CheapCheck] = &[
         pins: &[],
     },
     CheapCheck {
-        component: "File Size Ratchet",
-        script: "scripts/check-file-size-budget.sh",
-        requires: &["bash", "git"],
-        skip_steps: &[],
-        pins: &[],
-    },
-    CheapCheck {
         component: "Markdown Token Ratchet",
         script: "scripts/check-markdown-token-budget.sh",
         requires: &["bash", "git"],

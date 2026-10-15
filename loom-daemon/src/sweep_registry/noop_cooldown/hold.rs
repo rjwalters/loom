@@ -457,6 +457,11 @@ impl SweepRegistry {
             return;
         }
         self.restore_noop_holds();
+        // #12073: after a restart every restored hold is due at once, and
+        // adoption lists the forge; both wait out this host's startup jitter.
+        if !crate::startup_jitter::is_open() {
+            return;
+        }
         self.adopt_forge_noop_holds();
         let mut due: Vec<u32> = self
             .noop_cooldown

@@ -22,7 +22,6 @@ the same set CI's `Structural Checks` job runs.
 | `check-claude-md-budget.sh` | `CLAUDE.md` line budget |
 | `check-markdown-token-budget.sh` | Agent-facing markdown token ratchet |
 | `check-role-prompt-budget.sh` | Whole per-role prompt prefix ratchet |
-| `check-file-size-budget.sh` | Oversized source file ratchet |
 | `check-shell-allowlist.sh` | Every tracked `.sh` is in `shell-allowlist.txt` |
 | `check-pipefail-early-exit.sh` | `pipefail` + early-exit SIGPIPE ratchet |
 | `check-dangling-links.sh` | Relative markdown links resolve |

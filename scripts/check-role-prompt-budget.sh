@@ -70,7 +70,7 @@
 # mirrors of `defaults/` — absent from a fresh CI checkout, so a check written
 # against them would measure nothing and pass forever. Same exemption, same
 # reason, as check-markdown-token-budget.sh (".loom/* — installed mirror,
-# measured at defaults/ source") and check-file-size-budget.sh.
+# measured at defaults/ source").
 #
 # Usage:
 #   check-role-prompt-budget.sh              Check every role against its budget.
@@ -112,8 +112,7 @@
 # recomputed.
 #
 # A UNIFORM delta across every role means a SHARED file moved, not a prompt.
-# Unlike its per-file siblings (check-file-size-budget.sh,
-# check-markdown-token-budget.sh), this budget is a whole-tree measurement:
+# Unlike its per-file sibling (check-markdown-token-budget.sh), this budget is a whole-tree measurement:
 # it sums both CLAUDE.md files and every always-loaded sibling, which a given
 # PR does not necessarily own. A baseline recorded on a branch is therefore
 # invalidated by ANY concurrent merge touching one of those shared files, even
@@ -298,7 +297,7 @@ write_budgets() {
     echo "#"
     echo "# A diff that RAISES a budget needs a clear reason in the PR description."
     echo "# Do not hand-edit these upward; that is the ratchet slipping. See"
-    echo "# .loom/docs/file-size-policy.md."
+    echo "# .loom/docs/prompt-budget-policy.md."
     while IFS= read -r role; do
       [[ -n "$role" ]] || continue
       read -r total count < <(role_total "$role")
@@ -650,7 +649,7 @@ if (( ${#over[@]} > 0 || ${#unbudgeted[@]} > 0 || ${#stale[@]} > 0 )); then
       echo ""
       echo "If this change legitimately trims content, or deliberately accepts a larger"
       echo "prefix, run --update and say so in the PR description. Do NOT hand-edit a"
-      echo "budget upward — that is the ratchet slipping. See .loom/docs/file-size-policy.md."
+      echo "budget upward — that is the ratchet slipping. See .loom/docs/prompt-budget-policy.md."
       echo ""
     fi
     if (( ${#unbudgeted[@]} > 0 )); then

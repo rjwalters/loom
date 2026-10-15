@@ -950,6 +950,29 @@ fn warming_up_outranks_build_skew() {
     );
 }
 
+/// #12073: a host inside its startup-jitter window (delay 400 s, up 300 s)
+/// has not ticked because its first tick waits the jitter. It is warming
+/// up, with the grace window extended by the delay, not a dead work finder.
+#[test]
+fn a_host_inside_its_startup_jitter_is_warming_up_not_dead() {
+    let mut inputs = missing_tick_inputs();
+    inputs.status.as_mut().unwrap().startup_jitter_delay_secs = Some(400);
+    let mut report = install_report(InstallState::AliveButUnresponsive);
+    report.process_age_secs = Some(300);
+    inputs.install_state = Some(report);
+    assert_eq!(
+        classify_missing_tick(&inputs, inputs.status.as_ref().unwrap()),
+        MissingTick::WarmingUp {
+            age_secs: 300,
+            grace_secs: 520
+        }
+    );
+    assert_ne!(assess_dispatch(&inputs).verdict, Verdict::Degraded);
+    // Past delay + 2 x interval with no tick, it is a fault again.
+    inputs.install_state.as_mut().unwrap().process_age_secs = Some(600);
+    assert_eq!(assess_dispatch(&inputs).verdict, Verdict::Degraded);
+}
+
 // -------------------------------------------------------------------
 // #4824 — build-skew classification
 // -------------------------------------------------------------------

@@ -30,13 +30,13 @@ fn spec(ctx: &str) -> &'static CheckSpec<'static> {
 fn the_8078_8204_timeline_is_refused_on_inputs_not_on_timing() {
     // B = main at 09-17 with baseline 1845; D = #8204 tightening the baseline
     // (a G input); P = the PR's own main_health_gate.rs (an S path).
-    let d = set(&["scripts/file-size-baseline.txt"]);
-    let p = set(&["loom-daemon/src/main_health_gate.rs"]);
-    let reason = stale_reason(spec("File Size Ratchet"), &d, &p)
+    let d = set(&["scripts/markdown-token-baseline.txt"]);
+    let p = set(&["defaults/.claude/commands/loom/builder.md"]);
+    let reason = stale_reason(spec("Markdown Token Ratchet"), &d, &p)
         .expect("a tightened baseline under an in-flight source change is stale");
     assert!(reason.clause.contains("global input"), "{reason:?}");
-    assert_eq!(reason.base_path.as_deref(), Some("scripts/file-size-baseline.txt"));
-    assert_eq!(reason.pr_path.as_deref(), Some("loom-daemon/src/main_health_gate.rs"));
+    assert_eq!(reason.base_path.as_deref(), Some("scripts/markdown-token-baseline.txt"));
+    assert_eq!(reason.pr_path.as_deref(), Some("defaults/.claude/commands/loom/builder.md"));
 }
 
 #[test]
@@ -44,28 +44,34 @@ fn a_baseline_tightening_with_no_measured_file_in_the_pr_is_fresh() {
     // The narrowing that makes #8919 worth doing: main tightened the ratchet
     // baseline, but this PR touches nothing the ratchet measures, so the merged
     // tree's ratchet verdict is main's own — not this PR's business.
-    let d = set(&["scripts/file-size-baseline.txt"]);
+    let d = set(&["scripts/markdown-token-baseline.txt"]);
     let p = set(&["docs/adr/0020-something.md"]);
-    assert_eq!(stale_reason(spec("File Size Ratchet"), &d, &p), None);
+    assert_eq!(stale_reason(spec("Markdown Token Ratchet"), &d, &p), None);
 }
 
 // --- Per-file (S) checks -----------------------------------------------------
 
 #[test]
 fn disjoint_per_file_moves_are_fresh_and_an_overlap_is_stale() {
-    let s = spec("File Size Ratchet");
-    // Disjoint: main grew a.rs, the PR grew b.rs. Each file's verdict depends
+    let s = spec("Markdown Token Ratchet");
+    // Disjoint: main grew a.md, the PR grew b.md. Each file's verdict depends
     // only on its own content, so neither side can change the other's.
-    let d = set(&["loom-daemon/src/a.rs"]);
-    let p = set(&["loom-daemon/src/b.rs"]);
+    let d = set(&["defaults/.claude/commands/loom/a.md"]);
+    let p = set(&["defaults/.claude/commands/loom/b.md"]);
     assert_eq!(stale_reason(s, &d, &p), None);
 
     // Overlap: both sides touched the SAME measured file, so the merged
     // content is neither side's tested content.
-    let d = set(&["loom-daemon/src/a.rs", "loom-daemon/src/c.rs"]);
-    let p = set(&["loom-daemon/src/b.rs", "loom-daemon/src/c.rs"]);
+    let d = set(&[
+        "defaults/.claude/commands/loom/a.md",
+        "defaults/.claude/commands/loom/c.md",
+    ]);
+    let p = set(&[
+        "defaults/.claude/commands/loom/b.md",
+        "defaults/.claude/commands/loom/c.md",
+    ]);
     let reason = stale_reason(s, &d, &p).expect("an overlapping measured file is stale");
-    assert_eq!(reason.base_path.as_deref(), Some("loom-daemon/src/c.rs"));
+    assert_eq!(reason.base_path.as_deref(), Some("defaults/.claude/commands/loom/c.md"));
     assert!(reason.clause.contains("same scanned file"), "{reason:?}");
 }
 
@@ -158,7 +164,7 @@ fn an_empty_base_move_is_fresh_for_every_required_check() {
         "CLAUDE.md",
         "loom-daemon/src/x.rs",
         "defaults/roles/builder.md",
-        "scripts/file-size-baseline.txt",
+        "scripts/markdown-token-baseline.txt",
         ".gitignore",
         "AGENTS.md",
     ]);
@@ -176,11 +182,11 @@ fn an_empty_base_move_is_fresh_for_every_required_check() {
 fn a_global_input_touched_by_the_pr_alone_is_fresh() {
     // Clause 2 needs BOTH sides: the PR editing a ratchet script while main
     // moved somewhere irrelevant does not invalidate the tested verdict.
-    let s = spec("File Size Ratchet");
-    let p = set(&["scripts/check-file-size-budget.sh"]);
+    let s = spec("Markdown Token Ratchet");
+    let p = set(&["scripts/check-markdown-token-budget.sh"]);
     assert_eq!(stale_reason(s, &set(&["README.md"]), &p), None);
     // …but main touching anything the check reads makes it stale.
-    assert!(stale_reason(s, &set(&["loom-daemon/src/x.rs"]), &p).is_some());
+    assert!(stale_reason(s, &set(&["defaults/.claude/commands/loom/x.md"]), &p).is_some());
 }
 
 #[test]
@@ -420,20 +426,20 @@ guard will not notice when `main` changes that script.",
 #[test]
 fn a_composite_context_is_stale_when_any_component_is() {
     let specs = specs_for("Structural Checks").expect("composite resolves");
-    assert_eq!(specs.len(), 16);
-    // main tightens the file-size baseline; the PR edits a Rust source file.
-    let d = set(&["scripts/file-size-baseline.txt"]);
-    let p = set(&["loom-daemon/src/lib.rs"]);
+    assert_eq!(specs.len(), 15);
+    // main tightens the markdown-token baseline; the PR edits a role prompt.
+    let d = set(&["scripts/markdown-token-baseline.txt"]);
+    let p = set(&["defaults/.claude/commands/loom/judge.md"]);
     let (component, _) =
         composite_stale_reason(&specs, &d, &p, &CiScopes::unscoped()).expect("stale");
-    assert_eq!(component, "File Size Ratchet");
+    assert_eq!(component, "Markdown Token Ratchet");
 }
 
 #[test]
 fn a_composite_context_is_not_stale_on_cross_component_terms() {
     // main changes the CLAUDE.md budget script (a global input of CLAUDE.md
     // Line Budget only); the PR edits a role prompt, which CLAUDE.md Line
-    // Budget never reads. The UNION of all sixteen specs would call this stale
+    // Budget never reads. The UNION of all fifteen specs would call this stale
     // (main moved a global input; the PR touches some input). Per-component OR
     // does not: no single gate's verdict could have changed.
     let specs = specs_for("Structural Checks").expect("composite resolves");
@@ -462,9 +468,9 @@ fn a_composite_context_is_not_stale_on_cross_component_terms() {
 fn a_component_name_still_resolves_to_its_own_spec() {
     // Historical evidence (and the #8078 incident fixtures) name the gate, not
     // the composite; both must resolve.
-    let one = specs_for("File Size Ratchet").expect("component resolves");
+    let one = specs_for("Markdown Token Ratchet").expect("component resolves");
     assert_eq!(one.len(), 1);
-    assert_eq!(one[0].context, "File Size Ratchet");
+    assert_eq!(one[0].context, "Markdown Token Ratchet");
     assert!(specs_for("No Such Check").is_none());
 }
 
@@ -513,7 +519,7 @@ fn a_pr_editing_this_gates_own_ci_yml_block_is_still_stale() {
     let s = spec("Conflict Marker Check");
     assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&["Conflict Marker Check"])).is_some());
     // …and a scope naming some OTHER gate does not accidentally cover this one.
-    assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&["File Size Ratchet"])).is_none());
+    assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&["Markdown Token Ratchet"])).is_none());
 }
 
 #[test]
@@ -521,11 +527,11 @@ fn the_pr_side_narrowing_does_not_rescue_a_real_global_input_change() {
     // The narrowing removes ONE path from the `P` match. A PR that edits
     // `ci.yml` in an unrelated block AND tightens the gate's baseline is still
     // stale on the baseline.
-    let d = set(&["loom-daemon/src/big.rs"]);
-    let p = set(&[CI_WORKFLOW, "scripts/file-size-baseline.txt"]);
-    let reason = stale_reason_scoped(spec("File Size Ratchet"), &d, &p, &pr_scope(&[]))
+    let d = set(&["defaults/.claude/commands/loom/big.md"]);
+    let p = set(&[CI_WORKFLOW, "scripts/markdown-token-baseline.txt"]);
+    let reason = stale_reason_scoped(spec("Markdown Token Ratchet"), &d, &p, &pr_scope(&[]))
         .expect("the baseline edit is a global-input change regardless of ci.yml");
-    assert_eq!(reason.pr_path.as_deref(), Some("scripts/file-size-baseline.txt"));
+    assert_eq!(reason.pr_path.as_deref(), Some("scripts/markdown-token-baseline.txt"));
 }
 
 #[test]
