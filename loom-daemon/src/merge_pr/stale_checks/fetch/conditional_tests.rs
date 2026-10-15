@@ -401,6 +401,9 @@ fn a_stored_hold_past_the_cap_is_read_as_the_cap() {
 #[test]
 fn later_check_runs_pages_are_spaced() {
     let f = Forge::new();
+    // Page 1's stub exec can outlast the real 200 ms gap (macOS scans a fresh
+    // script), leaving page 2 nothing to wait out; an hour cannot elapse.
+    budget::set_gap_for_test(std::time::Duration::from_secs(3600));
     f.serve(&runs_url(SHA), &page(150, 100, 0));
     f.serve(&format!("{}&page=2", runs_url(SHA)), &page(150, 50, 100));
     fetch_check_runs(f.gh(), "o/r", SHA).unwrap();

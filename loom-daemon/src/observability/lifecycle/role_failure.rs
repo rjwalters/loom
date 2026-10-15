@@ -35,6 +35,12 @@ pub const EXIT_CODE: &str = "loom.exit_code";
 /// recorded why. Prefixed like the sweep's synthesized labels so it cannot be
 /// mistaken for a classifier verdict.
 pub const UNCLASSIFIED: &str = "unclassified:after-launch";
+/// The fallback class for a tick that failed before its launch with no site
+/// having noted why (#12028).
+pub const UNCLASSIFIED_PRE_LAUNCH: &str = "unclassified:pre-launch";
+/// The fallback class for a failed step-engine step, which has no role-runner
+/// launch site to note one (#12028).
+pub const UNCLASSIFIED_STEP: &str = "unclassified:step";
 /// The exported span attributes a role failure adds (the status message
 /// travels as the OTLP status description instead). Each must survive the
 /// daemon allowlist and the gateway's span `keep_keys` (contract-tested).
@@ -141,6 +147,90 @@ pub fn for_outcome(outcome: &RoleTickOutcome, noted: Option<RoleFailure>) -> Opt
             )
         })),
         _ => None,
+    }
+}
+
+/// The tick that failed before its launch, for `role_tick.outcome` (#12028):
+/// the noted class for a `Failure`, else the [`UNCLASSIFIED_PRE_LAUNCH`]
+/// fallback; `None` for every other outcome.
+#[must_use]
+pub fn for_unlaunched(
+    outcome: &RoleTickOutcome,
+    noted: Option<RoleFailure>,
+) -> Option<RoleFailure> {
+    match outcome {
+        RoleTickOutcome::Failure(_) => Some(noted.unwrap_or_else(|| {
+            RoleFailure::new(
+                UNCLASSIFIED_PRE_LAUNCH,
+                None,
+                "role tick failed before its launch; no cause was recorded",
+            )
+        })),
+        _ => None,
+    }
+}
+
+/// The fixed classes of the refusals that return a `RoleTickOutcome::Failure`
+/// before a role launches (#12028). Each pairs a closed-vocabulary class with
+/// a fixed message, so nothing from the free-form failure text can reach the
+/// exported record.
+pub mod pre_launch {
+    use super::{note_role_failure, RoleFailure};
+
+    /// One pre-launch refusal site's class and fixed message.
+    #[derive(Debug, Clone, Copy)]
+    pub struct PreLaunch {
+        pub class: &'static str,
+        pub message: &'static str,
+    }
+
+    const fn site(class: &'static str, message: &'static str) -> PreLaunch {
+        PreLaunch { class, message }
+    }
+
+    pub const SPAWN_BIN_UNRESOLVED: PreLaunch =
+        site("spawn-bin-unresolved", "role launcher script could not be resolved");
+    pub const RESUME_REFUSED: PreLaunch =
+        site("resume-refused", "roll resume refused: the binding moved to another runtime");
+    pub const RESUME_SESSION_UNUSABLE: PreLaunch = site(
+        "resume-session-unusable",
+        "roll resume refused: the saved session id is not usable",
+    );
+    pub const WRITE_SCOPE_REFUSED: PreLaunch = site(
+        "write-scope-refused",
+        "this installation may not write to the workspace repository",
+    );
+    pub const SELECTION_PREPARE_FAILED: PreLaunch = site(
+        "selection-prepare-failed",
+        "the private account selection could not be prepared",
+    );
+    pub const LOGS_DIR_FAILED: PreLaunch =
+        site("logs-dir-failed", "the role logs directory could not be created");
+    pub const LOG_OPEN_FAILED: PreLaunch =
+        site("log-open-failed", "the role log could not be opened");
+    pub const LOG_HANDLE_FAILED: PreLaunch =
+        site("log-handle-failed", "the role log handle could not be cloned");
+    pub const PAUSED_FOR_ROLL: PreLaunch = site(
+        "paused-for-roll",
+        "launch refused: the daemon is pausing every agent for a version roll",
+    );
+
+    /// Every pre-launch site, for the contract tests.
+    pub const ALL: &[PreLaunch] = &[
+        SPAWN_BIN_UNRESOLVED,
+        RESUME_REFUSED,
+        RESUME_SESSION_UNUSABLE,
+        WRITE_SCOPE_REFUSED,
+        SELECTION_PREPARE_FAILED,
+        LOGS_DIR_FAILED,
+        LOG_OPEN_FAILED,
+        LOG_HANDLE_FAILED,
+        PAUSED_FOR_ROLL,
+    ];
+
+    /// Note `site` as the cause of the in-flight tick's failure.
+    pub fn note(site: PreLaunch) {
+        note_role_failure(RoleFailure::new(site.class, None, site.message));
     }
 }
 
