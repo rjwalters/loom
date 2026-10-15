@@ -161,9 +161,25 @@ pub fn arm(root: &Path) -> Gate {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CLOSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: hold [`is_open`] false on this thread (each test runs on its
+/// own thread, so this never leaks into another test).
+#[cfg(test)]
+pub(crate) fn test_hold_closed(closed: bool) {
+    TEST_CLOSED.with(|c| c.set(closed));
+}
+
 /// Whether the first-run delay is over. An unarmed gate is open.
 #[must_use]
 pub fn is_open() -> bool {
+    #[cfg(test)]
+    if TEST_CLOSED.with(std::cell::Cell::get) {
+        return false;
+    }
     GATE.get()
         .is_none_or(|gate| gate.remaining(Instant::now()).is_zero())
 }

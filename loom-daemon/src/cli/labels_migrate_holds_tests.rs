@@ -95,6 +95,17 @@ impl HoldsForge for Fake {
         Ok(())
     }
 
+    fn park_noop_hold(&self, number: u64) -> Result<(), ForgeError> {
+        self.log(format!("park-noop #{number}"))?;
+        self.items
+            .borrow_mut()
+            .get_mut(&number)
+            .unwrap()
+            .0
+            .insert("loom:blocked".into());
+        Ok(())
+    }
+
     fn remove_label(&self, number: u64, label: &str) -> Result<(), ForgeError> {
         self.log(format!("remove #{number} {label}"))?;
         let mut items = self.items.borrow_mut();
@@ -386,4 +397,62 @@ fn a_capped_hold_routed_to_a_human_keeps_its_operator_label() {
     assert_eq!(r.summary.untouched, 1);
     assert!(fake.writes().is_empty(), "{:?}", fake.writes());
     assert!(fake.labels(9).contains("loom:operator"));
+}
+
+fn noop_notice(released: bool) -> Vec<String> {
+    use loom_daemon::sweep_registry::{
+        NOOP_HOLD_APPLIED_COMMENT_MARKER, NOOP_HOLD_COMMENT_MARKER,
+        NOOP_HOLD_RELEASED_COMMENT_MARKER,
+    };
+    let mut v = vec![format!(
+        "{NOOP_HOLD_COMMENT_MARKER}\n{NOOP_HOLD_APPLIED_COMMENT_MARKER}\n**Held after 3 \
+         consecutive no-op sweeps.**\n\nFingerprint compared: `labels=[loom:curated];open=true`"
+    )];
+    if released {
+        v.push(format!(
+            "{NOOP_HOLD_COMMENT_MARKER}\n{NOOP_HOLD_RELEASED_COMMENT_MARKER}\nreleased"
+        ));
+    }
+    v
+}
+
+/// #12024: the old no-op hold shape (`loom:operator` + a standing hold
+/// notice) moves to `loom:blocked` + the `no-op hold` park record, and loses
+/// `loom:operator`; it never reaches the escalation classifier.
+#[test]
+fn a_pre_12024_noop_hold_moves_off_the_operator_label() {
+    let held = noop_notice(false);
+    let held: Vec<&str> = held.iter().map(String::as_str).collect();
+    let fake = Fake::default().item(20, &["loom:curated", "loom:operator"], false, &held);
+
+    let dry = run(&fake, "o/r", false);
+    assert_eq!(dry.events, vec![Event::NoopHold { item: 20 }]);
+    assert_eq!((dry.summary.noop_holds, dry.exit), (1, 3));
+    assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+
+    let applied = run(&fake, "o/r", true);
+    assert_eq!(applied.summary.noop_holds, 1);
+    assert_eq!(fake.writes(), vec!["park-noop #20", "remove #20 loom:operator"]);
+    let labels = fake.labels(20);
+    assert!(labels.contains("loom:blocked") && labels.contains("loom:curated"));
+    assert!(!labels.contains("loom:operator"));
+    assert!(!fake
+        .calls
+        .borrow()
+        .iter()
+        .any(|c| c.starts_with("escalation")));
+    assert_eq!(applied.exit, 0);
+}
+
+/// A released no-op hold, or none at all, is not this shape: a human's
+/// `loom:operator` beside it stays, and the escalation pass still sees it.
+#[test]
+fn a_released_noop_hold_is_left_to_the_other_shapes() {
+    let released = noop_notice(true);
+    let released: Vec<&str> = released.iter().map(String::as_str).collect();
+    let fake = Fake::default().item(21, &["loom:curated", "loom:operator"], false, &released);
+    let r = run(&fake, "o/r", true);
+    assert!(r.events.is_empty(), "{:?}", r.events);
+    assert_eq!(r.summary.untouched, 1);
+    assert_eq!(fake.writes(), vec!["escalation #21 apply=true"], "only the classifier's look");
 }

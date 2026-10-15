@@ -98,7 +98,8 @@ pub(crate) enum LabelsCommand {
         /// role applied to `loom:blocked` (#11861): Champion-held PRs (a
         /// reason-only park record; `loom:pr` kept) and dependency-only
         /// escalations (a park record per open blocker, or released when they
-        /// all closed). Run it BEFORE the retired-label migration.
+        /// all closed), and daemon no-op holds applied before #12024 (the
+        /// `no-op hold` park record). Run it BEFORE the retired-label migration.
         #[arg(long, conflicts_with = "keep_labels")]
         holds: bool,
         /// Print the report as JSON.

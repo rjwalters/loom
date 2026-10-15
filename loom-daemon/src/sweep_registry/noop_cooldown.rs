@@ -96,13 +96,15 @@
 use super::*;
 
 mod fingerprint;
+mod fleet_streak;
 mod hold;
 mod peer_expiry;
 
 pub(crate) use fingerprint::ParkKind;
 pub(crate) use hold::NoopCooldownTable;
 pub use hold::{
-    NOOP_HOLD_APPLIED_COMMENT_MARKER, NOOP_HOLD_COMMENT_MARKER, NOOP_HOLD_FAILED_COMMENT_MARKER,
+    standing_noop_hold_fingerprint, NOOP_HOLD_APPLIED_COMMENT_MARKER, NOOP_HOLD_COMMENT_MARKER,
+    NOOP_HOLD_FAILED_COMMENT_MARKER, NOOP_HOLD_FP_MARKER_PREFIX, NOOP_HOLD_RELEASED_COMMENT_MARKER,
 };
 
 /// Env var overriding how many consecutive unchanged no-op releases park an

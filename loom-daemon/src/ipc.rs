@@ -1567,6 +1567,9 @@ pub fn build_daemon_status_for(
         auto_update_artifact_published_at: au.artifact_published_at,
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
+        auto_update_floor_not_rolling: au.floor_not_rolling, // #11042
+        auto_update_config_enabled: crate::auto_update::loop_mode::current()
+            .map(crate::auto_update::loop_mode::LoopMode::config_enabled),
         // Long-running task liveness (#10414): every registered loop's
         // last beat and whether it is inside its staleness window.
         task_liveness: crate::task_liveness::snapshot(),
@@ -1724,7 +1727,6 @@ pub fn build_daemon_status_for(
     // owns both the one-time per-root INFO line and the slow-build WARN (and
     // names the root-scaled budget each is judged against). Logging policy
     // lives there, not here — see `crate::status_budget`.
-    let phase_tail = phase_start.elapsed();
     crate::status_budget::record_status_build(
         build_started.elapsed(),
         roots.len(),
@@ -1737,7 +1739,7 @@ pub fn build_daemon_status_for(
             token_pool: phase_token_pool,
             stash_git_shellout: phase_stash_git_shellout,
             sweep_command_check: phase_sweep_command_check,
-            tail: phase_tail,
+            tail: phase_start.elapsed(),
             slowest_root,
         },
     );

@@ -704,18 +704,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 if primary_minted && cross_owner_retry.due() {
                     let (ws, repo, script) =
                         (pass_workspace.clone(), owner_repo.clone(), pass_script.clone());
-                    let pass = tokio::task::spawn_blocking(move || {
-                        credential_preflight::cross_owner::establish_for_workspace(
-                            &ws, &repo, &script,
+                    let pass =
+                        credential_preflight::cross_owner::establish_for_workspace_off_thread(
+                            ws, repo, script,
                         )
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
-                        credential_preflight::cross_owner::CrossOwnerPass {
-                            failed: vec![format!("per-owner pass join error: {e}")],
-                            ..Default::default()
-                        }
-                    });
+                        .await;
                     cross_owner_retry.record(&pass);
                 }
             }
@@ -1351,15 +1344,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // once, here at startup, naming exactly what is being ignored and what
         // to tune instead.
         work_finder::warn_deprecated_cpu_knobs(&work_finder_config);
-        // Per-tick admission (ramp) cap (#4234): resolved once at startup from
-        // the same `work_finder_config`, precedence env > config > default —
-        // the same startup-capture pattern as the CPU knobs above. Bounds how
-        // many *new* sweeps a single tick may admit, independent of how large
-        // the dynamic cap computes to that tick — see
-        // `work_finder::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV` for the full
-        // ramp-lag rationale (#4231's second wave).
-        let max_admissions_per_tick =
-            work_finder::resolve_max_admissions_per_tick_with_config(&work_finder_config);
+        // The per-tick admission (ramp) cap (#4234) rides in `configured_max`
+        // and, like it, is re-read every tick since #12090.
+        let max_admissions_per_tick = configured_max.max_admissions_per_tick.0;
         // #4084: hold new dispatch off a root while its build-gate run is in
         // flight, so a fresh sweep build does not race the gate's own build for
         // cores (the contention that timed the gate out under #4073's mild
@@ -1416,8 +1403,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
              max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
              dynamic cap = min(disk, ram, configured_max) — token axis is \
              selection-only, not a cap, since #5270, \
-             global across workspaces; configured_max is re-read every tick — \
-             a config edit hot-applies, an env override needs a restart, #9060)",
+             global across workspaces; configured_max, max_admissions_per_tick and the \
+             brake/breaker thresholds are re-read every tick — a config edit hot-applies, \
+             an env override needs a restart, #9060/#12090)",
             interval.as_secs(),
             configured_max.value,
             configured_max.source,
@@ -1437,7 +1425,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             sweep_workspace.clone(),
             interval,
             configured_max,
-            max_admissions_per_tick,
             workspace_health_states.clone(),
             suppress_dispatch_during_gate,
             event_bus.clone(),
