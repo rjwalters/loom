@@ -13,6 +13,7 @@ mod fact_id;
 mod fleet_state;
 mod host_export;
 mod host_resource;
+mod host_status;
 mod issue_estimate;
 mod metadata;
 mod operator_presence;
@@ -999,6 +1000,7 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             samples
         }
         TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),
+        TelemetryRecord::HostStatus(r) => host_status::samples(r, time_unix_nano),
         // Every kind that is not declared `otlp: Gauges` in
         // `telemetry/kinds.rs` produces no gauge here:
         //   - every lifecycle-shaped kind — including `role_tick.outcome`
