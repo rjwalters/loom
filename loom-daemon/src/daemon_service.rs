@@ -704,18 +704,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 if primary_minted && cross_owner_retry.due() {
                     let (ws, repo, script) =
                         (pass_workspace.clone(), owner_repo.clone(), pass_script.clone());
-                    let pass = tokio::task::spawn_blocking(move || {
-                        credential_preflight::cross_owner::establish_for_workspace(
-                            &ws, &repo, &script,
+                    let pass =
+                        credential_preflight::cross_owner::establish_for_workspace_off_thread(
+                            ws, repo, script,
                         )
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
-                        credential_preflight::cross_owner::CrossOwnerPass {
-                            failed: vec![format!("per-owner pass join error: {e}")],
-                            ..Default::default()
-                        }
-                    });
+                        .await;
                     cross_owner_retry.record(&pass);
                 }
             }
