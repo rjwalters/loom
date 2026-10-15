@@ -308,10 +308,12 @@ impl BindingTerm {
 /// tie-break order [`BindingTerm`] documents.
 #[must_use]
 pub fn binding_term(disk_headroom: usize, ram_headroom: usize, ceiling: usize) -> BindingTerm {
-    let min_val = disk_headroom.min(ram_headroom).min(ceiling);
-    if disk_headroom == min_val {
+    // #11911 (2am#4463): the cap is the configured number; disk or RAM binds
+    // only when exhausted, which halts admission.
+    let _ = ceiling;
+    if disk_headroom == 0 {
         BindingTerm::Disk
-    } else if ram_headroom == min_val {
+    } else if ram_headroom == 0 {
         BindingTerm::Ram
     } else {
         BindingTerm::Ceiling
@@ -726,8 +728,8 @@ mod tests {
     /// Plenty of CPU/RAM/tokens, nearly-full scratch volume.
     fn disk_bound_host() -> HostMeasurements {
         HostMeasurements {
-            disk_headroom: 2,
-            disk_free_gb: Some(5),
+            disk_headroom: 0,
+            disk_free_gb: Some(1),
             configured_max_concurrent: 10,
             ..idle_worker_host()
         }
@@ -736,8 +738,8 @@ mod tests {
     /// Plenty of CPU/tokens/disk, critically low available RAM (#5270).
     fn ram_bound_host() -> HostMeasurements {
         HostMeasurements {
-            ram_headroom: 1,
-            ram_free_gb: Some(2),
+            ram_headroom: 0,
+            ram_free_gb: Some(1),
             configured_max_concurrent: 10,
             ..idle_worker_host()
         }
@@ -820,7 +822,7 @@ mod tests {
         // #5270 AC3: critically-low RAM caps the dynamic concurrency the same
         // way disk headroom already did.
         let m = ram_bound_host();
-        assert_eq!(m.dynamic_cap(), 1, "min(disk 36, ram 1, maxConcurrent 10)");
+        assert_eq!(m.dynamic_cap(), 0, "exhausted RAM halts (#11911)");
         assert_eq!(m.binding_term(), BindingTerm::Ram);
     }
 
@@ -830,13 +832,12 @@ mod tests {
 
     #[test]
     fn binding_term_prefers_disk_then_ram_then_ceiling() {
-        assert_eq!(binding_term(2, 9, 9), BindingTerm::Disk);
-        assert_eq!(binding_term(9, 2, 9), BindingTerm::Ram);
-        assert_eq!(binding_term(9, 9, 2), BindingTerm::Ceiling);
-        // A tie between disk and ram resolves to disk, matching `status`'s
-        // tie-break order.
-        assert_eq!(binding_term(3, 3, 9), BindingTerm::Disk);
-        assert_eq!(binding_term(9, 3, 3), BindingTerm::Ram);
+        // #11911: headroom binds only when exhausted.
+        assert_eq!(binding_term(0, 9, 9), BindingTerm::Disk);
+        assert_eq!(binding_term(9, 0, 9), BindingTerm::Ram);
+        assert_eq!(binding_term(2, 2, 9), BindingTerm::Ceiling);
+        // A tie between disk and ram resolves to disk.
+        assert_eq!(binding_term(0, 0, 9), BindingTerm::Disk);
     }
 
     #[test]

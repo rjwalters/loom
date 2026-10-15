@@ -1758,9 +1758,9 @@ fn role_liveness_unknown_when_status_missing() {
     assert_eq!(section.verdict, Verdict::Unknown);
 }
 
-/// The #6201 incident, reproduced directly: `curator` (300s default
-/// interval) has a real last-tick record from nine days ago on a root
-/// where the role runner is enabled and `curator` is a resolved role —
+/// The #6201 incident, reproduced directly (on `auditor` since #11911, when
+/// `curator` left the role runner): a role (600s default interval) has a real last-tick record from nine days ago on a root
+/// where the role runner is enabled and `auditor` is a resolved role —
 /// this must surface as `Degraded`, not the false-`Green` the incident's
 /// windowed-ring-only `roles` section produced.
 /// A fully-populated [`crate::types::RoleLastTick`] fixture for the
@@ -1789,10 +1789,10 @@ fn role_last_tick(
 fn role_liveness_flags_a_role_silent_for_far_beyond_its_interval() {
     let mut inputs = healthy_inputs();
     let status = inputs.status.as_mut().unwrap();
-    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["auditor"])];
     status.role_last_tick = vec![role_last_tick(
         "/repos/loom",
-        "curator",
+        "auditor",
         inputs.at - chrono::Duration::days(9),
         true,
         None,
@@ -1801,11 +1801,11 @@ fn role_liveness_flags_a_role_silent_for_far_beyond_its_interval() {
 
     let section = assess_role_liveness(&inputs);
     assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(section.summary.contains("curator"), "{}", section.summary);
+    assert!(section.summary.contains("auditor"), "{}", section.summary);
     assert!(section.summary.contains("SILENT"), "{}", section.summary);
     let stale = &section.detail["stale"][0];
-    assert_eq!(stale["role"], "curator");
-    assert_eq!(stale["expected_interval_secs"], 300);
+    assert_eq!(stale["role"], "auditor");
+    assert_eq!(stale["expected_interval_secs"], 600);
 }
 
 /// A role that has NEVER ticked at all (no [`crate::types::RoleLastTick`]
@@ -1815,23 +1815,23 @@ fn role_liveness_flags_a_role_silent_for_far_beyond_its_interval() {
 fn role_liveness_never_ticked_is_not_flagged() {
     let mut inputs = healthy_inputs();
     let status = inputs.status.as_mut().unwrap();
-    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["auditor"])];
     status.role_last_tick = vec![];
 
     let section = assess_role_liveness(&inputs);
     assert_eq!(section.verdict, Verdict::Green);
 }
 
-/// A recent tick, well inside `curator`'s `300s * 4x` threshold, is Green
+/// A recent tick, well inside `auditor`'s `600s * 4x` threshold, is Green
 /// — ordinary cadence, not staleness.
 #[test]
 fn role_liveness_recent_tick_is_green() {
     let mut inputs = healthy_inputs();
     let status = inputs.status.as_mut().unwrap();
-    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["auditor"])];
     status.role_last_tick = vec![role_last_tick(
         "/repos/loom",
-        "curator",
+        "auditor",
         inputs.at - chrono::Duration::minutes(2),
         true,
         None,
@@ -1844,7 +1844,7 @@ fn role_liveness_recent_tick_is_green() {
 }
 
 /// Issue #7238: a fleet that has deliberately slowed its role-runner
-/// cadence (here to 1800s, well above `curator`'s 300s built-in default)
+/// cadence (here to 1800s, well above `auditor`'s 600s built-in default)
 /// must not have a healthy role falsely flagged SILENT just because its
 /// last tick is beyond `4x` the UN-configured built-in default — it must
 /// be compared against the actually-resolved 1800s interval instead.
@@ -1855,15 +1855,15 @@ fn role_liveness_green_under_a_slowed_resolved_cadence_beyond_the_built_in_thres
     status.per_repo = vec![role_liveness_repo_with_intervals(
         "/repos/loom",
         true,
-        vec!["curator"],
-        &[("curator", 1800)],
+        vec!["auditor"],
+        &[("auditor", 1800)],
     )];
-    // Beyond `4 * 300s` (the built-in threshold this issue was filed
-    // against) but well within `4 * 1800s` (the resolved threshold).
+    // Beyond `4 * 600s` (auditor's built-in threshold) but well within
+    // `4 * 1800s` (the resolved threshold).
     status.role_last_tick = vec![role_last_tick(
         "/repos/loom",
-        "curator",
-        inputs.at - chrono::Duration::seconds(1500),
+        "auditor",
+        inputs.at - chrono::Duration::seconds(3000),
         true,
         None,
         0,
@@ -1886,13 +1886,13 @@ fn role_liveness_still_flags_stale_beyond_4x_the_resolved_interval() {
     status.per_repo = vec![role_liveness_repo_with_intervals(
         "/repos/loom",
         true,
-        vec!["curator"],
-        &[("curator", 1800)],
+        vec!["auditor"],
+        &[("auditor", 1800)],
     )];
     // Beyond `4 * 1800s = 7200s`.
     status.role_last_tick = vec![role_last_tick(
         "/repos/loom",
-        "curator",
+        "auditor",
         inputs.at - chrono::Duration::seconds(7300),
         true,
         None,
@@ -1903,7 +1903,7 @@ fn role_liveness_still_flags_stale_beyond_4x_the_resolved_interval() {
     assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
     assert!(section.summary.contains("SILENT"), "{}", section.summary);
     let stale = &section.detail["stale"][0];
-    assert_eq!(stale["role"], "curator");
+    assert_eq!(stale["role"], "auditor");
     assert_eq!(stale["expected_interval_secs"], 1800);
 }
 
@@ -1916,13 +1916,13 @@ fn role_liveness_still_flags_stale_beyond_4x_the_resolved_interval() {
 fn role_liveness_falls_back_to_built_in_default_when_intervals_map_is_empty() {
     let mut inputs = healthy_inputs();
     let status = inputs.status.as_mut().unwrap();
-    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
-    // Beyond `4 * 300s` (curator's built-in default) — must still flag,
+    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["auditor"])];
+    // Beyond `4 * 600s` (auditor's built-in default) — must still flag,
     // exactly as it did before #7238.
     status.role_last_tick = vec![role_last_tick(
         "/repos/loom",
-        "curator",
-        inputs.at - chrono::Duration::seconds(1300),
+        "auditor",
+        inputs.at - chrono::Duration::seconds(2500),
         true,
         None,
         0,
@@ -1931,7 +1931,7 @@ fn role_liveness_falls_back_to_built_in_default_when_intervals_map_is_empty() {
     let section = assess_role_liveness(&inputs);
     assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
     let stale = &section.detail["stale"][0];
-    assert_eq!(stale["expected_interval_secs"], 300);
+    assert_eq!(stale["expected_interval_secs"], 600);
 }
 
 /// A root with the role runner disabled is not checked at all, even if
@@ -1941,10 +1941,10 @@ fn role_liveness_falls_back_to_built_in_default_when_intervals_map_is_empty() {
 fn role_liveness_disabled_root_is_not_checked() {
     let mut inputs = healthy_inputs();
     let status = inputs.status.as_mut().unwrap();
-    status.per_repo = vec![role_liveness_repo("/repos/loom", false, vec!["curator"])];
+    status.per_repo = vec![role_liveness_repo("/repos/loom", false, vec!["auditor"])];
     status.role_last_tick = vec![role_last_tick(
         "/repos/loom",
-        "curator",
+        "auditor",
         inputs.at - chrono::Duration::days(9),
         true,
         None,
@@ -1958,7 +1958,7 @@ fn role_liveness_disabled_root_is_not_checked() {
 
 // ------- Stuck (ticking, but never actually running) roles (#6239) ----
 
-/// The #6239 incident, reproduced directly: `curator` ticks every
+/// The #6239 incident, reproduced directly: `auditor` ticks every
 /// interval (so it is nowhere near `stale`) but its last
 /// `ROLE_TICK_ESCALATION_THRESHOLD` consecutive ticks all bailed out
 /// pre-spawn with a byte-identical `ModelRuntimeMismatch` detail. This
@@ -1968,10 +1968,10 @@ fn role_liveness_disabled_root_is_not_checked() {
 fn role_liveness_flags_a_role_stuck_on_an_identical_pre_spawn_skip() {
     let mut inputs = healthy_inputs();
     let status = inputs.status.as_mut().unwrap();
-    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["auditor"])];
     status.role_last_tick = vec![role_last_tick(
         "/repos/loom",
-        "curator",
+        "auditor",
         inputs.at - chrono::Duration::seconds(30),
         false,
         Some("model/runtime mismatch: runtime \"codex\" only accepts Codex models"),
@@ -1981,10 +1981,10 @@ fn role_liveness_flags_a_role_stuck_on_an_identical_pre_spawn_skip() {
     let section = assess_role_liveness(&inputs);
     assert_eq!(section.verdict, Verdict::Degraded);
     assert!(section.summary.contains("STUCK"), "{}", section.summary);
-    assert!(section.summary.contains("curator @ loom"), "{}", section.summary);
+    assert!(section.summary.contains("auditor @ loom"), "{}", section.summary);
     assert!(section.summary.contains("model/runtime mismatch"), "{}", section.summary);
     let stuck = &section.detail["stuck"][0];
-    assert_eq!(stuck["role"], "curator");
+    assert_eq!(stuck["role"], "auditor");
     assert_eq!(stuck["consecutive_identical_failures"], ROLE_TICK_ESCALATION_THRESHOLD);
     assert!(section.detail["stale"].as_array().unwrap().is_empty());
 }
@@ -1997,10 +1997,10 @@ fn role_liveness_flags_a_role_stuck_on_an_identical_pre_spawn_skip() {
 fn role_liveness_below_threshold_failures_are_not_stuck() {
     let mut inputs = healthy_inputs();
     let status = inputs.status.as_mut().unwrap();
-    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["auditor"])];
     status.role_last_tick = vec![role_last_tick(
         "/repos/loom",
-        "curator",
+        "auditor",
         inputs.at - chrono::Duration::seconds(30),
         false,
         Some("no-token-pool"),
@@ -2019,10 +2019,10 @@ fn role_liveness_below_threshold_failures_are_not_stuck() {
 fn role_liveness_stale_takes_precedence_over_stuck_for_the_same_pair() {
     let mut inputs = healthy_inputs();
     let status = inputs.status.as_mut().unwrap();
-    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+    status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["auditor"])];
     status.role_last_tick = vec![role_last_tick(
         "/repos/loom",
-        "curator",
+        "auditor",
         inputs.at - chrono::Duration::days(9),
         false,
         Some("no-token-pool"),
@@ -2053,13 +2053,13 @@ fn role_liveness_reports_stuck_even_when_the_ring_is_saturated_by_other_roots() 
     // `role_last_tick` map.
     for _ in 0..ROLE_TICK_ESCALATION_THRESHOLD {
         crate::role_runner::record_role_tick(
-            "curator",
+            "auditor",
             root,
             &crate::role_runner::RoleTickOutcome::NoTokenPool,
         );
     }
     // Then saturate the ring with a different pair's successes —
-    // comfortably more than `ROLE_TICK_RING_CAPACITY` so every curator
+    // comfortably more than `ROLE_TICK_RING_CAPACITY` so every auditor
     // entry above (the oldest in the ring) is evicted.
     for _ in 0..(crate::role_runner::ROLE_TICK_RING_CAPACITY + 50) {
         crate::role_runner::record_role_tick(
@@ -2069,19 +2069,19 @@ fn role_liveness_reports_stuck_even_when_the_ring_is_saturated_by_other_roots() 
         );
     }
 
-    // Confirm the premise: the bounded ring holds NO curator@loom
+    // Confirm the premise: the bounded ring holds NO auditor@loom
     // records at all (fully evicted by the saturating champion ticks).
     let ring_records = crate::role_runner::role_tick_records();
     assert!(
-        ring_records.iter().all(|r| r.role != "curator"),
-        "the saturating loop must have fully evicted curator's ring records"
+        ring_records.iter().all(|r| r.role != "auditor"),
+        "the saturating loop must have fully evicted auditor's ring records"
     );
 
     let mut inputs = healthy_inputs();
     inputs.at = Utc::now();
     {
         let status = inputs.status.as_mut().unwrap();
-        status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+        status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["auditor"])];
         status.role_last_tick = crate::role_runner::last_role_tick_snapshot();
         status.role_tick_records = ring_records;
     }
@@ -2089,13 +2089,13 @@ fn role_liveness_reports_stuck_even_when_the_ring_is_saturated_by_other_roots() 
     let section = assess_role_liveness(&inputs);
     assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
     assert!(section.summary.contains("STUCK"), "{}", section.summary);
-    assert!(section.summary.contains("curator @ loom"), "{}", section.summary);
+    assert!(section.summary.contains("auditor @ loom"), "{}", section.summary);
 
     // The windowed `roles` section, sourced from the saturated ring
     // alone, is exactly the false-green this issue was filed for.
     let roles_section = assess_roles(&inputs);
     assert!(
-        !roles_section.summary.contains("curator"),
+        !roles_section.summary.contains("auditor"),
         "demonstrates the bounded ring alone cannot see the evicted pair: {}",
         roles_section.summary
     );

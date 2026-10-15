@@ -3,6 +3,10 @@
 //! resolver and process-local tick history — never a forge call, so a tick
 //! pass can produce it too. Scheduling never implies the Curator curated
 //! anything; `last_run_ok` is the runner's outcome, not a count of curations.
+//!
+//! Since #11911 Curator is a step the work finder draws and has left the role
+//! runner's table, so no repo reports a role-runner Curator state: the map is
+//! empty (Curator steps report through the step telemetry instead).
 
 /// Each managed repo's observed [`CuratorState`](crate::telemetry::kinds::fleet_state::CuratorState),
 /// by lowercased slug.
@@ -56,32 +60,12 @@ fn curator_with_ticks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #11911: Curator is a step, not a role-runner role, so no repo reports
+    /// a role-runner Curator state, even with an old Curator tick on record
+    /// or `curator` still named in `roles`.
     #[test]
-    fn attempts_are_attributed_to_exact_root_and_failed_skips_are_not_success() {
-        let first = tempfile::tempdir().expect("first");
-        let second = tempfile::tempdir().expect("second");
-        let at = chrono::Utc::now();
-        let ticks = vec![crate::types::RoleLastTick {
-            root: first.path().to_path_buf(),
-            role: "curator".into(),
-            at,
-            ok: false,
-            detail: Some("NoTokenPool".into()),
-            consecutive_identical_failures: 2,
-        }];
-        let roots = vec![
-            (first.path().to_path_buf(), "acme/first".into()),
-            (second.path().to_path_buf(), "acme/second".into()),
-        ];
-        let state = curator_with_ticks(&roots, &ticks);
-        assert_eq!(state["acme/first"].last_run_at, Some(at));
-        assert_eq!(state["acme/first"].last_run_ok, Some(false));
-        // A root with no recorded tick reports neither — never a guessed run.
-        assert_eq!(state["acme/second"].last_run_at, None);
-        assert_eq!(state["acme/second"].last_run_ok, None);
-    }
-    #[test]
-    fn effective_config_selects_curator_and_cadence() {
+    fn no_repo_reports_a_role_runner_curator_state() {
         let root = tempfile::tempdir().expect("root");
         std::fs::create_dir_all(root.path().join(".loom")).expect("config directory");
         std::fs::write(
@@ -89,19 +73,15 @@ mod tests {
             r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["curator"],"intervalSecs":123}}}"#,
         )
         .expect("config");
+        let ticks = vec![crate::types::RoleLastTick {
+            root: root.path().to_path_buf(),
+            role: "curator".into(),
+            at: chrono::Utc::now(),
+            ok: true,
+            detail: None,
+            consecutive_identical_failures: 0,
+        }];
         let roots = vec![(root.path().to_path_buf(), "acme/repo".into())];
-        let actual = curator_with_ticks(&roots, &[]);
-        let config = crate::role_runner::read_role_runner_config(root.path());
-        let spec = crate::role_runner::resolve_roles(&config)
-            .into_iter()
-            .find(|s| s.name == "curator")
-            .expect("Curator selected");
-        assert_eq!(
-            actual["acme/repo"].cadence_secs,
-            crate::role_runner::resolve_interval_for_role(&spec, &config).as_secs()
-        );
-        assert_eq!(actual["acme/repo"].cadence_secs, 123);
-        assert!(actual["acme/repo"].interval_enabled);
-        assert_eq!(actual["acme/repo"].last_run_at, None);
+        assert!(curator_with_ticks(&roots, &ticks).is_empty());
     }
 }

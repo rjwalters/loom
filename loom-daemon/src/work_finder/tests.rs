@@ -814,9 +814,8 @@ fn test_eager_reclaim_fires_when_disk_is_about_to_zero_the_cap() {
 
 #[test]
 fn test_eager_reclaim_fires_when_disk_merely_binds_the_cap_down() {
-    // Disk has not reached 0 yet but is already costing dispatch slots
-    // (cap 1 instead of 8). Reclaiming here is what keeps it off 0.
-    assert_eq!(resolve_dynamic_max_concurrent(1, 8, 10), 1);
+    // Disk has not reached 0 yet but is already low (below the other
+    // terms). Reclaiming here is what keeps it off 0, where admission halts.
     assert!(crate::eager_reclaim::should_trigger(false, 1, 8, 10));
 }
 
@@ -830,9 +829,8 @@ fn test_eager_reclaim_does_not_fire_on_an_ordinary_tick() {
 
 #[test]
 fn test_eager_reclaim_does_not_fire_when_ram_is_the_binding_axis() {
-    // Cap is 1, but disk is not why — freeing disk would not buy a single
-    // slot, so the forge/docker round-trips would be pure waste.
-    assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, 1, 8), 1);
+    // RAM is the low axis, not disk: freeing disk buys nothing, so the
+    // forge/docker round-trips would be pure waste.
     assert!(!crate::eager_reclaim::should_trigger(false, usize::MAX, 1, 8));
 }
 
@@ -874,7 +872,7 @@ fn test_eager_reclaim_rearms_after_a_successful_reclaim() {
     // Post-reclaim re-probe: 12 GB-worth of headroom recovered.
     was_binding = crate::eager_reclaim::disk_axis_binds_cap_down(12, 8, 10);
     assert!(!was_binding);
-    assert_eq!(resolve_dynamic_max_concurrent(12, 8, 10), 8, "cap recovered to the ram term");
+    assert_eq!(resolve_dynamic_max_concurrent(12, 8, 10), 10, "cap recovered (#11911)");
     // Hours later it fills up again.
     assert!(crate::eager_reclaim::should_trigger(was_binding, 0, 8, 10));
 }

@@ -3924,23 +3924,23 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
     assert!(report.in_flight.is_empty());
     // The tempdir has no `.loom/tokens/`, so the pool is 0 — but since
     // #5270 the token axis no longer participates in the dynamic cap, so
-    // an empty token pool no longer pins `dynamic_cap` to 0. The cap is
-    // `min(disk_headroom, ram_headroom, configured_max)`, where
-    // `configured_max` is resolved the same way `build_daemon_status`
-    // resolves it (not assumed to be the built-in default — a host-level
-    // config tier may set it, exactly the ambient config this assertion
-    // must tolerate).
+    // an empty token pool no longer pins `dynamic_cap` to 0. Since #11911
+    // (2am#4463) the cap is the one configured number, resolved the same way
+    // `build_daemon_status` resolves it (a host-level config tier may set
+    // it), and disk or RAM headroom only halt it at exhaustion.
     assert_eq!(report.token_pool_size, 0);
     let expected_configured_max = crate::work_finder::resolve_max_concurrent_with_config(
         &crate::work_finder::read_work_finder_config(&root),
     );
     assert_eq!(
         report.dynamic_cap,
-        report
-            .disk_headroom
-            .min(report.ram_headroom)
-            .min(expected_configured_max),
-        "dynamic cap is min(disk, ram, configured_max) regardless of the empty token pool"
+        crate::work_finder::resolve_dynamic_max_concurrent(
+            report.disk_headroom,
+            report.ram_headroom,
+            expected_configured_max,
+        ),
+        "dynamic cap is the configured number (or 0 at exhaustion), regardless of the \
+         empty token pool"
     );
     // #4345: a pool that never called start_safehouse_narration /
     // start_peer_coordination still reports a live safehouse state — the
