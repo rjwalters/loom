@@ -54,6 +54,7 @@ pub mod draw_claims;
 pub mod ended;
 pub(crate) mod lease;
 mod pool_state;
+pub(crate) mod span;
 pub(crate) mod timeout;
 mod unlocked;
 pub(crate) use unlocked::blocking;

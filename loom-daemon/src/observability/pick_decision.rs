@@ -521,6 +521,46 @@ pub fn completed_work_finder_record(
         .with_dispatch_result(Some(dispatch_result))
 }
 
+/// `dispatch_result` of a work-finder tick skipped whole because the shared
+/// GitHub rate-limit breaker (#4429) was suppressing forge polling (#12083).
+pub const RATE_LIMIT_HELD: &str = "rate_limit_held";
+
+/// A tick the work finder skipped before listing anything (#12083): an empty,
+/// unobserved record so a breaker-skipped tick reads as a tick with a named
+/// `dispatch_result`, not as silence. `outcome` stays `skipped`.
+#[must_use]
+pub fn skipped_work_finder_record(
+    host: &str,
+    at: DateTime<Utc>,
+    dispatch_result: &str,
+) -> PickDecisionRecord {
+    PickDecisionRecord::build(
+        PickTick {
+            role: WORK_FINDER_ROLE.to_string(),
+            host: host.to_string(),
+            tick_id: format!("{WORK_FINDER_ROLE}-{}", crate::telemetry::trace::instant(at)),
+            started_at: at,
+            ended_at: at,
+            outcome: "skipped".to_string(),
+        },
+        Vec::new(),
+    )
+    .with_source(source::READY_QUEUE, false)
+    .with_dispatch_result(Some(dispatch_result))
+}
+
+/// Emit [`skipped_work_finder_record`] for a tick skipped at `at`; a no-op
+/// unless an OTLP exporter is running.
+pub fn emit_skipped_work_finder(dispatch_result: &str, at: DateTime<Utc>) {
+    if exporting() {
+        emit(skipped_work_finder_record(
+            &crate::sweep_registry::host_identity(),
+            at,
+            dispatch_result,
+        ));
+    }
+}
+
 /// The reason every candidate of a tick that never ran the role was skipped.
 fn tick_skip_reason(result: RoleTickResult) -> Option<PickSkipReason> {
     match result {
