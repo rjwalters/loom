@@ -229,8 +229,6 @@ pub fn publish_tick(
         dispatch_result,
     );
     store_tick_summary(summary);
-    // #11161: `fleet.state` samples every tick, after the summary is stored.
-    crate::observability::fleet_state::tick_completed();
     crate::observability::ops::dispatch::record_tick(
         report,
         max_concurrent,

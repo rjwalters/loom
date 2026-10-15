@@ -376,6 +376,39 @@ fn a_failed_delivery_replays_only_the_record_it_failed_on() {
     assert_eq!(replayed, contexts[2..]);
 }
 
+fn hold_drain_lock(journal: &Journal) -> File {
+    let held = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(journal.path().with_extension("drain-lock"))
+        .unwrap();
+    held.try_lock().unwrap();
+    held
+}
+
+#[test]
+fn a_briefly_held_drain_lock_is_waited_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("execution.json"));
+    let held = hold_drain_lock(&journal);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        drop(held);
+    });
+    assert_eq!(journal.drain(|_| Ok(())).unwrap(), 0);
+    release.join().unwrap();
+}
+
+#[test]
+fn a_drain_lock_held_past_the_bound_still_reports_drain_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("execution.json"));
+    let _held = hold_drain_lock(&journal);
+    let error = journal.drain(|_| Ok(())).unwrap_err();
+    assert!(format!("{error:#}").contains("trace journal drain busy"));
+}
+
 #[test]
 fn representative_journal_overhead_is_measured() {
     let dir = tempfile::tempdir().unwrap();

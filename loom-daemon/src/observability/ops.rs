@@ -35,7 +35,9 @@
 //! (W4-B) one `forge.reader.spill` span per read-pool spill-latch
 //! transition. [`ipc_latency`] (#10765) exports IPC request latency by
 //! request kind on its own ticker. [`build_gate`] (#11690) one
-//! `build_gate.run` span per host-side run of `buildGate.command`. A new emitter adds a `MetricName`/`SpanName`
+//! `build_gate.run` span per host-side run of `buildGate.command`. [`feed`]
+//! (#12152) counts the narration sink's public-feed completions by trigger
+//! and its merge-reconciliation passes by outcome. A new emitter adds a `MetricName`/`SpanName`
 //! variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
@@ -51,6 +53,7 @@ pub mod dispatch_facts;
 pub mod dispatch_step;
 pub mod disposition;
 pub mod dwell;
+pub mod feed;
 pub mod forge_calls;
 pub mod forge_mirror;
 pub mod host;

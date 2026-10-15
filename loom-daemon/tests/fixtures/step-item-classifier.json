@@ -499,7 +499,7 @@
       ]
     },
     {
-      "name": "loom:issue + blocked dependency park with blockers closed: release-stale-blocked owns it, not a step",
+      "name": "loom:issue + blocked dependency park with blockers closed: stays blocked, not a step (#11301)",
       "inputs": {
         "issues": [
           {
