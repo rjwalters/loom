@@ -125,6 +125,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.draw_attempt",
     "loom.step.age_source",
     "loom.step.resumed",
+    // The draw's weight terms (#12185).
+    "loom.step.weight",
+    "loom.step.total_weight",
+    "loom.step.repo_items",
+    "loom.step.in_flight_repo",
     // `loom.dispatch.disposition` spans (Issue #9222).
     "loom.queue.disposition",
     "loom.queue.state",

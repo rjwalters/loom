@@ -3,19 +3,17 @@
 //!
 //! Each tick, for every free slot:
 //!
-//! 1. **Draw a workspace** among those with items left in their pool, with
-//!    the workspace draw's weights and bonuses
-//!    ([`crate::priority_pick::draw_workspace`], seeded `loom-draw/v1` once
-//!    per tick, #11103).
-//! 2. **Draw an item** from it ([`ItemDraw::try_next`], `loom-draw/v2`,
-//!    seeded per draw with the workspace's forge slug, the name
-//!    `pick.decision` gives it, so the logged draws replay). A
-//!    [`DrawError::WeightOverflow`] ends that workspace's draws for the tick
-//!    and is recorded on the record, never only logged.
-//! 3. **Gate**: the per-repo RAM, disk and count cap
+//! 1. **Draw an item** from one pool of every actionable item across the
+//!    host's workspaces ([`ItemDraw::try_next`], `loom-draw/v3`, seeded per
+//!    draw, #12185). An item's weight is its priority and age scaled by its
+//!    repo's roster weight, backlog and in-flight count
+//!    ([`super::item_draw::pool_weights`]); there is no separate workspace
+//!    draw. A [`DrawError::WeightOverflow`] ends the tick's draws and is
+//!    recorded on the record, never only logged.
+//! 2. **Gate**: the per-repo RAM, disk and count cap
 //!    ([`RepoCap::defer_admission`]). A repo that does not fit is out of the
 //!    draw for the rest of the tick.
-//! 4. **Claim and spawn** through the [`StepSpawner`] (the registry's step
+//! 3. **Claim and spawn** through the [`StepSpawner`] (the registry's step
 //!    spawn, #11906): the role's resolvers and pool gate, then the claim.
 //!
 //! A refused gate or claim is a **pass**: draw again, up to
@@ -32,18 +30,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::item_draw::{Candidate, DrawError, DrawRecord, ItemDraw, SeedKey, Weighing};
-use crate::observability::pick_decision::{item_draw_record, ItemDrawWorkspace};
-use crate::priority_pick::{self, Level, PickRng, WeightBonus, WorkspaceEntry};
+use super::item_draw::{
+    Candidate, DrawError, DrawRecord, ItemDraw, PoolKnobs, RepoTerms, SeedKey, Weighing,
+};
+use crate::observability::pick_decision::{item_draw_record, ItemDrawPool, ItemDrawWorkspace};
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_spawn::draw_claims::DrawClaims;
-use crate::sweep_registry::step_spawn::StepSpawnRequest;
+use crate::sweep_registry::step_spawn::{StepDrawTerms, StepSpawnRequest};
 use crate::telemetry::kinds::pick_decision::{PickItemExclusion, PickSkipReason};
 use crate::types::QueueDisposition as Qd;
 use crate::work_finder::ready_queue::TickQueueRow;
 use crate::work_finder::repo_cap::RepoCap;
 use crate::work_finder::step_item::{Lane, PassReason};
-use crate::work_finder::workspace_draw::{self, DrawLog, DrawStep, SeedInputs};
 use crate::work_finder::{PriorityCandidate, TickReport};
 
 /// At most this many item draws fill one slot (design §4.2 step 4).
@@ -58,7 +56,7 @@ pub const PASS_MERGE: &str = "merge_in_flight";
 
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The next value of this process's tick counter, the `loom-draw/v2` seed's
+/// The next value of this process's tick counter, the `loom-draw/v3` seed's
 /// third input.
 #[must_use]
 pub fn next_tick_counter() -> u64 {
@@ -70,11 +68,13 @@ pub fn next_tick_counter() -> u64 {
 pub struct StepWorkspace {
     /// Its index among the tick's roots.
     pub idx: usize,
-    /// The forge slug: the `repo` `pick.decision` names and the item seed's
-    /// `workspace` input.
+    /// The forge slug: the `repo` `pick.decision` names.
     pub repo: String,
-    /// Its roster weight (0: never drawn).
+    /// Its roster weight `w_repo` (0: never drawn).
     pub weight: u32,
+    /// `in_flight_repo`: its items this host runs or a peer advertises a
+    /// live claim on, counted before the draw takes them out of the pool.
+    pub in_flight: usize,
     /// Its items, weighed.
     pub weighing: Weighing,
     /// A hold keeps it out of the tick (red main, drain, preflight, ...).
@@ -94,7 +94,7 @@ pub struct StepTickLimits {
     pub saturation_held: bool,
 }
 
-/// What the item draws are seeded from, besides the workspace.
+/// What the item draws are seeded from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeedBase {
     pub minute: u64,
@@ -239,41 +239,13 @@ fn key_of(ws: &StepWorkspace, c: &Candidate) -> PriorityCandidate {
     }
 }
 
-/// One workspace's draw state.
-struct Drawing {
-    ws: StepWorkspace,
-    draw: ItemDraw,
-    draws: Vec<DrawRecord>,
-    /// A Champion merge was spawned in this repo this tick.
-    merging: bool,
-    /// Draws the spawn or the per-repo cap refused, by reason.
-    refused: BTreeMap<String, usize>,
-    /// Out of the draw for the rest of the tick (empty, capped, overflowed).
-    closed: bool,
-    overflow: bool,
-}
-
-impl Drawing {
-    fn entry(&self) -> WorkspaceEntry {
-        let left = self.draw.remaining();
-        WorkspaceEntry {
-            workspace: workspace_draw::workspace_key(self.ws.idx),
-            weight: self.ws.weight,
-            has_red_main_fix: left.iter().any(|c| c.item.lane == Lane::RedMain),
-            has_very_important: left.iter().any(|c| c.terms.level == Level::VeryImportant),
-            has_important: left.iter().any(|c| c.terms.level == Level::Important),
-        }
-    }
-}
-
 /// Run one step tick over `workspaces` (module docs).
 #[allow(clippy::too_many_lines)] // one loop, kept whole so the pass rules read in order.
 pub fn run(
-    workspaces: Vec<StepWorkspace>,
+    mut workspaces: Vec<StepWorkspace>,
     limits: StepTickLimits,
     seed: &SeedBase,
-    (workspace_seed, seed_inputs): (u64, Option<SeedInputs>),
-    bonus: &WeightBonus,
+    knobs: &PoolKnobs,
     repo_cap: &mut RepoCap,
     spawner: &mut dyn StepSpawner,
 ) -> StepTick {
@@ -286,8 +258,11 @@ pub fn run(
         ..TickReport::default()
     };
 
-    let mut drawing: Vec<Drawing> = Vec::new();
-    for ws in workspaces {
+    // The pool is every repo's items, repos in workspace order.
+    workspaces.sort_by_key(|w| w.idx);
+    let mut repos: BTreeMap<usize, RepoTerms> = BTreeMap::new();
+    let mut pool: Vec<Candidate> = Vec::new();
+    for ws in &workspaces {
         count_exclusions(&mut report, &ws.weighing);
         report.seen += ws.weighing.pool.len() + ws.weighing.excluded.values().sum::<usize>();
         report
@@ -295,7 +270,7 @@ pub fn run(
             .extend(ws.weighing.demotions.iter().cloned());
         for c in &ws.weighing.pool {
             report.queue.push(TickQueueRow {
-                key: key_of(&ws, c),
+                key: key_of(ws, c),
                 disposition: ws.halted.then_some(Qd::WorkspaceHalted),
                 detail: None,
                 updated_at: None,
@@ -304,91 +279,84 @@ pub fn run(
                 step: Some(c.step),
             });
         }
-        let key = SeedKey {
+        if !ws.halted {
+            repos.insert(
+                ws.idx,
+                RepoTerms {
+                    weight: ws.weight,
+                    in_flight: ws.in_flight,
+                },
+            );
+            pool.extend(ws.weighing.pool.iter().cloned());
+        }
+    }
+    let by_idx: BTreeMap<usize, &StepWorkspace> = workspaces.iter().map(|w| (w.idx, w)).collect();
+    let mut draw = ItemDraw::new(
+        pool,
+        repos,
+        *knobs,
+        SeedKey {
             minute: seed.minute,
             host: seed.host.clone(),
             tick_counter: seed.tick_counter,
-            workspace: ws.repo.clone(),
-        };
-        let draw = ItemDraw::new(ws.weighing.pool.clone(), key);
-        let closed = ws.halted || ws.weighing.pool.is_empty() || ws.weight == 0;
-        drawing.push(Drawing {
-            ws,
-            draw,
-            draws: Vec::new(),
-            refused: BTreeMap::new(),
-            merging: false,
-            closed,
-            overflow: false,
-        });
-    }
+        },
+    );
+    let mut draws: Vec<DrawRecord> = Vec::new();
+    // A Champion merge was spawned in the repo this tick.
+    let mut merging: BTreeSet<usize> = BTreeSet::new();
+    // Draws the spawn or the per-repo cap refused, by repo and reason.
+    let mut refused: BTreeMap<usize, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut overflow = false;
 
     let budget = if limits.saturation_held {
         0
     } else {
         limits.free_slots.min(limits.max_admissions)
     };
-    let mut rng = PickRng::from_seed(workspace_seed);
-    let mut steps: Vec<DrawStep> = Vec::new();
-    let mut draws_total = 0usize;
     let mut passes = 0u32;
     let mut order: Vec<(usize, u32)> = Vec::new();
     let mut exhausted = false;
     for _slot in 0..budget {
         let mut attempts = 0u32;
         while attempts < MAX_DRAWS_PER_SLOT && passes < MAX_PASSES_PER_TICK {
-            let entries: Vec<WorkspaceEntry> = drawing
-                .iter()
-                .filter(|d| !d.closed && !d.draw.remaining().is_empty())
-                .map(Drawing::entry)
-                .collect();
-            let Some(ws_draw) = priority_pick::draw_workspace(&entries, bonus, &mut rng) else {
-                exhausted = true;
-                break;
-            };
-            let Some(d) = workspace_draw::workspace_idx(&ws_draw.picked)
-                .and_then(|idx| drawing.iter_mut().find(|d| d.ws.idx == idx))
-            else {
-                exhausted = true;
-                break;
-            };
-            draws_total += 1;
-            let record = match d.draw.try_next() {
+            let record = match draw.try_next() {
                 Ok(Some(record)) => record,
                 Ok(None) => {
-                    d.closed = true;
-                    continue;
+                    exhausted = true;
+                    break;
                 }
                 Err(DrawError::WeightOverflow) => {
                     log::error!(
-                        "work_finder: {}: item draw stopped — {} ({} items pooled)",
-                        d.ws.repo,
+                        "work_finder: item draw stopped — {} ({} items pooled)",
                         DrawError::WeightOverflow,
-                        d.draw.remaining().len()
+                        draw.remaining().len()
                     );
-                    d.overflow = true;
-                    d.closed = true;
-                    continue;
+                    overflow = true;
+                    exhausted = true;
+                    break;
                 }
             };
             attempts += 1;
-            let key = key_of(&d.ws, &record.picked);
-            if steps.len() < workspace_draw::MAX_RECORDED_DRAWS {
-                steps.push(DrawStep {
-                    draw: ws_draw,
-                    workspace_idx: d.ws.idx,
-                    issue: key.number,
-                });
-            }
-            order.push((d.ws.idx, key.number));
+            let idx = record.picked.workspace_idx;
+            let Some(&ws) = by_idx.get(&idx) else {
+                exhausted = true;
+                break;
+            };
+            let key = key_of(ws, &record.picked);
+            order.push((idx, key.number));
             let picked = record.picked.clone();
-            d.draws.push(record);
+            let terms = record.terms;
+            draws.push(record);
             draws_taken += 1;
             if repo_cap.defer_admission(&key, &mut report) {
-                d.closed = true;
+                draw.close_repo(idx);
                 passes += 1;
                 *pass_counts.entry(PASS_REPO_CAP.to_string()).or_default() += 1;
-                *d.refused.entry(PASS_REPO_CAP.to_string()).or_default() += 1;
+                *refused
+                    .entry(idx)
+                    .or_default()
+                    .entry(PASS_REPO_CAP.to_string())
+                    .or_default() += 1;
                 continue;
             }
             // One Champion merge per repo at a time (design §6): a second
@@ -398,10 +366,14 @@ pub fn run(
                 crate::work_finder::step_item::Step::ChampionMerge
                     | crate::work_finder::step_item::Step::ChampionHoldReevaluate
             );
-            if merge && d.merging {
+            if merge && merging.contains(&idx) {
                 passes += 1;
                 resolve(&mut report.queue, &key, Qd::PeerClaim, Some(PASS_MERGE.to_string()));
-                *d.refused.entry(PASS_MERGE.to_string()).or_default() += 1;
+                *refused
+                    .entry(idx)
+                    .or_default()
+                    .entry(PASS_MERGE.to_string())
+                    .or_default() += 1;
                 *pass_counts.entry(PASS_MERGE.to_string()).or_default() += 1;
                 continue;
             }
@@ -411,10 +383,18 @@ pub fn run(
                 draw_attempt: attempts,
                 age_source: picked.terms.age_source.as_str().to_string(),
                 resumed: false,
+                draw: Some(StepDrawTerms {
+                    weight: terms.weight,
+                    total_weight: terms.total_weight,
+                    repo_items: terms.repo.items,
+                    in_flight_repo: terms.repo.in_flight,
+                }),
             };
-            match spawner.spawn(d.ws.idx, &request) {
+            match spawner.spawn(idx, &request) {
                 SpawnResult::Spawned => {
-                    d.merging |= merge;
+                    if merge {
+                        merging.insert(idx);
+                    }
                     resolve(&mut report.queue, &key, Qd::Dispatched, None);
                     report.dispatched += 1;
                     repo_cap.admit_candidate(&key);
@@ -427,7 +407,11 @@ pub fn run(
                     }
                     resolve(&mut report.queue, &key, disposition, Some(reason.clone()));
                     passes += 1;
-                    *d.refused.entry(reason.clone()).or_default() += 1;
+                    *refused
+                        .entry(idx)
+                        .or_default()
+                        .entry(reason.clone())
+                        .or_default() += 1;
                     *pass_counts.entry(reason).or_default() += 1;
                 }
             }
@@ -458,40 +442,42 @@ pub fn run(
     }
     // The plan order: the draws as taken, then every pooled item not drawn.
     let drawn: BTreeSet<(usize, u32)> = order.iter().copied().collect();
-    for d in &drawing {
-        for c in d.draw.remaining() {
-            if !d.ws.halted && !drawn.contains(&(d.ws.idx, c.target())) {
-                order.push((d.ws.idx, c.target()));
-            }
+    for c in draw.remaining() {
+        if !drawn.contains(&(c.workspace_idx, c.target())) {
+            order.push((c.workspace_idx, c.target()));
         }
     }
     report.plan_order = order;
     repo_cap.finish(&mut report);
-    report.workspace_draw = (draws_total > 0).then_some(DrawLog {
-        seed: workspace_seed,
-        draws_total,
-        steps,
-        seed_inputs,
-    });
-    let views: Vec<ItemDrawWorkspace<'_>> = drawing
+    let views: Vec<ItemDrawWorkspace<'_>> = workspaces
         .iter()
-        .filter(|d| !d.draws.is_empty() || d.overflow)
-        .map(|d| ItemDrawWorkspace {
-            repo: &d.ws.repo,
-            excluded: &d.ws.weighing.excluded,
-            pool: d.draw.starting_pool(),
-            draws: &d.draws,
-            overflow: d.overflow,
+        .map(|w| ItemDrawWorkspace {
+            idx: w.idx,
+            repo: &w.repo,
+            excluded: &w.weighing.excluded,
         })
         .collect();
-    report.item_draw = item_draw_record(seed.minute, &seed.host, seed.tick_counter, &views);
+    report.item_draw = item_draw_record(
+        seed.minute,
+        &seed.host,
+        seed.tick_counter,
+        &views,
+        &ItemDrawPool {
+            draw: &draw,
+            draws: &draws,
+            overflow,
+        },
+    );
     // The draws a gate or the claim refused, beside the weight-0 counts, so
     // a refused draw is visible on the record (the integrated review's M1).
     if let Some(record) = report.item_draw.as_mut() {
-        for d in &drawing {
-            for (reason, &count) in &d.refused {
+        for (idx, reasons) in &refused {
+            let repo = by_idx
+                .get(idx)
+                .map_or("repo_unresolved", |w| w.repo.as_str());
+            for (reason, &count) in reasons {
                 record.excluded.push(PickItemExclusion {
-                    repo: d.ws.repo.clone(),
+                    repo: repo.to_string(),
                     reason: format!("refused_{reason}"),
                     skip_reason: refusal_skip(reason),
                     count,

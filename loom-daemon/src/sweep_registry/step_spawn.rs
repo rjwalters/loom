@@ -61,6 +61,21 @@ pub(crate) use unlocked::blocking;
 
 pub use timeout::step_timeout;
 
+/// The weight terms of the draw that picked a step (#12185), so the
+/// `loom.dispatch.step` span can plot selection probability against item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepDrawTerms {
+    /// The item's integer draw weight.
+    pub weight: u64,
+    /// The pool's total weight at that draw: `weight / total_weight` is the
+    /// item's probability.
+    pub total_weight: u64,
+    /// `n_items`: the item's repo's items in the pool.
+    pub repo_items: usize,
+    /// `in_flight_repo`: the repo's items someone worked on.
+    pub in_flight_repo: usize,
+}
+
 /// One step the engine asks to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepSpawnRequest {
@@ -72,6 +87,8 @@ pub struct StepSpawnRequest {
     pub age_source: String,
     /// Whether the step resumes a paused session.
     pub resumed: bool,
+    /// The draw that picked it; `None` for a step not drawn (a resume).
+    pub draw: Option<StepDrawTerms>,
 }
 
 impl StepSpawnRequest {
@@ -84,6 +101,7 @@ impl StepSpawnRequest {
             draw_attempt: 1,
             age_source: "unknown".to_string(),
             resumed: false,
+            draw: None,
         }
     }
 
@@ -453,6 +471,7 @@ impl SweepRegistry {
                 draw_attempt: request.draw_attempt,
                 age_source: &request.age_source,
                 resumed: request.resumed,
+                draw: request.draw,
                 sweep_id,
             },
         );

@@ -47,7 +47,6 @@ fn key(tick_counter: u64) -> SeedKey {
         minute: 29_340_000,
         host: "host-a".into(),
         tick_counter,
-        workspace: "acme/widgets".into(),
     }
 }
 
@@ -221,9 +220,10 @@ fn the_vi_cap_demotes_across_stages_before_weighting() {
 #[test]
 fn the_seed_is_the_documented_sha256_prefix() {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(b"loom-draw/v2:29340000:host-a:7:acme/widgets:3");
+    let digest = Sha256::digest(b"loom-draw/v3:29340000:host-a:7:3");
     let expected = u64::from_be_bytes(digest[..8].try_into().unwrap());
     assert_eq!(item_seed(&key(7), 3), expected);
+    assert_eq!(ITEM_DRAW_SEED_SCHEME, "loom-draw/v3");
     assert_ne!(item_seed(&key(7), 3), item_seed(&key(8), 3), "tick counter is an input");
     assert_ne!(item_seed(&key(7), 3), item_seed(&key(7), 4), "draw index is an input");
 }
@@ -231,7 +231,8 @@ fn the_seed_is_the_documented_sha256_prefix() {
 /// Stage ages (days) inside and past the 90-day cap, so the age term varies.
 const AGES: [i64; 8] = [0, 3, 12, 30, 55, 80, 89, 120];
 
-fn pool_of(n: u32) -> Vec<Candidate> {
+/// `n` Judge steps of workspace `idx`, priorities and ages varying.
+fn pool_in(idx: usize, n: u32) -> Vec<Candidate> {
     let inputs: Vec<DrawInput> = (1..=n)
         .map(|i| {
             let labels: &[&str] = if i % 3 == 0 { &["loom:important"] } else { &[] };
@@ -244,7 +245,205 @@ fn pool_of(n: u32) -> Vec<Candidate> {
             input
         })
         .collect();
-    weigh(&inputs, &ctx(), &ItemWeights::default()).pool
+    let ctx = WeighContext {
+        workspace_idx: idx,
+        ..ctx()
+    };
+    weigh(&inputs, &ctx, &ItemWeights::default()).pool
+}
+
+fn pool_of(n: u32) -> Vec<Candidate> {
+    pool_in(0, n)
+}
+
+fn repo(weight: u32, in_flight: usize) -> RepoTerms {
+    RepoTerms { weight, in_flight }
+}
+
+fn repos_of(terms: &[(usize, u32, usize)]) -> BTreeMap<usize, RepoTerms> {
+    terms
+        .iter()
+        .map(|&(idx, weight, in_flight)| (idx, repo(weight, in_flight)))
+        .collect()
+}
+
+fn rows_of(pool: &[Candidate]) -> Vec<PoolRow> {
+    pool.iter()
+        .map(|c| PoolRow {
+            repo: c.workspace_idx,
+            item_weight: c.terms.weight,
+        })
+        .collect()
+}
+
+/// The probability each pooled item is drawn first.
+fn probabilities(
+    pool: &[Candidate],
+    repos: &BTreeMap<usize, RepoTerms>,
+    knobs: &PoolKnobs,
+) -> Vec<f64> {
+    let weighed = pool_weights(&rows_of(pool), repos, knobs);
+    let total: u64 = weighed.weights.iter().sum();
+    weighed
+        .weights
+        .iter()
+        .map(|&w| w as f64 / total as f64)
+        .collect()
+}
+
+/// Repos of very different backlogs: A (40 items, w 3), B (2 items, w 1) and
+/// C (7 items, w 2), the items' priorities and ages mixed.
+fn three_repos() -> Vec<Candidate> {
+    let mut pool = pool_in(0, 40);
+    pool.extend(pool_in(1, 2));
+    pool.extend(pool_in(2, 7));
+    pool
+}
+
+fn knobs(backlog_exponent: f64, busy_exponent: f64) -> PoolKnobs {
+    PoolKnobs {
+        backlog_exponent,
+        busy_exponent,
+    }
+}
+
+/// The sum of the item weights of workspace `idx`'s items.
+fn s_r(pool: &[Candidate], idx: usize) -> f64 {
+    pool.iter()
+        .filter(|c| c.workspace_idx == idx)
+        .map(|c| c.terms.weight as f64)
+        .sum()
+}
+
+fn close(a: f64, b: f64) {
+    assert!((a - b).abs() <= 1e-9 * b.max(a).max(1e-12), "{a} != {b}");
+}
+
+/// #12185 acceptance: with α = 0 and β = 0 each item's probability is the
+/// earlier two-stage draw's: its repo's `w_repo / Σw_repo`, then `iw / S_r`.
+#[test]
+fn alpha_zero_beta_zero_is_the_two_stage_draw() {
+    let pool = three_repos();
+    let repos = repos_of(&[(0, 3, 5), (1, 1, 0), (2, 2, 9)]);
+    let p = probabilities(&pool, &repos, &knobs(0.0, 0.0));
+    for (c, p) in pool.iter().zip(&p) {
+        let w = f64::from(repos[&c.workspace_idx].weight);
+        close(*p, w / 6.0 * c.terms.weight as f64 / s_r(&pool, c.workspace_idx));
+    }
+    // A repo's share is its roster share whatever its backlog or in-flight.
+    let share = |idx: usize| -> f64 {
+        pool.iter()
+            .zip(&p)
+            .filter(|(c, _)| c.workspace_idx == idx)
+            .map(|(_, p)| p)
+            .sum()
+    };
+    close(share(0), 0.5);
+    close(share(1), 1.0 / 6.0);
+    close(share(2), 1.0 / 3.0);
+}
+
+/// α = 1 is a flat pool: probability ∝ `w_repo × iw`, so a repo's share
+/// grows with its backlog.
+#[test]
+fn alpha_one_is_a_flat_pool() {
+    let pool = three_repos();
+    let repos = repos_of(&[(0, 3, 0), (1, 1, 0), (2, 2, 0)]);
+    let p = probabilities(&pool, &repos, &knobs(1.0, 0.0));
+    let raw: Vec<f64> = pool
+        .iter()
+        .map(|c| f64::from(repos[&c.workspace_idx].weight) * c.terms.weight as f64)
+        .collect();
+    let total: f64 = raw.iter().sum();
+    for (r, p) in raw.iter().zip(&p) {
+        close(*p, r / total);
+    }
+    // Equal `w_repo` and equal items: probability is the same for every item,
+    // so a repo's share is its item count over the pool's.
+    let flat = [pool_in(0, 1), pool_in(1, 1), pool_in(1, 1), pool_in(1, 1)].concat();
+    let p = probabilities(&flat, &repos_of(&[(0, 1, 0), (1, 1, 0)]), &knobs(1.0, 0.0));
+    close(p[0], p[1] * (flat[0].terms.weight as f64 / flat[1].terms.weight as f64));
+}
+
+#[test]
+fn alpha_half_scales_by_the_square_root_of_the_backlog() {
+    let pool = three_repos();
+    let repos = repos_of(&[(0, 3, 0), (1, 1, 0), (2, 2, 0)]);
+    let p = probabilities(&pool, &repos, &knobs(0.5, 0.0));
+    let raw: Vec<f64> = pool
+        .iter()
+        .map(|c| {
+            f64::from(repos[&c.workspace_idx].weight) * c.terms.weight as f64
+                / s_r(&pool, c.workspace_idx).sqrt()
+        })
+        .collect();
+    let total: f64 = raw.iter().sum();
+    for (r, p) in raw.iter().zip(&p) {
+        close(*p, r / total);
+    }
+}
+
+/// β > 0: a repo's share falls as its in-flight count rises, by
+/// `(1 + in_flight)^(−β)`, and the other repos' shares rise.
+#[test]
+fn busy_repos_are_drawn_less() {
+    let pool = three_repos();
+    let share = |in_flight: usize, busy: f64, idx: usize| -> f64 {
+        let repos = repos_of(&[(0, 3, in_flight), (1, 1, 0), (2, 2, 0)]);
+        let p = probabilities(&pool, &repos, &knobs(0.0, busy));
+        pool.iter()
+            .zip(&p)
+            .filter(|(c, _)| c.workspace_idx == idx)
+            .map(|(_, p)| p)
+            .sum()
+    };
+    close(share(0, 1.0, 0), 0.5);
+    let (a1, a3) = (share(1, 1.0, 0), share(3, 1.0, 0));
+    assert!(a1 < 0.5 && a3 < a1, "{a1} {a3}");
+    // β = 0 ignores the count; β = 2 bites harder than β = 1.
+    close(share(7, 0.0, 0), 0.5);
+    assert!(share(3, 2.0, 0) < a3);
+    // A's raw weight is divided by (1 + f)^β: 3 / 4 against B and C's 1 + 2.
+    close(share(3, 1.0, 0), (3.0 / 4.0) / (3.0 / 4.0 + 1.0 + 2.0));
+    assert!(share(3, 1.0, 1) > 1.0 / 6.0, "the others gain");
+}
+
+#[test]
+fn a_zero_weight_or_unknown_repo_is_never_drawn_and_a_tiny_item_still_can_be() {
+    let pool = three_repos();
+    let repos = repos_of(&[(0, 0, 0), (1, 1, 0)]);
+    let weighed = pool_weights(&rows_of(&pool), &repos, &knobs(0.3, 0.0));
+    for (c, w) in pool.iter().zip(&weighed.weights) {
+        assert_eq!(*w == 0, c.workspace_idx != 1, "only repo 1 is drawable");
+    }
+    // All weights zero: nothing to draw.
+    let none = pool_weights(&rows_of(&pool), &repos_of(&[]), &knobs(0.0, 0.0));
+    assert!(none.weights.iter().all(|&w| w == 0));
+    assert!(ItemDraw::new(pool.clone(), repos_of(&[(0, 0, 0)]), knobs(0.0, 0.0), key(1))
+        .next()
+        .is_none());
+    // Rounding to integers never turns a positive weight into 0.
+    let rows = [
+        PoolRow {
+            repo: 0,
+            item_weight: 1,
+        },
+        PoolRow {
+            repo: 1,
+            item_weight: 1_000_000_000_000_000,
+        },
+    ];
+    let w = pool_weights(&rows, &repos_of(&[(0, 1, 0), (1, 1, 0)]), &knobs(1.0, 0.0));
+    assert!(w.weights[0] >= 1, "{:?}", w.weights);
+}
+
+#[test]
+fn the_exponents_come_from_the_layer_in_range_only() {
+    let layer = serde_json::json!({"dispatch": {"backlogExponent": 0.4, "busyExponent": 2}});
+    assert_eq!(PoolKnobs::from_layer(&layer), knobs(0.4, 2.0));
+    let layer = serde_json::json!({"dispatch": {"backlogExponent": 1.5, "busyExponent": -1}});
+    assert_eq!(PoolKnobs::from_layer(&layer), PoolKnobs::default());
+    assert_eq!(PoolKnobs::from_layer(&Value::Null), knobs(0.0, 0.0));
 }
 
 #[test]
@@ -256,96 +455,124 @@ fn the_pool_spans_the_age_term() {
     );
 }
 
-#[test]
-fn replay_from_the_pick_decision_record_gives_the_same_picks() {
-    use crate::observability::pick_decision::{item_draw_record, ItemDrawWorkspace};
-    use crate::telemetry::kinds::pick_decision::PickItemDraw;
-    let k = key(42);
-    let mut draw = ItemDraw::new(pool_of(40), k.clone());
-    let start = draw.starting_pool().to_vec();
-    let draws: Vec<DrawRecord> = draw.by_ref().take(25).collect();
-    assert_eq!(draws.len(), 25);
+fn draw_over(pool: Vec<Candidate>, k: SeedKey) -> ItemDraw {
+    ItemDraw::new(pool, repos_of(&[(0, 3, 4), (1, 1, 0), (2, 2, 1)]), knobs(0.6, 0.5), k)
+}
+
+/// The record a tick would log, through the wire.
+fn wire_record(
+    draw: &ItemDraw,
+    draws: &[DrawRecord],
+    k: &SeedKey,
+) -> crate::telemetry::kinds::pick_decision::PickItemDraw {
+    use crate::observability::pick_decision::{item_draw_record, ItemDrawPool, ItemDrawWorkspace};
     let excluded = BTreeMap::new();
+    let names = ["acme/widgets", "acme/gadgets", "acme/gizmos"];
+    let workspaces: Vec<ItemDrawWorkspace<'_>> = names
+        .iter()
+        .enumerate()
+        .map(|(idx, repo)| ItemDrawWorkspace {
+            idx,
+            repo,
+            excluded: &excluded,
+        })
+        .collect();
     let record = item_draw_record(
         k.minute,
         &k.host,
         k.tick_counter,
-        &[ItemDrawWorkspace {
-            repo: &k.workspace,
-            excluded: &excluded,
-            pool: &start,
-            draws: &draws,
+        &workspaces,
+        &ItemDrawPool {
+            draw,
+            draws,
             overflow: false,
-        }],
+        },
     )
     .unwrap();
-    // Through the wire: only what the record carries.
-    let parsed: PickItemDraw =
-        serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+    serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap()
+}
+
+#[test]
+fn replay_from_the_pick_decision_record_gives_the_same_picks() {
+    let k = key(42);
+    let mut draw = draw_over(three_repos(), k.clone());
+    let draws: Vec<DrawRecord> = draw.by_ref().take(25).collect();
+    assert_eq!(draws.len(), 25);
+    let parsed = wire_record(&draw, &draws, &k);
+    assert_eq!(parsed.seed_scheme, "loom-draw/v3");
+    assert_eq!(
+        (parsed.backlog_exponent.as_str(), parsed.busy_exponent.as_str()),
+        ("0.6", "0.5")
+    );
+    let repo_a = &parsed.repos[0];
+    assert_eq!(
+        (repo_a.repo.as_str(), repo_a.weight, repo_a.in_flight, repo_a.items),
+        ("acme/widgets", 3, 4, 40)
+    );
+    // The draws carry the repo terms of the drawn item.
+    let first = &parsed.draws[0];
+    assert_eq!(first.draw_weight, draws[0].terms.weight);
+    assert_eq!(first.repo_items, draws[0].terms.repo.items);
+    assert_eq!(first.in_flight_repo, draws[0].terms.repo.in_flight);
+    assert!(first.draw_weight <= first.total_weight);
+
     let replayed = replay_record(&parsed).unwrap();
-    let expected: Vec<(Option<u32>, Option<u32>)> = draws
+    let expected: Vec<(usize, Option<u32>, Option<u32>)> = draws
         .iter()
-        .map(|d| (d.picked.item.issue, d.picked.item.pr))
+        .map(|d| (d.picked.workspace_idx, d.picked.item.issue, d.picked.item.pr))
         .collect();
-    let got: Vec<(Option<u32>, Option<u32>)> = replayed.iter().map(|p| (p.issue, p.pr)).collect();
+    let names = ["acme/widgets", "acme/gadgets", "acme/gizmos"];
+    let got: Vec<(usize, Option<u32>, Option<u32>)> = replayed
+        .iter()
+        .map(|p| (names.iter().position(|n| *n == p.repo).unwrap(), p.issue, p.pr))
+        .collect();
     assert_eq!(got, expected);
     // Same inputs, same sequence; another tick counter, another one.
-    let again: Vec<DrawRecord> = ItemDraw::new(pool_of(40), k.clone()).take(25).collect();
+    let again: Vec<DrawRecord> = draw_over(three_repos(), k.clone()).take(25).collect();
     assert_eq!(again, draws);
-    let other: Vec<DrawRecord> = ItemDraw::new(pool_of(40), key(43)).take(25).collect();
+    let other: Vec<DrawRecord> = draw_over(three_repos(), key(43)).take(25).collect();
     assert_ne!(other, draws);
     // A tampered record does not replay.
     let mut bad = parsed.clone();
     bad.draws[3].picked_index += 1;
     assert!(replay_record(&bad).is_err());
-    let mut bad = parsed;
+    let mut bad = parsed.clone();
     bad.pools[0].weight += 1;
     assert!(replay_record(&bad).is_err());
+    let mut bad = parsed.clone();
+    bad.repos[0].in_flight += 1;
+    assert!(replay_record(&bad).is_err(), "the in-flight count is an input");
+    let mut bad = parsed;
+    bad.busy_exponent = "0.6".into();
+    assert!(replay_record(&bad).is_err(), "so is the busy-ness exponent");
 }
 
-/// Two workspaces' draws, interleaved as a tick takes them, through a record
-/// split into chunks and reassembled: the replay reads only the wire (#11909).
+/// A repo the per-repo cap closes mid-tick leaves the pool for the draws
+/// after it, and the record says when, so the sequence still replays; the
+/// record goes through chunks and is reassembled from the wire (#11909).
 #[test]
-fn a_chunked_two_workspace_record_replays() {
-    use crate::observability::pick_decision::{item_draw_record, ItemDrawWorkspace};
+fn a_chunked_record_with_a_closed_repo_replays() {
     use crate::telemetry::kinds::pick_decision::{
         split_into_chunks, PickDecisionRecord, PickItemDraw, PickTick,
     };
-    let ka = key(9);
-    let kb = SeedKey {
-        workspace: "acme/gadgets".into(),
-        ..key(9)
-    };
-    let mut a = ItemDraw::new(pool_of(30), ka.clone());
-    let mut b = ItemDraw::new(pool_of(20), kb.clone());
-    let (start_a, start_b) = (a.starting_pool().to_vec(), b.starting_pool().to_vec());
-    let mut draws_a = Vec::new();
-    let mut draws_b = Vec::new();
-    for i in 0..18 {
-        if i % 3 == 0 {
-            draws_b.push(b.try_next().unwrap().unwrap());
-        } else {
-            draws_a.push(a.try_next().unwrap().unwrap());
+    let k = key(9);
+    let mut draw = draw_over(three_repos(), k.clone());
+    let mut draws = Vec::new();
+    for i in 0..14 {
+        if i == 6 {
+            draw.close_repo(0);
         }
+        draws.push(draw.try_next().unwrap().unwrap());
     }
-    let excluded = BTreeMap::new();
-    let ws = |repo, pool, draws| ItemDrawWorkspace {
-        repo,
-        excluded: &excluded,
-        pool,
-        draws,
-        overflow: false,
-    };
-    let record = item_draw_record(
-        ka.minute,
-        &ka.host,
-        ka.tick_counter,
-        &[
-            ws(&ka.workspace, &start_a, &draws_a),
-            ws(&kb.workspace, &start_b, &draws_b),
-        ],
-    )
-    .unwrap();
+    assert!(draws[6..].iter().all(|d| d.picked.workspace_idx != 0));
+    assert_eq!(draw.closures(), &[(0, 6)]);
+    let record = wire_record(&draw, &draws, &k);
+    assert_eq!(record.closures.len(), 1);
+    assert_eq!(
+        (record.closures[0].repo.as_str(), record.closures[0].after_draw),
+        ("acme/widgets", 6)
+    );
+
     let tick = PickTick {
         role: "work_finder".into(),
         host: "host-a".into(),
@@ -355,9 +582,8 @@ fn a_chunked_two_workspace_record_replays() {
         outcome: "dispatched".into(),
     };
     let whole = PickDecisionRecord::build(tick, Vec::new()).with_item_draw(Some(record));
-    let chunks = split_into_chunks(whole, 2_000);
+    let chunks = split_into_chunks(whole, 4_000);
     assert!(chunks.len() > 2, "{} chunks", chunks.len());
-    // Reassemble from the wire: the header from chunk 0, the lists in order.
     let mut parsed: Vec<PickItemDraw> = chunks
         .iter()
         .map(|c| {
@@ -368,47 +594,38 @@ fn a_chunked_two_workspace_record_replays() {
                 .unwrap()
         })
         .collect();
+    // The header is on every chunk, so it is read from one.
+    assert!(parsed
+        .iter()
+        .all(|c| c.repos.len() == 3 && c.closures.len() == 1));
     let mut joined = parsed.remove(0);
     for chunk in parsed {
         joined.pools.extend(chunk.pools);
         joined.draws.extend(chunk.draws);
     }
     let replayed = replay_record(&joined).unwrap();
-    let expect = |draws: &[DrawRecord]| -> Vec<Option<u32>> {
-        draws.iter().map(|d| d.picked.item.issue).collect()
-    };
-    let got = |repo: &str| -> Vec<Option<u32>> {
-        replayed
-            .iter()
-            .filter(|p| p.repo == repo)
-            .map(|p| p.issue)
-            .collect()
-    };
-    assert_eq!(got("acme/widgets"), expect(&draws_a));
-    assert_eq!(got("acme/gadgets"), expect(&draws_b));
+    let expected: Vec<Option<u32>> = draws.iter().map(|d| d.picked.item.issue).collect();
+    assert_eq!(replayed.iter().map(|p| p.issue).collect::<Vec<_>>(), expected);
 
-    // A dropped draw breaks the consecutive indices; a wrong pool size and a
-    // gap in the logged pool are caught too.
+    // A dropped draw breaks the consecutive indices; a wrong pool size, a
+    // forgotten closure and a gap in the logged pool are caught too.
     let mut gap = joined.clone();
-    let first_b = gap
-        .draws
-        .iter()
-        .position(|d| d.repo == "acme/gadgets")
-        .unwrap();
-    gap.draws.remove(first_b);
+    gap.draws.remove(0);
     assert!(replay_record(&gap).unwrap_err().contains("skips draw 0"));
     let mut size = joined.clone();
     size.draws[1].pool_size += 1;
     assert!(replay_record(&size).unwrap_err().contains("pool_size"));
+    let mut open = joined.clone();
+    open.closures.clear();
+    assert!(replay_record(&open).is_err());
     let mut hole = joined;
-    hole.pools
-        .retain(|p| !(p.repo == "acme/widgets" && p.index == 4));
+    hole.pools.retain(|p| p.index != 4);
     assert!(replay_record(&hole).unwrap_err().contains("not indexed"));
 }
 
 #[test]
 fn every_item_is_drawn_once() {
-    let mut numbers: Vec<u32> = ItemDraw::new(pool_of(12), key(7))
+    let mut numbers: Vec<u32> = draw_over(pool_of(12), key(7))
         .map(|d| d.picked.item.issue.unwrap())
         .collect();
     numbers.sort_unstable();
@@ -417,7 +634,9 @@ fn every_item_is_drawn_once() {
 
 #[test]
 fn an_empty_pool_draws_nothing() {
-    assert!(ItemDraw::new(Vec::new(), key(1)).next().is_none());
+    assert!(ItemDraw::new(Vec::new(), BTreeMap::new(), PoolKnobs::default(), key(1))
+        .next()
+        .is_none());
 }
 
 #[test]
@@ -435,25 +654,27 @@ fn the_roll_is_in_range_and_the_total_never_saturates() {
     assert_eq!(pick_by_roll([2, 3], 5), None);
 }
 
+/// The seeded draw's first-pick frequencies match the computed probabilities.
 #[test]
 fn first_draw_frequencies_match_the_weights() {
-    let pool = pool_of(8);
-    let total: u64 = pool.iter().map(|c| c.terms.weight).sum();
-    let trials = 40_000u64;
+    let pool = three_repos();
+    let repos = repos_of(&[(0, 3, 2), (1, 1, 0), (2, 2, 0)]);
+    let k = knobs(0.5, 1.0);
+    let expected = probabilities(&pool, &repos, &k);
+    let trials = 60_000u64;
     let mut hits = vec![0u64; pool.len()];
     for tick in 0..trials {
-        let (i, _, _) = pick_index(&pool, item_seed(&key(tick), 0))
-            .unwrap()
-            .unwrap();
-        hits[i] += 1;
+        let mut draw = ItemDraw::new(pool.clone(), repos.clone(), k, key(tick));
+        let first = draw.try_next().unwrap().unwrap();
+        hits[first.picked_index] += 1;
     }
-    for (c, h) in pool.iter().zip(&hits) {
-        #[allow(clippy::cast_precision_loss)]
-        let (expected, seen) = (c.terms.weight as f64 / total as f64, *h as f64 / trials as f64);
+    for ((c, h), expected) in pool.iter().zip(&hits).zip(&expected) {
+        let seen = *h as f64 / trials as f64;
         assert!(
             (expected - seen).abs() < 0.01,
-            "item {}: expected {expected:.4}, saw {seen:.4}",
-            c.item.issue.unwrap()
+            "item {} of repo {}: expected {expected:.4}, saw {seen:.4}",
+            c.item.issue.unwrap(),
+            c.workspace_idx
         );
     }
 }
