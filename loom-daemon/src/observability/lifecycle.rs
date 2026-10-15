@@ -1161,6 +1161,20 @@ pub fn role_invocation(
     role: &str,
     invoke: impl FnOnce() -> crate::role_runner::RoleTickOutcome,
 ) -> (crate::role_runner::RoleTickOutcome, Option<RoleTrace>) {
+    let (outcome, trace, _) = role_invocation_classified(root, role, invoke);
+    (outcome, trace)
+}
+
+/// [`role_invocation`], also returning why a tick that failed **before** its
+/// launch failed (#12028). That tick journals no span, so the class its site
+/// noted would otherwise be dropped; it rides back here for the
+/// `role_tick.outcome` record. `None` for a launched tick (its class is on
+/// [`RoleTrace::failure`]) and for any outcome that is not a failure.
+pub fn role_invocation_classified(
+    root: &Path,
+    role: &str,
+    invoke: impl FnOnce() -> crate::role_runner::RoleTickOutcome,
+) -> (crate::role_runner::RoleTickOutcome, Option<RoleTrace>, Option<RoleFailure>) {
     let started_at = Utc::now();
     let execution = role_execution_id(role, started_at);
     role_failure::clear();
@@ -1180,7 +1194,8 @@ pub fn role_invocation(
     let resumed_from = roll_interruption::take_resumed_from();
     let pr = role_target::take().or_else(|| role_target::take_handoff(root, &execution));
     let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
-        return (outcome, None);
+        let unlaunched = role_failure::for_unlaunched(&outcome, noted);
+        return (outcome, None, unlaunched);
     };
     let roll = roll_interruption::stopped(&span);
     let failure = role_failure::for_outcome(&outcome, noted).filter(|_| roll.is_none());
@@ -1215,7 +1230,7 @@ pub fn role_invocation(
         roll_interruption::RESULT.to_owned()
     });
     finish_execution(root, &execution, &result, close);
-    (outcome, trace)
+    (outcome, trace, None)
 }
 
 pub mod role_draw;
@@ -1223,8 +1238,8 @@ mod role_failure;
 pub mod role_target;
 pub mod roll_interruption;
 pub use role_failure::{
-    note_role_failure, RoleFailure, EXIT_CODE, FAILURE_CLASS, ROLE_FAILURE_ATTRIBUTE_KEYS,
-    UNCLASSIFIED,
+    note_role_failure, pre_launch, RoleFailure, EXIT_CODE, FAILURE_CLASS,
+    ROLE_FAILURE_ATTRIBUTE_KEYS, UNCLASSIFIED, UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP,
 };
 
 #[cfg(test)]

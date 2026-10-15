@@ -154,3 +154,9 @@ docs/stale-check-inputs.md
 scripts/tests/test-merge-pr-ci-result.sh
 scripts/tests/test-merge-pr-stale-check-redate.sh
 scripts/tests/test-merge-pr-stale-required-checks.sh
+
+# #12106 (2026-10-15) — CI simplification: the Dependabot manifest-label check
+# and the pipefail ratchet's suite leave the PR path with their checkers.
+scripts/check-dependabot-labels.sh
+scripts/tests/test-check-dependabot-labels.sh
+scripts/tests/test-check-pipefail-early-exit.sh

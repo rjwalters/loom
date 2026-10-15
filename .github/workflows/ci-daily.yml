@@ -326,10 +326,9 @@ jobs:
       - name: cargo-deny -- sources
         if: ${{ !cancelled() }}
         run: cargo deny check sources
-      # security.yml already runs cargo-audit, but only on a Cargo.lock PR, a
-      # push to main, and weekly. A new advisory published on a Monday against
-      # an unchanged lockfile is invisible for up to six days. Daily closes
-      # that window; the duplication is intentional and cheap.
+      # The one cargo-audit run (#12106): it no longer runs on push or PR. A
+      # new advisory lands against an unchanged lockfile, so a daily scan of
+      # main catches it at the same latency whatever the PR traffic.
       - name: cargo-audit
         if: ${{ !cancelled() }}
         run: cargo audit --deny warnings
