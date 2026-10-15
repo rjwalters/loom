@@ -2400,6 +2400,9 @@ jobs:
       - name: spawn-codex sealed-registration trust waiver (#10102)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-codex-sealed.sh
+      - name: spawn-codex model@effort split (#8387)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-spawn-codex-model-effort.sh
       - name: spawn-* session identity is not inherited by the agent (#10830)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-session-env.sh
