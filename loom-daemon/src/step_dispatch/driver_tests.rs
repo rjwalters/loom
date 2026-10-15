@@ -96,3 +96,48 @@ fn listing_failures_and_held_builders_name_their_error_kind() {
     note_listing(&mut limited, 0, Some(&wall), None, 0);
     assert_eq!(limited.error_kind(), Some("rate_limited"));
 }
+
+/// A red repo held for its fixes keeps every step that adds no code to `main`
+/// for a non-fix item, and drops Builder and `ChampionMerge` unless the item
+/// is a red-main fix (#12046).
+#[test]
+fn a_fixes_only_listing_keeps_the_steps_that_add_no_code() {
+    let held = ListingState {
+        fixes_only: true,
+        ..fresh()
+    };
+    let steps = |w: &crate::step_dispatch::item_draw::Weighing| -> Vec<Step> {
+        w.pool.iter().map(|c| c.step).collect()
+    };
+
+    let mut open = workspace(0, "acme/one", &forge()).weighing;
+    let before = steps(&open);
+    for step in [
+        Step::Builder,
+        Step::ChampionMerge,
+        Step::Judge,
+        Step::Doctor,
+    ] {
+        assert!(before.contains(&step), "fixture lacks {step:?}");
+    }
+    let _ = shape_pool(&mut open, &DrawClaims::default(), fresh());
+    assert_eq!(steps(&open), before, "fixes_only: false is unchanged");
+
+    let mut w = workspace(0, "acme/one", &forge()).weighing;
+    let _ = shape_pool(&mut w, &DrawClaims::default(), held);
+    let kept = steps(&w);
+    assert!(!kept.contains(&Step::Builder) && !kept.contains(&Step::ChampionMerge));
+    let expected: Vec<Step> = before
+        .iter()
+        .copied()
+        .filter(|s| !matches!(s, Step::Builder | Step::ChampionMerge))
+        .collect();
+    assert_eq!(kept, expected, "every other step stays");
+
+    let mut fix = workspace(0, "acme/one", &forge()).weighing;
+    for c in &mut fix.pool {
+        c.item.lane = Lane::RedMain;
+    }
+    let _ = shape_pool(&mut fix, &DrawClaims::default(), held);
+    assert_eq!(steps(&fix), before, "red-main fixes keep every step");
+}

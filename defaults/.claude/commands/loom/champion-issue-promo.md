@@ -808,7 +808,7 @@ POST_CLAIM=$(gh issue view "$ISSUE_NUMBER" --json state,labels \
   --jq '[.state, ([.labels[].name] | join(","))] | @tsv')
 if ! printf '%s\n' "$POST_CLAIM" | awk -F'\t' '
      $1 != "OPEN" { exit 1 }
-     $2 ~ /(^|,)loom:(issue|building|operator)(,|$)/ { exit 1 }
+     $2 ~ /(^|,)loom:(issue|building|operator|blocked|frozen)(,|$)/ { exit 1 }
      $2 !~ /(^|,)loom:(curated|architect|hermit|auditor)(,|$)/ { exit 1 }'; then
   gh issue edit "$ISSUE_NUMBER" --remove-label "loom:evaluating"
   echo "#$ISSUE_NUMBER was decided since discovery ($POST_CLAIM) — claim released, skipping"
@@ -836,7 +836,7 @@ RECHECK_LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels --jq '[.labels[].na
 
 If `loom:evaluating` is no longer present (reclaimed as stale by a concurrent Champion pass while you were evaluating), **abort**: do not comment, do not write any label. A later pass will pick this issue up cleanly.
 
-Abort the same way if `RECHECK_LABELS` already carries `loom:issue`, `loom:building` or `loom:operator`: another pass wrote a verdict while you evaluated (#11989), and a second one would only duplicate or contradict it. Release your claim first (`gh issue edit "$ISSUE_NUMBER" --remove-label "loom:evaluating"`), then move on.
+Abort the same way if `RECHECK_LABELS` already carries `loom:issue`, `loom:building`, `loom:operator`, `loom:blocked` or `loom:frozen`: another pass wrote a verdict (or a human placed a hold) while you evaluated (#11989), and a second verdict would only duplicate or contradict it, or override the hold. Release your claim first (`gh issue edit "$ISSUE_NUMBER" --remove-label "loom:evaluating"`), then move on.
 
 ---
 
@@ -1132,7 +1132,7 @@ Continue evaluating issues until all have been processed or all applicable level
 ### When NOT to Promote
 
 Regardless of quality, do NOT promote an issue if any of the following holds. The holds are already terminal; the rest get a Step 4 verdict, never a skip (#11860):
-- Issue has `loom:blocked` label. A block is re-evaluated once its blocker closes and it is lifted: by a targeted step that finds every park-record blocker closed (`champion-targeted.md`), or by a human (nothing lifts it automatically since #11301). Departs from `champion.md` Priority 2's "outside Champion's promotion authority" (#11860)
+- Issue has `loom:blocked` label. A block is re-evaluated once its blocker closes and it is lifted: by a targeted step that finds every park-record blocker closed (`champion-targeted.md`; the work finder draws a curated, dependency-parked issue for that step each time it comes up, #12078), or by a human (nothing lifts it automatically since #11301). Departs from `champion.md` Priority 2's "outside Champion's promotion authority" (#11860)
 - Issue has `loom:operator` label (a human must act or decide — credentials, infra rotations, manual deploys, hardware access, a ruling; sweep will skip these in pre-flight, so promoting to `loom:issue` would only stall the queue). This is also the terminal state the N=2 escalation in Step 4 routes to, so an escalated proposal is automatically excluded from every future pass. No exception (#11861): only a human removes it; while it is present, nothing here acts on it.
 - Issue title contains "DISCUSSION" or "RFC" (requires human input: escalate)
 - Issue mentions breaking changes without migration plan (revise)

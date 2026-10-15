@@ -398,6 +398,8 @@ impl WorkspacePool {
         // from and independent of the insta-crash quarantine and dispatch
         // backoff above.
         registry.set_noop_cooldown_config(sweep_registry::resolve_noop_cooldown_config(root));
+        // #11481: re-arm windows a restart would otherwise drop.
+        registry.replay_noop_cooldown_from_journal(chrono::Utc::now());
         // Hard-exclusion decline cooldown (#7528): resolve env > config >
         // default for this workspace, so a sweep that declines because the
         // issue carries a `crate::hard_exclusion` label (`external` today) is
