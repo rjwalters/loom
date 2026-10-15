@@ -1314,7 +1314,9 @@ pub fn build_daemon_status_for(
         let role_runner_env_override =
             matches!(role_runner_enabled_source, crate::role_runner::EnabledSource::Env)
                 .then_some(role_runner_enabled);
-        let resolved_role_specs = crate::role_runner::resolve_roles(&role_runner_config);
+        // Step roles run as work-finder steps, not interval loops (#11909).
+        let resolved_role_specs =
+            crate::role_runner::champion_mode::resolve_interval_roles(&role_runner_config);
         let role_runner_roles = resolved_role_specs
             .iter()
             .map(|spec| spec.name.to_string())
