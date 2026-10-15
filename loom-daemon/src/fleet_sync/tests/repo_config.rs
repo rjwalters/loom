@@ -261,13 +261,7 @@ fn a_removal_is_journaled() {
     );
     pass(&snapshot(root.path(), None), Path::new("/x"), &is_cloned, Mode::Write, now());
 
-    let stream = crate::journal::Journal::open(dir.path().join("journal"))
-        .stream(crate::config_journal::STREAM)
-        .unwrap();
-    let events: Vec<_> = stream
-        .reader(crate::journal::Position::START)
-        .map(|r| r.unwrap().envelope.data)
-        .collect();
+    let events = crate::config_journal::read_event_data(&dir.path().join("journal"));
     for k in [
         crate::config_journal::ENABLE_ENV,
         crate::config_journal::ROOT_ENV,

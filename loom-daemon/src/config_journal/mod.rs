@@ -45,6 +45,18 @@ use crate::journal::{AppendOutcome, Journal, JournalError, Position, Stream};
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;
 
+/// Test seam: the `data` of every record in the config stream under `root`,
+/// so tests outside this module need not name `crate::journal` (Phase 2a
+/// tree invariant, `tests/journal_no_wiring.rs`).
+#[cfg(test)]
+pub(crate) fn read_event_data(root: &Path) -> Vec<Value> {
+    let stream = Journal::open(root).stream(STREAM).unwrap();
+    stream
+        .reader(Position::START)
+        .map(|r| r.unwrap().envelope.data)
+        .collect()
+}
+
 /// Env switch for the shadow journal. Unset or falsy: everything is a no-op.
 pub const ENABLE_ENV: &str = "LOOM_CONFIG_JOURNAL";
 /// Env override of the journal root (shared with `journal verify`).
