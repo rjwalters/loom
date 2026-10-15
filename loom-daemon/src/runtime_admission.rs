@@ -257,6 +257,12 @@ struct RuntimeManifest {
     capabilities: BTreeMap<String, serde_json::Value>,
 }
 
+/// The per-role runtime pin variable for a canonical role, e.g.
+/// `sweep-lifecycle` -> `LOOM_RUNTIME_SWEEP_LIFECYCLE`.
+fn role_env_var(canonical: &str) -> String {
+    format!("LOOM_RUNTIME_{}", canonical.replace('-', "_").to_ascii_uppercase())
+}
+
 fn nonempty(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -359,6 +365,8 @@ pub fn suggested_worker_type_mismatch_warning(admission: &ResolvedRuntime) -> Op
     ))
 }
 
+/// Every `Some` output must also appear in `KNOWN_ROLE_KEYS`, which drives
+/// the `.cargo/config.toml` `LOOM_RUNTIME_<ROLE>` hermeticity list (#9851).
 pub fn canonical_role(role: &str) -> Option<&'static str> {
     match role.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "curator" | "issue-curator" => Some("curator"),
@@ -474,6 +482,10 @@ fn config_runtime(root: &Path, role: &str) -> Result<(Option<String>, Option<Str
 /// diagnostic above. Aliases (`issue-curator`, `pr-fixer`, `sweep`, …) are also
 /// accepted by [`canonical_role`]; only the canonical spellings are listed so
 /// the message stays short and points at the documented shape.
+///
+/// Also the role list `.cargo/config.toml` `[env]` forces empty as
+/// `LOOM_RUNTIME_<ROLE>` (#9851); `tests::cargo_env_clears_every_role_runtime_pin`
+/// fails if a role here (or a new [`canonical_role`] output) is missing there.
 const KNOWN_ROLE_KEYS: &[&str] = &[
     "architect",
     "auditor",
@@ -589,8 +601,7 @@ pub fn resolve_binding(
             unmet_capabilities: vec![],
             reason,
         })?;
-    let env_name = format!("LOOM_RUNTIME_{}", canonical.replace('-', "_").to_ascii_uppercase());
-    let role_env = std::env::var(env_name).ok();
+    let role_env = std::env::var(role_env_var(canonical)).ok();
     let global_env = std::env::var("LOOM_RUNTIME").ok();
     Ok(choose_runtime(
         explicit,
