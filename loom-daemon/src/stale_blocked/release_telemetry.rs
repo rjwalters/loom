@@ -39,11 +39,11 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use super::release::{Report, Skip};
-use super::release_items::{Item, ItemVerdict};
+use super::release_items::{Item, ItemVerdict, UnevaluatedReason};
 use crate::gh_invocation::caller_scope::{self, Scope};
 use crate::telemetry::kinds::pass::{
-    BlockerState, GithubSpend, PassMode, PassOutcome, PassSummaryRecord, PassVerdictRecord,
-    REPO_UNRESOLVED,
+    BlockerState, GithubSpend, PassBudget, PassBudgetReading, PassMode, PassOutcome,
+    PassSummaryRecord, PassVerdictRecord, REPO_UNRESOLVED,
 };
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
@@ -172,6 +172,8 @@ impl Observer {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v as u64))
                 .collect(),
+            unevaluated_reasons: reason_counts(report),
+            budget: pass_budget(report),
             write_cap_hit: report.skipped.contains_key(&Skip::WriteCap.key()),
             github: GithubSpend {
                 calls: spent.calls,
@@ -212,6 +214,40 @@ fn verdict_counts(report: &Report) -> BTreeMap<String, u64> {
     counts
 }
 
+/// Unevaluated artifacts per reason, every reason present.
+fn reason_counts(report: &Report) -> BTreeMap<String, u64> {
+    UnevaluatedReason::ALL
+        .iter()
+        .map(|r| {
+            let n = report
+                .unevaluated_reasons
+                .get(r.as_str())
+                .copied()
+                .unwrap_or(0);
+            (r.as_str().to_string(), n as u64)
+        })
+        .collect()
+}
+
+/// The readings the pass took, from values it already holds. `None` when it
+/// took none (nothing to read, or the pass never reached a budget).
+fn pass_budget(report: &Report) -> Option<PassBudget> {
+    let cost = &report.cost;
+    let start = cost.budget_at_start.or(cost.budget_before);
+    let (core_end, graphql_end) = (cost.meter.core_remaining, cost.meter.graphql_remaining);
+    if start.is_none() && core_end.is_none() && graphql_end.is_none() {
+        return None;
+    }
+    Some(PassBudget {
+        core_start: start.map(|b| b.core_remaining),
+        core_end,
+        graphql_start: start.map(|b| b.graphql_remaining),
+        graphql_end,
+        core_floor: cost.floor.core,
+        graphql_floor: cost.floor.graphql,
+    })
+}
+
 fn verdict_record(
     item: &Item,
     pass_id: &str,
@@ -230,6 +266,12 @@ fn verdict_record(
         verdict: item.verdict.as_str().to_string(),
         reason: item.reason.clone(),
         detail: item.detail.clone(),
+        unevaluated_reason: item.unevaluated_reason.map(|r| r.as_str().to_string()),
+        budget: item.budget.map(|b| PassBudgetReading {
+            bucket: b.bucket.as_str().to_string(),
+            remaining: b.remaining,
+            floor: b.floor,
+        }),
         blockers: item
             .blockers
             .iter()
@@ -243,6 +285,7 @@ fn verdict_record(
         mode,
         applied: item.applied,
         at,
+        step: Default::default(),
     }
 }
 
@@ -254,9 +297,12 @@ fn fingerprint(item: &Item, mode: PassMode) -> String {
         .map(|b| format!("{}={}", b.reference, b.state))
         .collect();
     format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         item.verdict.as_str(),
         item.reason.as_deref().unwrap_or_default(),
+        // The enum only: the readings change every pass and must not
+        // re-emit an unchanged verdict.
+        item.unevaluated_reason.map_or("", |r| r.as_str()),
         blockers.join(","),
         mode.as_str()
     )

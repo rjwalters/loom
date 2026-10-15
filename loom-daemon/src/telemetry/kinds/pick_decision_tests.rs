@@ -460,6 +460,7 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
             }],
             pools: Vec::new(),
             draws,
+            weight_overflow: vec!["o/big".to_string()],
         },
     ));
     let json = serde_json::to_value(&record).unwrap();
@@ -507,6 +508,7 @@ fn a_large_item_pool_splits_into_bounded_chunks_and_reassembles() {
             excluded: Vec::new(),
             pools: pool,
             draws: Vec::new(),
+            weight_overflow: Vec::new(),
         },
     ));
     let budget = 8_000;

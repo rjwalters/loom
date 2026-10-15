@@ -91,6 +91,7 @@ mod tests {
                 triage_flow: None,
                 curator: None,
                 pending_queue: None,
+                operator_recency: None,
                 ready_complete: false,
                 ready_replace: true,
                 census: Some(FleetPrCensus {

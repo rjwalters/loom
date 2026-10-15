@@ -8,12 +8,16 @@ use serde_json::{json, Value};
 use crate::comment_trust::TrustPolicy;
 use crate::provenance::origin::WorkOrigin;
 
+mod ci_gate;
+#[cfg(test)]
+mod ci_gate_tests;
 mod listing;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod workflow_shaped_tests;
-pub use listing::{fetch_queue, has_judge_fallback, has_judge_work};
+pub use ci_gate::{cached_answer as ci_pending_cached, ci_pending};
+pub use listing::{ci_pending_at_sha, fetch_queue, has_judge_fallback, has_judge_work};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PrRole {

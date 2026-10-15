@@ -199,6 +199,11 @@ pub fn tick_span(
         let causes: Vec<&str> = report.halt_causes.iter().map(|c| c.as_str()).collect();
         attributes.insert("loom.dispatch.halt_causes".to_string(), causes.join(","));
     }
+    if let Some(kind) = report.error_kind() {
+        // #11973: why `loom.dispatch.errors` is non-zero, from a fixed set
+        // (`work_finder::tick_report::error_kind`); absent on a clean tick.
+        attributes.insert("loom.dispatch.error_kind".to_string(), kind.to_string());
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context: TraceContext::derived(

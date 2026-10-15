@@ -37,7 +37,10 @@
 //! The same tick also gives the ETA facts (#11564): each `ready_wait` row's
 //! `eligible_reason` / `eligible_at` (the clock holding it back and its end)
 //! and each held repo's `halt` (`work_finder::halt_cause::since`). Neither is
-//! capped.
+//! capped. Each ready row also carries the dispatch facts (#11960):
+//! `dispatch_blocked_reason` (why the last pick skipped it, in the
+//! `pick.decision` `skip_reason` vocabulary) and `dispatch_blocked_since` (the
+//! first tick it was skipped for that reason, kept while the reason holds).
 //!
 //! The same two consecutive views also give the outcome facts
 //! `eta.stage_outcome` and `pr.resolved` ([`outcomes`], #11126).
@@ -68,11 +71,13 @@ use crate::telemetry::kinds::fleet_state::{
     FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason,
     PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
+use crate::telemetry::kinds::pick_decision::PickSkipReason;
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
 pub mod enrich;
 mod flow;
 pub mod history;
+mod operator_recency;
 pub mod outcomes;
 mod pending_queue;
 mod pre_ready_journal;
@@ -80,7 +85,7 @@ mod sources;
 mod step_rows;
 pub use step_rows::step_stage;
 
-use flow::{QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
+use flow::{annotate_triage, QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
 
 /// The review labels whose listings give the PR stages and the census.
 pub const REVIEW_LABELS: [&str; 3] = ["loom:review-requested", "loom:changes-requested", "loom:pr"];
@@ -292,6 +297,8 @@ pub struct ReadyItem {
     pub eligible_reason: Option<FleetEligibleReason>,
     /// When that clock ends, when the work finder knows (#11564).
     pub eligible_at: Option<DateTime<Utc>>,
+    /// The closed-set reason the tick skipped this eligible item (#11960).
+    pub dispatch_blocked_reason: Option<PickSkipReason>,
 }
 
 /// One repo's dispatch limits from the work finder's last tick (#11606).
@@ -388,6 +395,8 @@ pub struct RepoView {
     /// The repo's pending-human queue depth (#11955). Absent = unknown, never
     /// zero.
     pub pending_queue: Option<FleetQueueDepth>,
+    /// The repo's operator-action recency (#11956). Absent = unknown.
+    pub operator_recency: Option<crate::telemetry::kinds::fleet_state::FleetOperatorRecency>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -584,6 +593,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 main_red_fix: item.main_red_fix,
                 eligible_reason: item.eligible_reason,
                 eligible_at: item.eligible_at,
+                dispatch_blocked_reason: item.dispatch_blocked_reason,
                 ..FleetStateRow::new(item.issue, FleetStage::ReadyWait, now)
             };
             offer(&mut candidates, &item.repo, Source::Ready, row);
@@ -688,6 +698,17 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             (None, Some(was)) => row.hold_released_at = was.hold_released_at,
             (None, None) => {}
         }
+        // Dispatch-block timing (#11960), like hold timing: the first pass of
+        // the current continuous skip for one reason; a new reason restarts
+        // it, and an item no longer skipped carries none.
+        if let Some(reason) = row.dispatch_blocked_reason {
+            row.dispatch_blocked_since = match was {
+                Some(was) if was.dispatch_blocked_reason == Some(reason) => {
+                    was.dispatch_blocked_since.or(Some(now))
+                }
+                _ => Some(now),
+            };
+        }
         // Roll the row's own label-derived facts up into the merge-readiness
         // reason (#11644). Computed last, so it reflects the final stage, hold
         // and flags, whatever source set them.
@@ -764,6 +785,7 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         triage_flow: state.and_then(|r| r.triage_flow),
         curator: state.and_then(|r| r.curator.clone()),
         pending_queue: state.and_then(|r| r.pending_queue),
+        operator_recency: state.and_then(|r| r.operator_recency),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -868,6 +890,7 @@ pub fn decide(
             && now_state.triage_flow == was.triage_flow
             && now_state.curator == was.curator
             && now_state.pending_queue == was.pending_queue
+            && now_state.operator_recency == was.operator_recency
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -1145,7 +1168,7 @@ pub(super) async fn record(
         annotate_triage(&mut view, &mut live.triage_flow, Some(&triage_sets), now);
     }
     // A repo whose listing was incomplete this pass drops out: unknown.
-    pending_queue::observe(&mut view, eligible);
+    pending_queue::observe(&mut view, eligible, now);
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;
@@ -1181,7 +1204,7 @@ async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_po
         // last collector-pass observation (#11642).
         annotate_triage(&mut view, &mut live.triage_flow, None, now);
     }
-    pending_queue::restamp(&mut view);
+    pending_queue::restamp(&mut view, now);
     send(sink, workspace_root, view, state, now, &reused);
 }
 
@@ -1215,37 +1238,6 @@ fn annotate_flow(
         let state = view.repos.entry(repo.clone()).or_default();
         state.queue_depth = Some(u32::try_from(set.len()).unwrap_or(u32::MAX));
         state.flow = tracker.flow(repo, now);
-    }
-}
-
-/// Fold this pass's `loom:triage` sets into `tracker` and stamp each repo's
-/// [`RepoView`] with its triage depth and flow (#11642), the pre-ready
-/// analogue of [`annotate_flow`]. Only the collector pass reads the triage
-/// listings (`triage` is `Some`), and `label_listings` already drops any repo
-/// whose listing came back partial — so every repo present was read whole.
-/// A tick pass passes `None`: it re-stamps each repo from the tracker's last
-/// observed set, so the facts persist unchanged between the collector's forge
-/// passes (no delta churn, as [`annotate_flow`]'s idle repos do not churn).
-fn annotate_triage(
-    view: &mut FleetView,
-    tracker: &mut QueueFlowTracker,
-    triage: Option<&BTreeMap<String, BTreeSet<u32>>>,
-    now: DateTime<Utc>,
-) {
-    if let Some(sets) = triage {
-        for (repo, set) in sets {
-            tracker.observe(repo, set, now);
-        }
-    }
-    // Re-stamp every repo the tracker knows (both passes): the depth is its
-    // last observed set size, stable between the collector's forge reads.
-    for repo in tracker.observed_repos() {
-        let Some(depth) = tracker.depth(repo) else {
-            continue;
-        };
-        let state = view.repos.entry(repo.to_string()).or_default();
-        state.triage_depth = Some(depth);
-        state.triage_flow = tracker.flow(repo, now);
     }
 }
 
@@ -1337,3 +1329,8 @@ mod queue_flow_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state/triage_flow_tests.rs"]
 mod triage_flow_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/dispatch_blocked_tests.rs"]
+mod dispatch_blocked_tests;

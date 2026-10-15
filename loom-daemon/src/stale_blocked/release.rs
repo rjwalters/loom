@@ -52,8 +52,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::batch::{gather_filtered, Options, RefState, StaleBlockedForge};
-use super::budget::{Floor, ForgeCost, Guard};
-use super::release_items::{Item, ItemContext, ItemVerdict};
+use super::budget::{Bucket, Floor, FloorStop, ForgeCost, Guard};
+use super::release_items::{Item, ItemContext, ItemVerdict, Unreadable};
 use super::{classify, Artifact, Verdict};
 use crate::comment_trust::TrustPolicy;
 use crate::forge_identity::FleetLogins;
@@ -217,6 +217,9 @@ pub struct Report {
     pub still_blocked: usize,
     pub skipped: BTreeMap<String, usize>,
     pub unevaluated: Vec<Unread>,
+    /// `unevaluated` counted per [`UnevaluatedReason`] key, every key present
+    /// (#12036).
+    pub unevaluated_reasons: BTreeMap<String, usize>,
     pub failed: Vec<Unread>,
     pub cost: ForgeCost,
     /// One verdict per listed artifact, in decision order (#10752).
@@ -231,9 +234,18 @@ impl Report {
         self.decide(number, ItemVerdict::Skipped, Some(why.key()), None);
     }
 
-    fn unread(&mut self, number: u64, why: impl Into<String>) {
-        let why = why.into();
+    fn unread(&mut self, number: u64, cause: impl Into<Unreadable>) {
+        let cause = cause.into();
+        let why = cause.to_string();
         self.decide(number, ItemVerdict::Unevaluated, None, Some(&why));
+        if let Some(item) = self.items.last_mut() {
+            item.unevaluated_reason = Some(cause.reason);
+            item.budget = cause.budget;
+        }
+        *self
+            .unevaluated_reasons
+            .entry(cause.reason.as_str().to_string())
+            .or_default() += 1;
         self.unevaluated.push(Unread { number, why });
     }
 
@@ -506,21 +518,30 @@ fn plan_from_listing(
     if eligible.is_empty() {
         return Vec::new();
     }
-    if let Some(b) = gather.budget() {
+    let probe = gather.budget();
+    report.cost.budget_at_start = probe;
+    if let Some(b) = probe {
         if b.core_remaining < floor.core {
             let why = format!(
                 "budget floor: core remaining {} < floor {} — not evaluated this pass",
                 b.core_remaining, floor.core
             );
+            let stop = FloorStop {
+                bucket: Bucket::Core,
+                remaining: b.core_remaining,
+                floor: floor.core,
+                projected: None,
+                mid_run: false,
+            };
             for (_, row) in &eligible {
-                report.unread(u64::from(row.number), why.clone());
+                report.unread(u64::from(row.number), Unreadable::floor(&stop, why.clone()));
             }
             report.cost.budget_refused = Some(why);
             return Vec::new();
         }
     }
     let mut guard = Guard::new(floor);
-    let mut states: HashMap<u64, Result<RefState, String>> = HashMap::new();
+    let mut states: HashMap<u64, Result<RefState, Unreadable>> = HashMap::new();
     let mut plans = Vec::new();
     'rows: for (declared, row) in eligible {
         let number = u64::from(row.number);
@@ -529,20 +550,21 @@ fn plan_from_listing(
             let state = states
                 .entry(b)
                 .or_insert_with(|| {
-                    guard.core(&gather.meter())?;
+                    guard.core_stop(&gather.meter())?;
                     let n = i64::try_from(b).map_err(|e| e.to_string())?;
                     match gather.ref_state(None, n) {
                         Ok(Some(s)) if !s.state.is_empty() => Ok(s),
-                        Ok(Some(_)) => Err("the forge returned no state".to_string()),
-                        Ok(None) => Err("not found (HTTP 404)".to_string()),
-                        Err(e) => Err(e.to_string()),
+                        Ok(Some(_)) => Err("the forge returned no state".to_string().into()),
+                        Ok(None) => Err("not found (HTTP 404)".to_string().into()),
+                        Err(e) => Err(e.to_string().into()),
                     }
                 })
                 .clone();
             report.blocker_read(b, &state);
             match state {
                 Err(why) => {
-                    report.unread(number, format!("declared blocker #{b}: {why}"));
+                    let text = format!("declared blocker #{b}: {why}");
+                    report.unread(number, why.with_text(text));
                     continue 'rows;
                 }
                 Ok(s) => match resolution(&s) {
@@ -620,10 +642,17 @@ fn veto_from_evidence(
     if gathering.cost.budget_stopped.is_some() {
         report.cost.budget_stopped = gathering.cost.budget_stopped.clone();
     }
-    let evidence: HashMap<u64, Result<super::Evidence, String>> = gathering
+    let evidence: HashMap<u64, Result<super::Evidence, Unreadable>> = gathering
         .items
         .into_iter()
-        .filter_map(|g| u64::try_from(g.number).ok().map(|n| (n, g.evidence)))
+        .filter_map(|g| {
+            let ev = match (g.evidence, g.cause) {
+                (Ok(ev), _) => Ok(ev),
+                (Err(_), Some(cause)) => Err(cause),
+                (Err(text), None) => Err(Unreadable::read_failed(text)),
+            };
+            u64::try_from(g.number).ok().map(|n| (n, ev))
+        })
         .collect();
     let mut kept = Vec::new();
     for plan in plans {
@@ -639,7 +668,7 @@ fn veto_from_evidence(
                 continue;
             }
             None => {
-                report.unread(n, "no evidence gathered");
+                report.unread(n, Unreadable::other("no evidence gathered"));
                 continue;
             }
         };
@@ -650,7 +679,8 @@ fn veto_from_evidence(
                 continue;
             }
             None => {
-                report.unread(n, "the body the evidence was read from is unknown");
+                report
+                    .unread(n, Unreadable::other("the body the evidence was read from is unknown"));
                 continue;
             }
         }
@@ -702,7 +732,10 @@ fn execute(
     let fresh = match park.view(n) {
         Ok(s) => s,
         Err(e) => {
-            report.unread(n, format!("fresh read before the write failed: {e}"));
+            report.unread(
+                n,
+                Unreadable::read_failed(format!("fresh read before the write failed: {e}")),
+            );
             return false;
         }
     };
@@ -720,7 +753,7 @@ fn execute(
     let comments = match extra.comments(n) {
         Ok(c) => c,
         Err(e) => {
-            report.unread(n, format!("comment read failed: {e}"));
+            report.unread(n, Unreadable::read_failed(format!("comment read failed: {e}")));
             return false;
         }
     };
@@ -759,7 +792,7 @@ fn execute(
         match restore_label(extra, plan.kind, n) {
             Ok(r) => r,
             Err(e) => {
-                report.unread(n, format!("label-event read failed: {e}"));
+                report.unread(n, Unreadable::read_failed(format!("label-event read failed: {e}")));
                 return false;
             }
         }

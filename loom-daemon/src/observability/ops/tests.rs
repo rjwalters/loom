@@ -266,6 +266,8 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::ForgeStageDwell,
         MetricName::ForgeStageDwellSamples,
         MetricName::ForgeStageItems,
+        MetricName::ForgeStageOldestAgeSeconds,
+        MetricName::StepActionable,
         MetricName::QueueDispositionRowsDropped,
         MetricName::MergeRedatePrs,
         MetricName::MergeRedatesMax,
@@ -763,4 +765,33 @@ fn an_empty_queue_reads_as_zeros_not_as_missing() {
     let points = super::queue::queue_points(&queue_summary(&[]));
     assert!(!points.is_empty());
     assert!(points.iter().all(|p| p.value == MetricValue::Int(0)));
+}
+
+/// #11973: a tick that counted errors names their kind from the fixed set;
+/// several kinds read `mixed`; a clean tick omits the key.
+#[test]
+fn tick_span_names_the_error_kind_only_when_it_counted_errors() {
+    use crate::work_finder::DispatchErrorKind as K;
+    let mut listing = TickReport::default();
+    listing.note_listing_failure(0, &anyhow::anyhow!("gh: HTTP 502 Bad Gateway"));
+    let span = tick_span(&listing, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "error");
+    assert_eq!(span.attributes["loom.dispatch.error_kind"], "forge_listing");
+    assert_eq!(listing.listing_failed, vec![0]);
+
+    let mut limited = TickReport::default();
+    limited.note_listing_failure(1, &anyhow::anyhow!("API rate limit exceeded (HTTP 403)"));
+    limited.note_listing_failure(2, &anyhow::anyhow!("API rate limit exceeded (HTTP 403)"));
+    let span = tick_span(&limited, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.errors"], "2");
+    assert_eq!(span.attributes["loom.dispatch.error_kind"], "rate_limited");
+
+    let mut mixed = limited.clone();
+    mixed.note_error(K::DispatchSpawn);
+    let span = tick_span(&mixed, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.error_kind"], "mixed");
+
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert!(!idle.attributes.contains_key("loom.dispatch.error_kind"));
+    assert!(OPS_SPAN_ATTRIBUTE_KEYS.contains(&"loom.dispatch.error_kind"));
 }

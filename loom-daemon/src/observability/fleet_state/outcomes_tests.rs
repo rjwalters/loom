@@ -116,6 +116,7 @@ impl ForgeReads for Forge {
                 .filter(|(at, _)| clock.is_none_or(|now| *at <= now))
                 .cloned()
                 .collect(),
+            ..LabelHistory::default()
         })
     }
 }
@@ -371,6 +372,7 @@ fn a_ready_row_surviving_the_review_departure_gives_landed_not_advance() {
                 main_red_fix: false,
                 eligible_reason: None,
                 eligible_at: None,
+                dispatch_blocked_reason: None,
             }],
             listed: [REPO.to_string()].into(),
             complete: BTreeSet::new(),
@@ -518,6 +520,7 @@ fn ready(issues: &[u32], held: Vec<HeldSweep>) -> FleetInput {
                 main_red_fix: false,
                 eligible_reason: None,
                 eligible_at: None,
+                dispatch_blocked_reason: None,
             })
             .collect(),
         listed: [REPO.to_string()].into(),

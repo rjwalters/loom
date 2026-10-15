@@ -7,8 +7,11 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
+use super::super::budget::Bucket;
 use super::super::release::{Config, Report};
-use super::super::release_items::{blocker_state, BlockerCheck, Item, ItemVerdict};
+use super::super::release_items::{
+    blocker_state, BlockerCheck, BudgetReading, Item, ItemVerdict, UnevaluatedReason,
+};
 use super::super::release_tests::{cfg, World};
 use super::*;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation, ParentContext};
@@ -301,6 +304,8 @@ fn item(number: u64, verdict: ItemVerdict, state: &'static str) -> Item {
         artifact: "issue",
         verdict,
         reason: None,
+        unevaluated_reason: None,
+        budget: None,
         detail: None,
         blockers: vec![BlockerCheck {
             reference: "#1".to_string(),
@@ -396,4 +401,56 @@ fn a_second_pass_emits_only_what_changed_and_keeps_its_counts_exact() {
     let numbers: Vec<u64> = verdicts.iter().map(|v| v.number).collect();
     assert_eq!(numbers, vec![12]);
     assert_ne!(verdicts[0].verdict, "still_blocked");
+}
+
+#[test]
+fn the_unevaluated_reason_and_budget_are_exported_and_the_summary_counts_them() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &[]);
+    w.state(1, "CLOSED", false);
+    w.budget(10, 10);
+    let report = w.run();
+    let records = Observer::start(MECHANISM).records("o/r", "h", &report, HOUR);
+    let (summary, verdicts) = split(records);
+    let v = verdict(&verdicts, 10);
+    assert_eq!(v.unevaluated_reason.as_deref(), Some("budget_floor_core"));
+    let b = v.budget.as_ref().unwrap();
+    assert_eq!((b.bucket.as_str(), b.remaining, b.floor), ("core", 10, 1_000));
+    assert_eq!(summary.unevaluated_reasons.len(), 4);
+    assert_eq!(summary.unevaluated_reasons["budget_floor_core"], 1);
+    assert_eq!(summary.unevaluated_reasons["read_failed"], 0);
+    let sb = summary.budget.unwrap();
+    assert_eq!((sb.core_start, sb.core_floor), (Some(10), 1_000));
+}
+
+#[test]
+fn passes_differing_only_in_remaining_emit_once_and_a_new_reason_re_emits() {
+    let mut a = item(1, ItemVerdict::Unevaluated, blocker_state::NOT_READ);
+    a.unevaluated_reason = Some(UnevaluatedReason::BudgetFloorCore);
+    a.budget = Some(BudgetReading {
+        bucket: Bucket::Core,
+        remaining: 900,
+        floor: 1000,
+    });
+    let mut b = a.clone();
+    b.budget = Some(BudgetReading {
+        bucket: Bucket::Core,
+        remaining: 800,
+        floor: 1000,
+    });
+    assert_eq!(fingerprint(&a, PassMode::On), fingerprint(&b, PassMode::On));
+    b.unevaluated_reason = Some(UnevaluatedReason::ReadFailed);
+    assert_ne!(fingerprint(&a, PassMode::On), fingerprint(&b, PassMode::On));
+}
+
+#[test]
+fn detail_is_never_cut_mid_word() {
+    let why = "declared blocker #3037: budget floor reached mid-run: core remaining 920 < \
+               floor 1000 \u{2014} not evaluated (advisory; exit 0)";
+    let d = super::super::release_items::detail_for_test(why).unwrap();
+    assert!(d.ends_with("..."), "{d}");
+    assert!(!d.contains("evalu..."), "{d}");
+    assert!(d.len() <= 99);
+    let short = super::super::release_items::detail_for_test("short text").unwrap();
+    assert_eq!(short, "short text");
 }

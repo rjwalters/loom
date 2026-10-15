@@ -155,6 +155,7 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
             run_startup_quarantine_pass(&quarantine_root);
             run_startup_profile_provisioning_pass(&quarantine_root);
             run_startup_trace_join_reconciliation_pass(&quarantine_root);
+            run_startup_review_role_pins_pass(&quarantine_root);
             if let Some(dir) = gate_dir.as_deref() {
                 let _ = std::fs::write(dir.join(TEST_GATE_COMPLETED_FILE), b"done\n");
             }
@@ -168,6 +169,25 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
     rx
 }
 
+/// One WARN per registered workspace that pins a Champion, Judge or Doctor
+/// prompt in `.loom/resync-ignore` (#11970): that copy runs stale against
+/// this daemon. Local file reads only; the same fact is the `review_role_pins`
+/// warning in `loom-daemon health`.
+fn run_startup_review_role_pins_pass(fallback_root: &Path) {
+    let registry = crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    for root in registry.effective_roots(fallback_root) {
+        let pins = crate::health::pinned_review_roles(&root);
+        if !pins.is_empty() {
+            log::warn!(
+                "review_role_pins: {} pins review-role prompt(s) in .loom/resync-ignore, which \
+                 run stale against this daemon (#11970): {}",
+                root.display(),
+                pins.join(", ")
+            );
+        }
+    }
+}
+
 /// The stranded-quarantine half of the startup pass (Issue #4110): the
 /// insta-crash quarantine (#3939) is memory-only, so a restart drops the
 /// in-memory pause while the `loom:blocked` label it applied survives on the
@@ -177,7 +197,9 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
 /// quarantine comment back to `loom:issue`; a human's manual `loom:blocked`
 /// (no such comment) is never touched. Since #11930 a marked park still
 /// inside its TTL is kept on the forge and restored in memory instead (see
-/// `quarantine_reconciliation::restored`).
+/// `quarantine_reconciliation::restored`). A workspace the rate-limit breaker
+/// skipped is retried once after the breaker clears (#11973,
+/// `quarantine_reconciliation::deferred`).
 fn run_startup_quarantine_pass(fallback_root: &Path) {
     if !crate::quarantine_reconciliation::reconciliation_enabled() {
         log::info!(
@@ -190,14 +212,16 @@ fn run_startup_quarantine_pass(fallback_root: &Path) {
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
     let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
-    let mut total_checked = 0usize;
-    let mut total_released = 0usize;
-    for root in &roots {
-        let (checked, released) =
-            crate::quarantine_reconciliation::forge::reconcile_workspace(&gh_bin, root);
-        total_checked += checked;
-        total_released += released;
-    }
+    let crate::quarantine_reconciliation::deferred::Sweep {
+        checked: total_checked,
+        released: total_released,
+        skipped,
+    } = crate::quarantine_reconciliation::deferred::sweep(&roots, |root| {
+        crate::quarantine_reconciliation::forge::reconcile_workspace_pass(&gh_bin, root)
+    });
+    // #11973: a root the rate-limit breaker skipped is retried once, after
+    // the breaker clears, instead of waiting for the next restart.
+    crate::quarantine_reconciliation::deferred::schedule(gh_bin.clone(), skipped);
     if total_released > 0 {
         log::info!(
             "quarantine_reconciliation: startup pass checked {total_checked} loom:blocked \

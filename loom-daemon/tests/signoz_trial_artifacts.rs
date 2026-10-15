@@ -68,6 +68,10 @@ const QUEUE_STARVATION_ALERT: &str =
 /// for record kinds whose metric names are literals rather than a
 /// `MetricName` variant — see `tokens_metric_names`).
 const OTLP_MAPPING: &str = include_str!("../src/observability/otlp/mapping.rs");
+/// The `TokensSnapshot` metric builder split out of `mapping.rs`; it holds the
+/// `loom.tokens.*` name literals.
+const OTLP_TOKENS_SNAPSHOT: &str =
+    include_str!("../src/observability/otlp/mapping/tokens_snapshot.rs");
 
 /// Loom's own attribute namespace. Presence probes outside it are deliberate
 /// absence assertions (see [`fixture_queries_assert_the_privacy_sentinel_is_dropped`])
@@ -1037,23 +1041,20 @@ fn queue_dwell_queries_match_the_ops_metric_vocabulary() {
     }
 }
 
-/// Derived from `mapping.rs`'s `TokensSnapshot` arm text: the `loom.tokens.*`
-/// gauge names the account-utilization metric family emits. Not a
-/// `MetricName` variant — this record kind writes its OTLP metric names as
-/// literals directly in the mapping, so the mapping source is the authority
-/// here, exactly as `sweep_facts_gateway_survival.rs` already treats it for a
-/// different record family.
+/// Derived from `mapping/tokens_snapshot.rs`: the `loom.tokens.*` gauge names
+/// the account-utilization metric family emits. Not a `MetricName` variant —
+/// this record kind writes its OTLP metric names as literals in the mapping,
+/// so that source is the authority here, exactly as
+/// `sweep_facts_gateway_survival.rs` already treats it for a different record
+/// family. The `TokensSnapshot` arm in `mapping.rs` only delegates to
+/// `tokens_snapshot::samples`; the test asserts that delegation still holds so
+/// the literals read here are the ones actually emitted.
 fn tokens_metric_names() -> BTreeSet<String> {
-    let arm_start = OTLP_MAPPING
-        .find("TelemetryRecord::TokensSnapshot(r) =>")
-        .expect("mapping.rs no longer has a TokensSnapshot arm");
-    let next_arm = OTLP_MAPPING[arm_start + 1..]
-        .find("TelemetryRecord::")
-        .map(|offset| arm_start + 1 + offset);
-    let arm = match next_arm {
-        Some(end) => &OTLP_MAPPING[arm_start..end],
-        None => &OTLP_MAPPING[arm_start..],
-    };
+    assert!(
+        OTLP_MAPPING.contains("TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples("),
+        "mapping.rs no longer delegates the TokensSnapshot arm to tokens_snapshot::samples"
+    );
+    let arm = OTLP_TOKENS_SNAPSHOT;
     let names: BTreeSet<String> = Regex::new(r#"name:\s*"(loom\.tokens\.[a-z_]+)""#)
         .unwrap()
         .captures_iter(arm)

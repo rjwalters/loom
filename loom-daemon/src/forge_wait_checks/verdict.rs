@@ -204,6 +204,36 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
     Decision::Green
 }
 
+/// [`decide`] under `--settle-red` (#12011): a `Red` stands only once the
+/// run has finished — nothing observed is still pending. Until then it is
+/// `Pending` on what is still running (so the wait ends `TIMEOUT`, never an
+/// early `RED`). Every other decision is [`decide`]'s, unchanged.
+///
+/// Only observed pending checks hold a `Red` back (#12022): the job log is
+/// readable once they finish, whatever the required set. An unknown or
+/// unregistered required set must not — nothing would ever resolve it once
+/// the run is over, so a finished red would `TIMEOUT` on every pass and never
+/// reach the Doctor. The required-set fail-closed rules stay in [`decide`],
+/// where they keep `Green` honest.
+///
+/// Why opt-in: an early `RED` is right for a caller that only *refuses* on it
+/// (the approval gate, `merge-pr.sh`, Champion), but wrong as the trigger for
+/// a changes-requested verdict — a Judge cannot read a job log (`gh run view
+/// --log-failed`) until the whole run completes, so it cannot name the
+/// failing test, nor tell a tracked flake from a regression (#12011).
+#[must_use]
+pub fn decide_settled(r: &Rollup, required: Option<&[String]>, required_only: bool) -> Decision {
+    let d = decide(r, required, required_only);
+    if !matches!(d, Decision::Red(_)) {
+        return d;
+    }
+    if r.pending.is_empty() {
+        d
+    } else {
+        Decision::Pending(r.pending.clone())
+    }
+}
+
 /// The terminal answer of one `wait-checks` run — exactly one sentinel line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -458,6 +488,62 @@ mod tests {
         assert_eq!(
             decide(&r, Some(req.as_slice()), true),
             Decision::Pending(vec!["Backend".into(), "Gate".into()])
+        );
+    }
+
+    /// #12011: under `--settle-red` a failure is not RED while anything else
+    /// is still running (the PR #11974 replay); once the run has finished it
+    /// is. Without the flag the same rollup is RED at once, as before.
+    #[test]
+    fn settle_red_waits_for_the_run_to_finish_before_red() {
+        let none: &[String] = &[];
+        let partial = vec![
+            run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+            run("Rust Unit Tests (1/3)", "in_progress", None),
+            run("lint", "completed", Some("success")),
+        ];
+        let r = fold(&runs(partial), &no_status()).unwrap();
+        assert_eq!(
+            decide_settled(&r, Some(none), false),
+            Decision::Pending(vec!["Rust Unit Tests (1/3)".into()])
+        );
+        assert_eq!(
+            decide(&r, Some(none), false),
+            Decision::Red(vec!["Rust Unit Tests (2/3)".into()])
+        );
+        let done = vec![
+            run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+            run("Rust Unit Tests (1/3)", "completed", Some("success")),
+        ];
+        let r = fold(&runs(done), &no_status()).unwrap();
+        assert_eq!(
+            decide_settled(&r, Some(none), false),
+            Decision::Red(vec!["Rust Unit Tests (2/3)".into()])
+        );
+    }
+
+    /// #12022: under `--settle-red` an unknown or unregistered required set
+    /// does not hold back a finished red — nothing would ever resolve it, so
+    /// the wait would `TIMEOUT` every pass. It still keeps `Green` from
+    /// standing (the fail-closed rules live in `decide`).
+    #[test]
+    fn settle_red_is_red_once_nothing_is_pending_even_with_an_unknown_or_unregistered_required_set()
+    {
+        let r = fold(&runs(vec![run("lint", "completed", Some("failure"))]), &no_status()).unwrap();
+        assert_eq!(decide(&r, None, false), Decision::Red(vec!["lint".into()]));
+        assert_eq!(decide_settled(&r, None, false), Decision::Red(vec!["lint".into()]));
+        let req = vec!["Backend".to_string()];
+        assert_eq!(
+            decide_settled(&r, Some(req.as_slice()), false),
+            Decision::Red(vec!["lint".into()])
+        );
+        // Non-RED decisions are untouched.
+        let ok = fold(&runs(vec![run("ci", "completed", Some("success"))]), &no_status()).unwrap();
+        assert_eq!(decide_settled(&ok, Some(&[][..]), false), Decision::Green);
+        // Fail-closed side: a green-only rollup with an unknown set still waits.
+        assert_eq!(
+            decide_settled(&ok, None, false),
+            Decision::Pending(vec![REQUIRED_UNKNOWN.into()])
         );
     }
 

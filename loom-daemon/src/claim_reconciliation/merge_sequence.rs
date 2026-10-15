@@ -130,6 +130,10 @@ pub mod overlap;
 #[path = "merge_sequence_ready.rs"]
 pub mod ready;
 
+// Live CI and mergeability: "landable now" feeds `ready` (#12010).
+#[path = "merge_sequence_landable.rs"]
+pub mod landable;
+
 // Tree-identical re-dates keep a hold; operator releases stick (#10398).
 #[path = "merge_sequence_sticky.rs"]
 pub mod sticky;
@@ -691,7 +695,11 @@ pub fn apply_comment_body(marker: &SequenceMarker, reason: EdgeReason) -> String
 
 /// The release comment (predecessor landed / dissolved / expired).
 #[must_use]
-pub fn release_comment_body(marker: &SequenceMarker, action: HoldAction) -> String {
+pub fn release_comment_body(
+    marker: &SequenceMarker,
+    action: HoldAction,
+    head: Option<&SequencePr>,
+) -> String {
     let why = match action {
         HoldAction::Release => {
             format!("#{} merged at the recorded head — this PR may land now", marker.after)
@@ -713,7 +721,7 @@ pub fn release_comment_body(marker: &SequenceMarker, action: HoldAction) -> Stri
             marker.after
         ),
         HoldAction::ReleaseNoOverlap => overlap::release_reason(marker),
-        HoldAction::ReleaseNotReady => ready::release_reason(marker),
+        HoldAction::ReleaseNotReady => ready::release_reason(marker, head),
         _ => "released".to_string(),
     };
     format!(
@@ -980,6 +988,7 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     if open.len() <= TRIGGER_OPEN_PRS {
         return Ok(report);
     }
+    let open = landable::tag_live(gh_bin, root, &open, true);
     let eligible: Vec<&SequencePr> = open
         .iter()
         .filter(|p| p.eligible_for_ordering() && p.pinnable())
@@ -1148,6 +1157,8 @@ pub(super) fn reconcile_merge_sequences_gated(
     if open.len() <= TRIGGER_OPEN_PRS {
         return stats;
     }
+    // #12010: a ready PR that is red or conflicting now is not ready.
+    let open = landable::tag_live(gh_bin, root, &open, owned);
     let max_age = max_age_hours();
     let (now, stall_bound) = (Utc::now(), stall_hours());
     let mut stalls = stall::StallLedger::default();
@@ -1255,8 +1266,8 @@ pub(super) fn reconcile_merge_sequences_gated(
             | HoldAction::ReleaseStalled
             | HoldAction::ReleaseNoOverlap
             | HoldAction::ReleaseNotReady => {
-                release_hold(gh_bin, root, pr.number, &release_comment_body(&marker, action))
-                    .map(|_| action)
+                let body = release_comment_body(&marker, action, ready_head);
+                release_hold(gh_bin, root, pr.number, &body).map(|_| action)
             }
             HoldAction::VoidAndReplan => {
                 release_hold(gh_bin, root, pr.number, REPLAN_NOTE_BODY).map(|_| action)

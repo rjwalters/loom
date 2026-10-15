@@ -137,13 +137,21 @@ impl SweepRegistry {
         role: StepRole,
         sweep_id: &str,
     ) -> std::result::Result<(), StepRefusal> {
+        run_step_claim(self.step_claim_command(item, role, sweep_id))
+    }
+
+    /// The pre-claim's `lease pr claim` command, built under the lock and
+    /// run by [`run_step_claim`] with it released (#11909).
+    pub(super) fn step_claim_command(
+        &self,
+        item: u32,
+        role: StepRole,
+        sweep_id: &str,
+    ) -> Option<Command> {
         let root = &self.config.workspace_root;
         let _ = std::fs::remove_file(pr_lease_reap::path_for(root, sweep_id));
         let args = claim_args(root, item, role, sweep_id, None);
-        let Some(mut cmd) = self.lease_command(sweep_id, &args) else {
-            return Err(StepRefusal::new("claim_unverified", "no loom-daemon binary"));
-        };
-        claim_verdict(run_bounded(&mut cmd, CLAIM_TIMEOUT))
+        self.lease_command(sweep_id, &args)
     }
 
     /// Start the renewal of a just-spawned step's lease, on a detached
@@ -202,4 +210,13 @@ impl SweepRegistry {
             log::warn!("sweep_registry: {sweep_id}: no lease-reap thread ({e}); leases age out");
         }
     }
+}
+
+/// Run a pre-claim command ([`SweepRegistry::step_claim_command`]); no
+/// registry state is read, so the caller holds no lock.
+pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<(), StepRefusal> {
+    let Some(mut cmd) = cmd else {
+        return Err(StepRefusal::new("claim_unverified", "no loom-daemon binary"));
+    };
+    claim_verdict(run_bounded(&mut cmd, CLAIM_TIMEOUT))
 }

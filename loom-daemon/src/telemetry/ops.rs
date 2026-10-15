@@ -81,6 +81,9 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.halt_causes",
     // #11857: how many workspaces a hold gated this tick (`0` when none).
     "loom.dispatch.held_roots",
+    // #11973: why a tick counted errors — one token of a fixed set, or
+    // `mixed` (`work_finder::tick_report::error_kind`).
+    "loom.dispatch.error_kind",
     // #11858: the held repos with their causes, the cap's binding term and
     // terms, and the open-PR pre-filter's skips (`ops::dispatch_facts`).
     "loom.dispatch.halted_repos",
@@ -375,6 +378,14 @@ pub enum MetricName {
     /// Open items carrying a stage label, labelled `state`.
     #[serde(rename = "loom.forge.stage_items")]
     ForgeStageItems,
+    /// Seconds since the oldest item of a `stage_items` state entered it,
+    /// labelled `state`, `reason`, `repo` (#12027: `pr_refused`).
+    #[serde(rename = "loom.forge.stage_oldest_age_seconds")]
+    ForgeStageOldestAgeSeconds,
+    /// Items the step tick could draw (weight > 0, after the live claims),
+    /// labelled `repo`, sampled every work-finder tick (#11909).
+    #[serde(rename = "loom.step.actionable")]
+    StepActionable,
     /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
     /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
     /// (over the per-call row cap) — Issue #9222.
@@ -566,6 +577,8 @@ impl MetricName {
             Self::ForgeStageDwell => "loom.forge.stage_dwell",
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
+            Self::ForgeStageOldestAgeSeconds => "loom.forge.stage_oldest_age_seconds",
+            Self::StepActionable => "loom.step.actionable",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
             Self::GithubRateLimitUsed => "github.ratelimit.used",
@@ -672,10 +685,10 @@ impl MetricName {
             | Self::DispatchBusySlots
             | Self::DispatchRoleMaxConcurrent
             | Self::DispatchRoleIdleSlots => "{slot}",
-            Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
+            Self::ForgeStageDwellSamples | Self::ForgeStageItems | Self::StepActionable => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
-            Self::GithubRateLimitReset => "s",
+            Self::GithubRateLimitReset | Self::ForgeStageOldestAgeSeconds => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
             Self::ForgeCalls => "{request}",
             Self::ForgeFacadeEvents => "{event}",
@@ -764,6 +777,10 @@ impl MetricName {
             Self::ForgeStageItems => {
                 "Open items per repo by state: stage labels and queue states (overlapping)."
             }
+            Self::ForgeStageOldestAgeSeconds => {
+                "Age of the oldest item in a stage_items state, by reason (pr_refused)."
+            }
+            Self::StepActionable => "Items the step tick could draw this tick, per repo.",
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }
