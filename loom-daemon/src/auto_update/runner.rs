@@ -558,6 +558,10 @@ impl FloorFeed {
 /// ([`crate::fleet_sync::FloorWake`]) and restarts the interval from that
 /// tick. The wake fires on a change of value only, so a floor roll that keeps
 /// failing is paced by its backoff.
+///
+/// #12072: while the floor is unsatisfiable the next tick is
+/// [`stall_recheck::STALL_RECHECK`] away, not `tuning.interval`, for the first
+/// [`stall_recheck::STALL_WINDOW`] of the stall.
 pub(super) async fn run_loop<P, T>(
     mut state: AutoUpdateState,
     mut probe: P,
@@ -596,6 +600,17 @@ pub(super) async fn run_loop<P, T>(
                 probe = p;
                 trigger = t;
                 task_liveness::beat(AUTO_UPDATE, tuning.interval);
+                // #12072: a standing unsatisfiable floor is re-checked soon,
+                // so the roll starts minutes after the asset lands.
+                let delay =
+                    stall_recheck::delay_after_tick(&state.floor, Utc::now(), tuning.interval);
+                if delay < tuning.interval {
+                    ticker = tokio::time::interval_at(
+                        tokio::time::Instant::now() + delay,
+                        tuning.interval,
+                    );
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                }
             }
             Err(e) => {
                 // Unreachable for a panic (`guarded_tick` catches it); a

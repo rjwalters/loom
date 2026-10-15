@@ -589,12 +589,16 @@ fn parse_yield_marker_line(body: &str) -> Option<(String, String)> {
 /// ([`crate::claim_reconciliation::lease_is_fresh`]'s TTL semantics —
 /// `LOOM_LEASE_TTL_MINUTES`, default 15), trusted (the caller already
 /// filtered), and not excluded by a matching `loom:lease-yield` (#5331/
-/// #6485: a yielded claimant already stood down). Pure.
+/// #6485: a yielded claimant already stood down) and not published by the
+/// caller's own sweep (`own_sweep`, #11635: the sweep pre-flight publishes the
+/// lease before its Builder runs this guard, so it is not a peer's claim).
+/// Pure.
 #[must_use]
 pub(crate) fn freshest_live_lease(
     rows: &[LeaseRow],
     now: DateTime<Utc>,
     ttl_minutes: f64,
+    own_sweep: Option<&str>,
 ) -> Option<(String, String)> {
     let yielded: std::collections::BTreeSet<(String, String)> = rows
         .iter()
@@ -606,6 +610,7 @@ pub(crate) fn freshest_live_lease(
             SweepRegistry::parse_lease_marker_line(&r.body).map(|pair| (r.updated_at, pair))
         })
         .filter(|(_, pair)| !yielded.contains(pair))
+        .filter(|(_, (_, sweep))| own_sweep != Some(sweep.as_str()))
         .max_by_key(|(updated_at, _)| *updated_at)
         .map(|(_, pair)| pair)
 }
@@ -647,7 +652,10 @@ pub(crate) fn read_freshest_live_lease(
     // neither block a claim here nor excuse a peer's live lease.
     let policy = TrustPolicy::for_root(root);
     let rows = parse_lease_rows(&String::from_utf8_lossy(&policy.trusted_ndjson(&out.stdout)));
-    match freshest_live_lease(&rows, now, ttl_minutes) {
+    let own_sweep = std::env::var("LOOM_SWEEP_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    match freshest_live_lease(&rows, now, ttl_minutes, own_sweep.as_deref()) {
         Some((host, sweep_id)) => LeaseLeg::Held { host, sweep_id },
         None => LeaseLeg::NoneFresh,
     }
@@ -1087,17 +1095,30 @@ mod tests {
             mk(2, "freshest-host", "freshest-sweep", 4, false),
         ];
         assert_eq!(
-            freshest_live_lease(&rows, now, ttl),
+            freshest_live_lease(&rows, now, ttl, None),
             Some(("freshest-host".to_string(), "freshest-sweep".to_string()))
+        );
+
+        // #11635: the caller's own sweep is not a blocker, even when its lease
+        // is the newest row; a peer's older live lease is still found.
+        assert_eq!(
+            freshest_live_lease(&rows, now, ttl, Some("freshest-sweep")),
+            Some(("live-host".to_string(), "live-sweep".to_string()))
+        );
+        let own_only = vec![mk(1, "h", "mine", 7, false)];
+        assert_eq!(freshest_live_lease(&own_only, now, ttl, Some("mine")), None);
+        assert_eq!(
+            freshest_live_lease(&own_only, now, ttl, Some("other")),
+            Some(("h".to_string(), "mine".to_string()))
         );
 
         // The yielded row alone: not a live lease even though fresh.
         let yielded_only = vec![mk(1, "y-host", "y-sweep", 5, true)];
-        assert_eq!(freshest_live_lease(&yielded_only, now, ttl), None);
+        assert_eq!(freshest_live_lease(&yielded_only, now, ttl, None), None);
 
         // Exactly at the TTL boundary is NOT fresh (age < ttl is the rule).
         let boundary = vec![mk(15, "b-host", "b-sweep", 6, false)];
-        assert_eq!(freshest_live_lease(&boundary, now, ttl), None);
+        assert_eq!(freshest_live_lease(&boundary, now, ttl, None), None);
     }
 
     #[test]

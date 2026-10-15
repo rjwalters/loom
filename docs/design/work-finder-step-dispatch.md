@@ -114,7 +114,7 @@ The classifier (`work_finder/step_item.rs`, `classify`) checks these rows in ord
 | `loom:architect` / `loom:hermit` / `loom:auditor` proposal, not curated or promoted | none (Champion's non-item run) |
 | `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 | the same, a capability not held | none |
-| `loom:curated` + `loom:blocked`, **dependency park only**, blocker closed | Champion re-evaluate |
+| `loom:curated` (not `loom:issue`) + `loom:blocked`, **dependency park only** | Champion re-evaluate (it re-checks the blockers on every draw, #12078) |
 | any other blocked issue | none |
 | landed: a *closing* PR merged, issue still open (not `Part of`) | Curator keep-or-close |
 | `loom:decision-malformed` | Curator |

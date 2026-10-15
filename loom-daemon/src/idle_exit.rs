@@ -492,7 +492,11 @@ pub fn spawn_task(
             // already-published fleet announcement before process termination.
             tokio::time::sleep(Duration::from_millis(250)).await;
             let _ = tokio::fs::remove_file(&socket).await;
-            std::process::exit(0);
+            crate::observability::shutdown::exit(
+                0,
+                crate::observability::daemon_exit::ExitCause::IdleExit,
+            )
+            .await;
         }
     })
 }
