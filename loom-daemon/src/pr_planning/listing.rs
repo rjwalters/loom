@@ -314,11 +314,7 @@ fn ci_pending_at_head(root: &Path, gh: &Path, row: &Value) -> bool {
     let (Some(number), Some(head)) = (row["number"].as_u64(), row["head"]["sha"].as_str()) else {
         return false;
     };
-    let pending = super::ci_gate::cached(root, head, || {
-        super::ci_gate::ci_pending(head, chrono::Utc::now(), |path| {
-            read(root, gh, ops::CI_CHECK_RUNS_FOR_SHA, path).ok()
-        })
-    });
+    let pending = ci_pending_at_sha(root, gh, head);
     if pending {
         eprintln!(
             "Judge CI gate: PR #{number} skipped — CI is still running at head {} (#11971); \
@@ -327,6 +323,18 @@ fn ci_pending_at_head(root: &Path, gh: &Path, row: &Value) -> bool {
         );
     }
     pending
+}
+
+/// Whether CI is still running at head `sha` of the repository at `root`
+/// ([`super::ci_gate`]'s rule: pending, started under 6 h ago), through the
+/// per-head cache. Unreadable is not pending. The one read behind both the
+/// role-runner gate above and the step draw's Judge hold (#12042).
+pub fn ci_pending_at_sha(root: &Path, gh: &Path, sha: &str) -> bool {
+    super::ci_gate::cached(root, sha, || {
+        super::ci_gate::ci_pending(sha, chrono::Utc::now(), |path| {
+            read(root, gh, ops::CI_CHECK_RUNS_FOR_SHA, path).ok()
+        })
+    })
 }
 
 /// Judge's role-runner gate on an empty labeled listing (#9389): is there a

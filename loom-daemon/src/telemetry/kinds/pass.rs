@@ -75,6 +75,17 @@ pub const PASS_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pass.reason_set",
     "loom.pass.proposal_label",
     "loom.pass.body_hash",
+    "loom.pass.unevaluated_reason",
+    "loom.pass.unevaluated_reasons",
+    "loom.pass.budget.bucket",
+    "loom.pass.budget.remaining",
+    "loom.pass.budget.floor",
+    "loom.pass.budget.core_start",
+    "loom.pass.budget.core_end",
+    "loom.pass.budget.graphql_start",
+    "loom.pass.budget.graphql_end",
+    "loom.pass.budget.core_floor",
+    "loom.pass.budget.graphql_floor",
 ];
 
 /// `repo` value when no forge slug is known. Never a local path (#9442).
@@ -138,6 +149,32 @@ pub struct GithubSpend {
     pub not_modified: u64,
 }
 
+/// The budget readings of one pass (#12036). Start is the probe the pass
+/// already makes; end is the latest reading the forge sent back with an
+/// answer the pass already received, never a fresh probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_end: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_end: Option<u64>,
+    pub core_floor: u64,
+    pub graphql_floor: u64,
+}
+
+/// The budget reading that stopped one artifact (#12036).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassBudgetReading {
+    /// `core` or `graphql`.
+    pub bucket: String,
+    pub remaining: u64,
+    pub floor: u64,
+}
+
 /// One pass over one workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassSummaryRecord {
@@ -167,6 +204,13 @@ pub struct PassSummaryRecord {
     pub verdicts: BTreeMap<String, u64>,
     /// Skipped artifacts per reason.
     pub skipped: BTreeMap<String, u64>,
+    /// Unevaluated artifacts per `unevaluated_reason`, every reason present
+    /// (zeros included) (#12036).
+    #[serde(default)]
+    pub unevaluated_reasons: BTreeMap<String, u64>,
+    /// The budget readings the pass took; a reading it never took is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<PassBudget>,
     /// The per-pass write cap left work for the next pass.
     pub write_cap_hit: bool,
     pub github: GithubSpend,
@@ -216,6 +260,13 @@ pub struct PassVerdictRecord {
     /// failed), sanitized and truncated. Body only, never an attribute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Why an artifact went unevaluated (`budget_floor_core`,
+    /// `budget_floor_graphql`, `read_failed`, `other`) (#12036).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unevaluated_reason: Option<String>,
+    /// The budget reading behind a floor stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<PassBudgetReading>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<BlockerState>,
     /// Labels the verdict adds (planned, under dry-run).

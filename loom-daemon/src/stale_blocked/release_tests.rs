@@ -13,6 +13,7 @@ use super::batch_tests::{fleet, row, Fake};
 use super::budget::{Budget, Floor};
 use super::release::{marker, run, Config, ReleaseForge, Report};
 use super::release_gh::{gated, Mode};
+use super::release_items::{BudgetReading, UnevaluatedReason};
 use crate::comment_trust::TrustPolicy;
 use crate::operator_decision::cli::IssueState;
 use crate::park_record::apply::ParkForge;
@@ -907,4 +908,94 @@ fn a_champion_hold_on_a_pr_is_never_released_here() {
         assert_eq!(skipped(&r, "unstated"), 1, "{reason}: {}", r.summary());
         assert!(r.released.is_empty() && w.no_writes(), "{reason}");
     }
+}
+
+// --- typed unevaluated reasons (#12036) -----------------------------------------
+
+fn only_item(r: &Report, number: u64) -> &super::release_items::Item {
+    r.items.iter().find(|i| i.number == number).unwrap()
+}
+
+#[test]
+fn probe_floor_is_budget_floor_core_with_the_fixture_numbers() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &[]);
+    w.state(1, "CLOSED", false);
+    w.budget(10, 10);
+    let r = w.run();
+    let item = only_item(&r, 10);
+    assert_eq!(item.unevaluated_reason, Some(UnevaluatedReason::BudgetFloorCore));
+    let b = item.budget.unwrap();
+    assert_eq!((b.remaining, b.floor), (10, Floor::default().core));
+    assert_eq!(r.unevaluated_reasons["budget_floor_core"], 1);
+    // The phase-1 reading is kept for telemetry.
+    assert_eq!(r.cost.budget_at_start.unwrap().core_remaining, 10);
+}
+
+#[test]
+fn mid_run_core_guard_on_a_blocker_read_is_budget_floor_core() {
+    let mut w = World::new();
+    w.parked(10, false, &[1, 2], &[]);
+    w.state(1, "OPEN", false);
+    w.state(2, "OPEN", false);
+    // The first blocker read reports 10 remaining: the second is refused.
+    w.gather.core_remaining.push_back(10);
+    let r = w.run();
+    let item = only_item(&r, 10);
+    assert_eq!(item.unevaluated_reason, Some(UnevaluatedReason::BudgetFloorCore));
+    assert_eq!(
+        item.budget,
+        Some(BudgetReading {
+            bucket: super::budget::Bucket::Core,
+            remaining: 10,
+            floor: Floor::default().core,
+        })
+    );
+    let why = &r.unevaluated[0].why;
+    assert!(why.contains("declared blocker #2: budget floor reached mid-run: core remaining 10"));
+}
+
+#[test]
+fn phase_two_graphql_floor_is_budget_floor_graphql() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &[]);
+    w.state(1, "CLOSED", false);
+    w.budget(1_000_000, 10);
+    let r = w.run();
+    let item = only_item(&r, 10);
+    assert_eq!(item.verdict, super::release_items::ItemVerdict::Unevaluated);
+    assert_eq!(item.unevaluated_reason, Some(UnevaluatedReason::BudgetFloorGraphql));
+    assert_eq!(item.budget.unwrap().remaining, 10);
+    assert!(w.no_writes());
+}
+
+#[test]
+fn a_404_blocker_and_a_failed_comment_read_are_read_failed() {
+    let mut w = World::new();
+    w.parked(10, false, &[404], &[]);
+    w.parked(11, false, &[1], &[]);
+    w.state(1, "CLOSED", false);
+    w.extra.comments_fail = true;
+    let r = w.run();
+    for n in [10, 11] {
+        let item = only_item(&r, n);
+        assert_eq!(item.unevaluated_reason, Some(UnevaluatedReason::ReadFailed), "#{n}");
+        assert!(item.budget.is_none());
+    }
+    assert_eq!(r.unevaluated_reasons["read_failed"], 2);
+}
+
+#[test]
+fn a_release_candidate_makes_the_same_forge_calls_as_before() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &[]);
+    w.state(1, "CLOSED", false);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1);
+    // One phase-1 probe, one phase-2 probe: the typed reason adds neither a
+    // probe nor a read.
+    assert_eq!(w.gather.budget_calls, 2);
+    assert_eq!(w.gather.list_calls, 2);
+    assert_eq!(w.gather.state_calls.len(), 2);
+    assert_eq!(w.gather.closing_calls, vec![1]);
 }

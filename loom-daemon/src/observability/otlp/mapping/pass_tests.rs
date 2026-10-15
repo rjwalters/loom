@@ -38,6 +38,8 @@ fn summary() -> PassSummaryRecord {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
+        unevaluated_reasons: std::collections::BTreeMap::new(),
+        budget: None,
         write_cap_hit: true,
         github: GithubSpend {
             calls: 9,
@@ -66,6 +68,8 @@ fn verdict() -> PassVerdictRecord {
         verdict: "released".to_string(),
         reason: Some("no-park-record".to_string()),
         detail: Some("free text stays in the body".to_string()),
+        unevaluated_reason: None,
+        budget: None,
         blockers: vec![
             BlockerState {
                 reference: "#10753".to_string(),
@@ -362,4 +366,53 @@ fn a_step_verdict_maps_every_step_fact() {
     ] {
         assert!(!plain.contains_key(key), "a daemon pass has no {key}");
     }
+}
+
+#[test]
+fn unevaluated_reason_and_budget_attributes_are_present_when_some_absent_when_none() {
+    use crate::telemetry::kinds::pass::{PassBudget, PassBudgetReading};
+    let mut r = verdict();
+    let none = attrs(&log(TelemetryRecord::PassVerdict(r.clone())));
+    for key in [
+        "loom.pass.unevaluated_reason",
+        "loom.pass.budget.bucket",
+        "loom.pass.budget.remaining",
+        "loom.pass.budget.floor",
+    ] {
+        assert!(!none.contains_key(key), "{key}");
+    }
+    r.unevaluated_reason = Some("budget_floor_core".to_string());
+    r.budget = Some(PassBudgetReading {
+        bucket: "core".to_string(),
+        remaining: 920,
+        floor: 1000,
+    });
+    let a = attrs(&log(TelemetryRecord::PassVerdict(r)));
+    assert!(a.keys().all(|k| allowed(k)), "{:?}", a.keys());
+    assert_eq!(string(a.get("loom.pass.unevaluated_reason")), "budget_floor_core");
+    assert_eq!(string(a.get("loom.pass.budget.bucket")), "core");
+    assert_eq!(int(a.get("loom.pass.budget.remaining")), 920);
+    assert_eq!(int(a.get("loom.pass.budget.floor")), 1000);
+
+    let mut s = summary();
+    s.unevaluated_reasons = [("budget_floor_core", 2), ("other", 0)]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    s.budget = Some(PassBudget {
+        core_start: Some(1500),
+        core_end: Some(920),
+        graphql_start: None,
+        graphql_end: None,
+        core_floor: 1000,
+        graphql_floor: 1000,
+    });
+    let a = attrs(&log(TelemetryRecord::PassSummary(s)));
+    assert!(a.keys().all(|k| allowed(k)), "{:?}", a.keys());
+    assert_eq!(string(a.get("loom.pass.unevaluated_reasons")), "budget_floor_core=2,other=0");
+    assert_eq!(int(a.get("loom.pass.budget.core_start")), 1500);
+    assert_eq!(int(a.get("loom.pass.budget.core_end")), 920);
+    assert_eq!(int(a.get("loom.pass.budget.core_floor")), 1000);
+    assert!(!a.contains_key("loom.pass.budget.graphql_start"));
+    assert!(!a.contains_key("loom.pass.budget.graphql_end"));
 }

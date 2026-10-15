@@ -116,3 +116,14 @@ read is conditional (ETag), and the daemon's per-tick gate caches each
 (repo, head) answer for 60 s. A push is a new head and so a fresh read. See
 [`lease-record.md`](lease-record.md) for how a Judge pass that stood down for
 pending CI is released.
+
+**Where the gate lives under step dispatch (#12042).** Since the step-dispatch
+cutover (#11909) Judge is drawn as a step, not by the role runner, so the gate
+runs in the step tick's gather (`step_dispatch::gather::hold_ci_pending`): a
+Judge step whose PR head has pending CI, by the same rule and the same per-head
+60 s cache, is a `ci_pending` pass (weight 0, `pick.decision` skip reason
+`backoff`) and is drawn once CI concludes. At most four uncached heads are read
+per repo per tick; a head past that budget is drawn unread. If a Judge step
+still stands down for pending CI, its `noop`/`ci_pending` outcome cools the
+`(PR, judge)` pair for the 10 min refusal window, not the 1 h no-op window, so
+the next review follows CI by minutes.
