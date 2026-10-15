@@ -661,6 +661,20 @@ pub fn global_export_statuses(
         .collect()
 }
 
+/// The OTLP exporter's per-kind last-export times (Issue #12120); empty when
+/// no `otlp` exporter registered.
+#[must_use]
+pub fn global_otlp_kind_exports(
+) -> std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> {
+    GLOBAL_EXPORT_STATUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|map| map.get(ExporterKind::Otlp.name()))
+        .map(|status| status.kind_last_export())
+        .unwrap_or_default()
+}
+
 /// Process-global per-exporter queues (Issue #11124), keyed like
 /// [`GLOBAL_EXPORT_STATUSES`], so the `host.export` record can read each
 /// exporter's depth and lifetime drop count. Last-wins, for the same reason.

@@ -609,6 +609,7 @@ fn otlp_export_state_rides_a_state_labelled_gauge() {
         state: OtlpExportState::Exempt,
         detail: Some("air-gapped lab".into()),
         since: None,
+        kinds: Vec::new(),
     }))
     .unwrap();
     assert_eq!(attr(&exempt, "state").as_deref(), Some("exempt"));
@@ -618,6 +619,7 @@ fn otlp_export_state_rides_a_state_labelled_gauge() {
         state: OtlpExportState::Failing,
         detail: Some("no ack for 20m".into()),
         since: None,
+        kinds: Vec::new(),
     }))
     .unwrap();
     assert_eq!(attr(&failing, "state").as_deref(), Some("failing"));
