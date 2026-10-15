@@ -347,9 +347,9 @@ assert_allow "#7355: Allow a chained (non-fast-pathed) rg whose quoted pattern m
 #     (which would silently blind this check, the exact regression the
 #     COMMAND_ASK_SCAN_PRINTENV branch-off is designed to avoid) -----------
 assert_deny "#7355 regression: a real DDL grep (declines the fast path via a second pipe) still denies via SQL_DDL_PATTERN, unaffected by the printenv masking fix" \
-    "grep '$_HD_DDL' schema.sql | grep foo | head"
+    "sqlite3 schema.db '$_HD_DDL' | grep foo | head"
 assert_deny_env "#7355 regression: a real DDL grep with the read-only fast path disabled still denies via SQL_DDL_PATTERN" \
-    "LOOM_GUARD_READONLY_FASTPATH=0" "grep '$_HD_DDL' schema.sql"
+    "LOOM_GUARD_READONLY_FASTPATH=0" "sqlite3 schema.db '$_HD_DDL'"
 
 # --- Regression guard: a genuine LIVE printenv invocation still asks -------
 assert_ask "#7355 regression: a live (non-heredoc, non-quoted-argument) 'printenv SECRET_KEY' invocation still asks" \
