@@ -21,7 +21,7 @@
 #
 # WHAT THIS SUITE DOES
 #
-#   1. BEHAVIOUR -- champion.md's Priority 2 query and Priority 3 loop are
+#   1. BEHAVIOUR -- champion.md's Priority 2 query, Priority 3 loop and Priority 4 query are
 #      EXTRACTED and EXECUTED against a stubbed `gh`.
 #   2. BEHAVIOUR -- curator.md's send-back queue is extracted and executed, and
 #      its unanswered-marker check is executed against the hash Champion's OWN
@@ -201,6 +201,34 @@ EOF
 if [[ -s "$FIXTURE_DIR/p2.sh" ]]; then
     assert_eq "#34 #33 #32 #35 #31" "$(run_query p2.sh "$FIXTURE_DIR/levels.json" | numbers_of)" \
         "very-important, then important (oldest first), then the rest oldest first; a retired star carries no level"
+fi
+
+echo ""
+echo "Test 1c: a loom:curated proposal or epic has one owner -- Priority 2, never Priority 3/4 (#11922)"
+# `--non-item` runs Priority 3 and 4 but never Priority 2; under step dispatch
+# a curated proposal is a `--issue` Champion step. A curated issue that the
+# Priority 3/4 queries also return would be evaluated by both.
+cat >"$FIXTURE_DIR/curated-proposals.json" <<'EOF'
+[
+ {"number":40,"title":"plain architect","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:architect"}]},
+ {"number":41,"title":"curated architect","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:architect"},{"name":"loom:curated"}]},
+ {"number":42,"title":"curated hermit","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:hermit"},{"name":"loom:curated"}]},
+ {"number":43,"title":"curated auditor","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:auditor"},{"name":"loom:curated"}]},
+ {"number":44,"title":"plain epic","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:epic"}]},
+ {"number":45,"title":"curated epic","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:epic"},{"name":"loom:curated"}]}
+]
+EOF
+section_body "Priority 4: Epic Proposals" <"$CHAMPION_MD" \
+    | bash_block_with '--label="loom:epic"' >"$FIXTURE_DIR/p4.sh"
+if [[ ! -s "$FIXTURE_DIR/p3.sh" || ! -s "$FIXTURE_DIR/p4.sh" ]]; then
+    fail "could not extract champion.md's Priority 3 loop and Priority 4 query"
+else
+    assert_eq "#40" "$(run_query p3.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
+        "Priority 3 skips curated architect, hermit and auditor proposals"
+    assert_eq "#44" "$(run_query p4.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
+        "Priority 4 skips a curated epic"
+    assert_eq "#41 #42 #43 #45" "$(run_query p2.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
+        "Priority 2 still owns every curated proposal and epic (none is orphaned)"
 fi
 
 # ---------------------------------------------------------------------------
