@@ -551,6 +551,15 @@ jobs:
           git config --global user.name "Loom CI"
       - name: Assert the wired/excluded manifest invariant (#4455)
         run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
+      - name: Ensure a per-suite timeout wrapper (#11964)
+        # run-ci-suites.sh bounds each suite only through `timeout`/`gtimeout`
+        # and, in CI, now refuses to run without one: with neither, one hung
+        # suite silently ate this leg's whole 180-min cap. macOS ships neither
+        # by default; coreutils provides `gtimeout`.
+        if: runner.os == 'macOS'
+        run: |
+          command -v timeout || command -v gtimeout || brew install coreutils
+          command -v timeout || command -v gtimeout
       - name: Run the CI-wired shell test suites (UNSHARDED)
         # No LOOM_CI_SHARD: every suite runs in this one job. LOOM_CI_PARALLELISM
         # is the axis under test. LOOM_TEST_ALLOW_SYSTEMD only on Linux -- macOS
@@ -815,8 +824,14 @@ jobs:
       contents: read
       issues: write
       actions: read   # reading this run's own job list and completed-job logs
+      checks: read    # a cancelled job's check-run annotations (timeout vs cancel, #11964)
       id-token: write # the loom-ui step's OIDC token (2AMLogic/loom-ui#3319)
     steps:
+      # Only the classifier is needed: the step below is otherwise all inline.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci-daily-classify.sh
+          sparse-checkout-cone-mode: false
       - name: Open, update and close tracking issues
         env:
           GH_TOKEN: ${{ github.token }}
@@ -887,6 +902,22 @@ jobs:
                 continue ;;
             esac
 
+            # A job cut off by its own `timeout-minutes` concludes `cancelled`,
+            # which the case below leaves alone; only its check-run annotation
+            # tells it from a hand cancel (#11964). Fetched for cancelled jobs
+            # only, so normally zero or one extra REST call per night. A failed
+            # fetch leaves it `cancelled` (scripts/ci-daily-classify.sh).
+            annotations='[]'
+            if [ "$conclusion" = "cancelled" ]; then
+              annotations="$(gh api --paginate "repos/$REPO/check-runs/$job_id/annotations?per_page=100" 2>/dev/null \
+                | jq -s 'add // []' 2>/dev/null)" || annotations='[]'
+            fi
+            conclusion="$(CONCLUSION="$conclusion" ANNOTATIONS_JSON="$annotations" scripts/ci-daily-classify.sh)"
+            how="failed"
+            if [ "$conclusion" = "timed_out" ]; then
+              how="was cut off by its \`timeout-minutes\` cap"
+            fi
+
             title="${TITLE_PREFIX}${job_name}"
             number="$(jq -r --arg t "$title" \
               'map(select(.title == $t)) | (.[0].number // empty)' /tmp/open-tracking.json)"
@@ -895,8 +926,8 @@ jobs:
               failure|timed_out)
                 body_excerpt="$(excerpt "$job_id")"
                 if [ -n "$number" ]; then
-                  jq -n --arg run "$RUN_URL" --arg job "$job_url" --arg ex "$body_excerpt" \
-                    '{body: ("Still failing.\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>")}' \
+                  jq -n --arg run "$RUN_URL" --arg job "$job_url" --arg ex "$body_excerpt" --arg how "$how" \
+                    '{body: ("Still failing (the job \($how)).\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>")}' \
                     > /tmp/payload.json
                   gh api -X POST "repos/$REPO/issues/$number/comments" --input /tmp/payload.json >/dev/null
                   echo "updated #$number -- $title"
@@ -904,8 +935,8 @@ jobs:
                   updated=$((updated + 1))
                 else
                   jq -n --arg t "$title" --arg run "$RUN_URL" --arg job "$job_url" \
-                        --arg ex "$body_excerpt" --arg label "$TRACKING_LABEL" \
-                    '{title: $t, labels: [$label], body: ("The nightly `ci-daily.yml` job failed.\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>\n\nThis issue is opened, updated and closed by `.github/workflows/ci-daily.yml`. It closes itself on the next daily run in which this job is green. **Keep the title unchanged**: the workflow finds this issue by its exact title (whatever labels it carries), so a renamed issue is orphaned and a duplicate opens the next night.")}' \
+                        --arg ex "$body_excerpt" --arg label "$TRACKING_LABEL" --arg how "$how" \
+                    '{title: $t, labels: [$label], body: ("The nightly `ci-daily.yml` job \($how).\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>\n\nThis issue is opened, updated and closed by `.github/workflows/ci-daily.yml`. It closes itself on the next daily run in which this job is green. **Keep the title unchanged**: the workflow finds this issue by its exact title (whatever labels it carries), so a renamed issue is orphaned and a duplicate opens the next night.")}' \
                     > /tmp/payload.json
                   # REST, not `gh issue create`: that is GraphQL-backed, and
                   # this path also has no business going through
@@ -932,7 +963,8 @@ jobs:
                 fi
                 ;;
               *)
-                # skipped, cancelled, neutral, still-running. NOT a pass:
+                # skipped, cancelled (by hand -- a timeout is `timed_out` by
+                # now), neutral, still-running. NOT a pass:
                 # ci-principles.md rule 6. Leave any open tracking issue
                 # exactly as it is rather than closing it on a non-result.
                 echo "no result ($conclusion), leaving alone: $job_name"

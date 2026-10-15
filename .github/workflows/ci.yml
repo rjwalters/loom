@@ -722,6 +722,9 @@ jobs:
       - name: Test the CI Result aggregate gate (#10444)
         if: ${{ !cancelled() }}
         run: bash scripts/test-ci-result-gate.sh
+      - name: Test the ci-daily timeout classifier and report wiring (#11964)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-ci-daily-classify.sh
       - name: Test the image-input detection and the image gate wiring (#10825)
         if: ${{ !cancelled() }}
         run: bash scripts/test-ci-image-inputs.sh
