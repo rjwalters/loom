@@ -527,6 +527,15 @@ pub enum MetricName {
     /// (`mirror`, `events`, `created`, `none`), #11897: the step engine's stage-age coverage.
     #[serde(rename = "loom.stage_entry.lookups")]
     StageEntryLookups,
+    /// Public-feed `completion` envelopes the narration sink built, by
+    /// `kind` (the trigger: `sweep_exit`, `step`, `reconcile`) and `outcome`
+    /// (`narrated`, or `seeded` for a fresh host's silent first pass), #12152.
+    #[serde(rename = "loom.feed.completions")]
+    FeedCompletions,
+    /// Merge-reconciliation passes, by `outcome` (`ran`, `deferred` while the
+    /// rate-limit breaker cools, `failed` when the forge read failed), #12152.
+    #[serde(rename = "loom.feed.reconcile_passes")]
+    FeedReconcilePasses,
 }
 
 impl MetricName {
@@ -609,6 +618,8 @@ impl MetricName {
             Self::ForgeMirrorChanges => "loom.forge.mirror.changes",
             Self::ForgeMirrorWakeLatency => "loom.forge.mirror.wake_latency",
             Self::StageEntryLookups => "loom.stage_entry.lookups",
+            Self::FeedCompletions => "loom.feed.completions",
+            Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
         }
     }
 
@@ -648,7 +659,9 @@ impl MetricName {
             | Self::ForgeMirrorReads
             | Self::ForgeMirrorChanges
             | Self::ForgeMirrorWakeLatency
-            | Self::StageEntryLookups => MetricKind::DeltaCounter,
+            | Self::StageEntryLookups
+            | Self::FeedCompletions
+            | Self::FeedReconcilePasses => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -712,6 +725,8 @@ impl MetricName {
             Self::ForgeMirrorChanges => "{change}",
             Self::ForgeMirrorWakeLatency => "s",
             Self::StageEntryLookups => "{lookup}",
+            Self::FeedCompletions => "{completion}",
+            Self::FeedReconcilePasses => "{pass}",
             _ => "By",
         }
     }
@@ -841,6 +856,12 @@ impl MetricName {
             }
             Self::StageEntryLookups => {
                 "Stage-entry times the step engine looked up, by repo and answering source (kind)."
+            }
+            Self::FeedCompletions => {
+                "Public-feed completions the narration sink built, by trigger (kind) and outcome."
+            }
+            Self::FeedReconcilePasses => {
+                "Merge-reconciliation passes of the narration sink, by outcome."
             }
         }
     }

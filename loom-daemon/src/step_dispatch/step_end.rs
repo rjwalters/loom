@@ -14,7 +14,10 @@
 //!    ([`outcome_ledger::parse_outcome_line`]);
 //! 4. [`outcome_ledger::classify`] the two, and record the result
 //!    ([`SweepRegistry::record_step_outcome`]), which arms the cooldowns the
-//!    next draw reads.
+//!    next draw reads;
+//! 5. publish `step.item.{N}.ended` ([`SweepRegistry::emit_step_ended`],
+//!    #12152), the step's terminal bus event, from which the narration sink
+//!    narrates a merged PR's public-feed `completion`.
 //!
 //! # The post-state per role
 //!
@@ -180,6 +183,9 @@ pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
             crate::operator_decision::cli::GhForge::new(root.to_path_buf(), Some(slug.clone()));
         if let Ok(mut reg) = registry.lock() {
             reg.record_step_outcome(&run, &mut forge);
+            // #12152: the step's terminal bus event (the narration sink's
+            // completion trigger for a merged PR).
+            reg.emit_step_ended(&run);
         }
     }
 }

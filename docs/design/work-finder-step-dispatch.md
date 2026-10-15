@@ -242,7 +242,7 @@ The stalled and idle rules key on `loom.step.actionable{repo}`, which every disp
 
 - **No flag, no shadow, no pilot** (ruling 8). The cutover merge replaces the tick; the release that carries it goes to every host.
 - **Fix forward.** The alerts in §7 are the watch.
-- **Rollback** is reverting the cutover merge, which restores the `loom:issue` finder and the item-role intervals. Forge-side parks stay where they are; `release-stale-blocked` owns them.
+- **Rollback** is reverting the cutover merge, which restores the `loom:issue` finder and the item-role intervals. Forge-side parks stay where they are until a human, Guide or Champion lifts them (the release pass was removed, #11301).
 - **Prerequisite (met).** #11861 made `loom:operator` an all-role no-op and removed the work finder's PR-lane carve-out, so no other path acts on held PRs that the engine passes.
 
 ## 9. Open items

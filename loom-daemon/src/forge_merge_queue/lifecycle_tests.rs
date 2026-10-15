@@ -661,19 +661,6 @@ fn deny_reasons_name_the_check_failure() {
 }
 
 #[test]
-fn redate_is_refused_in_queue_mode() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
-    let cfg = dir.path().join(".loom/config.json");
-    std::fs::write(&cfg, r#"{"champion":{"mergeMode":"direct"}}"#).unwrap();
-    assert!(redate_permitted(dir.path()).is_ok());
-    std::fs::write(&cfg, r#"{"champion":{"mergeMode":"queue"}}"#).unwrap();
-    assert!(redate_permitted(dir.path())
-        .unwrap_err()
-        .contains("never pushes"));
-}
-
-#[test]
 fn parses_github_shapes() {
     let pr = r#"{"state":"closed","merged":true,"merged_at":"2026-10-06T11:00:00Z",
         "head":{"sha":"abc"},"labels":[{"name":"loom:pr"}]}"#;
