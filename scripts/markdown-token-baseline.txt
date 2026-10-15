@@ -47,8 +47,9 @@
 9898 defaults/.claude/commands/loom/hermit-patterns.md
 5823 defaults/.claude/commands/loom/hermit.md
 4072 defaults/.claude/commands/loom/imagine.md
+1487 defaults/.claude/commands/loom/judge-ci-red.md
 2162 defaults/.claude/commands/loom/judge-reference.md
-39873 defaults/.claude/commands/loom/judge.md
+39694 defaults/.claude/commands/loom/judge.md
 316 defaults/.claude/commands/loom/loom-iteration.md
 254 defaults/.claude/commands/loom/loom-parent.md
 9432 defaults/.claude/commands/loom/loom.md
