@@ -107,3 +107,104 @@ fn the_ladder_and_the_red_fix_marker_are_read_from_bodies() {
     assert!(has_red_fix_marker(Some("text\n<!-- loom:main-red-fix -->\n")));
     assert!(!has_red_fix_marker(Some("quoting <!-- loom:main-red-fix --> inline")));
 }
+
+// ------------------------------------------------- the Judge CI hold (#12042)
+
+mod ci_hold {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::{json, Value};
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap()
+    }
+
+    /// One check run in `status`, started `hours_ago`.
+    fn checks(status: &str, hours_ago: i64) -> Value {
+        let started = (now() - chrono::Duration::hours(hours_ago)).to_rfc3339();
+        json!({"total_count": 1, "check_runs": [{"status": status, "started_at": started}]})
+    }
+
+    /// `pr_planning::ci_pending` (the #12003 rule) over a fixed forge.
+    fn forge(page: Value) -> impl FnMut(&str) -> bool {
+        move |sha: &str| {
+            crate::pr_planning::ci_pending(sha, now(), |path| {
+                Some(if path.contains("/status?") {
+                    json!({"state": "success", "statuses": []})
+                } else {
+                    page.clone()
+                })
+            })
+        }
+    }
+
+    /// A review-requested PR (a Judge step) and a curated issue.
+    fn judge_and_issue() -> Vec<Item> {
+        let rows = vec![
+            row(5, &["loom:review-requested"], "", true),
+            row(2, &["loom:curated"], "", false),
+        ];
+        let items = classify_rows(&rows, &IssueFacts::default());
+        assert!(items.iter().any(|i| i.step() == Some(Step::Judge)), "{items:?}");
+        items
+    }
+
+    fn judge(items: &[Item]) -> Verdict {
+        items.iter().find(|i| i.pr == Some(5)).unwrap().verdict
+    }
+
+    fn heads() -> HashMap<u32, String> {
+        HashMap::from([(5, HEAD.to_string())])
+    }
+
+    #[test]
+    fn a_judge_step_with_ci_running_is_not_drawn() {
+        let mut items = judge_and_issue();
+        let held =
+            hold_ci_pending(&mut items, &heads(), 4, |_| None, forge(checks("in_progress", 1)));
+        assert_eq!(held, 1);
+        assert_eq!(judge(&items), Verdict::Pass(PassReason::CiPending));
+        assert_eq!(PassReason::CiPending.as_str(), "ci_pending");
+        assert!(
+            items
+                .iter()
+                .any(|i| i.issue == Some(2) && i.step().is_some()),
+            "only the Judge step is held"
+        );
+    }
+
+    #[test]
+    fn it_is_drawn_once_ci_concludes() {
+        let mut items = judge_and_issue();
+        let held =
+            hold_ci_pending(&mut items, &heads(), 4, |_| None, forge(checks("completed", 1)));
+        assert_eq!(held, 0);
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+    }
+
+    #[test]
+    fn ci_pending_past_the_six_hour_cap_is_drawn() {
+        let mut items = judge_and_issue();
+        let held = hold_ci_pending(&mut items, &heads(), 4, |_| None, forge(checks("queued", 7)));
+        assert_eq!(held, 0, "a run stuck past 6 h no longer holds the PR");
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+    }
+
+    #[test]
+    fn a_cached_answer_is_used_and_reads_are_budgeted() {
+        let mut items = judge_and_issue();
+        let held = hold_ci_pending(&mut items, &heads(), 4, |_| Some(true), |_| panic!("no read"));
+        assert_eq!(held, 1, "a cached pending answer holds without a read");
+
+        let mut items = judge_and_issue();
+        let held = hold_ci_pending(&mut items, &heads(), 0, |_| None, |_| panic!("no read"));
+        assert_eq!(held, 0, "past the budget the step is drawn unread");
+        assert_eq!(judge(&items), Verdict::Step(Step::Judge));
+
+        let mut items = judge_and_issue();
+        let held = hold_ci_pending(&mut items, &HashMap::new(), 4, |_| None, |_| panic!("no read"));
+        assert_eq!(held, 0, "a PR with no known head is drawn unread");
+    }
+}
