@@ -112,7 +112,7 @@ fn attach_renews_only_a_live_own_lease_and_never_posts() {
     assert_eq!(ctx(dir.path(), pre.clone()).attach(), EXIT_HELD);
     let peer = daemon(Role::Doctor, "step-doctor-77-2", StepRole::Doctor);
     assert_eq!(ctx(dir.path(), peer).attach(), EXIT_PEER);
-    assert_eq!(ctx(dir.path(), pre.clone()).release(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), pre.clone()).release(None), EXIT_HELD);
     assert_eq!(ctx(dir.path(), pre).attach(), EXIT_EXPIRED, "a released lease stays gone");
     assert_eq!(posted(dir.path()).len(), 1, "only the pre-claim ever posted");
 }

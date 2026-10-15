@@ -627,7 +627,8 @@ comment id, and renews yours while your session lives
   "label-only" — stand down before any worktree or label action; next PR.
 - **fence** is in the Verdict-Time CAS Recheck below and before every push.
 - **release** after the verdict write or any stand-down:
-  `loom-daemon lease pr release <n> --role judge --watch-pid …`.
+  `loom-daemon lease pr release <n> --role judge --watch-pid …`
+  (pending CI: `--skip-reason ci-pending`).
 
 ### Verdict-Time CAS Recheck (MANDATORY immediately before every verdict-label write)
 
@@ -1371,20 +1372,21 @@ If the PR has merge conflicts (`mergeStateStatus` is `DIRTY`), **attempt the aut
 
 ### When CI is Pending
 
-If checks are still running, **do not block on them and do not approve on a guess.** In batch mode there is no "wait" — waiting stalls the whole queue.
+If checks are still running, **do not block on them or approve on a guess**: in batch mode, waiting stalls the whole queue.
 
-1. **Do not apply an end-state label** — leave `loom:review-requested` in place (do NOT add `loom:pr` or `loom:changes-requested`); the PR must stay in the review queue.
-2. **Release your claim** — remove `loom:reviewing` so a later pass picks it up cleanly.
-3. **Skip and continue the batch** — move on to the next PR. The next cron tick re-evaluates this PR once CI has settled.
+1. **No end-state label** — leave `loom:review-requested` (no `loom:pr` / `loom:changes-requested`); the PR stays queued.
+2. **Release your claim** — remove `loom:reviewing`; release the lease with `--skip-reason ci-pending` (below).
+3. **Skip and continue the batch** — next PR; a later tick re-evaluates this one once CI settles.
 
 **Pending-CI skip check.** `loom-daemon forge wait-checks <PR_NUMBER> --timeout 0` is a single ETag'd poll (no wait) that also handles the empty-rollup trap (#6169). Branch on the first **stdout** line:
 
 ```bash
 first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 0 2>/dev/null | head -n1)"
 case "$first" in
-  LOOM-CHECKS-TIMEOUT*)   # still pending: release the claim and skip (no end-state label)
-    gh pr comment <number> --body "CI is still running. Releasing the claim and skipping — a later tick will review once CI settles."
-    gh pr edit <number> --remove-label "loom:reviewing"   # PR stays loom:review-requested; continue to the next PR
+  LOOM-CHECKS-TIMEOUT*)   # still pending: release and skip; PR stays loom:review-requested
+    gh pr comment <number> --body "CI still running; skipping until it settles."
+    gh pr edit <number> --remove-label "loom:reviewing"
+    loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" --skip-reason ci-pending
     ;;
   LOOM-CHECKS-RED*) ;;    # "When CI Fails"
   LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;
