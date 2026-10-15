@@ -559,7 +559,7 @@ check is external and the daemon says so instead of implying otherwise.
 ## 3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)
 
 A daemon that does not export to SigNoz looks healthy everywhere else, so the
-condition is a first-class health check with four states, shown on the
+condition is a first-class health check with five states, shown on the
 `OTLP export:` line of `loom-daemon status`, as `otlp_export` in
 `status --json`, and as `otlp_export` on the `host.health` record:
 
@@ -570,7 +570,9 @@ condition is a first-class health check with four states, shown on the
 | `ok` | The last successful export is recent (a fresh exporter gets the window as startup grace). |
 | `exempt` | The host opted out; the reason is shown. |
 
-Precedence is `exempt`, `no_exporter`, `failing`, `ok`. A line is logged at
+| `silent_kinds` | The exporter works, but a record kind the host should be producing has not been exported for 24h (Issue #12120; see below). |
+
+Precedence is `exempt`, `no_exporter`, `failing`, `silent_kinds`, `ok`. A line is logged at
 daemon start and on each change of state, never per tick: WARN for `no_exporter`
 and `failing`, INFO for recovery to `ok` and entry into `exempt`.
 
@@ -584,6 +586,19 @@ entry counts as `no_exporter`. A degraded start — no OTLP entry starts and the
 host is not exempt — logs one ERROR line, `observability: DEGRADED — this
 daemon's facts are not reaching SigNoz: <detail>`, and the daemon still starts
 (`otlp_health::startup_verdict`; the start policy itself is #11526).
+
+**Per-kind silence (Issue #12120).** While an `otlp` exporter runs, `otlp_export.kinds`
+(in `status --json` and on `host.health`) lists each OTLP-carried kind with its
+`last_export_at` and a `silent` flag; `silent_kinds` makes the `status` line read
+`otlp: silent_kinds … (no export for 24h+ from: <kinds>)`. The data is the local
+exporter's own record of acked envelopes, in memory only (no SigNoz query). A kind is
+silent when `now - (last_export_at, else exporter start)` exceeds its threshold, so a
+restart never reads as "never exported" and cannot flag a host in its first 24h.
+Thresholds are one static table, `telemetry/kinds/kind_silence.rs` (`KIND_SILENCE`; no
+config keys): `host.health`, `host.export` and `tokens.snapshot` fire every collector
+tick and get 24h; activity-driven or failure-only kinds are `None` (never flagged); a
+kind with no row defaults to 24h. A host with no `otlp` exporter reports
+`no_exporter` with no `kinds`, and no error.
 
 ```json
 { "observability": {
@@ -828,7 +843,8 @@ same facts per call (#10343): `github.http.{status,not_modified,requests,source}
 the bucket join keys `github.{resource,account,cred_owner,role}`. Since
 #10752 a span also carries `github.repo`, a write carries `github.number`, and
 a call made by a daemon pass inside its caller scope carries `github.caller`
-(the `loom:blocked` release pass: `stale_blocked_release`). Since #11407
+(for example `stale_blocked_release`, the retired `loom:blocked` release
+pass, #11301). Since #11407
 every span also names the endpoint: `github.route` (a template such as
 `/repos/{owner}/{repo}/pulls/{n}`, from the same finite table as gh-shim's
 `github.api.route`), `http.request.method`, and `github.command` (`pr view`

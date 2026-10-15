@@ -151,7 +151,6 @@ pub(crate) mod reconcile_stack;
 pub(crate) mod release_explain;
 pub(crate) mod release_fetch;
 pub(crate) mod release_resolve;
-mod release_stale_blocked;
 pub(crate) mod restart;
 mod resync_payload_cmd;
 mod resync_pin_cmd;

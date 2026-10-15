@@ -22,8 +22,8 @@
 //!    a timing finding is handed to
 //!    [`loom_daemon::dep_classify::cli::migrate_escalation`]: blockers closed
 //!    → the hold comes off (Pass 0's un-escalation, one last time); blockers
-//!    still open → `loom:blocked` + one park record per blocker, and the
-//!    stale-blocked release pass lifts it when they close.
+//!    still open → `loom:blocked` + one park record per blocker, which stays
+//!    until a human, Guide or Champion lifts it once they close (#11301).
 //! 3. **No-op holds (#12024).** An issue the daemon's no-op hold (#10156)
 //!    parked as a human gate, before #12024, carries `loom:operator` and a
 //!    trusted hold notice (`<!-- loom:noop-hold-kind=hold (#10156) -->`) with
