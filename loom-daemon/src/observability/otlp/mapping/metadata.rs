@@ -30,6 +30,7 @@ pub(super) fn role_tick_result_str(result: RoleTickResult) -> &'static str {
         RoleTickResult::SkippedModelRuntimeMismatch => "skipped_model_runtime_mismatch",
         RoleTickResult::SkippedLoad => "skipped_load",
         RoleTickResult::SkippedQueueEmpty => "skipped_queue_empty",
+        RoleTickResult::SkippedDeferred => "skipped_deferred",
     }
 }
 

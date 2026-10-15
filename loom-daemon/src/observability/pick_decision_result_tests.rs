@@ -263,3 +263,15 @@ fn the_result_is_exported_only_through_a_configured_sink() {
         emit_work_finder(&summary, at(), at(), (None, &[], None), &[], "dispatched");
     });
 }
+
+/// #12083: a tick the rate-limit breaker skipped whole is a record that names
+/// why, with no candidates and nothing observed.
+#[test]
+fn a_rate_limit_skipped_tick_is_a_named_empty_record() {
+    let record = skipped_work_finder_record("host-a", at(), RATE_LIMIT_HELD);
+    assert_eq!(record.role, crate::telemetry::kinds::pick_decision::WORK_FINDER_ROLE);
+    assert_eq!(record.outcome, "skipped");
+    assert_eq!(record.dispatch_result.as_deref(), Some("rate_limit_held"));
+    assert!(record.candidates.is_empty() && record.skipped.is_empty());
+    assert!(!record.decisions_observed);
+}
