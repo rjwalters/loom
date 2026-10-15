@@ -255,11 +255,24 @@ fn the_marker_records_what_the_daemon_runs_with() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_marker_prefers_the_running_daemons_own_env() {
-    // This test process stands in for the daemon: its exec-time env has PATH.
-    let pid = std::process::id().to_string();
-    assert!(proc_env_value(&pid, "PATH").is_some_and(|v| !v.is_empty()));
-    assert_eq!(proc_env_value("not-a-pid", "PATH"), None);
+    // A child stands in for the started daemon. Its exec-time env, read from
+    // /proc/<pid>/environ, carries LOOM_WORK_FINDER=1, and that beats a
+    // drop-in's 0. The test's own env is never compared: a harness can change
+    // it after exec, and /proc does not follow.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .env("LOOM_WORK_FINDER", "1")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id().to_string();
     let dropin_off = layer([Some("0"), None], [None, None]);
-    let want = std::env::var("PATH").unwrap_or_default();
-    assert_eq!(effective_marker_value(Some(&pid), &dropin_off, "PATH"), want);
+    let seen = effective_marker_value(Some(&pid), &dropin_off, "LOOM_WORK_FINDER");
+    let unset = proc_env_value(&pid, "LOOM_NOT_SET_11951");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(seen, "1", "the daemon's own env beats the drop-in");
+    assert_eq!(unset, None);
+    assert_eq!(proc_env_value("not-a-pid", "PATH"), None);
+    // With no readable /proc entry, the drop-in decides.
+    assert_eq!(effective_marker_value(Some("999999999"), &dropin_off, "LOOM_WORK_FINDER"), "0");
 }
