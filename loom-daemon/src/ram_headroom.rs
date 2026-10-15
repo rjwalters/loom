@@ -295,7 +295,7 @@ pub fn ram_headroom_limit_tick(
     roots: &[std::path::PathBuf],
 ) -> (usize, Option<RamBudget>) {
     let (scopes, in_flight) = crate::ram_peaks::live_scopes(pool, roots);
-    crate::ram_peaks::record_tick(&scopes);
+    crate::ram_peaks::record_tick(&scopes, roots);
     ram_headroom_limit_for(roots, &in_flight)
 }
 

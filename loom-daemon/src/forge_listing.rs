@@ -175,6 +175,25 @@ pub fn list_issues_cached_as(
         .map(|page| page.rows)
 }
 
+/// [`list_issues_cached_as`] as an **Observability** read
+/// ([`crate::forge_identity::ReadClass::Observability`], #12193): when no
+/// reader can serve it the read is shed, not retried on the writer, and the
+/// call fails with [`store::ReadShed`] (downcast the error to tell it from a
+/// failure). For telemetry samplers only; a gating read keeps
+/// [`list_issues_cached_as`].
+pub fn list_issues_cached_observability_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<Vec<RestIssue>> {
+    let site = issue_list(caller).deferrable(crate::forge_identity::ReadClass::Observability);
+    list_issues_cached_retrying(site, gh_bin, cwd, repo_override, label, state, None)
+        .map(|page| page.rows)
+}
+
 /// Most pages [`list_issues_cached_all_as`] reads.
 pub const MAX_PAGES: u32 = 10;
 
@@ -257,7 +276,42 @@ pub fn list_open_issues_cached_all_as(
     cwd: Option<&Path>,
     repo_override: Option<&str>,
 ) -> Result<Vec<RestIssue>> {
-    let site = issue_list(caller).deferrable(crate::forge_identity::ReadClass::Hygiene);
+    list_open_issues_walk(
+        caller,
+        gh_bin,
+        cwd,
+        repo_override,
+        crate::forge_identity::ReadClass::Hygiene,
+    )
+}
+
+/// [`list_open_issues_cached_all_as`] as an **Observability** read (#12193):
+/// shed on every exhaust cause while a reader pool exists, never retried on
+/// the writer. For telemetry samplers (`stage_dwell`); the intake pass keeps
+/// the Hygiene class.
+pub fn list_open_issues_cached_all_observability_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+) -> Result<Vec<RestIssue>> {
+    list_open_issues_walk(
+        caller,
+        gh_bin,
+        cwd,
+        repo_override,
+        crate::forge_identity::ReadClass::Observability,
+    )
+}
+
+fn list_open_issues_walk(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    class: crate::forge_identity::ReadClass,
+) -> Result<Vec<RestIssue>> {
+    let site = issue_list(caller).deferrable(class);
     walk_pages(
         site,
         gh_bin,

@@ -6,6 +6,7 @@ mod auto_update;
 mod backlog_level;
 mod checkout_external_change;
 mod ci;
+mod daemon_exit;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
@@ -19,6 +20,7 @@ mod outcome_facts;
 mod pass;
 mod pick_decision;
 mod role_draw;
+mod scope_memory;
 mod session_output;
 mod token_ranking;
 mod tokens_snapshot;
@@ -341,6 +343,11 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(gated_pool) = &r.gated_pool {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
+            // #12028: why a failed tick failed, from the closed vocabulary only.
+            if let Some(class) = &r.failure_class {
+                attributes
+                    .push(kv_string(crate::observability::lifecycle::FAILURE_CLASS, class.clone()));
+            }
             attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
             // #11906: a step-engine step, never a role-runner tick.
             if let Some(source) = &r.source {
@@ -605,6 +612,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::BacklogLevel(_)
+        | TelemetryRecord::DaemonExit(_)
+        | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
@@ -619,7 +628,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
-                .or_else(|| backlog_level::log_parts(r))?;
+                .or_else(|| backlog_level::log_parts(r))
+                .or_else(|| daemon_exit::log_parts(r))
+                .or_else(|| scope_memory::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);

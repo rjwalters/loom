@@ -34,6 +34,19 @@
 //! processes run in (their `/proc/<pid>/cwd`), else to
 //! [`UNATTRIBUTED_REPO`], whose expected peak falls back to the host's worst
 //! observed repo peak until it has a history of its own.
+//!
+//! # The applied limit, and clipped peaks (#12241)
+//!
+//! Each sample also reads the scope's `memory.max` (the `MemoryMax` that
+//! `loom-daemon ram-scope-limit` put on it, or none) and the `max` /
+//! `oom_kill` counters of `memory.events`. When the scope ends they are
+//! exported with its peak (`scope.memory` record, `loom.agent_scope.oom_kills`
+//! counter). A scope with a limit whose peak reached it, or that hit it at
+//! all (`memory.events` `max` or `oom_kill`), is **clipped**: `memory.peak`
+//! cannot exceed `memory.max`, so its peak is the cap, not the build's real
+//! need. The flag is a signal only: a clipped peak is still folded into the
+//! history (a lower bound that lets the derived cap grow), and how history
+//! should treat it is #11094's to decide.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -88,11 +101,189 @@ pub struct InFlight {
     /// Consecutive ticks the scope's cgroup could not be read.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unreadable_ticks: u32,
+    /// The scope's `memory.max` at its last sample; `None` = no limit (#12241).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<u64>,
+    /// `memory.events` `max`: times usage hit the limit (#12241).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub events_max: u64,
+    /// `memory.events` `oom_kill`: processes OOM-killed inside the scope.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub oom_kills: u64,
+}
+
+impl InFlight {
+    /// Whether this scope's peak is clipped at its limit ([`is_clipped`]).
+    #[must_use]
+    pub fn clipped(&self) -> bool {
+        is_clipped(
+            self.peak_bytes,
+            self.limit_bytes,
+            MemoryEvents {
+                max: self.events_max,
+                oom_kill: self.oom_kills,
+            },
+        )
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+/// The `memory.events` counters that say a scope ran into its limit (#12241).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryEvents {
+    /// Times the scope's usage hit `memory.max`.
+    pub max: u64,
+    /// Processes the kernel OOM-killed inside the scope.
+    pub oom_kill: u64,
+}
+
+/// Parse a cgroup v2 `memory.events` file (`<key> <count>` lines). Unknown
+/// keys and garbage lines are ignored; a missing key counts as `0`.
+#[must_use]
+pub fn parse_memory_events(contents: &str) -> MemoryEvents {
+    let mut out = MemoryEvents::default();
+    for line in contents.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(key), Some(value), None) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let Ok(n) = value.parse::<u64>() else {
+            continue;
+        };
+        match key {
+            "max" => out.max = n,
+            "oom_kill" => out.oom_kill = n,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A scope's peak is **clipped** when a limit applied and the peak reached it,
+/// or the scope hit it at all (`max` or `oom_kill` events): the kernel kept
+/// usage at or under `memory.max`, so `memory.peak` is the cap, not the real
+/// need. Without a limit it is never clipped: cgroup v2 `oom_kill` also counts
+/// kills by the global OOM killer, and such a scope's peak is genuine.
+#[must_use]
+pub fn is_clipped(peak_bytes: u64, limit_bytes: Option<u64>, events: MemoryEvents) -> bool {
+    limit_bytes.is_some_and(|l| peak_bytes >= l || events.max > 0 || events.oom_kill > 0)
+}
+
+/// One read of a scope's cgroup memory files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScopeSample {
+    pub peak: u64,
+    pub current: u64,
+    /// `memory.max`; `None` when it is `max` (no limit) or unreadable.
+    pub limit: Option<u64>,
+    pub events: MemoryEvents,
+}
+
+impl From<(u64, u64)> for ScopeSample {
+    fn from((peak, current): (u64, u64)) -> Self {
+        Self {
+            peak,
+            current,
+            ..Self::default()
+        }
+    }
+}
+
+/// Where a scope's applied `MemoryMax` came from (#12241), as
+/// `ram-scope-limit` decides it: an explicit value (`env`, `config`), derived
+/// from the repo's peak history (`history`), the derived value's floor
+/// (`floor`), or no limit (`none`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LimitSource {
+    Env,
+    /// An explicit limit from the `autonomous.agentMemoryMax` config key.
+    /// Not produced yet: see [`classify_limit`].
+    Config,
+    History,
+    Floor,
+    None,
+}
+
+impl LimitSource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Config => "config",
+            Self::History => "history",
+            Self::Floor => "floor",
+            Self::None => "none",
+        }
+    }
+}
+
+/// `ram-scope-limit`'s default floor for a derived limit, MiB.
+pub const SCOPE_LIMIT_DEFAULT_FLOOR_MB: u64 = 4096;
+
+const MIB: u64 = 1024 * 1024;
+
+/// Classify an applied scope limit: no limit is `none`; a limit equal to the
+/// explicit MiB value (`explicit_mb`, from `LOOM_SWEEP_MEMORY_MAX`) is `env`;
+/// one equal to the floor is `floor`; any other is `history` (derived from the
+/// repo's peak).
+///
+/// TODO(#12246): once `autonomous.agentMemoryMax` lands
+/// (`loom_daemon::ram_scope_limit::resolve_process`), an explicit value that
+/// came from a config tier should classify as [`LimitSource::Config`].
+#[must_use]
+pub fn classify_limit(
+    limit_bytes: Option<u64>,
+    explicit_mb: Option<u64>,
+    floor_mb: u64,
+) -> LimitSource {
+    let Some(limit) = limit_bytes else {
+        return LimitSource::None;
+    };
+    let mb = limit / MIB;
+    if limit % MIB == 0 && explicit_mb == Some(mb) {
+        LimitSource::Env
+    } else if limit % MIB == 0 && mb == floor_mb {
+        LimitSource::Floor
+    } else {
+        LimitSource::History
+    }
+}
+
+/// [`classify_limit`] against this process's `LOOM_SWEEP_MEMORY_MAX` and
+/// `LOOM_SWEEP_MEMORY_MAX_MIN_MB` (the daemon's env is the env
+/// `spawn-claude.sh` and `ram-scope-limit` inherit).
+#[must_use]
+pub fn classify_limit_from_env(limit_bytes: Option<u64>) -> LimitSource {
+    let get = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    let explicit = get("LOOM_SWEEP_MEMORY_MAX").filter(|&v| v > 0);
+    let floor = get("LOOM_SWEEP_MEMORY_MAX_MIN_MB").unwrap_or(SCOPE_LIMIT_DEFAULT_FLOOR_MB);
+    classify_limit(limit_bytes, explicit, floor)
+}
+
+/// The role an ended scope ran: the live role run's role
+/// ([`attach_roles`]), else `sweep` for an issue-lock scope, else `unknown`.
+/// Never parsed from the unit name, so a label value is always a known role.
+#[must_use]
+pub fn scope_role(role: Option<&str>, issue: Option<u32>) -> String {
+    match role.filter(|r| !r.is_empty()) {
+        Some(r) => r.to_string(),
+        None if issue.is_some() => "sweep".to_string(),
+        None => "unknown".to_string(),
+    }
 }
 
 /// On-disk state: rolling peak history per repo plus the live scopes.
@@ -131,6 +322,18 @@ pub struct EndedScope {
     pub issue: Option<u32>,
     pub role: Option<String>,
     pub peak_bytes: u64,
+    /// The scope's `memory.max` at its last sample (#12241).
+    pub limit_bytes: Option<u64>,
+    /// Its `memory.events` counters at its last sample.
+    pub events: MemoryEvents,
+}
+
+impl EndedScope {
+    /// Whether the recorded peak is clipped at the limit ([`is_clipped`]).
+    #[must_use]
+    pub fn clipped(&self) -> bool {
+        is_clipped(self.peak_bytes, self.limit_bytes, self.events)
+    }
 }
 
 /// A live agent scope handed to [`observe`].
@@ -309,8 +512,18 @@ pub fn observe(
     live: &[LiveScope],
     read: impl Fn(&str) -> Option<(u64, u64)>,
 ) -> Vec<EndedScope> {
+    observe_samples(store, live, |s| read(s).map(ScopeSample::from))
+}
+
+/// [`observe`] with full [`ScopeSample`]s: the limit and `memory.events`
+/// counters ride along to the ended scope (#12241).
+pub fn observe_samples(
+    store: &mut Store,
+    live: &[LiveScope],
+    read: impl Fn(&str) -> Option<ScopeSample>,
+) -> Vec<EndedScope> {
     for l in live {
-        let Some((peak, current)) = read(&l.scope) else {
+        let Some(sample) = read(&l.scope) else {
             let expired = store.inflight.get_mut(&l.scope).is_some_and(|f| {
                 f.unreadable_ticks = f.unreadable_ticks.saturating_add(1);
                 f.unreadable_ticks >= MAX_UNREADABLE_TICKS
@@ -322,16 +535,23 @@ pub fn observe(
             }
             continue;
         };
-        let prev_peak = store.inflight.get(&l.scope).map_or(0, |f| f.peak_bytes);
+        let prev = store.inflight.get(&l.scope);
+        let prev_peak = prev.map_or(0, |f| f.peak_bytes);
+        // `memory.events` counters are monotonic; never let a reset read lose one.
+        let events_max = sample.events.max.max(prev.map_or(0, |f| f.events_max));
+        let oom_kills = sample.events.oom_kill.max(prev.map_or(0, |f| f.oom_kills));
         store.inflight.insert(
             l.scope.clone(),
             InFlight {
                 repo: l.repo.clone(),
                 issue: l.issue,
-                peak_bytes: peak.max(prev_peak),
-                current_bytes: current,
+                peak_bytes: sample.peak.max(prev_peak),
+                current_bytes: sample.current,
                 role: l.role.clone(),
                 unreadable_ticks: 0,
+                limit_bytes: sample.limit,
+                events_max,
+                oom_kills,
             },
         );
     }
@@ -349,6 +569,11 @@ pub fn observe(
         fold_history(store, &f);
         ended.push(EndedScope {
             scope,
+            limit_bytes: f.limit_bytes,
+            events: MemoryEvents {
+                max: f.events_max,
+                oom_kill: f.oom_kills,
+            },
             repo: f.repo,
             issue: f.issue,
             role: f.role,
@@ -488,6 +713,24 @@ pub fn read_scope(slice_dir: &Path, scope: &str) -> Option<(u64, u64)> {
     Some((peak, current))
 }
 
+/// Read a full [`ScopeSample`] of `scope` under `slice_dir`: [`read_scope`]
+/// plus `memory.max` (`max` or unreadable = no limit) and `memory.events`
+/// (unreadable = zero counters) (#12241).
+#[must_use]
+pub fn read_scope_sample(slice_dir: &Path, scope: &str) -> Option<ScopeSample> {
+    let (peak, current) = read_scope(slice_dir, scope)?;
+    let dir = slice_dir.join(scope);
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
+    Some(ScopeSample {
+        peak,
+        current,
+        limit: read("memory.max").and_then(|s| parse_cgroup_bytes(&s)),
+        events: read("memory.events")
+            .map(|s| parse_memory_events(&s))
+            .unwrap_or_default(),
+    })
+}
+
 /// Agent scope units directly under `slice_dir`: every `loom-agent-*.scope`
 /// directory except `spawn-claude.sh`'s probe scopes, sorted.
 #[must_use]
@@ -569,18 +812,31 @@ pub fn discover_scopes(
 /// Emit the per-scope peak as telemetry (metric + log line). Only
 /// [`record_tick`]'s Linux branch calls it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn emit_ended(e: &EndedScope) {
+fn emit_ended(e: &EndedScope, roots: &[PathBuf]) {
     let who = e.issue.map_or_else(
         || format!("role agent {}", e.role.as_deref().unwrap_or("unknown")),
         |n| format!("issue #{n}"),
     );
+    let limit = e
+        .limit_bytes
+        .map_or_else(|| "no MemoryMax".to_string(), |l| format!("MemoryMax {l} bytes"));
     log::info!(
-        "ram_peaks: scope {} ({who}, repo {}) peaked at {} bytes ({:.2} GiB)",
+        "ram_peaks: scope {} ({who}, repo {}) peaked at {} bytes ({:.2} GiB); {limit}, \
+         memory.events max={} oom_kill={}{}",
         e.scope,
         e.repo,
         e.peak_bytes,
-        e.peak_bytes as f64 / GIB as f64
+        e.peak_bytes as f64 / GIB as f64,
+        e.events.max,
+        e.events.oom_kill,
+        if e.clipped() {
+            " (clipped: not recorded as a peak)"
+        } else {
+            ""
+        }
     );
+    let root = roots.iter().find(|r| repo_key(r) == e.repo);
+    crate::observability::ops::scope_memory::emit(e, root.map(PathBuf::as_path));
     use crate::telemetry::ops::{MetricName, MetricPoint};
     crate::observability::ops::emit_metrics(vec![MetricPoint::int(
         MetricName::AgentScopePeakMemoryBytes,
@@ -641,7 +897,7 @@ pub fn live_scopes(
 fn persist_tick(
     path: &Path,
     live: &[LiveScope],
-    read: impl Fn(&str) -> Option<(u64, u64)>,
+    read: impl Fn(&str) -> Option<ScopeSample>,
 ) -> Vec<EndedScope> {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut store = match load_checked(path) {
@@ -657,7 +913,7 @@ fn persist_tick(
         }
     };
     let before = store.clone();
-    let ended = observe(&mut store, live, read);
+    let ended = observe_samples(&mut store, live, read);
     if store != before {
         save(path, &store);
     }
@@ -666,19 +922,20 @@ fn persist_tick(
 
 /// One observation pass over the live scopes of all managed roots. Reads the
 /// cgroup files, updates and persists the store, emits telemetry for ended
-/// scopes. Linux only; elsewhere a no-op.
-pub fn record_tick(live: &[LiveScope]) {
+/// scopes (`roots` resolves a scope's repo key to its forge slug). Linux only;
+/// elsewhere a no-op.
+pub fn record_tick(live: &[LiveScope], roots: &[PathBuf]) {
     #[cfg(target_os = "linux")]
     {
         let (Some(path), Some(slice)) = (store_path(), agents_slice_dir()) else {
             return;
         };
-        for e in &persist_tick(&path, live, |s| read_scope(&slice, s)) {
-            emit_ended(e);
+        for e in &persist_tick(&path, live, |s| read_scope_sample(&slice, s)) {
+            emit_ended(e, roots);
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = live;
+    let _ = (live, roots);
 }
 
 #[cfg(test)]
@@ -960,7 +1217,7 @@ mod tests {
             peak_bytes: GIB,
             current_bytes: GIB,
             role: role.map(Into::into),
-            unreadable_ticks: 0,
+            ..InFlight::default()
         };
         store.inflight.insert("j".into(), f(Some("judge")));
         assert_eq!(reserved_bytes(&store), 12 * GIB, "no judge history");
@@ -1012,6 +1269,7 @@ mod tests {
                 current_bytes: 4,
                 role: Some("judge".into()),
                 unreadable_ticks: 2,
+                ..InFlight::default()
             },
         );
         s.inflight.insert(
@@ -1042,14 +1300,14 @@ mod tests {
         let l = [live("a.scope", "r")];
         for body in ["not json", r#"{"version":99,"repos":{"r":[1]}}"#] {
             std::fs::write(&p, body).unwrap();
-            let ended = persist_tick(&p, &l, |_| Some((GIB, GIB)));
+            let ended = persist_tick(&p, &l, |_| Some((GIB, GIB).into()));
             assert!(ended.is_empty());
             assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
         }
         assert_eq!(load_checked(&p), Err(LoadError::NewerVersion(99)));
         // A healthy file is still updated.
         std::fs::write(&p, "{}").unwrap();
-        persist_tick(&p, &l, |_| Some((GIB, GIB)));
+        persist_tick(&p, &l, |_| Some((GIB, GIB).into()));
         assert!(load_checked(&p).unwrap().inflight.contains_key("a.scope"));
     }
 
@@ -1064,6 +1322,196 @@ mod tests {
         assert_eq!(load_checked(&d.path().join("absent.json")), Ok(Store::default()));
         std::fs::write(&p, format!(r#"{{"version":{}}}"#, STORE_VERSION + 1)).unwrap();
         assert!(matches!(load_checked(&p), Err(LoadError::NewerVersion(_))));
+    }
+
+    #[test]
+    fn parse_memory_events_reads_max_and_oom_kill() {
+        let e = parse_memory_events("low 0\nhigh 0\nmax 37\noom 5\noom_kill 4\noom_group_kill 0\n");
+        assert_eq!(
+            e,
+            MemoryEvents {
+                max: 37,
+                oom_kill: 4
+            }
+        );
+        assert_eq!(parse_memory_events(""), MemoryEvents::default());
+        assert_eq!(
+            parse_memory_events("max x\noom_kill\ngarbage line here\noom_kill 2"),
+            MemoryEvents {
+                max: 0,
+                oom_kill: 2
+            }
+        );
+    }
+
+    #[test]
+    fn clipped_means_peak_at_the_limit_or_any_limit_event() {
+        let none = MemoryEvents::default();
+        assert!(!is_clipped(5 * GIB, None, none));
+        assert!(!is_clipped(5 * GIB, Some(8 * GIB), none));
+        assert!(is_clipped(8 * GIB, Some(8 * GIB), none));
+        assert!(is_clipped(
+            GIB,
+            Some(8 * GIB),
+            MemoryEvents {
+                max: 1,
+                oom_kill: 0
+            }
+        ));
+        assert!(is_clipped(
+            GIB,
+            Some(8 * GIB),
+            MemoryEvents {
+                max: 0,
+                oom_kill: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn no_limit_is_never_clipped_even_with_global_oom_kills() {
+        // cgroup v2 `oom_kill` also counts the global OOM killer's kills.
+        assert!(!is_clipped(
+            13 * GIB,
+            None,
+            MemoryEvents {
+                max: 0,
+                oom_kill: 1
+            }
+        ));
+        assert!(!is_clipped(
+            13 * GIB,
+            None,
+            MemoryEvents {
+                max: 5,
+                oom_kill: 3
+            }
+        ));
+        let f = InFlight {
+            peak_bytes: 13 * GIB,
+            oom_kills: 2,
+            ..InFlight::default()
+        };
+        assert!(!f.clipped());
+    }
+
+    #[test]
+    fn classify_limit_names_its_source() {
+        let mib = 1024 * 1024;
+        assert_eq!(classify_limit(None, Some(4096), 4096), LimitSource::None);
+        assert_eq!(classify_limit(Some(6000 * mib), Some(6000), 4096), LimitSource::Env);
+        assert_eq!(classify_limit(Some(4096 * mib), None, 4096), LimitSource::Floor);
+        assert_eq!(classify_limit(Some(8452 * mib), None, 4096), LimitSource::History);
+        // An explicit env value that is not the applied one is not the source.
+        assert_eq!(classify_limit(Some(8452 * mib), Some(6000), 4096), LimitSource::History);
+    }
+
+    #[test]
+    fn scope_role_prefers_the_attached_role_then_the_issue_lock() {
+        assert_eq!(scope_role(Some("judge"), None), "judge");
+        assert_eq!(scope_role(Some("doctor"), Some(7)), "doctor");
+        assert_eq!(scope_role(None, Some(7)), "sweep");
+        assert_eq!(scope_role(Some(""), None), "unknown");
+        assert_eq!(scope_role(None, None), "unknown");
+    }
+
+    #[test]
+    fn read_scope_sample_reads_limit_and_events() {
+        let d = tempfile::tempdir().unwrap();
+        let s = d.path().join("loom-agent-1.scope");
+        std::fs::create_dir(&s).unwrap();
+        std::fs::write(s.join("memory.peak"), "9000\n").unwrap();
+        std::fs::write(s.join("memory.current"), "4000\n").unwrap();
+        // No memory.max / memory.events: no limit, zero counters.
+        assert_eq!(
+            read_scope_sample(d.path(), "loom-agent-1.scope"),
+            Some(ScopeSample::from((9000, 4000)))
+        );
+        std::fs::write(s.join("memory.max"), "max\n").unwrap();
+        assert_eq!(
+            read_scope_sample(d.path(), "loom-agent-1.scope")
+                .unwrap()
+                .limit,
+            None
+        );
+        std::fs::write(s.join("memory.max"), "9000\n").unwrap();
+        std::fs::write(s.join("memory.events"), "max 3\noom_kill 1\n").unwrap();
+        let got = read_scope_sample(d.path(), "loom-agent-1.scope").unwrap();
+        assert_eq!(got.limit, Some(9000));
+        assert_eq!(
+            got.events,
+            MemoryEvents {
+                max: 3,
+                oom_kill: 1
+            }
+        );
+        assert_eq!(read_scope_sample(d.path(), "../x"), None);
+    }
+
+    #[test]
+    fn ended_scope_carries_limit_and_events_and_a_clipped_peak_is_still_history() {
+        let mut store = Store::default();
+        store.repos.insert("r".into(), vec![3 * GIB]);
+        let l = [live("a.scope", "r")];
+        let sample = |events| ScopeSample {
+            peak: 4 * GIB,
+            current: 4 * GIB,
+            limit: Some(4 * GIB),
+            events,
+        };
+        observe_samples(&mut store, &l, |_| {
+            Some(sample(MemoryEvents {
+                max: 2,
+                oom_kill: 1,
+            }))
+        });
+        // A later read with lower counters (never happens in the kernel) loses nothing.
+        observe_samples(&mut store, &l, |_| Some(sample(MemoryEvents::default())));
+        let ended = observe_samples(&mut store, &[], |_| None);
+        assert_eq!(ended.len(), 1);
+        let e = &ended[0];
+        assert_eq!(e.limit_bytes, Some(4 * GIB));
+        assert_eq!(
+            e.events,
+            MemoryEvents {
+                max: 2,
+                oom_kill: 1
+            }
+        );
+        assert!(e.clipped());
+        assert_eq!(
+            store.repos["r"],
+            vec![3 * GIB, 4 * GIB],
+            "a clipped peak is still history (a lower bound the cap grows from)"
+        );
+    }
+
+    #[test]
+    fn an_unclipped_capped_peak_is_still_history() {
+        let mut store = Store::default();
+        let l = [live("a.scope", "r")];
+        observe_samples(&mut store, &l, |_| {
+            Some(ScopeSample {
+                peak: 3 * GIB,
+                current: GIB,
+                limit: Some(8 * GIB),
+                events: MemoryEvents::default(),
+            })
+        });
+        let ended = observe_samples(&mut store, &[], |_| None);
+        assert!(!ended[0].clipped());
+        assert_eq!(store.repos["r"], vec![3 * GIB]);
+    }
+
+    #[test]
+    fn a_store_from_before_12241_loads_with_no_limit() {
+        let s: Store = serde_json::from_str(
+            r#"{"version":1,"inflight":{"a":{"repo":"r","peak_bytes":5,"current_bytes":4}}}"#,
+        )
+        .unwrap();
+        let f = &s.inflight["a"];
+        assert_eq!((f.limit_bytes, f.events_max, f.oom_kills), (None, 0, 0));
+        assert!(!f.clipped());
     }
 
     #[test]
