@@ -177,7 +177,9 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
 /// quarantine comment back to `loom:issue`; a human's manual `loom:blocked`
 /// (no such comment) is never touched. Since #11930 a marked park still
 /// inside its TTL is kept on the forge and restored in memory instead (see
-/// `quarantine_reconciliation::restored`).
+/// `quarantine_reconciliation::restored`). A workspace the rate-limit breaker
+/// skipped is retried once after the breaker clears (#11973,
+/// `quarantine_reconciliation::deferred`).
 fn run_startup_quarantine_pass(fallback_root: &Path) {
     if !crate::quarantine_reconciliation::reconciliation_enabled() {
         log::info!(
@@ -190,14 +192,16 @@ fn run_startup_quarantine_pass(fallback_root: &Path) {
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
     let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
-    let mut total_checked = 0usize;
-    let mut total_released = 0usize;
-    for root in &roots {
-        let (checked, released) =
-            crate::quarantine_reconciliation::forge::reconcile_workspace(&gh_bin, root);
-        total_checked += checked;
-        total_released += released;
-    }
+    let crate::quarantine_reconciliation::deferred::Sweep {
+        checked: total_checked,
+        released: total_released,
+        skipped,
+    } = crate::quarantine_reconciliation::deferred::sweep(&roots, |root| {
+        crate::quarantine_reconciliation::forge::reconcile_workspace_pass(&gh_bin, root)
+    });
+    // #11973: a root the rate-limit breaker skipped is retried once, after
+    // the breaker clears, instead of waiting for the next restart.
+    crate::quarantine_reconciliation::deferred::schedule(gh_bin.clone(), skipped);
     if total_released > 0 {
         log::info!(
             "quarantine_reconciliation: startup pass checked {total_checked} loom:blocked \
