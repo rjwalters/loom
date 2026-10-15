@@ -168,7 +168,6 @@ fn a_tick_with_no_journal_attached_takes_none() {
 fn writers_are_no_ops_outside_a_role_tick() {
     // PICK_JOURNAL_ENV is never set in the test process.
     if std::env::var_os(PICK_JOURNAL_ENV).is_none() {
-        record_pr_queue("judge", &[]);
         record_gh_actions(&[OsString::from("pr")]);
     }
 }
@@ -243,4 +242,34 @@ fn an_adopted_step_journal_drains_like_a_role_ticks() {
     assert_eq!(got.entries.len(), 1);
     assert!(!path.exists(), "drained");
     assert!(step_path("step-judge-7-1").ends_with("step-step-judge-7-1.jsonl"));
+}
+
+#[test]
+fn dispatch_journals_the_pr_queue_only_for_a_journaled_pr_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j.jsonl");
+    let rows = || Ok(vec![serde_json::json!({"number": 7, "labels": []})]);
+    let queue_entries = |p: &Path| {
+        parse(&std::fs::read_to_string(p).unwrap_or_default())
+            .into_iter()
+            .filter(|e| matches!(e, JournalEntry::Queue { .. }))
+            .count()
+    };
+
+    // No journal attached (no exporter): nothing is fetched.
+    let bare = Command::new("true");
+    record_queue_with(&bare, "judge", |_| panic!("fetched without a journal"));
+
+    let mut cmd = Command::new("true");
+    cmd.env(PICK_JOURNAL_ENV, &journal);
+    // A role without a PR queue is not fetched.
+    record_queue_with(&cmd, "curator", |_| panic!("curator has no PR queue"));
+    // A failed listing journals nothing.
+    record_queue_with(&cmd, "judge", |_| anyhow::bail!("forge down"));
+    assert_eq!(queue_entries(&journal), 0);
+
+    for role in ["judge", "doctor", "champion"] {
+        record_queue_with(&cmd, role, |_| rows());
+    }
+    assert_eq!(queue_entries(&journal), 3);
 }
