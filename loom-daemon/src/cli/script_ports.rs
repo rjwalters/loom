@@ -784,10 +784,11 @@ pub(crate) enum MergePrCommand {
     /// 2 = could not run (must also refuse).
     TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
 
-    /// Retired (#12063 slice 1): the #10444 CI-run gate. Hidden; answers
-    /// CLEAN for an older `merge-pr.sh`. See `cli::merge_pr_retired`.
+    /// Retired (#12063 slice 1): the #10444 CI-run gate. Hidden; answers an
+    /// older `merge-pr.sh` with the `required-checks` verdict in `ci-result`'s
+    /// old contract. See `cli::merge_pr_retired`.
     #[command(hide = true)]
-    CiResult(super::merge_pr_retired::RetiredArgs),
+    CiResult(super::merge_pr_retired::CiResultArgs),
 
     /// Refuse a plain (non-`--auto`) merge whose head has a required context
     /// that concluded red (#10688); hold (exit 3) on a missing/pending one.
@@ -1158,7 +1159,7 @@ impl MergePrCommand {
             MergePrCommand::MergeableRecheck(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run_stale_checks(),
             MergePrCommand::TreeChecks(args) => args.run(),
-            MergePrCommand::CiResult(args) => args.run_ci_result(),
+            MergePrCommand::CiResult(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run_redate_checks(),

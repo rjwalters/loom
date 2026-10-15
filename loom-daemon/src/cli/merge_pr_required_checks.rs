@@ -18,8 +18,9 @@
 use anyhow::Result;
 use loom_daemon::merge_pr::checks_failure::required::{
     assess, bypass_comment, hold_reason, list, live_inputs, parse_check_runs, parse_statuses,
-    refusal, Verdict, BYPASSED, CLEAN, HOLD, UNREADABLE,
+    refusal, Inputs, Status, Verdict, BYPASSED, CLEAN, HOLD, UNREADABLE,
 };
+use loom_daemon::merge_pr::stale_checks::CheckRun;
 use serde_json::Value;
 use std::io::Read;
 
@@ -54,6 +55,36 @@ pub(crate) struct RequiredChecksArgs {
     from_stdin: bool,
 }
 
+/// The `--from-stdin` document as [`Inputs`]. The outer `Err` is an I/O or
+/// JSON error; the inner one an unreadable `check_runs` / `statuses` field.
+/// Shared with the retired `ci-result` verb (`cli::merge_pr_retired`).
+pub(crate) fn read_stdin_inputs() -> Result<Result<Inputs, String>> {
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw)?;
+    let doc: Value = serde_json::from_str(&raw)?;
+    let required: Vec<String> = doc
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(evidence(&doc).map(|(runs, statuses)| (required, runs, statuses)))
+}
+
+/// The document's `check_runs` and `statuses` (a missing `statuses` is none).
+fn evidence(doc: &Value) -> Result<(Vec<CheckRun>, Vec<Status>), String> {
+    let runs = parse_check_runs(doc.get("check_runs").unwrap_or(&Value::Array(vec![])))?;
+    let statuses = match doc.get("statuses") {
+        Some(s) => parse_statuses(s)?,
+        None => Vec::new(),
+    };
+    Ok((runs, statuses))
+}
+
 fn unreadable(why: &str) -> ! {
     println!("{UNREADABLE} {why}");
     std::process::exit(2);
@@ -62,26 +93,7 @@ fn unreadable(why: &str) -> ! {
 impl RequiredChecksArgs {
     pub(crate) fn run(self) -> Result<()> {
         let (required, runs, statuses) = if self.from_stdin {
-            let mut raw = String::new();
-            std::io::stdin().read_to_string(&mut raw)?;
-            let doc: Value = serde_json::from_str(&raw)?;
-            let required: Vec<String> = doc
-                .get("required")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let runs = parse_check_runs(doc.get("check_runs").unwrap_or(&Value::Array(vec![])))
-                .unwrap_or_else(|e| unreadable(&e));
-            let statuses = match doc.get("statuses") {
-                Some(s) => parse_statuses(s).unwrap_or_else(|e| unreadable(&e)),
-                None => Vec::new(),
-            };
-            (required, runs, statuses)
+            read_stdin_inputs()?.unwrap_or_else(|e| unreadable(&e))
         } else {
             live_inputs(&self.repo, &self.base_ref, &self.head_sha)
                 .unwrap_or_else(|e| unreadable(&e))

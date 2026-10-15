@@ -705,7 +705,7 @@ completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
       bare `gh pr comment` and NOT `gh pr review`
 - [ ] I understand `gh pr review --approve` WILL fail with "cannot approve your own PR"
 - [ ] All CI checks pass (verified via `forge wait-checks`)
-- [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`)
+- [ ] Merge state is CLEAN or BEHIND (verified via `gh pr view --json mergeStateStatus`; BEHIND is reviewed as-is, see "BEHIND: review as-is")
 - [ ] I will NEVER call `gh pr review` in any form
 - [ ] `post-verdict.sh` exited 0 (it applied the verdict label; exit 8 = run its repair command)
 - [ ] If my review body came from a scratch file, the filename is namespaced by
