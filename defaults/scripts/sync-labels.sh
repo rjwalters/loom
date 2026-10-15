@@ -465,8 +465,7 @@ github_maybe_delete_label() {
 # Label-write accounting (#11746). Every create/update the mutating sync
 # attempts counts once in WRITE_ATTEMPTS; one that still fails after the
 # rate-limit retry below counts in WRITE_FAILURES, which turns into exit 5.
-WRITE_ATTEMPTS=0
-WRITE_FAILURES=0
+WRITE_ATTEMPTS=0 WRITE_FAILURES=0
 
 # gh_label_write ARGS...: `gh label ARGS...` with a bounded retry for a GitHub
 # rate limit (403/429 "secondary rate limit" / Retry-After): a fleet sync of
@@ -476,57 +475,30 @@ WRITE_FAILURES=0
 # (seconds) pins the wait, so a test need not sleep.
 GH_WRITE_OUT=""
 gh_label_write() {
-  local attempt=0 max_retries=4 delay
-  while true; do
-    if GH_WRITE_OUT=$(gh label "$@" 2>&1); then
-      return 0
-    fi
-    if [[ "$attempt" -ge "$max_retries" ]] \
-      || ! printf '%s' "$GH_WRITE_OUT" | grep -Eqi 'secondary rate limit|rate limit|HTTP 429'; then
-      return 1
-    fi
+  local attempt=0 delay
+  while ! GH_WRITE_OUT=$(gh label "$@" 2>&1); do
+    [[ "$attempt" -lt 4 && "${GH_WRITE_OUT,,}" =~ rate.limit|http.429 ]] || return 1
     delay=$((5 << attempt))
-    if [[ "$GH_WRITE_OUT" =~ [Rr]etry-[Aa]fter:?[[:space:]]*([0-9]+) ]]; then
-      delay="${BASH_REMATCH[1]}"
-    fi
-    [[ "$delay" -le 60 ]] || delay=60
-    delay="${SYNC_LABELS_RETRY_DELAY:-$delay}"
-    warning "GitHub rate limit on label write; retrying in ${delay}s ($((attempt + 1))/${max_retries})"
+    [[ "${GH_WRITE_OUT,,}" =~ retry-after:?[[:space:]]*([0-9]+) ]] && delay="${BASH_REMATCH[1]}"
+    delay="${SYNC_LABELS_RETRY_DELAY:-$((delay > 60 ? 60 : delay))}"
+    warning "GitHub rate limit on label write; retrying in ${delay}s ($((++attempt))/4)"
     sleep "$delay"
-    attempt=$((attempt + 1))
   done
 }
 
 github_sync_label() {
-  local name="$1" description="$2" color="$3"
+  local name="$1" description="$2" color="$3" verb=create
+  local args=("$name" -R "$REPO" --description "$description" --color "$color")
   WRITE_ATTEMPTS=$((WRITE_ATTEMPTS + 1))
-
-  if "$GH_READ" label list -R "$REPO" --json name --jq '.[].name' 2>&1 | grep -q "^${name}$" 2>/dev/null; then
-    if gh_label_write edit "$name" -R "$REPO" --description "$description" --color "$color"; then
-      info "Updated label: $name"
-    else
-      warning "Failed to update label: $name"
-      echo "$GH_WRITE_OUT" >&2
-      WRITE_FAILURES=$((WRITE_FAILURES + 1))
-    fi
+  [[ $'\n'"$("$GH_READ" label list -R "$REPO" --json name --jq '.[].name' 2>&1)"$'\n' != *$'\n'"$name"$'\n'* ]] || verb=edit
+  if gh_label_write "$verb" "${args[@]}" \
+    || { [[ "$verb" == create && "$GH_WRITE_OUT" == *"already exists"* ]] && verb=edit && gh_label_write edit "${args[@]}"; }; then
+    verb=${verb/edit/update}
+    info "${verb^}d label: $name"
   else
-    if gh_label_write create "$name" -R "$REPO" --description "$description" --color "$color"; then
-      info "Created label: $name"
-    else
-      if echo "$GH_WRITE_OUT" | grep -q "already exists"; then
-        if gh_label_write edit "$name" -R "$REPO" --description "$description" --color "$color"; then
-          info "Updated label: $name"
-        else
-          warning "Failed to update label: $name"
-          echo "$GH_WRITE_OUT" >&2
-          WRITE_FAILURES=$((WRITE_FAILURES + 1))
-        fi
-      else
-        warning "Failed to create label: $name"
-        echo "$GH_WRITE_OUT" >&2
-        WRITE_FAILURES=$((WRITE_FAILURES + 1))
-      fi
-    fi
+    warning "Failed to ${verb/edit/update} label: $name"
+    echo "$GH_WRITE_OUT" >&2
+    WRITE_FAILURES=$((WRITE_FAILURES + 1))
   fi
 }
 
@@ -822,30 +794,16 @@ gitea_maybe_delete_label() {
 }
 
 gitea_sync_label() {
-  local name="$1" description="$2" color="$3"
-  local label_id
+  local name="$1" description="$2" color="$3" verb=create method=POST label_id payload
   label_id=$(gitea_label_id "$name")
   WRITE_ATTEMPTS=$((WRITE_ATTEMPTS + 1))
-
-  local payload
   payload="{\"name\":$(printf '%s' "$name" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'),\"description\":$(printf '%s' "$description" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'),\"color\":\"#${color}\"}"
-
-  if [[ -n "$label_id" ]]; then
-    # Update existing label
-    if gitea_api PATCH "repos/${FORGE_OWNER}/${FORGE_REPO}/labels/${label_id}" -d "$payload" >/dev/null 2>&1; then
-      info "Updated label: $name"
-    else
-      warning "Failed to update label: $name"
-      WRITE_FAILURES=$((WRITE_FAILURES + 1))
-    fi
+  [[ -z "$label_id" ]] || { verb=update method=PATCH; label_id="/${label_id}"; }
+  if gitea_api "$method" "repos/${FORGE_OWNER}/${FORGE_REPO}/labels${label_id}" -d "$payload" >/dev/null 2>&1; then
+    info "${verb^}d label: $name"
   else
-    # Create new label
-    if gitea_api POST "repos/${FORGE_OWNER}/${FORGE_REPO}/labels" -d "$payload" >/dev/null 2>&1; then
-      info "Created label: $name"
-    else
-      warning "Failed to create label: $name"
-      WRITE_FAILURES=$((WRITE_FAILURES + 1))
-    fi
+    warning "Failed to $verb label: $name"
+    WRITE_FAILURES=$((WRITE_FAILURES + 1))
   fi
 }
 
