@@ -202,6 +202,10 @@ pub fn systemd_supervision_block() -> String {
 
 /// `render_systemd_unit <daemon_bin> <workdir> <log_path>` — the Linux mirror.
 ///
+/// Unlike the plist, the unit never carries the dispatcher's autonomy env
+/// (#11951, [`super::systemd_autonomy::UNRENDERED_KEYS`]): the host's
+/// supervisor env (a drop-in) or its config owns those settings.
+///
 /// The supervision directives come from [`systemd_supervision_block`] and
 /// [`SYSTEMD_START_LIMIT`], which carry the exit-code contract and the incident
 /// behind each line.
@@ -224,6 +228,11 @@ pub fn systemd_unit(
             continue;
         }
         if is_session_scoped_env_key(key) {
+            continue;
+        }
+        // #11951: the host's supervisor env owns the autonomy keys on systemd.
+        // The launchd renderer above still forwards them.
+        if super::systemd_autonomy::is_unrendered_key(key) {
             continue;
         }
         // The shell appended `$line`, i.e. the ORIGINAL `KEY=VALUE` text, not a
@@ -618,6 +627,7 @@ pub fn warn_dropped_env_keys(
 
     let mut dropped: Vec<String> = Vec::new();
     let mut purged: Vec<String> = Vec::new();
+    let mut purged_autonomy: Vec<(String, String)> = Vec::new();
     for k in old_keys {
         if k.is_empty() {
             continue;
@@ -633,7 +643,18 @@ pub fn warn_dropped_env_keys(
             purged.push(k);
             continue;
         }
+        // #11951: an installed unit's autonomy line is what made the outage
+        // self-perpetuating; it is removed, never carried forward.
+        if mech == Mechanism::Systemd && super::systemd_autonomy::is_unrendered_key(&k) {
+            let v = mech.value(&old_text, &k).unwrap_or_default();
+            purged_autonomy.push((k, v));
+            continue;
+        }
         dropped.push(k);
+    }
+
+    if !purged_autonomy.is_empty() {
+        super::systemd_autonomy::purge_notice(old_file, &purged_autonomy);
     }
 
     if !purged.is_empty() {
@@ -751,7 +772,8 @@ mod tests {
             assert!(!u.contains(k), "unit leaked {k}");
         }
         assert!(p.contains("LOOM_WORK_FINDER"));
-        assert!(u.contains("Environment=LOOM_WORK_FINDER=1"));
+        // #11951: the unit leaves autonomy to the host's supervisor env.
+        assert!(!u.contains("LOOM_WORK_FINDER"));
     }
 
     /// The one value of `key=` in `text`, panicking unless there is exactly one.
