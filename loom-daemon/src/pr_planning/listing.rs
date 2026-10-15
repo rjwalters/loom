@@ -193,13 +193,17 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
     if role == PrRole::Judge {
         let mut guarded = Vec::new();
         for row in queue {
-            if row["mode"] == "fallback" {
-                if guard_admits(root, &row)? {
-                    guarded.push(row);
-                }
-            } else if !backstop_holds(root, gh, &row, &trust) {
-                guarded.push(row);
+            if !judge_admits(root, gh, &row, &trust)? {
+                continue;
             }
+            // #11971: only the rows a Judge pass would reach first are worth
+            // a CI read; past them the queue is served as-is.
+            if guarded.len() < super::ci_gate::CI_SCREENED_ROWS
+                && ci_pending_at_head(root, gh, &row)
+            {
+                continue;
+            }
+            guarded.push(row);
         }
         queue = guarded;
     }
@@ -285,16 +289,44 @@ pub fn has_judge_work(root: &Path, gh: &Path) -> Result<bool> {
     // #11861: a Champion hold handed back by Doctor is Judge work.
     mark_champion_holds(root, gh, PrRole::Judge, &mut rows)?;
     for row in ordered_queue(rows, PrRole::Judge, prefer, &trust) {
-        let served = if row["mode"] == "fallback" {
-            guard_admits(root, &row)?
-        } else {
-            !backstop_holds(root, gh, &row, &trust)
-        };
-        if served {
+        if judge_admits(root, gh, &row, &trust)? && !ci_pending_at_head(root, gh, &row) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Whether Judge's queue admits an ordered row before the CI read: a
+/// fallback row its guard admits, or a workflow row the no-verdict backstop
+/// does not hold. One rule for `fetch_queue` and [`has_judge_work`].
+fn judge_admits(root: &Path, gh: &Path, row: &Value, trust: &TrustPolicy) -> Result<bool> {
+    if row["mode"] == "fallback" {
+        guard_admits(root, row)
+    } else {
+        Ok(!backstop_holds(root, gh, row, trust))
+    }
+}
+
+/// Whether CI is still running at this row's head (#11971,
+/// [`super::ci_gate`]): Judge would only release it. Unreadable, or a row
+/// with no head, is not pending. Says why on stderr (stdout is the queue).
+fn ci_pending_at_head(root: &Path, gh: &Path, row: &Value) -> bool {
+    let (Some(number), Some(head)) = (row["number"].as_u64(), row["head"]["sha"].as_str()) else {
+        return false;
+    };
+    let pending = super::ci_gate::cached(root, head, || {
+        super::ci_gate::ci_pending(head, chrono::Utc::now(), |path| {
+            read(root, gh, ops::CI_CHECK_RUNS_FOR_SHA, path).ok()
+        })
+    });
+    if pending {
+        eprintln!(
+            "Judge CI gate: PR #{number} skipped — CI is still running at head {} (#11971); \
+             it is served once CI concludes",
+            &head[..head.len().min(12)]
+        );
+    }
+    pending
 }
 
 /// Judge's role-runner gate on an empty labeled listing (#9389): is there a
