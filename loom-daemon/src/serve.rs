@@ -641,6 +641,12 @@ async fn handle_health(
         .then(crate::health::probe_work_finder_log_tick_age)
         .flatten();
 
+    // #11970: local `.loom/resync-ignore` reads, as `cli::health` does.
+    let resync_pins = report
+        .iter()
+        .flat_map(|r| r.per_repo.iter())
+        .map(|r| (r.root.display().to_string(), crate::resync_pin::read_pins(&r.root)))
+        .collect();
     let health = crate::health::assess(&crate::health::HealthInputs {
         at: chrono::Utc::now(),
         window: HEALTH_WINDOW,
@@ -704,6 +710,7 @@ async fn handle_health(
         // #11740: the in-process last fleet-sync pass, so the dashboard's
         // health route raises `fleet_identity` too.
         fleet_sync: crate::fleet_sync::cached_status(),
+        resync_pins,
     });
 
     let mut body = serde_json::to_value(&health)?;
