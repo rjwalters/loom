@@ -9,9 +9,8 @@
 //! - `loom:blocked` ([`crate::work_finder::BLOCKED_HOLD_LABEL`]);
 //! - a reason-only park record in the body
 //!   (`<!-- loom:park Blocked by: (unstated) by=champion reason="…" -->`,
-//!   [`MERGE_RISK_HOLD_REASON`] / [`CRITICAL_FILE_HOLD_REASON`]), which the
-//!   stale-blocked release pass skips (`Skip::Unstated`), so only Champion or
-//!   a human releases it;
+//!   [`MERGE_RISK_HOLD_REASON`] / [`CRITICAL_FILE_HOLD_REASON`]); only
+//!   Champion or a human releases it;
 //! - Champion's hold-state marker comment ([`MERGE_RISK_HOLD_MARKER`] /
 //!   [`CRITICAL_FILE_HOLD_MARKER`], carrying `champion:hold-state head=<sha>`).
 //!

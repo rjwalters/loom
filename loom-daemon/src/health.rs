@@ -1186,7 +1186,9 @@ pub enum MissingTick {
 /// The grace window (seconds) a missing tick is tolerated for after a daemon
 /// (re)start: [`WORK_FINDER_TICK_GRACE_INTERVALS`] × the daemon's own resolved
 /// tick interval, falling back to the default cadence for a pre-#4824 daemon
-/// that does not report one.
+/// that does not report one. Plus the daemon's startup jitter (#12073): the
+/// first tick waits that per-host delay, so the window runs from the gate's
+/// opening, not from the process start.
 #[must_use]
 pub fn work_finder_grace_secs(status: &DaemonStatusReport) -> u64 {
     status
@@ -1194,6 +1196,7 @@ pub fn work_finder_grace_secs(status: &DaemonStatusReport) -> u64 {
         .filter(|s| *s > 0)
         .unwrap_or(crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS)
         .saturating_mul(WORK_FINDER_TICK_GRACE_INTERVALS)
+        .saturating_add(status.startup_jitter_delay_secs.unwrap_or(0))
 }
 
 /// Classify a missing work-finder tick (#4824), in strict precedence order:

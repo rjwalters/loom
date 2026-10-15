@@ -90,8 +90,6 @@ impl WorkSource for GhWorkSource {
         // A label-transition write, so it runs on every tick, outside the gate.
         if let Some(root) = self.cwd.as_deref() {
             crate::intake_reconcile::maybe_run(&self.gh_bin, root);
-            // The `loom:blocked` release pass (#10556) has its own task since
-            // #10763: `crate::stale_blocked::release_task`.
         }
         // Event-gated polling (#9255, opt-in `forgeEvents.pollGating`, default
         // off): while the feed is `healthy`, a repo with no event since its

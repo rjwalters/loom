@@ -56,6 +56,7 @@ pub(crate) mod cwd_route;
 mod outcome;
 pub(crate) mod own_writes;
 mod paged;
+pub mod read_deadline;
 mod reader_route;
 pub mod resolver;
 pub mod route;
@@ -720,6 +721,10 @@ impl GhInvocation {
         if self.intent == AccessIntent::Write {
             own_writes::note(&self.args, self.target.slug().as_deref());
         }
+        // #12074: past the work-finder tick's deadline a read is not sent.
+        if self.intent == AccessIntent::Read && read_deadline::passed() {
+            return Ok(self.deadline_shed());
+        }
         #[cfg(test)]
         if let Some(routed) = test_routing::run(&self) {
             return routed;
@@ -740,6 +745,21 @@ impl GhInvocation {
         let policy = reader_route::ShedPolicy::current();
         self.with_derived_route()
             .execute_routed_v2(&lookup, &reader_route::withdraw_reader, policy)
+    }
+
+    /// A read the tick deadline stopped (#12074): shed, nothing sent.
+    fn deadline_shed(&self) -> GhCompletion {
+        let owner = self
+            .target
+            .slug()
+            .and_then(|s| s.split('/').next().map(str::to_ascii_lowercase))
+            .unwrap_or_else(|| "-".to_string());
+        log::debug!("gh: {} not sent: the tick deadline passed (#12074)", self.operation.as_str());
+        GhCompletion::Shed {
+            owner,
+            resource: crate::forge_bucket_book::Resource::Core,
+            until: std::time::SystemTime::now(),
+        }
     }
 
     /// Run exactly once under the credential already chosen (no routing).
@@ -770,7 +790,20 @@ impl GhInvocation {
     }
 
     /// Run this argv exactly once under its [`OutputContract`].
-    fn execute_once(self, program: &str, source: GhBinSource) -> Result<GhCompletion, ExecError> {
+    fn execute_once(
+        mut self,
+        program: &str,
+        source: GhBinSource,
+    ) -> Result<GhCompletion, ExecError> {
+        // #12074: a read inside a tick deadline gets only the time left.
+        if let (AccessIntent::Read, OutputContract::Captured { timeout }) =
+            (self.intent, self.contract)
+        {
+            match read_deadline::clamp(timeout) {
+                Some(timeout) => self.contract = OutputContract::Captured { timeout },
+                None => return Ok(self.deadline_shed()),
+            }
+        }
         let span = telemetry::InvocationSpan::open(&self);
         let mut cmd = self.command(program, span.child_context(&self.parent));
         match self.contract {
@@ -785,6 +818,9 @@ impl GhInvocation {
                 };
                 let billing = accounting::record(&self, outcome, captured);
                 span.finish(&self, source, outcome, code, &billing);
+                if let Ok(Completion::Exited(out)) = &result {
+                    crate::forge_gateway::outage::note_attempt(self.config_dir.as_deref(), out);
+                }
                 result.map(GhCompletion::Captured)
             }
             OutputContract::Passthrough => {

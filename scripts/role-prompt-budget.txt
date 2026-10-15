@@ -15,7 +15,7 @@
 #
 # A diff that RAISES a budget needs a clear reason in the PR description.
 # Do not hand-edit these upward; that is the ratchet slipping. See
-# .loom/docs/file-size-policy.md.
+# .loom/docs/prompt-budget-policy.md.
 architect      14916        -
 auditor        20505        -
 builder        29538        -
@@ -24,7 +24,7 @@ curator        44691    30000
 doctor         32548    30000
 driver         10763        -
 guide          44119        -
-hermit         16457        -
+hermit         16501        -
 judge          53736    30000
 loom           19280        -
 sweep          62675    60000

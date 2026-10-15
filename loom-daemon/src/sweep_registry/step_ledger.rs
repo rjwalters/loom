@@ -15,6 +15,16 @@
 //! | `Reclassify` | nothing for the first; a second identical state refusal in a row arms the ledger's doubling refusal cooldown, broadcast. Not a repeat-cap run |
 //! | `Failed` (slow) | counted toward the repeat cap |
 //!
+//! A Builder step's `noop` also feeds the issue's no-op hold (#12024,
+//! [`SweepRegistry::note_builder_step_noop`]). The ledger's own history
+//! cannot bound a promote / Builder-no-op cycle: Champion's promotion is a
+//! verdict, and a verdict clears every step's history and cooldown on the
+//! item. The hold's streak lives outside the ledger, is counted across the
+//! fleet, and survives the promotion (the fingerprint ignores the
+//! `loom:curated` / `loom:issue` lane churn), so the third no-op on an
+//! unchanged issue parks it on `loom:blocked` + a `no-op hold` park record,
+//! which the step draw passes (`Blocked`) until its fingerprint changes.
+//!
 //! Whenever the repeat cap arms, its window is broadcast like any other,
 //! except a refusal's: a pool gate or a claim race is this host's own, so a
 //! `Refused` outcome's window stays local (#11909).
@@ -62,6 +72,9 @@ impl SweepRegistry {
         let rec = self
             .step_ledger
             .record(item, step, &run.outcome, run.ran_for, now);
+        if step == StepRole::Builder && run.outcome.class == OutcomeClass::Noop {
+            self.note_builder_step_noop(item, &run.sweep_id, &run.outcome.reason);
+        }
         let champion = step.role_name() == "champion";
         if matches!(rec.effect, Effect::Advance | Effect::Landed) {
             self.lift_item_step_cooldowns(item);
@@ -131,6 +144,39 @@ impl SweepRegistry {
             cooling_until,
             ..rec
         }
+    }
+
+    /// Publish `step.item.{N}.ended` for a finished step (#12152): the
+    /// step's terminal event on the bus, carrying the ledger's
+    /// classification. A step emits no `sweep.issue.{N}.exited`, so this is
+    /// what the narration sink reads to narrate a merged PR's public-feed
+    /// `completion` (`safehouse::step_narrates_completion` decides which ends
+    /// qualify). Called once per ended step by the settle pass, never for a
+    /// spawn-time refusal (`record_refusal`: no session ran). A no-op without
+    /// a bus.
+    pub fn emit_step_ended(&self, run: &StepRun) {
+        self.emit_event(crate::types::Event::StepEnded {
+            item: run.item,
+            role: run.step,
+            class: run.outcome.class.as_str().to_string(),
+            reason: run.outcome.reason.clone(),
+            ran_for_sec: i64::try_from(run.ran_for.as_secs()).unwrap_or(i64::MAX),
+            repo: None,
+        });
+    }
+
+    /// Feed a Builder step's `noop` on issue `item` to the no-op hold
+    /// (#12024): the fleet-wide streak, and the `loom:blocked` park at the
+    /// threshold. A `noop` that waited on something outside the item
+    /// (`ci_pending`) is not a loop. Counted once per dispatch: a step that
+    /// also self-reported over IPC (`noop-cooldown record`) carries the same
+    /// sweep id, and the hold counts a sweep id once.
+    pub(crate) fn note_builder_step_noop(&mut self, item: u32, sweep_id: &str, reason: &str) {
+        if crate::step_dispatch::outcome_ledger::EXTERNAL_WAIT_NOOPS.contains(&reason) {
+            return;
+        }
+        let sweep = (!sweep_id.is_empty()).then_some(sweep_id);
+        self.note_noop_for_hold(item, sweep, Some(reason));
     }
 
     /// The draw's query at `now`: this host's ledger, plus every live peer

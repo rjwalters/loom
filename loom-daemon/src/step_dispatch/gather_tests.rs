@@ -208,3 +208,22 @@ mod ci_hold {
         assert_eq!(held, 0, "a PR with no known head is drawn unread");
     }
 }
+
+/// #12074: a failed open-PR listing keeps the last good PR set but never
+/// vouches for a Builder step (the flag stays false); with nothing cached it
+/// is empty, as before.
+#[test]
+fn a_failed_pull_listing_keeps_the_last_good_set_unvouched() {
+    let slug = format!("acme/pulls-last-good-{}", std::process::id());
+    let (none, ok) = pulls_or_last_good(&slug, Err(anyhow::anyhow!("shed")));
+    assert!(none.is_empty() && !ok);
+    let pull = RestPull {
+        number: 7,
+        ..RestPull::default()
+    };
+    let (fresh, ok) = pulls_or_last_good(&slug, Ok(vec![pull.clone()]));
+    assert_eq!((fresh.len(), ok), (1, true));
+    let (kept, ok) = pulls_or_last_good(&slug, Err(anyhow::anyhow!("shed")));
+    assert_eq!(kept, vec![pull]);
+    assert!(!ok, "a last good PR listing never vouches for a Builder step");
+}
