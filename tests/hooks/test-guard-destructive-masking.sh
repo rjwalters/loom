@@ -1066,6 +1066,25 @@ assert_deny "#7498 site 8 (mask_catastrophic_forloop_wordlist): word-list litera
 assert_deny "#7498 site 8 (mask_catastrophic_forloop_wordlist): mixed escaped + live backtick in the same word-list literal still denies" \
     'for q in "sql-ddl" "safe \`x\` then `'"$_S3RB"' s3://prod-bucket --force`"; do gh issue list --search "$q" --limit 5; done'
 
+WT12076_REPO=$(make_wt_repo)
+# ---------------------------------------------------------------------------
+# #12076: a quoted ">" inside an unquoted backtick substitution is data, not a
+# redirect. mask_gt() tracks a separate quote state (bq) inside a backtick span.
+# ---------------------------------------------------------------------------
+assert_allow "write-confinement (#12076): single-quoted --jq with quoted '>' inside backticks allows" \
+    "X=\`gh api repos/o/r/issues/1/comments --jq '.[] | select(.created_at > \"2026-10-15T05:50:00Z\") | .body'\`" "$WT12076_REPO"
+assert_allow "write-confinement (#12076): double-quoted '>' inside backticks allows" \
+    "X=\`jq \".a > 1\" /tmp/loom-test-$$-12076.json\`" "$WT12076_REPO"
+assert_deny "write-confinement (#12076 control): real redirect inside backticks still denies" \
+    "X=\`echo x > $WT12076_REPO/f.sh\`" "$WT12076_REPO"
+assert_deny "write-confinement (#12076 control): redirect after a closed quote inside backticks still denies" \
+    "X=\`echo 'a>b' > $WT12076_REPO/f.sh\`" "$WT12076_REPO"
+assert_deny "write-confinement (#12076 control): redirect after the closing backtick still denies" \
+    "X=\`echo '>'\` ; echo x > $WT12076_REPO/f.sh" "$WT12076_REPO"
+assert_deny "write-confinement (#12076 control): unquoted redirect still denies" \
+    "echo x > $WT12076_REPO/f" "$WT12076_REPO"
+rm -rf "$WT12076_REPO"
+
 echo ""
 
 # =========================================================================
