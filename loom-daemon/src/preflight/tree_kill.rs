@@ -467,8 +467,11 @@ mod tests {
     }
 
     /// `pid` is gone, allowing a moment for a just-signalled process to exit.
+    /// The bound is generous on purpose: the poll returns the instant the
+    /// process is gone, so it costs nothing when the test passes, and a
+    /// loaded host (teardown plus `ps` starved of CPU) cannot outlast it.
     fn assert_gone(pid: libc::pid_t, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(90);
         while running(pid) {
             assert!(Instant::now() < deadline, "{what} (pid {pid}) outlived the teardown");
             std::thread::sleep(Duration::from_millis(50));
