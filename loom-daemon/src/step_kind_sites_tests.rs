@@ -170,7 +170,6 @@ fn no_production_site_drops_other_kinds_silently() {
 /// the tick's occupancy, which `work_finder/forge.rs` computes (listed).
 const KNOWN_SITES: &[(&str, &[&str])] = &[
     ("sweep_registry/watchdog.rs", KIND_NEEDLES),
-    ("observability/fleet_state/sources.rs", KIND_NEEDLES),
     ("observability/collector/identity.rs", KIND_NEEDLES),
     ("sweep_registry/outcome_journal.rs", KIND_NEEDLES),
     ("auto_update/pause_roll/host.rs", KIND_NEEDLES),

@@ -27,7 +27,6 @@ const MARKERS: &[&str] = &[
     "CYCLE_MARKER_PREFIX",
     "UNESCALATE_MARKER_PREFIX",
     "ROSTER_MARKER_PREFIX",
-    "loom:stale-check-redate",
     "loom:premise-check",
     "loom:unnamed-block-review",
     "closedByPullRequestsReferences",
@@ -60,11 +59,6 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "forge_check_claim.rs",
         "lease + lease-yield reader in read_freshest_live_lease (FETCH_SITES, #9453)",
     ),
-    ("merge_pr/redate.rs", "writer; reader in remedy_with_sync (FETCH_SITES)"),
-    (
-        "merge_pr/redate/budget.rs",
-        "pure parser over remedy_with's trusted listing (#9590)",
-    ),
     ("premise_check/cli.rs", "reader in forge_inputs (FETCH_SITES)"),
     ("premise_check/record.rs", "parser over already-filtered chunks"),
     ("quarantine_reconciliation.rs", "reader (FETCH_SITES)"),
@@ -73,16 +67,6 @@ const MARKER_FILES: &[(&str, &str)] = &[
     (
         "stale_blocked/batch.rs",
         "parked issues' own closing refs + comment text for an advisory, not the linked-PR guard",
-    ),
-    (
-        "stale_blocked/release.rs",
-        "#10556 hold/idempotency reader: comments from ReleaseForge, trusted via policy.trusts_json",
-    ),
-    (
-        "stale_blocked/unnamed.rs",
-        "#10558 queue veto: legacy PR-less/quarantine and Curator review markers from \
-         ReleaseForge comments, trusted via policy.trusts_json (permanent-block veto reads any \
-         comment: fail-safe)",
     ),
     (
         "sweep_registry/guards.rs",
@@ -206,8 +190,6 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // `COMMENTS_QUERY` const, which the scanner cannot see; listed anyway.
     ("premise_check/cli.rs", "graphql_listing_and_object", ""),
     ("premise_check/cli.rs", "parse_graphql_comments", ""),
-    ("merge_pr/redate.rs", "remedy_with_sync", "policy.trusted_listing("),
-    ("merge_pr/redate.rs", "post_comment", ""),
     ("role_runner/roster.rs", "read_roster_comments", "trusted_ndjson("),
     ("role_runner/roster.rs", "create_roster_comment", ""),
     ("role_runner/roster.rs", "delete_roster_comment", ""),
@@ -230,10 +212,6 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(&forge.root)",
     ),
     ("stale_blocked/batch.rs", "parse_closing_refs", ""),
-    // #10556's release pass: the raw listing goes to `release::execute`, which
-    // trusts each comment through `policy.trusts_json` before reading a hold
-    // or idempotency marker from it.
-    ("stale_blocked/release_gh.rs", "comments", ""),
 ];
 
 /// Production code of a source file: inline test modules cut off, comment

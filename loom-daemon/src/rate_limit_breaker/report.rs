@@ -66,14 +66,16 @@ pub trait BudgetProbe: Send + Sync {
     fn probe(&self, ctx: &FailureContext, now: DateTime<Utc>) -> Option<BudgetSnapshot>;
 }
 
-/// The real probe: `gh api rate_limit` + the GraphQL `rateLimit` query
-/// through the `gh` facade, under the failure's context.
+/// The real probe: one `gh api rate_limit` through the `gh` facade, under
+/// the failure's context. It bypasses (and then refreshes) the process-wide
+/// budget cache (#12204): a trip is the moment the cached reading stopped
+/// being true, and the one time a `/rate_limit` read is always worth it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ForgeProbe;
 
 impl BudgetProbe for ForgeProbe {
     fn probe(&self, ctx: &FailureContext, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
-        super::forge::probe_budget_ctx(ctx, now)
+        super::forge::refresh_budget_ctx(ctx, now)
     }
 }
 

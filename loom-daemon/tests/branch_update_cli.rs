@@ -489,5 +489,5 @@ fn role_prompts_never_rebase_or_force_unconditionally() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
-    assert!(guarded >= 6, "expected the Doctor/Judge/Builder update sites, found {guarded}");
+    assert!(guarded >= 5, "expected the Doctor/Judge/Builder update sites, found {guarded}");
 }

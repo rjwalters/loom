@@ -70,6 +70,9 @@ path = "loom-daemon/src/merge_pr/stale_checks/fetch.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_wait_checks/reads.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/merge_pr/checks_failure/required.rs"
 
 [[operation]]
 id = "ci.workflow-runs-for-sha"
@@ -116,9 +119,6 @@ path = "loom-daemon/src/ci_telemetry/suites.rs"
 kind = "rust"
 path = "loom-daemon/src/gh_state_probe.rs"
 [[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/merge_pr/ci_result.rs"
-[[operation.callers]]
 kind = "script"
 path = "scripts/ci-image-inputs.sh"
 
@@ -154,13 +154,10 @@ caller_integration = "complete"
 unknowns = [
   "check-run timestamp granularity and clock source; #8248's ratchet compares a check's start against the base tip's commit time, so a provider with coarse or client-supplied timestamps changes the decision",
 ]
-notes = "#8248/#8508: a stale green is evidence about a tree that no longer exists. Exit 2 (cannot determine) must refuse the merge, which makes an unanswerable read a safe outcome rather than a pass."
+notes = "#8248/#8508: the freshness guard and its re-date remedy were deleted by #12063 slice 1 (required checks at the head are GitHub's); the reads stay for required-checks, checks-failure and zero-checks-settle until slice 2."
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/merge_pr/stale_checks/fetch.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/cli/merge_pr_stale_checks.rs"
 
 # --- branch-update-guarded-merge ---------------------------------------------
 

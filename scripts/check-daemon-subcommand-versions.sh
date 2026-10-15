@@ -3,6 +3,11 @@
 # `loom-daemon` subcommand must declare the minimum daemon version it needs
 # (issue #8285).
 #
+# STATUS (#12106): the ratchet no longer runs in CI and its baseline file is
+# gone. What CI still uses is `--list`, the detector `loom-daemon
+# install-compat check` reads to find every script's daemon dependency. The
+# declaration convention below stays the documented way to record a floor.
+#
 # ---------------------------------------------------------------------------
 # WHY
 # ---------------------------------------------------------------------------

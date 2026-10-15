@@ -11,7 +11,7 @@
 //! # Why an unrunnable guard is a warning here, not a refusal
 //!
 //! Every other merge GATE in this family fails closed when its binary is
-//! missing (`verdict-contradiction`, `stale-checks`, `loom-pr-guard`). This one
+//! missing (`verdict-contradiction`, `checks-failure`, `loom-pr-guard`). This one
 //! does not, and that is the guard's own documented contract rather than a
 //! convenience: since #7827 every guard-internal fault — a failed fetch, an
 //! unresolvable head, unknown ancestry, a checker that exits 2 — has skipped

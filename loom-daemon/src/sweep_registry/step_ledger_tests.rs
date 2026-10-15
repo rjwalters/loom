@@ -379,3 +379,48 @@ fn peer_step_cooldowns_join_the_query() {
     assert!(until <= now + chrono::Duration::hours(24), "a peer's window is capped too");
     assert!(until > now + chrono::Duration::hours(23));
 }
+
+/// #12152: a finished step's terminal bus event carries the ledger's
+/// classification and the registry's workspace, on its own topic.
+#[test]
+fn emit_step_ended_publishes_the_ledger_classification() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _rx) = registry(dir.path());
+    let bus = Arc::new(crate::event_bus::EventBus::new());
+    let mut sub = bus.subscribe(["step.item"]);
+    registry.set_event_bus(Arc::clone(&bus));
+    registry.emit_step_ended(&run(
+        42,
+        StepRole::ChampionMerge,
+        OutcomeClass::Verdict,
+        "merged",
+        90,
+    ));
+    let event = sub.try_recv().unwrap();
+    assert_eq!(event.topic(), "step.item.42.ended");
+    let crate::types::Event::StepEnded {
+        item,
+        role,
+        class,
+        reason,
+        ran_for_sec,
+        repo,
+    } = event
+    else {
+        panic!("expected StepEnded, got {event:?}");
+    };
+    assert_eq!((item, role), (42, StepRole::ChampionMerge));
+    assert_eq!((class.as_str(), reason.as_str(), ran_for_sec), ("verdict", "merged", 90));
+    assert_eq!(
+        repo.as_deref(),
+        Some(
+            registry
+                .config()
+                .workspace_root
+                .display()
+                .to_string()
+                .as_str()
+        )
+    );
+    assert!(sub.try_recv().is_err(), "exactly one event per ended step");
+}

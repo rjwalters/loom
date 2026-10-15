@@ -899,3 +899,17 @@ fn shed_pct_is_validated_between_target_and_full() {
     }));
     assert_eq!((cfg.shed_pct, w.len()), (75.0, 0));
 }
+
+/// #12207: in the agent front a reader directory comes from the environment,
+/// so a reader decision stands only for a private directory.
+#[test]
+fn the_front_uses_a_reader_only_when_its_directory_is_private() {
+    let reader = RouteDecision::Reader {
+        dir: PathBuf::from("/ws/.loom/gh-config-by-owner/acme/7"),
+        app_id: "7".into(),
+        placement: Placement::Home,
+    };
+    assert_eq!(trusted_in_front(reader.clone(), &|_| true), reader);
+    assert_eq!(trusted_in_front(reader, &|_| false), RouteDecision::NoPool);
+    assert_eq!(trusted_in_front(RouteDecision::NoPool, &|_| false), RouteDecision::NoPool);
+}

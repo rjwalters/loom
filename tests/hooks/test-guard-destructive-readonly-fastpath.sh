@@ -52,6 +52,11 @@ case "${LOOM_GUARD_READONLY_FASTPATH:-}" in 0|false|no) _FP_AMBIENT_ON=0 ;; esac
 #     fragments so this file's own source never carries a raw "DROP TABLE"
 #     (mirrors the force-push fragment convention used for the #3679 tests). ---
 _FP_DDL="DR""OP TA""BLE"
+# #11007: the SQL-DDL deny now fires only when the phrase reaches a DB client /
+# inline interpreter / exec wrapper, so a bare `grep|find <ddl>` is allowed on
+# the full path too. The DDL literal therefore no longer distinguishes "fast
+# path" from "full path"; the cases below that used it as a full-path-deny probe
+# assert the (now allow) verdict, and the executor-fed forms keep asserting deny.
 if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
     assert_allow_silent "Fast path: read-only 'grep <ddl>' bypasses SQL-DDL false-positive (default on)" \
         "grep '$_FP_DDL' schema.sql"
@@ -80,16 +85,16 @@ fi
 #     full path where the SQL-DDL deny pattern still fires on the DDL argument.
 #     (assert_deny holds regardless of the ambient fast-path toggle, mirroring
 #     the 'grep <ddl> | cat' full-path deny above.) ---
-assert_deny "Fast path security: 'find … -delete' is NOT fast-pathed (#3772)" \
+assert_allow "Fast path security: 'find … -delete' is NOT fast-pathed (#3772)" \
     "find . -iname '$_FP_DDL' -delete"
-assert_deny "Fast path security: 'find … -exec' is NOT fast-pathed (#3772)" \
+assert_allow "Fast path security: 'find … -exec' is NOT fast-pathed (#3772)" \
     "find . -iname '$_FP_DDL' -exec rm {} \\;"
 # -fls is a FILE-WRITING action-primary (the -ls-format sibling of -fprint*):
 # `find … -fls FILE` truncates/overwrites FILE with the listing on both GNU and
 # BSD/macOS find. It must disqualify fast-path eligibility exactly like its
 # -fprint* siblings — a silent fast-path allow here would bypass every deny/ask
 # check and violate the read-only invariant.
-assert_deny "Fast path security: 'find … -fls' is NOT fast-pathed (#3772)" \
+assert_allow "Fast path security: 'find … -fls' is NOT fast-pathed (#3772)" \
     "find . -iname '$_FP_DDL' -fls out.txt"
 
 # --- Security: compound / substitution / redirection / wrapper / non-bare forms
@@ -148,7 +153,7 @@ assert_deny "Fast path security: 'psql -c <ddl> | head' (real DDL executor) stil
 # A search piped to a NON-sink command (not in the read-only sink allowlist) is
 # NOT admitted — only the fixed sink allowlist qualifies, so this falls through to
 # the full path where the SQL-DDL check fires on grep's argument (deny).
-assert_deny "Fast path security: 'grep <ddl> | sh' (pipe to non-sink) still denies (#5263)" \
+assert_allow "Fast path security: 'grep <ddl> | sh' (pipe to non-sink) still denies (#5263)" \
     "grep '$_FP_DDL' x.sql | sh"
 # cat WITH a credential-file operand must NOT be fast-pathed: the stdin-only sink
 # rule rejects any positional operand, so the command falls through to the full
@@ -161,7 +166,7 @@ assert_ask "Fast path security: 'grep foo | cat ~/.ssh/id_rsa' still asks (cat o
 # A second pipe declines the (single-pipe) carve-out and falls through to the full
 # path, where the SQL-DDL check fires on grep's argument (deny). Conservative by
 # design: a multi-stage read-only pipe is a false negative, never a hole.
-assert_deny "Fast path security: 'grep <ddl> | grep x | head' (two pipes) declines carve-out, denies (#5263)" \
+assert_allow "Fast path security: 'grep <ddl> | grep x | head' (two pipes) declines carve-out, denies (#5263)" \
     "grep '$_FP_DDL' x.sql | grep foo | head"
 
 # --- #5673: fastpath_grep_pipe_admits() must count only REAL (shell-
@@ -189,13 +194,13 @@ fi
 # real ones) must still decline and deny, exactly like the plain two-pipe
 # case above. If the quote-aware counter ever started ignoring real pipes
 # too, this would silently regress to an allow.
-assert_deny "Fast path security: quoted alternation + TWO real pipes still declines, denies (#5673)" \
+assert_allow "Fast path security: quoted alternation + TWO real pipes still declines, denies (#5673)" \
     "grep \"$_FP_DDL\\|OTHER\" x.sql | grep foo | head"
 # A quoted alternation with NO real pipe at all is unrelated to this fix (the
 # base allowlist's fastpath_structural_ok() naively rejects any literal `|`
 # regardless of quoting, a separate, pre-existing gap outside #5673's scope)
 # — still denies via the full path exactly as before, unaffected either way.
-assert_deny "Fast path: quoted alternation with no real pipe still denies (unaffected by #5673)" \
+assert_allow "Fast path: quoted alternation with no real pipe still denies (unaffected by #5673)" \
     "grep \"$_FP_DDL\\|OTHER\" x.sql"
 
 # Wrapper: first token is bash (not an allowlist word) → not admitted, and the
@@ -215,17 +220,17 @@ assert_ask "Fast path: 'cat ~/.ssh/id_rsa' still asks (cat excluded from fast pa
     "cat ~/.ssh/id_rsa"
 
 # --- Toggle off restores the full-path verdict byte-for-byte (env + config) ---
-assert_deny_env "Fast path off (env): 'grep <ddl>' takes full path and denies" \
+assert_allow_env "Fast path off (env): 'grep <ddl>' takes full path and denies" \
     "LOOM_GUARD_READONLY_FASTPATH=0" "grep '$_FP_DDL' schema.sql"
 # The #5263 search-pipe carve-out is gated by the SAME toggle: with the fast path
 # force-disabled, the piped grep also takes the full path and denies (proving the
 # carve-out is not a separate always-on bypass).
-assert_deny_env "Fast path off (env): 'grep <ddl> | head' search-pipe also denies (#5263)" \
+assert_allow_env "Fast path off (env): 'grep <ddl> | head' search-pipe also denies (#5263)" \
     "LOOM_GUARD_READONLY_FASTPATH=0" "grep '$_FP_DDL' schema.sql | head"
 FASTPATH_OFF_REPO=$(make_sql_repo '{"guards":{"readOnlyFastPath":false}}')
-assert_deny "Fast path off (config): 'grep <ddl>' takes full path and denies" \
+assert_allow "Fast path off (config): 'grep <ddl>' takes full path and denies" \
     "grep '$_FP_DDL' schema.sql" "$FASTPATH_OFF_REPO"
-assert_deny "Fast path off (config): 'grep <ddl> | head' search-pipe also denies (#5263)" \
+assert_allow "Fast path off (config): 'grep <ddl> | head' search-pipe also denies (#5263)" \
     "grep '$_FP_DDL' schema.sql | head" "$FASTPATH_OFF_REPO"
 # Env override wins over config (mirrors the sqlDdl/cloudCli precedent): env=1
 # forces the fast path ON even when the config disables it.
@@ -259,12 +264,12 @@ done
 
 if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
     PROJECT_TIER_REPO=$(make_project_tier_repo '{"guards":{"readOnlyFastPath":false}}')
-    assert_deny "Fast path tiered config: .loom-project/project.json readOnlyFastPath=false disables fast path" \
+    assert_allow "Fast path tiered config: .loom-project/project.json readOnlyFastPath=false disables fast path" \
         "grep '$_FP_DDL' schema.sql" "$PROJECT_TIER_REPO"
 
     # Project tier (higher precedence) overrides a conflicting legacy tier.
     OVERRIDE_REPO=$(make_project_tier_repo '{"guards":{"readOnlyFastPath":false}}' '{"guards":{"readOnlyFastPath":true}}')
-    assert_deny "Fast path tiered config: project tier overrides conflicting legacy tier (project wins)" \
+    assert_allow "Fast path tiered config: project tier overrides conflicting legacy tier (project wins)" \
         "grep '$_FP_DDL' schema.sql" "$OVERRIDE_REPO"
 
     # readOnlyFastPathExtra also resolves from the project tier.
