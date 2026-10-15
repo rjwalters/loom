@@ -1090,10 +1090,21 @@ impl GhForgeReads {
     }
 }
 
+/// The `github.operation` of each per-item read below (2026-10-15: they
+/// were all the generic `api.rest`, so the writer's spend on them could not
+/// be told apart). Every one is a [`crate::gh_invocation::ReadClass::Observability`]
+/// read: shed, never sent to the writer, when no reader can serve it.
+pub const PULL_OP: &str = "fleet_state.pull";
+pub const ISSUE_OP: &str = "fleet_state.issue";
+pub const CLOSE_EVENTS_OP: &str = "fleet_state.close_events";
+pub const CLOSE_TIMELINE_OP: &str = "fleet_state.close_timeline";
+pub const LABEL_EVENTS_OP: &str = "fleet_state.label_events";
+
 impl ForgeReads for GhForgeReads {
     fn pull(&mut self, repo: &str, number: u32) -> Option<PullFacts> {
         let pull = crate::observability::ops::stage_dwell::gh_json(
             self.root(repo)?,
+            PULL_OP,
             &format!("repos/{repo}/pulls/{number}"),
         )?;
         Some(PullFacts {
@@ -1106,6 +1117,7 @@ impl ForgeReads for GhForgeReads {
         let root = self.root(repo)?.to_path_buf();
         let issue = crate::observability::ops::stage_dwell::gh_json(
             &root,
+            ISSUE_OP,
             &format!("repos/{repo}/issues/{number}"),
         )?;
         let Some(closed_at) = parse_instant(issue["closed_at"].as_str()) else {
@@ -1114,11 +1126,12 @@ impl ForgeReads for GhForgeReads {
         // Whether a merge closed it is on the `closed` event's `commit_id`
         // or, for a `Closes #N` merge (null `commit_id`), a merged PR in the
         // timeline; a failed page is a failed read, retried next pass.
-        let read_pages = |kind: &str| -> Option<Vec<serde_json::Value>> {
+        let read_pages = |kind: &str, op: &'static str| -> Option<Vec<serde_json::Value>> {
             let mut pages = Vec::new();
             for page in 1.. {
                 let batch = crate::observability::ops::stage_dwell::gh_json(
                     &root,
+                    op,
                     &format!(
                         "repos/{repo}/issues/{number}/{kind}?per_page={EVENTS_PAGE_SIZE}&page={page}"
                     ),
@@ -1131,8 +1144,8 @@ impl ForgeReads for GhForgeReads {
             }
             Some(pages)
         };
-        let events = read_pages("events")?;
-        let timeline = read_pages("timeline")?;
+        let events = read_pages("events", CLOSE_EVENTS_OP)?;
+        let timeline = read_pages("timeline", CLOSE_TIMELINE_OP)?;
         Some(IssueFacts::closed(repo, number, closed_at, &events, &timeline))
     }
 
@@ -1141,6 +1154,7 @@ impl ForgeReads for GhForgeReads {
         LabelHistory::read(|page| {
             crate::observability::ops::stage_dwell::gh_json(
                 &root,
+                LABEL_EVENTS_OP,
                 &format!(
                     "repos/{repo}/issues/{number}/events?per_page={EVENTS_PAGE_SIZE}&page={page}"
                 ),

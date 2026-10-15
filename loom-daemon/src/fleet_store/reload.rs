@@ -98,6 +98,9 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from config each time a red-main fix is waiting (#10118) —
     // `main_red_fix::escalate_after`, never cached.
     ("autonomous.workFinder.redFixEscalateAfterSecs", Reloadability::Live),
+    // Read from config at the start of every work-finder tick (#12074) —
+    // `step_dispatch::gather_budget::begin_tick`, never cached.
+    ("autonomous.workFinder.tickDeadlineSecs", Reloadability::Live),
     // Everything else under `autonomous.workFinder` is resolved once at
     // daemon bring-up in `daemon_service.rs`'s work-finder startup block,
     // before the loop is spawned: `enabled` (gates whether the loop is

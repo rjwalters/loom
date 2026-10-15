@@ -2877,6 +2877,8 @@ pub fn spawn_multi_work_finder_task(
         let mut step_driver = crate::step_dispatch::driver::StepDriver::default();
         loop {
             ticker.tick().await;
+            // #12074: one INFO line per tick body, and its wall-clock deadline.
+            let tick_budget = crate::step_dispatch::gather_budget::begin_tick(&fallback_root);
 
             // #8121: reload the registry and provision any newly-registered
             // root's `SweepRegistry` BEFORE the rate-limit breaker check
@@ -2975,6 +2977,11 @@ pub fn spawn_multi_work_finder_task(
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
             let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
+            // #12074: from here to the step tick nothing awaits, so every forge
+            // read in between is bounded by the tick deadline and fails fast
+            // past it; a listing does not fall through to the writer.
+            let tick_deadline = std::time::Instant::now() + tick_budget;
+            let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline, true);
 
             // `roots` was already resolved (registry reload + missing-root
             // filtering) by `refresh_local_workspace_state` above, before the
@@ -3184,7 +3191,9 @@ pub fn spawn_multi_work_finder_task(
                 max_admissions: max_admissions_per_tick,
                 saturation_held,
                 limits: (max_concurrent_per_repo, ram_budget, disk_budget).into(),
+                deadline: Some(tick_deadline),
             });
+            drop(read_scope);
 
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).

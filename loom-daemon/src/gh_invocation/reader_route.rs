@@ -145,6 +145,12 @@ impl GhInvocation {
 /// What a failed gateway attempt calls for
 /// ([`crate::forge_gateway::outage::fault`]); a timeout reruns.
 pub(super) fn gateway_fault(result: &GhCompletion) -> Fault {
+    crate::forge_gateway::outage::escalate(classify_gateway_fault(result))
+}
+
+/// [`gateway_fault`] for one attempt alone, before the consecutive-rerun
+/// escalation (#12074).
+fn classify_gateway_fault(result: &GhCompletion) -> Fault {
     let out = match result {
         GhCompletion::Captured(Completion::TimedOut { .. }) => return Fault::Rerun,
         GhCompletion::Captured(Completion::Exited(out)) if !out.status.success() => out,
