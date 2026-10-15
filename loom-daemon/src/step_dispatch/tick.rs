@@ -513,4 +513,4 @@ fn resolve(rows: &mut [TickQueueRow], key: &PriorityCandidate, d: Qd, detail: Op
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "tick_tests.rs"]
-mod tests;
+pub(crate) mod tests;

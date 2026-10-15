@@ -36,25 +36,32 @@ impl SweepRegistry {
 
 impl SweepRegistry {
     /// A `role` step got past token selection with a named account: its
-    /// pool hands out credentials again. Drop the role's `RoleTick` entry and
-    /// re-check the workspace's pre-flight hold, as an issue dispatch past
-    /// token selection does (`clear_token_selection_failures`, #6614), so
-    /// one recovered role lifts a hold the step refusals tripped (#11909).
-    /// Only this role's entry goes: another role's pool may still be empty.
+    /// pool hands out credentials again. Drop the role's `RoleTick` entry,
+    /// then re-check the workspace's pre-flight hold whenever an entry went
+    /// or the hold stands, as an issue dispatch past token selection does
+    /// (`clear_token_selection_failures`, #6614).
+    ///
+    /// The re-check must not wait on this role having had an entry: the
+    /// draw skips exhausted roles, so the hold's recovery probe is always a
+    /// role without one, and the hold is a stored flag that only a re-check
+    /// clears (aged-out entries included). Only this role's entry goes:
+    /// another role's pool may still be empty. Returns whether one went.
     pub(crate) fn clear_role_tick_pool_exhausted(&mut self, role: &str) -> bool {
         let source = TokenSelectionFailureSource::RoleTick {
             root: self.config.workspace_root.clone(),
             role: role.to_string(),
         };
-        if self.token_selection_failures.remove(&source).is_none() {
-            return false;
+        let removed = self.token_selection_failures.remove(&source).is_some();
+        if removed {
+            log::info!(
+                "sweep_registry: a {role} step got past token selection — its pool-exhausted \
+                 mark is cleared (#11909)"
+            );
         }
-        log::info!(
-            "sweep_registry: a {role} step got past token selection — its pool-exhausted mark \
-             is cleared (#11909)"
-        );
-        self.update_preflight_advisory();
-        true
+        if removed || self.preflight_advisory_tripped {
+            self.update_preflight_advisory();
+        }
+        removed
     }
 }
 
@@ -66,29 +73,44 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
-    /// Three roles' exhausted pools trip the empty-pool hold; one role's
-    /// recovery takes its entry out and the hold re-evaluates below the
-    /// threshold (#11909).
-    #[test]
-    #[serial]
-    fn one_recovered_role_lifts_the_hold_its_refusals_tripped() {
-        let dir = tempdir().unwrap();
-        let (mut reg, _) = fixture_registry(dir.path());
+    fn exhausted_registry(dir: &Path) -> SweepRegistry {
+        std::env::remove_var(EMPTY_POOL_BREAKER_THRESHOLD_ENV);
+        std::env::remove_var(EMPTY_POOL_BREAKER_WINDOW_ENV);
+        let (mut reg, _) = fixture_registry(dir);
         for role in ["curator", "judge", "doctor"] {
             reg.record_role_tick_pool_exhausted(role);
         }
-        let now = Utc::now();
-        let threshold = resolve_empty_pool_breaker_threshold();
-        assert_eq!(reg.token_selection_failure_count(now), 3);
-        assert_eq!(reg.empty_pool_breaker_tripped(now), 3 >= threshold);
-        assert_eq!(reg.pool_exhausted_roles(now).len(), 3);
+        assert!(reg.preflight_advisory().0, "three exhausted roles hold the workspace");
+        reg
+    }
 
+    /// One recovered role lifts the hold its refusals tripped (#11909).
+    #[test]
+    #[serial]
+    fn one_recovered_role_lifts_the_stored_hold() {
+        let dir = tempdir().unwrap();
+        let mut reg = exhausted_registry(dir.path());
         assert!(reg.clear_role_tick_pool_exhausted("judge"));
+        assert!(!reg.preflight_advisory().0, "the stored hold lifts");
+        assert!(!reg.pool_exhausted_roles(Utc::now()).contains("judge"));
         assert!(!reg.clear_role_tick_pool_exhausted("judge"), "already cleared");
-        assert_eq!(reg.token_selection_failure_count(now), 2);
-        assert!(!reg.pool_exhausted_roles(now).contains("judge"));
-        if threshold == 3 {
-            assert!(!reg.empty_pool_breaker_tripped(now), "the hold lifts");
+    }
+
+    /// The draw skips exhausted roles, so the hold's probe is a role with no
+    /// entry. Once the entries have aged out of the window, that success
+    /// must still clear the stored hold.
+    #[test]
+    #[serial]
+    fn a_success_of_an_unmarked_role_clears_an_aged_out_hold() {
+        let dir = tempdir().unwrap();
+        let mut reg = exhausted_registry(dir.path());
+        let old =
+            Utc::now() - chrono::Duration::seconds(resolve_empty_pool_breaker_window_secs() + 60);
+        for at in reg.token_selection_failures.values_mut() {
+            *at = old;
         }
+        assert!(reg.preflight_advisory().0, "a stored flag: aging alone does not clear it");
+        assert!(!reg.clear_role_tick_pool_exhausted("builder"), "builder had no entry");
+        assert!(!reg.preflight_advisory().0, "the success re-checks and lifts the hold");
     }
 }

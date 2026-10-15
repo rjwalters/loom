@@ -94,8 +94,10 @@ pub struct Gathered {
 
 /// How old a last good listing may be and still stand in for a failed one.
 /// A fleet-wide forge outage (a secondary rate limit) would otherwise stop
-/// every item dispatch everywhere; a short window rides it out, and every
-/// claim still re-reads the forge.
+/// every item dispatch everywhere; a short window rides it out. The
+/// non-Builder claims (the role-keyed lease) re-read the forge; a Builder
+/// claim is a blind label flip, so no Builder step is drawn from it
+/// ([`Gathered::stale_listing`]).
 pub const LAST_GOOD_TTL: Duration = Duration::from_secs(10 * 60);
 
 type LastGood = HashMap<String, (Instant, Vec<RestIssue>)>;
