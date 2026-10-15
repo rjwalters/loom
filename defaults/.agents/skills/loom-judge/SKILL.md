@@ -753,6 +753,12 @@ nothing re-queued the PR until an operator cleared the label by hand. The
 inverse is the direction to fear: a `loom:pr` approval that survives a
 force-push lets Champion auto-merge a tree **nobody approved**.
 
+**Canonical spelling**: the marker's `verdict=` token is `approved` or
+`changes-requested`; `post-verdict.sh` accepts and writes only those. Readers
+(the staleness guard, `extract_latest_verdict_sha`) are lenient and also
+tolerate `approve` / `request-changes` in a hand-posted marker (#12104) — never
+emit those spellings yourself.
+
 **The rule**: every verdict-label write in this document is posted through
 
 ```bash
