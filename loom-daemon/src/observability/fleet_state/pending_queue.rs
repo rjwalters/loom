@@ -3,6 +3,7 @@
 //! the operator-held items derived from the view's rows and PR census.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use super::{FleetView, RepoView};
 use crate::telemetry::kinds::fleet_state::{FleetHoldKind, FleetQueueDepth, FleetStage};
@@ -42,6 +43,33 @@ pub(super) fn operator_held(repo: &RepoView) -> Option<u32> {
         .unwrap_or(usize::MAX)
         .saturating_sub(merge_hold_rows);
     Some(u32::try_from(held_rows + unrowed).unwrap_or(u32::MAX))
+}
+
+/// The last complete collector-pass `(awaiting_curation, awaiting_approval)`
+/// eligible counts per repo (#11955), carried here between passes so a tick
+/// pass re-stamps the same `pending_queue` a reader saw (never a stale guess
+/// from a partial listing). Owned by this sibling module rather than
+/// `PassState` per the file-size policy; the collector/tick entry points hold
+/// the pass lock, so access is already serialised.
+static LAST_ELIGIBLE: Mutex<BTreeMap<String, (u32, u32)>> = Mutex::new(BTreeMap::new());
+
+/// Collector pass: record this pass's eligible counts — a repo whose triage or
+/// curated listing was incomplete drops out (unknown, never zero) — then stamp
+/// the view.
+pub(super) fn observe(view: &mut FleetView, eligible: BTreeMap<String, (u32, u32)>) {
+    let mut last = LAST_ELIGIBLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *last = eligible;
+    annotate_pending(view, &last);
+}
+
+/// Tick pass: re-stamp from the last collector-pass counts (no forge read).
+pub(super) fn restamp(view: &mut FleetView) {
+    let last = LAST_ELIGIBLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    annotate_pending(view, &last);
 }
 
 /// Stamp each repo with its pending-human queue depth (#11955) from the last

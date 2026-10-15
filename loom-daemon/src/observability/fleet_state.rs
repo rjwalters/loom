@@ -960,9 +960,6 @@ struct PassState {
     flow: QueueFlowTracker,
     /// Per-repo `loom:triage` arrival/drain history (#11642).
     triage_flow: QueueFlowTracker,
-    /// Per-repo `(awaiting_curation, awaiting_approval)` eligible counts of the
-    /// last collector pass that read both listings whole (#11955).
-    eligible: BTreeMap<String, (u32, u32)>,
 }
 
 static STATE: Mutex<PassState> = Mutex::new(PassState {
@@ -971,7 +968,6 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
     enrich: enrich::EnrichMemory::new(),
     flow: QueueFlowTracker::new(QUEUE_FLOW_WINDOW_SECS),
     triage_flow: QueueFlowTracker::new(QUEUE_FLOW_WINDOW_SECS),
-    eligible: BTreeMap::new(),
     outcomes: outcomes::Memory {
         listed: BTreeMap::new(),
         unread: BTreeMap::new(),
@@ -1147,10 +1143,9 @@ pub(super) async fn record(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         annotate_flow(&mut view, &mut live.flow, input.ready.as_ref(), now);
         annotate_triage(&mut view, &mut live.triage_flow, Some(&triage_sets), now);
-        // A repo whose listing was incomplete this pass drops out: unknown.
-        live.eligible = eligible;
-        pending_queue::annotate_pending(&mut view, &live.eligible);
     }
+    // A repo whose listing was incomplete this pass drops out: unknown.
+    pending_queue::observe(&mut view, eligible);
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;
@@ -1185,8 +1180,8 @@ async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_po
         // No forge read on a tick pass: re-stamp triage from the tracker's
         // last collector-pass observation (#11642).
         annotate_triage(&mut view, &mut live.triage_flow, None, now);
-        pending_queue::annotate_pending(&mut view, &live.eligible);
     }
+    pending_queue::restamp(&mut view);
     send(sink, workspace_root, view, state, now, &reused);
 }
 
