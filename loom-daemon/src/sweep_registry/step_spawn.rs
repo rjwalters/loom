@@ -52,6 +52,7 @@ use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 pub(crate) mod capture;
 pub mod draw_claims;
 pub mod ended;
+pub mod launch_gate;
 pub(crate) mod lease;
 mod pool_state;
 pub(crate) mod span;
@@ -220,7 +221,7 @@ impl SweepRegistry {
             self.unwind_step_claim(item, role, &sweep_id, false);
             return Err(refusal);
         }
-        self.spawn_prepared_step(request, &sweep_id, launch)
+        self.spawn_prepared_step(request, &sweep_id, launch, false)
     }
 
     /// Refuse a step whose `/loom:<role>` command is not installed in the
@@ -250,27 +251,41 @@ impl SweepRegistry {
     }
 
     /// The claimed step's launch: the stagger and the child. A failed spawn
-    /// undoes the claim.
+    /// undoes the claim. `host_gate` (a concurrent tick's spawn, #12298)
+    /// also launches through the host-wide gap
+    /// ([`launch_gate::HOST_LAUNCH_GATE`]), so children in different repos
+    /// launch at least the stagger apart too.
     fn spawn_prepared_step(
         &mut self,
         request: &StepSpawnRequest,
         sweep_id: &str,
         launch: StepLaunch,
+        host_gate: bool,
     ) -> std::result::Result<PreparedStep, StepRefusal> {
         let (item, role, kind) = (request.item, request.role, request.kind());
         let sweep_id = sweep_id.to_string();
         self.apply_dispatch_stagger();
         let log_path = self.compute_step_log_path(item, role);
-        match self.spawn_child_process(
-            &kind,
-            &log_path,
-            &sweep_id,
-            launch.model.as_deref(),
-            launch.effort.as_deref(),
-            None,
-            launch.admission.admitted.as_ref(),
-            launch.selection.as_ref(),
-        ) {
+        let spawn = |reg: &Self| {
+            reg.spawn_child_process(
+                &kind,
+                &log_path,
+                &sweep_id,
+                launch.model.as_deref(),
+                launch.effort.as_deref(),
+                None,
+                launch.admission.admitted.as_ref(),
+                launch.selection.as_ref(),
+            )
+        };
+        let spawned = if host_gate {
+            let gap = self.dispatch_stagger;
+            let this = &*self;
+            launch_gate::HOST_LAUNCH_GATE.launch(gap, || spawn(this))
+        } else {
+            spawn(self)
+        };
+        match spawned {
             Ok((child, header_anchor)) => Ok(PreparedStep {
                 child,
                 header_anchor,

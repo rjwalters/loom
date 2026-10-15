@@ -190,7 +190,7 @@ impl StepSpawner for RegistrySpawner {
 
     fn spawn(&mut self, idx: usize, request: &StepSpawnRequest) -> SpawnResult {
         let started = Instant::now();
-        let (result, parts) = self.spawn_one(idx, request);
+        let (result, parts) = self.spawn_one(idx, request, self.concurrency > 1);
         self.spent += started.elapsed();
         self.attempts += 1;
         self.parts.add(&parts);
@@ -222,7 +222,7 @@ impl StepSpawner for RegistrySpawner {
                     runtime.as_ref().map(tokio::runtime::Handle::enter),
                 )
             },
-            |_, (idx, request)| Some(this.spawn_one(idx, &request)),
+            |_, (idx, request)| Some(this.spawn_one(idx, &request, true)),
         );
         self.spent += started.elapsed();
         self.attempts += batch.len();
@@ -243,12 +243,22 @@ impl StepSpawner for RegistrySpawner {
 }
 
 impl RegistrySpawner {
-    fn spawn_one(&self, idx: usize, request: &StepSpawnRequest) -> (SpawnResult, StepSpawnTimings) {
+    /// One spawn. `host_gate`: the tick runs spawns concurrently, so the
+    /// launch keeps the host-wide stagger gap (#3887, #12298); a serial
+    /// tick (`spawnConcurrency` 1) launches exactly as before.
+    fn spawn_one(
+        &self,
+        idx: usize,
+        request: &StepSpawnRequest,
+        host_gate: bool,
+    ) -> (SpawnResult, StepSpawnTimings) {
         let mut parts = StepSpawnTimings::default();
         let Some(registry) = self.registries.get(idx) else {
             return (SpawnResult::Refused("spawn_failed".to_string()), parts);
         };
-        let result = match SweepRegistry::spawn_step_unlocked_timed(registry, request, &mut parts) {
+        let result = match SweepRegistry::spawn_step_unlocked_timed(
+            registry, request, &mut parts, host_gate,
+        ) {
             Ok(_) => SpawnResult::Spawned,
             Err(e) => {
                 let reason = refusal_reason(&e);
