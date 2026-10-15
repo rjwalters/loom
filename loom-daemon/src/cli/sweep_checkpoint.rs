@@ -3,7 +3,6 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use loom_daemon::telemetry::SweepResult;
 use serde_json::{json, Value};
 
 const PHASES: &[&str] = &[
@@ -160,15 +159,6 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
     }
     if command == "delete" {
         escalation::reset_on_delete(&dir, &target, &args[2..])?;
-        // Every delete marks the issue terminal (merged, or found closed), so
-        // an in-session sweep still driving it has ended (#11563).
-        let pr = std::fs::read(&target)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| v["pr_number"].as_u64())
-            .and_then(|n| u32::try_from(n).ok());
-        let ws = root.to_string_lossy();
-        super::presence::on_sweep_finished(&ws, issue.into(), SweepResult::Success, pr);
         return match std::fs::remove_file(&target) {
             Ok(()) => {
                 std::fs::File::open(&dir)

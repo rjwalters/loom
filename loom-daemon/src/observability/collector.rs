@@ -151,6 +151,14 @@ async fn run_collector(
     // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
     let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
     ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `operator.presence` and in-session sweep facts, derived from the
+    // session transcripts and lease records on this host (#12121).
+    let mut presence_timer = tokio::time::interval(super::presence_derive::TICK);
+    presence_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let presence = Arc::new(std::sync::Mutex::new(super::presence_derive::Deriver::new(
+        host_id.clone(),
+        &workspace_root,
+    )));
     // The pass's forge gathers (captain facts, stage dwell, fleet state) on
     // the snapshot cadence, first fired after this host's startup jitter
     // (#12073) so a fleet that restarts together does not gather at once.
@@ -216,6 +224,17 @@ async fn run_collector(
                 super::ops::ratelimit::record(&workspace_root).await;
             }
 
+            _ = presence_timer.tick() => {
+                derive_presence(
+                    &presence,
+                    queue.as_ref(),
+                    &workspace_root,
+                    &workspace_pool,
+                    &mut slug_cache,
+                )
+                .await;
+            }
+
             _ = snapshot_timer.tick() => {
                 sample_snapshots(
                     queue.as_ref(),
@@ -234,6 +253,37 @@ async fn run_collector(
                 run_backfill(&queue, &workspace_root, &workspace_pool).await;
             }
         }
+    }
+}
+
+/// One presence-derivation tick (#12121): skipped when the operator opted
+/// out, otherwise run off the reactor (it reads transcripts and a few small
+/// files) and offered to the queue like any other record.
+async fn derive_presence(
+    presence: &Arc<std::sync::Mutex<super::presence_derive::Deriver>>,
+    queue: &dyn QueueSink,
+    workspace_root: &Path,
+    workspace_pool: &WorkspacePool,
+    slug_cache: &mut HashMap<String, String>,
+) {
+    if !super::presence_derive::enabled() {
+        return;
+    }
+    let dispatched: std::collections::HashSet<String> = collect_active_sweep_ids(workspace_pool)
+        .into_iter()
+        .collect();
+    let slug = resolve_repo_slug_cached(slug_cache, &workspace_root.display().to_string()).await;
+    let (deriver, root) = (Arc::clone(presence), workspace_root.to_path_buf());
+    let envelopes = tokio::task::spawn_blocking(move || {
+        deriver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tick(Utc::now(), &dispatched, slug.as_deref().map(|s| (s, root.as_path())))
+    })
+    .await
+    .unwrap_or_default();
+    for envelope in envelopes {
+        queue.offer(envelope);
     }
 }
 
