@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use chrono::{DateTime, Duration, Utc};
 
+use super::FleetView;
 use crate::telemetry::kinds::fleet_state::FleetQueueFlow;
 
 /// The default trailing window `fleet.state` counts arrivals and drains over
@@ -141,6 +142,37 @@ impl QueueFlowTracker {
 fn expire(q: &mut VecDeque<DateTime<Utc>>, cutoff: DateTime<Utc>) {
     while q.front().is_some_and(|&t| t < cutoff) {
         q.pop_front();
+    }
+}
+
+/// Fold this pass's `loom:triage` sets into `tracker` and stamp each repo's
+/// `RepoView` with its triage depth and flow (#11642), the pre-ready
+/// analogue of `annotate_flow`. Only the collector pass reads the triage
+/// listings (`triage` is `Some`), and `label_listings` already drops any repo
+/// whose listing came back partial — so every repo present was read whole.
+/// A tick pass passes `None`: it re-stamps each repo from the tracker's last
+/// observed set, so the facts persist unchanged between the collector's forge
+/// passes (no delta churn, as `annotate_flow`'s idle repos do not churn).
+pub(super) fn annotate_triage(
+    view: &mut FleetView,
+    tracker: &mut QueueFlowTracker,
+    triage: Option<&BTreeMap<String, BTreeSet<u32>>>,
+    now: DateTime<Utc>,
+) {
+    if let Some(sets) = triage {
+        for (repo, set) in sets {
+            tracker.observe(repo, set, now);
+        }
+    }
+    // Re-stamp every repo the tracker knows (both passes): the depth is its
+    // last observed set size, stable between the collector's forge reads.
+    for repo in tracker.observed_repos() {
+        let Some(depth) = tracker.depth(repo) else {
+            continue;
+        };
+        let state = view.repos.entry(repo.to_string()).or_default();
+        state.triage_depth = Some(depth);
+        state.triage_flow = tracker.flow(repo, now);
     }
 }
 

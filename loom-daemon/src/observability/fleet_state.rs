@@ -73,6 +73,7 @@ use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, Telem
 pub mod enrich;
 mod flow;
 pub mod history;
+mod operator_recency;
 pub mod outcomes;
 mod pending_queue;
 mod pre_ready_journal;
@@ -80,7 +81,7 @@ mod sources;
 mod step_rows;
 pub use step_rows::step_stage;
 
-use flow::{QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
+use flow::{annotate_triage, QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
 
 /// The review labels whose listings give the PR stages and the census.
 pub const REVIEW_LABELS: [&str; 3] = ["loom:review-requested", "loom:changes-requested", "loom:pr"];
@@ -388,6 +389,8 @@ pub struct RepoView {
     /// The repo's pending-human queue depth (#11955). Absent = unknown, never
     /// zero.
     pub pending_queue: Option<FleetQueueDepth>,
+    /// The repo's operator-action recency (#11956). Absent = unknown.
+    pub operator_recency: Option<crate::telemetry::kinds::fleet_state::FleetOperatorRecency>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -764,6 +767,7 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         triage_flow: state.and_then(|r| r.triage_flow),
         curator: state.and_then(|r| r.curator.clone()),
         pending_queue: state.and_then(|r| r.pending_queue),
+        operator_recency: state.and_then(|r| r.operator_recency),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -868,6 +872,7 @@ pub fn decide(
             && now_state.triage_flow == was.triage_flow
             && now_state.curator == was.curator
             && now_state.pending_queue == was.pending_queue
+            && now_state.operator_recency == was.operator_recency
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -1145,7 +1150,7 @@ pub(super) async fn record(
         annotate_triage(&mut view, &mut live.triage_flow, Some(&triage_sets), now);
     }
     // A repo whose listing was incomplete this pass drops out: unknown.
-    pending_queue::observe(&mut view, eligible);
+    pending_queue::observe(&mut view, eligible, now);
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;
@@ -1181,7 +1186,7 @@ async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_po
         // last collector-pass observation (#11642).
         annotate_triage(&mut view, &mut live.triage_flow, None, now);
     }
-    pending_queue::restamp(&mut view);
+    pending_queue::restamp(&mut view, now);
     send(sink, workspace_root, view, state, now, &reused);
 }
 
@@ -1215,37 +1220,6 @@ fn annotate_flow(
         let state = view.repos.entry(repo.clone()).or_default();
         state.queue_depth = Some(u32::try_from(set.len()).unwrap_or(u32::MAX));
         state.flow = tracker.flow(repo, now);
-    }
-}
-
-/// Fold this pass's `loom:triage` sets into `tracker` and stamp each repo's
-/// [`RepoView`] with its triage depth and flow (#11642), the pre-ready
-/// analogue of [`annotate_flow`]. Only the collector pass reads the triage
-/// listings (`triage` is `Some`), and `label_listings` already drops any repo
-/// whose listing came back partial — so every repo present was read whole.
-/// A tick pass passes `None`: it re-stamps each repo from the tracker's last
-/// observed set, so the facts persist unchanged between the collector's forge
-/// passes (no delta churn, as [`annotate_flow`]'s idle repos do not churn).
-fn annotate_triage(
-    view: &mut FleetView,
-    tracker: &mut QueueFlowTracker,
-    triage: Option<&BTreeMap<String, BTreeSet<u32>>>,
-    now: DateTime<Utc>,
-) {
-    if let Some(sets) = triage {
-        for (repo, set) in sets {
-            tracker.observe(repo, set, now);
-        }
-    }
-    // Re-stamp every repo the tracker knows (both passes): the depth is its
-    // last observed set size, stable between the collector's forge reads.
-    for repo in tracker.observed_repos() {
-        let Some(depth) = tracker.depth(repo) else {
-            continue;
-        };
-        let state = view.repos.entry(repo.to_string()).or_default();
-        state.triage_depth = Some(depth);
-        state.triage_flow = tracker.flow(repo, now);
     }
 }
 
