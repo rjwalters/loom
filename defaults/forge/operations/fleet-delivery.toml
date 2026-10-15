@@ -592,15 +592,12 @@ platform_support = "documented"
 adapter_coverage = "partial"
 caller_integration = "partial"
 unknowns = [
-  "whether a ref update can be made non-fast-forward-safe only with an expected-SHA precondition; redate and fleet-config propose both rely on losing a race rather than overwriting",
+  "whether a ref update can be made non-fast-forward-safe only with an expected-SHA precondition; fleet-config propose relies on losing a race rather than overwriting",
 ]
 notes = "Native Git can replace these, but only if the branch/SHA guards are preserved — an unguarded push is not an equivalent implementation."
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet_store/propose/mod.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/merge_pr/redate.rs"
 
 # --- ci-diagnostics-remediation ----------------------------------------------
 

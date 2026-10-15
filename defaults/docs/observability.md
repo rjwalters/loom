@@ -700,7 +700,9 @@ sweeps (so `busy_slots{role="sweep"} + idle_slots = max_concurrent`), and each
 role-runner role has its own series, with the role pool's ceiling and spare
 in `loom.dispatch.role_max_concurrent` and `loom.dispatch.role_idle_slots`.
 Forge label-stage dwell
-(`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state, repo}`)
+(`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state, repo}`;
+**off by default** since #12203, switched on by `observability.stageDwell.enabled`,
+so these series are absent on a default fleet)
 covers created → curated, curated → `loom:issue`, building → review requested
 and review requested → merged. Beside the per-label counts, `stage_items` has
 queue states from one ETag-cached open-items walk per repo (#11847):
@@ -720,7 +722,8 @@ the liveness pass's idle operator-label listings and the snapshot's
 Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 **Merge-chain re-date pressure (#10163).** Three gauges track the #8508
-re-date remedy over a trailing 24 h: `loom.merge.redate_prs{state}`
+re-date remedy over a trailing 24 h (retired by #12063; the gauges stay to show
+it reaching zero, #10888): `loom.merge.redate_prs{state}`
 (`landed`, `pending`, `stuck`), `loom.merge.redates_max{state}` and
 `loom.merge.time_to_land_max`. They are read from local `git log` on the
 `host.health` cadence, with no forge call. A non-zero `stuck` series is a

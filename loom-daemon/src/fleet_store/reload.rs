@@ -104,6 +104,11 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from the workspace's effective config on every landed pre-filter
     // call (#12205) — `work_finder::landed_prefilter::prefilter_enabled`, never cached.
     ("autonomous.workFinder.landedPrefilter", Reloadability::Live),
+    // #12203: the stage-dwell sampler's switch and spacing are read from the
+    // effective config on every forge-gather pass
+    // (`captain_gauges::resolve` → `stage_dwell::Settings::from_effective`),
+    // never cached.
+    ("observability.stageDwell", Reloadability::Live),
     // Everything else under `autonomous.workFinder` is resolved once at
     // daemon bring-up in `daemon_service.rs`'s work-finder startup block,
     // before the loop is spawned: `enabled` (gates whether the loop is
@@ -207,6 +212,12 @@ mod tests {
         ] {
             assert_eq!(classify(path), Reloadability::Live, "{path}");
         }
+    }
+
+    #[test]
+    fn stage_dwell_switch_is_live() {
+        assert_eq!(classify("observability.stageDwell.enabled"), Reloadability::Live);
+        assert_eq!(classify("observability.stageDwell.intervalSecs"), Reloadability::Live);
     }
 
     #[test]
