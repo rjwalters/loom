@@ -60,7 +60,7 @@ mod tests {
         // after `$(...)` strips it, so a second one would print a blank line.
         assert!(USAGE.ends_with('\n'));
         assert!(!USAGE.ends_with("\n\n"));
-        assert_eq!(USAGE.lines().count(), 161);
+        assert_eq!(USAGE.lines().count(), 159);
     }
 
     #[test]
@@ -88,7 +88,7 @@ mod tests {
             "Exit codes:",
             "0 = merged (or --help) · 1 = failed",
             "3 = PR head moved past the SHA",
-            "4 = stale required checks",
+            "4 = retired (#12063)",
             "7 = held by a sequencing order",
         ] {
             assert!(USAGE.contains(needle), "usage text lost {needle:?}");

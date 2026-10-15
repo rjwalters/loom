@@ -97,6 +97,7 @@ if ! grep -q -- '--expected-head)' "$PARSE"; then echo "FATAL: could not extract
 run_parse() {
     set +e
     LAST_OUT="$( (PR_NUMBER=""; EXPECTED_HEAD_SHA=""; ALLOW_RED_REQUIRED=()
+        warning() { echo "WARN: $*" >&2; }
         # shellcheck disable=SC1090
         source "$PARSE"; echo "PIN=$EXPECTED_HEAD_SHA PR=$PR_NUMBER") 2>&1 )"; LAST_RC=$?
     set -e
@@ -108,6 +109,10 @@ set -- --expected-head "$SHA_256" 7 --auto; run_parse "$@"
 assert_contains "$LAST_OUT" "PIN=$SHA_256 PR=7" "64-hex (SHA-256 repo) is accepted, in any position"
 set -- 7 --auto; run_parse "$@"
 assert_contains "$LAST_OUT" "PIN= PR=7" "no flag: no pin"
+set -- 7 --auto --redate-stale-checks --expected-head "$SHA_A"; run_parse "$@"
+assert_eq 0 "$LAST_RC" "--redate-stale-checks is still accepted (deprecated no-op, #12063 slice 1)"
+assert_eq 1 "$(grep -c 'deprecated no-op' <<<"$LAST_OUT")" "--redate-stale-checks warns exactly once"
+assert_contains "$LAST_OUT" "PIN=$SHA_A PR=7" "--redate-stale-checks: parsing carries on past it"
 for bad in "${SHA_A:0:12}" "$(tr a A <<<"$SHA_A")" "${SHA_A}0" "--auto"; do
     set -- 7 --expected-head "$bad"; run_parse "$@"
     assert_eq 1 "$LAST_RC" "rejected value '${bad:0:16}': exit 1"
