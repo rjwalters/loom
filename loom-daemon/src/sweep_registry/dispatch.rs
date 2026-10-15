@@ -806,8 +806,9 @@ pub(crate) struct DispatchBackoffState {
     /// Consecutive failed dispatch outcomes for this issue.
     pub(super) consecutive: u32,
     /// When the most recent failure was recorded — used to decide whether the
-    /// streak is still "consecutive" (see [`DispatchBackoffConfig::max`]).
-    last_failure_at: DateTime<Utc>,
+    /// streak is still "consecutive" (see [`DispatchBackoffConfig::max`]), and
+    /// whether a peer's fast-fail break has since reset it (#11952).
+    pub(super) last_failure_at: DateTime<Utc>,
     /// The instant at which the next dispatch attempt becomes allowed.
     pub(super) until: DateTime<Utc>,
     /// What most recently (re-)armed this window (Issue #7606) — see
@@ -862,7 +863,16 @@ pub fn read_dispatch_backoff_file_config(repo_root: &Path) -> DispatchBackoffFil
         base_secs: b
             .get("baseSecs")
             .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
+            .filter(|&s| {
+                if s == 0 {
+                    // #11952: see `resolve_dispatch_backoff_config`.
+                    log::warn!(
+                        "sweep_registry: dispatchBackoff.baseSecs=0 ignored — the dispatch \
+                         backoff base must be positive (#11952)"
+                    );
+                }
+                s > 0
+            }),
         max_secs: b
             .get("maxSecs")
             .and_then(serde_json::Value::as_u64)
@@ -884,9 +894,19 @@ pub fn resolve_dispatch_backoff_config(repo_root: &Path) -> DispatchBackoffConfi
         file.enabled.unwrap_or(true)
     };
 
-    let base_secs = std::env::var(DISPATCH_BACKOFF_BASE_ENV)
+    let env_base = std::env::var(DISPATCH_BACKOFF_BASE_ENV)
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if env_base == Some(0) {
+        // #11952: a zero base arms zero-length windows, which a peer older
+        // than the explicit break marker reads as a fleet-wide fast-fail
+        // streak break. Refused, loudly rather than silently.
+        log::warn!(
+            "sweep_registry: {DISPATCH_BACKOFF_BASE_ENV}=0 ignored — the dispatch backoff base \
+             must be positive (#11952); using the config/default value"
+        );
+    }
+    let base_secs = env_base
         .filter(|&s| s > 0)
         .or(file.base_secs)
         .unwrap_or(DEFAULT_DISPATCH_BACKOFF_BASE_SECS);
@@ -1243,11 +1263,15 @@ impl SweepRegistry {
         let max = backoff_cause::cap(cause, self.dispatch_backoff_config.max);
         let max_secs = i64::try_from(max.as_secs()).unwrap_or(i64::MAX);
         let consecutive = match self.dispatch_backoff.get(&issue) {
-            Some(prev) if backoff_cause::continues(prev, cause, now, max_secs) => {
+            Some(prev)
+                if backoff_cause::continues(prev, cause, now, max_secs)
+                    && !self.peer_broke_fast_fail_streak(issue, prev) =>
+            {
                 prev.consecutive.saturating_add(1)
             }
-            // No prior record, the streak went cold, or it was the other
-            // cause's streak (#8865) — start a fresh streak.
+            // No prior record, the streak went cold, it was the other cause's
+            // streak (#8865), or a peer's progress broke it since (#11952) —
+            // start a fresh streak.
             _ => 1,
         };
         let delay = backoff_delay(consecutive, self.dispatch_backoff_config.base, max);
