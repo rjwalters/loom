@@ -209,6 +209,7 @@ impl PickSkipReason {
                 P::Blocked => Self::Blocked,
                 P::CapabilityMissing => Self::HostConstraint,
                 P::Epic | P::Proposal | P::NoStage => Self::NoStep,
+                P::CiPending => Self::Backoff,
             },
         }
     }

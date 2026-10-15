@@ -509,6 +509,8 @@ pub fn role_record(
                     acts.push((number, action));
                 }
             }
+            // #12027: read by `step_verdict`, not by the pick record.
+            JournalEntry::Marker { .. } | JournalEntry::Applied { .. } => {}
         }
     }
     // Decisions are observed when the agent ran with a journal that was read
@@ -582,9 +584,19 @@ pub fn emit_role_tick(
     trace: Option<&super::lifecycle::RoleTrace>,
 ) {
     let journal = super::pick_journal::take(root);
+    let step = super::step_verdict::take_staged_step();
     if !exporting() {
         return;
     }
+    // #12027: the role's per-item verdicts, from the same journal.
+    super::step_verdict::emit_drain(
+        root,
+        role,
+        &repo_label(root),
+        started_at,
+        step,
+        journal.as_ref(),
+    );
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let tick = PickTick {
         role: role.to_string(),
