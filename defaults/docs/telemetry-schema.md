@@ -1333,6 +1333,8 @@ gradeable by a model or prompt experiment.
 | `tokens_by_model` | array | no | Same grouped, raw (not cost-weighted) shape as `sweep.outcome`'s `tokens_by_model`, summed from the tick's own transcripts. |
 | `models_used` | string array | no | The distinct model ids in `tokens_by_model`, sorted and deduped — "did this tick's session escalate past the model it was launched with?" |
 | `actions` | object | no | Forge-mutating work observed in the transcripts: `issues_labeled`, `prs_merged`, `comments_posted`. |
+| `source` | string | no | `step` when a step-engine step ran, not a role-runner tick (#11906). Mapped to `loom.role_tick.source`; absent on a role tick. Additive. |
+| `sweep_id` | string | no | The step's sweep id (`step-<role>-<item>-<ts>`), with `source`. Mapped to `loom.sweep_id`. |
 
 #### `result` — seven values, and why a skip is not a failure
 

@@ -341,6 +341,13 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
             attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
+            // #11906: a step-engine step, never a role-runner tick.
+            if let Some(source) = &r.source {
+                attributes.push(kv_string("loom.role_tick.source", source.clone()));
+            }
+            if let Some(sweep_id) = &r.sweep_id {
+                attributes.push(kv_string("loom.sweep_id", sweep_id.clone()));
+            }
             if let Some(models) = metadata::models(r.models_used.as_deref()) {
                 attributes.push(models);
             }
