@@ -172,7 +172,7 @@ pub fn report_failure(
         );
         // Authoritative headers, no probe: the trip span carries no
         // attribution (#10022).
-        super::export_trip(source, now, transition.until, None, || None);
+        super::export_trip(source, now, transition.until, None, None, || None);
         return Some(Reported {
             transition,
             refine: None,
@@ -239,12 +239,15 @@ fn refine(
     if let Some(until) = until {
         log::info!("rate_limit_breaker: cooldown until {until} from {}", ev.describe());
     }
+    let credential = super::forge::credential_ctx(ctx);
+    let (account, owner) = (credential.account.clone(), credential.owner.clone());
     super::export_trip(
         source,
         tripped_at,
         until.or(provisional_until),
         budget.as_ref().map(|b| (b, reading_trusted)),
-        || crate::forge_call_stats::consumed_in_window(tripped_at),
+        Some(credential),
+        || crate::forge_call_stats::consumed_in_window_for(tripped_at, &account, owner.as_deref()),
     );
     until
 }

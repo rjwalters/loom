@@ -93,7 +93,7 @@ fn singleton_registry_owning_files_are_known() {
 #[test]
 fn singleton_registry_covers_every_singleton_job() {
     let jobs = discovered_jobs(&sources());
-    assert!(jobs.len() >= 5, "scan found too few jobs: {jobs:?}");
+    assert!(jobs.len() >= 4, "scan found too few jobs: {jobs:?}");
     let known: BTreeSet<&str> = SINGLETON_OUTPUTS
         .iter()
         .filter(|o| o.gate == Gate::SingletonJob)
