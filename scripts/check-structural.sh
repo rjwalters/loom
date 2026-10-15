@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# check-structural.sh — run every structural gate CI's `Structural Checks` job
+# check-structural.sh — run every structural gate CI's `Lint` job
 # runs, locally, before anything expensive (#9140).
 #
 # THE GAP THIS CLOSES. `.loom/scripts/build-gate.sh` is the gate a Builder runs
 # to decide "am I CI-green?", and it ran cargo, the doctests and five bash
 # suites — but none of the ~15 structural/ratchet checkers CI's required
-# `Structural Checks` job enforces. So a Builder could report a fully green
+# `Lint` job enforces. So a Builder could report a fully green
 # local gate and still fail CI on checks that are fast, deterministic and need
 # no build at all. PR #9137 is the receipt: an honest 9300/9303 local green,
 # then five CI failures (markdown-token ratchet, role-prompt ratchet,
@@ -19,7 +19,7 @@
 # local gate never learned about. A hand-mirrored list here would reproduce
 # exactly that drift the first time someone adds a 16th gate to the workflow
 # and not to this file. So the gate set is DERIVED, on every run, from the one
-# place it already has to be correct: the `Structural Checks` job in
+# place it already has to be correct: the `Lint` job in
 # .github/workflows/ci.yml. There is one definition, it lives in CI, and a gate
 # added there reaches this runner with no second edit.
 #
@@ -52,9 +52,8 @@
 #     splits on whitespace and will not `eval`;
 #   - a gate whose script is not present in this tree (a consumer repo, or a
 #     workflow ahead of the checkout);
-#   - a gate that exited 78 (`EX_CONFIG`), the REQUIRED-TOOL-ABSENT sentinel.
-#     `check-doc-anchors.sh` exits it deliberately when `lychee` is absent, and
-#     CI installs a pinned lychee that a dev host has no reason to have. A
+#   - a gate that exited 78 (`EX_CONFIG`), the REQUIRED-TOOL-ABSENT sentinel,
+#     for a gate that needs a tool CI installs and a dev host may lack. A
 #     missing tool is "could not check", not "checked and failed" — reporting it
 #     as a red gate forever would train a Builder to ignore the phase, which is
 #     worse than the gap. CI still enforces it for real.
@@ -86,7 +85,7 @@
 #   check-structural.sh --root DIR         Run the gates from DIR (default: the
 #                                          git toplevel, else the cwd).
 #   check-structural.sh --job NAME         Job `name:` to mirror (default:
-#                                          "Structural Checks").
+#                                          "Lint").
 #   check-structural.sh --help
 #
 # Exit codes: 0 = every runnable gate passed (or --list/--self-test succeeded);
@@ -102,7 +101,7 @@
 set -euo pipefail
 
 WORKFLOW_DEFAULT=".github/workflows/ci.yml"
-JOB_NAME_DEFAULT="Structural Checks"
+JOB_NAME_DEFAULT="Lint"
 # The one status a gate may use to say "a tool I require is not installed", and
 # so be reported SKIP rather than FAIL. See the header note on why it is not 127.
 TOOL_ABSENT_RC=78
@@ -178,11 +177,12 @@ extract_gates() {
     if [[ "$s" == *\\ ]]; then cont=1; continue; fi
     cont=0
 
-    # `bash` must start a token and be followed by a `.sh` operand, so the
-    # job's `bash --version` report and its `$(command -v bash)` echo do not
-    # look like gates. Everything from `bash` to end of line is the command.
-    if [[ "$buf" =~ (^|[[:space:]])(bash[[:space:]]+[^[:space:]]+\.sh.*)$ ]]; then
-      printf '%s\n' "${BASH_REMATCH[2]}"
+    # `bash` must START the command (optionally after `run:`) and be followed
+    # by a `.sh` operand, so the job's `bash --version` report, its
+    # `$(command -v bash)` echo and a `cd "$X" && bash …` chain do not look
+    # like gates. Everything from `bash` to end of line is the command.
+    if [[ "$buf" =~ ^(-[[:space:]]+)?(run:[[:space:]]+)?(bash[[:space:]]+[^[:space:]]+\.sh.*)$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[3]}"
     fi
   done < "$wf"
 }
@@ -192,6 +192,7 @@ skip_reason() {
   local cmd="$1" script
   case "$cmd" in
     *'${{'*) echo "needs the Actions workflow context (\${{ … }} expression)"; return 0 ;;
+    *target/debug/loom-daemon*) echo "needs the debug daemon CI builds and downloads"; return 0 ;;
     *[\"\'\$\|\&\;\<\>\(\)\`]*) echo "invocation uses shell quoting/metacharacters"; return 0 ;;
   esac
   script="${cmd#bash }"
@@ -326,7 +327,7 @@ jobs:
     steps:
       - run: bash scripts/must-not-be-collected-before.sh
   structural-checks:
-    name: Structural Checks
+    name: Lint
     steps:
       # A comment naming bash scripts/ghost.sh must not be collected.
       - name: simple
@@ -414,7 +415,7 @@ SKIP  bash scripts/not-in-this-tree.sh  [scripts/not-in-this-tree.sh is not pres
   cat >"$tmp/.github/workflows/empty.yml" <<'YAML'
 jobs:
   structural-checks:
-    name: Structural Checks
+    name: Lint
     steps:
       - run: echo "nothing here is a gate"
 YAML
@@ -459,16 +460,15 @@ YAML
     else
       echo "  ok: $n gate(s) derived from the real job"
     fi
-    # The four #9137 failures that opened #9140, by name. If the workflow stops
-    # running one of these the assertion should be updated deliberately — it is
-    # not allowed to lapse by accident.
+    # Gates the job must keep running, by name. If the workflow stops running
+    # one of these the assertion should be updated deliberately — it is not
+    # allowed to lapse by accident.
     local probe
-    for probe in check-markdown-token-budget.sh check-role-prompt-budget.sh \
-                 check-dangling-links.sh check-docs-defaults-parity.sh; do
+    for probe in check-conflict-markers.sh check-dangling-links.sh; do
       if printf '%s\n' "$live" | grep -F "$probe" >/dev/null; then
         echo "  ok: $probe is in the derived set"
       else
-        echo "SELF-TEST FAIL: $probe is not in the derived set (it is one of PR #9137's five CI failures)." >&2
+        echo "SELF-TEST FAIL: $probe is not in the derived set." >&2
         fails=$((fails + 1))
       fi
     done

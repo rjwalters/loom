@@ -40,6 +40,8 @@ pub fn spawn_task(
 ) -> tokio::task::JoinHandle<()> {
     let subscription = bus.subscribe([
         "daemon.drain",
+        // #12222: the work finder's first completed tick after a start.
+        "daemon.work_finder",
         "daemon.capacity.advisory",
         "daemon.preflight.advisory",
         "epic.issue",
@@ -103,7 +105,12 @@ pub(crate) fn map_event_to_daemon_event_record(event: &Event) -> Option<Telemetr
         // `daemon.drain.*` rides `Event::Generic` (published via
         // `EventBus::publish_generic` from `ipc.rs`) — its payload is
         // already the bare, tag-free shape.
-        Event::Generic { payload, .. } if topic.starts_with("daemon.drain.") => payload.clone(),
+        Event::Generic { payload, .. }
+            if topic.starts_with("daemon.drain.")
+                || topic == crate::work_finder::startup_gate::FIRST_TICK_TOPIC =>
+        {
+            payload.clone()
+        }
         _ => return None,
     };
     Some(TelemetryRecord::DaemonEvent(DaemonEventRecord { topic, payload }))

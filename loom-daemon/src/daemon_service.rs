@@ -1006,6 +1006,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // dispatch backoff above.
     let noop_cooldown_config = sweep_registry::resolve_noop_cooldown_config(&sweep_workspace);
     sweep.set_noop_cooldown_config(noop_cooldown_config);
+    // #11481: re-arm windows a restart would otherwise drop.
+    sweep.replay_noop_cooldown_from_journal(chrono::Utc::now());
     log::info!(
         "sweep_registry: no-op re-dispatch cooldown {} (cooldown={}s) (#6670)",
         if noop_cooldown_config.enabled {
@@ -1416,6 +1418,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // shared `workspace_pool`. Empty registry ⇒ the single `sweep_workspace`.
         //
         // `startup_reconciliation_ready` (Issue #7974) is awaited internally
+        // (bounded since #12222, see `work_finder::startup_gate`)
         // before the loop's first real tick — see `spawn_startup_passes`'s doc
         // comment above for why this is what still keeps the
         // reconcile-before-dispatch invariant (#6615) intact now that the

@@ -1356,12 +1356,23 @@ gradeable by a model or prompt experiment.
 | `skipped_pool_exhausted` | no | The credential pool the admitted runtime draws from has zero spawnable accounts (#7607) — `gated_pool` says which pool (#8408). |
 | `skipped_model_runtime_mismatch` | no | The resolved model provably conflicts with the admitted runtime (#5028). |
 | `skipped_queue_empty` | no | A queue-gated role (judge, doctor) found its work queue empty and spawned nothing (#9391). |
+| `skipped_deferred` | no | A host limit stopped the round-robin walk before this repo's turn, so the role did not run for it this tick (#12084). `deferred_by` names the limit (`ceiling`, `role_budget`, `demand_width`, `reservation`); `shard_owner` (`<index>/<count>`) is present on a sharded host. Its next chance is a later tick, so a repo's effective cadence is the interval times the ticks between its non-deferred records. |
 
 Folding the skips into `failure` is the exact mis-read #7607 documents: one
 fleet-wide exhausted pool produces hundreds of identical exit-78 skips, which
 must not read as hundreds of broken roles. Consumers computing a role failure
 rate should use `failure` alone as the numerator and state whether skips are in
 the denominator.
+
+#### Severity: policy refusals are informational, faults are errors (Issue #11928)
+
+A dispatch or role start refused because the workspace is held by a configured
+`maintain_only` policy is an expected outcome, not a failure. It is logged at
+`info` (never `warn`/`error`), carries its cause (`maintain_only`), sets no
+`status=ERROR` on a span and bumps no failure counter. Consumers computing an
+error rate must not count it. A fault on the same path (a failing hold lookup,
+a corrupt config) is still an error. The `install_incompatible` and
+`daemon_too_old` holds are unchanged and stay `warn`.
 
 #### Reading an absent `tokens_by_model` / `actions`
 
@@ -1594,6 +1605,12 @@ operator.
 |---|---|---|
 | `topic` | string | The exact bus topic this record mirrors, e.g. `"daemon.drain.started"`, `"epic.issue.123.decompose"`. |
 | `payload` | object | The event's own payload, exactly as published on the bus — see `event_bus.rs`'s topic table for each topic's shape. One documented exception, below. |
+
+Since #12222 the same record also carries `daemon.work_finder.first_tick`, once
+per daemon start: `{ "secs_since_start": 94.2, "startup_reconcile_cap_fired":
+true }` — the time from daemon start to the work finder's first completed
+tick, and whether it stopped waiting for the startup claim-reconciliation pass
+at its cap.
 
 **The one payload field that is not carried verbatim**:
 `daemon.preflight.advisory`'s `workspace_root` is reduced to its final path
@@ -1916,8 +1933,7 @@ a label.
 Fleet gauges produced by the captain (W12, `observability/captain_gauges.rs`).
 Gauges on the collector pass, emitted only on a host that is the armed captain
 or a dispatcher with `fleet.captainGauges.standDown`. `task` is the singleton job
-name (`stage-dwell`, and `star-facts` / `queue-blocked` where those switches
-are on), the same label key the task-liveness gauges use; never a repo or
+name (`stage-dwell`, and `queue-blocked` where that switch is on), the same label key the task-liveness gauges use; never a repo or
 issue. Configuration is in
 [`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12).
 
@@ -3690,25 +3706,29 @@ records, not one per picked commit.
 
 ### `issue.estimate` — completed curation's blind pre-build estimate
 
-One OTLP log per completed curation, produced by `loom-daemon curation-complete`
-for both attended Curators and daemon-mediated role sessions. The command
-fetches the current issue body's standalone `loom:estimate` marker, resolves
-the story points (#11663), and durably journals the envelope before it applies
-`points:N` and `loom:curated`. No historical backfill or inference from
-Builder outcomes is performed.
+One OTLP log per observed curation, produced by the daemon (#12118), not by an
+agent-run command. The stage-queue walk of a repo's open issues journals the
+fact for an issue that carries `loom:curated`, changed within the last 48 hours,
+has a trusted author and a valid standalone `loom:estimate` marker; `points` is
+read from its `points:N` label. `loom-daemon curation-complete` still resolves
+the points (#11663) and applies `points:N` and `loom:curated`, but writes no
+telemetry. No historical backfill or inference from Builder outcomes is
+performed, and a missing or malformed marker emits nothing.
 
 The JSON body contains `repo` (owner/repo), `issue`, `points` (the story points
 the gate resolved: 1, 2, 3, 5, 8 or 13; absent on records journaled before
-#11663), `lines` and `files` (nonnegative integers), `doctor_risk` (finite [0,1]), actual
-Curator `model` and `runtime` (null when unknown, never inferred), `estimated_at` (UTC completion time),
+#11663), `lines` and `files` (nonnegative integers), `doctor_risk` (finite [0,1]), `model` and `runtime` (null: the observer cannot see the Curator's; also null
+when unknown on older records, never inferred), `estimated_at` (UTC completion time),
 `completion_id` (UUID), and standard `loom` build provenance. `loom.repo`,
 `loom.issue`, `loom.model`, `loom.runtime` and `loom.fact_id` are log attributes.
 Both OTLP source and observed timestamps are the saved completion time: an ETA
 consumer may use the estimate only at or after `estimated_at`.
 
-`loom.fact_id` keys on repo, issue and completion UUID. A transport retry reuses
-the original envelope and time; a genuine re-curation generates a new UUID and
-time even if its numeric fields do not change. Readers dedupe by fact id and
+`loom.fact_id` keys on repo, issue and completion UUID. The observer derives the
+UUID from repo, issue and the marker values, so observing the same issue again
+emits nothing and a re-curation with an unchanged marker is the same fact; a
+changed marker is a new one. A transport retry reuses the original envelope and
+time. Readers dedupe by fact id and
 select the latest estimate known at their as-of instant. Files under the main
 workspace's `.loom/logs/issue-estimates/` are the local queue of record; normal
 observability backfill offers each to the configured durable export queue.
