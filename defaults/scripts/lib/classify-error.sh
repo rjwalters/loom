@@ -189,7 +189,7 @@
 # walk — which may itself fork a `--version` probe — per call is not). At
 # source time, not lazily, because callers almost always invoke
 # `classification=$(classify_error …)`: a cache filled inside that command
-# substitution would die with the subshell. Empty means "use the tables".
+# substitution would die with the subshell. Empty means "no capable daemon": the degraded answer.
 #
 # This is `loom_resolve_self_daemon_bin`'s chain — the binary that IMPLEMENTS
 # ported logic, NOT $LOOM_DAEMON_BIN (the install this wrapper DRIVES, which
@@ -308,8 +308,7 @@ is_recoverable_error() {
 # transient phrasings has twice turned a new CLI wording into an instant
 # permanent death (#4255's bare `Execution error`, #4501's "reached your
 # <model> limit"), while an over-retry costs only a bounded backoff. It also
-# matches the documented contract of the catch-all in
-# native classifier's catch-all ("unknown non-zero exit, treat as recoverable
+# matches the documented contract of the native classifier's catch-all ("unknown non-zero exit, treat as recoverable
 # in daemon mode").
 #
 # Delegates to `loom-daemon classify-error --transient` (#11208) when a

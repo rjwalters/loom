@@ -309,14 +309,18 @@ echo
 echo "--- delegation safety: a binary that cannot answer is never asked ---"
 
 # A resolved binary that fails the library's one-time capability probe (here
-# /bin/false: exit 1 to everything, the same code `--transient` uses for
-# "terminal") must be dropped at source time. Were it asked, every retryable
+# a stub that exits 1 to everything, the same code `--transient` uses for
+# "terminal"; /bin/false is not portable to macOS) must be dropped at
+# source time. Were it asked, every retryable
 # category would read as terminal. With no binary the documented fail-safe
 # degraded answer applies (#11219): exit-code short-circuits stay exact,
 # any other non-zero exit is RECOVERABLE, and every category is retryable.
 # Runs in a subshell so the re-source does not disturb the mode of the rest.
+NOCAP_STUB="$(mktemp)"
+printf '#!/bin/sh\nexit 1\n' > "$NOCAP_STUB"
+chmod +x "$NOCAP_STUB"
 degraded_out="$(
-    LOOM_DAEMON_SELF_BIN=/bin/false
+    LOOM_DAEMON_SELF_BIN="$NOCAP_STUB"
     export LOOM_DAEMON_SELF_BIN
     # shellcheck source=../lib/classify-error.sh
     source "$SRC"
@@ -329,6 +333,7 @@ degraded_out="$(
 )"
 assert_eq "bin=none exhausted=retry expired=retry class=RECOVERABLE ok=SUCCESS timeout=TIMEOUT" "$degraded_out" \
     "no capable binary: documented degraded answer (RECOVERABLE / retry; exit-code short-circuits exact)"
+rm -f "$NOCAP_STUB"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"

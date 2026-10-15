@@ -75,10 +75,10 @@ pub(crate) enum ScriptPortCommand {
     /// (or `--stdout-tail`/`--stderr-tail` files) plus `--exit-code` and an
     /// optional `--provider` in, one uppercase category line out;
     /// `--transient <CATEGORY>` answers the retry deny-list in its exit
-    /// code. Optional to its caller — the shell library falls back to its
-    /// in-file tables when no (new enough) binary resolves, and both sides
-    /// are pinned byte-equal by `test-classify-error.sh`'s parity section and
-    /// the shared `vectors.tsv` fixture.
+    /// code. Optional to its caller — the shell library degrades to a
+    /// fail-safe answer (RECOVERABLE / retry) when no (new enough) binary
+    /// resolves; the pattern tables live only here, pinned by the shared
+    /// `vectors.tsv` fixture.
     ClassifyError(super::classify_error_cli::ClassifyErrorArgs),
 
     /// The daemon-roll pause hook and pause state (#10830). `hook` is inert
