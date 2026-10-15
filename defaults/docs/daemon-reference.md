@@ -3559,7 +3559,14 @@ the table below is not exhaustive — `peer_coordination` (#6157), `stale_sweeps
 (#7708/#7990), and `transcript_ingest` (#8477) also always render, each
 documented at its own point in this file. `tmpfs_visibility` (#8572, split
 from #8512) is **conditional** — see "tmpfs/`shared`-RAM + OOM-kill
-visibility" below:
+visibility" below. `review_role_pins` (#11970) is conditional too: a
+`WARNING:` line (Green, never moves the exit code, `detail.warning = true`)
+naming the repo and files when a managed repo's `.loom/resync-ignore` pins a
+Champion, Judge or Doctor prompt (`roles/` or `commands/loom/`
+`champion*`/`judge*`/`doctor*`), because those prompts enforce label rules the
+daemon assumes and a pinned copy runs stale against it. A deliberate pin is
+allowed, so it warns rather than degrades; the daemon also logs one WARN per
+such repo at startup:
 
 | section | what it reports | source |
 |---------|-----------------|--------|
