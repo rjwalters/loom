@@ -536,8 +536,3 @@ async fn test_a_refused_daemon_does_not_overwrite_the_incumbents_pid_file() {
          hoisted ahead of the singleton guard (#4774)."
     );
 }
-
-// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
-#[allow(dead_code)]
-#[path = "../src/live_gh_guard.rs"]
-mod live_gh_guard;

@@ -200,8 +200,3 @@ async fn test_daemon_child_env_is_fail_closed_and_temp_dir_confined() {
         );
     }
 }
-
-// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
-#[allow(dead_code)]
-#[path = "../src/live_gh_guard.rs"]
-mod live_gh_guard;

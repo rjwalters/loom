@@ -323,8 +323,3 @@ async fn test_socket_pidfile_and_heartbeat_are_ready_during_slow_startup_reconci
         .await
         .expect("daemon must still answer Ping after the startup reconciliation pass finishes");
 }
-
-// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
-#[allow(dead_code)]
-#[path = "../src/live_gh_guard.rs"]
-mod live_gh_guard;

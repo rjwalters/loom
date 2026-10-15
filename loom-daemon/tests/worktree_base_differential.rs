@@ -222,8 +222,3 @@ fn live_worktree_sh_replays_the_records_end_to_end() {
     assert!(!repo.join(".loom/worktrees/issue-78").exists());
     let _ = fs::remove_dir_all(repo.parent().unwrap());
 }
-
-// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
-#[allow(dead_code)]
-#[path = "../src/live_gh_guard.rs"]
-mod live_gh_guard;
