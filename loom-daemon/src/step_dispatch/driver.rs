@@ -19,6 +19,7 @@ use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
 use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest};
 use crate::sweep_registry::SweepRegistry;
+use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::repo_cap::{RepoCap, RepoLimits};
 use crate::work_finder::step_item::Lane;
@@ -43,6 +44,56 @@ pub struct TickInputs<'a> {
     pub max_admissions: usize,
     pub saturation_held: bool,
     pub limits: RepoLimits,
+}
+
+/// What a workspace's listing said beyond its items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListingState {
+    /// The open-PR listing answered.
+    pub pulls_complete: bool,
+    /// The items are the last good listing, not this tick's.
+    pub stale_listing: bool,
+    /// The repo is held red and admits only its red-main fixes.
+    pub fixes_only: bool,
+}
+
+/// Shape one listed workspace's pool before the draw. Pure.
+///
+/// - This host's and the peers' live claims leave it (B1, M5).
+/// - A Builder claim is a blind label flip: no Builder step when the open-PR
+///   listing failed (a branch-only PR is invisible) or the items are the
+///   last good listing, not this tick's.
+/// - A red repo held for its fixes keeps only its red-main fixes.
+pub fn shape_pool(
+    weighing: &mut super::item_draw::Weighing,
+    claims: &crate::sweep_registry::step_spawn::draw_claims::DrawClaims,
+    listing: ListingState,
+) {
+    tick::exclude_claimed(weighing, claims);
+    if !listing.pulls_complete || listing.stale_listing {
+        tick::exclude_builders(weighing);
+    }
+    if listing.fixes_only {
+        weighing.pool.retain(|c| c.item.lane == Lane::RedMain);
+    }
+}
+
+/// The `loom.step.actionable{repo}` point of a workspace: its drawable
+/// depth after [`shape_pool`]. `None` for a workspace this tick did not list
+/// (`weighing` is `None`): absent, never a measured 0. Pure.
+#[must_use]
+pub fn actionable_point(
+    repo: &str,
+    weighing: Option<&super::item_draw::Weighing>,
+) -> Option<MetricPoint> {
+    let w = weighing?;
+    Some(
+        MetricPoint::int(
+            MetricName::StepActionable,
+            i64::try_from(w.pool.len()).unwrap_or(i64::MAX),
+        )
+        .label("repo", repo.to_string()),
+    )
 }
 
 /// The step tick's state across ticks: the stage-entry provider's cache.
@@ -122,6 +173,9 @@ impl StepDriver {
         let held_capabilities = crate::capability::held_capabilities();
         let mut workspaces = Vec::new();
         let mut listing_failed = Vec::new();
+        // `loom.step.actionable{repo}`: the drawable depth the stalled and
+        // idle alerts key on. Absent, never 0, for a repo not listed.
+        let mut actionable = Vec::new();
         for (idx, root) in input.roots.iter().enumerate() {
             // Record the steps that ended since the last tick first, so the
             // cooldowns they arm hold for this draw.
@@ -132,6 +186,8 @@ impl StepDriver {
             let repo = crate::observability::pick_decision::repo_label(root);
             let weight = input.weights.get(idx).copied().unwrap_or(0);
             if halted && !fixes_only {
+                // Not listed: no `loom.step.actionable` point, never a 0.
+                actionable.extend(actionable_point(&repo, None));
                 workspaces.push(StepWorkspace {
                     idx,
                     repo,
@@ -183,14 +239,16 @@ impl StepDriver {
                 cooldowns,
             };
             let mut weighing = weigh(&gathered.inputs, &ctx, &ItemWeights::for_root(root));
-            // This host's and the peers' live claims (B1, M5).
-            tick::exclude_claimed(&mut weighing, &claims);
-            if !gathered.pulls_complete {
-                tick::exclude_builders(&mut weighing);
-            }
-            if fixes_only {
-                weighing.pool.retain(|c| c.item.lane == Lane::RedMain);
-            }
+            shape_pool(
+                &mut weighing,
+                &claims,
+                ListingState {
+                    pulls_complete: gathered.pulls_complete,
+                    stale_listing: gathered.stale_listing,
+                    fixes_only,
+                },
+            );
+            actionable.extend(actionable_point(&repo, Some(&weighing)));
             workspaces.push(StepWorkspace {
                 idx,
                 repo,
@@ -200,6 +258,7 @@ impl StepDriver {
                 created_at: gathered.created_at,
             });
         }
+        crate::observability::ops::emit_metrics(actionable);
         if let Err(e) = self.provider.flush() {
             log::debug!("work_finder: stage-entry cache not written: {e}");
         }
@@ -247,3 +306,8 @@ impl StepDriver {
         report
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "driver_tests.rs"]
+mod tests;

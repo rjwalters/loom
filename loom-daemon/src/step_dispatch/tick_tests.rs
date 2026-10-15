@@ -38,7 +38,7 @@ fn row(number: u32, labels: &[&str], body: &str, pr: bool) -> RestIssue {
 
 /// One repo with an item at every stage, plus a claimed, a parked and an
 /// operator-held one.
-fn forge() -> Vec<RestIssue> {
+pub(crate) fn forge() -> Vec<RestIssue> {
     vec![
         row(1, &["loom:triage"], "", false),
         row(2, &["loom:curated"], "", false),
@@ -57,7 +57,7 @@ fn forge() -> Vec<RestIssue> {
     ]
 }
 
-fn workspace(idx: usize, repo: &str, rows: &[RestIssue]) -> StepWorkspace {
+pub(crate) fn workspace(idx: usize, repo: &str, rows: &[RestIssue]) -> StepWorkspace {
     let pulls = rows
         .iter()
         .filter(|r| r.is_pull_request)
