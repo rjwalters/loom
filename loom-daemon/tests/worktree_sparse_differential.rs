@@ -39,6 +39,9 @@
 //! 4. An unregistered `issue-4` beside a registered `issue-44`: the shell
 //!    accepts it, and writes a sentinel into it.
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -240,6 +243,7 @@ fn git_cmd(dir: &Path) -> Command {
 
 /// The same git environment for fixtures and for both implementations.
 fn hermetic(cmd: &mut Command) {
+    common::deny_real_gh(cmd);
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "Loom Test")
@@ -845,3 +849,8 @@ fn live_script_creates_a_sparse_worktree_and_emits_one_valid_document() {
     assert_eq!(doc["sparse"], false);
     assert_eq!(doc["cone"], serde_json::json!([]));
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

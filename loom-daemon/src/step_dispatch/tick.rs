@@ -175,6 +175,7 @@ pub fn disposition_of(reason: &str) -> Qd {
         | "admission_refused" => Qd::HostConstraint,
         "roll_paused" => Qd::DeferredCapacity,
         "workspace_commands_missing" => Qd::WorkspaceCommandsMissing,
+        crate::sweep_registry::ALREADY_LANDED_REASON => Qd::AlreadyLanded,
         PASS_REPO_CAP => Qd::DeferredRepoCap,
         PASS_MERGE => Qd::PeerClaim,
         _ => Qd::DispatchError,
@@ -230,6 +231,7 @@ fn refusal_skip(reason: &str) -> PickSkipReason {
         Qd::PeerClaim => PickSkipReason::InFlight,
         Qd::HostConstraint => PickSkipReason::Quota,
         Qd::DeferredCapacity | Qd::DeferredRepoCap => PickSkipReason::Cap,
+        Qd::AlreadyLanded => PickSkipReason::AlreadyLanded,
         _ => PickSkipReason::Error,
     }
 }

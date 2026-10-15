@@ -16,6 +16,9 @@
 //! What remains is exactly the rung under test — the offline
 //! `git merge-tree --write-tree` tree-equality comparison.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::Path;
 
 use loom_daemon::worktree_ops::aggressive::{
@@ -46,6 +49,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        common::stub_gh_bin_in_process();
         let origin = tempfile::tempdir().unwrap();
         git(origin.path(), &["init", "-q", "--bare"]);
         let repo = tempfile::tempdir().unwrap();
@@ -325,3 +329,8 @@ fn not_landed_is_still_force_removable() {
     assert_eq!(d, Decision::Remove);
     assert_eq!(r, Reason::ForceOverrideUnreachable);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
