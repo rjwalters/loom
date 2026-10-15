@@ -445,7 +445,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
 1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or a priority label.
 2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): PR lease, then the label — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
-2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `first="$(loom-daemon forge wait-checks <number> --timeout 20 2>/dev/null | head -n1)"`. `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; post the "When CI Fails" verdict (`changes-requested` + `loom:ci-failure`) so the Doctor takes it. `GREEN` / `NONE` → continue. Pending is never red.
+2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>/dev/null | head -n1)"` (`--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` / `NONE` → continue. Pending is never red.
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
@@ -1353,7 +1353,7 @@ loom-daemon forge wait-checks <PR_NUMBER> --timeout 20
 
 Branch on the first stdout line:
 - ✅ `LOOM-CHECKS-GREEN` / `-NONE` (no checks) - Safe to approve
-- ❌ `-RED` - Request changes (stderr: `<name>\t<url>\t<run_id>` per failure)
+- ❌ `-RED` - "When CI Fails"
 - ⏳ `-TIMEOUT` / `-HEAD-MOVED` - Pending (see "When CI is Pending")
 - `-ERROR` or no sentinel (Gitea / older binary) - run `gh pr checks <PR_NUMBER>` once
 
@@ -1374,21 +1374,11 @@ gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 
 ### When CI Fails
 
-If CI checks are failing, **do NOT approve**. Instead, apply `loom:ci-failure` for visibility. Run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below.
+**Do NOT approve.** A CI-failing verdict needs a finished run (`wait-checks --settle-red`; still running → "When CI is Pending") and must name the failing test or step from its log; an attempt-1 red in a tracked or untouched flake is recorded and re-run once instead (#12011). The procedure and the verdict template are in:
 
-```bash
-./.loom/scripts/post-verdict.sh <number> changes-requested "$VERDICT_SHA" --body "$(cat <<'EOF'
-❌ **Changes Requested - CI Failing**
-
-The following CI checks are failing:
-
-[LIST THE FAILING CHECKS (RED DETAIL)]
-
-Please fix these issues before the PR can be approved. I'll evaluate again once CI passes.
-EOF
-)" && \
-  gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested" --add-label "loom:ci-failure"
-```
+| File | Load when |
+|---|---|
+| [`judge-ci-red.md`](../loom-judge-ci-red/SKILL.md) | Any `LOOM-CHECKS-RED`, or `post-verdict.sh` exit 6 |
 
 ### When Merge Conflicts Exist
 
@@ -1411,7 +1401,7 @@ case "$first" in
     gh pr comment <number> --body "CI is still running. Releasing the claim and skipping — a later tick will review once CI settles."
     gh pr edit <number> --remove-label "loom:reviewing"   # PR stays loom:review-requested; continue to the next PR
     ;;
-  LOOM-CHECKS-RED*) ;;    # failing checks: rerun without 2>/dev/null for <name>\t<url>\t<run_id>
+  LOOM-CHECKS-RED*) ;;    # "When CI Fails"
   LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;
   *) gh pr checks <PR_NUMBER> ;;   # no sentinel (older binary / Gitea): one snapshot, no loop
 esac
@@ -1429,10 +1419,10 @@ This mirrors `sweep.md`'s guardrail ("ending your turn IS the kill signal", #425
 2. **Single-PR / manual invocation (there is no next PR — you were dispatched to judge exactly this one PR and a verdict is expected before your turn ends): wait in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** (bounded by `--timeout`; it also handles the empty-rollup trap, #6169). It returns control before you write your final message; nothing about it depends on a future turn. Branch on the first **stdout** line, never the exit code; keep stderr separate (RED detail).
 
 ```bash
-err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1800 2>"$err")"; first="${out%%$'\n'*}"
+err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1800 --settle-red 2>"$err")"; first="${out%%$'\n'*}"
 case "$first" in
   LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green
-  LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id> per failure; gh run view <run_id> --log-failed
+  LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id>; "When CI Fails"
   LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-HEAD-MOVED*|LOOM-CHECKS-ERROR*) ;;   # unsettled: conditional verdict below
   *) gh pr checks <PR_NUMBER> ;;             # no sentinel (older binary / Gitea): one snapshot, no loop
 esac
