@@ -143,3 +143,7 @@ scripts/tests/test-champion-needs-revision-routing.sh
 # its idempotency classifier has no caller; the script and its suite go.
 scripts/classify-capacity-defer.sh
 scripts/tests/test-classify-capacity-defer.sh
+
+# #9782 (2026-10-15) — every suite now registers a real write-scope fixture
+# (write-scope-fixture.sh); the allow-all forge may-write stub goes.
+scripts/tests/lib/write-scope-stub.sh

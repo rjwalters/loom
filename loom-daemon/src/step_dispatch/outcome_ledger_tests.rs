@@ -223,6 +223,20 @@ fn each_class_maps_to_one_effect() {
             fast,
             Effect::FastFailWindow,
         ),
+        // #11969: only Builder charges the issue ladder.
+        (
+            StepRole::Curator,
+            out(OutcomeClass::Failed, "crashed"),
+            fast,
+            Effect::FastFailWindow,
+        ),
+        (
+            StepRole::ChampionPromote,
+            out(OutcomeClass::Failed, "crashed"),
+            fast,
+            Effect::FastFailWindow,
+        ),
+        (StepRole::Curator, out(OutcomeClass::Failed, "crashed"), SLOW, Effect::Failed),
     ];
     for (step, outcome, ran_for, want) in cases {
         assert_eq!(effect_of(step, &outcome, ran_for, &cfg), want, "{step} {outcome:?}");
@@ -310,14 +324,66 @@ fn a_pool_or_claim_refusal_cools_before_the_next_tick_and_a_state_refusal_does_n
 fn claim_lost_redraws_and_is_counted_but_is_not_a_run() {
     let mut l = OutcomeLedger::default();
     let now = t0();
-    for _ in 0..5 {
+    for k in 0..5 {
         let rec =
             l.record(6, StepRole::Judge, &out(OutcomeClass::Refused, "claim_lost"), SLOW, now);
         assert_eq!(rec.effect, Effect::Redraw);
-        assert_eq!(rec.cooling_until, None, "five lost claims never trip the repeat cap");
+        assert_ne!(
+            l.cooling_cause(6, StepRole::Judge, now),
+            Some(CooldownCause::RepeatCap),
+            "lost claim {k} is not a run"
+        );
     }
     assert_eq!(l.counters().claim_lost, 5);
     assert_eq!(l.counters().by_class[&OutcomeClass::Refused], 5);
+    assert_eq!(l.counters().repeat_capped, 0);
+}
+
+/// #11969: one lost claim is a race and only redraws; a second in a row arms
+/// the refusal cooldown (10 min, doubling, 24 h cap); a verdict or any other
+/// outcome on the pair resets the streak.
+#[test]
+fn a_second_consecutive_claim_lost_arms_the_refusal_cooldown() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let lost = out(OutcomeClass::Refused, "claim_lost");
+    let step = StepRole::Doctor;
+
+    let first = l.record(80, step, &lost, SLOW, now);
+    assert_eq!((first.effect, first.cooling_until), (Effect::Redraw, None), "a race is free");
+    let mut lengths = Vec::new();
+    for k in 1..12 {
+        let at = now + chrono::Duration::days(k);
+        let rec = l.record(80, step, &lost, SLOW, at);
+        assert_eq!(rec.effect, Effect::Redraw, "still a redraw");
+        lengths.push((rec.cooling_until.expect("cooling") - at).num_seconds());
+    }
+    assert_eq!(&lengths[..3], &[600, 1200, 2400], "10 min, doubling");
+    assert_eq!(*lengths.last().unwrap(), 24 * 3600, "capped at 24 h");
+    assert_eq!(
+        l.cooling_cause(80, step, now + chrono::Duration::days(11)),
+        Some(CooldownCause::Refused)
+    );
+
+    // Per (item, step): another step's lost claim is its own streak.
+    assert_eq!(
+        l.record(80, StepRole::Judge, &lost, SLOW, now)
+            .cooling_until,
+        None
+    );
+
+    // Another outcome in between resets it.
+    l.record(81, step, &lost, SLOW, now);
+    l.record(81, step, &out(OutcomeClass::Refused, "not_eligible"), SLOW, now);
+    assert_eq!(l.record(81, step, &lost, SLOW, now).cooling_until, None);
+    l.record(82, step, &lost, SLOW, now);
+    l.record(82, step, &out(OutcomeClass::Failed, "crashed"), SLOW, now);
+    assert_eq!(l.record(82, step, &lost, SLOW, now).cooling_until, None);
+
+    // So does a verdict.
+    l.record(83, step, &lost, SLOW, now);
+    l.record(83, step, &out(OutcomeClass::Verdict, "fixed"), SLOW, now);
+    assert_eq!(l.record(83, step, &lost, SLOW, now).cooling_until, None);
 }
 
 #[test]
@@ -591,6 +657,30 @@ fn a_prune_inside_the_refusal_loop_keeps_the_streak_capped() {
             .cooling_until,
         None
     );
+}
+
+/// #11969: a Curator or Champion-promote fast failure takes the ledger-local
+/// window, never the issue ladder (whose release would restore `loom:issue`).
+#[test]
+fn a_non_builder_issue_step_fast_failure_takes_the_local_window() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let fail = out(OutcomeClass::Failed, "crashed");
+    let quick = Duration::from_secs(20);
+    for step in [StepRole::Curator, StepRole::ChampionPromote] {
+        let lengths: Vec<i64> = (0..3)
+            .map(|k| {
+                let at = now + chrono::Duration::days(k);
+                let rec = l.record(90, step, &fail, quick, at);
+                assert_eq!(rec.effect, Effect::FastFailWindow, "{step}");
+                (rec.cooling_until.unwrap() - at).num_seconds()
+            })
+            .collect();
+        assert_eq!(lengths, [60, 120, 240], "{step}");
+        assert_eq!(l.cooling_cause(90, step, now), Some(CooldownCause::FastFail));
+    }
+    let builder = l.record(91, StepRole::Builder, &fail, quick, now);
+    assert_eq!((builder.effect, builder.cooling_until), (Effect::FastFailLadder, None));
 }
 
 /// Any other outcome on the pair resets the PR fast-fail streak, so the

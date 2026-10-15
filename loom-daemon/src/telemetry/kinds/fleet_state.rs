@@ -651,6 +651,27 @@ pub struct FleetPrCensus {
     pub by_stage: BTreeMap<String, u32>,
 }
 
+/// A repo's pending-human queue depth (#11955): how much work waits on a
+/// curator or a human right now. Discrete sub-counts, not a pre-composed total,
+/// so a reader chooses how to combine them. The input to the human-gated ETA
+/// stages (`triage_wait`, `approval_wait`, `merge_hold`) and to the pre-ready
+/// `eligible_ahead` hurdle.
+///
+/// "Eligible" excludes issues labelled `loom:skip`, `loom:park` or a proposal
+/// label (`loom:architect`, `loom:hermit`, `loom:auditor`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetQueueDepth {
+    /// Eligible open `loom:triage` issues, awaiting curation.
+    pub awaiting_curation: u32,
+    /// Eligible open `loom:curated` issues, awaiting human approval.
+    pub awaiting_approval: u32,
+    /// Distinct items under an operator hold (operator-kind hold rows plus
+    /// `merge_hold` PRs, without double-counting). Absent when the repo's PR
+    /// census was not read whole this pass: unknown, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_held: Option<u32>,
+}
+
 /// Decode a present field, `null` included, as `Some(..)`; an absent field
 /// stays `None` through `#[serde(default)]` (#11606: uncapped vs unknown).
 fn observed_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
@@ -822,6 +843,11 @@ pub struct FleetStateRepo {
     /// emitter). Additive on `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curator: Option<CuratorState>,
+    /// The repo's pending-human queue depth (#11955). Absent when its
+    /// `loom:triage` or `loom:curated` listing was incomplete (or not yet read
+    /// by this host): unknown, never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_queue: Option<FleetQueueDepth>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]

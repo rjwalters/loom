@@ -1980,7 +1980,7 @@ fn test_resolve_role_prompt_carries_the_cap_for_architect_only() {
     // Every other role's prompt is its static spec prompt; Champion's runs
     // non-item (#11909).
     for spec in DEFAULT_ROLES.iter().filter(|s| s.name != "architect") {
-        let want = champion_mode::prompt_arg(spec.name)
+        let want = crate::role_runner::champion_mode::prompt_arg(spec.name)
             .map_or_else(|| spec.prompt.to_string(), |a| format!("{} {a}", spec.prompt));
         assert_eq!(resolve_role_prompt(spec, &config), want);
     }

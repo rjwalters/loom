@@ -16,6 +16,8 @@ const STALLED: &str =
 const PASS_RATE: &str =
     include_str!("../../defaults/observability/signoz/alerts/step-draw-pass-rate.json");
 const IDLE: &str = include_str!("../../defaults/observability/signoz/alerts/step-slots-idle.json");
+const ROLE_TICK: &str =
+    include_str!("../../defaults/observability/signoz/alerts/role-runner-item-tick.json");
 
 fn parse(s: &str) -> serde_json::Value {
     serde_json::from_str(s).expect("alert JSON must parse")
@@ -37,19 +39,27 @@ fn step_alerts_share_the_template_schema_and_are_per_host() {
         ("step-dispatch-stalled", STALLED),
         ("step-draw-pass-rate", PASS_RATE),
         ("step-slots-idle", IDLE),
+        ("role-runner-item-tick", ROLE_TICK),
     ] {
         let rule = parse(raw);
         assert_eq!(keys(&rule), keys(&template), "{name}: top-level keys");
         assert_eq!(keys(&rule["condition"]), keys(&template["condition"]), "{name}");
         assert_eq!(rule["ruleType"], "threshold_rule", "{name}");
-        assert_eq!(rule["alertType"], "METRIC_BASED_ALERT", "{name}");
+        let logs = rule["alertType"] == "LOGS_BASED_ALERT";
         assert_eq!(rule["disabled"], false, "{name}: ships enabled");
         assert_eq!(rule["labels"]["loom_signal"], name.replace('-', "_"), "{name}");
         let q = query(&rule);
-        for p in ["{{.start_timestamp_ms}}", "{{.end_timestamp_ms}}"] {
+        let window = if logs {
+            ["{{.start_timestamp_nano}}", "{{.end_timestamp_nano}}"]
+        } else {
+            ["{{.start_timestamp_ms}}", "{{.end_timestamp_ms}}"]
+        };
+        for p in window {
             assert!(q.contains(p), "{name}: query lacks {p}");
         }
-        assert!(q.contains("GROUP BY host"), "{name}: attributable per host");
+        // Attributable: per repo (the stage gauge is the captain's, keyed
+        // by repo) or per host.
+        assert!(q.contains("GROUP BY repo") || q.contains("GROUP BY host"), "{name}");
         assert!(!q.contains("\"loom:"), "{name}: no label literals");
     }
 }
@@ -67,9 +77,11 @@ fn the_thresholds_are_the_ruled_ones() {
     assert!(q.contains("'loom.dispatch.admission_result'] = 'spawned'"));
     assert!(q.contains("metric = 'loom.forge.stage_items'"));
     assert!(q.contains("max_concurrent > 0"), "dispatch hosts only");
-    // The gauge is per repo (the captain samples it): joined to the hosts
-    // that dispatch for the repo, never read as a host's own.
-    assert!(q.contains("INNER JOIN repo_depth ON repo_depth.repo = host_repos.repo"));
+    // Keyed by repo: the gauge is the captain's, per repo, and a host
+    // dispatching for the repo must have a free slot.
+    assert!(q.contains("repo_depth.repo AS repo"));
+    assert!(q.contains("hosts_with_free_slots > 0"));
+    assert!(q.contains("lower(attributes_string['loom.repo']) AS repo, count() AS n"));
 
     let pass = parse(PASS_RATE);
     assert_eq!(pass["evalWindow"], "30m0s");
@@ -95,5 +107,11 @@ fn the_thresholds_are_the_ruled_ones() {
         "the slot total, not the per-role split"
     );
     assert!(q.contains("min_depth > 0"), "work waited the whole window");
-    assert!(q.contains("INNER JOIN repo_depth ON repo_depth.repo = host_repos.repo"));
+    assert!(q.contains("repo_slots.repo AS repo"));
+
+    let ticks = parse(ROLE_TICK);
+    let q = query(&ticks);
+    assert_eq!(ticks["alertType"], "LOGS_BASED_ALERT");
+    assert!(q.contains("attributes_string['loom.role_tick.source'] != 'step'"));
+    assert!(q.contains("('curator', 'judge', 'doctor')"));
 }
