@@ -219,4 +219,62 @@ mod tests {
             CmdOutcome::Unavailable(Unavailable::Spawn(_))
         ));
     }
+
+    /// #12074: [`run_with`] for any invocation, waiting out `ETXTBSY` like
+    /// `run_stub`.
+    fn run_retrying(make: impl Fn() -> GhInvocation, program: &str) -> CmdOutcome {
+        for _ in 0..100 {
+            match run_with(make(), program) {
+                CmdOutcome::Unavailable(Unavailable::Spawn(e)) if e.contains("os error 26") => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                out => return out,
+            }
+        }
+        run_with(make(), program)
+    }
+
+    /// #12074: past the tick deadline a read is shed without running, through
+    /// `execute` and through a single execution alike; a write still runs.
+    #[test]
+    fn a_read_past_the_tick_deadline_is_shed_unsent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let program = stub(tmp.path(), &format!("touch '{}'", marker.display()));
+        let past = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
+        let _scope = super::super::read_deadline::enter(past, true);
+        let out = run_retrying(|| inv(TIMEOUT), &program);
+        assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::Shed { .. })), "{out:?}");
+        let out = inv(TIMEOUT).program(&program).run();
+        assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::Shed { .. })), "{out:?}");
+        assert!(!marker.exists(), "a shed read must not run");
+        let write = || {
+            GhInvocation::new(
+                Operation::new("issue.edit"),
+                AccessIntent::Write,
+                GhTarget::None,
+                TIMEOUT,
+            )
+            .parent(ParentContext::Missing)
+        };
+        let out = run_retrying(write, &program);
+        assert!(matches!(out, CmdOutcome::Ran(_)), "{out:?}");
+        assert!(marker.exists(), "a write is never cut by the read deadline");
+    }
+
+    /// #12074: a read that starts before the deadline gets only the time
+    /// left, however long its own timeout is.
+    #[test]
+    fn a_read_inside_the_tick_deadline_is_clamped_to_the_time_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let program = stub(tmp.path(), "sleep 5");
+        let left = Duration::from_millis(300);
+        let _scope = super::super::read_deadline::enter(std::time::Instant::now() + left, false);
+        let began = std::time::Instant::now();
+        let out = run_retrying(|| inv(Duration::from_secs(60)), &program);
+        assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::TimedOut { .. })), "{out:?}");
+        assert!(began.elapsed() < Duration::from_secs(4), "{:?}", began.elapsed());
+    }
 }

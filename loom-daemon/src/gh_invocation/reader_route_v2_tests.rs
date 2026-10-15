@@ -513,3 +513,17 @@ fn the_legacy_path_keeps_the_pre_change_fallback() {
     assert_eq!(p.who(), vec![Who::R2, Who::Writer], "the pre-change reader → writer");
     assert_eq!(withdrawn.borrow().len(), 1);
 }
+
+/// #12074: inside a work-finder tick's read scope a read every reader has
+/// rate-limited is shed at once, even a Gate read: no writer call, so the
+/// tick answers from its caches and the dispatch App's budget is kept.
+#[test]
+fn a_tick_scoped_gate_read_is_shed_not_moved_to_the_writer() {
+    let p = pool(LIMITED, LIMITED, OK);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let scope = super::super::read_deadline::enter(deadline, true);
+    let (out, _, _) = p.run(p.read("tick-gate", ReadClass::Gate), &[], SHED_ON, SystemTime::now());
+    drop(scope);
+    assert_eq!(p.who(), vec![Who::R2, Who::R1], "writer stub NOT invoked");
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+}

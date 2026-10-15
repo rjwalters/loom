@@ -168,6 +168,26 @@ pub fn list_open_pulls_cached_within(
     list_open_pulls_at(site, gh_bin, cwd, repo_override, max_pages, &refresh)
 }
 
+/// [`list_open_pulls_cached_as`] as a deferrable read (#12074): the step
+/// tick's open-PR listing is housekeeping, so when the readers are out of
+/// budget it is shed rather than spent on the writer. A shed listing is an
+/// error, and the step tick then draws no Builder step in the repo.
+///
+/// # Errors
+/// As [`list_open_pulls_cached_as`], plus a shed read.
+pub fn list_open_pulls_deferrable_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    max_pages: usize,
+) -> Result<Vec<RestPull>> {
+    let refresh = crate::credential_preflight::force_refresh_owner_credential;
+    let site = store::ConditionalRead::new(caller, PR_LIST_OPEN)
+        .deferrable(crate::forge_identity::ReadClass::Hygiene);
+    list_open_pulls_at(site, gh_bin, cwd, repo_override, max_pages, &refresh)
+}
+
 /// [`list_open_pulls_cached_as`] with the #6171 credential refresh injected
 /// (tests cannot drive the process-global primary-workspace mint).
 #[cfg(test)]

@@ -23,6 +23,8 @@
 //!   spawn, redrawing on a pass (#11909).
 //! - [`step_end`]: a finished step's forge post-state, classified and
 //!   recorded in the outcome ledger (#11909).
+//! - [`gather_budget`]: which repos a tick gathers before its wall-clock
+//!   deadline, and where the next tick resumes (#12074).
 //! - [`driver`]: the production tick the work-finder loop calls, over the
 //!   live registries (#11909).
 //!
@@ -31,6 +33,7 @@
 
 pub mod driver;
 pub mod gather;
+pub mod gather_budget;
 pub mod item_draw;
 pub mod listing;
 pub mod outcome_ledger;

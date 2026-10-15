@@ -534,6 +534,8 @@ fn run_fetch_with(
         .execute()
     {
         Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+        // #12074: the tick deadline passed; nothing was sent.
+        Ok(GhCompletion::Shed { until, .. }) => return Err(anyhow::Error::new(ReadShed { until })),
         Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", timeout.as_secs()),
         Err(e) => return Err(e).with_context(|| format!("failed to invoke {}", gh_bin.display())),
     };
