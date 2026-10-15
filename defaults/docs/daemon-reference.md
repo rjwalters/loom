@@ -8440,8 +8440,21 @@ Assigned, not elected: there is no standby producer. Per-host gauges and
 dispatch gates (`role_queue_gate`, `role_demand`, the work finder's listings)
 are unchanged on every host. Code: `observability/captain_gauges.rs`.
 
+**The stage-dwell sampler is off by default (#12203).** Every host listing
+every repo's stage labels every 5 minutes cost about 8.9k billable GitHub
+calls an hour on a 6-worker fleet and tripped `rate_limit_breaker`, which
+halts dispatch. Until it runs once per fleet, `observability.stageDwell.enabled`
+gates it entirely: off, a pass makes no stage listing, no open-items walk, no
+per-item events read and no `merged_at` read, exports no
+`loom.forge.stage_dwell` / `loom.forge.stage_items` points, and the captain
+does not arm `stage-dwell` (so no `stage-dwell` row in
+`loom.captain.gauge_*`). The daemon logs one INFO line naming the key on its
+first forge-gather pass, and again whenever the switch flips.
+
 | Key | Default | Meaning |
 |---|---|---|
+| `observability.stageDwell.enabled` | `false` | Run the forge stage-dwell sampler (and with it the `stage-dwell` captain job). `true` restores the sampling described above. **Hot-applies** (read every forge-gather pass) |
+| `observability.stageDwell.intervalSecs` | unset | Minimum seconds between two samples while enabled; passes inside it are skipped. Unset, `0` or malformed: every forge-gather pass (5 minutes). A value below that period has no effect. **Hot-applies** |
 | `fleet.captainGauges.enabled` | `false` | On the declared captain: arm the singleton jobs (`host.health.armed_singleton_jobs`) and publish their freshness |
 | `fleet.captainGauges.standDown` | `false` | On a dispatcher: skip a job for the repos a fresh heartbeat covers. Env `LOOM_CAPTAIN_GAUGES_STAND_DOWN` (`0`/`1`) overrides it per host |
 | `fleet.captainGauges.maxAgeSecs` | `1800` | A job's published `as_of` older than this is stale and the dispatcher produces locally again. Two publish intervals plus two collector passes, the fleet refresh's own liveness rule |

@@ -175,6 +175,9 @@ pub struct Config {
     pub queue_blocked: bool,
     /// `starFactsMaxAgeSecs`: the `star-facts` bound, in place of `max_age`.
     pub star_facts_max_age: Duration,
+    /// `observability.stageDwell.enabled` (#12203): off, no host arms or
+    /// relies on the `stage-dwell` job.
+    pub stage_dwell: bool,
 }
 
 fn env_bool(raw: Option<String>) -> Option<bool> {
@@ -209,6 +212,7 @@ impl Config {
             star_facts: flag(STAR_FACTS_KEY),
             queue_blocked: flag(QUEUE_BLOCKED_KEY),
             star_facts_max_age: secs(STAR_FACTS_MAX_AGE_KEY, DEFAULT_STAR_FACTS_MAX_AGE_SECS),
+            stage_dwell: super::ops::stage_dwell::Settings::from_effective(effective).enabled,
         }
     }
 
@@ -223,11 +227,15 @@ impl Config {
         }
     }
 
-    /// The jobs this host takes part in: `stage-dwell` always, the part 2
-    /// jobs by their own switches.
+    /// The jobs this host takes part in, each by its own switch:
+    /// `stage-dwell` by `observability.stageDwell.enabled` (#12203), the
+    /// part 2 jobs by theirs.
     #[must_use]
     pub fn jobs(&self) -> Vec<&'static str> {
-        let mut jobs = vec![STAGE_DWELL_JOB];
+        let mut jobs = Vec::new();
+        if self.stage_dwell {
+            jobs.push(STAGE_DWELL_JOB);
+        }
         if self.star_facts {
             jobs.push(STAR_FACTS_JOB);
         }
@@ -545,14 +553,16 @@ pub(super) async fn forge_gauges(
         move || resolve(&root, &host)
     })
     .await;
+    let mut stage_dwell = super::ops::stage_dwell::Settings::default();
     if let Ok(pass) = resolved {
+        stage_dwell = pass.stage_dwell;
         if pass.role.is_captain() {
             // Before the exchange, so this pass's facts are what it publishes.
             facts::produce(&pass.config, workspace_pool, slug_cache).await;
         }
         let _ = tokio::task::spawn_blocking(move || exchange(&root, &pass, Utc::now())).await;
     }
-    super::ops::stage_dwell::record(workspace_pool, slug_cache).await;
+    super::ops::stage_dwell::record(workspace_pool, slug_cache, stage_dwell).await;
 }
 
 /// One pass's resolved gating.
@@ -560,6 +570,8 @@ struct Pass {
     role: Role,
     config: Config,
     location: Option<(crate::fleet_store::StoreLocation, String)>,
+    /// `observability.stageDwell`, read with the rest of this pass's config.
+    stage_dwell: super::ops::stage_dwell::Settings,
 }
 
 /// Resolve this pass's role and arm or disarm the jobs. Blocking (config and
@@ -610,6 +622,7 @@ fn resolve(root: &Path, host: &str) -> Pass {
         role,
         config,
         location,
+        stage_dwell: super::ops::stage_dwell::Settings::from_effective(&effective),
     }
 }
 
@@ -621,6 +634,7 @@ fn exchange(root: &Path, pass: &Pass, now: DateTime<Utc>) {
         role,
         config,
         location,
+        ..
     } = pass;
     let jobs = config.jobs();
     // Take the publish cache out so the store call runs without the lock.

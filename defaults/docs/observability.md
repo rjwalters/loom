@@ -700,7 +700,9 @@ sweeps (so `busy_slots{role="sweep"} + idle_slots = max_concurrent`), and each
 role-runner role has its own series, with the role pool's ceiling and spare
 in `loom.dispatch.role_max_concurrent` and `loom.dispatch.role_idle_slots`.
 Forge label-stage dwell
-(`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state, repo}`)
+(`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state, repo}`;
+**off by default** since #12203, switched on by `observability.stageDwell.enabled`,
+so these series are absent on a default fleet)
 covers created → curated, curated → `loom:issue`, building → review requested
 and review requested → merged. Beside the per-label counts, `stage_items` has
 queue states from one ETag-cached open-items walk per repo (#11847):
