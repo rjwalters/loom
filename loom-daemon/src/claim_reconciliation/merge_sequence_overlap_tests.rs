@@ -142,7 +142,7 @@ fn a_shared_file_keeps_the_hold() {
 
 #[test]
 fn the_release_comment_names_the_reason_and_the_counter_is_separate() {
-    let body = release_comment_body(&soft(10, 9), HoldAction::ReleaseNoOverlap);
+    let body = release_comment_body(&soft(10, 9), HoldAction::ReleaseNoOverlap, None);
     assert!(body.contains("share no changed files"), "{body}");
     assert!(
         body.contains("#9") && body.contains("transitive-only") && body.contains("#10077"),
