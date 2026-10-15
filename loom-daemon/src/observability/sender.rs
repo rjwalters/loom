@@ -153,6 +153,8 @@ pub async fn try_flush<E: Exporter>(
     status.record_signals(&outcome.signals);
     if outcome.exported > 0 {
         status.record_success(outcome.exported);
+        // Per-kind liveness (#12120): the acked prefix is what landed.
+        status.record_kinds(batch[..acknowledged].iter().map(|e| e.record.kind()));
     }
     if let Some(error) = outcome.error {
         log::warn!(

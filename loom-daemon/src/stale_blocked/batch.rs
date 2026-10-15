@@ -50,7 +50,7 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
 use super::budget::{self, Budget, Floor, ForgeCost, Guard, Meter};
-use super::release_items::Unreadable;
+use super::unreadable::Unreadable;
 use super::{classify, park_self_block, Artifact, Evidence, RemoteRef, Verdict};
 use crate::dep_recheck::{extract, named, premise, recheck};
 use crate::forge_call_stats::{ops, ForgeOp};
@@ -102,7 +102,7 @@ pub struct ClosingRef {
 /// [`GhStaleBlockedForge`]; tests use a counting fake.
 pub trait StaleBlockedForge {
     /// Whether the repository is archived (#10562): one REST `repos/{slug}`
-    /// read through [`probe_archived`], the same probe the release pass uses.
+    /// read through [`probe_archived`], the same probe the role runner uses.
     ///
     /// # Errors
     /// The read failed, or the answer carried no `archived` flag.
@@ -113,13 +113,6 @@ pub trait StaleBlockedForge {
     /// # Errors
     /// The listing did not answer completely.
     fn list_blocked(&mut self) -> Result<Vec<RestIssue>>;
-
-    /// Every open item labelled `loom:blocked-unnamed` (#10558), which may no
-    /// longer carry `loom:blocked`.
-    ///
-    /// # Errors
-    /// The listing did not answer completely.
-    fn list_unnamed(&mut self) -> Result<Vec<RestIssue>>;
 
     /// Every comment on an issue or PR, oldest first.
     ///
@@ -289,8 +282,8 @@ pub fn gather_filtered(
             .filter(|r| r.is_pull_request == want_pr)
             // Champion's digest is not a parked artifact (#9397).
             .filter(|r| !super::digest::excluded(kind, r))
-            // #11743: a frozen artifact is not read as work by any pass —
-            // not the release pass, the unnamed queue or the notifier.
+            // #11743: a frozen artifact is not read as work by any pass,
+            // the notifier included.
             .filter(|r| !crate::work_finder::is_frozen(&r.labels))
             .take(limit);
         selected.extend(rows.map(|row| (kind, row.clone())));
@@ -757,17 +750,6 @@ impl StaleBlockedForge for GhStaleBlockedForge {
         )
     }
 
-    fn list_unnamed(&mut self) -> Result<Vec<RestIssue>> {
-        crate::forge_listing::list_issues_cached_all_as(
-            CALLER,
-            &self.gh_bin,
-            Some(&self.root),
-            self.repo.as_deref(),
-            super::unnamed::UNNAMED_LABEL,
-            "open",
-        )
-    }
-
     fn comments(&mut self, number: u32) -> Result<Vec<extract::Comment>> {
         let mut all = Vec::new();
         for page in 1..=COMMENT_MAX_PAGES {
@@ -871,9 +853,8 @@ impl StaleBlockedForge for GhStaleBlockedForge {
 
 /// The one archived-repository probe (#10556, #10562): `GET repos/{slug}`
 /// through the shared ETag store, so a warm re-run is a free `304`. Shared by
-/// `check-stale-blocked` ([`GhStaleBlockedForge`]), the release pass
-/// ([`super::release_gh::GhReleaseForge`]) and the role runner's archived-root
-/// gate; each passes its own call site and cache prefix. Returns the read too,
+/// `check-stale-blocked` ([`GhStaleBlockedForge`]) and the role runner's
+/// archived-root gate; each passes its own call site and cache prefix. Returns the read too,
 /// for a caller that meters its spend.
 ///
 /// # Errors

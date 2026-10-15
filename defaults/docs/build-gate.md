@@ -251,7 +251,8 @@ failures independently confirmed pre-existing and host-environmental — an
 accurate report), then CI failed **five** gates: the markdown-token ratchet, the
 role-prompt-prefix ratchet, `check-dangling-links.sh`, `check-docs-defaults-parity.sh`,
 and the install-surface link check — a ratchet violation plus one missing
-`.loom/docs/` symlink. Every one reproduces locally in about a second. The cost
+`.loom/docs/` symlink. (#12106 later removed both ratchets and the parity
+check from CI.) Every one reproduces locally in about a second. The cost
 of not being able to learn that without pushing was one full
 Builder → CI → Judge → Doctor lap.
 
@@ -278,14 +279,10 @@ and does not call this script:
 
 - each gate is its own named step under `if: ${{ !cancelled() }}`, so one red
   gate never hides another and the step name says which one failed; and
-- each step sits inside a `# component:` marker that `loom-daemon`'s
-  required-check freshness guard pins per component
-  ([`stale_checks/inputs.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/merge_pr/stale_checks/inputs.rs)
-  `REQUIRED_CHECKS`), whose pin test fails if a component's steps run a script
-  missing from that component's spec.
+- each step sits inside a `# component:` marker naming its gate group.
 
 Having CI invoke the aggregate instead would collapse fifteen named steps into
-one opaque one and break that pin test. Reading the workflow costs CI nothing
+one opaque one. Reading the workflow costs CI nothing
 and changes nothing about it.
 
 #### Ordering, and why it is unconditional
@@ -353,12 +350,17 @@ the audit that says what the gate does and does not predict.
 #12106, `Structural Checks`, `Daemon Checks`, `Install Surface Checks` and
 `Repo Hygiene Checks` are one `Lint` job (which `check-structural.sh` now
 mirrors), and the one required context is `CI Result`; the rows below predate
-that merge. The set of
-required status contexts is `REQUIRED_CONTEXTS` in
-[`stale_checks/inputs.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/merge_pr/stale_checks/inputs.rs):
+that merge. The set of required status contexts at the audit, from the `main`
+ruleset (`gh api repos/{owner}/{repo}/rules/branches/main`), was:
 `Structural Checks`, `Shell Syntax (macos-latest)`, `Daemon Checks`, `CI Result`.
 `Install Surface Checks` is **not** itself required; it reaches `main`'s merge
 gate only through `CI Result`.
+
+Since #12106 CI no longer runs the shell budget, the shell allowlist, the
+markdown-token / role-prompt / CLAUDE.md budgets, the pipefail and
+daemon-subcommand ratchets, doc TOC / anchor / docs-parity checks or the
+agent-skills sync; the rows below that time those were measured before it. Do
+not run them as CI gates.
 
 **A local green does not imply any CI context passed.** It means the rows
 marked "mirrored" below passed on this host, nothing more.
@@ -391,8 +393,9 @@ fixtures to test the *parser*; it never initializes the current complete
 
 #### Installed-tree link independence: verdict
 
-**Verdict: independent.** The source-tree checks
-(`scripts/check-dangling-links.sh`, `scripts/check-docs-defaults-parity.sh`) do
+**Verdict: independent.** (`check-docs-defaults-parity.sh` was retired with
+its CI step in #12106; the table records the audit as run.) The source-tree checks
+(`scripts/check-dangling-links.sh`, `scripts/check-docs-defaults-parity.sh`) did
 not subsume `loom-daemon init` followed by `verify-install.sh check-links` on a
 fresh fixture. A controlled fixture passes both source checks and fails the
 installed-tree check.
@@ -465,9 +468,9 @@ git -C "$FIXTURE" -c user.email=x@example.com -c user.name=x commit -q --allow-e
 Stock macOS ships `/bin/bash` 3.2.57, and `check-shell-syntax.sh` resolves
 `bash -n` through `PATH`, not its own shebang. With a directory holding a
 `bash` symlink to `/bin/bash` placed first on `PATH`, `bash defaults/scripts/check-shell-syntax.sh --quiet --dir .`
-and `bash scripts/check-shell-allowlist.sh --self-test` both exited 0 under 3.2.57
-on this host, and the two ratchets also passed under `/bin/bash`. That
-reproduces the syntax and ratchet *components* of the CI job under a real bash
+exited 0 under 3.2.57 on this host. (The allowlist and the two ratchets this
+audit also ran were retired from CI in #12106.) That
+reproduces the syntax *component* of the CI job under a real bash
 3.2; it does not reproduce the macOS runner image, its awk, or the job's inline
 bash-version assertion. On a host whose `PATH` bash is 4.x or 5.x (Homebrew),
 stage 0's derived run of these same scripts exercises that newer bash only.

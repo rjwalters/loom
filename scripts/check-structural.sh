@@ -26,11 +26,9 @@
 # The direction matters. CI keeps its per-step shape — each gate is its own
 # named step under `if: ${{ !cancelled() }}`, so one red gate never hides
 # another and the step name says which one failed — and each step stays inside
-# its `# component:` marker, which `loom-daemon`'s required-check freshness
-# guard pins per component (see loom-daemon/src/merge_pr/stale_checks/inputs.rs
-# REQUIRED_CHECKS). Having CI call THIS script instead would have collapsed
-# fifteen named steps into one opaque one and broken that pin test. Reading the
-# workflow costs CI nothing and changes nothing.
+# its `# component:` marker. Having CI call THIS script instead would have
+# collapsed fifteen named steps into one opaque one. Reading the workflow costs
+# CI nothing and changes nothing.
 #
 # WHAT IT RUNS. Every `bash <script>.sh [args…]` invocation appearing in the
 # job's step bodies, in workflow order, INCLUDING the `--self-test` steps — a

@@ -469,12 +469,8 @@ jobs:
     # (`!cancelled()`), so one red gate never hides another; the step names
     # say which gate failed.
     #
-    # `# component: <name>` marks each gate's steps. The required-check
-    # freshness guard judges staleness per component
-    # (stale_checks/inputs.rs REQUIRED_CHECKS), and its pin test fails if a
-    # component's steps run a script missing from that component's spec. Keep
-    # the markers accurate. scripts/check-structural.sh runs this job's
-    # `bash <script>` gates locally.
+    # `# component: <name>` marks each gate's steps (scripts/check-structural.sh
+    # reads them). Keep the markers accurate.
     #
     # Always runs: never behind a path filter (ci-principles.md rule 3).
     # `if: !cancelled()` keeps the job running and RED when build-daemon
@@ -1702,15 +1698,9 @@ jobs:
       - name: merge-pr PR-label fetch freshness (#8550)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
-      - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-merge-pr-stale-required-checks.sh
       - name: merge-pr self-sync head re-read (#8164, #8191 slice 4)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-head-sync-retry.sh
-      - name: merge-pr stale-check re-date remedy (#8508)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-merge-pr-stale-check-redate.sh
       - name: merge-pr --auto blocked settle + re-validate (#8410)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-auto-blocked-settle.sh

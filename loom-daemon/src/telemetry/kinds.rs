@@ -169,6 +169,9 @@ pub mod checkout_external_change;
 /// `host.export` (#11124).
 pub mod host_export;
 
+/// Per-kind silence thresholds for `otlp_export` health (#12120).
+pub mod kind_silence;
+
 /// `operator.presence` (#11563) — an operator session's keyboard presence.
 pub mod operator_presence;
 
