@@ -655,22 +655,25 @@ fn refusal_lines(records: &[(log::Level, String)]) -> Vec<&(log::Level, String)>
         .collect()
 }
 
+/// A host budget of 2 (#11911: `workFinder.maxConcurrent`), with Guide's own
+/// budget raised to it, so the host ceiling is what refuses.
+const CEILING_2: &str = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"guide":2}},"workFinder":{"maxConcurrent":2}}}"#;
+
 #[test]
 fn ac8_a_ceiling_refusal_logs_one_line_per_tick_not_one_per_root() {
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true},"workFinder":{"maxConcurrent":1}}}"#;
-    let (report, records) = refusal_tick(cfg, 5);
-    assert_eq!(report.spawned.len(), 1);
+    let (report, records) = refusal_tick(CEILING_2, 5);
+    assert_eq!(report.spawned.len(), 2);
     assert_eq!(
         report.refusal,
         Some(LimitRefusal::Ceiling {
-            active: 1,
-            ceiling: 1
+            active: 2,
+            ceiling: 2
         })
     );
-    assert_eq!(report.deferred, 4);
+    assert_eq!(report.deferred, 3);
     let lines = refusal_lines(&records);
     assert_eq!(lines.len(), 1, "one aggregated line: {records:?}");
-    assert!(lines[0].1.contains("4 root(s) deferred"), "{}", lines[0].1);
+    assert!(lines[0].1.contains("3 root(s) deferred"), "{}", lines[0].1);
 }
 
 #[test]
@@ -741,9 +744,8 @@ fn fairness_role_budget_rotates_through_every_root() {
 /// The same rotation when the host ceiling (`maxConcurrent`) is what refuses.
 #[test]
 fn fairness_host_ceiling_rotates_through_every_root() {
-    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true},"workFinder":{"maxConcurrent":1}}}"#;
-    assert_fair(&spawns_per_root(cfg, 4, 4), "ceiling 1, 4 ticks");
-    assert_eq!(spawns_per_root(cfg, 4, 6), vec![2, 2, 1, 1], "ceiling 1, 6 ticks");
+    assert_fair(&spawns_per_root(CEILING_2, 4, 2), "ceiling 2, 2 ticks");
+    assert_eq!(spawns_per_root(CEILING_2, 4, 3), vec![2, 2, 1, 1], "ceiling 2, 3 ticks");
 }
 
 /// While the admitted run is still going, the next tick's walk starts just

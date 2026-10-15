@@ -308,9 +308,26 @@ pub struct ManifestItem {
     /// `issue` for an issue step, `pr` for a PR step. Absent for a sweep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<crate::step_role::StepRole>,
+    /// Who dispatched a sweep (#11444's `dispatch_origin`), recorded since
+    /// #11911 so a roll resumes an attended sweep and requeues a daemon one
+    /// ([`Self::attended_sweep`]). Absent on manifests written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_origin: Option<String>,
 }
 
 impl ManifestItem {
+    /// Whether this whole-lifecycle sweep was asked for by an attended caller
+    /// (#11911): an operator, an attended `/loom:sweep`, ChatOps, or a
+    /// watchdog/reaper re-dispatch of one. A daemon-origin sweep
+    /// (`work_finder`, `epic_supervisor`), or one paused by a binary that
+    /// recorded no origin (the transition release), is not.
+    #[must_use]
+    pub fn attended_sweep(&self) -> bool {
+        self.dispatch_origin
+            .as_deref()
+            .is_some_and(|o| !matches!(o, "work_finder" | "epic_supervisor"))
+    }
+
     /// The disposition a reader must act on, with the reason when it is a
     /// requeue. An unknown enum value anywhere on the item forces `requeue`
     /// with `unknown-<field>-<value>` (§6): the item is never silently dropped

@@ -10,6 +10,15 @@ use crate::runtime_preference::DispatchAdmission;
 use crate::telemetry::SweepStartFacts;
 
 impl SweepRegistry {
+    /// The dispatch origin this process recorded for `sweep_id` (#11444),
+    /// `None` for a step, a PR set or a sweep adopted after a restart.
+    #[must_use]
+    pub fn dispatch_origin_of(&self, sweep_id: &str) -> Option<String> {
+        self.start_facts
+            .get(sweep_id)
+            .and_then(|f| f.dispatch_origin.clone())
+    }
+
     /// The start facts of every sweep this daemon dispatched and still holds.
     pub(crate) fn start_facts_snapshot(&self) -> HashMap<SweepId, SweepStartFacts> {
         self.start_facts.clone()

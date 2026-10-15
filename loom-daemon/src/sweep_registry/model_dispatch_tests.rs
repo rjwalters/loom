@@ -4,15 +4,10 @@
 use crate::sweep_registry::test_support::*;
 use crate::sweep_registry::{DispatchModel, SweepRegistry};
 use crate::types::SweepKind;
-use crate::work_finder::{RegistryDispatcher, WorkDispatcher};
 use crate::worker_spawn::{profiles, Options};
 use serde_json::{json, Value};
 // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
-use std::{
-    fs,
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{fs, path::Path};
 
 /// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
 struct Environment(
@@ -161,22 +156,6 @@ fn assert_native_profile(options: &Options, config: &Value) {
 
 #[test]
 #[serial_test::serial]
-fn work_finder_fallback_launch_uses_admitted_native_profile() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let _env = Environment::isolated(root);
-    let config = fallback_config();
-    let (registry, record, _, _ws) = fixture(root, &config);
-    // A one-slot backstop also catches accidentally admitting/reserving twice.
-    let registry = Arc::new(Mutex::new(registry));
-    assert!(RegistryDispatcher::new(registry).dispatch(8715).unwrap());
-    let options = captured_options(&record, "opencode");
-    assert_native_profile(&options, &config);
-    assert_eq!(options.model, None, "an implicit native model is left to its profile");
-}
-
-#[test]
-#[serial_test::serial]
 fn request_fallback_and_native_first_ignore_claude_experiment() {
     for native_first in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -207,55 +186,6 @@ fn request_fallback_and_native_first_ignore_claude_experiment() {
             !fs::read_to_string(gh_log).unwrap().contains("--json body"),
             "native dispatch must not fetch a Claude experiment stratum"
         );
-    }
-}
-
-#[test]
-#[serial_test::serial(loom_shared_tokens_dir_env)]
-fn claude_launch_retains_cost_safe_defaults_aliases_and_experiment() {
-    claude_launch_retains_cost_safe_defaults_aliases_and_experiment_body();
-}
-
-#[serial_test::serial]
-fn claude_launch_retains_cost_safe_defaults_aliases_and_experiment_body() {
-    for (preference, model, experiment, expected) in [
-        (false, None, false, "sonnet"),
-        (true, None, false, "sonnet"),
-        (false, Some("opus@xhigh"), false, "claude-opus-5@xhigh"),
-        (true, None, true, ""),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let _env = Environment::isolated(root);
-        let mut config = fallback_config();
-        if preference {
-            // Even a configured native binding must use the admitted Claude default.
-            config["runtimes"]["default"] = json!("opencode");
-            config["runtimes"]["preference"] = json!(["codex", "claude"]);
-        } else {
-            config["runtimes"]
-                .as_object_mut()
-                .unwrap()
-                .remove("preference");
-        }
-        if let Some(model) = model {
-            config["autonomous"] = json!({"model": model});
-        }
-        let (registry, record, _, _ws) = fixture(root, &config);
-        // The Claude pool is the shared one: the root is a registered git
-        // checkout (#9548), where an in-checkout pool is refused (#9135).
-        let _pool = crate::write_scope_test_support::SharedTokenPool::one_account();
-        let expected = if experiment {
-            std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
-            std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
-            let arm = crate::script_helpers::sweep_experiment::assign_arm(8715);
-            crate::script_helpers::sweep_experiment::resolved_arm_model(arm, &config)
-        } else {
-            expected.into()
-        };
-        let registry = Arc::new(Mutex::new(registry));
-        assert!(RegistryDispatcher::new(registry).dispatch(8715).unwrap());
-        assert_eq!(captured_options(&record, "claude").model.as_deref(), Some(expected.as_str()));
     }
 }
 
@@ -334,28 +264,4 @@ fn refused_preferences_and_explicit_runtime_never_claim_or_spawn() {
             assert!(!registry.config().locks_dir().join("issue-8715").exists());
         }
     }
-}
-
-/// #9548 negative control: the dispatch fixture above, but the credential
-/// only has `pull`. The real write-scope check in `private_dispatch::prepare`
-/// refuses the sweep, so nothing is launched.
-#[test]
-#[serial_test::serial]
-fn a_read_only_credential_refuses_the_dispatch() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let _env = Environment::isolated(root);
-    let config = fallback_config();
-    let (mut registry, record, _, _ws) = fixture(root, &config);
-    let read_only = crate::write_scope_test_support::WritableRoot::read_only(
-        root,
-        Some(&root.join("fake-gh.sh")),
-    );
-    registry.config.gh_bin = Some(read_only.gh.clone());
-    let outcome = RegistryDispatcher::new(Arc::new(Mutex::new(registry))).dispatch(8715);
-    match outcome {
-        Err(e) => assert!(format!("{e:#}").contains("#9548"), "{e:#}"),
-        Ok(dispatched) => assert!(!dispatched, "a read-only root must not dispatch"),
-    }
-    assert!(!record.exists(), "nothing may launch on a refused root");
 }

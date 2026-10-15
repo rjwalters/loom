@@ -75,6 +75,7 @@ fn sample() -> PauseManifest {
             holds_issue_creation_mutex: false,
             stopped_at: None,
             step: None,
+            dispatch_origin: None,
         }],
         events: vec![],
     }

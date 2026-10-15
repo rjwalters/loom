@@ -391,12 +391,11 @@ unknown, never guessed. They come from the dispatch itself, with no forge read.
   | Value | Dispatch path |
   |---|---|
   | `operator` | `loom-daemon dispatch`, the `dispatch_sweep` MCP tool, Safehouse ChatOps `dispatch` |
-  | `work_finder` | the autonomous work finder |
   | `watchdog` | a registry watchdog re-dispatch (startup, mid-build death, review stall) |
   | `reaper_retry` | the reaper's resume of a crashed sweep |
   | `unknown` | an IPC `DispatchSweep` request that did not name an origin (a legacy client), or named one this daemon does not know |
 
-  `epic_supervisor` was retired with the epic supervisor's per-child sweep dispatch (#11911): an older record carrying it reads as `unknown`.
+  `work_finder` and `epic_supervisor` were retired with the daemon's own sweep dispatch (#11911): an older record carrying either reads as `unknown`.
 
   Every production dispatch path names its origin; none defaults to
   `operator`. The origin on an IPC request is what the client says (telemetry,
@@ -1163,8 +1162,8 @@ the issue: it is set only when the sweep's `dispatch_origin` is `operator` and
 a previous attempt exists, and the journal inference never produces it.
 
 **`dispatch_origin`** (Issue #11444): who asked for this sweep, one of the
-[`sweep.started` values](#sweepstarted) (`operator`, `work_finder`,
-`watchdog`, `reaper_retry`, `unknown`; `epic_supervisor` before #11911). Copied from the
+[`sweep.started` values](#sweepstarted) (`operator`, `watchdog`, `reaper_retry`, `unknown`; `work_finder` and
+`epic_supervisor` before #11911). Copied from the
 sweep's start facts, so it and `trigger` equal what `sweep.started` reported.
 Exported as `loom.dispatch_origin` on the OTLP log and the trace metadata.
 Absent on lines written before #11444 and on sweeps this daemon did not
@@ -1803,8 +1802,8 @@ carries a `repo` (#11847):
 | `loom.dispatch.idle_slots` | `Gauge` | `{slot}` | — | `max_concurrent − occupancy` at the end of a tick |
 | `loom.dispatch.idle_slot_seconds` | delta `Sum` | `s` | — | `min(idle, waiting) × interval` for a tick that left ready work waiting (ramp cap, saturation brake, per-repo cap) with slots idle, held until the next tick and capped at 15 min |
 | `loom.dispatch.busy_slots` | `Gauge` | `{slot}` | `role` ∈ `sweep`, or a role-runner role (`champion`, `curator`, `judge`, `doctor`, `auditor`, `hermit`, `guide`, `architect`, or a configured role) | busy agent slots at the end of a tick (#11847). `sweep` is the tick's issue-sweep occupancy, the reading `idle_slots` comes from, so `busy_slots{role="sweep"} + idle_slots = max_concurrent` (more only while occupancy is over the cap). Each role is the role-runner agents in flight for it, all repos and lanes; every built-in role reports, `0` included |
-| `loom.dispatch.role_max_concurrent` | `Gauge` | `{slot}` | — | the role-runner agent ceiling: the largest `autonomous.roleRunner.maxConcurrent` (env tier first) among the tick's repos with the role runner enabled, `0` when none is |
-| `loom.dispatch.role_idle_slots` | `Gauge` | `{slot}` | — | `role_max_concurrent − Σ busy_slots{role≠"sweep"}`, floored at `0`. The host's agent capacity is `max_concurrent + role_max_concurrent` = `Σ busy_slots + idle_slots + role_idle_slots` |
+| `loom.dispatch.role_max_concurrent` | `Gauge` | `{slot}` | — | the role runner's share of the one host budget (#11911): `max_concurrent` (one configured number, `autonomous.workFinder.maxConcurrent`, default 20, 2am#4463) less the tick's registry occupancy, emitted only while this process runs a role runner. Before #11911, the largest `autonomous.roleRunner.maxConcurrent` among the tick's repos |
+| `loom.dispatch.role_idle_slots` | `Gauge` | `{slot}` | — | `role_max_concurrent − Σ busy_slots{role≠"sweep"}`, floored at `0`: the budget's free slots. Since #11911 the host's agent capacity is `max_concurrent` = `busy_slots{role="sweep"} + Σ busy_slots{role≠"sweep"} + role_idle_slots` (`idle_slots`, kept one release, overstates idle by the role runs in flight) |
 | `loom.forge.stage_dwell`, `.samples` | delta `Sum` | `s`, `{item}` | `state` ∈ `created_to_curated`, `curated_to_issue`, `building_to_review_requested`, `review_requested_to_merged` | time spent in a forge label stage the work finder never lists; mean = ratio |
 | `loom.forge.stage_items` | `Gauge` | `{item}` | `state`, `repo` (lowercase `owner/name`) | open items per repo, by state. The label states (`curated`, `issue`, `building`, `review_requested`, `changes_requested`, `pr`) count each stage label's first listing page. The queue states (#11847) come from one complete walk of the repo's open issues and PRs: `triage` (`loom:triage`), `unlabeled` (no `loom:` label), `curated_not_promoted` (`loom:curated` without `loom:issue` or `loom:building`), `issue_open_pr` / `issue_no_pr` (`loom:issue`, split by whether an open PR's body closes it), `parked` (a registry `park` label) and `pr_held` (**PRs** with a registry `hold` label, e.g. `loom:pr` under `loom:operator`) and `pr_champion_held` (#11905: **PRs** at `loom:pr` + `loom:blocked` with no operator hold, the label shape of Champion's merge-risk and critical-file holds since #11861, read without the hold marker, so another actor's markerless park counts too; a subset of `pr_held`, disjoint from operator-held approvals). States overlap; they are not a partition, so summing across `state` double-counts. Since `repo` was added (#11847) a per-state host total is `sum by (state)` |
 

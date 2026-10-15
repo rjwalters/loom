@@ -4501,7 +4501,7 @@ epic lane (#3841):
 |---------------|-----------|--------------------|
 | `epic:needs_decomp` | body has `< 2` `### Phase` sections | **decompose** — Architect enriches the body in place (no PR) |
 | `epic:designed` | `≥ 2` phases, no `epic-phase` children yet | **expand** — Champion materializes phase-1 children (under the #3707 mutex) |
-| `epic:active` | a current-phase child is open | per-child `/loom:sweep` dispatch (`BuildChildren`) |
+| `epic:active` | a current-phase child is open | nothing: the children are Builder steps the work finder draws (#11909; the `BuildChildren` sweep dispatch was deleted, #11911) |
 | `epic:phase_join` | current phase's children all closed, more phases remain | **join** — Champion materializes phase N+1 children (mutex + barrier-gated) |
 | `epic:done` | all phases' children closed, no phases remain | **close** — Champion closes the epic (terminal) |
 
@@ -4565,9 +4565,8 @@ supervisor's decisions are tailable via `subscribe_to_events` /
 | `epic.issue.{N}.join`      | `epic:phase_join`   | `{epic, action: "join", state: "epic:phase_join"}` |
 | `epic.issue.{N}.close`     | `epic:done`         | `{epic, action: "close", state: "epic:done"}` |
 
-The `BuildChildren` transition (per-child `/loom:sweep` dispatch) has **no**
-epic-action topic — those dispatches already surface on the frozen
-`sweep.global.dispatch` topic. Subscribe to `epic.issue` to receive every
+An `active` epic plans nothing (its children are Builder steps, #11911), so it
+has **no** epic-action topic. Subscribe to `epic.issue` to receive every
 epic-supervisor action across all epics, or `epic.issue.{N}` for one epic
 (segment-aligned prefix match, same routing rule as the sweep topics).
 
@@ -4679,7 +4678,9 @@ daemon logs `maxConcurrent=N is IGNORED` when a config edit is shadowed). See
 the `autonomous.workFinder.maxConcurrent` row in the config reference table
 (below, under "Config surface").
 
-> **This cap is the whole host's agent budget (#11911).** Steps and the role
+> **Since #11911 this cap is one configured number, the whole host's agent
+> budget (default 20, 2am#4463); disk and RAM headroom only halt it at
+> exhaustion.** Steps and the role
 > runner's agents (Champion non-item, Guide, Auditor, Hermit, Architect) draw
 > from it together: steps get the cap less the role agents in flight, and the
 > role runner gets it less the steps in flight. Until #11911 it bounded sweeps
@@ -4782,8 +4783,9 @@ default charge: set `diskChargeGb` to its real per-sweep footprint.
 - Every other dispatch route: the check also runs inside
   `begin_prepared_issue_dispatch`, after the other guards and before any
   claim, label or spawn — so the review-stall watchdog's re-dispatch
-  (#3910), its PR-set conversion (#7649), the reaper's resume (#4256),
-  IPC/CLI dispatch and the epic supervisor are gated by the same rule. A
+  (#3910), the reaper's resume (#4256) and IPC/CLI dispatch are gated by the
+  same rule. (The watchdog's PR-set conversion, #7649, and the epic
+  supervisor's sweep dispatch were retired, #11911.) A
   refusal is a typed `DiskAdmissionRefused` error naming every figure, logged
   at WARN. An admitted dispatch is recorded as a *pending* unit, so the next
   admission reserves for it before any sample has seen it (dropped after 180 s
@@ -5198,17 +5200,23 @@ with a single sweep in flight, because ten role-runner agents ran outside it.
 #6102 gave those agents a second ceiling, `autonomous.roleRunner.maxConcurrent`,
 so a host's worst-case agent count was the sum of the two.
 
-**Since #11911 there is one budget.** Step dispatch moved every item role into
-the work finder, and the role runner keeps only the roles with no item to draw.
-Both draw from the work finder's dynamic cap,
-`min(maxConcurrent, disk cap, RAM cap)` (`crate::host_budget`):
+**Since #11911 there is one budget, one configured number** (operator ruling,
+2am#4463: "just have a single number set in fleet-gitops based on experience").
+Step dispatch moved every item role into the work finder, and the role runner
+keeps only the roles with no item to draw. Both draw from
+`autonomous.workFinder.maxConcurrent`, **default 20**, set per host in the
+fleet store (`crate::host_budget`). Disk and RAM headroom no longer size it: an
+exhausted disk or RAM (headroom `0`) still halts admission, and the disk
+reservation (`disk_admission`), the per-repo caps, the saturation brake and the
+host-distress breaker are unchanged. The daemon logs `host_budget: one host
+budget = N` at start and on a change.
 
 | | |
 |---|---|
-| Budget | `autonomous.workFinder.maxConcurrent` (or `hyperparameters.dispatch.maxConcurrent`, or `LOOM_WORK_FINDER_MAX_CONCURRENT`), through the disk and RAM caps |
+| Budget | `autonomous.workFinder.maxConcurrent` (or `hyperparameters.dispatch.maxConcurrent`, or `LOOM_WORK_FINDER_MAX_CONCURRENT`), default 20; `0` while disk or RAM is exhausted |
 | Steps get | the budget less the role-runner agents in flight |
 | The role runner gets | the budget less the registry occupancy (steps, plus any sweep an attended session dispatched) the last work-finder tick saw |
-| Before the first tick, or with the work finder off | the role runner falls back to the root's configured `workFinder.maxConcurrent`, with nothing counted against it |
+| Before the first tick, or with the work finder off | the role runner falls back to the root's configured `workFinder.maxConcurrent`, less the occupancy the startup adoption found |
 | Retired | `autonomous.roleRunner.maxConcurrent` and `LOOM_ROLE_RUNNER_MAX_CONCURRENT`: parsed and ignored with one warning each, never rejected |
 
 Design notes:
@@ -6234,7 +6242,7 @@ knobs not yet audited here.
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop. **Restart required** — read once, before the loop is spawned; flipping it in config alone does not start/stop an already-running daemon's loop (#5963) |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
-| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **agent budget** since #4512 — **since #11911 one budget for steps and role-runner agents together** ([One host budget](#one-host-budget-steps-and-role-runner-agents-6102-11911)) — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
+| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `20` (since #11911; was `3`) | The per-machine **agent budget** since #4512 — **since #11911 one budget for steps and role-runner agents together** ([One host budget](#one-host-budget-steps-and-role-runner-agents-6102-11911)) — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
 | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup — a startup-capture pattern `maxConcurrent` no longer shares (it hot-applies since #9060). **Restart required** to pick up a change (#5963) |
 | `autonomous.workFinder.maxConcurrentPerRepo` | `LOOM_WORK_FINDER_MAX_CONCURRENT_PER_REPO` | *(absent = uncapped)* | How many of the shared `maxConcurrent` budget's slots ONE repo may hold (#9090). **Absent is uncapped, not a number**: this is opt-in, so an upgrade throttles nothing. Setting it also turns on **track affinity** (a repo with a live sweep sorts ahead of a cold repo — ordering only, always subordinate to the cap). A candidate whose repo is at the cap is *deferred*, never dropped (`deferred_repo_cap` / the `repo_cap` decision reason), and the slot goes to another repo's candidate in the same tick. Zero/invalid → absent (a literal cap of `0` would deadlock every repo). A value above `maxConcurrent` is harmless. **Hot-applies (#9090)** — re-read every multi-workspace tick on the same path as `maxConcurrent`, transition logged once. See [Per-repo dispatch cap + track affinity](#per-repo-dispatch-cap--track-affinity-9090) |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle alongside the host breaker (#5963). See [Saturation admission brake](#saturation-admission-brake-4903) below |

@@ -599,8 +599,8 @@ fn tracked_config_declares_shard_index(root: &Path) -> Option<usize> {
 ///
 /// **Read per-root, but describing the host.** The index/count knobs are
 /// host- and fleet-level facts, yet they are resolved from whichever root's
-/// tick is asking — exactly as `autonomous.roleRunner.maxConcurrent` already
-/// is (see [`crate::role_runner::RoleRunnerConfig::max_concurrent`]). On a
+/// tick is asking, exactly as `autonomous.roleRunner.roleMaxConcurrent` is.
+/// On a
 /// fleet host whose roots disagree, each root is gated by its own resolution;
 /// in the intended deployment `shardCount` is identical everywhere and
 /// `shardIndex` comes from the host's env, so they agree trivially.

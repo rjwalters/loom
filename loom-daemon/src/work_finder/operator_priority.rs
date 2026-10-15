@@ -85,7 +85,12 @@ impl CapTerms {
     /// The effective cap every non-overflow admission is held to.
     #[must_use]
     pub fn effective(&self) -> usize {
-        self.configured.min(self.headroom)
+        // #11911 (2am#4463): one configured number; headroom only halts.
+        crate::work_finder::resolve_dynamic_max_concurrent(
+            self.headroom,
+            usize::MAX,
+            self.configured,
+        )
     }
 }
 

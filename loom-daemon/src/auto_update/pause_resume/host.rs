@@ -132,15 +132,17 @@ fn pause_dir(item: &ManifestItem) -> PathBuf {
     roll_pause::item_dir(&roll_pause::default_pause_root(Path::new(&item.repo)), &item.id)
 }
 
-/// The sweep-registry resume spec of an issue step. `None` for anything else:
-/// a PR step (no `issue`) is requeued instead (#11898), and so is a
-/// whole-lifecycle `Issue` sweep (no `step`), which is never resumed (#11911).
+/// The sweep-registry resume spec of an issue step or an attended `Issue`
+/// sweep. `None` for anything else: a PR step (no `issue`) is requeued instead
+/// (#11898), and so is a daemon-origin `Issue` sweep (#11911).
 pub(crate) fn sweep_spec(item: &ManifestItem, launch: &RollResumeLaunch) -> Option<RollResumeSpec> {
     let handle = item.resume_handle.as_ref()?;
-    let step = item.step?;
+    if item.step.is_none() && !item.attended_sweep() {
+        return None;
+    }
     Some(RollResumeSpec {
         issue: item.issue?,
-        step: Some(step),
+        step: item.step,
         old_sweep_id: item.id.clone(),
         launch: launch.clone(),
         model: handle.model.clone(),
@@ -393,15 +395,22 @@ pub(crate) mod sweeps {
         }
     }
 
-    /// An `Issue` sweep whose requeue failed: release its lock here, and
-    /// leave the forge claim to claim reconciliation, which restores a dead
-    /// claim's label. It is never re-adopted as a running sweep (#11911): the
-    /// daemon no longer resumes or adopts the whole-lifecycle sweeps it
-    /// retired. A step is not one (#11898).
+    /// A daemon-origin `Issue` sweep whose requeue failed: release its lock
+    /// here, and leave the forge claim to claim reconciliation, which restores
+    /// a dead claim's label. It is never re-adopted as a running sweep
+    /// (#11911). An attended sweep keeps ordinary restart recovery. A step is
+    /// not one (#11898).
     pub(crate) fn recover(registry: &Arc<Mutex<SweepRegistry>>, item: &ManifestItem) {
         let (Some(issue), None) = (item.issue, item.step) else {
             return;
         };
+        if item.attended_sweep() {
+            let only = std::collections::HashSet::from([issue]);
+            if let Err(e) = locked(registry).reconstruct_issues(Some(&only)) {
+                log::warn!("pause_resume: {}: restart recovery failed: {e:#}", item.id);
+            }
+            return;
+        }
         locked(registry).release_roll_item(issue, &[&item.id]);
         log::info!(
             "pause_resume: {}: released issue #{issue}'s lock; its claim is left to claim \

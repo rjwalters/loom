@@ -458,6 +458,7 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         holds_issue_creation_mutex: c.holds_issue_creation_mutex,
         stopped_at: None,
         step: c.step,
+        dispatch_origin: c.dispatch_origin.clone(),
     }
 }
 

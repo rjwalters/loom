@@ -909,9 +909,8 @@ fn format_hms(total_secs: i64) -> String {
 /// **host-wide** load, so a role agent's CPU absolutely pushes it over the hold
 /// threshold — but the only thing it can withhold is a NEW *sweep* admission.
 /// It has no authority over role-runner agents (they are admitted by
-/// [`crate::role_runner`]'s own loops, bounded since #6102 by
-/// `autonomous.roleRunner.maxConcurrent`, never by this brake or by
-/// `autonomous.workFinder.maxConcurrent`), and it can shed nothing already
+/// [`crate::role_runner`]'s own loops, bounded by their share of the one host
+/// budget, #6102 and #11911, never by this brake), and it can shed nothing already
 /// running. So "held, 0 sweeps in flight" does **not** imply an idle host, and
 /// saying "nothing is running to relieve it" was wrong in exactly the case that
 /// matters: a host loaded entirely by role ticks.
@@ -922,8 +921,9 @@ fn role_agent_clause(active_role_agents: usize) -> String {
     }
     format!(
         " — NOTE: {active_role_agents} role-runner agent(s) ARE running; the brake cannot hold \
-         those back (they are admitted outside it — bound them with \
-         autonomous.roleRunner.maxConcurrent) and cannot shed load already in flight, so this \
+         those back (they are admitted outside it, within the one host budget — lower \
+         autonomous.workFinder.maxConcurrent to bound them) and cannot shed load already in \
+         flight, so this \
          load may be role-driven rather than idle (#6102)"
     )
 }

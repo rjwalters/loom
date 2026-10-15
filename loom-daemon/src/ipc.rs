@@ -1532,7 +1532,7 @@ pub fn build_daemon_status_for(
         // report from the daemon's own workspace root — the index/count knobs
         // describe the HOST, so a single resolution is the right shape even
         // though the config that carries them is read per-root (the same
-        // asymmetry `autonomous.roleRunner.maxConcurrent` already has). The
+        // asymmetry `roleRunner.roleMaxConcurrent` has). The
         // per-root `role_runner_shard` fields above carry the actual
         // per-workspace verdicts.
         role_runner_shard: status_scope::host_shard_posture(fallback_root, sections),

@@ -2005,11 +2005,11 @@ mod pass_loop;
 /// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
 /// in the #9251 forge-call accounting.
 mod building_listing;
-// The lease gate on PR-side reclaims (#11911).
 /// Keep `loom:building` on an issue whose PR is open (#11852).
 pub(crate) mod open_pr_hold;
 /// The ETag-cached REST open-PR listing the PR-side passes share (#10349).
 pub(crate) mod open_pr_listing;
+/// The lease gate on PR-side reclaims (#11911).
 mod pr_lease_gate;
 
 /// The facade glue every `gh` call below goes through (#10089), and the

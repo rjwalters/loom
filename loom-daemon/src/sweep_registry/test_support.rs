@@ -2377,3 +2377,15 @@ pub(crate) fn write_local_cfg(dir: &Path, body: &str) {
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, body).unwrap();
 }
+
+/// Record `origin` as `sweep_id`'s dispatch origin (#11444), as a real
+/// dispatch would: a roll resumes an attended sweep (#11911).
+pub(crate) fn mark_dispatch_origin(reg: &mut SweepRegistry, sweep_id: &str, origin: &str) {
+    reg.start_facts.insert(
+        sweep_id.to_string(),
+        crate::telemetry::SweepStartFacts {
+            dispatch_origin: Some(origin.to_string()),
+            ..Default::default()
+        },
+    );
+}

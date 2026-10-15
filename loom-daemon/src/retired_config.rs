@@ -4,8 +4,7 @@
 //! Step dispatch (design #11894) replaced the sweep tick and the item-role
 //! intervals (#11909); #11911 deleted what was left of them. A host whose
 //! config still sets one of their keys must keep starting, so a retired key is
-//! **parsed and ignored, never rejected**: it is read only to say, once per
-//! process, that it no longer does anything and what replaced it.
+//! **parsed and ignored, never rejected**, and warned about once per process.
 //!
 //! | Key | Replaced by |
 //! |---|---|
@@ -88,7 +87,7 @@ pub fn warn_role_runner_block(block: &serde_json::Value) {
             &format!(
                 "config: {RETIRED_ROLE_RUNNER_MAX_CONCURRENT_ENV} is retired and ignored: \
                  role-runner runs and steps share one host budget, \
-                 autonomous.workFinder.maxConcurrent / LOOM_WORK_FINDER_MAX_CONCURRENT (#11911)"
+                 autonomous.workFinder.maxConcurrent (#11911)"
             ),
         );
     }

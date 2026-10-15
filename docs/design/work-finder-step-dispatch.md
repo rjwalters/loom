@@ -79,7 +79,7 @@ The design builds on these and must not duplicate them.
 |---|---|---|
 | Workspace draw | `work_finder/workspace_draw.rs` (#11103) | v1 is seeded `(minute, host)` (`:268-275`) |
 | Targeted roles and outcome classes | #11868, `defaults/docs/targeted-role-invocation.md:85-137` | `verdict \| noop \| refused \| failed` plus reason tokens; `LOOM_STEP_OUTCOME` is unread (`:169-171`) |
-| Targeted Champion, non-item mode | #11871, `defaults/docs/champion-targeted.md`, `role_runner/champion_mode.rs` | `autonomous.roleRunner.championMode: "non-item"` |
+| Targeted Champion, non-item mode | #11871, `defaults/docs/champion-targeted.md`, `role_runner/champion_mode.rs` | `/loom:champion --non-item`, the role runner's only Champion mode (`championMode` retired, #11909, #11911) |
 | Queue-depth and slot gauges | #11874 | `loom.forge.stage_items{repo,state}` (`observability/ops/stage_queue.rs:26-55`), `loom.dispatch.busy_slots{role}` (`observability/ops/busy_slots.rs`) |
 | Role telemetry | #11877 | `loom.repo` and trace on role rows, Curator listing journal, `role_tick.outcome` |
 | Landed cooldown, fast-fail ladder | #11875, #11872 | `sweep_registry/dispatch/landed_cooldown.rs`; `sweep_registry/fast_fail_park.rs` |

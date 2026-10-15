@@ -89,105 +89,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::tick_report::record_dispatch_outcome;
-use super::{PriorityCandidate, TickReport, WorkDispatcher};
 use crate::sweep_registry::SweepRegistry;
-use crate::types::QueueDisposition as Qd;
 use crate::worktree_ops::gh::OpenPrProbe;
 
 /// The conditional-read caller name of the pre-filter's listing read.
 const CALLER: &str = "work_finder.open_pr_prefilter";
-
-/// One tick's pre-filter state. See the module docs.
-#[derive(Debug, Default)]
-pub struct OpenPrPrefilter {
-    /// Every candidate of the tick, per workspace index.
-    candidates: HashMap<usize, Vec<u32>>,
-    /// Per workspace already asked this tick: issue to its open linked PR.
-    blocked: HashMap<usize, HashMap<u32, u32>>,
-    /// Per workspace already asked this tick: open issue to its merged
-    /// closing PR (#11853, [`super::landed_prefilter`]).
-    landed: HashMap<usize, HashMap<u32, u32>>,
-}
-
-impl OpenPrPrefilter {
-    /// The pre-filter for a tick whose pass 2 will walk `candidates`.
-    #[must_use]
-    pub fn new(candidates: &[PriorityCandidate]) -> Self {
-        let mut by_workspace: HashMap<usize, Vec<u32>> = HashMap::new();
-        for cand in candidates {
-            by_workspace
-                .entry(cand.workspace_idx)
-                .or_default()
-                .push(cand.number);
-        }
-        Self {
-            candidates: by_workspace,
-            blocked: HashMap::new(),
-            landed: HashMap::new(),
-        }
-    }
-
-    /// Dispatch `cand` through its workspace's `dispatcher` unless the
-    /// pre-filter verified an open linked PR for it, and count the outcome on
-    /// `report`. Returns the ready-queue disposition and detail, like
-    /// [`record_dispatch_outcome`]; only [`Qd::Dispatched`] consumed a slot.
-    pub fn dispatch<D: WorkDispatcher>(
-        &mut self,
-        dispatcher: &mut D,
-        cand: &PriorityCandidate,
-        overflow: bool,
-        report: &mut TickReport,
-    ) -> (Qd, Option<String>) {
-        if let Some(pr) = self.open_pr(dispatcher, cand) {
-            report.skipped_pr_open += 1;
-            report.pr_open_prefiltered += 1;
-            return (Qd::OpenPr, Some(format!("open PR #{pr}")));
-        }
-        if let Some(pr) = self.landed_pr(dispatcher, cand) {
-            report.skipped_already_landed += 1;
-            return (Qd::AlreadyLanded, Some(format!("merged closing PR #{pr}")));
-        }
-        let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(cand.number, overflow);
-        record_dispatch_outcome(report, cand.number, cand.workspace_idx, started, &outcome)
-    }
-
-    /// `cand`'s verified open linked PR, asking its workspace's dispatcher on
-    /// the workspace's first candidate of the tick and never again.
-    fn open_pr<D: WorkDispatcher>(
-        &mut self,
-        dispatcher: &D,
-        cand: &PriorityCandidate,
-    ) -> Option<u32> {
-        let idx = cand.workspace_idx;
-        if !self.blocked.contains_key(&idx) {
-            let asked = self.candidates.get(&idx).map_or(&[][..], Vec::as_slice);
-            self.blocked.insert(idx, dispatcher.open_pr_blocked(asked));
-        }
-        self.blocked.get(&idx)?.get(&cand.number).copied()
-    }
-
-    /// `cand`'s merged closing PR while it stays open (#11853), asking its
-    /// workspace's dispatcher once per tick about every candidate without an
-    /// open linked PR. Called only after [`Self::open_pr`] answered.
-    fn landed_pr<D: WorkDispatcher>(
-        &mut self,
-        dispatcher: &D,
-        cand: &PriorityCandidate,
-    ) -> Option<u32> {
-        let idx = cand.workspace_idx;
-        if !self.landed.contains_key(&idx) {
-            let blocked = self.blocked.get(&idx);
-            let is_blocked = |n: &u32| blocked.is_some_and(|b| b.contains_key(n));
-            let all = self.candidates.get(&idx).map_or(&[][..], Vec::as_slice);
-            let (open_pr, asked): (Vec<u32>, Vec<u32>) = all.iter().partition(|n| is_blocked(n));
-            let answer = dispatcher.landed_closing_prs(&asked, &open_pr);
-            self.landed.insert(idx, answer);
-        }
-        self.landed.get(&idx)?.get(&cand.number).copied()
-    }
-}
 
 /// [`WorkDispatcher::open_pr_blocked`] for the production dispatcher: the
 /// issues in `candidates` with a verified open linked PR, from one read of the

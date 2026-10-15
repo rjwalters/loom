@@ -91,6 +91,7 @@ fn sweep(dir: &Path, id: &str, issue: u32) -> ManifestItem {
         stopped_at: Some(Utc::now()),
         // #11911: only steps resume; a Builder step is the issue item.
         step: Some(crate::step_role::StepRole::Builder),
+        dispatch_origin: None,
     }
 }
 
@@ -1093,5 +1094,25 @@ fn a_retired_issue_sweep_is_requeued_not_resumed() {
     let host = Arc::new(FakeHost::default());
     let status = finished(run_h5(host.clone(), &plan));
     assert_eq!(status.resumed, 0);
+    assert_eq!(status.requeued_by_reason.get(super::REASON_SWEEP_RETIRED), Some(&1));
+}
+
+/// #11911: an attended `Issue` sweep (an operator's, or an attended
+/// `/loom:sweep`'s) still resumes at a roll; only a daemon-origin one, or one
+/// with no recorded origin, is requeued.
+#[test]
+fn an_attended_issue_sweep_resumes_and_a_daemon_one_is_requeued() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = plan(dir.path());
+    let mut attended = sweep(dir.path(), "attended", 8);
+    attended.step = None;
+    attended.dispatch_origin = Some("operator".to_string());
+    let mut daemon = sweep(dir.path(), "daemon", 9);
+    daemon.step = None;
+    daemon.dispatch_origin = Some("work_finder".to_string());
+    write(&plan, &manifest("rp-origin", Phase::Paused, vec![attended, daemon]));
+    let host = Arc::new(FakeHost::default());
+    let status = finished(run_h5(host.clone(), &plan));
+    assert_eq!(status.resumed, 1);
     assert_eq!(status.requeued_by_reason.get(super::REASON_SWEEP_RETIRED), Some(&1));
 }

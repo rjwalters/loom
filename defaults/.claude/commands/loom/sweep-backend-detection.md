@@ -120,7 +120,7 @@ Before the dry-run gate and all wave lifecycles (but **after** Sweep Run Identit
 
 `mcp__loom__dispatch_sweep` (#3452) queues a sweep on the daemon's spawn queue and returns immediately. When the daemon is reachable **and** a multi-account token pool is configured, dispatching to the daemon means each sweep runs in its own detached process with its own rotated OAuth token — load is balanced across accounts, and this session exits right after dispatch. When either precondition is missing, today's Mode A/B/C subagent path is the right choice — it works on a solo token, and it doesn't depend on a running daemon.
 
-**Attended only (#11911).** The daemon never spawns `/loom:sweep` itself; `dispatch_sweep` runs one for an attended caller (this path, an operator, ChatOps) in the one host budget, requeued (never resumed) at a roll.
+**Attended only (#11911).** The daemon never spawns `/loom:sweep` itself; `dispatch_sweep` runs one for an attended caller (this path, an operator, ChatOps) in the one host budget; a roll resumes it like a step.
 
 The contract is **strict AND between two preconditions**, with an explicit Mode C short-circuit and an explicit `--no-daemon` opt-out. There is **no implicit auto-start** of the daemon if the pool exists but the daemon is down; there is **no implicit "use daemon if reachable even without a pool"** branch. Either probe failing → subagent fallthrough.
 

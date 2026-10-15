@@ -360,7 +360,8 @@ pub enum MetricName {
     /// finder's issue sweeps, the role name for role-runner agents.
     #[serde(rename = "loom.dispatch.busy_slots")]
     DispatchBusySlots,
-    /// The role-runner agent ceiling (`autonomous.roleRunner.maxConcurrent`).
+    /// The role runner's share of the one host budget: the budget less the
+    /// registry occupancy (#11911).
     #[serde(rename = "loom.dispatch.role_max_concurrent")]
     DispatchRoleMaxConcurrent,
     /// Role-runner agent slots idle: the ceiling minus agents in flight.

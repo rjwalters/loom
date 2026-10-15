@@ -373,27 +373,9 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
         default_interval_secs: 600,
         interval_default: true,
     },
-    RoleSpec {
-        name: "curator",
-        prompt: "/loom:curator",
-        default_interval_secs: 300,
-        interval_default: true,
-    },
-    RoleSpec {
-        name: "judge",
-        prompt: "/loom:judge",
-        default_interval_secs: 300,
-        interval_default: true,
-    },
-    RoleSpec {
-        // Standalone owner of the `loom:changes-requested` queue once a PR's
-        // sweep is gone (#5272) — see the module-level doc comment. Same
-        // 300s cadence as `judge`, its paired stage in the PR lifecycle.
-        name: "doctor",
-        prompt: "/loom:doctor",
-        default_interval_secs: 300,
-        interval_default: true,
-    },
+    // Curator, Judge and Doctor are work-finder steps (#11909) and left this
+    // table with their intervals (#11911); naming one in `roles` or `onIdle`
+    // is warned about and ignored.
     RoleSpec {
         name: "auditor",
         prompt: "/loom:auditor",
@@ -2754,10 +2736,7 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
 ) -> RoleTickOutcome {
     crate::role_collision::probe_before_tick(root, role, interval);
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
-    // #11819: a Curator on a repo with `curator.backlogTarget` carries the
-    // daemon-computed backlog level; every other dispatch is unchanged.
-    let outcome =
-        backlog::invoke_with_backlog(runner, root, role, prompt, backlog::count_open_issues);
+    let outcome = runner.invoke(role, prompt);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
     outcome
 }
@@ -3725,10 +3704,6 @@ fn log_outcome_for_root_deduped(
     pool_exhausted.insert(root.to_path_buf(), action.is_pool_exhausted());
     model_mismatch.insert(root.to_path_buf(), action.is_model_mismatch());
 }
-
-// The Curator's backlog level at dispatch (#11819) — see
-// `role_runner/backlog.rs`.
-pub mod backlog;
 
 // Concurrent per-(repository, role) dispatch and per-role budgets (#9391) —
 // see `role_runner/concurrent_dispatch.rs`.

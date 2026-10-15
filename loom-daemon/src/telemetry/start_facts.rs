@@ -44,15 +44,13 @@ pub enum DispatchOrigin {
     /// A human asked: `loom-daemon dispatch`, the `dispatch_sweep` MCP tool,
     /// or a Safehouse ChatOps `dispatch` command.
     Operator,
-    /// The daemon's autonomous work finder picked the issue.
-    WorkFinder,
     /// A registry watchdog re-dispatched after a stall or early exit.
     Watchdog,
     /// The reaper resumed a crashed sweep from its checkpoint.
     ReaperRetry,
     /// The requester did not say, or named a value this daemon does not know
-    /// (including `epic_supervisor`, retired with the epic supervisor's
-    /// per-child sweep dispatch, #11911).
+    /// (including `work_finder` and `epic_supervisor`, retired with the
+    /// daemon's own sweep dispatch, #11911).
     #[serde(other)]
     Unknown,
 }
@@ -63,7 +61,6 @@ impl DispatchOrigin {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Operator => "operator",
-            Self::WorkFinder => "work_finder",
             Self::Watchdog => "watchdog",
             Self::ReaperRetry => "reaper_retry",
             Self::Unknown => "unknown",

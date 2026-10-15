@@ -1233,6 +1233,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
             .unwrap_or_default()
             .effective_roots(&sweep_workspace);
         let _ = loom_daemon::startup_adoption::seed_capacity_from_journal(&workspace_pool, &roots);
+        // #11911: the role runner's first admissions count what survived.
+        loom_daemon::host_budget::seed_occupancy(loom_daemon::ipc::count_in_flight_sweeps(
+            &workspace_pool,
+            &sweep_workspace,
+        ));
     }
 
     // Startup watchdog (Issue #3887): auto-cancel + re-dispatch (once, bounded)
