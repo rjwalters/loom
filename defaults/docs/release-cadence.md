@@ -88,7 +88,7 @@ rate-limited) and a release can't wait for it, cut the bump by hand:
    `.loom/install-metadata.json` (7 files, 9 lines at the time of writing).
 2. Open it as a PR titled `chore: bump version to <X.Y.Z>`. Say in the body why
    the workflow couldn't publish it and what the release ships.
-3. Its `CI Result` fails at `Structural Checks`, because the PR gate
+3. Its `CI Result` fails at its `Lint` job (the version-bump guard), because the PR gate
    (`check-defaults-version-bump.sh --forbid-bump`) rejects any PR that changes
    a version value. That is expected. A person with the repository admin role
    merges it with a merge commit, using **their own token** and bypassing the
