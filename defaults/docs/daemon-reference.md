@@ -5927,11 +5927,13 @@ retryable, 1 terminal; 2 is a usage error with empty stdout). It exists so
 consumers stop vendoring `classify-error.sh` (miniset's E2B shim pins the
 daemon instead). The shell library remains the sourced entry point for
 in-repo callers: its public functions delegate to the subcommand when a
-daemon binary resolves and fall back to the in-file tables — byte-identical —
-when none does. The two renderings are pinned equal by
-`defaults/scripts/tests/test-classify-error.sh` (parity on every row of the
-shared `vectors.tsv` fixture) and by the Rust suite that reads the same
-fixture.
+daemon binary resolves, and with none they give a documented fail-safe
+degraded answer (#11219): `classify_error` prints `RECOVERABLE` for any
+non-zero exit other than the 124/137 → `TIMEOUT` short-circuit, and
+`classification_is_transient` returns 0 (retry, bounded by the caller's cap).
+The shell pattern tables were deleted; the Rust suite and
+`defaults/scripts/tests/test-classify-error.sh` read the shared
+`vectors.tsv` / `conformance.tsv` fixtures.
 
 **Session-limit fault handling (#3947).** Stacking can occasionally trip a
 **concurrent-session-limit** fault on a token (the account is healthy but cannot
