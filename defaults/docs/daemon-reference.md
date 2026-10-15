@@ -7749,6 +7749,34 @@ Not covered: the startup claim-reconciliation pass (it gates the first
 admission and is per-repo `loom:building` only). The stale-blocked release and
 fleet-state passes were removed by #11301.
 
+### Startup reconciliation: a bounded wait (#12222)
+
+The work finder's first tick waits for the daemon's startup passes, but only
+the local ones without limit (the trace-join close, profile provisioning:
+seconds). The forge-bound startup claim-reconciliation pass makes several
+calls per `loom:building` claim, and under step dispatch every in-flight issue
+keeps `loom:building` while its PR is open, so on a busy host it ran 20–40+
+minutes and the work finder dispatched nothing for that long. The work finder
+now waits for it at most the cap below, then ticks anyway and logs
+`work_finder: startup reconciliation still running after Ns; ticking anyway`;
+the pass carries on in the background.
+
+That is safe because the pass's one startup-only decision, reclaiming a
+zero-evidence claim at once (`NoRecordAtStartup`, #6615), now applies only to
+issues last updated before the pass began: a claim this daemon makes after
+start bumps the issue's `updatedAt`, so it is never mistaken for an orphan of
+the previous process. Every other reclaim is the periodic pass's, which always
+runs alongside the work finder.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `LOOM_STARTUP_RECONCILE_WAIT_SECS` (env) > `autonomous.startupReconcileWaitSecs` (any config tier) | `90` | Longest wait, in seconds, for the startup claim and quarantine passes before the first tick |
+
+The first completed tick logs `work_finder: first tick completed Ns after
+daemon start (startup reconciliation cap fired: …)` and publishes the
+`daemon.work_finder.first_tick` `daemon.event` record (`secs_since_start`,
+`startup_reconcile_cap_fired`).
+
 ### Agent CI wait: `forge wait-checks` (#10330)
 
 `loom-daemon forge wait-checks <PR|SHA> [--timeout SECS] [--required-only]

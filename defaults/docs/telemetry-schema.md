@@ -1595,6 +1595,12 @@ operator.
 | `topic` | string | The exact bus topic this record mirrors, e.g. `"daemon.drain.started"`, `"epic.issue.123.decompose"`. |
 | `payload` | object | The event's own payload, exactly as published on the bus — see `event_bus.rs`'s topic table for each topic's shape. One documented exception, below. |
 
+Since #12222 the same record also carries `daemon.work_finder.first_tick`, once
+per daemon start: `{ "secs_since_start": 94.2, "startup_reconcile_cap_fired":
+true }` — the time from daemon start to the work finder's first completed
+tick, and whether it stopped waiting for the startup claim-reconciliation pass
+at its cap.
+
 **The one payload field that is not carried verbatim**:
 `daemon.preflight.advisory`'s `workspace_root` is reduced to its final path
 component (`/home/alice/repos/loom` -> `loom`). It is the only absolute host
