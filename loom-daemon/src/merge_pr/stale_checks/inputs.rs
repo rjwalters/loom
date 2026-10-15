@@ -462,10 +462,6 @@ pub fn composite_stale_reason(
 /// Every tracked shell script (the pool the shell gates measure and parse).
 const SHELL: &[&str] = &["**/*.sh"];
 
-/// Everything `check-file-size-budget.sh` measures (`git ls-files '*.rs' '*.sh'
-/// '*.ts'`).
-const SOURCE_FILES: &[&str] = &["**/*.rs", "**/*.sh", "**/*.ts"];
-
 /// The agent-facing markdown + role JSON the prompt-size ratchets read.
 const PROMPT_SURFACE: &[&str] = &[
     "CLAUDE.md",
@@ -561,7 +557,6 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
         components: &[
             "Conflict Marker Check",
             "CLAUDE.md Line Budget",
-            "File Size Ratchet",
             "Shell Allowlist",
             "Markdown Token Ratchet",
             "Role Prompt Prefix Ratchet",
@@ -616,19 +611,6 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         context: "CLAUDE.md Line Budget",
         global: &["scripts/check-claude-md-budget.sh", CI_WORKFLOW],
         scanned: &["CLAUDE.md"],
-        coupled: &[],
-        removal_sensitive: false,
-    },
-    // The #8248 incident's own check: a per-file code-line count against a
-    // repo-global baseline ledger.
-    CheckSpec {
-        context: "File Size Ratchet",
-        global: &[
-            "scripts/check-file-size-budget.sh",
-            "scripts/file-size-baseline.txt",
-            CI_WORKFLOW,
-        ],
-        scanned: SOURCE_FILES,
         coupled: &[],
         removal_sensitive: false,
     },

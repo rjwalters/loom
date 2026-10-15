@@ -351,10 +351,10 @@ fn only_a_modified_ci_yml_with_a_patch_is_narrowed() {
 fn unscoped_affects_everything_and_scoped_affects_only_its_members() {
     assert!(CiScope::Unscoped.affects("anything at all"));
     assert_eq!(CiScope::default(), CiScope::Unscoped);
-    let scope = CiScope::Scoped(["File Size Ratchet".to_string()].into_iter().collect());
-    assert!(scope.affects("File Size Ratchet"));
+    let scope = CiScope::Scoped(["Markdown Token Ratchet".to_string()].into_iter().collect());
+    assert!(scope.affects("Markdown Token Ratchet"));
     assert!(!scope.affects("Dangling Link Check"));
-    assert!(!CiScope::Scoped(BTreeSet::new()).affects("File Size Ratchet"));
+    assert!(!CiScope::Scoped(BTreeSet::new()).affects("Markdown Token Ratchet"));
 }
 
 #[test]
@@ -455,14 +455,14 @@ fn a_deletion_past_the_files_tail_fails_closed() {
 fn ci_scopes_default_to_the_whole_file_meaning_on_both_sides() {
     let both = CiScopes::default();
     assert_eq!(both, CiScopes::unscoped());
-    assert!(both.base.affects("File Size Ratchet"));
-    assert!(both.pr.affects("File Size Ratchet"));
+    assert!(both.base.affects("Markdown Token Ratchet"));
+    assert!(both.pr.affects("Markdown Token Ratchet"));
 
     // `from_base` narrows the base side and leaves `P` at the old meaning, the
     // shape every caller that has no PR-side attribution to offer must get.
     let only_base = CiScopes::from_base(CiScope::Scoped(BTreeSet::new()));
-    assert!(!only_base.base.affects("File Size Ratchet"));
-    assert!(only_base.pr.affects("File Size Ratchet"));
+    assert!(!only_base.base.affects("Markdown Token Ratchet"));
+    assert!(only_base.pr.affects("Markdown Token Ratchet"));
 }
 
 #[test]
@@ -484,13 +484,13 @@ fn the_pr_side_is_attributed_by_the_same_machinery_as_the_base_side() {
         .expect("job")
         .components
         .iter()
-        .find(|c| c.name == "File Size Ratchet")
+        .find(|c| c.name == "Markdown Token Ratchet")
         .expect("marker")
         .start
         + 2;
     assert!(
         scope_for_files(&wf, &[ci_file("modified", Some(&add_at(own_block)))])
-            .affects("File Size Ratchet"),
+            .affects("Markdown Token Ratchet"),
         "a PR editing the gate's OWN block is still that gate's global input"
     );
 }
