@@ -340,3 +340,11 @@ fn a_refused_draw_is_counted_on_the_record() {
 fn a_missing_role_command_reads_as_workspace_commands_missing() {
     assert_eq!(disposition_of("workspace_commands_missing"), Qd::WorkspaceCommandsMissing);
 }
+
+/// #12251: a Builder step refused on a landed issue reads as
+/// `already_landed`, not as a dispatch error.
+#[test]
+fn a_landed_refusal_reads_as_already_landed() {
+    assert_eq!(disposition_of("already_landed"), Qd::AlreadyLanded);
+    assert_eq!(refusal_skip("already_landed"), PickSkipReason::AlreadyLanded);
+}

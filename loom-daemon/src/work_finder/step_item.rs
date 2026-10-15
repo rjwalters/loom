@@ -62,7 +62,7 @@
 //! | the same, a capability not held | pass `capability_missing` |
 //! | `loom:curated` + `loom:blocked`, **dependency park**, every blocker closed | Champion re-evaluate |
 //! | any other blocked issue | pass `blocked` |
-//! | landed: a merged **closing** PR, issue still open | Curator keep-or-close |
+//! | landed: a merged **closing** PR (or one built on the issue's `feature/issue-N` branch into the default branch, #12251), issue still open | Curator keep-or-close |
 //! | `loom:decision-malformed` | Curator |
 //! | `loom:issue` | Builder |
 //! | `loom:curated` | Champion promote |
@@ -202,7 +202,8 @@ pub struct MergedLink {
 #[serde(rename_all = "snake_case")]
 pub enum LinkKind {
     /// In the issue's closes-graph (a closing keyword or a Development-sidebar
-    /// link), merged after the issue was last reopened.
+    /// link), or built on the issue's Builder branch `feature/issue-N` into
+    /// the default branch (#12251), merged after the issue was last reopened.
     Closes,
     /// A partial-increment reference (`Part of #N`, `Contributes to #N`), or a
     /// closing merge older than the issue's last reopen.
