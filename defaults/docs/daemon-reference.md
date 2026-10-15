@@ -43,6 +43,7 @@
 - [Observability exporter (`observability`, #4705, epic #4702 Phase 1)](#observability-exporter-observability-4705-epic-4702-phase-1)
 - [Fleet dashboard (`loom-daemon serve`)](#fleet-dashboard-loom-daemon-serve)
 - [Locks and lifecycle](#locks-and-lifecycle)
+- [A tick appears hung — dump the async task tree (`kill -USR1`, #12079)](#a-tick-appears-hung--dump-the-async-task-tree-kill--usr1-12079)
 - [What this page does NOT describe](#what-this-page-does-not-describe)
 - [Related resources](#related-resources)
 <!-- toc:end -->

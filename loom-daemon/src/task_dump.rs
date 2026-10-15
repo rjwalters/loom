@@ -148,11 +148,8 @@ mod tests {
         }
         // Reaching here means the process survived both signals.
         let outcome = side_runtime().block_on(dump_to_log(main_rt.handle(), DUMP_TIMEOUT));
-        match outcome {
-            DumpOutcome::Tasks(_) => assert!(DUMP_AVAILABLE),
-            DumpOutcome::Unavailable => assert!(!DUMP_AVAILABLE),
-            DumpOutcome::TimedOut => panic!("dump timed out on an idle runtime"),
-        }
+        assert!(!matches!(outcome, DumpOutcome::TimedOut), "dump timed out on an idle runtime");
+        assert_eq!(matches!(outcome, DumpOutcome::Tasks(_)), DUMP_AVAILABLE);
     }
 
     #[cfg(all(
