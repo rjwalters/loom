@@ -67,6 +67,9 @@ fn the_thresholds_are_the_ruled_ones() {
     assert!(q.contains("'loom.dispatch.admission_result'] = 'spawned'"));
     assert!(q.contains("metric = 'loom.forge.stage_items'"));
     assert!(q.contains("max_concurrent > 0"), "dispatch hosts only");
+    // The gauge is per repo (the captain samples it): joined to the hosts
+    // that dispatch for the repo, never read as a host's own.
+    assert!(q.contains("INNER JOIN repo_depth ON repo_depth.repo = host_repos.repo"));
 
     let pass = parse(PASS_RATE);
     assert_eq!(pass["evalWindow"], "30m0s");
@@ -92,4 +95,5 @@ fn the_thresholds_are_the_ruled_ones() {
         "the slot total, not the per-role split"
     );
     assert!(q.contains("min_depth > 0"), "work waited the whole window");
+    assert!(q.contains("INNER JOIN repo_depth ON repo_depth.repo = host_repos.repo"));
 }

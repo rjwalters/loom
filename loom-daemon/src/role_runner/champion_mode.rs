@@ -13,8 +13,10 @@
 //!   is the only behaviour, and `"all"` (or any other value) is ignored with
 //!   a warning.
 //! - **Curator, Judge and Doctor** ([`STEP_ROLES`]) never tick on an
-//!   interval or on the idle edge. Naming one in `autonomous.roleRunner.roles`
-//!   or `onIdle` is ignored with a warning, once per name.
+//!   interval or on the idle edge: the daemon spawns no interval loop for
+//!   them (`daemon_service`), so naming one in `autonomous.roleRunner.roles`
+//!   has no effect, and naming one in `onIdle` is ignored with a warning,
+//!   once per name.
 //!
 //! Guide, Auditor, Hermit and Architect keep the interval: they have no item
 //! to draw.

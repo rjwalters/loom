@@ -498,8 +498,11 @@ pub fn default_roles_snapshot_id() -> String {
 /// without a running loop.
 #[must_use]
 pub fn interval_default_roles() -> Vec<RoleSpec> {
-    let defaults = DEFAULT_ROLES.iter().filter(|s| s.is_interval_default());
-    champion_mode::without_step_roles(defaults.copied().collect(), None)
+    DEFAULT_ROLES
+        .iter()
+        .filter(|s| s.is_interval_default())
+        .copied()
+        .collect()
 }
 
 // ============================================================================
@@ -1708,7 +1711,7 @@ pub fn resolve_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
             );
         }
     }
-    champion_mode::without_step_roles(out, Some("roles"))
+    out
 }
 
 /// Human-readable "config layer" label for whichever tier file actually

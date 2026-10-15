@@ -144,7 +144,7 @@ mod tests {
         let got = stale_after_minutes("loom:curating");
         std::env::remove_var("LOOM_STALE_CURATING_MINUTES");
         assert_eq!(got, Some(7.0));
-        assert_eq!(stale_after_minutes("loom:curating"), Some(30.0));
+        assert_eq!(stale_after_minutes("loom:curating"), Some(45.0));
         assert_eq!(stale_after_minutes("loom:issue"), None);
     }
 }

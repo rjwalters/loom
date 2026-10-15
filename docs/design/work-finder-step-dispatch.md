@@ -140,7 +140,8 @@ Notes on the table:
    - **`age`** = `1 + min(stage_age_days, 90) / 30`.
    - **Seed:** `loom-draw/v2` = `sha256("loom-draw/v2:"+minute+":"+host+":"+tick_counter+":"+workspace+":"+draw_index)`. Draws are without replacement and replayable from `pick.decision`, which logs each workspace's starting pool (in pool order, with weights) and every draw's roll and picked index.
    - The weights are numeric hyperparameters in the strict block.
-4. **Gate and claim** for the step's role: saturation, ramp cap, per-repo RAM/disk cap, then the claim (§5). **On a pass, draw again**, up to 8 redraws per slot and 32 per tick. Count each pass with its reason, including `claim_lost`.
+4. **Gate and claim** for the step's role: saturation, ramp cap, per-repo RAM/disk cap, then the claim (§5). **On a pass, draw again**: at most 8 draws fill one slot and at most 32 passes are taken in one tick (`step_dispatch/tick.rs`, `MAX_DRAWS_PER_SLOT`, `MAX_PASSES_PER_TICK`). Saturation and the ramp cap are host-wide, so they bound how many slots the tick fills rather than refusing one draw; a repo over its RAM, disk or count cap leaves the draw for the rest of the tick. Each pass is counted by its reason, including `claim_lost`, on `pick.decision` (`refused_<reason>` beside the weight-0 counts) and, for the pool gate and the claim, in the outcome ledger.
+   - Before the draw, an item this host runs (a live sweep or step) or a peer advertises a live claim on is a `claimed` pass, and while a peer's Champion merge is in flight in the repo every other merge step there is too (`SweepRegistry::draw_claims`, `PeerClaimView::merge_in_flight_at`). The classifier's `claimed` row reads labels only, and a non-Builder step labels its item late.
 5. **Spawn** `/loom:<role> <N>` (§4.4).
 
 ### 4.3 Stage-entry time
@@ -166,12 +167,12 @@ The stage-entry provider is a three-source adapter, tried in order:
 ## 5. Claims, restore and the outcome ledger
 
 **Claims.**
-- Builder: the issue lease plus `loom:building`.
-- Judge and Doctor: `lease pr` plus `loom:reviewing` / `loom:treating`.
-- Curator and Champion promote: a lease with a `step` field plus `loom:curating` / `loom:evaluating`.
+- Builder: the daemon takes the issue lease and flips `loom:issue` to `loom:building` before the spawn.
+- Every other step: the daemon takes **only** the role-keyed lease (`lease pr claim --role <role> --step <step>`); the prompt applies its claim label itself (`loom:reviewing`, `loom:treating`, `loom:curating`, `loom:evaluating`; a Champion merge has none).
 - Champion merge: `lease pr`, with `step=champion_merge`.
 - Peer claims gain an additive `(item, step)` shape (`peer_claims.rs:239-244`).
-- `labels.json` `stale_after_minutes` becomes live for all five claim labels. Builder liveness stays the renewed lease.
+- `labels.json` `stale_after_minutes` is live for all five claim labels. Builder liveness stays the renewed lease. Curating, evaluating and reviewing are 45 minutes, longer than the 30-minute step timeout, so a running step's claim never reads as stale; treating is 60.
+- **Timeouts.** Every non-Builder step has the role runner's 30-minute timeout and a Builder step the sweep's; the reaper kills a step past it and releases its claim (`sweep_registry/step_spawn/timeout.rs`).
 
 **Restore when a step dies.** Each claim is released back to its role's ready stage:
 
@@ -183,7 +184,9 @@ The stage-entry provider is a three-source adapter, tried in order:
 | `loom:reviewing` | `loom:review-requested` |
 | `loom:treating` | `loom:changes-requested` |
 
-A Builder restore with a verified open linked PR writes no label: the issue keeps `loom:building` while its PR is open, through the existing open-PR release hold (`ClaimRelease::HeldByOpenPr`). The item join then classifies the item by its PR.
+A Builder restore with a verified open linked PR writes no label: the issue keeps `loom:building` while its PR is open, through the existing open-PR release hold (`ClaimRelease::HeldByOpenPr`). A step's restore keeps that hold even when `LOOM_RELEASE_OPEN_PR_VETO=0` switches the hold off for sweeps. The item join then classifies the item by its PR.
+
+**Post-state.** The ledger's post-state comes from the one read the claim release takes, before its restore write; a read after the write would always see the claim gone. A step whose claim was not released (another claimant holds the item, a merge step) is read once at the next tick (`step_dispatch::step_end`).
 
 **Outcome ledger.** The ledger consumes #11868's classes.
 
@@ -214,7 +217,7 @@ A Builder restore with a verified open linked PR writes no label: the issue keep
 **Signals.**
 - `loom.dispatch.step` span: repo, item, role, admission result, reason, draw attempt, `age_source`, resumed (`observability/ops/dispatch_step.rs`). One per spawn attempt, spawned or refused.
 - `pick.decision`'s `item_draw`: the `loom-draw/v2` seed inputs, the weight-0 counts by reason, each drawn workspace's starting pool and every draw, enough to replay the tick (`item_draw::replay_record`), and the workspaces whose draw stopped on a `WeightOverflow`. Work-finder rows carry their step as `stage` and in the dispatch plan's `step` field.
-- The baseline: `loom.forge.stage_items{repo,state}` and `loom.dispatch.busy_slots{role}`.
+- The baseline: `loom.forge.stage_items{repo,state}`, sampled per repo by the captain's stage-dwell sampler, and `loom.dispatch.busy_slots{role}`. Steps count under `role="sweep"` (one slot each) and are broken down by step role as `busy_slots{role=<role>, pool="step"}`, never added to the total.
 
 **Alerts** (`defaults/observability/signoz/alerts/`, shipped with the cutover so a fix-forward rollout is watched from its first minute):
 

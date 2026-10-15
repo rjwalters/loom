@@ -1977,9 +1977,12 @@ fn test_resolve_role_prompt_carries_the_cap_for_architect_only() {
         resolve_role_prompt(architect, &config),
         "/loom:architect --max-proposals 7".to_string()
     );
-    // Every other role's prompt is byte-for-byte its static spec prompt.
+    // Every other role's prompt is its static spec prompt; Champion's runs
+    // non-item (#11909).
     for spec in DEFAULT_ROLES.iter().filter(|s| s.name != "architect") {
-        assert_eq!(resolve_role_prompt(spec, &config), spec.prompt.to_string());
+        let want = champion_mode::prompt_arg(spec.name)
+            .map_or_else(|| spec.prompt.to_string(), |a| format!("{} {a}", spec.prompt));
+        assert_eq!(resolve_role_prompt(spec, &config), want);
     }
 }
 
