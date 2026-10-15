@@ -193,7 +193,7 @@ pub const DEFAULT_ARCHITECT_MAX_PROPOSALS: u64 = 5;
 /// session) before killing it. Generous — a role tick can involve several
 /// forge round-trips (list/enrich/label issues, review PRs) — but bounded so
 /// a wedged session can't block that role's loop forever.
-const DEFAULT_ROLE_TIMEOUT: Duration = Duration::from_secs(1800);
+pub(crate) const DEFAULT_ROLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Load-per-core (issue #6637) at or above which a ceiling-hit tick is
 /// classified as [`RoleTickOutcome::LoadSkipped`] instead of
@@ -3896,7 +3896,7 @@ pub use roster::spawn_roster_heartbeat_task;
 
 // Model resolution + runtime reconciliation (#4501/#5001/#7894) —
 // see `role_runner/model_resolution.rs`.
-mod model_resolution;
+pub(crate) mod model_resolution;
 use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
     is_cli_default_model_sentinel, resolve_role_runner_effort, resolve_role_runner_model,

@@ -226,3 +226,21 @@ fn a_passed_through_gh_listing_journals_its_rows() {
     assert_eq!(gh_listing_rows("search", "not json"), None);
     assert_eq!(gh_listing_rows("search", "{\"number\":1}"), None, "an object is not rows");
 }
+
+/// #11906: a step's journal, named by its sweep id, drains through the same
+/// `take` a role tick uses once the step's end adopts it on its thread.
+#[test]
+fn an_adopted_step_journal_drains_like_a_role_ticks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = Path::new("/journal-test/step");
+    let path = dir.path().join("step.jsonl");
+    let line = r#"{"kind":"queue","at":"2026-10-04T12:00:00Z","role":"judge","acts_observable":true,"rows":[],"total":0}"#;
+    std::fs::write(&path, format!("{line}\n")).unwrap();
+    discard();
+    adopt(root, path.clone());
+    let got = take(root).unwrap();
+    assert!(got.read);
+    assert_eq!(got.entries.len(), 1);
+    assert!(!path.exists(), "drained");
+    assert!(step_path("step-judge-7-1").ends_with("step-step-judge-7-1.jsonl"));
+}

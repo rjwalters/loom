@@ -156,6 +156,7 @@ mod step_adopt;
 pub mod step_lease_owner;
 pub mod step_ledger;
 mod step_reap;
+pub mod step_spawn;
 mod step_story;
 #[cfg(test)]
 #[allow(unused_imports)]

@@ -79,16 +79,23 @@ pub(crate) const SWEEP_ID_ENV: &str = "LOOM_SWEEP_ID";
 /// prevent. Removing makes the guarantee hold under inheritance, not merely
 /// under a clean parent environment.
 pub(crate) fn apply_issue_scoped_markers(cmd: &mut Command, kind: &SweepKind) {
-    match kind {
-        // A step the daemon pre-claimed exports the same marker
+    let issue = match kind {
+        SweepKind::Issue(n) => Some(*n),
+        SweepKind::Step { .. } => kind.issue_number(),
+        SweepKind::PrSet(_) => None,
+    };
+    match issue {
+        // An issue step the daemon pre-claimed exports the same marker
         // (`targeted-role-invocation.md`: "a step engine that pre-claims ...
         // must export the same `LOOM_SWEEP_CLAIM_OWNED=<N>`"), and the daemon
-        // renews the step's lease as it does a sweep's (#11898).
-        SweepKind::Issue(item) | SweepKind::Step { item, .. } => {
+        // renews the step's lease as it does a sweep's (#11898, #11906).
+        Some(item) => {
             cmd.env(CLAIM_OWNED_ENV, item.to_string());
             cmd.env(LEASE_RENEW_STARTED_ENV, item.to_string());
         }
-        SweepKind::PrSet(_) => {
+        // A PR step's item is a PR: both markers name an issue, and
+        // `build-gate.sh` would back off the PR number as one (#11906).
+        None => {
             cmd.env_remove(CLAIM_OWNED_ENV);
             cmd.env_remove(LEASE_RENEW_STARTED_ENV);
         }
