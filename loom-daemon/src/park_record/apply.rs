@@ -277,5 +277,62 @@ pub fn apply(
     exit::OK
 }
 
+/// Journal a Champion park that [`apply`] landed (exit `0`, not a dry run,
+/// `--by champion`) for the role run's verdict record (#12027). Best-effort
+/// and a no-op outside a journaled run: it never changes output or exit.
+pub fn journal_applied(req: &ApplyRequest, is_pr: bool, code: i32) {
+    if code == exit::OK && !req.dry_run && req.by.as_deref() == Some("champion") {
+        crate::observability::pick_journal::record_applied(
+            req.number,
+            is_pr,
+            "blocked",
+            "park_record",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod journal_tests {
+    use super::*;
+    use crate::observability::pick_journal::{parse, set_test_journal, JournalEntry};
+
+    fn journaled(req: &ApplyRequest, is_pr: bool, code: i32) -> Vec<JournalEntry> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        set_test_journal(Some(path.clone()));
+        journal_applied(req, is_pr, code);
+        set_test_journal(None);
+        parse(&std::fs::read_to_string(&path).unwrap_or_default())
+    }
+
+    #[test]
+    fn a_landed_champion_park_journals_one_blocked_write() {
+        let req = ApplyRequest {
+            number: 42,
+            by: Some("champion".to_string()),
+            ..ApplyRequest::default()
+        };
+        let entries = journaled(&req, false, exit::OK);
+        assert!(matches!(
+            entries.as_slice(),
+            [JournalEntry::Applied { number: 42, is_pr: false, action, by, .. }]
+                if action == "blocked" && by == "park_record"
+        ));
+        assert!(journaled(&req, false, exit::FORGE).is_empty(), "a failed apply");
+        assert!(journaled(&req, false, exit::REFUSED).is_empty(), "a refused apply");
+        let dry = ApplyRequest {
+            dry_run: true,
+            ..req.clone()
+        };
+        assert!(journaled(&dry, false, exit::OK).is_empty(), "a dry run wrote nothing");
+        let other = ApplyRequest {
+            by: Some("doctor".to_string()),
+            ..req
+        };
+        assert!(journaled(&other, false, exit::OK).is_empty(), "not Champion's park");
+    }
+}

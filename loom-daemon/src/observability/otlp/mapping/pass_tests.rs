@@ -81,6 +81,7 @@ fn verdict() -> PassVerdictRecord {
         mode: PassMode::On,
         applied: true,
         at: Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 1).unwrap(),
+        step: Default::default(),
     }
 }
 
@@ -296,4 +297,69 @@ fn the_saved_queries_keep_dry_run_plans_out_of_applied_totals() {
     // Query 2 shows mode and applied beside the verdict.
     assert!(flat.contains("argMax(attributes_string['loom.pass.mode'], timestamp) AS mode"));
     assert!(flat.contains("argMax(attributes_bool['loom.pass.applied'], timestamp) AS applied"));
+}
+
+/// #12027: a role step's verdict maps every fact it carries, each key on the
+/// allow-list; a daemon pass's verdict gains none of them.
+#[test]
+fn a_step_verdict_maps_every_step_fact() {
+    use crate::telemetry::kinds::pass::StepFacts;
+    let mut r = verdict();
+    r.mechanism = "step:champion".to_string();
+    r.role = Some("champion".to_string());
+    r.artifact = "pr".to_string();
+    r.verdict = "refused".to_string();
+    r.reason = Some("ci_failing".to_string());
+    r.step = StepFacts {
+        head_sha: Some("abc1234".to_string()),
+        step: Some("champion_pr".to_string()),
+        class: Some("refused".to_string()),
+        reason_set: Some("champion_merge_v1".to_string()),
+        ledger_class: Some("failed".to_string()),
+        ledger_reason: Some("unclassified".to_string()),
+        pre_labels: vec!["loom:pr".to_string()],
+        evaluated_at: Some(r.at),
+        first_refused_at: Some(Utc.with_ymd_and_hms(2026, 10, 7, 11, 0, 0).unwrap()),
+        criterion_key: Some("ci-status".to_string()),
+        reason_key: Some("Lint".to_string()),
+        proposal_label: Some("loom:curated".to_string()),
+        body_hash: Some("0123abcd".to_string()),
+        fact_id: Some("f".repeat(32)),
+        loom: Some(crate::telemetry::provenance::Provenance {
+            version: "0.19.1161".to_string(),
+            revision: "3187e328c".repeat(4) + "abcd",
+            tree_state: "clean".to_string(),
+            complete: true,
+        }),
+    };
+    let a = attrs(&log(TelemetryRecord::PassVerdict(r.clone())));
+    assert!(a.keys().all(|k| allowed(k)), "{:?}", a.keys());
+    for (key, want) in [
+        ("loom.pass.verdict", "refused"),
+        ("loom.pass.reason", "ci_failing"),
+        ("loom.pass.head_sha", "abc1234"),
+        ("loom.pass.step", "champion_pr"),
+        ("loom.pass.class", "refused"),
+        ("loom.pass.reason_set", "champion_merge_v1"),
+        ("loom.pass.ledger_class", "failed"),
+        ("loom.pass.ledger_reason", "unclassified"),
+        ("loom.pass.first_refused_at", "2026-10-07T11:00:00Z"),
+        ("loom.pass.criterion", "ci-status"),
+        ("loom.pass.proposal_label", "loom:curated"),
+        ("loom.pass.body_hash", "0123abcd"),
+        ("loom.pass.version", "0.19.1161"),
+    ] {
+        assert_eq!(string(a.get(key)), want, "{key}");
+    }
+    assert_eq!(string(a.get("loom.pass.fact_id")).len(), 32);
+    assert!(!a.contains_key("loom.pass.reason_key"), "the raw reason key is body-only");
+    let plain = attrs(&log(TelemetryRecord::PassVerdict(verdict())));
+    for key in [
+        "loom.pass.step",
+        "loom.pass.class",
+        "loom.pass.fact_id",
+        "loom.pass.version",
+    ] {
+        assert!(!plain.contains_key(key), "a daemon pass has no {key}");
+    }
 }
