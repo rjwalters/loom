@@ -140,6 +140,7 @@ pub fn disposition_of(reason: &str) -> Qd {
         | "model_runtime_mismatch"
         | "admission_refused" => Qd::HostConstraint,
         "roll_paused" => Qd::DeferredCapacity,
+        "workspace_commands_missing" => Qd::WorkspaceCommandsMissing,
         PASS_REPO_CAP => Qd::DeferredRepoCap,
         PASS_MERGE => Qd::PeerClaim,
         _ => Qd::DispatchError,

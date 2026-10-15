@@ -258,26 +258,22 @@ fn probe_all_probes_each_published_dir_once_under_its_own_credential() {
         .unwrap_or_default();
     crate::forge_call_stats::set_test_sink_dir(None);
 
-    assert_eq!(probes, 3);
+    // #12204: the per-owner writer directory spends the same `(writer,
+    // acme)` bucket the primary's probe just booked for this window, so it
+    // is not read again.
+    assert_eq!(probes, 2);
     let calls = std::fs::read_to_string(&log).unwrap();
     let dirs: Vec<&str> = calls
         .lines()
         .map(|l| l.split('|').next().unwrap())
         .collect();
-    assert_eq!(
-        dirs,
-        [
-            primary.to_str().unwrap(),
-            owner.to_str().unwrap(),
-            reader.to_str().unwrap()
-        ]
-    );
+    assert_eq!(dirs, [primary.to_str().unwrap(), reader.to_str().unwrap()]);
     for l in calls.lines() {
         let f: Vec<&str> = l.split('|').collect();
         assert_eq!((f[1], f[2], f[3]), ("unset", "unset", "api --include rate_limit"), "{l}");
     }
     let rl = rows.iter().find(|r| r.caller == PROBE_OPERATION).unwrap();
-    assert_eq!((rl.pool.as_str(), rl.ok), ("other", 3), "free: booked to other");
+    assert_eq!((rl.pool.as_str(), rl.ok), ("other", 2), "free: booked to other");
 
     let writer = writer_account(ws.path());
     let at = chrono::Utc::now().timestamp();

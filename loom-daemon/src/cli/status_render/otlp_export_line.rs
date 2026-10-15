@@ -20,12 +20,14 @@ pub fn render(health: Option<&OtlpExportHealth>) -> String {
             "OTLP export: exempt (otlp_export: exempt) — {}",
             h.detail.as_deref().unwrap_or("no reason given")
         ),
-        OtlpExportState::NoExporter | OtlpExportState::Failing => format!(
-            "OTLP export: {} (otlp_export: {}) — {}",
-            h.state.as_str().to_uppercase(),
-            h.state.as_str(),
-            h.summary().unwrap_or_default()
-        ),
+        OtlpExportState::NoExporter | OtlpExportState::Failing | OtlpExportState::SilentKinds => {
+            format!(
+                "OTLP export: {} (otlp_export: {}) — {}",
+                h.state.as_str().to_uppercase(),
+                h.state.as_str(),
+                h.summary().unwrap_or_default()
+            )
+        }
     }
 }
 
@@ -40,6 +42,7 @@ mod tests {
             state,
             detail: detail.map(str::to_string),
             since: None,
+            kinds: Vec::new(),
         }
     }
 
@@ -53,6 +56,11 @@ mod tests {
         let failing = render(Some(&h(OtlpExportState::Failing, Some("no success in 15m"))));
         assert!(failing.contains("otlp_export: failing"));
         assert!(failing.contains("otlp: failing (no success in 15m)"));
+        let silent = render(Some(&h(
+            OtlpExportState::SilentKinds,
+            Some("no export for 24h+ from: host.health"),
+        )));
+        assert!(silent.contains("otlp_export: silent_kinds") && silent.contains("host.health"));
         assert!(render(None).contains("unknown"));
     }
 
@@ -71,6 +79,7 @@ mod tests {
             last_success_at: None,
             last_drop_growth_at: None,
             window: Duration::minutes(15),
+            kind_last_export: Default::default(),
             last_failure_detail: Some(
                 "OTLP HTTP 403 (credential refused; batch held until the credential is fixed)"
                     .to_string(),

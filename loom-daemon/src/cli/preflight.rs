@@ -54,6 +54,9 @@ impl PreflightArgs {
             );
             std::process::exit(preflight::EXIT_NOT_PASSED);
         }
+        if let Err(e) = preflight::install_signal_handlers() {
+            eprintln!("preflight: cannot install signal handlers: {e}");
+        }
         let verdict = preflight::run(&wt);
         match &verdict {
             Verdict::Disabled => eprintln!("preflight: no enabled buildGate — skipped"),
@@ -74,6 +77,9 @@ impl PreflightArgs {
                     "preflight: reason=preflight_unresolved after {attempts}/{max} attempts — open NO PR.\n{tail}"
                 );
             }
+            Verdict::Cancelled { signal } => eprintln!(
+                "preflight: cancelled by signal {signal}; gate processes were killed, nothing recorded"
+            ),
             Verdict::TimedOut {
                 attempt, max, tail, ..
             } if attempt >= max => {

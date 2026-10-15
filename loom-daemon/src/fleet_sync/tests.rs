@@ -780,6 +780,23 @@ fn the_status_block_pairs_desired_with_actual() {
 }
 
 #[test]
+fn a_running_store_never_claims_the_host_is_dispatching() {
+    // `Proceed` only says the *store* places no hold; a local operator-stop
+    // or drain hold can still be active, so the line must not say dispatch is
+    // flowing (it contradicted the capacity line's HELD, #11325).
+    let now = Utc::now();
+    let status = status_desiring(crate::fleet_store::state::RunState::Running);
+    assert_eq!(status.enforced, Enforcement::Proceed);
+    let line = render_line(Some(&status), now).expect("a line");
+    assert!(line.contains("desired running (host entry)"), "{line}");
+    assert!(
+        line.contains("-> no fleet-store hold (dispatch may still be held locally; see Drain)"),
+        "{line}"
+    );
+    assert!(!line.contains("dispatching normally"), "{line}");
+}
+
+#[test]
 fn the_status_block_names_a_cached_or_last_recorded_answer() {
     let now = Utc::now();
     let mut cached = status_desiring(crate::fleet_store::state::RunState::Stopped);
