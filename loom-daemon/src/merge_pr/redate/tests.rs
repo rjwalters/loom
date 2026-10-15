@@ -95,6 +95,7 @@ fn remedy_outcome_variants_are_distinct() {
     };
     let pushed = RemedyOutcome::Pushed {
         new_sha: "abc".to_string(),
+        n: 1,
     };
     assert_ne!(moved, pushed);
     assert_ne!(
@@ -347,7 +348,8 @@ fn remedy_pushes_a_tree_identical_commit_when_head_matches() {
     assert_eq!(
         outcome,
         RemedyOutcome::Pushed {
-            new_sha: "newsha22".to_string()
+            new_sha: "newsha22".to_string(),
+            n: 1,
         }
     );
 
@@ -598,7 +600,8 @@ fn an_untrusted_redate_marker_is_not_attempt_state() {
     assert_eq!(
         outcome,
         RemedyOutcome::Pushed {
-            new_sha: "newsha22".to_string()
+            new_sha: "newsha22".to_string(),
+            n: 1,
         }
     );
 
@@ -734,7 +737,8 @@ fn the_remedy_writes_the_trailers_into_the_created_commit() {
     assert_eq!(
         outcome,
         RemedyOutcome::Pushed {
-            new_sha: "newsha22".to_string()
+            new_sha: "newsha22".to_string(),
+            n: 1,
         }
     );
     let argv = fs::read_to_string(dir.join("argv.log")).expect("argv log");
@@ -760,7 +764,8 @@ fn an_unrecomputable_verdict_falls_back_to_the_generic_body_and_still_pushes() {
     assert_eq!(
         outcome,
         RemedyOutcome::Pushed {
-            new_sha: "newsha22".to_string()
+            new_sha: "newsha22".to_string(),
+            n: 1,
         }
     );
     let argv = fs::read_to_string(dir.join("argv.log")).expect("argv log");

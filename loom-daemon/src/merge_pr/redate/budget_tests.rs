@@ -200,7 +200,8 @@ fn budget_counts_across_heads_and_records_the_next_position() {
     assert_eq!(
         run(&gh, CFG3),
         RemedyOutcome::Pushed {
-            new_sha: "newsha22".to_string()
+            new_sha: "newsha22".to_string(),
+            n: 2,
         }
     );
     let argv = fs::read_to_string(dir.join("argv.log")).expect("argv log");

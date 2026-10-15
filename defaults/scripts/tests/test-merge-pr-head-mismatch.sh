@@ -495,6 +495,20 @@ else
     echo -e "  ${RED}FAIL${NC}: exit 7 (merge-queue step) is not documented next to 3-6 (#10628)"
 fi
 
+# #12014: exit 6 (auto-refresh rounds spent, loom:operator kept) is a re-queue:
+# Champion branches on it and lists it, and the doc table carries its row.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$CHAMPION_MD" ]] && grep -q '"\$MERGE_RC" -eq 6' "$CHAMPION_MD" \
+   && grep -q '^- \*\*6\*\* — ' "$CHAMPION_MD" \
+   && [[ -f "$EXIT_CODE_DOC" ]] && grep -q '^| `6` |' "$EXIT_CODE_DOC" \
+   && grep -q '^#   6 = ' "$MERGE_PR_SRC"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: exit 6 (auto-refresh exhausted) is a Champion re-queue and documented (#12014)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: exit 6 (auto-refresh exhausted) is not wired as a re-queue (#12014)"
+fi
+
 TESTS_RUN=$((TESTS_RUN + 1))
 if grep -q '^#   5 = --auto' "$MERGE_PR_SRC" \
    && [[ -f "$EXIT_CODE_DOC" ]] && grep -q '^| `5` |' "$EXIT_CODE_DOC"; then

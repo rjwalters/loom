@@ -311,8 +311,10 @@ not being bypassed here.",
 /// The result of attempting the remedy.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RemedyOutcome {
-    /// A new, tree-identical commit was pushed as the branch's new tip.
-    Pushed { new_sha: String },
+    /// A new, tree-identical commit was pushed as the branch's new tip: re-date
+    /// `n` of this chain's budget (#9590), which `merge-pr auto-refresh`
+    /// reports as the round (#12014).
+    Pushed { new_sha: String, n: u32 },
     /// This head's re-date chain already spent `spent` of `budget` re-dates
     /// and the guard still blocks: the PR was escalated to a durable
     /// `loom:operator` hold. `notice_posted` is false when a notice for this
@@ -576,7 +578,7 @@ re-run once the forge is writable, or post {} by hand",
         ));
     }
 
-    RemedyOutcome::Pushed { new_sha }
+    RemedyOutcome::Pushed { new_sha, n }
 }
 
 /// The bound is reached: post the notice (once per head) and apply the hold

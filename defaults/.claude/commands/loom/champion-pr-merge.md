@@ -1889,7 +1889,7 @@ fi
 [ "$MERGE_RC" -eq 0 ] && { LOOM_AUTO_MERGE_TIMEOUT=420 \
   ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks ${EXPECTED_HEAD:+--expected-head "$EXPECTED_HEAD"} || MERGE_RC=$?; }
 
-if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ] || [ "$MERGE_RC" -eq 8 ] || [ "$MERGE_RC" -eq 9 ] || [ "$MERGE_RC" -eq 10 ]; then
+if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ] || [ "$MERGE_RC" -eq 6 ] || [ "$MERGE_RC" -eq 8 ] || [ "$MERGE_RC" -eq 9 ] || [ "$MERGE_RC" -eq 10 ]; then
   # Not failures: nothing merged, no "Merge Failed" comment. See "exit codes 3-7".
   echo "PR #$PR_NUMBER not merged this pass (exit $MERGE_RC) — re-queuing instead of failing"
 elif [ "$MERGE_RC" -ne 0 ]; then
@@ -3156,10 +3156,10 @@ This PR met all safety criteria but the merge operation failed. A human will nee
 
 Never the failure exit **1**; each means "the merge did not happen":
 
-- **3** — the head moved between the fresh head-SHA read and the merge call.
+- **3** — the head moved between the head-SHA read and the merge call.
 - **4** — the #8248 freshness guard blocked the merge and `--redate-stale-checks`
-  ran that guard's own remedy (a tree-identical no-op commit). Nothing bypassed;
-  a spent budget (#9590) escalates to `loom:operator` and returns exit 1.
+  ran that guard's own remedy (a tree-identical no-op commit). Nothing bypassed.
+- **6** — its rounds are spent (#12014); `loom:operator` kept.
 - **5** — `--auto`'s bounded settle-wait expired; no required check went red.
   **Do not "fix" a recurring 5 by raising `LOOM_AUTO_MERGE_TIMEOUT`** (pinned
   under Step 3's own timeout, #9096); re-queuing is cheap.
@@ -3182,9 +3182,9 @@ Never the failure exit **1**; each means "the merge did not happen":
 - Leave `loom:pr`, move on. A later pass re-evaluates its safety criteria
   (`updatedAt`, CI) first.
 
-**`loom:pr` left after exit 3 or 4 does NOT carry the approval to the new head
-(#5686)**: the next pass's Verdict-State Janitor Part 2 resolves it; never
-re-merge on a later tick without it. Exits 5-7 move no head.
+**`loom:pr` left after exit 3 or 4 carries only via a `tree`/`clean-merge`
+equivalence (#9416)**: the next pass's Verdict-State
+Janitor Part 2 resolves it; never re-merge without it. Exits 5-7 move no head.
 
 **No exit code at all (#9096) is different**: the silence above assumes an
 outcome to be silent about. A killed call (no `CHAMPION-MERGE-OUTCOME`
@@ -3193,8 +3193,8 @@ sentinel), once a re-read confirms it is not merged, gets one head-keyed
 never "Merge Failed" (an unobserved error that parks a mergeable PR on a
 human), and re-queues. It never fires on 3-7.
 
-Rationale (4's bound, 5's contract, why 3-7 stay silent, 7's old-daemon
-path), the unknown-outcome recipe, and the merge-ancestry trap that defeats
+Rationale (4's bound, 5's contract, why 3-7 stay silent, 7's old daemons),
+the unknown-outcome recipe, and the merge-ancestry trap that defeats
 `git merge-base --is-ancestor` here:
 [`merge-pr-exit-code-exceptions.md`](../../../.loom/docs/merge-pr-exit-code-exceptions.md).
 

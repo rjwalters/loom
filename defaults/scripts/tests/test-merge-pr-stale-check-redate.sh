@@ -98,9 +98,11 @@ FUNCS_FILE="$(mktemp)"
 STUB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/test-merge-pr-redate.XXXXXX")"
 trap 'rm -rf "$FUNCS_FILE" "$STUB_DIR" 2>/dev/null || true' EXIT
 
-awk '/^_check_required_check_freshness\(\) \{/ { print; exit }' "$MERGE_PR_SRC" > "$FUNCS_FILE"
+# #12014: the guard dispatches to `_mp_ar` (merge-pr auto-refresh), so that
+# one-line helper is extracted with it.
+awk '/^_mp_ar\(\) \{/ { print } /^_check_required_check_freshness\(\) \{/ { print; exit }' "$MERGE_PR_SRC" > "$FUNCS_FILE"
 
-if ! grep -q '_check_required_check_freshness()' "$FUNCS_FILE"; then
+if ! grep -q '_check_required_check_freshness()' "$FUNCS_FILE" || ! grep -q '^_mp_ar()' "$FUNCS_FILE"; then
     echo -e "${RED}FATAL${NC}: could not extract _check_required_check_freshness from $MERGE_PR_SRC" >&2
     exit 2
 fi
@@ -147,6 +149,18 @@ make_stub() {
             moved)     echo "  echo 'branch already moved to feed0000'; exit 3" ;;
             failed)    echo "  echo 'could not create the re-date commit'; exit 1" ;;
         esac
+        echo 'fi'
+        # #12014: `merge-pr auto-refresh` answers per $AR_MODE (read at run
+        # time); unset = a binary that predates the verb (clap exit 2).
+        echo 'if [ "$SUB" = "auto-refresh" ]; then'
+        echo '  case "${AR_MODE:-}" in'
+        echo '    pushed) printf "LOOM-AUTO-REFRESH next=reinvoke pr=8493 round=1/3 head=cafe1234\nPR #8493: pushed re-date 1 of 3\n"; exit 4 ;;'
+        echo '    exhausted) printf "LOOM-AUTO-REFRESH-EXHAUSTED pr=8493 spent=3 budget=3\nloom:operator kept\n"; exit 6 ;;'
+        echo '    moved) echo "LOOM-AUTO-REFRESH-HEAD-MOVED current=feed0000"; exit 3 ;;'
+        echo '    failed) printf "LOOM-AUTO-REFRESH-FAILED\ngh api failed\n"; exit 1 ;;'
+        echo '    off) echo "LOOM-AUTO-REFRESH-OFF"; exit 0 ;;'
+        echo '    *) echo "error: unrecognized subcommand auto-refresh" >&2; exit 2 ;;'
+        echo '  esac'
         echo 'fi'
         echo 'echo "stub: unexpected subcommand $SUB" >&2; exit 64'
     } > "$path"
@@ -284,6 +298,188 @@ assert_eq "no" "$([[ -f "$STUB_DIR/argv-redate-checks" ]] && echo yes || echo no
     "gitea -> the remedy is never invoked"
 FORGE_TYPE="github"
 unset REDATE_STALE_CHECKS
+
+# --- #12014: --auto refreshes by default (merge-pr auto-refresh) -----------
+#
+# Bare --auto now runs the same remedy without --redate-stale-checks; the
+# decision and the caller-facing sentinel come from the daemon verb, which the
+# stub's $AR_MODE plays. A binary without the verb must degrade to the
+# pre-#12014 answers (exit 1 bare, the legacy exit 4 under the flag).
+echo ""
+echo "Testing --auto's default auto-refresh wiring (#12014)..."
+ar_calls() { [[ -f "$STUB_DIR/argv-auto-refresh" ]] && cat "$STUB_DIR/argv-auto-refresh" || true; }
+reset_argv() { rm -f "$STUB_DIR/argv-auto-refresh" "$STUB_DIR/argv-redate-checks" "$STUB_DIR/argv-stale-checks"; }
+unset REDATE_STALE_CHECKS
+STUB="$(make_stub stale pushed)"
+
+# T16: bare --auto + STALE -> the verb refreshes; exit 4 with next=reinvoke,
+# and the legacy redate-checks is not called (one mechanism per behaviour).
+reset_argv; AUTO_MERGE=true
+AR_MODE=pushed LOOM_DAEMON_BIN="$STUB" run_guard
+assert_eq "4" "$LAST_RC" "bare --auto + stale -> refreshed, exit 4 (not 1)"
+assert_contains "$LAST_OUT" "LOOM-AUTO-REFRESH next=reinvoke pr=8493 round=1/3" "the re-invoke sentinel is printed"
+assert_eq "1" "$(grep -c '^LOOM-AUTO-REFRESH next=' <<<"$LAST_OUT")" "exactly one sentinel line"
+assert_contains "$(ar_calls)" "--phase stale --pr 8493 --repo rjwalters/loom --branch feature/issue-8478 --head-sha deadbeef" "the verb gets the stale phase and its operands"
+assert_not_contains "$(ar_calls)" "--explicit" "bare --auto does not force the opt-out off"
+assert_eq "no" "$([[ -f "$STUB_DIR/argv-redate-checks" ]] && echo yes || echo no)" "the legacy redate-checks is not called when the verb answers"
+
+# T17: the opt-out (merge.autoRefresh=false / LOOM_MERGE_AUTO_REFRESH=0) ->
+# exit 1 with the original refusal, exactly as before.
+reset_argv
+AR_MODE=off LOOM_DAEMON_BIN="$STUB" run_guard
+assert_eq "1" "$LAST_RC" "auto-refresh off -> exit 1 as before"
+assert_contains "$LAST_OUT" "no longer exists (#8248)" "the original refusal stands"
+assert_eq "no" "$([[ -f "$STUB_DIR/argv-redate-checks" ]] && echo yes || echo no)" "off -> no legacy push either"
+
+# T18: rounds exhausted -> exit 6 (re-queue), the hold line surfaced, and no
+# failure wording.
+AR_MODE=exhausted LOOM_DAEMON_BIN="$STUB" run_guard
+assert_eq "6" "$LAST_RC" "exhausted -> exit 6, not 1"
+assert_contains "$LAST_OUT" "LOOM-AUTO-REFRESH-EXHAUSTED pr=8493 spent=3 budget=3" "the exhaustion line is printed"
+assert_not_contains "$LAST_OUT" "Merge Failed" "no failure wording on exit 6"
+
+# T19: head moved before the push -> exit 3 (re-queue, re-evaluate).
+error_head_moved() { echo "MOVED: $1 $2 -> $3"; exit 3; }
+AR_MODE=moved LOOM_DAEMON_BIN="$STUB" run_guard
+assert_eq "3" "$LAST_RC" "head moved before the refresh push -> exit 3"
+assert_contains "$LAST_OUT" "deadbeef -> feed0000" "both heads are named"
+
+# T20: the remedy failed -> exit 1 with the reason attached.
+AR_MODE=failed LOOM_DAEMON_BIN="$STUB" run_guard
+assert_eq "1" "$LAST_RC" "remedy failure -> exit 1"
+assert_contains "$LAST_OUT" "did not produce fresh evidence: gh api failed" "the failure reason is attached"
+
+# T21: a binary without the verb -> bare --auto keeps the pre-#12014 exit 1
+# (never a merge, never a push).
+reset_argv
+AR_MODE="" LOOM_DAEMON_BIN="$STUB" run_guard
+assert_eq "1" "$LAST_RC" "old binary + bare --auto -> exit 1 as before"
+assert_eq "no" "$([[ -f "$STUB_DIR/argv-redate-checks" ]] && echo yes || echo no)" "old binary + bare --auto -> no legacy push"
+
+# T22: ...and under the flag falls back to the legacy redate-checks exit 4.
+REDATE_STALE_CHECKS=true
+AR_MODE="" LOOM_DAEMON_BIN="$STUB" run_guard
+assert_eq "4" "$LAST_RC" "old binary + flag -> legacy redate, exit 4"
+assert_contains "$LAST_OUT" "LOOM-REDATE-PUSHED" "the legacy remedy ran"
+
+# T23: the flag forces auto-refresh on (Champion), whatever the opt-out says.
+reset_argv
+AR_MODE=pushed LOOM_DAEMON_BIN="$STUB" run_guard
+assert_contains "$(ar_calls)" "--explicit" "--redate-stale-checks passes --explicit"
+unset REDATE_STALE_CHECKS
+
+# T24: an UNKNOWN freshness (exit 2) never refreshes, even under --auto.
+reset_argv
+STUB="$(make_stub nodate pushed)"
+AR_MODE=pushed LOOM_DAEMON_BIN="$STUB" run_guard
+assert_eq "1" "$LAST_RC" "--auto + undeterminable -> refused (fail closed)"
+assert_eq "" "$(ar_calls)" "--auto + undeterminable -> the verb is never asked"
+AUTO_MERGE=false
+
+# --- #12014: the post-wait gate in _revalidate_merge_guards ----------------
+#
+# After the settle-wait the verdict gate runs, and on CLEAR the #8248 guard
+# re-runs on the head about to merge: a base move during the wait must
+# refresh again (exit 4), never merge on stale evidence.
+REVAL_FILE="$STUB_DIR/reval.sh"
+awk '/^_revalidate_merge_guards\(\) \{/ {on=1} on {print} on && /^}/ {exit}' "$MERGE_PR_SRC" > "$REVAL_FILE"
+# shellcheck disable=SC1090
+source "$REVAL_FILE"
+forge_get_pr_nocache() { echo '{"head":{"sha":"deadbeef"},"labels":[{"name":"loom:pr"}]}'; }
+_check_loom_pr_label() { echo "LABEL-CHECKED"; }
+_check_verdict_label_contradiction() { :; }
+_check_ci_result() { :; }
+GH=gh; MERGE_PRECONDITION_SHA="deadbeef"
+# A stub that answers revalidate-head CLEAR, auto-refresh per phase
+# ($AR_VERDICT for verdict, $AR_MODE for stale) and stale-checks per $STALE.
+REVAL_STUB="$STUB_DIR/loom-daemon-reval"
+cat > "$REVAL_STUB" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/argv-$2"
+case "$2" in
+  revalidate-head) printf 'LOOM-REVALIDATE CLEAR\nloom:pr\n' ;;
+  stale-checks) if [ "$STALE" = stale ]; then echo "Merge blocked: base moved under a required check's inputs (#8248)."; exit 1; fi; echo LOOM-STALE-CHECKS-CLEAN ;;
+  auto-refresh)
+    case "$4" in
+      verdict) case "$AR_VERDICT" in
+          clear) echo LOOM-AUTO-REFRESH-CLEAR ;;
+          judge) printf 'LOOM-AUTO-REFRESH next=judge pr=8493 round=1/3 head=deadbeef\nnot equivalent\n'; exit 3 ;;
+          off) echo LOOM-AUTO-REFRESH-OFF ;;
+          *) exit 2 ;;
+        esac ;;
+      stale) printf 'LOOM-AUTO-REFRESH next=reinvoke pr=8493 round=2/3 head=cafe1234\npushed\n'; exit 4 ;;
+    esac ;;
+  *) exit 64 ;;
+esac
+STUB
+chmod +x "$REVAL_STUB"
+export STUB_DIR
+run_reval() { set +e; LAST_OUT="$( _revalidate_merge_guards 2>&1 )"; LAST_RC=$?; set -e; }
+AUTO_MERGE=true
+
+# T25: THE #8248 hole: the base moved during the refreshed head's CI ->
+# the post-wait re-check refuses, the next round is pushed, nothing merges.
+reset_argv
+STALE=stale AR_VERDICT=clear LOOM_DAEMON_BIN="$REVAL_STUB" run_reval
+assert_eq "4" "$LAST_RC" "base moved during the wait -> next round (exit 4), never a merge"
+assert_contains "$LAST_OUT" "LOOM-AUTO-REFRESH next=reinvoke pr=8493 round=2/3" "the next round's sentinel is printed"
+assert_contains "$(cat "$STUB_DIR/argv-stale-checks" 2>/dev/null)" "--head-sha deadbeef" "the re-check runs on the head about to merge"
+assert_not_contains "$LAST_OUT" "LABEL-CHECKED" "nothing past the re-check runs"
+
+# T26: fresh after the wait -> falls through to the label re-check (merge).
+reset_argv
+STALE=clean AR_VERDICT=clear LOOM_DAEMON_BIN="$REVAL_STUB" run_reval
+assert_eq "0" "$LAST_RC" "fresh after the wait -> proceeds to merge"
+assert_contains "$LAST_OUT" "LABEL-CHECKED" "the loom:pr re-check still runs"
+
+# T27: the verdict does not carry to the refreshed head -> exit 3 next=judge,
+# and the freshness re-check is not even asked.
+reset_argv
+STALE=stale AR_VERDICT=judge LOOM_DAEMON_BIN="$REVAL_STUB" run_reval
+assert_eq "3" "$LAST_RC" "approval does not carry -> exit 3"
+assert_contains "$LAST_OUT" "LOOM-AUTO-REFRESH next=judge" "next=judge is printed"
+assert_eq "no" "$([[ -f "$STUB_DIR/argv-stale-checks" ]] && echo yes || echo no)" "no refresh is spent on a verdict that does not carry"
+
+# T28: off, or a binary without the verb -> the pre-#12014 post-wait path
+# (no re-check), so an older host still merges as before.
+for v in off old; do
+    reset_argv
+    STALE=stale AR_VERDICT=$v LOOM_DAEMON_BIN="$REVAL_STUB" run_reval
+    assert_eq "0" "$LAST_RC" "verdict phase '$v' -> pre-#12014 behaviour"
+    assert_eq "no" "$([[ -f "$STUB_DIR/argv-stale-checks" ]] && echo yes || echo no)" "verdict phase '$v' -> no post-wait re-check"
+done
+AUTO_MERGE=false
+
+# --- #12014: the exit-5 advice trap ----------------------------------------
+TRAP_LINE="$(grep -E '^  _mp_ar_exit\(\) \{' "$MERGE_PR_SRC" || true)"
+assert_contains "$TRAP_LINE" "trap _mp_ar_exit EXIT" "the --auto block arms the exit-5 advice trap"
+eval "${TRAP_LINE%%; trap _mp_ar_exit EXIT*}"
+TIMEOUT_STUB="$STUB_DIR/loom-daemon-timeout"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$STUB_DIR/argv-$2"\n[ "$2" = auto-refresh ] && printf "LOOM-AUTO-REFRESH next=reinvoke pr=8493 round=1/3 head=cafe1234\\n"\nexit 0\n' > "$TIMEOUT_STUB"; chmod +x "$TIMEOUT_STUB"
+for rc in 5 1 0; do
+    reset_argv
+    set +e
+    OUT="$(LOOM_DAEMON_BIN="$TIMEOUT_STUB" bash -c "$(declare -f _mp_ar _mp_ar_exit); PR_NUMBER=8493 REPO_NWO=o/r PR_BRANCH=b PR_HEAD_SHA=deadbeef; trap _mp_ar_exit EXIT; exit $rc")"
+    GOT=$?
+    set -e
+    assert_eq "$rc" "$GOT" "the trap keeps exit $rc"
+    if [[ $rc -eq 5 ]]; then
+        assert_eq "LOOM-AUTO-REFRESH next=reinvoke pr=8493 round=1/3 head=cafe1234" "$OUT" "exit 5 -> exactly the daemon's one advice line"
+        assert_contains "$(ar_calls)" "--phase timeout" "exit 5 asks the timeout phase"
+    else
+        assert_eq "" "$OUT" "exit $rc -> no advice"
+        assert_eq "" "$(ar_calls)" "exit $rc -> the verb is not asked"
+    fi
+done
+
+# T29: the real binary knows the verb and its operands.
+set +e
+AR_HELP="$("$REAL_DAEMON_BIN" merge-pr auto-refresh --help 2>&1)"; AR_HELP_RC=$?
+set -e
+assert_eq "0" "$AR_HELP_RC" "real binary: 'merge-pr auto-refresh --help' exits 0"
+for opt in --phase --pr --repo --branch --head-sha --explicit; do
+    assert_contains "$AR_HELP" "$opt" "real binary: auto-refresh accepts $opt"
+done
 
 # --- Script-level contract --------------------------------------------------
 

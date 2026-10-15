@@ -311,6 +311,7 @@ checks-failure closed 0.19.465
 head-sync-retry open -
 hold-state open -
 redate-checks open -
+auto-refresh open -
 delete-branch open -
 zero-checks-settle open -
 check-runs-streak open -

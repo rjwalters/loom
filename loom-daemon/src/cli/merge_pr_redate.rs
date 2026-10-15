@@ -129,7 +129,7 @@ the checks without re-testing the current base; only a new push does that. Going
             );
         }
         match remedy(&self.repo, &self.branch, &self.expected_head_sha, &self.pr) {
-            RemedyOutcome::Pushed { new_sha } => {
+            RemedyOutcome::Pushed { new_sha, .. } => {
                 println!("LOOM-REDATE-PUSHED sha={new_sha}");
                 std::process::exit(0);
             }

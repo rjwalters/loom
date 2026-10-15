@@ -822,6 +822,13 @@ pub(crate) enum MergePrCommand {
     /// `loom:operator` hold, 1 = could not produce fresh evidence.
     RedateChecks(super::merge_pr_redate::RedateChecksArgs),
 
+    /// `merge-pr.sh --auto`'s in-process refresh (#12014): `--phase stale`
+    /// runs the re-date remedy and answers exit 4 (`next=reinvoke|requeue`),
+    /// 6 (rounds spent, `loom:operator` kept) or 3/1; `--phase verdict` is the
+    /// post-wait gate on a Loom-refreshed head (`tree`/`clean-merge` carry,
+    /// else exit 3 `next=judge`); `--phase timeout` advises on an exit 5.
+    AutoRefresh(super::merge_pr_auto_refresh::AutoRefreshArgs),
+
     /// Read-only report of which required checks and paths forced the #8508
     /// re-dates (#9746), from the trailers on the re-date commits reachable
     /// from `--ref` (default origin/main) within `--since` (default 24h).
@@ -1170,6 +1177,7 @@ impl MergePrCommand {
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
+            MergePrCommand::AutoRefresh(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::LoomPrOverrideComment(args) => args.run(),

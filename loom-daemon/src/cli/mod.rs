@@ -81,6 +81,7 @@ pub(crate) mod lease_ensure;
 pub(crate) mod lease_renewer;
 pub(crate) mod legacy_script_cmds;
 pub(crate) mod merge_group_ci_cmd;
+mod merge_pr_auto_refresh;
 mod merge_pr_check_runs_rollup;
 mod merge_pr_check_runs_streak;
 mod merge_pr_checks_failure;

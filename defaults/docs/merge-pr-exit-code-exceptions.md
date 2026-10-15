@@ -1,6 +1,6 @@
 # `merge-pr.sh` exit codes 3-7 — the "not a failure" outcomes
 
-`merge-pr.sh` reserves four exit codes (3, 4, 5, 7) for outcomes that look like failures to
+`merge-pr.sh` reserves five exit codes (3, 4, 5, 6, 7) for outcomes that look like failures to
 a naive `|| handle_failure` caller but are not: the merge did not happen,
 nothing is wrong, and the correct response is to re-queue the PR for a later
 pass.
@@ -29,9 +29,10 @@ failure — the safe degradation for a caller older than a new code.
 |---|---|---|---|
 | `0` | — | Merged. | Done. |
 | `1` | no | Everything else: a real refusal or failure, including a #8248 block with no remedy left, a red required context on a plain merge (#10688; `--allow-red-required <context>` overrides one named context), and a non-success `CI` run (#10444), whose refusal ends in `LOOM-CI-RESULT-FAILED run=<id> jobs=<names>` (#11330). | Failure handling (Champion's "Merge Failed" comment). The `LOOM-CI-RESULT-FAILED` line is classification only: a driver MAY choose `gh run rerun --failed <id>`; nothing decides "flake vs. real" for it. |
-| `3` | yes | The PR's head moved between the fresh head-SHA read and the merge call (#5579) — someone else moved it. | Re-queue; the verdict does not carry to the new head (#5686). |
-| `4` | yes | The #8248/#8919 freshness guard blocked the merge and `--redate-stale-checks` re-dated the checks with a tree-identical no-op push (#8508) — this run moved the head. | Re-queue; a fresh Judge review is needed. |
-| `5` | yes | Held: `--auto`'s bounded settle-wait expired, or the check-runs API was unreadable (#8896); no concluded `CI` run for this exact head yet (#10567); or, on a plain merge, a required context is missing or pending (#10688). Nobody moved the head. | Re-queue. |
+| `3` | yes | The PR's head moved between the fresh head-SHA read and the merge call (#5579) — someone else moved it. Or (#12014) the approval does not carry to a head Loom's own refresh produced: stdout `LOOM-AUTO-REFRESH next=judge …`. | Re-queue; the verdict-staleness guard / Janitor sends a non-equivalent head to Judge (#5686, #9416). |
+| `4` | yes | The #8248/#8919 freshness guard blocked the merge and `--auto` (by default, #12014) or `--redate-stale-checks` refreshed the branch: a tree-identical no-op push (#8508) or, once the chain budget is spent, the base-sync handoff (#10388) — this run moved the head. stdout `LOOM-AUTO-REFRESH next=reinvoke\|requeue …`. | `next=reinvoke`: run the identical call again now (same pin, same tool timeout). Otherwise re-queue. The verdict carries only via a `tree` / `clean-merge` equivalence (#9416, #9576). |
+| `5` | yes | Held: `--auto`'s bounded settle-wait expired, or the check-runs API was unreadable (#8896); no concluded `CI` run for this exact head yet (#10567); or, on a plain merge, a required context is missing or pending (#10688). Nobody moved the head. On a Loom-refreshed head, `--auto` also prints `LOOM-AUTO-REFRESH next=reinvoke\|requeue …` (#12014). | `next=reinvoke`: run the identical call again now. Otherwise re-queue. |
+| `6` | yes | *(#12014)* The refresh rounds (`champion.redateBudget`, default 3) and the sync handoffs are spent and the guard still blocks. The PR keeps its `loom:operator` hold and notice (the cross-pass bound). stdout `LOOM-AUTO-REFRESH-EXHAUSTED pr=<N> spent=<k> budget=<N>`. | Re-queue: no "Merge Failed" comment, not an error. The hold parks it for a human. |
 | `7` | yes | `merge-pr.sh`: the PR carries `loom:pr` + `loom:sequenced` and no other blocker; stdout carries `LOOM-SEQUENCED-HOLD pr=<N> after=<M>` (#11330). Or *(Champion Step 3 only)* `forge merge-queue step` gave no `LOOM-MERGE-QUEUE-DIRECT` verdict (#10256, #10628). | Re-queue, like 6. The sequencing hold clears when `<M>` lands (`merge-pr sequence-eval`); a queue stall is surfaced by Step 3. |
 | `8` | no, re-evaluate | Only with `--expected-head <sha>` (#11859): the PR head is not the SHA the caller evaluated, on the first uncached read or the merge precondition read. stdout carries `LOOM-EXPECTED-HEAD-MISMATCH pr=<N> expected=<sha> actual=<sha\|unknown>`. Nothing was merged or written. | Not a failure comment. The caller's evaluation describes another tree: re-run the evaluation on the current head (a targeted Champion ends its step with `outcome=head-moved`). Never retry the same `--expected-head`. |
 | `10` | yes | *(Champion Step 3 only)* `loom-daemon champion-hold classify` did not answer `state=clear`: a Champion hold, another actor's `loom:blocked` park, a verdict contradiction, or an unreadable state (#11932). `merge-pr.sh` never ran. | No "Merge Failed"; skip silently. A park is someone's decision, not a failure. |
@@ -45,6 +46,7 @@ Retryable outcomes never post a failure comment and never count as errors.
 - [Exit-code table](#exit-code-table)
 - [Exit 3 — a foreign push raced the merge (#5579)](#exit-3--a-foreign-push-raced-the-merge-5579)
 - [Exit 4 — this run re-dated the stale required checks (#8508)](#exit-4--this-run-re-dated-the-stale-required-checks-8508)
+- [Auto-refresh under `--auto` — exits 4, 5, 6 and the re-invoke contract (#12014)](#auto-refresh-under---auto--exits-4-5-6-and-the-re-invoke-contract-12014)
 - [Exit 5 — CI outlasted `--auto`'s bounded settle-wait (#8896)](#exit-5--ci-outlasted---autos-bounded-settle-wait-8896)
 - [Exit 7 — the merge-queue step withheld the direct merge (#10256, #10628)](#exit-7--the-merge-queue-step-withheld-the-direct-merge-10256-10628)
 - [Exit 7 from `merge-pr.sh` — a sequencing hold (#11330)](#exit-7-from-merge-prsh--a-sequencing-hold-11330)
@@ -175,16 +177,17 @@ rather than a bypass:
 - **No evidence is fabricated.** Nothing asserts a check passed; CI runs for
   real against the new head, and the next merge attempt still has to satisfy
   #8248 on its own terms.
-- **It is opt-in.** Without the flag, `merge-pr.sh` behaves exactly as before
-  — a human merging by hand never has a commit pushed onto a branch by
-  surprise. Champion passes it; nothing else does by default.
+- **It runs only under `--auto` or the flag.** Since #12014 `--auto` runs it
+  by default (see "Auto-refresh" below; `merge.autoRefresh=false` opts out);
+  a plain `merge-pr.sh N` never pushes, so a human merging by hand never has a
+  commit pushed onto a branch by surprise.
 - **It never runs on an unknown.** The guard's fail-closed exit (freshness
   undeterminable) does not trigger the remedy — only a positively STALE
   verdict does. `--dry-run` never writes.
-- **The head move is honest.** It invalidates the standing Judge approval
-  (#5686), exactly as any other push does, so the PR cycles back through
-  `loom:review-requested` before merging. That re-review is the correct cost,
-  not a regression.
+- **The head move is honest.** The standing approval survives it only
+  because the repository proves the trees identical (`tree` equivalence,
+  #9576/#9416), never because a marker says so; an approval with no trusted
+  verdict-sha marker (#9258) still goes back through Judge.
 
 ### The bound, and why there is one
 
@@ -261,9 +264,10 @@ budget is exhausted:
 - the `loom:operator` label — the first-class "engine will not act further, a
   human is the only transition out" state (#5502).
 
-`merge-pr.sh` then returns the ordinary exit **1** with the original #8248
-refusal: the merge is still refused, and the PR is now simply a held PR that
-every `loom:operator` consumer already handles.
+`merge-pr.sh` then returns exit **6** (#12014; before it, the ordinary exit
+**1** with the original #8248 refusal): the merge is still refused, nothing
+failed, and the PR is now simply a held PR that every `loom:operator` consumer
+already handles. A binary predating `merge-pr auto-refresh` still answers 1.
 
 **Release** is a human act, by design, and there are two:
 
@@ -276,6 +280,60 @@ every `loom:operator` consumer already handles.
 Remove `loom:operator` once you have acted. Nothing removes it automatically:
 the label is what makes the stuck PR visible and keeps the engine from
 re-litigating a state it has already proven it cannot resolve.
+
+## Auto-refresh under `--auto` — exits 4, 5, 6 and the re-invoke contract (#12014)
+
+Before #12014 only Champion passed `--redate-stale-checks`; the sweep merge
+step and Mode C called bare `--auto`, so a stale PR came back as exit 1 and a
+human looped by hand. A PR touching a global CI input (workflow files,
+`.cargo/config.toml`) needed several post-approval CI rounds on a busy `main`,
+and this repo is user-owned, so no merge queue is available.
+
+`--auto` now runs the same remedy itself. Every decision is
+`loom-daemon merge-pr auto-refresh` (`loom-daemon/src/merge_pr/auto_refresh.rs`);
+`merge-pr.sh` only dispatches. It is one mechanism, extended: no second
+refresh path, no second round counter.
+
+- **Refresh.** A positively STALE verdict (exit 1 from `stale-checks`, never
+  the exit-2 unknown) runs the redate remedy: a tree-identical push per round,
+  the existing `update-branch` sync handoff once the chain is spent. In-place
+  re-runs stay excluded (#8919).
+- **Rounds.** The chain's own trusted attempt markers, bounded by
+  `champion.redateBudget` / `LOOM_REDATE_BUDGET` (default 3) plus
+  `champion.redateSyncHandoffs`. The key bounds every `--auto` caller, not
+  only Champion. Exhaustion is exit **6**, with the `loom:operator` hold kept.
+- **Re-invoke, never one long call.** One CI round outlasts the 420 s pin
+  (#9096, #9395), so rounds span calls. Exit 4/5 on a refresh prints exactly
+  one `LOOM-AUTO-REFRESH next=<reinvoke|requeue|judge> pr=<N> round=<k>/<budget> head=<sha>`
+  line. `reinvoke`: a refresh was pushed this call, or the head is a Loom
+  refresh head with CI pending whose refresh record is younger than
+  `merge.autoRefreshMaxWaitSecs` (env `LOOM_MERGE_AUTO_REFRESH_MAX_WAIT_SECS`,
+  default 2700). `requeue`: a backoff deferral, a sync conflict, or the
+  wall-clock bound hit. The caller re-runs the **identical** command (same
+  pin, same 600000 ms tool timeout) only on `next=reinvoke`.
+- **Re-check after the wait.** In auto-refresh mode `_revalidate_merge_guards`
+  re-runs the #8248 guard on the head about to be merged, so a base move during
+  the refreshed head's CI refreshes again instead of merging on stale evidence
+  (the #8410 residual). The input-scoped predicate (#8919) refuses only when
+  the move touches this PR's inputs.
+- **Verdict gate.** Before merging a head Loom refreshed (a trusted re-date
+  marker names it, or it is the `update-branch` merge of a synced head), the
+  approval must carry: the latest TRUSTED `loom:verdict-sha` marker equals the
+  head, or `verdict_equivalence` (the implementation
+  `verdict-staleness-guard.sh` uses) answers `tree` or `clean-merge`.
+  `rebase-patch-identical`, changed, indeterminate, or no trusted marker:
+  exit **3** with `next=judge`, nothing merged.
+
+| Setting | env (wins) | `.loom/config.json` | default |
+|---|---|---|---|
+| auto-refresh on/off | `LOOM_MERGE_AUTO_REFRESH` | `merge.autoRefresh` | `true` |
+| re-invoke wall-clock bound, seconds (≤ 86400) | `LOOM_MERGE_AUTO_REFRESH_MAX_WAIT_SECS` | `merge.autoRefreshMaxWaitSecs` | 2700 |
+
+Both resolve env > config (repo, then fleet tier) > default.
+`--redate-stale-checks` turns auto-refresh on regardless. Off restores the
+pre-#12014 answers: exit 1 for bare `--auto`. A binary without the verb does
+too, and under the flag runs the legacy `redate-checks` exit 4; it never merges
+on a missing answer, so the verb does not raise the `requires-daemon` floor.
 
 ## Exit 5 — CI outlasted `--auto`'s bounded settle-wait (#8896)
 

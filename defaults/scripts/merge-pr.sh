@@ -28,7 +28,13 @@
 #                          test suite. Bounded by LOOM_AUTO_MERGE_TIMEOUT
 #                          (default 600s; raise it on a slow-CI repo); exits
 #                          non-zero on timeout or a failed required check,
-#                          which Champion's next pass retries.
+#                          which Champion's next pass retries. On an #8248
+#                          freshness block it refreshes the branch itself
+#                          (#12014, the --redate-stale-checks remedy; opt out
+#                          with merge.autoRefresh=false / LOOM_MERGE_AUTO_
+#                          REFRESH=0) and prints `LOOM-AUTO-REFRESH next=
+#                          reinvoke|requeue|judge pr=N round=k/B head=S`: re-run
+#                          the identical command only on next=reinvoke.
 #   --allow-stacked-children
 #                          Bypass the pre-merge merge-ordering guard's hard-block
 #                          path. That guard's DEFAULT behavior, when the parent
@@ -134,16 +140,26 @@
 #   3 = PR head moved past the SHA this attempt gated on (#5579): still
 #       Judge-approved, its diff just changed underneath it. See "Merge-ancestry
 #       detection trap" in the doc above for why ancestry can't verify this.
-#   4 = stale required checks re-dated under --redate-stale-checks: the #8248
-#       guard blocked the merge and this run pushed a tree-identical no-op
-#       commit (#8508) so CI re-tests the current base (fresh Judge review
-#       needed). The #8914 in-place re-run is gone (#8919: a re-run re-tests
-#       the OLD base); only an older daemon still reports one. Bounded to one
-#       push per head; a repeat block escalates to a loom:operator hold and
-#       returns exit 1 with the original refusal.
+#   3 also = (#12014) the approval does not carry to a Loom-refreshed head
+#       (only a tree / clean-merge equivalence does); prints
+#       `LOOM-AUTO-REFRESH next=judge …`.
+#   4 = stale required checks refreshed (--auto, or --redate-stale-checks):
+#       the #8248 guard blocked the merge and this run pushed a tree-identical
+#       no-op commit (#8508) or, once the chain budget is spent, merged the
+#       base in (#10388), so CI re-tests the current base. The verdict carries
+#       only via a tree / clean-merge equivalence (#9416). Prints
+#       `LOOM-AUTO-REFRESH next=reinvoke|requeue …` (#12014); an older daemon
+#       prints only its LOOM-REDATE-* line.
+#   6 = (#12014) the refresh rounds (champion.redateBudget, default 3) and
+#       sync handoffs are spent and the guard still blocks: the PR keeps its
+#       loom:operator hold + notice; prints `LOOM-AUTO-REFRESH-EXHAUSTED
+#       pr=<N> spent=<k> budget=<N>`. Re-queue, never a failure comment.
 #   5 = --auto's settle-wait (LOOM_AUTO_MERGE_TIMEOUT, default 600s) expired
 #       (#8896); or held: this head has no concluded `CI` run yet (#10567),
 #       or a required context is missing/pending on a plain merge (#10688).
+#       On a Loom-refreshed head --auto also prints `LOOM-AUTO-REFRESH
+#       next=reinvoke|requeue …` (#12014; reinvoke within
+#       merge.autoRefreshMaxWaitSecs, default 2700, of the refresh).
 #   7 = held by a sequencing order (#11330): the PR carries loom:pr +
 #       loom:sequenced and no other blocker. Prints `LOOM-SEQUENCED-HOLD
 #       pr=<N> after=<M>`; the predecessor landing clears it (#9378). Re-queue
@@ -868,7 +884,7 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.763   the NEWEST fail-closed verb in this family, not the oldest (#8967): ci-result (#10444, merged in #10447 at 0.19.762, so first released in 0.19.763; fail-closed since #10567 — a binary without it is refused instead of merging unverified, and a 0.19.763+ binary that predates #10567's exit-3/no-CI contract holds on UNVERIFIED rather than passing); the other fail-closed verbs are checks-failure >= 0.19.465 (#8191 slice, merged in #9272), partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (required-checks — a binary without it warns and leaves branch protection as the guard (#10688); tree-checks — opt-in, called only when merge.treeChecks is declared, then refusing on an older binary (#10026); head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, check-runs-streak, check-runs-rollup, stacked-children, retarget-children — any non-0 exit keeps the merged parent's remote branch rather than deleting it (#9372), revalidate-head — falls back to the retired jq predicate (#8191 slice), pr-state — no verdict falls back to the retired PR_MERGED/PR_STATE predicate (#8191 slice), version-policy, partial-reset, partial-comment, loom-pr-override-comment, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains, cleanup-paths — partial-comment and loom-pr-override-comment each render a POST-merge audit comment and skip the note rather than posting an empty one; the last four decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing, and cleanup-paths leaves the cleanup targets unnamed so nothing is removed) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
+# requires-daemon: merge-pr >= 0.19.763   the NEWEST fail-closed verb in this family, not the oldest (#8967): ci-result (#10444, merged in #10447 at 0.19.762, so first released in 0.19.763; fail-closed since #10567 — a binary without it is refused instead of merging unverified, and a 0.19.763+ binary that predates #10567's exit-3/no-CI contract holds on UNVERIFIED rather than passing); the other fail-closed verbs are checks-failure >= 0.19.465 (#8191 slice, merged in #9272), partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (required-checks — a binary without it warns and leaves branch protection as the guard (#10688); tree-checks — opt-in, called only when merge.treeChecks is declared, then refusing on an older binary (#10026); head-sync-retry, hold-state, redate-checks, auto-refresh (#12014 — no answer keeps the pre-#12014 behaviour: the legacy redate-checks under --redate-stale-checks, else the #8248 refusal; no post-wait gate; no exit-5 advice; never a merge), delete-branch, zero-checks-settle, check-runs-streak, check-runs-rollup, stacked-children, retarget-children — any non-0 exit keeps the merged parent's remote branch rather than deleting it (#9372), revalidate-head — falls back to the retired jq predicate (#8191 slice), pr-state — no verdict falls back to the retired PR_MERGED/PR_STATE predicate (#8191 slice), version-policy, partial-reset, partial-comment, loom-pr-override-comment, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains, cleanup-paths — partial-comment and loom-pr-override-comment each render a POST-merge audit comment and skip the note rather than posting an empty one; the last four decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing, and cleanup-paths leaves the cleanup targets unnamed so nothing is removed) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
@@ -987,13 +1003,12 @@ _check_verdict_label_contradiction
 # leaves the #8248 refusal standing — the feature degrades to exactly today's
 # behaviour instead of failing a merge open, so it is optional by
 # construction. Full rationale, bound and release conditions:
-# defaults/docs/merge-pr-exit-code-exceptions.md. Known residual: this guard
-# is evaluated once, here, and `--auto` may then wait out CI before merging
-# (bounded by LOOM_AUTO_MERGE_TIMEOUT) — #8410 deliberately does NOT re-run it
-# after that wait (see `_revalidate_merge_guards`), leaving the same
-# minutes-scale window the pre-#8410 UNSTABLE wait path always had, not the
-# 22-hour exposure this guard exists to close; #8410 also removed the
-# server-side queued path this note used to describe.
+# defaults/docs/merge-pr-exit-code-exceptions.md. #12014 makes `--auto` run
+# the same remedy by default (`merge-pr auto-refresh`, see `_mp_ar` below) and
+# re-run this guard after the settle-wait (`_revalidate_merge_guards`), which
+# closes the #8410 residual: with refreshes, "start while the refreshed head's
+# CI is pending, wait, merge" is the common path, and the input-scoped
+# predicate (#8919) refuses only when the base move touches this PR's inputs.
 #
 # MERGE-TREE RE-VERIFICATION (#10388, DEFAULT-ON since #10465: merge.reverifyStaleChecks, env
 # LOOM_MERGE_REVERIFY_STALE_CHECKS=0/false/off disables): when EVERY stale
@@ -1028,7 +1043,11 @@ _check_verdict_label_contradiction
 # #10465: merge.reverifyStaleChecks (#10397, default-on) only works on a loom-daemon >= _MP_REVERIFY_FLOOR; an older binary silently falls back to re-dates. Warn ONCE per invocation (never changes the exit code, no requires-daemon floor: fail-open), naming host and both versions.
 _MP_REVERIFY_FLOOR=0.19.741
 _mp_warn_reverify_floor() { local on="${LOOM_MERGE_REVERIFY_STALE_CHECKS:-}" bin have lo; case "${on,,}" in 1|true|yes|on) on=1 ;; 0|false|no|off) on="" ;; *) on="$(jq -r '.merge.reverifyStaleChecks|tostring' "${REPO_ROOT:-.}/.loom/config.json" 2>/dev/null || true)"; case "${on,,}" in false|0|no|off) on="" ;; *) on=1 ;; esac ;; esac; [[ "$on" == "1" ]] || return 0; bin="${LOOM_DAEMON_BIN:-loom-daemon}"; have="$("$bin" --version 2>/dev/null | awk 'NR==1{print $2}' || true)"; [[ "$have" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || have=unknown; lo="$(sort -V <<<"$have"$'\n'"$_MP_REVERIFY_FLOOR")"; [[ "$have" != unknown && "${lo%%$'\n'*}" == "$_MP_REVERIFY_FLOOR" ]] && return 0; warning "merge.reverifyStaleChecks is on (explicit or default) but loom-daemon on host $(hostname 2>/dev/null || echo unknown) is $have, older than $_MP_REVERIFY_FLOOR, the first release with merge-tree re-verification (#10397): stale required checks will fall back to re-dates. Roll this host: ${SCRIPT_DIR:-.loom/scripts}/cli/loom-daemon-update.sh --fetch (#10465)." || true; return 0; }
-_check_required_check_freshness() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ -n "$base_ref" ]] || base_ref="${DEFAULT_BRANCH_NAME:-main}"; msg="$(LOOM_STALE_CHECKS_DRY_RUN="$DRY_RUN" "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stale-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "$base_ref")" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-STALE-CHECKS-CLEAN" ]] && return 0; if [[ $rc -ne 1 ]]; then local why=" It printed nothing, so the binary is most likely missing or predates the subcommand: build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; [[ -z "$msg" ]] || why=$'\n\n'"What it reported: $msg"; msg="Merge blocked: PR #$PR_NUMBER's required-check freshness guard (#8248) could not run — 'loom-daemon merge-pr stale-checks' exited $rc without the LOOM-STALE-CHECKS-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'every required check is fresh' from 'never checked', so only a positive clean signal is accepted.$why"; fi; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; if [[ "${REDATE_STALE_CHECKS:-false}" == "true" && $rc -eq 1 ]]; then local rd=0 out; out="$(LOOM_REDATE_ALLOW_PROCEED=1 "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --expected-head-sha "$PR_HEAD_SHA" 2>&1)" || rd=$?; if [[ $rd -eq 5 ]]; then info "$out"; return 0; fi; if [[ $rd -eq 0 ]]; then warning "$out"; warning "Exiting 4: not merged this pass. The stale required checks are re-running in place (head and loom:pr kept, #8914) or were re-dated by a no-op push (fresh Judge review needed, #5686) — see above. Re-attempt on a later pass."; exit 4; fi; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: $out"; fi; error "$msg"; }
+# #12014: --auto's in-process refresh (default-on: merge.autoRefresh / LOOM_MERGE_AUTO_REFRESH; --redate-stale-checks forces it). Every decision
+# is `loom-daemon merge-pr auto-refresh` (loom-daemon/src/merge_pr/auto_refresh.rs); this only dispatches. True only on a LOOM-AUTO-REFRESH*
+# answer that is not -OFF, so a missing/old binary or the opt-out keeps the pre-#12014 behaviour (legacy redate-checks under the flag, else exit 1).
+_mp_ar() { _AR_RC=0; _AR_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr auto-refresh --phase "$1" --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --head-sha "$2" ${REDATE_STALE_CHECKS:+--explicit} 2>/dev/null)" || _AR_RC=$?; [[ "$_AR_OUT" == LOOM-AUTO-REFRESH* && "$_AR_OUT" != LOOM-AUTO-REFRESH-OFF* ]]; }
+_check_required_check_freshness() { [[ "$FORGE_TYPE" == "github" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; [[ -n "$base_ref" ]] || base_ref="${DEFAULT_BRANCH_NAME:-main}"; msg="$(LOOM_STALE_CHECKS_DRY_RUN="$DRY_RUN" "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stale-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --head-sha "$PR_HEAD_SHA" --base-ref "$base_ref")" || rc=$?; [[ $rc -eq 0 && "$msg" == "LOOM-STALE-CHECKS-CLEAN" ]] && return 0; if [[ $rc -ne 1 ]]; then local why=" It printed nothing, so the binary is most likely missing or predates the subcommand: build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."; [[ -z "$msg" ]] || why=$'\n\n'"What it reported: $msg"; msg="Merge blocked: PR #$PR_NUMBER's required-check freshness guard (#8248) could not run — 'loom-daemon merge-pr stale-checks' exited $rc without the LOOM-STALE-CHECKS-CLEAN signal. A guard that cannot run refuses the merge rather than passing it: a caller cannot tell 'every required check is fresh' from 'never checked', so only a positive clean signal is accepted.$why"; fi; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $msg"; return 0; fi; if [[ $rc -eq 1 && ( "${REDATE_STALE_CHECKS:-false}" == "true" || "${AUTO_MERGE:-false}" == "true" ) ]] && _mp_ar stale "$PR_HEAD_SHA"; then case "$_AR_RC:${_AR_OUT%%[[:space:]]*}" in 4:LOOM-AUTO-REFRESH|6:LOOM-AUTO-REFRESH-EXHAUSTED) printf '%s\n' "$_AR_OUT"; warning "Exiting $_AR_RC: not merged this pass; re-queue, never a failure comment (#12014)."; exit "$_AR_RC" ;; 3:LOOM-AUTO-REFRESH-HEAD-MOVED) error_head_moved "PR #$PR_NUMBER: the branch moved before the #8248 refresh push (#12014)" "$PR_HEAD_SHA" "${_AR_OUT#*current=}" ;; esac; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: ${_AR_OUT#*$'\n'}"; elif [[ "${REDATE_STALE_CHECKS:-false}" == "true" && $rc -eq 1 ]]; then local rd=0 out; out="$(LOOM_REDATE_ALLOW_PROCEED=1 "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr redate-checks --pr "$PR_NUMBER" --repo "$REPO_NWO" --branch "$PR_BRANCH" --expected-head-sha "$PR_HEAD_SHA" 2>&1)" || rd=$?; if [[ $rd -eq 5 ]]; then info "$out"; return 0; fi; if [[ $rd -eq 0 ]]; then warning "$out"; warning "Exiting 4: not merged this pass. The stale required checks are re-running in place (head and loom:pr kept, #8914) or were re-dated by a no-op push (fresh Judge review needed, #5686) — see above. Re-attempt on a later pass."; exit 4; fi; msg="$msg"$'\n\n'"#8508 automated remedy did not produce fresh evidence: $out"; fi; error "$msg"; }
 _mp_warn_reverify_floor
 _check_required_check_freshness
 # #10026: repo-declared merge.treeChecks run on the merge tree (base + PR head) by `loom-daemon merge-pr tree-checks`. Strict no-op (no daemon call) unless .loom/config.json declares checks; once declared it fails CLOSED, so a missing/older daemon refuses (deliberately no requires-daemon floor: repos that do not opt in are unaffected). --allow-red-tree warns; the daemon records the audit comment. See defaults/docs/merge-tree-checks.md.
@@ -2182,12 +2201,10 @@ unset _MPS_JSON _MPS_FRESH_SHA; [[ "$MERGE_PRECONDITION_SHA" == "$PR_HEAD_SHA" |
 # is the half of this fix that closes the label-revocation gap (the wait itself
 # closes the pending-test-suite gap).
 #
-# Deliberately NOT re-run here: the #8248 required-check freshness guard. Its
-# input is the BASE branch's tip, which moves every few minutes in this fleet,
-# so re-evaluating it after a multi-minute wait would refuse nearly every PR
-# that actually had to wait — with "re-run CI" as the only remedy. Widening
-# that guard to cover the wait window is a separate policy call; the window
-# left here is the same one the pre-#8410 UNSTABLE wait path always had.
+# The #8248 required-check freshness guard is re-run here only in
+# auto-refresh mode (#12014): the input-scoped predicate (#8919) refuses only
+# when the base move touches this PR's inputs, and a refusal now refreshes
+# (exit 4) rather than leaving "re-run CI" as the only remedy.
 _revalidate_merge_guards() {
   local fresh v; fresh="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
   # The merged / no-head / head-moved decision, and the label set to re-check, are `loom-daemon merge-pr revalidate-head` (Rust, loom-daemon/src/merge_pr/revalidate_head.rs — #8191 slice): MERGED = merged underneath us while we waited (nothing left to guard); MOVED = the head moved during the wait (PR #8220's 07:12 force-push), the #5579 "re-queue, not a failure" signal (exit 3); NO-HEAD = the re-read was unusable (#8896: a forge read failure, NOT a missing loom:pr). No verdict line at all (a daemon predating the verb: rc 2/127) falls back to the retired jq predicate below, emitting the same protocol — the pre-verb behaviour, so an older host still merges (floor-test row `revalidate-head open -`, no floor raise). jq still READS the payload, so "head unchanged" and "never looked" still cannot read alike.
@@ -2199,6 +2216,8 @@ _revalidate_merge_guards() {
   case "${v%%$'\n'*}" in "LOOM-REVALIDATE MERGED") return 0 ;; "LOOM-REVALIDATE CLEAR") ;;
     "LOOM-REVALIDATE MOVED "*) error_head_moved "PR #$PR_NUMBER: head moved while --auto waited for this head's checks to settle (#8410)" "$MERGE_PRECONDITION_SHA" "${v#LOOM-REVALIDATE MOVED }" ;;
     *) error "Merge blocked: could not re-read PR #$PR_NUMBER after --auto's settle-wait — the uncached re-read returned no usable payload (no head SHA), so neither the head nor the label set could be re-validated against current state. This is a forge read failure, NOT a missing \`loom:pr\` label: refusing to merge rather than treating an unreadable response as a verdict. Re-run once the forge API is healthy." ;; esac
+  # #12014: on a Loom-refreshed head the approval must carry (tree/clean-merge, else exit 3 next=judge); then the #8248 guard re-runs on the head about to merge, so a base move during the wait refreshes again (exit 4/6), never merges. OFF / no answer = pre-#12014.
+  if _mp_ar verdict "$MERGE_PRECONDITION_SHA"; then case "$_AR_RC:${_AR_OUT%%[[:space:]]*}" in 0:LOOM-AUTO-REFRESH-CLEAR) PR_HEAD_SHA="$MERGE_PRECONDITION_SHA" _check_required_check_freshness ;; 3:LOOM-AUTO-REFRESH) printf '%s\n' "$_AR_OUT"; exit 3 ;; *) error "Merge blocked: PR #$PR_NUMBER's auto-refresh verdict gate (#12014) could not run: ${_AR_OUT#*$'\n'}" ;; esac; fi
   PR_LABELS=""; [[ "$v" != *$'\n'* ]] || PR_LABELS="${v#*$'\n'}"
   _check_loom_pr_label
   # #10567: the CI-run conclusion gate (deferred above while the run was still
@@ -2212,22 +2231,20 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
   # retired shell Gitea auto-merge poller (removed by #8427) and are kept for
   # config compatibility. Defaults: 30s interval, 600s ceiling —
   # raise LOOM_AUTO_MERGE_TIMEOUT on a repo whose CI runs longer than that.
-  LOOM_AUTO_MERGE_POLL_INTERVAL="${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}"
-  LOOM_AUTO_MERGE_TIMEOUT="${LOOM_AUTO_MERGE_TIMEOUT:-600}"
-  # Consecutive-iteration threshold (#6389) for treating the check-runs
-  # endpoint's HTTP 404 as a persistent "no checks configured for this repo"
-  # condition rather than a transient blip — see
-  # `_wait_for_checks_then_sync_merge()`.
-  LOOM_CHECK_RUNS_404_STREAK="${LOOM_CHECK_RUNS_404_STREAK:-2}"
+  # LOOM_CHECK_RUNS_404_STREAK: consecutive-iteration threshold (#6389) for treating the check-runs endpoint's HTTP 404 as a persistent
+  # "no checks configured for this repo" condition rather than a transient blip — see `_wait_for_checks_then_sync_merge()`. The three
+  # assignments, and the dry-run `if` below, are joined (verbatim, behavior-preserving) as the shell-budget offset for #12014.
+  LOOM_AUTO_MERGE_POLL_INTERVAL="${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}"; LOOM_AUTO_MERGE_TIMEOUT="${LOOM_AUTO_MERGE_TIMEOUT:-600}"; LOOM_CHECK_RUNS_404_STREAK="${LOOM_CHECK_RUNS_404_STREAK:-2}"
 
-  if [[ "$DRY_RUN" == "true" ]]; then
-    info "[dry-run] Would wait up to ${LOOM_AUTO_MERGE_TIMEOUT}s for PR #$PR_NUMBER's checks to settle, then merge it in-process (immediately if already settled)"
-    exit 0
-  fi
+  if [[ "$DRY_RUN" == "true" ]]; then info "[dry-run] Would wait up to ${LOOM_AUTO_MERGE_TIMEOUT}s for PR #$PR_NUMBER's checks to settle, then merge it in-process (immediately if already settled)"; exit 0; fi
 
   info "PR #$PR_NUMBER: --auto waits for this head's checks to settle, then merges in-process — the forge's server-side auto-merge queue is never armed (#8410)"
+  # #12014: an exit 5 from the wait or the re-validation (CI still running at the caller's pin) on a Loom-refreshed head prints the daemon's
+  # `LOOM-AUTO-REFRESH next=reinvoke|requeue …` line, so the caller knows whether to re-invoke now. Disarmed before the merge itself.
+  _mp_ar_exit() { local rc=$?; [[ $rc -ne 5 ]] || ! _mp_ar timeout "${MERGE_PRECONDITION_SHA:-$PR_HEAD_SHA}" || printf '%s\n' "${_AR_OUT%%$'\n'*}"; exit "$rc"; }; trap _mp_ar_exit EXIT
   _wait_for_checks_then_sync_merge
   _revalidate_merge_guards
+  trap - EXIT
   # The synchronous-merge path below is now the ONLY way a --auto run merges,
   # so the post-merge cleanup block — #3667's partial-increment reset, #6199's
   # loom:building strip, and #8048's stacked-children reconcile pass — is
