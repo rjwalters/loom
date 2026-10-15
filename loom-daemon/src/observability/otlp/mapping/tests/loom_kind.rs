@@ -164,6 +164,10 @@ fn samples() -> Vec<TelemetryRecord> {
                     "relaunch_expected": false, "supervisor": "systemd",
                     "in_flight_sweeps": [], "in_flight_fate": "die_with_cgroup",
                     "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "scope.memory", "scope": "loom-agent-1.scope",
+                    "workspace": "loom", "role": "builder", "limit_source": "none",
+                    "peak_bytes": 1, "events_max": 0, "oom_kills": 0, "clipped": false,
+                    "observed_at": AT, "loom": p})),
     ]
 }
 

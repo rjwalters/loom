@@ -1736,6 +1736,12 @@ listing with no `dispatch()` attempt (and so no admission span). The rest of
 `loom.queue.dispatch_wait` (seconds) and `loom.queue.dispatch_wait.samples`
 (issues) are also delta `Sum`s. Together they give the summed queue dwell of the
 issues dispatched in a tick, so the mean wait is `dispatch_wait / samples`.
+`loom.agent_scope.oom_kills` (`{kill}`, #12241) is also a delta `Sum`: one
+point per finished agent scope that had kernel OOM kills inside it (its cgroup
+`memory.events` `oom_kill`), labelled `repo` (the workspace key, as on
+`loom.agent_scope.peak_memory_bytes`) and `role` (see `scope.memory` below).
+Scopes with no kill emit no point. Unlike the host-wide
+`loom.host.oom_kill_total`, it says which steps are being killed.
 Every other name is a **`Gauge`**:
 
 | Metric | Unit | Cadence |
@@ -3857,6 +3863,65 @@ exported. Both OTLP timestamps are `observed_at`.
 `transform/privacy` `keep_keys`, contract-tested). The Curator's admission
 closes are not recorded here: they are GitHub `closed` events with the comment
 prefix `Closed at admission:`.
+
+### `scope.memory` — one agent scope's memory limit, peak and OOM kills
+
+One OTLP log per agent scope (`loom-agent-*.scope`, a sweep, step or role
+agent) when the daemon sees it end (Issue #12241). The daemon samples every
+live scope's cgroup each work-finder tick (`ram_peaks`); this record carries the
+last sample. Linux with cgroup v2 only. Envelopes carry `schema_version: 12`.
+**OTLP-only** (`native: false`). Severity `WARN` when the scope had OOM kills,
+else `INFO`.
+
+The JSON body contains:
+
+- `scope`: the systemd unit name.
+- `workspace`: the workspace directory name the peak history is keyed by, or
+  `(unattributed)`.
+- `repo` / `repo_visibility`: `owner/repo` and `public` / `private`, when the
+  workspace's slug is already resolved (never fetched for this record).
+- `role`: the role the scope ran. This is the live role run's role, else
+  `sweep` for an issue-lock scope, else `unknown`. It is never parsed from the
+  unit name.
+- `issue`: the claimed issue, for an issue-lock scope.
+- `limit_bytes`: the applied `MemoryMax` (the scope's `memory.max`); absent when
+  the scope had none.
+- `limit_source`: where the limit came from, as `loom-daemon ram-scope-limit`
+  decides it:
+  - `env`: the explicit `LOOM_SWEEP_MEMORY_MAX` MiB value;
+  - `config`: reserved for the `autonomous.agentMemoryMax` config key (#12246),
+    not produced yet;
+  - `floor`: a derived limit equal to the floor
+    (`LOOM_SWEEP_MEMORY_MAX_MIN_MB`, default 4096 MiB);
+  - `history`: derived from the repo's observed peak;
+  - `none`: no limit (disabled, no history, at or above host RAM, or rejected
+    by systemd).
+  The daemon classifies from the applied `memory.max` and its own environment
+  (which `spawn-claude.sh` inherits).
+- `peak_bytes`: the scope's `memory.peak`.
+- `events_max`, `oom_kills`: the scope's `memory.events` `max` (times usage hit
+  the limit) and `oom_kill` (processes the kernel OOM-killed inside it).
+- `clipped`: `true` only when a limit applied and `peak_bytes >= limit_bytes`,
+  or `events_max` or `oom_kills` is non-zero. `memory.peak` cannot exceed
+  `memory.max`, so a clipped peak is the cap, not the scope's real need. With
+  no limit it is always `false`: cgroup v2 `oom_kill` also counts kills by the
+  global OOM killer, and such a scope's peak is genuine. The flag is a signal
+  only. The peak history (`~/.loom/ram-peaks.json`) still records every peak,
+  clipped or not; how it should treat a clipped peak is #11094's to decide.
+- `observed_at`, and standard `loom` build provenance. A record whose
+  provenance does not validate is not exported. Both OTLP timestamps are
+  `observed_at`.
+
+The counters are sampled once per work-finder tick, so an event in the last
+interval before the scope exits is not seen. That mostly under-counts kills at
+the very end of a scope; with `OOMPolicy=continue` a scope usually outlives a
+kill inside it.
+
+**OTLP.** Attributes: `loom.role`, `loom.repo` / `loom.repo.visibility` and
+`loom.issue` (when known), and `loom.scope.unit` / `workspace` / `limit_bytes`
+(when a limit applied) / `limit_source` / `peak_bytes` / `events_max` /
+`oom_kills` / `clipped` (a bool) (`SCOPE_MEMORY_LOG_ATTRIBUTE_KEYS`, kept by the
+collector's `transform/privacy` `keep_keys`, contract-tested).
 
 
 ### `daemon.exit` — why the daemon process ended

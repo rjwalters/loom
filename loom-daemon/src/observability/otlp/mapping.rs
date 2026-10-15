@@ -20,6 +20,7 @@ mod outcome_facts;
 mod pass;
 mod pick_decision;
 mod role_draw;
+mod scope_memory;
 mod session_output;
 mod token_ranking;
 mod tokens_snapshot;
@@ -612,6 +613,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::BacklogLevel(_)
         | TelemetryRecord::DaemonExit(_)
+        | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
@@ -627,7 +629,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
                 .or_else(|| backlog_level::log_parts(r))
-                .or_else(|| daemon_exit::log_parts(r))?;
+                .or_else(|| daemon_exit::log_parts(r))
+                .or_else(|| scope_memory::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
