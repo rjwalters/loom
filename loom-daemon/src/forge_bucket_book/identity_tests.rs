@@ -264,3 +264,19 @@ fn an_old_snapshot_without_installation_still_loads() {
         .unwrap();
     assert_eq!(k.installation, "52");
 }
+
+/// #12204: a directory is probed once per reset window, not every pass.
+#[test]
+fn a_second_pass_inside_the_window_makes_no_probe() {
+    let owner = "acme12204";
+    let ws = workspace(owner, None);
+    let primary = ws.path().join(".loom/gh-config");
+    writer_dir(&primary, "1220401", "3", owner);
+    let bin = tempfile::tempdir().unwrap();
+    let gh = stub_gh(bin.path());
+    assert_eq!(probe_all_with(ws.path(), Some(&gh), SystemTime::now()), 1);
+    assert_eq!(probe_all_with(ws.path(), Some(&gh), SystemTime::now()), 0);
+    // Past the window's reset (stub: now + 1800) the directory is read again.
+    let later = SystemTime::now() + std::time::Duration::from_secs(1801);
+    assert_eq!(probe_all_with(ws.path(), Some(&gh), later), 1);
+}

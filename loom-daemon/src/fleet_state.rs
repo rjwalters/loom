@@ -128,7 +128,7 @@ impl StatePass {
     ///
     /// The whole decision, and pure: `paused` holds, `stopped` stops, and
     /// **everything else proceeds** — `running`, a store with no
-    /// `fleet/state.yml`, an unparseable one, a state naming no default for
+    /// `fleet/state.yml`, an unparseable one with no last recorded state, a state naming no default for
     /// this host, and an unreachable forge with nothing cached. A `desired`
     /// resolved from a cached snapshot or from the last recorded state is
     /// honoured exactly as a live one is; that is the invariant that keeps a
@@ -233,7 +233,12 @@ pub fn state_pass(
             reason: hs.reason,
             error: None,
         },
+        // A malformed store keeps the host's last recorded state — the same
+        // fail-closed rule as an unreachable forge — so a corrupt `fleet.json`
+        // never releases a `paused`/`stopped` host.
         Err(e) => StatePass {
+            desired: last_recorded,
+            from_last_recorded: last_recorded.is_some(),
             cached,
             staleness,
             error: Some(format!("{e:#}")),
