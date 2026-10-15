@@ -105,6 +105,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.phase.spawn_ms",
     "loom.dispatch.spawn_attempts",
     "loom.dispatch.gather_concurrency",
+    // #12298: the spawn half's concurrency and its sub-phases.
+    "loom.dispatch.spawn_concurrency",
+    "loom.dispatch.phase.spawn_resolve_ms",
+    "loom.dispatch.phase.spawn_claim_ms",
+    "loom.dispatch.phase.spawn_launch_ms",
+    "loom.dispatch.phase.spawn_account_ms",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",

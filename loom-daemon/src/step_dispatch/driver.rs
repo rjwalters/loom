@@ -16,12 +16,12 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 
 use super::gather_budget::{
-    deadline_passed, millis, GatherWalk, Starvation, TickPhases, GUARANTEED_FLOOR,
+    deadline_passed, millis, GatherWalk, SpawnParts, Starvation, TickPhases, GUARANTEED_FLOOR,
 };
 use super::item_draw::{weigh, ItemWeights, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
-use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest};
+use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawnTimings};
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
@@ -51,6 +51,9 @@ pub struct TickInputs<'a> {
     /// How many repos the gather lists at once (#12256,
     /// `autonomous.workFinder.gatherConcurrency`); `1` is serial.
     pub gather_concurrency: usize,
+    /// How many spawns, each in a different repo, the draw runs at once
+    /// (#12298, `autonomous.workFinder.spawnConcurrency`); `1` is serial.
+    pub spawn_concurrency: usize,
 }
 
 /// What a workspace's listing said beyond its items.
@@ -158,13 +161,18 @@ impl Default for StepDriver {
 
 /// The registries' step spawn, with the lock released around containment,
 /// the pre-claim and the account-selection poll
-/// ([`SweepRegistry::spawn_step_unlocked`]).
+/// ([`SweepRegistry::spawn_step_unlocked`]). A round's spawns, one per repo,
+/// run on up to `concurrency` threads (#12298).
 struct RegistrySpawner {
     registries: Vec<Arc<Mutex<SweepRegistry>>>,
     roots: Vec<PathBuf>,
     /// Wall time spent inside spawns this tick (#12256).
     spent: Duration,
     attempts: usize,
+    /// How many of a round's spawns run at once (#12298).
+    concurrency: usize,
+    /// Where the spawns' time went, summed over attempts (#12298).
+    parts: StepSpawnTimings,
 }
 
 fn refusal_reason(e: &anyhow::Error) -> String {
@@ -175,19 +183,65 @@ fn refusal_reason(e: &anyhow::Error) -> String {
 impl StepSpawner for RegistrySpawner {
     fn spawn(&mut self, idx: usize, request: &StepSpawnRequest) -> SpawnResult {
         let started = Instant::now();
-        let result = self.spawn_inner(idx, request);
+        let (result, parts) = self.spawn_one(idx, request);
         self.spent += started.elapsed();
         self.attempts += 1;
+        self.parts.add(&parts);
         result
+    }
+
+    fn spawn_batch(&mut self, batch: &[(usize, StepSpawnRequest)]) -> Vec<SpawnResult> {
+        if self.concurrency <= 1 || batch.len() <= 1 {
+            return batch
+                .iter()
+                .map(|(idx, request)| self.spawn(*idx, request))
+                .collect();
+        }
+        // Each worker carries the trace parent and the runtime context, as
+        // the gather's do; the draw's reads run outside the tick deadline,
+        // so the (suspended) read scope goes along as it is.
+        let started = Instant::now();
+        let read_scope = crate::gh_invocation::read_deadline::snapshot();
+        let parent = crate::gh_invocation::telemetry::thread_parent();
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let this = &*self;
+        let answered = super::gather_budget::run_ordered(
+            batch.to_vec(),
+            self.concurrency,
+            || {
+                (
+                    crate::gh_invocation::read_deadline::install(read_scope),
+                    crate::gh_invocation::telemetry::enter_parent(parent.clone()),
+                    runtime.as_ref().map(tokio::runtime::Handle::enter),
+                )
+            },
+            |_, (idx, request)| Some(this.spawn_one(idx, &request)),
+        );
+        self.spent += started.elapsed();
+        self.attempts += batch.len();
+        // `run_ordered` answers in batch order; a missing answer (a worker
+        // that panicked) is a failed spawn.
+        let mut results = vec![None; batch.len()];
+        for (pos, (result, parts)) in answered {
+            self.parts.add(&parts);
+            if let Some(slot) = results.get_mut(pos) {
+                *slot = Some(result);
+            }
+        }
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| SpawnResult::Refused("spawn_failed".to_string())))
+            .collect()
     }
 }
 
 impl RegistrySpawner {
-    fn spawn_inner(&mut self, idx: usize, request: &StepSpawnRequest) -> SpawnResult {
+    fn spawn_one(&self, idx: usize, request: &StepSpawnRequest) -> (SpawnResult, StepSpawnTimings) {
+        let mut parts = StepSpawnTimings::default();
         let Some(registry) = self.registries.get(idx) else {
-            return SpawnResult::Refused("spawn_failed".to_string());
+            return (SpawnResult::Refused("spawn_failed".to_string()), parts);
         };
-        match SweepRegistry::spawn_step_unlocked(registry, request) {
+        let result = match SweepRegistry::spawn_step_unlocked_timed(registry, request, &mut parts) {
             Ok(_) => SpawnResult::Spawned,
             Err(e) => {
                 let reason = refusal_reason(&e);
@@ -202,7 +256,8 @@ impl RegistrySpawner {
                 }
                 SpawnResult::Refused(reason)
             }
-        }
+        };
+        (result, parts)
     }
 }
 
@@ -468,6 +523,8 @@ impl StepDriver {
             roots: input.roots.to_vec(),
             spent: Duration::ZERO,
             attempts: 0,
+            concurrency: input.spawn_concurrency.max(1),
+            parts: StepSpawnTimings::default(),
         };
         let minute = u64::try_from(now.timestamp() / 60).unwrap_or(0);
         let seed = SeedBase {
@@ -485,6 +542,7 @@ impl StepDriver {
                 free_slots: input.max_concurrent.saturating_sub(total),
                 max_admissions: input.max_admissions,
                 saturation_held: input.saturation_held,
+                spawn_concurrency: input.spawn_concurrency.max(1),
             },
             &seed,
             workspace_draw::tick_seed(),
@@ -502,6 +560,13 @@ impl StepDriver {
             spawn_ms: millis(spawner.spent),
             spawn_attempts: spawner.attempts,
             gather_concurrency: concurrency,
+            spawn_concurrency: spawner.concurrency,
+            spawn_parts: SpawnParts {
+                resolve_ms: millis(spawner.parts.resolve),
+                claim_ms: millis(spawner.parts.claim),
+                launch_ms: millis(spawner.parts.launch),
+                account_ms: millis(spawner.parts.account),
+            },
         });
         for (idx, failed, listing, held) in &notes {
             note_listing(&mut report, *idx, failed.as_ref(), *listing, *held);

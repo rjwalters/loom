@@ -43,6 +43,32 @@ pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Where one step spawn's time went (#12298), for the tick span's
+/// `loom.dispatch.phase.spawn_*_ms`. A refused spawn stops adding at the
+/// phase that refused it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StepSpawnTimings {
+    /// Phase 2: the role's resolvers, containment included.
+    pub resolve: Duration,
+    /// Phases 3 and 4, and a Builder's claim flip and lease comment.
+    pub claim: Duration,
+    /// Phase 5 but the Builder's claim: the roll gate, the stagger, the
+    /// spawn.
+    pub launch: Duration,
+    /// Phases 6 and 7: the account-selection poll and the record.
+    pub account: Duration,
+}
+
+impl StepSpawnTimings {
+    /// Add `other` to `self`.
+    pub fn add(&mut self, other: &Self) {
+        self.resolve += other.resolve;
+        self.claim += other.claim;
+        self.launch += other.launch;
+        self.account += other.account;
+    }
+}
+
 impl SweepRegistry {
     /// Spawn one step with the lock released around containment and the
     /// pre-claim (module docs).
@@ -54,6 +80,26 @@ impl SweepRegistry {
         registry: &Arc<Mutex<Self>>,
         request: &StepSpawnRequest,
     ) -> Result<DispatchOutcome> {
+        Self::spawn_step_unlocked_timed(registry, request, &mut StepSpawnTimings::default())
+    }
+
+    /// [`Self::spawn_step_unlocked`], adding where its time went to
+    /// `timings` (#12298).
+    ///
+    /// # Errors
+    /// As [`Self::spawn_step_unlocked`].
+    #[allow(clippy::too_many_lines)] // the seven phases, kept in order.
+    pub fn spawn_step_unlocked_timed(
+        registry: &Arc<Mutex<Self>>,
+        request: &StepSpawnRequest,
+        timings: &mut StepSpawnTimings,
+    ) -> Result<DispatchOutcome> {
+        let mut mark = Instant::now();
+        let mut lap = |slot: &mut Duration| {
+            let now = Instant::now();
+            *slot += now.saturating_duration_since(mark);
+            mark = now;
+        };
         let refuse = |refusal: StepRefusal| -> anyhow::Error {
             let reg = locked(registry);
             reg.record_step_dispatch(request, dispatch_step::RESULT_REFUSED, refusal.reason, None);
@@ -73,7 +119,9 @@ impl SweepRegistry {
             }
             reg.config.clone()
         };
-        let launch = match blocking(|| Self::resolve_step_launch(&config, role, &kind)) {
+        let resolved = blocking(|| Self::resolve_step_launch(&config, role, &kind));
+        lap(&mut timings.resolve);
+        let launch = match resolved {
             Ok(launch) => launch,
             Err(refusal) => {
                 // The draw excludes a role whose pool is exhausted only from
@@ -102,11 +150,14 @@ impl SweepRegistry {
                 .then(|| reg.step_claim_command(item, role, &sweep_id))
         };
         if let Some(cmd) = claim_cmd {
-            if let Err(refusal) = blocking(|| super::lease::run_step_claim(cmd)) {
+            let claimed = blocking(|| super::lease::run_step_claim(cmd));
+            lap(&mut timings.claim);
+            if let Err(refusal) = claimed {
                 locked(registry).unwind_step_claim(item, role, &sweep_id, false);
                 return Err(refuse(refusal));
             }
         }
+        lap(&mut timings.claim);
         let mut prepared = {
             let mut reg = locked(registry);
             // A roll may have paused spawns while the lock was released (B5):
@@ -118,13 +169,18 @@ impl SweepRegistry {
                 return Err(refuse(StepRefusal::new("roll_paused", e)));
             }
             if role == StepRole::Builder {
-                if let Err(refusal) = reg.pre_claim_step(item, role, &sweep_id) {
+                lap(&mut timings.launch);
+                let claimed = reg.pre_claim_step(item, role, &sweep_id);
+                lap(&mut timings.claim);
+                if let Err(refusal) = claimed {
                     reg.unwind_step_claim(item, role, &sweep_id, false);
                     drop(reg);
                     return Err(refuse(refusal));
                 }
             }
-            match reg.spawn_prepared_step(request, &sweep_id, launch) {
+            let spawned = reg.spawn_prepared_step(request, &sweep_id, launch);
+            lap(&mut timings.launch);
+            match spawned {
                 Ok(p) => p,
                 Err(refusal) => {
                     drop(reg);
@@ -139,7 +195,9 @@ impl SweepRegistry {
                 &prepared.header_anchor,
             )
         });
-        locked(registry).finish_step_spawn(prepared, token_name, runtime, death)
+        let finished = locked(registry).finish_step_spawn(prepared, token_name, runtime, death);
+        lap(&mut timings.account);
+        finished
     }
 }
 

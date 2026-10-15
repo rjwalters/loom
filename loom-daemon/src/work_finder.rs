@@ -3209,6 +3209,9 @@ pub fn spawn_multi_work_finder_task(
                 gather_concurrency: crate::step_dispatch::gather_budget::gather_concurrency(
                     &fallback_root,
                 ),
+                spawn_concurrency: crate::step_dispatch::gather_budget::spawn_concurrency(
+                    &fallback_root,
+                ),
             });
             drop(tick_parent);
             drop(read_scope);

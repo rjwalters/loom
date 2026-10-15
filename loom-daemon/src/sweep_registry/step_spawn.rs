@@ -59,6 +59,7 @@ mod unlocked;
 pub(crate) use unlocked::blocking;
 
 pub use timeout::step_timeout;
+pub use unlocked::StepSpawnTimings;
 
 /// One step the engine asks to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]

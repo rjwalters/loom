@@ -42,6 +42,27 @@ pub struct TickPhases {
     pub spawn_attempts: usize,
     /// How many repos the listings read at once.
     pub gather_concurrency: usize,
+    /// How many spawns ran at once (#12298).
+    pub spawn_concurrency: usize,
+    /// Inside spawns, by sub-phase (#12298), **summed over attempts**: with
+    /// spawns running at once they can add up to more than `spawn_ms`.
+    pub spawn_parts: SpawnParts,
+}
+
+/// Where the time inside a tick's spawns went (#12298), in milliseconds
+/// summed over its attempts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpawnParts {
+    /// The role's resolvers: runtime admission, the pool preflight,
+    /// containment.
+    pub resolve_ms: u64,
+    /// The claim: the item's lock, the pre-claim subprocess (`lease pr
+    /// claim`) or a Builder's label flip and lease comment.
+    pub claim_ms: u64,
+    /// The launch: the dispatch stagger and the child's spawn.
+    pub launch_ms: u64,
+    /// The account-selection poll (up to 5 s per spawn) and the record.
+    pub account_ms: u64,
 }
 
 /// Milliseconds in `d`, saturating. Pure.
@@ -68,10 +89,35 @@ pub fn gather_concurrency_from(effective: &serde_json::Value) -> usize {
         })
 }
 
+/// The default number of spawns a step tick runs at once (#12298).
+pub const DEFAULT_SPAWN_CONCURRENCY: usize = 4;
+/// The most spawns a step tick runs at once, whatever the config says.
+pub const MAX_SPAWN_CONCURRENCY: usize = 16;
+
+/// `autonomous.workFinder.spawnConcurrency` from an effective config: a
+/// positive integer (at most [`MAX_SPAWN_CONCURRENCY`]), else
+/// [`DEFAULT_SPAWN_CONCURRENCY`]. `1` restores the serial spawns. Pure.
+#[must_use]
+pub fn spawn_concurrency_from(effective: &serde_json::Value) -> usize {
+    crate::config_resolver::get_path(effective, "autonomous.workFinder.spawnConcurrency")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| *n > 0)
+        .map_or(DEFAULT_SPAWN_CONCURRENCY, |n| {
+            usize::try_from(n).map_or(MAX_SPAWN_CONCURRENCY, |n| n.min(MAX_SPAWN_CONCURRENCY))
+        })
+}
+
 /// The gather concurrency for the daemon rooted at `root`, read live.
 #[must_use]
 pub fn gather_concurrency(root: &std::path::Path) -> usize {
     gather_concurrency_from(&crate::config_resolver::resolve_effective_config(root))
+}
+
+/// The spawn concurrency for the daemon rooted at `root`, read live
+/// (#12298).
+#[must_use]
+pub fn spawn_concurrency(root: &std::path::Path) -> usize {
+    spawn_concurrency_from(&crate::config_resolver::resolve_effective_config(root))
 }
 
 /// Run `work` over `jobs` on at most `workers` threads, each started with

@@ -220,3 +220,16 @@ fn gather_concurrency_reads_a_bounded_positive_integer() {
         assert_eq!(gather_concurrency_from(&at(bad)), DEFAULT_GATHER_CONCURRENCY);
     }
 }
+
+#[test]
+fn spawn_concurrency_reads_a_bounded_positive_integer() {
+    use serde_json::json;
+    let at = |v| json!({"autonomous": {"workFinder": {"spawnConcurrency": v}}});
+    assert_eq!(spawn_concurrency_from(&json!({})), DEFAULT_SPAWN_CONCURRENCY);
+    assert_eq!(spawn_concurrency_from(&at(json!(1))), 1);
+    assert_eq!(spawn_concurrency_from(&at(json!(6))), 6);
+    assert_eq!(spawn_concurrency_from(&at(json!(1000))), MAX_SPAWN_CONCURRENCY);
+    for bad in [json!(0), json!(-3), json!("4"), json!(2.5)] {
+        assert_eq!(spawn_concurrency_from(&at(bad)), DEFAULT_SPAWN_CONCURRENCY);
+    }
+}

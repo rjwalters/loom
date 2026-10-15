@@ -132,6 +132,20 @@ pub fn phase_attributes(
         ("loom.dispatch.phase.spawn_ms".into(), p.spawn_ms.to_string()),
         ("loom.dispatch.spawn_attempts".into(), p.spawn_attempts.to_string()),
         ("loom.dispatch.gather_concurrency".into(), p.gather_concurrency.to_string()),
+        ("loom.dispatch.spawn_concurrency".into(), p.spawn_concurrency.to_string()),
+        (
+            "loom.dispatch.phase.spawn_resolve_ms".into(),
+            p.spawn_parts.resolve_ms.to_string(),
+        ),
+        ("loom.dispatch.phase.spawn_claim_ms".into(), p.spawn_parts.claim_ms.to_string()),
+        (
+            "loom.dispatch.phase.spawn_launch_ms".into(),
+            p.spawn_parts.launch_ms.to_string(),
+        ),
+        (
+            "loom.dispatch.phase.spawn_account_ms".into(),
+            p.spawn_parts.account_ms.to_string(),
+        ),
     ]
 }
 
@@ -212,6 +226,13 @@ mod tests {
                 spawn_ms: 9_000,
                 spawn_attempts: 5,
                 gather_concurrency: 8,
+                spawn_concurrency: 4,
+                spawn_parts: crate::step_dispatch::gather_budget::SpawnParts {
+                    resolve_ms: 700,
+                    claim_ms: 6_000,
+                    launch_ms: 200,
+                    account_ms: 11_000,
+                },
             }),
             gather: Some(crate::step_dispatch::gather_budget::GatherStats::default()),
             ..TickReport::default()
@@ -222,6 +243,9 @@ mod tests {
         assert_eq!(get("loom.dispatch.phase.spawn_ms"), Some("9000"));
         assert_eq!(get("loom.dispatch.spawn_attempts"), Some("5"));
         assert_eq!(get("loom.dispatch.gather_concurrency"), Some("8"));
+        assert_eq!(get("loom.dispatch.spawn_concurrency"), Some("4"));
+        assert_eq!(get("loom.dispatch.phase.spawn_claim_ms"), Some("6000"));
+        assert_eq!(get("loom.dispatch.phase.spawn_account_ms"), Some("11000"));
         // Every tick attribute survives export (#12256: the #12074 gather
         // keys were emitted but missing from the allowlist).
         for (key, _) in &attrs {
