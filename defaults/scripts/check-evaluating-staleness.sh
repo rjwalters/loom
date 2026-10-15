@@ -180,7 +180,7 @@ fi
 if [[ "$LABEL" == "loom:evaluating" ]]; then
   # requires-daemon: lease optional   Without `lease pr check` (absent or older binary) the lease is not read: only the age rule decides, as before #11911.
   LEASE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease pr check "$ISSUE" --role champion --step champion_promote 2>/dev/null)" || true
-  case "$(sed -n 's/^PR_LEASE_STATE=//p' <<<"$LEASE_OUT" | head -n 1)" in
+  case "$(awk -F= '/^PR_LEASE_STATE=/ { print $2; exit }' <<<"$LEASE_OUT")" in
     held-peer | held-self | unknown)
       emit "FRESH" "$AGE_MIN" "$CLAIMED_AT"
       exit 0
