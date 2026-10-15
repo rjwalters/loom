@@ -1009,6 +1009,29 @@ fn recover_orphans(journal: &Journal) {
     roll_interruption::recover(journal, &mut roll_interruption::Records::at(None));
 }
 
+/// Whether `journal` is a step's execution whose step is still running
+/// (#12253). A step's leader can exit while its process group keeps running
+/// the session, and the journal's owner pid sees only the leader, so orphan
+/// recovery asks the step's claim lock before closing its `loom.sweep` span.
+/// The step's own end closes it ([`crate::sweep_registry::step_spawn::span`]).
+fn running_step(root: &Path, journal: &Journal) -> bool {
+    let Ok(active) = journal.active() else {
+        return false;
+    };
+    step_sweep_id(&active)
+        .is_some_and(|id| crate::sweep_registry::step_spawn::span::step_still_running(root, id))
+}
+
+/// The sweep id on a journal's open `loom.sweep` root, when it names a step.
+fn step_sweep_id(active: &[ActiveSpan]) -> Option<&str> {
+    active
+        .iter()
+        .filter(|span| span.record.name == SpanName::Sweep)
+        .find_map(|span| span.record.attributes.get("loom.sweep_id"))
+        .map(String::as_str)
+        .filter(|id| crate::step_role::StepRole::parse_sweep_id(id).is_some())
+}
+
 pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
     if !super::tracing::enabled(root) {
         return 0;
@@ -1024,7 +1047,9 @@ pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
             continue;
         }
         let journal = Journal::from_path(path);
-        roll_interruption::recover(&journal, &mut rolls);
+        if !running_step(root, &journal) {
+            roll_interruption::recover(&journal, &mut rolls);
+        }
         match journal.drain(|span| {
             let context = span.context.clone();
             let mut envelope = TelemetryEnvelope::new(
