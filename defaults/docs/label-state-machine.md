@@ -743,8 +743,10 @@ queries `operator_gate`; `label_literal_guard.rs` pins the rest). Changes go
 in the registry.
 The `propagate` table (#10012) was removed (#11510) after #11104 removed
 the star-liveness pass that read it. `lifecycle` is inert.
-`stale_after_minutes` is live for the five claim labels (#11898): curating 30,
-evaluating 15, building 15, reviewing 30, treating 60 minutes. It is the
+`stale_after_minutes` is live for the five claim labels (#11898): curating 45,
+evaluating 45, building 15, reviewing 45, treating 60 minutes (curating,
+evaluating and reviewing were raised by #11909 past the 30-minute step
+timeout, so a running step's claim never reads as stale). It is the
 default claim-liveness window (`loom-daemon/src/claim_liveness.rs`); the env
 overrides (`LOOM_STALE_<NAME>_MINUTES`) still win, and `loom:building`'s value
 is the lease TTL, because Builder liveness is the renewed lease. A dead step's

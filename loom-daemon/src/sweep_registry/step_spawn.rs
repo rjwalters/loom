@@ -50,6 +50,7 @@ use crate::step_role::StepRole;
 use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 
 pub(crate) mod capture;
+pub mod draw_claims;
 pub mod ended;
 pub(crate) mod lease;
 mod pool_state;

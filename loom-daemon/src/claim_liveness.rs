@@ -7,10 +7,13 @@
 //!
 //! | Claim | Minutes | Read by |
 //! |---|---|---|
-//! | `loom:curating` | 30 | `claim-staleness.sh` (pinned), [`stale_after_minutes`] |
-//! | `loom:evaluating` | 15 | `check-evaluating-staleness.sh` (pinned), [`stale_after_minutes`] |
+//! | `loom:curating` | 45 | `claim-staleness.sh` (pinned), [`stale_after_minutes`] |
+//! | `loom:evaluating` | 45 | `check-evaluating-staleness.sh` (pinned), [`stale_after_minutes`] |
 //! | `loom:building` | 15 | the lease TTL ([`crate::claim_reconciliation::resolve_lease_ttl_minutes`], pinned) |
-//! | `loom:reviewing` | 30 | claim reconciliation, `claim-staleness.sh` |
+//! | `loom:reviewing` | 45 | claim reconciliation, `claim-staleness.sh` |
+//!
+//! Curating, evaluating and reviewing outlive the 30-minute step timeout
+//! (#11909): a step's claim is never stale while the step may still run.
 //! | `loom:treating` | 60 | claim reconciliation, `claim-staleness.sh` |
 //!
 //! **Builder liveness stays the renewed lease.** A `loom:building` claim is

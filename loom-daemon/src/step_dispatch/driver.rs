@@ -60,6 +60,7 @@ impl Default for StepDriver {
 /// ([`SweepRegistry::spawn_step_unlocked`]).
 struct RegistrySpawner {
     registries: Vec<Arc<Mutex<SweepRegistry>>>,
+    roots: Vec<PathBuf>,
 }
 
 fn refusal_reason(e: &anyhow::Error) -> String {
@@ -74,7 +75,19 @@ impl StepSpawner for RegistrySpawner {
         };
         match SweepRegistry::spawn_step_unlocked(registry, request) {
             Ok(_) => SpawnResult::Spawned,
-            Err(e) => SpawnResult::Refused(refusal_reason(&e)),
+            Err(e) => {
+                let reason = refusal_reason(&e);
+                if let Some(root) = self.roots.get(idx) {
+                    super::step_end::record_refusal(
+                        root,
+                        registry,
+                        request.item,
+                        request.role,
+                        &reason,
+                    );
+                }
+                SpawnResult::Refused(reason)
+            }
         }
     }
 }
@@ -146,9 +159,9 @@ impl StepDriver {
                     continue;
                 }
             };
-            let (mut cooldowns, pool_exhausted_roles) = registry.lock().map_or_else(
-                |_| (Default::default(), BTreeSet::new()),
-                |reg| (reg.step_cooldowns(now), reg.pool_exhausted_roles(now)),
+            let (mut cooldowns, pool_exhausted_roles, claims) = registry.lock().map_or_else(
+                |_| (Default::default(), BTreeSet::new(), Default::default()),
+                |reg| (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims()),
             );
             for (item, role, until) in &gathered.ladder {
                 cooldowns.insert(*item, *role, *until);
@@ -161,6 +174,8 @@ impl StepDriver {
                 cooldowns,
             };
             let mut weighing = weigh(&gathered.inputs, &ctx, &ItemWeights::for_root(root));
+            // This host's and the peers' live claims (B1, M5).
+            tick::exclude_claimed(&mut weighing, &claims);
             if fixes_only {
                 weighing.pool.retain(|c| c.item.lane == Lane::RedMain);
             }
@@ -178,7 +193,10 @@ impl StepDriver {
         }
         let total: usize = occupied.iter().sum();
         let mut repo_cap = RepoCap::from_limits(input.limits.clone(), occupied);
-        let mut spawner = RegistrySpawner { registries };
+        let mut spawner = RegistrySpawner {
+            registries,
+            roots: input.roots.to_vec(),
+        };
         let minute = u64::try_from(now.timestamp() / 60).unwrap_or(0);
         let seed = SeedBase {
             minute,

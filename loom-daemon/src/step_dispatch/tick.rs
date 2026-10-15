@@ -36,7 +36,9 @@ use super::item_draw::{Candidate, DrawError, DrawRecord, ItemDraw, SeedKey, Weig
 use crate::observability::pick_decision::{item_draw_record, ItemDrawWorkspace};
 use crate::priority_pick::{self, Level, PickRng, WeightBonus, WorkspaceEntry};
 use crate::step_role::StepRole;
+use crate::sweep_registry::step_spawn::draw_claims::DrawClaims;
 use crate::sweep_registry::step_spawn::StepSpawnRequest;
+use crate::telemetry::kinds::pick_decision::{PickItemExclusion, PickSkipReason};
 use crate::types::QueueDisposition as Qd;
 use crate::work_finder::ready_queue::TickQueueRow;
 use crate::work_finder::repo_cap::RepoCap;
@@ -141,6 +143,42 @@ pub fn disposition_of(reason: &str) -> Qd {
     }
 }
 
+/// Take out of `w`'s pool every item `claims` names (this host's live runs
+/// and the peers' live claims), and every Champion merge but the one a peer
+/// is merging while a peer merge is in flight in this repo. Each counts as
+/// a `claimed` pass. Pure.
+pub fn exclude_claimed(w: &mut Weighing, claims: &DrawClaims) {
+    use super::item_draw::Exclusion;
+    let before = w.pool.len();
+    w.pool.retain(|c| {
+        let target = c.target();
+        let merging_elsewhere = c.step == crate::work_finder::step_item::Step::ChampionMerge
+            || c.step == crate::work_finder::step_item::Step::ChampionHoldReevaluate;
+        !(claims.items.contains(&target)
+            || (merging_elsewhere
+                && claims
+                    .merge_in_flight
+                    .as_ref()
+                    .is_some_and(|(pr, _)| *pr != target)))
+    });
+    let removed = before - w.pool.len();
+    if removed > 0 {
+        *w.excluded
+            .entry(Exclusion::Pass(PassReason::Claimed))
+            .or_default() += removed;
+    }
+}
+
+/// The closed-set skip reason a spawn refusal reads as on `pick.decision`.
+fn refusal_skip(reason: &str) -> PickSkipReason {
+    match disposition_of(reason) {
+        Qd::PeerClaim => PickSkipReason::InFlight,
+        Qd::HostConstraint => PickSkipReason::Quota,
+        Qd::DeferredCapacity | Qd::DeferredRepoCap => PickSkipReason::Cap,
+        _ => PickSkipReason::Error,
+    }
+}
+
 /// Fold the weight-0 counts onto the tick report's skip counters, so the
 /// tick line and the summary keep reading.
 fn count_exclusions(report: &mut TickReport, w: &Weighing) {
@@ -185,6 +223,8 @@ struct Drawing {
     ws: StepWorkspace,
     draw: ItemDraw,
     draws: Vec<DrawRecord>,
+    /// Draws the spawn or the per-repo cap refused, by reason.
+    refused: BTreeMap<String, usize>,
     /// Out of the draw for the rest of the tick (empty, capped, overflowed).
     closed: bool,
     overflow: bool,
@@ -253,6 +293,7 @@ pub fn run(
             ws,
             draw,
             draws: Vec::new(),
+            refused: BTreeMap::new(),
             closed,
             overflow: false,
         });
@@ -323,6 +364,7 @@ pub fn run(
                 d.closed = true;
                 passes += 1;
                 *pass_counts.entry(PASS_REPO_CAP.to_string()).or_default() += 1;
+                *d.refused.entry(PASS_REPO_CAP.to_string()).or_default() += 1;
                 continue;
             }
             let request = StepSpawnRequest {
@@ -346,6 +388,7 @@ pub fn run(
                     }
                     resolve(&mut report.queue, &key, disposition, Some(reason.clone()));
                     passes += 1;
+                    *d.refused.entry(reason.clone()).or_default() += 1;
                     *pass_counts.entry(reason).or_default() += 1;
                 }
             }
@@ -403,6 +446,20 @@ pub fn run(
         })
         .collect();
     report.item_draw = item_draw_record(seed.minute, &seed.host, seed.tick_counter, &views);
+    // The draws a gate or the claim refused, beside the weight-0 counts, so
+    // a refused draw is visible on the record (the integrated review's M1).
+    if let Some(record) = report.item_draw.as_mut() {
+        for d in &drawing {
+            for (reason, &count) in &d.refused {
+                record.excluded.push(PickItemExclusion {
+                    repo: d.ws.repo.clone(),
+                    reason: format!("refused_{reason}"),
+                    skip_reason: refusal_skip(reason),
+                    count,
+                });
+            }
+        }
+    }
     StepTick {
         report,
         passes: pass_counts,

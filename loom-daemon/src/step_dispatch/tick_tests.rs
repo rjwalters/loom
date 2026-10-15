@@ -289,3 +289,47 @@ fn a_halted_workspace_is_never_drawn() {
         .iter()
         .all(|r| r.disposition == Some(Qd::WorkspaceHalted)));
 }
+
+#[test]
+fn live_claims_and_a_peer_merge_leave_the_pool_as_claimed_passes() {
+    let mut ws = workspace(0, "acme/one", &forge());
+    let before = ws.weighing.pool.len();
+    let claims = DrawClaims {
+        items: std::collections::HashSet::from([1, 40]),
+        merge_in_flight: Some((61, "peer".to_string())),
+    };
+    let claimed_before = ws
+        .weighing
+        .excluded
+        .get(&crate::step_dispatch::item_draw::Exclusion::Pass(PassReason::Claimed))
+        .copied()
+        .unwrap_or(0);
+    exclude_claimed(&mut ws.weighing, &claims);
+    let left: BTreeSet<u32> = ws.weighing.pool.iter().map(Candidate::target).collect();
+    // 1 (this host or a peer runs it), 40 (likewise) and the merge of 60
+    // (a peer merges #61 in this repo) are out; the rest stay.
+    assert_eq!(left, BTreeSet::from([2, 3, 50]));
+    assert_eq!(ws.weighing.pool.len(), before - 3);
+    let claimed_after = ws.weighing.excluded
+        [&crate::step_dispatch::item_draw::Exclusion::Pass(PassReason::Claimed)];
+    assert_eq!(claimed_after, claimed_before + 3);
+}
+
+#[test]
+fn a_refused_draw_is_counted_on_the_record() {
+    let mut spawner = FakeSpawner {
+        refuse: vec![(3, "claim_lost")],
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0]);
+    let tick =
+        run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut cap, &mut spawner);
+    let record = tick.report.item_draw.unwrap();
+    let refused = record
+        .excluded
+        .iter()
+        .find(|e| e.reason == "refused_claim_lost")
+        .unwrap();
+    assert_eq!((refused.repo.as_str(), refused.count), ("acme/one", 1));
+    assert_eq!(refused.skip_reason, PickSkipReason::InFlight);
+}

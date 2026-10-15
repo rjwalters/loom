@@ -3993,7 +3993,7 @@ Thresholds are minutes-scale, not hours, and env-overridable:
 
 | Claim label | Env var | Default |
 |-------------|---------|---------|
-| `loom:reviewing` | `LOOM_STALE_REVIEWING_MINUTES` | 30 — the SAME env var `.claude/commands/loom/judge.md`'s "Stale `loom:reviewing` Claim Check" already established, so the agent-side fast path and this always-on daemon backstop share one convention |
+| `loom:reviewing` | `LOOM_STALE_REVIEWING_MINUTES` | 45 (30 before #11909; longer than a Judge step's 30-minute timeout) — the SAME env var `.claude/commands/loom/judge.md`'s "Stale `loom:reviewing` Claim Check" already established, so the agent-side fast path and this always-on daemon backstop share one convention |
 | `loom:treating` | `LOOM_STALE_TREATING_MINUTES` | 60 — a Doctor's fix cycle legitimately runs longer than a single Judge review pass; the SAME env var `.claude/commands/loom/doctor.md`'s "Stale `loom:treating` Claim Check" fast path uses (#4527) |
 
 Reclaiming removes only the stale claim label — the PR's state label (still
@@ -4072,7 +4072,7 @@ explicit `/curator <number>` naming it) and runs the stale-claim check —
 there is no periodic sweep that reclaims it in the background the way
 `reconcile_pr_claims` does for `loom:reviewing`/`loom:treating` or
 `reconcile_workspace` does for `loom:building`. `LOOM_STALE_CURATING_MINUTES`
-(default 30, matching `LOOM_STALE_REVIEWING_MINUTES`) and
+(default 45, matching `LOOM_STALE_REVIEWING_MINUTES`) and
 `LOOM_MAX_STANDDOWN_STREAK` are shared with the Judge/Doctor convention
 above. Extending `claim_reconciliation` to cover `loom:curating` as a fourth
 surface (mirroring `reconcile_pr_claims`'s `decide_pr`, keyed off the same

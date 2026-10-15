@@ -138,7 +138,7 @@ impl SweepRegistry {
             StepRole::Builder => self.restore_builder_step(item, sweep_id),
             StepRole::ChampionMerge => Ok(ClaimRelease::Released),
             StepRole::Curator | StepRole::ChampionPromote | StepRole::Judge | StepRole::Doctor => {
-                self.restore_role_step(item, role)
+                self.restore_role_step(item, role, sweep_id)
             }
         }
     }
@@ -150,6 +150,7 @@ impl SweepRegistry {
         // is finished, and an unreadable issue is not touched at all, since
         // removing `loom:building` blind could drop the open-PR hold (#11852).
         let signals = self.release_issue_signals(issue);
+        self.note_step_post(StepRole::Builder, sweep_id, &signals.labels, signals.closed);
         if signals.closed.is_none() {
             log::info!(
                 "sweep_registry: Builder step on #{issue} ended; the issue could not be read — \
@@ -177,11 +178,30 @@ impl SweepRegistry {
         self.restore_label_to_ready_checked(issue)
     }
 
-    fn restore_role_step(&self, item: u32, role: StepRole) -> Result<ClaimRelease> {
+    /// The ledger's post-state from the release's own read, before any
+    /// restore write (`step_spawn::ended`, #11909).
+    fn note_step_post(
+        &self,
+        role: StepRole,
+        sweep_id: &str,
+        labels: &[String],
+        closed: Option<bool>,
+    ) {
+        let post =
+            closed.map(|closed| crate::step_dispatch::step_end::post_state(role, labels, closed));
+        crate::sweep_registry::step_spawn::ended::note_post(
+            &self.config.workspace_root,
+            sweep_id,
+            post,
+        );
+    }
+
+    fn restore_role_step(&self, item: u32, role: StepRole, sweep_id: &str) -> Result<ClaimRelease> {
         let (Some(claim), Some(ready)) = (role.claim_label(), role.restore_label()) else {
             return Ok(ClaimRelease::Released);
         };
         let signals = self.release_issue_signals(item);
+        self.note_step_post(role, sweep_id, &signals.labels, signals.closed);
         let plan = plan_step_release(role, &signals.labels, signals.closed);
         log::info!(
             "sweep_registry: {role} step on #{item} died — releasing `{claim}` ({plan:?}, \

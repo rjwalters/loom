@@ -4,8 +4,10 @@
 //! (`sweep_registry::step_spawn::ended`). Each step tick drains the queue
 //! for every root, with the registry lock released:
 //!
-//! 1. read the item once from the forge (the PR for a PR step, else the
-//!    issue): its labels, and whether it is closed (a merged PR counts);
+//! 1. take the read the claim release made before its restore write
+//!    (`sweep_registry::step_spawn::ended::take_post`), or, when nothing
+//!    released the claim, read the item once from the forge (the PR for a PR
+//!    step, else the issue): its labels, and whether it is closed;
 //! 2. compute the role's [`PostState`] from that read ([`post_state`]), or
 //!    `None` when the read failed, never a default;
 //! 3. read the session's own outcome line from its log
@@ -116,6 +118,48 @@ pub fn run_of(
     }
 }
 
+/// The ledger's refusal reason for a spawn-time refusal
+/// (`sweep_registry::step_spawn::StepRefusal::reason`): the pool gate and a
+/// claim held elsewhere cool the `(item, step)` down; a lost claim is a
+/// counted redraw. `None` for a refusal that says nothing about the item (a
+/// roll pause, a failed spawn).
+#[must_use]
+pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
+    match spawn_reason {
+        "pool_exhausted" | "no_token_pool" | "token_selection_failed" => Some("pool_gate"),
+        "claimed" | "claim_unverified" | "backstop_hold" => Some("claimed"),
+        "claim_lost" => Some("claim_lost"),
+        _ => None,
+    }
+}
+
+/// Record a spawn-time refusal of `(item, role)` in the ledger, so the next
+/// draw skips the pair while it cools down and the `claim_lost` counter
+/// counts (the integrated review's M1).
+pub fn record_refusal(
+    root: &Path,
+    registry: &Arc<Mutex<SweepRegistry>>,
+    item: u32,
+    role: StepRole,
+    spawn_reason: &str,
+) {
+    let Some(reason) = ledger_reason(spawn_reason) else {
+        return;
+    };
+    let run = StepRun {
+        item,
+        step: role,
+        sweep_id: String::new(),
+        outcome: outcome_ledger::StepOutcome::new(outcome_ledger::OutcomeClass::Refused, reason),
+        ran_for: std::time::Duration::ZERO,
+        failure_class: None,
+    };
+    let mut forge = crate::operator_decision::cli::GhForge::new(root.to_path_buf(), None);
+    if let Ok(mut reg) = registry.lock() {
+        reg.record_step_outcome(&run, &mut forge);
+    }
+}
+
 /// Record every step of `root` that ended since the last tick (module docs).
 pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
     let steps = ended::take(root);
@@ -130,15 +174,19 @@ pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
         return;
     };
     for step in steps {
-        let post = crate::comment_trust::records::fetch_issue_object(
-            &slug,
-            &step.item.to_string(),
-            root,
-            false,
-        )
-        .as_ref()
-        .and_then(read_object)
-        .map(|(labels, closed)| post_state(step.role, &labels, closed));
+        // The claim release's own read, taken before its restore write; else
+        // one read now (nothing restored the claim, so nothing moved it).
+        let post = ended::take_post(root, &step.sweep_id).unwrap_or_else(|| {
+            crate::comment_trust::records::fetch_issue_object(
+                &slug,
+                &step.item.to_string(),
+                root,
+                false,
+            )
+            .as_ref()
+            .and_then(read_object)
+            .map(|(labels, closed)| post_state(step.role, &labels, closed))
+        });
         let run = run_of(&step, outcome_line(&step).as_ref(), post);
         log::info!(
             "work_finder: {} step on #{} ({}) classified {} {}",
@@ -195,6 +243,17 @@ mod tests {
         assert!(!p.moved && p.claim_held);
         let p = post_state(StepRole::Judge, &labels(&["loom:review-requested"]), true);
         assert!(p.closed && !p.moved && !p.claim_held);
+    }
+
+    #[test]
+    fn spawn_refusals_map_onto_the_ledgers_reasons() {
+        assert_eq!(ledger_reason("pool_exhausted"), Some("pool_gate"));
+        assert_eq!(ledger_reason("token_selection_failed"), Some("pool_gate"));
+        assert_eq!(ledger_reason("backstop_hold"), Some("claimed"));
+        assert_eq!(ledger_reason("claim_unverified"), Some("claimed"));
+        assert_eq!(ledger_reason("claim_lost"), Some("claim_lost"));
+        assert_eq!(ledger_reason("roll_paused"), None);
+        assert_eq!(ledger_reason("spawn_failed"), None);
     }
 
     #[test]
