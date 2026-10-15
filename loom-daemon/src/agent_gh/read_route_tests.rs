@@ -130,11 +130,13 @@ fn the_owner_comes_only_from_an_unambiguous_source() {
 fn plan_uses_the_gateway_only_for_a_read_with_a_live_profile() {
     let dir = PathBuf::from("/ws/.loom/gh-config-gateway/acme");
     let lookup = |o: &str| (o == "acme").then(|| dir.clone());
-    let p = |a: &str| plan(&argv(a), None, || None, &lookup);
+    let none = |_: &str| None::<PathBuf>;
+    let p = |a: &str| plan(&argv(a), None, || None, &lookup, &none);
     assert_eq!(
         p("pr view 7 -R acme/repo"),
         FrontRoute {
             gateway: Some(dir.clone()),
+            reader: None,
             read: true
         }
     );
@@ -143,12 +145,80 @@ fn plan_uses_the_gateway_only_for_a_read_with_a_live_profile() {
         p("pr view 7 -R other/repo"),
         FrontRoute {
             gateway: None,
+            reader: None,
             read: true
         }
     );
     assert_eq!(p("pr merge 7 -R acme/repo"), FrontRoute::default());
     assert_eq!(p("release view -R acme/repo"), FrontRoute::default());
     // No gateway at all (the break-glass state): nothing changes.
-    let off = |_: &str| None::<PathBuf>;
-    assert_eq!(plan(&argv("pr view 7 -R acme/repo"), None, || None, &off).gateway, None);
+    assert_eq!(plan(&argv("pr view 7 -R acme/repo"), None, || None, &none, &none).gateway, None);
+}
+
+#[test]
+fn plan_offers_a_reader_for_a_read_after_the_gateway_and_never_for_a_write() {
+    let gw = PathBuf::from("/ws/.loom/gh-config-gateway/acme");
+    let rd = PathBuf::from("/ws/.loom/gh-config-by-owner/acme/7");
+    let no_gateway = |_: &str| None::<PathBuf>;
+    let gateway = |o: &str| (o == "acme").then(|| gw.clone());
+    let asked = std::cell::RefCell::new(Vec::new());
+    let reader = |r: &str| {
+        asked.borrow_mut().push(r.to_string());
+        (r == "acme/repo").then(|| rd.clone())
+    };
+    // No gateway published: the reader, keyed by the full repo.
+    assert_eq!(
+        plan(&argv("pr diff 7 -R acme/repo"), None, || None, &no_gateway, &reader),
+        FrontRoute {
+            gateway: None,
+            reader: Some(rd.clone()),
+            read: true
+        }
+    );
+    // With one, the gateway is first and the reader is next in line.
+    let both = plan(&argv("api repos/acme/repo/pulls/7"), None, || None, &gateway, &reader);
+    assert_eq!((both.gateway, both.reader), (Some(gw.clone()), Some(rd.clone())));
+    // The repo can come from GH_REPO.
+    assert_eq!(
+        plan(&argv("pr diff 7"), Some("acme/repo"), || None, &no_gateway, &reader).reader,
+        Some(rd.clone())
+    );
+    asked.borrow_mut().clear();
+    // A write, an uncertain repo: no lookup at all.
+    assert_eq!(
+        plan(&argv("issue comment 7 -R acme/repo --body x"), None, || None, &gateway, &reader),
+        FrontRoute::default()
+    );
+    let uncertain = plan(
+        &argv("pr view https://github.com/a/r/pull/1 -R b/r"),
+        None,
+        || None,
+        &gateway,
+        &reader,
+    );
+    assert_eq!(
+        uncertain,
+        FrontRoute {
+            gateway: None,
+            reader: None,
+            read: true
+        }
+    );
+    assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());
+}
+
+#[test]
+fn a_reader_refusal_is_coverage_credential_or_rate_limit_only() {
+    use crate::forge_bucket_book::Resource;
+    let refused = |e: &str| reader_refused(e, None, Resource::Core);
+    assert!(refused("HTTP 404: Not Found (https://api.github.com/repos/a/b/pulls/1)"));
+    assert!(refused("HTTP 403: Resource not accessible by integration"));
+    assert!(refused("HTTP 403: API rate limit exceeded for installation ID 70."));
+    assert!(refused("HTTP 401: Bad credentials"));
+    assert!(refused("GraphQL: Could not resolve to a Repository with the name 'a/b'."));
+    assert!(reader_refused("", Some(404), Resource::Core));
+    // A real answer of another kind is the agent's to see.
+    assert!(!refused("HTTP 422: Validation Failed"));
+    assert!(!refused("unknown flag: --what"));
+    assert!(!refused(""));
 }

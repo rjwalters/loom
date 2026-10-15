@@ -1,33 +1,22 @@
 #!/usr/bin/env bash
-# ci-result-gate.sh — the pass/fail rule behind ci.yml's `CI Result` job (#10444).
-#
-# Why it exists: the `main` ruleset requires only always-run jobs, so a
-# cancelled/unacquired `Detect Changes` (hosted runner capacity) SKIPPED every
-# path-filtered job behind it and the PR still merged green with no Rust lint
-# or tests run (#10403). `CI Result` aggregates every job so that "tested
-# nothing" cannot read as "passed".
+# ci-result-gate.sh — the pass/fail rule behind ci.yml's `CI Result` job, the
+# one required check (#10444, #12106). It aggregates every job so that "tested
+# nothing" (a cancelled `Detect Changes` skipping every filtered job, #10403)
+# cannot read as "passed".
 #
 # Inputs (environment):
 #   EVENT_NAME   github.event_name
 #   NEEDS_JSON   toJSON(needs) — {"<job>": {"result": "...", ...}, ...}
 #
 # Rule:
-#   - pull_request: `changes` (Detect Changes) must be `success`. On push and
-#     merge_group it is legitimately `skipped` (it is PR-only). Push has one
-#     filter of its own, `changes-push` (#10825, the image jobs only): those
-#     jobs skip only when it succeeded with docker=false, and a failed or
-#     cancelled `changes-push` fails this gate by the next rule, so no extra
-#     case is needed here.
-#   - any job `failure` / `cancelled` (or any result other than success/skipped)
-#     fails the gate.
-#   - a `skipped` job passes only when the path filter really ran (`changes`
-#     succeeded) or the event has no path filter; otherwise the skip came from a
-#     cancelled/failed upstream and fails.
-# Remedy printed on failure: `gh run rerun --failed <run>` (re-runs in place;
-# never cancel a distinct commit's run — ci-principles.md).
+#   - pull_request and push: `changes` (Detect Changes) must be `success`.
+#     merge_group skips it and has no filter.
+#   - any job result other than success/skipped fails the gate.
+#   - a `skipped` job passes only when `changes` succeeded or the event has no
+#     filter (merge_group); otherwise the skip came from a failed upstream.
 #
-# Exit: 0 pass, 1 gate failed, 2 bad input. Runs before any loom-daemon binary
-# exists (the daemon build is itself one of the jobs gated), hence shell.
+# Exit: 0 pass, 1 gate failed, 2 bad input. Shell, because it runs before any
+# loom-daemon binary exists (the daemon build is itself a gated job).
 set -euo pipefail
 
 event="${EVENT_NAME:-}"
@@ -39,17 +28,15 @@ fi
 
 problems="$(jq -r --arg event "$event" '
   (.changes.result // "missing") as $ch
-  | ($event == "pull_request") as $pr
-  | (if $pr and $ch != "success"
-       then ["changes (Detect Changes): " + $ch + " — the path filter did not run, so every filtered job was skipped or untrusted"]
+  | ($event != "merge_group" and $ch != "success") as $unfiltered
+  | (if $unfiltered
+       then ["changes (Detect Changes): " + $ch + " — the change detection did not run, so every filtered job was skipped or untrusted"]
        else [] end)
     + [ to_entries[] | select(.key != "changes")
         | (.value.result // "missing") as $r
         | if ($r == "success") then empty
           elif ($r == "skipped") then
-            (if $pr and $ch != "success"
-               then (.key + ": skipped because Detect Changes was " + $ch)
-               else empty end)
+            (if $unfiltered then (.key + ": skipped because Detect Changes was " + $ch) else empty end)
           else (.key + ": " + $r) end ]
   | .[]' <<<"$needs")"
 

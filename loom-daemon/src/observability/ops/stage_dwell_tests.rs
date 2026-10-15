@@ -419,3 +419,42 @@ fn per_item_observability_reads_are_named_and_observability_class() {
     assert_eq!(inv.operation().as_str(), op);
     assert_eq!(inv.class(), ReadClass::Observability, "{op}");
 }
+
+// #12203: the kill switch. Off (the default) a pass makes no forge call.
+
+#[test]
+fn the_sampler_is_off_by_default_and_never_due() {
+    let off = super::Settings::from_effective(&serde_json::json!({}));
+    assert_eq!(off, super::Settings::default());
+    assert!(!off.enabled);
+    assert!(!off.due(None, at(0)));
+    assert!(!off.due(Some(at(0)), at(100_000)));
+    // Malformed is off too.
+    let junk = super::Settings::from_effective(
+        &serde_json::json!({"observability": {"stageDwell": {"enabled": "yes"}}}),
+    );
+    assert!(!junk.enabled);
+    // `claim_pass` refuses an off pass before any listing is attempted.
+    assert!(!super::claim_pass(off, at(0)));
+}
+
+#[test]
+fn switched_on_it_samples_every_pass_or_every_interval() {
+    let on = super::Settings::from_effective(
+        &serde_json::json!({"observability": {"stageDwell": {"enabled": true}}}),
+    );
+    assert!(on.enabled && on.interval_secs.is_none());
+    assert!(on.due(None, at(0)));
+    assert!(on.due(Some(at(0)), at(1)));
+    let spaced = super::Settings::from_effective(&serde_json::json!({
+        "observability": {"stageDwell": {"enabled": true, "intervalSecs": 900}}
+    }));
+    assert_eq!(spaced.interval_secs, Some(900));
+    assert!(spaced.due(None, at(0)));
+    assert!(!spaced.due(Some(at(0)), at(899)));
+    assert!(spaced.due(Some(at(0)), at(900)));
+    let zero = super::Settings::from_effective(&serde_json::json!({
+        "observability": {"stageDwell": {"enabled": true, "intervalSecs": 0}}
+    }));
+    assert_eq!(zero.interval_secs, None);
+}
