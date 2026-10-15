@@ -247,9 +247,11 @@ fn an_issue_step_fast_failure_charges_the_ladder_and_mirrors_its_window() {
 /// Judge review on #11962: a PR step driven well past the fast-fail park
 /// threshold never reaches the issue quarantine. No `gh` call (no label, no
 /// park record, no comment), no body write, no quarantine entry, no issue
-/// ladder; only the ledger's own window, broadcast.
+/// ladder; only the ledger's own window, broadcast. #11969 widens it to
+/// Curator and Champion promotion: the park's release restores `loom:issue`,
+/// which would let a curated or revised issue skip promotion.
 #[test]
-fn a_pr_step_past_the_fast_fail_threshold_writes_nothing_to_the_forge() {
+fn a_non_builder_step_past_the_fast_fail_threshold_writes_nothing_to_the_forge() {
     let dir = tempdir().unwrap();
     let (mut reg, mut rx) = registry(dir.path());
     let gh_log = dir.path().join("gh-calls.log");
@@ -268,7 +270,14 @@ fn a_pr_step_past_the_fast_fail_threshold_writes_nothing_to_the_forge() {
         body: "PR body.".into(),
         ..FakeForge::default()
     };
-    for step in [StepRole::Judge, StepRole::Doctor, StepRole::ChampionMerge] {
+    let steps = [
+        StepRole::Curator,
+        StepRole::ChampionPromote,
+        StepRole::Judge,
+        StepRole::Doctor,
+        StepRole::ChampionMerge,
+    ];
+    for step in steps {
         for _ in 0..6 {
             let rec = reg.record_step_outcome(
                 &run(77, step, OutcomeClass::Failed, "crashed", 20),
@@ -283,7 +292,9 @@ fn a_pr_step_past_the_fast_fail_threshold_writes_nothing_to_the_forge() {
     assert!(!reg.is_quarantined(77), "never the issue quarantine");
     assert_eq!(reg.dispatch_backoff_until(77, Utc::now()), None, "never the issue ladder");
     let now = Utc::now();
-    assert!(reg.step_cooldowns(now).is_cooling(77, StepRole::Judge, now));
+    for step in steps {
+        assert!(reg.step_cooldowns(now).is_cooling(77, step, now), "{step}");
+    }
     let ads = step_ads(&drain(&mut rx));
     assert!(ads.iter().all(|a| a.0 == 77 && a.2 <= DAY && a.2 > 0), "{ads:?}");
     assert!(drain(&mut rx).is_empty());
@@ -299,6 +310,29 @@ fn claim_lost_is_counted() {
     );
     assert_eq!(reg.step_ledger_counters().claim_lost, 1);
     assert!(step_ads(&drain(&mut rx)).is_empty(), "nothing to broadcast");
+}
+
+/// #11969: a second consecutive lost claim arms the 10-min refusal cooldown,
+/// in the draw's query and broadcast like every window.
+#[test]
+fn a_second_claim_lost_cools_and_is_broadcast() {
+    let dir = tempdir().unwrap();
+    let (mut reg, mut rx) = registry(dir.path());
+    let lost = run(5, StepRole::Curator, OutcomeClass::Refused, "claim_lost", 1);
+    reg.record_step_outcome(&lost, &mut FakeForge::default());
+    assert!(step_ads(&drain(&mut rx)).is_empty());
+    let rec = reg.record_step_outcome(&lost, &mut FakeForge::default());
+    assert_eq!(rec.effect, Effect::Redraw);
+    assert!(rec.cooling_until.is_some());
+    let now = Utc::now();
+    assert!(reg
+        .step_cooldowns(now)
+        .is_cooling(5, StepRole::Curator, now));
+    let ads = step_ads(&drain(&mut rx));
+    assert_eq!(ads.len(), 1, "{ads:?}");
+    assert_eq!((ads[0].0, ads[0].1), (5, Some(StepRole::Curator)));
+    assert!((590..=600).contains(&ads[0].2), "{ads:?}");
+    assert_eq!(reg.step_ledger_counters().claim_lost, 2);
 }
 
 #[test]

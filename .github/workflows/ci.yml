@@ -368,13 +368,14 @@ jobs:
   release-build:
     name: Release Build Check
     needs: [changes, changes-images]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes-images.outputs.docker == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     # The same `cargo build --release --features otlp` the release workflow
-    # runs, on every backend PR. Until #9065 the three binary-running checks
-    # each built --release, which caught release-profile-only breakage
-    # (cfg(debug_assertions) code, optimisation-only link failures) before
-    # merge. They now use the shared debug build, so without this job such a
-    # break would first surface in the post-merge release workflow.
+    # runs. Until #9065 the three binary-running checks each built --release,
+    # which caught release-profile-only breakage (cfg(debug_assertions) code,
+    # optimisation-only link failures) before merge. Since #11966 it no longer
+    # runs on every backend PR: that observation is owed by the push run of the
+    # merge commit and ci-daily.yml's release-matrix (and merge_group where a
+    # queue is enabled; it is dormant on this user-owned repo).
     #
     # It is ALSO the one release build per CI run (#10824): the binary is
     # uploaded as `loom-daemon-release-linux-amd64` and `worker-base-image`
@@ -389,11 +390,12 @@ jobs:
     # smokes'): if the base image runs while this job skipped, the artifact
     # download fails and the smokes go red for no reason. Today it is: this job
     # runs unconditionally on push and merge_group, where #10825 path-filters
-    # the image jobs on push only via `changes-push`, and on a PR it is the
-    # UNION of `backend` and `docker`, so a docker-only PR still produces the
-    # artifact. Narrowing this gate below the image gate is not allowed; if you
-    # change either, keep this note true (scripts/test-ci-image-inputs.sh pins
-    # it).
+    # the image jobs on push only via `changes-push`, and on a PR its term is
+    # byte-identical to the image gate's (`changes-images.docker == 'true'`),
+    # so the two are EQUAL on PRs. Keep `always()`: `changes`/`changes-images`
+    # skip on push, which would otherwise skip this job and starve
+    # `worker-buildcache` and `worker-base-image`. Narrowing this gate below
+    # the image gate is not allowed; scripts/test-ci-image-inputs.sh pins it.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2896,7 +2898,7 @@ jobs:
     # they do: always on merge_group; on push only when `changes-push` found an
     # image input since the last green push run, or did not succeed (fails
     # closed); on a PR when `changes-images.docker` is true (#10825). `release-build`'s
-    # gate must stay a superset of this one (see its comment).
+    # gate must stay a superset of this one (equal on PRs; see its comment).
     #
     # Layer cache: a REGISTRY cache at ghcr.io/rjwalters/loom-worker:buildcache,
     # not `type=gha`. The Actions cache is already over its 10 GB cap (13.28 GB

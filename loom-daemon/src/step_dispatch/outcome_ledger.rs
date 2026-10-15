@@ -17,10 +17,10 @@
 //! | any other `verdict` | [`Effect::Advance`]: the next step comes from the labels |
 //! | `noop` | [`Effect::Cooldown`] for [`LedgerConfig::noop_cooldown`], per `(item, step)` |
 //! | `refused`, reason `pool_gate` or `claimed` | [`Effect::Cooldown`] for [`LedgerConfig::refusal_cooldown`] |
-//! | `refused`, reason `claim_lost` | [`Effect::Redraw`], counted ([`LedgerCounters::claim_lost`]) |
+//! | `refused`, reason `claim_lost` | [`Effect::Redraw`], counted ([`LedgerCounters::claim_lost`]); a **second** one in a row arms a cooldown (below) |
 //! | any other `refused` (a state refusal) | [`Effect::Reclassify`]; a **second identical** one in a row arms a cooldown (below) |
-//! | `failed` inside the fast-fail window, issue step | [`Effect::FastFailLadder`]: the #11854/#11872 ladder |
-//! | `failed` inside the fast-fail window, PR step | [`Effect::FastFailWindow`]: a ledger-local doubling window, never the issue quarantine |
+//! | `failed` inside the fast-fail window, Builder step | [`Effect::FastFailLadder`]: the #11854/#11872 ladder |
+//! | `failed` inside the fast-fail window, any other step | [`Effect::FastFailWindow`]: a ledger-local doubling window, never the issue quarantine |
 //! | `failed` later | [`Effect::Failed`]: counted toward the repeat cap only |
 //! | Champion `held` / `blocked` | [`Effect::ForgeLadder`]: 6 h → 7 d, on the forge ([`super::reeval_ladder`]) |
 //!
@@ -41,6 +41,21 @@
 //! (10 min), doubling per further identical refusal up to
 //! [`MAX_SHORT_COOLDOWN`], broadcast like every window. A verdict or any
 //! other outcome on the pair resets the streak.
+//!
+//! `claim_lost` rides the same streak guard (#11969): one lost claim is a
+//! race and only redraws, but a pair whose claim is lost on every draw (a
+//! peer or an attended session holding it for longer than a tick) would
+//! otherwise spawn and lose on every tick. A second consecutive `claim_lost`
+//! on the pair arms the same doubling refusal cooldown; it still redraws.
+//!
+//! # Fast failures of non-Builder issue steps
+//!
+//! Only a Builder step charges the issue fast-fail ladder. Its park restores
+//! `loom:issue` on release when the issue ever carried it, which is right for
+//! an issue Builder was building and wrong for one Curator or Champion
+//! promotion was working (a revised-then-curated issue would come back ready
+//! and skip promotion). So Curator and promote fast failures take the same
+//! ledger-local window PR steps use, with no forge park (#11969).
 //!
 //! # The repeat cap
 //!
@@ -302,9 +317,10 @@ pub enum Effect {
     Reclassify,
     /// A short `(item, step)` cooldown of this length.
     Cooldown(Duration),
-    /// A fast failure on an issue step: charge the #11854 fast-fail ladder.
+    /// A fast failure on a Builder step: charge the #11854 fast-fail ladder.
     FastFailLadder,
-    /// A fast failure on a PR step: a ledger-local window doubling per
+    /// A fast failure on any other step (a PR step, Curator, Champion
+    /// promotion): a ledger-local window doubling per
     /// consecutive fast failure from [`PR_FAST_FAIL_BASE`], capped at
     /// [`MAX_SHORT_COOLDOWN`]. Never the issue quarantine, whose park and
     /// release (`loom:issue` restored) are issue-only. The base and cap are
@@ -317,7 +333,8 @@ pub enum Effect {
     /// Champion re-evaluation left the item held or blocked: advance the
     /// 6 h → 7 d ladder on the forge.
     ForgeLadder,
-    /// The claim was lost to a peer: redraw, and count it.
+    /// The claim was lost to a peer: redraw, and count it. A second one in a
+    /// row on the pair arms the refusal cooldown (module doc).
     Redraw,
 }
 
@@ -367,10 +384,10 @@ pub fn effect_of(
             "claim_lost" => Effect::Redraw,
             _ => Effect::Reclassify,
         },
-        OutcomeClass::Failed if ran_for < cfg.fast_fail_window && step.acts_on_pr() => {
-            Effect::FastFailWindow
+        OutcomeClass::Failed if ran_for < cfg.fast_fail_window && step == StepRole::Builder => {
+            Effect::FastFailLadder
         }
-        OutcomeClass::Failed if ran_for < cfg.fast_fail_window => Effect::FastFailLadder,
+        OutcomeClass::Failed if ran_for < cfg.fast_fail_window => Effect::FastFailWindow,
         OutcomeClass::Failed => Effect::Failed,
     }
 }
@@ -403,12 +420,13 @@ struct Entry {
     runs: Vec<DateTime<Utc>>,
     /// The cooldown in force, if any.
     until: Option<(DateTime<Utc>, CooldownCause)>,
-    /// Consecutive fast failures of a PR step ([`Effect::FastFailWindow`]):
+    /// Consecutive fast failures of a non-Builder step ([`Effect::FastFailWindow`]):
     /// any other outcome on the pair resets it.
     fast_fails: u32,
-    /// The last state refusal's reason, how many identical ones in a row,
-    /// and when the last one was recorded (module doc, "Repeated state
-    /// refusals"). Any other outcome on the pair resets it.
+    /// The last state refusal's (or `claim_lost`'s) reason, how many
+    /// identical ones in a row, and when the last one was recorded (module
+    /// doc, "Repeated state refusals"). Any other outcome on the pair resets
+    /// it.
     refusals: Option<(String, u32, DateTime<Utc>)>,
 }
 
@@ -508,7 +526,10 @@ impl OutcomeLedger {
                     );
                 }
             }
-            Effect::Redraw => self.counters.claim_lost += 1,
+            Effect::Redraw => {
+                self.counters.claim_lost += 1;
+                self.refusal_streak(item, step, &outcome.reason, now);
+            }
             Effect::Cooldown(d) => {
                 let cause = if outcome.class == OutcomeClass::Noop {
                     CooldownCause::Noop
@@ -527,30 +548,14 @@ impl OutcomeLedger {
                 );
                 self.arm(item, step, add(now, delay), CooldownCause::FastFail, now);
             }
-            Effect::Reclassify => {
-                let cooldown = self.cfg.refusal_cooldown;
-                let entry = self.entries.entry((item, step)).or_default();
-                let streak = match &entry.refusals {
-                    Some((reason, n, _)) if *reason == outcome.reason => n.saturating_add(1),
-                    _ => 1,
-                };
-                entry.refusals = Some((outcome.reason.clone(), streak, now));
-                if streak >= 2 {
-                    let delay = crate::sweep_registry::backoff_delay(
-                        streak - 1,
-                        cooldown,
-                        MAX_SHORT_COOLDOWN,
-                    );
-                    self.arm(item, step, add(now, delay), CooldownCause::Refused, now);
-                }
-            }
+            Effect::Reclassify => self.refusal_streak(item, step, &outcome.reason, now),
             Effect::FastFailLadder | Effect::Failed | Effect::ForgeLadder => {}
         }
         if let Some(entry) = self.entries.get_mut(&(item, step)) {
             if effect != Effect::FastFailWindow {
                 entry.fast_fails = 0;
             }
-            if effect != Effect::Reclassify {
+            if !matches!(effect, Effect::Reclassify | Effect::Redraw) {
                 entry.refusals = None;
             }
         }
@@ -562,6 +567,25 @@ impl OutcomeLedger {
             cooling_until: self.cooling_until(item, step, now),
             repeat_capped,
             lifted,
+        }
+    }
+
+    /// Extend the pair's refusal streak by one `reason` refusal (a different
+    /// reason starts a new streak); from the second identical one in a row,
+    /// arm the refusal cooldown, doubling per further one, capped at
+    /// [`MAX_SHORT_COOLDOWN`] (module doc, "Repeated state refusals").
+    fn refusal_streak(&mut self, item: u32, step: StepRole, reason: &str, now: DateTime<Utc>) {
+        let cooldown = self.cfg.refusal_cooldown;
+        let entry = self.entries.entry((item, step)).or_default();
+        let streak = match &entry.refusals {
+            Some((last, n, _)) if last == reason => n.saturating_add(1),
+            _ => 1,
+        };
+        entry.refusals = Some((reason.to_string(), streak, now));
+        if streak >= 2 {
+            let delay =
+                crate::sweep_registry::backoff_delay(streak - 1, cooldown, MAX_SHORT_COOLDOWN);
+            self.arm(item, step, add(now, delay), CooldownCause::Refused, now);
         }
     }
 
