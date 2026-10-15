@@ -532,6 +532,14 @@ paired `sweep.outcome`).
 
 `result` is one of `success`, `failure`, `cancelled`, `blocked`.
 
+Only an issue sweep emits `sweep.completed`. A step (one role session on one
+item, the item-first step dispatch of #12009) never does: its end is
+`role_tick.outcome` with `source = "step"` and, for Champion,
+`pass.verdict`. So since step dispatch, `sweep.completed` counts only the
+remaining issue sweeps and is not a measure of merged work. For "is merged
+work reaching the public feed", read `loom.feed.completions` (#12152), whose
+`kind = step` series is a merged Champion merge step.
+
 #### Per-model token usage (Issue #6384)
 
 `tokens_by_model` is an **additive, optional** array — omitted entirely
@@ -2103,6 +2111,8 @@ GitHub rate limit (Issue #10022):
 | `loom.forge.mirror.changes` | delta `Sum` | `{change}`; labels `repo`, `kind` | changes the state mirror's change stream delivered since the previous point; `kind` ∈ `issue`, `pr`, `label`, `check`, `pr_merged`, `other` |
 | `loom.forge.mirror.wake_latency` | delta `Sum` | `s`; label `repo` | summed seconds from a change at the mirror (its `at`) to the pull that saw it; divided by `loom.forge.mirror.changes` it is the mean wake latency |
 | `loom.stage_entry.lookups` | delta `Sum` | `{lookup}`; labels `repo`, `kind` | stage-entry times the step engine's provider (`step_dispatch::stage_entry`, #11897) looked up since the previous point, flushed on the same tick, by the source that answered in `kind`: `mirror` (the state mirror's per-item `labels_at`), `events` (the issue's `labeled` events, from the provider's persisted cache or one budgeted read), `created` (the item's creation time) or `none` (not even that). The `mirror` + `events` share is the stage-age coverage the step-dispatch design gates on (#11894). Nothing consumes the provider yet, so the series is empty until the item draw lands. Past 1024 series a new one is counted under `repo` = `overflow`. Accumulated only while an ops sink is registered |
+| `loom.feed.completions` | delta `Sum` | `{completion}`; labels `kind`, `outcome` | public-feed `completion` envelopes the safehouse narration sink built since the previous point (#12152), flushed on the same tick, by the trigger that found the merge in `kind`: `sweep_exit` (an issue sweep's `SweepExited`), `step` (a Champion merge step's `step.item.{N}.ended`) or `reconcile` (the periodic merge-reconciliation pass); `outcome` is `narrated`, or `seeded` for a fresh host's first pass, which records merges without posting them (#4649). The direct measure of merged work reaching the feed: a step emits no `sweep.completed`, so since step dispatch (#12009) that record no longer tracks it. Accumulated only while an ops sink is registered |
+| `loom.feed.reconcile_passes` | delta `Sum` | `{pass}`; label `outcome` | merge-reconciliation ticks of the narration sink that had a workspace to visit (#12152), by `outcome`: `ran` (the forge answered; the workspace's watermark advanced), `deferred` (the rate-limit breaker was cooling; the tick is not spent and the workspace catches up from its watermark later) or `failed` (the forge read failed; the watermark holds). Accumulated only while an ops sink is registered |
 
 `resource` ∈ `core`, `graphql` (`search` too on a bucket point). On an
 ambient-login host's points `account` is the validated `gh` login, else
