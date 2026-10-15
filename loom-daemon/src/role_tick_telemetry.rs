@@ -120,6 +120,9 @@ pub struct RoleTickTelemetry {
     /// The role draw's decision record when `runtimes.roleDraw` chose the
     /// tap (#11726).
     pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
+    /// The step's sweep id when a step-engine step, not a role tick, ran
+    /// (#11906); the record then carries `source = "step"`.
+    pub step_sweep_id: Option<String>,
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -278,6 +281,32 @@ pub fn emit_for_tick_correlated(
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
 ) {
+    emit_tick(root, role, started_at, outcome, resolved, trace, None);
+}
+
+/// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
+/// record marked `source = "step"` with the step's sweep id, so it is never
+/// counted as a role-runner tick.
+pub fn emit_for_step(
+    root: &Path,
+    role: &str,
+    started_at: DateTime<Utc>,
+    outcome: &RoleTickOutcome,
+    resolved: Option<ResolvedLaunch>,
+    sweep_id: &str,
+) {
+    emit_tick(root, role, started_at, outcome, resolved, None, Some(sweep_id.to_string()));
+}
+
+fn emit_tick(
+    root: &Path,
+    role: &str,
+    started_at: DateTime<Utc>,
+    outcome: &RoleTickOutcome,
+    resolved: Option<ResolvedLaunch>,
+    trace: Option<crate::observability::lifecycle::RoleTrace>,
+    step_sweep_id: Option<String>,
+) {
     // #10212: the gate listing this tick read, as a ranked `pick.decision`.
     crate::observability::pick_decision::emit_role_tick(
         root,
@@ -314,6 +343,7 @@ pub fn emit_for_tick_correlated(
                 .and_then(|stamp| u32::try_from(stamp.tier).ok()),
             preference_tap: preference.map(|stamp| stamp.tap),
             role_draw,
+            step_sweep_id,
         },
         trace,
     );
@@ -625,6 +655,11 @@ pub fn build_record(
         tokens_by_model,
         models_used,
         actions,
+        source: tick
+            .step_sweep_id
+            .as_ref()
+            .map(|_| crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string()),
+        sweep_id: tick.step_sweep_id.clone(),
     }
 }
 

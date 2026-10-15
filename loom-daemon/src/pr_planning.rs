@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 use crate::comment_trust::TrustPolicy;
 use crate::provenance::origin::WorkOrigin;
 
+mod ci_gate;
+#[cfg(test)]
+mod ci_gate_tests;
 mod listing;
 #[cfg(test)]
 mod tests;
