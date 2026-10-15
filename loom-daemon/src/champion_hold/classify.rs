@@ -18,6 +18,7 @@
 //! | [`PrClass::ForeignPark`] | `loom:blocked`, no standing hold marker | skips the PR: no merge attempt, no comment, no label change |
 //! | [`PrClass::Contradiction`] | `loom:pr` beside `loom:changes-requested` / `loom:review-requested` | the janitor repairs it (strips `loom:pr`) |
 //! | [`PrClass::ChampionHold`] | `loom:blocked` with a standing hold marker | leaves it; criteria #2/#3 decide |
+//! | [`PrClass::StrayOperator`] | a hold, plus a fleet-added `loom:operator` and no capped-hold recommendation | removes `loom:operator`; the hold stands |
 //! | [`PrClass::Clear`] | none of these | the 6 criteria run |
 //!
 //! A foreign park is checked first: a PR another actor parked is theirs, even
@@ -25,10 +26,19 @@
 //! hold (two Judges racing on a held PR) is still repaired, and the hold
 //! survives the repair because `loom:blocked` is never touched.
 //!
+//! A stray operator (#11970) is a hold that a pre-#11888 Champion prompt
+//! re-labelled `loom:operator` (its old LABEL_REPAIR): every role skips that
+//! label, so the approved hold is stranded. Only the fleet's own add is
+//! stray: a human's `loom:operator`, and the capped-hold inbox route (#11905),
+//! are holds for a person and stay ([`classify_operator`]).
+//!
 //! [`merge_failed_marker`] is the second half: the "Merge Failed" notice is
 //! posted at most once per head.
 
-use super::{standing_hold, HoldKind};
+use serde_json::Value;
+
+use super::{capped_hold_routed, standing_hold, HoldKind};
+use crate::work_finder::OPERATOR_HOLD_LABEL;
 
 /// The first token of every `champion-hold classify` stdout line.
 pub const CLASSIFY_SENTINEL: &str = "LOOM-CHAMPION-HOLD";
@@ -52,6 +62,9 @@ pub enum PrClass {
     ForeignPark,
     /// `loom:pr` beside the named verdict label: strip `loom:pr`.
     Contradiction(&'static str),
+    /// Champion's own hold carrying a fleet-added `loom:operator` (#11970):
+    /// remove `loom:operator`, leave the hold.
+    StrayOperator(HoldKind),
 }
 
 impl PrClass {
@@ -63,6 +76,7 @@ impl PrClass {
             PrClass::ChampionHold(_) => "champion-hold",
             PrClass::ForeignPark => "foreign-park",
             PrClass::Contradiction(_) => "contradiction",
+            PrClass::StrayOperator(_) => "stray-operator",
         }
     }
 
@@ -72,8 +86,10 @@ impl PrClass {
     pub fn line(self, pr: u64) -> String {
         let detail = match self {
             PrClass::Contradiction(label) => label,
-            PrClass::ChampionHold(HoldKind::MergeRisk) => "merge-risk",
-            PrClass::ChampionHold(HoldKind::CriticalFile) => "critical-file",
+            PrClass::ChampionHold(HoldKind::MergeRisk)
+            | PrClass::StrayOperator(HoldKind::MergeRisk) => "merge-risk",
+            PrClass::ChampionHold(HoldKind::CriticalFile)
+            | PrClass::StrayOperator(HoldKind::CriticalFile) => "critical-file",
             PrClass::Clear | PrClass::ForeignPark => "-",
         };
         format!("{CLASSIFY_SENTINEL} state={} pr={pr} detail={detail}", self.state())
@@ -110,6 +126,107 @@ pub fn classify<L: AsRef<str>, C: AsRef<str>>(labels: &[L], trusted: &[C]) -> Pr
     hold.map_or(PrClass::Clear, PrClass::ChampionHold)
 }
 
+/// Who added the `loom:operator` standing on a PR (#11970).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorAdder {
+    /// The fleet's own GitHub App: a role, i.e. a stale Champion prompt.
+    Fleet,
+    /// Anyone else: a human (or another App), whose hold it is.
+    Other,
+}
+
+/// The Capped-PR Recovery Pass's close recommendation, which also adds
+/// `loom:operator` for a human (`champion-pr-merge.md`).
+pub const CAPPED_CLOSE_RECOMMENDED_MARKER: &str = "<!-- champion:capped-pr-close-recommended -->";
+
+/// Whether a stray `loom:operator` is possible here, so the label events are
+/// worth reading: `loom:operator` beside a standing trusted Champion hold
+/// (`loom:blocked` + marker) with no capped-hold recommendation after the
+/// marker. That recommendation's `loom:operator` is the operator-inbox route
+/// (#11905), never stray; a close recommendation after the hold is treated the
+/// same way.
+#[must_use]
+pub fn stray_operator_candidate<L: AsRef<str>, C: AsRef<str>>(labels: &[L], trusted: &[C]) -> bool {
+    let hold = trusted.iter().rposition(|c| {
+        let c = c.as_ref();
+        c.starts_with(super::MERGE_RISK_HOLD_MARKER)
+            || c.starts_with(super::CRITICAL_FILE_HOLD_MARKER)
+    });
+    let closing = trusted.iter().enumerate().any(|(i, c)| {
+        hold.is_none_or(|h| i > h) && c.as_ref().starts_with(CAPPED_CLOSE_RECOMMENDED_MARKER)
+    });
+    labels.iter().any(|l| l.as_ref() == OPERATOR_HOLD_LABEL)
+        && crate::work_finder::is_blocked_hold(labels)
+        && standing_hold(trusted).is_some()
+        && !capped_hold_routed(trusted)
+        && !closing
+}
+
+/// Who added the `loom:operator` the PR carries now, from its REST issue
+/// events (oldest first): the actor of the newest `labeled` event for it,
+/// [`OperatorAdder::Fleet`] when `is_fleet` claims the login. `None` when no
+/// such event names an actor: unknown is never the fleet.
+#[must_use]
+pub fn operator_adder(events: &[Value], is_fleet: impl Fn(&str) -> bool) -> Option<OperatorAdder> {
+    let event = events.iter().rev().find(|e| {
+        e.get("event").and_then(Value::as_str) == Some("labeled")
+            && e.pointer("/label/name").and_then(Value::as_str) == Some(OPERATOR_HOLD_LABEL)
+    })?;
+    let login = event
+        .pointer("/actor/login")
+        .and_then(Value::as_str)?
+        .trim();
+    if login.is_empty() {
+        return None;
+    }
+    Some(if is_fleet(login) {
+        OperatorAdder::Fleet
+    } else {
+        OperatorAdder::Other
+    })
+}
+
+/// Who added the PR's standing `loom:operator` (#11970), read live from its
+/// REST issue events through the `gh` facade (every page; counted per page
+/// when the page walk is on), with the fleet's logins
+/// ([`crate::forge_identity::FleetLogins`]) as [`OperatorAdder::Fleet`].
+/// `repo` is `owner/repo` or the `{owner}/{repo}` placeholder. `None` when the
+/// read failed or no event names an actor.
+#[must_use]
+pub fn fetch_operator_adder(repo: &str, pr: u64, root: &std::path::Path) -> Option<OperatorAdder> {
+    use crate::claim_reconciliation::gh_call;
+    let path = format!("repos/{repo}/issues/{pr}/events?per_page=100");
+    let gh = std::path::Path::new("gh");
+    let out = gh_call::ok_stdout(gh_call::read("champion.label_events", gh, root).args([
+        "api",
+        &path,
+        "--paginate",
+    ]))?;
+    let events = crate::comment_trust::parse_listing(&out)?;
+    let fleet = crate::forge_identity::FleetLogins::for_root(root);
+    operator_adder(&events, |login| fleet.contains(login))
+}
+
+/// [`classify`], then (#11970) a Champion hold whose `loom:operator` the fleet
+/// added, with no capped-hold recommendation standing, is
+/// [`PrClass::StrayOperator`]. `adder` is `None` when the events were not read
+/// or named no actor: the hold is left as it is.
+#[must_use]
+pub fn classify_operator<L: AsRef<str>, C: AsRef<str>>(
+    labels: &[L],
+    trusted: &[C],
+    adder: Option<OperatorAdder>,
+) -> PrClass {
+    match classify(labels, trusted) {
+        PrClass::ChampionHold(kind)
+            if adder == Some(OperatorAdder::Fleet) && stray_operator_candidate(labels, trusted) =>
+        {
+            PrClass::StrayOperator(kind)
+        }
+        class => class,
+    }
+}
+
 /// The marker a "Merge Failed" notice for `head` opens with.
 #[must_use]
 pub fn merge_failed_marker(head: &str) -> String {
@@ -132,7 +249,8 @@ pub fn merge_failed_notice_due<C: AsRef<str>>(trusted: &[C], head: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::super::{
-        CRITICAL_FILE_HOLD_MARKER, MERGE_RISK_CLEARED_MARKER, MERGE_RISK_HOLD_MARKER,
+        CAPPED_HOLD_RECOMMENDATION_MARKER, CRITICAL_FILE_HOLD_MARKER, MERGE_RISK_CLEARED_MARKER,
+        MERGE_RISK_HOLD_MARKER,
     };
     use super::*;
 
@@ -140,6 +258,113 @@ mod tests {
 
     fn hold() -> String {
         format!("{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head=abc -->")
+    }
+
+    const STRANDED: [&str; 3] = ["loom:pr", "loom:blocked", "loom:operator"];
+
+    fn fleet(login: &str) -> bool {
+        login == "loom-fleet-dispatch[bot]"
+    }
+
+    fn labeled(name: &str, login: &str) -> Value {
+        serde_json::json!({"event": "labeled", "label": {"name": name}, "actor": {"login": login}})
+    }
+
+    #[test]
+    fn a_fleet_added_operator_on_a_hold_is_stray() {
+        assert_eq!(
+            classify_operator(&STRANDED, &[hold()], Some(OperatorAdder::Fleet)),
+            PrClass::StrayOperator(HoldKind::MergeRisk)
+        );
+        // A hold out at Doctor is stranded the same way.
+        let doctor = ["loom:changes-requested", "loom:blocked", "loom:operator"];
+        assert_eq!(
+            classify_operator(&doctor, &[hold()], Some(OperatorAdder::Fleet)),
+            PrClass::StrayOperator(HoldKind::MergeRisk)
+        );
+        let cf = format!("{CRITICAL_FILE_HOLD_MARKER}\nheld");
+        assert_eq!(
+            classify_operator(&STRANDED, &[cf], Some(OperatorAdder::Fleet)).line(7),
+            "LOOM-CHAMPION-HOLD state=stray-operator pr=7 detail=critical-file"
+        );
+    }
+
+    #[test]
+    fn a_human_added_operator_is_left_alone() {
+        for adder in [Some(OperatorAdder::Other), None] {
+            assert_eq!(
+                classify_operator(&STRANDED, &[hold()], adder),
+                PrClass::ChampionHold(HoldKind::MergeRisk),
+                "{adder:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_capped_hold_route_is_left_alone() {
+        let rec = format!("{CAPPED_HOLD_RECOMMENDATION_MARKER}\nreview, close or release");
+        let trusted = [hold(), rec.clone()];
+        assert!(!stray_operator_candidate(&STRANDED, &trusted));
+        assert_eq!(
+            classify_operator(&STRANDED, &trusted, Some(OperatorAdder::Fleet)),
+            PrClass::ChampionHold(HoldKind::MergeRisk)
+        );
+        // A recommendation from an earlier hold episode routes nothing now.
+        assert!(stray_operator_candidate(&STRANDED, &[rec, hold()]));
+        // Nor is a close recommendation's loom:operator stray.
+        let close = format!("{CAPPED_CLOSE_RECOMMENDED_MARKER}\nrecommend closing");
+        assert!(!stray_operator_candidate(&STRANDED, &[hold(), close]));
+    }
+
+    #[test]
+    fn no_hold_or_no_operator_is_never_stray() {
+        let f = Some(OperatorAdder::Fleet);
+        // No standing marker: another actor's park, whoever added the label.
+        assert_eq!(classify_operator(&STRANDED, &NONE, f), PrClass::ForeignPark);
+        // No loom:blocked: the pre-#11861 shape, the migration's to move.
+        assert_eq!(classify_operator(&["loom:pr", "loom:operator"], &[hold()], f), PrClass::Clear);
+        // No loom:operator: just the hold.
+        assert_eq!(
+            classify_operator(&["loom:pr", "loom:blocked"], &[hold()], f),
+            PrClass::ChampionHold(HoldKind::MergeRisk)
+        );
+        // A contradiction is repaired first.
+        let both = [
+            "loom:pr",
+            "loom:review-requested",
+            "loom:blocked",
+            "loom:operator",
+        ];
+        assert_eq!(
+            classify_operator(&both, &[hold()], f),
+            PrClass::Contradiction("loom:review-requested")
+        );
+    }
+
+    #[test]
+    fn the_adder_is_the_newest_operator_labeled_event() {
+        let bot = "loom-fleet-dispatch[bot]";
+        let events = [
+            labeled("loom:operator", "a-human"),
+            serde_json::json!({"event": "unlabeled", "label": {"name": "loom:operator"}, "actor": {"login": "a-human"}}),
+            labeled("loom:operator", bot),
+            labeled("loom:blocked", "a-human"),
+        ];
+        assert_eq!(operator_adder(&events, fleet), Some(OperatorAdder::Fleet));
+        let events = [
+            labeled("loom:operator", bot),
+            labeled("loom:operator", "a-human"),
+        ];
+        assert_eq!(operator_adder(&events, fleet), Some(OperatorAdder::Other));
+        // Another App is not the fleet.
+        let events = [labeled("loom:operator", "some-other-app[bot]")];
+        assert_eq!(operator_adder(&events, fleet), Some(OperatorAdder::Other));
+        // No event, or no actor (a deleted account): unknown, never the fleet.
+        assert_eq!(operator_adder(&[labeled("loom:blocked", bot)], fleet), None);
+        let ghost = [
+            serde_json::json!({"event": "labeled", "label": {"name": "loom:operator"}, "actor": null}),
+        ];
+        assert_eq!(operator_adder(&ghost, fleet), None);
     }
 
     #[test]
