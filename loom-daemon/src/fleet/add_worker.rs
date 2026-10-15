@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use super::path_bootstrap;
-mod egress;
+mod forge_auth;
 use super::{
     all_succeeded, default_fleet_registry_path, execute_plan, render_checklist, CommandOutput,
     CommandRunner, FleetRegistry, Plan, Step, StepStatus, StepStdin, VerifyResult, WorkerRecord,
@@ -118,9 +118,9 @@ pub struct AddWorkerConfig {
     /// Workspace repos to clone + register on the worker (`owner/name`). At
     /// least one is required.
     pub repos: Vec<String>,
-    /// Cross-repo dispatch priority the workspaces are registered at (#3946;
-    /// lower = higher priority).
-    pub priority: u32,
+    /// Cross-repo draw weight the workspaces are registered at (#11742;
+    /// higher = more draws).
+    pub weight: u32,
     /// Print the ordered plan without contacting the host.
     pub dry_run: bool,
     /// Upstream Loom repo URL to clone on the worker.
@@ -597,15 +597,6 @@ pub fn ensure_supported_platform(runner: &dyn CommandRunner, ssh_host: &str) -> 
 /// `check` phase is what makes a re-run idempotent (AC 2).
 #[must_use]
 pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
-    build_plan_with_policy(config, secrets, None)
-}
-
-#[must_use]
-pub fn build_plan_with_policy(
-    config: &AddWorkerConfig,
-    secrets: &Secrets,
-    egress: Option<&egress::EgressProvisioning>,
-) -> Plan {
     let mut plan = Plan::new();
     let primary_rel = workspace_rel(&config.repos[0]);
 
@@ -646,9 +637,8 @@ pub fn build_plan_with_policy(
         render_claude_code(),
     ));
 
-    // 4. Forge auth (PAT over stdin; policy-governed hosts store none, #10050).
-    egress::push_forge_auth(&mut plan, secrets.pat.as_ref(), egress);
-    egress.inspect(|p| egress::push_toolchain_steps(&mut plan, p)); // 4b (#10050)
+    // 4. Forge auth (PAT over stdin).
+    forge_auth::push_forge_auth(&mut plan, secrets.pat.as_ref());
 
     // 5. Token pool: full account pool (#3979 decision — no pinned subsets).
     //    5a. Install accounts.env (secret, over stdin, 0600).
@@ -703,9 +693,9 @@ pub fn build_plan_with_policy(
     // 7. Register workspaces in the machine-level registry (idempotent).
     plan.push_step(Step::new(
         "workspace-register",
-        &format!("loom-daemon workspace add each repo (priority {})", config.priority),
+        &format!("loom-daemon workspace add each repo (weight {})", config.weight),
         Some(render_workspace_register_check(&config.repos)),
-        render_workspace_register(&config.repos, config.priority),
+        render_workspace_register(&config.repos, config.weight),
     ));
 
     // 8. Start the daemon under a systemd --user unit (Restart=always, linger).
@@ -716,12 +706,9 @@ pub fn build_plan_with_policy(
         render_daemon_unit(&primary_rel),
     ));
 
-    // 8b. Watchdog timer (#5343): `daemon-unit` above hand-renders the systemd
-    //     unit directly, never calling loom-daemon-start.sh, so its
-    //     watchdog-provisioning branch never runs on THIS path -- the root
-    //     cause of the "autonomy-desired marker present, watchdog job
-    //     missing" gap discovered on loom-worker-2. See
-    //     render_daemon_watchdog's doc comment for how this step closes it.
+    // 8b. Watchdog timer (#5343) via `--heal-watchdog-only`, which must never
+    //     replace the fleet unit above. See
+    //     render_daemon_watchdog's doc comment.
     plan.push_step(Step::new(
         "daemon-watchdog",
         "provision the loom-daemon-watchdog systemd --user timer (#5343)",
@@ -767,8 +754,6 @@ pub fn build_plan_with_policy(
         None,
         render_verify(&primary_rel, &config.repos),
     ));
-
-    egress.inspect(|_| egress::push_doctor_step(&mut plan, &primary_rel)); // 12 (#10050)
 
     plan
 }
@@ -912,7 +897,7 @@ fn build_worker_record(
     WorkerRecord {
         ssh_host: config.ssh_host.clone(),
         repos: config.repos.clone(),
-        priority: config.priority,
+        weight: config.weight,
         bootstrapped_at: now_str.clone(),
         last_verify: verify_ok.map(|ok| VerifyResult {
             ok,
@@ -960,10 +945,9 @@ fn build_worker_record(
 /// before a single `apt-get`/`systemd` step is rendered, let alone run.
 pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let secrets = preflight(config)?;
-    let egress = egress::load_for_operator_from_process()?; // fails closed (#10050)
 
     if config.dry_run {
-        let plan = build_plan_with_policy(config, &secrets, egress.as_ref());
+        let plan = build_plan(config, &secrets);
         print!("{}", plan.render_dry_run("fleet add-worker", &config.ssh_host));
         println!(
             "\n(dry run — no action taken on {}. Re-run without --dry-run to execute.)",
@@ -980,7 +964,7 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let runner = SshRunner::new(&config.ssh_host);
     ensure_supported_platform(&runner, &config.ssh_host)?;
 
-    let plan = build_plan_with_policy(config, &secrets, egress.as_ref());
+    let plan = build_plan(config, &secrets);
     let reports = execute_plan(&runner, &plan);
     print!("{}", render_checklist("fleet add-worker", &config.ssh_host, &reports));
 
@@ -1238,7 +1222,7 @@ fn render_workspace_register_check(repos: &[String]) -> String {
     s
 }
 
-fn render_workspace_register(repos: &[String], priority: u32) -> String {
+fn render_workspace_register(repos: &[String], weight: u32) -> String {
     let export_line = path_bootstrap::canonical_path_export_line();
     let mut s = format!(
         r#"set -e
@@ -1246,7 +1230,7 @@ fn render_workspace_register(repos: &[String], priority: u32) -> String {
     );
     for repo in repos {
         let rel = workspace_rel(repo);
-        s.push_str(&format!("loom-daemon workspace add \"$HOME/{rel}\" --priority {priority}\n"));
+        s.push_str(&format!("loom-daemon workspace add \"$HOME/{rel}\" --weight {weight}\n"));
     }
     s
 }
@@ -1312,38 +1296,42 @@ systemctl --user enable --now loom-daemon.service
     )
 }
 
-/// Provision the `loom-daemon-watchdog.timer` (#5343) by re-running the
-/// already-cloned `loom-daemon-start.sh` from the workspace root
-/// `render_daemon_unit` just (re)started the daemon under.
+/// Provision the `loom-daemon-watchdog.timer` (#5343) WITHOUT re-rendering the
+/// daemon unit `render_daemon_unit` just installed.
 ///
-/// `daemon-unit` above hand-renders the systemd unit directly (its own
-/// `cat > ... <<'UNIT'` heredoc + `systemctl --user enable --now`) instead of
-/// calling `loom-daemon-start.sh` — so that script's own
-/// `provision_watchdog_job_systemd` call, which normally arms the watchdog on
-/// every fresh start, never runs on this path. That gap is exactly what left
-/// `loom-worker-2` with the `autonomy-desired` marker present (written by the
-/// daemon's own startup healing, `autonomy_marker.rs`, #4331, once it saw
-/// `LOOM_DAEMON_SUPERVISOR=systemd`) but no watchdog job ever provisioned.
+/// `daemon-unit` hand-renders the fleet unit, so `loom-daemon-start.sh`'s own
+/// watchdog provisioning never runs on this path; this step closes that gap by
+/// reusing the shell-side provisioner rather than a second Rust renderer.
 ///
-/// Rather than duplicating the watchdog unit/timer rendering a SECOND time in
-/// Rust (drifting from the shell version is exactly the kind of two-copy bug
-/// this codebase avoids elsewhere, e.g. `canonical-daemon-path.sh` / #4831),
-/// this step re-runs `loom-daemon-start.sh` itself. By the time this step
-/// executes, `daemon-unit` has already started the daemon, so
-/// `loom-daemon-start.sh`'s "already running" guard fires — and its #5343
-/// self-heal (`heal_watchdog_provisioning_gap`) provisions the missing
-/// watchdog timer WITHOUT touching the running daemon, exactly mirroring what
-/// an operator re-running the same script by hand would do. Idempotent on a
-/// re-run: `provision_watchdog_job_systemd`'s own `enable --now` on an
-/// already-active timer is a verified no-op (#4862), and this step's own
-/// `check` (`systemctl --user is-enabled loom-daemon-watchdog.timer`) reports
-/// `AlreadyDone` once the timer is provisioned.
+/// It MUST pass `--heal-watchdog-only` (#5405). A bare `loom-daemon-start.sh`
+/// was meant to hit the "already running" guard and heal only the watchdog,
+/// but that guard reads `<workspace>/.loom/.daemon.pid`, while a daemon started
+/// by the fleet unit (no `LOOM_PID_FILE`, no `LOOM_WORKSPACE`) claims
+/// `~/.loom/.daemon.pid`. The guard therefore never fired: the script ran a
+/// full FLAGS-OFF start and REPLACED the fleet unit with the canonical render,
+/// which bakes the start's own process env into `Environment=` lines --
+/// `LOOM_WORK_FINDER=0`, `LOOM_MAIN_HEALTH_GATE=0`, `LOOM_FORCE_SCOPE`,
+/// `LOOM_GUARD_DECISION_LOG`, `LOOM_PID_FILE`, `LOOM_WORKSPACE`,
+/// `LOOM_START_ARGV0` -- and env outranks the fleet config, so the worker came
+/// up with its work finder pinned off.
+///
+/// `--heal-watchdog-only` never touches the pid file, the daemon or its unit,
+/// but it is a no-op until the autonomy-desired marker exists, and the daemon
+/// writes that marker itself shortly after `enable --now` (#4331). So the step
+/// waits for the marker (bounded), heals, and then fails loudly if the timer is
+/// still not enabled rather than reporting success for a no-op.
 fn render_daemon_watchdog(primary_rel: &str) -> String {
     let export_line = path_bootstrap::canonical_path_export_line();
     format!(
         r#"set -e
 {export_line}cd "$HOME/{primary_rel}"
-"$HOME/.local/share/loom/defaults/scripts/cli/loom-daemon-start.sh"
+MARKER="${{LOOM_AUTONOMY_MARKER:-$HOME/.loom/autonomy-desired}}"
+for _ in $(seq 1 60); do [ -e "$MARKER" ] && break; sleep 1; done
+"$HOME/.local/share/loom/defaults/scripts/cli/loom-daemon-start.sh" --heal-watchdog-only
+systemctl --user is-enabled loom-daemon-watchdog.timer >/dev/null 2>&1 || {{
+  echo "loom-daemon-watchdog.timer not provisioned (marker $MARKER present: $([ -e "$MARKER" ] && echo yes || echo no))" >&2
+  exit 1
+}}
 "#
     )
 }
@@ -1707,6 +1695,11 @@ mod feed_egress_tests;
 // reason.
 #[cfg(test)]
 mod invoker_tests;
+
+// The fleet unit carries no harvested env, same reason.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod unit_env_tests;
 
 // #9064: verify-script `status` exit-code handling, same reason.
 #[cfg(test)]

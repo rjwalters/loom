@@ -4,6 +4,7 @@
 
 mod activity;
 mod dirty_probe;
+mod forge_comments;
 mod reset_quarantine;
 
 use super::*;
@@ -818,7 +819,7 @@ pub(crate) fn scan_stale_sweep_findings<'a>(
     entries
         .filter(|(id, info)| {
             matches!(info.state, SweepState::Running | SweepState::Pending)
-                && matches!(info.kind, SweepKind::Issue(_))
+                // The kind is matched exhaustively below (#11898).
                 // The complement of the other two watchdogs' eligibility
                 // gate: ONLY sweeps this daemon instance did not itself
                 // spawn are candidates here, so nothing is ever
@@ -827,8 +828,12 @@ pub(crate) fn scan_stale_sweep_findings<'a>(
                 && !is_own_child(id)
         })
         .filter_map(|(id, info)| {
-            let SweepKind::Issue(issue) = info.kind else {
-                return None;
+            let issue = match info.kind {
+                SweepKind::Issue(issue) => issue,
+                // A step's liveness is its claim (`stale_after_minutes`, the
+                // lease); a dead one is restored by the reaper (#11898). This
+                // backstop's remedy is an issue-sweep recovery, so not here.
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => return None,
             };
             if !is_pid_alive(info.pid) {
                 // Already dead: the ordinary reaper's dead-pid path
@@ -838,10 +843,20 @@ pub(crate) fn scan_stale_sweep_findings<'a>(
                 return None;
             }
             let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
+            if elapsed < min_age {
+                // Too young to judge; skip the (possibly costly) probes below.
+                return None;
+            }
             // #9533: log mtime alone is not liveness (headless sweeps
-            // write nothing to it); fold in the session transcripts.
-            let log_idle =
-                activity::sweep_idle(&info.log_path, workspace_root, issue, log_silence_timeout);
+            // write nothing to it); fold in transcripts, worktree writes,
+            // and the agent's tool processes.
+            let log_idle = activity::sweep_idle(
+                &info.log_path,
+                workspace_root,
+                issue,
+                info.pid,
+                log_silence_timeout,
+            );
             if !is_stale_untracked_sweep(elapsed, min_age, log_idle, log_silence_timeout) {
                 return None;
             }
@@ -952,8 +967,11 @@ impl SweepRegistry {
             .iter()
             .filter(|(_, info)| matches!(info.state, SweepState::Running | SweepState::Pending))
             .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
+                // A step holds its item's slot like a sweep holds its issue's
+                // (#11898): both draw from the same `maxConcurrent`.
+                let issue = match info.kind {
+                    SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => n,
+                    SweepKind::PrSet(_) => return None,
                 };
                 let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
                 Some((id.clone(), issue, info.log_path.clone(), elapsed))
@@ -984,8 +1002,9 @@ impl SweepRegistry {
             .iter()
             .filter(|(_, info)| matches!(info.state, SweepState::Running | SweepState::Pending))
             .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
+                let issue = match info.kind {
+                    SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => n,
+                    SweepKind::PrSet(_) => return None,
                 };
                 if self.watchdog_progressed.contains(id)
                     || self.sweep_made_progress(issue, &info.log_path)
@@ -1021,13 +1040,15 @@ impl SweepRegistry {
             .iter()
             .filter(|(id, info)| {
                 matches!(info.state, SweepState::Running | SweepState::Pending)
-                    && matches!(info.kind, SweepKind::Issue(_))
                     // Only sweeps we spawned (own the Child handle) are cancelable.
                     && self.children.contains_key(*id)
             })
             .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
+                let issue = match info.kind {
+                    SweepKind::Issue(issue) => issue,
+                    // The restart re-dispatches `/loom:sweep N`; a hung step is
+                    // left to its claim's staleness and the reaper (#11898).
+                    SweepKind::Step { .. } | SweepKind::PrSet(_) => return None,
                 };
                 let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
                 Some((id.clone(), issue, info.log_path.clone(), elapsed))
@@ -1138,67 +1159,6 @@ impl SweepRegistry {
             }
         }
         restarts
-    }
-
-    /// Best-effort forge comment when the startup watchdog gives up (Issue
-    /// #5302): the bounded auto-restart (#3887) already retried this issue's
-    /// sweep exactly once and it is still stuck, so nothing further will
-    /// happen automatically until an operator acts. Before this, "giving up"
-    /// meant only a `log::error!` line — invisible unless someone was
-    /// tailing the daemon log at the moment it fired. Mirrors
-    /// [`SweepRegistry::apply_quarantine_label`]'s "post a comment so the
-    /// pause is visible to a human on the forge, not just in the daemon
-    /// log" pattern.
-    ///
-    /// Called from exactly one call site, already inside the
-    /// `self.watchdog_gaveup.insert(issue)` dedup guard [`watchdog_once`]
-    /// uses to log the give-up once — so this posts at most one comment per
-    /// issue no matter how many subsequent ticks re-observe the same
-    /// give-up (the same dedup fixture the existing
-    /// `watchdog_restarts_hung_sweep_once_then_gives_up` test already
-    /// exercises for the log line).
-    ///
-    /// Skipped when label flips are disabled (test fixtures /
-    /// `skip_label_flip`), matching every other best-effort forge mutation
-    /// in this registry. Every step is best-effort: a `gh` failure only logs
-    /// (at `warn`, not `debug` — a silently-dropped give-up notice defeats
-    /// the whole point of this method), it never affects the load-bearing
-    /// `watchdog_gaveup` dedup state, which the caller already committed
-    /// before this runs.
-    fn post_watchdog_gaveup_comment(&self, issue: u32, elapsed: Duration) {
-        if self.config.skip_label_flip {
-            return;
-        }
-        let body = format!(
-            "{marker}: this issue's sweep made no progress for {elapsed_secs}s, exhausted its \
-             one bounded auto-restart (#3887), and is still stuck — the daemon has stopped \
-             retrying and left it running for operator triage rather than looping forever. \
-             Investigate the sweep log, then either cancel the stuck sweep and re-dispatch the \
-             issue, or investigate the underlying hang (e.g. an MCP-init race, #3887). This \
-             issue remains held at `loom:building` until you act.",
-            marker = WATCHDOG_GAVEUP_COMMENT_MARKER,
-            elapsed_secs = elapsed.as_secs(),
-        );
-        // Counted as `watchdog.gaveup_comment` (#10089), scoped to the
-        // workspace (#5401 GH_CONFIG_DIR).
-        let issue_arg = issue.to_string();
-        let mut comment = vec!["issue", "comment", &issue_arg, "--body", &body];
-        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
-        comment.extend(repo_flag.iter().map(String::as_str));
-        let timeout = reap_gh_timeout();
-        match self.gh_write("watchdog.gaveup_comment", comment) {
-            Ok(Some(output)) if output.status.success() => {}
-            Ok(Some(output)) => log::warn!(
-                "watchdog: give-up comment for #{issue} exited {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Ok(None) => log::warn!(
-                "watchdog: give-up comment for #{issue} exceeded {}s, killed (#3973)",
-                timeout.as_secs()
-            ),
-            Err(e) => log::warn!("watchdog: give-up comment for #{issue} failed: {e}"),
-        }
     }
 
     // ------------------------------------------------------------------------
@@ -1545,7 +1505,8 @@ impl SweepRegistry {
     /// issued after the reaper restored `loom:issue` (Issue #3895).
     pub(crate) fn issue_has_active_sweep(&self, issue: u32) -> bool {
         self.entries.values().any(|i| {
-            matches!(i.kind, SweepKind::Issue(n) if n == issue)
+            // A live issue step on it is as good as a sweep (#11898).
+            i.kind.issue_number() == Some(issue)
                 && matches!(i.state, SweepState::Running | SweepState::Pending)
         })
     }
@@ -1606,14 +1567,11 @@ impl SweepRegistry {
         let candidates: Vec<(SweepId, u32)> = self
             .entries
             .iter()
-            .filter(|(_, info)| {
-                info.state.is_terminal()
-                    && matches!(info.kind, SweepKind::Issue(_))
-                    && info.pr_number.is_none()
-            })
+            .filter(|(_, info)| info.state.is_terminal() && info.pr_number.is_none())
             .filter_map(|(id, info)| match info.kind {
                 SweepKind::Issue(issue) => Some((id.clone(), issue)),
-                SweepKind::PrSet(_) => None,
+                // A step's recovery is its claim restore, not a re-dispatch.
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect();
 
@@ -1898,8 +1856,9 @@ impl SweepRegistry {
     /// The daemon redirects each child's stdout/stderr to `log_path`, but a
     /// headless (`claude -p`) sweep writes nothing there while it works, so
     /// this is **not** a liveness signal on its own (#9533). The watchdogs
-    /// judge [`activity::sweep_idle`] instead, which also folds in the session
-    /// transcripts' mtimes; this is only the log-file input to it.
+    /// judge [`activity::sweep_idle`] instead, which also folds in session
+    /// transcripts, worktree writes, and the agent's tool processes; this is
+    /// only the log-file input to it.
     ///
     /// Returns `None` when the file is missing or its mtime is unreadable / in
     /// the future (clock skew) — callers treat `None` as "cannot assess, leave
@@ -1950,45 +1909,39 @@ impl SweepRegistry {
     pub fn review_stall_watchdog_once(&mut self, timeout: Duration) -> usize {
         // Snapshot eligible candidates first so we can mutate below (mirrors
         // `watchdog_once`).
-        let candidates: Vec<(SweepId, u32, PathBuf)> = self
+        let candidates: Vec<(SweepId, u32, u32, PathBuf)> = self
             .entries
             .iter()
             .filter(|(id, info)| {
                 matches!(info.state, SweepState::Running | SweepState::Pending)
-                    && matches!(info.kind, SweepKind::Issue(_))
                     // Only sweeps we spawned (own the Child handle) are cancelable.
                     && self.children.contains_key(*id)
             })
-            .filter_map(|(id, info)| match info.kind {
-                SweepKind::Issue(issue) => Some((id.clone(), issue, info.log_path.clone())),
-                SweepKind::PrSet(_) => None,
+            .filter_map(|(id, i)| match i.kind {
+                SweepKind::Issue(n) => Some((id.clone(), n, i.pid, i.log_path.clone())),
+                // A review-stalled step is one Judge/Doctor session: its claim
+                // goes stale and the reaper restores it (#11898).
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect();
 
         let mut restarts = 0usize;
-        for (sweep_id, issue, log_path) in candidates {
+        for (sweep_id, issue, pid, log_path) in candidates {
             // Gate to sweeps past startup: a sweep that has made NO progress is
             // the #3887 startup watchdog's job, not ours. This keeps the two
             // backstops disjoint on any given tick.
             if !self.sweep_made_progress(issue, &log_path) {
                 continue;
             }
-            // No readable signal ⇒ cannot assess ⇒ leave alone. Log mtime AND
-            // session-transcript mtime (#9533): headless sweeps don't log.
+            // No readable signal ⇒ cannot assess ⇒ leave alone. Log mtime,
+            // session transcripts, worktree writes, and the agent's tool
+            // processes (#9533): headless sweeps don't log.
             let Some(idle) =
-                activity::sweep_idle(&log_path, &self.config.workspace_root, issue, timeout)
+                activity::sweep_idle(&log_path, &self.config.workspace_root, issue, pid, timeout)
             else {
                 continue;
             };
-            let phase = activity::phase_label(
-                reaper::read_checkpoint_phase(
-                    &self
-                        .config
-                        .checkpoint_dir()
-                        .join(format!("issue-{issue}.json")),
-                )
-                .as_deref(),
-            );
+            let phase = activity::checkpoint_phase_label(&self.config.checkpoint_dir(), issue);
             let already_retried = self.review_stall_retried.contains(&issue);
             match review_stall_decision(idle, timeout, already_retried) {
                 WatchdogDecision::Healthy => {}
@@ -1996,9 +1949,9 @@ impl SweepRegistry {
                     if self.review_stall_gaveup.insert(issue) {
                         log::error!(
                             "review-stall-watchdog: {phase} for issue #{issue} ({sweep_id}) \
-                             stalled again (no log or session activity for {}s) after an \
-                             auto-restart — giving up (bounded to one retry). Operator \
-                             intervention needed: it appears wedged; inspect \
+                             stalled again (no log/session/worktree/tool-process activity \
+                             for {}s) after an auto-restart — giving up (bounded to one \
+                             retry). Operator intervention needed: it appears wedged; inspect \
                              .loom/logs/sweep-issue-{issue}.log, then cancel + re-dispatch (#3910).",
                             idle.as_secs()
                         );
@@ -2026,9 +1979,9 @@ impl SweepRegistry {
                     }
                     log::warn!(
                         "review-stall-watchdog: {phase} for issue #{issue} ({sweep_id}) showed no \
-                         log or session activity in {}s despite making startup progress — looks \
-                         hung; auto-cancelling and re-dispatching once. The re-dispatch resumes \
-                         from the sweep checkpoint (#3910).",
+                         log/session/worktree/tool-process activity in {}s despite making startup \
+                         progress — looks hung; auto-cancelling and re-dispatching once. The \
+                         re-dispatch resumes from the sweep checkpoint (#3910).",
                         idle.as_secs()
                     );
                     // Capture re-dispatch params from the wedged entry BEFORE
@@ -2282,50 +2235,6 @@ impl SweepRegistry {
             }
         }
         reaped
-    }
-
-    /// Best-effort forge comment when the stale-sweep backstop reaps an
-    /// untracked sweep (Issue #7529) — mirrors
-    /// [`post_watchdog_gaveup_comment`](Self::post_watchdog_gaveup_comment)'s
-    /// "make the daemon-log-only fact visible on the forge" pattern, except
-    /// this backstop already acted (restored `loom:issue`) rather than
-    /// leaving the issue held.
-    fn post_stale_sweep_comment(&self, finding: &StaleSweepFinding) {
-        if self.config.skip_label_flip {
-            return;
-        }
-        let body = format!(
-            "{marker}: this issue's sweep (pid {pid}) had been running {elapsed_secs}s with its \
-             log silent and no daemon-retained process handle for it — a sweep that survived a \
-             prior daemon restart, which strips it of coverage from both the startup-hang \
-             (#3887) and review-stall (#3910) watchdogs (#7529). The daemon has cancelled the \
-             process and restored `loom:issue` so this issue can be re-dispatched.",
-            marker = STALE_SWEEP_COMMENT_MARKER,
-            pid = finding.pid,
-            elapsed_secs = finding.elapsed.as_secs(),
-        );
-        let issue_arg = finding.issue.to_string();
-        let mut comment = vec!["issue", "comment", &issue_arg, "--body", &body];
-        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
-        comment.extend(repo_flag.iter().map(String::as_str));
-        let timeout = reap_gh_timeout();
-        match self.gh_write("watchdog.stale_comment", comment) {
-            Ok(Some(output)) if output.status.success() => {}
-            Ok(Some(output)) => log::warn!(
-                "stale-sweep-watchdog: reap comment for #{} exited {:?}: {}",
-                finding.issue,
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Ok(None) => log::warn!(
-                "stale-sweep-watchdog: reap comment for #{} exceeded {}s, killed (#3973)",
-                finding.issue,
-                timeout.as_secs()
-            ),
-            Err(e) => {
-                log::warn!("stale-sweep-watchdog: reap comment for #{} failed: {e}", finding.issue)
-            }
-        }
     }
 }
 

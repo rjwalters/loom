@@ -1,5 +1,4 @@
-//! The one `gh` spawn choke point (#9985, part of the forge egress policy
-//! epic #9983, 2am#1911 P3).
+//! The one `gh` spawn choke point (#9985).
 //!
 //! # Why
 //!
@@ -87,8 +86,8 @@ pub const TARGET_ATTR_MAX: usize = 100;
 
 /// Whether an invocation reads or mutates forge state.
 ///
-/// Carried so the egress policy (C1) and the managed launcher (C4) can apply
-/// different routing to writes, and so telemetry can separate them.
+/// Carried so routing can treat writes differently, and so telemetry can
+/// separate them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessIntent {
     Read,
@@ -336,6 +335,10 @@ pub struct GhInvocation {
     /// (`facade.cwd_route.disagree`), so its accounting row must not count
     /// it again (one counter, one count per call).
     disagree_counted: bool,
+    /// Never route this read through the forge gateway (2am#4367 P4): the
+    /// fleet store fetch, which must work while the gateway is broken so the
+    /// gateway can be unset ([`GhInvocation::gateway_exempt`]).
+    gateway_exempt: bool,
 }
 
 impl GhInvocation {
@@ -369,6 +372,7 @@ impl GhInvocation {
             route_slug: None,
             read_class: ReadClass::Gate,
             disagree_counted: false,
+            gateway_exempt: false,
         }
     }
 
@@ -478,6 +482,21 @@ impl GhInvocation {
     pub fn strip_env(mut self, key: &'static str) -> Self {
         self.stripped_env.push(key);
         self
+    }
+
+    /// Keep this read off the forge gateway (2am#4367 P4); reader Apps and
+    /// the writer route exactly as before. For a read the gateway's own
+    /// break-glass depends on — the `fleet.json` fetch that can unset it.
+    #[must_use]
+    pub fn gateway_exempt(mut self) -> Self {
+        self.gateway_exempt = true;
+        self
+    }
+
+    /// Whether [`GhInvocation::gateway_exempt`] was set (tests).
+    #[cfg(test)]
+    pub(crate) fn is_gateway_exempt(&self) -> bool {
+        self.gateway_exempt
     }
 
     /// Keep this read on the writer credential (#9872): for a read whose
@@ -705,8 +724,11 @@ impl GhInvocation {
         if let Some(routed) = test_routing::run(&self) {
             return routed;
         }
-        let lookup = |req: &crate::forge_identity::RouteRequest<'_>| {
-            crate::forge_identity::route_read(req, std::time::SystemTime::now())
+        // 2am#4367 P4: the gateway profile first (a no-op while
+        // `forge.gateway` is unset), unless the site opted out.
+        let route = read_router(self.gateway_exempt);
+        let lookup = move |req: &crate::forge_identity::RouteRequest<'_>| {
+            route(req, std::time::SystemTime::now())
         };
         // `LOOM_READ_ROUTING=legacy`: the pre-W4-C path exactly — no
         // derivation, no read class, the unconditional writer fallback.
@@ -831,3 +853,20 @@ mod migrated_sites_tests_d;
 #[cfg(test)]
 #[path = "migrated_sites_tests_e.rs"]
 mod migrated_sites_tests_e;
+
+/// The read router an execution uses (2am#4367 P4): the forge gateway first
+/// ([`crate::forge_gateway::route_read`]), or — for a
+/// [`GhInvocation::gateway_exempt`] site — the reader pool alone, exactly as
+/// before the gateway existed.
+pub(crate) fn read_router(
+    gateway_exempt: bool,
+) -> fn(
+    &crate::forge_identity::RouteRequest<'_>,
+    std::time::SystemTime,
+) -> crate::forge_identity::RouteDecision {
+    if gateway_exempt {
+        crate::forge_identity::route_read
+    } else {
+        crate::forge_gateway::route_read
+    }
+}

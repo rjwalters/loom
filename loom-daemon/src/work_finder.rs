@@ -18,7 +18,7 @@
 //! 2. Filters out issues that are **already in flight** (present in the
 //!    [`SweepRegistry`](crate::sweep_registry::SweepRegistry) as a `Running` /
 //!    `Pending` sweep) or that defensively carry any [`SKIP_LABELS`] entry
-//!    (`loom:building` / `loom:blocked` / `loom:operator-only`).
+//!    (`loom:building` / `loom:blocked` / `loom:operator`).
 //! 3. For each remaining issue, dispatches through the existing
 //!    [`SweepRegistry::dispatch`](crate::sweep_registry::SweepRegistry::dispatch)
 //!    path — up to a **work-driven** max-concurrency cap recomputed every tick
@@ -234,12 +234,15 @@ pub mod dispatch_plan;
 pub mod dispatch_plan_merge;
 pub mod halt_cause;
 mod labels;
+pub mod landed_prefilter;
+pub mod main_red_autofile;
 pub mod main_red_fix;
 pub mod open_pr_prefilter;
 pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
 mod recheck_interval;
+pub mod step_item;
 mod tick_line;
 mod tick_report;
 mod tick_summary;
@@ -247,7 +250,7 @@ mod tracking_parent;
 pub mod vi_cap;
 pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
-pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
+pub use labels::*;
 pub use main_red_fix::RedMainLane;
 pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};
@@ -377,14 +380,14 @@ impl WorkItem {
                 .any(|l| extra_skip_labels.iter().any(|e| e == l))
     }
 
-    /// How the capability-aware `loom:operator-mechanical` lane (#6893) routes
-    /// this item, given the capabilities this worker declares it holds.
+    /// How the capability lane (#6893) routes this item, given the capabilities
+    /// this worker declares it holds.
     ///
     /// A thin adapter over [`crate::capability::route_mechanical`] — the labels
     /// and body already fetched by the listing, no extra forge read. Returns
     /// [`MechanicalRouting::NotApplicable`](crate::capability::MechanicalRouting::NotApplicable)
-    /// for every item that is not a `loom:operator-only` +
-    /// `loom:operator-mechanical` pair, which is all but a handful.
+    /// for every item that is not a capability-only `loom:blocked` park (#11861),
+    /// which is all but a handful.
     #[must_use]
     pub fn mechanical_routing(
         &self,
@@ -406,23 +409,23 @@ impl WorkItem {
         crate::host_affinity::host_constraint(&self.labels, self.body.as_deref())
     }
 
-    /// True when the issue is skipped, with the `loom:operator-only` hard park
-    /// made **capability-aware for the mechanical sub-kind only** (#6893, AC1).
+    /// True when the issue is skipped, with the `loom:blocked` park made
+    /// **capability-aware for capability-only parks** (#6893, AC1; #11795;
+    /// re-keyed from `loom:operator` by #11861).
     ///
     /// Identical to [`Self::is_skipped_with_extra`] except for one narrow
-    /// exemption: an item carrying `loom:operator-only` **and**
-    /// `loom:operator-mechanical`, whose body declares capabilities (the
+    /// exemption: a blocked hold whose body declares capabilities (the
     /// `<!-- loom:capability=<name> -->` markers from #6892) that
-    /// `held_capabilities` fully covers, is **not** skipped — it is dispatchable
-    /// into the propose-mode lane. Everything else about the park is unchanged:
+    /// `held_capabilities` fully covers, names no blocker in a park record and
+    /// carries no decision block, is **not** skipped — it is dispatchable into
+    /// the propose-mode lane:
     ///
-    /// - The other two sub-kinds (`loom:operator-decision`,
-    ///   `loom:operator-blocked`) stay hard-skipped unconditionally, marker or
-    ///   no marker.
-    /// - `loom:blocked`, `loom:needs-capability` and `loom:operator` veto the
-    ///   exemption outright, as does [`BUILDING_LABEL`] and any
-    ///   `extra_skip_labels` entry — the exemption only ever relaxes
-    ///   `loom:operator-only`, never any other reason to skip.
+    /// - A decision (a body decision block) or a named blocker stays
+    ///   hard-skipped unconditionally, marker or no marker.
+    /// - `loom:operator` (under any name: no role acts on it), `loom:frozen`,
+    ///   [`BUILDING_LABEL`] and any `extra_skip_labels` entry veto the
+    ///   exemption outright — it only ever relaxes the blocked hold, never any
+    ///   other reason to skip.
     /// - No declaration, an unrecognized value, or a capability this worker does
     ///   not hold all leave the item skipped (fail-closed).
     ///
@@ -442,10 +445,10 @@ impl WorkItem {
             // Fast path: nothing to relax, or no worker declaration at all.
             return skipped;
         }
-        // The exemption may only cancel `loom:operator-only`. If any OTHER skip
-        // reason applies, the item stays skipped regardless of capabilities.
+        // The exemption may only cancel the blocked hold (any of its names).
+        // If any OTHER skip reason applies, the item stays skipped.
         let other_skip_reason = self.labels.iter().any(|l| {
-            (SKIP_LABELS.contains(&l.as_str()) && l != crate::capability::OPERATOR_ONLY_LABEL)
+            (SKIP_LABELS.contains(&l.as_str()) && !labels::BLOCKED_HOLD_NAMES.contains(&l.as_str()))
                 || extra_skip_labels.iter().any(|e| e == l)
         });
         if other_skip_reason {
@@ -719,7 +722,7 @@ pub trait WorkDispatcher {
     }
 
     /// The capabilities **this worker/host declares it holds** (#6893), used to
-    /// decide whether a `loom:operator-mechanical` item's declared
+    /// decide whether a mechanical operator hold's declared
     /// `<!-- loom:capability=<name> -->` requirements are met — see
     /// [`WorkItem::is_skipped_with_capabilities`]. Read fresh each tick,
     /// alongside [`extra_skip_labels`](Self::extra_skip_labels).
@@ -788,6 +791,25 @@ pub trait WorkDispatcher {
         HashMap::new()
     }
 
+    /// The landed pre-filter (#11853, [`landed_prefilter`]): the issues in
+    /// `candidates` that are still open although a PR closing them merged,
+    /// each mapped to that PR. `open_pr` are the workspace's candidates the
+    /// open-PR pre-filter blocked this tick. Asked at most once per workspace
+    /// per tick, after [`open_pr_blocked`](Self::open_pr_blocked); like it,
+    /// it can only remove candidates. Defaults to empty.
+    fn landed_closing_prs(&self, _candidates: &[u32], _open_pr: &[u32]) -> HashMap<u32, u32> {
+        HashMap::new()
+    }
+
+    /// The landed-cooldown lift (#11901, [`landed_prefilter::lift_in`]): of
+    /// `held`, this workspace's listed candidates inside a dispatch-backoff
+    /// window, the ones whose landed cooldown was just lifted because the
+    /// issue was reopened after its landing or Curator kept it. The tick then
+    /// treats them as not backed off. Defaults to empty.
+    fn lift_landed_cooldowns(&self, _held: &[u32]) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Whether a live sweep on this host is already marked `overflow`
     /// (#9244): the [`OverflowSlot`] is then taken for the whole tick.
     /// Defaults to `false`.
@@ -808,6 +830,10 @@ pub trait WorkDispatcher {
     /// The production dispatcher alerts the operator once per fix left
     /// unclaimed past the threshold. Defaults to a no-op.
     fn escalate_red_fix(&mut self, _red: bool, _waiting: &[u32]) {}
+
+    /// File, reuse or close this repo's auto-filed red-main fix issue
+    /// (#11766, [`main_red_autofile`]). Defaults to a no-op.
+    fn autofile_red_main(&mut self, _lane: RedMainLane) {}
 
     /// Count of in-flight sweeps that occupy the work-finder's concurrency
     /// budget (Issue #4003).
@@ -834,22 +860,22 @@ pub trait WorkDispatcher {
 // Tick
 // ============================================================================
 
-/// Log — once per skipped candidate — *why* a `loom:operator-mechanical` item
+/// Log — once per skipped candidate — *why* a mechanical operator hold
 /// stayed parked, naming the capability gap (#6893 AC1/AC3).
 ///
 /// This is the daemon-side half of "turn a silent stall into a capability
 /// request": the item is still parked (it must be — nothing about it changed),
 /// but the reason is now stated instead of being invisible inside a
 /// `labeled-skip` tally. The forge-comment half of AC1 lives on the sweep side
-/// (`sweep.md`'s "Capability-aware `loom:operator-mechanical` lane"), which is
+/// (`sweep.md`'s capability-lane section), which is
 /// the surface that actually resolves these items: the daemon's own candidate
 /// listing is `loom:issue`-filtered and re-evaluates the same rows every tick,
 /// so commenting from here would either spam the issue or need a whole
 /// dedup-state mechanism to avoid it.
 ///
 /// Costs nothing on the overwhelmingly common path: [`MechanicalRouting::NotApplicable`]
-/// for every item that is not a `loom:operator-only` + `loom:operator-mechanical`
-/// pair, and the routing is short-circuited entirely when this host declared no
+/// for every item that is not a capability-only `loom:blocked` park, and
+/// the routing is short-circuited entirely when this host declared no
 /// capabilities.
 ///
 /// [`MechanicalRouting::NotApplicable`]: crate::capability::MechanicalRouting::NotApplicable
@@ -861,13 +887,17 @@ fn log_capability_gap(item: &WorkItem, held_capabilities: &BTreeSet<String>) {
     match item.mechanical_routing(held_capabilities) {
         MechanicalRouting::MissingCapabilities { missing } => {
             log::info!(
-            "work_finder: issue #{} is `loom:operator-mechanical` but this worker does not hold \
+                "work_finder: issue #{} is a capability-only park but this worker does not hold \
              the capability it declares: {} (held: {}). It stays parked — file/comment a \
              capability request naming the gap rather than waiting (#6893)",
-            item.number,
-            missing.join(", "),
-            held_capabilities.iter().cloned().collect::<Vec<_>>().join(", ")
-        )
+                item.number,
+                missing.join(", "),
+                held_capabilities
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
         MechanicalRouting::NoDeclaration { unknown } if !unknown.is_empty() => log::info!(
             "work_finder: issue #{} declares capability value(s) outside the closed vocabulary \
@@ -1128,7 +1158,7 @@ pub fn tick_with_lanes(
         }
         // 1. Defensive skip-label filter (stale forge cache), extended with
         //    this workspace's configured extra skip-label list (#6685) and made
-        //    capability-aware for the `loom:operator-mechanical` sub-kind
+        //    capability-aware for mechanical operator holds
         //    (#6893 — inert unless this host declared capabilities).
         if item.is_skipped_with_capabilities(&extra_skip_labels, &held_capabilities) {
             report.skipped_labeled += 1;
@@ -1326,8 +1356,8 @@ pub fn tick_with_lanes(
 /// # Cross-repo priority ordering (#3946)
 ///
 /// `priorities` is a slice **parallel to `workspaces`**: `priorities[i]` is
-/// workspace `i`'s dispatch tier (lower = higher priority; a missing entry
-/// defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`]).
+/// workspace `i`'s draw weight (#11742; higher = drawn more, 0 = never; a
+/// missing entry defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT`]).
 /// Rather than dispatching each workspace's backlog in registration order, this
 /// gathers every eligible candidate across all workspaces and orders them by
 /// **weighted workspace draws** ([`workspace_draw`], #11103): each draw picks a
@@ -1572,7 +1602,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     lanes: &[RedMainLane],
     build_backoff_held: &[bool],
 ) -> TickReport {
-    use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
+    use crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT;
 
     let mut report = TickReport::for_tick(saturation_held, max_admissions_per_tick);
     report.build_backoff_held = build_backoff::any_held(build_backoff_held, workspaces.len());
@@ -1602,7 +1632,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // Snapshot each workspace's dispatch-backoff set (#4485) alongside its
     // quarantined set — dropped in pass 1 for the same reason: a backed-off
     // candidate must not reserve a shared slot it cannot use.
-    let backed_off_sets: Vec<HashSet<u32>> =
+    let mut backed_off_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.backed_off()).collect();
 
     // Sibling snapshot of `backed_off_sets`' absolute expiry (Issue #9311),
@@ -1678,7 +1708,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         .collect();
 
     // Snapshot each workspace's declared host capabilities (#6893), used by the
-    // capability-aware `loom:operator-mechanical` exemption in pass 1. Empty on
+    // capability-aware operator-hold exemption in pass 1. Empty on
     // every host that has not opted in, which leaves the filter unchanged.
     let held_capability_sets: Vec<BTreeSet<String>> = workspaces
         .iter()
@@ -1751,10 +1781,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // #11509: one `loom:very-important` per workspace; the rest rank important.
         vi_cap::enforce(idx, source, &mut ready, &mut report);
         report.seen += ready.len();
-        let workspace_priority = priorities
+        let workspace_weight = priorities
             .get(idx)
             .copied()
-            .unwrap_or(DEFAULT_WORKSPACE_PRIORITY);
+            .unwrap_or(DEFAULT_WORKSPACE_WEIGHT);
         let q = &mut report.queue;
 
         // Per-repo main-health gate (#3930): a red repo skips only its own
@@ -1765,7 +1795,11 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let repo_halted = halted.get(idx).copied().unwrap_or(false);
         if repo_halted && !lane.admits_fixes_while_halted() {
             // #9017: name WHICH hold tripped, not just that one did.
-            halt_cause::record_halted(q, &ready, idx, workspace_priority, red, halt_causes);
+            halt_cause::record_halted(q, &ready, idx, workspace_weight, red, halt_causes);
+            continue;
+        }
+        if workspace_weight == 0 {
+            halt_cause::record_weight_zero(q, &ready, idx, red); // #11742: after holds, which name their own cause
             continue;
         }
 
@@ -1777,18 +1811,30 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         if commands_missing[idx] {
             report.skipped_workspace_commands_missing += ready.len();
             for item in &ready {
-                let key = ready_queue::key_of(idx, workspace_priority, item, red);
+                let key = ready_queue::key_of(idx, workspace_weight, item, red);
                 ready_queue::record_skip(q, key, item, Qd::WorkspaceCommandsMissing, None);
             }
             continue;
         }
 
+        // #11901: a listed candidate whose landed cooldown no longer holds
+        // (reopened, or kept by Curator) is lifted before the backoff skip.
+        let held: Vec<u32> = ready
+            .iter()
+            .map(|i| i.number)
+            .filter(|n| backed_off_sets[idx].contains(n))
+            .collect();
+        if !held.is_empty() {
+            for n in dispatcher.lift_landed_cooldowns(&held) {
+                backed_off_sets[idx].remove(&n);
+            }
+        }
         let in_flight = &in_flights[idx];
         let now = chrono::Utc::now();
 
         for item in ready {
             cap.note_surface(idx, &item, in_flight.contains(&item.number));
-            let key = ready_queue::key_of(idx, workspace_priority, &item, red);
+            let key = ready_queue::key_of(idx, workspace_weight, &item, red);
             // `held_until` (Issue #9311): `None` for every disposition but
             // the five time-boxed holds below, which pass their computed
             // expiry explicitly as the third argument.
@@ -2716,7 +2762,7 @@ where
 ///    roots. Re-reading each tick — and provisioning any new root — happens in
 ///    `registry_refresh::refresh_local_workspace_state`, called BEFORE the
 ///    rate-limit breaker
-///    check (#8121), so `loom-daemon workspace add|remove|set-priority` is
+///    check (#8121), so `loom-daemon workspace add|remove|set-weight` is
 ///    hot-applied without a daemon restart even while gh polling is
 ///    suppressed.
 /// 2. Builds one `(GhWorkSource, RegistryDispatcher)` pair per root — the source
@@ -2838,7 +2884,7 @@ pub fn spawn_multi_work_finder_task(
             // below — see `registry_refresh`'s module doc comment for
             // why this purely-local, no-GitHub-API work must never be gated
             // behind the breaker (`loom-daemon workspace add|remove
-            // |set-priority` must hot-apply even while gh polling is
+            // |set-weight` must hot-apply even while gh polling is
             // suppressed).
             let (registry, roots) = registry_refresh::refresh_local_workspace_state(
                 &pool,
@@ -2942,9 +2988,9 @@ pub fn spawn_multi_work_finder_task(
             let min_workspace_healthy =
                 min_available_tokens_across_roots(&roots).unwrap_or(token_limit);
 
-            // Per-repo priority tiers (#3946), parallel to `pairs`: lower = higher
-            // priority. The empty-registry cwd fallback resolves to the default.
-            let priorities: Vec<u32> = roots.iter().map(|r| registry.priority_of(r)).collect();
+            // Per-repo draw weights (#11742), parallel to `pairs`: higher = drawn
+            // more. The empty-registry cwd fallback resolves to the default.
+            let priorities: Vec<u32> = roots.iter().map(|r| registry.weight_of(r)).collect();
 
             // Shard verdicts, per root, for the dispatch plan's `owning_shard`
             // only (the fleet-merge primary rule, #9288). They no longer
@@ -3199,7 +3245,9 @@ pub fn spawn_multi_work_finder_task(
             // #10624: which repos the build back-off deferred (INFO on change).
             build_backoff.log_deferred(&report.queue, &roots);
 
-            if !report.halted {
+            // #11857: a partial hold (say one maintain-only repo) must not
+            // silence the capacity advisory for the healthy repos beside it.
+            if !report.halted_fully() {
                 // #5305: see the single-workspace loop above — `token_bound`
                 // is now a pure starvation check, not a cross-axis comparison
                 // against disk/RAM/ceiling.

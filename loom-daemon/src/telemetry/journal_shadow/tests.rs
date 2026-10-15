@@ -340,6 +340,7 @@ fn role_tick(root: &Path) -> crate::role_tick_telemetry::RoleTickTelemetry {
         gated_pool: None,
         preference_tier: None,
         preference_tap: None,
+        role_draw: None,
     }
 }
 

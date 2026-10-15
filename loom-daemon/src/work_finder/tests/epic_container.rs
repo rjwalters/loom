@@ -71,7 +71,7 @@ fn a_tick_dispatches_the_phase_child_and_counts_the_epics_as_labeled_skips() {
 #[test]
 fn a_multi_workspace_tick_shows_the_epic_as_a_skipped_row_naming_the_label() {
     let mut multi = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
-    let report = tick_multi(&mut multi, &[100], 10, &[false]);
+    let report = tick_multi(&mut multi, &[1], 10, &[false]);
     assert_eq!(multi[0].1.dispatched, vec![3, 4]);
     assert_eq!(report.skipped_labeled, 2);
 
@@ -123,11 +123,12 @@ fn the_epic_skip_is_not_a_park_and_the_registry_still_validates() {
 
 #[test]
 fn the_mechanical_capability_lane_cannot_dispatch_an_epic() {
-    // #6893: the lane may only cancel `loom:operator-only`. An epic is another
-    // skip reason, so the item stays skipped even with every capability held.
+    // #6893: the lane may only cancel `loom:blocked` (#11861). An epic is
+    // another skip reason, so the item stays skipped even with every
+    // capability held.
     let held: BTreeSet<String> = BTreeSet::from(["host-sudo".to_string()]);
     let item = |extra: &[&str]| {
-        let mut l = vec!["loom:operator-only", "loom:operator-mechanical"];
+        let mut l = vec!["loom:blocked"];
         l.extend_from_slice(extra);
         labelled(7, &l).with_body(Some("<!-- loom:capability=host-sudo -->".to_string()))
     };

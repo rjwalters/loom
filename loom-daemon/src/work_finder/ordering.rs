@@ -19,9 +19,9 @@ use crate::priority_pick::Level;
 pub struct PriorityCandidate {
     /// The owning workspace's index in the `workspaces` slice (dispatch routing).
     pub workspace_idx: usize,
-    /// The owning workspace's `fleet_priority` (lower = higher priority). It
+    /// The owning workspace's roster `weight` (#11742, higher = more draws). It
     /// weights the workspace draw; it is not one of [`candidate_cmp`]'s keys.
-    pub workspace_priority: u32,
+    pub workspace_weight: u32,
     /// The issue's creation timestamp for age ordering (oldest-first).
     pub created_at: Option<String>,
     /// The issue number (dispatch target + final deterministic tiebreak).
@@ -35,9 +35,9 @@ pub struct PriorityCandidate {
     /// in that repo can merge, so its fix goes first. It is not an input to
     /// [`Self::level`], and on a green `main` it is `false`, so the marker
     /// grants nothing. Its only gate effect is unchanged: it lets the fix
-    /// past the three gates that `main` being red would otherwise deadlock
-    /// (#11508): the build back-off, the file-overlap gate and the
-    /// repo-sharding slice.
+    /// past the two gates that `main` being red would otherwise deadlock
+    /// (#11508): the build back-off and the file-overlap gate (the
+    /// repo-sharding slice it also bypassed left dispatch in #11682).
     pub main_red_fix: bool,
 }
 

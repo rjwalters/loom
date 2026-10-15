@@ -1045,6 +1045,24 @@ fn dispatch_flags_a_halted_gate() {
     assert!(section.summary.contains("HALTED"));
 }
 
+/// #11857: the tick line says HALTED only for a hold that covered the tick's
+/// work; a partial hold reads as a count of held roots.
+#[test]
+fn tick_line_names_a_partial_hold_by_its_held_roots() {
+    let mut tick = crate::types::WorkFinderTickSummary {
+        seen: 5,
+        halted: true,
+        held_roots: 1,
+        halt_partial: true,
+        ..Default::default()
+    };
+    let line = tick.reason_summary();
+    assert!(line.ends_with("1 root(s) held"), "{line}");
+    assert!(!line.contains("HALTED"), "{line}");
+    tick.halt_partial = false;
+    assert!(tick.reason_summary().ends_with("HALTED"));
+}
+
 #[test]
 fn dispatch_flags_tick_errors() {
     let mut inputs = healthy_inputs();
@@ -1148,7 +1166,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/loom"),
             maintain_only: None,
-            priority: crate::workspace_registry::default_priority(),
+            weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],
@@ -1181,7 +1199,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/anvil"),
             maintain_only: None,
-            priority: crate::workspace_registry::default_priority(),
+            weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],
@@ -1252,7 +1270,7 @@ fn tokens_per_repo_missing_ranking_counts_as_affected() {
     status.per_repo = vec![crate::types::RepoStatus {
         root: PathBuf::from("/repos/never-bootstrapped"),
         maintain_only: None,
-        priority: crate::workspace_registry::default_priority(),
+        weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
         quarantined_issues: vec![],
@@ -1690,7 +1708,7 @@ fn role_liveness_repo_with_intervals(
     crate::types::RepoStatus {
         root: PathBuf::from(root),
         maintain_only: None,
-        priority: crate::workspace_registry::default_priority(),
+        weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
         quarantined_issues: vec![],

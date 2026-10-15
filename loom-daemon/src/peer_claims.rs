@@ -97,10 +97,14 @@ pub use brakes::{
 };
 
 mod coordination_idle;
+mod fast_fail_tally;
+mod steps;
 pub use coordination_idle::{
     resolve_advertise_activity_window, ADVERTISE_ACTIVITY_WINDOW_ENV,
     DEFAULT_ADVERTISE_ACTIVITY_WINDOW,
 };
+pub use fast_fail_tally::MAX_PEER_FAST_FAIL_STREAK_AGE;
+pub use steps::MAX_PEER_STEP_COOLDOWN;
 
 mod send_health;
 pub use send_health::{
@@ -349,6 +353,10 @@ pub enum ClaimKind {
     /// while every peer stayed suppressed for up to 15 more minutes —
     /// converting a latency win into a fleet-wide stall.
     PoolHoldCleared,
+    /// "I armed a step cooldown on `(issue, step)`, `remaining_secs` left"
+    /// (#11900): the step-outcome ledger's short window, keyed by the ad's
+    /// `step`. Zero is a clear. See `steps.rs`.
+    StepCooldownArmed,
     /// "I am alive" (Issue #8736) — a periodic liveness signal published
     /// every reaper tick **regardless of live-sweep count**, unlike
     /// [`ClaimKind::Advertise`] (entirely dispatch-gated). Closes the
@@ -394,6 +402,7 @@ impl ClaimKind {
             ClaimKind::PrlessReleaseArmed => "prless_release_armed",
             ClaimKind::PoolHoldArmed => "pool_hold_armed",
             ClaimKind::PoolHoldCleared => "pool_hold_cleared",
+            ClaimKind::StepCooldownArmed => "step_cooldown_armed",
             ClaimKind::Heartbeat => "heartbeat",
         }
     }
@@ -411,6 +420,7 @@ impl ClaimKind {
             "prless_release_armed" => Some(ClaimKind::PrlessReleaseArmed),
             "pool_hold_armed" => Some(ClaimKind::PoolHoldArmed),
             "pool_hold_cleared" => Some(ClaimKind::PoolHoldCleared),
+            "step_cooldown_armed" => Some(ClaimKind::StepCooldownArmed),
             "heartbeat" => Some(ClaimKind::Heartbeat),
             _ => None,
         }
@@ -445,6 +455,7 @@ impl ClaimKind {
             ClaimKind::NoopCooldownArmed
                 | ClaimKind::DispatchBackoffArmed
                 | ClaimKind::PrlessReleaseArmed
+                | ClaimKind::StepCooldownArmed
         )
     }
 
@@ -512,8 +523,11 @@ pub struct ClaimAd {
     /// the full argument.
     pub pool_key: Option<String>,
     /// The advertising host's **own** consecutive tally at send time (Issue
-    /// #9292). `Some` only for [`ClaimKind::PrlessReleaseArmed`]; every other
-    /// kind leaves it `None`.
+    /// #9292). `Some` for [`ClaimKind::PrlessReleaseArmed`] and, since Issue
+    /// #11930, for a [`ClaimKind::DispatchBackoffArmed`] armed by the #4485
+    /// ladder, where it is the sender's own issue-attributable fast-failure
+    /// streak (`0` when the window was armed under another cause, which breaks
+    /// that streak). Every other kind leaves it `None`.
     ///
     /// Counts only that host's own releases — never a fleet total — so a
     /// receiver can sum one entry per peer host without double-counting its
@@ -523,6 +537,12 @@ pub struct ClaimAd {
     /// not inflate anyone's threshold, and the receiver's own local tally is
     /// still exact.
     pub consecutive: Option<u32>,
+    /// The step an [`ClaimKind::Advertise`]/[`ClaimKind::Retract`] ad claims
+    /// (#11898): `issue` is then the step's item (an issue, or a PR for a PR
+    /// step), and the claim is `(item, step)`. `None` for an issue sweep and
+    /// every other lane. Additive: an older peer ignores the key and reads the
+    /// ad as a claim on `issue`, which is the item the step holds.
+    pub step: Option<crate::step_role::StepRole>,
 }
 
 impl ClaimAd {
@@ -539,6 +559,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -555,6 +576,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -582,6 +604,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -604,6 +627,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -622,6 +646,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -650,6 +675,7 @@ impl ClaimAd {
             remaining_secs: Some(remaining_secs),
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -675,6 +701,7 @@ impl ClaimAd {
             remaining_secs: Some(remaining_secs),
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -697,6 +724,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -715,6 +743,7 @@ impl ClaimAd {
             "remaining_secs": self.remaining_secs,
             "pool_key": self.pool_key,
             "consecutive": self.consecutive,
+            "step": self.step,
         })
         .to_string()
     }
@@ -784,6 +813,13 @@ impl ClaimAd {
             .get("consecutive")
             .and_then(Value::as_u64)
             .and_then(|c| u32::try_from(c).ok());
+        // `step` is new as of #11898: absent (any older peer, any non-step
+        // ad) or an unknown role name degrades to `None`, a plain claim on
+        // `issue`, rather than rejecting the ad.
+        let step = obj
+            .get("step")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse().ok());
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -798,6 +834,7 @@ impl ClaimAd {
             remaining_secs,
             pool_key,
             consecutive,
+            step,
         })
     }
 
@@ -959,6 +996,8 @@ struct ClaimEntry {
     /// **Local** [`Instant`] at which this daemon observed the ad — the TTL
     /// clock. Never the advertiser's wall clock.
     received_at: Instant,
+    /// The step the peer claims the item for (#11898), `None` for a sweep.
+    step: Option<crate::step_role::StepRole>,
 }
 
 /// One live peer claim, rendered for external observability (Issue #5921):
@@ -1196,6 +1235,11 @@ pub struct PeerClaimView {
     /// construction, the interval after which the *next* host may claim; see
     /// [`brakes::PEER_PRLESS_STREAK_TTL`] for what collapsing them costs.
     prless_releases: HashMap<(String, u32, String), brakes::PeerPrlessRelease>,
+    /// Each peer host's own issue-attributable fast-failure streak (Issue
+    /// #11930), keyed by `(repo_slug, issue, advertising_host)` and valued by
+    /// `(count, received_at)`. Carried on the `DispatchBackoffArmed` ad; see
+    /// [`fast_fail_tally`] for why it is summed per host.
+    fast_fail_streaks: HashMap<(String, u32, String), (u32, Instant)>,
     /// Fleet-visible token-pool exhaustion holds armed by peer hosts (Issue
     /// #8001), keyed by `(pool_key, advertising_host)`, valued by the
     /// **local** [`Instant`] at which this daemon's copy of the hold expires
@@ -1217,6 +1261,8 @@ pub struct PeerClaimView {
     ///   for diagnostics, exactly as the filing lane does for its own
     ///   fleet-wide hold.
     pool_holds: HashMap<(String, String), Instant>,
+    /// Peer step cooldowns (#11900), `(repo, item, step)` → local expiry.
+    step_cooldowns: HashMap<(String, u32, crate::step_role::StepRole), Instant>,
     /// Publish-side health (Issue #9294): whether safehoused is currently
     /// **accepting** this host's claim ads at all. See [`send_health`] — a
     /// refused send is direct proof the channel is one-way, which every other
@@ -1269,7 +1315,9 @@ impl PeerClaimView {
             noop_cooldowns: HashMap::new(),
             dispatch_backoffs: HashMap::new(),
             prless_releases: HashMap::new(),
+            fast_fail_streaks: HashMap::new(),
             pool_holds: HashMap::new(),
+            step_cooldowns: HashMap::new(),
             send_health: ClaimSendHealth::default(),
             last_coordination_reason: None,
             degraded_cause_publish: false,
@@ -1430,6 +1478,7 @@ impl PeerClaimView {
                         host: ad.host.clone(),
                         pid: ad.pid,
                         received_at: now,
+                        step: ad.step,
                     },
                 );
             }
@@ -1446,6 +1495,7 @@ impl PeerClaimView {
             | ClaimKind::PrlessReleaseArmed
             | ClaimKind::PoolHoldArmed
             | ClaimKind::PoolHoldCleared
+            | ClaimKind::StepCooldownArmed
             | ClaimKind::Heartbeat => {
                 unreachable!("returned above")
             }
@@ -2123,6 +2173,7 @@ mod tests {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 

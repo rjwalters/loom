@@ -258,7 +258,7 @@ pub use drain_status::{DrainRollStatus, PauseRollStatus, MAX_DRAIN_PENDING_BUDGE
 pub mod drain_state;
 pub use drain_state::{
     evaluate_drain_tick, AbortOutcome, DrainBegin, DrainDescriptor, DrainOrigin, DrainState,
-    DrainTick, PauseOwnership, ResumeHold,
+    DrainTick, MaintenanceBegin, PauseOwnership, ResumeHold, TookOver,
 };
 /// `DrainAndRestartDaemon` handling and the drain supervisor — see the module doc.
 pub mod drain_supervisor;
@@ -776,6 +776,22 @@ async fn handle_client(
             );
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            continue;
+        }
+
+        // #11812: host maintenance. Acked at once; H4 runs on its supervisor.
+        if let Request::PauseThenExit = request {
+            let response = crate::auto_update::pause_roll::maintenance::handle_request(
+                &drain_state,
+                &workspace_pool,
+                &fallback_root,
+                &event_bus,
+            );
+            writer
+                .write_all(serde_json::to_string(&response)?.as_bytes())
+                .await?;
             writer.write_all(b"\n").await?;
             writer.flush().await?;
             continue;
@@ -1387,7 +1403,7 @@ pub fn build_daemon_status_for(
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             maintain_only: workspace_registry.maintain_only_of(root),
-            priority: workspace_registry.priority_of(root),
+            weight: workspace_registry.weight_of(root),
             in_flight_count,
             health_gate_halted: health_states.is_halted(root),
             quarantined_issues,
@@ -1443,14 +1459,10 @@ pub fn build_daemon_status_for(
         + phase_stash_git_shellout
         + phase_sweep_command_check;
 
-    // Present the per-repo breakdown in dispatch-priority order (#3946) — the
-    // same order the autonomous loops drain — so the highest-priority repos are
-    // listed first. Stable within a tier (tiebreak on root path) for determinism.
-    per_repo.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| a.root.cmp(&b.root))
-    });
+    // Present the per-repo breakdown heaviest draw weight first (#11742), so
+    // the repos drawn most are listed first. Ties break on root path for
+    // determinism.
+    per_repo.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.root.cmp(&b.root)));
     // #7513: everything from here to the report literal is machine-level
     // (computed once, not per root) — timed as one "tail" phase so the
     // slow-build log below can rule it in or out as a contributor distinct
@@ -3390,7 +3402,7 @@ fn handle_request(
         Request::ReadIssueState { .. } => Response::Error {
             message: "internal: ReadIssueState is handled by handle_client".to_string(),
         },
-        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
+        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain | Request::PauseThenExit => {
             // Structurally unreachable: `handle_client` intercepts both drain
             // requests (#4090) before dispatching here, because a drain must ack
             // immediately and exit from a background supervisor task minutes

@@ -1,7 +1,8 @@
 //! The operator-attention health section (Issue #8091): open PRs labeled
 //! `loom:operator` (the first-class "the engine has stopped acting on this
 //! artifact, a human is needed" hold, #5502) plus their `mergeable`/age
-//! breakdown, and open issues labeled `loom:operator-only` (the hard park),
+//! breakdown, and open issues held by `loom:operator` (the issue-dispatch
+//! park; the retired `loom:operator-only` counts until migrated, #11795),
 //! across every managed repo — answering "what is waiting on me?" without a
 //! separate `gh` query.
 //!
@@ -48,15 +49,15 @@ use super::{accumulate_observed, repo_label, HealthInputs, HealthSection, Verdic
 ///
 /// Until #11104 the star-liveness pass appended its escalated starred
 /// issues here. That pass is gone; the section is the plain list of
-/// human-gated items above (`loom:operator` PRs, `loom:operator-only`
-/// issues) and nothing else.
+/// human-gated items above (`loom:operator` PRs and issues) and nothing
+/// else.
 #[must_use]
 pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
     if let Some(gh) = &inputs.gh_unavailable {
         return HealthSection::new(
             "operator_attention",
             Verdict::Green,
-            format!("? held, ? operator-only — {}", gh.reason),
+            format!("? held, ? operator-held — {}", gh.reason),
             serde_json::json!({
                 "unavailable": "gh not found on PATH or not executable",
                 "gh_bin": gh.gh_bin,
@@ -65,6 +66,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
                 "held_conflicting": null,
                 "held_oldest_days": null,
                 "operator_only_issues": null,
+                "champion_held": null,
             }),
         );
     }
@@ -72,13 +74,14 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
         return HealthSection::new(
             "operator_attention",
             Verdict::Green,
-            "? held, ? operator-only — forge snapshot not collected",
+            "? held, ? operator-held — forge snapshot not collected",
             serde_json::json!({
                 "unavailable": "forge snapshot not collected",
                 "held": null,
                 "held_conflicting": null,
                 "held_oldest_days": null,
                 "operator_only_issues": null,
+                "champion_held": null,
             }),
         );
     };
@@ -86,12 +89,13 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
         return HealthSection::new(
             "operator_attention",
             Verdict::Green,
-            "0 held, 0 operator-only (no managed repos)",
+            "0 held, 0 operator-held (no managed repos)",
             serde_json::json!({
                 "held": 0,
                 "held_conflicting": 0,
                 "held_oldest_days": null,
                 "operator_only_issues": 0,
+                "champion_held": 0,
                 "repos": [],
             }),
         );
@@ -101,6 +105,9 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
     let mut conflicting_total: Option<usize> = None;
     let mut oldest_days: Option<i64> = None;
     let mut issues_total: Option<usize> = None;
+    // Held approvals, `loom:pr` + `loom:blocked` by label (#11905): details only,
+    // so the summary line and every existing key are unchanged.
+    let mut champion_total: Option<usize> = None;
     let mut failed: Vec<String> = Vec::new();
 
     for snap in pipeline {
@@ -111,6 +118,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
             None => repo_failed = true,
         }
         accumulate_observed(&mut conflicting_total, snap.operator_held_conflicting);
+        accumulate_observed(&mut champion_total, snap.champion_held);
         if let Some(days) = snap.operator_held_oldest_days {
             oldest_days = Some(oldest_days.map_or(days, |cur: i64| cur.max(days)));
         }
@@ -148,7 +156,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
     };
 
     let summary =
-        format!("{held_str} PR(s) held{breakdown_clause}, {issues_str} issue(s) operator-only{failed_clause}");
+        format!("{held_str} PR(s) held{breakdown_clause}, {issues_str} issue(s) operator-held{failed_clause}");
 
     HealthSection::new(
         "operator_attention",
@@ -159,6 +167,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
             "held_conflicting": conflicting_total,
             "held_oldest_days": oldest_days,
             "operator_only_issues": issues_total,
+            "champion_held": champion_total,
             "repos": pipeline
                 .iter()
                 .map(|s| serde_json::json!({
@@ -167,6 +176,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
                     "operator_held_conflicting": s.operator_held_conflicting,
                     "operator_held_oldest_days": s.operator_held_oldest_days,
                     "operator_only_issues": s.operator_only_issues,
+                    "champion_held": s.champion_held,
                     "error": s.error,
                 }))
                 .collect::<Vec<_>>(),
@@ -220,7 +230,7 @@ mod tests {
         assert!(section.summary.contains("6 PR(s) held"), "{}", section.summary);
         assert!(section.summary.contains("1 conflicting"), "{}", section.summary);
         assert!(section.summary.contains("oldest 5d"), "{}", section.summary);
-        assert!(section.summary.contains("8 issue(s) operator-only"), "{}", section.summary);
+        assert!(section.summary.contains("8 issue(s) operator-held"), "{}", section.summary);
         assert_eq!(section.detail["held"], 6);
         assert_eq!(section.detail["held_conflicting"], 1);
         assert_eq!(section.detail["held_oldest_days"], 5);
@@ -395,6 +405,6 @@ mod tests {
         let section = assess_operator_attention(&inputs);
         assert_eq!(section.verdict, Verdict::Green);
         assert!(section.summary.contains("0 held"), "{}", section.summary);
-        assert!(section.summary.contains("0 operator-only"), "{}", section.summary);
+        assert!(section.summary.contains("0 operator-held"), "{}", section.summary);
     }
 }

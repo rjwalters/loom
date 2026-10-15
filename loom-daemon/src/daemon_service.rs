@@ -18,7 +18,6 @@ use loom_daemon::daemon_heartbeat;
 use loom_daemon::daemon_startup_reconciliation;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
-use loom_daemon::forge_egress::publication as egress;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
 use loom_daemon::hyperparams;
@@ -432,10 +431,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     };
     let github_app_script = credential_preflight::resolve_github_app_script(&sweep_workspace);
     let github_app_owner_repo = credential_preflight::nwo_from_git_remote(&sweep_workspace);
-    // #9986: `required` egress host: the gateway owns the GitHub credential.
-    let github_credential_forbidden = egress::github_credential_forbidden(Some(&sweep_workspace));
     let github_app_preflight = match &github_app_script {
-        _ if github_credential_forbidden => credential_preflight::gateway_owned_preflight(),
         Some(script_path) => {
             let minter = credential_preflight::RealGithubAppMinter {
                 script_path: script_path.clone(),
@@ -482,11 +478,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // silently outrank the just-minted app token — the pre-#4458 code
     // achieved the same override by unconditionally overwriting `GH_TOKEN`.
     let github_app_config_dir = credential_preflight::github_app_gh_config_dir(&sweep_workspace);
-    // #9986: a `required` host activates a token-less profile instead. Its
-    // preflight is `gateway_owned_preflight` (no minted token), so the
-    // publication branch below never runs there.
-    let mut github_app_gh_config_dir_active =
-        github_credential_forbidden && egress::activate_tokenless_profile(&github_app_config_dir);
+    let mut github_app_gh_config_dir_active = false;
     if let Some(minted) = &github_app_preflight.minted {
         match credential_preflight::publish_minted(&github_app_config_dir, minted) {
             Ok(()) => {
@@ -659,17 +651,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // an unset `fleet.repo` all carry on untouched.
     let fleet_started =
         loom_daemon::fleet_sync::start(&sweep_workspace, Some(event_bus.clone())).await;
-
-    // Forge egress doctor (#9984), after `GH_CONFIG_DIR` activation above so it
-    // validates the profile this daemon's `gh` children will actually read.
-    // A background loop (first pass now, then every
-    // LOOM_FORGE_EGRESS_DOCTOR_INTERVAL_SECS): logs each finding + its repair
-    // command, caches the report for `status`, publishes `forge.egress.drift`
-    // on change. It never blocks startup or exits the daemon — refusal under
-    // `enforcement.api=required` happens at dispatch/spawn admission, so
-    // local-only commands keep working. No policy configured ⇒ a no-op.
-    let _forge_egress_doctor =
-        loom_daemon::forge_egress::gate::start(&sweep_workspace, Some(event_bus.clone()));
 
     // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
     // minted installation token fresh across its ~1h lifetime for a
@@ -1425,7 +1406,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // an operator env var still overrides for a single run (precedence env >
     // config > default). An absent `autonomous` block is byte-for-byte the
     // env-only behavior shipped in Phases A/B.
-    let work_finder_config = work_finder::read_work_finder_config(&sweep_workspace);
+    let work_finder_config = loom_daemon::work_finder_guard::read_and_check(&sweep_workspace);
 
     let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);

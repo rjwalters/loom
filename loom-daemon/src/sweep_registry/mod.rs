@@ -118,11 +118,15 @@ pub use model::generate_sweep_id;
 mod config_paths;
 mod decline_cooldown;
 mod dispatch;
+mod fast_fail_fleet;
+mod fast_fail_park;
+mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
 mod journal_shadow;
 mod landed_guard;
 mod lease_episode;
+pub mod lease_step;
 mod locks;
 mod model;
 mod noop_cooldown;
@@ -148,6 +152,11 @@ pub(crate) mod roll_resume;
 mod spawn_process;
 mod stacking;
 mod start_facts;
+mod step_adopt;
+pub mod step_lease_owner;
+pub mod step_ledger;
+mod step_reap;
+mod step_story;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;
@@ -168,6 +177,9 @@ pub use crash_signals::*;
 pub use decline_cooldown::*;
 #[allow(unused_imports)]
 pub use dispatch::*;
+pub use fast_fail_park::{
+    fast_fail_class, fast_fail_parks, is_fast_failure, FAST_FAIL_WINDOW_SECS,
+};
 #[allow(unused_imports)]
 pub use guards::*;
 #[allow(unused_imports)]
@@ -257,10 +269,6 @@ pub struct SweepRegistryConfig {
     /// [`outcomes_journal_path`](Self::outcomes_journal_path) — see the
     /// `sweep_outcomes` module doc for why the two are kept separate.
     pub outcome_telemetry_path: Option<PathBuf>,
-    /// Forge-egress policy sources for the dispatch gate (#9999). `None`
-    /// means `PolicySources::from_process`; `new` pins the unconfigured
-    /// default under `cfg(test)` so tests never read the host policy.
-    pub forge_egress_sources: Option<crate::forge_egress::policy::PolicySources>,
     /// The rate-limit breaker the dispatch path's forge writes (label flip,
     /// lease comment) report failures to (Issue #8997). `None` ⇒ the
     /// process-global breaker; tests inject their own.
@@ -279,11 +287,6 @@ impl SweepRegistryConfig {
             journal_path: None,
             outcomes_journal_path: None,
             outcome_telemetry_path: None,
-            forge_egress_sources: if cfg!(test) {
-                Some(crate::forge_egress::policy::PolicySources::default())
-            } else {
-                None
-            },
             rate_limit: None,
         }
     }
@@ -635,6 +638,9 @@ pub struct SweepRegistry {
     /// quarantining. This map counts *every* no-progress outcome, so the retry
     /// cadence is bounded regardless of blame.
     dispatch_backoff: HashMap<u32, DispatchBackoffState>,
+    /// The step-outcome ledger (#11900): per-`(item, step)` outcomes and
+    /// short cooldowns. See [`step_ledger`].
+    step_ledger: crate::step_dispatch::outcome_ledger::OutcomeLedger,
     /// No-op re-dispatch cooldown parameters (Issue #6670). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -1046,6 +1052,7 @@ impl SweepRegistry {
             preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
+            step_ledger: Default::default(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
@@ -1301,7 +1308,8 @@ impl SweepRegistry {
     #[must_use]
     pub fn tracked_sweep_identity(&self, issue: u32) -> Option<TrackedSweepIdentity> {
         let mut candidates = self.entries.values().filter(|info| {
-            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(n) if n == issue)
+            // A step on the item is the item's tracked run (#11898).
+            !info.state.is_terminal() && info.kind.item_number() == Some(issue)
         });
         let found = candidates.next()?;
         if candidates.next().is_some() {
@@ -1476,11 +1484,16 @@ fn overlay_live_phase_at(checkpoint_dir: &Path, info: &mut SweepInfo) {
     if info.latest_phase.is_none()
         && matches!(info.state, SweepState::Running | SweepState::Pending)
     {
-        if let SweepKind::Issue(issue) = info.kind {
-            let checkpoint = checkpoint_dir.join(format!("issue-{issue}.json"));
-            if checkpoint_written_by_run(&checkpoint, info.started_at) {
-                info.latest_phase = read_checkpoint_phase(&checkpoint);
+        match info.kind {
+            SweepKind::Issue(issue) => {
+                let checkpoint = checkpoint_dir.join(format!("issue-{issue}.json"));
+                if checkpoint_written_by_run(&checkpoint, info.started_at) {
+                    info.latest_phase = read_checkpoint_phase(&checkpoint);
+                }
             }
+            // A step writes no sweep checkpoint: its role is its phase (#11898).
+            SweepKind::Step { role, .. } => info.latest_phase = Some(role.as_str().to_string()),
+            SweepKind::PrSet(_) => {}
         }
     }
 }
@@ -1564,9 +1577,9 @@ impl RegistrySnapshot {
     /// helper `unregistered_locked_issues` depends on.
     #[must_use]
     fn has_tracked_sweep_for(&self, issue: u32) -> bool {
-        self.entries.values().any(|info| {
-            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
-        })
+        self.entries
+            .values()
+            .any(|info| !info.state.is_terminal() && info.kind.issue_number() == Some(issue))
     }
 }
 

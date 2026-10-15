@@ -64,7 +64,6 @@ impl Fixture {
             .env_remove("LOOM_TRACEPARENT")
             .env_remove("LOOM_TRACE_CONTEXT_FILE")
             .env_remove("LOOM_ROLE")
-            .env_remove("LOOM_FORGE_EGRESS_POLICY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

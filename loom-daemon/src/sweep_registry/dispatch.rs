@@ -13,6 +13,9 @@ pub(super) mod child_env_markers;
 // Issue #11304: claim-unwind + post-claim closed-issue re-verification.
 mod claim_release;
 
+// Issue #11853: the long, fleet-wide window an already-landed issue gets.
+mod landed_cooldown;
+
 // Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
 mod lease_renewal_start;
 use lease_renewal_start::lease_renewal_start_command;
@@ -164,7 +167,7 @@ impl std::error::Error for OpenPrDispatchError {}
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
 /// park-label guard (Issue #4444, step 2.7) refuses a dispatch because the
 /// target issue currently carries a [`PARK_LABELS`] entry (`loom:blocked` /
-/// `loom:operator-only`).
+/// `loom:operator` / `loom:frozen`).
 ///
 /// The work-finder's [`SKIP_LABELS`] filter only covers *its own* candidate
 /// query. Every other dispatch route — all three watchdogs (#3887 / #3895 /
@@ -185,8 +188,8 @@ impl std::error::Error for OpenPrDispatchError {}
 pub struct ParkedIssueDispatchError {
     /// The issue whose dispatch was refused.
     pub issue: u32,
-    /// The park label that triggered the refusal (`loom:blocked` or
-    /// `loom:operator-only`).
+    /// The park label that triggered the refusal (`loom:blocked`,
+    /// `loom:operator`, `loom:frozen`, or a retired name for one).
     pub label: String,
 }
 
@@ -593,12 +596,13 @@ pub const DISPATCH_BACKOFF_MAX_ENV: &str = "LOOM_DISPATCH_BACKOFF_MAX_SECS";
 /// flapping its label on every poll.
 pub const DEFAULT_DISPATCH_BACKOFF_BASE_SECS: u64 = 60;
 
-/// Default maximum backoff delay (#4485). Reached after 5 consecutive failures
-/// (60s → 120 → 240 → 480 → 900). Well under the quarantine TTL
-/// ([`DEFAULT_QUARANTINE_TTL_SECS`]), so on an issue that IS quarantine-eligible
-/// the quarantine remains the longer, louder, operator-visible brake and this
-/// only smooths the ramp toward it.
-pub const DEFAULT_DISPATCH_BACKOFF_MAX_SECS: u64 = 900;
+/// Default maximum backoff delay: 6 h (#11854; 900 s under #4485). A 15-minute
+/// ceiling still let an issue that fails a minute in run around the clock
+/// (one issue: 20 failed sweeps in a day). Only an issue-attributable fast
+/// failure climbs this far; every other cause keeps a 900 s cap
+/// (`backoff_cause::cap`), and such a streak is usually parked at the
+/// quarantine threshold first (`fast_fail_park`).
+pub const DEFAULT_DISPATCH_BACKOFF_MAX_SECS: u64 = 21_600;
 
 // ============================================================================
 // Cross-issue empty-pool dispatch brake (Issue #6614)
@@ -770,37 +774,45 @@ impl Default for DispatchBackoffConfig {
 }
 
 /// Why a per-issue dispatch-backoff window (Issue #4485) was most recently
-/// (re-)armed. Purely observational metadata riding alongside
-/// [`DispatchBackoffState`] — it does not change the doubling/expiry math at
-/// all, it only lets a reader distinguish "this issue's *dispatches* keep
-/// failing" from "this issue's open-PR guard keeps refusing it" (Issue
+/// (re-)armed. Metadata riding alongside [`DispatchBackoffState`] — beyond its
+/// ceiling (`backoff_cause::cap`, #11854) it does not change the
+/// doubling/expiry math, it only lets a reader distinguish "this issue's
+/// *dispatches* keep failing" from "this issue's open-PR guard keeps refusing it" (Issue
 /// #7606), so the work-finder can attribute a pre-filtered skip to its own
 /// `pr-open-backoff` tick-summary counter instead of the generic
 /// `backoff-skip`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DispatchBackoffCause {
-    /// A dispatch attempt failed outright (spawn error, token-selection
-    /// death, a lost claim-then-verify-order lease race, etc.) — the sole
-    /// cause before #7606.
+    /// A dispatch attempt failed for a reason that is not the issue's own
+    /// (token-selection death, a lost lease race, an environmental reaper
+    /// class, etc.). Capped at 900 s whatever `max` says (#11854): the window
+    /// is broadcast fleet-wide, and a transient fault must not strand the
+    /// issue for hours.
     Generic,
+    /// An issue-attributable fast failure (#11854): no progress, not
+    /// environmental, inside the fast-fail window. The only cause that climbs
+    /// to `max`, and its streak is the one the fast-fail park counts.
+    FastFailure,
     /// The open-PR guard (#4123, step 2.5/2.6) refused dispatch because the
     /// issue already has a verified open linked PR (#7606).
     OpenPrGuard,
+    /// The issue's work already landed (#11853): see `landed_cooldown`.
+    Landed,
 }
 
 /// Per-issue dispatch-backoff bookkeeping (Issue #4485).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DispatchBackoffState {
     /// Consecutive failed dispatch outcomes for this issue.
-    consecutive: u32,
+    pub(super) consecutive: u32,
     /// When the most recent failure was recorded — used to decide whether the
     /// streak is still "consecutive" (see [`DispatchBackoffConfig::max`]).
     last_failure_at: DateTime<Utc>,
     /// The instant at which the next dispatch attempt becomes allowed.
-    until: DateTime<Utc>,
-    /// What most recently (re-)armed this window (Issue #7606). Purely
-    /// observational — see [`DispatchBackoffCause`].
-    cause: DispatchBackoffCause,
+    pub(super) until: DateTime<Utc>,
+    /// What most recently (re-)armed this window (Issue #7606) — see
+    /// [`DispatchBackoffCause`].
+    pub(super) cause: DispatchBackoffCause,
 }
 
 /// Compute the backoff delay for the `consecutive`-th consecutive failure
@@ -1022,6 +1034,7 @@ impl SweepRegistry {
             | peer_claims::ClaimKind::PrlessReleaseArmed
             | peer_claims::ClaimKind::PoolHoldArmed
             | peer_claims::ClaimKind::PoolHoldCleared
+            | peer_claims::ClaimKind::StepCooldownArmed
             | peer_claims::ClaimKind::Heartbeat => return,
         };
         if let Err(e) = tx.try_send(ad) {
@@ -1065,13 +1078,12 @@ impl SweepRegistry {
         let host = host_identity();
         let pid = std::process::id();
         let ts = Utc::now().to_rfc3339();
-        let remaining_secs = remaining.as_secs();
         let ad = match kind {
             peer_claims::ClaimKind::NoopCooldownArmed => {
-                ClaimAd::noop_cooldown_armed(issue, repo, host, pid, ts, remaining_secs)
+                ClaimAd::noop_cooldown_armed(issue, repo, host, pid, ts, remaining.as_secs())
             }
             peer_claims::ClaimKind::DispatchBackoffArmed => {
-                ClaimAd::dispatch_backoff_armed(issue, repo, host, pid, ts, remaining_secs)
+                ClaimAd::dispatch_backoff_armed(issue, repo, host, pid, ts, remaining.as_secs())
             }
             // Unreachable: every call site below passes one of the two kinds
             // above.
@@ -1123,13 +1135,14 @@ impl SweepRegistry {
             .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
             .filter_map(|info| match info.kind {
                 SweepKind::Issue(issue) => Some(issue),
-                _ => None,
+                // A step re-advertises its `(item, step)` shape below (#11898).
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect();
         for issue in &live {
             self.publish_peer_claim(peer_claims::ClaimKind::Advertise, *issue);
         }
-        live.len()
+        live.len() + self.readvertise_step_claims()
     }
 
     /// Evaluate this host's peer-coordination health at the current instant
@@ -1188,6 +1201,12 @@ impl SweepRegistry {
         self.record_dispatch_backoff(issue, DispatchBackoffCause::Generic);
     }
 
+    /// Record an issue-attributable fast failure (#11854) — see
+    /// [`DispatchBackoffCause::FastFailure`].
+    pub(crate) fn record_fast_failure(&mut self, issue: u32) {
+        self.record_dispatch_backoff(issue, DispatchBackoffCause::FastFailure);
+    }
+
     /// Arm `issue`'s #4485 backoff ladder because the **open-PR guard**
     /// (#4123, step 2.5/2.6) refused it, not because a dispatch attempt
     /// itself failed (Issue #7606).
@@ -1200,11 +1219,11 @@ impl SweepRegistry {
     /// exponential growth (60s -> 120 -> 240 -> 480 -> 900), the same
     /// pre-`dispatch()` work-finder short-circuit
     /// ([`WorkDispatcher::backed_off`](crate::work_finder::WorkDispatcher::backed_off)),
-    /// and — because [`DispatchBackoffConfig::max`] defaults to 900s, the same
-    /// as [`super::guards::OPEN_PR_MEMO_FRESH`] — a cap that never outlives
-    /// the memo's own freshness window on default config.
+    /// and — because this cause is capped at [`super::guards::OPEN_PR_MEMO_FRESH`]
+    /// whatever [`DispatchBackoffConfig::max`] says (#11854) — a cap that
+    /// never outlives the memo's own freshness window.
     ///
-    /// Tagged [`DispatchBackoffCause::OpenPrGuard`] (purely observational) so
+    /// Tagged [`DispatchBackoffCause::OpenPrGuard`] (which sets the cap above) so
     /// the work-finder can attribute the pre-filtered skip this arms to its
     /// own `pr-open-backoff` tick-summary counter instead of the generic
     /// `backoff-skip`.
@@ -1221,8 +1240,8 @@ impl SweepRegistry {
             return;
         }
         let now = Utc::now();
-        let max_secs =
-            i64::try_from(self.dispatch_backoff_config.max.as_secs()).unwrap_or(i64::MAX);
+        let max = backoff_cause::cap(cause, self.dispatch_backoff_config.max);
+        let max_secs = i64::try_from(max.as_secs()).unwrap_or(i64::MAX);
         let consecutive = match self.dispatch_backoff.get(&issue) {
             Some(prev) if backoff_cause::continues(prev, cause, now, max_secs) => {
                 prev.consecutive.saturating_add(1)
@@ -1231,11 +1250,7 @@ impl SweepRegistry {
             // cause's streak (#8865) — start a fresh streak.
             _ => 1,
         };
-        let delay = backoff_delay(
-            consecutive,
-            self.dispatch_backoff_config.base,
-            self.dispatch_backoff_config.max,
-        );
+        let delay = backoff_delay(consecutive, self.dispatch_backoff_config.base, max);
         let until =
             now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero());
         self.dispatch_backoff.insert(
@@ -1252,11 +1267,13 @@ impl SweepRegistry {
         // does not immediately re-attempt the same failing candidate this
         // host just backed off on — see `publish_peer_cooldown_claim`'s doc
         // comment for why this is one-shot rather than re-advertised.
-        self.publish_peer_cooldown_claim(
-            peer_claims::ClaimKind::DispatchBackoffArmed,
-            issue,
-            delay,
-        );
+        // #11930: and this host's fast-failure streak, which the park sums.
+        let streak = if cause == DispatchBackoffCause::FastFailure {
+            consecutive
+        } else {
+            0
+        };
+        self.publish_dispatch_backoff_claim(issue, delay, streak);
     }
 
     /// Clear `issue`'s dispatch-backoff record (Issue #4485) — called on any
@@ -1748,6 +1765,7 @@ impl SweepRegistry {
                 let log_path = match kind {
                     SweepKind::Issue(n) => self.compute_log_path(*n),
                     SweepKind::PrSet(prs) => self.compute_prset_log_path(prs),
+                    SweepKind::Step { item, role } => self.compute_step_log_path(*item, *role),
                 };
                 return Ok(BeginIssueDispatch::Done(Ok(DispatchOutcome {
                     sweep_id,
@@ -1761,27 +1779,6 @@ impl SweepRegistry {
 
         // #10974: a daemon roll is pausing agents; nothing new may start.
         self.roll_gate.admit(kind)?;
-
-        // Forge egress admission (#9984): a fresh `forge egress assert`. Under
-        // `enforcement.api = required` a routing finding refuses the dispatch
-        // here, before any claim/label/account/log/spawn side effect, and the
-        // refusal is visible on the bus as `sweep.blocked reason=forge-egress`.
-        // `observe` logs and admits; no policy configured is a no-op.
-        if let Some(refusal) = self.config.forge_egress_sources.as_ref().map_or_else(
-            || crate::forge_egress::gate::dispatch_refusal(&self.config.workspace_root),
-            |sources| {
-                crate::forge_egress::gate::dispatch_refusal_with(
-                    sources,
-                    &self.config.workspace_root,
-                )
-            },
-        ) {
-            self.emit_event(Event::Generic {
-                topic: crate::forge_egress::gate::SWEEP_BLOCKED_TOPIC.to_string(),
-                payload: refusal.event_payload(serde_json::to_value(kind).unwrap_or_default()),
-            });
-            return Err(anyhow!(refusal.message()));
-        }
 
         // Runtime admission is the first decision for a new dispatch:
         // before account selection, claim lock, forge mutation,
@@ -1839,6 +1836,15 @@ impl SweepRegistry {
         //    `dispatch_prset_inner` / `SweepRegistry::pr_lock_dir`).
         let issue_number = match kind {
             SweepKind::Issue(n) => *n,
+            // Nothing dispatches a step through the sweep path: the step
+            // engine's spawn (#11906) claims and launches it. Refuse loudly
+            // rather than run the issue guard chain on a PR or a Curator item.
+            SweepKind::Step { item, role } => {
+                anyhow::bail!(
+                    "dispatch refused: a {role} step on #{item} is not dispatched as a sweep \
+                     (the step engine spawns steps, #11906)"
+                );
+            }
             SweepKind::PrSet(prs) => {
                 // #11191: disk admission, as for an issue before step 3.
                 crate::disk_admission::admit_dispatch(&self.config.workspace_root, kind)?;
@@ -2366,9 +2372,13 @@ impl SweepRegistry {
             //     arrived yet): a host that proceeded past 2.95 still gets
             //     caught — and logged — here when the collision is confirmed
             //     against the forge's own label state.
-            if let Some(CollisionClass::Collision { labels }) =
-                self.detect_and_record_collision(issue_number)
-            {
+            //     Not for a crash resume (#11852): the `loom:building` it sees
+            //     is the crashed sweep's own, kept while its PR is open.
+            let collision = resume_bypass_pr
+                .is_none()
+                .then(|| self.detect_and_record_collision(issue_number))
+                .flatten();
+            if let Some(CollisionClass::Collision { labels }) = collision {
                 log::warn!(
                     "sweep_registry: BACKING OFF dispatch of issue #{issue_number} — the \
                      pre-flip forge-label read confirmed another host already claimed it \
@@ -2412,6 +2422,17 @@ impl SweepRegistry {
                     //     from a lane that published no lease record — which
                     //     `yield_identity` reports through this same channel.
                     let decision = self.resolve_lease_order(issue_number, &sweep_id, episode_start);
+                    // #11852: a crash resume re-claims the issue's own
+                    // `loom:building`, kept while its PR is open — not a
+                    // foreign leaseless claim. Lease-comment order still counts.
+                    let decision = match decision {
+                        LeaseOrderDecision::YieldToLeaselessClaim { .. }
+                            if resume_bypass_pr.is_some() =>
+                        {
+                            LeaseOrderDecision::Proceed
+                        }
+                        other => other,
+                    };
                     if matches!(decision, LeaseOrderDecision::YieldToLeaselessClaim { .. }) {
                         leaseless_flip_window = Some((episode_start, Utc::now()));
                     }
@@ -2743,8 +2764,12 @@ impl SweepRegistry {
         // `start` handshake runs on its own thread"), and nothing in this
         // dispatch depends on its result — it is best-effort in both
         // directions.
-        if matches!(kind, SweepKind::Issue(_)) {
-            drop(self.start_lease_renewal_loop(issue_number, &sweep_id, pid, &log_path));
+        match kind {
+            SweepKind::Issue(_) => {
+                drop(self.start_lease_renewal_loop(issue_number, &sweep_id, pid, &log_path));
+            }
+            // A step never reaches the sweep dispatch (refused at step 2).
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => {}
         }
 
         // Retain the handle so the reaper can `try_wait()` it (Issue #3801).
@@ -3520,11 +3545,6 @@ mod idempotency_inflight_tests;
 // over the file-size ratchet threshold.
 #[cfg(test)]
 mod fleet_noop_cooldown_tests;
-
-// Issue #9984's forge-egress dispatch admission coverage — a sibling module
-// for the same reason as the two above.
-#[cfg(test)]
-mod forge_egress_tests;
 
 // Issue #8997's rate-limited label-flip breaker coverage (same reason).
 #[cfg(test)]

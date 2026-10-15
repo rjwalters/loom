@@ -317,7 +317,7 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
         false,
     );
 
-    persist_invocation_flags(&ctx);
+    let prior_flags = persist_invocation_flags(&ctx);
 
     out::say(&format!("Daemon binary: {}", ctx.daemon_bin_str()));
     out::say(&format!("Socket:        {}", ctx.socket_path.display()));
@@ -400,9 +400,11 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
         want_health_gate: ctx.args.want_health_gate,
         prior: &prior,
         intent_marker: &ctx.intent_marker,
+        config_work_finder: config_work_finder(&ctx.repo_root),
     });
     if downgrade {
         autonomy::print_downgrade_refusal();
+        restore_invocation_flags(&ctx, prior_flags);
         std::process::exit(1);
     }
     // The drift warning runs FIRST so a refused start still reports both
@@ -543,6 +545,7 @@ fn run_inspection_mode_and_exit(ctx: &Ctx) -> ! {
         want_health_gate: ctx.args.want_health_gate,
         prior: &prior,
         intent_marker: &ctx.intent_marker,
+        config_work_finder: config_work_finder(&ctx.repo_root),
     });
     guards::warn_scratch_workdir_drift(&ctx.repo_root);
     let _ = guards::guard_session_context_start(
@@ -639,13 +642,36 @@ fn run_inspection_mode_and_exit(ctx: &Ctx) -> ! {
 /// reflects the most recent invocation — `loom-daemon-update.sh` replays it
 /// after a rebuild so the FLAGS-OFF/opt-in contract never widens across an
 /// update.
-fn persist_invocation_flags(ctx: &Ctx) {
+///
+/// Returns what the file held before (`None`: it did not exist), so a start
+/// REFUSED as an autonomy downgrade can put it back: the watchdog replays this
+/// file on recovery, and a refused bare start that left it empty would turn
+/// the next recovery into the very downgrade it refused (#11934).
+fn persist_invocation_flags(ctx: &Ctx) -> Option<String> {
     let flags_file = ctx.state_home.join(".daemon.flags");
+    let before = std::fs::read_to_string(&flags_file).ok();
     let body = args::persisted_flags(&ctx.args.original)
         .into_iter()
         .map(|f| format!("{f}\n"))
         .collect::<String>();
     let _ = std::fs::write(&flags_file, body);
+    before
+}
+
+/// Undo [`persist_invocation_flags`] for a refused start (#11934).
+fn restore_invocation_flags(ctx: &Ctx, before: Option<String>) {
+    let flags_file = ctx.state_home.join(".daemon.flags");
+    let _ = match before {
+        Some(body) => std::fs::write(&flags_file, body),
+        None => std::fs::remove_file(&flags_file),
+    };
+}
+
+/// The resolved config's `autonomous.workFinder.enabled` for `repo_root`
+/// (#11934) — the same read the daemon makes at startup, so the downgrade
+/// check sees exactly the value the started daemon would have obeyed.
+fn config_work_finder(repo_root: &Path) -> Option<bool> {
+    crate::work_finder::read_work_finder_config(repo_root).enabled
 }
 
 /// `DAEMON_SLEEP_INHIBIT_WRAP` — the `systemd-inhibit` prefix, or empty.

@@ -769,6 +769,11 @@ impl SweepRegistry {
             .start_facts
             .get(sweep_id)
             .and_then(|facts| facts.dispatch_origin.clone());
+        // 2am#4393: the draw that chose this sweep's tap, from the same facts.
+        let role_draw = self
+            .start_facts
+            .get(sweep_id)
+            .and_then(|facts| facts.role_draw.clone());
         let (attempt_index, previous_sweep_id, trigger) =
             if let Some(facts) = self.start_facts.get(sweep_id) {
                 (facts.attempt_index, facts.previous_sweep_id.clone(), facts.trigger.clone())
@@ -972,6 +977,8 @@ impl SweepRegistry {
                 .map(ParkKind::failure_class),
             exit_code == Some(0),
         );
+        // Issue #11854: a reported `failure` never goes out without a class.
+        let failure_class = telemetry::ensure_failure_class(reported_result, failure_class);
         let process_result = result;
         let result = reported_result;
 
@@ -1010,6 +1017,7 @@ impl SweepRegistry {
             previous_sweep_id,
             trigger,
             dispatch_origin,
+            role_draw,
             rework_events,
             pr_numbers,
             hw_lines_added: landing_size.as_ref().map(|size| size.hw_lines_added),
@@ -1044,8 +1052,10 @@ impl SweepRegistry {
         // slow or hung `gh` can never delay (or, via a daemon restart in that
         // window, lose) the `sweep.outcome` record. See `writeback`'s module
         // doc for the full fail-open contract.
-        let writeback_record =
-            (process_result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
+        // #11743: and only on an issue the same read shows is not frozen.
+        let writeback_record = (process_result == telemetry::SweepResult::Success
+            && writeback::writeback_admitted(issue, &issue_signals))
+        .then(|| outcome_record.clone());
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -1225,8 +1235,11 @@ impl SweepRegistry {
         kind: &SweepKind,
         started_at: DateTime<Utc>,
     ) {
-        let SweepKind::Issue(issue) = kind else {
-            return;
+        let issue = match kind {
+            SweepKind::Issue(issue) => issue,
+            // A step writes no sweep checkpoint, so it has no phase to sample;
+            // its role is its phase (#11898).
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => return,
         };
         let checkpoint = self
             .config

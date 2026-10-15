@@ -25,8 +25,8 @@
 //! state of every dependency the body names. An unchanged fingerprint extends
 //! the streak; a changed one restarts it at 1. At
 //! [`NoopCooldownConfig::hold_threshold`] the issue is parked with a forge
-//! label — `loom:blocked` for dependencies, `loom:operator-only` +
-//! `loom:operator-decision` for a human gate or when the kind is unclear — and
+//! label — `loom:blocked` for dependencies, `loom:operator` for a human gate
+//! or when the kind is unclear (#11795) — and
 //! one marked comment says why and what unparks it. A priority label
 //! (`loom:important` / `loom:very-important`) never exempts an issue and is
 //! never touched; the park labels are already in
@@ -188,7 +188,6 @@ impl SweepRegistry {
     }
 
     /// Whether this daemon holds `issue` for a no-op loop.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn noop_hold_applied(&self, issue: u32) -> bool {
         self.noop_cooldown
@@ -307,10 +306,10 @@ impl SweepRegistry {
         };
         // Closed or already parked: nothing for the hold to do, and a stale
         // streak must not survive into a later reopen.
-        let already_parked = snapshot.labels.iter().any(|l| {
-            crate::work_finder::PARK_LABELS.contains(&l.as_str())
-                || l == crate::work_finder::OPERATOR_HOLD_LABEL
-        });
+        let already_parked = snapshot
+            .labels
+            .iter()
+            .any(|l| crate::work_finder::PARK_LABELS.contains(&l.as_str()));
         if !snapshot.open || already_parked {
             self.noop_cooldown.streaks.remove(&issue);
             self.persist_noop_holds();
@@ -412,9 +411,16 @@ impl SweepRegistry {
         let Some(snapshot) = self.fetch_noop_snapshot(issue) else {
             return;
         };
-        let ours = park.labels();
-        let still_parked = ours.iter().any(|l| snapshot.labels.iter().any(|x| x == l));
-        if !snapshot.open || !still_parked {
+        // Only the hold's labels actually present (#11795: a pre-fold hold
+        // carries the old names; removing an absent label can fail).
+        let ours: Vec<&str> = park
+            .lift_labels()
+            .iter()
+            .copied()
+            .filter(|l| snapshot.labels.iter().any(|x| x == l))
+            .collect();
+        let ours = ours.as_slice();
+        if !snapshot.open || ours.is_empty() {
             // Closed, or someone already lifted the park: nothing to undo.
             self.noop_cooldown.streaks.remove(&issue);
             return;
@@ -422,13 +428,15 @@ impl SweepRegistry {
         if snapshot.fingerprint_ignoring(ours) == announced {
             return;
         }
-        let other_hold = snapshot.labels.iter().any(|l| {
-            !ours.contains(&l.as_str())
-                && (crate::work_finder::PARK_LABELS.contains(&l.as_str())
-                    || l == crate::work_finder::OPERATOR_HOLD_LABEL)
-        });
+        // #11480: the shared veto, less the hold's own labels being lifted.
+        if crate::work_finder::is_frozen(&snapshot.labels) {
+            // #11743: frozen means no write; drop our record, touch nothing.
+            self.noop_cooldown.streaks.remove(&issue);
+            return;
+        }
+        let other_hold = crate::work_finder::restore_veto(&snapshot.labels, ours);
         let claimed = snapshot.labels.iter().any(|l| l == "loom:building");
-        let restore = !other_hold && !claimed;
+        let restore = other_hold.is_none() && !claimed;
         if let Err(cause) = self.lift_park_labels(issue, ours, restore) {
             log::warn!(
                 "sweep_registry: no-op hold for #{issue} saw changed inputs but could not lift                  {ours:?}; retrying next interval (#10156): {cause}"
@@ -518,8 +526,7 @@ impl SweepRegistry {
             ParkKind::HumanGate => (
                 "its remaining work is a human gate (or the sweeps could not say what else it \
                  waits on)",
-                "Decide it, then remove `loom:operator-only` and `loom:operator-decision` and \
-                 add `loom:issue` back",
+                "Decide it, then remove `loom:operator` and add `loom:issue` back",
             ),
         };
         let body = format!(

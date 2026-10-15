@@ -1164,6 +1164,8 @@ pub fn role_invocation(
     let started_at = Utc::now();
     let execution = role_execution_id(role, started_at);
     role_failure::clear();
+    role_draw::clear();
+    role_target::clear();
     ROLE_CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(RoleSlot::Pending {
             root: root.to_path_buf(),
@@ -1174,7 +1176,9 @@ pub fn role_invocation(
     });
     let outcome = invoke();
     let noted = role_failure::take();
+    let drawn = role_draw::take();
     let resumed_from = roll_interruption::take_resumed_from();
+    let pr = role_target::take().or_else(|| role_target::take_handoff(root, &execution));
     let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
         return (outcome, None);
     };
@@ -1198,6 +1202,14 @@ pub fn role_invocation(
     if let Some(from) = resumed_from {
         close.insert(roll_interruption::RESUMED_FROM.into(), from);
     }
+    // 2am#4393: the draw that chose this tick's tap, so the exported span
+    // carries the pick `role_tick.outcome` (never shipped) records.
+    if let Some(drawn) = drawn {
+        close.extend(drawn);
+    }
+    if let Some(pr) = pr {
+        close.insert(role_target::PR_NUMBER.into(), pr.to_string());
+    }
     let result = roll.map_or(result, |roll| {
         roll.apply(&mut close);
         roll_interruption::RESULT.to_owned()
@@ -1206,7 +1218,9 @@ pub fn role_invocation(
     (outcome, trace)
 }
 
+pub mod role_draw;
 mod role_failure;
+pub mod role_target;
 pub mod roll_interruption;
 pub use role_failure::{
     note_role_failure, RoleFailure, EXIT_CODE, FAILURE_CLASS, ROLE_FAILURE_ATTRIBUTE_KEYS,

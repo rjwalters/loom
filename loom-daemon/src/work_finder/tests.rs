@@ -364,7 +364,7 @@ fn tick_skips_a_tracking_parent_with_open_sub_issues() {
     assert_eq!(dispatcher.dispatch_attempts, vec![31, 32]);
 
     let mut workspaces = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
-    let report = tick_multi(&mut workspaces, &[0], 10, &[false]);
+    let report = tick_multi(&mut workspaces, &[1], 10, &[false]);
     assert_eq!((report.dispatched, report.skipped_labeled), (2, 1));
     assert_eq!(workspaces[0].1.dispatch_attempts, vec![31, 32]);
 }
@@ -386,7 +386,7 @@ fn tick_multi_with_saturation_brake_is_a_sharding_noop() {
     ];
     let report = tick_multi_with_saturation_brake(
         &mut workspaces,
-        &[0, 0],
+        &[1, 1],
         10,
         &[false, false],
         usize::MAX,
@@ -1693,7 +1693,7 @@ fn test_tick_multi_sums_collision_totals() {
             },
         ),
     ];
-    let report = tick_multi(&mut multi, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 1], 10, &[false, false]);
     assert_eq!(report.collisions, 7, "collision totals summed across workspaces");
 }
 
@@ -1841,8 +1841,8 @@ fn test_tick_lease_order_refusal_counts_as_backoff_skip_not_error() {
 fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     // #4444: the dispatch-time guard keys on PARK_LABELS, so the two
     // constants must stay in lockstep — SKIP_LABELS is exactly
-    // BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL + `loom:epic`
-    // (#11399) + the decision sub-kind, and PARK_LABELS
+    // BUILDING_LABEL + PARK_LABELS (loom:operator among them since #11795) +
+    // the bounced decision + `loom:epic` (#11399), and PARK_LABELS
     // must never contain `loom:building` (a guard that refused it would break
     // the watchdogs' and the reaper's re-dispatch of the daemon's OWN claim).
     assert!(
@@ -1858,13 +1858,12 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     }
     let mut expected = [&[BUILDING_LABEL], PARK_LABELS.as_slice()].concat();
     expected.extend([
-        OPERATOR_HOLD_LABEL,
+        "loom:decision-malformed", // #11480
         labels::EPIC_LABEL,
-        labels::OPERATOR_DECISION_LABEL,
     ]);
     assert_eq!(
         *SKIP_LABELS, expected,
-        "SKIP_LABELS is the claim + the parks + the hold + the epic container + the decision sub-kind"
+        "SKIP_LABELS is the claim + the parks + the bounced decision + the epic container"
     );
 }
 
@@ -1875,6 +1874,7 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
 // already uses in this file. `epic_container` (#11399) follows it.
 mod epic_container;
 mod operator_hold;
+mod restore_veto;
 
 #[test]
 fn test_hard_exclusion_labels_are_disjoint_from_skip_labels() {
@@ -1891,7 +1891,17 @@ fn test_hard_exclusion_labels_are_disjoint_from_skip_labels() {
     // So assert the two sets stay disjoint. If a future label genuinely
     // belongs in both, that is a deliberate decision that should have to
     // edit this test.
-    for excluded in crate::hard_exclusion::HARD_EXCLUSION_LABELS.iter() {
+    //
+    // #11743: `loom:frozen` is that deliberate decision. It must refuse every
+    // route: as a park (the dispatch-time guard, so also a skip by #4444) AND
+    // as a hard exclusion (every role and daemon pass that reads the
+    // `hard_exclusion` property). The skip filter runs first, so it counts
+    // once, as `labeled-skip`, a human park. It cannot be relaxed, because it
+    // is a capability `LANE_VETO_LABELS` entry.
+    for excluded in crate::hard_exclusion::HARD_EXCLUSION_LABELS
+        .iter()
+        .filter(|l| **l != "loom:frozen")
+    {
         assert!(
             !SKIP_LABELS.contains(excluded),
             "{excluded} is a hard exclusion (#7528), counted as `declined-skip`; it must \
@@ -1941,7 +1951,7 @@ fn test_tick_multi_park_label_refusal_counts_as_labeled_skip() {
         ),
         (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
     ];
-    let report = tick_multi(&mut multi, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 1], 10, &[false, false]);
 
     assert_eq!(report.skipped_labeled, 1);
     assert_eq!(report.errors, 0);
@@ -2207,7 +2217,7 @@ fn test_tick_multi_existing_occupancy_is_summed_globally() {
             },
         ),
     ];
-    let report = tick_multi(&mut multi, &[], 4, &[false, false]);
+    let report = tick_multi(&mut multi, &[1000, 1], 4, &[false, false]);
     assert_eq!(report.dispatched, 1, "3 in-flight + cap 4 ⇒ 1 free slot globally");
     assert_eq!(report.deferred_capacity, 3);
     // The single free slot goes to the first workspace's first ready issue.
@@ -2412,23 +2422,16 @@ fn caps(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// A ready `loom:operator-only` + `loom:operator-mechanical` item whose
-/// body carries the given capability markers.
+/// A ready capability-only park (#11861): `loom:issue` + `loom:blocked`, no
+/// named blocker, whose body carries the given capability markers.
 fn mechanical_item(number: u32, markers: &[&str]) -> WorkItem {
     let body = markers
         .iter()
         .map(|m| format!("<!-- loom:capability={m} -->"))
         .collect::<Vec<_>>()
         .join("\n");
-    WorkItem::new(
-        number,
-        vec![
-            "loom:issue".into(),
-            "loom:operator-only".into(),
-            "loom:operator-mechanical".into(),
-        ],
-    )
-    .with_body(Some(format!("## Task\n\nDo the thing.\n\n{body}\n")))
+    WorkItem::new(number, vec!["loom:issue".into(), "loom:blocked".into()])
+        .with_body(Some(format!("## Task\n\nDo the thing.\n\n{body}\n")))
 }
 
 #[test]
@@ -2480,24 +2483,11 @@ fn test_mechanical_capabilities_are_anded_not_ored() {
 #[test]
 fn test_mechanical_item_without_a_marker_stays_parked_exactly_as_today() {
     // Fail-closed: "no capability declared" is not "no capability needed".
-    let bare = WorkItem::new(
-        1,
-        vec![
-            "loom:issue".into(),
-            "loom:operator-only".into(),
-            "loom:operator-mechanical".into(),
-        ],
-    )
-    .with_body(Some("## Task\n\nRotate the deploy key.\n".to_string()));
+    let bare = WorkItem::new(1, vec!["loom:issue".into(), "loom:blocked".into()])
+        .with_body(Some("## Task\n\nRotate the deploy key.\n".to_string()));
     assert!(bare.is_skipped_with_capabilities(&[], &caps(&["host-sudo", "tailnet-access"])));
     // ...and so does one whose body was never fetched.
-    let no_body = WorkItem::new(
-        2,
-        vec![
-            "loom:operator-only".into(),
-            "loom:operator-mechanical".into(),
-        ],
-    );
+    let no_body = WorkItem::new(2, vec!["loom:blocked".into()]);
     assert!(no_body.is_skipped_with_capabilities(&[], &caps(&["host-sudo"])));
 }
 
@@ -2511,29 +2501,27 @@ fn test_mechanical_item_with_an_unknown_capability_fails_closed() {
 }
 
 #[test]
-fn test_other_operator_only_sub_kinds_remain_hard_skipped() {
-    // #6885 non-goal, asserted directly: the other two sub-kinds are
-    // unaffected — a marker in their body is ignored entirely, even for a
-    // maximally-capable worker.
+fn test_operator_holds_remain_hard_skipped_for_a_capable_worker() {
+    // #11861: no role acts on `loom:operator` (under any name), so a marker in
+    // its body is ignored entirely, even for a maximally-capable worker.
     let all_caps = caps(&["host-sudo", "forge-admin-token", "tailnet-access"]);
-    for sub_kind in ["loom:operator-decision", "loom:operator-blocked"] {
-        let item = WorkItem::new(
-            1,
-            vec![
-                "loom:issue".into(),
-                "loom:operator-only".into(),
-                sub_kind.into(),
-            ],
-        )
-        .with_body(Some("<!-- loom:capability=host-sudo -->".to_string()));
+    for hold in [
+        "loom:operator",
+        "loom:operator-only",
+        "loom:operator-mechanical",
+        "loom:operator-decision",
+        "loom:operator-blocked",
+    ] {
+        let item = WorkItem::new(1, vec!["loom:issue".into(), hold.into()])
+            .with_body(Some("<!-- loom:capability=host-sudo -->".to_string()));
         assert!(
             item.is_skipped_with_capabilities(&[], &all_caps),
-            "{sub_kind} must stay hard-skipped"
+            "{hold} must stay hard-skipped"
         );
         assert_eq!(
             item.mechanical_routing(&all_caps),
             crate::capability::MechanicalRouting::NotApplicable,
-            "{sub_kind} is not a capability-lane item at all"
+            "{hold} is not a capability-lane item at all"
         );
     }
 }
@@ -2542,38 +2530,17 @@ fn test_other_operator_only_sub_kinds_remain_hard_skipped() {
 fn test_capability_exemption_never_overrides_another_skip_reason() {
     let markers = "<!-- loom:capability=host-sudo -->";
     let held = caps(&["host-sudo"]);
-    // loom:blocked is an independent park with its own release condition.
-    let blocked = WorkItem::new(
-        1,
-        vec![
-            "loom:operator-only".into(),
-            "loom:operator-mechanical".into(),
-            "loom:blocked".into(),
-        ],
-    )
-    .with_body(Some(markers.to_string()));
-    assert!(blocked.is_skipped_with_capabilities(&[], &held));
-    // loom:needs-capability is explicitly out of scope (#5817 non-goal).
-    let needs_capability = WorkItem::new(
-        2,
-        vec![
-            "loom:operator-only".into(),
-            "loom:operator-mechanical".into(),
-            "loom:needs-capability".into(),
-        ],
-    )
-    .with_body(Some(markers.to_string()));
-    assert!(needs_capability.is_skipped_with_capabilities(&[], &held));
+    // loom:operator beside the capability park: a human must act (#11861).
+    let operator = WorkItem::new(1, vec!["loom:blocked".into(), "loom:operator".into()])
+        .with_body(Some(markers.to_string()));
+    assert!(operator.is_skipped_with_capabilities(&[], &held));
+    // A park record naming a blocker: it waits on another change too.
+    let named = WorkItem::new(2, vec!["loom:blocked".into()])
+        .with_body(Some(format!("{markers}\n<!-- loom:park Blocked by: #9 by=curator -->")));
+    assert!(named.is_skipped_with_capabilities(&[], &held));
     // loom:building — the daemon's own in-flight claim.
-    let building = WorkItem::new(
-        3,
-        vec![
-            "loom:operator-only".into(),
-            "loom:operator-mechanical".into(),
-            "loom:building".into(),
-        ],
-    )
-    .with_body(Some(markers.to_string()));
+    let building = WorkItem::new(3, vec!["loom:blocked".into(), "loom:building".into()])
+        .with_body(Some(markers.to_string()));
     assert!(building.is_skipped_with_capabilities(&[], &held));
     // A repo-configured extra skip label (#6685) still wins too.
     let extra = mechanical_item(4, &["host-sudo"]);
@@ -2619,14 +2586,14 @@ fn test_empty_held_set_is_byte_for_byte_is_skipped_with_extra() {
 #[test]
 fn test_capability_lane_does_not_touch_ordinary_items() {
     // A plain `loom:issue` row is dispatchable with or without the lane, and
-    // a plain `loom:operator-only` row is parked with or without it.
+    // an operator hold with no capability marker is parked with or without it.
     let held = caps(&["host-sudo", "forge-admin-token", "tailnet-access"]);
     assert!(!issue(1).is_skipped_with_capabilities(&[], &held));
-    let operator_only = WorkItem::new(2, vec!["loom:issue".into(), "loom:operator-only".into()])
-        .with_body(Some("<!-- loom:capability=host-sudo -->".to_string()));
+    let operator = WorkItem::new(2, vec!["loom:issue".into(), "loom:operator".into()])
+        .with_body(Some("an alert: no capability marker".to_string()));
     assert!(
-        operator_only.is_skipped_with_capabilities(&[], &held),
-        "a marker WITHOUT the mechanical sub-kind label changes nothing"
+        operator.is_skipped_with_capabilities(&[], &held),
+        "#11795: the lane keys on the marker; without one nothing changes"
     );
 }
 
@@ -2797,7 +2764,7 @@ fn tick_multi_with_two_hosts_only_the_matching_one_claims_the_pinned_issue() {
             },
         ),
     ];
-    let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut workspaces, &[1, 1], 10, &[false, false]);
 
     assert_eq!(report.dispatched, 1, "exactly one of the two hosts claims it");
     assert_eq!(report.skipped_host_constraint, 1, "the other host skips it");
@@ -2931,20 +2898,13 @@ fn test_tick_skips_issue_with_configured_extra_skip_label() {
 fn test_tick_dispatches_capability_matched_mechanical_item() {
     // #6893 AC1, end-to-end through `tick`: #1 declares `host-sudo` and
     // this host holds it (dispatched into the propose lane); #2 declares a
-    // capability this host does not hold; #3 is a `loom:operator-decision`
-    // item with the same marker in its body (hard-skipped, unchanged).
+    // capability this host does not hold; #3 is a `loom:operator` item with
+    // the same marker in its body (hard-skipped: no role acts on it, #11861).
     let mut source = FakeSource::once(vec![
         mechanical_item(1, &["host-sudo"]),
         mechanical_item(2, &["tailnet-access"]),
-        WorkItem::new(
-            3,
-            vec![
-                "loom:issue".into(),
-                "loom:operator-only".into(),
-                "loom:operator-decision".into(),
-            ],
-        )
-        .with_body(Some("<!-- loom:capability=host-sudo -->".to_string())),
+        WorkItem::new(3, vec!["loom:issue".into(), "loom:operator".into()])
+            .with_body(Some("<!-- loom:capability=host-sudo -->".to_string())),
     ]);
     let mut disp = RecordingDispatcher {
         declared_capabilities: caps(&["host-sudo"]),
@@ -2986,7 +2946,7 @@ fn test_tick_multi_capability_declaration_is_per_workspace() {
             RecordingDispatcher::default(),
         ),
     ];
-    let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut workspaces, &[1, 1], 10, &[false, false]);
 
     assert_eq!(report.dispatched, 1);
     assert_eq!(report.skipped_labeled, 1);
@@ -3018,7 +2978,7 @@ fn test_tick_multi_skips_issue_with_per_workspace_extra_skip_label() {
             RecordingDispatcher::default(),
         ),
     ];
-    let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut workspaces, &[1, 1], 10, &[false, false]);
 
     assert_eq!(report.skipped_labeled, 1, "only workspace A's #1 is skipped");
     assert_eq!(report.dispatched, 1, "workspace B's #1 still dispatches");

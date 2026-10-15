@@ -125,7 +125,7 @@ pub fn build_record(
             repo: repo.repo.clone(),
             visibility: repo.visibility,
             issue: row.issue,
-            workspace_priority: row.workspace_priority,
+            workspace_weight: row.workspace_weight,
             urgent: false,
             level: row.level,
             created_at: row.created_at.clone(),

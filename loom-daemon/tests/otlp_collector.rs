@@ -54,6 +54,9 @@ fn receiver_ready(address: &str) -> bool {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn real_collector_decodes_installed_binary_logs_metrics_and_correlated_traces() {
+    if !hub_image::available(IMAGE) {
+        return;
+    }
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/otlp_transport");
     let evidence = tempfile::tempdir().unwrap();
     let collector = Collector(format!("loom-8523-{}", std::process::id()));

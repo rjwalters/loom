@@ -61,10 +61,8 @@ pub use post_init::update_gitignore;
 pub use post_init::{is_credential_path, CREDENTIAL_PATTERNS};
 
 // Import the rest for internal use
-use git::{
-    link_dogfood_symlinks, resolve_defaults_path, validate_git_repository,
-    validate_loom_source_repo,
-};
+pub(crate) use git::link_dogfood_symlinks;
+use git::{resolve_defaults_path, validate_git_repository, validate_loom_source_repo};
 
 /// Report of files affected during initialization
 ///
@@ -664,7 +662,7 @@ fn merge_config_file(
     // `warn!` with a best-effort list of the key names visible in the discarded
     // text. A torn read caused by a concurrent writer is exactly the scenario
     // this needs to leave evidence for.
-    let mut existing_val: Value = match serde_json::from_str::<Value>(&existing_str) {
+    let existing_val: Value = match serde_json::from_str::<Value>(&existing_str) {
         Ok(v) if v.is_object() => v,
         parsed => {
             let reason = match parsed {
@@ -709,25 +707,6 @@ fn merge_config_file(
         }
     };
 
-    // Slice 3 of #11441 (#11451): a repo installed before #11445 may still
-    // commit the exact fleet keys the old template seeded. Strip them from
-    // the existing value BEFORE the merge — existing-wins would otherwise
-    // resurrect them over the now-clean template — but only on exact seed
-    // equality (see `fleet_policy::legacy_template_seeds`): a value an
-    // operator changed is real configuration, stays in place, and is
-    // reported by `validate --fleet-policy-only` instead. The strip runs
-    // only on this valid-object merge branch; the invalid-JSON fallback and
-    // the fresh-write branch never strip.
-    let pre_strip = existing_val.clone();
-    let stripped_seeds =
-        crate::fleet_policy::strip_legacy_template_seeds(&mut existing_val, &template_val);
-    if !stripped_seeds.is_empty() {
-        log::info!(
-            "init: config.json: stripped legacy template seed fleet key(s) {} — the current template no longer seeds them; fleet policy resolves from fleet-gitops (tier 1). Check for remaining per-repo overrides with `loom-daemon validate <path> --fleet-policy-only`.",
-            summarize_list(&stripped_seeds)
-        );
-    }
-
     // Deep-merge: template is the base, existing consumer values win on conflict.
     let mut merged = template_val;
     deep_merge_existing_wins(&mut merged, &existing_val);
@@ -743,8 +722,7 @@ fn merge_config_file(
     // call is about to make. With existing-wins semantics the expected shape is
     // additions only (new template keys); a `~` or `-` entry here means a
     // consumer value was overwritten or dropped and is worth investigating.
-    // Diffed against the pre-strip value so seed removals show as `-` entries.
-    let changes = describe_config_changes(&pre_strip, &merged);
+    let changes = describe_config_changes(&existing_val, &merged);
 
     let mut serialized = serde_json::to_string_pretty(&merged)
         .map_err(|e| format!("Failed to serialize merged config.json: {e}"))?;
@@ -1308,8 +1286,3 @@ mod payload_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod config_dir_tests;
-// #11451: the upgrade-time strip of legacy template-seeded fleet keys, in
-// its own file for the same file-size-ratchet reason as the modules above.
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod legacy_seed_strip_tests;

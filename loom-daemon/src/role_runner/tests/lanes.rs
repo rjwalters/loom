@@ -45,7 +45,7 @@ fn lane_of(decision: &RootTickDecision) -> Option<(usize, bool)> {
 
 fn probe(rows: Vec<u64>, stale: &'static [u64]) -> LaneProbe {
     LaneProbe {
-        queue: Arc::new(move |_| Ok(rows.clone())),
+        queue: Arc::new(move |_, _| Ok(rows.clone())),
         verdict: Arc::new(move |_, pr| !stale.contains(&pr)),
     }
 }
@@ -54,7 +54,7 @@ fn probe(rows: Vec<u64>, stale: &'static [u64]) -> LaneProbe {
 
 #[test]
 fn doctor_width_follows_its_own_repository_debt_clamped_to_max_per_repo() {
-    let cfg = DemandConfig::default(); // perRun 3, doctorMaxPerRepo 3
+    let cfg = DemandConfig::default(); // laneK 10, perRepoCap 3
     let changes = |n: usize| {
         let ledger = DemandLedger::default();
         let root = PathBuf::from("/tmp/loom-10632-width");
@@ -62,8 +62,8 @@ fn doctor_width_follows_its_own_repository_debt_clamped_to_max_per_repo() {
         ledger.repo_debt(&root, cfg.stale())
     };
     assert_eq!(demand::repo_lanes("doctor", &changes(1), &cfg), 1);
-    assert_eq!(demand::repo_lanes("doctor", &changes(3), &cfg), 1);
-    assert_eq!(demand::repo_lanes("doctor", &changes(4), &cfg), 2);
+    assert_eq!(demand::repo_lanes("doctor", &changes(10), &cfg), 1);
+    assert_eq!(demand::repo_lanes("doctor", &changes(11), &cfg), 2);
     assert_eq!(demand::repo_lanes("doctor", &changes(60), &cfg), 3, "clamped");
     assert_eq!(demand::repo_lanes("doctor", &changes(0), &cfg), 1, "drained ⇒ classic");
     assert_eq!(
@@ -71,7 +71,7 @@ fn doctor_width_follows_its_own_repository_debt_clamped_to_max_per_repo() {
         1,
         "unobserved ⇒ classic"
     );
-    for role in ["judge", "champion", "curator"] {
+    for role in ["champion", "curator"] {
         assert_eq!(demand::repo_lanes(role, &changes(60), &cfg), 1, "{role} keeps one");
     }
     let off = DemandConfig {
@@ -156,7 +156,7 @@ fn a_cold_repository_and_other_roles_keep_one_instance() {
     let ws = workspace(ENABLED);
     let ledger = ledger();
     ledger.record(ws.path(), DebtAxis::Changes, 2);
-    ledger.record(ws.path(), DebtAxis::Review, 60);
+    ledger.record(ws.path(), DebtAxis::Review, 2);
     let in_progress = new_in_progress_guard();
     let first = admit(ws.path(), "doctor", &in_progress, ledger);
     assert_eq!(lane_of(&first), Some((0, false)), "classic, unassigned run");
@@ -186,28 +186,37 @@ fn lanes_still_count_against_the_host_ceiling_and_doctor_budget() {
         .map(|_| admit(ceiling_two.path(), "doctor", &in_progress, ledger))
         .collect();
     assert!(held.iter().all(|d| lane_of(d).is_some()), "{held:?}");
+    // The lane rule trims the repository's three wished lanes to the two the
+    // host can hold (#10630), so the third attempt finds every lane in flight.
     assert!(matches!(
         admit(ceiling_two.path(), "doctor", &in_progress, ledger),
-        RootTickDecision::Refused(LimitRefusal::Ceiling {
-            active: 2,
-            ceiling: 2
-        })
+        RootTickDecision::InProgress
     ));
 
-    // Budget: doctor's host budget is 3 at the default ceiling, so a hot repo
-    // holding three lanes leaves another repository's doctor refused.
+    // Budget: doctor's host budget is 3 at the default ceiling. The hot repo
+    // wishes three lanes, but the lane rule (#10630) trims its extra lane so the
+    // cold repository's first lane still fits under the same budget.
     let (hot, other) = (workspace(ENABLED), workspace(ENABLED));
     let ledger = self::ledger();
     ledger.record(hot.path(), DebtAxis::Changes, 60);
     ledger.record(other.path(), DebtAxis::Changes, 1);
     let in_progress = new_in_progress_guard();
-    let _lanes: Vec<_> = (0..3)
+    let lanes: Vec<_> = (0..3)
         .map(|_| admit(hot.path(), "doctor", &in_progress, ledger))
         .collect();
-    let refused = admit(other.path(), "doctor", &in_progress, ledger);
+    assert_eq!(
+        lanes.iter().map(lane_of).collect::<Vec<_>>(),
+        vec![Some((0, true)), Some((1, true)), None],
+        "hot repository trimmed to two lanes"
+    );
+    let cold = admit(other.path(), "doctor", &in_progress, ledger);
+    assert_eq!(lane_of(&cold), Some((0, false)), "{cold:?}");
+    let refused = admit(other.path(), "judge", &in_progress, ledger);
+    assert!(lane_of(&refused).is_some(), "judge has its own budget: {refused:?}");
+    let full = admit(hot.path(), "doctor", &in_progress, ledger);
     assert!(
-        matches!(refused, RootTickDecision::Refused(LimitRefusal::RoleBudget { active: 3, .. })),
-        "{refused:?}"
+        matches!(full, RootTickDecision::InProgress | RootTickDecision::Refused(_)),
+        "{full:?}"
     );
 }
 
@@ -233,20 +242,22 @@ fn doctor_max_per_repo_one_is_the_classic_admission() {
 fn concurrent_lanes_are_assigned_distinct_prs_and_a_finished_lane_frees_its_pr() {
     let root = PathBuf::from("/tmp/loom-10632-assign-distinct");
     let p = probe(vec![11, 12, 13], &[]);
-    let LaneTarget::Pr(a) = assign(&p, &root, 0) else {
+    let LaneTarget::Pr(a) = assign(&p, "doctor", &root, 0) else {
         panic!("lane 0 gets the queue head")
     };
-    let LaneTarget::Pr(b) = assign(&p, &root, 1) else {
+    let LaneTarget::Pr(b) = assign(&p, "doctor", &root, 1) else {
         panic!("lane 1 gets the next row")
     };
     assert_eq!((a.pr(), b.pr()), (11, 12));
     // Another repository's lanes do not see this one's holds.
-    let LaneTarget::Pr(elsewhere) = assign(&p, Path::new("/tmp/loom-10632-assign-other"), 1) else {
+    let LaneTarget::Pr(elsewhere) =
+        assign(&p, "doctor", Path::new("/tmp/loom-10632-assign-other"), 1)
+    else {
         panic!("a different root starts at its own head")
     };
     assert_eq!(elsewhere.pr(), 11);
     drop(a);
-    let LaneTarget::Pr(c) = assign(&p, &root, 2) else {
+    let LaneTarget::Pr(c) = assign(&p, "doctor", &root, 2) else {
         panic!("the freed head is assignable again")
     };
     assert_eq!(c.pr(), 11);
@@ -255,7 +266,8 @@ fn concurrent_lanes_are_assigned_distinct_prs_and_a_finished_lane_frees_its_pr()
 #[test]
 fn stale_verdicts_are_skipped_and_the_guard_runs_on_a_bounded_number_of_rows() {
     let root = PathBuf::from("/tmp/loom-10632-assign-stale");
-    let LaneTarget::Pr(hold) = assign(&probe(vec![21, 22, 23], &[21, 22]), &root, 1) else {
+    let LaneTarget::Pr(hold) = assign(&probe(vec![21, 22, 23], &[21, 22]), "doctor", &root, 1)
+    else {
         panic!("the first fresh row is taken")
     };
     assert_eq!(hold.pr(), 23);
@@ -263,13 +275,13 @@ fn stale_verdicts_are_skipped_and_the_guard_runs_on_a_bounded_number_of_rows() {
     let calls = Arc::new(AtomicUsize::new(0));
     let c = Arc::clone(&calls);
     let all_stale = LaneProbe {
-        queue: Arc::new(|_| Ok((100..120).collect())),
+        queue: Arc::new(|_, _| Ok((100..120).collect())),
         verdict: Arc::new(move |_, _| {
             c.fetch_add(1, Ordering::SeqCst);
             false
         }),
     };
-    assert!(matches!(assign(&all_stale, &root, 1), LaneTarget::Nothing));
+    assert!(matches!(assign(&all_stale, "doctor", &root, 1), LaneTarget::Nothing));
     assert_eq!(calls.load(Ordering::SeqCst), VERDICT_ATTEMPTS);
     assert!(LaneAssignment::reserve(&root, 100).is_some(), "a rejected row is not left held");
 }
@@ -278,9 +290,9 @@ fn stale_verdicts_are_skipped_and_the_guard_runs_on_a_bounded_number_of_rows() {
 fn an_unreadable_queue_runs_lane_zero_classic_and_stands_extra_lanes_down() {
     let root = PathBuf::from("/tmp/loom-10632-assign-error");
     let none = LaneProbe::none();
-    assert!(matches!(assign(&none, &root, 0), LaneTarget::Unassigned));
-    assert!(matches!(assign(&none, &root, 1), LaneTarget::Nothing));
-    assert!(matches!(assign(&probe(vec![], &[]), &root, 0), LaneTarget::Nothing));
+    assert!(matches!(assign(&none, "doctor", &root, 0), LaneTarget::Unassigned));
+    assert!(matches!(assign(&none, "doctor", &root, 1), LaneTarget::Nothing));
+    assert!(matches!(assign(&probe(vec![], &[]), "doctor", &root, 0), LaneTarget::Nothing));
 }
 
 // -- dispatcher --------------------------------------------------------------

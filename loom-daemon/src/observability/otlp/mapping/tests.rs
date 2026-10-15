@@ -15,8 +15,8 @@ mod loom_kind;
 mod record_id;
 mod start_facts;
 use crate::telemetry::{
-    HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord, SweepDisposition,
-    SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
+    HostHealthRecord, MemoryPressureSummary, PhaseDuration, RoleTickResult, SweepCompletedRecord,
+    SweepDisposition, SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
     TokenSnapshotRecord,
 };
 
@@ -155,6 +155,7 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             previous_sweep_id: None,
             trigger: None,
             dispatch_origin: None,
+            role_draw: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,
@@ -857,6 +858,7 @@ fn role_tick_outcome_envelope(
             // Issue #8599: no preference list decided this tick.
             preference_tier: None,
             preference_tap: None,
+            role_draw: None,
             // Issue #8507: a Claude tick writes no launch record.
             runtime: None,
             provider: None,

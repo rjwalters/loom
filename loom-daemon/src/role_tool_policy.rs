@@ -100,7 +100,6 @@
 use std::path::{Path, PathBuf};
 
 pub mod command_match;
-pub mod forge_egress;
 
 /// The capability namespace, in the order the guard documents it and the order
 /// specs are emitted in.

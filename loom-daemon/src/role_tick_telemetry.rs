@@ -117,6 +117,9 @@ pub struct RoleTickTelemetry {
     /// The chosen tap's `<runtime>[:<profile>]` identity (Issue #8599).
     /// Present exactly when [`Self::preference_tier`] is.
     pub preference_tap: Option<String>,
+    /// The role draw's decision record when `runtimes.roleDraw` chose the
+    /// tap (#11726).
+    pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -281,7 +284,7 @@ pub fn emit_for_tick_correlated(
         role,
         started_at,
         outcome,
-        trace.as_ref().map(|t| t.execution.clone()),
+        trace.as_ref(),
     );
     let (result, detail) = classify(outcome);
     let (model, effort) = match &resolved {
@@ -292,6 +295,9 @@ pub fn emit_for_tick_correlated(
     // launch the preference list did not decide has none either — absent, not
     // a fabricated `0`, which would read as "chose the top tap".
     let preference = resolved.and_then(|resolved| resolved.preference);
+    let role_draw = preference
+        .as_ref()
+        .and_then(|stamp| stamp.draw.as_deref().cloned());
     emit_correlated(
         &RoleTickTelemetry {
             root: root.to_path_buf(),
@@ -307,6 +313,7 @@ pub fn emit_for_tick_correlated(
                 .as_ref()
                 .and_then(|stamp| u32::try_from(stamp.tier).ok()),
             preference_tap: preference.map(|stamp| stamp.tap),
+            role_draw,
         },
         trace,
     );
@@ -608,6 +615,7 @@ pub fn build_record(
         gated_pool: tick.gated_pool.clone().filter(|p| !p.is_empty()),
         preference_tier: tick.preference_tier,
         preference_tap: tick.preference_tap.clone().filter(|t| !t.is_empty()),
+        role_draw: tick.role_draw.clone(),
         // Populated by `emit` via `apply_runtime_attribution` (Issue #8507):
         // that resolution needs a filesystem read this function deliberately
         // stays free of (see the doc comment above).
@@ -790,6 +798,10 @@ fn emit_correlated(
             path.display()
         );
     }
+    // #11858: the record also goes to SigNoz, joined to the tick's trace, so
+    // a tick that never spawned (pool exhausted, runtime rejected, queue
+    // empty) is visible there. The journal above stays the local copy.
+    export(&envelope);
     // #9168: join the story of every issue/PR this tick wrote to — after the
     // durable record, so a slow forge lookup can never cost the tick record.
     if let (Some(trace), Some(rows)) = (&trace, &tokens_by_model) {
@@ -798,7 +810,7 @@ fn emit_correlated(
             trace,
             &tick.role,
             tick.ended_at,
-            story_runtime.as_deref(),
+            usage::span_runtime(story_runtime.as_deref(), source),
             llm_billing.as_ref(),
             rows,
         );
@@ -830,6 +842,30 @@ fn emit_correlated(
         };
         story::emit(&tick.root, &facts, &targets);
     }
+}
+
+/// Offer a `role_tick.outcome` envelope to the OTLP exporters (#11858). A
+/// no-op with no OTLP exporter; the record's mapping exports no free-form
+/// `detail`.
+fn export(envelope: &TelemetryEnvelope) {
+    if crate::observability::ops::records_exported() {
+        crate::observability::ops::emit_record_in(
+            exportable(envelope.record.clone()),
+            envelope.trace_context.clone(),
+        );
+    }
+}
+
+/// The exported copy of a record: a repo that is not a forge `owner/repo`
+/// (the local journal's path fallback) reads `repo_unresolved`, so no local
+/// path reaches the wire (#9442).
+fn exportable(mut record: TelemetryRecord) -> TelemetryRecord {
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut record {
+        if !crate::agent_gh::classify::is_slug(&r.repo) {
+            r.repo = crate::observability::pick_decision::REPO_UNRESOLVED.to_string();
+        }
+    }
+    record
 }
 
 /// Whether the role log's last preference marker records a metered-backstop

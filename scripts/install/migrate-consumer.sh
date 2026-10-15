@@ -33,7 +33,7 @@
 #      section to describe the daemon-model surface.
 #
 # Source this file (for the test suite) OR run it directly:
-#     bash scripts/install/migrate-consumer.sh <repo> [--dry-run] [--priority N] [--force]
+#     bash scripts/install/migrate-consumer.sh <repo> [--dry-run] [--weight N] [--force]
 #
 # Reuses the established installer patterns:
 #   - scripts/install/manifest.sh        (_emit_loom_ownership_set — #3450 boundary)
@@ -528,18 +528,18 @@ mc_apply_gitignore() {
 # this migration has already put the repo in the correct daemon-model shape, so
 # registration here should be registration-only.
 mc_register_workspace() {
-    local repo="$1" priority="$2" dry_run="$3"
+    local repo="$1" weight="$2" dry_run="$3"
     if ! command -v loom-daemon >/dev/null 2>&1; then
         mc_warn "loom-daemon not on PATH — skipping workspace registration."
-        mc_warn "  register later with: loom-daemon workspace add \"$repo\" --priority $priority --no-init"
+        mc_warn "  register later with: loom-daemon workspace add \"$repo\" --weight $weight --no-init"
         return 0
     fi
     if [[ "$dry_run" == "1" ]]; then
-        mc_report "would register" "$repo" "loom-daemon workspace add --priority $priority --no-init"
+        mc_report "would register" "$repo" "loom-daemon workspace add --weight $weight --no-init"
         return 0
     fi
-    if loom-daemon workspace add "$repo" --priority "$priority" --no-init >/dev/null 2>&1; then
-        mc_report registered "$repo" "loom-daemon workspace (priority $priority)"
+    if loom-daemon workspace add "$repo" --weight "$weight" --no-init >/dev/null 2>&1; then
+        mc_report registered "$repo" "loom-daemon workspace (weight $weight)"
     else
         # add is idempotent-ish; a duplicate is not a failure worth aborting on.
         mc_warn "loom-daemon workspace add returned non-zero (already registered?)"
@@ -795,19 +795,19 @@ Migrate a historical file-copy Loom install to the machine-level daemon model.
 
 Options:
   --dry-run          Print the full file-by-file plan; make no changes.
-  --priority N       Workspace registry priority (default: 3).
+  --weight N         Workspace draw weight (default: 1; higher = more draws).
   --force            Proceed even when the working tree has uncommitted changes.
   -h, --help         Show this help.
 EOF
 }
 
 mc_main() {
-    local repo="" dry_run=0 priority=3 force=0
+    local repo="" dry_run=0 weight=1 force=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dry-run|-n) dry_run=1 ;;
-            --priority)   priority="${2:-3}"; shift ;;
-            --priority=*) priority="${1#--priority=}" ;;
+            --weight)     weight="${2:-1}"; shift ;;
+            --weight=*)   weight="${1#--weight=}" ;;
             --force)      force=1 ;;
             -h|--help)    mc_usage; return 0 ;;
             -*)           mc_err "unknown option: $1"; mc_usage; return 2 ;;
@@ -862,7 +862,7 @@ mc_main() {
     mc_fix_mcp           "$repo" "$dry_run"
     mc_restamp_metadata  "$repo" "$dry_run"
     mc_update_claude_md  "$repo" "$dry_run"
-    mc_register_workspace "$repo" "$priority" "$dry_run"
+    mc_register_workspace "$repo" "$weight" "$dry_run"
 
     if [[ "$dry_run" == "1" ]]; then
         mc_info "── dry run complete — no changes made ──"

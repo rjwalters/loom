@@ -70,6 +70,18 @@
 #                          just printing manual instructions. Pass this to
 #                          always print the manual instructions instead.
 #   --cleanup-primary      (no-op, primary-checkout cleanup is the default)
+#   --expected-head <sha>  Fail-closed head pin (#11859): refuse (exit 8) unless
+#                          the PR's head is exactly this full SHA, checked on
+#                          the first uncached PR read and again on the merge
+#                          precondition read, which then gates the forge merge
+#                          call on the CALLER's SHA instead of its own read. A
+#                          targeted Champion (`/loom:champion --pr N`) passes
+#                          the head it evaluated, so a push after its
+#                          evaluation can never be merged under its verdict.
+#                          Any later head move exits 3: under the pin the #8164
+#                          self-sync retry is declined (its check reads only the
+#                          merge commit's parents, never its tree), so a fresh
+#                          evaluation of the new head always comes first.
 #
 # By default, the local worktree AND the local branch it held are cleaned up
 # after a successful merge (#4100). Pass --no-cleanup-worktree to skip both
@@ -136,6 +148,10 @@
 #       loom:sequenced and no other blocker. Prints `LOOM-SEQUENCED-HOLD
 #       pr=<N> after=<M>`; the predecessor landing clears it (#9378). Re-queue
 #       later; it has no cap of its own (sequence-eval owns release).
+#   8 = --expected-head refused (#11859): the PR head is not the SHA the
+#       caller evaluated. Prints `LOOM-EXPECTED-HEAD-MISMATCH pr=<N>
+#       expected=<sha> actual=<sha|unknown>`. Nothing written; the caller's
+#       evaluation is stale, so re-evaluate the new head, never retry blind.
 
 set -euo pipefail
 
@@ -144,9 +160,8 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
 error() { echo -e "${RED}Error: $*${NC}" >&2; exit 1; }
-info() { echo -e "${BLUE}$*${NC}"; }
-success() { echo -e "${GREEN}$*${NC}"; }
-warning() { echo -e "${YELLOW}$*${NC}"; }
+# info/success/warning joined onto one line: file-size/shell-budget offset for #11859's --expected-head.
+info() { echo -e "${BLUE}$*${NC}"; }; success() { echo -e "${GREEN}$*${NC}"; }; warning() { echo -e "${YELLOW}$*${NC}"; }
 # #5579: distinct from error() (exit 1) — see "Exit codes" above. Emits to
 # stderr like error() so it is visible in logs, but exits 3 so the caller can
 # tell "re-queue" from "genuinely failed" without parsing message text.
@@ -164,6 +179,10 @@ error_head_moved() {
   fi
   exit 3
 }
+
+# #11859: --expected-head's fail-closed pin. Distinct exit 8: unlike 3 (a race
+# lost mid-merge, re-queue) the caller's evaluation itself is of another tree.
+_check_expected_head() { [[ -z "$EXPECTED_HEAD_SHA" || "$1" == "$EXPECTED_HEAD_SHA" ]] && return 0; echo "LOOM-EXPECTED-HEAD-MISMATCH pr=$PR_NUMBER expected=$EXPECTED_HEAD_SHA actual=${1:-unknown}"; echo -e "${RED}Error: Merge refused: PR #$PR_NUMBER head is ${1:-unreadable}, not the --expected-head $EXPECTED_HEAD_SHA the caller evaluated (#11859). Nothing was merged or written; re-evaluate the current head.${NC}" >&2; exit 8; }
 
 # Which route a FAILED merge's forge error TEXT sends the retry loop below down
 # (#8191 slice). Prints one of: merge-in-progress (HTTP 405), head-mismatch
@@ -237,6 +256,11 @@ _mr_say() { local l="${_MR#*$'\n'"$1"$'\t'}"; [[ "$l" != "$_MR" ]] || l="PR #$PR
 # (a rebase-style update, a commit pushed on top, a merge of some other
 # branch) stays the #5579 hard stop.
 #
+# Under --expected-head (#11859) the retry is declined: the check reads
+# parents, not the tree, and a pinned caller re-evaluates instead. The verb
+# still classifies the move, so a retry it would allow is refused here naming
+# the pin (#11902), never as a spent budget.
+#
 # Fails safe by construction: only exit 0 PLUS the sentinel retries, so a
 # missing/old/substituted binary, a forge read failure, or any silent failure
 # lands on the pre-#8164 behaviour — exit 3, re-queue — which is why this
@@ -246,7 +270,7 @@ _head_moved_or_resync() {
   local _CURRENT_HEAD_SHA="" _CHR_JSON _HMR_OUT _HMR_RC=0 _HMR_FLAGS=(); _CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"; _CURRENT_HEAD_SHA="$(echo "$_CHR_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"; unset _CHR_JSON
   [[ "${_HEAD_SELF_SYNCED:-}" == "true" ]] && _HMR_FLAGS+=(--self-synced); [[ "${_HEAD_RESYNC_USED:-}" == "true" || "${MERGE_ATTEMPT:-1}" -ge "${MAX_MERGE_RETRIES:-3}" ]] && _HMR_FLAGS+=(--retry-used); [[ "${2:-}" == "exit-code" ]] && _HMR_FLAGS+=(--mismatch-confirmed)
   _HMR_OUT="$(printf '%s' "$1" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr head-sync-retry --pr "$PR_NUMBER" --repo "$REPO_NWO" --precondition-sha "$MERGE_PRECONDITION_SHA" "${_HMR_FLAGS[@]+"${_HMR_FLAGS[@]}"}" 2>/dev/null)" || _HMR_RC=$?
-  if [[ $_HMR_RC -eq 0 && "$_HMR_OUT" == "LOOM-HEAD-SELF-SYNC-RETRY "* ]]; then _HEAD_RESYNC_USED=true; MERGE_PRECONDITION_SHA="${_HMR_OUT##* }"; info "PR #$PR_NUMBER: head-SHA mismatch attributed to this run's own base-sync; retrying once against ${MERGE_PRECONDITION_SHA:0:8} (#8164)"; return 0; fi
+  if [[ $_HMR_RC -eq 0 && "$_HMR_OUT" == "LOOM-HEAD-SELF-SYNC-RETRY "* ]]; then if [[ -n "${EXPECTED_HEAD_SHA:-}" ]]; then _HMR_OUT="PR #$PR_NUMBER: the head moved by this run's own base-sync, but the --expected-head pin forbids the #8164 retry: the new head ${_HMR_OUT##* } was never evaluated, so re-evaluate it (#11902)"; else _HEAD_RESYNC_USED=true; MERGE_PRECONDITION_SHA="${_HMR_OUT##* }"; info "PR #$PR_NUMBER: head-SHA mismatch attributed to this run's own base-sync; retrying once against ${MERGE_PRECONDITION_SHA:0:8} (#8164)"; return 0; fi; fi
   [[ -n "$_HMR_OUT" ]] && warning "$_HMR_OUT"; error_head_moved "PR #$PR_NUMBER: $1" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"
 }
 
@@ -386,13 +410,13 @@ CLEANUP_PRIMARY_CHECKOUT=true; DRY_RUN=false; AUTO_MERGE=false; WORKTREE_PATH_OV
 # ALLOW_RED_TREE (#10026): bypasses _check_tree_checks. ALLOW_RED_REQUIRED (#10688): contexts
 # _check_required_checks may merge over red. MERGE_METHOD_REQUESTED (#8845): explicit
 # --merge-method override, resolved against REPO_MERGE_METHOD once parsing is done.
-ALLOW_UNAPPROVED=false; ALLOW_RED_TREE=false; ALLOW_RED_REQUIRED=(); MERGE_METHOD_REQUESTED=""
+ALLOW_UNAPPROVED=false; ALLOW_RED_TREE=false; ALLOW_RED_REQUIRED=(); MERGE_METHOD_REQUESTED=""; EXPECTED_HEAD_SHA=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --cleanup-worktree) shift ;;  # no-op, cleanup is now the default
+    --cleanup-worktree|--cleanup-primary) shift ;;  # no-ops, both cleanups are now the default (one arm: #11859 offset)
     --no-cleanup-worktree) CLEANUP_WORKTREE=false; shift ;;
-    --cleanup-primary) shift ;;  # no-op, primary-checkout cleanup is now the default
+    --expected-head) [[ $# -ge 2 && "$2" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || error "--expected-head requires a full lowercase hex commit SHA (40 or 64 chars)"; EXPECTED_HEAD_SHA="$2"; shift 2 ;;
     --no-cleanup-primary) CLEANUP_PRIMARY_CHECKOUT=false; shift ;;
     # The two --worktree-path arms are joined onto one line each (verbatim,
     # behavior-preserving) to PAY for the portable-shell lines --redate-stale-checks
@@ -422,7 +446,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--no-cleanup-primary] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children] [--allow-unapproved] [--allow-red-tree] [--allow-red-required <context>]... [--redate-stale-checks] [--merge-method squash|merge|rebase]"
+[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--no-cleanup-primary] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children] [--allow-unapproved] [--allow-red-tree] [--allow-red-required <context>]... [--redate-stale-checks] [--merge-method squash|merge|rebase] [--expected-head <sha>]"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || error "PR number must be numeric: $PR_NUMBER"
 
 # #8845: an explicit --merge-method overrides REPO_MERGE_METHOD's auto-detect
@@ -512,6 +536,9 @@ case "$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr pr-state --state "$PR_STATE" 
   "LOOM-PR-STATE MERGED") warning "PR #$PR_NUMBER is already merged"; exit 0 ;;
   "LOOM-PR-STATE CLOSED") error "PR #$PR_NUMBER is closed (not merged)" ;; "LOOM-PR-STATE OPEN") ;;
   *) [[ "$PR_MERGED" != "true" ]] || { warning "PR #$PR_NUMBER is already merged"; exit 0; }; [[ "$PR_STATE" != "closed" ]] || error "PR #$PR_NUMBER is closed (not merged)" ;; esac
+# #11859: pin the caller's evaluated head BEFORE any gate below can write (a
+# redate push, a parent-ref pin, a label) on behalf of a tree it never saw.
+_check_expected_head "$PR_HEAD_SHA"
 
 # ---------------------------------------------------------------------------
 # Pre-merge merge-ordering guard (#3747, stacked-PR v2 item 2; reshaped by
@@ -1509,17 +1536,27 @@ _strip_one_closed_issue_building_label() {
 
   issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
   out="$(printf '%s\n' "$issue_json" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr closed-building 2>/dev/null)" || rc=$?
-  if [[ $rc -ne 0 || ( "$out" != "STRIP" && "$out" != "SKIP"$'\t'* ) ]]; then
+  if [[ $rc -ne 0 || ( "$out" != STRIP && "$out" != STRIP-READY && "$out" != STRIP-BOTH && "$out" != "SKIP"$'\t'* ) ]]; then
     warning "Closed-issue loom:building cleanup for issue #$issue_num did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr closed-building' exited $rc and printed '${out//$'\n'/ }' rather than STRIP or SKIP (a loom-daemon predating #8191's slice has no such verb). Advisory only — the merge already happened and #$issue_num was left untouched; if it is closed and still loom:building, drop the stale claim by hand: gh issue edit $issue_num --repo $REPO_NWO --remove-label loom:building $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
     return 0
   fi
-  [[ "$out" == "STRIP" ]] || return 0
+  local labels=()
+  case "$out" in
+    STRIP) labels=(loom:building) ;;
+    # #11517 (operator ruling 2026-10-13): a closed issue also loses loom:issue.
+    STRIP-READY) labels=(loom:issue) ;;
+    STRIP-BOTH) labels=(loom:building loom:issue) ;;
+    *) return 0 ;;
+  esac
 
-  if forge_gh_remove_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" 2>/dev/null; then
-    success "Issue #$issue_num: removed stale loom:building label (closed by this merge, #6199)"
-  else
-    warning "Could not remove loom:building from closed issue #$issue_num — may need manual: gh issue edit $issue_num --repo $REPO_NWO --remove-label loom:building"
-  fi
+  local label
+  for label in "${labels[@]}"; do
+    if forge_gh_remove_label_rl_safe "$REPO_NWO" "$issue_num" "$label" 2>/dev/null; then
+      success "Issue #$issue_num: removed stale $label label (closed by this merge, #6199/#11517)"
+    else
+      warning "Could not remove $label from closed issue #$issue_num — may need manual: gh issue edit $issue_num --repo $REPO_NWO --remove-label $label"
+    fi
+  done
 }
 
 # Resolve this PR's closing issue targets and strip loom:building from each
@@ -2106,7 +2143,8 @@ _wait_for_checks_then_sync_merge() {
 MERGE_PRECONDITION_SHA="$PR_HEAD_SHA"
 _MPS_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
 _MPS_FRESH_SHA="$(echo "$_MPS_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"
-[[ -n "$_MPS_FRESH_SHA" ]] && MERGE_PRECONDITION_SHA="$_MPS_FRESH_SHA"
+# #11859: under --expected-head the fresh read must equal the caller's SHA, and the caller's SHA is what the forge merge call is gated on.
+[[ -n "$_MPS_FRESH_SHA" ]] && MERGE_PRECONDITION_SHA="$_MPS_FRESH_SHA"; _check_expected_head "$MERGE_PRECONDITION_SHA"; MERGE_PRECONDITION_SHA="${EXPECTED_HEAD_SHA:-$MERGE_PRECONDITION_SHA}"
 # #10567: the CI-run gate above judged $PR_HEAD_SHA; a head that moved by this read is re-gated on the SHA the merge call will name (--auto does it after its wait). Joined onto the unset line: file-size/shell-budget offset.
 unset _MPS_JSON _MPS_FRESH_SHA; [[ "$MERGE_PRECONDITION_SHA" == "$PR_HEAD_SHA" || "$AUTO_MERGE" == "true" ]] || _check_ci_result settled; [[ "$AUTO_MERGE" == "true" ]] || _check_required_checks
 
@@ -2730,7 +2768,7 @@ _remove_loom_worktree() {
   #     records, not worktree/branch-name collision, and would not have caught
   #     #5031 (the colliding worktree came from a separate host that never
   #     touched this daemon's lock).
-  #   - #4146 (open, loom:operator-only): *measures* the cross-host collision
+  #   - #4146 (open, operator-held): *measures* the cross-host collision
   #     rate (observation only, behavior unchanged on collision by design). This
   #     guard is the behavioral mitigation for the data-loss instance #4146 is
   #     meant to eventually quantify.

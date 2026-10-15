@@ -1162,17 +1162,17 @@ pub fn spawn_multi_supervisor_thread(
                     }
                 }
 
-                // Cross-repo priority ordering (#3946): reorder the parallel
-                // `roots` / `supervisors` vectors by workspace priority (lower =
-                // higher priority) before ticking, so higher-tier repos' epics
-                // are advanced/dispatched ahead of lower-tier ones. The sort is
-                // stable, so repos sharing a tier keep their provisioning order,
+                // Cross-repo ordering (#3946, #11742): reorder the parallel
+                // `roots` / `supervisors` vectors by workspace draw weight
+                // (higher first) before ticking, so heavier repos' epics are
+                // advanced/dispatched ahead of lighter ones. The sort is
+                // stable, so repos sharing a weight keep their provisioning order,
                 // and each supervisor's per-epic ledger moves with it (ownership
                 // is transferred through the drain/collect below).
                 if supervisors.len() > 1 {
                     let mut paired: Vec<(PathBuf, EpicSupervisor<_, _>)> =
                         roots.drain(..).zip(supervisors.drain(..)).collect();
-                    paired.sort_by_key(|(root, _)| registry.priority_of(root));
+                    paired.sort_by_key(|(root, _)| std::cmp::Reverse(registry.weight_of(root)));
                     for (root, supervisor) in paired {
                         roots.push(root);
                         supervisors.push(supervisor);
@@ -1333,9 +1333,10 @@ pub mod forge {
             // ETag-cached REST listing (#4428): unchanged epic sets cost zero
             // rate limit (304). REST reports state lowercase (`"open"` vs
             // GraphQL's `"OPEN"`) — `EpicSnapshot::is_open` compares
-            // case-insensitively, so both forms are safe. The `pull_request`
-            // filter keeps the pre-#4428 issue-only semantics.
-            let rows = crate::forge_listing::list_issues_cached_as(
+            // case-insensitively, so both forms are safe. The issues-only
+            // listing keeps the pre-#4428 semantics (#9929: PR rows must
+            // never reach an issue-targeting consumer).
+            let rows = crate::forge_listing::list_issues_only_cached_as(
                 "epic_supervisor",
                 &self.gh_bin,
                 self.cwd.as_deref(),
@@ -1345,7 +1346,6 @@ pub mod forge {
             )?;
             Ok(rows
                 .into_iter()
-                .filter(|r| !r.is_pull_request)
                 .map(|r| GhIssue {
                     number: r.number,
                     // REST `body` is nullable; the GraphQL-era parse defaulted

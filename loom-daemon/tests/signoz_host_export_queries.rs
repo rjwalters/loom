@@ -180,6 +180,9 @@ fn sql_query(n: usize) -> String {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn replayed_queries_find_silent_roster_hosts_and_drop_steps() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // Queries 1 and 2: increment, no-increase, reset, no-baseline, baseline.
     let q1: BTreeMap<String, f64> = rows(&clickhouse(&format!("{FIXTURE}\n{}", sql_query(1))))
         .iter()
@@ -253,6 +256,9 @@ fn replayed_queries_find_silent_roster_hosts_and_drop_steps() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn replayed_exporter_loss_keeps_reset_steps_and_unknown_coverage() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // Change only the clock expression, not the committed accounting SQL.
     let query = sql_query(4).replace("now64(9)", "toDateTime64('2026-10-12 17:10:00', 9, 'UTC')");
     let fixture = include_str!("fixtures/signoz_host_export/loss_steps.sql");

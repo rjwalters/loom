@@ -1,8 +1,9 @@
 //! Config resolution layer (#4039, Epic #3835 Phase 2).
 //!
 //! A single resolver over the tier chain: private/shared defaults, the
-//! legacy `.loom/config.json`, tracked `.loom-project/project.json`, and
-//! ignored `.loom-local/local.json`. See
+//! legacy `.loom/config.json`, tracked `.loom-project/project.json`, the
+//! per-repo fleet tier `.loom-local/fleet-repo.json` (#11738), and ignored
+//! `.loom-local/local.json`. See
 //! `docs/design/config-resolution-tiers.md` for the full design (schema,
 //! precedence table, and how this composes with the existing **env >
 //! config > default** rule used by e.g. the `autonomous` block).
@@ -30,6 +31,22 @@ pub const PROJECT_CONFIG_REL: &str = ".loom-project/project.json";
 /// Repo-relative path to the ignored, host-local config override file.
 /// Empty (absent) in every repo until Phase 3+.
 pub const LOCAL_CONFIG_REL: &str = ".loom-local/local.json";
+
+/// Repo-relative path to the **per-repo fleet tier** (#11738): this repo's
+/// `config` object from the fleet config repo's compiled `fleet.json`
+/// (`repos[].config`), materialized here by the fleet sync
+/// ([`crate::fleet_sync`]). It sits above the repo's committed config
+/// (`.loom/config.json` and `.loom-project/project.json`) so a fleet-wide or
+/// class-wide value reaches a repo even when the repo commits the same key,
+/// and below [`LOCAL_CONFIG_REL`] so the host-local escape hatch still wins.
+///
+/// It lives under `.loom-local/` because that directory is gitignored by
+/// every Loom install, so the materialized file never dirties a tree. The
+/// file is owned by the fleet sync: it is rewritten when the record's
+/// `config` changes and removed when the record has none. Absent on any host
+/// whose fleet store has no per-repo config, in which case resolution is
+/// exactly what it was before this tier existed.
+pub const FLEET_REPO_CONFIG_REL: &str = ".loom-local/fleet-repo.json";
 
 /// Env var overriding the private/shared defaults file location. Set to a
 /// non-empty path to point at an alternate file; set to the empty string to
@@ -221,7 +238,10 @@ pub fn deep_merge(base: &Value, overlay: &Value) -> Value {
 /// 2. Legacy `.loom/config.json` — the sole tier every existing repo has.
 /// 3. Tracked `.loom-project/project.json` — new in #4039; empty until a
 ///    repo migrates (Phase 6).
-/// 4. Ignored `.loom-local/local.json` — new in #4039; host-local override.
+/// 4. Per-repo fleet tier `.loom-local/fleet-repo.json`
+///    ([`FLEET_REPO_CONFIG_REL`], #11738) — written by the fleet sync from
+///    the fleet store's `repos[].config`; beats the repo's committed config.
+/// 5. Ignored `.loom-local/local.json` — new in #4039; host-local override.
 ///
 /// A missing or malformed file at **any** tier soft-fails to that tier
 /// contributing nothing, and this function never aborts the caller. When
@@ -239,6 +259,8 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
 
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LEGACY_CONFIG_REL)));
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(PROJECT_CONFIG_REL)));
+    effective =
+        deep_merge(&effective, &soft_read_json_object(&repo_root.join(FLEET_REPO_CONFIG_REL)));
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LOCAL_CONFIG_REL)));
 
     effective
@@ -281,6 +303,7 @@ pub fn unreadable_tiers(repo_root: &Path) -> Vec<(PathBuf, String)> {
 pub fn tier_paths_by_precedence(repo_root: &Path) -> Vec<PathBuf> {
     let mut paths = vec![
         repo_root.join(LOCAL_CONFIG_REL),
+        repo_root.join(FLEET_REPO_CONFIG_REL),
         repo_root.join(PROJECT_CONFIG_REL),
         repo_root.join(LEGACY_CONFIG_REL),
     ];
@@ -294,7 +317,7 @@ pub fn tier_paths_by_precedence(repo_root: &Path) -> Vec<PathBuf> {
 ///
 /// This exists because a **multi-workspace** daemon makes "which
 /// `.loom/config.json` did that number come from?" a real operator question
-/// (#4512): the effective config is a merge across up to four files, and a knob
+/// (#4512): the effective config is a merge across up to five files, and a knob
 /// that reads as `3` might be a repo's committed value, a host-local override,
 /// or the built-in default. Reporting the provenance alongside the value —
 /// rather than only the value — is the same fix `token_pool_dir` applied to the
@@ -430,6 +453,25 @@ pub fn fleet_captain_arm_ttl_secs(repo_root: &Path) -> u64 {
         .and_then(Value::as_u64)
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS)
+}
+
+/// Dotted key read by [`curator_backlog_target`] (#11819).
+pub const CURATOR_BACKLOG_TARGET_KEY: &str = "curator.backlogTarget";
+
+/// Read `curator.backlogTarget` (#11819): the number of open issues this repo
+/// should hold, which sets how strict the Curator's admission step is.
+///
+/// Resolved through [`resolve_effective_config`], so every tier can set it
+/// (machine defaults < `.loom/config.json` < `.loom-project/project.json` <
+/// `.loom-local/fleet-repo.json` < `.loom-local/local.json`). There is **no
+/// built-in default**: `None` (the step is skipped, the Curator unchanged) on
+/// a missing key, a zero, a negative, a fractional or a non-number value.
+#[must_use]
+pub fn curator_backlog_target(repo_root: &Path) -> Option<u64> {
+    let effective = resolve_effective_config(repo_root);
+    get_path(&effective, CURATOR_BACKLOG_TARGET_KEY)
+        .and_then(Value::as_u64)
+        .filter(|v| *v > 0)
 }
 
 #[cfg(test)]
@@ -770,6 +812,118 @@ mod tests {
         );
     }
 
+    // ===== per-repo fleet tier (#11738) =====
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_repo_tier_beats_committed_config_and_project() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous": {"roleRunner": {"onIdle": ["auditor"], "keep": 1}}, "a": "legacy"}"#,
+        );
+        write(&dir.path().join(PROJECT_CONFIG_REL), r#"{"a": "project", "b": "project"}"#);
+        write(
+            &dir.path().join(FLEET_REPO_CONFIG_REL),
+            r#"{"autonomous": {"roleRunner": {"onIdle": []}}, "a": "fleet-repo"}"#,
+        );
+        let effective = resolve_effective_config(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            effective,
+            json!({
+                "autonomous": {"roleRunner": {"onIdle": [], "keep": 1}},
+                "a": "fleet-repo",
+                "b": "project"
+            }),
+            "the fleet's per-repo value wins over a committed one; lists replace; \
+             keys the fleet does not set fall through"
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_local_beats_fleet_repo_tier() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(&dir.path().join(FLEET_REPO_CONFIG_REL), r#"{"a": "fleet-repo", "c": 1}"#);
+        write(&dir.path().join(LOCAL_CONFIG_REL), r#"{"a": "local"}"#);
+        let effective = resolve_effective_config(dir.path());
+        let src = source_of(dir.path(), "a");
+        let src_c = source_of(dir.path(), "c");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(effective, json!({"a": "local", "c": 1}));
+        assert_eq!(src, Some(dir.path().join(LOCAL_CONFIG_REL)));
+        assert_eq!(src_c, Some(dir.path().join(FLEET_REPO_CONFIG_REL)));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_repo_tier_null_clears_a_committed_key() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"guards": {"sqlDdl": true, "x": 1}}"#);
+        write(&dir.path().join(FLEET_REPO_CONFIG_REL), r#"{"guards": {"sqlDdl": null}}"#);
+        let effective = resolve_effective_config(dir.path());
+        let src = source_of(dir.path(), "guards.sqlDdl");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(effective, json!({"guards": {"sqlDdl": null, "x": 1}}));
+        assert!(get_path(&effective, "guards.sqlDdl").is_some_and(Value::is_null));
+        // `source_of` skips nulls, as it does for every tier: the committed
+        // file is the highest tier that still *sets* the key.
+        assert_eq!(src, Some(dir.path().join(LEGACY_CONFIG_REL)));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_source_of_names_the_fleet_repo_tier() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"autonomous": {"x": 1}}"#);
+        write(&dir.path().join(PROJECT_CONFIG_REL), r#"{"autonomous": {"x": 2}}"#);
+        write(&dir.path().join(FLEET_REPO_CONFIG_REL), r#"{"autonomous": {"x": 3}}"#);
+        let src = source_of(dir.path(), "autonomous.x");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(src, Some(dir.path().join(FLEET_REPO_CONFIG_REL)));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_absent_fleet_repo_tier_leaves_resolution_unchanged() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let legacy = r#"{"z": 1, "a": {"y": [1, 2], "b": null}, "m": "x"}"#;
+        write(&dir.path().join(LEGACY_CONFIG_REL), legacy);
+        write(&dir.path().join(PROJECT_CONFIG_REL), r#"{"m": "project"}"#);
+        write(&dir.path().join(LOCAL_CONFIG_REL), r#"{"a": {"y": [3]}}"#);
+        let effective = resolve_effective_config(dir.path());
+        let unreadable = unreadable_tiers(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        // The pre-#11738 chain, merged by hand.
+        let mut want = deep_merge(&json!({}), &serde_json::from_str::<Value>(legacy).unwrap());
+        want = deep_merge(&want, &json!({"m": "project"}));
+        want = deep_merge(&want, &json!({"a": {"y": [3]}}));
+        assert_eq!(
+            serde_json::to_string(&effective).unwrap(),
+            serde_json::to_string(&want).unwrap(),
+            "no fleet-repo file means byte-identical output"
+        );
+        assert!(unreadable.is_empty(), "a missing fleet-repo file is not unreadable");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_unreadable_tiers_reports_a_malformed_fleet_repo_file() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(&dir.path().join(FLEET_REPO_CONFIG_REL), "[1, 2]");
+        let got = unreadable_tiers(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].0.ends_with(FLEET_REPO_CONFIG_REL));
+    }
+
     // ===== get_path =====
 
     #[test]
@@ -1024,6 +1178,7 @@ mod tests {
             paths,
             vec![
                 root.path().join(LOCAL_CONFIG_REL),
+                root.path().join(FLEET_REPO_CONFIG_REL),
                 root.path().join(PROJECT_CONFIG_REL),
                 root.path().join(LEGACY_CONFIG_REL),
             ]
@@ -1144,5 +1299,51 @@ mod tests {
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert_eq!(got.len(), 1);
         assert!(got[0].0.ends_with(LEGACY_CONFIG_REL));
+    }
+
+    // ===== curator_backlog_target (#11819) =====
+
+    fn backlog(value: u64) -> String {
+        format!(r#"{{"curator": {{"backlogTarget": {value}}}}}"#)
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_curator_backlog_target_resolves_each_tier_and_a_higher_tier_wins() {
+        let dir = tempdir().unwrap();
+        let defaults = dir.path().join("machine-defaults.json");
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, &defaults);
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(curator_backlog_target(&root), None, "unset at every tier");
+        // Lowest to highest precedence; each write must take over.
+        let tiers = [
+            defaults.clone(),
+            root.join(LEGACY_CONFIG_REL),
+            root.join(PROJECT_CONFIG_REL),
+            root.join(FLEET_REPO_CONFIG_REL),
+            root.join(LOCAL_CONFIG_REL),
+        ];
+        for (i, tier) in tiers.iter().enumerate() {
+            let value = 100 + i as u64;
+            write(tier, &backlog(value));
+            assert_eq!(curator_backlog_target(&root), Some(value), "{}", tier.display());
+        }
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_curator_backlog_target_zero_or_non_integer_is_unset() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        for raw in ["0", "-5", "1.5", "\"140\"", "null", "true"] {
+            write(
+                &dir.path().join(LEGACY_CONFIG_REL),
+                &format!(r#"{{"curator": {{"backlogTarget": {raw}}}}}"#),
+            );
+            assert_eq!(curator_backlog_target(dir.path()), None, "{raw}");
+        }
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
     }
 }

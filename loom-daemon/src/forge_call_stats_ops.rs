@@ -98,6 +98,10 @@ pub const PR_LIST_OPEN: ForgeOp = ForgeOp::inventoried("pr.list-open");
 pub const ISSUE_EDIT_LABELS: ForgeOp = ForgeOp::inventoried("issue.edit-labels");
 /// `PATCH repos/{o}/{r}/issues/{n}` — replace an issue's (or PR's) body.
 pub const ISSUE_EDIT_BODY: ForgeOp = ForgeOp::inventoried("issue.edit-body");
+/// `POST repos/{o}/{r}/issues` — file an issue with its labels (#11766).
+pub const ISSUE_CREATE: ForgeOp = ForgeOp::inventoried("issue.create");
+/// `PATCH repos/{o}/{r}/issues/{n}` with a state and close reason (#11766).
+pub const ISSUE_CLOSE_WITH_REASON: ForgeOp = ForgeOp::inventoried("issue.close-with-reason");
 /// Post a comment on an issue or PR.
 pub const COMMENT_CREATE: ForgeOp = ForgeOp::inventoried("comment.create");
 /// Edit or delete an existing comment by id.
@@ -136,6 +140,8 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     PR_LIST_OPEN,
     ISSUE_EDIT_LABELS,
     ISSUE_EDIT_BODY,
+    ISSUE_CREATE,
+    ISSUE_CLOSE_WITH_REASON,
     COMMENT_CREATE,
     COMMENT_EDIT_DELETE,
     PR_DIFF_AND_FILES,

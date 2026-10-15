@@ -74,7 +74,7 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
 /// | value | when |
 /// |---|---|
 /// | `dispatched` | at least one sweep started |
-/// | `halted_<cause>` | every held workspace names one cause, e.g. `halted_main_red`, `halted_disk_reservation` (#11649; see [`halted_result`]) |
+/// | `halted_<cause>` | the hold covered the tick's work (#11857: every workspace with candidates was held, or every workspace when none had any; see [`TickReport::note_halts`]) and every held workspace names one cause, e.g. `halted_main_red`, `halted_disk_reservation` (#11649; see [`halted_result`]) |
 /// | `halted_ci_billing` | the `ci_billing` cause, or a cause-less hold while an owner's Actions jobs are billing-blocked (#10113) |
 /// | `halted` | held, but by several causes or by none named (`loom.dispatch.halt_causes` lists them) |
 /// | `saturation_held` | the saturation admission brake was engaged |
@@ -83,6 +83,11 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
 /// | `no_eligible_work` | no ready candidates at all |
 /// | `capacity_full` | candidates deferred by the concurrency or ramp cap |
 /// | `all_skipped` | every candidate was skipped for a per-issue reason |
+///
+/// A partial hold (#11857: [`TickReport::halt_partial`]) falls through to the
+/// rows below it: one held repo no longer masks why the others dispatched
+/// nothing. Its causes stay on `loom.dispatch.halt_causes` and its size on
+/// `loom.dispatch.held_roots`.
 #[must_use]
 pub fn tick_result(report: &TickReport) -> &'static str {
     tick_result_with(report, crate::ci_telemetry::billing::any_blocked())
@@ -93,7 +98,7 @@ pub fn tick_result(report: &TickReport) -> &'static str {
 pub fn tick_result_with(report: &TickReport, billing_blocked: bool) -> &'static str {
     if report.dispatched > 0 {
         "dispatched"
-    } else if report.halted {
+    } else if report.halted && !report.halt_partial {
         halted_result(&report.halt_causes, billing_blocked)
     } else if report.saturation_held {
         "saturation_held"
@@ -140,6 +145,7 @@ pub fn halted_result(causes: &[HaltCause], billing_blocked: bool) -> &'static st
             HaltCause::DaemonTooOld => "halted_daemon_too_old",
             HaltCause::MaintainOnly => "halted_maintain_only",
             HaltCause::DiskReservation => "halted_disk_reservation",
+            HaltCause::WeightZero => "halted_weight_zero",
         },
         _ => "halted",
     }
@@ -181,6 +187,7 @@ pub fn tick_span(
         ("loom.dispatch.dispatched", report.dispatched.to_string()),
         ("loom.dispatch.errors", report.errors.to_string()),
         ("loom.dispatch.max_concurrent", max_concurrent.to_string()),
+        ("loom.dispatch.held_roots", report.held_roots.to_string()), // #11857
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
@@ -352,7 +359,9 @@ fn resolved_repo_refs(
         let Some(root) = roots.get(idx) else {
             continue;
         };
+        // #11858: before the collector's first pass, the checkout's origin.
         if let Some(repo_ref) = super::super::repo_ref::cached_repo_ref(&root.display().to_string())
+            .or_else(|| super::dispatch_facts::fallback_repo_ref(root))
         {
             resolved.insert(idx, repo_ref);
         }
@@ -427,7 +436,13 @@ pub fn record_tick(
         &failed,
         completed_at,
     );
-    let tick = tick_span(report, max_concurrent, started_at, completed_at);
+    let mut tick = tick_span(report, max_concurrent, started_at, completed_at);
+    // #11858: the cap's terms, pre-filtered skips and held repos.
+    let cap = super::dispatch_facts::published_cap().filter(|c| c.effective() == max_concurrent);
+    let held = super::dispatch_facts::current_halted_repos();
+    tick.attributes
+        .extend(super::dispatch_facts::tick_attributes(report, cap, held));
+    sink.emit_metrics_since(super::dispatch_facts::tick_points(report, cap), Some(started_at));
     for span in admission_spans(report, &tick, &repo_refs, &lockouts) {
         sink.emit_span(span);
     }

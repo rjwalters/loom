@@ -257,6 +257,9 @@ fn write_fixtures(trial: &Trial) {
 #[test]
 #[ignore = "requires Docker; starts one isolated pinned Collector container"]
 fn interactive_session_filelogs_normalize_to_loom_attrs_and_never_leak_raw_content() {
+    if !hub_image::available(IMAGE) {
+        return;
+    }
     let mut trial = Trial::new();
     write_fixtures(&trial);
     trial.start();

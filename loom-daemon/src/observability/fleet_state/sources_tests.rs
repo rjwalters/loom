@@ -172,7 +172,7 @@ fn an_unfinished_curated_walk_is_an_error_not_the_first_page() {
 
 fn row(repo: &str, issue: u32) -> ReadyQueueRow {
     serde_json::from_value(serde_json::json!({
-        "rank": issue, "repo": repo, "issue": issue, "workspace_priority": 100,
+        "rank": issue, "repo": repo, "issue": issue, "workspace_weight": 100,
         "urgent": false, "disposition": "queued"
     }))
     .unwrap()
@@ -411,7 +411,7 @@ fn a_ready_row_carries_its_clock_and_only_a_clocked_hold_its_expiry() {
     let at = "2026-10-11T12:30:00Z";
     let tick_row = |issue: u32, disposition: &str, held_until: Option<&str>| -> ReadyQueueRow {
         let mut v = serde_json::json!({
-            "rank": issue, "repo": "/src/app", "issue": issue, "workspace_priority": 100,
+            "rank": issue, "repo": "/src/app", "issue": issue, "workspace_weight": 100,
             "urgent": false, "disposition": disposition
         });
         if let Some(until) = held_until {
@@ -452,4 +452,44 @@ fn a_ready_row_carries_its_clock_and_only_a_clocked_hold_its_expiry() {
     );
     // The tick's own rows never carry a halt; those come from the clock.
     assert!(ready.halts.is_empty());
+}
+
+/// #11858: a repo the work finder holds `main_red` reads red, even when the
+/// gate state the collector found for its root said `unknown`; other holds
+/// and unmanaged repos change nothing.
+#[test]
+fn a_red_hold_reads_main_ci_red() {
+    use crate::telemetry::kinds::fleet_state::MainCi;
+    use crate::work_finder::halt_cause::{since::RootHalt, HaltCause};
+    let halt = |root: &str, cause| RootHalt {
+        root: PathBuf::from(root),
+        cause: Some(cause),
+        since: Utc::now(),
+        since_lower_bound: false,
+    };
+    let main_ci: std::collections::BTreeMap<String, MainCi> = [
+        ("o/red".to_string(), MainCi::Unknown),
+        ("o/held".to_string(), MainCi::Green),
+        ("o/billing".to_string(), MainCi::Unknown),
+    ]
+    .into_iter()
+    .collect();
+    let halts = Some(vec![
+        halt("/w/red-2", HaltCause::MainRed),
+        halt("/w/held", HaltCause::MaintainOnly),
+        halt("/w/billing", HaltCause::CiBilling),
+        halt("/w/unmanaged", HaltCause::MainRed),
+    ]);
+    let slug = |root: &str| match root {
+        "/w/red-2" => Some("o/red".to_string()),
+        "/w/held" => Some("o/held".to_string()),
+        "/w/billing" => Some("o/billing".to_string()),
+        "/w/unmanaged" => Some("o/unmanaged".to_string()),
+        _ => None,
+    };
+    let got = super::with_red_holds(main_ci, &halts, slug);
+    assert_eq!(got["o/red"], MainCi::Red);
+    assert_eq!(got["o/held"], MainCi::Green);
+    assert_eq!(got["o/billing"], MainCi::Red);
+    assert!(!got.contains_key("o/unmanaged"));
 }

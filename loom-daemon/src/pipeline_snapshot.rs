@@ -14,8 +14,8 @@
 //! / `loom:pr`, PRs merged in the last 24h, and — since Issue #8091 — the
 //! operator-attention state: open PRs labeled `loom:operator` (the
 //! first-class "engine stopped, a human is needed" hold, #5502) plus their
-//! `mergeable`/age breakdown, and open issues labeled `loom:operator-only`
-//! (the hard park).
+//! `mergeable`/age breakdown, and open issues held by `loom:operator` (the
+//! issue-dispatch park, #11795).
 //!
 //! # Resilience
 //!
@@ -63,7 +63,7 @@ pub struct RepoPipelineSnapshot {
     /// Open issues labeled `loom:issue` — queued, not yet claimed, and
     /// **dispatchable**: rows also carrying a park label
     /// (`crate::work_finder::PARK_LABELS` — `loom:blocked` /
-    /// `loom:operator-only`) are excluded, mirroring the work-finder's own
+    /// `loom:operator` / `loom:frozen`) are excluded, mirroring the work-finder's own
     /// admission check (Issue #4825).
     pub queued: Option<usize>,
     /// Open issues labeled `loom:building` — claimed, in progress.
@@ -74,8 +74,8 @@ pub struct RepoPipelineSnapshot {
     pub changes_requested: Option<usize>,
     /// The strict subset of [`Self::changes_requested`] that has **no
     /// owner** (Issue #5272): no active Doctor claim (`loom:treating`) and no
-    /// park/hold label (`crate::work_finder::PARK_LABELS` — `loom:blocked` /
-    /// `loom:operator-only`). Before #5272's standalone Doctor dispatch, every
+    /// park (`crate::work_finder::PARK_LABELS` — `loom:blocked`,
+    /// `loom:operator`, `loom:frozen`). Before #5272's standalone Doctor dispatch, every
     /// row here was a PR permanently parked once its sweep ended — nothing in
     /// the fleet would ever pick it up again. A regression here (this count
     /// climbing and staying nonzero) is exactly the failure mode #5272 fixes,
@@ -89,8 +89,11 @@ pub struct RepoPipelineSnapshot {
     pub merged_24h: Option<usize>,
     /// Open PRs labeled `loom:operator` (Issue #8091) — the first-class
     /// "the engine has stopped acting on this artifact, a human is needed"
-    /// hold (#5502), distinct from the hard-park `loom:operator-only`
-    /// tracked in [`Self::operator_only_issues`]. A fleet carrying several of
+    /// hold (#5502), a park for every role since #11861; the held issues are
+    /// tracked in [`Self::operator_only_issues`]. Champion's merge-risk and
+    /// critical-file holds moved to `loom:blocked` beside `loom:pr` (#11861),
+    /// so after the `labels migrate --holds` pass they are no longer counted
+    /// here. A fleet carrying several of
     /// these is normal steady state, not a fault — see
     /// `crate::health::assess_operator_attention`.
     pub operator_held: Option<usize>,
@@ -105,9 +108,23 @@ pub struct RepoPipelineSnapshot {
     /// `createdAt`. `None` when there are no held PRs (not a failure — see
     /// [`Self::operator_held`]) or the read failed.
     pub operator_held_oldest_days: Option<i64>,
-    /// Open issues labeled `loom:operator-only` (Issue #8091) — the hard
-    /// park every dispatch route refuses (`crate::capability`,
-    /// `crate::work_finder::PARK_LABELS`).
+    /// Open PRs at the Champion-hold label shape (#11905): the approval beside
+    /// `loom:blocked`, and no operator hold; it includes another actor's
+    /// markerless park at approval (which Champion's `champion-hold classify`,
+    /// #11932, skips: this count reads no marker), so read it as held approvals
+    /// ([`crate::champion_hold::held_approval_shape`]), so it never overlaps
+    /// [`Self::operator_held`]. The sibling count that keeps Champion's
+    /// merge-risk and critical-file holds visible once `labels migrate
+    /// --holds` moves them off `loom:operator`: the two together are the held
+    /// approvals. Read from the `loom:pr` listing (no extra call when
+    /// [`Self::approved`] is fetched too) and fetched with
+    /// [`PipelineMetrics::operator_held`]; `None` when that read failed.
+    /// Additive: absent from consumers that predate it.
+    pub champion_held: Option<usize>,
+    /// Open issues held for a human (Issue #8091): labeled `loom:operator`, or
+    /// still carrying the retired `loom:operator-only` it replaced (#11795;
+    /// the field keeps its name, a wire contract). The park every dispatch
+    /// route refuses (`crate::capability`, `crate::work_finder::PARK_LABELS`).
     pub operator_only_issues: Option<usize>,
     /// The first forge-query failure encountered for this repo, if any. A
     /// repo can have `Some(error)` and still carry partial `Some(..)` counts
@@ -187,9 +204,11 @@ pub struct PipelineMetrics {
     /// PRs merged inside the configured window.
     pub merged: bool,
     /// Open PRs labeled `loom:operator`, plus their `mergeable`/age
-    /// breakdown — see [`RepoPipelineSnapshot::operator_held`] (Issue #8091).
+    /// breakdown — see [`RepoPipelineSnapshot::operator_held`] (Issue #8091)
+    /// — and the Champion-held sibling count,
+    /// [`RepoPipelineSnapshot::champion_held`] (#11905).
     pub operator_held: bool,
-    /// Open issues labeled `loom:operator-only` — see
+    /// Open issues held by `loom:operator` — see
     /// [`RepoPipelineSnapshot::operator_only_issues`] (Issue #8091).
     pub operator_only_issues: bool,
 }
@@ -536,7 +555,7 @@ impl GhPipelineSource {
     ///
     /// `gh issue list --label` ANDs its label flags together with no
     /// negation syntax, so a plain `--label loom:issue` count includes
-    /// `loom:blocked`/`loom:operator-only` rows the work-finder would never
+    /// `loom:blocked`/`loom:operator` rows the work-finder would never
     /// admit — `queued` and "the work-finder considers this repo to have
     /// ready work" silently diverged. `--search` supports `-label:` negation,
     /// so this is built from `PARK_LABELS` (not a re-listed literal) so the
@@ -551,10 +570,9 @@ impl GhPipelineSource {
 
     /// The `--search` query for the `changes_requested_unclaimed` metric
     /// (Issue #5272): open `loom:changes-requested` PRs that are **owned by
-    /// nothing** — no active Doctor claim (`loom:treating`) and no park/hold
-    /// label (the same [`crate::work_finder::PARK_LABELS`] the `queued`
-    /// query above excludes, reused rather than re-listed so the two
-    /// definitions can never drift apart). Mirrors [`Self::queued_search_query`]'s
+    /// nothing** — no active Doctor claim (`loom:treating`) and no PR-lane
+    /// park ([`crate::work_finder::PARK_LABELS`], the set Doctor
+    /// skips; since #11861 that includes `loom:operator`). Mirrors [`Self::queued_search_query`]'s
     /// `--search`-negation shape for the identical reason: `gh pr list --label`
     /// only ANDs, it cannot express "and NOT this label".
     fn changes_requested_unclaimed_search_query() -> String {
@@ -1048,8 +1066,8 @@ mod tests {
 
     /// The `changes_requested_unclaimed` query must exclude an active
     /// Doctor claim (`loom:treating`) *and* every park/hold label in
-    /// `work_finder::PARK_LABELS` — the two conditions AC2/AC4 of #5272
-    /// require for a `loom:changes-requested` PR to count as "no owner".
+    /// `work_finder::PARK_LABELS` — the two conditions AC2/AC4 of
+    /// #5272 require for a `loom:changes-requested` PR to count as "no owner".
     #[test]
     fn changes_requested_unclaimed_search_query_excludes_claim_and_park_labels() {
         let query = GhPipelineSource::changes_requested_unclaimed_search_query();
@@ -1066,5 +1084,7 @@ mod tests {
                 "expected '-label:{label}' in query: {query}"
             );
         }
+        // #11861: loom:operator parks a PR too; Doctor never acts on it.
+        assert!(query.split(' ').any(|t| t == "-label:loom:operator"), "{query}");
     }
 }

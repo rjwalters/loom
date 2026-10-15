@@ -141,7 +141,7 @@ fn blocked_candidates_are_skipped_without_a_dispatch_attempt() {
     let blocked: Vec<(u32, u32)> = (1..=12).map(|n| (n, 900 + n)).collect();
     let numbers: Vec<u32> = (1..=12).collect();
     let mut multi = vec![workspace(&numbers, Disp::new(&blocked, Listing::Readable))];
-    let report = tick_multi(&mut multi, &[100], 5, &[false]);
+    let report = tick_multi(&mut multi, &[1], 5, &[false]);
 
     let disp = &multi[0].1;
     assert!(disp.attempts.is_empty(), "no dispatch_with for a blocked candidate");
@@ -171,7 +171,7 @@ fn an_unreadable_listing_skips_nothing() {
         &[1, 2, 3, 4, 5],
         Disp::new(&blocked, Listing::Unreadable),
     )];
-    let report = tick_multi(&mut multi, &[100], 5, &[false]);
+    let report = tick_multi(&mut multi, &[1], 5, &[false]);
 
     let disp = &multi[0].1;
     assert_eq!(disp.attempts.len(), 5, "every candidate was offered to dispatch()");
@@ -186,7 +186,7 @@ fn an_unreadable_listing_skips_nothing() {
         &[1, 2, 3, 4, 5],
         Disp::new(&blocked, Listing::NoPrefilter),
     )];
-    let report_before = tick_multi(&mut before, &[100], 5, &[false]);
+    let report_before = tick_multi(&mut before, &[1], 5, &[false]);
     assert_eq!(report, report_before);
 }
 
@@ -211,7 +211,7 @@ fn a_candidate_the_listing_misses_still_meets_the_dispatch_guard() {
     }
     let disp = Disp::new(&[(1, 901), (2, 902)], Listing::Readable);
     let mut multi = vec![(OneShotSource(Some(items(&[1, 2, 3]))), Partial(disp))];
-    let report = tick_multi(&mut multi, &[100], 5, &[false]);
+    let report = tick_multi(&mut multi, &[1], 5, &[false]);
 
     assert_eq!(multi[0].1 .0.attempts, vec![2, 3], "1 is pre-filtered; 2 and 3 are attempted");
     assert_eq!(multi[0].1 .0.dispatched, vec![3]);
@@ -239,7 +239,7 @@ fn mixed_tick(listing: Listing, seed: u64, cap: usize) -> (TickReport, Vec<u32>,
         workspace(&[21, 22, 23, 24, 25, 26], Disp::new(&blocked_b, listing).sharing(&log)),
     ];
     let report =
-        workspace_draw::with_seed(seed, || tick_multi(&mut multi, &[100, 40], cap, &[false; 2]));
+        workspace_draw::with_seed(seed, || tick_multi(&mut multi, &[1, 3], cap, &[false; 2]));
     let mut dispatched = multi[0].1.dispatched.clone();
     dispatched.extend(&multi[1].1.dispatched);
     let attempts = log.borrow().clone();
@@ -290,7 +290,7 @@ fn the_first_unblocked_candidate_is_dispatched_in_the_same_tick() {
     let blocked: Vec<(u32, u32)> = (1..=9).map(|n| (n, 900 + n)).collect();
     let numbers: Vec<u32> = (1..=11).collect();
     let mut multi = vec![workspace(&numbers, Disp::new(&blocked, Listing::Readable))];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
+    let report = tick_multi(&mut multi, &[1], 1, &[false]);
 
     assert_eq!(multi[0].1.attempts, vec![10], "one attempt, for the first unblocked issue");
     assert_eq!(report.dispatched, 1);
@@ -311,7 +311,7 @@ fn a_tick_that_cannot_place_anything_asks_nothing() {
         &[1, 2, 3],
         Disp::new(&blocked, Listing::Readable),
     )];
-    let report = tick_multi(&mut multi, &[100], 0, &[false]);
+    let report = tick_multi(&mut multi, &[1], 0, &[false]);
     assert_eq!((asked(&multi), report.deferred_capacity), (0, 3));
 
     // Saturation brake.
@@ -319,8 +319,7 @@ fn a_tick_that_cannot_place_anything_asks_nothing() {
         &[1, 2, 3],
         Disp::new(&blocked, Listing::Readable),
     )];
-    let report =
-        tick_multi_with_saturation_brake(&mut multi, &[100], 5, &[false], usize::MAX, true);
+    let report = tick_multi_with_saturation_brake(&mut multi, &[1], 5, &[false], usize::MAX, true);
     assert_eq!((asked(&multi), report.deferred_saturation), (0, 3));
 
     // Ramp cap of zero admissions.
@@ -328,7 +327,7 @@ fn a_tick_that_cannot_place_anything_asks_nothing() {
         &[1, 2, 3],
         Disp::new(&blocked, Listing::Readable),
     )];
-    let report = tick_multi_with_admission_cap(&mut multi, &[100], 5, &[false], 0);
+    let report = tick_multi_with_admission_cap(&mut multi, &[1], 5, &[false], 0);
     assert_eq!((asked(&multi), report.deferred_ramp_cap), (0, 3));
 
     // Halted repo.
@@ -336,12 +335,12 @@ fn a_tick_that_cannot_place_anything_asks_nothing() {
         &[1, 2, 3],
         Disp::new(&blocked, Listing::Readable),
     )];
-    tick_multi(&mut multi, &[100], 5, &[true]);
+    tick_multi(&mut multi, &[1], 5, &[true]);
     assert_eq!(asked(&multi), 0);
 
     // Nothing ready.
     let mut multi = vec![workspace(&[], Disp::new(&blocked, Listing::Readable))];
-    tick_multi(&mut multi, &[100], 5, &[false]);
+    tick_multi(&mut multi, &[1], 5, &[false]);
     assert_eq!(asked(&multi), 0);
 }
 
@@ -352,7 +351,7 @@ fn each_workspace_is_asked_once_about_its_own_candidates() {
         workspace(&[1, 2, 3], Disp::new(&[(1, 901), (3, 903)], Listing::Readable)),
         workspace(&[7, 8], Disp::new(&[(8, 908)], Listing::Readable)),
     ];
-    let report = tick_multi(&mut multi, &[100, 100], 10, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 1], 10, &[false, false]);
 
     for (idx, want) in [(0, vec![1, 2, 3]), (1, vec![7, 8])] {
         let asked = multi[idx].1.asked.borrow();
@@ -372,7 +371,7 @@ fn only_surviving_candidates_are_asked_about() {
     let mut disp = Disp::new(&[(2, 902)], Listing::Readable);
     disp.in_flight.insert(1);
     let mut multi = vec![workspace(&[1, 2, 3], disp)];
-    tick_multi(&mut multi, &[100], 10, &[false]);
+    tick_multi(&mut multi, &[1], 10, &[false]);
     let mut asked = multi[0].1.asked.borrow()[0].clone();
     asked.sort_unstable();
     assert_eq!(asked, vec![2, 3]);
@@ -383,11 +382,11 @@ fn only_surviving_candidates_are_asked_about() {
 #[test]
 fn a_closed_pr_frees_its_issue_on_the_next_tick() {
     let mut multi = vec![workspace(&[1], Disp::new(&[(1, 901)], Listing::Readable))];
-    let first = tick_multi(&mut multi, &[100], 5, &[false]);
+    let first = tick_multi(&mut multi, &[1], 5, &[false]);
     assert_eq!((first.dispatched, first.skipped_pr_open), (0, 1));
 
     let mut multi = vec![workspace(&[1], Disp::new(&[], Listing::Readable))];
-    let second = tick_multi(&mut multi, &[100], 5, &[false]);
+    let second = tick_multi(&mut multi, &[1], 5, &[false]);
     assert_eq!((second.dispatched, second.skipped_pr_open), (1, 0));
     assert_eq!(multi[0].1.dispatched, vec![1]);
 }
@@ -403,7 +402,7 @@ fn a_prefiltered_candidate_is_an_open_pr_row_on_every_tick() {
             &[1, 2],
             Disp::new(&[(1, 901), (2, 902)], Listing::Readable),
         )];
-        let report = tick_multi(&mut multi, &[100], 5, &[false]);
+        let report = tick_multi(&mut multi, &[1], 5, &[false]);
         let queue = rows(&report);
         let frozen = frozen_by_repo(queue.iter().map(|r| (r.repo.as_str(), r.disposition, None)));
         assert_eq!(frozen["/repo/a"].candidates, 2, "tick {tick}");

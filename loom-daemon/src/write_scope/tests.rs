@@ -422,6 +422,8 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
         ("quarantine_reconciliation.rs", Gated),
+        // #11480: the vetoed reclaim; reached only from the reclaim pass.
+        ("reclaim_pr_warning.rs", Via(PASS, "reclaim pass (#11480 claim-only release)")),
         ("fleet_sync/workspace_resync/host.rs", Gated),
         (
             "fleet_store/resync_claim.rs",
@@ -442,21 +444,44 @@ fn daemon_write_paths_are_scoped() {
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
+        (
+            "intake_reconcile/demote.rs",
+            Via(
+                "intake_reconcile.rs",
+                "demotion step (#11820): the inline pass behind gate_root_with, and the \
+                 singleton's run_repo behind may_write (gate_repo_with)",
+            ),
+        ),
         ("stale_blocked/release_gh.rs", Gated),
+        ("work_finder/main_red_autofile.rs", Gated),
+        // #11853: label swap + routing comment, each behind gate_repo_with.
+        ("work_finder/landed_prefilter.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
         ),
         (
+            "sweep_registry/lease_step.rs",
+            Via(DISPATCH, "the lease record of a dispatched sweep or step (moved from guards.rs, #11898)"),
+        ),
+        (
             "sweep_registry/dispatch/claim_release.rs",
             Via(DISPATCH, "releases the claim of a dispatched sweep found closed post-flip (#11304)"),
         ),
-        ("sweep_registry/watchdog.rs", Via(DISPATCH, "acts on dispatched sweeps")),
+        (
+            "sweep_registry/watchdog/forge_comments.rs",
+            Via(DISPATCH, "acts on dispatched sweeps (moved from watchdog.rs, #11743)"),
+        ),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
+        (
+            "sweep_registry/restore_to_ready/step_restore.rs",
+            Via(DISPATCH, "releases the claim of a dispatched step sweep via run_claim_release_edit"),
+        ),
         (
             "sweep_registry/roll_requeue.rs",
             Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
         ),
+        ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
             "sweep_registry/prless_retry/hold.rs",
@@ -540,6 +565,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("operator_decision/cli.rs", Gated),
         ("cli/labels_migrate.rs", Gated),
+        (
+            "cli/labels_migrate_holds.rs",
+            Via("cli/labels_migrate.rs", "labels migrate --holds, gated by its write_gate"),
+        ),
         ("cli/curation_complete.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
@@ -614,6 +643,13 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("names the label flags to parse a write argv for the numbers it pins, runs none"),
         ),
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "agent_gh/read_route.rs",
+            NotAWrite(
+                "classifies an agent gh argv as a gateway read; the method/field flags it names \
+                 are what keep a call off the gateway, runs none (2am#4367 P4)",
+            ),
+        ),
         (
             "observability/pick_journal.rs",
             NotAWrite("classifies an agent gh argv for pick.decision, runs none"),

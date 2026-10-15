@@ -39,7 +39,7 @@
 //! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
 //! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, ram_headroom, token_axis_limit, message}` |
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
-//! | `forge.event` | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
+//! | `forge.event` | `forge_events.rs` feed consumer (#8765); `forge_mirror/wake.rs` change-stream puller (2am#4367 P5) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}`; mirror: `{source: "github-events-mirror", count, types, repos, missed}` |
 //! | `operator_priority.escalation` | `fleet_alert` (#10164; the star-liveness publisher, #9321, was removed by #11104) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally

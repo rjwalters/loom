@@ -163,11 +163,14 @@ pub enum FleetSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetHoldKind {
-    /// `loom:operator`.
+    /// `loom:operator` (since #11795 also the folded operator holds, when the
+    /// body is not read).
     Operator,
-    /// `loom:operator-only` (or `-mechanical`).
+    /// The retired `loom:operator-only` (or `-mechanical`): unmigrated items
+    /// and history (#11795).
     OperatorOnly,
-    /// `loom:operator-decision`.
+    /// A decision: the retired `loom:operator-decision`, or `loom:operator`
+    /// with a decision block where the body is read (#11795).
     OperatorDecision,
     /// Champion's merge-risk hold.
     MergeRisk,
@@ -241,6 +244,7 @@ pub enum FleetHaltReason {
     DaemonTooOld,
     MaintainOnly,
     DiskReservation,
+    WeightZero,
     /// A hold with no named cause. A reader also decodes any value it does
     /// not know (from a newer emitter) as this.
     #[serde(other)]
@@ -249,7 +253,7 @@ pub enum FleetHaltReason {
 
 impl FleetHaltReason {
     /// Every reason, in wire order.
-    pub const ALL: [FleetHaltReason; 13] = [
+    pub const ALL: [FleetHaltReason; 14] = [
         FleetHaltReason::MainRed,
         FleetHaltReason::GatePending,
         FleetHaltReason::TokenPool,
@@ -262,6 +266,7 @@ impl FleetHaltReason {
         FleetHaltReason::DaemonTooOld,
         FleetHaltReason::MaintainOnly,
         FleetHaltReason::DiskReservation,
+        FleetHaltReason::WeightZero,
         FleetHaltReason::Unknown,
     ];
 
@@ -282,6 +287,7 @@ impl FleetHaltReason {
             Some(HaltCause::DaemonTooOld) => Self::DaemonTooOld,
             Some(HaltCause::MaintainOnly) => Self::MaintainOnly,
             Some(HaltCause::DiskReservation) => Self::DiskReservation,
+            Some(HaltCause::WeightZero) => Self::WeightZero,
             None => Self::Unknown,
         }
     }
@@ -302,6 +308,7 @@ impl FleetHaltReason {
             Self::DaemonTooOld => "daemon_too_old",
             Self::MaintainOnly => "maintain_only",
             Self::DiskReservation => "disk_reservation",
+            Self::WeightZero => "weight_zero",
             Self::Unknown => "unknown",
         }
     }
@@ -529,10 +536,10 @@ pub struct FleetStateRow {
     /// retired `star` / `star_at` fields are no longer sent (#11510).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub level: u8,
-    /// `ready_wait` only: the repo's fleet priority (the workspace priority
-    /// tier; lower dispatches first).
+    /// `ready_wait` only: the repo's draw weight (#11742; higher is drawn
+    /// more). Older records carried `fleet_priority`, a tier, instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fleet_priority: Option<u32>,
+    pub weight: Option<u32>,
     /// `ready_wait` only: the issue's creation instant, the planner's age
     /// input. Age at a record is `as_of - created_at`; the instant is sent
     /// instead of the age so an unchanged row stays unchanged.
@@ -611,7 +618,7 @@ impl FleetStateRow {
             sweep_id: None,
             rank: None,
             level: 0,
-            fleet_priority: None,
+            weight: None,
             created_at: None,
             main_red_fix: false,
             hold_kind: None,

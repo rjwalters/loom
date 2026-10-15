@@ -16,21 +16,36 @@ fn fix(number: u32, created: Option<&str>) -> IssueKey {
     }
 }
 
-fn ws(name: &str, priority: u32, vi: bool) -> WorkspaceEntry {
+fn ws(name: &str, weight: u32) -> WorkspaceEntry {
     WorkspaceEntry {
         workspace: name.to_string(),
-        priority,
-        has_very_important: vi,
+        weight,
         has_red_main_fix: false,
+        has_very_important: false,
+        has_important: false,
     }
 }
 
-fn ws_fix(name: &str, priority: u32) -> WorkspaceEntry {
+fn ws_vi(name: &str, weight: u32) -> WorkspaceEntry {
     WorkspaceEntry {
-        has_red_main_fix: true,
-        ..ws(name, priority, false)
+        has_very_important: true,
+        ..ws(name, weight)
     }
 }
+
+fn ws_fix(name: &str, weight: u32) -> WorkspaceEntry {
+    WorkspaceEntry {
+        has_red_main_fix: true,
+        ..ws(name, weight)
+    }
+}
+
+/// No bonuses: the draw is over base weights alone.
+const FLAT: WeightBonus = WeightBonus {
+    red_main_fix: 0,
+    very_important: 0,
+    important: 0,
+};
 
 #[test]
 fn level_is_the_highest_priority_label() {
@@ -65,199 +80,153 @@ fn within_workspace_is_level_then_oldest_then_number() {
     assert!(next_in_workspace(&[]).is_none());
 }
 
-const T80: u32 = DEFAULT_DRAW_TEMPERATURE;
-
-/// The pre-#11684 `1000 / (1 + p)` assertions are replaced by the softmax's
-/// pinned values: the top of the pool weighs the full scale, and the curve
-/// falls by `e` every `T` priority units.
 #[test]
-fn softmax_weights_are_pinned() {
-    assert_eq!(softmax_weight(0, 0, T80), DRAW_WEIGHT_SCALE);
-    assert_eq!(softmax_weight(12, 12, T80), 1_000_000);
-    assert_eq!(softmax_weight(80, 0, 80), 367_879); // e^-1
-    assert_eq!(softmax_weight(100, 0, T80), 286_505); // e^-1.25
-    assert_eq!(softmax_weight(200, 20, T80), 105_399); // e^-2.25
-    assert_eq!(softmax_weight(u32::MAX, 0, T80), 1);
+fn bonus_for_entry_stacks_every_condition_that_holds() {
+    let b = WeightBonus::default();
+    assert_eq!(b.for_entry(&ws("a", 5)), 0);
+    assert_eq!(b.for_entry(&ws_vi("a", 5)), u64::from(DEFAULT_BONUS_VERY_IMPORTANT));
+    let all = WorkspaceEntry {
+        has_red_main_fix: true,
+        has_very_important: true,
+        has_important: true,
+        ..ws("a", 5)
+    };
+    assert_eq!(
+        b.for_entry(&all),
+        u64::from(
+            DEFAULT_BONUS_RED_MAIN_FIX + DEFAULT_BONUS_VERY_IMPORTANT + DEFAULT_BONUS_IMPORTANT
+        )
+    );
 }
 
+/// ACCEPTANCE (#11742): weights mean exactly what they say. With N repos at
+/// weight 1 and loom at weight N, all holding work, loom's share over a
+/// seeded run is about N / (2N - 1).
 #[test]
-fn softmax_weight_is_monotone_non_increasing_in_priority() {
-    for t in [1, 7, 80, 1000, 100_000] {
-        let mut prev = u64::MAX;
-        for p in 0..=1000 {
-            let w = softmax_weight(p, 0, t);
-            assert!(w <= prev, "T={t}: w({p})={w} > w({})={prev}", p - 1);
-            prev = w;
-        }
-    }
-}
-
-#[test]
-fn softmax_weight_is_never_zero_and_never_overflows() {
-    let edges = [0, 1, 12, 1000, u32::MAX - 1, u32::MAX];
-    for &p in &edges {
-        for &p_min in &edges {
-            for t in [0, 1, 80, 100_000, u32::MAX] {
-                let w = softmax_weight(p, p_min, t);
-                assert!((1..=DRAW_WEIGHT_SCALE).contains(&w), "w({p},{p_min},{t})={w}");
-            }
-        }
-    }
-    // A full pool over priorities 0..=1000 sums far inside u64.
-    let sum: u64 = (0..=1000).map(|p| softmax_weight(p, 0, 100_000)).sum();
-    assert!(sum <= 1001 * DRAW_WEIGHT_SCALE);
-}
-
-#[test]
-fn small_temperature_concentrates_on_p_min() {
-    assert_eq!(softmax_weight(50, 50, 1), DRAW_WEIGHT_SCALE);
-    for gap in 20..=1000 {
-        assert_eq!(softmax_weight(50 + gap, 50, 1), 1, "gap {gap}");
-    }
-    let entries = vec![ws("a", 50, false), ws("b", 70, false), ws("c", 300, false)];
-    let mut rng = PickRng::from_seed(3);
-    let a_wins = (0..10_000)
-        .filter(|_| draw_workspace(&entries, 1, &mut rng).unwrap().picked == "a")
+fn draw_share_is_weight_over_total_weight() {
+    let n = 10u32;
+    let mut entries: Vec<WorkspaceEntry> = (0..n - 1).map(|i| ws(&format!("r{i:02}"), 1)).collect();
+    entries.push(ws("loom", n));
+    let mut rng = PickRng::from_seed(11742);
+    let draws = 20_000;
+    let loom_wins = (0..draws)
+        .filter(|_| draw_workspace(&entries, &FLAT, &mut rng).unwrap().picked == "loom")
         .count();
-    assert!(a_wins >= 9_995, "a won {a_wins}/10000 at T=1");
+    let expected = f64::from(n) / f64::from(2 * n - 1);
+    let observed = loom_wins as f64 / f64::from(draws);
+    assert!(
+        (observed - expected).abs() < 0.015,
+        "observed {observed:.4}, expected {expected:.4}"
+    );
 }
 
 #[test]
-fn large_temperature_is_near_uniform() {
-    let weights: Vec<u64> = (0..=1000).map(|p| softmax_weight(p, 0, 100_000)).collect();
-    let max = *weights.iter().max().unwrap() as f64;
-    let min = *weights.iter().min().unwrap() as f64;
-    assert!(max / min < 1.02, "max/min = {}", max / min);
-}
-
-#[test]
-fn p_min_is_taken_over_the_tier_filtered_pool() {
-    // The very-important pool holds only p=200 workspaces: its top weighs the
-    // full scale even though an all-pool entry sits at p=0.
+fn draw_frequencies_match_effective_weights_with_bonuses() {
+    let bonus = WeightBonus {
+        red_main_fix: 30,
+        very_important: 10,
+        important: 5,
+    };
     let entries = vec![
-        ws("a/tool", 0, false),
-        ws("b/prod", 200, true),
-        ws("c/prod", 240, true),
+        ws("plain", 10),
+        ws_vi("vi", 6),
+        ws_fix("red", 1),
+        WorkspaceEntry {
+            has_important: true,
+            ..ws("imp", 3)
+        },
     ];
-    let d = draw_workspace(&entries, T80, &mut PickRng::from_seed(1)).unwrap();
-    assert_eq!(d.pool, "very-important");
-    assert_eq!((d.p_min, d.temperature), (200, T80));
-    assert_eq!(d.candidates[0].weight, DRAW_WEIGHT_SCALE);
-    assert_eq!(d.candidates[1].weight, softmax_weight(240, 200, T80));
-}
-
-/// ACCEPTANCE (#11684): with a fixed seed, N = 10,000 draws land within
-/// 1.5 percentage points of the softmax probabilities `w_i / sum(w)`.
-#[test]
-fn draw_frequencies_match_the_softmax_probabilities() {
-    let entries = vec![
-        ws("p012", 12, false),
-        ws("p066", 66, false),
-        ws("p100", 100, false),
-        ws("p200", 200, false),
-    ];
-    let weights: Vec<u64> = entries
-        .iter()
-        .map(|e| softmax_weight(e.priority, 12, T80))
-        .collect();
-    let total: u64 = weights.iter().sum();
-    let mut rng = PickRng::from_seed(11684);
-    let n = 10_000;
-    let mut wins = [0usize; 4];
+    // Effective weights: 10, 16, 31, 8 (total 65).
+    let expected = [("imp", 8.0), ("plain", 10.0), ("red", 31.0), ("vi", 16.0)];
+    let mut rng = PickRng::from_seed(7);
+    let n = 20_000;
+    let mut wins = std::collections::BTreeMap::<String, usize>::new();
     for _ in 0..n {
-        let d = draw_workspace(&entries, T80, &mut rng).unwrap();
-        assert_eq!(d.total_weight, total);
-        let i = entries
-            .iter()
-            .position(|e| e.workspace == d.picked)
-            .unwrap();
-        wins[i] += 1;
+        let d = draw_workspace(&entries, &bonus, &mut rng).unwrap();
+        assert_eq!(d.total_weight, 65);
+        *wins.entry(d.picked).or_default() += 1;
     }
-    for (i, e) in entries.iter().enumerate() {
-        let expected = weights[i] as f64 / total as f64;
-        let observed = wins[i] as f64 / f64::from(n);
-        assert!(
-            (observed - expected).abs() < 0.015,
-            "{}: observed {observed:.4}, expected {expected:.4}",
-            e.workspace
+    for (name, w) in expected {
+        let observed = wins.get(name).copied().unwrap_or(0) as f64 / f64::from(n);
+        assert!((observed - w / 65.0).abs() < 0.015, "{name}: observed {observed:.4}");
+    }
+}
+
+#[test]
+fn no_tier_wins_outright() {
+    // A red-main fix or very-important work makes a workspace likelier, never
+    // certain: the plain workspace still gets drawn.
+    let entries = vec![ws("a/plain", 10), ws_vi("b/vi", 1), ws_fix("c/red", 1)];
+    let mut rng = PickRng::from_seed(3);
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..2_000 {
+        seen.insert(
+            draw_workspace(&entries, &WeightBonus::default(), &mut rng)
+                .unwrap()
+                .picked,
+        );
+    }
+    assert_eq!(seen.len(), 3, "{seen:?}");
+}
+
+#[test]
+fn weight_zero_is_never_drawn_even_with_bonuses() {
+    let entries = vec![ws("a", 1), ws_fix("b", 0)];
+    for seed in 0..200 {
+        let d = draw_workspace(&entries, &WeightBonus::default(), &mut PickRng::from_seed(seed))
+            .unwrap();
+        assert_eq!(d.picked, "a");
+        assert_eq!(d.candidates.len(), 1);
+    }
+    assert!(draw_workspace(&[ws("z", 0)], &FLAT, &mut PickRng::from_seed(1)).is_none());
+}
+
+#[test]
+fn fixed_seed_reproduces_the_exact_pick_sequence() {
+    let entries = vec![ws("a", 1), ws("b", 1), ws("c", 1)];
+    let run = |seed| {
+        let mut rng = PickRng::from_seed(seed);
+        (0..12)
+            .map(|_| draw_workspace(&entries, &FLAT, &mut rng).unwrap().picked)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(run(42), run(42));
+    assert_ne!(run(42), run(43));
+}
+
+#[test]
+fn draw_is_input_order_independent() {
+    let a = vec![ws("a", 3), ws_vi("b", 1)];
+    let b = vec![ws_vi("b", 1), ws("a", 3)];
+    let mut ra = PickRng::from_seed(1);
+    let mut rb = PickRng::from_seed(1);
+    for _ in 0..500 {
+        assert_eq!(
+            draw_workspace(&a, &WeightBonus::default(), &mut ra),
+            draw_workspace(&b, &WeightBonus::default(), &mut rb)
         );
     }
 }
 
 #[test]
-fn very_important_workspace_always_wins() {
-    let entries = vec![ws("a/tool", 0, false), ws("b/prod", 100, true)];
-    for seed in 0..200 {
-        let d = draw_workspace(&entries, T80, &mut PickRng::from_seed(seed)).unwrap();
-        assert_eq!(d.picked, "b/prod");
-        assert_eq!(d.pool, "very-important");
-        assert_eq!(d.candidates.len(), 1);
-    }
-}
-
-#[test]
-fn several_very_important_workspaces_are_drawn_among_themselves() {
-    let entries = vec![ws("a", 0, true), ws("b", 100, true), ws("c", 0, false)];
-    let mut rng = PickRng::from_seed(7);
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..500 {
-        let d = draw_workspace(&entries, T80, &mut rng).unwrap();
-        assert_ne!(d.picked, "c");
-        seen.insert(d.picked);
-    }
-    assert_eq!(seen.len(), 2);
-}
-
-#[test]
-fn fixed_seed_reproduces_the_exact_pick_sequence() {
-    let entries = vec![
-        ws("a", 100, false),
-        ws("b", 100, false),
-        ws("c", 100, false),
-    ];
-    let run = |seed| {
-        let mut rng = PickRng::from_seed(seed);
-        (0..12)
-            .map(|_| draw_workspace(&entries, T80, &mut rng).unwrap().picked)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(run(42), run(42));
-    // Pinned sequence: a change here means the draw or the RNG changed
-    // (re-pinned for the #11684 softmax weights).
-    assert_eq!(run(42).join(""), "aacbacacabcc");
-    assert_ne!(run(42), run(43));
-}
-
-#[test]
-fn draw_is_weighted_and_input_order_independent() {
-    let a = vec![ws("a", 0, false), ws("b", 100, false)];
-    let b = vec![ws("b", 100, false), ws("a", 0, false)];
-    let mut ra = PickRng::from_seed(1);
-    let mut rb = PickRng::from_seed(1);
-    let mut a_wins = 0;
-    for _ in 0..2000 {
-        let da = draw_workspace(&a, T80, &mut ra).unwrap();
-        assert_eq!(da, draw_workspace(&b, T80, &mut rb).unwrap());
-        if da.picked == "a" {
-            a_wins += 1;
-        }
-    }
-    // Expected share 1 / (1 + e^-1.25) ~ 77.7% at T = 80.
-    assert!((1450..=1650).contains(&a_wins), "a won {a_wins}/2000");
-}
-
-#[test]
-fn draw_records_candidates_weights_and_pick() {
-    let entries = vec![ws("a", 0, false), ws("b", 100, false)];
-    let d = draw_workspace(&entries, T80, &mut PickRng::from_seed(5)).unwrap();
-    assert_eq!(d.pool, "all");
-    assert_eq!(d.total_weight, 1_286_505);
-    assert_eq!(d.candidates[0].weight, DRAW_WEIGHT_SCALE);
-    assert_eq!((d.temperature, d.p_min), (T80, 0));
+fn draw_records_base_weights_bonuses_and_pick() {
+    let entries = vec![ws("a", 2), ws_vi("b", 1)];
+    let d = draw_workspace(&entries, &WeightBonus::default(), &mut PickRng::from_seed(5)).unwrap();
+    assert_eq!(d.candidates[0].workspace, "a");
+    assert_eq!(
+        (d.candidates[0].base_weight, d.candidates[0].bonus, d.candidates[0].weight),
+        (2, 0, 2)
+    );
+    let vi = u64::from(DEFAULT_BONUS_VERY_IMPORTANT);
+    assert_eq!(
+        (d.candidates[1].base_weight, d.candidates[1].bonus, d.candidates[1].weight),
+        (1, vi, 1 + vi)
+    );
+    assert_eq!(d.total_weight, 3 + vi);
     assert!(d.roll < d.total_weight);
     let v = serde_json::to_value(&d).unwrap();
     assert_eq!(v["picked"], d.picked);
-    assert!(draw_workspace(&[], T80, &mut PickRng::from_seed(1)).is_none());
+    assert!(draw_workspace(&[], &FLAT, &mut PickRng::from_seed(1)).is_none());
 }
 
 /// ACCEPTANCE (#11509): with N+2 open very-important issues in a workspace
@@ -313,34 +282,6 @@ fn red_main_fix_leads_the_workspace_order() {
         .collect();
     assert_eq!(order, vec![77, 30, 2, 9]);
     assert_eq!(next_in_workspace(&items).unwrap().number, 77);
-}
-
-#[test]
-fn red_main_fix_workspace_wins_the_draw_over_very_important() {
-    let entries = vec![
-        ws("a/tool", 0, false),
-        ws("b/prod", 0, true),
-        ws_fix("c/red", 100),
-    ];
-    for seed in 0..200 {
-        let d = draw_workspace(&entries, T80, &mut PickRng::from_seed(seed)).unwrap();
-        assert_eq!(d.picked, "c/red");
-        assert_eq!(d.pool, "red-main-fix");
-        assert_eq!(d.candidates.len(), 1);
-    }
-}
-
-#[test]
-fn without_a_red_main_fix_the_draw_pools_are_unchanged() {
-    let vi = vec![ws("a/tool", 0, false), ws("b/prod", 100, true)];
-    let all = vec![ws("a/tool", 0, false), ws("b/prod", 100, false)];
-    for seed in 0..200 {
-        let d = draw_workspace(&vi, T80, &mut PickRng::from_seed(seed)).unwrap();
-        assert_eq!((d.pool, d.picked.as_str()), ("very-important", "b/prod"));
-        let d = draw_workspace(&all, T80, &mut PickRng::from_seed(seed)).unwrap();
-        assert_eq!(d.pool, "all");
-        assert_eq!(d.candidates.len(), 2);
-    }
 }
 
 #[test]

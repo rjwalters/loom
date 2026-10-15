@@ -105,6 +105,11 @@ ORDER BY timestamp DESC LIMIT 20;
 -- A `workspace_halted` row names its cause on `loom.queue.halt_cause` (#9017
 -- token: main_red / gate_pending / token_pool / preflight_advisory / drain /
 -- breaker / write_scope; #9673, #9548). The column is empty for a cause-less legacy row — join to
--- the parent `loom.dispatch.tick` span
--- (`attributes_string['loom.dispatch.result'] = 'halted_main_red'`) through
--- `parentSpanID` there.
+-- the parent `loom.dispatch.tick` span through `parentSpanID` there and read
+-- its `attributes_string['loom.dispatch.halt_causes']` (comma-separated
+-- tokens, e.g. `has(splitByChar(',', ...), 'main_red')`). Do not key on
+-- `loom.dispatch.result = 'halted_main_red'`: since #11857 the result names a
+-- hold only when it covered the tick's work, so a tick that held one root
+-- beside healthy ones reads its per-candidate result (`all_skipped`, ...)
+-- while `loom.dispatch.halt_causes` still lists the cause and
+-- `loom.dispatch.held_roots` counts the held roots.

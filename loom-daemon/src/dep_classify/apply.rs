@@ -12,7 +12,7 @@
 //!
 //! - **Comment first, label removal fails** → every later re-scan finds the
 //!   marker, short-circuits on `already-unescalated`, and never retries the
-//!   removal. The proposal sits at `loom:operator-only` forever, carrying a
+//!   removal. The proposal sits at `loom:operator` forever, carrying a
 //!   comment claiming it was released. That is exactly the permanence failure
 //!   #5664 exists to eliminate.
 //! - **Label first, comment fails** → the state change that matters already
@@ -23,10 +23,10 @@
 //! So the label goes first, and a failed label removal aborts **before** any
 //! comment is posted.
 //!
-//! The sub-kind label removal between them is best-effort: a sub-label must
-//! never outlive the base label it accompanies (#5671), but a pre-#5679
-//! escalation never carried one, so "already absent" is the common case rather
-//! than an error.
+//! The removal of the hold's other names between them is best-effort: since
+//! #11795 the hold is `loom:operator`, and an unmigrated item may still carry
+//! the retired `loom:operator-only` and a sub-kind label beside it. The caller
+//! passes only the names actually present.
 
 use crate::cmd_out::CmdOutcome;
 
@@ -52,7 +52,7 @@ impl std::fmt::Display for ApplyError {
                 write!(f, "could not append the revision section ({d}); no label change, no comment, a later pass will retry")
             }
             ApplyError::LabelRemoval(d) => {
-                write!(f, "could not remove the operator-only label ({d}); no comment posted, a later pass will retry")
+                write!(f, "could not remove the operator hold label ({d}); no comment posted, a later pass will retry")
             }
             ApplyError::CommentPost(d) => {
                 write!(f, "label removed but the marker comment did not post ({d})")
@@ -73,11 +73,27 @@ pub trait Writer {
     fn edit_body(&mut self, body: &str) -> CmdOutcome;
 }
 
-/// Labels this operation manipulates.
+/// Labels an un-escalation (either path) manipulates (#11795).
 pub struct Labels<'a> {
-    pub operator_only: &'a str,
-    /// The #5671 sub-kind label, removed best-effort.
-    pub operator_blocked: &'a str,
+    /// The operator hold the item carries: `loom:operator`, or a retired name
+    /// on an unmigrated item. Its removal is the state change.
+    pub hold: &'a str,
+    /// The hold's other names present on the item (retired names, sub-kinds),
+    /// removed best-effort after it.
+    pub also: &'a [&'a str],
+}
+
+impl Labels<'_> {
+    /// "`hold`" or "`hold` (and `a`, `b`)", for the audit comments.
+    #[must_use]
+    pub fn removed_text(&self) -> String {
+        let also: Vec<String> = self.also.iter().map(|l| format!("`{l}`")).collect();
+        if also.is_empty() {
+            format!("`{}`", self.hold)
+        } else {
+            format!("`{}` (and {})", self.hold, also.join(", "))
+        }
+    }
 }
 
 /// Apply an un-escalation: remove the label, then post the marker comment.
@@ -94,16 +110,17 @@ pub fn apply_unescalation<W: Writer>(
 ) -> Result<(), ApplyError> {
     // 1. The state change that matters. If this fails, stop — posting the
     //    marker now would permanently suppress every future retry.
-    let removed = writer.remove_label(labels.operator_only);
+    let removed = writer.remove_label(labels.hold);
     if !removed.succeeded() {
         return Err(ApplyError::LabelRemoval(
             removed.failure_reason("gh issue edit --remove-label"),
         ));
     }
 
-    // 2. Best-effort: the sub-kind label must not outlive its base label
-    //    (#5671), but "already absent" is the common case, not an error.
-    let _ = writer.remove_label(labels.operator_blocked);
+    // 2. Best-effort: the hold's other names must not outlive it.
+    for l in labels.also {
+        let _ = writer.remove_label(l);
+    }
 
     // 3. The audit trail and the anti-refight marker.
     let posted = writer.post_comment(body);
@@ -116,23 +133,19 @@ pub fn apply_unescalation<W: Writer>(
 
 /// The marker comment body for a blockers-cleared release.
 #[must_use]
-pub fn cleared_body(
-    operator_only: &str,
-    operator_blocked: &str,
-    cleared: &str,
-    marker: &str,
-) -> String {
+pub fn cleared_body(labels: &Labels<'_>, cleared: &str, marker: &str) -> String {
+    let hold = labels.hold;
+    let removed = labels.removed_text();
     format!(
         "**Champion: Un-escalating — the recorded blocker has closed**\n\
          \n\
-         This proposal was routed to `{operator_only}` for a **timing** finding, not a\n\
+         This proposal was routed to `{hold}` for a **timing** finding, not a\n\
          merits one: its only recurring finding was an open dependency. That dependency has\n\
          since closed, so the stated reason for the escalation no longer holds.\n\
          \n\
          **Cleared blockers**: {cleared}\n\
          \n\
-         Removed `{operator_only}` (and its `{operator_blocked}` sub-kind\n\
-         label, if present); this proposal returns to normal evaluation. Nothing\n\
+         Removed {removed}; this proposal returns to normal evaluation. Nothing\n\
          here overrides a human decision — if this proposal genuinely needs one, re-add\n\
          the label (or state the merits finding) and it will not be un-escalated again.\n\
          \n\
@@ -144,17 +157,13 @@ pub fn cleared_body(
 
 /// The marker comment body for a startable-subset carve-out.
 #[must_use]
-pub fn subset_body(
-    operator_only: &str,
-    operator_blocked: &str,
-    still_open: &str,
-    subset: &str,
-    marker: &str,
-) -> String {
+pub fn subset_body(labels: &Labels<'_>, still_open: &str, subset: &str, marker: &str) -> String {
+    let hold = labels.hold;
+    let removed = labels.removed_text();
     format!(
         "**Champion: Un-escalating — a startable subset was never actually blocked**\n\
          \n\
-         This proposal was routed to `{operator_only}` for a **timing** finding, not a\n\
+         This proposal was routed to `{hold}` for a **timing** finding, not a\n\
          merits one: its only recurring finding was an open dependency. That dependency\n\
          ({still_open}) is still open, but this issue declares a **startable subset**\n\
          independent of it:\n\
@@ -165,8 +174,7 @@ pub fn subset_body(
          mistake, not the wait itself — un-escalating so the subset above can be\n\
          promoted and built now.\n\
          \n\
-         Removed `{operator_only}` (and its `{operator_blocked}` sub-kind\n\
-         label, if present); this proposal returns to normal evaluation, scoped to the\n\
+         Removed {removed}; this proposal returns to normal evaluation, scoped to the\n\
          startable subset until {still_open} closes. Nothing here overrides a human\n\
          decision — if this proposal genuinely needs one, re-add the label (or state\n\
          the merits finding) and it will not be un-escalated again.\n\
@@ -180,20 +188,6 @@ pub fn subset_body(
 // ===========================================================================
 // The fact path (#7650)
 // ===========================================================================
-
-/// Labels the **fact** un-escalation manipulates.
-///
-/// Deliberately not [`Labels`]: the two mechanisms drop a *different* sub-kind.
-/// A dependency-timing escalation carries `loom:operator-blocked`; a
-/// fact-checkable one carries `loom:operator-decision`, which is what
-/// `champion-issue-promo.md` selects whenever a recurring finding is not a pure
-/// dependency citation. Sharing one struct would invite passing the wrong one,
-/// which fails silently — removing an absent label is best-effort and succeeds.
-pub struct FactLabels<'a> {
-    pub operator_only: &'a str,
-    /// The #7650 sub-kind label, removed best-effort.
-    pub operator_decision: &'a str,
-}
 
 /// Fold a resolutions file into prose bullets.
 ///
@@ -233,15 +227,10 @@ pub fn fact_revised_body(
 /// The confirming comment for a fact un-escalation. No trailing newline,
 /// matching the shell.
 #[must_use]
-pub fn fact_comment_body(
-    operator_only: &str,
-    operator_decision: &str,
-    commit: &str,
-    summary: &str,
-    marker: &str,
-) -> String {
+pub fn fact_comment_body(labels: &Labels<'_>, commit: &str, summary: &str, marker: &str) -> String {
+    let removed = labels.removed_text();
     format!(
-        "**Curator: De-escalating — every cited objection has resolved on `main`**\n\nChampion escalated this proposal for repeated rejection without revision.\nEvery objection Champion's escalation cited has since been independently\nre-verified against `{commit}`:\n\n{summary}\n\nAppended a `## Revision` section naming the verifying commit (this changes\nthe body hash, the existing contract for \"revised — evaluate again\") and\nremoved `{operator_only}` (and its `{operator_decision}`\nsub-kind label, if present). This proposal returns to Champion's normal\nevaluation queue. Nothing here overrides a human decision — if this proposal\ngenuinely needs one, re-add the label and it will not be de-escalated again\nfor the same finding set.\n\n---\n*Automated by Curator role (classify-dependency-block.sh --check-fact-unescalate, #7650)*\n{marker}"
+        "**Curator: De-escalating — every cited objection has resolved on `main`**\n\nChampion escalated this proposal for repeated rejection without revision.\nEvery objection Champion's escalation cited has since been independently\nre-verified against `{commit}`:\n\n{summary}\n\nAppended a `## Revision` section naming the verifying commit (this changes\nthe body hash, the existing contract for \"revised — evaluate again\") and\nremoved {removed}. This proposal returns to Champion's normal\nevaluation queue. Nothing here overrides a human decision — if this proposal\ngenuinely needs one, re-add the label and it will not be de-escalated again\nfor the same finding set.\n\n---\n*Automated by Curator role (classify-dependency-block.sh --check-fact-unescalate, #7650)*\n{marker}"
     )
 }
 
@@ -269,7 +258,7 @@ pub fn fact_comment_body(
 /// [`ApplyError::CommentPost`], per the ordering above.
 pub fn apply_fact_unescalation<W: Writer>(
     writer: &mut W,
-    labels: &FactLabels<'_>,
+    labels: &Labels<'_>,
     current_body: &str,
     revised_body: &str,
     revision_marker: &str,
@@ -284,14 +273,16 @@ pub fn apply_fact_unescalation<W: Writer>(
         }
     }
 
-    let removed = writer.remove_label(labels.operator_only);
+    let removed = writer.remove_label(labels.hold);
     if !removed.succeeded() {
         return Err(ApplyError::LabelRemoval(
             removed.failure_reason("gh issue edit --remove-label"),
         ));
     }
 
-    let _ = writer.remove_label(labels.operator_decision);
+    for l in labels.also {
+        let _ = writer.remove_label(l);
+    }
 
     let posted = writer.post_comment(comment);
     if !posted.succeeded() {

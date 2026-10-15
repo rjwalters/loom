@@ -54,6 +54,11 @@ case "$*" in
     printf '[{"number": 7, "title": "seven", "state": "open", "labels": [{"name": "loom:issue"}], "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z", "closed_at": null, "body": null, "user": {"login": "x"}}]\n'
     exit 0
     ;;
+  'issue list --label loom:triage --json number,labels -R o/r')
+    printf '[{"labels":[{"id":"LA_1","name":"loom:triage","description":"","color":"fff"}],"number":12},{"labels":[],"number":9}]\n'
+    echo 'listing stderr' 1>&2
+    exit 0
+    ;;
   'wait-for-signal')
     trap 'echo TERM >> "$STUB_LOG.sig"; exit 42' TERM
     : > "$STUB_LOG.ready"
@@ -135,6 +140,7 @@ impl Sandbox {
             "GH_CONFIG_DIR",
             "GH_TOKEN",
             "GITHUB_TOKEN",
+            "LOOM_PICK_JOURNAL",
         ] {
             cmd.env_remove(k);
         }
@@ -533,8 +539,7 @@ fn gh_shim_path_links_gh_to_this_binary() {
 }
 
 /// #10516: `gh-shim session-env` (the SessionStart hook) writes the front into
-/// `$CLAUDE_ENV_FILE` once — with the managed launcher ahead of it under a
-/// policy, as for a worker — prints nothing on stdout, always exits 0, and
+/// `$CLAUDE_ENV_FILE` once, as for a worker, prints nothing on stdout, always exits 0, and
 /// no-ops without an env file, under `LOOM_GH_SHIM=0`, or outside a workspace.
 #[test]
 fn gh_shim_session_env_puts_the_front_on_the_session_path_once() {
@@ -553,13 +558,7 @@ fn gh_shim_session_env_puts_the_front_on_the_session_path_once() {
         ];
         env.extend_from_slice(extra);
         let mut cmd = s.command(&bin, &["gh-shim", "session-env"], &[]);
-        for k in [
-            "LOOM_GH_SHIM",
-            "LOOM_FORGE_EGRESS_POLICY",
-            "LOOM_FORGE_EGRESS_MANAGED",
-        ] {
-            cmd.env_remove(k);
-        }
+        cmd.env_remove("LOOM_GH_SHIM");
         let out = cmd.envs(env).output().unwrap();
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert!(out.stdout.is_empty(), "{out:?}");
@@ -568,9 +567,7 @@ fn gh_shim_session_env_puts_the_front_on_the_session_path_once() {
     let sourced_status = |env_file: &Path, extra: &[(&str, &str)]| {
         let script = format!(". '{}'; '{}' gh-shim status", env_file.display(), bin.display());
         let mut cmd = s.command(Path::new("sh"), &["-c", &script], &[]);
-        cmd.env("PATH", "/usr/bin:/bin")
-            .env_remove("LOOM_FORGE_EGRESS_POLICY")
-            .envs(extra.iter().copied());
+        cmd.env("PATH", "/usr/bin:/bin").envs(extra.iter().copied());
         stdout(&cmd.output().unwrap())
     };
 
@@ -588,26 +585,6 @@ fn gh_shim_session_env_puts_the_front_on_the_session_path_once() {
     assert!(front.contains(&base), "{front}");
     let status = sourced_status(&s.p("d.sh"), &[]);
     assert!(status.starts_with("front: ") && status.contains(&base), "{status}");
-
-    // Under a policy the managed launcher comes first, exactly as for a worker.
-    let managed = s.p("managed/gh");
-    std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
-    std::fs::write(&managed, "#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut policy: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/forge-egress/policy.example.json")).unwrap();
-    policy["toolchain"]["launcherPath"] = managed.display().to_string().into();
-    policy["enforcement"]["api"] = "observe".into();
-    let policy_file = s.p("policy.json");
-    std::fs::write(&policy_file, policy.to_string()).unwrap();
-    let policy_env = policy_file.display().to_string();
-    let with_policy = [("LOOM_FORGE_EGRESS_POLICY", policy_env.as_str())];
-    let line = run(&s.p("e.sh"), &with_policy);
-    let managed_dir = s.p("managed").display().to_string();
-    let (at_launcher, at_front) = (line.find(&managed_dir).unwrap(), line.find(&base).unwrap());
-    assert!(at_launcher < at_front, "{line}");
-    let status = sourced_status(&s.p("e.sh"), &with_policy);
-    assert_eq!(status.trim(), format!("launcher: {}", managed.display()), "{status}");
 }
 
 /// W5: every passthrough is one forge-call ledger row, written before the
@@ -1079,4 +1056,48 @@ fn the_daemon_ingests_a_passthrough_pr_create_and_a_served_issue_view() {
     let outcomes: Vec<_> = views.iter().map(|c| c.labels.outcome).collect();
     assert_eq!(outcomes, [CallOutcome::Ok, CallOutcome::NotModified]);
     assert!(drain(&sink, &mut cursors, now()).calls.is_empty(), "each row once");
+}
+
+/// #11858: inside a role tick (a pick journal attached), a `--json …labels`
+/// listing the front cannot serve passes through captured: stdout, stderr and
+/// exit status are `gh`'s, and its rows are journaled for `pick.decision`.
+/// Outside a role tick the same call journals nothing.
+#[test]
+fn a_role_ticks_passthrough_listing_is_journaled() {
+    let s = Sandbox::new();
+    let args = [
+        "issue",
+        "list",
+        "--label",
+        "loom:triage",
+        "--json",
+        "number,labels",
+        "-R",
+        "o/r",
+    ];
+    let listing = "[{\"labels\":[{\"id\":\"LA_1\",\"name\":\"loom:triage\",\"description\":\"\",\
+                   \"color\":\"fff\"}],\"number\":12},{\"labels\":[],\"number\":9}]\n";
+    let plain = s.gh(&args, &[]);
+    assert!(plain.status.success(), "{plain:?}");
+    assert_eq!(stdout(&plain), listing);
+
+    let journal = s.p("tmp/pick-journal.jsonl");
+    let out = s.gh(&args, &[("LOOM_PICK_JOURNAL", journal.to_str().unwrap())]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stdout(&out), listing, "output replayed unchanged");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "listing stderr\n");
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let rows = lines
+        .iter()
+        .find(|l| l["kind"] == "listing")
+        .map(|l| l["rows"].as_array().unwrap().clone())
+        .expect("a listing line");
+    let numbers: Vec<u64> = rows.iter().map(|r| r["number"].as_u64().unwrap()).collect();
+    assert_eq!(numbers, [12, 9]);
+    assert_eq!(rows[0]["stage"], "loom:triage");
+    assert_eq!(rows[0]["labels"][0], "loom:triage");
 }

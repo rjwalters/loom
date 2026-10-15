@@ -87,9 +87,9 @@ fn a_blocked_open_very_important_issue_does_not_hold_the_slot_in_the_tick() {
 }
 
 /// Multi-workspace tick: a workspace whose only very-important ready issue
-/// is demoted (an older one is being built) no longer wins the draw pool.
+/// is demoted (an older one is being built) earns only the important bonus.
 #[test]
-fn a_demoted_workspace_does_not_win_the_very_important_draw() {
+fn a_demoted_workspace_earns_only_the_important_bonus() {
     let building = WorkItem::with_created_at(
         1,
         vec!["loom:building".into(), VERY_IMPORTANT_LABEL.into()],
@@ -117,9 +117,13 @@ fn a_demoted_workspace_does_not_win_the_very_important_draw() {
             RecordingDispatcher::default(),
         ),
     ];
-    let report = tick_multi(&mut multi, &[100, 100], 1, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 1], 1, &[false, false]);
     let log = report.workspace_draw.as_ref().unwrap();
-    assert_eq!(log.steps[0].draw.pool, "all", "no very-important work is left after the cap");
+    assert_eq!(
+        log.steps[0].draw.candidates[0].bonus,
+        u64::from(crate::priority_pick::DEFAULT_BONUS_IMPORTANT),
+        "no very-important work is left after the cap; the demoted issue ranks important"
+    );
     assert_eq!(
         report.vi_demotions,
         vec![ViDemotion {
@@ -141,7 +145,7 @@ fn the_cap_is_per_workspace() {
         (FakeSource::once(vec![vi(1)]), RecordingDispatcher::default()),
         (FakeSource::once(vec![vi(2)]), RecordingDispatcher::default()),
     ];
-    let report = tick_multi(&mut multi, &[100, 100], 4, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 1], 4, &[false, false]);
     assert!(report.vi_demotions.is_empty());
     assert_eq!(report.dispatched, 2);
 }

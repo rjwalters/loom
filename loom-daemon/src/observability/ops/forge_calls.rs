@@ -29,8 +29,9 @@ use std::collections::BTreeMap;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 
 /// Distinct label sets held between drains. A new set past this is folded
-/// into the fixed [`OVERFLOW`] labels — only `outcome` survives, a closed
-/// five-value enum — so a drain is never more than `MAX_SERIES + 5` points
+/// into the fixed [`OVERFLOW`] labels — only `route` and `outcome` survive,
+/// closed enums of four and six values — so a drain is never more than
+/// `MAX_SERIES + 24` points
 /// whatever the labels vary in, and the folded counts keep the total.
 const MAX_SERIES: usize = 2048;
 
@@ -98,11 +99,15 @@ pub struct CallLabels {
     pub target_owner: String,
     /// The billed resource.
     pub resource: String,
+    /// How the call reached GitHub (2am#4367 P4): one of
+    /// [`crate::forge_gateway::ROUTES`]. With `account`, it reports the
+    /// writer installation's read share (`route = direct_read`).
+    pub route: &'static str,
     pub outcome: CallOutcome,
 }
 
 /// `(caller, op, role, account, cred_owner, installation, target_owner,
-/// resource, agent, outcome)`.
+/// resource, agent, route, outcome)`.
 type Key = (
     String,
     String,
@@ -112,6 +117,7 @@ type Key = (
     String,
     String,
     String,
+    &'static str,
     &'static str,
     &'static str,
 );
@@ -145,6 +151,7 @@ fn add(store: &mut Series, cap: usize, labels: CallLabels, agent: &'static str, 
         labels.target_owner,
         labels.resource,
         agent,
+        labels.route,
         labels.outcome.as_str(),
     );
     let key = if store.len() >= cap && !store.contains_key(&key) {
@@ -156,7 +163,7 @@ fn add(store: &mut Series, cap: usize, labels: CallLabels, agent: &'static str, 
         } else {
             AGENT_OVERFLOW_CALLER.to_string()
         };
-        (caller, o(), o(), o(), o(), o(), o(), o(), agent, key.9)
+        (caller, o(), o(), o(), o(), o(), o(), o(), agent, key.9, key.10)
     } else {
         key
     };
@@ -220,6 +227,7 @@ pub fn drain_points() -> Vec<MetricPoint> {
                     target_owner,
                     resource,
                     agent,
+                    route,
                     outcome,
                 ),
                 n,
@@ -234,6 +242,7 @@ pub fn drain_points() -> Vec<MetricPoint> {
                     .label("target_owner", target_owner)
                     .label("resource", resource)
                     .label("agent", agent)
+                    .label("route", route)
                     .label("outcome", outcome)
             },
         )
@@ -291,6 +300,7 @@ mod tests {
             installation: format!("{i}"),
             target_owner: format!("target-{i}"),
             resource: format!("res-{}", i % 5),
+            route: "direct",
             outcome,
         }
     }
@@ -337,6 +347,7 @@ mod tests {
             first.target_owner,
             first.resource,
             NO_AGENT,
+            first.route,
             first.outcome.as_str(),
         );
         assert_eq!(store.get(&key).copied(), Some(2 + 5));
@@ -352,6 +363,7 @@ mod tests {
             installation: "-".to_string(),
             target_owner: "acme".to_string(),
             resource: "graphql".to_string(),
+            route: "direct",
             outcome: CallOutcome::Ok,
         }
     }
@@ -386,9 +398,9 @@ mod tests {
             .find(|p| p.labels["caller"] == "issue.view")
             .unwrap();
         assert_eq!(agent(own), NO_AGENT);
-        assert!(points.iter().all(|p| p.labels.len() == 10), "{points:?}");
+        assert!(points.iter().all(|p| p.labels.len() == 11), "{points:?}");
         // The export boundary applies `bounded_points()` (sink and OTLP
-        // mapping); all ten labels must survive it, not just the raw drain.
+        // mapping); all eleven labels must survive it, not just the raw drain.
         let bounded = crate::telemetry::ops::MetricPointsRecord {
             captured_at: chrono::Utc::now(),
             interval_start: None,
@@ -396,7 +408,7 @@ mod tests {
         }
         .bounded_points();
         assert_eq!(bounded, points, "bounding must not drop any forge-call label");
-        for key in ["target_owner", "installation", "agent"] {
+        for key in ["target_owner", "installation", "agent", "route"] {
             assert!(bounded.iter().all(|p| p.labels.contains_key(key)), "{key}: {bounded:?}");
         }
         let (again, _) = capture(drain_points);

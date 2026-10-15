@@ -250,6 +250,34 @@ fn all_declared_blockers_closed_releases_and_restores_prior_approval() {
     assert!(w.labels(10).contains("loom:issue") && !w.labels(10).contains("loom:blocked"));
 }
 
+/// #11480 follow-up: a closed dependency releases the park, but an issue that
+/// also carries a restore veto (`loom:needs-capability`, the sky130-comparator
+/// #127 shape) does not get `loom:issue` back.
+#[test]
+fn a_veto_label_keeps_loom_issue_off_on_release() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &[]);
+    w.park
+        .items
+        .get_mut(&10)
+        .unwrap()
+        .labels
+        .push("loom:needs-capability".into());
+    w.state(1, "CLOSED", false);
+    w.extra
+        .events
+        .insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].restored, None);
+    assert_eq!(w.park.writes, vec!["remove #10 loom:blocked"]);
+    assert!(!w.labels(10).contains("loom:issue"));
+    // The audit comment names the veto, never "it never carried loom:issue".
+    let comment = &w.extra.posted[0].1;
+    assert!(comment.contains("carries `loom:needs-capability`"), "{comment}");
+    assert!(!comment.contains("never carried"), "{comment}");
+}
+
 #[test]
 fn never_approved_issue_is_released_without_loom_issue() {
     let mut w = World::new();
@@ -783,4 +811,100 @@ fn env_off_and_unowned_shard_read_nothing() {
     let r = gated(Mode::DryRun, true, |dry_run| w.run_with(Config { dry_run, ..cfg() })).unwrap();
     assert!(r.dry_run && w.no_writes());
     assert_eq!(r.released.len(), 1);
+}
+
+/// #11743: a frozen artifact gets no write of any kind, even when every
+/// declared blocker has closed.
+#[test]
+fn a_frozen_artifact_is_never_released_or_commented() {
+    for pr in [false, true] {
+        let mut w = World::new();
+        w.parked(10, pr, &[1], &["loom:frozen"]);
+        w.state(1, "CLOSED", false);
+        w.extra
+            .events
+            .insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
+        let r = w.run();
+        assert!(r.released.is_empty(), "pr={pr}: {}", r.summary());
+        assert!(w.no_writes(), "pr={pr}: {:?}", w.park.writes);
+    }
+}
+
+/// #11517: a release never adds `loom:issue` beside a live `loom:building`.
+#[test]
+fn a_claimed_issue_does_not_get_loom_issue_back_on_release() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &["loom:building"]);
+    w.state(1, "CLOSED", false);
+    w.extra
+        .events
+        .insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].restored, None);
+    assert!(!w.labels(10).contains("loom:issue"));
+}
+
+// --- #11861: dependency-only escalations and Champion holds -------------------
+
+/// A dependency-only finding parked by `classify-dependency-block.sh
+/// --check-defer --apply` (or moved off `loom:operator` by `labels migrate
+/// --holds`) clears itself when its blocker closes: the park is released, the
+/// proposal keeps `loom:curated` for Champion's re-evaluation, and it never
+/// gains `loom:issue` it did not carry.
+#[test]
+fn a_dependency_only_escalation_clears_when_its_blocker_closes() {
+    let mut w = World::new();
+    let body = format!(
+        "A proposal.\n\n{}\n",
+        render_park(
+            &[3],
+            Some(crate::dep_classify::park::PARK_BY),
+            Some("2026-10-01T00:00:00Z"),
+            Some(crate::dep_classify::park::PARK_REASON),
+        )
+    );
+    w.with_body(10, false, &body, &["loom:curated"]);
+    w.state(3, "OPEN", false);
+    let r = w.run();
+    assert!(r.released.is_empty() && w.no_writes(), "still waiting: {}", r.summary());
+
+    let mut w = World::new();
+    w.with_body(10, false, &body, &["loom:curated"]);
+    w.state(3, "CLOSED", false);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].restored, None);
+    assert_eq!(w.park.writes, vec!["remove #10 loom:blocked"]);
+    let labels = w.labels(10);
+    assert!(
+        labels.contains("loom:curated") && !labels.contains("loom:blocked"),
+        "{labels:?}"
+    );
+}
+
+/// Champion's merge-risk and critical-file holds are a reason-only park
+/// record beside `loom:pr`: this pass never releases one. Only Champion (a
+/// release signal) or a human does.
+#[test]
+fn a_champion_hold_on_a_pr_is_never_released_here() {
+    for reason in [
+        crate::champion_hold::MERGE_RISK_HOLD_REASON,
+        crate::champion_hold::CRITICAL_FILE_HOLD_REASON,
+    ] {
+        let mut w = World::new();
+        let body = format!(
+            "A change.\n\n{}\n",
+            render_park(
+                &[],
+                Some(crate::champion_hold::HOLD_BY),
+                Some("2026-10-01T00:00:00Z"),
+                Some(reason),
+            )
+        );
+        w.with_body(30, true, &body, &["loom:pr"]);
+        let r = w.run();
+        assert_eq!(skipped(&r, "unstated"), 1, "{reason}: {}", r.summary());
+        assert!(r.released.is_empty() && w.no_writes(), "{reason}");
+    }
 }

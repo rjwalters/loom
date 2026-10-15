@@ -107,6 +107,9 @@ pub(crate) enum Event {
         label: String,
         to: Option<String>,
         had_target: bool,
+        /// The entry's `also_remove` labels this item carried (#11860).
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        also_removed: Vec<String>,
     },
     AddOnly {
         item: u64,
@@ -136,6 +139,11 @@ pub(crate) enum Event {
         label: String,
         open: usize,
     },
+    /// `--keep-labels` (2am#4345): open items are migrated, the label
+    /// definition is kept so closed items keep it.
+    Retained {
+        label: String,
+    },
     Stopped {
         why: String,
     },
@@ -149,8 +157,12 @@ impl fmt::Display for Event {
                 label,
                 to,
                 had_target,
+                also_removed,
             } => {
                 write!(f, "RELABEL #{item} {label} -> {}", to.as_deref().unwrap_or("none"))?;
+                for x in also_removed {
+                    write!(f, ", -{x}")?;
+                }
                 if *had_target {
                     write!(f, " (already has {})", to.as_deref().unwrap_or_default())?;
                 }
@@ -169,6 +181,9 @@ impl fmt::Display for Event {
                 "UNOWNED {label} (add-only: Loom never declared it, so it is never removed \
                  or deleted; open: {open})"
             ),
+            Event::Retained { label } => {
+                write!(f, "RETAINED {label} (definition kept: --keep-labels; closed items keep it)")
+            }
             Event::Stopped { why } => {
                 write!(f, "STOPPED ({why}); rerun later, every step is idempotent")
             }
@@ -265,6 +280,25 @@ pub(crate) fn list_open(forge: &dyn MigrateForge, label: &str) -> Result<Vec<Ite
     )))
 }
 
+std::thread_local! {
+    /// `--keep-labels` (2am#4345, operator 2026-10-13: "we don't need to change
+    /// labels on anything closed"): migrate open items, never delete a retired
+    /// label's definition. GitHub strips a deleted label from every closed item
+    /// that carried it, which can't be undone. Set once by [`dispatch`], read
+    /// only by [`migrate_one`], on the same thread. Thread-local, not
+    /// process-wide, so parallel tests that flip it cannot leak it into each
+    /// other's runs.
+    static KEEP_LABELS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_keep_labels(keep: bool) {
+    KEEP_LABELS.with(|k| k.set(keep));
+}
+
+fn keep_labels() -> bool {
+    KEEP_LABELS.with(std::cell::Cell::get)
+}
+
 /// Migrate every `retired` entry, in order, on one repo.
 pub(crate) fn run(
     forge: &dyn MigrateForge,
@@ -353,6 +387,14 @@ fn migrate_one(
         });
         return Ok(());
     }
+    if keep_labels() {
+        // Open items are done (or counted as remaining above); the
+        // definition stays, so nothing is left for this label.
+        r.events.push(Event::Retained {
+            label: name.clone(),
+        });
+        return Ok(());
+    }
     if !apply {
         r.events.push(Event::Delete {
             label: name.clone(),
@@ -363,7 +405,8 @@ fn migrate_one(
     prune(forge, name, r)
 }
 
-/// Add the replacement (if missing), then, for an owned label, remove the old one.
+/// Add the replacement (if missing), then, for an owned label, strip its
+/// `also_remove` labels and remove the old one.
 fn relabel_item(
     forge: &dyn MigrateForge,
     entry: &RetiredLabel,
@@ -408,6 +451,35 @@ fn relabel_item(
     if !entry.owned {
         return Ok(());
     }
+    // `also_remove` (#11860): after the add, before the old label goes, so an
+    // interrupted run leaves the old label as the marker a rerun finds.
+    let also_removed: Vec<String> = entry
+        .also_remove
+        .iter()
+        .filter(|x| item.labels.iter().any(|l| ieq(l, x)))
+        .cloned()
+        .collect();
+    for x in &also_removed {
+        if !apply {
+            r.summary.remaining += 1;
+            continue;
+        }
+        match forge.remove_label(item.number, x) {
+            Ok(()) => r.summary.writes += 1,
+            Err(ForgeError::NotFound(_)) => {}
+            Err(e) => {
+                stop_on_limit(r, &e)?;
+                let why = format!("remove {x} failed, old label left in place: {e}");
+                r.events.push(Event::Failed {
+                    item: item.number,
+                    label: name.clone(),
+                    why,
+                });
+                r.summary.remaining += 1;
+                return Ok(());
+            }
+        }
+    }
     if apply {
         match forge.remove_label(item.number, name) {
             Ok(()) => r.summary.writes += 1,
@@ -432,6 +504,7 @@ fn relabel_item(
         label: name.clone(),
         to: entry.replaced_by.clone(),
         had_target: entry.replaced_by.is_some() && had_target,
+        also_removed,
     });
     r.summary.relabeled += 1;
     Ok(())
@@ -537,6 +610,45 @@ pub(crate) struct GhMigrateForge {
 
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Minimum spacing between this process's forge WRITES (2am#4345): a bulk
+/// triage of ~450 label writes in one hour from the operator account tripped
+/// GitHub's secondary write limit, which the whole fleet shares. GitHub's
+/// guidance is under 80 content-creating requests a minute and 500 an hour;
+/// the default 7.5 s keeps a run under 480 an hour. `LOOM_LABEL_WRITE_INTERVAL_MS`
+/// overrides it (0 disables pacing, e.g. for a handful of writes).
+const DEFAULT_WRITE_INTERVAL: Duration = Duration::from_millis(7500);
+
+/// The configured write interval.
+pub(crate) fn write_interval() -> Duration {
+    std::env::var("LOOM_LABEL_WRITE_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_WRITE_INTERVAL, Duration::from_millis)
+}
+
+/// How long to wait before the next write, given the last one's time.
+pub(crate) fn pace_delay(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: Duration,
+) -> Duration {
+    last.map_or(Duration::ZERO, |t| interval.saturating_sub(now.saturating_duration_since(t)))
+}
+
+/// Block until the next write may go, process-wide (every target in an
+/// `--all-workspaces` run shares one pace: they share one write budget).
+pub(crate) fn pace_write() {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let wait = pace_delay(*last, std::time::Instant::now(), write_interval());
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+    *last = Some(std::time::Instant::now());
+}
+
 /// Percent-encode one URL path/query component.
 pub(crate) fn enc(s: &str) -> String {
     s.bytes()
@@ -578,6 +690,7 @@ impl GhMigrateForge {
     }
 
     fn write(&self, args: &[&str]) -> Result<(), ForgeError> {
+        pace_write();
         self.gh(AccessIntent::Write, args).map(|_| ())
     }
 }
@@ -644,7 +757,7 @@ pub(crate) enum Scope {
     Here(PathBuf),
 }
 
-fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>), String> {
+pub(crate) fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>), String> {
     let cwd = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
     match scope {
         Scope::Repo(repo) => {
@@ -674,15 +787,47 @@ fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>), String> 
     }
 }
 
-fn write_gate(t: &Target) -> Result<(), String> {
+pub(crate) fn write_gate(t: &Target) -> Result<(), String> {
     match loom_daemon::write_scope::may_write_from(Path::new(&t.root), Some(&t.repo)) {
         loom_daemon::write_scope::Verdict::Allow(_) => Ok(()),
         loom_daemon::write_scope::Verdict::Deny(why) => Err(why),
     }
 }
 
+/// `labels migrate --holds [--repo R | --all-workspaces] [--apply] [--json]`
+/// (#11861): see [`super::labels_migrate_holds`].
+pub(crate) fn dispatch_holds(scope: Scope, apply: bool, json: bool) -> i32 {
+    let fleet = matches!(scope, Scope::AllWorkspaces);
+    let (targets, unresolved) = match resolve_targets(scope) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("labels migrate --holds: {e}");
+            return 2;
+        }
+    };
+    for root in &unresolved {
+        eprintln!("labels migrate --holds: UNRESOLVED {} (no GitHub origin)", root.display());
+    }
+    let forge_for = |t: &Target| -> Box<dyn super::labels_migrate_holds::HoldsForge> {
+        Box::new(super::labels_migrate_holds::GhHoldsForge {
+            repo: t.repo.clone(),
+            root: t.root.clone(),
+        })
+    };
+    let reports =
+        super::labels_migrate_holds::run_targets(&targets, apply, &forge_for, &write_gate);
+    super::labels_migrate_holds::finish(&reports, apply, fleet, json)
+}
+
 /// `labels migrate [--repo R | --all-workspaces] [--apply] [--json]`.
-pub(crate) fn dispatch(retired: &[RetiredLabel], scope: Scope, apply: bool, json: bool) -> i32 {
+pub(crate) fn dispatch(
+    retired: &[RetiredLabel],
+    scope: Scope,
+    apply: bool,
+    keep: bool,
+    json: bool,
+) -> i32 {
+    set_keep_labels(keep);
     let fleet = matches!(scope, Scope::AllWorkspaces);
     let (targets, unresolved) = match resolve_targets(scope) {
         Ok(t) => t,

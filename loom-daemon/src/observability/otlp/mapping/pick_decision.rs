@@ -5,7 +5,8 @@
 //! `telemetry-kind-pick-decision.md`). The **body** is the chunk's JSON, so
 //! ClickHouse
 //! can `JSONExtract` the ranked candidate list (see `telemetry-schema.md` for
-//! the rank query). The one attribute here is `loom.role`; `log_record_for`
+//! the rank query). The attributes here are `loom.role` and, on a role
+//! record, `loom.repo` (#11858); `log_record_for`
 //! adds `loom.kind` (`pick.decision`, the key the SigNoz queries filter on,
 //! #9881) to every log kind centrally (#10899). Both are already on the
 //! collector's `keep_keys` allowlist, so no collector change is needed.
@@ -25,7 +26,12 @@ pub(super) fn log_parts(
     let TelemetryRecord::PickDecision(r) = record else {
         return None;
     };
-    let attributes = vec![kv_string("loom.role", r.role.clone())];
+    let mut attributes = vec![kv_string("loom.role", r.role.clone())];
+    // #11858: a role record names its repo, so "which repos have empty
+    // queues" is an attribute filter, not a body parse of empty candidates.
+    if let Some(repo) = &r.repo {
+        attributes.push(kv_string("loom.repo", repo.clone()));
+    }
     let body = serde_json::to_string(r).unwrap_or_default();
     Some(("pick.decision", SeverityNumber::Info, nanos(r.ended_at), attributes, body))
 }
@@ -88,16 +94,16 @@ mod tests {
     fn a_chunked_record_keeps_the_chunk_fields_and_tick_id_in_its_body() {
         let draws = (0u32..200)
             .map(|d| PickDraw {
-                pool: "all".into(),
                 candidates: vec![PickDrawCandidate {
                     repo: format!("o/w{d}"),
                     weight: u64::from(10 + d),
+                    base_weight: None,
+                    bonus: None,
                 }],
                 total_weight: u64::from(10 + d),
                 roll: u64::from(d),
                 picked: format!("o/w{d}"),
                 number: d,
-                p_min: Some(12),
             })
             .collect();
         let record = PickDecisionRecord::build(tick(), Vec::new()).with_workspace_draw(Some(
@@ -105,7 +111,9 @@ mod tests {
                 seed: "42".into(),
                 draws_total: 200,
                 draws,
-                temperature: Some(80),
+                seed_scheme: Some("loom-draw/v1".into()),
+                seed_minute: Some("29000000".into()),
+                seed_host: Some("host-a".into()),
             },
         ));
         for chunk in split_into_chunks(record, 2_000) {
@@ -121,8 +129,28 @@ mod tests {
             assert_eq!(body["tick_id"], "t");
             assert_eq!(body["workspace_draw"]["seed"], "42");
             assert_eq!(body["workspace_draw"]["draws_total"], 200);
-            // #11684: the per-tick temperature repeats on every chunk, like the seed.
-            assert_eq!(body["workspace_draw"]["temperature"], 80);
+            assert_eq!(body["workspace_draw"]["seed_scheme"], "loom-draw/v1");
+            assert_eq!(body["workspace_draw"]["seed_minute"], "29000000");
+            assert_eq!(body["workspace_draw"]["seed_host"], "host-a");
         }
+    }
+
+    /// #11858: a role record carries `loom.repo` even with no candidates, and
+    /// the log carries the trace its envelope was joined to.
+    #[test]
+    fn a_role_record_names_its_repo_and_trace() {
+        let mut record = PickDecisionRecord::build(tick(), Vec::new());
+        record.repo = Some("o/r".into());
+        let mut envelope = TelemetryEnvelope::new("h", TelemetryRecord::PickDecision(record));
+        let context = crate::telemetry::trace::TraceContext::derived("t", &["11858"]);
+        envelope.trace_context = Some(context.clone());
+        let log = log_record_for(&envelope).expect("pick.decision exports as a log");
+        let repo = log.attributes.iter().find(|a| a.key == "loom.repo");
+        assert!(format!("{repo:?}").contains("o/r"), "{repo:?}");
+        assert_eq!(log.trace_id, context.trace_id.bytes());
+        let work_finder = PickDecisionRecord::build(tick(), Vec::new());
+        let envelope = TelemetryEnvelope::new("h", TelemetryRecord::PickDecision(work_finder));
+        let log = log_record_for(&envelope).expect("pick.decision exports as a log");
+        assert!(!log.attributes.iter().any(|a| a.key == "loom.repo"));
     }
 }

@@ -102,6 +102,8 @@ pub fn tick_summary(
         deferred_build_backoff: report.deferred_build_backoff,
         errors: report.errors,
         halted: report.halted,
+        held_roots: report.held_roots,
+        halt_partial: report.halt_partial,
         saturation_held: report.saturation_held,
         build_backoff_held: report.build_backoff_held,
         collisions: report.collisions,
@@ -214,6 +216,9 @@ pub fn publish_tick(
     let mut summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
     summary.cap = last_cap().filter(|c| c.effective() == max_concurrent);
     crate::observability::ops::queue::record_queue(&summary);
+    // #11840: the tick's canonical `loom.dispatch.result`, classified once
+    // here from the report itself (not re-derived from the reduced summary).
+    let dispatch_result = crate::observability::ops::dispatch::tick_result(report);
     // #10212: the ranked candidates and what the tick did with each.
     crate::observability::pick_decision::emit_work_finder(
         &summary,
@@ -221,6 +226,7 @@ pub fn publish_tick(
         completed_at,
         (report.workspace_draw.as_ref(), &report.vi_demotions),
         roots,
+        dispatch_result,
     );
     store_tick_summary(summary);
     // #11161: `fleet.state` samples every tick, after the summary is stored.
@@ -236,4 +242,6 @@ pub fn publish_tick(
     crate::observability::ops::dwell::record_tick(report, roots, started_at);
     // #8929: idle slots, and idle slot-seconds while ready work waited.
     crate::observability::ops::turnaround::record_tick(report, max_concurrent);
+    // #11847: busy slots by role (sweep occupancy and role-runner agents).
+    crate::observability::ops::busy_slots::record_tick(report, roots);
 }

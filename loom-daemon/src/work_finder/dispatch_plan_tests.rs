@@ -13,7 +13,7 @@ use crate::types::{PlanGate, PlanShard, PlanState, QueueDisposition as Qd, RepoC
 fn key(ws: usize, prio: u32, number: u32) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: ws,
-        workspace_priority: prio,
+        workspace_weight: prio,
         number,
         ..PriorityCandidate::default()
     }

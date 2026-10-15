@@ -430,17 +430,9 @@ fn fingerprint(items: &[crate::work_finder::WorkItem]) -> u64 {
 
 /// `owner/repo` for a workspace root from its git remote (no forge call).
 fn repo_for_root(root: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let url = String::from_utf8(out.stdout).ok()?;
-    crate::forge_cmd::parse_nwo_from_remote_url(url.trim())
+    // Bounded (#9715): a hung `git` must not stall the poll.
+    let url = crate::forge_cmd::get_remote_url(root)?;
+    crate::forge_cmd::parse_nwo_from_remote_url(&url)
 }
 
 /// The gate's key for a workspace root (the one [`gated_list`] uses).

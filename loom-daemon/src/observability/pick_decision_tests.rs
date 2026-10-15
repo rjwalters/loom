@@ -49,7 +49,7 @@ fn summary(rows: Vec<(u32, QueueDisposition)>) -> WorkFinderTickSummary {
         .map(|(i, (issue, disposition))| {
             serde_json::from_value::<ReadyQueueRow>(serde_json::json!({
                 "rank": i + 1, "repo": "/work/loom", "issue": issue,
-                "workspace_priority": 100, "urgent": false,
+                "workspace_weight": 100, "urgent": false,
                 "disposition": disposition,
             }))
             .unwrap()
@@ -112,6 +112,131 @@ fn a_file_overlap_deferral_carries_its_shared_paths_into_the_record() {
     let json = serde_json::to_value(&r).unwrap();
     assert_eq!(json["skipped"][0]["detail"], "file overlap: src/a.rs, src/b.rs");
     assert!(json["skipped"][1].get("detail").is_none(), "absent, not null");
+}
+
+/// #11811: each skip carries the daemon's un-collapsed disposition, so the
+/// four caps `cap` lumps together stay distinct, plus its `held_until`.
+#[test]
+fn a_skip_carries_its_uncollapsed_disposition_and_hold_expiry() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::Dispatched),
+        (2, QueueDisposition::DeferredRampCap),
+        (3, QueueDisposition::DeferredCapacity),
+        (4, QueueDisposition::DeferredRepoCap),
+        (5, QueueDisposition::DeferredSaturation),
+        (6, QueueDisposition::DispatchBackoff),
+    ]);
+    let until = Utc.with_ymd_and_hms(2026, 10, 4, 12, 30, 0).unwrap();
+    s.queue[5].plan.held_until = Some(until);
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    let got: Vec<(u32, PickSkipReason, Option<QueueDisposition>)> = r
+        .skipped
+        .iter()
+        .map(|k| (k.number, k.reason, k.disposition))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (2, PickSkipReason::Cap, Some(QueueDisposition::DeferredRampCap)),
+            (3, PickSkipReason::Cap, Some(QueueDisposition::DeferredCapacity)),
+            (4, PickSkipReason::Cap, Some(QueueDisposition::DeferredRepoCap)),
+            (5, PickSkipReason::Cap, Some(QueueDisposition::DeferredSaturation)),
+            (6, PickSkipReason::Backoff, Some(QueueDisposition::DispatchBackoff)),
+        ]
+    );
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(json["skipped"][0]["reason"], "cap", "reason is unchanged");
+    assert_eq!(json["skipped"][0]["disposition"], "deferred_ramp_cap");
+    assert!(json["skipped"][0].get("held_until").is_none(), "absent, not null");
+    assert_eq!(json["skipped"][4]["disposition"], "dispatch_backoff");
+    assert_eq!(json["skipped"][4]["held_until"], "2026-10-04T12:30:00Z");
+    // Older records (no disposition / held_until) still parse.
+    let mut old = json.clone();
+    for k in old["skipped"].as_array_mut().unwrap() {
+        let k = k.as_object_mut().unwrap();
+        k.remove("disposition");
+        k.remove("held_until");
+    }
+    let parsed: PickDecisionRecord = serde_json::from_value(old).unwrap();
+    assert!(parsed
+        .skipped
+        .iter()
+        .all(|k| k.disposition.is_none() && k.held_until.is_none()));
+}
+
+/// #11811: a halted row names its cause, but only a closed-vocabulary token.
+#[test]
+fn a_halted_skip_carries_only_a_closed_vocabulary_cause() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::WorkspaceHalted),
+        (2, QueueDisposition::WorkspaceHalted),
+        (3, QueueDisposition::WorkspaceHalted),
+    ]);
+    s.queue[0].detail = Some("drain".to_string());
+    s.queue[1].detail = Some("not a cause".to_string());
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    let details: Vec<Option<&str>> = r.skipped.iter().map(|k| k.detail.as_deref()).collect();
+    assert_eq!(details, vec![Some("drain"), None, None]);
+    assert!(r.skipped.iter().all(|k| k.reason == PickSkipReason::Halted
+        && k.disposition == Some(QueueDisposition::WorkspaceHalted)));
+}
+
+/// #11858: an already-landed skip names its evidence, closed vocabulary only.
+#[test]
+fn an_already_landed_skip_carries_only_its_evidence_token() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::AlreadyLanded),
+        (2, QueueDisposition::AlreadyLanded),
+        (3, QueueDisposition::AlreadyLanded),
+    ]);
+    s.queue[0].detail = Some("journal_landed".to_string());
+    s.queue[1].detail = Some("forge_closed".to_string());
+    s.queue[2].detail = Some("landed by a free-text reason".to_string());
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    let details: Vec<Option<&str>> = r.skipped.iter().map(|k| k.detail.as_deref()).collect();
+    assert_eq!(details, vec![Some("journal_landed"), Some("forge_closed"), None]);
+}
+
+/// #11857: the outcome agrees with the tick result. A hold that covered the
+/// tick's work reads `halted`; one held root beside a healthy repo with
+/// candidates is a partial hold and the outcome follows the rows.
+#[test]
+fn a_partial_hold_is_not_a_halted_outcome() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::WorkspaceHalted),
+        (2, QueueDisposition::OpenPr),
+    ]);
+    s.halted = true;
+    s.held_roots = 1;
+    s.halt_partial = true;
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "none_dispatched");
+
+    s.queue.clear();
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "idle");
+
+    // A full hold still reads `halted`, as does a pre-#11857 summary that
+    // carries no `halt_partial` (the old meaning of `halted`).
+    s.halt_partial = false;
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "halted");
+}
+
+/// Role ticks have no work-finder disposition: the fields stay absent.
+#[test]
+fn a_role_skip_carries_no_disposition() {
+    let r = role_record(
+        tick("judge"),
+        RoleTickResult::SkippedLoad,
+        gate_only(vec![("loom:review-requested".into(), vec![row(7, &[])])]),
+        "o/r",
+        &[],
+    );
+    assert_eq!(r.skipped.len(), 1);
+    assert_eq!((r.skipped[0].disposition, r.skipped[0].held_until), (None, None));
+    let json = serde_json::to_value(&r).unwrap();
+    assert!(json["skipped"][0].get("disposition").is_none());
 }
 
 #[test]
@@ -184,6 +309,8 @@ fn an_empty_role_tick_records_cadence_with_no_candidates() {
     assert_eq!(r.role, "curator");
     assert_eq!(r.candidate_source, "none", "nothing observed");
     assert!(!r.decisions_observed);
+    // #11858: an empty queue still names its repo.
+    assert_eq!(r.repo.as_deref(), Some("o/r"));
 }
 
 fn gate_only(gate: Vec<(String, Vec<GateRow>)>) -> RoleObservation {
@@ -394,6 +521,7 @@ fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
         author_association: None,
         is_pull_request: is_pr,
         open_sub_issues: None,
+        labels_at: None,
     };
     let root = Path::new("/stash-test/a");
     record_gate_listing(
@@ -497,9 +625,10 @@ fn work_finder_record_carries_the_workspace_draw() {
     let item = |n: u32| WorkItem::with_created_at(n, vec!["loom:issue".into()], None);
     let candidates = vec![
         ready_queue::key_of(0, 0, &item(1), false),
-        ready_queue::key_of(1, 100, &item(2), false),
+        ready_queue::key_of(1, 1, &item(2), false),
     ];
-    let (order, log) = draw_order(candidates, &[0, 100], 99, 80);
+    let (order, log) =
+        draw_order(candidates, &[3, 1], 99, &crate::priority_pick::WeightBonus::default());
     let log = log.unwrap();
     let names = ["o/tool", "o/product"];
     let draw = workspace_draw_record(&log, |idx| names[idx].to_string());
@@ -510,21 +639,22 @@ fn work_finder_record_carries_the_workspace_draw() {
     let d = &json["workspace_draw"];
     assert_eq!(d["seed"], "99");
     assert_eq!(d["draws_total"], 2);
+    // A draw with no derived seed (pinned / passed in) names no inputs.
+    assert!(d.get("seed_scheme").is_none());
     let first = &d["draws"][0];
-    assert_eq!(first["pool"], "all");
-    // #11684: softmax weights at T = 80, relative to the pool's p_min.
-    assert_eq!(d["temperature"], 80);
-    assert_eq!(first["p_min"], 0);
+    assert!(first.get("pool").is_none(), "no tiers since #11742");
+    assert!(d.get("temperature").is_none());
+    // #11742: linear weights, with each candidate's base weight and bonus.
     assert_eq!(
         first["candidates"][0],
-        serde_json::json!({"repo": "o/tool", "weight": 1_000_000})
+        serde_json::json!({"repo": "o/tool", "weight": 3, "base_weight": 3, "bonus": 0})
     );
     assert_eq!(
         first["candidates"][1],
-        serde_json::json!({"repo": "o/product", "weight": 286_505})
+        serde_json::json!({"repo": "o/product", "weight": 1, "base_weight": 1, "bonus": 0})
     );
-    assert_eq!(first["total_weight"], 1_286_505);
-    assert!(first["roll"].as_u64().unwrap() < 1_286_505);
+    assert_eq!(first["total_weight"], 4);
+    assert!(first["roll"].as_u64().unwrap() < 4);
     assert_eq!(first["picked"], names[order[0].workspace_idx]);
     assert_eq!(first["number"], order[0].number);
     // The second draw is over the one workspace left.
@@ -532,24 +662,64 @@ fn work_finder_record_carries_the_workspace_draw() {
     // It round-trips, and a role record (no draw) omits the field.
     let back: PickDecisionRecord = serde_json::from_value(json.clone()).unwrap();
     assert_eq!(back, r);
-    // A pre-#11684 record (no `temperature` / `p_min`) still parses.
+    // A pre-#11742 record (tier `pool`, softmax `temperature` / `p_min`, no
+    // `base_weight` / `bonus`) still parses.
     let mut old = json;
-    old["workspace_draw"]
-        .as_object_mut()
-        .unwrap()
-        .remove("temperature");
+    old["workspace_draw"]["temperature"] = serde_json::json!(80);
     for draw in old["workspace_draw"]["draws"].as_array_mut().unwrap() {
-        draw.as_object_mut().unwrap().remove("p_min");
+        draw["pool"] = serde_json::json!("all");
+        draw["p_min"] = serde_json::json!(0);
+        for c in draw["candidates"].as_array_mut().unwrap() {
+            let c = c.as_object_mut().unwrap();
+            c.remove("base_weight");
+            c.remove("bonus");
+        }
     }
     let back: PickDecisionRecord = serde_json::from_value(old).unwrap();
     let back_draw = back.workspace_draw.unwrap();
-    assert_eq!(back_draw.temperature, None);
-    assert!(back_draw.draws.iter().all(|d| d.p_min.is_none()));
+    assert!(back_draw
+        .draws
+        .iter()
+        .all(|d| d.candidates.iter().all(|c| c.bonus.is_none())));
     let plain = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve);
     assert!(serde_json::to_value(&plain)
         .unwrap()
         .get("workspace_draw")
         .is_none());
+}
+
+/// #11683: a clock-and-host-seeded draw exports its inputs beside the seed,
+/// and they recompute it.
+#[test]
+fn work_finder_record_carries_the_seed_inputs() {
+    use crate::work_finder::workspace_draw::{
+        draw_order, minute_seed, SeedInputs, DRAW_SEED_SCHEME,
+    };
+    use crate::work_finder::{ready_queue, WorkItem};
+    let item = |n: u32| WorkItem::with_created_at(n, vec!["loom:issue".into()], None);
+    let seed = minute_seed(29_000_000, "host-a");
+    let (_, log) = draw_order(
+        vec![ready_queue::key_of(0, 0, &item(1), false)],
+        &[1],
+        seed,
+        &crate::priority_pick::WeightBonus::default(),
+    );
+    let mut log = log.unwrap();
+    log.seed_inputs = Some(SeedInputs {
+        scheme: DRAW_SEED_SCHEME,
+        minute: 29_000_000,
+        host: "host-a".into(),
+    });
+    let d = serde_json::to_value(workspace_draw_record(&log, |_| "o/r".into())).unwrap();
+    assert_eq!(d["seed"], "18365900956060715395");
+    assert_eq!(d["seed_scheme"], "loom-draw/v1");
+    assert_eq!(d["seed_minute"], "29000000");
+    assert_eq!(d["seed_host"], "host-a");
+    let minute: u64 = d["seed_minute"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        minute_seed(minute, d["seed_host"].as_str().unwrap()).to_string(),
+        d["seed"].as_str().unwrap()
+    );
 }
 
 /// #11509: the work finder's record carries the tick's `loom:very-important`
@@ -578,4 +748,97 @@ fn work_finder_record_carries_the_very_important_demotions() {
         .unwrap()
         .get("very_important_demoted")
         .is_none());
+}
+
+#[test]
+fn lane_plan_is_stashed_converted_and_drained_once() {
+    use crate::role_runner::concurrent_dispatch::lane_rule::RepoLane;
+    stash_lane_plan(
+        Path::new("/tmp/loom-10630-obs"),
+        vec![RepoLane {
+            root: "/tmp/loom-10630-obs".into(),
+            debt: 60,
+            wanted: 3,
+            lanes: 2,
+        }],
+    );
+    let lanes = take_lane_plan();
+    assert_eq!((lanes.len(), lanes[0].debt, lanes[0].wanted, lanes[0].lanes), (1, 60, 3, 2));
+    assert!(take_lane_plan().is_empty(), "drained");
+    let json = serde_json::to_value(&lanes).unwrap();
+    assert_eq!(json[0]["debt"], 60);
+}
+
+#[test]
+fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
+    use crate::step_dispatch::item_draw::{
+        weight_terms, AgeSource, Candidate, DrawRecord, Exclusion, ItemWeights,
+    };
+    use crate::work_finder::step_item::{Item, ItemState, Lane, PassReason, Step, Verdict};
+    assert!(item_draw_record(1, "h", 2, &[]).is_none());
+    let picked = Candidate {
+        item: Item {
+            issue: Some(7),
+            pr: Some(8),
+            state: ItemState::ReviewRequested,
+            verdict: Verdict::Step(Step::Judge),
+            lane: Lane::Normal,
+            send_back: false,
+        },
+        step: Step::Judge,
+        terms: weight_terms(
+            &ItemWeights::default(),
+            Lane::Normal,
+            crate::priority_pick::Level::Important,
+            30 * 1440,
+            AgeSource::Mirror,
+        ),
+    };
+    let draws = [DrawRecord {
+        draw_index: 0,
+        seed: 99,
+        pool_size: 3,
+        total_weight: 1_000_000,
+        roll: 5,
+        picked_index: 0,
+        picked: picked.clone(),
+    }];
+    let excluded = std::collections::BTreeMap::from([
+        (Exclusion::Pass(PassReason::Claimed), 2),
+        (Exclusion::PoolExhausted, 1),
+    ]);
+    let d = item_draw_record(
+        29_000_000,
+        "host-a",
+        17,
+        &[ItemDrawWorkspace {
+            repo: "o/r",
+            excluded: &excluded,
+            pool: std::slice::from_ref(&picked),
+            draws: &draws,
+        }],
+    )
+    .unwrap();
+    assert_eq!(d.seed_scheme, "loom-draw/v2");
+    assert_eq!(d.tick_counter, "17");
+    assert_eq!(
+        (d.pools.len(), d.pools[0].pr, d.pools[0].weight),
+        (1, Some(8), d.draws[0].weight)
+    );
+    let step = &d.draws[0];
+    assert_eq!(step.number, 8, "a Judge step acts on the PR");
+    assert_eq!((step.priority, step.age_permille), (3, 2000));
+    assert_eq!((step.age_source.as_str(), step.step.as_str()), ("mirror", "judge"));
+    let counts: Vec<(&str, PickSkipReason, usize)> = d
+        .excluded
+        .iter()
+        .map(|e| (e.reason.as_str(), e.skip_reason, e.count))
+        .collect();
+    assert_eq!(
+        counts,
+        vec![
+            ("claimed", PickSkipReason::InFlight, 2),
+            ("pool_exhausted", PickSkipReason::Quota, 1)
+        ]
+    );
 }

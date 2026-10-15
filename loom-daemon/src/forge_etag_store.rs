@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -309,7 +309,7 @@ pub(crate) fn fetch_conditional(
         return fetch_conditional_via(site, gh_bin, cwd, target, url, etag, &*route);
     }
     fetch_conditional_via(site, gh_bin, cwd, target, url, etag, &|req| {
-        crate::forge_identity::route_read(req, std::time::SystemTime::now())
+        crate::forge_gateway::route_read(req, std::time::SystemTime::now())
     })
 }
 
@@ -354,6 +354,7 @@ pub(crate) fn fetch_conditional_via(
         .into_credential()
     });
     let reader_dir = reader.as_ref().map(|(dir, _)| dir.as_path());
+    let gateway_down = std::cell::Cell::new(false);
     let family = served::endpoint_family(url);
     let now = std::time::SystemTime::now;
     let http_ok = |r: &FetchResult| {
@@ -393,6 +394,16 @@ pub(crate) fn fetch_conditional_via(
         },
         http_ok,
         |r: &FetchResult| {
+            // 2am#4367 P4: the relay down or unreachable is not a credential
+            // failure: withdraw it for the default window and use the writer.
+            let fault = gateway_fault(reader.as_ref().map(|(_, a)| a.as_str()), r);
+            if fault.reruns() {
+                gateway_down.set(true);
+                if fault == crate::forge_gateway::outage::Fault::Withdraw {
+                    crate::forge_gateway::outage::withdraw_for_outage(site.caller);
+                }
+                return Some(crate::forge_identity::Failure::Credential);
+            }
             let failure = reader_failure(r)?;
             let item_404 = site.item_scoped
                 && failure == crate::forge_identity::Failure::Coverage
@@ -409,6 +420,9 @@ pub(crate) fn fetch_conditional_via(
             Some(failure)
         },
         |failure, _| {
+            if gateway_down.get() {
+                return;
+            }
             if let Some((_, app_id)) = &reader {
                 let repo = target.repo.as_deref().unwrap_or_default();
                 let why = format!("{} {url}", site.caller);
@@ -426,6 +440,18 @@ fn repo_of(target: &Target) -> &str {
 /// What a failed conditional read says about its credential. The parsed
 /// `--include` headers travel with it (W4-A), so a rate-limit refusal names
 /// its pool and its real `x-ratelimit-reset` rather than the flat default.
+/// What a failed conditional read on `app` calls for, when `app` is the
+/// gateway ([`crate::forge_gateway::outage::fault`]).
+pub(crate) fn gateway_fault(
+    app: Option<&str>,
+    r: &FetchResult,
+) -> crate::forge_gateway::outage::Fault {
+    if app != Some(crate::forge_gateway::GATEWAY_APP_ID) || r.0.success() {
+        return crate::forge_gateway::outage::Fault::None;
+    }
+    crate::forge_gateway::outage::fault(r.1.as_ref(), "", &r.2)
+}
+
 pub(crate) fn reader_failure(r: &FetchResult) -> Option<crate::forge_identity::Failure> {
     crate::forge_identity::classify_failure(
         &r.2,
@@ -559,16 +585,8 @@ pub(crate) fn remote_identity(cwd: &Path) -> Option<(String, String)> {
     if let Some(hit) = memo.lock().ok().and_then(|m| m.get(cwd).cloned()) {
         return Some(hit);
     }
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let resolved = parse_remote_url(&String::from_utf8_lossy(&output.stdout))?;
+    // Bounded (#9715): a hung `git` must not stall the caller.
+    let resolved = parse_remote_url(&crate::forge_cmd::get_remote_url(cwd)?)?;
     if let Ok(mut m) = memo.lock() {
         m.insert(cwd.to_path_buf(), resolved.clone());
     }
@@ -810,7 +828,7 @@ pub(crate) fn cached_read_pinned(
     pin: ReadPin,
 ) -> Result<CachedRead> {
     let route = |req: &crate::forge_identity::RouteRequest<'_>| {
-        crate::forge_identity::route_read(req, std::time::SystemTime::now())
+        crate::forge_gateway::route_read(req, std::time::SystemTime::now())
     };
     cached_read_via(site, gh_bin, cwd, (repo, url, prefix), pin, &route)
 }

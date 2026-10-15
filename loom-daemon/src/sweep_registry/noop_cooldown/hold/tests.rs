@@ -161,8 +161,9 @@ fn important_human_gate_issue_is_parked_after_k_dispatches() {
     }
     assert_eq!(dispatches, K, "at most K dispatches before the hold");
     let edit = edit_args(&forge);
-    assert!(edit.contains("--add-label loom:operator-only"), "{edit}");
-    assert!(edit.contains("--add-label loom:operator-decision"), "{edit}");
+    // #11795: the human gate is loom:operator alone; no retired name.
+    assert!(edit.contains("--add-label loom:operator"), "{edit}");
+    assert!(!edit.contains("loom:operator-"), "{edit}");
     assert!(edit.contains("--remove-label loom:issue"), "{edit}");
     assert!(!edit.contains("loom:important"), "the priority label is never touched: {edit}");
     assert!(!edit.contains("loom:building"), "the claim is never touched: {edit}");
@@ -181,7 +182,7 @@ fn dependency_blocked_issue_gets_loom_blocked() {
     assert!(reg.noop_hold_applied(ISSUE));
     let edit = edit_args(&forge);
     assert!(edit.contains("--add-label loom:blocked"), "{edit}");
-    assert!(!edit.contains("loom:operator-only"), "{edit}");
+    assert!(!edit.contains("loom:operator"), "{edit}");
 }
 
 #[test]
@@ -269,11 +270,7 @@ fn a_changed_input_releases_an_applied_park_without_a_manual_label_edit() {
     reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
     reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
     assert!(reg.noop_hold_applied(ISSUE));
-    let parked = [
-        "loom:important",
-        "loom:operator-only",
-        "loom:operator-decision",
-    ];
+    let parked = ["loom:important", "loom:operator"];
     reflect_park(&forge, &parked);
     let t0 = std::time::Instant::now();
     let edits = forge.calls("issue edit").len();
@@ -293,8 +290,8 @@ fn a_changed_input_releases_an_applied_park_without_a_manual_label_edit() {
     assert!(!reg.noop_hold_applied(ISSUE));
     assert_eq!(reg.noop_streak_count(ISSUE), 0, "the streak is dropped");
     let lift = forge.calls("issue edit").pop().unwrap();
-    assert!(lift.contains("--remove-label loom:operator-only"), "{lift}");
-    assert!(lift.contains("--remove-label loom:operator-decision"), "{lift}");
+    assert!(lift.contains("--remove-label loom:operator"), "{lift}");
+    assert!(!lift.contains("loom:operator-"), "only labels present are removed: {lift}");
     assert!(lift.contains("--add-label loom:issue"), "{lift}");
     assert!(!lift.contains("loom:important"), "the priority label is never touched: {lift}");
     assert!(forge
@@ -325,6 +322,27 @@ fn a_closed_dependency_releases_a_blocked_park() {
     let lift = forge.calls("issue edit").pop().unwrap();
     assert!(lift.contains("--remove-label loom:blocked"), "{lift}");
     assert!(lift.contains("--add-label loom:issue"), "{lift}");
+}
+
+/// #11480: lifting the hold's own park never re-arms `loom:issue` past a
+/// veto that is not a park (`loom:needs-capability`).
+#[test]
+#[serial]
+fn a_lift_beside_another_veto_does_not_restore_the_queue_label() {
+    let (mut reg, forge, _dir) = forge_registry(2);
+    let body = "## Dependencies\n- [ ] #77 the upstream\n";
+    forge.set_issue(ISSUE, "open", body, &["loom:issue"]);
+    forge.set_issue(77, "open", "", &[]);
+    reg.record_noop_release(ISSUE, None);
+    reg.record_noop_release(ISSUE, None);
+    assert!(reg.noop_hold_applied(ISSUE));
+    forge.set_issue(ISSUE, "open", body, &["loom:blocked", "loom:needs-capability"]);
+    forge.set_issue(77, "closed", "", &[]);
+    reg.reconcile_noop_holds(std::time::Instant::now() + RECONCILE_INTERVAL * 2);
+    assert!(!reg.noop_hold_applied(ISSUE));
+    let lift = forge.calls("issue edit").pop().unwrap();
+    assert!(lift.contains("--remove-label loom:blocked"), "{lift}");
+    assert!(!lift.contains("--add-label loom:issue"), "{lift}");
 }
 
 #[test]
@@ -432,7 +450,7 @@ fn clean_phaseless_reaper_outcomes_feed_the_hold() {
     assert!(reg.noop_loop_kind(ISSUE, "sweep-3").is_some(), "the next outcome is a loop");
     reg.note_clean_phaseless_exit_outcome(ISSUE, "sweep-3", Some(OpenPrProbe::NoneOpen), Some(0));
     assert!(reg.noop_hold_applied(ISSUE));
-    assert!(edit_args(&forge).contains("loom:operator-only"));
+    assert!(edit_args(&forge).contains("--add-label loom:operator"));
 }
 
 /// A sweep that DID self-report was already counted at IPC time
@@ -470,7 +488,7 @@ fn curator_only_reaper_outcomes_are_counted_without_the_ipc_call() {
     assert!(reg.noop_loop_kind(ISSUE, "sweep-3").is_some(), "the next outcome is a loop");
     reg.note_curator_only_outcome(ISSUE, "sweep-3", Some("curator-done"));
     assert!(reg.noop_hold_applied(ISSUE));
-    assert!(edit_args(&forge).contains("loom:operator-only"));
+    assert!(edit_args(&forge).contains("--add-label loom:operator"));
 }
 
 #[test]
@@ -567,6 +585,8 @@ fn an_applied_hold_is_released_after_a_daemon_restart() {
         "loom:operator-only",
         "loom:operator-decision",
     ];
+    // #11795 transition: a hold an older daemon applied under the retired
+    // names, recovered from disk, still lifts cleanly.
     reflect_park(&forge, &parked);
 
     // A fresh registry over the same logs dir: the in-memory table is empty.
@@ -592,6 +612,7 @@ fn an_applied_hold_is_released_after_a_daemon_restart() {
     assert!(!restarted.noop_hold_applied(ISSUE));
     let lift = forge.calls("issue edit").pop().unwrap();
     assert!(lift.contains("--remove-label loom:operator-only"), "{lift}");
+    assert!(lift.contains("--remove-label loom:operator-decision"), "{lift}");
     assert!(lift.contains("--add-label loom:issue"), "{lift}");
 }
 

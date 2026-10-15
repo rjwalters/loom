@@ -70,6 +70,15 @@
 //!    expiring cycle's own `quarantined_at` (already known in-memory by the
 //!    caller) as the recency anchor directly, instead of re-deriving it from
 //!    the forge.
+//!
+//! ## Releasing only an expired park (Issue #11930)
+//!
+//! "A fresh daemon's quarantine memory is always empty" stopped meaning "no
+//! one is holding this park" once several hosts share a queue: the pass
+//! released parks peers had just set, and every worker restart in a roll undid
+//! them. The startup pass now releases a marked park only once its TTL has
+//! run, and hands a younger one to this host's registry to hold until it has
+//! ([`restored`]).
 
 use chrono::{DateTime, Utc};
 
@@ -183,13 +192,15 @@ pub fn plan(issues: &[BlockedIssue]) -> Vec<(u32, ReconcileAction)> {
 }
 
 mod listing;
+pub(crate) mod restored;
+pub use restored::{decide_at_startup, StartupAction};
 
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::claim_reconciliation::forge`] / [`crate::work_finder::forge`]) —
 /// the decision logic above is the fully-covered surface; this module is a
 /// thin, best-effort `Command` wrapper.
 pub mod forge {
-    use super::{decide, plan, BlockedIssue, ReconcileAction};
+    use super::{decide, BlockedIssue, ReconcileAction, StartupAction};
     use crate::claim_reconciliation::gh_call;
     use crate::sweep_registry::{reap_gh_timeout, QUARANTINE_COMMENT_MARKER};
     use anyhow::{anyhow, Result};
@@ -316,10 +327,25 @@ pub mod forge {
 
     fn release(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
         let n = issue.to_string();
+        // #11480: never hand the item back to the queue past another hold.
+        let veto = crate::release_veto::quarantine_veto(gh_bin, root, issue);
+        if veto.as_deref() == Some(crate::work_finder::FROZEN_LABEL) {
+            log::info!("quarantine_reconciliation: #{issue} is `loom:frozen` — no write (#11743)");
+            return Ok(());
+        }
+        let add: &[&str] = if let Some(label) = &veto {
+            log::info!(
+                "quarantine_reconciliation: #{issue} carries `{label}` — removing the \
+                 quarantine's `loom:blocked` only, NOT re-adding `loom:issue` (#11480)"
+            );
+            &[]
+        } else {
+            &["--add-label", "loom:issue"]
+        };
         let out = gh_call::output(
             gh_call::write("quarantine.issue_release", gh_bin, root)
                 .args(["issue", "edit", &n, "--remove-label", "loom:blocked"])
-                .args(["--add-label", "loom:issue"])
+                .args(add)
                 .args(gh_call::loom_repo_flag()),
         )?;
         if !out.status.success() {
@@ -385,14 +411,30 @@ pub mod forge {
             })
             .collect();
 
-        let decisions = plan(&issues);
-        let checked = decisions.len();
+        // #11930: release only a park whose TTL has run; hold a younger one.
+        let ttl = crate::sweep_registry::resolve_quarantine_config(root).ttl;
+        let now = Utc::now();
+        let checked = issues.len();
 
         let mut released = 0usize;
-        for (issue_number, action) in decisions {
-            let ReconcileAction::Release = action else {
-                continue;
-            };
+        for issue in &issues {
+            let issue_number = issue.number;
+            match super::decide_at_startup(issue, now, ttl) {
+                StartupAction::Keep => continue,
+                StartupAction::Restore { quarantined_at } => {
+                    super::restored::stash(root, issue_number, quarantined_at);
+                    log::info!(
+                        "quarantine_reconciliation: #{issue_number} in {} is parked inside its \
+                         {}s TTL (marked {}) — kept loom:blocked and restored in memory \
+                         (#11930)",
+                        root.display(),
+                        ttl.as_secs(),
+                        quarantined_at.to_rfc3339()
+                    );
+                    continue;
+                }
+                StartupAction::Release => {}
+            }
             match release(gh_bin, root, issue_number) {
                 Ok(()) => {
                     released += 1;
@@ -695,6 +737,44 @@ exit 0
             gh_calls.contains("issue edit 99 --remove-label loom:blocked --add-label loom:issue"),
             "expected the real label-flip argv; got: {gh_calls:?}"
         );
+    }
+
+    /// #11480: the startup pass releases the quarantine's own `loom:blocked`
+    /// but does not re-arm `loom:issue` beside another veto.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_keeps_the_queue_label_off_past_a_veto() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let script = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> "{log}"
+case "$*" in *issues?labels=loom:blocked*)
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":99,"state":"open","updated_at":"2026-01-01T00:00:00Z","labels":[{{"name":"loom:blocked"}}]}}]'
+  exit 0 ;; esac
+case "$*" in
+*/issues/99/comments*)
+  echo '[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times","user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}}}}]'
+  exit 0 ;;
+*"/issues/99 --jq"*)
+  echo '["loom:blocked","loom:needs-capability"]'
+  exit 0 ;;
+esac
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        let fake_gh = write_fake_gh(dir.path(), &script);
+
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        assert_eq!(forge::reconcile_workspace(&ws.gh, &repo_root), (1, 1));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(gh_calls.contains("issue edit 99 --remove-label loom:blocked"), "{gh_calls}");
+        assert!(!gh_calls.contains("--add-label loom:issue"), "{gh_calls}");
     }
 
     /// #10089: N unchanged passes over a re-parked `loom:blocked` issue cost

@@ -478,6 +478,8 @@ pub fn resolve_stale_reviewing_minutes() -> f64 {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
+        // #11898: the label registry's `stale_after_minutes` is the default.
+        .or_else(|| crate::claim_liveness::registry_minutes("loom:reviewing").map(f64::from))
         .unwrap_or(DEFAULT_STALE_REVIEWING_MINUTES)
 }
 
@@ -491,6 +493,7 @@ pub fn resolve_stale_treating_minutes() -> f64 {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
+        .or_else(|| crate::claim_liveness::registry_minutes("loom:treating").map(f64::from))
         .unwrap_or(DEFAULT_STALE_TREATING_MINUTES)
 }
 
@@ -1365,7 +1368,7 @@ impl VerdictKind {
 /// still stale, but clearing it would silently un-park the PR, so this pass
 /// leaves it alone (mirrors `verdict-staleness-guard.sh`'s `--clear`
 /// suppression and doctor.md's Priority-2 `PARK_LABELS` exclusion).
-pub const VERDICT_HOLD_LABELS: [&str; 3] = ["loom:blocked", "loom:operator", "loom:operator-only"];
+pub use pr_label_info::VERDICT_HOLDS as VERDICT_HOLD_LABELS;
 
 /// An open PR carrying a terminal verdict label, trimmed to the fields the
 /// staleness decision needs.
@@ -2001,6 +2004,8 @@ mod pass_loop;
 /// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
 /// in the #9251 forge-call accounting.
 mod building_listing;
+/// Keep `loom:building` on an issue whose PR is open (#11852).
+pub(crate) mod open_pr_hold;
 /// The ETag-cached REST open-PR listing the PR-side passes share (#10349).
 pub(crate) mod open_pr_listing;
 
@@ -2449,7 +2454,16 @@ pub mod forge {
                 continue;
             }
             match crate::reclaim_pr_warning::reclaim_and_warn(gh_bin, root, issue_number) {
-                Ok(()) => {
+                // #11743: a frozen skip wrote nothing — not a reclaim.
+                Ok(crate::reclaim_pr_warning::Reclaim::Frozen) => {}
+                // #11852: the claim stays while its PR is open; a later pass
+                // reclaims once the PR has closed unmerged.
+                Ok(crate::reclaim_pr_warning::Reclaim::HeldByOpenPr(pr)) => log::info!(
+                    "claim_reconciliation: keeping loom:building on #{issue_number} in {} — \
+                     its PR #{pr} is open ({reason:?}, {lease_evidence}) (#11852)",
+                    root.display(),
+                ),
+                Ok(crate::reclaim_pr_warning::Reclaim::Released) => {
                     reclaimed += 1;
                     // #4348 acceptance criterion: WARN-level, with the
                     // issue number, last-known pid, and (when the evidence
@@ -2500,7 +2514,8 @@ pub mod forge {
     fn list_prs_with_label(gh_bin: &Path, root: &Path, label: &str) -> Result<Vec<ClaimedPr>> {
         // #10349: the ETag'd REST listing, filtered here (was GraphQL `gh pr list`).
         let rows = super::open_pr_listing::list_with_label(gh_bin, root, label)?;
-        Ok(rows
+        // #11743: a frozen PR is neither planned nor reclaimed.
+        Ok(super::pr_label_info::drop_frozen_claims(rows, label)
             .into_iter()
             .map(|r| {
                 // Issue #4638: activity is only worth fetching when there is a

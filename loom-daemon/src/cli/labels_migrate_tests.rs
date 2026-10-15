@@ -163,6 +163,7 @@ fn retired(name: &str, to: Option<&str>, owned: bool) -> RetiredLabel {
         replaced_by: to.map(str::to_string),
         owned,
         retired_in: "#11103".into(),
+        also_remove: Vec::new(),
     }
 }
 
@@ -506,4 +507,130 @@ fn json_events_are_tagged() {
     assert_eq!(v["events"][0]["action"], "relabel");
     assert_eq!(v["events"][0]["item"], 2);
     assert_eq!(v["exit"], 3);
+}
+
+/// 2am#4345: writes are spaced by the configured interval; the first write
+/// never waits, and a write after a long gap doesn't either.
+#[test]
+fn writes_are_paced_by_the_interval() {
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    let iv = Duration::from_millis(7500);
+    assert_eq!(pace_delay(None, now, iv), Duration::ZERO);
+    let just = now.checked_sub(Duration::from_millis(1500)).unwrap();
+    assert_eq!(pace_delay(Some(just), now, iv), Duration::from_millis(6000));
+    let long_ago = now.checked_sub(Duration::from_secs(60)).unwrap();
+    assert_eq!(pace_delay(Some(long_ago), now, iv), Duration::ZERO);
+}
+
+#[test]
+#[serial_test::serial]
+fn the_write_interval_defaults_to_under_500_an_hour_and_is_overridable() {
+    std::env::remove_var("LOOM_LABEL_WRITE_INTERVAL_MS");
+    assert!(3600.0 / write_interval().as_secs_f64() <= 500.0);
+    std::env::set_var("LOOM_LABEL_WRITE_INTERVAL_MS", "0");
+    assert_eq!(write_interval(), std::time::Duration::ZERO);
+    std::env::remove_var("LOOM_LABEL_WRITE_INTERVAL_MS");
+}
+
+/// 2am#4345 (operator 2026-10-13): `--keep-labels` migrates open items and
+/// never deletes the definition, so closed items keep the label; nothing is
+/// left over for the label afterwards.
+#[test]
+#[serial_test::serial]
+fn keep_labels_relabels_open_items_and_never_deletes() {
+    set_keep_labels(true);
+    let f = Fake::new(&[STAR, IMPORTANT]).item(7, &[STAR, "bug"]);
+    let r = run(&f, "o/r", &[retired(STAR, Some(IMPORTANT), true)], true);
+    set_keep_labels(false);
+    assert_eq!(f.writes(), vec![format!("add #7 {IMPORTANT}"), format!("remove #7 {STAR}")]);
+    assert_eq!(
+        (r.exit, r.summary.deleted, r.summary.relabeled, r.summary.remaining),
+        (0, 0, 1, 0)
+    );
+    assert!(text(&r).contains("RETAINED loom:operator-priority"), "{}", text(&r));
+
+    // Dry run: only the open-item relabel counts as remaining, never a delete.
+    set_keep_labels(true);
+    let f = Fake::new(&[STAR, IMPORTANT]).item(7, &[STAR]);
+    let r = run(&f, "o/r", &[retired(STAR, Some(IMPORTANT), true)], false);
+    set_keep_labels(false);
+    assert!(f.writes().is_empty());
+    assert!(!text(&r).contains("DELETE"), "{}", text(&r));
+    assert!(r.summary.remaining >= 1);
+}
+
+// --- also_remove (#11860): a retired label that rode on another one ---
+
+const REVISE: &str = "loom:needs-revision";
+const TRIAGE: &str = "loom:triage";
+const CURATED: &str = "loom:curated";
+
+fn revise_entry() -> RetiredLabel {
+    RetiredLabel {
+        also_remove: vec![CURATED.into()],
+        ..retired(REVISE, Some(TRIAGE), true)
+    }
+}
+
+#[test]
+fn also_remove_is_stripped_after_the_add_and_before_the_old_label() {
+    let f = Fake::new(&[REVISE, TRIAGE, CURATED]).item(5, &[CURATED, REVISE, "bug"]);
+    let r = run(&f, "o/r", &[revise_entry()], true);
+    assert_eq!(
+        f.writes(),
+        vec![
+            format!("add #5 {TRIAGE}"),
+            format!("remove #5 {CURATED}"),
+            format!("remove #5 {REVISE}"),
+            format!("delete {REVISE}"),
+        ]
+    );
+    assert_eq!(f.labels_of(5), BTreeSet::from(["bug".to_string(), TRIAGE.to_string()]));
+    assert!(text(&r).contains("RELABEL #5 loom:needs-revision -> loom:triage, -loom:curated\n"));
+    assert_eq!(r.exit, 0);
+}
+
+#[test]
+fn also_remove_is_skipped_on_an_item_that_lacks_it() {
+    let f = Fake::new(&[REVISE, TRIAGE, CURATED]).item(6, &["loom:architect", REVISE]);
+    let r = run(&f, "o/r", &[revise_entry()], true);
+    assert!(!f.writes().iter().any(|w| w.contains(CURATED)), "{:?}", f.writes());
+    assert_eq!(
+        f.labels_of(6),
+        BTreeSet::from(["loom:architect".to_string(), TRIAGE.to_string()])
+    );
+    assert!(text(&r).contains("RELABEL #6 loom:needs-revision -> loom:triage\n"));
+}
+
+#[test]
+fn also_remove_in_a_dry_run_writes_nothing_and_counts_as_remaining() {
+    let f = Fake::new(&[REVISE, TRIAGE, CURATED]).item(5, &[CURATED, REVISE]);
+    let r = run(&f, "o/r", &[revise_entry()], false);
+    assert!(f.writes().is_empty(), "{:?}", f.writes());
+    // add + strip + remove + delete
+    assert_eq!(r.summary.remaining, 4);
+    assert!(text(&r).contains("-loom:curated"));
+}
+
+#[test]
+fn a_failed_also_remove_leaves_the_old_label_for_the_rerun() {
+    let mut f = Fake::new(&[REVISE, TRIAGE, CURATED]).item(5, &[CURATED, REVISE]);
+    f.remove_fails.insert((5, CURATED.into()));
+    let r = run(&f, "o/r", &[revise_entry()], true);
+    assert!(f.labels_of(5).contains(REVISE), "the old label is the rerun's marker");
+    assert!(!f.writes().iter().any(|w| w.starts_with("delete")), "{:?}", f.writes());
+    assert_eq!(r.exit, 3);
+}
+
+#[test]
+fn the_registry_retires_needs_revision_onto_triage_without_curated() {
+    let reg = loom_daemon::label_registry::Registry::embedded();
+    assert!(reg.get(REVISE).is_none(), "loom:needs-revision is no longer declared");
+    let r = reg
+        .get_retired(REVISE)
+        .expect("loom:needs-revision is retired");
+    assert_eq!(r.replaced_by.as_deref(), Some(TRIAGE));
+    assert_eq!(r.also_remove, vec![CURATED.to_string()]);
+    assert!(r.owned);
 }

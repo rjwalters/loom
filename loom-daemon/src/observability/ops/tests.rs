@@ -260,6 +260,9 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::DispatchSlotTurnaroundSamples,
         MetricName::DispatchIdleSlots,
         MetricName::DispatchIdleSlotSeconds,
+        MetricName::DispatchBusySlots,
+        MetricName::DispatchRoleMaxConcurrent,
+        MetricName::DispatchRoleIdleSlots,
         MetricName::ForgeStageDwell,
         MetricName::ForgeStageDwellSamples,
         MetricName::ForgeStageItems,
@@ -285,6 +288,10 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::CaptainGaugeAgeSeconds,
         MetricName::CaptainGaugeFallback,
         MetricName::AgentScopePeakMemoryBytes,
+        MetricName::ForgeMirrorReads,
+        MetricName::ForgeMirrorChanges,
+        MetricName::ForgeMirrorWakeLatency,
+        MetricName::StageEntryLookups,
         MetricName::EgressRequests,
         MetricName::EgressTokens,
         MetricName::EgressLatency,
@@ -411,6 +418,34 @@ fn tick_span_lists_halt_causes_only_when_held() {
     assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,disk_reservation");
     let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
     assert!(!idle.attributes.contains_key("loom.dispatch.halt_causes"));
+}
+
+/// #11857: a partial hold keeps its causes and held count on the span but
+/// does not name the result; `loom.dispatch.held_roots` is always present.
+#[test]
+fn partial_hold_keeps_its_causes_but_not_the_result() {
+    let partial = TickReport {
+        seen: 2,
+        halted: true,
+        halt_causes: vec![HaltCause::MaintainOnly],
+        held_roots: 1,
+        halt_partial: true,
+        ..TickReport::default()
+    };
+    let span = tick_span(&partial, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "all_skipped");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "maintain_only");
+    assert_eq!(span.attributes["loom.dispatch.held_roots"], "1");
+    let full = TickReport {
+        halt_partial: false,
+        held_roots: 2,
+        ..partial
+    };
+    let span = tick_span(&full, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "halted_maintain_only");
+    assert_eq!(span.attributes["loom.dispatch.held_roots"], "2");
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert_eq!(idle.attributes["loom.dispatch.held_roots"], "0");
 }
 
 /// #10624: the build back-off result keys on an actual deferral, ranks after
@@ -623,7 +658,7 @@ fn queue_summary(
                 rank: i + 1,
                 repo: "/r".into(),
                 issue: u32::try_from(i).unwrap(),
-                workspace_priority: 100,
+                workspace_weight: 100,
                 urgent: false,
                 level: Default::default(),
                 main_red_fix: false,
@@ -652,7 +687,9 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     summary.listing_failed = vec!["/r2".into()];
     summary.listing_incomplete = vec!["/r3".into(), "/r4".into()];
     let points = super::queue::queue_points(&summary);
-    assert_eq!(points.len(), Qd::ALL.len() + 2);
+    // + listing_failed, listing_incomplete and the four already_landed
+    // evidence points (#11858).
+    assert_eq!(points.len(), Qd::ALL.len() + 2 + 4);
     let value = |reason: &str| {
         points
             .iter()
@@ -687,6 +724,38 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         assert_eq!(bounded_labels(&point.labels), point.labels);
         assert!(point.labels.keys().all(|k| k == "state" || k == "reason"));
     }
+}
+
+/// #11858: `already_landed` rows split by the landed guard's evidence, with
+/// a row naming none read as `unknown` and free text never a label.
+#[test]
+fn queue_points_split_already_landed_by_evidence() {
+    use crate::types::QueueDisposition as Qd;
+    let mut summary = queue_summary(&[Qd::AlreadyLanded; 4]);
+    let details = [
+        Some("forge_closed"),
+        Some("journal_landed"),
+        Some("journal_landed"),
+        Some("free text"),
+    ];
+    for (row, detail) in summary.queue.iter_mut().zip(details) {
+        row.detail = detail.map(str::to_string);
+    }
+    let points = super::queue::queue_points(&summary);
+    let landed = |reason: &str| {
+        points
+            .iter()
+            .find(|p| {
+                p.name == MetricName::QueueAlreadyLanded
+                    && p.labels.get("reason").map(String::as_str) == Some(reason)
+            })
+            .map(|p| p.value)
+    };
+    assert_eq!(landed("forge_closed"), Some(MetricValue::Int(1)));
+    assert_eq!(landed("journal_landed"), Some(MetricValue::Int(2)));
+    assert_eq!(landed("forge_closed_not_planned"), Some(MetricValue::Int(0)));
+    assert_eq!(landed("unknown"), Some(MetricValue::Int(1)));
+    assert_eq!(landed("free text"), None);
 }
 
 #[test]

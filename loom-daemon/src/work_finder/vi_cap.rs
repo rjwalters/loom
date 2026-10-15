@@ -56,9 +56,8 @@ fn is_very_important(item: &WorkItem) -> bool {
 }
 
 /// The registry's `hold` labels (#10013), derived rather than hand-listed,
-/// as in `pr_latency` (see the policy note in `super::labels`).
-static HOLD_SET: crate::label_registry::LabelSet =
-    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("hold"));
+/// with the retired names that fold into one (#11795).
+use super::labels::HOLD_NAMES as HOLD_SET;
 
 /// The approved-ready label: with [`super::labels::BUILDING_LABEL`], the
 /// states in which a very-important issue is live work.

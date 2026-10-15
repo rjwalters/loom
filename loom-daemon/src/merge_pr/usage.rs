@@ -18,7 +18,7 @@
 //! # Why the exit-code table matters most
 //!
 //! Role prompts and `champion-pr-merge.md` branch on `merge-pr.sh`'s exit
-//! codes (0 / 1 / 3 / 4 / 5 / 6 / 7). This text is where an operator reads what
+//! codes (0 / 1 / 3 / 4 / 5 / 6 / 7 / 8). This text is where an operator reads what
 //! each one means, so it is byte-frozen against the retired heredoc by
 //! `tests/merge_pr_usage_differential.rs` rather than paraphrased.
 //!
@@ -60,7 +60,7 @@ mod tests {
         // after `$(...)` strips it, so a second one would print a blank line.
         assert!(USAGE.ends_with('\n'));
         assert!(!USAGE.ends_with("\n\n"));
-        assert_eq!(USAGE.lines().count(), 155);
+        assert_eq!(USAGE.lines().count(), 161);
     }
 
     #[test]

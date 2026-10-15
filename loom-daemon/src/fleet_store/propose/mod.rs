@@ -15,7 +15,7 @@
 //! rejects a hand-edited render. [`source`] then runs the store's own
 //! renderer on the edit, so the PR also carries every render it changes.
 //!
-//! - [`state_edit`] / [`priority_edit`] — format-preserving edits of
+//! - [`state_edit`] / [`weight_edit`] — format-preserving edits of
 //!   `fleet.yml`'s `state:` / `repos:` ([`yaml_edit`]): touch only the lines
 //!   a sub-verb's change requires, so a reviewer's diff is exactly that
 //!   change and the file's comments survive.
@@ -35,9 +35,9 @@
 
 pub mod adopt;
 pub mod diff;
-mod priority_edit;
 pub mod source;
 mod state_edit;
+mod weight_edit;
 mod yaml_edit;
 
 use std::path::Path;
@@ -47,8 +47,8 @@ use base64::engine::general_purpose;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-pub use priority_edit::edit as edit_priority;
 pub use state_edit::edit as edit_state;
+pub use weight_edit::edit as edit_weight;
 
 use super::fetch::Reply;
 

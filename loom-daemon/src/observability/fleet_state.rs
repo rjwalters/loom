@@ -74,7 +74,10 @@ pub mod enrich;
 mod flow;
 pub mod history;
 pub mod outcomes;
+mod pre_ready_journal;
 mod sources;
+mod step_rows;
+pub use step_rows::step_stage;
 
 use flow::{QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
 
@@ -85,13 +88,20 @@ pub const REVIEW_LABELS: [&str; 3] = ["loom:review-requested", "loom:changes-req
 const TREATING: &str = "loom:treating";
 
 /// The operator holds that make an approved PR `merge_hold`: the label
-/// registry's `merge_hold` set.
+/// registry's `merge_hold` set, plus the retired names that fold into it
+/// (#11795), so label history and unmigrated PRs still read as held.
 static MERGE_HOLD_LABELS: crate::label_registry::LabelSet =
-    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("merge_hold"));
+    crate::label_registry::LabelSet::new(|| {
+        crate::label_registry::embedded_set_with_retired("merge_hold")
+    });
 
 /// The hold kind the hold labels in `labels` name on their own, or `None`
 /// when none holds. Labels alone cannot split `merge_risk` / `critical_file` /
 /// `ac_hold` out of `operator`; that refinement is left to the reader. Pure.
+///
+/// Reads PR labels only, with no body, so since #11795 `loom:operator` maps to
+/// `operator` here; the retired `loom:operator-decision` / `-only` /
+/// `-mechanical` keep their own kinds for unmigrated items and history.
 #[must_use]
 pub fn hold_kind(labels: &[String]) -> Option<FleetHoldKind> {
     let has = |label: &str| labels.iter().any(|l| l == label);
@@ -274,7 +284,7 @@ pub struct ReadyItem {
     pub issue: u32,
     pub rank: u32,
     pub level: u8,
-    pub fleet_priority: u32,
+    pub weight: u32,
     pub created_at: Option<DateTime<Utc>>,
     pub main_red_fix: bool,
     /// The clock holding it back this tick, when one does (#11564).
@@ -494,7 +504,7 @@ fn offer(candidates: &mut Candidates, repo: &str, source: Source, row: FleetStat
 #[must_use]
 pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Utc>) -> FleetView {
     let mut candidates = Candidates::new();
-    for sweep in &input.held {
+    for (sweep, issue) in input.held.iter().zip(step_rows::held_row_keys(input)) {
         let row = FleetStateRow {
             entered_at_lower_bound: sweep.entered_at_lower_bound,
             pr: sweep.pr,
@@ -506,7 +516,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             }),
             start: sweep.start.clone(),
             sweep_id: sweep.sweep_id.clone(),
-            ..FleetStateRow::new(sweep.issue, sweep.stage, sweep.entered_at)
+            ..FleetStateRow::new(issue, sweep.stage, sweep.entered_at)
         };
         offer(&mut candidates, &sweep.repo, Source::Held, row);
     }
@@ -565,7 +575,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             let row = FleetStateRow {
                 rank: Some(item.rank),
                 level: item.level,
-                fleet_priority: Some(item.fleet_priority),
+                weight: Some(item.weight),
                 created_at: item.created_at,
                 main_red_fix: item.main_red_fix,
                 eligible_reason: item.eligible_reason,
@@ -978,20 +988,26 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
 /// view. The forge reads run off the event loop; `view` comes back as given
 /// when they fail.
 async fn record_outcomes(
+    ctx: pre_ready_journal::OutcomeContext<'_>,
     sink: &FleetStateSink,
     input: &FleetInput,
     (curated, triage): (outcomes::Curated, outcomes::Curated),
     view: FleetView,
     now: DateTime<Utc>,
-    workspace_pool: &crate::workspace_pool::WorkspacePool,
-    slug_cache: &mut std::collections::HashMap<String, String>,
 ) -> FleetView {
+    let pre_ready_journal::OutcomeContext {
+        workspace_root,
+        workspace_pool,
+        slug_cache,
+    } = ctx;
     let (mut memory, mut enrich_memory) = {
         let state = STATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.outcomes.clone(), state.enrich.clone())
     };
+    let journal = pre_ready_journal::Journal::open(workspace_root, &mut memory.pre_ready_done, now);
+    let done_before = memory.pre_ready_done.clone();
     memory.curated_now = Some(curated);
     memory.triage_now = Some(triage);
     let roots = sources::managed_roots(workspace_pool, slug_cache)
@@ -1028,9 +1044,11 @@ async fn record_outcomes(
         Ok(done) => done,
         Err(join_error) => {
             log::warn!("fleet.state: outcome diff panicked: {join_error}");
+            journal.reload_next_pass();
             return original;
         }
     };
+    let done_after = memory.pre_ready_done.clone();
     {
         let mut state = STATE
             .lock()
@@ -1038,6 +1056,7 @@ async fn record_outcomes(
         state.outcomes = memory;
         state.enrich = enrich_memory;
     }
+    journal.save_if_changed(&done_before, &done_after);
     outcomes::offer(records, sink);
     view
 }
@@ -1099,9 +1118,19 @@ pub(super) async fn record(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
-    let mut view =
-        record_outcomes(sink, &input, (curated, triage), view, now, workspace_pool, slug_cache)
-            .await;
+    let mut view = record_outcomes(
+        pre_ready_journal::OutcomeContext {
+            workspace_root,
+            workspace_pool,
+            slug_cache,
+        },
+        sink,
+        &input,
+        (curated, triage),
+        view,
+        now,
+    )
+    .await;
     {
         let mut live = STATE
             .lock()

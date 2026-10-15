@@ -61,9 +61,20 @@ impl DispatchModel<'_> {
         // actually launched.
         let policy = admitted
             .map_or_else(|| DefaultModelPolicy::resolve(root), DefaultModelPolicy::for_runtime);
-        let resolved = match (self, kind) {
-            (Self::Request(None) | Self::Autonomous, SweepKind::Issue(issue)) => {
-                resolve_autonomous_model_for_runtime(root, *issue, policy)
+        // Only Builder work keeps the per-issue experiment arm (design #11894
+        // §4.4): an issue sweep, or a Builder step (#11898). Other steps take
+        // their role's resolvers at spawn (#11906), so here the default.
+        let experiment_issue = match kind {
+            SweepKind::Issue(n)
+            | SweepKind::Step {
+                item: n,
+                role: crate::step_role::StepRole::Builder,
+            } => Some(*n),
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
+        };
+        let resolved = match (self, experiment_issue) {
+            (Self::Request(None) | Self::Autonomous, Some(issue)) => {
+                resolve_autonomous_model_for_runtime(root, issue, policy)
             }
             _ => {
                 let explicit = match self {

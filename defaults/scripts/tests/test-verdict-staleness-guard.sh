@@ -25,59 +25,8 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
 GUARD="$SCRIPTS_DIR/verdict-staleness-guard.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-assert_eq() {
-    local expected="$1" actual="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$expected" == "$actual" ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected: '$expected'"
-        echo "    Actual:   '$actual'"
-    fi
-}
-
-# assert_contains/assert_not_contains use a pure-bash substring match (no
-# forked printf|grep pipeline) so a transient fork/exec failure under
-# run-ci-suites.sh's parallel suite pool can never masquerade as a genuine
-# content mismatch (#7819, #7874).
-assert_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$haystack" == *"$needle"* ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected substring: '$needle'"
-        echo "    In: '$haystack'"
-    fi
-}
-
-assert_not_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$haystack" == *"$needle"* ]]; then
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Unexpected substring: '$needle'"
-        echo "    In: '$haystack'"
-    else
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    fi
-}
+# shellcheck source=lib/assert.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 if [[ ! -x "$GUARD" ]]; then
     echo -e "${RED}FATAL${NC}: $GUARD not found or not executable" >&2
@@ -230,6 +179,11 @@ chmod +x "$STUB_DIR/gh"
 cat > "$STUB_DIR/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub loom-daemon: LOOM_TEST_STUB_DIR not set}"
+# $STUB_DIR/hold-labels: the registry's answer to `labels list --property hold
+# --with-retired` (#11795); absent, the query fails like an older binary.
+if [[ "$*" == "labels list --property hold --with-retired" && -f "$STUB_DIR_FROM_ENV/hold-labels" ]]; then
+  exec cat "$STUB_DIR_FROM_ENV/hold-labels"
+fi
 if [[ "$1" == "forge" && "$2" == "verdict-equivalent" ]]; then
   printf 'TREE %s\n' "$*" >> "$STUB_DIR_FROM_ENV/tree-calls.log"
   if [[ -f "$STUB_DIR_FROM_ENV/tree-verb-missing" ]]; then
@@ -319,6 +273,9 @@ export PATH="$STUB_DIR:$PATH"
 # Force the guard's $PATH resolution tier (the production shape). A sweep-
 # dispatched shell inherits LOOM_DAEMON_BIN pointing at the real installed
 # daemon, which would silently run live `gh` mutations instead of the stub.
+# A real daemon from the caller (CI exports LOOM_DAEMON_BIN) supplies (g3)'s
+# registry answer; it is only ever asked `labels list`, a read.
+LOOM_TEST_REAL_DAEMON="${LOOM_TEST_REAL_DAEMON:-${LOOM_DAEMON_BIN:-}}"
 unset LOOM_DAEMON_BIN
 
 SHA_A="1111111111111111111111111111111111111111"
@@ -579,14 +536,38 @@ assert_eq "0" "$(get_field "$OUT" CLEARED)" "(g) CLEARED=0 on an explicit hold"
 assert_contains "$OUT" "clear suppressed" "(g) REASON explains the suppression"
 assert_eq "" "$WRITES" "(g) No label writes on a held PR"
 
-# (g2) Same for loom:operator-only.
+# (g2) Same for loom:frozen (the third hold, #11795).
 reset_state
-pr_json 210 "$SHA_B" "loom:pr" "loom:operator-only"
+pr_json 210 "$SHA_B" "loom:pr" "loom:frozen"
 { echo "["; verdict_comment "2026-08-08T03:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-210.json"
 run_guard 210 --clear
-assert_eq "12" "$RC" "(g2) Stale approval on loom:operator-only -> exit 12"
-assert_eq "0" "$(get_field "$OUT" CLEARED)" "(g2) CLEARED=0 on loom:operator-only"
-assert_eq "" "$WRITES" "(g2) No label writes on loom:operator-only"
+assert_eq "12" "$RC" "(g2) Stale approval on loom:frozen -> exit 12"
+assert_eq "0" "$(get_field "$OUT" CLEARED)" "(g2) CLEARED=0 on loom:frozen"
+assert_eq "" "$WRITES" "(g2) No label writes on loom:frozen"
+
+# (g3) #11795 transition: a PR carrying ONLY a retired hold name (not yet moved
+#      by `labels migrate`) is still held -- --clear stays suppressed, through
+#      the registry (--with-retired) and through the older-daemon fallback.
+for retired in loom:operator-only loom:operator-blocked; do
+  for source in fallback registry; do
+    reset_state
+    rm -f "$STUB_DIR/hold-labels"
+    if [[ "$source" == "registry" ]]; then
+      if [[ -n "$LOOM_TEST_REAL_DAEMON" && -x "$LOOM_TEST_REAL_DAEMON" ]]; then
+        "$LOOM_TEST_REAL_DAEMON" labels list --property hold --with-retired > "$STUB_DIR/hold-labels"
+      else
+        printf '%s\n' loom:blocked loom:operator loom:frozen loom:operator-only loom:operator-decision \
+          loom:operator-mechanical loom:operator-blocked loom:needs-capability > "$STUB_DIR/hold-labels"
+      fi
+    fi
+    pr_json 210 "$SHA_B" "loom:pr" "$retired"
+    { echo "["; verdict_comment "2026-08-08T03:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-210.json"
+    run_guard 210 --clear
+    assert_eq "0" "$(get_field "$OUT" CLEARED)" "(g3) only $retired ($source) -> CLEARED=0, still held"
+    assert_eq "" "$WRITES" "(g3) only $retired ($source) -> no label writes"
+  done
+done
+rm -f "$STUB_DIR/hold-labels"
 
 # (h) Idempotency: the old->new transition was already announced by an earlier
 #     pass (daemon backstop and a Judge pass can both notice the same move).

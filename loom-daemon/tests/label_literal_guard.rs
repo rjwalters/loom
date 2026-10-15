@@ -9,6 +9,10 @@
 //!
 //! A new label must be added to the registry first; typos and unregistered
 //! labels fail here instead of silently joining or missing a label set.
+//!
+//! A retired label with a replacement (`retired[].replaced_by`, #11513) is
+//! registered too: code must keep recognising it until `labels migrate`
+//! relabels open items (#11795). A retired label with no replacement is not.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -24,6 +28,7 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("host_affinity.rs", "loom:host:"),
     ("intake_reconcile.rs", "loom:"),
     ("intake_reconcile/singleton.rs", "loom:"),
+    ("judge_backstop.rs", "loom:"),
     ("label_registry/mod.rs", "loom:"),
     ("merge_pr/consolidate.rs", "loom:consolidation"),
     ("merge_pr/consolidate.rs", "loom:consolidation-abort"),
@@ -61,6 +66,15 @@ const SCRIPTS: &[&str] = &[
     "warn-out-of-set-deps.sh",
     "hard-exclusion-labels.sh",
 ];
+
+/// Whether `name` is a registry label: declared, or retired with a
+/// replacement (a transition alias, #11795).
+fn registered(reg: &Registry, name: &str) -> bool {
+    reg.get(name).is_some()
+        || reg
+            .get_retired(name)
+            .is_some_and(|r| r.replaced_by.is_some())
+}
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -128,7 +142,7 @@ fn strip_inline_test_mods(text: &str) -> String {
 }
 
 /// `guards_status.rs` lists each guard category's decision-log rule tags in
-/// `tags: &[..]` fields (e.g. `loom:forge-egress`, `loom:cargo-target-dir`).
+/// `tags: &[..]` fields (e.g. `loom:cargo-target-dir`).
 /// Those are hook rule identifiers matched against the decision log, never
 /// GitHub labels, so those lines are structurally exempt: only a line whose
 /// trimmed text starts with `tags: &[` in that one file is dropped.
@@ -222,7 +236,7 @@ fn no_unregistered_loom_literal_in_non_test_daemon_source() {
             .to_string_lossy()
             .replace('\\', "/");
         for m in re.captures_iter(&body) {
-            if reg.get(&m[1]).is_none() {
+            if !registered(reg, &m[1]) {
                 found.insert((rel.clone(), m[1].to_string()));
             }
         }
@@ -255,7 +269,7 @@ fn label_shell_scripts_name_only_registered_labels() {
         let text = std::fs::read_to_string(dir.join(s)).unwrap_or_else(|e| panic!("{s}: {e}"));
         for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
             for m in re.find_iter(line) {
-                if reg.get(m.as_str()).is_none() {
+                if !registered(reg, m.as_str()) {
                     found.insert(((*s).into(), m.as_str().into()));
                 }
             }
@@ -297,6 +311,15 @@ fn names_with(prop: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// [`names_with`] plus the retired names whose replacement has `prop`
+/// (#11795): a script may keep naming them during the migration window.
+fn names_with_retired(prop: &str) -> BTreeSet<String> {
+    loom_daemon::label_registry::embedded_set_with_retired(prop)
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
 /// `verdict-staleness-guard.sh` hand-lists the PR explicit-hold labels. That
 /// set is not one registry property, so pin it to its two registry bounds:
 /// every parking label is in it, and every member is a `hold` label. A new
@@ -307,7 +330,7 @@ fn verdict_staleness_guard_hold_set_is_bounded_by_the_registry() {
     let set = loop_label_set("verdict-staleness-guard.sh", &anchor);
     assert!(!set.is_empty());
     let park = names_with("park");
-    let hold = names_with("hold");
+    let hold = names_with_retired("hold");
     let missing_park: Vec<_> = park.difference(&set).collect();
     assert!(
         missing_park.is_empty(),
@@ -320,14 +343,16 @@ fn verdict_staleness_guard_hold_set_is_bounded_by_the_registry() {
     );
 }
 
-/// `warn-operator-gated.sh` flags a dependency carrying one of two labels; both
-/// must stay operator-gate labels in the registry.
+/// `warn-operator-gated.sh`'s offline fallback flags a dependency carrying
+/// `loom:operator` or its retired base name (#11795); each must stay an
+/// operator-gate label in the registry (the retired one through its
+/// replacement).
 #[test]
 fn warn_operator_gated_dep_labels_are_operator_gate_labels() {
-    let anchor = Regex::new(r"for dep_label in ").expect("regex");
+    let anchor = Regex::new(r"--property operator_gate --with-retired").expect("regex");
     let set = loop_label_set("warn-operator-gated.sh", &anchor);
     assert!(!set.is_empty());
-    let gate = names_with("operator_gate");
+    let gate = names_with_retired("operator_gate");
     let outside: Vec<_> = set.difference(&gate).collect();
     assert!(
         outside.is_empty(),
@@ -345,4 +370,16 @@ fn check_promotion_landed_progress_labels_are_registered_skip_labels() {
     let skip = names_with("skip");
     let outside: Vec<_> = set.difference(&skip).collect();
     assert!(outside.is_empty(), "later-lifecycle labels {outside:?} are not skip labels");
+}
+
+/// #11795: a retired label with a replacement is a transition alias the code
+/// may still name; one retired outright is not.
+#[test]
+fn registered_accepts_transition_aliases_only() {
+    let reg = Registry::embedded();
+    assert!(registered(reg, "loom:operator"));
+    assert!(registered(reg, "loom:operator-only"));
+    assert!(registered(reg, "loom:needs-capability"));
+    assert!(!registered(reg, "loom:urgent"));
+    assert!(!registered(reg, "loom:nope"));
 }

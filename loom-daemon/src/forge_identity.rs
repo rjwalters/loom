@@ -565,17 +565,6 @@ pub fn reader_for_resource_at<'a>(
     now: SystemTime,
     mode: RoutingMode,
 ) -> Option<&'a Identity> {
-    // #9986: the gateway owns the pool on a `required` egress host.
-    // `workspace_root()` is `None` when `WORKSPACE_ROOT` was never registered
-    // (CLI subcommands, not the daemon). Then only the env/machine policy tiers
-    // are consulted, so a repo-tier-only `required` policy is not honoured
-    // here — a deliberate fail-open for the repo tier alone: the daemon (which
-    // mints and publishes) registers its workspace at startup via
-    // `forge_identity::spawn_reader_refresh`, and
-    // env/machine `required` policies still apply.
-    if crate::forge_egress::publication::github_credential_forbidden(workspace_root()) {
-        return None;
-    }
     let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
     // The same eligible set and walk as `route_read` (W4-B): a reader
     // limited to other owners is not counted (legacy: every reader).
@@ -623,7 +612,7 @@ fn repo_withdrawals() -> &'static Mutex<std::collections::HashMap<(String, Strin
 /// re-probe of an uncovered repo is a guaranteed wasted call.
 pub const REPO_WITHDRAWAL: Duration = Duration::from_secs(3600);
 
-fn repo_withdrawn_at(app_id: &str, owner_repo: &str, now: SystemTime) -> bool {
+pub(crate) fn repo_withdrawn_at(app_id: &str, owner_repo: &str, now: SystemTime) -> bool {
     let Ok(map) = repo_withdrawals().lock() else {
         return false;
     };
@@ -734,11 +723,7 @@ pub fn read_credential_in_for(
         workspace_root,
         roster,
         &RouteRequest::gate(owner_repo, None, resource),
-        &route::RouteEnv {
-            mode,
-            egress_forbidden: false,
-            cfg: &cfg,
-        },
+        &route::RouteEnv { mode, cfg: &cfg },
         now,
     )
     .into_credential()
@@ -1039,6 +1024,10 @@ pub fn refresh_reader_credentials(
 /// a cheap no-op, so the loop is safe to spawn on every host.
 pub fn spawn_reader_refresh(workspace_root: PathBuf, primary_owner_repo: Option<String>) {
     WORKSPACE_ROOT.get_or_init(|| workspace_root.clone());
+    // 2am#4367 P4: the gateway read profiles (a no-op while forge.gateway
+    // is unset). Its own loop: it re-reads the config every minute, so
+    // unsetting the key restores today's routing within one.
+    crate::forge_gateway::spawn_refresh(workspace_root.clone());
     tokio::spawn(async move {
         loop {
             let ws = workspace_root.clone();
