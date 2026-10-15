@@ -48,12 +48,13 @@ fn calls_matching(log: &Path, needle: &str) -> usize {
 }
 
 /// Live reads of predecessor PR #1 (`pulls/1`, not its REST `/files` pages,
-/// #10382).
+/// #10382, nor the conditional `--include` mergeability probe that #12010's
+/// "landable now" check makes of every approved PR).
 fn pred_reads(log: &Path) -> usize {
     std::fs::read_to_string(log)
         .unwrap_or_default()
         .lines()
-        .filter(|l| l.contains("pulls/1") && !l.contains("/files?"))
+        .filter(|l| l.contains("pulls/1") && !l.contains("/files?") && !l.contains("--include"))
         .count()
 }
 
