@@ -145,6 +145,38 @@ fn listing_or_last_good(
     }
 }
 
+type LastGoodPulls = HashMap<String, (Instant, Vec<RestPull>)>;
+
+fn last_good_pulls() -> &'static Mutex<LastGoodPulls> {
+    static CACHE: OnceLock<Mutex<LastGoodPulls>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The open-PR listing, or on its failure the last good one while it is
+/// fresh (#12074), and whether this tick's listing answered. A shed listing
+/// (a reader back-off) then keeps the PR set (heads for the CI hold, branch
+/// links, authors) instead of emptying it. It never vouches for a Builder
+/// step: the second value stays `false`, so [`super::driver::shape_pool`]
+/// still holds Builders (#12025).
+pub fn pulls_or_last_good(
+    slug: &str,
+    listing: anyhow::Result<Vec<RestPull>>,
+) -> (Vec<RestPull>, bool) {
+    let mut cache = last_good_pulls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match listing {
+        Ok(pulls) => {
+            cache.insert(slug.to_string(), (Instant::now(), pulls.clone()));
+            (pulls, true)
+        }
+        Err(_) => match cache.get(slug) {
+            Some((at, pulls)) if at.elapsed() < LAST_GOOD_TTL => (pulls.clone(), false),
+            _ => (Vec::new(), false),
+        },
+    }
+}
+
 fn has(labels: &[String], label: &str) -> bool {
     labels.iter().any(|l| l == label)
 }
@@ -486,10 +518,8 @@ pub fn gather(
         Some(&slug),
         PULL_PAGES,
     );
-    let pulls_complete = pull_listing.is_ok();
-    let full: HashMap<u32, RestPull> = pull_listing
-        .map(|pulls| pulls.into_iter().map(|p| (p.number, p)).collect())
-        .unwrap_or_default();
+    let (pulls, pulls_complete) = pulls_or_last_good(&slug, pull_listing);
+    let full: HashMap<u32, RestPull> = pulls.into_iter().map(|p| (p.number, p)).collect();
     let markers = pull_markers(&slug, root, &rows);
     let pulls: Vec<PullInput> = rows
         .iter()

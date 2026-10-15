@@ -67,6 +67,13 @@ impl GatherWalk {
         true
     }
 
+    /// Whether the repo just admitted is the tick's first, the one it always
+    /// gathers ([`GUARANTEED_FLOOR`]).
+    #[must_use]
+    pub fn is_guaranteed(&self) -> bool {
+        self.gathered == 1
+    }
+
     /// Where the next tick's walk starts: the first repo skipped this tick,
     /// else where this one started.
     #[must_use]
@@ -113,14 +120,53 @@ pub fn tick_deadline(root: &std::path::Path) -> Duration {
 }
 
 /// Start one work-finder tick body: log it at INFO, so a tick that never
-/// reaches its dispatch line can be placed, and return its deadline (#12074).
+/// reaches its dispatch line can be placed, and return its read budget
+/// (#12074). The clock starts when the loop enters its read scope, after the
+/// local pre-tick work (the eager reclaim, the CPU sample), so slow local work
+/// never turns into forge shedding.
 #[must_use]
-pub fn begin_tick(root: &std::path::Path) -> Instant {
+pub fn begin_tick(root: &std::path::Path) -> Duration {
     static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let budget = tick_deadline(root);
     log::info!("work_finder: tick {n} start (deadline {}s, #12074)", budget.as_secs());
-    Instant::now() + budget
+    budget
+}
+
+/// The read budget the one repo a tick always gathers gets, however late it
+/// starts: its reads run until `max(tick deadline, start + this)`.
+pub const GUARANTEED_FLOOR: Duration = Duration::from_secs(20);
+
+/// Consecutive starved ticks after which a repo's reads may fall through to
+/// the writer for one tick.
+pub const STARVED_TICKS_BEFORE_WRITER: u32 = 3;
+
+/// Which repos have been starved (#12074): their gather failed, or answered
+/// only from a last good listing, or could not read the open-PR listing, tick
+/// after tick. Inside a tick a read whose readers are out of budget is shed
+/// rather than sent to the writer; this bounds that rule, so a long back-off
+/// slows a repo down but never stops it.
+#[derive(Debug, Default)]
+pub struct Starvation {
+    ticks: std::collections::HashMap<std::path::PathBuf, u32>,
+}
+
+impl Starvation {
+    /// Whether `root`'s reads may use the writer this tick.
+    #[must_use]
+    pub fn escalate(&self, root: &std::path::Path) -> bool {
+        self.ticks.get(root).copied().unwrap_or(0) >= STARVED_TICKS_BEFORE_WRITER
+    }
+
+    /// Record this tick's outcome for `root`. A healthy gather, or a tick
+    /// that already escalated, starts the count again.
+    pub fn record(&mut self, root: &std::path::Path, starved: bool, escalated: bool) {
+        if starved && !escalated {
+            *self.ticks.entry(root.to_path_buf()).or_default() += 1;
+        } else {
+            self.ticks.remove(root);
+        }
+    }
 }
 
 #[cfg(test)]

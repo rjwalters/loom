@@ -277,4 +277,23 @@ mod tests {
         assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::TimedOut { .. })), "{out:?}");
         assert!(began.elapsed() < Duration::from_secs(4), "{:?}", began.elapsed());
     }
+
+    /// #12074 review: the repo a tick always gathers gets a real read budget
+    /// ([`super::super::read_deadline::at_least`]): past the tick deadline,
+    /// its reads are sent, not shed.
+    #[test]
+    fn the_guaranteed_repo_reads_past_a_passed_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let program = stub(tmp.path(), &format!("touch '{}'", marker.display()));
+        let now = std::time::Instant::now();
+        let _scope = super::super::read_deadline::enter(
+            now.checked_sub(Duration::from_secs(1)).unwrap(),
+            true,
+        );
+        let _floor = super::super::read_deadline::at_least(now + Duration::from_secs(20));
+        let out = run_retrying(|| inv(TIMEOUT), &program);
+        assert!(matches!(out, CmdOutcome::Ran(_)), "{out:?}");
+        assert!(marker.exists(), "the guaranteed repo's read ran");
+    }
 }

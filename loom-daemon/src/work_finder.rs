@@ -2883,7 +2883,7 @@ pub fn spawn_multi_work_finder_task(
         loop {
             ticker.tick().await;
             // #12074: one INFO line per tick body, and its wall-clock deadline.
-            let tick_deadline = crate::step_dispatch::gather_budget::begin_tick(&fallback_root);
+            let tick_budget = crate::step_dispatch::gather_budget::begin_tick(&fallback_root);
 
             // #8121: reload the registry and provision any newly-registered
             // root's `SweepRegistry` BEFORE the rate-limit breaker check
@@ -2983,6 +2983,7 @@ pub fn spawn_multi_work_finder_task(
             // #12074: from here to the step tick nothing awaits, so every forge
             // read in between is bounded by the tick deadline and fails fast
             // past it; a listing does not fall through to the writer.
+            let tick_deadline = std::time::Instant::now() + tick_budget;
             let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline, true);
 
             // `roots` was already resolved (registry reload + missing-root

@@ -526,4 +526,19 @@ fn a_tick_scoped_gate_read_is_shed_not_moved_to_the_writer() {
     drop(scope);
     assert_eq!(p.who(), vec![Who::R2, Who::R1], "writer stub NOT invoked");
     assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+
+    // #12074 review: readers out for a cause that is not budget still reach
+    // the writer inside a tick: only a rate-limit back-off is shed.
+    let p = pool(LIMITED, LIMITED, OK);
+    let scope = super::super::read_deadline::enter(deadline, true);
+    let (out, _, _) = p.run_as(
+        p.read("tick-unavail", ReadClass::Gate),
+        &[],
+        SHED_ON,
+        SystemTime::now(),
+        ExhaustCause::Unavailable,
+    );
+    drop(scope);
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1, Who::Writer]);
 }

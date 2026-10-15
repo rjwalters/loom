@@ -208,58 +208,31 @@ fn a_gate_read_keeps_its_writer_fallback() {
     assert_eq!(calls(&log), ["reader-limited", "writer"]);
 }
 
-/// #12074: inside a work-finder tick's read scope, a listing a reader
-/// already failed is shed rather than moved to the writer (the dispatch
-/// App) while the readers are out for any cause. Outside the scope the
-/// writer still serves it; a listing no reader was tried for still goes to
-/// the writer in the scope too (no pool, or a repo outside it).
+/// #12074 review: inside a work-finder tick's read scope a listing still
+/// reaches the writer when the readers are out for a cause that is not
+/// budget (only a rate-limit back-off is shed), so a degraded pool never
+/// starves the tick.
 #[test]
-fn a_tick_scoped_listing_a_reader_failed_never_falls_to_the_writer() {
+fn a_tick_scoped_listing_still_reaches_the_writer_for_a_non_budget_cause() {
     let tmp = tempfile::tempdir().unwrap();
     let (gh, log) = stub(tmp.path());
-    let reader = tmp.path().join("reader-limited");
-    std::fs::create_dir_all(&reader).unwrap();
-    let pid = std::process::id();
-    let route_for = |app: String| {
-        let asked = Cell::new(0);
-        let reader = reader.clone();
-        move |_: &RouteRequest<'_>| {
-            asked.set(asked.get() + 1);
-            if asked.get() == 1 {
-                RouteDecision::Reader {
-                    dir: reader.clone(),
-                    app_id: app.clone(),
-                    placement: Placement::Home,
-                }
-            } else {
-                RouteDecision::Exhausted {
-                    until: SystemTime::now(),
-                    cause: ExhaustCause::Unavailable,
-                }
-            }
-        }
-    };
-    let unscoped = route_for(format!("t12074-a-{pid}"));
-    let r =
-        fetch_conditional_via(site(ReadClass::Hygiene), &gh, None, &target(), URL, None, &unscoped);
-    assert!(r.is_ok(), "outside a tick the writer serves it");
-    assert_eq!(calls(&log), ["reader-limited", "writer"]);
-
-    std::fs::remove_file(&log).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let _scope = crate::gh_invocation::read_deadline::enter(deadline, true);
-    let scoped = route_for(format!("t12074-b-{pid}"));
-    let r =
-        fetch_conditional_via(site(ReadClass::Hygiene), &gh, None, &target(), URL, None, &scoped);
-    assert!(is_shed(&r), "{:?}", r.map(|x| x.0));
-    assert_eq!(calls(&log), ["reader-limited"], "no writer call in a tick");
-
-    std::fs::remove_file(&log).unwrap();
-    let no_pool = |_: &RouteRequest<'_>| RouteDecision::NoPool;
-    let r =
-        fetch_conditional_via(site(ReadClass::Hygiene), &gh, None, &target(), URL, None, &no_pool);
+    let unavailable = |_: &RouteRequest<'_>| RouteDecision::Exhausted {
+        until: SystemTime::now(),
+        cause: ExhaustCause::Unavailable,
+    };
+    let r = fetch_conditional_via(
+        site(ReadClass::Hygiene),
+        &gh,
+        None,
+        &target(),
+        URL,
+        None,
+        &unavailable,
+    );
     assert!(r.is_ok());
-    assert_eq!(calls(&log), ["writer"], "no pool: the writer is the only identity");
+    assert_eq!(calls(&log), ["writer"]);
 }
 
 /// #12074: past the tick deadline a listing page is not sent at all; the

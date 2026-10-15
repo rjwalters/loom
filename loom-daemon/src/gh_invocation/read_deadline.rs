@@ -89,6 +89,39 @@ pub fn enter(deadline: Instant, no_writer_fallback: bool) -> Guard {
     }
 }
 
+/// Narrow or widen the scope in force (if any) until the guard drops.
+fn adjust(f: impl FnOnce(Scope) -> Scope) -> Guard {
+    let previous = SCOPE.with(Cell::get);
+    if let Some(scope) = previous {
+        SCOPE.with(|s| s.set(Some(f(scope))));
+    }
+    Guard {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// Give the reads until the guard drops a deadline no earlier than `floor`
+/// (#12074): the one repo a tick always gathers gets a real read budget even
+/// when the tick's own deadline has passed. A no-op with no scope.
+pub fn at_least(floor: Instant) -> Guard {
+    adjust(|s| Scope {
+        deadline: s.deadline.max(floor),
+        ..s
+    })
+}
+
+/// Let the reads until the guard drops fall through to the writer again
+/// (#12074): a repo whose reads were shed for several ticks in a row gets one
+/// tick on the writer, so a long back-off can never stop it for good. A
+/// no-op with no scope.
+pub fn allow_writer() -> Guard {
+    adjust(|s| Scope {
+        no_writer_fallback: false,
+        ..s
+    })
+}
+
 /// Lift the scope until the guard drops.
 pub fn suspend() -> Guard {
     Guard {
@@ -172,6 +205,32 @@ mod tests {
             assert!(!writer_fallback_allowed(), "suspend restores the scope");
         }
         assert_eq!(budget(), Budget::Unbounded, "the guard restores no scope");
+    }
+
+    /// The guaranteed repo's floor revives a passed deadline; allow_writer
+    /// lifts only the writer rule; both restore on drop and are no-ops with
+    /// no scope.
+    #[test]
+    fn at_least_and_allow_writer_adjust_the_scope_and_restore() {
+        let now = Instant::now();
+        {
+            let _none = at_least(now + Duration::from_secs(20));
+            assert_eq!(budget(), Budget::Unbounded, "no scope: nothing to widen");
+        }
+        let _g = enter(now.checked_sub(Duration::from_secs(1)).unwrap(), true);
+        assert!(passed());
+        {
+            let _floor = at_least(now + Duration::from_secs(20));
+            assert!(matches!(budget(), Budget::Left(d) if d > Duration::from_secs(15)));
+            assert!(!writer_fallback_allowed(), "the writer rule is kept");
+            {
+                let _w = allow_writer();
+                assert!(writer_fallback_allowed());
+                assert!(!passed(), "the deadline is kept");
+            }
+            assert!(!writer_fallback_allowed());
+        }
+        assert!(passed(), "the floor ends with its guard");
     }
 
     #[test]

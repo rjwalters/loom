@@ -271,6 +271,9 @@ impl GhInvocation {
                 .without_token_env()
                 .execute_direct()?;
             if succeeded(&first) {
+                if app_id == crate::forge_gateway::GATEWAY_APP_ID {
+                    crate::forge_gateway::outage::note_answered();
+                }
                 return Ok(first);
             }
             let fault = if app_id == crate::forge_gateway::GATEWAY_APP_ID {
@@ -365,11 +368,17 @@ impl GhInvocation {
         app: Option<&str>,
         tried: bool,
     ) -> Result<GhCompletion, ExecError> {
-        // #12074: inside a work-finder tick's read scope, a read a reader or
-        // the gateway already failed is shed, whatever its class: the tick
+        // #12074: inside a work-finder tick's read scope, a read whose
+        // readers are out of BUDGET is shed whatever its class: the tick
         // answers it from its caches, and the writer's (dispatch App's)
-        // budget is left to the claims and merges during a back-off.
-        let in_tick = tried && !super::super::read_deadline::writer_fallback_allowed();
+        // budget is left to the claims and merges during a rate-limit
+        // back-off. Any other cause (a failing gateway, a coverage miss)
+        // still reaches the writer, bounded by the deadline's clamp; and a
+        // repo starved for several ticks lifts the rule for one
+        // ([`super::super::read_deadline::writer_fallback_allowed`]).
+        let in_tick = tried
+            && cause == ExhaustCause::Budget
+            && !super::super::read_deadline::writer_fallback_allowed();
         if !in_tick && (class == ReadClass::Gate || cause != ExhaustCause::Budget) {
             return if tried {
                 self.writer_fallback()

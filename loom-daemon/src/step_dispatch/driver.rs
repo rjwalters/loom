@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 
-use super::gather_budget::{deadline_passed, GatherWalk};
+use super::gather_budget::{deadline_passed, GatherWalk, Starvation, GUARANTEED_FLOOR};
 use super::item_draw::{weigh, ItemWeights, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
@@ -134,6 +134,7 @@ pub fn actionable_point(
 pub struct StepDriver {
     provider: StageEntryProvider,
     next_start: usize,
+    starvation: Starvation,
 }
 
 impl Default for StepDriver {
@@ -141,6 +142,7 @@ impl Default for StepDriver {
         Self {
             provider: StageEntryProvider::load(default_cache_path(), DEFAULT_EVENTS_BUDGET),
             next_start: 0,
+            starvation: Starvation::default(),
         }
     }
 }
@@ -247,6 +249,20 @@ impl StepDriver {
             if !walk.admit(idx, deadline_passed(input.deadline, Instant::now())) {
                 continue;
             }
+            // The repo a tick always gathers gets a real read budget, even
+            // past the deadline; a repo starved for several ticks gets one
+            // tick on the writer (#12074).
+            let _floor = walk.is_guaranteed().then(|| {
+                crate::gh_invocation::read_deadline::at_least(Instant::now() + GUARANTEED_FLOOR)
+            });
+            let escalated = self.starvation.escalate(root);
+            let _writer = escalated.then(|| {
+                log::info!(
+                    "work_finder: {repo}: reads shed for several ticks; this tick may use the \
+                     writer (#12074)"
+                );
+                crate::gh_invocation::read_deadline::allow_writer()
+            });
             let registry = &registries[idx];
             let red = |fixes: Vec<crate::work_finder::WorkItem>| {
                 let mut fixes = fixes;
@@ -264,11 +280,17 @@ impl StepDriver {
                 Ok(Some(g)) => g,
                 Ok(None) => continue,
                 Err(e) => {
+                    self.starvation.record(root, true, escalated);
                     log::warn!("work_finder: {}: step listing failed: {e:#}", root.display());
                     notes.push((idx, Some(e), None, 0));
                     continue;
                 }
             };
+            self.starvation.record(
+                root,
+                gathered.stale_listing || !gathered.pulls_complete,
+                escalated,
+            );
             let (mut cooldowns, pool_exhausted_roles, claims) = registry.lock().map_or_else(
                 |_| (Default::default(), BTreeSet::new(), Default::default()),
                 |reg| (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims()),

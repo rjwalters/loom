@@ -22,13 +22,6 @@
 //!    does the writer serve it. Shedding there would stop the caller's
 //!    housekeeping for as long as the condition lasts.
 //!
-//! Inside a work-finder tick's read scope
-//! ([`crate::gh_invocation::read_deadline`], #12074) step 4's fallback is
-//! narrower: once a reader or the gateway has failed the read, it is shed
-//! rather than moved to the writer, so a listing never spends the dispatch
-//! App's budget during a back-off. A read no reader was ever tried for still
-//! goes to the writer (no pool, or a repo outside it).
-//!
 //! `LOOM_READ_SHED=0` ([`crate::gh_invocation::READ_SHED_ENV`]) turns this
 //! off: every conditional read is routed as `Gate` again.
 
@@ -130,9 +123,7 @@ pub(super) fn fetch(
             // reader is left. Budget only if what it failed on was a rate
             // limit.
             RouteDecision::Reader { app_id, .. } => {
-                if matches!(last_failure, Some(Failure::RateLimited { .. }))
-                    || !crate::gh_invocation::read_deadline::writer_fallback_allowed()
-                {
+                if matches!(last_failure, Some(Failure::RateLimited { .. })) {
                     let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
                     return Err(shed(site, gh_bin, target, repo, until, Some(&app_id)));
                 }
@@ -142,18 +133,6 @@ pub(super) fn fetch(
                 until,
                 cause: ExhaustCause::Budget,
             } => {
-                let app = tried.last().map(String::as_str);
-                return Err(shed(site, gh_bin, target, repo, until, app));
-            }
-            // #12074: a step-tick listing a reader or the gateway already
-            // failed does not fall through to the writer (the dispatch App)
-            // during a back-off; it is shed and the caller uses its last good
-            // listing.
-            RouteDecision::NoPool | RouteDecision::Exhausted { .. }
-                if !tried.is_empty()
-                    && !crate::gh_invocation::read_deadline::writer_fallback_allowed() =>
-            {
-                let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
                 let app = tried.last().map(String::as_str);
                 return Err(shed(site, gh_bin, target, repo, until, app));
             }
@@ -179,6 +158,9 @@ pub(super) fn fetch(
             Some(&bucket),
         )?;
         if answered(&first) {
+            if app_id == crate::forge_gateway::GATEWAY_APP_ID {
+                crate::forge_gateway::outage::note_answered();
+            }
             if matches!(first.1.as_ref().map(|h| h.status), Some(200 | 304)) {
                 served::note_reader_served(&app_id, repo, family, SystemTime::now());
             }

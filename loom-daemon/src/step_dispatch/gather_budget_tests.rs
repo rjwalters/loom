@@ -81,3 +81,37 @@ fn the_deadline_config_defaults_and_overrides() {
     let zero = serde_json::json!({"autonomous": {"workFinder": {"tickDeadlineSecs": 0}}});
     assert_eq!(tick_deadline_from(&zero), DEFAULT_TICK_DEADLINE);
 }
+
+/// #12074: the first repo admitted is the guaranteed one, whatever the
+/// deadline; later ones are not.
+#[test]
+fn the_first_admitted_repo_is_the_guaranteed_one() {
+    let mut w = GatherWalk::new(3, 0, Instant::now());
+    assert!(w.admit(0, true));
+    assert!(w.is_guaranteed());
+    assert!(!w.admit(1, true));
+    let mut w = GatherWalk::new(3, 0, Instant::now());
+    assert!(w.admit(0, false) && w.is_guaranteed());
+    assert!(w.admit(1, false) && !w.is_guaranteed());
+}
+
+/// #12074: a repo starved for N ticks in a row escalates to the writer for
+/// one tick, then counts again; a healthy tick resets it.
+#[test]
+fn a_starved_repo_escalates_to_the_writer_once_every_n_ticks() {
+    let root = std::path::Path::new("/w/one");
+    let mut s = Starvation::default();
+    let mut escalated_at = Vec::new();
+    for tick in 0..8 {
+        let escalate = s.escalate(root);
+        if escalate {
+            escalated_at.push(tick);
+        }
+        s.record(root, true, escalate);
+    }
+    let n = usize::try_from(STARVED_TICKS_BEFORE_WRITER).unwrap();
+    assert_eq!(escalated_at, vec![n, 2 * n + 1], "bounded: every N+1 ticks at worst");
+    s.record(root, true, false);
+    s.record(root, false, false);
+    assert!(!s.escalate(root), "a healthy gather resets the count");
+}

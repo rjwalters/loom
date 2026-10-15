@@ -449,7 +449,11 @@ pub(crate) fn gateway_fault(
     if app != Some(crate::forge_gateway::GATEWAY_APP_ID) || r.0.success() {
         return crate::forge_gateway::outage::Fault::None;
     }
-    crate::forge_gateway::outage::fault(r.1.as_ref(), "", &r.2)
+    crate::forge_gateway::outage::escalate(crate::forge_gateway::outage::fault(
+        r.1.as_ref(),
+        "",
+        &r.2,
+    ))
 }
 
 pub(crate) fn reader_failure(r: &FetchResult) -> Option<crate::forge_identity::Failure> {
