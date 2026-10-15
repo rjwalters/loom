@@ -2469,6 +2469,23 @@ assert_allow "write-confinement (#6968): cp with an embedded-apostrophe source f
 assert_deny "write-confinement (#6968 control): cp with an embedded-apostrophe source filename still denies when the destination resolves into the main checkout" \
     "cp '/tmp/loom-test-$$-dont'\\''forget.txt' $WT5674_REPO/defaults/hooks/f.sh" "$WT5674_REPO"
 
+# ---------------------------------------------------------------------------
+# #12076: a quoted ">" inside an unquoted backtick substitution is data, not a
+# redirect. mask_gt() tracks a separate quote state (bq) inside a backtick span.
+# ---------------------------------------------------------------------------
+assert_allow "write-confinement (#12076): single-quoted --jq with quoted '>' inside backticks allows" \
+    "X=\`gh api repos/o/r/issues/1/comments --jq '.[] | select(.created_at > \"2026-10-15T05:50:00Z\") | .body'\`" "$WT5674_REPO"
+assert_allow "write-confinement (#12076): double-quoted '>' inside backticks allows" \
+    "X=\`jq \".a > 1\" /tmp/loom-test-$$-12076.json\`" "$WT5674_REPO"
+assert_deny "write-confinement (#12076 control): real redirect inside backticks still denies" \
+    "X=\`echo x > $WT5674_REPO/f.sh\`" "$WT5674_REPO"
+assert_deny "write-confinement (#12076 control): redirect after a closed quote inside backticks still denies" \
+    "X=\`echo 'a>b' > $WT5674_REPO/f.sh\`" "$WT5674_REPO"
+assert_deny "write-confinement (#12076 control): redirect after the closing backtick still denies" \
+    "X=\`echo '>'\` ; echo x > $WT5674_REPO/f.sh" "$WT5674_REPO"
+assert_deny "write-confinement (#12076 control): unquoted redirect still denies" \
+    "echo x > $WT5674_REPO/f" "$WT5674_REPO"
+
 rm -rf "$WT5674_REPO"
 
 rm -rf "$HOME_FIXTURE_OUTSIDE"

@@ -2677,7 +2677,7 @@ BEGIN {
 # (a masked-away `>` can only DROP a write target, never invent a new deny).
 # =============================================================================
 _MASKGT_AWK='
-function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc, btick) {
+function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc, btick, bq) {
     SQ = sprintf("%c", 39)    # single quote
     DQ = sprintf("%c", 34)    # double quote
     MASK = sprintf("%c", 1)   # SOH -- placeholder for a quoted/arith-context ">"/"<" (never a real char)
@@ -2689,6 +2689,7 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc, bti
     tdepth = 0   # `[[...]]` test-context nesting depth (unquoted only)
     esc = 0      # previous byte was an unescaped backslash (mode 0/2 only, #6472)
     btick = 0    # inside an unquoted `...` command substitution (#8211)
+    bq = 0       # quote state INSIDE a backtick span, for masking ">" only (#12076): 0 none, 1 single, 2 double
     while (i <= n) {
         c = substr(s, i, 1)
         if (esc) {
@@ -2698,12 +2699,13 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc, bti
             # every ">" is already masked regardless of escaping, so that
             # half of the ternary is a no-op there, not a behavior change.
             esc = 0
-            out = out (mode == 2 && c == ">" ? MASK : c)
+            out = out ((mode == 2 || bq == 2) && c == ">" ? MASK : c)
             i++
             continue
         }
-        if (c == "\\" && mode != 1) {
-            # Single-quoted mode (mode == 1) is handled below and never
+        if (c == "\\" && mode != 1 && bq != 1) {
+            # Single-quoted mode (mode == 1, or bq == 1 inside a backtick
+            # span) is handled below and never
             # reaches here: a backslash has no escaping power inside single
             # quotes in real bash, so it must stay a plain literal byte
             # there and must never suppress the next quote-close check.
@@ -2715,7 +2717,20 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc, bti
         if (mode == 0) {
             # An unquoted backtick span makes the quote characters inside it
             # literal data (#8211 -- lockstep with mask_ws(), see above).
-            if (c == "`") { btick = 1 - btick; out = out c; i++; continue }
+            #
+            # #12076: a quoted ">" inside that span is still data, so track a
+            # SEPARATE quote state (bq) that only masks ">" bytes. It never
+            # touches `mode`, so mask_ws() lockstep and the #8211 span-boundary
+            # handling are unchanged, and a backtick always closes the span
+            # (resetting bq) so a quote can never hide the real close.
+            if (c == "`") { btick = 1 - btick; bq = 0; out = out c; i++; continue }
+            if (btick && bq == 0 && (c == SQ || c == DQ)) { bq = (c == SQ ? 1 : 2); out = out c; i++; continue }
+            if (btick && bq != 0) {
+                if ((bq == 1 && c == SQ) || (bq == 2 && c == DQ)) bq = 0
+                out = out (c == ">" ? MASK : c)
+                i++
+                continue
+            }
             if (c == SQ && !btick) { mode = 1; out = out c; i++; continue }
             if (c == DQ && !btick) { mode = 2; out = out c; i++; continue }
             if (c == "(" && i < n && substr(s, i + 1, 1) == "(") {
