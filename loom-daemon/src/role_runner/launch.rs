@@ -345,6 +345,8 @@ pub(super) fn run_role_with_timeout(
     }
     // #10432: the agent's pick journal, read back into this tick's `pick.decision`.
     crate::observability::pick_journal::attach(&mut cmd, workspace_root, role);
+    // #12119: the serving PR queue, journaled by the daemon, not the agent.
+    crate::observability::pick_journal::record_queue_at_dispatch(&cmd, workspace_root, role);
     if let Some(selection) = &selection {
         selection.apply(&mut cmd);
     }
