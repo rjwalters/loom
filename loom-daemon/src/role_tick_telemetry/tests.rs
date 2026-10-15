@@ -23,6 +23,7 @@ fn tick(result: RoleTickResult) -> RoleTickTelemetry {
         preference_tier: None,
         preference_tap: None,
         role_draw: None,
+        step_sweep_id: None,
     }
 }
 

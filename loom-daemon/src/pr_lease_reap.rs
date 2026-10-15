@@ -58,7 +58,7 @@ const POLL: Duration = Duration::from_millis(200);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     pub pr: u64,
-    /// `judge` or `doctor`.
+    /// `judge`, `doctor`, or a step's `curator` / `champion` (#11906).
     pub role: String,
     /// The published host id the lease marker carries.
     pub host: String,
@@ -72,14 +72,14 @@ impl Held {
         format!("{} {} {} {}", self.pr, self.role, self.host, self.sweep)
     }
 
-    /// Parse one [`line`](Self::line). Anything else (a role other than
-    /// `judge`/`doctor`, a missing or extra field) is `None`.
+    /// Parse one [`line`](Self::line). Anything else (a role `lease pr` does
+    /// not key, a missing or extra field) is `None`.
     #[must_use]
     pub fn parse(line: &str) -> Option<Self> {
         let mut tokens = line.split_whitespace();
         let pr = tokens.next()?.parse().ok()?;
         let role = tokens.next()?;
-        if !matches!(role, "judge" | "doctor") {
+        if !matches!(role, "judge" | "doctor" | "curator" | "champion") {
             return None;
         }
         let host = tokens.next()?;
@@ -216,6 +216,17 @@ impl Reaper {
         Self {
             root: root.to_path_buf(),
             path,
+        }
+    }
+
+    /// The lease file run `item` of `root` already wrote, kept as it is: a
+    /// step's leases are listed from its spawn on (#11906), and reaped when
+    /// it ends. Removed on drop, like [`plan`](Self::plan)'s.
+    #[must_use]
+    pub fn existing(root: &Path, item: &str) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            path: path_for(root, item),
         }
     }
 
