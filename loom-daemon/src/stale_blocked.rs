@@ -66,15 +66,9 @@ pub mod batch;
 pub mod budget;
 pub mod hold;
 pub mod notify;
-pub mod release;
-pub mod release_gh;
-pub mod release_outcome;
-pub mod release_task;
-pub mod unnamed;
 
-// The release pass's per-artifact verdicts and their SigNoz export (#10752).
-pub mod release_items;
-pub mod release_telemetry;
+// Why an artifact could not be read (#12036).
+pub mod unreadable;
 
 // Champion's merge-risk hold digest is exempt from the gather (#9397).
 pub mod digest;
@@ -498,13 +492,7 @@ mod batch_tests;
 mod budget_tests;
 
 #[cfg(test)]
-mod release_tests;
-
-#[cfg(test)]
 mod notify_tests;
 
 #[cfg(test)]
 mod archived_tests;
-
-#[cfg(test)]
-mod unnamed_tests;

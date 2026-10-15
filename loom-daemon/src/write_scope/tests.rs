@@ -452,7 +452,6 @@ fn daemon_write_paths_are_scoped() {
                  singleton's run_repo behind may_write (gate_repo_with)",
             ),
         ),
-        ("stale_blocked/release_gh.rs", Gated),
         ("work_finder/main_red_autofile.rs", Gated),
         // #11853: label swap + routing comment, each behind gate_repo_with.
         ("work_finder/landed_prefilter.rs", Gated),

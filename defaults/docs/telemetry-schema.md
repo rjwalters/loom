@@ -2383,6 +2383,8 @@ token's prefix inside the probing process.
 
 ### `pr.resolved`
 
+> **No producer since #11301.** The daemon's `fleet.state` loop (`observability/fleet_state`), this kind's only producer, was removed: Loom exports facts, and a consumer computes fleet state from them (`sweep.*`, `stage.work_started`, `pick.decision`, `queue.snapshot`, `host.health`, and the forge's own label history). The kind stays registered so records already in a store still decode; nothing new is sent. The text below describes what daemons before the removal sent.
+
 A PR that left the review listings, with its forge merge or close instant
 (Issue #10519). Envelopes carry `schema_version: 12`. **OTLP-only**
 (native: `false`). It gives a SigNoz reader a merge/close instant wherever the
@@ -2428,6 +2430,8 @@ promise). Provenance is required, and exports as `loom.eta.version` /
 | `loom` | object | the observing daemon's provenance (required) |
 
 ### `eta.stage_outcome`
+
+> **No producer since #11301.** The daemon's `fleet.state` loop (`observability/fleet_state`), this kind's only producer, was removed: Loom exports facts, and a consumer computes fleet state from them (`sweep.*`, `stage.work_started`, `pick.decision`, `queue.snapshot`, `host.health`, and the forge's own label history). The kind stays registered so records already in a store still decode; nothing new is sent. The text below describes what daemons before the removal sent.
 
 One stage an item actually left (Issue #10929). Envelopes carry
 `schema_version: 12`. **OTLP-only** (native: `false`). The wire tag keeps its
@@ -2576,6 +2580,8 @@ Full field reference, the SigNoz rank-at-instant query and the rows/day volume:
 [`telemetry-kind-pick-decision.md`](telemetry-kind-pick-decision.md).
 
 ### `pass.summary` and `pass.verdict`
+
+> **No producer since #11301.** The `loom:blocked` release pass, the only emitter, was removed. The kinds stay registered for records already in a store and for a future pass that reuses the shape.
 
 What a pass over forge artifacts did (Issue #10752): one `pass.summary` per
 pass per workspace, and one `pass.verdict` per artifact it decided. Today the
@@ -2744,6 +2750,8 @@ ORDER BY t;
 ```
 
 ### `fleet.state`
+
+> **No producer since #11301.** The daemon's `fleet.state` loop (`observability/fleet_state`) was removed: Loom exports facts, and a consumer computes fleet state from them (`sweep.*`, `stage.work_started`, `pick.decision`, `queue.snapshot`, `host.health`, and the forge's own label history). The kind stays registered so records already in a store still decode; nothing new is sent. The text below describes what daemons before the removal sent.
 
 This host's own view of the work it holds, the PRs under review in its repos,
 and its ready queue (Issue #10196). It is the state record of the replay
@@ -3229,7 +3237,8 @@ sent `priority`, a tier where lower dispatched first, #9244); it is omitted for 
 workspace and on older daemons, never defaulted. Additive, no `schema_version`
 bump.
 
-**`managed_repos[].stale_blocked_release` (#10763).** This host's
+**`managed_repos[].stale_blocked_release` (#10763; not sent since #11301,
+when the release pass was removed; a reader ignores it).** This host's
 `loom:blocked` release-pass tallies for the repo since the daemon started:
 `released` and `reparked` (applied writes only), `last_outcome`, and `ticks`, a
 count per outcome key (`ran`, `not_due`, `skipped_shard`, `denied_scope`,
