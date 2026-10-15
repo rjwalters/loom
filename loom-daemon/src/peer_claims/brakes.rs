@@ -171,6 +171,9 @@ pub fn observe_brake_ad(view: &mut PeerClaimView, ad: &ClaimAd, now: Instant) {
             view.observe_step_cooldown_at(ad, now);
             view.prune_expired_step_cooldowns(now);
         }
+        ClaimKind::NoopStreak => {
+            view.observe_noop_streak_at(ad, now);
+        }
         _ => {}
     }
 }
@@ -206,6 +209,7 @@ impl ClaimAd {
             consecutive: None,
             step: None,
             streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -241,6 +245,7 @@ impl ClaimAd {
             consecutive: Some(consecutive),
             step: None,
             streak_break: None,
+            fingerprint: None,
         }
     }
 
@@ -269,6 +274,7 @@ impl ClaimAd {
             consecutive: None,
             step: None,
             streak_break: None,
+            fingerprint: None,
         }
     }
 }

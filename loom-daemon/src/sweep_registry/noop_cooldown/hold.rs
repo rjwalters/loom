@@ -24,13 +24,30 @@
 //! daemon's own claim churn), non-bot comments, the linked-PR state, and the
 //! state of every dependency the body names. An unchanged fingerprint extends
 //! the streak; a changed one restarts it at 1. At
-//! [`NoopCooldownConfig::hold_threshold`] the issue is parked with a forge
-//! label — `loom:blocked` for dependencies, `loom:operator` for a human gate
-//! or when the kind is unclear (#11795) — and
-//! one marked comment says why and what unparks it. A priority label
+//! [`NoopCooldownConfig::hold_threshold`] the issue is parked: a daemon-hold
+//! park record in the body (`reason="no-op hold"`, [`park_hold`]), then
+//! `loom:blocked`, then one marked comment that says why, records the
+//! fingerprint digest, and says what unparks it. A priority label
 //! (`loom:important` / `loom:very-important`) never exempts an issue and is
-//! never touched; the park labels are already in
-//! [`crate::work_finder::SKIP_LABELS`], which every candidate path applies.
+//! never touched; `loom:blocked` is in [`crate::work_finder::SKIP_LABELS`],
+//! which every candidate path applies, and Champion does not promote it.
+//!
+//! # Counted across the fleet (#12024)
+//!
+//! The streak compared with the threshold is this host's count **plus every
+//! peer's** count on the same fingerprint ([`fleet_streak`]): one issue took
+//! ten no-op sweeps from six hosts in 97 minutes, no host saw more than two,
+//! and the old per-host streak never tripped. Parking and releasing publish a
+//! break that resets the streak everywhere.
+//!
+//! # Never `loom:operator` (#12024)
+//!
+//! Before #12024 a human gate parked on `loom:operator`, and the daemon then
+//! removed that label itself on release. That broke the #11861 rule that only
+//! a human removes `loom:operator`, and the release re-armed the loop. The
+//! hold now parks on `loom:blocked` for every kind, and the daemon releases
+//! only that. An older hold still on `loom:operator` is moved by
+//! `loom-daemon labels migrate --holds`.
 //!
 //! The label write is the deliverable, the comment is commentary (the #9239
 //! lesson from `prless_retry::hold`): nothing is recorded as held or announced
@@ -39,10 +56,14 @@
 //!
 //! # Unparking
 //!
-//! The hold is released by the forge, not by daemon state. Any change to the
-//! fingerprint restarts the streak, and a no-op arriving for an issue this
-//! daemon already held means someone removed the park and re-offered it — it
-//! starts a fresh streak at 1 rather than re-holding immediately.
+//! The hold is released by the forge, not by daemon state: the
+//! fingerprint-change pass ([`SweepRegistry::reconcile_noop_holds`]) removes
+//! `loom:blocked` and restores `loom:issue` once anything the fingerprint
+//! covers changes (a comment, a label, a linked PR, a dependency). Any change
+//! to the fingerprint also restarts the streak, and a no-op arriving for an
+//! issue this daemon already held means someone removed the park and
+//! re-offered it — it starts a fresh streak at 1 rather than re-holding
+//! immediately.
 //!
 //! # State across restarts
 //!
@@ -52,10 +73,15 @@
 //! announced fingerprint) is mirrored to `noop-holds.json` under the logs dir
 //! ([`persist`]) and reloaded before the first count or reconciliation, so a
 //! restart cannot strand a parked issue. The park label itself is
-//! forge-visible, which is what every other host reads.
+//! forge-visible, which is what every other host reads, and since #12024 a
+//! host adopts any no-op park it finds on the forge from its park record and
+//! notice ([`adopt`]), so a hold outlives the host that applied it.
 
-use super::fingerprint::{choose_park, IssueSnapshot, ParkKind, MAX_DEPENDENCY_READS};
+use super::fingerprint::{
+    choose_park, digest, is_digest, legacy_digest, IssueSnapshot, ParkKind, MAX_DEPENDENCY_READS,
+};
 use super::*;
+use crate::sweep_registry::park_hold::{self, HoldGate};
 
 /// Marker on the one comment posted per held streak.
 pub const NOOP_HOLD_COMMENT_MARKER: &str = "<!-- loom:noop-hold (#10156) -->";
@@ -67,16 +93,29 @@ pub const NOOP_HOLD_FAILED_COMMENT_MARKER: &str =
 /// Kind marker on a real hold notice (posted only after the labels landed).
 pub const NOOP_HOLD_APPLIED_COMMENT_MARKER: &str = "<!-- loom:noop-hold-kind=hold (#10156) -->";
 
+/// Kind marker on the notice posted when the hold is released.
+pub const NOOP_HOLD_RELEASED_COMMENT_MARKER: &str =
+    "<!-- loom:noop-hold-kind=released (#10156) -->";
+
+/// Prefix of the line carrying the fingerprint digest the hold was decided on
+/// (#12024): `<!-- loom:noop-hold-fp=<digest> -->`. What lets any host adopt
+/// the hold from the forge.
+pub const NOOP_HOLD_FP_MARKER_PREFIX: &str = "<!-- loom:noop-hold-fp=";
+
 /// Bound on `gh` stderr carried into a log line or a forge notice.
 const STDERR_LIMIT: usize = 300;
 
 /// One issue's consecutive-no-op streak.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoopStreak {
-    /// Consecutive no-ops with an unchanged fingerprint.
+    /// This host's consecutive no-ops with an unchanged fingerprint (the
+    /// peers' counts are added at the threshold check, #12024).
     pub(crate) count: u32,
-    /// The fingerprint the streak is accumulating against.
+    /// The [`digest`] of the fingerprint the streak is accumulating against.
     fingerprint: String,
+    /// When this host last counted a no-op (or adopted the hold): a peer's
+    /// streak break at or after it resets the count (#12024).
+    counted_at: DateTime<Utc>,
     /// The sweep whose no-op was counted last, so the IPC report and the
     /// reaper's classification of one dispatch never count twice.
     last_sweep: Option<String>,
@@ -88,6 +127,27 @@ pub(crate) struct NoopStreak {
     failure_notice_posted: bool,
     /// When reconciliation last looked at this held streak's inputs.
     checked_at: Option<std::time::Instant>,
+    /// Adopted from the forge rather than applied here ([`adopt`], #12024):
+    /// reconciled on the slower clock and not written to the holds file.
+    adopted: bool,
+}
+
+impl NoopStreak {
+    /// A hold this host did not count itself: recovered from disk or adopted
+    /// from the forge, against the digest `fingerprint`.
+    pub(super) fn recovered(count: u32, fingerprint: String, park: ParkKind) -> Self {
+        Self {
+            count,
+            fingerprint,
+            counted_at: Utc::now(),
+            last_sweep: None,
+            park,
+            held: true,
+            failure_notice_posted: false,
+            checked_at: None,
+            adopted: false,
+        }
+    }
 }
 
 /// Minimum gap between reconciliation reads of one held issue.
@@ -108,6 +168,10 @@ pub(crate) struct NoopCooldownTable {
     streaks: HashMap<u32, NoopStreak>,
     /// Persisted holds have been reloaded into `streaks` (once per process).
     restored: bool,
+    /// The forge has been searched for no-op parks to adopt (#12024).
+    adopted: bool,
+    /// When a failed adoption listing may be retried.
+    adopt_retry_at: Option<std::time::Instant>,
     /// Last serialized holds file contents (skips redundant rewrites).
     persisted: String,
 }
@@ -134,6 +198,8 @@ pub(crate) enum NoopHoldOutcome {
     VetoedClosed,
     /// Label flips are disabled (hermetic fixture).
     VetoedNoForge,
+    /// The issue is `loom:frozen` (#11743): nothing was written.
+    VetoedFrozen,
     /// The write did not land and could not be confirmed; the issue is still
     /// a dispatch candidate.
     LabelWriteFailed,
@@ -315,12 +381,15 @@ impl SweepRegistry {
             self.persist_noop_holds();
             return;
         }
-        let fingerprint = snapshot.fingerprint();
+        let fingerprint = digest(&snapshot.fingerprint());
         let park = choose_park(reason, Some(&snapshot));
         let prev = self.noop_cooldown.streaks.get(&issue);
+        // #12024: a peer parked or released the issue since this host last
+        // counted it, so this host's streak is broken too.
+        let broken = prev.is_some_and(|p| self.peer_broke_noop_streak(issue, p.counted_at));
         // A held streak that is being no-op'd again means the park was lifted
         // and the issue re-offered: a fresh streak, not an instant re-hold.
-        let continues = prev.is_some_and(|p| !p.held && p.fingerprint == fingerprint);
+        let continues = !broken && prev.is_some_and(|p| !p.held && p.fingerprint == fingerprint);
         let count = if continues {
             prev.map_or(1, |p| p.count.saturating_add(1))
         } else {
@@ -331,22 +400,29 @@ impl SweepRegistry {
             issue,
             NoopStreak {
                 count,
-                fingerprint,
+                fingerprint: fingerprint.clone(),
+                counted_at: Utc::now(),
                 last_sweep: sweep_id.map(str::to_owned),
                 park,
                 held: false,
                 failure_notice_posted,
                 checked_at: None,
+                adopted: false,
             },
         );
+        // #12024: the streak is the fleet's. Advertise this host's own count,
+        // then add every peer's count on the same fingerprint.
+        self.publish_noop_streak(issue, count, &fingerprint);
+        let peers = self.peer_noop_streak(issue, &fingerprint);
+        let fleet = count.saturating_add(peers);
         log::info!(
-            "sweep_registry: issue #{issue} no-op streak {count}/{threshold} with an unchanged \
-             fingerprint (#10156)"
+            "sweep_registry: issue #{issue} no-op streak {fleet}/{threshold} with an unchanged \
+             fingerprint ({count} on this host, {peers} on peers) (#10156, #12024)"
         );
-        if count < threshold {
+        if fleet < threshold {
             return;
         }
-        let outcome = self.apply_noop_hold(issue, count, park, reason, &snapshot);
+        let outcome = self.apply_noop_hold(issue, fleet, park, reason, &fingerprint);
         if let Some(s) = self.noop_cooldown.streaks.get_mut(&issue) {
             match outcome {
                 NoopHoldOutcome::Applied => {
@@ -354,11 +430,14 @@ impl SweepRegistry {
                     s.checked_at = Some(std::time::Instant::now());
                 }
                 NoopHoldOutcome::LabelWriteFailed => s.failure_notice_posted = true,
-                NoopHoldOutcome::VetoedClosed => {
+                NoopHoldOutcome::VetoedClosed | NoopHoldOutcome::VetoedFrozen => {
                     self.noop_cooldown.streaks.remove(&issue);
                 }
                 NoopHoldOutcome::VetoedNoForge => {}
             }
+        }
+        if outcome == NoopHoldOutcome::Applied {
+            self.break_fleet_noop_streak(issue);
         }
         self.persist_noop_holds();
     }
@@ -368,23 +447,30 @@ impl SweepRegistry {
     /// A parked issue is excluded from dispatch, so it can never no-op again
     /// to notice a change; this pass reads each held issue (at most every
     /// [`RECONCILE_INTERVAL`], [`RECONCILE_PER_TICK`] per call) and compares
-    /// its fingerprint, ignoring the hold's own labels, against the one the
-    /// park was decided on. A change removes only this hold's labels, returns
-    /// the issue to `loom:issue`, and drops the streak so the next no-op starts
-    /// at 1. Fails open: an unreadable forge leaves the hold in place.
+    /// its fingerprint, ignoring the hold's own label, against the one the
+    /// park was decided on. A change removes only `loom:blocked` (never
+    /// `loom:operator`, #12024), returns the issue to `loom:issue`, and drops
+    /// the streak so the next no-op starts at 1. Fails open: an unreadable
+    /// forge leaves the hold in place.
     pub(crate) fn reconcile_noop_holds(&mut self, now: std::time::Instant) {
         if self.config.skip_label_flip {
             return;
         }
         self.restore_noop_holds();
+        self.adopt_forge_noop_holds();
         let mut due: Vec<u32> = self
             .noop_cooldown
             .streaks
             .iter()
             .filter(|(_, s)| {
+                let interval = if s.adopted {
+                    adopt::ADOPTED_RECONCILE_INTERVAL
+                } else {
+                    RECONCILE_INTERVAL
+                };
                 s.held
                     && s.checked_at
-                        .is_none_or(|t| now.saturating_duration_since(t) >= RECONCILE_INTERVAL)
+                        .is_none_or(|t| now.saturating_duration_since(t) >= interval)
             })
             .map(|(issue, _)| *issue)
             .collect();
@@ -425,7 +511,7 @@ impl SweepRegistry {
             self.noop_cooldown.streaks.remove(&issue);
             return;
         }
-        if snapshot.fingerprint_ignoring(ours) == announced {
+        if digest(&snapshot.fingerprint_ignoring(ours)) == announced {
             return;
         }
         // #11480: the shared veto, less the hold's own labels being lifted.
@@ -444,11 +530,13 @@ impl SweepRegistry {
             return;
         }
         self.noop_cooldown.streaks.remove(&issue);
+        self.break_fleet_noop_streak(issue);
         log::info!("sweep_registry: no-op hold for #{issue} released: inputs changed (#10156)");
         let body = format!(
-            "{NOOP_HOLD_COMMENT_MARKER}\n<!-- loom:noop-hold-kind=released (#10156) -->\n\
+            "{NOOP_HOLD_COMMENT_MARKER}\n{NOOP_HOLD_RELEASED_COMMENT_MARKER}\n\
              **Hold released.** A comment, label, linked PR or dependency changed since this \
-             issue was held, so {} was removed{} and the no-op count restarts (Issue #10156).",
+             issue was held, so {} was removed{} and the no-op count restarts across the \
+             fleet (Issue #10156, #12024).",
             ours.join(" + "),
             if restore {
                 " and `loom:issue` restored"
@@ -473,15 +561,16 @@ impl SweepRegistry {
             .map_err(|(_, detail)| detail)
     }
 
-    /// Park `issue` and say why. Never touches `loom:building` or a priority
-    /// label.
+    /// Park `issue` and say why: the body park record, then `loom:blocked`,
+    /// then the notice. Never touches `loom:building`, a priority label or
+    /// `loom:operator` (#12024).
     fn apply_noop_hold(
         &self,
         issue: u32,
         count: u32,
         park: ParkKind,
         reason: Option<&str>,
-        snapshot: &IssueSnapshot,
+        announced: &str,
     ) -> NoopHoldOutcome {
         if self.config.skip_label_flip {
             return NoopHoldOutcome::VetoedNoForge;
@@ -490,13 +579,19 @@ impl SweepRegistry {
             return NoopHoldOutcome::VetoedClosed;
         }
         let labels = park.labels();
-        let announced = snapshot.fingerprint();
         let already_noticed = self
             .noop_cooldown
             .streaks
             .get(&issue)
             .is_some_and(|s| s.failure_notice_posted);
-        if let Err(cause) = self.write_park_labels(issue, labels) {
+        // #12024: the park record first (the #10161 shape every daemon hold
+        // uses), so the label never lands without its reason.
+        let written = match self.record_daemon_hold(issue, park_hold::NOOP_HOLD_REASON) {
+            Ok(HoldGate::Proceed) => self.write_park_labels(issue, labels),
+            Ok(HoldGate::Frozen) => return NoopHoldOutcome::VetoedFrozen,
+            Err(cause) => Err(cause),
+        };
+        if let Err(cause) = written {
             log::error!(
                 "sweep_registry: no-op hold for #{issue} FAILED to apply {labels:?} after {count} \
                  consecutive no-ops — NOT parked, still a dispatch candidate (#10156): {cause}"
@@ -517,27 +612,27 @@ impl SweepRegistry {
             return NoopHoldOutcome::LabelWriteFailed;
         }
         let why = reason.map_or_else(String::new, |r| format!("Last reported reason: {r}\n\n"));
-        let (needs, unparks) = match park {
-            ParkKind::Blocked => (
-                "its remaining work is blocked on dependencies",
-                "Close or complete the dependencies it names, then flip `loom:blocked` back to \
-                 `loom:issue`",
-            ),
-            ParkKind::HumanGate => (
-                "its remaining work is a human gate (or the sweeps could not say what else it \
-                 waits on)",
-                "Decide it, then remove `loom:operator` and add `loom:issue` back",
-            ),
+        let needs = match park {
+            ParkKind::Blocked => "its remaining work is blocked on dependencies",
+            ParkKind::HumanGate => {
+                "its remaining work looks like a human decision (or the sweeps could not say \
+                 what else it waits on)"
+            }
         };
         let body = format!(
             "{NOOP_HOLD_COMMENT_MARKER}\n{NOOP_HOLD_APPLIED_COMMENT_MARKER}\n\
-             **Held after {count} consecutive no-op sweeps.** Each of the last {count} sweeps \
-             concluded there was nothing to do, and nothing this issue depends on changed in \
-             between — {needs}. It now carries {} instead of being offered again \
-             (Issue #10156). A priority label (`loom:important` / `loom:very-important`) does \
-             not exempt an issue from this hold and has been left in place.\n\n{why}Fingerprint compared: `{announced}`\n\n\
-             **What unparks it**: {unparks}. Any new comment, label change, linked-PR change or \
-             dependency state change also restarts the count from zero.",
+             {NOOP_HOLD_FP_MARKER_PREFIX}{announced} -->\n\
+             **Held after {count} consecutive no-op sweeps across the fleet.** Each of the last \
+             {count} sweeps concluded there was nothing to do, and nothing this issue depends on \
+             changed in between — {needs}. It now carries {} with a `no-op hold` park record \
+             instead of being offered again (Issue #10156, #12024). A priority label \
+             (`loom:important` / `loom:very-important`) does not exempt an issue from this hold \
+             and has been left in place.\n\n{why}Fingerprint digest compared: `{announced}`\n\n\
+             **What unparks it**: the daemon releases this hold by itself, removing \
+             `loom:blocked` and restoring `loom:issue`, as soon as a comment, label, linked PR \
+             or dependency changes — so answering the question, or closing the dependency, is \
+             enough. Removing `loom:blocked` by hand also unparks it, and the no-op count \
+             restarts from zero either way.",
             labels.join(" + "),
         );
         self.post_noop_hold_comment(issue, &body);
@@ -743,6 +838,8 @@ impl SweepRegistry {
     }
 }
 
+mod adopt;
+pub use adopt::standing_noop_hold_fingerprint;
 mod persist;
 
 #[cfg(test)]
