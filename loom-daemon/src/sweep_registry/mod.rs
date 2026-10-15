@@ -1140,7 +1140,23 @@ impl SweepRegistry {
     /// and the workspace pool call this once at provision time with the
     /// resolved env > config > default value, mirroring
     /// [`set_quarantine_config`](Self::set_quarantine_config).
-    pub fn set_dispatch_backoff_config(&mut self, config: DispatchBackoffConfig) {
+    ///
+    /// A zero `base` or `max` is clamped to one second with a warning
+    /// (#11952): a zero window on a ladder ad is the old encoding of a
+    /// fleet-wide fast-fail streak break, and the resolver already refuses a
+    /// zero from env or config, so only a hand-built config reaches this.
+    pub fn set_dispatch_backoff_config(&mut self, mut config: DispatchBackoffConfig) {
+        let floor = Duration::from_secs(1);
+        if config.base < floor || config.max < floor {
+            log::warn!(
+                "sweep_registry: dispatch backoff base={}s max={}s clamped to at least 1s — a \
+                 zero window would read as a fleet-wide fast-fail streak break (#11952)",
+                config.base.as_secs(),
+                config.max.as_secs()
+            );
+            config.base = config.base.max(floor);
+            config.max = config.max.max(config.base);
+        }
         self.dispatch_backoff_config = config;
     }
 
