@@ -193,7 +193,8 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 );
                 self.resolved_launch = Some(
                     crate::role_tick_telemetry::ResolvedLaunch::new(&model, &effort)
-                        .with_preference(admission.as_ref().and_then(|a| a.preference.clone())),
+                        .with_preference(admission.as_ref().and_then(|a| a.preference.clone()))
+                        .with_prompt_tree(&self.workspace_root),
                 );
                 run_role_with_timeout(
                     &script,

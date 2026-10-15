@@ -1253,6 +1253,13 @@ pub struct RoleTickOutcomeRecord {
     /// optional unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<RoleTickActions>,
+    /// The checkout this tick's session read its `/loom:<role>` prompt from,
+    /// as it stood at launch (#11989): its commit, the Loom release installed
+    /// in it, how far it is behind `origin/<default>`, and whether HEAD was
+    /// on a branch. Absent for a tick that never resolved a launch and on
+    /// records written before #11989 — additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<crate::role_tick_telemetry::prompt_tree::PromptTree>,
     /// What ran the tick (#11906): absent for a role-runner tick, `"step"`
     /// ([`ROLE_TICK_SOURCE_STEP`]) for a step-engine step, so a "role ticks
     /// still running" query never counts steps.

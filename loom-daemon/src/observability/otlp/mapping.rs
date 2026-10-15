@@ -18,6 +18,7 @@ mod ops;
 mod outcome_facts;
 mod pass;
 mod pick_decision;
+mod prompt_tree;
 mod role_draw;
 mod session_output;
 mod token_ranking;
@@ -342,6 +343,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
             attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
+            // #11989: the prompt tree the session ran.
+            attributes.extend(prompt_tree::attributes(r.prompt.as_ref()));
             // #11906: a step-engine step, never a role-runner tick.
             if let Some(source) = &r.source {
                 attributes.push(kv_string("loom.role_tick.source", source.clone()));
