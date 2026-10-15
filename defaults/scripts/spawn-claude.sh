@@ -1385,15 +1385,12 @@ if [[ "$_CONTAINMENT_CRED_PROXY" != "1" && -f "$_mcp_config_lib" ]]; then
             # repeated spawns overwrite one file (the script exec's claude, so
             # no trap could ever delete a per-spawn mktemp file). Written
             # atomically: mktemp in the same dir, then mv -f.
-            _mcp_cfg_key="$(printf '%s|%s|%s|%s' "$WORKSPACE" "$_sh_persona" "$_sh_socket" "$_sh_command" | cksum | cut -d' ' -f1)"
-            _mcp_session_config="${TMPDIR:-/tmp}/loom-mcp-config-$(id -u)-${_mcp_cfg_key}.json"
-            _mcp_session_config_tmp="$(mktemp "${_mcp_session_config}.XXXXXX" 2>/dev/null || mktemp)"
-            if loom_mcp_emit_config "$WORKSPACE" "$_sh_socket" "$_sh_persona" "$_sh_command" >"$_mcp_session_config_tmp" 2>/dev/null \
-                && mv -f "$_mcp_session_config_tmp" "$_mcp_session_config"; then
+            _mcp_session_config="${TMPDIR:-/tmp}/loom-mcp-config-$(id -u)-$(printf '%s|%s|%s|%s' "$WORKSPACE" "$_sh_persona" "$_sh_socket" "$_sh_command" | cksum | cut -d' ' -f1).json"
+            if loom_mcp_emit_config "$WORKSPACE" "$_sh_socket" "$_sh_persona" "$_sh_command" >"$_mcp_session_config.$$" 2>/dev/null && mv -f "$_mcp_session_config.$$" "$_mcp_session_config"; then
                 PASSTHROUGH_ARGS+=(--mcp-config "$_mcp_session_config")
                 log_info "spawn-claude: injected safehouse MCP server (persona=$_sh_persona, socket=$_sh_socket, config=$_mcp_session_config)"
             else
-                rm -f "$_mcp_session_config_tmp"
+                rm -f "$_mcp_session_config.$$"
                 log_warn "spawn-claude: failed to generate safehouse MCP config; skipping injection (loom MCP unaffected)."
             fi
         fi
