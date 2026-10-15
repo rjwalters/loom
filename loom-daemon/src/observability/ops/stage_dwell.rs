@@ -602,17 +602,18 @@ pub struct GhStageFetcher;
 /// `loom.forge.calls` (the step engine's provider has its own).
 pub const EVENTS_CALLER: &str = "stage_dwell.events";
 
-pub(in crate::observability) fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
-    let CmdOutcome::Ran(output) = GhInvocation::new(
-        Operation::new("api.rest"),
-        AccessIntent::Read,
-        GhTarget::None,
-        GH_TIMEOUT,
-    )
-    .read_class(crate::gh_invocation::ReadClass::Observability)
-    .args(["api", path])
-    .current_dir(root)
-    .run() else {
+/// The `github.operation` of stage-dwell's `pulls/{n}` read.
+pub const MERGED_AT_OP: &str = "stage_dwell.merged_at";
+
+/// One Observability `gh api` GET of `path` in `root`, as JSON, named
+/// `operation` (never the generic `api.rest`: 2026-10-15, the fleet.state
+/// history reads were invisible in the writer's spend under that name).
+pub(in crate::observability) fn gh_json(
+    root: &Path,
+    operation: &'static str,
+    path: &str,
+) -> Option<serde_json::Value> {
+    let CmdOutcome::Ran(output) = gh_json_invocation(root, operation, path).run() else {
         return None;
     };
     if !output.status.success() {
@@ -620,6 +621,18 @@ pub(in crate::observability) fn gh_json(root: &Path, path: &str) -> Option<serde
         return None;
     }
     serde_json::from_slice(&output.stdout).ok()
+}
+
+/// The invocation [`gh_json`] runs (split out so a test can inspect it).
+pub(in crate::observability) fn gh_json_invocation(
+    root: &Path,
+    operation: &'static str,
+    path: &str,
+) -> GhInvocation {
+    GhInvocation::new(Operation::new(operation), AccessIntent::Read, GhTarget::None, GH_TIMEOUT)
+        .read_class(crate::gh_invocation::ReadClass::Observability)
+        .args(["api", path])
+        .current_dir(root)
 }
 
 /// The latest `labeled` time per label in one events page.
@@ -657,7 +670,7 @@ impl StageFetcher for GhStageFetcher {
     }
 
     fn merged_at(&mut self, root: &Path, slug: &str, number: u32) -> Option<Option<DateTime<Utc>>> {
-        let pull = gh_json(root, &format!("repos/{slug}/pulls/{number}"))?;
+        let pull = gh_json(root, MERGED_AT_OP, &format!("repos/{slug}/pulls/{number}"))?;
         Some(pull["merged_at"].as_str().and_then(parse_time))
     }
 }
