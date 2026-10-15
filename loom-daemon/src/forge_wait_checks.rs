@@ -34,7 +34,7 @@
 //! `--timeout 0` takes exactly one poll (a snapshot). A RED is reported as
 //! soon as a failing check is terminal, without waiting for the rest —
 //! unless `--settle-red` (#12011): then RED only once nothing observed is
-//! pending and every required context has registered; a failure seen while
+//! pending (the required set does not hold it back, #12022); a failure seen while
 //! the run is still going keeps the wait pending (→ `TIMEOUT`, with a
 //! `wait-checks: --settle-red: already failing: …` stderr note). The Judge
 //! uses it before a changes-requested verdict, which must name the failing
@@ -468,9 +468,11 @@ fn poll(
     st.zero_polls = 0;
 
     // Required contexts are looked up only when a verdict needs them.
-    // `--settle-red` turns a failure into RED only against a known set.
-    let needs_required = opts.required_only
-        || (rollup.pending.is_empty() && (opts.settle_red || rollup.failing.is_empty()));
+    // A failure needs no required set, `--settle-red` included (#12022): it
+    // waits only on observed pending checks, so a failed lookup (#11837)
+    // cannot hide a finished red.
+    let needs_required =
+        opts.required_only || (rollup.pending.is_empty() && rollup.failing.is_empty());
     let required = if needs_required {
         resolve_required(reads, st)?
     } else {
@@ -498,7 +500,7 @@ fn poll(
     } else {
         verdict::decide(&rollup, required.as_deref(), opts.required_only)
     };
-    st.early_red = if matches!(decision, Decision::Pending(_)) {
+    st.early_red = if opts.settle_red && matches!(decision, Decision::Pending(_)) {
         rollup.failing.clone()
     } else {
         Vec::new()
