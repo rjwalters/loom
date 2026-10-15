@@ -28,7 +28,7 @@
 3655 loom-daemon/src/cli/status_render.rs
 1913 loom-daemon/src/credential_preflight.rs
 1840 loom-daemon/src/daemon_install_state.rs
-1222 loom-daemon/src/daemon_service.rs
+1154 loom-daemon/src/daemon_service.rs
 1575 loom-daemon/src/epic_supervisor.rs
 1108 loom-daemon/src/fleet/add_worker.rs
 1362 loom-daemon/src/fleet/add_worker/tests.rs

@@ -791,6 +791,15 @@ pub trait WorkDispatcher {
         HashMap::new()
     }
 
+    /// What the pre-filter asks (#12025): [`open_pr_blocked`](Self::open_pr_blocked)
+    /// plus whether a listing was read at all. An
+    /// [`OpenPrAnswer::Unreadable`](open_pr_prefilter::OpenPrAnswer::Unreadable)
+    /// workspace's unverified candidates are not dispatched this tick (fail
+    /// closed). Defaults to `NotAsked(open_pr_blocked(..))`: the pre-#12025 path.
+    fn open_pr_answer(&self, candidates: &[u32]) -> open_pr_prefilter::OpenPrAnswer {
+        open_pr_prefilter::OpenPrAnswer::NotAsked(self.open_pr_blocked(candidates))
+    }
+
     /// The landed pre-filter (#11853, [`landed_prefilter`]): the issues in
     /// `candidates` that are still open although a PR closing them merged,
     /// each mapped to that PR. `open_pr` are the workspace's candidates the
