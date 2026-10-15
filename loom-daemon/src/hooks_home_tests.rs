@@ -2,6 +2,7 @@
 //! 2am#4501: the sessions a daemon spawns run the hooks of its own release.
 
 use super::*;
+use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 
 /// A `.tar.zst` of `(path, body, mode)` entries, packed the way `build.rs`
@@ -155,30 +156,237 @@ fn resolve_without_a_home_is_none() {
     assert_eq!(resolve(None, None, &sample(), "1.2.3"), None);
 }
 
-/// The real embedded payload carries what the wired hooks execute and
-/// source: if a hook moved or a library it sources fell out of the payload,
-/// the session would fall back to a stale checkout without anyone noticing.
+/// Every mode bit `walk` sees under `root` that grants group/other write.
+fn shared_write(root: &Path) -> Vec<String> {
+    let mut bad = Vec::new();
+    walk(root, &mut |path, meta| {
+        if !meta.file_type().is_symlink() && meta.permissions().mode() & 0o022 != 0 {
+            bad.push(format!("{} {:o}", path.display(), meta.permissions().mode()));
+        }
+        true
+    });
+    bad
+}
+
+/// The source tree this crate was built from.
+fn source_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+}
+
+/// The hooks `provision_loom_hooks` wires: its `_PHOOK_NAMES` array, plus
+/// `presence-beat.sh`, which `_phook_presence_apply` wires separately.
+fn wired_hook_names() -> BTreeSet<String> {
+    let text = std::fs::read_to_string(source_root().join("scripts/install/provision-hooks.sh"))
+        .expect("read provision-hooks.sh");
+    let block = text
+        .split("_PHOOK_NAMES=(")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("provision-hooks.sh has a _PHOOK_NAMES=( ... ) array");
+    let mut names: BTreeSet<String> = block
+        .split_whitespace()
+        .filter(|w| !w.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    names.insert("presence-beat.sh".to_string());
+    names
+}
+
+/// The `scripts/lib/*.sh` files the shipped hooks reach, transitively: any
+/// library a hook (or an already-reached library) names. Matching is by
+/// file name, so it errs toward asserting more, never less.
+fn reached_libraries() -> BTreeSet<String> {
+    let lib_dir = source_root().join("defaults/scripts/lib");
+    let libs: Vec<String> = std::fs::read_dir(&lib_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sh"))
+        .collect();
+    let mut todo: Vec<PathBuf> = std::fs::read_dir(source_root().join("defaults/hooks"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sh"))
+        .collect();
+    let mut seen = BTreeSet::new();
+    while let Some(file) = todo.pop() {
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        for lib in &libs {
+            if text.contains(lib.as_str()) && seen.insert(lib.clone()) {
+                todo.push(lib_dir.join(lib));
+            }
+        }
+    }
+    seen
+}
+
+/// The real embedded payload carries every hook `provision_loom_hooks` wires
+/// and every library they source. If one moved or fell out of the payload,
+/// sessions would quietly fall back to a stale checkout, so the lists are
+/// derived from the installer and the hooks themselves, never hand-kept.
 #[test]
 fn the_embedded_payload_carries_the_wired_hooks_and_their_libraries() {
     let tmp = tempfile::tempdir().unwrap();
     let archive = crate::init::payload::embedded_archive();
-    let dir = materialize(tmp.path(), archive, env!("CARGO_PKG_VERSION")).unwrap();
-    for rel in [
-        "defaults/hooks/guard-destructive.sh",
-        "defaults/hooks/guard-destructive-generic.sh",
-        "defaults/hooks/guard-loom-workflow.sh",
-        "defaults/hooks/guard-worktree-paths.sh",
-        "defaults/hooks/guard-mcp-tools.sh",
-        "defaults/hooks/guard-uncommitted-work.sh",
-        "defaults/hooks/roll-pause.sh",
-        "defaults/hooks/gh-front-env.sh",
-        "defaults/hooks/hook-wiring.sh",
-        "defaults/scripts/lib/locate-daemon-bin.sh",
-        "defaults/scripts/lib/config-resolver.sh",
+    let dir = materialize(&tmp.path().join("hh"), archive, env!("CARGO_PKG_VERSION")).unwrap();
+
+    let wired = wired_hook_names();
+    assert!(wired.len() >= 11, "too few wired hooks parsed: {wired:?}");
+    for name in &wired {
+        let path = dir.join("defaults/hooks").join(name);
+        let mode = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("wired hook {name} missing from the hooks home: {e}"))
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "wired hook {name} is not executable");
+    }
+    // Every hook script the source tree ships, wired or exec'd by one.
+    for entry in std::fs::read_dir(source_root().join("defaults/hooks")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|x| x == "sh") {
+            let name = path.file_name().unwrap();
+            assert!(
+                dir.join("defaults/hooks").join(name).is_file(),
+                "{} missing from the hooks home",
+                name.to_string_lossy()
+            );
+        }
+    }
+    let libs = reached_libraries();
+    for lib in [
+        "locate-daemon-bin.sh",
+        "config-resolver.sh",
+        "canonical-path.sh",
+        "installed-file-guard.sh",
+        "default-branch.sh",
+        "worktree-root.sh",
     ] {
-        assert!(dir.join(rel).is_file(), "{rel} missing from the hooks home");
+        assert!(libs.contains(lib), "{lib} not found by the derivation: {libs:?}");
+    }
+    for lib in &libs {
+        assert!(
+            dir.join("defaults/scripts/lib").join(lib).is_file(),
+            "library {lib} missing from the hooks home"
+        );
     }
     assert!(!dir.join("defaults/scripts/tests").exists());
+    assert_eq!(shared_write(&dir), Vec::<String>::new());
+}
+
+const UMASK_CHILD_ENV: &str = "LOOM_HOOKS_HOME_TEST_UMASK_BASE";
+
+/// Run by [`a_permissive_umask_leaves_no_shared_write_bit`] in its own
+/// process, because the umask is process-wide.
+#[test]
+#[ignore = "run in a child process by a_permissive_umask_leaves_no_shared_write_bit"]
+fn umask_child() {
+    let Ok(base) = std::env::var(UMASK_CHILD_ENV) else {
+        return;
+    };
+    // SAFETY: umask only sets this (child) process's file-creation mask.
+    unsafe {
+        libc::umask(0);
+    }
+    let loose = archive(&[
+        ("defaults/hooks/guard-destructive.sh", "#!/bin/bash\n", 0o777),
+        ("defaults/hooks/nested/deeper/x.sh", "#!/bin/bash\n", 0o775),
+        ("defaults/scripts/lib/a.sh", "# lib\n", 0o666),
+    ]);
+    materialize(Path::new(&base), &loose, "1.2.3").unwrap();
+}
+
+#[test]
+fn a_permissive_umask_leaves_no_shared_write_bit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("share/hooks-home");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hooks_home::tests::umask_child",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(UMASK_CHILD_ENV, &base)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the umask-0 child failed: {status}");
+    let copies: Vec<PathBuf> = std::fs::read_dir(&base)
+        .expect("the child unpacked under the base")
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(std::fs::metadata(&base).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::metadata(&copies[0]).unwrap().permissions().mode() & 0o777, 0o700);
+    assert!(copies[0]
+        .join("defaults/hooks/nested/deeper/x.sh")
+        .is_file());
+    assert_eq!(shared_write(&tmp.path().join("share")), Vec::<String>::new());
+    assert!(is_trusted(&copies[0]));
+}
+
+#[test]
+fn a_group_writable_copy_is_unpacked_again_not_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("hooks-home");
+    let dir = materialize(&base, &sample(), "1.2.3").unwrap();
+    let hooks = dir.join("defaults/hooks");
+    std::fs::write(hooks.join("guard-destructive.sh"), "planted").unwrap();
+    std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(!is_trusted(&dir));
+
+    assert_eq!(materialize(&base, &sample(), "1.2.3").unwrap(), dir);
+    assert_eq!(
+        std::fs::read_to_string(hooks.join("guard-destructive.sh")).unwrap(),
+        "#!/bin/bash\nexit 0\n",
+        "the planted hook was replaced by the payload's"
+    );
+    assert!(is_trusted(&dir));
+}
+
+#[test]
+fn a_symlink_under_the_key_is_replaced_by_a_real_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("hooks-home");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(elsewhere.join("defaults/hooks")).unwrap();
+    std::fs::write(elsewhere.join(COMPLETE_MARKER), "x").unwrap();
+    std::fs::create_dir_all(&base).unwrap();
+    let dest = base.join(key(&sample(), "1.2.3"));
+    std::os::unix::fs::symlink(&elsewhere, &dest).unwrap();
+    assert!(!is_trusted(&dest));
+
+    let dir = materialize(&base, &sample(), "1.2.3").unwrap();
+    assert!(!dir.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(dir.join("defaults/hooks/guard-destructive.sh").is_file());
+    assert!(elsewhere.join("defaults/hooks").is_dir(), "the link target is left alone");
+}
+
+#[test]
+fn a_loose_base_is_tightened_to_0700() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("hooks-home");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+    materialize(&base, &sample(), "1.2.3").unwrap();
+    assert_eq!(std::fs::metadata(&base).unwrap().permissions().mode() & 0o777, 0o700);
+}
+
+#[test]
+fn reuse_refreshes_the_copy_so_pruning_keys_on_last_use() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("hooks-home");
+    let dir = materialize(&base, &sample(), "1.2.3").unwrap();
+    let old = SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+    std::fs::File::open(&dir)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    materialize(&base, &sample(), "1.2.3").unwrap();
+    let age = SystemTime::now()
+        .duration_since(std::fs::metadata(&dir).unwrap().modified().unwrap())
+        .unwrap_or_default();
+    assert!(age < Duration::from_secs(3600), "mtime not refreshed: {age:?} old");
 }
 
 #[test]
