@@ -504,130 +504,32 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let credential_preflight = credential_preflight::attach_pool(github_app_preflight.report);
     credential_preflight::loom_ui::startup(&credential_preflight); // #11295
 
-    // Per-owner managed-repo credentials (#5401). The GitHub App mechanism
-    // above mints exactly ONE installation token, keyed on this daemon's
-    // *workspace root* owner (`github_app_owner_repo`) and delivered via the
-    // process-global `GH_CONFIG_DIR`. An installation token is scoped to its
-    // own installation's repos, so every managed repo owned by a DIFFERENT
-    // account/org (the reporter's fleet spans `rjwalters/*` and `2AMLogic/*`)
-    // is unreachable for private data under it — public reads succeed
-    // anonymously while private reads and writes silently 404, which is what
-    // made a wrong-owner fleet look uniformly healthy (#5401's evidence).
+    // Per-owner managed-repo credentials (#5401). The App preflight above
+    // mints ONE installation token, for the workspace-root owner; every
+    // managed repo owned by another account/org needs its own, published into
+    // a per-owner `GH_CONFIG_DIR` and registered against its checkout roots
+    // (`credential_preflight::cross_owner`). Only when the App is the active
+    // credential this run; a single-owner fleet plans nothing.
     //
-    // The fix: mint a SECOND (third, …) installation token — one per distinct
-    // owner among the managed repos — and publish each into its own per-owner
-    // `GH_CONFIG_DIR` (reusing #4458's tested delivery path), registering
-    // every cross-owner checkout root against it so the daemon's per-repo
-    // `gh`/`git` call sites (`credential_preflight::apply_gh_config_for_root`)
-    // select the right credential per child. The `mint(owner_repo)` machinery
-    // already resolves the correct installation per owner/repo; it was simply
-    // never called per owner before now.
-    //
-    // Only runs when the App mechanism is actually the active credential this
-    // run (`minted.is_some()`) — an ambient `gh` auth / PAT host is
-    // not subject to the single-installation limit. A single-owner fleet
-    // yields no plans, registers nothing, and is byte-identical to pre-#5401.
-    // Each established plan is registered into
-    // `credential_preflight::register_owner_refresh_source` (#6171), the
-    // shared registry the refresh task below re-reads every tick — rather
-    // than a `Vec` captured once here — so an owner discovered dynamically
-    // after startup (via `force_refresh_owner_credential`'s 404-recovery
-    // path) is picked up by the SAME periodic freshness tick as one
-    // established here, with no separate task to spawn or track.
+    // #11957: a startup mint that fails (a timeout on a saturated host) skips
+    // this pass, and `cross_owner_retry` makes the primary refresh tick below
+    // run it once its own mint succeeds, then with bounded backoff while any
+    // owner still fails — instead of leaving every cross-owner root on the
+    // root owner's credential, refused by the write-scope gate, until restart.
+    let mut cross_owner_retry =
+        credential_preflight::cross_owner::CrossOwnerRetry::after_startup(None);
     if let (Some(root_owner_repo), Some(script_path), true) = (
         &github_app_owner_repo,
         &github_app_script,
         github_app_preflight.minted.is_some(),
     ) {
-        let root_owner = credential_preflight::owner_of_nwo(root_owner_repo).to_string();
-        let cross_owner_registry =
-            loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
-        let managed: Vec<(std::path::PathBuf, String)> = cross_owner_registry
-            .effective_roots(&sweep_workspace)
-            .into_iter()
-            .filter_map(|root| {
-                credential_preflight::nwo_from_git_remote(&root).map(|nwo| (root, nwo))
-            })
-            .collect();
-        let plans = credential_preflight::plan_cross_owner_credentials(&root_owner, &managed);
-        if !plans.is_empty() {
-            let minter = credential_preflight::RealGithubAppMinter {
-                script_path: script_path.clone(),
-                cwd: sweep_workspace.clone(),
-            };
-            for plan in plans {
-                let owner_dir = credential_preflight::github_app_gh_config_dir_for_owner(
-                    &sweep_workspace,
-                    &plan.owner,
-                );
-                let repo = &plan.representative_owner_repo;
-                match credential_preflight::GithubAppMinter::mint(&minter, repo) {
-                    ref outcome @ credential_preflight::GithubAppOutcome::Minted {
-                        ref installation_id,
-                        ref app_id,
-                        ..
-                    } => match credential_preflight::publish_outcome(&owner_dir, outcome, repo) {
-                        Ok(()) => {
-                            for root in &plan.roots {
-                                credential_preflight::register_root_gh_config_dir(root, &owner_dir);
-                            }
-                            // #5431: also register the owner slug so call sites
-                            // that target the repo by `--repo <owner/repo>`
-                            // (fleet::drain) or an `owner/repo`-in-path `gh api`
-                            // (telemetry::visibility) — with no checkout-root
-                            // `current_dir` to key off — select this owner's
-                            // credential too.
-                            credential_preflight::register_owner_gh_config_dir(
-                                &plan.owner,
-                                &owner_dir,
-                            );
-                            // #6171: also register this owner as a periodic
-                            // refresh source — see the comment on the
-                            // registration loop above.
-                            credential_preflight::register_owner_refresh_source(
-                                &plan.representative_owner_repo,
-                                &owner_dir,
-                            );
-                            log::info!(
-                                "credential_preflight: per-owner github-app credential established \
-                                 for {} ({} managed repo(s), app {app_id} installation \
-                                 {installation_id}) — those cross-owner repos are now reachable \
-                                 (#5401)",
-                                plan.owner,
-                                plan.roots.len()
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "credential_preflight: minted a per-owner github-app token for {} \
-                                 but could not publish it to {} ({e}); its {} managed repo(s) \
-                                 remain unreachable — #5401",
-                                plan.owner,
-                                owner_dir.display(),
-                                plan.roots.len()
-                            );
-                        }
-                    },
-                    credential_preflight::GithubAppOutcome::Error(reason) => {
-                        log::warn!(
-                            "credential_preflight: could not mint a per-owner github-app token for \
-                             {} ({reason}); its {} managed repo(s) ({:?}) remain unreachable — the \
-                             app may not be installed on {}'s account/org (public reads may still \
-                             work; private reads and writes will 404) — #5401",
-                            plan.owner,
-                            plan.roots.len(),
-                            plan.roots,
-                            plan.owner
-                        );
-                    }
-                    credential_preflight::GithubAppOutcome::NotConfigured => {
-                        // Unreachable in practice: `minted.is_some()`
-                        // above already proved the app is configured. Treat as
-                        // a no-op rather than a failure.
-                    }
-                }
-            }
-        }
+        let pass = credential_preflight::cross_owner::establish_for_workspace(
+            &sweep_workspace,
+            root_owner_repo,
+            script_path,
+        );
+        cross_owner_retry =
+            credential_preflight::cross_owner::CrossOwnerRetry::after_startup(Some(&pass));
     }
 
     // Fleet-store sync (#9596). HERE, and not earlier or later, for two hard
@@ -672,6 +574,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         let config_dir = github_app_config_dir.clone();
         let mut current_token = github_app_preflight.minted.map(|m| m.token);
         let mut config_dir_active = github_app_gh_config_dir_active;
+        let (pass_workspace, pass_script) = (cwd.clone(), script_path.clone());
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
@@ -683,6 +586,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     credential_preflight::GithubAppMinter::mint(&minter, &repo)
                 })
                 .await;
+                let primary_minted =
+                    matches!(outcome, Ok(credential_preflight::GithubAppOutcome::Minted { .. }));
                 match outcome {
                     Ok(
                         ref minted @ credential_preflight::GithubAppOutcome::Minted {
@@ -791,6 +696,20 @@ pub(crate) async fn run_daemon() -> Result<()> {
                             "credential_preflight: github-app refresh task join error: {e} — #4430"
                         );
                     }
+                }
+                // #11957: run the per-owner pass startup skipped or could not
+                // finish, once the App mints again. After the primary publish
+                // above, so the cached refusals it expires are filed under
+                // the process credential as it now stands.
+                if primary_minted && cross_owner_retry.due() {
+                    let (ws, repo, script) =
+                        (pass_workspace.clone(), owner_repo.clone(), pass_script.clone());
+                    let pass =
+                        credential_preflight::cross_owner::establish_for_workspace_off_thread(
+                            ws, repo, script,
+                        )
+                        .await;
+                    cross_owner_retry.record(&pass);
                 }
             }
         });

@@ -97,6 +97,9 @@ pub const QUARANTINE_HOLD_REASON: &str = "insta-crash quarantine";
 /// `reason=` on the PR-less retry hold's park record (#7972, #9239).
 pub const PRLESS_HOLD_REASON: &str = "pr-less hold";
 
+/// `reason=` on the no-op hold's park record (#10156, written since #12024).
+pub const NOOP_HOLD_REASON: &str = "no-op hold";
+
 /// Telemetry name of the body read (#10089). Mapped to `issue.view-state`.
 pub(crate) const VIEW_OP: &str = "park_hold.issue_view";
 /// Telemetry name of the body write (#10089). Mapped to `issue.edit-body`.
@@ -106,7 +109,7 @@ pub(crate) const BODY_OP: &str = "park_hold.issue_body";
 pub(crate) const LABELS_OP: &str = "park_hold.issue_labels";
 
 /// Whether `record` is a daemon hold: no numbered blocker, `by=daemon`, and
-/// one of the two daemon hold reasons.
+/// one of the daemon hold reasons (the no-op hold's since #12024).
 ///
 /// The release tick (#10556) and the undocumented-block queue (#10558) key on
 /// this rather than on comment prose.
@@ -114,7 +117,10 @@ pub(crate) const LABELS_OP: &str = "park_hold.issue_labels";
 pub fn is_daemon_hold(record: &ParkRecord) -> bool {
     record.blocker.is_none()
         && record.by.as_deref() == Some(DAEMON_HOLD_BY)
-        && matches!(record.reason.as_deref(), Some(QUARANTINE_HOLD_REASON | PRLESS_HOLD_REASON))
+        && matches!(
+            record.reason.as_deref(),
+            Some(QUARANTINE_HOLD_REASON | PRLESS_HOLD_REASON | NOOP_HOLD_REASON)
+        )
 }
 
 /// The record line this module writes for `reason` at `at`.
