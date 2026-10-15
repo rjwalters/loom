@@ -4,9 +4,8 @@
 //! These used to be the live inputs of the #8248 required-check freshness
 //! guard, which #12063 slice 1 deleted along with the re-date remedy (#8508)
 //! and the CI-run conclusion gate (#10444): required checks at the head are
-//! GitHub's to enforce. What stays is what `required-checks`,
-//! `checks-failure`, `zero-checks-settle`, `check-runs-rollup` and
-//! `forge wait-checks` still read, and it goes with them in slice 2.
+//! GitHub's to enforce. What stays is what `forge wait-checks` still reads
+//! (the `merge-pr` verbs that shared these reads went in slice 2).
 //!
 //! 1. **required contexts** — the TWO-source union
 //!    `forge_get_required_status_check_contexts` builds (#8103): rulesets
@@ -23,7 +22,10 @@
 //! secondary-limit answer holds every later request on that credential until
 //! it clears ([`budget`]).
 
+// Test-only since #12063 slice 2: the `merge-pr` verbs that projected check runs went; `forge wait-checks` reads the rollup directly.
+#[cfg(test)]
 use super::CheckRun;
+#[cfg(test)]
 use chrono::{DateTime, Utc};
 
 use crate::forge_call_stats::ForgeOp;
@@ -167,6 +169,7 @@ refuses the merge."
     )
 }
 
+#[cfg(test)]
 fn parse_iso(label: &str, raw: &str) -> Result<DateTime<Utc>, String> {
     DateTime::parse_from_rfc3339(raw)
         .map(|d| d.with_timezone(&Utc))
@@ -394,6 +397,7 @@ fn fetch_required(
 /// run after a wait is a free `304`. That read folds every page and returns
 /// [`ReadError::Fatal`] when it holds fewer rows than the forge's own
 /// `total_count`: a subset is never evaluated as if complete.
+#[cfg(test)]
 pub(crate) fn fetch_check_runs(
     gh: &str,
     nwo: &str,
@@ -406,8 +410,8 @@ pub(crate) fn fetch_check_runs(
 }
 
 /// The workflow runs on `head_sha` (one page), through the same paced,
-/// conditional read as [`fetch_check_runs`] — for `merge-pr
-/// check-runs-rollup`'s superseded-twin drop (#11097).
+/// conditional read as [`fetch_check_runs`] — for `forge wait-checks`'s
+/// superseded-twin drop (#11097).
 ///
 /// # Errors
 ///
@@ -421,6 +425,7 @@ pub fn fetch_workflow_runs(
 }
 
 /// The guard's [`CheckRun`]s from a `{total_count, check_runs}` rollup.
+#[cfg(test)]
 fn project_check_runs(rollup: &serde_json::Value, head_sha: &str) -> Result<Vec<CheckRun>, String> {
     let rows = rollup
         .get("check_runs")

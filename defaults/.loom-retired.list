@@ -160,3 +160,15 @@ scripts/tests/test-merge-pr-stale-required-checks.sh
 scripts/check-dependabot-labels.sh
 scripts/tests/test-check-dependabot-labels.sh
 scripts/tests/test-check-pipefail-early-exit.sh
+# #12063 slice 2 (2026-10-15) — merge-pr no longer waits for checks, self-syncs or pre-reads
+# mergeability; the suites for that machinery leave with it.
+scripts/tests/test-merge-pr-auto-blocked-settle.sh
+scripts/tests/test-merge-pr-auto-merge-disabled-fallback.sh
+scripts/tests/test-merge-pr-auto-queued-stacked-children.sh
+scripts/tests/test-merge-pr-check-runs-404-fallback.sh
+scripts/tests/test-merge-pr-head-sync-retry.sh
+scripts/tests/test-merge-pr-rate-limit-fallback.sh
+scripts/tests/test-merge-pr-required-checks.sh
+scripts/tests/test-merge-pr-stale-mergeable.sh
+scripts/tests/test-merge-pr-unstable-fallback.sh
+scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh

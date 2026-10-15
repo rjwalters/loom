@@ -19,11 +19,8 @@ Options:
                          the matching local branch via 'git branch -d'
                          (Git refuses on unmerged commits).
   --dry-run              Show what would happen without merging
-  --auto                 Wait (bounded) for this head's checks to settle, then
-                         merge in THIS process — immediately if they already
-                         are. NEVER arms the forge's server-side auto-merge
-                         queue, which re-reads neither the loom:pr label nor
-                         the non-required test suites once armed (#8410).
+  --auto                 No-op (#12063): merge-pr no longer waits for checks;
+                         GitHub's required checks gate the merge call itself.
   --allow-stacked-children
                          Bypass the pre-merge merge-ordering guard's remaining
                          hard-block path. By default (#7982) the guard pins
@@ -39,13 +36,7 @@ Options:
                          records an audit PR comment. Operator asserts
                          responsibility.
   --allow-red-required <context>
-                         Repeatable. Merge over a red REQUIRED status-check
-                         context, for exactly the named context(s). Otherwise
-                         a plain (non --auto) merge refuses (exit 1) on any red
-                         required context and holds (exit 5) on a missing or
-                         pending one, even with a token that could bypass
-                         branch protection (#10688). Warns and, on a real
-                         merge, records an audit PR comment.
+                         No-op (#12063): accepted and ignored with a warning.
   --allow-unapproved     Bypass the pre-merge loom:pr review-signal guard.
                          By default the script refuses to merge (exit 1) a
                          PR whose current head does not carry the loom:pr
@@ -124,7 +115,7 @@ Precedence (highest wins):
 
 Exit codes:
   0 = merged (or --help) · 1 = failed
-  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896) — neither is a failure; retry later
+  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = held: a required status check is pending or red on this head (#12063) — neither is a failure; retry later
   4 = retired (#12063): no longer emitted
   7 = held by a sequencing order, loom:pr + loom:sequenced only (#11330; prints LOOM-SEQUENCED-HOLD pr=N after=M) — nothing written; retry later
   8 = --expected-head refused: the PR head is not the SHA the caller evaluated (#11859; prints LOOM-EXPECTED-HEAD-MISMATCH pr=N expected=S actual=S) — nothing written; re-evaluate, never retry blind
@@ -135,10 +126,6 @@ Examples:
 
   ./.loom/scripts/merge-pr.sh 123 --dry-run
     Shows what would happen without merging
-
-  ./.loom/scripts/merge-pr.sh 123 --auto
-    Waits (bounded by LOOM_AUTO_MERGE_TIMEOUT) for PR #123's checks to
-    settle, then merges it here — never via a server-side merge queue
 
   ./.loom/scripts/merge-pr.sh 123 --no-cleanup-worktree
     Merges PR but leaves the local worktree in place
