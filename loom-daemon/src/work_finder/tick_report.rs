@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 
 use super::halt_cause::HaltCause;
 use super::ready_queue;
+#[path = "tick_error_kind.rs"]
+pub mod error_kind;
 use crate::sweep_registry::{
     AlreadyLandedDispatchError, ClaimLockDispatchError, CollisionDispatchError,
     DispatchBackoffError, LandedEvidence, LeaseOrderDispatchError, LiveClaimDispatchError,
@@ -16,6 +18,7 @@ use crate::sweep_registry::{
     WorkspaceCommandsMissingDispatchError,
 };
 use crate::types::QueueDisposition as Qd;
+use error_kind::DispatchErrorKind;
 
 /// Per-tick outcome counts, for observability and test assertions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -179,6 +182,10 @@ pub struct TickReport {
     pub skipped_host_constraint: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
+    /// The distinct reasons behind [`Self::errors`] (#11973), sorted. Fed
+    /// only through [`Self::note_error`]; exported as
+    /// `loom.dispatch.error_kind`.
+    pub error_kinds: Vec<DispatchErrorKind>,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
     /// of #4028). Unlike the other counters — which are per-tick tallies — this
     /// is a **monotonic total** read from the dispatcher(s) at tick end, so an
@@ -312,6 +319,27 @@ pub struct TickReport {
 }
 
 impl TickReport {
+    /// Count one error of `kind` (#11973).
+    pub fn note_error(&mut self, kind: DispatchErrorKind) {
+        self.errors += 1;
+        if let Err(at) = self.error_kinds.binary_search(&kind) {
+            self.error_kinds.insert(at, kind);
+        }
+    }
+
+    /// Count workspace `idx`'s failed ready-issue listing (#8852, #11973).
+    pub fn note_listing_failure(&mut self, idx: usize, err: &anyhow::Error) {
+        self.note_error(DispatchErrorKind::of_listing(err));
+        self.listing_failed.push(idx);
+    }
+
+    /// The tick's `loom.dispatch.error_kind` value (#11973), or `None` when
+    /// it counted no error. See [`error_kind::attribute_value`].
+    #[must_use]
+    pub fn error_kind(&self) -> Option<&'static str> {
+        error_kind::attribute_value(self.errors, &self.error_kinds)
+    }
+
     /// Record whether workspace `idx`'s listing came back whole (#11139).
     pub fn note_listing(&mut self, idx: usize, complete: bool) {
         if !complete {
@@ -588,7 +616,7 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
         // Empty/unusable token pool (#4689, typed by #6614): a real failure,
         // still on `errors`, named because the remedy is the pool. The registry
         // has armed this issue's backoff and the cross-issue pool hold.
-        report.errors += 1;
+        report.note_error(DispatchErrorKind::TokenSelection);
         report.refused_token_selection += 1;
         log::warn!(
             "work_finder: dispatch for issue #{issue} died at token selection — the token pool \
@@ -597,18 +625,18 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
         Outcome::new(Qd::DispatchError, why, "error", "token_selection_failed")
     } else if e.downcast_ref::<CollisionDispatchError>().is_some() {
         // Cross-host collision enforcement (#5789): a peer already claimed it.
-        report.errors += 1;
+        report.note_error(DispatchErrorKind::ClaimCollision);
         report.refused_claim_collision += 1;
         log::info!("work_finder: skipping issue #{issue} — {e}");
         Outcome::new(Qd::DispatchError, why, "refused", "claim_collision")
     } else if e.downcast_ref::<ClaimLockDispatchError>().is_some() {
         // The local claim lock is already held (#8907).
-        report.errors += 1;
+        report.note_error(DispatchErrorKind::ClaimLock);
         report.refused_claim_lock += 1;
         log::warn!("work_finder: dispatch for issue #{issue} failed: {e}");
         Outcome::new(Qd::DispatchError, why, "refused", "claim_lock_held")
     } else {
-        report.errors += 1;
+        report.note_error(DispatchErrorKind::of_dispatch(e));
         log::warn!("work_finder: dispatch for issue #{issue} failed: {e}");
         Outcome::new(Qd::DispatchError, why, "error", "error")
     }

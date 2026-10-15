@@ -137,7 +137,7 @@ pub(crate) enum ForgeAction {
         max_points: u32,
     },
 
-    /// `forge wait-checks <PR|SHA> [--timeout SECS] [--required-only]`
+    /// `forge wait-checks <PR|SHA> [--timeout SECS] [--required-only] [--settle-red]`
     /// (#10330) — wait for a PR's (or commit's) CI with ETag'd REST reads
     /// (an unchanged poll is a free `304`) backing off 30s → 120s.
     ///
@@ -170,6 +170,12 @@ pub(crate) enum ForgeAction {
         /// Settle on the base branch's required contexts only.
         #[arg(long)]
         required_only: bool,
+
+        /// No early RED (#12011): a failing check is RED only once nothing
+        /// is still pending; until then the wait stays pending (→ TIMEOUT).
+        /// For a changes-requested verdict that must name the failing test.
+        #[arg(long)]
+        settle_red: bool,
 
         /// First poll interval, seconds (env `LOOM_WAIT_CHECKS_MIN`, default 30).
         #[arg(long, value_name = "SECS")]
@@ -1026,6 +1032,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             base,
             timeout,
             required_only,
+            settle_red,
             min_interval,
             max_interval,
         } => loom_daemon::forge_wait_checks::cli_entrypoint(
@@ -1035,6 +1042,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 base,
                 timeout,
                 required_only,
+                settle_red,
                 min_interval,
                 max_interval,
             },

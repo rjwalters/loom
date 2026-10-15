@@ -203,6 +203,13 @@ pub struct DowngradeCheck<'a> {
     /// beats config) is a downgrade even with no prior plist/unit value and no
     /// marker to say so. `None`/`Some(false)` adds nothing.
     pub config_work_finder: Option<bool>,
+    /// `Some` on the systemd tier (#11951): what decides each loop once the
+    /// unit is re-rendered without autonomy env. The start's own resolved
+    /// values are never written there, so a loop a drop-in sets, or the
+    /// config turns on, is out of this start's reach and is not checked; and
+    /// a loop this start asks for that nothing will turn on is refused.
+    /// `None` on launchd and nohup, which still carry the start's env.
+    pub systemd: Option<&'a super::systemd_autonomy::Layer>,
 }
 
 /// `check_autonomy_downgrade_key` + `warn_autonomy_downgrade`.
@@ -211,29 +218,49 @@ pub struct DowngradeCheck<'a> {
 /// refuse — `--print-plist`/`--print-unit` stay warn-only, a real start exits 1).
 #[must_use]
 pub fn warn_autonomy_downgrade(c: &DowngradeCheck) -> bool {
-    // `--from-config` hands control to config deliberately — not a silent
-    // default — so it is exempt from this check entirely.
-    if c.from_config {
-        return false;
-    }
     let mut detected = false;
-    detected |= check_config_work_finder(c);
-    detected |= check_key(
-        "LOOM_WORK_FINDER",
-        c.work_finder.0,
-        c.want_work_finder,
-        c.work_finder.1,
-        c.prior,
-        c.intent_marker,
-    );
-    detected |= check_key(
-        "LOOM_MAIN_HEALTH_GATE",
-        c.health_gate.0,
-        c.want_health_gate,
-        c.health_gate.1,
-        c.prior,
-        c.intent_marker,
-    );
+    // #11951: checked before the `--from-config` exemption, because
+    // `--from-config --work-finder` still asks for the loop on.
+    if let Some(layer) = c.systemd {
+        detected |= super::systemd_autonomy::unmet_intent(
+            layer,
+            [
+                (c.want_work_finder, c.work_finder.1),
+                (c.want_health_gate, c.health_gate.1),
+            ],
+        );
+    }
+    // `--from-config` hands control to config deliberately — not a silent
+    // default — so it is exempt from the downgrade check entirely.
+    if c.from_config {
+        return detected;
+    }
+    // On systemd the start's `0` is never rendered, so it cannot switch off a
+    // loop the config enables (#11951); the config check is launchd/nohup only.
+    if c.systemd.is_none() {
+        detected |= check_config_work_finder(c);
+    }
+    let out_of_reach = |key: &str| c.systemd.is_some_and(|l| l.decides(key));
+    if !out_of_reach("LOOM_WORK_FINDER") {
+        detected |= check_key(
+            "LOOM_WORK_FINDER",
+            c.work_finder.0,
+            c.want_work_finder,
+            c.work_finder.1,
+            c.prior,
+            c.intent_marker,
+        );
+    }
+    if !out_of_reach("LOOM_MAIN_HEALTH_GATE") {
+        detected |= check_key(
+            "LOOM_MAIN_HEALTH_GATE",
+            c.health_gate.0,
+            c.want_health_gate,
+            c.health_gate.1,
+            c.prior,
+            c.intent_marker,
+        );
+    }
     detected
 }
 
@@ -420,6 +447,7 @@ mod tests {
             prior: &no_prior(),
             intent_marker: &marker,
             config_work_finder: None,
+            systemd: None,
         }));
     }
 
@@ -438,6 +466,7 @@ mod tests {
                 prior: &no_prior(),
                 intent_marker: &marker,
                 config_work_finder: None,
+                systemd: None,
             }),
             "--no-work-finder / --no-health-gate state the value explicitly"
         );
@@ -457,6 +486,7 @@ mod tests {
             prior: &no_prior(),
             intent_marker: &marker,
             config_work_finder: None,
+            systemd: None,
         }));
     }
 
@@ -477,6 +507,7 @@ mod tests {
             prior: &no_prior(),
             intent_marker: &marker,
             config_work_finder: None,
+            systemd: None,
         }));
     }
 
@@ -494,6 +525,7 @@ mod tests {
             prior: &no_prior(),
             intent_marker: &marker,
             config_work_finder: None,
+            systemd: None,
         }));
     }
 
@@ -512,6 +544,7 @@ mod tests {
             prior: &no_prior(),
             intent_marker: &marker,
             config_work_finder: None,
+            systemd: None,
         }));
     }
 
@@ -529,6 +562,7 @@ mod tests {
             prior: &no_prior(),
             intent_marker: &marker,
             config_work_finder: None,
+            systemd: None,
         }));
     }
 
@@ -542,6 +576,7 @@ mod tests {
             prior: &no_prior(),
             intent_marker: marker,
             config_work_finder,
+            systemd: None,
         })
     }
 
@@ -603,6 +638,7 @@ mod tests {
                 prior: &no_prior(),
                 intent_marker: &marker,
                 config_work_finder: Some(true),
+                systemd: None,
             })
         };
         assert!(!with(true, ("", ""), Want::Unset), "--from-config hands control to config");

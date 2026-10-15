@@ -204,6 +204,35 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
     Decision::Green
 }
 
+/// [`decide`] under `--settle-red` (#12011): a `Red` stands only once the
+/// run has finished — nothing observed is still pending, the required set is
+/// known, and every required context has registered. Until then it is
+/// `Pending` on what is still outstanding (so the wait ends `TIMEOUT`, never
+/// an early `RED`). Every other decision is [`decide`]'s, unchanged.
+///
+/// Why opt-in: an early `RED` is right for a caller that only *refuses* on it
+/// (the approval gate, `merge-pr.sh`, Champion), but wrong as the trigger for
+/// a changes-requested verdict — a Judge cannot read a job log (`gh run view
+/// --log-failed`) until the whole run completes, so it cannot name the
+/// failing test, nor tell a tracked flake from a regression (#12011).
+#[must_use]
+pub fn decide_settled(r: &Rollup, required: Option<&[String]>, required_only: bool) -> Decision {
+    let d = decide(r, required, required_only);
+    if !matches!(d, Decision::Red(_)) {
+        return d;
+    }
+    let mut waiting = r.pending.clone();
+    match required {
+        None => waiting.push(REQUIRED_UNKNOWN.to_string()),
+        Some(req) => waiting.extend(req.iter().filter(|c| !r.seen.contains(*c)).cloned()),
+    }
+    if waiting.is_empty() {
+        d
+    } else {
+        Decision::Pending(waiting)
+    }
+}
+
 /// The terminal answer of one `wait-checks` run — exactly one sentinel line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -459,6 +488,57 @@ mod tests {
             decide(&r, Some(req.as_slice()), true),
             Decision::Pending(vec!["Backend".into(), "Gate".into()])
         );
+    }
+
+    /// #12011: under `--settle-red` a failure is not RED while anything else
+    /// is still running (the PR #11974 replay); once the run has finished it
+    /// is. Without the flag the same rollup is RED at once, as before.
+    #[test]
+    fn settle_red_waits_for_the_run_to_finish_before_red() {
+        let none: &[String] = &[];
+        let partial = vec![
+            run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+            run("Rust Unit Tests (1/3)", "in_progress", None),
+            run("lint", "completed", Some("success")),
+        ];
+        let r = fold(&runs(partial), &no_status()).unwrap();
+        assert_eq!(
+            decide_settled(&r, Some(none), false),
+            Decision::Pending(vec!["Rust Unit Tests (1/3)".into()])
+        );
+        assert_eq!(
+            decide(&r, Some(none), false),
+            Decision::Red(vec!["Rust Unit Tests (2/3)".into()])
+        );
+        let done = vec![
+            run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+            run("Rust Unit Tests (1/3)", "completed", Some("success")),
+        ];
+        let r = fold(&runs(done), &no_status()).unwrap();
+        assert_eq!(
+            decide_settled(&r, Some(none), false),
+            Decision::Red(vec!["Rust Unit Tests (2/3)".into()])
+        );
+    }
+
+    /// Under `--settle-red` an unknown required set, or a required context
+    /// that has not registered, also keeps a failure from being RED yet.
+    #[test]
+    fn settle_red_waits_on_an_unknown_or_unregistered_required_context() {
+        let r = fold(&runs(vec![run("lint", "completed", Some("failure"))]), &no_status()).unwrap();
+        assert_eq!(decide(&r, None, false), Decision::Red(vec!["lint".into()]));
+        assert_eq!(
+            decide_settled(&r, None, false),
+            Decision::Pending(vec![REQUIRED_UNKNOWN.into()])
+        );
+        let req = vec!["Backend".to_string()];
+        assert_eq!(
+            decide_settled(&r, Some(req.as_slice()), false),
+            Decision::Pending(vec!["Backend".into()])
+        );
+        // Non-RED decisions are untouched.
+        let ok = fold(&runs(vec![run("ci", "completed", Some("success"))]), &no_status()).unwrap();
+        assert_eq!(decide_settled(&ok, Some(&[][..]), false), Decision::Green);
     }
 
     #[test]

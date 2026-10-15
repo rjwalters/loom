@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
-use super::{annotate_triage, FleetView, QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
+use super::flow::annotate_triage;
+use super::{FleetView, QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
 
 const REPO: &str = "acme/a";
 

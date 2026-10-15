@@ -255,7 +255,7 @@ pub use main_red_fix::RedMainLane;
 pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
-pub use tick_report::{Admission, TickReport};
+pub use tick_report::{error_kind::DispatchErrorKind, Admission, TickReport};
 #[cfg(test)]
 use tick_summary::reset_last_tick_summary;
 pub use tick_summary::{
@@ -1763,8 +1763,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             Err(e) => {
                 // Per-workspace isolation: log, count, and move on — the other
                 // workspaces are still polled and dispatched this same tick.
-                report.errors += 1;
-                report.listing_failed.push(idx);
+                report.note_listing_failure(idx, &e);
                 log::warn!("work_finder: listing ready issues for workspace #{idx} failed: {e}");
                 // A rate-limit failure trips the global breaker (#4429) so the
                 // NEXT tick skips its gh fan-out entirely; this tick still

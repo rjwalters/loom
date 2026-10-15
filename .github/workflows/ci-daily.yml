@@ -6,7 +6,7 @@
 # time in five deliberate ways. Each is correct for a merge gate; none should
 # be the only verification the repo ever gets:
 #
-#   1. nextest is PARTITIONED three ways, so a cross-test interaction between
+#   1. nextest is PARTITIONED five ways, so a cross-test interaction between
 #      tests in different legs can no longer occur -- and therefore can no
 #      longer be observed.
 #   2. The shell suites are SHARDED two ways and run 4-wide inside each shard,
@@ -100,7 +100,7 @@ jobs:
       - name: nextest, whole workspace, UNPARTITIONED
         if: ${{ !cancelled() }}
         # The one place the full cross-test interaction surface exists. Under
-        # ci.yml's `--partition count:k/3` two tests that collide can never
+        # ci.yml's `--partition count:k/N` two tests that collide can never
         # land in the same process tree, so the collision is unobservable.
         # Since #10700 the OTLP exporter is compiled unconditionally, so this
         # run already covers what a separate `--features otlp` run did.

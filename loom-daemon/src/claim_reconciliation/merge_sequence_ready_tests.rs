@@ -224,7 +224,7 @@ fn a_hold_releases_when_the_predecessor_loses_its_verdict_or_gains_a_blocking_la
     // An unapproved follower is released too: the order has no subject.
     let draft_like = pr(20, "2026-10-02T00:00:00Z", &[SEQUENCE_LABEL]);
     assert_eq!(decide(&m, &draft_like, &at(&[CR])), HoldAction::ReleaseNotReady);
-    let body = release_comment_body(&m, HoldAction::ReleaseNotReady);
+    let body = release_comment_body(&m, HoldAction::ReleaseNotReady, None);
     assert!(body.contains("loom:sequence released plan=seq-c0ffee00"), "{body}");
     assert!(body.contains("#10 is not ready"), "{body}");
 }

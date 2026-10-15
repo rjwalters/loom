@@ -676,7 +676,12 @@ fn run_preflight(
     }
     // 2am#4367 P4: no gh update check, and the gateway profiles the front's
     // classified reads use — exported only while the daemon has them live.
-    for (key, value) in crate::forge_gateway::agent_env() {
+    // 2am#4501: and the hooks of this release, which the wired user-scope
+    // hook command prefers over the machine checkout.
+    for (key, value) in crate::forge_gateway::agent_env()
+        .into_iter()
+        .chain(crate::hooks_home::agent_env())
+    {
         match value {
             Some(v) => command.env(key, v),
             None => command.env_remove(key),

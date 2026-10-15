@@ -543,6 +543,17 @@ pub struct ClaimAd {
     /// every other lane. Additive: an older peer ignores the key and reads the
     /// ad as a claim on `issue`, which is the item the step holds.
     pub step: Option<crate::step_role::StepRole>,
+    /// Whether a [`ClaimKind::DispatchBackoffArmed`] ad is a **fast-fail
+    /// streak break** (#11952): `Some(true)` from
+    /// [`crate::sweep_registry::SweepRegistry::break_fleet_fast_fail_streak`],
+    /// `Some(false)` on every ordinary ladder window, `None` on every other
+    /// ad (and on any ad from a peer older than #11952). Before this marker a
+    /// break was encoded only as "zero window and zero streak", which an
+    /// ordinary failure could also produce; see `peer_claims::fast_fail_tally`
+    /// for how the two encodings are read. Additive: an older peer ignores
+    /// the key, and a new sender's break still has the zero window and zero
+    /// streak such a peer reads as one.
+    pub streak_break: Option<bool>,
 }
 
 impl ClaimAd {
@@ -560,6 +571,7 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
         }
     }
 
@@ -577,6 +589,7 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
         }
     }
 
@@ -605,6 +618,7 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
         }
     }
 
@@ -628,6 +642,7 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
         }
     }
 
@@ -647,6 +662,7 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
         }
     }
 
@@ -676,6 +692,7 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
         }
     }
 
@@ -702,6 +719,7 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
         }
     }
 
@@ -725,6 +743,7 @@ impl ClaimAd {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
         }
     }
 
@@ -744,6 +763,7 @@ impl ClaimAd {
             "pool_key": self.pool_key,
             "consecutive": self.consecutive,
             "step": self.step,
+            "streak_break": self.streak_break,
         })
         .to_string()
     }
@@ -820,6 +840,10 @@ impl ClaimAd {
             .get("step")
             .and_then(Value::as_str)
             .and_then(|s| s.parse().ok());
+        // `streak_break` is new as of #11952: absent (any older peer, any
+        // ad but a fast-fail ladder window) degrades to `None`, which the
+        // tally reads under the pre-#11952 "zero window and zero streak" rule.
+        let streak_break = obj.get("streak_break").and_then(Value::as_bool);
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -835,6 +859,7 @@ impl ClaimAd {
             pool_key,
             consecutive,
             step,
+            streak_break,
         })
     }
 
@@ -1240,6 +1265,10 @@ pub struct PeerClaimView {
     /// `(count, received_at)`. Carried on the `DispatchBackoffArmed` ad; see
     /// [`fast_fail_tally`] for why it is summed per host.
     fast_fail_streaks: HashMap<(String, u32, String), (u32, Instant)>,
+    /// When a peer's fast-fail streak **break** for `(repo_slug, issue)` last
+    /// arrived, on this host's wall clock (#11952): what lets the sweep
+    /// registry break this host's own streak too. See [`fast_fail_tally`].
+    fast_fail_breaks: HashMap<(String, u32), chrono::DateTime<chrono::Utc>>,
     /// Fleet-visible token-pool exhaustion holds armed by peer hosts (Issue
     /// #8001), keyed by `(pool_key, advertising_host)`, valued by the
     /// **local** [`Instant`] at which this daemon's copy of the hold expires
@@ -1316,6 +1345,7 @@ impl PeerClaimView {
             dispatch_backoffs: HashMap::new(),
             prless_releases: HashMap::new(),
             fast_fail_streaks: HashMap::new(),
+            fast_fail_breaks: HashMap::new(),
             pool_holds: HashMap::new(),
             step_cooldowns: HashMap::new(),
             send_health: ClaimSendHealth::default(),
@@ -2174,6 +2204,7 @@ mod tests {
             pool_key: None,
             consecutive: None,
             step: None,
+            streak_break: None,
         }
     }
 

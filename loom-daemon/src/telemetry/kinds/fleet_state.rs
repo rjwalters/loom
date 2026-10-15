@@ -672,6 +672,30 @@ pub struct FleetQueueDepth {
     pub operator_held: Option<u32>,
 }
 
+/// A repo's operator-action recency (#11956), derived from the delta between
+/// consecutive passes' operator-held sets. Approximate: a release cannot be
+/// attributed to a human, and the tracker is in memory (resets on restart).
+/// Hours since the last release is `as_of - last_hold_release_at`; the instant
+/// is carried instead so an idle repo's record does not change every tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetOperatorRecency {
+    /// The latest observed hold release.
+    pub last_hold_release_at: DateTime<Utc>,
+    /// Set only while at least a threshold of releases fall in the trailing
+    /// window (a purge burst).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_release_burst: Option<FleetHoldReleaseBurst>,
+}
+
+/// A burst of hold releases (#11956).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetHoldReleaseBurst {
+    /// Releases observed inside the window.
+    pub count_in_window: u32,
+    /// The trailing window, in minutes.
+    pub window_minutes: u32,
+}
+
 /// Decode a present field, `null` included, as `Some(..)`; an absent field
 /// stays `None` through `#[serde(default)]` (#11606: uncapped vs unknown).
 fn observed_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
@@ -848,6 +872,11 @@ pub struct FleetStateRepo {
     /// by this host): unknown, never zero. Additive on `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_queue: Option<FleetQueueDepth>,
+    /// The repo's operator-action recency (#11956). Absent = unknown (no
+    /// release observed since this host started, or the census was unread),
+    /// never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_recency: Option<FleetOperatorRecency>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]

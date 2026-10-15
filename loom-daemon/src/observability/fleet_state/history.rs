@@ -16,10 +16,23 @@ pub enum HistoryEvent {
     Reopened,
 }
 
+/// Who caused an event, as the events API reports it (#11956). Captured only:
+/// no human-versus-Loom-bot classification is made here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventActor {
+    pub login: String,
+    /// `actor.type == "Bot"`.
+    pub is_bot: bool,
+}
+
 /// The events of one issue or PR, oldest first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LabelHistory {
     pub events: Vec<(DateTime<Utc>, HistoryEvent)>,
+    /// The actor of `events[i]`, aligned by index (#11956). `None` when the
+    /// page carried no `actor`; may be shorter than `events` for a history
+    /// built without one, so read it through [`LabelHistory::actor`].
+    pub actors: Vec<Option<EventActor>>,
 }
 
 impl LabelHistory {
@@ -43,6 +56,11 @@ impl LabelHistory {
             };
             if let Some(parsed) = parsed {
                 self.events.push((at, parsed));
+                self.actors
+                    .push(event["actor"]["login"].as_str().map(|login| EventActor {
+                        login: login.to_string(),
+                        is_bot: event["actor"]["type"].as_str() == Some("Bot"),
+                    }));
             }
         }
     }
@@ -59,8 +77,15 @@ impl LabelHistory {
                 break;
             }
         }
-        history.events.sort_by_key(|(at, _)| *at);
-        Some(history)
+        let mut paired: Vec<_> = history.events.into_iter().zip(history.actors).collect();
+        paired.sort_by_key(|((at, _), _)| *at);
+        let (events, actors) = paired.into_iter().unzip();
+        Some(LabelHistory { events, actors })
+    }
+
+    /// The actor of `events[index]`, when the page named one (#11956).
+    pub fn actor(&self, index: usize) -> Option<&EventActor> {
+        self.actors.get(index)?.as_ref()
     }
 
     /// The latest instant at or before `bound` of an event `pick` accepts.
@@ -109,4 +134,42 @@ pub fn labeled(event: &HistoryEvent, labels: &[&str]) -> bool {
 /// Whether `event` is the `unlabeled` event of one of `labels`.
 pub fn unlabeled(event: &HistoryEvent, labels: &[&str]) -> bool {
     matches!(event, HistoryEvent::Unlabeled(l) if labels.contains(&l.as_str()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actor_login_and_bot_flag_are_captured_and_absence_keeps_the_event() {
+        let page = serde_json::json!([
+            {"event": "labeled", "label": {"name": "loom:issue"},
+             "created_at": "2026-10-14T12:00:00Z",
+             "actor": {"login": "loom-bot", "type": "Bot"}},
+            {"event": "unlabeled", "label": {"name": "loom:operator"},
+             "created_at": "2026-10-14T11:00:00Z",
+             "actor": {"login": "turian", "type": "User"}},
+            {"event": "closed", "created_at": "2026-10-14T13:00:00Z"},
+        ]);
+        let history = LabelHistory::read(|_| Some(page.clone())).unwrap();
+        assert_eq!(history.events.len(), 3);
+        // Oldest first: the actors travel with their events through the sort.
+        assert_eq!(
+            history.actor(0),
+            Some(&EventActor {
+                login: "turian".to_string(),
+                is_bot: false
+            })
+        );
+        assert_eq!(
+            history.actor(1),
+            Some(&EventActor {
+                login: "loom-bot".to_string(),
+                is_bot: true
+            })
+        );
+        assert_eq!(history.actor(2), None, "no actor on the page: None");
+        assert_eq!(history.actor(9), None, "out of range: None");
+    }
 }

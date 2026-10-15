@@ -7,7 +7,7 @@ mod log_paths;
 use super::*;
 
 // Issue #8865: per-cause streak and log wording of the dispatch backoff.
-mod backoff_cause;
+pub(super) mod backoff_cause;
 pub(super) mod child_env_markers;
 
 // Issue #11304: claim-unwind + post-claim closed-issue re-verification.
@@ -806,8 +806,9 @@ pub(crate) struct DispatchBackoffState {
     /// Consecutive failed dispatch outcomes for this issue.
     pub(super) consecutive: u32,
     /// When the most recent failure was recorded — used to decide whether the
-    /// streak is still "consecutive" (see [`DispatchBackoffConfig::max`]).
-    last_failure_at: DateTime<Utc>,
+    /// streak is still "consecutive" (see [`DispatchBackoffConfig::max`]), and
+    /// whether a peer's fast-fail break has since reset it (#11952).
+    pub(super) last_failure_at: DateTime<Utc>,
     /// The instant at which the next dispatch attempt becomes allowed.
     pub(super) until: DateTime<Utc>,
     /// What most recently (re-)armed this window (Issue #7606) — see
@@ -862,7 +863,7 @@ pub fn read_dispatch_backoff_file_config(repo_root: &Path) -> DispatchBackoffFil
         base_secs: b
             .get("baseSecs")
             .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
+            .filter(|&s| fast_fail_fleet::positive_base_secs(s, "dispatchBackoff.baseSecs")),
         max_secs: b
             .get("maxSecs")
             .and_then(serde_json::Value::as_u64)
@@ -887,7 +888,7 @@ pub fn resolve_dispatch_backoff_config(repo_root: &Path) -> DispatchBackoffConfi
     let base_secs = std::env::var(DISPATCH_BACKOFF_BASE_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
+        .filter(|&s| fast_fail_fleet::positive_base_secs(s, DISPATCH_BACKOFF_BASE_ENV))
         .or(file.base_secs)
         .unwrap_or(DEFAULT_DISPATCH_BACKOFF_BASE_SECS);
 
@@ -1243,11 +1244,12 @@ impl SweepRegistry {
         let max = backoff_cause::cap(cause, self.dispatch_backoff_config.max);
         let max_secs = i64::try_from(max.as_secs()).unwrap_or(i64::MAX);
         let consecutive = match self.dispatch_backoff.get(&issue) {
-            Some(prev) if backoff_cause::continues(prev, cause, now, max_secs) => {
+            Some(prev) if self.backoff_streak_continues(issue, prev, cause, now, max_secs) => {
                 prev.consecutive.saturating_add(1)
             }
-            // No prior record, the streak went cold, or it was the other
-            // cause's streak (#8865) — start a fresh streak.
+            // No prior record, the streak went cold, it was the other cause's
+            // streak (#8865), or a peer's progress broke it since (#11952) —
+            // start a fresh streak.
             _ => 1,
         };
         let delay = backoff_delay(consecutive, self.dispatch_backoff_config.base, max);
