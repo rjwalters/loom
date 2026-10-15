@@ -532,7 +532,6 @@ reset
 set_claim loom:reviewing "$(ago 40)"
 out="$(LOOM_TEST_LEASE_STATE=held-peer "$TARGET_SCRIPT" check --number 6513 --label loom:reviewing)"
 assert_eq "fresh" "$(field "$out" CLAIM_STATE)" "T23a: a peer's live lease keeps a 40m-old claim fresh"
-assert_eq "held-peer" "$(field "$out" LEASE_STATE)" "T23b: the lease reading is reported"
 assert_contains "$(cat "$STUB_DIR/lease-args")" "--role judge" "T23c: loom:reviewing is a judge lease"
 out="$(LOOM_TEST_LEASE_STATE=held-self "$TARGET_SCRIPT" check --number 6513 --label loom:reviewing)"
 assert_eq "fresh" "$(field "$out" CLAIM_STATE)" "T23d: the caller's own live lease is not stale either"

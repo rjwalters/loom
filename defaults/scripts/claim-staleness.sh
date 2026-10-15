@@ -397,7 +397,6 @@ _emit_evaluation() {
             --argjson standdown "${STANDDOWN_COUNT:-0}" \
             --argjson stale_minutes "$STALE_MINUTES" \
             --argjson max_streak "$MAX_STREAK" \
-            --arg lease_state "$LEASE_STATE" \
             --arg claim_label "$LABEL" \
             --arg extra_key "$extra_key" \
             --arg extra_val "$extra_val" \
@@ -411,8 +410,7 @@ _emit_evaluation() {
                activity_count: $activity,
                standdown_count: $standdown,
                stale_minutes: $stale_minutes,
-               max_standdown_streak: $max_streak,
-               lease_state: $lease_state
+               max_standdown_streak: $max_streak
              }
              + (if $extra_key == "" then {} else {($extra_key | ascii_downcase): $extra_val} end)'
     else
@@ -426,7 +424,6 @@ _emit_evaluation() {
         echo "STANDDOWN_COUNT=${STANDDOWN_COUNT:-0}"
         echo "STALE_MINUTES=$STALE_MINUTES"
         echo "MAX_STANDDOWN_STREAK=$MAX_STREAK"
-        echo "LEASE_STATE=$LEASE_STATE"
         [[ -n "$extra_key" ]] && echo "$extra_key=$extra_val"
     fi
     return 0
