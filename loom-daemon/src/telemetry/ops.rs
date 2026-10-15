@@ -375,6 +375,10 @@ pub enum MetricName {
     /// Open items carrying a stage label, labelled `state`.
     #[serde(rename = "loom.forge.stage_items")]
     ForgeStageItems,
+    /// Items the step tick could draw (weight > 0, after the live claims),
+    /// labelled `repo`, sampled every work-finder tick (#11909).
+    #[serde(rename = "loom.step.actionable")]
+    StepActionable,
     /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
     /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
     /// (over the per-call row cap) — Issue #9222.
@@ -566,6 +570,7 @@ impl MetricName {
             Self::ForgeStageDwell => "loom.forge.stage_dwell",
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
+            Self::StepActionable => "loom.step.actionable",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
             Self::GithubRateLimitUsed => "github.ratelimit.used",
@@ -672,7 +677,7 @@ impl MetricName {
             | Self::DispatchBusySlots
             | Self::DispatchRoleMaxConcurrent
             | Self::DispatchRoleIdleSlots => "{slot}",
-            Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
+            Self::ForgeStageDwellSamples | Self::ForgeStageItems | Self::StepActionable => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
             Self::GithubRateLimitReset => "s",
@@ -764,6 +769,7 @@ impl MetricName {
             Self::ForgeStageItems => {
                 "Open items per repo by state: stage labels and queue states (overlapping)."
             }
+            Self::StepActionable => "Items the step tick could draw this tick, per repo.",
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }

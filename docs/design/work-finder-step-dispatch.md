@@ -223,18 +223,19 @@ A step that wrote its verdict and died still holding its claim only loses the cl
 **Signals.**
 - `loom.dispatch.step` span: repo, item, role, admission result, reason, draw attempt, `age_source`, resumed (`observability/ops/dispatch_step.rs`). One per spawn attempt, spawned or refused.
 - `pick.decision`'s `item_draw`: the `loom-draw/v2` seed inputs, the weight-0 counts by reason, each drawn workspace's starting pool and every draw, enough to replay the tick (`item_draw::replay_record`), and the workspaces whose draw stopped on a `WeightOverflow`. Work-finder rows carry their step as `stage` and in the dispatch plan's `step` field.
+- `loom.step.actionable{repo}`: the drawable depth per repo, each tick.
 - The baseline: `loom.forge.stage_items{repo,state}`, sampled per repo by the captain's stage-dwell sampler, and `loom.dispatch.busy_slots{role}`. Steps count under `role="sweep"` (one slot each) and are broken down by step role as `busy_slots{role=<role>, pool="step"}`, never added to the total.
 
 **Alerts** (`defaults/observability/signoz/alerts/`, shipped with the cutover so a fix-forward rollout is watched from its first minute):
 
 | Rule | Fires when |
 |---|---|
-| `step-dispatch-stalled.json` | a repo shows `loom.forge.stage_items` > 0 in a work state, a host dispatching for it has a free slot, and no `loom.dispatch.step` was spawned for the repo for 15 min |
+| `step-dispatch-stalled.json` | a repo has drawable items (`loom.step.actionable` > 0) for 15 min, a host dispatching for it has a free slot, and no `loom.dispatch.step` was spawned for the repo |
 | `step-draw-pass-rate.json` | pool-gate plus claim refusals are above 80% of a host's `loom.dispatch.step` attempts for 30 min |
 | `step-slots-idle.json` | a repo had work waiting for 30 min while the busiest host dispatching for it stayed below 50% of `maxConcurrent` |
 | `role-runner-item-tick.json` | a Curator, Judge or Doctor `role_tick.outcome` that is not a step (`loom.role_tick.source` != `step`) appears: a pre-cutover daemon or a surviving interval loop |
 
-`loom.forge.stage_items` is the captain's per-repo gauge, so the stalled and idle rules are keyed by repo and join it to the hosts that dispatch for the repo (their step and disposition spans in the last 24 h).
+The stalled and idle rules key on `loom.step.actionable{repo}`, which every dispatching host emits per listed repo each tick: the items with weight > 0 after the live claims. `loom.forge.stage_items` would count parked, held, operator, frozen and epic work the tick never draws, and it is the captain's gauge, not the dispatcher's.
 
 **Holds.** A held workspace is not listed, so it has no queue rows on the tick (only a red-main repo that admits its fixes is listed, for those fixes).
 

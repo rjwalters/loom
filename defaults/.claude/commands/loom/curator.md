@@ -537,7 +537,7 @@ not been resynced yet): fall back to the **age-only** rule — read the latest
 **not** reintroduce a "any comment after the claim means fresh" test — that is
 precisely the defect this section exists to fix.
 
-**Env vars**: `LOOM_STALE_CURATING_MINUTES` (default **30**, the Judge's
+**Env vars**: `LOOM_STALE_CURATING_MINUTES` (default **45**, the Judge's
 `LOOM_STALE_REVIEWING_MINUTES` default, since a Curator pass runs about as long
 as a review; raise it for long measurement passes) and
 `LOOM_MAX_STANDDOWN_STREAK` (default **3**, shared with `judge.md`/`doctor.md`).
