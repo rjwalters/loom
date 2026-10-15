@@ -92,7 +92,8 @@ pub const CONFIG_KEY: &str = "forge.gateway";
 pub const GATEWAY_APP_ID: &str = "gateway";
 
 /// Exported to agent sessions while the gateway is active: the directory
-/// holding the per-owner profiles. Absent (or removed) otherwise.
+/// holding the per-owner profiles. Absent (or removed) otherwise. Dispatched
+/// roles get it from [`crate::launch_env::apply_launch_env`] (#12207).
 pub const DIR_ENV: &str = "LOOM_GH_GATEWAY_DIR";
 
 /// `gh`'s update check is a request to `api.github.com` on its own schedule;
@@ -376,14 +377,45 @@ pub fn profile_for(owner: &str) -> Option<PathBuf> {
 }
 
 /// The variables an agent session gets: `GH_NO_UPDATE_NOTIFIER=1` always,
-/// and [`DIR_ENV`] set while the gateway is active, removed (`None`)
-/// otherwise so an inherited value can never route.
+/// [`DIR_ENV`] while the gateway is active, and the reader root
+/// ([`crate::forge_identity::FRONT_ROOT_ENV`]) the front's served reads fall
+/// back to. `None` removes a variable.
+///
+/// In the daemon, [`DIR_ENV`] is what it published, so an inherited value can
+/// never route. Anywhere else (the `loom-daemon worker` process
+/// `spawn-worker.sh` starts and then `exec`s into the agent) it is the value
+/// this process inherited from the daemon, when that is still a
+/// [`publish::safe_base`]. Before #12207 such a process computed `None`
+/// here, having published nothing itself, and stripped the variable from
+/// every dispatched agent: the front's reads then all went to the writer.
 #[must_use]
 pub fn agent_env() -> Vec<(&'static str, Option<OsString>)> {
+    let gateway = match DAEMON.get() {
+        Some(_) => active().map(|a| a.base.into_os_string()),
+        None => inherited_base(std::env::var_os(DIR_ENV)),
+    };
     vec![
         (NO_UPDATE_NOTIFIER_ENV, Some(OsString::from("1"))),
-        (DIR_ENV, active().map(|a| a.base.into_os_string())),
+        (DIR_ENV, gateway),
+        (
+            crate::forge_identity::FRONT_ROOT_ENV,
+            crate::forge_identity::agent_reader_root(),
+        ),
     ]
+}
+
+/// A non-daemon spawner's [`DIR_ENV`]: `inherited` when it names a
+/// [`publish::safe_base`], else `None`.
+fn inherited_base(inherited: Option<OsString>) -> Option<OsString> {
+    inherited.filter(|v| !v.is_empty() && publish::safe_base(Path::new(v)))
+}
+
+/// Whether the front may trust a profile directory it was pointed at by its
+/// environment (a gateway or a reader `GH_CONFIG_DIR`): see
+/// [`publish::safe_profile`].
+#[must_use]
+pub fn trusted_profile(dir: &Path) -> bool {
+    publish::safe_profile(dir)
 }
 
 // ---------------------------------------------------------------------------
