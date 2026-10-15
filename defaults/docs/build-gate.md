@@ -346,9 +346,12 @@ belonged to `Install Surface Checks`, outside the mirrored job. This section is
 the audit that says what the gate does and does not predict.
 
 **Audited at** `9ca463f06afa2864aa58f3adbeb8e1a4d743a2ad` (`main`, workflow
-`.github/workflows/ci.yml`). Re-audit when the jobs below change. The set of
-required status contexts is the `main` ruleset's (`gh api
-repos/{owner}/{repo}/rules/branches/main`):
+`.github/workflows/ci.yml`). Re-audit when the jobs below change. Since
+#12106, `Structural Checks`, `Daemon Checks`, `Install Surface Checks` and
+`Repo Hygiene Checks` are one `Lint` job (which `check-structural.sh` now
+mirrors), and the one required context is `CI Result`; the rows below predate
+that merge. The set of required status contexts at the audit, from the `main`
+ruleset (`gh api repos/{owner}/{repo}/rules/branches/main`), was:
 `Structural Checks`, `Shell Syntax (macos-latest)`, `Daemon Checks`, `CI Result`.
 `Install Surface Checks` is **not** itself required; it reaches `main`'s merge
 gate only through `CI Result`.
