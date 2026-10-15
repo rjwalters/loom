@@ -971,6 +971,7 @@ impl RoleDispatcher {
                 &outcome,
                 runner.resolved_launch(),
                 runner.trace_context(),
+                runner.unlaunched_failure(),
             );
             FinishedRun {
                 root: task_root,

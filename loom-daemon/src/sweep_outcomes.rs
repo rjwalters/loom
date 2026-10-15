@@ -1181,6 +1181,7 @@ mod tests {
                 effort: None,
                 detail: None,
                 gated_pool: None,
+                failure_class: None,
                 preference_tier: None,
                 preference_tap: None,
                 role_draw: None,
