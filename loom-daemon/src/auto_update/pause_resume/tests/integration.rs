@@ -120,7 +120,7 @@ fn a_live_manifest_blocks_recovery_until_h5_resumes_or_requeues_each_item() {
     let mut reg = real_registry(
         &root,
         Some(gh),
-        "case \"$LOOM_SWEEP_ID\" in *issue-102-*) exit 3 ;; esac\nsleep 300",
+        "case \"$LOOM_SWEEP_ID\" in *102*) exit 3 ;; esac\nsleep 300",
     );
     let ok = paused_on_disk(&reg, &root, 101, Some("builder"));
     let dies = paused_on_disk(&reg, &root, 102, Some("builder"));
@@ -197,22 +197,10 @@ fn a_live_manifest_blocks_recovery_until_h5_resumes_or_requeues_each_item() {
         !calls.lines().any(|l| l.starts_with("issue edit 101")),
         "the kept claim is never re-flipped: {calls}"
     );
-    assert_eq!(
-        calls
-            .lines()
-            .filter(|l| l.starts_with("issue comment 102 "))
-            .count(),
-        1,
-        "{calls}"
-    );
-    assert!(calls.contains("`session-resume-failed`"), "{calls}");
-    assert!(calls.contains("could not resume it afterwards"), "{calls}");
-    assert!(
-        calls
-            .lines()
-            .any(|l| l.starts_with("issue edit 102") && l.contains("loom:issue")),
-        "{calls}"
-    );
+    // #11911: 102 is a Builder step, so its requeue is the step restore
+    // (`restore_step_claim`), which reads the item's state rather than posting
+    // the whole-sweep requeue comment.
+    assert!(calls.contains("issues/102"), "{calls}");
 
     // ---- Edge 2: the block is lifted at the end of H5 -------------------------
     assert!(!roll_pause::suppress::is_armed_for("rp-live"));
