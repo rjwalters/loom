@@ -198,3 +198,81 @@ fn champion_held_prs_are_a_sibling_state() {
     assert_eq!(c["pr_champion_held"], 1, "PR 40 only; 44 is an issue");
     assert_eq!(c["pr_held"], 4, "pr_held is unchanged and a superset");
 }
+
+/// #12027: `pr_refused` counts this host's standing refusals on open
+/// `loom:pr` PRs, by reason, with the oldest refusal's age.
+#[test]
+fn pr_refused_counts_live_refusals_by_reason_with_the_oldest_age() {
+    use crate::observability::step_verdict::refusals::{Observed, RefusalStore};
+    use chrono::TimeZone;
+    let t0 = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 3, 0, 0).unwrap();
+    let mut store = RefusalStore::default();
+    let refuse =
+        |store: &mut RefusalStore, pr: u64, criterion: &str, reason: &str, minutes: i64| {
+            store.observe(
+                "acme/app",
+                pr,
+                &Observed {
+                    head_sha: Some("abc1234"),
+                    criterion_key: criterion,
+                    reason_key: "k",
+                    reason,
+                    at: t0 + chrono::Duration::minutes(minutes),
+                },
+            );
+        };
+    refuse(&mut store, 11277, "ci-status", "ci_failing", 0);
+    refuse(&mut store, 11313, "ci-status", "ci_failing", 30);
+    refuse(&mut store, 50, "merge-conflict", "conflict", 10);
+    refuse(&mut store, 51, "ci-status", "ci_failing", 40);
+    // The walk: #51 lost `loom:pr`, #50 was merged (gone from the open walk).
+    let rows = [
+        row(11277, &["loom:pr"], Some("")),
+        row(11313, &["loom:pr"], Some("")),
+        row(51, &["loom:review-requested"], Some("")),
+        row(52, &["loom:pr"], None),
+    ];
+    let open = super::approved_open(&rows);
+    assert_eq!(open.into_iter().collect::<Vec<_>>(), vec![11277, 11313], "52 is an issue");
+    store.reconcile("acme/app", &super::approved_open(&rows));
+    let now = t0 + chrono::Duration::hours(2);
+    let points = super::refused_points(&store, "acme/app", now);
+    let get = |name: MetricName, reason: &str| {
+        points
+            .iter()
+            .find(|p| {
+                p.name == name
+                    && p.labels.get("reason").map(String::as_str) == Some(reason)
+                    && p.labels.get("state").map(String::as_str) == Some("pr_refused")
+                    && p.labels.get("repo").map(String::as_str) == Some("acme/app")
+            })
+            .map(|p| p.value)
+    };
+    use crate::telemetry::ops::MetricValue;
+    assert_eq!(get(MetricName::ForgeStageItems, "ci_failing"), Some(MetricValue::Int(2)));
+    assert_eq!(get(MetricName::ForgeStageItems, "conflict"), Some(MetricValue::Int(0)));
+    assert_eq!(
+        get(MetricName::ForgeStageOldestAgeSeconds, "ci_failing"),
+        Some(MetricValue::Int(7200)),
+        "now - min(first_refused_at)"
+    );
+    assert_eq!(
+        get(MetricName::ForgeStageOldestAgeSeconds, "conflict"),
+        None,
+        "no refusal, no age"
+    );
+    // A moved head: the standing refusal no longer applies.
+    assert!(store
+        .touch("acme/app", 11277, Some("fffffff"), now)
+        .is_none());
+    assert!(super::refused_points(&store, "acme/app", now)
+        .iter()
+        .any(|p| p.name == MetricName::ForgeStageItems
+            && p.labels.get("reason").map(String::as_str) == Some("ci_failing")
+            && p.value == MetricValue::Int(1)));
+    // A repo this host never refused on (or whose walk was shed): absent.
+    assert!(super::refused_points(&store, "acme/other", now).is_empty());
+    for point in &points {
+        assert_eq!(bounded_labels(&point.labels), point.labels);
+    }
+}

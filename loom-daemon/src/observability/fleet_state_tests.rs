@@ -67,6 +67,7 @@ fn ready(repo: &str, issue: u32, rank: u32) -> ReadyItem {
         main_red_fix: false,
         eligible_reason: None,
         eligible_at: None,
+        dispatch_blocked_reason: None,
     }
 }
 

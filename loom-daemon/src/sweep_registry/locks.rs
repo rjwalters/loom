@@ -1124,6 +1124,9 @@ impl SweepRegistry {
 
         // #11898: PR steps hold `pr-<N>` locks, which the loop above skips.
         admitted += self.adopt_pr_steps(only);
+        // #11909: the adopted steps' slots reach `busy_slots` now, not only
+        // at the next spawn.
+        self.publish_step_slots();
 
         // Checkpoints for daemon-owned sweeps whose process is gone -> Crashed
         // entries (so list_sweeps shows them; the next dispatch resumes via the

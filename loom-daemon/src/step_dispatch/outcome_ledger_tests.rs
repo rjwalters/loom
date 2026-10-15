@@ -620,6 +620,45 @@ fn a_repeated_identical_state_refusal_arms_a_doubling_cooldown() {
         .is_some());
 }
 
+/// #11909: the reaper prunes every tick. A prune just before each draw must
+/// not drop a refusal streak whose cooldown reached the 24 h cap (the same
+/// length as the prune window): the next identical refusal keeps the 24 h
+/// cooldown instead of restarting at 10 min.
+#[test]
+fn a_prune_inside_the_refusal_loop_keeps_the_streak_capped() {
+    let mut l = OutcomeLedger::default();
+    let step = StepRole::ChampionMerge;
+    let refuse = out(OutcomeClass::Refused, "not_eligible");
+    let mut at = t0();
+    let mut lengths = Vec::new();
+    for _ in 0..16 {
+        let rec = l.record(70, step, &refuse, SLOW, at);
+        if let Some(until) = rec.cooling_until {
+            lengths.push((until - at).num_seconds());
+            // The next draw is just after the cooldown ends, with a reaper
+            // prune in between.
+            at = until + mins(1);
+        } else {
+            at += mins(1);
+        }
+        l.prune(at);
+    }
+    let capped: Vec<i64> = lengths
+        .iter()
+        .copied()
+        .skip_while(|s| *s < 24 * 3600)
+        .collect();
+    assert!(capped.len() >= 4, "{lengths:?}");
+    assert!(capped.iter().all(|s| *s == 24 * 3600), "the streak restarted: {lengths:?}");
+    // A full window past the cooldown with no refusal: the streak is gone.
+    l.prune(at + chrono::Duration::days(2));
+    assert_eq!(
+        l.record(70, step, &refuse, SLOW, at + chrono::Duration::days(2))
+            .cooling_until,
+        None
+    );
+}
+
 /// #11969: a Curator or Champion-promote fast failure takes the ledger-local
 /// window, never the issue ladder (whose release would restore `loom:issue`).
 #[test]

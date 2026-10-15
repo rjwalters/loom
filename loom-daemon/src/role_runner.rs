@@ -1320,10 +1320,8 @@ pub struct RoleRunnerConfig {
     /// fleet host where the roots disagree, the effective ceiling for a given
     /// tick is that root's own — the tighter root simply refuses sooner.
     pub max_concurrent: Option<usize>,
-    /// `autonomous.roleRunner.championMode` (#11859) — `"all"` (absent) or
-    /// `"non-item"`: whether an interval Champion tick works every queue or
-    /// only the non-item ones. Per root, config only; see
-    /// [`champion_mode`] and [`resolve_role_prompt`].
+    /// `autonomous.roleRunner.championMode` (#11859), retired by #11909:
+    /// parsed only to warn. Champion always runs non-item ([`champion_mode`]).
     pub champion_mode: Option<champion_mode::ChampionMode>,
 }
 
@@ -1840,7 +1838,7 @@ pub fn resolve_on_idle_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
             );
         }
     }
-    out
+    champion_mode::without_step_roles(out, Some("onIdle"))
 }
 
 /// Age since `role`'s last completed tick at `root`, per
@@ -2197,8 +2195,8 @@ pub fn resolve_max_concurrent_for(repo_root: &Path) -> usize {
 /// The prompt string actually passed to `claude -p` for one dispatch of
 /// `spec`.
 ///
-/// Every role but `architect` (and `champion` under
-/// `championMode: "non-item"`, which appends `--non-item`, #11859) resolves
+/// Every role but `architect` (and `champion`, which always appends
+/// `--non-item` since #11909) resolves
 /// to its static [`RoleSpec::prompt`] verbatim (byte-for-byte the pre-#5656
 /// behavior). `architect` additionally
 /// carries the resolved per-invocation proposal cap as a slash-command
@@ -2219,8 +2217,8 @@ pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String
             resolve_architect_max_proposals(config)
         );
     }
-    // #11859: `championMode: "non-item"` dispatches `/loom:champion --non-item`.
-    if let Some(arg) = champion_mode::prompt_arg(spec.name, config.champion_mode) {
+    // #11909: Champion's item work is steps; its interval run is non-item.
+    if let Some(arg) = champion_mode::prompt_arg(spec.name) {
         return format!("{} {arg}", spec.prompt);
     }
     spec.prompt.to_string()
@@ -3921,8 +3919,8 @@ use skip_counters::{
     POOL_EXHAUSTED_SKIP_COUNT,
 };
 
-// `autonomous.roleRunner.championMode` (#11859) — Champion's non-item-only
-// interval mode; see `role_runner/champion_mode.rs`.
+// Champion non-item only, item roles off the interval (#11909); see
+// `role_runner/champion_mode.rs`.
 pub mod champion_mode;
 
 #[cfg(test)]

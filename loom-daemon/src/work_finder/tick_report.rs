@@ -314,6 +314,8 @@ pub struct TickReport {
     /// The `loom:very-important` issues the flood cap ranked as important
     /// this tick (#11509), in listing order; exported in `pick.decision`.
     pub vi_demotions: Vec<super::vi_cap::ViDemotion>,
+    /// The step tick's item draws (#11909), exported on `pick.decision`.
+    pub item_draw: Option<crate::telemetry::kinds::pick_decision::PickItemDraw>,
 }
 
 impl TickReport {

@@ -243,6 +243,7 @@ fn verdict_record(
         mode,
         applied: item.applied,
         at,
+        step: Default::default(),
     }
 }
 
