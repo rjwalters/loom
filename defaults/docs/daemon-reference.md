@@ -2461,7 +2461,14 @@ blocker is Loom-owned:
 - **What counts as Loom-owned.** The `installed_files` of
   `.loom/install-metadata.json` at HEAD, at the branch tip and at
   `origin/<default>`, plus the metadata file. Missing or unparseable metadata
-  on any side means nothing is repaired. Every local commit (and every commit
+  on any side means nothing is repaired. Because only the installer writes
+  `installed_files`, a file a later release added is missing from it, so the
+  surfaces the resync overwrites wholesale also count (#11989): anything under
+  `.loom/{roles,scripts,docs,runtimes,bin,hooks}/`, `.claude/commands/loom/`
+  and `.agents/skills/loom-*/`, and the single files `.loom/pricing.json`,
+  `.loom/biome.jsonc`, `.claude/biome.jsonc`, `.claude/README.md` and
+  `.github/CONFIGURATION.md`. A path pinned in `.loom/resync-ignore` is never
+  counted that way. Every local commit (and every commit
   of an in-progress rebase, merge or cherry-pick) may change only those paths,
   and so may every dirty tracked path. Dirt counts only on a checkout that is
   behind. Untracked files are never touched; one where `origin` writes a file
@@ -2470,10 +2477,20 @@ blocker is Loom-owned:
   cherry-pick is repaired only when its state is 30 minutes old and no `git`
   process has its working directory in the repo. An `index.lock` is removed
   only when empty, 30 minutes old and no `git` process is live there.
+- **A detached HEAD** with nothing in progress (a role session's `git checkout
+  origin/main` or of a PR head, left in the main checkout) is put back on the
+  default branch when it is behind `origin/<default>`, has not moved for 6
+  hours (`LOOM_CHECKOUT_DETACHED_AFTER_MINUTES`, from the newest line of the
+  HEAD reflog) and every commit on it is Loom-owned. One at origin's tip is
+  left alone: it already serves current files (2am's `provision.sh` keeps
+  geode-fem detached at its newest green commit this way). The branch tip gets
+  its `-branch` rescue ref, then `checkout -B <default> --track
+  origin/<default>`.
 - **Repair, in order.** `refs/loom/rescue/<UTC ts>` at HEAD (and `<ts>-branch`
   at the branch tip when an operation moved HEAD); the lock; `stash push` of
   the dirty paths as `loom-rescue-<ts>` (not during an operation, whose abort
-  discards them); `<op> --abort`; `reset --hard origin/<default>`. A failure
+  discards them); `<op> --abort`, or the re-attach of a detached HEAD;
+  `reset --hard origin/<default>`. A failure
   stops the repair, before the reset, and the ordinary rules report the
   checkout as before.
 - **Write gates.** Nothing is written while `fleet.autoApply` is off, the host
@@ -2486,8 +2503,8 @@ blocker is Loom-owned:
   the command to run, until the hold clears. Memory is per process, so a
   restart asks once more.
 - **Telemetry.** Each step is an event on `fleet_sync.checkout` with kind
-  `rescue-ref`, `lock-removed`, `stash`, `abort`, `repaired`, `repair-failed`,
-  `rescue-pruned` or `escalated`, and a log line naming the repo path. Carrying
+  `rescue-ref`, `lock-removed`, `stash`, `abort`, `reattached`, `repaired`,
+  `repair-failed`, `rescue-pruned` or `escalated`, and a log line naming the repo path. Carrying
   these to SigNoz is #11386.
 
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)

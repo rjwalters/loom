@@ -859,6 +859,7 @@ fn role_tick_outcome_envelope(
             preference_tier: None,
             preference_tap: None,
             role_draw: None,
+            prompt: None,
             // Issue #8507: a Claude tick writes no launch record.
             runtime: None,
             provider: None,
