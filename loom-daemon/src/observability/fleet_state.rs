@@ -64,9 +64,9 @@ use serde_json::Value;
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
     split_into_chunks, CuratorState, FleetCapacity, FleetEligibleReason, FleetHoldKind,
-    FleetPrCensus, FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots, FleetStage,
-    FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason, PlannerStamps,
-    ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
+    FleetPrCensus, FleetQueueDepth, FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots,
+    FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason,
+    PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
@@ -74,6 +74,7 @@ pub mod enrich;
 mod flow;
 pub mod history;
 pub mod outcomes;
+mod pending_queue;
 mod pre_ready_journal;
 mod sources;
 mod step_rows;
@@ -384,6 +385,9 @@ pub struct RepoView {
     pub triage_flow: Option<FleetQueueFlow>,
     /// The Curator role-runner's cadence and last run for the repo (#11642).
     pub curator: Option<CuratorState>,
+    /// The repo's pending-human queue depth (#11955). Absent = unknown, never
+    /// zero.
+    pub pending_queue: Option<FleetQueueDepth>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -759,6 +763,7 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         triage_depth: state.and_then(|r| r.triage_depth),
         triage_flow: state.and_then(|r| r.triage_flow),
         curator: state.and_then(|r| r.curator.clone()),
+        pending_queue: state.and_then(|r| r.pending_queue),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -862,6 +867,7 @@ pub fn decide(
             && now_state.triage_depth == was.triage_depth
             && now_state.triage_flow == was.triage_flow
             && now_state.curator == was.curator
+            && now_state.pending_queue == was.pending_queue
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -1105,7 +1111,7 @@ pub(super) async fn record(
     };
     let _pass = pass_lock().lock().await;
     let now = Utc::now();
-    let (input, mut reused, curated, triage) =
+    let (input, mut reused, curated, triage, eligible) =
         sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
     // The complete `loom:triage` sets this pass read, before `triage` is moved
     // into the outcome diff (#11642). Every repo present was read whole.
@@ -1138,6 +1144,8 @@ pub(super) async fn record(
         annotate_flow(&mut view, &mut live.flow, input.ready.as_ref(), now);
         annotate_triage(&mut view, &mut live.triage_flow, Some(&triage_sets), now);
     }
+    // A repo whose listing was incomplete this pass drops out: unknown.
+    pending_queue::observe(&mut view, eligible);
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;
@@ -1173,6 +1181,7 @@ async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_po
         // last collector-pass observation (#11642).
         annotate_triage(&mut view, &mut live.triage_flow, None, now);
     }
+    pending_queue::restamp(&mut view);
     send(sink, workspace_root, view, state, now, &reused);
 }
 

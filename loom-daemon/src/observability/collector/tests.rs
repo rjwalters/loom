@@ -1053,6 +1053,7 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         tmpfs_visibility: None,
         ci_telemetry: None,
         fleet_sync: None,
+        resync_pins: Vec::new(),
     }
 }
 

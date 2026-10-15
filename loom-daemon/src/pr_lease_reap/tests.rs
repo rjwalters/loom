@@ -27,6 +27,14 @@ fn a_held_line_round_trips_and_malformed_lines_drop() {
     }
     let text = format!("{}\nnoise\n{}\n", h.line(), h.line());
     assert_eq!(parse_file(&text), vec![h], "duplicates and noise drop");
+    // A step's Curator and Champion leases are reaped too (#11906).
+    for role in ["curator", "champion"] {
+        let step = Held {
+            role: role.into(),
+            ..judge(80, "step-x-80-1")
+        };
+        assert_eq!(Held::parse(&step.line()), Some(step));
+    }
 }
 
 #[test]

@@ -126,10 +126,13 @@ for j in ("worker-base-image", "worker-image-smoke", "session-image-smoke", "nat
     assert "changes-push" in jobs[j]["needs"], f"{j} must need changes-push"
     assert "changes-images" in jobs[j]["needs"], f"{j} must need changes-images"
 # release-build produces the binary worker-base-image downloads: its gate must
-# stay a superset (unconditional on push and merge_group, backend||docker on PRs).
+# stay a superset (unconditional on push and merge_group, equal to the image
+# gate's `docker == 'true'` term on PRs; no `backend` leg since #11966).
 rb = " ".join(jobs["release-build"]["if"].split())
-for frag in ("github.event_name == 'push' ||", "github.event_name == 'merge_group' ||", "needs.changes-images.outputs.docker == 'true'"):
+assert rb.startswith("always() && "), "release-build gate must keep always() (changes/changes-images skip on push)"
+for frag in ("github.event_name == 'push' ||", "github.event_name == 'merge_group' ||", "(github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true')"):
     assert frag in rb, f"release-build gate must keep `{frag}` (superset of the image gate)"
+assert "needs.changes.outputs.backend" not in rb, "release-build must not run on every backend PR (#11966; owed by push + ci-daily)"
 print("ok: ci.yml image-gate wiring")
 PY
 else

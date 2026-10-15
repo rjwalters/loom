@@ -8,10 +8,10 @@
 //! | `Advance` | the item's local history and cooldowns are dropped; so is every peer copy in this host's view, and every peer is told to drop its own (a zero-length `StepCooldownArmed` for **every** step of the item, whoever armed it); a Champion verdict also removes its step's forge ladder |
 //! | `Landed` | the same, plus the #11853 landed cooldown on the issue (fleet-wide, every consumer) and a 24 h Builder cooldown on `(item, builder)` |
 //! | `Cooldown` | the window, broadcast |
-//! | `FastFailLadder` (issue steps) | [`SweepRegistry::charge_fast_failure`] (the #11854 ladder and park), and the ladder's window mirrored onto `(item, step)` and broadcast |
-//! | `FastFailWindow` (PR steps) | the ledger's own doubling window, broadcast; **no** forge write: the issue quarantine's park and release are issue-only |
+//! | `FastFailLadder` (Builder steps only) | [`SweepRegistry::charge_fast_failure`] (the #11854 ladder and park), and the ladder's window mirrored onto `(item, step)` and broadcast |
+//! | `FastFailWindow` (every other step: PR steps, Curator, Champion promotion) | the ledger's own doubling window, broadcast; **no** forge write: the park's release restores `loom:issue`, which is only right for an issue Builder was building (#11969) |
 //! | `ForgeLadder` | the next rung written to the item's body ([`reeval_ladder::record`]), its due time mirrored locally (capped at 24 h) and broadcast |
-//! | `Redraw` | counted |
+//! | `Redraw` | counted; a second in a row on the pair arms the ledger's doubling refusal cooldown, broadcast (#11969) |
 //! | `Reclassify` | nothing for the first; a second identical state refusal in a row arms the ledger's doubling refusal cooldown, broadcast. Not a repeat-cap run |
 //! | `Failed` (slow) | counted toward the repeat cap |
 //!
