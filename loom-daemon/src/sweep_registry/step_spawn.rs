@@ -38,6 +38,15 @@
 //! only on the reaper's heartbeat, so two hosts cannot draw the same item in
 //! between.
 //!
+//! # Landed work (#12251)
+//!
+//! Before a Builder step claims an issue, the forge is asked once whether
+//! its work already landed: a merged PR that closes it, or one built on its
+//! own `feature/issue-N` branch into the default branch
+//! (`work_finder::landed_prefilter::landed_at_spawn`). A landed issue is
+//! routed to Curator, the step is refused `already_landed`, and the Builder
+//! is held off it fleet-wide ([`SweepRegistry::hold_landed_builder`]).
+//!
 //! # After the spawn
 //!
 //! Every step's lease is renewed while it runs ([`lease`]); every step has
@@ -148,6 +157,22 @@ fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Whether issue `item`'s work already landed, asked of the forge right
+/// before a Builder step claims it (#12251): the merged PR when it did.
+/// `target` is the registry's `(gh, root, slug)`.
+pub(crate) fn landed_at_spawn(target: &(PathBuf, PathBuf, String), item: u32) -> Option<u32> {
+    let (gh_bin, root, slug) = target;
+    crate::work_finder::landed_prefilter::landed_at_spawn(gh_bin, root, slug, item)
+}
+
+/// The refusal of a Builder step on an issue whose work landed by `pr`.
+pub(crate) fn landed_refusal(item: u32, pr: u32) -> StepRefusal {
+    StepRefusal::new(
+        ALREADY_LANDED_REASON,
+        format!("issue #{item} is still open but PR #{pr}, which lands it, has merged"),
+    )
+}
+
 /// Map a role tick's pre-spawn refusal to a step refusal. Pure.
 pub(crate) fn refusal_of(outcome: &crate::role_runner::RoleTickOutcome) -> StepRefusal {
     use crate::role_runner::RoleTickOutcome as O;
@@ -205,6 +230,15 @@ impl SweepRegistry {
         self.roll_gate
             .admit(&kind)
             .map_err(|e| StepRefusal::new("roll_paused", e))?;
+        if role == StepRole::Builder {
+            if let Some(pr) = self
+                .open_pr_listing_target()
+                .and_then(|t| landed_at_spawn(&t, item))
+            {
+                self.hold_landed_builder(item);
+                return Err(landed_refusal(item, pr));
+            }
+        }
         let launch = Self::resolve_step_launch(&self.config, role, &kind)?;
         let sweep_id = generate_sweep_id(&kind);
         let locked = if role.acts_on_pr() {
