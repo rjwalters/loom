@@ -2471,6 +2471,31 @@ assert_deny "write-confinement (#6968 control): cp with an embedded-apostrophe s
 
 rm -rf "$WT5674_REPO"
 
+# --- #12082: a `cd` inside a subshell / brace group / pushd must be tracked, so
+# a RELATIVE write after it that lands outside the repo is not denied as a
+# main-checkout write. cwd is the main checkout throughout.
+OUT12082="/tmp/loom-test-$$-12082"
+assert_allow "write-confinement (#12082): absolute out-of-repo target at main-checkout cwd allows" \
+    "echo x > $OUT12082/a.txt" "$WT_REPO"
+assert_allow "write-confinement (#12082): ( cd /tmp/x && echo > rel ) subshell allows" \
+    "( cd $OUT12082 && echo x > a.txt )" "$WT_REPO"
+assert_allow "write-confinement (#12082): (cd /tmp/x && echo > rel) with no inner spaces allows" \
+    "(cd $OUT12082 && echo x > a.txt)" "$WT_REPO"
+assert_allow "write-confinement (#12082): { cd /tmp/x; echo > rel; } brace group allows" \
+    "{ cd $OUT12082; echo x > a.txt; }" "$WT_REPO"
+assert_allow "write-confinement (#12082): pushd /tmp/x && echo > rel allows" \
+    "pushd $OUT12082 >/dev/null && echo x > a.txt" "$WT_REPO"
+assert_allow "write-confinement (#12082): cd persists after a closed subshell group" \
+    "cd $OUT12082 && (echo y > b.txt); echo x > a.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): a subshell cd does not leak past its closing paren" \
+    "(cd $OUT12082 && echo x > a.txt); echo x > b.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): a paren inside a quoted string does not close the subshell" \
+    "(cd $OUT12082; echo \")\" > a.txt); echo x > b.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): popd restores the pre-pushd cwd" \
+    "pushd $OUT12082 >/dev/null; popd >/dev/null; echo x > b.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): main-checkout target still denies" \
+    "echo hi > $WT_REPO/zz.txt" "$WT_REPO"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 

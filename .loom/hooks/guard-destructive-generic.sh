@@ -8619,6 +8619,7 @@ _extract_write_targets_scan() {
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
+        sw_depth = 0; sw_pending = 0; pd_depth = 0   # #12082 subshell / pushd stacks
     }
     # Slurp the whole (possibly multi-line) command into ONE buffer,
     # preserving embedded newlines (mirrors the #3898 multi-line
@@ -8703,6 +8704,38 @@ _extract_write_targets_scan() {
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
+
+            # GROUPING OPENERS AND CLOSERS AROUND A `cd` (#12082). The cd
+            # tracker below only fires when the segment WORD is `cd`, so
+            # `( cd /tmp/x && echo hi > a.txt )` and `{ cd /tmp/x; ...; }` were
+            # never tracked: the relative write resolved against the hook cwd
+            # (the main checkout) and was denied although it lands in /tmp/x.
+            #   * A subshell `(` saves curcwd on a stack and its matching `)`
+            #     restores it, because a cd inside a subshell never leaks out.
+            #     Restoring on an unmatched `)` can only RESTORE the pre-group
+            #     cwd, so a miscount errs toward more denials, not fewer.
+            #   * A brace group `{ ` runs in the current shell, so it is only
+            #     stripped; its cd correctly persists.
+            # Quoted spans are blanked before counting parens so a `(` or `)`
+            # inside a string can neither open nor close a group.
+            if (sw_pending > 0) {
+                while (sw_pending > 0 && sw_depth > 0) { curcwd = sw_stack[sw_depth]; sw_depth--; sw_pending-- }
+                sw_pending = 0
+            }
+            while (seg ~ /^\{[ \t]/) sub(/^\{[ \t]+/, "", seg)
+            while (seg ~ /^\(/ && seg !~ /^\(\(/) {
+                sw_depth++
+                sw_stack[sw_depth] = curcwd
+                sub(/^\([ \t]*/, "", seg)
+            }
+            if (sw_depth > 0) {
+                _pq = seg
+                gsub(/"[^"]*"/, "", _pq)
+                gsub(/'"'"'[^'"'"']*'"'"'/, "", _pq)
+                _po = gsub(/\(/, "", _pq)
+                _pc = gsub(/\)/, "", _pq)
+                if (_pc > _po) sw_pending = _pc - _po
+            }
             if (seg == "") continue
 
             # `NAME=value` assignments in any ordinary shell assignment
@@ -8769,7 +8802,13 @@ _extract_write_targets_scan() {
             mseg = substr(gsegs[i], stripped + 1)
             mm = split(mseg, mtoks, /[ \t]+/)
 
-            if (toks[1] == "cd") {
+            # `popd` undoes the most recent `pushd` of THIS command (#12082).
+            if (toks[1] == "popd") {
+                if (pd_depth > 0) { curcwd = pd_stack[pd_depth]; pd_depth-- }
+                continue
+            }
+            if (toks[1] == "cd" || (toks[1] == "pushd" && m >= 2 && toks[2] !~ /^-/)) {
+                if (toks[1] == "pushd") { pd_depth++; pd_stack[pd_depth] = curcwd }
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     # SAME-COMMAND VARIABLE RESOLUTION FOR THE cd ARGUMENT
                     # ITSELF (#7294, mirrors parse_force_ops'"'"' identical
