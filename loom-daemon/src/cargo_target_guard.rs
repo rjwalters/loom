@@ -291,7 +291,7 @@ pub enum Verdict {
     Ask(shared::SharedAsk),
 }
 
-/// The deny (when its toggle is on), else the shared-target ask (when its
+/// The deny (when its toggle is on), else the shared-target deny (when its
 /// toggle is on). Each toggle is read only once its verdict is about to fire.
 #[must_use]
 pub fn check_all(
