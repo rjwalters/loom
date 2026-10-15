@@ -18,7 +18,11 @@
 //!   [`DEFAULT_PUSH_WINDOW_MINUTES`], `0` turns the check off) by a login
 //!   other than this workspace's writer identity. The time and actor come
 //!   from the repository activity API, so a rebase that keeps old commit
-//!   dates still counts as a push.
+//!   dates still counts as a push. A write to the branch is any of
+//!   [`WRITE_ACTIVITY_TYPES`]: the API reports a force push (a rebase, an
+//!   amend, a `--force-with-lease`) as its own `force_push` type and takes
+//!   only one `activity_type` filter, so the read asks for every type and
+//!   keeps the write types client-side.
 //!
 //! Both checks are extra evidence on top of the PR's own lease list, which
 //! keeps its fail-closed exit 5. So an unreadable closing-issue lease list or
@@ -45,9 +49,14 @@ pub(crate) const PUSH_WINDOW_ENV: &str = "LOOM_DOCTOR_PUSH_WINDOW_MINUTES";
 /// "recently active" window a lease gets.
 pub(crate) const DEFAULT_PUSH_WINDOW_MINUTES: i64 = 15;
 
-/// How many recent pushes the activity read asks for. Only the newest one
-/// inside the window matters, and a branch rarely sees more than a few
-/// pushes in 15 minutes.
+/// The activity types that count as a write to the head branch. The API
+/// reports a force push as `force_push`, not `push`; a deleted and
+/// re-created branch shows as `branch_creation`.
+pub(crate) const WRITE_ACTIVITY_TYPES: [&str; 3] = ["push", "force_push", "branch_creation"];
+
+/// How many recent activity records the read asks for. Only the newest
+/// write inside the window matters, and a branch rarely sees more than a few
+/// in 15 minutes.
 const ACTIVITY_PAGE: u32 = 10;
 
 /// The activity read has no inventory row yet.
@@ -73,13 +82,18 @@ pub(crate) struct Push {
     pub(crate) login: String,
 }
 
-/// Parse the activity read's NDJSON (`{timestamp, login}` per line).
-/// Malformed lines drop. Pure.
+/// Parse the activity read's NDJSON (`{timestamp, login, type}` per line),
+/// keeping only [`WRITE_ACTIVITY_TYPES`]. Malformed lines, and records of any
+/// other type (a merge, a branch deletion), drop. Pure.
 pub(crate) fn parse_pushes(ndjson: &str) -> Vec<Push> {
     ndjson
         .lines()
         .filter_map(|line| {
             let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+            let kind = v.get("type")?.as_str()?;
+            if !WRITE_ACTIVITY_TYPES.contains(&kind) {
+                return None;
+            }
             let at = DateTime::parse_from_rfc3339(v.get("timestamp")?.as_str()?)
                 .ok()?
                 .with_timezone(&Utc);
@@ -246,19 +260,20 @@ impl Gh {
         parse_head(&serde_json::from_slice(&out.ok_output()?.stdout).ok()?)
     }
 
-    /// The newest pushes to `branch`; `None` when unreadable.
+    /// The newest writes to `branch` (every [`WRITE_ACTIVITY_TYPES`] kind);
+    /// `None` when unreadable.
     pub(crate) fn branch_pushes(&self, branch: &str) -> Option<Vec<Push>> {
         let out = self
             .inv("pr_lease.branch_pushes", AccessIntent::Read, ACTIVITY_OP)
             .args([
                 "api",
                 &format!(
-                    "repos/{{owner}}/{{repo}}/activity?ref={}&activity_type=push\
-                     &per_page={ACTIVITY_PAGE}",
+                    "repos/{{owner}}/{{repo}}/activity?ref={}&per_page={ACTIVITY_PAGE}",
                     query_escape(&format!("refs/heads/{branch}"))
                 ),
                 "--jq",
-                ".[] | {timestamp: .timestamp, login: (.actor.login // \"\")}",
+                ".[] | {timestamp: .timestamp, login: (.actor.login // \"\"), \
+                 type: (.activity_type // \"\")}",
             ])
             .run();
         Some(parse_pushes(&String::from_utf8_lossy(&out.ok_output()?.stdout)))

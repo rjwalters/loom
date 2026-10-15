@@ -181,10 +181,28 @@ fn the_head_and_the_activity_records_parse() {
     assert_eq!(parse_head(&gone).map(|h| h.same_repo), Some(false));
     assert_eq!(parse_head(&serde_json::json!({"branch": ""})), None);
 
-    let ndjson = "{\"timestamp\":\"2026-10-15T11:58:00Z\",\"login\":\"rjwalters\"}\n\
-                  not json\n\
-                  {\"timestamp\":\"2026-10-15T11:50:00Z\",\"login\":\"\"}\n";
-    assert_eq!(parse_pushes(ndjson), vec![push(2, "rjwalters")]);
+    let ndjson = concat!(
+        r#"{"timestamp":"2026-10-15T11:58:00Z","login":"rjwalters","type":"push"}"#,
+        "\nnot json\n",
+        r#"{"timestamp":"2026-10-15T11:50:00Z","login":"","type":"push"}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-15T11:57:00Z","login":"amender","type":"force_push"}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-15T11:56:00Z","login":"recreator","type":"branch_creation"}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-15T11:59:00Z","login":"merger","type":"pr_merge"}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-15T11:59:00Z","login":"untyped"}"#,
+        "\n",
+    );
+    assert_eq!(
+        parse_pushes(ndjson),
+        vec![
+            push(2, "rjwalters"),
+            push(3, "amender"),
+            push(4, "recreator")
+        ]
+    );
     assert_eq!(query_escape("refs/heads/feature/a b&c"), "refs/heads/feature/a%20b%26c");
 }
 
@@ -275,10 +293,18 @@ fn comment(id: u64, age_min: i64, first_line: &str) -> String {
 }
 
 fn pushes(dir: &Path, list: &[(i64, &str)]) {
+    let typed: Vec<(i64, &str, &str)> = list.iter().map(|(a, l)| (*a, *l, "push")).collect();
+    activity_records(dir, &typed);
+}
+
+/// `(age_min, login, activity_type)` records, as the activity read's jq
+/// emits them.
+fn activity_records(dir: &Path, list: &[(i64, &str, &str)]) {
     let ndjson: String = list
         .iter()
-        .map(|(age, login)| {
-            format!(r#"{{"timestamp":"{}","login":"{login}"}}"#, stamp_ago(*age)) + "\n"
+        .map(|(age, login, kind)| {
+            format!(r#"{{"timestamp":"{}","login":"{login}","type":"{kind}"}}"#, stamp_ago(*age))
+                + "\n"
         })
         .collect();
     fs::write(dir.join("pushes"), ndjson).unwrap();
@@ -349,7 +375,33 @@ fn a_doctor_stands_down_on_a_recent_push_by_another_login() {
     assert!(posted(dir.path()).is_empty());
     let read = activity_reads(dir.path());
     assert!(read.contains("ref=refs/heads/feature/issue-12"), "{read}");
-    assert!(read.contains("activity_type=push"), "{read}");
+    // No `activity_type` filter: with `=push` a force push is never seen.
+    assert!(!read.contains("activity_type="), "{read}");
+}
+
+#[test]
+fn a_doctor_stands_down_on_a_recent_force_push_by_another_login() {
+    // A rebase or amend pushed with `--force-with-lease` is a `force_push`
+    // record, not a `push`: it holds the PR just the same.
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    activity_records(dir.path(), &[(3, "rjwalters", "force_push"), (30, SELF_LOGIN, "push")]);
+    assert_eq!(ctx(dir.path(), who(Role::Doctor, "sweep-me")).claim(), EXIT_ACTIVE);
+    assert!(posted(dir.path()).is_empty(), "nothing written");
+
+    // Our own force push, or a recent non-write record by someone else, does not.
+    for list in [
+        vec![(2, SELF_LOGIN, "force_push")],
+        vec![
+            (1, "rjwalters", "pr_merge"),
+            (1, "rjwalters", "branch_deletion"),
+        ],
+    ] {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        activity_records(dir.path(), &list);
+        assert_eq!(ctx(dir.path(), who(Role::Doctor, "sweep-me")).claim(), EXIT_HELD, "{list:?}");
+    }
 }
 
 #[test]

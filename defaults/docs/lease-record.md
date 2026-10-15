@@ -737,7 +737,11 @@ the same lease semantics, **keyed by role**:
   sweep)` (an attended builder's lease lives there); or a push to the head
   branch by a login other than the workspace's writer identity within
   `LOOM_DOCTOR_PUSH_WINDOW_MINUTES` (default 15, `0` off), read from the
-  repository activity API. These are evidence beyond the PR's own lease list,
+  repository activity API. A push here is a `push`, `force_push` or
+  `branch_creation` activity record, so a rebase or amend counts. An attended
+  Doctor that pushes under a person's login (not the writer App) sees its own
+  pushes as foreign; it runs with `LOOM_DOCTOR_PUSH_WINDOW_MINUTES=0`.
+  These are evidence beyond the PR's own lease list,
   so an unreadable closing-issue list or activity read proceeds. A fork head
   is not checked. A re-attach to the claimant's own live lease skips the
   guard. On the step path exit 7 is the refusal `peer_active`, which the
