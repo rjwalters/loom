@@ -160,6 +160,9 @@ fn samples() -> Vec<TelemetryRecord> {
         wire(json!({"kind": "backlog.level", "repo": "rjwalters/loom", "open": 412,
                     "target": 140, "level": "strict", "dispatch_id": "role-curator-x",
                     "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "write_scope.refused", "credential": "gh-process-default",
+                    "call_site": "claim reconciliation", "reason": "unverifiable",
+                    "refused_at": AT, "loom": p})),
     ]
 }
 

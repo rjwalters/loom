@@ -163,6 +163,9 @@ pub mod auto_update_tick;
 
 pub mod backlog_level;
 
+/// `write_scope.refused` (#12168) — a daemon write the #9548 gate refused.
+pub mod write_scope_refused;
+
 /// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
 pub mod checkout_external_change;
 
@@ -474,6 +477,12 @@ macro_rules! telemetry_kind_table {
             /// (#11819): open count, target, level. OTLP-only. See
             /// [`backlog_level`].
             BacklogLevel = "backlog.level" => $crate::telemetry::kinds::backlog_level::BacklogLevelRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One daemon-pass write the #9548 credential-scope gate refused
+            /// (Issue #12168): repo, credential identity, call site and a
+            /// closed reason class. OTLP-only. See [`write_scope_refused`].
+            WriteScopeRefused = "write_scope.refused" => $crate::telemetry::kinds::write_scope_refused::WriteScopeRefusedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

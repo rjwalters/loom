@@ -859,3 +859,129 @@ fn shell_write_paths_are_vetted() {
          (#9548): {offenders:?}"
     );
 }
+
+// ---- write_scope.refused telemetry (#12168) --------------------------------
+
+fn classified(
+    t: Option<GhTarget>,
+    explicit: bool,
+    origin: Option<&str>,
+    managed: &[&str],
+    probe: &FakeProbe,
+) -> Decision {
+    let m = |r: &str| managed.iter().any(|x| x.eq_ignore_ascii_case(r));
+    decide_classified(
+        &Inputs {
+            target: t,
+            explicit,
+            origin,
+            managed: &m,
+        },
+        probe,
+    )
+}
+
+fn refusals_from_gate(decision: &Decision, times: usize) -> Vec<WriteScopeRefusedRecord> {
+    let root = Path::new("/nonexistent/write-scope-telemetry");
+    let (_, captured) = crate::observability::ops::capture::capture(|| {
+        for _ in 0..times {
+            gate("write-scope-telemetry".into(), root, decision, "claim reconciliation");
+        }
+    });
+    captured
+        .records
+        .into_iter()
+        .filter_map(|r| match r {
+            crate::telemetry::TelemetryRecord::WriteScopeRefused(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn every_deny_branch_has_its_refusal_class() {
+    let w = FakeProbe::new(Permission::Write);
+    let ni = FakeProbe::new(Permission::Insufficient(probe::NOT_IN_INSTALLATION.into()));
+    let ro = FakeProbe::new(Permission::Insufficient("repository role `read`".into()));
+    let unk = FakeProbe::new(Permission::Unknown("timeout".into()));
+    let cases = [
+        (classified(None, false, None, &[], &w), RefusalClass::NoTarget, None),
+        (
+            classified(target("a/b"), false, Some("c/d"), &["a/b"], &w),
+            RefusalClass::TargetMismatch,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), false, None, &["a/b"], &w),
+            RefusalClass::TargetMismatch,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &[], &w),
+            RefusalClass::UnmanagedRepo,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &["a/b"], &ni),
+            RefusalClass::NotInInstallation,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &["a/b"], &ro),
+            RefusalClass::InsufficientPermission,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &["a/b"], &unk),
+            RefusalClass::Unverifiable,
+            Some("a/b"),
+        ),
+    ];
+    for (decision, class, repo) in cases {
+        assert!(!decision.verdict.is_allowed());
+        assert_eq!(decision.class, Some(class));
+        assert_eq!(decision.repo.as_deref(), repo);
+    }
+    let ok = classified(target("a/b"), true, None, &["a/b"], &w);
+    assert!(ok.verdict.is_allowed());
+    assert_eq!(ok.class, None);
+}
+
+#[test]
+fn a_deny_through_the_gate_emits_one_record_each_time_while_the_warn_dedupes() {
+    let unk = FakeProbe::new(Permission::Unknown("timeout".into()));
+    let d = classified(target("acme/widgets"), true, None, &["acme/widgets"], &unk);
+    let records = refusals_from_gate(&d, 3);
+    assert_eq!(records.len(), 3, "the count is not deduplicated");
+    for r in &records {
+        assert_eq!(r.reason, RefusalClass::Unverifiable);
+        assert_eq!(r.repo.as_deref(), Some("acme/widgets"));
+        assert_eq!(r.call_site, "claim reconciliation");
+        assert!(!r.credential.is_empty());
+    }
+}
+
+#[test]
+fn an_allow_through_the_gate_emits_nothing() {
+    let w = FakeProbe::new(Permission::Write);
+    let d = classified(target("acme/widgets"), true, None, &["acme/widgets"], &w);
+    assert!(refusals_from_gate(&d, 2).is_empty());
+}
+
+#[test]
+fn a_deny_with_no_known_repo_omits_it_and_without_a_sink_does_not_panic() {
+    let w = FakeProbe::new(Permission::Write);
+    let d = classified(None, false, None, &[], &w);
+    let records = refusals_from_gate(&d, 1);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].repo, None);
+    assert_eq!(records[0].reason, RefusalClass::NoTarget);
+    // Outside a capture and with no global sink, the gate still just refuses.
+    let root = Path::new("/nonexistent/write-scope-telemetry");
+    assert!(!crate::observability::ops::capture::without_global_sink(|| gate(
+        "k2".into(),
+        root,
+        &d,
+        "x"
+    )));
+}

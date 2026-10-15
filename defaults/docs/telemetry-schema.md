@@ -215,6 +215,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
 | [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
+| [`write_scope.refused`](#write_scoperefused) | log, OTLP only | `write_scope.rs` (`gate()` Deny branch) |
 | Captain gauges: `loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`, `loom.forge.stage_dwell`, `loom.forge.stage_items` ([`metric.points`](#metricpoints)) | metric | `observability/captain_gauges.rs`, `observability/ops/stage_dwell.rs` |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
@@ -3853,6 +3854,41 @@ exported. Both OTLP timestamps are `observed_at`.
 `transform/privacy` `keep_keys`, contract-tested). The Curator's admission
 closes are not recorded here: they are GitHub `closed` events with the comment
 prefix `Closed at admission:`.
+
+
+### `write_scope.refused` — a daemon-pass write the #9548 gate refused
+
+One OTLP log (WARN) per write the credential-scope gate refuses in a daemon
+pass (Issue #12168), emitted from the `Deny` branch of `write_scope::gate`
+(`gate_root`, `gate_root_with`, `gate_repo_with`). **Not deduplicated**: the
+`daemon.log` WARN fires once per change of reason per key, this record fires
+on every refusal, because the point is a count. **OTLP-only** (`native: false`).
+
+**Scope.** Daemon passes only. Short-lived `loom-daemon forge ...` / `cli/*`
+processes have no OTLP sink, so their refusals (the quoted `refusing the write
+(#9548)` stderr text) are not recorded.
+
+The JSON body contains `repo` (the refused `owner/repo`; absent when the gate
+had no target), `credential` (a non-secret identity: `gh-process-default`,
+`gh-config:<dir name>` for a registered per-owner credential, or `gitea`;
+never a token or a fragment of one), `call_site` (the `what` the pass handed
+the gate), `reason`, `refused_at`, and standard `loom` build provenance; a
+record whose provenance does not validate is not exported.
+
+`reason` is a closed set, derived from the typed deny branch rather than parsed
+from the sentence: `not-in-installation`, `insufficient-permission`,
+`unverifiable`, `unmanaged-repo`, `target-mismatch`, `no-target`.
+
+**OTLP.** Attributes: `loom.repo` (when known) and `loom.write_scope.reason` /
+`credential` / `call_site` / `version` / `revision` / `provenance_complete`
+(`WRITE_SCOPE_REFUSED_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested). Both timestamps are
+`refused_at`; the executing host is `host.id` on the resource.
+
+Query (refusals by repo and host, and since when): in SigNoz Logs, filter
+attribute `loom.kind = write_scope.refused`,
+group by `loom.repo` and `host.id` (add `loom.write_scope.reason` to split by
+cause), and take `min(timestamp)` per group for "since when".
 
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
