@@ -1304,7 +1304,7 @@ pub mod role_runtime;
 pub mod role_target;
 pub mod roll_interruption;
 pub use role_failure::{
-    note_role_failure, pre_launch, RoleFailure, EXIT_CODE, FAILURE_CLASS,
+    note_role_failure, pre_launch, step, RoleFailure, EXIT_CODE, FAILURE_CLASS,
     ROLE_FAILURE_ATTRIBUTE_KEYS, UNCLASSIFIED, UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP,
 };
 

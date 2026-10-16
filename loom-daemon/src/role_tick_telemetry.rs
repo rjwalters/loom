@@ -309,13 +309,15 @@ pub fn emit_for_tick_correlated(
 
 /// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
 /// record marked `source = "step"` with the step's sweep id, so it is never
-/// counted as a role-runner tick.
+/// counted as a role-runner tick. `failure` is the class the step's end
+/// derived (#12480); `None` on a failure falls back to `unclassified:step`.
 pub fn emit_for_step(
     root: &Path,
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
+    failure: Option<crate::observability::lifecycle::RoleFailure>,
     sweep_id: &str,
 ) {
     emit_tick(
@@ -325,7 +327,7 @@ pub fn emit_for_step(
         outcome,
         resolved,
         None,
-        None,
+        failure,
         Some(sweep_id.to_string()),
     );
 }
