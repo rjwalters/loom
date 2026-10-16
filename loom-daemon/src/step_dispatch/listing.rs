@@ -63,6 +63,8 @@ pub struct OpenItems {
 /// or the listing moved mid-walk. The set is all-or-nothing, so a caller must
 /// not read a missing item as absent.
 pub fn list_all_open(gh_bin: &Path, cwd: Option<&Path>, repo: Option<&str>) -> Result<OpenItems> {
+    // #12310: the step engine's items listing is discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     list_all_open_with(cwd, repo, mirror_rows, |cwd, repo| {
         crate::forge_listing::list_open_issues_cached_all_as(CALLER, gh_bin, cwd, repo)
     })

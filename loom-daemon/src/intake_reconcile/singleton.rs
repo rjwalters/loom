@@ -714,6 +714,8 @@ pub(super) fn open_issue_labels(body: &str) -> Result<Option<Vec<String>>> {
 
 impl IntakeForge for GhIntakeForge {
     fn list_open(&mut self, repo: &Repo) -> Result<Vec<IntakeRow>> {
+        // #12310: the intake walk is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let rows = crate::forge_listing::list_open_issues_cached_all_as(
             "intake.list_open",
             &self.gh_bin,

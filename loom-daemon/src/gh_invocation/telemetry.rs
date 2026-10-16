@@ -61,6 +61,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.operation",
     "github.access_intent",
+    // #12310: what the call was for (discovery | gate | write | hygiene |
+    // observability).
+    "loom.forge.purpose",
     "github.target",
     "github.outcome",
     "github.exit_code",
@@ -444,6 +447,7 @@ impl InvocationSpan {
         let mut attributes: TraceAttributes = [
             ("github.operation", inv.operation.as_str().to_string()),
             ("github.access_intent", inv.intent.as_str().to_string()),
+            ("loom.forge.purpose", inv.purpose().as_str().to_string()),
             ("github.target", inv.target.bounded()),
             ("github.outcome", outcome.as_str().to_string()),
             ("github.invocation", self.invocation.clone()),
@@ -459,6 +463,9 @@ impl InvocationSpan {
         }
         for (key, value) in billing.attributes() {
             attributes.insert(key.to_string(), value);
+        }
+        if let Some(reason) = billing.fallback_reason {
+            attributes.insert("loom.discovery.fallback_reason".into(), reason.to_string());
         }
         for (key, value) in super::route::classify(&argv(inv)).attributes() {
             attributes.insert(key.to_string(), value.to_string());

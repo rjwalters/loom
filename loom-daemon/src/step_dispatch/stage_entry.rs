@@ -139,6 +139,8 @@ impl EventsSource for GhEventsReader {
         label: &str,
         max_pages: usize,
     ) -> LabelTimes {
+        // #12310: the labeled-events read is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         stage_events::read(EVENTS_CALLER, root, slug, number, label, max_pages)
     }
 }
