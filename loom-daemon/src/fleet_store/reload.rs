@@ -101,6 +101,12 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from config at the start of every work-finder tick (#12074) —
     // `step_dispatch::gather_budget::begin_tick`, never cached.
     ("autonomous.workFinder.tickDeadlineSecs", Reloadability::Live),
+    // Read from config at every work-finder tick (#12256) —
+    // `step_dispatch::gather_budget::gather_concurrency`, never cached.
+    ("autonomous.workFinder.gatherConcurrency", Reloadability::Live),
+    // Read from config at every work-finder tick (#12298) —
+    // `step_dispatch::gather_budget::spawn_concurrency`, never cached.
+    ("autonomous.workFinder.spawnConcurrency", Reloadability::Live),
     // Read from the workspace's effective config on every landed pre-filter
     // call (#12205) — `work_finder::landed_prefilter::prefilter_enabled`, never cached.
     ("autonomous.workFinder.landedPrefilter", Reloadability::Live),
@@ -109,6 +115,12 @@ const TABLE: &[(&str, Reloadability)] = &[
     // (`captain_gauges::resolve` → `stage_dwell::Settings::from_effective`),
     // never cached.
     ("observability.stageDwell", Reloadability::Live),
+    // #12246: the per-agent-scope `MemoryMax` knobs are resolved by
+    // `loom-daemon ram-scope-limit`, a fresh process per agent spawn
+    // (`ram_scope_limit::resolve`), never cached by the daemon.
+    ("autonomous.agentMemoryMax", Reloadability::Live),
+    ("autonomous.agentMemoryMaxPct", Reloadability::Live),
+    ("autonomous.agentMemoryMaxMinMb", Reloadability::Live),
     // Everything else under `autonomous.workFinder` is resolved once at
     // daemon bring-up in `daemon_service.rs`'s work-finder startup block,
     // before the loop is spawned: `enabled` (gates whether the loop is

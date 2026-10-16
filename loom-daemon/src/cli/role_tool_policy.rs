@@ -113,8 +113,13 @@ pub(crate) struct CheckArgs {
 impl CheckArgs {
     /// The deny reason, or `None` to allow.
     fn verdict(&self) -> Option<String> {
+        self.verdict_for_home(std::env::var("HOME").ok())
+    }
+
+    /// [`Self::verdict`] with `$HOME` supplied, so a test can pin the
+    /// canonical-home branch without mutating the process environment.
+    fn verdict_for_home(&self, home: Option<String>) -> Option<String> {
         let policy = self.policy.resolve()?;
-        let home = std::env::var("HOME").ok();
         // The Edit/Write hook canonicalizes its target (symlinks resolved), so
         // a `$HOME` that itself traverses a symlink (macOS `/var` ->
         // `/private/var`, Fedora Atomic `/home` -> `/var/home`) would never
@@ -322,6 +327,39 @@ mod tests {
         assert_eq!(p.role, "builder");
         assert_eq!(p.allowlist, Allowlist::Declared(vec!["*".to_string()]));
         assert!(p.deny_specs().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_under_the_canonical_form_of_a_symlinked_home_is_judged() {
+        let dir = tempfile::tempdir().unwrap();
+        write_role(dir.path(), "judge", r#"{"toolPolicy":{"allowedCapabilities":[]}}"#);
+        let real_home = dir.path().join("real-home");
+        std::fs::create_dir_all(real_home.join(".ssh")).unwrap();
+        let link_home = dir.path().join("link-home");
+        std::os::unix::fs::symlink(&real_home, &link_home).unwrap();
+
+        let check = |path: std::path::PathBuf| {
+            CheckArgs {
+                policy: args("judge", dir.path()),
+                command: None,
+                path: Some(path.to_str().unwrap().to_string()),
+            }
+            .verdict_for_home(Some(link_home.to_str().unwrap().to_string()))
+        };
+
+        // The hook canonicalizes its target, so it arrives under the REAL home
+        // while `$HOME` is the symlink: only the canonical-home branch matches.
+        let denied = check(
+            real_home
+                .canonicalize()
+                .unwrap()
+                .join(".ssh/authorized_keys"),
+        );
+        assert!(denied.is_some_and(|r| r.contains("credential-store")));
+        // The raw spelling and an unrelated path keep their verdicts.
+        assert!(check(link_home.join(".ssh/authorized_keys")).is_some());
+        assert!(check(real_home.canonicalize().unwrap().join("notes.md")).is_none());
     }
 
     #[test]

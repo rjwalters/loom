@@ -374,3 +374,8 @@ fn tokens_bootstrap_reaches_normal_error_path_with_no_delegation_configured() {
         "undelegated workspace must not hit the delegation refusal, stderr: {stderr}"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
