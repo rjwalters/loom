@@ -394,7 +394,7 @@ impl GhCliApi {
     ) -> Result<ApiResponse, ApiError> {
         let reader = nwo.as_deref().and_then(|r| (self.reader_for)(r));
         // The shared reader → writer retry (#9872, `reader_then_writer`).
-        let attempt = crate::forge_identity::reader_then_writer(
+        let attempt = crate::forge_identity::read_via_reader(
             reader.as_ref().map(|(dir, _)| dir.as_path()),
             |dir, role| {
                 Ok::<_, std::convert::Infallible>(self.run_once(
@@ -582,7 +582,7 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
         dest: &std::path::Path,
     ) -> Result<(), ApiError> {
         let reader = (self.reader_for)(repo);
-        let attempt = crate::forge_identity::reader_then_writer(
+        let attempt = crate::forge_identity::read_via_reader(
             reader.as_ref().map(|(dir, _)| dir.as_path()),
             |dir, role| {
                 let role = reader.as_ref().map(|_| role);

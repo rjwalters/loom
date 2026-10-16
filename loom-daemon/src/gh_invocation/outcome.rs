@@ -244,7 +244,7 @@ mod tests {
         let past = std::time::Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap();
-        let _scope = super::super::read_deadline::enter(past, true);
+        let _scope = super::super::read_deadline::enter(past);
         let out = run_retrying(|| inv(TIMEOUT), &program);
         assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::Shed { .. })), "{out:?}");
         let out = inv(TIMEOUT).program(&program).run();
@@ -271,7 +271,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let program = stub(tmp.path(), "sleep 5");
         let left = Duration::from_millis(300);
-        let _scope = super::super::read_deadline::enter(std::time::Instant::now() + left, false);
+        let _scope = super::super::read_deadline::enter(std::time::Instant::now() + left);
         let began = std::time::Instant::now();
         let out = run_retrying(|| inv(Duration::from_secs(60)), &program);
         assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::TimedOut { .. })), "{out:?}");
@@ -287,10 +287,8 @@ mod tests {
         let marker = tmp.path().join("ran");
         let program = stub(tmp.path(), &format!("touch '{}'", marker.display()));
         let now = std::time::Instant::now();
-        let _scope = super::super::read_deadline::enter(
-            now.checked_sub(Duration::from_secs(1)).unwrap(),
-            true,
-        );
+        let _scope =
+            super::super::read_deadline::enter(now.checked_sub(Duration::from_secs(1)).unwrap());
         let _floor = super::super::read_deadline::at_least(now + Duration::from_secs(20));
         let out = run_retrying(|| inv(TIMEOUT), &program);
         assert!(matches!(out, CmdOutcome::Ran(_)), "{out:?}");
