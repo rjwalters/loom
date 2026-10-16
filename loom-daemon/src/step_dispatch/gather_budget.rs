@@ -49,6 +49,33 @@ pub struct TickPhases {
     pub spawn_parts: SpawnParts,
 }
 
+/// A tick's draws and passes (#12410): why a tick with free slots made few
+/// spawn attempts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickPasses {
+    /// Item draws taken, across workspaces.
+    pub draws: usize,
+    /// Draws that never reached the spawner: a repo at its cap or a second
+    /// merge in a repo.
+    pub draws_unspawned: usize,
+    /// Passes by reason (`claim_lost`, `repo_cap`, ...).
+    pub by_reason: std::collections::BTreeMap<String, usize>,
+}
+
+impl TickPasses {
+    /// The tick span's `loom.dispatch.passes` value: `reason=count` pairs,
+    /// comma-joined in reason order. Refusal reasons are an open set, so
+    /// they ride one attribute value rather than a key each.
+    #[must_use]
+    pub fn render(&self) -> String {
+        self.by_reason
+            .iter()
+            .map(|(reason, n)| format!("{reason}={n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 /// Where the time inside a tick's spawns went (#12298), in milliseconds
 /// summed over its attempts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

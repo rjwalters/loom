@@ -2031,6 +2031,15 @@ with concurrent spawns they can add up to more than `phase.spawn_ms`):
 | `loom.dispatch.spawn_hold` | Why the draw stopped spawning before its slots were filled: `rate_limit_breaker` when the shared GitHub rate-limit breaker tripped mid-tick (checked before each round's batch). Absent when it never stopped |
 | `loom.dispatch.phase.spawn_account_ms` | The account-selection poll (up to 5 s per spawn) and recording the step |
 
+Since #12410 the tick span also says why a tick with free slots made few
+spawn attempts:
+
+| Attribute | Meaning |
+|---|---|
+| `loom.dispatch.draws` | Item draws the tick took, across repos (count) |
+| `loom.dispatch.draws_unspawned` | Draws that never reached the spawner: a repo at its cap (`repo_cap`) or a second merge in a repo (`merge_in_flight`) (count) |
+| `loom.dispatch.passes` | Passes by reason as comma-joined `reason=count` pairs in reason order (`claim_lost=3,repo_cap=1`). The reasons are an open set, so they share one value; absent when nothing passed |
+
 Since #12306 and #12311 the tick also records what its discovery snapshot
 cost, covered and which tier answered (the worklist rows are absent when the
 chain has no worklist tier, never a 0):
