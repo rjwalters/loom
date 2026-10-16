@@ -225,6 +225,9 @@ fi
 # A throwaway project proves uv resolves its env under UV_PROJECT_ENVIRONMENT
 # and leaves the project dir without a .venv — under the read-only private
 # shape too, where only /tmp is writable.
+# stdout only is compared: uv's "Using CPython"/"Creating virtual environment"
+# status lines go to stderr, kept aside for the failure message.
+UV_PROBE_ERR=$(mktemp)
 UV_PROBE=$(docker run --rm --read-only --user 1000:1000 --tmpfs /tmp:rw,exec,size=512m \
     --entrypoint bash "$IMAGE" -lc '
       set -e
@@ -232,12 +235,13 @@ UV_PROBE=$(docker run --rm --read-only --user 1000:1000 --tmpfs /tmp:rw,exec,siz
       printf "[project]\nname = \"probe\"\nversion = \"0\"\nrequires-python = \">=3.10\"\n" > pyproject.toml
       uv run python -c "import sys; print(sys.prefix)"
       [ ! -e .venv ] || { echo "VENV_CREATED_IN_PROJECT"; exit 1; }
-    ' 2>&1)
+    ' 2>"$UV_PROBE_ERR")
 if [[ "$UV_PROBE" == "$UV_ENV" ]]; then
     pass "uv run resolves under UV_PROJECT_ENVIRONMENT and creates no project .venv (read-only rootfs)"
 else
-    fail "uv probe failed or resolved elsewhere: $UV_PROBE"
+    fail "uv probe failed or resolved elsewhere: $UV_PROBE $(cat "$UV_PROBE_ERR")"
 fi
+rm -f "$UV_PROBE_ERR"
 
 # 9. Private-session control bundle (issue #8839) — the image-owned half of the
 # `loom-private-control-v1` boundary. This is the only place the claims about
