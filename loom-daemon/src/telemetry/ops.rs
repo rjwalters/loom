@@ -105,6 +105,16 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.phase.spawn_ms",
     "loom.dispatch.spawn_attempts",
     "loom.dispatch.gather_concurrency",
+    // #12306: the tick's discovery snapshot (`ops::dispatch_facts`).
+    "loom.discovery.backend",
+    "loom.discovery.repos",
+    "loom.discovery.items",
+    "loom.discovery.forge_reads",
+    "loom.discovery.worklist_latency_ms",
+    "loom.discovery.not_modified",
+    "loom.discovery.reused_previous",
+    "loom.discovery.stale_repos",
+    "loom.discovery.oldest_watermark_age_secs",
     // #12298: the spawn half's concurrency and its sub-phases.
     "loom.dispatch.spawn_concurrency",
     "loom.dispatch.spawn_hold",
