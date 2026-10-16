@@ -182,7 +182,7 @@
 //! file is reported at ERROR.
 
 pub(crate) mod external_change;
-mod git;
+pub(crate) mod git;
 mod host;
 mod self_heal;
 

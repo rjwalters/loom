@@ -77,6 +77,7 @@ mod labels_migrate_holds;
 mod labels_undeclared;
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;
+pub(crate) mod lease_release;
 pub(crate) mod lease_renewer;
 pub(crate) mod legacy_script_cmds;
 pub(crate) mod merge_group_ci_cmd;
