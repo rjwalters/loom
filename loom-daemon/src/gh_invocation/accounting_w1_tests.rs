@@ -489,6 +489,7 @@ fn recorded_calls_drain_once_as_forge_calls_points() {
             "installation",
             "op",
             "outcome",
+            "purpose",
             "resource",
             "role",
             "route",
