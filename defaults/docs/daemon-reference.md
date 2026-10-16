@@ -6482,7 +6482,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.tickDeadlineSecs` | — | `90` | The wall-clock deadline of one work-finder tick body (#12074). Every forge read from the pre-dispatch holds through the step gather gets only the time left (its own timeout is clamped), a read past the deadline is not sent (a shed: the gather uses its last good listing, a fact keeps the value that passes the item), and once it passes no further repo is gathered: the tick draws from what it gathered, reports `loom.dispatch.gather_truncated`, and the next tick starts at the first repo skipped. The deadline clock starts after the tick's local pre-dispatch work (eager reclaim, CPU sample). At least one repo is gathered every tick, and its reads get at least 20 s even past the deadline. Inside the tick, a read whose readers are out of budget (a rate-limit back-off) is shed rather than moved to the writer App, whatever its class; any other cause (a failing gateway, a coverage miss) still reaches the writer. A repo whose gather was starved (failed, last-good only, or no open-PR listing) for 3 ticks in a row gets one tick on the writer: every budget shed is lifted for that tick, deferrable listings included. Three consecutive gateway attempts that time out or fail with an unmarked 5xx withdraw the gateway for the default window; any gateway answer, on any read path, resets the count. The step tick's open-PR listing stays a Gate read, with its last good copy standing in when it fails. The draw's own claim reads run outside the deadline. Positive integer seconds; anything else uses the default. **Hot-applies** (read at the start of each tick) |
 | `autonomous.workFinder.gatherConcurrency` | — | `8` | How many repos the step gather lists at once (#12256). The forge half of each repo's gather (the item and open-PR listings, hold markers, blocker states, the landed pre-filter, CI at a Judge head) runs on up to this many threads; each keeps the tick's read deadline (`tickDeadlineSecs`) and its starvation rules, and repos are taken in walk order, so a deadline still skips from the end. Stage-entry lookups, weighing and the draw stay serial and run in walk order, so the draw does not depend on which listing answered first. `1` restores the serial gather. Positive integer, at most 32; anything else uses the default. **Hot-applies** (read at each tick) |
 | `autonomous.workFinder.spawnConcurrency` | — | `4` | How many step spawns the work finder's draw runs at once, each in a different repo (#12298). The draw fills its slots in rounds: each round draws one candidate for up to this many open slots, never two in one repo, runs the per-repo cap, RAM, disk and one-merge-per-repo gates for them in draw order (the round's earlier candidates count as admitted, so a round cannot overrun a shared budget), then spawns them together, so their resolvers, pre-claims and account-selection polls overlap. The child launches themselves stay serialised host-wide, at least `dispatchStaggerMs` apart across all repos (the #3887 startup-race gap, which is otherwise kept per repo), so a round never starts several children within milliseconds. Results are applied in draw order, and a refused slot draws again in the next round. Within one repo, claims and step-ledger writes stay one at a time and in order; `workFinder.maxConcurrent`, the free slots and `maxAdmissionsPerTick` bound the tick as before. Before each round the shared GitHub rate-limit breaker is checked: when it has tripped since the tick started, the round is not spawned, its drawn candidates wait for a later tick (`deferred_capacity`, detail `rate_limit_breaker`), and the tick span records `loom.dispatch.spawn_hold`. `1` restores the serial spawns. Positive integer, at most 16; anything else uses the default. **Hot-applies** (read at each tick) |
-| `autonomous.workFinder.discovery` | — | `"direct"` | Which backend builds the step tick's discovery snapshot (#12306). `"direct"`: today's per-repo listings with the ETag cache (standalone installs and Gitea). `"mirror"`: one `GET /v1/mirror/worklist` per tick, conditional on the last `ETag` (a `304` reuses the previous snapshot); it makes no per-repo forge listing and **has no fallback to the forge**: a stale repo is served from the snapshot with its watermark recorded on the tick span (`loom.discovery.*`), a failed request reuses the previous snapshot, and with none every repo reads as unavailable that tick. Needs `forge.mirror` and a mirror that serves the worklist endpoint. Claim, lease, label-transition and merge reads stay live. Anything but `"mirror"` is `"direct"`. **Hot-applies** (read at each tick) |
+| `forge.mirror.discovery` | — | `"per_call"` | The discovery chain a daemon walks each step tick (#12311). **No `forge.mirror` block: the chain is `gh` only** (today's behaviour with the installation's own credential; nothing to set). With a `forge.mirror` block: `"per_call"` (default during the transition) is today's behaviour, each listing asking the mirror per call; `"worklist"` is mirror, then gateway, then `gh`: one `GET /v1/mirror/worklist` per tick, conditional on the last `ETag` (a `304` reuses the one in-memory `(etag, body)`, which is replaced every tick, dropped on restart and never persisted or merged with change events); `"direct"` is the break-glass for a mirror that is wrong rather than down: gateway, then `gh`, never the mirror. On `"worklist"`, a failed request (transport, 5xx, auth, malformed body) sends every repo to the gateway tier, and a repo whose `status` is not `ok` (`unknown`, `backfilling`, `error`, or omitted) goes alone. The fallback tiers are outage modes and **capped**: a repo is listed at most once per work-finder interval (the backstop pace; between listings the tick draws from that repo's last listing, held in memory only), and a gateway reserve `429` ends the tick's discovery with `loom.discovery.fallback_reason = reserve`, draws from the last listing and leaves `rate_limit_breaker` alone. A repo no tier answers for is tier `none`: nothing is drawn from it that tick, and running sessions are unaffected. There is never a writer tier. Which tier answered is on the `loom.dispatch.tick` span (`loom.discovery.tier`; see `telemetry-schema.md`). Claim, lease, label-transition and merge reads never read the snapshot. Replaces #12306's `autonomous.workFinder.discovery`, still read as an alias when this key is unset (`"mirror"` is `"worklist"`). **Hot-applies** (read at each tick) |
 | `autonomous.workFinder.landedPrefilter` | — | `false` | The landed pre-filter (#11853): before a `loom:issue` candidate without an open PR is dispatched, one batched GraphQL closes-graph query per workspace asks whether a PR that closes it has merged while it stays open, and routes such an issue to Curator (`loom:triage`) instead of a Builder. **Off by default since #12205** (it cost about 1.5k dispatch-App GraphQL calls an hour fleet-wide). Off, it makes no forge call and every candidate is dispatched as before #11853: a landed-but-open issue can reach a Builder again, bounded by the #11429 journal check, the 2.5 closed-issue guard and the no-op cooldown. On, the query asks only candidates without an open linked PR, at most once per half `LANDED_RECHECK` (15 min) per workspace, backs off 5 min after an unanswered query, and is a repo-targeted Hygiene read (reader pool or gateway; shed, never moved to the writer, when the readers are out of budget). `true` turns it on; anything else is off. **Hot-applies** (read on every call) |
 | *(env only)* | `LOOM_OPEN_PR_MEMO` | `true` | Verified-open-PR memo for the #4123 open-PR dispatch guard (#6788). Falsy (`0`/`false`/`no`/`off`) disables; anything else (including unset) enables. When on, the guard (a) reuses a verified "issue #N has open linked PR #M" answer for 15 minutes instead of re-running the closes-graph query on every work-finder tick, and (b) when **both** the GraphQL probe and its #5911 REST fallback fail, re-verifies that one known PR over a single `GET repos/{owner}/{repo}/pulls/{M}` before conceding. The documented fail-open contract is unchanged: with no memo, or if that recheck also cannot answer, the guard still proceeds. In-memory only — a daemon restart clears it. Disable only to restore the exact pre-#6788 probe |
 | *(env only)* | `LOOM_GUARD_ISSUE_SNAPSHOT` | `true` | Conditional (ETag) issue reads for the 2.5 closed-issue and 2.7 park-label dispatch guards (W9). Falsy (`0`/`false`/`no`/`off`) restores the unconditional `guard.issue_state` / `guard.issue_labels` reads. When on, 2.5 reads `repos/{owner}/{repo}/issues/{N}` reader-first (`guard.issue_view`) and 2.7 reads it on the writer (`guard.issue_labels_view`), each with `If-None-Match` from its own store entry, so a re-attempted, unchanged candidate costs a free `304`. The verdict is always taken from the body the read serves. For 10 minutes after this daemon writes issue N of the repo (keyed by repo and number; a write whose repo is unknown, including a `{owner}/{repo}` placeholder path with no explicit target, is a wildcard that pins N in every repo; the parse is deliberately loose, so any numeric argument of a `gh issue|pr` write may be pinned, and a mis-parse can only add a pin, never drop one), both reads of N are sent without an ETag and keep their identity: 2.5 stays reader-first, 2.7 stays on the writer. Any failure falls back to the unconditional read |
@@ -6530,7 +6530,7 @@ knobs not yet audited here.
 | `autonomous.roleRunner.onIdleMaxWait` | *(config only)* | *(unset — no promotion, today's idle-edge-only firing)* | **Per-role starvation guard for an `onIdle` role (#7511).** A `{"<role>": "<duration>"}` object (e.g. `{"hermit": "24h", "auditor": "72h"}`, duration strings `<n>s`/`<n>m`/`<n>h`/`<n>d`) naming the longest a role may go without a completed tick before it is **promoted** into the next interval-cadence pass — see [`onIdleMaxWait` — promoting a starved `onIdle` role](#onidlemaxwait--promoting-a-starved-onidle-role-7511) below |
 | `autonomous.roleRunner.architectMaxProposals` | `LOOM_ARCHITECT_MAX_PROPOSALS` | `5` | **Per-invocation** cap on how many proposal issues one `architect` dispatch may file (#5656) — the actuator-saturation limit of the idle-edge control loop. Passed to the session as `/loom:architect --max-proposals <n>`, which `architect.md` enforces as a hard ceiling. Per-repo on purpose (the workable cap grows with a repo's maturity — ~5 while work is narrow, 7+ once it fans out), so it is read from each root's own config. Zero/negative/non-integer at either tier drops to the next one (a cap of `0` would spend a whole session forbidden from producing anything). Ignored for every other role |
 | `autonomous.roleRunner.championMode` | *(config only)* | *(retired)* | **Retired by #11909.** Every role-runner Champion launch is `/loom:champion --non-item`: proposals (architect/hermit/auditor), epics, Doctor-cap parked PRs, rollout checks and the batch-wide Pass 0 / held-PR census. Curated-issue promotion and `loom:pr` merges are work-finder steps (`/loom:champion --issue N` / `--pr N`, `champion-targeted.md`). Any value is ignored with a warning |
-| **`curator.backlogTarget`** (top-level `curator`, not `autonomous.*`) | *(config only)* | *(unset: step skipped)* | **How many open issues this repo should hold (#11819).** Read through the full config resolver, so any tier may set it (machine defaults < `.loom/config.json` < `.loom-project/project.json` < fleet `.loom-local/fleet-repo.json` < host `.loom-local/local.json`). When set, each role-runner Curator dispatch counts the repo's open issues (one REST `search/issues` call, PRs excluded) and passes `/loom:curator --backlog-level <lenient\|normal\|strict> --backlog-open <n> --backlog-target <n>` from `r = open / target` (`< 0.5` lenient, `0.5`–`1.0` normal, `> 1.0` strict), which runs `curator.md`'s keep-or-close admission step on `loom:triage` issues; a failed count passes `normal` (no `--backlog-open`) and logs a `WARN`. Each such dispatch exports one `backlog.level` OTLP log. Unset, zero, negative or non-integer: no count, no flags, no record. Attended `/curator`, `/curator <n>` and `/loom:sweep` pass no flags. Per-repo, live |
+| **`curator.backlogTarget`** *(retired, #12077)* | *(config only)* | *(ignored)* | **Retired; set it and the daemon logs one `WARN` per process, then ignores it.** It drove backlog-pressure admission (#11819) on role-runner Curator ticks only; Curator now runs as step-dispatch steps, which never read it. The `backlog.level` OTLP log and the `--backlog-level/--backlog-open/--backlog-target` Curator flags are gone with it. Remove the key from every config tier. |
 | `autonomous.balance.idleGate` | `LOOM_BALANCE_IDLE_GATE` | `false` | **Pipeline-empty gate for hermit/architect idle generation (#10817, slice 4 of #10630).** Off: an `onIdle` edge means a host slot is free, exactly as before (no ledger read, no log line). On: `hermit` and `architect` additionally need this repo's pipeline empty -- no review/changes/merge debt in the demand ledger (`role_runner::demand`) and, where observed, no ready/building issues; any observed work denies the run even with free slots. Unobserved axes never deny nor newly grant (today's host-slot rule applies). Other idle roles are untouched; `architectMaxProposals` still caps a granted architect run. A grant logs `role_runner: idle grant root=<r> role=<role> trigger=idle reason=pipeline-empty`. Precedence env > config > default; truthy `1/true/yes/on`, falsy `0/false/no/off`, an invalid env value warns and falls back to config. Per-repo, live |
 | `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
 | `autonomous.roleRunner.collisionWindowSecs` | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | that role's tick interval | Lookback window for the #4623 probe, clamped to `[60, 3600]`. Zero/invalid dropped to the next tier |
@@ -6870,6 +6870,7 @@ Two env vars now cover both the log path and the socket path:
 |---------|---------|---------|
 | `LOOM_DAEMON_LOG` | Full override of the daemon log file path | `<loom dir>/daemon.log` |
 | `LOOM_SOCKET_PATH` | Full override of the daemon's IPC socket path; also implicitly derives the log path (below) when `LOOM_DAEMON_LOG` is unset | `<loom dir>/loom-daemon.sock` |
+| `LOOM_ALLOW_PARALLEL_DAEMON` | `1` lets a second daemon start even though a live loom-daemon already owns the same non-scratch pid file (#9816); without it startup is refused. Scratch-rooted pid files are never refused | unset |
 
 Precedence is **env > default only** (no `autonomous.*` config tier) — `resolve_log_path()`
 checks `LOOM_DAEMON_LOG` first, then falls back to `resolve_loom_dir().join("daemon.log")`,
@@ -8542,115 +8543,23 @@ Full module-level rationale (including why `evaluate()` stays pure while
 `run()` writes): `loom-daemon/src/fleet_captain.rs`'s "Two arm registries" /
 "Staleness policy" doc sections.
 
-#### Fleet gauges produced by the captain (W12)
+#### Forge-read gauges (per host)
 
-Some collector reads describe the forge, not the host. The `loom:blocked`
-listing behind `queue.snapshot` (singleton job **`queue-blocked`**) reads the
-same repos on every host that manages them, so N hosts spend N times the
-reader budget on N copies of one fact. With `fleet.captainGauges` configured,
-the declared captain produces it for the fleet and a dispatcher stops
-producing it for the repos the captain covers, **only while the captain's
-output is fresh**. Assigned, not elected: there is no standby producer.
-Per-host gauges and dispatch gates (`role_queue_gate`, `role_demand`, the work
-finder's listings) are unchanged on every host. Code:
-`observability/captain_gauges.rs`.
+The `queue.snapshot` blocked rows list each repo's `loom:blocked` issues, and
+every host produces them itself. The fleet-captain producer that once did this
+for the fleet (W12, `fleet.captainGauges`, #10673) was removed in #11406: it
+covered the 2 of 61 repos the captain managed, and both had starred issues, so
+stand-down saved almost nothing. A host config that still carries a
+`fleet.captainGauges.*` key is ignored with one startup warning naming it;
+delete the block. The `captain/gauges.json` heartbeat on the fleet store's
+`eta-fit` branch is no longer written or read; an operator can delete it.
 
 The forge stage-dwell sampler (`loom.forge.stage_dwell`,
 `loom.forge.stage_items`, the `stage-dwell` job and the
 `observability.stageDwell.*` keys) was deleted in #12316: dwell is a
 consumer's computation over the mirror's per-item label times, and nothing
 the daemon decides reads it. A leftover `observability.stageDwell` key in a
-host config is ignored. An older captain's heartbeat that still lists
-`stage-dwell` parses; the job is never consulted.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `fleet.captainGauges.enabled` | `false` | On the declared captain: arm the singleton jobs (`host.health.armed_singleton_jobs`) and publish their freshness |
-| `fleet.captainGauges.standDown` | `false` | On a dispatcher: skip a job for the repos a fresh heartbeat covers. Env `LOOM_CAPTAIN_GAUGES_STAND_DOWN` (`0`/`1`) overrides it per host |
-| `fleet.captainGauges.maxAgeSecs` | `1800` | A job's published `as_of` older than this is stale and the dispatcher produces locally again. Two publish intervals plus two collector passes, the fleet refresh's own liveness rule |
-| `fleet.captainGauges.publishIntervalSecs` | `600` | How often the captain writes the heartbeat |
-| `fleet.captainGauges.ref` | `eta-fit` (legacy fallback: `fleet.etaFitRef`) | The fleet-store branch the heartbeat lives on. Never the store's reviewed branch or `main` |
-| `fleet.captainGauges.queueBlocked` | `false` | Part 2 job **`queue-blocked`**. Captain: list `loom:blocked` per repo and publish number, creation time and label names. Dispatcher: build its `queue.snapshot` blocked rows from that instead of listing |
-
-**How a dispatcher knows the captain is fresh.** Hosts have no channel to
-each other's telemetry, so the captain publishes a heartbeat to the fleet
-store (`fleet.repo`), through the same transport and
-credentials (#10395): `captain/gauges.json`, schema `captain-gauges/v1`, with
-per job the `as_of` of the captain's last finished pass (its points handed to
-the OTLP sink) and the repos it covered. A dispatcher reads it once per
-collector pass with `If-None-Match` (a `304` when unchanged) and stands down
-for a job and repo only when the heartbeat names the declared captain and the
-`as_of` is within `maxAgeSecs`. A
-read failure keeps the last heartbeat, which keeps ageing against the same
-bound; a missing or malformed one counts as absent. Without
-`fleet.repo` there is no heartbeat and every host produces locally. When a
-dispatcher takes a repo back it starts from a fresh baseline, so the
-transitions the captain already sampled are not replayed.
-
-| Gate | `fleet.captainGauges` | What the pass does |
-|---|---|---|
-| `Armed` | `enabled` | Arms `queue-blocked` (when switched on), produces, and publishes the heartbeat every `publishIntervalSecs` and at once when its content changes |
-| `Refused` | `standDown`, store configured | Skips the repos the fresh heartbeat covers; produces the rest |
-| anything else | | Produces locally, exactly as before |
-
-**Captain down** shows as `loom.captain.gauge_age_seconds{task}` growing on
-every dispatcher, then `loom.captain.gauge_fallback{task} = 1` once it passes
-`maxAgeSecs` while the dispatchers produce locally. The hand-back has a gap:
-a dispatcher notices only after `maxAgeSecs` plus a 300 s clock-skew
-allowance plus one collector pass (about 40 minutes at the defaults), nobody
-samples stage transitions inside that window, and each dispatcher then starts
-from a baseline, so those transitions are lost, not delayed. Lower
-`maxAgeSecs` to shorten it. Alert on `gauge_fallback == 1` or on the age
-passing the bound. See [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
-A captain that could not list a repo for longer than `maxAgeSecs` baselines
-it on recovery too, because the dispatchers have sampled it meanwhile.
-
-**Part 2: forge facts.** One more per-host read says the same thing on every
-host. It has its own switch, so a fleet running only part 1 is unchanged.
-Code: `observability/captain_gauges/facts.rs`.
-
-- **Retired (#11579).** The `star-facts` job and its two keys, `starFacts` and
-  `starFactsMaxAgeSecs`, are gone with the star-liveness pass (#11104). A host
-  config that still carries them is ignored with one startup warning, and a
-  heartbeat from an older captain that still lists the job parses and is
-  never consulted.
-- **`queue-blocked`.** The captain publishes each repo's open `loom:blocked`
-  issues as number, creation time and `loom:*` / `tier:*` label names (no
-  title, body or author). A dispatcher runs them through the same row
-  builder as its own listing and appends them to its own `queue.snapshot`.
-  The rows can trail the forge by up to `maxAgeSecs`.
-
-The captain lists **the repo it publishes under**: each listing names the
-slug the collector resolves for the checkout (as `gh` does: an `upstream`
-remote first, renames followed), never the checkout's `origin` or a
-`LOOM_REPO` in the daemon's environment. On a fork checkout those differ,
-and a listing of the fork would publish its rows under the upstream's
-name. Checkouts that resolve to the same slug are listed once.
-
-A repo is covered for a job only when its listing succeeded on the
-captain; a failed listing (a rate-limited or withdrawn reader included)
-leaves the repo out, the dispatchers read it themselves, and nothing is
-reported to the host-wide rate-limit breaker. The captain's reads are
-recorded under the caller they replace (`queue_blocked`), so
-`loom-daemon forge calls --by caller` shows the same reads on one host. Per dispatcher with R covered repos,
-that is up to `12 × R` fewer `queue_blocked` listings an hour.
-
-**Mixed-version safety.** The switch defaults off and older daemons ignore
-the key, so an unconfigured or older host keeps today's behaviour. A
-dispatcher stands down only on fresh data from the current captain, so an
-older captain (no heartbeat) leaves every dispatcher producing. The part 2
-field is additive under the same `captain-gauges/v1` tag: an older
-dispatcher ignores it, and an older captain publishes no `queue-blocked`
-job, which every newer dispatcher reads as "not covered".
-
-**Rollout order**: deploy everywhere; set `fleet.captainGauges.enabled` and
-confirm the captain's `loom.captain.gauge_age_seconds` stays under
-`maxAgeSecs`; then set `fleet.captainGauges.standDown`. For part 2, set
-`queueBlocked` on the captain first, watch
-`gauge_age_seconds{task="queue-blocked"}`, then set the same key on the
-dispatchers. The captain needs the
-OTLP exporter, the fleet repos provisioned, and the writer App's
-`contents:write` on the store's publication branch .
+host config is ignored.
 
 #### Intake reconcile on the captain (W7)
 

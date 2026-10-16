@@ -124,7 +124,17 @@ impl Sandbox {
     }
 
     fn gh(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
-        let mut cmd = Command::new(self.p("bin/gh"));
+        self.run(&self.p("bin/gh"), args, env)
+    }
+
+    /// `loom-daemon <args>` run the way an agent session runs a subcommand
+    /// (#12389), with the session's environment.
+    fn cli(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
+        self.run(Path::new(env!("CARGO_BIN_EXE_loom-daemon")), args, env)
+    }
+
+    fn run(&self, program: &Path, args: &[&str], env: &[(&str, &Path)]) -> Output {
+        let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(self.p("work"))
             .env("LOOM_GH_BIN", self.p("next-gh"))
@@ -166,6 +176,17 @@ impl Sandbox {
             cmd.env(k, v);
         }
         cmd.output().unwrap()
+    }
+
+    /// `GH_CONFIG_DIR` of each logged call whose argv contains `part`.
+    fn dirs_with(&self, part: &str) -> Vec<PathBuf> {
+        std::fs::read_to_string(self.p("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_once('|'))
+            .filter(|(_, argv)| argv.contains(part))
+            .map(|(dir, _)| PathBuf::from(dir))
+            .collect()
     }
 
     /// `GH_CONFIG_DIR` of each logged call whose argv starts with `prefix`.
@@ -338,3 +359,67 @@ fn without_either_variable_reads_stay_on_the_writer() {
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+/// #12389: a `loom-daemon` subcommand an agent session runs (here `forge
+/// wait-checks`, the Judge's and Doctor's CI wait) reads through the gateway,
+/// then the reader pool, the daemon exported to the session. Before, it was
+/// neither the daemon nor the front, so every read it made went to the
+/// writer.
+const WAIT: &[&str] = &[
+    "forge",
+    "wait-checks",
+    "42",
+    "--repo",
+    "acme/widget",
+    "--timeout",
+    "0",
+];
+
+#[test]
+fn a_cli_subcommand_in_a_gateway_session_reads_through_the_gateway() {
+    let sb = Sandbox::new();
+    let (base, profile) = sb.publish_gateway("acme");
+    let _ = sb.cli(WAIT, &[("LOOM_GH_GATEWAY_DIR", base.as_path())]);
+    let dirs = sb.dirs_with("repos/acme/widget/pulls/42");
+    assert!(!dirs.is_empty(), "the PR read was never sent");
+    assert!(dirs.iter().all(|d| *d == profile), "{dirs:?}");
+}
+
+#[test]
+fn a_cli_subcommand_with_no_gateway_reads_on_a_reader() {
+    let sb = Sandbox::new();
+    let reader = sb.publish_reader("acme");
+    let ws = sb.p("ws");
+    let _ = sb.cli(WAIT, &[("LOOM_GH_READER_ROOT", ws.as_path())]);
+    let dirs = sb.dirs_with("repos/acme/widget/pulls/42");
+    assert!(!dirs.is_empty(), "the PR read was never sent");
+    assert!(dirs.iter().all(|d| *d == reader), "{dirs:?}");
+}
+
+#[test]
+fn a_cli_subcommand_without_either_variable_reads_on_the_writer() {
+    let sb = Sandbox::new();
+    let _ = sb.cli(WAIT, &[]);
+    let dirs = sb.dirs_with("repos/acme/widget/pulls/42");
+    assert!(!dirs.is_empty(), "the PR read was never sent");
+    assert!(dirs.iter().all(|d| *d == sb.p("writer")), "{dirs:?}");
+}
+
+/// #12394: a CLI subcommand with a read route adopted never reads on the
+/// writer. With its gateway failing and no reader behind it, the read is
+/// shed and the command reports no answer.
+#[test]
+fn a_cli_subcommand_whose_gateway_fails_sheds_instead_of_using_the_writer() {
+    let sb = Sandbox::new();
+    let (base, profile) = sb.publish_gateway("acme");
+    let _ = sb.cli(
+        WAIT,
+        &[
+            ("LOOM_GH_GATEWAY_DIR", base.as_path()),
+            ("STUB_FAIL_DIR", profile.as_path()),
+        ],
+    );
+    let dirs = sb.dirs_with("repos/acme/widget/pulls/42");
+    assert!(!dirs.is_empty(), "the gateway was tried");
+    assert!(!dirs.contains(&sb.p("writer")), "the writer was used: {dirs:?}");
+}
