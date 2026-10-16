@@ -2053,6 +2053,21 @@ with concurrent spawns they can add up to more than `phase.spawn_ms`):
 | `loom.dispatch.spawn_hold` | Why the draw stopped spawning before its slots were filled: `rate_limit_breaker` when the shared GitHub rate-limit breaker tripped mid-tick (checked before each round's batch). Absent when it never stopped |
 | `loom.dispatch.phase.spawn_account_ms` | The account-selection poll (up to 5 s per spawn) and recording the step |
 
+Since #12306 the tick also records what its discovery snapshot cost and
+covered (the worklist rows are absent in Direct mode, never a 0):
+
+| Attribute | Meaning |
+|---|---|
+| `loom.discovery.backend` | `mirror` (one worklist read) or `direct` (per-repo listings), from `autonomous.workFinder.discovery` |
+| `loom.discovery.repos` | Repos in the snapshot (Mirror: every repo the key may read; Direct: repos listed this tick) (count) |
+| `loom.discovery.items` | Open issues and PRs in the snapshot (count) |
+| `loom.discovery.forge_reads` | Per-repo forge listing calls made for discovery. `0` in Mirror mode. Per-item gate reads (hold markers, CI at a Judge head) are not listings and are not counted (count) |
+| `loom.discovery.worklist_latency_ms` | The `GET /v1/mirror/worklist` round trip (Mirror only; milliseconds) |
+| `loom.discovery.not_modified` | The worklist answered `304` and the previous snapshot was reused (Mirror only) |
+| `loom.discovery.reused_previous` | The worklist request failed and the previous snapshot stood in; no forge fallback (Mirror only) |
+| `loom.discovery.stale_repos` | Repos whose newest watermark evidence is older than `forge.mirror.maxStalenessSecs`. They are served anyway (Mirror only; count) |
+| `loom.discovery.oldest_watermark_age_secs` | Age of the stalest repo's newest watermark evidence (Mirror only; seconds) |
+
 The `invoke github` spans the tick's own thread and its gather workers open
 are children of the `loom.dispatch.tick` span (`context_source=parent`).
 Before #12256 each was the root of its own trace, so which calls a tick waited
