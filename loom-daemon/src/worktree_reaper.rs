@@ -1320,11 +1320,24 @@ mod tests {
     /// Populate `issue-<N>`'s worktree with a `target/` and `node_modules/`
     /// directory plus an untouchable `Cargo.lock` file, so tests can assert
     /// on what a reclaim pass did and did not remove.
+    /// Make `wt` a git repo: the fixed-name reclaim path asks git whether an
+    /// artifact directory holds tracked files, and keeps it when git cannot say.
+    fn git_init(wt: &Path) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
     fn populate_build_artifacts(repo: &Path, issue: u32) {
         let wt = repo.join(".loom/worktrees").join(format!("issue-{issue}"));
         fs::create_dir_all(wt.join("target/debug")).unwrap();
         fs::create_dir_all(wt.join("node_modules/.bin")).unwrap();
         fs::write(wt.join("Cargo.lock"), b"lockfile").unwrap();
+        git_init(&wt);
     }
 
     // ===================================================================
@@ -2111,6 +2124,7 @@ mod tests {
         fs::create_dir_all(wt.join("target/debug")).unwrap();
         fs::create_dir_all(wt.join("node_modules/.bin")).unwrap();
         fs::write(wt.join("Cargo.lock"), b"lockfile").unwrap();
+        git_init(&wt);
     }
 
     #[test]
@@ -2201,6 +2215,7 @@ mod tests {
             let wt = repo.path().join(".loom/worktrees").join(name);
             fs::create_dir_all(wt.join("target")).unwrap();
             fs::write(wt.join(".loom-managed"), "").unwrap();
+            git_init(&wt);
         }
         let spec = ProbeSpec {
             pr_status: PrStatus::Open,
