@@ -39,7 +39,7 @@
 //! # What it changes when set
 //!
 //! - **Discovery reads** ([`discovery`]): the work finder's candidate
-//!   listings and the stage-dwell sampler's stage listings are read from the
+//!   listings are read from the
 //!   mirror when the repo's watermark is within the bound, and from today's
 //!   path (the ETag-cached REST listing, through the gateway when that is
 //!   set) otherwise. A stale, unknown, never-reconciled or moved repo, an

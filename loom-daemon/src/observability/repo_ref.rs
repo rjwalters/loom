@@ -1,10 +1,7 @@
 //! Shared repo-root -> forge-slug resolution for the periodic collector
 //! samples that name repositories (Issue #8852's `queue_snapshot` and #9222's
 //! `ops::disposition`), plus a synchronous, read-only cache of the result
-//! (Issue #9222). `ops::stage_dwell` resolves its own roots directly through
-//! `collector::resolve_repo_slug_cached` / `resolve_visibility` (it also needs
-//! the root `PathBuf`, not just its display string) and is unaffected by this
-//! module.
+//! (Issue #9222).
 //!
 //! [`resolve_repo_refs`] is the one place that turns a set of workspace-root
 //! strings into their [`QueueRepoRef`]s (forge slug + visibility), so its two

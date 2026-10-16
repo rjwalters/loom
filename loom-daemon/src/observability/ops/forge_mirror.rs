@@ -118,7 +118,7 @@ mod tests {
             let _ = drain_points();
             record_read("work_finder", "o/a", Outcome::Hit);
             record_read("work_finder", "o/a", Outcome::Hit);
-            record_read("stage_dwell", "o/a", Outcome::Stale);
+            record_read("step_engine", "o/a", Outcome::Stale);
             record_change("o/a", "label", 2.5);
             record_change("o/a", "label", 1.5);
             record_change("o/a", "weird", 0.0);
@@ -143,7 +143,7 @@ mod tests {
             Some(Int(2))
         );
         assert_eq!(
-            find(MetricName::ForgeMirrorReads, &[("caller", "stage_dwell"), ("outcome", "stale")]),
+            find(MetricName::ForgeMirrorReads, &[("caller", "step_engine"), ("outcome", "stale")]),
             Some(Int(1))
         );
         assert_eq!(

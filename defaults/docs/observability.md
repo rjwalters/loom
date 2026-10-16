@@ -699,21 +699,11 @@ waited (`loom.dispatch.idle_slot_seconds`). Busy slots by role (#11847,
 sweeps (so `busy_slots{role="sweep"} + idle_slots = max_concurrent`), and each
 role-runner role has its own series, with the role pool's ceiling and spare
 in `loom.dispatch.role_max_concurrent` and `loom.dispatch.role_idle_slots`.
-Forge label-stage dwell
-(`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state, repo}`;
-**off by default** since #12203, switched on by `observability.stageDwell.enabled`,
-so these series are absent on a default fleet)
-covers created → curated, curated → `loom:issue`, building → review requested
-and review requested → merged. Beside the per-label counts, `stage_items` has
-queue states from one ETag-cached open-items walk per repo (#11847):
-`triage`, `unlabeled`, `curated_not_promoted`, `issue_open_pr`,
-`issue_no_pr`, `parked`, `pr_held` and `pr_champion_held` (the Champion-hold
-label shape, `loom:pr` + `loom:blocked`, #11905; it reads no marker, so markerless parks count too). They are absent, not `0`, for a repo
-whose walk did not complete. `stage_items` is per repo, so a per-host total is `sum by (state)`, and the
-states overlap, so never sum across them. It reads ETag-cached stage listings every 5
-minutes plus at most 8 per-item reads per sample, never per tick. With
-`fleet.captainGauges` configured, the fleet captain samples for the fleet and
-dispatchers stand down while its published data is fresh
+Forge label-stage dwell is not exported by the daemon (the sampler and
+`loom.forge.stage_dwell` / `loom.forge.stage_items` were deleted in #12316):
+dwell is a consumer's computation over the mirror's per-item label times.
+With `fleet.captainGauges` configured, the fleet captain reads shared forge
+facts for the fleet and dispatchers stand down while its published data is fresh
 (`loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`; see
 [`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12)).
 The same heartbeat can carry a forge fact (`queueBlocked`), so the snapshot's
@@ -871,8 +861,7 @@ every span also names the endpoint: `github.route` (a template such as
 for an agent front read), so `api.rest` and `agent_gh_front` spend can be
 ranked by route. That pass also
 emits a `pass.summary` log per pass and a `pass.verdict` per artifact; Champion
-steps add `pass.verdict` rows with `mechanism=step:champion` and a
-`stage_items{state="pr_refused"}` gauge (#12027); see
+steps add `pass.verdict` rows with `mechanism=step:champion`; see
 [`telemetry-schema.md`](telemetry-schema.md) and
 `defaults/observability/signoz/pass-queries.sql`.
 
