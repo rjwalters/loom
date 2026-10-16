@@ -3,8 +3,8 @@
 //! Samples CPU, memory, disk and network on a fixed interval, filters each raw
 //! series with a first-order EWMA, and returns a
 //! [`HostStatusRecord`](crate::telemetry::kinds::host_status::HostStatusRecord)
-//! for the OTLP gauge export. Nothing consumes it yet: role-span attributes,
-//! admission and GPU are later slices.
+//! for the OTLP gauge export. Nothing consumes it yet: role-span attributes
+//! and admission are later slices.
 //!
 //! The sampler is split so the arithmetic is testable without an OS:
 //! [`read_os`] turns the platform into a [`Readings`], and
@@ -18,7 +18,8 @@
 //! Platforms: Linux reads every signal. macOS reads load, memory pressure,
 //! swap and volume space; CPU utilisation (`iostat` blocks for a second), disk
 //! I/O and network counters have no cheap non-blocking source there and stay
-//! absent.
+//! absent. GPU (NVIDIA, via `nvidia-smi`) is Linux-only and absent on any host
+//! without the binary or a listed GPU.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -92,6 +93,17 @@ pub struct NetCounters {
     pub tx_bytes: u64,
 }
 
+/// GPU readings aggregated over every NVIDIA GPU on the host.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuReadings {
+    /// Highest utilisation across GPUs, as a fraction (0..1).
+    pub utilisation: f64,
+    /// Memory in use, summed over GPUs.
+    pub mem_used_bytes: u64,
+    /// Total memory, summed over GPUs.
+    pub mem_total_bytes: u64,
+}
+
 /// One tick's raw OS readings. `None` is "could not read", never zero.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Readings {
@@ -113,6 +125,8 @@ pub struct Readings {
     pub net: Option<NetCounters>,
     /// Free bytes of the worktree-root volume.
     pub volume_free_bytes: Option<u64>,
+    /// Aggregate GPU readings; `None` on a host without a readable GPU.
+    pub gpu: Option<GpuReadings>,
 }
 
 /// One EWMA filter. A signal that goes unread for longer than
@@ -233,6 +247,12 @@ impl HostStatusSampler {
             put("net_tx_bytes_per_sec", per_sec(delta(now.tx_bytes, p.tx_bytes)));
         }
 
+        if let Some(gpu) = readings.gpu {
+            put("gpu_utilisation", Some(gpu.utilisation));
+            put("gpu_mem_used_bytes", Some(gpu.mem_used_bytes as f64));
+            put("gpu_mem_total_bytes", Some(gpu.mem_total_bytes as f64));
+        }
+
         // Volume: fill rate is the fall in free bytes (positive while
         // filling); a volume that is not filling has no time-to-full, not an
         // infinite one.
@@ -330,6 +350,7 @@ pub fn read_os(workspace_root: &Path) -> Readings {
         disk: read_disk(),
         net: read_net(),
         volume_free_bytes: volume_free_bytes(&workspace_root.join(".loom").join("worktrees")),
+        gpu: read_gpu(),
     }
 }
 
@@ -387,6 +408,83 @@ fn read_net() -> Option<NetCounters> {
 #[cfg(not(target_os = "linux"))]
 fn read_net() -> Option<NetCounters> {
     None
+}
+
+#[cfg(target_os = "linux")]
+fn read_gpu() -> Option<GpuReadings> {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Set once `nvidia-smi` is found missing: later ticks neither spawn nor log.
+    static NO_NVIDIA_SMI: AtomicBool = AtomicBool::new(false);
+    if NO_NVIDIA_SMI.load(Ordering::Relaxed) {
+        return None;
+    }
+    let out = match Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                NO_NVIDIA_SMI.store(true, Ordering::Relaxed);
+            } else {
+                log::debug!("nvidia-smi failed to start: {e}");
+            }
+            return None;
+        }
+    };
+    if !out.status.success() {
+        log::debug!("nvidia-smi exited with {}", out.status);
+        return None;
+    }
+    parse_nvidia_smi(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_gpu() -> Option<GpuReadings> {
+    None
+}
+
+/// Aggregate `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total
+/// --format=csv,noheader,nounits` output: max utilisation, summed memory (MiB
+/// in the source, bytes out). A row with a non-numeric cell (`[N/A]`) is
+/// skipped; `None` when no row parses, so zero GPUs is absent, not zero.
+#[must_use]
+pub fn parse_nvidia_smi(text: &str) -> Option<GpuReadings> {
+    const MIB: u64 = 1024 * 1024;
+    let mut out = GpuReadings {
+        utilisation: 0.0,
+        mem_used_bytes: 0,
+        mem_total_bytes: 0,
+    };
+    let mut any = false;
+    for line in text.lines() {
+        let f: Vec<&str> = line.split(',').map(str::trim).collect();
+        let [util, used, total] = f.as_slice() else {
+            continue;
+        };
+        let (Ok(util), Ok(used), Ok(total)) =
+            (util.parse::<f64>(), used.parse::<u64>(), total.parse::<u64>())
+        else {
+            continue;
+        };
+        if !util.is_finite() {
+            continue;
+        }
+        out.utilisation = out.utilisation.max((util / 100.0).clamp(0.0, 1.0));
+        out.mem_used_bytes = out.mem_used_bytes.saturating_add(used.saturating_mul(MIB));
+        out.mem_total_bytes = out
+            .mem_total_bytes
+            .saturating_add(total.saturating_mul(MIB));
+        any = true;
+    }
+    any.then_some(out)
 }
 
 /// Sum `/proc/diskstats` over whole disks (`is_whole_disk` rejects partitions;

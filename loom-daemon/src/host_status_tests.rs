@@ -83,7 +83,51 @@ fn readings() -> Readings {
             tx_bytes: 0,
         }),
         volume_free_bytes: Some(1_000_000),
+        gpu: None,
     }
+}
+
+#[test]
+fn parse_nvidia_smi_aggregates_max_util_and_summed_memory() {
+    let g = parse_nvidia_smi("30, 1000, 16000\n80, 2000, 16000\n").unwrap();
+    assert!(approx(g.utilisation, 0.8));
+    assert_eq!(g.mem_used_bytes, 3000 * 1024 * 1024);
+    assert_eq!(g.mem_total_bytes, 32000 * 1024 * 1024);
+}
+
+#[test]
+fn parse_nvidia_smi_skips_na_rows_and_empty_is_absent() {
+    let g = parse_nvidia_smi("[N/A], 1000, 16000\n10, 500, 8000\n").unwrap();
+    assert!(approx(g.utilisation, 0.1));
+    assert_eq!(g.mem_total_bytes, 8000 * 1024 * 1024);
+    assert_eq!(parse_nvidia_smi(""), None);
+    assert_eq!(parse_nvidia_smi("[N/A], [N/A], [N/A]\n"), None);
+}
+
+#[test]
+fn gpu_signals_present_only_when_read_and_absent_never_zero() {
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    let r = s.step(&readings(), 0.0);
+    for k in [
+        "gpu_utilisation",
+        "gpu_mem_used_bytes",
+        "gpu_mem_total_bytes",
+    ] {
+        assert!(!r.raw.contains_key(k) && !r.filtered.contains_key(k), "{k}");
+    }
+    let mut with = readings();
+    with.gpu = Some(GpuReadings {
+        utilisation: 0.5,
+        mem_used_bytes: 10,
+        mem_total_bytes: 100,
+    });
+    let r = s.step(&with, 5.0);
+    assert!(approx(r.raw["gpu_utilisation"], 0.5));
+    assert!(r.filtered.contains_key("gpu_mem_used_bytes"));
+    // A later tick without a GPU reading drops the keys instead of emitting 0.
+    let r = s.step(&readings(), 10.0);
+    assert!(!r.raw.contains_key("gpu_utilisation"));
+    assert!(!r.filtered.contains_key("gpu_utilisation"));
 }
 
 #[test]
