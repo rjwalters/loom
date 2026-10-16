@@ -197,13 +197,47 @@ fi
 
 # 8. Core toolchain inherited from the base image is still present (sanity
 # check that this layer did not accidentally shadow/break anything).
-for bin in git gh jq tmux curl claude codex node npm; do
+for bin in git gh jq tmux curl claude codex node npm python3 uv; do
     if docker exec "$CONTAINER_NAME" bash -lc "command -v $bin >/dev/null 2>&1"; then
         pass "$bin present on PATH inside the running container"
     else
         fail "$bin missing from PATH inside the running container"
     fi
 done
+
+# 8b. Python toolchain for Judge/Auditor sessions (#12339): python3 >= 3.10, and
+# UV_PROJECT_ENVIRONMENT absolute and outside the mounted checkout so uv never
+# reuses or clobbers a host `.venv` (a macOS one exec-fails on Linux).
+PY_OK=$(docker exec "$CONTAINER_NAME" bash -lc "python3 -c 'import sys; print(int(sys.version_info >= (3, 10)))'" 2>&1)
+if [[ "$PY_OK" == "1" ]]; then
+    pass "python3 >= 3.10 inside the running container"
+else
+    fail "python3 missing or older than 3.10: $PY_OK"
+fi
+
+UV_ENV=$(docker exec "$CONTAINER_NAME" bash -lc 'echo "$UV_PROJECT_ENVIRONMENT"' 2>&1)
+if [[ "$UV_ENV" == /* && "$UV_ENV" != /workspace* ]]; then
+    pass "UV_PROJECT_ENVIRONMENT is absolute and outside /workspace ($UV_ENV)"
+else
+    fail "UV_PROJECT_ENVIRONMENT must be absolute and not under /workspace, got: '$UV_ENV'"
+fi
+
+# A throwaway project proves uv resolves its env under UV_PROJECT_ENVIRONMENT
+# and leaves the project dir without a .venv — under the read-only private
+# shape too, where only /tmp is writable.
+UV_PROBE=$(docker run --rm --read-only --user 1000:1000 --tmpfs /tmp:rw,exec,size=512m \
+    --entrypoint bash "$IMAGE" -lc '
+      set -e
+      d=$(mktemp -d); cd "$d"
+      printf "[project]\nname = \"probe\"\nversion = \"0\"\nrequires-python = \">=3.10\"\n" > pyproject.toml
+      uv run python -c "import sys; print(sys.prefix)"
+      [ ! -e .venv ] || { echo "VENV_CREATED_IN_PROJECT"; exit 1; }
+    ' 2>&1)
+if [[ "$UV_PROBE" == "$UV_ENV" ]]; then
+    pass "uv run resolves under UV_PROJECT_ENVIRONMENT and creates no project .venv (read-only rootfs)"
+else
+    fail "uv probe failed or resolved elsewhere: $UV_PROBE"
+fi
 
 # 9. Private-session control bundle (issue #8839) — the image-owned half of the
 # `loom-private-control-v1` boundary. This is the only place the claims about
