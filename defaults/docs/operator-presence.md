@@ -5,6 +5,17 @@ issue. It is emitted by the **operator's own Claude session**, never by a
 fleet worker (workers stay inert through `LOOM_DAEMON_ITEM_ID`), and it needs
 **no running daemon**.
 
+## Rule: daemon work only (#12536)
+
+Loom records telemetry for the work the daemon itself does, and nothing else.
+No hook watches AI work outside the daemon, and no `loom-daemon` subcommand an
+attended or outside session can call emits a span, log or metric about that
+session's own work (`usage-record` and `live-output-attend` were removed).
+Consumers infer external operator work from an item that advances with no
+daemon span or record. The in-session lease *comments*
+(`sweep-lease-publish.sh`, `sweep-lease-renew.sh`) are forge-side claim
+coordination, not telemetry, and are kept.
+
 ## Turning it on (one step)
 
 Presence is a fleet key, `operatorPresence.enabled`, set in fleet-gitops

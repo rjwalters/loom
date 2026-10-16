@@ -150,16 +150,14 @@ use crate::workspace_pool::WorkspacePool;
 
 use endpoint_policy::reserved_placeholder_host;
 use exporter::HttpsExporter;
-use ingest_key::{
-    entry_needs_key, read_ingest_key, resolve_for_planned, PlannedKey, NOT_CONFIGURED_DETAIL,
-};
+#[cfg(test)]
+use ingest_key::read_ingest_key;
+use ingest_key::{entry_needs_key, resolve_for_planned, PlannedKey, NOT_CONFIGURED_DETAIL};
 use queue::DurableQueue;
 
 // The ingest-key resolution lives in `ingest_key`; the `pub use` keeps the
 // pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working
-// for `loom_ui_alerts` and the attended live-output tailer, and the private
-// `read_ingest_key` re-import keeps `super::super::read_ingest_key` alive
-// for the latter.
+// for `loom_ui_alerts`.
 pub use ingest_key::resolve_ingest_key_file;
 
 /// `observability.enabled` env override.

@@ -26,9 +26,8 @@
 //!   counter is exported as `"0"`.
 //!
 //! The same span shape records one role attempt's usage with
-//! `loom.usage.scope=attempt`: `loom-daemon usage-record` for in-session
-//! subagents ([`record`]) and single-target role-runner ticks
-//! (`role_tick_telemetry::usage`).
+//! `loom.usage.scope=attempt` for single-target role-runner ticks
+//! (`role_tick_telemetry::usage`); the daemon's own work only.
 //!
 //! Only counters are exported: no prompt, tool argument or transcript text.
 //! The span drains to the OTLP queue with every other journalled span.
@@ -40,7 +39,6 @@
 mod billing;
 pub mod cost;
 pub mod join;
-pub mod record;
 pub mod spans;
 
 use std::path::Path;
@@ -180,9 +178,9 @@ pub struct PhaseUsage<'a> {
 /// its usage, and an invented span would claim a role attempt the trace never
 /// observed.
 ///
-/// Span ids derive from `(parent, scope, model)`, so a phase whose usage the
-/// in-session `usage-record` path already journalled keeps that span: the
-/// first writer wins and the counters are never double-counted. Call before
+/// Span ids derive from `(parent, scope, model)`, so a phase whose usage was
+/// already journalled keeps that span: the first writer wins and the counters
+/// are never double-counted. Call before
 /// `lifecycle::finish_execution`, which lets the journal retire.
 pub fn record_phase_usage(
     root: &Path,
