@@ -524,3 +524,24 @@ fn a_live_entry_without_an_id_adopts_the_hosts_own_grant() {
     // The id still names the adopted row.
     assert!(t.release(A, &id));
 }
+
+#[test]
+fn an_in_flight_heartbeat_cannot_revert_a_just_replaced_row() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 4));
+    let judge = granted_id(&t.claim(at(100), A, "acme/w", 7, "judge", Some(40)));
+    t.heartbeat(at(105), A, &hb(A, vec![live("acme/w", 7, "judge", Some(&judge))], 3));
+    let doctor = granted_id(&t.claim(at(110), A, "acme/w", 7, "doctor", Some(40)));
+    // The heartbeat was read before the replacement and lands after it.
+    t.heartbeat(at(111), A, &hb(A, vec![live("acme/w", 7, "judge", Some(&judge))], 3));
+    let row = t.row("acme/w", 7).unwrap();
+    assert_eq!((row.step.as_str(), row.assignment_id.as_str()), ("doctor", doctor.as_str()));
+    assert_eq!(row.state, RowState::Granted);
+    // An id-less entry of the old step is just as stale.
+    t.heartbeat(at(112), A, &hb(A, vec![live("acme/w", 7, "judge", None)], 3));
+    assert_eq!(t.row("acme/w", 7).unwrap().step, "doctor");
+    // The next heartbeat carries the new id and adopts it.
+    t.heartbeat(at(130), A, &hb(A, vec![live("acme/w", 7, "doctor", Some(&doctor))], 3));
+    let row = t.row("acme/w", 7).unwrap();
+    assert_eq!((row.step.as_str(), row.state), ("doctor", RowState::Live));
+}

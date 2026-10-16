@@ -43,7 +43,7 @@ pub const REFUSE_CLAIM_LOST: &str = "claim_lost";
 /// The `refuse` reasons the captain counts by name (spec §5.4): the worker's
 /// existing refusal tokens. Any other token is counted as `other`, so a
 /// worker cannot grow the refusals metric's label set.
-pub const REFUSE_REASONS: [&str; 7] = [
+pub const REFUSE_REASONS: [&str; 18] = [
     REFUSE_CLAIM_LOST,
     "already_closed",
     "already_landed",
@@ -51,7 +51,52 @@ pub const REFUSE_REASONS: [&str; 7] = [
     "head_moved",
     "peer_active",
     "backstop_hold",
+    "claim_unverified",
+    "roll_paused",
+    "spawn_failed",
+    "label_flip_failed",
+    "workspace_commands_missing",
+    "token_selection_failed",
+    "no_token_pool",
+    "pool_exhausted",
+    "runtime_rejected",
+    "model_runtime_mismatch",
+    "admission_refused",
 ];
+
+#[cfg(test)]
+mod refuse_reason_tests {
+    use super::REFUSE_REASONS;
+    use std::collections::BTreeSet;
+
+    /// Every `StepRefusal::new("<token>", …)` literal in `src`.
+    fn tokens(src: &str) -> impl Iterator<Item = String> + '_ {
+        src.split("StepRefusal::new(").skip(1).filter_map(|rest| {
+            let rest = rest.trim_start().strip_prefix('"')?;
+            Some(rest.split('"').next()?.to_string())
+        })
+    }
+
+    /// The worker client sends `StepRefusal::reason` on `/v1/refuse`
+    /// (`step_spawn::give_back`), so every literal it is built with must be
+    /// counted by name, not as `other`.
+    #[test]
+    fn every_client_refusal_token_is_a_refuse_reason() {
+        let sources = [
+            include_str!("../sweep_registry/step_spawn.rs"),
+            include_str!("../sweep_registry/step_spawn/lease.rs"),
+            include_str!("../sweep_registry/step_spawn/unlocked.rs"),
+        ];
+        let emitted: BTreeSet<String> = sources.iter().flat_map(|s| tokens(s)).collect();
+        assert!(emitted.len() >= 10, "the scan found too few tokens: {emitted:?}");
+        let counted: BTreeSet<String> = REFUSE_REASONS.iter().map(|r| (*r).to_string()).collect();
+        let missing: Vec<_> = emitted.difference(&counted).collect();
+        assert!(
+            missing.is_empty(),
+            "client refusal tokens missing from REFUSE_REASONS: {missing:?}"
+        );
+    }
+}
 
 /// One step the host runs, granted or not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
