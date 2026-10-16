@@ -34,13 +34,13 @@
 //!
 //! # Heartbeat
 //!
-//! Each registry's reaper tick (30 s) records its repo's live steps
+//! Each registry's reaper tick (30 s by default) records its repo's live steps
 //! ([`on_reaper_tick`]); at most one heartbeat per [`HEARTBEAT_GAP`] goes out
 //! for the whole host, carrying every repo's live steps, the free slots and
 //! the runnable roles the last step tick noted ([`note_capacity`]). In
 //! fallback the heartbeat is the probe that ends it.
 //!
-//! A repo whose live set has not been refreshed for [`LIVE_STALE_AFTER`]
+//! A repo whose live set has not been refreshed for [`live_stale_after`]
 //! (its workspace was deregistered and its reaper aborted, so neither its
 //! next tick nor its steps' ends will come) leaves the table on the next
 //! tick of any other repo, and its grants are released `failed`. Without
@@ -73,9 +73,26 @@ pub const URL_KEY: &str = "fleetDispatch.url";
 /// the reapers of a host's other repos in the same round do not.
 pub const HEARTBEAT_GAP: Duration = Duration::from_secs(25);
 
-/// How long a repo's live set stands without a refresh: three reaper periods
-/// (30 s each). Past it the repo's reaper is taken to be gone (module docs).
+/// The floor of how long a repo's live set stands without a refresh: three
+/// default reaper periods (30 s each). Past it the repo's reaper is taken to
+/// be gone (module docs). A longer configured reaper interval raises the
+/// bar, see [`live_stale_after`].
 pub const LIVE_STALE_AFTER: Duration = Duration::from_secs(90);
+
+/// How long a live set stands without a refresh for a reaper ticking every
+/// `reaper_interval`: three periods, never under [`LIVE_STALE_AFTER`]. A
+/// fixed 90 s would age out a running step's repo between ticks once
+/// `LOOM_SWEEP_REAPER_INTERVAL_SECS` exceeds it, and release its grant
+/// `failed` while the step is live.
+#[must_use]
+pub fn live_stale_after_for(reaper_interval: Duration) -> Duration {
+    reaper_interval.saturating_mul(3).max(LIVE_STALE_AFTER)
+}
+
+/// [`live_stale_after_for`] the effective (env-configured) reaper interval.
+fn live_stale_after() -> Duration {
+    live_stale_after_for(crate::sweep_registry::reaper::resolve_reaper_interval())
+}
 
 /// The server URL when `root`'s effective config enables fleet dispatch.
 #[must_use]
@@ -524,13 +541,14 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
     }
 }
 
-/// Drop every repo whose live set is older than [`LIVE_STALE_AFTER`] at
+/// Drop every repo whose live set is older than [`live_stale_after`] at
 /// `now`, and take out its grants, to be released `failed` (module docs).
 /// A grant whose repo never recorded a live set ages out the same way from
 /// when it was noted spawned. The repo ticking now was just refreshed, so it
 /// is never dropped. Pure over `state`.
 fn prune_stale(state: &mut State, now: Instant) -> Vec<Grant> {
-    let stale = |at: Instant| now.saturating_duration_since(at) > LIVE_STALE_AFTER;
+    let stale_after = live_stale_after();
+    let stale = |at: Instant| now.saturating_duration_since(at) > stale_after;
     let dropped: BTreeSet<PathBuf> = state
         .live_by_root
         .iter()
@@ -540,9 +558,9 @@ fn prune_stale(state: &mut State, now: Instant) -> Vec<Grant> {
     for root in &dropped {
         state.live_by_root.remove(root);
         log::warn!(
-            "fleet_dispatch: {} has not refreshed its live steps for over {}s (its workspace              was deregistered?); dropping them from the heartbeat and releasing their grants",
+            "fleet_dispatch: {} has not refreshed its live steps for over {}s (its workspace was deregistered?); dropping them from the heartbeat and releasing their grants",
             root.display(),
-            LIVE_STALE_AFTER.as_secs()
+            stale_after.as_secs()
         );
     }
     let orphaned: Vec<String> = state

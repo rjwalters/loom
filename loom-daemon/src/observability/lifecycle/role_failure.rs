@@ -253,5 +253,58 @@ pub mod pre_launch {
     }
 }
 
+/// The fixed classes of a failed step-engine step, one per failing branch of
+/// `step_spawn::capture::tick_outcome` (#12480). Each pairs a closed-vocabulary
+/// class with a fixed message, so neither the free-form failure text nor the
+/// exit code can reach the class.
+pub mod step {
+    use super::RoleFailure;
+
+    /// One failed-step branch's class and fixed message.
+    #[derive(Debug, Clone, Copy)]
+    pub struct StepSite {
+        pub class: &'static str,
+        pub message: &'static str,
+    }
+
+    pub const TIMED_OUT: StepSite = StepSite {
+        class: "step-timed-out",
+        message: "step killed at its role timeout",
+    };
+    pub const CANCELLED: StepSite = StepSite {
+        class: "step-cancelled",
+        message: "step cancelled by an operator or a roll",
+    };
+    pub const OUTCOME_FAILED: StepSite = StepSite {
+        class: "step-outcome-failed",
+        message: "step session reported a failed outcome",
+    };
+    pub const EXIT_NONZERO: StepSite = StepSite {
+        class: "step-exit-nonzero",
+        message: "step exited with a non-zero status",
+    };
+    pub const STATUS_UNKNOWN: StepSite = StepSite {
+        class: "step-status-unknown",
+        message: "step exited with no status and no outcome line",
+    };
+
+    /// Every step class, for the contract tests.
+    pub const ALL: &[StepSite] = &[
+        TIMED_OUT,
+        CANCELLED,
+        OUTCOME_FAILED,
+        EXIT_NONZERO,
+        STATUS_UNKNOWN,
+    ];
+
+    impl StepSite {
+        /// The failure this site reports, with the exit code when it has one.
+        #[must_use]
+        pub fn failure(self, exit_code: Option<i32>) -> RoleFailure {
+            RoleFailure::new(self.class, exit_code, self.message)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

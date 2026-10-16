@@ -164,6 +164,29 @@ fn every_pre_launch_site_has_its_own_bounded_non_fallback_class() {
     }
 }
 
+/// #12480: the step classes are a closed, bounded, distinct vocabulary, and
+/// the class (not the exit code) is what `role_tick.outcome` exports.
+#[test]
+fn every_step_class_is_bounded_distinct_and_non_fallback() {
+    let mut seen = std::collections::BTreeSet::new();
+    for site in step::ALL {
+        assert!(!site.class.starts_with("unclassified"), "{}", site.class);
+        assert!(
+            site.class
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'-'),
+            "{} is not kebab-case",
+            site.class
+        );
+        assert!(seen.insert(site.class), "duplicate class {}", site.class);
+        assert!(pre_launch::ALL.iter().all(|p| p.class != site.class));
+        let failure = site.failure(Some(3));
+        assert_eq!(failure.class(), site.class);
+        assert!(failure.message().len() <= 256);
+        assert!(!failure.message().chars().any(char::is_control));
+    }
+}
+
 #[test]
 fn a_tick_refused_before_launch_returns_the_class_its_site_noted() {
     let dir = tempfile::tempdir().unwrap();
