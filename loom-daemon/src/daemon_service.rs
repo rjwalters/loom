@@ -374,15 +374,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         );
     }
 
-    // Forge-identity config problems (writer/App mismatches, a `writers[]`
-    // shadowed by the `LOOM_GITHUB_APP_ID` env override). Evaluated here so
-    // the env check sees the daemon's own environment, which its credential
-    // delivery and agent sessions inherit — `forge identities` run from an
-    // operator's shell cannot see that.
-    for warning in loom_daemon::forge_identity::config_warnings_for(&sweep_workspace) {
-        log::warn!("forge_identity: {warning}");
-    }
-
     // Unified operational hyperparameters (Issue #9683): resolve the vector
     // down its tier chain (single-knob env > $LOOM_HYPERPARAMS vector >
     // "hyperparameters" config block > legacy autonomous.* keys > defaults),
