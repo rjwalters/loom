@@ -526,3 +526,227 @@ fn a_hold_that_cannot_be_repaired_is_escalated_once() {
         assert!(ask.line.contains(needle), "{needle} in {}", ask.line);
     }
 }
+
+// ----------------------------------------------------------------------------
+// #11989: surfaces `installed_files` does not list, and a detached HEAD
+// ----------------------------------------------------------------------------
+
+/// Far enough ahead that a detached HEAD has sat past
+/// `managed::detached_after()`'s six-hour default.
+fn much_later() -> DateTime<Utc> {
+    Utc::now() + chrono::Duration::hours(7)
+}
+
+/// A local resync-shaped commit writing surfaces a release added after the
+/// last full install: none of them is in `installed_files`.
+fn commit_unlisted_surfaces(fx: &Fixture) {
+    for path in [
+        ".agents/skills/loom-builder/SKILL.md",
+        ".loom/scripts/tests/check-ci-suite-manifest.sh",
+        ".loom/docs/blame-issue.md",
+    ] {
+        write(
+            &fx.host.join(path),
+            &format!("{}\nresynced locally\n", crate::agent_skills::MARKER),
+        );
+    }
+    git(&fx.host, &["add", "-A"]);
+    git(
+        &fx.host,
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "chore: resync installed Loom surfaces",
+        ],
+    );
+}
+
+#[test]
+fn a_stranded_resync_commit_on_surfaces_installed_files_misses_is_repaired() {
+    let fx = loom_fixture();
+    commit_unlisted_surfaces(&fx);
+    let stranded = fx.head();
+    let tip = fx.push(".loom/scripts/spawn.sh", "resynced\n");
+
+    let found = heal(&fx, Utc::now());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert!(rescue_refs(&fx)[0].ends_with(&stranded));
+}
+
+#[test]
+fn a_surface_path_pinned_in_resync_ignore_is_not_touched() {
+    let fx = loom_fixture();
+    fx.push(
+        ".loom/resync-ignore",
+        "# deliberate\nscripts/tests/check-ci-suite-manifest.sh\n",
+    );
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    commit_unlisted_surfaces(&fx);
+    fx.push("README.md", "two\n");
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+#[test]
+fn a_non_loom_skill_or_command_is_not_counted_as_a_surface() {
+    let fx = loom_fixture();
+    write(&fx.host.join(".agents/skills/custom/SKILL.md"), "mine\n");
+    write(&fx.host.join(".claude/commands/repo/x.md"), "mine\n");
+    git(&fx.host, &["add", "-A"]);
+    git(
+        &fx.host,
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "chore: resync installed Loom surfaces",
+        ],
+    );
+    fx.push("README.md", "two\n");
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+/// The host's checkout detached at its current HEAD, with origin one commit
+/// ahead and the clone already holding it.
+fn detached_behind(fx: &Fixture) -> String {
+    git(&fx.host, &["checkout", "--quiet", "--detach", "HEAD"]);
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    tip
+}
+
+#[test]
+fn a_detached_head_left_behind_for_hours_is_put_back_on_the_branch() {
+    let fx = loom_fixture();
+    let tip = detached_behind(&fx);
+
+    let found = heal(&fx, much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "main");
+    assert_eq!(
+        git(&fx.host, &["rev-parse", "--abbrev-ref", "main@{upstream}"]),
+        "origin/main",
+        "the branch tracks origin again"
+    );
+    assert!(kinds(&found).contains(&"reattached"), "{:?}", kinds(&found));
+}
+
+#[test]
+fn a_detached_head_with_loom_only_commits_is_put_back_and_rescued() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "--detach", "HEAD"]);
+    commit_unlisted_surfaces(&fx);
+    let stranded = fx.head();
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    let found = heal(&fx, much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "main");
+    let refs = rescue_refs(&fx);
+    assert!(refs.iter().any(|r| r.ends_with(&stranded)), "{refs:?}");
+}
+
+#[test]
+fn a_recently_detached_head_is_not_touched() {
+    let fx = loom_fixture();
+    detached_behind(&fx);
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_detached_head_at_origins_tip_is_not_touched() {
+    let fx = loom_fixture();
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    git(&fx.host, &["checkout", "--quiet", "--detach", "origin/main"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_detached_head_with_a_non_loom_commit_is_not_touched() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "--detach", "HEAD"]);
+    fx.commit_locally("src/feature.rs");
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_checkout_on_another_branch_is_not_this_repair() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "pr6597"]);
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+/// Commit `files` on the host's branch, ahead of an origin that has moved on.
+fn commit_files_behind_origin(fx: &Fixture, files: &[(&str, &str)]) -> String {
+    for (path, body) in files {
+        write(&fx.host.join(path), body);
+    }
+    git(&fx.host, &["add", "-A"]);
+    git(&fx.host, &["commit", "--quiet", "-m", "local"]);
+    let local = fx.head();
+    fx.push("README.md", "two\n");
+    local
+}
+
+#[test]
+fn a_repo_local_file_in_a_managed_directory_is_not_loom_owned() {
+    for path in [
+        ".loom/roles/custom-role.md",
+        ".loom/scripts/my-local-helper.sh",
+        ".claude/commands/loom/mine.md",
+    ] {
+        let fx = loom_fixture();
+        commit_files_behind_origin(&fx, &[(path, "mine\n")]);
+        assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged, "{path}");
+    }
+}
+
+#[test]
+fn a_skill_without_the_generation_marker_is_not_loom_owned() {
+    let fx = loom_fixture();
+    // A shipped name, but detached from generation: the resync skips it.
+    commit_files_behind_origin(
+        &fx,
+        &[(".agents/skills/loom-builder/SKILL.md", "consumer's own\n")],
+    );
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+#[test]
+fn a_skill_pinned_in_the_agents_skills_form_is_not_touched() {
+    let fx = loom_fixture();
+    fx.push(".loom/resync-ignore", "agents-skills/loom-builder/SKILL.md\n");
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    let marked = format!("{}\nlocal\n", crate::agent_skills::MARKER);
+    commit_files_behind_origin(&fx, &[(".agents/skills/loom-builder/SKILL.md", &marked)]);
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+#[test]
+fn another_named_branch_with_loom_only_commits_is_not_reset() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "loom/my-work"]);
+    commit_files_behind_origin(&fx, &[(".loom/scripts/tests/check-ci-suite-manifest.sh", "x\n")]);
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_detached_head_pinned_to_keep_is_not_put_back() {
+    let fx = loom_fixture();
+    detached_behind(&fx);
+    git(&fx.host, &["config", "--local", "loom.checkoutFf.detached", "keep"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
