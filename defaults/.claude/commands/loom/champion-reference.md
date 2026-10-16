@@ -525,7 +525,7 @@ monotonically-growing held-PR backlog documented in #6848.
 
 **Covering critical files (#12528)**: a class may add
 `"coversCriticalFiles": true`, `"excludeFilePatterns": [...]` (globs) and
-`"forbiddenDiffPatterns": [...]` (`grep -E` over every added/removed line). Criterion
+`"forbiddenDiffPatterns": [...]` (jq `test()` regexes over every added/removed line). Criterion
 #3 then runs the class check before it emits FAIL. Worked examples, class
 `ci-steps` = `filePatterns: [".github/workflows/*.yml"]`, `coversCriticalFiles: true`,
 `excludeFilePatterns: [".github/workflows/*publish*", "*release*", "*deploy*"]`,

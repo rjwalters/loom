@@ -486,25 +486,36 @@ behavior is byte-for-byte unchanged from before #6850.
   `filePatterns`. A PR with **any** changed file matching one is disqualified
   from the class (e.g. `.github/workflows/*publish*`, `*release*`,
   `*deploy*`). A class with no `excludeFilePatterns` is unchanged.
-- `forbiddenDiffPatterns` (#12528, optional) — `grep -E` regexes matched
-  against every **added or removed line** (leading `+`/`-` stripped) of every
-  changed file, read fresh from the paginated files API (e.g. `^\s*permissions:`,
-  `id-token`, `secrets\.`, `pull_request_target`). One matching line
-  disqualifies the PR from the class. **Fail closed**: an unreadable diff, a
-  changed file the API returns no patch for (binary, or too large to inline),
-  or an invalid regex also disqualifies it.
+- `forbiddenDiffPatterns` (#12528, optional) — regexes (jq `test()`, i.e.
+  Oniguruma: one engine on every host, so macOS and Linux decide alike)
+  matched against every **added or removed line** (leading `+`/`-` stripped)
+  of every changed file, read fresh from the paginated files API (e.g.
+  `^\s*permissions:`, `id-token`, `secrets\.`, `pull_request_target`). One
+  matching line disqualifies the PR from the class. **Fail closed**: an
+  unreadable diff, a changed file the API returns no patch for (binary, or
+  too large to inline), or an invalid regex also disqualifies it.
 - **Kept set — never satisfiable by a class (#12528).** In criterion #3 mode
   the matcher also disqualifies any PR touching a path of the kept set,
   whatever the class says and with or without `coversCriticalFiles`: kept-set
   items 1 and 2 of criterion #2 (irreversible migrations; the merge gate
-  itself — this file, `champion-critical-file-hold.md`, `merge-pr.sh`,
-  `post-verdict.sh`, `verdict-staleness-guard.sh`, `check-review-feedback.sh`,
-  `comment_trust.rs`) and the remaining red entries (credential/token
-  selection, guard hooks, installers/updaters that rewrite installed files on
-  roll, worktree/branch deletion, `.github/labels.yml`). The list is
+  itself — the Champion and Judge prompts, `merge-pr.sh` and its daemon port
+  (`merge_pr*`), every verdict writer/invalidator (`*verdict*`,
+  `claim_reconciliation`), comment trust (`comment_trust*`,
+  `trusted_comments`, `forge_identity_cmd`), and `.loom/config.json` /
+  `defaults/config.json`, which declare the classes) and the remaining red
+  entries (credential/token selection, guard hooks and their wiring,
+  installers/updaters that rewrite installed files on roll,
+  worktree/branch deletion, `.github/labels.yml`). The list is
   `KEPT_SET_PATTERNS` in the block below; it is hardcoded, so an operator
-  config cannot widen it. Criterion #2's standing-authorization behavior for
+  config cannot widen it. It is matched against both the `filename` and the
+  `previous_filename` of every changed file, so a rename out of a kept-set
+  path is caught too. Criterion #2's standing-authorization behavior for
   existing classes (including the `guard-hooks` example above) is unchanged.
+- **Criterion #3 reads its own file list (#12528).** `standing_auth_eval
+  critical "$FILES"` re-reads the PR's files once (slurped, so every page is
+  one array) and requires: the count equals the PR's `changed_files`, and the
+  set of `filename`s equals criterion #3's own `$FILES`. Any mismatch (a
+  partial read, a head that moved between reads) disqualifies the PR.
 
 **Why this criterion re-checks conditions that are also criteria #1 and #6**:
 those criteria still run independently later in this same pass and still
@@ -528,30 +539,70 @@ CONFIG_FILE=".loom/config.json"
 # config cannot widen it. Applied in "critical" mode only, so criterion #2's
 # behavior for existing classes is unchanged.
 KEPT_SET_PATTERNS=(
+  # The merge gate itself (kept-set item 2): prompts, scripts, daemon modules.
   "*champion-pr-merge.md" "*champion-critical-file-hold.md"
-  "*merge-pr.sh" "*post-verdict.sh" "*verdict-staleness-guard.sh"
-  "*check-review-feedback.sh" "*comment_trust.rs" "*reconcile_pr_verdicts*"
-  "*/hooks/guard-*" "*spawn-claude.sh" "*spawn-worker.sh" "*/tokens/*"
-  "*install-loom.sh" "*resync-installed.sh" "*worktree.sh" "*loom-clean*"
-  ".github/labels.yml" "*migrations/*" "*_migration.py"
+  "*commands/loom/champion*" "*commands/loom/judge*" "*roles/judge.md"
+  "*merge-pr.sh" "*merge_pr*" "*post-verdict.sh" "*verdict*"
+  "*check-review-feedback.sh" "*comment_trust*" "*trusted_comments*"
+  "*forge_identity_cmd*" "*claim_reconciliation*" "*reconcile_pr_verdicts*"
+  "*version_only_diff*" "*version-only-diff*"
+  # The config that declares the classes: a PR must not widen its own class.
+  "*.loom/config.json" "*defaults/config.json"
+  # Guard hooks and their wiring, token selection.
+  "*/hooks/guard-*" "*hook-wiring*" "*installed-file-guard*"
+  "*.claude/settings.json" "*spawn-claude.sh" "*spawn-worker.sh"
+  "*/tokens/*" "*github-app-token*" "*token-precedence*"
+  # Installers/updaters, worktree and branch deletion, label schema, migrations.
+  "*install-loom.sh" "*install.sh" "*resync-installed.sh" "*auto_update*"
+  "*worktree.sh" "*loom-clean*" ".github/labels.yml"
+  "*migrations/*" "*_migration.py"
 )
+
+# standing_auth_fetch_diff: read the PR's files ONCE, every page slurped into a
+# single JSON array (DIFF_JSON) -- never one document per page, whose `jq -e`
+# status would reflect only the last page. Nonzero = unreadable (fail closed).
+standing_auth_fetch_diff() {
+  local raw
+  raw=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate 2>/dev/null) || return 1
+  DIFF_JSON=$(printf '%s' "$raw" | jq -s -c 'add // []' 2>/dev/null) || return 1
+}
 
 # standing_auth_eval <any|critical>
 #   any      criterion #2: a class satisfies the four-axis judgment.
 #   critical criterion #3: only a class with "coversCriticalFiles": true, and
 #            no kept-set path, may waive the critical-file FAIL.
 # Sets STANDING_AUTH_RESULT / STANDING_AUTH_ID. Every check fails closed.
+# Reads PR_NUMBER, CONFIG_FILE, LABELS (judgeApproval), read_ci_checks (greenCi)
+# and, in "any" mode, FAST_PATH_FILES. In critical mode $2 is criterion #3's own
+# $FILES.
 standing_auth_eval() {
-  local mode="$1" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN
+  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN
+  local MATCH_FILES CHANGED_COUNT
   STANDING_AUTH_RESULT="NOT ELIGIBLE"
   STANDING_AUTH_ID=""
+  DIFF_JSON=""
   [ -f "$CONFIG_FILE" ] || return 0
   jq -e '(.champion.standingAuthorizations // []) | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 || return 0
 
-  # Reuse the SAME freshly-fetched file list the docs-only fast path above
-  # just read (FAST_PATH_FILES) -- no second network call, and the same
-  # #4613/#5371 "never trust a marker, always re-derive" discipline.
-  AUTH_FILES="$FAST_PATH_FILES"
+  if [ "$mode" = "critical" ]; then
+    # One slurped read of the files API drives the whole decision (#12528).
+    # It must be complete (count == the PR's changed_files) and name exactly
+    # the files criterion #3 itself just listed; otherwise fail closed. Class
+    # and kept-set matching run over filename AND previous_filename, so a
+    # rename out of a kept-set path (or out of the class) cannot slip through.
+    standing_auth_fetch_diff || return 0
+    CHANGED_COUNT=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.changed_files' 2>/dev/null) || return 0
+    printf '%s' "$DIFF_JSON" | jq -e --argjson n "${CHANGED_COUNT:-null}" 'length == $n and length > 0' >/dev/null 2>&1 || return 0
+    AUTH_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[].filename') || return 0
+    [ "$(printf '%s\n' "$AUTH_FILES" | LC_ALL=C sort -u)" = "$(printf '%s\n' "$crit_files" | LC_ALL=C sort -u)" ] || return 0
+    MATCH_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[] | .filename, (.previous_filename // empty)') || return 0
+  else
+    # Reuse the SAME freshly-fetched file list the docs-only fast path above
+    # just read (FAST_PATH_FILES) -- no second network call, and the same
+    # #4613/#5371 "never trust a marker, always re-derive" discipline.
+    AUTH_FILES="$FAST_PATH_FILES"
+    MATCH_FILES="$FAST_PATH_FILES"
+  fi
   NUM_CLASSES=$(jq '(.champion.standingAuthorizations // []) | length' "$CONFIG_FILE")
 
   for ((i = 0; i < NUM_CLASSES; i++)); do
@@ -622,25 +673,29 @@ standing_auth_eval() {
           fi
         done
       fi
-    done <<<"$AUTH_FILES"
+    done <<<"$MATCH_FILES"
     [ "$ALL_MATCH" -eq 0 ] && continue
-    [ -z "$(printf '%s' "$AUTH_FILES" | tr -d '[:space:]')" ] && continue
 
-    # forbiddenDiffPatterns (#12528): a regex (grep -E) matched against every
-    # added/removed line of every changed file, from the paginated files API
-    # read in THIS pass. A file with no patch (binary, or too large for the
-    # API to inline), an unreadable diff, or an invalid regex all disqualify.
+    # forbiddenDiffPatterns (#12528): a regex (jq test(), one engine on every
+    # host) matched against every added/removed line of every changed file,
+    # from the files API read in THIS pass. A file with no patch (binary, too
+    # large for the API to inline, a pure rename), an unreadable diff, or an
+    # invalid regex all disqualify.
     if [ -n "$FORBIDDEN" ]; then
-      local DIFF_JSON LINES
-      DIFF_JSON=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate 2>/dev/null) || continue
+      local LINES_JSON DIFF_HIT=0 rx rc
+      [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
       printf '%s' "$DIFF_JSON" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || continue
-      LINES=$(printf '%s' "$DIFF_JSON" | jq -r '.[].patch | split("\n")[] | select(test("^[+-]"))' | sed -E 's/^[+-]//')
-      local DIFF_HIT=0 rx rc
+      LINES_JSON=$(printf '%s' "$DIFF_JSON" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]]') || continue
       while IFS= read -r rx; do
         [ -z "$rx" ] && continue
-        printf '%s\n' "$LINES" | grep -Eq -- "$rx"
+        # Validate the regex on its own: `any` over zero lines never compiles it.
+        jq -n -e --arg rx "$rx" '"" | test($rx)' >/dev/null 2>&1
         rc=$?
-        # rc 0 = a forbidden line; rc >= 2 = invalid regex. Both disqualify.
+        [ "$rc" -le 1 ] || { DIFF_HIT=1; continue; }
+        printf '%s' "$LINES_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx))' >/dev/null 2>&1
+        rc=$?
+        # rc 0 = a forbidden line; rc 1 = none; anything else = error. Only
+        # "none" passes.
         [ "$rc" -eq 1 ] || DIFF_HIT=1
       done <<<"$FORBIDDEN"
       [ "$DIFF_HIT" -eq 1 ] && continue
@@ -1167,9 +1222,17 @@ version_only_diff() {
 # class with "coversCriticalFiles": true that matches the whole PR (exact
 # subset, no excludeFilePatterns / forbiddenDiffPatterns / kept-set hit,
 # every condition holding now) waives this criterion. Reuses the
-# standing_auth_eval defined under criterion #2 (same FAST_PATH_FILES, same
-# fail-closed rules). No such class -> the loop below runs exactly as before.
-standing_auth_eval critical
+# standing_auth_eval defined under criterion #2, with its own slurped files read
+# checked against $FILES above. No such class -> the loop below runs as before.
+# Self-contained inputs (never a literal placeholder left to a prior block). The
+# function itself and LABELS / read_ci_checks come from criteria #1/#2/#6 and
+# must be in this shell; if not, the reset below and a missing function both
+# fall through to today's FAIL path.
+PR_NUMBER=<number>
+CONFIG_FILE=".loom/config.json"
+STANDING_AUTH_RESULT="NOT ELIGIBLE"   # never inherit criterion #2's ELIGIBLE
+STANDING_AUTH_ID=""
+standing_auth_eval critical "$FILES"
 if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
   echo "PASS (standing authorization '$STANDING_AUTH_ID', #12528): criterion #3 satisfied by a coversCriticalFiles class — changed files: $AUTH_FILES"
   # Name STANDING_AUTH_ID in the rationale. $CRITERION3_RESULT is "PASS".
