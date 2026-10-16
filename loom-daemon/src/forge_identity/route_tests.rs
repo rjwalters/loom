@@ -24,6 +24,7 @@ fn roster(readers: Vec<Identity>) -> Roster {
         writer: Some(reader("100", None)),
         readers,
         legacy_logins: vec![],
+        writers: Vec::new(),
     }
 }
 
