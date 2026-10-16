@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Mirror discovery reads one snapshot per tick; the per-listing mirror path is deleted** (#12307, part of #12304). On `forge.mirror.discovery = "worklist"` the blocked-queue gauge, quarantine reconciliation's blocked set and claim reconciliation's open-PR listing read the tick's snapshot instead of listing the forge (a repo the snapshot has not read is a failed listing, not an empty one; their write-gating reads stay live), so discovery forge reads per tick are 0. `forge_mirror::discovery` (the per-call check-mirror-else-REST path with its stale hold and error back-off) is removed, and with it the `"per_call"` mode: that value, and an unset key, now read as `"direct"`. `autonomous.workFinder.gatherConcurrency` applies to the Direct backend only; on `"worklist"` it is ignored with a one-time warning. The stage-dwell sampler's listing was already gone.
+
 ### Added
 
 - **`host.status`: fixed-interval host gauges, raw and EWMA-filtered** (#12112, slice a of #11809). A new OTLP-only gauge kind, sampled every 5 s by `host_status.rs` while an OTLP exporter is running (inert otherwise): CPU utilisation and load per core, memory used, available and pressure, swap, disk I/O busy and throughput, network throughput, and the worktree volume's free bytes, fill rate and time to full. Each series is exported raw (`system.*` semconv names where one fits, else `loom.host.*`) and filtered with a first-order EWMA whose time constant is in the gauge name (`loom.host.cpu_utilisation_ewma_30s`). A failed reading is absent, never zero. The collector's datapoint allowlist gains `volume`. No consumers yet, and `cpu_headroom`, `host_pressure` and `disk_headroom` are unchanged. See `defaults/docs/telemetry-schema.md`.
