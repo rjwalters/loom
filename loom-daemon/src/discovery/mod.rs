@@ -56,10 +56,9 @@ pub struct Target {
     pub root_dir: PathBuf,
 }
 
-/// Lists one repo through the direct backend: `(target, reads counter,
-/// per-call mirror leg allowed, tier to record)`.
-type Lister =
-    dyn Fn(&Target, &AtomicU64, bool, Tier) -> Result<RepoSnapshot> + Send + Sync + 'static;
+/// Lists one repo through the direct backend: `(target, reads counter, tier
+/// to record)`.
+type Lister = dyn Fn(&Target, &AtomicU64, Tier) -> Result<RepoSnapshot> + Send + Sync + 'static;
 
 /// The discovery state across ticks: the Mirror tier's last worklist and
 /// ETag, and the fallback tiers' last listings. Both in memory only, owned
@@ -174,7 +173,7 @@ impl TickSnapshot {
     #[cfg(test)]
     fn with_lister(
         mut self,
-        lister: impl Fn(&Target, &AtomicU64, bool, Tier) -> Result<RepoSnapshot> + Send + Sync + 'static,
+        lister: impl Fn(&Target, &AtomicU64, Tier) -> Result<RepoSnapshot> + Send + Sync + 'static,
     ) -> Self {
         self.lister = Box::new(lister);
         self
@@ -219,12 +218,7 @@ impl TickSnapshot {
     }
 
     fn read_direct(&self, target: &Target, key: &str) -> Result<Arc<RepoSnapshot>> {
-        let listed = (self.lister)(
-            target,
-            &self.direct_reads,
-            self.chain.per_call_mirror(),
-            self.chain.listing_tier(),
-        );
+        let listed = (self.lister)(target, &self.direct_reads, self.chain.listing_tier());
         let mut notes = self.lock(&self.notes);
         match listed {
             Ok(repo) => {
@@ -307,7 +301,7 @@ impl TickSnapshot {
                 detail: "the rate-limit breaker is open".into(),
             });
         }
-        (self.lister)(target, &self.direct_reads, false, self.chain.listing_tier()).map_err(|e| {
+        (self.lister)(target, &self.direct_reads, self.chain.listing_tier()).map_err(|e| {
             // A reserve refusal is its own outcome: it ends the tick's
             // discovery and the breaker is left alone (#12310).
             let reserve = crate::gh_invocation::purpose::discovery_ended();

@@ -95,11 +95,8 @@ fn listed(slug: &str, tier: Tier) -> RepoSnapshot {
 }
 
 /// A lister that answers every repo and counts its calls.
-fn counting(
-    calls: Arc<AtomicU64>,
-) -> impl Fn(&Target, &AtomicU64, bool, Tier) -> Result<RepoSnapshot> {
-    move |t, reads, per_call, tier| {
-        assert!(!per_call, "a fallback tier never asks the mirror per call");
+fn counting(calls: Arc<AtomicU64>) -> impl Fn(&Target, &AtomicU64, Tier) -> Result<RepoSnapshot> {
+    move |t, reads, tier| {
         calls.fetch_add(1, Ordering::SeqCst);
         reads.fetch_add(1, Ordering::Relaxed);
         Ok(listed(&t.slug, tier))
@@ -146,7 +143,6 @@ fn no_mirror_block_is_the_gh_only_chain() {
         let chain = Chain::from_effective(&effective);
         assert_eq!(chain.tiers(), vec![Tier::Gh], "{effective}");
         assert_eq!(chain.backend(), BackendKind::Direct);
-        assert!(!chain.per_call_mirror());
         assert!(!chain.is_worklist());
     }
 }
@@ -154,24 +150,22 @@ fn no_mirror_block_is_the_gh_only_chain() {
 #[test]
 fn a_mirror_block_selects_the_chain_by_discovery_mode() {
     let chain = |d: Option<&str>| Chain::from_effective(&config(d));
-    // The default during the transition is today's per-call behaviour.
-    let per_call = chain(None);
-    assert_eq!(per_call.mode(), Some(Mode::PerCall));
-    assert!(per_call.per_call_mirror());
-    assert_eq!(per_call.backend(), BackendKind::Direct);
-    assert_eq!(chain(Some("per_call")).mode(), Some(Mode::PerCall));
-    assert_eq!(chain(Some("garbage")).mode(), Some(Mode::PerCall));
+    // Unset, `per_call` (retired, #12307) and anything unrecognised list
+    // per repo and never ask the mirror.
+    for d in [None, Some("per_call"), Some("garbage")] {
+        let c = chain(d);
+        assert_eq!(c.mode(), Some(Mode::Direct), "{d:?}");
+        assert_eq!(c.backend(), BackendKind::Direct);
+    }
 
     let worklist = chain(Some("worklist"));
     assert_eq!(worklist.tiers(), vec![Tier::Mirror, Tier::Gateway, Tier::Gh]);
     assert_eq!(worklist.backend(), BackendKind::Mirror);
-    assert!(!worklist.per_call_mirror());
 
     // Break-glass: a mirror that is wrong, not down.
     let direct = chain(Some(" Direct "));
     assert_eq!(direct.tiers(), vec![Tier::Gateway, Tier::Gh]);
     assert_eq!(direct.backend(), BackendKind::Direct);
-    assert!(!direct.per_call_mirror(), "the break-glass never asks the mirror");
 }
 
 #[test]
@@ -280,7 +274,7 @@ fn a_ready_worklist_serves_every_repo_from_the_mirror_tier() {
     let mut d = Discovery::default();
     let snap = d
         .begin_mirror_tick_with(wl(), now(), |_| modified("\"w1\""))
-        .with_lister(|_, _, _, _| panic!("a worklist answer lists nothing"));
+        .with_lister(|_, _, _| panic!("a worklist answer lists nothing"));
     assert_eq!(snap.repo(&target("acme/widgets")).unwrap().tier, Tier::Mirror);
     snap.repo(&target("acme/old")).unwrap();
     let stats = snap.stats();
@@ -478,7 +472,7 @@ fn a_failed_listing_is_tier_none_and_is_not_retried_until_the_backstop() {
     let mut d = Discovery::default();
     let calls = Arc::new(AtomicU64::new(0));
     let failing = |calls: Arc<AtomicU64>| {
-        move |_: &Target, _: &AtomicU64, _: bool, _: Tier| -> Result<RepoSnapshot> {
+        move |_: &Target, _: &AtomicU64, _: Tier| -> Result<RepoSnapshot> {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(anyhow!("no credential"))
         }
@@ -515,7 +509,7 @@ fn a_reserve_refusal_ends_discovery_draws_from_the_last_listing_and_spares_the_b
     let attempts = Arc::new(AtomicU64::new(0));
     let refusing = {
         let attempts = attempts.clone();
-        move |_: &Target, _: &AtomicU64, _: bool, _: Tier| -> Result<RepoSnapshot> {
+        move |_: &Target, _: &AtomicU64, _: Tier| -> Result<RepoSnapshot> {
             attempts.fetch_add(1, Ordering::SeqCst);
             purpose::end_discovery();
             Err(anyhow!("gh: loom-gateway-reserve: discovery refused (HTTP 429)"))
@@ -549,7 +543,7 @@ fn a_reserve_refusal_with_no_earlier_listing_draws_nothing() {
     let mut d = Discovery::default();
     let snap = d
         .begin_mirror_tick_with(wl(), now(), |_| failed(503))
-        .with_lister(|_, _, _, _| {
+        .with_lister(|_, _, _| {
             purpose::end_discovery();
             Err(anyhow!("loom-gateway-reserve"))
         });
@@ -564,8 +558,7 @@ fn the_standalone_chain_makes_no_mirror_or_gateway_request() {
     let mut d = Discovery::default();
     let snap = d
         .begin_tick(Chain::standalone(), now())
-        .with_lister(|t, reads, per_call, tier| {
-            assert!(!per_call);
+        .with_lister(|t, reads, tier| {
             reads.fetch_add(1, Ordering::Relaxed);
             Ok(listed(&t.slug, tier))
         });
@@ -588,27 +581,6 @@ fn the_direct_chains_list_every_tick_with_no_pace() {
         assert_eq!(snap.repo(&target("acme/widgets")).unwrap().tier, Tier::Gateway);
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-}
-
-#[test]
-fn only_the_per_call_chain_lets_the_listing_ask_the_mirror() {
-    let mut d = Discovery::default();
-    let saw = Arc::new(Mutex::new(Vec::new()));
-    for chain in [
-        Chain::standalone(),
-        Chain::fleet(Mode::PerCall, Tier::Gateway),
-        Chain::fleet(Mode::Direct, Tier::Gateway),
-    ] {
-        let saw = saw.clone();
-        let snap = d
-            .begin_tick(chain, now())
-            .with_lister(move |t, _, per_call, tier| {
-                saw.lock().unwrap().push(per_call);
-                Ok(listed(&t.slug, tier))
-            });
-        snap.repo(&target("acme/widgets")).unwrap();
-    }
-    assert_eq!(*saw.lock().unwrap(), vec![false, true, false]);
 }
 
 #[test]
@@ -650,7 +622,7 @@ fn the_direct_backend_reports_no_worklist_facts_until_it_lists() {
 }
 
 #[test]
-fn the_mirror_backend_never_reaches_the_per_call_listing_path() {
+fn the_mirror_backend_never_reaches_a_per_repo_listing_path() {
     for file in ["mirror.rs", "worklist.rs"] {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src/discovery")
@@ -662,7 +634,6 @@ fn the_mirror_backend_never_reaches_the_per_call_listing_path() {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!code.contains("list_open"), "{file} must not call a per-repo listing");
-        assert!(!code.contains("forge_mirror::discovery"), "{file}");
         assert!(!code.contains("forge_listing::list"), "{file}");
     }
 }
