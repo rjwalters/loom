@@ -8,7 +8,6 @@
 //! step spawn, and returns the [`TickReport`] every tick consumer (the tick
 //! line, the summary, the dispatch plan, `pick.decision`) reads.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -24,7 +23,7 @@ use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::repo_cap::{RepoCap, RepoLimits};
-use crate::work_finder::step_item::Lane;
+use crate::work_finder::step_item::{Lane, Step};
 use crate::work_finder::{workspace_draw, RedMainLane, RegistryDispatcher, TickReport};
 use crate::workspace_pool::WorkspacePool;
 
@@ -65,7 +64,9 @@ pub struct ListingState {
 /// - A Builder claim is a blind label flip: no Builder step when the open-PR
 ///   listing failed (a branch-only PR is invisible) or the items are the
 ///   last good listing, not this tick's.
-/// - A red repo held for its fixes keeps only its red-main fixes.
+/// - A red repo held for its fixes keeps its red-main fixes and every step
+///   that adds no code to a red `main`: Builder and `ChampionMerge` run only
+///   for a red-main fix, so a fix PR can still be reviewed and repaired.
 ///
 /// Returns how many Builder steps the listing held (#12025): the step path
 /// fails closed on a listing it cannot vouch for, and never falls back to a
@@ -82,7 +83,9 @@ pub fn shape_pool(
         0
     };
     if listing.fixes_only {
-        weighing.pool.retain(|c| c.item.lane == Lane::RedMain);
+        weighing.pool.retain(|c| {
+            c.item.lane == Lane::RedMain || !matches!(c.step, Step::Builder | Step::ChampionMerge)
+        });
     }
     held
 }
@@ -184,11 +187,13 @@ impl StepSpawner for RegistrySpawner {
     }
 }
 
-fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
-    registry.lock().map_or(0, |mut reg| {
-        reg.reap_liveness();
-        reg.occupied_issues().len()
-    })
+pub(crate) fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
+    // A poisoned lock still holds the real claims; recover rather than report 0.
+    let mut reg = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reg.reap_liveness();
+    reg.occupied_issues().len()
 }
 
 impl StepDriver {
@@ -291,10 +296,12 @@ impl StepDriver {
                 gathered.stale_listing || !gathered.pulls_complete,
                 escalated,
             );
-            let (mut cooldowns, pool_exhausted_roles, claims) = registry.lock().map_or_else(
-                |_| (Default::default(), BTreeSet::new(), Default::default()),
-                |reg| (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims()),
-            );
+            let (mut cooldowns, pool_exhausted_roles, claims) = {
+                let reg = registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims())
+            };
             for (item, role, until) in &gathered.ladder {
                 cooldowns.insert(*item, *role, *until);
             }

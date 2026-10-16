@@ -424,8 +424,7 @@ fn fake_gh(dir: &std::path::Path, installation_cfg: &std::path::Path) -> PathBuf
 printf '%s|%s\n' "${{GH_CONFIG_DIR:-}}" "$*" >> "{log}"
 if [ "${{GH_CONFIG_DIR:-}}" = "{inst}" ]; then core=0; gql=0; else core=5000; gql=5000; fi
 case "$*" in
-  "api rate_limit") printf '{{"resources":{{"core":{{"limit":5000,"used":1,"remaining":%s,"reset":{reset}}}}}}}' "$core" ;;
-  "api -i graphql"*) printf 'HTTP/2.0 200 OK\r\n\r\n{{"data":{{"rateLimit":{{"limit":5000,"used":9,"remaining":%s,"resetAt":"2026-07-29T19:20:35Z"}}}}}}' "$gql" ;;
+  "api rate_limit") printf '{{"resources":{{"core":{{"limit":5000,"used":1,"remaining":%s,"reset":{reset}}},"graphql":{{"limit":5000,"used":9,"remaining":%s,"reset":{reset}}}}}}}' "$core" "$gql" ;;
   *) exit 1 ;;
 esac
 "#,
@@ -462,5 +461,83 @@ fn forge_probe_reads_the_failing_credential_not_the_ambient_one() {
     assert_eq!((a.core_remaining, a.graphql_remaining), (5000, 5000));
 
     let log = std::fs::read_to_string(dir.path().join("gh.log")).unwrap();
-    assert_eq!(log.lines().count(), 4, "two bounded calls per probe: {log}");
+    assert_eq!(log.lines().count(), 2, "one bounded `/rate_limit` call per probe: {log}");
+    assert!(
+        !log.contains("graphql"),
+        "no standalone GraphQL rateLimit query (#12204): {log}"
+    );
+}
+
+// ===== #12204: one `/rate_limit` per credential per window =====
+
+/// `gh.log` lines that were `/rate_limit` reads.
+fn rate_limit_calls(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("gh.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.ends_with("api rate_limit"))
+        .count()
+}
+
+#[test]
+fn repeated_budget_checks_within_a_reset_window_make_no_forge_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = dir.path().join("gh-config-cache-window");
+    std::fs::create_dir_all(&inst).unwrap();
+    let gh = fake_gh(dir.path(), &inst);
+    let ctx = FailureContext {
+        config_dir: Some(inst.clone()),
+        ..FailureContext::for_root(dir.path(), gh.to_string_lossy())
+    };
+
+    // Cold start: one read.
+    let first = super::forge::probe_budget_ctx(&ctx, t(0)).unwrap();
+    assert_eq!(rate_limit_calls(dir.path()), 1);
+    // Every later check inside the window (reset at t(1100)) is served from
+    // the process-wide cache, by any caller, with no forge call.
+    for at in [1, 60, 600, 1099] {
+        assert_eq!(super::forge::probe_budget_ctx(&ctx, t(at)), Some(first));
+        assert_eq!(super::forge::cached_budget_ctx(&ctx, t(at)), Some(first));
+    }
+    assert_eq!(rate_limit_calls(dir.path()), 1, "no re-probe inside the window");
+    // A cache-only read never probes, even after the window closes.
+    assert_eq!(super::forge::cached_budget_ctx(&ctx, t(1100)), None);
+    assert_eq!(rate_limit_calls(dir.path()), 1);
+    // The window reset: the next budget check reads once more.
+    assert!(super::forge::probe_budget_ctx(&ctx, t(1100)).is_some());
+    assert_eq!(rate_limit_calls(dir.path()), 2);
+}
+
+#[test]
+fn a_rate_limit_refusal_triggers_exactly_one_rate_limit_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = dir.path().join("gh-config-trip");
+    std::fs::create_dir_all(&inst).unwrap();
+    let gh = fake_gh(dir.path(), &inst);
+    let ctx = FailureContext {
+        config_dir: Some(inst.clone()),
+        ..FailureContext::for_root(dir.path(), gh.to_string_lossy())
+    };
+    // A warm cache (healthy-looking reading earlier in the window) must not
+    // stand in for the trip's probe: the refusal is what made it stale.
+    let _ = super::forge::probe_budget_ctx(&ctx, t(0));
+    let warm = rate_limit_calls(dir.path());
+
+    let b = breaker(true);
+    let h = handle(&b, Arc::new(super::report::ForgeProbe), ProbeMode::Inline);
+    let r = report_failure(&h, PRIMARY_REST, "caller", ctx.clone(), t(10)).unwrap();
+    assert_eq!(r.transition.kind, TransitionKind::Tripped);
+    assert_eq!(rate_limit_calls(dir.path()), warm + 1, "exactly one read on the trip");
+    assert_eq!(b.snapshot(t(11)).cooldown_until, Some(t(1100)), "reset learned from it");
+
+    // Repeats while cooling never re-probe, and later budget checks read the
+    // trip's answer from the cache.
+    for at in [20, 30, 40] {
+        assert!(report_failure(&h, PRIMARY_REST, "caller", ctx.clone(), t(at)).is_none());
+        let cached = super::forge::probe_budget_ctx(&ctx, t(at)).unwrap();
+        assert_eq!(cached.core_remaining, 0);
+    }
+    assert_eq!(rate_limit_calls(dir.path()), warm + 1);
+    let log = std::fs::read_to_string(dir.path().join("gh.log")).unwrap();
+    assert!(!log.contains("graphql"), "no standalone GraphQL rateLimit query: {log}");
 }

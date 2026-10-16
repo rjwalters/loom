@@ -32,7 +32,12 @@
 //! A PR in the issue's GitHub closes-graph (`closedByPullRequestsReferences`,
 //! closed PRs included: a closing keyword such as `Closes #N`, or a
 //! Development-sidebar link) is `MERGED`, merged after the issue was last
-//! reopened, and belongs to the issue's own repository. A `Part of #N` /
+//! reopened, and belongs to the issue's own repository. So is a PR built on
+//! the issue's Builder branch `feature/issue-N` (#12251): the open-PR guard
+//! already links an open PR that way, and once it merges without a closing
+//! keyword the issue stays open with nothing else to say it is done. It
+//! counts when its head is in this repository, it merged into the default
+//! branch, and after the last reopen ([`branch_landing`]). A `Part of #N` /
 //! `Refs #N` PR is not in the closes-graph, so its merge never counts: that
 //! work is unfinished, and the issue keeps its stage (the no-op cooldown
 //! handles a dispatch that finds nothing to do). A merge older than the
@@ -68,9 +73,11 @@
 //!
 //! # Cost
 //!
-//! One aliased GraphQL query (≈1 point) per workspace per tick, and only on
-//! a tick with a candidate whose verdict is unknown or older than
-//! [`LANDED_RECHECK`]. A verdict is dropped as soon as the candidate shows an
+//! At most one aliased GraphQL query (≈1 point) per workspace per tick, and
+//! only on a tick with a candidate (without an open PR) whose verdict is
+//! unknown or older than [`LANDED_RECHECK`]; the verdicts past half their
+//! life ride along, so in steady state a workspace asks about once per
+//! `LANDED_RECHECK / 2` (#12205). A verdict is dropped as soon as the candidate shows an
 //! open PR, so the tick its PR merges, the issue is asked about again. The
 //! comment read and label writes happen only for a landed issue. Nothing is
 //! asked while the rate-limit breaker is open.
@@ -79,7 +86,45 @@
 //!
 //! Fail open. An unreadable answer, an issue alias the forge did not answer,
 //! or a truncated closes-graph is no verdict: the candidate goes to
-//! `dispatch()` as before. Only a verified merged closing PR removes it.
+//! `dispatch()` as before. Only a verified merged closing PR removes it. An
+//! unanswered query is not repeated for [`LANDED_FAIL_BACKOFF`] (#12205), so
+//! a forge that cannot answer costs one query per backoff, not one per tick.
+//!
+//! # At the Builder spawn (#12251)
+//!
+//! The step engine asks once more, for one issue, right before a Builder step
+//! claims it ([`landed_at_spawn`]): a landed issue is routed to Curator as
+//! above and the step is refused `already_landed`. This guard does not read
+//! [`ENABLED_KEY`]: it costs one query per Builder spawn, not one per
+//! workspace per tick, and it is what keeps a landed issue whose `loom:issue`
+//! a claim release restored from being built again on every host.
+//!
+//! # Off by default (#12205)
+//!
+//! [`ENABLED_KEY`] (`autonomous.workFinder.landedPrefilter`, read live from
+//! the workspace's effective config on every call) gates the whole
+//! pre-filter, and defaults to **off**. Off, [`landed_in`] and [`lift_in`]
+//! make no forge call and return nothing: every candidate goes to
+//! `dispatch()` exactly as before #11853. What that costs: an open issue
+//! whose closing PR merged is not routed to Curator, so it can be dispatched
+//! to a Builder again. Such a sweep finds the work done; the #11429 journal
+//! check (on the host that landed it), the 2.5 closed-issue guard and the
+//! no-op cooldown still bound how often that happens. Landed cooldowns
+//! already armed keep running out on their own.
+//!
+//! # Who pays (#12205)
+//!
+//! The closes-graph query is a read of the workspace's repository, so it is
+//! offered to the reader pool (and the gateway) like any other repo read,
+//! never pinned to the dispatch App. It is a
+//! [`crate::forge_identity::ReadClass::Hygiene`] read: when the readers are
+//! out of budget it is shed, which is no verdict (fail open), rather than
+//! spending the dispatch App's GraphQL budget.
+//!
+//! Only candidates **without** an open linked PR are asked about. The step
+//! gather hands over every `loom:issue` item; before #12205 one with an open
+//! PR had its verdict dropped and was then re-asked on every tick, so nearly
+//! every workspace with a PR in review paid one query per tick.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -105,8 +150,34 @@ pub const LANDED_BATCH: usize = 100;
 /// `first:` on each closes-graph: a truncated graph is no verdict.
 const CLOSING_FIRST: usize = 20;
 
+/// `first:` on each Builder-branch PR listing (#12251). A branch is reused
+/// only when an issue is reopened and built again, so a handful is plenty;
+/// the read only adds a landing, so a truncated one costs nothing.
+const BRANCH_FIRST: usize = 5;
+
 /// Deadline of the closes-graph query.
 const GRAPHQL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// After an unanswered closes-graph query, no query for this long (#12205).
+pub const LANDED_FAIL_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// The live config key that turns the pre-filter on (#12205). Absent or
+/// anything but `true` is off.
+pub const ENABLED_KEY: &str = "autonomous.workFinder.landedPrefilter";
+
+/// Whether the pre-filter is on in an already-resolved effective config.
+#[must_use]
+pub fn prefilter_enabled_in(effective: &Value) -> bool {
+    crate::config_resolver::get_path(effective, ENABLED_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the pre-filter is on for the workspace at `root`, read live.
+#[must_use]
+pub fn prefilter_enabled(root: &std::path::Path) -> bool {
+    prefilter_enabled_in(&crate::config_resolver::resolve_effective_config(root))
+}
 
 /// The hidden marker the routing comment carries, naming the merged PR.
 #[must_use]
@@ -118,10 +189,11 @@ pub fn route_marker(pr: u32) -> String {
 #[must_use]
 pub fn route_comment(pr: u32) -> String {
     format!(
-        "PR #{pr}, which closes this issue, has merged, but the issue is still open. It goes \
+        "PR #{pr}, which closes this issue (a closing keyword, or built on the issue's own \
+         `feature/issue-N` branch), has merged, but the issue is still open. It goes \
          back to Curator (`loom:triage`) instead of to a Builder: close it if #{pr} finished \
          the work, or curate it again if work remains. This is done once per merged PR \
-         (#11853).\n\n{}",
+         (#11853, #12251).\n\n{}",
         route_marker(pr)
     )
 }
@@ -132,21 +204,35 @@ pub fn route_comment(pr: u32) -> String {
 
 /// One aliased query: each issue's state, its last reopen, and its
 /// closes-graph with closed (and so merged) PRs included, each PR naming its
-/// repository.
+/// repository; beside each issue, the merged PRs from its Builder branch
+/// [`builder_branch`] (#12251), and once, the default branch they must target.
 #[must_use]
 pub fn landed_query(owner: &str, name: &str, issues: &[u32]) -> String {
     let fields: String = issues
         .iter()
         .map(|n| {
+            let branch = builder_branch(*n);
             format!(
                 " i{n}: issue(number: {n}) {{ state timelineItems(itemTypes: [REOPENED_EVENT], \
                  last: 1) {{ nodes {{ ... on ReopenedEvent {{ createdAt }} }} }} \
                  closedByPullRequestsReferences(first: {CLOSING_FIRST}, includeClosedPrs: true) \
-                 {{ totalCount nodes {{ number state mergedAt repository {{ nameWithOwner }} }} }} }}"
+                 {{ totalCount nodes {{ number state mergedAt repository {{ nameWithOwner }} }} }} }} \
+                 b{n}: pullRequests(headRefName: \"{branch}\", states: [MERGED], \
+                 first: {BRANCH_FIRST}) {{ nodes {{ number mergedAt baseRefName \
+                 headRepository {{ nameWithOwner }} }} }}"
             )
         })
         .collect();
-    format!("query {{ repository(owner: \"{owner}\", name: \"{name}\") {{{fields} }} }}")
+    format!(
+        "query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ defaultBranchRef {{ name }}{fields} }} }}"
+    )
+}
+
+/// The Builder's branch for `issue` (`feature/issue-N`), the same name the
+/// open-PR guard links by ([`crate::worktree_ops::linked_pr_listing`]).
+#[must_use]
+pub fn builder_branch(issue: u32) -> String {
+    format!("feature/issue-{issue}")
 }
 
 fn ts(v: &Value) -> Option<DateTime<Utc>> {
@@ -201,9 +287,52 @@ pub fn alias_verdict(issue: &Value, repo: &str) -> Option<Option<u32>> {
     (usize::try_from(total).ok() == Some(nodes.len())).then_some(None)
 }
 
+/// The issue's Builder-branch landing (#12251): the latest PR in `prs` (the
+/// `b{n}` alias of [`landed_query`], merged PRs whose head is
+/// [`builder_branch`]) whose head lives in `repo`, that targets
+/// `default_branch`, and that merged after the issue's last reopen. A PR
+/// built on the issue's own branch finished its work as surely as one that
+/// says `Closes #N`: without the keyword the merge leaves the issue open, and
+/// nothing else would stop the step draw handing it to a Builder again.
+///
+/// A head in another repository (a fork can name its branch anything), a
+/// merge into another branch (a stacked base), or one older than the last
+/// reopen does not count. `None` when `issue` is not an open issue or `prs`
+/// carries no merge that counts: the branch read only ever adds a landing,
+/// it never takes the closes-graph's verdict away.
+#[must_use]
+pub fn branch_landing(issue: &Value, prs: &Value, default_branch: &str, repo: &str) -> Option<u32> {
+    let state = issue.get("state")?.as_str()?;
+    if !state.eq_ignore_ascii_case("open") || default_branch.is_empty() {
+        return None;
+    }
+    let reopened = issue["timelineItems"]["nodes"]
+        .as_array()
+        .and_then(|n| n.iter().filter_map(|e| ts(&e["createdAt"])).max());
+    prs.get("nodes")?
+        .as_array()?
+        .iter()
+        .filter(|pr| pr["baseRefName"].as_str() == Some(default_branch))
+        .filter(|pr| {
+            pr["headRepository"]["nameWithOwner"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+        })
+        .filter_map(|pr| {
+            let number = u32::try_from(pr["number"].as_u64()?).ok()?;
+            let merged = ts(&pr["mergedAt"])?;
+            reopened
+                .is_none_or(|r| merged > r)
+                .then_some((merged, number))
+        })
+        .max()
+        .map(|(_, number)| number)
+}
+
 /// Parse a [`landed_query`] answer for repository `repo` (`owner/name`): the
 /// verdict of each issue that has one. `None` when the answer carries no
-/// `data.repository` at all.
+/// `data.repository` at all. A closing merge names the landing; failing one,
+/// a Builder-branch merge does ([`branch_landing`], #12251).
 #[must_use]
 pub fn parse_landed(body: &str, issues: &[u32], repo: &str) -> Option<HashMap<u32, Option<u32>>> {
     let json: Value = serde_json::from_str(body.trim()).ok()?;
@@ -211,10 +340,24 @@ pub fn parse_landed(body: &str, issues: &[u32], repo: &str) -> Option<HashMap<u3
     if !repository.is_object() {
         return None;
     }
+    let default_branch = repository["defaultBranchRef"]["name"]
+        .as_str()
+        .unwrap_or_default();
     Some(
         issues
             .iter()
-            .filter_map(|n| Some((*n, alias_verdict(repository.get(format!("i{n}"))?, repo)?)))
+            .filter_map(|n| {
+                let issue = repository.get(format!("i{n}"))?;
+                let branch = repository
+                    .get(format!("b{n}"))
+                    .and_then(|prs| branch_landing(issue, prs, default_branch, repo));
+                let verdict = match (alias_verdict(issue, repo), branch) {
+                    (Some(Some(pr)), _) => Some(Some(pr)),
+                    (_, Some(pr)) => Some(Some(pr)),
+                    (verdict, None) => verdict,
+                };
+                Some((*n, verdict?))
+            })
             .collect(),
     )
 }
@@ -331,6 +474,9 @@ pub struct LandedCache {
     /// Issues this host routed whose return to the queue has not been asked
     /// about yet: [`lift`] asks at once, not after [`LANDED_RECHECK`].
     routed: HashSet<u32>,
+    /// When the last closes-graph query went unanswered: nothing is asked
+    /// until [`LANDED_FAIL_BACKOFF`] after it (#12205).
+    failed_at: Option<Instant>,
 }
 
 impl LandedCache {
@@ -340,19 +486,53 @@ impl LandedCache {
             .is_none_or(|(at, _)| now.saturating_duration_since(*at) >= LANDED_RECHECK)
     }
 
+    /// Whether an unanswered query at or after `now - LANDED_FAIL_BACKOFF`
+    /// holds every question back.
+    fn backing_off(&self, now: Instant) -> bool {
+        self.failed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < LANDED_FAIL_BACKOFF)
+    }
+
     /// The candidates to ask about at `now`: no verdict, or one older than
-    /// [`LANDED_RECHECK`], at most [`LANDED_BATCH`]. Forgets the verdict of
-    /// every issue in `open_pr`, so the tick its PR merges asks again.
+    /// [`LANDED_RECHECK`], at most [`LANDED_BATCH`]. A candidate in `open_pr`
+    /// is never asked (its PR is open, so its landing is not this filter's
+    /// question), and its verdict is forgotten, so the tick its PR merges
+    /// asks again (#12205: the step gather lists such candidates too).
+    ///
+    /// When anything is due, the candidates whose verdict is past half its
+    /// life ride along in the same query, so verdicts expire together and a
+    /// workspace pays one query per [`LANDED_RECHECK`] / 2 at most, not one
+    /// per tick as staggered verdicts would cost (#12205).
     fn due(&mut self, candidates: &[u32], open_pr: &[u32], now: Instant) -> Vec<u32> {
         for issue in open_pr {
             self.verdicts.remove(issue);
         }
-        candidates
+        if self.backing_off(now) {
+            return Vec::new();
+        }
+        let open: HashSet<u32> = open_pr.iter().copied().collect();
+        let asked: Vec<u32> = candidates
+            .iter()
+            .copied()
+            .filter(|n| !open.contains(n))
+            .collect();
+        if !asked.iter().any(|n| self.stale(*n, now)) {
+            return Vec::new();
+        }
+        let half = LANDED_RECHECK / 2;
+        let mut ask: Vec<u32> = asked
             .iter()
             .copied()
             .filter(|n| self.stale(*n, now))
-            .take(LANDED_BATCH)
-            .collect()
+            .collect();
+        ask.extend(asked.iter().copied().filter(|n| {
+            self.verdicts
+                .get(n)
+                .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= half)
+                && !self.stale(*n, now)
+        }));
+        ask.truncate(LANDED_BATCH);
+        ask
     }
 
     fn landed(&self, issue: u32) -> Option<u32> {
@@ -376,7 +556,12 @@ fn settle<F: LandedForge + ?Sized>(
     }
     let mut answered = Vec::new();
     let mut fresh: Vec<(u32, u32)> = Vec::new();
-    for (issue, verdict) in forge.closing_verdicts(ask).unwrap_or_default() {
+    let Some(verdicts) = forge.closing_verdicts(ask) else {
+        cache.failed_at = Some(now);
+        return Vec::new();
+    };
+    cache.failed_at = None;
+    for (issue, verdict) in verdicts {
         answered.push(issue);
         let verdict = match verdict {
             None => Verdict::NotLanded,
@@ -440,6 +625,9 @@ pub fn lift<F: LandedForge + ?Sized>(
     held: &[u32],
     now: Instant,
 ) -> Vec<u32> {
+    if cache.backing_off(now) {
+        return Vec::new();
+    }
     let ask: Vec<u32> = held
         .iter()
         .copied()
@@ -458,9 +646,52 @@ pub fn lift<F: LandedForge + ?Sized>(
         .collect()
 }
 
+/// The Builder-step spawn guard (#12251): whether `issue`'s work has landed,
+/// asked fresh, right before a Builder step would claim it. `Some(pr)` when a
+/// merged closing or Builder-branch PR lands it and Curator has not kept that
+/// landing; the landing is routed to Curator here, as [`detect`] routes one.
+/// `None` (spawn) when it has not landed, when Curator kept it, while an
+/// unanswered query backs this workspace off, or when the forge does not
+/// answer: fail open, as every landed read is.
+pub fn spawn_check<F: LandedForge + ?Sized>(
+    forge: &mut F,
+    cache: &mut LandedCache,
+    issue: u32,
+    now: Instant,
+) -> Option<u32> {
+    if cache.backing_off(now) {
+        return None;
+    }
+    settle(forge, cache, &[issue], now);
+    cache.landed(issue)
+}
+
 // ---------------------------------------------------------------------------
 // Production glue
 // ---------------------------------------------------------------------------
+
+/// [`spawn_check`] against the live forge, for the step engine's Builder
+/// spawn (#12251). Not gated by [`ENABLED_KEY`]: that key bounds the
+/// per-tick reads of every candidate, and this is one read per Builder spawn,
+/// the one moment a landed issue costs a session.
+#[must_use]
+pub fn landed_at_spawn(
+    gh_bin: &std::path::Path,
+    root: &std::path::Path,
+    slug: &str,
+    issue: u32,
+) -> Option<u32> {
+    let mut forge = GhLandedForge {
+        gh_bin: gh_bin.to_path_buf(),
+        root: root.to_path_buf(),
+        slug: slug.to_string(),
+    };
+    let mut all = caches()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = all.entry(root.to_path_buf()).or_default();
+    spawn_check(&mut forge, cache, issue, Instant::now())
+}
 
 fn caches() -> &'static Mutex<HashMap<PathBuf, LandedCache>> {
     static CACHES: OnceLock<Mutex<HashMap<PathBuf, LandedCache>>> = OnceLock::new();
@@ -487,6 +718,9 @@ pub fn landed_in(
     let Some((gh_bin, root, slug)) = target else {
         return HashMap::new();
     };
+    if !prefilter_enabled(&root) {
+        return HashMap::new();
+    }
     let mut forge = GhLandedForge {
         gh_bin,
         root: root.clone(),
@@ -531,6 +765,9 @@ pub fn lift_in(registry: &Arc<Mutex<SweepRegistry>>, held: &[u32]) -> HashSet<u3
     let Some((gh_bin, root, slug)) = target.filter(|_| !mine.is_empty()) else {
         return HashSet::new();
     };
+    if !prefilter_enabled(&root) {
+        return HashSet::new();
+    }
     let mut forge = GhLandedForge {
         gh_bin,
         root: root.clone(),
@@ -609,25 +846,46 @@ fn owner_name(slug: &str) -> Option<(&str, &str)> {
     slug.split_once('/').filter(|(o, n)| safe(o) && safe(n))
 }
 
-impl LandedForge for GhLandedForge {
-    fn closing_verdicts(&mut self, issues: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
-        use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-        if crate::rate_limit_breaker::global_skip_pass(CALLER) {
-            return None;
-        }
-        let (owner, name) = owner_name(&self.slug)?;
-        let field = format!("query={}", landed_query(owner, name, issues));
-        let inv = GhInvocation::new(
+/// The closes-graph read of `issues` in `slug`, run from `root` (#12205): a
+/// repo-targeted [`crate::forge_identity::ReadClass::Hygiene`] read, so the
+/// facade offers it to the reader pool (and the gateway) rather than the
+/// dispatch App, and sheds it rather than spill it onto the writer when the
+/// readers are out of budget.
+/// `None` when `slug` cannot be named safely in the query.
+#[must_use]
+pub fn closing_refs_invocation(
+    gh_bin: &std::path::Path,
+    root: &std::path::Path,
+    slug: &str,
+    issues: &[u32],
+) -> Option<crate::gh_invocation::GhInvocation> {
+    use crate::forge_identity::ReadClass;
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let (owner, name) = owner_name(slug)?;
+    let target = GhTarget::repo(slug).ok()?;
+    let field = format!("query={}", landed_query(owner, name, issues));
+    Some(
+        GhInvocation::new(
             Operation::new("work_finder.landed_closing_refs"),
             AccessIntent::Read,
-            GhTarget::None,
+            target,
             GRAPHQL_TIMEOUT,
         )
         .forge_op(crate::forge_call_stats::ops::ISSUE_CLOSED_BY_PULL_REQUESTS)
-        .identity_scope(None, Some(&self.slug))
-        .program(&self.gh_bin)
-        .current_dir(&self.root)
-        .args(["api", "graphql", "-f", field.as_str()]);
+        .read_class(ReadClass::Hygiene)
+        .identity_scope(None, Some(slug))
+        .program(gh_bin)
+        .current_dir(root)
+        .args(["api", "graphql", "-f", field.as_str()]),
+    )
+}
+
+impl LandedForge for GhLandedForge {
+    fn closing_verdicts(&mut self, issues: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
+        if crate::rate_limit_breaker::global_skip_pass(CALLER) {
+            return None;
+        }
+        let inv = closing_refs_invocation(&self.gh_bin, &self.root, &self.slug, issues)?;
         // `gh` exits non-zero when any alias errored but still prints the
         // partial `data`: parse first, judge per alias.
         let out = gh_call::output(inv).ok()?;

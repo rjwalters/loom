@@ -72,23 +72,29 @@
 //! and a `noop` that waited on something outside the item (`ci_pending`), so
 //! a PR sitting in the CI queue does not lose its Judge for a day.
 //!
-//! **Scope.** The run history is per host and in memory: it is not broadcast
-//! and a restart or roll forgets it. The cap a host arms *is* broadcast, but
-//! across N hosts an `(item, step)` can run up to about `2N + 1` times in
-//! 24 h before any one host caps it. It enforces the gate exactly on one host
-//! (the pilot); fleet-wide it is a bound per host.
+//! **Scope.** The run history is per host: it is not broadcast. The cap a
+//! host arms *is* broadcast, but across N hosts an `(item, step)` can run up
+//! to about `2N + 1` times in 24 h before any one host caps it. It enforces
+//! the gate exactly on one host (the pilot); fleet-wide it is a bound per
+//! host. It survives a restart or roll ([`OutcomeLedger::persisted`], below):
+//! before #12251 a roll emptied it, and a fleet that rolls every few hours
+//! never reached the cap at all.
 //!
 //! # Durability
 //!
-//! The ledger is local, in-memory state. Every window it arms is at most
-//! [`MAX_SHORT_COOLDOWN`] (24 h, the landed cooldown's own ceiling), and the
-//! registry broadcasts each one on the peer channel
-//! (`ClaimKind::StepCooldownArmed`), so peers keep honouring a window after
-//! this host restarts. The restarted host itself does not get its own windows
-//! back (peers never re-send them, and a host ignores its own ads). Nothing
+//! Every window the ledger arms is at most [`MAX_SHORT_COOLDOWN`] (24 h, the
+//! landed cooldown's own ceiling), and the registry broadcasts each one on
+//! the peer channel (`ClaimKind::StepCooldownArmed`), so peers keep honouring
+//! a window after this host restarts. A host never gets its own windows back
+//! from peers (they never re-send them, and a host ignores its own ads), so
+//! the registry mirrors each pair's runs and window to a file in the
+//! workspace's logs directory after every change and reloads it when it is
+//! built (#12251): the restarted host keeps its own windows and its repeat-cap
+//! history. Lapsed runs and windows are dropped on reload. The refusal and
+//! fast-fail streaks and the counters stay in memory. Nothing
 //! longer rides the broadcast: the Champion ladder's
 //! rungs past 24 h live on the forge only (the item's body), and after a
-//! rollback `release-stale-blocked` owns those parks.
+//! rollback those parks stay parked until a role or a human clears them.
 //!
 //! # The draw's query
 //!
@@ -401,7 +407,10 @@ pub fn effect_of(
 }
 
 /// Why an `(item, step)` is cooling down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum CooldownCause {
     Noop,
     Refused,
@@ -446,6 +455,20 @@ pub fn counts_as_run(outcome: &StepOutcome) -> bool {
         OutcomeClass::Noop => !EXTERNAL_WAIT_NOOPS.contains(&outcome.reason.as_str()),
         OutcomeClass::Verdict | OutcomeClass::Failed => true,
     }
+}
+
+/// One `(item, step)` pair's durable part: its repeat-cap runs and its
+/// window in force ([`OutcomeLedger::persisted`], #12251).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedPair {
+    pub item: u32,
+    pub step: StepRole,
+    #[serde(default)]
+    pub runs: Vec<DateTime<Utc>>,
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub cause: Option<CooldownCause>,
 }
 
 /// What [`OutcomeLedger::record`] did.
@@ -683,6 +706,57 @@ impl OutcomeLedger {
                 || e.until.is_some_and(|(u, _)| u > now)
                 || streak_until.is_some_and(|keep| keep > now)
         });
+    }
+
+    /// The durable part of every pair with a run inside the window or a
+    /// window in force at `now` (#12251), in key order.
+    #[must_use]
+    pub fn persisted(&self, now: DateTime<Utc>) -> Vec<PersistedPair> {
+        let window = self.cfg.repeat_window;
+        self.entries
+            .iter()
+            .filter_map(|(&(item, step), e)| {
+                let runs: Vec<_> = e
+                    .runs
+                    .iter()
+                    .copied()
+                    .filter(|at| add(*at, window) > now)
+                    .collect();
+                let live = e.until.filter(|(u, _)| *u > now);
+                (!runs.is_empty() || live.is_some()).then(|| PersistedPair {
+                    item,
+                    step,
+                    runs,
+                    until: live.map(|(u, _)| u),
+                    cause: live.map(|(_, c)| c),
+                })
+            })
+            .collect()
+    }
+
+    /// Load `pairs` from [`Self::persisted`] after a restart (#12251): their
+    /// runs inside the window join the pair's history, and their window in
+    /// force is armed (extend-only, capped at [`MAX_SHORT_COOLDOWN`] from
+    /// `now` like every window). Lapsed runs and windows are dropped.
+    pub fn restore(&mut self, pairs: Vec<PersistedPair>, now: DateTime<Utc>) {
+        let window = self.cfg.repeat_window;
+        for p in pairs {
+            let runs: Vec<_> = p
+                .runs
+                .into_iter()
+                .filter(|at| add(*at, window) > now && *at <= now)
+                .collect();
+            if !runs.is_empty() {
+                let entry = self.entries.entry((p.item, p.step)).or_default();
+                entry.runs.extend(runs);
+                entry.runs.sort_unstable();
+                entry.runs.dedup();
+            }
+            if let Some(until) = p.until.filter(|u| *u > now) {
+                let cause = p.cause.unwrap_or(CooldownCause::RepeatCap);
+                self.arm(p.item, p.step, until, cause, now);
+            }
+        }
     }
 
     /// Every local cooldown in force at `at`, as the draw's query.

@@ -63,6 +63,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Records the #11112 decision made while removing the safehouse (Matrix) integration: the `loom:lease` comment plus the claim-then-verify-order tie-break is the only cross-host claim (pinned by `lease_cross_host_tests.rs`). The #7477 no-op cooldown broadcast is removed and stays per-host. The #9936 quarantine broadcast was never implemented and is dropped
   - **Key Decision**: Accept up to N× no-op cooldown dilution on an N-host fleet rather than add a forge marker or keep a side channel. Correctness comes from the lease, not the cooldown
 
+- [ADR-0026: Consumer Hook Settings Ownership: Non-Mutating Surfaces Only](0026-consumer-hook-settings-ownership.md)
+  - **Status**: Proposed
+  - **Summary**: Records the #11514 decision on who owns Loom hook registrations in consumer Claude settings: resync never writes the consumer `.claude/settings.json`; hooks ship through launch-time `--settings` or user-scope entries, and project scope is only reported on
+  - **Key Decision**: A resync-managed delimited block is rejected; the Claude Code settings-merge semantics must be cited or fixture-proven before Accepted
+
 ### Orchestration Architecture
 
 - [ADR-0009: Deprecate and Delete Shepherd Brain and Python Daemon (Phase 3)](0009-shepherd-deprecation.md)

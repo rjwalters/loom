@@ -261,6 +261,13 @@ counts/ids/allowlisted tool names — never transcript content, same as
 `epic.issue.*` event-bus payload, carried whole as one JSON string rather than
 re-typed per topic — see `crate::event_bus`'s frozen taxonomy).
 
+Issue #12230 adds four allowlisted attributes and no new kind: the
+`daemon.work_finder.first_tick` record's scalars as typed copies,
+`loom.payload.secs_since_start`, `loom.payload.gate_wait_secs`,
+`loom.payload.jitter_delay_secs` and
+`loom.payload.startup_reconcile_cap_fired` (durations and a flag; the same
+values are already inside `loom.payload`).
+
 Issue #9445 adds one more allowlisted attribute and no new kind:
 `session.summary`'s `loom.session_kind` (`sweep` / `role` / `interactive`), a
 fixed three-value vocabulary that says whether a row's absent `loom.issue` is

@@ -31,30 +31,23 @@
 //!
 //! # Part 2: forge facts, not only gauges ([`facts`])
 //!
-//! Two more per-host forge reads are the same on every host, and each has its
-//! own switch (off by default, so a part 1 fleet is unchanged):
+//! One more per-host forge read is the same on every host, and has its own
+//! switch (off by default, so a part 1 fleet is unchanged):
 //!
-//! - **`star-facts`** (`starFacts`). **Inert since #11104**, which removed its
-//!   only consumer; #11579 retires the job. The starred-issue
-//!   liveness pass's evaluator listed every operator label of every
-//!   managed repo every two minutes, and does nothing else for a repo with no
-//!   open starred issue (the level step after it lists its own labels and is
-//!   not covered). The captain publishes, per repo, how many open starred
-//!   issues there are; a dispatcher skips its evaluator for a repo the captain
-//!   freshly reports as having none ([`star_free`]). A repo with a star is
-//!   evaluated locally by every host exactly as before: landing rows, blocker
-//!   inheritance (a dispatch input) and escalation never come from the
-//!   captain.
 //! - **`queue-blocked`** (`queueBlocked`). The `loom:blocked` rows of
 //!   `queue.snapshot` ([`super::queue_blocked`]) come from one listing per
 //!   repo per snapshot. The captain publishes the listing reduced to number,
 //!   creation time and label names; a dispatcher builds its own rows from it
 //!   ([`captain_blocked`]) and appends them to its own snapshot.
 //!
-//! Both are read **at the time of use**, with the caller's clock: the
-//! liveness thread has its own cadence and must not trust a verdict a stalled
-//! collector left behind. Missing, stale or uncovered always means today's
-//! local read.
+//! It is read **at the time of use**, with the caller's clock: a verdict a
+//! stalled collector left behind must not be trusted. Missing, stale or
+//! uncovered always means today's local read.
+//!
+//! A third job, the starred-issue facts, is retired (#11579): its only reader
+//! went with the star-liveness subsystem (#11104). Its two config keys are
+//! ignored with one warning ([`unknown_keys`]); an older captain's heartbeat
+//! that still lists the job parses, and the job is ignored.
 //!
 //! # How a dispatcher learns the captain is fresh
 //!
@@ -75,24 +68,13 @@
 //! | `fleet.captainGauges.maxAgeSecs` | `1800` | a job's `as_of` older than this is stale: the dispatcher falls back to local production |
 //! | `fleet.captainGauges.publishIntervalSecs` | `600` | how often the captain writes the heartbeat |
 //! | `fleet.captainGauges.ref` | `eta-fit` (legacy fallback: `fleet.etaFitRef`) | the store branch the heartbeat lives on |
-//! | `fleet.captainGauges.starFacts` | `false` | captain: produce `star-facts`; dispatcher: skip the liveness evaluator for repos it reports star-free |
 //! | `fleet.captainGauges.queueBlocked` | `false` | captain: produce `queue-blocked`; dispatcher: build its snapshot's blocked rows from it |
-//! | `fleet.captainGauges.starFactsMaxAgeSecs` | `900` | the staleness bound for `star-facts` alone (see below) |
 //!
 //! The default staleness bound follows the fleet refresh task's liveness rule
 //! (`task_liveness::default_stale_after`: two intervals plus slack): two
 //! publish intervals plus two collector passes (`2 × 600 + 2 × 300`), so one
 //! missed publish never flaps a dispatcher back to local production.
 //!
-//! `star-facts` has its own, tighter bound (`starFactsMaxAgeSecs`, 900 s: two
-//! collector passes plus slack). A "no star here" a dispatcher believes is a
-//! liveness pass it skips, so its age is the delay before a brand-new star is
-//! evaluated when the captain stops reporting, not just a gauge's lag. The
-//! dispatcher ages its last read heartbeat against it at every liveness pass,
-//! so a failed heartbeat read does not extend it. While it produces
-//! `star-facts` the captain republishes at least every `starFactsMaxAgeSecs`
-//! minus [`READ_LAG_SECS`] ([`effective_publish_interval`]), so a healthy
-//! captain's facts never age out between publishes.
 //!
 //! # Gating (re-read every collector pass, so an edit needs no restart)
 //!
@@ -110,8 +92,9 @@
 pub mod facts;
 pub mod store;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use chrono::{DateTime, Duration, Utc};
@@ -123,15 +106,12 @@ use crate::telemetry::ops::{MetricName, MetricPoint};
 
 /// Forge label-stage dwell ([`super::ops::stage_dwell`]).
 pub const STAGE_DWELL_JOB: &str = "stage-dwell";
-/// Whether each repo has an open starred issue ([`facts`]). Inert since
-/// #11104 removed the star-liveness pass that read it.
-pub const STAR_FACTS_JOB: &str = "star-facts";
 /// Each repo's open `loom:blocked` issues ([`facts`], for
 /// [`super::queue_blocked`]).
 pub const QUEUE_BLOCKED_JOB: &str = "queue-blocked";
 /// Every job this module can arm on the captain. Which ones a host runs is
 /// [`Config::jobs`].
-pub const JOBS: [&str; 3] = [STAGE_DWELL_JOB, STAR_FACTS_JOB, QUEUE_BLOCKED_JOB];
+pub const JOBS: [&str; 2] = [STAGE_DWELL_JOB, QUEUE_BLOCKED_JOB];
 
 /// Config key: arm and publish on the declared captain.
 pub const ENABLED_KEY: &str = "fleet.captainGauges.enabled";
@@ -141,22 +121,26 @@ pub const STAND_DOWN_KEY: &str = "fleet.captainGauges.standDown";
 pub const MAX_AGE_KEY: &str = "fleet.captainGauges.maxAgeSecs";
 /// Config key: the captain's heartbeat cadence, in seconds.
 pub const PUBLISH_INTERVAL_KEY: &str = "fleet.captainGauges.publishIntervalSecs";
-/// Config key: the `star-facts` job, on both roles.
-pub const STAR_FACTS_KEY: &str = "fleet.captainGauges.starFacts";
 /// Config key: the `queue-blocked` job, on both roles.
 pub const QUEUE_BLOCKED_KEY: &str = "fleet.captainGauges.queueBlocked";
-/// Config key: the `star-facts` staleness bound, in seconds.
-pub const STAR_FACTS_MAX_AGE_KEY: &str = "fleet.captainGauges.starFactsMaxAgeSecs";
 /// Env override of [`STAND_DOWN_KEY`] (`0`/`false` forces local production).
 pub const STAND_DOWN_ENV: &str = "LOOM_CAPTAIN_GAUGES_STAND_DOWN";
 /// Default [`MAX_AGE_KEY`].
 pub const DEFAULT_MAX_AGE_SECS: i64 = 1800;
 /// Default [`PUBLISH_INTERVAL_KEY`].
 pub const DEFAULT_PUBLISH_INTERVAL_SECS: i64 = 600;
-/// Default [`STAR_FACTS_MAX_AGE_KEY`]: two collector passes (`2 × 300`) plus
-/// 300 s of slack. The captain republishes often enough to stay inside it
-/// ([`effective_publish_interval`]).
-pub const DEFAULT_STAR_FACTS_MAX_AGE_SECS: i64 = 900;
+
+/// The `fleet.captainGauges` block's keys, relative to it. Any other key is
+/// ignored ([`unknown_keys`]), notably the two the retired starred-issue job
+/// read (#11579).
+const KNOWN_KEYS: [&str; 6] = [
+    "enabled",
+    "standDown",
+    "maxAgeSecs",
+    "publishIntervalSecs",
+    "queueBlocked",
+    "ref",
+];
 
 /// The resolved `fleet.captainGauges` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,12 +153,45 @@ pub struct Config {
     pub max_age: Duration,
     /// `publishIntervalSecs`.
     pub publish_interval: Duration,
-    /// `starFacts`.
-    pub star_facts: bool,
     /// `queueBlocked`.
     pub queue_blocked: bool,
-    /// `starFactsMaxAgeSecs`: the `star-facts` bound, in place of `max_age`.
-    pub star_facts_max_age: Duration,
+    /// `observability.stageDwell.enabled` (#12203): off, no host arms or
+    /// relies on the `stage-dwell` job.
+    pub stage_dwell: bool,
+}
+
+/// The `fleet.captainGauges` keys in `effective` that nothing reads, as full
+/// dotted paths, sorted. Pure.
+#[must_use]
+pub fn unknown_keys(effective: &Value) -> Vec<String> {
+    let block = crate::config_resolver::get_path(effective, "fleet.captainGauges");
+    let mut keys: Vec<String> = block
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| !KNOWN_KEYS.contains(key))
+        .map(|key| format!("fleet.captainGauges.{key}"))
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Warn about [`unknown_keys`] the first time one is seen in this process
+/// (`resolve` re-reads the config every collector pass). Returns the keys
+/// warned about: empty when there are none or the warning was already given.
+fn warn_unknown_keys(effective: &Value) -> Vec<String> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let keys = unknown_keys(effective);
+    if keys.is_empty() || WARNED.swap(true, Ordering::Relaxed) {
+        return Vec::new();
+    }
+    log::warn!(
+        "config: ignoring {} (read by nothing; the starred-issue captain job was removed, \
+         #11579); delete them from the host config",
+        keys.join(", ")
+    );
+    keys
 }
 
 fn env_bool(raw: Option<String>) -> Option<bool> {
@@ -206,30 +223,19 @@ impl Config {
             stand_down: env_bool(env(STAND_DOWN_ENV)).unwrap_or_else(|| flag(STAND_DOWN_KEY)),
             max_age: secs(MAX_AGE_KEY, DEFAULT_MAX_AGE_SECS),
             publish_interval: secs(PUBLISH_INTERVAL_KEY, DEFAULT_PUBLISH_INTERVAL_SECS),
-            star_facts: flag(STAR_FACTS_KEY),
             queue_blocked: flag(QUEUE_BLOCKED_KEY),
-            star_facts_max_age: secs(STAR_FACTS_MAX_AGE_KEY, DEFAULT_STAR_FACTS_MAX_AGE_SECS),
+            stage_dwell: super::ops::stage_dwell::Settings::from_effective(effective).enabled,
         }
     }
 
-    /// The staleness bound for `job`: `starFactsMaxAgeSecs` for `star-facts`,
-    /// `maxAgeSecs` for everything else.
-    #[must_use]
-    pub fn max_age_for(&self, job: &str) -> Duration {
-        if job == STAR_FACTS_JOB {
-            self.star_facts_max_age
-        } else {
-            self.max_age
-        }
-    }
-
-    /// The jobs this host takes part in: `stage-dwell` always, the part 2
-    /// jobs by their own switches.
+    /// The jobs this host takes part in, each by its own switch:
+    /// `stage-dwell` by `observability.stageDwell.enabled` (#12203),
+    /// `queue-blocked` by `queueBlocked`.
     #[must_use]
     pub fn jobs(&self) -> Vec<&'static str> {
-        let mut jobs = vec![STAGE_DWELL_JOB];
-        if self.star_facts {
-            jobs.push(STAR_FACTS_JOB);
+        let mut jobs = Vec::new();
+        if self.stage_dwell {
+            jobs.push(STAGE_DWELL_JOB);
         }
         if self.queue_blocked {
             jobs.push(QUEUE_BLOCKED_JOB);
@@ -284,7 +290,7 @@ pub fn resolve_role(gate: &CaptainGate, config: &Config, store_configured: bool)
 pub type Coverage = BTreeMap<String, BTreeSet<String>>;
 
 /// What a dispatcher may leave to `captain` at `now`, from `heartbeat`, each
-/// job judged against its own bound ([`Config::max_age_for`]). Pure.
+/// job judged against [`Config::max_age`]. Pure.
 #[must_use]
 pub fn coverage(
     heartbeat: Option<&Heartbeat>,
@@ -297,7 +303,7 @@ pub fn coverage(
     };
     JOBS.iter()
         .filter_map(|job| {
-            hb.fresh(job, captain, now, config.max_age_for(job))
+            hb.fresh(job, captain, now, config.max_age)
                 .map(|facts| ((*job).to_string(), facts.repos.clone()))
         })
         .collect()
@@ -376,7 +382,7 @@ pub fn fresh_job<'a>(
     if !config.jobs().contains(&job) {
         return None;
     }
-    heartbeat?.fresh(job, captain, now, config.max_age_for(job))
+    heartbeat?.fresh(job, captain, now, config.max_age)
 }
 
 /// What the captain published last, with its `as_of` zeroed: two heartbeats
@@ -401,29 +407,6 @@ pub fn publish_due(
     interval: Duration,
 ) -> bool {
     last.is_none_or(|(at, published)| now - at >= interval || published != key)
-}
-
-/// How long a published `as_of` takes to reach a dispatcher's check: its next
-/// collector pass reads the heartbeat (300 s), and the captain's own pass
-/// takes as long again at most.
-pub const READ_LAG_SECS: i64 = 600;
-
-/// How often the captain must republish: `publishIntervalSecs`, shortened
-/// while `star-facts` is produced so its published `as_of` stays inside
-/// `starFactsMaxAgeSecs` for as long as the captain keeps producing
-/// (`starFactsMaxAgeSecs − READ_LAG_SECS`, 300 s at the defaults). Without
-/// it a quiet fleet's facts would go stale between publishes and every
-/// dispatcher would flap back to its own listings. Pure.
-#[must_use]
-pub fn effective_publish_interval(
-    config: &Config,
-    produced: &BTreeMap<String, JobFacts>,
-) -> Duration {
-    if !produced.contains_key(STAR_FACTS_JOB) {
-        return config.publish_interval;
-    }
-    let star = (config.star_facts_max_age - Duration::seconds(READ_LAG_SECS)).max(Duration::zero());
-    config.publish_interval.min(star)
 }
 
 #[derive(Debug, Default)]
@@ -477,26 +460,6 @@ fn note_facts(job: &str, facts: JobFacts) {
     });
 }
 
-/// The repos (lowercased slugs) the captain freshly reports as having **no
-/// open starred issue**, each with the `as_of` of that report, for a liveness
-/// pass at `now` whose level table lists `labels`. Empty unless this host is
-/// a dispatcher with `starFacts` on and the captain listed every one of
-/// `labels`: the caller then evaluates every repo itself.
-#[must_use]
-pub fn star_free(now: DateTime<Utc>, labels: &[&str]) -> HashMap<String, DateTime<Utc>> {
-    with(|s| {
-        fresh_job(
-            s.role.as_ref(),
-            s.config.as_ref(),
-            s.fetch.heartbeat.as_ref(),
-            STAR_FACTS_JOB,
-            now,
-        )
-        .map(|job| facts::star_free(job, labels))
-        .unwrap_or_default()
-    })
-}
-
 /// The captain's `loom:blocked` rows for `slug` when they are fresh at `now`
 /// and cover it (`Some(vec![])`: covered, none blocked). `None`: list it
 /// locally.
@@ -545,14 +508,16 @@ pub(super) async fn forge_gauges(
         move || resolve(&root, &host)
     })
     .await;
+    let mut stage_dwell = super::ops::stage_dwell::Settings::default();
     if let Ok(pass) = resolved {
+        stage_dwell = pass.stage_dwell;
         if pass.role.is_captain() {
             // Before the exchange, so this pass's facts are what it publishes.
             facts::produce(&pass.config, workspace_pool, slug_cache).await;
         }
         let _ = tokio::task::spawn_blocking(move || exchange(&root, &pass, Utc::now())).await;
     }
-    super::ops::stage_dwell::record(workspace_pool, slug_cache).await;
+    super::ops::stage_dwell::record(workspace_pool, slug_cache, stage_dwell).await;
 }
 
 /// One pass's resolved gating.
@@ -560,6 +525,8 @@ struct Pass {
     role: Role,
     config: Config,
     location: Option<(crate::fleet_store::StoreLocation, String)>,
+    /// `observability.stageDwell`, read with the rest of this pass's config.
+    stage_dwell: super::ops::stage_dwell::Settings,
 }
 
 /// Resolve this pass's role and arm or disarm the jobs. Blocking (config and
@@ -568,6 +535,7 @@ fn resolve(root: &Path, host: &str) -> Pass {
     let effective = crate::config_resolver::resolve_effective_config(root);
     let env = |k: &str| std::env::var(k).ok();
     let config = Config::from_effective(&effective, &env);
+    warn_unknown_keys(&effective);
     let gate = captain::resolve_gate_for_root(root, host);
     // Only a host that takes part reads the store's location: with its
     // switch off a misconfigured `fleet.repo` is not this feature's warning.
@@ -610,6 +578,7 @@ fn resolve(root: &Path, host: &str) -> Pass {
         role,
         config,
         location,
+        stage_dwell: super::ops::stage_dwell::Settings::from_effective(&effective),
     }
 }
 
@@ -621,11 +590,12 @@ fn exchange(root: &Path, pass: &Pass, now: DateTime<Utc>) {
         role,
         config,
         location,
+        ..
     } = pass;
     let jobs = config.jobs();
     // Take the publish cache out so the store call runs without the lock.
-    // The read cache is copied, not taken: [`star_free`] and
-    // [`captain_blocked`] are asked from other threads meanwhile.
+    // The read cache is copied, not taken: [`captain_blocked`] is
+    // asked from other threads meanwhile.
     let (mut fetch, mut publish, produced, mut published, mut published_key, previous) =
         with(|s| {
             (
@@ -643,7 +613,7 @@ fn exchange(root: &Path, pass: &Pass, now: DateTime<Utc>) {
             fetch = FetchCache::default();
             let key = content_key(&produced);
             let last = published.zip(published_key.as_deref());
-            let due = publish_due(last, &key, now, effective_publish_interval(config, &produced));
+            let due = publish_due(last, &key, now, config.publish_interval);
             if let Some((loc, base)) = location.as_ref().filter(|_| due && !produced.is_empty()) {
                 let hb = Heartbeat::new(captain, now, produced.clone());
                 match store::publish_heartbeat(root, loc, base, &hb, &mut publish) {

@@ -289,12 +289,35 @@ pub fn live_inputs(nwo: &str, base_ref: &str, sha: &str) -> Result<Inputs, Strin
     }
     let gh = crate::gh_invocation::gh_bin();
     let runs = crate::merge_pr::stale_checks::fetch::fetch_check_runs(&gh, nwo, sha)?;
-    let raw = crate::merge_pr::ci_result::gh_get(&format!(
-        "repos/{nwo}/commits/{sha}/status?per_page=100"
-    ))?;
+    let raw = gh_get(&format!("repos/{nwo}/commits/{sha}/status?per_page=100"))?;
     let combined: Value =
         serde_json::from_str(&raw).map_err(|e| format!("unparseable combined status: {e}"))?;
     Ok((required, runs, parse_statuses(&combined)?))
+}
+
+/// `gh api <path>` (REST, read-only) through the counted `gh` facade. It
+/// lived in the deleted `ci_result` gate (#10444, #12063 slice 1) and keeps its
+/// ledger caller name so the operation inventory does not move.
+fn gh_get(path: &str) -> Result<String, String> {
+    let out = crate::gh_invocation::GhInvocation::new(
+        crate::gh_invocation::Operation::new("merge_guard.ci_result"),
+        crate::gh_invocation::AccessIntent::Read,
+        crate::gh_invocation::GhTarget::None,
+        std::time::Duration::from_secs(60),
+    )
+    .program(crate::gh_invocation::gh_bin())
+    .arg("api")
+    .arg(path)
+    .run();
+    match out {
+        crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => {
+            Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+        crate::cmd_out::CmdOutcome::Ran(o) => {
+            Err(format!("gh api {path} failed: {}", String::from_utf8_lossy(&o.stderr).trim()))
+        }
+        crate::cmd_out::CmdOutcome::Unavailable(u) => Err(format!("could not exec gh api: {u}")),
+    }
 }
 
 #[cfg(test)]

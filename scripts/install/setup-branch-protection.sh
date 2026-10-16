@@ -124,8 +124,10 @@ fetch_live_bypass_actors() {
 # admin-only list at an EXISTING ruleset silently deletes every other actor's
 # bypass (issue #8239). On rjwalters/loom that would have dropped the
 # `loom-fleet-dispatch` App, whose post-merge `git push origin HEAD:main` in
-# .github/workflows/version-bump-on-merge.yml depends on bypassing the
-# pull_request rule.
+# .github/workflows/version-bump-on-merge.yml then depended on bypassing the
+# pull_request rule. Since #12063 that workflow publishes through the fleet
+# publisher (`loom-fleet-publisher`) instead, whose bump commit needs the same
+# kind of bypass, so the union still matters.
 #
 # Entries are keyed by (actor_id, actor_type). The LIVE entry wins on conflict,
 # so a deliberately narrowed bypass_mode (e.g. "pull_request" for the admin

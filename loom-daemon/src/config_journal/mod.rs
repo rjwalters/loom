@@ -6,11 +6,11 @@
 //! journal core ([`crate::journal`]):
 //!
 //! - `config.resolved` (C8): the effective-config hash
-//!   ([`planner_config_hash`], the same function `fleet.state` uses), the
+//!   ([`planner_config_hash`]), the
 //!   tier path/sha256-or-absent metadata, and the **redacted** body only the
 //!   first time a hash is seen.
-//! - `config.rendered` (C6): a render (`event: rendered`), and the
-//!   pending-restart marker lifecycle (`pending_restart` / `pending_cleared`).
+//! - `config.rendered` (C6): a render (`event: rendered`), a removal of a
+//!   rendered file (`event: removed`), and the pending-restart marker lifecycle (`pending_restart` / `pending_cleared`).
 //! - `fleet.sync` (C7): the `FleetSyncStatus` snapshot (`published`) or its
 //!   removal (`cleared`).
 //!
@@ -44,6 +44,18 @@ use crate::journal::{AppendOutcome, Journal, JournalError, Position, Stream};
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;
+
+/// Test seam: the `data` of every record in the config stream under `root`,
+/// so tests outside this module need not name `crate::journal` (Phase 2a
+/// tree invariant, `tests/journal_no_wiring.rs`).
+#[cfg(test)]
+pub(crate) fn read_event_data(root: &Path) -> Vec<Value> {
+    let stream = Journal::open(root).stream(STREAM).unwrap();
+    stream
+        .reader(Position::START)
+        .map(|r| r.unwrap().envelope.data)
+        .collect()
+}
 
 /// Env switch for the shadow journal. Unset or falsy: everything is a no-op.
 pub const ENABLE_ENV: &str = "LOOM_CONFIG_JOURNAL";
@@ -208,6 +220,25 @@ pub fn record_resolved(repo_root: &Path) {
     });
 }
 
+/// 12 hex of sha256 over the canonical JSON (sorted keys, no whitespace) of
+/// the planner-relevant effective config: `autonomous.workFinder` (which
+/// carries the slot and per-repo caps) and `autonomous.mergeSequencing`.
+/// Unrelated config never changes it. Pure.
+#[must_use]
+pub(crate) fn planner_config_hash(effective: &Value) -> String {
+    let pick = |key: &str| {
+        crate::config_resolver::get_path(effective, &format!("autonomous.{key}"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let mut slice = serde_json::Map::new();
+    slice.insert("mergeSequencing".to_string(), pick("mergeSequencing"));
+    slice.insert("workFinder".to_string(), pick("workFinder"));
+    let text = crate::tokens_pool::profile_merge::canonical_json(&Value::Object(slice));
+    let digest = Sha256::digest(text.as_bytes());
+    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Two concerns, kept apart:
 ///
 /// - **Transitions** (current state): a record is appended whenever the
@@ -224,7 +255,7 @@ pub(crate) fn append_resolved(
     effective: &Value,
     tiers: Vec<Value>,
 ) -> Result<(), JournalError> {
-    let hash = crate::observability::fleet_state::planner_config_hash(effective);
+    let hash = planner_config_hash(effective);
     let tiers_digest = sha256_hex(Value::Array(tiers.clone()).to_string().as_bytes());
     if latest_state(s, workspace).is_some_and(|(h, t)| h == hash && t == tiers_digest) {
         return Ok(());
@@ -326,6 +357,45 @@ pub fn append_rendered(
                 "store_commit": store_commit,
                 "restart_required_keys": restart_required_keys,
                 "daemon_pid_at_render": Value::Null,
+            }),
+        )
+        .map(|_| ())
+    });
+}
+
+/// Shadow-record that the fleet sync removed a rendered file (`removed`), after
+/// the legacy removal. `backup` is where `render::remove` moved it. Same
+/// shadow / no-op-when-disabled behaviour as [`record_rendered`].
+pub fn record_removed(
+    removed: bool,
+    tier: &str,
+    path: &Path,
+    backup: Option<std::path::PathBuf>,
+    store_commit: &Option<String>,
+) {
+    if removed {
+        append_removed(tier, path, backup.as_deref(), store_commit.as_deref());
+    }
+}
+
+/// [`record_removed`] with the pieces spelled out (tests).
+pub fn append_removed(
+    tier: &str,
+    target: &Path,
+    backup: Option<&Path>,
+    store_commit: Option<&str>,
+) {
+    shadow("config.removed", |s| {
+        s.append(
+            KIND_RENDERED,
+            None,
+            json!({
+                "schema": SCHEMA,
+                "event": "removed",
+                "tier": tier,
+                "target": target.display().to_string(),
+                "backup": backup.map(|b| b.display().to_string()),
+                "store_commit": store_commit,
             }),
         )
         .map(|_| ())

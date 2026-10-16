@@ -20,6 +20,11 @@ pub struct ExportStatus {
     /// The exporter's own queue, attached once at startup (#11115) so a
     /// snapshot can report live pressure.
     queue: std::sync::OnceLock<std::sync::Arc<super::queue::DurableQueue>>,
+    /// Wire kind -> last time an envelope of that kind was acked (#12120).
+    /// In memory only: after a restart a kind reads as "not yet exported this
+    /// process", which the health rule measures from process start.
+    kind_last_export:
+        std::sync::Mutex<std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>>,
 }
 
 // Allow expect_used: a poisoned status mutex means another thread panicked
@@ -58,6 +63,7 @@ impl ExportStatus {
         ExportStatus {
             inner: std::sync::Mutex::new(initial),
             queue: std::sync::OnceLock::new(),
+            kind_last_export: Default::default(),
         }
     }
 
@@ -79,6 +85,29 @@ impl ExportStatus {
             .records_exported
             .saturating_add(count.try_into().unwrap_or(u64::MAX));
         guard.consecutive_failures = 0;
+    }
+
+    /// Stamp each of `kinds` (wire tags of acked envelopes) as exported now.
+    pub fn record_kinds<'a>(&self, kinds: impl IntoIterator<Item = &'a str>) {
+        let now = chrono::Utc::now();
+        let mut guard = self
+            .kind_last_export
+            .lock()
+            .expect("observability kind map mutex poisoned");
+        for kind in kinds {
+            guard.insert(kind.to_string(), now);
+        }
+    }
+
+    /// Wire kind -> last acked export time, for kinds seen this process.
+    #[must_use]
+    pub fn kind_last_export(
+        &self,
+    ) -> std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> {
+        self.kind_last_export
+            .lock()
+            .expect("observability kind map mutex poisoned")
+            .clone()
     }
 
     /// Counts use signal units, never envelope counts (one envelope may contain many points).
@@ -125,6 +154,7 @@ impl ExportStatus {
                 endpoint, detail,
             )),
             queue: std::sync::OnceLock::new(),
+            kind_last_export: Default::default(),
         }
     }
 

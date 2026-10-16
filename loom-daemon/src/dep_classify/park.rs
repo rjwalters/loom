@@ -6,9 +6,9 @@
 //! Champion's Pass 0 un-escalation), or stay `loom:curated` with no record at
 //! all (the gate's `DEFER`). `loom:operator` is now a no-op for every role, so
 //! neither is a resting state: the finding becomes `loom:blocked` with one park
-//! record per open blocker (`park-record.md`), and the daemon's stale-blocked
-//! release pass lifts it when the blockers close. Champion re-evaluates the
-//! released proposal through the same gate (`REEVALUATE`).
+//! record per open blocker (`park-record.md`), which stays until a human,
+//! Guide or Champion lifts it once the blockers close (#11301). Champion
+//! re-evaluates the released proposal through the same gate (`REEVALUATE`).
 //!
 //! The write goes through [`crate::park_record::apply`], the one shared way to
 //! apply `loom:blocked`: body record first, then the label, so there is never

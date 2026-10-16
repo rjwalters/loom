@@ -367,6 +367,24 @@ impl SweepRegistryConfig {
             .join("sweep.md")
             .exists()
     }
+
+    /// The workspace file holding `role`'s slash command (`/loom:<role>`).
+    #[must_use]
+    pub fn role_command_path(&self, role: crate::step_role::StepRole) -> PathBuf {
+        self.workspace_root
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .join(format!("{}.md", role.role_name()))
+    }
+
+    /// Whether `role`'s command is absent from this workspace (#12048): the
+    /// step-dispatch counterpart of [`Self::has_sweep_command`]. One `stat`
+    /// that follows symlinks, so a dangling one counts as missing.
+    #[must_use]
+    pub fn role_command_missing(&self, role: crate::step_role::StepRole) -> bool {
+        !self.role_command_path(role).exists()
+    }
 }
 
 /// In-memory registry of dispatched sweeps.
@@ -642,6 +660,9 @@ pub struct SweepRegistry {
     /// The step-outcome ledger (#11900): per-`(item, step)` outcomes and
     /// short cooldowns. See [`step_ledger`].
     step_ledger: crate::step_dispatch::outcome_ledger::OutcomeLedger,
+    /// The ledger's durable part as last written (#12251): an unchanged
+    /// ledger is not rewritten.
+    step_ledger_persisted: String,
     /// No-op re-dispatch cooldown parameters (Issue #6670). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -857,6 +878,10 @@ pub struct SweepRegistry {
     inflight_idempotency: HashMap<String, SweepId>,
     /// #10974: the dispatch gate a daemon roll closes (`roll_gate`).
     roll_gate: roll_gate::RollGate,
+    /// #12048: roles whose missing workspace command has already been WARNed
+    /// about, so the refusal logs once rather than every tick. A role leaves
+    /// the set when its command file is seen again.
+    missing_command_warned: HashSet<&'static str>,
 }
 
 /// Env var restoring the pre-#6322 behavior of publishing this host's RAW
@@ -1014,7 +1039,7 @@ impl SweepRegistry {
     /// or [`with_event_bus`](Self::with_event_bus) to attach a bus.
     #[must_use]
     pub fn new(config: SweepRegistryConfig) -> Self {
-        Self {
+        let mut registry = Self {
             config,
             entries: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -1054,6 +1079,7 @@ impl SweepRegistry {
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             step_ledger: Default::default(),
+            step_ledger_persisted: String::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
@@ -1072,7 +1098,10 @@ impl SweepRegistry {
             owner_repo_cache: Arc::new(Mutex::new(None)),
             inflight_idempotency: HashMap::new(),
             roll_gate: roll_gate::RollGate::default(),
-        }
+            missing_command_warned: HashSet::new(),
+        };
+        registry.restore_step_ledger();
+        registry
     }
 
     /// Construct an empty registry with the given event bus pre-attached.

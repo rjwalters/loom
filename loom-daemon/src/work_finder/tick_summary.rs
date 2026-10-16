@@ -168,6 +168,15 @@ pub fn last_cap() -> Option<crate::types::CapView> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Export a tick skipped whole by the GitHub rate-limit breaker (#12083) as an
+/// empty `pick.decision` naming why, so the skip is a record, not silence.
+pub fn publish_rate_limit_skip(at: chrono::DateTime<chrono::Utc>) {
+    crate::observability::pick_decision::emit_skipped_work_finder(
+        crate::observability::pick_decision::RATE_LIMIT_HELD,
+        at,
+    );
+}
+
 /// [`publish_tick_summary_at`] stamped with the current wall clock.
 pub fn publish_tick_summary(report: &TickReport, max_concurrent: usize) {
     publish_tick_summary_at(report, max_concurrent, chrono::Utc::now());
@@ -229,8 +238,6 @@ pub fn publish_tick(
         dispatch_result,
     );
     store_tick_summary(summary);
-    // #11161: `fleet.state` samples every tick, after the summary is stored.
-    crate::observability::fleet_state::tick_completed();
     crate::observability::ops::dispatch::record_tick(
         report,
         max_concurrent,

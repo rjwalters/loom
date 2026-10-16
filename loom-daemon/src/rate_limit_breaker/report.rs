@@ -66,14 +66,16 @@ pub trait BudgetProbe: Send + Sync {
     fn probe(&self, ctx: &FailureContext, now: DateTime<Utc>) -> Option<BudgetSnapshot>;
 }
 
-/// The real probe: `gh api rate_limit` + the GraphQL `rateLimit` query
-/// through the `gh` facade, under the failure's context.
+/// The real probe: one `gh api rate_limit` through the `gh` facade, under
+/// the failure's context. It bypasses (and then refreshes) the process-wide
+/// budget cache (#12204): a trip is the moment the cached reading stopped
+/// being true, and the one time a `/rate_limit` read is always worth it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ForgeProbe;
 
 impl BudgetProbe for ForgeProbe {
     fn probe(&self, ctx: &FailureContext, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
-        super::forge::probe_budget_ctx(ctx, now)
+        super::forge::refresh_budget_ctx(ctx, now)
     }
 }
 
@@ -170,7 +172,7 @@ pub fn report_failure(
         );
         // Authoritative headers, no probe: the trip span carries no
         // attribution (#10022).
-        super::export_trip(source, now, transition.until, None, || None);
+        super::export_trip(source, now, transition.until, None, None, || None);
         return Some(Reported {
             transition,
             refine: None,
@@ -237,12 +239,15 @@ fn refine(
     if let Some(until) = until {
         log::info!("rate_limit_breaker: cooldown until {until} from {}", ev.describe());
     }
+    let credential = super::forge::credential_ctx(ctx);
+    let (account, owner) = (credential.account.clone(), credential.owner.clone());
     super::export_trip(
         source,
         tripped_at,
         until.or(provisional_until),
         budget.as_ref().map(|b| (b, reading_trusted)),
-        || crate::forge_call_stats::consumed_in_window(tripped_at),
+        Some(credential),
+        || crate::forge_call_stats::consumed_in_window_for(tripped_at, &account, owner.as_deref()),
     );
     until
 }

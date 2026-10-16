@@ -479,6 +479,61 @@ fn the_repeat_cap_counts_noops_too_and_arms_until_the_oldest_leaves() {
     );
 }
 
+/// #12251: the repeat cap survives a restart. A new ledger restored from the
+/// old one's durable part caps on the third run exactly as the old one would
+/// have; before #12251 a roll emptied the history and the cap never armed on
+/// a fleet that rolls every few hours.
+#[test]
+fn the_repeat_cap_holds_across_a_restart() {
+    let now = t0();
+    let failed = out(OutcomeClass::Failed, "crashed");
+    let mut before = OutcomeLedger::default();
+    before.record(5, StepRole::Builder, &failed, SLOW, now);
+    before.record(5, StepRole::Builder, &failed, SLOW, now + mins(30));
+    let durable = before.persisted(now + mins(30));
+    let json = serde_json::to_string(&durable).unwrap();
+
+    let mut after = OutcomeLedger::default();
+    let back: Vec<PersistedPair> = serde_json::from_str(&json).unwrap();
+    after.restore(back, now + mins(60));
+    let rec = after.record(5, StepRole::Builder, &failed, SLOW, now + mins(60));
+    assert!(rec.repeat_capped, "the third run in 24 h caps, restart or not");
+    assert_eq!(rec.cooling_until, Some(now + chrono::Duration::hours(24)));
+
+    // Without the restore, the same run is the first one.
+    let mut forgot = OutcomeLedger::default();
+    assert!(
+        !forgot
+            .record(5, StepRole::Builder, &failed, SLOW, now + mins(60))
+            .repeat_capped
+    );
+}
+
+/// #12251: a window in force comes back with its cause; lapsed runs and
+/// windows are not persisted and not restored.
+#[test]
+fn a_restored_ledger_keeps_live_windows_and_drops_lapsed_ones() {
+    let now = t0();
+    let mut l = OutcomeLedger::default();
+    l.arm(7, StepRole::Builder, now + mins(90), CooldownCause::Landed, now);
+    l.arm(8, StepRole::Judge, now + mins(5), CooldownCause::Noop, now);
+    let durable = l.persisted(now + mins(10));
+    assert_eq!(durable.len(), 1, "{durable:?}");
+    assert_eq!(durable[0].cause, Some(CooldownCause::Landed));
+
+    let mut after = OutcomeLedger::default();
+    after.restore(durable.clone(), now + mins(10));
+    assert_eq!(after.cooling_until(7, StepRole::Builder, now + mins(10)), Some(now + mins(90)));
+    assert_eq!(
+        after.cooling_cause(7, StepRole::Builder, now + mins(10)),
+        Some(CooldownCause::Landed)
+    );
+    let mut late = OutcomeLedger::default();
+    late.restore(durable, now + mins(91));
+    assert!(late.snapshot(now + mins(91)).is_empty(), "lapsed on reload");
+    assert!(late.persisted(now + mins(91)).is_empty());
+}
+
 #[test]
 fn a_local_window_is_capped_at_24h_and_extend_only() {
     let mut l = OutcomeLedger::default();

@@ -257,6 +257,34 @@ fn a_pass_publishes_each_owner_and_rewrites_api_host_on_every_publish() {
     assert_eq!(agent_env()[1], (DIR_ENV, None));
 }
 
+/// #12147: the `gh` version is re-probed on each due pass, so a `gh` replaced
+/// on disk is picked up without a daemon restart.
+#[test]
+fn a_replaced_gh_is_reported_on_the_next_refresh() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let config = cfg(&[("gwt-a", "file:/k/a")]);
+    let old = Fake::new(Some(GhVersion(2, 101, 0))).key("/k/a", Ok(KEY));
+    let new = Fake::new(Some(GhVersion(2, 102, 0))).key("/k/a", Ok(KEY));
+    let mut r = Refresher::default();
+    let now = Instant::now();
+    assert!(matches!(r.pass_with(ws, &config, now, &old), PassOutcome::Published { .. }));
+    assert_eq!(r.gh_seen().unwrap().1, GhVersion(2, 101, 0));
+    // Not due yet: the probe is not consulted, nothing changes.
+    assert_eq!(r.pass_with(ws, &config, now, &new), PassOutcome::Unchanged);
+    assert_eq!(r.gh_seen().unwrap().1, GhVersion(2, 101, 0));
+    // Due again (same owners, same config): the new version is reported.
+    let later = now + crate::credential_preflight::GITHUB_APP_REFRESH_INTERVAL;
+    assert!(matches!(r.pass_with(ws, &config, later, &new), PassOutcome::Published { .. }));
+    assert_eq!(r.gh_seen().unwrap().1, GhVersion(2, 102, 0));
+    // `gh` missing mid-run: the gateway goes off, the last-seen stays harmless.
+    let gone = Fake::new(None);
+    let much_later = later + crate::credential_preflight::GITHUB_APP_REFRESH_INTERVAL;
+    assert_eq!(r.pass_with(ws, &config, much_later, &gone), PassOutcome::GhTooOld(None));
+    teardown(&base_dir(ws));
+}
+
 #[test]
 fn an_old_gh_publishes_nothing_and_removes_what_was_there() {
     let _serial = serial();
@@ -356,7 +384,8 @@ fn with_the_gateway_unset_routing_is_byte_identical_to_today() {
     }
     assert_eq!(profile_for("gwt-bg"), None);
     assert!(!any_live(), "the agent front does no gateway work at all");
-    assert_eq!(agent_env(), vec![(NO_UPDATE_NOTIFIER_ENV, Some("1".into())), (DIR_ENV, None)]);
+    assert_eq!(agent_env()[..2], [(NO_UPDATE_NOTIFIER_ENV, Some("1".into())), (DIR_ENV, None)]);
+    assert_eq!(agent_env()[2].0, crate::forge_identity::FRONT_ROOT_ENV);
 }
 
 #[test]
@@ -799,4 +828,28 @@ fn an_ssm_failure_names_the_exit_and_the_first_stderr_line() {
     );
     assert_eq!(first_line(""), "(no stderr)");
     assert_eq!(first_line(&"x".repeat(1000)).len(), 240);
+}
+
+/// #12207: a spawner that is not the daemon (`loom-daemon worker`) passes on
+/// the gateway base it inherited, when it is still the shape the daemon
+/// publishes, instead of stripping it from the agent it execs.
+#[test]
+fn a_non_daemon_spawner_passes_on_an_inherited_safe_base_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join(".loom").join(DIR_NAME);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = base.join("gh-ok");
+    std::fs::write(&marker, "/usr/bin/gh").unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let inherited = Some(base.clone().into_os_string());
+    assert_eq!(inherited_base(inherited.clone()), inherited);
+    assert_eq!(inherited_base(None), None);
+    assert_eq!(inherited_base(Some(OsString::new())), None);
+    // Not the published shape: never passed on.
+    assert_eq!(inherited_base(Some(tmp.path().as_os_str().to_os_string())), None);
+    // A base another user could write to is not passed on either.
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert_eq!(inherited_base(inherited), None);
 }

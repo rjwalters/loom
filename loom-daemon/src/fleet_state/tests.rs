@@ -110,11 +110,28 @@ fn a_store_with_no_state_file_proceeds_and_says_why() {
 }
 
 #[test]
-fn an_unparseable_state_file_proceeds_rather_than_stranding_the_host() {
+fn an_unparseable_state_file_with_no_recorded_state_proceeds() {
     let (pass, _d) = pass_for(files_with_state("fleet:\n  state: retired\n"), "build-1");
     assert_eq!(pass.desired, None);
     assert_eq!(pass.enforcement(), Enforcement::Proceed);
     assert!(pass.error.is_some());
+}
+
+#[test]
+fn an_unparseable_state_file_keeps_the_last_recorded_paused_or_stopped_state() {
+    for (recorded, want) in [
+        (RunState::Paused, Enforcement::Hold),
+        (RunState::Stopped, Enforcement::Stop),
+        (RunState::Running, Enforcement::Proceed),
+    ] {
+        let forge = FakeForge::new(files_with_state("fleet:\n  state: retired\n"));
+        let dir = tempfile::tempdir().unwrap();
+        let pass = state_pass(&forge, dir.path(), &location(), "build-1", Some(recorded), t0());
+        assert_eq!(pass.desired, Some(recorded));
+        assert!(pass.from_last_recorded);
+        assert_eq!(pass.enforcement(), want, "{recorded:?}");
+        assert!(pass.error.is_some(), "the parse error is still reported");
+    }
 }
 
 #[test]

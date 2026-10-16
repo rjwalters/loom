@@ -45,7 +45,7 @@ Loom has three hold labels, each with one meaning:
 
 | Label | Meaning | Release |
 |---|---|---|
-| `loom:blocked` | Waiting on something automation will resolve: another change merging, a capability, a dependency. The park record or a `Blocked by #N` line says what. Also Champion's own merge-risk and critical-file PR holds (#11861, "Champion's PR holds" below) | Automatic once the blocker resolves (`release-stale-blocked`, `check-stale-blocked`, `merge-pr.sh`'s cleared-blocker notice); see [`park-record.md`](park-record.md). Champion releases its own PR holds |
+| `loom:blocked` | Waiting on something outside the item: another change merging, a capability, a dependency. The park record or a `Blocked by #N` line says what. Also Champion's own merge-risk and critical-file PR holds (#11861, "Champion's PR holds" below) | A role or a human, once the blocker resolves. Nothing lifts it automatically: the daemon's release pass was retired (#11301). `check-stale-blocked` and `merge-pr.sh`'s cleared-blocker notice report cleared blockers; see [`park-record.md`](park-record.md). Champion releases its own PR holds |
 | `loom:operator` | A human must act or decide. The body says which: a ```` ```decision ```` block is a ruling ([`operator-decision.md`](operator-decision.md)); otherwise the comment names the step; a `Blocked by #N` line says the human action waits on something named | A human removes it. Nothing else does |
 | `loom:frozen` | Not now; don't touch (#11743). No agent or daemon path reads it as work, comments on it or relabels it | A human removes it |
 
@@ -76,7 +76,8 @@ moves open items (closed items keep their labels):
 
 Three queue labels sit next to the holds and are not holds:
 `loom:blocked-unnamed` (the Curator's queue of `loom:blocked` issues naming no
-blocker, [`unnamed-block-review.md`](unnamed-block-review.md)),
+blocker, [`unnamed-block-review.md`](unnamed-block-review.md); no longer
+applied since #11301, drained where it remains),
 `loom:decision-malformed` (the Curator's repair queue for a bad decision
 block, below) and `loom:sequenced` (PR merge ordering, #11708).
 
@@ -97,6 +98,17 @@ structurally cannot.
 | A human action that waits on something named first | `loom:operator`, plus a literal `Blocked by #N` line in the body or comment |
 | Waiting on something automation will resolve: an issue, a PR, infrastructure | `loom:blocked` with a park record (`loom-daemon park-record apply`, [`park-record.md`](park-record.md)), or at least a literal `Blocked by #N` / `Depends on #N` / `Requires #N` line in the same comment (the phrasings `detect-dependency-cycle.sh` and `warn-operator-gated.sh` parse; a backtick-quoted reference does not count) |
 | Waiting on a capability a fleet host may hold (host or admin access, a credential profile) | `loom:blocked` with a reason-only park record and a `<!-- loom:capability=<name> -->` marker naming it, plus a linked capability-request issue: the capability lane (below) proposes it on a host that holds it |
+
+**`loom:operator` needs a stated reason class.** Only these classes qualify:
+physical (bench, hardware, or an install on an operator machine);
+credential/access (grant, mint or rotate); money (spend or a standing cost);
+irreversible or outward-facing (publish, delete, migrate, someone else's
+system); firewall/legal; decision (a ranked 2-4 option question, best first,
+each with a why). A human-hands `loom:operator` comment opens with one
+`Operator reason: <class> — <one line>` line. A decision routed through
+`operator-decision apply` already satisfies `decision`; add no extra line. An
+item that fits no class does not belong: the label comes off and the item
+returns to the queue.
 
 **One hold per decision.** The operator's ruling (a dashboard vote, or a
 human removing the label) lifts `loom:operator`, so never add an unrelated
@@ -189,9 +201,8 @@ all-role rule they moved to `loom:blocked`:
 - `loom:pr` is **kept**: the Judge's approval stands.
 - `loom:blocked` is added by `loom-daemon park-record apply --pr N --reason
   "champion merge-risk hold" --by champion` (or `"champion critical-file
-  hold"`), which also writes a reason-only park record into the PR body. The
-  stale-blocked release pass skips a reason-only record (`Skip::Unstated`), so
-  only Champion or a human releases the hold.
+  hold"`), which also writes a reason-only park record into the PR body. Only
+  Champion or a human releases the hold.
 - The hold-state marker comment (`<!-- champion:merge-risk-hold -->` /
   `<!-- champion:critical-file-hold -->`, carrying `champion:hold-state
   head=<sha>`) is unchanged and remains the record of the hold.
@@ -348,7 +359,8 @@ the #11795 Q1 ruling (option 2) and is recorded for the operator there.
 
 After the migration, Champion's Pass 0 un-escalation is retired from the
 prompts: Step 4 blocks a new dependency-only finding (#11860) on
-`loom:blocked`, and `release-stale-blocked` lifts it when the blocker closes.
+`loom:blocked`, where it stays until a role or a human lifts it once the
+blocker closes (#11301).
 `--check-unescalate` stays in the binary only for prompts installed before
 #11861 and as this migration's decider.
 
@@ -524,8 +536,8 @@ item with a decision block on every later pass.
 
 A `loom:blocked` item that also names a blocker in a park record is **not**
 lane-eligible: it waits on another change, which no capability satisfies.
-Nor does the stale-blocked release pass lift a capability-only park (it has no
-named blocker to resolve): it stays parked until a capable host proposes it or
+Nothing lifts a capability-only park automatically (it has no named blocker
+to resolve): it stays parked until a capable host proposes it or
 a human releases it, and the linked capability-request issue says which host
 setting would unblock it.
 
@@ -802,8 +814,7 @@ comment, a label, a linked PR, a dependency closing), removes `loom:blocked`,
 restores `loom:issue` (unless another hold or lane veto is on it) and posts a
 `kind=released` notice. Any host adopts a no-op park it finds on the forge (the
 park record plus the notice) once per process, so the hold outlives the host
-that applied it. The stale-blocked release pass skips this record as a daemon
-hold. A human can also remove `loom:blocked` by hand; the next no-op then starts
+that applied it. A human can also remove `loom:blocked` by hand; the next no-op then starts
 a fresh streak.
 
 **Holds applied before #12024** sit on `loom:operator` with the notice above.

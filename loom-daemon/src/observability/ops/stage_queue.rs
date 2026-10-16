@@ -138,7 +138,7 @@ pub(super) async fn walk_counts(
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
-        let rows = crate::forge_listing::list_open_issues_cached_all_as(
+        let rows = crate::forge_listing::list_open_issues_cached_all_observability_as(
             "stage_dwell",
             &gh,
             Some(&root),
@@ -146,6 +146,15 @@ pub(super) async fn walk_counts(
         );
         if let Ok(rows) = &rows {
             reconcile_refusals(&root, &slug, rows);
+            // #12118: the same complete walk journals `issue.estimate` for
+            // freshly curated issues, so no Curator CLI call is needed.
+            crate::telemetry::kinds::issue_estimate::observe::observe(
+                &root,
+                &slug,
+                rows,
+                &crate::comment_trust::TrustPolicy::for_root(&root),
+                chrono::Utc::now(),
+            );
         }
         rows
     })
