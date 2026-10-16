@@ -366,8 +366,11 @@ pub fn reading(key: &BucketKey, now: i64) -> Option<Reading> {
 
 /// Whether `key`'s held reading (of any age) still describes an open window
 /// at `now` — the per-directory probe's "already known this window" test
-/// (#12204): the window's reset is fixed, so a reading inside it, refreshed
-/// by response headers, makes another `/rate_limit` read redundant.
+/// (#12204): the window's reset is fixed, so a reading inside it makes
+/// another `/rate_limit` read redundant. The reading is only kept current by
+/// response headers when the bucket sees traffic; a quiet bucket's reading
+/// goes stale (`Reading::is_fresh` needs it under `MAX_AGE_SECS`, 600 s) while
+/// this still returns true, so it reads unknown until the window resets.
 #[must_use]
 pub fn window_open(key: &BucketKey, now: i64) -> bool {
     book()
