@@ -348,3 +348,102 @@ fn roles_ok_names_each_role_once() {
     assert_eq!(unique.len(), roles.len(), "{roles:?}");
     assert!(roles.contains(&"champion".to_string()));
 }
+
+// ---- #12493: the flag is the host's, read from the daemon workspace ------
+
+/// Write `fleetDispatch` into `host`'s host-local tier only.
+fn enable_host_tier(host: &Path, url: &str, enabled: bool) {
+    let path = host.join(crate::config_resolver::LOCAL_CONFIG_REL);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, json!({"fleetDispatch": {"enabled": enabled, "url": url}}).to_string())
+        .unwrap();
+}
+
+/// The A/B trial's shape: the flag set only in the daemon workspace's
+/// host-local tier, the step in another repo whose root has no
+/// `fleetDispatch` at all. The claim, the heartbeat and the budget all
+/// follow the host's flag.
+#[test]
+#[serial]
+fn a_flag_in_the_host_tier_reaches_a_step_in_another_repo() {
+    reset_for_test();
+    let (host, repo) = (tempdir().unwrap(), tempdir().unwrap());
+    let server = granting();
+    enable_host_tier(host.path(), &server.url(), true);
+    set_host_root(host.path());
+    assert_eq!(host_endpoint(repo.path()).as_deref(), Some(server.url().as_str()));
+
+    let Ask::Granted(grant) = claim(repo.path(), 7, StepRole::Judge) else {
+        panic!("the host's flag must reach a repo with none of its own");
+    };
+    assert_eq!(grant.assignment_id, "a-1");
+    let claims = server.requests_to(proto::CLAIM_PATH);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0]["item"], 7);
+
+    note_spawned(repo.path(), "step-judge-7-1", grant);
+    note_capacity(3, &BTreeSet::new());
+    on_reaper_tick(repo.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
+    assert_eq!(beats[0]["live"][0]["assignment_id"], "a-1");
+    release("step-judge-7-1", "verdict");
+    assert_eq!(server.wait_for(proto::RELEASE_PATH, 1)[0]["assignment_id"], "a-1");
+}
+
+/// The host's flag off: nothing is asked, even of a repo whose own config
+/// turns fleet dispatch on. A host property is not overridden per repo.
+#[test]
+#[serial]
+fn the_host_tier_flag_off_asks_nothing_whatever_the_repo_says() {
+    reset_for_test();
+    let (host, repo) = (tempdir().unwrap(), tempdir().unwrap());
+    let server = granting();
+    enable_host_tier(host.path(), &server.url(), false);
+    enable(repo.path(), &server.url(), true);
+    set_host_root(host.path());
+    assert_eq!(claim(repo.path(), 7, StepRole::Judge), Ask::Off);
+    assert_eq!(tick_budget(repo.path(), 9, 2), (9, false));
+    note_capacity(9, &BTreeSet::new());
+    on_reaper_tick(repo.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(server.requests().is_empty(), "{:?}", server.requests());
+}
+
+/// `tick_budget` reads the host's flag: in fallback, a repo with no flag of
+/// its own draws the reduced budget while the host tier is on, and its full
+/// budget once the host tier turns it off (live, no restart).
+#[test]
+#[serial]
+fn tick_budget_follows_the_host_tier_live() {
+    reset_for_test();
+    let (host, repo) = (tempdir().unwrap(), tempdir().unwrap());
+    set_host_root(host.path());
+    enable_host_tier(host.path(), &TestServer::dead_url(), true);
+    for _ in 0..fallback::ENTER_AFTER_FAILURES {
+        assert_eq!(claim(repo.path(), 1, StepRole::Judge), Ask::FailOpen);
+    }
+    assert_eq!(mode(), Mode::Fallback);
+    assert_eq!(tick_budget(repo.path(), 9, 2), (2, true));
+
+    enable_host_tier(host.path(), &TestServer::dead_url(), false);
+    assert_eq!(tick_budget(repo.path(), 9, 2), (9, false));
+    assert_eq!(claim(repo.path(), 1, StepRole::Judge), Ask::Off);
+}
+
+/// The INFO announcement tracks the resolved answer: it changes when the
+/// host tier does.
+#[test]
+#[serial]
+fn the_resolved_mode_is_announced_on_each_change() {
+    reset_for_test();
+    let (host, repo) = (tempdir().unwrap(), tempdir().unwrap());
+    set_host_root(host.path());
+    assert_eq!(host_endpoint(repo.path()), None);
+    assert_eq!(state().announced, None);
+    enable_host_tier(host.path(), "http://captain:1/", true);
+    assert_eq!(host_endpoint(repo.path()).as_deref(), Some("http://captain:1"));
+    assert_eq!(state().announced.as_deref(), Some("http://captain:1"));
+    enable_host_tier(host.path(), "http://captain:1/", false);
+    assert_eq!(host_endpoint(repo.path()), None);
+    assert_eq!(state().announced, None);
+}

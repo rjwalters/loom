@@ -9,10 +9,16 @@
 //! # Flag
 //!
 //! `fleetDispatch.enabled` (bool) and `fleetDispatch.url` in the effective
-//! config, normally the per-host tier fleet-gitops renders. Both are read
-//! fresh on every use ([`endpoint`]), so they are live-reloadable. With the
-//! flag off (the default) nothing here makes a call, emits a span or changes
-//! a budget: dispatch is exactly what it was.
+//! config, normally the per-host tier fleet-gitops renders. Fleet dispatch
+//! is a property of the host, not of a repo, so the flag is read from the
+//! daemon's own workspace ([`set_host_root`]), whose host-local tier
+//! (`<daemon workspace>/.loom-local/local.json`) carries it, whichever
+//! managed repo the step is for ([`host_endpoint`], #12493). Before the
+//! daemon names its workspace (tests, a step spawned outside the daemon)
+//! the caller's root stands in. Both keys are read fresh on every use, so
+//! they are live-reloadable; each change of the answer is logged once at
+//! INFO. With the flag off (the default) nothing here makes a call, emits a
+//! span or changes a budget: dispatch is exactly what it was.
 //!
 //! # The claim
 //!
@@ -95,6 +101,7 @@ fn live_stale_after() -> Duration {
 }
 
 /// The server URL when `root`'s effective config enables fleet dispatch.
+/// The dispatch paths ask [`host_endpoint`], which reads the host's tier.
 #[must_use]
 pub fn endpoint(root: &Path) -> Option<String> {
     let effective = crate::config_resolver::resolve_effective_config(root);
@@ -116,6 +123,44 @@ pub fn endpoint_in(effective: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|u| !u.is_empty())?;
     Some(url.trim_end_matches('/').to_string())
+}
+
+/// Name the daemon's own workspace root: the root whose effective config
+/// (its host-local tier above all) says whether this host is in fleet mode
+/// (#12493). Called once at daemon startup; a later call replaces it.
+pub fn set_host_root(root: &Path) {
+    state().host_root = Some(root.to_path_buf());
+}
+
+/// The server URL when this host is in fleet mode: [`endpoint`] of the
+/// daemon workspace ([`set_host_root`]), or of `root` before one is named.
+/// Read fresh on every call, so a flag flipped in the host tier takes effect
+/// on the next claim, tick or heartbeat. A change of the answer (on, off, a
+/// new URL) is logged once at INFO, so a host whose flag does not resolve
+/// where it was set shows in its log.
+#[must_use]
+pub fn host_endpoint(root: &Path) -> Option<String> {
+    let host_root = state().host_root.clone();
+    let source = host_root.as_deref().unwrap_or(root);
+    let url = endpoint(source);
+    let mut s = state();
+    if s.announced != url {
+        match &url {
+            Some(url) => log::info!(
+                "fleet_dispatch: fleet mode is on for this host (captain {url}, from {}'s \
+                 effective config); claims ask the captain first (#12493)",
+                source.display()
+            ),
+            None if s.announced.is_some() => log::info!(
+                "fleet_dispatch: fleet mode is off for this host ({}'s effective config); \
+                 claiming without the captain (#12493)",
+                source.display()
+            ),
+            None => {}
+        }
+        s.announced.clone_from(&url);
+    }
+    url
 }
 
 /// A grant, carried from the claim to its `refuse` or `release`.
@@ -170,6 +215,10 @@ struct LiveSet {
 
 #[derive(Debug, Default)]
 struct State {
+    /// The daemon's own workspace root ([`set_host_root`]).
+    host_root: Option<PathBuf>,
+    /// The endpoint [`host_endpoint`] last logged.
+    announced: Option<String>,
     hysteresis: Hysteresis,
     /// Why the current fallback began (a failed call's token).
     entry_reason: &'static str,
@@ -261,7 +310,7 @@ fn decide(r: &ClaimResponse) -> Option<Decision> {
 /// (module docs). Blocks for at most about [`client::CALL_TIMEOUT`].
 #[must_use]
 pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
-    let Some(url) = endpoint(root) else {
+    let Some(url) = host_endpoint(root) else {
         return Ask::Off;
     };
     if mode() == Mode::Fallback {
@@ -463,7 +512,7 @@ pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
 /// step is gone without an end, and send the host's heartbeat when one is
 /// due. A no-op while the flag is off and nothing was ever granted.
 pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
-    let url = endpoint(root);
+    let url = host_endpoint(root);
     let (vanished, heartbeat) = {
         let mut s = state();
         if url.is_none() && s.assignments.is_empty() && s.live_by_root.is_empty() {
@@ -580,12 +629,12 @@ fn prune_stale(state: &mut State, now: Instant) -> Vec<Grant> {
 }
 
 /// The slots this tick may fill, and whether it runs in fallback: the
-/// reduced budget ([`fallback::draw_budget`]) when the flag is on at `root`
-/// and the host is in fallback, counted on `loom.fleet_dispatch.fallback_ticks`
+/// reduced budget ([`fallback::draw_budget`]) when the flag is on for the
+/// host ([`host_endpoint`]) and the host is in fallback, counted on `loom.fleet_dispatch.fallback_ticks`
 /// with the reason fallback began. Unchanged when the flag is off.
 #[must_use]
 pub fn tick_budget(root: &Path, free_slots: usize, spawn_concurrency: usize) -> (usize, bool) {
-    if endpoint(root).is_none() {
+    if host_endpoint(root).is_none() {
         return (free_slots, false);
     }
     let (mode, reason) = {
