@@ -312,14 +312,19 @@ fn terminating_native_tool_terminates_its_shell_descendants() {
         .unwrap();
     child.stdin.take().unwrap().write_all(serde_json::to_string(&json!({"tool":"bash","input":{"command":format!("sleep 60 & echo $! > {}; wait",pidfile.display())}})).unwrap().as_bytes()).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !pidfile.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    // The shell truncates the file before writing the PID, so wait for a
+    // parseable PID rather than for the file to merely exist.
+    let mut parsed_pid: Option<i32> = None;
+    while parsed_pid.is_none() && std::time::Instant::now() < deadline {
+        parsed_pid = fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        if parsed_pid.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
-    let pid: i32 = fs::read_to_string(&pidfile)
-        .expect("shell started")
-        .trim()
-        .parse()
-        .unwrap();
+    let pid: i32 =
+        parsed_pid.expect("shell did not write a parseable PID to the pidfile within 5s");
     // Only signal the processes created by this test.
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);

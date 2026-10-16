@@ -73,9 +73,11 @@
 //! role must write, is `defaults/docs/park-record.md`.
 
 pub mod apply;
+mod code;
 
 use regex::Regex;
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::OnceLock;
 
 /// The opening sentinel. A body containing this substring carries a park record
@@ -237,12 +239,24 @@ pub fn has_record(text: &str) -> bool {
 /// More than one is legitimate and expected: a multi-blocker park is written as
 /// several records, and a second park applied later (by a different role, for a
 /// different blocker) appends its own rather than editing someone else's.
+///
+/// A marker quoted inside a fenced block or an inline code span is not a
+/// record: it renders as visible text, not a comment (#10837, [`code`]).
 #[must_use]
 pub fn parse(text: &str) -> Vec<ParkRecord> {
+    markers(text)
+        .into_iter()
+        .flat_map(|(_, inner)| parse_inner(&text[inner]))
+        .collect()
+}
+
+/// The `(whole, interior)` byte ranges of every park marker outside code,
+/// in document order. Offsets index `text` itself ([`code::blank`] keeps them).
+fn markers(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    let masked = code::blank(text);
     marker_re()
-        .captures_iter(text)
-        .filter_map(|c| c.get(1))
-        .flat_map(|m| parse_inner(m.as_str()))
+        .captures_iter(&masked)
+        .filter_map(|c| Some((c.get(0)?.range(), c.get(1)?.range())))
         .collect()
 }
 
@@ -361,11 +375,9 @@ pub fn has_qualified_ref(text: &str) -> bool {
 pub fn drop_blockers(body: &str, resolved: &[u64]) -> String {
     let mut out = String::with_capacity(body.len());
     let mut last = 0;
-    for caps in marker_re().captures_iter(body) {
-        let (Some(whole), Some(inner)) = (caps.get(0), caps.get(1)) else {
-            continue;
-        };
-        let records = parse_inner(inner.as_str());
+    // A quoted marker in code is never a record, so never edited (#10837).
+    for (whole, inner) in markers(body) {
+        let records = parse_inner(&body[inner]);
         let keep: Vec<ParkRecord> = records
             .iter()
             .filter(|r| {
@@ -378,7 +390,7 @@ pub fn drop_blockers(body: &str, resolved: &[u64]) -> String {
         if keep.len() == records.len() {
             continue;
         }
-        let (mut start, mut end) = (whole.start(), whole.end());
+        let (mut start, mut end) = (whole.start, whole.end);
         let replacement = keep.iter().map(render).collect::<Vec<_>>().join("\n");
         if replacement.is_empty() {
             // Take the whole line when the marker was alone on it.

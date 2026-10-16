@@ -28,6 +28,7 @@ use crate::pr_lease_reap::{self, Reaper};
 const EXIT_HELD: i32 = 0;
 const EXIT_PEER: i32 = 4;
 const EXIT_BACKSTOP: i32 = 6;
+const EXIT_ACTIVE: i32 = 7;
 
 /// The deadline for one `lease pr claim`: bounded reads and one post, each
 /// with its own `gh` deadline (as `pr_lease_reap::REAP_TIMEOUT`).
@@ -131,6 +132,12 @@ pub(crate) fn claim_verdict(run: &ClaimRun) -> std::result::Result<(), StepRefus
         ClaimRun::Exited(EXIT_BACKSTOP) => {
             Err(StepRefusal::new("backstop_hold", "the Judge no-verdict backstop holds this PR"))
         }
+        // #12105: another actor (a live lease of another kind, or a recent
+        // push by another login) is working the PR; a Doctor stands down.
+        ClaimRun::Exited(EXIT_ACTIVE) => Err(StepRefusal::new(
+            "peer_active",
+            "another actor is active on this PR (a live lease or a recent push)",
+        )),
         ClaimRun::Exited(code) => {
             Err(StepRefusal::new("claim_unverified", format!("`lease pr claim` exited {code}")))
         }
