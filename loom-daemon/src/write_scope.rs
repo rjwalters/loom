@@ -74,6 +74,8 @@ pub(crate) mod target;
 use probe::{Permission, PermissionProbe};
 use target::GhTarget;
 
+use crate::telemetry::kinds::write_scope_refused::{RefusalClass, WriteScopeRefusedRecord};
+
 /// The answer to "may this installation write here?".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -108,50 +110,109 @@ pub(crate) struct Inputs<'a> {
     pub(crate) managed: &'a dyn Fn(&str) -> bool,
 }
 
+/// A verdict with the closed refusal class behind a `Deny`, so telemetry never
+/// parses the reason sentence (#12168).
+pub(crate) struct Decision {
+    pub(crate) verdict: Verdict,
+    /// `Some` exactly when `verdict` is a `Deny`.
+    pub(crate) class: Option<RefusalClass>,
+    /// The `owner/repo` the decision was about, when known.
+    pub(crate) repo: Option<String>,
+}
+
+impl Decision {
+    fn deny(class: RefusalClass, repo: Option<&str>, why: String) -> Self {
+        Decision {
+            verdict: Verdict::Deny(why),
+            class: Some(class),
+            repo: repo.map(str::to_owned),
+        }
+    }
+}
+
 /// The pure decision (rules 1-3 in the module docs).
 pub(crate) fn decide(inputs: &Inputs<'_>, probe: &dyn PermissionProbe) -> Verdict {
+    decide_classified(inputs, probe).verdict
+}
+
+/// [`decide`] plus the refusal class and the repository the decision is about.
+pub(crate) fn decide_classified(inputs: &Inputs<'_>, probe: &dyn PermissionProbe) -> Decision {
     let Some(target) = &inputs.target else {
-        return Verdict::Deny(
+        return Decision::deny(
+            RefusalClass::NoTarget,
+            None,
             "no target repository: the checkout has no GitHub remote and none was named".into(),
         );
     };
+    let repo = Some(target.nwo.as_str());
     if !inputs.explicit {
         match inputs.origin {
             Some(o) if eq(o, &target.nwo) => {}
             Some(o) => {
-                return Verdict::Deny(format!(
-                    "gh resolves this checkout to {} (via {}), not its origin {o}; Loom will not \
-                     read from one repository and write to another. Pin it with \
-                     `gh repo set-default {o}` if origin is the repository Loom manages",
-                    target.nwo, target.via
-                ))
+                return Decision::deny(
+                    RefusalClass::TargetMismatch,
+                    repo,
+                    format!(
+                        "gh resolves this checkout to {} (via {}), not its origin {o}; Loom will \
+                         not read from one repository and write to another. Pin it with \
+                         `gh repo set-default {o}` if origin is the repository Loom manages",
+                        target.nwo, target.via
+                    ),
+                )
             }
             None => {
-                return Verdict::Deny(format!(
-                    "the checkout has no origin remote, so {} (via {}) cannot be confirmed as \
-                     the repository it manages",
-                    target.nwo, target.via
-                ))
+                return Decision::deny(
+                    RefusalClass::TargetMismatch,
+                    repo,
+                    format!(
+                        "the checkout has no origin remote, so {} (via {}) cannot be confirmed \
+                         as the repository it manages",
+                        target.nwo, target.via
+                    ),
+                )
             }
         }
     }
     if !(inputs.managed)(&target.nwo) {
-        return Verdict::Deny(format!(
-            "{} is not a repository this installation manages (not the origin of a registered \
-             workspace or of this Loom checkout)",
-            target.nwo
-        ));
+        return Decision::deny(
+            RefusalClass::UnmanagedRepo,
+            repo,
+            format!(
+                "{} is not a repository this installation manages (not the origin of a \
+                 registered workspace or of this Loom checkout)",
+                target.nwo
+            ),
+        );
     }
     match probe.permission(&target.nwo) {
-        Permission::Write => Verdict::Allow(target.nwo.clone()),
-        Permission::Insufficient(what) => Verdict::Deny(format!(
-            "the credential in use cannot write to {} ({what}); Loom writes need WRITE",
-            target.nwo
-        )),
-        Permission::Unknown(why) => Verdict::Deny(format!(
-            "could not verify write permission on {} ({why}); refusing rather than guessing",
-            target.nwo
-        )),
+        Permission::Write => Decision {
+            verdict: Verdict::Allow(target.nwo.clone()),
+            class: None,
+            repo: Some(target.nwo.clone()),
+        },
+        Permission::Insufficient(what) => {
+            let class = if what == probe::NOT_IN_INSTALLATION {
+                RefusalClass::NotInInstallation
+            } else {
+                RefusalClass::InsufficientPermission
+            };
+            Decision::deny(
+                class,
+                repo,
+                format!(
+                    "the credential in use cannot write to {} ({what}); Loom writes need WRITE",
+                    target.nwo
+                ),
+            )
+        }
+        Permission::Unknown(why) => Decision::deny(
+            RefusalClass::Unverifiable,
+            repo,
+            format!(
+                "could not verify write permission on {} ({why}); refusing rather than guessing",
+                target.nwo
+            ),
+        ),
     }
 }
 
@@ -289,12 +350,17 @@ pub fn root_writable(root: &Path) -> Verdict {
 /// the caller's own writes use.
 #[must_use]
 pub fn root_writable_with(root: &Path, gh: &Path) -> Verdict {
+    root_decision_with(root, gh).verdict
+}
+
+/// [`root_writable_with`], keeping the refusal class for [`gate`].
+fn root_decision_with(root: &Path, gh: &Path) -> Decision {
     let remotes = remotes_cached(root);
     let origin = target::origin_nwo(&remotes);
     let probe = probe_for_root(root, gh);
     let managed = |r: &str| is_managed(root, origin.as_deref(), r);
     let gh_repo = std::env::var("GH_REPO").ok();
-    let verdict = decide(
+    let decision = decide_classified(
         &Inputs {
             target: target::gh_target(&remotes, gh_repo.as_deref()),
             explicit: false,
@@ -303,11 +369,11 @@ pub fn root_writable_with(root: &Path, gh: &Path) -> Verdict {
         },
         probe.as_ref(),
     );
-    match (&verdict, std::env::var("LOOM_REPO").ok()) {
+    match (&decision.verdict, std::env::var("LOOM_REPO").ok()) {
         (Verdict::Allow(t), Some(o)) if !o.trim().is_empty() && !eq(t, o.trim()) => {
-            repo_writable_with(root, &o, gh)
+            repo_decision_with(root, &o, gh)
         }
-        _ => verdict,
+        _ => decision,
     }
 }
 
@@ -323,12 +389,21 @@ pub fn repo_writable(root: &Path, repo: &str) -> Verdict {
 /// [`repo_writable`] with the permission probe run through `gh`.
 #[must_use]
 pub fn repo_writable_with(root: &Path, repo: &str, gh: &Path) -> Verdict {
+    repo_decision_with(root, repo, gh).verdict
+}
+
+/// [`repo_writable_with`], keeping the refusal class for [`gate`].
+fn repo_decision_with(root: &Path, repo: &str, gh: &Path) -> Decision {
     let Some(nwo) = target::nwo_from_repo_arg(repo) else {
-        return Verdict::Deny(format!("`{repo}` is not an OWNER/REPO"));
+        return Decision::deny(
+            RefusalClass::NoTarget,
+            None,
+            format!("`{repo}` is not an OWNER/REPO"),
+        );
     };
     let origin = target::origin_nwo(&remotes_cached(root));
     let managed = |r: &str| is_managed(root, origin.as_deref(), r);
-    decide(
+    decide_classified(
         &Inputs {
             target: Some(GhTarget {
                 nwo,
@@ -342,10 +417,54 @@ pub fn repo_writable_with(root: &Path, repo: &str, gh: &Path) -> Verdict {
     )
 }
 
+/// A non-secret identity for the credential a write from `root` would carry:
+/// its kind, or the registered per-owner config directory's name. Never a
+/// token or any part of one (#12168).
+fn credential_identity(root: &Path) -> String {
+    if crate::forge_cmd::detect_forge(Some(root)) == crate::forge_cmd::ForgeType::Gitea {
+        return "gitea".into();
+    }
+    match crate::credential_preflight::gh_config_dir_for_root(root)
+        .as_deref()
+        .and_then(Path::file_name)
+    {
+        Some(dir) => format!("gh-config:{}", dir.to_string_lossy()),
+        None => "gh-process-default".into(),
+    }
+}
+
+/// Emit one `write_scope.refused` record for a refused daemon-pass write
+/// (#12168). Not deduplicated: the record is the count. A no-op without a
+/// registered ops sink, and skipped when the build provenance is not valid.
+fn emit_refused(root: &Path, decision: &Decision, what: &str) {
+    let Some(reason) = decision.class else {
+        return;
+    };
+    let loom = crate::telemetry::provenance::Provenance::current();
+    if !loom.is_valid() {
+        return;
+    }
+    crate::observability::ops::emit_record(crate::telemetry::TelemetryRecord::WriteScopeRefused(
+        WriteScopeRefusedRecord {
+            repo: decision.repo.clone(),
+            credential: credential_identity(root),
+            call_site: what.to_owned(),
+            reason,
+            refused_at: chrono::Utc::now(),
+            loom,
+        },
+    ));
+}
+
 /// Log a refusal at `warn` once per change of reason per `key`, and its
 /// clearing at `info`, so a denied workspace costs one log line, not one per
-/// tick. Returns whether to proceed.
-fn gate(key: String, verdict: &Verdict, what: &str) -> bool {
+/// tick. Every refusal, however, emits a `write_scope.refused` record (#12168).
+/// Returns whether to proceed.
+fn gate(key: String, root: &Path, decision: &Decision, what: &str) -> bool {
+    let verdict = &decision.verdict;
+    if !verdict.is_allowed() {
+        emit_refused(root, decision, what);
+    }
     static LAST: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
     let Ok(mut last) = last.lock() else {
@@ -378,14 +497,15 @@ pub fn gate_root(root: &Path, what: &str) -> bool {
 
 /// [`root_writable_with`] as a gate, for a pass that writes through `gh`.
 pub fn gate_root_with(root: &Path, gh: &Path, what: &str) -> bool {
-    gate(root.display().to_string(), &root_writable_with(root, gh), what)
+    gate(root.display().to_string(), root, &root_decision_with(root, gh), what)
 }
 
 /// [`repo_writable_with`] as a gate, for a pass that writes through `gh`.
 pub fn gate_repo_with(root: &Path, repo: &str, gh: &Path, what: &str) -> bool {
     gate(
         format!("{} -> {repo}", root.display()),
-        &repo_writable_with(root, repo, gh),
+        root,
+        &repo_decision_with(root, repo, gh),
         what,
     )
 }
