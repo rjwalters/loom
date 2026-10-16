@@ -175,7 +175,7 @@ fn single_workspace_tick_moves_a_red_main_fix_first_only_while_main_is_red() {
     ] {
         let mut dispatcher = RecordingDispatcher::default();
         let src = &mut FakeSource::once(items());
-        tick_with_lanes(src, &mut dispatcher, (10.into(), usize::MAX), false, false, lane).unwrap();
+        tick_with_lanes(src, &mut dispatcher, 10, false, lane).unwrap();
         assert_eq!(dispatcher.dispatched, want, "{lane:?}");
     }
 }

@@ -799,62 +799,6 @@ async fn registry_evidence_is_scoped_to_the_workspace_root_that_emitted_the_even
 // handle is a process-wide `OnceLock` shared by every test in this
 // binary, so mutating it here would leak into unrelated tests.
 
-fn breaker_snapshot(
-    phase: crate::host_breaker::BreakerPhase,
-    reason: Option<&str>,
-) -> crate::host_breaker::BreakerSnapshot {
-    crate::host_breaker::BreakerSnapshot {
-        enabled: true,
-        phase,
-        suppressed: phase.suppresses_dispatch(),
-        reason: reason.map(str::to_string),
-        tripped_at: None,
-        releases_at: None,
-        last_load_per_core: Some(4.24),
-        load_per_core_threshold: 2.5,
-        sustain_ticks: 3,
-        cooldown_secs: 300,
-        consecutive_over: 3,
-    }
-}
-
-#[test]
-fn dispatch_halt_from_breaker_reports_not_halted_when_no_breaker_registered() {
-    assert_eq!(dispatch_halt_from_breaker(None, None), (false, None));
-}
-
-#[test]
-fn dispatch_halt_from_breaker_reports_not_halted_when_closed() {
-    let snapshot = breaker_snapshot(crate::host_breaker::BreakerPhase::Closed, None);
-    assert_eq!(dispatch_halt_from_breaker(Some(snapshot), None), (false, None));
-}
-
-#[test]
-fn dispatch_halt_from_breaker_reports_halted_with_reason_when_open() {
-    let snapshot = breaker_snapshot(
-        crate::host_breaker::BreakerPhase::Open,
-        Some("load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)"),
-    );
-    assert_eq!(
-        dispatch_halt_from_breaker(Some(snapshot), None),
-        (
-            true,
-            Some("load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)".to_string())
-        )
-    );
-}
-
-#[test]
-fn dispatch_halt_from_breaker_reports_halted_during_cooldown() {
-    let snapshot = breaker_snapshot(
-        crate::host_breaker::BreakerPhase::CoolDown,
-        Some("load-per-core 1.10 < 2.50; cooling down for 300s"),
-    );
-    let (halted, reason) = dispatch_halt_from_breaker(Some(snapshot), None);
-    assert!(halted, "CoolDown still suppresses dispatch, so it must count as halted");
-    assert!(reason.is_some());
-}
-
 #[tokio::test]
 async fn collect_managed_repos_reports_every_provisioned_registrys_repo_even_when_idle() {
     // Registered but never dispatched into: this is the exact "idle
@@ -1159,12 +1103,9 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: vec![],
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: vec![],
         roles: roles_health,
         protection: None,
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),

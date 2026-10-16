@@ -11,7 +11,7 @@
 //! overage means even a subscription pool no longer hard-stops at one
 //! either). The dynamic cap is now `min(disk headroom, ram headroom,
 //! configured max)` — see
-//! [`crate::work_finder::resolve_dynamic_max_concurrent`]. This module's
+//! `crate::work_finder::resolve_dynamic_max_concurrent` (removed, #12406). This module's
 //! machinery ([`token_axis_limit`], [`assess_pressure`], the add-capacity
 //! advisory below) is **not** deleted: it still drives spawn-time account
 //! *selection* (prefer fresher/healthier accounts, skip exhausted/blocked
@@ -59,7 +59,7 @@
 //! #4344) so the reader and writer can never diverge onto different files.
 //! Reading that file keeps this module a fast, non-blocking, filesystem-only
 //! read that matches the footing of [`crate::tokens::token_pool_size`] and
-//! [`crate::disk_headroom::disk_headroom_limit`].
+//! `crate::disk_headroom::disk_headroom_limit` (removed, #12406).
 //!
 //! # Near-ceiling granularity
 //!

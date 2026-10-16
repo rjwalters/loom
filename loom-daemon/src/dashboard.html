@@ -397,12 +397,11 @@ function renderQueue(report) {
 function renderCapacity(report) {
   var body = document.getElementById("capacity-body");
   body.innerHTML = "";
-  // The dynamic cap is min(disk headroom, configured max). The RAM headroom
-  // term was removed in #12330 and the token axis / per-token-concurrency
-  // factor in #5743; `report.capacity.token_axis_limit` remains available
-  // elsewhere on the report as an informational account-health figure only.
+  // The cap is the configured max and nothing else (#12406: the disk, RAM,
+  // token and CPU terms are all gone). `report.capacity.token_axis_limit`
+  // remains available elsewhere on the report as an informational
+  // account-health figure only.
   var terms = [
-    ["disk headroom", report.disk_headroom],
     ["configured max", report.configured_max],
   ];
   var minVal = terms.reduce(function (acc, t) {
