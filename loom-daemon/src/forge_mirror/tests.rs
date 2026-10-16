@@ -454,15 +454,17 @@ fn only_the_discovery_listings_name_the_mirror() {
         }
     }
     let expected: std::collections::BTreeSet<String> = [
-        // The two discovery listings (2am#4367 P5), and the step engine's
-        // all-open listing (#11897).
+        // The work finder's discovery listing (2am#4367 P5), and the step
+        // engine's all-open listing (#11897).
         "work_finder/forge.rs",
-        "observability/ops/stage_dwell.rs",
         "step_dispatch/listing.rs",
         // The fleet worklist backend (#12306): one discovery read per tick,
         // never a claim, label-transition or merge read (invariant 3), so it
         // does not go through `forge_mirror::discovery`. Its tests drive the
         // mirror's client and `set_active`.
+        // The chain (#12311) reads `forge.mirror` to know whether a mirror is
+        // configured; it makes no read.
+        "discovery/chain.rs",
         "discovery/mirror.rs",
         "discovery/tests.rs",
         "discovery/worklist.rs",
@@ -491,14 +493,6 @@ fn only_the_discovery_listings_name_the_mirror() {
     assert_eq!(count("work_finder/forge.rs", "poll_gate::ReadKind::Discovery,"), 1);
     assert_eq!(count("work_finder/forge.rs", "Caller::"), 1);
     assert_eq!(
-        count("observability/ops/stage_dwell.rs", "mirror_listing("),
-        2,
-        "the helper and its caller"
-    );
-    // `mirror_listing` (stage dwell) and `mirror_hold_rows` (hold gauges, #12038).
-    assert_eq!(count("observability/ops/stage_dwell.rs", "poll_gate::ReadKind::Discovery,"), 2);
-    assert_eq!(count("observability/ops/stage_dwell.rs", "Caller::"), 2);
-    assert_eq!(
         count("step_dispatch/listing.rs", "mirror_rows"),
         2,
         "the helper and its one use"
@@ -508,19 +502,12 @@ fn only_the_discovery_listings_name_the_mirror() {
     assert_eq!(count("step_dispatch/listing.rs", "Caller::StepEngine,"), 1);
     assert_eq!(count("step_dispatch/listing.rs", "Caller::"), 1);
     // Only the step engine lists with no label.
-    for (rel, listings) in [
-        ("work_finder/forge.rs", 1),
-        ("observability/ops/stage_dwell.rs", 2),
-    ] {
-        assert_eq!(count(rel, "Some(label),"), listings, "{rel} lists one label per listing");
-    }
-    // And of those, only the three listings call the listing.
+    assert_eq!(count("work_finder/forge.rs", "Some(label),"), 1, "work_finder lists one label");
+    // And of those, only the two listings call the listing.
     for rel in &users {
         let text = std::fs::read_to_string(src.join(rel)).unwrap();
         let lists = text.contains("list_open(") && text.contains("forge_mirror::discovery");
-        let allowed = rel == "work_finder/forge.rs"
-            || rel == "observability/ops/stage_dwell.rs"
-            || rel == "step_dispatch/listing.rs";
+        let allowed = rel == "work_finder/forge.rs" || rel == "step_dispatch/listing.rs";
         assert!(!lists || allowed, "{rel} calls the mirror listing");
         if allowed {
             assert!(text.contains("ReadKind::Discovery"), "{rel} must ask as a discovery read");

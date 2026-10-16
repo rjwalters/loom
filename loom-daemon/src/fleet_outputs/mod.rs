@@ -20,8 +20,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::observability::captain_gauges::{self as gauges, QUEUE_BLOCKED_JOB, STAGE_DWELL_JOB};
-
 #[cfg(test)]
 mod registry_tests;
 #[cfg(test)]
@@ -66,26 +64,23 @@ pub struct SingletonOutput {
     /// Record kind / heartbeat the job emits.
     pub record_kind: &'static str,
     pub scope: Scope,
-    /// Expected emission period; the deadline is `2 * cadence` unless
-    /// `deadline_override` is set.
+    /// Expected emission period; the deadline is `2 * cadence`.
     pub cadence: Duration,
     pub severity: Severity,
     /// Config toggles that must all be on for the job to run. The row is not
     /// evaluated while any is in [`OutputSource::disabled`].
     pub enabled_by: &'static [&'static str],
-    /// Explicit deadline when the producer's own staleness contract is not
-    /// `2 * cadence` (captain gauges: `maxAgeSecs`).
-    pub deadline_override: Option<Duration>,
 }
 
 impl SingletonOutput {
     /// Age beyond which the output is stale.
     #[must_use]
     pub fn deadline(&self) -> Duration {
-        self.deadline_override.unwrap_or(self.cadence * 2)
+        self.cadence * 2
     }
 }
 
+#[cfg(test)]
 const fn mins(m: u64) -> Duration {
     Duration::from_secs(m * 60)
 }
@@ -108,20 +103,6 @@ const fn job(
         cadence,
         severity: Severity::Critical,
         enabled_by,
-        deadline_override: None,
-    }
-}
-
-const fn gauge(
-    job_name: &'static str,
-    kind: &'static str,
-    enabled_by: &'static [&'static str],
-) -> SingletonOutput {
-    SingletonOutput {
-        deadline_override: Some(Duration::from_secs(
-            crate::observability::captain_gauges::DEFAULT_MAX_AGE_SECS as u64,
-        )),
-        ..job(job_name, kind, Scope::FleetWide, mins(10), enabled_by)
     }
 }
 
@@ -139,16 +120,6 @@ pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
             &[CI_TELEMETRY_KEY],
         )
     },
-    // Captain gauges: the per-job `as_of` in the `captain-gauges/v1`
-    // heartbeat, published every 600s by default.
-    // The deadline is the heartbeat's own `maxAgeSecs` (1800s), not 2x cadence
-    // (1200s): one missed publish puts `as_of` near 1500s and must not fire.
-    gauge(STAGE_DWELL_JOB, "captain-gauges/v1:stage-dwell", &[gauges::ENABLED_KEY]),
-    gauge(
-        QUEUE_BLOCKED_JOB,
-        "captain-gauges/v1:queue-blocked",
-        &[gauges::ENABLED_KEY, gauges::QUEUE_BLOCKED_KEY],
-    ),
     // Intake reconcile (#10924): the captain's pass over the registered repos
     // runs on the built-in default cadence (300 s) whether or not anything
     // was labelled — the LOOM_INTAKE_RECONCILE_INTERVAL_SECS override does

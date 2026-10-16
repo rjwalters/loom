@@ -42,6 +42,8 @@ fn host_health_with(brake: Option<AdmissionBrakeSummary>) -> TelemetryRecord {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     })
 }
 
