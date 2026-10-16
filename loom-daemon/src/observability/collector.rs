@@ -205,6 +205,7 @@ async fn run_collector(
                     {
                         let record =
                             host_status.step(&readings, host_status_started.elapsed().as_secs_f64());
+                        crate::host_status::publish(&record);
                         queue.offer(TelemetryEnvelope::new(
                             &host_id,
                             TelemetryRecord::HostStatus(record),
