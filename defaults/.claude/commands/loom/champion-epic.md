@@ -746,6 +746,14 @@ unrevised re-entries, linking the verdict comment that carries the tally. The to
 is a counted non-verdict, and the operator must be able to tell the two apart.
 
 ```bash
+# Portable sha256 — same fallback shape as the "Idempotency Guard for Unrevised
+# Epics" section above (`_sha256`, restated here so this block is self-contained
+# and does not depend on that section having already run in this shell).
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256
+  else cksum; fi
+}
 ESCALATE_MARKER="<!-- champion:epic-escalated -->"
 EVALUATIONS_TEXT=$(gh api "repos/{owner}/{repo}/issues/<number>/comments" --paginate \
   --jq '.[] | select(.body | contains("Champion Review: Epic Needs Revision")) | "- posted rejection: " + .html_url')
