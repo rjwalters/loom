@@ -3,7 +3,7 @@
 //!
 //! Every request has a short deadline ([`CALL_TIMEOUT`]), follows no
 //! redirect and uses no proxy (the server is on the tailnet). The calls run
-//! on a small runtime of their own, the same bridge `forge_mirror::client`
+//! on a small runtime of their own, the same bridge the forge mirror client
 //! uses for its synchronous callers: it is only built and spawned onto, never
 //! entered with `block_on`, so a call is safe from any thread, inside a tokio
 //! runtime or not.
