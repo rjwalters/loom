@@ -40,6 +40,19 @@ pub const PATHS: [&str; 4] = [HEARTBEAT_PATH, CLAIM_PATH, REFUSE_PATH, RELEASE_P
 /// outside fleet mode won the forge order. Every other reason drops the row.
 pub const REFUSE_CLAIM_LOST: &str = "claim_lost";
 
+/// The `refuse` reasons the captain counts by name (spec §5.4): the worker's
+/// existing refusal tokens. Any other token is counted as `other`, so a
+/// worker cannot grow the refusals metric's label set.
+pub const REFUSE_REASONS: [&str; 7] = [
+    REFUSE_CLAIM_LOST,
+    "already_closed",
+    "already_landed",
+    "claimed",
+    "head_moved",
+    "peer_active",
+    "backstop_hold",
+];
+
 /// One step the host runs, granted or not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveStep {

@@ -1143,6 +1143,22 @@ impl SweepRegistry {
         live.len() + self.readvertise_step_claims()
     }
 
+    /// The fleet-dispatch heartbeat's share of this registry (#12450): its
+    /// live steps go to [`crate::fleet_dispatch::worker::on_reaper_tick`], which
+    /// sends the host's heartbeat when one is due. A no-op with the flag off.
+    pub fn fleet_dispatch_heartbeat(&self) {
+        let live: Vec<(String, u32, crate::step_role::StepRole)> = self
+            .entries
+            .values()
+            .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter_map(|info| match info.kind {
+                SweepKind::Step { item, role } => Some((info.sweep_id.clone(), item, role)),
+                SweepKind::Issue(_) | SweepKind::PrSet(_) => None,
+            })
+            .collect();
+        crate::fleet_dispatch::worker::on_reaper_tick(&self.config.workspace_root, &live);
+    }
+
     /// Evaluate this host's peer-coordination health at the current instant
     /// (Issue #6157) — called by the reaper on its own cadence, right after
     /// [`Self::readvertise_peer_claims`]. `None` when no view is attached

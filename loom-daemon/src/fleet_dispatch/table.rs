@@ -32,9 +32,9 @@
 //!    until every expected host (the roster hosts whose fleet config turns
 //!    fleet mode on, [`Table::set_expected`]) has heartbeated, whichever is
 //!    first;
-//! 2. `held` when a row holds the `(repo, item)`, unless it is this host's
-//!    own granted or live row, which is re-granted idempotently with the same
-//!    assignment id; or when any row holds the repo's `champion_merge` step;
+//! 2. `held` when another host's row (or a held row) holds the
+//!    `(repo, item)`, or when any other row holds the repo's
+//!    `champion_merge` step;
 //! 3. `not_eligible` when the step's role is not in the host's last reported
 //!    `roles_ok` (Phase 1 decides eligibility by `roles_ok` only; a step name
 //!    this build does not know has no role, so it is `not_eligible` too);
@@ -43,6 +43,19 @@
 //!    clamped by the fleet config, so a wrong report cannot hoard. A host
 //!    that has not heartbeated this epoch is bounded by `maxConcurrent`
 //!    alone, and refused when that is unknown too.
+//!
+//! # A claim on an item the host already holds
+//!
+//! Only a duplicate claim for the **same** `(item, step)` (spec §5.3) is an
+//! idempotent re-grant: the same assignment id, the row renewed, no policy
+//! check (the row already passed it). A claim for a **different** step on an
+//! item the host holds is a new assignment: it runs the whole policy path
+//! above (the one-`champion_merge`-per-repo lock, `roles_ok` and the cap,
+//! counting the replaced row out of the cap), and only when granted replaces
+//! the old row under a fresh assignment id. A refusal leaves the old row as
+//! it was. The step on a row is never rewritten by a claim, so a host whose
+//! `release` was lost cannot turn a stale `judge` row into a `champion_merge`
+//! grant that skipped both the merge lock and its own `roles_ok`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -399,21 +412,26 @@ impl Table {
             return refused(RefusalReason::Grace, None, now.secs_until(end, 1));
         }
         let key = (repo.to_string(), item);
+        // Whether this claim replaces the host's own row on the item with a
+        // different step (see the module docs).
+        let mut replaces_own = false;
         if let Some(row) = self.rows.get_mut(&key) {
-            let own = row.host.as_deref() == Some(host);
-            if own && row.state != RowState::Held {
-                // Idempotent: the same host asking again for an item it
-                // holds gets the same assignment id back, renewed.
+            let own = row.host.as_deref() == Some(host) && row.state != RowState::Held;
+            if own && row.step == step {
+                // Idempotent: the same host asking again for the same
+                // (item, step) gets the same assignment id back, renewed.
                 row.deadline = row.deadline.max(now.plus(self.policy.assignment_ttl));
-                row.step = step.to_string();
                 return ClaimDecision::Granted {
                     assignment_id: row.assignment_id.clone(),
                     ttl_s: self.policy.assignment_ttl.as_secs(),
                     renewed: true,
                 };
             }
-            let retry = now.secs_until(row.deadline, 1).min(HELD_RETRY_MAX_SECS);
-            return refused(RefusalReason::Held, row.host.clone(), retry);
+            if !own {
+                let retry = now.secs_until(row.deadline, 1).min(HELD_RETRY_MAX_SECS);
+                return refused(RefusalReason::Held, row.host.clone(), retry);
+            }
+            replaces_own = true;
         }
         let Ok(parsed) = step.parse::<StepRole>() else {
             return refused(RefusalReason::NotEligible, None, NOT_ELIGIBLE_RETRY_SECS);
@@ -423,7 +441,7 @@ impl Table {
             if let Some(row) = self
                 .rows
                 .iter()
-                .find(|((r, _), row)| r == repo && row.step == merge)
+                .find(|(k, row)| k.0 == repo && row.step == merge && **k != key)
                 .map(|(_, row)| row)
             {
                 let retry = now.secs_until(row.deadline, 1).min(HELD_RETRY_MAX_SECS);
@@ -442,9 +460,13 @@ impl Table {
             (Some(r), None) => Some(r),
             (None, m) => m,
         };
-        let held = self.held_by(host);
+        // The row being replaced frees its slot for the new step.
+        let held = self.held_by(host).saturating_sub(u32::from(replaces_own));
         if limit.is_none_or(|l| held >= l) {
             return refused(RefusalReason::Cap, None, CAP_RETRY_SECS);
+        }
+        if replaces_own {
+            self.remove(&key);
         }
         let id = self.new_id("a");
         self.insert(

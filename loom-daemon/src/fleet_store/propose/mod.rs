@@ -71,7 +71,7 @@ pub struct Proposal {
     pub branch: String,
     /// PR title.
     pub title: String,
-    /// PR body, including the hidden provenance marker.
+    /// PR body.
     pub body: String,
     /// The files it changes. Never empty — a proposal with nothing to change
     /// is not opened at all (the caller reports "nothing to propose" before

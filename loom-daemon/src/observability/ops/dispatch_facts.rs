@@ -247,6 +247,16 @@ pub fn fallback_repo_ref(root: &Path) -> Option<QueueRepoRef> {
     Some(QueueRepoRef { repo, visibility })
 }
 
+/// `root`'s `owner/name`, through the collector's cache, else
+/// [`fallback_repo_ref`]; never a forge call (#12450's claim names its repo
+/// with it).
+#[must_use]
+pub fn repo_for_root(root: &Path) -> Option<String> {
+    super::super::repo_ref::cached_repo_ref(&root.display().to_string())
+        .or_else(|| fallback_repo_ref(root))
+        .map(|r| r.repo)
+}
+
 /// The held repos of the work finder's last tick, each named through the
 /// collector's cache, else [`fallback_repo_ref`].
 #[must_use]
