@@ -36,6 +36,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::outcome_ledger::{self, PostState};
+use super::session_ledger;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_ledger::StepRun;
 use crate::sweep_registry::step_spawn::ended::{self, EndedStep};
@@ -172,6 +173,10 @@ pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
             .map(|(labels, closed)| post_state(step.role, &labels, closed))
         });
         let run = run_of(&step, outcome_line(&step).as_ref(), post);
+        // #11913: the step's session, for a later step on the same item.
+        if let Some(noted) = session_ledger::take_session(root, &step.sweep_id) {
+            session_ledger::record_ended(root, step.item, step.role, &noted, chrono::Utc::now());
+        }
         log::info!(
             "work_finder: {} step on #{} ({}) classified {} {}",
             step.role,
