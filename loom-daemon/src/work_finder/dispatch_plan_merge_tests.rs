@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::types::{HostPlanRow, PlanShard, PlanState};
+use crate::work_finder::step_item::Step;
 
 /// The fixture, verbatim. `include_str!` (not a runtime read) so the test
 /// binary carries it and a moved fixture is a compile error, the same way
@@ -33,9 +34,17 @@ struct Case {
 struct ExpectedItem {
     repo: String,
     issue: u32,
+    /// The item's step by wire name; an expected item without one is a
+    /// `builder` item (Issue #11910), as a plan row without one is.
+    #[serde(default = "builder")]
+    step: String,
     plan_state: PlanState,
     primary: String,
     others: Vec<String>,
+}
+
+fn builder() -> String {
+    "builder".into()
 }
 
 impl ExpectedItem {
@@ -43,6 +52,7 @@ impl ExpectedItem {
         ExpectedItem {
             repo: item.repo.clone(),
             issue: item.issue,
+            step: item.step.name(),
             plan_state: item.plan_state,
             primary: item.primary.host_id.clone(),
             others: item.others.iter().map(|o| o.host_id.clone()).collect(),
@@ -140,4 +150,44 @@ fn the_fold_key_is_repo_and_issue_not_the_issue_number_alone() {
     let merged = merge_plans(&hosts);
     assert_eq!(merged.items.len(), 2);
     assert!(merged.items.iter().all(|i| i.others.is_empty()));
+}
+
+/// Issue #11910: the merged item carries the resolved step, and an older
+/// host's row (no `step`) folds into the same item as a newer host's explicit
+/// `builder` row rather than standing beside it.
+#[test]
+fn an_absent_step_and_an_explicit_builder_step_are_one_item() {
+    let row = |step: Option<PlanStep>| HostPlanRow {
+        repo: "acme/one".into(),
+        issue: 42,
+        plan: RowPlan {
+            position: Some(1),
+            plan_state: PlanState::Queued,
+            step,
+            ..RowPlan::default()
+        },
+    };
+    let hosts = vec![
+        HostPlan {
+            host_id: "host-old".into(),
+            shard: PlanShard::default(),
+            rows: vec![row(None)],
+        },
+        HostPlan {
+            host_id: "host-new".into(),
+            shard: PlanShard::default(),
+            rows: vec![row(Some(PlanStep::Known(Step::Builder)))],
+        },
+    ];
+    let merged = merge_plans(&hosts);
+    assert_eq!(merged.items.len(), 1);
+    assert_eq!(merged.items[0].step, PlanStep::Known(Step::Builder));
+    assert_eq!(merged.items[0].others.len(), 1);
+    // Each observation is carried verbatim: the old host's row still has no
+    // `step` of its own.
+    let old = std::iter::once(&merged.items[0].primary)
+        .chain(&merged.items[0].others)
+        .find(|o| o.host_id == "host-old")
+        .unwrap();
+    assert_eq!(old.plan.step, None);
 }

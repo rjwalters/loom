@@ -181,6 +181,48 @@ fn a_halted_skip_carries_only_a_closed_vocabulary_cause() {
         && k.disposition == Some(QueueDisposition::WorkspaceHalted)));
 }
 
+/// #11858: an already-landed skip names its evidence, closed vocabulary only.
+#[test]
+fn an_already_landed_skip_carries_only_its_evidence_token() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::AlreadyLanded),
+        (2, QueueDisposition::AlreadyLanded),
+        (3, QueueDisposition::AlreadyLanded),
+    ]);
+    s.queue[0].detail = Some("journal_landed".to_string());
+    s.queue[1].detail = Some("forge_closed".to_string());
+    s.queue[2].detail = Some("landed by a free-text reason".to_string());
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    let details: Vec<Option<&str>> = r.skipped.iter().map(|k| k.detail.as_deref()).collect();
+    assert_eq!(details, vec![Some("journal_landed"), Some("forge_closed"), None]);
+}
+
+/// #11857: the outcome agrees with the tick result. A hold that covered the
+/// tick's work reads `halted`; one held root beside a healthy repo with
+/// candidates is a partial hold and the outcome follows the rows.
+#[test]
+fn a_partial_hold_is_not_a_halted_outcome() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::WorkspaceHalted),
+        (2, QueueDisposition::OpenPr),
+    ]);
+    s.halted = true;
+    s.held_roots = 1;
+    s.halt_partial = true;
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "none_dispatched");
+
+    s.queue.clear();
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "idle");
+
+    // A full hold still reads `halted`, as does a pre-#11857 summary that
+    // carries no `halt_partial` (the old meaning of `halted`).
+    s.halt_partial = false;
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "halted");
+}
+
 /// Role ticks have no work-finder disposition: the fields stay absent.
 #[test]
 fn a_role_skip_carries_no_disposition() {
@@ -267,6 +309,8 @@ fn an_empty_role_tick_records_cadence_with_no_candidates() {
     assert_eq!(r.role, "curator");
     assert_eq!(r.candidate_source, "none", "nothing observed");
     assert!(!r.decisions_observed);
+    // #11858: an empty queue still names its repo.
+    assert_eq!(r.repo.as_deref(), Some("o/r"));
 }
 
 fn gate_only(gate: Vec<(String, Vec<GateRow>)>) -> RoleObservation {
@@ -477,6 +521,7 @@ fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
         author_association: None,
         is_pull_request: is_pr,
         open_sub_issues: None,
+        labels_at: None,
     };
     let root = Path::new("/stash-test/a");
     record_gate_listing(
@@ -722,4 +767,136 @@ fn lane_plan_is_stashed_converted_and_drained_once() {
     assert!(take_lane_plan().is_empty(), "drained");
     let json = serde_json::to_value(&lanes).unwrap();
     assert_eq!(json[0]["debt"], 60);
+}
+
+#[test]
+fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
+    use crate::step_dispatch::item_draw::{
+        weight_terms, AgeSource, Candidate, DrawRecord, DrawTerms, Exclusion, ItemDraw,
+        ItemWeights, PoolKnobs, RepoDrawTerms, RepoTerms, SeedKey,
+    };
+    use crate::work_finder::step_item::{Item, ItemState, Lane, PassReason, Step, Verdict};
+    let picked = Candidate {
+        workspace_idx: 4,
+        item: Item {
+            issue: Some(7),
+            pr: Some(8),
+            state: ItemState::ReviewRequested,
+            verdict: Verdict::Step(Step::Judge),
+            lane: Lane::Normal,
+            send_back: false,
+        },
+        step: Step::Judge,
+        terms: weight_terms(
+            &ItemWeights::default(),
+            Lane::Normal,
+            crate::priority_pick::Level::Important,
+            30 * 1440,
+            AgeSource::Mirror,
+        ),
+    };
+    let draw = ItemDraw::new(
+        vec![picked.clone()],
+        std::collections::BTreeMap::from([(
+            4,
+            RepoTerms {
+                weight: 6,
+                in_flight: 2,
+            },
+        )]),
+        PoolKnobs {
+            backlog_exponent: 0.5,
+            busy_exponent: 1.0,
+        },
+        SeedKey {
+            minute: 29_000_000,
+            host: "host-a".into(),
+            tick_counter: 17,
+        },
+    );
+    let excluded = std::collections::BTreeMap::from([
+        (Exclusion::Pass(PassReason::Claimed), 2),
+        (Exclusion::PoolExhausted, 1),
+    ]);
+    let workspaces = [ItemDrawWorkspace {
+        idx: 4,
+        repo: "o/r",
+        excluded: &excluded,
+    }];
+    let nothing = ItemDrawPool {
+        draw: &draw,
+        draws: &[],
+        overflow: false,
+    };
+    assert!(item_draw_record(1, "h", 2, &[], &nothing).is_none());
+    assert!(
+        item_draw_record(1, "h", 2, &workspaces, &nothing).is_none(),
+        "no draw, no record"
+    );
+    let draws = [DrawRecord {
+        draw_index: 0,
+        seed: 99,
+        pool_size: 3,
+        total_weight: 1_000_000,
+        roll: 5,
+        picked_index: 0,
+        picked: picked.clone(),
+        terms: DrawTerms {
+            weight: 250_000,
+            total_weight: 1_000_000,
+            repo: RepoDrawTerms {
+                weight: 6,
+                in_flight: 2,
+                items: 3,
+                pool_weight: 77,
+            },
+        },
+    }];
+    let d = item_draw_record(
+        29_000_000,
+        "host-a",
+        17,
+        &workspaces,
+        &ItemDrawPool {
+            draw: &draw,
+            draws: &draws,
+            overflow: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(d.seed_scheme, "loom-draw/v3");
+    assert_eq!(d.tick_counter, "17");
+    assert_eq!((d.backlog_exponent.as_str(), d.busy_exponent.as_str()), ("0.5", "1"));
+    assert_eq!(
+        (d.pools.len(), d.pools[0].pr, d.pools[0].weight, d.pools[0].repo.as_str()),
+        (1, Some(8), d.draws[0].weight, "o/r")
+    );
+    let repo = &d.repos[0];
+    assert_eq!((repo.repo.as_str(), repo.weight, repo.in_flight, repo.items), ("o/r", 6, 2, 1));
+    let step = &d.draws[0];
+    assert_eq!(step.number, 8, "a Judge step acts on the PR");
+    assert_eq!((step.priority, step.age_permille), (3, 2000));
+    assert_eq!((step.age_source.as_str(), step.step.as_str()), ("mirror", "judge"));
+    assert_eq!(
+        (
+            step.draw_weight,
+            step.repo_weight,
+            step.repo_items,
+            step.repo_pool_weight,
+            step.in_flight_repo
+        ),
+        (250_000, 6, 3, 77, 2)
+    );
+    let counts: Vec<(&str, PickSkipReason, usize)> = d
+        .excluded
+        .iter()
+        .map(|e| (e.reason.as_str(), e.skip_reason, e.count))
+        .collect();
+    assert_eq!(
+        counts,
+        vec![
+            ("claimed", PickSkipReason::InFlight, 2),
+            ("pool_exhausted", PickSkipReason::Quota, 1)
+        ]
+    );
 }

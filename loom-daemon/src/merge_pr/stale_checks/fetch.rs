@@ -1,83 +1,37 @@
-//! The live-forge inputs for the required-check freshness guard (#8248).
+//! The forge reads the surviving merge-pr verbs share: a base branch's
+//! required contexts and a head's check runs / workflow runs.
 //!
-//! Three read-only `gh` calls, REST-first exactly where the shell's
-//! `forge-helpers.sh` already treads, so the two implementations agree on API
-//! shape:
+//! These used to be the live inputs of the #8248 required-check freshness
+//! guard, which #12063 slice 1 deleted along with the re-date remedy (#8508)
+//! and the CI-run conclusion gate (#10444): required checks at the head are
+//! GitHub's to enforce. What stays is what `required-checks`,
+//! `checks-failure`, `zero-checks-settle`, `check-runs-rollup` and
+//! `forge wait-checks` still read, and it goes with them in slice 2.
 //!
-//! 1. **base tip** — `GET /repos/{nwo}/commits/{base_ref}`: the tip SHA and
-//!    its *committer* date (when the commit landed on the branch; the author
-//!    date of a squash merge is also the merge time, but a rebase merge's is
-//!    not, and committer date is the honest "when did this tip appear").
-//! 2. **required contexts** — the same TWO-source union
+//! 1. **required contexts** — the TWO-source union
 //!    `forge_get_required_status_check_contexts` builds (#8103): rulesets
 //!    (`GET /repos/{nwo}/rules/branches/{branch}`) and classic branch
-//!    protection (GraphQL `branchProtectionRule.requiredStatusCheckContexts`),
-//!    because a required check configured in either is invisible to the
-//!    other's API. A failure on EITHER source fails the whole lookup closed —
-//!    a surviving source's answer is a partial view, and a partial view of
-//!    what is required is not a safe input to a merge decision. The ONE
-//!    exception is the plan gate described in
-//!    [`is_plan_gated`]: a source GitHub refuses to serve because the
-//!    repository's plan does not include it cannot be holding rules.
-//! 3. **check runs** — `GET /repos/{nwo}/commits/{sha}/check-runs`
-//!    (`per_page=100` **and** `--paginate`, so the rows retrieved do not depend
-//!    on how many checks a repo happens to have), projecting
-//!    `name`/`status`/`conclusion`/`started_at` plus the Actions run/job ids —
-//!    and `total_count`, so a read short of the forge's own count fails closed
-//!    instead of yielding a subset (#8987, matching #8895's shell fix).
+//!    protection (GraphQL `branchProtectionRule.requiredStatusCheckContexts`,
+//!    or the REST branch summary when GraphQL is refused, #11855). A failure
+//!    on EITHER source fails the whole lookup closed, except the plan gate of
+//!    [`is_plan_gated`].
+//! 2. **check runs** — `GET /repos/{nwo}/commits/{sha}/check-runs`, fully
+//!    paginated, failing closed on a short read (#8987).
 //!
-//! Plus, for the input-scoped predicate (#8919), three more:
-//!
-//! 4. **`P`** — `GET /repos/{nwo}/pulls/{pr}/files` (paginated).
-//! 5. **`B`** — `GET /repos/{nwo}/actions/jobs/{job}/logs`, parsed by
-//!    [`parse_tested_base`].
-//! 6. **`D`** — `GET /repos/{nwo}/compare/{B}...{tip}`, validated by
-//!    [`compare_usable`] and narrowed by [`strip_validated_restamps`].
-//!
-//! And, ONLY when the side in question touched `.github/workflows/ci.yml`, up
-//! to two more per side for #9065's block attribution: the workflow text at
-//! that side's tree (`GET /repos/{nwo}/contents/…?ref=…` — the base tip for
-//! `D`, the PR head for `P`), plus, on the `P` side, a second `pulls/{pr}/files`
-//! read for that one file's patch (which (4) deliberately does not carry). A
-//! merge that does not touch `ci.yml` pays for none of them, and every failure
-//! is [`CiScope::Unscoped`], i.e. the whole-file behaviour from before the
-//! narrowing existed.
-//!
-//! And, ONLY when a green required context with a usable base move has no
-//! built-in spec (a consumer repo, #9589), one read of the base tip's
-//! `.loom/stale-check-inputs.json` — see [`super::repo_specs`]. A 404 is
-//! "no declaration"; any other failure rejects it with a warning, which leaves
-//! those contexts exactly as strict as before.
-//!
-//! Everything in (1)–(3) is fallible I/O reporting `Err(reason)`; every caller
-//! outcome of an `Err` is "refuse the merge" (the guard's fail-closed
-//! contract), never "skip". (4)–(6) are different: a failure there is recorded
-//! as a per-context FALLBACK to the #8248 time rule, announced on stderr, so an
-//! install without `Actions: read` is no worse off than before #8919.
-//!
-//! Cost (#11418): (1), the rulesets half of (2) and (3) are conditional reads
-//! through the shared ETag store, (3) on the very entry `forge wait-checks`
-//! keeps; a tested base and a compare answer are kept once read ([`memo`]);
-//! every request is spaced, and a secondary-limit answer holds every later
-//! request on that credential until it clears ([`budget`]).
+//! Cost (#11418): the rulesets read and the check runs are conditional reads
+//! through the shared ETag store, every request is spaced, and a
+//! secondary-limit answer holds every later request on that credential until
+//! it clears ([`budget`]).
 
-use super::evidence::{
-    compare_usable, parse_tested_base, strip_validated_restamps, to_file_set, ChangedFile,
-};
-use super::inputs::{BaseMove, ScopedEvidence, CI_WORKFLOW};
-use super::repo_specs::{RepoSpecs, DECLARATION_PATH};
-use super::workflow_scope::{self, CiScope, Workflow};
 use super::CheckRun;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
 
-use crate::forge_call_stats::{ops, ForgeOp};
+use crate::forge_call_stats::ForgeOp;
 use crate::forge_wait_checks::reads::{GhReads, ReadError};
 use crate::gh_invocation::gh_bin;
 use std::path::{Path, PathBuf};
 
 mod budget;
-mod memo;
 
 /// The facade operation and ledger caller of every read here.
 pub const CALLER: &str = "merge_guard.stale_checks";
@@ -167,23 +121,6 @@ fn gh_api(gh: &str, nwo: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// What the decision needs from the forge.
-pub struct LiveInputs {
-    pub tip_sha: String,
-    pub base_tip: DateTime<Utc>,
-    pub required: Vec<String>,
-    pub runs: Vec<CheckRun>,
-    /// Degradations the caller must SAY OUT LOUD but that do not change the
-    /// verdict — the plan gate of [`is_plan_gated`], and any per-context
-    /// fallback to the #8248 time rule. A relaxation nobody can see is how a
-    /// fail-open ships unnoticed.
-    pub notices: Vec<String>,
-    /// `P` plus per-context `B`/`D` for the input-scoped predicate (#8919), or
-    /// `None` when `P` itself could not be read — in which case EVERY context
-    /// falls back to the time rule.
-    pub scoped: Option<ScopedEvidence>,
-}
-
 /// Is this `gh` failure GitHub declining to serve a branch-protection source
 /// because the repository's PLAN does not include it (#8844)?
 ///
@@ -249,35 +186,11 @@ fn split_nwo(nwo: &str) -> Result<(&str, &str), String> {
     Ok((owner, repo))
 }
 
-/// Resolve the base branch's current tip: its SHA and commit time.
-fn fetch_base_tip(
-    gh: &str,
-    nwo: &str,
-    base_ref: &str,
-    store: Option<&Path>,
-) -> Result<(String, DateTime<Utc>), String> {
-    let url = format!("repos/{nwo}/commits/{base_ref}");
-    let body = conditional(gh, nwo, store, |r| r.read(&url, ops::GIT_DEFAULT_BRANCH_HEADS))?;
-    let v: serde_json::Value = serde_json::from_str(body.trim())
-        .map_err(|e| format!("base branch '{base_ref}' commit was not JSON: {e}"))?;
-    let sha = v.get("sha").and_then(|s| s.as_str()).unwrap_or("").trim();
-    let date = v
-        .pointer("/commit/committer/date")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .trim();
-    if sha.is_empty() || date.is_empty() {
-        return Err(format!("base branch '{base_ref}' resolved to an empty SHA or committer date"));
-    }
-    Ok((sha.to_string(), parse_iso("base tip commit time", date)?))
-}
-
-/// [`fetch_required`] on its own, for a caller that needs ONLY the base
-/// branch's required-context set — #9091's zero-row settle discriminator, which
-/// has no use for the base tip, the check-runs rollup, or the scoped evidence
-/// [`live_inputs`] also gathers.
+/// [`fetch_required`] for a caller that needs the base branch's
+/// required-context set — #9091's zero-row settle discriminator, `required-checks`
+/// and `forge wait-checks`.
 ///
-/// Shared rather than reimplemented so the two guards can never disagree about
+/// Shared rather than reimplemented so the callers can never disagree about
 /// what a given base branch requires: `Ok(vec![])` means "provably requires
 /// nothing" (including the plan-gated case, per [`is_plan_gated`]) and `Err`
 /// means "could not find out", a distinction both callers fail closed on in
@@ -320,6 +233,71 @@ fn ruleset_contexts(body: &str) -> Result<Vec<String>, String> {
         .filter_map(|c| c.get("context").and_then(|s| s.as_str()))
         .map(String::from)
         .collect())
+}
+
+/// The classic-protection read REST serves to any reader (#11855).
+const BRANCH_OP: ForgeOp =
+    ForgeOp::uninventoried("branch protection summary read by the freshness guard");
+
+/// Classic branch protection's required contexts from the REST branch summary
+/// (`GET /repos/{nwo}/branches/{branch}`, #11855), the fallback for a refused
+/// GraphQL `branchProtectionRule` read. Conditional like the rulesets read.
+fn classic_from_branch(
+    gh: &str,
+    nwo: &str,
+    base_ref: &str,
+    store: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let url = format!("repos/{nwo}/branches/{base_ref}");
+    let body = conditional(gh, nwo, store, |r| r.read(&url, BRANCH_OP))?;
+    branch_protection_contexts(&body)
+}
+
+/// The contexts a `branches/{ref}` answer's `protection` summary requires
+/// (`contexts` plus `checks[].context`, de-duplicated). An unprotected branch
+/// requires none. A protected branch whose answer carries no `protection`
+/// object, or a `protection` with no `required_status_checks` object (GitHub
+/// always sends one, `enforcement_level: "off"` when unused), is an `Err`:
+/// the summary was withheld, not empty, and the caller fails closed on it.
+pub(crate) fn branch_protection_contexts(body: &str) -> Result<Vec<String>, String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| format!("branch response was not JSON: {e}"))?;
+    let protected = v
+        .get("protected")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("branch response has no `protected` flag")?;
+    let Some(protection) = v.get("protection").filter(|p| p.is_object()) else {
+        return if protected {
+            Err("branch is protected but its `protection` summary was withheld".into())
+        } else {
+            Ok(Vec::new())
+        };
+    };
+    let checks = Some(
+        protection
+            .get("required_status_checks")
+            .filter(|c| c.is_object())
+            .ok_or("branch protection summary has no `required_status_checks`")?,
+    );
+    let named = checks
+        .and_then(|c| c.get("contexts"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str);
+    let by_app = checks
+        .and_then(|c| c.get("checks"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("context").and_then(serde_json::Value::as_str));
+    let mut out: Vec<String> = Vec::new();
+    for ctx in named.chain(by_app) {
+        if !ctx.trim().is_empty() && !out.iter().any(|s| s == ctx) {
+            out.push(ctx.to_string());
+        }
+    }
+    Ok(out)
 }
 
 /// Required status check contexts, unioned across rulesets and classic branch
@@ -375,7 +353,22 @@ fn fetch_required(
             notices.push(plan_gated_notice("classic branch-protection", base_ref, &e));
             String::new()
         }
-        Err(e) => return Err(format!("classic branch-protection lookup failed: {e}")),
+        // #11855: the GraphQL field needs `Administration: read`, which a
+        // read-only App token lacks ("Resource not accessible by
+        // integration"). The REST branch summary answers the same question
+        // with read access alone, so a refused GraphQL read is retried there
+        // before the lookup fails closed.
+        Err(e) => match classic_from_branch(gh, nwo, base_ref, store) {
+            Ok(contexts) => {
+                log::debug!("required contexts for {nwo}@{base_ref}: GraphQL failed ({e}); read the REST branch summary instead (#11855)");
+                contexts.join("\n")
+            }
+            Err(rest) => {
+                return Err(format!(
+                    "classic branch-protection lookup failed: {e}; REST branch fallback: {rest}"
+                ))
+            }
+        },
     };
 
     // Union, order-preserving, de-duplicated: a context can legitimately be
@@ -495,415 +488,6 @@ pub fn actions_job_id(app_slug: Option<&str>, details_url: Option<&str>) -> Opti
     let id = rest.split(['/', '?', '#']).next()?;
     id.parse::<u64>().ok()
 }
-
-/// One workflow job's log, as plain text. `gh api` follows GitHub's 302 to the
-/// log blob, so this is a single read. Actions logs carry ANSI colour codes,
-/// which `gh` refuses to print without `--allow-escape-sequences`; without it
-/// every read failed and the guard silently fell back to the time rule
-/// (#9057). A `gh` predating the flag rejects it, so retry without it.
-fn fetch_job_log(gh: &str, nwo: &str, job_id: u64) -> Result<String, String> {
-    let path = format!("repos/{nwo}/actions/jobs/{job_id}/logs");
-    match gh_api(gh, nwo, &[&path, "--allow-escape-sequences"]) {
-        Err(e) if crate::ci_telemetry::api::mentions_unknown_escape_flag(&e) => {
-            gh_api(gh, nwo, &[&path])
-        }
-        other => other,
-    }
-}
-
-/// `P` — the PR's own changed files, paginated, keeping removals and renames.
-fn fetch_pr_files(gh: &str, nwo: &str, pr: &str) -> Result<Vec<ChangedFile>, String> {
-    let out = gh_api(
-        gh,
-        nwo,
-        &[
-            &format!("repos/{nwo}/pulls/{pr}/files"),
-            "--paginate",
-            "--jq",
-            r#".[]? | [.filename, .status, (.previous_filename // "")] | @tsv"#,
-        ],
-    )?;
-    Ok(out
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            let mut cols = line.split('\t');
-            let path = cols.next().unwrap_or_default().to_string();
-            let status = cols.next().unwrap_or_default().to_string();
-            let prev = cols.next().unwrap_or_default();
-            ChangedFile {
-                path,
-                status,
-                previous_filename: (!prev.is_empty()).then(|| prev.to_string()),
-                // P is matched by path only; no patch is needed for it.
-                patch: None,
-            }
-        })
-        .collect())
-}
-
-/// `D` — `compare/B...tip`, with the compare's own `status` so
-/// [`compare_usable`] can refuse a diverged or truncated answer.
-fn fetch_compare(
-    gh: &str,
-    nwo: &str,
-    base: &str,
-    head: &str,
-) -> Result<(String, Vec<ChangedFile>), String> {
-    let out = gh_api(
-        gh,
-        nwo,
-        &[
-            &format!("repos/{nwo}/compare/{base}...{head}"),
-            "--jq",
-            "{status: .status, files: [.files[]? | {filename, status, previous_filename, patch}]}",
-        ],
-    )?;
-    let v: serde_json::Value =
-        serde_json::from_str(&out).map_err(|e| format!("compare response was not JSON: {e}"))?;
-    let status = v
-        .get("status")
-        .and_then(|s| s.as_str())
-        .ok_or("compare response had no status")?
-        .to_string();
-    let files = v
-        .get("files")
-        .and_then(|f| f.as_array())
-        .ok_or("compare response had no files array")?
-        .iter()
-        .map(|f| ChangedFile {
-            path: f
-                .get("filename")
-                .and_then(|s| s.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            status: f
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            previous_filename: f
-                .get("previous_filename")
-                .and_then(|s| s.as_str())
-                .map(String::from),
-            patch: f.get("patch").and_then(|s| s.as_str()).map(String::from),
-        })
-        .collect();
-    Ok((status, files))
-}
-
-/// The `.github/workflows/ci.yml` entry of `pulls/{n}/files`, with its patch —
-/// the `P` side of #9065's narrowing.
-///
-/// [`fetch_pr_files`] deliberately reads `P` by path alone (a patch per file
-/// over a large PR is a lot of payload for a set that is otherwise matched by
-/// name), so this is a second, narrower read issued **only** when `P` contains
-/// `ci.yml` at all. `--jq` emits at most one object, because a path appears at
-/// most once across the endpoint's pages; an empty answer is `Ok(None)`, which
-/// leaves the side unscoped.
-fn fetch_pr_ci_file(gh: &str, nwo: &str, pr: &str) -> Result<Option<ChangedFile>, String> {
-    let out = gh_api(
-        gh,
-        nwo,
-        &[
-            &format!("repos/{nwo}/pulls/{pr}/files"),
-            "--paginate",
-            "--jq",
-            &format!(r#".[]? | select(.filename == "{CI_WORKFLOW}") | {{status, patch}}"#),
-        ],
-    )?;
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let v: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|e| format!("the PR's ci.yml file entry was not JSON: {e}"))?;
-    Ok(Some(ChangedFile {
-        path: CI_WORKFLOW.to_string(),
-        status: v
-            .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        previous_filename: None,
-        patch: v.get("patch").and_then(|s| s.as_str()).map(String::from),
-    }))
-}
-
-/// Which components the **PR's own** `ci.yml` hunks are a global input for
-/// (#9065), attributed against the PR head's workflow — the tree
-/// `pulls/{n}/files`' patches diff *to*.
-///
-/// Costs two extra reads, and only on a PR that edits `ci.yml` at all. Every
-/// failure is [`CiScope::Unscoped`]: the whole-file `G` meaning, i.e. exactly
-/// the behaviour before this narrowing existed.
-fn pr_ci_scope(gh: &str, nwo: &str, pr: &str, head_sha: &str, pr_files: &[ChangedFile]) -> CiScope {
-    if !pr_files.iter().any(|f| f.path == CI_WORKFLOW) {
-        return CiScope::Unscoped;
-    }
-    let Ok(Some(file)) = fetch_pr_ci_file(gh, nwo, pr) else {
-        return CiScope::Unscoped;
-    };
-    let Ok(text) = fetch_workflow(gh, nwo, head_sha) else {
-        return CiScope::Unscoped;
-    };
-    workflow_scope::scope_for_files(&workflow_scope::parse(&text), &[file])
-}
-
-/// One revision's `.github/workflows/ci.yml`, as raw text.
-///
-/// Read only when that side actually touched that path, so the ordinary merge
-/// pays nothing for #9065's narrowing. The raw media type returns the file
-/// body directly rather than the base64 `content` field.
-fn fetch_workflow(gh: &str, nwo: &str, sha: &str) -> Result<String, String> {
-    gh_api(
-        gh,
-        nwo,
-        &[
-            "-H",
-            "Accept: application/vnd.github.raw",
-            &format!("repos/{nwo}/contents/{CI_WORKFLOW}?ref={sha}"),
-        ],
-    )
-}
-
-/// Which components a base move's `ci.yml` hunks are a global input for
-/// (#9065), memoising the tip's workflow across the (usually single) bases.
-///
-/// Every failure — an unreadable tip, a suppressed patch, an add/remove — is
-/// [`CiScope::Unscoped`], i.e. `ci.yml` keeps its whole-file `G` meaning. The
-/// narrowing can only ever be *skipped*, never mis-applied, so no notice is
-/// raised: unlike the fallbacks above, this direction is a tightening.
-fn ci_scope_for(
-    gh: &str,
-    nwo: &str,
-    tip_sha: &str,
-    files: &[ChangedFile],
-    cache: &mut Option<Result<Workflow, String>>,
-) -> CiScope {
-    if !files.iter().any(|f| f.path == CI_WORKFLOW) {
-        return CiScope::Unscoped;
-    }
-    let workflow = cache.get_or_insert_with(|| {
-        fetch_workflow(gh, nwo, tip_sha).map(|text| workflow_scope::parse(&text))
-    });
-    match workflow {
-        Ok(wf) => workflow_scope::scope_for_files(wf, files),
-        Err(_) => CiScope::Unscoped,
-    }
-}
-
-/// Gather `P` and, per green required context, `B` and `D` (#8919).
-///
-/// Every per-context failure is recorded in `fallbacks` rather than propagated:
-/// one context whose log is unreadable must not cost the other eighteen their
-/// input-scoped verdict. A failure to read `P` DOES return `None`, because
-/// without it no clause can be evaluated at all.
-///
-/// Reads are memoised per job id and per tested base, so the common case (all
-/// 19 required contexts in one `ci.yml` run, hence one `B`) costs one compare.
-fn scoped_evidence(
-    gh: &str,
-    nwo: &str,
-    pr: &str,
-    head_sha: &str,
-    tip_sha: &str,
-    required: &[String],
-    runs: &[CheckRun],
-) -> (Option<ScopedEvidence>, Vec<String>) {
-    let mut notices = Vec::new();
-    let pr_files = match fetch_pr_files(gh, nwo, pr) {
-        Ok(f) => f,
-        Err(e) => {
-            notices.push(format!(
-                "required-check freshness guard (#8919): could not read PR #{pr}'s changed files \
-({e}), so the input-scoped predicate cannot run for any required check"
-            ));
-            return (None, notices);
-        }
-    };
-    let mut ev = ScopedEvidence {
-        pr_delta: to_file_set(&pr_files),
-        pr_ci_scope: pr_ci_scope(gh, nwo, pr, head_sha, &pr_files),
-        ..ScopedEvidence::default()
-    };
-
-    let mut bases: HashMap<u64, Result<String, String>> = HashMap::new();
-    let mut moves: HashMap<String, Result<(super::inputs::FileSet, CiScope), String>> =
-        HashMap::new();
-    let mut workflow: Option<Result<Workflow, String>> = None;
-    let mut sorted: Vec<&String> = required.iter().collect();
-    sorted.sort();
-    sorted.dedup();
-
-    for ctx in sorted {
-        let Some(run) = super::latest_run(runs, ctx) else {
-            continue;
-        };
-        if !run.is_completed_success() {
-            continue;
-        }
-        let Some(job_id) = run.actions_job_id else {
-            ev.fallbacks.insert(
-                ctx.clone(),
-                "it is not a GitHub Actions job, so the base it tested cannot be read from a \
-workflow log"
-                    .to_string(),
-            );
-            continue;
-        };
-        let base = bases
-            .entry(job_id)
-            .or_insert_with(|| tested_base(gh, nwo, job_id, head_sha))
-            .clone();
-        let base = match base {
-            Ok(b) => b,
-            Err(why) => {
-                ev.fallbacks.insert(ctx.clone(), why);
-                continue;
-            }
-        };
-        if !moves.contains_key(&base) {
-            // Not `or_insert_with`: the ci.yml attribution needs a mutable
-            // borrow of the memoised workflow, which a closure cannot hold at
-            // the same time as the entry it is filling.
-            let computed = match compare_memoised(gh, nwo, &base, tip_sha) {
-                Err(e) => Err(format!("the base-move compare from {base} failed ({e})")),
-                Ok((status, files)) => compare_usable(&status, files.len()).map(|()| {
-                    let ci = ci_scope_for(gh, nwo, tip_sha, &files, &mut workflow);
-                    (to_file_set(&strip_validated_restamps(&files)), ci)
-                }),
-            };
-            moves.insert(base.clone(), computed);
-        }
-        let files = moves.get(&base).cloned().unwrap_or_else(|| {
-            Err("the base-move compare result went missing from the cache".to_string())
-        });
-        match files {
-            Ok((files, ci_scope)) => {
-                ev.base_moves.insert(
-                    ctx.clone(),
-                    BaseMove {
-                        tested_base: base,
-                        files,
-                        ci_scope,
-                    },
-                );
-            }
-            Err(why) => {
-                ev.fallbacks.insert(ctx.clone(), why);
-            }
-        }
-    }
-    // The per-repo declaration (#9589) is read only when some context with a
-    // usable base move has no built-in spec, so loom's own repo never pays.
-    if ev
-        .base_moves
-        .keys()
-        .any(|ctx| super::inputs::specs_for(ctx).is_none())
-    {
-        ev.repo_specs = RepoSpecs::from_fetch(fetch_declaration(gh, nwo, tip_sha));
-    }
-    (Some(ev), notices)
-}
-
-/// The base job `job_id` tested for `head_sha`: from [`memo`] when an earlier
-/// run read it (a finished job's log never changes), else from its log.
-fn tested_base(gh: &str, nwo: &str, job_id: u64, head_sha: &str) -> Result<String, String> {
-    if let Some(base) = memo::tested_base(nwo, job_id, head_sha) {
-        return Ok(base);
-    }
-    let base = fetch_job_log(gh, nwo, job_id)
-        .map_err(|e| format!("its job log could not be read ({e})"))
-        .and_then(|log| parse_tested_base(&log, head_sha))?;
-    memo::keep_tested_base(nwo, job_id, head_sha, &base);
-    Ok(base)
-}
-
-/// [`fetch_compare`], kept in [`memo`]: both ends are commit SHAs.
-fn compare_memoised(
-    gh: &str,
-    nwo: &str,
-    base: &str,
-    tip: &str,
-) -> Result<(String, Vec<ChangedFile>), String> {
-    if let Some(hit) = memo::compare(nwo, base, tip) {
-        return Ok(hit);
-    }
-    let (status, files) = fetch_compare(gh, nwo, base, tip)?;
-    memo::keep_compare(nwo, base, tip, &status, &files);
-    Ok((status, files))
-}
-
-/// The base tip's [`DECLARATION_PATH`] — the BASE tip, never the PR head, so a
-/// PR cannot narrow its own freshness check (#9589).
-fn fetch_declaration(gh: &str, nwo: &str, tip_sha: &str) -> Result<String, String> {
-    gh_api(
-        gh,
-        nwo,
-        &[
-            "-H",
-            "Accept: application/vnd.github.raw",
-            &format!("repos/{nwo}/contents/{DECLARATION_PATH}?ref={tip_sha}"),
-        ],
-    )
-}
-
-/// The base tip with trailing post-merge version bumps discounted (#11330),
-/// or `None` when the tip is not a bump or any read failed. Read lazily — only
-/// for a verdict that is already stale — one `commits/{sha}` per commit.
-/// The bump identity is a fleet App bot ([`crate::forge_identity::FleetLogins`]
-/// for the repo at `root`): the workflow commits as the fleet App.
-pub fn bump_tail(nwo: &str, tip_sha: &str, root: &Path) -> Option<super::bump_tail::BumpTail> {
-    let gh = gh_bin();
-    let fleet = crate::forge_identity::FleetLogins::for_root(root);
-    super::bump_tail::walk(
-        tip_sha,
-        &mut |sha| {
-            gh_api(&gh, nwo, &[&format!("repos/{nwo}/commits/{sha}")])
-                .and_then(|body| super::bump_tail::commit_from_json(&body))
-        },
-        &|login| fleet.contains(login),
-    )
-}
-
-/// Gather everything [`super::assess_scoped`] needs from the live forge.
-pub fn live_inputs(
-    nwo: &str,
-    pr: &str,
-    base_ref: &str,
-    head_sha: &str,
-) -> Result<LiveInputs, String> {
-    live_inputs_with(&gh_bin(), nwo, pr, base_ref, head_sha)
-}
-
-/// [`live_inputs`], parameterized on the `gh` binary (see [`gh_api`]).
-pub fn live_inputs_with(
-    gh: &str,
-    nwo: &str,
-    pr: &str,
-    base_ref: &str,
-    head_sha: &str,
-) -> Result<LiveInputs, String> {
-    let store = default_store();
-    let (tip_sha, base_tip) = fetch_base_tip(gh, nwo, base_ref, store.as_deref())?;
-    let (required, mut notices) = fetch_required(gh, nwo, base_ref, store.as_deref())?;
-    let runs = fetch_check_runs(gh, nwo, head_sha)?;
-    let (scoped, scoped_notices) =
-        scoped_evidence(gh, nwo, pr, head_sha, &tip_sha, &required, &runs);
-    notices.extend(scoped_notices);
-    Ok(LiveInputs {
-        tip_sha,
-        base_tip,
-        required,
-        runs,
-        notices,
-        scoped,
-    })
-}
-
-#[cfg(test)]
-mod tests;
 
 #[cfg(test)]
 mod conditional_tests;

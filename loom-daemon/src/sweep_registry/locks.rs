@@ -863,7 +863,8 @@ impl SweepRegistry {
     #[must_use]
     fn has_tracked_sweep_for(&self, issue: u32) -> bool {
         self.entries.values().any(|info| {
-            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
+            // An issue step holds the same `issue-<N>` lock (#11898).
+            !info.state.is_terminal() && info.kind.issue_number() == Some(issue)
         })
     }
 
@@ -956,6 +957,10 @@ impl SweepRegistry {
                 };
                 let alive =
                     pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at);
+                // #11898: an issue step holds this same lock; its owner's
+                // sweep id says so, and it is adopted as the step it is.
+                let step = crate::step_role::StepRole::parse_sweep_id(&owner.sweep_id)
+                    .filter(|(role, item)| *item == issue && !role.acts_on_pr());
                 // #10832: a roll's H4 pause stopped this agent on purpose and
                 // left its lock for H5, which resumes the saved session or
                 // requeues it. Crash recovery must not get there first: keep
@@ -1009,13 +1014,26 @@ impl SweepRegistry {
                     if let Some(pgid) = owner.pgid {
                         self.reap_orphaned_group(&owner.sweep_id, Some(issue), pgid);
                     }
-                    daemon_owned_dead.insert(issue);
+                    // A dead step has no checkpoint to recover; its claim goes
+                    // back per role instead (#11898).
+                    if step.is_none() {
+                        daemon_owned_dead.insert(issue);
+                    }
                     if std::fs::remove_dir_all(&path).is_ok() {
                         self.shadow_owner_released(LockNs::Issue, issue, Some(&owner.sweep_id));
                     }
+                    if let Some((role, item)) = step {
+                        let started_at = Self::lock_started_at(&owner);
+                        self.restore_dead_step_at_startup(item, role, &owner.sweep_id, started_at);
+                    }
                     continue;
                 }
-                let log_path = self.compute_log_path(issue);
+                let (kind, log_path) = match step {
+                    Some((role, item)) => {
+                        (SweepKind::Step { item, role }, self.compute_step_log_path(item, role))
+                    }
+                    None => (SweepKind::Issue(issue), self.compute_log_path(issue)),
+                };
                 let started_at = chrono::DateTime::parse_from_rfc3339(&owner.acquired_at)
                     .map_or_else(|_| Utc::now(), |t| t.with_timezone(&Utc));
                 let repo = Some(self.config.workspace_root.display().to_string());
@@ -1059,7 +1077,7 @@ impl SweepRegistry {
                     owner.sweep_id.clone(),
                     SweepInfo {
                         sweep_id: owner.sweep_id.clone(),
-                        kind: SweepKind::Issue(issue),
+                        kind,
                         pid: owner.owner_pid,
                         pgid,
                         token_name,
@@ -1104,6 +1122,12 @@ impl SweepRegistry {
             }
         }
 
+        // #11898: PR steps hold `pr-<N>` locks, which the loop above skips.
+        admitted += self.adopt_pr_steps(only);
+        // #11909: the adopted steps' slots reach `busy_slots` now, not only
+        // at the next spawn.
+        self.publish_step_slots();
+
         // Checkpoints for daemon-owned sweeps whose process is gone -> Crashed
         // entries (so list_sweeps shows them; the next dispatch resumes via the
         // sweep skill). Gated on daemon ownership (Issue #3808): a checkpoint
@@ -1132,7 +1156,7 @@ impl SweepRegistry {
                 // Skip if we already have a Running entry for this issue.
                 let already_running = self.entries.values().any(|info| {
                     matches!(info.state, SweepState::Running | SweepState::Pending)
-                        && matches!(info.kind, SweepKind::Issue(n) if n == issue)
+                        && info.kind.issue_number() == Some(issue)
                 });
                 if already_running {
                     continue;

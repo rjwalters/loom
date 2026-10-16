@@ -27,10 +27,10 @@ const MARKERS: &[&str] = &[
     "CYCLE_MARKER_PREFIX",
     "UNESCALATE_MARKER_PREFIX",
     "ROSTER_MARKER_PREFIX",
-    "loom:stale-check-redate",
     "loom:premise-check",
     "loom:unnamed-block-review",
     "closedByPullRequestsReferences",
+    "loom:landed-route",
 ];
 
 /// Every production file whose code names a covered marker.
@@ -59,11 +59,6 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "forge_check_claim.rs",
         "lease + lease-yield reader in read_freshest_live_lease (FETCH_SITES, #9453)",
     ),
-    ("merge_pr/redate.rs", "writer; reader in remedy_with_sync (FETCH_SITES)"),
-    (
-        "merge_pr/redate/budget.rs",
-        "pure parser over remedy_with's trusted listing (#9590)",
-    ),
     ("premise_check/cli.rs", "reader in forge_inputs (FETCH_SITES)"),
     ("premise_check/record.rs", "parser over already-filtered chunks"),
     ("quarantine_reconciliation.rs", "reader (FETCH_SITES)"),
@@ -74,25 +69,30 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "parked issues' own closing refs + comment text for an advisory, not the linked-PR guard",
     ),
     (
-        "stale_blocked/release.rs",
-        "#10556 hold/idempotency reader: comments from ReleaseForge, trusted via policy.trusts_json",
-    ),
-    (
-        "stale_blocked/unnamed.rs",
-        "#10558 queue veto: legacy PR-less/quarantine and Curator review markers from \
-         ReleaseForge comments, trusted via policy.trusts_json (permanent-block veto reads any \
-         comment: fail-safe)",
-    ),
-    (
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),
+    (
+        "sweep_registry/lease_step.rs",
+        "writer (moved from guards.rs, #11898); pure second-line step parser over a body \
+         guards.rs's trusted read_lease_comments already returned",
+    ),
+    ("sweep_registry/fast_fail_park.rs", "writer (quarantine park comment, #11854)"),
     ("sweep_registry/quarantine.rs", "writer"),
     (
         "sweep_registry/outcome_journal/label_timeline.rs",
         "#9062 timeline flag rows, trusted via policy.trusts_json in parse_label_events",
     ),
     ("worktree_ops/gh.rs", "linked-PR probe (FETCH_SITES)"),
+    (
+        "work_finder/landed_prefilter.rs",
+        "writer + reader of loom:landed-route in read_route_marked; closes-graph counts MERGED PRs \
+         only, which an outsider cannot produce (FETCH_SITES, #11853)",
+    ),
+    (
+        "work_finder/step_item.rs",
+        "pure parsers over TrustedComments, built only by TrustPolicy::filter (#11895)",
+    ),
 ];
 
 /// Per reviewed file: every function that fetches comments (or linked PRs),
@@ -125,6 +125,12 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_bodies(",
     ),
     ("sweep_registry/guards.rs", "read_lease_comments", "policy.trusted_ndjson("),
+    // #11898: a dead step's role-keyed lease holder.
+    (
+        "sweep_registry/step_lease_owner.rs",
+        "read_role_lease_rows",
+        "policy.trusted_ndjson(",
+    ),
     // #9062: the PR timeline read carries base-conflict flag comments.
     (
         "sweep_registry/outcome_journal/label_timeline.rs",
@@ -184,8 +190,6 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // `COMMENTS_QUERY` const, which the scanner cannot see; listed anyway.
     ("premise_check/cli.rs", "graphql_listing_and_object", ""),
     ("premise_check/cli.rs", "parse_graphql_comments", ""),
-    ("merge_pr/redate.rs", "remedy_with_sync", "policy.trusted_listing("),
-    ("merge_pr/redate.rs", "post_comment", ""),
     ("role_runner/roster.rs", "read_roster_comments", "trusted_ndjson("),
     ("role_runner/roster.rs", "create_roster_comment", ""),
     ("role_runner/roster.rs", "delete_roster_comment", ""),
@@ -197,11 +201,17 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // advisory comment and never edits a label.
     ("stale_blocked/batch.rs", "comments", ""),
     ("stale_blocked/batch.rs", "closing_refs_query", ""),
+    // #11853: the closes-graph query and parser count only MERGED PRs; the
+    // routing comment is a write.
+    ("work_finder/landed_prefilter.rs", "landed_query", ""),
+    ("work_finder/landed_prefilter.rs", "alias_verdict", ""),
+    ("work_finder/landed_prefilter.rs", "comment", ""),
+    (
+        "work_finder/landed_prefilter.rs",
+        "read_route_marked",
+        "TrustPolicy::for_root(&forge.root)",
+    ),
     ("stale_blocked/batch.rs", "parse_closing_refs", ""),
-    // #10556's release pass: the raw listing goes to `release::execute`, which
-    // trusts each comment through `policy.trusts_json` before reading a hold
-    // or idempotency marker from it.
-    ("stale_blocked/release_gh.rs", "comments", ""),
 ];
 
 /// Production code of a source file: inline test modules cut off, comment

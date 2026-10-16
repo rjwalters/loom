@@ -23,18 +23,22 @@ use crate::label_registry::{embedded_set_with_retired, LabelSet, Registry};
 /// cancel-and-re-dispatch and the reaper's checkpoint-resume — both of which
 /// re-dispatch an issue the daemon itself already flipped to `loom:building`.
 ///
-/// **One narrow exemption exists (#6893).** The [`OPERATOR_HOLD_LABEL`] park is
-/// capability-aware: an item whose body declares
-/// `<!-- loom:capability=<name> -->` markers (#6892) that this worker's own
-/// `LOOM_WORKER_CAPABILITIES` declaration fully covers, and carries no
-/// decision block, may be dispatched into a propose-mode lane instead of
-/// parked. See [`WorkItem::is_skipped_with_capabilities`] and
-/// [`crate::capability`]. The exemption is applied by the callers that opt
-/// into it, never by removing a label from this set, and it is inert unless a
-/// host opts in.
+/// **One narrow exemption exists (#6893).** The [`BLOCKED_HOLD_LABEL`] park is
+/// capability-aware: an item whose only blocker is a capability — it declares
+/// `<!-- loom:capability=<name> -->` markers (#6892), names no blocker in a park
+/// record and carries no decision block — and whose markers this worker's own
+/// `LOOM_WORKER_CAPABILITIES` declaration fully covers may be dispatched into a
+/// propose-mode lane instead of parked (#11861: before, the lane read the
+/// operator hold, which no role acts on any more). See
+/// [`WorkItem::is_skipped_with_capabilities`] and [`crate::capability`]. The
+/// exemption is applied by the callers that opt into it, never by removing a
+/// label from this set, and it is inert unless a host opts in.
 ///
-/// **This is the issue-dispatch park.** The PR lane reads
-/// [`PR_LANE_PARK_LABELS`] instead, which leaves [`OPERATOR_HOLD_LABEL`] out.
+/// **Issues and pull requests read the same set** (#11861). Before, the PR
+/// lane read a copy without [`OPERATOR_HOLD_LABEL`], because Champion's
+/// merge-risk and critical-file holds used it and had to stay re-evaluable.
+/// Those holds are `loom:blocked` now, so `loom:operator` parks a PR too: no
+/// role acts on it until a human removes it.
 ///
 /// Derived: the registry's `park` labels in registry order (the order the park
 /// guards report a label in when an issue carries several), then the retired
@@ -42,36 +46,19 @@ use crate::label_registry::{embedded_set_with_retired, LabelSet, Registry};
 /// `loom:operator-only` item stays parked.
 pub static PARK_LABELS: LabelSet = LabelSet::new(|| embedded_set_with_retired("park"));
 
-/// The park set of the PR-lane consumers: the reaper's linked-PR park probe
-/// (`pr_park`), the role runner's changes-axis demand, and Doctor's queue in
-/// `pr_planning` (#11795).
-///
-/// [`PARK_LABELS`] minus [`OPERATOR_HOLD_LABEL`], derived explicitly. On a pull
-/// request `loom:operator` is not a park: Champion's merge-risk and
-/// critical-file holds clear themselves, and Champion routes stale held PRs
-/// to Doctor with the label still on, which Doctor drains (#7660). The retired
-/// `loom:operator-only` stays in this set, so an unmigrated PR parks exactly
-/// as it did before the fold.
-pub static PR_LANE_PARK_LABELS: LabelSet = LabelSet::new(|| {
-    PARK_LABELS
-        .iter()
-        .copied()
-        .filter(|l| *l != OPERATOR_HOLD_LABEL)
-        .collect()
-});
-
 /// The daemon's own claim label. Disqualifies a *fresh* work-finder candidate
 /// (a `loom:building` row is already being worked), but is NOT a park — see
 /// [`PARK_LABELS`].
 pub const BUILDING_LABEL: &str = "loom:building";
 
 /// The operator hold (#11795): a human must act or decide now, and only a
-/// human removes it. On an issue it is a park ([`PARK_LABELS`]), so no
-/// dispatch route reaches it: before the fold `loom:operator-only` carried the
-/// park and this label was skip-only, and a hold applied after dispatch was
-/// overridden by watchdog re-dispatch, checkpoint resume or the epic
-/// supervisor (#4366). On a pull request it is not a park
-/// ([`PR_LANE_PARK_LABELS`]).
+/// human removes it. It is a park ([`PARK_LABELS`]) on issues and pull
+/// requests alike (#11861), so no role and no dispatch route acts on it:
+/// before the fold `loom:operator-only` carried the park and this label was
+/// skip-only, and a hold applied after dispatch was overridden by watchdog
+/// re-dispatch, checkpoint resume or the epic supervisor (#4366). Champion's
+/// own merge-risk and critical-file holds are [`BLOCKED_HOLD_LABEL`] plus a
+/// hold marker, not this label.
 ///
 /// What the human must do is read from the body, not from a sub-label: a
 /// ```` ```decision ```` block (#10057) makes it a decision, a capability
@@ -82,6 +69,11 @@ pub const OPERATOR_HOLD_LABEL: &str = "loom:operator";
 /// The blocked hold (#11795): waiting on something named — another change, a
 /// capability — and released automatically once it resolves. Folds the
 /// retired `loom:needs-capability` (with its capability marker in the body).
+///
+/// It also carries Champion's merge-risk and critical-file PR holds (#11861):
+/// `loom:blocked` beside `loom:pr`, a reason-only park record and Champion's
+/// hold-state marker comment. That is the one shape in which `loom:pr` and
+/// `loom:blocked` may coexist ([`crate::champion_hold`]); Champion releases it.
 pub const BLOCKED_HOLD_LABEL: &str = "loom:blocked";
 
 /// [`OPERATOR_HOLD_LABEL`] and the retired names that fold into it

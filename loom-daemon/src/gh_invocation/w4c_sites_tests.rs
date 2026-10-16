@@ -58,19 +58,22 @@ fn every_deferrable_site_maps_a_shed_to_no_answer() {
         "clean.pr_status_rest",
         clean::check_pr_status_for_branch_rest(root, "acme", "feature/x") == PrStatus::Unknown,
     );
-    step(
-        "intake.list_open",
-        crate::intake_reconcile::run_once(Path::new("gh"), root, chrono::Utc::now(), 5) == 0,
-    );
+    // `intake.list_open` left this list in #11897: the inline pass now reads
+    // the shared ETag walk, whose shed is the store's (`ReadShed`), proven
+    // by `forge_listing_open_pages_tests` and `intake_reconcile::tests`.
     {
-        use crate::observability::ops::stage_dwell::{GhStageFetcher, StageFetcher};
         step(
-            "stage_dwell.label_times",
-            GhStageFetcher.label_times(root, "acme/shed", 3).is_none(),
-        );
-        step(
-            "stage_dwell.merged_at",
-            GhStageFetcher.merged_at(root, "acme/shed", 3).is_none(),
+            "stage_entry.events",
+            crate::step_dispatch::stage_entry::EventsSource::label_times(
+                &mut crate::step_dispatch::stage_entry::GhEventsReader,
+                root,
+                "acme/shed",
+                3,
+                "loom:issue",
+                3,
+            )
+            .times
+            .is_none(),
         );
     }
     step(
@@ -191,16 +194,6 @@ fn the_carry_over_reads_route_to_the_reader() {
             &["api", "repos/{owner}/{repo}/pulls?state=all&head=acme:b"],
         ),
         shape("clean.pr_by_number_rest", &["api", "repos/{owner}/{repo}/pulls/9"]),
-        shape(
-            "intake.list_open",
-            &[
-                "api",
-                "--paginate",
-                "repos/{owner}/{repo}/issues?state=open&per_page=100",
-                "--jq",
-                ".",
-            ],
-        ),
         shape(
             "guard.lease_comments",
             &["api", "repos/{owner}/{repo}/issues/7/comments?per_page=100"],

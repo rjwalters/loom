@@ -382,6 +382,36 @@ impl DrawConfig {
             .map(|(_, table)| table)
     }
 
+    /// The table attempt `attempt` of `role` draws from, after exclusions —
+    /// falling through (#11782). The table [`Self::table_for`] names can be
+    /// empty on this host (every candidate excluded or weight 0), and a skip
+    /// before spawn never advances the attempt counter, so the stage would
+    /// stay on that table forever. "The draw never waits on a missing
+    /// provider": when it is empty, the next configured attempt's table is
+    /// tried, and so on; the first non-empty one wins. When every remaining
+    /// table is empty too, the originally named (empty) table is returned so
+    /// the skip still carries its record and the EMPTY diagnostic.
+    #[must_use]
+    pub fn effective_for(&self, role: &str, attempt: u32) -> Option<EffectiveTable> {
+        let first = self.table_for(role, attempt)?;
+        let named = self.effective(first);
+        if !named.active.is_empty() {
+            return Some(named);
+        }
+        let later = self.roles.get(role).into_iter().flat_map(|tables| {
+            tables
+                .range(first.attempt.saturating_add(1)..)
+                .map(|(_, table)| table)
+        });
+        for table in later {
+            let effective = self.effective(table);
+            if !effective.active.is_empty() {
+                return Some(effective);
+            }
+        }
+        Some(named)
+    }
+
     /// Whether `runtime` is excluded on this host.
     #[must_use]
     pub fn excludes(&self, candidate: &Candidate) -> bool {
@@ -433,10 +463,12 @@ pub struct EffectiveTable {
 }
 
 impl EffectiveTable {
-    /// `Σ w` over [`Self::active`].
+    /// `Σ w` over [`Self::active`], saturating at `u64::MAX` (#11782).
     #[must_use]
     pub fn total(&self) -> u64 {
-        self.active.iter().map(|(_, w)| *w).sum()
+        self.active
+            .iter()
+            .fold(0u64, |acc, (_, w)| acc.saturating_add(*w))
     }
 }
 
@@ -684,7 +716,7 @@ pub fn prepare(root: &Path, role: &str, now: u64, role_tick: bool) -> Option<Dra
     } else {
         1
     };
-    let table = config.effective(config.table_for(role, attempt)?);
+    let table = config.effective_for(role, attempt)?;
     if table.active.is_empty() {
         log::warn!(
             "role_draw: {role} attempt {attempt} table a{} ({}) is EMPTY after exclusions — \

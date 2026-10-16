@@ -152,6 +152,26 @@ pub struct MirrorItem {
     pub sub_issues_total: Option<u64>,
     #[serde(default)]
     pub sub_issues_completed: Option<u64>,
+    /// When each current label was last applied (label name → RFC-3339
+    /// time), the mirror's per-item `labels_at` (#11897). Values are kept as
+    /// sent, so one malformed entry drops only itself ([`Self::to_rest`]),
+    /// never the page; a field that is not an object at all (an array, a
+    /// string, a number) reads as `None` for this item alone (#11924).
+    #[serde(default, deserialize_with = "lenient_labels_at")]
+    pub labels_at: Option<BTreeMap<String, Value>>,
+}
+
+/// `labels_at` as an object of label → value, or `None` for any other shape:
+/// a wrong shape must not fail the item, which would fail the whole page
+/// and start the mirror backoff for every caller (#11924).
+fn lenient_labels_at<'de, D>(de: D) -> Result<Option<BTreeMap<String, Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(de)? {
+        Value::Object(map) => Some(map.into_iter().collect()),
+        _ => None,
+    })
 }
 
 impl MirrorItem {
@@ -182,6 +202,12 @@ impl MirrorItem {
                 .and_then(|c| u32::try_from(c).ok())
                 .unwrap_or(0),
             open_sub_issues,
+            labels_at: self.labels_at.as_ref().map(|times| {
+                times
+                    .iter()
+                    .filter_map(|(label, at)| Some((label.clone(), at.as_str()?.to_string())))
+                    .collect()
+            }),
         })
     }
 }
@@ -290,6 +316,67 @@ pub async fn get_json(
         .map_err(|e| MirrorError::Malformed(classify_transport(&e)))
 }
 
+/// A conditional `GET`'s answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Conditional {
+    /// `304`: the caller's copy is current.
+    NotModified,
+    /// `200`: a new body, and the `ETag` to send next time.
+    Modified { etag: Option<String>, body: Value },
+}
+
+/// `GET <base><path>` with `If-None-Match: <etag>` when one is held, bounded
+/// by `timeout`.
+///
+/// # Errors
+///
+/// [`MirrorError`]; a `401` also asks the refresher to re-read the key.
+pub async fn get_json_conditional(
+    http: &reqwest::Client,
+    active: &Active,
+    path: &str,
+    etag: Option<&str>,
+    timeout: Duration,
+) -> Result<Conditional, MirrorError> {
+    let url = reqwest::Url::parse(&format!("{}{path}", active.base_url))
+        .map_err(|e| MirrorError::Transport(format!("bad url: {e}")))?;
+    let mut req = http
+        .get(url)
+        .timeout(timeout)
+        .bearer_auth(active.key())
+        .header(reqwest::header::ACCEPT, "application/json");
+    if let Some(etag) = etag {
+        req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    let res = req
+        .send()
+        .await
+        .map_err(|e| MirrorError::Transport(classify_transport(&e)))?;
+    let status = res.status().as_u16();
+    if status == 304 {
+        return Ok(Conditional::NotModified);
+    }
+    if status == 401 || status == 403 {
+        if status == 401 {
+            super::note_key_rejected();
+        }
+        return Err(MirrorError::Auth(status));
+    }
+    if !(200..300).contains(&status) {
+        return Err(MirrorError::Status(status));
+    }
+    let etag = res
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = res
+        .json::<Value>()
+        .await
+        .map_err(|e| MirrorError::Malformed(classify_transport(&e)))?;
+    Ok(Conditional::Modified { etag, body })
+}
+
 /// A transport error's class, never its URL (which carries no key, but may
 /// carry repo names an operator did not expect in a log).
 fn classify_transport(e: &reqwest::Error) -> String {
@@ -380,4 +467,30 @@ pub fn get_json_blocking(
         let _ = tx.send(get_json(&http, &active, &path, &query).await);
     });
     wait(&rx, deadline).unwrap_or_else(|| Err(MirrorError::Transport("deadline".into())))
+}
+
+/// [`get_json_conditional`] from synchronous code, bounded by `deadline`
+/// whatever the network does.
+///
+/// # Errors
+///
+/// [`MirrorError`]; a missed deadline is [`MirrorError::Transport`].
+pub fn get_json_conditional_blocking(
+    active: &Active,
+    path: &str,
+    etag: Option<&str>,
+    deadline: Duration,
+) -> Result<Conditional, MirrorError> {
+    let Some((rt, http)) = runtime() else {
+        return Err(MirrorError::Transport("no runtime".into()));
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (http, active, path, etag) =
+        (http.clone(), active.clone(), path.to_string(), etag.map(str::to_string));
+    rt.spawn(async move {
+        let _ =
+            tx.send(get_json_conditional(&http, &active, &path, etag.as_deref(), deadline).await);
+    });
+    wait(&rx, deadline + Duration::from_secs(1))
+        .unwrap_or_else(|| Err(MirrorError::Transport("deadline".into())))
 }

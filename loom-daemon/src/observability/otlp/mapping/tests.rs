@@ -246,6 +246,8 @@ fn host_health_envelope() -> TelemetryEnvelope {
                 memory_pressure: Some(crate::host_pressure::MemoryPressure::Some),
                 oom_kill_total: Some(3),
             }),
+            agent_scopes: Vec::new(),
+            agent_scopes_total: None,
         }),
     )
 }
@@ -532,6 +534,46 @@ fn unmeasured_memory_summary_produces_no_memory_gauges_at_all() {
 }
 
 #[test]
+fn agent_scope_census_maps_to_aggregate_gauges_and_is_absent_when_unmeasured() {
+    // #12166: unmeasured census -> no gauges at all, never a zero.
+    let names_of = |e: TelemetryEnvelope| -> Vec<String> {
+        let req = build_metrics_request(&[e]).unwrap();
+        req.resource_metrics[0].scope_metrics[0]
+            .metrics
+            .iter()
+            .map(|m| m.name.clone())
+            .collect()
+    };
+    let absent = names_of(host_health_envelope());
+    assert!(!absent
+        .iter()
+        .any(|n| n.starts_with("loom.host.agent_scope")));
+
+    let mut e = host_health_envelope();
+    if let TelemetryRecord::HostHealth(r) = &mut e.record {
+        r.agent_scopes_total = Some(3);
+        r.agent_scopes = vec![crate::telemetry::AgentScopeSummary {
+            scope: "loom-agent-x.scope".into(),
+            age_sec: Some(5 * 3600),
+            agent_alive: false,
+            oldest_pid: None,
+            oldest_comm: None,
+            oldest_age_sec: None,
+            cpu_usec: None,
+            transcript_age_sec: None,
+        }];
+    }
+    let names = names_of(e);
+    for want in [
+        "loom.host.agent_scopes",
+        "loom.host.agent_scopes_orphaned",
+        "loom.host.agent_scope_orphan_max_age_seconds",
+    ] {
+        assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
+    }
+}
+
+#[test]
 fn role_tick_health_becomes_gauge_metrics_with_the_persistent_failure_count() {
     // #5022: `host_health_envelope`'s fixture carries one persistent
     // failure (judge @ /repos/loom, 2 failed ticks of 12 total, 10 ok).
@@ -609,6 +651,7 @@ fn otlp_export_state_rides_a_state_labelled_gauge() {
         state: OtlpExportState::Exempt,
         detail: Some("air-gapped lab".into()),
         since: None,
+        kinds: Vec::new(),
     }))
     .unwrap();
     assert_eq!(attr(&exempt, "state").as_deref(), Some("exempt"));
@@ -618,6 +661,7 @@ fn otlp_export_state_rides_a_state_labelled_gauge() {
         state: OtlpExportState::Failing,
         detail: Some("no ack for 20m".into()),
         since: None,
+        kinds: Vec::new(),
     }))
     .unwrap();
     assert_eq!(attr(&failing, "state").as_deref(), Some("failing"));
@@ -701,6 +745,8 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     };
     let batch = vec![envelope(
         "host-c",
@@ -799,6 +845,72 @@ fn tokens_snapshot_weekly_axis_is_a_separate_gauge_absent_when_unknown() {
     assert_eq!(points[0].value, Some(number_data_point::Value::AsDouble(0.37)));
 }
 
+/// Issue #11992: the reset instant reaches OTLP as two per-account gauges —
+/// the absolute Unix time and the signed countdown from `captured_at` —
+/// emitted only where the instant is known (agent-2 has none: no point, not 0).
+#[test]
+fn tokens_snapshot_reset_instant_is_a_countdown_gauge_absent_when_unknown() {
+    let reset_at = ts() + chrono::Duration::hours(30);
+    let mut exhausted = tokens_snapshot_envelope();
+    let TelemetryRecord::TokensSnapshot(snapshot) = &mut exhausted.record else {
+        unreachable!()
+    };
+    snapshot.accounts[0].limit_window_reset_at = Some(reset_at);
+    snapshot.accounts[0].exhausted = true;
+    let request = build_metrics_request(&[exhausted]).unwrap();
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    let points = |name: &str| {
+        let metric = metrics
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("{name} metric must exist"));
+        assert_eq!(metric.unit, "s");
+        match &metric.data {
+            Some(metric::Data::Gauge(gauge)) => gauge.data_points.clone(),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    };
+    let account = |point: &NumberDataPoint| {
+        point
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "account")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+
+    let absolute = points("loom.tokens.limit_window_reset_at");
+    assert_eq!(absolute.len(), 1, "only the account with a known reset instant");
+    assert_eq!(account(&absolute[0]), Some(any_value::Value::StringValue("agent-1".into())));
+    assert_eq!(absolute[0].value, Some(number_data_point::Value::AsInt(reset_at.timestamp())));
+
+    let countdown = points("loom.tokens.seconds_until_reset");
+    assert_eq!(countdown.len(), 1);
+    assert_eq!(account(&countdown[0]), Some(any_value::Value::StringValue("agent-1".into())));
+    assert_eq!(countdown[0].value, Some(number_data_point::Value::AsInt(30 * 3600)));
+}
+
+/// A reset instant already behind `captured_at` stays visibly stale
+/// (negative), never clamped into a false "capacity is free now".
+#[test]
+fn tokens_snapshot_stale_reset_instant_yields_a_negative_countdown() {
+    let mut stale = tokens_snapshot_envelope();
+    let TelemetryRecord::TokensSnapshot(snapshot) = &mut stale.record else {
+        unreachable!()
+    };
+    snapshot.accounts[0].limit_window_reset_at = Some(ts() - chrono::Duration::minutes(5));
+    let request = build_metrics_request(&[stale]).unwrap();
+    let countdown = request.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .find(|m| m.name == "loom.tokens.seconds_until_reset")
+        .expect("countdown metric must exist");
+    let Some(metric::Data::Gauge(gauge)) = &countdown.data else {
+        panic!("expected Gauge")
+    };
+    assert_eq!(gauge.data_points[0].value, Some(number_data_point::Value::AsInt(-300)));
+}
+
 #[test]
 fn metrics_are_grouped_by_host_id() {
     let batch = vec![host_health_envelope(), sweep_started_envelope()];
@@ -855,10 +967,12 @@ fn role_tick_outcome_envelope(
             effort: None,
             detail: Some("codex-account-pool-exhausted: no account provisioned".to_string()),
             gated_pool: gated_pool.map(str::to_string),
+            failure_class: None,
             // Issue #8599: no preference list decided this tick.
             preference_tier: None,
             preference_tap: None,
             role_draw: None,
+            prompt: None,
             // Issue #8507: a Claude tick writes no launch record.
             runtime: None,
             provider: None,
@@ -866,8 +980,40 @@ fn role_tick_outcome_envelope(
             tokens_by_model: None,
             models_used: None,
             actions: None,
+            source: None,
+            sweep_id: None,
+            deferred_by: None,
+            shard_owner: None,
         }),
     )
+}
+
+/// #11906: a step's `role_tick.outcome` carries `loom.role_tick.source=step`
+/// and its sweep id; a role-runner tick carries neither, so a "role ticks
+/// still running" query never counts steps.
+#[test]
+fn a_steps_role_tick_outcome_is_marked_as_a_step() {
+    let mut step = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut step.record {
+        r.source = Some(crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string());
+        r.sweep_id = Some("step-judge-7-1".to_string());
+    }
+    let tick = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    let request = build_logs_request(&[step, tick]).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let attr = |record: &LogRecord, key: &str| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    let s = |v: &str| Some(any_value::Value::StringValue(v.to_string()));
+    assert_eq!(attr(&records[0], "loom.role_tick.source"), s("step"));
+    assert_eq!(attr(&records[0], "loom.sweep_id"), s("step-judge-7-1"));
+    assert_eq!(attr(&records[1], "loom.role_tick.source"), None);
+    assert_eq!(attr(&records[1], "loom.sweep_id"), None);
 }
 
 /// Issue #8408 shipped `loom.gated_pool` with no assertion behind it (#8444):
@@ -906,6 +1052,38 @@ fn role_tick_outcome_maps_the_gated_pool_attribute_only_when_a_pool_gated_it() {
         None,
         "an unobserved field stays an ABSENT attribute"
     );
+}
+
+/// #12028: a failed tick exports its closed-vocabulary `loom.failure_class`;
+/// a tick with no class (a success, a pre-#12028 record) leaves it absent.
+#[test]
+fn role_tick_outcome_maps_the_failure_class_only_when_one_was_recorded() {
+    use crate::telemetry::RoleTickResult;
+    let mut classed = role_tick_outcome_envelope(RoleTickResult::Failure, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut classed.record {
+        r.failure_class = Some("write-scope-refused".to_string());
+    }
+    let batch = vec![
+        classed,
+        role_tick_outcome_envelope(RoleTickResult::Failure, None),
+    ];
+    let request = build_logs_request(&batch).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let class = |record: &LogRecord| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "loom.failure_class")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    assert_eq!(
+        class(&records[0]),
+        Some(any_value::Value::StringValue("write-scope-refused".to_string()))
+    );
+    assert_eq!(class(&records[1]), None);
+    let text = format!("{records:?}");
+    assert!(!text.contains("codex-account-pool-exhausted"), "detail must not be exported");
 }
 
 #[test]

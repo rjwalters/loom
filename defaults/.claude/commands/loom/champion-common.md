@@ -53,7 +53,7 @@ for the length of this pass's own session. Run `champion-pr-merge.md` →
 number / hold reason / `mergeable` status for every currently-held PR to the
 pinned `Champion: Merge-Risk Hold Digest` tracking issue, so a human or another
 role (e.g. Guide) can read the current pile without a Champion transcript or a
-hand-run `loom:operator` label query. This is reporting/visibility only — it
+hand-run label query. This is reporting/visibility only — it
 changes no Safety Criteria evaluation and no merge decision.
 
 **Example report**:
@@ -443,7 +443,7 @@ else
 
   if [ -n "$FLAG_COMMENT_ID" ]; then
     # Same fingerprint seen before — read the streak this marker has already
-    # recorded (mirrors champion-issue-promo.md's unrevised-skips counter).
+    # recorded (the shape of the retired unrevised-skips counter, #4967).
     STREAK=$(printf '%s' "$FLAG_COMMENT_BODY" \
       | sed -n "s|.*<!-- champion:epic-block-streak:$FINGERPRINT:\([0-9]\{1,\}\) -->.*|\1|p" | tail -n 1)
     STREAK=${STREAK:-1}
@@ -527,8 +527,8 @@ closed, gained an open child again, etc.) computes a different
 `EPIC_BLOCK_MARKER` entirely, so it is treated as new — the streak resets by
 construction rather than by an explicit reset step.
 
-**Invariants a future edit must preserve** (mirrors
-`champion-issue-promo.md`'s "Bounding the silent skip" for the same reason):
+**Invariants a future edit must preserve** (the reason #4967 gave for the
+proposal path's since-retired silent-skip tally):
 
 - Comment budget for a persistently-unresolved `epic-complete-unpromoted`
   state is bounded, not unbounded: one flag comment, then only silent

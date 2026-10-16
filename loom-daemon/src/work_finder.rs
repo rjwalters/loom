@@ -199,12 +199,11 @@ pub const DEFAULT_WORK_FINDER_MAX_CONCURRENT: usize = 3;
 /// uncontrolled burst.
 ///
 /// Precedence is the standard **env > config
-/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default**, resolved once at
-/// daemon startup via [`read_work_finder_config`] → `config_resolver` — the
-/// same startup-capture pattern as `cpuUtilizationTarget` / `estCoresPerSweep`
-/// (#4032): the *inputs* (occupancy, live headroom) are re-read every tick, but
-/// this *knob* takes effect only on daemon restart unless a future change
-/// moves knob resolution into the tick loop itself. A zero/unparseable value is
+/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default**. Since #12090 the
+/// config layer is re-read every multi-workspace tick
+/// ([`ConfiguredMaxReloader::max_admissions_per_tick`]), so a fleet-store edit
+/// hot-applies; this env override, being process environment, is read only at
+/// daemon start. A zero/unparseable value is
 /// dropped (falls through to config/default) — a zero cap would silently
 /// freeze the loop at its current occupancy forever, which is a footgun, not a
 /// deliberate "pause" (use the main-health-gate halt or a scheduled drain for
@@ -234,6 +233,7 @@ pub mod dispatch_plan;
 pub mod dispatch_plan_merge;
 pub mod halt_cause;
 mod labels;
+pub mod landed_prefilter;
 pub mod main_red_autofile;
 pub mod main_red_fix;
 pub mod open_pr_prefilter;
@@ -241,6 +241,8 @@ pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
 mod recheck_interval;
+pub mod startup_gate;
+pub mod step_item;
 mod tick_line;
 mod tick_report;
 mod tick_summary;
@@ -253,7 +255,7 @@ pub use main_red_fix::RedMainLane;
 pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
-pub use tick_report::{Admission, TickReport};
+pub use tick_report::{error_kind::DispatchErrorKind, Admission, TickReport};
 #[cfg(test)]
 use tick_summary::reset_last_tick_summary;
 pub use tick_summary::{
@@ -384,7 +386,7 @@ impl WorkItem {
     /// A thin adapter over [`crate::capability::route_mechanical`] — the labels
     /// and body already fetched by the listing, no extra forge read. Returns
     /// [`MechanicalRouting::NotApplicable`](crate::capability::MechanicalRouting::NotApplicable)
-    /// for every item that is not an operator hold without a decision block,
+    /// for every item that is not a capability-only `loom:blocked` park (#11861),
     /// which is all but a handful.
     #[must_use]
     pub fn mechanical_routing(
@@ -407,20 +409,23 @@ impl WorkItem {
         crate::host_affinity::host_constraint(&self.labels, self.body.as_deref())
     }
 
-    /// True when the issue is skipped, with the `loom:operator` park made
-    /// **capability-aware for mechanical holds only** (#6893, AC1; #11795).
+    /// True when the issue is skipped, with the `loom:blocked` park made
+    /// **capability-aware for capability-only parks** (#6893, AC1; #11795;
+    /// re-keyed from `loom:operator` by #11861).
     ///
     /// Identical to [`Self::is_skipped_with_extra`] except for one narrow
-    /// exemption: an operator hold whose body declares capabilities (the
+    /// exemption: a blocked hold whose body declares capabilities (the
     /// `<!-- loom:capability=<name> -->` markers from #6892) that
-    /// `held_capabilities` fully covers, and carries no decision block, is
-    /// **not** skipped — it is dispatchable into the propose-mode lane:
+    /// `held_capabilities` fully covers, names no blocker in a park record and
+    /// carries no decision block, is **not** skipped — it is dispatchable into
+    /// the propose-mode lane:
     ///
-    /// - A decision (a body decision block, or the retired decision label)
-    ///   stays hard-skipped unconditionally, marker or no marker.
-    /// - `loom:blocked` (under any name), `loom:frozen`, [`BUILDING_LABEL`] and
-    ///   any `extra_skip_labels` entry veto the exemption outright — it only
-    ///   ever relaxes the operator hold, never any other reason to skip.
+    /// - A decision (a body decision block) or a named blocker stays
+    ///   hard-skipped unconditionally, marker or no marker.
+    /// - `loom:operator` (under any name: no role acts on it), `loom:frozen`,
+    ///   [`BUILDING_LABEL`] and any `extra_skip_labels` entry veto the
+    ///   exemption outright — it only ever relaxes the blocked hold, never any
+    ///   other reason to skip.
     /// - No declaration, an unrecognized value, or a capability this worker does
     ///   not hold all leave the item skipped (fail-closed).
     ///
@@ -440,11 +445,10 @@ impl WorkItem {
             // Fast path: nothing to relax, or no worker declaration at all.
             return skipped;
         }
-        // The exemption may only cancel the operator hold (any of its names).
+        // The exemption may only cancel the blocked hold (any of its names).
         // If any OTHER skip reason applies, the item stays skipped.
         let other_skip_reason = self.labels.iter().any(|l| {
-            (SKIP_LABELS.contains(&l.as_str())
-                && !labels::OPERATOR_HOLD_NAMES.contains(&l.as_str()))
+            (SKIP_LABELS.contains(&l.as_str()) && !labels::BLOCKED_HOLD_NAMES.contains(&l.as_str()))
                 || extra_skip_labels.iter().any(|e| e == l)
         });
         if other_skip_reason {
@@ -787,6 +791,34 @@ pub trait WorkDispatcher {
         HashMap::new()
     }
 
+    /// What the pre-filter asks (#12025): [`open_pr_blocked`](Self::open_pr_blocked)
+    /// plus whether a listing was read at all. An
+    /// [`OpenPrAnswer::Unreadable`](open_pr_prefilter::OpenPrAnswer::Unreadable)
+    /// workspace's unverified candidates are not dispatched this tick (fail
+    /// closed). Defaults to `NotAsked(open_pr_blocked(..))`: the pre-#12025 path.
+    fn open_pr_answer(&self, candidates: &[u32]) -> open_pr_prefilter::OpenPrAnswer {
+        open_pr_prefilter::OpenPrAnswer::NotAsked(self.open_pr_blocked(candidates))
+    }
+
+    /// The landed pre-filter (#11853, [`landed_prefilter`]): the issues in
+    /// `candidates` that are still open although a PR closing them merged,
+    /// each mapped to that PR. `open_pr` are the workspace's candidates the
+    /// open-PR pre-filter blocked this tick. Asked at most once per workspace
+    /// per tick, after [`open_pr_blocked`](Self::open_pr_blocked); like it,
+    /// it can only remove candidates. Defaults to empty.
+    fn landed_closing_prs(&self, _candidates: &[u32], _open_pr: &[u32]) -> HashMap<u32, u32> {
+        HashMap::new()
+    }
+
+    /// The landed-cooldown lift (#11901, [`landed_prefilter::lift_in`]): of
+    /// `held`, this workspace's listed candidates inside a dispatch-backoff
+    /// window, the ones whose landed cooldown was just lifted because the
+    /// issue was reopened after its landing or Curator kept it. The tick then
+    /// treats them as not backed off. Defaults to empty.
+    fn lift_landed_cooldowns(&self, _held: &[u32]) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Whether a live sweep on this host is already marked `overflow`
     /// (#9244): the [`OverflowSlot`] is then taken for the whole tick.
     /// Defaults to `false`.
@@ -851,7 +883,7 @@ pub trait WorkDispatcher {
 /// dedup-state mechanism to avoid it.
 ///
 /// Costs nothing on the overwhelmingly common path: [`MechanicalRouting::NotApplicable`]
-/// for every item that is not an operator hold without a decision block, and
+/// for every item that is not a capability-only `loom:blocked` park, and
 /// the routing is short-circuited entirely when this host declared no
 /// capabilities.
 ///
@@ -864,13 +896,17 @@ fn log_capability_gap(item: &WorkItem, held_capabilities: &BTreeSet<String>) {
     match item.mechanical_routing(held_capabilities) {
         MechanicalRouting::MissingCapabilities { missing } => {
             log::info!(
-            "work_finder: issue #{} is a mechanical operator hold but this worker does not hold \
+                "work_finder: issue #{} is a capability-only park but this worker does not hold \
              the capability it declares: {} (held: {}). It stays parked — file/comment a \
              capability request naming the gap rather than waiting (#6893)",
-            item.number,
-            missing.join(", "),
-            held_capabilities.iter().cloned().collect::<Vec<_>>().join(", ")
-        )
+                item.number,
+                missing.join(", "),
+                held_capabilities
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
         MechanicalRouting::NoDeclaration { unknown } if !unknown.is_empty() => log::info!(
             "work_finder: issue #{} declares capability value(s) outside the closed vocabulary \
@@ -1605,7 +1641,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // Snapshot each workspace's dispatch-backoff set (#4485) alongside its
     // quarantined set — dropped in pass 1 for the same reason: a backed-off
     // candidate must not reserve a shared slot it cannot use.
-    let backed_off_sets: Vec<HashSet<u32>> =
+    let mut backed_off_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.backed_off()).collect();
 
     // Sibling snapshot of `backed_off_sets`' absolute expiry (Issue #9311),
@@ -1736,8 +1772,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             Err(e) => {
                 // Per-workspace isolation: log, count, and move on — the other
                 // workspaces are still polled and dispatched this same tick.
-                report.errors += 1;
-                report.listing_failed.push(idx);
+                report.note_listing_failure(idx, &e);
                 log::warn!("work_finder: listing ready issues for workspace #{idx} failed: {e}");
                 // A rate-limit failure trips the global breaker (#4429) so the
                 // NEXT tick skips its gh fan-out entirely; this tick still
@@ -1790,6 +1825,18 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             continue;
         }
 
+        // #11901: a listed candidate whose landed cooldown no longer holds
+        // (reopened, or kept by Curator) is lifted before the backoff skip.
+        let held: Vec<u32> = ready
+            .iter()
+            .map(|i| i.number)
+            .filter(|n| backed_off_sets[idx].contains(n))
+            .collect();
+        if !held.is_empty() {
+            for n in dispatcher.lift_landed_cooldowns(&held) {
+                backed_off_sets[idx].remove(&n);
+            }
+        }
         let in_flight = &in_flights[idx];
         let now = chrono::Utc::now();
 
@@ -2167,16 +2214,10 @@ fn env_max_admissions_per_tick() -> Option<usize> {
 }
 
 /// Resolve the per-tick admission (ramp) cap with precedence **env > config
-/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default** (#4234).
-/// Resolved once at daemon startup — the same startup-capture pattern as
-/// [`resolve_max_concurrent_with_config`] — and threaded through to
-/// [`spawn_work_finder_task`] / [`spawn_multi_work_finder_task`] as a plain
-/// `usize`. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for why this is a
-/// deliberate startup-capture, not a per-tick re-read: the ramp cap's whole
-/// purpose is to smooth admission *within* the live per-tick re-computation of
-/// `max_concurrent`, so it does not itself need to be live — an operator
-/// retuning it takes effect on the next daemon restart (unlike
-/// `configured_max`, which hot-applies since #9060).
+/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default** (#4234). The
+/// production multi-workspace loop re-reads it every tick since #12090 (via
+/// [`configured_max::resolve_admissions_with_source`]); the single-workspace
+/// reference loop still takes it as a fixed `usize`.
 #[must_use]
 pub fn resolve_max_admissions_per_tick_with_config(config: &WorkFinderConfig) -> usize {
     env_max_admissions_per_tick()
@@ -2439,6 +2480,7 @@ where
                         );
                     }
                     was_rate_limited = true;
+                    tick_summary::publish_rate_limit_skip(now); // #12083
                     continue;
                 }
                 was_rate_limited = false;
@@ -2762,7 +2804,6 @@ pub fn spawn_multi_work_finder_task(
     fallback_root: PathBuf,
     interval: Duration,
     configured_max: ConfiguredMax,
-    max_admissions_per_tick: usize,
     health_states: Arc<WorkspaceHealthStates>,
     suppress_dispatch_during_gate: bool,
     event_bus: Arc<EventBus>,
@@ -2774,11 +2815,18 @@ pub fn spawn_multi_work_finder_task(
     // actually finished. That pass now runs on a blocking thread rather than
     // blocking `run_daemon` itself, so this is what still guarantees no sweep
     // is admitted before a startup reclaim of a stale `loom:building` claim
-    // has landed.
-    mut startup_reconciliation_ready: tokio::sync::watch::Receiver<bool>,
+    // has landed. Since #12222 the wait is bounded: see `startup_gate`.
+    mut startup_reconciliation_ready: tokio::sync::watch::Receiver<
+        crate::daemon_startup_reconciliation::StartupPasses,
+    >,
 ) -> tokio::task::JoinHandle<()> {
-    configured_max::log_loop_start(interval, configured_max, max_admissions_per_tick);
+    configured_max::log_loop_start(interval, configured_max);
+    // #12222: about daemon start (spawned during `run_daemon` startup).
+    let spawned_at = std::time::Instant::now();
     tokio::spawn(async move {
+        // #12073: a per-host delay before the first gather, so a fleet that
+        // restarts together does not gather all at once. First run only.
+        crate::startup_jitter::wait_first_run(&fallback_root, "work_finder").await;
         // #9060: the operator ceiling is re-resolved every tick (see the
         // `configured_max` module) — no longer a frozen startup value.
         let mut configured_max_reload =
@@ -2797,12 +2845,19 @@ pub fn spawn_multi_work_finder_task(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;
-        // Block the loop's first REAL tick body until the startup
-        // reconciliation pass has finished (#6615/#7974). Already-`true`
-        // resolves instantly (the common case: the pass is almost always
-        // faster than one tick interval), so this never adds latency once the
-        // pass has completed — including on every tick after the first.
-        let _ = startup_reconciliation_ready.wait_for(|ready| *ready).await;
+        // Block the loop's first REAL tick body until the startup passes
+        // have finished (#6615/#7974) — but the forge-bound claim pass only
+        // up to a cap (#12222): it took 20–40+ min on a host with hundreds of
+        // open-PR claims. Ticking past the cap is safe; see `startup_gate`.
+        // Already-finished resolves instantly, and only the first tick waits.
+        let gate_started = std::time::Instant::now();
+        let startup_outcome = startup_gate::wait(
+            &mut startup_reconciliation_ready,
+            startup_gate::wait_cap(&fallback_root),
+        )
+        .await;
+        let mut first_tick =
+            startup_gate::FirstTick::new(spawned_at, startup_outcome, gate_started.elapsed());
         let mut was_halted = false;
         let mut was_pressured = false;
         // #9410/#10624: the build back-off's per-repo (and optional host
@@ -2825,11 +2880,6 @@ pub fn spawn_multi_work_finder_task(
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
-        // Workspace-commands-missing tripwire (#6440): tracks which roots are
-        // currently missing .claude/commands/loom/sweep.md so the loud WARN
-        // below fires once per transition (into AND out of the condition),
-        // never every tick — mirroring `missing_roots_warned`.
-        let mut commands_missing_warned: HashSet<PathBuf> = HashSet::new();
         // Idle-edge role triggering (#4364): per-root idle level + per-(root,
         // role) debounce state. Fed one post-tick idle observation per root; on
         // the non-idle → idle edge it fire-and-forgets each configured on-idle
@@ -2837,8 +2887,11 @@ pub fn spawn_multi_work_finder_task(
         // fires.
         let mut idle_trigger = crate::role_runner::IdleTrigger::new();
         let mut was_rate_limited = false;
+        let mut step_driver = crate::step_dispatch::driver::StepDriver::default();
         loop {
             ticker.tick().await;
+            // #12074: one INFO line per tick body, and its wall-clock deadline.
+            let tick_budget = crate::step_dispatch::gather_budget::begin_tick(&fallback_root);
 
             // #8121: reload the registry and provision any newly-registered
             // root's `SweepRegistry` BEFORE the rate-limit breaker check
@@ -2880,6 +2933,7 @@ pub fn spawn_multi_work_finder_task(
                         );
                     }
                     was_rate_limited = true;
+                    tick_summary::publish_rate_limit_skip(now); // #12083
                     continue;
                 }
                 was_rate_limited = false;
@@ -2893,6 +2947,8 @@ pub fn spawn_multi_work_finder_task(
             // `maxConcurrentPerRepo` hot-applies exactly as the ceiling does.
             // `None` (the default) leaves dispatch byte-for-byte pre-#9090.
             let max_concurrent_per_repo = configured_max_reload.per_repo();
+            // #12090: and the per-tick admission (ramp) cap, from the same read.
+            let max_admissions_per_tick = configured_max_reload.max_admissions_per_tick();
             // `fallback_root` (the daemon's own seeded default) may not itself
             // be a recognized Loom workspace — e.g. a machine-level daemon
             // started under systemd with a bare `$HOME` cwd — in which case
@@ -2935,6 +2991,11 @@ pub fn spawn_multi_work_finder_task(
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
             let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
+            // #12074: from here to the step tick nothing awaits, so every forge
+            // read in between is bounded by the tick deadline and fails fast
+            // past it; a listing does not fall through to the writer.
+            let tick_deadline = std::time::Instant::now() + tick_budget;
+            let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline, true);
 
             // `roots` was already resolved (registry reload + missing-root
             // filtering) by `refresh_local_workspace_state` above, before the
@@ -3110,36 +3171,6 @@ pub fn spawn_multi_work_finder_task(
                 draining || breaker_suppressed,
             );
 
-            let mut pairs = forge::dispatcher_pairs(&pool, &roots);
-
-            // Workspace-commands-missing tripwire (#6440): a loud, ONE-TIME
-            // WARN per root on the transition into (and recovery from) the
-            // condition — never every tick. `tick_multi_with_saturation_brake`
-            // below independently re-checks this per root to decide whether
-            // to skip its candidates; this is purely the log-once concern,
-            // mirroring `filter_missing_roots`' `missing_roots_warned` dedup.
-            for (root, (_src, dispatcher)) in roots.iter().zip(pairs.iter()) {
-                let missing = dispatcher.workspace_commands_missing();
-                if missing && commands_missing_warned.insert(root.clone()) {
-                    log::warn!(
-                        "work_finder: workspace {} is missing \
-                         .claude/commands/loom/sweep.md — every dispatch to it is refused \
-                         (#4027 guard). Its ready issues will be skipped in one batch per tick \
-                         rather than retried individually (#6440). Run `loom-daemon init {}` \
-                         there. `loom-daemon status` reports this repo's HEALTH-GATE as `no-sweep` \
-                         until fixed.",
-                        root.display(),
-                        root.display()
-                    );
-                } else if !missing && commands_missing_warned.remove(root) {
-                    log::info!(
-                        "work_finder: workspace {} now has .claude/commands/loom/sweep.md — \
-                         dispatch resuming (#6440)",
-                        root.display()
-                    );
-                }
-            }
-
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
@@ -3151,7 +3182,7 @@ pub fn spawn_multi_work_finder_task(
                  build_backoff_held={build_backoff_held} (#9410), \
                  observed_idle={}, workspaces={}, priorities={priorities:?})",
                 format_idle(idle),
-                pairs.len()
+                roots.len()
             );
             if was_max_concurrent != Some(max_concurrent) {
                 log::info!("{axis_line}");
@@ -3161,18 +3192,34 @@ pub fn spawn_multi_work_finder_task(
             }
 
             let tick_started = chrono::Utc::now();
-            let report = tick_multi_with_build_backoff(
-                &mut pairs,
-                &priorities,
-                CapTerms::observed(configured_max, disk, ram),
-                &halted,
-                Some(&halt_causes),
-                max_admissions_per_tick,
+            // #12256: the tick's forge calls are children of its span.
+            let tick_parent = crate::gh_invocation::telemetry::enter_parent(Some(
+                crate::observability::ops::dispatch::tick_context(tick_started),
+            ));
+            // #11909: the step tick is the only item dispatch path.
+            let report = step_driver.tick(&crate::step_dispatch::driver::TickInputs {
+                pool: &pool,
+                roots: &roots,
+                weights: &priorities,
+                halted: &halted,
+                halt_causes: &halt_causes,
+                lanes: &lanes,
+                build_backoff: &build_backoff_held.per_workspace,
+                max_concurrent,
+                max_admissions: max_admissions_per_tick,
                 saturation_held,
-                (max_concurrent_per_repo, ram_budget, disk_budget),
-                &lanes,
-                &build_backoff_held.per_workspace,
-            );
+                limits: (max_concurrent_per_repo, ram_budget, disk_budget).into(),
+                deadline: Some(tick_deadline),
+                gather_concurrency: crate::step_dispatch::gather_budget::gather_concurrency(
+                    &fallback_root,
+                ),
+                spawn_concurrency: crate::step_dispatch::gather_budget::spawn_concurrency(
+                    &fallback_root,
+                ),
+                discovery: crate::discovery::Chain::for_root(&fallback_root),
+            });
+            drop(tick_parent);
+            drop(read_scope);
 
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
@@ -3199,14 +3246,16 @@ pub fn spawn_multi_work_finder_task(
                 ram,
                 configured_max,
                 max_admissions_per_tick,
-                workspaces: pairs.len(),
+                workspaces: roots.len(),
                 disk_note: &disk_note,
             };
             tick_line::log(&report, &tick_line);
             // #10624: which repos the build back-off deferred (INFO on change).
             build_backoff.log_deferred(&report.queue, &roots);
 
-            if !report.halted {
+            // #11857: a partial hold (say one maintain-only repo) must not
+            // silence the capacity advisory for the healthy repos beside it.
+            if !report.halted_fully() {
                 // #5305: see the single-workspace loop above — `token_bound`
                 // is now a pure starvation check, not a cross-axis comparison
                 // against disk/RAM/ceiling.
@@ -3229,8 +3278,11 @@ pub fn spawn_multi_work_finder_task(
             // on-idle role (never awaited here — the tick must not block on a
             // multi-minute role session). `draining` (#4090) suppresses firing;
             // per-root config gating (enabled + `onIdle`) is applied inside.
-            for (root, (_src, dispatcher)) in roots.iter().zip(pairs.iter()) {
-                let idle_now = dispatcher.in_flight().is_empty();
+            for root in &roots {
+                let idle_now = pool.get_or_provision(root).lock().map_or(true, |mut reg| {
+                    reg.reap_liveness();
+                    reg.occupied_issues().is_empty()
+                });
                 crate::role_runner::observe_and_fire_idle(
                     &mut idle_trigger,
                     &role_in_progress,
@@ -3239,6 +3291,8 @@ pub fn spawn_multi_work_finder_task(
                     draining,
                 );
             }
+            // #12222: time from daemon start to the first completed tick.
+            first_tick.completed(&event_bus);
         }
     })
 }

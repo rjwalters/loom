@@ -87,8 +87,9 @@ pub fn level(pr: &SequencePr) -> crate::priority_pick::Level {
 /// Why a chain head is stalled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StallCause {
-    /// The head carries this verdict-hold label (`loom:operator` is the
-    /// Champion merge-risk hold): a human must rule.
+    /// The head carries this verdict-hold label: a human must rule
+    /// (`loom:operator`), or release Champion's merge-risk / critical-file
+    /// hold (`loom:blocked` beside `loom:pr`, #11861).
     HumanHold(String),
     /// The head has no `loom:pr` verdict (fork CI `action_required`, or a
     /// review that never came).
@@ -203,8 +204,13 @@ impl StalledChain {
     pub fn action(&self) -> String {
         match &self.cause {
             StallCause::HumanHold(l) if l == "loom:operator" => format!(
-                "make the merge decision on #{} (it carries `loom:operator`, a merge-risk hold): \
-                 merge it, close it, or release the hold",
+                "decide #{} (it carries `loom:operator`: a human must act, no role will): \
+                 merge it, close it, or remove the label",
+                self.head
+            ),
+            StallCause::HumanHold(l) if l == "loom:blocked" => format!(
+                "release #{}'s `loom:blocked` (beside `loom:pr` it is Champion's merge-risk or \
+                 critical-file hold: remove the label to release it, #11861), or close it",
                 self.head
             ),
             StallCause::HumanHold(l) => {

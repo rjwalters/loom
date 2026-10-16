@@ -105,6 +105,26 @@ fn classify_halted_tick_without_token_starvation() {
     assert_eq!(c.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![KEY_TOKENS]);
 }
 
+/// #11857: one held root (say a maintain-only repo) beside healthy ones with
+/// candidates is a partial hold, not a halt, and raises no dispatch alert.
+#[test]
+fn classify_partial_hold_raises_no_dispatch_alert() {
+    let mut s = status(3, 3);
+    s.last_work_finder_tick = Some(WorkFinderTickSummary {
+        halted: true,
+        held_roots: 1,
+        halt_partial: true,
+        ..Default::default()
+    });
+    assert!(classify(&s, t0(), WINDOW, TokenCause::Exhausted).is_empty());
+    // The same held root covering the tick's work is a halt.
+    if let Some(t) = s.last_work_finder_tick.as_mut() {
+        t.halt_partial = false;
+    }
+    let c = classify(&s, t0(), WINDOW, TokenCause::Exhausted);
+    assert_eq!(c.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![KEY_DISPATCH]);
+}
+
 #[test]
 fn classify_persistent_roles_exit_78_guarded_refusal() {
     let mut s = status(3, 3);

@@ -22,7 +22,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::step_dispatch::item_draw::Exclusion;
 use crate::types::QueueDisposition;
+use crate::work_finder::step_item::PassReason;
 
 /// Payload version carried in the record's own `schema_version` field
 /// (distinct from the envelope's gate, which is `NEW_KIND_SCHEMA_VERSION`).
@@ -108,11 +110,14 @@ pub enum PickSkipReason {
     AlreadyLanded,
     /// The issue is closed as not planned (Issue #11429).
     AlreadyClosed,
+    /// The item's state calls for no step: an epic, an unpromoted proposal,
+    /// or a PR with no workflow label (the step engine's item draw, #11896).
+    NoStep,
 }
 
 impl PickSkipReason {
     /// Every reason, in declaration order (pinned by a test against the docs).
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::OverlapChain,
         Self::PrOpenSkip,
         Self::OperatorHold,
@@ -128,6 +133,7 @@ impl PickSkipReason {
         Self::NotSelected,
         Self::AlreadyLanded,
         Self::AlreadyClosed,
+        Self::NoStep,
     ];
 
     /// The snake_case wire name (identical to the serde form).
@@ -149,6 +155,7 @@ impl PickSkipReason {
             Self::NotSelected => "not_selected",
             Self::AlreadyLanded => "already_landed",
             Self::AlreadyClosed => "already_closed",
+            Self::NoStep => "no_step",
         }
     }
 
@@ -184,6 +191,30 @@ impl PickSkipReason {
             Qd::AlreadyLanded => Self::AlreadyLanded,
             Qd::AlreadyClosed => Self::AlreadyClosed,
         })
+    }
+
+    /// The reason a step-engine weight-0 [`Exclusion`] maps to (#11896).
+    ///
+    /// Total over the exclusions and the classifier's pass reasons, no catch-all, so a new pass
+    /// reason must be classified here deliberately, as a new disposition must
+    /// be in [`Self::from_disposition`].
+    #[must_use]
+    pub fn from_exclusion(exclusion: Exclusion) -> Self {
+        use PassReason as P;
+        match exclusion {
+            Exclusion::PoolExhausted => Self::Quota,
+            Exclusion::BuildBackoff | Exclusion::CoolingDown => Self::Backoff,
+            Exclusion::Pass(reason) => match reason {
+                P::Frozen | P::Operator | P::HardExclusion => Self::OperatorHold,
+                P::Claimed | P::Queued => Self::InFlight,
+                P::SharedPr => Self::PrOpenSkip,
+                P::Sequenced => Self::OverlapChain,
+                P::Blocked => Self::Blocked,
+                P::CapabilityMissing => Self::HostConstraint,
+                P::Epic | P::Proposal | P::NoStage => Self::NoStep,
+                P::CiPending => Self::Backoff,
+            },
+        }
     }
 }
 
@@ -326,6 +357,186 @@ pub struct PickWorkspaceDraw {
     pub seed_host: Option<String>,
 }
 
+/// The step engine's item draws for one tick (#11896, #12185): the seed
+/// inputs, the two exponents, each repo's roster weight and in-flight count,
+/// the weight-0 exclusion counts, the starting pool of every repo and every
+/// draw: enough to replay the sequence
+/// ([`crate::step_dispatch::item_draw::replay_record`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemDraw {
+    /// `loom-draw/v3`.
+    pub seed_scheme: String,
+    /// The wall-clock minute the seeds were derived from, as decimal text.
+    pub seed_minute: String,
+    /// The host id the seeds were derived from.
+    pub seed_host: String,
+    /// The process tick counter the seeds were derived from, as decimal text.
+    pub tick_counter: String,
+    /// How many item draws the tick made.
+    pub draws_total: usize,
+    /// The backlog exponent α the pool was weighed with, as decimal text
+    /// (it parses back to the same float). Header: repeats on every chunk.
+    #[serde(default)]
+    pub backlog_exponent: String,
+    /// The busy-ness exponent β, as decimal text. Header.
+    #[serde(default)]
+    pub busy_exponent: String,
+    /// Every repo with an item in the pool: its roster weight, its
+    /// `in_flight_repo` and its starting `n_items`. Header: repeats on every
+    /// chunk, so read it from one chunk only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<PickItemRepo>,
+    /// The repos a per-repo cap took out of the pool mid-tick. Header.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closures: Vec<PickItemClosure>,
+    /// Weight-0 items per workspace and reason. Header: repeats on every
+    /// chunk, so read it from one chunk only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<PickItemExclusion>,
+    /// The pool before the first draw, repos in workspace order and each
+    /// repo's items in item order; `index` counts across the whole pool (the
+    /// chunk's in-order slice). Empty only when nothing was drawn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<PickItemPoolEntry>,
+    /// Every draw, in order (the chunk's in-order slice).
+    pub draws: Vec<PickItemDrawStep>,
+    /// The repos in the pool when its total weight overflowed `u64`
+    /// (`DrawError::WeightOverflow`, #11909): no further item was drawn this
+    /// tick. Header: repeats on every chunk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weight_overflow: Vec<String>,
+}
+
+/// One repo's terms in the item draw (#12185).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemRepo {
+    /// Forge `owner/repo`.
+    pub repo: String,
+    /// `w_repo`: the roster weight.
+    pub weight: u32,
+    /// `in_flight_repo`: the repo's items worked on when the tick drew.
+    pub in_flight: usize,
+    /// `n_items`: the repo's items in the starting pool.
+    pub items: usize,
+    /// `S_r`: the sum of their item weights.
+    pub pool_weight: u64,
+}
+
+/// A repo a per-repo cap took out of the item pool mid-tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemClosure {
+    /// Forge `owner/repo`.
+    pub repo: String,
+    /// Draws taken before it closed: it is absent from every draw with an
+    /// index at least this.
+    pub after_draw: u32,
+}
+
+/// One item of the starting pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemPoolEntry {
+    /// Forge `owner/repo`.
+    pub repo: String,
+    /// 0-based position in the whole pool.
+    pub index: u32,
+    /// The number the step acts on (the PR for a PR step).
+    pub number: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u32>,
+    /// The step (`builder`, `judge`, ...).
+    pub step: String,
+    /// The item weight `iw`: `priority × (divisor_min + min(age_min,
+    /// cap_min))`.
+    pub weight: u64,
+    /// The priority factor.
+    pub priority: u32,
+    /// The age term × 1000.
+    pub age_permille: u64,
+    /// `mirror`, `events`, `created` or `none`.
+    pub age_source: String,
+}
+
+/// How many items of one workspace a reason kept out of the item draw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemExclusion {
+    /// Forge `owner/repo`, or `repo_unresolved`.
+    pub repo: String,
+    /// The classifier's pass reason (`frozen`, `claimed`, `no_stage`, ...)
+    /// or `pool_exhausted` / `build_backoff`.
+    pub reason: String,
+    /// The closed-set skip reason it maps to
+    /// ([`PickSkipReason::from_exclusion`]).
+    pub skip_reason: PickSkipReason,
+    pub count: usize,
+}
+
+/// One item draw: the seed, the pool, the roll and the drawn item's weight
+/// terms (`weight = actionable × priority × age`, and the repo terms the pool
+/// weight scales it by).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemDrawStep {
+    /// Forge `owner/repo` of the drawn item.
+    pub repo: String,
+    /// 0-based draw index within the tick (the seed's last input).
+    pub draw_index: u32,
+    /// The draw's seed, as decimal text.
+    pub seed: String,
+    /// Items in the pool when drawn.
+    pub pool_size: usize,
+    /// Their total weight.
+    pub total_weight: u64,
+    /// The roll in `0..total_weight`.
+    pub roll: u64,
+    /// The drawn item's index in the pool as it stood: the `pools[]` entries
+    /// minus earlier picks and closed repos, in pool order.
+    pub picked_index: usize,
+    /// The number the step acts on (the PR for a PR step).
+    pub number: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u32>,
+    /// The step (`builder`, `judge`, `champion_merge`, ...).
+    pub step: String,
+    /// The drawn item's item weight `iw`, `priority × (divisor_min +
+    /// min(age_min, cap_min))`.
+    pub weight: u64,
+    /// The drawn item's draw weight in this draw: `w_repo × iw ×
+    /// S_r^(α−1) × (1 + in_flight_repo)^(−β)`, scaled to integers
+    /// ([`crate::step_dispatch::item_draw::pool_weights`]). Its share of
+    /// `total_weight` is the item's probability.
+    #[serde(default)]
+    pub draw_weight: u64,
+    /// `w_repo`: the drawn item's repo's roster weight.
+    #[serde(default)]
+    pub repo_weight: u32,
+    /// `n_items`: the repo's items in the pool at this draw.
+    #[serde(default)]
+    pub repo_items: usize,
+    /// `S_r`: the sum of their item weights.
+    #[serde(default)]
+    pub repo_pool_weight: u64,
+    /// `in_flight_repo`: the repo's items worked on.
+    #[serde(default)]
+    pub in_flight_repo: usize,
+    /// Always 1 for a drawn item.
+    pub actionable: u8,
+    /// The priority factor.
+    pub priority: u32,
+    /// The level it was read from, after the very-important cap.
+    pub level: String,
+    /// `red_main`, `normal` or `capability`.
+    pub lane: String,
+    /// The age term × 1000.
+    pub age_permille: u64,
+    /// The stage age in whole minutes, uncapped.
+    pub age_minutes: u64,
+    /// `mirror`, `events`, `created` or `none`.
+    pub age_source: String,
+}
+
 /// A `loom:very-important` issue the flood cap ranked as `loom:important`
 /// this tick (#11509): its workspace already has an older open one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,6 +619,26 @@ pub struct PickDecisionRecord {
     /// is one query. Empty for every other record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lanes: Vec<PickLane>,
+    /// The repository a role tick ran for (#11858): forge `owner/repo`, or
+    /// `repo_unresolved`. Present on every role record, so a tick with an
+    /// empty queue still names its repo; absent on work-finder records (their
+    /// candidates name their own repos) and on an older daemon's records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The step engine's item draws (#11896); `None` everywhere else. The
+    /// header repeats on every chunk; `draws` is the chunk's in-order slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_draw: Option<PickItemDraw>,
+    /// A completed work-finder tick's canonical dispatch result (#11840):
+    /// exactly the `loom.dispatch.result` token
+    /// [`crate::observability::ops::dispatch::tick_result`] classified from
+    /// the tick's own report (`dispatched`, `halted_<cause>`, `halted`,
+    /// `saturation_held`, `error`, `build_backoff_held`, `no_eligible_work`,
+    /// `capacity_full`, `all_skipped`). Repeats on every chunk. Absent on
+    /// role ticks and on older daemons' records: absence means unavailable,
+    /// never idle or ready. Additive beside the legacy `outcome`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_result: Option<String>,
 }
 
 /// One repository's lane computation (#10630): `lanes = clamp(ceil(debt / k),
@@ -493,6 +724,9 @@ impl PickDecisionRecord {
             workspace_draw: None,
             very_important_demoted: Vec::new(),
             lanes: Vec::new(),
+            repo: None,
+            item_draw: None,
+            dispatch_result: None,
         }
     }
 
@@ -514,6 +748,21 @@ impl PickDecisionRecord {
     #[must_use]
     pub fn with_workspace_draw(mut self, draw: Option<PickWorkspaceDraw>) -> Self {
         self.workspace_draw = draw;
+        self
+    }
+
+    /// Attach the step engine's item draws (#11896) in full.
+    #[must_use]
+    pub fn with_item_draw(mut self, draw: Option<PickItemDraw>) -> Self {
+        self.item_draw = draw;
+        self
+    }
+
+    /// Attach the work-finder tick's canonical dispatch result (#11840), as
+    /// the caller classified it once from the tick's report.
+    #[must_use]
+    pub fn with_dispatch_result(mut self, result: Option<&str>) -> Self {
+        self.dispatch_result = result.map(str::to_string);
         self
     }
 
@@ -547,12 +796,14 @@ enum PickChunkEntry {
     Act(PickAction),
     Draw(PickDraw),
     Demoted(PickViDemotion),
+    ItemPool(PickItemPoolEntry),
+    ItemDraw(PickItemDrawStep),
 }
 
 /// Split `record` into chunks whose JSON is at most `max_bytes` each (one
 /// chunk, unchanged but for `chunk_index: 0, chunk_count: 1`, when it fits).
 /// Every chunk repeats the header (`role`, `host`, `tick_id`, the tick
-/// bounds, `outcome`, `candidates_total`, `candidate_source`,
+/// bounds, `outcome`, `dispatch_result`, `candidates_total`, `candidate_source`,
 /// `decisions_observed`, and `workspace_draw.seed` / `draws_total` /
 /// `seed_scheme` / `seed_minute` / `seed_host`); the
 /// `candidates`, `skipped`, `acted`, `workspace_draw.draws` and
@@ -595,6 +846,24 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
             std::mem::take(&mut header.very_important_demoted)
                 .into_iter()
                 .map(PickChunkEntry::Demoted),
+        )
+        .chain(
+            header
+                .item_draw
+                .as_mut()
+                .map(|d| std::mem::take(&mut d.pools))
+                .unwrap_or_default()
+                .into_iter()
+                .map(PickChunkEntry::ItemPool),
+        )
+        .chain(
+            header
+                .item_draw
+                .as_mut()
+                .map(|d| std::mem::take(&mut d.draws))
+                .unwrap_or_default()
+                .into_iter()
+                .map(PickChunkEntry::ItemDraw),
         );
 
     // Header plus room for the multi-digit chunk numbers.
@@ -609,6 +878,8 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
             PickChunkEntry::Act(a) => json_len(a),
             PickChunkEntry::Draw(d) => json_len(d),
             PickChunkEntry::Demoted(d) => json_len(d),
+            PickChunkEntry::ItemPool(p) => json_len(p),
+            PickChunkEntry::ItemDraw(d) => json_len(d),
         } + 1; // the separating comma
                // Cut between entries; a lone oversized entry still goes out whole.
         if used > 0 && used + len > budget {
@@ -633,6 +904,18 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
                 .draws
                 .push(d),
             PickChunkEntry::Demoted(d) => chunk.very_important_demoted.push(d),
+            // The header's `item_draw` (with emptied `draws`) is on every
+            // chunk, so the draw lands in it.
+            PickChunkEntry::ItemPool(p) => {
+                if let Some(item_draw) = chunk.item_draw.as_mut() {
+                    item_draw.pools.push(p);
+                }
+            }
+            PickChunkEntry::ItemDraw(d) => {
+                if let Some(item_draw) = chunk.item_draw.as_mut() {
+                    item_draw.draws.push(d);
+                }
+            }
         }
         used += len;
     }

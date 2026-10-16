@@ -6,7 +6,831 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-16
+- **PR #12376**: fix: reword stacked-rebase comment and baseline forge calls to restore green main
+- **Issue #12373** (closed): main red: rebase-stacked-children.sh (#9808) fails rebase_guard callsite test and forge_inventory gate
+- **PR #12365**: chore(harness): track latest CLIs — codex 0.162.1→0.163.0 opencode 1.19.1→1.19.2
+- **PR #12366**: fix: define _sha256 helper in champion-epic Step 4 escalation block
+- **Issue #12356** (closed): champion-epic.md Step 4 escalation block uses _sha256 without defining it
+- **PR #12363**: docs: record safehouse extraction measurement and no-go in lib-test shrink design
+- **Issue #12157** (closed): Prototype and time a loom-safehouse crate extraction (loom-daemon lib-test shrink, step 0)
+- **PR #12338**: refactor: delete the forge stage-dwell sampler from the daemon
+- **Issue #12316** (closed): Delete the stage-dwell sampler from the daemon (dwell is a consumer's computation over the mirror's label times)
+- **PR #12334**: feat: merge stale stacked children in merge-only repos instead of only warning
+- **Issue #9808** (closed): merge-based de-stacking for stacked PR children (the rebase remedy is policy-barred; children go stale on every base move)
+- **PR #12358**: test: guard the last two integration crates against live gh spawns
+- **Issue #10225** (closed): loom-daemon integration tests (tests/*.rs) may still reach the real gh; extend the #10138 live-gh guard to them
+- **PR #12361**: docs: reattach task_dump and SIGUSR1 comments to their code
+- **Issue #11116** (closed): Umbrella: tests are not hermetic — host env, real binaries and shared process state leak into suites (21 bugs)
+- **Issue #12332** (closed): Fix displaced comments from SIGUSR1 task dump change (#12129)
+- **PR #12191**: feat(telemetry): carry provenance join facts as plain span attributes
+- **Issue #11982** (closed): Provenance out of Loom, stage 1: facts contract on spans and telemetry-schema doc
+- **Issue #11347** (closed): [Epic #9908] Phase 2c: Execution journal shadow appends from checkpoint CLI
+- **PR #12348**: feat(journal): shadow checkpoint.completed appends from sweep-checkpoint write
+- **Issue #12339** (closed): Session image: carry python3, uv and git with a container-local UV_PROJECT_ENVIRONMENT
+- **PR #12352**: feat: add pinned uv and container-local UV_PROJECT_ENVIRONMENT to session image
+- **Issue #12038** (closed): Telemetry: hold-age gauge (loom.forge.hold_age_seconds) from fleet.state held_since + mirror labels_at for parked issues
+- **PR #12301**: feat: export hold-count and hold-age gauges from the state mirror
+- **PR #12360**: test: assert maintain-only dispatch refusals are not tick errors
+- **PR #12353**: fix: shell exporters use loom-daemon host-id; add running/stopped/silent host query
+- **PR #12350**: test: hold first run in fairness_a_real_run to remove slot race
+- **PR #12349**: docs: add close-out rule for filing and parking a decision's follow-ups
+- **PR #12347**: feat: add discovery snapshot interface with Mirror worklist and Direct backends
+- **Issue #12340** (closed): Session containers: use the host's current loom-daemon (mount or install at start), not the baked one
+- **PR #12337**: docs: route Champion epic and capped-PR escalations through operator-decision apply
+- **PR #12335**: feat: tag forge calls with loom.forge.purpose and send a discovery header
+- **PR #12331**: docs: document quiet-bucket unknown gap and ambient gauge condition
+- **PR #12329**: fix: allow literal loop-variable writes under cd /tmp/<dir> in write-confinement guard
+- **PR #12328**: fix: clear label-only loom:merge-conflict on mergeable held/sequenced PRs
+- **PR #12327**: live_gh_guard: the leaking fixture leaks only under its own self-test
+- **PR #12326**: feat: export a per-repo CI queue-depth gauge from the CI telemetry poll
+- **PR #12324**: docs: record keep/move verdict for every restart --drain user
+- **Issue #12310** (closed): Discovery telemetry: `loom.forge.purpose` (discovery | gate | write) on every forge call, plus the request header the gateway reserve reads
+- **Issue #12308** (closed): Wake the step tick early from the mirror change stream
+- **Issue #12306** (closed): Discovery interface: mirror and direct backends, one snapshot per step tick
+- **PR #12305**: test: pin stage-dwell zero-call guarantee; skip idle dispatcher heartbeat read
+- **PR #12302**: Step tick: spawn concurrently across repos, time each spawn sub-phase (#12298)
+- **Issue #12300** (closed): lease_renewer: stop_pid_never_signals_a_real_unrelated_process fails on main (Linux CI shard 1/5)
+- **Issue #12298** (closed): Step tick spawn half is serial (~85 s/tick): claim subprocess + account-selection wait per spawn; spawn concurrently across repos
+- **PR #12297**: Step tick: concurrent gather listings, per-phase timing, tick-parented forge calls (#12256)
+- **PR #12292**: refactor: share one pending-CI page loop between the PR gate and the release backstop
+- **PR #12291**: feat: draw step items from one weighted pool across repos
+- **Issue #12290** (closed): Base-conflict pass: clear loom:merge-conflict on held/sequenced loom:pr PRs once mergeable
+- **Issue #12289** (closed): Flaky test: role_runner::concurrent_dispatch fairness_a_real_run_does_not_resume_and_a_new_tick_replaces_pending
+- **PR #12288**: test: wait for parseable PID in native tool termination test
+- **Issue #12285** (closed): guard: allow variable-derived relative writes after a literal /tmp cwd (bounded, fail-closed otherwise)
+- **PR #12284**: fix: one required-only rule for failing checks in merge-pr.sh and Champion criterion 6
+- **PR #12282**: fix: decide over observed checks when wait-checks required lookup is permission-refused
+- **PR #12281**: chore(harness): track latest CLIs — opencode 1.19.0→1.19.1
+- **Issue #12280** (closed): Trace surviving users of the restart --drain family and move or keep each (for #12148)
+- **PR #12276**: fix: recover poisoned step-driver lock and drop step roles from reported loops
+- **PR #12263**: fix(step_dispatch): end an owner's draws for the tick on claim_unverified
+- **Issue #12260** (closed): Step tick: a claim_unverified refusal should end the owner's draws for the tick (writer rate limit burns the pass budget)
+- **PR #12259**: fix: accept approve/request-changes in verdict marker readers
+- **PR #12258**: feat: record why a step's lease pre-claim was unverified on the dispatch span
+- **Issue #12256** (closed): Step work-finder tick takes ~3 min: freed slots wait that long, hosts idle below budget with thousands of candidates
+- **PR #12254**: feat: emit session.summary for Codex rollouts
+- **PR #12243**: fix: self-heal owns only payload-shipped files and re-attaches stale detached HEADs
+- **PR #12235**: feat: emit counted write_scope.refused OTLP record per refused daemon write
+- **PR #12232**: fix: skip repo-local daemon builds older than the installed daemon
+- **PR #12225**: docs: list counted evaluations with links in Champion repeated-rejection escalations
+- **Issue #12219** (closed): stage_dwell kill switch follow-ups: end-to-end zero-call test, docs nits, captain heartbeat read when idle
+- **PR #12214**: fix(hooks): judge raw and canonical Edit/Write paths for role-tool-policy
+- **PR #12213**: feat(telemetry): record each role tick's prompt tree on role_tick.outcome
+- **PR #12209**: fix(claim-staleness): treat a live PR lease as fresh and fail closed on empty claim timestamp
+- **Issue #12196** (closed): test flake: terminating_native_tool_terminates_its_shell_descendants fails on Rust Unit Tests (2/5)
+- **Issue #12185** (closed): Step dispatch: draw items from one fleet-wide weighted pool, tuned by a minimal set of fleet-gitops hyperparameters
+- **Issue #12183** (closed): Record why a step's lease claim was unverified on the loom.dispatch.step span
+- **PR #12179**: docs: require a stated reason class for loom:operator holds
+- **PR #12171**: refactor: delete shell classifier tables, keep native delegation
+- **PR #12169**: feat(lease): add lease release to hand back an attended lease
+- **Issue #12168** (closed): telemetry: emit a counted event per write refused by the #9548 credential-scope guard
+- **PR #12164**: perf(observability): append+compact journal for DurableQueue
+- **Issue #12137** (closed): merge-pr.sh and Champion criterion 6 disagree on non-required failing checks (pending-to-failed during --auto)
+- **PR #12129**: feat: dump async task tree to the daemon log on SIGUSR1
+- **PR #12123**: test: guard loom-daemon integration crates against the real gh
+- **Issue #12111** (closed): Record each role tick's prompt tree (loom.prompt.*) on role_tick telemetry
+- **Issue #12104** (closed): verdict-staleness guard reads verdict=approve as no verdict; share one marker parser
+- **Issue #12103** (closed): Lease: add 'lease release', and stop a subagent's --watch-pid lease outliving the subagent
+- **Issue #12081** (closed): Repeated-rejection escalation counts a silent skip as a second rejection
+- **Issue #12080** (closed): Document that loom:operator must carry a stated operator-only reason
+- **Issue #12079** (closed): Add an in-process task/stack dump for a hung daemon tick (hosts restrict ptrace)
+- **Issue #12059** (closed): ETA telemetry: operator_recency/hold_release_burst (#11956) not surfacing in SigNoz on floor 1161
+- **Issue #12049** (closed): Step dispatch: poisoned-lock handling and stale role reporting
+- **Issue #12016** (closed): Deduplicate the pending-CI page loop (pr_planning/ci_gate.rs vs cli/pr_lease/backstop.rs)
+- **Issue #11993** (closed): telemetry(ci): emit CI queue-depth gauge (loom.ci.queue_depth); runner-wait already shipped
+- **Issue #11989** (closed): Role sessions run prompts from stale per-host repo checkouts (re-adds retired labels after migration)
+- **Issue #11947** (closed): Judge bounded-fallback reclaim fires against a live, renewing lease (empty claim timestamp in the reclaim message)
+- **Issue #11862** (closed): Codex role runs emit no usage span or session summary
+- **Issue #11837** (closed): forge wait-checks: required-context lookup 403s (needs Administration:read) — post-verdict refuses every approval
+- **Issue #11285** (closed): Sweeps: run each phase on its role's runtime (GLM Builder/Doctor via a phase-worker subcommand; Judge/Curator never GLM)
+- **Issue #11227** (closed): role-tool-policy: Edit/Write check sees only the canonical path, so a symlinked credential directory is writable by a read-only role (#8256 follow-up)
+- **Issue #11219** (closed): Retire classify-error.sh's shell fallback tables once consumers pin loom-daemon classify-error
+- **Issue #11137** (closed): DurableQueue rewrites and fsyncs the whole queue file on every push (O(capacity) per offer)
+- **Issue #10940** (closed): Agent decisions name follow-ups ('file X', 'handed back to Curator') that nobody files; file and park at decision time
+- **Issue #10392** (closed): fleet-config: a repo/workspace tier from the fleet store (fleet/repo-defaults.json + per-repo overrides)
+- **Issue #10098** (closed): Route Champion and sweep operator-decision escalations through loom-daemon operator-decision apply
+- **Issue #10079** (closed): locate-daemon-bin prefers a stale target/ build over the installed daemon — post-comment.sh fails for every role session on that host
+- **Issue #10023** (closed): daemon: one stable host.id per machine, plus start/stop/heartbeat events in SigNoz
+
+### 2026-10-15
+- **PR #12303**: test(lease-renewer): wait for exec before judging a real sleep's argv (main red)
+- **PR #12299**: feat(config): report fleet-vs-repo tier conflicts in validate
+- **PR #12296**: Champion: batch its forge reads onto REST (one facts read per PR)
+- **Issue #12295** (closed): CI red on main: cli::lease_renewer::tests::stop_pid_never_signals_a_real_unrelated_process fails at tests.rs:375
+- **PR #12294**: feat: show H5 step elapsed/budget in status and report gh changes on refresh
+- **Issue #12293** (closed): Report step roles (StepRole) in status/health alongside interval roles
+- **PR #12286**: fix: apply root owner's gh credential to roll lease-refresh child
+- **PR #12283**: docs: record consumer hook settings ownership boundary (ADR-0026)
+- **PR #12278**: fix: make the Builder step claim verify its lease and fail closed
+- **PR #12277**: fix: resolve tracked config from origin/HEAD when main checkout is behind
+- **PR #12275**: fix(doctor): stand down on a PR another actor is working (#12105)
+- **PR #12274**: fix(ratelimit): attribute trips to the tripping credential, call the rest unattributed
+- **PR #12273**: fix(observability): close a step's loom.sweep span at the step's end (#12253)
+- **PR #12272**: Agent gh front: route passthrough reads to a reader App before the writer
+- **PR #12271**: test: route 15 integration crates through a fake gh and restore live_gh_guard
+- **PR #12270**: fix(daemon): startup claim cutoff margin, first-tick typed telemetry (#12230)
+- **PR #12269**: Fix main compile: initialize failure_class in deferred_tick
+- **PR #12267**: Stop Builder redraws of branch-landed issues; persist the step ledger
+- **PR #12266**: Export per-agent-scope MemoryMax, source, peak and OOM kills (#12241)
+- **PR #12265**: Champion re-checks a dependency park on every draw (#12078)
+- **PR #12264**: fix(lease): refuse a --step PR claim whose ordering stays unverified (#12252)
+- **PR #12261**: docs(release-cadence): document the hand-cut bump PR escape hatch (#12132)
+- **PR #12257**: fix: remove dead Biome block from pre-commit hook
+- **PR #12255**: feat(daemon): live, layered config keys for the per-agent-scope MemoryMax (#12246)
+- **Issue #12253** (closed): Step loom.sweep spans are only ever closed by recovery as process_lost (durations and outcomes unusable)
+- **Issue #12252** (closed): lease pr claim --step: verify_order maps Unverified to HELD (residual fail-open)
+- **Issue #12251** (closed): Step dispatch redraws an issue as Builder after its branch-linked PR merged (no Closes keyword); repeat cap resets on every roll
+- **PR #12247**: feat: emit a daemon.exit telemetry record on shutdown
+- **Issue #12246** (closed): Per-agent-scope MemoryMax is env-only: make it a live, layered config key (autonomous.agentMemoryMax) so fleets can turn it off or tune it per host
+- **Issue #12245** (closed): Agent gh front: send passthrough reads to a reader App, not the writer, when the gateway isn't published
+- **PR #12244**: fix: shed stage_dwell listing reads as Observability instead of using the writer
+- **Issue #12242** (closed): Champion: batch its reads instead of per-item gh calls (largest non-daemon GraphQL spender)
+- **Issue #12241** (closed): Telemetry gap: per-agent-scope MemoryMax, peak and OOM kills are not exported (#11094 caps are invisible)
+- **Issue #12240** (closed): Agent-session forge calls (agent.gh.*) aren't exported to telemetry
+- **PR #12239**: feat(telemetry): record rate-limit-skipped work-finder ticks in pick.decision
+- **Issue #12238** (closed): loom.ratelimit.trip: 'external' counts other hosts, and 'own' mixes credentials
+- **PR #12234**: feat: flag conflicting loom:pr PRs in the base-conflict pass
+- **PR #12233**: test: pin the page-spacing test's gap so it ignores stub exec time
+- **PR #12231**: refactor: remove the inert star-facts captain-gauges job
+- **Issue #12230** (closed): Startup claim cutoff: round down to the second and subtract a margin; fix stale daemon-reference line
+- **PR #12229**: refactor: remove never-called budget and cost-rollup API from activity
+- **PR #12228**: fix: give plain-exec codex prompt runs /dev/null stdin
+- **PR #12227**: chore: bump version to 0.19.1166
+- **PR #12226**: fix: stop fleet-store run state claiming the host is dispatching
+- **PR #12224**: fix: hold applied-SHA cell per thread in test builds
+- **PR #12223**: fix(daemon): bound the work finder's wait for startup reconciliation (#12222)
+- **Issue #12222** (closed): First work-finder tick after a restart waits behind the full checkout_ff pass (20+ min of no dispatch per roll)
+- **PR #12218**: fix(agent-gh): route dispatched agents' gh reads through the gateway and readers, not the writer
+- **PR #12216**: work_finder: stop landed_closing_refs re-asking every tick; gate it off by default (#12205)
+- **PR #12215**: Cache rate-limit probes per credential until reset; drop standalone GraphQL rateLimit (#12204)
+- **PR #12212**: feat(hooks-home): warn when a LOOM_HOOKS_HOME pin skips the trust check
+- **PR #12211**: Stage-dwell sampler off by default behind a live kill switch (#12203)
+- **PR #12210**: fix: treat existing directory citations as present in verify-proposal-refs
+- **Issue #12208** (closed): work_finder.landed_closing_refs: cache closing refs for landed PRs and keep the query off the dispatch App
+- **Issue #12207** (closed): Agent-session gh reads (agent_gh_front) still use the dispatch App instead of the gateway or readers
+- **PR #12206**: fix: log maintain-only dispatch refusals at info, not warn
+- **Issue #12205** (closed): Step gather: per-host listings and landed_closing_refs GraphQL cost ~6k GitHub calls/h; use the mirror, ETags and a closing-refs cache
+- **Issue #12204** (closed): Rate-limit probing costs ~4.2k GitHub calls/h on the dispatch App; read budget from response headers instead
+- **Issue #12202** (closed): Rate-limit probing: cache per (account, resource) until reset and use response headers, not repeated probes
+- **PR #12201**: feat(telemetry): daemon emits issue.estimate from observed curation
+- **PR #12200**: ci: bound nextest discovery with a separate compile step and run timeout
+- **PR #12199**: docs: add CI contract with required set, layer authority and cut rules
+- **PR #12197**: chore: bump version to 0.19.1165
+- **PR #12195**: fix(hooks): never build loom-daemon in the post-worktree hook
+- **PR #12194**: fix(check-claim): ignore the caller's own sweep lease
+- **Issue #12193** (closed): stage_dwell: /issues listing reads still use the dispatch App after #12138
+- **PR #12192**: test(write-scope): clear ambient TTL override in cache tests
+- **PR #12190**: fix(worker_spawn): read OpenCode's nested part.tool in toolless-launch classifier
+- **PR #12189**: feat(telemetry): flag exported kinds silent for 24h in otlp_export health
+- **PR #12188**: feat(telemetry): export failure class on failed role ticks
+- **PR #12187**: fix(auto-update): re-check a standing unsatisfiable floor every 2 minutes
+- **PR #12184**: fix(fleet): keep recorded run state on malformed fleet.json; journal removals; report all repo errors
+- **PR #12182**: ci: merge jobs into Lint, two native-suite legs and one change detector (#12106)
+- **PR #12181**: ci(version-bump): publish the bump through fleet-publish (OIDC), never push
+- **PR #12180**: test: widen polling bounds and wait on child readiness in subprocess-timing tests
+- **PR #12178**: fix: ignore pre-exec fork children when sampling git peak RSS
+- **PR #12177**: fix: refuse step spawns whose role command is missing from the workspace
+- **PR #12176**: ci: remove ratchet, budget and process checks from the PR path (#12106)
+- **PR #12175**: Fix red main: keep check-cas-recheck-consistency.sh within the shell budget
+- **PR #12174**: feat: journal the PR queue from the daemon at role-tick dispatch
+- **PR #12172**: fix: keep review and repair steps running while main is red
+- **PR #12170**: fix(preflight): tear down the gate tree on SIGTERM/SIGINT/SIGHUP
+- **PR #12165**: test: assert status read ordering, not elapsed time, in dispatch poll test
+- **Issue #12163** (closed): Route 15 loom-daemon integration crates through a fake gh, then restore the live-gh guard
+- **PR #12162**: Fix red main: cas-recheck check script tripped the forge-call guards
+- **PR #12161**: fix(gateway): classify note_attempt by parsed status before exit code
+- **PR #12160**: fix(worker): name profile, source and known profiles in unknown-profile error
+- **PR #12159**: docs: design for shrinking the loom-daemon lib-test compile unit
+- **PR #12158**: fix(safehouse): narrate merged step work to the public feed; defer, then catch up, reconciliation
+- **PR #12156**: chore: bump version to 0.19.1164
+- **PR #12153**: test: unset ambient CARGO_TARGET_DIR in three target-dir suites
+- **Issue #12152** (closed): Step dispatch: merged work is no longer narrated to the public feed (no SweepExited; reconcile gated by the forge breaker)
+- **PR #12151**: fix: deny instead of ask on a shared cargo build.target-dir
+- **PR #12150**: fix: re-arm the no-op cooldown from the outcome journal on restart
+- **PR #12149**: test(fleet_sync): tolerate injected hook trailers in resync commit assertion
+- **Issue #12147** (closed): Pause-and-roll polish: H5 status line reads as stuck; gh version check cached for the process life (from #11812)
+- **PR #12146**: test: register land-resync fixtures with the real write-scope gate
+- **PR #12145**: fix: wait out a briefly held trace journal drain lock
+- **PR #12144**: fix: make check_branch_name locale-independent without LC_ALL override
+- **PR #12143**: fix(collector): forge gathers starve host.health/host.export (0.19.1163 regression from #12100)
+- **PR #12142**: fix: champion rechecks skip loom:blocked and loom:frozen
+- **PR #12141**: fix: ignore .loom/private-jobs/ runtime state in managed gitignore block
+- **PR #12140**: Harden verdict path: make post-verdict.sh the sole merge-gating verdict writer (#12136)
+- **PR #12139**: fix: gate SQL DDL guard on what executes the statement
+- **PR #12138**: fix(forge): Observability reads never fall to the writer; name fleet.state reads
+- **Issue #12136** (closed): Harden the verdict path: make post-verdict.sh the sole merge-gating verdict writer (close #9258 × #6319 hard-stall)
+- **PR #12135**: fix: saturate role-draw weight sums and fall through empty attempt tables
+- **Issue #12134** (closed): Architect: shrink the loom-daemon cfg(test) lib-test compile unit (move tests out or split the crate) — follow-up to #12089
+- **Issue #12133** (closed): Step dispatch: several hosts spawned concurrent Builders on one item while lease reads were throttled (1162)
+- **Issue #12132** (closed): Version bump shares the fleet dispatch App's rate limit, so a fleet-wide read drain blocks the release that fixes it
+- **PR #12131**: chore: bump version to 0.19.1163
+- **PR #12130**: feat(telemetry): emit skipped_deferred role_tick.outcome for budget-deferred repos
+- **PR #12128**: refactor: retire the gh ladder from forge_gh_comment_rl_safe
+- **PR #12125**: fix: exit 5 from sync-labels.sh when label writes fail, retry rate limits
+- **Issue #12124** (closed): Gateway failure counter: treat a parsed HTTP status >= 500 as unanswered regardless of exit code
+- **PR #12122**: merge-pr: delete the freshness guard, re-date remedy and ci-result gate (#12063 slice 1)
+- **Issue #12120** (closed): Telemetry: host.health flags a registered kind silent for 24h
+- **Issue #12119** (closed): Telemetry: daemon journals the PR queue at role-tick dispatch, not via pr-queue
+- **Issue #12118** (closed): Telemetry: daemon emits issue.estimate from observed curation, not curation-complete
+- **PR #12116**: ci: remove Lines of Code workflow and README badge
+- **PR #12110**: Hot-reload work-finder tuning keys (maxAdmissionsPerTick, saturationBrake, hostBreaker) from the fleet store
+- **PR #12109**: Remove the file-size budget CI check; Hermit may propose splits instead
+- **PR #12108**: Remove the loom:blocked release pass and the fleet.state producer
+- **PR #12107**: fix: drop merge=union on the telemetry kind registry
+- **Issue #12106** (closed): Simplify CI: drop ratchet/budget/process checks from the PR path and merge jobs
+- **Issue #12105** (closed): Doctor claims a changes-requested PR another actor is actively fixing (parallel pushes)
+- **PR #12101**: Bound the work-finder tick with a deadline; fail its forge reads fast (#12074)
+- **PR #12100**: feat(daemon): per-host post-restart jitter for the first fleet-wide gather (#12073)
+- **Issue #12099** (closed): Remove the file-size budget CI check (scripts/check-file-size-budget.sh)
+- **PR #12098**: fix(bash-3.2): check-shell-syntax empty FILES under set -u; retire stale root script forks to pay the budget (#12068)
+- **PR #12097**: Close run-job dangling-symlink refusal gap on BSD/GNU; portable macOS test fixtures
+- **PR #12096**: fix: mask quoted '>' inside backtick substitutions in write-confinement guard
+- **Issue #12095** (closed): Champion lifts a loom:blocked item when the work finder draws it and its blockers have closed
+- **PR #12092**: Shrink daemon_service.rs back under its frozen size (#12088)
+- **Issue #12090** (closed): Work-finder tuning keys (maxAdmissionsPerTick, intervalSecs, brakes) should hot-reload from the fleet store like maxConcurrent
+- **Issue #12089** (closed): test: cut the loom-daemon lib-test (cfg(test)) compile, the measured critical path of every Rust Unit Tests leg
+- **Issue #12088** (closed): main fails the file-size budget: daemon_service.rs grew 1154 -> 1155 (Structural Checks red on every PR)
+- **Issue #12087** (closed): hooks_home: a LOOM_HOOKS_HOME env override skips the trust check without a warning
+- **Issue #12084** (closed): Telemetry(champion): emit effective per-repo Champion cadence + un-lumped merge-pass skip reasons (ETA merge_wait, loom-ui#4063 #5)
+- **Issue #12083** (closed): Telemetry(dispatch): un-lump pick.decision skip disposition (QueueDisposition/split cap+halted) + held_until on skipped rows (ETA ready_wait, loom-ui#4063 #1)
+- **Issue #12078** (closed): Champion: revisit a loom:blocked item each time the work finder draws it
+- **Issue #12076** (closed): Worktree-isolation guard treats a '>' inside a quoted argument as a shell redirect
+- **PR #12075**: No-op hold: fleet-wide streak, loom:blocked park, fed by Builder steps (never loom:operator)
+- **Issue #12074** (closed): Step tick has no deadline: a fleet roll starves every host's first tick
+- **Issue #12073** (closed): Restart burst: every daemon's first full GitHub gather after a floor roll drains the fleet's read budget
+- **Issue #12072** (closed): Fleet floor: an unsatisfiable floor isn't re-checked when the platform asset lands
+- **Issue #12068** (closed): check-shell-syntax.sh fails under macOS bash 3.2 (empty array under set -u) — fix without shell-budget growth
+- **PR #12062**: build: line-tables-only debuginfo for dev/test to cap rustc peak RAM (#11094 item 4)
+- **Issue #12048** (closed): Step dispatch: restore the missing-commands guard (#4027/#6440)
+- **Issue #12047** (closed): Step dispatch: listing failures don't count as errors
+- **Issue #12046** (closed): Step dispatch: main-red halt now stops every role, not just Builder
+- **Issue #12045** (closed): macOS BSD userland: run-job symlink refusal misses dangling links (BSD readlink -f exits 1), plus setsid and cat --version test fixtures
+- **Issue #12041** (closed): CONFLICTING loom:pr PRs are never labelled loom:merge-conflict unless Champion attempts a merge, so they never reach Doctor
+- **Issue #12039** (closed): URGENT: merge-pr CI gate holds forever when the CI workflow exists only on a branch (has_ci_workflow reads actions/workflows)
+- **PR #12037**: build: force LOOM_RUNTIME* empty for cargo test binaries (#9851)
+- **Issue #12034** (closed): Champion post-claim re-check should also skip loom:blocked / loom:frozen (follow-up to #11996)
+- **Issue #12024** (closed): No-op hold counts per host and auto-releases loom:operator: loops across 6 dispatchers
+- **PR #12002**: terminal.rs: feed the keychain clone credential to security on stdin, not argv
+- **PR #11995**: fix: keep forge, GitHub and OAuth tokens off curl argv (#11991)
+- **Issue #11991** (closed): Shell scripts and check-usage pass tokens in curl argv (forge-detect, guard drift check, usage.rs)
+- **Issue #11963** (closed): Step lease renewal must be renew-only, not a fresh claim (follow-up to #11961)
+- **Issue #11851** (closed): Dispatch tick reports halted_<cause> when only one workspace is held and the rest were tried and skipped
+- **Issue #11850** (closed): terminal.rs: keychain clone passes the credential (hex) in security add-generic-password argv
+- **Issue #11841** (closed): otlp fleet_provenance tests race under plain cargo test (hidden by nextest in CI)
+- **Issue #11839** (closed): Emit a fact when the daemon exits: signal, requester if known, supervised relaunch or not, in-flight sweeps killed
+- **PR #11801**: fix(worktree): run the check-claim probe only on fresh-branch creation (#9828)
+- **PR #11799**: docs(champion): held-PR notice states #6852 route condition (#9534)
+- **Issue #11797** (closed): Per-repo fleet tier follow-ups: paused host released on malformed fleet.json; stale fleet-repo.json; journaling
+- **Issue #11782** (closed): Role draw follow-ups from #11780 review (overflow, empty-table attempt advance, sweep model stamp)
+- **Issue #11760** (closed): pre-commit hook still runs pnpm biome on defaults/**/*.json, but biome was removed (#3353): blocks every merge of main that touches defaults JSON
+- **Issue #11746** (closed): sync-labels.sh exits 0 when label writes fail (615 failed writes under secondary rate limit reported as success)
+- **Issue #11737** (closed): Remove dead budget/cost-rollup API from ActivityDb (#1064): ~600 LOC never called
+- **Issue #11710** (closed): Review and simplify CI: inventory, single required-check contract, cut duplicate and always-red jobs
+- **Issue #11678** (closed): Write-scope vets cross-owner roots under the daemon's process credential: 4th site (roll lease refresh) and a class-level fix
+- **Issue #11652** (closed): test: later_check_runs_pages_are_spaced flakes under host load, failing the pre-PR gate
+- **Issue #11650** (closed): Flaky test: sweep_registry::dispatch concurrent_status_read… times out under host load
+- **Issue #11638** (closed): loom-daemon worker run --role builder exits 78 "unknown model profile" when no modelProfile is configured
+- **Issue #11635** (closed): check-claim treats the calling sweep's own lease as a blocker
+- **Issue #11625** (closed): cargo-shared-target guard: headless/in-session ask is unactionable (retier to deny or surface prefix to the model)
+- **Issue #11613** (closed): ci_result::latest_run picks a cancelled newest CI twin, refusing a green tree (follow-up to #11097)
+- **Issue #11583** (closed): fleet_sync: fix the memory-hungry git operation itself (follow-up to #11059 AC 3)
+- **Issue #11579** (closed): Retire the inert captain-gauges star-facts job (its only reader, star-liveness, was removed by #11104)
+- **Issue #11549** (closed): launch_outcome: every OpenCode launch is classified toolless — tool_name() misses OpenCode's nested part.tool, so working Doctor runs fail and arm launch-failure holds
+- **Issue #11514** (closed): Decide ownership and convergence model for Loom hook entries in consumer Claude settings
+- **Issue #11481** (closed): persist insta-crash quarantine and no-op cooldown across daemon restarts
+- **Issue #11333** (closed): Unit tests that fail under host load or low disk and pass in isolation (subprocess-timing tests)
+- **Issue #11329** (closed): worktree.sh post-worktree hook runs a release build into the worktree-local target/, ignoring CARGO_TARGET_DIR
+- **Issue #11325** (closed): Stale operator-stop record keeps a startup drain hold after the fleet store returns the host to running
+- **PR #11313**: fix(lease-renew): make stop verify the target is a renewer before signalling (#11086)
+- **PR #11277**: fix(park-record): ignore park markers quoted in Markdown code (Part of #10837)
+- **Issue #11121** (closed): CI: Rust Unit Tests shard stalled in nextest test discovery (lib binary --list), not covered by slow-timeout
+- **Issue #11117** (closed): Umbrella: daemon-update / floor roll / post-roll convergence — one state machine, not a trail of follow-ups (17 bugs)
+- **Issue #11094** (closed): Work-finder RAM admission charges 2 GB per sweep, but a loom-daemon rustc peaks at ~13 GB: concurrent loom builds OOM 30 GB workers
+- **Issue #11086** (closed): sweep-lease-renew.sh stop <arg> kills any PID, so an issue number passed by mistake signals an unrelated process
+- **Issue #11055** (closed): test-land-resync-commit.sh is not hermetic: its fixture reaches the host's installed loom-daemon write-scope gate
+- **Issue #11022** (closed): test(fleet_sync): workspace_resync test fails inside a sweep because GIT_CONFIG_* provenance hooksPath leaks into the scratch repo
+- **Issue #11007** (closed): SQL DDL guard denies source edits and read-only searches containing the phrase; agents bypass it via script files
+- **Issue #10888** (closed): merge-pr cheap tree checks: measure re-date cycles per merged PR (on or after 2026-10-14)
+- **Issue #10881** (closed): telemetry/kinds.rs merge=union can silently drop/splice lines of multi-line rows (not just duplicate)
+- **Issue #10839** (closed): preflight: killing loom-daemon preflight leaves its build-gate child (and a full nextest run) orphaned
+- **Issue #10703** (closed): Three harness suites fail locally when CARGO_TARGET_DIR is exported (on main too)
+- **Issue #10699** (closed): test-spawn-codex.sh hangs forever when the caller's stdin stays open (mock codex blocks on cat)
+- **Issue #10612** (closed): CI: Lines of Code badge push is rejected by the main ruleset on every run but the step reports success
+- **Issue #10575** (closed): write_scope test fails when sweep env sets LOOM_WRITE_SCOPE_TTL_SECS (test isolation)
+- **Issue #10352** (closed): loom-daemon reads tracked .loom/config.json from a stale main checkout, silently overriding up-to-date worktrees
+- **Issue #10309** (closed): Managed gitignore misses .loom/private-jobs/ — private-clone runs leave checkouts dirty
+- **Issue #10302** (closed): test flake: trace journal a_failed_delivery_replays_only_the_record_it_failed_on fails with "drain busy"
+- **Issue #10191** (closed): verify-proposal-refs reports existing directory citations as MISSING FILE
+- **Issue #10127** (closed): test-merge-pr-stale-mergeable.sh intermittently dies with SIGSEGV (rc=139) under bash 5.3.20 after check_branch_name returns
+- **Issue #9865** (closed): retire the gh ladder in forge_gh_comment_rl_safe once every fleet host is >= 0.19.598 (#9774 follow-up)
+- **Issue #9851** (closed): ~110 loom-daemon unit tests fail under a global LOOM_RUNTIME pin: the buildGate class behind #9360 is far wider than its 4 named tests
+- **Issue #9828** (closed): worktree.sh's new forge check-claim guard blocks Doctor's normal worktree creation for a PR'd issue
+- **Issue #9534** (closed): Stale-PR route to Doctor not firing: 6 held+CONFLICTING PRs, 31-161h real-activity stale, none swapped to loom:changes-requested
+- **Issue #8387** (closed): spawn-codex.sh forwards a `model@effort` suffix verbatim to the Codex CLI's `-m`
+- **Issue #11846** (closed): Curator re-check posts (dep-recheck / operator-premise-recheck) race: decide runs before the claim and the post is unlocked
+- **Issue #12013** (closed): test: measure loom-daemon test-build time and consolidate integration-test binaries if linking dominates
+- **Issue #11042** (closed): Floor-loop follow-ups: unsupervised hosts re-download every tick; typed not-rolling reason; status enabled semantics
+- **PR #11261**: fix(auto_update): stop unsupervised re-downloads; typed below-floor not-rolling reason (#11042)
+- **PR #11996**: Champion: step back when a claimed proposal was already decided (#11989)
+- **Issue #9573** (closed): daemon: dispatch_sweep guard chain (Issue kind) must run outside the SweepRegistry mutex (split from #9572)
+- **PR #11808**: fix(daemon): release SweepRegistry mutex around forge calls on Issue dispatch (#9573)
+- **Issue #11957** (closed): Startup App-mint timeout leaves cross-owner roots unregistered for the process lifetime: write scope refuses every 2AMLogic root (not in this App installation)
+- **PR #11997**: Retry per-owner App credentials after a failed startup mint (#11957)
+- **Issue #11189** (closed): Epic: fleet workers stop filling their disks — bound per-sweep build output and reclaim what the reaper misses (loom-worker-1, 2026-10-09)
+- **Issue #12025** (closed): A partial work-finder listing degrades to hundreds of per-item open-PR probes; fail closed
+- **PR #12070**: work finder: fail closed on an unreadable or partial listing (#12025)
+- **Issue #11194** (closed): Judge worktrees: align supported checkout guidance and report legacy directories without reclaiming them
+- **PR #11732**: Judge worktrees: align checkout guidance and report unrecognized dirs (#11194)
+- **Issue #9806** (closed): test suite: gate pool-dependent tests on fixture state, de-flake the parallelism set (full-suite reds on clean hosts)
+- **PR #12071**: test: pin Claude pool fixture in runtime_preference pool-gated tests (#9806)
+- **Issue #12060** (closed): CI red on main: step_ledger a_noop_cools_locally test fails (also systemd_autonomy marker test on PR #12052)
+- **PR #12069**: test(daemon_start): wait for child's /proc environ before marker assert (#12060)
+- **PR #12067**: fix(bash-3.2): installed-file guard fail-open + 3.2 suite fixes, per-PR 3.2 guard step (#12043)
+- **PR #11729**: fix(spawn-codex): split model@effort suffix before forwarding -m (#8387)
+- **PR #12064**: Fix red main: step_ledger test expected the hour for ci_pending
+- **Issue #11489** (closed): Codex pool: add Joseph's 2AM Logic Pro account (profile joseph-2am)
+- **Issue #10009** (closed): Operator-label review (Lane B of #10001): give every parked item in the wired repos a verdict and return what agents can do
+- **Issue #11944** (closed): Decision: bounded On-Demand compute for ETA fit jobs
+- **Issue #12036** (closed): Telemetry: structured 'unevaluated' reason + budget readings on stale_blocked_release (no behaviour change)
+- **PR #12056**: feat(telemetry): typed unevaluated_reason + budget readings on stale_blocked_release (#12036)
+- **Issue #12044** (closed): check-verified-corrections-preserved.sh hangs >20 min under macOS bash 3.2: per-paragraph ${NEW_PARAS//…} is quadratic (13s per call)
+- **PR #12054**: Fix bash 3.2 hang in check-verified-corrections-preserved.sh
+- **Issue #12042** (closed): Step dispatch: a Judge step on a PR with CI pending cools down for 1 h (the #12003 gate does not cover the step path)
+- **PR #12058**: step dispatch: hold a Judge step while CI runs at its PR head (#12042)
+- **Issue #12027** (closed): Telemetry: export Champion merge-gate decisions (refused/deferred + criterion + since) as a fact
+- **PR #12053**: feat(telemetry): Champion merge-gate + promotion verdicts as pass.verdict (#12027)
+- **Issue #11922** (closed): Champion --non-item: Priority 3 proposal query does not exclude loom:curated, so curated proposals get two owners
+- **PR #12040**: champion: Priority 3/4 skip loom:curated proposals
+- **Issue #11786** (closed): Red-main autofile: enable fleet-wide after canary + review hardening (#11773 follow-ups)
+- **Issue #11909** (closed): Step dispatch: live dispatch per root, epic BuildChildren gate, coexisting budgets
+- **PR #12009**: Step dispatch cutover: the step tick is the work finder's only item path (#11909)
+- **Issue #11960** (closed): telemetry(fleet_state): emit dispatch_blocked_reason + dispatch_blocked_since per ready item (like held_since) — the never-dispatched parked tail that is ~78% of ready_wait ETA error and the v8 pickup hazard can't see
+- **PR #12033**: telemetry(fleet_state): dispatch_blocked_reason + dispatch_blocked_since on ready rows
+- **Issue #12022** (closed): wait-checks --settle-red follow-ups: unknown-required TIMEOUT never settles; note leaks under --required-only; judge-ci-red wording (#12020)
+- **PR #12030**: fix(wait-checks): --settle-red never holds a finished red on the required set (#12022)
+- **Issue #11660** (closed): [ci-daily] Full Suite (clean, unpartitioned)
+- **PR #12031**: Deflake Full Suite: journal busy retry + second-boundary timestamp (#11660)
+- **Issue #12026** (closed): Docs lag 2am#4452 code: fleet-wide fast-fail streak, ci-pending release, Judge CI gate
+- **PR #12032**: docs: catch up with the 2am#4452 code (fleet-wide fast-fail streak, ci-pending release, Judge CI gate)
+- **Issue #12018** (closed): [ci-daily] Supply Chain
+- **PR #12023**: Bump rustls to 0.23.46 for RUSTSEC-2026-0346..0349
+- **Issue #11778** (closed): Test suite size: ~16k loom-daemon tests are slow locally and in CI
+- **Issue #12035** (closed): Champion: route an unheld approved PR with persistently red CI to Doctor (today it waits for the 24h stale route)
+- **Issue #11972** (closed): Judge backstop release re-reads CI and records verdict=none at a green head
+- **PR #12008**: Judge backstop: a ci-pending skip is never recorded at release (#11972)
+- **Issue #10463** (closed): github-app-token.sh puts the App JWT/installation token on curl's command line (seen by 2am secret.argv; ps-readable)
+- **PR #11807**: fix(defaults): keep forge credentials off curl argv (#10463)
+- **PR #11990**: hooks: run daemon-spawned sessions' hooks from the daemon's own release
+- **Issue #12012** (closed): ci: partition Rust Unit Tests 5 ways instead of 3 (the PR critical path after #11710's cuts)
+- **PR #12017**: ci: partition backend-tests nextest five ways instead of three (#12012)
+- **Issue #10199** (closed): hold-state-trust suite skips undefined assert_eq yet exits successfully
+- **PR #12007**: test(merge-pr): define missing assert_eq in hold-state-trust suite
+- **Issue #9896** (closed): Temp-dir leaks: loom-daemon release_fetch tests, loom-mcp-config, loom-review-feedback accumulate in $TMPDIR
+- **PR #12015**: fix: bound temp-dir leaks (#9896)
+- **Issue #12011** (closed): judge: no 'CI failing' verdict on an in-progress run; name the failing test and route untouched flakes to a recorded rerun
+- **PR #12020**: judge: no CI-failing verdict on a partial run; name the test; rerun tracked flakes once (#12011)
+- **Issue #12010** (closed): merge sequencing: never hold an approved PR behind a predecessor that is red, conflicting or unapproved
+- **PR #12021**: fix(merge-sequence): never hold behind a red or conflicting predecessor (#12010)
+- **Issue #11952** (closed): fast-fail park: a streak break leaves the receiver's own local streak, and base=0 forges a break
+- **PR #12006**: fast-fail park: a break resets the receiver's own streak, and is marked explicitly
+- **Issue #11951** (closed): loom-daemon-start.sh: stop writing autonomy env into systemd units
+- **PR #12004**: daemon-start: stop writing autonomy env into systemd units (#11951)
+- **Issue #11956** (closed): ETA telemetry: emit per-repo operator-action recency + purge-burst markers (gap 1 remainder of #11955)
+- **PR #11999**: Operator hold-release recency/burst markers and event actor capture on fleet.state
+- **Issue #11494** (closed): [ci-daily] Flake Detection (Rust)
+- **Issue #11973** (closed): Startup quarantine pass skipped under breaker trip; tick error results carry no reason
+- **PR #12005**: Retry the breaker-skipped startup quarantine pass; add loom.dispatch.error_kind
+- **Issue #9720** (closed): tests not isolated from the host: fleet_captain CLI tests read host defaults; test-provision-daemon fails on macOS 27
+- **PR #11998**: test: isolate bin-target tests and provision fixtures from the host (#9720)
+- **Issue #11992** (closed): telemetry: emit token-pool per-account exhaustion + reset timeline (expected_reset_at) so ready_wait's capacity-blocked tail becomes a countdown, not an unknown
+- **PR #12001**: telemetry: export tokens.snapshot reset instant as OTLP countdown gauges (#11992)
+- **Issue #11971** (closed): Judge spawned on PRs with pending CI: most runs are claim-and-release churn
+- **PR #12003**: Judge queue and spawn gate skip a PR while CI is pending at its head
+- **Issue #11970** (closed): Stale pre-#11888 Champion prompts re-add loom:operator to migrated holds, stranding approved PRs
+- **PR #11987**: Repair a stale prompt's loom:operator on Champion holds; warn on pinned review prompts (#11970)
+- **Issue #11964** (closed): ci-daily: report a job cut off by its timeout, and get the macOS shell flake leg under its 180-min cap
+- **PR #11986**: fix(ci-daily): report jobs cut off by their timeout; name the hung macOS suite (#11964)
+- **Issue #11967** (closed): ci: retire Rust OTLP Feature Build & Test (no-op feature since #10700; real-service suites run in daily)
+- **PR #11975**: ci: fold Rust OTLP Feature job into lint + daily Full Suite (#11967)
+- **PR #11988**: Step spawn: mark step role_tick.outcome records; issue-lease markers for Builder only (#11906 follow-up)
+- **Issue #11965** (closed): ci: move Codex Adapter Smoke's Docker steps to ci-daily and reuse the shared debug daemon
+- **PR #11977**: ci: slim Codex Adapter Smoke (mocked) by moving Docker fixtures to daily (#11965)
+- **Issue #11969** (closed): Step engine follow-ups: claim_lost cooldown, non-Builder fast-fail park, label-aware restore, promote restore edge
+- **PR #11978**: Step engine follow-ups: claim_lost cooldown, Builder-only fast-fail park, label-aware restore, promote restore edge
+- **Issue #11966** (closed): ci: run Release Build Check only on push, merge_group and image-input PRs
+- **PR #11974**: ci: run Release Build Check only on push, merge_group and image-input PRs
+- **Issue #11955** (closed): fleet.state: emit per-repo queue-depth snapshot (awaiting_curation/approval + operator_held) — ETA gap 1 pending-queue + gap 2 eligible-depth
+- **PR #11959**: fleet.state: per-repo pending_queue depth snapshot (#11955)
+- **Issue #11981** (closed): test: sender byte-budget test is flaky — fixture stamps Utc::now(), whose JSON length varies
+- **PR #11985**: test(observability): pin both fixture timestamps in sender tests (#11981)
+- **Issue #9782** (closed): test(security): register the last six write-scope-stub suites and delete the stub (#9548)
+- **PR #11980**: test(security): register the last write-scope-stub suites and delete the stub (#9782)
+- **Issue #11731** (closed): test: egress_proxy journal test fails under plain `cargo test -p loom-daemon` (needs --features otlp to match its own expectation)
+- **Issue #11699** (closed): test: egress observe journal test is not hermetic — host tracing tier leaks in (fails local preflight on fleet Macs)
+- **Issue #11906** (closed): Step dispatch: spawn one role step with the role's resolvers, keeping role-tick capture
+- **PR #11961**: Step engine: spawn one role step with its role's resolvers (#11906)
+- **Issue #11968** (closed): ci: split Native Port Suites into 2-3 sibling jobs (the PR critical path)
+- **PR #11976**: ci: split Native Port Suites into three family legs (#11968)
+- **Issue #11898** (closed): Step dispatch: SweepKind::Step across every consumer, step claims, and per-role restore
+
+### 2026-10-14
+- **Issue #11900** (closed): Step dispatch: step-outcome ledger over the targeted-role outcome classes
+- **PR #11962**: Step dispatch: the step-outcome ledger over the targeted-role outcome classes (#11900)
+- **Issue #11840** (closed): ETA facts: preserve canonical dispatch result on completed pick.decision ticks
+- **PR #11948**: pick.decision: carry the work-finder tick's canonical dispatch_result
+- **Issue #11954** (closed): telemetry(fleet_state): persist outcomes::Memory.pre_ready_done across daemon restarts — stop ~3x re-emission of label-derived stage outcomes (SigNoz volume)
+- **PR #11958**: Persist pre_ready_done across daemon restarts (#11954)
+- **PR #11950**: Step dispatch: step claims, live stale_after_minutes, restart and requeue for steps (#11898, part 2)
+- **PR #11953**: fix(install): never link user-scope /loom:* skills into a stale machine checkout
+- **Issue #11889** (closed): Stale doc comment in reaper/pr_park.rs says loom:operator is not a PR park
+- **Issue #11905** (closed): Held-PR visibility after #11888: operator_held sibling metric, capped-hold inbox routing, cheaper held-shape probe
+- **PR #11938**: Held-PR visibility after #11861: champion_held count, capped-hold inbox routing, cheaper gate (#11905)
+- **PR #11937**: fleet add-worker: provision the watchdog with --heal-watchdog-only, never a full start
+- **Issue #11934** (closed): Supervised relaunch leaves work finder OFF despite unit LOOM_WORK_FINDER=1 (process env gets 0)
+- **PR #11946**: daemon-start: never relaunch a dispatcher with its work finder silently off (#11934)
+- **Issue #11769** (closed): test: replaces_a_currently_executing_binary fails every CI Daily since #10983 -- 30 s sleeper is outlived by keep-previous copy+sha256 of the test binary
+- **PR #11949**: test: raise sleeper_helper sleep to 300s (#11769)
+- **Issue #11932** (closed): Janitor exception for Champion holds is prompt-only; markerless loom:pr+loom:blocked PRs get repeated Merge Failed (C12 follow-up)
+- **PR #11945**: Champion: classify loom:pr + loom:blocked in code; Merge Failed once per head (#11932)
+- **Issue #11930** (closed): Fast-fail park does not survive restarts and counts per host (C3 follow-up)
+- **PR #11942**: Hold the fast-fail park across restarts and count its streak fleet-wide
+- **PR #11921**: Step dispatch: SweepKind::Step across every consumer, per-role restore (#11898, part 1)
+- **Issue #11896** (closed): Step dispatch: seeded weighted item draw (actionable × priority × stage-age)
+- **PR #11939**: Step dispatch: seeded weighted item draw (actionable × priority × age)
+- **Issue #9740** (closed): test-merge-pr-merge-method.sh Test 5 fails when LOOM_DAEMON_BIN is inherited from the environment
+- **PR #11940**: Pin LOOM_DAEMON_BIN to stub in merge-method Test 5 (#9740)
+- **Issue #11924** (closed): Stage-entry provider: latest labeled event, not the first page; lenient labels_at parsing (#11897 follow-ups)
+- **PR #11929**: Stage entry: latest labeled event from the end of the events; lenient labels_at (#11924)
+- **Issue #9715** (closed): daemon: git subprocess calls have no timeout — a hung `git remote get-url` blocked `status` for 120s+
+- **PR #11943**: Bound the daemon's six hand-rolled git remote get-url calls (#9715)
+- **Issue #11931** (closed): Judge timeout → stale loom:reviewing reclaim lets several hosts re-race one PR (C4 follow-up)
+- **PR #11941**: Judge timeout: reap the dead claimant's PR lease into a backstop record (#11931)
+- **PR #11933**: forge_gateway: let a CLI subcommand route reads through the daemon's gateway profiles (2am#4367 P4)
+- **Issue #11904** (closed): Cleanups: stale sharding comment, retire classify-capacity-defer.sh, duplicated doc paragraph, hermetic egress_proxy tests
+- **PR #11935**: Cleanups: stale sharding comment, retire classify-capacity-defer.sh, fold duplicated doc paragraph, hermetic egress_proxy tests
+- **Issue #11759** (closed): telemetry: once-per-merge PR event and periodic held-PR gauge (fleet throughput, 2AMLogic/2am#4350)
+- **Issue #11744** (closed): Merge stall: 139 Judge-approved PRs fleet-wide held by Champion merge-risk holds — mostly 'Judge review depth' where the Judge couldn't verify
+- **Issue #11910** (closed): Dispatch plan: step field on plan rows (fixture first)
+- **PR #11927**: Dispatch plan: step field on plan rows, merge folds by repo#issue + step (#11910)
+- **Issue #9401** (closed): In-session sweep Doctors take no claim, so a peer session's Doctor reset the worktree under a running Doctor
+- **PR #11916**: Doctor yields when a live process occupies the PR worktree with no lease
+- **Issue #11901** (closed): Landed cooldown refinements: missed second landing, failed route comment, peer shortening, reopen wait
+- **PR #11923**: Landed cooldown refinements: second landing, failed route comment, extend-only peers, lift on reopen/keep (#11901)
+- **Issue #11908** (closed): Step dispatch: shadow mode and the shadow-vs-live comparison metric
+- **Issue #11903** (closed): Judge backstop checks_pending: paginate check runs, include legacy statuses
+- **PR #11920**: Judge backstop: page check runs, count pending legacy statuses (#11903)
+- **Issue #11895** (closed): Step dispatch: item model and state-to-step classifier
+- **PR #11914**: Step dispatch: item model and state-to-step classifier (#11895)
+- **Issue #11899** (closed): Comment-trust gaps: PRIOR_RECLAIMS raw read; landed pre-filter counts cross-repo PRs
+- **PR #11919**: Trust only same-repo PRs and trusted reclaim markers (#11899)
+- **Issue #11897** (closed): Step dispatch: all-open listing on the shared ETag walk, mirror caller, and stage-entry provider
+- **PR #11918**: Step dispatch: all-open listing, labels_at plumbing and a stage-entry provider
+- **Issue #11894** (closed): Step dispatch: design doc and owner-doc departures
+- **PR #11915**: docs: accept the work-finder step-dispatch design (#11894)
+- **Issue #11902** (closed): Targeted Champion: pin expiry on long steps, misleading retry message, double verdict fetch
+- **PR #11912**: Targeted Champion: long --pr pin, pin-named retry refusal, single verdict read (#11902)
+- **Issue #9667** (closed): watchdog_provisioning_guard / fleet_captain_cmd tests leak ambient host state (LOOM_AUTONOMY_MARKER not guarded in 4+ tests, #6538 fix incomplete)
+- **PR #11917**: Guard remaining watchdog_provisioning_guard tests against ambient LOOM_AUTONOMY_MARKER
+- **Issue #11880** (closed): Enable open-PR release veto: Champion/Curator/intake exclusion and unmerged-close re-queue (follow-up to #11876)
+- **Issue #11852** (closed): Restore path re-adds loom:issue beside an open linked PR (reaper checkpoint path)
+- **PR #11893**: Open-PR release hold: keep loom:building while the PR is open, on by default
+- **Issue #11861** (closed): loom:operator is a no-op for every role; Champion's own holds move to loom:blocked (follow-on to #11849)
+- **PR #11888**: loom:operator is a no-op for every role; Champion's own holds move to loom:blocked (#11861)
+- **Issue #11890** (closed): Rework PR #11888 (loom:operator no-op): resolve main conflicts + Judge items 1-4
+- **Issue #11882** (closed): main red: comment_trust structure test flags work_finder/landed_prefilter.rs as unreviewed
+- **Issue #11681** (closed): Loom source-repo checkouts never get dogfood symlinks unless 'init' ran — resync skips them, roster clone doesn't init (#6440 recurrence)
+- **PR #11892**: Self-heal missing dogfood symlinks in workspace resync (#11681)
+- **Issue #9614** (closed): flaky test: stale_checks::fetch::tests::a_gh_without_the_flag_is_retried_plainly fails with ETXTBSY
+- **PR #11891**: Wait out ETXTBSY on stub execs in stale_checks fetch tests
+- **Issue #11695** (closed): Dedupe assert_eq/assert_contains helpers copied into 175 shell test suites
+- **PR #11876**: Release veto: keep loom:issue off an issue with an open linked PR
+- **Issue #11544** (closed): Flaky test: lease_ensure the_deferred_lock_admits_a_single_owner fails ~1 in 4 full bin-suite runs (also on main)
+- **PR #11866**: test(lease_ensure): tolerate concurrent fork in deferred-lock release check (#11544)
+- **Issue #11860** (closed): Champion promotion verdicts are terminal; retire loom:needs-revision (revise sets loom:triage)
+- **PR #11885**: Champion promotion verdicts are terminal; retire loom:needs-revision
+- **PR #11887**: fix(test): drop the stale stage_queue.rs label-guard allowlist entry
+- **Issue #11854** (closed): Fast-fail re-dispatch loop: extend the #4485 ladder (2 min window, 6 h ceiling, park after 3, always classify)
+- **PR #11872**: Fast-fail ladder: 2 min window, 6 h ceiling, park after 3 via quarantine, always classify (#11854)
+- **PR #11883**: fix: main red — landed_prefilter write_scope + comment_trust (#11853)
+- **PR #11886**: fix(test): allow stage_queue.rs's bare loom: prefix in the label literal guard
+- **Issue #11863** (closed): Audit Judge, Curator and Builder targeted modes for daemon invocation
+- **PR #11868**: Gate targeted Judge, Curator and Builder runs before their first write
+- **PR #11881**: fix(work_finder): a partial hold no longer silences the capacity advisory (#11857)
+- **Issue #11858** (closed): Telemetry gaps in work-finder and role-runner signals
+- **PR #11877**: Close work-finder and role-runner telemetry gaps (#11858)
+- **PR #11879**: Stop reading a partial hold as a halted tick in pick.decision, fleet_alert and the queue-dwell fallback (#11857)
+- **Issue #11870** (closed): main CI red: every_role_queue_query_excludes_frozen flags champion-issue-promo.md:83-84 and champion.md:89
+- **PR #11878**: fix(test): frozen-exclusion lint accepts registry hold/park sets (#11870)
+- **Issue #11859** (closed): Champion: targeted --pr N / --issue N modes, a non-item-only mode, and merge-pr.sh --expected-head
+- **PR #11871**: Champion: targeted --pr/--issue steps, a --non-item mode, and merge-pr.sh --expected-head
+- **Issue #11847** (closed): Telemetry: emit loom:triage queue depth and busy dispatch slots by role
+- **PR #11874**: Telemetry: queue-depth states and busy slots by role (#11847)
+- **Issue #11857** (closed): Tick result reads halted_<cause> whenever any one root is held, masking the real reason
+- **PR #11873**: Tick result names a hold only when it covered the tick's work (#11857)
+- **Issue #11853** (closed): Landed-but-open issues are re-dispatched: arm a fleet-wide cooldown and route to Curator keep-or-close
+- **PR #11875**: Landed-but-open issues: fleet-wide cooldown and Curator routing (#11853)
+- **Issue #11855** (closed): Judge loop: thousands of Judge runs for a few hundred verdicts, same PRs re-judged across hosts
+- **PR #11867**: Judge loop: read classic protection over REST, and bound no-verdict re-runs (#11855)
+- **Issue #11864** (closed): Docs: priority-model still names the sharding slice; hyperparameters.md lacks roleRunner knobs
+- **PR #11865**: docs: drop retired sharding slice; document roleRunner knobs (#11864)
+- **PR #11856**: refactor(tests): migrate 7 more suites to shared lib/assert.sh (Part of #11695)
+- **Issue #11795** (closed): Hold taxonomy: collapse to loom:blocked / loom:operator / loom:frozen (staged after the freeze)
+- **PR #11849**: feat(labels): collapse the hold taxonomy to loom:blocked / loom:operator / loom:frozen (#11795)
+- **Issue #10630** (closed): Judge/Doctor lanes per repo scale with that repo's own debt (deterministic; replaces the marginal-value allocator)
+- **PR #11824**: feat(role-runner): deterministic per-repo lane rule for judge and doctor (#10630)
+- **Issue #11816** (closed): Main red after #11790/#11792: renovate_labels tests, dependabot label gate, unclassified forge_auth.rs
+- **PR #11832**: fix(ci): declare optional Dependabot checker command
+- **PR #11845**: forge_mirror: discovery reads from the state mirror, and wakes from its change stream (2am#4367 P5)
+- **Issue #9609** (closed): Guard: deny adding the issue-only claim label loom:curating to a pull request number
+- **PR #11848**: fix(forge_gateway): read ssm:// relay keys as the instance role (2am#4367 P4 canary)
+- **PR #11844**: refactor(tests): migrate 28 more suites to shared lib/assert.sh (#11695)
+- **Issue #11080** (closed): Decision: parked feature PRs and issues during stability focus (review one by one)
+- **Issue #10375** (closed): rate_limit_breaker: a primary rate-limit error on an unprobed credential arms a 15-min fleet-wide pause while every probed budget is healthy
+- **PR #11810**: fix(rate_limit_breaker): minimum cooldown when the probe contradicts a primary failure
+- **PR #11835**: refactor(tests): migrate 6 more suites to shared lib/assert.sh (#11695)
+- **PR #11842**: fix(tests): let the CI-suite partition classify correctly in an installed copy
+- **Issue #11819** (closed): Curator: keep-or-close at admission, stricter as the backlog passes curator.backlogTarget (level computed and recorded by the daemon)
+- **PR #11834**: Curator keep-or-close at admission, level computed by the daemon from curator.backlogTarget (#11819)
+- **Issue #11103** (closed): Priority model: loom:important / loom:very-important for everyone; weighted workspace pick, then level → oldest → number
+- **Issue #11278** (closed): Priority model rollout: wire priority_pick into dispatch, remove old readers, prompts, label migration (follow-up to #11103)
+- **Issue #11820** (closed): Intake: issues opened as loom:issue or loom:curated are demoted to loom:triage (no bypass of Curator admission)
+- **PR #11833**: Intake: demote issues opened as loom:issue/loom:curated to loom:triage (#11820)
+- **PR #11838**: fix(forge_gateway): honest gateway booking and gateway-signalled outages (2am#4367 P4 nits)
+- **Issue #11033** (closed): resync-installed.sh misses .claude/agents/, hooks/tests/ and new labels.yml entries (needs-revision label broke Champion routing downstream)
+- **PR #11831**: feat: resync .claude/agents, report hooks/tests drift and unwired hooks
+- **PR #11823**: feat(forge): daemon and agent reads through the github-read gateway (2am#4367 P4)
+- **Issue #11811** (closed): ETA fact (small): emit un-lumped pick.decision disposition + held_until (don't collapse 29 QueueDispositions to 15)
+- **PR #11829**: feat(pick.decision): carry the un-collapsed disposition and held_until (#11811)
+- **Issue #11806** (closed): Structural Checks red on main: config-resolver.sh claims 'settled' but has a fix-commit (#11738)
+- **PR #11828**: Fix main CI: dependabot/renovate checks after #11788/#11792
+- **PR #11827**: fix(forge-inventory): baseline add_worker/forge_auth.rs after the #11790 move
+- **PR #11825**: fix(labels): cite the public loom PR, not a private ref, in the retired entries
+- **PR #11826**: fix(ci): config-resolver.sh back to contract in the shell allowlist (#11738)
+- **PR #11818**: feat(labels): retire five legacy loom:* names the label-drift check found live
+- **PR #11817**: feat(daemon): restart --pause --then-exit, host maintenance on the roll's H4 (#11812)
+- **PR #11814**: fix(labels): in-flight writers, role demand and reclaim count leave a frozen item alone (#11743 follow-ups)
+
 ### 2026-10-13
+- **PR #11813**: feat(labels): labels migrate --keep-labels never deletes a retired label definition
+- **Issue #11735** (closed): Stabilization freeze (2026-10-13): P0 bugs and unwinding only; new features parked
+- **Issue #11758** (closed): Telemetry gap: git subprocess spawns never reach SigNoz (blocked answering #11583)
+- **Issue #11694** (closed): loom-daemon cancel can't find a sweep that loom-daemon status lists as in flight (unknown sweep_id)
+- **Issue #11689** (closed): IPC server: bound client frame size (unbounded lines() reader, parse error echoes whole payload)
+- **Issue #11677** (closed): merge-pr.sh: support policy-exempt PR classes instead of --allow-unapproved + override comment on every merge
+- **Issue #11673** (closed): Daemon refuses to start (exit 78) when fact export is statically misconfigured, per #11526 ruling
+- **Issue #11653** (closed): Renovate lock-file maintenance can downgrade below main and re-open fixed npm advisories
+- **Issue #11647** (closed): roll-pause state directories accumulate after runs end
+- **Issue #11636** (closed): /loom:sweep: parallel subagents overwrite each other's scratch files
+- **Issue #11620** (closed): Doctor cannot conflict-resolve cross-fork PRs: pushes go to the base repo, fork needs workflows scope
+- **Issue #11617** (closed): remote-fleet-exec guard: ssh -o HostName= alias, stdin interpreters beyond sh, missing destructive patterns
+- **Issue #11596** (closed): Roll-stopped role ticks still recorded as Failure in role_tick history and hold feed (follow-up to #11263)
+- **Issue #11581** (closed): Guard: harden COMMAND_NO_LITERAL_TEXT=$(mask_* ...) sites to fail closed when the masker awk errors
+- **Issue #11569** (closed): Renovate: target signoz casting.yaml, not generated pours/ compose
+- **Issue #11554** (closed): loom-ui alerts: re-send an exhausted resolve; hold resync incidents through an unreachable pass
+- **Issue #11546** (closed): OpenCode Builder: observe child exit (or reap at checkpoint) instead of closing runtime.run as exit_unobserved at sweep end
+- **Issue #11540** (closed): Alert when a Codex seat needs re-login (reauth_required / session down), naming the codex-pool-login --from-fleet fix
+- **Issue #11536** (closed): Curator: check that blockers and tracker structure are machine-readable before curating (lint prose blockers, unstated park records, missing children checklists)
+- **Issue #11535** (closed): Builder needs a first-class 'not buildable' release that names the blocker, so a known-blocked or tracking issue stops being re-dispatched
+- **Issue #11528** (closed): loom-daemon telemetry join: one command that brings a host into SigNoz and proves its records land under the right identity
+- **Issue #11516** (closed): operator_levels: read the per-level cap from fleet config instead of default_cap
+- **Issue #11498** (closed): Update observability: publish one typed host/workspace state snapshot
+- **Issue #11484** (closed): sweep skill: noop-cooldown record must key on the daemon sweep id and fail loudly
+- **Issue #11482** (closed): telemetry: exit code/signal, reaper branch, no-op flags and redacted stderr tail on sweep.outcome and loom.sweep span
+- **Issue #11477** (closed): guard: rm-scope check misses local deletions in $(…) wrapper arguments, bash -c / eval payloads, xargs and bind mounts
+- **Issue #11471** (closed): affected-files check: wrong-case path with (new) clears on a case-insensitive filesystem; .//path is skipped
+- **Issue #11470** (closed): spawn-claude.sh containment passthrough mis-splits a variable whose value contains a newline (value fragment reaches docker argv)
+- **Issue #11467** (closed): check-ci-status: zero-job failed/startup_failure runs and commits with no verifying run can read success
+- **Issue #11466** (closed): Follow-ups from #11450: make the bare-opencode Judge-exclusion test real; check-onidle-status.sh must read the effective config
+- **Issue #11455** (closed): guard: SQL DDL check misses a quoted-delimiter heredoc fed to psql/mysql
+- **Issue #11454** (closed): guard: catastrophic floor misses a repo delete/archive inside $(…), backticks or a subshell
+- **Issue #11436** (closed): Roll rollback operator surfaces: quarantine controls, status, telemetry and validation docs
+- **Issue #11415** (closed): Epic supervisor dispatches a build sweep onto a sub-epic phase child (loom:epic-phase + loom:epic + loom:issue)
+- **PR #11805**: fix(defaults): drop private-org refs added by #11790
+- **PR #11804**: Export the agent-draw pick: role-tick span + sweep.outcome (2am#4393)
+- **Issue #11743** (closed): Add loom:frozen: one human-only label that every agent and daemon path ignores (distinct from loom:blocked)
+- **PR #11793**: feat(labels): loom:frozen, one human-only label every agent and daemon path ignores (#11743)
+- **Issue #11394** (closed): daemon: a stale installation token may be refused by the write-scope gate before any write, so the #9247 retry never fires
+- **Issue #11386** (closed): telemetry: per-repo resync emits nothing — miniset halted install_incompatible for 20h with no record of why resync never ran
+- **Issue #11385** (closed): journal verify: flag empty streams and dangling cursors (Phase 2a follow-up)
+- **Issue #11381** (closed): Approved PR parked as loom:pr + loom:blocked (rebase budget exhausted) has no automated route back
+- **Issue #11376** (closed): Champion hold_issue_on_unverified_ac reopens on a bare CLOSED read without confirming this merge closed the issue
+- **Issue #11361** (closed): duplicate-scan: the >50% degenerate detector can suppress the search-selected closed-issue match list
+- **Issue #11360** (closed): Mixed sweep usage: verify phase launch records and per-tap journal accounting
+- **Issue #11352** (closed): stale_blocked digest exemption trusts title/body from any author; gate it on author trust (follow-up to #11351)
+- **Issue #11334** (closed): forge wait-checks --timeout does not state its unit (seconds); a Judge passed 20 meaning minutes
+- **Issue #11331** (closed): Judge approved a PR while required CI jobs were still queued, with no verdict-sha marker
+- **Issue #11326** (closed): Maintain-only workspace shows held: install-incompatible for a detached, pinned checkout; there is no dispatch to hold
+- **Issue #11320** (closed): worktree.sh landed-branch remedy: say that 'git worktree remove --force' discards uncommitted work in the holding worktree
+- **Issue #11298** (closed): telemetry: write-scope (#9548) refusals don't reach SigNoz — a managed-but-unwritable repo (miniset) looks healthy and the reason is host-local only
+- **Issue #11297** (closed): telemetry: mirror daemon.roll.* bus events to SigNoz (roll outcome is invisible: pause duration, resumed vs requeued, health)
+- **Issue #11289** (closed): Per-repo resync: open a PR when the default branch is PR-only, instead of stopping at Push::Protected
+- **Issue #11267** (closed): resync-payload fallback: misleading --output message, non-hermetic group 11 tests, no local-divergence protection
+- **Issue #11260** (closed): Visibility-tagged telemetry record for roster clone attempts (#11218 follow-up)
+- **Issue #11259** (closed): dep-recheck-fingerprint: a value starting with '=' is emitted bare and zsh =command-expands it under eval
+- **Issue #11257** (closed): Release pass posted its audit comment twice on loom-ui#2405/#2286 (same marker, ~1 s apart)
+- **Issue #11250** (closed): Live-verify resync-installed.sh's embedded-payload fallback with an official release loom-daemon
+- **Issue #11247** (closed): auto_update.tick: expose effective settle, ceiling clock and deferring gate (split from #10414)
+- **Issue #11239** (closed): Credential-storage audit: reconcile #9049 acceptance and scope non-OAuth remediations
+- **Issue #11234** (closed): status: below-cap capacity line does not name the maintain-only hold (#11186 x #11169)
+- **Issue #11225** (closed): Run target dir deletion gates: three places an unknown reads as 'safe to delete' (follow-up to #11216)
+- **Issue #11210** (closed): main-health gate: decide whether it should run on maintain-only workspaces
+- **Issue #11209** (closed): work finder: skip the forge ready-issue listing for maintain-only workspaces
+- **Issue #11199** (closed): Telemetry: memory.available_bytes reads 0 on the Macs and loom-fleet-captain
+- **Issue #11179** (closed): Dashboard session pane: links should open the dashboard view, not GitHub
+- **Issue #11175** (closed): Curator decision repair can leave an issue repaired but parked in loom:decision-malformed
+- **Issue #11057** (closed): Resync-surface follow-ups deferred from #10895 (PR #11027)
+- **Issue #11056** (closed): Dispatch-hold follow-ups deferred from #10719 (PR #11023)
+- **Issue #11054** (closed): loom-daemon-update.sh --fetch fails on a host without gh auth although the releases are public
+- **PR #11792**: Remove Renovate config: Dependabot takes over
+- **Issue #11019** (closed): Agent OTLP relay: review follow-ups (documented memory ceiling, slot exhaustion, drain decode) and four flaky tests on main
+- **Issue #11003** (closed): Every-tick resync: follow-ups from #10998 (breaker re-check before fallback/claim, per-owner budget, host-level credential alert, empty and archived repos)
+- **Issue #10985** (closed): Telemetry gap: disk pressure can't be diagnosed from SigNoz (only free GB is exported, not what's using it)
+- **Issue #10980** (closed): OTLP headers_file: review follow-ups (tailer diagnostic, absolute paths, owned headers, BOM, FIFO) and two flaky tests on main
+- **Issue #10939** (closed): Auditor files per-repo duplicates of fleet-wide capability gaps; dedupe against an open fleet-wide request first
+- **Issue #10938** (closed): Curator re-check passes post no-op heartbeat comments; empty gap trackers get re-checked instead of having children filed
+- **Issue #10913** (closed): forge_events: hold read caches (gh-cached, pipeline_snapshot) under the poll-gating health signal (#9255 slice 2)
+- **Issue #10901** (closed): check-promotion-landed (Pass 0c) fires on a quoted 'Champion Review: APPROVED' in a Curator comment; match the Champion verdict marker only
+- **Issue #10893** (closed): curator.md: record the rule for an operator alert that bundles sub-kinds (most-blocking action decides; 2am#879 ruling)
+- **Issue #10892** (closed): Wake subscription inside loom-daemon, per host (replace the captain-only pull script; trigger attribute on dispatch spans)
+- **Issue #10887** (closed): Dependency-cycle detector counts any #N on a 'Depends on' line as an edge, so a prose mention escalates a false cycle
+- **Issue #10871** (closed): MCP pre-flight treats the first .mcp.json server as a rebuildable Loom bundle
+- **Issue #10841** (closed): agent gh front: attribute launcher-routed passthrough rows as ca=launcher, not ambient
+- **Issue #10775** (closed): Installer's package.json stub makes check:ci/check:all/test pass without running anything in non-Node repos
+- **Issue #10773** (closed): Auditor pushes an unrelated main-breakage fix onto an open PR's branch
+- **Issue #10772** (closed): provenance trailers --repo-root . prints nothing and exits 0 (relative path)
+- **Issue #10769** (closed): merge-pr.sh: operator override for the CI-run conclusion gate (like --allow-unapproved / --allow-red-tree)
+- **Issue #10758** (closed): telemetry: record Guide unblock outcomes and Champion promotion verdicts as pass.verdict, and attribute agent-made label writes (follow-up to #10752)
+- **Issue #10755** (closed): gh telemetry: record 304 Not Modified as success (not error), stop writing it to the failures log
+- **Issue #10739** (closed): Session reconciler: check the hold on a failed start, re-report a deferred undo (follow-up to #10725)
+- **Issue #10721** (closed): Gauges and status for host H0-H7 and workspace W states
+- **Issue #10720** (closed): Restart-only fleet config change triggers pause and restart
+- **Issue #10707** (closed): verdict-staleness-guard fails closed on a Doctor's conflict-only merge commit, contradicting doctor.md
+- **Issue #10706** (closed): In-session /loom:sweep Step 1b lease-renewal loops exit early; a peer host reclaims the issue
+- **Issue #10704** (closed): runtime-adapters.md still calls SESSION_DOWN adapter-produced; it is daemon-produced since #10610
+- **Issue #10702** (closed): Daemon test resolver: accept a HEAD-stamped per-worktree build in a shared target dir (without executing test binaries)
+- **Issue #10696** (closed): Managed .gitignore's unanchored `.loom-local/` hides the installed config_resolver fixture in consumer repos — anchor it to `/.loom-local/`
+- **Issue #10683** (closed): Every role that can push should re-run failed CI jobs (forge rerun --failed), not push an empty re-trigger commit
+- **Issue #10680** (closed): rm-scope guard: allow deleting an agent's own scratch files outside the repo (scratch-root allowlist)
+- **Issue #10656** (closed): Role tick logs never reach SigNoz: 697 fast Codex Judge/Champion failures on loom-worker-2 (Oct 5–6) can't be diagnosed from telemetry
+- **Issue #10654** (closed): Per-repo build back-off fails open on non-owner hosts in a sharded fleet (#10624 follow-up)
+- **Issue #10649** (closed): publish_minted: lock token+sidecar pair (two-minter tear), 0600 sidecar, temp cleanup, per-bucket role (#10645 follow-ups)
+- **Issue #10636** (closed): provenance: origin=attended (what attended PRs emit) is rejected by the parser, and attended issues carry no origin
+- **Issue #10629** (closed): agent gh front: serve or retire 'gh pr view --json statusCheckRollup' polling (split from #10516)
+- **Issue #10618** (closed): observability: route remaining gh callers through the invoke github span (follow-up to #10343)
+- **Issue #10559** (closed): Guide unblock: single-source 'all blockers resolved' read from loom-daemon
+- **Issue #10555** (closed): stale-checks tests: mixed case in clearing_the_role_prefix_false_component_does_not_clear_another_stale_one is still vacuous
+- **Issue #10533** (closed): forge_etag_store: prune issue-/stale-/star- entries (unbounded); test the no-checkout owner-credential path (#10530 follow-ups)
+- **Issue #10517** (closed): Claude Code 2FA re-auth after 15 idle minutes: emit needs_reauth and cap wakeups under 900s
+- **Issue #10513** (closed): Telemetry: create-pr.sh emits a pr.create record (closes, labels requested vs applied, REST-fallback path, role/sweep/host)
+- **Issue #10495** (closed): Session mode: veto work generators at runtime, not only at install time
+- **Issue #10494** (closed): Session mode: install a session-only payload (skip pool and daemon-tier files)
+- **Issue #10483** (closed): Surface guards status warnings in loom doctor or session start
+- **Issue #10471** (closed): forge calls --since: parse_since panics on multibyte suffix and overflows on large hours
+- **Issue #10470** (closed): security(update): enforce independent release approval and artifact assurance for managed fleets
+- **Issue #10468** (closed): Codex guard parity omits read-only clockcurr_time tool
+- **Issue #10467** (closed): forge-egress: wire 78/69 events and e2e launcher acceptance (follow-up to #10446)
+- **Issue #10442** (closed): Champion reconciliation announces Builder readiness while operator hold remains
+- **Issue #10441** (closed): guard: worktree-write-confinement denies a quoted literal /tmp redirect target with a $(...) tail (cwd-prefixes the raw token)
+- **Issue #10429** (closed): fleet add-worker: five defects found provisioning a bare Ubuntu 24.04 host (loom-worker-3)
+- **Issue #10393** (closed): Builder commit messages split the provenance trailers: a blank line before Co-Authored-By makes git drop Loom-Story/Trace-Id/Build
+- **Issue #10376** (closed): Give cwd-resolved GhInvocation reads an explicit repo target so #9872 reader routing reaches them
+- **Issue #10353** (closed): comment trust: check live repo permission when author_association is viewer-relative CONTRIBUTOR
+- **Issue #10314** (closed): create-issue.sh, /loom:star and filing roles: write a <!-- loom:requested-by login=… via=… --> marker naming who asked
+- **Issue #10290** (closed): Codex session containers: profile's sessions/ symlink dangles in-container → every rollout transcript lost (EEXIST)
+- **Issue #10275** (closed): create-issue.sh cannot file on a daemonless machine (duplicate-scan + may-write guard need loom-daemon)
+- **Issue #10273** (closed): Port sweep-lease-renew.sh single-owner/state-check logic to a loom-daemon subcommand
+- **Issue #10194** (closed): daemon-start: refuse to install a persistent unit on a host the fleet roster says must not dispatch
+- **Issue #10186** (closed): test-merge-pr-daemon-version-floor.sh: invocation scan misses _mp_worktree verbs (5 unclassified, incl. worktree-teardown)
+- **Issue #10166** (closed): daemon-update: converge the whole host after a roll (daemon-root checkout + installed workspace surfaces)
+- **Issue #10149** (closed): Attended live output: wire Champion, Guide, Auditor, Hermit and Architect into live-output-attend
+- **Issue #10130** (closed): forge check-open-pr reports 'safe to claim' when the credential cannot see PR cross-references (silent false negative)
+- **Issue #10115** (closed): ci-telemetry: warn when org Actions minutes approach exhaustion (80%/95%)
+- **Issue #10104** (closed): fleet: containment-soak report so the #7767 default-flip gate can be judged without manual per-host log greps
+- **Issue #10099** (closed): premise-check: point the reversal-requires-decision guidance at loom-daemon operator-decision apply
+- **Issue #10071** (closed): guard-destructive: conditional/background/piped assignments and cd are trusted as if they ran (pre-existing gaps found reviewing #9893)
+- **Issue #10069** (closed): Bare --force-with-lease / --force pushes remain after #9966 (judge.md, builder-worktree.md, create-pr.sh) — pin them and add a CI scan
+- **Issue #10043** (closed): Guide parse_dependencies misses task-list blockers with text before #N, and resolves owner/repo#N against the local repo
+- **Issue #10042** (closed): recover-orphans: stale-building age is measured from the oldest loom:building event, so a fresh re-claim is flagged as orphaned
+- **Issue #10037** (closed): daemon-update on launchd reports 'restart FAILED: did not accept' when the drain-restart was actually accepted
+- **Issue #9967** (closed): Guard: deny a bare 'git push --force-with-lease' while two managed worktrees are live
+- **Issue #9963** (closed): Superseding-block check misses PRs that reference an issue without a magic closing keyword
+- **Issue #9940** (closed): Champion: hold PRs that add/change decision records for a human merge (proposal-only DR PRs bypass the ratification gate)
+- **Issue #9898** (closed): storyid: adopt the D32 2026-10-01 amendment — story.comment / story.edited in STORY_SPAN_KINDS + the fixture copy
+- **Issue #9882** (closed): observability: a nameless loom.run span dies at a hard 720s ceiling with all loom.* attributes null — 25 of them in 72h
+- **Issue #11517** (closed): Closed issues keep loom:issue: merge/close strips only loom:building, and loom:issue is re-added while (or after) building
+- **PR #11794**: feat(merge-pr): strip loom:issue too from an issue the merge closes (#11517)
+- **Issue #9878** (closed): tmux health monitor WARNs every 60s forever on tmux-less hosts — warn once on steady state, not every tick
+- **Issue #9876** (closed): tokens: a zero-account pool reports EXHAUSTED with a cooldown hold instead of unconfigured — no timer can fix an empty pool
+- **Issue #9874** (closed): fix(guard): ignore remote rm targets inside ssh/docker exec command strings in LOOM_RM_SCOPE=repo check
+- **Issue #9868** (closed): observability: confirm the SigNoz transposed metric_log retention outcome over a multi-day soak
+- **Issue #9867** (closed): Daemon dispatched Curator from a 708-commits-stale home checkout, silently bypassing the merged story-point pause
+- **PR #11790**: refactor: remove forge_egress policy machinery (2AMLogic/2am#4367 P0)
+- **Issue #9866** (closed): port post-verdict.sh's verdict assembly + reconciliation gate into a forge verdict verb (#7810)
+- **Issue #9864** (closed): port create-issue.sh's filing orchestration behind a loom-daemon file-issue verb (#7810)
+- **Issue #11738** (closed): Design: per-repo fleet config tier (plain tier order, above the repo's committed config)
+- **PR #11785**: feat(config): per-repo fleet config tier, .loom-local/fleet-repo.json (#11738)
+- **Issue #9859** (closed): Existing-PR probe misses a phase issue's PR when it only references the parent epic (#9777/#9832 repeated-dispatch loop)
+- **Issue #9855** (closed): Daemon can't tell its own forge spend from an external drain on a shared credential: surface pool used vs host ledger, attribute role-agent gh calls, warn on a personal-login forge credential
+- **Issue #9841** (closed): Port check-review-feedback.sh's trust-filter + reconciliation logic into loom-daemon (shell-budget gate blocks #9836)
+- **Issue #9838** (closed): shell: route the remaining 6 comment sites + 2 REST POSTs through the footer transport (AC1 remainder of #9774)
+- **Issue #9830** (closed): Forge inventory: register the coverage gate as a required Daemon Checks component
+- **Issue #9829** (closed): loom-daemon: finish the comment chokepoint — consolidate the POST sites #9772 left owning their own transport
+- **Issue #9823** (closed): merge-pr-refs: trailing punctuation inside a backticked `Part of #N` trailer defeats both the declaration parser AND the advisory warning
+- **Issue #9820** (closed): merge-pr check-runs-rollup: bring #9760's differential test harness onto #9755's classify() design
+- **Issue #9815** (closed): daemon: discourage accidental parallel daemons — scoped-socket startup advisory + LOOM_SOCKET_PATH doc reword
+- **Issue #9811** (closed): multi-workspace daemon: a process-wide LOOM_REPO routes every workspace's writes to one repo
+- **Issue #9809** (closed): health: dispatch reads DEGRADED on a captain that is pinned never to dispatch
+- **Issue #9735** (closed): auto_update: roll back candidates that fail startup and quarantine failed artifacts
+- **Issue #9718** (closed): worktree_cli: add `--` before the branch in `git branch --set-upstream-to` and validate branch names inside worktree-existing
+- **Issue #9717** (closed): stale-checks: a consumer check with the same name as one of loom's gets loom's input spec (possible stale green)
+- **Issue #9716** (closed): comment-trust follow-up: remaining unfiltered marker readers after #9593/#9612
+- **Issue #9713** (closed): `loom-daemon fleet-captain` from a shell resolves host identity by hostname and can disagree with the running daemon
+- **Issue #9712** (closed): daemon-update exits 6 ("restart refused by the running binary") when no daemon is running
+- **Issue #9711** (closed): daemon-update: default artifact fetch installs a release older than the fast-forwarded checkout
+- **Issue #9710** (closed): daemon: four gaps a fleet-wide pause has to work around today (pause IPC, per-repo hold, drain-timeout resume, watchdog marker)
+- **Issue #11757** (closed): [ci-daily] Supply Chain
+- **Issue #9682** (closed): fleet-config propose priority: zero-indent repos.yml sequences are rejected with a misleading 'no such record' error
+- **Issue #9679** (closed): fleet-config propose: clean up orphaned loom/fleet-propose branches left by a failed submit
+- **Issue #9677** (closed): telemetry: suppress_journal_owned_outcome's 'reaper always journals before it emits' invariant does not cover the watchdog's three SweepCrashed emits
+- **Issue #9676** (closed): resync/install: the two remaining exclusion-based bootstrap `git add` sites, and whether land-resync-commit.sh should run the #9133 content scan
+- **Issue #9670** (closed): Guard: residual fail-open rebinding shapes the rm-scope fast paths still miss after #9331 (quoted names, brace/compound groups, `while read`, escaped command words)
+- **Issue #9663** (closed): extract-refs false-positives on backtick-quoted historical Blocked-by citations
+- **Issue #9618** (closed): guard-worktree-paths: ~/… and out-of-repo write targets are classified as the primary checkout when cwd is inside it
+- **Issue #9615** (closed): loom-daemon cancel reports "unknown sweep_id" for sweeps in non-loom workspaces unless --workspace is given
+- **Issue #9575** (closed): daemon: ack Issue dispatch after claim; move work_finder/reaper/watchdog gh work off tokio workers (split from #9572)
+- **Issue #9551** (closed): Worktree cleanup: git refuses to remove worktrees containing submodule gitlinks, even after deinit
+- **Issue #9548** (closed): Authenticate Loom's control signals: markers and phrases count only from trusted authors (work safely on any public repo)
+- **Issue #9539** (closed): Finish the main.rs split: move the remaining 12 inline subcommand enums into cli/ (drops main.rs under the size threshold)
+- **Issue #9509** (closed): pipeline_snapshot follow-ups (#9256): per-caller accounting, explicit --repo on surviving GraphQL reads, optional ETag'd merged_24h
+- **Issue #9449** (closed): accounts disable/enable re-homes a shared registry entry into the current repo's .loom/accounts.json
+- **Issue #9448** (closed): Codex device login inside a session container can bind the wrong identity, and nothing checks it
+- **Issue #9439** (closed): defaults/optional/github-workflows/ pins actions Dependabot never scans — the repo now carries two github-script versions
+- **Issue #9437** (closed): Daemon dispatches onto an issue holding a fresh in-session /loom:sweep lease from another host
+- **Issue #9411** (closed): guard-destructive-generic.sh resolves relative paths against the session cwd, not the command's repo — false refusal in cross-repo work
+- **Issue #9399** (closed): Champion escalates to loom:operator-decision over factual slips in an issue body; route those to Curator
+- **Issue #9398** (closed): sync-labels.sh: a mutating run can overwrite newer live label descriptions with an older labels.yml
+- **Issue #9323** (closed): Guard: extract_rm_targets() misses a loop/conditional-body rm written as a one-liner (`; do rm -rf …`)
+- **Issue #9284** (closed): Worktree write guard blocks a review role from creating gitignored local config, inconsistently
+- **Issue #9283** (closed): Stale-claim stand-down has no visible time-to-reclaim and no operator override
+- **Issue #9280** (closed): guard-outward-disclosure.sh: a PreToolUse gate on agent writes into other repos
+- **Issue #9266** (closed): Builder should not provision cloud resources when its configured build box is unreachable
+- **Issue #9259** (closed): Stacked reconcile defers on the issue's loom:building label, not the child PR's state
+- **Issue #9207** (closed): champion-epic: human-hold guard is prose-only — epic-escalated re-parks a loom:blocked epic for the 3rd time despite #7734/#7921/#8245
+- **Issue #9190** (closed): guard-worktree-paths.sh blocks legitimate Bash writes to the primary checkout whenever any worktree exists, and the Edit/Write path does not
+- **Issue #9189** (closed): guard: refuse a blanket `git add -A` in the main checkout of a registered daemon workspace — it silently stages another actor's in-flight work
+- **Issue #9173** (closed): Agents have no mechanism to file issues/PRs outside their GitHub App installation's scope (blocks upstream filing, incl. third-party repos)
+- **Issue #9160** (closed): Orphan reaping is uid-blind: a root-owned (dockerd-started) orphan survives every SIGKILL with EPERM, is logged as "uninterruptible I/O", and binds nothing
+- **Issue #9154** (closed): loom:installed-file-write false-denies a same-command cd-then-relative-write into a scratch dir (and the 'never a false deny' comment is inaccurate)
+- **Issue #9128** (closed): install.sh --quick should run the post-install metadata-vs-disk completeness check too
+- **Issue #9095** (closed): merge-pr.sh stacked-PR handling: reconcile rebases onto stale local main inside another worktree, and deleting the parent branch closes the child PR
+- **Issue #9079** (closed): provenance: D33 record in lease/verdict comments, prompt hash, and in-session trailers (follow-up to #9027)
+- **Issue #9037** (closed): observability: end-to-end story trace per issue (Intake → Curator → Dwell → Builder → CI → Judge → Merge)
+- **Issue #9011** (closed): champion: fail-closed tri-state marker lookup for six marker-gated writes (port of a downstream fix)
+- **Issue #8971** (closed): stashes retire only classifies loom-quarantine: stashes, so ordinary agent WIP stashes accumulate without bound (186 in one checkout, 0 labeled)
+- **Issue #8903** (closed): observability collector: saturated sibling-backend queue causes misleading 503s and unbounded file_log receivers
+- **Issue #8902** (closed): Fleet captain: alert when the declared captain stops reporting host.health (lease, not failover)
+- **Issue #8879** (closed): bot-PR review routing is Dependabot-only: Renovate repos silently lose Judge review
+- **Issue #8867** (closed): archive-transcripts: agent memory under projects/*/memory/ is excluded, so nothing backs it up
+- **Issue #8861** (closed): guard-loom-workflow.sh: 'gh pr merge' redirect matches string literals inside heredocs and scripts
+- **Issue #8491** (closed): Port lib/cargo-target-dir.sh's reclaim path onto loom-daemon (retires the #8486 shell-budget residual)
+- **Issue #8372** (closed): Canary the uncommitted-work Stop guard in opted-in consumer workspaces with measured block outcomes
+- **Issue #8162** (closed): helper scripts print the loom_locate_daemon_bin resolution trace to stderr on every call (#6392 covered only one caller)
+- **Issue #6896** (closed): Epic: Session containers — persistent Codex auth, mandatory worker containment, and a remote-execution job seam
+- **Issue #6109** (closed): Add a runtime-neutral scientific research lifecycle with evidence-gated phase contracts
+- **Issue #4765** (closed): feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
+- **Issue #11338** (closed): verify-proposal-refs falsely rejects existing directory references
+- **PR #11788**: Dependabot: render dependabot.yml from the org policy
+- **PR #11789**: fix(labels): pace labels-migrate forge writes under GitHub's secondary write limit
+- **PR #11231**: feat(watchdog): worktree + agent tool-process liveness signals (#9533)
+- **Issue #11766** (closed): Auto-file a very-important 'fix red main CI' issue when main is verified red
+- **PR #11773**: Auto-file a very-important fix-red-main issue when main is verified red (#11766)
+- **PR #11783**: fix(daemon): quarantine releases never re-add loom:issue to a claimed or closed issue (#11517)
+- **PR #11784**: Weight-0 check after holds; drop leftover set-priority wording (#11742 follow-up)
+- **Issue #9929** (closed): Curator applies issue-lifecycle labels (loom:curating/loom:curated) to pull requests
+- **PR #9938**: fix(daemon): never treat a pull request as an issue in candidate selection or claim
+- **PR #11754**: resync: refresh the Loom-managed block of .github/labels.yml (#11033, labels part)
+- **Issue #11742** (closed): Repo draw: explicit linear weights, P(repo) = w / Σw, replacing the softmax over fleet_priority
+- **PR #11777**: Repo draw: linear weights plus bonuses, no tiers (#11742)
+- **Issue #11739** (closed): UNWIND: remove fleet-policy key classification (Fleet/Repo/Host) and the shadow guard (#11441)
+- **PR #11781**: refactor(config): remove fleet-policy key classification and its CI guard (#11739)
+- **Issue #11726** (closed): Assign Loom stages to agent providers/models by weighted random draw per attempt (replace ordered rolePreference)
+- **PR #11780**: Weighted per-stage, per-attempt agent draw replacing ordered rolePreference (#11726)
+- **PR #11779**: ci(harness-pins): drop the 2AMLogic/provenance-action step
+- **PR #11775**: fix(daemon): close the two restore-veto gaps from #11768's review (#11480)
+- **Issue #11366** (closed): skip-labels/hard-exclusion --jq-not uses jq contains (substring match): a skip label loom:epic also hides loom:epic-phase issues
+- **PR #11774**: fix(skip-labels): exact label membership in the --jq-not fragment (#11366)
+- **Issue #11765** (closed): ETA fact: emit the executing host's Loom version on sweep lifecycle facts (sweep.started/phase, stage.work_started)
+- **PR #11770**: feat(telemetry): executing host version on sweep lifecycle facts (#11765)
+- **Issue #11727** (closed): Codex session containers keep a stale loom-daemon after host rolls; hook exit 2 blocked every Codex role for 30h with no Claude fallback
+- **PR #11772**: feat(session): recreate session containers with a daemon older than the host's (#11727 slice 2)
+- **Issue #11480** (closed): work finder: one shared veto check on every dispatch path (veto labels, Decision issues)
+- **PR #11768**: fix(daemon): one shared restore veto on every loom:issue release path (#11480)
+- **Issue #11762** (closed): telemetry: attribute daemon label writes to their code path (quarantine enter/release, restore veto, gh-write call name)
+- **Issue #9030** (closed): fix(daemon): fast-fail 30m skipped_load timeout on persistent host admission brake
+- **Issue #8999** (closed): tokens: repo-local pools still shadow the shared pool after #7527, splitting one account budget across two independent rotations
+- **Issue #9249** (closed): Reconsider "don't parallelize judges": it is a width choice awaiting evidence, not a safety rule
+- **Issue #8742** (closed): loom:blocked is silently stripped from operator-ruled permanent blocks (unblock probe treats 'unparseable blocker' as 'no blocker')
 - **PR #11767**: refactor(tests): migrate second batch of 28 suites to lib/assert.sh (#11695)
 - **PR #11764**: ci: mirror pinned test images to GHCR by digest, pull GHCR first (#11755)
 - **PR #11763**: test(ci): skip, don't fail, image-dependent telemetry tests when the image is unavailable on PRs (#11756)

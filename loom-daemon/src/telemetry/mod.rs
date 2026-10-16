@@ -78,8 +78,9 @@ pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{
-    apply_noop_loop_class, classify_disposition, result_for_disposition, DispositionSignals,
-    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS, SPAWN_DEATH_CLASS,
+    apply_noop_loop_class, classify_disposition, ensure_failure_class, result_for_disposition,
+    DispositionSignals, IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS, SPAWN_DEATH_CLASS,
+    UNCLASSIFIED_CLASS,
 };
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
@@ -1074,6 +1075,10 @@ pub enum RoleTickResult {
     SkippedLoad,
     /// Skipped pre-spawn: a queue-gated role's work queue was empty (#9391).
     SkippedQueueEmpty,
+    /// Not reached this tick: a host-level limit (ceiling, role budget,
+    /// demand width, reservation) stopped the round-robin walk before this
+    /// repo's turn, so its next chance is a later tick (#12084).
+    SkippedDeferred,
 }
 
 /// Whether a `repo` string is a local filesystem path (or empty) rather than
@@ -1189,6 +1194,14 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Why a [`RoleTickResult::Failure`] tick failed (#12028): the closed-
+    /// vocabulary `loom.failure_class` the tick's `role_attempt` span carries
+    /// when it launched, or the fixed pre-launch class of the site that
+    /// refused it. Never `detail`'s text. Present only on a failure; absent on
+    /// every other result and on every record written before #12028 —
+    /// additive, no `schema_version` bump, exactly as [`Self::gated_pool`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
     /// Which tier of the ordered runtime-preference list this tick launched on
     /// (Issue #8599): `0` is the most-preferred tap — nothing fell through —
     /// and any higher value is a fall-through, so "how much work went to the
@@ -1252,7 +1265,37 @@ pub struct RoleTickOutcomeRecord {
     /// optional unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<RoleTickActions>,
+    /// The checkout this tick's session read its `/loom:<role>` prompt from,
+    /// as it stood at launch (#11989): its commit, the Loom release installed
+    /// in it, how far it is behind `origin/<default>`, and whether HEAD was
+    /// on a branch. Absent for a tick that never resolved a launch and on
+    /// records written before #11989 — additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<crate::role_tick_telemetry::prompt_tree::PromptTree>,
+    /// What ran the tick (#11906): absent for a role-runner tick, `"step"`
+    /// ([`ROLE_TICK_SOURCE_STEP`]) for a step-engine step, so a "role ticks
+    /// still running" query never counts steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
+    /// Which host limit deferred this repo's tick (#12084): `ceiling`,
+    /// `role_budget`, `demand_width` or `reservation`. Present exactly on
+    /// [`RoleTickResult::SkippedDeferred`]. Additive, no `schema_version`
+    /// bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_by: Option<String>,
+    /// Which shard owns this repo's role ticks (#12084), `<index>/<count>`
+    /// (zero-based index), as [`crate::role_shard`] resolved it. Present only
+    /// on a [`RoleTickResult::SkippedDeferred`] record of a sharded host;
+    /// absent when unsharded, never a guessed `0/1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_owner: Option<String>,
 }
+
+/// [`RoleTickOutcomeRecord::source`] of a step-engine step (#11906).
+pub const ROLE_TICK_SOURCE_STEP: &str = "step";
 
 /// One account's slice of a `tokens.snapshot` — the per-account usage /
 /// limit-window state matching what `loom-daemon tokens check --ranking` knows.
@@ -1679,6 +1722,48 @@ pub struct HostHealthRecord {
     /// backward-compatibility contract `protection` established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryPressureSummary>,
+    /// Live `loom-agent-*` cgroup scopes on this host (Issue #12166), read
+    /// from the cgroup tree rather than the sweep registry, so residue that
+    /// outlived its registry entry stays visible. Capped at
+    /// [`crate::agent_scopes::MAX_AGENT_SCOPES`]; the true count is
+    /// `agent_scopes_total`. Empty means "unmeasured or none" (non-Linux, no
+    /// systemd agents slice), never "proved idle".
+    ///
+    /// `#[serde(default)]` so a pre-#12166 record still decodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_scopes: Vec<AgentScopeSummary>,
+    /// Total live agent scopes (uncapped). `None` when the agents slice could
+    /// not be read at all, distinct from `Some(0)` (read, none live).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_scopes_total: Option<u32>,
+}
+
+/// One live `loom-agent-*` scope as seen in the cgroup tree (Issue #12166).
+/// Each measurement is optional: unmeasurable is absent, never zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentScopeSummary {
+    /// Scope unit name (carries the sweep id).
+    pub scope: String,
+    /// Seconds since the scope's cgroup was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_sec: Option<u64>,
+    /// Whether an agent runtime/launcher process is among the scope's procs.
+    pub agent_alive: bool,
+    /// Pid of the longest-running process left in the scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pid: Option<u32>,
+    /// `comm` of that process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_comm: Option<String>,
+    /// Age in seconds of that process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_age_sec: Option<u64>,
+    /// Cumulative CPU time of the scope (`cpu.stat` `usage_usec`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_usec: Option<u64>,
+    /// Seconds since the newest transcript write for the scope's cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_age_sec: Option<u64>,
 }
 
 /// Memory/pressure readings at one host.health sampling moment: physical
@@ -1778,32 +1863,6 @@ pub struct ManagedRepoEntry {
     /// older daemons, which sent a `priority` tier instead (#9244).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
-    /// This host's `loom:blocked` release-pass tallies for the repo since the
-    /// daemon started (#10763). Absent before the pass's first tick for the
-    /// repo on this host and on older daemons.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stale_blocked_release: Option<StaleBlockedReleaseCounters>,
-}
-
-/// One repo's `loom:blocked` release-pass tallies on one host (#10763),
-/// carried on [`ManagedRepoEntry`] so a fleet where the pass never acts is
-/// diagnosable without host logs: `ticks` counts every per-repo tick by
-/// outcome (`ran`, `not_due`, `skipped_shard`, `denied_scope`, `not_served`,
-/// `rate_limited`, `skipped_off`, `dry_run`, `archived`, `enumerate_error`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StaleBlockedReleaseCounters {
-    /// Artifacts released (applied writes only).
-    #[serde(default)]
-    pub released: u64,
-    /// Artifacts re-parked (applied writes only).
-    #[serde(default)]
-    pub reparked: u64,
-    /// The most recent tick's outcome key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_outcome: Option<String>,
-    /// Ticks per outcome key.
-    #[serde(default)]
-    pub ticks: std::collections::BTreeMap<String, u64>,
 }
 
 /// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many

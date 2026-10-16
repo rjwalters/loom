@@ -559,7 +559,7 @@ check is external and the daemon says so instead of implying otherwise.
 ## 3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)
 
 A daemon that does not export to SigNoz looks healthy everywhere else, so the
-condition is a first-class health check with four states, shown on the
+condition is a first-class health check with five states, shown on the
 `OTLP export:` line of `loom-daemon status`, as `otlp_export` in
 `status --json`, and as `otlp_export` on the `host.health` record:
 
@@ -570,7 +570,9 @@ condition is a first-class health check with four states, shown on the
 | `ok` | The last successful export is recent (a fresh exporter gets the window as startup grace). |
 | `exempt` | The host opted out; the reason is shown. |
 
-Precedence is `exempt`, `no_exporter`, `failing`, `ok`. A line is logged at
+| `silent_kinds` | The exporter works, but a record kind the host should be producing has not been exported for 24h (Issue #12120; see below). |
+
+Precedence is `exempt`, `no_exporter`, `failing`, `silent_kinds`, `ok`. A line is logged at
 daemon start and on each change of state, never per tick: WARN for `no_exporter`
 and `failing`, INFO for recovery to `ok` and entry into `exempt`.
 
@@ -584,6 +586,19 @@ entry counts as `no_exporter`. A degraded start — no OTLP entry starts and the
 host is not exempt — logs one ERROR line, `observability: DEGRADED — this
 daemon's facts are not reaching SigNoz: <detail>`, and the daemon still starts
 (`otlp_health::startup_verdict`; the start policy itself is #11526).
+
+**Per-kind silence (Issue #12120).** While an `otlp` exporter runs, `otlp_export.kinds`
+(in `status --json` and on `host.health`) lists each OTLP-carried kind with its
+`last_export_at` and a `silent` flag; `silent_kinds` makes the `status` line read
+`otlp: silent_kinds … (no export for 24h+ from: <kinds>)`. The data is the local
+exporter's own record of acked envelopes, in memory only (no SigNoz query). A kind is
+silent when `now - (last_export_at, else exporter start)` exceeds its threshold, so a
+restart never reads as "never exported" and cannot flag a host in its first 24h.
+Thresholds are one static table, `telemetry/kinds/kind_silence.rs` (`KIND_SILENCE`; no
+config keys): `host.health`, `host.export` and `tokens.snapshot` fire every collector
+tick and get 24h; activity-driven or failure-only kinds are `None` (never flagged); a
+kind with no row defaults to 24h. A host with no `otlp` exporter reports
+`no_exporter` with no `kinds`, and no error.
 
 ```json
 { "observability": {
@@ -679,22 +694,21 @@ comes from bus events the daemon already publishes: seconds from an issue
 sweep finishing to the next issue-sweep dispatch
 (`loom.dispatch.slot_turnaround` / `.samples`). The tick adds idle slots
 (`loom.dispatch.idle_slots`) and the slot-seconds left idle while ready work
-waited (`loom.dispatch.idle_slot_seconds`). Forge label-stage dwell
-(`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state}`)
-covers created → curated, curated → `loom:issue`, building → review requested
-and review requested → merged. It reads ETag-cached stage listings every 5
-minutes plus at most 8 per-item reads per sample, never per tick. With
-`fleet.captainGauges` configured, the fleet captain samples for the fleet and
-dispatchers stand down while its published data is fresh
-(`loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`; see
-[`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12)).
-The same heartbeat can carry two forge facts (`starFacts`, `queueBlocked`), so
-the liveness pass's idle operator-label listings and the snapshot's
-`loom:blocked` listing are made by the captain alone.
+waited (`loom.dispatch.idle_slot_seconds`). Busy slots by role (#11847,
+`loom.dispatch.busy_slots{role}`) split the load: `role="sweep"` is the issue
+sweeps (so `busy_slots{role="sweep"} + idle_slots = max_concurrent`), and each
+role-runner role has its own series, with the role pool's ceiling and spare
+in `loom.dispatch.role_max_concurrent` and `loom.dispatch.role_idle_slots`.
+Forge label-stage dwell is not exported by the daemon (the sampler and
+`loom.forge.stage_dwell` / `loom.forge.stage_items` were deleted in #12316):
+dwell is a consumer's computation over the mirror's per-item label times.
+The fleet-captain gauge producer (`fleet.captainGauges`, `loom.captain.*`) was
+removed in #11406: every host reads the snapshot's `loom:blocked` listing itself.
 Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 **Merge-chain re-date pressure (#10163).** Three gauges track the #8508
-re-date remedy over a trailing 24 h: `loom.merge.redate_prs{state}`
+re-date remedy over a trailing 24 h (retired by #12063; the gauges stay to show
+it reaching zero, #10888): `loom.merge.redate_prs{state}`
 (`landed`, `pending`, `stuck`), `loom.merge.redates_max{state}` and
 `loom.merge.time_to_land_max`. They are read from local `git log` on the
 `host.health` cadence, with no forge call. A non-zero `stuck` series is a
@@ -721,6 +735,15 @@ in the same change, so `loom.issue` is no longer ambiguous on a multi-repo
 host. Full attribute table in
 [`telemetry-schema.md`](telemetry-schema.md#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting).
 
+**Step claim facts (#12183).** A `loom.dispatch.step` span for a role-keyed
+lease claim (every step but Builder) also carries how `lease pr claim` ran,
+whether the step spawned or was refused: `loom.dispatch.claim_outcome`
+(`exited` / `timed_out` / `spawn_failed` / `signaled` / `no_binary`),
+`loom.dispatch.claim_exit_code` (only when it exited), `loom.dispatch.claim_ms`,
+and `loom.dispatch.claim_stderr_tail` (last stderr line, control characters
+stripped, at most 256 bytes). They say *why* a `claim_unverified` refusal
+happened; `loom.dispatch.reason` keeps its closed tokens.
+
 Mapping an operator's plain-English question onto the `QueueDisposition`
 vocabulary (`loom.queue.disposition`'s wire values):
 
@@ -739,9 +762,15 @@ the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`,
 `write_scope` (#9548) — so
 "which hold is this repo under" is filterable straight from the span, no
 join needed. The attribute is absent on a cause-less legacy row (a
-pre-#9017 caller); the `loom.dispatch.tick`-span join
-(`loom.dispatch.result="halted_main_red"` through `parentSpanID`) remains
-the fallback there.
+pre-#9017 caller); the fallback there is the `loom.dispatch.tick`-span join
+through `parentSpanID`, reading the tick's `loom.dispatch.halt_causes`
+(comma-separated tokens). Do not key that join on
+`loom.dispatch.result="halted_main_red"`: since #11857 the result names a
+hold only when it covered the tick's work, so a tick that held one root
+beside healthy roots with candidates carries its per-candidate result
+(`all_skipped`, `no_eligible_work`, ...). `loom.dispatch.halt_causes` is
+still emitted on such a partial hold, and `loom.dispatch.held_roots` counts
+the held roots.
 
 A runnable copy of the "why hasn't `owner/repo#N` started" query is query 5 of
 `defaults/observability/signoz/queue-dwell.sql` — that file's other four
@@ -771,9 +800,13 @@ job that tripped it (`loom.ratelimit.source`), the cooldown end and, per pool,
 the probe's `used` split into this host's own share and the external share
 (`github.ratelimit.{core,graphql}.{used,own,external}`) — the `attribution:`
 line from `daemon.log`, now queryable fleet-wide. Every 60 s the collector
-probes `gh api rate_limit` (free: it does not count against the quota). On a
-GitHub App host the reading is booked into the bucket book below as the
-writer App's bucket for the workspace's own owner; on an ambient-login host it
+reads the process-wide budget cache (#12204: no forge call of its own — one
+`gh api rate_limit` per credential per reset window, made by a budget check on
+a cold start or by a breaker trip, refreshed between probes from response
+headers). On a GitHub App host the reading is booked into the bucket book below as the
+writer App's bucket for the workspace's own owner; on an ambient-login host,
+once the budget cache holds a reading (a cold-start budget check or a breaker
+trip fills it) or the breaker has a trip-time reading with open windows, it
 is exported as `github.ratelimit.{remaining,used,reset}` gauges labelled
 `resource` (`core`|`graphql`), `account` (the `gh` login, else `unknown` —
 never a token or path), `owner="-"` and `role="ambient"`. The collector also
@@ -785,8 +818,13 @@ OTLP exporter exports none of this; its evidence stays in `daemon.log`.
 installation separately, so the daemon also keeps a *bucket book*: the newest
 reading of every `(account, owner, resource)` pool it spends, from the free
 `x-ratelimit-*` headers of `gh api --include` calls and from one free
-`gh api rate_limit` probe per published credential directory after every
-reader-refresh pass, plus the 60 s probe above. Each believed reading is
+`gh api rate_limit` probe per published credential directory whose bucket it
+does not already hold for the current window (checked after every
+reader-refresh pass, #12204), plus the 60 s cached reading above. A bucket
+with no header traffic is therefore not re-probed: its reading expires after
+10 minutes (`MAX_AGE_SECS`) and the bucket reads unknown until its window
+resets. Routing treats unknown as headroom and a refusal still withdraws the
+bucket, so the gap is safe, but the gauge is absent for it. Each believed reading is
 exported once per tick as `github.ratelimit.{remaining,used,reset}` labelled
 `resource`, `account`, `owner`, `installation` and `role` (`writer`|`reader`)
 — since #10343 no point leaves without `owner`, and since #10571 `account`/
@@ -811,13 +849,15 @@ same facts per call (#10343): `github.http.{status,not_modified,requests,source}
 the bucket join keys `github.{resource,account,cred_owner,role}`. Since
 #10752 a span also carries `github.repo`, a write carries `github.number`, and
 a call made by a daemon pass inside its caller scope carries `github.caller`
-(the `loom:blocked` release pass: `stale_blocked_release`). Since #11407
+(for example `stale_blocked_release`, the retired `loom:blocked` release
+pass, #11301). Since #11407
 every span also names the endpoint: `github.route` (a template such as
 `/repos/{owner}/{repo}/pulls/{n}`, from the same finite table as gh-shim's
 `github.api.route`), `http.request.method`, and `github.command` (`pr view`
 for an agent front read), so `api.rest` and `agent_gh_front` spend can be
 ranked by route. That pass also
-emits a `pass.summary` log per pass and a `pass.verdict` per artifact; see
+emits a `pass.summary` log per pass and a `pass.verdict` per artifact; Champion
+steps add `pass.verdict` rows with `mechanism=step:champion`; see
 [`telemetry-schema.md`](telemetry-schema.md) and
 `defaults/observability/signoz/pass-queries.sql`.
 

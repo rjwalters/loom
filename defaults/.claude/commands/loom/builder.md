@@ -217,7 +217,7 @@ missing credential may trigger one, and it requests the **name, shape, and
 provisioning path — never the value**; never print, commit, or quote a
 credential value in an issue/PR/commit. A missing credential you cannot
 provision in-session is a mechanical blocker, not a judgement call — apply
-`loom:operator` with a capability marker per "Routing to a human" below
+a hold per "Routing to a human" below
 rather than prompting for a value. Full
 convention: `.loom/docs/credentials.md`.
 
@@ -228,10 +228,11 @@ Check for an argument passed via the slash command:
 **Arguments**: `$ARGUMENTS`
 
 If a number is provided (e.g., `/builder 42`):
-1. Treat that number as the target **issue** to work on
-2. **Skip** the "Finding Work" section entirely
-3. Claim the issue: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
+1. Treat that number as the target **issue** to work on; **skip** "Finding Work"
+2. **Guard before any write** (#11863): `loom-daemon forge check-claim <number>`. Exit `1`: claim. Exit `0` prints a token: `TARGET_IS_PR` (an issue role, #9929), `CLOSED`, `FROZEN`, `OPERATOR` or `OPEN_PR` → refuse, writing nothing. `BUILDING` / `LEASE_ALREADY_HELD` / `BRANCH_EXISTS` → refuse unless your invoker holds this claim (`LOOM_SWEEP_CLAIM_OWNED` names the number, or your brief says `This /loom:sweep pre-flighted #<number>`) or the operator told you to resume or force it: that overrides these three, never the five above. Any other exit: stop. A hard-excluded label (Label Workflow) refuses too
+3. Claim the issue: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"` (`worktree.sh` leases it)
 4. Proceed directly to implementation
+5. End with the outcome line from `.loom/docs/targeted-role-invocation.md`: `LOOM_STEP_OUTCOME role=builder target=<n> class=<verdict|noop|refused|failed> reason=<token>`
 
 If no argument is provided, use the normal "Finding Work" workflow below.
 
@@ -338,57 +339,20 @@ workflow) that require maintainer approval before being worked on.
 
 - **Find work**: Use the three-tier priority order in "Finding Work: Priority System" below (urgent → curated → approved-only); FIFO (oldest-first) is only the tiebreak **within** a tier.
 - **Check dependencies**: all task-list items checked before claiming
-- **Guard, then claim**: `loom-daemon forge check-claim <number>` must not exit 0 (exit 0 = blocked — open PR, claim label, fresh lease, or remote branch; take another issue), then `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`, then lease it: `loom-daemon lease ensure <number> --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`. `worktree.sh` (below) runs this itself; a lane NOT using it MUST call `lease ensure` directly — a leaseless claim is invisible to other lanes and reclaimable (#9453)
+- **Guard, then claim**: `loom-daemon forge check-claim <number>` must not exit 0 (exit 0 = blocked — open PR, claim label, fresh lease, or remote branch; take another issue; your own `$LOOM_SWEEP_ID` lease is not a blocker), then `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`, then lease it: `loom-daemon lease ensure <number> --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (watch the process doing the work, never a subagent's inherited `$PPID`, which is the parent session and keeps the lease alive after you exit). `worktree.sh` (below) runs this itself; a lane NOT using it MUST call `lease ensure` directly — a leaseless claim is invisible to other lanes and reclaimable (#9453). When you finish or abandon the issue, `loom-daemon lease release <number>` hands the lease back (#12103)
 - **Do the work**: Implement, test, commit, create PR
 - **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` (copies the priority label, #10518) — never a bare `gh pr create` (#6074); body template: builder-pr.md § "Creating the PR"
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
 
 ## Exception: Explicit User Instructions
 
-**User commands override the label-based state machine.**
+**User commands override the label-based state machine.** When the user names an issue ("work on issue 592 as builder", "implement issue 342", "fix bug 234"):
 
-When the user explicitly instructs you to work on a specific issue or PR by number:
+1. **Gate first**: the guard above. The instruction approves the stage (e.g. `loom:curated`) and overrides only its three claim tokens, never the five refusals
+2. **Claim**: add `loom:building` and comment "Starting work on this issue per user request"
+3. **Work and finish normally**: `./.loom/scripts/worktree.sh 592`, implement, then a PR with `loom:review-requested` (builder-pr.md § "Creating the PR")
 
-```bash
-# Examples of explicit user instructions
-"work on issue 592 as builder"
-"take up issue 592 as a builder"
-"implement issue 342"
-"fix bug 234"
-```
-
-**Behavior**:
-1. **Proceed immediately** — skip label checks
-2. **Interpret as approval** — user instruction = implicit approval
-3. **Apply working label** — add `loom:building`
-4. **Document override** — comment: "Working on this per user request"
-5. **Follow normal completion** — apply end-state labels
-
-**Example**:
-```bash
-# User says: "work on issue 592 as builder"
-# Issue has: loom:curated (not loom:issue)
-
-# Proceed immediately
-gh issue edit 592 --add-label "loom:building"
-./.loom/scripts/post-comment.sh 592 --body "Starting work on this issue per user request"
-
-# Create worktree and implement
-./.loom/scripts/worktree.sh 592
-# ... do the work ...
-
-# Complete normally with a PR — the canonical structured body template
-# (builder-pr.md § "Creating the PR") with loom:review-requested at creation.
-```
-
-**Why This Matters**: users may prioritize work outside the normal flow, test
-workflows on specific issues, or override Curator/Guide triage decisions —
-flexibility matters in manual orchestration mode.
-
-**When NOT to Override**:
-- When user says "find work" or "look for issues" -> Use label-based workflow
-- When running autonomously -> Always use label-based workflow
-- When user doesn't specify an issue/PR number -> Use label-based workflow
+Not an override: "find work" / "look for issues", no issue number, or an autonomous run. Use the label-based workflow.
 
 ## Worktree Management
 
@@ -581,8 +545,7 @@ stop. `--output` does not help either: it stages a copy of the *primary's*
 `defaults/`, not your unmerged edits.
 
 In `rjwalters/loom` the installed mirrors are tracked and CI requires them current
-before merge (`check-hooks-defaults-parity.sh`, `check-docs-defaults-parity.sh`,
-`check-dangling-links.sh`). So when your diff touches one, update it by hand
+before merge (`check-hooks-defaults-parity.sh`, `check-dangling-links.sh`). So when your diff touches one, update it by hand
 **inside your worktree** (paths via `$WORKTREE_ABS`):
 
 - `defaults/hooks/X.sh` -> `cp -p defaults/hooks/X.sh .loom/hooks/X.sh`
@@ -945,9 +908,9 @@ attempt or a hard bug is not one. The rule is
 `.loom/docs/label-state-machine.md` → "Routing to a human": a ruling →
 `loom-daemon operator-decision apply <number> --input d.json --remove-label
 loom:building` (2-4 ranked options; adds `loom:operator`); a human's hands →
-`loom:operator` + a capability marker (+ `Blocked by #N` if it waits on
-something named); automation-resolvable waiting → `loom:blocked` with a park
-record.
+`loom:operator` + a comment naming the step (+ `Blocked by #N` if it waits
+on something named); automation-resolvable waiting → `loom:blocked` with a
+park record.
 
 **Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close is not re-picked-up. A **rescoped** issue must have its labels reset so it is not re-dispatched in a loop with a stale scope.
 
@@ -1036,7 +999,6 @@ For additional PR quality guidelines, see **builder-pr.md**.
 - Pass the fast-tier pre-flight (`loom-daemon preflight --issue N`) plus targeted tests for what you touched; CI runs the full suite (#11690)
 - **Run the project's formatter + linter on your changed files before committing** — discover the commands from repo convention (`buildGate.command`, `CONTRIBUTING.md`, CI workflow, or the language's standard tool). A format-only CI failure is a **guaranteed Judge rejection** that costs a Doctor cycle — see **builder-pr.md § "Format and Lint Changed Files"**
 - **Test-first discipline, for behavior changes**: write the failing test (or bug-reproducing test) before the fix, confirm it fails for the right reason, then implement to green. Record a `TDD:` line in the PR's Test Plan section — Judge re-verifies it against the diff, not just your say-so. Full requirement, format, and advisory/blocking rules: **builder-pr.md § "Test-First Discipline (TDD line)"** (ADR-0015).
-- **If you touched an already-large file, run `scripts/check-file-size-budget.sh` before pushing.** On failure, extract into a sibling file first; never grow it in place.
 
 ### Live Verification You Cannot Perform: Say So, Don't Claim It
 

@@ -8,7 +8,7 @@ resolver = "2"
 # hardcoded its own version, so every bump edited two files that could drift
 # apart independently -- the "the bump missed a file" class of #6536/#6730.
 [workspace.package]
-version = "0.19.1157"
+version = "0.19.1169"
 # The repo this workspace is built from — compiled into `loom-daemon` via
 # `repository.workspace = true` + `env!("CARGO_PKG_REPOSITORY")` (#8513). This
 # is the build-time fallback `auto_update`'s release resolver falls back to
@@ -30,3 +30,15 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 tokio = { version = "1.52", features = ["full"] }
 anyhow = "1.0"
+
+# Cap rustc's peak memory for the dev/test profiles (#11094, item 4). One
+# `loom-daemon` codegen unit peaked at 7-13 GB with full debuginfo, enough for
+# two concurrent sweeps to OOM a 30 GB worker. `line-tables-only` keeps
+# backtraces and drops the type-level DWARF that dominates that peak. This
+# matches CI (CARGO_PROFILE_{DEV,TEST}_DEBUG in ci.yml), so local builds now
+# compile the same way CI does. Release is untouched.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

@@ -1,18 +1,17 @@
 use super::*;
 
-/// #11795: `loom:operator` is an issue-dispatch park. A hold applied after
-/// dispatch must stop every re-dispatch route (watchdog, checkpoint resume,
-/// epic supervisor), the #4366 shape `loom:operator-only` used to guard; the
-/// human overrides by removing the label.
+/// #11795: `loom:operator` is a park. A hold applied after dispatch must stop
+/// every re-dispatch route (watchdog, checkpoint resume, epic supervisor), the
+/// #4366 shape `loom:operator-only` used to guard; the human overrides by
+/// removing the label. #11861: there is one park set for issues and PRs, so
+/// it parks a PR too.
 #[test]
-fn test_operator_hold_is_an_issue_dispatch_park() {
+fn test_operator_hold_is_a_park() {
     // vibesql#6664: a fresh `loom:issue` candidate carrying the hold is never
     // dispatched.
     let held = WorkItem::new(6172, vec!["loom:issue".into(), OPERATOR_HOLD_LABEL.into()]);
     assert!(held.is_skipped());
     assert!(PARK_LABELS.contains(&OPERATOR_HOLD_LABEL));
-    // ...but it is not a PR-lane park (#7660: Doctor drains held PRs).
-    assert!(!PR_LANE_PARK_LABELS.contains(&OPERATOR_HOLD_LABEL));
 }
 
 /// #11795 transition: an item still carrying a retired name is held exactly
@@ -42,8 +41,9 @@ fn caps() -> std::collections::BTreeSet<String> {
     ["host-sudo".to_string()].into_iter().collect()
 }
 
-/// #11795: the capability lane keys on `loom:operator` + a capability marker
-/// + no decision block. Never without a marker.
+/// #11861: the capability lane keys on `loom:blocked` + a capability marker +
+/// no named blocker + no decision block, and never on `loom:operator` (no role
+/// acts on it). Never without a marker.
 #[test]
 fn test_capability_lane_needs_a_marker_and_no_decision_block() {
     let lane = |labels: Vec<String>, body: &str| {
@@ -51,32 +51,28 @@ fn test_capability_lane_needs_a_marker_and_no_decision_block() {
             .with_body(Some(body.to_string()))
             .is_skipped_with_capabilities(&[], &caps())
     };
-    let op = || vec!["loom:issue".to_string(), OPERATOR_HOLD_LABEL.to_string()];
+    let blocked = || vec!["loom:issue".to_string(), BLOCKED_HOLD_LABEL.to_string()];
     let marker = "<!-- loom:capability=host-sudo -->";
-    assert!(lane(op(), marker), "marker, no decision: propose lane");
-    assert!(!lane(op(), "no marker here"), "no marker: parked (alerts, merge-risk)");
+    assert!(lane(blocked(), marker), "marker, no decision: propose lane");
+    assert!(!lane(blocked(), "no marker here"), "no marker: parked (deps, merge-risk)");
     assert!(
-        !lane(op(), &format!("{marker}\n```decision\n{{}}\n```")),
+        !lane(blocked(), &format!("{marker}\n```decision\n{{}}\n```")),
         "a decision block is a ruling, never mechanical"
     );
-    // Unmigrated mechanical item: still routes.
-    let old = vec![
-        "loom:issue".to_string(),
-        "loom:operator-only".to_string(),
-        "loom:operator-mechanical".to_string(),
-    ];
-    assert!(lane(old, marker));
-    // Unmigrated decision / operator-blocked by label: never.
-    for judgement in ["loom:operator-decision", "loom:operator-blocked"] {
-        let mut l = op();
-        l.push(judgement.to_string());
-        assert!(!lane(l, marker), "{judgement}");
+    // Unmigrated needs-capability item: routes.
+    assert!(lane(vec!["loom:issue".into(), "loom:needs-capability".into()], marker));
+    // The operator hold, under any name, alone or beside the park: never.
+    for hold in [
+        OPERATOR_HOLD_LABEL,
+        "loom:operator-only",
+        "loom:operator-mechanical",
+    ] {
+        assert!(!lane(vec!["loom:issue".into(), hold.into()], marker), "{hold}");
+        let mut l = blocked();
+        l.push(hold.to_string());
+        assert!(!lane(l, marker), "{hold} beside loom:blocked");
     }
-    // Another hold beside it vetoes.
-    let mut blocked = op();
-    blocked.push("loom:blocked".to_string());
-    assert!(!lane(blocked, marker));
     // No host capabilities: the default everywhere, always parked.
-    let item = WorkItem::new(6174, op()).with_body(Some(marker.to_string()));
+    let item = WorkItem::new(6174, blocked()).with_body(Some(marker.to_string()));
     assert!(item.is_skipped_with_capabilities(&[], &std::collections::BTreeSet::new()));
 }

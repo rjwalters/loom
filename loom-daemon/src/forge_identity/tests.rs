@@ -354,6 +354,10 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // tests compare the two); the gateway itself is a reviewed read path.
         "forge_gateway.rs",
         "forge_gateway/tests.rs",
+        // #12245: the agent `gh` front's passthrough reads. `pool_reader` is
+        // asked only for an argv `is_read` classifies as a read whose repo is
+        // certain; writes and unclassified calls never reach it.
+        "agent_gh/read_route.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let re = regex::Regex::new(
@@ -540,4 +544,20 @@ fn a_stale_reader_token_yields_to_the_next_reader_not_the_writer() {
     );
     let (_, app) = read_credential_in(tmp.path(), &r, repo, SystemTime::now()).unwrap();
     assert_eq!(app, second.app_id);
+}
+
+/// #12207: the reader root a session is given is a directory with a
+/// `.loom/` beside it, never a relative or blank value.
+#[test]
+fn a_reader_root_is_an_absolute_workspace_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(reader_root_from(Some(tmp.path().as_os_str().into())), None, "no .loom/");
+    std::fs::create_dir(tmp.path().join(".loom")).unwrap();
+    assert_eq!(
+        reader_root_from(Some(tmp.path().as_os_str().into())),
+        Some(tmp.path().to_path_buf())
+    );
+    assert_eq!(reader_root_from(Some("rel/ws".into())), None);
+    assert_eq!(reader_root_from(Some(std::ffi::OsString::new())), None);
+    assert_eq!(reader_root_from(None), None);
 }

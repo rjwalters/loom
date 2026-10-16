@@ -32,10 +32,16 @@
 //! Issue #10955 adds one more carve-out of the same shape: an issue that did
 //! not carry `loom:issue` when it was claimed does not gain it on release.
 //! See [`prior_label`].
+//!
+//! Issue #11852 adds the last one: an issue with a verified open linked PR
+//! keeps `loom:building` while that PR is open — the release writes no label
+//! at all. See [`open_pr_veto`].
 
 use super::*;
 
+mod open_pr_veto;
 mod prior_label;
+mod step_restore;
 
 /// What a claim release did (#11743).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +50,14 @@ pub(crate) enum ClaimRelease {
     Released,
     /// The issue is `loom:frozen`: no label was touched.
     Frozen,
+    /// The issue has this open linked PR (#11852): it keeps `loom:building`
+    /// while the PR is open, so no label was touched.
+    HeldByOpenPr(u32),
+    /// A step's release wrote nothing (#11898): its claim label was already
+    /// gone (the step finished and moved the item on, or a later role holds
+    /// it), or the item could not be read and a Builder claim is not touched
+    /// blind.
+    Untouched,
 }
 
 impl SweepRegistry {
@@ -114,6 +128,22 @@ impl SweepRegistry {
         // Only a positive "no" skips the re-add (see `prior_label`).
         let never_ready = !(veto.is_some() || is_pr || closed == Some(true))
             && self.claim_took_ready_label(issue) == Some(false);
+        // Issue #11852: and, only when the re-add would STILL happen, is the
+        // issue's PR open? Then the issue keeps `loom:building` while it is,
+        // and nothing is written. A fresh memo is fine (here `Open` prevents a
+        // write); anything else releases as before (see `open_pr_veto`). Asked
+        // only once the signals read verified the issue OPEN: a forge that
+        // could not answer that read (a wedged `gh`, #3973) is not asked more.
+        if veto.is_none() && !is_pr && closed == Some(false) && !never_ready {
+            if let Some(pr) = self.release_open_linked_pr(issue) {
+                log::info!(
+                    "sweep_registry: restore_label_to_ready for #{issue} found open linked PR \
+                     #{pr} — keeping `loom:building` while the PR is open, no label write; \
+                     claim reconciliation releases it once the PR closes unmerged (#11852)"
+                );
+                return Ok(ClaimRelease::HeldByOpenPr(pr));
+            }
+        }
         let mut args = vec![
             "issue".to_string(),
             "edit".to_string(),
@@ -368,6 +398,88 @@ exit 0
             calls.contains("--add-label loom:issue"),
             "fail-open: an unverifiable state still restores the queue label: {calls}"
         );
+    }
+
+    /// #11852: an issue keeps `loom:building` while its PR is open, so a
+    /// release with a verified open linked PR writes no label at all. The
+    /// verified answer here is a fresh #6788 memo, which this veto may use
+    /// because `Open` prevents a write rather than permitting a dispatch.
+    #[test]
+    #[serial_test::serial]
+    fn an_open_linked_pr_keeps_the_claim_label_on_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
+        let registry = registry_with(&fake_gh, dir.path());
+        registry.seed_open_pr_memo(11852, 11853, chrono::Utc::now());
+
+        let released = registry.restore_label_to_ready_checked(11852).unwrap();
+
+        assert_eq!(released, ClaimRelease::HeldByOpenPr(11853));
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(
+            !calls.contains("issue edit"),
+            "an issue keeps `loom:building` while its PR is open — no label write (#11852): \
+             {calls}"
+        );
+    }
+
+    /// #11852 off-switch: `LOOM_RELEASE_OPEN_PR_VETO=0` restores the old
+    /// release even with a verified open PR, and asks no probe.
+    #[test]
+    #[serial_test::serial]
+    fn the_open_pr_hold_has_an_off_switch() {
+        std::env::set_var(crate::release_veto::OPEN_PR_VETO_ENV, "0");
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
+        let registry = registry_with(&fake_gh, dir.path());
+        registry.seed_open_pr_memo(11858, 11859, chrono::Utc::now());
+
+        registry.restore_label_to_ready(11858).unwrap();
+        std::env::remove_var(crate::release_veto::OPEN_PR_VETO_ENV);
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(
+            calls.contains("issue edit 11858 --remove-label loom:building --add-label loom:issue"),
+            "switched off, the release re-adds the queue label as before: {calls}"
+        );
+    }
+
+    /// #11852 fail-open: a probe that cannot answer (no resolvable repo, and
+    /// a stale memo whose one-PR recheck does not say "open") restores the
+    /// queue label exactly as before.
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_open_pr_probe_still_restores_the_queue_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
+        let registry = registry_with(&fake_gh, dir.path());
+        registry.seed_open_pr_memo(11854, 11855, chrono::Utc::now() - chrono::Duration::days(1));
+
+        registry.restore_label_to_ready(11854).unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(
+            calls.contains("issue edit 11854 --remove-label loom:building --add-label loom:issue"),
+            "an unverifiable open-PR answer fails open to the restore (#11852): {calls}"
+        );
+    }
+
+    /// #11852: the open-PR probe is asked only when the re-add would otherwise
+    /// happen — a closed issue is decided without it, even with a memo saying
+    /// a PR is open.
+    #[test]
+    #[serial_test::serial]
+    fn the_open_pr_probe_is_not_consulted_once_another_veto_decides() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "closed");
+        let registry = registry_with(&fake_gh, dir.path());
+
+        registry.restore_label_to_ready(11856).unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(!calls.contains("graphql"), "no open-PR probe on a closed issue: {calls}");
+        assert!(!calls.contains("pulls"), "no open-PR listing on a closed issue: {calls}");
+        assert!(!calls.contains("--add-label loom:issue"), "{calls}");
     }
 
     /// Issue #11438: when the reaped dispatch itself self-reported a no-op

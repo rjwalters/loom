@@ -32,6 +32,8 @@ pub(crate) const MAX_PAGES: usize = 10;
 
 /// Every open PR of `root`'s repository (`LOOM_REPO` wins), newest first.
 pub(super) fn list_open_prs(gh_bin: &Path, root: &Path) -> Result<Vec<RestPull>> {
+    // #12310: the open-PR listing is discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     list_open_pulls_cached_as("claim_reconciliation.pr_list", gh_bin, Some(root), None, MAX_PAGES)
 }
 

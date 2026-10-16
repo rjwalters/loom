@@ -31,6 +31,7 @@ fn who(role: Role, sweep: &str) -> Identity {
         role,
         host: "host-a1b2c3d4".into(),
         sweep: sweep.into(),
+        step: None,
     }
 }
 
@@ -233,41 +234,44 @@ fn the_renewer_stops_and_skips_on_the_right_signals() {
     let ok = lease_renewer_exit_renew();
     let mut m = 0;
     assert_eq!(
-        decide(true, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Renew
     );
     assert!(matches!(
-        decide(false, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(false, fresh(10, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, fresh(100, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(100, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, fresh(10, 100), 3, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), 3, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, fresh(10, 100), ok, Some(&closed), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&closed), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
-    assert_eq!(decide(true, fresh(10, 100), ok, None, "loom:treating", &mut m), Step::Skip);
+    assert_eq!(
+        decide(true, fresh(10, 100), ok, None, Some("loom:treating"), &mut m),
+        Step::Skip
+    );
     // The label must be gone for LABEL_MISS_LIMIT consecutive cycles.
     m = 0;
     for _ in 1..LABEL_MISS_LIMIT {
         assert_eq!(
-            decide(true, fresh(10, 100), ok, Some(&bare), "loom:treating", &mut m),
+            decide(true, fresh(10, 100), ok, Some(&bare), Some("loom:treating"), &mut m),
             Step::Skip
         );
     }
     assert!(matches!(
-        decide(true, fresh(10, 100), ok, Some(&bare), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&bare), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     m = 1;
     assert_eq!(
-        decide(true, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Renew
     );
     assert_eq!(m, 0, "a present label resets the streak");
@@ -295,18 +299,21 @@ fn the_renewer_stops_once_its_last_renewal_is_a_ttl_old_by_the_wall_clock() {
     // Inside the TTL less the margin: renew.
     let limit = i64::try_from(900 - RENEW_MARGIN_SECS).unwrap();
     assert_eq!(
-        decide(true, at(limit - 1), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, at(limit - 1), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Renew
     );
     // At or past it, even with the PR open and labelled and the forge
     // unreadable: stop, never renew.
     for since in [limit, 900, 20 * 60, 3 * 3600] {
         assert!(
-            matches!(decide(true, at(since), ok, None, "loom:treating", &mut m), Step::Stop(_)),
+            matches!(
+                decide(true, at(since), ok, None, Some("loom:treating"), &mut m),
+                Step::Stop(_)
+            ),
             "{since}"
         );
         assert!(matches!(
-            decide(true, at(since), ok, Some(&open), "loom:treating", &mut m),
+            decide(true, at(since), ok, Some(&open), Some("loom:treating"), &mut m),
             Step::Stop(_)
         ));
     }
@@ -316,13 +323,13 @@ fn the_renewer_stops_once_its_last_renewal_is_a_ttl_old_by_the_wall_clock() {
         ttl_secs: 60,
         ..fresh(10, 14_400)
     };
-    assert_eq!(decide(true, short, ok, Some(&open), "loom:treating", &mut m), Step::Renew);
+    assert_eq!(decide(true, short, ok, Some(&open), Some("loom:treating"), &mut m), Step::Renew);
     let short = Clocks {
         since_renewal_secs: 45,
         ..short
     };
     assert!(matches!(
-        decide(true, short, ok, Some(&open), "loom:treating", &mut m),
+        decide(true, short, ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
 }
@@ -342,7 +349,14 @@ fn the_age_cap_and_the_renewal_age_are_wall_clock() {
     let open = (true, vec!["loom:reviewing".to_string()]);
     let mut m = 0;
     assert_eq!(
-        decide(true, clocks, lease_renewer_exit_renew(), Some(&open), "loom:reviewing", &mut m),
+        decide(
+            true,
+            clocks,
+            lease_renewer_exit_renew(),
+            Some(&open),
+            Some("loom:reviewing"),
+            &mut m
+        ),
         Step::Stop("the age cap passed")
     );
     assert_eq!(wall_secs(woke, started), 5 * 3600);
@@ -364,7 +378,14 @@ fn a_woken_renewer_never_revives_an_expired_lease_a_peer_has_since_claimed() {
     };
     let mut m = 0;
     assert!(matches!(
-        decide(true, woke, lease_renewer_exit_renew(), Some(&open), "loom:treating", &mut m),
+        decide(
+            true,
+            woke,
+            lease_renewer_exit_renew(),
+            Some(&open),
+            Some("loom:treating"),
+            &mut m
+        ),
         Step::Stop(_)
     ));
     // …and the forge guard stops it independently: B holds the claim.
@@ -412,7 +433,14 @@ fn the_wall_clock_is_rechecked_immediately_before_the_patch() {
     };
     let mut m = 0;
     assert_eq!(
-        decide(true, checked, lease_renewer_exit_renew(), Some(&open), "loom:treating", &mut m),
+        decide(
+            true,
+            checked,
+            lease_renewer_exit_renew(),
+            Some(&open),
+            Some("loom:treating"),
+            &mut m
+        ),
         Step::Renew
     );
     assert_eq!(pre_patch_guard(now(), last_renewed, 900), Step::Renew);
@@ -466,14 +494,24 @@ const AUTHOR: &str =
     r#""user":{"login":"loom-fleet-dispatch[bot]","type":"Bot"},"author_association":"NONE""#;
 
 /// A fake `gh` keeping the PR's comments in `<dir>/rows` (NDJSON). A POST
-/// appends a row holding the body's marker line; rows in `<dir>/late` join
+/// appends a row holding the body's marker line, and a PATCH replaces that
+/// comment's row (marker line, `updated_at` now); rows in `<dir>/late` join
 /// the list after the first comments read (a peer racing the pre-check).
+/// `<dir>/pull` answers the PR read (already in its `--jq` shape) and
+/// `<dir>/checks` the head's check runs; without them both are unreadable.
+/// `<dir>/fail_reads` (`<lo> <hi>`) fails the comment reads numbered `lo..=hi`
+/// (from 0, the pre-check) as a throttled forge would, and `<dir>/fail_patch`
+/// fails every PATCH after recording it.
+/// Every call runs under a lock, so claimants on several threads see one
+/// consistent comment list, as they would on the forge.
 fn fake_gh(dir: &Path) -> PathBuf {
     let d = dir.display();
     let script = format!(
         r#"#!/usr/bin/env bash
 D="{d}"
 [ -f "$D/fail" ] && {{ echo 'HTTP 502' >&2; exit 1; }}
+until mkdir "$D/lock" 2>/dev/null; do sleep 0.01; done
+trap 'rmdir "$D/lock"' EXIT
 case " $* " in
   *" POST "*)
     prev=""; body=""
@@ -483,10 +521,27 @@ case " $* " in
     printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows"
     echo "$first" >> "$D/posted"
     echo "$id" ;;
-  *" PATCH "*) echo "$*" >> "$D/patched" ;;
-  *"/pulls/"*) echo "" ;;
+  *" PATCH "*)
+    echo "$*" >> "$D/patched"
+    [ -f "$D/fail_patch" ] && {{ echo 'HTTP 403' >&2; exit 1; }}
+    prev=""; body=""; cid=""
+    for a in "$@"; do
+      [ "$prev" = "-f" ] && body="${{a#body=}}"
+      case "$a" in */issues/comments/*) cid="${{a##*/}}" ;; esac
+      prev="$a"
+    done
+    first="${{body%%$'\n'*}}"
+    grep -v "^{{\"id\":$cid," "$D/rows" > "$D/rows.tmp" || true
+    printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$cid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows.tmp"
+    mv "$D/rows.tmp" "$D/rows" ;;
+  *"/check-runs"*) [ -f "$D/checks" ] || exit 1; cat "$D/checks" ;;
+  *"/pulls/"*) echo "$*" >> "$D/pulled"; cat "$D/pull" 2>/dev/null || echo "" ;;
   *"/comments"*)
     n=$(cat "$D/reads" 2>/dev/null || echo 0); echo $((n + 1)) > "$D/reads"
+    if [ -f "$D/fail_reads" ]; then
+      read -r lo hi < "$D/fail_reads"
+      if [ "$n" -ge "$lo" ] && [ "$n" -le "$hi" ]; then echo 'HTTP 403: rate limit' >&2; exit 1; fi
+    fi
     if [ "$n" -ge 1 ] && [ -f "$D/late" ]; then cat "$D/late" >> "$D/rows"; rm "$D/late"; fi
     cat "$D/rows" ;;
   *) exit 1 ;;
@@ -509,11 +564,15 @@ fn live_row(id: u64, holder: &Identity) -> String {
     ) + "\n"
 }
 
+/// Two short pauses: [`STEP_VERIFY_BACKOFF`]'s shape without its seconds.
+const TEST_STEP_BACKOFF: &[Duration] = &[Duration::from_millis(10), Duration::from_millis(10)];
+
 fn ctx(dir: &Path, me: Identity) -> Ctx {
     Ctx {
         common: Common {
             pr: 77,
             role: me.role,
+            step: me.step,
             watch_pid: None,
             sweep_id: Some(me.sweep.clone()),
             workspace: dir.to_path_buf(),
@@ -528,6 +587,8 @@ fn ctx(dir: &Path, me: Identity) -> Ctx {
         ttl: ttl(),
         now: Utc::now,
         manage_renewer: false,
+        lease_file: None,
+        step_verify_backoff: TEST_STEP_BACKOFF,
     }
 }
 
@@ -586,6 +647,112 @@ fn claim_refuses_without_writing_when_the_list_is_unreadable() {
     assert!(posted(dir.path()).is_empty());
 }
 
+// ---- a read-back failure after the claim write (#12252) -------------------
+
+/// The step engine's Judge pre-claim identity (`--step judge`).
+fn stepped_judge(sweep: &str) -> Identity {
+    Identity {
+        step: Some(StepRole::Judge),
+        ..who(Role::Judge, sweep)
+    }
+}
+
+/// Fail every comment read after the pre-check (reads 1 and on).
+fn fail_read_back(dir: &Path) {
+    fs::write(dir.join("fail_reads"), "1 1000\n").unwrap();
+}
+
+#[test]
+fn a_step_claim_whose_read_back_fails_is_refused_and_its_lease_released() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fail_read_back(dir.path());
+    let me = stepped_judge("sweep-step");
+    assert_eq!(ctx(dir.path(), me.clone()).claim(), EXIT_UNVERIFIED);
+    assert_eq!(posted(dir.path()), vec![me.lease_marker()], "the lease was written");
+    let patched = patched(dir.path());
+    assert!(patched.contains("repos/acme/widgets/issues/comments/500"), "{patched}");
+    // Released plainly: a refused step never ran, so no no-verdict record.
+    assert!(patched.contains(&format!("body={}\n", me.released_marker())), "{patched}");
+    // Read-back: initial READ_ATTEMPTS, then one per backoff pause.
+    let reads: u32 = fs::read_to_string(dir.path().join("reads"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(reads, 1 + READ_ATTEMPTS + 2, "bounded: no unbounded retry");
+    // Once reads recover, a peer finds the PR free at once, not after a TTL.
+    fs::remove_file(dir.path().join("fail_reads")).unwrap();
+    assert_eq!(ctx(dir.path(), stepped_judge("sweep-peer")).claim(), EXIT_HELD);
+}
+
+#[test]
+fn a_step_claim_whose_withdrawal_also_fails_still_refuses() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fail_read_back(dir.path());
+    fs::write(dir.path().join("fail_patch"), "").unwrap();
+    assert_eq!(ctx(dir.path(), stepped_judge("s")).claim(), EXIT_UNVERIFIED);
+    assert_eq!(patched(dir.path()).matches(" PATCH ").count(), 1, "one PATCH, no retry loop");
+}
+
+#[test]
+fn a_step_claim_survives_a_throttle_burst_that_clears_within_the_backoff() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    // Every quick read-back fails; the first backoff read succeeds.
+    fs::write(dir.path().join("fail_reads"), format!("1 {READ_ATTEMPTS}\n")).unwrap();
+    let me = stepped_judge("sweep-step");
+    assert_eq!(ctx(dir.path(), me.clone()).claim(), EXIT_HELD);
+    assert!(!dir.path().join("patched").exists(), "a held claim is not withdrawn");
+    assert_eq!(ctx(dir.path(), me).fence(), EXIT_HELD);
+}
+
+#[test]
+fn a_step_claim_that_loses_after_the_backoff_still_yields() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail_reads"), format!("1 {READ_ATTEMPTS}\n")).unwrap();
+    // A peer's earlier lease, visible from the second read on.
+    let peer = stepped_judge("sweep-peer");
+    fs::write(dir.path().join("late"), live_row(100, &peer)).unwrap();
+    let me = stepped_judge("sweep-me");
+    assert_eq!(ctx(dir.path(), me.clone()).claim(), EXIT_PEER);
+    assert_eq!(posted(dir.path()), vec![me.lease_marker(), me.yield_marker(&peer)]);
+}
+
+#[test]
+fn a_step_claim_with_a_clean_read_back_is_held_without_extra_reads() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let me = stepped_judge("sweep-step");
+    assert_eq!(ctx(dir.path(), me).claim(), EXIT_HELD);
+    let reads: u32 = fs::read_to_string(dir.path().join("reads"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The pre-check, one read-back, and the confirmation re-reads.
+    assert_eq!(reads, 2 + CONFIRM_ATTEMPTS);
+    assert!(!dir.path().join("patched").exists());
+}
+
+#[test]
+fn a_stepless_claim_whose_read_back_fails_still_proceeds() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fail_read_back(dir.path());
+    // A role prompt's own claim: #6287's fail-open, its fence catches a loss.
+    assert_eq!(ctx(dir.path(), who(Role::Judge, "s")).claim(), EXIT_HELD);
+    assert!(!dir.path().join("patched").exists());
+    let reads: u32 = fs::read_to_string(dir.path().join("reads"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(reads, 1 + READ_ATTEMPTS, "no step backoff without --step");
+}
+
 #[test]
 fn a_judge_claims_while_a_doctor_holds_the_pr() {
     let dir = TempDir::new().unwrap();
@@ -601,7 +768,7 @@ fn release_rewrites_the_marker_so_the_claim_frees_at_once() {
     fake_gh(dir.path());
     let a = who(Role::Doctor, "sweep-a");
     fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
-    assert_eq!(ctx(dir.path(), a.clone()).release(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), a.clone()).release(None), EXIT_HELD);
     let patched = fs::read_to_string(dir.path().join("patched")).unwrap();
     assert!(patched.contains("repos/acme/widgets/issues/comments/100"), "{patched}");
     assert!(patched.contains(&a.released_marker()), "{patched}");
@@ -615,6 +782,192 @@ fn claim_refuses_without_writing_when_write_scope_denies_the_repo() {
     c.gh.write_repo = Err("not a managed repository".to_string());
     assert_eq!(c.claim(), EXIT_UNVERIFIED);
     assert!(posted(dir.path()).is_empty(), "#9548: no write to an unvetted repo");
+}
+
+// ---- a timed-out Judge, reaped by the daemon (#11931) ---------------------
+
+const HEAD: &str = "3333333333333333333333333333333333333333";
+
+fn on(host: &str, sweep: &str) -> Identity {
+    Identity {
+        role: Role::Judge,
+        host: host.into(),
+        sweep: sweep.into(),
+        step: None,
+    }
+}
+
+/// The PR read the fake answers: open, waiting for review, claimed.
+fn waiting_pr(dir: &Path) {
+    let pull = format!(
+        r#"{{"state":"open","head":"{HEAD}","labels":["loom:review-requested","loom:reviewing"]}}"#
+    );
+    fs::write(dir.join("pull"), pull).unwrap();
+}
+
+fn stamp(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn row_at(id: u64, at: DateTime<Utc>, first_line: &str) -> String {
+    format!(r#"{{"id":{id},"updated_at":"{}","body":"{first_line}",{AUTHOR}}}"#, stamp(at)) + "\n"
+}
+
+fn patched(dir: &Path) -> String {
+    fs::read_to_string(dir.join("patched")).unwrap_or_default()
+}
+
+#[test]
+fn a_timed_out_judge_is_reaped_into_a_record_that_holds_the_pr_on_every_host() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    // The head's CI is still running, young: a release by the Judge itself
+    // would not be recorded, a reap after a timeout is.
+    let young = stamp(Utc::now() - chrono::Duration::minutes(10));
+    fs::write(
+        dir.path().join("checks"),
+        format!(r#"{{"total_count":1,"check_runs":[{{"status":"in_progress","started_at":"{young}"}}]}}"#),
+    )
+    .unwrap();
+    let dead = on("host-a", "run-1");
+    let lease_file = dir.path().join("run-1.leases");
+    let mut claimant = ctx(dir.path(), dead.clone());
+    claimant.lease_file = Some(lease_file.clone());
+    assert_eq!(claimant.claim(), EXIT_HELD);
+    // The won lease is listed for the daemon.
+    let listed = loom_daemon::pr_lease_reap::parse_file(&fs::read_to_string(&lease_file).unwrap());
+    assert_eq!(listed, vec![claimant.held()]);
+    // The run times out; the role runner reaps on the claimant's behalf.
+    assert_eq!(ctx(dir.path(), dead.clone()).reap("timeout"), EXIT_HELD);
+    let patch = patched(dir.path());
+    assert!(
+        patch.contains(&dead.released_marker_with(&format!(
+            " head={HEAD} verdict=none labels=review-requested reaped=timeout"
+        ))),
+        "{patch}"
+    );
+    // Every other host's Judge is now refused before writing anything.
+    for host in ["host-b", "host-c"] {
+        assert_eq!(ctx(dir.path(), on(host, "run-2")).claim(), backstop::EXIT_BACKSTOP);
+    }
+    assert_eq!(posted(dir.path()), vec![dead.lease_marker()], "no peer wrote a lease");
+    // A Doctor's claim is untouched by the Judge backstop.
+    let doctor = Identity {
+        role: Role::Doctor,
+        ..on("host-b", "run-3")
+    };
+    assert_eq!(ctx(dir.path(), doctor).claim(), EXIT_HELD);
+}
+
+#[test]
+fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let lease_file = dir.path().join("run.leases");
+    let mut c = ctx(dir.path(), on("host-a", "run-1"));
+    c.lease_file = Some(lease_file.clone());
+    assert_eq!(c.claim(), EXIT_HELD);
+    assert_eq!(c.release(None), EXIT_HELD);
+    assert_eq!(fs::read_to_string(&lease_file).unwrap(), "", "nothing left to reap");
+    // A reap after a verdict landed frees the lease and records nothing.
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(
+        dir.path().join("pull"),
+        format!(r#"{{"state":"open","head":"{HEAD}","labels":["loom:pr","loom:reviewing"]}}"#),
+    )
+    .unwrap();
+    let a = on("host-a", "run-1");
+    assert_eq!(ctx(dir.path(), a.clone()).claim(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), a.clone()).reap("timeout"), EXIT_HELD);
+    assert!(patched(dir.path()).contains(&format!("body={}", a.released_marker())));
+    assert!(!patched(dir.path()).contains("verdict=none"));
+}
+
+/// Acceptance (#11931): a timed-out run counts toward the three Judge runs an
+/// unchanged PR gets per 24 h.
+#[test]
+fn a_timed_out_judge_run_counts_toward_the_three_per_day_cap() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    // Two earlier passes at this head ended without a verdict, 23 h and 6 h
+    // ago: the 4 h cool-off after the second is over, so a third Judge runs.
+    let fields = format!(" head={HEAD} verdict=none labels=review-requested");
+    let first = DateTime::parse_from_rfc3339(&stamp(Utc::now() - chrono::Duration::hours(23)))
+        .unwrap()
+        .with_timezone(&Utc);
+    let second = Utc::now() - chrono::Duration::hours(6);
+    let rows = row_at(10, first, &on("host-x", "s1").released_marker_with(&fields))
+        + &row_at(20, second, &on("host-y", "s2").released_marker_with(&fields));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    let third = on("host-a", "run-3");
+    assert_eq!(ctx(dir.path(), third.clone()).claim(), EXIT_HELD);
+    // It times out and is reaped: the third record.
+    assert_eq!(ctx(dir.path(), third).reap("timeout"), EXIT_HELD);
+    // No host gets a fourth run until the first record leaves the window.
+    let c = ctx(dir.path(), on("host-b", "run-4"));
+    assert_eq!(c.claim(), backstop::EXIT_BACKSTOP);
+    let rows = c.gh.read_rows(77, &c.policy).unwrap();
+    assert_eq!(
+        backstop::hold(&rows, c.gh.pr_head(77), Utc::now()),
+        Some(first + chrono::Duration::hours(loom_daemon::judge_backstop::WINDOW_HOURS))
+    );
+}
+
+/// Acceptance (#11931): two hosts reclaiming the same stale claim at once
+/// produce exactly one winner. The dead claimant's lease has aged out; both
+/// claimants pass the pre-check concurrently, and claim-then-verify-order
+/// on comment id leaves one holder.
+#[test]
+fn two_hosts_reclaiming_one_stale_judge_claim_produce_one_winner() {
+    for _ in 0..3 {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        waiting_pr(dir.path());
+        let dead = on("host-c", "run-dead");
+        let aged = Utc::now() - chrono::Duration::minutes(20);
+        fs::write(dir.path().join("rows"), row_at(50, aged, &dead.lease_marker())).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let racers: Vec<_> = [on("host-a", "run-a"), on("host-b", "run-b")]
+            .into_iter()
+            .map(|me| {
+                let root = dir.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (me.clone(), ctx(&root, me).claim())
+                })
+            })
+            .collect();
+        let results: Vec<(Identity, i32)> = racers.into_iter().map(|t| t.join().unwrap()).collect();
+        let winners: Vec<&Identity> = results
+            .iter()
+            .filter(|(_, c)| *c == EXIT_HELD)
+            .map(|(w, _)| w)
+            .collect();
+        assert_eq!(winners.len(), 1, "{results:?}");
+        assert!(
+            results
+                .iter()
+                .all(|(_, c)| *c == EXIT_HELD || *c == EXIT_PEER),
+            "{results:?}"
+        );
+        // The fences agree: only the winner may write a verdict.
+        for (me, _) in &results {
+            let want = if me == winners[0] {
+                EXIT_HELD
+            } else {
+                EXIT_PEER
+            };
+            assert_eq!(ctx(dir.path(), me.clone()).fence(), want, "{me:?}");
+        }
+        // A third host arriving later stands down without writing.
+        let before = posted(dir.path()).len();
+        assert_eq!(ctx(dir.path(), on("host-d", "run-d")).claim(), EXIT_PEER);
+        assert_eq!(posted(dir.path()).len(), before);
+    }
 }
 
 // ---- prompt gates ---------------------------------------------------------
@@ -635,7 +988,7 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         (
             "judge.md",
             include_str!("../../../../defaults/.claude/commands/loom/judge.md"),
-            9,
+            7, // the BEHIND push and its fence are gone (#12063 D6)
         ),
         (
             "loom-doctor/SKILL.md",
@@ -645,7 +998,7 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         (
             "loom-judge/SKILL.md",
             include_str!("../../../../defaults/.agents/skills/loom-judge/SKILL.md"),
-            9,
+            7, // the BEHIND push and its fence are gone (#12063 D6)
         ),
     ];
     for (name, text, gates) in prompts {
@@ -671,4 +1024,192 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         }
         assert_eq!(text.matches(GATE).count(), gates, "{name}: gate count");
     }
+}
+
+// ---- step claims (#11898) -------------------------------------------------
+
+#[test]
+fn a_champion_lease_defaults_to_the_merge_step_and_carries_no_label() {
+    let me = Identity::new(Role::Champion, "host-a".into(), "s".into(), None).unwrap();
+    assert_eq!(me.step, Some(StepRole::ChampionMerge));
+    assert_eq!(me.claim_label(), None);
+    let marker = me.lease_marker();
+    assert!(marker.ends_with("step=champion_merge -->"), "{marker}");
+    assert_eq!(parse_record(&marker), Some(Record::Lease(me.clone())));
+    // The yield record keeps the step inside the identity's fields.
+    assert_eq!(parse_record(&me.yield_marker(&me)), Some(Record::Yield(me)));
+}
+
+#[test]
+fn step_leases_name_their_claim_label() {
+    let promote =
+        Identity::new(Role::Champion, "h".into(), "s".into(), Some(StepRole::ChampionPromote))
+            .unwrap();
+    assert_eq!(promote.claim_label(), Some("loom:evaluating"));
+    let curator = Identity::new(Role::Curator, "h".into(), "s".into(), None).unwrap();
+    assert_eq!(curator.claim_label(), Some("loom:curating"));
+    assert!(curator
+        .lease_marker()
+        .starts_with("<!-- loom:pr-lease role=curator host=h"));
+    assert!(Identity::new(Role::Judge, "h".into(), "s".into(), Some(StepRole::Curator)).is_err());
+}
+
+/// An older binary's three-token marker still parses (no step), and a step
+/// lease keys apart from a stepless one of the same identity.
+#[test]
+fn the_step_token_is_additive() {
+    let old = who(Role::Judge, "s");
+    assert_eq!(parse_record(&old.lease_marker()), Some(Record::Lease(old.clone())));
+    let stepped =
+        Identity::new(Role::Judge, old.host.clone(), "s".into(), Some(StepRole::Judge)).unwrap();
+    // Ownership is (role, host, sweep): the step is metadata (#11950 review).
+    assert_eq!(stepped, old);
+    assert_ne!(stepped.step, old.step);
+    let marker = stepped.lease_marker();
+    let tokens: Vec<&str> = marker.split_whitespace().collect();
+    assert_eq!(tokens[2..5], ["role=judge", "host=host-a1b2c3d4", "sweep=s"]);
+}
+
+#[test]
+fn a_labelless_claim_renews_without_a_label_check() {
+    let open = (true, Vec::<String>::new());
+    let mut m = 0;
+    assert_eq!(
+        decide(true, fresh(10, 100), lease_renewer_exit_renew(), Some(&open), None, &mut m),
+        Step::Renew
+    );
+    let closed = (false, Vec::<String>::new());
+    assert!(matches!(
+        decide(true, fresh(10, 100), lease_renewer_exit_renew(), Some(&closed), None, &mut m),
+        Step::Stop(_)
+    ));
+}
+
+/// The daemon's lib-side reader of this family (a dead step's lease holder,
+/// #11898) agrees with this module's parser on every record shape.
+#[test]
+fn the_lib_role_lease_reader_agrees_with_parse_record() {
+    use loom_daemon::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
+    let me = Identity::new(Role::Champion, "host-a".into(), "s1".into(), None).unwrap();
+    let peer = who(Role::Judge, "s2");
+    let bodies = [
+        me.lease_marker(),
+        me.yield_marker(&peer),
+        me.released_marker(),
+        peer.lease_marker(),
+        peer.released_marker_with(" head=abc verdict=none"),
+    ];
+    for body in bodies {
+        let (kind, holder) = match parse_record(&body).unwrap() {
+            Record::Lease(h) => (RoleLeaseKind::Lease, h),
+            Record::Yield(h) => (RoleLeaseKind::Yield, h),
+            Record::Released(h) => (RoleLeaseKind::Released, h),
+        };
+        let lib = parse_role_lease(&body).unwrap();
+        assert_eq!(lib.kind, kind, "{body}");
+        assert_eq!(
+            (lib.role.as_str(), lib.host.as_str(), lib.sweep.as_str()),
+            (holder.role.as_str(), holder.host.as_str(), holder.sweep.as_str()),
+            "{body}"
+        );
+    }
+}
+
+// ---- a daemon step's pre-taken lease (#11906) ---------------------------
+
+#[path = "step_claim_tests.rs"]
+mod step_claim;
+
+// ---- the pass's own skip reason on release (#11972) ---------------------
+
+#[path = "release_skip_tests.rs"]
+mod release_skip;
+/// #11950 review: a Champion that claimed with `--step champion_promote`
+/// fences and releases its own lease with plain `--role champion` (default
+/// step `champion_merge`) from the same host and sweep.
+#[test]
+fn a_step_less_fence_and_release_find_the_sessions_stepped_lease() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let claimed = Identity::new(
+        Role::Champion,
+        "host-a".into(),
+        "run-1".into(),
+        Some(StepRole::ChampionPromote),
+    )
+    .unwrap();
+    assert_eq!(ctx(dir.path(), claimed.clone()).claim(), EXIT_HELD);
+    let plain = Identity::new(Role::Champion, "host-a".into(), "run-1".into(), None).unwrap();
+    assert_eq!(plain.step, Some(StepRole::ChampionMerge), "the default step differs");
+    assert_eq!(ctx(dir.path(), plain.clone()).fence(), EXIT_HELD, "own lease, not a peer's");
+    assert_eq!(ctx(dir.path(), plain.clone()).check(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), plain).release(None), EXIT_HELD);
+    // The released marker keeps the lease's own step.
+    assert!(
+        patched(dir.path()).contains(&claimed.released_marker()),
+        "{}",
+        patched(dir.path())
+    );
+    // And the claim is free at once for a peer Champion.
+    let peer = Identity::new(Role::Champion, "host-b".into(), "run-2".into(), None).unwrap();
+    assert_eq!(ctx(dir.path(), peer).check(), EXIT_HELD);
+}
+
+/// #11950 review: a reap with no step (the role runner's) reaps a stepped lease.
+#[test]
+fn a_step_less_reap_reaps_a_stepped_lease() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let stepped =
+        Identity::new(Role::Judge, "host-a".into(), "run-1".into(), Some(StepRole::Judge)).unwrap();
+    fs::write(dir.path().join("rows"), live_row(100, &stepped)).unwrap();
+    let plain = Identity::new(Role::Judge, "host-a".into(), "run-1".into(), None).unwrap();
+    assert_eq!(ctx(dir.path(), plain).reap("timeout"), EXIT_HELD);
+    let patch = patched(dir.path());
+    assert!(patch.contains("repos/acme/widgets/issues/comments/100"), "{patch}");
+    assert!(
+        patch.contains("loom:pr-lease-released role=judge host=host-a sweep=run-1 step=judge"),
+        "{patch}"
+    );
+}
+
+/// The issue-scoped leases never read a PR head on release (it would 404).
+#[test]
+fn an_issue_scoped_release_reads_no_pr_head() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let curator = Identity::new(Role::Curator, "host-a".into(), "run-1".into(), None).unwrap();
+    fs::write(dir.path().join("rows"), live_row(100, &curator)).unwrap();
+    assert_eq!(ctx(dir.path(), curator.clone()).release(None), EXIT_HELD);
+    assert!(patched(dir.path()).contains(&curator.released_marker()));
+    assert!(!dir.path().join("pulled").exists(), "no PR read for a Curator lease");
+}
+
+/// #11950 review: the lib-side holder reader (a dead step's restore) and this
+/// module agree that ownership ignores the step: a stepped lease yielded by a
+/// step-less record of the same session holds nothing on either side, and the
+/// next lease is the holder on both.
+#[test]
+fn the_lib_and_bin_lease_holders_agree_when_steps_differ() {
+    use loom_daemon::sweep_registry::step_lease_owner::{earliest_live_holder, RoleLeaseRow};
+    let stepped =
+        Identity::new(Role::Judge, "host-a".into(), "run-1".into(), Some(StepRole::Judge)).unwrap();
+    let plain = Identity::new(Role::Judge, "host-a".into(), "run-1".into(), None).unwrap();
+    let next = Identity::new(Role::Judge, "host-b".into(), "run-2".into(), None).unwrap();
+    let rows = vec![
+        row(1, 1, stepped.lease_marker()),
+        row(2, 1, next.lease_marker()),
+        row(3, 1, plain.yield_marker(&next)),
+    ];
+    let bin = live_leases(&rows, Role::Judge, now(), ttl());
+    assert_eq!(bin.first().map(|l| l.holder.sweep.as_str()), Some("run-2"));
+    let lib_rows: Vec<RoleLeaseRow> = rows
+        .iter()
+        .map(|r| RoleLeaseRow {
+            id: r.id,
+            updated_at: r.updated_at,
+            body: r.body.clone(),
+        })
+        .collect();
+    assert_eq!(earliest_live_holder(&lib_rows, "judge", now(), ttl()).as_deref(), Some("run-2"));
 }

@@ -39,20 +39,27 @@ test-build-gate-timeout.sh
 test-build-rs-watchset.sh
 test-build-slot.sh
 test-cargo-test-daemon-guard.sh
+test-champion-capped-hold-routing.sh
 test-champion-ci-checks-no-checks-signal.sh
 test-champion-critical-file-check.sh
+test-champion-evaluating-reclaim-trust.sh
+test-champion-epic-escalation-evaluations.sh
 test-champion-epic-escalation-respects-human-hold.sh
 test-champion-epic-phase-marker-normalization.sh
 test-champion-epic-verdict-marker-scope.sh
 test-champion-held-pr-health-pass.sh
 test-champion-issue-promo-escalation-respects-human-hold.sh
+test-champion-markerless-park.sh
 test-champion-merge-queue-step-no-fallthrough.sh
-test-champion-needs-revision-routing.sh
 test-champion-pr-merge-hold-release.sh
 test-champion-pr-merge-negation-guard.sh
+test-champion-post-claim-recheck.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
 test-champion-standing-authorization.sh
+test-champion-targeted-modes.sh
+test-champion-terminal-verdicts.sh
+test-check-cas-recheck-consistency.sh
 test-check-ci-status.sh
 test-ci-suite-manifest-installed-layout.sh
 test-check-config-no-host-paths.sh
@@ -65,7 +72,6 @@ test-check-host-sleep.sh
 test-check-defaults-version-bump.sh
 test-check-ingest-key-file.sh
 test-check-main-freshness.sh
-test-check-pipefail-early-exit.sh
 test-check-promotion-landed.sh
 test-check-quarantine-stashes.sh
 test-check-runtime-capabilities.sh
@@ -155,13 +161,13 @@ test-merge-admission-telemetry.sh
 test-merge-pr-app-permission-fallback.sh
 test-merge-pr-auto-merge-disabled-fallback.sh
 test-merge-pr-auto-queued-stacked-children.sh
+test-merge-pr-expected-head.sh
 test-merge-pr-pr-state.sh
 test-merge-pr-check-runs-404-fallback.sh
 test-merge-pr-daemon-version-floor.sh
 test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-stacked-child-branch-delete.sh
 test-merge-pr-tree-checks.sh
-test-merge-pr-ci-result.sh
 test-merge-pr-required-checks.sh
 test-nextest-daemon-guard.sh
 test-operator-hold-routing.sh
@@ -223,6 +229,7 @@ test-sync-labels-migrate-retired.sh
 test-token-cache-affinity.sh
 test-claude-wrapper-proxy-rotation.sh
 test-sync-labels-repo-flag.sh
+test-sync-labels-write-failures.sh
 test-verdict-staleness-guard.sh
 test-verify-install-scope.sh
 test-version-bump-workflow-identity.sh
@@ -324,3 +331,6 @@ test-spawn-claude-oom-policy.sh
 # ram-scope-limit`. Hermetic: daemon/systemd-run/systemctl/claude stubs under
 # mktemp -d; no real daemon, forge or network.
 test-spawn-claude-memory-max.sh
+# #11863: prompt-lint that targeted Judge/Curator/Builder invocations repeat
+# discovery gates before the first write. Hermetic: reads files only.
+test-targeted-role-invocation.sh

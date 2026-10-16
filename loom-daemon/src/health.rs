@@ -579,6 +579,10 @@ pub struct HealthInputs {
     /// The last fleet-sync pass snapshot ([`crate::fleet_sync::probe_status`]),
     /// rendered by [`fleet_identity_section::assess_fleet_identity`] (#11740).
     pub fleet_sync: Option<crate::fleet_sync::FleetSyncStatus>,
+    /// Each managed root's `.loom/resync-ignore` pins, `(root, labels)`
+    /// ([`crate::resync_pin::read_pins`]), for
+    /// [`review_role_pins_section::assess_review_role_pins`] (#11970).
+    pub resync_pins: Vec<(String, Vec<String>)>,
 }
 
 // ============================================================================
@@ -1182,7 +1186,9 @@ pub enum MissingTick {
 /// The grace window (seconds) a missing tick is tolerated for after a daemon
 /// (re)start: [`WORK_FINDER_TICK_GRACE_INTERVALS`] × the daemon's own resolved
 /// tick interval, falling back to the default cadence for a pre-#4824 daemon
-/// that does not report one.
+/// that does not report one. Plus the daemon's startup jitter (#12073): the
+/// first tick waits that per-host delay, so the window runs from the gate's
+/// opening, not from the process start.
 #[must_use]
 pub fn work_finder_grace_secs(status: &DaemonStatusReport) -> u64 {
     status
@@ -1190,6 +1196,7 @@ pub fn work_finder_grace_secs(status: &DaemonStatusReport) -> u64 {
         .filter(|s| *s > 0)
         .unwrap_or(crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS)
         .saturating_mul(WORK_FINDER_TICK_GRACE_INTERVALS)
+        .saturating_add(status.startup_jitter_delay_secs.unwrap_or(0))
 }
 
 /// Classify a missing work-finder tick (#4824), in strict precedence order:
@@ -2727,6 +2734,15 @@ mod fleet_identity_section;
 
 pub use fleet_identity_section::assess_fleet_identity;
 
+/// The `review_role_pins` section (#11970): a warning (Green, exit code
+/// unchanged) when a managed repo pins a Champion, Judge or Doctor prompt in
+/// `.loom/resync-ignore`.
+mod review_role_pins_section;
+
+pub use review_role_pins_section::{
+    assess_review_role_pins, is_review_role_pin, pinned_review_roles,
+};
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2801,6 +2817,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_tmpfs_visibility(inputs));
     sections.extend(assess_ci_telemetry(inputs));
     sections.extend(assess_fleet_identity(inputs));
+    sections.extend(assess_review_role_pins(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {

@@ -714,26 +714,24 @@ pub(super) fn open_issue_labels(body: &str) -> Result<Option<Vec<String>>> {
 
 impl IntakeForge for GhIntakeForge {
     fn list_open(&mut self, repo: &Repo) -> Result<Vec<IntakeRow>> {
+        // #12310: the intake walk is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let rows = crate::forge_listing::list_open_issues_cached_all_as(
             "intake.list_open",
             &self.gh_bin,
             Some(&repo.root),
             None,
         )?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| !row.is_pull_request)
-            .map(|row| IntakeRow {
-                number: row.number,
-                created_at: row
-                    .created_at
-                    .as_deref()
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|d| d.with_timezone(&Utc)),
-                labels: row.labels,
-                author: row.author,
-            })
-            .collect())
+        // #12118: the walk journals `issue.estimate` for freshly curated
+        // issues (was the stage-queue walk, removed with the sampler, #12316).
+        crate::telemetry::kinds::issue_estimate::observe::observe(
+            &repo.root,
+            &repo.slug,
+            &rows,
+            &crate::comment_trust::TrustPolicy::for_root(&repo.root),
+            Utc::now(),
+        );
+        Ok(super::rows_from_listing(rows))
     }
 
     fn may_write(&mut self, repo: &Repo) -> bool {

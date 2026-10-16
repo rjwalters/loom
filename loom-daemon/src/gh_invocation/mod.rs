@@ -56,6 +56,8 @@ pub(crate) mod cwd_route;
 mod outcome;
 pub(crate) mod own_writes;
 mod paged;
+pub mod purpose;
+pub mod read_deadline;
 mod reader_route;
 pub mod resolver;
 pub mod route;
@@ -65,6 +67,7 @@ pub mod transparent;
 pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
 pub use paged::{walk_enabled as page_walk_enabled, WALK_ENV as PAGE_WALK_ENV};
+pub use purpose::ForgePurpose;
 pub use reader_route::{READ_SHED_ENV, SHED_MARKER};
 
 #[cfg(test)]
@@ -339,6 +342,10 @@ pub struct GhInvocation {
     /// fleet store fetch, which must work while the gateway is broken so the
     /// gateway can be unset ([`GhInvocation::gateway_exempt`]).
     gateway_exempt: bool,
+    /// A listing the daemon makes to find work (#12310): the site said so
+    /// ([`GhInvocation::discovery`]) or built the call inside a
+    /// [`purpose::discovery`] scope. Meaningful for reads only.
+    discovery: bool,
 }
 
 impl GhInvocation {
@@ -373,6 +380,7 @@ impl GhInvocation {
             read_class: ReadClass::Gate,
             disagree_counted: false,
             gateway_exempt: false,
+            discovery: purpose::in_discovery_scope(),
         }
     }
 
@@ -520,6 +528,52 @@ impl GhInvocation {
     pub fn read_class(mut self, class: ReadClass) -> Self {
         self.read_class = class;
         self
+    }
+
+    /// Mark this read as **discovery** (#12310): a listing made to find work.
+    /// Tags `loom.forge.purpose = discovery` on its span and metric and, on a
+    /// `gh api` call, sends the `loom.forge.purpose: discovery` request header
+    /// so the read gateway can refuse it first when a pool runs low. Set it
+    /// next to [`GhInvocation::read_class`]; leave a read that gates a write
+    /// untagged.
+    #[must_use]
+    pub fn discovery(mut self) -> Self {
+        self.discovery = true;
+        self
+    }
+
+    /// What this call is for (#12310): a write is `write`; a read is
+    /// `discovery` only when its site said so, else its [`ReadClass`] name.
+    #[must_use]
+    pub fn purpose(&self) -> ForgePurpose {
+        if self.intent == AccessIntent::Write {
+            ForgePurpose::Write
+        } else if self.discovery {
+            ForgePurpose::Discovery
+        } else {
+            ForgePurpose::of_read(self.read_class)
+        }
+    }
+
+    /// The argv handed to `gh`: [`GhInvocation::args`] plus, on a `discovery`
+    /// `gh api` call, the purpose header. No other call sends it.
+    #[must_use]
+    pub(crate) fn spawn_args(&self) -> Vec<OsString> {
+        let mut args = self.args.clone();
+        if self.purpose() == ForgePurpose::Discovery && args.first().is_some_and(|a| a == "api") {
+            args.splice(
+                1..1,
+                [
+                    OsString::from("-H"),
+                    OsString::from(format!(
+                        "{}: {}",
+                        purpose::HEADER_NAME,
+                        purpose::DISCOVERY_VALUE
+                    )),
+                ],
+            );
+        }
+        args
     }
 
     /// This read's [`ReadClass`].
@@ -687,7 +741,7 @@ impl GhInvocation {
     /// Assemble the child. Private: the facade owns execution.
     fn command(&self, program: &str, child_context: Option<&TraceContext>) -> Command {
         let mut cmd = Command::new(program);
-        cmd.args(&self.args);
+        cmd.args(self.spawn_args());
         cmd.env(BOOKED_ENV, "1");
         if let Some(dir) = &self.cwd {
             cmd.current_dir(dir);
@@ -720,6 +774,15 @@ impl GhInvocation {
         if self.intent == AccessIntent::Write {
             own_writes::note(&self.args, self.target.slug().as_deref());
         }
+        // #12074: past the work-finder tick's deadline a read is not sent.
+        if self.intent == AccessIntent::Read && read_deadline::passed() {
+            return Ok(self.deadline_shed());
+        }
+        // #12310: the gateway refused a discovery read for its quota reserve
+        // earlier in this tick; the rest of the tick's discovery is not sent.
+        if self.purpose() == ForgePurpose::Discovery && purpose::discovery_ended() {
+            return Ok(self.deadline_shed());
+        }
         #[cfg(test)]
         if let Some(routed) = test_routing::run(&self) {
             return routed;
@@ -740,6 +803,21 @@ impl GhInvocation {
         let policy = reader_route::ShedPolicy::current();
         self.with_derived_route()
             .execute_routed_v2(&lookup, &reader_route::withdraw_reader, policy)
+    }
+
+    /// A read the tick deadline stopped (#12074): shed, nothing sent.
+    fn deadline_shed(&self) -> GhCompletion {
+        let owner = self
+            .target
+            .slug()
+            .and_then(|s| s.split('/').next().map(str::to_ascii_lowercase))
+            .unwrap_or_else(|| "-".to_string());
+        log::debug!("gh: {} not sent: the tick deadline passed (#12074)", self.operation.as_str());
+        GhCompletion::Shed {
+            owner,
+            resource: crate::forge_bucket_book::Resource::Core,
+            until: std::time::SystemTime::now(),
+        }
     }
 
     /// Run exactly once under the credential already chosen (no routing).
@@ -770,7 +848,20 @@ impl GhInvocation {
     }
 
     /// Run this argv exactly once under its [`OutputContract`].
-    fn execute_once(self, program: &str, source: GhBinSource) -> Result<GhCompletion, ExecError> {
+    fn execute_once(
+        mut self,
+        program: &str,
+        source: GhBinSource,
+    ) -> Result<GhCompletion, ExecError> {
+        // #12074: a read inside a tick deadline gets only the time left.
+        if let (AccessIntent::Read, OutputContract::Captured { timeout }) =
+            (self.intent, self.contract)
+        {
+            match read_deadline::clamp(timeout) {
+                Some(timeout) => self.contract = OutputContract::Captured { timeout },
+                None => return Ok(self.deadline_shed()),
+            }
+        }
         let span = telemetry::InvocationSpan::open(&self);
         let mut cmd = self.command(program, span.child_context(&self.parent));
         match self.contract {
@@ -785,6 +876,9 @@ impl GhInvocation {
                 };
                 let billing = accounting::record(&self, outcome, captured);
                 span.finish(&self, source, outcome, code, &billing);
+                if let Ok(Completion::Exited(out)) = &result {
+                    crate::forge_gateway::outage::note_attempt(self.config_dir.as_deref(), out);
+                }
                 result.map(GhCompletion::Captured)
             }
             OutputContract::Passthrough => {

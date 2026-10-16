@@ -17,6 +17,9 @@
 //!   `worker_spawn/mod.rs`, `script_helpers/validate_phase.rs`, and the
 //!   startup verification hook in `daemon_service.rs`. Exact files, not
 //!   directories, so a new caller elsewhere still fails here.
+//! - Phase 2c (#11347) — `src/cli/sweep_checkpoint.rs`, the
+//!   `checkpoint.completed` shadow append from the sweep-checkpoint write.
+//!   Exact file, not the `cli/` directory.
 //! - Phase 2e (#11349) — `src/config_journal/`, the config-change journal
 //!   producer.
 //!
@@ -35,6 +38,8 @@ use regex::Regex;
 const ALLOWED: &[&str] = &[
     "src/journal/",
     "src/cli/journal_cli.rs",
+    // Phase 2c (#11347): checkpoint.completed shadow append.
+    "src/cli/sweep_checkpoint.rs",
     // Phase 2e (#11349): sanctioned producer, admitted in review.
     "src/config_journal/",
     // Phase 2b (#11346): execution-journal shadow-write producers, admitted
@@ -108,3 +113,8 @@ fn the_crate_root_only_declares_the_module() {
     let mentions: Vec<&str> = main.lines().filter(|l| l.contains("journal_cli")).collect();
     assert_eq!(mentions.len(), 2, "one variant + one dispatch arm: {mentions:?}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -381,7 +381,17 @@ pub fn start_systemd(ctx: &Ctx) -> ! {
     }
 
     let _ = std::fs::write(&ctx.pid_file, format!("{main_pid}\n"));
-    marker::write(&ctx.loom_dir, &ctx.intent_marker, &ctx.intent(false, "", true, &unit));
+    // #11951: record what the daemon runs with, not this script's default.
+    let layer = super::systemd_autonomy::Layer::read(&unit_path, &ctx.repo_root);
+    let effective =
+        |key| super::systemd_autonomy::effective_marker_value(Some(&main_pid), &layer, key);
+    marker::write_recording(
+        &ctx.loom_dir,
+        &ctx.intent_marker,
+        &ctx.intent(false, "", true, &unit),
+        &effective("LOOM_WORK_FINDER"),
+        &effective("LOOM_MAIN_HEALTH_GATE"),
+    );
     watchdog_job::provision_systemd(&ctx.watchdog_ctx());
     out::ok(&format!("loom-daemon started under systemd (pid {main_pid}, unit {unit})."));
     out::say(&format!("PID file: {}", ctx.pid_file.display()));

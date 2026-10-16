@@ -116,6 +116,13 @@ use crate::install_compat::{
 static EMBEDDED_PAYLOAD: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/install-payload.tar.zst"));
 
+/// The packed `defaults/` tree itself, for [`crate::hooks_home`], which
+/// unpacks the hook-runtime part of it for the sessions this daemon spawns.
+#[must_use]
+pub fn embedded_archive() -> &'static [u8] {
+    EMBEDDED_PAYLOAD
+}
+
 /// The `.loom/` directories [`super::install_payload_files`] syncs by name.
 /// `payload_surface_covers_everything_the_installer_writes` (tests) fails if
 /// that step starts writing somewhere [`surface_roots`] does not look.

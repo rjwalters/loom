@@ -225,21 +225,8 @@ pub(crate) fn parse_host(url: &str) -> Option<String> {
     None
 }
 
-/// Get the `origin` remote URL from `cwd`, or `None`.
-pub(crate) fn get_remote_url(cwd: &Path) -> Option<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .stdin(Stdio::null());
-    let outcome = run_command(cmd, FORGE_CMD_TIMEOUT);
-    let out = outcome.ok_output()?;
-    let url = std::str::from_utf8(&out.stdout).ok()?.trim().to_string();
-    if url.is_empty() {
-        None
-    } else {
-        Some(url)
-    }
-}
+mod remote_url;
+pub(crate) use remote_url::get_remote_url;
 
 /// Determine forge type from a hostname, consulting the configured Gitea URL.
 fn detect_from_host(host: &str, forge_config: &Value) -> ForgeType {

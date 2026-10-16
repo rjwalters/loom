@@ -479,6 +479,13 @@ pub fn kind_key(repo: &str, kind: &SweepKind) -> (String, Option<u32>, String) {
             let first = prs.iter().min().copied().unwrap_or(0);
             (format!("{repo}#prs-{first}"), None, format!("PR set {prs:?}"))
         }
+        // A step's footprint is its item's: a Builder step's worktree is the
+        // issue's, and a PR step works in that PR's worktree (#11898).
+        SweepKind::Step { item, role } => (
+            disk_footprint::issue_key(repo, *item),
+            Some(*item),
+            format!("{role} step #{item}"),
+        ),
     }
 }
 

@@ -1,4 +1,7 @@
 //! Owned Rust launch/tool contracts. Real provider canaries are separate evidence.
+#[allow(dead_code)]
+mod common;
+
 use loom_daemon::{
     observability::{lifecycle, queue::DurableQueue},
     telemetry::{
@@ -31,6 +34,7 @@ fn fixture() -> &'static PathBuf {
     })
 }
 fn root() -> tempfile::TempDir {
+    common::stub_gh_bin_in_process();
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".loom")).unwrap();
     fs::write(dir.path().join(".loom/config.json"), json!({"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}).to_string()).unwrap();
@@ -38,6 +42,7 @@ fn root() -> tempfile::TempDir {
 }
 fn command(root: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+    common::deny_real_gh(&mut cmd);
     cmd.current_dir(root)
         .env("LOOM_WORKSPACE", root)
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
@@ -181,14 +186,11 @@ fn unresolvable_repo_id_makes_the_execution_its_own_root() {
     for sweep in &sweeps {
         assert_eq!(sweep.parent_span_id, None);
         assert_ne!(sweep.context.trace_id, name_derived);
-        for key in [
-            "loom.story_id",
-            "loom.story",
-            "loom.story.key_version",
-            "loom.issue",
-        ] {
+        for key in ["loom.story_id", "loom.story", "loom.story.key_version"] {
             assert!(!sweep.attributes.contains_key(key), "{key} must be absent");
         }
+        // #11982: the issue is a plain fact, carried without a story.
+        assert_eq!(sweep.attributes["loom.issue"], "7");
     }
     assert_ne!(sweeps[0].context.trace_id, sweeps[1].context.trace_id);
 }
@@ -454,3 +456,8 @@ fn actual_checkpoint_cli_preserves_rapid_judge_doctor_repair_waterfall() {
         }
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

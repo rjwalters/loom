@@ -469,9 +469,6 @@ kind = "rust"
 path = "loom-daemon/src/forge_cached_view.rs"
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/stale_blocked/release_gh.rs"
-[[operation.callers]]
-kind = "rust"
 path = "loom-daemon/src/work_finder/main_red_autofile.rs"
 
 [[operation]]
@@ -540,7 +537,7 @@ adapter_coverage = "partial"
 caller_integration = "partial"
 unknowns = [
   "Gitea's comments-and-timeline endpoint merges comments with events; label-applied timestamps and cross-reference events must survive that shape",
-  "whether `labeled`/`unlabeled` events are retained indefinitely (stage dwell and staleness checks read them)",
+  "whether `labeled`/`unlabeled` events are retained indefinitely (staleness checks read them)",
 ]
 [[operation.callers]]
 kind = "script"
@@ -550,10 +547,7 @@ kind = "script"
 path = "defaults/scripts/check-promotion-landed.sh"
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/observability/ops/stage_dwell.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/stale_blocked/release_gh.rs"
+path = "loom-daemon/src/observability/ops/stage_events.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/intake_reconcile/demote.rs"

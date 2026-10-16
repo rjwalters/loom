@@ -2,6 +2,7 @@
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
 pub mod cargo_debuginfo;
+mod claim_owned;
 pub mod containment;
 // `pub(crate)` rather than private since #8436: `runtime_preference::
 // availability` mirrors `credential::resolve`'s ladder to decide whether a
@@ -675,7 +676,12 @@ fn run_preflight(
     }
     // 2am#4367 P4: no gh update check, and the gateway profiles the front's
     // classified reads use — exported only while the daemon has them live.
-    for (key, value) in crate::forge_gateway::agent_env() {
+    // 2am#4501: and the hooks of this release, which the wired user-scope
+    // hook command prefers over the machine checkout.
+    for (key, value) in crate::forge_gateway::agent_env()
+        .into_iter()
+        .chain(crate::hooks_home::agent_env())
+    {
         match value {
             Some(v) => command.env(key, v),
             None => command.env_remove(key),

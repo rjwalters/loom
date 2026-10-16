@@ -15,14 +15,6 @@
 //!   allowlisted hold labels in [`HOLD_LABELS`]; comment text (where a
 //!   blocking reason is usually written) is never read, let alone exported.
 //! - **Order.** The rows are not in dispatch order, so their `rank` is `0`.
-//! - **One lister per fleet (W12 part 2).** With
-//!   `fleet.captainGauges.queueBlocked`, the fleet captain lists and publishes
-//!   each repo's blocked issues (number, creation time, label names), and a
-//!   dispatcher builds its rows from those facts instead of listing, for the
-//!   repos the captain's fresh heartbeat covers. Anything else (no captain,
-//!   stale, uncovered) is this host's own listing, as before. The rows are
-//!   the same either way: both go through [`blocked_rows`]. See
-//!   [`super::captain_gauges::facts`].
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -153,16 +145,8 @@ pub(super) async fn collect(
         if !listed.insert(slug.clone()) {
             continue;
         }
-        // W12 part 2: the fleet captain listed this repo and its facts are
-        // fresh, so no listing here. Stale, uncovered or unconfigured: list.
-        let from_captain = super::captain_gauges::captain_blocked(&slug, chrono::Utc::now())
-            .map(|facts| super::captain_gauges::facts::as_listing(&facts));
-        let listing = match from_captain {
-            Some(listing) => listing,
-            None => match list_open(root, BLOCKED_LABEL, "queue_blocked").await {
-                Some(listing) => listing,
-                None => continue,
-            },
+        let Some(listing) = list_open(root, BLOCKED_LABEL, "queue_blocked").await else {
+            continue;
         };
         let repo = QueueRepoRef {
             visibility: super::collector::resolve_visibility(&slug).await,
@@ -196,6 +180,8 @@ pub(super) async fn list_open_in(
 ) -> Option<Vec<RestIssue>> {
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
+        // #12310: the blocked-queue listing is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
         list_open_with(&gh, &root, repo.as_deref(), label, caller)
     })

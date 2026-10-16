@@ -59,31 +59,41 @@ outside, so the only defense is your own discipline:
 - **Emit progress as you go.** Print a short line at each step. Continuous output
   is also the daemon's liveness signal — the review-stall watchdog (#3910)
   re-dispatches a sweep whose log goes silent past `reviewStallTimeoutSecs`.
-- **Bound the whole fix.** Make the smallest change that satisfies the feedback,
-  then hand back. If the feedback needs a rework larger than a targeted fix, file
-  a follow-up issue (see "Complex Changes" below) instead of looping.
+- **Bound the whole fix.** Limit *scope*, not completeness: no unrelated
+  refactors, and no rework beyond a targeted fix — file a follow-up issue (see
+  "Complex Changes" below) instead of looping. Within that scope the fix includes
+  every instance of a cited defect class in the PR's changed files (see "Fix the
+  Whole Class, Not Just the Cited Lines" below), then hand back.
 
 ## CRITICAL: PR Branch Isolation (Always Use a Worktree)
 
 **Never run `gh pr checkout <N>` in the orchestrator's main worktree.** Doing so switches the orchestrator's `HEAD` to the PR branch and can leave behind untracked files from the PR when you switch back — see issue #3358 for a concrete incident.
 
-Pick the right worktree path before any `gh pr checkout` mutation:
+### Occupied worktree: yield, never reset (#9401)
 
-- **Loom-issue PRs** — branch matches the strict pattern `^feature/issue-([0-9]+)$`:
-  ```bash
-  ./.loom/scripts/worktree.sh <ISSUE_NUMBER>
-  cd .loom/worktrees/issue-<ISSUE_NUMBER>
-  gh pr checkout <PR_NUMBER>   # safe: already inside the issue worktree
-  ```
+After `lease pr claim` succeeds and **before** `worktree.sh`/`pr-worktree.sh`,
+`gh pr checkout`, a snapshot or any reset: if the PR's worktree already exists,
+look for a live process whose cwd is inside it and is not your own session (an
+in-session Doctor may hold it with no lease). Any line printed = occupied:
 
-- **External-fork or ad-hoc PRs** — any other branch shape (e.g., `fix/foo-bar`, `release-1`, `jperla:fix/claude-code-2.1-compat`):
-  ```bash
-  ./.loom/scripts/pr-worktree.sh <PR_NUMBER>
-  cd .loom/worktrees/pr-<PR_NUMBER>
-  # pr-worktree.sh already ran `gh pr checkout` inside the worktree
-  ```
+```bash
+WT="$(cd .loom/worktrees/<issue-N|pr-N> 2>/dev/null && pwd -P)"; S="${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+for p in $([ -n "$WT" ] && pgrep -u "$(id -u)"); do
+  c=$(readlink "/proc/$p/cwd" 2>/dev/null || lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+  case "$c" in "$WT"|"$WT"/*) q=$p; while [ "${q:-1}" -gt 1 ] && [ "$q" != "$S" ]; do q=$(ps -o ppid= -p "$q" | tr -d ' '); done
+    [ "$q" = "$S" ] || ps -o pid=,command= -p "$p";; esac
+done
+```
 
-The branch-name heuristic to choose between them:
+**Occupied → yield**: `lease pr release`, drop any `loom:treating` you added,
+post `Doctor yielding: live process in <WT> (pid <pid>: <command>) with no PR
+lease; worktree left untouched.` and stop — no snapshot, reset or checkout.
+**Cannot probe** (no `pgrep`, or neither `/proc` nor `lsof`): treat a dirty
+worktree as occupied; a clean one may proceed.
+
+Pick the worktree by branch shape before any `gh pr checkout` mutation: strict
+`^feature/issue-([0-9]+)$` gets the issue worktree; any other shape (external
+fork, `fix/foo-bar`, `release-1`) gets `pr-worktree.sh`, which runs `gh pr checkout` itself:
 
 ```bash
 PR_BRANCH=$(gh pr view <PR_NUMBER> --json headRefName --jq '.headRefName')
@@ -131,13 +141,9 @@ worktree from an earlier phase of the same sweep (no fresh `worktree.sh` call in
 between) does not get that warning re-run. Verify explicitly, immediately before
 making any edits — **pin the worktree path once into `WORKTREE_ABS` and use
 `git -C "$WORKTREE_ABS" ...` for every check, never a bare `git status`/`git
-rev-parse` that relies on a `cd` still being in effect.** A `cd` earlier in the
-same shell session persists for every later command in that session, including
-a command you intended for a *different* directory (e.g. the main checkout) —
-that silent redirection is exactly what made a prior Judge falsely report both
-a worktree and the main checkout clean from a single `cd`'d `git status`
-(#6373). `-C` makes the target directory explicit in the command itself, so it
-can't be hijacked by a stale `cd`:
+rev-parse` relying on an earlier `cd`**, which silently redirects later commands
+meant for another directory (#6373: a Judge reported a worktree and the main
+checkout clean from one `cd`'d `git status`):
 
 ```bash
 WORKTREE_ABS="$(cd .loom/worktrees/issue-<ISSUE_NUM> && pwd)"
@@ -168,21 +174,17 @@ the same session.
 ### Never use bare `git stash` for ad-hoc WIP (#4821)
 
 `refs/stash` is **one stack shared across every linked worktree of the
-repo** — not per-worktree. If you `git stash` / `git stash pop` /
-`git stash drop` to temporarily shelve WIP while fixing a PR, a concurrent
-Builder or Doctor in a *different* worktree doing the same thing can pop or
-drop **your** stash entry (or you can pop theirs), silently swapping or
-discarding uncommitted work. This happened in production (kicad-tools PRs
-#4524/#4526).
+repo**, so a concurrent Builder or Doctor in another worktree can pop or drop
+**your** stash entry (or you theirs), silently swapping or discarding
+uncommitted work (kicad-tools PRs #4524/#4526).
 
 **Use `./.loom/scripts/worktree.sh snapshot <issue-number>` instead** — it
 writes your WIP as a patch file under
 `<worktree-root>/.snapshots/issue-<N>-<timestamp>.patch`, scoped to your own
 worktree, so there is no shared stack to collide on.
 
-**For a "clean baseline vs. my diff" comparison** — temporarily clearing your
-fix to re-run a lint/test baseline, then restoring it — `snapshot` is *not*
-enough (it captures a patch but does not reset the working tree). Use
+**For a "clean baseline vs. my diff" comparison** `snapshot` is *not* enough
+(it does not reset the working tree). Use
 `./.loom/scripts/worktree.sh stash-push <issue-number>`, run the baseline
 check, then `./.loom/scripts/worktree.sh stash-pop <issue-number>` (#5217).
 It anchors your WIP to a **per-issue** ref (`refs/loom/stash-baseline/issue-<N>`),
@@ -190,12 +192,9 @@ never `refs/stash`, so no concurrent builder's stash can land between your
 push and pop — and, unlike raw `git stash pop`, it does not trip the
 `stash-scope` ask that would stall a headless sweep.
 
-**This is enforced, not merely advised (#5754).** Inside a managed worktree,
-while a second managed worktree is active, a raw stash *create* — `git stash`,
-`git stash push`, `git stash save` — is **denied** by the guard, with the exact
-`snapshot` / `stash-push` / `stash-pop` command (issue number already filled
-in) in the deny message. The deny is lossless: nothing ran and your working
-tree is untouched, so just rerun with the command it hands you.
+**Enforced (#5754):** with a second managed worktree active, a raw stash
+*create* (`git stash`, `push`, `save`) is **denied** by the guard; the deny is
+lossless and names the exact replacement command, so rerun with it.
 `git stash pop` / `drop` / `clear` stay an *ask*, not a deny, on purpose —
 once WIP is on `refs/stash`, popping it is the only way to get it back.
 
@@ -331,10 +330,13 @@ Check for an argument passed via the slash command:
 ### PR Fix Mode
 
 If a number is provided (e.g., `/doctor 123`):
-1. Treat that number as the target **PR** to fix
+1. Treat that number as the target **PR** to fix. `loom:frozen` or any `loom:operator*` label on it (#11861): refuse, writing nothing
 2. **Skip** the "Finding Work" section entirely
 3. Claim the PR exactly as in Work Process step 2 (a dispatched PR can
-   already be claimed by a concurrent Doctor)
+   already be claimed by a concurrent Doctor). A lease held by your own
+   `$LOOM_SWEEP_ID` is yours, not a peer's: a daemon step pre-takes it, and
+   `lease pr claim` re-attaches (exit 0) — continue and add `loom:treating`
+   yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`
 4. Proceed directly to fixing that PR
 
 **How judge feedback reaches you.** When `/loom:sweep` dispatches a Doctor after a
@@ -407,7 +409,7 @@ Full convention and rationale: `.loom/docs/untrusted-external-content.md`. A mar
 
 ## Finding Work
 
-**Skip any item labelled `loom:frozen`**: don't read it as work, comment on it, or relabel it. Only a human removes it.
+**Skip any item labelled `loom:frozen` or `loom:operator`** (#11861): don't read it as work, comment on it, or relabel it. Only a human removes them.
 
 Use the shared queue and walk its rows in order:
 ```bash
@@ -422,7 +424,8 @@ row; keep a per-pass visited set. Preserve PR origin during repairs.
 ### Priority 1: Approved PRs with Merge Conflicts (URGENT)
 
 **Find approved PRs with merge conflicts that aren't already claimed and are
-not on an explicit operator hold.**
+not parked (`loom:blocked`, Champion's merge-risk / critical-file hold
+included; `loom:operator`; `loom:frozen`).**
 
 **Why earlier in the baseline?** They are approved but blocked, and conflicts only get
 harder over time.
@@ -430,7 +433,7 @@ harder over time.
 ### Priority 2: PRs with Changes Requested (NORMAL)
 
 **Find PRs with review feedback that aren't already claimed and are not on an
-explicit hard hold (`loom:blocked` / `loom:frozen`).**
+explicit hold (`loom:blocked` / `loom:operator` / `loom:frozen`).**
 
 > **Claim discipline for every queue above.** The `loom:treating` filter in this
 > queue is a point-in-time snapshot: a claim can land between your list call and
@@ -439,31 +442,14 @@ explicit hard hold (`loom:blocked` / `loom:frozen`).**
 > from PR Fix Mode, or from an explicit user instruction — run the
 > "Stale `loom:treating` Claim Check" in the Work Process below.
 >
-> **Hold exclusion (Priority 2 queue, #5272).** `loom:blocked` and
-> `loom:frozen` are the same generic "taken out of
-> automated flow" signal the work-finder already honors for `loom:issue` rows
-> — the shared queue excludes both so autonomous Finding Work never
-> auto-claims a held PR. This does not change PR Fix Mode or an explicit user
-> instruction naming a PR by number — those remain a deliberate human
-> decision to work on that specific PR, same as everywhere else in this file.
->
-> **Why this query does NOT also exclude `loom:operator` (#7660).** Unlike
-> `loom:blocked` / `loom:frozen` above, `loom:operator` is
-> **deliberately left unfiltered** here — this is not an oversight. When
-> Champion routes a stale, held PR from `loom:pr` to `loom:changes-requested`,
-> it intentionally *keeps* `loom:operator` so this Priority 2 queue can still
-> pick the PR up and refresh the diff; see `.loom/docs/label-state-machine.md`
-> § "Stale departure to Doctor" (#6720/#6852) for the full rationale. Adding a
-> `loom:operator` exclusion to this query would reproduce the exact bug #6720
-> fixed (held PRs becoming permanently stuck as `CONFLICTING`, unreachable by
-> Doctor) — do not add one.
->
-> **Operator-hold exclusion (Priority 1 queue, #5978).** The shared queue
-> skips `loom:operator` approved-conflict PRs (feedback rows remain eligible)
-> so autonomous Finding Work never rebases/pushes to a held PR. Outside
-> "Routing to a human" below, Doctor never adds or removes `loom:operator`
-> (see `.loom/docs/label-state-machine.md`). Same PR Fix Mode /
-> explicit-user-instruction carve-out as the Priority 2 note above.
+> **Hold exclusion (both queues, #5272, #11861).** The shared queue drops
+> every park, `loom:operator` included: no role acts on an item a human must
+> decide, so autonomous Finding Work never claims, rebases or pushes to a held
+> PR. One exception (#11861): Champion's own hold sent back for fixes
+> (`loom:changes-requested` + `loom:blocked` with a standing trusted Champion
+> hold marker) is in the queue. Work it as any feedback PR and leave
+> `loom:blocked` on: only a human removes it. An explicit user instruction naming a PR is a human decision, but
+> never overrides `loom:frozen` or `loom:operator`.
 
 ### Routing to a human
 
@@ -472,7 +458,7 @@ explicit user instruction to park a PR, or a finding whose fix needs a
 human's hands (a secret rotation, a machine you cannot reach) — never because
 a fix is hard or two attempts failed (#10001). The rule is
 `.loom/docs/label-state-machine.md` → "Routing to a human": a human's hands →
-`loom:operator` + a capability marker and a comment naming the step; a ruling
+`loom:operator` and a comment naming the step; a ruling
 → `loom-daemon operator-decision apply`; either can carry a `Blocked by #N`
 line; automation-resolvable waiting → `loom:blocked` with a park record.
 
@@ -481,9 +467,8 @@ line; automation-resolvable waiting → `loom:blocked` with a park record.
 gh pr edit <number> --add-label "loom:operator" --remove-label "loom:changes-requested"
 ```
 
-Drop `loom:changes-requested` in the same edit: on a PR `loom:operator` is
-not a park (#7660), so the label alone would hand the PR straight back to
-your own queue.
+Drop `loom:changes-requested` in the same edit, so the PR leaves the
+changes queue's count as well as its listing.
 
 ### Stale-Verdict Check (before claiming from Priority 1 or Priority 2)
 
@@ -523,21 +508,21 @@ at all.
 ### Other PRs Needing Attention
 
 **Find PRs with merge conflicts (any label):** this is a broad diagnostic scan,
-not itself a claim path — the shared queue above (which excludes `loom:treating` and, for approved
-conflicts, `loom:operator`) is what autonomous Finding Work actually
-claims from. Still excludes `loom:operator` here too, so a Doctor skimming this
-list doesn't hand-pick a held PR (#5978).
+not itself a claim path — the shared queue above (which excludes
+`loom:treating` and every park) is what autonomous Finding Work actually
+claims from. Excludes parks here too, so a Doctor skimming this list doesn't
+hand-pick a held PR (#5978).
 ```bash
 gh pr list --state=open --json number,title,labels,mergeable \
-  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:operator" and .name != "loom:frozen")) | "#\(.number): \(.title)"'
+  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:operator" and .name != "loom:blocked" and .name != "loom:frozen")) | "#\(.number): \(.title)"'
 ```
 
 **Find all open PRs:**
 ```bash
 # Check primary queues first
-PRIORITY_1=$(gh pr list --label="loom:pr" --state=open --json number,mergeable,labels | jq '[.[] | select(.mergeable == "CONFLICTING") | select(any(.labels[]?.name; . == "loom:frozen") | not)] | length')
-# PR-lane parks: holds but loom:operator (#7660), retired names incl. (#11795)
-PR_PARKS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null | grep -vx 'loom:operator' || printf 'loom:blocked\nloom:frozen')
+# Parks: every hold, loom:operator included (#11861), retired names incl. (#11795)
+PR_PARKS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen')
+PRIORITY_1=$(gh pr list --label="loom:pr" --state=open --json number,mergeable,labels | jq --arg p "$PR_PARKS" '[.[] | select(.mergeable == "CONFLICTING") | select(any(.labels[]?.name; IN(($p | split("\n"))[])) | not)] | length')
 PRIORITY_2=$(gh pr list --search "is:open is:pr label:loom:changes-requested $(sed 's/^/-label:/' <<<"$PR_PARKS" | tr '\n' ' ')" --json number | jq 'length')
 
 if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
@@ -599,7 +584,7 @@ When the user explicitly instructs you to work on a specific PR by number:
 ```
 
 **Behavior**:
-1. **Proceed immediately** — skip the required-label check
+1. **Proceed immediately** — skip the required-label check, never the `loom:frozen` / `loom:operator` refusal (#11861)
 2. **Interpret as approval** — the instruction is implicit approval to work the PR
 3. **Apply working label** — add `loom:treating` to track it
 4. **Document override** — comment "Addressing issues on this PR"
@@ -660,7 +645,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    ```
 3. **Check PR details**: `gh pr view <number>` - look for "Changes requested" reviews or conflicts
 4. **Read feedback**: Understand what the reviewer is asking for
-5. **Check out PR branch in a dedicated worktree** (see "PR Branch Isolation" above): use `./.loom/scripts/worktree.sh <ISSUE_NUM>` for `feature/issue-<N>` branches or `./.loom/scripts/pr-worktree.sh <PR_NUMBER>` for external/ad-hoc branches, then `cd` into the worktree before running `gh pr checkout`. Then "Verify the pin" (below), before any edit.
+5. **Check out PR branch in a dedicated worktree** ("PR Branch Isolation" above; its "Occupied worktree" check first): use `./.loom/scripts/worktree.sh <ISSUE_NUM>` for `feature/issue-<N>` branches or `./.loom/scripts/pr-worktree.sh <PR_NUMBER>` for external/ad-hoc branches, then `cd` into the worktree before running `gh pr checkout`. Then "Verify the pin" (below), before any edit.
 6. **CRITICAL: Assess ALL CI failures FIRST** (see "CI Assessment" section below):
    - Run `forge wait-checks <number> --timeout 20` to identify ALL failing checks
    - Fetch logs for each failing check
@@ -807,7 +792,7 @@ CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 ```
 
 **Env vars**: `LOOM_STALE_TREATING_MINUTES` (default **60**) — deliberately
-longer than the Judge's `LOOM_STALE_REVIEWING_MINUTES` (30): a Doctor's fix
+longer than the Judge's `LOOM_STALE_REVIEWING_MINUTES` (45): a Doctor's fix
 cycle (assess all CI failures → fix → verify locally → push → re-verify
 remotely) legitimately runs longer than a single review pass. The script picks
 the **treating** default from the `--label` you pass; do not borrow the Judge's
@@ -839,7 +824,10 @@ comment id, and renews yours while your session lives
 - **claim** exit **0** = held: add `loom:treating` (**2** = an older
   `loom-daemon` without `lease pr`: label alone, as before). **4** = a peer's
   live lease wins (a lost race posts your yield record), **5** = unreadable,
-  any other code (**1** = `loom-daemon` failed to start) = unknown: never
+  **7** = another actor is working the PR (a live lease of another kind on it
+  or its closing issue, or a push by another login inside
+  `LOOM_DOCTOR_PUSH_WINDOW_MINUTES`, default 15; #12105), any other code
+  (**1** = `loom-daemon` failed to start) = unknown: never
   "label-only" — stand down **before** any worktree, snapshot or label action.
   Never touch a worktree a peer's lease holds, or its `loom:treating`.
 - **fence** before every push and the completion write (step 11):
@@ -1151,6 +1139,22 @@ something you control from inside a Doctor session; this note is for a human
 choosing a Doctor model in manual mode — don't reach for a stronger model on a
 purely mechanical format fix (#4882).
 
+### Fix the Whole Class, Not Just the Cited Lines
+
+For each finding, name the underlying pattern (the same mistake in a value,
+field, call or schema entry), then search the **PR's changed files** (and code
+directly affected by them) for every instance — `grep`, or a structured query of
+a data file — and fix them all. A fix that stops at the cited lines turns one
+class-level defect into extra Judge/Doctor rounds.
+
+- **Class language means examples.** When the Judge writes "the same … occurs
+  in", "and other …" or "everywhere that …", the cited instances are examples,
+  not the full list.
+- **Bounded.** Only the PR's changed files and directly affected code; no
+  repository-wide cleanup, and the time budget above is unchanged.
+- **Report it.** The fix summary comment lists the extra instances fixed beyond
+  those the Judge cited (path and line), or says "no other instances found".
+
 ### Medium Complexity (Usually Handle)
 - Refactoring to improve clarity
 - Adding edge case handling
@@ -1225,10 +1229,6 @@ Comment on the PR when pushing fixes ("Addressed: formatting, added tests for ed
 ### Quality Checks
 ```bash
 # Targeted only (CI is the test gate, #11690); Rust lint = each CI `cargo clippy` line verbatim, apart from tests; no clippy = unvalidated.
-# Production shell changed + CI runs shell-budget --check? After the final commit, before re-review:
-# `loom-daemon shell-budget --check --base <PR base, default origin/main>`; nonzero = this branch's
-# growth (never pre-existing): cut counted shell or move it to the daemon, rerun to exit 0.
-# Comments, follow-up issues or arbitrary trailers are not permission.
 
 # If review mentioned tests / style / types (scope to what you touched):
 pnpm test -- <touched specs>

@@ -546,3 +546,8 @@ fn an_unresolvable_daemon_is_neither_answer() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

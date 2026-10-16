@@ -3,7 +3,7 @@
 //! emitted, and the default-off gate.
 
 use super::*;
-use crate::observability::ops::capture::{capture, Captured};
+use crate::observability::ops::capture::{capture, without_global_sink, Captured};
 use crate::worker_spawn::egress_proxy::{
     server, HeaderStyle, Placeholder, ProfileProxy, Record, Registry, Upstream,
 };
@@ -729,17 +729,63 @@ fn egress_journals(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// Clears, for one test, every input outside the workspace's own config
+/// that decides whether it exports traces (#11904): the observability env
+/// overrides a fleet host's daemon or shell may carry, and the machine-level
+/// defaults tier (an explicit `LOOM_CONFIG_DEFAULTS_FILE` would otherwise
+/// still be read under test). Restored on drop.
+struct TraceEnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl TraceEnvGuard {
+    fn hermetic() -> Self {
+        use crate::observability as obs;
+        let cleared = [obs::ENABLED_ENV, obs::ENDPOINT_ENV, obs::EXPORTER_ENV];
+        let defaults = crate::config_resolver::PRIVATE_DEFAULTS_ENV;
+        let mut previous: Vec<_> = cleared.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        previous.push((defaults, std::env::var_os(defaults)));
+        for key in cleared {
+            std::env::remove_var(key);
+        }
+        std::env::set_var(defaults, "");
+        Self(previous)
+    }
+}
+
+impl Drop for TraceEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// A workspace that does not export traces gets no journal: the daemon would
-/// never drain one, so writing it would only leak files.
+/// never drain one, so writing it would only leak files. The OTLP exporter is
+/// compiled unconditionally (#10700), so an exporting workspace always gets
+/// one, whatever `--features` the test binary was built with.
+///
+/// It writes two env groups, so it holds both locks the same way
+/// `host_identity_tests`' `env_test!` does: `loom_config_env` (outer, for
+/// `LOOM_CONFIG_DEFAULTS_FILE`) then the crate-default group (inner, for the
+/// observability overrides), then this module's own `env_lock`.
 #[test]
+#[serial_test::serial(loom_config_env)]
 fn a_journal_is_named_only_when_the_workspace_exports_traces() {
-    let _g = super::super::tests::env_lock();
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
-    assert_eq!(context().with_journal(tmp.path()).journal_dir, None);
-    std::fs::write(tmp.path().join(".loom/config.json"), TRACING_CONFIG).unwrap();
-    let want = cfg!(feature = "otlp").then(|| journal_dir(tmp.path()));
-    assert_eq!(context().with_journal(tmp.path()).journal_dir, want);
+    #[serial_test::serial]
+    fn inner() {
+        let _g = super::super::tests::env_lock();
+        let _env = TraceEnvGuard::hermetic();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+        assert_eq!(context().with_journal(tmp.path()).journal_dir, None);
+        std::fs::write(tmp.path().join(".loom/config.json"), TRACING_CONFIG).unwrap();
+        let want = Some(journal_dir(tmp.path()));
+        assert_eq!(context().with_journal(tmp.path()).journal_dir, want);
+    }
+    inner();
 }
 
 /// The proxy runs in the `worker` launcher, which registers no ops sink. A
@@ -754,7 +800,11 @@ fn without_an_ops_sink_each_request_is_journalled_for_the_daemon() {
         .enable_all()
         .build()
         .unwrap();
-    let reply = rt.block_on(async {
+    // The global ops sink is process-wide and set for good by any test that
+    // starts an OTLP exporter; run as the sinkless launcher does (#11904).
+    // The current-thread runtime keeps the proxy's publish on this thread.
+    let reply = without_global_sink(|| {
+        rt.block_on(async {
         let events = sse(&[
             &format!("{{\"model\":\"glm-4.6\",\"choices\":[{{\"delta\":{{\"content\":\"{SECRET_TEXT}\"}}}}]}}"),
             "{\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}",
@@ -790,6 +840,7 @@ fn without_an_ops_sink_each_request_is_journalled_for_the_daemon() {
         let mut out = Vec::new();
         stream.read_to_end(&mut out).await.unwrap();
         String::from_utf8_lossy(&out).into_owned()
+        })
     });
     // Dropping the runtime waits for the blocking journal write.
     drop(rt);

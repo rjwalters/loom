@@ -405,6 +405,8 @@ pub fn classify(response: Option<&HttpResponse>, exit_ok: bool, stderr: &str) ->
     let outcome = match status {
         Some(304) => Outcome::NotModified,
         Some(200..=299) if exit_ok => Outcome::Ok,
+        // #12310: a gateway reserve refusal is a `429` that is not a limit.
+        _ if crate::gh_invocation::purpose::is_reserve_refusal(stderr) => Outcome::Error,
         _ if is_secondary_limit(response, stderr) => Outcome::SecondaryLimited,
         _ if crate::rate_limit_breaker::indicates_rate_limit(stderr) => Outcome::RateLimited,
         Some(429) => Outcome::RateLimited,
@@ -661,6 +663,27 @@ struct Aggregate {
     /// key). Only lines that name a bucket, or ran as an owner's writer, land
     /// here.
     latest_by_bucket: BTreeMap<(Pool, String), Reading>,
+    /// Budget-costing calls per `(credential account, credential owner,
+    /// pool)` (#12238), split into daemon and agent-session rows — the trip
+    /// span's `own`, which must count only the credential that tripped. A row
+    /// that names no account (a non-facade call, an older binary) lands
+    /// nowhere: it stays in the trip's unattributed remainder.
+    by_credential: BTreeMap<(String, Option<String>, Pool), CredentialSpend>,
+}
+
+/// One credential's budget-costing calls in the window, by who made them:
+/// the daemon's own rows, or an agent session's `gh` front (`ag`-stamped).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CredentialSpend {
+    pub daemon: u64,
+    pub agent: u64,
+}
+
+impl CredentialSpend {
+    #[must_use]
+    pub fn total(self) -> u64 {
+        self.daemon + self.agent
+    }
 }
 
 /// The owner whose writer a writer-role `line` spent (#10334): the owner its
@@ -681,6 +704,21 @@ impl Aggregate {
     fn add(&mut self, line: &SinkLine) {
         let c = self.counts.entry((line.c.clone(), line.p)).or_default();
         bump(c, line.o);
+        // `ok` + `error` cost budget (as in `consumed_per_pool`); a free
+        // probe (`fr`) is a request GitHub never charges.
+        if matches!(line.o, Outcome::Ok | Outcome::Error) && line.at.fr != Some(true) {
+            if let Some(account) = line.at.ca.clone() {
+                let spend = self
+                    .by_credential
+                    .entry((account, line.at.co.clone(), line.p))
+                    .or_default();
+                if line.ag.ag.is_some() {
+                    spend.agent += 1;
+                } else {
+                    spend.daemon += 1;
+                }
+            }
+        }
         let role = line.ir.as_deref().unwrap_or(UNKNOWN_OPERATION);
         bump(self.roles.entry(role.to_string()).or_default(), line.o);
         if let Some(operation) = line.op.clone() {
@@ -744,6 +782,15 @@ impl Aggregate {
             *spent.entry(*pool).or_default() += c.ok + c.error;
         }
         spent
+    }
+
+    /// [`Self::by_credential`] for one `(account, owner)`, per pool.
+    fn consumed_for(&self, account: &str, owner: Option<&str>) -> BTreeMap<Pool, CredentialSpend> {
+        self.by_credential
+            .iter()
+            .filter(|((a, o, _), _)| a == account && o.as_deref() == owner)
+            .map(|((_, _, pool), spend)| (*pool, *spend))
+            .collect()
     }
 
     fn rows(&self) -> Vec<ForgeCallCounts> {
@@ -1115,15 +1162,22 @@ pub fn bucket_readings(now: DateTime<Utc>) -> BTreeMap<String, Vec<ForgeBudgetRe
     out
 }
 
-/// This host's budget-costing forge calls per pool over the last window —
-/// `ok` + `error` outcomes, host-wide from the sink (Issue #9855). The
-/// breaker's trip-time attribution log divides a pool's `used` by this to
-/// estimate the external share. `None` when the sink is disabled — own
-/// consumption is unknown, not zero.
+/// This host's budget-costing forge calls per pool over the last window on
+/// **one credential** — the `account` (`app-<id>`, `ambient`, …) and the
+/// `owner` its installation covers (`None` for a credential with no owner)
+/// — split into daemon and agent-session rows (Issues #9855, #12238). The
+/// breaker's trip-time attribution subtracts this from the tripping
+/// credential's `used`; the remainder is other hosts or processes on that
+/// credential. `None` when the sink is disabled — own consumption is
+/// unknown, not zero.
 #[must_use]
-pub fn consumed_in_window(now: DateTime<Utc>) -> Option<BTreeMap<Pool, u64>> {
+pub fn consumed_in_window_for(
+    now: DateTime<Utc>,
+    account: &str,
+    owner: Option<&str>,
+) -> Option<BTreeMap<Pool, CredentialSpend>> {
     let dir = sink_dir()?;
-    Some(read_window(&dir, now.timestamp()).consumed_per_pool())
+    Some(read_window(&dir, now.timestamp()).consumed_for(account, owner))
 }
 
 #[cfg(test)]

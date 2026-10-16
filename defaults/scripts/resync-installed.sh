@@ -2417,7 +2417,7 @@ fi
 # The file is co-owned (#4187): Loom's labels sit between `# BEGIN LOOM LABELS`
 # and `# END LOOM LABELS`, and a consumer may keep its own labels above or below.
 # The installer splices the block, but no resync ever refreshed it, so a label
-# upstream added (loom:needs-revision) never arrived and a label upstream retired
+# upstream added (#10753's revise label) never arrived and a label upstream retired
 # (loom:urgent) stayed declared, and the forge drift check below re-created it
 # minutes after `labels migrate --apply` deleted it.
 #
@@ -3839,7 +3839,10 @@ if [[ "$DRY_RUN" -eq 0 && "${LOOM_RESYNC_SKIP_USER_SCOPE:-0}" != "1" \
         # shellcheck source=/dev/null
         source "$SOURCE_ROOT/scripts/install/provision-skills.sh"
         provision_loom_dispatcher "$SOURCE_ROOT" >&2 || true
-        provision_loom_skills "${LOOM_HOME:-$HOME/.local/share/loom}" >&2 || true
+        # SOURCE_ROOT is the reference: a machine checkout older than the
+        # tree this run synced from must not supply the user-scope /loom:*
+        # commands, which shadow every repo's own fresher copy.
+        provision_loom_skills "${LOOM_HOME:-$HOME/.local/share/loom}" "" "$SOURCE_ROOT" >&2 || true
     ) || printf '%b\n' "${YELLOW}[resync] user-scope skill provisioning failed (non-fatal).${NC}" >&2
 fi
 

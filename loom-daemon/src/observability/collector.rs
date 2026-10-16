@@ -151,7 +151,6 @@ async fn run_collector(
     // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
     let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
     ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     // First-boot backfill (Issue #5084): run once immediately, before the
     // first snapshot tick, so a sweep adopted across a daemon restart does
     // not wait a full `snapshot_interval` (5 minutes) for its terminal
@@ -576,6 +575,14 @@ fn event_issue(event: &Event) -> Option<u32> {
             kind: SweepKind::Issue(issue),
             ..
         } => Some(*issue),
+        // A step is not `sweep.*` telemetry (#11898): it ends with no
+        // `sweep.issue.*.exited`/`.crashed` (its outcome is the step ledger's,
+        // C15e), so a `sweep.started` would stay in flight forever. Its
+        // dispatch telemetry is the spawn's own `loom.dispatch.step` (#11906).
+        Event::SweepGlobalDispatch {
+            kind: SweepKind::Step { .. } | SweepKind::PrSet(_),
+            ..
+        } => None,
         Event::SweepPhase { issue, .. }
         | Event::SweepExited { issue, .. }
         | Event::SweepCrashed { issue, .. } => Some(*issue),
@@ -761,6 +768,8 @@ fn terminal_records(
     };
     let (disposition, failure_class) = crate::telemetry::classify_disposition(&signals);
     let outcome_result = crate::telemetry::result_for_disposition(&signals, disposition);
+    // Issue #11854: a reported `failure` never goes out without a class.
+    let failure_class = crate::telemetry::ensure_failure_class(outcome_result, failure_class);
     vec![
         TelemetryRecord::SweepCompleted(crate::telemetry::SweepCompletedRecord {
             repo: repo.clone(),
@@ -993,11 +1002,6 @@ async fn sample_snapshots(
     // The work finder's ranked ready queue (Issue #8852, phase 2) — native
     // HTTPS only, and only when the work finder has ticked since last time.
     super::queue_snapshot::record(workspace_pool, slug_cache).await;
-    // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
-    // listings plus a bounded per-item budget; a no-op without the ops sink.
-    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
-    // skips the repos a fresh captain covers (`captain_gauges`).
-    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
     // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
     // reads, no forge call; a no-op without the ops sink.
     super::ops::redate_chain::record(workspace_pool).await;
@@ -1010,11 +1014,6 @@ async fn sample_snapshots(
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot
     // stall this pass; the WARN lives in the watch and runs without telemetry.
     super::ops::codex_session::record();
-    // This host's view of its held sweeps, review PRs and ready queue over
-    // OTLP (Issue #10196), independent of ETA. 5-minute anchor, deltas only
-    // on change; its review listings are ETag-cached (warm after stage_dwell)
-    // and reused by the pass after each work-finder tick (#11161).
-    super::fleet_state::record(workspace_root, workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
@@ -1208,6 +1207,14 @@ async fn sample_host_health(
         &crate::observability::global_export_statuses(),
         Utc::now(),
     );
+    // Cgroup-derived agent-scope census (#12166): independent of the registry
+    // so orphaned scopes show. Blocking fs/proc reads; absent on non-Linux.
+    let (agent_scopes, agent_scopes_total) =
+        tokio::task::spawn_blocking(crate::agent_scopes::census)
+            .await
+            .ok()
+            .flatten()
+            .map_or((Vec::new(), None), |(l, t)| (l, Some(t)));
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1245,6 +1252,8 @@ async fn sample_host_health(
         // zero — the same absence contract `protection`/`admission_brake`
         // follow. Swap rates come from the process-global sample history.
         memory: memory_summary(pressure, swap_in_bytes_per_sec, swap_out_bytes_per_sec),
+        agent_scopes,
+        agent_scopes_total,
     }
 }
 
@@ -1607,14 +1616,10 @@ where
             }
         };
         let weight = weights.get(&root).copied();
-        // #10763: this host's release-pass tallies for the repo, if it ticked.
-        let stale_blocked_release =
-            crate::stale_blocked::release_outcome::counters(&root).map(|c| c.to_telemetry());
         entries.push(ManagedRepoEntry {
             slug,
             visibility,
             weight,
-            stale_blocked_release,
         });
     }
     // Deterministic order (the dashboard renders this list directly) and

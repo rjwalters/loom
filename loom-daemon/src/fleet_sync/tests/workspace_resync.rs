@@ -497,11 +497,16 @@ fn a_stale_workspace_is_resynced_with_one_commit_and_the_claim_released() {
     assert!(meta.contains("\"loom_version\": \"0.19.880\""), "{meta}");
     assert!(!meta.contains("resync_pending"), "{meta}");
     let message = git(&fx.origin, &["log", "-1", "--format=%B", "refs/heads/main"]);
+    // Subject plus the resync trailers only: a sweep's injected `GIT_CONFIG_*`
+    // `core.hooksPath` may stamp extra provenance trailers onto the commit.
     assert_eq!(
-        message,
-        "chore(loom): resync installed Loom to v0.19.880\n\nLoom-Resync-Host: host-a\n\
-         Loom-Resync-Version: 0.19.880"
+        message.lines().next(),
+        Some("chore(loom): resync installed Loom to v0.19.880"),
+        "{message}"
     );
+    for trailer in ["Loom-Resync-Host: host-a", "Loom-Resync-Version: 0.19.880"] {
+        assert!(message.lines().any(|l| l == trailer), "missing {trailer:?} in {message}");
+    }
     // The commit's parent is the head that was fetched: a plain fast-forward.
     assert_eq!(git(&fx.origin, &["rev-list", "--count", "--merges", "refs/heads/main"]), "0");
 
@@ -1169,6 +1174,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
 
 #[path = "workspace_resync_bounds.rs"]
 mod bounds;
+mod dogfood;
 #[path = "workspace_resync_heads.rs"]
 mod head_check;
 #[path = "workspace_resync_hold.rs"]

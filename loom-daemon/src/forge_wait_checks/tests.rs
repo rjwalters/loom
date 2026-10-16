@@ -214,6 +214,7 @@ fn opts(timeout: u64) -> Opts {
     Opts {
         timeout: Duration::from_secs(timeout),
         required_only: false,
+        settle_red: false,
         base: None,
         min_interval: DEFAULT_MIN_INTERVAL,
         max_interval: DEFAULT_MAX_INTERVAL,
@@ -685,6 +686,81 @@ fn a_required_lookup_that_keeps_failing_is_error_never_green() {
     );
 }
 
+impl Forge {
+    /// Both required-context sources refused for want of a permission: the
+    /// rulesets read is empty, the GraphQL read and the REST branch summary
+    /// 403 "Resource not accessible by integration" (#11837).
+    fn required_denied(&self, status: u16, headers: &str, body: &str) {
+        self.required(&[]);
+        let raw = format!("HTTP/2.0 {status} Forbidden\r\n{headers}\r\n{body}");
+        let msg = crate::forge_denial::body_message(body).unwrap_or_default();
+        for k in ["graphql", &key("repos/o/r/branches/main")] {
+            std::fs::write(self.dir.path().join(format!("{k}.out")), "").ok();
+            let _ = std::fs::remove_file(self.dir.path().join(format!("{k}.out")));
+            std::fs::write(self.dir.path().join(format!("{k}.raw")), &raw).unwrap();
+            std::fs::write(
+                self.dir.path().join(format!("{k}.err")),
+                format!("gh: {msg} (HTTP {status})\n"),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_permission_refused_lookup_decides_over_every_observed_check() {
+    let f = Forge::new();
+    f.required_denied(403, "", NOT_ACCESSIBLE);
+    f.runs(SHA, &[run("labeler", "completed", Some("success"))]);
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert_eq!(o, Outcome::Green { sha: SHA.into() });
+    assert_eq!(f.polls(), 1, "a permission refusal is not retried");
+    assert!(notes.iter().any(|n| n.contains("Administration: Read")), "{notes:?}");
+}
+
+#[test]
+fn a_permission_refused_lookup_still_waits_for_a_pending_check() {
+    let f = Forge::new();
+    f.required_denied(403, "", NOT_ACCESSIBLE);
+    f.runs(
+        SHA,
+        &[
+            run("labeler", "completed", Some("success")),
+            run("lint", "in_progress", None),
+        ],
+    );
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert_eq!(
+        o,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["lint".into()]
+        }
+    );
+}
+
+#[test]
+fn a_permission_refused_lookup_still_reports_a_red_check() {
+    let f = Forge::new();
+    f.required_denied(403, "", NOT_ACCESSIBLE);
+    f.runs(SHA, &[run("lint", "completed", Some("failure"))]);
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Red { .. }), "{o:?}");
+}
+
+#[test]
+fn a_rate_limited_lookup_is_still_never_green() {
+    let f = Forge::new();
+    f.required_denied(
+        403,
+        "Retry-After: 60\r\n",
+        r#"{"message":"You have exceeded a secondary rate limit"}"#,
+    );
+    f.runs(SHA, &[run("labeler", "completed", Some("success"))]);
+    let (o, _) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert!(!matches!(o, Outcome::Green { .. }), "{o:?}");
+}
+
 /// `--required-only` waits through a failed lookup (no longer an immediate
 /// ERROR) and then for a required check that has not been created yet,
 /// while an informational failure stays informational.
@@ -934,4 +1010,125 @@ fn superseded_twin_run_residue_is_dropped() {
     f.runs(SHA, &[twin(1, "failure")]);
     go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
     assert!(!f.calls().iter().any(|c| c.contains("actions/runs")), "{:?}", f.calls());
+}
+
+fn settle(timeout: u64) -> Opts {
+    Opts {
+        settle_red: true,
+        ..opts(timeout)
+    }
+}
+
+/// #12011, the PR #11974 replay: one leg is red while the rest still run.
+/// Without `--settle-red` that is RED on the first poll; with it, a snapshot
+/// is TIMEOUT naming what still runs, plus a stderr note naming the failure.
+#[test]
+fn settle_red_snapshot_of_a_partial_run_is_timeout_with_an_already_failing_note() {
+    let partial = [
+        run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+        run("Rust Unit Tests (1/3)", "in_progress", None),
+    ];
+    let f = Forge::new();
+    f.runs(SHA, &partial);
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Red { .. }), "{o:?}");
+
+    let f = Forge::new();
+    f.runs(SHA, &partial);
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &settle(0), &mut FakeClock::new());
+    assert_eq!(
+        o,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["Rust Unit Tests (1/3)".into()]
+        }
+    );
+    assert_eq!(
+        notes,
+        vec!["wait-checks: --settle-red: already failing: Rust Unit Tests (2/3)".to_string()]
+    );
+}
+
+/// Under `--settle-red` the wait keeps polling past the first failure and
+/// reports RED once the run has finished, naming the run id for the log.
+#[test]
+fn settle_red_waits_for_the_run_to_finish_then_is_red() {
+    let f = Forge::new();
+    f.required(&[]);
+    f.runs(
+        SHA,
+        &[
+            run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+            run("Rust Unit Tests (1/3)", "in_progress", None),
+        ],
+    );
+    let mut clock = FakeClock::new().at(100, || {
+        f.runs(
+            SHA,
+            &[
+                run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+                run("Rust Unit Tests (1/3)", "completed", Some("success")),
+            ],
+        );
+    });
+    let o = go(&f, Selector::Pr(42), &settle(1800), &mut clock);
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-RED {SHA} Rust Unit Tests (2/3)"));
+    assert_eq!(f.polls(), 4);
+}
+
+/// #12022: under `--settle-red` a finished red does not wait on the required
+/// set. A failing lookup (the #11837 403) used to hold it as `TIMEOUT …
+/// (required-contexts-unknown)` on every pass — or, given time, `ERROR
+/// required-lookup-failed` — so it never reached the Doctor. The lookup is
+/// not even made.
+#[test]
+fn settle_red_finished_red_does_not_depend_on_the_required_lookup() {
+    for timeout in [0, 1800] {
+        let f = Forge::new();
+        f.required_fails();
+        f.runs(SHA, &[run("lint", "completed", Some("failure"))]);
+        let o = go(&f, Selector::Pr(42), &settle(timeout), &mut FakeClock::new());
+        assert!(matches!(o, Outcome::Red { .. }), "{o:?}");
+        assert_eq!(o.sentinel(), format!("LOOM-CHECKS-RED {SHA} lint"));
+        assert_eq!(f.lookups(), 0, "{:#?}", f.calls());
+    }
+}
+
+/// #12022: the `--settle-red: already failing` note belongs to that flag
+/// alone. `--required-only` without it, with a non-required failure and a
+/// required check still running, is a plain TIMEOUT with no such note.
+#[test]
+fn required_only_alone_emits_no_settle_red_note() {
+    let rows = [
+        run("lint", "completed", Some("failure")),
+        run("Backend", "in_progress", None),
+    ];
+    let f = Forge::new();
+    f.required(&["Backend"]);
+    f.runs(SHA, &rows);
+    let mut o = opts(0);
+    o.required_only = true;
+    let (out, notes) = wait(&mut f.reads(), &Selector::Pr(42), &o, &mut FakeClock::new());
+    assert_eq!(
+        out,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["Backend".into()]
+        }
+    );
+    assert!(!notes.iter().any(|n| n.contains("--settle-red")), "{notes:?}");
+
+    // With the flag, the same snapshot still carries the note.
+    let f = Forge::new();
+    f.required(&["Backend"]);
+    f.runs(SHA, &rows);
+    let mut o = settle(0);
+    o.required_only = true;
+    let (_, notes) = wait(&mut f.reads(), &Selector::Pr(42), &o, &mut FakeClock::new());
+    assert!(
+        notes
+            .iter()
+            .any(|n| n == "wait-checks: --settle-red: already failing: lint"),
+        "{notes:?}"
+    );
 }

@@ -87,6 +87,15 @@ fn dispatch_is_refused_after_a_landing_in_the_journal() {
     );
     assert_eq!(refusal.detail(), "journal_landed");
     assert!(!spawn_log.exists(), "nothing was spawned");
+    // #11853: the refusal arms a fleet-wide cooldown for the rest of the
+    // window, so the work finder skips the issue instead of being refused
+    // again on every tick.
+    assert!(registry.landed_cooldown_active(3079));
+    let remaining = registry
+        .dispatch_backoff_remaining(3079, Utc::now())
+        .unwrap();
+    assert!(remaining <= LANDED_REDISPATCH_WINDOW, "{remaining:?}");
+    assert!(remaining > Duration::from_secs(20 * 60), "{remaining:?}");
 
     let later = landed_at + chrono::Duration::minutes(31);
     assert!(registry.refuse_recent_landing(3079, later).is_ok());
@@ -113,6 +122,13 @@ fn a_closed_issue_is_refused_as_already_landed() {
         .downcast_ref::<AlreadyLandedDispatchError>()
         .expect("typed already_landed refusal");
     assert_eq!(refusal.evidence, LandedEvidence::ForgeClosed);
+    assert!(registry.landed_cooldown_active(149), "#11853: a closed issue cools down");
+    assert!(
+        registry
+            .dispatch_backoff_remaining(149, Utc::now())
+            .unwrap()
+            > Duration::from_secs(5 * 3600)
+    );
     let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(!calls.contains("issue edit"), "no label flip: {calls}");
 

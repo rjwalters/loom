@@ -627,8 +627,8 @@ The writer's read share is `route = direct_read` on the writer's `account`
 over all reads. A rise means a classifier gap, not an outage.
 
 Discovery listings can also skip GitHub, and the gateway, entirely: with a
-state mirror configured (`forge.mirror`), the work finder and the stage-dwell
-sampler read fresh listings from it and fall back to the paths above. See
+state mirror configured (`forge.mirror`), the work finder
+reads fresh listings from it and fall back to the paths above. See
 [`forge-events.md` §8](forge-events.md#8-the-state-mirror-forgemirror-discovery-reads-and-wakes).
 
 ### The cached-permission window: `403 … not accessible by integration` (#6074)
@@ -879,8 +879,8 @@ stopped it, and why it was hard to diagnose:
   never registers one, so a secondary-limit refusal neither stops the rest of
   that invocation nor reaches the next one, and a loop of them keeps bursting.
   The classifier does match secondary-limit phrasing, which is why the
-  daemon's own every-workspace pass (`release-stale-blocked`) is gated on the
-  breaker and a shell loop is not.
+  daemon's own every-workspace passes are gated on the breaker and a shell
+  loop is not.
 
 If you do have to visit several repositories from a shell, pace the
 invocations, and stop the whole loop at the first rate-limit refusal instead

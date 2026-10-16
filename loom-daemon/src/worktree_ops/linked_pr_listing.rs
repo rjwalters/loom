@@ -44,17 +44,26 @@
 //! (#7863). After a failed read the listing is skipped for that root for
 //! [`LISTING_RETRY_AFTER`], so an outage or a wedged `gh` costs one extra
 //! bounded call, not one per probe on top of the fallback's own.
+//!
+//! # Reuse of the last good listing (#12025)
+//!
+//! [`probe_many`] alone (the work finder's pre-filter) may stand in the last
+//! listing it read whole for a failed read, for up to [`LISTING_REUSE_FOR`],
+//! and says so ([`ManyVerdicts::reused`]). The pre-filter fails closed on an
+//! unreadable listing, so without this one failed page would hold a whole
+//! workspace's dispatch for the tick. [`probe`] never reuses: its `NoneOpen`
+//! is the dispatch guard's permit, and a stale permit is a guess.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::claim_reconciliation::open_pr_listing::MAX_PAGES;
 use crate::comment_trust::TrustPolicy;
 use crate::forge_pull_listing::{list_open_pulls_cached_within, RestPull};
 
-use super::gh::{linkage_phrase_regex, OpenPrProbe};
+use super::gh::{linkage_phrase_regex, LinkageKind, OpenPrProbe};
 use super::naming::branch_name;
 
 /// Leg 0 for `issue` in `owner_repo` (`owner/name`): `Some(Open(pr))` /
@@ -88,25 +97,49 @@ pub(crate) fn probe(
     }
 }
 
+/// [`probe_many`]'s answer: the verified verdict of each asked issue, and
+/// whether a recent listing stood in for a failed read (#12025).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManyVerdicts {
+    /// `Open(pr)` or `NoneOpen` per asked issue the classifier answered.
+    pub(crate) verdicts: Vec<(u32, OpenPrProbe)>,
+    /// `None` for a listing read just now. `Some(age)` when the read failed
+    /// and the last good listing of this root and repo, read `age` ago (at
+    /// most [`LISTING_REUSE_FOR`]), answered instead.
+    pub(crate) reused: Option<Duration>,
+}
+
 /// [`probe`] for many issues from ONE listing read (#8865): the verified
 /// verdict of each issue in `issues`, in that order. `None` when the listing
-/// could not be read, which is no verdict for any of them.
+/// could not be read and no good listing of the last [`LISTING_REUSE_FOR`]
+/// can stand in (#12025), which is no verdict for any of them.
 ///
 /// The read, the repo, the classifier and the trust rule are [`probe`]'s, so
 /// an issue's verdict here is exactly what [`probe`] over the same rows would
 /// answer for it: `Open(pr)` or `NoneOpen`. An issue the classifier could not
 /// answer for (`ProbeFailed`) is left out, so every pair returned is a
 /// verified one. `NoneOpen` is the same verified absence the 2.6 guard's leg
-/// 0 acts on; the work finder's pre-filter, the one caller, uses it only to
-/// invalidate the #6788 memo and never as a permit.
+/// 0 acts on; the work finder's pre-filter, the one caller, uses it to
+/// invalidate the #6788 memo (fresh reads only) and to let a candidate go on
+/// to `dispatch()`, whose own guard still decides.
 pub(crate) fn probe_many(
     caller: &'static str,
     gh_bin: &Path,
     root: &Path,
     (owner_repo, issues): (&str, &[u32]),
     timeout: Option<Duration>,
-) -> Option<Vec<(u32, OpenPrProbe)>> {
-    let rows = read_rows(caller, gh_bin, root, owner_repo, timeout)?;
+) -> Option<ManyVerdicts> {
+    let (rows, reused) = match read_rows(caller, gh_bin, root, owner_repo, timeout) {
+        Some(rows) => {
+            let rows = Arc::new(rows);
+            remember_good(root, owner_repo, Arc::clone(&rows));
+            (rows, None)
+        }
+        None => {
+            let (age, rows) = recent_good(root, owner_repo, Instant::now())?;
+            (rows, Some(age))
+        }
+    };
     let policy = TrustPolicy::for_root(root);
     let verified = issues.iter().filter_map(|&issue| {
         match classify_open_linked_pr_rows(&rows, issue, owner_repo, &policy) {
@@ -114,7 +147,58 @@ pub(crate) fn probe_many(
             verdict => Some((issue, verdict)),
         }
     });
-    Some(verified.collect())
+    Some(ManyVerdicts {
+        verdicts: verified.collect(),
+        reused,
+    })
+}
+
+/// How long [`probe_many`] may answer from the last good listing of a root
+/// after a failed read (#12025). Short: an `Open` verdict it reuses only
+/// removes a candidate, but a reused `NoneOpen` lets one reach `dispatch()`,
+/// whose own guard is then the only check of a PR opened since.
+pub(crate) const LISTING_REUSE_FOR: Duration = Duration::from_secs(300);
+
+/// The last listing [`probe_many`] read whole, per root and repo, and when.
+type GoodListings = HashMap<(PathBuf, String), (Instant, Arc<Vec<RestPull>>)>;
+
+fn good_listings() -> &'static Mutex<GoodListings> {
+    static GOOD: OnceLock<Mutex<GoodListings>> = OnceLock::new();
+    GOOD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record `rows` as the last good listing of `owner_repo` at `root`.
+fn remember_good(root: &Path, owner_repo: &str, rows: Arc<Vec<RestPull>>) {
+    let mut good = good_listings().lock().unwrap_or_else(|p| p.into_inner());
+    good.insert((root.to_path_buf(), owner_repo.to_string()), (Instant::now(), rows));
+}
+
+/// The last good listing of `owner_repo` at `root` and its age at `now`, if
+/// it is at most [`LISTING_REUSE_FOR`] old. An older one is dropped.
+fn recent_good(
+    root: &Path,
+    owner_repo: &str,
+    now: Instant,
+) -> Option<(Duration, Arc<Vec<RestPull>>)> {
+    let mut good = good_listings().lock().unwrap_or_else(|p| p.into_inner());
+    let key = (root.to_path_buf(), owner_repo.to_string());
+    let (at, rows) = good.get(&key)?;
+    let age = now.saturating_duration_since(*at);
+    if age > LISTING_REUSE_FOR {
+        good.remove(&key);
+        return None;
+    }
+    Some((age, Arc::clone(rows)))
+}
+
+/// Test hook: make the last good listing of `owner_repo` at `root` `by`
+/// older, as if it had been read that much earlier.
+#[cfg(test)]
+pub(crate) fn age_good_listing(root: &Path, owner_repo: &str, by: Duration) {
+    let mut good = good_listings().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((at, _)) = good.get_mut(&(root.to_path_buf(), owner_repo.to_string())) {
+        *at = at.checked_sub(by).unwrap_or(*at);
+    }
 }
 
 /// The open-PR listing of `owner_repo`, or `None` when it could not be read
@@ -208,6 +292,43 @@ pub(crate) fn classify_open_linked_pr_rows(
         .map(|row| row.number)
         .min();
     linked.map_or(OpenPrProbe::NoneOpen, OpenPrProbe::Open)
+}
+
+/// Every issue one open PR links to under [`classify_open_linked_pr_rows`]'s
+/// rules, by issue number, with how it links: the issues its body names with
+/// a linking phrase ([`super::gh::linkage_refs`], the same phrase families as
+/// [`linkage_phrase_regex`]), plus the Builder branch's issue when the head is
+/// in this same repo. The branch counts only when [`branch_name`] reproduces
+/// it exactly (`feature/issue-0123` names no issue), and it links as
+/// [`LinkageKind::Closes`]: it is that issue's Builder PR. Nothing for a fork
+/// PR by a known-untrusted author (H14). The step engine's item join (#11895,
+/// design #11894) reads it, so the join and the open-PR guard cannot disagree
+/// on what links.
+#[must_use]
+pub(crate) fn linked_issues(
+    body: Option<&str>,
+    head_ref: Option<&str>,
+    same_repo: bool,
+    known_untrusted: bool,
+) -> std::collections::BTreeMap<u32, LinkageKind> {
+    let mut linked = std::collections::BTreeMap::new();
+    if !same_repo && known_untrusted {
+        return linked;
+    }
+    linked.extend(body.map(super::gh::linkage_refs).unwrap_or_default());
+    let branch_issue =
+        head_ref.and_then(|h| super::naming::issue_from_branch(h).filter(|&n| branch_name(n) == h));
+    if let (true, Some(n)) = (same_repo, branch_issue) {
+        linked.insert(n, LinkageKind::Closes);
+    }
+    linked
+}
+
+/// The two trust facts [`linked_issues`] reads, from a listing row of
+/// `owner_repo`: `(same_repo, known_untrusted)`.
+#[must_use]
+pub(crate) fn link_facts(row: &RestPull, owner_repo: &str, policy: &TrustPolicy) -> (bool, bool) {
+    (is_same_repo(row, owner_repo), policy.known_untrusted(&author_json(row)))
 }
 
 /// The PR's head lives in `owner_repo` itself. An absent head repo (GitHub

@@ -54,11 +54,12 @@ this doc, verified against source:
 | Surface | Reload behaviour | Evidence |
 |---|---|---|
 | `autonomous.roleRunner.*` (`enabled`, `roles`, `onIdle`, `model`, …) | **Live** — re-read from `.loom/config.json` every role-runner tick, per registered root | `read_role_runner_config` is called inside the per-tick loop body (`loom-daemon/src/role_runner.rs`), not cached at spawn |
-| `autonomous.workFinder.maxConcurrent` | **Requires a daemon restart** — the *operator ceiling* is resolved once at bring-up and frozen; only the `disk`/`ram` headroom terms of the per-tick `min(...)` are recomputed live around it | `resolve_max_concurrent_with_config` is called once in `loom-daemon/src/daemon_service.rs` (outside any loop) and the resulting `configured_max` is passed into `resolve_dynamic_max_concurrent(disk, ram, configured_max)` in the tick body of `loom-daemon/src/work_finder.rs` |
+| `autonomous.workFinder.maxConcurrent` / `maxConcurrentPerRepo` | **Live** — re-read every multi-workspace tick since #9060/#9090 | `ConfiguredMaxReloader::refresh()` in `loom-daemon/src/work_finder/configured_max.rs`, called from the tick body |
 | `autonomous.workFinder.enabled` (the work-finder **master switch**) | **Requires a daemon restart** — read once when the daemon decides whether to spawn the loop at all | `loom-daemon/src/daemon_service.rs` (`read_work_finder_config` called once, outside any loop, gating the `tokio::spawn`) |
-| `autonomous.workFinder.maxAdmissionsPerTick` | **Requires a daemon restart** — resolved once at startup, the same startup-capture pattern as `maxConcurrent` | `loom-daemon/src/work_finder.rs` doc comment: "an operator retuning it takes effect on the next daemon restart, exactly like `configured_max` today" |
-| `autonomous.workFinder.saturationBrake.*` (admission brake) | **Requires a daemon restart** — resolved once and registered as a process-global singleton alongside the host breaker | `loom-daemon/src/daemon_service.rs`, same startup block as `hostBreaker` below |
-| `autonomous.hostBreaker.*` | **Requires a daemon restart** — resolved once at startup, registered as a process-global handle | `loom-daemon/src/daemon_service.rs`: "resolve its config once at startup ... and register the process-global handle" |
+| `autonomous.workFinder.maxAdmissionsPerTick` | **Live** — re-read every tick since #12090, on the same read as `maxConcurrent` | `ConfiguredMaxReloader::max_admissions_per_tick()` (`loom-daemon/src/work_finder/configured_max.rs`) |
+| `autonomous.workFinder.intervalSecs` | **Requires a daemon restart** — the ticker's period also seeds the forge-event poll gate's cadence and the early-tick registration, so a ticker-only re-arm would leave them stale | `loom-daemon/src/daemon_service.rs` startup block (`resolve_interval_with_config`, `poll_gate::configure_for`) |
+| `autonomous.workFinder.saturationBrake.*` (admission brake) | **Live** — re-resolved every work-finder tick and swapped into the process-global handle since #12090 | `admission_brake::global_reload` (`loom-daemon/src/admission_brake/live_reload.rs`), called from `ConfiguredMaxReloader::refresh()` |
+| `autonomous.hostBreaker.*` | **Live** — re-resolved every work-finder tick and swapped into the process-global handle since #12090 | `host_breaker::global_reload` (`loom-daemon/src/host_breaker/live_reload.rs`), called from `ConfiguredMaxReloader::refresh()` |
 | `autonomous.rateLimitBreaker.*` | **Requires a daemon restart** — resolved once at startup, before any loop is spawned | `loom-daemon/src/daemon_service.rs`, registered unconditionally ahead of the work-finder branch |
 | `autonomous.mainHealthGate.suppressDispatchDuringGate` | **Requires a daemon restart** — resolved once at startup from the primary workspace config | `loom-daemon/src/daemon_service.rs` comment: "Resolved once at startup from the same primary workspace config as the gate's master switch" |
 | `autonomous.transcriptIngest.*` (`enabled`, `intervalSecs`, `windowHours`) | **Requires a daemon restart** — resolved once before the ingestion thread is spawned, then frozen for the life of that thread | `read_transcript_ingest_config` + `resolve_settings` are called inside `try_init_transcript_ingest` (`loom-daemon/src/activity/transcript_ingest.rs`), which `daemon_service.rs` invokes once at bring-up; the spawned thread's `loop` body reads only the already-resolved `interval`/`window_hours` locals |
@@ -166,6 +167,17 @@ has per-repo config; a store that still serves `repos.yml` leaves these files
 alone. Do not edit the file by hand: it belongs to the sync, which will
 rewrite or remove it on the next write pass. A host-only override goes in
 `.loom-local/local.json`.
+
+**A repo that leaves the desired set keeps its file.** The sync only visits
+desired, cloned repos, so when a repo moves to `fleet: false`, becomes
+`firewall: true`, or is removed from the roster, its last
+`.loom-local/fleet-repo.json` stays in place and keeps feeding the resolver.
+That is deliberate: the sync never touches a `firewall` repo, and it stops
+managing the others the moment they leave the set. To drop the stale tier,
+delete `<repo>/.loom-local/fleet-repo.json` by hand. Removals the sync does
+make are journaled (`config.rendered`, `event: removed`) when the config
+journal is enabled, and when several repos fail in one pass the status error
+names the first and counts the rest.
 
 `loom-daemon status` reports it in the `Fleet store:` block, one
 `per-repo fleet tier:` line per repo that has a config or a file (`applied`,

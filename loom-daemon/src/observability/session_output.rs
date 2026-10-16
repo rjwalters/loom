@@ -536,6 +536,13 @@ fn handle_event(tracker: &mut Tracker, sink: &SessionOutputSink, event: &Event, 
             let record = run.status(OutputCategory::Coverage, now, coverage, RunState::Running);
             sink.push(record);
         }
+        // A step publishes no `sweep.issue.*` terminal event to close a run,
+        // so it opens none (#11898); its live output joins the step spawn's
+        // own capture (#11906).
+        Event::SweepGlobalDispatch {
+            kind: SweepKind::Step { .. } | SweepKind::PrSet(_),
+            ..
+        } => {}
         Event::SweepExited { issue, repo, .. } | Event::SweepCrashed { issue, repo, .. } => {
             let Some(root) = repo.clone() else { return };
             if let Some(mut run) = tracker.close(&root, *issue) {

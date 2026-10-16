@@ -3,7 +3,10 @@
 //! [`list_open`] stands in for one ETag-cached REST listing
 //! ([`crate::forge_listing::list_issues_cached_as`] /
 //! [`crate::forge_listing::list_issues_cached_paged_as`]): open items carrying
-//! one label, PRs included, newest first. It returns `Some(rows)` only when
+//! one label, PRs included, newest first. For [`Caller::StepEngine`] alone it
+//! may also stand in for the unfiltered walk of every open item
+//! ([`crate::forge_listing::list_open_issues_cached_all_as`], #11897): no
+//! label, every page, oldest first like that walk. It returns `Some(rows)` only when
 //! every page the mirror served was [`Freshness::Fresh`] for the caller's
 //! bound, and `None` otherwise, which the caller answers by reading exactly as
 //! it does today. `None` is also the answer, with no request at all, when:
@@ -37,8 +40,9 @@ use crate::forge_listing::RestIssue;
 pub enum Caller {
     /// [`crate::work_finder`]'s candidate listings.
     WorkFinder,
-    /// The stage-dwell sampler's stage listings.
-    StageDwell,
+    /// The step engine's all-open listing ([`crate::step_dispatch::listing`],
+    /// #11894 §4.2), the only caller that may list with no label.
+    StepEngine,
 }
 
 impl Caller {
@@ -47,7 +51,7 @@ impl Caller {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::WorkFinder => "work_finder",
-            Self::StageDwell => "stage_dwell",
+            Self::StepEngine => "step_engine",
         }
     }
 }
@@ -210,6 +214,8 @@ pub fn valid_slug(slug: &str) -> bool {
 }
 
 /// Open items carrying `label` from the mirror, or `None` for today's path.
+/// `label: None` lists every open item, and is served only to
+/// [`Caller::StepEngine`] (any other caller gets `None`, with no request).
 /// See the module doc.
 #[must_use]
 pub fn list_open(
@@ -217,11 +223,11 @@ pub fn list_open(
     caller: Caller,
     cwd: Option<&Path>,
     repo: Option<&str>,
-    label: &str,
+    label: Option<&str>,
     pages: Pages,
 ) -> Option<Vec<RestIssue>> {
     // Invariant 3 first: nothing below runs for a read that gates a write.
-    if kind != ReadKind::Discovery {
+    if kind != ReadKind::Discovery || !caller_may_list(caller, label) {
         return None;
     }
     let active = super::active()?;
@@ -243,6 +249,15 @@ pub fn list_open(
     rows
 }
 
+/// Whether `caller` may ask for this listing: a labelled one, any caller; the
+/// unfiltered one (`label: None`), only [`Caller::StepEngine`]. The single-label
+/// callers replace single-label REST reads, so an unfiltered answer would be
+/// a different listing, not a cheaper copy of theirs.
+#[must_use]
+pub fn caller_may_list(caller: Caller, label: Option<&str>) -> bool {
+    label.is_some() || caller == Caller::StepEngine
+}
+
 /// [`list_open`]'s decision, with the mirror, the fetcher and the clock
 /// given. `None` (with why) unless every page was fresh.
 #[must_use]
@@ -251,7 +266,7 @@ pub fn list_open_via(
     active: &Active,
     fetch: &mut dyn Fetch,
     slug: &str,
-    label: &str,
+    label: Option<&str>,
     pages: Pages,
     now: DateTime<Utc>,
 ) -> (Option<Vec<RestIssue>>, Outcome) {
@@ -265,22 +280,27 @@ pub fn list_open_via(
         let Some(left) = LISTING_DEADLINE.checked_sub(started.elapsed()) else {
             return (None, Outcome::Error);
         };
-        let query = vec![
+        let mut query = vec![
             ("repo".to_string(), slug.to_string()),
             ("type".to_string(), "all".to_string()),
             ("state".to_string(), "open".to_string()),
-            ("label".to_string(), label.to_string()),
+        ];
+        if let Some(label) = label {
+            query.push(("label".to_string(), label.to_string()));
+        }
+        query.extend([
             ("include".to_string(), "body".to_string()),
             ("limit".to_string(), PAGE_LIMIT.to_string()),
             ("after".to_string(), after.to_string()),
-        ];
+        ]);
         let page: ItemsPage = match fetch
             .get("/v1/mirror/items", &query, left.min(client::REQUEST_TIMEOUT))
             .and_then(client::decode)
         {
             Ok(p) => p,
             Err(e) => {
-                log::debug!("forge_mirror: {slug} {label} listing failed ({e}); reading the forge");
+                let what = label.unwrap_or("all-open");
+                log::debug!("forge_mirror: {slug} {what} listing failed ({e}); reading the forge");
                 return (None, Outcome::Error);
             }
         };
@@ -301,17 +321,22 @@ pub fn list_open_via(
 
 /// The REST rows for `items`: open, carrying `label` (the mirror filtered;
 /// this re-checks), each number once, newest first like the REST listing,
-/// and only its first page for [`Pages::First`].
-fn rows_of(items: Vec<client::MirrorItem>, label: &str, pages: Pages) -> Vec<RestIssue> {
+/// and only its first page for [`Pages::First`]. With no label every open
+/// item is kept, oldest first like the unfiltered REST walk.
+fn rows_of(items: Vec<client::MirrorItem>, label: Option<&str>, pages: Pages) -> Vec<RestIssue> {
     let mut rows: Vec<RestIssue> = items
         .iter()
         .filter_map(client::MirrorItem::to_rest)
         .filter(|r| {
             r.state.eq_ignore_ascii_case("open")
-                && r.labels.iter().any(|l| l.eq_ignore_ascii_case(label))
+                && label.is_none_or(|label| r.labels.iter().any(|l| l.eq_ignore_ascii_case(label)))
         })
         .collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.number));
+    if label.is_some() {
+        rows.sort_by_key(|r| std::cmp::Reverse(r.number));
+    } else {
+        rows.sort_by_key(|r| r.number);
+    }
     rows.dedup_by_key(|r| r.number);
     if pages == Pages::First {
         rows.truncate(crate::forge_listing::PER_PAGE);

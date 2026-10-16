@@ -354,3 +354,8 @@ fn version_policy_does_not_execute_the_payload() {
         "evaluate() must refuse BEFORE any git process could exec the payload"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

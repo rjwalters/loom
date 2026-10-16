@@ -61,10 +61,8 @@ pub use post_init::update_gitignore;
 pub use post_init::{is_credential_path, CREDENTIAL_PATTERNS};
 
 // Import the rest for internal use
-use git::{
-    link_dogfood_symlinks, resolve_defaults_path, validate_git_repository,
-    validate_loom_source_repo,
-};
+pub(crate) use git::link_dogfood_symlinks;
+use git::{resolve_defaults_path, validate_git_repository, validate_loom_source_repo};
 
 /// Report of files affected during initialization
 ///

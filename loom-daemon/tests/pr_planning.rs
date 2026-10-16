@@ -384,3 +384,69 @@ esac
     assert!(stderr.contains("Judge fallback guard failed for #123"), "{stderr}");
     assert!(stderr.contains("fixture forge failure"), "{stderr}");
 }
+
+/// #11855: a labeled PR whose Judge passes at its current head and labels
+/// already ended without a verdict is held out of `pr-queue --role judge`;
+/// a new head, an outsider's forged records, or the off switch serve it.
+#[cfg(unix)]
+#[test]
+fn the_judge_backstop_holds_a_pr_whose_passes_ended_without_a_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+    let head = "c".repeat(40);
+    let mut pr = row(7, "autonomous", "loom:review-requested");
+    pr["head"] = serde_json::json!({"sha": head});
+    std::fs::write(root.join("pulls.json"), serde_json::to_vec(&vec![pr]).unwrap()).unwrap();
+    script(
+        &root.join("gh"),
+        r#"
+printf 'HTTP/2 200 OK\r\n\r\n'
+case "$*" in *comments*) cat comments.json;; *) cat pulls.json;; esac
+"#,
+    );
+    let now = chrono::Utc::now();
+    let comments = |sha: &str, login: &str, n: usize| {
+        let body = format!(
+            "<!-- loom:pr-lease-released role=judge host=h sweep=s head={sha} verdict=none \
+             labels=review-requested -->\nPR #7's claim…"
+        );
+        let rows: Vec<_> = (0..n)
+            .map(|i| {
+                let at = now - chrono::Duration::minutes(30 * (i as i64 + 1));
+                serde_json::json!({
+                    "body": body,
+                    "updated_at": at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    "user": {"login": login, "type": "Bot"},
+                    "author_association": "NONE"
+                })
+            })
+            .collect();
+        std::fs::write(root.join("comments.json"), serde_json::to_vec(&rows).unwrap()).unwrap();
+    };
+    let queue = |switch: &str| {
+        let mut cmd = cli(root);
+        cmd.args(["pr-queue", "--role", "judge"])
+            .env("LOOM_GH_BIN", root.join("gh"))
+            .env("LOOM_JUDGE_BACKSTOP", switch);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        (rows.as_array().unwrap().len(), String::from_utf8(out.stderr).unwrap())
+    };
+    let fleet = "loom-fleet-dispatch[bot]";
+    comments(&head, fleet, 3);
+    let (served, stderr) = queue("1");
+    assert_eq!(served, 0, "{stderr}");
+    assert!(stderr.contains("Judge backstop: PR #7 held"), "{stderr}");
+    assert_eq!(queue("0").0, 1, "the off switch serves it");
+    comments(&"d".repeat(40), fleet, 3);
+    assert_eq!(queue("1").0, 1, "records at an older head do not hold the new one");
+    comments(&head, "outsider", 3);
+    assert_eq!(queue("1").0, 1, "an outsider's records are prose");
+}
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -1,11 +1,12 @@
 //! Runtime admission and traced invocation for scheduled roles.
 use super::*;
+use crate::observability::lifecycle::pre_launch;
 
 impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
         let trace_root = self.workspace_root.clone();
-        let (outcome, context) =
-            crate::observability::lifecycle::role_invocation(&trace_root, role, || {
+        let (outcome, context, unlaunched) =
+            crate::observability::lifecycle::role_invocation_classified(&trace_root, role, || {
                 let script = match self.resolve_spawn_bin() {
                     Ok(p) => p,
                     Err(e) => {
@@ -14,6 +15,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                             role,
                             &format!("spawn-bin unresolved: {e}"),
                         );
+                        pre_launch::note(pre_launch::SPAWN_BIN_UNRESOLVED);
                         return RoleTickOutcome::Failure(e);
                     }
                 };
@@ -183,6 +185,8 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // report the chosen tier without re-resolving anything.
                 // 2am#4393: the draw that chose this tap rides the tick's
                 // exported `loom.role_attempt` span (`None` clears it).
+                // #11855: an assigned Judge/Doctor tick's PR rides its span.
+                crate::observability::lifecycle::role_target::note_prompt(role, prompt);
                 crate::observability::lifecycle::role_draw::note_role_draw(
                     admission
                         .as_ref()
@@ -191,7 +195,8 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 );
                 self.resolved_launch = Some(
                     crate::role_tick_telemetry::ResolvedLaunch::new(&model, &effort)
-                        .with_preference(admission.as_ref().and_then(|a| a.preference.clone())),
+                        .with_preference(admission.as_ref().and_then(|a| a.preference.clone()))
+                        .with_prompt_tree(&self.workspace_root),
                 );
                 run_role_with_timeout(
                     &script,
@@ -213,6 +218,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 )
             });
         self.trace_context = context;
+        self.unlaunched_failure = unlaunched;
         outcome
     }
 
@@ -222,5 +228,9 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
 
     fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
         self.trace_context.clone()
+    }
+
+    fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
+        self.unlaunched_failure.clone()
     }
 }

@@ -4,9 +4,9 @@
 #
 # THE FAILURE MODE THIS GUARDS AGAINST
 #
-# champion-issue-promo.md's "Idempotency check" escalates an unrevised,
-# repeatedly-rejected proposal to `loom:operator` once
-# LOOM_MAX_UNREVISED_EVALUATIONS is spent. The epic ladder had exactly two ways
+# champion-issue-promo.md's "Idempotency check" sends an unrevised,
+# already-rejected proposal straight to Step 4's bound (UNREVISED=yes, #11860;
+# a silent-skip tally until then), which escalates to `loom:operator`. The epic ladder had exactly two ways
 # to re-fight a ruling a human had already made on an unchanged item, both
 # fixed there (#7734 / #7921 / #7965) and both still open here until #8245:
 #
@@ -154,7 +154,7 @@ has_unpark_check() {
     grep -qE 'issues/\$ISSUE_NUMBER/timeline' <<<"$block" \
         && grep -qE '\.event == "unlabeled"' <<<"$block" \
         && grep -qE '\.label\.name \| IN\(\$o\[\]\)' <<<"$block" \
-        && grep -qE 'VERDICT_CREATED_AT=.*created_at' <<<"$block" \
+        && grep -qE 'VERDICT_CREATED_AT=.*(created_at|createdAt)' <<<"$block" \
         && grep -qE 'UNPARKED_AT.*>.*VERDICT_CREATED_AT' <<<"$block" \
         && grep -qE '^ *OPERATOR_RULED=yes' <<<"$block"
 }
@@ -197,7 +197,7 @@ SKIP_STREAK=0
 if [ "$ALREADY_ROUTED" = "yes" ]; then
   echo "already routed"
 elif [ "$UNREVISED_EVALS" -ge "${LOOM_MAX_UNREVISED_EVALUATIONS:-2}" ]; then
-  ESCALATE_UNREVISED=yes
+  UNREVISED=yes
 fi
 ```
 EOF
@@ -285,12 +285,13 @@ else
     else
         fail "ALREADY_ROUTED is not derived from HELD_BY"
     fi
-    # The self-healing un-escalation must stay gated on the ONE label it can
-    # remove -- widening its gate would call the script on a loom:blocked park.
-    if grep -qE '^if \[ "\$OPERATOR_PRESENT" = "yes" \]' <<<"$BLOCK"; then
-        pass "the #5664 self-healing un-escalation is gated on OPERATOR_PRESENT, not on the widened ALREADY_ROUTED"
+    # #11861: loom:operator is a no-op for every role, so the #5664
+    # self-healing un-escalation is retired: nothing in the guard may call
+    # --check-unescalate or remove the operator hold.
+    if grep -qE 'check-unescalate|OPERATOR_PRESENT' <<<"$BLOCK"; then
+        fail "the guard still runs the retired self-healing un-escalation (#11861)"
     else
-        fail "the self-healing un-escalation is not gated on OPERATOR_PRESENT"
+        pass "the retired #5664 un-escalation is gone from the guard (#11861)"
     fi
     if grep -qE '^ *OPERATOR_RULED=no' <<<"$BLOCK"; then
         pass "OPERATOR_RULED is initialised alongside the other escalation inputs"
@@ -331,7 +332,7 @@ if [[ -f "$PROMO" ]]; then
     NUMBERED="$(guard_block "$PROMO")"
     ROUTED_LINE="$(grep -E $'\t *(el)?if \\[ "\\$ALREADY_ROUTED" = "yes" \\]' <<<"$NUMBERED" | cut -f1 | tail -n 1)"
     RULED_LINE="$(grep -E $'\t *elif \\[ "\\$OPERATOR_RULED" = "yes" \\]' <<<"$NUMBERED" | cut -f1)"
-    ESC_LINE="$(grep -E $'\t *elif \\[ "\\$UNREVISED_EVALS" -ge ' <<<"$NUMBERED" | cut -f1)"
+    ESC_LINE="$(grep -E $'\t *UNREVISED=yes' <<<"$NUMBERED" | cut -f1)"
     RULED_LINE="${RULED_LINE%%$'\n'*}"; ESC_LINE="${ESC_LINE%%$'\n'*}"
     if [[ -n "$ROUTED_LINE" && -n "$RULED_LINE" && -n "$ESC_LINE" ]]; then
         if (( ROUTED_LINE < RULED_LINE && RULED_LINE < ESC_LINE )); then
@@ -340,10 +341,10 @@ if [[ -f "$PROMO" ]]; then
             fail "branch order wrong: routed=$ROUTED_LINE ruled=$RULED_LINE escalate=$ESC_LINE"
         fi
         RULED_BODY="$(awk -F'\t' -v s="$RULED_LINE" -v e="$ESC_LINE" '$1 > s && $1 < e { print $2 }' <<<"$NUMBERED")"
-        if grep -qE 'ESCALATE_UNREVISED=yes|--method PATCH|--add-label|gh issue comment' <<<"$RULED_BODY"; then
+        if grep -qE '^ *UNREVISED=yes|--method PATCH|--add-label|gh issue comment' <<<"$RULED_BODY"; then
             fail "the OPERATOR_RULED branch tallies, comments, labels, or escalates:"$'\n'"$RULED_BODY"
         else
-            pass "the OPERATOR_RULED branch only logs and ends the pass (no tally, no comment, no label, no escalation)"
+            pass "the OPERATOR_RULED branch only logs (no comment, no label, no escalation; Step 1 re-evaluates)"
         fi
     else
         fail "could not locate all three branches (routed=$ROUTED_LINE ruled=$RULED_LINE escalate=$ESC_LINE)"
@@ -402,6 +403,13 @@ STUB
 # $LOOM_TEST_OLD_DAEMON is set, so the guard's literal fallback is exercised.
 cat >"$RUN_DIR/bin/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
+# The guard reads comments through `forge trusted-comments` (#9548, #11860);
+# every fixture comment here is trusted (the forged case is
+# test-champion-terminal-verdicts.sh's).
+if [ "${1:-} ${2:-}" = "forge trusted-comments" ]; then
+  if [[ " $* " == *" --gh-shape "* ]]; then exec jq '.comments' "$LOOM_TEST_FIX/issue.json"; fi
+  exec cat "$LOOM_TEST_FIX/rest-comments.json"
+fi
 [ -n "${LOOM_TEST_OLD_DAEMON:-}" ] && { echo "error: unexpected argument '--with-retired'" >&2; exit 2; }
 if [ "$1 $2 $3" = "labels list --property" ] && [ "${5:-}" = "--with-retired" ] && [ -f "$LOOM_TEST_RUN/registry-$4" ]; then
   exec cat "$LOOM_TEST_RUN/registry-$4"
@@ -432,7 +440,7 @@ extract_runnable() {
         echo 'echo "RESULT BODY_HASH=${BODY_HASH:-}"'
         echo 'echo "RESULT ALREADY_ROUTED=${ALREADY_ROUTED:-}"'
         echo 'echo "RESULT OPERATOR_RULED=${OPERATOR_RULED:-}"'
-        echo 'echo "RESULT ESCALATE_UNREVISED=${ESCALATE_UNREVISED:-}"'
+        echo 'echo "RESULT UNREVISED=${UNREVISED:-}"'
         echo 'echo "RESULT FORCE_REEVALUATE=${FORCE_REEVALUATE:-}"'
     } >"$RUN_DIR/guard.sh"
 }
@@ -482,8 +490,8 @@ else
     fi
 
     VMARK="<!-- champion:proposal-verdict:body-$BODY_HASH -->"
-    # A verdict comment at the cap: 1 posted rejection + 1 recorded skip = 2.
-    VBODY="$VMARK\nChampion Review: NEEDS REVISION\n<!-- champion:unrevised-skips:$BODY_HASH:1 -->"
+    # A verdict comment on THIS body: an unchanged body goes straight to Step 4.
+    VBODY="$VMARK\nChampion Review: NEEDS REVISION"
     VERDICT_TS="2026-09-16T12:00:00Z"
     VIEW_COMMENTS="$(jq -nc --arg b "$(printf '%b' "$VBODY")" --arg t "$VERDICT_TS" \
         '[{body:$b, createdAt:$t}]')"
@@ -498,10 +506,10 @@ else
     make_fixture "$F" '[]' "$VIEW_COMMENTS" "$TL_UNPARK" "$REST_COMMENTS" 1
     OUT="$(run_guard "$F")"
     if [[ "$(result_of "$OUT" OPERATOR_RULED)" == "yes" \
-       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+       && "$(result_of "$OUT" UNREVISED)" == "no" ]]; then
         pass "4a: an operator un-park newer than this revision's verdict sets OPERATOR_RULED=yes and does NOT escalate"
     else
-        fail "4a: expected OPERATOR_RULED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+        fail "4a: expected OPERATOR_RULED=yes / UNREVISED=no, got:"$'\n'"$OUT"
     fi
 
     # --- 4b. Never touched by a human -> the N=2 ladder still fires.
@@ -509,10 +517,10 @@ else
     make_fixture "$F" '[]' "$VIEW_COMMENTS" '[]' "$REST_COMMENTS" 1
     OUT="$(run_guard "$F")"
     if [[ "$(result_of "$OUT" OPERATOR_RULED)" == "no" \
-       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "yes" ]]; then
-        pass "4b: an unrevised proposal no human ever touched still escalates once the skip budget is spent"
+       && "$(result_of "$OUT" UNREVISED)" == "yes" ]]; then
+        pass "4b: an unrevised proposal no human ever touched goes straight to Step 4's bound (no silent skip, #11860)"
     else
-        fail "4b: expected OPERATOR_RULED=no / ESCALATE_UNREVISED=yes, got:"$'\n'"$OUT"
+        fail "4b: expected OPERATOR_RULED=no / UNREVISED=yes, got:"$'\n'"$OUT"
     fi
 
     # --- 4c. The bot's OWN un-escalation must not masquerade as a human ruling.
@@ -523,22 +531,23 @@ else
     make_fixture "$F" '[]' "$BOT_COMMENTS" "$TL_UNPARK" "$REST_COMMENTS" 1
     OUT="$(run_guard "$F")"
     if [[ "$(result_of "$OUT" OPERATOR_RULED)" == "no" \
-       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "yes" ]]; then
+       && "$(result_of "$OUT" UNREVISED)" == "yes" ]]; then
         pass "4c: an un-park recorded by Champion's own un-escalation marker is NOT read as a human ruling"
     else
-        fail "4c: expected OPERATOR_RULED=no / ESCALATE_UNREVISED=yes, got:"$'\n'"$OUT"
+        fail "4c: expected OPERATOR_RULED=no / UNREVISED=yes, got:"$'\n'"$OUT"
     fi
 
-    # --- 4d. A failed verdict re-read (no created_at) fails OPEN, not closed.
-    REST_NO_TS="$(jq -nc --arg b "$(printf '%b' "$VBODY")" '[{id:99, body:$b}]')"
+    # --- 4d. An unknown verdict time (no createdAt on the held trusted comment,
+    # #11902: there is no second read any more) fails OPEN, not closed.
+    VIEW_NO_TS="$(jq -nc --arg b "$(printf '%b' "$VBODY")" '[{body:$b}]')"
     F="$RUN_DIR/fix/no-verdict-ts"
-    make_fixture "$F" '[]' "$VIEW_COMMENTS" "$TL_UNPARK" "$REST_NO_TS" 1
+    make_fixture "$F" '[]' "$VIEW_NO_TS" "$TL_UNPARK" "$REST_COMMENTS" 1
     OUT="$(run_guard "$F")"
     if [[ "$(result_of "$OUT" OPERATOR_RULED)" == "no" \
-       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "yes" ]]; then
-        pass "4d: an empty VERDICT_CREATED_AT (failed REST re-read) fails open — the ladder is not stood down on an API hiccup"
+       && "$(result_of "$OUT" UNREVISED)" == "yes" ]]; then
+        pass "4d: an empty VERDICT_CREATED_AT (unknown verdict time) fails open — the ladder is not stood down on it"
     else
-        fail "4d: expected OPERATOR_RULED=no / ESCALATE_UNREVISED=yes, got:"$'\n'"$OUT"
+        fail "4d: expected OPERATOR_RULED=no / UNREVISED=yes, got:"$'\n'"$OUT"
     fi
 
     # --- 4e. An operator's loom:blocked park holds the pass before any tally.
@@ -546,10 +555,10 @@ else
     make_fixture "$F" '[{"name":"loom:blocked"}]' "$VIEW_COMMENTS" '[]' "$REST_COMMENTS" 1
     OUT="$(run_guard "$F")"
     if [[ "$(result_of "$OUT" ALREADY_ROUTED)" == "yes" \
-       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+       && "$(result_of "$OUT" UNREVISED)" == "no" ]]; then
         pass "4e: a loom:blocked park sets ALREADY_ROUTED=yes and stops the pass before the escalation branch"
     else
-        fail "4e: expected ALREADY_ROUTED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+        fail "4e: expected ALREADY_ROUTED=yes / UNREVISED=no, got:"$'\n'"$OUT"
     fi
 
     # --- 4f. POSITIVE direction of the bot-vs-human attribution comparison
@@ -564,10 +573,10 @@ else
     make_fixture "$F" '[]' "$BOT_COMMENTS" "$TL_HUMAN_AFTER_BOT" "$REST_COMMENTS" 1
     OUT="$(run_guard "$F")"
     if [[ "$(result_of "$OUT" OPERATOR_RULED)" == "yes" \
-       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+       && "$(result_of "$OUT" UNREVISED)" == "no" ]]; then
         pass "4f: a human un-park strictly newer than a prior bot un-escalation marker sets OPERATOR_RULED=yes and does NOT escalate"
     else
-        fail "4f: expected OPERATOR_RULED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+        fail "4f: expected OPERATOR_RULED=yes / UNREVISED=no, got:"$'\n'"$OUT"
     fi
 
     # --- 4g/4h. #11795 transition: a proposal carrying ONLY a retired hold
@@ -579,10 +588,10 @@ else
         make_fixture "$F" "[{\"name\":\"$retired\"}]" "$VIEW_COMMENTS" '[]' "$REST_COMMENTS" 1
         OUT="$(run_guard "$F")"
         if [[ "$(result_of "$OUT" ALREADY_ROUTED)" == "yes" \
-           && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+           && "$(result_of "$OUT" UNREVISED)" == "no" ]]; then
             pass "4g: only $retired (unmigrated) sets ALREADY_ROUTED=yes and does NOT escalate"
         else
-            fail "4g: only $retired: expected ALREADY_ROUTED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+            fail "4g: only $retired: expected ALREADY_ROUTED=yes / UNREVISED=no, got:"$'\n'"$OUT"
         fi
     done
 
@@ -594,10 +603,10 @@ else
     make_fixture "$F" '[]' "$VIEW_COMMENTS" "$TL_RETIRED_UNPARK" "$REST_COMMENTS" 1
     OUT="$(run_guard "$F")"
     if [[ "$(result_of "$OUT" OPERATOR_RULED)" == "yes" \
-       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+       && "$(result_of "$OUT" UNREVISED)" == "no" ]]; then
         pass "4i: removing an unmigrated loom:operator-only after the rejection sets OPERATOR_RULED=yes"
     else
-        fail "4i: expected OPERATOR_RULED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+        fail "4i: expected OPERATOR_RULED=yes / UNREVISED=no, got:"$'\n'"$OUT"
     fi
 
     # --- 4j. A daemon too old for --with-retired: the literal fallback still
@@ -606,10 +615,10 @@ else
     make_fixture "$F" '[{"name":"loom:operator"}]' "$VIEW_COMMENTS" '[]' "$REST_COMMENTS" 1
     OUT="$(LOOM_TEST_OLD_DAEMON=1 run_guard "$F")"
     if [[ "$(result_of "$OUT" ALREADY_ROUTED)" == "yes" \
-       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+       && "$(result_of "$OUT" UNREVISED)" == "no" ]]; then
         pass "4j: with an older daemon the fallback hold set still routes a loom:operator proposal"
     else
-        fail "4j: expected ALREADY_ROUTED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+        fail "4j: expected ALREADY_ROUTED=yes / UNREVISED=no, got:"$'\n'"$OUT"
     fi
 fi
 

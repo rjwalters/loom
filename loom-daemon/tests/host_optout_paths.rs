@@ -2,6 +2,9 @@
 //! re-provision path. Each test drives the real `loom-daemon` binary against a
 //! temp HOME / marker, never the machine-level Loom dir.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -37,6 +40,7 @@ impl Host {
             .env_remove("LOOM_MACHINE_CHECKOUT")
             .env_remove("LOOM_WORKSPACE")
             .env_remove("LOOM_DAEMON_SUPERVISOR");
+        common::deny_real_gh(&mut c);
         c
     }
     fn run(&self, args: &[&str]) -> Output {
@@ -243,3 +247,8 @@ fn installer_refuses() {
     assert_refused(&o);
     assert!(!target.join(".loom").exists(), "installer must have no side effects");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

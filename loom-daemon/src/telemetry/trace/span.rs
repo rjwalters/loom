@@ -65,6 +65,11 @@ pub enum SpanName {
     /// tick's [`Self::DispatchTick`] span when the tick is still known.
     #[serde(rename = "loom.dispatch.disposition")]
     DispatchDisposition,
+    /// One step spawn attempt by the step engine (Issue #11906): repo, item,
+    /// role, admission result and reason, draw attempt, `age_source` and
+    /// whether it resumed. Its own root trace.
+    #[serde(rename = "loom.dispatch.step")]
+    DispatchStep,
     /// One `gh` invocation through the `gh_invocation` facade (Issue #9985):
     /// the client-side "caller operation" span of the forge egress trace
     /// tree. A child of the caller's execution when it has one, else its own
@@ -131,6 +136,7 @@ impl SpanName {
             Self::PoolHold => "loom.pool.hold",
             Self::DispatchAdmission => "loom.dispatch.admission",
             Self::DispatchDisposition => "loom.dispatch.disposition",
+            Self::DispatchStep => "loom.dispatch.step",
             Self::GithubInvoke => "invoke github",
             Self::RateLimitTrip => "loom.ratelimit.trip",
             Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
@@ -206,6 +212,8 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.story.key_version"
                     | "loom.issue"
                     | "loom.pr_number"
+                    | "loom.base_sha"
+                    | "loom.head_sha"
                     | "loom.role"
                     | "loom.phase"
                     | "loom.attempt"

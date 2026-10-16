@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-champion-pr-merge-hold-release.sh - #11416: a human removing
-# `loom:operator` releases a Champion merge-risk hold, and a hold is never left
+# `loom:blocked` releases a Champion merge-risk hold, and a hold is never left
 # as plain `loom:pr`, unmerged and invisible.
 #
 # Extract-and-execute (#7979), not a mirror: the SHIPPED bash blocks are lifted
@@ -80,10 +80,13 @@ printf '%s\n' '#!/usr/bin/env bash' 'echo "POST $*" >>"$STUB_LOG"' >"$WORK/.loom
 chmod +x "$WORK/.loom/scripts/post-comment.sh"
 
 # ---- forge stubs ------------------------------------------------------------
-# FIX_PR       gh pr view --json commits,labels,headRefOid payload
-# FIX_COMMENTS loom-daemon forge trusted-comments --gh-shape payload
+# FIX_PR       the "0. PR facts" payload (commits, labels, headRefOid; #12242)
+# FIX_COMMENTS its trusted comments (loom-daemon forge trusted-comments --gh-shape)
 # FIX_EVENTS   issues/N/events payload; FIX_EVENTS_FAIL=1 makes the read fail
 # FIX_LIST     gh pr list payload for the census
+git() { [[ "$*" == "rev-parse --git-common-dir" ]] && echo "$WORK"; }
+# Write the "0. PR facts" file the precheck reads, from FIX_PR + FIX_COMMENTS.
+write_facts() { jq --argjson c "$FIX_COMMENTS" '.comments = $c' <<<"$FIX_PR" >"$WORK/loom-champion-facts-pr-$1.json"; }
 gh() {
     case "$1 $2" in
         "pr view") printf '%s\n' "$FIX_PR" ;;
@@ -101,6 +104,8 @@ gh() {
     esac
 }
 loom-daemon() {
+    # #11861: the hold label is loom:blocked, applied with its park record.
+    [[ "$1 $2" == "park-record apply" ]] && { echo "PARK $*" >>"$STUB_LOG"; return 0; }
     [[ "$1 $2 $3" == "forge trusted-comments --fetch" ]] || { echo "unexpected loom-daemon: $*" >&2; return 99; }
     printf '%s\n' "$FIX_COMMENTS"
 }
@@ -116,7 +121,7 @@ gh_read() {
         *) echo "unexpected GH_READ call: $*" >&2; return 99 ;;
     esac
 }
-export -f gh loom-daemon gh_read
+export -f git gh loom-daemon gh_read
 
 HOLD_AT="2026-10-09T08:53:41Z"
 HOLD_HEAD="d4ea576427e62a710459ab601250e462993c19b7"
@@ -133,7 +138,7 @@ pr_json() { # <head> <labels...>
 }
 unlabeled_event() { # <created_at> [actor-login] [actor-type]
     jq -n --arg at "$1" --arg who "${2:-rjwalters}" --arg type "${3:-User}" '[{event: "labeled", label: {name: "loom:pr"}, actor: {login: "judge"}, created_at: "2026-10-08T00:00:00Z"},
-                          {event: "unlabeled", label: {name: "loom:operator"}, actor: {login: $who, type: $type}, created_at: $at}]'
+                          {event: "unlabeled", label: {name: ($ENV.UNLABELED // "loom:blocked")}, actor: {login: $who, type: $type}, created_at: $at}]'
 }
 
 # Run the extracted precheck once; print the decision variables and the stub log.
@@ -142,6 +147,7 @@ run_precheck() {
         cd "$WORK" || exit 1
         export STUB_LOG="$WORK/log"; : >"$STUB_LOG"
         PR_NUMBER=10280
+        write_facts "$PR_NUMBER"
         for _once in 1; do eval "$PRECHECK" >/dev/null 2>&1; done
         echo "BLOCKED=$MERGE_BLOCKED_BY_HOLD PRIOR=$PRIOR_HOLD MANUAL=${MANUAL_RELEASE_SINCE_HOLD:-} REASON=${RELEASE_REASON:-}"
         cat "$STUB_LOG"
@@ -156,6 +162,7 @@ run_hold_behavior() {
         export STUB_LOG="$WORK/log"; : >"$STUB_LOG"
         PR_NUMBER=10280
         GH_READ=gh_read
+        write_facts "$PR_NUMBER"
         for _once in 1; do eval "$PRECHECK" >/dev/null 2>&1; done
         MERGE_BLOCKED_BY_HOLD=false   # axes judged red this tick -> Hold behavior runs
         local block
@@ -197,34 +204,34 @@ OUT=$(run_precheck)
 assert_contains "$OUT" "BLOCKED=false PRIOR=false" "no prior hold, nothing blocks"
 echo
 
-echo "Test 3: REGRESSION — hold + loom:operator present + head unchanged -> still blocked"
-FIX_PR=$(pr_json "$HOLD_HEAD" loom:pr loom:operator); FIX_COMMENTS="[$HOLD_COMMENT]"
+echo "Test 3: REGRESSION — hold + loom:blocked present + head unchanged -> still blocked"
+FIX_PR=$(pr_json "$HOLD_HEAD" loom:pr loom:blocked); FIX_COMMENTS="[$HOLD_COMMENT]"
 OUT=$(run_precheck)
 assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false REASON=" "sticky hold binds"
 assert_lacks "$OUT" "EDIT" "no label write on a correctly-labelled sticky hold"
 echo
 
-echo "Test 4: THE #10280 SHAPE — hold + loom:operator removed by a human + head unchanged -> released (e)"
+echo "Test 4: THE #10280 SHAPE — hold + loom:blocked removed by a human + head unchanged -> released (e)"
 FIX_PR=$(pr_json "$HOLD_HEAD" loom:pr); FIX_EVENTS=$(unlabeled_event "2026-10-10T12:00:00Z")
 OUT=$(run_precheck)
 assert_contains "$OUT" "BLOCKED=false" "the hold no longer blocks the merge"
 assert_contains "$OUT" "MANUAL=true" "MANUAL_RELEASE_SINCE_HOLD is set"
-assert_contains "$OUT" 'REASON=`loom:operator` removed by rjwalters at 2026-10-10T12:00:00Z' "RELEASE_REASON names who removed it and when"
-assert_lacks "$OUT" "EDIT" "loom:operator is not put back"
+assert_contains "$OUT" 'REASON=the hold label removed by rjwalters at 2026-10-10T12:00:00Z' "RELEASE_REASON names who removed it and when"
+assert_lacks "$OUT" "EDIT" "loom:blocked is not put back"
 echo
 
 echo "Test 5: label absent but the only removal PREDATES the hold -> not a release; label repaired"
 FIX_EVENTS=$(unlabeled_event "2026-10-01T00:00:00Z")
 OUT=$(run_precheck)
 assert_contains "$OUT" "BLOCKED=true" "still held"
-assert_contains "$OUT" "EDIT pr edit 10280 --add-label loom:operator" "loom:operator restored, so the census counts it"
+assert_contains "$OUT" "PARK park-record apply --pr 10280 --reason champion merge-risk hold --by champion" "loom:blocked restored, so the census counts it"
 echo
 
 echo "Test 6: label absent, no unlabeled event at all (failed --add-label on the hold tick) -> repaired, not released"
 FIX_EVENTS='[]'
 OUT=$(run_precheck)
 assert_contains "$OUT" "BLOCKED=true" "a missing label alone is never a release"
-assert_contains "$OUT" "EDIT pr edit 10280 --add-label loom:operator" "label repaired"
+assert_contains "$OUT" "PARK park-record apply --pr 10280 --reason champion merge-risk hold --by champion" "label repaired"
 echo
 
 echo "Test 7: label absent, events read FAILS -> held this pass, and no label write over a possible human removal"
@@ -241,18 +248,41 @@ for bot in 'loom-fleet-dispatch[bot] Bot' 'loom-fleet-dispatch[bot] User' 'loom-
     FIX_EVENTS=$(unlabeled_event "2026-10-10T12:00:00Z" "$login" "$type")
     OUT=$(run_precheck)
     assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false" "removal by $login ($type) does not release the hold"
-    assert_contains "$OUT" "EDIT pr edit 10280 --add-label loom:operator" "label repaired after $login ($type) removal"
+    assert_contains "$OUT" "PARK park-record apply --pr 10280 --reason champion merge-risk hold --by champion" "label repaired after $login ($type) removal"
 done
 echo
 
 echo "Test 7c: removal with unidentified actor (null actor, missing/empty login or type) -> not a release; repaired"
 for actor in 'null' '{"type":"User"}' '{"login":"","type":"User"}' '{"login":"rjwalters"}'; do
     FIX_EVENTS=$(jq -n --argjson a "$actor" '[{event: "labeled", label: {name: "loom:pr"}, actor: {login: "judge"}, created_at: "2026-10-08T00:00:00Z"},
-                          {event: "unlabeled", label: {name: "loom:operator"}, actor: $a, created_at: "2026-10-10T12:00:00Z"}]')
+                          {event: "unlabeled", label: {name: ($ENV.UNLABELED // "loom:blocked")}, actor: $a, created_at: "2026-10-10T12:00:00Z"}]')
     OUT=$(run_precheck)
     assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false" "unidentified actor $actor does not release the hold"
-    assert_contains "$OUT" "EDIT pr edit 10280 --add-label loom:operator" "label repaired for actor $actor"
+    assert_contains "$OUT" "PARK park-record apply --pr 10280 --reason champion merge-risk hold --by champion" "label repaired for actor $actor"
 done
+echo
+
+echo "Test 7b: a human removal of the pre-#11861 loom:operator still releases (#11861)"
+FIX_PR=$(pr_json "$HOLD_HEAD" loom:pr); FIX_COMMENTS="[$HOLD_COMMENT]"
+FIX_EVENTS=$(UNLABELED=loom:operator unlabeled_event "2026-10-10T12:00:00Z")
+OUT=$(run_precheck)
+assert_contains "$OUT" "MANUAL=true" "a legacy loom:operator removal is release (e)"
+echo
+
+echo "Test 7c: a loom:operator removal AFTER the capped-hold recommendation clears the inbox, not the hold (#11905)"
+REC_COMMENT=$(jq -n '{author: {login: "loom-fleet-dispatch"}, body: "<!-- champion:capped-hold-recommendation -->\nreview it", createdAt: "2026-10-10T06:00:00Z"}')
+FIX_COMMENTS="[$HOLD_COMMENT, $REC_COMMENT]"
+FIX_EVENTS=$(UNLABELED=loom:operator unlabeled_event "2026-10-10T12:00:00Z")
+OUT=$(run_precheck)
+assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false" "the inbox clearing is not release (e)"
+assert_contains "$OUT" "PARK park-record apply --pr 10280 --reason champion merge-risk hold --by champion" "the missing loom:blocked is repaired instead"
+FIX_EVENTS=$(unlabeled_event "2026-10-10T12:00:00Z")
+OUT=$(run_precheck)
+assert_contains "$OUT" "MANUAL=true" "a human loom:blocked removal still releases after the recommendation"
+FIX_EVENTS=$(UNLABELED=loom:operator unlabeled_event "2026-10-10T03:00:00Z")
+OUT=$(run_precheck)
+assert_contains "$OUT" "MANUAL=true" "a loom:operator removal before the recommendation still releases"
+FIX_COMMENTS="[$HOLD_COMMENT]"
 echo
 
 echo "Test 8: head moved AND label removed -> (c) is the reason, MANUAL still set for the outcome rule"
@@ -266,22 +296,22 @@ FIX_PR=$(pr_json "$HOLD_HEAD" loom:pr)
 OUT=$(run_hold_behavior "$BULLET")
 assert_contains "$OUT" "BLOCKED=false" "not blocked: merges via Step 2 with the reversal block"
 assert_lacks "$OUT" "POST" "no hold notice"
-assert_lacks "$OUT" "EDIT" "loom:operator not reasserted"
+assert_lacks "$OUT" "EDIT" "loom:blocked not reasserted"
 echo
 
 echo "Test 10: Hold behavior — human release + NEW concern -> fresh notice despite the existing marker, label back"
 OUT=$(run_hold_behavior '- **Kept set (merge gate)**: edits `merge-pr.sh` verdict guard.')
 assert_contains "$OUT" "BLOCKED=true" "held"
 assert_contains "$OUT" "POST 10280 --pr --body" "a fresh hold notice is posted, so the next removal releases THIS concern"
-assert_contains "$OUT" "EDIT pr edit 10280 --add-label loom:operator" "loom:operator reapplied"
+assert_contains "$OUT" "PARK park-record apply --pr 10280 --reason champion merge-risk hold --by champion" "loom:blocked reapplied"
 echo
 
 echo "Test 11: Hold behavior — no human release, marker on record -> notice suppressed, label reasserted"
-FIX_PR=$(pr_json "abcdef1234567890" loom:pr loom:operator)
+FIX_PR=$(pr_json "abcdef1234567890" loom:pr loom:blocked)
 OUT=$(run_hold_behavior "$BULLET")
 assert_contains "$OUT" "BLOCKED=true" "held"
 assert_lacks "$OUT" "POST" "idempotency guard suppresses the repeat notice"
-assert_contains "$OUT" "EDIT pr edit 10280 --add-label loom:operator" "label reasserted"
+assert_contains "$OUT" "PARK park-record apply --pr 10280 --reason champion merge-risk hold --by champion" "label reasserted"
 echo
 
 echo "Test 12: census lists hand-released, unmerged holds (merge-risk and critical-file), not quoted markers"

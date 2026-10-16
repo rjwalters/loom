@@ -3,9 +3,10 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod auto_update;
-mod backlog_level;
 mod checkout_external_change;
 mod ci;
+mod daemon_event;
+mod daemon_exit;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
@@ -18,10 +19,14 @@ mod ops;
 mod outcome_facts;
 mod pass;
 mod pick_decision;
+mod prompt_tree;
 mod role_draw;
+mod scope_memory;
 mod session_output;
 mod token_ranking;
+mod tokens_snapshot;
 mod work_started;
+mod write_scope_refused;
 
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
@@ -340,7 +345,21 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(gated_pool) = &r.gated_pool {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
+            // #12028: why a failed tick failed, from the closed vocabulary only.
+            if let Some(class) = &r.failure_class {
+                attributes
+                    .push(kv_string(crate::observability::lifecycle::FAILURE_CLASS, class.clone()));
+            }
             attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
+            // #11989: the prompt tree the session ran.
+            attributes.extend(prompt_tree::attributes(r.prompt.as_ref()));
+            // #11906: a step-engine step, never a role-runner tick.
+            if let Some(source) = &r.source {
+                attributes.push(kv_string("loom.role_tick.source", source.clone()));
+            }
+            if let Some(sweep_id) = &r.sweep_id {
+                attributes.push(kv_string("loom.sweep_id", sweep_id.clone()));
+            }
             if let Some(models) = metadata::models(r.models_used.as_deref()) {
                 attributes.push(models);
             }
@@ -534,10 +553,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // already-reviewed, small, operator-facing JSON (never
             // free-form transcript content), so it is carried whole as one
             // compact-JSON string attribute rather than re-typed per topic.
-            let attributes = vec![
-                kv_string("loom.topic", r.topic.clone()),
-                kv_string("loom.payload", serde_json::to_string(&r.payload).unwrap_or_default()),
-            ];
+            // #12230: listed payload scalars also ride typed.
+            let attributes = daemon_event::attributes(r);
             (
                 "daemon.event",
                 SeverityNumber::Info,
@@ -596,7 +613,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SessionOutput(_)
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
-        | TelemetryRecord::BacklogLevel(_)
+        | TelemetryRecord::WriteScopeRefused(_)
+        | TelemetryRecord::DaemonExit(_)
+        | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
@@ -611,7 +630,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
-                .or_else(|| backlog_level::log_parts(r))?;
+                .or_else(|| daemon_exit::log_parts(r))
+                .or_else(|| scope_memory::log_parts(r))
+                .or_else(|| write_scope_refused::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
@@ -840,6 +861,38 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     time_unix_nano,
                 });
             }
+            // Cgroup-derived agent-scope census (#12166). Aggregate gauges only
+            // (per-scope names would be unbounded label cardinality); the
+            // per-scope detail rides on the host.health record itself. Absent
+            // when the agents slice was unreadable, never a fabricated zero.
+            if let Some(total) = r.agent_scopes_total {
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes",
+                    "Live loom-agent-* cgroup scopes on this host, registry-independent.",
+                    "{scope}",
+                    number_data_point::Value::AsInt(i64::from(total)),
+                    time_unix_nano,
+                ));
+                let orphans: Vec<_> = r.agent_scopes.iter().filter(|s| !s.agent_alive).collect();
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes_orphaned",
+                    "Listed agent scopes with no agent process left (residue).",
+                    "{scope}",
+                    number_data_point::Value::AsInt(
+                        i64::try_from(orphans.len()).unwrap_or(i64::MAX),
+                    ),
+                    time_unix_nano,
+                ));
+                if let Some(age) = orphans.iter().filter_map(|s| s.age_sec).max() {
+                    samples.push(memory_gauge(
+                        "loom.host.agent_scope_orphan_max_age_seconds",
+                        "Age of the oldest orphaned agent scope.",
+                        "s",
+                        number_data_point::Value::AsInt(i64::try_from(age).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+            }
             if let Some(cpu_idle_fraction) = r.cpu_idle_fraction {
                 samples.push(MetricSample {
                     name: "loom.host.cpu_idle_fraction",
@@ -980,49 +1033,7 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             }
             samples
         }
-        TelemetryRecord::TokensSnapshot(r) => {
-            let mut samples = Vec::new();
-            for account in &r.accounts {
-                let mut attributes = vec![
-                    kv_string("account", account.account.clone()),
-                    kv_string("provider", account.provider.clone()),
-                ];
-                if let Some(rank) = account.rank {
-                    attributes.push(kv_int("rank", i64::from(rank)));
-                }
-                if let Some(usage_fraction) = account.usage_fraction {
-                    samples.push(MetricSample {
-                        name: "loom.tokens.usage_fraction",
-                        description: "Fraction of the current limit window consumed (0..1).",
-                        unit: "1",
-                        attributes: attributes.clone(),
-                        value: number_data_point::Value::AsDouble(usage_fraction),
-                        time_unix_nano,
-                    });
-                }
-                // Issue #9005: the rolling 7-day axis beside the 5h one. Same
-                // absent-not-zero rule — no source, no series.
-                if let Some(weekly) = account.usage_fraction_weekly {
-                    samples.push(MetricSample {
-                        name: "loom.tokens.usage_fraction_weekly",
-                        description: "Fraction of the rolling 7-day limit window consumed (0..1).",
-                        unit: "1",
-                        attributes: attributes.clone(),
-                        value: number_data_point::Value::AsDouble(weekly),
-                        time_unix_nano,
-                    });
-                }
-                samples.push(MetricSample {
-                    name: "loom.tokens.exhausted",
-                    description: "Whether the account is currently excluded from the usable pool (1 = exhausted).",
-                    unit: "1",
-                    attributes,
-                    value: number_data_point::Value::AsInt(i64::from(account.exhausted)),
-                    time_unix_nano,
-                });
-            }
-            samples
-        }
+        TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),
         // Every kind that is not declared `otlp: Gauges` in
         // `telemetry/kinds.rs` produces no gauge here:
         //   - every lifecycle-shaped kind — including `role_tick.outcome`

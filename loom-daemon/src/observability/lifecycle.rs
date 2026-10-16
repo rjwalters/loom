@@ -795,6 +795,7 @@ pub fn prepare_execution(
     root: &Path,
     execution: &str,
     story: Option<&super::tracing::StoryRef>,
+    issue: Option<u32>,
 ) {
     // The root carries its own ID-derivation inputs (repo + sweep id) and the
     // installed prompt surface the child is about to run.
@@ -814,6 +815,14 @@ pub fn prepare_execution(
         );
     } else {
         metadata.insert("loom.repo".into(), TraceStore::repo_attribute(root));
+        // #11982: the issue is a plain fact even when `repo_id` did not
+        // resolve and no story trace exists.
+        if let Some(issue) = issue {
+            metadata.insert("loom.issue".into(), issue.to_string());
+        }
+    }
+    if let Some(base) = git_facts::base_sha(root) {
+        metadata.insert(git_facts::BASE_SHA.into(), base);
     }
     if let Some(span) = begin(root, execution, SpanName::Sweep, metadata) {
         span.command(command);
@@ -853,6 +862,18 @@ pub fn finish_execution(
             TraceAttributes::new()
         };
         attrs.extend(host.clone());
+        // #11982: the issue branch tip as of the close; the branch does not
+        // exist at dispatch, so the root cannot carry it earlier.
+        if root_span {
+            if let Some(head) = active
+                .record
+                .attributes
+                .get("loom.issue")
+                .and_then(|issue| git_facts::head_sha(root, issue))
+            {
+                attrs.insert(git_facts::HEAD_SHA.into(), head);
+            }
+        }
         attrs
             .insert("loom.result".into(), if observed { result } else { "exit_unobserved" }.into());
         if !observed {
@@ -1009,6 +1030,29 @@ fn recover_orphans(journal: &Journal) {
     roll_interruption::recover(journal, &mut roll_interruption::Records::at(None));
 }
 
+/// Whether `journal` is a step's execution whose step is still running
+/// (#12253). A step's leader can exit while its process group keeps running
+/// the session, and the journal's owner pid sees only the leader, so orphan
+/// recovery asks the step's claim lock before closing its `loom.sweep` span.
+/// The step's own end closes it ([`crate::sweep_registry::step_spawn::span`]).
+fn running_step(root: &Path, journal: &Journal) -> bool {
+    let Ok(active) = journal.active() else {
+        return false;
+    };
+    step_sweep_id(&active)
+        .is_some_and(|id| crate::sweep_registry::step_spawn::span::step_still_running(root, id))
+}
+
+/// The sweep id on a journal's open `loom.sweep` root, when it names a step.
+fn step_sweep_id(active: &[ActiveSpan]) -> Option<&str> {
+    active
+        .iter()
+        .filter(|span| span.record.name == SpanName::Sweep)
+        .find_map(|span| span.record.attributes.get("loom.sweep_id"))
+        .map(String::as_str)
+        .filter(|id| crate::step_role::StepRole::parse_sweep_id(id).is_some())
+}
+
 pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
     if !super::tracing::enabled(root) {
         return 0;
@@ -1024,7 +1068,9 @@ pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
             continue;
         }
         let journal = Journal::from_path(path);
-        roll_interruption::recover(&journal, &mut rolls);
+        if !running_step(root, &journal) {
+            roll_interruption::recover(&journal, &mut rolls);
+        }
         match journal.drain(|span| {
             let context = span.context.clone();
             let mut envelope = TelemetryEnvelope::new(
@@ -1161,10 +1207,25 @@ pub fn role_invocation(
     role: &str,
     invoke: impl FnOnce() -> crate::role_runner::RoleTickOutcome,
 ) -> (crate::role_runner::RoleTickOutcome, Option<RoleTrace>) {
+    let (outcome, trace, _) = role_invocation_classified(root, role, invoke);
+    (outcome, trace)
+}
+
+/// [`role_invocation`], also returning why a tick that failed **before** its
+/// launch failed (#12028). That tick journals no span, so the class its site
+/// noted would otherwise be dropped; it rides back here for the
+/// `role_tick.outcome` record. `None` for a launched tick (its class is on
+/// [`RoleTrace::failure`]) and for any outcome that is not a failure.
+pub fn role_invocation_classified(
+    root: &Path,
+    role: &str,
+    invoke: impl FnOnce() -> crate::role_runner::RoleTickOutcome,
+) -> (crate::role_runner::RoleTickOutcome, Option<RoleTrace>, Option<RoleFailure>) {
     let started_at = Utc::now();
     let execution = role_execution_id(role, started_at);
     role_failure::clear();
     role_draw::clear();
+    role_target::clear();
     ROLE_CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(RoleSlot::Pending {
             root: root.to_path_buf(),
@@ -1177,8 +1238,11 @@ pub fn role_invocation(
     let noted = role_failure::take();
     let drawn = role_draw::take();
     let resumed_from = roll_interruption::take_resumed_from();
+    let pr = role_target::take().or_else(|| role_target::take_handoff(root, &execution));
+    let issue = role_target::take_issue();
     let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
-        return (outcome, None);
+        let unlaunched = role_failure::for_unlaunched(&outcome, noted);
+        return (outcome, None, unlaunched);
     };
     let roll = roll_interruption::stopped(&span);
     let failure = role_failure::for_outcome(&outcome, noted).filter(|_| roll.is_none());
@@ -1205,20 +1269,29 @@ pub fn role_invocation(
     if let Some(drawn) = drawn {
         close.extend(drawn);
     }
+    if let Some(pr) = pr {
+        close.insert(role_target::PR_NUMBER.into(), pr.to_string());
+    }
+    // #11982: an assigned Builder/Curator tick's issue rides its root too.
+    if let Some(issue) = issue {
+        close.insert(role_target::ISSUE.into(), issue.to_string());
+    }
     let result = roll.map_or(result, |roll| {
         roll.apply(&mut close);
         roll_interruption::RESULT.to_owned()
     });
     finish_execution(root, &execution, &result, close);
-    (outcome, trace)
+    (outcome, trace, None)
 }
 
+pub mod git_facts;
 pub mod role_draw;
 mod role_failure;
+pub mod role_target;
 pub mod roll_interruption;
 pub use role_failure::{
-    note_role_failure, RoleFailure, EXIT_CODE, FAILURE_CLASS, ROLE_FAILURE_ATTRIBUTE_KEYS,
-    UNCLASSIFIED,
+    note_role_failure, pre_launch, RoleFailure, EXIT_CODE, FAILURE_CLASS,
+    ROLE_FAILURE_ATTRIBUTE_KEYS, UNCLASSIFIED, UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP,
 };
 
 #[cfg(test)]

@@ -836,18 +836,8 @@ pub fn resolve_github_app_script(root: &Path) -> Option<PathBuf> {
 /// the app can see"), so this is the key the shell helper caches against.
 #[must_use]
 pub fn nwo_from_git_remote(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if url.is_empty() {
-        return None;
-    }
+    // Bounded (#9715): a hung `git` must not stall the caller.
+    let url = crate::forge_cmd::get_remote_url(cwd)?;
     let stripped = url.strip_suffix(".git").unwrap_or(url.as_str());
 
     let path = if let Some(rest) = stripped.strip_prefix("git@") {
@@ -1628,6 +1618,7 @@ pub fn force_refresh_owner_credential(repo_root: &Path) -> bool {
     force_refresh_owner_credential_with(workspace_root, repo_root, &minter)
 }
 
+pub mod cross_owner;
 pub mod loom_ui;
 pub mod pool;
 pub use pool::attach as attach_pool;

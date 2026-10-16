@@ -10,7 +10,10 @@
 //! Called from the work finder's per-root listing, i.e. only after the
 //! rate-limit breaker has passed. Idempotent: a labeled issue drops out of the
 //! next listing, and an already-lifecycle-labeled issue is never selected. Uses
-//! REST (`gh api`) only, batch-capped per pass, and never fails the tick.
+//! REST (`gh api`) only, batch-capped per pass, and never fails the tick. The
+//! listing is [`crate::forge_listing::list_open_issues_cached_all_as`], the
+//! shared ETag-cached walk of every open item (#11897), so a repo where nothing
+//! moved costs free `304`s instead of a full paginated read.
 //!
 //! Config (env; default ON): `LOOM_INTAKE_RECONCILE=0|false|off` disables,
 //! `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` (default 300),
@@ -85,37 +88,21 @@ pub fn select_unlabeled(rows: &[IntakeRow], now: DateTime<Utc>, cap: usize) -> V
     picked.into_iter().take(cap).map(|r| r.number).collect()
 }
 
-/// Parse `number<TAB>created_at<TAB>label,label[<TAB>author]` lines.
+/// The intake rows of an open-items listing: issues only (pull requests are
+/// never touched), with their creation time, labels and author.
 #[must_use]
-pub fn parse_rows(stdout: &str) -> Vec<IntakeRow> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\t');
-            let number = parts.next()?.trim().parse().ok()?;
-            let created_at = parts
-                .next()
-                .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
-                .map(|d| d.with_timezone(&Utc));
-            let labels = parts
-                .next()
-                .unwrap_or("")
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
-            let author = parts
-                .next()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
-            Some(IntakeRow {
-                number,
-                created_at,
-                labels,
-                author,
-            })
+pub fn rows_from_listing(rows: Vec<crate::forge_listing::RestIssue>) -> Vec<IntakeRow> {
+    crate::forge_listing::issues_only(rows)
+        .into_iter()
+        .map(|row| IntakeRow {
+            number: row.number,
+            created_at: row
+                .created_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc)),
+            labels: row.labels,
+            author: row.author,
         })
         .collect()
 }
@@ -198,36 +185,37 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
 /// One ungated pass (tests call this directly). Returns issues labeled or
 /// demoted.
 pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> usize {
-    const JQ: &str = r#".[] | select(.pull_request|not) | [.number, .created_at, ([.labels[].name]|join(",")), (.user.login // "")] | @tsv"#;
-    // W4-C: Hygiene — a shed listing is a skipped pass, retried on the next
-    // tick. The shed itself is logged (rate-limited) by the facade, so it is
-    // not reported here as a failure every tick.
-    let outcome = gh_call::read("intake.list_open", gh_bin, root)
-        .read_class(crate::gh_invocation::ReadClass::Hygiene)
-        .args([
-            "api",
-            "--paginate",
-            "repos/{owner}/{repo}/issues?state=open&per_page=100",
-            "--jq",
-            JQ,
-        ])
-        .run();
-    let stdout = match outcome {
-        crate::cmd_out::CmdOutcome::Ran(out) if out.status.success() => out.stdout,
-        crate::cmd_out::CmdOutcome::Unavailable(crate::cmd_out::Unavailable::Shed { until }) => {
+    // The shared ETag-cached walk of every open item (#11897), the one the
+    // singleton and the stage-queue gauge read: an idle repo costs only free
+    // `304`s. It is Hygiene-class: a shed walk is a skipped pass, retried on
+    // the next one, and so is an incomplete one (past its page cap, or moved
+    // mid-walk), since a missing issue must not read as absent.
+    // #12310: the intake walk is discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
+    let listed = crate::forge_listing::list_open_issues_cached_all_as(
+        "intake.list_open",
+        gh_bin,
+        Some(root),
+        None,
+    );
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(e)
+            if e.downcast_ref::<crate::forge_etag_store::ReadShed>()
+                .is_some() =>
+        {
             log::debug!(
-                "intake_reconcile: open-issue listing deferred in {} (reader budget low until \
-                 {until:?}); skipped this pass",
+                "intake_reconcile: open-issue listing deferred in {} ({e}); skipped this pass",
                 root.display()
             );
             return 0;
         }
-        _ => {
-            log::warn!("intake_reconcile: open-issue listing failed in {}", root.display());
+        Err(e) => {
+            log::warn!("intake_reconcile: open-issue listing failed in {}: {e:#}", root.display());
             return 0;
         }
     };
-    let rows = parse_rows(&String::from_utf8_lossy(&stdout));
+    let rows = rows_from_listing(listed);
     // #11820: issues opened as `loom:issue`/`loom:curated` go back to intake.
     // Its events reads count against the same cap; triage gets the rest.
     let key = root.display().to_string();

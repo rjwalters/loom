@@ -1,8 +1,7 @@
 //! Start the daemon's **fleet-captain singleton tasks that own their loop**.
 //!
 //! A singleton job ([`crate::fleet_captain`], #8848) watches one shared thing
-//! and must run on exactly one fleet host. Most of them ride an existing loop
-//! (the collector's captain gauges); the ones here have
+//! and must run on exactly one fleet host. Some ride an existing loop; the ones here have
 //! a loop of their own, and share one call site because they share one
 //! contract: each re-evaluates its captain gate on every tick, so a
 //! `fleet.captain` edit takes effect without a restart, and each is inert on a
@@ -25,26 +24,12 @@ pub struct SingletonHandles {
     /// call only on the declared captain with
     /// `fleet.intakeReconcile.singleton` set.
     pub intake_reconcile: tokio::task::JoinHandle<()>,
-    /// The `loom:blocked` release task (#10763). Not a captain singleton: it
-    /// is sharded per workspace by the role-runner shard, and owns its loop so
-    /// the pass runs on the shard owner whether or not its work finder does.
-    pub stale_blocked_release: tokio::task::JoinHandle<()>,
 }
 
 /// Spawn every loop-owning singleton task against `workspace_root`'s config.
-/// `loops` is which daemon loops actually started; the release task serves a
-/// workspace only through one of them.
-pub fn spawn(
-    workspace_root: PathBuf,
-    bus: &EventBus,
-    loops: crate::stale_blocked::release_task::Loops,
-) -> SingletonHandles {
+pub fn spawn(workspace_root: PathBuf, bus: &EventBus) -> SingletonHandles {
     SingletonHandles {
         ci_telemetry: crate::ci_telemetry::spawn_task_on(workspace_root.clone(), bus),
-        intake_reconcile: crate::intake_reconcile::singleton::spawn_task(workspace_root.clone()),
-        stale_blocked_release: crate::stale_blocked::release_task::spawn_task(
-            workspace_root,
-            loops,
-        ),
+        intake_reconcile: crate::intake_reconcile::singleton::spawn_task(workspace_root),
     }
 }

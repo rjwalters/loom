@@ -72,11 +72,20 @@ impl SweepRegistry {
     /// ([`classify_preflip_labels`](Self::classify_preflip_labels),
     /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr)).
     pub(crate) fn fetch_claim_labeled_at(&self, issue: u32) -> Option<DateTime<Utc>> {
+        self.fetch_label_applied_at(issue, "loom:building")
+    }
+
+    /// [`fetch_claim_labeled_at`](Self::fetch_claim_labeled_at) for any claim
+    /// label (#11898: a step's claim is its role's label).
+    pub(crate) fn fetch_label_applied_at(&self, issue: u32, label: &str) -> Option<DateTime<Utc>> {
         // Counted as `guard.claim_timeline` (#10089); the facade applies the
         // cross-owner GH_CONFIG_DIR (#5401) and `LOOM_REPO` as GH_REPO (#8263 —
         // `gh api` has no `--repo` flag).
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
-        let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:building") | .created_at] | max // empty"#;
+        let jq = format!(
+            r#"[.[] | select(.event == "labeled" and .label.name == "{label}") | .created_at] | max // empty"#
+        );
+        let jq = jq.as_str();
         let output = self
             .gh_read_own_write("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
             .ok()
@@ -317,7 +326,7 @@ impl LeaseOrderDecision {
     /// yield variant never has to be re-plumbed through the dispatch path.
     pub(crate) fn yield_identity(self) -> Option<(String, String)> {
         match self {
-            Self::Proceed => None,
+            Self::Proceed | Self::Unverified => None,
             Self::Yield {
                 earliest_host,
                 earliest_sweep_id,

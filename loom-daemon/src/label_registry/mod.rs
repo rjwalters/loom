@@ -27,8 +27,8 @@
 //! never rendered into `labels.yml`, so the additive `sync-labels.sh` cannot
 //! re-create a retired label.
 //!
-//! Fields documented as inert (`stale_after_minutes`, `lifecycle`) have no
-//! consumer yet.
+//! `lifecycle` is inert: no consumer yet. `stale_after_minutes` is live for
+//! the five claim labels (#11898): see [`crate::claim_liveness`].
 
 use std::collections::HashSet;
 
@@ -171,7 +171,8 @@ pub struct Label {
     /// 1-based position in the order labels that contradict `loom:pr` are
     /// reported; `None` = does not contradict.
     pub contradicts_approval: Option<u32>,
-    /// Inert (no consumer yet).
+    /// The claim-liveness window of a claim label (#11898,
+    /// [`crate::claim_liveness`]); `None` for every other label.
     pub stale_after_minutes: Option<u32>,
     pub requires_base: Option<String>,
     pub remove_with: Vec<String>,
@@ -199,6 +200,12 @@ pub struct RetiredLabel {
     pub owned: bool,
     /// The issue that retired it, e.g. `#11103`.
     pub retired_in: String,
+    /// Active labels the migration also strips from an item it relabels
+    /// (#11860): a retired label whose meaning was a label *combination*
+    /// (the retired revise label rode on `loom:curated`) maps onto a state that
+    /// excludes part of it. Owned entries only; empty for a plain rename.
+    #[serde(default)]
+    pub also_remove: Vec<String>,
 }
 
 /// The parsed registry.
@@ -310,7 +317,8 @@ impl Registry {
     }
 
     /// `retired` invariants (#11513): a retired name is unique and not also
-    /// declared, and each `replaced_by` names an active declared label.
+    /// declared, each `replaced_by` names an active declared label, and each
+    /// `also_remove` (#11860) names another active label on an owned entry.
     fn validate_retired(&self) -> Result<()> {
         let mut seen = HashSet::new();
         for r in &self.retired {
@@ -328,6 +336,17 @@ impl Registry {
                     Some(l) if l.lifecycle == "active" => {}
                     Some(_) => bail!("{}: replaced_by {to} is not an active label", r.name),
                     None => bail!("{}: replaced_by unknown label {to}", r.name),
+                }
+            }
+            if !r.also_remove.is_empty() && !r.owned {
+                bail!("{}: also_remove needs owned: true (unowned is add-only)", r.name);
+            }
+            for x in &r.also_remove {
+                if r.replaced_by.as_deref() == Some(x.as_str()) {
+                    bail!("{}: also_remove {x} is its own replaced_by", r.name);
+                }
+                if self.get(x).is_none_or(|l| l.lifecycle != "active") {
+                    bail!("{}: also_remove {x} is not an active label", r.name);
                 }
             }
         }

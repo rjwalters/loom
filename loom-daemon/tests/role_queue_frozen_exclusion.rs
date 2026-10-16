@@ -34,7 +34,13 @@
 //! - `$EXCL`, when the same file sets `EXCL` from `skip-labels.sh` or
 //!   `hard-exclusion-labels.sh` (both read the label registry, where
 //!   `loom:frozen` is a hard exclusion);
-//! - a direct call to `skip-labels.sh` or `hard-exclusion-labels.sh`.
+//! - a direct call to `skip-labels.sh` or `hard-exclusion-labels.sh`;
+//! - a reference (`$VAR`, `${VAR}`, `$ENV.VAR`) to a variable the same file
+//!   sets from `loom-daemon labels list --property hold|park` on a line whose
+//!   fallback also names `loom:frozen` (#11870). The registry marks
+//!   `loom:frozen` as both a hold and a park, which
+//!   `frozen_is_a_hold_and_a_park_in_the_registry` pins, so such a set always
+//!   contains it.
 //!
 //! Known blind spots, by design: a query that selects only in its jq filter
 //! (no `--label` / `labels=`), and queries in prose. Both are left to review rather than a
@@ -70,6 +76,14 @@ static EXCLUDES_FROZEN: LazyLock<Regex> =
 
 static USES_EXCL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{?EXCL\b").unwrap());
 
+/// `VAR=$(loom-daemon labels list --property hold|park …|| printf '…loom:frozen…')`.
+static SETS_REGISTRY_SET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)\b([A-Za-z_][A-Za-z0-9_]*)=\$\(\s*loom-daemon labels list --property (?:hold|park)\b[^\n]*loom:frozen",
+    )
+    .unwrap()
+});
+
 static SETS_EXCL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"EXCL=.*(?:skip-labels|hard-exclusion-labels)\.sh").unwrap());
 
@@ -97,6 +111,13 @@ fn continues(line: &str) -> bool {
 fn scan(doc: &str) -> Vec<Violation> {
     let lines: Vec<&str> = doc.lines().collect();
     let file_sets_excl = SETS_EXCL.is_match(doc);
+    let registry_set_refs: Vec<Regex> = SETS_REGISTRY_SET
+        .captures_iter(doc)
+        .map(|c| {
+            let v = regex::escape(&c[1]);
+            Regex::new(&format!(r"\$\{{?{v}\b|\bENV\.{v}\b")).unwrap()
+        })
+        .collect();
     let mut out = Vec::new();
     let mut in_fence = false;
     let mut i = 0;
@@ -131,7 +152,9 @@ fn scan(doc: &str) -> Vec<Violation> {
             leading.push('\n');
         }
         let scope = format!("{leading}{statement}");
-        let ok = EXCLUDES_FROZEN.is_match(&scope) || (file_sets_excl && USES_EXCL.is_match(&scope));
+        let ok = EXCLUDES_FROZEN.is_match(&scope)
+            || (file_sets_excl && USES_EXCL.is_match(&scope))
+            || registry_set_refs.iter().any(|r| r.is_match(&scope));
         if !ok {
             out.push(Violation {
                 line: start + 1,
@@ -249,3 +272,39 @@ fn a_continuation_does_not_run_past_the_closing_fence() {
     let doc = "```bash\ngh issue list --state open |\n```\ngh issue list --label loom:issue\n";
     assert!(scan(doc).is_empty());
 }
+
+#[test]
+fn passes_a_registry_hold_set_only_when_its_fallback_names_frozen() {
+    let set = "HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\\nloom:frozen'); export HOLDS";
+    let q = "gh issue list --label loom:curated --json number,labels \\\n  --jq '($ENV.HOLDS | split(\"\\n\")) as $h | .[] | select(any(.labels[].name; IN($h[])) | not)'";
+    assert!(scan(&format!("```bash\n{set}\n{q}\n```\n")).is_empty());
+    let shell =
+        "HQ=$(loom-daemon labels list --property park 2>/dev/null || printf 'loom:frozen')\n\
+                 gh issue list --label loom:issue --search \"$(sed 's/^/-label:/' <<<\"$HQ\")\"";
+    assert!(scan(&format!("```bash\n{shell}\n```\n")).is_empty());
+    // A set whose fallback does not name loom:frozen does not count.
+    let weak = "HOLDS=$(loom-daemon labels list --property hold 2>/dev/null || printf 'loom:blocked'); export HOLDS";
+    assert_eq!(scan(&format!("```bash\n{weak}\n{q}\n```\n")).len(), 1);
+    // Nor does an unrelated variable.
+    let other = "HOLDSX=$(echo loom:frozen)";
+    assert_eq!(scan(&format!("```bash\n{other}\n{q}\n```\n")).len(), 1);
+}
+
+#[test]
+fn frozen_is_a_hold_and_a_park_in_the_registry() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/labels.json");
+    let reg: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let labels = reg.get("labels").unwrap_or(&reg);
+    let frozen = labels
+        .as_array()
+        .and_then(|a| a.iter().find(|l| l["name"] == "loom:frozen"))
+        .or_else(|| labels.get("loom:frozen"))
+        .expect("loom:frozen in defaults/labels.json");
+    assert_eq!(frozen["hold"], true, "loom:frozen must stay a hold (#11870)");
+    assert_eq!(frozen["park"], true, "loom:frozen must stay a park (#11870)");
+}
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -99,7 +99,7 @@ impl Deps for RealDeps {
 }
 
 /// `program` (a path, or a bare name looked up on `PATH`), canonicalized.
-fn canonical_program(program: &str) -> Option<PathBuf> {
+pub(super) fn canonical_program(program: &str) -> Option<PathBuf> {
     let p = Path::new(program);
     let found = if p.components().count() > 1 {
         Some(p.to_path_buf())
@@ -118,6 +118,57 @@ pub fn gh_marker_matches(base: &Path, gh: &Path) -> bool {
         return false;
     };
     std::fs::canonicalize(gh).is_ok_and(|c| c.to_string_lossy() == recorded.trim())
+}
+
+/// Whether `path` is a real (non-symlink) directory owned by this uid that
+/// no other user can write to: what the daemon publishes (0700).
+fn private_dir(path: &Path) -> bool {
+    owned_and_closed(path, true)
+}
+
+/// As [`private_dir`], for a regular file (the daemon writes 0600).
+fn private_file(path: &Path) -> bool {
+    owned_and_closed(path, false)
+}
+
+fn owned_and_closed(path: &Path, dir: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let kind = if dir { m.is_dir() } else { m.is_file() };
+    // SAFETY: geteuid only reads the caller's effective user id.
+    kind && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o022 == 0
+}
+
+/// Whether a consumer other than the daemon may trust `base` (the value of
+/// `LOOM_GH_GATEWAY_DIR`): the shape the daemon publishes ([`base_dir`]),
+/// and a base directory it alone could have written, whose `gh-ok` marker
+/// and outage file (when present) are private regular files, never symlinks:
+/// both are read by path, and a link would let another file answer for them.
+/// The front and a CLI subcommand share this one check.
+#[must_use]
+pub fn safe_base(base: &Path) -> bool {
+    let outage = base.join(super::outage::FRONT_OUTAGE);
+    let outage_ok = match std::fs::symlink_metadata(&outage) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(_) => private_file(&outage),
+    };
+    base.file_name().is_some_and(|n| n == super::DIR_NAME)
+        && base
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == ".loom")
+        && private_dir(base)
+        && private_file(&base.join(GH_MARKER))
+        && outage_ok
+}
+
+/// Whether a consumer may trust the published profile `dir` (`<base>/<owner>`)
+/// and its `hosts.yml`: neither a symlink, both ours and closed to others.
+#[must_use]
+pub fn safe_profile(dir: &Path) -> bool {
+    private_dir(dir) && private_file(&dir.join("hosts.yml"))
 }
 
 /// What one pass did.
@@ -143,6 +194,9 @@ pub struct Refresher {
     at: Option<Instant>,
     published: BTreeSet<String>,
     logged: HashSet<String>,
+    /// The `gh` (path, version) the last successful pass published with, so a
+    /// replaced `gh` is reported on the next refresh (#12147).
+    gh_seen: Option<(PathBuf, GhVersion)>,
 }
 
 impl Refresher {
@@ -150,6 +204,12 @@ impl Refresher {
         if self.logged.insert(key.clone()) {
             f(&key);
         }
+    }
+
+    /// The `gh` the last successful pass published with.
+    #[must_use]
+    pub fn gh_seen(&self) -> Option<&(PathBuf, GhVersion)> {
+        self.gh_seen.as_ref()
     }
 
     /// One pass for the workspace at `ws` against its live config.
@@ -264,6 +324,17 @@ impl Refresher {
             log::warn!("forge_gateway: could not write {GH_MARKER} in {}", base.display());
         }
         let set: BTreeSet<String> = owners.iter().cloned().collect();
+        // The version is re-probed on every due pass; what used to hide an
+        // upgraded `gh` was this line logging only when the owner set moved.
+        let gh_now = (gh_path.to_path_buf(), version);
+        let gh_changed = self.gh_seen.as_ref().is_some_and(|prev| *prev != gh_now);
+        if gh_changed {
+            log::info!(
+                "forge_gateway: gh changed to {} (gh {version}) — 2am#4367",
+                gh_path.display()
+            );
+        }
+        self.gh_seen = Some(gh_now);
         if set != self.published {
             log::info!(
                 "forge_gateway: gateway read profiles live for [{}] via {} (gh {version}) — 2am#4367",

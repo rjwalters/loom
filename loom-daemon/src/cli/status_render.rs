@@ -615,6 +615,8 @@ pub(crate) fn build_status_json_value_for(
         "auto_update": {
             "enabled": report.auto_update_enabled,
             "mode": report.auto_update_mode, // #10954
+            "config_enabled": report.auto_update_config_enabled, // #11042
+            "floor_not_rolling": report.auto_update_floor_not_rolling, // #11042
             "last_check": report.auto_update_last_check,
             "last_roll": report.auto_update_last_roll,
             "consecutive_failures": report.auto_update_consecutive_failures,
@@ -1471,11 +1473,16 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
         let _ = writeln!(out, "  {:-<100}", "");
         for s in &report.in_flight {
             let issue = match &s.kind {
-                SweepKind::Issue(n) => format!("#{n}"),
+                SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => format!("#{n}"),
                 SweepKind::PrSet(_) => "prs".to_string(),
             };
             let repo = format_repo_column(s.repo.as_deref());
-            let mut phase = s.latest_phase.as_deref().unwrap_or("-").to_string();
+            // A step has no sweep phases; its role is its phase (#11898).
+            let fallback = s
+                .kind
+                .role()
+                .map_or("-", loom_daemon::step_role::StepRole::as_str);
+            let mut phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
             if s.overflow {
                 // #9244: the host's single over-limit starred sweep.
                 phase.push_str(" [overflow]");
@@ -2801,6 +2808,9 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
+        if let Some(why) = report.auto_update_floor_not_rolling {
+            println!("  Below the fleet floor, NOT rolling ({}): {}", why.as_str(), why.describe());
+        }
         last_tick_line::print(report);
     }
     task_liveness_line::print(&report.task_liveness);

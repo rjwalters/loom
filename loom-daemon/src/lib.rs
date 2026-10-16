@@ -148,7 +148,10 @@ pub mod capability;
 pub mod capacity;
 /// The `loom:cargo-target-dir` guard: deny a cargo build into an unowned target dir (#11582).
 pub mod cargo_target_guard;
+pub mod champion_hold;
 pub mod ci_telemetry;
+/// Claim liveness from the label registry's `stale_after_minutes` (#11898).
+pub mod claim_liveness;
 pub mod claim_reconciliation;
 pub mod classify_error;
 pub mod cmd_out;
@@ -174,7 +177,9 @@ pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
-pub mod dependabot_labels;
+/// Fleet discovery (#12306): one snapshot of what work exists per step tick,
+/// from the mirror's worklist or per-repo listings.
+pub mod discovery;
 pub mod disk_admission;
 pub mod disk_footprint;
 pub mod disk_full_halt;
@@ -247,6 +252,7 @@ pub mod guards_status;
 pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;
+pub mod hooks_home;
 pub mod host_affinity;
 pub mod host_breaker;
 pub mod host_identity;
@@ -264,7 +270,9 @@ pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
+// #11855: bound Judge re-runs on a PR whose passes end without a verdict.
 pub mod journal;
+pub mod judge_backstop;
 pub mod key_ref;
 pub mod kimi_usage;
 pub mod label_registry;
@@ -299,6 +307,9 @@ pub mod pi_usage;
 pub mod pipeline_snapshot;
 pub mod points_marker;
 pub mod pr_latency;
+// #11931: a terminated role run's PR leases are released on its behalf.
+pub mod agent_scopes;
+pub mod pr_lease_reap;
 pub mod pr_planning;
 pub mod preflight;
 pub mod premise_check;
@@ -312,6 +323,7 @@ pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
 pub mod ram_headroom;
 pub mod ram_peaks;
+pub mod ram_scope_limit;
 pub mod rate_limit_breaker;
 pub mod rebase_guard;
 pub mod reclaim_pr_warning;
@@ -363,12 +375,12 @@ pub mod self_update;
 pub mod serve;
 pub mod session_reconcile;
 pub mod session_status;
-pub mod shell_budget;
 pub mod short_hash;
 pub mod signoz_read;
 pub mod stale_blocked;
 pub(crate) mod stale_token_retry;
 pub mod startup_adoption;
+pub mod startup_jitter;
 pub mod stash_issue_state;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
@@ -381,6 +393,10 @@ pub mod status_budget;
 /// needs (#10787): one list for `--section` parsing, `--help`, the wire request
 /// and the renderer's key filter.
 pub mod status_section;
+pub mod step_dispatch;
+/// The role a step runs and the claim it holds (#11898): `SweepKind::Step`'s
+/// role, its claim label and its restore stage.
+pub mod step_role;
 /// `points:*` story-point size labels (#9432, epic #9429) — the one parser both
 /// telemetry consumers (`sweep.started` at dispatch, `sweep.outcome` at the
 /// terminal transition) resolve points through, including the daemon-side
@@ -402,6 +418,9 @@ pub mod tap_usage;
 pub mod target_dir_gc;
 /// Orphan sweep for Loom-owned and agent-improvised cargo target dirs (#8370).
 pub mod target_orphan_reclaim;
+/// SIGUSR1-triggered dump of the async task tree to the daemon log, for
+/// diagnosing a hung tick (Issue #12079).
+pub mod task_dump;
 /// Per-task liveness heartbeats for the daemon's long-running loops (Issue
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
 pub mod task_liveness;
@@ -442,6 +461,7 @@ pub mod watchdog;
 pub mod watchdog_provisioning_guard;
 pub mod weighted_draw;
 pub mod work_finder;
+pub mod work_finder_guard;
 pub mod worker_spawn;
 pub mod workspace_hold;
 pub mod workspace_pool;

@@ -158,6 +158,61 @@ fn an_already_landed_refusal_is_recorded_as_a_pick_decision_skip() {
     assert!(record.acted.iter().any(|a| a.number == 1129));
 }
 
+fn maintain_only_hold(issue: u32) -> anyhow::Error {
+    crate::workspace_hold::WorkspaceHeldDispatchError {
+        workspace: PathBuf::from(format!("/tmp/held-{issue}")),
+        kind: crate::workspace_hold::HoldKind::MaintainOnly,
+        detail: "maintain_only".into(),
+    }
+    .into()
+}
+
+/// Issue #11928: a mid-tick `maintain_only` refusal is an informational skip
+/// with a cause, never an error: no `errors` tick, no `error` reason.
+#[test]
+fn a_maintain_only_refusal_in_a_multi_workspace_tick_is_not_an_error() {
+    let mut multi = vec![
+        (
+            Source(items(&[10])),
+            Refusing {
+                refuse: maintain_only_hold,
+                ok: HashSet::new(),
+            },
+        ),
+        (
+            Source(items(&[20])),
+            Refusing {
+                refuse: maintain_only_hold,
+                ok: HashSet::from([20]),
+            },
+        ),
+    ];
+    let report = tick_multi(&mut multi, &[], 4, &[false, false]);
+    assert_eq!(report.errors, 0, "{report:?}");
+    assert_eq!(reason(&report, "error"), 0);
+    assert_eq!(reason(&report, "dispatched"), 1);
+    let held = report.admissions.iter().find(|a| a.issue == 10).unwrap();
+    assert_eq!((held.result, held.reason), ("refused", "maintain_only"));
+    let row = report.queue.iter().find(|r| r.key.number == 10).unwrap();
+    assert_eq!(row.disposition, Some(Qd::WorkspaceHalted));
+}
+
+/// Issue #11928: a host whose only workspace is `maintain_only` records the
+/// same informational skip, not an error.
+#[test]
+fn a_maintain_only_refusal_on_a_single_workspace_host_is_not_an_error() {
+    let mut source = Source(items(&[30]));
+    let mut disp = Refusing {
+        refuse: maintain_only_hold,
+        ok: HashSet::new(),
+    };
+    let report = tick(&mut source, &mut disp, 4, false).unwrap();
+    assert_eq!(report.errors, 0, "{report:?}");
+    assert_eq!(reason(&report, "error"), 0);
+    assert_eq!(report.admissions[0].reason, "maintain_only");
+    assert_eq!(report.admissions[0].result, "refused");
+}
+
 #[test]
 fn a_token_selection_failure_is_token_selection_failed_not_error() {
     let mut multi = vec![(
@@ -206,6 +261,47 @@ fn collisions_and_claim_lock_contention_get_their_own_reasons() {
     assert_partition(&report, 3);
     let results: Vec<_> = report.admissions.iter().map(|a| a.result).collect();
     assert_eq!(results, ["refused", "refused", "error"]);
+}
+
+/// #11973: every counted dispatch error notes its kind, so the tick's
+/// `loom.dispatch.error_kind` is never missing when `errors` is non-zero.
+#[test]
+fn every_counted_dispatch_error_notes_its_kind() {
+    use super::DispatchErrorKind as K;
+    let now = Utc::now();
+    let cases: Vec<(Result<bool>, K)> = vec![
+        (Err(token_selection(1)), K::TokenSelection),
+        (
+            Err(CollisionDispatchError {
+                issue: 2,
+                source: CollisionSource::PeerClaim,
+            }
+            .into()),
+            K::ClaimCollision,
+        ),
+        (
+            Err(ClaimLockDispatchError {
+                issue: 3,
+                lock: PathBuf::from("/tmp/locks/issue-3"),
+            }
+            .into()),
+            K::ClaimLock,
+        ),
+        (Err(anyhow!("ENOENT").context("failed to spawn sweep child")), K::DispatchSpawn),
+        (Err(anyhow!("gh: API rate limit exceeded (HTTP 403)")), K::RateLimited),
+        (Err(anyhow!("something else")), K::Other),
+    ];
+    for (outcome, kind) in cases {
+        let mut report = TickReport::default();
+        record_dispatch_outcome(&mut report, 1, 0, now, &outcome);
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.error_kinds, vec![kind]);
+        assert_eq!(report.error_kind(), Some(kind.as_str()));
+    }
+    // A refusal that is not an error notes no kind.
+    let mut report = TickReport::default();
+    record_dispatch_outcome(&mut report, 1, 0, now, &Err(lease_order(1)));
+    assert_eq!((report.errors, report.error_kind()), (0, None));
 }
 
 #[test]
