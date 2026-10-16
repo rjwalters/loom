@@ -4141,8 +4141,9 @@ Judge stamps every verdict comment with
 <!-- loom:verdict-sha sha=<head-sha> verdict=approved|changes-requested -->
 ```
 
-(`.claude/commands/loom/judge.md` → "Verdict SHA Marker"), recording which tree
-the verdict covers. `claim_reconciliation::forge::reconcile_pr_verdicts` runs on
+(`.claude/commands/loom/judge.md` → "Verdict SHA Marker"; `approved` /
+`changes-requested` are canonical, readers also tolerate `approve` /
+`request-changes`), recording which tree the verdict covers. `claim_reconciliation::forge::reconcile_pr_verdicts` runs on
 the same periodic tick as the claim passes: for each open PR carrying a verdict
 label it reads the newest marker **of that verdict's own kind** and compares its
 SHA to the PR's current `headRefOid`. On a mismatch it posts an auditable
