@@ -482,6 +482,53 @@ fn no_pool_is_one_plain_writer_call() {
     assert_eq!(p.who(), vec![Who::Writer]);
 }
 
+// ===== reader-only (#12389 / #12394) =====
+
+/// A reader-only read never reaches the writer: not with no pool, not with
+/// every reader out, not after a reader's coverage 404. `LOOM_READ_SHED=0`
+/// (break-glass) lifts it like every other shed.
+#[test]
+fn a_reader_only_gate_read_is_shed_instead_of_reaching_the_writer() {
+    let nopool = |_: &RouteRequest<'_>| RouteDecision::NoPool;
+    let ignore = |_: &str, _: &str, _: Failure, _: &str| {};
+
+    let p = pool(OK, OK, OK);
+    let inv = p.read("ro-nopool", ReadClass::Gate).reader_only();
+    let out = inv
+        .execute_routed_v2_at(&nopool, &ignore, SHED_ON, SystemTime::now())
+        .unwrap();
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert!(p.who().is_empty(), "no request at all");
+
+    let p = pool(LIMITED, LIMITED, OK);
+    let inv = p.read("ro-limited", ReadClass::Gate).reader_only();
+    let (out, _, _) = p.run(inv, &[], SHED_ON, SystemTime::now());
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1], "writer stub NOT invoked");
+
+    let p = pool(OK, NOT_FOUND, OK);
+    let inv = p.read("ro-coverage", ReadClass::Gate).reader_only();
+    let (out, _, _) = p.run(inv, &[], SHED_ON, SystemTime::now());
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2], "no writer confirmation");
+
+    // A reader that answers serves it as usual.
+    let p = pool(OK, OK, OK);
+    let (out, _, _) =
+        p.run(p.read("ro-ok", ReadClass::Gate).reader_only(), &[], SHED_ON, SystemTime::now());
+    assert!(matches!(out, GhCompletion::Captured(_)));
+    assert_eq!(p.who(), vec![Who::R2]);
+
+    // Break-glass: shedding off sends it to the writer like any Gate read.
+    let p = pool(OK, OK, OK);
+    let inv = p.read("ro-off", ReadClass::Gate).reader_only();
+    let out = inv
+        .execute_routed_v2_at(&nopool, &ignore, SHED_OFF, SystemTime::now())
+        .unwrap();
+    assert!(matches!(out, GhCompletion::Captured(_)));
+    assert_eq!(p.who(), vec![Who::Writer]);
+}
+
 // ===== the 404 gone memo =====
 
 #[test]

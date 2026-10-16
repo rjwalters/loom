@@ -1161,6 +1161,8 @@ fn open_role_attempt(
         ("loom.timing_source", "owned_boundary"),
     ]);
     start.extend(host_attributes());
+    // #12342: runtime, engine and (in a container) its name and image digest.
+    start.extend(role_runtime::take());
     let span = begin_at(root, execution, SpanName::RoleAttempt, start, Some(started_at))?;
     // #9231: let the transcript-ingest pass join this tick's own
     // `session.summary` log to the tick's trace — the role-runner counterpart
@@ -1225,6 +1227,7 @@ pub fn role_invocation_classified(
     let execution = role_execution_id(role, started_at);
     role_failure::clear();
     role_draw::clear();
+    role_runtime::clear();
     role_target::clear();
     ROLE_CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(RoleSlot::Pending {
@@ -1287,6 +1290,7 @@ pub fn role_invocation_classified(
 pub mod git_facts;
 pub mod role_draw;
 mod role_failure;
+pub mod role_runtime;
 pub mod role_target;
 pub mod roll_interruption;
 pub use role_failure::{

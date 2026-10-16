@@ -206,7 +206,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 |---|---|---|
 | [`sweep.outcome`](#sweepoutcome) | log, native + OTLP | `sweep_registry/outcome_journal.rs`, `observability/collector.rs`, `sweep_registry/prless_retry/durable.rs`, `observability/backfill.rs` |
 | [`sweep.started`](#sweepstarted) / [`sweep.phase`](#sweepphase) / [`sweep.completed`](#sweepcompleted) / [`sweep.identity`](#sweepidentity) | log, native + OTLP | `observability/collector.rs` (+ `collector/identity.rs`), `observability/queue.rs`, `observability/shutdown.rs`, `observability/backfill.rs`; `sweep.started` carries the dispatch facts (`model`, `effort`, `effort_source`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id`, #11280; `dispatch_origin`, #11444) from `sweep_registry/start_facts.rs` |
-| Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation). A role tick's `loom.role_attempt` root also carries `loom.role_draw.pick`, `.attempt`, `.table_attempt`, `.layer` and optional `.model` when a `roleDraw` table decided the tick (`observability/lifecycle/role_draw.rs`, [role-draw.md](role-draw.md)) |
+| Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation). A role tick's `loom.role_attempt` root also carries `loom.role_draw.pick`, `.attempt`, `.table_attempt`, `.layer` and optional `.model` when a `roleDraw` table decided the tick (`observability/lifecycle/role_draw.rs`, [role-draw.md](role-draw.md)); it also carries `loom.runtime`, `loom.engine` and, for a session-container run, `loom.session.container` and `loom.session.image_digest` (`observability/lifecycle/role_runtime.rs`, [observability.md](observability.md)) |
 | [`pick.decision`](#pickdecision) | log, OTLP only | `observability/pick_decision.rs` (from `role_tick_telemetry.rs` and `work_finder/tick_summary.rs`) |
 | [`queue.snapshot`](#queuesnapshot) (whole ready queue per tick) | native only | `observability/queue_snapshot.rs` |
 | `loom.queue.issues`, `loom.queue.listing_failed_repos`, `loom.queue.listing_incomplete_repos` ([`metric.points`](#metricpoints)) | metric | `observability/ops/queue.rs` |
@@ -3870,29 +3870,6 @@ empty), so a replayed record dedupes.
 
 It also carries the executing host's `loom.version`, `loom.revision` and `host.id`
 (#11765; see `sweep.phase`).
-
-### `backlog.level` — the backlog level the daemon handed one Curator dispatch
-
-One OTLP log per role-runner Curator dispatch on a repo that sets
-`curator.backlogTarget` (Issue #11819), emitted by the daemon on its direct
-OTLP exporter as it builds the dispatch. Nothing is written for a repo with no
-target. Envelopes carry `schema_version: 12`. **OTLP-only** (`native: false`).
-
-The JSON body contains `repo` (owner/repo, lowercased), `open` (open issues, PRs
-excluded, from one REST `search/issues` `total_count`; absent when the count
-failed), `target` (the resolved `curator.backlogTarget`), `level` (`lenient` /
-`normal` / `strict` from `r = open / target`: `< 0.5`, `0.5`–`1.0`, `> 1.0`;
-`normal` when the count failed), `dispatch_id` (`role-curator-<instant>`),
-`count_error` (present only when the count failed), `observed_at`, and standard
-`loom` build provenance; a record whose provenance does not validate is not
-exported. Both OTLP timestamps are `observed_at`.
-
-**OTLP.** Attributes: `loom.repo`, `loom.role` (`curator`), `loom.sweep_id`
-(the `dispatch_id`), and `loom.backlog.level` / `open` / `target` /
-`count_failed` (`BACKLOG_LEVEL_LOG_ATTRIBUTE_KEYS`, kept by the collector's
-`transform/privacy` `keep_keys`, contract-tested). The Curator's admission
-closes are not recorded here: they are GitHub `closed` events with the comment
-prefix `Closed at admission:`.
 
 ### `scope.memory` — one agent scope's memory limit, peak and OOM kills
 

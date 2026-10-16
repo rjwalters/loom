@@ -489,6 +489,32 @@ impl IpcServer {
             );
         }
 
+        // Shared-state ownership guard (#9816): a different socket that resolves
+        // to the same (non-scratch) pid file would otherwise silently overwrite
+        // the incumbent's pid below. Read-only and fail-open; runs before the
+        // socket is unlinked so a refused daemon never disturbs the incumbent.
+        match crate::daemon_pidfile::check_ownership_for_current_process().await {
+            Some((path, crate::daemon_pidfile::OwnershipDecision::Refuse { incumbent })) => {
+                anyhow::bail!(
+                    "another loom-daemon (pid {incumbent}) already owns pid file {} — refusing \
+                     to start a second daemon on shared state. Stop it first, or set \
+                     {}=1 to acknowledge a deliberate parallel daemon.",
+                    path.display(),
+                    crate::daemon_pidfile::ALLOW_PARALLEL_DAEMON_ENV
+                );
+            }
+            Some((
+                path,
+                crate::daemon_pidfile::OwnershipDecision::ProceedWithWarn { incumbent },
+            )) => log::warn!(
+                "daemon_pidfile: live loom-daemon pid {incumbent} already owns {} — continuing \
+                 because {}=1 (#9816)",
+                path.display(),
+                crate::daemon_pidfile::ALLOW_PARALLEL_DAEMON_ENV
+            ),
+            _ => {}
+        }
+
         // Remove old socket (best-effort; only reached when no live listener
         // answered the probe above, i.e. the file is stale or absent).
         let _ = fs::remove_file(&self.socket_path).await;
