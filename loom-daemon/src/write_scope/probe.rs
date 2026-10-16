@@ -61,6 +61,11 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The `Insufficient` detail for a repository outside the App installation.
+/// Shared by the probes and by the refusal-class mapping, so the class is
+/// derived from the typed verdict rather than parsed from a sentence.
+pub(crate) const NOT_IN_INSTALLATION: &str = "not in this App installation";
+
 /// What the probe established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Permission {
@@ -227,7 +232,7 @@ impl GhProbe {
             (_, Ok(list)) if list.lines().any(|l| l.trim().eq_ignore_ascii_case(repo)) => {
                 Permission::Write
             }
-            (_, Ok(_)) => Permission::Insufficient("not in this App installation".into()),
+            (_, Ok(_)) => Permission::Insufficient(NOT_IN_INSTALLATION.into()),
             (Ok(Some(p)), Err(_)) => p,
             (Ok(None), Err(e)) => Permission::Unknown(format!("unparseable permissions ({e})")),
             (Err(e), Err(_)) => Permission::Unknown(e),

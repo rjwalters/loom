@@ -200,6 +200,8 @@ async fn list_open_classed(
 ) -> Option<Vec<RestIssue>> {
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
+        // #12310: the blocked-queue listing is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
         list_open_with(&gh, &root, repo.as_deref(), label, caller, observability)
     })

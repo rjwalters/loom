@@ -190,58 +190,12 @@ pub fn order(
     ordered
 }
 
-/// The process's current weight bonuses (`dispatch.weightBonus*`, #11742).
-/// Published once per tick by the work-finder loop's config reload
-/// ([`super::ConfiguredMaxReloader::refresh`]) so a committed-config or
-/// `LOOM_HYPERPARAMS` edit applies on the next tick without a restart, and
-/// read by [`order`]. A process global rather than a tick argument because
-/// the tick entry points live in the size-frozen `work_finder.rs`.
-#[cfg(not(test))]
-static WEIGHT_BONUS: std::sync::Mutex<WeightBonus> = std::sync::Mutex::new(WeightBonus {
-    red_main_fix: priority_pick::DEFAULT_BONUS_RED_MAIN_FIX,
-    very_important: priority_pick::DEFAULT_BONUS_VERY_IMPORTANT,
-    important: priority_pick::DEFAULT_BONUS_IMPORTANT,
-});
-
-#[cfg(test)]
-thread_local! {
-    /// Under `cfg(test)` the bonuses are per thread, so a test that
-    /// publishes some cannot change the draws of a tick another test runs
-    /// concurrently (the same isolation [`with_seed`] gives the seed).
-    static WEIGHT_BONUS: Cell<WeightBonus> = Cell::new(WeightBonus::default());
-}
-
-/// The weight bonuses the next tick uses.
+/// The weight bonuses [`order`] uses: the defaults. The `dispatch.weightBonus*`
+/// keys are retired (#12185): the step tick no longer draws a workspace, and
+/// this order serves only the legacy pass-1 queue.
 #[must_use]
 pub fn weight_bonus() -> WeightBonus {
-    #[cfg(not(test))]
-    {
-        *WEIGHT_BONUS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-    #[cfg(test)]
-    {
-        WEIGHT_BONUS.with(Cell::get)
-    }
-}
-
-/// Publish the weight bonuses for the next tick. Returns the previous value,
-/// so a caller can log a transition.
-pub fn set_weight_bonus(bonus: WeightBonus) -> WeightBonus {
-    #[cfg(not(test))]
-    {
-        std::mem::replace(
-            &mut *WEIGHT_BONUS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            bonus,
-        )
-    }
-    #[cfg(test)]
-    {
-        WEIGHT_BONUS.with(|c| c.replace(bonus))
-    }
+    WeightBonus::default()
 }
 
 thread_local! {

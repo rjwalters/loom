@@ -104,6 +104,9 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from config at every work-finder tick (#12256) —
     // `step_dispatch::gather_budget::gather_concurrency`, never cached.
     ("autonomous.workFinder.gatherConcurrency", Reloadability::Live),
+    // Read from config at every work-finder tick (#12306) —
+    // `discovery::BackendKind::for_root`, never cached.
+    ("autonomous.workFinder.discovery", Reloadability::Live),
     // Read from config at every work-finder tick (#12298) —
     // `step_dispatch::gather_budget::spawn_concurrency`, never cached.
     ("autonomous.workFinder.spawnConcurrency", Reloadability::Live),
