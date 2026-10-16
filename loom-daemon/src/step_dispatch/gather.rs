@@ -379,6 +379,8 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    // #12310: the hold-marker comment reads are discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     for row in rows
         .iter()
         .filter(|r| r.is_pull_request && crate::work_finder::is_blocked_hold(&r.labels))
@@ -467,13 +469,17 @@ pub fn list(
         super::listing::list_all_open(&gh_bin, Some(&root_dir), Some(&slug)),
     )?;
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
-    let pull_listing = crate::forge_pull_listing::list_open_pulls_cached_as(
-        super::listing::CALLER,
-        &gh_bin,
-        Some(&root_dir),
-        Some(&slug),
-        PULL_PAGES,
-    );
+    // #12310: the open-PR listing is discovery.
+    let pull_listing = {
+        let _discovery = crate::gh_invocation::purpose::discovery();
+        crate::forge_pull_listing::list_open_pulls_cached_as(
+            super::listing::CALLER,
+            &gh_bin,
+            Some(&root_dir),
+            Some(&slug),
+            PULL_PAGES,
+        )
+    };
     let (pulls, pulls_complete) = pulls_or_last_good(&slug, pull_listing);
     let full: HashMap<u32, RestPull> = pulls.into_iter().map(|p| (p.number, p)).collect();
     let markers = pull_markers(&slug, root, &rows);

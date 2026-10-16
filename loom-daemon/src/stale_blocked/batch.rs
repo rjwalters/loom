@@ -741,6 +741,8 @@ impl StaleBlockedForge for GhStaleBlockedForge {
     }
 
     fn list_blocked(&mut self) -> Result<Vec<RestIssue>> {
+        // #12310: the blocked-issue listing is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         crate::forge_listing::list_issues_cached_all_as(
             CALLER,
             &self.gh_bin,

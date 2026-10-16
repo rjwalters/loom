@@ -9,6 +9,8 @@ use std::path::Path;
 use std::process::Command;
 
 fn read(root: &Path, gh: &Path, op: ForgeOp, suffix: &str) -> Result<Value> {
+    // #12310: the planner's PR-queue and CI reads are discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     let repo = std::env::var("LOOM_REPO").ok();
     let target = store::resolve_target(Some(root), repo.as_deref());
     let url = format!("repos/{}/{}", target.repo.as_deref().unwrap_or("{owner}/{repo}"), suffix);
