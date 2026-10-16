@@ -7,7 +7,7 @@ use super::capture::{
     emit_step_capture, parse_outcome_line, read_outcome_line, tick_outcome, StepCapture, StepEnd,
     StepOutcomeClass,
 };
-use super::lease::{claim_args, claim_verdict};
+use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
 use super::*;
 use crate::observability::ops::capture::capture;
@@ -199,13 +199,16 @@ fn the_pre_claim_is_the_role_keyed_lease_with_the_step() {
 
 #[test]
 fn a_lost_or_unreadable_pre_claim_refuses_the_step() {
-    assert_eq!(claim_verdict(Some(0)), Ok(()));
-    assert_eq!(claim_verdict(Some(4)).unwrap_err().reason, "claim_lost");
-    assert_eq!(claim_verdict(Some(6)).unwrap_err().reason, "backstop_hold");
+    assert_eq!(claim_verdict(&ClaimRun::Exited(0)), Ok(()));
+    let reason = |run: ClaimRun| claim_verdict(&run).unwrap_err().reason;
+    assert_eq!(reason(ClaimRun::Exited(4)), "claim_lost");
+    assert_eq!(reason(ClaimRun::Exited(6)), "backstop_hold");
     // #12105: a Doctor that found another actor active on the PR.
-    assert_eq!(claim_verdict(Some(7)).unwrap_err().reason, "peer_active");
-    assert_eq!(claim_verdict(Some(5)).unwrap_err().reason, "claim_unverified");
-    assert_eq!(claim_verdict(None).unwrap_err().reason, "claim_unverified");
+    assert_eq!(reason(ClaimRun::Exited(7)), "peer_active");
+    assert_eq!(reason(ClaimRun::Exited(5)), "claim_unverified");
+    assert_eq!(reason(ClaimRun::TimedOut), "claim_unverified");
+    assert_eq!(reason(ClaimRun::SpawnFailed), "claim_unverified");
+    assert_eq!(reason(ClaimRun::Signaled), "claim_unverified");
 }
 
 // ---- B3: the timeout ------------------------------------------------------
@@ -525,7 +528,10 @@ const BUILDER_ITEM: u32 = 12133;
 const PEER_LEASE: &str = "<!-- loom:lease host=peer-host sweep=sweep-peer -->";
 
 fn builder_claim(reg: &mut SweepRegistry, sweep: &str) -> std::result::Result<(), StepRefusal> {
+    // A Builder's claim is a label flip and a lease comment: it has no
+    // `lease pr claim` facts to carry (#12183).
     reg.pre_claim_step(BUILDER_ITEM, StepRole::Builder, sweep)
+        .map(|claim| assert!(claim.is_none(), "a Builder claim carries no facts"))
 }
 
 /// Make the fake `gh`'s `arm` (e.g. the comment read) exit 1 straight away.
