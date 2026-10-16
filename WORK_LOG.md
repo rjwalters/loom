@@ -7,6 +7,28 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12470**: refactor: record why disk reclaim predicates stay raw and drop unused df helpers
+- **PR #12469**: feat(observability): export worktree-reaper per-pass telemetry as reaper.pass spans
+- **PR #12468**: feat(reaper): reclaim idle Python caches and .venv, keep tracked artifact dirs
+- **PR #12465**: feat(fleet_dispatch): captain claim arbiter, loom-daemon fleet-dispatch serve (#12449)
+- **PR #12463**: fix: close values() in lifecycle fixture and drop bash-4 case conversion in sync-labels
+- **PR #12462**: test: route private-workspace docker fixture gh calls through a fail-loud fake
+- **PR #12457**: Revert #12448: claim_lost stopgap (operator ruling: go straight to captain dispatch)
+- **PR #12452**: docs(design): fleet captain dispatch spec (Phase 0 of #12447)
+- **PR #12451**: feat: resolve a per-owner writer App from forge.identities.writers
+- **PR #12448**: fix(step_dispatch): stop lost claims ending ticks early (free claim_lost 16→128, passes 32→48)
+- **PR #12445**: fix: bound nvidia-smi query with a 2s deadline in host-status sampler
+- **PR #12443**: test: count only per-issue reads of held candidates in expired-listing assertion
+- **PR #12441**: feat(host_status): gate, launch and work-finder read filtered host_status
+- **PR #12436**: refactor: stop deriving story trace IDs; every execution is its own root trace
+- **Issue #12461** (closed): Export worktree-reaper per-pass telemetry (scanned/removed/preserved/bytes)
+- **Issue #12459** (closed): Reclaim Python caches and .venv from idle worktrees
+- **Issue #12449** (closed): Fleet dispatch Phase 1a: captain server `loom-daemon fleet-dispatch serve` (claim arbiter, soft state, roster auth)
+- **Issue #12446** (closed): forge: per-owner writer App (pick the writer by repo owner)
+- **Issue #12440** (closed): test flake: a_failed_read_reuses_the_last_good_listing_for_a_few_minutes fails on Rust Unit Tests (2/5)
+- **Issue #12437** (closed): host_status: bound nvidia-smi runtime so a wedged driver cannot stall the sampler tick
+- **Issue #12114** (closed): host_status (slice c): re-point admission_brake / work_finder at host_status
+- **Issue #11984** (closed): Provenance out of Loom, stage 2: stop stamping trailers/markers, drop trace-ID derivation
 - **PR #12438**: feat: classify audited config blocks and underscore annotations in fleet reload table
 - **PR #12432**: feat: report NVIDIA GPU utilisation and memory in host status
 - **Issue #12423** (closed): reload: classify annotation keys and audited config blocks (#12419 child 1)
