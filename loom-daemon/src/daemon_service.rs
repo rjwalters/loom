@@ -1460,6 +1460,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     }
     // #11104: star-liveness is gone; its `autonomous.operatorPriority` keys warn once.
     work_finder::operator_priority::warn_retired_config(&sweep_workspace);
+    // #11406: the fleet-captain gauge block is gone; its keys warn once.
+    loom_daemon::observability::retired_captain_config::warn_retired_config(&sweep_workspace);
     let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
         sweep_workspace.clone(),
         socket_path.clone(),

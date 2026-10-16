@@ -105,7 +105,6 @@
 
 pub mod agent_relay;
 pub mod backfill;
-pub mod captain_gauges;
 pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;
@@ -130,6 +129,7 @@ pub mod queue_blocked;
 pub mod queue_snapshot;
 pub mod repo_ref;
 pub mod request_headers;
+pub mod retired_captain_config;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
