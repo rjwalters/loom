@@ -327,6 +327,19 @@ pub(crate) fn handle_validate_command(
             .to_string(),
     );
 
+    // #11703: surface repo-vs-fleet disagreements so silent shadowing can't happen.
+    let conflicts = config_resolver::tier_conflicts(&absolute_workspace);
+    if format != "json" && !conflicts.is_empty() {
+        eprintln!("Config conflicts between fleet and other tiers (first value is in effect):");
+        for c in &conflicts {
+            eprintln!("  {}", c.key);
+            for (i, (path, val)) in c.values.iter().enumerate() {
+                let tag = if i == 0 { " (in effect)" } else { "" };
+                eprintln!("    {val} <- {}{tag}", path.display());
+            }
+        }
+    }
+
     // Retargeted precondition (#4059) — stated verbatim for #4062 to mirror:
     //   "A workspace is validatable iff resolve_effective_config(workspace)
     //    yields a `terminals` array with at least one element; otherwise the

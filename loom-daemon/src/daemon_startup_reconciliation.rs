@@ -169,7 +169,8 @@ static CLAIM_CUTOFF: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> =
 /// The instant this daemon's startup passes began, or `None` before
 /// [`spawn_startup_passes`] ran (tests, CLI). The startup claim pass reclaims
 /// a zero-evidence `loom:building` claim (#6615) only when the issue was last
-/// updated before it: since #12222 the work finder may already be ticking,
+/// updated before it (to the second, less a clock margin: see
+/// `claim_reconciliation::startup_cutoff`): since #12222 the work finder may already be ticking,
 /// and a claim it just made looks exactly like an orphan for a moment.
 #[must_use]
 pub fn claim_cutoff() -> Option<chrono::DateTime<chrono::Utc>> {
