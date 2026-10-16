@@ -124,6 +124,7 @@ pub(crate) fn handle_clean_command(
         // typed the command is the authority on a sentinel-less worktree. Only
         // the unattended reaper (#4876) requires the `.loom-managed` sentinel.
         require_managed_sentinel: false,
+        idle_open_secs: None,
     };
     let exit_code = clean::run_clean(&repo_root, &opts);
     if !worktrees_only && !branches_only && !tmux_only {

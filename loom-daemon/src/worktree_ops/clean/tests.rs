@@ -987,6 +987,7 @@ fn classify_and_cleanup_pr_worktree_treat_a_detached_head_the_same_as_a_named_br
         pr_status: &pr_status,
         branch_reachable_from_remotes: &|_: &Path| true,
         uncommitted: &check_uncommitted_or_unproven_untracked_changes,
+        idle_for: &|_: &Path, _: i64| false,
         now: chrono::Utc::now(),
     };
     let decision = classify_pr_worktree(&wt_path, 888, &opts, &probes);
