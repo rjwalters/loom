@@ -555,6 +555,7 @@ impl DemoteForge<Repo> for Scoped {
 /// pull request, #4 was labelled after the listing and is left alone, only
 /// #1 gets the label, and the next listing of the unchanged repo is one `304`.
 #[test]
+#[serial_test::serial]
 fn the_live_pass_re_reads_each_issue_and_an_idle_repo_is_a_304() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().display();
@@ -624,6 +625,48 @@ esac
     std::fs::remove_file(dir.path().join("calls.log")).unwrap();
     assert_eq!(forge.current_labels(&repo, 1).unwrap(), labels(&[]));
     assert_eq!(calls(), "reread 1\n");
+}
+
+/// #12118 / #12316: the intake listing, not a telemetry sampler, journals
+/// `issue.estimate` for a freshly curated issue, once.
+#[test]
+#[serial_test::serial]
+fn the_live_listing_journals_issue_estimate_for_a_fresh_curated_issue() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let updated = Utc::now().to_rfc3339();
+    let listing = serde_json::json!([{
+        "number": 7, "state": "open", "created_at": updated, "updated_at": updated,
+        "labels": [{"name": "loom:curated"}],
+        "body": "<!-- loom:estimate lines=7 files=1 doctor_risk=0.3 -->",
+        "user": {"login": "owner"}, "author_association": "OWNER"
+    }]);
+    std::fs::write(dir.path().join("listing.json"), listing.to_string()).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+d={d}
+printf 'HTTP/2.0 200 OK\r\nEtag: W/"l1"\r\n\r\n'
+cat "$d/listing.json"
+"#
+    );
+    let gh = dir.path().join("gh");
+    std::fs::write(&gh, script).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let repo = Repo {
+        slug: "acme/widgets".into(),
+        host: None,
+        root: dir.path().to_path_buf(),
+    };
+    let mut forge = GhIntakeForge::new(gh);
+    forge.list_open(&repo).unwrap();
+    let journal = || {
+        std::fs::read_dir(dir.path().join(".loom/logs/issue-estimates"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    assert_eq!(journal(), 1);
+    forge.list_open(&repo).unwrap();
+    assert_eq!(journal(), 1, "re-observing the same marker journals nothing");
 }
 
 /// The write's own answer is the compare step: when it shows another

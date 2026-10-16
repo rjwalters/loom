@@ -226,6 +226,8 @@ fn explained(
             (dead(journal) && dead(legacy)).then_some("dead_pid")
         }
         Store::Outcomes | Store::Launch => (legacy.is_none()).then_some("retention"),
+        // `delete` ends the lineage at merge; that removal is not shadowed.
+        Store::Checkpoint => (legacy.is_none()).then_some("terminal_delete"),
         Store::Recovery => (legacy.is_none() && legacy_store.at_capacity).then_some("retention"),
         Store::PrlessClears | Store::PrlessCounted => {
             let expired = journal
@@ -289,6 +291,15 @@ fn load_legacy(store: Store, path: &Path) -> Legacy {
                 }
             }
             Ok(_) => {}
+            Err(()) => legacy.corrupt = true,
+        },
+        Store::Checkpoint => match read_json(path) {
+            Ok(Some(record)) => {
+                legacy
+                    .items
+                    .insert(super::checkpoint_item(path), super::checkpoint_projection(&record));
+            }
+            Ok(None) => {}
             Err(()) => legacy.corrupt = true,
         },
         Store::Launch => {

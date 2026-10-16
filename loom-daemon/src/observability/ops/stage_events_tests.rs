@@ -216,3 +216,17 @@ fn a_budget_stop_that_saw_the_label_answers() {
     assert_eq!(item.reads, [1, 3]);
     assert_eq!(read.times.unwrap()["x"], t("2026-09-03T00:00:00Z"));
 }
+
+#[test]
+fn label_times_take_the_latest_labeled_event_per_label() {
+    let events = serde_json::json!([
+        {"event": "labeled", "label": {"name": "loom:curated"}, "created_at": "2026-09-01T00:00:00Z"},
+        {"event": "unlabeled", "label": {"name": "loom:curated"}, "created_at": "2026-09-02T00:00:00Z"},
+        {"event": "labeled", "label": {"name": "loom:curated"}, "created_at": "2026-09-03T00:00:00Z"},
+        {"event": "commented", "created_at": "2026-09-04T00:00:00Z"}
+    ]);
+    let times = parse_label_times(&events);
+    assert_eq!(times.len(), 1);
+    assert_eq!(times["loom:curated"], t("2026-09-03T00:00:00Z"));
+    assert!(parse_label_times(&serde_json::json!({"message": "Not Found"})).is_empty());
+}

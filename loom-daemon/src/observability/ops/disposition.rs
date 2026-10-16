@@ -14,7 +14,7 @@
 //!
 //! Driven from the collector's periodic sample
 //! (`observability::collector::sample_snapshots`, the same cadence as
-//! [`super::super::queue_snapshot::record`] / [`super::stage_dwell::record`]),
+//! [`super::super::queue_snapshot::record`]),
 //! reading [`crate::work_finder::last_tick_summary`] — never from the
 //! work-finder tick itself, which must never block on a `gh repo view` probe
 //! (see `queue_snapshot`'s module doc for the identical rationale). A
@@ -56,8 +56,8 @@
 //!
 //! The single-workspace work-finder loop records no per-issue queue rows at
 //! all (`WorkFinderTickSummary::queue` is empty), so it never has anything to
-//! export here — the same limitation `queue_snapshot` and `stage_dwell`
-//! already document.
+//! export here — the same limitation `queue_snapshot` already
+//! documents.
 //!
 //! # Repo lockout attributes (Issue #9674)
 //!

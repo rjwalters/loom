@@ -429,19 +429,6 @@ pub enum MetricName {
     /// Role-runner agent slots idle: the ceiling minus agents in flight.
     #[serde(rename = "loom.dispatch.role_idle_slots")]
     DispatchRoleIdleSlots,
-    /// Seconds items spent in a forge label stage, summed, labelled `state`.
-    #[serde(rename = "loom.forge.stage_dwell")]
-    ForgeStageDwell,
-    /// Stage transitions counted in `loom.forge.stage_dwell`, labelled `state`.
-    #[serde(rename = "loom.forge.stage_dwell.samples")]
-    ForgeStageDwellSamples,
-    /// Open items carrying a stage label, labelled `state`.
-    #[serde(rename = "loom.forge.stage_items")]
-    ForgeStageItems,
-    /// Seconds since the oldest item of a `stage_items` state entered it,
-    /// labelled `state`, `reason`, `repo` (#12027: `pr_refused`).
-    #[serde(rename = "loom.forge.stage_oldest_age_seconds")]
-    ForgeStageOldestAgeSeconds,
     /// Items the step tick could draw (weight > 0, after the live claims),
     /// labelled `repo`, sampled every work-finder tick (#11909).
     #[serde(rename = "loom.step.actionable")]
@@ -653,10 +640,6 @@ impl MetricName {
             Self::DispatchBusySlots => "loom.dispatch.busy_slots",
             Self::DispatchRoleMaxConcurrent => "loom.dispatch.role_max_concurrent",
             Self::DispatchRoleIdleSlots => "loom.dispatch.role_idle_slots",
-            Self::ForgeStageDwell => "loom.forge.stage_dwell",
-            Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
-            Self::ForgeStageItems => "loom.forge.stage_items",
-            Self::ForgeStageOldestAgeSeconds => "loom.forge.stage_oldest_age_seconds",
             Self::StepActionable => "loom.step.actionable",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
@@ -714,8 +697,6 @@ impl MetricName {
             | Self::DispatchSlotTurnaround
             | Self::DispatchSlotTurnaroundSamples
             | Self::DispatchIdleSlotSeconds
-            | Self::ForgeStageDwell
-            | Self::ForgeStageDwellSamples
             | Self::QueueDispositionRowsDropped
             | Self::GithubRateLimitBreakerSkips
             | Self::ForgeCalls
@@ -763,18 +744,16 @@ impl MetricName {
             Self::PoolExhaustedSeconds | Self::PoolPlanWindowSeconds => "s",
             Self::PoolPlanTokenLimit => "{token}",
             Self::QueueOldestWait | Self::QueueDispatchWait => "s",
-            Self::DispatchSlotTurnaround
-            | Self::DispatchIdleSlotSeconds
-            | Self::ForgeStageDwell => "s",
+            Self::DispatchSlotTurnaround | Self::DispatchIdleSlotSeconds => "s",
             Self::DispatchSlotTurnaroundSamples
             | Self::DispatchIdleSlots
             | Self::DispatchBusySlots
             | Self::DispatchRoleMaxConcurrent
             | Self::DispatchRoleIdleSlots => "{slot}",
-            Self::ForgeStageDwellSamples | Self::ForgeStageItems | Self::StepActionable => "{item}",
+            Self::StepActionable => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
-            Self::GithubRateLimitReset | Self::ForgeStageOldestAgeSeconds => "s",
+            Self::GithubRateLimitReset => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
             Self::ForgeCalls => "{request}",
             Self::ForgeFacadeEvents => "{event}",
@@ -862,14 +841,6 @@ impl MetricName {
             }
             Self::DispatchRoleMaxConcurrent => "The role-runner concurrent agent ceiling.",
             Self::DispatchRoleIdleSlots => "Role-runner agent slots idle under the ceiling.",
-            Self::ForgeStageDwell => "Seconds items spent in a forge label stage, by state.",
-            Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
-            Self::ForgeStageItems => {
-                "Open items per repo by state: stage labels and queue states (overlapping)."
-            }
-            Self::ForgeStageOldestAgeSeconds => {
-                "Age of the oldest item in a stage_items state, by reason (pr_refused)."
-            }
             Self::StepActionable => "Items the step tick could draw this tick, per repo.",
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."

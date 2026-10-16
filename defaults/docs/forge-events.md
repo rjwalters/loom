@@ -409,8 +409,7 @@ minutes, or at once after a `401`.
 
 ### 8.1 Discovery reads
 
-The work finder's candidate listings and the stage-dwell sampler's stage
-listings ask the mirror first: `GET /v1/mirror/items?repo=&label=&state=open`
+The work finder's candidate listings ask the mirror first: `GET /v1/mirror/items?repo=&label=&state=open`
 (every page, with bodies). The step engine's all-open listing (#11897) asks
 the same endpoint with no `label`; it is the only caller allowed to, and it
 stands in for the unfiltered ETag walk of every open item. Each item may
@@ -478,7 +477,7 @@ have to be enabled.
   mirror to the pull that saw it; divide by `changes` for the mean).
 
 That discovery no longer reaches GitHub shows as `loom.forge.calls` for
-`caller` `work_finder` and `stage_dwell` falling while `reads{outcome=hit}`
+`caller` `work_finder` falling while `reads{outcome=hit}`
 rises.
 
 **Break-glass.** Unset `forge.mirror`. Within a minute no listing asks the
