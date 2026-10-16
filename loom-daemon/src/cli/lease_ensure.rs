@@ -134,6 +134,12 @@ pub(crate) enum LeaseCommand {
     /// See `cli::lease_co_occupancy`.
     CoOccupancy(super::lease_co_occupancy::LeaseCoOccupancyArgs),
 
+    /// Hand back this host's lease on `<issue>`: stop its renewer(s) and post
+    /// a `loom:lease-yield` so `forge check-claim` stops counting it (#12103).
+    /// Idempotent; refuses (exit 1) a live lease held by another host. See
+    /// `cli::lease_release`.
+    Release(super::lease_release::LeaseReleaseArgs),
+
     /// Single-owner bookkeeping and the per-cycle completion gate for
     /// `sweep-lease-renew.sh`'s renewal loops (#10229). See
     /// `cli::lease_renewer`.
@@ -151,6 +157,7 @@ impl LeaseCommand {
         match self {
             LeaseCommand::Ensure(args) => args.run(),
             LeaseCommand::CoOccupancy(args) => args.run(),
+            LeaseCommand::Release(args) => args.run(),
             LeaseCommand::Renewer(action) => action.run(),
             LeaseCommand::Pr(action) => action.run(),
         }

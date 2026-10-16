@@ -419,6 +419,7 @@ pub mod target_dir_gc;
 pub mod target_orphan_reclaim;
 /// Per-task liveness heartbeats for the daemon's long-running loops (Issue
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
+pub mod task_dump;
 pub mod task_liveness;
 pub mod telemetry;
 pub mod telemetry_join;

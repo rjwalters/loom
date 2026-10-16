@@ -755,6 +755,20 @@ fn jobs_path(repo: &str, run_id: u64) -> String {
     format!("repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100")
 }
 
+/// The `loom.ci.queue_depth` gauge (#11993): runs still `queued` in the page
+/// already fetched, so it costs no request and rides the CI cycle's cadence.
+/// A run older than the rescan floor that is still queued is not counted; it
+/// is already an outlier through its `queued_ms`.
+fn emit_queue_depth(repo: &str, runs: &[RunJson]) {
+    use crate::telemetry::ops::{MetricName, MetricPoint};
+    let depth = runs.iter().filter(|run| run.is_queued()).count();
+    crate::observability::ops::emit_metrics(vec![MetricPoint::int(
+        MetricName::CiQueueDepth,
+        i64::try_from(depth).unwrap_or(i64::MAX),
+    )
+    .label("repo", repo)]);
+}
+
 fn poll_repo(
     ctx: &CycleContext<'_>,
     api: &dyn GithubApi,
@@ -772,6 +786,7 @@ fn poll_repo(
             serde_json::from_str::<RunsPage>(body).map(|p| p.workflow_runs)
         })?;
     runs.sort_by_key(|r| (r.created_at, r.id));
+    emit_queue_depth(full, &runs);
 
     // #9088: resolve story membership for every run this pass may emit, up
     // front, so a repo costs at most one identity probe and one batched
