@@ -749,6 +749,15 @@ in the same change, so `loom.issue` is no longer ambiguous on a multi-repo
 host. Full attribute table in
 [`telemetry-schema.md`](telemetry-schema.md#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting).
 
+**Step claim facts (#12183).** A `loom.dispatch.step` span for a role-keyed
+lease claim (every step but Builder) also carries how `lease pr claim` ran,
+whether the step spawned or was refused: `loom.dispatch.claim_outcome`
+(`exited` / `timed_out` / `spawn_failed` / `signaled` / `no_binary`),
+`loom.dispatch.claim_exit_code` (only when it exited), `loom.dispatch.claim_ms`,
+and `loom.dispatch.claim_stderr_tail` (last stderr line, control characters
+stripped, at most 256 bytes). They say *why* a `claim_unverified` refusal
+happened; `loom.dispatch.reason` keeps its closed tokens.
+
 Mapping an operator's plain-English question onto the `QueueDisposition`
 vocabulary (`loom.queue.disposition`'s wire values):
 
