@@ -207,13 +207,28 @@ impl SweepRegistry {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return;
         };
-        let pairs: Vec<PersistedPair> = match serde_json::from_str(&raw) {
-            Ok(pairs) => pairs,
+        // Entry by entry, so one entry this build cannot decode (a cause added
+        // by a newer daemon) does not discard the rest (#12524).
+        let entries: Vec<serde_json::Value> = match serde_json::from_str(&raw) {
+            Ok(entries) => entries,
             Err(e) => {
                 log::warn!("step_ledger: ignoring unreadable {}: {e}", path.display());
                 return;
             }
         };
+        let pairs: Vec<PersistedPair> = entries
+            .into_iter()
+            .filter_map(|v| match serde_json::from_value(v) {
+                Ok(pair) => Some(pair),
+                Err(e) => {
+                    log::warn!(
+                        "step_ledger: skipping undecodable entry in {}: {e}",
+                        path.display()
+                    );
+                    None
+                }
+            })
+            .collect();
         let count = pairs.len();
         self.step_ledger.restore(pairs, Utc::now());
         self.step_ledger_persisted = raw;
