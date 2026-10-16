@@ -51,7 +51,11 @@ case "$1 $2" in
   "issue list")
     [[ -n "${FAIL_LIST:-}" ]] && { echo "rate limited" >&2; exit 1; }
     case "$args" in
-      *'loom:epic-phase'*) emit '[]' ;;
+      *'loom:epic-phase'*)
+        if [[ -n "${BIG_PAGE:-}" ]]; then   # full 500-row page, none carrying the marker
+          emit "$(jq -nc '[range(500) | {number: (1000 + .), state: "CLOSED", body: "unrelated"}]')"
+        else emit '[]'; fi ;;
+      *'Epic #23'*) [[ -n "${BIG_PAGE_D:-}" ]] && emit "$(jq -nc '[range(200) | {number: (2000 + .), state: "CLOSED"}]')" || emit '[]' ;;
       *'loom:parent #23'*) emit '[{"number":103,"state":"OPEN","body":"x\n<!-- loom:parent #23 -->"},{"number":104,"state":"OPEN","body":"<!-- loom:parent #230 -->"}]' ;;
       *) emit '[]' ;;
     esac ;;
@@ -98,6 +102,12 @@ echo "Test 3: long task list is not truncated silently"
 read -r _ _ complete _ <<<"$(run BIG_TASKLIST=1)"
 eq ">100 task refs marks discovery incomplete" "$complete" "no"
 
+echo "Test 3b: a full raw page trips the flag even when the marker filter leaves few rows"
+read -r _ _ complete _ <<<"$(run BIG_PAGE=1)"
+eq "full phase-marker page marks discovery incomplete" "$complete" "no"
+read -r _ _ complete _ <<<"$(run BIG_PAGE_D=1)"
+eq "full weak-reference page marks discovery incomplete" "$complete" "no"
+
 echo "Test 4: role docs wire the flag and the new routes"
 check "0a refuses a completion candidate on incomplete discovery" "$EPIC" 'EPIC_CHILD_DISCOVERY_COMPLETE=no'
 check "0c files a verification child under the epic" "$EPIC" 'create-issue.sh --parent "$EPIC_NUMBER" --label loom:triage'
@@ -106,6 +116,9 @@ if grep -qF 'gh issue edit "$EPIC_NUMBER" --add-label "loom:operator"' "$EPIC"; 
     fail "0c still adds a bare loom:operator"
 else pass "0c no longer adds a bare loom:operator"; fi
 if grep -F "head -40" "$COMMON" | grep -vq '^\s*#'; then fail "silent head -40 cap remains"; else pass "no silent head -40 cap"; fi
+check "0c assigns RESIDUE_KIND explicitly" "$EPIC" 'RESIDUE_KIND=judgement'
+check "0c reads the verification child outcome" "$EPIC" 'VERIFY_STATE=$(gh issue list'
+check "0c builds the decision JSON with jq --arg" "$EPIC" 'jq -n --arg n "$EPIC_NUMBER"'
 check "0d table documents the new rows" "$EPIC" 'sky130-sar-adc#23 shape'
 
 echo

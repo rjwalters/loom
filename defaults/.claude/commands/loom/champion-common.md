@@ -274,16 +274,18 @@ discover_epic_children() {
   EPIC_CHILD_DISCOVERY_COMPLETE=yes
 
   # (a) phase-marker children — the historical source (champion-epic.md Step 3).
-  local a
-  # `gh --jq` takes only an expression (no `--arg`), so the marker — digits and
-  # literals only — is interpolated into the program directly. Includes
+  # Every `gh issue list` below is fetched UNFILTERED and filtered locally with
+  # jq: the truncation check must see the raw page, because a full page whose
+  # marker matches are few would otherwise look short (#10935). Includes
   # loom:frozen children (discovery, not work).
-  a=$(${GH_READ:-gh} issue list --repo "$repo" --label="loom:epic-phase" --state=all --limit=500 \
-    --json number,state,body \
-    --jq "[.[] | select(.body | contains(\"$marker\")) | {number, state}]" 2>/dev/null) \
-    || { a='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
+  page_full() { [ "$(printf '%s' "$1" | jq 'length' 2>/dev/null || echo 0)" -ge "$2" ]; }
+  local a a_raw
+  a_raw=$(${GH_READ:-gh} issue list --repo "$repo" --label="loom:epic-phase" --state=all --limit=500 \
+    --json number,state,body 2>/dev/null) \
+    || { a_raw='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
   # A full page means the list was cut at --limit: more children may exist.
-  [ "$(printf '%s' "$a" | jq 'length' 2>/dev/null || echo 0)" -ge 500 ] && EPIC_CHILD_DISCOVERY_COMPLETE=no
+  page_full "$a_raw" 500 && EPIC_CHILD_DISCOVERY_COMPLETE=no
+  a=$(printf '%s' "$a_raw" | jq --arg m "$marker" '[.[] | select(.body | contains($m)) | {number, state}]')
 
   # (b) native sub-issues. 404s (→ `[]`) on forges/repos without the API, which
   # is a legitimate "no evidence", never "no children". Any OTHER failure (rate
@@ -325,17 +327,21 @@ discover_epic_children() {
 
   # (e) `<!-- loom:parent #N -->` children. The search is a loose text match; the
   # jq select re-checks the exact marker so #12 never matches #123.
-  local e
-  e=$(${GH_READ:-gh} issue list --repo "$repo" --state=all --limit=200 \
-    --search "\"loom:parent #$num\" in:body" --json number,state,body \
-    --jq "[.[] | select(.body | contains(\"<!-- loom:parent #$num -->\")) | {number, state}]" 2>/dev/null) \
-    || { e='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
+  # Search recall on an HTML comment is not guaranteed; `create-issue.sh --parent`
+  # also files a native sub-issue link, so source (b) is the independent fallback.
+  local e e_raw
+  e_raw=$(${GH_READ:-gh} issue list --repo "$repo" --state=all --limit=200 \
+    --search "\"loom:parent #$num\" in:body" --json number,state,body 2>/dev/null) \
+    || { e_raw='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
+  page_full "$e_raw" 200 && EPIC_CHILD_DISCOVERY_COMPLETE=no
+  e=$(printf '%s' "$e_raw" | jq --arg m "<!-- loom:parent #$num -->" '[.[] | select(.body | contains($m)) | {number, state}]')
 
   # (d) weak: prose references to this epic, no containment claimed.
   local d
   d=$(${GH_READ:-gh} issue list --repo "$repo" --state=all --limit=200 \
-    --search "\"Epic #$num\" in:body" --json number,state --jq '.' 2>/dev/null) \
+    --search "\"Epic #$num\" in:body" --json number,state 2>/dev/null) \
     || { d='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
+  page_full "$d" 200 && EPIC_CHILD_DISCOVERY_COMPLETE=no
 
   local strong weak
   strong=$(jq -s --argjson e "$num" 'add | map(select(.number != $e)) | unique_by(.number)' \
