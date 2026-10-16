@@ -20,7 +20,8 @@
 //!
 //! There is never a writer tier. The step gather reads only the tick's
 //! snapshot ([`TickSnapshot::repo`]), which is a plain value
-//! ([`RepoSnapshot`]) other readers can consume later (#12307). Claim,
+//! ([`RepoSnapshot`]); the other listing readers consume it through
+//! [`published`] (#12307). Claim,
 //! lease, label-transition and merge reads stay live
 //! (`forge_events/poll_gate.rs` invariant 3): this module never serves them.
 
@@ -28,6 +29,7 @@ pub mod chain;
 pub mod direct;
 pub mod fallback;
 pub mod mirror;
+pub mod published;
 pub mod snapshot;
 pub mod worklist;
 

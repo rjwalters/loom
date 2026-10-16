@@ -740,8 +740,9 @@ fn an_inactive_mirror_falls_to_the_next_tier() {
 
 /// The snapshot answers `ReadKind::Discovery` only (`poll_gate` invariant 3):
 /// no claim, label-transition or merge module names it, so no such decision
-/// can read it. The reconcilers that will read it (#12307) join this list in
-/// their own slices.
+/// can read it. The listing readers that moved onto it (#12307) are named
+/// here; each keeps its write-gating checks (`scan_issue`, `mergeable_of`, PR
+/// state) live.
 #[test]
 fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -777,6 +778,14 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         }
     }
     let expected: std::collections::BTreeSet<String> = [
+        // The listing readers (#12307).
+        "claim_reconciliation/open_pr_listing.rs",
+        "claim_reconciliation/open_pr_listing_tests.rs",
+        "observability/queue_blocked.rs",
+        "observability/queue_blocked_tests.rs",
+        "quarantine_reconciliation/listing.rs",
+        // The gather concurrency is the Direct backend's alone.
+        "step_dispatch/gather_budget.rs",
         "observability/ops/dispatch_facts.rs",
         "step_dispatch/driver.rs",
         "step_dispatch/gather.rs",
