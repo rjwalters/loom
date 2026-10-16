@@ -201,6 +201,19 @@ impl Sandbox {
     }
 }
 
+/// #12394: the read was shed — no reader could serve it, and the writer is
+/// never used for a read.
+fn shed(out: &Output) {
+    assert_eq!(
+        out.status.code(),
+        Some(75),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("read shed"));
+}
+
 fn ok(out: &Output) {
     assert!(
         out.status.success(),
@@ -281,7 +294,7 @@ fn a_gateway_for_another_owner_leaves_a_passthrough_read_to_the_reader() {
 }
 
 #[test]
-fn a_reader_fault_reruns_the_read_on_the_writer_and_withdraws_no_gateway() {
+fn a_reader_fault_sheds_the_read_and_never_uses_the_writer() {
     let sb = Sandbox::new();
     let reader = sb.publish_reader("acme");
     let ws = sb.p("ws");
@@ -291,15 +304,14 @@ fn a_reader_fault_reruns_the_read_on_the_writer_and_withdraws_no_gateway() {
     ];
 
     let diff = sb.gh(DIFF, &env);
-    ok(&diff);
-    assert_eq!(String::from_utf8_lossy(&diff.stdout), "ok\n");
-    assert_eq!(sb.dirs_for("pr diff"), [reader.clone(), sb.p("writer")]);
+    shed(&diff);
+    assert_eq!(sb.dirs_for("pr diff"), [reader.clone()]);
     // The gateway's outage marker is never written beside a reader.
     assert!(!reader.parent().unwrap().join("outage-until").exists());
 }
 
 #[test]
-fn a_readers_own_refusal_reruns_the_read_on_the_writer() {
+fn a_readers_own_refusal_sheds_the_read_and_never_uses_the_writer() {
     for msg in [
         "HTTP 404: Not Found (https://api.github.com/repos/acme/widget/pulls/42)",
         "HTTP 403: Resource not accessible by integration",
@@ -316,22 +328,20 @@ fn a_readers_own_refusal_reruns_the_read_on_the_writer() {
         ];
 
         let diff = sb.gh(DIFF, &env);
-        ok(&diff);
-        assert_eq!(String::from_utf8_lossy(&diff.stdout), "ok\n", "{msg}");
-        assert_eq!(String::from_utf8_lossy(&diff.stderr), "", "{msg}");
-        assert_eq!(sb.dirs_for("pr diff"), [reader.clone(), sb.p("writer")], "{msg}");
+        shed(&diff);
+        assert_eq!(sb.dirs_for("pr diff"), [reader.clone()], "{msg}");
     }
 }
 
 #[test]
-fn a_passthrough_read_skips_a_reader_directory_others_can_write() {
+fn a_passthrough_read_skips_a_reader_directory_others_can_write_and_sheds() {
     let sb = Sandbox::new();
     let reader = sb.publish_reader("acme");
     std::fs::set_permissions(&reader, std::fs::Permissions::from_mode(0o770)).unwrap();
     let ws = sb.p("ws");
 
-    ok(&sb.gh(DIFF, &[("LOOM_GH_READER_ROOT", ws.as_path())]));
-    assert_eq!(sb.dirs_for("pr diff"), [sb.p("writer")]);
+    shed(&sb.gh(DIFF, &[("LOOM_GH_READER_ROOT", ws.as_path())]));
+    assert!(sb.dirs_for("pr diff").is_empty(), "no read was sent");
 }
 
 #[test]
