@@ -33,6 +33,13 @@
 //! the ramp cap are host-wide, so they bound how many slots the tick fills
 //! rather than refusing one draw.
 //!
+//! An **unverifiable claim** ([`REFUSAL_CLAIM_UNVERIFIED`]) is the exception
+//! to "draw again" (#12260): the pre-claim's lease reads and post run on the
+//! forge owner's writer installation, so when one cannot be verified (in
+//! practice, that installation is rate-limited) every other draw of the
+//! same owner fails the same way. Every workspace of that owner leaves the
+//! draw for the rest of the tick; other owners keep drawing.
+//!
 //! Pure over its inputs: the listing, the classification and the weighing
 //! happen before ([`super::gather`]), and the spawn is the caller's. That
 //! is what lets one test drive a whole tick with a fake forge and a fake
@@ -64,6 +71,19 @@ pub const MAX_PASSES_PER_TICK: u32 = 32;
 pub const PASS_REPO_CAP: &str = "repo_cap";
 /// The pass reason of a second Champion merge in one repo in one tick.
 pub const PASS_MERGE: &str = "merge_in_flight";
+/// The spawn refusal of a pre-claim that could not be verified
+/// (`sweep_registry::step_spawn::lease`): it ends the owner's draws for the
+/// tick (module docs, #12260).
+pub const REFUSAL_CLAIM_UNVERIFIED: &str = "claim_unverified";
+
+/// The forge owner of a workspace's `owner/repo` slug, lowercased (GitHub
+/// owners are case-insensitive). Pure.
+#[must_use]
+pub fn forge_owner(repo: &str) -> String {
+    repo.split_once('/')
+        .map_or(repo, |(owner, _)| owner)
+        .to_ascii_lowercase()
+}
 
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -558,6 +578,20 @@ pub fn run(
                         .or_default()
                         .entry(reason.clone())
                         .or_default() += 1;
+                    if reason == REFUSAL_CLAIM_UNVERIFIED {
+                        // The owner's writer installation cannot verify a
+                        // claim: every workspace of that owner leaves the
+                        // draw for the rest of the tick (#12260).
+                        let owner = match by_idx.get(&idx) {
+                            Some(ws) => forge_owner(&ws.repo),
+                            None => String::new(),
+                        };
+                        for other in workspaces.iter() {
+                            if forge_owner(&other.repo) == owner {
+                                draw.close_repo(other.idx);
+                            }
+                        }
+                    }
                     *pass_counts.entry(reason).or_default() += 1;
                 }
             }

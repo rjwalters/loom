@@ -3,7 +3,8 @@
 //!
 //! - [`listing`]: every open issue and pull request of a repo, from the GitHub
 //!   state mirror when it can vouch for the repo, else the shared ETag-cached
-//!   REST walk (#11894 §4.2 step 1).
+//!   REST walk (#11894 §4.2 step 1). Since #12306 this is the Direct backend
+//!   of [`crate::discovery`]; the gather reads the tick's snapshot, not this.
 //! - [`stage_entry`]: when an item entered its current stage, from the
 //!   mirror's `labels_at`, then the issue's events, then its creation time
 //!   (#11894 §4.3).

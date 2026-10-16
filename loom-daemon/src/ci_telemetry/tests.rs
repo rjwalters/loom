@@ -23,6 +23,7 @@ mod journal_rotation;
 mod journal_view;
 mod ledger_retention;
 mod owners;
+mod queue_depth;
 mod queue_time;
 mod reader_routing;
 mod rerun_window;
