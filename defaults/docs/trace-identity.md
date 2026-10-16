@@ -20,8 +20,7 @@ inside a key use RFC 3339 UTC with nanosecond precision.
 
 | Trace | Trace ID is derived from |
 |-------|--------------------------|
-| Issue story (`loom.story.trace`) | the repo's GitHub numeric `repo_id` and the issue number: `loom-story/v1:github:<repo_id>:<issue>` (story key version v1, #9068) — stable across repo renames and transfers; see [`tracing.md`](tracing.md) |
-| Sweep outside a story (`loom.execution.trace`) | lowercased repo key (`$LOOM_REPO`, else the checkout's GitHub `owner/repo`, else the workspace basename), sweep id — used for PR-set sweeps and checkouts with no GitHub origin. The span's `loom.repo` is that repo spelled as GitHub spells it (#10637); the key is its ASCII lowercase |
+| Sweep (`loom.execution.trace`) | lowercased repo key (`$LOOM_REPO`, else the checkout's GitHub `owner/repo`, else the workspace basename), sweep id. The span's `loom.repo` is that repo spelled as GitHub spells it (#10637); the key is its ASCII lowercase |
 | Role-runner invocation (`loom.execution.trace`) | the same repo key, and the execution id `role-<role>-<start instant>` — carried as `loom.repo` (the key is its ASCII lowercase) and `loom.sweep_id` on the `loom.role_attempt` root. The role is in the key so two roles starting in the same instant differ; the repo key (not a host id) scopes it, because the span carries the repo but no host attribute, and one repo's role runner ticks each role serially |
 | Dispatch tick (`loom.dispatch.tick`) | tick start instant |
 | Pool hold (`loom.pool.hold`) | pool identity (`loom.pool.hold.pool`, a hash of the pool directory) and hold start instant (`since`) — every hold armed in one work-finder tick shares `since`, so the pool is what tells them apart |
@@ -33,14 +32,9 @@ inside a key use RFC 3339 UTC with nanosecond precision.
 | `gh` invocation with no parent (`loom.github.invoke`, span `invoke github`) | `github.operation`, start instant, and `github.invocation` (`<pid>.<seq>`, so two calls in one clock tick differ); with a parent it is that span's child, keyed by the same facts (#9985) |
 | CI run/job (`loom.ci.*`) | repo, run id, attempt (job: job id) — [`ci-observability.md`](ci-observability.md) |
 
-Every sweep of an issue is a `loom.sweep` span in that issue's story trace.
-Its span ID is derived from the story root and the sweep id
-(`sweep-issue-42-1790000000`). A role-runner tick that wrote to an issue or PR
-adds a `loom.role_attempt` span to that story (#9168) whose ID is derived from
-the story root, `loom.role_tick`, the tick's execution id (`loom.sweep_id`)
-and the target (`pr:<loom.pr_number>`, else `issue:<loom.issue>`).
-The story's `story.*` phase spans are the 2am reconciler's, with story-key IDs keyed
-by a GitHub timeline event (see [`tracing.md`](tracing.md)); Loom mints none.
+Every sweep is a `loom.sweep` span rooted in its own execution trace. A
+role-runner tick is a `loom.role_attempt` root in its own execution trace
+(table above).
 
 **`loom.attempt`** has one meaning everywhere: the 1-indexed ordinal of a span
 among the same-named spans (and the same `loom.role`, when present) under the
@@ -71,14 +65,12 @@ Dispatch admissions also key on `loom.issue`.
 
 Consequences:
 
-- Every sweep of an issue, on any host, lands in the **same** trace: the
-  issue's story. Each retry is a distinct sibling span because the sweep id
+- Each retry of an issue is a distinct execution because the sweep id
   carries the dispatch time. The sweep id is in the registry, the lease
   comment, logs and the `loom.sweep_id` attribute.
 - Re-emitting the same work (such as a replay, a restart re-report, or a second
   host) produces the same IDs, so a backend can deduplicate on them.
-- The sweep span carries its derivation inputs: `loom.repo`, `loom.issue` and
-  `loom.story_id` in a story, or `loom.repo` and `loom.sweep_id` outside one.
+- The sweep span carries its derivation inputs: `loom.repo` and `loom.sweep_id`.
   `loom.repo` is GitHub's own `owner/name` spelling, the value
   `loom.dispatch.*` carries; a repo key is its ASCII lowercase (#10637).
 
