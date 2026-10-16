@@ -109,25 +109,58 @@ pub enum StepEnd {
     TimedOut,
 }
 
+/// Whether a clean exit of a `role` step with `class` is a non-success: a
+/// Builder step that exits 0 without opening a PR (`noop`) or without
+/// writing any outcome line (#12500). Other roles' exit 0 is a completion.
+fn clean_exit_failure(role: StepRole, class: Option<StepOutcomeClass>) -> Option<CleanExit> {
+    if role != StepRole::Builder {
+        return None;
+    }
+    match class {
+        Some(StepOutcomeClass::Noop) => Some(CleanExit::NoPr),
+        None => Some(CleanExit::NoOutcomeLine),
+        Some(_) => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CleanExit {
+    NoPr,
+    NoOutcomeLine,
+}
+
 /// The role tick outcome a step's end maps to. The session's `failed`
-/// class, a non-zero exit, a timeout and a cancel are failures; anything
-/// else completed. Pure.
+/// class, a non-zero exit, a timeout and a cancel are failures, and so is a
+/// Builder step that ends without a PR (`noop`, or no outcome line at all,
+/// #12500); anything else completed. Pure.
 #[must_use]
-pub fn tick_outcome(end: StepEnd, line: Option<&StepOutcomeLine>) -> RoleTickOutcome {
+pub fn tick_outcome(
+    role: StepRole,
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+) -> RoleTickOutcome {
     let class = line.map(|l| l.class);
+    let reason = line.map_or("", |l| l.reason.as_str());
+    let clean = clean_exit_failure(role, class);
     match (end, class) {
         (StepEnd::TimedOut, _) => RoleTickOutcome::Failure("step timed out".to_string()),
         (StepEnd::Cancelled, _) => RoleTickOutcome::Failure("step cancelled".to_string()),
-        (_, Some(StepOutcomeClass::Failed)) => RoleTickOutcome::Failure(format!(
-            "step outcome failed: {}",
-            line.map_or("", |l| l.reason.as_str())
-        )),
-        (StepEnd::Exited(Some(0)), _) => RoleTickOutcome::Success,
-        (StepEnd::Exited(Some(code)), _) => RoleTickOutcome::Failure(format!("step exited {code}")),
-        (StepEnd::Exited(None), Some(_)) => RoleTickOutcome::Success,
+        (_, Some(StepOutcomeClass::Failed)) => {
+            RoleTickOutcome::Failure(format!("step outcome failed: {reason}"))
+        }
+        (StepEnd::Exited(Some(code)), _) if code != 0 => {
+            RoleTickOutcome::Failure(format!("step exited {code}"))
+        }
         (StepEnd::Exited(None), None) => {
             RoleTickOutcome::Failure("step exited, status unknown".to_string())
         }
+        _ => match clean {
+            Some(CleanExit::NoPr) => RoleTickOutcome::Failure(format!("no_pr: {reason}")),
+            Some(CleanExit::NoOutcomeLine) => {
+                RoleTickOutcome::Failure("step exited without an outcome line".to_string())
+            }
+            None => RoleTickOutcome::Success,
+        },
     }
 }
 
@@ -135,16 +168,26 @@ pub fn tick_outcome(end: StepEnd, line: Option<&StepOutcomeLine>) -> RoleTickOut
 /// `Some` exactly when `tick_outcome` is a `Failure`, one class per branch.
 /// The exit code rides `exit_code`, never the class. Pure.
 #[must_use]
-pub fn step_failure(end: StepEnd, line: Option<&StepOutcomeLine>) -> Option<RoleFailure> {
+pub fn step_failure(
+    role: StepRole,
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+) -> Option<RoleFailure> {
     use crate::observability::lifecycle::step;
     let class = line.map(|l| l.class);
     match (end, class) {
         (StepEnd::TimedOut, _) => Some(step::TIMED_OUT.failure(None)),
         (StepEnd::Cancelled, _) => Some(step::CANCELLED.failure(None)),
         (_, Some(StepOutcomeClass::Failed)) => Some(step::OUTCOME_FAILED.failure(None)),
-        (StepEnd::Exited(Some(0)), _) | (StepEnd::Exited(None), Some(_)) => None,
-        (StepEnd::Exited(Some(code)), _) => Some(step::EXIT_NONZERO.failure(Some(code))),
+        (StepEnd::Exited(Some(code)), _) if code != 0 => {
+            Some(step::EXIT_NONZERO.failure(Some(code)))
+        }
         (StepEnd::Exited(None), None) => Some(step::STATUS_UNKNOWN.failure(None)),
+        (StepEnd::Exited(code), _) => match clean_exit_failure(role, class) {
+            Some(CleanExit::NoPr) => Some(step::NO_PR.failure(code)),
+            Some(CleanExit::NoOutcomeLine) => Some(step::NO_OUTCOME_LINE.failure(code)),
+            None => None,
+        },
     }
 }
 
@@ -241,8 +284,8 @@ impl SweepRegistry {
             role,
             sweep_id: sweep_id.to_string(),
             started_at,
-            outcome: tick_outcome(end, line.as_ref()),
-            failure: step_failure(end, line.as_ref()),
+            outcome: tick_outcome(role, end, line.as_ref()),
+            failure: step_failure(role, end, line.as_ref()),
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
         };
