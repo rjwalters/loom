@@ -279,12 +279,24 @@ impl DurableQueue {
             .and_then(|item| serde_json::to_string(item).ok());
         if let Some(mut line) = line {
             line.push('\n');
-            let mut file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
-            write_counted(&mut file, line.as_bytes())?;
-            state.file_lines += 1;
-            if durable {
-                file.sync_all()?;
+            let appended = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .and_then(|mut file| {
+                    write_counted(&mut file, line.as_bytes())?;
+                    state.file_lines += 1;
+                    if durable {
+                        file.sync_all()?;
+                    }
+                    Ok(())
+                });
+            if appended.is_err() {
+                // A failed append may leave a torn line or a missing record;
+                // distrust the file so the next enqueue rewrites it from memory.
+                state.file_ready = false;
             }
+            return appended;
         }
         Ok(())
     }
@@ -434,10 +446,14 @@ impl DurableQueue {
                 state.file_lines = state.items.len();
                 state.file_ready = true;
             }
-            Err(error) => log::warn!(
-                "observability: failed to persist queue to {}: {error}",
-                self.path.display()
-            ),
+            Err(error) => {
+                // The file may still hold acked lines; force a rewrite next enqueue.
+                state.file_ready = false;
+                log::warn!(
+                    "observability: failed to persist queue to {}: {error}",
+                    self.path.display()
+                );
+            }
         }
     }
 }
@@ -1163,5 +1179,46 @@ mod tests {
         let fanout = FanoutQueue::new(Vec::new());
         QueueSink::offer(&fanout, envelope(1)); // must not panic
         assert!(fanout.queues().is_empty());
+    }
+
+    #[test]
+    fn torn_append_is_healed_by_the_next_enqueue() {
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let queue = DurableQueue::open(path.clone(), 8);
+        queue.push(envelope(1));
+        queue.push(envelope(2));
+        // Simulate a failed append that left a partial line with no newline,
+        // and the bookkeeping the failure path performs.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"partial").unwrap();
+        queue.lock().file_ready = false;
+        queue.push_durable(envelope(3)).unwrap();
+        drop(queue);
+        let reopened = DurableQueue::open(path, 8);
+        assert_eq!(issues(&reopened), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn failed_append_distrusts_the_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let queue = DurableQueue::open(path.clone(), 8);
+        queue.push(envelope(1));
+        assert!(queue.lock().file_ready);
+        // Replace the file with a directory so the append open fails.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(queue.push_durable(envelope(2)).is_err());
+        assert!(!queue.lock().file_ready, "a failed append must force a rewrite");
+        std::fs::remove_dir(&path).unwrap();
+        queue.push_durable(envelope(3)).unwrap();
+        drop(queue);
+        let reopened = DurableQueue::open(path, 8);
+        assert_eq!(issues(&reopened), vec![1, 2, 3]);
     }
 }
