@@ -18,7 +18,7 @@ use chrono::Utc;
 use super::gather_budget::{
     deadline_passed, millis, GatherWalk, SpawnParts, Starvation, TickPhases, GUARANTEED_FLOOR,
 };
-use super::item_draw::{weigh, ItemWeights, WeighContext};
+use super::item_draw::{weigh, ItemWeights, PoolKnobs, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
 use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawnTimings};
@@ -27,7 +27,7 @@ use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::repo_cap::{RepoCap, RepoLimits};
 use crate::work_finder::step_item::{Lane, Step};
-use crate::work_finder::{workspace_draw, RedMainLane, RegistryDispatcher, TickReport};
+use crate::work_finder::{RedMainLane, RegistryDispatcher, TickReport};
 use crate::workspace_pool::WorkspacePool;
 
 /// What the loop computed for this tick, per root and for the host.
@@ -388,6 +388,7 @@ impl StepDriver {
                     idx,
                     repo,
                     weight,
+                    in_flight: 0,
                     weighing: super::item_draw::Weighing {
                         pool: Vec::new(),
                         excluded: Default::default(),
@@ -503,6 +504,10 @@ impl StepDriver {
                 stale_listing: gathered.stale_listing,
                 fixes_only,
             };
+            // `in_flight_repo` (#12185): the repo's items this host runs plus
+            // the live claims peers advertise, counted before the claimed
+            // items leave the pool.
+            let in_flight = claims.items.len();
             let held = shape_pool(&mut weighing, &claims, listing);
             if held > 0 {
                 log::warn!(
@@ -521,6 +526,7 @@ impl StepDriver {
                 idx,
                 repo,
                 weight,
+                in_flight,
                 weighing,
                 halted: false,
                 created_at: gathered.created_at,
@@ -576,8 +582,12 @@ impl StepDriver {
                 spawn_concurrency: input.spawn_concurrency.max(1),
             },
             &seed,
-            workspace_draw::tick_seed(),
-            &workspace_draw::weight_bonus(),
+            // Pool-wide, so read once, from the primary workspace like the
+            // work-finder's own hot-applied config.
+            &input
+                .roots
+                .first()
+                .map_or_else(PoolKnobs::default, |root| PoolKnobs::for_root(root)),
             &mut repo_cap,
             &mut spawner,
         );

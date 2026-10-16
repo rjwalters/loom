@@ -495,8 +495,9 @@ fn only_the_discovery_listings_name_the_mirror() {
         2,
         "the helper and its caller"
     );
-    assert_eq!(count("observability/ops/stage_dwell.rs", "poll_gate::ReadKind::Discovery,"), 1);
-    assert_eq!(count("observability/ops/stage_dwell.rs", "Caller::"), 1);
+    // `mirror_listing` (stage dwell) and `mirror_hold_rows` (hold gauges, #12038).
+    assert_eq!(count("observability/ops/stage_dwell.rs", "poll_gate::ReadKind::Discovery,"), 2);
+    assert_eq!(count("observability/ops/stage_dwell.rs", "Caller::"), 2);
     assert_eq!(
         count("step_dispatch/listing.rs", "mirror_rows"),
         2,
@@ -507,8 +508,11 @@ fn only_the_discovery_listings_name_the_mirror() {
     assert_eq!(count("step_dispatch/listing.rs", "Caller::StepEngine,"), 1);
     assert_eq!(count("step_dispatch/listing.rs", "Caller::"), 1);
     // Only the step engine lists with no label.
-    for rel in ["work_finder/forge.rs", "observability/ops/stage_dwell.rs"] {
-        assert_eq!(count(rel, "Some(label),"), 1, "{rel} lists one label");
+    for (rel, listings) in [
+        ("work_finder/forge.rs", 1),
+        ("observability/ops/stage_dwell.rs", 2),
+    ] {
+        assert_eq!(count(rel, "Some(label),"), listings, "{rel} lists one label per listing");
     }
     // And of those, only the three listings call the listing.
     for rel in &users {

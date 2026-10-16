@@ -436,6 +436,11 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
             pr: None,
             step: "builder".to_string(),
             weight: 43_200,
+            draw_weight: 4_096,
+            repo_weight: 3,
+            repo_items: 9,
+            repo_pool_weight: 388_800,
+            in_flight_repo: 1,
             actionable: 1,
             priority: 1,
             level: "default".to_string(),
@@ -447,11 +452,24 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
         .collect();
     let record = PickDecisionRecord::build(tick("work_finder"), Vec::new()).with_item_draw(Some(
         PickItemDraw {
-            seed_scheme: "loom-draw/v2".to_string(),
+            seed_scheme: "loom-draw/v3".to_string(),
             seed_minute: "29000000".to_string(),
             seed_host: "host-a".to_string(),
             tick_counter: "17".to_string(),
             draws_total: 9,
+            backlog_exponent: "0.5".to_string(),
+            busy_exponent: "1".to_string(),
+            repos: vec![PickItemRepo {
+                repo: "o/r".to_string(),
+                weight: 3,
+                in_flight: 1,
+                items: 9,
+                pool_weight: 388_800,
+            }],
+            closures: vec![PickItemClosure {
+                repo: "o/big".to_string(),
+                after_draw: 4,
+            }],
             excluded: vec![PickItemExclusion {
                 repo: "o/r".to_string(),
                 reason: "pool_exhausted".to_string(),
@@ -500,11 +518,15 @@ fn a_large_item_pool_splits_into_bounded_chunks_and_reassembles() {
         .collect();
     let record = PickDecisionRecord::build(tick("work_finder"), Vec::new()).with_item_draw(Some(
         PickItemDraw {
-            seed_scheme: "loom-draw/v2".to_string(),
+            seed_scheme: "loom-draw/v3".to_string(),
             seed_minute: "1".to_string(),
             seed_host: "h".to_string(),
             tick_counter: "2".to_string(),
             draws_total: 0,
+            backlog_exponent: "0".to_string(),
+            busy_exponent: "0".to_string(),
+            repos: Vec::new(),
+            closures: Vec::new(),
             excluded: Vec::new(),
             pools: pool,
             draws: Vec::new(),
