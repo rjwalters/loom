@@ -7,6 +7,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12365**: chore(harness): track latest CLIs — codex 0.162.1→0.163.0 opencode 1.19.1→1.19.2
+- **PR #12366**: fix: define _sha256 helper in champion-epic Step 4 escalation block
+- **Issue #12356** (closed): champion-epic.md Step 4 escalation block uses _sha256 without defining it
+- **PR #12363**: docs: record safehouse extraction measurement and no-go in lib-test shrink design
+- **Issue #12157** (closed): Prototype and time a loom-safehouse crate extraction (loom-daemon lib-test shrink, step 0)
+- **PR #12338**: refactor: delete the forge stage-dwell sampler from the daemon
+- **Issue #12316** (closed): Delete the stage-dwell sampler from the daemon (dwell is a consumer's computation over the mirror's label times)
+- **PR #12334**: feat: merge stale stacked children in merge-only repos instead of only warning
+- **Issue #9808** (closed): merge-based de-stacking for stacked PR children (the rebase remedy is policy-barred; children go stale on every base move)
+- **PR #12358**: test: guard the last two integration crates against live gh spawns
+- **Issue #10225** (closed): loom-daemon integration tests (tests/*.rs) may still reach the real gh; extend the #10138 live-gh guard to them
+- **PR #12361**: docs: reattach task_dump and SIGUSR1 comments to their code
+- **Issue #11116** (closed): Umbrella: tests are not hermetic — host env, real binaries and shared process state leak into suites (21 bugs)
 - **Issue #12332** (closed): Fix displaced comments from SIGUSR1 task dump change (#12129)
 - **PR #12191**: feat(telemetry): carry provenance join facts as plain span attributes
 - **Issue #11982** (closed): Provenance out of Loom, stage 1: facts contract on spans and telemetry-schema doc
