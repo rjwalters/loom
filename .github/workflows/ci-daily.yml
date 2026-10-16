@@ -519,6 +519,9 @@ jobs:
     name: Flake Detection (shell suites, ${{ matrix.os }}, parallelism ${{ matrix.parallelism }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
+    # Only entries that set `advisory: true` (macOS, below) are non-gating; the
+    # key is absent on the ubuntu entries, so this is false there.
+    continue-on-error: ${{ matrix.advisory == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -539,8 +542,16 @@ jobs:
           # have. Unsharded and single-lane: the first question about a macOS
           # failure is "is it macOS or is it concurrency", and parallelism 1
           # answers it up front.
+          #
+          # ADVISORY until #12043 (the bash-3.2 suite fixes) lands: this leg is
+          # red in every scheduled run (docs/guides/ci-contract.md, "Always-red
+          # dispositions"), so it must not turn the run red by itself. Its only
+          # consumer is the `[ci-daily]` report issue #12019, which keeps being
+          # updated because the job `name:` above is unchanged (do NOT use the
+          # `(warn-only)` suffix). Follow-up once #12043 lands: drop `advisory`.
           - os: macos-latest
             parallelism: 1
+            advisory: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Report the bash under test

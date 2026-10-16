@@ -105,7 +105,7 @@ Against rule 3, over the inventory window:
 
 | Check | Window result | Disposition | Follow-up |
 |-------|---------------|-------------|-----------|
-| `CI Daily` → Flake Detection (shell suites, macos-latest) | 2 completed (both red), 15 cancelled by timeout, 0 green | Advisory until #12043 lands, then fix | #12198 (`loom:triage`); existing report #12019 |
+| `CI Daily` → Flake Detection (shell suites, macos-latest) | 2 completed (both red), 15 cancelled by timeout, 0 green | Advisory until #12043 lands, then fix. Advisory in the workflow: `advisory: true` on the macOS matrix entry drives `continue-on-error` (#12198) | #12043 (drop `advisory`); existing report #12019 |
 | `Security Scan` | 152 of 1000 runs red, all before #11688 closed; the latest runs on `main` are green | No change: fixed | #11688 |
 
 No `ci.yml` job is red on more than half of its runs. `Structural Checks`
