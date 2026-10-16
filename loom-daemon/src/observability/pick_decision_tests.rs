@@ -772,11 +772,12 @@ fn lane_plan_is_stashed_converted_and_drained_once() {
 #[test]
 fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
     use crate::step_dispatch::item_draw::{
-        weight_terms, AgeSource, Candidate, DrawRecord, Exclusion, ItemWeights,
+        weight_terms, AgeSource, Candidate, DrawRecord, DrawTerms, Exclusion, ItemDraw,
+        ItemWeights, PoolKnobs, RepoDrawTerms, RepoTerms, SeedKey,
     };
     use crate::work_finder::step_item::{Item, ItemState, Lane, PassReason, Step, Verdict};
-    assert!(item_draw_record(1, "h", 2, &[]).is_none());
     let picked = Candidate {
+        workspace_idx: 4,
         item: Item {
             issue: Some(7),
             pr: Some(8),
@@ -794,6 +795,44 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
             AgeSource::Mirror,
         ),
     };
+    let draw = ItemDraw::new(
+        vec![picked.clone()],
+        std::collections::BTreeMap::from([(
+            4,
+            RepoTerms {
+                weight: 6,
+                in_flight: 2,
+            },
+        )]),
+        PoolKnobs {
+            backlog_exponent: 0.5,
+            busy_exponent: 1.0,
+        },
+        SeedKey {
+            minute: 29_000_000,
+            host: "host-a".into(),
+            tick_counter: 17,
+        },
+    );
+    let excluded = std::collections::BTreeMap::from([
+        (Exclusion::Pass(PassReason::Claimed), 2),
+        (Exclusion::PoolExhausted, 1),
+    ]);
+    let workspaces = [ItemDrawWorkspace {
+        idx: 4,
+        repo: "o/r",
+        excluded: &excluded,
+    }];
+    let nothing = ItemDrawPool {
+        draw: &draw,
+        draws: &[],
+        overflow: false,
+    };
+    assert!(item_draw_record(1, "h", 2, &[], &nothing).is_none());
+    assert!(
+        item_draw_record(1, "h", 2, &workspaces, &nothing).is_none(),
+        "no draw, no record"
+    );
     let draws = [DrawRecord {
         draw_index: 0,
         seed: 99,
@@ -802,34 +841,52 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
         roll: 5,
         picked_index: 0,
         picked: picked.clone(),
+        terms: DrawTerms {
+            weight: 250_000,
+            total_weight: 1_000_000,
+            repo: RepoDrawTerms {
+                weight: 6,
+                in_flight: 2,
+                items: 3,
+                pool_weight: 77,
+            },
+        },
     }];
-    let excluded = std::collections::BTreeMap::from([
-        (Exclusion::Pass(PassReason::Claimed), 2),
-        (Exclusion::PoolExhausted, 1),
-    ]);
     let d = item_draw_record(
         29_000_000,
         "host-a",
         17,
-        &[ItemDrawWorkspace {
-            repo: "o/r",
-            excluded: &excluded,
-            pool: std::slice::from_ref(&picked),
+        &workspaces,
+        &ItemDrawPool {
+            draw: &draw,
             draws: &draws,
             overflow: false,
-        }],
+        },
     )
     .unwrap();
-    assert_eq!(d.seed_scheme, "loom-draw/v2");
+    assert_eq!(d.seed_scheme, "loom-draw/v3");
     assert_eq!(d.tick_counter, "17");
+    assert_eq!((d.backlog_exponent.as_str(), d.busy_exponent.as_str()), ("0.5", "1"));
     assert_eq!(
-        (d.pools.len(), d.pools[0].pr, d.pools[0].weight),
-        (1, Some(8), d.draws[0].weight)
+        (d.pools.len(), d.pools[0].pr, d.pools[0].weight, d.pools[0].repo.as_str()),
+        (1, Some(8), d.draws[0].weight, "o/r")
     );
+    let repo = &d.repos[0];
+    assert_eq!((repo.repo.as_str(), repo.weight, repo.in_flight, repo.items), ("o/r", 6, 2, 1));
     let step = &d.draws[0];
     assert_eq!(step.number, 8, "a Judge step acts on the PR");
     assert_eq!((step.priority, step.age_permille), (3, 2000));
     assert_eq!((step.age_source.as_str(), step.step.as_str()), ("mirror", "judge"));
+    assert_eq!(
+        (
+            step.draw_weight,
+            step.repo_weight,
+            step.repo_items,
+            step.repo_pool_weight,
+            step.in_flight_repo
+        ),
+        (250_000, 6, 3, 77, 2)
+    );
     let counts: Vec<(&str, PickSkipReason, usize)> = d
         .excluded
         .iter()

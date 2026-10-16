@@ -3113,12 +3113,20 @@ in [`priority-model.md`](priority-model.md)):
   - `loom-daemon workspace list` prints a `WEIGHT` column, heaviest first
     (mutation order on disk is preserved).
 
-- **Work-finder ordering** — `work_finder::tick_multi` takes a `weights`
+- **Step tick (#12185)** — the step engine does not draw a workspace first:
+  it draws one item from a single pool of every actionable item across the
+  workspaces, with weight `w_repo × priority × age × S_r^(α−1) ×
+  (1 + in_flight_repo)^(−β)`, where `w_repo` is the weight above. The
+  `dispatch.weightBonus*` points are retired (accepted, ignored). Knobs and
+  formula: [`hyperparameters.md`](hyperparameters.md#the-item-draw-12185).
+
+- **Work-finder ordering** (the legacy pass-1 queue) — `work_finder::tick_multi` takes a `weights`
   slice parallel to the workspaces. It gathers **every** eligible candidate
   across all workspaces and orders them by **weighted workspace draws**
   (#11103, #11742): each draw picks a workspace with probability
-  `w / Σw`, where `w` is its weight plus the `dispatch.weightBonus*` points it
-  earns for a verified red-main fix, very-important or important work, and
+  `w / Σw`, where `w` is its weight plus the default weight-bonus points it
+  earns for a verified red-main fix, very-important or important work (the
+  `dispatch.weightBonus*` keys no longer change them, #12185), and
   places its next issue (red-main fix, level, oldest, number). There are no
   tiers. `pick.decision` records each candidate's `base_weight`, `bonus` and
   `weight`. It fills the single shared concurrency budget in that order. The
@@ -3162,7 +3170,7 @@ follows the workspace draw, and the single-workspace tick uses the same four
 keys (passed the repo's real verified-red state). The workspace draw has no
 tiers (#11742): every workspace with work is drawn with probability
 `(weight + bonuses) / Σ`, where a verified red-main fix, very-important work
-and important work each add their `dispatch.weightBonus*` points. #11508 removed the legacy keys: the star, its
+and important work each add their default bonus points. #11508 removed the legacy keys: the star, its
 levels and inherited levels, the starred-at time and its restart store
 (`starred-<sha16>.json`, no longer read or written; `LOOM_STARRED_AT_PERSIST` is
 ignored), and `workspace_weight` as a rank key (it weights the workspace
@@ -14379,6 +14387,31 @@ dispatch — is validated by the E2E playbook at
 throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
 the operator only ever created the issue.
+
+### Forge call purpose and the gateway discovery reserve (#12310)
+
+Every forge call the `gh` facade makes carries a **purpose**: `discovery` (a
+listing made to find work), `gate`, `write`, `hygiene` or `observability`.
+It is `loom.forge.purpose` on the `invoke github` span and `purpose` on
+`loom.forge.calls`; a write is `write`, a read is `gate` unless its site marks
+it `discovery` (`GhInvocation::discovery()` or a `purpose::discovery()` scope
+around a listing) or gave it a deferrable `ReadClass`. Epic #12304 counts
+`discovery` reads per tick.
+
+A `discovery` read sent as `gh api` also carries the request header
+`loom.forge.purpose: discovery` (porcelain commands such as `gh issue list`
+cannot carry one). No `gate` or `write` call sends it. GitHub and Gitea
+ignore unknown request headers, so a standalone install is unaffected.
+
+The read gateway may use the header to refuse discovery reads (`429`) once a
+pool's remaining quota is below a reserve held for gate reads and the mirror.
+That refusal is the fleet operator's side of the contract; the daemon's side
+is: the `429` message contains `loom-gateway-reserve`. The daemon then books
+the call as outcome `reserve_refused` (not `rate_limited`), stamps the span
+`loom.discovery.fallback_reason = reserve`, sends no more discovery reads on
+that thread until the next work-finder tick (or 30 s), never retries it on the
+writer, and does **not** feed the rate-limit breaker, so claims and writes
+carry on. Real rate-limit responses still trip the breaker.
 
 ## Reader withdrawal kill switch (`LOOM_READ_ROUTING`)
 

@@ -731,6 +731,8 @@ pub fn landed_in(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cache = all.entry(root).or_default();
+        // #12310: the closing-refs reads are discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         detect(&mut forge, cache, candidates, open_pr, Instant::now())
     };
     if !landed.is_empty() {
