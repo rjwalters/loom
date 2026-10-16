@@ -177,11 +177,7 @@ fn a_writer_fallback_env_plan_equals_the_pre_change_plan_with_derivation_on_and_
             .clone()
             .with_derived_route_in(&off, &sole("acme/origin"));
         assert!(not_derived.reader_slug().is_none());
-        for role in [
-            None,
-            Some(IdentityRole::Writer),
-            Some(IdentityRole::WriterFallback),
-        ] {
+        for role in [None, Some(IdentityRole::Writer)] {
             let attempt = |inv: &GhInvocation| {
                 let inv = match role {
                     Some(r) => inv.clone().identity_role(r),

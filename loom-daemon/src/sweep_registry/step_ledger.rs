@@ -10,7 +10,7 @@
 //! | `Cooldown` | the window, broadcast |
 //! | `FastFailLadder` (Builder steps only) | [`SweepRegistry::charge_fast_failure`] (the #11854 ladder and park), and the ladder's window mirrored onto `(item, step)` and broadcast |
 //! | `FastFailWindow` (every other step: PR steps, Curator, Champion promotion) | the ledger's own doubling window, broadcast; **no** forge write: the park's release restores `loom:issue`, which is only right for an issue Builder was building (#11969) |
-//! | `ForgeLadder` | the next rung written to the item's body ([`reeval_ladder::record`]), its due time mirrored locally (capped at 24 h) and broadcast |
+//! | `ForgeLadder` | the next rung written to the item's body ([`reeval_ladder::record`]), its due time mirrored locally (capped at 24 h) and broadcast. When the write fails, that rung's window is held locally (persisted, restored on restart) and broadcast, and the run counts toward the repeat cap (#12516) |
 //! | `Redraw` | counted; a second in a row on the pair arms the ledger's doubling refusal cooldown, broadcast (#11969) |
 //! | `Reclassify` | nothing for the first; a second identical state refusal in a row arms the ledger's doubling refusal cooldown, broadcast. Not a repeat-cap run |
 //! | `Failed` (slow) | counted toward the repeat cap |
@@ -101,6 +101,7 @@ impl SweepRegistry {
                 }
             }
         }
+        let mut capped = rec.repeat_capped;
         match rec.effect {
             Effect::Landed => {
                 self.arm_landed_cooldown(item, LANDED_COOLDOWN);
@@ -117,27 +118,38 @@ impl SweepRegistry {
                         .arm(item, step, until, CooldownCause::FastFail, now);
                 }
             }
-            Effect::ForgeLadder => {
-                // On a failed write, the first rung still holds locally, so
-                // the item is not redrawn on the next tick.
-                let next = match reeval_ladder::record(forge, item, step, now) {
-                    Ok(r) => {
-                        log::info!(
-                            "step_ledger: #{item} {step} re-evaluation ladder rung {} until {}",
-                            r.rung,
-                            r.next
-                        );
+            Effect::ForgeLadder => match reeval_ladder::record(forge, item, step, now) {
+                Ok(r) => {
+                    log::info!(
+                        "step_ledger: #{item} {step} re-evaluation ladder rung {} until {}",
+                        r.rung,
                         r.next
-                    }
-                    Err(e) => {
-                        log::warn!("step_ledger: writing the re-evaluation ladder on #{item}: {e}");
-                        now + chrono::Duration::from_std(reeval_ladder::FIRST_RUNG)
-                            .unwrap_or_else(|_| chrono::Duration::hours(6))
-                    }
-                };
-                self.step_ledger
-                    .arm(item, step, next, CooldownCause::ForgeLadder, now);
-            }
+                    );
+                    self.step_ledger
+                        .arm(item, step, r.next, CooldownCause::ForgeLadder, now);
+                }
+                // A failed write (#12516): hold the rung the marker would
+                // have got, locally and across a restart, and count the run
+                // toward the repeat cap, so a write that keeps failing (a
+                // forge rate limit on every held item at once) cannot loop
+                // the item at the first rung.
+                Err(e) => {
+                    log::warn!(
+                        "step_ledger: writing the re-evaluation ladder on #{item}: {e}; \
+                         holding rung {} locally until {}",
+                        e.attempted.rung,
+                        e.attempted.next
+                    );
+                    self.step_ledger.arm(
+                        item,
+                        step,
+                        e.attempted.next,
+                        CooldownCause::ForgeLadderFallback,
+                        now,
+                    );
+                    capped |= self.step_ledger.count_failed_ladder_write(item, step, now);
+                }
+            },
             Effect::Redraw => {
                 log::info!(
                     "step_ledger: #{item} {step} claim lost to a peer (count {})",
@@ -160,6 +172,7 @@ impl SweepRegistry {
         self.persist_step_ledger();
         Recorded {
             cooling_until,
+            repeat_capped: capped,
             ..rec
         }
     }

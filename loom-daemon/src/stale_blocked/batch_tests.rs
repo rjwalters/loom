@@ -135,6 +135,7 @@ pub(super) fn row(number: u32, body: &str, comments: u32, pr: bool, labels: &[&s
         comments,
         open_sub_issues: None,
         labels_at: None,
+        draft: false,
     }
 }
 

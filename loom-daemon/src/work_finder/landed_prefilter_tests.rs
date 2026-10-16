@@ -692,7 +692,6 @@ fn the_closes_graph_read_goes_to_the_reader_pool_and_is_shed_not_spilled() {
         },
         env: Default::default(),
         checkout: crate::gh_invocation::cwd_route::CwdAnswer::Sole("acme/shed".into()),
-        shed: true,
     });
     let mut forge = GhLandedForge {
         gh_bin: PathBuf::from("gh"),

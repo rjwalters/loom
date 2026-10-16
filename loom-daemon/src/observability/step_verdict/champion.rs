@@ -1,6 +1,7 @@
 //! Champion's projections (#12027): its merge-gate decisions
-//! (`champion_merge_v1`) and its promotion verdicts
-//! (`champion_promotion_v1`), each a closed, versioned reason set. A new
+//! (`champion_merge_v1`), its promotion verdicts (`champion_promotion_v1`)
+//! and its PR triage (`champion_triage_v1`, #12499), each a closed, versioned
+//! reason set. A new
 //! reason is a new version, never a silent addition.
 //!
 //! Evidence, strongest first: the write the gh front journaled (`merged`,
@@ -15,6 +16,13 @@ pub const MERGE_REASON_SET: &str = "champion_merge_v1";
 
 /// The promotion verdict's reason set.
 pub const PROMOTION_REASON_SET: &str = "champion_promotion_v1";
+
+/// The PR triage's reason set (#12499): a `--pr` step on an unlabelled PR.
+pub const TRIAGE_REASON_SET: &str = "champion_triage_v1";
+
+/// Every reason of [`TRIAGE_REASON_SET`]: the PR went to review (`verdict`),
+/// or was blocked or sent to the operator (`refused`).
+pub const TRIAGE_REASONS: [&str; 3] = ["review_requested", "blocked", "operator"];
 
 /// Every reason of [`MERGE_REASON_SET`].
 pub const MERGE_REASONS: [&str; 14] = [
@@ -206,7 +214,11 @@ fn project_merge(e: &Evidence) -> Option<Projection> {
             });
         }
     }
+    let triage = TRIAGE_REASON_SET;
     let p = match e.outcome.as_deref() {
+        Some("triaged") => projection("verdict", "review_requested", triage),
+        Some("triage-blocked") => projection("refused", "blocked", triage),
+        Some("triage-operator") => projection("refused", "operator", triage),
         Some("merged") => Projection {
             store: StoreOp::Clear,
             ..projection("verdict", "merged", set)

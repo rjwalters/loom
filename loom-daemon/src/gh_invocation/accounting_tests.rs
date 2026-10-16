@@ -203,3 +203,25 @@ fn a_site_scope_and_operation_win_and_never_merge_origin_into_repo() {
     assert_eq!(id.origin.as_deref(), Some("gitea.example.com"));
     assert_eq!(id.repo.as_deref(), Some("acme/app"));
 }
+
+/// #12394: a read that reaches the writer unmarked is an error-level event;
+/// a pinned read, a write, a routed reader read and a caller-chosen
+/// credential are not.
+#[test]
+fn only_an_unmarked_read_on_the_writer_is_flagged() {
+    let read = |op: &'static str, intent| {
+        GhInvocation::new(Operation::new(op), intent, GhTarget::None, Duration::from_secs(1))
+    };
+    assert!(is_unmarked_read_on_writer(&read("t.read", AccessIntent::Read)));
+    assert!(!is_unmarked_read_on_writer(&read("t.write", AccessIntent::Write)));
+    assert!(!is_unmarked_read_on_writer(
+        &read("t.pinned", AccessIntent::Read).writer_identity()
+    ));
+    assert!(!is_unmarked_read_on_writer(
+        &read("t.reader", AccessIntent::Read)
+            .identity_role(crate::forge_identity::IdentityRole::Reader)
+    ));
+    assert!(!is_unmarked_read_on_writer(
+        &read("t.dir", AccessIntent::Read).gh_config_dir(Some(Path::new("/x")))
+    ));
+}

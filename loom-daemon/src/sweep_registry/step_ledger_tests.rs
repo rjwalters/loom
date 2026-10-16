@@ -28,6 +28,23 @@ impl BodyForge for FakeForge {
     }
 }
 
+/// A forge whose body reads but whose writes fail (#12516): a secondary rate
+/// limit on content writes, an oversized body, a permission error.
+struct WriteFailingForge {
+    body: String,
+    attempts: usize,
+}
+
+impl BodyForge for WriteFailingForge {
+    fn body(&mut self, _number: u64) -> Result<String, String> {
+        Ok(self.body.clone())
+    }
+    fn set_body(&mut self, _number: u64, _body: &str) -> Result<(), String> {
+        self.attempts += 1;
+        Err("secondary rate limit".into())
+    }
+}
+
 fn run(item: u32, step: StepRole, class: OutcomeClass, reason: &str, secs: u64) -> StepRun {
     StepRun {
         item,
@@ -224,7 +241,7 @@ fn the_forge_ladder_is_written_and_its_mirror_is_bounded_at_24h() {
     let (mut reg, mut rx) = registry(dir.path());
     let mut forge = FakeForge {
         body:
-            "Parked.\n\n<!-- loom:reeval step=champion_promote rung=2 next=2026-01-01T00:00:00Z -->"
+            "Parked.\n\n<!-- loom:reeval step=champion_promote rung=6 next=2026-01-01T00:00:00Z -->"
                 .into(),
         ..FakeForge::default()
     };
@@ -234,7 +251,7 @@ fn the_forge_ladder_is_written_and_its_mirror_is_bounded_at_24h() {
     );
     let written = reeval_ladder::parse(&forge.body);
     assert_eq!(written.len(), 1);
-    assert_eq!(written[0].rung, 3, "48 h rung");
+    assert_eq!(written[0].rung, 7, "48 h rung (#12513)");
     let now = Utc::now();
     let local = reg
         .step_cooldowns(now)
@@ -462,6 +479,96 @@ fn the_repeat_cap_and_windows_survive_a_registry_restart() {
         &mut FakeForge::default(),
     );
     assert!(rec.repeat_capped, "the third run caps across the restart");
+}
+
+/// #12516: a forge write that keeps failing does not loop a held item at the
+/// first rung. Each failed write holds the rung the marker would have got,
+/// and the runs count toward the repeat cap, so the third held verdict in a
+/// row cools the item well past 1 h.
+#[test]
+fn a_failing_ladder_write_climbs_past_the_first_rung_and_hits_the_cap() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _rx) = registry(dir.path());
+    let mut forge = WriteFailingForge {
+        body: "Held.".into(),
+        attempts: 0,
+    };
+    let mut windows = Vec::new();
+    for _ in 0..3 {
+        let rec = reg.record_step_outcome(
+            &run(60, StepRole::ChampionMerge, OutcomeClass::Noop, "held", 600),
+            &mut forge,
+        );
+        let now = Utc::now();
+        windows.push((rec.repeat_capped, rec.cooling_until.unwrap() - now));
+    }
+    assert_eq!(forge.attempts, 3);
+    assert!(reeval_ladder::parse(&forge.body).is_empty(), "nothing written");
+    for (capped, left) in &windows[..2] {
+        assert!(!capped);
+        assert!(*left <= chrono::Duration::hours(1), "{left}");
+        assert!(*left > chrono::Duration::minutes(59), "{left}");
+    }
+    let (capped, left) = windows[2];
+    assert!(capped, "the third failed write counts toward the cap");
+    assert!(left > chrono::Duration::hours(23), "{left}");
+    assert!(left <= chrono::Duration::hours(24), "{left}");
+}
+
+/// #12516: the fallback is the next rung after the stored one, not a flat 1 h.
+#[test]
+fn a_failing_ladder_write_holds_the_next_rung_after_the_stored_one() {
+    let dir = tempdir().unwrap();
+    let (mut reg, mut rx) = registry(dir.path());
+    let next = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
+    let mut forge = WriteFailingForge {
+        body: format!("Held.\n\n<!-- loom:reeval step=champion_merge rung=3 next={next} -->"),
+        attempts: 0,
+    };
+    let rec = reg.record_step_outcome(
+        &run(61, StepRole::ChampionMerge, OutcomeClass::Noop, "held", 600),
+        &mut forge,
+    );
+    let left = rec.cooling_until.unwrap() - Utc::now();
+    assert!(left > chrono::Duration::minutes(239), "rung 4 = 4 h: {left}");
+    assert!(left <= chrono::Duration::hours(4), "{left}");
+    let ads = step_ads(&drain(&mut rx));
+    assert_eq!(ads.len(), 1, "broadcast: {ads:?}");
+    assert!(ads[0].2 > 3 * 3600, "{ads:?}");
+}
+
+/// #12516: the failed write's window survives a restart (there is no marker
+/// to read back), and so do its repeat-cap runs.
+#[test]
+#[serial]
+fn a_failing_ladder_writes_fallback_survives_a_registry_restart() {
+    let dir = tempdir().unwrap();
+    let mut forge = WriteFailingForge {
+        body: "Held.".into(),
+        attempts: 0,
+    };
+    {
+        let (mut reg, _rx) = registry(dir.path());
+        for _ in 0..2 {
+            let rec = reg.record_step_outcome(
+                &run(62, StepRole::ChampionMerge, OutcomeClass::Noop, "held", 600),
+                &mut forge,
+            );
+            assert!(!rec.repeat_capped);
+        }
+    }
+    let (mut reg, _rx) = registry(dir.path());
+    let now = Utc::now();
+    let until = reg
+        .step_cooldowns(now)
+        .until(62, StepRole::ChampionMerge)
+        .expect("the fallback came back");
+    assert!(until > now + chrono::Duration::minutes(59), "{until}");
+    let rec = reg.record_step_outcome(
+        &run(62, StepRole::ChampionMerge, OutcomeClass::Noop, "held", 600),
+        &mut forge,
+    );
+    assert!(rec.repeat_capped, "the third failed write caps across the restart");
 }
 
 /// #12251: a Builder refused on a landed issue is held off it fleet-wide for
