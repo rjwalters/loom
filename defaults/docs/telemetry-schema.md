@@ -214,6 +214,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
+| [`host.status`](#hoststatus) | gauges, OTLP only | `host_status.rs` (sampler), `observability/collector.rs`, `observability/otlp/mapping/host_status.rs` |
 | [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` Deny branch) |
@@ -3549,6 +3550,46 @@ like `worktree_root_free_gb`. The same fields ride **span-boundary trace
 attributes** (`loom.host.*`) on role attempts — see
 [tracing.md](tracing.md) — so the state is captured at the decision moment,
 not only on each 30 s sampling cadence.
+
+### `host.status`
+
+A fixed-interval sample of this host's CPU, memory, disk and network, raw and
+EWMA-filtered (Issue #12112, slice a of #11809). One record per 5 s from the
+collector, **only when an OTLP exporter started** (otherwise no reads and no
+record). Envelopes carry `schema_version: 12`. **OTLP-only** (native: `false`),
+exported as gauges. Nothing consumes it yet; role-span attributes, admission and
+GPU are later slices.
+
+The signal table lives in code (`telemetry/kinds/host_status.rs`, `SIGNALS`) and
+is the one source for both the record and the gauge names. `system.*` semconv
+names are used where the semantics match; `loom.host.*` otherwise. A filtered
+series states its time constant in its name (`..._ewma_30s`), so the constants
+are fixed rather than per-host overrides.
+
+| Signal | Raw gauge | Filtered gauge (EWMA tau) |
+|---|---|---|
+| CPU utilisation (0..1) | `system.cpu.utilization` | `loom.host.cpu_utilisation_ewma_30s` |
+| Load per core | `loom.host.cpu_load_per_core` | `loom.host.cpu_load_per_core_ewma_30s` |
+| Memory used | `system.memory.usage` (`state=used`) | `loom.host.mem_used_bytes_ewma_30s` |
+| Memory available | `loom.host.mem_available_bytes` (from `host.health`) | `loom.host.mem_available_bytes_ewma_30s` |
+| Memory pressure grade (0/1/2) | `loom.host.mem_pressure_grade` | `loom.host.mem_pressure_grade_ewma_30s` |
+| Swap used | `system.paging.usage` (`state=used`) | `loom.host.swap_used_bytes_ewma_60s` |
+| Disk I/O busy (busiest whole disk) | `loom.host.disk_io_busy` | `loom.host.disk_io_busy_ewma_30s` |
+| Disk read / write throughput | `loom.host.disk_{read,write}_bytes_per_sec` | `..._ewma_30s` |
+| Network rx / tx throughput | `loom.host.net_{rx,tx}_bytes_per_sec` | `..._ewma_30s` |
+| Volume free bytes (`volume=worktree_root`) | `system.filesystem.usage` (`state=free`) | `loom.host.disk_free_bytes_ewma_300s` |
+| Volume fill rate | `loom.host.disk_fill_rate_bytes_per_sec` | `..._ewma_300s` |
+| Volume time to full | `loom.host.disk_time_to_full_seconds` | `..._ewma_300s` (from the filtered free and rate) |
+
+**Absent is never zero.** A reading that failed, a counter that went backwards
+(reboot or reset) and the first tick of any rate have no data point, and the
+filter keeps its state instead of taking a fake zero. A volume that is not
+filling has no fill rate above zero and no time-to-full. A filter that has gone
+unread for more than five time constants re-seeds. Linux reads every signal;
+macOS reads load, memory pressure, swap and volume space, and leaves CPU
+utilisation, disk I/O and network absent (no cheap non-blocking source). The
+`volume` label is a closed value, never a path, and is on the collector's
+datapoint allowlist.
 
 ### `host.export`
 

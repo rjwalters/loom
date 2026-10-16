@@ -171,6 +171,9 @@ pub mod checkout_external_change;
 /// `host.export` (#11124).
 pub mod host_export;
 
+/// `host.status` (#12112) — fixed-interval host CPU/memory/disk/network gauges.
+pub mod host_status;
+
 /// Per-kind silence thresholds for `otlp_export` health (#12120).
 pub mod kind_silence;
 
@@ -492,6 +495,12 @@ macro_rules! telemetry_kind_table {
             /// See [`scope_memory`].
             ScopeMemory = "scope.memory" => $crate::telemetry::kinds::scope_memory::ScopeMemoryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A fixed-interval sample of this host's CPU, memory, disk and
+            /// network, raw and EWMA-filtered (#12112, slice a of #11809). OTLP
+            /// gauges only. See [`host_status`].
+            HostStatus = "host.status" => $crate::telemetry::kinds::host_status::HostStatusRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Gauges, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —
