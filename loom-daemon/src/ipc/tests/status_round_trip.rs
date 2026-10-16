@@ -109,6 +109,7 @@ fn test_daemon_status_request_response_round_trip() {
             crate::auto_update::not_rolling::FloorNotRolling::Unsupervised,
         ),
         auto_update_config_enabled: Some(false),
+        auto_update_freshness: None,
         task_liveness: Vec::new(),
         session_containers: Some(crate::session_status::SessionContainersReport {
             observation: "available".into(),

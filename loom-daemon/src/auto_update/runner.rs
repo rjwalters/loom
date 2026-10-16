@@ -102,6 +102,9 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     let artifact = probe.resolve_artifact();
     let check = probe.check();
     let tree_clean = probe.is_tree_clean().unwrap_or(false);
+    // #9736: what this tick learned. An error is an attempt, not an answer.
+    let observation = freshness::classify(&artifact, &check, !state.floor.fleet_host());
+    state.freshness.observe(last_check, &observation);
     // Only pay for the in-flight count once a roll is actually on the table (it
     // loads the workspace registry from disk); a cheap pre-filter avoids that
     // read on every up-to-date tick.
@@ -425,6 +428,8 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     // #10954: a loop that runs only for the fleet floor (autoUpdate off) does
     // nothing on a tick where the host has no fleet store.
     let idle = loop_mode::idle_reason(tuning.chase_enabled, state.floor.fleet_host());
+    let is_idle = idle.is_some();
+    state.freshness.set_tuning(tuning.freshness, started_at);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match idle {
         Some(note) => idle_tick(state, status, note),
         None => run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline),
@@ -440,6 +445,9 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
         status.publish(state.snapshot(true, started_at, note.clone(), &unresolved));
         TickSummary::new(None).finish(TickDecisionKind::Panic, note, &unresolved, None)
     });
+    if !is_idle {
+        state.alert_on_freshness_edge(&status.snapshot());
+    }
     // #10880 rule 5: a roll that reached this binary, up past its startup
     // grace, took; forget the attempt.
     state
@@ -459,7 +467,10 @@ fn idle_tick(state: &mut AutoUpdateState, status: &AutoUpdateStatus, note: Strin
     log::info!("auto_update: {note}");
     state.clear_tracking();
     let unchecked = ArtifactResolution::Unresolved("not checked".to_string());
-    status.publish(state.snapshot(true, Utc::now(), note.clone(), &unchecked));
+    // #9736: a loop that checks nothing by design is not "overdue".
+    let mut snapshot = state.snapshot(true, Utc::now(), note.clone(), &unchecked);
+    snapshot.freshness = None;
+    status.publish(snapshot);
     TickSummary::new(None).finish(TickDecisionKind::Skip, note, &unchecked, None)
 }
 

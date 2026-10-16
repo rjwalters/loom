@@ -94,6 +94,8 @@ fn test_config_reads_all_fields() {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
+            overdue_secs: None,
+            converge_deadline_secs: None,
             removed_keys: Vec::new(),
         }
     );

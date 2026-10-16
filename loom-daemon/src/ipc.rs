@@ -1612,6 +1612,7 @@ pub fn build_daemon_status_for(
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
         auto_update_floor_not_rolling: au.floor_not_rolling, // #11042
+        auto_update_freshness: au.freshness,                 // #9736
         auto_update_config_enabled: crate::auto_update::loop_mode::current()
             .map(crate::auto_update::loop_mode::LoopMode::config_enabled),
         // Long-running task liveness (#10414): every registered loop's

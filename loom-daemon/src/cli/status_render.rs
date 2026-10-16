@@ -616,6 +616,10 @@ pub(crate) fn build_status_json_value_for(
             "backoff_secs": report.auto_update_backoff_secs,
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
+            // Issue #9736: running version, last successful check, pending
+            // age, next attempt, blocking reason, thresholds. `null` from an
+            // older daemon and while the loop has not ticked.
+            "freshness": report.auto_update_freshness,
             // Issue #7609: the release artifact the loop resolved for this
             // host's platform, next to the installed version above. `null`
             // when no artifact resolved (no Releases yet, an unreachable API,
@@ -2617,6 +2621,23 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
+        if let Some(f) = &report.auto_update_freshness {
+            let when = |t: Option<chrono::DateTime<chrono::Utc>>| {
+                t.map_or_else(
+                    || "never".to_string(),
+                    |t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                )
+            };
+            println!(
+                "  Running {}; last successful check {}; next attempt {}",
+                f.running_version,
+                when(f.last_success),
+                when(f.next_check)
+            );
+            if let (Some(target), Some(since)) = (&f.pending_target, f.pending_since) {
+                println!("  Newer release {target} pending since {}", when(Some(since)));
+            }
+        }
         if let Some(why) = report.auto_update_floor_not_rolling {
             println!("  Below the fleet floor, NOT rolling ({}): {}", why.as_str(), why.describe());
         }

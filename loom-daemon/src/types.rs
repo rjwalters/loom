@@ -1561,6 +1561,12 @@ pub struct DaemonStatusReport {
     /// the spawn decision and from an older daemon.
     #[serde(default)]
     pub auto_update_config_enabled: Option<bool>,
+    /// #9736: the loop's progress clocks (last successful check, unapplied
+    /// release age, next attempt, blocking reason, thresholds), stamped with the
+    /// daemon's own running version. `None` when the loop has not ticked and
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_freshness: Option<crate::auto_update::freshness::FreshnessReport>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]

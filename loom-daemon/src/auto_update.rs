@@ -279,6 +279,10 @@ pub struct AutoUpdateConfig {
     /// priority (#4929). A zero/invalid value is dropped to `None`; `0` is
     /// intentionally *not* "never defer" — use a small positive value.
     pub defer_deadline_secs: Option<u64>,
+    /// #9736: no successful check for this long is a health finding.
+    pub overdue_secs: Option<u64>,
+    /// #9736: a newer release unapplied this long is a health finding.
+    pub converge_deadline_secs: Option<u64>,
     /// #10885: the removed keys this block still sets (see
     /// [`removed_settings`]). They are ignored; this only feeds the warning.
     pub removed_keys: Vec<&'static str>,
@@ -309,6 +313,14 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
             .filter(|&s| s > 0),
         defer_deadline_secs: block
             .get("deferDeadlineSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        overdue_secs: block
+            .get("overdueSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        converge_deadline_secs: block
+            .get("convergeDeadlineSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
         removed_keys: removed_settings::keys_in(block),
@@ -409,6 +421,8 @@ pub struct AutoUpdateStatusSnapshot {
     pub stale_repo: Option<String>,
     /// #11042: why a host below the fleet floor is not rolling, or `None`.
     pub floor_not_rolling: Option<not_rolling::FloorNotRolling>,
+    /// #9736: last successful check, pending age and thresholds.
+    pub freshness: Option<freshness::FreshnessReport>,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -597,6 +611,11 @@ pub mod tuning;
 pub use tuning::TickTuning;
 /// #10954: the loop runs on every fleet host; `autoUpdate.enabled` gates only chase-latest.
 pub mod loop_mode;
+
+/// Whether the loop is making progress at all: last successful check and
+/// unapplied-release age, with the assessment `health` and the alert share
+/// (#9736).
+pub mod freshness;
 /// Low-priority (`nice`) setup for the rebuild subprocess.
 mod nice;
 /// #11042: the unsupervised re-download guard and the typed not-rolling reason.
@@ -1228,6 +1247,8 @@ pub struct AutoUpdateState {
     unsupervised: not_rolling::UnsupervisedStage,
     /// #10880: the last version roll armed, persisted, and its retry gate.
     attempt: roll_attempt::AttemptGuard,
+    /// #9736: last successful check and unapplied-release clocks.
+    freshness: freshness::Freshness,
 }
 
 impl AutoUpdateState {
@@ -1788,6 +1809,7 @@ impl AutoUpdateState {
             }
             ArtifactResolution::Unresolved(_) => (None, None),
         };
+        let freshness = self.freshness.report(last_check, &note);
         AutoUpdateStatusSnapshot {
             enabled,
             last_check: Some(last_check),
@@ -1801,6 +1823,7 @@ impl AutoUpdateState {
             stale_repo_ticks: self.stale_repo.ticks(),
             stale_repo: self.stale_repo.repo(),
             floor_not_rolling: None,
+            freshness: Some(freshness),
         }
     }
 }
