@@ -114,6 +114,11 @@ pub enum SpanName {
     /// (`created` / `reused` / `closed` / `closed_duplicate`) and the issue.
     #[serde(rename = "main_red.autofile")]
     MainRedAutofile,
+    /// One fleet-dispatch call (#12449, spec #12452 §12): on the captain, one
+    /// per request it answered; `loom.fleet_dispatch.side` says which end.
+    /// Its own root trace.
+    #[serde(rename = "loom.fleet_dispatch.call")]
+    FleetDispatchCall,
     /// One worktree-reaper pass over one repo and worktree class (Issue
     /// #12461): an instant span, its own root, with the pass's scanned /
     /// removed / failed / preserved counts, preserved by fixed reason, and the
@@ -152,6 +157,7 @@ impl SpanName {
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
             Self::BuildGateRun => "build_gate.run",
             Self::MainRedAutofile => "main_red.autofile",
+            Self::FleetDispatchCall => "loom.fleet_dispatch.call",
             Self::ReaperPass => "reaper.pass",
         }
     }
