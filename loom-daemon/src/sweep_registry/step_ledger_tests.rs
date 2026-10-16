@@ -482,11 +482,11 @@ fn the_repeat_cap_and_windows_survive_a_registry_restart() {
 }
 
 /// #12516: a forge write that keeps failing does not loop a held item at the
-/// first rung. Each failed write holds the rung the marker would have got,
-/// and the runs count toward the repeat cap, so the third held verdict in a
-/// row cools the item well past 1 h.
+/// first rung. Each failed write holds the first rung's window, and the runs
+/// count toward the repeat cap, so the third held verdict in a row cools the
+/// item well past 1 h (#12524: it is the cap, not a climb, that does this).
 #[test]
-fn a_failing_ladder_write_climbs_past_the_first_rung_and_hits_the_cap() {
+fn a_failing_ladder_write_hits_the_cap_on_the_third_run() {
     let dir = tempdir().unwrap();
     let (mut reg, _rx) = registry(dir.path());
     let mut forge = WriteFailingForge {
@@ -597,4 +597,49 @@ fn a_landed_builder_hold_is_broadcast_and_a_verdict_lifts_it() {
     assert!(!reg
         .step_cooldowns(now)
         .is_cooling(40, StepRole::Builder, now));
+}
+
+/// #12524: one entry this build cannot decode (a cause a newer daemon added)
+/// is skipped; every other entry still loads.
+#[test]
+#[serial]
+fn an_unknown_cause_skips_that_entry_and_loads_the_rest() {
+    let dir = tempdir().unwrap();
+    let logs = dir.path().join(".loom/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let until = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
+    let entry = |item: u32, cause: &str| {
+        serde_json::json!({
+            "item": item, "step": "builder", "runs": [],
+            "until": until, "cause": cause,
+        })
+    };
+    let file = serde_json::json!([
+        entry(41, "landed"),
+        entry(42, "some_future_cause"),
+        entry(43, "landed"),
+    ]);
+    std::fs::write(logs.join(STEP_LEDGER_FILE), file.to_string()).unwrap();
+
+    let (reg, _rx) = registry(dir.path());
+    let now = Utc::now();
+    let cooling = reg.step_cooldowns(now);
+    assert!(cooling.is_cooling(41, StepRole::Builder, now));
+    assert!(!cooling.is_cooling(42, StepRole::Builder, now));
+    assert!(cooling.is_cooling(43, StepRole::Builder, now));
+}
+
+/// #12524: a file that is not a JSON array is still an empty ledger.
+#[test]
+#[serial]
+fn a_non_array_ledger_file_is_an_empty_ledger() {
+    let dir = tempdir().unwrap();
+    let logs = dir.path().join(".loom/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join(STEP_LEDGER_FILE), "{\"item\": 1}").unwrap();
+    let (reg, _rx) = registry(dir.path());
+    let now = Utc::now();
+    assert!(!reg
+        .step_cooldowns(now)
+        .is_cooling(1, StepRole::Builder, now));
 }
