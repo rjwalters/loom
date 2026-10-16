@@ -326,7 +326,10 @@ pub(crate) fn fetch_conditional_via(
         &crate::forge_identity::RouteRequest<'_>,
     ) -> crate::forge_identity::RouteDecision,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
-    if site.class != ReadClass::Gate && deferrable::shedding_enabled() {
+    // #12389: in a CLI subcommand with a read route adopted, a read never
+    // falls back to the writer: it takes the deferrable path, which sheds.
+    let barred = target.repo.is_some() && crate::forge_gateway::cli_reads_reader_only();
+    if (site.class != ReadClass::Gate || barred) && deferrable::shedding_enabled() {
         return deferrable::fetch(site, gh_bin, cwd, target, url, etag, route);
     }
     // #9537: a listing is a read, so it goes to the repo's reader App when one

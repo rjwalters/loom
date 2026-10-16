@@ -105,6 +105,10 @@ pub(super) fn fetch(
         // An unresolved repo has no reader pool to be out of budget.
         return on_writer(IdentityRole::Writer);
     };
+    // #12389: a CLI subcommand's read never reaches the writer: every
+    // "no reader left" below is a shed, whatever the class.
+    let barred = crate::forge_gateway::cli_reads_reader_only();
+    let sheds = |class: ReadClass, cause: ExhaustCause| barred || sheds(class, cause);
     let affinity = crate::gh_invocation::url_affinity_key(url);
     let request = RouteRequest {
         owner_repo: repo,
@@ -162,6 +166,11 @@ pub(super) fn fetch(
                 let app = tried.last().map(String::as_str);
                 return Err(shed(site, gh_bin, target, repo, until, app));
             }
+            RouteDecision::NoPool | RouteDecision::Exhausted { .. } if barred => {
+                let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
+                let app = tried.last().map(String::as_str);
+                return Err(shed(site, gh_bin, target, repo, until, app));
+            }
             RouteDecision::NoPool | RouteDecision::Exhausted { .. } => {
                 return on_writer(if tried.is_empty() {
                     IdentityRole::Writer
@@ -207,6 +216,12 @@ pub(super) fn fetch(
             return Ok(first);
         };
         let why = format!("{} {url}", site.caller);
+        if failure == Failure::Coverage && barred {
+            // The reader does not cover the repo and the writer may not
+            // confirm it (#12389): no answer.
+            let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
+            return Err(shed(site, gh_bin, target, repo, until, Some(&app_id)));
+        }
         if failure == Failure::Coverage {
             // The Gate rule: confirm on the writer, and withdraw the reader
             // for this repo only if the writer could read it.

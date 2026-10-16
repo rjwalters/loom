@@ -13,12 +13,15 @@
 //!
 //! Per owner because the credential is: an App installation token sees its
 //! own installation's repos and no others. More than [`CHUNK`] repos of one
-//! owner are split across queries. Each query runs under the writer
-//! credential through the fleet store's transport
-//! ([`GhTransport::graphql_as_writer`]), is accounted as
+//! owner are split across queries. Each query runs on the read path only (the
+//! gateway, then a reader App, never the writer: [`GhTransport::graphql_read`],
+//! booked as `fleet_store_graphql`, #12389 / #12394), is accounted as
 //! `git.default-branch-heads`, and is not sent while the rate-limit breaker
-//! is open. GraphQL is a `POST`, so there is no ETag and no free `304`: a
-//! query costs one point on the credential's GraphQL bucket.
+//! is open. A reader not installed on a repo says `NOT_FOUND` for it, so a
+//! missing or forbidden repo is left unanswered and asked about with
+//! `git ls-remote`, like a repo whose query was shed. GraphQL is a `POST`, so
+//! there is no ETag and no free `304`: a query costs one point on the
+//! answering credential's GraphQL bucket.
 //!
 //! # What a caller does with the answer
 //!
@@ -272,16 +275,31 @@ pub(super) fn gather(
     heads
 }
 
-/// The production head check: one query per owner (per [`CHUNK`] repos),
-/// under that owner's writer credential.
+/// The production head check: one query per owner (per [`CHUNK`] repos), on
+/// the read path only ([`GhTransport::graphql_read`], #12389): it never runs
+/// on the writer. A repo the read path names as missing or forbidden is left
+/// unanswered ([`read_path_final`]), so the pass asks its remote instead.
 pub(super) fn live(asks: &[HeadAsk]) -> Heads {
-    gather(asks, &|| crate::rate_limit_breaker::global_skip_pass(CALLER), &|batch| {
-        GhTransport::new(&batch.under.root, &batch.under.nwo).graphql_as_writer(
-            ops::GIT_DEFAULT_BRANCH_HEADS,
-            &query(&batch.repos),
-            QUERY_TIMEOUT,
-        )
-    })
+    let mut heads =
+        gather(asks, &|| crate::rate_limit_breaker::global_skip_pass(CALLER), &|batch| {
+            GhTransport::new(&batch.under.root, &batch.under.nwo).graphql_read(
+                ops::GIT_DEFAULT_BRANCH_HEADS,
+                &query(&batch.repos),
+                QUERY_TIMEOUT,
+            )
+        });
+    heads.answers.retain(|_, answer| read_path_final(answer));
+    heads
+}
+
+/// Whether a read-path answer is final. A reader App or the gateway answers
+/// `NOT_FOUND` (or `FORBIDDEN`) for a repo outside its installation, which
+/// [`Fault::NotFound`] would read as "the repo is gone" (#10987). The writer
+/// may not be asked (#12394), so such a repo is unanswered and its remote is
+/// asked directly. A missing default branch is the repo's own fact.
+#[must_use]
+pub fn read_path_final(answer: &Answer) -> bool {
+    !matches!(answer, Answer::Fault(Fault::NotFound(_) | Fault::Forbidden(_)))
 }
 
 /// Ask each of `roots`' remotes for its default branch's head with
