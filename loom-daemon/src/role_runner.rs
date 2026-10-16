@@ -2891,10 +2891,7 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
 ) -> RoleTickOutcome {
     crate::role_collision::probe_before_tick(root, role, interval);
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
-    // #11819: a Curator on a repo with `curator.backlogTarget` carries the
-    // daemon-computed backlog level; every other dispatch is unchanged.
-    let outcome =
-        backlog::invoke_with_backlog(runner, root, role, prompt, backlog::count_open_issues);
+    let outcome = runner.invoke(role, prompt);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
     outcome
 }
@@ -3866,10 +3863,6 @@ fn log_outcome_for_root_deduped(
     pool_exhausted.insert(root.to_path_buf(), action.is_pool_exhausted());
     model_mismatch.insert(root.to_path_buf(), action.is_model_mismatch());
 }
-
-// The Curator's backlog level at dispatch (#11819) — see
-// `role_runner/backlog.rs`.
-pub mod backlog;
 
 // Concurrent per-(repository, role) dispatch, per-role budgets and queue
 // gating (#9391) — see `role_runner/concurrent_dispatch.rs`.

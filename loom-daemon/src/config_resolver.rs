@@ -323,6 +323,7 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
         deep_merge(&effective, &soft_read_json_object(&repo_root.join(FLEET_REPO_CONFIG_REL)));
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LOCAL_CONFIG_REL)));
 
+    warn_retired_curator_backlog_target(&effective);
     effective
 }
 
@@ -582,23 +583,26 @@ pub fn fleet_captain_arm_ttl_secs(repo_root: &Path) -> u64 {
         .unwrap_or(DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS)
 }
 
-/// Dotted key read by [`curator_backlog_target`] (#11819).
+/// Dotted key of the retired `curator.backlogTarget` (#11819, retired #12077).
 pub const CURATOR_BACKLOG_TARGET_KEY: &str = "curator.backlogTarget";
 
-/// Read `curator.backlogTarget` (#11819): the number of open issues this repo
-/// should hold, which sets how strict the Curator's admission step is.
+/// Warn, once per process, that `curator.backlogTarget` is set (#12077).
 ///
-/// Resolved through [`resolve_effective_config`], so every tier can set it
-/// (machine defaults < `.loom/config.json` < `.loom-project/project.json` <
-/// `.loom-local/fleet-repo.json` < `.loom-local/local.json`). There is **no
-/// built-in default**: `None` (the step is skipped, the Curator unchanged) on
-/// a missing key, a zero, a negative, a fractional or a non-number value.
-#[must_use]
-pub fn curator_backlog_target(repo_root: &Path) -> Option<u64> {
-    let effective = resolve_effective_config(repo_root);
-    get_path(&effective, CURATOR_BACKLOG_TARGET_KEY)
-        .and_then(Value::as_u64)
-        .filter(|v| *v > 0)
+/// The key drove backlog-pressure admission on role-runner Curator ticks only;
+/// Curator now runs as step-dispatch steps, so the key is retired and ignored.
+/// Returns whether this call gave the warning.
+pub fn warn_retired_curator_backlog_target(effective: &Value) -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if get_path(effective, CURATOR_BACKLOG_TARGET_KEY).is_none()
+        || WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return false;
+    }
+    log::warn!(
+        "config: {CURATOR_BACKLOG_TARGET_KEY} is retired and ignored: Curator no longer \
+         admits by backlog pressure; remove the key (#12077)"
+    );
+    true
 }
 
 #[cfg(test)]
@@ -1522,49 +1526,17 @@ mod tests {
         assert!(got[0].0.ends_with(LEGACY_CONFIG_REL));
     }
 
-    // ===== curator_backlog_target (#11819) =====
-
-    fn backlog(value: u64) -> String {
-        format!(r#"{{"curator": {{"backlogTarget": {value}}}}}"#)
-    }
+    // ===== retired curator.backlogTarget (#12077) =====
 
     #[test]
-    #[serial(loom_config_env)]
-    fn test_curator_backlog_target_resolves_each_tier_and_a_higher_tier_wins() {
-        let dir = tempdir().unwrap();
-        let defaults = dir.path().join("machine-defaults.json");
-        std::env::set_var(PRIVATE_DEFAULTS_ENV, &defaults);
-        let root = dir.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
-        assert_eq!(curator_backlog_target(&root), None, "unset at every tier");
-        // Lowest to highest precedence; each write must take over.
-        let tiers = [
-            defaults.clone(),
-            root.join(LEGACY_CONFIG_REL),
-            root.join(PROJECT_CONFIG_REL),
-            root.join(FLEET_REPO_CONFIG_REL),
-            root.join(LOCAL_CONFIG_REL),
-        ];
-        for (i, tier) in tiers.iter().enumerate() {
-            let value = 100 + i as u64;
-            write(tier, &backlog(value));
-            assert_eq!(curator_backlog_target(&root), Some(value), "{}", tier.display());
-        }
-        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
-    }
-
-    #[test]
-    #[serial(loom_config_env)]
-    fn test_curator_backlog_target_zero_or_non_integer_is_unset() {
-        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
-        let dir = tempdir().unwrap();
-        for raw in ["0", "-5", "1.5", "\"140\"", "null", "true"] {
-            write(
-                &dir.path().join(LEGACY_CONFIG_REL),
-                &format!(r#"{{"curator": {{"backlogTarget": {raw}}}}}"#),
-            );
-            assert_eq!(curator_backlog_target(dir.path()), None, "{raw}");
-        }
-        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+    fn test_retired_curator_backlog_target_warns_once_and_unset_is_silent() {
+        let unset = serde_json::json!({"curator": {}});
+        assert!(!warn_retired_curator_backlog_target(&unset), "unset key is silent");
+        let set = serde_json::json!({"curator": {"backlogTarget": 100}});
+        let first = warn_retired_curator_backlog_target(&set);
+        let second = warn_retired_curator_backlog_target(&set);
+        assert!(!second, "already warned");
+        // Another test in this process may have warned first.
+        let _ = first;
     }
 }
