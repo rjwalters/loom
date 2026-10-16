@@ -305,7 +305,7 @@ fn a_reader_fault_sheds_the_read_and_never_uses_the_writer() {
 
     let diff = sb.gh(DIFF, &env);
     shed(&diff);
-    assert_eq!(sb.dirs_for("pr diff"), [reader.clone()]);
+    assert_eq!(sb.dirs_for("pr diff"), std::slice::from_ref(&reader));
     // The gateway's outage marker is never written beside a reader.
     assert!(!reader.parent().unwrap().join("outage-until").exists());
 }
@@ -329,7 +329,7 @@ fn a_readers_own_refusal_sheds_the_read_and_never_uses_the_writer() {
 
         let diff = sb.gh(DIFF, &env);
         shed(&diff);
-        assert_eq!(sb.dirs_for("pr diff"), [reader.clone()], "{msg}");
+        assert_eq!(sb.dirs_for("pr diff"), std::slice::from_ref(&reader), "{msg}");
     }
 }
 
