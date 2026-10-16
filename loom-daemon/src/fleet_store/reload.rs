@@ -112,7 +112,7 @@ const TABLE: &[(&str, Reloadability)] = &[
     ("autonomous.workFinder.landedPrefilter", Reloadability::Live),
     // #12203: the stage-dwell sampler's switch and spacing are read from the
     // effective config on every forge-gather pass
-    // (`captain_gauges::resolve` → `stage_dwell::Settings::from_effective`),
+    // (`collector::forge_gathers` → `stage_dwell::Settings::from_effective`),
     // never cached.
     ("observability.stageDwell", Reloadability::Live),
     // #12246: the per-agent-scope `MemoryMax` knobs are resolved by

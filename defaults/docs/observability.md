@@ -711,13 +711,7 @@ queue states from one ETag-cached open-items walk per repo (#11847):
 label shape, `loom:pr` + `loom:blocked`, #11905; it reads no marker, so markerless parks count too). They are absent, not `0`, for a repo
 whose walk did not complete. `stage_items` is per repo, so a per-host total is `sum by (state)`, and the
 states overlap, so never sum across them. It reads ETag-cached stage listings every 5
-minutes plus at most 8 per-item reads per sample, never per tick. With
-`fleet.captainGauges` configured, the fleet captain samples for the fleet and
-dispatchers stand down while its published data is fresh
-(`loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`; see
-[`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12)).
-The same heartbeat can carry a forge fact (`queueBlocked`), so the snapshot's
-`loom:blocked` listing is made by the captain alone.
+minutes plus at most 8 per-item reads per sample, never per tick.
 Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 **Merge-chain re-date pressure (#10163).** Three gauges track the #8508

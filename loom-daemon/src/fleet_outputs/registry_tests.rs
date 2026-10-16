@@ -9,11 +9,7 @@ use std::path::{Path, PathBuf};
 /// Files (relative to `src`) that own a named singleton job, i.e. call
 /// `arm_singleton_job(`. A new owning file
 /// must be added here *and* its job registered.
-const OWNING_FILES: &[&str] = &[
-    "ci_telemetry/mod.rs",
-    "intake_reconcile/singleton.rs",
-    "observability/captain_gauges.rs",
-];
+const OWNING_FILES: &[&str] = &["ci_telemetry/mod.rs", "intake_reconcile/singleton.rs"];
 
 /// Every `.rs` under `src` as (relative path with `/`, contents), skipping
 /// `fleet_captain.rs` (the definition and its throwaway test jobs) and this
@@ -55,21 +51,16 @@ fn re(s: &str) -> regex::Regex {
 }
 
 /// Singleton job names in source: every `*JOB_NAME` const (not only
-/// `SINGLETON_JOB_NAME`), the `captain_gauges` `*_JOB` consts, and string literals at call
-/// sites.
+/// `SINGLETON_JOB_NAME`) and string literals at call sites.
 fn discovered_jobs(srcs: &[(String, String)]) -> BTreeSet<String> {
     let konst = re(r#"const (?:[A-Z]+_)*JOB_NAME: &str = "([^"]+)""#);
-    let gauge = re(r#"const [A-Z_]+_JOB: &str = "([^"]+)""#);
     let literal = re(r#"\barm_singleton_job\(\s*"([^"]+)""#);
     let mut found = BTreeSet::new();
-    for (rel, text) in srcs {
+    for (_, text) in srcs {
         let mut grab =
             |r: &regex::Regex| found.extend(r.captures_iter(text).map(|c| c[1].to_string()));
         grab(&konst);
         grab(&literal);
-        if rel == "observability/captain_gauges.rs" {
-            grab(&gauge);
-        }
     }
     found
 }
@@ -93,7 +84,7 @@ fn singleton_registry_owning_files_are_known() {
 #[test]
 fn singleton_registry_covers_every_singleton_job() {
     let jobs = discovered_jobs(&sources());
-    assert!(jobs.len() >= 4, "scan found too few jobs: {jobs:?}");
+    assert!(jobs.len() >= 2, "scan found too few jobs: {jobs:?}");
     let known: BTreeSet<&str> = SINGLETON_OUTPUTS
         .iter()
         .filter(|o| o.gate == Gate::SingletonJob)

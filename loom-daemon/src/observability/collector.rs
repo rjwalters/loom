@@ -1154,9 +1154,15 @@ async fn forge_gathers(
 ) {
     // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
     // listings plus a bounded per-item budget; a no-op without the ops sink.
-    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
-    // skips the repos a fresh captain covers (`captain_gauges`).
-    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
+    let root = workspace_root.to_path_buf();
+    let settings = tokio::task::spawn_blocking(move || {
+        super::ops::stage_dwell::Settings::from_effective(
+            &crate::config_resolver::resolve_effective_config(&root),
+        )
+    })
+    .await
+    .unwrap_or_default();
+    super::ops::stage_dwell::record(workspace_pool, slug_cache, settings).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
