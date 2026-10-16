@@ -321,6 +321,44 @@ else
     fail "expected the telemetry record call (line ${RECORD_LINE:-?}) after gh pr create (line ${CREATE_LINE:-?})"
 fi
 
+# --- Test 9: host_id comes from `loom-daemon host-id`, not the hostname ------
+echo ""
+echo "Test 9: host_id equals 'loom-daemon host-id' output, not \$HOSTNAME"
+
+STUB_BIN="$SANDBOX/stub-bin"
+mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == "host-id" ]] || exit 2
+echo "stub-persisted-host-id"
+STUB
+chmod +x "$STUB_BIN/loom-daemon"
+
+rm -f "$LOG_FILE"
+(cd "$SANDBOX_REPO" && env -u LOOM_HOST_ID HOSTNAME="some-distinct-hostname" PATH="$STUB_BIN:$PATH" \
+    "$TELEMETRY_SH" record --pr 9 --repo acme/widgets >/dev/null 2>&1)
+GOT_HOST="$(tail -n 1 "$LOG_FILE" | jq -r '.host_id')"
+if [[ "$GOT_HOST" == "stub-persisted-host-id" ]]; then
+    pass "host_id is the loom-daemon host-id value"
+else
+    fail "expected host_id 'stub-persisted-host-id', got '$GOT_HOST'"
+fi
+
+# A failing `host-id` (no identity) keeps the unknown-host literal.
+cat > "$STUB_BIN/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+rm -f "$LOG_FILE"
+(cd "$SANDBOX_REPO" && env -u LOOM_HOST_ID HOSTNAME="some-distinct-hostname" PATH="$STUB_BIN:$PATH" \
+    "$TELEMETRY_SH" record --pr 9 --repo acme/widgets >/dev/null 2>&1)
+GOT_HOST="$(tail -n 1 "$LOG_FILE" | jq -r '.host_id')"
+if [[ "$GOT_HOST" == "unknown-host" ]]; then
+    pass "a failing host-id keeps the unknown-host literal (not the hostname)"
+else
+    fail "expected host_id 'unknown-host', got '$GOT_HOST'"
+fi
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================"

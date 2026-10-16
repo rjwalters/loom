@@ -3634,7 +3634,7 @@ the defensive read stays correct for either shape. `dropped_by_reason` is
 additive (serde-defaulted), so records from before #11527 still parse and no
 `schema_version` bump is needed. The committed query is
 [`defaults/observability/signoz/host-export-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
-hosts with drops, or with no `host.export` at all, in the last 2 h. Query 3 compares a rendered `hosts.yml` roster against `host.export` to find silent hosts by absence (#11198).
+hosts with drops, or with no `host.export` at all, in the last 2 h. Query 3 compares a rendered `hosts.yml` roster against `host.export` to find silent hosts by absence (#11198). Query 5 reads `daemon.start` (`daemon.event` with `loom.topic = daemon.start`), `daemon.exit` and `host.export` into a per-host `running` / `stopped` / `silent` state, with `exporter_silent` vs `host_silent` as the cause of `silent` (#10023); `host.export` is the heartbeat, so no separate heartbeat record exists.
 
 ### `operator.presence`
 

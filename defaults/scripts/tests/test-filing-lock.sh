@@ -312,6 +312,21 @@ else
 fi
 
 echo ""
+echo "=== host identity comes from loom-daemon host-id ==="
+
+HID_BIN="$TMPROOT/hid-bin"
+mkdir -p "$HID_BIN"
+printf '#!/usr/bin/env bash\n[[ "${1:-}" == "host-id" ]] || exit 2\necho stub-persisted-host-id\n' > "$HID_BIN/loom-daemon"
+chmod +x "$HID_BIN/loom-daemon"
+
+GOT="$(unset LOOM_HOST_ID; HOSTNAME=some-distinct-hostname PATH="$HID_BIN:$PATH"; loom_filing_lock_host)"
+assert_eq "$GOT" "stub-persisted-host-id" "owner host equals loom-daemon host-id, not \$HOSTNAME"
+
+printf '#!/usr/bin/env bash\nexit 1\n' > "$HID_BIN/loom-daemon"
+GOT="$(unset LOOM_HOST_ID; HOSTNAME=some-distinct-hostname PATH="$HID_BIN:$PATH"; loom_filing_lock_host)"
+assert_eq "$GOT" "unknown-host" "a failing host-id yields unknown-host, not the hostname"
+
+echo ""
 echo "==============================================="
 echo "  Tests run:    $TESTS_RUN"
 echo -e "  ${GREEN}Passed:${NC}       $TESTS_PASSED"

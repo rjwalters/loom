@@ -143,10 +143,17 @@ loom_filing_lock_held() {
     esac
 }
 
-# Host identity, mirroring sweep_registry::host_identity()'s precedence (the
-# same helper sweep-lease-fence.sh uses) so the owner record this script writes
-# is comparable with one written by the daemon.
+# Host identity: `loom-daemon host-id`, the same resolver the daemon's
+# filing_lock.rs uses, so the owner record is comparable with the daemon's. A
+# non-zero exit (no identity) yields `unknown-host`; with no loom-daemon on PATH
+# the prior LOOM_HOST_ID > $HOSTNAME > hostname chain applies.
 loom_filing_lock_host() {
+    if command -v loom-daemon >/dev/null 2>&1; then
+        local id
+        id="$(loom-daemon host-id 2>/dev/null)" || id=""
+        printf '%s' "${id:-unknown-host}"
+        return 0
+    fi
     if [[ -n "${LOOM_HOST_ID:-}" ]]; then printf '%s' "$LOOM_HOST_ID"; return 0; fi
     if [[ -n "${HOSTNAME:-}" ]]; then printf '%s' "$HOSTNAME"; return 0; fi
     local h
