@@ -380,6 +380,8 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    // #12310: the hold-marker comment reads are discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     for row in rows
         .iter()
         .filter(|r| r.is_pull_request && crate::work_finder::is_blocked_hold(&r.labels))
@@ -467,11 +469,15 @@ pub fn list(
         return Ok(None);
     };
     // The tick's one snapshot is the only place the items come from (#12306).
-    let repo_snapshot = snapshot.repo(&Target {
-        slug: slug.clone(),
-        gh_bin: gh_bin.clone(),
-        root_dir: root_dir.clone(),
-    });
+    // #12310: the open-PR listing is discovery.
+    let repo_snapshot = {
+        let _discovery = crate::gh_invocation::purpose::discovery();
+        snapshot.repo(&Target {
+            slug: slug.clone(),
+            gh_bin: gh_bin.clone(),
+            root_dir: root_dir.clone(),
+        })
+    };
     let (rows, stale_listing) = listing_or_last_good(
         &slug,
         repo_snapshot
