@@ -416,6 +416,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `.loom/gh-config-by-owner/*` here regardless of which managed repo's
     // checkout root the refresh was triggered from.
     credential_preflight::register_primary_workspace_root(&sweep_workspace);
+    // #12493: fleet dispatch is a host property, carried by this workspace's
+    // host-local tier; every managed repo's claims, ticks and heartbeats read
+    // the flag from here, not from their own repo roots.
+    loom_daemon::fleet_dispatch::worker::set_host_root(&sweep_workspace);
 
     // Startup forge-credential preflight (Issue #4005; GitHub App identity
     // mechanism added by #4430). Resolved once, here — immediately before the
