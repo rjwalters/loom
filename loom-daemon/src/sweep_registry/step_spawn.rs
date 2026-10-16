@@ -72,6 +72,21 @@ pub(crate) use unlocked::blocking;
 pub use timeout::step_timeout;
 pub use unlocked::StepSpawnTimings;
 
+/// The weight terms of the draw that picked a step (#12185), so the
+/// `loom.dispatch.step` span can plot selection probability against item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepDrawTerms {
+    /// The item's integer draw weight.
+    pub weight: u64,
+    /// The pool's total weight at that draw: `weight / total_weight` is the
+    /// item's probability.
+    pub total_weight: u64,
+    /// `n_items`: the item's repo's items in the pool.
+    pub repo_items: usize,
+    /// `in_flight_repo`: the repo's items someone worked on.
+    pub in_flight_repo: usize,
+}
+
 /// One step the engine asks to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepSpawnRequest {
@@ -83,6 +98,8 @@ pub struct StepSpawnRequest {
     pub age_source: String,
     /// Whether the step resumes a paused session.
     pub resumed: bool,
+    /// The draw that picked it; `None` for a step not drawn (a resume).
+    pub draw: Option<StepDrawTerms>,
 }
 
 impl StepSpawnRequest {
@@ -95,6 +112,7 @@ impl StepSpawnRequest {
             draw_attempt: 1,
             age_source: "unknown".to_string(),
             resumed: false,
+            draw: None,
         }
     }
 
@@ -112,6 +130,8 @@ impl StepSpawnRequest {
 pub struct StepRefusal {
     pub reason: &'static str,
     pub detail: String,
+    /// How the pre-claim ran, when it was the refusal (#12183).
+    pub claim: Option<lease::ClaimFacts>,
 }
 
 impl StepRefusal {
@@ -119,6 +139,7 @@ impl StepRefusal {
         Self {
             reason,
             detail: detail.to_string(),
+            claim: None,
         }
     }
 }
@@ -151,6 +172,8 @@ pub struct PreparedStep {
     request: StepSpawnRequest,
     sweep_id: SweepId,
     launch: StepLaunch,
+    /// How the won pre-claim ran, for the `spawned` span (#12183).
+    claim: Option<lease::ClaimFacts>,
     _mid_spawn: roll_gate::MidSpawn,
 }
 
@@ -213,7 +236,13 @@ impl SweepRegistry {
     /// A [`StepRefusal`]: every side effect taken so far is undone.
     pub fn begin_step_spawn(&mut self, request: &StepSpawnRequest) -> Result<PreparedStep> {
         self.begin_step_spawn_inner(request).map_err(|refusal| {
-            self.record_step_dispatch(request, dispatch_step::RESULT_REFUSED, refusal.reason, None);
+            self.record_step_dispatch(
+                request,
+                dispatch_step::RESULT_REFUSED,
+                refusal.reason,
+                None,
+                refusal.claim.as_ref(),
+            );
             log::info!(
                 "sweep_registry: {} step on #{} not spawned — {refusal}",
                 request.role,
@@ -251,11 +280,16 @@ impl SweepRegistry {
         locked.map_err(|e| StepRefusal::new("claimed", format!("{e:#}")))?;
         // Advertise at spawn, before any forge write (#11906 review item 4).
         self.publish_step_claim(peer_claims::ClaimKind::Advertise, item, role);
-        if let Err(refusal) = self.pre_claim_step(item, role, &sweep_id) {
-            self.unwind_step_claim(item, role, &sweep_id, false);
-            return Err(refusal);
-        }
-        self.spawn_prepared_step(request, &sweep_id, launch, false)
+        let claim = match self.pre_claim_step(item, role, &sweep_id) {
+            Ok(claim) => claim,
+            Err(refusal) => {
+                self.unwind_step_claim(item, role, &sweep_id, false);
+                return Err(refusal);
+            }
+        };
+        let mut prepared = self.spawn_prepared_step(request, &sweep_id, launch, false)?;
+        prepared.claim = claim;
+        Ok(prepared)
     }
 
     /// Refuse a step whose `/loom:<role>` command is not installed in the
@@ -300,8 +334,14 @@ impl SweepRegistry {
         let sweep_id = sweep_id.to_string();
         self.apply_dispatch_stagger();
         let log_path = self.compute_step_log_path(item, role);
+        // #11913: a preference, never eligibility. Any reason not to resume
+        // runs the step fresh, exactly as before.
+        let resume = self.step_session_resume(item, role, &launch);
+        let mut request = request.clone();
+        request.resumed = resume.is_some();
+        let request = &request;
         let spawn = |reg: &Self| {
-            reg.spawn_child_process(
+            reg.spawn_child_process_for(
                 &kind,
                 &log_path,
                 &sweep_id,
@@ -310,6 +350,7 @@ impl SweepRegistry {
                 None,
                 launch.admission.admitted.as_ref(),
                 launch.selection.as_ref(),
+                resume.as_ref(),
             )
         };
         let spawned = if host_gate {
@@ -327,11 +368,58 @@ impl SweepRegistry {
                 request: request.clone(),
                 sweep_id,
                 launch,
+                claim: None,
                 _mid_spawn: self.roll_gate.enter(),
             }),
             Err(e) => {
                 self.unwind_step_claim(item, role, &sweep_id, true);
                 Err(StepRefusal::new("spawn_failed", format!("{e:#}")))
+            }
+        }
+    }
+
+    /// The session this step resumes, when the session ledger (#11913) says
+    /// so; `None` runs it fresh. A fresh step on an item that had a session
+    /// logs the written handoff the ledger composed.
+    fn step_session_resume(
+        &self,
+        item: u32,
+        role: StepRole,
+        launch: &StepLaunch,
+    ) -> Option<super::resume_handle::RollResumeLaunch> {
+        use crate::step_dispatch::session_ledger::{self as ledger, Decision};
+        let root = &self.config.workspace_root;
+        // Only Claude sessions are pinned and ledgered.
+        let admitted = launch
+            .admission
+            .admitted
+            .as_ref()
+            .map(|a| a.runtime.as_str());
+        if admitted.is_some_and(|r| r != "claude") {
+            return None;
+        }
+        match ledger::decide_for(root, item, role) {
+            Decision::Resume(record) => Some(super::resume_handle::RollResumeLaunch {
+                runtime: record.runtime.clone(),
+                session_id: record.session_id.clone(),
+                prompt: ledger::resume_prompt(&record, role),
+                resume_of: format!("step-ledger:{item}:{}", record.role),
+                resume_count: 1,
+                agent_started_at: None,
+                session_store: record.session_store.clone(),
+                account: record.account.clone(),
+                container: None,
+                sandbox: None,
+                lease_sweep_id: None,
+            }),
+            Decision::Fresh { reason, handoff } => {
+                if let Some(handoff) = handoff {
+                    log::info!(
+                        "sweep_registry: {role} step on #{item} runs fresh ({}): {handoff}",
+                        reason.as_str()
+                    );
+                }
+                None
             }
         }
     }
@@ -342,17 +430,19 @@ impl SweepRegistry {
         item: u32,
         role: StepRole,
         sweep_id: &str,
-    ) -> std::result::Result<(), StepRefusal> {
+    ) -> std::result::Result<Option<lease::ClaimFacts>, StepRefusal> {
         if self.config.skip_label_flip {
-            return Ok(());
+            return Ok(None);
         }
         match role {
-            StepRole::Builder => self.pre_claim_builder_step(item, sweep_id),
+            // The Builder's claim is a label flip and a lease comment, not a
+            // `lease pr claim` run: no claim facts to record.
+            StepRole::Builder => self.pre_claim_builder_step(item, sweep_id).map(|()| None),
             StepRole::Curator
             | StepRole::ChampionPromote
             | StepRole::Judge
             | StepRole::Doctor
-            | StepRole::ChampionMerge => self.pre_claim_step_lease(item, role, sweep_id),
+            | StepRole::ChampionMerge => self.pre_claim_step_lease(item, role, sweep_id).map(Some),
         }
     }
 
@@ -437,6 +527,7 @@ impl SweepRegistry {
             request,
             sweep_id,
             mut launch,
+            claim,
             ..
         } = prepared;
         let (item, role) = (request.item, request.role);
@@ -452,6 +543,7 @@ impl SweepRegistry {
                 dispatch_step::RESULT_REFUSED,
                 refusal.reason,
                 None,
+                claim.as_ref(),
             );
             return Err(refusal.into());
         }
@@ -506,7 +598,13 @@ impl SweepRegistry {
         if token_name != crate::sweep_registry::UNKNOWN_TOKEN_NAME {
             self.clear_role_tick_pool_exhausted(role.role_name());
         }
-        self.record_step_dispatch(&request, dispatch_step::RESULT_SPAWNED, "ok", Some(&sweep_id));
+        self.record_step_dispatch(
+            &request,
+            dispatch_step::RESULT_SPAWNED,
+            "ok",
+            Some(&sweep_id),
+            claim.as_ref(),
+        );
         log::info!(
             "sweep_registry: {role} step {sweep_id} on #{item} spawned (pid {pid}, model {}, \
              timeout {}s, #11906)",
@@ -529,6 +627,7 @@ impl SweepRegistry {
         result: &str,
         reason: &str,
         sweep_id: Option<&str>,
+        claim: Option<&lease::ClaimFacts>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -540,7 +639,9 @@ impl SweepRegistry {
                 draw_attempt: request.draw_attempt,
                 age_source: &request.age_source,
                 resumed: request.resumed,
+                draw: request.draw,
                 sweep_id,
+                claim,
             },
         );
     }

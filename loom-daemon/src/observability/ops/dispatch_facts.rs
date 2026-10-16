@@ -113,8 +113,48 @@ pub fn tick_attributes(
     if let Some(p) = report.phases {
         out.extend(phase_attributes(&p));
     }
+    if let Some(d) = &report.discovery {
+        out.extend(discovery_attributes(d));
+    }
     if let Some(hold) = &report.spawn_hold {
         out.push(("loom.dispatch.spawn_hold".into(), hold.clone()));
+    }
+    out
+}
+
+/// The tick span's discovery facts (#12306, #12311). The worklist keys are
+/// absent when the chain has no worklist tier, never a 0. Pure.
+#[must_use]
+pub fn discovery_attributes(d: &crate::discovery::SnapshotStats) -> Vec<(String, String)> {
+    let mut out = vec![
+        ("loom.discovery.backend".to_string(), d.backend.to_string()),
+        ("loom.discovery.tier".into(), d.tier.to_string()),
+        ("loom.discovery.items".into(), d.items.to_string()),
+        ("loom.discovery.forge_reads".into(), d.discovery_forge_reads.to_string()),
+    ];
+    if let Some(reason) = &d.fallback_reason {
+        out.push(("loom.discovery.fallback_reason".into(), reason.clone()));
+    }
+    if !d.fallback_repos.is_empty() {
+        out.push(("loom.discovery.fallback_repos".into(), d.fallback_repos.join(",")));
+    }
+    if let Some(outcome) = d.worklist_outcome {
+        out.push(("loom.discovery.worklist.outcome".into(), outcome.to_string()));
+        if let Some(class) = d.worklist_error_class {
+            out.push(("loom.discovery.worklist.error_class".into(), class.to_string()));
+        }
+        if let Some(ms) = d.worklist_latency_ms {
+            out.push(("loom.discovery.worklist.latency_ms".into(), ms.to_string()));
+        }
+        out.push(("loom.discovery.repos.requested".into(), d.repos.to_string()));
+        out.push(("loom.discovery.repos.ok".into(), d.repos_ok.to_string()));
+        out.push(("loom.discovery.repos.unknown".into(), d.repos_unknown.to_string()));
+        out.push(("loom.discovery.repos.backfilling".into(), d.repos_backfilling.to_string()));
+        out.push(("loom.discovery.repos.error".into(), d.repos_error.to_string()));
+        out.push(("loom.discovery.stale_repos".into(), d.stale_repos.to_string()));
+    }
+    if let Some(age) = d.oldest_watermark_age_secs {
+        out.push(("loom.discovery.oldest_watermark_age_secs".into(), age.to_string()));
     }
     out
 }
@@ -211,6 +251,72 @@ pub fn current_halted_repos() -> Option<String> {
 mod tests {
     use super::*;
     use crate::telemetry::ops::MetricValue;
+
+    #[test]
+    fn discovery_facts_are_attributes_the_export_keeps() {
+        let mirror = crate::discovery::SnapshotStats {
+            backend: "mirror",
+            tier: "gateway",
+            fallback_reason: Some("transport".into()),
+            fallback_repos: vec!["acme/a".into(), "acme/b".into()],
+            worklist_outcome: Some("error"),
+            worklist_error_class: Some("transport"),
+            worklist_latency_ms: Some(40),
+            not_modified: Some(false),
+            repos: 31,
+            repos_ok: 28,
+            repos_unknown: 1,
+            repos_backfilling: 1,
+            repos_error: 1,
+            items: 1_555,
+            oldest_watermark_age_secs: Some(90),
+            stale_repos: 2,
+            discovery_forge_reads: 4,
+        };
+        let report = TickReport {
+            discovery: Some(mirror),
+            ..TickReport::default()
+        };
+        let attrs = tick_attributes(&report, None, None);
+        let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("loom.discovery.backend"), Some("mirror"));
+        assert_eq!(get("loom.discovery.tier"), Some("gateway"));
+        assert_eq!(get("loom.discovery.fallback_reason"), Some("transport"));
+        assert_eq!(get("loom.discovery.fallback_repos"), Some("acme/a,acme/b"));
+        assert_eq!(get("loom.discovery.worklist.outcome"), Some("error"));
+        assert_eq!(get("loom.discovery.worklist.error_class"), Some("transport"));
+        assert_eq!(get("loom.discovery.worklist.latency_ms"), Some("40"));
+        assert_eq!(get("loom.discovery.repos.requested"), Some("31"));
+        assert_eq!(get("loom.discovery.repos.ok"), Some("28"));
+        assert_eq!(get("loom.discovery.repos.unknown"), Some("1"));
+        assert_eq!(get("loom.discovery.repos.backfilling"), Some("1"));
+        assert_eq!(get("loom.discovery.repos.error"), Some("1"));
+        assert_eq!(get("loom.discovery.items"), Some("1555"));
+        assert_eq!(get("loom.discovery.oldest_watermark_age_secs"), Some("90"));
+        assert_eq!(get("loom.discovery.forge_reads"), Some("4"));
+        for (key, _) in &attrs {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
+                "{key} is not on the export allowlist"
+            );
+        }
+        // Direct mode has no worklist: those keys are absent, never 0.
+        let direct = TickReport {
+            discovery: Some(crate::discovery::SnapshotStats {
+                backend: "direct",
+                repos: 3,
+                discovery_forge_reads: 6,
+                ..crate::discovery::SnapshotStats::default()
+            }),
+            ..TickReport::default()
+        };
+        let attrs = tick_attributes(&direct, None, None);
+        let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("loom.discovery.forge_reads"), Some("6"));
+        assert_eq!(get("loom.discovery.worklist.outcome"), None);
+        assert_eq!(get("loom.discovery.worklist.latency_ms"), None);
+        assert_eq!(get("loom.discovery.repos.requested"), None);
+    }
 
     #[test]
     fn tick_phases_are_attributes_the_export_keeps() {

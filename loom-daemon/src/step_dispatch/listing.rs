@@ -63,9 +63,32 @@ pub struct OpenItems {
 /// or the listing moved mid-walk. The set is all-or-nothing, so a caller must
 /// not read a missing item as absent.
 pub fn list_all_open(gh_bin: &Path, cwd: Option<&Path>, repo: Option<&str>) -> Result<OpenItems> {
+    // #12310: the step engine's items listing is discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     list_all_open_with(cwd, repo, mirror_rows, |cwd, repo| {
         crate::forge_listing::list_open_issues_cached_all_as(CALLER, gh_bin, cwd, repo)
     })
+}
+
+/// [`list_all_open`] without its per-call mirror leg: the shared REST walk
+/// only. The discovery chain's gateway and `gh` tiers, and the break-glass
+/// `forge.mirror.discovery = "direct"`, list this way (#12311).
+///
+/// # Errors
+///
+/// The REST walk's, as for [`list_all_open`].
+pub fn list_all_open_forge(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo: Option<&str>,
+) -> Result<OpenItems> {
+    let _discovery = crate::gh_invocation::purpose::discovery();
+    list_all_open_with(
+        cwd,
+        repo,
+        |_, _| None,
+        |cwd, repo| crate::forge_listing::list_open_issues_cached_all_as(CALLER, gh_bin, cwd, repo),
+    )
 }
 
 /// [`list_all_open`] with both sources given, so the order is testable

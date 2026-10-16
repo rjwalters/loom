@@ -20,12 +20,14 @@ mod ops;
 mod outcome_facts;
 mod pass;
 mod pick_decision;
+mod prompt_tree;
 mod role_draw;
 mod scope_memory;
 mod session_output;
 mod token_ranking;
 mod tokens_snapshot;
 mod work_started;
+mod write_scope_refused;
 
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
@@ -350,6 +352,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                     .push(kv_string(crate::observability::lifecycle::FAILURE_CLASS, class.clone()));
             }
             attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
+            // #11989: the prompt tree the session ran.
+            attributes.extend(prompt_tree::attributes(r.prompt.as_ref()));
             // #11906: a step-engine step, never a role-runner tick.
             if let Some(source) = &r.source {
                 attributes.push(kv_string("loom.role_tick.source", source.clone()));
@@ -611,6 +615,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::BacklogLevel(_)
+        | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
@@ -629,7 +634,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| work_started::log_parts(r))
                 .or_else(|| backlog_level::log_parts(r))
                 .or_else(|| daemon_exit::log_parts(r))
-                .or_else(|| scope_memory::log_parts(r))?;
+                .or_else(|| scope_memory::log_parts(r))
+                .or_else(|| write_scope_refused::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
@@ -857,6 +863,38 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     value: number_data_point::Value::AsInt(1),
                     time_unix_nano,
                 });
+            }
+            // Cgroup-derived agent-scope census (#12166). Aggregate gauges only
+            // (per-scope names would be unbounded label cardinality); the
+            // per-scope detail rides on the host.health record itself. Absent
+            // when the agents slice was unreadable, never a fabricated zero.
+            if let Some(total) = r.agent_scopes_total {
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes",
+                    "Live loom-agent-* cgroup scopes on this host, registry-independent.",
+                    "{scope}",
+                    number_data_point::Value::AsInt(i64::from(total)),
+                    time_unix_nano,
+                ));
+                let orphans: Vec<_> = r.agent_scopes.iter().filter(|s| !s.agent_alive).collect();
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes_orphaned",
+                    "Listed agent scopes with no agent process left (residue).",
+                    "{scope}",
+                    number_data_point::Value::AsInt(
+                        i64::try_from(orphans.len()).unwrap_or(i64::MAX),
+                    ),
+                    time_unix_nano,
+                ));
+                if let Some(age) = orphans.iter().filter_map(|s| s.age_sec).max() {
+                    samples.push(memory_gauge(
+                        "loom.host.agent_scope_orphan_max_age_seconds",
+                        "Age of the oldest orphaned agent scope.",
+                        "s",
+                        number_data_point::Value::AsInt(i64::try_from(age).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
             }
             if let Some(cpu_idle_fraction) = r.cpu_idle_fraction {
                 samples.push(MetricSample {

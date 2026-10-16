@@ -33,6 +33,7 @@ use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_collision;
 use loom_daemon::role_runner;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
+use loom_daemon::task_dump;
 use loom_daemon::terminal::TerminalManager;
 use loom_daemon::token_ranking_refresh;
 use loom_daemon::watch_registry;
@@ -1459,6 +1460,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     }
     // #11104: star-liveness is gone; its `autonomous.operatorPriority` keys warn once.
     work_finder::operator_priority::warn_retired_config(&sweep_workspace);
+    // #11406: the fleet-captain gauge block is gone; its keys warn once.
+    loom_daemon::observability::retired_captain_config::warn_retired_config(&sweep_workspace);
     let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
         sweep_workspace.clone(),
         socket_path.clone(),
@@ -1999,6 +2002,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         credential_preflight,
         drain_state.clone(),
     );
+
+    // SIGUSR1 dumps the async task tree to the log for a hung tick (#12079).
+    task_dump::spawn_signal_listener();
 
     // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
     // (Ctrl-C, interactive) and SIGTERM (`kill <pid>`, the default signal a

@@ -18,7 +18,7 @@ use chrono::Utc;
 use super::gather_budget::{
     deadline_passed, millis, GatherWalk, SpawnParts, Starvation, TickPhases, GUARANTEED_FLOOR,
 };
-use super::item_draw::{weigh, ItemWeights, WeighContext};
+use super::item_draw::{weigh, ItemWeights, PoolKnobs, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
 use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawnTimings};
@@ -27,7 +27,7 @@ use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::repo_cap::{RepoCap, RepoLimits};
 use crate::work_finder::step_item::{Lane, Step};
-use crate::work_finder::{workspace_draw, RedMainLane, RegistryDispatcher, TickReport};
+use crate::work_finder::{RedMainLane, RegistryDispatcher, TickReport};
 use crate::workspace_pool::WorkspacePool;
 
 /// What the loop computed for this tick, per root and for the host.
@@ -54,6 +54,9 @@ pub struct TickInputs<'a> {
     /// How many spawns, each in a different repo, the draw runs at once
     /// (#12298, `autonomous.workFinder.spawnConcurrency`); `1` is serial.
     pub spawn_concurrency: usize,
+    /// The discovery tier chain that builds the tick's snapshot (#12311,
+    /// `forge.mirror.discovery`).
+    pub discovery: crate::discovery::Chain,
 }
 
 /// What a workspace's listing said beyond its items.
@@ -144,6 +147,7 @@ pub fn actionable_point(
 /// The step tick's state across ticks: the stage-entry provider's cache,
 /// and where the next gather starts (#12074).
 pub struct StepDriver {
+    discovery: crate::discovery::Discovery,
     provider: StageEntryProvider,
     next_start: usize,
     starvation: Starvation,
@@ -152,6 +156,7 @@ pub struct StepDriver {
 impl Default for StepDriver {
     fn default() -> Self {
         Self {
+            discovery: crate::discovery::Discovery::default(),
             provider: StageEntryProvider::load(default_cache_path(), DEFAULT_EVENTS_BUDGET),
             next_start: 0,
             starvation: Starvation::default(),
@@ -301,6 +306,7 @@ fn list_one(
     idx: usize,
     guaranteed: bool,
     escalated: bool,
+    snapshot: &crate::discovery::TickSnapshot,
     held_capabilities: &BTreeSet<String>,
 ) -> anyhow::Result<Option<super::gather::Listed>> {
     let root = &input.roots[idx];
@@ -323,7 +329,7 @@ fn list_one(
         let mut dispatcher = RegistryDispatcher::new(registry.clone());
         crate::work_finder::main_red_fix::evaluate(lane, &mut fixes, &mut dispatcher)
     };
-    super::gather::list(root, registry, red, held_capabilities)
+    super::gather::list(root, registry, snapshot, red, held_capabilities)
 }
 
 pub(crate) fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
@@ -382,6 +388,7 @@ impl StepDriver {
                     idx,
                     repo,
                     weight,
+                    in_flight: 0,
                     weighing: super::item_draw::Weighing {
                         pool: Vec::new(),
                         excluded: Default::default(),
@@ -405,6 +412,9 @@ impl StepDriver {
         // parent and the runtime context; a repo past the deadline is
         // skipped as before. Results come back in walk order.
         let listing_started = Instant::now();
+        // One snapshot per tick (#12306): the Mirror backend makes its one
+        // worklist request here; Direct lists each repo as the gather asks.
+        let snapshot = self.discovery.begin_tick(input.discovery, now);
         let read_scope = crate::gh_invocation::read_deadline::snapshot();
         let parent = crate::gh_invocation::telemetry::thread_parent();
         let runtime = tokio::runtime::Handle::try_current().ok();
@@ -434,6 +444,7 @@ impl StepDriver {
                     idx,
                     guaranteed,
                     escalated,
+                    &snapshot,
                     &held_capabilities,
                 ))
             },
@@ -493,6 +504,10 @@ impl StepDriver {
                 stale_listing: gathered.stale_listing,
                 fixes_only,
             };
+            // `in_flight_repo` (#12185): the repo's items this host runs plus
+            // the live claims peers advertise, counted before the claimed
+            // items leave the pool.
+            let in_flight = claims.items.len();
             let held = shape_pool(&mut weighing, &claims, listing);
             if held > 0 {
                 log::warn!(
@@ -511,6 +526,7 @@ impl StepDriver {
                 idx,
                 repo,
                 weight,
+                in_flight,
                 weighing,
                 halted: false,
                 created_at: gathered.created_at,
@@ -566,14 +582,19 @@ impl StepDriver {
                 spawn_concurrency: input.spawn_concurrency.max(1),
             },
             &seed,
-            workspace_draw::tick_seed(),
-            &workspace_draw::weight_bonus(),
+            // Pool-wide, so read once, from the primary workspace like the
+            // work-finder's own hot-applied config.
+            &input
+                .roots
+                .first()
+                .map_or_else(PoolKnobs::default, |root| PoolKnobs::for_root(root)),
             &mut repo_cap,
             &mut spawner,
         );
         let draw_total = draw_started.elapsed();
         let mut report = result.report;
         report.gather = Some(gather);
+        report.discovery = Some(snapshot.stats());
         report.phases = Some(TickPhases {
             listing_ms,
             filter_ms,

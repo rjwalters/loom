@@ -746,15 +746,28 @@ unrevised re-entries, linking the verdict comment that carries the tally. The to
 is a counted non-verdict, and the operator must be able to tell the two apart.
 
 ```bash
+# Portable sha256 — same fallback shape as the "Idempotency Guard for Unrevised
+# Epics" section above (`_sha256`, restated here so this block is self-contained
+# and does not depend on that section having already run in this shell).
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256
+  else cksum; fi
+}
 ESCALATE_MARKER="<!-- champion:epic-escalated -->"
 EVALUATIONS_TEXT=$(gh api "repos/{owner}/{repo}/issues/<number>/comments" --paginate \
   --jq '.[] | select(.body | contains("Champion Review: Epic Needs Revision")) | "- posted rejection: " + .html_url')
 [ "$SKIP_STREAK" -gt 0 ] && EVALUATIONS_TEXT="$EVALUATIONS_TEXT
 - $SKIP_STREAK unrevised re-entry(ies), no comment (tally on the verdict comment: $(printf '%s\n' "$VERDICT_COMMENT" | jq -r '.html_url // "link unavailable"'))"
-./.loom/scripts/post-comment.sh <number> --body "$ESCALATE_MARKER
+# Options (operator-decision.md): restructure / close / file as ordinary issues.
+loom-daemon operator-decision apply <number> --input /tmp/decision-<number>.json \
+  && J=$(gh issue view <number> --json title,body) \
+  && BODY_HASH=$(printf '%s\n%s' "$(jq -r .title <<<"$J")" "$(jq -r .body <<<"$J")" | _sha256 | awk '{print substr($1, 1, 16)}') \
+  && ./.loom/scripts/post-comment.sh <number> --body "$ESCALATE_MARKER
+<!-- champion:epic-verdict:body-$BODY_HASH -->
 **Champion: Escalating to Operator — Epic Rejected Repeatedly Without Revision**
 
-Evaluated $UNREVISED_EVALS+ times with converging feedback ($PRIOR_REJECTIONS posted rejection(s) + $SKIP_STREAK unrevised re-entry(ies) of an unchanged epic), but has not been revised to address it. Re-running an identical evaluation each cycle changes nothing, and skipping it silently forever would leave it invisible; escalating is the only move that makes progress.
+Evaluated $UNREVISED_EVALS+ times with converging feedback ($PRIOR_REJECTIONS posted rejection(s) + $SKIP_STREAK unrevised re-entry(ies)), never revised. Re-evaluating changes nothing and skipping hides it. Ranked options are in the body.
 
 **Evaluations counted:**
 $EVALUATIONS_TEXT
@@ -762,21 +775,15 @@ $EVALUATIONS_TEXT
 **Recurring findings:**
 - [Criterion that failed, repeated across rejections]: [Specific reason]
 
-A human needs to decide whether to restructure this epic, close it, or take it
-out of the epic workflow entirely (for example by filing the work as ordinary
-issues instead of phases).
-
 ---
-*Automated by Champion role*" \
-  && gh issue edit <number> --add-label "loom:operator"
+*Automated by Champion role*"
 ```
 
-**Anti-regression caveat (#6715): the escalation `gh issue edit` above is
-add-only and must never also remove `loom:epic`.** Escalating parks the epic for
-a human while it stays discoverable as an epic; stripping `loom:epic` would hide
-it from every later Champion pass (which discovers epics by that label), including
-the one after a human revises it, since nothing re-applies the label. If a future
-edit adds a label-removal flag here, it must never target `loom:epic`.
+`apply` rewrites the body, so the hash is re-derived and stamped on the comment:
+an un-park then reads as `OPERATOR_RULED` (#7921). On exit 1, fix the JSON and re-run.
+
+**Anti-regression caveat (#6715): `apply` above removes no label and must not remove `loom:epic`**
+(epics are discovered by it and nothing re-applies it).
 
 When you arrive here via `ESCALATE_UNREVISED=yes` you have **not** re-run the 6
 criteria, and must not: the title and body are byte-identical to the revision the

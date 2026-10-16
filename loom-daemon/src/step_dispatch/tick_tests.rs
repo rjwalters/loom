@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use super::*;
 use crate::forge_listing::RestIssue;
 use crate::step_dispatch::gather::{build_inputs, draw_inputs, pull_from_row, IssueFacts};
-use crate::step_dispatch::item_draw::{replay_record, weigh, ItemWeights, WeighContext};
+use crate::step_dispatch::item_draw::{replay_record, weigh, ItemWeights, PoolKnobs, WeighContext};
 use crate::work_finder::step_item::{self, HostInput, PullMarkers, RepoInput};
 
 fn now() -> DateTime<Utc> {
@@ -82,6 +82,7 @@ pub(crate) fn workspace(idx: usize, repo: &str, rows: &[RestIssue]) -> StepWorks
         idx,
         repo: repo.to_string(),
         weight: 1,
+        in_flight: 0,
         weighing: weigh(&items, &ctx, &ItemWeights::default()),
         halted: false,
         created_at: HashMap::new(),
@@ -94,6 +95,7 @@ struct FakeSpawner {
     refuse: Vec<(u32, &'static str)>,
     refuse_all: Option<&'static str>,
     asked: Vec<(usize, u32, StepRole, u32)>,
+    terms: Vec<Option<StepDrawTerms>>,
     /// Each round's batch, as `(workspace, item)` (#12298).
     batches: Vec<Vec<(usize, u32)>>,
     /// Hold the spawns once this many batches ran (#12298).
@@ -104,6 +106,7 @@ impl StepSpawner for FakeSpawner {
     fn spawn(&mut self, idx: usize, request: &StepSpawnRequest) -> SpawnResult {
         self.asked
             .push((idx, request.item, request.role, request.draw_attempt));
+        self.terms.push(request.draw);
         if let Some(reason) = self.refuse_all {
             return SpawnResult::Refused(reason.to_string());
         }
@@ -160,15 +163,17 @@ fn run_with(
     cap: &mut RepoCap,
     spawner: &mut FakeSpawner,
 ) -> StepTick {
-    run(
-        workspaces,
-        limits,
-        &seed(),
-        (11_103, None),
-        &WeightBonus::default(),
-        cap,
-        spawner,
-    )
+    run_knobs(workspaces, limits, PoolKnobs::default(), cap, spawner)
+}
+
+fn run_knobs(
+    workspaces: Vec<StepWorkspace>,
+    limits: StepTickLimits,
+    knobs: PoolKnobs,
+    cap: &mut RepoCap,
+    spawner: &mut FakeSpawner,
+) -> StepTick {
+    run(workspaces, limits, &seed(), &knobs, cap, spawner)
 }
 
 #[test]
@@ -210,6 +215,7 @@ fn every_stage_gets_its_step_and_claimed_and_parked_items_are_skipped() {
     // The record names the repo it seeded with, and replays.
     let record = tick.report.item_draw.as_ref().unwrap();
     assert!(record.draws.iter().all(|d| d.repo == "acme/one"));
+    assert_eq!(record.repos.len(), 1);
     let replayed = replay_record(record).unwrap();
     assert_eq!(replayed.len(), 6);
 }
@@ -366,6 +372,99 @@ fn a_refused_draw_is_counted_on_the_record() {
 #[test]
 fn a_missing_role_command_reads_as_workspace_commands_missing() {
     assert_eq!(disposition_of("workspace_commands_missing"), Qd::WorkspaceCommandsMissing);
+}
+
+fn many(n: u32) -> Vec<RestIssue> {
+    (1..=n)
+        .map(|i| row(i, &["loom:triage"], "", false))
+        .collect()
+}
+
+/// #12185: one pool across the workspaces. Each draw names its item's repo,
+/// carries the repo terms (`n_items`, `in_flight_repo`) to the spawn request,
+/// and the whole record replays.
+#[test]
+fn one_pool_spans_the_workspaces_and_the_record_replays() {
+    let mut spawner = FakeSpawner::default();
+    let mut cap = RepoCap::new(None, vec![0, 0]);
+    let mut busy = workspace(1, "acme/two", &many(3));
+    busy.in_flight = 4;
+    busy.weight = 16;
+    let tick = run_knobs(
+        vec![workspace(0, "acme/one", &many(30)), busy],
+        limits(12),
+        PoolKnobs {
+            backlog_exponent: 0.5,
+            busy_exponent: 1.0,
+        },
+        &mut cap,
+        &mut spawner,
+    );
+    let repos: BTreeSet<usize> = spawner.asked.iter().map(|a| a.0).collect();
+    assert_eq!(repos, BTreeSet::from([0, 1]), "both repos drew from the one pool");
+    let record = tick.report.item_draw.as_ref().unwrap();
+    assert_eq!(record.seed_scheme, "loom-draw/v3");
+    assert_eq!(
+        record
+            .repos
+            .iter()
+            .map(|r| (r.repo.as_str(), r.weight, r.in_flight, r.items))
+            .collect::<Vec<_>>(),
+        vec![("acme/one", 1, 0, 30), ("acme/two", 16, 4, 3)]
+    );
+    // The spawn request, and so the step span, carries the weight terms.
+    for (asked, terms) in spawner.asked.iter().zip(&spawner.terms) {
+        let terms = terms.expect("a drawn step carries its terms");
+        let (items, in_flight) = if asked.0 == 0 { (30, 0) } else { (3, 4) };
+        assert!(terms.weight > 0 && terms.weight <= terms.total_weight);
+        assert_eq!(terms.in_flight_repo, in_flight);
+        assert!(terms.repo_items <= items, "the repo's pool shrinks as it is drawn");
+    }
+    assert_eq!(replay_record(record).unwrap().len(), tick.draws);
+    // The old workspace draw is gone.
+    assert!(tick.report.workspace_draw.is_none());
+}
+
+#[test]
+fn a_zero_weight_workspace_is_never_drawn() {
+    let mut spawner = FakeSpawner::default();
+    let mut cap = RepoCap::new(None, vec![0, 0]);
+    let mut off = workspace(0, "acme/off", &many(5));
+    off.weight = 0;
+    let tick =
+        run_with(vec![off, workspace(1, "acme/on", &many(5))], limits(8), &mut cap, &mut spawner);
+    assert!(spawner.asked.iter().all(|a| a.0 == 1), "{:?}", spawner.asked);
+    assert_eq!(tick.report.dispatched, 5, "the repo that is on drains, no more");
+}
+
+/// A repo the per-repo cap refuses is out of the pool for the rest of the
+/// tick, and the record still replays.
+#[test]
+fn a_capped_repo_leaves_the_pool_and_the_record_replays() {
+    let mut spawner = FakeSpawner::default();
+    // `one` is already at its cap of 8: any draw of it is refused and closes it.
+    let mut cap = RepoCap::new(Some(8), vec![8, 0]);
+    let tick = run_knobs(
+        vec![
+            workspace(0, "acme/one", &many(20)),
+            workspace(1, "acme/two", &many(20)),
+        ],
+        limits(6),
+        PoolKnobs::default(),
+        &mut cap,
+        &mut spawner,
+    );
+    assert!(spawner.asked.iter().all(|a| a.0 == 1));
+    assert_eq!(tick.report.dispatched, 6);
+    let record = tick.report.item_draw.as_ref().unwrap();
+    assert!(record.closures.len() <= 1, "{:?}", record.closures);
+    if let Some(c) = record.closures.first() {
+        assert_eq!(c.repo, "acme/one");
+        assert!(record.draws[c.after_draw as usize..]
+            .iter()
+            .all(|d| d.repo != "acme/one"));
+    }
+    assert_eq!(replay_record(record).unwrap().len(), tick.draws);
 }
 
 /// #12251: a Builder step refused on a landed issue reads as
@@ -614,4 +713,100 @@ fn a_breaker_tripped_mid_tick_stops_the_next_round() {
     let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
     assert!(spawner.asked.is_empty());
     assert_eq!(tick.report.dispatched, 0);
+}
+
+/// #12260: an unverifiable claim means the owner's writer cannot claim
+/// anything this tick, so no other workspace of that owner is drawn; another
+/// owner's workspaces still are.
+#[test]
+fn an_unverified_claim_ends_the_owners_draws_for_the_tick() {
+    let rows: Vec<RestIssue> = (1..=10)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_all: Some(REFUSAL_CLAIM_UNVERIFIED),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0, 0]);
+    let tick = run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "ACME/two", &rows),
+        ],
+        limits(10),
+        &mut cap,
+        &mut spawner,
+    );
+    // One draw, not MAX_PASSES_PER_TICK: both repos share the owner.
+    assert_eq!(spawner.asked.len(), 1, "{:?}", spawner.asked);
+    assert_eq!(tick.passes.get(REFUSAL_CLAIM_UNVERIFIED), Some(&1));
+    assert_eq!(tick.report.dispatched, 0);
+
+    // A second owner keeps drawing after the first owner's refusal.
+    // Find the first acme draw, then refuse it.
+    let mut spawner = FakeSpawner::default();
+    let mut cap = RepoCap::new(None, vec![0, 0, 0]);
+    run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "acme/two", &rows),
+            workspace(2, "other/three", &rows),
+        ],
+        limits(4),
+        &mut cap,
+        &mut spawner,
+    );
+    let first_acme = spawner.asked.iter().find(|a| a.0 != 2).copied().unwrap();
+    let mut spawner = FakeSpawner {
+        refuse: vec![(first_acme.1, REFUSAL_CLAIM_UNVERIFIED)],
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0, 0, 0]);
+    let tick = run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "acme/two", &rows),
+            workspace(2, "other/three", &rows),
+        ],
+        limits(4),
+        &mut cap,
+        &mut spawner,
+    );
+    // The refused acme draw is the only acme draw that follows it.
+    let refused_at = spawner
+        .asked
+        .iter()
+        .position(|a| a.0 == first_acme.0 && a.1 == first_acme.1)
+        .unwrap();
+    assert!(spawner.asked[refused_at + 1..].iter().all(|a| a.0 == 2), "{:?}", spawner.asked);
+    // `other/three` fills every slot the refusal left.
+    assert_eq!(tick.report.dispatched, 4);
+}
+
+#[test]
+fn other_refusals_still_redraw_in_the_same_owner() {
+    let rows: Vec<RestIssue> = (1..=10)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_all: Some("claim_lost"),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0, 0]);
+    run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "acme/two", &rows),
+        ],
+        limits(1),
+        &mut cap,
+        &mut spawner,
+    );
+    assert_eq!(spawner.asked.len(), MAX_DRAWS_PER_SLOT as usize);
+}
+
+#[test]
+fn forge_owner_is_the_lowercased_slug_prefix() {
+    assert_eq!(forge_owner("AcMe/one"), "acme");
+    assert_eq!(forge_owner("bare"), "bare");
 }

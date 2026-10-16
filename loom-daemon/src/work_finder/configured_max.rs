@@ -204,11 +204,8 @@ impl ConfiguredMaxReloader {
     ///
     /// The per-repo cap (#9090) is refreshed by the same read and read back
     /// with [`Self::per_repo`] — one config read per tick serves both knobs.
-    /// The same read also publishes the workspace draw's weight bonuses
-    /// (`dispatch.weightBonus*`, #11742) for this tick's draw.
     pub fn refresh(&mut self) -> usize {
         let config = read_work_finder_config(&self.root);
-        publish_weight_bonus(&config);
         let next = ConfiguredMax::resolve(&config);
         if let Some(msg) = transition_message(self.current, next) {
             log::info!("work_finder: {msg}");
@@ -238,19 +235,6 @@ impl ConfiguredMaxReloader {
     #[must_use]
     pub fn per_repo(&self) -> Option<usize> {
         self.current.per_repo
-    }
-}
-
-/// Publish `config`'s weight bonuses (#11742) for the next tick's
-/// [`super::workspace_draw::order`], logging a change once.
-pub fn publish_weight_bonus(config: &WorkFinderConfig) {
-    let next = super::config::resolve_weight_bonus(config);
-    let prev = super::workspace_draw::set_weight_bonus(next);
-    if prev != next {
-        log::info!(
-            "work_finder: dispatch.weightBonus {prev:?} -> {next:?} — hot-applied without a \
-             daemon restart (#11742); the next workspace draw uses the new bonuses"
-        );
     }
 }
 
@@ -419,39 +403,6 @@ mod tests {
 
         write_config(dir.path(), &max_config(1));
         assert_eq!(reloader.refresh(), 1);
-    }
-
-    /// #11742: the per-tick reload publishes `dispatch.weightBonus*` for the
-    /// next draw, so a config edit hot-applies without a restart. (The
-    /// published value is per thread under `cfg(test)`.)
-    #[test]
-    #[serial]
-    fn reloader_publishes_the_weight_bonus() {
-        use crate::priority_pick::WeightBonus;
-        use crate::work_finder::workspace_draw::weight_bonus;
-        let dir = tempfile::tempdir().unwrap();
-        let initial = ConfiguredMax::resolve(&read_work_finder_config(dir.path()));
-        let mut reloader = ConfiguredMaxReloader::new(dir.path().to_path_buf(), initial);
-        reloader.refresh();
-        assert_eq!(weight_bonus(), WeightBonus::default());
-
-        write_config(
-            dir.path(),
-            r#"{"hyperparameters": {"dispatch": {"weightBonusRedMainFix": 7, "weightBonusImportant": 0}}}"#,
-        );
-        reloader.refresh();
-        assert_eq!(
-            weight_bonus(),
-            WeightBonus {
-                red_main_fix: 7,
-                important: 0,
-                ..WeightBonus::default()
-            }
-        );
-
-        write_config(dir.path(), "{}");
-        reloader.refresh();
-        assert_eq!(weight_bonus(), WeightBonus::default());
     }
 
     #[test]

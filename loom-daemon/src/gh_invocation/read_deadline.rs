@@ -79,6 +79,8 @@ impl Drop for Guard {
 /// `no_writer_fallback`, a read-only listing a reader could not serve is shed
 /// rather than moved onto the writer.
 pub fn enter(deadline: Instant, no_writer_fallback: bool) -> Guard {
+    // A new tick: a reserve refusal in the last one does not carry over.
+    super::purpose::reopen_discovery();
     let previous = SCOPE.with(|s| {
         s.replace(Some(Scope {
             deadline,
