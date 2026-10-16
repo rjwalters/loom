@@ -568,13 +568,29 @@ fn a_restored_ledger_drops_the_forge_ladder_mirror() {
         now,
     );
     l.arm(7, StepRole::Builder, now + mins(90), CooldownCause::Landed, now);
+    // #12516: a fallback for a marker that was never written is restored.
+    l.arm(
+        4,
+        StepRole::ChampionMerge,
+        now + mins(240),
+        CooldownCause::ForgeLadderFallback,
+        now,
+    );
     let durable = l.persisted(now + mins(1));
-    assert_eq!(durable.len(), 2, "{durable:?}");
+    assert_eq!(durable.len(), 3, "{durable:?}");
 
     let mut after = OutcomeLedger::default();
     after.restore(durable, now + mins(1));
     assert_eq!(after.cooling_until(3, StepRole::ChampionMerge, now + mins(1)), None);
     assert_eq!(after.cooling_until(7, StepRole::Builder, now + mins(1)), Some(now + mins(90)));
+    assert_eq!(
+        after.cooling_cause(4, StepRole::ChampionMerge, now + mins(1)),
+        Some(CooldownCause::ForgeLadderFallback)
+    );
+    assert_eq!(
+        after.cooling_until(4, StepRole::ChampionMerge, now + mins(1)),
+        Some(now + mins(240))
+    );
 }
 
 #[test]
