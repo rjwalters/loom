@@ -309,6 +309,7 @@ pub mod pipeline_snapshot;
 pub mod points_marker;
 pub mod pr_latency;
 // #11931: a terminated role run's PR leases are released on its behalf.
+pub mod agent_scopes;
 pub mod pr_lease_reap;
 pub mod pr_planning;
 pub mod preflight;

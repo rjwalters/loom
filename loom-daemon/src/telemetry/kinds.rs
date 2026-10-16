@@ -160,8 +160,6 @@ pub struct TelemetryKindMeta {
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
-pub mod backlog_level;
-
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
 /// `write_scope.refused` (#12168) — a daemon write the #9548 gate refused.
@@ -478,12 +476,6 @@ macro_rules! telemetry_kind_table {
             /// A role agent began working an item in a stage (#11641): the
             /// work-start that splits a stay into queue wait and work time.
             WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
-
-            /// The backlog level the daemon handed one Curator dispatch
-            /// (#11819): open count, target, level. OTLP-only. See
-            /// [`backlog_level`].
-            BacklogLevel = "backlog.level" => $crate::telemetry::kinds::backlog_level::BacklogLevelRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One daemon-pass write the #9548 credential-scope gate refused

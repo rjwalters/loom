@@ -462,6 +462,9 @@ fn only_the_discovery_listings_name_the_mirror() {
         // never a claim, label-transition or merge read (invariant 3), so it
         // does not go through `forge_mirror::discovery`. Its tests drive the
         // mirror's client and `set_active`.
+        // The chain (#12311) reads `forge.mirror` to know whether a mirror is
+        // configured; it makes no read.
+        "discovery/chain.rs",
         "discovery/mirror.rs",
         "discovery/tests.rs",
         "discovery/worklist.rs",

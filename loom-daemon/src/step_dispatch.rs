@@ -39,6 +39,7 @@ pub mod item_draw;
 pub mod listing;
 pub mod outcome_ledger;
 pub mod reeval_ladder;
+pub mod session_ledger;
 pub mod stage_entry;
 pub mod step_end;
 pub mod tick;

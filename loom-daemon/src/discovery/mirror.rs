@@ -1,13 +1,16 @@
-//! The Mirror backend: one worklist request per tick, conditional on the
-//! last ETag (module docs of [`super`]). No fallback to the forge.
+//! The Mirror tier: one worklist request per tick, conditional on the last
+//! ETag (module docs of [`super`]). The cache is one in-memory
+//! `(etag, body)`, replaced on every `200`, dropped on restart, never merged
+//! with change-stream events and never persisted. It only ever answers a
+//! `304`: a failed request does not reuse it, the tick falls to the next tier
+//! instead ([`super::fallback`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
-use super::snapshot::RepoSnapshot;
+use super::snapshot::{RepoSnapshot, RepoStatus};
 use super::worklist::{self, Worklist};
 use crate::forge_mirror::client::{self, Conditional, MirrorError};
 
@@ -38,11 +41,66 @@ pub struct MirrorBackend {
 /// One tick's view of the worklist.
 pub struct TickWorklist {
     worklist: Option<Arc<Worklist>>,
-    error: Option<String>,
+    /// Why there is no worklist this tick.
+    failure: Option<Failure>,
     pub latency_ms: u64,
     pub not_modified: bool,
-    pub reused_previous: bool,
     max_staleness: Duration,
+}
+
+/// A failed worklist request: its class (the span's `.worklist.error_class`)
+/// and its text (logged, never put on a span).
+#[derive(Debug, Clone)]
+pub struct Failure {
+    pub class: &'static str,
+    pub detail: String,
+}
+
+impl Failure {
+    fn of(e: &MirrorError) -> Self {
+        let class = match e {
+            MirrorError::Transport(_) => "transport",
+            MirrorError::Auth(_) => "auth",
+            MirrorError::Status(_) => "status",
+            MirrorError::Malformed(_) => "malformed",
+        };
+        Self {
+            class,
+            detail: e.to_string(),
+        }
+    }
+}
+
+/// Why the worklist could not answer for a repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Miss {
+    /// The request failed, or nothing is cached for a `304`.
+    NoWorklist(&'static str),
+    /// The worklist omits the repo: the key may not read it.
+    NotInWorklist,
+    /// The worklist names the repo with a `status` that is not `ok`.
+    Status(RepoStatus),
+}
+
+impl Miss {
+    /// The tick's `fallback_reason` for this miss.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::NoWorklist(class) => class,
+            Self::NotInWorklist | Self::Status(_) => "repo_status",
+        }
+    }
+
+    /// The `status` bucket the miss counts under.
+    #[must_use]
+    pub fn status(&self) -> RepoStatus {
+        match self {
+            Self::NoWorklist(_) => RepoStatus::Error,
+            Self::NotInWorklist => RepoStatus::Unknown,
+            Self::Status(s) => *s,
+        }
+    }
 }
 
 fn request(etag: Option<&str>) -> Fetched {
@@ -80,10 +138,9 @@ impl MirrorBackend {
             });
         let mut tick = TickWorklist {
             worklist: None,
-            error: None,
+            failure: None,
             latency_ms,
             not_modified: false,
-            reused_previous: false,
             max_staleness,
         };
         let failure = match outcome {
@@ -93,7 +150,10 @@ impl MirrorBackend {
                     tick.not_modified = true;
                     return tick;
                 }
-                None => "worklist answered 304 with nothing cached".to_string(),
+                None => Failure {
+                    class: "malformed",
+                    detail: "worklist answered 304 with nothing cached".to_string(),
+                },
             },
             Ok(Conditional::Modified { etag, body }) => match worklist::decode(body) {
                 Ok(list) => {
@@ -105,58 +165,54 @@ impl MirrorBackend {
                     });
                     return tick;
                 }
-                Err(e) => e.to_string(),
+                Err(e) => Failure::of(&e),
             },
-            Err(e) => e.to_string(),
+            Err(e) => Failure::of(&e),
         };
-        // No fallback to the forge: the previous snapshot stands in, or
-        // every repo reads as unavailable this tick.
-        if let Some(last) = &self.last {
-            log::warn!(
-                "discovery: worklist request failed ({failure}); using the previous snapshot"
-            );
-            tick.worklist = Some(last.worklist.clone());
-            tick.reused_previous = true;
-        } else {
-            log::warn!("discovery: worklist request failed ({failure}); no previous snapshot");
-        }
-        tick.error = Some(failure);
+        log::warn!(
+            "discovery: worklist request failed ({}); this tick falls to the next tier",
+            failure.detail
+        );
+        tick.failure = Some(failure);
         tick
     }
 }
 
 impl TickWorklist {
-    /// One repo's snapshot.
+    /// One repo's snapshot from the worklist.
     ///
     /// # Errors
     ///
-    /// No worklist at all, or the repo is not in it (the key may read a
-    /// subset of repos).
-    pub fn repo(&self, slug: &str, _now: DateTime<Utc>) -> Result<Arc<RepoSnapshot>> {
+    /// [`Miss`]: the caller falls to the next tier for this repo alone.
+    pub fn repo(&self, slug: &str, _now: DateTime<Utc>) -> Result<Arc<RepoSnapshot>, Miss> {
         let Some(list) = &self.worklist else {
-            return Err(anyhow!(
-                "mirror discovery: no worklist ({})",
-                self.error.as_deref().unwrap_or("unavailable")
-            ));
+            return Err(Miss::NoWorklist(self.failure.as_ref().map_or("transport", |f| f.class)));
         };
-        list.repos
+        let repo = list
+            .repos
             .get(&slug.to_ascii_lowercase())
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!("mirror discovery: {slug} is not in the worklist (the key may not read it)")
-            })
+            .ok_or(Miss::NotInWorklist)?;
+        match repo.status {
+            RepoStatus::Ok => Ok(repo.clone()),
+            other => Err(Miss::Status(other)),
+        }
+    }
+
+    /// `ok`, `not_modified` or `error`.
+    #[must_use]
+    pub fn outcome(&self) -> &'static str {
+        if self.failure.is_some() {
+            "error"
+        } else if self.not_modified {
+            "not_modified"
+        } else {
+            "ok"
+        }
     }
 
     #[must_use]
-    pub fn repo_count(&self) -> usize {
-        self.worklist.as_ref().map_or(0, |w| w.repos.len())
-    }
-
-    #[must_use]
-    pub fn item_count(&self) -> usize {
-        self.worklist
-            .as_ref()
-            .map_or(0, |w| w.repos.values().map(|r| r.rows.len()).sum())
+    pub fn error_class(&self) -> Option<&'static str> {
+        self.failure.as_ref().map(|f| f.class)
     }
 
     /// Age of the stalest repo's newest evidence.
