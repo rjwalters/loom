@@ -219,6 +219,10 @@ impl GhInvocation {
             class,
         };
         let owner = crate::credential_preflight::owner_of_nwo(&slug).to_ascii_lowercase();
+        // #12389: a reader-only read never reaches the writer; with no
+        // reader or gateway to serve it, it is shed whatever its class.
+        let barred =
+            policy.shed && (self.reader_only || crate::forge_gateway::cli_reads_reader_only());
         let why = format!("{} via the gh choke point", self.operation.as_str());
         let mut tried: HashSet<String> = HashSet::new();
         let mut last_app: Option<String> = None;
@@ -226,7 +230,7 @@ impl GhInvocation {
         let mut decision = lookup(&request);
         loop {
             let (dir, app_id) = match decision {
-                RouteDecision::NoPool if tried.is_empty() => {
+                RouteDecision::NoPool if tried.is_empty() && !barred => {
                     // No reader pool at all: the writer, as before W4.
                     return self.execute_direct();
                 }
@@ -236,6 +240,7 @@ impl GhInvocation {
                     // (except inside a tick's read scope, #12074).
                     return self.no_reader_left(
                         class,
+                        barred,
                         ExhaustCause::Unavailable,
                         &owner,
                         resource,
@@ -247,6 +252,7 @@ impl GhInvocation {
                 RouteDecision::Exhausted { until, cause } => {
                     return self.no_reader_left(
                         class,
+                        barred,
                         cause,
                         &owner,
                         resource,
@@ -264,6 +270,7 @@ impl GhInvocation {
                 let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
                 return self.no_reader_left(
                     class,
+                    barred,
                     cause_after(last_failure),
                     &owner,
                     resource,
@@ -312,6 +319,21 @@ impl GhInvocation {
                 return Ok(first);
             };
             if failure == Failure::Coverage {
+                if barred {
+                    // The reader does not cover the repo and the writer may
+                    // not confirm it: no answer.
+                    let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
+                    return self.no_reader_left(
+                        class,
+                        barred,
+                        ExhaustCause::Unavailable,
+                        &owner,
+                        resource,
+                        until,
+                        Some(app_id.as_str()),
+                        true,
+                    );
+                }
                 if class != ReadClass::Gate
                     && is_not_found(&first)
                     && is_gone_at(&slug, &affinity, now)
@@ -367,6 +389,7 @@ impl GhInvocation {
     fn no_reader_left(
         &self,
         class: ReadClass,
+        barred: bool,
         cause: ExhaustCause,
         owner: &str,
         resource: Resource,
@@ -395,7 +418,7 @@ impl GhInvocation {
         // non-budget withdrawals made the router answer `Unavailable`.
         // `LOOM_READ_SHED=0` still maps every class to `Gate` before this.
         let sheds = class.sheds(cause);
-        if class != ReadClass::Observability && (escalated || (!in_tick && !sheds)) {
+        if !barred && class != ReadClass::Observability && (escalated || (!in_tick && !sheds)) {
             return if tried {
                 self.writer_fallback()
             } else {
