@@ -3,7 +3,6 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod auto_update;
-mod backlog_level;
 mod checkout_external_change;
 mod ci;
 mod daemon_event;
@@ -614,7 +613,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SessionOutput(_)
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
-        | TelemetryRecord::BacklogLevel(_)
         | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::ScopeMemory(_)
@@ -632,7 +630,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
-                .or_else(|| backlog_level::log_parts(r))
                 .or_else(|| daemon_exit::log_parts(r))
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))?;

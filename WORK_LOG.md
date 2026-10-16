@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12376**: fix: reword stacked-rebase comment and baseline forge calls to restore green main
+- **Issue #12373** (closed): main red: rebase-stacked-children.sh (#9808) fails rebase_guard callsite test and forge_inventory gate
 - **PR #12365**: chore(harness): track latest CLIs — codex 0.162.1→0.163.0 opencode 1.19.1→1.19.2
 - **PR #12366**: fix: define _sha256 helper in champion-epic Step 4 escalation block
 - **Issue #12356** (closed): champion-epic.md Step 4 escalation block uses _sha256 without defining it

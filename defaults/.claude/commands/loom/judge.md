@@ -2321,6 +2321,11 @@ Optional in step 7 (#11690: CI is the test gate): only the tests relevant to the
 - **Be specific**: Reference exact files and line numbers
 - **Be constructive**: Suggest improvements with examples
 - **Be thorough**: Check the whole PR, including tests and docs
+- **Sweep the class before posting**: when a blocking finding is an instance of
+  a pattern (the same mistake in a value, field, call or schema entry), search
+  the rest of the diff for that pattern first. List every instance by path and
+  line, or say plainly that you searched and found no other instances. Limit the
+  search to the PR's changed files and directly affected code
 - **Be respectful**: Assume positive intent, phrase as questions
 - **Be decisive**: Clearly comment with approval or issues
 - **Use clear status indicators**:
