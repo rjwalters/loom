@@ -113,6 +113,9 @@ pub fn tick_attributes(
     if let Some(p) = report.phases {
         out.extend(phase_attributes(&p));
     }
+    if let Some(p) = &report.passes {
+        out.extend(pass_attributes(p));
+    }
     if let Some(d) = &report.discovery {
         out.extend(discovery_attributes(d));
     }
@@ -187,6 +190,22 @@ pub fn phase_attributes(
             p.spawn_parts.account_ms.to_string(),
         ),
     ]
+}
+
+/// The tick span's draw and pass facts (#12410). `loom.dispatch.passes` is
+/// absent when the tick passed nothing. Pure.
+#[must_use]
+pub fn pass_attributes(
+    p: &crate::step_dispatch::gather_budget::TickPasses,
+) -> Vec<(String, String)> {
+    let mut out = vec![
+        ("loom.dispatch.draws".to_string(), p.draws.to_string()),
+        ("loom.dispatch.draws_unspawned".into(), p.draws_unspawned.to_string()),
+    ];
+    if !p.by_reason.is_empty() {
+        out.push(("loom.dispatch.passes".into(), p.render()));
+    }
+    out
 }
 
 /// The tick's extra metric points: one `loom.dispatch.cap_term{kind}` gauge
@@ -316,6 +335,41 @@ mod tests {
         assert_eq!(get("loom.discovery.worklist.outcome"), None);
         assert_eq!(get("loom.discovery.worklist.latency_ms"), None);
         assert_eq!(get("loom.discovery.repos.requested"), None);
+    }
+
+    #[test]
+    fn tick_passes_are_attributes_the_export_keeps() {
+        let report = TickReport {
+            passes: Some(crate::step_dispatch::gather_budget::TickPasses {
+                draws: 9,
+                draws_unspawned: 2,
+                by_reason: [("repo_cap".to_string(), 2), ("claim_lost".to_string(), 3)]
+                    .into_iter()
+                    .collect(),
+            }),
+            ..TickReport::default()
+        };
+        let attrs = tick_attributes(&report, None, None);
+        let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("loom.dispatch.draws"), Some("9"));
+        assert_eq!(get("loom.dispatch.draws_unspawned"), Some("2"));
+        assert_eq!(get("loom.dispatch.passes"), Some("claim_lost=3,repo_cap=2"));
+        for (key, _) in &attrs {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
+                "{key} is not on the export allowlist"
+            );
+        }
+        // Nothing passed: the counts stay, the reason list is absent.
+        let quiet = TickReport {
+            passes: Some(crate::step_dispatch::gather_budget::TickPasses::default()),
+            ..TickReport::default()
+        };
+        let attrs = tick_attributes(&quiet, None, None);
+        assert!(attrs
+            .iter()
+            .any(|(k, v)| k == "loom.dispatch.draws" && v == "0"));
+        assert!(!attrs.iter().any(|(k, _)| k == "loom.dispatch.passes"));
     }
 
     #[test]
