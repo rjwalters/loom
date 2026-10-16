@@ -51,6 +51,9 @@ path = "defaults/.claude/commands/loom/curator.md"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/work_finder/main_red_autofile.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_create_issue.rs"
 
 [[operation]]
 id = "issue.list"
