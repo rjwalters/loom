@@ -4666,8 +4666,9 @@ they were the largest GitHub read cost a host made on its own initiative.
   collector pass and the post-tick pass no longer build, diff or send
   `fleet.state`, and so no longer derive `eta.stage_outcome` or `pr.resolved`
   from consecutive views. All three kinds stay registered so stored records
-  decode, but nothing sends them. `telemetry-replay` and its `--check` read only
-  records already in the store. A consumer that needs fleet state computes it
+  decode, but nothing sends them. The `telemetry-replay` CLI, its SigNoz replay
+  queries and their CI jobs are deleted (#12094): with no new anchors every
+  host would read `unknown`. A consumer that needs fleet state computes it
   from the facts the daemon still exports (`sweep.*`, `stage.work_started`,
   `pick.decision`, `queue.snapshot`, `host.health`) and from the forge's label
   history.

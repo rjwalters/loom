@@ -1692,8 +1692,8 @@ pub struct HostHealthRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captainless_singleton_jobs: Vec<String>,
     /// Record kinds this host's started exporters carry (Issue #10196),
-    /// sorted wire `kind` tags -- the export-coverage half of the replay
-    /// contract (`telemetry-replay.md`). Derived from the kind registry via
+    /// sorted wire `kind` tags -- the export-coverage half of the former replay
+    /// contract. Derived from the kind registry via
     /// [`exported_kinds_for`], so it can never drift from routing.
     ///
     /// Empty means "unknown / no exporter started / pre-#10196

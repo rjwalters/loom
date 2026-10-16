@@ -60,7 +60,7 @@ filters on knowable-at**, never event time. The exporter currently sets
 a true ingest-side value needs a collector-side receive stamp, a recorded design
 decision. Every log record also carries `loom.record_id`, a content-derived
 dedupe id (`derived_hex(["loom.record", kind, host_id, emitted_at, record JSON],
-16)`). Full contract: [`telemetry-replay.md`](telemetry-replay.md).
+16)`).
 
 ### `loom.kind` on every log record (Issues #9881, #10899)
 
@@ -2501,7 +2501,7 @@ state, closed_at], 16)` (`closed_at` as RFC 3339 UTC, nanoseconds). Every
 part is a forge fact, the same on every host, so a reader dedupes the fact
 across hosts with `LIMIT 1 BY loom.fact_id`; a PR closed, reopened and closed
 again is two facts. A record with no `closed_at` (an older build) carries no
-`loom.fact_id`; see [`telemetry-replay.md`](telemetry-replay.md).
+`loom.fact_id`.
 
 The log record's **time is `resolved_at`** and its **observed timestamp is
 `observed_at`** (the knowable-at time, see "Event time vs knowable-at"
@@ -2838,8 +2838,7 @@ ORDER BY t;
 > **No producer since #11301.** The daemon's `fleet.state` loop (`observability/fleet_state`) was removed: Loom exports facts, and a consumer computes fleet state from them (`sweep.*`, `stage.work_started`, `pick.decision`, `queue.snapshot`, `host.health`, and the forge's own label history). The kind stays registered so records already in a store still decode; nothing new is sent. The text below describes what daemons before the removal sent.
 
 This host's own view of the work it holds, the PRs under review in its repos,
-and its ready queue (Issue #10196). It is the state record of the replay
-contract ([`telemetry-replay.md`](telemetry-replay.md)). Envelopes carry
+and its ready queue (Issue #10196). Envelopes carry
 `schema_version: 12` (the shared post-#8921 gate). The kind is **OTLP-only**:
 one log record per envelope, with the record JSON as the log **body** and a few
 `loom.fleet.*` scalars as attributes. `queue.snapshot` stays a
@@ -3484,7 +3483,6 @@ in `daemon-reference.md` for the full design:
   entries excluded) and the sorted record `kind` tags they carry (from the kind
   registry). Omitted when empty; **empty means unknown** (pre-#10196 daemon or
   no exporter started), never "exports nothing".
-  See [`telemetry-replay.md`](telemetry-replay.md).
 - `captainless_singleton_jobs` (#9014) — in-daemon singleton-job names whose
   most recent gate check was refused because **no** `fleet.captain` is
   declared at all, so the job runs on no host (e.g. `["ci-telemetry-poll"]`
