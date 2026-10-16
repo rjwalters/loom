@@ -15,9 +15,10 @@
 //! against a stub; the daemon has no HTTP client by house style (`forge_cmd`).
 
 use std::io::Write;
-use std::process::{Command, Stdio};
 
 use serde_json::json;
+
+use crate::intake_reconcile::{is_loom_label, TRIAGE_LABEL};
 
 /// Issues enter at `loom:triage` (#11820); these skip Curator admission.
 const REFUSED_LABELS: [&str; 2] = ["loom:issue", "loom:curated"];
@@ -48,43 +49,67 @@ pub struct RealGh;
 
 impl Gh for RealGh {
     fn run(&self, args: &[String], stdin: Option<&str>) -> GhOut {
-        let spawned = Command::new("gh")
-            .args(args)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-        let mut child = match spawned {
-            Ok(c) => c,
+        use crate::cmd_out::{CmdOutcome, Unavailable};
+        use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+
+        // The facade carries no free-form stdin, so a body for `--input -` is
+        // staged in a private temp file and the `-` swapped for its path.
+        let staged = match stdin.map(stage_input).transpose() {
+            Ok(f) => f,
             Err(e) => {
                 return GhOut {
                     code: None,
                     stdout: String::new(),
-                    stderr: format!("cannot run gh: {e}"),
+                    stderr: format!("cannot stage gh input: {e}"),
                 }
             }
         };
-        if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            // A write error surfaces as gh's own failure below.
-            let _ = pipe.write_all(text.as_bytes());
+        let mut argv: Vec<String> = args.to_vec();
+        if let Some(f) = &staged {
+            if let Some(slot) = argv.iter().position(|a| a == "-") {
+                argv[slot] = f.path().to_string_lossy().into_owned();
+            }
         }
-        match child.wait_with_output() {
-            Ok(o) => GhOut {
+        let write =
+            args.first().map(String::as_str) != Some("api") || args.iter().any(|a| a == "POST");
+        let (op, intent) = if write {
+            ("forge.create_issue.write", AccessIntent::Write)
+        } else {
+            ("forge.create_issue.reconcile", AccessIntent::Read)
+        };
+        let outcome = GhInvocation::new(
+            Operation::new(op),
+            intent,
+            GhTarget::None,
+            crate::forge_cmd::FORGE_CMD_TIMEOUT,
+        )
+        .args(argv)
+        .run();
+        match outcome {
+            CmdOutcome::Ran(o) => GhOut {
                 code: o.status.code(),
                 stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
             },
-            Err(e) => GhOut {
+            CmdOutcome::Unavailable(Unavailable::Spawn(e)) => GhOut {
                 code: None,
                 stdout: String::new(),
-                stderr: format!("gh wait failed: {e}"),
+                stderr: format!("cannot run gh: {e}"),
+            },
+            CmdOutcome::Unavailable(other) => GhOut {
+                code: None,
+                stdout: String::new(),
+                stderr: format!("gh did not answer: {other:?}"),
             },
         }
     }
+}
+
+fn stage_input(text: &str) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut f = tempfile::NamedTempFile::new()?;
+    f.write_all(text.as_bytes())?;
+    f.flush()?;
+    Ok(f)
 }
 
 /// A filing request. `labels` are raw `--label` values (comma lists allowed).
@@ -218,8 +243,8 @@ pub fn normalize_labels(raw: &[String]) -> Result<Vec<String>, CreateError> {
             out.push(l.to_string());
         }
     }
-    if !out.iter().any(|l| l.starts_with("loom:")) {
-        out.push("loom:triage".to_string());
+    if !out.iter().any(|l| is_loom_label(l)) {
+        out.push(TRIAGE_LABEL.to_string());
     }
     Ok(out)
 }

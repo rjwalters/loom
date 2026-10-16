@@ -492,6 +492,13 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("forge_rerun.rs", Gated),
         (
+            "forge_create_issue.rs",
+            Via(
+                "cli/forge_action.rs",
+                "the `forge create-issue` verb is vetted via may_write_from before create()",
+            ),
+        ),
+        (
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
         ),
