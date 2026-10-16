@@ -537,6 +537,32 @@ else
     fail "env override should beat writers[]"
 fi
 
+# The shell filter must agree with `forge_identity::writer_for_owner` on
+# malformed entries (Rust drops one bad element / skips one bad entry; it never
+# turns the whole `writers[]` off).
+WRITERS_REPO_ORIG="$WRITERS_REPO"
+WRITERS_REPO="$WORK_DIR/writers-repo-edge"
+mkdir -p "$WRITERS_REPO/.loom"
+cat > "$WRITERS_REPO/.loom/config.json" <<CFG
+{"forge":{"githubApp":{"appId":"100","privateKeyPath":"$KEY_PATH"},
+  "identities":{"writers":[
+    {"appId":"  ","privateKeyPath":"$KEY_PATH","owners":["emptyid"]},
+    {"appId":"400","privateKeyPath":"   ","owners":["emptykey"]},
+    {"appId":"500","privateKeyPath":"$KEY_PATH","owners":[7,null," Spaced ","mixed"]},
+    {"appId":600,"privateKeyPath":"$KEY_PATH","owners":["emptyid","emptykey","numid"]}]}}}
+CFG
+if [[ "$(resolved_app_for spaced)" == "500" && "$(resolved_app_for mixed)" == "500" ]]; then
+    pass "a non-string owners element is dropped alone; surrounding whitespace is trimmed"
+else
+    fail "bad owners element must not hide the list" "spaced=$(resolved_app_for spaced) mixed=$(resolved_app_for mixed)"
+fi
+if [[ "$(resolved_app_for emptyid)" == "600" && "$(resolved_app_for emptykey)" == "600" && "$(resolved_app_for numid)" == "600" ]]; then
+    pass "an entry with an empty appId / privateKeyPath is skipped; numeric appId accepted"
+else
+    fail "invalid entries should be skipped" "emptyid=$(resolved_app_for emptyid) emptykey=$(resolved_app_for emptykey) numid=$(resolved_app_for numid)"
+fi
+WRITERS_REPO="$WRITERS_REPO_ORIG"
+
 # Two owners mint with two different app ids through the CLI envelope.
 export LOOM_GITHUB_APP_CACHE_DIR="$WORK_DIR/cache-writers"
 curl() {

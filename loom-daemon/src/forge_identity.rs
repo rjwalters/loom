@@ -476,6 +476,20 @@ fn owners_warnings(effective: &Value) -> Vec<String> {
 /// App identity or lists no valid owner (it would never be chosen), an invalid
 /// owner name (dropped), and an owner claimed by two entries (the first wins).
 fn writers_warnings(effective: &Value) -> Vec<String> {
+    let env_override = ["LOOM_GITHUB_APP_ID", "LOOM_GITHUB_APP_KEY_PATH"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()));
+    writers_warnings_with(effective, env_override)
+}
+
+/// [`writers_warnings`] with the env-override state supplied by the caller.
+///
+/// `github-app-token.sh` lets `LOOM_GITHUB_APP_ID` / `LOOM_GITHUB_APP_KEY_PATH`
+/// beat everything, so with either set every credential delivery, agent write
+/// and `merge-pr.sh` run as that App for every owner. `forge token` (lease
+/// posting) never reads the override and still follows `writers[]`, so the two
+/// would author as different Apps with nothing pointing at the cause.
+fn writers_warnings_with(effective: &Value, env_override: bool) -> Vec<String> {
     let Some(writers) = crate::config_resolver::get_path(effective, "forge.identities.writers")
     else {
         return Vec::new();
@@ -484,6 +498,15 @@ fn writers_warnings(effective: &Value) -> Vec<String> {
         return vec!["forge.identities.writers must be an array; ignored".to_string()];
     };
     let mut out = Vec::new();
+    if env_override && !writers.is_empty() {
+        out.push(
+            "per-owner writers (forge.identities.writers) are ignored by github-app-token.sh while \
+             LOOM_GITHUB_APP_ID / LOOM_GITHUB_APP_KEY_PATH is set (credential delivery, agent and \
+             merge writes use the env App for every owner), but `forge token` still follows them — \
+             unset the override and provision through forge.githubApp"
+                .to_string(),
+        );
+    }
     let mut claimed: Vec<(String, String)> = Vec::new();
     for w in writers {
         let id = w

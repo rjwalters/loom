@@ -131,12 +131,18 @@ _github_app_load_config() {
     if [[ -n "$_GH_APP_OWNER" && -z "$_GH_APP_ID" && -z "$_GH_APP_KEY_PATH" ]]; then
       local writer
       writer="$(loom_resolve_config "$root" | jq -r --arg owner "$_GH_APP_OWNER" '
+        def trim: gsub("^\\s+|\\s+$"; "");
         try ((.forge.identities.writers // [])
-          | map(select(
-              (.appId != null) and ((.privateKeyPath // "") != "")
-              and (((.owners // []) | map(ascii_downcase | tostring)) | index($owner | ascii_downcase)) != null))
-          | .[0] // empty
-          | "\(.appId)\t\(.privateKeyPath)") catch empty' 2>/dev/null)"
+          | if type == "array" then . else [] end
+          | map(select(type == "object")
+              | ((.appId | if type == "string" then trim elif type == "number" then tostring else "" end)) as $id
+              | ((.privateKeyPath | if type == "string" then trim else "" end)) as $key
+              | select($id != "" and $key != "")
+              | select([(.owners // []) | if type == "array" then .[] else empty end
+                        | strings | trim | ascii_downcase]
+                       | index($owner | trim | ascii_downcase) != null)
+              | "\($id)\t\($key)")
+          | .[0] // empty) catch empty' 2>/dev/null)"
       if [[ -n "$writer" && "$writer" != "null" ]]; then
         _GH_APP_ID="${writer%%$'\t'*}"
         _GH_APP_KEY_PATH="${writer#*$'\t'}"

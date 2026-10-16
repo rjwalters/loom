@@ -114,7 +114,7 @@ fn every_gauge_carries_an_owner_installation_and_role_label() {
             ),
             (BucketKey::new("app-2", "beta", Resource::Graphql), reading),
         ],
-        "app-1",
+        &["app-1".to_string()],
     );
     assert_eq!(points.len(), 6);
     for p in &points {

@@ -643,3 +643,18 @@ fn writers_warnings_flag_bad_entries_and_duplicate_owners() {
     assert!(w.contains("app 400") && w.contains("never chosen"), "{w}");
     assert!(w.contains("app 500") && w.contains("ignored"), "{w}");
 }
+
+#[test]
+fn writers_warn_when_the_env_override_would_shadow_them() {
+    let cfg = json!({"forge": {"identities": {"writers": [
+        {"appId": "200", "privateKeyPath": "/k/o.pem", "owners": ["orgtwo"]}
+    ]}}});
+    let on = super::writers_warnings_with(&cfg, true).join("\n");
+    assert!(
+        on.contains("ignored by github-app-token.sh") && on.contains("LOOM_GITHUB_APP_ID"),
+        "{on}"
+    );
+    assert!(super::writers_warnings_with(&cfg, false).is_empty());
+    // No writers declared: the override is not this feature's concern.
+    assert!(super::writers_warnings_with(&json!({}), true).is_empty());
+}
