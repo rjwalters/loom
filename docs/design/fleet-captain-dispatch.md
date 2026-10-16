@@ -140,14 +140,14 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 
 `{"host_id", "repo", "item", "step"}` → one of:
 
-- `{"granted": true, "assignment_id": "a-…", "ttl_s": 1200}`: run today's pre-claim and forge lease path, unchanged.
+- `{"granted": true, "assignment_id": "a-…", "ttl_s": 1200}`: run today's pre-claim and forge lease path, unchanged. A **duplicate claim from the same host for the same `(item, step)`** is an idempotent re-grant: the same `assignment_id`, with the TTL refreshed.
 - `{"granted": false, "reason": "held" | "grace" | "not_eligible" | "cap", "held_by": "<host id>"?, "retry_after_s": 60}`: for `held`, `not_eligible` and `cap`, a **free pass with zero forge calls**; the item leaves this tick's pool. `grace` is the exception (below).
 
 | Reason | Meaning |
 |---|---|
 | `held` | another live assignment holds the `(repo, item)`, or another host holds the repo's Champion merge step; `held_by` names the host when known |
 | `grace` | the server is in its start-up grace window (section 15.1). The worker treats it as **fail-open for that one call**: it takes today's local forge-lease path for that claim. It does **not** count toward the fallback hysteresis (section 9), since it is expected after every roll. |
-| `not_eligible` | the host does not fit the item (section 7.2), or the role is not in its `roles_ok` |
+| `not_eligible` | in Phase 1, the step's role is not in the host's `roles_ok`, and nothing else; Phase 2 adds the per-host fit of section 7.2 |
 | `cap` | the host is at its cap (5.2) |
 
 ### 5.4 `refuse` and `release`
@@ -155,11 +155,11 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 - `{"host_id", "assignment_id", "reason"}` on `/v1/refuse`: the worker's live pre-check or its forge claim refused a granted item. `reason` is the existing refusal token. **`claim_lost` holds the item for the forge lease TTL** (someone outside fleet mode owns it, section 6); a stale reason (`already_closed`, `already_landed`, `claimed`, `head_moved`, …) **drops** it.
 - `{"host_id", "assignment_id", "outcome"}` on `/v1/release`: the step ended. `outcome` is the step's outcome (#11868's class, `verdict | noop | refused | failed`), the input Phase 2's fleet ledger folds.
 
-An assignment the host stops listing in `live` without a `refuse` or `release` (a lost request, a crash) ends with its TTL (section 6).
+**A row ends only by `refuse`, `release` or its TTL.** A row missing from a host's `live` set is **not** released early: a claim granted between one heartbeat and the spawn is legitimately absent from that heartbeat, and ending it on absence would let a second host be granted the same item. A lost `refuse` / `release` or a crashed host therefore costs one TTL (section 6).
 
 ### 5.5 Failures, from the worker's side
 
-Unreachable, a timeout (short, about 2 s) or a `5xx` is a **failure** and counts toward fallback (section 9). A `claim` refusal is an answer, never a failure; a `grace` refusal sends that one claim down today's forge-lease path without counting as a failure. Nothing is retried within the tick.
+Unreachable, a timeout (short, about 2 s) or a `5xx` is a **failure** and counts toward fallback (section 9). A `403` (the host is not in the node map, or its `host_id` does not match) also fails open and counts toward the hysteresis, and the worker logs it at `ERROR`, so a mapping mistake is loud rather than a silent permanent fallback. A `claim` refusal is an answer, never a failure; a `grace` refusal sends that one claim down today's forge-lease path without counting as a failure. Nothing is retried within the tick.
 
 ### 5.6 `next` (Phase 2 proposal)
 
@@ -175,14 +175,14 @@ Unreachable, a timeout (short, about 2 s) or a `5xx` is a **failure** and counts
 |---|---|---|
 | Where | captain memory | an issue or PR comment |
 | Says | "host H is assigned item I" | "host H's sweep S works item I" |
-| Ends | `release`, `refuse`, the host dropping it from `live`, or TTL | release or reap, or TTL |
-| TTL | **20 min** from the last heartbeat that renewed it | 15 min (`LOOM_LEASE_TTL_MINUTES`) from the last renewal |
+| Ends | `release`, `refuse`, or TTL; never on absence from `live` | release or reap, or TTL |
+| TTL | `resolve_lease_ttl_minutes() + 5` min (20 by default) from the last heartbeat that renewed it | 15 min (`LOOM_LEASE_TTL_MINUTES`) from the last renewal |
 | Clock | captain's monotonic clock | forge `updated_at` |
 | Authoritative | no | **yes** |
 
-**The captain never re-assigns before the forge lease could have lapsed.** The row TTL is the forge TTL plus a margin (15 + 5 min). A host that dies after posting its forge lease leaves a renewed lease that out-ranks any new claimant in claim-then-verify-order (`lease_episode.rs` leg 2) until it ages out; re-assigning sooner only buys a wasted pre-claim. The TTL is derived from the forge TTL, not a new knob.
+**The captain never re-assigns before the forge lease could have lapsed.** The row TTL is the forge TTL plus a margin: `claim_reconciliation::resolve_lease_ttl_minutes() + 5` minutes, 20 at today's default. A host that dies after posting its forge lease leaves a renewed lease that out-ranks any new claimant in claim-then-verify-order (`lease_episode.rs` leg 2) until it ages out; re-assigning sooner only buys a wasted pre-claim. The TTL is derived from the forge TTL, not a new knob.
 
-**Renewal is the heartbeat.** Every call that lists an assignment in `live` renews its row. A row is released early by `release`, by `refuse`, or when the host's `live` set stops listing it.
+**Renewal is the heartbeat.** Every heartbeat that lists an assignment in `live` renews its row. A row ends early only by `release` or `refuse`; a row the host stops listing simply stops being renewed and ends by TTL (section 5.4 gives the race this avoids).
 
 **`claim_lost` after a grant is a first-class outcome.** It means someone outside fleet mode (a fallback worker, an attended session, `worktree.sh`, a hand claim) won the forge order. The captain marks the row `held` for the forge TTL and assigns it to nobody; the forge lease's owner has it. A `held` row ends early if the mirror shows the item leaving its stage.
 
@@ -214,7 +214,7 @@ A draw for a host is restricted to items that host fits:
 - **One step per item.** No two rows for one item.
 - **The `(item, step)` ledger** (section 8): cooldowns, repeat caps and streaks count every host's outcomes.
 
-There is no new per-repo or per-host quota. The busy term β keeps doing what it does, now on exact counts.
+There is no new per-repo or per-host quota. **Exact per-repo concurrency was considered and declined**: the operator removed per-repo caps, and `maxConcurrent` is the only cap. The busy term β keeps doing what it does, now on exact counts.
 
 ### 7.4 Rounds, fairness and starvation
 
@@ -243,28 +243,32 @@ The peer channel was more than claims. Each of its signals either moves to the c
 | No-op cooldown (`NoopCooldownArmed`, #7477) and no-op streak (`noop_streak_tally.rs`, #12024) | broadcast window + per-host tallies | **The fleet ledger**: one streak per item, counted from every host's `release`. |
 | Dispatch backoff (`DispatchBackoffArmed`) and fast-fail streak (`fast_fail_tally.rs`, `fast_fail_fleet.rs`, #11930) | broadcast window + summed count | **The fleet ledger.** The park itself stays a forge write by the worker, as today. |
 | PR-less retry tally (`PrlessReleaseArmed`, #9292) | per-host count, summed | **The fleet ledger.** |
-| Pool-exhaustion hold (`PoolHoldArmed`/`Cleared`, `pool_hold_broadcast.rs`, #8001) | broadcast per token pool | **Host state.** A host leaves the role out of `roles_runnable`. A pool shared by several hosts is reported by each; no fleet copy needed. |
+| Pool-exhaustion hold (`PoolHoldArmed`/`Cleared`, `pool_hold_broadcast.rs`, #8001) | broadcast per token pool | **Host state.** A host leaves the role out of `roles_ok`. A pool shared by several hosts is reported by each; no fleet copy needed. |
+| Completion narration (`ClaimKind::Completed`, #6352) | stops two hosts narrating the same public-feed completion | **Not a dispatch signal; not moved.** It is dark with the channel today. This design does not host it; Phase 3 deletes only the channel's dispatch use, and its owner decides its home. |
+| Issue-filing lock (`ClaimKind::FilingLock` / `FilingUnlock`, #6714) | fleet-wide hold on `gh issue create` bursts | **Not a dispatch signal; not moved.** Dark with the channel today. A fleet-wide lock fits the captain naturally, but hosting it is out of scope here; its owner decides. |
 | Heartbeat (`heartbeat_broadcast.rs`, #8736) | liveness ad | **Dies** for dispatch: every captain call is a heartbeat. Other consumers of host liveness keep their telemetry source. |
 
 Workers keep their local copies of these for the fallback path, so a fallback tick still honours its own host's cooldowns. In Phase 3 the broadcasts are deleted; the local ledgers stay.
 
 ## 9. Fail-open
 
-The fallback must not need the per-host gather that Phase 3 retires. So the fallback is **the #12304 discovery chain at its capped backstop pace** (`discovery/fallback.rs`), which stays for standalone installs anyway, feeding today's local draw.
+**In Phase 1 the fallback is today's local tick with a reduced draw budget.** Phase 1 changes only the claim, so the worker's own discovery and draw are still running every tick and there is nothing else to fall back to.
+
+**From Phase 2 on**, the fallback must not need the per-host gather that Phase 3 retires, so it is **the #12304 discovery chain at its capped backstop pace** (`discovery/fallback.rs`), which stays for standalone installs anyway, feeding the same local draw.
 
 1. **A `grace` refusal is not a failure.** After a captain start, `grace` sends that one claim down today's local forge-lease path, and the hysteresis counter is untouched: a roll is routine and must not push hosts into fallback or stall dispatch for the window.
 2. **Enter on 3 consecutive failures** (section 5.5), not on one. A single failed call claims as today for that item, and the worker tries the captain again on the next one.
 3. **In fallback**, each tick:
-   - discovers through the worker's own chain, at the backstop pace, not every tick;
+   - discovers as the worker does today (Phase 1), or through the worker's own chain at the backstop pace (Phase 2 on);
    - runs the local draw with a **reduced budget**: one round (`spawn_concurrency` items at most) per tick and no free `claim_lost` allowance, so a captain blip does not restart an eight-way race at full rate;
    - honours its local ledgers and every forge gate, as today;
    - keeps sending heartbeats, which are its probes.
-4. **Leave** after **5 minutes of successful probes**, so a flapping captain does not flip modes every tick.
+4. **Leave** after **5 minutes of successful probes**; **any failure resets the 5-minute timer**, so a flapping captain does not flip modes every tick.
 5. **Alert** when the fleet's fallback share passes 5% of ticks over an hour. Fail-open is safe for correctness, which is exactly why it can hide a broken captain.
 
 The counts (3 failures, 5 min, one round) are constants, not knobs, until telemetry shows they are wrong.
 
-**Split-brain.** While a worker is in fallback, the captain may assign an item that worker draws locally. Both run the pre-claim; the forge lease decides; the later one yields. If the captain's host lost, it `refuse`s with `claim_lost` and the row goes `held` (section 6). Nothing new is needed for correctness; `loom.fleet_dispatch.claim_lost_after_grant` counts it.
+**Split-brain.** While a worker is in fallback, the captain may assign an item that worker draws locally. Both run the pre-claim; the forge lease decides; the later one yields. If the captain's host lost, it `refuse`s with `claim_lost` and the row goes `held` (section 6). Nothing new is needed for correctness; the refusals counter's `reason=claim_lost` counts it.
 
 **A bad release.** The captain rolls on the same version floor as the workers. A release that breaks the captain sends workers to fallback, which is the existing tick code; a release that breaks the tick breaks today's dispatch too, with or without a captain.
 
@@ -313,10 +317,10 @@ All signals go out over OTLP with the daemon's existing exporter, with `loom.rep
 |---|---|---|
 | `loom.fleet_dispatch.call` span, one per call | worker and captain | `host`, endpoint, latency, granted or refused, `reason`, `server_epoch` (Phase 2 adds `queue_age_s` and queue size) |
 | `loom.assignment.id` attribute | the existing `loom.dispatch.step` span | joins assign → pre-check → claim → outcome |
-| `loom.fleet_dispatch.claim_lost_after_grant` counter | captain | grants that lost the forge order (split-brain and attended-claim measure) |
+| `claim_lost` after a grant (**derived**, not a new signal) | captain | the existing refusals counter with `reason=claim_lost`, which only a `refuse` after a grant can carry; the split-brain and attended-claim measure |
 | `loom.fleet_dispatch.refusals` counter | captain | refusals by reason: `claim` refusals and `refuse` tokens |
 | `loom.fleet_dispatch.expired` counter | captain | assignments that hit their TTL |
-| `loom.fleet_dispatch.fallback_ticks` counter | worker | fallback ticks per host, with the entry reason |
+| `loom.fleet_dispatch.fallback_ticks` counter | worker | fallback ticks per host (the entry reason only if #12450 records one on it; no separate signal) |
 | `loom.fleet_dispatch.queue_refresh` span (Phase 2) | captain | full or change-driven, bytes, `304` or not, items, forge reads by `loom.forge.purpose` |
 | writer calls per spawned step | derived | `loom.forge.purpose = write` per step spawn; the Phase 1 headline |
 | `loom.dispatch.stop` distribution, occupancy at cap | worker (existing) | the tick SLIs this design must move |
@@ -326,9 +330,9 @@ All signals go out over OTLP with the daemon's existing exporter, with `loom.rep
 
 ### 13.1 Phase 1: the claims table (the minimal slice; contract fixed, issues filed)
 
-- **Server** (#12449): `loom-daemon fleet-dispatch serve` on the captain host, in a new `fleet_dispatch/` module: `proto.rs` (the section 5 serde types, shared with the client), `server.rs`, `table.rs` (the assignment table and its policy, pure, tested with an injected monotonic clock) and `identity.rs` (the identity trait and a LocalAPI `whois` implementation). The host roster comes from the fleet store's `fleet.json` dispatchers. It is its own subcommand because `fleet-captain <JOB_NAME>` takes its first argument as a job name; it should run only on the declared captain (the `fleet_captain` gate is the existing way to say so).
+- **Server** (#12449): `loom-daemon fleet-dispatch serve` on the captain host, in a new `fleet_dispatch/` module: `proto.rs` (the section 5 serde types, shared with the client), `server.rs`, `table.rs` (the assignment table and its policy, pure, tested with an injected monotonic clock) and `identity.rs` (the identity trait and a LocalAPI `whois` implementation). The host roster comes from the fleet store's `fleet.json` dispatchers, and #12449's `fleet_store` loader reads each dispatcher's tailnet **node** field (node name → `host_id`, section 11). It is its own subcommand because `fleet-captain <JOB_NAME>` takes its first argument as a job name; it should run only on the declared captain (the `fleet_captain` gate is the existing way to say so).
 - **Client** (#12450): `fleet_dispatch/client.rs` on `reqwest` (already a dependency) with short timeouts, hooked into the step claim path before the forge pre-claim (`sweep_registry/step_spawn/lease.rs`). A refusal is a free pass with **zero forge calls**; a grant runs today's lease path unchanged and carries `assignment_id` to the `loom.dispatch.step` span and to `release` / `refuse`. The heartbeat rides the 30 s reaper heartbeat. The fallback state machine (section 9) is a pure function. With the flag off, behaviour is byte-identical to today.
-- **Deployment wiring** (the deployment-wiring issue in the operator's infra repo): the tailnet access-policy grant, the captain's service unit, and the per-host flag on **two workers**; the rest are the control group.
+- **Deployment wiring** (the deployment-wiring issue in the operator's infra repo): the tailnet access-policy grant, the captain's service unit, the node field on each dispatcher entry in the fleet config, and the per-host flag on **two workers**; the rest are the control group.
 - The table is the one `next` uses in Phase 2.
 
 **Exit, on the flagged hosts against the control group:** `claim_lost` under 5% of step draws; no `pass_limit` stops with free slots; occupancy at `maxConcurrent`; writer calls per spawned step down; no ownership incident against attended sessions or hand claims.
@@ -358,9 +362,9 @@ Setting them on two hosts is the Phase 1 A/B; setting them in the fleet defaults
 
 | Issue | Scope |
 |---|---|
-| A: #12449 | The captain server, `loom-daemon fleet-dispatch serve`: claim arbiter, soft state, roster auth. |
+| A: #12449 | The captain server, `loom-daemon fleet-dispatch serve`: claim arbiter, soft state, roster auth. Reads the dispatcher node field in the `fleet_store` loader. |
 | B: #12450 | The worker client: `claim` before the forge pre-claim, `heartbeat`/`refuse`/`release`, fail-open with hysteresis and a reduced budget. |
-| C: the deployment-wiring issue in the operator's infra repo | The tailnet access-policy grant, the captain unit, the per-host flag on two workers. |
+| C: the deployment-wiring issue in the operator's infra repo | The tailnet access-policy grant, the captain unit, the dispatcher node field in the fleet config, the per-host flag on two workers. |
 
 **Phases 2 and 3 (proposals; filed only after the operator reviews this doc):**
 
@@ -397,7 +401,7 @@ The GitHub saving is #12304's (discovery) plus this design's (no writer calls on
 | Captain down | Workers enter fallback after 3 failures (section 9); dispatch continues at the reduced budget. |
 | Captain slow | Each call has a 2 s timeout; a slow call is a failure; 3 in a row is fallback. |
 | Captain partitioned from some hosts | Those hosts fall back; the others keep fleet mode; the forge lease settles overlaps, and the captain marks losses `held`. |
-| Split brain (captain assigns, fallback host draws) | Forge lease decides; the loser yields; `claim_lost_after_grant`. |
+| Split brain (captain assigns, fallback host draws) | Forge lease decides; the loser yields; counted as refusals with `reason=claim_lost`. |
 | Attended or hand claim | Same as split brain: `claim_lost`, row `held` for the forge TTL. |
 | Clock skew | None to handle: captain deadlines are monotonic on the captain; forge liveness uses forge `updated_at`; no worker timestamp is compared. |
 | Captain restart or roll | New `server_epoch` and a grace window; 15.1. |
@@ -408,13 +412,13 @@ The GitHub saving is #12304's (discovery) plus this design's (no writer calls on
 
 ### 15.1 Captain restart mid-assignment
 
-**Nothing is persisted.** On start the captain takes a new `server_epoch` and opens a **grace window**: 90 s by default, or until every roster host has heartbeated, whichever comes first. During it `claim` is answered `{"granted": false, "reason": "grace", "retry_after_s": …}` (and, in Phase 2, `next` returns nothing), while heartbeats and their `live` sets are accepted, so the table is rebuilt from the workers before anything is granted. The worker takes today's local forge-lease path for each `grace`-refused claim, without counting it toward fallback, so a captain roll is never a 90 s dispatch stall; during the window the forge lease settles races as it does today. In Phase 2 the captain also reads the worklist and builds the queue during the window.
+**Nothing is persisted.** On start the captain takes a new `server_epoch` and opens a **grace window**: 90 s by default, ending early once every **fleet-mode** host (`fleetDispatch.enabled`, not every roster host) has heartbeated. During it `claim` is answered `{"granted": false, "reason": "grace", "retry_after_s": …}` (and, in Phase 2, `next` returns nothing), while heartbeats and their `live` sets are accepted, so the table is rebuilt from the workers before anything is granted. The worker takes today's local forge-lease path for each `grace`-refused claim, without counting it toward fallback, so a captain roll is never a 90 s dispatch stall; during the window the forge lease settles races as it does today. In Phase 2 the captain also reads the worklist and builds the queue during the window.
 
 Grants outstanding at the crash are lost. Each was either claimed (the host's next `live` set puts it back in the table), refused, or never tried. A new grant of an item someone claimed in the gap ends in that host's pre-claim yielding. Persisting the table would add a second record that can disagree with the forge after a crash.
 
 ### 15.2 A worker dies holding an assignment
 
-Its heartbeats stop. Its rows live out the 20 min TTL, which is longer than its forge lease's 15 min, so when the item returns to the queue the dead lease has aged out of claim-then-verify-order and the next claimant wins. Existing reclamation (`claim_reconciliation.rs`) restores labels on the forge side on the same TTL. If it died before posting a forge lease, the cost is the same 20 min of an idle item: the price of never re-assigning before a lease could have lapsed.
+Its heartbeats stop. Its rows live out their TTL (`resolve_lease_ttl_minutes() + 5`, 20 min by default), which is longer than its forge lease's 15 min, so when the item returns to the queue the dead lease has aged out of claim-then-verify-order and the next claimant wins. Existing reclamation (`claim_reconciliation.rs`) restores labels on the forge side on the same TTL. If it died before posting a forge lease, the cost is the same 20 min of an idle item: the price of never re-assigning before a lease could have lapsed.
 
 ### 15.3 A stale entry whose item is already closed
 
@@ -443,8 +447,9 @@ The worker's closed-issue read refuses it with `already_closed` (or `already_lan
 
 1. **Runtime and toolchain fit.** Are host affinity markers enough for Phase 2, or should the host tier gain explicit runtime/toolchain fields?
 2. **Phase 3 threshold.** Is under 1% fallback ticks over 14 days the right gate?
-3. **Fallback constants.** 3 failures in, 5 minutes of successful probes out, one round per tick, a 5% fallback-share alert: acceptable as starting constants? And should a `403` (a misconfigured host) count as a failure, or only unreachable, timeout and `5xx` as the contract says?
+3. **Fallback constants.** 3 failures in, 5 minutes of successful probes out, one round per tick, a 5% fallback-share alert: acceptable as starting constants?
 4. **Heartbeat consumers.** Does anything besides dispatch read the peer heartbeat (#8736), and does it need a replacement?
+5. **Non-dispatch peer signals.** Completion narration (#6352) and the issue-filing lock (#6714) are dark with the peer channel and not moved by this design. Should the captain host the filing lock later?
 
 ## 18. Review log
 
@@ -462,3 +467,9 @@ The worker's closed-issue read refuses it with `already_closed` (or `already_lan
 | 2026-10-16 | same | Minimal first slice: `fleet-dispatch serve`, two flagged workers, `claim` before the pre-claim, exit criteria. | §13.1 is that slice. |
 | 2026-10-16 | Phase 1 build session, by agreement | Open question: should a `grace` refusal stall the claim? | Settled: `grace` is fail-open for that one call (today's forge-lease path) and does not count toward hysteresis. §5.3, §5.5, §9, §15.1. |
 | 2026-10-16 | same | Open question: is the tailnet node name the `host_id`? | Settled: no. Each dispatcher entry carries an explicit node field; `whois` → node → `host_id`; unmapped nodes get `403`. §5.1, §11. |
+| 2026-10-16 | Judge (changes requested at `c0af4bcf`) | §5.4 and §6 disagreed on a row missing from `live`. | One rule: rows end only by `refuse`, `release` or TTL; absence never ends a row (it races a grant made between heartbeat and spawn). §5.4, §6. |
+| 2026-10-16 | same | §9 described the Phase 3 fallback. | Phase 1 fallback is today's local tick with a reduced budget; backstop-pace discovery is Phase 2 on. §9. |
+| 2026-10-16 | same | `claim_lost_after_grant` and a fallback entry reason were not in #12449's contract. | Both are derived: refusals with `reason=claim_lost`; the entry reason only if #12450 records one on the fallback counter. §9, §12, §15. |
+| 2026-10-16 | same | §8 used `roles_runnable` and missed `Completed` (#6352) and `FilingLock`/`FilingUnlock` (#6714). | Renamed to `roles_ok`; rows added (not dispatch signals, not moved). §8, §17.2. |
+| 2026-10-16 | same | The node field's owners were unstated. | #12449's `fleet_store` loader reads it; the deployment-wiring change adds it to the fleet config. §13.1, §13.5. |
+| 2026-10-16 | same (recommended, all taken) | TTL value; grace end; `403`; duplicate claims; Phase 1 `not_eligible`; fallback exit timer; per-repo concurrency. | TTL = `resolve_lease_ttl_minutes() + 5` min; grace ends once every fleet-mode host has heartbeated; `403` fails open, logs `ERROR`, counts toward hysteresis; a same-host duplicate claim is an idempotent re-grant; Phase 1 `not_eligible` is `roles_ok` only; any failure resets the 5-min exit timer; exact per-repo concurrency considered and declined. §5.3, §5.5, §6, §7.3, §9, §15.1. |
