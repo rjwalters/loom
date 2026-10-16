@@ -104,6 +104,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     // Handle CLI commands (init mode)
     if let Some(command) = cli.command {
+        // #12389: a subcommand's reads take the gateway, then the reader
+        // pool, the daemon exported to this process (an agent session, a
+        // host job), and are shed rather than sent to the writer (#12394).
+        // Without it every read a CLI makes (`forge wait-checks`,
+        // `recover-orphans`, `check-stale-blocked`, the pipeline snapshot)
+        // spent the writer. With neither exported, nothing changes.
+        loom_daemon::forge_gateway::enable_cli_reads();
         return match command {
             // `status` connects to the running daemon over its Unix socket, so
             // it needs the async runtime (unlike the other sync subcommands).

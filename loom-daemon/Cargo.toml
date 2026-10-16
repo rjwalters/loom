@@ -6,8 +6,11 @@ license.workspace = true
 edition = "2021"
 
 [dependencies]
-# `taskdump` backs the SIGUSR1 task dump (#12079); it also needs `--cfg tokio_unstable`.
-tokio = { workspace = true, features = ["taskdump"] }
+# `taskdump` backs the SIGUSR1 task dump (#12079). It is enabled for Linux
+# only (see the target table below): tokio refuses to compile `taskdump` on any
+# other OS, which broke the aarch64-apple-darwin build. task_dump.rs already
+# gates the dump itself to Linux and degrades to "unavailable" elsewhere.
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 anyhow = { workspace = true }
@@ -76,6 +79,11 @@ toml_edit = "0.25"
 # gains no new package.
 tar = "0.4.46"
 zstd = "0.14.0"
+
+# tokio's `taskdump` (the SIGUSR1 task dump, #12079) compiles only on Linux, and
+# it also needs `--cfg tokio_unstable` (.cargo/config.toml).
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["taskdump"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
