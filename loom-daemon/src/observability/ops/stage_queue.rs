@@ -137,6 +137,8 @@ pub(super) async fn walk_counts(
 ) -> Option<BTreeMap<&'static str, usize>> {
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
+        // #12310: the stage-queue walk is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
         let rows = crate::forge_listing::list_open_issues_cached_all_observability_as(
             "stage_dwell",

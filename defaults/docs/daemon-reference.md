@@ -44,6 +44,7 @@
 - [Observability exporter (`observability`, #4705, epic #4702 Phase 1)](#observability-exporter-observability-4705-epic-4702-phase-1)
 - [Fleet dashboard (`loom-daemon serve`)](#fleet-dashboard-loom-daemon-serve)
 - [Locks and lifecycle](#locks-and-lifecycle)
+- [A tick appears hung — dump the async task tree (`kill -USR1`, #12079)](#a-tick-appears-hung--dump-the-async-task-tree-kill--usr1-12079)
 - [What this page does NOT describe](#what-this-page-does-not-describe)
 - [Related resources](#related-resources)
 <!-- toc:end -->
@@ -4141,8 +4142,9 @@ Judge stamps every verdict comment with
 <!-- loom:verdict-sha sha=<head-sha> verdict=approved|changes-requested -->
 ```
 
-(`.claude/commands/loom/judge.md` → "Verdict SHA Marker"), recording which tree
-the verdict covers. `claim_reconciliation::forge::reconcile_pr_verdicts` runs on
+(`.claude/commands/loom/judge.md` → "Verdict SHA Marker"; `approved` /
+`changes-requested` are canonical, readers also tolerate `approve` /
+`request-changes`), recording which tree the verdict covers. `claim_reconciliation::forge::reconcile_pr_verdicts` runs on
 the same periodic tick as the claim passes: for each open PR carrying a verdict
 label it reads the newest marker **of that verdict's own kind** and compares its
 SHA to the PR's current `headRefOid`. On a mismatch it posts an auditable
@@ -6472,6 +6474,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.tickDeadlineSecs` | — | `90` | The wall-clock deadline of one work-finder tick body (#12074). Every forge read from the pre-dispatch holds through the step gather gets only the time left (its own timeout is clamped), a read past the deadline is not sent (a shed: the gather uses its last good listing, a fact keeps the value that passes the item), and once it passes no further repo is gathered: the tick draws from what it gathered, reports `loom.dispatch.gather_truncated`, and the next tick starts at the first repo skipped. The deadline clock starts after the tick's local pre-dispatch work (eager reclaim, CPU sample). At least one repo is gathered every tick, and its reads get at least 20 s even past the deadline. Inside the tick, a read whose readers are out of budget (a rate-limit back-off) is shed rather than moved to the writer App, whatever its class; any other cause (a failing gateway, a coverage miss) still reaches the writer. A repo whose gather was starved (failed, last-good only, or no open-PR listing) for 3 ticks in a row gets one tick on the writer: every budget shed is lifted for that tick, deferrable listings included. Three consecutive gateway attempts that time out or fail with an unmarked 5xx withdraw the gateway for the default window; any gateway answer, on any read path, resets the count. The step tick's open-PR listing stays a Gate read, with its last good copy standing in when it fails. The draw's own claim reads run outside the deadline. Positive integer seconds; anything else uses the default. **Hot-applies** (read at the start of each tick) |
 | `autonomous.workFinder.gatherConcurrency` | — | `8` | How many repos the step gather lists at once (#12256). The forge half of each repo's gather (the item and open-PR listings, hold markers, blocker states, the landed pre-filter, CI at a Judge head) runs on up to this many threads; each keeps the tick's read deadline (`tickDeadlineSecs`) and its starvation rules, and repos are taken in walk order, so a deadline still skips from the end. Stage-entry lookups, weighing and the draw stay serial and run in walk order, so the draw does not depend on which listing answered first. `1` restores the serial gather. Positive integer, at most 32; anything else uses the default. **Hot-applies** (read at each tick) |
 | `autonomous.workFinder.spawnConcurrency` | — | `4` | How many step spawns the work finder's draw runs at once, each in a different repo (#12298). The draw fills its slots in rounds: each round draws one candidate for up to this many open slots, never two in one repo, runs the per-repo cap, RAM, disk and one-merge-per-repo gates for them in draw order (the round's earlier candidates count as admitted, so a round cannot overrun a shared budget), then spawns them together, so their resolvers, pre-claims and account-selection polls overlap. The child launches themselves stay serialised host-wide, at least `dispatchStaggerMs` apart across all repos (the #3887 startup-race gap, which is otherwise kept per repo), so a round never starts several children within milliseconds. Results are applied in draw order, and a refused slot draws again in the next round. Within one repo, claims and step-ledger writes stay one at a time and in order; `workFinder.maxConcurrent`, the free slots and `maxAdmissionsPerTick` bound the tick as before. Before each round the shared GitHub rate-limit breaker is checked: when it has tripped since the tick started, the round is not spawned, its drawn candidates wait for a later tick (`deferred_capacity`, detail `rate_limit_breaker`), and the tick span records `loom.dispatch.spawn_hold`. `1` restores the serial spawns. Positive integer, at most 16; anything else uses the default. **Hot-applies** (read at each tick) |
+| `autonomous.workFinder.discovery` | — | `"direct"` | Which backend builds the step tick's discovery snapshot (#12306). `"direct"`: today's per-repo listings with the ETag cache (standalone installs and Gitea). `"mirror"`: one `GET /v1/mirror/worklist` per tick, conditional on the last `ETag` (a `304` reuses the previous snapshot); it makes no per-repo forge listing and **has no fallback to the forge**: a stale repo is served from the snapshot with its watermark recorded on the tick span (`loom.discovery.*`), a failed request reuses the previous snapshot, and with none every repo reads as unavailable that tick. Needs `forge.mirror` and a mirror that serves the worklist endpoint. Claim, lease, label-transition and merge reads stay live. Anything but `"mirror"` is `"direct"`. **Hot-applies** (read at each tick) |
 | `autonomous.workFinder.landedPrefilter` | — | `false` | The landed pre-filter (#11853): before a `loom:issue` candidate without an open PR is dispatched, one batched GraphQL closes-graph query per workspace asks whether a PR that closes it has merged while it stays open, and routes such an issue to Curator (`loom:triage`) instead of a Builder. **Off by default since #12205** (it cost about 1.5k dispatch-App GraphQL calls an hour fleet-wide). Off, it makes no forge call and every candidate is dispatched as before #11853: a landed-but-open issue can reach a Builder again, bounded by the #11429 journal check, the 2.5 closed-issue guard and the no-op cooldown. On, the query asks only candidates without an open linked PR, at most once per half `LANDED_RECHECK` (15 min) per workspace, backs off 5 min after an unanswered query, and is a repo-targeted Hygiene read (reader pool or gateway; shed, never moved to the writer, when the readers are out of budget). `true` turns it on; anything else is off. **Hot-applies** (read on every call) |
 | *(env only)* | `LOOM_OPEN_PR_MEMO` | `true` | Verified-open-PR memo for the #4123 open-PR dispatch guard (#6788). Falsy (`0`/`false`/`no`/`off`) disables; anything else (including unset) enables. When on, the guard (a) reuses a verified "issue #N has open linked PR #M" answer for 15 minutes instead of re-running the closes-graph query on every work-finder tick, and (b) when **both** the GraphQL probe and its #5911 REST fallback fail, re-verifies that one known PR over a single `GET repos/{owner}/{repo}/pulls/{M}` before conceding. The documented fail-open contract is unchanged: with no memo, or if that recheck also cannot answer, the guard still proceeds. In-memory only — a daemon restart clears it. Disable only to restore the exact pre-#6788 probe |
 | *(env only)* | `LOOM_GUARD_ISSUE_SNAPSHOT` | `true` | Conditional (ETag) issue reads for the 2.5 closed-issue and 2.7 park-label dispatch guards (W9). Falsy (`0`/`false`/`no`/`off`) restores the unconditional `guard.issue_state` / `guard.issue_labels` reads. When on, 2.5 reads `repos/{owner}/{repo}/issues/{N}` reader-first (`guard.issue_view`) and 2.7 reads it on the writer (`guard.issue_labels_view`), each with `If-None-Match` from its own store entry, so a re-attempted, unchanged candidate costs a free `304`. The verdict is always taken from the body the read serves. For 10 minutes after this daemon writes issue N of the repo (keyed by repo and number; a write whose repo is unknown, including a `{owner}/{repo}` placeholder path with no explicit target, is a wildcard that pins N in every repo; the parse is deliberately loose, so any numeric argument of a `gh issue|pr` write may be pinned, and a mis-parse can only add a pin, never drop one), both reads of N are sent without an ETag and keep their identity: 2.5 stays reader-first, 2.7 stays on the writer. Any failure falls back to the unconditional read |
@@ -14392,6 +14395,31 @@ throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
 the operator only ever created the issue.
 
+### Forge call purpose and the gateway discovery reserve (#12310)
+
+Every forge call the `gh` facade makes carries a **purpose**: `discovery` (a
+listing made to find work), `gate`, `write`, `hygiene` or `observability`.
+It is `loom.forge.purpose` on the `invoke github` span and `purpose` on
+`loom.forge.calls`; a write is `write`, a read is `gate` unless its site marks
+it `discovery` (`GhInvocation::discovery()` or a `purpose::discovery()` scope
+around a listing) or gave it a deferrable `ReadClass`. Epic #12304 counts
+`discovery` reads per tick.
+
+A `discovery` read sent as `gh api` also carries the request header
+`loom.forge.purpose: discovery` (porcelain commands such as `gh issue list`
+cannot carry one). No `gate` or `write` call sends it. GitHub and Gitea
+ignore unknown request headers, so a standalone install is unaffected.
+
+The read gateway may use the header to refuse discovery reads (`429`) once a
+pool's remaining quota is below a reserve held for gate reads and the mirror.
+That refusal is the fleet operator's side of the contract; the daemon's side
+is: the `429` message contains `loom-gateway-reserve`. The daemon then books
+the call as outcome `reserve_refused` (not `rate_limited`), stamps the span
+`loom.discovery.fallback_reason = reserve`, sends no more discovery reads on
+that thread until the next work-finder tick (or 30 s), never retries it on the
+writer, and does **not** feed the rate-limit breaker, so claims and writes
+carry on. Real rate-limit responses still trip the breaker.
+
 ## Reader withdrawal kill switch (`LOOM_READ_ROUTING`)
 
 When a reader App fails a read, the daemon withdraws it from routing for a
@@ -14729,6 +14757,32 @@ to a fixture (`isolate_daemon_state`: `LOOM_WORKSPACES_PATH`,
 `LOOM_SWEEPS_JOURNAL_PATH`, `LOOM_WATCHES_PATH`, `LOOM_WATCH_RESULTS_LOG`,
 plus the cwd), so a test daemon has no managed workspace to reconcile or
 dispatch against.
+
+## A tick appears hung — dump the async task tree (`kill -USR1`, #12079)
+
+First step when a daemon tick (work finder, role runner, …) stops logging and
+you need to know **which await it is parked on**. Hosts restrict ptrace (yama
+`ptrace_scope=1`), so gdb/strace need root; this needs neither.
+
+```bash
+pgrep -u "$USER" -x loom-daemon          # the daemon's pid
+kill -USR1 <pid>                         # as the daemon's own user
+tail -n 200 ~/.loom/daemon.log           # "SIGUSR1 task dump: N task(s)" + one trace per task
+```
+
+- The daemon keeps running; each signal writes a fresh dump. The handler runs
+  on its own thread with its own runtime, so it works while the IPC accept loop
+  or the main runtime is wedged.
+- The dump is bounded to 10s. A task that never yields to the runtime (a
+  blocking call on a worker thread) stalls tokio's dump; the log then gets
+  `SIGUSR1 task dump timed out after 10s` instead — that itself says a worker
+  is blocked rather than awaiting.
+- Availability: needs tokio's `taskdump` feature (on in `loom-daemon/Cargo.toml`)
+  and `--cfg tokio_unstable` (set in `.cargo/config.toml`), Linux
+  x86/x86_64/aarch64 only. A build without them, or a non-Linux host, logs
+  `SIGUSR1 task dump unavailable` and keeps running — SIGUSR1 never kills the
+  daemon. A build that overrides `RUSTFLAGS` outright drops the cfg and gets the
+  "unavailable" line.
 
 ## What this page does NOT describe
 

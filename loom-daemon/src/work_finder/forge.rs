@@ -122,6 +122,8 @@ impl WorkSource for GhWorkSource {
     /// the cap unions with the ready listing); it never marks the ready queue incomplete, because
     /// the ready rows themselves were read whole.
     fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
+        // #12310: the work finder's listings are discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
         let label = crate::priority_pick::VERY_IMPORTANT_LABEL;
         // 2am#4367 P5: a discovery listing, so the mirror may serve it.
@@ -230,6 +232,8 @@ impl GhWorkSource {
     /// change) returns what it read and clears [`Self::complete`]; only page
     /// 1 failing is an error. Without `all_pages`, page 1 alone.
     fn list_label(&mut self, label: &str, all_pages: bool) -> Result<Vec<WorkItem>> {
+        // #12310: the work finder's listings are discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
         // 2am#4367 P5: the candidate listing from the state mirror when the
         // repo's watermark is within its bound; else today's REST path. The
