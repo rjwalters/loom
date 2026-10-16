@@ -121,6 +121,7 @@ fn tuning(interval: Duration, settle: Duration) -> TickTuning {
         settle,
         defer_deadline: Duration::from_secs(3600),
         chase_enabled: true,
+        freshness: crate::auto_update::freshness::Thresholds::default(),
     }
 }
 

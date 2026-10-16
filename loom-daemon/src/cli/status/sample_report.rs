@@ -79,6 +79,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         auto_update_stale_repo_ticks: 0,
         auto_update_stale_repo: None,
         auto_update_floor_not_rolling: None,
+        auto_update_freshness: None,
         auto_update_config_enabled: None,
         task_liveness: Vec::new(),
         session_containers: None,

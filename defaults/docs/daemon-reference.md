@@ -6566,6 +6566,8 @@ knobs not yet audited here.
 | `autonomous.transcriptArchive.archiveDir` | `LOOM_TRANSCRIPT_ARCHIVE_DIR` | `~/.loom/transcript-archives` | Where the scheduled pass writes its `.tar.zst` + `.manifest.json` pairs (same default as the CLI's `--archive-dir`). **Restart required** |
 | `autonomous.transcriptArchive.sinks` | *(config only)* | `["local"]` | Destination identities to ledger under. `local` is the only sink implemented (#8758's scope); unknown names are warned about and dropped, and an enabled pass whose list retains no recognized sink does not start — a future remote sink (#8759) listing must never silently disable `local`. **Restart required** |
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
+| `autonomous.autoUpdate.overdueSecs` | `LOOM_AUTO_UPDATE_OVERDUE_SECS` | `4 × intervalSecs` (1h) | Health finding (#9736): the enabled loop has had no **successful** release check for this long, or none since it started tracking. A network error, an unresolved platform or a panicked tick is an attempt, never a successful check. Zero/invalid → default |
+| `autonomous.autoUpdate.convergeDeadlineSecs` | `LOOM_AUTO_UPDATE_CONVERGE_DEADLINE_SECS` | `6 × settleSecs + 4 × intervalSecs` (~1h + settle ceiling) | Health finding (#9736): a release newer than the **running daemon** has gone unapplied this long. The origin is when "behind" was first seen and is not reset by newer releases; it persists in `auto_update_state.json` across a restart of the same binary and clears on a successful check that finds the daemon current. The default exceeds the settle ceiling so settling/draining is never a finding. Not tracked on a fleet host (it moves with the floor, never the newest release). Zero/invalid → default |
 | ~~`autonomous.autoUpdate.rollStallDeadlines`~~, ~~`autonomous.autoUpdate.rollStallCooldownSecs`~~ | ~~`LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES`~~, ~~`LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS`~~ | — | **Removed by #10831.** They tuned the unsatisfiable-drain detector (#8998/#9010) of the wait-for-zero roll, which no longer exists: every automatic roll is now a pause-and-roll bounded by `pauseRoll.pauseBudgetSecs`. Both keys and both env vars are ignored if still set. |
 | `autonomous.autoUpdate.pauseRoll.pauseBudgetSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_PAUSE_BUDGET_SECS` | `120` | Pause-and-roll H4 (#10831, design §7): how long a roll waits for its agents to reach a safe point. An agent that has not parked by then (a tool call longer than the budget, a runtime whose image has no pause hook) is stopped and requeued with `pause-budget-missed`. Read per roll, **no restart**. Validated together with the two keys below: the three must sum to less than two thirds of the lease TTL (`LOOM_LEASE_TTL_MINUTES`, default 15 min → under 600s), or the combination is **rejected** (ERROR + `daemon.roll.config_rejected`) and the defaults are used. |
 | `autonomous.autoUpdate.pauseRoll.verifyProbationSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_VERIFY_PROBATION_SECS` | `90` | Pause-and-roll H5 health probation (#10832, design §7): after a roll's restart, how long the daemon's IPC must keep answering and its heartbeat stay fresh before any paused agent is relaunched. A failed sample restarts the window. Dispatch is held throughout. Read at startup. Validated with the two keys beside it so the pause→resume window stays under the lease TTL. |
@@ -14164,6 +14166,19 @@ reimplementing neither. Since Issue #7609 a published Release artifact is what
 drives a roll, and the source checkout is only the fallback — see
 [Artifact-first auto-update ticks](#artifact-first-auto-update-ticks-7609)
 below.
+
+**Progress health (#9736).** `loom-daemon health`'s `auto_update` section goes
+Degraded when the enabled loop has no successful release check inside
+`overdueSecs`, or a release newer than the *running daemon* stays unapplied past
+`convergeDeadlineSecs` (defaults and precedence in the settings table above).
+Neither needs git or a source checkout. Identity is the daemon's own running
+version (`status` → `auto_update.freshness.running_version`), never the binary
+on disk or the CLI's. `status` also reports the last successful check, pending
+age, next attempt and the latest tick's note as the blocking reason. One
+incident posts one ERROR log line and one loom-ui alert (`auto-update.stalled`),
+and one resolved alert when a successful check clears it. A disabled loop stays
+Green and distinct from a stalled one. A restart of the same binary keeps the
+clocks (`auto_update_state.json`); a changed binary ends convergence tracking.
 
 **Opt-in, default OFF on a host with no fleet store** (it has side effects on
 the running process); a fleet host always runs it, for the floor (#10954).

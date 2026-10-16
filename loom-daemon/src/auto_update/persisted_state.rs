@@ -123,6 +123,10 @@ pub struct PersistedState {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_attempt: Option<RollAttempt>,
+    /// #9736: last successful check and unapplied-release clocks. Absent in
+    /// older files (loads as `None`), so the schema version is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<super::freshness::FreshnessRecord>,
 }
 
 /// The settle gate's clocks, as wall-clock times.
@@ -324,6 +328,7 @@ impl AutoUpdateState {
             },
             floor_stall: self.floor.stall_state(),
             roll_attempt: self.attempt.record().cloned(),
+            freshness: Some(self.freshness.record()),
         }
     }
 
@@ -356,6 +361,12 @@ impl AutoUpdateState {
             .attempt
             .restore(saved.roll_attempt, now, now_utc, running);
         let floor = format!("{floor}{attempt}");
+        // #9736: also before the binary check. A restart of the same binary
+        // keeps a stale host's clocks; a different binary ends convergence.
+        if let Some(saved_freshness) = saved.freshness {
+            self.freshness
+                .restore(saved_freshness, now_utc, saved.binary == binary);
+        }
         if saved.binary != binary {
             return format!(
                 "settle clocks DROPPED because the binary changed ({} -> {binary}), i.e. a roll \
