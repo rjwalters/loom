@@ -105,7 +105,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "defaults/scripts/rebase-stacked-children.sh"
-calls = 3
+calls = 7
 owner = "role-scripts"
 removal_issue = 9799
 
