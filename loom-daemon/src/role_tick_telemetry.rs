@@ -171,10 +171,12 @@ impl ResolvedLaunch {
     }
 
     /// Record the prompt tree of `root` (#11989): a role session's
-    /// `/loom:<role>` prompt is read from that checkout's working tree.
+    /// `/loom:<role>` prompt is read from that checkout's working tree. The
+    /// remote facts come from the tip the daemon last heard (#12509), never
+    /// from a remote question.
     #[must_use]
     pub fn with_prompt_tree(mut self, root: &Path) -> Self {
-        self.prompt = prompt_tree::read(root);
+        self.prompt = prompt_tree::remote::read_with_heard(root);
         self
     }
 

@@ -182,6 +182,7 @@
 //! file is reported at ERROR.
 
 pub(crate) mod external_change;
+mod freshness;
 pub(crate) mod git;
 mod host;
 mod self_heal;
@@ -195,12 +196,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord;
 
-pub(crate) use host::hold_for_self_update;
 pub use host::BUSY_NOTE;
 pub(super) use host::{after_resync, announce, note_remote_head, startup};
 #[cfg(test)]
 pub(in crate::fleet_sync) use host::{boot_step, online_at_boot, timer_step, Stepped};
 pub use host::{health_states, hold_for_move, GateProbe, MoveHold};
+pub(crate) use host::{heard_within, hold_for_self_update};
 
 /// Event-bus topic a checkout state transition is published on.
 pub const TOPIC: &str = "fleet_sync.checkout";
@@ -667,6 +668,9 @@ struct Net {
     misses: u32,
     /// The rate-limit breaker was found open: nothing more is asked.
     breaker_open: bool,
+    /// The remote head the checkout being attempted was compared with (#12509),
+    /// for its `checkout.freshness` record. Reset before each attempt.
+    last_head: Option<String>,
     repairs: Vec<self_heal::Repair>,
 }
 
@@ -676,18 +680,50 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
     memory.seen.retain(|root, _| roots.contains(root));
     memory.reflogs.retain(|root, _| roots.contains(root));
     let mut net = Net::default();
+    let exporting = crate::observability::ops::records_exported();
     let start = memory.cursor % roots.len().max(1);
     let mut reached = 0;
     for root in roots.iter().cycle().skip(start).take(roots.len()) {
         if env.out_of_budget() {
             break;
         }
+        net.last_head = None;
+        let low_before = net.low_disk;
         let found = attempt(env, root, &mut net);
         let now = (env.clock)();
         let report = memory.record(root, found, now, &mut pass.transitions);
         self_heal::after(env, memory, &mut net, &report, &mut pass.transitions);
         watch_reflog(root, report.branch.as_deref(), now, memory, &mut pass);
+        if exporting {
+            let branch = report.branch.as_deref();
+            let head = net
+                .last_head
+                .take()
+                .or_else(|| branch.and_then(|b| (env.confirmed)(root, b)));
+            let low_disk = net.low_disk > low_before;
+            freshness::publish(freshness::reached(
+                env,
+                root,
+                branch,
+                head.as_deref(),
+                low_disk,
+                &net,
+                now,
+            ));
+        }
         reached += 1;
+    }
+    if exporting {
+        // A stale count must never look fresh: say the pass did not reach these.
+        let now = (env.clock)();
+        for root in roots
+            .iter()
+            .cycle()
+            .skip(start + reached)
+            .take(roots.len() - reached)
+        {
+            freshness::publish(freshness::deferred(root, now));
+        }
     }
     pass.deferred = roots.len() - reached;
     memory.cursor = if pass.deferred == 0 {
@@ -786,6 +822,7 @@ fn refresh(
             head
         }
     };
+    net.last_head = Some(head.clone());
     let tracking = git::tracking_head(root, branch, env.bound(git::LOCAL_TIMEOUT));
     if tracking.as_deref() != Some(head.as_str()) {
         // The one gate every daemon fetch into a managed checkout asks first.

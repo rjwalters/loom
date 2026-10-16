@@ -579,6 +579,13 @@ fn a_restored_ledger_drops_the_forge_ladder_mirror() {
     let durable = l.persisted(now + mins(1));
     assert_eq!(durable.len(), 3, "{durable:?}");
 
+    // #12524: the wire form is a plain ladder window plus `fallback`, so a
+    // daemon that predates the fallback cause still parses the file.
+    let json = serde_json::to_string(&durable).unwrap();
+    assert!(!json.contains("forge_ladder_fallback"), "{json}");
+    assert!(json.contains(r#""fallback":true"#), "{json}");
+    let durable: Vec<PersistedPair> = serde_json::from_str(&json).unwrap();
+
     let mut after = OutcomeLedger::default();
     after.restore(durable, now + mins(1));
     assert_eq!(after.cooling_until(3, StepRole::ChampionMerge, now + mins(1)), None);
@@ -842,4 +849,23 @@ fn the_pr_fast_fail_streak_is_consecutive() {
     let at = now + chrono::Duration::hours(30);
     let rec = l.record(70, StepRole::Judge, &fail, quick, at);
     assert_eq!((rec.cooling_until.unwrap() - at).num_seconds(), 60, "back to the base");
+}
+
+/// #12524: a file written by #12519 (cause `forge_ladder_fallback`, no
+/// `fallback` field) still restores as a fallback window.
+#[test]
+fn the_pre_12524_fallback_cause_still_restores() {
+    let now = t0();
+    let until = now + mins(240);
+    let json = format!(
+        r#"[{{"item":4,"step":"champion_merge","until":"{}","cause":"forge_ladder_fallback"}}]"#,
+        until.to_rfc3339()
+    );
+    let pairs: Vec<PersistedPair> = serde_json::from_str(&json).unwrap();
+    let mut l = OutcomeLedger::default();
+    l.restore(pairs, now + mins(1));
+    assert_eq!(
+        l.cooling_cause(4, StepRole::ChampionMerge, now + mins(1)),
+        Some(CooldownCause::ForgeLadderFallback)
+    );
 }

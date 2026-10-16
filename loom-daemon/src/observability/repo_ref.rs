@@ -87,6 +87,14 @@ pub(super) fn cached_repo_ref(root: &str) -> Option<QueueRepoRef> {
         .cloned()
 }
 
+/// The `owner/repo` the collector last resolved for workspace `root` from the
+/// forge, never from the clone's own `origin` (#12509): what `origin` is
+/// compared with to find a clone pointing somewhere else. Cache only.
+#[must_use]
+pub fn registered_repo(root: &std::path::Path) -> Option<String> {
+    cached_repo_ref(&root.display().to_string()).map(|r| r.repo)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

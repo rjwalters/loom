@@ -184,6 +184,9 @@ pub mod scope_memory;
 /// `operator.presence` (#11563) — an operator session's keyboard presence.
 pub mod operator_presence;
 
+/// `checkout.freshness` (#12509) — one managed checkout, measured against GitHub's tip.
+pub mod checkout_freshness;
+
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
 pub mod pass;
 
@@ -508,6 +511,12 @@ macro_rules! telemetry_kind_table {
             /// gauges only. See [`host_status`].
             HostStatus = "host.status" => $crate::telemetry::kinds::host_status::HostStatusRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Gauges, native: false;
+
+            /// One managed checkout, measured against the remote tip the
+            /// fast-forward pass already learned (#12509). OTLP-only. See
+            /// [`checkout_freshness`].
+            CheckoutFreshness = "checkout.freshness" => $crate::telemetry::kinds::checkout_freshness::CheckoutFreshnessRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

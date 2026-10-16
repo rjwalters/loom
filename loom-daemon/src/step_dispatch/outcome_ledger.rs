@@ -480,6 +480,13 @@ pub struct PersistedPair {
     pub until: Option<DateTime<Utc>>,
     #[serde(default)]
     pub cause: Option<CooldownCause>,
+    /// Marks a [`CooldownCause::ForgeLadderFallback`] window (#12524). It is
+    /// written as `cause: forge_ladder` plus this flag, so a daemon older than
+    /// #12516, which cannot parse the `forge_ladder_fallback` cause and would
+    /// discard the whole file, reads a plain ladder window instead. Restore
+    /// still accepts the `forge_ladder_fallback` cause that #12519 wrote.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback: bool,
 }
 
 /// What [`OutcomeLedger::record`] did.
@@ -757,7 +764,11 @@ impl OutcomeLedger {
                     step,
                     runs,
                     until: live.map(|(u, _)| u),
-                    cause: live.map(|(_, c)| c),
+                    cause: live.map(|(_, c)| match c {
+                        CooldownCause::ForgeLadderFallback => CooldownCause::ForgeLadder,
+                        c => c,
+                    }),
+                    fallback: live.is_some_and(|(_, c)| c == CooldownCause::ForgeLadderFallback),
                 })
             })
             .collect()
@@ -790,7 +801,10 @@ impl OutcomeLedger {
                 entry.runs.dedup();
             }
             if let Some(until) = p.until.filter(|u| *u > now) {
-                let cause = p.cause.unwrap_or(CooldownCause::RepeatCap);
+                let cause = match p.cause.unwrap_or(CooldownCause::RepeatCap) {
+                    CooldownCause::ForgeLadder if p.fallback => CooldownCause::ForgeLadderFallback,
+                    c => c,
+                };
                 if cause == CooldownCause::ForgeLadder {
                     continue;
                 }

@@ -145,6 +145,15 @@ pub(super) fn heard(root: &Path, branch: &str, since: DateTime<Utc>) -> Option<S
     (b == branch && *at >= since).then(|| head.clone())
 }
 
+/// The branch and head the workspace half heard for `root` within `max_age`:
+/// a cache read, never a remote question (#12509). `None` for anything older.
+pub(crate) fn heard_within(root: &Path, max_age: Duration) -> Option<(String, String)> {
+    let max_age = chrono::Duration::from_std(max_age).ok()?;
+    let heads = remote_heads().lock().ok()?;
+    let (branch, head, at) = heads.get(root)?;
+    (*at >= Utc::now() - max_age).then(|| (branch.clone(), head.clone()))
+}
+
 // ============================================================================
 // The main-health gate's states
 // ============================================================================
