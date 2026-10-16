@@ -331,15 +331,15 @@ them for correctness.
    **Outcome (#9508, reconciled 2026-10-16): delivered by `forge.mirror`, not
    by a designated poller.** No host polls for the others and no election,
    lease or peer transport is built (ADR-0024's publisher was never built and
-   is superseded, pending rollout). Discovery listings read the operator-run
-   state mirror instead (`defaults/docs/forge-events.md` §8). Each of the
-   original criteria maps as follows:
+   is superseded, pending rollout). Discovery reads one worklist snapshot per
+   step tick from the operator-run state mirror instead (`defaults/docs/forge-events.md`
+   §8.1, §8.1.1). Each of the original criteria maps as follows:
 
    | Original criterion | Status | Where |
    |---|---|---|
-   | Active repos: ~4× to ~1× calls per change window | **Needs measurement** | Mechanism: `forge-events.md` §8.1. Evidence: `loom.forge.calls{caller=work_finder\|stage_dwell}` falling while `loom.forge.mirror.reads{outcome=hit}` rises (§8.3), on an active repo over a window with and without `forge.mirror`. Out-of-band; needs the fleet-tier rollout. Open until a named run records it. |
-   | Poller failure falls back; no stale shared read gates a claim, label or merge | **Covered** | A stale, unknown, errored, timed-out or malformed page makes the whole listing fall back to the ETag REST path within the same call: `any_stale_unknown_or_failed_page_falls_back_for_the_whole_listing`. A failed request also pauses mirror asks for 60s (§8.1), so a down mirror costs one bounded wait. Decision reads: `a_decision_read_never_consults_the_mirror` and `only_the_discovery_listings_name_the_mirror` (`loom-daemon/src/forge_mirror/tests.rs`). |
-   | Opt-in and independently toggleable | **Covered** | `forge.mirror` unset is today's path, with no key read and no request: `break_glass_unset_is_todays_path`. |
+   | Active repos: ~4× to ~1× calls per change window | **Needs measurement** | Mechanism: `forge-events.md` §8.1.1 (one `GET /v1/mirror/worklist` per tick, a `304` when unchanged). Evidence: `loom.discovery.forge_reads` at 0 and `loom.discovery.tier=mirror` on the tick span, with `loom.forge.calls{caller=work_finder}` falling (§8.1, §8.3), on an active repo over a window with and without `forge.mirror`. Out-of-band; needs the fleet-tier rollout. Open until a named run records it. |
+   | Poller failure falls back; no stale shared read gates a claim, label or merge | **Covered** | A failed worklist request, or a repo whose `status` is not `ok` or whose watermark cannot vouch for it, falls to the gateway tier for the affected repos only (§8.1.1): `a_failed_worklist_falls_to_the_gateway_for_every_repo_and_the_span_says_so`, `a_status_that_is_not_ok_falls_to_the_gateway_for_that_repo_alone`, `a_repo_the_mirror_cannot_vouch_for_is_not_served_but_others_are` (`loom-daemon/src/discovery/tests.rs`). A stale repo is served and counted, not refused (`a_stale_repo_is_served_with_its_watermark_recorded`), which is safe because no decision reads the snapshot: `only_the_discovery_and_wake_modules_name_the_mirror` (`loom-daemon/src/forge_mirror/tests.rs`) and `only_the_step_tick_and_its_reporting_name_the_snapshot` (`discovery/tests.rs`). |
+   | Opt-in and independently toggleable | **Covered** | `forge.mirror` unset is today's path, with no key read and no request: `break_glass_unset_is_todays_path` (`forge_mirror/tests.rs`) and `no_mirror_block_is_the_gh_only_chain` (`discovery/tests.rs`). |
    | No new inbound reachability | **Covered** | The mirror client is outbound HTTPS only; no listener is added (§8). |
 
 **Reads that gate a decision never come from a held cache.** A read that
