@@ -340,7 +340,19 @@ pub(super) fn record(
         }
     }
 
-    record_metric(caller, &identity, &cred, (&resource, route), classified, pg);
+    let reserve = super::purpose::is_reserve_refusal(stderr);
+    if reserve && inv.purpose() == super::ForgePurpose::Discovery {
+        super::purpose::end_discovery();
+    }
+    record_metric(
+        caller,
+        &identity,
+        &cred,
+        (&resource, route),
+        classified,
+        pg,
+        (inv.purpose(), reserve),
+    );
     Billing::sent(
         response.as_ref().map(|r| r.status),
         stderr,
@@ -351,6 +363,7 @@ pub(super) fn record(
         identity.role.as_deref().unwrap_or("unknown"),
     )
     .with_repo(identity.repo.as_deref())
+    .with_fallback_reason(reserve.then_some(super::purpose::FALLBACK_RESERVE))
 }
 
 /// Record a shed read (W4-C): no request was sent, so the row charges
@@ -397,7 +410,15 @@ pub(super) fn record_shed(
         kind: "shed",
         installation: None,
     };
-    record_metric(caller, &identity, &cred, (resource.as_str(), "none"), Outcome::Shed, None);
+    record_metric(
+        caller,
+        &identity,
+        &cred,
+        (resource.as_str(), "none"),
+        Outcome::Shed,
+        None,
+        (inv.purpose(), false),
+    );
 }
 
 /// Add the row to `loom.forge.calls` (a no-op without an ops sink).
@@ -408,6 +429,7 @@ fn record_metric(
     (resource, route): (&str, &'static str),
     outcome: Outcome,
     pg: Option<u32>,
+    (purpose, reserve): (super::ForgePurpose, bool),
 ) {
     use crate::observability::ops::forge_calls::{self, CallLabels, CallOutcome};
     let unknown = || forge_call_stats::UNKNOWN_OPERATION.to_string();
@@ -430,7 +452,9 @@ fn record_metric(
         target_owner,
         resource: resource.to_string(),
         route,
+        purpose: purpose.as_str(),
         outcome: match outcome {
+            _ if reserve => CallOutcome::ReserveRefused,
             Outcome::Ok => CallOutcome::Ok,
             Outcome::NotModified => CallOutcome::NotModified,
             Outcome::RateLimited => CallOutcome::RateLimited,
