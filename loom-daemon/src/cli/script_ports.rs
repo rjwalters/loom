@@ -1102,6 +1102,15 @@ pub(crate) enum MergePrCommand {
     /// AWAIT|SYNC|FAIL` plus its narration, exit 0. The shell routes on the
     /// classifier's kind itself on any fault — see `cli::merge_pr_merge_route`.
     MergeRoute(super::merge_pr_merge_route::MergeRouteArgs),
+
+    /// The whole post-merge worktree/branch cleanup block (#8191, slice 1 of
+    /// the orchestrator port): target naming, the remove-vs-preserve decision,
+    /// the primary/sentinel/dirty-work guards, the removal, the ledger, the
+    /// local-branch delete and the cargo-target reclaim, sequenced in one
+    /// process. Prints `LEVEL<TAB>message` records to replay, or `LOOM-NEED
+    /// <fact>` (exit 3, nothing done) when a forge fact must be fetched first
+    /// — see `cli::merge_pr_post_merge_cleanup`.
+    PostMergeCleanup(super::merge_pr_post_merge_cleanup::PostMergeCleanupArgs),
 }
 
 impl MergePrCommand {
@@ -1155,6 +1164,7 @@ impl MergePrCommand {
             MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::MergeRoute(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
+            MergePrCommand::PostMergeCleanup(args) => args.run(),
         }
     }
 }

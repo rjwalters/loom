@@ -2,53 +2,58 @@
 
 use super::*;
 
-/// `merge-pr.sh`'s `_maybe_delete_local_branch` body, or `None` outside a full
-/// checkout.
+/// `merge-pr.sh`'s text, or `None` outside a full checkout.
 ///
-/// #8191 replaced that body with a thin call into `loom-daemon merge-pr
-/// delete-branch` — this module IS the implementation now, so there is no
-/// longer a second copy of the rule's text to drift out of sync with. What
-/// the shell body must still get right is the WIRING: it delegates rather
-/// than reimplementing, per `shell_delegates_rather_than_reimplementing` below.
-fn shell_twin_body() -> Option<String> {
+/// #8191 replaced `_maybe_delete_local_branch` with a thin call into `loom-daemon
+/// merge-pr delete-branch`, and the orchestrator slice then moved that call
+/// in-process (`merge-pr post-merge-cleanup` calls [`maybe_delete_local_branch`]
+/// directly) — this module IS the implementation, so there is no second copy of
+/// the rule's text to drift out of sync with. What the shell must still get
+/// right is the WIRING: it holds no branch-delete logic of its own, per
+/// `shell_delegates_rather_than_reimplementing` below.
+fn shell_twin() -> Option<String> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts/merge-pr.sh");
-    let sh = std::fs::read_to_string(&script).ok()?;
-    let start = sh
-        .find("_maybe_delete_local_branch() {")
-        .expect("merge-pr.sh still defines _maybe_delete_local_branch");
-    let body = &sh[start..];
-    let end = body.find("\n}\n").expect("the function has a terminator");
-    Some(body[..end].to_string())
+    std::fs::read_to_string(&script).ok()
 }
 
 // ---------------------------------------------------------------------------
 // The anti-drift guarantee
 // ---------------------------------------------------------------------------
 
-/// `merge-pr.sh`'s `_maybe_delete_local_branch` must delegate to
-/// `loom-daemon merge-pr delete-branch` — the CLI wrapper over THIS module —
-/// rather than growing a second, independent implementation. Prior to #8191
-/// this test asserted every operator-visible message string existed
-/// verbatim in both copies; now there is exactly one copy (this file), and
-/// what could drift instead is the shell quietly regaining its own logic. A
-/// literal `if [[ "$BRANCH_LANDED_VERDICT"` reappearing here would be exactly
-/// that regression.
+/// `merge-pr.sh` must reach the local-branch delete only through `loom-daemon
+/// merge-pr post-merge-cleanup` — whose orchestrator calls THIS module — rather
+/// than growing a second, independent implementation. Prior to #8191 this test
+/// asserted every operator-visible message string existed verbatim in both
+/// copies; now there is exactly one copy (this file), and what could drift
+/// instead is the shell quietly regaining its own logic: a `git branch -d`/`-D`
+/// or a `_maybe_delete_local_branch` function reappearing there would be
+/// exactly that regression.
 #[test]
 fn shell_delegates_rather_than_reimplementing() {
-    let Some(body) = shell_twin_body() else {
+    let Some(sh) = shell_twin() else {
         return;
     };
     assert!(
-        body.contains("merge-pr delete-branch"),
-        "merge-pr.sh's _maybe_delete_local_branch no longer calls 'loom-daemon merge-pr \
-         delete-branch' — has it regrown its own copy of the branch_delete.rs rule?"
+        sh.contains("merge-pr post-merge-cleanup"),
+        "merge-pr.sh no longer calls 'loom-daemon merge-pr post-merge-cleanup' — has the \
+         cleanup regrown its own copy of the branch_delete.rs rule?"
     );
     assert!(
-        !body.contains(r#"BRANCH_LANDED_VERDICT"#),
-        "merge-pr.sh's _maybe_delete_local_branch references $BRANCH_LANDED_VERDICT directly — \
-         that is the pre-#8191 inline implementation this module replaced; it should only call \
-         the daemon now"
+        !sh.contains("_maybe_delete_local_branch() {"),
+        "merge-pr.sh defines _maybe_delete_local_branch again — that is the pre-#8191 \
+         inline implementation this module replaced"
     );
+    for forbidden in [
+        "git -C \"$REPO_ROOT\" branch -D",
+        "branch -d \"$branch\"",
+        "branch -D \"$branch\"",
+    ] {
+        assert!(
+            !sh.contains(forbidden),
+            "merge-pr.sh deletes a local branch itself ({forbidden}); that decision lives in \
+             branch_delete.rs"
+        );
+    }
 }
 
 /// The escalation criterion, stated as a test so it cannot be relaxed by

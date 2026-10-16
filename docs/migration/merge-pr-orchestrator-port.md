@@ -93,7 +93,8 @@ Work from the outside in on the *irreversible tail*, so each slice leaves a
 working script and the next slice's inputs already exist as Rust. Every slice
 is `Part of #8191`; only the last closes it.
 
-1. **Post-merge cleanup** (lines ~2332-2977, plus `_remove_loom_worktree`,
+1. **Post-merge cleanup** — **DONE** (this slice; see "Slice 1 status" below).
+   Original scope (lines ~2332-2977, plus `_remove_loom_worktree`,
    `_maybe_delete_local_branch`, `_worktree_cleanup_decide`,
    `_find_worktree_by_branch`): `merge-pr post-merge-cleanup`. Highest
    cost-of-being-wrong (branch and worktree deletion), and every predicate it
@@ -116,3 +117,52 @@ Per-slice acceptance: the suites that still apply pass unchanged; a differential
 test (shell vs Rust on one frozen corpus, never regenerated per side) for any
 rewritten predicate; no behaviour change, no new merge-flow semantics, no
 deletion of unmerged branches or worktrees.
+
+
+## Slice 1 status: post-merge cleanup (landed with `merge-pr post-merge-cleanup`)
+
+What moved: the whole `CLEANUP_WORKTREE` block and the nine functions behind it
+(`_remove_loom_worktree`, `_maybe_delete_local_branch`, `_worktree_cleanup_decide`,
+`_issue_is_closed_for_cleanup`, `_find_worktree_by_branch`, `_worktree_branch_for`,
+`_primary_worktree_path`, `_is_primary_worktree_path`, `_mp_worktree`; ~580 shell
+lines) into `loom-daemon/src/merge_pr/post_merge_cleanup.rs`, with the existing
+predicates (`cleanup_paths`, `worktree_preserve`, `discovered_worktree`,
+`remove_gate`, `dirty_guard`, `worktree_teardown`, `issue_close_gate`,
+`branch_delete`, `cargo_target`, `removal_log`) called in-process in the order the
+shell called them. The shell keeps `_post_merge_cleanup`, a ~50-line wrapper.
+
+Design decisions a later slice should know about:
+
+- **Forge reads stay in the shell, asked for lazily.** `forge_pr_close_targets`,
+  `forge_get_issue_state` and `branch_has_landed` are shared with Gitea and other
+  callers, and the retired code only paid for them when it needed them. The verb
+  prints `LOOM-NEED close-targets|issue-state <N>|landed` and exits 3 having done
+  nothing; the wrapper fetches the fact and calls again. Every fact is demanded
+  before the first mutation (`Run::mutated` makes a late demand resolve to the
+  fail-safe answer instead of asking), so the retry is replay-safe. Slices 2-4
+  can reuse this protocol for the facts their steps need until the forge reads
+  themselves move.
+- **Positive terminator.** A finished run ends with `LOOM-POST-MERGE-CLEANUP
+  DONE`; exit 0 without it is treated as "did not run" (a stale or muted binary),
+  as `dirty-guard`'s `CLEAN` sentinel does.
+- **Fail direction is unchanged: toward removing nothing.** A verb that did not
+  run removes no worktree and deletes no branch. This is slightly wider than
+  before (an old daemon used to still attempt the local-branch delete), and
+  deliberately so: there is no half-answered state left to fall out of.
+- **Argv fidelity.** The `git` calls the shell made (`worktree list --porcelain`,
+  `status --porcelain`, `worktree remove --force`, `worktree prune`) are issued
+  with the same arguments in the same order; the ledger line is the Rust writer's
+  (byte-identical format), with the daemon's pid rather than the shell's.
+
+Suites: 8 retained suites that extracted the deleted functions were re-pointed
+at the real wrapper + real verb against real git repos through
+`defaults/scripts/tests/lib/post-merge-cleanup-harness.sh` (`worktree-path`,
+`local-branch-cleanup`, `dirty-worktree-guard`, `primary-worktree-guard`,
+`primary-checkout-advice`, `worktree-remove-diagnosis`, `worktree-awk`, plus the
+reclaim assertions in `test-cargo-target-dir-reclaim.sh` and
+`test-per-worktree-target-dir.sh`). Source-text assertions are retired in the
+suites under the three-part test with named successors. `worktree-path`'s inline
+bash *models* of the decision tree (Tests 4-6) now drive the real thing, which is
+a strictly stronger check. Four suites (`merge-ordering-guard`,
+`notify-cleared-blockers`, `verdict-label-guard`, `workflow-scope-preflight`)
+fail identically on `main` in this environment and are untouched.

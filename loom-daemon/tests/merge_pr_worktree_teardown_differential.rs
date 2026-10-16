@@ -20,9 +20,10 @@
 //! its argument on newlines before recording, so a divergence in the TEXT of
 //! any line still fails here.
 //!
-//! The last two tests drive the LIVE `_remove_loom_worktree`, extracted from
-//! `merge-pr.sh`, to pin the wrapper's fail-closed direction: a binary that
-//! cannot answer `worktree-teardown` removes nothing.
+//! The last two tests drive the LIVE `_post_merge_cleanup` wrapper, extracted from
+//! `merge-pr.sh` (#8191 orchestrator slice 1: the removal ladder runs in-process
+//! inside `merge-pr post-merge-cleanup` now), to pin the wrapper's fail-closed
+//! direction: a binary that cannot answer `post-merge-cleanup` removes nothing.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -369,14 +370,21 @@ fn the_live_script_no_longer_carries_the_ladder() {
         !src.contains(r#"worktree remove "$worktree_path" --force 2>&1"#),
         "merge-pr.sh still runs the retired remove ladder itself"
     );
-    assert!(src.contains("_mp_worktree worktree-teardown"));
+    assert!(src.contains("merge-pr post-merge-cleanup"));
+    assert!(
+        !src.contains("_mp_worktree worktree-teardown")
+            && !src.contains("merge-pr worktree-teardown --"),
+        "merge-pr.sh calls the teardown verb itself again; it runs inside post-merge-cleanup"
+    );
 }
 
-/// Extract the live `_remove_loom_worktree` (and the helpers it reaches) and
-/// run it against a fresh worktree with `LOOM_DAEMON_SELF_BIN` pointed at a
-/// shim that answers `worktree-teardown` with `teardown_script` and delegates
-/// every other verb to the real binary. Returns (stdout, worktree survived).
-fn run_live_wrapper(teardown_script: &str) -> (String, bool) {
+/// Extract the live `_post_merge_cleanup` wrapper and run it (the
+/// `--worktree-path` arm, so the target is named explicitly) against a fresh
+/// worktree with `LOOM_DAEMON_SELF_BIN` pointed at a shim that answers
+/// `post-merge-cleanup` with `verb_script` (`:` falls through to the real
+/// binary) and delegates every other verb to the real binary. Returns (stdout,
+/// worktree survived, removal ledger written).
+fn run_live_wrapper(verb_script: &str) -> (String, bool, bool) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let case = Case {
@@ -391,7 +399,7 @@ fn run_live_wrapper(teardown_script: &str) -> (String, bool) {
     std::fs::write(
         &shim,
         format!(
-            "#!/usr/bin/env bash\nif [[ \"$1\" == merge-pr && \"$2\" == worktree-teardown ]]; then {teardown_script}; fi\nexec \"{real}\" \"$@\"\n"
+            "#!/usr/bin/env bash\nif [[ \"$1\" == merge-pr && \"$2\" == post-merge-cleanup ]]; then {verb_script}; fi\nexec \"{real}\" \"$@\"\n"
         ),
     )
     .unwrap();
@@ -404,12 +412,14 @@ info() { echo "INFO: $*"; }
 warning() { echo "WARN: $*"; }
 success() { echo "OK: $*"; }
 error() { echo "ERROR: $*" >&2; return 1; }
-loom_record_worktree_removal() { echo "LEDGER: $3"; }
-for f in _mp_worktree _primary_worktree_path _worktree_branch_for _remove_loom_worktree; do
-  eval "$(extract_fn "$f" "$1")"
-done
-REPO_ROOT="$2"
-_remove_loom_worktree "$3"
+forge_pr_close_targets() { :; }
+forge_get_issue_state() { :; }
+branch_has_landed() { return 1; }
+eval "$(extract_fn _post_merge_cleanup "$1")"
+REPO_ROOT="$2"; PR_NUMBER=1; PR_BRANCH="feature/live"; PR_HEAD_SHA=""
+DEFAULT_BRANCH_NAME=main; CLEANUP_WORKTREE=true; CLEANUP_PRIMARY_CHECKOUT=true
+WORKTREE_PATH_OVERRIDE="$3"; GH=gh; REPO_NWO=o/r
+_post_merge_cleanup
 "#;
     let out = Command::new("bash")
         .args(["-c", driver, "driver"])
@@ -418,6 +428,7 @@ _remove_loom_worktree "$3"
         .arg(&wt)
         .env("LOOM_DAEMON_SELF_BIN", &shim)
         .env("LOOM_DAEMON_BIN", real)
+        .env_remove("LOOM_PRESERVE_WORKTREE")
         .current_dir(&root)
         .output()
         .expect("bash ran the live wrapper");
@@ -428,37 +439,37 @@ _remove_loom_worktree "$3"
         out.status.code(),
         String::from_utf8_lossy(&out.stderr)
     );
-    (stdout, wt.exists())
+    let ledger = repo.join(".loom/logs/worktree-removals.log").exists();
+    (stdout, wt.exists(), ledger)
 }
 
 #[test]
 fn the_live_wrapper_removes_through_the_verb() {
-    let (out, survived) = run_live_wrapper(":");
+    let (out, survived, ledger) = run_live_wrapper(":");
     assert!(!survived, "the worktree should be gone: {out}");
     assert!(out.contains("OK: Worktree removed"), "{out}");
-    assert!(out.contains("LEDGER: "), "the success-only ledger step ran: {out}");
+    assert!(ledger, "the success-only ledger step ran: {out}");
 }
 
 #[test]
 fn the_live_wrapper_removes_nothing_when_the_verb_cannot_run() {
-    // A binary predating the verb (clap usage error, exit 2), and one that
-    // answers off-protocol with exit 0: both must leave the worktree in place,
-    // warn, and skip the success-only steps.
+    // A binary predating the verb (clap usage error, exit 2), one that answers
+    // off-protocol with exit 0 and no terminator, and one that exits 0 having
+    // printed nothing: all must leave the worktree in place, warn, and skip the
+    // success-only steps.
     for script in [
         "echo 'error: unrecognized subcommand' >&2; exit 2",
-        "echo 'LOOM-WORKTREE-TEARDOWN MAYBE'; exit 0",
+        "echo 'INFO\tcleaned up'; exit 0",
+        "exit 0",
     ] {
-        let (out, survived) = run_live_wrapper(script);
+        let (out, survived, ledger) = run_live_wrapper(script);
         assert!(survived, "a verb that did not run must remove nothing ({script}): {out}");
         assert!(
-            out.contains("WARN: Could not remove worktree at")
-                && out.contains("no removal was attempted"),
+            out.contains("WARN: Post-merge worktree cleanup for PR #1 did not run")
+                && out.contains("Nothing is removed and no local branch is deleted"),
             "{out}"
         );
-        assert!(
-            !out.contains("LEDGER: "),
-            "no ledger entry for a removal that did not happen: {out}"
-        );
+        assert!(!ledger, "no ledger entry for a removal that did not happen: {out}");
         assert!(!out.contains("OK: Worktree removed"), "{out}");
     }
 }
