@@ -7,6 +7,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12473**: chore: remove stamp-only provenance test, fixture and stale docs
+- **PR #12471**: docs(fleet-captain-dispatch): tailnet node field lives on host records
+- **PR #12467**: feat(fleet-dispatch): worker client claims through the captain first (#12450)
 - **PR #12470**: refactor: record why disk reclaim predicates stay raw and drop unused df helpers
 - **PR #12469**: feat(observability): export worktree-reaper per-pass telemetry as reaper.pass spans
 - **PR #12468**: feat(reaper): reclaim idle Python caches and .venv, keep tracked artifact dirs
@@ -21,6 +24,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #12443**: test: count only per-issue reads of held candidates in expired-listing assertion
 - **PR #12441**: feat(host_status): gate, launch and work-finder read filtered host_status
 - **PR #12436**: refactor: stop deriving story trace IDs; every execution is its own root trace
+- **Issue #12450** (closed): Fleet dispatch Phase 1b: worker client — claim via the captain before the forge pre-claim, fail-open with hysteresis
+- **Issue #11983** (closed): Provenance out of Loom, stage 3: remove provenance-only docs, fixtures and CI checks
+- **Issue #11809** (closed): host_status: one continuous, IIR-filtered host sampler, exported as OTel metrics and used by admission
 - **Issue #12461** (closed): Export worktree-reaper per-pass telemetry (scanned/removed/preserved/bytes)
 - **Issue #12459** (closed): Reclaim Python caches and .venv from idle worktrees
 - **Issue #12449** (closed): Fleet dispatch Phase 1a: captain server `loom-daemon fleet-dispatch serve` (claim arbiter, soft state, roster auth)
