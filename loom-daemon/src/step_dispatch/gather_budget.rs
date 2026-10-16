@@ -60,6 +60,10 @@ pub struct TickPasses {
     pub draws_unspawned: usize,
     /// Passes by reason (`claim_lost`, `repo_cap`, ...).
     pub by_reason: std::collections::BTreeMap<String, usize>,
+    /// The slots the tick could fill (free slots, bounded by the ramp cap).
+    pub budget: usize,
+    /// Why the draw loop stopped ([`super::tick::TickStop::as_str`]).
+    pub stop: Option<&'static str>,
 }
 
 impl TickPasses {

@@ -33,6 +33,20 @@
 //! the ramp cap are host-wide, so they bound how many slots the tick fills
 //! rather than refusing one draw.
 //!
+//! A **lost claim** ([`REFUSAL_CLAIM_LOST`]: a peer claimed the item first)
+//! is a cheap pass (#12410): the item has already left the tick's pool (draws
+//! are without replacement), and the slot draws again at once, but the loss
+//! spends neither the tick's [`MAX_PASSES_PER_TICK`] nor the slot's
+//! [`MAX_DRAWS_PER_SLOT`]. Losing is a fact about a peer, not about this
+//! host's gates, so on a fleet where every host draws the same heavy items it
+//! must not starve the tick of attempts. It has its own bound,
+//! [`MAX_FREE_CLAIM_LOST_PER_TICK`], past which a loss is an ordinary pass.
+//!
+//! Every tick also says why its draw loop stopped ([`TickStop`], the tick
+//! span's `loom.dispatch.stop`) and how many slots it could fill
+//! (`loom.dispatch.budget`), so a tick with free slots and few attempts names
+//! its limit.
+//!
 //! An **unverifiable claim** ([`REFUSAL_CLAIM_UNVERIFIED`]) is the exception
 //! to "draw again" (#12260): the pre-claim's lease reads and post run on the
 //! forge owner's writer installation, so when one cannot be verified (in
@@ -67,6 +81,13 @@ pub const MAX_DRAWS_PER_SLOT: u32 = 8;
 /// At most this many passes in one tick (design §4.2 step 4).
 pub const MAX_PASSES_PER_TICK: u32 = 32;
 
+/// At most this many `claim_lost` refusals in one tick are free (#12410):
+/// they spend no pass and no slot draw. Past it a loss is an ordinary pass,
+/// so a tick's draws stay bounded (`MAX_PASSES_PER_TICK` +
+/// `MAX_FREE_CLAIM_LOST_PER_TICK` refusals) while each loss still costs a
+/// claim subprocess.
+pub const MAX_FREE_CLAIM_LOST_PER_TICK: u32 = 16;
+
 /// The pass reason of a draw the per-repo cap refused.
 pub const PASS_REPO_CAP: &str = "repo_cap";
 /// The pass reason of a second Champion merge in one repo in one tick.
@@ -75,6 +96,53 @@ pub const PASS_MERGE: &str = "merge_in_flight";
 /// (`sweep_registry::step_spawn::lease`): it ends the owner's draws for the
 /// tick (module docs, #12260).
 pub const REFUSAL_CLAIM_UNVERIFIED: &str = "claim_unverified";
+/// The spawn refusal of a claim a peer won first: a cheap pass (module docs,
+/// #12410).
+pub const REFUSAL_CLAIM_LOST: &str = "claim_lost";
+
+/// Why a tick's draw loop stopped (#12410): the tick span's
+/// `loom.dispatch.stop`, a closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TickStop {
+    /// Every slot the tick could fill was filled.
+    #[default]
+    Filled,
+    /// Every slot was filled, but the ramp cap (`maxAdmissionsPerTick`)
+    /// allowed fewer slots than were free.
+    RampCap,
+    /// The saturation brake held every admission.
+    Saturation,
+    /// No slot was free.
+    NoSlots,
+    /// The pool had nothing left to draw.
+    PoolDrained,
+    /// The tick spent its [`MAX_PASSES_PER_TICK`] passes.
+    PassLimit,
+    /// Every open slot gave up after [`MAX_DRAWS_PER_SLOT`] draws.
+    SlotDraws,
+    /// The spawner held the spawns (the shared rate-limit breaker, #12298).
+    SpawnHold,
+    /// The pool's total weight overflowed ([`DrawError::WeightOverflow`]).
+    WeightOverflow,
+}
+
+impl TickStop {
+    /// The attribute value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::RampCap => "ramp_cap",
+            Self::Saturation => "saturation",
+            Self::NoSlots => "no_slots",
+            Self::PoolDrained => "pool_drained",
+            Self::PassLimit => "pass_limit",
+            Self::SlotDraws => "slot_draws",
+            Self::SpawnHold => "spawn_hold",
+            Self::WeightOverflow => "weight_overflow",
+        }
+    }
+}
 
 /// The forge owner of a workspace's `owner/repo` slug, lowercased (GitHub
 /// owners are case-insensitive). Pure.
@@ -179,6 +247,11 @@ pub struct StepTick {
     pub passes: BTreeMap<String, usize>,
     /// Draws taken, across workspaces.
     pub draws: usize,
+    /// The slots the tick could fill: the free slots, bounded by the ramp
+    /// cap, `0` under the saturation brake.
+    pub budget: usize,
+    /// Why the draw loop stopped.
+    pub stop: TickStop,
 }
 
 /// The queue disposition a pass reason reads as.
@@ -396,13 +469,16 @@ pub fn run(
     // (that would change the pool, and its replay) but carried to the
     // head of the next round.
     let concurrency = limits.spawn_concurrency.max(1);
-    // Draw attempts of each open slot, in the order the slots opened.
-    let mut open: Vec<u32> = Vec::new();
+    // Each open slot's draws and, of those, the free `claim_lost` ones, in
+    // the order the slots opened.
+    let mut open: Vec<(u32, u32)> = Vec::new();
+    let mut free_losses = 0u32;
+    let mut gave_up = 0usize;
     let mut opened = 0usize;
     let mut carry: Option<DrawRecord> = None;
     loop {
         while open.len() < concurrency && opened < budget {
-            open.push(0);
+            open.push((0, 0));
             opened += 1;
         }
         if open.is_empty() || passes >= MAX_PASSES_PER_TICK {
@@ -413,13 +489,15 @@ pub fn run(
         let mut planned = repo_cap.clone();
         let mut batch: Vec<Pending> = Vec::new();
         let mut done: BTreeSet<usize> = BTreeSet::new();
-        'slots: for (slot, attempts) in open.iter_mut().enumerate() {
+        'slots: for (slot, (attempts, free)) in open.iter_mut().enumerate() {
             loop {
                 if passes >= MAX_PASSES_PER_TICK {
                     break 'slots;
                 }
-                if *attempts >= MAX_DRAWS_PER_SLOT {
+                // A free `claim_lost` does not count toward the slot's draws.
+                if attempts.saturating_sub(*free) >= MAX_DRAWS_PER_SLOT {
                     done.insert(slot);
+                    gave_up += 1;
                     break;
                 }
                 let record = match carry.take() {
@@ -572,7 +650,17 @@ pub fn run(
                         report.errors += 1;
                     }
                     resolve(&mut report.queue, &key, disposition, Some(reason.clone()));
-                    passes += 1;
+                    // A lost claim is cheap (module docs, #12410): the item
+                    // already left the pool and the slot redraws next round
+                    // without spending a pass or one of its draws.
+                    if reason == REFUSAL_CLAIM_LOST && free_losses < MAX_FREE_CLAIM_LOST_PER_TICK {
+                        free_losses += 1;
+                        if let Some((_, free)) = open.get_mut(p.slot) {
+                            *free += 1;
+                        }
+                    } else {
+                        passes += 1;
+                    }
                     *refused
                         .entry(idx)
                         .or_default()
@@ -607,6 +695,26 @@ pub fn run(
             break;
         }
     }
+
+    let stop = if limits.saturation_held {
+        TickStop::Saturation
+    } else if budget == 0 {
+        TickStop::NoSlots
+    } else if report.spawn_hold.is_some() {
+        TickStop::SpawnHold
+    } else if overflow {
+        TickStop::WeightOverflow
+    } else if exhausted {
+        TickStop::PoolDrained
+    } else if passes >= MAX_PASSES_PER_TICK {
+        TickStop::PassLimit
+    } else if gave_up > 0 {
+        TickStop::SlotDraws
+    } else if budget < limits.free_slots {
+        TickStop::RampCap
+    } else {
+        TickStop::Filled
+    };
 
     // Rows nothing resolved wait for a later tick: name the limit that held
     // them.
@@ -676,6 +784,8 @@ pub fn run(
         report,
         passes: pass_counts,
         draws: draws_taken,
+        budget,
+        stop,
     }
 }
 

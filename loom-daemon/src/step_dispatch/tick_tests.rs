@@ -100,6 +100,8 @@ struct FakeSpawner {
     batches: Vec<Vec<(usize, u32)>>,
     /// Hold the spawns once this many batches ran (#12298).
     hold_after: Option<usize>,
+    /// Refuse the first `.0` spawn calls, whatever their item, with `.1`.
+    refuse_first: Option<(usize, &'static str)>,
 }
 
 impl StepSpawner for FakeSpawner {
@@ -109,6 +111,11 @@ impl StepSpawner for FakeSpawner {
         self.terms.push(request.draw);
         if let Some(reason) = self.refuse_all {
             return SpawnResult::Refused(reason.to_string());
+        }
+        if let Some((n, reason)) = self.refuse_first {
+            if self.asked.len() <= n {
+                return SpawnResult::Refused(reason.to_string());
+            }
         }
         if let Some(i) = self.refuse.iter().position(|(n, _)| *n == request.item) {
             let (_, reason) = self.refuse.remove(i);
@@ -380,6 +387,93 @@ fn claim_lost_refusals_are_counted_as_passes_and_draws() {
         run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut cap, &mut spawner);
     assert_eq!(tick.passes.get("claim_lost"), Some(&1));
     assert!(tick.draws > 1, "{} draws", tick.draws);
+}
+
+/// #12410: a lost claim is cheap. Forty lost claims in a row spend neither the
+/// tick's passes nor (for the first sixteen) a slot's draws, so the tick
+/// still spawns; forty real refusals (`claimed`) spend the pass budget and
+/// spawn nothing.
+#[test]
+fn claim_lost_refusals_do_not_exhaust_the_tick_passes() {
+    let rows: Vec<RestIssue> = (1..=60)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((40, "claim_lost")),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0]);
+    let lost = run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut cap, &mut spawner);
+    // Slot 1: 16 free losses + 8 charged; slots 2 and 3: 8 charged each (the
+    // free ones are spent); slots 4..10 spawn.
+    assert_eq!(lost.passes.get("claim_lost"), Some(&40), "every loss is still counted");
+    assert_eq!(lost.report.dispatched, 7);
+    assert_eq!(lost.stop, TickStop::SlotDraws);
+    assert_eq!(lost.draws, 47);
+
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((40, "claimed")),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0]);
+    let claimed =
+        run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut cap, &mut spawner);
+    assert_eq!(spawner.asked.len(), MAX_PASSES_PER_TICK as usize);
+    assert_eq!(claimed.report.dispatched, 0);
+    assert_eq!(claimed.stop, TickStop::PassLimit);
+}
+
+/// #12410: a few lost claims cost the slot nothing: it redraws at once and
+/// keeps its numbering, and the lost item never comes back in the tick.
+#[test]
+fn a_lost_claim_redraws_without_spending_the_slot() {
+    let rows: Vec<RestIssue> = (1..=20)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((10, "claim_lost")),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0]);
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut cap, &mut spawner);
+    // Ten losses exceed the slot's eight draws, but none is charged.
+    assert_eq!(tick.report.dispatched, 1);
+    assert_eq!(tick.stop, TickStop::Filled);
+    let attempts: Vec<u32> = spawner.asked.iter().map(|a| a.3).collect();
+    assert_eq!(attempts, (1..=11).collect::<Vec<u32>>());
+    let items: BTreeSet<u32> = spawner.asked.iter().map(|a| a.1).collect();
+    assert_eq!(items.len(), 11, "a lost item is never redrawn in the tick");
+}
+
+/// #12410: the tick names why its draw loop stopped and how many slots it
+/// could fill.
+#[test]
+fn the_tick_names_its_stop_and_budget() {
+    let rows: Vec<RestIssue> = (1..=12)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let ws = || vec![workspace(0, "acme/one", &rows)];
+    let tick_of = |limits: StepTickLimits| {
+        let mut cap = RepoCap::new(None, vec![0]);
+        run_with(ws(), limits, &mut cap, &mut FakeSpawner::default())
+    };
+    let filled = tick_of(limits(4));
+    assert_eq!((filled.stop, filled.budget, filled.report.dispatched), (TickStop::Filled, 4, 4));
+    let ramp = tick_of(StepTickLimits {
+        max_admissions: 3,
+        ..limits(30)
+    });
+    assert_eq!((ramp.stop, ramp.budget, ramp.report.dispatched), (TickStop::RampCap, 3, 3));
+    let drained = tick_of(limits(30));
+    assert_eq!((drained.stop, drained.budget), (TickStop::PoolDrained, 30));
+    assert_eq!(drained.report.dispatched, 12);
+    let saturated = tick_of(StepTickLimits {
+        saturation_held: true,
+        ..limits(4)
+    });
+    assert_eq!((saturated.stop, saturated.budget), (TickStop::Saturation, 0));
+    assert_eq!(tick_of(limits(0)).stop, TickStop::NoSlots);
+    assert_eq!(TickStop::PassLimit.as_str(), "pass_limit");
 }
 
 /// #12048: a workspace missing the role's command reads as blocked in the
@@ -817,7 +911,11 @@ fn other_refusals_still_redraw_in_the_same_owner() {
         &mut cap,
         &mut spawner,
     );
-    assert_eq!(spawner.asked.len(), MAX_DRAWS_PER_SLOT as usize);
+    // Neither owner's repo leaves the draw, and (#12410) a lost claim spends
+    // no slot draw while the free ones last: all 20 items are tried.
+    let repos: BTreeSet<usize> = spawner.asked.iter().map(|a| a.0).collect();
+    assert_eq!(repos.len(), 2);
+    assert_eq!(spawner.asked.len(), 20);
 }
 
 #[test]

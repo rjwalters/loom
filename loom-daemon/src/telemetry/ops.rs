@@ -141,6 +141,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.passes",
     "loom.dispatch.draws",
     "loom.dispatch.draws_unspawned",
+    "loom.dispatch.budget",
+    "loom.dispatch.stop",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",
