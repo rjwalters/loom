@@ -11,7 +11,10 @@
 //! 3. when no reader is left the read is **shed**: no request, an `o=shed`
 //!    accounting row, and the error [`ReadShed`]; the caller skips its pass or
 //!    serves from its cache;
-//! 4. a 403/404 is the reader's own answer and is returned as-is;
+//! 4. a 403/404 is the reader's answer only for an item-scoped 404 from a
+//!    reader that recently served the same repo and endpoint family (the item
+//!    is gone); otherwise the reader cannot see the repo, so it is withdrawn
+//!    for that repo (step 2) and the read sheds if no reader is left;
 //! 5. only a host with no reader pool at all (a target with no repo, or
 //!    [`RouteDecision::NoPool`] before any reader was tried) reads on the
 //!    writer: it is the only credential there is.
@@ -169,10 +172,16 @@ pub(super) fn fetch(
             return Ok(first);
         };
         let why = format!("{} {url}", site.caller);
-        if failure == Failure::Coverage {
-            // The reader's own answer (403/404): the writer is not asked
-            // (#12394), and nothing confirms the repo is visible to anyone,
-            // so the reader is not withdrawn.
+        if failure == Failure::Coverage
+            && site.item_scoped
+            && matches!(first.1.as_ref().map(|h| h.status), Some(404))
+            && served::reader_recently_served(&app_id, repo, family, SystemTime::now())
+        {
+            // W6: a reader that just served this repo's endpoint family
+            // answers an item-scoped 404 for the item itself (it does not
+            // exist). Any other 403/404 may be a reader that cannot see the
+            // repo, which is no answer: it is withdrawn for the repo below
+            // and the next reader tried, and the read sheds when none is left.
             return Ok(first);
         }
         crate::forge_identity::withdraw_after(&app_id, repo, failure, &why);

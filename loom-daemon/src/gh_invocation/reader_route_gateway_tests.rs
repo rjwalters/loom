@@ -143,16 +143,22 @@ fn a_bad_gateway_with_no_reader_is_shed_never_sent_to_the_writer() {
     assert_eq!(s.calls(), ["gateway"], "writer stub NOT invoked");
 }
 
-/// A real answer from GitHub through the gateway is the answer: a 404 is
-/// returned as-is (the writer is not asked, #12394), never treated as an
-/// outage.
+/// A 404 through the gateway is GitHub's answer, not an outage: the gateway
+/// is not outage-withdrawn. It is no answer for the caller either (the
+/// gateway may simply not cover the repo), so it is withdrawn for the repo as
+/// a coverage miss and, with no reader left, the read sheds. The writer is
+/// never asked (#12394).
 #[test]
 fn a_not_found_through_the_gateway_is_not_an_outage() {
     let s = stub(NOT_FOUND, OK, NOT_FOUND);
-    let (_, withdrawals) = s.run(false);
-    assert_eq!(s.calls(), ["gateway"]);
+    let (out, withdrawals) = s.run(false);
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert_eq!(s.calls(), ["gateway"], "writer stub NOT invoked");
     assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
-    assert!(withdrawals.is_empty(), "{withdrawals:?}");
+    assert!(
+        withdrawals.iter().all(|w| w.1 == Failure::Coverage),
+        "only a coverage withdrawal, never an outage: {withdrawals:?}"
+    );
 }
 
 /// A relayed GitHub 5xx, and a non-`api` read's bare `HTTP 500` (gh prints

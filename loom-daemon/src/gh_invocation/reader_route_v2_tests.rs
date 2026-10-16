@@ -18,6 +18,7 @@ const OK: &str = "echo '{}'; exit 0";
 const LIMITED: &str =
     "echo 'gh: API rate limit exceeded for installation ID 1 (HTTP 403)' >&2; exit 1";
 const NOT_FOUND: &str = "echo 'gh: Not Found (HTTP 404)' >&2; exit 1";
+const BLIND: &str = "echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1";
 
 /// A stub `gh` logging `GH_CONFIG_DIR|GH_REPO` per call, answering by dir.
 struct Pool {
@@ -149,9 +150,7 @@ impl Pool {
             }
         };
         let withdraw = |app: &str, slug: &str, f: Failure, _why: &str| {
-            if f != Failure::Coverage {
-                withdrawn.borrow_mut().insert(app.to_string());
-            }
+            withdrawn.borrow_mut().insert(app.to_string());
             log.borrow_mut()
                 .push((app.to_string(), slug.to_string(), f));
         };
@@ -437,21 +436,40 @@ fn no_pool_is_one_plain_writer_call() {
     assert_eq!(p.who(), vec![Who::Writer]);
 }
 
-// ===== a 403/404 is the reader's own answer =====
+// ===== a 403/404 is no answer: the next reader serves it, or it sheds =====
 
 #[test]
-fn a_reader_404_is_the_answer_the_writer_is_not_asked_and_nothing_is_withdrawn() {
+fn a_reader_that_cannot_see_the_repo_is_withdrawn_and_the_next_reader_serves_it() {
+    let now = SystemTime::now();
+    for refusal in [BLIND, NOT_FOUND] {
+        // reader-2 (home) refuses; reader-1 serves. The writer is not asked.
+        let p = pool(OK, refusal, OK);
+        let (out, withdrawn, _) = p.run(p.read("cov-a", ReadClass::Gate), &[], now);
+        assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+        assert_eq!(p.who(), vec![Who::R2, Who::R1], "writer stub NOT invoked");
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0].2, Failure::Coverage);
+    }
+}
+
+#[test]
+fn the_only_reader_refusing_sheds_the_read_and_never_reaches_the_writer() {
     let now = SystemTime::now();
     for class in [
         ReadClass::Gate,
         ReadClass::Hygiene,
         ReadClass::Observability,
     ] {
-        let p = pool(NOT_FOUND, NOT_FOUND, OK);
-        let (out, withdrawn, _) = p.run(p.read("cov-a", class), &[], now);
-        assert!(matches!(out, GhCompletion::Captured(_)), "{class:?}: {out:?}");
-        assert_eq!(p.who(), vec![Who::R2], "{class:?}: writer stub NOT invoked");
-        assert!(withdrawn.is_empty(), "{class:?}: {withdrawn:?}");
+        for refusal in [BLIND, NOT_FOUND] {
+            let p = pool(refusal, refusal, OK);
+            let (out, withdrawn, _) = p.run(p.read("cov-b", class), &[], now);
+            assert!(
+                matches!(out, GhCompletion::Shed { .. }),
+                "{class:?}: a refusal is not a 404 for the caller: {out:?}"
+            );
+            assert_eq!(p.who(), vec![Who::R2, Who::R1], "{class:?}: writer NOT invoked");
+            assert_eq!(withdrawn.len(), 2, "{class:?}: {withdrawn:?}");
+        }
     }
 }
 

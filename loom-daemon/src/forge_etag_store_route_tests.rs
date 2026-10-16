@@ -105,17 +105,21 @@ fn a_spilled_route_sends_the_callers_etag_and_a_mismatch_is_a_fresh_200() {
 }
 
 /// A stub where the reader (`GH_CONFIG_DIR` basename `reader-w6`) answers
-/// `404` for `pulls/5` and `200` for everything else, and the writer answers
-/// `200` for everything. Logs `<who> <url>` per call.
+/// `404` for `pulls/5` and `200` for everything else, the reader
+/// `reader-w6-blind` answers `403 Resource not accessible by integration` for
+/// everything (an installation that does not cover the repo), and the writer
+/// answers `200` for everything. Logs `<who> <url>` per call.
 fn item_stub(dir: &Path) -> (PathBuf, PathBuf) {
     let log = dir.join("item.log");
     let gh = dir.join("gh-item-stub");
     let body = format!(
         r#"#!/bin/sh
 who="$(basename "${{GH_CONFIG_DIR:-writer}}")"
-[ "$who" = reader-w6 ] || who=writer
+case "$who" in reader-w6|reader-w6-blind) ;; *) who=writer ;; esac
 echo "$who $3" >> '{log}'
 case "$who $3" in
+  "reader-w6-blind "*)
+    printf 'HTTP/2.0 403 Forbidden\r\n\r\n{{"message":"Resource not accessible by integration"}}'; exit 1 ;;
   "reader-w6 repos/acme/w6-item/pulls/5")
     printf 'HTTP/2.0 404 Not Found\r\n\r\n{{"message":"Not Found"}}'; exit 1 ;;
 esac
@@ -128,11 +132,21 @@ printf 'HTTP/2.0 200 OK\r\nEtag: "e"\r\n\r\n{{}}'
     (gh, log)
 }
 
-/// A reader `404` is the reader's own answer whether or not the read is
-/// item-scoped (W6): the writer is never asked to confirm it (#12394), so
-/// same-family evidence no longer changes what runs.
+fn calls(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A reader `404` is the item's own answer only for an item-scoped read, and
+/// only once that reader has recently served the same repo and endpoint
+/// family (W6): otherwise it may be a reader that cannot see the repo, so it
+/// is withdrawn and, with no reader left, the read sheds. The writer is never
+/// asked (#12394).
 #[test]
-fn a_reader_404_is_the_answer_for_item_scoped_and_plain_reads_alike() {
+fn a_reader_404_is_the_answer_only_for_a_covered_item() {
     let tmp = tempfile::tempdir().unwrap();
     let (gh, log) = item_stub(tmp.path());
     let reader = tmp.path().join("reader-w6");
@@ -151,29 +165,91 @@ fn a_reader_404_is_the_answer_for_item_scoped_and_plain_reads_alike() {
             .item_scoped();
     let plain =
         ConditionalRead::new("test_item_scoped", crate::forge_call_stats::ops::PR_VIEW_STATE);
-    let status = |site: ConditionalRead, url: &str| {
-        let (_, resp, _) =
-            fetch_conditional_via(site, &gh, None, &target, url, None, &route).unwrap();
-        resp.unwrap().status
+    let fetch = |site: ConditionalRead, url: &str| {
+        fetch_conditional_via(site, &gh, None, &target, url, None, &route)
     };
     let missing = "repos/acme/w6-item/pulls/5";
-    // No evidence, evidence for another family, evidence for this one, a
-    // whole-resource read: always the reader's 404, never a writer call.
-    assert_eq!(status(item, missing), 404);
-    assert_eq!(status(item, "repos/acme/w6-item/issues/1"), 200);
-    assert_eq!(status(item, missing), 404);
-    assert_eq!(status(item, "repos/acme/w6-item/pulls/6"), 200);
-    assert_eq!(status(item, missing), 404);
-    assert_eq!(status(plain, missing), 404);
+    let shed = |r: anyhow::Result<_>| {
+        r.err()
+            .is_some_and(|e| e.downcast_ref::<ReadShed>().is_some())
+    };
 
-    let calls: Vec<String> = std::fs::read_to_string(&log)
-        .unwrap()
-        .lines()
-        .map(str::to_string)
-        .collect();
-    assert!(
-        calls.iter().all(|c| c.starts_with("reader-w6 ")),
-        "writer stub NOT invoked: {calls:?}"
+    // No evidence yet: not an answer.
+    assert!(shed(fetch(item, missing)));
+    // Evidence for another family does not cover `pulls`.
+    assert_eq!(
+        fetch(item, "repos/acme/w6-item/issues/1")
+            .unwrap()
+            .1
+            .unwrap()
+            .status,
+        200
     );
-    assert_eq!(calls.len(), 6);
+    assert!(shed(fetch(item, missing)));
+    // Evidence for this family: the item's own 404.
+    assert_eq!(
+        fetch(item, "repos/acme/w6-item/pulls/6")
+            .unwrap()
+            .1
+            .unwrap()
+            .status,
+        200
+    );
+    assert_eq!(fetch(item, missing).unwrap().1.unwrap().status, 404);
+    // A read that is not item-scoped never takes a 404 as the answer.
+    assert!(shed(fetch(plain, missing)));
+
+    assert!(
+        calls(&log).iter().all(|c| c.starts_with("reader-w6 ")),
+        "writer stub NOT invoked: {:?}",
+        calls(&log)
+    );
+}
+
+/// (a) The first reader answers `403 Resource not accessible by integration`:
+/// the next reader serves the read. (b) The only reader does: the read sheds,
+/// the writer is not called, and the caller never sees a 403/404.
+#[test]
+fn a_blind_reader_is_skipped_and_with_none_left_the_read_sheds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gh, log) = item_stub(tmp.path());
+    let blind = tmp.path().join("reader-w6-blind");
+    let good = tmp.path().join("reader-w6");
+    std::fs::create_dir_all(&blind).unwrap();
+    std::fs::create_dir_all(&good).unwrap();
+    let target = Target {
+        repo: Some("acme/w6-item".to_string()),
+        host: None,
+    };
+    let site =
+        ConditionalRead::new("test_blind_reader", crate::forge_call_stats::ops::PR_VIEW_STATE);
+    let url = "repos/acme/w6-item/issues/1";
+
+    let tried = RefCell::new(Vec::<String>::new());
+    let two = |_: &RouteRequest<'_>| {
+        let (dir, app) = if tried.borrow().is_empty() {
+            (blind.clone(), "w6-blind-a")
+        } else {
+            (good.clone(), "w6-good-a")
+        };
+        tried.borrow_mut().push(app.to_string());
+        RouteDecision::Reader {
+            dir,
+            app_id: app.to_string(),
+            placement: Placement::Home,
+        }
+    };
+    let served = fetch_conditional_via(site, &gh, None, &target, url, None, &two).unwrap();
+    assert_eq!(served.1.unwrap().status, 200);
+    assert_eq!(calls(&log), vec![format!("reader-w6-blind {url}"), format!("reader-w6 {url}")]);
+
+    std::fs::remove_file(&log).unwrap();
+    let only = |_: &RouteRequest<'_>| RouteDecision::Reader {
+        dir: blind.clone(),
+        app_id: "w6-blind-b".to_string(),
+        placement: Placement::Home,
+    };
+    let err = fetch_conditional_via(site, &gh, None, &target, url, None, &only).unwrap_err();
+    assert!(err.downcast_ref::<ReadShed>().is_some(), "{err:#}");
+    assert_eq!(calls(&log), vec![format!("reader-w6-blind {url}")], "writer NOT invoked");
 }

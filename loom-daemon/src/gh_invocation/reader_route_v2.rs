@@ -13,8 +13,10 @@
 //!    [`GhCompletion::Shed`] without a request, and its caller defers it,
 //!    skips it this tick or serves it from cache.
 //!
-//! A 403/404 is the reader's own answer and is returned as-is: it is not
-//! re-run on the writer and withdraws nothing.
+//! A 403/404 ([`Failure::Coverage`]) is not an answer: a reader that cannot
+//! see the repo says the same thing, and every later read would land on it.
+//! It is withdrawn for that repo and the next reader tried; when none is left
+//! the read is shed. It is never re-run on the writer.
 //!
 //! The one read that still reaches the writer is a host with **no reader
 //! pool at all** ([`RouteDecision::NoPool`] before any reader was tried): the
@@ -172,12 +174,6 @@ impl GhInvocation {
                 // another reader would not help.
                 return Ok(first);
             };
-            if failure == Failure::Coverage {
-                // A 403/404 is the reader's own answer: the writer is not
-                // asked (#12394), and nothing confirms the resource exists
-                // for anyone, so the reader is not withdrawn either.
-                return Ok(first);
-            }
             withdraw(&app_id, &slug, failure, &why);
             tried.insert(app_id.clone());
             last_app = Some(app_id);
