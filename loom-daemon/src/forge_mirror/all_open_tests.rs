@@ -126,7 +126,6 @@ fn only_the_step_engine_may_list_every_open_item() {
     assert!(caller_may_list(Caller::StepEngine, None));
     assert!(caller_may_list(Caller::StepEngine, Some("loom:issue")));
     assert!(!caller_may_list(Caller::WorkFinder, None));
-    assert!(!caller_may_list(Caller::StageDwell, None));
     assert!(caller_may_list(Caller::WorkFinder, Some("loom:issue")));
     assert_eq!(Caller::StepEngine.as_str(), "step_engine");
     // With no mirror live the answer is `None` whoever asks.

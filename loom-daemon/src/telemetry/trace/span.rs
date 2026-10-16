@@ -212,6 +212,8 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.story.key_version"
                     | "loom.issue"
                     | "loom.pr_number"
+                    | "loom.base_sha"
+                    | "loom.head_sha"
                     | "loom.role"
                     | "loom.phase"
                     | "loom.attempt"
@@ -250,7 +252,6 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     // #12362: a Judge tick's found-work split.
                     | "loom.found_work"
                     | "loom.noop_reason"
-                    | "loom.head_sha"
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"

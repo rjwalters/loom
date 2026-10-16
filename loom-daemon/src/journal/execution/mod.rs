@@ -13,7 +13,7 @@
 //! | E10 `.loom/metrics/recovery-events.json` | `validate_phase` | `recovery.event` |
 //! | E16 `# LOOM_LAUNCH` credential attribution | `worker_spawn::run` | `claim.child_recorded` (`credential`) |
 //!
-//! (E3, the CLI `sweep-checkpoint` producer, belongs to Phase 2c.)
+//! | E3 `.loom/sweep-checkpoint/issue-N.json` | CLI `sweep-checkpoint write` | `checkpoint.completed` |
 //!
 //! # Contract
 //!
@@ -190,6 +190,7 @@ pub enum Kind {
     PrlessCleared,
     PrlessCounted,
     RecoveryEvent,
+    CheckpointCompleted,
     Divergence,
 }
 
@@ -204,6 +205,7 @@ impl Kind {
             Kind::PrlessCleared => "prless.cleared",
             Kind::PrlessCounted => "prless.counted",
             Kind::RecoveryEvent => "recovery.event",
+            Kind::CheckpointCompleted => "checkpoint.completed",
             Kind::Divergence => "journal.divergence",
         }
     }
@@ -226,10 +228,12 @@ pub enum Store {
     Recovery,
     /// E16 `# LOOM_LAUNCH` credential attribution in a sweep log.
     Launch,
+    /// E3 `sweep-checkpoint` `issue-N.json`.
+    Checkpoint,
 }
 
 impl Store {
-    pub const ALL: [Store; 7] = [
+    pub const ALL: [Store; 8] = [
         Store::Sweeps,
         Store::Owner,
         Store::Outcomes,
@@ -237,6 +241,7 @@ impl Store {
         Store::PrlessCounted,
         Store::Recovery,
         Store::Launch,
+        Store::Checkpoint,
     ];
 
     #[must_use]
@@ -249,6 +254,7 @@ impl Store {
             Store::PrlessCounted => "prless_counted",
             Store::Recovery => "recovery_events",
             Store::Launch => "launch_record",
+            Store::Checkpoint => "sweep_checkpoint",
         }
     }
 

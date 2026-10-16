@@ -418,7 +418,7 @@ fn record(
     store: &mut RefusalStore,
 ) -> PassVerdictRecord {
     let number = u64::from(evidence.number);
-    // The store is keyed by the lowercase slug, like `stage_items`' `repo`.
+    // The store is keyed by the lowercase slug, like every other lowercase repo key.
     let key = ctx.repo.to_ascii_lowercase();
     let mut first_refused_at = None;
     match p.store {

@@ -186,14 +186,11 @@ fn unresolvable_repo_id_makes_the_execution_its_own_root() {
     for sweep in &sweeps {
         assert_eq!(sweep.parent_span_id, None);
         assert_ne!(sweep.context.trace_id, name_derived);
-        for key in [
-            "loom.story_id",
-            "loom.story",
-            "loom.story.key_version",
-            "loom.issue",
-        ] {
+        for key in ["loom.story_id", "loom.story", "loom.story.key_version"] {
             assert!(!sweep.attributes.contains_key(key), "{key} must be absent");
         }
+        // #11982: the issue is a plain fact, carried without a story.
+        assert_eq!(sweep.attributes["loom.issue"], "7");
     }
     assert_ne!(sweeps[0].context.trace_id, sweeps[1].context.trace_id);
 }
