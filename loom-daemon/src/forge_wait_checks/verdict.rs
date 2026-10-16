@@ -28,6 +28,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT;
 use crate::merge_pr::check_runs_rollup;
 use crate::merge_pr::checks_failure::{self, Verdict as RequiredVerdict};
 
@@ -159,6 +160,12 @@ pub const REQUIRED_UNKNOWN: &str = "(required-contexts-unknown)";
 /// - **Empty set under `--required-only`**: falls back to the default-mode
 ///   decision over every observed check. (`gh pr checks --required` errors
 ///   with "no required checks reported" here; it never passes.)
+///
+/// **The authorization context never holds the wait** (#12526): Champion posts
+/// [`REQUIRED_CHECK_CONTEXT`] only AFTER the Judge's approval, so a Judge
+/// waiting on it for a green verdict deadlocks until timeout. Its absence or
+/// `pending` state is ignored; a posted `failure` (a revocation) still counts
+/// as failing in both modes.
 #[must_use]
 pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> Decision {
     let Some(req) = required else {
@@ -175,12 +182,17 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
     };
     let missing: Vec<String> = req
         .iter()
-        .filter(|c| !r.seen.contains(*c))
+        .filter(|c| c.as_str() != REQUIRED_CHECK_CONTEXT && !r.seen.contains(*c))
+        .cloned()
+        .collect();
+    let pending: Vec<String> = r
+        .pending
+        .iter()
+        .filter(|p| p.as_str() != REQUIRED_CHECK_CONTEXT)
         .cloned()
         .collect();
     if required_only && !req.is_empty() {
-        let mut waiting: Vec<String> = r
-            .pending
+        let mut waiting: Vec<String> = pending
             .iter()
             .filter(|p| req.contains(p))
             .cloned()
@@ -195,8 +207,8 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
     if !r.failing.is_empty() {
         return Decision::Red(r.failing.clone());
     }
-    if !r.pending.is_empty() {
-        return Decision::Pending(r.pending.clone());
+    if !pending.is_empty() {
+        return Decision::Pending(pending);
     }
     if !missing.is_empty() {
         return Decision::Pending(missing);
