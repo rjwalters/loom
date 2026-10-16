@@ -48,6 +48,19 @@ pub struct TickSummary {
     /// #10880: the held-roll alert this tick raised (ERROR below the floor,
     /// WARN otherwise). Set on every tick the roll stays held.
     pub roll_held: Option<RollHeld>,
+    /// #12425: the tick armed a same-binary restart for restart-required
+    /// config.
+    pub config_restart: Option<ConfigRestartFacts>,
+}
+
+/// What a `config_restart` tick reports: the trigger and how many paths
+/// asked for it. Never the paths' values, nor the paths themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigRestartFacts {
+    /// The roll's `target_source`.
+    pub source: &'static str,
+    /// How many restart-required paths are in the demand.
+    pub paths: usize,
 }
 
 impl TickSummary {
@@ -76,6 +89,7 @@ impl TickSummary {
             floor_alerted: false,
             floor_not_rolling: None,
             roll_held: None,
+            config_restart: None,
         }
     }
 
@@ -130,6 +144,8 @@ pub fn record(
         floor_stall: summary.floor_stall.clone(),
         floor_not_rolling: summary.floor_not_rolling,
         roll_held: summary.roll_held.clone(),
+        target_source: summary.config_restart.map(|c| c.source.to_string()),
+        config_restart_paths: summary.config_restart.map(|c| c.paths as u64),
         consecutive_failures,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         loom,

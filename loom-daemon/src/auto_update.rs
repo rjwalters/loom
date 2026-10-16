@@ -602,6 +602,8 @@ mod nice;
 /// #11042: the unsupervised re-download guard and the typed not-rolling reason.
 pub mod not_rolling;
 use nice::nice_child;
+/// #12425: arm the pause-and-roll from the restart-required config demand.
+mod config_restart;
 /// #10880: the failed-roll guard (attempt record, gate, held-roll alert).
 pub mod roll_attempt;
 
@@ -1137,6 +1139,13 @@ pub enum TickDecision {
         /// deferred in the first place (Issue #8252) — it just runs politely.
         low_priority: bool,
     },
+    /// Restart-required config changed since boot and no version roll is
+    /// arming (#12425): restart onto the same binary through the one
+    /// pause-and-roll path. No fetch, no gate.
+    ConfigRestart {
+        /// The restart-required dotted paths (never values).
+        paths: Vec<String>,
+    },
 }
 
 /// One tick's probe readings, as [`AutoUpdateState::decide`] consumes them.
@@ -1228,6 +1237,9 @@ pub struct AutoUpdateState {
     unsupervised: not_rolling::UnsupervisedStage,
     /// #10880: the last version roll armed, persisted, and its retry gate.
     attempt: roll_attempt::AttemptGuard,
+    /// #12425: the restart-required config demand this tick may arm a
+    /// same-binary restart for (`None` unless the host writes its config).
+    config_restart: Option<crate::fleet_sync::config_restart::ConfigRestartDemand>,
 }
 
 impl AutoUpdateState {

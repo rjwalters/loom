@@ -40,6 +40,8 @@ pub const AUTO_UPDATE_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.auto_update.drain_pending",
     "loom.auto_update.drain_refusals",
     "loom.auto_update.drain_target",
+    "loom.auto_update.target_source",
+    "loom.auto_update.config_restart_paths",
     "loom.auto_update.consecutive_failures",
     "loom.auto_update.duration_ms",
     "loom.auto_update.version",
@@ -66,6 +68,9 @@ pub enum TickDecisionKind {
     Rebuild,
     /// A roll or drain is already armed; the tick leaves it to finish.
     DrainWait,
+    /// Restart-required config changed since boot and the tick armed a
+    /// same-binary restart for it (#12425).
+    ConfigRestart,
     /// The tick panicked. The loop recorded it and keeps running.
     Panic,
 }
@@ -81,6 +86,7 @@ impl TickDecisionKind {
             Self::Fetch => "fetch",
             Self::Rebuild => "rebuild",
             Self::DrainWait => "drain_wait",
+            Self::ConfigRestart => "config_restart",
             Self::Panic => "panic",
         }
     }
@@ -242,6 +248,13 @@ pub struct AutoUpdateTickRecord {
     /// Raises the record to ERROR when floor-driven, else WARN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_held: Option<RollHeld>,
+    /// #12425: the roll's `target_source` on a `config_restart` tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_source: Option<String>,
+    /// #12425: how many restart-required paths asked for the restart. A
+    /// count, never the paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_restart_paths: Option<u64>,
     /// Consecutive retryable failures for the tracked target.
     pub consecutive_failures: u32,
     /// Wall time the tick took, milliseconds.

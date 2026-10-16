@@ -1111,6 +1111,8 @@ mod supersede_tick;
 mod running_basis;
 // Floor-driven roll targets (#10712).
 mod floor_roll;
+// Restart-required config arms a same-binary restart (#12425).
+mod config_restart;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
