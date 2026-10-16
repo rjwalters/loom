@@ -121,6 +121,91 @@ fn a_duplicate_claim_from_the_holder_is_an_idempotent_regrant() {
 }
 
 #[test]
+fn a_same_step_regrant_returns_the_same_id_and_renews_the_row() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 4));
+    let first = granted_id(&t.claim(at(100), A, "acme/w", 7, "doctor", Some(40)));
+    for when in [150, 300] {
+        let d = t.claim(at(when), A, "acme/w", 7, "doctor", Some(40));
+        assert!(matches!(d, ClaimDecision::Granted { renewed: true, .. }), "{d:?}");
+        assert_eq!(granted_id(&d), first);
+        let row = t.row("acme/w", 7).unwrap();
+        assert_eq!(row.step, "doctor");
+        assert_eq!(row.deadline, at(when + 1200));
+    }
+    assert_eq!(t.held_by(A), 1);
+}
+
+/// The Judge's reproduction on #12465: a host's own stale row must not let a
+/// different step skip the merge lock and `roles_ok`.
+#[test]
+fn a_different_step_on_an_own_item_cannot_bypass_the_merge_lock_or_roles_ok() {
+    let mut t = open_table();
+    t.heartbeat(at(100), B, &hb(B, vec![], 8));
+    let mut beat = hb(A, vec![], 8);
+    beat.roles_ok = vec!["judge".into()];
+    t.heartbeat(at(100), A, &beat);
+    granted_id(&t.claim(at(100), B, "acme/w", 10, "champion_merge", Some(40)));
+    // A's `judge` on PR 11, whose `release` was lost: the row lives on.
+    let judge = granted_id(&t.claim(at(100), A, "acme/w", 11, "judge", Some(40)));
+
+    let d = t.claim(at(110), A, "acme/w", 11, "champion_merge", Some(40));
+    assert_eq!(refusal(&d), (RefusalReason::Held, Some(B.to_string())));
+    let merges = t
+        .rows()
+        .iter()
+        .filter(|((repo, _), row)| repo == "acme/w" && row.step == "champion_merge")
+        .count();
+    assert_eq!(merges, 1, "exactly one champion_merge row in the repo");
+    // The refused claim left A's row exactly as it was.
+    let row = t.row("acme/w", 11).unwrap();
+    assert_eq!(row.step, "judge");
+    assert_eq!(row.assignment_id, judge);
+
+    // With the merge lock gone, `roles_ok` still refuses it.
+    let merge = t.row("acme/w", 10).unwrap().assignment_id.clone();
+    assert!(t.release(B, &merge));
+    let d = t.claim(at(120), A, "acme/w", 11, "champion_merge", Some(40));
+    assert_eq!(refusal(&d).0, RefusalReason::NotEligible);
+    assert_eq!(t.row("acme/w", 11).unwrap().step, "judge");
+}
+
+#[test]
+fn a_different_step_on_an_own_item_is_a_new_grant_through_the_cap() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 1));
+    let judge = granted_id(&t.claim(at(100), A, "acme/w", 7, "judge", Some(40)));
+    // At its cap of 1: the new step replaces the row, so it fits.
+    let d = t.claim(at(110), A, "acme/w", 7, "doctor", Some(40));
+    assert!(matches!(d, ClaimDecision::Granted { renewed: false, .. }), "{d:?}");
+    let doctor = granted_id(&d);
+    assert_ne!(doctor, judge, "a different step is a new assignment");
+    let row = t.row("acme/w", 7).unwrap();
+    assert_eq!((row.step.as_str(), row.state), ("doctor", RowState::Granted));
+    assert_eq!(t.held_by(A), 1);
+    assert!(!t.release(A, &judge), "the replaced assignment is gone");
+
+    // Holding two rows against a limit of one, a step change on either is
+    // over the cap and changes nothing.
+    t.heartbeat(
+        at(120),
+        A,
+        &hb(
+            A,
+            vec![
+                live("acme/w", 7, "doctor", Some(&doctor)),
+                live("acme/w", 8, "builder", None),
+            ],
+            0,
+        ),
+    );
+    let d = t.claim(at(130), A, "acme/w", 7, "judge", Some(1));
+    assert_eq!(refusal(&d).0, RefusalReason::Cap);
+    let row = t.row("acme/w", 7).unwrap();
+    assert_eq!((row.step.as_str(), row.assignment_id.as_str()), ("doctor", doctor.as_str()));
+}
+
+#[test]
 fn one_champion_merge_per_repo_fleet_wide() {
     let mut t = open_table();
     t.heartbeat(at(100), A, &hb(A, vec![], 8));

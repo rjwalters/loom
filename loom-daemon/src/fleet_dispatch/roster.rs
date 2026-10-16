@@ -5,30 +5,37 @@
 //! ([`crate::fleet_store::compiled`]), the same document every other fleet
 //! fact comes from:
 //!
-//! - **Who may call:** `dispatch.dispatchers`, one entry per dispatching host.
-//!   An entry is an object naming the host and its tailnet node:
+//! - **Who may call:** `dispatch.dispatchers`, a list of host-name strings,
+//!   joined to each host's `hosts[]` record for its `host_id` and its optional
+//!   `tailnet_node`:
 //!
 //!   ```json
-//!   {"dispatch": {"dispatchers": [
-//!     {"host_id": "worker-a", "tailnet_node": "worker-a-node"}
-//!   ]}}
+//!   {"dispatch": {"dispatchers": ["worker-a"]},
+//!    "hosts": [{"name": "worker-a", "host_id": "worker-a", "tailnet_node": "node-17"}]}
 //!   ```
 //!
-//!   The entries are read by [`crate::fleet_store::dispatchers`]. The node
-//!   is matched against the `whois` node's MagicDNS name, either
-//!   whole (`worker-a-node.example.ts.net`, trailing dot ignored) or its first
-//!   label, ASCII case-insensitively. The node name is **never** assumed to be
-//!   the `host_id` (they diverge for operator machines and re-imaged hosts;
-//!   spec §5.1, §11). A bare-string entry (`"worker-a"`, the older shape)
-//!   names a dispatcher with no node, so it cannot call until its entry gains
-//!   `tailnet_node`. A node no entry maps is refused `403`.
+//!   Both are read by [`crate::fleet_store::dispatchers`]; the list's element
+//!   type is never changed, because the store's schema, render step,
+//!   dashboard and shell tooling read it as strings. The node is matched
+//!   against the `whois` node's MagicDNS name, either whole
+//!   (`node-17.example.ts.net`, trailing dot ignored) or its first label,
+//!   ASCII case-insensitively. The node name is **never** assumed to be the
+//!   `host_id` (they diverge for operator machines and re-imaged hosts;
+//!   spec §5.1, §11). A dispatcher with no host record, or whose record has
+//!   no `host_id` or no `tailnet_node`, is unresolved
+//!   ([`Roster::unresolved`]): nothing maps to it, so it cannot call, and the
+//!   server warns at start. A node no dispatcher maps is refused `403`.
 //! - **Its cap:** `autonomous.workFinder.maxConcurrent`, resolved per host as
 //!   a host renders it: `config.hosts.<host>.local` over
 //!   `config.hosts.<host>.defaults` over `config.defaults`.
 //! - **Whether it is in fleet mode:** `fleetDispatch.enabled`, resolved the
-//!   same way. The grace window ends early once every fleet-mode host has
-//!   heartbeated; a host not in fleet mode never calls, so waiting for it
-//!   would only ever run the window to its time bound.
+//!   same way. The grace window ends early once every fleet-mode host that
+//!   can call has heartbeated; a host not in fleet mode, or unresolved, never
+//!   calls, so waiting for it would only ever run the window to its time
+//!   bound.
+//!
+//! The config tiers (`config.hosts.<name>`) are keyed by the host's name;
+//! the roster is keyed by its `host_id`, the id a caller's body carries.
 //!
 //! [`RosterSource`] is the seam: the server reloads through it, and tests
 //! inject a fixed roster.
@@ -46,8 +53,9 @@ use crate::fleet_store::dispatchers::{self, normalise_node as normalise};
 /// One dispatching host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterHost {
-    /// The tailnet node name, lower-cased, trailing dot trimmed. `None` for a
-    /// bare-string entry: the host cannot call.
+    /// The tailnet node name, lower-cased, trailing dot trimmed. `None` for
+    /// an unresolved dispatcher (no host record, `host_id` or node): the
+    /// host cannot call.
     pub tailnet_node: Option<String>,
     /// `autonomous.workFinder.maxConcurrent` for the host, when configured.
     pub max_concurrent: Option<u32>,
@@ -77,26 +85,31 @@ impl Roster {
     }
 
     /// Read the roster from a compiled `fleet.json`. Fails when
-    /// `dispatch.dispatchers` is missing or malformed, or two entries claim
-    /// one host or one node: an ambiguous map is never guessed at.
+    /// `dispatch.dispatchers` or `hosts` is missing or malformed, or the map
+    /// is ambiguous (a host named twice, or two dispatchers whose nodes could
+    /// match one `whois` name): an ambiguous map is never guessed at.
     pub fn from_compiled(doc: &Compiled) -> Result<Self> {
         let hosts = dispatchers::from_compiled(doc)?
             .into_iter()
             .map(|d| {
                 let host = RosterHost {
-                    tailnet_node: d.tailnet_node,
+                    tailnet_node: if d.unresolved() {
+                        None
+                    } else {
+                        d.tailnet_node.clone()
+                    },
                     max_concurrent: tiered(
                         doc,
-                        &d.host_id,
+                        &d.name,
                         &["autonomous", "workFinder", "maxConcurrent"],
                     )
                     .and_then(Value::as_u64)
                     .and_then(|n| u32::try_from(n).ok()),
-                    fleet_mode: tiered(doc, &d.host_id, &["fleetDispatch", "enabled"])
+                    fleet_mode: tiered(doc, &d.name, &["fleetDispatch", "enabled"])
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                 };
-                (d.host_id, host)
+                (d.id().to_string(), host)
             })
             .collect();
         Ok(Self { hosts })
@@ -132,12 +145,24 @@ impl Roster {
         self.hosts.keys().cloned().collect()
     }
 
-    /// Roster hosts in fleet mode: the hosts the grace window waits for.
+    /// Roster hosts in fleet mode that can call: the hosts the grace window
+    /// waits for.
     #[must_use]
     pub fn fleet_mode_hosts(&self) -> BTreeSet<String> {
         self.hosts
             .iter()
-            .filter(|(_, h)| h.fleet_mode)
+            .filter(|(_, h)| h.fleet_mode && h.tailnet_node.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Roster hosts no tailnet node maps to (no host record, `host_id` or
+    /// `tailnet_node`): every call from them is refused `403`.
+    #[must_use]
+    pub fn unresolved(&self) -> Vec<String> {
+        self.hosts
+            .iter()
+            .filter(|(_, h)| h.tailnet_node.is_none())
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -223,13 +248,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    pub(crate) fn fleet_json(dispatchers: Value) -> Compiled {
+    /// A `fleet.json` with `dispatchers` and the host records `hosts`.
+    pub(crate) fn fleet_json(dispatchers: Value, hosts: Value) -> Compiled {
         let doc = json!({
             "_generated": {"schema_version": 1},
             "root": "~/src",
             "repos": [],
             "state": {},
             "dispatch": {"dispatchers": dispatchers},
+            "hosts": hosts,
             "config": {
                 "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 20}}},
                 "hosts": {
@@ -239,12 +266,21 @@ mod tests {
                                   "fleetDispatch": {"enabled": true, "url": "http://c:1"}}
                     },
                     "worker-b": {
-                        "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 8}}}
+                        "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 8}}},
+                        "local": {"fleetDispatch": {"enabled": true}}
                     }
                 }
             }
         });
         crate::fleet_store::compiled::parse(&doc.to_string()).unwrap()
+    }
+
+    fn record(name: &str, host_id: &str, node: Option<&str>) -> Value {
+        let mut r = json!({"name": name, "host_id": host_id, "role": "worker"});
+        if let Some(n) = node {
+            r["tailnet_node"] = json!(n);
+        }
+        r
     }
 
     fn node(name: &str) -> TailnetNode {
@@ -256,53 +292,118 @@ mod tests {
     }
 
     #[test]
-    fn nodes_map_through_the_explicit_field_never_by_host_id() {
-        let roster = Roster::from_compiled(&fleet_json(json!([
-            {"host_id": "worker-a", "tailnet_node": "node-17"},
-            {"host_id": "worker-b", "tailnet_node": "Node-18.Example.ts.net."},
-            "worker-c"
-        ])))
+    fn nodes_map_through_the_host_record_never_by_host_id() {
+        let roster = Roster::from_compiled(&fleet_json(
+            json!(["worker-a", "worker-b", "worker-c", "worker-d"]),
+            json!([
+                record("worker-a", "worker-a", Some("node-17")),
+                record("worker-b", "host-b", Some("Node-18.Example.ts.net.")),
+                record("worker-c", "worker-c", None),
+                record("not-a-dispatcher", "x", Some("node-99"))
+            ]),
+        ))
         .unwrap();
         assert_eq!(roster.host_for(&node("node-17.example.ts.net.")), Some("worker-a"));
-        assert_eq!(roster.host_for(&node("node-17")), Some("worker-a"));
-        assert_eq!(roster.host_for(&node("node-18.example.ts.net")), Some("worker-b"));
+        assert_eq!(roster.host_for(&node("NODE-17")), Some("worker-a"));
+        // Keyed by the record's host_id, not the dispatcher name.
+        assert_eq!(roster.host_for(&node("node-18.example.ts.net")), Some("host-b"));
         // The host id is not a node name.
         assert_eq!(roster.host_for(&node("worker-a.example.ts.net.")), None);
-        // A bare-string entry has no node, so nothing maps to it.
+        // A record without a node, and a dispatcher without a record, are
+        // unresolved: nothing maps to them.
         assert_eq!(roster.host_for(&node("worker-c.example.ts.net.")), None);
+        assert_eq!(roster.host_for(&node("worker-d")), None);
+        // A host that is not a dispatcher cannot call.
+        assert_eq!(roster.host_for(&node("node-99")), None);
         assert_eq!(roster.host_for(&node("")), None);
-        assert_eq!(roster.host_ids().len(), 3);
+        assert_eq!(roster.host_ids().len(), 4);
         assert_eq!(roster.callable(), 2);
+        assert_eq!(roster.unresolved(), vec!["worker-c".to_string(), "worker-d".to_string()]);
     }
 
     #[test]
-    fn max_concurrent_follows_the_render_tiers() {
-        let roster = Roster::from_compiled(&fleet_json(json!([
-            {"host_id": "worker-a", "tailnet_node": "n-a"},
-            {"host_id": "worker-b", "tailnet_node": "n-b"},
-            {"host_id": "worker-c", "tailnet_node": "n-c"}
-        ])))
+    fn max_concurrent_and_fleet_mode_follow_the_render_tiers_by_name() {
+        let roster = Roster::from_compiled(&fleet_json(
+            json!(["worker-a", "worker-b", "worker-c"]),
+            json!([
+                record("worker-a", "id-a", Some("n-a")),
+                record("worker-b", "id-b", None),
+                record("worker-c", "id-c", Some("n-c"))
+            ]),
+        ))
         .unwrap();
-        assert_eq!(roster.max_concurrent("worker-a"), Some(40), "local wins");
-        assert_eq!(roster.max_concurrent("worker-b"), Some(8), "host defaults next");
-        assert_eq!(roster.max_concurrent("worker-c"), Some(20), "fleet defaults last");
+        assert_eq!(roster.max_concurrent("id-a"), Some(40), "local wins");
+        assert_eq!(roster.max_concurrent("id-b"), Some(8), "host defaults next");
+        assert_eq!(roster.max_concurrent("id-c"), Some(20), "fleet defaults last");
         assert_eq!(roster.max_concurrent("stranger"), None);
+        // worker-b is in fleet mode but cannot call, so grace never waits on it.
         let fleet_mode: Vec<String> = roster.fleet_mode_hosts().into_iter().collect();
-        assert_eq!(fleet_mode, vec!["worker-a".to_string()]);
+        assert_eq!(fleet_mode, vec!["id-a".to_string()]);
+    }
+
+    #[test]
+    fn a_store_without_host_records_leaves_every_dispatcher_unresolved() {
+        let roster =
+            Roster::from_compiled(&fleet_json(json!(["worker-a", "worker-b"]), Value::Null))
+                .unwrap();
+        assert_eq!(roster.callable(), 0);
+        assert_eq!(roster.unresolved().len(), 2);
+        assert!(roster.fleet_mode_hosts().is_empty());
     }
 
     #[test]
     fn an_ambiguous_or_malformed_roster_is_refused() {
-        for bad in [
-            json!([{"host_id": "a", "tailnet_node": "n"}, {"host_id": "b", "tailnet_node": "N"}]),
-            json!(["a", {"host_id": "a", "tailnet_node": "n"}]),
-            json!([{"tailnet_node": "n"}]),
-            json!([{"host_id": "a", "tailnet_node": 3}]),
-            json!([""]),
-            json!([4]),
-            json!("a"),
+        let two = json!(["a", "b"]);
+        for (dispatchers, hosts) in [
+            // The node's short and full forms are one node.
+            (
+                two.clone(),
+                json!([
+                    record("a", "a", Some("n")),
+                    record("b", "b", Some("N.example.ts.net."))
+                ]),
+            ),
+            (
+                two.clone(),
+                json!([
+                    record("a", "a", Some("n.example.ts.net")),
+                    record("b", "b", Some("n"))
+                ]),
+            ),
+            (two.clone(), json!([record("a", "a", Some("n")), record("b", "b", Some("N."))])),
+            // Two dispatchers, one host id.
+            (two.clone(), json!([record("a", "x", Some("n1")), record("b", "x", Some("n2"))])),
+            // Two records with one name.
+            (
+                json!(["a"]),
+                json!([record("a", "a", Some("n1")), record("a", "a2", Some("n2"))]),
+            ),
+            // Malformed records.
+            (json!(["a"]), json!([{"name": "a", "host_id": "a", "tailnet_node": 3}])),
+            (json!(["a"]), json!([{"name": "a", "host_id": "a", "tailnet_node": " "}])),
+            (json!(["a"]), json!([{"name": "a", "host_id": 4}])),
+            (json!(["a"]), json!(["a"])),
+            (json!(["a"]), json!({"a": {}})),
+            // The list stays strings: the object form is gone.
+            (json!([{"host_id": "a", "tailnet_node": "n"}]), json!([])),
+            (json!(["a", "a"]), json!([])),
+            (json!([""]), json!([])),
+            (json!([4]), json!([])),
+            (json!("a"), json!([])),
         ] {
-            assert!(Roster::from_compiled(&fleet_json(bad.clone())).is_err(), "{bad}");
+            let doc = fleet_json(dispatchers.clone(), hosts.clone());
+            assert!(Roster::from_compiled(&doc).is_err(), "{dispatchers} / {hosts}");
         }
+        // Distinct full names sharing a first label are distinct nodes: a
+        // `whois` name matches at most one of them.
+        let ok = fleet_json(
+            two,
+            json!([
+                record("a", "a", Some("n.one.ts.net")),
+                record("b", "b", Some("n.two.ts.net"))
+            ]),
+        );
+        let roster = Roster::from_compiled(&ok).unwrap();
+        assert_eq!(roster.host_for(&node("n.two.ts.net")), Some("b"));
     }
 }

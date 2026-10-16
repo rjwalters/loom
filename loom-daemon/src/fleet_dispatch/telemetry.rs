@@ -8,7 +8,8 @@
 //!   same name says `worker`.
 //! - Counters, accumulated and flushed as delta points by the server's sweep
 //!   task: `loom.fleet_dispatch.refusals` by `reason` (claim refusals and
-//!   `refuse` tokens, `kind` = `claim` / `refuse`),
+//!   `refuse` tokens, `kind` = `claim` / `refuse`; `reason` is bounded to the
+//!   known tokens, anything else is `other`),
 //!   `loom.fleet_dispatch.expired` by `kind` (`assignment` / `hold`) and
 //!   `loom.fleet_dispatch.claim_lost_after_grant`.
 //!
@@ -19,6 +20,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 
+use super::proto::{RefusalReason, REFUSE_REASONS};
 use crate::step_role::StepRole;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
@@ -131,18 +133,24 @@ pub struct Counters {
 
 impl Counters {
     /// Count a claim refusal.
-    pub fn claim_refused(&mut self, reason: &str) {
+    pub fn claim_refused(&mut self, reason: RefusalReason) {
         *self
             .refusals
-            .entry(("claim", reason.to_string()))
+            .entry(("claim", reason.as_str().to_string()))
             .or_default() += 1;
     }
 
-    /// Count a `refuse` call's token.
+    /// Count a `refuse` call's token: one of [`REFUSE_REASONS`], or `other`.
+    /// The token is worker-supplied, so it is never a label as sent.
     pub fn refused(&mut self, reason: &str) {
+        let label = REFUSE_REASONS
+            .iter()
+            .find(|r| **r == reason)
+            .copied()
+            .unwrap_or(RefusalReason::Other.as_str());
         *self
             .refusals
-            .entry(("refuse", reason.to_string()))
+            .entry(("refuse", label.to_string()))
             .or_default() += 1;
     }
 
@@ -246,8 +254,8 @@ mod tests {
     #[test]
     fn counters_flush_as_labelled_deltas_once() {
         let mut c = Counters::default();
-        c.claim_refused("held");
-        c.claim_refused("held");
+        c.claim_refused(RefusalReason::Held);
+        c.claim_refused(RefusalReason::Held);
         c.refused("claim_lost");
         c.expired(super::super::table::Expired {
             assignments: 2,
@@ -263,5 +271,20 @@ mod tests {
         assert_eq!(held.name, MetricName::FleetDispatchRefusals);
         assert_eq!(held.labels.get("kind").map(String::as_str), Some("claim"));
         assert!(c.take_points().is_empty(), "flushed counters reset");
+    }
+
+    #[test]
+    fn an_unknown_refuse_token_is_counted_as_other() {
+        let mut c = Counters::default();
+        c.refused("head_moved");
+        for junk in ["x-1", "x-2", "", "claim_lost "] {
+            c.refused(junk);
+        }
+        let labels: Vec<(&str, &str, i64)> = c
+            .refusals
+            .iter()
+            .map(|((k, r), n)| (*k, r.as_str(), *n))
+            .collect();
+        assert_eq!(labels, vec![("refuse", "head_moved", 1), ("refuse", "other", 4)]);
     }
 }
