@@ -17,7 +17,6 @@ use super::*;
 const FLOOR: u64 = 20;
 const STEP: u64 = 10;
 const CEILING: usize = 12;
-const RAM: usize = 64;
 const COOLDOWN: u64 = 600;
 
 fn t(secs: i64) -> DateTime<Utc> {
@@ -32,7 +31,6 @@ fn disk_term(free: Option<u64>) -> usize {
 fn reading(free: Option<u64>) -> TickReading {
     TickReading {
         disk: disk_term(free),
-        ram: RAM,
         configured_max: CEILING,
         free_gb: free,
         floor_gb: FLOOR,
@@ -178,7 +176,7 @@ impl Sim {
             pass = Some(report);
         }
         self.trigger
-            .observe(disk_axis_binds_cap_down(disk, RAM, CEILING), free_now, pass.as_ref());
+            .observe(disk_axis_binds_cap_down(disk, CEILING), free_now, pass.as_ref());
     }
 }
 
@@ -207,7 +205,7 @@ fn test_rearms_while_disk_keeps_binding_and_free_space_falls() {
         ]
     );
     // The edge-only rule this replaces would have fired none of them.
-    assert!(!should_trigger(true, disk_term(Some(19)), RAM, CEILING));
+    assert!(!should_trigger(true, disk_term(Some(19)), CEILING));
 }
 
 #[test]
@@ -218,7 +216,6 @@ fn test_below_floor_fires_even_when_the_disk_term_does_not_bind() {
     let trigger = EagerTrigger::default();
     let r = TickReading {
         disk: 2,
-        ram: RAM,
         configured_max: 2,
         free_gb: Some(17),
         floor_gb: FLOOR,
@@ -620,7 +617,7 @@ fn test_the_edge_rearms_from_the_admission_term() {
     let mut trigger = EagerTrigger::default();
     let disk = trigger.settle(&before, Some(&report), || admission_term(40, 1, 0));
     assert_eq!(disk, 37);
-    assert!(disk_axis_binds_cap_down(disk_term(Some(40)), RAM, CEILING));
+    assert!(disk_axis_binds_cap_down(disk_term(Some(40)), CEILING));
     assert_eq!(trigger, EagerTrigger::default(), "disarmed by the admission term");
 
     // A heavy sweep is admitted: same 40G free, the admission term now binds.

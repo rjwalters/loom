@@ -104,10 +104,6 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from config at every work-finder tick (#12256) —
     // `step_dispatch::gather_budget::gather_concurrency`, never cached.
     ("autonomous.workFinder.gatherConcurrency", Reloadability::Live),
-    // Read from config at every multi-workspace work-finder tick (#12330) —
-    // `ram_headroom::ram_admission_config`, never cached.
-    ("autonomous.workFinder.ramAdmission", Reloadability::Live),
-    ("autonomous.workFinder.ramChargeGb", Reloadability::Live),
     // Read from config at every work-finder tick (#12298) —
     // `step_dispatch::gather_budget::spawn_concurrency`, never cached.
     ("autonomous.workFinder.spawnConcurrency", Reloadability::Live),
@@ -195,13 +191,6 @@ mod tests {
         assert_eq!(classify("autonomous.workFinder.extraSkipLabels"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.redFixEscalateAfterSecs"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.landedPrefilter"), Reloadability::Live);
-    }
-
-    /// #12330: the RAM admission model and flat charge hot-reload.
-    #[test]
-    fn work_finder_ram_admission_keys_are_live() {
-        assert_eq!(classify("autonomous.workFinder.ramAdmission"), Reloadability::Live);
-        assert_eq!(classify("autonomous.workFinder.ramChargeGb"), Reloadability::Live);
     }
 
     #[test]

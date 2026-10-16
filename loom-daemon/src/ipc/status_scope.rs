@@ -62,7 +62,6 @@ pub(super) struct MachineCaps {
     pub token_pool_size: usize,
     pub token_pool_dir: Option<PathBuf>,
     pub disk_headroom: usize,
-    pub ram_headroom: usize,
     pub configured_max: usize,
     pub logical_cpus: usize,
     pub loadavg_1m: Option<f64>,
@@ -142,14 +141,10 @@ pub(super) fn machine_caps(
     }
     if sections.needs_host_headroom() {
         caps.disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
-        // RAM headroom (#5270): the second "dumb mode" machine-headroom axis,
-        // folded into `dynamic_cap` alongside disk headroom.
-        caps.ram_headroom = crate::ram_headroom::ram_headroom_limit();
         // `needs_host_headroom` implies `needs_work_finder_config`, so
         // `configured_max` is resolved here.
         caps.dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
             caps.disk_headroom,
-            caps.ram_headroom,
             caps.configured_max,
         );
         // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is

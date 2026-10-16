@@ -3314,7 +3314,7 @@ conditions, each keyed and alerted independently:
 | `tokens-zero-healthy` | zero healthy token accounts | `auth_401` (blocked by an auth-class `.bad_tokens` entry such as `auth-dead: 401`, or with no `.bad_tokens` history; never self-heals): re-auth / `tokens import-from-monitor` / `tokens unblock`; exhausted: wait or add accounts; empty pool: `tokens bootstrap` |
 | `dispatch-halted` | main-health gate halted, or the last tick halted while tokens are still available | read `health`'s dispatch section |
 | `roles-persistent` | one or more roles with PERSISTENT tick failures | a launch refused for a missing guarded-canary receipt (exit 78) is named as a runtime/version mismatch (`runtimes.default`, opencode version) |
-| `capacity-limited` | disk or RAM headroom holds the effective cap below the configured `maxConcurrent` (#10214; even with nothing waiting) | which term, the effective vs. configured cap, how many ready issues wait; free disk / RAM or add capacity |
+| `capacity-limited` | disk headroom holds the effective cap below the configured `maxConcurrent` (#10214; even with nothing waiting) | the effective vs. configured cap, how many ready issues wait; free disk or add capacity |
 
 The `star-backlog` ask (#10214) was retired with the operator star (#11510):
 priority only orders the queue, and `loom:very-important` is capped at one
@@ -4734,7 +4734,7 @@ fleet-gitops can retune a live daemon without a restart:
 
 | Live (re-read every tick) | Restart required |
 |---------------------------|------------------|
-| `maxConcurrent`, `maxConcurrentPerRepo`, `maxAdmissionsPerTick` (and their `hyperparameters.dispatch` homes), `ramAdmission`, `ramChargeGb`, `extraSkipLabels`, `redFixEscalateAfterSecs`, `landedPrefilter`, `saturationBrake.*`, `autonomous.hostBreaker.*` | `enabled`, `intervalSecs` / `hyperparameters.dispatch.tickIntervalSecs`, every `LOOM_*` env override |
+| `maxConcurrent`, `maxConcurrentPerRepo`, `maxAdmissionsPerTick` (and their `hyperparameters.dispatch` homes), `extraSkipLabels`, `redFixEscalateAfterSecs`, `landedPrefilter`, `saturationBrake.*`, `autonomous.hostBreaker.*` | `enabled`, `intervalSecs` / `hyperparameters.dispatch.tickIntervalSecs`, every `LOOM_*` env override |
 
 `loom-daemon fleet-config render` classifies a changed path from the same
 table in code (`fleet_store::reload`).
@@ -4770,7 +4770,6 @@ touching running work.
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
 | **disk headroom** | since #11191, `sweeps in flight + floor((free - floor - reserved) / smallest repo charge)` on the worktree-root volume, with each repo charged its own measured footprint — see [Disk admission](#disk-admission-11191) (`disk_admission::tick`). With `LOOM_DISK_ADMISSION=0`, or when free space is unmeasurable, the legacy `floor(free_gb / LOOM_PER_WORKTREE_GB)` (default 8 GB, #8370; `disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold, counting the growth the running sweeps have still to write |
-| **ram headroom** (#5270) | by `autonomous.workFinder.ramAdmission` (#12330): `observed` (default) charges each repo its observed peak and reserves the in-flight sweeps' unrealised peaks (#11094); `flat` charges every sweep, running or new, `ramChargeGb`; `off` drops the term. With no history it is `floor(available_gb / charge)` on the host's currently-available memory (`ram_headroom::ram_headroom_limit`, modeled on `disk_headroom`'s shape: `/proc/meminfo`'s `MemAvailable` on Linux, `vm_stat` free+inactive pages × page size on macOS) | never provision more worktrees than available RAM can hold; the second "dumb mode" machine-headroom axis alongside disk |
 | **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | the per-machine **sweep-dispatch** admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: bytes of disk and bytes of RAM). **Not the whole host's agent budget**: role-runner agents are admitted outside this formula entirely (#6102) |
 
 Retired as cap inputs (informational-only now — see `capacity::token_axis_limit` / `tokens_pool::select`):
@@ -4986,9 +4985,12 @@ actually is**:
 
 1. **Sweep admission is one per-machine knob.** `autonomous.workFinder.maxConcurrent`
    is the whole *sweep* policy, tuned empirically by the operator (expect 10+ on an
-   8-core API-bound worker). The two remaining terms — disk headroom and (since
-   #5270) RAM headroom — stay because they meter genuinely *exhaustible*
-   resources (bytes), not an estimate. (The token axis sat here too until
+   8-core API-bound worker). The one remaining term — disk headroom — stays
+   because it meters a genuinely *exhaustible* resource (bytes), not an
+   estimate. RAM headroom (#5270, #11094) was removed in #12330: it reserved
+   every in-flight sweep's worst observed build peak at once and capped idle
+   hosts near 1; RAM is watched from outside instead (host memory pressure),
+   by adjusting `maxConcurrent`. (The token axis sat here too until
    #5270 removed it — see the section above.) **It is not the whole *host*
    policy**: role-runner agents are admitted outside this formula entirely and
    carry their own ceiling since #6102 — see
@@ -5076,15 +5078,8 @@ consistent env-only behavior. Wiring the Bash `config-resolver.sh` into
 `disk-headroom.sh` too is a separate, larger change; file a follow-up if that
 cost is judged worth paying.
 
-**RAM headroom has config keys since #12330.** `LOOM_PER_WORKTREE_RAM_GB`
-(default **2** GB, floored to 1) is still honoured and wins over config: when
-set, it forces `autonomous.workFinder.ramAdmission` to `flat` at that charge.
-Without it, `ramAdmission` and `ramChargeGb` are read from the layered config
-(host-local tier included) every tick; see the config table. There is no Bash-side RAM counterpart to
-`disk-headroom.sh` (RAM headroom is Rust-only, consumed solely by the daemon's
-own `resolve_dynamic_max_concurrent`), so the #4032 divergence concern above
-does not apply here — env-only was simply the cheapest consistent choice, not
-a workaround for a second reader.
+**There is no RAM headroom term** (removed in #12330). The dynamic cap is
+`min(disk headroom, maxConcurrent)`; `LOOM_PER_WORKTREE_RAM_GB` is no longer read.
 
 #### Saturation admission brake (#4903)
 

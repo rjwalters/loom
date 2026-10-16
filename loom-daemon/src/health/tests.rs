@@ -601,44 +601,19 @@ fn dispatch_reports_last_tick_reason_summary() {
         .contains("12 seen, 2 dispatched, 10 in-flight-skip"));
 }
 
-/// #5177 AC4 (re-scoped #5270): `disk_binds_cap` is the strict-minimum
-/// test against `configured_max` (never merely tied), and ties WITH ram
-/// resolve to disk (matching `calibrate::binding_term`'s tie-break order).
-/// The token axis no longer participates in the cap at all.
+/// #5177 AC4 (re-scoped #5270, #12330): `disk_binds_cap` is the
+/// strict-minimum test against `configured_max` (never merely tied). Neither
+/// the token axis nor RAM participates in the cap any more.
 #[test]
-fn disk_binds_cap_only_when_smallest_or_tied_with_ram() {
-    // disk 2 < ram (unbounded) and < configured 12 → disk binds.
-    assert!(disk_binds_cap(2, usize::MAX, 12));
+fn disk_binds_cap_only_when_strictly_below_the_ceiling() {
+    assert!(disk_binds_cap(2, 12));
     // disk ties configured_max → operator's own ceiling, not a disk fault.
-    assert!(!disk_binds_cap(12, usize::MAX, 12));
+    assert!(!disk_binds_cap(12, 12));
     // disk larger than configured_max → the ceiling binds, not disk.
-    assert!(!disk_binds_cap(5, usize::MAX, 1));
-    // disk larger than ram → ram binds, not disk (see ram_binds_cap below).
-    assert!(!disk_binds_cap(5, 2, 12));
-    // disk ties ram (both smaller than configured_max) → disk wins the tie.
-    assert!(disk_binds_cap(3, 3, 12));
-    // the healthy default fixture (disk 0, ram 0, configured 0) must NOT
-    // trip it — a 0/0/0 tie is "unconfigured", not "throttling".
-    assert!(!disk_binds_cap(0, 0, 0));
-}
-
-/// #5270: `ram_binds_cap` is the RAM-headroom mirror of the disk test
-/// above — RAM must be the UNIQUE smallest term (a tie resolves to disk).
-#[test]
-fn ram_binds_cap_only_when_uniquely_smallest() {
-    // ram 2 < disk (unbounded) and < configured 12 → ram binds.
-    assert!(ram_binds_cap(usize::MAX, 2, 12));
-    // ram ties configured_max → operator's own ceiling, not a ram fault.
-    assert!(!ram_binds_cap(usize::MAX, 12, 12));
-    // ram larger than configured_max → the ceiling binds, not ram.
-    assert!(!ram_binds_cap(usize::MAX, 5, 1));
-    // ram larger than disk → disk binds, not ram.
-    assert!(!ram_binds_cap(2, 5, 12));
-    // ram ties disk → disk wins the tie (not flagged as ram).
-    assert!(!ram_binds_cap(3, 3, 12));
-    // the healthy default fixture (disk 0, ram 0, configured 0) must NOT
-    // trip it.
-    assert!(!ram_binds_cap(0, 0, 0));
+    assert!(!disk_binds_cap(5, 1));
+    // the healthy default fixture (disk 0, configured 0) must NOT trip it —
+    // a 0/0 tie is "unconfigured", not "throttling".
+    assert!(!disk_binds_cap(0, 0));
 }
 
 /// #5177 AC4: when disk headroom is the binding cap term, the dispatch
@@ -652,7 +627,6 @@ fn disk_bound_cap_produces_degraded_verdict_naming_disk() {
         status.capacity.token_axis_limit = 6;
         status.configured_max = 12;
         status.disk_headroom = 2; // strictly the smallest term
-        status.ram_headroom = 40; // ample RAM — must not also fire
         status.dynamic_cap = 2;
     }
     let section = assess_dispatch(&inputs);
@@ -664,30 +638,8 @@ fn disk_bound_cap_produces_degraded_verdict_naming_disk() {
     );
 }
 
-/// #5270: the RAM-headroom mirror of the disk test above — a critically-low
-/// available-memory host must be named as degraded the same way a
-/// critically-low-disk host already is.
-#[test]
-fn ram_bound_cap_produces_degraded_verdict_naming_ram() {
-    let mut inputs = healthy_inputs();
-    {
-        let status = inputs.status.as_mut().unwrap();
-        status.configured_max = 12;
-        status.disk_headroom = 40; // ample disk — must not also fire
-        status.ram_headroom = 1; // strictly the smallest term
-        status.dynamic_cap = 1;
-    }
-    let section = assess_dispatch(&inputs);
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(
-        section.summary.to_lowercase().contains("ram"),
-        "summary must name ram: {}",
-        section.summary
-    );
-}
-
 /// #5270: a host where the CPU saturation admission brake is HOLDING new
-/// admissions must be named as degraded, even when the numeric disk/ram/
+/// admissions must be named as degraded, even when the numeric disk/
 /// ceiling terms are all comfortably ample — the brake is a point-in-time
 /// gate outside the `min(...)` formula (see `crate::admission_brake`).
 #[test]
@@ -697,7 +649,6 @@ fn cpu_brake_held_produces_degraded_verdict_naming_cpu() {
         let status = inputs.status.as_mut().unwrap();
         status.configured_max = 12;
         status.disk_headroom = 40;
-        status.ram_headroom = 40;
         status.dynamic_cap = 12;
         status.admission_brake = Some(crate::types::AdmissionBrakeStatus {
             enabled: true,
@@ -722,7 +673,7 @@ fn cpu_brake_held_produces_degraded_verdict_naming_cpu() {
 }
 
 /// #5270: a brake that exists but is NOT holding must not itself degrade
-/// the section (mirrors the existing disk/ram negative test below).
+/// the section (mirrors the existing disk negative test below).
 #[test]
 fn cpu_brake_not_holding_is_not_flagged() {
     let mut inputs = healthy_inputs();
@@ -730,7 +681,6 @@ fn cpu_brake_not_holding_is_not_flagged() {
         let status = inputs.status.as_mut().unwrap();
         status.configured_max = 12;
         status.disk_headroom = 40;
-        status.ram_headroom = 40;
         status.dynamic_cap = 12;
         status.admission_brake = Some(crate::types::AdmissionBrakeStatus {
             enabled: true,
@@ -749,7 +699,7 @@ fn cpu_brake_not_holding_is_not_flagged() {
 }
 
 /// #5177 AC4 (negative): a cap bound by the operator's configured ceiling
-/// (disk/ram headroom ample) stays green — neither is the culprit there.
+/// (disk headroom ample) stays green — neither is the culprit there.
 #[test]
 fn config_bound_cap_is_not_flagged_as_disk() {
     let mut inputs = healthy_inputs();
@@ -758,7 +708,6 @@ fn config_bound_cap_is_not_flagged_as_disk() {
         status.capacity.token_axis_limit = 6;
         status.configured_max = 4; // operator's own ceiling binds
         status.disk_headroom = 50; // plenty of disk
-        status.ram_headroom = 50; // plenty of ram
         status.dynamic_cap = 4;
     }
     let section = assess_dispatch(&inputs);

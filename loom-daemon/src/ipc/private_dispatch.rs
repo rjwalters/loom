@@ -134,13 +134,12 @@ pub(super) async fn dispatch_sweep_nonblocking(
 
         log::info!(
             "dispatch_sweep: {:?}; \
-             headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
+             headroom occupancy={} dynamic_cap={} (disk={} tokens={} [informational \
              only, not capacity-limiting since #5270])",
             kind,
             headroom.occupancy,
             headroom.dynamic_cap,
             headroom.disk_headroom,
-            headroom.ram_headroom,
             headroom.token_axis_limit
         );
     }

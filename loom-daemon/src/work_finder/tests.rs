@@ -2391,7 +2391,6 @@ mod main_red_fix;
 mod maintain_only;
 mod ordering;
 mod priority_admission;
-mod ram_budget;
 mod vi_cap;
 mod workspace_draw;
 
@@ -3223,11 +3222,11 @@ fn test_resolve_max_concurrent_default_and_override() {
 // ===================================================================
 
 #[test]
-fn test_dynamic_cap_is_min_of_three_inputs() {
+fn test_dynamic_cap_is_min_of_disk_and_configured() {
     // Never exceeds any bound. `usize::MAX` ram = the term doesn't bind.
-    assert_eq!(resolve_dynamic_max_concurrent(10, usize::MAX, 10), 10);
-    assert_eq!(resolve_dynamic_max_concurrent(3, usize::MAX, 9), 3, "disk binds");
-    assert_eq!(resolve_dynamic_max_concurrent(9, usize::MAX, 4), 4, "maxConcurrent binds");
+    assert_eq!(resolve_dynamic_max_concurrent(10, 10), 10);
+    assert_eq!(resolve_dynamic_max_concurrent(3, 9), 3, "disk binds");
+    assert_eq!(resolve_dynamic_max_concurrent(9, 4), 4, "maxConcurrent binds");
 }
 
 #[test]
@@ -3238,19 +3237,19 @@ fn test_dynamic_cap_has_no_cpu_term_at_all() {
     // saturated one, which is the whole point — an idle host must not be
     // throttled to 2 by an estimate (`estCoresPerSweep`) that priced every
     // sweep as a build.
-    assert_eq!(resolve_dynamic_max_concurrent(36, usize::MAX, 10), 10);
+    assert_eq!(resolve_dynamic_max_concurrent(36, 10), 10);
 }
 
 #[test]
 fn test_dynamic_cap_has_no_token_axis_term_either() {
     // #5270 AC1: a starved token pool (few/no healthy accounts) must NOT
-    // cap the dynamic concurrency — only disk headroom, RAM headroom, and
-    // the configured ceiling do. The arity itself is the guard (a >3-arg
+    // cap the dynamic concurrency — only disk headroom and the configured
+    // ceiling do (RAM headroom was removed in #12330). The arity itself is the guard (a >3-arg
     // call no longer compiles); this asserts the *value* is independent of
     // any token-pool state, unlike the pre-#5270 formula which would have
     // pinned this to (near-)zero when accounts were exhausted.
     assert_eq!(
-        resolve_dynamic_max_concurrent(36, usize::MAX, 10),
+        resolve_dynamic_max_concurrent(36, 10),
         10,
         "disk (36) and ceiling (10) alone determine the cap"
     );
@@ -3260,41 +3259,16 @@ fn test_dynamic_cap_has_no_token_axis_term_either() {
 fn test_dynamic_cap_disk_headroom_bound() {
     // A nearly-full scratch volume (disk headroom 1) caps concurrency at 1
     // even with a high ceiling.
-    assert_eq!(resolve_dynamic_max_concurrent(1, usize::MAX, 8), 1);
+    assert_eq!(resolve_dynamic_max_concurrent(1, 8), 1);
     // A full volume (0 headroom) drops the cap to 0 — dispatch nothing.
     // Disk meters an exhaustible resource, so this hard floor stays.
-    assert_eq!(resolve_dynamic_max_concurrent(0, usize::MAX, 8), 0);
-}
-
-#[test]
-fn test_dynamic_cap_ram_headroom_bound() {
-    // #5270 AC3: critically-low available RAM caps concurrency exactly the
-    // way disk headroom already does — same posture, same hard floor.
-    assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, 1, 8), 1, "ram binds");
-    assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, 0, 8), 0, "ram exhausted");
-    // Whichever of disk/ram is smaller binds, regardless of position.
-    assert_eq!(resolve_dynamic_max_concurrent(2, 5, 100), 2, "disk (2) < ram (5)");
-    assert_eq!(resolve_dynamic_max_concurrent(5, 2, 100), 2, "ram (2) < disk (5)");
+    assert_eq!(resolve_dynamic_max_concurrent(0, 8), 0);
 }
 
 #[test]
 fn test_dynamic_cap_zero_disk_dispatches_nothing() {
     // No disk headroom ⇒ cap 0 ⇒ a subsequent tick dispatches nothing.
-    let cap = resolve_dynamic_max_concurrent(0, usize::MAX, 10);
-    assert_eq!(cap, 0);
-    let mut source = FakeSource::once((1..=3).map(issue).collect());
-    let mut disp = RecordingDispatcher::default();
-    let report = tick(&mut source, &mut disp, cap, false).unwrap();
-    assert_eq!(report.dispatched, 0);
-    assert_eq!(report.deferred_capacity, 3);
-    assert!(disp.dispatched.is_empty());
-}
-
-#[test]
-fn test_dynamic_cap_zero_ram_dispatches_nothing() {
-    // No available RAM ⇒ cap 0 ⇒ a subsequent tick dispatches nothing —
-    // mirrors test_dynamic_cap_zero_disk_dispatches_nothing exactly.
-    let cap = resolve_dynamic_max_concurrent(usize::MAX, 0, 10);
+    let cap = resolve_dynamic_max_concurrent(0, 10);
     assert_eq!(cap, 0);
     let mut source = FakeSource::once((1..=3).map(issue).collect());
     let mut disp = RecordingDispatcher::default();
@@ -3316,32 +3290,24 @@ fn test_eager_reclaim_fires_when_disk_is_about_to_zero_the_cap() {
     // The #7512 headline case: disk 0, RAM and ceiling both healthy. The
     // cap is about to be finalized as 0, so the eager pass must be
     // attempted first.
-    assert_eq!(resolve_dynamic_max_concurrent(0, 8, 10), 0);
-    assert!(crate::eager_reclaim::should_trigger(false, 0, 8, 10));
+    assert_eq!(resolve_dynamic_max_concurrent(0, 10), 0);
+    assert!(crate::eager_reclaim::should_trigger(false, 0, 10));
 }
 
 #[test]
 fn test_eager_reclaim_fires_when_disk_merely_binds_the_cap_down() {
     // Disk has not reached 0 yet but is already costing dispatch slots
     // (cap 1 instead of 8). Reclaiming here is what keeps it off 0.
-    assert_eq!(resolve_dynamic_max_concurrent(1, 8, 10), 1);
-    assert!(crate::eager_reclaim::should_trigger(false, 1, 8, 10));
+    assert_eq!(resolve_dynamic_max_concurrent(1, 10), 1);
+    assert!(crate::eager_reclaim::should_trigger(false, 1, 10));
 }
 
 #[test]
 fn test_eager_reclaim_does_not_fire_on_an_ordinary_tick() {
     // Healthy disk: the ceiling binds, not disk. No reclaim — this is the
     // overwhelmingly common tick and it must stay side-effect-free.
-    assert_eq!(resolve_dynamic_max_concurrent(36, usize::MAX, 10), 10);
-    assert!(!crate::eager_reclaim::should_trigger(false, 36, usize::MAX, 10));
-}
-
-#[test]
-fn test_eager_reclaim_does_not_fire_when_ram_is_the_binding_axis() {
-    // Cap is 1, but disk is not why — freeing disk would not buy a single
-    // slot, so the forge/docker round-trips would be pure waste.
-    assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, 1, 8), 1);
-    assert!(!crate::eager_reclaim::should_trigger(false, usize::MAX, 1, 8));
+    assert_eq!(resolve_dynamic_max_concurrent(36, 10), 10);
+    assert!(!crate::eager_reclaim::should_trigger(false, 36, 10));
 }
 
 #[test]
@@ -3349,8 +3315,8 @@ fn test_eager_reclaim_does_not_fire_on_an_unmeasurable_disk_probe() {
     // `disk_headroom_limit` returns usize::MAX when `df` is unmeasurable
     // (#4164, unknown != zero) and the cap is left unclamped by disk — so
     // the eager pass must not fire either.
-    assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, usize::MAX, 10), 10);
-    assert!(!crate::eager_reclaim::should_trigger(false, usize::MAX, usize::MAX, 10));
+    assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, 10), 10);
+    assert!(!crate::eager_reclaim::should_trigger(false, usize::MAX, 10));
 }
 
 #[test]
@@ -3362,12 +3328,12 @@ fn test_eager_reclaim_fires_once_per_crossing_not_once_per_tick() {
     let mut was_binding = false;
     let mut fired = 0usize;
     for _ in 0..10 {
-        if crate::eager_reclaim::should_trigger(was_binding, 0, 8, 10) {
+        if crate::eager_reclaim::should_trigger(was_binding, 0, 10) {
             fired += 1;
         }
         // Post-reclaim re-probe still reads 0 — nothing was reclaimable.
-        was_binding = crate::eager_reclaim::disk_axis_binds_cap_down(0, 8, 10);
-        assert_eq!(resolve_dynamic_max_concurrent(0, 8, 10), 0, "cap stays 0 either way");
+        was_binding = crate::eager_reclaim::disk_axis_binds_cap_down(0, 10);
+        assert_eq!(resolve_dynamic_max_concurrent(0, 10), 0, "cap stays 0 either way");
     }
     assert_eq!(fired, 1, "edge-triggered, not level-triggered");
 }
@@ -3378,13 +3344,13 @@ fn test_eager_reclaim_rearms_after_a_successful_reclaim() {
     // binding threshold; a LATER drop is a genuine new crossing and must
     // fire again rather than being suppressed forever.
     let mut was_binding = false;
-    assert!(crate::eager_reclaim::should_trigger(was_binding, 0, 8, 10));
+    assert!(crate::eager_reclaim::should_trigger(was_binding, 0, 10));
     // Post-reclaim re-probe: 12 GB-worth of headroom recovered.
-    was_binding = crate::eager_reclaim::disk_axis_binds_cap_down(12, 8, 10);
+    was_binding = crate::eager_reclaim::disk_axis_binds_cap_down(12, 10);
     assert!(!was_binding);
-    assert_eq!(resolve_dynamic_max_concurrent(12, 8, 10), 8, "cap recovered to the ram term");
+    assert_eq!(resolve_dynamic_max_concurrent(12, 10), 10, "cap recovered to the ceiling");
     // Hours later it fills up again.
-    assert!(crate::eager_reclaim::should_trigger(was_binding, 0, 8, 10));
+    assert!(crate::eager_reclaim::should_trigger(was_binding, 0, 10));
 }
 
 #[test]
@@ -3392,7 +3358,7 @@ fn test_dynamic_cap_unbounded_by_max_concurrent_default() {
     // A machine whose operator has NOT tuned the knob rides the shipped
     // default rather than an estimate of its cores or its token pool.
     assert_eq!(
-        resolve_dynamic_max_concurrent(100, usize::MAX, DEFAULT_WORK_FINDER_MAX_CONCURRENT),
+        resolve_dynamic_max_concurrent(100, DEFAULT_WORK_FINDER_MAX_CONCURRENT),
         DEFAULT_WORK_FINDER_MAX_CONCURRENT
     );
 }
@@ -3406,7 +3372,7 @@ fn test_scale_up_with_growing_backlog_bounded_by_dynamic_cap() {
     // Fixed resources: disk=4, ceiling=10 ⇒ dynamic cap 4. As the backlog
     // grows tick-over-tick, effective concurrency scales up but is bounded
     // by the cap (min(cap, backlog)).
-    let cap = resolve_dynamic_max_concurrent(4, usize::MAX, 10);
+    let cap = resolve_dynamic_max_concurrent(4, 10);
     assert_eq!(cap, 4);
 
     // Backlog 2 (< cap): all 2 dispatch, nothing deferred.
@@ -3428,7 +3394,7 @@ fn test_scale_up_with_growing_backlog_bounded_by_dynamic_cap() {
 fn test_scale_to_zero_on_empty_backlog() {
     // Even with ample resources (cap 5), an empty backlog dispatches nothing
     // — no capacity is pre-reserved and no idle workers are spawned.
-    let cap = resolve_dynamic_max_concurrent(5, usize::MAX, 5);
+    let cap = resolve_dynamic_max_concurrent(5, 5);
     assert_eq!(cap, 5);
     let mut source = FakeSource::once(vec![]);
     let mut disp = RecordingDispatcher::default();
@@ -3972,7 +3938,7 @@ fn test_retired_per_token_concurrency_env_var_is_silently_ignored() {
     };
     assert_eq!(resolve_max_concurrent_with_config(&cfg), 10);
     assert_eq!(
-        resolve_dynamic_max_concurrent(36, usize::MAX, 10),
+        resolve_dynamic_max_concurrent(36, 10),
         10,
         "a retired env var must not clamp the cap"
     );
@@ -4002,7 +3968,7 @@ fn test_retired_cpu_env_vars_are_ignored_not_honored() {
     };
     assert_eq!(resolve_max_concurrent_with_config(&cfg), 10);
     assert_eq!(
-        resolve_dynamic_max_concurrent(36, usize::MAX, 10),
+        resolve_dynamic_max_concurrent(36, 10),
         10,
         "a retired env knob must not clamp the cap"
     );

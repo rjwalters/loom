@@ -59,8 +59,6 @@ impl TriggerReason {
 pub struct TickReading {
     /// The disk term (`free / per_worktree_gb`; `usize::MAX` when unmeasurable).
     pub disk: usize,
-    /// The RAM term.
-    pub ram: usize,
     /// The configured ceiling.
     pub configured_max: usize,
     /// Free GB on the worktree-root volume, `None` when unmeasurable.
@@ -99,7 +97,7 @@ impl EagerTrigger {
     /// (no edge), and `free_gb` is `None` (no level).
     #[must_use]
     pub fn evaluate(&self, r: &TickReading) -> Option<TriggerReason> {
-        let binds = disk_axis_binds_cap_down(r.disk, r.ram, r.configured_max);
+        let binds = disk_axis_binds_cap_down(r.disk, r.configured_max);
         if binds && !self.was_binding {
             return Some(TriggerReason::Edge);
         }
@@ -153,11 +151,7 @@ impl EagerTrigger {
             disk = reprobe();
             free_now = report.free_gb_after;
         }
-        self.observe(
-            disk_axis_binds_cap_down(disk, reading.ram, reading.configured_max),
-            free_now,
-            pass,
-        );
+        self.observe(disk_axis_binds_cap_down(disk, reading.configured_max), free_now, pass);
         disk
     }
 
@@ -170,7 +164,6 @@ impl EagerTrigger {
         &mut self,
         root: &Path,
         disk: usize,
-        ram: usize,
         configured_max: usize,
         reprobe: impl FnOnce() -> usize,
     ) -> usize {
@@ -181,7 +174,6 @@ impl EagerTrigger {
                 .unwrap_or((None, 0, 0));
         let reading = TickReading {
             disk,
-            ram,
             configured_max,
             free_gb,
             floor_gb,
@@ -199,14 +191,8 @@ impl EagerTrigger {
 
     /// [`Self::tick_with`] on the legacy flat term
     /// ([`crate::disk_headroom::disk_headroom_limit`]).
-    pub async fn tick(
-        &mut self,
-        root: &Path,
-        disk: usize,
-        ram: usize,
-        configured_max: usize,
-    ) -> usize {
-        self.tick_with(root, disk, ram, configured_max, || {
+    pub async fn tick(&mut self, root: &Path, disk: usize, configured_max: usize) -> usize {
+        self.tick_with(root, disk, configured_max, || {
             crate::disk_headroom::disk_headroom_limit(root)
         })
         .await
@@ -221,12 +207,11 @@ impl EagerTrigger {
         &mut self,
         roots: &[PathBuf],
         root: &Path,
-        ram: usize,
         configured_max: usize,
     ) -> (usize, Option<DiskBudget>) {
         let (disk, mut budget) = crate::disk_admission::tick(roots, root);
         let disk = self
-            .tick_with(root, disk, ram, configured_max, || {
+            .tick_with(root, disk, configured_max, || {
                 let (disk, fresh) = crate::disk_admission::tick(roots, root);
                 budget = fresh;
                 disk

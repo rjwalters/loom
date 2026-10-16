@@ -47,25 +47,25 @@ pub fn excluded_from_side_listing(item: &WorkItem) -> bool {
 
 /// The two kinds of term in this tick's concurrency cap (#9244 §5, #5270).
 ///
-/// The dynamic cap is `min(disk headroom, ram headroom, configured)`: the
-/// configured term is the operator's queue limit, the headroom terms say the
-/// host cannot hold another worktree. Both are published on the tick summary
+/// The dynamic cap is `min(disk headroom, configured)` (RAM term removed in
+/// #12330): the configured term is the operator's queue limit, the headroom
+/// term says the host cannot hold another worktree. Both are published on the tick summary
 /// (Issue #10214) so an alert can say which term holds the cap down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapTerms {
     /// The configured `maxConcurrent` (after env / config resolution).
     pub configured: usize,
-    /// `min(disk headroom, ram headroom)`: how many sweeps the host can hold.
+    /// Disk headroom: how many sweeps the host can hold.
     pub headroom: usize,
 }
 
 impl CapTerms {
-    /// The terms from this tick's configured cap and its disk / RAM probes.
+    /// The terms from this tick's configured cap and its disk probe.
     #[must_use]
-    pub fn new(configured: usize, disk_headroom: usize, ram_headroom: usize) -> Self {
+    pub fn new(configured: usize, disk_headroom: usize) -> Self {
         Self {
             configured,
-            headroom: disk_headroom.min(ram_headroom),
+            headroom: disk_headroom,
         }
     }
 
@@ -73,13 +73,12 @@ impl CapTerms {
     /// the published tick summary (Issue #10214), so the liveness pass and
     /// the fleet alert can say which term holds the cap down.
     #[must_use]
-    pub fn observed(configured: usize, disk_headroom: usize, ram_headroom: usize) -> Self {
+    pub fn observed(configured: usize, disk_headroom: usize) -> Self {
         super::tick_summary::record_cap(crate::types::CapView::from_terms(
             configured,
             disk_headroom,
-            ram_headroom,
         ));
-        Self::new(configured, disk_headroom, ram_headroom)
+        Self::new(configured, disk_headroom)
     }
 
     /// The effective cap every non-overflow admission is held to.

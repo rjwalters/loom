@@ -484,31 +484,6 @@ fn concurrent_spawns_keep_the_repo_caps() {
 }
 
 #[test]
-fn a_round_does_not_overrun_a_ram_budget_its_repos_share() {
-    use crate::ram_headroom::{RamBudget, RepoCharge};
-    use crate::ram_peaks::ChargeSource;
-    let charge = |repo: &str| RepoCharge {
-        repo: repo.to_string(),
-        gb: 4,
-        source: ChargeSource::Default,
-    };
-    // Room for two 4 GB admissions, across four repos.
-    let limits = crate::work_finder::repo_cap::RepoLimits {
-        per_repo: None,
-        ram: Some(RamBudget {
-            remaining_gb: 9,
-            charges: (0..4).map(|i| charge(&format!("r{i}"))).collect(),
-        }),
-        disk: None,
-    };
-    let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::from_limits(limits, vec![0; 4]);
-    let tick = run_with(repos(4), concurrent(8, 4), &mut cap, &mut spawner);
-    assert_eq!(spawner.asked.len(), 2, "{:?}", spawner.batches);
-    assert_eq!(tick.report.dispatched, 2);
-}
-
-#[test]
 fn one_champion_merge_per_repo_holds_across_rounds() {
     let rows = vec![
         row(6, &["loom:building"], "", false),

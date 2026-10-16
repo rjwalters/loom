@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use chrono::{Duration, TimeZone, Utc};
 
 use super::dispatch::{decision_counts, tick_points, tick_result, tick_span};
-use super::host::{parse_macos_swapusage, parse_meminfo, HostResources};
+use super::host::{
+    parse_macos_swapusage, parse_meminfo, parse_vm_stat_available_pages, HostResources,
+};
 use super::OpsSink;
 use crate::observability::queue::QueueSink;
 use crate::telemetry::ops::{
@@ -797,4 +799,16 @@ fn tick_span_names_the_error_kind_only_when_it_counted_errors() {
     let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
     assert!(!idle.attributes.contains_key("loom.dispatch.error_kind"));
     assert!(OPS_SPAN_ATTRIBUTE_KEYS.contains(&"loom.dispatch.error_kind"));
+}
+
+#[test]
+fn parse_vm_stat_sums_free_and_inactive() {
+    let out = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                Pages free:                              10000.\n\
+                Pages active:                            50000.\n\
+                Pages inactive:                           5000.\n\
+                Pages speculative:                         100.\n";
+    assert_eq!(parse_vm_stat_available_pages(out), Some(15_000));
+    assert_eq!(parse_vm_stat_available_pages("Pages free: 10000.\n"), None);
+    assert_eq!(parse_vm_stat_available_pages(""), None);
 }

@@ -8,9 +8,9 @@
 //!   with its cause, from the work finder's halt clock
 //!   ([`crate::work_finder::halt_cause::since::current`]).
 //! - **Why the cap is what it is.** `loom.dispatch.max_concurrent` is
-//!   `min(configured, disk headroom, RAM headroom)`; when it dropped, nothing
-//!   said which term did it. `loom.dispatch.cap_limiter` names the binding
-//!   term and `loom.dispatch.cap_{configured,disk,ram}` carry the terms, also
+//!   `min(configured, disk headroom)` (the RAM term was removed in #12330);
+//!   when it dropped, nothing said which term did it. `loom.dispatch.cap_limiter`
+//!   names the binding term and `loom.dispatch.cap_{configured,disk}` carry the terms, also
 //!   exported as the `loom.dispatch.cap_term{kind}` gauge.
 //! - **Pre-filter skips apart from refusals.**
 //!   `loom.dispatch.decisions{reason=pr_open}` counts both the open-PR
@@ -22,11 +22,6 @@
 //!   pass, so early admissions carried no `loom.repo`. [`fallback_repo_ref`]
 //!   names the repo from the checkout's `origin` remote (the memoised read the
 //!   tick's listings already make), never a local path.
-//!
-//! - **Why the RAM term is what it is** (#12330).
-//!   `loom.dispatch.cap_ram_mode` (`autonomous.workFinder.ramAdmission`),
-//!   `loom.dispatch.cap_ram_reserved_gb` and
-//!   `loom.dispatch.cap_ram_remaining_gb` ([`ram_attributes`]).
 //!
 //! - **How long the step gather took, and what it covered** (#12074).
 //!   `loom.dispatch.gather_ms`, `loom.dispatch.repos_gathered`,
@@ -105,9 +100,6 @@ pub fn tick_attributes(
         if let Some(disk) = cap.disk {
             out.push(("loom.dispatch.cap_disk".into(), disk.to_string()));
         }
-        if let Some(ram) = cap.ram {
-            out.push(("loom.dispatch.cap_ram".into(), ram.to_string()));
-        }
     }
     if let Some(repos) = halted_repos {
         out.push(("loom.dispatch.halted_repos".into(), repos));
@@ -123,26 +115,6 @@ pub fn tick_attributes(
     }
     if let Some(hold) = &report.spawn_hold {
         out.push(("loom.dispatch.spawn_hold".into(), hold.clone()));
-    }
-    out
-}
-
-/// The tick span's RAM-term attributes (#12330): the admission model
-/// (`observed` / `flat` / `off`), and — when computed — the GB held back for
-/// the in-flight sweeps and the available GB left after it. With
-/// `loom.dispatch.cap_ram` and `loom.dispatch.cap_limiter` they say why the
-/// RAM term is what it is. Pure.
-#[must_use]
-pub fn ram_attributes(term: Option<crate::ram_headroom::RamTerm>) -> Vec<(String, String)> {
-    let Some(term) = term else {
-        return Vec::new();
-    };
-    let mut out = vec![("loom.dispatch.cap_ram_mode".to_string(), term.mode.as_str().to_string())];
-    if let Some(gb) = term.reserved_gb {
-        out.push(("loom.dispatch.cap_ram_reserved_gb".into(), gb.to_string()));
-    }
-    if let Some(gb) = term.remaining_gb {
-        out.push(("loom.dispatch.cap_ram_remaining_gb".into(), gb.to_string()));
     }
     out
 }
@@ -183,11 +155,7 @@ pub fn phase_attributes(
 pub fn tick_points(report: &TickReport, cap: Option<CapView>) -> Vec<MetricPoint> {
     let mut points = Vec::new();
     if let Some(cap) = cap {
-        let terms = [
-            ("configured", Some(cap.configured)),
-            ("disk", cap.disk),
-            ("ram", cap.ram),
-        ];
+        let terms = [("configured", Some(cap.configured)), ("disk", cap.disk)];
         for (kind, value) in terms {
             if let Some(value) = value {
                 points.push(
@@ -344,7 +312,7 @@ mod tests {
             pr_open_prefiltered: 2,
             ..TickReport::default()
         };
-        let cap = CapView::from_terms(12, 4, 9);
+        let cap = CapView::from_terms(12, 4);
         let attrs = tick_attributes(&report, Some(cap), Some("o/a=main_red".into()));
         let get = |k: &str| {
             attrs
@@ -355,7 +323,7 @@ mod tests {
         assert_eq!(get("loom.dispatch.cap_limiter"), Some("disk"));
         assert_eq!(get("loom.dispatch.cap_configured"), Some("12"));
         assert_eq!(get("loom.dispatch.cap_disk"), Some("4"));
-        assert_eq!(get("loom.dispatch.cap_ram"), Some("9"));
+        assert_eq!(get("loom.dispatch.cap_ram"), None, "no RAM term since #12330");
         assert_eq!(get("loom.dispatch.pr_open_prefiltered"), Some("2"));
         assert_eq!(get("loom.dispatch.halted_repos"), Some("o/a=main_red"));
         for (key, _) in &attrs {
@@ -376,7 +344,7 @@ mod tests {
                 .map(|p| p.value)
         };
         assert_eq!(term("disk"), Some(MetricValue::Int(4)));
-        assert_eq!(term("ram"), Some(MetricValue::Int(9)));
+        assert_eq!(term("ram"), None);
         assert_eq!(term("configured"), Some(MetricValue::Int(12)));
         let prefiltered = points
             .iter()
@@ -385,57 +353,33 @@ mod tests {
         assert_eq!(prefiltered.value, MetricValue::Int(2));
     }
 
-    /// #12330: the binding axis for each term, and the RAM term's model and
-    /// budget, all on the ops allowlist.
+    /// #12330: the binding axis is `disk` or `configured`; there is no RAM
+    /// term, so `loom.dispatch.cap_ram` is never exported.
     #[test]
-    fn tick_facts_name_the_binding_axis_and_the_ram_term() {
-        use crate::ram_headroom::{RamMode, RamTerm};
-        let limiter = |c, d, r| CapView::from_terms(c, d, r).limiter().as_str();
-        assert_eq!(limiter(20, 30, 1), "ram");
-        assert_eq!(limiter(20, 3, 9), "disk");
-        assert_eq!(limiter(20, 30, usize::MAX), "configured", "ram off never binds");
-        assert_eq!(limiter(20, 30, 20), "configured", "a tie is the operator's");
-
-        let attrs = ram_attributes(Some(RamTerm {
-            mode: RamMode::Flat,
-            reserved_gb: Some(24),
-            remaining_gb: Some(36),
-        }));
-        let get = |k: &str| {
-            attrs
-                .iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.as_str())
-        };
-        assert_eq!(get("loom.dispatch.cap_ram_mode"), Some("flat"));
-        assert_eq!(get("loom.dispatch.cap_ram_reserved_gb"), Some("24"));
-        assert_eq!(get("loom.dispatch.cap_ram_remaining_gb"), Some("36"));
-        for (key, _) in &attrs {
-            assert!(
-                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
-                "{key}"
-            );
-        }
-        let off = ram_attributes(Some(RamTerm {
-            mode: RamMode::Off,
-            reserved_gb: None,
-            remaining_gb: None,
-        }));
-        assert_eq!(off, vec![("loom.dispatch.cap_ram_mode".to_string(), "off".to_string())]);
-        assert!(ram_attributes(None).is_empty());
+    fn tick_facts_name_the_binding_axis_without_a_ram_term() {
+        let limiter = |c, d| CapView::from_terms(c, d).limiter().as_str();
+        assert_eq!(limiter(20, 3), "disk");
+        assert_eq!(limiter(20, 30), "configured");
+        assert_eq!(limiter(20, 20), "configured", "a tie is the operator's");
+        assert_eq!(limiter(20, usize::MAX), "configured", "unmeasured disk never binds");
+        let attrs = tick_attributes(&TickReport::default(), Some(CapView::from_terms(20, 3)), None);
+        assert!(attrs.iter().all(|(k, _)| !k.contains("ram")), "{attrs:?}");
+        assert!(attrs
+            .iter()
+            .any(|(k, v)| k == "loom.dispatch.cap_limiter" && v == "disk"));
     }
 
     #[test]
     fn an_unmeasured_term_is_absent_not_zero() {
         let report = TickReport::default();
-        let cap = CapView::from_terms(8, usize::MAX, 6);
+        let cap = CapView::from_terms(8, usize::MAX);
         let attrs = tick_attributes(&report, Some(cap), None);
         assert!(attrs.iter().all(|(k, _)| k != "loom.dispatch.cap_disk"));
         assert!(attrs
             .iter()
-            .any(|(k, v)| k == "loom.dispatch.cap_limiter" && v == "ram"));
+            .any(|(k, v)| k == "loom.dispatch.cap_limiter" && v == "configured"));
         let points = tick_points(&report, Some(cap));
-        assert_eq!(points.len(), 2, "configured and ram only; no prefiltered counter at zero");
+        assert_eq!(points.len(), 1, "configured only; no prefiltered counter at zero");
         assert!(tick_attributes(&report, None, None).len() == 1);
     }
 
