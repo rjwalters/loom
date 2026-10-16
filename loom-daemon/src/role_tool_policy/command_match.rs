@@ -344,6 +344,18 @@ fn lex(input: &str) -> Lexed {
                 end_segment!();
                 continue;
             }
+            '(' if next == Some('(') && !in_word && seg.is_empty() => {
+                // `(( … ))` arithmetic command: its `<<` is a shift, not a heredoc.
+                // Analyzed as one region (so `$( )` inside still counts); a `((`
+                // that does not close as `))` is nested subshells and lexes normally.
+                let (body, end) = take_balanced(&c, i + 2);
+                if c.get(end) == Some(&')') {
+                    out.nested.push(body);
+                    i = end + 1;
+                    continue;
+                }
+                end_segment!();
+            }
             '\n' | ';' | '&' | '|' | '(' | ')' => {
                 end_segment!();
             }
@@ -363,9 +375,13 @@ fn lex(input: &str) -> Lexed {
                 if ch == '<' && run == 2 {
                     let strip_tabs = c.get(i + 2) == Some(&'-');
                     let (delim, end) = take_heredoc_delimiter(&c, i + 2 + usize::from(strip_tabs));
-                    heredocs.push((delim, strip_tabs));
-                    i = end;
-                    continue;
+                    // Not a redirect (`<<=` shift-assign, `<< 3` shift): keep lexing
+                    // the following lines as commands rather than swallow them.
+                    if is_heredoc_opener(&c, i + 2 + usize::from(strip_tabs), &delim) {
+                        heredocs.push((delim, strip_tabs));
+                        i = end;
+                        continue;
+                    }
                 }
                 pending = if ch == '<' && run >= 3 {
                     WordKind::HereString
@@ -391,6 +407,17 @@ fn is_file_redirect(w: &Word) -> bool {
     w.kind == WordKind::Redirect
         && !w.text.starts_with("/dev/")
         && !w.text.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// Whether a `<<` whose delimiter text starts at `start` opens a heredoc: it
+/// needs a delimiter word, and `<<=` or a bare numeric word after a space reads
+/// as an arithmetic shift, not a redirect.
+fn is_heredoc_opener(c: &[char], start: usize, delim: &str) -> bool {
+    if delim.is_empty() || c.get(start) == Some(&'=') {
+        return false;
+    }
+    let spaced = matches!(c.get(start), Some(' ' | '\t'));
+    !(spaced && delim.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 /// The delimiter word of a `<<` heredoc starting at `start` (quotes and

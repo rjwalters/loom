@@ -66,6 +66,8 @@ const DENIED: &[(&str, &str)] = &[
     ("live merge after a heredoc", "cat <<'EOF'\nhello\nEOF\ngh pr merge 12"),
     ("unterminated heredoc fed to a shell", "bash <<EOF\ngh pr merge 12"),
     ("quote-escaped word", "gh pr 'merge' 12"),
+    ("live merge after an arithmetic shift", "(( x = 1 << 3 ))\ngh pr merge 12"),
+    ("live merge after a shift-assign", "(( n <<= 1 ))\ngh pr merge 12"),
 ];
 
 struct Fixture {
