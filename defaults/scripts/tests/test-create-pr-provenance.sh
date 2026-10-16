@@ -75,7 +75,7 @@ fi
 if [[ "\$1" == "forge" && "\$2" == "priority-labels" ]]; then cat >/dev/null; exit 0; fi
 printf '%s\n' "\$*" > "\$LOOM_TEST_STUB_DIR/daemon-args.txt"
 cat > "\$LOOM_TEST_STUB_DIR/daemon-stdin.txt"
-echo '$MARKER'
+echo 'unexpected daemon call' >&2
 STUB
 cat > "$STUB_DIR/daemon-old" <<'STUB'
 #!/usr/bin/env bash
