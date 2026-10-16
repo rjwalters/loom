@@ -3178,3 +3178,7 @@ mod rest_only_tests;
 // #9258: an unmarked approval is re-queued, never anchored.
 #[cfg(test)]
 mod unanchored_verdict_tests;
+
+// #12230: a slow startup pass beside work-finder ticks dispatches once.
+#[cfg(test)]
+mod startup_cutoff_race_tests;

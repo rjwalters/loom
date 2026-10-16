@@ -641,24 +641,28 @@ pub fn global_skip_pass(job: &str) -> bool {
 }
 
 /// Export one fresh trip as a `loom.ratelimit.trip` span (Issue #10022) and,
-/// when a probe reading exists, log its attribution (Issue #9855): the
-/// probe's pool-wide `used` minus this host's own ledger says whether this
-/// daemon exhausted its own pool or an external client sharing the
-/// credential did. `ledger` (`forge_call_stats::consumed_in_window`) is read
-/// only when there is a reading. An untrusted reading (#8997 — possibly
-/// another credential's budget) is logged with a marker but kept off the
-/// span, whose attribution attributes are then omitted rather than wrong.
+/// when a probe reading exists, log its attribution (Issues #9855, #12238):
+/// the tripping `credential`'s `used` minus this host's own ledger on that
+/// same credential leaves the share this host did not record — other hosts
+/// or processes on the credential. `ledger`
+/// (`forge_call_stats::consumed_in_window_for`) is read only when there is a
+/// reading. An untrusted reading (#8997 — possibly another credential's
+/// budget) is logged with a marker but kept off the span, whose attribution
+/// attributes are then omitted rather than wrong; the credential is still
+/// named, since it comes from the failing call, not the reading.
 pub fn export_trip(
     source: &str,
     tripped_at: DateTime<Utc>,
     cooldown_until: Option<DateTime<Utc>>,
     reading: Option<(&BudgetSnapshot, bool)>,
-    ledger: impl FnOnce() -> Option<BTreeMap<Pool, u64>>,
+    credential: Option<crate::observability::ops::ratelimit::TripCredential>,
+    ledger: impl FnOnce() -> Option<BTreeMap<Pool, crate::forge_call_stats::CredentialSpend>>,
 ) {
     let attribution = reading.map_or_else(TripAttribution::default, |(budget, trusted)| {
         let attribution = TripAttribution::from_budget(Some(budget), ledger().as_ref());
         log::warn!(
-            "rate_limit_breaker: attribution: core {} · graphql {} — external is other clients of this credential{}",
+            "rate_limit_breaker: attribution ({}): core {} · graphql {} — unattributed is other hosts or processes on the same credential{}",
+            credential.as_ref().map_or("credential unknown", |c| c.account.as_str()),
             attribution.core.log_text(),
             attribution.graphql.log_text(),
             if trusted { "" } else { " (reading untrusted, see #8997)" },
@@ -669,6 +673,10 @@ pub fn export_trip(
             TripAttribution::default()
         }
     });
+    let attribution = TripAttribution {
+        credential,
+        ..attribution
+    };
     crate::observability::ops::ratelimit::record_trip(
         source,
         tripped_at,
@@ -795,6 +803,21 @@ pub mod forge {
         let b = run_probe(inv, now);
         budget_cache::store(key, b, now);
         b
+    }
+
+    /// The credential a probe under `ctx` reads — the one the failing call
+    /// ran under — as the trip span names it (#12238). Local only: path
+    /// shapes and the directory's `identity.json`, never a forge call.
+    #[must_use]
+    pub fn credential_ctx(
+        ctx: &FailureContext,
+    ) -> crate::observability::ops::ratelimit::TripCredential {
+        let cred = crate::gh_invocation::accounting::cred_of(&probe_invocation(ctx));
+        crate::observability::ops::ratelimit::TripCredential {
+            account: cred.account,
+            owner: cred.owner,
+            installation: cred.installation,
+        }
     }
 
     fn probe_invocation(ctx: &FailureContext) -> GhInvocation {

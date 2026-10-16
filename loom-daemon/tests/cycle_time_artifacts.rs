@@ -301,3 +301,8 @@ fn reads_go_through_the_deduplicating_view_not_the_base_table() {
         "the ship view no longer deduplicates with FINAL"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

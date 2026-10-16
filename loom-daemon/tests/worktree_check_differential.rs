@@ -668,3 +668,8 @@ fn the_shell_fallback_owns_the_decision_but_not_one_word_of_the_message_text() {
         );
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
