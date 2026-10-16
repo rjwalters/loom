@@ -135,6 +135,8 @@ fn samples() -> Vec<TelemetryRecord> {
                     "host": "host-a", "move_kind": "reset", "ref": "HEAD", "reflog_line": "reset: moving to x",
                     "from_sha": "a", "to_sha": "b", "at": AT, "observed_at": AT,
                     "hold_active": false, "loom": p})),
+        wire(json!({"kind": "roster.change", "name": "repo", "action": "register",
+                    "host": "host-a", "at": AT, "loom": p})),
         TelemetryRecord::PickDecision(pick_decision()),
         wire(json!({"kind": "pr.resolved", "repo": "rjwalters/loom", "pr_number": 1,
                     "state": "merged", "resolved_at": AT, "observed_at": AT,

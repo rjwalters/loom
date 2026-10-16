@@ -216,6 +216,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
 | [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
+| [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` Deny branch) |
 | Captain gauges: `loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback` ([`metric.points`](#metricpoints)) | metric | `observability/captain_gauges.rs` |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
@@ -3749,6 +3750,42 @@ invoked by a person *through Loom's own tagged environment* (a shell inheriting
 entries other than start/finish/abort are ignored, so one rebase is one or two
 records, not one per picked commit.
 
+
+### `roster.change`
+
+The roster pass changed this host's workspace registry, or could not register a
+desired repo because it is not cloned (Issue #12322). One record per applied
+change and per uncloned repo, emitted by `fleet_sync::roster_clone` (via
+`emit_changes`) **whatever the repo's queue holds**, so a registered-but-idle
+repo is visible: `loom.dispatch.disposition` spans only exist for repos with a
+queue item. Envelopes carry `schema_version: 12`. **OTLP-only** (native:
+`false`), severity `INFO`, stamped when the pass made the change. The body is
+the record's JSON; the scalars ride as `loom.roster.*` attributes
+(`ROSTER_CHANGE_LOG_ATTRIBUTE_KEYS`, which the collector's `transform/privacy`
+allowlists), plus `loom.repo` / `loom.repo.visibility`. No absolute path is
+exported. Nothing is emitted when `fleet.autoApply` is off (the pass applies
+nothing), when the pass has no changes, or for an apply that failed.
+
+`skip:not-cloned` repeats every timer pass while the repo stays uncloned (one
+row per missing repo per pass); a repeating row is the proof the repo is still
+unregistered. A repo the pass cloned and registered is `register`; one whose
+clone failed, was refused or deferred is `skip:not-cloned`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string? | `owner/repo` from the record's GitHub remote, else the checkout's `origin`; omitted when neither parses |
+| `visibility` | `public` \| `private` | `private` until resolved |
+| `name` | string | the roster record's name |
+| `action` | string | `register`, `set-weight`, `set-maintain-only`, `remove` or `skip:not-cloned` |
+| `from_weight`, `to_weight` | integer? | draw weights (`set-weight` has both; `register` and `skip:not-cloned` carry `to_weight`, the weight it is or would be registered at). `fleet_priority` is not used (ignored since #11742) |
+| `maintain_only` | boolean? | maintain-only after the change (`register`, `skip:not-cloned`, `set-maintain-only`) |
+| `host` | string | the host whose registry this is |
+| `at` | RFC3339 | when the pass made the change; the record time |
+| `loom` | object | the observing build's provenance (required; a record without valid provenance is not emitted) |
+
+Attributes: `loom.roster.action`, `.name`, `.from_weight`, `.to_weight`,
+`.maintain_only`, `.host`, and the build as `.version`, `.revision`,
+`.tree_state`, `.provenance_complete`.
 
 ### `issue.estimate` — completed curation's blind pre-build estimate
 

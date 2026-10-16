@@ -169,6 +169,7 @@ pub mod write_scope_refused;
 
 /// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
 pub mod checkout_external_change;
+pub mod roster_change;
 
 /// `host.export` (#11124).
 pub mod host_export;
@@ -466,6 +467,12 @@ macro_rules! telemetry_kind_table {
             /// Loom (Issue #11566): the reflog entry, from/to sha and the commits
             /// it made unreachable. OTLP-only. See [`checkout_external_change`].
             CheckoutExternalChange = "checkout.external_change" => $crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+            /// The roster pass changed this host's workspace registry, or could
+            /// not register a desired repo because it is not cloned (Issue
+            /// #12322). Emitted whatever the repo's queue holds. OTLP-only. See
+            /// [`roster_change`].
+            RosterChange = "roster.change" => $crate::telemetry::kinds::roster_change::RosterChangeRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One curation completion's blind difficulty estimate (#11608).
