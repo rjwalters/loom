@@ -19,6 +19,7 @@ fn policy(allow: &[&str]) -> TrustPolicy {
         writer: Some(app("acme-writer")),
         readers: vec![app("acme-reader-1")],
         legacy_logins: vec!["acme-old".into()],
+        writers: Vec::new(),
     };
     TrustPolicy::new(
         FleetLogins::of(&roster),

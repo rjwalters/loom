@@ -218,6 +218,7 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<StartupPa
             run_startup_trace_join_reconciliation_pass(&quarantine_root);
             run_startup_profile_provisioning_pass(&quarantine_root);
             run_startup_review_role_pins_pass(&quarantine_root);
+            run_startup_forge_identity_warnings_pass(&quarantine_root);
             local_tx.send_replace(StartupPasses::LocalDone);
             crate::claim_reconciliation::run_reconciliation_pass(&fallback_root, true);
             run_startup_quarantine_pass(&quarantine_root);
@@ -248,6 +249,27 @@ fn run_startup_review_role_pins_pass(fallback_root: &Path) {
                 root.display(),
                 pins.join(", ")
             );
+        }
+    }
+}
+
+/// One WARN per `forge.identities` / `forge.githubApp` problem in each
+/// registered workspace (#12446), the same list `loom-daemon forge identities`
+/// prints. It runs here, in the daemon's own process, because one of the
+/// checks (the `LOOM_GITHUB_APP_ID` / `LOOM_GITHUB_APP_KEY_PATH` override that
+/// makes `github-app-token.sh` ignore `writers[]`) reads the environment: the
+/// daemon's service environment is the one that matters, and an operator's
+/// interactive shell may not carry it. Local file reads only.
+fn run_startup_forge_identity_warnings_pass(fallback_root: &Path) {
+    let registry = crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    log_forge_identity_warnings(&registry.effective_roots(fallback_root));
+}
+
+/// [`run_startup_forge_identity_warnings_pass`] over an explicit root list.
+fn log_forge_identity_warnings(roots: &[PathBuf]) {
+    for root in roots {
+        for warning in crate::forge_identity::config_warnings_for(root) {
+            log::warn!("forge_identity: {}: {warning}", root.display());
         }
     }
 }
@@ -425,6 +447,45 @@ mod tests {
     /// ceiling costs a passing run nothing, and nothing here compares elapsed
     /// time against a *fraction* of anything (#9092).
     const GATE_WAIT: Duration = Duration::from_secs(30);
+
+    /// #12446: the daemon logs the `forge identities` config warnings at WARN,
+    /// one line per warning, naming the workspace, so a problem shows up in
+    /// the daemon's log and not only when an operator runs the CLI.
+    #[test]
+    fn forge_identity_warnings_are_logged_at_warn_per_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("bad");
+        let good = tmp.path().join("good");
+        std::fs::create_dir_all(bad.join(".loom-local")).unwrap();
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(
+            bad.join(crate::config_resolver::LOCAL_CONFIG_REL),
+            r#"{"forge": {"identities": {"writers": "not-an-array"}}}"#,
+        )
+        .unwrap();
+        let expected = crate::forge_identity::config_warnings_for(&bad);
+        assert!(!expected.is_empty(), "fixture must produce a warning");
+
+        let logs = crate::test_log_capture::capture_logs(|| {
+            log_forge_identity_warnings(&[bad.clone(), good.clone()]);
+        });
+        let lines_for = |root: &Path| -> Vec<(log::Level, String)> {
+            let prefix = format!("forge_identity: {}: ", root.display());
+            logs.iter()
+                .filter(|(_, m)| m.starts_with(&prefix))
+                .cloned()
+                .collect()
+        };
+        let ours = lines_for(&bad);
+        assert_eq!(ours.len(), expected.len(), "one line per warning: {logs:?}");
+        for ((level, msg), want) in ours.iter().zip(&expected) {
+            assert_eq!(*level, log::Level::Warn);
+            assert!(msg.ends_with(want.as_str()), "{msg}");
+        }
+        // A workspace with nothing wrong in its own config adds nothing
+        // beyond what a shared defaults tier might already say.
+        assert_eq!(lines_for(&good).len(), crate::forge_identity::config_warnings_for(&good).len());
+    }
 
     /// Issue #8672 AC 2, daemon half: the startup pass provisions **every**
     /// pooled profile, not just ones created after this shipped — and is a

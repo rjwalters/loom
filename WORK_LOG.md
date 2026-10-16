@@ -7,6 +7,61 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12485**: feat: classify failed steps by StepEnd instead of unclassified:step
+- **PR #12482**: fix(fleet_dispatch): derive live-table age-out from the reaper interval
+- **PR #12474**: fix(fleet-dispatch): re-grant only the same step; read tailnet_node from host records
+- **Issue #12487** (closed): design(eta-fit): durable fix for the dump string-cap so we can train on ALL history (not 7d slices) — streaming vs compact format vs query-time aggregation
+- **Issue #12480** (closed): Step-engine failures all export unclassified:step; derive class from StepEnd (#12028 follow-up)
+- **Issue #12479** (closed): fleet_dispatch worker: derive the live-table age-out from the reaper interval (90 s is hard-coded)
+- **Issue #12357** (closed): Verify live OTLP delivery of host.status gauges (follow-up to #12309)
+- **Issue #12028** (closed): role_tick.outcome failures carry no reason (167/6h vs 12 role_attempt failures)
+- **Issue #11776** (closed): Remove provenance stamping from Loom (moved to telemetry consumers) — staged
+- **PR #12473**: chore: remove stamp-only provenance test, fixture and stale docs
+- **PR #12471**: docs(fleet-captain-dispatch): tailnet node field lives on host records
+- **PR #12467**: feat(fleet-dispatch): worker client claims through the captain first (#12450)
+- **PR #12470**: refactor: record why disk reclaim predicates stay raw and drop unused df helpers
+- **PR #12469**: feat(observability): export worktree-reaper per-pass telemetry as reaper.pass spans
+- **PR #12468**: feat(reaper): reclaim idle Python caches and .venv, keep tracked artifact dirs
+- **PR #12465**: feat(fleet_dispatch): captain claim arbiter, loom-daemon fleet-dispatch serve (#12449)
+- **PR #12463**: fix: close values() in lifecycle fixture and drop bash-4 case conversion in sync-labels
+- **PR #12462**: test: route private-workspace docker fixture gh calls through a fail-loud fake
+- **PR #12457**: Revert #12448: claim_lost stopgap (operator ruling: go straight to captain dispatch)
+- **PR #12452**: docs(design): fleet captain dispatch spec (Phase 0 of #12447)
+- **PR #12451**: feat: resolve a per-owner writer App from forge.identities.writers
+- **PR #12448**: fix(step_dispatch): stop lost claims ending ticks early (free claim_lost 16→128, passes 32→48)
+- **PR #12445**: fix: bound nvidia-smi query with a 2s deadline in host-status sampler
+- **PR #12443**: test: count only per-issue reads of held candidates in expired-listing assertion
+- **PR #12441**: feat(host_status): gate, launch and work-finder read filtered host_status
+- **PR #12436**: refactor: stop deriving story trace IDs; every execution is its own root trace
+- **Issue #12450** (closed): Fleet dispatch Phase 1b: worker client — claim via the captain before the forge pre-claim, fail-open with hysteresis
+- **Issue #11983** (closed): Provenance out of Loom, stage 3: remove provenance-only docs, fixtures and CI checks
+- **Issue #11809** (closed): host_status: one continuous, IIR-filtered host sampler, exported as OTel metrics and used by admission
+- **Issue #12461** (closed): Export worktree-reaper per-pass telemetry (scanned/removed/preserved/bytes)
+- **Issue #12459** (closed): Reclaim Python caches and .venv from idle worktrees
+- **Issue #12449** (closed): Fleet dispatch Phase 1a: captain server `loom-daemon fleet-dispatch serve` (claim arbiter, soft state, roster auth)
+- **Issue #12446** (closed): forge: per-owner writer App (pick the writer by repo owner)
+- **Issue #12440** (closed): test flake: a_failed_read_reuses_the_last_good_listing_for_a_few_minutes fails on Rust Unit Tests (2/5)
+- **Issue #12437** (closed): host_status: bound nvidia-smi runtime so a wedged driver cannot stall the sampler tick
+- **Issue #12114** (closed): host_status (slice c): re-point admission_brake / work_finder at host_status
+- **Issue #11984** (closed): Provenance out of Loom, stage 2: stop stamping trailers/markers, drop trace-ID derivation
+- **PR #12438**: feat: classify audited config blocks and underscore annotations in fleet reload table
+- **PR #12432**: feat: report NVIDIA GPU utilisation and memory in host status
+- **Issue #12423** (closed): reload: classify annotation keys and audited config blocks (#12419 child 1)
+- **Issue #12115** (closed): host_status (slice d): add GPU signals to host_status
+- **PR #12434**: feat: source role-span host attributes from host_status latest record
+- **PR #12435**: step tick: a lost claim is a cheap pass; the tick names its stop and budget
+- **PR #12431**: feat: detect restart-required config changes since boot in fleet-sync
+- **PR #12427**: work finder: the cap is maxConcurrent alone; remove automatic and secondary admission caps
+- **PR #12430**: docs: route cross-repo and time-gated leftovers to park records, not loom:operator
+- **PR #12426**: refactor: remove dead provenance hook/marker modules and provenance CLI
+- **Issue #12424** (closed): fleet-sync: detect restart-required changes since boot as a demand (#12419 child 2)
+- **Issue #12410** (closed): Hosts race for the same step draws: 43% of draws refused claim_lost; spread draws per host and export per-tick pass counts
+- **Issue #12406** (closed): Remove the automatic and secondary admission caps: the cap is the operator's maxConcurrent alone
+- **Issue #12346** (closed): Flow-change evidence review (#11708 slice D): role triggers, Builder preflight, Doctor runtime
+- **Issue #12345** (closed): Flow-change evidence review (#11708 slice C): Champion, daemon holds, parking, work finder, labels
+- **Issue #12343** (closed): Flow-change evidence review (#11708 slice A): re-date/freshness and Judge CI-complete rule
+- **Issue #12113** (closed): host_status (slice b): re-point role-span host attributes at host_status
+- **Issue #10942** (closed): Sweeps use bare loom:operator as a re-dispatch brake for cross-repo/time-gated work; file the child or write a dated park instead
 - **PR #12417**: refactor: stop stamping provenance markers on lease comments, proposals and sweep commits
 - **Issue #12330** (closed): RAM admission reserves every in-flight sweep's peak build RAM: cap collapses to 1 on an idle 64 GiB host; make it realistic and fleet-configurable
 - **PR #12336**: fix(daemon): remove RAM admission; dynamic cap = min(disk, maxConcurrent) (#12330)

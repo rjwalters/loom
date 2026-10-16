@@ -3,7 +3,7 @@
 //! When the forge event feed reports `workflow_run.completed` for repo R and
 //! run N ([`crate::forge_events::keys`]), this records **that one run**
 //! through the exact path the repo sweep uses ([`super::record_run`]):
-//! fetch the run, list its jobs, then ledger commit, emit, story stitching
+//! fetch the run, list its jobs, then ledger commit, emit
 //! and wanted-log bookkeeping. About two requests per finished run, instead
 //! of a sweep over every repo of every owner.
 //!
@@ -35,7 +35,6 @@ use crate::ci_telemetry::journal::Journal;
 use crate::ci_telemetry::ledger::Ledger;
 use crate::ci_telemetry::records::{RepoJson, RunJson};
 use crate::ci_telemetry::state::{self, CycleLock, CycleSummary};
-use crate::ci_telemetry::story::RepoStories;
 use crate::ci_telemetry::{journal_path, state_dir};
 use crate::forge_events::keys::RunKey;
 
@@ -220,20 +219,7 @@ fn record_one(
     if ledger.run_is_past_retention(&repo.full_name, run.created_at) {
         return Ok(Recorded::Skipped("the run is older than the ledger's retention window"));
     }
-    let stories = ctx.repo_identity.map(|resolve| {
-        let mut graphql_ok = !cycle.graphql_suppressed;
-        let stories = RepoStories::prepare(
-            resolve,
-            api,
-            &repo.full_name,
-            &[&run],
-            &mut cycle.summary.requests,
-            &mut graphql_ok,
-        );
-        cycle.graphql_suppressed = !graphql_ok;
-        stories
-    });
-    record_run(ctx, api, ledger, journal, &repo, &run, stories.as_ref(), cycle).map(Recorded::Run)
+    record_run(ctx, api, ledger, journal, &repo, &run, cycle).map(Recorded::Run)
 }
 
 /// The sweep's org-wide abort rule, applied to a targeted batch: a rate limit

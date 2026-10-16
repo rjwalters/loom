@@ -21,6 +21,29 @@
 //! dependency and keeps the two ports byte-for-byte auditable. The pure parsing
 //! ([`parse_df_available_gb`]) is split out
 //! from the I/O so they stay unit-testable without a real filesystem.
+//!
+//! # Why the reclaim predicates read this directly, not `host_status` (#12114)
+//!
+//! `host_status` publishes an EWMA-filtered `vol_free_bytes` for the
+//! worktree-root volume only. Each reclaim predicate below was weighed for a
+//! move onto it; none moved, because a smoothed free-space value lags in both
+//! directions that matter (a build filling the disk, and the free space a
+//! reclaim pass just returned), and free disk space does not spike the way
+//! CPU does, so there is no one-sample noise to filter out.
+//!
+//! | Call site | Outcome | Reason |
+//! |---|---|---|
+//! | `eager_reclaim.rs` (`free_gb` closure) | kept raw | measures the volume after each reclaim step to decide whether to continue; a lagging filter would not see the space just freed |
+//! | `eager_reclaim/idle_schedule.rs` | kept raw | the pressure trigger acts on a falling edge; the filter delays reclaim while a build fills the disk |
+//! | `eager_reclaim/level_trigger.rs` | kept raw | same level trigger, and it feeds the edge decision the reclaim pass is run from |
+//! | `worktree_reaper.rs` (`report.free_gb`) | kept raw | reports the free space after the pass; must reflect what the pass freed |
+//! | `worktree_reaper/artifact_reclaim.rs` (`floor_reached`) | kept raw | stop condition checked between deletions on the artifact's own volume, which need not be the published one |
+//! | `deep_clean.rs` | kept raw | measures the primary checkout's volume (`path_free_gb`), which is not the published worktree-root volume |
+//! | `docker_image_clean.rs` | kept raw | measures Docker's data root, a volume `host_status` does not publish |
+//! | `fetch_headroom.rs` | kept raw | measures the checkout's own volume, not the published one |
+//!
+//! None of these gates dispatch (the work finder's disk term was removed in
+//! #12406), so nothing here changes admission behaviour.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -82,10 +105,10 @@ fn nearest_existing_ancestor(path: &Path) -> &Path {
 
 /// Run `df -Pk` against `probe` and return its raw stdout on success, `None`
 /// on any probe failure (missing `df` binary, non-zero exit). Shared by
-/// [`worktree_root_free_gb`], [`worktree_root_total_gb`], and
-/// [`worktree_root_disk_gb`] so a caller that wants both free and total reads
-/// them from the SAME `df` sample instead of two separate invocations racing
-/// a filesystem that can change size between them (#5356).
+/// [`worktree_root_free_gb`], [`path_free_gb`], and
+/// [`worktree_root_disk_bytes`] so a caller that wants both free and total
+/// reads them from the SAME `df` sample instead of two separate invocations
+/// racing a filesystem that can change size between them (#5356).
 fn df_probe_output(probe: &Path) -> Option<String> {
     let output = match Command::new("df")
         .arg("-Pk")
@@ -149,45 +172,8 @@ pub fn path_free_gb(path: &Path) -> Option<u64> {
     parse_df_available_gb(&df_probe_output(probe)?)
 }
 
-/// Echo the integer total capacity (GB) of the filesystem hosting the
-/// resolved worktree root for `repo_root` — the denominator a consumer needs
-/// to render [`worktree_root_free_gb`] as a percentage instead of a bare
-/// absolute number that is not comparable across a heterogeneous fleet
-/// (#5356).
-///
-/// Same resolution and "unknown != zero" contract as `worktree_root_free_gb`:
-/// `None` means the probe could not measure total capacity (`df`
-/// missing/errored, unparseable output), never a fabricated `0`.
-#[must_use]
-pub fn worktree_root_total_gb(repo_root: &Path) -> Option<u64> {
-    let wt_root = worktree_root(repo_root);
-    let probe = nearest_existing_ancestor(&wt_root);
-    parse_df_total_gb(&df_probe_output(probe)?)
-}
-
-/// Probe both free and total GB on the worktree-root filesystem for
-/// `repo_root` in a SINGLE `df -Pk` invocation (#5356) — `host.health`
-/// sampling wants both every tick, and they are two columns of the same `df`
-/// row, so this avoids spawning `df` twice per sample.
-///
-/// Each half of the pair follows the free-standing functions' own "unknown !=
-/// zero" contract independently: a malformed Available column does not
-/// prevent a well-formed Total column (or vice versa) from still resolving,
-/// though in practice a `df` invocation that fails at all (missing binary,
-/// non-zero exit) yields `(None, None)` together.
-#[must_use]
-pub fn worktree_root_disk_gb(repo_root: &Path) -> (Option<u64>, Option<u64>) {
-    let wt_root = worktree_root(repo_root);
-    let probe = nearest_existing_ancestor(&wt_root);
-    match df_probe_output(probe) {
-        Some(output) => (parse_df_available_gb(&output), parse_df_total_gb(&output)),
-        None => (None, None),
-    }
-}
-
 /// Free and total **bytes** on the worktree-root filesystem for `repo_root`,
-/// from one `df -Pk` sample (Issue #8860) — [`worktree_root_disk_gb`] without
-/// the integer-GB floor, for the OTLP host-resource gauges. Same "unknown !=
+/// from one `df -Pk` sample (Issue #8860), without an integer-GB floor, for the OTLP host-resource gauges. Same "unknown !=
 /// zero" contract: each half is `None` when unmeasurable.
 #[must_use]
 pub fn worktree_root_disk_bytes(repo_root: &Path) -> (Option<u64>, Option<u64>) {
@@ -211,7 +197,7 @@ pub fn worktree_root_disk_bytes(repo_root: &Path) -> (Option<u64>, Option<u64>) 
 /// Whole GB (integer floor) from a byte count — the same rounding
 /// [`parse_df_available_gb`]/[`parse_df_total_gb`] apply to `df -Pk`'s 1K
 /// blocks, so a GB figure derived from [`worktree_root_disk_bytes`] equals the
-/// one [`worktree_root_disk_gb`] would report for the same sample (#8857).
+/// one [`parse_df_available_gb`] reports for the same sample (#8857).
 #[must_use]
 pub fn bytes_to_whole_gb(bytes: u64) -> u64 {
     bytes / (1024 * 1024 * 1024)
@@ -302,8 +288,8 @@ mod tests {
     fn test_parse_df_free_and_total_read_from_the_same_row() {
         // Free and total are two independent columns of the SAME data row —
         // this pins that they parse consistently against one shared fixture,
-        // the exact shape worktree_root_disk_gb's single-df-call design
-        // relies on.
+        // the exact shape the single-df-call probes
+        // ([`worktree_root_disk_bytes`]) rely on.
         let out = "Filesystem 1024-blocks      Used Available Capacity  Mounted on\n\
                    /dev/disk3s1 1048576000 838860800 209715200      80%    /\n";
         assert_eq!(parse_df_total_gb(out), Some(1000));
@@ -359,130 +345,6 @@ mod tests {
             .expect("a real df -Pk against a real tempdir should succeed in the test env");
         // A modern dev/CI volume has < 1 EB free; this just guards the parse.
         assert!(free < 1_000_000_000);
-    }
-
-    // ===================================================================
-    // worktree_root_total_gb / worktree_root_disk_gb — smoke tests against
-    // the real df (#5356)
-    // ===================================================================
-
-    #[test]
-    #[serial]
-    fn test_worktree_root_total_gb_returns_a_value() {
-        // Same smoke-test shape as test_worktree_root_free_gb_returns_a_value:
-        // real df, plausible (non-astronomical) value, `#[serial]` shares the
-        // PATH-mutation lock with the stub-df tests below.
-        let tmp = tempfile::tempdir().unwrap();
-        let total = worktree_root_total_gb(tmp.path())
-            .expect("a real df -Pk against a real tempdir should succeed in the test env");
-        assert!(total < 1_000_000_000);
-        // A filesystem's total capacity is always >= 0 and, on any real dev/CI
-        // box, strictly positive.
-        assert!(total > 0);
-    }
-
-    #[test]
-    #[serial]
-    fn test_worktree_root_disk_gb_returns_free_and_total_together() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (free, total) = worktree_root_disk_gb(tmp.path());
-        let free = free.expect("real df should measure free space");
-        let total = total.expect("real df should measure total capacity");
-        // Total capacity can never be smaller than free space on the same
-        // filesystem sample.
-        assert!(total >= free, "total {total} GB should be >= free {free} GB");
-    }
-
-    // ===================================================================
-    // worktree_root_total_gb / worktree_root_disk_gb — unmeasurable (None)
-    // path (#5356, mirroring #4164's free-space contract)
-    // ===================================================================
-
-    #[test]
-    #[serial]
-    fn test_worktree_root_total_gb_returns_none_on_df_failure() {
-        // A `df` on PATH that always fails must surface as `None`
-        // (unmeasurable), never a fake `Some(0)` — mirrors
-        // test_worktree_root_free_gb_returns_none_on_df_failure exactly.
-        let stub_dir = tempfile::tempdir().unwrap();
-        let stub_df = stub_dir.path().join("df");
-        std::fs::write(&stub_df, "#!/bin/sh\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stub_df).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub_df, perms).unwrap();
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{old_path}", stub_dir.path().display()));
-        let result = worktree_root_total_gb(tmp.path());
-        std::env::set_var("PATH", old_path);
-
-        assert_eq!(result, None, "a failing df must yield None (unmeasurable), not a fake Some(0)");
-    }
-
-    #[test]
-    #[serial]
-    fn test_worktree_root_disk_gb_returns_none_none_on_df_failure() {
-        // The combined probe must degrade both halves together on a failed
-        // `df` invocation — never a partial (Some, None) or (None, Some) pair
-        // from a single failed sample.
-        let stub_dir = tempfile::tempdir().unwrap();
-        let stub_df = stub_dir.path().join("df");
-        std::fs::write(&stub_df, "#!/bin/sh\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stub_df).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub_df, perms).unwrap();
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{old_path}", stub_dir.path().display()));
-        let result = worktree_root_disk_gb(tmp.path());
-        std::env::set_var("PATH", old_path);
-
-        assert_eq!(result, (None, None));
-    }
-
-    #[test]
-    #[serial]
-    fn test_worktree_root_disk_gb_matches_the_separate_probes_on_a_stub_df() {
-        // The combined probe's (free, total) pair must match what the two
-        // standalone functions would each independently parse from the same
-        // fixture — pins that worktree_root_disk_gb's single-df-call design
-        // does not silently diverge from worktree_root_free_gb /
-        // worktree_root_total_gb.
-        let stub_dir = tempfile::tempdir().unwrap();
-        let stub_df = stub_dir.path().join("df");
-        std::fs::write(
-            &stub_df,
-            "#!/bin/sh\n\
-             printf 'Filesystem 1024-blocks      Used Available Capacity  Mounted on\\n'\n\
-             printf '/dev/disk3s1 1048576000 838860800 209715200      80%%    /\\n'\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&stub_df).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub_df, perms).unwrap();
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{old_path}", stub_dir.path().display()));
-        let (free, total) = worktree_root_disk_gb(tmp.path());
-        std::env::set_var("PATH", old_path);
-
-        assert_eq!(free, Some(200));
-        assert_eq!(total, Some(1000));
     }
 
     // ===================================================================

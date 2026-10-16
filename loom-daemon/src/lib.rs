@@ -193,6 +193,7 @@ pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_alert;
 pub mod fleet_captain;
+pub mod fleet_dispatch;
 pub mod fleet_outputs;
 pub mod fleet_singletons;
 pub mod fleet_state;

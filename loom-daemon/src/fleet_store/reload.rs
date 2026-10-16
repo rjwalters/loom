@@ -132,13 +132,78 @@ const TABLE: &[(&str, Reloadability)] = &[
     // the timer task is spawned — including the very config this `render`
     // itself is driven by.
     ("fleet", Reloadability::RestartRequired),
+    // ...except the captain declaration (#12423): the gate is re-evaluated on
+    // every ci-telemetry tick (`ci_telemetry::gate_tick` →
+    // `fleet_captain::arm_singleton_job`) and on every observability export
+    // (`resolve_gate_for_root` in `observability/collector.rs`).
+    ("fleet.captain", Reloadability::Live),
+    // Audited blocks (#12423). Each entry names the call site that decided it.
+    //
+    // `read_auto_update_config` runs once from `auto_update::loop_mode::start`,
+    // which `daemon_service.rs` calls once per process.
+    ("autonomous.autoUpdate", Reloadability::RestartRequired),
+    // `daemon_service.rs` reads it once at bring-up to decide whether the
+    // reaper loop is spawned at all (and its interval); the per-tick re-read
+    // inside the loop cannot start a loop that was never spawned.
+    ("autonomous.worktreeReaper", Reloadability::RestartRequired),
+    // `observability::read_config` feeds `observer_tasks::spawn` once at
+    // bring-up (exporter wiring, `observability::spawn_task`).
+    ("observability", Reloadability::RestartRequired),
+    // `ci_telemetry::spawn_task_on` resolves the config once (owners,
+    // interval, excluded repos) before the ticker is built; only the
+    // captain gate inside the tick is live (see `fleet.captain`).
+    ("autonomous.ciTelemetry", Reloadability::RestartRequired),
+    // No daemon consumer: `autonomous.eta` is a retired block
+    // (`signoz_read::RETIRED_CONFIG_KEY`, `config_resolver`), only reported as
+    // ignored. Nothing caches it, so no restart changes anything.
+    ("autonomous.eta", Reloadability::Live),
+    // Retired block too (`work_finder::operator_priority::warn_retired_config`
+    // only warns about it); there is no value to pick up.
+    ("autonomous.operatorPriority", Reloadability::Live),
+    // Resolved per dispatch: `runtime_preference::resolve_for_dispatch` takes
+    // the root and reads the effective config on every admission.
+    ("runtimes", Reloadability::Live),
+    // `forge.gateway` is installed once into the process-wide gateway handles
+    // (`forge_gateway` `DAEMON`/`FRONT` `OnceLock`s), so the block defaults to
+    // restart-required; its per-call readers override below.
+    ("forge", Reloadability::RestartRequired),
+    // Read from the effective config on each use:
+    // `credential_preflight::config_github_app_mint_timeout_secs` and
+    // `forge_read_pool` (`resolve_effective_config` per read).
+    ("forge.githubApp", Reloadability::Live),
+    ("forge.githubAppReadPool", Reloadability::Live),
+    // `safehouse::resolve_config` is called once by
+    // `WorkspacePool::start_safehouse_narration` / peer-claim coordination at
+    // start, and the sink/coordinator it builds is held for the process.
+    ("safehouse", Reloadability::RestartRequired),
+    // `codesign.identity` is resolved fresh each time it is needed
+    // (`health::codesign::assess_codesign_identity`, the provisioning
+    // scripts); the daemon holds no copy.
+    ("codesign", Reloadability::Live),
+    // Read from the workspace's effective config on every claim, every
+    // reaper heartbeat and every step tick's budget (#12450) —
+    // `fleet_dispatch::endpoint`, never cached.
+    ("fleetDispatch", Reloadability::Live),
+    // No `loom-daemon` process reads it: ratification keys are consumed by
+    // the branch-update/sign-off scripts, fresh on each invocation.
+    ("ratification", Reloadability::Live),
 ];
 
-/// Classify one dotted config path. Unmatched paths default conservatively to
-/// [`Reloadability::RestartRequired`] — see the module doc's "mechanical
-/// test".
+/// A path with any `_`-prefixed segment is an annotation (`fleet._sync_note`),
+/// not a knob: nothing reads it, so it never needs a restart.
+fn is_annotation(path: &str) -> bool {
+    path.split('.').any(|segment| segment.starts_with('_'))
+}
+
+/// Classify one dotted config path. A `_`-prefixed segment at any depth marks
+/// an annotation and is always [`Reloadability::Live`]. Other unmatched paths
+/// default conservatively to [`Reloadability::RestartRequired`] — see the
+/// module doc's "mechanical test".
 #[must_use]
 pub fn classify(path: &str) -> Reloadability {
+    if is_annotation(path) {
+        return Reloadability::Live;
+    }
     TABLE
         .iter()
         .filter(|(prefix, _)| path == *prefix || path.starts_with(&format!("{prefix}.")))
@@ -164,6 +229,12 @@ pub fn partition(paths: &[String]) -> (Vec<String>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_dispatch_flag_and_url_are_live() {
+        assert_eq!(classify("fleetDispatch.enabled"), Reloadability::Live);
+        assert_eq!(classify("fleetDispatch.url"), Reloadability::Live);
+    }
 
     #[test]
     fn role_runner_subtree_is_live() {
@@ -202,6 +273,53 @@ mod tests {
     fn fleet_block_is_restart_required() {
         assert_eq!(classify("fleet.syncIntervalSecs"), Reloadability::RestartRequired);
         assert_eq!(classify("fleet.autoApply"), Reloadability::RestartRequired);
+    }
+
+    #[test]
+    fn underscore_segment_at_any_depth_is_live() {
+        for path in [
+            "fleet._sync_note",
+            "_note",
+            "autonomous.workFinder.enabled._why",
+            "somethingBrandNew._x.knob",
+            "fleet._a._b",
+        ] {
+            assert_eq!(classify(path), Reloadability::Live, "{path}");
+        }
+        // An underscore that is not at a segment start is a normal key.
+        assert_eq!(classify("fleet.sync_interval"), Reloadability::RestartRequired);
+    }
+
+    #[test]
+    fn fleet_captain_overrides_the_fleet_prefix() {
+        assert_eq!(classify("fleet.captain"), Reloadability::Live);
+    }
+
+    #[test]
+    fn every_audited_block_has_an_explicit_entry() {
+        use Reloadability::{Live, RestartRequired};
+        for (path, want) in [
+            ("autonomous.autoUpdate.enabled", RestartRequired),
+            ("autonomous.worktreeReaper.enabled", RestartRequired),
+            ("observability.enabled", RestartRequired),
+            ("autonomous.ciTelemetry.intervalSecs", RestartRequired),
+            ("autonomous.eta.enabled", Live),
+            ("autonomous.operatorPriority.propagate", Live),
+            ("runtimes.default", Live),
+            ("forge.gateway", RestartRequired),
+            ("forge.githubApp.mintTimeoutSeconds", Live),
+            ("forge.githubAppReadPool", Live),
+            ("safehouse.enabled", RestartRequired),
+            ("codesign.identity", Live),
+            ("ratification.key", Live),
+        ] {
+            assert_eq!(classify(path), want, "{path}");
+            let block = path.split('.').next().unwrap();
+            assert!(
+                TABLE.iter().any(|(prefix, _)| prefix.starts_with(block)),
+                "{block} has no explicit entry"
+            );
+        }
     }
 
     #[test]

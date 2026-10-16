@@ -159,6 +159,7 @@ fn limits(free_slots: usize) -> StepTickLimits {
     StepTickLimits {
         free_slots,
         spawn_concurrency: 1,
+        fallback: false,
     }
 }
 
@@ -776,4 +777,70 @@ fn other_refusals_still_redraw_in_the_same_owner() {
 fn forge_owner_is_the_lowercased_slug_prefix() {
     assert_eq!(forge_owner("AcMe/one"), "acme");
     assert_eq!(forge_owner("bare"), "bare");
+}
+
+// ---- #12450: fleet dispatch ------------------------------------------------
+
+/// A `captain_held` refusal is a cheap pass like a lost claim; in fallback
+/// neither is free, so the same refusals spend the slot's draws.
+#[test]
+fn a_captain_held_refusal_is_free_and_fallback_makes_no_loss_free() {
+    let rows: Vec<RestIssue> = (1..=20)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((10, "captain_held")),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut spawner);
+    assert_eq!(tick.report.dispatched, 1, "ten holds cost the slot nothing");
+    assert_eq!(tick.passes.get("captain_held"), Some(&10));
+    let row = tick
+        .report
+        .queue
+        .iter()
+        .find(|r| r.disposition == Some(Qd::PeerClaim));
+    assert!(row.is_some(), "a held item reads as a peer's claim");
+
+    for reason in ["claim_lost", "captain_held"] {
+        let mut spawner = FakeSpawner {
+            refuse_first: Some((10, reason)),
+            ..FakeSpawner::default()
+        };
+        let fallback = StepTickLimits {
+            fallback: true,
+            ..limits(1)
+        };
+        let tick = run_with(vec![workspace(0, "acme/one", &rows)], fallback, &mut spawner);
+        assert_eq!(tick.report.dispatched, 0, "{reason}: the slot gives up after its draws");
+        assert_eq!(tick.stop, TickStop::SlotDraws, "{reason}");
+        assert_eq!(spawner.asked.len(), MAX_DRAWS_PER_SLOT as usize, "{reason}");
+    }
+}
+
+/// `captain_cap` ends every repo's draws for the tick: the captain would
+/// refuse each later claim the same way.
+#[test]
+fn a_captain_cap_refusal_ends_the_ticks_draws() {
+    let rows: Vec<RestIssue> = (1..=10)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_all: Some("captain_cap"),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "other/two", &rows),
+        ],
+        limits(4),
+        &mut spawner,
+    );
+    assert_eq!(spawner.asked.len(), 1, "{:?}", spawner.asked);
+    assert_eq!(tick.report.dispatched, 0);
+    assert_eq!(tick.stop, TickStop::CaptainCap, "its own stop, not pool_drained");
+    assert_eq!(TickStop::CaptainCap.as_str(), "captain_cap");
+    assert_eq!(disposition_of("captain_cap"), Qd::DeferredCapacity);
+    assert_eq!(disposition_of("captain_not_eligible"), Qd::HostConstraint);
 }

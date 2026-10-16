@@ -350,6 +350,9 @@ impl StepDriver {
         let occupied: Vec<usize> = registries.iter().map(occupancy).collect();
         let held_capabilities = crate::capability::held_capabilities();
         let mut workspaces = Vec::new();
+        // Roles whose pool is exhausted in any workspace, for the
+        // fleet-dispatch heartbeat's `roles_ok` (#12450).
+        let mut exhausted_roles: std::collections::BTreeSet<String> = Default::default();
         // Per workspace: (idx, failed listing, listing state, Builders held).
         let mut notes: Vec<(usize, Option<anyhow::Error>, Option<ListingState>, usize)> =
             Vec::new();
@@ -480,6 +483,7 @@ impl StepDriver {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims())
             };
+            exhausted_roles.extend(pool_exhausted_roles.iter().cloned());
             for (item, role, until) in &gathered.ladder {
                 cooldowns.insert(*item, *role, *until);
             }
@@ -564,11 +568,23 @@ impl StepDriver {
         // normally, outside the gather's read deadline (#12074).
         let _spawning = crate::gh_invocation::read_deadline::suspend();
         let draw_started = Instant::now();
+        let free_slots = input.max_concurrent.saturating_sub(total);
+        crate::fleet_dispatch::worker::note_capacity(free_slots, &exhausted_roles);
+        // #12450: a host in fleet-dispatch fallback draws one round, with no
+        // free `claim_lost`; unchanged with the flag off.
+        let (free_slots, fallback) = input.roots.first().map_or((free_slots, false), |root| {
+            crate::fleet_dispatch::worker::tick_budget(
+                root,
+                free_slots,
+                input.spawn_concurrency.max(1),
+            )
+        });
         let result = tick::run(
             workspaces,
             StepTickLimits {
-                free_slots: input.max_concurrent.saturating_sub(total),
+                free_slots,
                 spawn_concurrency: input.spawn_concurrency.max(1),
+                fallback,
             },
             &seed,
             // Pool-wide, so read once, from the primary workspace like the

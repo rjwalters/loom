@@ -5,16 +5,10 @@ use chrono::{Duration, Utc};
 use super::*;
 use crate::observability::runtime_usage::{journal_usage, TokenUsage};
 use crate::script_helpers::transcript_usage::merge_rows;
-use crate::telemetry::trace::story_context;
 
-const REPO_ID: u64 = 4242;
-
-fn story(issue: u32) -> StoryRef {
-    StoryRef {
+fn session() -> Parent {
+    Parent::Session {
         repo: "owner/repo".into(),
-        issue,
-        story: format!("owner/repo#{issue}"),
-        context: story_context(REPO_ID, issue).unwrap(),
     }
 }
 
@@ -68,25 +62,32 @@ fn total(spans: &[SpanRecord]) -> i64 {
 }
 
 #[test]
-fn an_in_session_record_journals_an_attempt_and_per_model_usage_into_the_story_trace() {
+fn an_in_session_record_journals_an_attempt_and_per_model_usage_into_its_own_trace() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path();
     let path = transcript(ws, "a1", &[("claude-opus-5", 100), ("claude-haiku-4-5", 10)]);
     let req = request("builder", Some(1), "a1");
-    let outcome =
-        record_transcript(ws, &req, &path, Parent::Story(story(9303)), &Pricing::with(None));
+    let outcome = record_transcript(ws, &req, &path, session(), &Pricing::with(None));
     assert_eq!(outcome, Outcome::Recorded(3));
 
     let spans = journalled(ws, "insession-sweep-20260928T020000Z-1-abc");
-    let story_root = story_context(REPO_ID, 9303).unwrap();
+    let root = TraceStore::new(ws)
+        .load_or_create(ws, "insession-sweep-20260928T020000Z-1-abc")
+        .unwrap()
+        .context;
     let attempt = spans
         .iter()
         .find(|s| s.name == SpanName::RoleAttempt)
         .unwrap();
-    assert_eq!(attempt.context.trace_id, story_root.trace_id, "the story's trace");
-    assert_eq!(attempt.parent_span_id.as_ref(), Some(&story_root.span_id));
+    assert_eq!(attempt.context.trace_id, root.trace_id, "the session execution's trace");
+    assert_eq!(attempt.parent_span_id.as_ref(), Some(&root.span_id));
     assert_eq!(attempt.attributes["loom.role"], "builder");
-    assert_eq!(attempt.attributes["loom.story"], "owner/repo#9303");
+    assert_eq!(attempt.attributes["loom.repo"], "owner/repo");
+    assert!(!attempt
+        .attributes
+        .keys()
+        .any(|k| k.starts_with("loom.story.")));
+    assert!(!attempt.attributes.contains_key("loom.story"));
     assert_eq!(attempt.attributes["loom.sweep_id"], "sweep-20260928T020000Z-1-abc");
     assert_eq!(attempt.started_at.to_rfc3339(), "2026-09-28T02:00:00+00:00");
     assert_eq!(attempt.ended_at.to_rfc3339(), "2026-09-28T02:01:00+00:00");
@@ -98,7 +99,7 @@ fn an_in_session_record_journals_an_attempt_and_per_model_usage_into_the_story_t
     assert_eq!(usage.len(), 2, "one per model");
     for span in &usage {
         assert_eq!(span.parent_span_id.as_ref(), Some(&attempt.context.span_id));
-        assert_eq!(span.context.trace_id, story_root.trace_id);
+        assert_eq!(span.context.trace_id, root.trace_id);
         assert_eq!(span.attributes["loom.usage.scope"], "attempt");
         assert_eq!(span.attributes["loom.attempt"], "1");
         assert_eq!(span.attributes["loom.issue"], "9303");
@@ -108,8 +109,7 @@ fn an_in_session_record_journals_an_attempt_and_per_model_usage_into_the_story_t
     assert_eq!(total(&spans), 1700 + 170);
 
     // A re-run journals nothing new.
-    let again =
-        record_transcript(ws, &req, &path, Parent::Story(story(9303)), &Pricing::with(None));
+    let again = record_transcript(ws, &req, &path, session(), &Pricing::with(None));
     assert_eq!(again, Outcome::Recorded(0));
 }
 
@@ -122,7 +122,7 @@ fn a_doctor_retry_gives_two_attempts_whose_sum_is_the_execution_total() {
     let pricing = Pricing::with(None);
     for (attempt, agent, path) in [(2, "d2", &first), (3, "d3", &second)] {
         let req = request("doctor", Some(attempt), agent);
-        let outcome = record_transcript(ws, &req, path, Parent::Story(story(9303)), &pricing);
+        let outcome = record_transcript(ws, &req, path, session(), &pricing);
         assert_eq!(outcome, Outcome::Recorded(if attempt == 2 { 2 } else { 3 }));
     }
     let spans = journalled(ws, "insession-sweep-20260928T020000Z-1-abc");
@@ -206,8 +206,7 @@ fn unknown_usage_journals_nothing() {
     let empty = ws.join("agent-empty.jsonl");
     std::fs::write(&empty, "{\"type\":\"user\"}\n").unwrap();
     for path in [missing, empty] {
-        let outcome =
-            record_transcript(ws, &req, &path, Parent::Story(story(1)), &Pricing::with(None));
+        let outcome = record_transcript(ws, &req, &path, session(), &Pricing::with(None));
         assert!(matches!(outcome, Outcome::Skipped(_)), "{outcome:?}");
     }
     assert!(!ws.join(".loom/logs/trace-context").exists());
@@ -225,7 +224,7 @@ fn a_recorder_failure_is_an_outcome_not_a_panic() {
         ws,
         &request("builder", Some(1), "f1"),
         &path,
-        Parent::Story(story(1)),
+        session(),
         &Pricing::with(None),
     );
     assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");

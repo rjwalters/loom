@@ -136,6 +136,7 @@ pub mod session_analysis;
 pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
+pub mod standalone_ops;
 pub mod step_verdict;
 pub mod tracing;
 pub mod work_started;

@@ -618,7 +618,6 @@ fn daemon_write_paths_are_scoped() {
             "gh_invocation/own_writes.rs",
             NotAWrite("names the label flags to parse a write argv for the numbers it pins, runs none"),
         ),
-        ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         (
             "agent_gh/read_route.rs",
             NotAWrite(
@@ -644,6 +643,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "observability/otlp/relay/server.rs",
             NotAWrite("HTTP method check in the loopback relay receiver"),
+        ),
+        (
+            "fleet_dispatch/server.rs",
+            NotAWrite("HTTP method check in the captain's claim-arbiter listener"),
         ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

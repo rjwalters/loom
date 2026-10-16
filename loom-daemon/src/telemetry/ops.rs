@@ -272,6 +272,40 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.main_red.sha",
     "loom.main_red.action",
     "loom.main_red.source",
+    // `loom.fleet_dispatch.call` spans (#12449 captain, #12450 worker): one
+    // per call on each side — the side, host, endpoint, latency, HTTP status,
+    // result, reason, server epoch and assignment id
+    // (`fleet_dispatch::telemetry::KEYS`). The item and role ride the shared
+    // `loom.issue` / `loom.pr_number` / `loom.role` keys.
+    "loom.fleet_dispatch.side",
+    "loom.fleet_dispatch.host",
+    "loom.fleet_dispatch.endpoint",
+    "loom.fleet_dispatch.latency_ms",
+    "loom.fleet_dispatch.status",
+    "loom.fleet_dispatch.result",
+    "loom.fleet_dispatch.reason",
+    "loom.fleet_dispatch.server_epoch",
+    "loom.assignment.id",
+    // `reaper.pass` spans (#12461): one worktree-reaper pass over one repo and
+    // worktree class — counts, bytes and preserved-by-fixed-reason.
+    "loom.reaper.class",
+    "loom.reaper.phase",
+    "loom.reaper.scanned",
+    "loom.reaper.removed",
+    "loom.reaper.failed",
+    "loom.reaper.preserved",
+    "loom.reaper.bytes",
+    "loom.reaper.preserved.in_use",
+    "loom.reaper.preserved.unmanaged",
+    "loom.reaper.preserved.editable_install",
+    "loom.reaper.preserved.issue_open",
+    "loom.reaper.preserved.pr_open",
+    "loom.reaper.preserved.pr_unknown",
+    "loom.reaper.preserved.not_merged",
+    "loom.reaper.preserved.grace",
+    "loom.reaper.preserved.uncommitted",
+    "loom.reaper.preserved.private_workspace",
+    "loom.reaper.preserved.other",
 ];
 
 /// Longest label value kept, in bytes.
@@ -591,6 +625,25 @@ pub enum MetricName {
     /// at that instant, the complement of the per-run `loom.ci.queued_ms`.
     #[serde(rename = "loom.ci.queue_depth")]
     CiQueueDepth,
+    /// Step ticks a fleet-dispatch worker ran in fallback, by `reason` (why
+    /// fallback began), #12450. Host-level: the resource names the host.
+    #[serde(rename = "loom.fleet_dispatch.fallback_ticks")]
+    FleetDispatchFallbackTicks,
+    // ---- Fleet dispatch, captain side (Issue #12449) ----------------------
+    /// Fleet-dispatch refusals since the previous point, by `kind` (`claim`
+    /// for a claim the captain refused, `refuse` for a worker's `refuse`
+    /// call) and `reason` (the refusal reason or the `refuse` token).
+    #[serde(rename = "loom.fleet_dispatch.refusals")]
+    FleetDispatchRefusals,
+    /// Captain rows that hit their TTL since the previous point, by `kind`
+    /// (`assignment` for a granted or live row, `hold` for a `claim_lost`
+    /// hold).
+    #[serde(rename = "loom.fleet_dispatch.expired")]
+    FleetDispatchExpired,
+    /// Granted items whose worker then lost the forge order (`refuse` with
+    /// `claim_lost`): the split-brain and attended-claim measure.
+    #[serde(rename = "loom.fleet_dispatch.claim_lost_after_grant")]
+    FleetDispatchClaimLostAfterGrant,
 }
 
 impl MetricName {
@@ -671,6 +724,10 @@ impl MetricName {
             Self::FeedCompletions => "loom.feed.completions",
             Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
             Self::CiQueueDepth => "loom.ci.queue_depth",
+            Self::FleetDispatchFallbackTicks => "loom.fleet_dispatch.fallback_ticks",
+            Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
+            Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
+            Self::FleetDispatchClaimLostAfterGrant => "loom.fleet_dispatch.claim_lost_after_grant",
         }
     }
 
@@ -711,7 +768,11 @@ impl MetricName {
             | Self::StageEntryLookups
             | Self::FeedCompletions
             | Self::FeedReconcilePasses
-            | Self::AgentScopeOomKills => MetricKind::DeltaCounter,
+            | Self::AgentScopeOomKills
+            | Self::FleetDispatchFallbackTicks
+            | Self::FleetDispatchRefusals
+            | Self::FleetDispatchExpired
+            | Self::FleetDispatchClaimLostAfterGrant => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -775,6 +836,9 @@ impl MetricName {
             Self::FeedReconcilePasses => "{pass}",
             Self::CiQueueDepth => "{run}",
             Self::AgentScopeOomKills => "{kill}",
+            Self::FleetDispatchFallbackTicks => "{tick}",
+            Self::FleetDispatchRefusals | Self::FleetDispatchClaimLostAfterGrant => "{claim}",
+            Self::FleetDispatchExpired => "{assignment}",
             _ => "By",
         }
     }
@@ -902,6 +966,18 @@ impl MetricName {
             }
             Self::CiQueueDepth => {
                 "Workflow runs queued for a runner in the CI poll window at the end of a poll, by repo."
+            }
+            Self::FleetDispatchFallbackTicks => {
+                "Step ticks run in fleet-dispatch fallback, by the reason fallback began."
+            }
+            Self::FleetDispatchRefusals => {
+                "Fleet-dispatch refusals at the captain, by kind (claim / refuse) and reason."
+            }
+            Self::FleetDispatchExpired => {
+                "Captain assignment rows that hit their TTL, by kind (assignment / hold)."
+            }
+            Self::FleetDispatchClaimLostAfterGrant => {
+                "Captain grants whose worker then lost the forge order (claim_lost)."
             }
         }
     }
