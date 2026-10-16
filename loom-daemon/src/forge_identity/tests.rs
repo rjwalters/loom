@@ -18,6 +18,7 @@ fn split_roster() -> Roster {
             ident("202", Some("loom-fleet-reader-2")),
         ],
         legacy_logins: vec!["loom-fleet-dispatch-0".to_string()],
+        writers: Vec::new(),
     }
 }
 
@@ -204,6 +205,7 @@ fn a_fresh_reader_dir_is_used_and_a_near_expiry_one_is_not() {
         writer: Some(ident("100", Some("w"))),
         readers: vec![ident("fresh-1", Some("r1"))],
         legacy_logins: vec![],
+        writers: Vec::new(),
     };
     let reader = &r.readers[0];
     let now = SystemTime::now();
@@ -241,6 +243,7 @@ fn a_withdrawn_reader_sends_reads_elsewhere() {
         writer: Some(ident("100", None)),
         readers: vec![ident("wd-only", None)],
         legacy_logins: vec![],
+        writers: Vec::new(),
     };
     assert!(reader_for(&r, "o/r").is_some());
     withdraw_reader("wd-only", "test");
@@ -280,6 +283,7 @@ fn refresh_publishes_each_reader_for_each_owner_and_withdraws_failures() {
         writer: Some(ident("100", None)),
         readers: vec![ident("rf-ok", Some("ok")), ident("rf-bad", Some("bad"))],
         legacy_logins: vec![],
+        writers: Vec::new(),
     };
     let expires = (chrono::Utc::now() + chrono::Duration::minutes(55)).to_rfc3339();
     let exp2 = expires.clone();
@@ -433,6 +437,7 @@ fn a_coverage_withdrawal_affects_only_that_repo() {
         writer: Some(ident("100", None)),
         readers: vec![ident("cov-a", None), ident("cov-b", None)],
         legacy_logins: vec![],
+        writers: Vec::new(),
     };
     // Find two repos that hash to the same reader.
     let first = reader_for(&r, "owner/repo-0").unwrap().app_id.clone();
@@ -526,6 +531,7 @@ fn a_stale_reader_token_yields_to_the_next_reader_not_the_writer() {
         writer: Some(ident("100", None)),
         readers: vec![ident("nx-a", None), ident("nx-b", None)],
         legacy_logins: vec![],
+        writers: Vec::new(),
     };
     let repo = "Acme/app";
     let first = reader_for(&r, repo).unwrap().clone();
@@ -560,4 +566,80 @@ fn a_reader_root_is_an_absolute_workspace_only() {
     assert_eq!(reader_root_from(Some("rel/ws".into())), None);
     assert_eq!(reader_root_from(Some(std::ffi::OsString::new())), None);
     assert_eq!(reader_root_from(None), None);
+}
+
+// ---- per-owner writers (#12446) --------------------------------------------
+
+fn writers_cfg() -> Value {
+    json!({"forge": {
+        "githubApp": {"appId": "100", "privateKeyPath": "/k/w.pem"},
+        "identities": {
+            "writers": [
+                {"appId": "200", "slug": "org-writer", "privateKeyPath": "/k/o.pem", "owners": ["OrgTwo", "org-three"]},
+                {"appId": "300", "privateKeyPath": "/k/x.pem", "owners": ["orgtwo"]}
+            ],
+            "readers": [{"appId": "200", "privateKeyPath": "/k/o.pem"}, {"appId": "201", "privateKeyPath": "/k/r.pem"}]
+        }
+    }})
+}
+
+#[test]
+fn writers_block_is_parsed_and_resolves_per_owner() {
+    let r = from_config(&writers_cfg(), None, &[]);
+    assert_eq!(r.writers.len(), 2);
+    assert_eq!(r.writer.as_ref().unwrap().app_id, "100");
+    // Case-insensitive; the first entry wins over a later one claiming the owner.
+    assert_eq!(writer_for_owner(&r, "ORGTWO").unwrap().app_id, "200");
+    assert_eq!(writer_for_owner(&r, "org-three").unwrap().app_id, "200");
+    // An unlisted owner takes the default writer.
+    assert_eq!(writer_for_owner(&r, "someone").unwrap().app_id, "100");
+}
+
+#[test]
+fn without_writers_every_owner_uses_the_default_writer() {
+    let r = from_config(&split_roster_cfg(), None, &[]);
+    assert!(r.writers.is_empty());
+    assert_eq!(writer_for_owner(&r, "anyone").unwrap().app_id, "100");
+    let none = Roster::default();
+    assert!(writer_for_owner(&none, "anyone").is_none());
+    // The serialised roster is unchanged when no `writers` key is set.
+    assert!(serde_json::to_value(&r).unwrap().get("writers").is_none());
+}
+
+fn split_roster_cfg() -> Value {
+    json!({"forge": {"githubApp": {"appId": "100", "privateKeyPath": "/k/w.pem"}}})
+}
+
+#[test]
+fn a_reader_that_is_also_an_owner_writer_is_dropped() {
+    let r = from_config(&writers_cfg(), None, &[]);
+    assert_eq!(
+        r.readers
+            .iter()
+            .map(|x| x.app_id.as_str())
+            .collect::<Vec<_>>(),
+        ["201"]
+    );
+}
+
+#[test]
+fn owner_writers_are_fleet_logins_with_role_writer() {
+    let r = from_config(&writers_cfg(), None, &[]);
+    assert!(FleetLogins::of(&r).contains("org-writer[bot]"));
+    assert_eq!(role_of(&r, "org-writer"), Some("writer"));
+}
+
+#[test]
+fn writers_warnings_flag_bad_entries_and_duplicate_owners() {
+    let cfg = json!({"forge": {"identities": {"writers": [
+        {"appId": "200", "privateKeyPath": "/k/o.pem", "owners": ["orgtwo", "bad owner!"]},
+        {"appId": "300", "privateKeyPath": "/k/x.pem", "owners": ["OrgTwo"]},
+        {"appId": "400", "privateKeyPath": "/k/y.pem"},
+        {"appId": "500"}
+    ]}}});
+    let w = config_warnings(&cfg).join("\n");
+    assert!(w.contains("bad owner!") && w.contains("dropped"), "{w}");
+    assert!(w.contains("owner orgtwo is claimed by app 200 and app 300"), "{w}");
+    assert!(w.contains("app 400") && w.contains("never chosen"), "{w}");
+    assert!(w.contains("app 500") && w.contains("ignored"), "{w}");
 }

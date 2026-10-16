@@ -476,6 +476,13 @@ Every host is configured the same way. There is no per-host pinning:
     reader for that one repo for an hour;
   - only a **mint or key** failure withdraws the reader App-wide.
 
+- **Per-owner writers (#12446).** When the fleet manages repos under more than
+  one account (a user and an org) a single private App cannot write to both. Add
+  `forge.identities.writers: [{"appId": "...", "privateKeyPath": "...", "owners": ["acme"]}]`;
+  writes for a listed owner mint as that App, every other owner keeps
+  `forge.githubApp`. Absent key = unchanged behaviour. Check with
+  `loom-daemon forge identities` and `loom-daemon forge token --repo acme/x`.
+
   Each withdrawal is exported as a `forge.reader.withdrawn` span
   ([`telemetry-schema.md`](telemetry-schema.md)), and `loom-daemon status`
   lists the live scoped ones under `reader withdrawals (scoped)`. Reads fall

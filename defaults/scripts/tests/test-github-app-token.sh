@@ -499,6 +499,65 @@ fi
 unset -f curl github_app_jwt
 unset LOOM_GITHUB_APP_ID LOOM_GITHUB_APP_KEY_PATH STUB_INSTALL_BODY STUB_INSTALL_CODE
 
+# ============================================================================
+# Per-owner writer selection (forge.identities.writers[], #12446)
+# ============================================================================
+echo "Testing per-owner writer selection..."
+
+WRITERS_REPO="$WORK_DIR/writers-repo"
+mkdir -p "$WRITERS_REPO/.loom"
+cat > "$WRITERS_REPO/.loom/config.json" <<CFG
+{"forge":{"githubApp":{"appId":"100","privateKeyPath":"$KEY_PATH"},
+  "identities":{"writers":[
+    {"appId":"200","privateKeyPath":"$KEY_PATH","owners":["OrgTwo","org-three"]},
+    {"appId":"300","privateKeyPath":"$KEY_PATH","owners":["orgtwo"]}]}}}
+CFG
+unset LOOM_GITHUB_APP_ID LOOM_GITHUB_APP_KEY_PATH 2>/dev/null || true
+
+resolved_app_for() {
+    REPO_ROOT="$WRITERS_REPO" LOOM_CONFIG_DEFAULTS_FILE="" bash -c "
+        source '$LIB_DIR/github-app-token.sh'
+        github_app_configured '$1' && printf '%s' \"\$_GH_APP_ID\"
+      "
+}
+
+if [[ "$(resolved_app_for orgtwo)" == "200" && "$(resolved_app_for ORG-THREE)" == "200" ]]; then
+    pass "a listed owner resolves its writer app (case-insensitive, first match wins)"
+else
+    fail "listed owner should resolve writers[0]" "orgtwo=$(resolved_app_for orgtwo) org-three=$(resolved_app_for ORG-THREE)"
+fi
+if [[ "$(resolved_app_for someone-else)" == "100" && "$(resolved_app_for '')" == "100" ]]; then
+    pass "an unlisted owner (or none) falls back to forge.githubApp"
+else
+    fail "unlisted owner should fall back to forge.githubApp"
+fi
+if [[ "$(LOOM_GITHUB_APP_ID=999 LOOM_GITHUB_APP_KEY_PATH="$KEY_PATH" resolved_app_for orgtwo)" == "999" ]]; then
+    pass "env LOOM_GITHUB_APP_ID still beats a per-owner writer"
+else
+    fail "env override should beat writers[]"
+fi
+
+# Two owners mint with two different app ids through the CLI envelope.
+export LOOM_GITHUB_APP_CACHE_DIR="$WORK_DIR/cache-writers"
+curl() {
+    local url="" arg
+    for arg in "$@"; do [[ "$arg" == https://* ]] && url="$arg"; done
+    if [[ "$url" == */installation ]]; then
+        printf '{"id": 77}\n200'
+    else
+        printf '{"token":"ghs_stub","expires_at":"2099-01-01T00:00:00Z"}\n201'
+    fi
+}
+export -f curl
+listed_out=$(REPO_ROOT="$WRITERS_REPO" LOOM_CONFIG_DEFAULTS_FILE="" bash "$LIB_DIR/github-app-token.sh" get-token "orgtwo/repo")
+other_out=$(REPO_ROOT="$WRITERS_REPO" LOOM_CONFIG_DEFAULTS_FILE="" bash "$LIB_DIR/github-app-token.sh" get-token "someone-else/repo")
+if [[ "$(echo "$listed_out" | jq -r '.app_id')" == "200" && "$(echo "$other_out" | jq -r '.app_id')" == "100" ]]; then
+    pass "get-token mints with a different app id per owner"
+else
+    fail "get-token should report per-owner app ids" "listed=$listed_out other=$other_out"
+fi
+unset -f curl
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
