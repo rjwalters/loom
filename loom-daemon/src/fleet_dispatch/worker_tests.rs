@@ -297,6 +297,45 @@ fn a_repo_whose_reaper_stopped_ages_out_and_its_grants_are_released() {
     assert!(state().assignments.is_empty());
 }
 
+/// The age-out is three reaper periods with a 90 s floor, so a long
+/// `LOOM_SWEEP_REAPER_INTERVAL_SECS` does not age out a live repo.
+#[test]
+fn live_stale_after_is_three_reaper_periods_with_a_floor() {
+    assert_eq!(live_stale_after_for(Duration::from_secs(30)), LIVE_STALE_AFTER);
+    assert_eq!(live_stale_after_for(Duration::from_secs(5)), LIVE_STALE_AFTER);
+    assert_eq!(live_stale_after_for(Duration::from_secs(120)), Duration::from_secs(360));
+}
+
+/// With a reaper interval above 90 s, a repo last refreshed one interval ago
+/// is still live: it stays in the heartbeat and its grant is not released.
+#[test]
+#[serial]
+fn a_long_reaper_interval_does_not_age_out_a_live_repo() {
+    reset_for_test();
+    std::env::set_var(crate::sweep_registry::reaper::REAPER_INTERVAL_ENV, "120");
+    let (a, b) = (tempdir().unwrap(), tempdir().unwrap());
+    let server = granting();
+    enable(a.path(), &server.url(), true);
+    enable(b.path(), &server.url(), true);
+    note_capacity(5, &BTreeSet::new());
+    let Ask::Granted(grant) = claim(a.path(), 7, StepRole::Judge) else {
+        panic!("granted");
+    };
+    note_spawned(a.path(), "step-judge-7-1", grant);
+    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    server.wait_for(proto::HEARTBEAT_PATH, 1);
+
+    // One 120 s interval since a's last tick: past the old fixed 90 s.
+    state().live_by_root.get_mut(a.path()).unwrap().refreshed = ago(Duration::from_secs(120));
+    state().last_heartbeat = None;
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    let beats = server.wait_for(proto::HEARTBEAT_PATH, 2);
+    std::env::remove_var(crate::sweep_registry::reaper::REAPER_INTERVAL_ENV);
+    assert_eq!(beats[1]["live"].as_array().unwrap().len(), 2);
+    assert!(server.requests_to(proto::RELEASE_PATH).is_empty());
+    assert!(state().live_by_root.contains_key(a.path()));
+}
+
 /// Each role is listed once in `roles_ok`, though three steps share
 /// `champion`.
 #[test]
