@@ -17,6 +17,7 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     // Emitted on every collector tick, whatever the host is doing.
     ("host.health", Some(24)),
     ("host.export", Some(24)),
+    ("host.status", Some(24)),
     ("tokens.snapshot", Some(24)),
     // Activity-driven or failure-only: an idle host emits none of these.
     ("sweep.started", None),
