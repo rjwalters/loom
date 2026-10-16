@@ -688,6 +688,42 @@ NONLOOM25=$(mktemp -d); git -C "$NONLOOM25" init -q
 out=$(cd "$NONLOOM25" && LOOM_HOME="$CHK25" LOOM_DAEMON_SELF_BIN="$FAKE25" bash -c "$CMD25" </dev/null 2>&1); rc=$?
 assert_eq "$out|$rc|$(cat "$ARGV25")" "|0|" "non-Loom repo: the wrapper never runs the stub (PATH untouched)"
 
+# ── Test 25b: the SessionStart prompt-tree record (#12509) ───────────────────
+echo "Test 25b: SessionStart prompt-tree-session.sh — wired once beside gh-front-env.sh, operator entries kept, removed by deprovision, stub stdout-silent (#12509)"
+HOME25B=$(mktemp -d); mkdir -p "$HOME25B/.claude"
+cat > "$HOME25B/.claude/settings.json" <<'EOF'
+{ "hooks": { "SessionStart": [ { "matcher": "startup", "hooks": [
+  { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/skills/repo/hooks/session-start-handoff.sh" }
+] } ] } }
+EOF
+S25B="$HOME25B/.claude/settings.json"
+provision_loom_hooks "$HOME25B/.claude" >/dev/null 2>&1
+provision_loom_hooks "$HOME25B/.claude" >/dev/null 2>&1
+assert_eq "$(count_marker "$S25B" prompt-tree-session.sh)" "1" "prompt-tree-session.sh wired exactly once after two provisions"
+assert_eq "$(count_marker "$S25B" gh-front-env.sh)" "1" "gh-front-env.sh still wired once beside it"
+assert_eq "$(jq -r '[.hooks.SessionStart[] | select(any(.hooks[]?; .command | contains("defaults/hooks/prompt-tree-session.sh"))) | .matcher] == [""]' "$S25B")" "true" "wired under matcher \"\" (startup, resume, clear, compact)"
+HANDOFF25B='[.hooks.SessionStart[]? | .hooks[]? | .command | select(contains("session-start-handoff.sh"))] | length'
+assert_eq "$(jq -r "$HANDOFF25B" "$S25B")" "1" "operator's own SessionStart entry preserved"
+deprovision_loom_hooks "$HOME25B/.claude" >/dev/null 2>&1
+assert_eq "$(count_marker "$S25B" prompt-tree-session.sh)" "0" "deprovision removed the SessionStart entry"
+assert_eq "$(jq -r "$HANDOFF25B" "$S25B")" "1" "operator's SessionStart entry survives deprovision"
+# The stub: whatever the daemon prints, the hook prints nothing on stdout
+# (SessionStart stdout reaches the model) and exits 0, even without a binary.
+CHK25B=$(mktemp -d); mkdir -p "$CHK25B/defaults/hooks"
+cp "$REPO_ROOT/defaults/hooks/prompt-tree-session.sh" "$CHK25B/defaults/hooks/"
+ln -s "$REPO_ROOT/defaults/scripts" "$CHK25B/defaults/scripts"
+FAKE25B="$CHK25B/fake-daemon"; ARGV25B="$CHK25B/argv"
+printf '#!/bin/sh\necho "$*" >> "%s"\necho STDOUT-NOISE\n' "$ARGV25B" > "$FAKE25B"
+chmod +x "$FAKE25B"
+out=$(env -u LOOM_DAEMON_ITEM_ID LOOM_PROMPT_TREE_BIN="$FAKE25B" bash "$CHK25B/defaults/hooks/prompt-tree-session.sh" </dev/null 2>/dev/null); rc=$?
+assert_eq "$out|$rc" "|0" "stub is stdout-silent and exits 0 even when the daemon prints on stdout"
+assert_eq "$(cat "$ARGV25B" 2>/dev/null)" "prompt-tree session-start" "stub runs \`prompt-tree session-start\`"
+: > "$ARGV25B"
+out=$(LOOM_DAEMON_ITEM_ID=42 LOOM_PROMPT_TREE_BIN="$FAKE25B" bash "$CHK25B/defaults/hooks/prompt-tree-session.sh" </dev/null 2>/dev/null); rc=$?
+assert_eq "$out|$rc|$(cat "$ARGV25B")" "|0|" "a daemon-dispatched agent: exit 0, binary never called"
+out=$(env -u LOOM_DAEMON_ITEM_ID LOOM_PROMPT_TREE_BIN="/nonexistent/loom-daemon" bash "$CHK25B/defaults/hooks/prompt-tree-session.sh" </dev/null 2>&1); rc=$?
+assert_eq "$out|$rc" "|0" "missing binary -> silent exit 0"
+
 # ── Test 26: guard-uncommitted-work.sh on Stop AND SubagentStop (#8372) ─────
 echo "Test 26: uncommitted-work consumer canary stub — both events, both install modes, dedup, deprovision (#8372)"
 # Count entries for <name> under ONE hook event type (machine marker).

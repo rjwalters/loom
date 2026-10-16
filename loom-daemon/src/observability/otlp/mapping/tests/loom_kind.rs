@@ -131,6 +131,8 @@ fn samples() -> Vec<TelemetryRecord> {
                     "exporters": []})),
         wire(json!({"kind": "operator.presence", "captured_at": AT, "host": "host-a",
                     "session_id": "s1", "last_activity_at": AT, "driving": []})),
+        wire(json!({"kind": "session.prompt_tree", "captured_at": AT, "session_id": "s1",
+                    "prompt": {"commit": "a"}})),
         wire(json!({"kind": "checkout.external_change", "change_id": "c", "root": "/r",
                     "host": "host-a", "move_kind": "reset", "ref": "HEAD", "reflog_line": "reset: moving to x",
                     "from_sha": "a", "to_sha": "b", "at": AT, "observed_at": AT,

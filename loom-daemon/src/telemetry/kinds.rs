@@ -184,6 +184,9 @@ pub mod scope_memory;
 /// `operator.presence` (#11563) — an operator session's keyboard presence.
 pub mod operator_presence;
 
+/// `session.prompt_tree` (#12509) — an attended session's checkout freshness.
+pub mod session_prompt_tree;
+
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
 pub mod pass;
 
@@ -508,6 +511,11 @@ macro_rules! telemetry_kind_table {
             /// gauges only. See [`host_status`].
             HostStatus = "host.status" => $crate::telemetry::kinds::host_status::HostStatusRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Gauges, native: false;
+
+            /// The checkout an attended session started in, measured against
+            /// GitHub's tip (#12509). OTLP-only. See [`session_prompt_tree`].
+            SessionPromptTree = "session.prompt_tree" => $crate::telemetry::kinds::session_prompt_tree::SessionPromptTreeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

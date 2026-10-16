@@ -33,6 +33,22 @@ pub struct PromptTree {
     /// `false` when `HEAD` is detached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_branch: Option<bool>,
+    /// GitHub's tip of the default branch, as `git ls-remote` reported it
+    /// (#12509). Only the attended `session.prompt_tree` record fills it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_tip: Option<String>,
+    /// The clone's local `origin/<default>` ref disagrees with
+    /// [`Self::remote_tip`] (or does not exist): the remote-tracking ref is
+    /// stale or divergent, so a count against it would under-report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_ref_stale: Option<bool>,
+    /// `owner/repo` of the `origin` remote, never a full URL or userinfo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_repo: Option<String>,
+    /// `origin` is not the expected forge repo (a local path, another host,
+    /// another repo, or an unparseable URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_foreign: Option<bool>,
 }
 
 /// One bounded local `git` read; `None` on a non-zero exit, a spawn failure
@@ -61,8 +77,16 @@ pub fn read(root: &Path) -> Option<PromptTree> {
         loom_version,
         commits_behind,
         on_branch,
+        ..PromptTree::default()
     })
 }
+
+pub mod remote;
+pub mod session;
+
+#[cfg(test)]
+#[path = "prompt_tree_tests.rs"]
+mod remote_tests;
 
 #[cfg(test)]
 mod tests {

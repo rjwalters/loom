@@ -26,6 +26,23 @@ pub(super) fn attributes(prompt: Option<&PromptTree>) -> Vec<KeyValue> {
         };
         out.push(kv("loom.prompt.on_branch", value));
     }
+    if let Some(tip) = &prompt.remote_tip {
+        out.push(kv_string("loom.prompt.remote_tip", tip.clone()));
+    }
+    for (key, flag) in [
+        ("loom.prompt.origin_ref_stale", prompt.origin_ref_stale),
+        ("loom.prompt.remote_foreign", prompt.remote_foreign),
+    ] {
+        if let Some(flag) = flag {
+            let value = AnyValue {
+                value: Some(any_value::Value::BoolValue(flag)),
+            };
+            out.push(kv(key, value));
+        }
+    }
+    if let Some(repo) = &prompt.remote_repo {
+        out.push(kv_string("loom.prompt.remote_repo", repo.clone()));
+    }
     out
 }
 
@@ -44,6 +61,10 @@ mod tests {
             loom_version: Some("0.19.1100".to_string()),
             commits_behind: Some(121),
             on_branch: Some(false),
+            remote_tip: Some("c".repeat(40)),
+            origin_ref_stale: Some(true),
+            remote_repo: Some("o/r".to_string()),
+            remote_foreign: Some(false),
         };
         let kvs = attributes(Some(&tree));
         assert_eq!(
@@ -52,7 +73,11 @@ mod tests {
                 "loom.prompt.commit",
                 "loom.prompt.loom_version",
                 "loom.prompt.commits_behind",
-                "loom.prompt.on_branch"
+                "loom.prompt.on_branch",
+                "loom.prompt.remote_tip",
+                "loom.prompt.origin_ref_stale",
+                "loom.prompt.remote_foreign",
+                "loom.prompt.remote_repo"
             ]
         );
         assert_eq!(kvs[2].value.as_ref().unwrap().value, Some(any_value::Value::IntValue(121)));

@@ -10,7 +10,10 @@
 //! `FETCH_HEAD`). Nothing here runs `reset`, `rebase`, `stash` or `clean`,
 //! makes a merge commit, or removes a lock file.
 //!
-//! Two commands use the network: [`remote_head`] and [`fetch`]. Every ref
+//! Four commands use the network: [`remote_head`] and [`fetch`], plus the two
+//! the attended session-start probe adds (#12509): [`remote_default_head`], an
+//! `ls-remote --symref`, and [`fetch_objects`], a fetch that moves no ref and
+//! writes no `FETCH_HEAD`. Every ref
 //! operand that comes from the remote sits behind a standalone `--` (#9106,
 //! #9479), and the default branch's name is checked with
 //! [`crate::refname::check_refname`] before it is used at all.
@@ -23,9 +26,9 @@ use crate::cmd_out::CmdOutcome;
 use crate::fleet_sync::git_spawn_log::{memory_config_for, run_logged};
 
 /// Bound for `git ls-remote` of one ref: a connection and a ref advertisement.
-pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound for the fetch of one branch.
-pub(super) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Starting bound for each local read.
 pub(crate) const LOCAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound for the fast-forward itself. Long on purpose, and never shortened by
@@ -49,13 +52,13 @@ pub(super) enum Refusal {
     Other(String),
 }
 
-pub(super) fn tracking(branch: &str) -> String {
+pub(crate) fn tracking(branch: &str) -> String {
     format!("refs/remotes/origin/{branch}")
 }
 
 /// Run `git` in `root` to an exit. `config` is `-c` pairs placed before the
 /// subcommand. `Err` when it could not be run or outlived `timeout`.
-pub(super) fn run(
+pub(crate) fn run(
     root: &Path,
     config: &[&str],
     args: &[&str],
@@ -111,11 +114,11 @@ fn command(root: &Path, config: &[&str], args: &[&str]) -> Command {
     cmd
 }
 
-pub(super) fn stderr(out: &Output) -> String {
+pub(crate) fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
 }
 
-pub(super) fn stdout(out: &Output) -> String {
+pub(crate) fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -158,9 +161,74 @@ pub(super) fn remote_head(root: &Path, branch: &str, timeout: Duration) -> Resul
         .ok_or_else(|| format!("origin has no {name}"))
 }
 
+/// The remote's default branch and its tip, from one
+/// `git ls-remote --symref origin -- HEAD`: works when the clone's own
+/// `origin/HEAD` is unset (#12509). Nothing is written in the clone.
+pub(crate) fn remote_default_head(
+    root: &Path,
+    timeout: Duration,
+) -> Result<(String, String), String> {
+    let listed = ok(root, &["ls-remote", "--quiet", "--symref", "origin", "--", "HEAD"], timeout)?;
+    parse_symref_head(&listed)
+        .ok_or_else(|| "origin did not advertise a default branch".to_string())
+}
+
+/// `(branch, tip)` out of `ls-remote --symref origin HEAD` output. The branch
+/// passes [`crate::refname::check_refname`] and the tip is a full hex object id.
+pub(crate) fn parse_symref_head(listed: &str) -> Option<(String, String)> {
+    let branch = listed
+        .lines()
+        .find_map(|l| l.strip_prefix("ref: refs/heads/"))
+        .and_then(|rest| rest.split_once('\t'))
+        .filter(|(b, at)| *at == "HEAD" && crate::refname::check_refname(b).is_ok())
+        .map(|(b, _)| b.to_string())?;
+    let tip = listed
+        .lines()
+        .filter(|l| !l.starts_with("ref:"))
+        .filter_map(|l| l.split_once('\t'))
+        .find(|(_, at)| *at == "HEAD")
+        .map(|(sha, _)| sha)
+        .filter(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))?;
+    Some((branch, tip.to_string()))
+}
+
+/// Download `refs/heads/<branch>`'s objects without touching the clone's
+/// refs: no remote-tracking ref moves, no `FETCH_HEAD`, no maintenance run.
+/// The tip is then readable by id, which is all a behind count needs (#12509).
+pub(crate) fn fetch_objects(root: &Path, branch: &str, timeout: Duration) -> Result<(), String> {
+    let refspec = format!("refs/heads/{branch}");
+    run_ok(
+        root,
+        &["gc.auto=0"],
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--refmap=",
+            "origin",
+            "--",
+            &refspec,
+        ],
+        timeout,
+    )
+}
+
+/// [`run`] with `-c` pairs, requiring exit 0.
+fn run_ok(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result<(), String> {
+    let out = run(root, config, args, timeout)?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("git {} failed: {}", args.join(" "), stderr(&out)))
+    }
+}
+
 /// The commit the clone's `origin/<branch>` is at; `None` when it has never
 /// been fetched. Local.
-pub(super) fn tracking_head(root: &Path, branch: &str, timeout: Duration) -> Option<String> {
+pub(crate) fn tracking_head(root: &Path, branch: &str, timeout: Duration) -> Option<String> {
     let spec = format!("{}^{{commit}}", tracking(branch));
     ok(root, &["rev-parse", "--verify", "--quiet", &spec], timeout)
         .ok()
