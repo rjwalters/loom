@@ -25,7 +25,7 @@
 //!    time). [`revoke_refail_dequeue`] revokes the grant, then posts a
 //!    `failure` status for [`REQUIRED_CHECK_CONTEXT`] on **every live group
 //!    commit containing the PR** (a commit status is latest-wins per
-//!    context), then dequeues. All three are attempted; each is idempotent.
+//!    context) and on the PR head (#12496), then dequeues. All three are attempted; each is idempotent.
 //!
 //! # What remains open
 //!
@@ -275,13 +275,22 @@ pub struct GroupRevocation {
     /// Group commits re-failed, or why that could not be confirmed (group
     /// discovery failed, or a status write failed).
     pub refailed: Result<Vec<String>, String>,
+    /// The `failure` on the PR head itself (#12496), or why it was not
+    /// confirmed written. The head success a handoff posted would otherwise
+    /// survive the revocation and let a re-enqueue pass GitHub's required
+    /// check on the head.
+    pub head_failed: Result<(), String>,
 }
 
 impl fmt::Display for GroupRevocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.refailed {
-            Ok(c) => write!(f, "re-failed {} merge-group commit(s)", c.len()),
-            Err(e) => write!(f, "merge-group re-fail NOT confirmed ({e})"),
+            Ok(c) => write!(f, "re-failed {} merge-group commit(s)", c.len())?,
+            Err(e) => write!(f, "merge-group re-fail NOT confirmed ({e})")?,
+        }
+        match &self.head_failed {
+            Ok(()) => write!(f, "; PR head status failed"),
+            Err(e) => write!(f, "; PR head status failure NOT confirmed ({e})"),
         }
     }
 }
@@ -310,11 +319,13 @@ impl GroupRevocation {
 }
 
 /// Revoke the grant, re-fail every live merge-group commit that contains
-/// `pr`, then dequeue. Every step is attempted regardless of the others;
+/// `pr` and the PR head itself (`head`, read lazily; an `Err` is reported in
+/// [`GroupRevocation::head_failed`]), then dequeue. Every step is attempted regardless of the others;
 /// all are idempotent, so duplicate events are safe.
 ///
 /// Re-failing needs no execution gate: it only ever withdraws authority. The
 /// dequeue goes through [`ops::guarded_dequeue`] as before.
+#[allow(clippy::too_many_arguments)] // injected seams (queue, grants, statuses, groups, head), each distinct
 pub fn revoke_refail_dequeue(
     mode: MergeMode,
     execution_enabled: bool,
@@ -322,6 +333,7 @@ pub fn revoke_refail_dequeue(
     store: &dyn GrantStore,
     statuses: &dyn StatusApi,
     groups: &dyn Fn() -> Result<Vec<MergeGroup>, String>,
+    head: &dyn Fn() -> Result<String, String>,
     pr: u32,
 ) -> GroupRevocation {
     let grant_revoked = store.revoke(pr);
@@ -341,6 +353,11 @@ pub fn revoke_refail_dequeue(
             Err(errs.join("; "))
         }
     });
+    let head_failed = head().and_then(|sha| {
+        statuses
+            .post_status(&sha, StatusState::Failure, &format!("authorization for #{pr} revoked"))
+            .map_err(|e| format!("{sha}: {e}"))
+    });
     let dequeue = ops::guarded_dequeue(mode, execution_enabled, api, pr);
     GroupRevocation {
         revocation: Revocation {
@@ -348,5 +365,6 @@ pub fn revoke_refail_dequeue(
             dequeue,
         },
         refailed,
+        head_failed,
     }
 }

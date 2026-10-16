@@ -532,8 +532,12 @@ fn daemon_write_paths_are_scoped() {
                  whose callers are exactly the gh_lifecycle.rs ones above: `forge \
                  merge-queue revoke` (vetted via write_target) and `revoke_for_root` (behind \
                  gate_root_with / the shell-vetted disable-auto-merge guard). It returns \
-                 before any forge call in direct mode, refuses a non-sha target, and only \
-                 ever writes `failure` (withdraws authority); opt-in via \
+                 before any forge call in direct mode, refuses a non-sha target, and writes \
+                 `failure` (withdraws authority) on revoke. The one `success` write (#12496) \
+                 is the PR-head status `authorize_and_enqueue` posts from `forge merge-queue \
+                 handoff` (vetted via write_target), only after the dormant/direct execution \
+                 gate and `evaluate` allowed it, pinned to the grant's approved sha, and rolled \
+                 back to `failure` if the enqueue does not follow; opt-in via \
                  champion.mergeMode=queue",
             ),
         ),

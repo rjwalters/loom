@@ -10,6 +10,7 @@
 use std::cell::{Cell, RefCell};
 
 use super::authz::*;
+use super::group_authz::{StatusApi, StatusState};
 use super::mode::MergeMode;
 use super::ops::*;
 
@@ -23,6 +24,11 @@ struct FakeForge {
     merged: Cell<bool>,
     facts: RefCell<Result<AuthzFacts, String>>,
     check: RefCell<Option<CheckConclusion>>,
+    /// Latest `loom/merge-authorization` status per commit.
+    head_status: RefCell<std::collections::HashMap<String, StatusState>>,
+    status_fails: Cell<bool>,
+    /// GitHub only enqueues a PR whose required check is green on its head.
+    require_head_status: Cell<bool>,
     dequeue_fails: Cell<bool>,
     revoke_on_enqueue: Cell<bool>,
 }
@@ -35,6 +41,9 @@ impl FakeForge {
             merged: Cell::new(false),
             facts: RefCell::new(Ok(AuthzFacts::approved(SHA1))),
             check: RefCell::new(None),
+            head_status: RefCell::new(std::collections::HashMap::new()),
+            status_fails: Cell::new(false),
+            require_head_status: Cell::new(true),
             dequeue_fails: Cell::new(false),
             revoke_on_enqueue: Cell::new(false),
         }
@@ -69,6 +78,16 @@ impl FakeForge {
     }
 }
 
+impl StatusApi for FakeForge {
+    fn post_status(&self, commit: &str, s: StatusState, _d: &str) -> Result<(), String> {
+        if self.status_fails.get() {
+            return Err("statuses api 503".into());
+        }
+        self.head_status.borrow_mut().insert(commit.into(), s);
+        Ok(())
+    }
+}
+
 impl QueueApi for FakeForge {
     fn status(&self, pr: u32) -> Result<PrQueueStatus, QueueError> {
         Ok(PrQueueStatus {
@@ -88,6 +107,12 @@ impl QueueApi for FakeForge {
         })
     }
     fn enqueue(&self, _pr: u32, _n: &str, expected: &str) -> Result<EnqueueAck, QueueError> {
+        let green = self.head_status.borrow().get(expected) == Some(&StatusState::Success);
+        if self.require_head_status.get() && !green {
+            return Err(QueueError::Forge {
+                detail: "Required status check \"loom/merge-authorization\" is expected".into(),
+            });
+        }
         if !self.head.borrow().eq_ignore_ascii_case(expected) {
             return Err(QueueError::HeadMismatch {
                 pr: PR,
@@ -113,7 +138,7 @@ impl QueueApi for FakeForge {
 }
 
 fn handoff(f: &FakeForge, store: &MemoryGrantStore) -> Result<EnqueueOutcome, HandoffError> {
-    authorize_and_enqueue(MergeMode::Queue, true, f, store, &|| f.read_facts(), PR, SHA1)
+    authorize_and_enqueue(MergeMode::Queue, true, f, store, f, &|| f.read_facts(), PR, SHA1)
 }
 
 fn revoke(f: &FakeForge, store: &MemoryGrantStore) -> Revocation {
@@ -155,8 +180,8 @@ fn gate_refusal_writes_nothing() {
         (MergeMode::Direct, true, "NOT_QUEUE_MODE"),
         (MergeMode::Queue, false, "EXECUTION_DORMANT"),
     ] {
-        let e =
-            authorize_and_enqueue(mode, enabled, &f, &s, &|| f.read_facts(), PR, SHA1).unwrap_err();
+        let e = authorize_and_enqueue(mode, enabled, &f, &s, &f, &|| f.read_facts(), PR, SHA1)
+            .unwrap_err();
         match e {
             HandoffError::Gate(q) => assert_eq!(q.code(), code),
             other => panic!("{other:?}"),
@@ -341,4 +366,76 @@ fn known_gap_revocation_after_check_pass_can_still_merge() {
     assert!(r.grant_revoked.is_ok());
     assert!(f.try_merge(), "documented gap: pass-to-merge window");
     const { assert!(!INVARIANT_FULLY_DEMONSTRATED) };
+}
+
+#[test]
+fn handoff_posts_success_on_the_approved_head_before_enqueue() {
+    // `FakeForge::enqueue` refuses unless the head is green, like GitHub.
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::Enqueued { .. })));
+    assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Success));
+    assert_eq!(f.head_status.borrow().len(), 1, "only the pinned head is written");
+}
+
+#[test]
+fn enqueue_refused_without_the_head_status_is_the_bug() {
+    // Without the head write the fake forge refuses, as loom-ui#4826 saw.
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.require_head_status.set(true);
+    let e = authorize_and_enqueue(
+        MergeMode::Queue,
+        true,
+        &f,
+        &s,
+        &NoStatus,
+        &|| f.read_facts(),
+        PR,
+        SHA1,
+    )
+    .unwrap_err();
+    assert!(matches!(e, HandoffError::Enqueue(_)), "{e:?}");
+    assert_eq!(s.get(PR).unwrap(), None);
+}
+
+struct NoStatus;
+impl StatusApi for NoStatus {
+    fn post_status(&self, _: &str, _: StatusState, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn status_write_failure_aborts_before_enqueue_and_revokes_the_grant() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.status_fails.set(true);
+    let e = handoff(&f, &s).unwrap_err();
+    assert!(matches!(e, HandoffError::HeadStatus(_)), "{e:?}");
+    assert!(f.queued.borrow().is_none());
+    assert_eq!(s.get(PR).unwrap(), None, "grant revoked");
+}
+
+#[test]
+fn rolled_back_handoff_withdraws_the_head_success() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.revoke_on_enqueue.set(true);
+    assert!(handoff(&f, &s).is_err());
+    assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Failure));
+}
+
+#[test]
+fn a_new_head_never_inherits_the_old_success() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    handoff(&f, &s).unwrap();
+    f.push_head(SHA2);
+    assert_eq!(f.head_status.borrow().get(SHA2), None);
+    assert!(handoff_at(&f, &s, SHA2).is_err(), "SHA2 needs its own grant and status");
+}
+
+fn handoff_at(
+    f: &FakeForge,
+    store: &MemoryGrantStore,
+    sha: &str,
+) -> Result<EnqueueOutcome, HandoffError> {
+    // Facts still approve SHA1 only: evaluation denies a moved head.
+    authorize_and_enqueue(MergeMode::Queue, true, f, store, f, &|| f.read_facts(), PR, sha)
 }
