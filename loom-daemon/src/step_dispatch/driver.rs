@@ -54,6 +54,9 @@ pub struct TickInputs<'a> {
     /// How many spawns, each in a different repo, the draw runs at once
     /// (#12298, `autonomous.workFinder.spawnConcurrency`); `1` is serial.
     pub spawn_concurrency: usize,
+    /// Which discovery backend builds the tick's snapshot (#12306,
+    /// `autonomous.workFinder.discovery`).
+    pub discovery: crate::discovery::BackendKind,
 }
 
 /// What a workspace's listing said beyond its items.
@@ -144,6 +147,7 @@ pub fn actionable_point(
 /// The step tick's state across ticks: the stage-entry provider's cache,
 /// and where the next gather starts (#12074).
 pub struct StepDriver {
+    discovery: crate::discovery::Discovery,
     provider: StageEntryProvider,
     next_start: usize,
     starvation: Starvation,
@@ -152,6 +156,7 @@ pub struct StepDriver {
 impl Default for StepDriver {
     fn default() -> Self {
         Self {
+            discovery: crate::discovery::Discovery::default(),
             provider: StageEntryProvider::load(default_cache_path(), DEFAULT_EVENTS_BUDGET),
             next_start: 0,
             starvation: Starvation::default(),
@@ -301,6 +306,7 @@ fn list_one(
     idx: usize,
     guaranteed: bool,
     escalated: bool,
+    snapshot: &crate::discovery::TickSnapshot,
     held_capabilities: &BTreeSet<String>,
 ) -> anyhow::Result<Option<super::gather::Listed>> {
     let root = &input.roots[idx];
@@ -323,7 +329,7 @@ fn list_one(
         let mut dispatcher = RegistryDispatcher::new(registry.clone());
         crate::work_finder::main_red_fix::evaluate(lane, &mut fixes, &mut dispatcher)
     };
-    super::gather::list(root, registry, red, held_capabilities)
+    super::gather::list(root, registry, snapshot, red, held_capabilities)
 }
 
 pub(crate) fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
@@ -405,6 +411,9 @@ impl StepDriver {
         // parent and the runtime context; a repo past the deadline is
         // skipped as before. Results come back in walk order.
         let listing_started = Instant::now();
+        // One snapshot per tick (#12306): the Mirror backend makes its one
+        // worklist request here; Direct lists each repo as the gather asks.
+        let snapshot = self.discovery.begin_tick(input.discovery, now);
         let read_scope = crate::gh_invocation::read_deadline::snapshot();
         let parent = crate::gh_invocation::telemetry::thread_parent();
         let runtime = tokio::runtime::Handle::try_current().ok();
@@ -434,6 +443,7 @@ impl StepDriver {
                     idx,
                     guaranteed,
                     escalated,
+                    &snapshot,
                     &held_capabilities,
                 ))
             },
@@ -574,6 +584,7 @@ impl StepDriver {
         let draw_total = draw_started.elapsed();
         let mut report = result.report;
         report.gather = Some(gather);
+        report.discovery = Some(snapshot.stats());
         report.phases = Some(TickPhases {
             listing_ms,
             filter_ms,
