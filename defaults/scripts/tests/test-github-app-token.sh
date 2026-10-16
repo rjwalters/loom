@@ -548,7 +548,7 @@ cat > "$WRITERS_REPO/.loom/config.json" <<CFG
   "identities":{"writers":[
     {"appId":"  ","privateKeyPath":"$KEY_PATH","owners":["emptyid"]},
     {"appId":"400","privateKeyPath":"   ","owners":["emptykey"]},
-    {"appId":"500","privateKeyPath":"$KEY_PATH","owners":[7,null," Spaced ","mixed"]},
+    {"appId":"500","privateKeyPath":"$KEY_PATH","owners":[7,null," Spaced ","mixed","bad_name","-lead"]},
     {"appId":600,"privateKeyPath":"$KEY_PATH","owners":["emptyid","emptykey","numid"]}]}}}
 CFG
 if [[ "$(resolved_app_for spaced)" == "500" && "$(resolved_app_for mixed)" == "500" ]]; then
@@ -560,6 +560,11 @@ if [[ "$(resolved_app_for emptyid)" == "600" && "$(resolved_app_for emptykey)" =
     pass "an entry with an empty appId / privateKeyPath is skipped; numeric appId accepted"
 else
     fail "invalid entries should be skipped" "emptyid=$(resolved_app_for emptyid) emptykey=$(resolved_app_for emptykey) numid=$(resolved_app_for numid)"
+fi
+if [[ "$(resolved_app_for bad_name)" == "100" && "$(resolved_app_for -lead)" == "100" ]]; then
+    pass "an owner that is not a valid GitHub login is dropped, as valid_owner drops it"
+else
+    fail "invalid owner names should not match a writer" "bad_name=$(resolved_app_for bad_name) -lead=$(resolved_app_for -lead)"
 fi
 WRITERS_REPO="$WRITERS_REPO_ORIG"
 

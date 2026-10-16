@@ -117,6 +117,9 @@ GITHUB_APP_TOKEN_EXPIRES_AT=""
 # a second account, so a fleet spanning a user and an org needs one writer App
 # per owner. An owner no entry lists, an absent `writers` key, or no `owner`
 # at all resolves exactly as before. The env override still beats everything.
+# An owner that is not a valid GitHub login (1-39 alphanumerics or `-`, not
+# leading `-`) is dropped, as the daemon's `valid_owner` drops it, so both
+# sides pick the same App for the same config.
 # `_GH_APP_OWNER` remembers the owner so a later `github_app_configured` call
 # from inside the token flow (JWT signing) resolves the same App.
 _GH_APP_OWNER=""
@@ -139,7 +142,9 @@ _github_app_load_config() {
               | ((.privateKeyPath | if type == "string" then trim else "" end)) as $key
               | select($id != "" and $key != "")
               | select([(.owners // []) | if type == "array" then .[] else empty end
-                        | strings | trim | ascii_downcase]
+                        | strings | trim
+                        | select(test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"))
+                        | ascii_downcase]
                        | index($owner | trim | ascii_downcase) != null)
               | "\($id)\t\($key)")
           | .[0] // empty) catch empty' 2>/dev/null)"

@@ -322,8 +322,12 @@ pub fn writer_for_owner<'a>(roster: &'a Roster, owner: &str) -> Option<&'a Ident
 
 /// Config problems an operator should see: the writer declared in
 /// `forge.identities` disagreeing with `forge.githubApp`, or declared without
-/// it. `forge identities` prints these (the daemon also logs them), so a
-/// misconfiguration is visible where an operator checks, not only in a log.
+/// it, bad `owners` / `writers[]` entries, an env override that makes the shell
+/// ignore `writers[]`, and read-pool routing problems. `forge identities`
+/// prints these, and the daemon logs them at WARN once per workspace at
+/// startup (`daemon_startup_reconciliation`), so a misconfiguration is visible
+/// where an operator checks and in the daemon's log. The env check reads the
+/// calling process's environment, which is why the daemon runs it itself.
 #[must_use]
 pub fn config_warnings(effective: &Value) -> Vec<String> {
     let mut out = writer_warnings(effective);
