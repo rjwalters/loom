@@ -7,6 +7,20 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12498**: fix: post loom/merge-authorization on the PR head before enqueue
+- **PR #12497**: Step draw: defer merge-blocked Champion items before the draw (#12494)
+- **PR #12495**: fleet_dispatch: read the fleetDispatch flag from the daemon workspace host tier
+- **PR #12492**: docs: inventory merge-pr.sh orchestration and plan the Rust port
+- **PR #12490**: fix(ci): stop stale-pin advisory step failing on missing pin
+- **PR #12488**: chore(harness): track latest CLIs — opencode 1.19.2→1.19.3
+- **PR #12486**: fix(fleet-dispatch): count every client refusal token; keep stale heartbeats from reverting a replaced row
+- **PR #12484**: fix: export roll-interrupted for roll-stopped role ticks
+- **Issue #12496** (closed): merge queue: handoff can never enqueue — required loom/merge-authorization is never posted on the PR head (2AMLogic/loom-ui pilot)
+- **Issue #12494** (closed): step draw: don't redraw Champion merge items in a repo with a merge in flight (largest pass reason)
+- **Issue #12493** (closed): fleet_dispatch worker: claim/refuse/release/tick_budget read the flag from the repo root, so a host-tier fleetDispatch never claims
+- **Issue #12483** (closed): fleet_dispatch: REFUSE_REASONS misses client refusal tokens; in-flight heartbeat can revert a just-replaced row's step
+- **Issue #12454** (closed): [ci-daily] Supply Chain
+- **Issue #11240** (closed): Verify secret-scanning and push-protection settings for #9049 with authoritative live evidence
 - **PR #12485**: feat: classify failed steps by StepEnd instead of unclassified:step
 - **PR #12482**: fix(fleet_dispatch): derive live-table age-out from the reaper interval
 - **PR #12474**: fix(fleet-dispatch): re-grant only the same step; read tailnet_node from host records
