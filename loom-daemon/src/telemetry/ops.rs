@@ -272,6 +272,26 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.main_red.sha",
     "loom.main_red.action",
     "loom.main_red.source",
+    // `reaper.pass` spans (#12461): one worktree-reaper pass over one repo and
+    // worktree class — counts, bytes and preserved-by-fixed-reason.
+    "loom.reaper.class",
+    "loom.reaper.phase",
+    "loom.reaper.scanned",
+    "loom.reaper.removed",
+    "loom.reaper.failed",
+    "loom.reaper.preserved",
+    "loom.reaper.bytes",
+    "loom.reaper.preserved.in_use",
+    "loom.reaper.preserved.unmanaged",
+    "loom.reaper.preserved.editable_install",
+    "loom.reaper.preserved.issue_open",
+    "loom.reaper.preserved.pr_open",
+    "loom.reaper.preserved.pr_unknown",
+    "loom.reaper.preserved.not_merged",
+    "loom.reaper.preserved.grace",
+    "loom.reaper.preserved.uncommitted",
+    "loom.reaper.preserved.private_workspace",
+    "loom.reaper.preserved.other",
 ];
 
 /// Longest label value kept, in bytes.
