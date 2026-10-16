@@ -404,7 +404,7 @@ _process_one_stacked_child() {
         ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         comment="## Stacked parent advanced — rebase deferred
 
-Parent branch \`$parent_branch\` advanced (amended/pushed) after this child branched off it, so this PR is now **stale** relative to the parent's current tip. But issue #$child_issue is still \`loom:building\` — a Builder likely has this branch checked out. The auto-rebase was **skipped** to avoid racing that in-progress work with an out-of-band \`git rebase\` + \`push --force-with-lease\`.
+Parent branch \`$parent_branch\` advanced (amended/pushed) after this child branched off it, so this PR is now **stale** relative to the parent's current tip. But issue #$child_issue is still \`loom:building\` — a Builder likely has this branch checked out. The auto-rebase was **skipped** to avoid racing that in-progress work with an out-of-band \`git rebase\` and force-push.
 
 **What happens next**: once issue #$child_issue is no longer \`loom:building\`, re-run this script to rebase the child onto the parent's current tip (the child's PR base stays \`$parent_branch\` — it remains stacked):
 
