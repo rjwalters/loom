@@ -245,21 +245,46 @@ impl<F: crate::operator_decision::cli::Forge> BodyForge for F {
     }
 }
 
+/// A failed [`record`]: the forge's error, and the record it tried to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordError {
+    /// The next rung after the stored one, due `now + rung_delay(rung)`: what
+    /// the marker would have said. When the read itself failed the stored
+    /// rung is unknown, and this is rung 0.
+    pub attempted: Reeval,
+    pub error: String,
+}
+
+impl std::fmt::Display for RecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
 /// Advance the ladder on the forge: read `item`'s body fresh, write the next
 /// rung. Returns the record written.
 ///
 /// # Errors
 ///
-/// A failed read or write, as the forge reported it.
+/// A failed read or write, as the forge reported it, with the record that was
+/// not written (#12516: the caller holds the item locally until its due time).
 pub fn record<F: BodyForge + ?Sized>(
     forge: &mut F,
     item: u32,
     step: StepRole,
     now: DateTime<Utc>,
-) -> Result<Reeval, String> {
-    let body = forge.body(u64::from(item))?;
+) -> Result<Reeval, RecordError> {
+    let body = forge.body(u64::from(item)).map_err(|error| RecordError {
+        attempted: advance("", step, now).1,
+        error,
+    })?;
     let (new_body, rec) = advance(&body, step, now);
-    forge.set_body(u64::from(item), &new_body)?;
+    forge
+        .set_body(u64::from(item), &new_body)
+        .map_err(|error| RecordError {
+            attempted: rec.clone(),
+            error,
+        })?;
     Ok(rec)
 }
 
