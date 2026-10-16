@@ -96,6 +96,10 @@ pub enum Failure {
     /// This repo is outside the reader's installation (404, "not accessible
     /// by integration"): withdraw it for this repo only.
     Coverage,
+    /// A plain 404 from a reader with no evidence it sees the repo (#12511):
+    /// likely a restart wiped the in-memory served map and the item is just
+    /// missing, so withdraw it for the repo only briefly, not for an hour.
+    CoverageUnproven,
 }
 
 impl Failure {
@@ -300,10 +304,18 @@ pub fn plan_withdrawal(
     probe: ProbeReset<'_>,
 ) -> Withdrawal {
     let default_until = now + forge_read_pool::DEFAULT_WITHDRAWAL;
-    if failure == Failure::Coverage {
-        return Withdrawal::Repo {
-            until: now + super::REPO_WITHDRAWAL,
-        };
+    match failure {
+        Failure::Coverage => {
+            return Withdrawal::Repo {
+                until: now + super::REPO_WITHDRAWAL,
+            };
+        }
+        Failure::CoverageUnproven => {
+            return Withdrawal::Repo {
+                until: default_until,
+            };
+        }
+        _ => {}
     }
     let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
     if mode == RoutingMode::Legacy || owner.is_empty() {
@@ -356,7 +368,7 @@ pub fn plan_withdrawal(
             source: ResetSource::Default,
             secondary: false,
         },
-        Failure::Coverage => unreachable!("handled above"),
+        Failure::Coverage | Failure::CoverageUnproven => unreachable!("handled above"),
     }
 }
 

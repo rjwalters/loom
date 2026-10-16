@@ -25,6 +25,7 @@ fn roster(readers: Vec<Identity>) -> Roster {
         readers,
         legacy_logins: vec![],
         writers: Vec::new(),
+        load_failed: false,
     }
 }
 
@@ -941,4 +942,47 @@ fn the_front_uses_a_reader_only_when_its_directory_is_private() {
     assert_eq!(trusted_in_front(reader.clone(), &|_| true), reader);
     assert_eq!(trusted_in_front(reader, &|_| false), RouteDecision::NoPool);
     assert_eq!(trusted_in_front(RouteDecision::NoPool, &|_| false), RouteDecision::NoPool);
+}
+
+// ---- roster load failure fails closed (#12511) -------------------------------
+
+#[test]
+fn a_roster_that_failed_to_load_sheds_instead_of_routing_to_the_writer() {
+    let mut r = roster(vec![]);
+    r.load_failed = true;
+    let cfg = RoutingConfig::default();
+    let before = crate::forge_call_stats::counters::get(ROSTER_LOAD_FAILED);
+    let d = route_read_in(
+        std::path::Path::new("/nonexistent"),
+        &r,
+        &req("acme/widgets", None),
+        &v2(&cfg),
+        SystemTime::now(),
+    );
+    assert!(
+        matches!(
+            d,
+            RouteDecision::Exhausted {
+                cause: ExhaustCause::Unavailable,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
+    assert!(crate::forge_call_stats::counters::get(ROSTER_LOAD_FAILED) > before);
+}
+
+#[test]
+fn a_host_with_no_readers_configured_still_gets_no_pool() {
+    let r = roster(vec![]);
+    assert!(!r.load_failed);
+    let cfg = RoutingConfig::default();
+    let d = route_read_in(
+        std::path::Path::new("/nonexistent"),
+        &r,
+        &req("acme/widgets", None),
+        &v2(&cfg),
+        SystemTime::now(),
+    );
+    assert_eq!(d, RouteDecision::NoPool);
 }

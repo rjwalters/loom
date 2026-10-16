@@ -199,6 +199,12 @@ pub struct Roster {
     pub writers: Vec<Identity>,
     /// Extra logins believed as the fleet (renamed or retired Apps).
     pub legacy_logins: Vec<String>,
+    /// A config tier that carries (or may carry) the roster failed to load
+    /// (parse error, unreadable file), so an empty [`Roster::readers`] means
+    /// "unknown", not "none configured". Reads fail closed on it instead of
+    /// falling back to the writer (#12511). Set by [`resolve`] only.
+    #[serde(skip)]
+    pub load_failed: bool,
 }
 
 /// Which kind of call a credential is for.
@@ -221,7 +227,11 @@ pub fn resolve(root: &Path) -> Roster {
     let effective = crate::config_resolver::resolve_effective_config(root);
     let slug_env = std::env::var(APP_SLUG_ENV).ok();
     let pool = forge_read_pool::configured_pool(root);
-    from_config(&effective, slug_env.as_deref(), &pool)
+    let mut roster = from_config(&effective, slug_env.as_deref(), &pool);
+    // `resolve_effective_config` soft-fails a broken tier to `{}`, which reads
+    // as "no readers configured"; `unreadable_tiers` says which tiers broke.
+    roster.load_failed = !crate::config_resolver::unreadable_tiers(root).is_empty();
+    roster
 }
 
 /// Pure core of [`resolve`]: the effective config, the slug env override,
@@ -270,6 +280,7 @@ pub fn from_config(
                             .collect()
                     })
                     .unwrap_or_default(),
+                load_failed: false,
             }
         } else {
             Roster {
@@ -286,6 +297,7 @@ pub fn from_config(
                     .collect(),
                 writers: Vec::new(),
                 legacy_logins: Vec::new(),
+                load_failed: false,
             }
         };
     if let (Some(w), Some(s)) = (roster.writer.as_mut(), slug_override) {
