@@ -442,6 +442,33 @@ merge reads stay on their current path (the poll gate's invariant 3: reads
 that gate a decision are never held). The mirror's listing answers only discovery reads, and a source
 test pins its three call sites.
 
+### 8.1.1 The worklist and the discovery chain (`forge.mirror.discovery`, #12311)
+
+`"per_call"` (the default) is §8.1. `"worklist"` replaces it with **one read
+per step tick**: `GET /v1/mirror/worklist`, which returns, per repo, a `status`
+(`ok` | `unknown` | `backfilling` | `error`), the watermark, and every open
+issue and PR with the fields discovery uses. It is ETagged, so an unchanged
+fleet costs a `304`; the daemon keeps one in-memory `(etag, body)`, replaced
+every tick, dropped on restart, never persisted and never merged with the
+change stream.
+
+The daemon walks a chain from the first tier and records the tier that
+answered (`loom.discovery.tier`):
+
+| Tier | Used when | How |
+|---|---|---|
+| `mirror` | first | the worklist, for every repo whose `status` is `ok` |
+| `gateway` | the request failed, or a repo's `status` is not `ok` | the direct per-repo listing through the read gateway; only the repos the mirror could not answer for |
+| `gh` | standalone always; on the fleet when the gateway also fails | the same listing with the installation's credential |
+| `none` | every configured tier failed | no draw from that repo this tick; running sessions are unaffected |
+
+No `forge.mirror` block means the chain is `gh` alone; `"direct"` skips the
+mirror (break-glass). On the fleet the fallback tiers are outage modes and
+are capped: a repo is listed at most once per work-finder interval and drawn
+from its last listing in between; a gateway reserve refusal ends the tick's
+discovery without tripping the rate-limit breaker; and there is no writer
+tier. Claim, label-transition and merge reads never read the snapshot.
+
 ### 8.2 Wakes
 
 While a mirror is live, the daemon pulls `GET /v1/changes?repos=…&after=…`
