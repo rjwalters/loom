@@ -10,6 +10,11 @@
 # the same recording stubs (forge_merge_pr, forge_get_pr_nocache,
 # forge_update_branch, sleep, info/success/warning/error, ...) it gives the
 # live loop extracted from merge-pr.sh, and compare the two traces.
+#
+# #12063 slice 2 edited the oracle in two places, to the new contract rather
+# than the old text: a moved base is a plain sleep-and-retry (no branch update,
+# no head re-read, no rework marker), and a head mismatch is always the exit-3
+# `error_head_moved` (no self-sync retry). Everything else is still verbatim.
 
 _retired_merge_loop() {
   MAX_MERGE_RETRIES=3; MERGE_RETRY_DELAY=5
@@ -64,35 +69,14 @@ _retired_merge_loop() {
     # precedence lives in the classifier's own ordered match, not in the order of
     # these two `if`s, so a reorder here cannot change which route is taken.
     if [[ "$MERGE_RESPONSE_KIND" == "head-mismatch" ]]; then
-      _head_moved_or_resync "$MERGE_RESPONSE" && continue
+      error_head_moved "PR #$PR_NUMBER: $MERGE_RESPONSE" "$MERGE_PRECONDITION_SHA" ""
     fi
 
     # Check for stale branch error (base branch was modified)
     if [[ "$MERGE_RESPONSE_KIND" == "base-modified" ]]; then
       if [[ $MERGE_ATTEMPT -lt $MAX_MERGE_RETRIES ]]; then
         info "Branch is behind base branch, updating... (attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES)"
-
-        # Update branch via forge API
-        UPDATE_RESPONSE=$(forge_update_branch "$REPO_NWO" "$PR_NUMBER" 2>&1) || {
-          warning "Failed to update branch: $UPDATE_RESPONSE"
-          # Continue to retry merge anyway - update may have partially succeeded
-        }
-
-        # Wait for branch to sync
-        info "Waiting ${MERGE_RETRY_DELAY}s for branch to sync..."
         sleep "$MERGE_RETRY_DELAY"
-
-        # The sync just pushed to the head branch: re-read it, or the retry
-        # below re-gates on a SHA the forge has already superseded (#8164).
-        #
-        # …and mark it (#9444). This is the canonical "main moved under the
-        # work" event: the base advanced, so the branch had to be synced before
-        # it could merge. `--duration-sec` is the settle wait we just slept —
-        # the only part of this rework that is measured here; the forge-side
-        # merge that produced the new head is not. Appended to the line above
-        # rather than given its own so the file does not grow (it is
-        # ratcheted); `|| true` because a marker may never fail a merge.
-        _refresh_precondition_sha; "${LOOM_DAEMON_BIN:-loom-daemon}" record-rework --kind rebase --branch "$PR_BRANCH" --repo-root "$REPO_ROOT" --reason "base branch was modified; synced before merge retry $MERGE_ATTEMPT/$MAX_MERGE_RETRIES" --duration-sec "$MERGE_RETRY_DELAY" >/dev/null 2>&1 || true
 
         # Increase delay for next attempt (exponential backoff)
         MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))
