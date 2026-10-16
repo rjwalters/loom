@@ -224,7 +224,7 @@ fn the_forge_ladder_is_written_and_its_mirror_is_bounded_at_24h() {
     let (mut reg, mut rx) = registry(dir.path());
     let mut forge = FakeForge {
         body:
-            "Parked.\n\n<!-- loom:reeval step=champion_promote rung=2 next=2026-01-01T00:00:00Z -->"
+            "Parked.\n\n<!-- loom:reeval step=champion_promote rung=6 next=2026-01-01T00:00:00Z -->"
                 .into(),
         ..FakeForge::default()
     };
@@ -234,7 +234,7 @@ fn the_forge_ladder_is_written_and_its_mirror_is_bounded_at_24h() {
     );
     let written = reeval_ladder::parse(&forge.body);
     assert_eq!(written.len(), 1);
-    assert_eq!(written[0].rung, 3, "48 h rung");
+    assert_eq!(written[0].rung, 7, "48 h rung (#12513)");
     let now = Utc::now();
     let local = reg
         .step_cooldowns(now)

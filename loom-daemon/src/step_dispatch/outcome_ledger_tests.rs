@@ -441,6 +441,20 @@ fn champion_held_or_blocked_goes_to_the_forge_ladder() {
     assert_eq!(rec.effect, Effect::ForgeLadder);
 }
 
+/// #12513: the ladder's 1 h, 1 h, 1 h rungs put three held verdicts inside
+/// 24 h; the repeat cap must not turn the third into a day.
+#[test]
+fn champion_held_runs_are_spaced_by_the_ladder_not_the_repeat_cap() {
+    let mut l = OutcomeLedger::default();
+    for h in 0..6 {
+        let now = t0() + chrono::Duration::hours(h);
+        let rec =
+            l.record(30, StepRole::ChampionMerge, &out(OutcomeClass::Noop, "held"), SLOW, now);
+        assert!(!rec.repeat_capped, "hour {h}");
+        assert_eq!(rec.cooling_until, None, "hour {h}: the registry mirrors the ladder");
+    }
+}
+
 /// Acceptance: no `(item, step)` runs more than 3 times in 24 h without a
 /// state change. A daemon that redraws whenever the query allows, for two
 /// days, with every run failing slowly.
@@ -537,6 +551,30 @@ fn a_restored_ledger_keeps_live_windows_and_drops_lapsed_ones() {
     late.restore(durable, now + mins(91));
     assert!(late.snapshot(now + mins(91)).is_empty(), "lapsed on reload");
     assert!(late.persisted(now + mins(91)).is_empty());
+}
+
+/// #12513: a Champion ladder mirror is not restored; the forge marker is read
+/// instead (a pre-#12513 one as due now), so the restart that upgrades a
+/// host does not keep an old-ladder 24 h mirror armed.
+#[test]
+fn a_restored_ledger_drops_the_forge_ladder_mirror() {
+    let now = t0();
+    let mut l = OutcomeLedger::default();
+    l.arm(
+        3,
+        StepRole::ChampionMerge,
+        now + chrono::Duration::days(4),
+        CooldownCause::ForgeLadder,
+        now,
+    );
+    l.arm(7, StepRole::Builder, now + mins(90), CooldownCause::Landed, now);
+    let durable = l.persisted(now + mins(1));
+    assert_eq!(durable.len(), 2, "{durable:?}");
+
+    let mut after = OutcomeLedger::default();
+    after.restore(durable, now + mins(1));
+    assert_eq!(after.cooling_until(3, StepRole::ChampionMerge, now + mins(1)), None);
+    assert_eq!(after.cooling_until(7, StepRole::Builder, now + mins(1)), Some(now + mins(90)));
 }
 
 #[test]

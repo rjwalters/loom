@@ -103,9 +103,16 @@ fn draw_inputs_read_the_target_row_and_its_stage_label() {
 fn the_ladder_and_the_red_fix_marker_are_read_from_bodies() {
     let ladder = "<!-- loom:reeval step=champion_merge rung=1 next=2026-10-20T00:00:00Z -->";
     let rows = vec![row(70, &["loom:pr"], ladder, true)];
-    let due = ladder_due(&rows);
+    let next = DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let now = next - chrono::Duration::minutes(30);
+    let due = ladder_due(&rows, now);
     assert_eq!(due.len(), 1);
-    assert_eq!((due[0].0, due[0].1), (70, StepRole::ChampionMerge));
+    assert_eq!((due[0].0, due[0].1, due[0].2), (70, StepRole::ChampionMerge, next));
+    // #12513: four days out is past rung 1's 1 h, a pre-#12513 marker: due now.
+    let early = next - chrono::Duration::days(4);
+    assert_eq!(ladder_due(&rows, early)[0].2, early);
     assert!(has_red_fix_marker(Some("text\n<!-- loom:main-red-fix -->\n")));
     assert!(!has_red_fix_marker(Some("quoting <!-- loom:main-red-fix --> inline")));
 }

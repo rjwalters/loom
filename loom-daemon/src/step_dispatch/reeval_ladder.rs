@@ -4,8 +4,21 @@
 //! A Champion re-evaluation that leaves an item as it was (`--pr` `held`, or
 //! `--issue` `blocked`) would be drawn again on the next tick: the classifier
 //! still calls for a hold re-evaluation or a re-evaluate. So each such outcome
-//! advances a ladder, **6 h, 12 h, 24 h, 48 h, 96 h, then 7 d** ([`rung_delay`]),
-//! and the item is not re-evaluated before the rung's due time.
+//! advances a ladder, **1 h, 1 h, 1 h, 2 h, 4 h, 8 h, 24 h, 48 h, 96 h, then
+//! 7 d** for every later rung ([`rung_delay`]; operator ruling, #12513), and
+//! the item is not re-evaluated before the rung's due time.
+//!
+//! # Markers from an older, longer ladder
+//!
+//! Until #12513 the ladder ran 6 h doubled per rung (6 h → 7 d), so a marker
+//! written then can hold its item for days past what its rung now allows. A
+//! stored `next=` further from now than [`rung_delay`] of its rung (plus
+//! [`SKEW_GRACE`] for clock skew between hosts) is read as due now
+//! ([`Reeval::due_at`], applied by [`due`], which the cutover reads). The
+//! Champion's next verdict on the item rewrites the marker on this ladder
+//! (`next` = verdict time + the new rung's delay), which is within the delay,
+//! so the rule fires once per stale marker. A `next=` within the delay is
+//! honoured unchanged.
 //!
 //! # Where it lives
 //!
@@ -26,7 +39,7 @@
 //! to every other reader (it is not a `loom:park` record).
 //!
 //! A Champion verdict that moves the item (`merged`, `rejected`, `promoted`,
-//! …) removes the marker ([`clear`]), so a later hold starts again at 6 h.
+//! …) removes the marker ([`clear`]), so a later hold starts again at 1 h.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -41,17 +54,29 @@ use crate::step_role::StepRole;
 /// (`tests/label_literal_guard.rs`): this is a marker, not a label.
 pub const MARKER_OPEN: &str = concat!("<!-- loom", ":reeval ");
 
-/// The first rung: 6 h.
-pub const FIRST_RUNG: Duration = Duration::from_secs(6 * 3600);
+/// The rungs' delays in hours, rung 0 first (operator ruling, #12513). Every
+/// rung past the table is [`LAST_RUNG`].
+const RUNG_HOURS: [u64; 9] = [1, 1, 1, 2, 4, 8, 24, 48, 96];
 
-/// The last rung: 7 d. Every rung past it stays at 7 d.
+/// The first rung: 1 h.
+pub const FIRST_RUNG: Duration = Duration::from_secs(RUNG_HOURS[0] * 3600);
+
+/// The last rung: 7 d. Every rung past the table stays at 7 d.
 pub const LAST_RUNG: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// The delay of rung `rung` (0-based): 6 h doubled per rung, capped at 7 d.
+/// How far a stored `next=` may sit past its rung's delay before it is read as
+/// written under an older ladder: room for clock skew between the host that
+/// wrote it and the host reading it.
+pub const SKEW_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// The delay of rung `rung` (0-based): 1, 1, 1, 2, 4, 8, 24, 48, 96 h, then
+/// 7 d.
 #[must_use]
 pub fn rung_delay(rung: u32) -> Duration {
-    let factor = 1u32.checked_shl(rung.min(16)).unwrap_or(u32::MAX);
-    FIRST_RUNG.saturating_mul(factor).min(LAST_RUNG)
+    usize::try_from(rung)
+        .ok()
+        .and_then(|i| RUNG_HOURS.get(i))
+        .map_or(LAST_RUNG, |h| Duration::from_secs(h * 3600))
 }
 
 /// One ladder record.
@@ -61,6 +86,23 @@ pub struct Reeval {
     pub rung: u32,
     /// Not re-evaluated before this.
     pub next: DateTime<Utc>,
+}
+
+impl Reeval {
+    /// When this record is due, read at `now`: its `next`, unless that lies
+    /// further from `now` than its rung's delay plus [`SKEW_GRACE`]. Such a
+    /// record was written under an older, longer ladder (#12513), and is due
+    /// now.
+    #[must_use]
+    pub fn due_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        let allowed = chrono::Duration::from_std(rung_delay(self.rung).saturating_add(SKEW_GRACE))
+            .unwrap_or_else(|_| chrono::Duration::days(7));
+        if self.next - now > allowed {
+            now
+        } else {
+            self.next
+        }
+    }
 }
 
 fn marker_re() -> &'static Regex {
@@ -103,15 +145,16 @@ pub fn parse(body: &str) -> Vec<Reeval> {
         .collect()
 }
 
-/// When `step` on the item whose body is `body` is next due, if a ladder
-/// record for it exists. The cutover feeds this into the draw's
-/// [`super::outcome_ledger::StepCooldowns`].
+/// When `step` on the item whose body is `body` is next due, read at `now`,
+/// if a ladder record for it exists: each record's [`Reeval::due_at`], so a
+/// marker from the pre-#12513 ladder is due `now`. The cutover feeds this
+/// into the draw's [`super::outcome_ledger::StepCooldowns`].
 #[must_use]
-pub fn due(body: &str, step: StepRole) -> Option<DateTime<Utc>> {
+pub fn due(body: &str, step: StepRole, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     parse(body)
         .into_iter()
         .filter(|r| r.step == step)
-        .map(|r| r.next)
+        .map(|r| r.due_at(now))
         .max()
 }
 

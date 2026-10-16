@@ -132,7 +132,7 @@ impl SweepRegistry {
                     Err(e) => {
                         log::warn!("step_ledger: writing the re-evaluation ladder on #{item}: {e}");
                         now + chrono::Duration::from_std(reeval_ladder::FIRST_RUNG)
-                            .unwrap_or_else(|_| chrono::Duration::hours(6))
+                            .unwrap_or_else(|_| chrono::Duration::hours(1))
                     }
                 };
                 self.step_ledger
