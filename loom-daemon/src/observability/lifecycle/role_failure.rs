@@ -38,6 +38,11 @@ pub const UNCLASSIFIED: &str = "unclassified:after-launch";
 /// The fallback class for a tick that failed before its launch with no site
 /// having noted why (#12028).
 pub const UNCLASSIFIED_PRE_LAUNCH: &str = "unclassified:pre-launch";
+/// The class of a launched tick the version roll stopped (#12481). It is an
+/// interruption, not a failure to launch, so it never rides the span (which
+/// closes `interrupted`); it only keeps `role_tick.outcome` from exporting
+/// [`UNCLASSIFIED_PRE_LAUNCH`] for a tick that did launch.
+pub const ROLL_INTERRUPTED: &str = "roll-interrupted";
 /// The fallback class for a failed step-engine step, which has no role-runner
 /// launch site to note one (#12028).
 pub const UNCLASSIFIED_STEP: &str = "unclassified:step";
@@ -148,6 +153,20 @@ pub fn for_outcome(outcome: &RoleTickOutcome, noted: Option<RoleFailure>) -> Opt
         })),
         _ => None,
     }
+}
+
+/// The failure a tick the version roll stopped reports for `role_tick.outcome`
+/// (#12481): [`ROLL_INTERRUPTED`] for a `Failure` (whatever class a site noted
+/// is a consequence of the stop), `None` for every other outcome.
+#[must_use]
+pub fn for_roll_stopped(outcome: &RoleTickOutcome) -> Option<RoleFailure> {
+    matches!(outcome, RoleTickOutcome::Failure(_)).then(|| {
+        RoleFailure::new(
+            ROLL_INTERRUPTED,
+            None,
+            "role tick was stopped by a version roll; not a launch failure",
+        )
+    })
 }
 
 /// The tick that failed before its launch, for `role_tick.outcome` (#12028):
