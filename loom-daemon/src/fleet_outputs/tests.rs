@@ -143,20 +143,16 @@ fn far_future_timestamp_does_not_mask_an_outage() {
 /// 600s publish cadence.
 #[test]
 fn captain_gauges_tolerate_one_missed_publish() {
-    for kind in [
-        "captain-gauges/v1:stage-dwell",
-        "captain-gauges/v1:queue-blocked",
-    ] {
-        let row = row_for(kind);
-        assert_eq!(row.deadline(), Duration::from_secs(1800));
-        let mut f = Fake::default();
-        f.fleet
-            .insert(kind, now() - chrono::Duration::seconds(1500));
-        assert!(evaluate(&[row], &f, &[], now()).is_empty(), "{kind}");
-        f.fleet
-            .insert(kind, now() - chrono::Duration::seconds(1801));
-        assert_eq!(evaluate(&[row], &f, &[], now()).len(), 1, "{kind}");
-    }
+    let kind = "captain-gauges/v1:queue-blocked";
+    let row = row_for(kind);
+    assert_eq!(row.deadline(), Duration::from_secs(1800));
+    let mut f = Fake::default();
+    f.fleet
+        .insert(kind, now() - chrono::Duration::seconds(1500));
+    assert!(evaluate(&[row], &f, &[], now()).is_empty(), "{kind}");
+    f.fleet
+        .insert(kind, now() - chrono::Duration::seconds(1801));
+    assert_eq!(evaluate(&[row], &f, &[], now()).len(), 1, "{kind}");
 }
 
 fn kinds(c: &[Condition]) -> Vec<&'static str> {
@@ -167,13 +163,12 @@ fn kinds(c: &[Condition]) -> Vec<&'static str> {
 /// for that job.
 #[test]
 fn captain_gauge_deadlines_cover_the_heartbeat_contract() {
-    for (job, bound) in [
-        (STAGE_DWELL_JOB, gauges::DEFAULT_MAX_AGE_SECS),
-        (QUEUE_BLOCKED_JOB, gauges::DEFAULT_MAX_AGE_SECS),
-    ] {
-        let row = SINGLETON_OUTPUTS.iter().find(|o| o.job == job).unwrap();
-        assert!(row.deadline().as_secs() >= bound.unsigned_abs(), "{job}");
-    }
+    let row = SINGLETON_OUTPUTS
+        .iter()
+        .find(|o| o.job == QUEUE_BLOCKED_JOB)
+        .unwrap();
+    let bound = gauges::DEFAULT_MAX_AGE_SECS;
+    assert!(row.deadline().as_secs() >= bound.unsigned_abs(), "{QUEUE_BLOCKED_JOB}");
 }
 
 /// Opt-in jobs: a fleet with them off is not owed their output; the rest of
@@ -191,20 +186,17 @@ fn disabled_opt_in_jobs_do_not_fire() {
             f.fleet.remove(o.record_kind);
         }
     }
-    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 4);
+    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 3);
     f.disabled = BTreeSet::from([
         gauges::ENABLED_KEY,
         CI_TELEMETRY_KEY,
         crate::intake_reconcile::singleton::SINGLETON_KEY,
     ]);
     assert!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).is_empty());
-    // Only the sub-switches off: stage-dwell is still owed, and so is the
-    // intake pass (gated by the singleton key alone).
+    // Only the sub-switches off: the intake pass is still owed (gated by the
+    // singleton key alone).
     f.disabled = BTreeSet::from([gauges::QUEUE_BLOCKED_KEY, CI_TELEMETRY_KEY]);
-    assert_eq!(
-        kinds(&evaluate(SINGLETON_OUTPUTS, &f, &r, now())),
-        ["captain-gauges/v1:stage-dwell", PASS_HEARTBEAT_KIND]
-    );
+    assert_eq!(kinds(&evaluate(SINGLETON_OUTPUTS, &f, &r, now())), [PASS_HEARTBEAT_KIND]);
 }
 
 // ===== intake-reconcile completed-pass heartbeat (#10924) =====
