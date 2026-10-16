@@ -62,6 +62,14 @@ impl FakeQueue {
         }
         q
     }
+    /// The PR head, or an error once the entry has left the queue.
+    fn head(&self, pr: u32) -> Result<String, String> {
+        let e = self.entries.borrow();
+        e.iter()
+            .find(|m| m.pr == pr)
+            .map(|m| m.head.clone())
+            .ok_or_else(|| format!("PR #{pr} not queued"))
+    }
     fn groups(&self) -> Vec<MergeGroup> {
         let e = self.entries.borrow();
         (0..e.len())
@@ -201,7 +209,7 @@ fn revoke(q: &FakeQueue, s: &MemoryGrantStore, pr: u32) -> GroupRevocation {
             Ok(q.groups())
         }
     };
-    revoke_refail_dequeue(MergeMode::Queue, true, q, s, q, &groups, pr)
+    revoke_refail_dequeue(MergeMode::Queue, true, q, s, q, &groups, &|| q.head(pr), pr)
 }
 
 fn hold(q: &FakeQueue, pr: u32) {
@@ -441,7 +449,8 @@ fn refail_works_in_a_dormant_build() {
     q.ci(A, CheckState::Success);
     q.run_authz(&s, A);
     let groups = || Ok(q.groups());
-    let r = revoke_refail_dequeue(MergeMode::Queue, false, &q, &s, &q, &groups, A);
+    let r =
+        revoke_refail_dequeue(MergeMode::Queue, false, &q, &s, &q, &groups, &|| Ok(HA.into()), A);
     assert_eq!(r.revocation.dequeue, Err(QueueError::ExecutionDormant));
     assert!(r.passed_checks_withdrawn());
     assert!(q.try_merge().is_empty());
@@ -519,4 +528,47 @@ fn group_discovery_outage_is_reported() {
     let r = revoke(&q, &s, A);
     assert!(!r.passed_checks_withdrawn());
     assert!(r.safe_to_transition(), "the grant is revoked; future evaluations deny");
+}
+
+#[test]
+fn revoke_fails_the_pr_head_status_too() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA)], &s);
+    q.post_status(HA, StatusState::Success, "authorized")
+        .unwrap();
+    let r = revoke(&q, &s, A);
+    assert_eq!(r.head_failed, Ok(()));
+    assert_eq!(
+        q.statuses
+            .borrow()
+            .get(&(HA.to_string(), REQUIRED_CHECK_CONTEXT.to_string())),
+        Some(&CheckState::Failure),
+        "the head success is replaced"
+    );
+}
+
+#[test]
+fn head_failure_is_reported_not_swallowed() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA)], &s);
+    // Status writes down: the group re-fail and the head write both fail.
+    q.status_down.set(true);
+    let r = revoke(&q, &s, A);
+    assert!(r.head_failed.is_err());
+    assert!(format!("{r}").contains("PR head status failure NOT confirmed"), "{r}");
+    // Head unreadable: reported too, and the rest still ran.
+    q.status_down.set(false);
+    let groups = || Ok(q.groups());
+    let r = revoke_refail_dequeue(
+        MergeMode::Queue,
+        true,
+        &q,
+        &s,
+        &q,
+        &groups,
+        &|| Err("pulls 502".into()),
+        A,
+    );
+    assert_eq!(r.head_failed, Err("pulls 502".to_string()));
+    assert!(r.passed_checks_withdrawn());
 }

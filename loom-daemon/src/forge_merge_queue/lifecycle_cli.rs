@@ -142,7 +142,7 @@ pub fn render_handoff(pr: u32, sha: &str, r: &Result<EnqueueOutcome, HandoffFail
                 HandoffFailure::Gate(q) => queue_exit_code(q),
                 HandoffFailure::Preflight(_) => 3,
                 HandoffFailure::Authz(HandoffError::Enqueue(q)) => queue_exit_code(q),
-                HandoffFailure::Authz(HandoffError::Store(_)) => 3,
+                HandoffFailure::Authz(HandoffError::Store(_) | HandoffError::HeadStatus(_)) => 3,
                 _ => 1,
             };
             lines(
@@ -184,6 +184,7 @@ fn ctx<'a>(env: &Env, mode: MergeMode, l: &'a Live) -> Ctx<'a> {
         execution_enabled: env.execution_enabled,
         queue: &l.queue,
         forge: &l.forge,
+        statuses: &l.forge,
         events: &l.events,
         now: chrono::Utc::now(),
     }

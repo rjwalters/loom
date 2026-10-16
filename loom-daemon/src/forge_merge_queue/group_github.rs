@@ -278,6 +278,7 @@ pub fn revoke_for_transition_groups(
         &store,
         groups,
         &|| groups.groups(),
+        &|| ctx.forge.snapshot(pr).map(|s| s.head_sha),
         pr,
     );
     if rev.revocation.grant_revoked.is_ok() {
