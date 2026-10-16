@@ -241,6 +241,7 @@ awk '/^KEPT_SET_PATTERNS=\(/{p=1} p{print} /^standing_auth_eval any$/{exit}' "$C
 run_eval() {
     local mode="$1" cfg="$2" files="$3" api="$4" ci="$5" labels="$6"
     printf '%s' "$cfg" >"$CFG_DIR/config.json"
+    # shellcheck disable=SC2034  # consumed by the sourced $EVAL_SRC / standing_auth_eval
     (
         CONFIG_FILE="$CFG_DIR/config.json"
         PR_NUMBER=1
