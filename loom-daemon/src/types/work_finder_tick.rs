@@ -196,8 +196,6 @@ pub enum CapLimiter {
     Configured,
     /// Disk headroom on the worktree volume (`free GB / per-worktree GB`).
     Disk,
-    /// Available-RAM headroom.
-    Ram,
     /// A limiter this client does not know (forward compatibility).
     #[serde(other)]
     Unknown,
@@ -210,14 +208,14 @@ impl CapLimiter {
         match self {
             Self::Configured => "configured",
             Self::Disk => "disk",
-            Self::Ram => "ram",
             Self::Unknown => "unknown",
         }
     }
 }
 
 /// The terms of one tick's concurrency cap (Issue #10214): `min(configured,
-/// disk headroom, ram headroom)`. A headroom term is `None` when it was
+/// disk headroom)` (the RAM term was removed in #12330; an older payload's
+/// `ram` field is ignored). The headroom term is `None` when it was
 /// unmeasurable (the work finder then skips that clamp).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapView {
@@ -227,52 +225,41 @@ pub struct CapView {
     /// Disk headroom: how many worktrees the scratch volume can hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<usize>,
-    /// RAM headroom: how many sweeps available memory can hold.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ram: Option<usize>,
 }
 
 impl CapView {
     /// From the work finder's raw terms, where `usize::MAX` means "not
     /// measured, not clamping".
     #[must_use]
-    pub fn from_terms(configured: usize, disk: usize, ram: usize) -> Self {
-        let known = |n: usize| (n != usize::MAX).then_some(n);
+    pub fn from_terms(configured: usize, disk: usize) -> Self {
         Self {
             configured,
-            disk: known(disk),
-            ram: known(ram),
+            disk: (disk != usize::MAX).then_some(disk),
         }
     }
 
     /// The effective cap.
     #[must_use]
     pub fn effective(&self) -> usize {
-        self.configured
-            .min(self.disk.unwrap_or(usize::MAX))
-            .min(self.ram.unwrap_or(usize::MAX))
+        self.configured.min(self.disk.unwrap_or(usize::MAX))
     }
 
-    /// The term that binds. A headroom term binds only when it is strictly
-    /// below the configured cap; disk wins a disk / RAM tie.
+    /// The term that binds. Disk binds only when it is strictly below the
+    /// configured cap.
     #[must_use]
     pub fn limiter(&self) -> CapLimiter {
-        let disk = self.disk.unwrap_or(usize::MAX);
-        let ram = self.ram.unwrap_or(usize::MAX);
-        if disk < self.configured && disk <= ram {
+        if self.disk.is_some_and(|disk| disk < self.configured) {
             CapLimiter::Disk
-        } else if ram < self.configured {
-            CapLimiter::Ram
         } else {
             CapLimiter::Configured
         }
     }
 
-    /// Whether a resource shortage (disk or RAM), not the operator's
-    /// setting, holds the cap below `maxConcurrent`.
+    /// Whether a resource shortage (disk), not the operator's setting, holds
+    /// the cap below `maxConcurrent`.
     #[must_use]
     pub fn resource_limited(&self) -> bool {
-        matches!(self.limiter(), CapLimiter::Disk | CapLimiter::Ram)
+        self.limiter() == CapLimiter::Disk
     }
 }
 
@@ -317,7 +304,6 @@ impl CapacityWait {
     pub fn limit_phrase(&self) -> &'static str {
         match (self.gate.as_str(), self.limiter) {
             ("capacity", Some(CapLimiter::Disk)) => "disk-limited",
-            ("capacity", Some(CapLimiter::Ram)) => "ram-limited",
             ("capacity", Some(CapLimiter::Configured)) => "at the configured cap",
             ("capacity", _) => "concurrency cap full",
             ("ramp", _) => "per-tick admission ramp",

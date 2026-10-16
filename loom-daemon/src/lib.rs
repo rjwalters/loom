@@ -322,7 +322,6 @@ pub mod proc_exec;
 pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
-pub mod ram_headroom;
 pub mod ram_peaks;
 pub mod ram_scope_limit;
 pub mod rate_limit_breaker;

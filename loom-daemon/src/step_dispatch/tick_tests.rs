@@ -367,6 +367,21 @@ fn a_refused_draw_is_counted_on_the_record() {
     assert_eq!(refused.skip_reason, PickSkipReason::InFlight);
 }
 
+/// #12410: a `claim_lost` refusal is a counted pass, and the draw behind it
+/// is a draw taken: the tick span reads both from the tick.
+#[test]
+fn claim_lost_refusals_are_counted_as_passes_and_draws() {
+    let mut spawner = FakeSpawner {
+        refuse: vec![(3, "claim_lost")],
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0]);
+    let tick =
+        run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut cap, &mut spawner);
+    assert_eq!(tick.passes.get("claim_lost"), Some(&1));
+    assert!(tick.draws > 1, "{} draws", tick.draws);
+}
+
 /// #12048: a workspace missing the role's command reads as blocked in the
 /// pick decision, not as a dispatch error.
 #[test]
@@ -580,31 +595,6 @@ fn concurrent_spawns_keep_the_repo_caps() {
     assert_eq!(tick.report.dispatched, 3);
     let end = tick.report.repo_cap.unwrap().occupancy_end;
     assert_eq!(end, vec![2, 2, 2]);
-}
-
-#[test]
-fn a_round_does_not_overrun_a_ram_budget_its_repos_share() {
-    use crate::ram_headroom::{RamBudget, RepoCharge};
-    use crate::ram_peaks::ChargeSource;
-    let charge = |repo: &str| RepoCharge {
-        repo: repo.to_string(),
-        gb: 4,
-        source: ChargeSource::Default,
-    };
-    // Room for two 4 GB admissions, across four repos.
-    let limits = crate::work_finder::repo_cap::RepoLimits {
-        per_repo: None,
-        ram: Some(RamBudget {
-            remaining_gb: 9,
-            charges: (0..4).map(|i| charge(&format!("r{i}"))).collect(),
-        }),
-        disk: None,
-    };
-    let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::from_limits(limits, vec![0; 4]);
-    let tick = run_with(repos(4), concurrent(8, 4), &mut cap, &mut spawner);
-    assert_eq!(spawner.asked.len(), 2, "{:?}", spawner.batches);
-    assert_eq!(tick.report.dispatched, 2);
 }
 
 #[test]

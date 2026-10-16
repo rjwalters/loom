@@ -121,7 +121,7 @@ fn a_daemon_build_and_auto_update_build_walks_no_registered_root() {
     // and forge-call window were never read.
     assert!(pool.is_empty(), "a sectioned build provisioned a registry");
     assert_eq!(report.token_pool_dir, None);
-    assert_eq!((report.disk_headroom, report.ram_headroom, report.dynamic_cap), (0, 0, 0));
+    assert_eq!((report.disk_headroom, report.dynamic_cap), (0, 0));
     assert_eq!(report.work_finder_enabled, None);
     assert!(report.role_runner_shard.is_none() && report.forge_calls.is_none());
 

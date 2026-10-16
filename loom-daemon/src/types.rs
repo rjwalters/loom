@@ -1225,18 +1225,6 @@ pub struct DaemonStatusReport {
     /// Dynamic-cap input 2: how many worktrees the scratch volume can hold at
     /// `LOOM_PER_WORKTREE_GB` each. Via [`crate::disk_headroom::disk_headroom_limit`].
     pub disk_headroom: usize,
-    /// Dynamic-cap input (#5270): how many worktrees the host's
-    /// currently-available RAM can hold at `LOOM_PER_WORKTREE_RAM_GB` each.
-    /// Via [`crate::ram_headroom::ram_headroom_limit`] — the second machine-
-    /// headroom axis alongside [`Self::disk_headroom`], added when the token
-    /// axis was removed from admission entirely (operator direction: "we
-    /// should only ever limit parallelism based on the machine
-    /// disk/RAM/CPU"). `#[serde(default)]` keeps pre-#5270 wire data / older
-    /// clients compatible (an absent field parses as `0`, i.e. "unknown" —
-    /// callers should treat a `0` from a stale client cautiously, the same
-    /// caution any dynamic-cap input warrants).
-    #[serde(default)]
-    pub ram_headroom: usize,
     /// The host's logical CPU count (#3978), via
     /// [`crate::cpu_headroom::logical_cpu_count`]. **Observational only since
     /// #4512** — the CPU headroom *term* it used to feed was removed from the
@@ -1306,15 +1294,16 @@ pub struct DaemonStatusReport {
     pub preflight_advisory_changed_at: Option<DateTime<Utc>>,
     /// Dynamic-cap input 3: **the** per-machine admission knob
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
-    /// Since #4512 this is the only *policy* term in the cap — the other two
-    /// meter exhaustible resources (accounts, bytes) — so it is what an operator
+    /// Since #4512 this is the only *policy* term in the cap — the other
+    /// meters an exhaustible resource (disk bytes) — so it is what an operator
     /// tunes for a host, empirically, from the observed idle fraction above.
     pub configured_max: usize,
     /// The effective dynamic concurrency cap —
-    /// `min(disk_headroom, ram_headroom, configured_max)`
+    /// `min(disk_headroom, configured_max)`
     /// (`resolve_dynamic_max_concurrent`; the CPU term that sat in this `min`
-    /// from #3978 was removed in #4512, and the token axis was removed
-    /// entirely in #5270 — see [`Self::ram_headroom`]). This is the
+    /// from #3978 was removed in #4512, the token axis in #5270, and the RAM
+    /// headroom term in #12330 — an older payload's `ram_headroom` is
+    /// ignored). This is the
     /// total-occupancy ceiling the work finder recomputes every tick.
     pub dynamic_cap: usize,
     /// Whether autonomous dispatch is currently halted by the reactive

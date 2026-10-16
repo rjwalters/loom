@@ -272,8 +272,8 @@ pub fn resolve_fall_step_gb(config: &EagerReclaimConfig) -> u64 {
 
 /// Whether the disk term is the axis that binds
 /// [`crate::work_finder::resolve_dynamic_max_concurrent`] down this tick —
-/// i.e. whether `min(disk, ram, configured_max)` is strictly smaller than
-/// `min(ram, configured_max)` would have been on its own.
+/// i.e. whether `min(disk, configured_max)` is strictly smaller than
+/// `configured_max` would have been on its own.
 ///
 /// This is deliberately broader than "the cap is exactly 0": a root whose disk
 /// term has fallen to 1 while RAM and the operator ceiling would both allow 4
@@ -288,12 +288,8 @@ pub fn resolve_fall_step_gb(config: &EagerReclaimConfig) -> u64 {
 /// contract, #4164), which can never be strictly less than another term — so a
 /// broken `df` never triggers reclaim, exactly as it never triggers a clamp.
 #[must_use]
-pub fn disk_axis_binds_cap_down(
-    disk_headroom: usize,
-    ram_headroom: usize,
-    configured_max: usize,
-) -> bool {
-    disk_headroom < ram_headroom.min(configured_max)
+pub fn disk_axis_binds_cap_down(disk_headroom: usize, configured_max: usize) -> bool {
+    disk_headroom < configured_max
 }
 
 /// Whether this tick should run an eager reclaim pass: the disk axis binds the
@@ -304,13 +300,8 @@ pub fn disk_axis_binds_cap_down(
 /// the trigger for a genuine future crossing. See the module docs for why this
 /// is edge-triggered rather than level-triggered.
 #[must_use]
-pub fn should_trigger(
-    was_binding: bool,
-    disk_headroom: usize,
-    ram_headroom: usize,
-    configured_max: usize,
-) -> bool {
-    !was_binding && disk_axis_binds_cap_down(disk_headroom, ram_headroom, configured_max)
+pub fn should_trigger(was_binding: bool, disk_headroom: usize, configured_max: usize) -> bool {
+    !was_binding && disk_axis_binds_cap_down(disk_headroom, configured_max)
 }
 
 // ============================================================================
@@ -823,43 +814,43 @@ mod tests {
     #[test]
     fn test_binds_when_disk_is_the_smallest_axis() {
         // disk 1 < min(ram 8, max 4) = 4 → disk is the binding axis.
-        assert!(disk_axis_binds_cap_down(1, 8, 4));
+        assert!(disk_axis_binds_cap_down(1, 4));
     }
 
     #[test]
     fn test_binds_when_disk_is_zero() {
         // The headline case from #7512: cap 0 while RAM and the ceiling are
         // both healthy.
-        assert!(disk_axis_binds_cap_down(0, 8, 4));
+        assert!(disk_axis_binds_cap_down(0, 4));
     }
 
     #[test]
     fn test_does_not_bind_when_another_axis_is_already_smaller() {
         // RAM is the binding axis, not disk — reclaiming disk would not raise
         // the cap by a single slot, so there is nothing to do eagerly.
-        assert!(!disk_axis_binds_cap_down(6, 2, 4));
+        assert!(!disk_axis_binds_cap_down(6, 4));
         // The operator ceiling binds.
-        assert!(!disk_axis_binds_cap_down(6, 8, 4));
+        assert!(!disk_axis_binds_cap_down(6, 4));
     }
 
     #[test]
     fn test_does_not_bind_on_a_tie() {
         // Equal is not "binding down" — the cap is the same either way.
-        assert!(!disk_axis_binds_cap_down(4, 8, 4));
+        assert!(!disk_axis_binds_cap_down(4, 4));
     }
 
     #[test]
     fn test_unmeasurable_disk_never_binds() {
         // `disk_headroom_limit` returns usize::MAX when `df` is unmeasurable
         // (#4164, unknown != zero). It must never trigger a reclaim.
-        assert!(!disk_axis_binds_cap_down(usize::MAX, 8, 4));
+        assert!(!disk_axis_binds_cap_down(usize::MAX, 4));
     }
 
     #[test]
     fn test_all_axes_zero_does_not_bind() {
         // A configured_max of 0 (dispatch disabled outright) is not a disk
         // problem — there is nothing to reclaim *for*.
-        assert!(!disk_axis_binds_cap_down(0, 0, 0));
+        assert!(!disk_axis_binds_cap_down(0, 0));
     }
 
     // ===================================================================
@@ -869,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_should_trigger_fires_on_a_fresh_crossing() {
-        assert!(should_trigger(false, 0, 8, 4));
+        assert!(should_trigger(false, 0, 4));
     }
 
     #[test]
@@ -877,12 +868,12 @@ mod tests {
         // Already binding as of the previous tick: staying there must NOT
         // refire — this is the property that keeps the no-cooldown merged-PR
         // worktree reap sub-pass from becoming a 60s forge-polling loop.
-        assert!(!should_trigger(true, 0, 8, 4));
+        assert!(!should_trigger(true, 0, 4));
     }
 
     #[test]
     fn test_should_trigger_does_not_fire_while_disk_is_healthy() {
-        assert!(!should_trigger(false, 9, 8, 4));
+        assert!(!should_trigger(false, 9, 4));
     }
 
     #[test]
@@ -893,10 +884,10 @@ mod tests {
         let mut was_binding = false;
         let mut fired_at = Vec::new();
         for (i, &disk) in ticks.iter().enumerate() {
-            if should_trigger(was_binding, disk, 8, 4) {
+            if should_trigger(was_binding, disk, 4) {
                 fired_at.push(i);
             }
-            was_binding = disk_axis_binds_cap_down(disk, 8, 4);
+            was_binding = disk_axis_binds_cap_down(disk, 4);
         }
         assert_eq!(fired_at, vec![1, 5]);
     }

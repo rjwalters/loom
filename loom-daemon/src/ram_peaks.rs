@@ -1,39 +1,31 @@
-//! Observed per-repo agent-scope memory peaks and the RAM admission charge
-//! derived from them (#11094, slice 1).
+//! Observed per-repo agent-scope memory peaks (#11094, slice 1).
 //!
 //! # Why this exists
 //!
-//! [`crate::ram_headroom`] used to charge every sweep a flat 2 GB against a
-//! point-in-time `MemAvailable` snapshot. A build-heavy repo can peak at 13 GB
-//! per sweep, and a young sweep has not yet allocated its peak, so several
-//! admissions each saw "plenty free" and the host OOM-killed the user session.
+//! Each agent scope's `memory.peak` (cgroup v2) is recorded per repo, so
+//! `loom-daemon ram-scope-limit`'s `auto` mode (#12246) can size an agent's
+//! `MemoryMax` from the repo's history, and so every ended scope is exported
+//! as `scope.memory` telemetry (#12241). A transient scope's cgroup vanishes
+//! when its last process exits, so the peak cannot be read *after* the sweep
+//! ends; [`observe`] samples every live scope each work-finder tick
+//! (`memory.peak` is itself a monotonic high-water mark, so a sample never
+//! loses the peak), and when a scope disappears from the live set its last
+//! sample is folded into the repo's rolling history and emitted as telemetry.
 //!
-//! This module closes both gaps without any new dependency:
-//!
-//! 1. **Record** each agent scope's `memory.peak` (cgroup v2). A transient
-//!    scope's cgroup vanishes when its last process exits, so the peak cannot
-//!    be read *after* the sweep ends; [`observe`] samples every live scope each
-//!    work-finder tick (`memory.peak` is itself a monotonic high-water mark, so
-//!    a sample never loses the peak), and when a scope disappears from the live
-//!    set its last sample is folded into the repo's rolling history and
-//!    emitted as telemetry.
-//! 2. **Charge** admission with the repo's observed high-water mark
-//!    ([`charge_gb`]) instead of the flat default, and **reserve** each
-//!    in-flight sweep's not-yet-realised peak ([`reserved_bytes`]).
+//! This history no longer feeds dispatch admission: #11094 charged admission
+//! with it and reserved every in-flight sweep's unrealised peak, and #12330
+//! removed that RAM term (operator ruling).
 //!
 //! A missing cgroup file (macOS, cgroup v1, a scope that never got created) is
-//! a no-op, never an error. A repo with no history keeps the flat default and
-//! reserves nothing, so behaviour without history is unchanged.
+//! a no-op, never an error.
 //!
 //! # Every agent scope, not only sweeps
 //!
 //! The live set is the issue locks' stamped scopes **plus** every
 //! `loom-agent-*.scope` found under [`AGENTS_SLICE`] ([`discover_scopes`]), so
-//! a role agent (Doctor, Judge, …) that holds no issue lock is still sampled
-//! and still reserved for. Such a scope is attributed to the workspace its
-//! processes run in (their `/proc/<pid>/cwd`), else to
-//! [`UNATTRIBUTED_REPO`], whose expected peak falls back to the host's worst
-//! observed repo peak until it has a history of its own.
+//! a role agent (Doctor, Judge, …) that holds no issue lock is still sampled.
+//! Such a scope is attributed to the workspace its processes run in (their
+//! `/proc/<pid>/cwd`), else to [`UNATTRIBUTED_REPO`].
 //!
 //! # The applied limit, and clipped peaks (#12241)
 //!
@@ -56,12 +48,9 @@ use serde::{Deserialize, Serialize};
 /// Override for the store location (tests, odd hosts).
 pub const PEAKS_PATH_ENV: &str = "LOOM_RAM_PEAKS_PATH";
 
-/// Samples kept per repo. The charge is the max of these, so one outlier ages
+/// Samples kept per repo. The high-water mark is the max of these, so one outlier ages
 /// out after this many later sweeps instead of pinning the repo forever.
 pub const HISTORY_LEN: usize = 8;
-
-/// Safety margin (percent) added on top of the observed high-water mark.
-pub const MARGIN_PCT: u64 = 10;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -75,7 +64,7 @@ pub const AGENT_SCOPE_PREFIX: &str = "loom-agent-";
 const PROBE_SCOPE_PREFIX: &str = "loom-agent-probe-";
 
 /// Consecutive failed cgroup reads after which a tracked scope's frozen
-/// sample is dropped, so it stops being credited back into admission (#11182).
+/// sample is dropped and its peak folded into history (#11182).
 pub const MAX_UNREADABLE_TICKS: u32 = 3;
 
 /// On-disk format this build writes. A file with no `version` field is the
@@ -347,25 +336,6 @@ pub struct LiveScope {
     pub role: Option<String>,
 }
 
-/// Where a sweep's RAM charge came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChargeSource {
-    Env,
-    Observed,
-    Default,
-}
-
-impl ChargeSource {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Env => "env",
-            Self::Observed => "observed",
-            Self::Default => "default",
-        }
-    }
-}
-
 /// Parse a cgroup v2 single-value file (`memory.peak`, `memory.current`).
 /// `max` and garbage are `None`.
 #[must_use]
@@ -377,99 +347,6 @@ pub fn parse_cgroup_bytes(contents: &str) -> Option<u64> {
 #[must_use]
 pub fn high_water_bytes(samples: &[u64]) -> Option<u64> {
     samples.iter().copied().max().filter(|&b| b > 0)
-}
-
-/// Resolve the per-sweep charge: env override > observed high-water mark plus
-/// [`MARGIN_PCT`] (rounded up to whole GB) > the flat default.
-#[must_use]
-pub fn charge_gb(
-    env_gb: Option<u64>,
-    observed_bytes: Option<u64>,
-    default_gb: u64,
-) -> (u64, ChargeSource) {
-    if let Some(gb) = env_gb {
-        return (gb.max(1), ChargeSource::Env);
-    }
-    if let Some(bytes) = observed_bytes {
-        let padded = bytes.saturating_add(bytes / 100 * MARGIN_PCT);
-        return (padded.div_ceil(GIB).max(1), ChargeSource::Observed);
-    }
-    (default_gb.max(1), ChargeSource::Default)
-}
-
-/// The peak a live scope of `repo` is expected to reach: its repo's
-/// high-water mark. An [`UNATTRIBUTED_REPO`] scope with no history of its own
-/// is assumed able to reach the host's worst observed repo peak, so a role
-/// agent outside every workspace still counts toward the reservation.
-#[must_use]
-pub fn expected_peak_bytes(store: &Store, repo: &str) -> Option<u64> {
-    store
-        .repos
-        .get(repo)
-        .and_then(|h| high_water_bytes(h))
-        .or_else(|| {
-            (repo == UNATTRIBUTED_REPO)
-                .then(|| {
-                    store
-                        .repos
-                        .values()
-                        .filter_map(|h| high_water_bytes(h))
-                        .max()
-                })
-                .flatten()
-        })
-}
-
-/// The peak a specific in-flight scope is expected to reach. A role-agent
-/// scope (no issue lock) with a known role and real `(repo, role)` history uses
-/// that history; anything else falls back to [`expected_peak_bytes`], so
-/// role-keyed history only ever lowers a reservation once it has samples.
-#[must_use]
-pub fn expected_peak_for(store: &Store, f: &InFlight) -> Option<u64> {
-    if f.issue.is_none() {
-        if let Some(b) = f
-            .role
-            .as_deref()
-            .and_then(|r| store.roles.get(&f.repo)?.get(r))
-            .and_then(|h| high_water_bytes(h))
-        {
-            return Some(b);
-        }
-    }
-    expected_peak_bytes(store, &f.repo)
-}
-
-/// Bytes still to be realised by the live agent scopes (sweeps and role
-/// agents alike): for each one with an expected peak
-/// ([`expected_peak_bytes`]), `max(0, expected_peak - current_usage)`. A scope
-/// that has already passed its expectation, or that has no expectation,
-/// reserves nothing (so no-history behaviour is the pre-#11094 snapshot).
-#[must_use]
-pub fn reserved_bytes(store: &Store) -> u64 {
-    store
-        .inflight
-        .values()
-        .filter_map(|f| {
-            let expected = expected_peak_for(store, f)?;
-            Some(expected.saturating_sub(f.current_bytes))
-        })
-        .sum()
-}
-
-/// Per repo key, the in-flight SWEEPS (issue-lock scopes) whose future use
-/// [`reserved_bytes`] accounts for: sampled into `inflight` AND with an
-/// expected peak. Only these may be credited back into the admission cap; a
-/// lock with no scope, an unreadable cgroup or a repo without history is
-/// charged by admission instead (#11094).
-#[must_use]
-pub fn accounted_sweeps(store: &Store) -> BTreeMap<String, usize> {
-    let mut out = BTreeMap::new();
-    for f in store.inflight.values() {
-        if f.issue.is_some() && expected_peak_for(store, f).is_some() {
-            *out.entry(f.repo.clone()).or_insert(0) += 1;
-        }
-    }
-    out
 }
 
 fn push_sample(hist: &mut Vec<u64>, peak: u64) {
@@ -631,7 +508,7 @@ pub fn load_checked(path: &Path) -> Result<Store, LoadError> {
 }
 
 /// Load the store for read-only use; any unreadable file is an empty store
-/// (no history: today's flat-charge behaviour).
+/// (no history).
 #[must_use]
 pub fn load(path: &Path) -> Store {
     load_checked(path).unwrap_or_default()
@@ -845,26 +722,29 @@ fn emit_ended(e: &EndedScope, roots: &[PathBuf]) {
     .label("repo", e.repo.clone())]);
 }
 
+/// Sample every live agent scope of `roots` and fold finished scopes into
+/// the peak history ([`live_scopes`] then [`record_tick`]) — the work
+/// finder's per-tick call. Recording only: it gates nothing (#12330).
+pub fn sample_tick(pool: &std::sync::Arc<crate::workspace_pool::WorkspacePool>, roots: &[PathBuf]) {
+    record_tick(&live_scopes(pool, roots), roots);
+}
+
 /// The live agent scopes of every managed root — each registry's claim locks'
 /// stamped scope units, plus every other `loom-agent-*.scope` under the agents
 /// slice ([`discover_scopes`], Linux only), so role agents without an issue
-/// lock are sampled and reserved too — and the number of in-flight sweeps
-/// (issue locks) of each root, parallel to `roots`. Every lock is counted,
-/// sampled or not, so admission can charge the ones no sample accounts for.
+/// lock are sampled too.
 #[must_use]
 pub fn live_scopes(
     pool: &std::sync::Arc<crate::workspace_pool::WorkspacePool>,
     roots: &[PathBuf],
-) -> (Vec<LiveScope>, Vec<usize>) {
+) -> Vec<LiveScope> {
     let mut out = Vec::new();
-    let mut in_flight = vec![0; roots.len()];
-    for (idx, root) in roots.iter().enumerate() {
+    for root in roots {
         let registry = pool.get_or_provision(root);
         let sr = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for a in sr.in_flight_snapshot() {
-            in_flight[idx] += 1;
             if let Some(scope) = a.scope_unit {
                 out.push(LiveScope {
                     scope,
@@ -886,7 +766,7 @@ pub fn live_scopes(
         .filter_map(|r| Some((r.scope_unit?, r.role)))
         .collect();
     attach_roles(&mut out, &runs);
-    (out, in_flight)
+    out
 }
 
 /// Load, observe and persist one tick against `path`. An existing file that
@@ -957,14 +837,6 @@ mod tests {
         assert_eq!(parse_cgroup_bytes("12345\n"), Some(12345));
         assert_eq!(parse_cgroup_bytes("max\n"), None);
         assert_eq!(parse_cgroup_bytes(""), None);
-    }
-
-    #[test]
-    fn charge_precedence_env_observed_default() {
-        assert_eq!(charge_gb(Some(4), Some(13 * GIB), 2), (4, ChargeSource::Env));
-        // 13 GiB + 10% = 14.3 -> 15
-        assert_eq!(charge_gb(None, Some(13 * GIB), 2), (15, ChargeSource::Observed));
-        assert_eq!(charge_gb(None, None, 2), (2, ChargeSource::Default));
     }
 
     #[test]
@@ -1045,23 +917,6 @@ mod tests {
         assert_eq!(read_scope(d.path(), "../x"), None);
     }
 
-    #[test]
-    fn reservation_counts_only_repos_with_history_and_saturates() {
-        let mut store = Store::default();
-        store.repos.insert("hist".into(), vec![13 * GIB]);
-        let f = |repo: &str, cur: u64| InFlight {
-            repo: repo.into(),
-            issue: Some(1),
-            peak_bytes: cur,
-            current_bytes: cur,
-            ..InFlight::default()
-        };
-        store.inflight.insert("a".into(), f("hist", 4 * GIB));
-        store.inflight.insert("b".into(), f("nohist", GIB));
-        store.inflight.insert("c".into(), f("hist", 20 * GIB)); // past expectation
-        assert_eq!(reserved_bytes(&store), 9 * GIB);
-    }
-
     /// A fake agents slice: `(scope, peak, current, pids)` per scope dir.
     fn fake_slice(scopes: &[(&str, u64, u64, &[u32])]) -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
@@ -1134,32 +989,6 @@ mod tests {
     }
 
     #[test]
-    fn role_scopes_without_an_issue_lock_are_reserved_for() {
-        let mut store = Store::default();
-        store.repos.insert("heavy".into(), vec![13 * GIB]);
-        store.repos.insert("small".into(), vec![3 * GIB]);
-        let role = |repo: &str, cur: u64| InFlight {
-            repo: repo.into(),
-            issue: None,
-            peak_bytes: cur,
-            current_bytes: cur,
-            ..InFlight::default()
-        };
-        // A Doctor in `small` at 1 GiB of its 3 GiB history reserves 2 GiB.
-        store.inflight.insert("doctor".into(), role("small", GIB));
-        assert_eq!(reserved_bytes(&store), 2 * GIB);
-        // An unattributed agent with no history of its own is assumed able to
-        // reach the host's worst repo peak (13 GiB): 13 - 4 = 9 more.
-        store
-            .inflight
-            .insert("judge".into(), role(UNATTRIBUTED_REPO, 4 * GIB));
-        assert_eq!(reserved_bytes(&store), 11 * GIB);
-        // Once unattributed scopes have their own history, it wins.
-        store.repos.insert(UNATTRIBUTED_REPO.into(), vec![5 * GIB]);
-        assert_eq!(reserved_bytes(&store), 3 * GIB);
-    }
-
-    #[test]
     fn stored_issue_numbers_from_the_previous_schema_still_load() {
         let raw = r#"{"inflight":{"s":{"repo":"r","issue":5,"peak_bytes":1,"current_bytes":1}}}"#;
         let s: Store = serde_json::from_str(raw).unwrap();
@@ -1205,34 +1034,6 @@ mod tests {
         assert_eq!(store.roles["r"]["judge"], vec![2 * GIB]);
         // Role-unknown role scope and the issue-lock scope stay in `repos`.
         assert_eq!(store.repos["r"], vec![2 * GIB, 2 * GIB]);
-    }
-
-    #[test]
-    fn role_history_lowers_reservation_only_once_it_has_samples() {
-        let mut store = Store::default();
-        store.repos.insert("heavy".into(), vec![13 * GIB]);
-        let f = |role: Option<&str>| InFlight {
-            repo: "heavy".into(),
-            issue: None,
-            peak_bytes: GIB,
-            current_bytes: GIB,
-            role: role.map(Into::into),
-            ..InFlight::default()
-        };
-        store.inflight.insert("j".into(), f(Some("judge")));
-        assert_eq!(reserved_bytes(&store), 12 * GIB, "no judge history");
-        store
-            .roles
-            .entry("heavy".into())
-            .or_default()
-            .insert("judge".into(), vec![2 * GIB]);
-        assert_eq!(reserved_bytes(&store), GIB);
-        store.inflight.clear();
-        store.inflight.insert("u".into(), f(None));
-        assert_eq!(reserved_bytes(&store), 12 * GIB, "unknown role");
-        store.inflight.clear();
-        store.inflight.insert("d".into(), f(Some("doctor")));
-        assert_eq!(reserved_bytes(&store), 12 * GIB, "other role, no history");
     }
 
     /// The v0.19.976 struct definitions, to prove forward-tolerance.
@@ -1520,7 +1321,7 @@ mod tests {
         store.repos.insert("r".into(), vec![13 * GIB]);
         let l = [live("a.scope", "r")];
         observe(&mut store, &l, |_| Some((5 * GIB, GIB)));
-        assert_eq!(accounted_sweeps(&store)["r"], 1);
+        assert!(store.inflight.contains_key("a.scope"));
         for _ in 0..MAX_UNREADABLE_TICKS - 1 {
             observe(&mut store, &l, |_| None);
         }
@@ -1535,7 +1336,6 @@ mod tests {
         let ended = observe(&mut store, &l, |_| None);
         assert!(ended.is_empty(), "not an ended scope");
         assert!(!store.inflight.contains_key("a.scope"));
-        assert!(accounted_sweeps(&store).is_empty());
         assert_eq!(*store.repos["r"].last().unwrap(), 5 * GIB, "peak folded");
     }
 }

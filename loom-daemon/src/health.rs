@@ -1251,36 +1251,18 @@ pub fn classify_missing_tick(inputs: &HealthInputs, status: &DaemonStatusReport)
 }
 
 /// Whether `disk_headroom` is the **strictly** binding term of the dynamic
-/// concurrency cap `min(disk_headroom, ram_headroom, configured_max)` (#5177;
-/// token axis removed / ram_headroom added in #5270 — see
+/// concurrency cap `min(disk_headroom, configured_max)` (#5177; token axis
+/// removed in #5270, RAM term in #12330 — see
 /// [`crate::work_finder::resolve_dynamic_max_concurrent`]).
 ///
-/// True when disk headroom is at most RAM headroom (a tie resolves to disk,
-/// matching [`crate::calibrate::binding_term`]'s tie-break order) AND
-/// strictly smaller than the operator's configured admission ceiling — i.e.
-/// the scratch volume is throttling dispatch below what `configured_max`
-/// would otherwise allow. A tie **with the ceiling** is deliberately NOT
-/// flagged: that ceiling is the operator's own deliberate choice, not a disk
-/// fault. Mirrors the input shape of
-/// [`crate::work_finder::resolve_dynamic_max_concurrent`] so the two agree on
-/// what "binding" means.
+/// True when disk headroom is strictly smaller than the operator's configured
+/// admission ceiling — i.e. the scratch volume is throttling dispatch below
+/// what `configured_max` would otherwise allow. A tie **with the ceiling** is
+/// deliberately NOT flagged: that ceiling is the operator's own deliberate
+/// choice, not a disk fault.
 #[must_use]
-pub fn disk_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
-    disk_headroom <= ram_headroom && disk_headroom < configured_max
-}
-
-/// Whether `ram_headroom` is the **uniquely** binding term of the dynamic
-/// concurrency cap (#5270) — the RAM-headroom mirror of [`disk_binds_cap`].
-///
-/// True only when RAM headroom is strictly smaller than **both** the disk
-/// headroom and the operator's configured admission ceiling. A tie with disk
-/// resolves to [`disk_binds_cap`] instead (mirroring
-/// [`crate::calibrate::binding_term`]'s tie-break order), keeping the two
-/// predicates mutually exclusive so `assess_dispatch` never double-reports
-/// the same throttling event under both names.
-#[must_use]
-pub fn ram_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
-    ram_headroom < disk_headroom && ram_headroom < configured_max
+pub fn disk_binds_cap(disk_headroom: usize, configured_max: usize) -> bool {
+    disk_headroom < configured_max
 }
 
 /// Assess the dispatch section: in-flight occupancy against the dynamic cap,
@@ -1327,28 +1309,18 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
     // cap and throttles the host to a fraction of its configured capacity. That
     // used to present as a green daemon dispatching at, say, cap 2 — a fault an
     // operator had to notice in the `min(...)` breakdown. Name it as degraded.
-    if disk_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
+    if disk_binds_cap(status.disk_headroom, status.configured_max) {
         degraded.push(format!(
             "disk headroom is throttling dispatch (cap {} bound by disk headroom {} — free scratch \
              disk; e.g. `loom-daemon clean --aggressive` / `--deep`)",
             cap, status.disk_headroom
         ));
     }
-    // #5270: the RAM-headroom mirror of the #5177 disk case above — the second
-    // "dumb mode" machine-headroom axis, so a critically-low-memory host is
-    // named as degraded the same way a critically-low-disk host already is.
-    if ram_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
-        degraded.push(format!(
-            "RAM headroom is throttling dispatch (cap {} bound by ram headroom {} — free memory \
-             or lower LOOM_PER_WORKTREE_RAM_GB, #5270)",
-            cap, status.ram_headroom
-        ));
-    }
-    // #5270: name the machine axis (max/disk/RAM/CPU) currently HOLDING new
+    // #5270: name the machine axis (max/disk/CPU) currently HOLDING new
     // admissions outright — the CPU saturation admission brake is a
     // point-in-time gate outside the `min(...)` cap formula (see
     // `crate::admission_brake`'s module docs for why), so it cannot be named
-    // by `disk_binds_cap` / `ram_binds_cap` above; it is checked independently
+    // by `disk_binds_cap` above; it is checked independently
     // here, mirroring the host-distress breaker check above it.
     if status.admission_brake.as_ref().is_some_and(|b| b.held) {
         let load = status

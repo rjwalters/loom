@@ -2737,7 +2737,8 @@ own registry from the `WorkspacePool` (`get_or_provision`). It returns:
 
 `loom-daemon status` prints a **Managed repos** section (root, in-flight count,
 gate state); `loom-daemon status --json` adds the `per_repo` array. The
-dynamic-cap inputs (disk headroom, ram headroom, configured ceiling) remain
+dynamic-cap inputs (disk headroom, configured ceiling; the RAM term was
+removed in #12330) remain
 computed once from the daemon's primary workspace —
 they are *machine-level* resources, so
 they stay a single global figure, not per-repo. `resolve_registry` (the
@@ -3323,7 +3324,7 @@ conditions, each keyed and alerted independently:
 | `tokens-zero-healthy` | zero healthy token accounts | `auth_401` (blocked by an auth-class `.bad_tokens` entry such as `auth-dead: 401`, or with no `.bad_tokens` history; never self-heals): re-auth / `tokens import-from-monitor` / `tokens unblock`; exhausted: wait or add accounts; empty pool: `tokens bootstrap` |
 | `dispatch-halted` | main-health gate halted, or the last tick halted while tokens are still available | read `health`'s dispatch section |
 | `roles-persistent` | one or more roles with PERSISTENT tick failures | a launch refused for a missing guarded-canary receipt (exit 78) is named as a runtime/version mismatch (`runtimes.default`, opencode version) |
-| `capacity-limited` | disk or RAM headroom holds the effective cap below the configured `maxConcurrent` (#10214; even with nothing waiting) | which term, the effective vs. configured cap, how many ready issues wait; free disk / RAM or add capacity |
+| `capacity-limited` | disk headroom holds the effective cap below the configured `maxConcurrent` (#10214; even with nothing waiting) | the effective vs. configured cap, how many ready issues wait; free disk or add capacity |
 
 The `star-backlog` ask (#10214) was retired with the operator star (#11510):
 priority only orders the queue, and `loom:very-important` is capped at one
@@ -4724,10 +4725,10 @@ The concurrency cap is **not** a fixed value resolved once at startup. Every
 tick the finder recomputes
 
 ```
-dynamic_cap = min(disk headroom, ram headroom, configured maxConcurrent)
+dynamic_cap = min(disk headroom, configured maxConcurrent)
 ```
 
-from live inputs, so disk/RAM/backlog changes are honored without a daemon
+from live inputs, so disk/backlog changes are honored without a daemon
 restart. Since #9060 that includes **`configured maxConcurrent`**: the loop
 re-reads `autonomous.workFinder.maxConcurrent` from the primary workspace's
 effective config every tick, so an edit (committed `.loom/config.json`, or
@@ -4780,7 +4781,6 @@ touching running work.
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
 | **disk headroom** | since #11191, `sweeps in flight + floor((free - floor - reserved) / smallest repo charge)` on the worktree-root volume, with each repo charged its own measured footprint — see [Disk admission](#disk-admission-11191) (`disk_admission::tick`). With `LOOM_DISK_ADMISSION=0`, or when free space is unmeasurable, the legacy `floor(free_gb / LOOM_PER_WORKTREE_GB)` (default 8 GB, #8370; `disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold, counting the growth the running sweeps have still to write |
-| **ram headroom** (#5270) | `floor(available_gb / LOOM_PER_WORKTREE_RAM_GB)` on the host's currently-available memory (`ram_headroom::ram_headroom_limit`, modeled on `disk_headroom`'s shape: `/proc/meminfo`'s `MemAvailable` on Linux, `vm_stat` free+inactive pages × page size on macOS) | never provision more worktrees than available RAM can hold; the second "dumb mode" machine-headroom axis alongside disk |
 | **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | the per-machine **sweep-dispatch** admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: bytes of disk and bytes of RAM). **Not the whole host's agent budget**: role-runner agents are admitted outside this formula entirely (#6102) |
 
 Retired as cap inputs (informational-only now — see `capacity::token_axis_limit` / `tokens_pool::select`):
@@ -4996,9 +4996,12 @@ actually is**:
 
 1. **Sweep admission is one per-machine knob.** `autonomous.workFinder.maxConcurrent`
    is the whole *sweep* policy, tuned empirically by the operator (expect 10+ on an
-   8-core API-bound worker). The two remaining terms — disk headroom and (since
-   #5270) RAM headroom — stay because they meter genuinely *exhaustible*
-   resources (bytes), not an estimate. (The token axis sat here too until
+   8-core API-bound worker). The one remaining term — disk headroom — stays
+   because it meters a genuinely *exhaustible* resource (bytes), not an
+   estimate. RAM headroom (#5270, #11094) was removed in #12330: it reserved
+   every in-flight sweep's worst observed build peak at once and capped idle
+   hosts near 1; RAM is watched from outside instead (host memory pressure),
+   by adjusting `maxConcurrent`. (The token axis sat here too until
    #5270 removed it — see the section above.) **It is not the whole *host*
    policy**: role-runner agents are admitted outside this formula entirely and
    carry their own ceiling since #6102 — see
@@ -5086,14 +5089,8 @@ consistent env-only behavior. Wiring the Bash `config-resolver.sh` into
 `disk-headroom.sh` too is a separate, larger change; file a follow-up if that
 cost is judged worth paying.
 
-**RAM headroom mirrors this env-only shape (#5270).** `ram_headroom::per_worktree_ram_gb`
-resolves `LOOM_PER_WORKTREE_RAM_GB` (default **2** GB) the same way
-`disk_headroom::per_worktree_gb` resolves its own env var — no config key,
-env-only, floored to a minimum of 1. There is no Bash-side RAM counterpart to
-`disk-headroom.sh` (RAM headroom is Rust-only, consumed solely by the daemon's
-own `resolve_dynamic_max_concurrent`), so the #4032 divergence concern above
-does not apply here — env-only was simply the cheapest consistent choice, not
-a workaround for a second reader.
+**There is no RAM headroom term** (removed in #12330). The dynamic cap is
+`min(disk headroom, maxConcurrent)`; `LOOM_PER_WORKTREE_RAM_GB` is no longer read.
 
 #### Saturation admission brake (#4903)
 
@@ -5780,10 +5777,10 @@ loom-daemon calibrate --write         # DEPRECATED, ignored (prints a notice)
   failing. The JSON payload keeps a `"write": {"applied": false, "config_path":
   null}` object for machine consumers that keyed off it.
 - **What it prints**: host measurements (logical cpus, observed idle fraction +
-  1m loadavg, disk headroom, ram headroom, healthy/total accounts — informational
-  only, build slots), the currently resolved knobs, the `min(disk, ram,
-  maxConcurrent)` breakdown (#5270 — no token term), which term binds (`disk` /
-  `ram` / `ceiling`), the **role-agent ceiling** and this host's worst-case
+  1m loadavg, disk headroom, healthy/total accounts — informational
+  only, build slots), the currently resolved knobs, the `min(disk,
+  maxConcurrent)` breakdown (#5270 — no token term; #12330 — no RAM term),
+  which term binds (`disk` / `ceiling`), the **role-agent ceiling** and this host's worst-case
   agent count (#6102), and one line of advice.
 - **How to read it** (this is the tuning loop that replaces the old
   recommendation):
@@ -5824,8 +5821,8 @@ loom-daemon calibrate --write         # DEPRECATED, ignored (prints a notice)
   `LOOM_WORK_FINDER_MAX_CONCURRENT` in the daemon's start environment — rather
   than in each repo's `.loom/config.json`.
 - **Fleet-safety**: a generous committed `maxConcurrent` is still safe fleet-wide
-  because the two exhaustible-resource terms remain in the `min(...)` (each host
-  binds on its **own** disk/RAM), the build slot bounds concurrent heavy
+  because the exhaustible-resource term remains in the `min(...)` (each host
+  binds on its **own** disk), the build slot bounds concurrent heavy
   builds per machine, and the host breaker is the measured backstop.
 - **Startup hint**: `loom-daemon-start.sh` prints one advisory line at start
   time — `"maxConcurrent N binds while the host is M% idle — consider raising
@@ -5906,13 +5903,12 @@ duplicating the `disk_headroom_limit` plumbing `loom-daemon status`
 
 Nothing in this handler may block, because it holds the sweep-registry mutex
 from the assessment through the dispatch call. Since #5270 the headroom is
-`min(disk, ram, configured max)` — cheap filesystem/config reads (plus a
-non-sleeping `/proc/meminfo` read or a flag-less `vm_stat` snapshot on macOS
-for RAM), no CPU sampling at all. (Before #4512 this had to carefully avoid
+`min(disk, configured max)` — cheap filesystem/config reads, no CPU sampling
+at all (the RAM term and its `/proc/meminfo` / `vm_stat` read were removed in
+#12330). (Before #4512 this had to carefully avoid
 the **refreshing** CPU probe, whose macOS `iostat` refresh sleeps ~1s and
 would have stalled every other IPC request on the same registry for that
-second; removing the CPU term removed that hazard outright, and RAM headroom
-deliberately preserves the same non-blocking contract.)
+second; removing the CPU term removed that hazard outright.)
 
 **Per-token concurrency factor (#3947, retired from the cap by #5270, removed
 entirely by #5743).** The token axis used to be `healthy × factor`, not
@@ -5924,7 +5920,8 @@ the retirement by deleting the knob, its env var, and the derived `healthy N ×
 per-token M = P` line from `loom-daemon status` / `calibrate` entirely — that
 line disclaimed itself as "informational only" but was still misread as a live
 cap term more than once. `= min(...)` is now simply `= min(disk headroom 120,
-ram headroom 40, configured max 3)`, with no token term at all. A config file
+configured max 3)`, with no token term at all (and, since #12330, no RAM
+term). A config file
 that still sets `autonomous.perTokenConcurrency` parses fine (unknown keys are
 ignored, not an error) — the key just does nothing. A separate line reports the
 live host CPU **observation** — explicitly labelled as not a cap term, e.g.
@@ -6481,7 +6478,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.redFixEscalateAfterSecs` | — | `1800` | How long a `<!-- loom:main-red-fix -->` candidate may wait unclaimed on a red `main` before the daemon files one `loom:operator` alert issue for it (#10118). Positive integer seconds; anything else uses the default. **Hot-applies** (read when a fix is waiting). See "Unpromoted red-main fixes (#10118)" above |
 | `autonomous.workFinder.tickDeadlineSecs` | — | `90` | The wall-clock deadline of one work-finder tick body (#12074). Every forge read from the pre-dispatch holds through the step gather gets only the time left (its own timeout is clamped), a read past the deadline is not sent (a shed: the gather uses its last good listing, a fact keeps the value that passes the item), and once it passes no further repo is gathered: the tick draws from what it gathered, reports `loom.dispatch.gather_truncated`, and the next tick starts at the first repo skipped. The deadline clock starts after the tick's local pre-dispatch work (eager reclaim, CPU sample). At least one repo is gathered every tick, and its reads get at least 20 s even past the deadline. Inside the tick, a read whose readers are out of budget (a rate-limit back-off) is shed rather than moved to the writer App, whatever its class; any other cause (a failing gateway, a coverage miss) still reaches the writer. A repo whose gather was starved (failed, last-good only, or no open-PR listing) for 3 ticks in a row gets one tick on the writer: every budget shed is lifted for that tick, deferrable listings included. Three consecutive gateway attempts that time out or fail with an unmarked 5xx withdraw the gateway for the default window; any gateway answer, on any read path, resets the count. The step tick's open-PR listing stays a Gate read, with its last good copy standing in when it fails. The draw's own claim reads run outside the deadline. Positive integer seconds; anything else uses the default. **Hot-applies** (read at the start of each tick) |
 | `autonomous.workFinder.gatherConcurrency` | — | `8` | How many repos the step gather lists at once (#12256). The forge half of each repo's gather (the item and open-PR listings, hold markers, blocker states, the landed pre-filter, CI at a Judge head) runs on up to this many threads; each keeps the tick's read deadline (`tickDeadlineSecs`) and its starvation rules, and repos are taken in walk order, so a deadline still skips from the end. Stage-entry lookups, weighing and the draw stay serial and run in walk order, so the draw does not depend on which listing answered first. `1` restores the serial gather. Positive integer, at most 32; anything else uses the default. **Direct backend only (#12307):** with `forge.mirror.discovery = "worklist"` the gather reads the tick's one in-memory snapshot, so the key is ignored (the gather is serial) and a one-time warning says so. **Hot-applies** (read at each tick) |
-| `autonomous.workFinder.spawnConcurrency` | — | `4` | How many step spawns the work finder's draw runs at once, each in a different repo (#12298). The draw fills its slots in rounds: each round draws one candidate for up to this many open slots, never two in one repo, runs the per-repo cap, RAM, disk and one-merge-per-repo gates for them in draw order (the round's earlier candidates count as admitted, so a round cannot overrun a shared budget), then spawns them together, so their resolvers, pre-claims and account-selection polls overlap. The child launches themselves stay serialised host-wide, at least `dispatchStaggerMs` apart across all repos (the #3887 startup-race gap, which is otherwise kept per repo), so a round never starts several children within milliseconds. Results are applied in draw order, and a refused slot draws again in the next round. Within one repo, claims and step-ledger writes stay one at a time and in order; `workFinder.maxConcurrent`, the free slots and `maxAdmissionsPerTick` bound the tick as before. Before each round the shared GitHub rate-limit breaker is checked: when it has tripped since the tick started, the round is not spawned, its drawn candidates wait for a later tick (`deferred_capacity`, detail `rate_limit_breaker`), and the tick span records `loom.dispatch.spawn_hold`. `1` restores the serial spawns. Positive integer, at most 16; anything else uses the default. **Hot-applies** (read at each tick) |
+| `autonomous.workFinder.spawnConcurrency` | — | `4` | How many step spawns the work finder's draw runs at once, each in a different repo (#12298). The draw fills its slots in rounds: each round draws one candidate for up to this many open slots, never two in one repo, runs the per-repo cap, disk and one-merge-per-repo gates for them in draw order (the round's earlier candidates count as admitted, so a round cannot overrun a shared budget), then spawns them together, so their resolvers, pre-claims and account-selection polls overlap. The child launches themselves stay serialised host-wide, at least `dispatchStaggerMs` apart across all repos (the #3887 startup-race gap, which is otherwise kept per repo), so a round never starts several children within milliseconds. Results are applied in draw order, and a refused slot draws again in the next round. Within one repo, claims and step-ledger writes stay one at a time and in order; `workFinder.maxConcurrent`, the free slots and `maxAdmissionsPerTick` bound the tick as before. Before each round the shared GitHub rate-limit breaker is checked: when it has tripped since the tick started, the round is not spawned, its drawn candidates wait for a later tick (`deferred_capacity`, detail `rate_limit_breaker`), and the tick span records `loom.dispatch.spawn_hold`. `1` restores the serial spawns. Positive integer, at most 16; anything else uses the default. **Hot-applies** (read at each tick) |
 | `forge.mirror.discovery` | — | `"direct"` | The discovery chain a daemon walks each step tick (#12311). **No `forge.mirror` block: the chain is `gh` only** (today's behaviour with the installation's own credential; nothing to set). With a `forge.mirror` block: `"direct"` (the default, and what the retired `"per_call"` now reads as, #12307) lists per repo and never asks the mirror; `"worklist"` is mirror, then gateway, then `gh`: one `GET /v1/mirror/worklist` per tick, conditional on the last `ETag` (a `304` reuses the one in-memory `(etag, body)`, which is replaced every tick, dropped on restart and never persisted or merged with change events); `"direct"` is also the break-glass for a mirror that is wrong rather than down: gateway, then `gh`, never the mirror. On `"worklist"`, a failed request (transport, 5xx, auth, malformed body) sends every repo to the gateway tier, and a repo whose `status` is not `ok` (`unknown`, `backfilling`, `error`, or omitted) goes alone. The fallback tiers are outage modes and **capped**: a repo is listed at most once per work-finder interval (the backstop pace; between listings the tick draws from that repo's last listing, held in memory only), and a gateway reserve `429` ends the tick's discovery with `loom.discovery.fallback_reason = reserve`, draws from the last listing and leaves `rate_limit_breaker` alone. A repo no tier answers for is tier `none`: nothing is drawn from it that tick, and running sessions are unaffected. There is never a writer tier. Which tier answered is on the `loom.dispatch.tick` span (`loom.discovery.tier`; see `telemetry-schema.md`). Claim, lease, label-transition and merge reads never read the snapshot. Replaces #12306's `autonomous.workFinder.discovery`, still read as an alias when this key is unset (`"mirror"` is `"worklist"`). **Hot-applies** (read at each tick) |
 | `autonomous.workFinder.landedPrefilter` | — | `false` | The landed pre-filter (#11853): before a `loom:issue` candidate without an open PR is dispatched, one batched GraphQL closes-graph query per workspace asks whether a PR that closes it has merged while it stays open, and routes such an issue to Curator (`loom:triage`) instead of a Builder. **Off by default since #12205** (it cost about 1.5k dispatch-App GraphQL calls an hour fleet-wide). Off, it makes no forge call and every candidate is dispatched as before #11853: a landed-but-open issue can reach a Builder again, bounded by the #11429 journal check, the 2.5 closed-issue guard and the no-op cooldown. On, the query asks only candidates without an open linked PR, at most once per half `LANDED_RECHECK` (15 min) per workspace, backs off 5 min after an unanswered query, and is a repo-targeted Hygiene read (reader pool or gateway; shed, never moved to the writer, when the readers are out of budget). `true` turns it on; anything else is off. **Hot-applies** (read on every call) |
 | *(env only)* | `LOOM_OPEN_PR_MEMO` | `true` | Verified-open-PR memo for the #4123 open-PR dispatch guard (#6788). Falsy (`0`/`false`/`no`/`off`) disables; anything else (including unset) enables. When on, the guard (a) reuses a verified "issue #N has open linked PR #M" answer for 15 minutes instead of re-running the closes-graph query on every work-finder tick, and (b) when **both** the GraphQL probe and its #5911 REST fallback fail, re-verifies that one known PR over a single `GET repos/{owner}/{repo}/pulls/{M}` before conceding. The documented fail-open contract is unchanged: with no memo, or if that recheck also cannot answer, the guard still proceeds. In-memory only — a daemon restart clears it. Disable only to restore the exact pre-#6788 probe |
@@ -9903,7 +9900,7 @@ OOM-kill count, the single most diagnostic number in the #8512 incident.
 **The work finder emits a bounded, non-spammy `WARN`** when `shmem / total`
 crosses a configured fraction (default 15%), naming the largest offending
 mount and the `tmpfs-scratch-gc --dry-run` recipe. **Warning only — it never
-gates dispatch**, unlike the disk/RAM headroom axes above: a host with a
+gates dispatch**, unlike the disk headroom axis above: a host with a
 legitimately large tmpfs (a shared-memory-heavy workload) must not be starved
 of work, and the reclaim pass already removes the Loom-caused case on its own.
 A process-global cooldown (`LOOM_TMPFS_VISIBILITY_WARN_INTERVAL_SECS`, default
@@ -11300,7 +11297,7 @@ interval-cadence pass, e.g.:
   `RoleRunGuard::admit(...)` call an ordinary interval role uses in
   `decide_root_tick()`, so it is refused exactly like any other tick once
   `maxConcurrent` (or any other admission ceiling) is saturated — promotion
-  is never a bypass of the token/disk/RAM axes.
+  is never a bypass of the disk axis or `maxConcurrent`.
 - **`loom-daemon status`** (both human-readable and `--json`) surfaces, for
   every role that is both `onIdle` and has a configured `onIdleMaxWait`
   entry, the age since its last completed tick and whether it is currently

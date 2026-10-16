@@ -347,7 +347,6 @@ fn fake_headroom(occupancy: usize, dynamic_cap: usize) -> DispatchHeadroom {
         occupancy,
         dynamic_cap,
         disk_headroom: 10,
-        ram_headroom: 10,
         token_axis_limit: 5,
     }
 }
@@ -374,7 +373,6 @@ fn dispatch_headroom_message_names_every_axis() {
         occupancy: 4,
         dynamic_cap: 3,
         disk_headroom: 9,
-        ram_headroom: 7,
         token_axis_limit: 6,
     };
     let kind = SweepKind::Issue(123);
@@ -384,7 +382,7 @@ fn dispatch_headroom_message_names_every_axis() {
     assert!(entered.contains("occupancy=4"), "{entered}");
     assert!(entered.contains("dynamic_cap=3"), "{entered}");
     assert!(entered.contains("disk_headroom=9"), "{entered}");
-    assert!(entered.contains("ram_headroom=7"), "{entered}");
+    assert!(!entered.contains("ram_headroom"), "no RAM term since #12330: {entered}");
     assert!(entered.contains("token_axis_limit=6"), "{entered}");
     assert!(entered.contains("123"), "{entered}");
     assert!(entered.contains("advisory only"), "{entered}");
@@ -3763,21 +3761,17 @@ fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
     let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
     std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
 
-    // #11679: pin the live RAM/disk probes so the cap does not depend on host
+    // #11679: pin the live disk probe so the cap does not depend on host
     // load. The guard restores everything on drop, including on panic.
     struct PinGuard;
     impl Drop for PinGuard {
         fn drop(&mut self) {
-            crate::ram_headroom::set_available_ram_gb_override(None);
             crate::disk_headroom::set_free_gb_override(None);
-            std::env::remove_var("LOOM_PER_WORKTREE_RAM_GB");
             std::env::remove_var("LOOM_PER_WORKTREE_GB");
         }
     }
     let _pin = PinGuard;
-    crate::ram_headroom::set_available_ram_gb_override(Some(1024));
     crate::disk_headroom::set_free_gb_override(Some(1024));
-    std::env::set_var("LOOM_PER_WORKTREE_RAM_GB", "1");
     std::env::set_var("LOOM_PER_WORKTREE_GB", "1");
 
     // Provision a two-token pool so the dynamic cap is > 0 (a real ceiling).
@@ -3925,7 +3919,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
     // The tempdir has no `.loom/tokens/`, so the pool is 0 — but since
     // #5270 the token axis no longer participates in the dynamic cap, so
     // an empty token pool no longer pins `dynamic_cap` to 0. The cap is
-    // `min(disk_headroom, ram_headroom, configured_max)`, where
+    // `min(disk_headroom, configured_max)`, where
     // `configured_max` is resolved the same way `build_daemon_status`
     // resolves it (not assumed to be the built-in default — a host-level
     // config tier may set it, exactly the ambient config this assertion
@@ -3936,11 +3930,8 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
     );
     assert_eq!(
         report.dynamic_cap,
-        report
-            .disk_headroom
-            .min(report.ram_headroom)
-            .min(expected_configured_max),
-        "dynamic cap is min(disk, ram, configured_max) regardless of the empty token pool"
+        report.disk_headroom.min(expected_configured_max),
+        "dynamic cap is min(disk, configured_max) regardless of the empty token pool"
     );
     // #4345: a pool that never called start_safehouse_narration /
     // start_peer_coordination still reports a live safehouse state — the

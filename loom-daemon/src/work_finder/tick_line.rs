@@ -13,7 +13,6 @@ pub struct TickLine<'a> {
     pub token_limit: usize,
     pub min_workspace_healthy: usize,
     pub disk: usize,
-    pub ram: usize,
     pub configured_max: usize,
     pub max_admissions_per_tick: usize,
     pub workspaces: usize,
@@ -48,7 +47,7 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
     format!(
         "work_finder: tick — cap {} (pool={}, healthy={} [fallback_root probe only], \
          min_workspace_healthy={} [minimum across every registered workspace's own resolved \
-         pool, #7527], disk={} [{}], ram={}, ceiling={}, ramp_cap={}); {} workspace(s), \
+         pool, #7527], disk={} [{}], ceiling={}, ramp_cap={}); {} workspace(s), \
          {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
          {} quarantine-skip, {} workspace-commands-missing-skip, \
          {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
@@ -67,7 +66,6 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
         t.min_workspace_healthy,
         t.disk,
         t.disk_note,
-        t.ram,
         t.configured_max,
         t.max_admissions_per_tick,
         t.workspaces,
@@ -120,7 +118,6 @@ mod tests {
             token_limit: 4,
             min_workspace_healthy: 4,
             disk: 2,
-            ram: 9,
             configured_max: 12,
             max_admissions_per_tick: 2,
             workspaces: 1,

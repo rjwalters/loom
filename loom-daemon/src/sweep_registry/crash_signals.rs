@@ -458,7 +458,7 @@ pub(crate) fn poll_observability(
 ///
 /// Note (capacity accounting): recovery restores *attribution* only. An
 /// `unknown` adopted sweep was never a capacity-exemption bug — the concurrency
-/// cap is `min(disk_headroom, ram_headroom, configured_max)` vs. total occupancy
+/// cap is `min(disk_headroom, configured_max)` vs. total occupancy
 /// (`resolve_dynamic_max_concurrent`, #5270), and adopted `Running` entries
 /// already count toward that occupancy regardless of `token_name`. What
 /// `unknown` costs is `status` visibility and the #4122 bad-marking path.

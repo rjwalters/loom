@@ -217,6 +217,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`host.status`](#hoststatus) | gauges, OTLP only | `host_status.rs` (sampler), `observability/collector.rs`, `observability/otlp/mapping/host_status.rs` |
 | [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
+| [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` Deny branch) |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
@@ -1986,11 +1987,16 @@ The tick span also carries (#11858, `observability/ops/dispatch_facts.rs`):
 `loom.dispatch.halted_repos`, each repo the work finder holds with its cause
 (`owner/repo=main_red,owner/b=maintain_only`, sorted, cut at a whole entry
 within 256 characters; absent when nothing is held), so a hold names its repo;
-`loom.dispatch.cap_limiter` (`configured`, `disk` or `ram`: the term that binds
-`loom.dispatch.max_concurrent`) with the terms `loom.dispatch.cap_configured`,
-`loom.dispatch.cap_disk` and `loom.dispatch.cap_ram` (each absent when not
-measured); and `loom.dispatch.pr_open_prefiltered`, the open-PR skips the
+`loom.dispatch.cap_limiter` (`configured` or `disk`: the term that binds
+`loom.dispatch.max_concurrent`) with the terms `loom.dispatch.cap_configured`
+and `loom.dispatch.cap_disk` (each absent when not measured;
+`loom.dispatch.cap_ram` and the `ram` limiter value are no longer emitted
+since the RAM term was removed in #12330); and `loom.dispatch.pr_open_prefiltered`, the open-PR skips the
 pre-filter made with no admission span.
+
+Since #12330 the multi-workspace loop records those cap terms too (before, only
+the single-workspace loop did, so the production tick span carried none of
+them).
 
 Since #12074 the tick span also carries the step gather's cost and coverage
 (absent when no step gather ran): `loom.dispatch.gather_ms` (wall-clock
@@ -2030,6 +2036,15 @@ with concurrent spawns they can add up to more than `phase.spawn_ms`):
 | `loom.dispatch.phase.spawn_launch_ms` | The launch: the second roll gate, the dispatch stagger and the child's spawn |
 | `loom.dispatch.spawn_hold` | Why the draw stopped spawning before its slots were filled: `rate_limit_breaker` when the shared GitHub rate-limit breaker tripped mid-tick (checked before each round's batch). Absent when it never stopped |
 | `loom.dispatch.phase.spawn_account_ms` | The account-selection poll (up to 5 s per spawn) and recording the step |
+
+Since #12410 the tick span also says why a tick with free slots made few
+spawn attempts:
+
+| Attribute | Meaning |
+|---|---|
+| `loom.dispatch.draws` | Item draws the tick took, across repos (count) |
+| `loom.dispatch.draws_unspawned` | Draws that never reached the spawner: a repo at its cap (`repo_cap`) or a second merge in a repo (`merge_in_flight`) (count) |
+| `loom.dispatch.passes` | Passes by reason as comma-joined `reason=count` pairs in reason order (`claim_lost=3,repo_cap=1`). The reasons are an open set, so they share one value; absent when nothing passed |
 
 Since #12306 and #12311 the tick also records what its discovery snapshot
 cost, covered and which tier answered (the worklist rows are absent when the
@@ -3775,6 +3790,42 @@ invoked by a person *through Loom's own tagged environment* (a shell inheriting
 entries other than start/finish/abort are ignored, so one rebase is one or two
 records, not one per picked commit.
 
+
+### `roster.change`
+
+The roster pass changed this host's workspace registry, or could not register a
+desired repo because it is not cloned (Issue #12322). One record per applied
+change and per uncloned repo, emitted by `fleet_sync::roster_clone` (via
+`emit_changes`) **whatever the repo's queue holds**, so a registered-but-idle
+repo is visible: `loom.dispatch.disposition` spans only exist for repos with a
+queue item. Envelopes carry `schema_version: 12`. **OTLP-only** (native:
+`false`), severity `INFO`, stamped when the pass made the change. The body is
+the record's JSON; the scalars ride as `loom.roster.*` attributes
+(`ROSTER_CHANGE_LOG_ATTRIBUTE_KEYS`, which the collector's `transform/privacy`
+allowlists), plus `loom.repo` / `loom.repo.visibility`. No absolute path is
+exported. Nothing is emitted when `fleet.autoApply` is off (the pass applies
+nothing), when the pass has no changes, or for an apply that failed.
+
+`skip:not-cloned` repeats every timer pass while the repo stays uncloned (one
+row per missing repo per pass); a repeating row is the proof the repo is still
+unregistered. A repo the pass cloned and registered is `register`; one whose
+clone failed, was refused or deferred is `skip:not-cloned`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string? | `owner/repo` from the record's GitHub remote, else the checkout's `origin`; omitted when neither parses |
+| `visibility` | `public` \| `private` | `private` until resolved |
+| `name` | string | the roster record's name |
+| `action` | string | `register`, `set-weight`, `set-maintain-only`, `remove` or `skip:not-cloned` |
+| `from_weight`, `to_weight` | integer? | draw weights (`set-weight` has both; `register` and `skip:not-cloned` carry `to_weight`, the weight it is or would be registered at). `fleet_priority` is not used (ignored since #11742) |
+| `maintain_only` | boolean? | maintain-only after the change (`register`, `skip:not-cloned`, `set-maintain-only`) |
+| `host` | string | the host whose registry this is |
+| `at` | RFC3339 | when the pass made the change; the record time |
+| `loom` | object | the observing build's provenance (required; a record without valid provenance is not emitted) |
+
+Attributes: `loom.roster.action`, `.name`, `.from_weight`, `.to_weight`,
+`.maintain_only`, `.host`, and the build as `.version`, `.revision`,
+`.tree_state`, `.provenance_complete`.
 
 ### `issue.estimate` — completed curation's blind pre-build estimate
 
