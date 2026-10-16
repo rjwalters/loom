@@ -334,9 +334,9 @@ fn claim_lost_refusals_are_counted_as_passes_and_draws() {
 }
 
 /// #12410: a lost claim is cheap. Forty lost claims in a row spend neither the
-/// tick's passes nor (for the first sixteen) a slot's draws, so the tick
-/// still spawns; forty real refusals (`claimed`) spend the pass budget and
-/// spawn nothing.
+/// tick's passes nor (while the free allowance lasts) a slot's draws, so every
+/// slot still fills; real refusals (`claimed`) on every item spend the pass
+/// budget and spawn nothing.
 #[test]
 fn claim_lost_refusals_do_not_exhaust_the_tick_passes() {
     let rows: Vec<RestIssue> = (1..=60)
@@ -347,21 +347,43 @@ fn claim_lost_refusals_do_not_exhaust_the_tick_passes() {
         ..FakeSpawner::default()
     };
     let lost = run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut spawner);
-    // Slot 1: 16 free losses + 8 charged; slots 2 and 3: 8 charged each (the
-    // free ones are spent); slots 4..10 spawn.
+    // All 40 losses are free (under MAX_FREE_CLAIM_LOST_PER_TICK), so slot 1
+    // keeps redrawing and every slot still fills.
     assert_eq!(lost.passes.get("claim_lost"), Some(&40), "every loss is still counted");
-    assert_eq!(lost.report.dispatched, 7);
-    assert_eq!(lost.stop, TickStop::SlotDraws);
-    assert_eq!(lost.draws, 47);
+    assert_eq!(lost.report.dispatched, 10);
+    assert_eq!(lost.stop, TickStop::Filled);
+    assert_eq!(lost.draws, 50);
 
     let mut spawner = FakeSpawner {
-        refuse_first: Some((40, "claimed")),
+        refuse_first: Some((60, "claimed")),
         ..FakeSpawner::default()
     };
     let claimed = run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut spawner);
     assert_eq!(spawner.asked.len(), MAX_PASSES_PER_TICK as usize);
     assert_eq!(claimed.report.dispatched, 0);
     assert_eq!(claimed.stop, TickStop::PassLimit);
+}
+
+/// A tick that loses every race still ends: the free losses run out at
+/// MAX_FREE_CLAIM_LOST_PER_TICK, and after that each loss is a counted pass up
+/// to MAX_PASSES_PER_TICK. So the claim attempts are bounded by their sum.
+#[test]
+fn a_tick_that_loses_every_claim_is_still_bounded() {
+    let rows: Vec<RestIssue> = (1..=400)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_all: Some("claim_lost"),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(40), &mut spawner);
+    assert_eq!(tick.report.dispatched, 0);
+    assert!(
+        spawner.asked.len() <= (MAX_FREE_CLAIM_LOST_PER_TICK + MAX_PASSES_PER_TICK) as usize,
+        "asked {} claims",
+        spawner.asked.len()
+    );
+    assert_ne!(tick.stop, TickStop::PoolDrained, "the bound, not the pool, ends the tick");
 }
 
 /// #12410: a few lost claims cost the slot nothing: it redraws at once and
