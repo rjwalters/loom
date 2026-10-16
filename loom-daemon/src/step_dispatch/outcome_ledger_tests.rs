@@ -143,6 +143,34 @@ fn the_forge_post_state_decides_and_the_line_only_chooses() {
     assert_eq!(classify(Some(&verdict), None).class, OutcomeClass::Failed);
 }
 
+/// #12541: a Champion `not-eligible` wrote nothing, so a PR that already
+/// carries a label Champion moves PRs to (a stale draw on a PR in review)
+/// stays a state refusal, which arms the repeat-refusal cooldown, instead of
+/// a verdict that reset the pair and armed nothing.
+#[test]
+fn a_champion_not_eligible_is_never_upgraded_by_the_post_state() {
+    let line = champion_outcome(true, "not-eligible").unwrap();
+    assert_eq!(line, out(OutcomeClass::Refused, "not_eligible"));
+    let moved = PostState {
+        moved: true,
+        ..PostState::default()
+    };
+    assert_eq!(classify(Some(&line), Some(moved)), line);
+    assert_eq!(classify(Some(&line), Some(PostState::default())), line);
+    let closed = PostState {
+        closed: true,
+        ..PostState::default()
+    };
+    assert_eq!(
+        classify(Some(&line), Some(closed)).class,
+        OutcomeClass::Verdict,
+        "a closed item is still landed"
+    );
+    // A triage that did move its PR is still a verdict.
+    let triaged = champion_outcome(true, "triaged").unwrap();
+    assert_eq!(classify(Some(&triaged), Some(moved)).class, OutcomeClass::Verdict);
+}
+
 // -------------------------------------------------------- class → effect
 
 #[test]
