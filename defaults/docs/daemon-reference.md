@@ -14388,6 +14388,31 @@ throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
 the operator only ever created the issue.
 
+### Forge call purpose and the gateway discovery reserve (#12310)
+
+Every forge call the `gh` facade makes carries a **purpose**: `discovery` (a
+listing made to find work), `gate`, `write`, `hygiene` or `observability`.
+It is `loom.forge.purpose` on the `invoke github` span and `purpose` on
+`loom.forge.calls`; a write is `write`, a read is `gate` unless its site marks
+it `discovery` (`GhInvocation::discovery()` or a `purpose::discovery()` scope
+around a listing) or gave it a deferrable `ReadClass`. Epic #12304 counts
+`discovery` reads per tick.
+
+A `discovery` read sent as `gh api` also carries the request header
+`loom.forge.purpose: discovery` (porcelain commands such as `gh issue list`
+cannot carry one). No `gate` or `write` call sends it. GitHub and Gitea
+ignore unknown request headers, so a standalone install is unaffected.
+
+The read gateway may use the header to refuse discovery reads (`429`) once a
+pool's remaining quota is below a reserve held for gate reads and the mirror.
+That refusal is the fleet operator's side of the contract; the daemon's side
+is: the `429` message contains `loom-gateway-reserve`. The daemon then books
+the call as outcome `reserve_refused` (not `rate_limited`), stamps the span
+`loom.discovery.fallback_reason = reserve`, sends no more discovery reads on
+that thread until the next work-finder tick (or 30 s), never retries it on the
+writer, and does **not** feed the rate-limit breaker, so claims and writes
+carry on. Real rate-limit responses still trip the breaker.
+
 ## Reader withdrawal kill switch (`LOOM_READ_ROUTING`)
 
 When a reader App fails a read, the daemon withdraws it from routing for a
