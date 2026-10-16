@@ -39,7 +39,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
-use crate::forge_identity::{served, ReadClass};
+use crate::forge_identity::ReadClass;
 use crate::forge_listing::{parse_http_response, HttpResponse};
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
@@ -326,118 +326,9 @@ pub(crate) fn fetch_conditional_via(
         &crate::forge_identity::RouteRequest<'_>,
     ) -> crate::forge_identity::RouteDecision,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
-    // #12389: in a CLI subcommand with a read route adopted, a read never
-    // falls back to the writer: it takes the deferrable path, which sheds.
-    let barred = target.repo.is_some() && crate::forge_gateway::cli_reads_reader_only();
-    if (site.class != ReadClass::Gate || barred) && deferrable::shedding_enabled() {
-        return deferrable::fetch(site, gh_bin, cwd, target, url, etag, route);
-    }
-    // #9537: a listing is a read, so it goes to the repo's reader App when one
-    // is usable. On a credential failure the reader is withdrawn and the SAME
-    // request is retried once on the writer, so a broken reader costs one
-    // extra call, never a failed poll (the shared shape,
-    // `forge_identity::reader_then_writer`, #9872). The cache key deliberately
-    // stays on the writer's credential scope: reader choice is deterministic
-    // per URL (W4-B: the URL is the affinity key, so a split repo's URL
-    // always lands on the same reader), so keeping the key means no ETag is
-    // invalidated when readers come online. The caller's stored ETag is sent
-    // to whichever reader serves the read; GitHub answers 304 only when that
-    // reader's own validator matches, so a URL that moved readers (a spill,
-    // or a split rolled out) costs at most one 200, never a stale body.
-    let affinity = crate::gh_invocation::url_affinity_key(url);
-    let reader = target.repo.as_deref().and_then(|r| {
-        route(
-            &crate::forge_identity::RouteRequest::gate(
-                r,
-                target.host.as_deref(),
-                crate::forge_bucket_book::Resource::Core,
-            )
-            .affinity(Some(&affinity)),
-        )
-        .into_credential()
-    });
-    let reader_dir = reader.as_ref().map(|(dir, _)| dir.as_path());
-    let gateway_down = std::cell::Cell::new(false);
-    let family = served::endpoint_family(url);
-    let now = std::time::SystemTime::now;
-    let http_ok = |r: &FetchResult| {
-        r.0.success() || matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304))
-    };
-    crate::forge_identity::reader_then_writer(
-        reader_dir,
-        // The reader attempt drops env tokens (#9872): `gh` prefers an env
-        // `GH_TOKEN`/`GITHUB_TOKEN` over `GH_CONFIG_DIR`, so without this an
-        // ambient personal token would serve the "reader" read.
-        |dir, role| {
-            // The reader's public bucket label (#10232), only on the reader attempt.
-            let bucket = dir.and(reader.as_ref()).map(|(_, app_id)| {
-                crate::forge_identity::reader_bucket(
-                    app_id,
-                    target.repo.as_deref().unwrap_or_default(),
-                )
-            });
-            let fetched = run_fetch_with(
-                site,
-                gh_bin,
-                cwd,
-                target,
-                url,
-                etag,
-                dir,
-                dir.is_some(),
-                role,
-                bucket.as_deref(),
-            );
-            if let (Some((_, app_id)), Some(_), Ok(r)) = (reader.as_ref(), dir, fetched.as_ref()) {
-                if matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304)) {
-                    served::note_reader_served(app_id, repo_of(target), family, now());
-                }
-            }
-            fetched
-        },
-        http_ok,
-        |r: &FetchResult| {
-            // 2am#4367 P4: the relay down or unreachable is not a credential
-            // failure: withdraw it for the default window and use the writer.
-            let fault = gateway_fault(reader.as_ref().map(|(_, a)| a.as_str()), r);
-            if fault.reruns() {
-                gateway_down.set(true);
-                if fault == crate::forge_gateway::outage::Fault::Withdraw {
-                    crate::forge_gateway::outage::withdraw_for_outage(site.caller);
-                }
-                return Some(crate::forge_identity::Failure::Credential);
-            }
-            let failure = reader_failure(r)?;
-            let item_404 = site.item_scoped
-                && failure == crate::forge_identity::Failure::Coverage
-                && r.1.as_ref().map(|h| h.status) == Some(404);
-            let covered = reader.as_ref().is_some_and(|(_, app_id)| {
-                served::reader_recently_served(app_id, repo_of(target), family, now())
-            });
-            if item_404 && covered {
-                // The reader covers this repo's `family`: the 404 is the
-                // item's own answer. No writer retry, no withdrawal (W6).
-                crate::forge_call_stats::counters::bump(served::ITEM_SCOPED_404);
-                return None;
-            }
-            Some(failure)
-        },
-        |failure, _| {
-            if gateway_down.get() {
-                return;
-            }
-            if let Some((_, app_id)) = &reader {
-                let repo = target.repo.as_deref().unwrap_or_default();
-                let why = format!("{} {url}", site.caller);
-                crate::forge_identity::withdraw_after(app_id, repo, failure, &why);
-            }
-        },
-    )
-}
-
-/// `target`'s `owner/repo`, or `""` (a placeholder read has no reader).
-fn repo_of(target: &Target) -> &str {
-    target.repo.as_deref().unwrap_or_default()
+    // #12394: every conditional read — whatever its class — runs the
+    // reader-only chain; none falls through to the writer.
+    deferrable::fetch(site, gh_bin, cwd, target, url, etag, route)
 }
 
 /// What a failed conditional read says about its credential. The parsed

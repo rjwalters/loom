@@ -23,7 +23,7 @@ fn line(class: StepOutcomeClass) -> StepOutcomeLine {
 }
 
 fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttributes) {
-    let outcome = super::super::capture::tick_outcome(end, line);
+    let outcome = super::super::capture::tick_outcome(StepRole::Judge, end, line);
     sweep_close(end, line, &outcome, StepRole::Judge, Some("opus"), None)
 }
 

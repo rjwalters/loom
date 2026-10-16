@@ -266,7 +266,6 @@ impl GhTransport {
         .identity_scope(None, Some(&self.repo))
         .program(&self.gh_bin)
         .current_dir(&self.workspace_root)
-        .reader_only()
         .args(["api", "graphql", "-f", field.as_str()]);
         self.graphql_body(inv, timeout)
     }

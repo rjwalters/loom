@@ -468,6 +468,10 @@ fn daemon_write_paths_are_scoped() {
             "sweep_registry/roll_requeue.rs",
             Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
         ),
+        (
+            "sweep_registry/step_cap_notice.rs",
+            Via(DISPATCH, "repeat-cap notice on an item whose Builder step was dispatched (#12500)"),
+        ),
         ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
@@ -491,6 +495,13 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
         ("forge_rerun.rs", Gated),
+        (
+            "forge_create_issue.rs",
+            Via(
+                "cli/forge_action.rs",
+                "the `forge create-issue` verb is vetted via may_write_from before create()",
+            ),
+        ),
         (
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),

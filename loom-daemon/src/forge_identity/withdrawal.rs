@@ -113,7 +113,7 @@ impl Failure {
     /// Whether the pre-W4-A classifier called this an App-wide failure
     /// (`Failure::App`): any rate limit or credential failure. Legacy mode
     /// withdraws App-wide exactly when this holds; the writer fallback in
-    /// [`super::reader_then_writer`] still keys on it.
+    /// [`super::read_via_reader`] still keys on it.
     #[must_use]
     pub fn is_app_wide(&self) -> bool {
         matches!(self, Self::RateLimited { .. } | Self::Credential)

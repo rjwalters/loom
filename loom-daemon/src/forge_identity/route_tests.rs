@@ -192,6 +192,39 @@ fn an_empty_roster_a_foreign_host_or_no_owner_is_no_pool() {
 // ---- owners filter -------------------------------------------------------------
 
 #[test]
+fn a_pool_with_no_reader_for_the_owner_is_unavailable_not_no_pool() {
+    // The host HAS a reader pool, but every reader's `owners` excludes this
+    // owner: not "no pool" (which would put the read on the writer, #12394
+    // review), an Unavailable exhaustion the read chains shed.
+    let r = roster(vec![
+        reader("81041", Some(&["acme"])),
+        reader("81042", Some(&["acme"])),
+    ]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = RoutingConfig::default();
+    let now = SystemTime::now();
+    let d = route_read_in(ws.path(), &r, &req("third-party/x", None), &v2(&cfg), now);
+    assert!(
+        matches!(
+            d,
+            RouteDecision::Exhausted {
+                cause: ExhaustCause::Unavailable,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
+    assert!(owner_uncovered_in(&r, "third-party", RoutingMode::Scoped));
+    assert!(!owner_uncovered_in(&r, "ACME", RoutingMode::Scoped));
+    // No pool at all, or legacy routing (no owners filter): never uncovered.
+    assert!(!owner_uncovered_in(&roster(vec![]), "third-party", RoutingMode::Scoped));
+    assert!(!owner_uncovered_in(&r, "third-party", RoutingMode::Legacy));
+    // The covered owner still routes to a reader.
+    let d = route_read_in(ws.path(), &r, &req("acme/x", None), &v2(&cfg), now);
+    assert!(matches!(d, RouteDecision::Reader { .. }), "{d:?}");
+}
+
+#[test]
 fn a_reader_limited_to_one_owner_leaves_other_owners_untouched() {
     let base = roster(vec![reader("81051", None), reader("81052", None)]);
     let mut with_third = base.clone();
@@ -765,9 +798,6 @@ fn a_credential_withdrawal_beside_a_budget_one_is_a_withdrawn_exhaustion() {
     // 2026-10-15: this mix was `Unavailable`, which sent every Hygiene and
     // Observability read to the writer. Both exclusions end on their own.
     assert_eq!(cause_of(&d), ExhaustCause::Withdrawn);
-    assert!(ReadClass::Hygiene.sheds(cause_of(&d)));
-    assert!(ReadClass::Observability.sheds(cause_of(&d)));
-    assert!(!ReadClass::Gate.sheds(cause_of(&d)));
 }
 
 #[test]
@@ -788,14 +818,12 @@ fn an_app_wide_withdrawal_beside_a_budget_one_is_withdrawn_and_a_stale_dir_unava
     assert_eq!(cause_of(&d), ExhaustCause::Withdrawn);
 
     // A stale token directory may never clear: Unavailable, even beside a
-    // withdrawal. Hygiene goes to the writer; Observability still sheds.
+    // withdrawal.
     let r = roster(vec![reader("81393", None), reader("81394", None)]);
     let ws = workspace(&r, &["other"]);
     forge_read_pool::withdraw_until("81393", until);
     let d = route_read_in(ws.path(), &r, &hygiene("acme/stale"), &v2(&cfg), now);
     assert_eq!(cause_of(&d), ExhaustCause::Unavailable);
-    assert!(!ReadClass::Hygiene.sheds(cause_of(&d)));
-    assert!(ReadClass::Observability.sheds(cause_of(&d)));
 }
 
 #[test]
