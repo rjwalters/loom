@@ -22,7 +22,11 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12375**: chore: delete the telemetry-replay CLI, SigNoz replay queries and CI jobs
 - **#12381**: ci: make the macOS flake-shell leg of CI Daily advisory
 - **#12402**: ci: check macOS compile and run the release otlp_collector step on every backend PR
+- **#12412**: feat: never use the writer App for reads; shed a read no reader can serve
 - **#12428**: feat: show a read-only host update state in status and tick records
+- **#12442**: feat: restart the daemon onto the same binary for restart-required config
+- **#12464**: feat(daemon): prune unregistered idle codex profile dirs; document uv cache bound
+- **#12466**: feat: reap idle worktrees of open issues and PRs
 
 ## Very Important
 
@@ -44,6 +48,8 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#11301**: check-stale-blocked: the per-repo budget probe spends ~1.4k GraphQL points/h on the writer bucket that runs dry
 - **#11787**: issue.estimate coverage gap: operator-session curation sets loom:curated by hand and bypasses curation-complete (loom-ui: 58 of 62 curations since the gate have no estimate)
 - **#12217**: github-events mirror reads stale for quiet repos (1555 stale vs 1049 hits/h), so the step gather falls back to REST
+- **#12447**: Epic: captain-assigned dispatch — workers ask the fleet captain for their next assignment from one fleet queue
+- **#12450**: Fleet dispatch Phase 1b: worker client — claim via the captain before the forge pre-claim, fail-open with hysteresis
 
 ## Ready
 
@@ -54,50 +60,45 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#10890**: Daemon dispatches loom:issue + loom:needs-capability items; pre-flight skip then reads as insta-crash and quarantine release re-queues them
 - **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default)
 - **#11112**: Remove the safehouse (Matrix) integration from Loom: narration, ChatOps/Concierge, peer-claim channel (forge leases remain)
+- **#11301**: check-stale-blocked: the per-repo budget probe spends ~1.4k GraphQL points/h on the writer bucket that runs dry
 - **#11787**: issue.estimate coverage gap: operator-session curation sets loom:curated by hand and bypasses curation-complete (loom-ui: 58 of 62 curations since the gate have no estimate)
-- **#12051**: pass_shard: run the stale-blocked release pass and fleet.state listings on one host per repo
 - **#12085**: Telemetry(doctor): structured parked-PR cause (park reason, doctor_cycles, queue gate, treating age) (ETA doctor, loom-ui#4063 #6)
 - **#12093**: Simplify: retire the dispatch-inert tier:* axis (Level::of ignores it; no consumer) — it only adds confusion beside the real priority labels
 - **#12117**: Telemetry: inventory every kind; fix or delete role_tick.outcome, ci.job.log, session.output
 - **#12167**: telemetry: export peer_coordination verdict and degraded duration on host.health
-- **#12346**: Flow-change evidence review (#11708 slice D): role triggers, Builder preflight, Doctor runtime
-- **#12416**: main CI red: every_role_queue_query_excludes_frozen flags champion-common.md:283 (#10935)
+- **#12475**: Judge re-review ignores prior changes-requested verdicts posted as comments (review-reconciliation reads formal reviews only)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#9508**: forge polling: ADR-0021 amendment step 3 — cross-host dedup (one host polls a repo, the others reuse the answer)
 - **#9736**: health: detect stalled release updates without a source checkout
-- **#10942**: Sweeps use bare loom:operator as a re-dispatch brake for cross-repo/time-gated work; file the child or write a dated park instead
-- **#11301**: check-stale-blocked: the per-repo budget probe spends ~1.4k GraphQL points/h on the writer bucket that runs dry
 - **#11332**: A real fleet commit is authored as the test-fixture identity Loom CI <ci@loom.test>
+- **#11983**: Provenance out of Loom, stage 3: remove provenance-only docs, fixtures and CI checks
+- **#12051**: pass_shard: run the stale-blocked release pass and fleet.state listings on one host per repo
 - **#12082**: Worktree-isolation guard blocks Bash writes to paths outside the repo when the cwd is the main checkout
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
-- **#12113**: host_status (slice b): re-point role-span host attributes at host_status
-- **#12115**: host_status (slice d): add GPU signals to host_status
 - **#12121**: Telemetry: daemon derives operator.presence and in-session sweep.* from observed sessions
 - **#12198**: ci-daily: macOS shell flake leg never completes green — decide fix, advisory or remove
 - **#12236**: guard: shared command-analysis lexer + corpus harness, first move: merge-redirect check (slice 1 of #11113)
-- **#12357**: Verify live OTLP delivery of host.status gauges (follow-up to #12309)
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes)
 - **#12394**: The writer App is never used for reads: a read with no reader available is shed, not sent to the writer
 - **#12396**: CI misses release-only build failures: check the macOS target and the release's test step on every PR
-- **#12406**: Remove the automatic and secondary admission caps: the cap is the operator's maxConcurrent alone
-- **#12418**: Verify epic #10698 acceptance: completed-vs-not-planned dispositions and live fleet receipts
+- **#12416**: main CI red: every_role_queue_query_excludes_frozen flags champion-common.md:283 (#10935)
 - **#12420**: status/gauges: expose host state H0-H7, target and its source, and per-workspace W state
-- **#12423**: reload: classify annotation keys and audited config blocks (#12419 child 1)
-- **#12424**: fleet-sync: detect restart-required changes since boot as a demand (#12419 child 2)
+- **#12425**: auto-update: arm pause-and-roll from the config-restart demand (#12419 child 3)
+- **#12447**: Epic: captain-assigned dispatch — workers ask the fleet captain for their next assignment from one fleet queue
+- **#12450**: Fleet dispatch Phase 1b: worker client — claim via the captain before the forge pre-claim, fail-open with hysteresis
+- **#12454**: [ci-daily] Supply Chain
+- **#12456**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
+- **#12458**: Reap idle clean worktrees of open issues/PRs (configurable idle period)
+- **#12460**: Bound shared tool caches (uv) and prune non-live codex profiles
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#12412**: feat: never use the writer App for reads; shed a read no reader can serve
-- **#12427**: work finder: the cap is maxConcurrent alone; remove automatic and secondary admission caps
-- **#12430**: docs: route cross-repo and time-gated leftovers to park records, not loom:operator
-- **#12431**: feat: detect restart-required config changes since boot in fleet-sync
-- **#12432**: feat: report NVIDIA GPU utilisation and memory in host status
+- **#12467**: feat(fleet-dispatch): worker client claims through the captain first (#12450)
 
 ## Approved (Awaiting Merge)
 
@@ -116,7 +117,11 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12375**: chore: delete the telemetry-replay CLI, SigNoz replay queries and CI jobs
 - **#12381**: ci: make the macOS flake-shell leg of CI Daily advisory
 - **#12402**: ci: check macOS compile and run the release otlp_collector step on every backend PR
+- **#12412**: feat: never use the writer App for reads; shed a read no reader can serve
 - **#12428**: feat: show a read-only host update state in status and tick records
+- **#12442**: feat: restart the daemon onto the same binary for restart-required config
+- **#12464**: feat(daemon): prune unregistered idle codex profile dirs; document uv cache bound
+- **#12466**: feat: reap idle worktrees of open issues and PRs
 
 ## Proposed
 
@@ -155,7 +160,6 @@ Issues carrying `loom:curated`.
 - **#10827**: Promotion author gate: don't auto-promote issues authored by untrusted identities (signed decision markers dropped) *(curated)*
 - **#10838**: merge_pr_reconcile_differential: claim-gate differential disagrees on case-variant duplicate label (loom:buildinG) *(curated)*
 - **#10916**: Fleet singleton output watchdog: alert when any one-host fleet job stops producing output (not just when its host goes silent) *(curated)*
-- **#10942**: Sweeps use bare loom:operator as a re-dispatch brake for cross-repo/time-gated work; file the child or write a dated park instead *(curated)*
 - **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default) *(curated)*
 - **#11112**: Remove the safehouse (Matrix) integration from Loom: narration, ChatOps/Concierge, peer-claim channel (forge leases remain) *(curated)*
 - **#11118**: Umbrella: claim and lease state is inferred from label age and presence — live work gets orphaned, stripped or doubled (13 bugs) *(curated)*
@@ -171,7 +175,7 @@ Issues carrying `loom:curated`.
 - **#11712**: Daemon: export OTLP only and remove inbound control channels other than config (2am#4300) *(curated)*
 - **#11761**: Keep-it-simple beyond Curator: Judge and Champion gate on unjustified complexity; Curator checks 'already covered' first (follow-up to #11662) *(curated)*
 - **#11787**: issue.estimate coverage gap: operator-session curation sets loom:curated by hand and bypasses curation-complete (loom-ui: 58 of 62 curations since the gate have no estimate) *(curated)*
-- **#11984**: Provenance out of Loom, stage 2: stop stamping trailers/markers, drop trace-ID derivation *(curated)*
+- **#11983**: Provenance out of Loom, stage 3: remove provenance-only docs, fixtures and CI checks *(curated)*
 - **#12014**: ci: approved PRs touching workflow files need several CI rounds to land as main moves (no merge queue on a user-owned repo) *(curated)*
 - **#12019**: [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1) *(curated)*
 - **#12029**: Telemetry: merge runs record PR number and observed result (merge-pr chokepoint) — Judge parts moved to #12362; held behind #12063 *(curated)*
@@ -179,8 +183,6 @@ Issues carrying `loom:curated`.
 - **#12082**: Worktree-isolation guard blocks Bash writes to paths outside the repo when the cwd is the main checkout *(curated)*
 - **#12086**: Telemetry(coverage): every lease-writing host exports pick.decision + fleet.state (ETA ready_wait over-prediction, loom-ui#4063 #7) *(curated)*
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301 *(curated)*
-- **#12113**: host_status (slice b): re-point role-span host attributes at host_status *(curated)*
-- **#12115**: host_status (slice d): add GPU signals to host_status *(curated)*
 - **#12121**: Telemetry: daemon derives operator.presence and in-session sweep.* from observed sessions *(curated)*
 - **#12127**: ci: rebalance Native Port Suites legs so none runs over ~3 min (next PR critical path after #12089) *(curated)*
 - **#12198**: ci-daily: macOS shell flake leg never completes green — decide fix, advisory or remove *(curated)*
@@ -199,7 +201,6 @@ Issues carrying `loom:curated`.
 - **#12320**: Cleanup once every worker reads the worklist: delete the per-call `forge_mirror` discovery path, `maxStalenessSecs` and `per_call`; docs and ADR-0024; direct backend preserved *(curated)*
 - **#12322**: Roster pass: emit a telemetry record per register / set-priority / skip:not-cloned change *(curated)*
 - **#12344**: Flow-change evidence review (#11708 slice B): verdict/merge gates and merge sequencing *(curated)*
-- **#12346**: Flow-change evidence review (#11708 slice D): role triggers, Builder preflight, Doctor runtime *(curated)*
 - **#12357**: Verify live OTLP delivery of host.status gauges (follow-up to #12309) *(curated)*
 - **#12362**: Telemetry: Judge runs record found-work, PR, head_sha and the real verdict; drop the synthetic loom.judge_verdict (split from #12029, no merge-pr changes) *(curated)*
 - **#12396**: CI misses release-only build failures: check the macOS target and the release's test step on every PR *(curated)*
@@ -207,8 +208,13 @@ Issues carrying `loom:curated`.
 - **#12416**: main CI red: every_role_queue_query_excludes_frozen flags champion-common.md:283 (#10935) *(curated)*
 - **#12418**: Verify epic #10698 acceptance: completed-vs-not-planned dispositions and live fleet receipts *(curated)*
 - **#12420**: status/gauges: expose host state H0-H7, target and its source, and per-workspace W state *(curated)*
-- **#12423**: reload: classify annotation keys and audited config blocks (#12419 child 1) *(curated)*
-- **#12424**: fleet-sync: detect restart-required changes since boot as a demand (#12419 child 2) *(curated)*
+- **#12425**: auto-update: arm pause-and-roll from the config-restart demand (#12419 child 3) *(curated)*
+- **#12447**: Epic: captain-assigned dispatch — workers ask the fleet captain for their next assignment from one fleet queue *(curated)*
+- **#12454**: [ci-daily] Supply Chain *(curated)*
+- **#12456**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered) *(curated)*
+- **#12458**: Reap idle clean worktrees of open issues/PRs (configurable idle period) *(curated)*
+- **#12460**: Bound shared tool caches (uv) and prune non-live codex profiles *(curated)*
+- **#12475**: Judge re-review ignores prior changes-requested verdicts posted as comments (review-reconciliation reads formal reviews only) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -232,14 +238,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 14 |
+| Operator merge-risk holds | 18 |
 | Very important | 1 |
-| Important | 10 |
-| Ready (`loom:issue`) | 13 |
+| Important | 12 |
+| Ready (`loom:issue`) | 12 |
 | In Progress (`loom:building`) | 21 |
-| PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 14 |
-| Curated | 87 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 18 |
+| Curated | 88 |
 | Architect / Hermit proposals | 1 |
 | Active epics | 11 |
 <!-- guide:plan-body:end -->
