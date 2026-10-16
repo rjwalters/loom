@@ -1126,3 +1126,6 @@ fn a_maintain_only_workspace_is_still_fast_forwarded() {
 
     set_maintain_only_for_test(&fx.host, None);
 }
+
+#[path = "checkout_ff_freshness.rs"]
+mod freshness_tests;
