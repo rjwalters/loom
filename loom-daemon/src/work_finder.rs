@@ -2115,7 +2115,17 @@ pub fn spawn_multi_work_finder_task(
             // `observed_idle=` figure in the axis line and `loom-daemon status`
             // / `calibrate`, which is how an operator tunes this machine's
             // `maxConcurrent`; it no longer gates admission.
-            let idle = crate::host_status::filtered_cpu_idle_fraction();
+            // With no published record (observability off, so no sampler tick)
+            // fall back to the memoized raw sample, as before #12114.
+            let idle = match crate::host_status::filtered_cpu_idle_fraction() {
+                Some(idle) => Some(idle),
+                None => {
+                    let _ =
+                        tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache)
+                            .await;
+                    crate::cpu_headroom::cached_cpu_idle_fraction()
+                }
+            };
             // The cap, for the published summary and the tick span
             // (`ops::dispatch_facts`).
             tick_summary::record_cap(crate::types::CapView {

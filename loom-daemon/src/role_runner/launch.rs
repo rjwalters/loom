@@ -528,7 +528,7 @@ pub(super) fn run_role_with_timeout(
                     // a fake saturated/unsaturated host can be asserted
                     // deterministically.
                     let load_per_core =
-                        load_per_core_override.or_else(crate::host_status::filtered_load_per_core);
+                        load_per_core_override.or_else(crate::host_status::load_per_core_or_raw);
                     let outcome =
                         terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
                     // #11931: the agent never reached `lease pr release`; do

@@ -227,6 +227,22 @@ pub fn filtered_loadavg_1m(ncpu: usize) -> Option<f64> {
     filtered_load_per_core().map(|lpc| lpc * ncpu as f64)
 }
 
+/// [`filtered_load_per_core`], falling back to the raw per-core read while no
+/// record is published. The sampler tick runs inside the observability
+/// collector, which is not spawned on hosts with observability disabled or no
+/// exporter, so admission readers must behave as they did before #12114 there
+/// rather than go dark.
+#[must_use]
+pub fn load_per_core_or_raw() -> Option<f64> {
+    filtered_load_per_core().or_else(crate::cpu_headroom::load_per_core)
+}
+
+/// [`filtered_loadavg_1m`] with the raw-read fallback of [`load_per_core_or_raw`].
+#[must_use]
+pub fn loadavg_1m_or_raw(ncpu: usize) -> Option<f64> {
+    filtered_loadavg_1m(ncpu).or_else(crate::cpu_headroom::read_loadavg_1m)
+}
+
 /// Filtered CPU idle fraction (`1 - cpu_utilisation`), clamped to `0..=1`.
 #[must_use]
 pub fn filtered_cpu_idle_fraction() -> Option<f64> {

@@ -388,3 +388,18 @@ fn query_nvidia_smi_nonzero_exit_and_missing_binary() {
         query_nvidia_smi("/nonexistent/nvidia-smi", std::time::Duration::from_secs(1)).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
+
+#[test]
+fn raw_fallback_readers_serve_an_unpublished_host_and_defer_to_the_record() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    // No record (observability off, no sampler tick): the raw read answers.
+    clear_latest();
+    assert_eq!(load_per_core_or_raw().is_some(), crate::cpu_headroom::load_per_core().is_some());
+    assert_eq!(loadavg_1m_or_raw(8).is_some(), crate::cpu_headroom::read_loadavg_1m().is_some());
+    // A published record wins over the raw read.
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    publish(&s.step(&readings(), 0.0));
+    assert_eq!(load_per_core_or_raw(), filtered_load_per_core());
+    assert_eq!(loadavg_1m_or_raw(8), filtered_loadavg_1m(8));
+    clear_latest();
+}

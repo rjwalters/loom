@@ -2008,7 +2008,8 @@ fn glob_match_chars(pattern: &str, text: &str) -> bool {
 /// runs it inside `spawn_blocking`, and it is directly unit-testable without
 /// a tokio runtime.
 ///
-/// Always uses the filtered [`crate::host_status`] load reading (#12114);
+/// Always uses the filtered [`crate::host_status`] load reading (#12114), or
+/// the raw read when no record is published;
 /// see [`run_gate_tick_with_load_fn`] for the injectable variant tests use to
 /// pin a deterministic (unsaturated, or saturated) host load (#4441).
 #[must_use]
@@ -2018,7 +2019,7 @@ pub fn run_gate_tick(
     repo_root: &Path,
 ) -> Option<GateOutcome> {
     run_gate_tick_with_load_fn(state, config, repo_root, || {
-        crate::host_status::filtered_loadavg_1m(crate::cpu_headroom::logical_cpu_count())
+        crate::host_status::loadavg_1m_or_raw(crate::cpu_headroom::logical_cpu_count())
     })
 }
 
@@ -2052,7 +2053,7 @@ fn credential_hold_reason(is_stale: bool) -> Option<String> {
 
 /// [`run_gate_tick`]'s implementation, parameterized over the 1-minute load
 /// average lookup. Production code always goes through [`run_gate_tick`]
-/// (which passes the filtered [`crate::host_status::filtered_loadavg_1m`] reading);
+/// (which passes the filtered [`crate::host_status::loadavg_1m_or_raw`] reading);
 /// tests use this directly with a fixed closure so the tier/defer decision is
 /// deterministic — the real host's live load average, shared across every
 /// unit test running in this one process, is not a value any single test can
