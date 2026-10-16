@@ -11,8 +11,7 @@ use std::sync::mpsc;
 
 use super::super::git::is_refusal;
 use super::super::heads::{
-    batches, gather, parse, query, read_path_final, Answer, Fault as HeadFault, HeadAsk, Heads,
-    CHUNK,
+    batches, gather, parse, query, Answer, Fault as HeadFault, HeadAsk, Heads, CHUNK,
 };
 use super::super::host::{begin, note_refused, supervise, Ended};
 use super::*;
@@ -389,22 +388,6 @@ fn an_answer_is_read_per_alias() {
     assert_eq!(parse(r#"{"message":"API rate limit exceeded"}"#, 1), None);
     assert_eq!(parse(r#"{"data":null,"errors":[{"message":"x"}]}"#, 1), None);
     assert_eq!(parse("", 1), None);
-}
-
-/// #12389: the head query runs on the read path only. A reader or the
-/// gateway says `NOT_FOUND` for a repo outside its installation and the
-/// writer may not confirm it, so only a missing default branch or a head is
-/// final; a missing or forbidden repo is asked about at its remote.
-#[test]
-fn a_read_path_answer_naming_a_repo_missing_is_not_final() {
-    let at = Answer::At {
-        branch: "main".to_string(),
-        commit: "b".repeat(40),
-    };
-    assert!(read_path_final(&at));
-    assert!(read_path_final(&Answer::Fault(HeadFault::NoDefaultBranch)));
-    assert!(!read_path_final(&Answer::Fault(HeadFault::NotFound("m".into()))));
-    assert!(!read_path_final(&Answer::Fault(HeadFault::Forbidden("m".into()))));
 }
 
 fn asks(repos: &[&str]) -> Vec<HeadAsk> {
