@@ -98,7 +98,9 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
         PassReason::CapabilityMissing,
         PassReason::Epic,
         PassReason::Proposal,
-        PassReason::NoStage,
+        // `NoStage` is only the defensive answer for an item with neither an
+        // issue nor a PR (#12499: an unlabelled PR is a Judge step now).
+        PassReason::Draft,
     ];
     for p in passes {
         assert!(verdicts.contains(&Verdict::Pass(p)), "no fixture case for {p:?}");

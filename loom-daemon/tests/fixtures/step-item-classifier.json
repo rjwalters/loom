@@ -1042,7 +1042,7 @@
       ]
     },
     {
-      "name": "a PR with no stage label: pass",
+      "name": "a PR with no stage label: judge",
       "inputs": {
         "issues": [],
         "pulls": [
@@ -1058,9 +1058,34 @@
         {
           "issue": null,
           "pr": 511,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a draft PR with no stage label: pass draft",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 590,
+            "labels": [],
+            "same_repo": true,
+            "draft": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 590,
           "state": "no_stage",
           "verdict": {
-            "pass": "no_stage"
+            "pass": "draft"
           }
         }
       ]

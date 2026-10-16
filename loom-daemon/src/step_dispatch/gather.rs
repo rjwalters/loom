@@ -206,6 +206,7 @@ pub fn pull_from_row(row: &RestIssue, markers: PullMarkers) -> PullInput {
         same_repo: false,
         author_untrusted: false,
         queued: false,
+        draft: row.draft,
         markers,
     }
 }

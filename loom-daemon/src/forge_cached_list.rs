@@ -494,6 +494,7 @@ mod tests {
             is_pull_request: is_pr,
             open_sub_issues: None,
             labels_at: None,
+            draft: false,
         }
     }
 

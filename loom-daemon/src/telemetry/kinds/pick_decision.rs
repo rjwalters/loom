@@ -209,7 +209,7 @@ impl PickSkipReason {
                 P::Sequenced => Self::OverlapChain,
                 P::Blocked => Self::Blocked,
                 P::CapabilityMissing => Self::HostConstraint,
-                P::Epic | P::Proposal | P::NoStage => Self::NoStep,
+                P::Epic | P::Proposal | P::NoStage | P::Draft => Self::NoStep,
                 P::CiPending => Self::Backoff,
             },
         }

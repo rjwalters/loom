@@ -91,6 +91,9 @@ pub struct RestIssue {
     /// ([`crate::step_dispatch::stage_entry`]). `None` on every REST row (the
     /// listing carries no label times) and on a mirror row that sent none.
     pub labels_at: Option<BTreeMap<String, String>>,
+    /// The REST `draft` flag of a PR row (#12499): an unfinished PR is never
+    /// drawn for review. `false` on an issue row and when the forge omitted it.
+    pub draft: bool,
 }
 
 /// Keep only the real issues in a REST issues listing (Issue #9929).
@@ -835,6 +838,8 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
         comments: u32,
         #[serde(default)]
         sub_issues_summary: Option<serde_json::Value>,
+        #[serde(default)]
+        draft: bool,
     }
     let rows: Vec<RawIssue> = serde_json::from_str(body.trim())?;
     Ok(rows
@@ -854,6 +859,7 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
             is_pull_request: r.pull_request.is_some(),
             open_sub_issues: r.sub_issues_summary.as_ref().and_then(open_sub_issues),
             labels_at: None,
+            draft: r.draft,
         })
         .collect())
 }

@@ -54,7 +54,7 @@
 //! | PR `loom:changes-requested` | Doctor |
 //! | PR `loom:review-requested` | Judge |
 //! | PR `loom:pr` | Champion merge |
-//! | PR with none of those | pass `no_stage` |
+//! | PR with none of those | Judge (`review_requested`); a draft passes `draft` |
 //! | issue `loom:epic` | pass `epic` |
 //! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
@@ -268,6 +268,9 @@ pub struct PullInput {
     /// The PR is in GitHub's merge queue: it is never drawn again for merge.
     #[serde(default)]
     pub queued: bool,
+    /// The PR is a draft (#12499): an unlabelled one is not drawn for review.
+    #[serde(default)]
+    pub draft: bool,
     /// Markers read from the PR's trusted comments.
     #[serde(default)]
     pub markers: PullMarkers,
@@ -451,6 +454,8 @@ pub enum PassReason {
     Epic,
     Proposal,
     NoStage,
+    /// An open draft PR with no stage label (#12499): unfinished, never Judged.
+    Draft,
     /// A Judge step whose PR head has CI still running (#12042). The
     /// classifier never answers it: the step tick's gather applies it from a
     /// forge read (`step_dispatch::gather::hold_ci_pending`), the step path's
@@ -475,6 +480,7 @@ impl PassReason {
             Self::Epic => "epic",
             Self::Proposal => "proposal",
             Self::NoStage => "no_stage",
+            Self::Draft => "draft",
             Self::CiPending => "ci_pending",
         }
     }
@@ -692,8 +698,11 @@ fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
         step(ItemState::ReviewRequested, Step::Judge)
     } else if has(labels, APPROVED) {
         step(ItemState::Approved, Step::ChampionMerge)
+    } else if pr.draft {
+        (ItemState::NoStage, Verdict::Pass(PassReason::Draft))
     } else {
-        (ItemState::NoStage, Verdict::Pass(PassReason::NoStage))
+        // No stage label and no hold: treated as review-requested (#12499).
+        step(ItemState::ReviewRequested, Step::Judge)
     }
 }
 
@@ -958,6 +967,7 @@ impl PullInput {
             same_repo,
             author_untrusted,
             queued,
+            draft: row.draft,
             markers,
         }
     }

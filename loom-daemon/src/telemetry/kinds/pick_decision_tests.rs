@@ -405,7 +405,7 @@ fn every_exclusion_maps_to_a_skip_reason() {
     assert_eq!(map(Exclusion::Pass(P::Claimed)), PickSkipReason::InFlight);
     assert_eq!(map(Exclusion::Pass(P::Operator)), PickSkipReason::OperatorHold);
     assert_eq!(map(Exclusion::Pass(P::CapabilityMissing)), PickSkipReason::HostConstraint);
-    for r in [P::Epic, P::Proposal, P::NoStage] {
+    for r in [P::Epic, P::Proposal, P::NoStage, P::Draft] {
         assert_eq!(map(Exclusion::Pass(r)), PickSkipReason::NoStep);
     }
     // Pass-reason wire names match their serde form.
@@ -413,6 +413,7 @@ fn every_exclusion_maps_to_a_skip_reason() {
         P::HardExclusion,
         P::SharedPr,
         P::NoStage,
+        P::Draft,
         P::CapabilityMissing,
     ] {
         assert_eq!(serde_json::to_value(r).unwrap(), serde_json::json!(r.as_str()));
