@@ -774,7 +774,7 @@ $EVALUATIONS_TEXT
 `apply` rewrites the body, so the hash is re-derived and stamped on the comment:
 an un-park then reads as `OPERATOR_RULED` (#7921). On exit 1, fix the JSON and re-run.
 
-**Anti-regression caveat (#6715): `apply` above passes no `--remove-label` and must not remove `loom:epic`**
+**Anti-regression caveat (#6715): `apply` above removes no label and must not remove `loom:epic`**
 (epics are discovered by it and nothing re-applies it).
 
 When you arrive here via `ESCALATE_UNREVISED=yes` you have **not** re-run the 6
