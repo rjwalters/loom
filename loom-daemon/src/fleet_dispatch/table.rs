@@ -356,6 +356,12 @@ impl Table {
         let key = (live.repo.clone(), live.item);
         if let Some(row) = self.rows.get_mut(&key) {
             match row.host.as_deref() {
+                // A heartbeat naming another assignment, or an id-less step
+                // that differs from a fresh grant's, was read before this
+                // row was replaced (a step change through `claim`): it still
+                // names the old step and must not flip the row back. The
+                // next heartbeat carries the new id.
+                Some(h) if h == host && is_stale_for(row, live) => {}
                 Some(h) if h == host => {
                     row.state = RowState::Live;
                     row.deadline = deadline;
@@ -568,3 +574,13 @@ fn refused(reason: RefusalReason, held_by: Option<String>, retry_after_s: u64) -
 #[cfg(test)]
 #[path = "table_tests.rs"]
 mod tests;
+
+/// Whether `live` predates `row`'s grant: it carries a different assignment
+/// id, or none while the row is a fresh grant for another step.
+fn is_stale_for(row: &Row, live: &LiveStep) -> bool {
+    row.granted
+        && match live.assignment_id.as_deref() {
+            Some(id) => id != row.assignment_id,
+            None => row.state == RowState::Granted && live.step != row.step,
+        }
+}
