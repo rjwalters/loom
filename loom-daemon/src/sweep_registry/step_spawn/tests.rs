@@ -7,7 +7,7 @@ use super::capture::{
     emit_step_capture, parse_outcome_line, read_outcome_line, tick_outcome, StepCapture, StepEnd,
     StepOutcomeClass,
 };
-use super::lease::{claim_args, claim_verdict};
+use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
 use super::*;
 use crate::observability::ops::capture::capture;
@@ -199,11 +199,16 @@ fn the_pre_claim_is_the_role_keyed_lease_with_the_step() {
 
 #[test]
 fn a_lost_or_unreadable_pre_claim_refuses_the_step() {
-    assert_eq!(claim_verdict(Some(0)), Ok(()));
-    assert_eq!(claim_verdict(Some(4)).unwrap_err().reason, "claim_lost");
-    assert_eq!(claim_verdict(Some(6)).unwrap_err().reason, "backstop_hold");
-    assert_eq!(claim_verdict(Some(5)).unwrap_err().reason, "claim_unverified");
-    assert_eq!(claim_verdict(None).unwrap_err().reason, "claim_unverified");
+    assert_eq!(claim_verdict(&ClaimRun::Exited(0)), Ok(()));
+    let reason = |run: ClaimRun| claim_verdict(&run).unwrap_err().reason;
+    assert_eq!(reason(ClaimRun::Exited(4)), "claim_lost");
+    assert_eq!(reason(ClaimRun::Exited(6)), "backstop_hold");
+    // #12105: a Doctor that found another actor active on the PR.
+    assert_eq!(reason(ClaimRun::Exited(7)), "peer_active");
+    assert_eq!(reason(ClaimRun::Exited(5)), "claim_unverified");
+    assert_eq!(reason(ClaimRun::TimedOut), "claim_unverified");
+    assert_eq!(reason(ClaimRun::SpawnFailed), "claim_unverified");
+    assert_eq!(reason(ClaimRun::Signaled), "claim_unverified");
 }
 
 // ---- B3: the timeout ------------------------------------------------------
@@ -461,4 +466,181 @@ fn only_a_builder_step_names_its_item_as_the_owned_claim() {
         .unwrap_or_default();
     assert!(block.contains("LOOM_SWEEP_CLAIM_OWNED=unset"), "{block}");
     cancel_all(&mut reg);
+}
+
+// ---- workspace role command (#12048) ----------------------------------------
+
+/// A non-hermetic registry refuses a step whose `/loom:<role>` command is not
+/// installed, before any lock; once the file exists that refusal stops.
+#[test]
+#[serial]
+fn a_step_without_its_role_command_is_refused_before_any_lock() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _record) = fixture_registry(dir.path());
+    reg.config.skip_label_flip = false;
+    let request = StepSpawnRequest::new(9_200, StepRole::Judge);
+
+    let (result, signals) = capture(|| reg.spawn_step(&request));
+    let refusal = result.unwrap_err();
+    let refusal = refusal.downcast_ref::<StepRefusal>().unwrap();
+    assert_eq!(refusal.reason, "workspace_commands_missing");
+    assert!(!reg.config.locks_dir().join("pr-9200").exists(), "no lock may be left behind");
+    assert!(reg.entries.is_empty());
+    assert_eq!(
+        step_span_reason(&signals.spans),
+        vec![("refused".into(), "workspace_commands_missing".into())]
+    );
+
+    // A second refusal records the span again but does not WARN again.
+    assert!(reg.missing_command_warned.contains("judge"));
+    let _ = reg.spawn_step(&request).unwrap_err();
+    assert_eq!(reg.missing_command_warned.len(), 1);
+
+    let commands = dir.path().join(".claude").join("commands").join("loom");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(commands.join("judge.md"), "# judge").unwrap();
+    // The non-hermetic fixture has no credential pool, so the step may still be
+    // refused further on; the guard owns only that it is no longer refused for
+    // the missing command and that its WARN re-arms.
+    if let Err(err) = reg.spawn_step(&request) {
+        let refusal = err.downcast_ref::<StepRefusal>().unwrap();
+        assert_ne!(refusal.reason, "workspace_commands_missing");
+    }
+    assert!(reg.missing_command_warned.is_empty(), "the WARN re-arms once the file is seen");
+    cancel_all(&mut reg);
+}
+
+/// Champion's promote and merge steps share `champion.md`.
+#[test]
+fn champion_steps_resolve_the_same_command_file() {
+    let dir = tempdir().unwrap();
+    let config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    assert_eq!(
+        config.role_command_path(StepRole::ChampionPromote),
+        config.role_command_path(StepRole::ChampionMerge)
+    );
+    assert!(config.role_command_missing(StepRole::ChampionMerge));
+}
+
+// ---- #12133: the Builder claim is claim-then-verify and fails closed ------
+
+const BUILDER_ITEM: u32 = 12133;
+const PEER_LEASE: &str = "<!-- loom:lease host=peer-host sweep=sweep-peer -->";
+
+fn builder_claim(reg: &mut SweepRegistry, sweep: &str) -> std::result::Result<(), StepRefusal> {
+    // A Builder's claim is a label flip and a lease comment: it has no
+    // `lease pr claim` facts to carry (#12183).
+    reg.pre_claim_step(BUILDER_ITEM, StepRole::Builder, sweep)
+        .map(|claim| assert!(claim.is_none(), "a Builder claim carries no facts"))
+}
+
+/// Make the fake `gh`'s `arm` (e.g. the comment read) exit 1 straight away.
+fn break_gh_arm(ws: &Path, arm: &str) {
+    let fake = ws.join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    assert!(script.contains(arm), "harness arm changed shape");
+    std::fs::write(&fake, script.replacen(arm, &format!("{arm}exit 1\n"), 1)).unwrap();
+}
+
+const COMMENT_READ_ARM: &str = "if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n";
+const COMMENT_WRITE_ARM: &str = "if [[ \"$1\" == \"issue\" && \"$2\" == \"comment\" ]]; then\n";
+
+/// The one claimant, with no peer lease anywhere, spawns.
+#[test]
+#[serial]
+fn a_sole_builder_claim_is_verified_and_proceeds() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    assert_eq!(builder_claim(&mut reg, "step-builder-1-1"), Ok(()));
+}
+
+/// A peer's earlier live lease wins: the label flip alone no longer claims.
+#[test]
+#[serial]
+fn a_builder_claim_behind_a_peer_lease_is_lost() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) = crate::sweep_registry::test_support::lease_order_dispatch_registry(
+        dir.path(),
+        &[PEER_LEASE],
+    );
+    assert_eq!(
+        builder_claim(&mut reg, "step-builder-1-1")
+            .unwrap_err()
+            .reason,
+        "claim_lost"
+    );
+}
+
+/// Two hosts racing one item on one forge comment list: exactly one claim.
+#[test]
+#[serial]
+fn two_hosts_racing_one_item_claim_it_once() {
+    use crate::sweep_registry::test_support::lease_order_dispatch_registry;
+    let (dir_a, dir_b) = (tempdir().unwrap(), tempdir().unwrap());
+    let (mut reg_a, _, _, store) = lease_order_dispatch_registry(dir_a.path(), &[]);
+    let (mut reg_b, _, _, store_b) = lease_order_dispatch_registry(dir_b.path(), &[]);
+    let fake_b = dir_b.path().join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake_b).unwrap();
+    std::fs::write(
+        &fake_b,
+        script.replace(&store_b.display().to_string(), &store.display().to_string()),
+    )
+    .unwrap();
+
+    let results = [
+        builder_claim(&mut reg_a, "step-builder-1-1"),
+        builder_claim(&mut reg_b, "step-builder-1-2"),
+    ];
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{results:?}");
+    assert_eq!(results[1].as_ref().unwrap_err().reason, "claim_lost");
+}
+
+/// An unreadable forge is not "no peer": the step is refused, not spawned.
+#[test]
+#[serial]
+fn an_unreadable_lease_order_refuses_the_builder_claim() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    break_gh_arm(dir.path(), COMMENT_READ_ARM);
+    assert_eq!(
+        builder_claim(&mut reg, "step-builder-1-1")
+            .unwrap_err()
+            .reason,
+        "claim_unverified"
+    );
+}
+
+/// A lease comment that cannot be written leaves no mutex: refused.
+#[test]
+#[serial]
+fn an_unwritable_lease_comment_refuses_the_builder_claim() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    break_gh_arm(dir.path(), COMMENT_WRITE_ARM);
+    assert_eq!(
+        builder_claim(&mut reg, "step-builder-1-1")
+            .unwrap_err()
+            .reason,
+        "claim_unverified"
+    );
+}
+
+/// The lease is written but never reads back (stale read): refused.
+#[test]
+#[serial]
+fn a_lease_that_never_reads_back_refuses_the_builder_claim() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _, _, store) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    std::fs::remove_file(&store).unwrap();
+    std::fs::create_dir(&store).unwrap(); // appends fail; the read finds nothing
+    assert_eq!(
+        builder_claim(&mut reg, "step-builder-1-1")
+            .unwrap_err()
+            .reason,
+        "claim_unverified"
+    );
 }

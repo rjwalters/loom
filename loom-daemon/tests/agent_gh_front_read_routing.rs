@@ -3,7 +3,8 @@
 //! (`LOOM_GH_GATEWAY_DIR`) a read goes to the owner's gateway profile, and
 //! with no gateway to a reader App from the daemon's root
 //! (`LOOM_GH_READER_ROOT`); a write keeps the session's credential (the
-//! writer) either way. The stub `next_gh` logs the `GH_CONFIG_DIR` it ran
+//! writer) either way. Classified passthrough reads take the same order
+//! (#12245), and a reader's fault reruns on the writer. The stub `next_gh` logs the `GH_CONFIG_DIR` it ran
 //! under beside its argv, so the test reads off where each call went.
 
 #![cfg(unix)]
@@ -13,10 +14,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-/// `issue 42` answers `200` with an ETag; everything else succeeds quietly.
+/// `issue 42` answers `200` with an ETag; everything else succeeds quietly,
+/// except under `$STUB_FAIL_DIR`, where every call fails with
+/// `$STUB_FAIL_MSG` on stderr (default an edge `530`).
 /// Each call logs `<GH_CONFIG_DIR>|<argv>`.
 const STUB: &str = r#"#!/bin/sh
 printf '%s|%s\n' "$GH_CONFIG_DIR" "$*" >> "$STUB_LOG"
+if [ -n "$STUB_FAIL_DIR" ] && [ "$GH_CONFIG_DIR" = "$STUB_FAIL_DIR" ]; then
+  echo "${STUB_FAIL_MSG:-HTTP 530}" >&2
+  exit 1
+fi
 case "$*" in
   'api --include repos/acme/widget/issues/42')
     printf 'HTTP/2.0 200 OK\r\nEtag: W/"v1"\r\n\r\n'
@@ -150,6 +157,8 @@ impl Sandbox {
             "LOOM_PICK_JOURNAL",
             "LOOM_GH_GATEWAY_DIR",
             "LOOM_GH_READER_ROOT",
+            "STUB_FAIL_DIR",
+            "STUB_FAIL_MSG",
         ] {
             cmd.env_remove(k);
         }
@@ -217,6 +226,91 @@ fn with_no_gateway_a_served_read_goes_to_a_reader_and_a_write_to_the_writer() {
 
     ok(&sb.gh(COMMENT, &env));
     assert_eq!(sb.dirs_for("issue comment"), [sb.p("writer")]);
+}
+
+#[test]
+fn with_no_gateway_a_passthrough_read_goes_to_a_reader_and_a_write_to_the_writer() {
+    let sb = Sandbox::new();
+    let reader = sb.publish_reader("acme");
+    let ws = sb.p("ws");
+    let env = [("LOOM_GH_READER_ROOT", ws.as_path())];
+
+    let diff = sb.gh(DIFF, &env);
+    ok(&diff);
+    assert_eq!(String::from_utf8_lossy(&diff.stdout), "ok\n");
+    assert_eq!(sb.dirs_for("pr diff"), [reader]);
+
+    ok(&sb.gh(COMMENT, &env));
+    assert_eq!(sb.dirs_for("issue comment"), [sb.p("writer")]);
+}
+
+#[test]
+fn a_gateway_for_another_owner_leaves_a_passthrough_read_to_the_reader() {
+    let sb = Sandbox::new();
+    let (base, _) = sb.publish_gateway("other");
+    let reader = sb.publish_reader("acme");
+    let ws = sb.p("ws");
+    let env = [
+        ("LOOM_GH_GATEWAY_DIR", base.as_path()),
+        ("LOOM_GH_READER_ROOT", ws.as_path()),
+    ];
+
+    ok(&sb.gh(DIFF, &env));
+    assert_eq!(sb.dirs_for("pr diff"), [reader]);
+}
+
+#[test]
+fn a_reader_fault_reruns_the_read_on_the_writer_and_withdraws_no_gateway() {
+    let sb = Sandbox::new();
+    let reader = sb.publish_reader("acme");
+    let ws = sb.p("ws");
+    let env = [
+        ("LOOM_GH_READER_ROOT", ws.as_path()),
+        ("STUB_FAIL_DIR", reader.as_path()),
+    ];
+
+    let diff = sb.gh(DIFF, &env);
+    ok(&diff);
+    assert_eq!(String::from_utf8_lossy(&diff.stdout), "ok\n");
+    assert_eq!(sb.dirs_for("pr diff"), [reader.clone(), sb.p("writer")]);
+    // The gateway's outage marker is never written beside a reader.
+    assert!(!reader.parent().unwrap().join("outage-until").exists());
+}
+
+#[test]
+fn a_readers_own_refusal_reruns_the_read_on_the_writer() {
+    for msg in [
+        "HTTP 404: Not Found (https://api.github.com/repos/acme/widget/pulls/42)",
+        "HTTP 403: Resource not accessible by integration",
+        "HTTP 403: API rate limit exceeded for installation ID 70.",
+        "HTTP 401: Bad credentials",
+    ] {
+        let sb = Sandbox::new();
+        let reader = sb.publish_reader("acme");
+        let ws = sb.p("ws");
+        let env = [
+            ("LOOM_GH_READER_ROOT", ws.as_path()),
+            ("STUB_FAIL_DIR", reader.as_path()),
+            ("STUB_FAIL_MSG", Path::new(msg)),
+        ];
+
+        let diff = sb.gh(DIFF, &env);
+        ok(&diff);
+        assert_eq!(String::from_utf8_lossy(&diff.stdout), "ok\n", "{msg}");
+        assert_eq!(String::from_utf8_lossy(&diff.stderr), "", "{msg}");
+        assert_eq!(sb.dirs_for("pr diff"), [reader.clone(), sb.p("writer")], "{msg}");
+    }
+}
+
+#[test]
+fn a_passthrough_read_skips_a_reader_directory_others_can_write() {
+    let sb = Sandbox::new();
+    let reader = sb.publish_reader("acme");
+    std::fs::set_permissions(&reader, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let ws = sb.p("ws");
+
+    ok(&sb.gh(DIFF, &[("LOOM_GH_READER_ROOT", ws.as_path())]));
+    assert_eq!(sb.dirs_for("pr diff"), [sb.p("writer")]);
 }
 
 #[test]

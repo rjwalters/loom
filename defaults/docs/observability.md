@@ -716,9 +716,8 @@ minutes plus at most 8 per-item reads per sample, never per tick. With
 dispatchers stand down while its published data is fresh
 (`loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`; see
 [`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12)).
-The same heartbeat can carry two forge facts (`starFacts`, `queueBlocked`), so
-the liveness pass's idle operator-label listings and the snapshot's
-`loom:blocked` listing are made by the captain alone.
+The same heartbeat can carry a forge fact (`queueBlocked`), so the snapshot's
+`loom:blocked` listing is made by the captain alone.
 Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 **Merge-chain re-date pressure (#10163).** Three gauges track the #8508
@@ -749,6 +748,15 @@ path. `loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
 in the same change, so `loom.issue` is no longer ambiguous on a multi-repo
 host. Full attribute table in
 [`telemetry-schema.md`](telemetry-schema.md#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting).
+
+**Step claim facts (#12183).** A `loom.dispatch.step` span for a role-keyed
+lease claim (every step but Builder) also carries how `lease pr claim` ran,
+whether the step spawned or was refused: `loom.dispatch.claim_outcome`
+(`exited` / `timed_out` / `spawn_failed` / `signaled` / `no_binary`),
+`loom.dispatch.claim_exit_code` (only when it exited), `loom.dispatch.claim_ms`,
+and `loom.dispatch.claim_stderr_tail` (last stderr line, control characters
+stripped, at most 256 bytes). They say *why* a `claim_unverified` refusal
+happened; `loom.dispatch.reason` keeps its closed tokens.
 
 Mapping an operator's plain-English question onto the `QueueDisposition`
 vocabulary (`loom.queue.disposition`'s wire values):

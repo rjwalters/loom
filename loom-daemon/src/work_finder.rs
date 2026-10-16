@@ -2480,6 +2480,7 @@ where
                         );
                     }
                     was_rate_limited = true;
+                    tick_summary::publish_rate_limit_skip(now); // #12083
                     continue;
                 }
                 was_rate_limited = false;
@@ -2849,12 +2850,14 @@ pub fn spawn_multi_work_finder_task(
         // up to a cap (#12222): it took 20–40+ min on a host with hundreds of
         // open-PR claims. Ticking past the cap is safe; see `startup_gate`.
         // Already-finished resolves instantly, and only the first tick waits.
+        let gate_started = std::time::Instant::now();
         let startup_outcome = startup_gate::wait(
             &mut startup_reconciliation_ready,
             startup_gate::wait_cap(&fallback_root),
         )
         .await;
-        let mut first_tick = startup_gate::FirstTick::new(spawned_at, startup_outcome);
+        let mut first_tick =
+            startup_gate::FirstTick::new(spawned_at, startup_outcome, gate_started.elapsed());
         let mut was_halted = false;
         let mut was_pressured = false;
         // #9410/#10624: the build back-off's per-repo (and optional host
@@ -2930,6 +2933,7 @@ pub fn spawn_multi_work_finder_task(
                         );
                     }
                     was_rate_limited = true;
+                    tick_summary::publish_rate_limit_skip(now); // #12083
                     continue;
                 }
                 was_rate_limited = false;
@@ -3188,6 +3192,10 @@ pub fn spawn_multi_work_finder_task(
             }
 
             let tick_started = chrono::Utc::now();
+            // #12256: the tick's forge calls are children of its span.
+            let tick_parent = crate::gh_invocation::telemetry::enter_parent(Some(
+                crate::observability::ops::dispatch::tick_context(tick_started),
+            ));
             // #11909: the step tick is the only item dispatch path.
             let report = step_driver.tick(&crate::step_dispatch::driver::TickInputs {
                 pool: &pool,
@@ -3202,7 +3210,14 @@ pub fn spawn_multi_work_finder_task(
                 saturation_held,
                 limits: (max_concurrent_per_repo, ram_budget, disk_budget).into(),
                 deadline: Some(tick_deadline),
+                gather_concurrency: crate::step_dispatch::gather_budget::gather_concurrency(
+                    &fallback_root,
+                ),
+                spawn_concurrency: crate::step_dispatch::gather_budget::spawn_concurrency(
+                    &fallback_root,
+                ),
             });
+            drop(tick_parent);
             drop(read_scope);
 
             // Publish before any logging so `loom-daemon health` sees the same

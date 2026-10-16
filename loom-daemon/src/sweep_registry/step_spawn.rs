@@ -38,6 +38,15 @@
 //! only on the reaper's heartbeat, so two hosts cannot draw the same item in
 //! between.
 //!
+//! # Landed work (#12251)
+//!
+//! Before a Builder step claims an issue, the forge is asked once whether
+//! its work already landed: a merged PR that closes it, or one built on its
+//! own `feature/issue-N` branch into the default branch
+//! (`work_finder::landed_prefilter::landed_at_spawn`). A landed issue is
+//! routed to Curator, the step is refused `already_landed`, and the Builder
+//! is held off it fleet-wide ([`SweepRegistry::hold_landed_builder`]).
+//!
 //! # After the spawn
 //!
 //! Every step's lease is renewed while it runs ([`lease`]); every step has
@@ -52,13 +61,16 @@ use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 pub(crate) mod capture;
 pub mod draw_claims;
 pub mod ended;
+pub mod launch_gate;
 pub(crate) mod lease;
 mod pool_state;
+pub(crate) mod span;
 pub(crate) mod timeout;
 mod unlocked;
 pub(crate) use unlocked::blocking;
 
 pub use timeout::step_timeout;
+pub use unlocked::StepSpawnTimings;
 
 /// One step the engine asks to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +112,8 @@ impl StepSpawnRequest {
 pub struct StepRefusal {
     pub reason: &'static str,
     pub detail: String,
+    /// How the pre-claim ran, when it was the refusal (#12183).
+    pub claim: Option<lease::ClaimFacts>,
 }
 
 impl StepRefusal {
@@ -107,6 +121,7 @@ impl StepRefusal {
         Self {
             reason,
             detail: detail.to_string(),
+            claim: None,
         }
     }
 }
@@ -139,12 +154,30 @@ pub struct PreparedStep {
     request: StepSpawnRequest,
     sweep_id: SweepId,
     launch: StepLaunch,
+    /// How the won pre-claim ran, for the `spawned` span (#12183).
+    claim: Option<lease::ClaimFacts>,
     _mid_spawn: roll_gate::MidSpawn,
 }
 
 fn non_empty(value: String) -> Option<String> {
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+/// Whether issue `item`'s work already landed, asked of the forge right
+/// before a Builder step claims it (#12251): the merged PR when it did.
+/// `target` is the registry's `(gh, root, slug)`.
+pub(crate) fn landed_at_spawn(target: &(PathBuf, PathBuf, String), item: u32) -> Option<u32> {
+    let (gh_bin, root, slug) = target;
+    crate::work_finder::landed_prefilter::landed_at_spawn(gh_bin, root, slug, item)
+}
+
+/// The refusal of a Builder step on an issue whose work landed by `pr`.
+pub(crate) fn landed_refusal(item: u32, pr: u32) -> StepRefusal {
+    StepRefusal::new(
+        ALREADY_LANDED_REASON,
+        format!("issue #{item} is still open but PR #{pr}, which lands it, has merged"),
+    )
 }
 
 /// Map a role tick's pre-spawn refusal to a step refusal. Pure.
@@ -185,7 +218,13 @@ impl SweepRegistry {
     /// A [`StepRefusal`]: every side effect taken so far is undone.
     pub fn begin_step_spawn(&mut self, request: &StepSpawnRequest) -> Result<PreparedStep> {
         self.begin_step_spawn_inner(request).map_err(|refusal| {
-            self.record_step_dispatch(request, dispatch_step::RESULT_REFUSED, refusal.reason, None);
+            self.record_step_dispatch(
+                request,
+                dispatch_step::RESULT_REFUSED,
+                refusal.reason,
+                None,
+                refusal.claim.as_ref(),
+            );
             log::info!(
                 "sweep_registry: {} step on #{} not spawned — {refusal}",
                 request.role,
@@ -200,9 +239,19 @@ impl SweepRegistry {
         request: &StepSpawnRequest,
     ) -> std::result::Result<PreparedStep, StepRefusal> {
         let (item, role, kind) = (request.item, request.role, request.kind());
+        self.check_role_command(role)?;
         self.roll_gate
             .admit(&kind)
             .map_err(|e| StepRefusal::new("roll_paused", e))?;
+        if role == StepRole::Builder {
+            if let Some(pr) = self
+                .open_pr_listing_target()
+                .and_then(|t| landed_at_spawn(&t, item))
+            {
+                self.hold_landed_builder(item);
+                return Err(landed_refusal(item, pr));
+            }
+        }
         let launch = Self::resolve_step_launch(&self.config, role, &kind)?;
         let sweep_id = generate_sweep_id(&kind);
         let locked = if role.acts_on_pr() {
@@ -213,35 +262,80 @@ impl SweepRegistry {
         locked.map_err(|e| StepRefusal::new("claimed", format!("{e:#}")))?;
         // Advertise at spawn, before any forge write (#11906 review item 4).
         self.publish_step_claim(peer_claims::ClaimKind::Advertise, item, role);
-        if let Err(refusal) = self.pre_claim_step(item, role, &sweep_id) {
-            self.unwind_step_claim(item, role, &sweep_id, false);
-            return Err(refusal);
+        let claim = match self.pre_claim_step(item, role, &sweep_id) {
+            Ok(claim) => claim,
+            Err(refusal) => {
+                self.unwind_step_claim(item, role, &sweep_id, false);
+                return Err(refusal);
+            }
+        };
+        let mut prepared = self.spawn_prepared_step(request, &sweep_id, launch, false)?;
+        prepared.claim = claim;
+        Ok(prepared)
+    }
+
+    /// Refuse a step whose `/loom:<role>` command is not installed in the
+    /// workspace (#12048, the step-dispatch counterpart of #4027/#6440): the
+    /// child would die on `Unknown command` and cool the item down as a failed
+    /// spawn. Runs before any lock or forge write; WARNs once per role until the
+    /// file appears. Hermetic fixtures (`skip_label_flip`) are exempt.
+    fn check_role_command(&mut self, role: StepRole) -> std::result::Result<(), StepRefusal> {
+        if self.config.skip_label_flip {
+            return Ok(());
         }
-        self.spawn_prepared_step(request, &sweep_id, launch)
+        let name = role.role_name();
+        if !self.config.role_command_missing(role) {
+            self.missing_command_warned.remove(name);
+            return Ok(());
+        }
+        let path = self.config.role_command_path(role);
+        let detail = format!(
+            "workspace {} is missing {} (run `loom-daemon init`)",
+            self.config.workspace_root.display(),
+            path.display()
+        );
+        if self.missing_command_warned.insert(name) {
+            log::warn!("sweep_registry: step refused — {detail}");
+        }
+        Err(StepRefusal::new("workspace_commands_missing", detail))
     }
 
     /// The claimed step's launch: the stagger and the child. A failed spawn
-    /// undoes the claim.
+    /// undoes the claim. `host_gate` (a concurrent tick's spawn, #12298)
+    /// also launches through the host-wide gap
+    /// ([`launch_gate::HOST_LAUNCH_GATE`]), so children in different repos
+    /// launch at least the stagger apart too.
     fn spawn_prepared_step(
         &mut self,
         request: &StepSpawnRequest,
         sweep_id: &str,
         launch: StepLaunch,
+        host_gate: bool,
     ) -> std::result::Result<PreparedStep, StepRefusal> {
         let (item, role, kind) = (request.item, request.role, request.kind());
         let sweep_id = sweep_id.to_string();
         self.apply_dispatch_stagger();
         let log_path = self.compute_step_log_path(item, role);
-        match self.spawn_child_process(
-            &kind,
-            &log_path,
-            &sweep_id,
-            launch.model.as_deref(),
-            launch.effort.as_deref(),
-            None,
-            launch.admission.admitted.as_ref(),
-            launch.selection.as_ref(),
-        ) {
+        let spawn = |reg: &Self| {
+            reg.spawn_child_process(
+                &kind,
+                &log_path,
+                &sweep_id,
+                launch.model.as_deref(),
+                launch.effort.as_deref(),
+                None,
+                launch.admission.admitted.as_ref(),
+                launch.selection.as_ref(),
+            )
+        };
+        let spawned = if host_gate {
+            let gap = self.dispatch_stagger;
+            let this = &*self;
+            launch_gate::HOST_LAUNCH_GATE.launch(gap, || spawn(this))
+        } else {
+            spawn(self)
+        };
+        match spawned {
             Ok((child, header_anchor)) => Ok(PreparedStep {
                 child,
                 header_anchor,
@@ -249,6 +343,7 @@ impl SweepRegistry {
                 request: request.clone(),
                 sweep_id,
                 launch,
+                claim: None,
                 _mid_spawn: self.roll_gate.enter(),
             }),
             Err(e) => {
@@ -264,23 +359,62 @@ impl SweepRegistry {
         item: u32,
         role: StepRole,
         sweep_id: &str,
-    ) -> std::result::Result<(), StepRefusal> {
+    ) -> std::result::Result<Option<lease::ClaimFacts>, StepRefusal> {
         if self.config.skip_label_flip {
-            return Ok(());
+            return Ok(None);
         }
         match role {
-            StepRole::Builder => {
-                self.flip_label_to_building(item)
-                    .map_err(|e| StepRefusal::new("label_flip_failed", format!("{e:#}")))?;
-                self.write_lease_comment_for(item, sweep_id, Some(StepRole::Builder));
-                self.note_label_flip(item);
-                Ok(())
-            }
+            // The Builder's claim is a label flip and a lease comment, not a
+            // `lease pr claim` run: no claim facts to record.
+            StepRole::Builder => self.pre_claim_builder_step(item, sweep_id).map(|()| None),
             StepRole::Curator
             | StepRole::ChampionPromote
             | StepRole::Judge
             | StepRole::Doctor
-            | StepRole::ChampionMerge => self.pre_claim_step_lease(item, role, sweep_id),
+            | StepRole::ChampionMerge => self.pre_claim_step_lease(item, role, sweep_id).map(Some),
+        }
+    }
+
+    /// A Builder step's claim, claim-then-verify and FAIL CLOSED (#12133). The
+    /// label flip is idempotent, so every host "wins" it; the lease comment's
+    /// forge order is the only cross-host mutex. So after the flip and the
+    /// lease write, the earliest live lease comment must be this step's own:
+    /// a peer's earlier one is `claim_lost`; a lease that could not be written,
+    /// or an order that could not be read, is `claim_unverified`. (An issue
+    /// sweep falls open on an unreadable forge; a step must not.) Either
+    /// refusal leaves the label as it is: it may be the winner's claim.
+    fn pre_claim_builder_step(
+        &mut self,
+        item: u32,
+        sweep_id: &str,
+    ) -> std::result::Result<(), StepRefusal> {
+        let episode_start = Utc::now();
+        self.flip_label_to_building(item)
+            .map_err(|e| StepRefusal::new("label_flip_failed", format!("{e:#}")))?;
+        let wrote = self.write_lease_comment_for(item, sweep_id, Some(StepRole::Builder));
+        self.note_label_flip(item);
+        if !wrote {
+            return Err(StepRefusal::new(
+                "claim_unverified",
+                "the Builder lease comment could not be written",
+            ));
+        }
+        match self.resolve_lease_order_strict(item, sweep_id, episode_start) {
+            LeaseOrderDecision::Proceed => Ok(()),
+            LeaseOrderDecision::Unverified => {
+                Err(StepRefusal::new("claim_unverified", "the lease order could not be read back"))
+            }
+            LeaseOrderDecision::Yield {
+                earliest_host,
+                earliest_sweep_id,
+            } => Err(StepRefusal::new(
+                "claim_lost",
+                format!("a peer's earlier lease holds it ({earliest_host} {earliest_sweep_id})"),
+            )),
+            // Not produced in the strict mode; a refusal is the safe reading.
+            LeaseOrderDecision::YieldToLeaselessClaim { .. } => {
+                Err(StepRefusal::new("claim_lost", "a leaseless claim holds it"))
+            }
         }
     }
 
@@ -322,6 +456,7 @@ impl SweepRegistry {
             request,
             sweep_id,
             mut launch,
+            claim,
             ..
         } = prepared;
         let (item, role) = (request.item, request.role);
@@ -337,6 +472,7 @@ impl SweepRegistry {
                 dispatch_step::RESULT_REFUSED,
                 refusal.reason,
                 None,
+                claim.as_ref(),
             );
             return Err(refusal.into());
         }
@@ -391,7 +527,13 @@ impl SweepRegistry {
         if token_name != crate::sweep_registry::UNKNOWN_TOKEN_NAME {
             self.clear_role_tick_pool_exhausted(role.role_name());
         }
-        self.record_step_dispatch(&request, dispatch_step::RESULT_SPAWNED, "ok", Some(&sweep_id));
+        self.record_step_dispatch(
+            &request,
+            dispatch_step::RESULT_SPAWNED,
+            "ok",
+            Some(&sweep_id),
+            claim.as_ref(),
+        );
         log::info!(
             "sweep_registry: {role} step {sweep_id} on #{item} spawned (pid {pid}, model {}, \
              timeout {}s, #11906)",
@@ -414,6 +556,7 @@ impl SweepRegistry {
         result: &str,
         reason: &str,
         sweep_id: Option<&str>,
+        claim: Option<&lease::ClaimFacts>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -426,6 +569,7 @@ impl SweepRegistry {
                 age_source: &request.age_source,
                 resumed: request.resumed,
                 sweep_id,
+                claim,
             },
         );
     }

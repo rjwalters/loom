@@ -91,3 +91,8 @@ fn unknown_stream_is_not_green() {
     let out = run(&["--root", root(&tmp), "--stream", "absent"]);
     assert_eq!(out.status.code(), Some(1));
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

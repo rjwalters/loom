@@ -171,6 +171,17 @@ pub fn tick_points(report: &TickReport, max_concurrent: usize) -> Vec<MetricPoin
     points
 }
 
+/// The context of the tick span that starts at `started_at` (#12256): known
+/// before the tick runs, so the tick's forge calls can be parented to it
+/// ([`crate::gh_invocation::telemetry::enter_parent`]). Pure.
+#[must_use]
+pub fn tick_context(started_at: DateTime<Utc>) -> TraceContext {
+    TraceContext::derived(
+        SpanName::DispatchTick.as_str(),
+        &[&crate::telemetry::trace::instant(started_at)],
+    )
+}
+
 /// The tick's span: its own sampled root trace covering `started_at..ended_at`,
 /// its ID derived from the tick's start instant.
 #[must_use]
@@ -206,10 +217,7 @@ pub fn tick_span(
     }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
-        context: TraceContext::derived(
-            SpanName::DispatchTick.as_str(),
-            &[&crate::telemetry::trace::instant(started_at)],
-        ),
+        context: tick_context(started_at),
         parent_span_id: None,
         name: SpanName::DispatchTick,
         started_at,

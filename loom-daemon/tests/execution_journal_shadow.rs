@@ -72,3 +72,8 @@ fn shadow_writes_follow_the_env_switch_and_verify_through_the_cli() {
     assert_eq!(legacy.entries[0].issue, 1);
     std::env::remove_var(DIR_ENV);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -6,6 +6,8 @@ mod auto_update;
 mod backlog_level;
 mod checkout_external_change;
 mod ci;
+mod daemon_event;
+mod daemon_exit;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
@@ -18,7 +20,9 @@ mod ops;
 mod outcome_facts;
 mod pass;
 mod pick_decision;
+mod prompt_tree;
 mod role_draw;
+mod scope_memory;
 mod session_output;
 mod token_ranking;
 mod tokens_snapshot;
@@ -342,7 +346,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(gated_pool) = &r.gated_pool {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
+            // #12028: why a failed tick failed, from the closed vocabulary only.
+            if let Some(class) = &r.failure_class {
+                attributes
+                    .push(kv_string(crate::observability::lifecycle::FAILURE_CLASS, class.clone()));
+            }
             attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
+            // #11989: the prompt tree the session ran.
+            attributes.extend(prompt_tree::attributes(r.prompt.as_ref()));
             // #11906: a step-engine step, never a role-runner tick.
             if let Some(source) = &r.source {
                 attributes.push(kv_string("loom.role_tick.source", source.clone()));
@@ -543,10 +554,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // already-reviewed, small, operator-facing JSON (never
             // free-form transcript content), so it is carried whole as one
             // compact-JSON string attribute rather than re-typed per topic.
-            let attributes = vec![
-                kv_string("loom.topic", r.topic.clone()),
-                kv_string("loom.payload", serde_json::to_string(&r.payload).unwrap_or_default()),
-            ];
+            // #12230: listed payload scalars also ride typed.
+            let attributes = daemon_event::attributes(r);
             (
                 "daemon.event",
                 SeverityNumber::Info,
@@ -607,6 +616,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::BacklogLevel(_)
         | TelemetryRecord::WriteScopeRefused(_)
+        | TelemetryRecord::DaemonExit(_)
+        | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
@@ -622,6 +633,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
                 .or_else(|| backlog_level::log_parts(r))
+                .or_else(|| daemon_exit::log_parts(r))
+                .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;

@@ -68,6 +68,7 @@ pub mod read_shed;
 pub mod reader_spill;
 pub mod reader_withdrawal;
 pub mod redate_chain;
+pub mod scope_memory;
 pub mod stage_dwell;
 pub mod stage_entry;
 pub mod stage_events;

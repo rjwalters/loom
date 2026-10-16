@@ -1075,6 +1075,10 @@ pub enum RoleTickResult {
     SkippedLoad,
     /// Skipped pre-spawn: a queue-gated role's work queue was empty (#9391).
     SkippedQueueEmpty,
+    /// Not reached this tick: a host-level limit (ceiling, role budget,
+    /// demand width, reservation) stopped the round-robin walk before this
+    /// repo's turn, so its next chance is a later tick (#12084).
+    SkippedDeferred,
 }
 
 /// Whether a `repo` string is a local filesystem path (or empty) rather than
@@ -1190,6 +1194,14 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Why a [`RoleTickResult::Failure`] tick failed (#12028): the closed-
+    /// vocabulary `loom.failure_class` the tick's `role_attempt` span carries
+    /// when it launched, or the fixed pre-launch class of the site that
+    /// refused it. Never `detail`'s text. Present only on a failure; absent on
+    /// every other result and on every record written before #12028 —
+    /// additive, no `schema_version` bump, exactly as [`Self::gated_pool`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
     /// Which tier of the ordered runtime-preference list this tick launched on
     /// (Issue #8599): `0` is the most-preferred tap — nothing fell through —
     /// and any higher value is a fall-through, so "how much work went to the
@@ -1253,6 +1265,13 @@ pub struct RoleTickOutcomeRecord {
     /// optional unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<RoleTickActions>,
+    /// The checkout this tick's session read its `/loom:<role>` prompt from,
+    /// as it stood at launch (#11989): its commit, the Loom release installed
+    /// in it, how far it is behind `origin/<default>`, and whether HEAD was
+    /// on a branch. Absent for a tick that never resolved a launch and on
+    /// records written before #11989 — additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<crate::role_tick_telemetry::prompt_tree::PromptTree>,
     /// What ran the tick (#11906): absent for a role-runner tick, `"step"`
     /// ([`ROLE_TICK_SOURCE_STEP`]) for a step-engine step, so a "role ticks
     /// still running" query never counts steps.
@@ -1261,6 +1280,18 @@ pub struct RoleTickOutcomeRecord {
     /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_id: Option<String>,
+    /// Which host limit deferred this repo's tick (#12084): `ceiling`,
+    /// `role_budget`, `demand_width` or `reservation`. Present exactly on
+    /// [`RoleTickResult::SkippedDeferred`]. Additive, no `schema_version`
+    /// bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_by: Option<String>,
+    /// Which shard owns this repo's role ticks (#12084), `<index>/<count>`
+    /// (zero-based index), as [`crate::role_shard`] resolved it. Present only
+    /// on a [`RoleTickResult::SkippedDeferred`] record of a sharded host;
+    /// absent when unsharded, never a guessed `0/1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_owner: Option<String>,
 }
 
 /// [`RoleTickOutcomeRecord::source`] of a step-engine step (#11906).

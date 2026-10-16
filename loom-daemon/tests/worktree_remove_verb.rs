@@ -676,3 +676,8 @@ fn a_refused_removal_writes_no_ledger_entry() {
         "a refusal must not be recorded as a removal"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

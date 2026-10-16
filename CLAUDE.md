@@ -5,8 +5,7 @@ This repository uses **Loom** for AI-powered development orchestration.
 **Installation Date**: 2026-04-21
 
 > **Operating core:** keep immediate dispatch instructions here. Put reference
-> details in `.loom/docs/*`, with a one-line pointer here; CI enforces the
-> instruction budget (`scripts/check-claude-md-budget.sh`). Completed migration
+> details in `.loom/docs/*`, with a one-line pointer here. Completed migration
 > history belongs in `docs/migration/` and ADRs.
 
 ## What is Loom?
@@ -194,8 +193,8 @@ All org CI is captured in SigNoz: [`ci-observability`](.loom/docs/ci-observabili
    all-clear. A hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
 2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`, then
-   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`.
-   Step 3's `worktree.sh` does this itself; a lane not using it MUST call `lease ensure` (#9453)
+   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (the process doing the work, never a subagent's inherited `$PPID`).
+   Step 3's `worktree.sh` does this itself; a lane not using it MUST call `lease ensure` (#9453); `lease release 42` hands it back (#12103)
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
 4. Implement, test, commit
 5. Create PR: `git push -u origin feature/issue-42 && gh pr create --label "loom:review-requested" --body "Closes #42"`
@@ -235,8 +234,8 @@ Configuration lives in `.loom/config.json` (committed): a `terminals` array
 - **Runtime dispatch (`runtimes`)** — `spawn-worker.sh` selects the worker runtime
   (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
   [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).
-- **Prompt budget policy** — agent-facing markdown and each role's prompt prefix may shrink, not grow: [`.loom/docs/prompt-budget-policy.md`](.loom/docs/prompt-budget-policy.md). Large files: Hermit may propose splits.
-- **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh`; a new script needs a category + reason in `scripts/shell-allowlist.txt` (CI-enforced, `contract` is baseline-only): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
+- **Large files** — no size gate; Hermit may propose splits.
+- **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh` (a review standard, not a CI gate): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
 - **Role-prompt authoring discipline** — pressure-test a non-trivial role-prompt/operator-dispatch-brief change against a resisting scenario, audit it for rule conflicts, and load-gate by default: [`.loom/docs/role-prompt-authoring.md`](.loom/docs/role-prompt-authoring.md).
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).
 - **Branch rulesets & repository settings** — at install, or via `scripts/install/setup-{branch-protection,repository-settings}.sh`.

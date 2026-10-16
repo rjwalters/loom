@@ -244,6 +244,7 @@ fn a_fork_checkout_with_an_upstream_remote_is_refused() {
 #[serial_test::serial(write_scope_cache)]
 fn the_cache_answers_repeat_questions_without_a_second_probe() {
     let dir = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
     // SAFETY-free: the variable is read only by this module's cache.
     std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
     probe::clear_memory();
@@ -324,6 +325,7 @@ pub(super) fn seed_disk_for(
 #[serial_test::serial(write_scope_cache)]
 fn an_unanswerable_reprobe_keeps_a_recent_write_but_not_an_old_one() {
     let dir = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
     std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("g"));
     probe::clear_memory();
     let hour = std::time::Duration::from_secs(3600);
@@ -569,6 +571,7 @@ fn daemon_write_paths_are_scoped() {
         ("cli/curation_complete.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
+        ("cli/lease_release.rs", Gated),
         (
             "fleet/drain_reset.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),

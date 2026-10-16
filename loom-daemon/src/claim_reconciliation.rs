@@ -1362,6 +1362,18 @@ impl VerdictKind {
             Self::ChangesRequested => "changes-requested",
         }
     }
+
+    /// Every `verdict=` spelling a reader accepts for this verdict: the
+    /// canonical [`Self::marker_token`] first, then tolerated aliases
+    /// (a hand-posted or in-session marker may say `approve` /
+    /// `request-changes`). Writers stay canonical; only readers are lenient.
+    #[must_use]
+    pub fn marker_tokens(self) -> &'static [&'static str] {
+        match self {
+            Self::Approved => &["approved", "approve"],
+            Self::ChangesRequested => &["changes-requested", "request-changes"],
+        }
+    }
 }
 
 /// Labels that park a PR out of automated flow — an operator hold, or
@@ -1594,10 +1606,13 @@ impl VerdictReconcileStats {
 /// for a superseded verdict vouch for (or wrongly invalidate) the live one.
 #[must_use]
 pub fn extract_latest_verdict_sha(bodies: &[String], kind: VerdictKind) -> Option<String> {
-    let pattern = format!(
-        r"<!-- loom:verdict-sha sha=([0-9a-f]{{7,40}}) verdict={} -->",
-        regex::escape(kind.marker_token())
-    );
+    let tokens = kind
+        .marker_tokens()
+        .iter()
+        .map(|t| regex::escape(t))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = format!(r"<!-- loom:verdict-sha sha=([0-9a-f]{{7,40}}) verdict=(?:{tokens}) -->");
     let re = regex::Regex::new(&pattern).ok()?;
     bodies
         .iter()
@@ -3163,3 +3178,7 @@ mod rest_only_tests;
 // #9258: an unmarked approval is re-queued, never anchored.
 #[cfg(test)]
 mod unanchored_verdict_tests;
+
+// #12230: a slow startup pass beside work-finder ticks dispatches once.
+#[cfg(test)]
+mod startup_cutoff_race_tests;

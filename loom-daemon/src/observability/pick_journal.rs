@@ -5,10 +5,12 @@
 //!
 //! The daemon creates one journal file per launched role tick ([`attach`]) and
 //! hands its path to the agent as [`PICK_JOURNAL_ENV`]. Three writers, all in
-//! the agent's own process tree, append JSON lines to it:
+//! the agent's own process tree, append JSON lines to it. A fourth writer, the
+//! daemon itself, journals the Judge/Doctor/Champion queue at dispatch:
 //!
-//! - `loom-daemon pr-queue` ([`record_pr_queue`]): the ordered queue Judge,
-//!   Doctor and Champion consume, with its sort keys — the same rows it prints.
+//! - the daemon, at launch ([`record_queue_at_dispatch`], #12119): the ordered
+//!   queue Judge, Doctor and Champion consume, with its sort keys. It does not
+//!   depend on the agent calling `loom-daemon pr-queue`, which is a pure read.
 //! - the agent `gh` front's served `issue|pr list` ([`record_listing`]): the
 //!   rows a listing-driven role (Curator) read, in listing order, after its own
 //!   `--jq` filter; and the `--json` listings it passes through to `gh`
@@ -382,19 +384,45 @@ pub fn front_on_path(path: Option<OsString>) -> bool {
         .is_some_and(|exe| exe.file_name() == Some(std::ffi::OsStr::new("loom-daemon")))
 }
 
-/// Journal a `pr-queue` result (the role's serving queue). A no-op outside a
-/// role tick.
-pub fn record_pr_queue(role: &str, rows: &[Value]) {
-    if journal_path().is_none() {
+/// Journal the serving PR queue for a Judge, Doctor or Champion tick (#12119),
+/// from the daemon, before the agent is spawned. `command` is the agent
+/// launch, already carrying its journal ([`attach`]): without one (no
+/// exporter) nothing is fetched. A role without a PR queue, or a failed
+/// listing, journals nothing and never fails the launch.
+pub fn record_queue_at_dispatch(command: &Command, root: &Path, role: &str) {
+    let gh = std::env::var_os("LOOM_GH_BIN").map_or_else(|| PathBuf::from("gh"), PathBuf::from);
+    record_queue_with(command, role, |r| crate::pr_planning::fetch_queue(root, &gh, r));
+}
+
+fn record_queue_with<F>(command: &Command, role: &str, fetch: F)
+where
+    F: FnOnce(crate::pr_planning::PrRole) -> anyhow::Result<Vec<Value>>,
+{
+    let env_of = |name: &str| {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(name))
+            .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+    };
+    let Some(Some(path)) = env_of(PICK_JOURNAL_ENV) else {
         return;
-    }
-    append(&JournalEntry::Queue {
-        at: Utc::now(),
-        role: role.to_string(),
-        acts_observable: front_on_path(std::env::var_os("PATH")),
-        total: rows.len(),
-        rows: pr_queue_rows(rows),
-    });
+    };
+    let Some(role) = crate::pr_planning::PrRole::from_name(role) else {
+        return;
+    };
+    let Ok(rows) = fetch(role) else { return };
+    // The PATH the agent will receive: its own override, else the daemon's.
+    let path_env = env_of("PATH").unwrap_or_else(|| std::env::var_os("PATH"));
+    append_to(
+        Path::new(&path),
+        &JournalEntry::Queue {
+            at: Utc::now(),
+            role: role.as_str().to_string(),
+            acts_observable: front_on_path(path_env),
+            total: rows.len(),
+            rows: pr_queue_rows(&rows),
+        },
+    );
 }
 
 /// The journal rows for a served listing: the rows its `--jq` prints, in the
