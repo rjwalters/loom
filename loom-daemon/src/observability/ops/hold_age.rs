@@ -31,9 +31,13 @@ pub fn hold_labels() -> Vec<&'static str> {
     labels
 }
 
-/// The `hold` label value: the label with `loom:` stripped and `-` → `_`.
+/// The `hold` label value: the label without its namespace prefix and with
+/// `-` → `_`.
 fn hold_name(label: &str) -> String {
-    label.trim_start_matches("loom:").replace('-', "_")
+    label
+        .split_once(':')
+        .map_or(label, |(_, name)| name)
+        .replace('-', "_")
 }
 
 /// The `p`th percentile (1..=100) of `sorted` (ascending, non-empty) by

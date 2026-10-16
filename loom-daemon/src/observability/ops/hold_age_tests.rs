@@ -1,9 +1,11 @@
 //! Hold-age points (#12038). Pure: rows are parsed from the mirror's shape.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Duration, Utc};
 
 use super::{hold_labels, nearest_rank, points_from_mirror};
-use crate::forge_listing::{parse_rest_issues, RestIssue};
+use crate::forge_listing::RestIssue;
 use crate::telemetry::ops::{MetricName, MetricPoint, MetricValue};
 
 fn now() -> DateTime<Utc> {
@@ -16,25 +18,29 @@ fn ago(secs: i64) -> String {
     (now() - Duration::seconds(secs)).to_rfc3339()
 }
 
-/// One open row; `labels` are `(label, applied-at)` (`None`: no time sent).
+/// One open row as the mirror serves it; `labels` are `(label, applied-at)`
+/// (`None`: no time sent).
 fn row(number: u32, pr: bool, labels: &[(&str, Option<String>)], updated_at: &str) -> RestIssue {
-    let names: Vec<_> = labels.iter().map(|(l, _)| serde_json::json!(l)).collect();
-    let at: serde_json::Map<_, _> = labels
+    let at: BTreeMap<String, String> = labels
         .iter()
-        .filter_map(|(l, t)| t.as_ref().map(|t| ((*l).to_string(), serde_json::json!(t))))
+        .filter_map(|(l, t)| t.as_ref().map(|t| ((*l).to_string(), t.clone())))
         .collect();
-    let mut item = serde_json::json!({
-        "number": number, "state": "open", "labels": names, "updated_at": updated_at,
-    });
-    if !at.is_empty() {
-        item["labels_at"] = serde_json::Value::Object(at);
+    RestIssue {
+        number,
+        title: None,
+        labels: labels.iter().map(|(l, _)| (*l).to_string()).collect(),
+        created_at: None,
+        updated_at: Some(updated_at.to_string()),
+        closed_at: None,
+        state: "open".to_string(),
+        body: None,
+        author: None,
+        author_association: None,
+        is_pull_request: pr,
+        comments: 0,
+        open_sub_issues: None,
+        labels_at: (!at.is_empty()).then_some(at),
     }
-    if pr {
-        item["pull_request"] = serde_json::json!({"url": "u"});
-    }
-    parse_rest_issues(&serde_json::json!([item]).to_string())
-        .unwrap()
-        .remove(0)
 }
 
 fn blocked(number: u32, secs: i64) -> RestIssue {
