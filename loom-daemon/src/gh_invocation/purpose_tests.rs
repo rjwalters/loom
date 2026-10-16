@@ -24,9 +24,7 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Each discovery site of the epic's table sets the tag. `stage_dwell.rs`
-/// lists through `queue_blocked::list_open_observability`, which carries it
-/// (the scope is thread-local, so it cannot sit across that file's awaits).
+/// Each discovery site of the epic's table sets the tag.
 #[test]
 fn every_discovery_site_sets_the_tag() {
     for rel in [
@@ -37,7 +35,6 @@ fn every_discovery_site_sets_the_tag() {
         "work_finder/landed_prefilter.rs",
         "work_finder/forge.rs",
         "observability/queue_blocked.rs",
-        "observability/ops/stage_queue.rs",
         "quarantine_reconciliation/listing.rs",
         "claim_reconciliation/open_pr_listing.rs",
         "intake_reconcile.rs",
@@ -46,10 +43,6 @@ fn every_discovery_site_sets_the_tag() {
     ] {
         assert!(read(rel).contains(TAG), "{rel} does not tag its listing as discovery");
     }
-    assert!(
-        read("observability/ops/stage_dwell.rs").contains("list_open_observability"),
-        "stage_dwell no longer lists through the tagged queue_blocked reader"
-    );
 }
 
 /// No gate or write module sets it: the claim, lease, merge and dispatch

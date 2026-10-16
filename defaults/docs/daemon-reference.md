@@ -7764,7 +7764,7 @@ waits a per-host delay, then runs on its normal cadence:
 
 - the work finder's first tick (step gather, discovery listings, inline
   intake);
-- the collector's forge gathers (captain facts, stage dwell, fleet state),
+- the collector's forge gathers (captain facts, fleet state),
   which now run on their own snapshot-cadence timer whose first tick is the
   delay; host-local samples (`host.health`, tokens, disk) still run from boot;
 - the no-op hold re-checks on the reaper tick.
@@ -8542,12 +8542,10 @@ Full module-level rationale (including why `evaluate()` stays pure while
 `run()` writes): `loom-daemon/src/fleet_captain.rs`'s "Two arm registries" /
 "Staleness policy" doc sections.
 
-#### Forge stage-dwell gauge (per host)
+#### Forge-read gauges (per host)
 
-The forge label-stage dwell (`loom.forge.stage_dwell`,
-`loom.forge.stage_items`) lists the stage labels of the repos a host manages,
-and the `queue.snapshot` blocked rows list each repo's `loom:blocked` issues.
-Every host produces both itself. The fleet-captain producer that once did this
+The `queue.snapshot` blocked rows list each repo's `loom:blocked` issues, and
+every host produces them itself. The fleet-captain producer that once did this
 for the fleet (W12, `fleet.captainGauges`, #10673) was removed in #11406: it
 covered the 2 of 61 repos the captain managed, and both had starred issues, so
 stand-down saved almost nothing. A host config that still carries a
@@ -8555,19 +8553,12 @@ stand-down saved almost nothing. A host config that still carries a
 delete the block. The `captain/gauges.json` heartbeat on the fleet store's
 `eta-fit` branch is no longer written or read; an operator can delete it.
 
-**The stage-dwell sampler is off by default (#12203).** Every host listing
-every repo's stage labels every 5 minutes cost about 8.9k billable GitHub
-calls an hour on a 6-worker fleet and tripped `rate_limit_breaker`, which
-halts dispatch. `observability.stageDwell.enabled` gates it entirely: off, a
-pass makes no stage listing, no open-items walk, no per-item events read and
-no `merged_at` read, and exports no `loom.forge.stage_dwell` /
-`loom.forge.stage_items` points. The daemon logs one INFO line naming the key
-on its first forge-gather pass, and again whenever the switch flips.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `observability.stageDwell.enabled` | `false` | Run the forge stage-dwell sampler. `true` restores the sampling described above. **Hot-applies** (read every forge-gather pass) |
-| `observability.stageDwell.intervalSecs` | unset | Minimum seconds between two samples while enabled; passes inside it are skipped. Unset, `0` or malformed: every forge-gather pass (5 minutes). A value below that period has no effect. **Hot-applies** |
+The forge stage-dwell sampler (`loom.forge.stage_dwell`,
+`loom.forge.stage_items`, the `stage-dwell` job and the
+`observability.stageDwell.*` keys) was deleted in #12316: dwell is a
+consumer's computation over the mirror's per-item label times, and nothing
+the daemon decides reads it. A leftover `observability.stageDwell` key in a
+host config is ignored.
 
 #### Intake reconcile on the captain (W7)
 
@@ -9274,8 +9265,8 @@ Hygiene — `worktree.issue_state`, `worktree.has_open_pr`, `clean.pr_list`,
 `clean.pr_status_rest`, `worktree.landed_pulls`, `intake.list_open`, and
 `clean.pr_by_number_rest` / `worktree.issue_state_rest` /
 `worktree.issue_closed_at` on a root without a repo fact; Observability —
-`stage_dwell`'s `api.rest` (its `pulls/{n}` merge check), the events
-page walk's `stage_dwell.events` and `stage_entry.events` (#11924),
+the events
+page walk's `stage_entry.events` (#11924),
 `telemetry.repo_identity`. `visibility.repo`, and
 the single-item hygiene reads on a root with a repo fact, are conditional
 reads through the shared ETag store (#10512, W6) and route as `Gate` — not

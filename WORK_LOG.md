@@ -7,6 +7,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **Issue #12332** (closed): Fix displaced comments from SIGUSR1 task dump change (#12129)
+- **PR #12191**: feat(telemetry): carry provenance join facts as plain span attributes
+- **Issue #11982** (closed): Provenance out of Loom, stage 1: facts contract on spans and telemetry-schema doc
+- **Issue #11347** (closed): [Epic #9908] Phase 2c: Execution journal shadow appends from checkpoint CLI
+- **PR #12348**: feat(journal): shadow checkpoint.completed appends from sweep-checkpoint write
+- **Issue #12339** (closed): Session image: carry python3, uv and git with a container-local UV_PROJECT_ENVIRONMENT
+- **PR #12352**: feat: add pinned uv and container-local UV_PROJECT_ENVIRONMENT to session image
+- **Issue #12038** (closed): Telemetry: hold-age gauge (loom.forge.hold_age_seconds) from fleet.state held_since + mirror labels_at for parked issues
+- **PR #12301**: feat: export hold-count and hold-age gauges from the state mirror
 - **PR #12360**: test: assert maintain-only dispatch refusals are not tick errors
 - **PR #12353**: fix: shell exporters use loom-daemon host-id; add running/stopped/silent host query
 - **PR #12350**: test: hold first run in fairness_a_real_run to remove slot race

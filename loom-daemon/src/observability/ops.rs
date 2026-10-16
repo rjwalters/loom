@@ -24,7 +24,7 @@
 //! multi-workspace tick, #8856). [`pool_marks`] (#8931) emits a
 //! reason-classified counter at each seam that marks a pool account, and one
 //! span per pool dispatch hold. [`turnaround`] (#8929) covers slot turnaround
-//! and idle slots per host, [`stage_dwell`] forge label-stage dwell, and
+//! and idle slots per host, and
 //! [`disposition`] (#9222) one span per ready-queue row's disposition, on
 //! transition or periodic refresh. [`ratelimit`] (#10022) exports GitHub
 //! rate-limit breaker trips, quota gauges (per bucket since W1) and breaker
@@ -56,7 +56,6 @@ pub mod dwell;
 pub mod feed;
 pub mod forge_calls;
 pub mod forge_mirror;
-pub mod hold_age;
 pub mod host;
 pub mod ipc_latency;
 pub mod liveness;
@@ -70,10 +69,8 @@ pub mod reader_spill;
 pub mod reader_withdrawal;
 pub mod redate_chain;
 pub mod scope_memory;
-pub mod stage_dwell;
 pub mod stage_entry;
 pub mod stage_events;
-pub mod stage_queue;
 pub mod turnaround;
 
 use std::sync::{Arc, OnceLock};
