@@ -3,7 +3,6 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod auto_update;
-mod backlog_level;
 mod checkout_external_change;
 mod ci;
 mod daemon_event;
@@ -13,6 +12,7 @@ mod fact_id;
 mod fleet_state;
 mod host_export;
 mod host_resource;
+mod host_status;
 mod issue_estimate;
 mod metadata;
 mod operator_presence;
@@ -614,7 +614,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SessionOutput(_)
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
-        | TelemetryRecord::BacklogLevel(_)
         | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::ScopeMemory(_)
@@ -632,7 +631,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
-                .or_else(|| backlog_level::log_parts(r))
                 .or_else(|| daemon_exit::log_parts(r))
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))?;
@@ -1037,6 +1035,7 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             samples
         }
         TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),
+        TelemetryRecord::HostStatus(r) => host_status::samples(r, time_unix_nano),
         // Every kind that is not declared `otlp: Gauges` in
         // `telemetry/kinds.rs` produces no gauge here:
         //   - every lifecycle-shaped kind — including `role_tick.outcome`

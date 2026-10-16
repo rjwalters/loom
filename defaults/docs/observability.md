@@ -702,12 +702,8 @@ in `loom.dispatch.role_max_concurrent` and `loom.dispatch.role_idle_slots`.
 Forge label-stage dwell is not exported by the daemon (the sampler and
 `loom.forge.stage_dwell` / `loom.forge.stage_items` were deleted in #12316):
 dwell is a consumer's computation over the mirror's per-item label times.
-With `fleet.captainGauges` configured, the fleet captain reads shared forge
-facts for the fleet and dispatchers stand down while its published data is fresh
-(`loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`; see
-[`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12)).
-The same heartbeat can carry a forge fact (`queueBlocked`), so the snapshot's
-`loom:blocked` listing is made by the captain alone.
+The fleet-captain gauge producer (`fleet.captainGauges`, `loom.captain.*`) was
+removed in #11406: every host reads the snapshot's `loom:blocked` listing itself.
 Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 **Merge-chain re-date pressure (#10163).** Three gauges track the #8508
@@ -1049,6 +1045,27 @@ running / ready / blocked counts with a freshness badge (`idle` = recent tick,
 empty queue; `stale` = no new tick for 15 minutes; `no queue data` = the host
 never sent one), and a fleet-wide work queue listing every issue
 with its host, phase, waiting time, blocking reason and issue / PR links.
+
+### Which host and runtime ran a role tick? (#12342)
+
+Answer it from **traces**, not logs: a role-runner tick's identity lives on its
+`loom.role_attempt` span, and a tick may emit no log row at all (a logs query
+that returns only unrelated rows, as in the klayout-tools#3202 report, is a
+wrong-signal query, not necessarily a missing attribute). Filter spans on
+`name = loom.role_attempt` with `loom.role`, `loom.repo` and the time window.
+Each such span carries, at open:
+
+| Key | Meaning |
+|---|---|
+| `host.name` / `host.id` | Resource attributes, from the envelope's host id (#10977) |
+| `loom.daemon.version` / `.revision` | the build, stamped on every span by the journal |
+| `loom.runtime`, `loom.engine` | the admitted runtime and its engine (`codex` / `claude`); no engine for any other runtime |
+| `loom.session.container`, `loom.session.image_digest` | only when the tick ran in a session container: its name and the image ID (`sha256:…`) the session reconciler last observed (no Docker call; absent when there is no fresh snapshot) |
+| `loom.pr_number` / `loom.issue` | the tick's target, at close, when one is known |
+
+A host-process run carries no container keys: unknown is absent, never zero.
+A sweep-dispatched Judge or Doctor has no `loom.role_attempt`; read its
+`loom.phase` span, which carries the PR through the sweep.
 
 ## 3d. Agent telemetry relay (Issue #10964)
 

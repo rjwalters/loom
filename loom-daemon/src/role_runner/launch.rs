@@ -39,6 +39,8 @@ pub(super) fn apply_role_observability(
     runtime: Option<&str>,
 ) -> Option<crate::observability::agent_relay::SessionLease> {
     use crate::telemetry::trace::store::{TRACEPARENT_ENV, W3C_TRACEPARENT_ENV};
+    // #12342: where the tick runs rides its span at open.
+    crate::observability::lifecycle::role_runtime::note_launch(cmd, runtime);
     let execution = crate::observability::lifecycle::role_command(cmd);
     if let Some(execution) = &execution {
         // #11855: where a won PR claim names this tick's PR.

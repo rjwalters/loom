@@ -7,6 +7,21 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12386**: feat: add host-local step session ledger with default-off resume
+- **Issue #11913** (closed): Session ledger and soft host affinity for resumed role steps
+- **PR #12383**: feat: report cgroup-derived live agent scopes in host.health
+- **Issue #12166** (closed): telemetry: export live loom-agent scopes and agent liveness so orphaned sweeps are visible
+- **PR #12380**: fix: unwrap command-prefix wrappers in the SQL DDL exec gate
+- **Issue #12237** (closed): SQL DDL guard: DB client behind time/nohup/timeout/xargs/sudo -u wrapper is no longer denied
+- **PR #12377**: docs: make Judge and Doctor sweep the PR for every instance of a defect class
+- **Issue #11340** (closed): Judge and Doctor: when a finding is one example of a class, sweep for the rest in the same pass
+- **PR #12374**: feat: discovery tier chain with per-repo worklist fallback, backstop pace and reserve handling
+- **PR #12370**: refactor: retire curator.backlogTarget and the backlog.level telemetry kind
+- **Issue #12077** (closed): curator.backlogTarget has no effect once the role-runner Curator is retired (#12000)
+- **PR #12333**: refactor: remove the fleet-captain gauge producer (W12)
+- **Issue #11406** (closed): captain gauges (W12) cover only the captain's registered workspaces, so stand-down saves ~nothing
+- **PR #12376**: fix: reword stacked-rebase comment and baseline forge calls to restore green main
+- **Issue #12373** (closed): main red: rebase-stacked-children.sh (#9808) fails rebase_guard callsite test and forge_inventory gate
 - **PR #12365**: chore(harness): track latest CLIs — codex 0.162.1→0.163.0 opencode 1.19.1→1.19.2
 - **PR #12366**: fix: define _sha256 helper in champion-epic Step 4 escalation block
 - **Issue #12356** (closed): champion-epic.md Step 4 escalation block uses _sha256 without defining it

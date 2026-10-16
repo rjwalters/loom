@@ -124,7 +124,10 @@ fn reader_root_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
 }
 
 /// The agent front's half: adopt [`FRONT_ROOT_ENV`] once per process. A
-/// no-op in the daemon, whose own root always wins.
+/// no-op in the daemon, whose own root always wins. A `loom-daemon
+/// <subcommand>` an agent session runs adopts it the same way
+/// ([`crate::forge_gateway::enable_cli_reads`], #12389), with the same
+/// private-directory check on every reader directory it would use.
 pub fn enable_front_readers() {
     if WORKSPACE_ROOT.get().is_none() {
         let _ = FRONT_ROOT.set(reader_root_from(std::env::var_os(FRONT_ROOT_ENV)));
