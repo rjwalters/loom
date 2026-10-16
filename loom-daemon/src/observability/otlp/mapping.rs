@@ -21,6 +21,7 @@ mod ops;
 mod outcome_facts;
 mod pass;
 mod pick_decision;
+mod prompt_tree;
 mod role_draw;
 mod scope_memory;
 mod session_output;
@@ -351,6 +352,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                     .push(kv_string(crate::observability::lifecycle::FAILURE_CLASS, class.clone()));
             }
             attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
+            // #11989: the prompt tree the session ran.
+            attributes.extend(prompt_tree::attributes(r.prompt.as_ref()));
             // #11906: a step-engine step, never a role-runner tick.
             if let Some(source) = &r.source {
                 attributes.push(kv_string("loom.role_tick.source", source.clone()));

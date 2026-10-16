@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use loom_daemon::forge_call_stats::ops;
 use loom_daemon::gh_invocation::AccessIntent;
-use loom_daemon::judge_backstop as backstop;
+use loom_daemon::judge_backstop::{self as backstop, CiRead, CiState};
 
 use super::{Ctx, Gh, Role, Row};
 
@@ -38,109 +38,20 @@ impl Gh {
         Some((open, head, labels))
     }
 
-    /// `sha`'s CI as the backstop sees it ([`ci_state`]).
+    /// `sha`'s CI as the backstop sees it ([`backstop::ci_state`]).
     pub(crate) fn ci_state(&self, sha: &str) -> CiState {
-        ci_state(sha, Utc::now(), |op, path| {
+        backstop::ci_state(sha, Utc::now(), |kind, path| {
+            let (name, op) = match kind {
+                CiRead::CheckRuns => ("pr_lease.checks_pending", ops::CI_CHECK_RUNS_FOR_SHA),
+                CiRead::CommitStatus => ("pr_lease.commit_status", ops::CI_COMMIT_STATUS),
+            };
             let out = self
-                .inv(op, AccessIntent::Read, ops::CI_CHECK_RUNS_FOR_SHA)
-                .args(["api", path])
+                .inv(name, AccessIntent::Read, op)
+                .args(["api", &format!("repos/{{owner}}/{{repo}}/{path}")])
                 .run();
             serde_json::from_slice(&out.ok_output()?.stdout).ok()
         })
     }
-}
-
-/// A head's CI as the release reads it (#11972).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CiState {
-    /// Something still pending started inside the exemption window
-    /// ([`backstop::pending_exempts`]).
-    Young,
-    /// Something is still pending, but every pending run or status is past
-    /// the window or has no start stamp: CI that is stuck, not settling.
-    Stuck,
-    /// Nothing pending was read: CI concluded (or could not be read).
-    Settled,
-}
-
-impl CiState {
-    /// Whether a Judge pass that ended without a verdict at this CI is
-    /// exempt from the no-verdict record. By default only young pending CI
-    /// exempts. A pass that said it stood down for pending CI
-    /// (`--skip-reason ci-pending`) is also exempt once CI has settled since
-    /// (the race #11972 fixes), but never on stuck CI: `forge wait-checks`
-    /// has no age cap, so stuck CI would exempt every pass, and the PR
-    /// planner serves exactly those PRs (#12003); recording them keeps the
-    /// loop bounded.
-    #[must_use]
-    pub(crate) fn exempts(self, skipped_for_pending_ci: bool) -> bool {
-        match self {
-            Self::Young => true,
-            Self::Settled => skipped_for_pending_ci,
-            Self::Stuck => false,
-        }
-    }
-}
-
-/// `sha`'s [`CiState`], read through `get(op, path)`: every page of its check
-/// runs, up to [`backstop::MAX_CHECK_RUN_PAGES`], then its legacy commit
-/// statuses (#11903). Stops at the first read that is [`CiState::Young`], so
-/// the usual cost is one call; an unreadable read contributes nothing.
-pub(crate) fn ci_state(
-    sha: &str,
-    now: DateTime<Utc>,
-    mut get: impl FnMut(&'static str, &str) -> Option<serde_json::Value>,
-) -> CiState {
-    let base = format!(
-        "repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page={}",
-        backstop::CI_PAGE
-    );
-    let mut stuck = false;
-    let mut read = 0;
-    for page in 1..=backstop::MAX_CHECK_RUN_PAGES {
-        let path = if page == 1 {
-            base.clone()
-        } else {
-            format!("{base}&page={page}")
-        };
-        let Some(v) = get("pr_lease.checks_pending", &path) else {
-            break;
-        };
-        let pending = backstop::pending_check_runs(&v);
-        if backstop::pending_exempts(&pending, now) {
-            return CiState::Young;
-        }
-        stuck |= !pending.is_empty();
-        read += backstop::check_runs_listed(&v);
-        if !backstop::more_check_runs(&v, read) {
-            break;
-        }
-    }
-    let status =
-        format!("repos/{{owner}}/{{repo}}/commits/{sha}/status?per_page={}", backstop::CI_PAGE);
-    if let Some(v) = get("pr_lease.commit_status", &status) {
-        let pending = backstop::pending_statuses(&v);
-        if backstop::pending_exempts(&pending, now) {
-            return CiState::Young;
-        }
-        stuck |= !pending.is_empty();
-    }
-    if stuck {
-        CiState::Stuck
-    } else {
-        CiState::Settled
-    }
-}
-
-/// Whether `sha`'s CI is still pending young enough to exempt a pass: its
-/// [`ci_state`] is [`CiState::Young`].
-#[cfg(test)]
-pub(crate) fn ci_pending(
-    sha: &str,
-    now: DateTime<Utc>,
-    get: impl FnMut(&'static str, &str) -> Option<serde_json::Value>,
-) -> bool {
-    ci_state(sha, now, get) == CiState::Young
 }
 
 /// The fields a Judge release appends to its marker: the no-verdict record
@@ -228,6 +139,29 @@ impl Ctx {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// [`backstop::ci_state`] with `Gh::ci_state`'s op names and full paths.
+    fn ci_state(
+        sha: &str,
+        now: DateTime<Utc>,
+        mut get: impl FnMut(&str, &str) -> Option<serde_json::Value>,
+    ) -> CiState {
+        backstop::ci_state(sha, now, |kind, path| {
+            let op = match kind {
+                CiRead::CheckRuns => "pr_lease.checks_pending",
+                CiRead::CommitStatus => "pr_lease.commit_status",
+            };
+            get(op, &format!("repos/{{owner}}/{{repo}}/{path}"))
+        })
+    }
+
+    fn ci_pending(
+        sha: &str,
+        now: DateTime<Utc>,
+        get: impl FnMut(&str, &str) -> Option<serde_json::Value>,
+    ) -> bool {
+        ci_state(sha, now, get) == CiState::Young
+    }
 
     const HEAD: &str = "3333333333333333333333333333333333333333";
 

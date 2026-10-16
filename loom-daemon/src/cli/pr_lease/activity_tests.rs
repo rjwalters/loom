@@ -278,6 +278,8 @@ fn ctx(dir: &Path, me: Identity) -> Ctx {
         now: Utc::now,
         manage_renewer: false,
         lease_file: None,
+        // #12252: these tests never take the --step re-check path.
+        step_verify_backoff: &[],
     }
 }
 

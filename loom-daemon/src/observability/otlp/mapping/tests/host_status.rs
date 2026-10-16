@@ -86,7 +86,7 @@ fn an_empty_record_produces_no_gauges() {
     r.filtered.clear();
     r.volumes.clear();
     let batch = vec![envelope("host-s", TelemetryRecord::HostStatus(r))];
-    let empty = build_metrics_request(&batch).map_or(true, |req| {
+    let empty = build_metrics_request(&batch).is_none_or(|req| {
         req.resource_metrics
             .iter()
             .all(|rm| rm.scope_metrics.iter().all(|sm| sm.metrics.is_empty()))

@@ -188,3 +188,8 @@ fn the_cli_binary_under_test_exists() {
         "CARGO_BIN_EXE_loom-daemon did not resolve to a real file: {path:?}"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

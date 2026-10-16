@@ -359,3 +359,8 @@ fn publish_refuses_a_file_it_did_not_stage() {
     assert!(new_src.exists(), "a file that is not ours must not be removed");
     assert_eq!(std::fs::read(host.dest()).unwrap(), old_body);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -177,6 +177,9 @@ pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
+/// Fleet discovery (#12306): one snapshot of what work exists per step tick,
+/// from the mirror's worklist or per-repo listings.
+pub mod discovery;
 pub mod disk_admission;
 pub mod disk_footprint;
 pub mod disk_full_halt;
@@ -417,6 +420,7 @@ pub mod target_dir_gc;
 pub mod target_orphan_reclaim;
 /// Per-task liveness heartbeats for the daemon's long-running loops (Issue
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
+pub mod task_dump;
 pub mod task_liveness;
 pub mod telemetry;
 pub mod telemetry_join;

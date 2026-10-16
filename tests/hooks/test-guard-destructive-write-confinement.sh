@@ -2471,6 +2471,42 @@ assert_deny "write-confinement (#6968 control): cp with an embedded-apostrophe s
 
 rm -rf "$WT5674_REPO"
 
+# --- #12285: literal loop variable under a literal `cd /tmp/<dir>` -----------
+assert_allow "write-confinement (#12285): for-loop var write under cd /tmp/probe -> allow" \
+    'cd /tmp/probe && for name in a b; do echo x > "$name.gds"; done' "$WT_REPO"
+assert_allow "write-confinement (#12285): \${name} form -> allow" \
+    'cd /tmp/probe && for name in a b; do echo x > "${name}.gds"; done' "$WT_REPO"
+assert_allow "write-confinement (#12285): literal name=a assignment -> allow" \
+    'cd /tmp/probe && name=a && echo x > "$name.gds"' "$WT_REPO"
+assert_allow "write-confinement (#12285): unquoted target -> allow" \
+    'cd /tmp/probe && for name in a b; do echo x > $name.gds; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): absolute loop value stays denied" \
+    "cd /tmp/probe && for n in $WT_REPO/x; do echo x > \"\$n.gds\"; done" "$WT_REPO"
+assert_deny "write-confinement (#12285 control): loop value with .. stays denied" \
+    'cd /tmp/probe && for n in ../x; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): loop value with / stays denied" \
+    'cd /tmp/probe && for n in a/b; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): var with no same-command assignment stays denied" \
+    'cd /tmp/probe && echo x > "$name.gds"' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): \$var/ directory component stays denied" \
+    'cd /tmp/probe && for n in a b; do echo x > "$n/f.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): cd target with \$ stays denied" \
+    'cd /tmp/$D && for n in a b; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): cd target with .. stays denied" \
+    'cd /tmp/../x && for n in a b; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): cwd at the checkout itself (under /tmp here) stays denied" \
+    "cd $WT_REPO && for n in a b; do echo x > \"\$n.gds\"; done" "$WT_REPO"
+assert_deny "write-confinement (#12285 control): write preceding the cd stays denied" \
+    'for n in a b; do echo x > "$n.gds"; done; cd /tmp/probe' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): ln -s in the command stays denied" \
+    'cd /tmp/probe && ln -s /repo/x link && for n in a b; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): var rebound by read stays denied" \
+    'cd /tmp/probe && read n && echo x > "$n.gds"' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): second non-literal binding stays denied" \
+    'cd /tmp/probe && for n in a b; do n=$(pwd); echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#12285 control): loop value from \$(...) stays denied" \
+    'cd /tmp/probe && for n in $(ls); do echo x > "$n.gds"; done' "$WT_REPO"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 

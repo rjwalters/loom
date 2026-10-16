@@ -101,6 +101,15 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from config at the start of every work-finder tick (#12074) —
     // `step_dispatch::gather_budget::begin_tick`, never cached.
     ("autonomous.workFinder.tickDeadlineSecs", Reloadability::Live),
+    // Read from config at every work-finder tick (#12256) —
+    // `step_dispatch::gather_budget::gather_concurrency`, never cached.
+    ("autonomous.workFinder.gatherConcurrency", Reloadability::Live),
+    // Read from config at every work-finder tick (#12306) —
+    // `discovery::BackendKind::for_root`, never cached.
+    ("autonomous.workFinder.discovery", Reloadability::Live),
+    // Read from config at every work-finder tick (#12298) —
+    // `step_dispatch::gather_budget::spawn_concurrency`, never cached.
+    ("autonomous.workFinder.spawnConcurrency", Reloadability::Live),
     // Read from the workspace's effective config on every landed pre-filter
     // call (#12205) — `work_finder::landed_prefilter::prefilter_enabled`, never cached.
     ("autonomous.workFinder.landedPrefilter", Reloadability::Live),

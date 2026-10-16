@@ -3192,6 +3192,10 @@ pub fn spawn_multi_work_finder_task(
             }
 
             let tick_started = chrono::Utc::now();
+            // #12256: the tick's forge calls are children of its span.
+            let tick_parent = crate::gh_invocation::telemetry::enter_parent(Some(
+                crate::observability::ops::dispatch::tick_context(tick_started),
+            ));
             // #11909: the step tick is the only item dispatch path.
             let report = step_driver.tick(&crate::step_dispatch::driver::TickInputs {
                 pool: &pool,
@@ -3206,7 +3210,15 @@ pub fn spawn_multi_work_finder_task(
                 saturation_held,
                 limits: (max_concurrent_per_repo, ram_budget, disk_budget).into(),
                 deadline: Some(tick_deadline),
+                gather_concurrency: crate::step_dispatch::gather_budget::gather_concurrency(
+                    &fallback_root,
+                ),
+                spawn_concurrency: crate::step_dispatch::gather_budget::spawn_concurrency(
+                    &fallback_root,
+                ),
+                discovery: crate::discovery::BackendKind::for_root(&fallback_root),
             });
+            drop(tick_parent);
             drop(read_scope);
 
             // Publish before any logging so `loom-daemon health` sees the same

@@ -25,6 +25,11 @@
 //! unchanged issue parks it on `loom:blocked` + a `no-op hold` park record,
 //! which the step draw passes (`Blocked`) until its fingerprint changes.
 //!
+//! The ledger's runs and windows are mirrored to [`STEP_LEDGER_FILE`] in the
+//! workspace's logs directory after every change and reloaded when the
+//! registry is built (#12251), so a restart or roll keeps the repeat cap's
+//! history and this host's own windows.
+//!
 //! Whenever the repeat cap arms, its window is broadcast like any other,
 //! except a refusal's: a pool gate or a claim race is this host's own, so a
 //! `Refused` outcome's window stays local (#11909).
@@ -35,9 +40,13 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use super::{host_identity, SweepRegistry, LANDED_COOLDOWN};
+
+/// The ledger's durable part in the workspace's logs directory (#12251).
+pub const STEP_LEDGER_FILE: &str = "step-ledger.json";
 use crate::peer_claims::{self, ClaimAd};
 use crate::step_dispatch::outcome_ledger::{
-    CooldownCause, Effect, LedgerCounters, OutcomeClass, Recorded, StepCooldowns, StepOutcome,
+    CooldownCause, Effect, LedgerCounters, OutcomeClass, PersistedPair, Recorded, StepCooldowns,
+    StepOutcome,
 };
 use crate::step_dispatch::reeval_ladder::{self, BodyForge};
 use crate::step_role::StepRole;
@@ -140,9 +149,78 @@ impl SweepRegistry {
             self.broadcast_step_cooldown(item, step, now);
         }
         let cooling_until = self.step_ledger.cooling_until(item, step, now);
+        self.persist_step_ledger();
         Recorded {
             cooling_until,
             ..rec
+        }
+    }
+
+    /// A Builder step on `item` was refused because the issue's work already
+    /// landed (#12251, `work_finder::landed_prefilter::landed_at_spawn`): the
+    /// issue's landed cooldown (fleet-wide, every consumer) and a
+    /// [`LANDED_COOLDOWN`] Builder window on `(item, builder)`, broadcast, so
+    /// no host draws the Builder again while Curator decides. Curator's
+    /// verdict on the item lifts the window everywhere, as every verdict does.
+    pub fn hold_landed_builder(&mut self, item: u32) {
+        let now = Utc::now();
+        self.arm_landed_cooldown(item, LANDED_COOLDOWN);
+        let until = now
+            + chrono::Duration::from_std(LANDED_COOLDOWN)
+                .unwrap_or_else(|_| chrono::Duration::hours(6));
+        self.step_ledger
+            .arm(item, StepRole::Builder, until, CooldownCause::Landed, now);
+        self.broadcast_step_cooldown(item, StepRole::Builder, now);
+        self.persist_step_ledger();
+    }
+
+    fn step_ledger_path(&self) -> std::path::PathBuf {
+        self.config.logs_dir().join(STEP_LEDGER_FILE)
+    }
+
+    /// Reload the ledger's durable part (#12251) from the workspace's logs
+    /// directory: called once, when the registry is built. A missing or
+    /// unreadable file is an empty ledger, as before #12251.
+    pub(super) fn restore_step_ledger(&mut self) {
+        let path = self.step_ledger_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let pairs: Vec<PersistedPair> = match serde_json::from_str(&raw) {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                log::warn!("step_ledger: ignoring unreadable {}: {e}", path.display());
+                return;
+            }
+        };
+        let count = pairs.len();
+        self.step_ledger.restore(pairs, Utc::now());
+        self.step_ledger_persisted = raw;
+        if count > 0 {
+            log::info!(
+                "step_ledger: restored {count} (item, step) pair(s) from {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Mirror the ledger's durable part to disk (#12251), skipped when it is
+    /// unchanged. Best-effort: a failed write leaves the last good file.
+    fn persist_step_ledger(&mut self) {
+        let Ok(json) = serde_json::to_string(&self.step_ledger.persisted(Utc::now())) else {
+            return;
+        };
+        if json == self.step_ledger_persisted {
+            return;
+        }
+        let path = self.step_ledger_path();
+        let tmp = path.with_extension("json.tmp");
+        let written = std::fs::create_dir_all(self.config.logs_dir())
+            .and_then(|()| std::fs::write(&tmp, &json))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        match written {
+            Ok(()) => self.step_ledger_persisted = json,
+            Err(e) => log::debug!("step_ledger: could not persist {}: {e}", path.display()),
         }
     }
 
@@ -208,6 +286,7 @@ impl SweepRegistry {
     /// Drop the ledger's lapsed entries (each reaper tick).
     pub fn prune_step_ledger(&mut self) {
         self.step_ledger.prune(Utc::now());
+        self.persist_step_ledger();
     }
 
     /// A verdict changed `item`'s state: drop every peer copy of its step

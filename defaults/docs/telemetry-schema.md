@@ -1328,6 +1328,7 @@ gradeable by a model or prompt experiment.
 | `tokens_by_model` | array | no | Same grouped, raw (not cost-weighted) shape as `sweep.outcome`'s `tokens_by_model`, summed from the tick's own transcripts. |
 | `models_used` | string array | no | The distinct model ids in `tokens_by_model`, sorted and deduped — "did this tick's session escalate past the model it was launched with?" |
 | `actions` | object | no | Forge-mutating work observed in the transcripts: `issues_labeled`, `prs_merged`, `comments_posted`. |
+| `prompt` | object | no | The checkout the session read its `/loom:<role>` prompt from, as it stood immediately before the spawn (#11989): `commit` (HEAD, full SHA), `loom_version` (the working tree's `.loom/install-metadata.json`), `commits_behind` (HEAD's distance behind the clone's `origin/<default>`) and `on_branch` (`false` for a detached HEAD); each inner key is absent when it cannot be read. Absent on a tick that never resolved a launch. OTLP: `loom.prompt.commit`, `loom.prompt.loom_version`, `loom.prompt.commits_behind`, `loom.prompt.on_branch`, so a role running stale prompts is `loom.prompt.commits_behind > 0`. Additive, no `schema_version` bump. |
 | `source` | string | no | `step` when a step-engine step ran, not a role-runner tick (#11906). Mapped to `loom.role_tick.source`; absent on a role tick. Additive. |
 | `sweep_id` | string | no | The step's sweep id (`step-<role>-<item>-<ts>`), with `source`. Mapped to `loom.sweep_id`. |
 
@@ -2026,6 +2027,55 @@ large `gather_ms`, not a silent host. Every work-finder tick body also logs
 `work_finder: tick N start` at INFO, so a tick that never reaches its
 dispatch line can be placed in the host log.
 
+Since #12256 these four keys are also on the export allowlist (they were
+emitted but dropped before it), and the tick span records where its wall
+time went, all in milliseconds unless noted (absent when no step tick ran):
+
+| Attribute | Meaning |
+|---|---|
+| `loom.dispatch.phase.listing_ms` | The gather's forge half: item and open-PR listings, hold markers, blocker states, the landed pre-filter, CI at Judge heads. Runs `gather_concurrency` repos at once |
+| `loom.dispatch.phase.filter_ms` | Stage-entry lookups (events reads, budgeted per tick), weighing and pool shaping. Serial, in walk order |
+| `loom.dispatch.phase.draw_ms` | The draw loop outside spawns |
+| `loom.dispatch.phase.spawn_ms` | Time inside spawns: resolvers and containment, the pre-claim, the claim flip and lease comment, the spawn and the account-selection poll |
+| `loom.dispatch.spawn_attempts` | Spawn attempts the draw made, spawned or refused (count) |
+| `loom.dispatch.gather_concurrency` | How many repos the listings read at once (`autonomous.workFinder.gatherConcurrency`) (count) |
+
+Since #12298 the draw spawns up to `spawn_concurrency` steps at once, one per
+repo, so `phase.spawn_ms` is the wall time of its spawn rounds. The tick span
+also splits the time inside spawns by sub-phase, **summed over attempts** (so
+with concurrent spawns they can add up to more than `phase.spawn_ms`):
+
+| Attribute | Meaning |
+|---|---|
+| `loom.dispatch.spawn_concurrency` | How many spawns a round ran at once (`autonomous.workFinder.spawnConcurrency`) (count) |
+| `loom.dispatch.phase.spawn_resolve_ms` | The role's resolvers: the roll gate, runtime admission, the pool preflight, containment |
+| `loom.dispatch.phase.spawn_claim_ms` | The claim: the item's lock and peer advertisement, the pre-claim subprocess (`lease pr claim`), or a Builder's label flip and lease comment |
+| `loom.dispatch.phase.spawn_launch_ms` | The launch: the second roll gate, the dispatch stagger and the child's spawn |
+| `loom.dispatch.spawn_hold` | Why the draw stopped spawning before its slots were filled: `rate_limit_breaker` when the shared GitHub rate-limit breaker tripped mid-tick (checked before each round's batch). Absent when it never stopped |
+| `loom.dispatch.phase.spawn_account_ms` | The account-selection poll (up to 5 s per spawn) and recording the step |
+
+Since #12306 the tick also records what its discovery snapshot cost and
+covered (the worklist rows are absent in Direct mode, never a 0):
+
+| Attribute | Meaning |
+|---|---|
+| `loom.discovery.backend` | `mirror` (one worklist read) or `direct` (per-repo listings), from `autonomous.workFinder.discovery` |
+| `loom.discovery.repos` | Repos in the snapshot (Mirror: every repo the key may read; Direct: repos listed this tick) (count) |
+| `loom.discovery.items` | Open issues and PRs in the snapshot (count) |
+| `loom.discovery.forge_reads` | Per-repo forge listing calls made for discovery. `0` in Mirror mode. Per-item gate reads (hold markers, CI at a Judge head) are not listings and are not counted (count) |
+| `loom.discovery.worklist_latency_ms` | The `GET /v1/mirror/worklist` round trip (Mirror only; milliseconds) |
+| `loom.discovery.not_modified` | The worklist answered `304` and the previous snapshot was reused (Mirror only) |
+| `loom.discovery.reused_previous` | The worklist request failed and the previous snapshot stood in; no forge fallback (Mirror only) |
+| `loom.discovery.stale_repos` | Repos whose newest watermark evidence is older than `forge.mirror.maxStalenessSecs`. They are served anyway (Mirror only; count) |
+| `loom.discovery.oldest_watermark_age_secs` | Age of the stalest repo's newest watermark evidence (Mirror only; seconds) |
+
+The `invoke github` spans the tick's own thread and its gather workers open
+are children of the `loom.dispatch.tick` span (`context_source=parent`).
+Before #12256 each was the root of its own trace, so which calls a tick waited
+on could not be read from the trace. Forge calls made in a separate process,
+such as the pre-claim's `loom-daemon lease pr claim`, are still separate
+traces.
+
 #### `loom.dispatch.disposition` (Issue #9222): per-issue "why is it waiting"
 
 Every ready-queue row the work finder ranked on its most recent tick
@@ -2126,7 +2176,7 @@ GitHub rate limit (Issue #10022):
 | `forge.reader.withdrawn` span | instant span, own root trace (derived from the App, owner, resource and the instant) | `forge.reader.app` (the reader App id), `forge.reader.owner` (lowercased; `-` for an App-wide withdrawal), `forge.reader.resource` (`core`, `graphql`, `search`, `all`, or `app` for an App-wide withdrawal), `forge.reader.until` (RFC 3339), `forge.reader.source` (`header`, `probe` or `default`: where the end came from), `forge.reader.secondary` (`true` for a secondary limit) | one per reader withdrawal (W4-A). A rate limit withdraws only the refused `(owner, resource)` bucket; a secondary limit or a refused credential withdraws that owner's `all`; a mint or key failure, or any failure under `LOOM_READ_ROUTING=legacy`, withdraws the App (`app`). A per-repo coverage withdrawal emits nothing |
 | `forge.reader.spill` span | instant span, own root trace (derived from the repo, resource, home reader, mode and instant) | `forge.spill.owner_repo`, `forge.spill.resource` (`core` / `graphql` / `search`), `forge.spill.from` (home reader App id), `forge.spill.to` (target reader App id, or `home` when none has headroom and on release), `forge.spill.mode` (`partial` / `full` / `off`), `forge.spill.until` (RFC 3339 release instant) | one per read-pool spill-latch transition (W4-B, [daemon-reference](daemon-reference.md) `forge.readPool.routing`): engaged when the home bucket is projected at or above `spillProjectedPct` / `spillFullPct` or is withdrawn, released at the home bucket's reset; one more when a held latch re-picks a target that was withdrawn, went stale or reached `spillFullPct` (current mode, new `to`). A few per repo per day is normal; a steady stream means the pool is short of readers |
 | `invoke github` span | one per `gh` facade execution; child of the caller's span (or `LOOM_TRACEPARENT`), else its own root (derived per [`trace-identity.md`](trace-identity.md)) | process truth: `github.operation`, `github.access_intent`, `github.target`, `github.outcome` (`ok`, `exit_nonzero`, `signaled`, `timeout`, `spawn_failed`, `collect_failed`, `routing_refused`, `routing_blocked`, `adapter_unavailable`), `github.exit_code`, `github.invocation`, `github.launcher`, `github.api`, `context_source`. What GitHub billed (#10343): `github.http.status` (`200`, `304`, `403`, … or `unknown`), `github.http.not_modified` (`true`/`false`, `unknown` without a status), `github.http.requests` (pages of a `--paginate --include` call, `1` for one `--include` block, `2` for `run download`, `0` when nothing was sent, else `unknown`), `github.http.source` (`headers`, `stderr`, `none`), `github.billing` (`ok`, `not_modified`, `rate_limited`, `secondary_limited`, `error`, `not_sent`), and the bucket join keys `github.resource`, `github.account`, `github.cred_owner` (`-` when not an App installation), `github.role` (`reader`, `writer`, `writer-fallback`). Since #10752: `github.caller` (the daemon pass whose caller scope the call ran in, e.g. `stale_blocked_release`; absent outside one), `github.repo` (the `owner/repo` the ledger booked the call under) and, on a write, `github.number` (the issue/PR number(s) its argv targets). Since #11407: `github.route` (a `gh api` endpoint as a template from gh-shim's finite table, e.g. `/repos/{owner}/{repo}/pulls/{n}/reviews`, query dropped; `/graphql`; `(unknown)` for a path the table lacks; `(other-host)`; `(none)` for no endpoint; `(porcelain)` for a non-`api` command), `http.request.method` (`gh api` only: `GET`, `POST`, … or `_OTHER`) and `github.command` (the gh command group, e.g. `api`, `pr view`, `issue list`; in the agent `gh` front, the agent's command rather than the `gh api` the front sent). No raw path, query or argument value is recorded | one per execution (a reader-routed read retried on the writer is two). The status comes from the `--include` status line, else `gh`'s `(HTTP NNN)` / `HTTP NNN:` stderr marker, else it is `unknown` — never guessed; a passthrough run is always `unknown`. A `304` is `github.billing=not_modified` while `github.outcome=exit_nonzero` (gh exits non-zero on it) |
-| `github.ratelimit.remaining` | `Gauge` | `{request}`; labels `resource`, `account`, `owner`, `role` (+ `installation` on a bucket point) | requests left in one bucket. On an App host every point is a bucket-book reading (below); the 60 s tick's cached `gh api rate_limit` reading (no forge call of its own since #12204) is booked there as the `(writer account, workspace owner, resource)` bucket (`role=writer`), never exported bare. On an ambient-login host the probe (falling back to the breaker's last trip-time reading while its reset windows are still open) is exported with `owner="-"`, `role="ambient"`; an unresolvable `account` stays `unknown` and is retried at most every 20 min, never while the breaker is suppressing |
+| `github.ratelimit.remaining` | `Gauge` | `{request}`; labels `resource`, `account`, `owner`, `role` (+ `installation` on a bucket point) | requests left in one bucket. On an App host every point is a bucket-book reading (below); the 60 s tick's cached `gh api rate_limit` reading (no forge call of its own since #12204) is booked there as the `(writer account, workspace owner, resource)` bucket (`role=writer`), never exported bare. On an ambient-login host the gauge appears only once the process-wide budget cache holds a reading (filled by a cold-start budget check or a breaker trip) or the breaker has a trip-time reading with open reset windows (it falls back to that); it is then exported with `owner="-"`, `role="ambient"`; an unresolvable `account` stays `unknown` and is retried at most every 20 min, never while the breaker is suppressing |
 | `github.ratelimit.used` | `Gauge` | `{request}`; labels as above | requests spent this window; absent when the response carried no `used`. Monotone only within one window (`github.ratelimit.reset`): several hosts export one bucket with readings of different ages, and a pre-#10571 daemon's label set can carry two interleaved windows, so GitHub's bill is each window's high-water mark (`github-shadow.sql`), never Σ of drops-as-resets |
 | `github.ratelimit.reset` | `Gauge` | `s` (Unix epoch seconds); labels as above | when the bucket's window resets |
 | `github.ratelimit.breaker_skips` | delta `Sum` | `{pass}`; label `reason` | job passes skipped because the breaker was suppressing, flushed on the 60 s tick |
@@ -2139,6 +2189,7 @@ GitHub rate limit (Issue #10022):
 | `loom.stage_entry.lookups` | delta `Sum` | `{lookup}`; labels `repo`, `kind` | stage-entry times the step engine's provider (`step_dispatch::stage_entry`, #11897) looked up since the previous point, flushed on the same tick, by the source that answered in `kind`: `mirror` (the state mirror's per-item `labels_at`), `events` (the issue's `labeled` events, from the provider's persisted cache or one budgeted read), `created` (the item's creation time) or `none` (not even that). The `mirror` + `events` share is the stage-age coverage the step-dispatch design gates on (#11894). Nothing consumes the provider yet, so the series is empty until the item draw lands. Past 1024 series a new one is counted under `repo` = `overflow`. Accumulated only while an ops sink is registered |
 | `loom.feed.completions` | delta `Sum` | `{completion}`; labels `kind`, `outcome` | public-feed `completion` envelopes the safehouse narration sink built since the previous point (#12152), flushed on the same tick, by the trigger that found the merge in `kind`: `sweep_exit` (an issue sweep's `SweepExited`), `step` (a Champion merge step's `step.item.{N}.ended`) or `reconcile` (the periodic merge-reconciliation pass); `outcome` is `narrated`, or `seeded` for a fresh host's first pass, which records merges without posting them (#4649). The direct measure of merged work reaching the feed: a step emits no `sweep.completed`, so since step dispatch (#12009) that record no longer tracks it. Accumulated only while an ops sink is registered |
 | `loom.feed.reconcile_passes` | delta `Sum` | `{pass}`; label `outcome` | merge-reconciliation ticks of the narration sink that had a workspace to visit (#12152), by `outcome`: `ran` (the forge answered; the workspace's watermark advanced), `deferred` (the rate-limit breaker was cooling; the tick is not spent and the workspace catches up from its watermark later) or `failed` (the forge read failed; the watermark holds). Accumulated only while an ops sink is registered |
+| `loom.ci.queue_depth` | `Gauge` | `{run}`; label `repo` | workflow runs with `status == "queued"` in the page the CI telemetry poll fetched for the repo (#11993), one point per repo per cycle (`0` when none), counted from the run listing `poll_repo` already reads, so it adds no GitHub request. A run older than the rescan floor that is still queued is not counted. Fleet CI contention at that instant, beside the per-run `loom.ci.queued_ms` on `ci.run` / `ci.job` |
 
 `resource` ∈ `core`, `graphql` (`search` too on a bucket point). On an
 ambient-login host's points `account` is the validated `gh` login, else
@@ -2754,7 +2805,7 @@ Un-evaluated issues get no record by design (about 650 rows per tick).
 **Volume.** The step path emits one record per step end, no-ops included. The
 role-tick path emits one per marker or merge act. There is no heartbeat.
 
-**Gauge (D2).** `loom.forge.stage_items{state="pr_refused", reason}` counts open
+**Gauge (D2).** **Off by default** (#12203): the `pr_refused` points are emitted by the stage-dwell sampler, so they are absent unless `observability.stageDwell.enabled` is `true`. `loom.forge.stage_items{state="pr_refused", reason}` counts open
 `loom:pr` PRs on a still-current head that Champion is refusing, and
 `loom.forge.stage_oldest_age_seconds{state="pr_refused", reason, repo}` is
 `now - min(first_refused_at)`. The refusal store is per host (a host-local JSON

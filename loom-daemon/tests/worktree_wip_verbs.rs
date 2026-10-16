@@ -680,3 +680,8 @@ fn a_change_stash_create_cannot_see_fails_the_push_and_pop_still_restores() {
         "the captured tracked edit must come back"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

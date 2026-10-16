@@ -342,3 +342,8 @@ fn the_pr_head_oracle_and_its_fallback_agree() {
     f.advance_main(|d| write_exec(&d.join("scripts/version.sh"), "#!/usr/bin/env bash\n"));
     assert_eq!(agree("drift", &case(&f.local, "feature/plain", &head)), (0, String::new()));
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
