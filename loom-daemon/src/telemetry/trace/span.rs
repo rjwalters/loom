@@ -247,6 +247,10 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.effort"
                     | "loom.doctor_cycles"
                     | "loom.judge_verdict"
+                    // #12362: a Judge tick's found-work split.
+                    | "loom.found_work"
+                    | "loom.noop_reason"
+                    | "loom.head_sha"
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"

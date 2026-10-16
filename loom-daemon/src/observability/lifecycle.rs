@@ -677,17 +677,6 @@ fn checkpoint_observation(
     // The owned-start branch below overwrites this with `true`: there the
     // checkpoint completes an attempt whose begin Loom itself recorded.
     insert_worked(&mut metadata, Some(!SYNTHETIC_TIMING_SOURCES.contains(&source)));
-    if role == "judge" {
-        metadata.insert(
-            "loom.judge_verdict".into(),
-            if result == "success" {
-                "approved"
-            } else {
-                "rejected"
-            }
-            .into(),
-        );
-    }
     if let Some(attempt) = attempt {
         metadata.insert("loom.attempt".into(), attempt.to_string());
     }
@@ -1173,6 +1162,8 @@ pub struct RoleTrace {
     /// Why the tick failed, when it did (#10640) — the same class, code and
     /// message its root span closed with, for the story copies.
     pub failure: Option<RoleFailure>,
+    /// What a launched Judge tick did (#12362); `None` for any other role.
+    pub judge: Option<judge_tick::JudgeTick>,
 }
 
 /// Run one role tick under its `loom.role_attempt` root span — **if it
@@ -1222,6 +1213,8 @@ pub fn role_invocation_classified(
         let unlaunched = role_failure::for_unlaunched(&outcome, noted);
         return (outcome, None, unlaunched);
     };
+    // #12362: before the drain takes the journal; local reads only.
+    let judge = (role == "judge").then(|| judge_tick::observe(root, pr));
     let roll = roll_interruption::stopped(&span);
     let failure = role_failure::for_outcome(&outcome, noted).filter(|_| roll.is_none());
     let trace = Some(RoleTrace {
@@ -1229,6 +1222,7 @@ pub fn role_invocation_classified(
         execution: execution.clone(),
         started_at: span.active.record.started_at,
         failure: failure.clone(),
+        judge: judge.clone(),
     });
     let (result, _) = crate::role_tick_telemetry::classify(&outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -1247,8 +1241,26 @@ pub fn role_invocation_classified(
     if let Some(drawn) = drawn {
         close.extend(drawn);
     }
-    if let Some(pr) = pr {
-        close.insert(role_target::PR_NUMBER.into(), pr.to_string());
+    if let Some(judge) = &judge {
+        close.insert(judge_tick::FOUND_WORK.into(), judge.found_work.to_string());
+        if let Some(reason) = &judge.noop_reason {
+            close.insert(judge_tick::NOOP_REASON.into(), reason.clone());
+        }
+        if let Some(v) = judge.latest() {
+            close.insert(judge_tick::JUDGE_VERDICT.into(), v.verdict.clone());
+            if let Some(sha) = &v.head_sha {
+                close.insert(judge_tick::HEAD_SHA.into(), sha.clone());
+            }
+        }
+    }
+    // A claim or prompt names the PR; a verdict write names it when neither did.
+    if let Some(pr) = pr.map(|p| p.to_string()).or_else(|| {
+        judge
+            .as_ref()
+            .and_then(judge_tick::JudgeTick::verdict_pr)
+            .map(|p| p.to_string())
+    }) {
+        close.insert(role_target::PR_NUMBER.into(), pr);
     }
     let result = roll.map_or(result, |roll| {
         roll.apply(&mut close);
@@ -1258,6 +1270,7 @@ pub fn role_invocation_classified(
     (outcome, trace, None)
 }
 
+pub mod judge_tick;
 pub mod role_draw;
 mod role_failure;
 pub mod role_target;

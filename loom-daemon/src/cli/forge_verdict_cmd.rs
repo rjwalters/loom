@@ -17,6 +17,14 @@ fn verdict_or_exit(cmd: &str, verdict: &str) -> VerdictKind {
     })
 }
 
+/// The `ROLE_ACTIONS` word a verdict's label write journals as (#12362).
+const fn journal_action(kind: VerdictKind) -> &'static str {
+    match kind {
+        VerdictKind::Approved => "approved",
+        VerdictKind::ChangesRequested => "changes_requested",
+    }
+}
+
 /// The PR's label names, live (uncached). `None` when the read failed.
 fn read_labels(repo: &str, pr: u64, root: &Path) -> Option<Vec<String>> {
     let path = format!("repos/{repo}/issues/{pr}/labels?per_page=100");
@@ -135,7 +143,7 @@ pub(crate) fn verdict_reconcile(
 }
 
 /// `forge verdict-labels`.
-pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
+pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&str>) -> Result<()> {
     let kind = verdict_or_exit("verdict-labels", verdict);
     let root = super::forge_identity_cmd::workspace();
     let (add, remove) = gate::transition(kind);
@@ -174,6 +182,9 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
         None => vec!["the labels could not be re-read to verify the transition".to_string()],
     };
     if problems.is_empty() {
+        // Telemetry only (#12362): the verdict the run observed, from this
+        // write; no forge call.
+        loom_daemon::observability::pick_journal::record_verdict(pr, journal_action(kind), sha);
         println!("{} OK {}", gate::LABELS_SENTINEL, add.join(","));
         return Ok(());
     }

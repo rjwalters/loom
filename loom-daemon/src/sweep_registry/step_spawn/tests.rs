@@ -410,6 +410,7 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
         sweep_id: "step-champion_merge-8-1".into(),
         started_at: Utc::now() - chrono::Duration::seconds(30),
         outcome: RoleTickOutcome::Success,
+        step_outcome: Some(("noop".into(), "already_judged".into())),
         model: "opus".into(),
         effort: "high".into(),
     });
@@ -420,6 +421,10 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
     assert_eq!(records[0].model.as_deref(), Some("opus"));
     assert_eq!(records[0].source.as_deref(), Some(crate::telemetry::ROLE_TICK_SOURCE_STEP));
     assert_eq!(records[0].sweep_id.as_deref(), Some("step-champion_merge-8-1"));
+    // #12362: the class and reason `tick_outcome` collapses ride additively.
+    assert_eq!(records[0].step_class.as_deref(), Some("noop"));
+    assert_eq!(records[0].step_reason.as_deref(), Some("already_judged"));
+    assert_eq!(records[0].result, crate::telemetry::RoleTickResult::Success);
 }
 
 /// Review item 4: a step found dead at startup runs the step end too, so the

@@ -33,6 +33,7 @@ fn facts() -> TickFacts {
             execution,
             started_at,
             failure: None,
+            judge: None,
         },
         role: "judge".into(),
         ended_at: started_at + chrono::Duration::seconds(60),

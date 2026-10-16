@@ -49,6 +49,11 @@ pub(super) fn role_tick_outcome() -> TelemetryRecord {
         sweep_id: None,
         deferred_by: None,
         shard_owner: None,
+        found_work: None,
+        noop_reason: None,
+        verdicts: None,
+        step_class: None,
+        step_reason: None,
     })
 }
 
@@ -121,6 +126,11 @@ fn role_tick_outcome_omits_every_unobserved_field() {
         sweep_id: None,
         deferred_by: None,
         shard_owner: None,
+        found_work: None,
+        noop_reason: None,
+        verdicts: None,
+        step_class: None,
+        step_reason: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for key in [
@@ -300,4 +310,41 @@ fn role_tick_outcome_preference_tier_round_trips_and_older_records_still_parse()
     let parsed: RoleTickOutcomeRecord = serde_json::from_value(older).unwrap();
     assert_eq!(parsed.preference_tier, None);
     assert_eq!(parsed.preference_tap, None);
+}
+
+/// #12362: the Judge found-work split and the step class/reason are additive
+/// optional fields: they round-trip, are omitted when absent, and an older
+/// record still parses.
+#[test]
+fn role_tick_outcome_judge_and_step_fields_are_additive() {
+    let mut record = match role_tick_outcome() {
+        TelemetryRecord::RoleTickOutcome(r) => r,
+        other => panic!("fixture changed: {other:?}"),
+    };
+    let bare = serde_json::to_value(&record).unwrap();
+    for key in [
+        "found_work",
+        "noop_reason",
+        "verdicts",
+        "step_class",
+        "step_reason",
+    ] {
+        assert!(bare.get(key).is_none(), "{key} must be omitted when unobserved");
+    }
+    record.found_work = Some(false);
+    record.noop_reason = Some("no_claim_no_verdict".to_string());
+    record.verdicts = Some(vec![crate::telemetry::JudgeVerdictRecord {
+        pr_number: 9,
+        head_sha: Some("abc".to_string()),
+        verdict: "approved".to_string(),
+    }]);
+    record.step_class = Some("noop".to_string());
+    record.step_reason = Some("already_judged".to_string());
+    let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(value["found_work"], false, "false is an observation, not an absence");
+    assert_eq!(value["verdicts"][0]["pr_number"], 9);
+    let back: RoleTickOutcomeRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(back, record);
+    let parsed: RoleTickOutcomeRecord = serde_json::from_value(bare).unwrap();
+    assert_eq!(parsed.found_work, None);
 }

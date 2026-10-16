@@ -131,6 +131,7 @@ fn launched(execution: &str) -> crate::observability::lifecycle::RoleTrace {
         execution: execution.to_string(),
         started_at: chrono::Utc::now(),
         failure: None,
+        judge: None,
     }
 }
 

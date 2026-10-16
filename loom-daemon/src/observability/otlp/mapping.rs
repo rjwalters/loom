@@ -361,6 +361,27 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(sweep_id) = &r.sweep_id {
                 attributes.push(kv_string("loom.sweep_id", sweep_id.clone()));
             }
+            // #12362: a Judge tick's found-work split and verdicts, and a
+            // step's own outcome class/reason. Each absent when unobserved.
+            if let Some(found_work) = r.found_work {
+                attributes.push(kv_string("loom.found_work", found_work.to_string()));
+            }
+            if let Some(reason) = &r.noop_reason {
+                attributes.push(kv_string("loom.noop_reason", reason.clone()));
+            }
+            if let Some(verdicts) = r
+                .verdicts
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok())
+            {
+                attributes.push(kv_string("loom.role_tick.verdicts", verdicts));
+            }
+            if let Some(class) = &r.step_class {
+                attributes.push(kv_string("loom.role_tick.step_class", class.clone()));
+            }
+            if let Some(reason) = &r.step_reason {
+                attributes.push(kv_string("loom.role_tick.step_reason", reason.clone()));
+            }
             if let Some(models) = metadata::models(r.models_used.as_deref()) {
                 attributes.push(models);
             }
