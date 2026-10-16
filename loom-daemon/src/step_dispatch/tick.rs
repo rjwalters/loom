@@ -75,15 +75,23 @@ use crate::work_finder::{PriorityCandidate, TickReport};
 
 /// At most this many item draws fill one slot (design §4.2 step 4).
 pub const MAX_DRAWS_PER_SLOT: u32 = 8;
-/// At most this many passes in one tick (design §4.2 step 4).
-pub const MAX_PASSES_PER_TICK: u32 = 32;
+/// At most this many passes in one tick (design §4.2 step 4). Raised 32 -> 48
+/// once the tick could fill dozens of slots: with free draws spent, the
+/// remaining real refusals (`peer_active`, `backstop_hold`) used up 32 before
+/// the slots filled.
+pub const MAX_PASSES_PER_TICK: u32 = 48;
 
 /// At most this many `claim_lost` refusals in one tick are free (#12410):
 /// they spend no pass and no slot draw. Past it a loss is an ordinary pass,
 /// so a tick's draws stay bounded (`MAX_PASSES_PER_TICK` +
 /// `MAX_FREE_CLAIM_LOST_PER_TICK` refusals) while each loss still costs a
-/// claim subprocess.
-pub const MAX_FREE_CLAIM_LOST_PER_TICK: u32 = 16;
+/// claim subprocess. Raised 16 -> 128 as a stopgap while hosts have no shared
+/// claim channel: about 30-40% of a fleet's draws lose a race, and a tick that
+/// fills 40 slots made more than 16 losses, so the rest ended it on
+/// `pass_limit` with slots empty. The bound is still finite (48 + 128
+/// refusals), and an item is never drawn twice in a tick, so a tick also stops
+/// when its pool drains.
+pub const MAX_FREE_CLAIM_LOST_PER_TICK: u32 = 128;
 /// The pass reason of a second Champion merge in one repo in one tick.
 pub const PASS_MERGE: &str = "merge_in_flight";
 /// The spawn refusal of a pre-claim that could not be verified
