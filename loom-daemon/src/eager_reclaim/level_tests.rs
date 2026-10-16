@@ -1,4 +1,4 @@
-//! #11192: the level trigger, tier escalation, the empty-pass alert and
+//! #11192: the floor trigger (re-keyed by #12406), tier escalation, the empty-pass alert and
 //! backoff, and the cross-root idle-target pass on the scheduled path. A
 //! sibling of `eager_reclaim.rs`'s own `tests` module so that file stays
 //! under the file-size threshold.
@@ -15,26 +15,16 @@ use serial_test::serial;
 use super::*;
 
 const FLOOR: u64 = 20;
-const STEP: u64 = 10;
-const CEILING: usize = 12;
 const COOLDOWN: u64 = 600;
 
 fn t(secs: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
 }
 
-/// The disk term the work finder computes at the default 8 GB/worktree.
-fn disk_term(free: Option<u64>) -> usize {
-    free.map_or(usize::MAX, |gb| usize::try_from(gb / 8).unwrap())
-}
-
 fn reading(free: Option<u64>) -> TickReading {
     TickReading {
-        disk: disk_term(free),
-        configured_max: CEILING,
         free_gb: free,
         floor_gb: FLOOR,
-        step_gb: STEP,
     }
 }
 
@@ -98,7 +88,7 @@ fn orphan_report(root: &Path) -> TargetOrphanReport {
 
 // ===================================================================
 // A whole dispatch loop, simulated: trigger -> run_pass -> ledger ->
-// observe, on an injected clock, mirroring `EagerTrigger::tick`.
+// on an injected clock, mirroring `EagerTrigger::tick`.
 // ===================================================================
 
 struct Sim {
@@ -127,9 +117,6 @@ impl Sim {
     fn tick(&mut self, secs: i64, free: Option<u64>) {
         let now = t(secs);
         let r = reading(free);
-        let mut free_now = free;
-        let mut disk = r.disk;
-        let mut pass = None;
         if let Some(reason) = self.trigger.evaluate(&r) {
             let inputs = EagerReclaimInputs {
                 enabled: true,
@@ -169,96 +156,27 @@ impl Sim {
             let report = run_pass(Path::new("/repo"), &inputs, &passes);
             self.ledger.record(&report);
             if report.skipped.is_none() {
-                free_now = report.free_gb_after;
-                disk = disk_term(free_now);
-                self.ran.push((secs, reason, report.clone()));
+                self.ran.push((secs, reason, report));
             }
-            pass = Some(report);
         }
-        self.trigger
-            .observe(disk_axis_binds_cap_down(disk, CEILING), free_now, pass.as_ref());
     }
 }
 
 // ===================================================================
-// AC1: re-arms while the disk term keeps binding
+// The floor trigger (#12406)
 // ===================================================================
 
 #[test]
-#[serial]
-fn test_rearms_while_disk_keeps_binding_and_free_space_falls() {
-    // loom-worker-1, 2026-10-09: one pass at 08:59 left 79G free; the disk
-    // term (free/8 < ceiling 12) then bound on every tick. Edge-only
-    // triggering ran nothing more. Ticks 10+ minutes apart.
-    reset_idle_state_for_test();
-    let mut sim = Sim::new(EagerTrigger::after_pass(79));
-    for (i, free) in [79u64, 60, 40, 19].into_iter().enumerate() {
-        sim.tick(i64::try_from(i).unwrap() * 660, Some(free));
-    }
-    let fired: Vec<(i64, TriggerReason)> = sim.ran.iter().map(|(s, r, _)| (*s, *r)).collect();
-    assert_eq!(
-        fired,
-        vec![
-            (660, TriggerReason::FellSinceLastPass { from_gb: 79 }),
-            (1320, TriggerReason::FellSinceLastPass { from_gb: 60 }),
-            (1980, TriggerReason::BelowFloor),
-        ]
-    );
-    // The edge-only rule this replaces would have fired none of them.
-    assert!(!should_trigger(true, disk_term(Some(19)), CEILING));
-}
-
-#[test]
-#[serial]
-fn test_below_floor_fires_even_when_the_disk_term_does_not_bind() {
-    // A host whose ceiling is 2 never has the disk term bind above 16G free,
-    // but below the floor the pass is still due.
-    let trigger = EagerTrigger::default();
-    let r = TickReading {
-        disk: 2,
-        configured_max: 2,
-        free_gb: Some(17),
-        floor_gb: FLOOR,
-        step_gb: STEP,
-    };
-    assert_eq!(trigger.evaluate(&r), Some(TriggerReason::BelowFloor));
-}
-
-#[test]
-fn test_small_wobbles_do_not_fire() {
-    let trigger = EagerTrigger::after_pass(79);
-    assert_eq!(trigger.evaluate(&reading(Some(72))), None, "7G < the 10G step");
-    assert_eq!(
-        trigger.evaluate(&reading(Some(69))),
-        Some(TriggerReason::FellSinceLastPass { from_gb: 79 })
-    );
-    let no_step = TickReading {
-        step_gb: 0,
-        ..reading(Some(30))
-    };
-    assert_eq!(trigger.evaluate(&no_step), None, "a zero step disables the fall rule");
+fn test_fires_below_the_floor_only() {
+    let trigger = EagerTrigger;
+    assert_eq!(trigger.evaluate(&reading(Some(19))), Some(TriggerReason::BelowFloor));
+    assert_eq!(trigger.evaluate(&reading(Some(20))), None, "at the floor is not below it");
+    assert_eq!(trigger.evaluate(&reading(Some(500))), None);
 }
 
 #[test]
 fn test_unmeasurable_disk_never_fires() {
-    let trigger = EagerTrigger::after_pass(79);
-    assert_eq!(trigger.evaluate(&reading(None)), None);
-}
-
-#[test]
-fn test_fall_reference_is_a_high_water_mark_and_resets_off_binding() {
-    let mut trigger = EagerTrigger::after_pass(50);
-    // Space came back to 70 without a pass (a sweep finished): the fall is
-    // measured from 70 now, not from 50.
-    trigger.observe(true, Some(70), None);
-    assert_eq!(trigger.evaluate(&reading(Some(62))), None);
-    assert_eq!(
-        trigger.evaluate(&reading(Some(60))),
-        Some(TriggerReason::FellSinceLastPass { from_gb: 70 })
-    );
-    // The disk term stops binding: the next binding tick is an edge again.
-    trigger.observe(false, Some(120), None);
-    assert_eq!(trigger.evaluate(&reading(Some(90))), Some(TriggerReason::Edge));
+    assert_eq!(EagerTrigger.evaluate(&reading(None)), None);
 }
 
 // ===================================================================
@@ -543,101 +461,4 @@ fn test_log_line_names_the_trigger_and_the_tier() {
     assert!(line.starts_with("eager_reclaim:"), "{line}");
     assert!(line.contains("free space is below the floor"), "{line}");
     assert!(line.contains("tier 3 of 3"), "{line}");
-}
-
-// ===================================================================
-// Config
-// ===================================================================
-
-#[test]
-#[serial]
-fn test_resolve_fall_step_precedence() {
-    std::env::remove_var(EAGER_RECLAIM_FALL_STEP_ENV);
-    assert_eq!(resolve_fall_step_gb(&EagerReclaimConfig::default()), DEFAULT_EAGER_FALL_STEP_GB);
-    let config = EagerReclaimConfig {
-        fall_step_gb: Some(25),
-        ..EagerReclaimConfig::default()
-    };
-    assert_eq!(resolve_fall_step_gb(&config), 25);
-    std::env::set_var(EAGER_RECLAIM_FALL_STEP_ENV, "5");
-    assert_eq!(resolve_fall_step_gb(&config), 5);
-    std::env::set_var(EAGER_RECLAIM_FALL_STEP_ENV, "0");
-    assert_eq!(resolve_fall_step_gb(&config), 25, "zero falls through");
-    std::env::remove_var(EAGER_RECLAIM_FALL_STEP_ENV);
-}
-
-// ===================================================================
-// #11191 x #11192: the term re-probed after a pass is the admission term
-// ===================================================================
-
-/// The #11191 admission term for one `loom` workspace charged `charge_gb`,
-/// with `inflight` pending sweeps, on a volume with `free` GB (halt floor 3).
-fn admission_term(free: u64, charge_gb: u64, inflight: u32) -> usize {
-    use crate::disk_admission::{assess, ChargeSource, RepoCharge};
-    const NOW: i64 = 1_000_000;
-    let mut store = crate::disk_footprint::Store::default();
-    for n in 0..inflight {
-        let key = crate::disk_footprint::issue_key("loom", n);
-        crate::disk_footprint::record_pending(&mut store, &key, "loom", Some(n), NOW);
-    }
-    let charges = vec![RepoCharge {
-        repo: "loom".into(),
-        gb: charge_gb,
-        source: ChargeSource::Observed,
-    }];
-    assess(free, 3, &store, charges, 8, NOW, None).cap_term()
-}
-
-#[test]
-fn test_the_term_after_a_pass_is_the_admission_term_not_the_flat_one() {
-    // A pass below the floor leaves 40G free. Flat: 40 / 8 = 5 slots. With one
-    // 20G sweep in flight that has written nothing yet: 40 - 3 - 20 = 17G
-    // left, which fits no further 20G sweep, so the term is the 1 in flight.
-    let (report, _) = run_tiered(&[Some(15), Some(40)]);
-    assert_eq!(report.free_gb_after, Some(40));
-    let (flat, admission) = (disk_term(Some(40)), admission_term(40, 20, 1));
-    assert_eq!((flat, admission), (5, 1));
-
-    let mut before = reading(Some(15));
-    before.disk = admission_term(15, 20, 1);
-    let mut trigger = EagerTrigger::default();
-    let disk = trigger.settle(&before, Some(&report), || admission_term(40, 20, 1));
-    assert_eq!(disk, admission, "the cap is finalized on the post-reclaim admission term");
-    assert_eq!(trigger, EagerTrigger::after_pass(40));
-}
-
-#[test]
-fn test_the_edge_rearms_from_the_admission_term() {
-    // After the pass the flat term still binds (5 < 12) but admission does
-    // not: a light repo (1G charge), nothing in flight, 37 slots. The trigger
-    // must record "not binding", so the next binding tick is a fresh edge.
-    let (report, _) = run_tiered(&[Some(15), Some(40)]);
-    let mut before = reading(Some(15));
-    before.disk = admission_term(15, 1, 0);
-    let mut trigger = EagerTrigger::default();
-    let disk = trigger.settle(&before, Some(&report), || admission_term(40, 1, 0));
-    assert_eq!(disk, 37);
-    assert!(disk_axis_binds_cap_down(disk_term(Some(40)), CEILING));
-    assert_eq!(trigger, EagerTrigger::default(), "disarmed by the admission term");
-
-    // A heavy sweep is admitted: same 40G free, the admission term now binds.
-    let mut next = reading(Some(40));
-    next.disk = admission_term(40, 20, 1);
-    assert_eq!(trigger.evaluate(&next), Some(TriggerReason::Edge));
-    // Had the flat term been recorded, this tick would not have fired.
-    assert_eq!(EagerTrigger::after_pass(40).evaluate(&next), None);
-}
-
-#[test]
-fn test_no_reprobe_without_a_pass_that_ran() {
-    let r = reading(Some(79));
-    let unreachable = || -> usize { panic!("re-probed without a pass") };
-    let mut trigger = EagerTrigger::default();
-    assert_eq!(trigger.settle(&r, None, unreachable), r.disk);
-    assert_eq!(trigger, EagerTrigger::after_pass(79));
-
-    let (mut skipped, _) = run_tiered(&[Some(79)]);
-    skipped.skipped = Some("cooldown".to_string());
-    assert_eq!(trigger.settle(&r, Some(&skipped), unreachable), r.disk);
-    assert_eq!(trigger, EagerTrigger::after_pass(79));
 }

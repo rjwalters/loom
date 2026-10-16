@@ -39,29 +39,12 @@ pub struct TickReport {
     pub skipped_in_flight: usize,
     /// Issues deferred to a future tick because the concurrency cap was reached.
     pub deferred_capacity: usize,
-    /// Issues deferred to a future tick because the **per-tick admission cap**
-    /// (#4234, `max_admissions_per_tick`) was reached, independent of
-    /// `deferred_capacity` — this fires even when `max_concurrent` computes
-    /// large enough to admit them (e.g. a token-axis jump), because the ramp
-    /// cap deliberately smooths *how fast* new sweeps are admitted rather than
-    /// how many may run concurrently. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`](super::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV).
-    pub deferred_ramp_cap: usize,
-    /// Issues deferred to a future tick because the **saturation admission
-    /// brake** (#4903, [`crate::admission_brake`]) held new admissions: the host
-    /// is already at/over the configured load-per-core hold threshold, so adding
-    /// work would only slow the sweeps already running.
-    ///
-    /// Deliberately its own counter, not folded into
-    /// [`deferred_capacity`](Self::deferred_capacity): the concurrency cap was
-    /// *not* reached — the host was. Conflating them would report a token/disk
-    /// shortage on a machine whose only problem is that it is already full, and
-    /// send an operator to raise a knob that is not binding.
-    pub deferred_saturation: usize,
     /// Issues deferred to a future tick because the **build back-off**
     /// (#9410, [`build_backoff`](super::build_backoff)) was engaged: review +
     /// merge debt is high, so no new unstarred issue build is admitted. Its
-    /// own counter for the same reason as [`deferred_saturation`](Self::deferred_saturation):
-    /// no cap was reached, a WIP policy held.
+    /// own counter, not folded into
+    /// [`deferred_capacity`](Self::deferred_capacity): no cap was reached, a
+    /// WIP policy held.
     pub deferred_build_backoff: usize,
     /// Issues skipped because they are quarantined for repeated insta-crashing
     /// (Issue #3939). Filtered out before the concurrency budget is allocated, so
@@ -218,14 +201,14 @@ pub struct TickReport {
     /// the gate loop reports — including when a repo's forge query fails.
     ///
     /// Despite the history above, any hold sets it — a drain, an exhausted
-    /// token pool, a disk reservation (#9017, #11191); [`Self::halt_causes`]
+    /// token pool (#9017); [`Self::halt_causes`]
     /// says which.
     pub halted: bool,
     /// The distinct causes of this tick's holds (#11649), in
     /// [`HaltCause::ALL`] order. Empty when the tick was not held, or when the
     /// caller attributed no cause (a legacy, cause-less tick). The
-    /// `loom.dispatch.tick` result is derived from it, so a disk-held tick no
-    /// longer reads `halted_main_red`.
+    /// `loom.dispatch.tick` result is derived from it, so a drain-held tick
+    /// does not read `halted_main_red`.
     pub halt_causes: Vec<HaltCause>,
     /// How many workspaces a hold gated this tick (#11857), exported as
     /// `loom.dispatch.held_roots` so the held share of a host stays visible
@@ -236,37 +219,14 @@ pub struct TickReport {
     /// the tick's outcome is the per-candidate one, not `halted_<cause>`. See
     /// [`Self::note_halts`] for the rule.
     pub halt_partial: bool,
-    /// True when the saturation admission brake (#4903) was engaged for this
-    /// tick. Reported separately from
-    /// [`deferred_saturation`](Self::deferred_saturation) so "the host was
-    /// holding" is visible even when the backlog was empty and nothing was
-    /// deferred — otherwise a saturated host with no queued work is
-    /// indistinguishable from a healthy idle one, which is the exact reporting
-    /// gap #4903 was filed on.
-    pub saturation_held: bool,
     /// True when the build back-off (#9410) held at least one repo this tick
     /// (#10624: the hold is per repo), even when nothing was deferred. The tick
     /// result keys on [`deferred_build_backoff`](Self::deferred_build_backoff)
     /// instead, so a repo that stays held cannot mask other outcomes.
     pub build_backoff_held: bool,
-    /// Candidates deferred THIS TICK because their own repo was already at
-    /// `autonomous.workFinder.maxConcurrentPerRepo` (Issue #9090,
-    /// [`repo_cap`](super::repo_cap)). Always `0` when the knob is absent (the
-    /// opt-in default) — see [`RepoCap`](super::RepoCap).
-    ///
-    /// Deliberately its own counter, not folded into
-    /// [`deferred_capacity`](Self::deferred_capacity): the *machine* cap was not
-    /// reached, one repo's share of it was, so an operator reading
-    /// `deferred_capacity` is never sent to raise a ceiling that is not binding.
-    /// Purely observational (mirrors
-    /// [`deferred_saturation`](Self::deferred_saturation)'s shape): these
-    /// candidates are NOT lost — they stay ready and are re-evaluated next tick,
-    /// and within THIS tick their deferral is handed straight to the next
-    /// candidate, which is another repo's work.
-    pub deferred_repo_cap: usize,
     /// The subset of [`dispatched`](Self::dispatched) admitted through the
     /// overflow slot (#9244, inert since #11508): an operator-starred issue that
-    /// only the global and/or per-repo cap refused, dispatched as this host's
+    /// only the global cap refused, dispatched as this host's
     /// single over-limit sweep. At most one per tick, and none while an
     /// earlier overflow sweep is still live. See
     /// [`operator_priority::OverflowSlot`](super::operator_priority::OverflowSlot).
@@ -305,18 +265,12 @@ pub struct TickReport {
     /// single-workspace tick). Feeds `loom.dispatch.idle_slots`.
     pub occupancy: Option<usize>,
     /// The shaped candidate order pass 2 iterated, as `(workspace_idx,
-    /// issue)` (Issue #9288): the global sort after `repo_cap::shape_queue`'s
-    /// affinity partition. Recorded before pass 2 runs, so it is
+    /// issue)` (Issue #9288): the global draw order. Recorded before pass 2
+    /// runs, so it is
     /// the order `dispatch()` was offered candidates in, including those a
     /// gate then deferred. The published plan's `position` is read from here
     /// and never re-derived. Empty for the single-workspace tick.
     pub plan_order: Vec<(usize, u32)>,
-    /// The per-repo cap and top-of-tick per-workspace occupancy (#9090) the
-    /// tick shaped with. `None` for the single-workspace tick.
-    pub repo_cap: Option<super::repo_cap::RepoCapSnapshot>,
-    /// The per-tick admission ramp cap (#4234) the tick ran under, or `None`
-    /// when the caller did not record it.
-    pub max_admissions_per_tick: Option<usize>,
     /// Whether the host's single overflow slot (#9244, inert since #11508)
     /// was still unused when the tick finished, or `None` when the
     /// tick did not record it (Issue #9288).
@@ -426,20 +380,9 @@ impl TickReport {
         self.halted && !self.halt_partial
     }
 
-    /// An empty report for a multi-workspace tick run under these admission
-    /// knobs.
-    #[must_use]
-    pub fn for_tick(saturation_held: bool, max_admissions_per_tick: usize) -> Self {
-        TickReport {
-            saturation_held,
-            max_admissions_per_tick: Some(max_admissions_per_tick),
-            ..TickReport::default()
-        }
-    }
-
     /// This report with no occupancy reading and none of the admission
     /// context a multi-workspace tick records for its dispatch plan (#9288:
-    /// ramp cap, slice mask, per-repo cap snapshot, overflow slot), for comparing an idle
+    /// the overflow slot), for comparing an idle
     /// tick against [`TickReport::default`] in tests. The shaped order itself
     /// (`plan_order`) is kept: an idle tick has none.
     #[cfg(test)]
@@ -447,8 +390,6 @@ impl TickReport {
     pub fn without_occupancy(self) -> Self {
         TickReport {
             occupancy: None,
-            max_admissions_per_tick: None,
-            repo_cap: None,
             overflow_free: None,
             workspace_draw: None,
             ..self

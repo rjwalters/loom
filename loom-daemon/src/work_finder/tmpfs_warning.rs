@@ -261,21 +261,4 @@ mod tests {
     // ===================================================================
     // Dispatch/admission independence (#8572 AC: "warning only", test-asserted)
     // ===================================================================
-
-    #[test]
-    fn warning_never_changes_the_admission_cap() {
-        let disk = 5;
-        let configured_max = 10;
-        let before = crate::work_finder::resolve_dynamic_max_concurrent(disk, configured_max);
-
-        // A firing warning (fraction far above threshold) has no return value
-        // or shared state that could feed into admission math.
-        assert!(should_warn(Some(0.95), 15.0, None, Utc::now(), 1800));
-
-        let after = crate::work_finder::resolve_dynamic_max_concurrent(disk, configured_max);
-        assert_eq!(
-            before, after,
-            "the tmpfs warning must never influence the admission cap (#8572)"
-        );
-    }
 }

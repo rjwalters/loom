@@ -217,10 +217,8 @@ fn rows_carry_the_level_and_urgent_is_always_false() {
 /// schema-version bump.
 #[test]
 fn plan_fields_ride_the_snapshot_at_version_11() {
-    use crate::types::{
-        DispatchPlanContext, PlanGate, PlanKey, PlanSlots, PlanState, RepoCapView, RowPlan,
-    };
-    let mut r = row(1, PUBLIC_ROOT, 5, Qd::DeferredRepoCap, None);
+    use crate::types::{DispatchPlanContext, PlanGate, PlanKey, PlanSlots, PlanState, RowPlan};
+    let mut r = row(1, PUBLIC_ROOT, 5, Qd::DeferredCapacity, None);
     r.plan = RowPlan {
         position: Some(3),
         plan_state: PlanState::Queued,
@@ -228,13 +226,8 @@ fn plan_fields_ride_the_snapshot_at_version_11() {
             name: "workspace_weight".into(),
             value: serde_json::json!(100),
         }],
-        gate: Some(PlanGate::RepoCap),
-        hot: Some(true),
+        gate: Some(PlanGate::Capacity),
         owning_shard: Some(1),
-        repo_cap: Some(RepoCapView {
-            cap: Some(1),
-            occupancy: 1,
-        }),
         // Issue #9311: additive, exercised on its own round-trip coverage in
         // `types::dispatch_plan::tests`; `None` here keeps this test's own
         // `schema_version` assertion about the pre-existing fields.

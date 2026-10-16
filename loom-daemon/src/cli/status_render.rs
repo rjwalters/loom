@@ -293,8 +293,8 @@ pub(crate) fn build_status_json_value_for(
         // through work-finder admission. A scripted consumer sizing a host
         // wants the sum, and before #6102 could only get the second term from
         // `pgrep`. Grouped into one object (rather than three sibling keys)
-        // for the same reason `admission_brake` is: this file's top-level
-        // `json!` literal is already at the macro recursion limit.
+        // because this file's top-level `json!` literal is already at the
+        // macro recursion limit.
         "role_agents": role_agents_json(report),
         // Claude-wrapper pre-flight-death workspace tripwire (#4386): `true`
         // means N consecutive dispatches, across different issues, died at
@@ -358,13 +358,9 @@ pub(crate) fn build_status_json_value_for(
             // per-repo/shared pools is actually in effect, independent of
             // whatever cwd `loom-daemon status` itself was run from.
             "token_pool_dir": report.token_pool_dir,
-            "disk_headroom": report.disk_headroom,
-            // Host CPU OBSERVATIONS (#3978/#4031), not cap terms: #4512 removed
-            // the CPU headroom term from admission. Reported because observed
-            // idle is the evidence for tuning `configured_max` on this machine.
-            // The separate CPU saturation admission brake (#4903, retuned by
-            // #5270) DOES gate admission — see the `admission_brake` block
-            // below for its live held/threshold state.
+            // Host CPU OBSERVATIONS (#3978/#4031), not cap terms: the cap is
+            // `configured_max` alone (#12406). Reported because observed idle
+            // and load are the evidence for tuning it on this machine.
             "logical_cpus": report.logical_cpus,
             "loadavg_1m": report.loadavg_1m,
             "cpu_idle_fraction": report.cpu_idle_fraction,
@@ -657,47 +653,6 @@ pub(crate) fn build_status_json_value_for(
             "starved_elapsed_secs": i.starved_elapsed_secs,
             "starvation_enabled": i.starvation_enabled,
             "observed_at": i.observed_at,
-        })),
-        // Host-distress circuit breaker (#4235) — `null` when no breaker is
-        // registered (work-finder off / breaker disabled). Otherwise the current
-        // phase (closed/open/cooldown), why it tripped, and the cool-down
-        // release time so a scripted consumer sees a paused-dispatch host.
-        "host_breaker": report.host_breaker.as_ref().map(|h| serde_json::json!({
-            "enabled": h.enabled,
-            "phase": h.phase,
-            "suppressed": h.suppressed,
-            "reason": h.reason,
-            "tripped_at": h.tripped_at,
-            "releases_at": h.releases_at,
-            "last_load_per_core": h.last_load_per_core,
-            "load_per_core_threshold": h.load_per_core_threshold,
-            "sustain_ticks": h.sustain_ticks,
-            "cooldown_secs": h.cooldown_secs,
-        })),
-        // Saturation admission brake (#4903) — `null` when no brake is
-        // registered. `held` is the machine-readable form of "this host is
-        // refusing new sweeps because it is already saturated", which
-        // `capacity_bound` alone could never express.
-        "admission_brake": report.admission_brake.as_ref().map(|b| serde_json::json!({
-            "enabled": b.enabled,
-            "held": b.held,
-            "load_per_core": b.load_per_core,
-            "load_per_core_threshold": b.load_per_core_threshold,
-            "held_since": b.held_since,
-            "held_ticks": b.held_ticks,
-            // Issue #5715: distinguishes ordinary held-with-sweeps-draining
-            // backpressure from starvation (held with NOTHING running to ever
-            // relieve it) for a scripted consumer, mirroring the human line.
-            "starving_since": b.starving_since,
-            "starving_ticks": b.starving_ticks,
-            // Issue #8478: the DURATION, pre-computed. `starving_since` alone
-            // required every consumer to subtract it from its own clock, and
-            // the tick count is not a duration at all (it scales with the
-            // work-finder interval). The 12-hour incident behind #8478 was a
-            // duration question — "how long has this been held" — that no
-            // machine-readable field answered.
-            "starving_secs": b.starving_since.map(|s| (Utc::now() - s).num_seconds().max(0)),
-            "escape_hatch_grants": b.escape_hatch_grants,
         })),
         "rate_limit_breaker": report.rate_limit_breaker.as_ref().map(|r| serde_json::json!({
             "enabled": r.enabled,
@@ -1099,34 +1054,6 @@ fn format_repo_column(repo: Option<&str>) -> &str {
     }
 }
 
-/// The capacity-block line that **replaces** "the limiter is work availability"
-/// while the saturation admission brake is holding (#4903).
-///
-/// `None` when no brake is registered, it is disabled, or it is not currently
-/// holding — in which case the caller prints the generic line unchanged, so a
-/// healthy host's output is byte-for-byte what it was before #4903.
-///
-/// Split out from [`print_status_human`] (same rationale as
-/// [`render_in_flight_table`]) so the "a saturated host must not read as idle"
-/// contract is unit-testable without capturing process stdout.
-fn saturation_hold_note(report: &DaemonStatusReport, dispatch_cap: usize) -> Option<String> {
-    let b = report.admission_brake.as_ref()?;
-    if !(b.enabled && b.held) {
-        return None;
-    }
-    let load = b
-        .load_per_core
-        .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
-    Some(format!(
-        "  \u{26a0} ADMISSION BRAKE HOLDING: {} in flight, cap {dispatch_cap}, but this host is \
-         saturated (load/core {load} \u{2265} {:.2}) — the limiter is the HOST, not work \
-         availability. New sweeps are held until load recovers; in-flight sweeps are untouched. \
-         Tune `autonomous.workFinder.maxConcurrent` for this machine's workload (#4903).",
-        report.in_flight.len(),
-        b.load_per_core_threshold,
-    ))
-}
-
 /// Render the "as of" freshness suffix for the pre-flight advisory line
 /// (Issue #5029), e.g. `" (as of 12s ago, 2026-08-03T12:00:00Z)"` — empty
 /// string when no transition timestamp is available (an older daemon binary,
@@ -1145,7 +1072,7 @@ fn format_preflight_advisory_freshness(changed_at: Option<DateTime<Utc>>) -> Str
 /// The claude-wrapper pre-flight-death tripwire warning line (#4386), with an
 /// "as of" freshness suffix appended (Issue #5029) — split out from
 /// [`print_status_human`] so the freshness text is unit-testable without
-/// capturing process stdout, mirroring [`render_admission_brake_line`].
+/// capturing process stdout.
 /// `None` when the advisory is not currently active (nothing to print) or the
 /// active flag is set with no message (defensive — should not happen in
 /// practice).
@@ -1281,63 +1208,12 @@ fn deep_clean_lines(report: &DaemonStatusReport) -> Vec<String> {
     lines
 }
 
-/// The standalone `Admission brake: …` status line (#4903), or `None` when no
-/// brake is registered (older daemon / never registered) — which renders
-/// nothing at all, the zero-behavior-change baseline the host breaker's line
-/// already uses.
-fn render_admission_brake_line(report: &DaemonStatusReport) -> Option<String> {
-    let b = report.admission_brake.as_ref()?;
-    let load = b
-        .load_per_core
-        .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
-    if !b.enabled {
-        return Some("Admission brake: disabled".to_string());
-    }
-    if !b.held {
-        return Some(format!(
-            "Admission brake: OK (load/core {load}, hold \u{2265} {:.2})",
-            b.load_per_core_threshold
-        ));
-    }
-    let since = b.held_since.map_or_else(
-        || "unknown".to_string(),
-        |s| {
-            let secs = (Utc::now() - s).num_seconds().max(0);
-            format!("{secs}s ago ({s})")
-        },
-    );
-    // #5715: a hold with sweeps genuinely draining is ordinary backpressure;
-    // a hold with **zero** in flight for a sustained period is starvation —
-    // the very shape the 33h robb-studio outage looked like from the outside.
-    // Name it distinctly rather than let it read identically to a healthy
-    // hold, mirroring the escalating log line the daemon itself emits.
-    let starving_note = if b.starving_ticks > 0 {
-        let starving_secs = b
-            .starving_since
-            .map_or(0, |s| (Utc::now() - s).num_seconds().max(0));
-        format!(
-            " — \u{26a0} STARVING: 0 sweeps in flight for {starving_secs}s ({} tick(s)); nothing \
-             is running to relieve this (escape-hatch grants so far: {})",
-            b.starving_ticks, b.escape_hatch_grants
-        )
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "Admission brake: HOLDING — host saturated (load/core {load} \u{2265} {:.2}); NEW sweep \
-         admissions held since {since} ({} tick(s)); in-flight sweeps are untouched and will \
-         drain{starving_note}",
-        b.load_per_core_threshold, b.held_ticks
-    ))
-}
-
 /// The `Worktree footprint` section (Issue #5939) — how much of this host's
 /// disk each managed repo's `.loom/worktrees` is holding, split by naming
 /// class.
 ///
 /// Returned as lines rather than printed so it is unit-testable as a pure
-/// function (the same split [`render_in_flight_table`] and
-/// [`render_admission_brake_line`] already use). `None` when the caller did
+/// function (the same split [`render_in_flight_table`] already uses). `None` when the caller did
 /// not collect a census at all — an absent measurement renders nothing, never
 /// a misleading `0 worktrees`.
 ///
@@ -1886,11 +1762,7 @@ pub(crate) fn print_status_human(
     // the daemon's own cap; the probe's number is shown as a labeled
     // secondary line only when it disagrees.
     let dispatch_cap = report.dynamic_cap;
-    println!("\nDynamic concurrency cap: {dispatch_cap}  (the number dispatch uses)");
-    println!(
-        "  = min(disk headroom {}, configured max {})",
-        report.disk_headroom, report.configured_max
-    );
+    println!("\nConcurrency cap: {dispatch_cap}  (maxConcurrent; nothing else limits it, #12406)");
     // Host CPU OBSERVATION (#3978 AC4; measured-idle signal #4031) — since
     // #4512 this is deliberately NOT a cap term: it is the evidence an operator
     // uses to decide whether this machine's `maxConcurrent` should go up (host
@@ -2410,66 +2282,6 @@ pub(crate) fn print_status_human(
                 );
             }
         }
-    }
-
-    // Host-distress circuit breaker (#4235): surface the phase, why it tripped,
-    // and when the cool-down releases so an operator sees a paused-dispatch host
-    // and can tell it apart from a main-health halt or a drain. A Closed breaker
-    // prints a one-line "OK" with its configured thresholds; an absent breaker
-    // (work-finder off / disabled) prints nothing.
-    if let Some(hb) = &report.host_breaker {
-        let load = hb
-            .last_load_per_core
-            .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
-        match hb.phase.as_str() {
-            "closed" => {
-                if hb.enabled {
-                    println!(
-                        "Host breaker: OK (closed; load/core {load}, trip ≥ {:.2} for {} tick(s), cooldown {}s)",
-                        hb.load_per_core_threshold, hb.sustain_ticks, hb.cooldown_secs
-                    );
-                } else {
-                    println!("Host breaker: disabled");
-                }
-            }
-            "open" => {
-                println!(
-                    "Host breaker: OPEN — new dispatch paused, running work draining ({})",
-                    hb.reason.as_deref().unwrap_or("sustained host distress")
-                );
-                if let Some(t) = hb.tripped_at {
-                    println!("  tripped at: {t}");
-                }
-            }
-            "cooldown" => {
-                let releases = hb.releases_at.map_or_else(
-                    || "unknown".to_string(),
-                    |r| {
-                        let secs = (r - Utc::now()).num_seconds();
-                        if secs >= 0 {
-                            format!("in {secs}s ({r})")
-                        } else {
-                            format!("overdue by {}s ({r})", -secs)
-                        }
-                    },
-                );
-                println!(
-                    "Host breaker: COOLING DOWN — dispatch paused, releases {releases} (load/core {load})"
-                );
-            }
-            other => println!("Host breaker: {other}"),
-        }
-    }
-
-    // Saturation admission brake (#4903): a host that is holding new admissions
-    // because it is already saturated must SAY so. Before this line, a worker at
-    // 12× overcommit rendered as "3 sweeps, not capacity-bound" — visually
-    // indistinguishable from an idle host with free slots. Printed immediately
-    // after the host breaker so the two load-aware guards read together, and
-    // always stating that in-flight work is untouched (the operator's next
-    // question).
-    if let Some(line) = render_admission_brake_line(report) {
-        println!("{line}");
     }
 
     // GitHub rate-limit circuit breaker (#4429): one line while Closed, a
@@ -4169,272 +3981,6 @@ mod status_protection_tests {
         assert_ne!(EXIT_AUTONOMY_MISMATCH, EXIT_EXPECTED_BUT_DEAD);
         assert_ne!(EXIT_AUTONOMY_MISMATCH, EXIT_ALIVE_BUT_UNRESPONSIVE);
         assert_ne!(EXIT_AUTONOMY_MISMATCH, 0, "must not silently collapse to the OK exit code");
-    }
-}
-
-#[cfg(test)]
-mod admission_brake_render_tests {
-    //! Saturation admission-brake surfacing (#4903, AC4).
-    //!
-    //! The reporting half of the issue: `loom-worker-1` sat at 12× overcommit
-    //! and `loom-daemon status` said `capacity_bound: false` — "3 sweeps, cap
-    //! 12, the limiter is work availability" — which is indistinguishable from
-    //! an idle host with nine free slots. These tests pin that a holding host
-    //! *says so*, on both the human and `--json` surfaces, and that a healthy
-    //! host's output is unchanged.
-    use super::{build_status_json_value, render_admission_brake_line, saturation_hold_note};
-    use crate::cli::status::sample_report::sample_report;
-    use chrono::Utc;
-    use loom_daemon::self_update::SelfUpdateStatus;
-    use loom_daemon::types::{AdmissionBrakeStatus, DaemonStatusReport};
-
-    fn no_update() -> SelfUpdateStatus {
-        SelfUpdateStatus {
-            built_commit: "abc".to_string(),
-            source_commit: None,
-            update_available: None,
-            commits_behind: None,
-            hours_behind: None,
-        }
-    }
-
-    fn brake(enabled: bool, held: bool, load: Option<f64>) -> AdmissionBrakeStatus {
-        AdmissionBrakeStatus {
-            enabled,
-            held,
-            load_per_core: load,
-            load_per_core_threshold: 4.0,
-            held_since: held.then(|| Utc::now() - chrono::Duration::seconds(120)),
-            held_ticks: u32::from(held) * 2,
-            starving_since: None,
-            starving_ticks: 0,
-            escape_hatch_grants: 0,
-        }
-    }
-
-    /// Like [`brake`], but starving (Issue #5715): held, 0 sweeps in flight,
-    /// for `starving_ticks` consecutive ticks.
-    fn starving_brake(
-        load: Option<f64>,
-        starving_ticks: u32,
-        escape_hatch_grants: u32,
-    ) -> AdmissionBrakeStatus {
-        AdmissionBrakeStatus {
-            starving_since: Some(Utc::now() - chrono::Duration::seconds(400)),
-            starving_ticks,
-            escape_hatch_grants,
-            ..brake(true, true, load)
-        }
-    }
-
-    fn report_with(brake: Option<AdmissionBrakeStatus>) -> DaemonStatusReport {
-        let mut r = sample_report();
-        r.admission_brake = brake;
-        r
-    }
-
-    // ---- human surface -----------------------------------------------------
-
-    #[test]
-    fn a_holding_host_says_so_instead_of_looking_idle() {
-        let note = saturation_hold_note(&report_with(Some(brake(true, true, Some(11.91)))), 12)
-            .expect("a holding brake must produce the substitute line");
-        assert!(note.contains("ADMISSION BRAKE HOLDING"), "got: {note}");
-        assert!(note.contains("11.91"), "the measured load must be shown: {note}");
-        assert!(
-            note.contains("the limiter is the HOST, not work availability"),
-            "the misleading diagnosis must be actively contradicted: {note}"
-        );
-        assert!(
-            note.contains("in-flight sweeps are untouched"),
-            "the operator's next question must be answered inline: {note}"
-        );
-    }
-
-    #[test]
-    fn a_healthy_host_keeps_the_generic_capacity_line() {
-        // AC3's reporting half: not holding ⇒ no substitution, so the pre-#4903
-        // "limiter is work availability" line still prints unchanged.
-        assert!(
-            saturation_hold_note(&report_with(Some(brake(true, false, Some(0.4)))), 12).is_none()
-        );
-        assert!(
-            saturation_hold_note(&report_with(Some(brake(false, true, Some(11.9)))), 12).is_none()
-        );
-        assert!(saturation_hold_note(&report_with(None), 12).is_none());
-    }
-
-    #[test]
-    fn brake_line_reports_held_ok_and_disabled_distinctly() {
-        let holding =
-            render_admission_brake_line(&report_with(Some(brake(true, true, Some(11.91)))))
-                .expect("line");
-        assert!(holding.starts_with("Admission brake: HOLDING"), "got: {holding}");
-        assert!(holding.contains("2 tick(s)"), "got: {holding}");
-
-        let ok = render_admission_brake_line(&report_with(Some(brake(true, false, Some(0.42)))))
-            .expect("line");
-        assert!(ok.starts_with("Admission brake: OK"), "got: {ok}");
-        assert!(ok.contains("0.42"), "got: {ok}");
-
-        let off = render_admission_brake_line(&report_with(Some(brake(false, false, None))))
-            .expect("line");
-        assert_eq!(off, "Admission brake: disabled");
-    }
-
-    #[test]
-    fn absent_brake_renders_nothing_at_all() {
-        // A pre-#4903 daemon reports `None`; the renderer must stay silent
-        // rather than invent a "brake OK" claim it has no evidence for.
-        assert!(render_admission_brake_line(&report_with(None)).is_none());
-    }
-
-    /// #5715: a held brake with 0 sweeps in flight must read distinctly from
-    /// ordinary held-with-sweeps-draining backpressure on the human status
-    /// surface, not just in the daemon's own log.
-    #[test]
-    fn starving_brake_names_itself_distinctly_from_ordinary_backpressure() {
-        let ordinary =
-            render_admission_brake_line(&report_with(Some(brake(true, true, Some(1.10)))))
-                .expect("line");
-        assert!(!ordinary.contains("STARVING"), "got: {ordinary}");
-
-        let starving =
-            render_admission_brake_line(&report_with(Some(starving_brake(Some(1.81), 5, 0))))
-                .expect("line");
-        assert!(starving.starts_with("Admission brake: HOLDING"), "got: {starving}");
-        assert!(starving.contains("STARVING"), "got: {starving}");
-        assert!(starving.contains("0 sweeps in flight"), "got: {starving}");
-        assert!(starving.contains("5 tick(s)"), "got: {starving}");
-    }
-
-    #[test]
-    fn escape_hatch_grant_count_surfaces_on_the_starving_line() {
-        let line =
-            render_admission_brake_line(&report_with(Some(starving_brake(Some(1.81), 3, 2))))
-                .expect("line");
-        assert!(
-            line.contains("escape-hatch grants so far: 2"),
-            "an operator must see how many times the livelock breaker has already fired: {line}"
-        );
-    }
-
-    #[test]
-    fn missing_load_reading_renders_as_na_not_zero() {
-        let ok = render_admission_brake_line(&report_with(Some(brake(true, false, None))))
-            .expect("line");
-        assert!(ok.contains("n/a"), "absent evidence must not render as 0.00: {ok}");
-    }
-
-    // ---- --json surface ----------------------------------------------------
-
-    #[test]
-    fn json_carries_the_brake_hold_state() {
-        let value = build_status_json_value(
-            &report_with(Some(brake(true, true, Some(11.91)))),
-            None,
-            &no_update(),
-            None,
-            None,
-            None,
-        );
-        let b = &value["admission_brake"];
-        assert_eq!(b["enabled"], true);
-        assert_eq!(b["held"], true);
-        assert_eq!(b["load_per_core_threshold"], 4.0);
-        assert_eq!(b["held_ticks"], 2);
-        assert!(b["held_since"].is_string());
-    }
-
-    #[test]
-    fn json_carries_the_starvation_fields() {
-        // #5715: a scripted consumer must be able to tell "held, sweeps
-        // draining" apart from "held, nothing running" without parsing the
-        // human line.
-        let value = build_status_json_value(
-            &report_with(Some(starving_brake(Some(1.81), 5, 1))),
-            None,
-            &no_update(),
-            None,
-            None,
-            None,
-        );
-        let b = &value["admission_brake"];
-        assert_eq!(b["starving_ticks"], 5);
-        assert_eq!(b["escape_hatch_grants"], 1);
-        assert!(b["starving_since"].is_string());
-
-        let healthy = build_status_json_value(
-            &report_with(Some(brake(true, true, Some(1.10)))),
-            None,
-            &no_update(),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(healthy["admission_brake"]["starving_ticks"], 0);
-        assert!(healthy["admission_brake"]["starving_since"].is_null());
-    }
-
-    /// #8478: the incident behind this field was a *duration* question ("how
-    /// long has dispatch been held?"). `starving_since` forced a consumer to do
-    /// clock arithmetic, and `starving_ticks` is not a duration at all — it
-    /// scales with the work-finder interval, so the same count means minutes on
-    /// one host and an hour on another.
-    #[test]
-    fn json_carries_the_starvation_duration_in_seconds() {
-        // `starving_brake` stamps `starving_since` 400s in the past.
-        let value = build_status_json_value(
-            &report_with(Some(starving_brake(Some(1.81), 5, 1))),
-            None,
-            &no_update(),
-            None,
-            None,
-            None,
-        );
-        let secs = value["admission_brake"]["starving_secs"]
-            .as_i64()
-            .expect("a starving brake must report its duration");
-        assert!((395..=405).contains(&secs), "expected ~400s of starvation, got {secs}");
-
-        let healthy = build_status_json_value(
-            &report_with(Some(brake(true, true, Some(1.10)))),
-            None,
-            &no_update(),
-            None,
-            None,
-            None,
-        );
-        assert!(
-            healthy["admission_brake"]["starving_secs"].is_null(),
-            "a brake that is not starving has no duration to report — null, never 0"
-        );
-    }
-
-    #[test]
-    fn json_brake_is_null_when_no_brake_is_registered() {
-        let value =
-            build_status_json_value(&report_with(None), None, &no_update(), None, None, None);
-        assert!(value["admission_brake"].is_null());
-    }
-
-    #[test]
-    fn admission_brake_field_survives_a_wire_round_trip_and_older_payloads() {
-        // Forward-compat contract: an absent field (pre-#4903 daemon) parses as
-        // `None`, never as a fabricated "not holding" brake.
-        let report = report_with(Some(brake(true, true, Some(11.91))));
-        let json = serde_json::to_string(&report).expect("serialize");
-        let back: DaemonStatusReport = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.admission_brake, report.admission_brake);
-
-        let mut stripped: serde_json::Value = serde_json::from_str(&json).expect("value");
-        stripped
-            .as_object_mut()
-            .expect("object")
-            .remove("admission_brake");
-        let older: DaemonStatusReport =
-            serde_json::from_value(stripped).expect("pre-#4903 payload must still parse");
-        assert!(older.admission_brake.is_none());
     }
 }
 

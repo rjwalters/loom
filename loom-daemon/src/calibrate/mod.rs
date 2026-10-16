@@ -14,30 +14,18 @@
 //! per-machine knob, **tuned empirically by the operator** from observed
 //! behavior.
 //!
-//! So calibrate is now strictly a **measurement report**: it prints what the
-//! host looks like right now, what the knobs currently resolve to, the
-//! `min(disk headroom, maxConcurrent)` breakdown, which term
-//! binds, and — since #5270 — whether the separate CPU saturation admission
-//! brake ([`crate::admission_brake`]) is holding dispatch outright. Reading it
-//! is how an operator decides whether to raise the knob:
+//! So calibrate is strictly a **measurement report**: it prints what the host
+//! looks like right now and what the knobs currently resolve to. Since #12406
+//! the cap is `maxConcurrent` and nothing else, so reading the report is how
+//! an operator decides whether to move it:
 //!
-//! - **binds on `ceiling` while the host sits idle** ⇒ raise `maxConcurrent`.
-//! - **binds on `ceiling` while the host is saturated** (low idle fraction, or
-//!   the host breaker tripping) ⇒ the knob is already at/above what this machine
-//!   sustains; leave it or lower it.
-//! - **binds on `disk`** ⇒ raising `maxConcurrent` changes nothing; free
-//!   scratch space.
-//! - **the CPU admission brake is holding** (#5270) ⇒ dispatch is blocked
-//!   THIS tick regardless of the cap above; wait for load to drop, or retune
-//!   the brake's threshold if it is firing on routine bursts.
+//! - **the host sits idle at the cap** ⇒ raise `maxConcurrent`.
+//! - **the host is saturated** (low idle fraction, high load per core, little
+//!   free disk or RAM) ⇒ the knob is already at/above what this machine
+//!   sustains; lower it.
 //!
 //! The token pool's healthy-account count is still reported (it drives
-//! spawn-time *selection*), but since #5270 it is informational only — it no
-//! longer bounds the cap (nor does the CPU term, on any auth path — a
-//! metered API key or an overage-enabled subscription pool has no
-//! exhaustible admission ceiling worth modeling). See
-//! [`crate::work_finder::resolve_dynamic_max_concurrent`] for the full
-//! rationale.
+//! spawn-time *selection*), but it does not bound the cap.
 //!
 //! It never writes config. `--write` is accepted-but-ignored with a deprecation
 //! warning so an existing `loom-daemon calibrate --write` invocation in a
@@ -47,9 +35,8 @@
 //!
 //! [`measure`] is the **only** function here that touches the live host (CPU
 //! idle sampling, `df`, the token-pool ranking file) — it reuses exactly the
-//! primitives [`crate::work_finder`]'s dynamic cap and `loom-daemon status`
-//! already use, so calibrate can never disagree with what dispatch actually
-//! does. Everything else ([`binding_term`], [`report_json`], [`report_human`])
+//! primitives `loom-daemon status` already uses. Everything else
+//! ([`report_json`], [`report_human`])
 //! is pure over [`HostMeasurements`] and unit-tested against injected host
 //! classes.
 
@@ -78,20 +65,11 @@ pub struct HostMeasurements {
     pub cpu_idle_fraction: Option<f64>,
     /// Current 1-minute load average, or `None` on a platform with no source
     /// ([`crate::cpu_headroom::read_loadavg_1m`]). The load-**per-core** ratio
-    /// derived from it is what the host-distress breaker (#4235) trips on.
+    /// derived from it is what an operator reads for CPU pressure.
     pub loadavg_1m: Option<f64>,
-    /// The disk headroom term
-    /// ([`crate::disk_headroom::disk_headroom_limit`]) — worktree slots the
-    /// scratch volume can hold at the resolved per-worktree GB estimate.
-    /// `usize::MAX` means the free-space probe was unmeasurable (skip the
-    /// clamp — see [`crate::disk_headroom`] docs).
-    pub disk_headroom: usize,
     /// Free GB on the scratch volume, when measurable (`None` when
     /// unmeasurable — see [`crate::disk_headroom::worktree_root_free_gb`]).
     pub disk_free_gb: Option<u64>,
-    /// The resolved per-worktree GB estimate
-    /// ([`crate::disk_headroom::per_worktree_gb`]) — env-only, no config key.
-    pub per_worktree_gb: u64,
     /// Count of `available` (healthy) accounts from the ranking snapshot, or
     /// the raw pool size when no ranking data exists — mirrors
     /// [`crate::capacity::token_axis_limit`], the same source
@@ -105,7 +83,7 @@ pub struct HostMeasurements {
     /// [`Self::ranking_present`] is `false`).
     pub total_accounts: usize,
     /// The currently resolved `autonomous.workFinder.maxConcurrent` — the
-    /// per-machine **sweep-dispatch** admission knob (env > config > default —
+    /// per-machine **sweep-dispatch** cap, and nothing else limits it (#12406) (env > config > default —
     /// [`crate::work_finder::resolve_max_concurrent_with_config`]).
     ///
     /// **It bounds sweeps only (#6102).** Role-runner agents are spawned by
@@ -137,19 +115,6 @@ pub struct HostMeasurements {
     /// because this — not an admission-time CPU estimate — is what bounds
     /// concurrent heavy builds since #4512.
     pub build_slots: usize,
-    /// Whether the CPU saturation admission brake
-    /// ([`crate::admission_brake`], #4903) is enabled for this workspace.
-    pub cpu_admission_brake_enabled: bool,
-    /// The brake's resolved load-per-core hold threshold (env > config >
-    /// default — [`crate::admission_brake::DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE`],
-    /// retuned to the "dumb mode" `0.95` CPU gate by #5270).
-    pub cpu_admission_brake_threshold: f64,
-    /// Whether the brake would hold new admissions **right now**, computed
-    /// fresh from [`Self::loadavg_1m`] / [`Self::logical_cpus`] — a one-shot
-    /// `calibrate` invocation is a separate process from the running daemon,
-    /// so this recomputes the decision rather than reading the live daemon's
-    /// registered brake state (which this process cannot see).
-    pub cpu_admission_brake_held: bool,
     /// Whether the role runner is enabled for this workspace
     /// ([`crate::role_runner::resolve_enabled`], #6102). When `true`, this host
     /// carries a second population of agents that
@@ -162,52 +127,14 @@ pub struct HostMeasurements {
     /// `autonomous.roleRunner.maxConcurrent` /
     /// `LOOM_ROLE_RUNNER_MAX_CONCURRENT`.
     ///
-    /// Deliberately **not** a term in [`Self::dynamic_cap`]: role agents and
-    /// sweeps are admitted by different subsystems against different queues, so
-    /// folding them into one `min(...)` would misreport which one is actually
-    /// binding. They are reported as two ceilings that sum to a worst-case
-    /// agent count, which is the number an operator sizing a host needs.
+    /// Role agents and sweeps are admitted by different subsystems against
+    /// different queues, so they are reported as two ceilings that sum to a
+    /// worst-case agent count, which is the number an operator sizing a host
+    /// needs.
     pub role_agent_max_concurrent: usize,
 }
 
 impl HostMeasurements {
-    /// The dynamic cap these measurements imply — exactly
-    /// [`crate::work_finder::resolve_dynamic_max_concurrent`], so calibrate can
-    /// never print a different cap than dispatch would compute.
-    #[must_use]
-    pub fn dynamic_cap(&self) -> usize {
-        crate::work_finder::resolve_dynamic_max_concurrent(
-            self.disk_headroom,
-            self.configured_max_concurrent,
-        )
-    }
-
-    /// Which of the two cap terms binds ([`binding_term`]). The token axis
-    /// is no longer part of the admission formula (#5270) — `token_axis_limit`
-    /// remains an informational-only field on this report, reflecting
-    /// spawn-time account health, not a concurrency cap.
-    #[must_use]
-    pub fn binding_term(&self) -> BindingTerm {
-        binding_term(self.disk_headroom, self.configured_max_concurrent)
-    }
-
-    /// The single "which machine axis is limiting dispatch right now" answer
-    /// (#5270 AC4 — max/disk/CPU observability; RAM is no term since #12330). The CPU saturation
-    /// admission brake is a **point-in-time hold**, not a term in the
-    /// `min(...)` [`Self::dynamic_cap`] formula (see
-    /// [`crate::work_finder::resolve_dynamic_max_concurrent`]'s own docs for
-    /// why), so it takes priority here: a held brake means dispatch is
-    /// blocked THIS tick regardless of what the numeric cap says. When the
-    /// brake is not holding, this falls back to [`Self::binding_term`].
-    #[must_use]
-    pub fn admission_axis(&self) -> &'static str {
-        if self.cpu_admission_brake_held {
-            "cpu"
-        } else {
-            self.binding_term().as_str()
-        }
-    }
-
     /// Render this struct as the `"measurements"` JSON object for `--json`
     /// output.
     #[must_use]
@@ -216,9 +143,7 @@ impl HostMeasurements {
             "logical_cpus": self.logical_cpus,
             "cpu_idle_fraction": self.cpu_idle_fraction,
             "loadavg_1m": self.loadavg_1m,
-            "disk_headroom": headroom_json(self.disk_headroom),
             "disk_free_gb": self.disk_free_gb,
-            "per_worktree_gb": self.per_worktree_gb,
             "token_axis_limit": self.token_axis_limit,
             "ranking_present": self.ranking_present,
             "total_accounts": self.total_accounts,
@@ -231,83 +156,14 @@ impl HostMeasurements {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             "build_slots": self.build_slots,
-            "cpu_admission_brake": {
-                "enabled": self.cpu_admission_brake_enabled,
-                "held": self.cpu_admission_brake_held,
-                "load_per_core_threshold": self.cpu_admission_brake_threshold,
-                // #6102: the brake samples host-wide load (so role-agent load
-                // DOES push it over the threshold) but only gates sweep
-                // admission — it cannot hold back a role agent, and it cannot
-                // shed load already in flight. Stated in the payload so a
-                // machine consumer reads the same guarantee the human report
-                // prints.
-                "holds": "new sweep admissions only",
-            },
             // The other half of this host's agent budget (#6102) — a separate
-            // ceiling, not a term in `dynamic_cap`.
+            // ceiling.
             "role_runner": {
                 "enabled": self.role_runner_enabled,
                 "max_concurrent": self.role_agent_max_concurrent,
                 "bounded_by_work_finder_max_concurrent": false,
             },
         })
-    }
-}
-
-/// `usize::MAX` (the disk-unmeasurable / unbounded sentinel) does not
-/// survive JSON's number type cleanly across every consumer — render it as
-/// the string `"unbounded"` instead of a giant integer, matching how an
-/// operator should read it.
-fn headroom_json(headroom: usize) -> Value {
-    if headroom == usize::MAX {
-        Value::String("unbounded".to_string())
-    } else {
-        serde_json::json!(headroom)
-    }
-}
-
-// ============================================================================
-// Binding term — which of the two `min(...)` terms is smallest
-// ============================================================================
-
-/// Which of the two dynamic-cap terms is the binding (smallest) constraint.
-/// Tie-break order mirrors `loom-daemon status`'s own diagnosis: disk first,
-/// then the ceiling. (A `Ram` variant existed until #12330 removed the RAM
-/// term, a `Token` variant until #5270 removed
-/// the token axis from admission — see
-/// [`crate::work_finder::resolve_dynamic_max_concurrent`] — and a `Cpu`
-/// variant existed until #4512 removed the CPU term from this same formula;
-/// CPU saturation is reported separately via
-/// [`crate::admission_brake`]/`loom-daemon status`'s `admission_brake` block,
-/// since it holds admission as a point-in-time gate rather than shrinking
-/// this `min(...)`.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BindingTerm {
-    /// Disk headroom is the smallest term.
-    Disk,
-    /// The operator-configured `maxConcurrent` is the smallest term.
-    Ceiling,
-}
-
-impl BindingTerm {
-    /// The stable lowercase identifier used in `--json` output and log lines.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Disk => "disk",
-            Self::Ceiling => "ceiling",
-        }
-    }
-}
-
-/// Determine which of the two terms is smallest (binds), applying the same
-/// tie-break order [`BindingTerm`] documents.
-#[must_use]
-pub fn binding_term(disk_headroom: usize, ceiling: usize) -> BindingTerm {
-    if disk_headroom <= ceiling {
-        BindingTerm::Disk
-    } else {
-        BindingTerm::Ceiling
     }
 }
 
@@ -347,8 +203,6 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
     let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
 
     let disk_free_gb = crate::disk_headroom::worktree_root_free_gb(workspace_root);
-    let per_worktree_gb = crate::disk_headroom::per_worktree_gb();
-    let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
 
     let pool_size = crate::tokens::token_pool_size(workspace_root);
     let ranking = crate::capacity::read_ranking(workspace_root);
@@ -363,14 +217,6 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
     let max_concurrent_source =
         crate::config_resolver::source_of(workspace_root, "autonomous.workFinder.maxConcurrent");
 
-    // CPU saturation admission brake (#4903, retuned by #5270 into the "dumb
-    // mode" CPU gate): recomputed fresh rather than read from the live
-    // daemon's registered global, since a one-shot `calibrate` invocation runs
-    // in a separate process that never sees that state.
-    let brake_config = crate::admission_brake::resolve_config_for(workspace_root);
-    let brake_decision =
-        crate::admission_brake::decide(&brake_config, loadavg_1m, logical_cpus, cpu_idle_fraction);
-
     // Role-runner agent budget (#6102) — read from the same root's config as
     // every other knob above.
     let role_runner_config = crate::role_runner::read_role_runner_config(workspace_root);
@@ -379,9 +225,7 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
         logical_cpus,
         cpu_idle_fraction,
         loadavg_1m,
-        disk_headroom,
         disk_free_gb,
-        per_worktree_gb,
         token_axis_limit,
         ranking_present,
         total_accounts,
@@ -389,9 +233,6 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
         max_concurrent_env_override,
         max_concurrent_source,
         build_slots: crate::build_slot::resolve_slots(),
-        cpu_admission_brake_enabled: brake_config.enabled,
-        cpu_admission_brake_threshold: brake_config.load_per_core_threshold,
-        cpu_admission_brake_held: brake_decision.held,
         // Role-runner agent budget (#6102): resolved the same way the daemon's
         // own role loops resolve it, so calibrate can never print a ceiling
         // different from the one that will actually refuse a tick. NOT the live
@@ -412,13 +253,8 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
 pub fn report_json(m: &HostMeasurements) -> Value {
     serde_json::json!({
         "measurements": m.to_json(),
-        "dynamic_cap": m.dynamic_cap(),
-        "binding_term": m.binding_term().as_str(),
-        // #5270 AC4: the CPU brake is a point-in-time hold outside the
-        // `min(...)` cap formula, so it can override `binding_term` as the
-        // real answer to "what's stopping dispatch right now" — see
-        // `HostMeasurements::admission_axis`.
-        "admission_axis": m.admission_axis(),
+        // The cap is `maxConcurrent` alone (#12406).
+        "cap": m.configured_max_concurrent,
         "advice": advice(m),
         // Retained for machine consumers that keyed off it before #4512: this
         // subcommand no longer writes anything, ever.
@@ -432,48 +268,28 @@ pub fn report_json(m: &HostMeasurements) -> Value {
 /// unit-tested against injected host classes.
 #[must_use]
 pub fn advice(m: &HostMeasurements) -> String {
-    if m.cpu_admission_brake_held {
-        return format!(
-            "the CPU saturation admission brake is HOLDING new SWEEP admissions right now \
-             (load-per-core ≥ {:.2}) — this is the actual limiter this instant, ahead of the \
-             disk/maxConcurrent cap below; in-flight sweeps are untouched and it releases the \
-             moment load drops back under the threshold (#5270, #4903).{}",
-            m.cpu_admission_brake_threshold,
+    match m.cpu_idle_fraction {
+        Some(idle) if idle >= IDLE_HEADROOM_FRACTION => format!(
+            "maxConcurrent={} is the cap and the host is {:.0}% idle — this machine looks \
+             under-subscribed; raise autonomous.workFinder.maxConcurrent (a step at a time) and \
+             re-measure.{}",
+            m.configured_max_concurrent,
+            idle * 100.0,
             role_agent_caveat(m)
-        );
-    }
-    match m.binding_term() {
-        BindingTerm::Ceiling => match m.cpu_idle_fraction {
-            Some(idle) if idle >= IDLE_HEADROOM_FRACTION => format!(
-                "maxConcurrent={} binds sweep dispatch while the host is {:.0}% idle — this \
-                 machine looks under-subscribed; raise autonomous.workFinder.maxConcurrent (a \
-                 step at a time) and re-measure. The host-distress breaker is the safety net if \
-                 you overshoot.{}",
-                m.configured_max_concurrent,
-                idle * 100.0,
-                role_agent_caveat(m)
-            ),
-            Some(idle) => format!(
-                "maxConcurrent={} binds sweep dispatch and the host is only {:.0}% idle — it is \
-                 already close to what this machine sustains; do not raise it further without \
-                 freeing CPU.{}",
-                m.configured_max_concurrent,
-                idle * 100.0,
-                role_agent_caveat(m)
-            ),
-            None => format!(
-                "maxConcurrent={} binds sweep dispatch, but no CPU idle sample is available on \
-                 this host — run this again (or read `loom-daemon status`) once the daemon has \
-                 sampled, then tune.{}",
-                m.configured_max_concurrent,
-                role_agent_caveat(m)
-            ),
-        },
-        BindingTerm::Disk => format!(
-            "disk headroom binds ({} worktree slot(s) at {} GB each) — raising maxConcurrent \
-             changes nothing; free scratch space or lower LOOM_PER_WORKTREE_GB.",
-            display_headroom(m.disk_headroom),
-            m.per_worktree_gb
+        ),
+        Some(idle) => format!(
+            "maxConcurrent={} is the cap and the host is only {:.0}% idle — it is already close \
+             to what this machine sustains; do not raise it further without freeing CPU.{}",
+            m.configured_max_concurrent,
+            idle * 100.0,
+            role_agent_caveat(m)
+        ),
+        None => format!(
+            "maxConcurrent={} is the cap, but no CPU idle sample is available on this host — \
+             run this again (or read `loom-daemon status`) once the daemon has sampled, then \
+             tune.{}",
+            m.configured_max_concurrent,
+            role_agent_caveat(m)
         ),
     }
 }
@@ -543,47 +359,15 @@ pub fn report_human(m: &HostMeasurements) -> String {
             out.push_str("  cpu observed:   no CPU signal available on this platform\n");
         }
     }
-    out.push_str(&format!(
-        "                  (not a `min(...)` cap term since #4512 — but the CPU admission \
-         brake {} watches it: holds new admissions at load-per-core ≥ {:.2}, currently {})\n",
-        if m.cpu_admission_brake_enabled {
-            "IS enabled"
-        } else {
-            "is disabled"
-        },
-        m.cpu_admission_brake_threshold,
-        if m.cpu_admission_brake_held {
-            "HOLDING"
-        } else {
-            "not holding"
+    match m.disk_free_gb {
+        Some(free) => {
+            out.push_str(&format!("  disk free:      {free} GB on the worktree volume\n"))
         }
-    ));
-    // #6102 AC4 — state the brake's guarantee accurately at the point it is
-    // reported. It samples host-wide load (role-agent load DOES push it over
-    // the threshold), but the only thing it can withhold is a NEW sweep
-    // admission: it cannot refuse a role agent, and it cannot shed load already
-    // in flight. Both limits caused real confusion on the incident host.
-    out.push_str(
-        "                  (what the brake can hold back: NEW sweep admissions only. It cannot \
-         refuse a role-runner agent, and it cannot shed load already in flight — see the \
-         role-agent ceiling below, #6102)\n",
-    );
-    match (m.disk_free_gb, m.disk_headroom) {
-        (Some(free), headroom) if headroom != usize::MAX => {
-            out.push_str(&format!(
-                "  disk headroom:  {headroom} worktree slot(s) ({free} GB free / {} GB per-worktree estimate)\n",
-                m.per_worktree_gb
-            ));
-        }
-        _ => {
-            out.push_str(
-                "  disk headroom:  unmeasurable (skipping the disk clamp — treated as unbounded)\n",
-            );
-        }
+        None => out.push_str("  disk free:      unmeasurable\n"),
     }
     out.push_str(
-        "                  (LOOM_PER_WORKTREE_GB is env-only — there is no config key for the \
-         disk estimate; override with `export LOOM_PER_WORKTREE_GB=<gb>`)\n",
+        "                  (CPU, load and disk are not cap terms since #12406 — watch them and \
+         move maxConcurrent)\n",
     );
     if m.ranking_present {
         out.push_str(&format!(
@@ -652,11 +436,9 @@ pub fn report_human(m: &HostMeasurements) -> String {
          maxConcurrent has never bounded them — #6102)\n",
     );
 
-    out.push_str(&format!("\nDynamic concurrency cap: {}\n", m.dynamic_cap()));
     out.push_str(&format!(
-        "  = min(disk {}, maxConcurrent {})\n",
-        display_headroom(m.disk_headroom),
-        m.configured_max_concurrent,
+        "\nConcurrency cap: {} (maxConcurrent, nothing else limits it — #12406)\n",
+        m.configured_max_concurrent
     ));
     out.push_str("  bounds: SWEEP dispatch only (#6102)\n");
     if m.role_runner_enabled {
@@ -668,29 +450,16 @@ pub fn report_human(m: &HostMeasurements) -> String {
                 .saturating_add(m.role_agent_max_concurrent)
         ));
     }
-    out.push_str(&format!("  cap binds on: {}\n", m.binding_term().as_str()));
-    out.push_str(&format!(
-        "  admission blocked by (max/disk/cpu, #5270 AC4): {}\n",
-        m.admission_axis()
-    ));
 
     out.push_str(&format!("\nReading: {}\n", advice(m)));
     out.push_str(
         "\nThis report is read-only — calibrate no longer recommends or writes knob values \
          (#4512): maxConcurrent is a per-machine knob you tune from observations like the ones \
-         above. It is read once at daemon startup, so restart after editing:\n  \
-         ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh\n",
+         above. The daemon re-reads it every tick, so an edit applies without a restart \
+         (unless LOOM_WORK_FINDER_MAX_CONCURRENT is set).\n",
     );
 
     out
-}
-
-fn display_headroom(headroom: usize) -> String {
-    if headroom == usize::MAX {
-        "unbounded".to_string()
-    } else {
-        headroom.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -711,9 +480,7 @@ mod tests {
             logical_cpus: 8,
             cpu_idle_fraction: Some(0.95),
             loadavg_1m: Some(0.4),
-            disk_headroom: 36,
             disk_free_gb: Some(72),
-            per_worktree_gb: 2,
             token_axis_limit: 6,
             ranking_present: true,
             total_accounts: 8,
@@ -721,9 +488,6 @@ mod tests {
             max_concurrent_env_override: false,
             max_concurrent_source: Some(std::path::PathBuf::from("/repo/.loom/config.json")),
             build_slots: 1,
-            cpu_admission_brake_enabled: true,
-            cpu_admission_brake_threshold: 0.95,
-            cpu_admission_brake_held: false,
             // #6102: the base fixture keeps the role runner OFF so every
             // pre-#6102 advice assertion below reads the unchanged text (the
             // caveat sentence is appended only when there is a second agent
@@ -744,38 +508,6 @@ mod tests {
         }
     }
 
-    /// Plenty of CPU/tokens, nearly-full scratch volume.
-    fn disk_bound_host() -> HostMeasurements {
-        HostMeasurements {
-            disk_headroom: 2,
-            disk_free_gb: Some(5),
-            configured_max_concurrent: 10,
-            ..idle_worker_host()
-        }
-    }
-
-    /// A near-exhausted token pool: no longer binds the cap since #5270 (only
-    /// disk/maxConcurrent do), but the field remains for the informational
-    /// token-pool line in the report.
-    fn token_starved_host() -> HostMeasurements {
-        HostMeasurements {
-            token_axis_limit: 1,
-            total_accounts: 8,
-            configured_max_concurrent: 10,
-            ..idle_worker_host()
-        }
-    }
-
-    /// A host where the CPU saturation admission brake is currently holding
-    /// new admissions — the "dumb mode" case #5270 introduces.
-    fn cpu_brake_held_host() -> HostMeasurements {
-        HostMeasurements {
-            cpu_admission_brake_held: true,
-            loadavg_1m: Some(7.8),
-            ..idle_worker_host()
-        }
-    }
-
     /// The #6102 incident shape: a busy host whose `maxConcurrent` binds while
     /// the role runner is ALSO enabled, so a second population of agents is
     /// admitted entirely outside that knob.
@@ -787,81 +519,6 @@ mod tests {
             loadavg_1m: Some(32.4),
             ..idle_worker_host()
         }
-    }
-
-    // ========================================================================
-    // The cap is exactly `resolve_dynamic_max_concurrent` — no CPU or token
-    // axis term (#5270)
-    // ========================================================================
-
-    #[test]
-    fn dynamic_cap_matches_the_two_term_admission_formula() {
-        let m = idle_worker_host();
-        // min(disk 36, maxConcurrent 3) = 3 — the token axis (6 × 2 =
-        // 12) plays no role even though it would have been smaller under the
-        // old formula.
-        assert_eq!(m.dynamic_cap(), 3);
-        assert_eq!(
-            m.dynamic_cap(),
-            crate::work_finder::resolve_dynamic_max_concurrent(36, 3),
-            "calibrate must never compute a different cap than dispatch"
-        );
-    }
-
-    #[test]
-    fn a_token_starved_host_is_not_capped_by_its_token_pool() {
-        // #5270: even with only 1 healthy account, the cap is min(disk,
-        // maxConcurrent) — the token axis never binds any more.
-        let m = token_starved_host();
-        assert_eq!(m.dynamic_cap(), 10, "min(disk 36, maxConcurrent 10)");
-        assert_eq!(m.binding_term(), BindingTerm::Ceiling);
-    }
-
-    #[test]
-    fn a_95_percent_idle_host_is_no_longer_capped_by_its_cpu() {
-        // The #4512 evidence case: with maxConcurrent raised to 10, the cap
-        // follows — under the old formula the cpu term pinned it at 2.
-        let mut m = idle_worker_host();
-        m.configured_max_concurrent = 10;
-        assert_eq!(m.dynamic_cap(), 10);
-        assert_eq!(m.binding_term(), BindingTerm::Ceiling);
-    }
-
-    // ========================================================================
-    // binding_term
-    // ========================================================================
-
-    #[test]
-    fn binding_term_prefers_disk_then_ceiling() {
-        assert_eq!(binding_term(2, 9), BindingTerm::Disk);
-        assert_eq!(binding_term(9, 2), BindingTerm::Ceiling);
-        // A tie resolves to disk, matching `status`'s tie-break order.
-        assert_eq!(binding_term(3, 3), BindingTerm::Disk);
-    }
-
-    #[test]
-    fn host_classes_bind_where_expected() {
-        assert_eq!(idle_worker_host().binding_term(), BindingTerm::Ceiling);
-        assert_eq!(disk_bound_host().binding_term(), BindingTerm::Disk);
-        // #5270: even a near-exhausted token pool never binds the cap any more.
-        assert_eq!(token_starved_host().binding_term(), BindingTerm::Ceiling);
-    }
-
-    // ========================================================================
-    // admission_axis — the CPU brake overrides the numeric binding_term
-    // ========================================================================
-
-    #[test]
-    fn admission_axis_falls_back_to_binding_term_when_the_brake_is_not_holding() {
-        assert_eq!(idle_worker_host().admission_axis(), "ceiling");
-        assert_eq!(disk_bound_host().admission_axis(), "disk");
-    }
-
-    #[test]
-    fn admission_axis_reports_cpu_when_the_brake_is_holding() {
-        // Even a host whose numeric cap would say "ceiling" reports "cpu" here
-        // — the brake blocks dispatch THIS tick regardless of the cap.
-        assert_eq!(cpu_brake_held_host().admission_axis(), "cpu");
     }
 
     // ========================================================================
@@ -883,29 +540,10 @@ mod tests {
     }
 
     #[test]
-    fn advice_points_at_disk_when_it_binds() {
-        assert!(advice(&disk_bound_host()).contains("LOOM_PER_WORKTREE_GB"));
-        // Must not tell the operator to raise maxConcurrent — it would do
-        // nothing while disk binds.
-        assert!(!advice(&disk_bound_host()).contains("raise autonomous"));
-    }
-
-    #[test]
     fn advice_handles_a_host_with_no_idle_sample() {
         let mut m = idle_worker_host();
         m.cpu_idle_fraction = None;
         assert!(advice(&m).contains("no CPU idle sample"));
-    }
-
-    #[test]
-    fn advice_names_the_cpu_brake_when_it_is_holding_ahead_of_the_numeric_cap() {
-        // The brake held-state must win even though this fixture's numeric cap
-        // (min(disk, maxConcurrent)) would otherwise say "ceiling" — the
-        // brake is the real limiter this instant.
-        let text = advice(&cpu_brake_held_host());
-        assert!(text.contains("HOLDING"), "{text}");
-        assert!(text.contains("0.95"), "{text}");
-        assert!(!text.contains("raise autonomous"), "{text}");
     }
 
     // ========================================================================
@@ -941,29 +579,10 @@ mod tests {
     /// must not grow a spurious warning.
     #[test]
     fn advice_omits_the_role_agent_caveat_when_the_role_runner_is_disabled() {
-        for m in [
-            idle_worker_host(),
-            saturated_host(),
-            disk_bound_host(),
-            cpu_brake_held_host(),
-        ] {
+        for m in [idle_worker_host(), saturated_host()] {
             let text = advice(&m);
             assert!(!text.contains("#6102"), "role runner disabled ⇒ no role-agent caveat: {text}");
         }
-    }
-
-    /// The caveat rides along even when the CPU brake is the reported limiter
-    /// — that branch returns early, and it is precisely the branch an operator
-    /// reads on a saturated host, so omitting it there would miss the case
-    /// that matters most.
-    #[test]
-    fn advice_carries_the_caveat_on_the_brake_held_branch_too() {
-        let text = advice(&HostMeasurements {
-            cpu_admission_brake_held: true,
-            ..role_runner_enabled_host()
-        });
-        assert!(text.contains("HOLDING"), "{text}");
-        assert!(text.contains("#6102"), "{text}");
     }
 
     #[test]
@@ -975,41 +594,11 @@ mod tests {
         );
         assert!(
             text.contains("bounds: SWEEP dispatch only"),
-            "the dynamic-cap block must scope itself: {text}"
+            "the cap block must scope itself: {text}"
         );
         assert!(
             text.contains("worst-case agents on this host: 3 sweep(s) + 7 role agent(s) = 10"),
             "{text}"
-        );
-    }
-
-    /// AC4: the brake's stated guarantee must be accurate wherever it is
-    /// reported — it samples host-wide load, but can only withhold a NEW sweep
-    /// admission, and can shed nothing already running.
-    #[test]
-    fn human_report_states_what_the_brake_can_and_cannot_hold_back() {
-        let text = report_human(&idle_worker_host());
-        assert!(text.contains("NEW sweep admissions only"), "{text}");
-        assert!(text.contains("cannot refuse a role-runner agent"), "{text}");
-        assert!(text.contains("cannot shed load already in flight"), "{text}");
-    }
-
-    #[test]
-    fn json_reports_the_role_runner_block_and_the_brake_scope() {
-        let json = role_runner_enabled_host().to_json();
-        assert_eq!(json["role_runner"]["enabled"], true);
-        assert_eq!(json["role_runner"]["max_concurrent"], 7);
-        assert_eq!(
-            json["role_runner"]["bounded_by_work_finder_max_concurrent"], false,
-            "machine consumers must get the #6102 fact too, not just the prose"
-        );
-        assert_eq!(json["cpu_admission_brake"]["holds"], "new sweep admissions only");
-        // Role agents are deliberately NOT a term in the `min(...)` cap — the
-        // two populations are admitted by different subsystems, so folding
-        // them into one number would misreport which is binding.
-        assert_eq!(
-            report_json(&role_runner_enabled_host())["dynamic_cap"],
-            role_runner_enabled_host().dynamic_cap()
         );
     }
 
@@ -1018,7 +607,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn json_round_trips_measurements_and_the_binding_term() {
+    fn json_round_trips_measurements_and_the_cap() {
         let m = idle_worker_host();
         let report = report_json(&m);
 
@@ -1026,8 +615,8 @@ mod tests {
         assert_eq!(report["measurements"]["cpu_idle_fraction"], 0.95);
         assert_eq!(report["measurements"]["configured_max_concurrent"], 3);
         assert_eq!(report["measurements"]["build_slots"], 1);
-        assert_eq!(report["dynamic_cap"], 3);
-        assert_eq!(report["binding_term"], "ceiling");
+        assert_eq!(report["cap"], 3);
+        assert!(report.get("binding_term").is_none(), "no binding term since #12406");
         // #4512: calibrate never writes, so this is unconditionally false.
         assert_eq!(report["write"]["applied"], false);
         assert_eq!(report["restart_required"], true);
@@ -1098,14 +687,6 @@ mod tests {
         assert!(text.contains("/repo/.loom/config.json"), "{text}");
     }
 
-    #[test]
-    fn disk_headroom_unbounded_renders_as_string_not_a_giant_int() {
-        let mut m = idle_worker_host();
-        m.disk_headroom = usize::MAX;
-        m.disk_free_gb = None;
-        assert_eq!(m.to_json()["disk_headroom"], "unbounded");
-    }
-
     // ========================================================================
     // Human report
     // ========================================================================
@@ -1114,15 +695,12 @@ mod tests {
     fn human_report_contains_key_lines() {
         let text = report_human(&idle_worker_host());
         assert!(text.contains("loom-daemon calibrate"));
-        assert!(text.contains("Dynamic concurrency cap: 3"));
-        assert!(text.contains("= min(disk 36, maxConcurrent 3)"));
-        assert!(text.contains("cap binds on: ceiling"));
-        assert!(text.contains("admission blocked by"));
+        assert!(text.contains("Concurrency cap: 3 (maxConcurrent"));
         assert!(text.contains("build slots:    1"));
-        assert!(text.contains("LOOM_PER_WORKTREE_GB"));
-        assert!(!text.contains("ram headroom"), "no RAM term since #12330");
+        assert!(text.contains("disk free:      72 GB"));
+        assert!(!text.contains("LOOM_PER_WORKTREE_GB"), "no disk term since #12406");
+        assert!(!text.contains("min(disk"), "no disk term since #12406");
         assert!(text.contains("read-only"));
-        assert!(text.contains("loom-daemon-start.sh"));
     }
 
     #[test]
@@ -1130,18 +708,6 @@ mod tests {
         let mut m = idle_worker_host();
         m.build_slots = 0;
         assert!(report_human(&m).contains("0 — DISABLED"));
-    }
-
-    #[test]
-    fn human_report_handles_unmeasurable_disk_and_missing_cpu_signal() {
-        let mut m = idle_worker_host();
-        m.disk_headroom = usize::MAX;
-        m.disk_free_gb = None;
-        m.cpu_idle_fraction = None;
-        m.loadavg_1m = None;
-        let text = report_human(&m);
-        assert!(text.contains("unmeasurable"));
-        assert!(text.contains("no CPU signal available"));
     }
 
     #[test]
@@ -1157,16 +723,4 @@ mod tests {
     // against a real (empty) temp workspace. No live-probe assertions (host
     // dependent).
     // ========================================================================
-
-    #[test]
-    fn measure_does_not_panic_on_an_empty_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = measure(dir.path());
-        assert!(m.logical_cpus >= 1);
-        // Whatever the host reports, the derived numbers must be coherent.
-        assert_eq!(m.dynamic_cap(), m.dynamic_cap());
-        if let Some(idle) = m.cpu_idle_fraction {
-            assert!((0.0..=1.0).contains(&idle));
-        }
-    }
 }

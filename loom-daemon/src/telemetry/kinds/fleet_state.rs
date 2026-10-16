@@ -238,13 +238,11 @@ pub enum FleetHaltReason {
     TokenPool,
     PreflightAdvisory,
     Drain,
-    Breaker,
     WriteScope,
     CiBilling,
     InstallIncompatible,
     DaemonTooOld,
     MaintainOnly,
-    DiskReservation,
     WeightZero,
     /// A hold with no named cause. A reader also decodes any value it does
     /// not know (from a newer emitter) as this.
@@ -254,19 +252,17 @@ pub enum FleetHaltReason {
 
 impl FleetHaltReason {
     /// Every reason, in wire order.
-    pub const ALL: [FleetHaltReason; 14] = [
+    pub const ALL: [FleetHaltReason; 12] = [
         FleetHaltReason::MainRed,
         FleetHaltReason::GatePending,
         FleetHaltReason::TokenPool,
         FleetHaltReason::PreflightAdvisory,
         FleetHaltReason::Drain,
-        FleetHaltReason::Breaker,
         FleetHaltReason::WriteScope,
         FleetHaltReason::CiBilling,
         FleetHaltReason::InstallIncompatible,
         FleetHaltReason::DaemonTooOld,
         FleetHaltReason::MaintainOnly,
-        FleetHaltReason::DiskReservation,
         FleetHaltReason::WeightZero,
         FleetHaltReason::Unknown,
     ];
@@ -281,13 +277,11 @@ impl FleetHaltReason {
             Some(HaltCause::TokenPool) => Self::TokenPool,
             Some(HaltCause::PreflightAdvisory) => Self::PreflightAdvisory,
             Some(HaltCause::Drain) => Self::Drain,
-            Some(HaltCause::Breaker) => Self::Breaker,
             Some(HaltCause::WriteScope) => Self::WriteScope,
             Some(HaltCause::CiBilling) => Self::CiBilling,
             Some(HaltCause::InstallIncompatible) => Self::InstallIncompatible,
             Some(HaltCause::DaemonTooOld) => Self::DaemonTooOld,
             Some(HaltCause::MaintainOnly) => Self::MaintainOnly,
-            Some(HaltCause::DiskReservation) => Self::DiskReservation,
             Some(HaltCause::WeightZero) => Self::WeightZero,
             None => Self::Unknown,
         }
@@ -302,13 +296,11 @@ impl FleetHaltReason {
             Self::TokenPool => "token_pool",
             Self::PreflightAdvisory => "preflight_advisory",
             Self::Drain => "drain",
-            Self::Breaker => "breaker",
             Self::WriteScope => "write_scope",
             Self::CiBilling => "ci_billing",
             Self::InstallIncompatible => "install_incompatible",
             Self::DaemonTooOld => "daemon_too_old",
             Self::MaintainOnly => "maintain_only",
-            Self::DiskReservation => "disk_reservation",
             Self::WeightZero => "weight_zero",
             Self::Unknown => "unknown",
         }
@@ -380,9 +372,6 @@ impl FleetEligibleReason {
             Qd::Dispatched
             | Qd::InFlight
             | Qd::DeferredCapacity
-            | Qd::DeferredRampCap
-            | Qd::DeferredSaturation
-            | Qd::DeferredRepoCap
             | Qd::DeferredFileOverlap
             | Qd::WorkspaceHalted
             | Qd::WorkspaceCommandsMissing
@@ -710,16 +699,6 @@ pub struct FleetHoldReleaseBurst {
     pub window_minutes: u32,
 }
 
-/// Decode a present field, `null` included, as `Some(..)`; an absent field
-/// stays `None` through `#[serde(default)]` (#11606: uncapped vs unknown).
-fn observed_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(de).map(Some)
-}
-
 /// Observed Champion dispatch metadata, independent of approval authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChampionState {
@@ -819,26 +798,6 @@ pub struct FleetStateRepo {
     /// `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt: Option<FleetRepoHalt>,
-    /// Sweeps this host's work finder counts against the repo's dispatch cap
-    /// when its last tick finished (#11606): host-local, the dispatcher's
-    /// own occupancy count plus that tick's admissions. Absent means unknown
-    /// (no tick, or an older emitter), never zero. Additive on `fleet-state/v1`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub in_flight: Option<u32>,
-    /// The repo's resolved `maxConcurrentPerRepo` on that tick (#11606).
-    /// Three states: absent = unknown, `null` = uncapped (observed), a number
-    /// = the cap. Present exactly when `in_flight` is. Additive.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "observed_option"
-    )]
-    pub cap: Option<Option<u32>>,
-    /// Ready candidates of the repo that tick deferred for the cap (#11606).
-    /// `0` is a measured result; absent means unknown. Present exactly when
-    /// `in_flight` is. Additive.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deferred_repo_cap: Option<u32>,
     /// `ready_wait` only (#11645): issues of this repo waiting in the dispatch
     /// queue right now — the depth of the queue the work finder read this
     /// tick, the same source `ready_wait` rows come from. The single strongest

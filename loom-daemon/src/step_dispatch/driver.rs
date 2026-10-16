@@ -1,7 +1,7 @@
 //! The production step tick (#11909): the work-finder loop's dispatch call.
 //!
-//! The loop keeps computing what it always did (the dynamic cap, holds,
-//! saturation, the build back-off, the per-repo limits) and hands it here.
+//! The loop computes the cap (the operator's `maxConcurrent`, #12406), the
+//! holds and the build back-off, and hands them here.
 //! This module reads each workspace's items ([`super::gather`]), weighs them
 //! with the registry's live state (step cooldowns, the Champion ladder, the
 //! exhausted role pools), runs [`super::tick::run`] with the registries'
@@ -25,7 +25,6 @@ use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawn
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
-use crate::work_finder::repo_cap::{RepoCap, RepoLimits};
 use crate::work_finder::step_item::{Lane, Step};
 use crate::work_finder::{RedMainLane, RegistryDispatcher, TickReport};
 use crate::workspace_pool::WorkspacePool;
@@ -41,10 +40,8 @@ pub struct TickInputs<'a> {
     pub lanes: &'a [RedMainLane],
     /// The build back-off is engaged, per root.
     pub build_backoff: &'a [bool],
+    /// The cap: the operator's `maxConcurrent` (#12406).
     pub max_concurrent: usize,
-    pub max_admissions: usize,
-    pub saturation_held: bool,
-    pub limits: RepoLimits,
     /// The tick's wall-clock deadline (#12074): past it, no further repo is
     /// gathered. `None`: gather every repo.
     pub deadline: Option<Instant>,
@@ -554,7 +551,6 @@ impl StepDriver {
             log::debug!("work_finder: stage-entry cache not written: {e}");
         }
         let total: usize = occupied.iter().sum();
-        let mut repo_cap = RepoCap::from_limits(input.limits.clone(), occupied);
         let mut spawner = RegistrySpawner {
             registries,
             roots: input.roots.to_vec(),
@@ -577,8 +573,6 @@ impl StepDriver {
             workspaces,
             StepTickLimits {
                 free_slots: input.max_concurrent.saturating_sub(total),
-                max_admissions: input.max_admissions,
-                saturation_held: input.saturation_held,
                 spawn_concurrency: input.spawn_concurrency.max(1),
             },
             &seed,
@@ -588,7 +582,6 @@ impl StepDriver {
                 .roots
                 .first()
                 .map_or_else(PoolKnobs::default, |root| PoolKnobs::for_root(root)),
-            &mut repo_cap,
             &mut spawner,
         );
         let draw_total = draw_started.elapsed();

@@ -56,11 +56,7 @@ fn config_block_overrides_defaults_field_wise() {
     assert_eq!(resolved.sources["dispatch.maxConcurrent"], Source::Config);
     assert_eq!(resolved.sources["lifecycle.leaseTtlMinutes"], Source::Config);
     // Untouched fields fall through to their defaults, and say so.
-    assert_eq!(
-        resolved.params.dispatch.max_admissions_per_tick,
-        DEFAULT_MAX_ADMISSIONS_PER_TICK
-    );
-    assert_eq!(resolved.sources["dispatch.maxAdmissionsPerTick"], Source::Default);
+    assert_eq!(resolved.sources["dispatch.itemWeightRedMain"], Source::Default);
 }
 
 #[test]
@@ -148,7 +144,7 @@ fn invalid_env_vector_is_soft_ignored_by_per_tick_readers_but_fatal_at_startup()
 #[test]
 fn validate_accepts_a_well_formed_layer() {
     let violations = validate_layer(&serde_json::json!({
-        "dispatch": {"tickIntervalSecs": 30, "maxConcurrent": 6, "maxAdmissionsPerTick": 2},
+        "dispatch": {"tickIntervalSecs": 30, "maxConcurrent": 6},
         "lifecycle": {"leaseTtlMinutes": 20.5, "idleExitMinutes": 90},
         "rework": {"buildBackoffHigh": 40, "buildBackoffLow": 25},
     }));
@@ -240,12 +236,12 @@ fn work_finder_reader_applies_the_dispatch_overlay() {
     let tmp = empty_workspace();
     write_config(
         tmp.path(),
-        r#"{"hyperparameters": {"dispatch": {"tickIntervalSecs": 45, "maxAdmissionsPerTick": 2}},
+        r#"{"hyperparameters": {"dispatch": {"tickIntervalSecs": 45, "maxConcurrent": 2}},
             "autonomous": {"workFinder": {"intervalSecs": 120}}}"#,
     );
     let config = crate::work_finder::read_work_finder_config(tmp.path());
     assert_eq!(config.interval_secs, Some(45));
-    assert_eq!(config.max_admissions_per_tick, Some(2));
+    assert_eq!(config.max_concurrent, Some(2));
 }
 
 #[test]

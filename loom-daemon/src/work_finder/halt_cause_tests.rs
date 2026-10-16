@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use super::super::{tick_multi_with_repo_cap, WorkDispatcher, WorkItem, WorkSource};
+use super::super::{tick_multi_with_build_backoff, WorkDispatcher, WorkItem, WorkSource};
 use super::{causes_per_root, HaltCause};
 use crate::main_health_gate::WorkspaceHealthStates;
 use crate::types::QueueDisposition;
@@ -56,7 +56,6 @@ fn cause_tokens_are_pinned() {
     assert_eq!(HaltCause::TokenPool.as_str(), "token_pool");
     assert_eq!(HaltCause::PreflightAdvisory.as_str(), "preflight_advisory");
     assert_eq!(HaltCause::Drain.as_str(), "drain");
-    assert_eq!(HaltCause::Breaker.as_str(), "breaker");
 }
 
 // ---- per-root fold --------------------------------------------------------
@@ -80,17 +79,17 @@ fn roots2() -> Vec<PathBuf> {
 fn each_hold_source_names_its_own_cause() {
     // main_red: root A verified-red.
     let states = states_with("/tmp/repo-a", true, false);
-    let got = causes_per_root(&states, &roots2(), false, &[None, None], false, false);
+    let got = causes_per_root(&states, &roots2(), false, &[None, None], false);
     assert_eq!(got, vec![Some(HaltCause::MainRed), None]);
 
     // gate_pending: root A gate in flight, suppressor on.
     let states = states_with("/tmp/repo-a", false, true);
-    let got = causes_per_root(&states, &roots2(), true, &[None, None], false, false);
+    let got = causes_per_root(&states, &roots2(), true, &[None, None], false);
     assert_eq!(got, vec![Some(HaltCause::GatePending), None]);
 
     // gate in flight but suppressor OFF ⇒ not held (byte-for-byte the bool
     // fold's pre-#4084 behaviour).
-    let got = causes_per_root(&states, &roots2(), false, &[None, None], false, false);
+    let got = causes_per_root(&states, &roots2(), false, &[None, None], false);
     assert_eq!(got, vec![None, None]);
 
     // token_pool / preflight_advisory arrive via the preflight cause slice.
@@ -104,7 +103,6 @@ fn each_hold_source_names_its_own_cause() {
             Some(HaltCause::PreflightAdvisory),
         ],
         false,
-        false,
     );
     assert_eq!(
         got,
@@ -116,92 +114,19 @@ fn each_hold_source_names_its_own_cause() {
 
     // A preflight slice shorter than roots defaults to not held, mirroring
     // the bool fold's `unwrap_or(false)`.
-    let got =
-        causes_per_root(&states, &roots2(), false, &[Some(HaltCause::TokenPool)], false, false);
+    let got = causes_per_root(&states, &roots2(), false, &[Some(HaltCause::TokenPool)], false);
     assert_eq!(got, vec![Some(HaltCause::TokenPool), None]);
 
-    // drain and breaker are daemon-global: they name every root.
-    let got = causes_per_root(&states, &roots2(), false, &[None, None], true, false);
+    // drain is daemon-global: it names every root.
+    let got = causes_per_root(&states, &roots2(), false, &[None, None], true);
     assert_eq!(got, vec![Some(HaltCause::Drain), Some(HaltCause::Drain)]);
-    let got = causes_per_root(&states, &roots2(), false, &[None, None], false, true);
-    assert_eq!(got, vec![Some(HaltCause::Breaker), Some(HaltCause::Breaker)]);
-}
-
-/// Simultaneous causes resolve by the documented precedence — the row always
-/// names exactly one cause, the most specific true one.
-#[test]
-fn simultaneous_causes_follow_the_fixed_precedence() {
-    // main_red beats everything (gate + token_pool + drain + breaker).
-    let states = states_with("/tmp/repo-a", true, true);
-    let got =
-        causes_per_root(&states, &roots2(), true, &[Some(HaltCause::TokenPool), None], true, true);
-    assert_eq!(got, vec![Some(HaltCause::MainRed), Some(HaltCause::Drain)]);
-
-    // gate_pending beats token_pool, which beats preflight_advisory.
-    let states = states_with("/tmp/repo-a", false, true);
-    let got = causes_per_root(
-        &states,
-        &roots2(),
-        true,
-        &[
-            Some(HaltCause::TokenPool),
-            Some(HaltCause::PreflightAdvisory),
-        ],
-        false,
-        false,
-    );
-    assert_eq!(
-        got,
-        vec![
-            Some(HaltCause::GatePending),
-            Some(HaltCause::PreflightAdvisory)
-        ]
-    );
-
-    // token_pool beats drain and breaker.
-    let states = states_with("/tmp/repo-a", false, false);
-    let got =
-        causes_per_root(&states, &roots2(), false, &[Some(HaltCause::TokenPool), None], true, true);
-    assert_eq!(got, vec![Some(HaltCause::TokenPool), Some(HaltCause::Drain)]);
-
-    // drain beats breaker (operator intent outranks automatic suppression).
-    let got = causes_per_root(&states, &roots2(), false, &[None, None], true, true);
-    assert_eq!(got, vec![Some(HaltCause::Drain), Some(HaltCause::Drain)]);
-}
-
-/// `cause.is_some()` is byte-for-byte the bool fold the production loop used
-/// to compute inline — the projection the loop now derives `halted` from.
-#[test]
-fn cause_presence_matches_the_bool_fold() {
-    use super::super::dispatch_held_per_root_with_preflight;
-    let states = states_with("/tmp/repo-a", true, true);
-    let roots = roots2();
-    let preflight = [Some(HaltCause::TokenPool), None];
-    let (draining, breaker) = (false, true);
-    let causes = causes_per_root(&states, &roots, true, &preflight, draining, breaker);
-    let preflight_bools = preflight.map(|c| c.is_some());
-    let bools = dispatch_held_per_root_with_preflight(&states, &roots, true, &preflight_bools)
-        .into_iter()
-        .map(|h| h || draining || breaker)
-        .collect::<Vec<bool>>();
-    assert_eq!(causes.iter().map(Option::is_some).collect::<Vec<bool>>(), bools);
 }
 
 // ---- the row the operator sees ---------------------------------------------
 
 fn halted_row(halt_causes: Option<&[Option<HaltCause>]>) -> crate::types::ReadyQueueRow {
     let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[],
-        10.into(),
-        &[true],
-        halt_causes,
-        usize::MAX,
-        false,
-        None,
-        &[],
-    );
+    let report = tick_multi_with_build_backoff(&mut multi, &[], 10, &[true], halt_causes, &[], &[]);
     assert_eq!(report.queue.len(), 1);
     let rows = super::super::ready_queue::finish(&report.queue, &[]);
     rows.into_iter().next().unwrap()
@@ -217,7 +142,6 @@ fn workspace_halted_row_names_its_cause_in_detail() {
         (HaltCause::TokenPool, "token_pool"),
         (HaltCause::PreflightAdvisory, "preflight_advisory"),
         (HaltCause::Drain, "drain"),
-        (HaltCause::Breaker, "breaker"),
     ] {
         let row = halted_row(Some(&[Some(cause)]));
         assert_eq!(row.disposition, QueueDisposition::WorkspaceHalted, "{token}");
@@ -238,15 +162,13 @@ fn workspace_halted_row_without_causes_keeps_a_empty_detail() {
 #[test]
 fn a_cause_at_a_not_held_index_never_halts_the_workspace() {
     let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
-    let report = tick_multi_with_repo_cap(
+    let report = tick_multi_with_build_backoff(
         &mut multi,
         &[],
-        10.into(),
+        10,
         &[false],
         Some(&[Some(HaltCause::MainRed)]),
-        usize::MAX,
-        false,
-        None,
+        &[],
         &[],
     );
     assert_eq!(report.dispatched, 1);
@@ -269,155 +191,7 @@ fn exportable_detail_passes_the_cause_through() {
 
 // ---- disk admission (#11191) ------------------------------------------------
 
-/// `heavy` (28 GB observed charge) and `light` (1 GB), `remaining_gb` left.
-fn disk_budget(remaining_gb: u64) -> crate::disk_admission::DiskBudget {
-    use crate::disk_admission::{ChargeSource, RepoCharge};
-    let c = |repo: &str, gb| RepoCharge {
-        repo: repo.into(),
-        gb,
-        source: ChargeSource::Observed,
-    };
-    crate::disk_admission::DiskBudget {
-        free_gb: remaining_gb + 3,
-        floor_gb: 3,
-        reserved_gb: 0,
-        remaining_gb,
-        sweeps_in_flight: 0,
-        charges: vec![c("heavy", 28), c("light", 1)],
-    }
-}
-
-#[test]
-fn disk_reservation_is_a_pinned_lowest_precedence_cause() {
-    assert_eq!(HaltCause::DiskReservation.as_str(), "disk_reservation");
-    assert_eq!(HaltCause::from_wire("disk_reservation"), Some(HaltCause::DiskReservation));
-    let b = disk_budget(14);
-    // Not otherwise held: the heavy root is held for disk, the light one not.
-    let folded = super::with_disk_holds(vec![None, None], Some(&b));
-    assert_eq!(folded, vec![Some(HaltCause::DiskReservation), None]);
-    // A root another hold already names keeps that cause.
-    let folded = super::with_disk_holds(vec![Some(HaltCause::MainRed), None], Some(&b));
-    assert_eq!(folded[0], Some(HaltCause::MainRed));
-    // No budget (admission off or unmeasured): unchanged.
-    assert_eq!(super::with_disk_holds(vec![None, None], None), vec![None, None]);
-}
-
-#[test]
-fn pass_two_defers_a_heavy_repo_on_disk_and_admits_a_light_one() {
-    let mut multi = vec![
-        (OneShotSource(Some(vec![item(1)])), Disp::default()),
-        (OneShotSource(Some(vec![item(2), item(3)])), Disp::default()),
-    ];
-    let report = super::super::tick_multi_with_build_backoff(
-        &mut multi,
-        &[1000, 1],
-        10.into(),
-        &[false, false],
-        None,
-        usize::MAX,
-        false,
-        crate::work_finder::repo_cap::RepoLimits {
-            per_repo: None,
-            disk: Some(disk_budget(14)),
-        },
-        &[],
-        &[],
-    );
-    assert!(multi[0].1.dispatched.is_empty(), "28 GB does not fit 14 GB");
-    assert_eq!(multi[1].1.dispatched, vec![2, 3], "a light repo still admits");
-    assert_eq!((report.dispatched, report.deferred_capacity), (2, 1));
-    let rows = super::super::ready_queue::finish(&report.queue, &[]);
-    let heavy = rows.iter().find(|r| r.issue == 1).unwrap();
-    assert_eq!(heavy.disposition, QueueDisposition::DeferredCapacity);
-    let detail = heavy.detail.as_deref().unwrap_or_default();
-    assert!(
-        detail.contains("disk: heavy charge 28GB (observed) exceeds remaining 14GB"),
-        "{detail}"
-    );
-}
-
-#[test]
-fn pass_two_debits_each_disk_admission() {
-    // 30 GB: one heavy sweep fits (28), the second does not, and the 2 GB
-    // left then admits two light sweeps but not a third.
-    let mut multi = vec![
-        (OneShotSource(Some(vec![item(1), item(2)])), Disp::default()),
-        (OneShotSource(Some(vec![item(3), item(4), item(5)])), Disp::default()),
-    ];
-    let report = super::super::tick_multi_with_build_backoff(
-        &mut multi,
-        &[1000, 1],
-        10.into(),
-        &[false, false],
-        None,
-        usize::MAX,
-        false,
-        crate::work_finder::repo_cap::RepoLimits {
-            per_repo: None,
-            disk: Some(disk_budget(30)),
-        },
-        &[],
-        &[],
-    );
-    assert_eq!(multi[0].1.dispatched, vec![1]);
-    assert_eq!(multi[1].1.dispatched, vec![3, 4]);
-    assert_eq!(report.deferred_capacity, 2);
-}
-
 // ---- the tick's own result (#11649) ----------------------------------------
-
-/// **#11649.** The tick report carries the distinct causes of the workspaces
-/// it held — not just "something was halted" — so the `loom.dispatch.tick`
-/// result can say `halted_disk_reservation` instead of `halted_main_red`.
-/// Duplicates fold, the order is `HaltCause::ALL`, and a cause at a not-held
-/// index is ignored.
-#[test]
-fn tick_report_carries_the_held_workspaces_distinct_causes() {
-    let mut multi: Vec<_> = (0..4)
-        .map(|n| (OneShotSource(Some(vec![item(n + 1)])), Disp::default()))
-        .collect();
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[],
-        10.into(),
-        &[true, true, true, false],
-        Some(&[
-            Some(HaltCause::DiskReservation),
-            Some(HaltCause::Drain),
-            Some(HaltCause::DiskReservation),
-            Some(HaltCause::MainRed),
-        ]),
-        usize::MAX,
-        false,
-        None,
-        &[],
-    );
-    assert!(report.halted);
-    assert_eq!(report.halt_causes, vec![HaltCause::Drain, HaltCause::DiskReservation]);
-    // The not-held workspace still dispatched, and that outranks the hold.
-    let tick = crate::observability::ops::dispatch::tick_result_with(&report, false);
-    assert_eq!((report.dispatched, tick), (1, "dispatched"));
-
-    // A cause-less caller holds without naming a cause.
-    let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
-    let report =
-        tick_multi_with_repo_cap(&mut multi, &[], 10.into(), &[true], None, 1, false, None, &[]);
-    assert!(report.halted);
-    assert!(report.halt_causes.is_empty());
-}
-
-/// #11649: the single-workspace loop's cause follows `causes_per_root`'s
-/// precedence, and is `None` exactly when nothing holds the root.
-#[test]
-fn single_root_names_the_highest_precedence_hold() {
-    let root = PathBuf::from("/nonexistent/loom-11649");
-    let cause = |holds| super::single_root(&root, holds);
-    assert_eq!(cause((false, false, false, false)), None);
-    assert_eq!(cause((true, true, true, true)), Some(HaltCause::MainRed));
-    assert_eq!(cause((false, true, true, true)), Some(HaltCause::GatePending));
-    assert_eq!(cause((false, false, true, true)), Some(HaltCause::Breaker));
-    assert_eq!(cause((false, false, true, false)), Some(HaltCause::TokenPool));
-}
 
 /// #11742: a held workspace keeps its own hold's cause even at weight 0 (a
 /// weightless `fleet: maintain` repo reads `maintain_only`, not
@@ -426,15 +200,13 @@ fn single_root_names_the_highest_precedence_hold() {
 fn a_hold_cause_wins_over_weight_zero() {
     let row = |held: bool| {
         let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
-        let report = tick_multi_with_repo_cap(
+        let report = tick_multi_with_build_backoff(
             &mut multi,
             &[0],
-            10.into(),
+            10,
             &[held],
             Some(&[held.then_some(HaltCause::MaintainOnly)]),
-            usize::MAX,
-            false,
-            None,
+            &[],
             &[],
         );
         let rows = super::super::ready_queue::finish(&report.queue, &[]);
@@ -462,17 +234,7 @@ fn held_tick(
         .iter()
         .map(|&h| h.then_some(HaltCause::MaintainOnly))
         .collect();
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[],
-        10.into(),
-        held,
-        Some(&causes),
-        usize::MAX,
-        false,
-        None,
-        &[],
-    );
+    let report = tick_multi_with_build_backoff(&mut multi, &[], 10, held, Some(&causes), &[], &[]);
     let result = crate::observability::ops::dispatch::tick_result_with(&report, false);
     (report, result)
 }

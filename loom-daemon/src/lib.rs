@@ -133,7 +133,6 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
-pub mod admission_brake;
 pub mod agent_gh;
 pub mod agent_session;
 pub mod agent_skills;
@@ -180,9 +179,6 @@ pub mod dep_recheck;
 /// Fleet discovery (#12306): one snapshot of what work exists per step tick,
 /// from the mirror's worklist or per-repo listings.
 pub mod discovery;
-pub mod disk_admission;
-pub mod disk_footprint;
-pub mod disk_full_halt;
 pub mod disk_headroom;
 pub mod dispatch_tap;
 pub mod docker_image_clean;
@@ -202,7 +198,6 @@ pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
-pub mod foreign_load;
 pub mod forge_bucket_book;
 pub mod forge_cached_list;
 pub mod forge_cached_view;
@@ -254,7 +249,6 @@ pub mod health;
 pub mod health_monitor;
 pub mod hooks_home;
 pub mod host_affinity;
-pub mod host_breaker;
 pub mod host_identity;
 pub mod host_optout;
 pub mod host_pressure;
