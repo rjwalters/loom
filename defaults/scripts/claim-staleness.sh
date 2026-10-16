@@ -344,25 +344,13 @@ if [[ -z "$CLAIM_STATE" ]]; then
         CLAIM_STATE="fresh"
     fi
 
-    # #11947: a live PR lease outranks the idle/streak clocks. A holder waiting
-    # on CI renews its lease without posting activity markers, so both stale
-    # states would otherwise reclaim a claim that is demonstrably alive.
-    # Only a definite held-self/held-peer downgrades; free, unknown (exit 5),
-    # an unmapped label or a binary without `lease pr` keep the state as computed.
-    if [[ "$CLAIM_STATE" == "stale" || "$CLAIM_STATE" == "stale-bounded-fallback" ]]; then
-        case "$LABEL" in
-            loom:reviewing) LEASE_ROLE="judge" ;;
-            loom:treating) LEASE_ROLE="doctor" ;;
-            loom:curating) LEASE_ROLE="curator" ;;
-            *) LEASE_ROLE="" ;;
-        esac
-        if [[ -n "$LEASE_ROLE" ]]; then
-            # requires-daemon: forge optional   Without `lease pr check` (absent or older binary) the output has no PR_LEASE_STATE and the computed state stands.
-            LEASE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease pr check "$NUMBER" --role "$LEASE_ROLE" 2>/dev/null || true)"
-            if grep -Eq '^PR_LEASE_STATE=held-(self|peer)([[:space:]]|$)' <<<"$LEASE_OUT"; then
-                CLAIM_STATE="fresh"
-            fi
-        fi
+    # #11947: a live PR lease outranks the idle/streak clocks (a holder waiting on CI
+    # renews it without activity markers). Only held-self/held-peer downgrades.
+    case "$LABEL" in loom:reviewing) LEASE_ROLE=judge ;; loom:treating) LEASE_ROLE=doctor ;; loom:curating) LEASE_ROLE=curator ;; *) LEASE_ROLE="" ;; esac
+    if [[ "$CLAIM_STATE" == stale* && -n "$LEASE_ROLE" ]]; then
+        # requires-daemon: lease optional   Without `lease pr check` (absent or older binary) the output has no PR_LEASE_STATE and the computed state stands.
+        LEASE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease pr check "$NUMBER" --role "$LEASE_ROLE" 2>/dev/null || true)"
+        grep -Eq '^PR_LEASE_STATE=held-(self|peer)([[:space:]]|$)' <<<"$LEASE_OUT" && CLAIM_STATE="fresh"
     fi
 fi
 
