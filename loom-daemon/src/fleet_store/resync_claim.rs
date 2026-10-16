@@ -229,6 +229,9 @@ pub struct ClaimGh(pub GhTransport);
 
 impl Transport for ClaimGh {
     fn get(&self, api_path: &str, _: Option<&str>, _: Option<&str>) -> Result<Reply> {
+        // Read-for-write (#12389 / #12394 allowlist): the claim ref is read
+        // right before this transport writes or deletes it, by the identity
+        // that created it, so it stays on the writer (`fleet_store`).
         self.0.get_as_writer(api_path)
     }
 }

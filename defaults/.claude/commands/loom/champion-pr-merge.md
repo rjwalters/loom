@@ -901,6 +901,7 @@ HEAD_SHA=$(jq -r '.headRefOid' <<<"$PR_JSON")
 # below — compute it FIRST, so the (e) comparison against the prior hold's
 # own bullet runs before deciding anything (#7048, #11416).
 CONCERN_BULLET="- **<AXIS>**: <SPECIFIC_CONCERN — name the file/function and what could break>"
+BLOCKER_NUMBERS=""   # #10937: open issue/PR numbers the concern names (e.g. "pending verification in #N"); empty if none
 PRIOR_CONCERN_BULLET=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:')
 
 if [ "$MANUAL_RELEASE_SINCE_HOLD" = true ] && [ "$CONCERN_BULLET" = "$PRIOR_CONCERN_BULLET" ]; then
@@ -950,6 +951,11 @@ Keeping \`loom:pr\`. This PR stays in the queue and is re-checked each tick agai
   # place of loom:pr.
   loom-daemon park-record apply --pr "$PR_NUMBER" --reason "champion merge-risk hold" \
     --by champion >/dev/null 2>&1 || true
+  # #10937: when the concern names an OPEN issue/PR, record it too (the extra
+  # record is inert: Guide skips a standing Champion hold; a closed or
+  # unnamed blocker makes `apply` refuse, leaving today's record). Never a release.
+  for N in $BLOCKER_NUMBERS; do loom-daemon park-record apply --pr "$PR_NUMBER" --blocked-by "$N" \
+    --reason "champion merge-risk hold: human evidence gate" --by champion >/dev/null 2>&1 || true; done
 
   # Do NOT merge this PR this pass. But do NOT drop it from the pass either
   # (#6720): a hold blocks the merge, it does not suspend the mechanical health

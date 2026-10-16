@@ -167,9 +167,13 @@ pub mod write_scope_refused;
 
 /// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
 pub mod checkout_external_change;
+pub mod roster_change;
 
 /// `host.export` (#11124).
 pub mod host_export;
+
+/// `host.status` (#12112) — fixed-interval host CPU/memory/disk/network gauges.
+pub mod host_status;
 
 /// Per-kind silence thresholds for `otlp_export` health (#12120).
 pub mod kind_silence;
@@ -465,6 +469,12 @@ macro_rules! telemetry_kind_table {
             /// it made unreachable. OTLP-only. See [`checkout_external_change`].
             CheckoutExternalChange = "checkout.external_change" => $crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+            /// The roster pass changed this host's workspace registry, or could
+            /// not register a desired repo because it is not cloned (Issue
+            /// #12322). Emitted whatever the repo's queue holds. OTLP-only. See
+            /// [`roster_change`].
+            RosterChange = "roster.change" => $crate::telemetry::kinds::roster_change::RosterChangeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One curation completion's blind difficulty estimate (#11608).
             IssueEstimate = "issue.estimate" => $crate::telemetry::kinds::issue_estimate::IssueEstimateRecord,
@@ -492,6 +502,12 @@ macro_rules! telemetry_kind_table {
             /// See [`scope_memory`].
             ScopeMemory = "scope.memory" => $crate::telemetry::kinds::scope_memory::ScopeMemoryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A fixed-interval sample of this host's CPU, memory, disk and
+            /// network, raw and EWMA-filtered (#12112, slice a of #11809). OTLP
+            /// gauges only. See [`host_status`].
+            HostStatus = "host.status" => $crate::telemetry::kinds::host_status::HostStatusRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Gauges, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

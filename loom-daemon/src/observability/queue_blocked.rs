@@ -127,7 +127,28 @@ pub fn append(record: &mut QueueSnapshotRecord, rows: Vec<QueueSnapshotRow>) {
     }
 }
 
-/// List `loom:blocked` for every managed repo and return the rows. A repo
+/// Where one workspace's blocked listing comes from.
+enum Rows {
+    /// The tick's snapshot (mirror mode, #12307); nothing is listed.
+    Snapshot(Vec<RestIssue>),
+    /// Mirror mode, and the snapshot has not read the repo: no rows, like a
+    /// failed listing.
+    Skip,
+    /// Not mirror mode: list it.
+    List,
+}
+
+fn snapshot_rows(root: &Path) -> Rows {
+    use crate::discovery::published::{lookup, Lookup};
+    match lookup(root) {
+        Lookup::Repo(repo) => Rows::Snapshot(repo.rows.clone()),
+        Lookup::Absent => Rows::Skip,
+        Lookup::NotMirror => Rows::List,
+    }
+}
+
+/// List `loom:blocked` for every managed repo and return the rows (from the
+/// tick's snapshot in mirror mode, #12307). A repo
 /// whose slug cannot be resolved, or whose listing fails, contributes nothing
 /// (logged at debug; the ready rows are unaffected).
 pub(super) async fn collect(
@@ -145,8 +166,15 @@ pub(super) async fn collect(
         if !listed.insert(slug.clone()) {
             continue;
         }
-        let Some(listing) = list_open(root, BLOCKED_LABEL, "queue_blocked").await else {
-            continue;
+        let listing = match snapshot_rows(&root) {
+            Rows::Snapshot(rows) => rows,
+            Rows::Skip => continue,
+            Rows::List => {
+                let Some(listing) = list_open(root, BLOCKED_LABEL, "queue_blocked").await else {
+                    continue;
+                };
+                listing
+            }
         };
         let repo = QueueRepoRef {
             visibility: super::collector::resolve_visibility(&slug).await,

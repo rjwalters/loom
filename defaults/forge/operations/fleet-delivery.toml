@@ -738,6 +738,12 @@ path = "loom-daemon/src/release_fetch/fetch.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/install_compat_harness.rs"
+# The optional merge-queue group-check template (#12323) downloads the
+# loom-daemon release asset (and its .sha256) before running
+# `forge merge-queue group-check`.
+[[operation.callers]]
+kind = "workflow"
+path = "defaults/optional/github-workflows/merge-group-check.yml"
 
 [[operation]]
 id = "release.publish"

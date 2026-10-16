@@ -57,9 +57,10 @@ impl RepoStatus {
     }
 }
 
-/// A repo's freshness as the mirror last reported it. Recorded, never acted
-/// on: a stale repo is served anyway, because claims and merges re-read the
-/// forge live.
+/// A repo's freshness as the mirror last reported it. A stale repo is served
+/// anyway, because claims and merges re-read the forge live. This view is only
+/// recorded; a repo the mirror cannot vouch for at all (unknown, gone, never
+/// reconciled) is refused earlier, by `TickWorklist::repo`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatermarkView {
     pub last_event_at: Option<DateTime<Utc>>,

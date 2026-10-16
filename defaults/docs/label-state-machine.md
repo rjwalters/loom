@@ -34,6 +34,7 @@ leaves the issue uncurated. The rubric is in `.loom/docs/story-points.md`.
 - [The kind comes from the body (#11795)](#the-kind-comes-from-the-body-11795)
 - [Fact-based de-escalation of a Champion `proposal-escalated` hold (#7650, retired by #11861)](#fact-based-de-escalation-of-a-champion-proposal-escalated-hold-7650-retired-by-11861)
 - [PR verdict-label mutual exclusion: three independent layers (#8112)](#pr-verdict-label-mutual-exclusion-three-independent-layers-8112)
+- [CI-gate recovery (#10178)](#ci-gate-recovery-10178)
 - [Follow-up work](#follow-up-work)
 - [Label registry: the source of truth (#10013)](#label-registry-the-source-of-truth-10013)
 - [No-op hold (#10156)](#no-op-hold-10156)
@@ -459,6 +460,17 @@ No role acts on any of these (#11861): the kind tells the human what to do.
 A capability marker on a `loom:operator` item is inert; the capability lane
 reads `loom:blocked` only (below).
 
+### Tracker marker (`<!-- loom:tracker -->`, #10886)
+
+A body marker (not a label, not a hold) for a living tracker or governance hub
+that is meant to stay open with no finite deliverable. It must be a line by
+itself outside any code fence; a quoted or inline mention does not count.
+Champion's Priority 2 discovery skips it and `champion-issue-promo.md` treats it
+as `ALREADY_ROUTED`, so no rejection is counted and it never reaches the N=2
+escalation; Curator leaves it as found. Remove the marker to restore normal
+evaluation. It does not suppress a human-filed `loom:operator` decision.
+`loom:needs-capability` waits need no marker: the registry `hold` set covers them.
+
 ### Capability marker (`<!-- loom:capability=<name> -->`, #6885/#6892)
 
 The marker states, machine-readably, what capability an item needs. On a
@@ -752,6 +764,21 @@ not in doubt, a human decision is. Remove the label and merge; both PR holds
 record that removal instead of re-asserting it over you. Procedure and scoping:
 ["Releasing a Champion hold and merging it yourself"](#releasing-a-champion-hold-and-merging-it-yourself-9016)
 above. Nothing about the guard changes for any other blocking label.
+
+## CI-gate recovery (#10178)
+
+A Judge CI-failing verdict leaves `loom:changes-requested` + `loom:ci-failure`.
+Head-move invalidation never fires when the head does not move, and refuses a
+`loom:blocked` PR. A daemon pass (`claim_reconciliation/ci_gate_recovery.rs`,
+behind `LOOM_VERDICT_STALENESS_RECONCILE`) therefore returns such a PR to
+`loom:review-requested` once `wait-checks` reports the **exact head** green, and
+only for a CI-only verdict (`<!-- loom:ci-gate-only -->`). It never touches
+`loom:operator*`, `loom:frozen`, a Champion hold, or a `loom:blocked` that is not
+a park record with no blocker and `reason="ci-gate"`.
+
+A CI-only gate must not add `loom:blocked`; if one is unavoidable, park with
+`loom-daemon park-record apply --issue <PR> --reason ci-gate --by judge` so the
+pass can tell it from a real hold.
 
 ## Follow-up work
 
