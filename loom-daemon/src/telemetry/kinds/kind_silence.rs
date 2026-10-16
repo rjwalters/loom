@@ -49,6 +49,8 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("issue.estimate", None),
     ("stage.work_started", None),
     ("backlog.level", None),
+    ("daemon.exit", None),
+    ("scope.memory", None),
 ];
 
 /// How long `kind` may stay silent; `None` when it is exempt.

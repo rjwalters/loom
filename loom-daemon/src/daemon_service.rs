@@ -216,6 +216,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
         };
     }
 
+    // #12246: children overwrite `LOOM_WORKSPACE` with their target repo;
+    // this keeps the daemon's own (where the fleet's host-local tier lives).
+    loom_daemon::ram_scope_limit::export_daemon_workspace();
+
     // Setup logging to ~/.loom/daemon.log
     setup_logging()?;
 
@@ -1006,6 +1010,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // dispatch backoff above.
     let noop_cooldown_config = sweep_registry::resolve_noop_cooldown_config(&sweep_workspace);
     sweep.set_noop_cooldown_config(noop_cooldown_config);
+    // #11481: re-arm windows a restart would otherwise drop.
+    sweep.replay_noop_cooldown_from_journal(chrono::Utc::now());
     log::info!(
         "sweep_registry: no-op re-dispatch cooldown {} (cooldown={}s) (#6670)",
         if noop_cooldown_config.enabled {
@@ -1090,6 +1096,15 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let workspace_pool =
         Arc::new(WorkspacePool::new(event_bus.clone(), tokio::runtime::Handle::current()));
     workspace_pool.seed(sweep_workspace.clone(), sweep_registry.clone());
+    // #11839: let the exit funnel list in-flight sweeps for `daemon.exit`.
+    loom_daemon::observability::daemon_exit::mark_started();
+    {
+        let pool = workspace_pool.clone();
+        let root = sweep_workspace.clone();
+        loom_daemon::observability::daemon_exit::register_in_flight_lister(move || {
+            loom_daemon::ipc::in_flight_sweep_ids(&pool, &root)
+        });
+    }
 
     // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
     // connection that advertises this daemon's dispatch claims and consumes peer
@@ -1416,6 +1431,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // shared `workspace_pool`. Empty registry ⇒ the single `sweep_workspace`.
         //
         // `startup_reconciliation_ready` (Issue #7974) is awaited internally
+        // (bounded since #12222, see `work_finder::startup_gate`)
         // before the loop's first real tick — see `spawn_startup_passes`'s doc
         // comment above for why this is what still keeps the
         // reconcile-before-dispatch invariant (#6615) intact now that the
@@ -2039,7 +2055,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::info!(
             "Socket cleaned up, exiting {code} ({signal_name} received — no supervised relaunch)"
         );
-        loom_daemon::observability::shutdown::exit(code).await;
+        loom_daemon::observability::shutdown::exit(
+            code,
+            loom_daemon::observability::daemon_exit::ExitCause::Signal(signal_name),
+        )
+        .await;
     });
 
     log::info!("Loom daemon starting...");

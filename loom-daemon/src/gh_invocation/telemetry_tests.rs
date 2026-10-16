@@ -424,3 +424,29 @@ fn a_front_read_carries_the_agents_command_and_its_own_route() {
     assert_eq!(attr(&spans[0], "github.route"), Some("/repos/{owner}/{repo}/pulls/{n}"));
     assert_eq!(attr(&spans[0], "http.request.method"), Some("GET"));
 }
+
+// #12256: the tick's forge calls parent to its span.
+#[test]
+fn a_thread_parent_is_the_ambient_parent_until_its_guard_drops() {
+    set_test_ambient(None, None);
+    assert_eq!(ParentContext::ambient(), ParentContext::Missing);
+    let tick = TraceContext::derived("loom.dispatch.tick", &["2026-10-15T00:00:00Z"]);
+    {
+        let _g = enter_parent(Some(tick.clone()));
+        assert_eq!(ParentContext::ambient(), ParentContext::Parent(tick.clone()));
+        let inv = GhInvocation::new(
+            Operation::new("issue.list"),
+            AccessIntent::Read,
+            GhTarget::None,
+            Duration::from_secs(5),
+        );
+        let span = InvocationSpan::open(&inv);
+        assert_eq!(span.parent_span_id.as_ref(), Some(&tick.span_id));
+        assert_eq!(span.context.trace_id, tick.trace_id);
+        // Another thread does not see it.
+        std::thread::spawn(|| assert_eq!(thread_parent(), None))
+            .join()
+            .unwrap();
+    }
+    assert_eq!(ParentContext::ambient(), ParentContext::Missing);
+}

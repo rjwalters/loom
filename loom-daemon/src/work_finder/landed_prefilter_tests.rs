@@ -148,6 +148,130 @@ fn the_query_asks_for_closed_prs_and_the_last_reopen() {
     assert!(q.contains("includeClosedPrs: true"), "{q}");
     assert!(q.contains("REOPENED_EVENT") && q.contains("mergedAt"), "{q}");
     assert!(q.contains("repository { nameWithOwner }"), "{q}");
+    // #12251: the merged PRs of each issue's Builder branch, and the default
+    // branch they must target.
+    assert!(
+        q.contains("b7: pullRequests(headRefName: \"feature/issue-7\", states: [MERGED]"),
+        "{q}"
+    );
+    assert!(q.contains("b9: pullRequests(headRefName: \"feature/issue-9\""), "{q}");
+    assert!(q.contains("defaultBranchRef { name }"), "{q}");
+    assert!(
+        q.contains("baseRefName") && q.contains("headRepository { nameWithOwner }"),
+        "{q}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The Builder-branch landing (#12251)
+// ---------------------------------------------------------------------------
+
+fn branch_pr(number: u32, merged_at: &str, base: &str, head_repo: &str) -> Value {
+    json!({
+        "number": number,
+        "mergedAt": merged_at,
+        "baseRefName": base,
+        "headRepository": { "nameWithOwner": head_repo },
+    })
+}
+
+fn branch_prs(prs: &[Value]) -> Value {
+    json!({ "nodes": prs })
+}
+
+/// A PR built on `feature/issue-N`, merged into the default branch with no
+/// closing keyword, lands issue N: it is not in the closes-graph, but it
+/// finished the work. A merge into another branch, a head in another
+/// repository, or a merge older than the last reopen does not count.
+#[test]
+fn a_merged_builder_branch_pr_lands_the_issue() {
+    let open = alias("OPEN", None, &[], None);
+    let prs = branch_prs(&[branch_pr(40, T1, "main", REPO)]);
+    assert_eq!(branch_landing(&open, &prs, "main", REPO), Some(40));
+    let latest = branch_prs(&[
+        branch_pr(40, T1, "main", REPO),
+        branch_pr(41, T2, "main", REPO),
+    ]);
+    assert_eq!(branch_landing(&open, &latest, "main", REPO), Some(41));
+
+    let stacked = branch_prs(&[branch_pr(40, T1, "feature/issue-3", REPO)]);
+    assert_eq!(branch_landing(&open, &stacked, "main", REPO), None, "not the default branch");
+    let fork = branch_prs(&[branch_pr(40, T1, "main", "outsider/fork")]);
+    assert_eq!(branch_landing(&open, &fork, "main", REPO), None, "a fork's branch");
+    let reopened = alias("OPEN", Some(T2), &[], None);
+    assert_eq!(branch_landing(&reopened, &prs, "main", REPO), None, "reopened after");
+    let closed = alias("CLOSED", None, &[], None);
+    assert_eq!(branch_landing(&closed, &prs, "main", REPO), None, "the 2.5 guard's");
+    assert_eq!(branch_landing(&open, &prs, "", REPO), None, "no default branch read");
+}
+
+/// The answer's verdict: a closing merge names the landing; failing one, a
+/// Builder-branch merge does. The branch read only adds a landing: a missing
+/// branch alias keeps the closes-graph's verdict, verified or not.
+#[test]
+fn parse_landed_counts_a_builder_branch_merge_as_landed() {
+    let body = json!({ "data": { "repository": {
+        "defaultBranchRef": { "name": "main" },
+        "i1": alias("OPEN", None, &[], None),
+        "b1": branch_prs(&[branch_pr(40, T1, "main", REPO)]),
+        "i2": alias("OPEN", None, &[pr(50, "MERGED", Some(T1))], None),
+        "b2": branch_prs(&[branch_pr(51, T2, "main", REPO)]),
+        "i3": alias("OPEN", None, &[], None),
+        "b3": branch_prs(&[]),
+        "i4": alias("OPEN", None, &[], None),
+        "i5": alias("OPEN", None, &[pr(60, "OPEN", None)], Some(30)),
+        "b5": branch_prs(&[branch_pr(61, T1, "main", REPO)]),
+    } } })
+    .to_string();
+    let parsed = parse_landed(&body, &[1, 2, 3, 4, 5], REPO).unwrap();
+    assert_eq!(parsed.get(&1), Some(&Some(40)), "branch-linked, no keyword");
+    assert_eq!(parsed.get(&2), Some(&Some(50)), "the closing merge names it");
+    assert_eq!(parsed.get(&3), Some(&None));
+    assert_eq!(parsed.get(&4), Some(&None), "no branch alias: the closes-graph's verdict");
+    assert_eq!(parsed.get(&5), Some(&Some(61)), "a truncated graph, but a branch merge");
+}
+
+/// #12251: the Builder spawn's check. A branch-linked landing is routed to
+/// Curator and refuses the spawn, so the step draw has no Builder step on the
+/// issue after it (its `loom:issue` is gone); an issue that has not landed,
+/// or one Curator kept, spawns. Every spawn asks afresh.
+#[test]
+fn the_spawn_check_refuses_a_landed_issue_and_routes_it_to_curator() {
+    let mut forge = FakeForge::default()
+        .with_labels(5, &["loom:issue"])
+        .with_labels(6, &["loom:issue"])
+        .with_labels(7, &["loom:issue"]);
+    forge.graph.insert(5, Some(40));
+    forge.graph.insert(6, None);
+    forge.graph.insert(7, Some(70));
+    forge.marked.insert((7, 70));
+    let mut cache = LandedCache::default();
+    let now = Instant::now();
+
+    assert_eq!(spawn_check(&mut forge, &mut cache, 5, now), Some(40));
+    assert_eq!(forge.writes[0], "+5 loom:triage");
+    assert_eq!(forge.writes[1], "-5 loom:issue");
+    assert!(forge.writes[2].contains(&route_marker(40)), "{:?}", forge.writes);
+
+    assert_eq!(spawn_check(&mut forge, &mut cache, 6, now), None, "not landed");
+    assert_eq!(spawn_check(&mut forge, &mut cache, 7, now), None, "Curator kept it");
+    assert_eq!(forge.writes.len(), 3, "{:?}", forge.writes);
+    assert_eq!(spawn_check(&mut forge, &mut cache, 6, now), None);
+    assert_eq!(forge.asked.len(), 4, "every spawn asks, fresh verdict or not");
+}
+
+/// The spawn check fails open: no answer is a spawn, and the backoff after an
+/// unanswered query is honoured without asking.
+#[test]
+fn the_spawn_check_fails_open() {
+    let mut forge = FakeForge::default().with_labels(5, &["loom:issue"]);
+    let mut cache = LandedCache::default();
+    let now = Instant::now();
+    assert_eq!(spawn_check(&mut forge, &mut cache, 5, now), None, "no verdict");
+    cache.failed_at = Some(now);
+    forge.graph.insert(5, Some(40));
+    assert_eq!(spawn_check(&mut forge, &mut cache, 5, now), None, "backing off");
+    assert_eq!(forge.asked.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +548,170 @@ fn an_unanswered_query_removes_nothing() {
     }
     let mut cache = LandedCache::default();
     assert!(detect(&mut Down, &mut cache, &[1, 2], &[], Instant::now()).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Cost (#12205)
+// ---------------------------------------------------------------------------
+
+/// The step gather hands every `loom:issue` item over, open PR or not. A
+/// candidate with an open PR is never asked about, so a workspace whose only
+/// unanswered candidate has a PR in review makes no query, tick after tick.
+/// Before #12205 its verdict was dropped and it was re-asked every tick.
+#[test]
+fn a_candidate_with_an_open_pr_is_never_asked_about() {
+    let mut forge = FakeForge::default();
+    forge.graph.insert(5, None);
+    forge.graph.insert(6, None);
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+    for tick in 0..10u64 {
+        let now = t0 + Duration::from_secs(60 * tick);
+        assert!(detect(&mut forge, &mut cache, &[5, 6], &[5], now).is_empty());
+    }
+    assert_eq!(forge.asked, vec![vec![6]], "one query, and never for #5");
+}
+
+/// A cached verdict makes no forge call: ticks inside the verdict's life
+/// cost nothing, and a candidate that turns up later brings the half-aged
+/// verdicts along, so the workspace's verdicts expire together and it pays
+/// one query per half [`LANDED_RECHECK`] at most, not one per tick.
+#[test]
+fn cached_verdicts_make_no_call_and_expiries_are_coalesced() {
+    let mut forge = FakeForge::default();
+    for n in [5, 6, 7] {
+        forge.graph.insert(n, None);
+    }
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+    let minute = Duration::from_secs(60);
+    detect(&mut forge, &mut cache, &[5], &[], t0);
+    for m in 1..20u32 {
+        detect(&mut forge, &mut cache, &[5], &[], t0 + minute * m);
+    }
+    assert_eq!(forge.asked, vec![vec![5]], "a cached verdict makes no forge call");
+
+    // #6 is new at minute 20: asked, and #5 (20 minutes old) rides along.
+    detect(&mut forge, &mut cache, &[5, 6], &[], t0 + minute * 20);
+    assert_eq!(forge.asked.last().unwrap(), &vec![6, 5]);
+    // #7 at minute 25: #5 and #6 are only 5 minutes old, so #7 goes alone.
+    detect(&mut forge, &mut cache, &[5, 6, 7], &[], t0 + minute * 25);
+    assert_eq!(forge.asked.last().unwrap(), &vec![7]);
+    // Up to minute 45 every verdict is fresh: no call at all.
+    for m in 26..45u32 {
+        detect(&mut forge, &mut cache, &[5, 6, 7], &[], t0 + minute * m);
+    }
+    assert_eq!(forge.asked.len(), 3, "{:?}", forge.asked);
+}
+
+/// An unanswered query is not repeated every tick: nothing is asked for
+/// [`LANDED_FAIL_BACKOFF`], then the question is asked again.
+#[test]
+fn an_unanswered_query_backs_off() {
+    struct Flaky {
+        up: bool,
+        asked: usize,
+    }
+    impl LandedForge for Flaky {
+        fn closing_verdicts(&mut self, issues: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
+            self.asked += 1;
+            self.up.then(|| issues.iter().map(|n| (*n, None)).collect())
+        }
+        fn labels(&mut self, _: u32) -> Result<Option<Vec<String>>> {
+            unreachable!()
+        }
+        fn route_marked(&mut self, _: u32, _: u32) -> Result<bool> {
+            unreachable!()
+        }
+        fn add_label(&mut self, _: u32, _: &str) -> bool {
+            unreachable!()
+        }
+        fn remove_label(&mut self, _: u32, _: &str) -> bool {
+            unreachable!()
+        }
+        fn comment(&mut self, _: u32, _: &str) -> bool {
+            unreachable!()
+        }
+    }
+    let mut forge = Flaky {
+        up: false,
+        asked: 0,
+    };
+    let mut cache = LandedCache::default();
+    let t0 = Instant::now();
+    for s in (0..LANDED_FAIL_BACKOFF.as_secs()).step_by(60) {
+        detect(&mut forge, &mut cache, &[1], &[], t0 + Duration::from_secs(s));
+        lift(&mut forge, &mut cache, &[1], t0 + Duration::from_secs(s));
+    }
+    assert_eq!(forge.asked, 1, "one query per backoff, not one per tick");
+    forge.up = true;
+    detect(&mut forge, &mut cache, &[1], &[], t0 + LANDED_FAIL_BACKOFF);
+    assert_eq!(forge.asked, 2);
+    detect(&mut forge, &mut cache, &[1], &[], t0 + LANDED_FAIL_BACKOFF);
+    assert_eq!(forge.asked, 2, "answered: cached again");
+}
+
+/// The pre-filter is off unless the live key says `true`.
+#[test]
+fn the_prefilter_is_off_unless_the_live_key_is_true() {
+    assert!(!prefilter_enabled_in(&json!({})));
+    assert!(!prefilter_enabled_in(&json!({ "autonomous": { "workFinder": {} } })));
+    assert!(!prefilter_enabled_in(
+        &json!({ "autonomous": { "workFinder": { "landedPrefilter": "yes" } } })
+    ));
+    assert!(!prefilter_enabled_in(
+        &json!({ "autonomous": { "workFinder": { "landedPrefilter": false } } })
+    ));
+    assert!(prefilter_enabled_in(
+        &json!({ "autonomous": { "workFinder": { "landedPrefilter": true } } })
+    ));
+
+    // Read live from the workspace's config: an edit applies on the next call.
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join(".loom/config.json");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    assert!(!prefilter_enabled(root.path()), "no config: off");
+    std::fs::write(&config, r#"{"autonomous":{"workFinder":{"landedPrefilter":true}}}"#).unwrap();
+    assert!(prefilter_enabled(root.path()));
+    std::fs::write(&config, r#"{"autonomous":{"workFinder":{"landedPrefilter":false}}}"#).unwrap();
+    assert!(!prefilter_enabled(root.path()));
+}
+
+/// The closes-graph read is a repo-targeted Hygiene read: the facade offers
+/// it to the reader pool, and with every reader out of budget it is shed
+/// (no request, no verdict) instead of spilling onto the dispatch App.
+#[test]
+fn the_closes_graph_read_goes_to_the_reader_pool_and_is_shed_not_spilled() {
+    use crate::forge_identity::{ExhaustCause, ReadClass, RouteDecision};
+    use crate::gh_invocation::test_routing::{install, seen, sheds, TestRouting};
+    let root = tempfile::tempdir().unwrap();
+    let _g = install(TestRouting {
+        decision: RouteDecision::Exhausted {
+            until: std::time::SystemTime::now() + Duration::from_secs(900),
+            cause: ExhaustCause::Budget,
+        },
+        env: Default::default(),
+        checkout: crate::gh_invocation::cwd_route::CwdAnswer::Sole("acme/shed".into()),
+        shed: true,
+    });
+    let mut forge = GhLandedForge {
+        gh_bin: PathBuf::from("gh"),
+        root: root.path().to_path_buf(),
+        slug: "acme/shed".to_string(),
+    };
+    assert_eq!(forge.closing_verdicts(&[5, 6]), None, "a shed is no verdict");
+    assert_eq!(sheds(), 1, "shed, never run on the writer");
+    let seen = seen();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].op, "work_finder.landed_closing_refs");
+    assert_eq!(seen[0].class, ReadClass::Hygiene);
+    let inv = closing_refs_invocation(std::path::Path::new("gh"), root.path(), "acme/shed", &[5])
+        .unwrap();
+    assert_eq!(inv.target().slug().as_deref(), Some("acme/shed"));
+    assert!(
+        closing_refs_invocation(std::path::Path::new("gh"), root.path(), "acme/x\"", &[5])
+            .is_none()
+    );
 }
 
 // ---------------------------------------------------------------------------

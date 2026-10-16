@@ -424,3 +424,70 @@ fn emit_step_ended_publishes_the_ledger_classification() {
     );
     assert!(sub.try_recv().is_err(), "exactly one event per ended step");
 }
+
+/// #12251: the registry mirrors its ledger to the workspace's logs directory
+/// and a new registry on the same workspace (a daemon restart or roll)
+/// reloads it, so the repeat cap holds across the restart and this host's
+/// own windows come back.
+#[test]
+#[serial]
+fn the_repeat_cap_and_windows_survive_a_registry_restart() {
+    let dir = tempdir().unwrap();
+    {
+        let (mut reg, _rx) = registry(dir.path());
+        for _ in 0..2 {
+            let rec = reg.record_step_outcome(
+                &run(31, StepRole::Builder, OutcomeClass::Failed, "crashed", 600),
+                &mut FakeForge::default(),
+            );
+            assert!(!rec.repeat_capped);
+        }
+        reg.hold_landed_builder(32);
+    }
+    assert!(dir
+        .path()
+        .join(".loom/logs")
+        .join(STEP_LEDGER_FILE)
+        .exists());
+
+    let (mut reg, _rx) = registry(dir.path());
+    let now = Utc::now();
+    assert!(
+        reg.step_cooldowns(now)
+            .is_cooling(32, StepRole::Builder, now),
+        "the landed Builder hold came back"
+    );
+    let rec = reg.record_step_outcome(
+        &run(31, StepRole::Builder, OutcomeClass::Failed, "crashed", 600),
+        &mut FakeForge::default(),
+    );
+    assert!(rec.repeat_capped, "the third run caps across the restart");
+}
+
+/// #12251: a Builder refused on a landed issue is held off it fleet-wide for
+/// [`LANDED_COOLDOWN`]: the window is local, broadcast, and Curator's verdict
+/// on the item lifts it like any verdict.
+#[test]
+fn a_landed_builder_hold_is_broadcast_and_a_verdict_lifts_it() {
+    let dir = tempdir().unwrap();
+    let (mut reg, mut rx) = registry(dir.path());
+    reg.hold_landed_builder(40);
+    let now = Utc::now();
+    assert!(reg
+        .step_cooldowns(now)
+        .is_cooling(40, StepRole::Builder, now));
+    let ads = step_ads(&drain(&mut rx));
+    assert_eq!(ads.len(), 1, "{ads:?}");
+    assert_eq!((ads[0].0, ads[0].1), (40, Some(StepRole::Builder)));
+    let secs = LANDED_COOLDOWN.as_secs();
+    assert!((secs - 10..=secs).contains(&ads[0].2), "{ads:?}");
+
+    reg.record_step_outcome(
+        &run(40, StepRole::Curator, OutcomeClass::Verdict, "kept", 300),
+        &mut FakeForge::default(),
+    );
+    let now = Utc::now();
+    assert!(!reg
+        .step_cooldowns(now)
+        .is_cooling(40, StepRole::Builder, now));
+}

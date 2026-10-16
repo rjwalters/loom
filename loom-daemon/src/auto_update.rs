@@ -1880,6 +1880,7 @@ fn backoff_delay(failures: u32) -> Duration {
 // which added panic recovery, a tick watchdog, liveness and `auto_update.tick`
 // telemetry; this file is over the file-size ratchet threshold.
 mod runner;
+mod stall_recheck;
 mod tick_telemetry;
 #[cfg(test)]
 use runner::run_tick;

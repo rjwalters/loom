@@ -390,3 +390,8 @@ fn frozen_shell_and_rust_cli_agree_or_differ_only_by_named_class() {
         "coverage floor not met (failing, pending, null-name, newline-name, multi-line): {saw:?}"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

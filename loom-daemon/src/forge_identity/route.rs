@@ -691,18 +691,39 @@ pub struct RouteEnv<'a> {
     pub cfg: &'a RoutingConfig,
 }
 
-/// Route one read for the daemon's workspace (see the module docs).
+/// Route one read for the daemon's workspace (see the module docs), or in
+/// the agent `gh` front for the reader root the daemon exported to it
+/// ([`super::front_root`], #12207).
 #[must_use]
 pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
     if !is_github(req.host) {
         return RouteDecision::NoPool;
     }
-    let Some(ws) = super::workspace_root() else {
-        return RouteDecision::NoPool;
+    let (ws, front) = match (super::workspace_root(), super::front_root()) {
+        (Some(ws), _) => (ws, false),
+        (None, Some(ws)) => (ws, true),
+        (None, None) => return RouteDecision::NoPool,
     };
     let mode = RoutingMode::current();
     let cfg = cached_routing(ws);
-    route_read_in(ws, &super::cached(ws), req, &RouteEnv { mode, cfg: &cfg }, now)
+    let decision = route_read_in(ws, &super::cached(ws), req, &RouteEnv { mode, cfg: &cfg }, now);
+    if front {
+        trusted_in_front(decision, &crate::forge_gateway::trusted_profile)
+    } else {
+        decision
+    }
+}
+
+/// The front found its reader root in its environment, not by publishing it:
+/// a reader directory it would hand to `gh` must be private to this user,
+/// as the daemon writes it (0700, `hosts.yml` 0600), or the read goes to the
+/// writer ([`RouteDecision::NoPool`]).
+#[must_use]
+pub fn trusted_in_front(decision: RouteDecision, trusted: &dyn Fn(&Path) -> bool) -> RouteDecision {
+    match decision {
+        RouteDecision::Reader { ref dir, .. } if !trusted(dir) => RouteDecision::NoPool,
+        other => other,
+    }
 }
 
 fn is_github(host: Option<&str>) -> bool {

@@ -103,6 +103,50 @@ pub fn workspace_root() -> Option<&'static Path> {
     WORKSPACE_ROOT.get().map(PathBuf::as_path)
 }
 
+/// Exported to agent sessions (#12207): the daemon's workspace root, whose
+/// roster and published reader directories the agent `gh` front's served
+/// reads may use when no gateway profile answers for the owner. A
+/// directory, never a credential.
+pub const FRONT_ROOT_ENV: &str = "LOOM_GH_READER_ROOT";
+
+/// The reader root the agent front adopted ([`enable_front_readers`]).
+/// Separate from [`WORKSPACE_ROOT`] on purpose: only [`route_read`] consults
+/// it, so the front gains the reader pool and nothing else the daemon's root
+/// switches on (the bucket-book probes stay daemon-only).
+static FRONT_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// `value` as a reader root: an absolute path with a `.loom/` directory.
+fn reader_root_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && p.join(".loom").is_dir())
+}
+
+/// The agent front's half: adopt [`FRONT_ROOT_ENV`] once per process. A
+/// no-op in the daemon, whose own root always wins.
+pub fn enable_front_readers() {
+    if WORKSPACE_ROOT.get().is_none() {
+        let _ = FRONT_ROOT.set(reader_root_from(std::env::var_os(FRONT_ROOT_ENV)));
+    }
+}
+
+/// The reader root adopted by [`enable_front_readers`], if any.
+pub(crate) fn front_root() -> Option<&'static Path> {
+    FRONT_ROOT.get()?.as_deref()
+}
+
+/// [`FRONT_ROOT_ENV`]'s value for an agent session: this daemon's root, or
+/// in a non-daemon spawner (the `loom-daemon worker` process) the root it
+/// inherited from the daemon.
+#[must_use]
+pub fn agent_reader_root() -> Option<std::ffi::OsString> {
+    workspace_root()
+        .map(Path::to_path_buf)
+        .or_else(|| reader_root_from(std::env::var_os(FRONT_ROOT_ENV)))
+        .map(PathBuf::into_os_string)
+}
+
 /// One GitHub App the fleet acts as.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -233,11 +233,22 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "fake\n");
     }
 
+    /// Set only by [`a_leaking_test_fails_its_binary_naming_argv`] for its
+    /// child, so the fixture below leaks only there.
+    const FIXTURE_ENV: &str = "LOOM_LIVE_GH_GUARD_FIXTURE";
+
     /// A test that leaks a real-`gh` spawn and swallows the error. Ignored, so
     /// it runs only inside the child process of the self-test below.
     #[test]
     #[ignore = "fixture: run only by a_leaking_test_fails_its_binary_naming_argv"]
     fn leaking_fixture() {
+        // #10225 compiles this module into every integration crate, and
+        // release/CI Daily run those crates with `--ignored`. Leak only when
+        // the self-test below launched us; under a plain `--ignored` run, do
+        // nothing, or the guard fails a binary that never touched `gh`.
+        if std::env::var_os(FIXTURE_ENV).is_none() {
+            return;
+        }
         let _ = Command::new(guard_stand_in())
             .args(["api", "repos/o/r/pulls", "--paginate"])
             .output();
@@ -254,6 +265,7 @@ mod tests {
                 "--ignored",
             ])
             .env_remove(LOG_ENV)
+            .env(FIXTURE_ENV, "1")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);

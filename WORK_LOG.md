@@ -6,7 +6,149 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-15
+- **Issue #11846** (closed): Curator re-check posts (dep-recheck / operator-premise-recheck) race: decide runs before the claim and the post is unlocked
+- **Issue #12013** (closed): test: measure loom-daemon test-build time and consolidate integration-test binaries if linking dominates
+- **Issue #11042** (closed): Floor-loop follow-ups: unsupervised hosts re-download every tick; typed not-rolling reason; status enabled semantics
+- **PR #11261**: fix(auto_update): stop unsupervised re-downloads; typed below-floor not-rolling reason (#11042)
+- **PR #11996**: Champion: step back when a claimed proposal was already decided (#11989)
+- **Issue #9573** (closed): daemon: dispatch_sweep guard chain (Issue kind) must run outside the SweepRegistry mutex (split from #9572)
+- **PR #11808**: fix(daemon): release SweepRegistry mutex around forge calls on Issue dispatch (#9573)
+- **Issue #11957** (closed): Startup App-mint timeout leaves cross-owner roots unregistered for the process lifetime: write scope refuses every 2AMLogic root (not in this App installation)
+- **PR #11997**: Retry per-owner App credentials after a failed startup mint (#11957)
+- **Issue #11189** (closed): Epic: fleet workers stop filling their disks — bound per-sweep build output and reclaim what the reaper misses (loom-worker-1, 2026-10-09)
+- **Issue #12025** (closed): A partial work-finder listing degrades to hundreds of per-item open-PR probes; fail closed
+- **PR #12070**: work finder: fail closed on an unreadable or partial listing (#12025)
+- **Issue #11194** (closed): Judge worktrees: align supported checkout guidance and report legacy directories without reclaiming them
+- **PR #11732**: Judge worktrees: align checkout guidance and report unrecognized dirs (#11194)
+- **Issue #9806** (closed): test suite: gate pool-dependent tests on fixture state, de-flake the parallelism set (full-suite reds on clean hosts)
+- **PR #12071**: test: pin Claude pool fixture in runtime_preference pool-gated tests (#9806)
+- **Issue #12060** (closed): CI red on main: step_ledger a_noop_cools_locally test fails (also systemd_autonomy marker test on PR #12052)
+- **PR #12069**: test(daemon_start): wait for child's /proc environ before marker assert (#12060)
+- **PR #12067**: fix(bash-3.2): installed-file guard fail-open + 3.2 suite fixes, per-PR 3.2 guard step (#12043)
+- **PR #11729**: fix(spawn-codex): split model@effort suffix before forwarding -m (#8387)
+- **PR #12064**: Fix red main: step_ledger test expected the hour for ci_pending
+- **Issue #11489** (closed): Codex pool: add Joseph's 2AM Logic Pro account (profile joseph-2am)
+- **Issue #10009** (closed): Operator-label review (Lane B of #10001): give every parked item in the wired repos a verdict and return what agents can do
+- **Issue #11944** (closed): Decision: bounded On-Demand compute for ETA fit jobs
+- **Issue #12036** (closed): Telemetry: structured 'unevaluated' reason + budget readings on stale_blocked_release (no behaviour change)
+- **PR #12056**: feat(telemetry): typed unevaluated_reason + budget readings on stale_blocked_release (#12036)
+- **Issue #12044** (closed): check-verified-corrections-preserved.sh hangs >20 min under macOS bash 3.2: per-paragraph ${NEW_PARAS//…} is quadratic (13s per call)
+- **PR #12054**: Fix bash 3.2 hang in check-verified-corrections-preserved.sh
+- **Issue #12042** (closed): Step dispatch: a Judge step on a PR with CI pending cools down for 1 h (the #12003 gate does not cover the step path)
+- **PR #12058**: step dispatch: hold a Judge step while CI runs at its PR head (#12042)
+- **Issue #12027** (closed): Telemetry: export Champion merge-gate decisions (refused/deferred + criterion + since) as a fact
+- **PR #12053**: feat(telemetry): Champion merge-gate + promotion verdicts as pass.verdict (#12027)
+- **Issue #11922** (closed): Champion --non-item: Priority 3 proposal query does not exclude loom:curated, so curated proposals get two owners
+- **PR #12040**: champion: Priority 3/4 skip loom:curated proposals
+- **Issue #11786** (closed): Red-main autofile: enable fleet-wide after canary + review hardening (#11773 follow-ups)
+- **Issue #11909** (closed): Step dispatch: live dispatch per root, epic BuildChildren gate, coexisting budgets
+- **PR #12009**: Step dispatch cutover: the step tick is the work finder's only item path (#11909)
+- **Issue #11960** (closed): telemetry(fleet_state): emit dispatch_blocked_reason + dispatch_blocked_since per ready item (like held_since) — the never-dispatched parked tail that is ~78% of ready_wait ETA error and the v8 pickup hazard can't see
+- **PR #12033**: telemetry(fleet_state): dispatch_blocked_reason + dispatch_blocked_since on ready rows
+- **Issue #12022** (closed): wait-checks --settle-red follow-ups: unknown-required TIMEOUT never settles; note leaks under --required-only; judge-ci-red wording (#12020)
+- **PR #12030**: fix(wait-checks): --settle-red never holds a finished red on the required set (#12022)
+- **Issue #11660** (closed): [ci-daily] Full Suite (clean, unpartitioned)
+- **PR #12031**: Deflake Full Suite: journal busy retry + second-boundary timestamp (#11660)
+- **Issue #12026** (closed): Docs lag 2am#4452 code: fleet-wide fast-fail streak, ci-pending release, Judge CI gate
+- **PR #12032**: docs: catch up with the 2am#4452 code (fleet-wide fast-fail streak, ci-pending release, Judge CI gate)
+- **Issue #12018** (closed): [ci-daily] Supply Chain
+- **PR #12023**: Bump rustls to 0.23.46 for RUSTSEC-2026-0346..0349
+- **Issue #11778** (closed): Test suite size: ~16k loom-daemon tests are slow locally and in CI
+- **Issue #12035** (closed): Champion: route an unheld approved PR with persistently red CI to Doctor (today it waits for the 24h stale route)
+- **Issue #11972** (closed): Judge backstop release re-reads CI and records verdict=none at a green head
+- **PR #12008**: Judge backstop: a ci-pending skip is never recorded at release (#11972)
+- **Issue #10463** (closed): github-app-token.sh puts the App JWT/installation token on curl's command line (seen by 2am secret.argv; ps-readable)
+- **PR #11807**: fix(defaults): keep forge credentials off curl argv (#10463)
+- **PR #11990**: hooks: run daemon-spawned sessions' hooks from the daemon's own release
+- **Issue #12012** (closed): ci: partition Rust Unit Tests 5 ways instead of 3 (the PR critical path after #11710's cuts)
+- **PR #12017**: ci: partition backend-tests nextest five ways instead of three (#12012)
+- **Issue #10199** (closed): hold-state-trust suite skips undefined assert_eq yet exits successfully
+- **PR #12007**: test(merge-pr): define missing assert_eq in hold-state-trust suite
+- **Issue #9896** (closed): Temp-dir leaks: loom-daemon release_fetch tests, loom-mcp-config, loom-review-feedback accumulate in $TMPDIR
+- **PR #12015**: fix: bound temp-dir leaks (#9896)
+- **Issue #12011** (closed): judge: no 'CI failing' verdict on an in-progress run; name the failing test and route untouched flakes to a recorded rerun
+- **PR #12020**: judge: no CI-failing verdict on a partial run; name the test; rerun tracked flakes once (#12011)
+- **Issue #12010** (closed): merge sequencing: never hold an approved PR behind a predecessor that is red, conflicting or unapproved
+- **PR #12021**: fix(merge-sequence): never hold behind a red or conflicting predecessor (#12010)
+- **Issue #11952** (closed): fast-fail park: a streak break leaves the receiver's own local streak, and base=0 forges a break
+- **PR #12006**: fast-fail park: a break resets the receiver's own streak, and is marked explicitly
+- **Issue #11951** (closed): loom-daemon-start.sh: stop writing autonomy env into systemd units
+- **PR #12004**: daemon-start: stop writing autonomy env into systemd units (#11951)
+- **Issue #11956** (closed): ETA telemetry: emit per-repo operator-action recency + purge-burst markers (gap 1 remainder of #11955)
+- **PR #11999**: Operator hold-release recency/burst markers and event actor capture on fleet.state
+- **Issue #11494** (closed): [ci-daily] Flake Detection (Rust)
+- **Issue #11973** (closed): Startup quarantine pass skipped under breaker trip; tick error results carry no reason
+- **PR #12005**: Retry the breaker-skipped startup quarantine pass; add loom.dispatch.error_kind
+- **Issue #9720** (closed): tests not isolated from the host: fleet_captain CLI tests read host defaults; test-provision-daemon fails on macOS 27
+- **PR #11998**: test: isolate bin-target tests and provision fixtures from the host (#9720)
+- **Issue #11992** (closed): telemetry: emit token-pool per-account exhaustion + reset timeline (expected_reset_at) so ready_wait's capacity-blocked tail becomes a countdown, not an unknown
+- **PR #12001**: telemetry: export tokens.snapshot reset instant as OTLP countdown gauges (#11992)
+- **Issue #11971** (closed): Judge spawned on PRs with pending CI: most runs are claim-and-release churn
+- **PR #12003**: Judge queue and spawn gate skip a PR while CI is pending at its head
+- **Issue #11970** (closed): Stale pre-#11888 Champion prompts re-add loom:operator to migrated holds, stranding approved PRs
+- **PR #11987**: Repair a stale prompt's loom:operator on Champion holds; warn on pinned review prompts (#11970)
+- **Issue #11964** (closed): ci-daily: report a job cut off by its timeout, and get the macOS shell flake leg under its 180-min cap
+- **PR #11986**: fix(ci-daily): report jobs cut off by their timeout; name the hung macOS suite (#11964)
+- **Issue #11967** (closed): ci: retire Rust OTLP Feature Build & Test (no-op feature since #10700; real-service suites run in daily)
+- **PR #11975**: ci: fold Rust OTLP Feature job into lint + daily Full Suite (#11967)
+- **PR #11988**: Step spawn: mark step role_tick.outcome records; issue-lease markers for Builder only (#11906 follow-up)
+- **Issue #11965** (closed): ci: move Codex Adapter Smoke's Docker steps to ci-daily and reuse the shared debug daemon
+- **PR #11977**: ci: slim Codex Adapter Smoke (mocked) by moving Docker fixtures to daily (#11965)
+- **Issue #11969** (closed): Step engine follow-ups: claim_lost cooldown, non-Builder fast-fail park, label-aware restore, promote restore edge
+- **PR #11978**: Step engine follow-ups: claim_lost cooldown, Builder-only fast-fail park, label-aware restore, promote restore edge
+- **Issue #11966** (closed): ci: run Release Build Check only on push, merge_group and image-input PRs
+- **PR #11974**: ci: run Release Build Check only on push, merge_group and image-input PRs
+- **Issue #11955** (closed): fleet.state: emit per-repo queue-depth snapshot (awaiting_curation/approval + operator_held) — ETA gap 1 pending-queue + gap 2 eligible-depth
+- **PR #11959**: fleet.state: per-repo pending_queue depth snapshot (#11955)
+- **Issue #11981** (closed): test: sender byte-budget test is flaky — fixture stamps Utc::now(), whose JSON length varies
+- **PR #11985**: test(observability): pin both fixture timestamps in sender tests (#11981)
+- **Issue #9782** (closed): test(security): register the last six write-scope-stub suites and delete the stub (#9548)
+- **PR #11980**: test(security): register the last write-scope-stub suites and delete the stub (#9782)
+- **Issue #11731** (closed): test: egress_proxy journal test fails under plain `cargo test -p loom-daemon` (needs --features otlp to match its own expectation)
+- **Issue #11699** (closed): test: egress observe journal test is not hermetic — host tracing tier leaks in (fails local preflight on fleet Macs)
+- **Issue #11906** (closed): Step dispatch: spawn one role step with the role's resolvers, keeping role-tick capture
+- **PR #11961**: Step engine: spawn one role step with its role's resolvers (#11906)
+- **Issue #11968** (closed): ci: split Native Port Suites into 2-3 sibling jobs (the PR critical path)
+- **PR #11976**: ci: split Native Port Suites into three family legs (#11968)
+- **Issue #11898** (closed): Step dispatch: SweepKind::Step across every consumer, step claims, and per-role restore
+
 ### 2026-10-14
+- **Issue #11900** (closed): Step dispatch: step-outcome ledger over the targeted-role outcome classes
+- **PR #11962**: Step dispatch: the step-outcome ledger over the targeted-role outcome classes (#11900)
+- **Issue #11840** (closed): ETA facts: preserve canonical dispatch result on completed pick.decision ticks
+- **PR #11948**: pick.decision: carry the work-finder tick's canonical dispatch_result
+- **Issue #11954** (closed): telemetry(fleet_state): persist outcomes::Memory.pre_ready_done across daemon restarts — stop ~3x re-emission of label-derived stage outcomes (SigNoz volume)
+- **PR #11958**: Persist pre_ready_done across daemon restarts (#11954)
+- **PR #11950**: Step dispatch: step claims, live stale_after_minutes, restart and requeue for steps (#11898, part 2)
+- **PR #11953**: fix(install): never link user-scope /loom:* skills into a stale machine checkout
+- **Issue #11889** (closed): Stale doc comment in reaper/pr_park.rs says loom:operator is not a PR park
+- **Issue #11905** (closed): Held-PR visibility after #11888: operator_held sibling metric, capped-hold inbox routing, cheaper held-shape probe
+- **PR #11938**: Held-PR visibility after #11861: champion_held count, capped-hold inbox routing, cheaper gate (#11905)
+- **PR #11937**: fleet add-worker: provision the watchdog with --heal-watchdog-only, never a full start
+- **Issue #11934** (closed): Supervised relaunch leaves work finder OFF despite unit LOOM_WORK_FINDER=1 (process env gets 0)
+- **PR #11946**: daemon-start: never relaunch a dispatcher with its work finder silently off (#11934)
+- **Issue #11769** (closed): test: replaces_a_currently_executing_binary fails every CI Daily since #10983 -- 30 s sleeper is outlived by keep-previous copy+sha256 of the test binary
+- **PR #11949**: test: raise sleeper_helper sleep to 300s (#11769)
+- **Issue #11932** (closed): Janitor exception for Champion holds is prompt-only; markerless loom:pr+loom:blocked PRs get repeated Merge Failed (C12 follow-up)
+- **PR #11945**: Champion: classify loom:pr + loom:blocked in code; Merge Failed once per head (#11932)
+- **Issue #11930** (closed): Fast-fail park does not survive restarts and counts per host (C3 follow-up)
+- **PR #11942**: Hold the fast-fail park across restarts and count its streak fleet-wide
+- **PR #11921**: Step dispatch: SweepKind::Step across every consumer, per-role restore (#11898, part 1)
+- **Issue #11896** (closed): Step dispatch: seeded weighted item draw (actionable × priority × stage-age)
+- **PR #11939**: Step dispatch: seeded weighted item draw (actionable × priority × age)
+- **Issue #9740** (closed): test-merge-pr-merge-method.sh Test 5 fails when LOOM_DAEMON_BIN is inherited from the environment
+- **PR #11940**: Pin LOOM_DAEMON_BIN to stub in merge-method Test 5 (#9740)
+- **Issue #11924** (closed): Stage-entry provider: latest labeled event, not the first page; lenient labels_at parsing (#11897 follow-ups)
+- **PR #11929**: Stage entry: latest labeled event from the end of the events; lenient labels_at (#11924)
+- **Issue #9715** (closed): daemon: git subprocess calls have no timeout — a hung `git remote get-url` blocked `status` for 120s+
+- **PR #11943**: Bound the daemon's six hand-rolled git remote get-url calls (#9715)
+- **Issue #11931** (closed): Judge timeout → stale loom:reviewing reclaim lets several hosts re-race one PR (C4 follow-up)
+- **PR #11941**: Judge timeout: reap the dead claimant's PR lease into a backstop record (#11931)
+- **PR #11933**: forge_gateway: let a CLI subcommand route reads through the daemon's gateway profiles (2am#4367 P4)
+- **Issue #11904** (closed): Cleanups: stale sharding comment, retire classify-capacity-defer.sh, duplicated doc paragraph, hermetic egress_proxy tests
+- **PR #11935**: Cleanups: stale sharding comment, retire classify-capacity-defer.sh, fold duplicated doc paragraph, hermetic egress_proxy tests
+- **Issue #11759** (closed): telemetry: once-per-merge PR event and periodic held-PR gauge (fleet throughput, 2AMLogic/2am#4350)
 - **Issue #11744** (closed): Merge stall: 139 Judge-approved PRs fleet-wide held by Champion merge-risk holds — mostly 'Judge review depth' where the Judge couldn't verify
 - **Issue #11910** (closed): Dispatch plan: step field on plan rows (fixture first)
 - **PR #11927**: Dispatch plan: step field on plan rows, merge folds by repo#issue + step (#11910)

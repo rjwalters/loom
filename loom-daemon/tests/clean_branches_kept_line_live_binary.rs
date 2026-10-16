@@ -72,3 +72,8 @@ fn clean_prints_the_kept_line_and_counts_held_branches_as_in_use() {
     assert!(stdout.contains("Kept: 0 branch(es)"), "held branch counted as Kept:\n{stdout}");
     assert!(wt.join("dirty.txt").exists());
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

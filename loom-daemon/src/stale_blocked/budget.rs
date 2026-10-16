@@ -6,8 +6,10 @@
 //! one epic #10332 is keeping clear. So the run checks before it spends:
 //!
 //! - **Before gathering**: after the candidate listing (a free `304` when
-//!   nothing moved), the free `/rate_limit` + GraphQL `rateLimit` probe
-//!   ([`crate::rate_limit_breaker::forge::probe_budget_ctx`]) is compared with
+//!   nothing moved), the budget
+//!   ([`crate::rate_limit_breaker::forge::probe_budget_ctx`] — cached and
+//!   header-refreshed, one free `/rate_limit` only on a cold start, #12204)
+//!   is compared with
 //!   the run's projected cost ([`project`]). If the run would take either
 //!   bucket below its floor, nothing is gathered: every artifact is reported
 //!   *not evaluated*, and the advisory still exits 0 ([`refusal`]).
