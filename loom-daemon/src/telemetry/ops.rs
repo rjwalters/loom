@@ -570,6 +570,11 @@ pub enum MetricName {
     /// rate-limit breaker cools, `failed` when the forge read failed), #12152.
     #[serde(rename = "loom.feed.reconcile_passes")]
     FeedReconcilePasses,
+    /// Workflow runs sitting `queued` for a runner in a repo's CI poll window
+    /// at the end of a poll, by `repo` (#11993). A gauge: fleet CI contention
+    /// at that instant, the complement of the per-run `loom.ci.queued_ms`.
+    #[serde(rename = "loom.ci.queue_depth")]
+    CiQueueDepth,
 }
 
 impl MetricName {
@@ -655,6 +660,7 @@ impl MetricName {
             Self::StageEntryLookups => "loom.stage_entry.lookups",
             Self::FeedCompletions => "loom.feed.completions",
             Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
+            Self::CiQueueDepth => "loom.ci.queue_depth",
         }
     }
 
@@ -763,6 +769,7 @@ impl MetricName {
             Self::StageEntryLookups => "{lookup}",
             Self::FeedCompletions => "{completion}",
             Self::FeedReconcilePasses => "{pass}",
+            Self::CiQueueDepth => "{run}",
             Self::AgentScopeOomKills => "{kill}",
             _ => "By",
         }
@@ -902,6 +909,9 @@ impl MetricName {
             }
             Self::FeedReconcilePasses => {
                 "Merge-reconciliation passes of the narration sink, by outcome."
+            }
+            Self::CiQueueDepth => {
+                "Workflow runs queued for a runner in the CI poll window at the end of a poll, by repo."
             }
         }
     }
