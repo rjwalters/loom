@@ -1,1 +1,0 @@
-../../defaults/docs/telemetry-replay.md

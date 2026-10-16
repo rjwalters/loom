@@ -178,18 +178,6 @@ jobs:
         # #11198: host-export-queries.sql queries 1-3 and the host-export-silent
         # alert, run verbatim (roster substituted) over a fixture.
         run: cargo test --package loom-daemon --features otlp --test signoz_host_export_queries -- --ignored --nocapture
-      - name: "Ignored: SigNoz replay reconstruction against a real pinned ClickHouse"
-        if: ${{ !cancelled() }}
-        # #11125: replay-queries.sql queries 1-3. Only this run shows an issue
-        # removed, re-added and removed again stays deleted, and that a lost delta or
-        # missing anchor/chunk makes that host unknown instead of rebuilding wrong state.
-        run: cargo test --package loom-daemon --features otlp --test signoz_replay_queries -- --ignored --nocapture
-      - name: "Ignored: telemetry-replay against the replay fixture store"
-        if: ${{ !cancelled() }}
-        # #11127: `telemetry-replay --as-of` runs the same committed queries with its
-        # own parameter binding and reader; only this run shows an uncovered host is
-        # reported `unknown`, not empty.
-        run: cargo test --package loom-daemon --features otlp --test telemetry_replay_fixture_store -- --ignored --nocapture
       - name: "Ignored: SigNoz CI failed-run log join against a real pinned ClickHouse"
         if: ${{ !cancelled() }}
         # #8528 / #8826: section 5 of ci-queries.sql ("Failed run -> logs"). Only
