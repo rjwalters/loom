@@ -10,7 +10,11 @@
 //!    ([`super::item_draw::pool_weights`]); there is no separate workspace
 //!    draw. A [`DrawError::WeightOverflow`] ends the tick's draws and is
 //!    recorded on the record, never only logged.
-//! 2. **Gate**: one Champion merge per repo at a time (design §6).
+//! 2. **Gate**: one Champion merge per repo at a time (design §6). A repo's
+//!    merge steps leave the pool *before* they are drawn while a merge is in
+//!    flight there (#12494): a merge this host or a peer runs ([`exclude_claimed`]),
+//!    or one this tick spawned ([`ItemDraw::close_steps`]). So a merge-blocked
+//!    item costs no draw and no pass; the tick counts it as `merge_deferred`.
 //! 3. **Claim and spawn** through the [`StepSpawner`] (the registry's step
 //!    spawn, #11906): the role's resolvers and pool gate, then the claim.
 //!
@@ -90,8 +94,31 @@ pub const MAX_PASSES_PER_TICK: u32 = 32;
 /// `MAX_FREE_CLAIM_LOST_PER_TICK` refusals) while each loss still costs a
 /// claim subprocess.
 pub const MAX_FREE_CLAIM_LOST_PER_TICK: u32 = 16;
-/// The pass reason of a second Champion merge in one repo in one tick.
+/// The reason a second Champion merge in one repo is held back (design §6):
+/// the queue row's detail. Since #12494 it is not a pass: the item leaves the
+/// pool before the draw ([`exclude_claimed`], [`ItemDraw::close_steps`]).
 pub const PASS_MERGE: &str = "merge_in_flight";
+
+/// The steps serialised behind a repo's Champion merge (design §6).
+///
+/// `ChampionHoldReevaluate` stays in (#12494 asked whether it must): it is
+/// not a lighter step. It spawns the same [`StepRole::ChampionMerge`] role on
+/// an approved PR under a Champion hold, and when the hold no longer applies
+/// that run merges the PR. Letting it run beside another merge in the repo
+/// would be two merges in flight. It is also what the registry's own-merge
+/// check ([`DrawClaims::merge_in_flight`]) and the peer merge advertisement
+/// key on (the role, not the classifier step), so exempting it here alone
+/// would leave the two halves of the rule disagreeing.
+pub const MERGE_STEPS: [crate::work_finder::step_item::Step; 2] = [
+    crate::work_finder::step_item::Step::ChampionMerge,
+    crate::work_finder::step_item::Step::ChampionHoldReevaluate,
+];
+
+/// The step is serialised behind its repo's Champion merge ([`MERGE_STEPS`]).
+#[must_use]
+pub fn is_merge_step(step: crate::work_finder::step_item::Step) -> bool {
+    MERGE_STEPS.contains(&step)
+}
 /// The spawn refusal of a pre-claim that could not be verified
 /// (`sweep_registry::step_spawn::lease`): it ends the owner's draws for the
 /// tick (module docs, #12260).
@@ -255,6 +282,16 @@ pub struct StepTick {
     pub budget: usize,
     /// Why the draw loop stopped.
     pub stop: TickStop,
+    /// Merge steps held back because their repo had a merge in flight
+    /// (#12494): before the tick ([`Exclusion::MergeInFlight`]), after a merge
+    /// this tick spawned, or drawn before it spawned. The tick span's
+    /// `loom.dispatch.merge_deferred`.
+    ///
+    /// [`Exclusion::MergeInFlight`]: super::item_draw::Exclusion::MergeInFlight
+    pub merge_deferred: usize,
+    /// Draws that never reached the spawner: a merge step drawn in a repo
+    /// before the round that spawned the repo's merge applied it.
+    pub draws_unspawned: usize,
 }
 
 /// The queue disposition a pass reason reads as.
@@ -284,28 +321,41 @@ pub fn disposition_of(reason: &str) -> Qd {
 }
 
 /// Take out of `w`'s pool every item `claims` names (this host's live runs
-/// and the peers' live claims), and every Champion merge but the one a peer
-/// is merging while a peer merge is in flight in this repo. Each counts as
-/// a `claimed` pass. Pure.
+/// and the peers' live claims), each a `claimed` pass, and every merge step
+/// ([`MERGE_STEPS`]) but the one being merged while this host or a peer has
+/// a merge in flight in this repo, each a [`Exclusion::MergeInFlight`]
+/// (#12494: deferred before the draw, so it costs no draw and no pass).
+/// Pure.
+///
+/// [`Exclusion::MergeInFlight`]: super::item_draw::Exclusion::MergeInFlight
 pub fn exclude_claimed(w: &mut Weighing, claims: &DrawClaims) {
     use super::item_draw::Exclusion;
-    let before = w.pool.len();
+    let mut claimed = 0usize;
+    let mut deferred = 0usize;
     w.pool.retain(|c| {
         let target = c.target();
-        let merging_elsewhere = c.step == crate::work_finder::step_item::Step::ChampionMerge
-            || c.step == crate::work_finder::step_item::Step::ChampionHoldReevaluate;
-        !(claims.items.contains(&target)
-            || (merging_elsewhere
-                && claims
-                    .merge_in_flight
-                    .as_ref()
-                    .is_some_and(|(pr, _)| *pr != target)))
+        if claims.items.contains(&target) {
+            claimed += 1;
+            return false;
+        }
+        let merging_elsewhere = is_merge_step(c.step)
+            && claims
+                .merge_in_flight
+                .as_ref()
+                .is_some_and(|(pr, _)| *pr != target);
+        if merging_elsewhere {
+            deferred += 1;
+            return false;
+        }
+        true
     });
-    let removed = before - w.pool.len();
-    if removed > 0 {
+    if claimed > 0 {
         *w.excluded
             .entry(Exclusion::Pass(PassReason::Claimed))
-            .or_default() += removed;
+            .or_default() += claimed;
+    }
+    if deferred > 0 {
+        *w.excluded.entry(Exclusion::MergeInFlight).or_default() += deferred;
     }
 }
 
@@ -343,7 +393,9 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
     use super::item_draw::Exclusion as E;
     for (reason, &n) in &w.excluded {
         let slot = match reason {
-            E::Pass(PassReason::Claimed | PassReason::Queued) => &mut report.skipped_in_flight,
+            E::Pass(PassReason::Claimed | PassReason::Queued) | E::MergeInFlight => {
+                &mut report.skipped_in_flight
+            }
             E::Pass(PassReason::SharedPr) => &mut report.skipped_pr_open,
             E::Pass(PassReason::CapabilityMissing) | E::PoolExhausted => {
                 &mut report.skipped_host_constraint
@@ -403,8 +455,19 @@ pub fn run(
     workspaces.sort_by_key(|w| w.idx);
     let mut repos: BTreeMap<usize, RepoTerms> = BTreeMap::new();
     let mut pool: Vec<Candidate> = Vec::new();
+    // Merge steps held back by a repo's merge in flight (#12494).
+    let mut merge_deferred = 0usize;
+    let mut draws_unspawned = 0usize;
+    // Those a merge this tick spawned took out of the pool, by repo.
+    let mut deferred: BTreeMap<usize, usize> = BTreeMap::new();
     for ws in &workspaces {
         count_exclusions(&mut report, &ws.weighing);
+        merge_deferred += ws
+            .weighing
+            .excluded
+            .get(&super::item_draw::Exclusion::MergeInFlight)
+            .copied()
+            .unwrap_or(0);
         report.seen += ws.weighing.pool.len() + ws.weighing.excluded.values().sum::<usize>();
         report
             .vi_demotions
@@ -525,31 +588,27 @@ pub fn run(
                     exhausted = batch.is_empty();
                     break 'slots;
                 };
-                *attempts += 1;
                 let key = key_of(ws, &record.picked);
                 order.push((idx, key.number));
                 let picked = record.picked.clone();
                 let terms = record.terms;
                 draws.push(record);
                 draws_taken += 1;
-                // One Champion merge per repo at a time (design §6): a second
-                // merge drawn in a repo that spawned one this tick passes.
-                let merge = matches!(
-                    picked.step,
-                    crate::work_finder::step_item::Step::ChampionMerge
-                        | crate::work_finder::step_item::Step::ChampionHoldReevaluate
-                );
+                // One Champion merge per repo at a time (design §6). A merge
+                // this tick spawned took the repo's other merge steps out of
+                // the pool (#12494), so the only one left to meet here is one
+                // drawn before that round applied its spawn and carried into
+                // this one. It was already drawn, but it is deferred like
+                // the rest: no pass and none of the slot's draws.
+                let merge = is_merge_step(picked.step);
                 if merge && merging.contains(&idx) {
-                    passes += 1;
+                    merge_deferred += 1;
+                    draws_unspawned += 1;
                     resolve(&mut report.queue, &key, Qd::PeerClaim, Some(PASS_MERGE.to_string()));
-                    *refused
-                        .entry(idx)
-                        .or_default()
-                        .entry(PASS_MERGE.to_string())
-                        .or_default() += 1;
-                    *pass_counts.entry(PASS_MERGE.to_string()).or_default() += 1;
+                    *deferred.entry(idx).or_default() += 1;
                     continue;
                 }
+                *attempts += 1;
                 batch.push(Pending {
                     slot,
                     ws_idx: idx,
@@ -620,6 +679,20 @@ pub fn run(
                 SpawnResult::Spawned => {
                     if p.merge {
                         merging.insert(idx);
+                        // The repo's other merge steps leave the pool now
+                        // (#12494): drawn, each would only be held back.
+                        for c in draw.close_steps(idx, &MERGE_STEPS) {
+                            if let Some(&ws) = by_idx.get(&idx) {
+                                resolve(
+                                    &mut report.queue,
+                                    &key_of(ws, &c),
+                                    Qd::PeerClaim,
+                                    Some(PASS_MERGE.to_string()),
+                                );
+                            }
+                            merge_deferred += 1;
+                            *deferred.entry(idx).or_default() += 1;
+                        }
                     }
                     resolve(&mut report.queue, &key, Qd::Dispatched, None);
                     report.dispatched += 1;
@@ -740,6 +813,18 @@ pub fn run(
     // The draws a gate or the claim refused, beside the weight-0 counts, so
     // a refused draw is visible on the record (the integrated review's M1).
     if let Some(record) = report.item_draw.as_mut() {
+        // The merge steps a merge this tick spawned held back (#12494).
+        for (idx, &count) in &deferred {
+            let repo = by_idx
+                .get(idx)
+                .map_or("repo_unresolved", |w| w.repo.as_str());
+            record.excluded.push(PickItemExclusion {
+                repo: repo.to_string(),
+                reason: format!("deferred_{PASS_MERGE}"),
+                skip_reason: PickSkipReason::InFlight,
+                count,
+            });
+        }
         for (idx, reasons) in &refused {
             let repo = by_idx
                 .get(idx)
@@ -760,6 +845,8 @@ pub fn run(
         draws: draws_taken,
         budget,
         stop,
+        merge_deferred,
+        draws_unspawned,
     }
 }
 

@@ -468,6 +468,7 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
             closures: vec![PickItemClosure {
                 repo: "o/big".to_string(),
                 after_draw: 4,
+                steps: Vec::new(),
             }],
             excluded: vec![PickItemExclusion {
                 repo: "o/r".to_string(),

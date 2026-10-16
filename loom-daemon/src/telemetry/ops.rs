@@ -139,6 +139,9 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.passes",
     "loom.dispatch.draws",
     "loom.dispatch.draws_unspawned",
+    // #12494: merge steps held back before the draw by a repo's merge in
+    // flight.
+    "loom.dispatch.merge_deferred",
     "loom.dispatch.budget",
     "loom.dispatch.stop",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------

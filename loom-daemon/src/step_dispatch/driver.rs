@@ -21,9 +21,7 @@ use super::gather_budget::{
 };
 use super::item_draw::{weigh, ItemWeights, PoolKnobs, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
-use super::tick::{
-    self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace, PASS_MERGE,
-};
+use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
 use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawnTimings};
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
@@ -627,7 +625,8 @@ impl StepDriver {
         });
         report.passes = Some(TickPasses {
             draws: result.draws,
-            draws_unspawned: result.passes.get(PASS_MERGE).copied().unwrap_or(0),
+            draws_unspawned: result.draws_unspawned,
+            merge_deferred: result.merge_deferred,
             by_reason: result.passes.clone(),
             budget: result.budget,
             stop: Some(result.stop.as_str()),
