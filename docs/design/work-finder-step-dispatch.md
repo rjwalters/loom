@@ -32,7 +32,7 @@ This is a repo-local design doc under `docs/design/`. It is never installed into
 
 These were ruled 2026-10-13/14 and are not reopened here.
 
-1. **Item first, then role.** Draw a repo with the existing workspace draw (#11103), then an item. If the item is being processed or is parked, pass and draw again.
+1. **Item first, then role.** Draw one item from a single pool of every actionable item across the host's repos (#12185; this was a repo draw with the workspace draw (#11103), then an item in it, until the operator changed it to cut claim collisions on small repos: 27 repos with at most 10 actionable items got 31% of step draws and 185 of 264 `claim_lost` refusals in a 3-hour window). If the item is being processed or is parked, pass and draw again.
 2. **The item draw** is seeded and weighted: `actionable × priority × stage-age`.
    - Items carrying `loom:operator`, and items being worked on, have zero weight.
    - There is no stage term and there are no per-stage quotas.
@@ -133,13 +133,17 @@ Notes on the table:
 ### 4.2 The tick
 
 1. **List.** Use the shared all-open walk, or the mirror when `forge.mirror` is on. Join PRs to issues, classify each item, and compute zero weights from labels and local state.
-2. **Draw a workspace** with the existing workspace draw. Workspace holds, including maintain-only, keep the root out.
-3. **Draw an item** with weight `actionable × priority × age`:
+2. **Pool the workspaces.** There is no workspace draw (#12185). Workspace holds, including maintain-only, keep the root out of the pool; a repo with `w_repo` 0 has weight 0.
+3. **Draw an item** from the one pool (#12185), with weight `w_repo × iw × S_r^(α−1) × (1 + in_flight_repo)^(−β)`, where `iw = actionable × priority × age` is the item weight and:
+   - `w_repo` is the repo's roster weight (`workspaces.json`, from the fleet store); `S_r` is the sum of `iw` over the repo's items still in the pool; `in_flight_repo` is the repo's items this host runs plus the live claims peers advertise, counted at the start of the tick.
+   - **α** (`dispatch.backlogExponent`, 0–1, default 0) and **β** (`dispatch.busyExponent`, ≥ 0, default 0) are float hyperparameters in the strict block, hot-applied. α = 0 gives `w_repo × iw / S_r`, the earlier two-stage draw's distribution (a repo's share is its `w_repo`); α = 1 gives `w_repo × iw`, a flat pool where a repo's share grows with its backlog; β > 0 draws a repo with work in flight less. (The first draft of #12185 wrote `n_items^(α−1)`; that only equals the two-stage draw when every item of a repo weighs the same, so the term is `S_r`. `n_items` is still recorded.) The repo-level `dispatch.weightBonus*` points are retired: with one pool the item priority factors do their job.
+   - The terms are real numbers: the weights are computed in floating point, scaled so the heaviest is `2^40`, and rounded to integers (a positive weight stays at least 1), so the roll and the pick are integer and the probabilities are `w / Σw` of the scaled weights. Draws are without replacement and `S_r` is recomputed over the items still in the pool at each draw.
+   - Knobs, formula and effects: [`defaults/docs/hyperparameters.md`](../../defaults/docs/hyperparameters.md#the-item-draw-12185).
    - **`actionable` ∈ {0, 1}.** Set to 0 for each "none" row in §4.1, and for a Builder step in a repo whose build backoff is engaged. Red-main fixes are exempt (`work_finder/build_backoff.rs:594`). Also 0 for a step whose role's token pool is exhausted (the `record_role_tick_pool_exhausted` state): the spawn would be refused, so drawing it would only burn the redraw budget (#11896).
    - **`priority`:** red-main ×50, `loom:very-important` ×8, `loom:important` ×3. The `vi_cap` demotion (`work_finder/vi_cap.rs:1-24`) runs over the whole item list first.
    - **`age`** = `1 + min(stage_age_days, 90) / 30`.
-   - **Seed:** `loom-draw/v2` = `sha256("loom-draw/v2:"+minute+":"+host+":"+tick_counter+":"+workspace+":"+draw_index)`. Draws are without replacement and replayable from `pick.decision`, which logs each workspace's starting pool (in pool order, with weights) and every draw's roll and picked index.
-   - The weights are numeric hyperparameters in the strict block.
+   - **Seed:** `loom-draw/v3` = `sha256("loom-draw/v3:"+minute+":"+host+":"+tick_counter+":"+draw_index)` (`v2` also keyed the workspace). Draws are without replacement and replayable from `pick.decision`, which logs the exponents, each repo's `w_repo`, `in_flight` and `n_items`, the starting pool (in pool order, with item weights), the repos a per-repo cap closed mid-tick, and every draw's roll and picked index.
+   - The weights are numeric hyperparameters in the strict block (`w_repo` excepted: it stays in the roster).
 4. **Gate and claim** for the step's role: saturation, ramp cap, per-repo RAM/disk cap, then the claim (§5). **On a pass, draw again**: at most 8 draws fill one slot and at most 32 passes are taken in one tick (`step_dispatch/tick.rs`, `MAX_DRAWS_PER_SLOT`, `MAX_PASSES_PER_TICK`). Saturation and the ramp cap are host-wide, so they bound how many slots the tick fills rather than refusing one draw; a repo over its RAM, disk or count cap leaves the draw for the rest of the tick. Each pass is counted by its reason, including `claim_lost`, on `pick.decision` (`refused_<reason>` beside the weight-0 counts) and, for the pool gate and the claim, in the outcome ledger.
    - Before the draw, an item this host runs (a live sweep or step) or a peer advertises a live claim on is a `claimed` pass, and while a peer's Champion merge is in flight in the repo every other merge step there is too (`SweepRegistry::draw_claims`, `PeerClaimView::merge_in_flight_at`). The classifier's `claimed` row reads labels only, and a non-Builder step labels its item late.
 5. **Spawn** `/loom:<role> <N>` (§4.4).
@@ -220,8 +224,8 @@ A step that wrote its verdict and died still holding its claim only loses the cl
 ## 7. Telemetry and alerts
 
 **Signals.**
-- `loom.dispatch.step` span: repo, item, role, admission result, reason, draw attempt, `age_source`, resumed (`observability/ops/dispatch_step.rs`). One per spawn attempt, spawned or refused.
-- `pick.decision`'s `item_draw`: the `loom-draw/v2` seed inputs, the weight-0 counts by reason, each drawn workspace's starting pool and every draw, enough to replay the tick (`item_draw::replay_record`), and the workspaces whose draw stopped on a `WeightOverflow`. Work-finder rows carry their step as `stage` and in the dispatch plan's `step` field.
+- `loom.dispatch.step` span: repo, item, role, admission result, reason, draw attempt, `age_source`, resumed, and (#12185) the drawn item's draw weight, the pool's total weight at that draw, and its repo's `n_items` and `in_flight_repo` (`loom.step.weight`, `loom.step.total_weight`, `loom.step.repo_items`, `loom.step.in_flight_repo`; `observability/ops/dispatch_step.rs`). One per spawn attempt, spawned or refused.
+- `pick.decision`'s `item_draw`: the `loom-draw/v3` seed inputs, the two exponents, each repo's `w_repo`, `in_flight` and `n_items`, the weight-0 counts by reason, the starting pool and every draw, enough to replay the tick (`item_draw::replay_record`), and the repos in the pool when a `WeightOverflow` stopped the draws. Work-finder rows carry their step as `stage` and in the dispatch plan's `step` field.
 - `loom.step.actionable{repo}`: the drawable depth per repo, each tick.
 - The baseline: `loom.forge.stage_items{repo,state}`, sampled per repo by the captain's stage-dwell sampler, and `loom.dispatch.busy_slots{role}`. Steps count under `role="sweep"` (one slot each) and are broken down by step role as `busy_slots{role=<role>, pool="step"}`, never added to the total.
 
