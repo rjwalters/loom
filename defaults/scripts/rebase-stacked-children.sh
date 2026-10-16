@@ -282,7 +282,8 @@ $(printf '%s\n' "${files:-(none reported)}" | sed 's/^/- /')
 **To finish it by hand**, in this branch's worktree:
 
 \`\`\`
-git fetch origin && git merge origin/$parent_branch
+git fetch origin
+git merge origin/$parent_branch
 # resolve the conflicts, commit, then a plain push (never a rewrite):
 git push origin HEAD:$child_branch
 \`\`\`
