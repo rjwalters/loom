@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn build_backoff_disposition_round_trips_and_old_summaries_parse() {
         let d = QueueDisposition::DeferredBuildBackoff;
-        assert_eq!(QueueDisposition::ALL.len(), 25);
+        assert_eq!(QueueDisposition::ALL.len(), 22);
         assert!(QueueDisposition::ALL.contains(&d));
         let json = serde_json::to_value(d).unwrap();
         assert_eq!(json, serde_json::json!("deferred_build_backoff"));

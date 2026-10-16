@@ -158,9 +158,10 @@ mod tests {
     #[serial(loom_socket_path_env)]
     fn record_then_probe_roundtrips() {
         with_loom_dir(|_| {
-            record(vec!["autonomous.hostBreaker.enabled".to_string()], 4242, Utc::now()).unwrap();
+            record(vec!["autonomous.mainHealthGate.enabled".to_string()], 4242, Utc::now())
+                .unwrap();
             let marker = probe().unwrap();
-            assert_eq!(marker.paths, vec!["autonomous.hostBreaker.enabled".to_string()]);
+            assert_eq!(marker.paths, vec!["autonomous.mainHealthGate.enabled".to_string()]);
             assert_eq!(marker.observed_pid, 4242);
         });
     }

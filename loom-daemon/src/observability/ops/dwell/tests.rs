@@ -248,8 +248,10 @@ fn points_oldest_starved_by_reason_and_dispatch_wait() {
         1
     );
     assert_eq!(
-        int(find(&points, MetricName::QueueStarvedByReason, "reason", "deferred_saturation")
-            .unwrap()),
+        int(
+            find(&points, MetricName::QueueStarvedByReason, "reason", "deferred_build_backoff")
+                .unwrap()
+        ),
         1
     );
     assert!(find(&points, MetricName::QueueStarvedByReason, "reason", "dispatch_backoff").is_none());

@@ -1260,7 +1260,7 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     tick_multi_with_build_backoff(workspaces, priorities, max_concurrent, halted, None, &[], &[])
 }
 
-/// Like [`tick_multi`], but additionally honors the **build/// Like [`tick_multi_with_repo_cap`], but additionally honors the **build
+/// Like [`tick_multi`], but additionally honors the **build
 /// back-off** (#9410, [`build_backoff`]): `build_backoff_held` is parallel to
 /// `workspaces` (#10624 — a repo's own debt, or the optional host ceiling);
 /// pass 2 defers every candidate of a held workspace, whatever its priority
@@ -1285,8 +1285,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 ) -> TickReport {
     use crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT;
 
-    let mut report = TickReport::default();
-    report.build_backoff_held = build_backoff::any_held(build_backoff_held, workspaces.len());
+    let mut report = TickReport {
+        build_backoff_held: build_backoff::any_held(build_backoff_held, workspaces.len()),
+        ..TickReport::default()
+    };
 
     // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
     // dedup filtering below always has the full in-flight view.
@@ -2017,7 +2019,7 @@ pub fn spawn_multi_work_finder_task(
         let mut was_healthy_tokens: Option<usize> = None;
         // Eager reclaim trigger state (#7512, #11192, re-keyed on the
         // free-disk floor by #12406).
-        let mut eager_trigger = crate::eager_reclaim::EagerTrigger::default();
+        let mut eager_trigger = crate::eager_reclaim::EagerTrigger;
         // Missing-root hygiene (#4326): tracks which registered roots are
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
@@ -2400,7 +2402,7 @@ fn format_idle(idle: Option<f64>) -> String {
 /// the log named the divergence.
 ///
 /// This is a **display-only** figure. It is never wired into
-/// [`resolve_dynamic_max_concurrent`] or [`capacity::assess_pressure`] —
+/// the cap or [`capacity::assess_pressure`] —
 /// both keep consuming the original single-probe `token_limit`/`ranking`
 /// unchanged — so this does not reintroduce the token-count capacity gating
 /// #5270 removed; it only makes the log line honest about what `healthy=`
@@ -2525,10 +2527,6 @@ mod halt_log;
 /// own file for the same file-size-ratchet reason as [`registry_refresh`].
 pub mod configured_max;
 pub use configured_max::{ConfiguredMax, ConfiguredMaxReloader};
-
-/// Per-repo dispatch cap + repo-track affinity (#9090), including the
-/// candidate-list shaping (the affinity partition) and the pre-#9090 [`tick_multi_with_sharding`] entry point. Its own
-/// file for the same file-size-ratchet reason as [`registry_refresh`].
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

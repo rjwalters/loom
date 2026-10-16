@@ -12,7 +12,7 @@ use crate::types::WorkFinderTickSummary;
 ///
 /// Mirrors the "loop publishes, status reads" discipline
 /// [`crate::auto_update::global_status_snapshot`] and
-/// [`crate::host_breaker::global_snapshot`] already use: the work-finder loop
+/// `crate::host_breaker::global_snapshot` (removed, #12406) already use: the work-finder loop
 /// writes here at the end of every tick, and `build_daemon_status` reads it
 /// back so a cross-process consumer (`loom-daemon health`) can see the last
 /// tick's dispatch/skip breakdown without scraping the daemon log.

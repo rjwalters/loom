@@ -903,17 +903,9 @@ pub struct FleetCapacity {
     /// Token accounts the ranking calls exhausted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounts_exhausted: Option<u32>,
-    /// Host-load breaker phase (`closed`, `open`, `cooldown`). Absent when
-    /// none is registered.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_breaker: Option<String>,
     /// Forge rate-limit breaker phase. Absent when none is registered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_breaker: Option<String>,
-    /// The admission brake is holding new dispatch. Absent when none is
-    /// registered or it is disabled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admission_brake_held: Option<bool>,
 }
 
 /// The planner regime a record was observed under.

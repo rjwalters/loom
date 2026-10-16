@@ -6,8 +6,8 @@
 //!
 //! [`check_and_warn`] returns only whether it fired — a fact for the caller
 //! to (optionally) log or count, never a value fed into
-//! [`crate::work_finder::resolve_dynamic_max_concurrent`] or either headroom
-//! axis ([`crate::disk_headroom::disk_headroom_limit`],
+//! `crate::work_finder::resolve_dynamic_max_concurrent` (removed, #12406) or either headroom
+//! axis (`crate::disk_headroom::disk_headroom_limit` (removed, #12406),
 //! the former RAM headroom term, removed in #12330). There is no path from this
 //! module back into the admission cap — `tests::warning_never_changes_the_admission_cap`
 //! pins that structurally: computing the cap before and after a firing

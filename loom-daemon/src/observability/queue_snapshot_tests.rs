@@ -255,9 +255,9 @@ fn plan_fields_ride_the_snapshot_at_version_11() {
     let row0 = &json["record"]["rows"][0];
     assert_eq!(row0["position"], 3);
     assert_eq!(row0["plan_state"], "queued");
-    assert_eq!(row0["gate"], "repo_cap");
+    assert_eq!(row0["gate"], "capacity");
     assert!(row0.get("in_slice").is_none(), "retired, absent since #11682");
-    assert_eq!(row0["repo_cap"]["cap"], 1);
+    assert!(row0.get("repo_cap").is_none(), "retired, absent since #12406");
     assert_eq!(json["record"]["plan"]["slots"]["free"], 2);
     let back: TelemetryEnvelope = serde_json::from_value(json).unwrap();
     assert_eq!(back, envelope);

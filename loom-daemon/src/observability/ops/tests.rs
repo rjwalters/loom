@@ -416,7 +416,7 @@ fn tick_span_lists_halt_causes_only_when_held() {
     };
     let span = tick_span(&held, 3, at(0), at(1));
     assert_eq!(span.attributes["loom.dispatch.result"], "halted");
-    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "token_pool,drain");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,token_pool");
     let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
     assert!(!idle.attributes.contains_key("loom.dispatch.halt_causes"));
 }

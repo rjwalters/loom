@@ -546,7 +546,7 @@ fn every_attribute_survives_the_export_time_allowlist() {
     assert_eq!(span.attributes["loom.repo"], "acme/widgets");
     assert_eq!(span.attributes["loom.repo.visibility"], "public");
     assert_eq!(span.attributes["loom.issue"], "98");
-    assert_eq!(span.attributes["loom.queue.disposition"], "deferred_saturation");
+    assert_eq!(span.attributes["loom.queue.disposition"], "deferred_build_backoff");
     assert_eq!(span.attributes["loom.queue.state"], "ready");
     assert_eq!(span.attributes["loom.queue.rank"], "3");
     // Queue-position metadata (Issue #9669).

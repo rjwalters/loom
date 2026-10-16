@@ -3101,7 +3101,7 @@ fn decide_root_tick_detailed(
 /// [`spawn_multi_role_task`] (the multi-workspace entry point wired into
 /// `main.rs`).
 ///
-/// Mirrors [`crate::work_finder::spawn_work_finder_task`] /
+/// Mirrors `crate::work_finder::spawn_work_finder_task` (removed, #12406) /
 /// [`crate::main_health_gate`]: the **first tick is skipped** so several
 /// role loops starting at daemon boot don't burst several `claude` sessions
 /// at once — see the module docs.

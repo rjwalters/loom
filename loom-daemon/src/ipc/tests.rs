@@ -379,7 +379,7 @@ fn dispatch_headroom_message_names_every_axis() {
     let entered = dispatch_headroom_message(repo, true, &h, &kind);
     assert!(entered.contains("occupancy=4"), "{entered}");
     assert!(entered.contains("dynamic_cap=3"), "{entered}");
-    assert!(entered.contains("disk_headroom=9"), "{entered}");
+    assert!(!entered.contains("disk_headroom"), "no disk term since #12406: {entered}");
     assert!(!entered.contains("ram_headroom"), "no RAM term since #12330: {entered}");
     assert!(entered.contains("token_axis_limit=6"), "{entered}");
     assert!(entered.contains("123"), "{entered}");

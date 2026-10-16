@@ -187,7 +187,7 @@ fn test_unmeasurable_disk_never_fires() {
 #[serial]
 fn test_pinned_below_floor_runs_at_most_one_pass_per_cooldown_window() {
     reset_idle_state_for_test();
-    let mut sim = Sim::new(EagerTrigger::default());
+    let mut sim = Sim::new(EagerTrigger);
     sim.reclaimable = true; // keep the backoff out of this test
     for tick in 0..60 {
         sim.tick(tick * 60, Some(15));
@@ -405,7 +405,7 @@ fn test_idle_pass_due() {
 fn test_no_thrash_when_nothing_is_reclaimable() {
     // Four hours pinned below the floor with nothing the daemon can remove.
     reset_idle_state_for_test();
-    let mut sim = Sim::new(EagerTrigger::default());
+    let mut sim = Sim::new(EagerTrigger);
     for tick in 0..240 {
         sim.tick(tick * 60, Some(12));
     }
