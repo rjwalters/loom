@@ -197,15 +197,17 @@ async fn run_collector(
             }
 
             _ = host_status_timer.tick() => {
-                // Inert without an OTLP exporter: no reads, no record.
-                if super::ops::global_ops_sink().is_some() {
-                    let root = workspace_root.clone();
-                    if let Ok(readings) =
-                        tokio::task::spawn_blocking(move || crate::host_status::read_os(&root)).await
-                    {
-                        let record =
-                            host_status.step(&readings, host_status_started.elapsed().as_secs_f64());
-                        crate::host_status::publish(&record);
+                // Sampled and published even without an OTLP exporter:
+                // admission readers (#12114) need the filtered record. Only the
+                // telemetry offer is exporter-gated.
+                let root = workspace_root.clone();
+                if let Ok(readings) =
+                    tokio::task::spawn_blocking(move || crate::host_status::read_os(&root)).await
+                {
+                    let record =
+                        host_status.step(&readings, host_status_started.elapsed().as_secs_f64());
+                    crate::host_status::publish(&record);
+                    if super::ops::global_ops_sink().is_some() {
                         queue.offer(TelemetryEnvelope::new(
                             &host_id,
                             TelemetryRecord::HostStatus(record),

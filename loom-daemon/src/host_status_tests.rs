@@ -280,6 +280,59 @@ fn volume_free_bytes_reads_an_existing_ancestor_and_none_for_nothing() {
     assert!(volume_free_bytes(&dir).is_some(), "walks up to the existing /tmp");
 }
 
+// ---- #12114: admission readers see the filtered record ----
+
+#[test]
+fn filtered_readers_smooth_a_one_sample_load_spike() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    // Six calm ticks at 0.5/core, then one 2.0/core spike one tick later (the old raw gate
+    // threshold is 0.9/core).
+    let mut last = None;
+    for i in 0..6 {
+        last = Some(s.step(&readings(), f64::from(i) * 5.0));
+    }
+    let mut spike = readings();
+    spike.load_per_core = Some(2.0);
+    let record = s.step(&spike, 30.0);
+    publish(&record);
+    let raw = latest_raw("cpu_load_per_core").unwrap();
+    let filtered = filtered_load_per_core().unwrap();
+    clear_latest();
+    assert!(last.is_some());
+    assert!(raw >= 0.9, "a raw read trips the 0.9 gate threshold: {raw}");
+    assert!(filtered < 0.9, "the filtered read does not: {filtered}");
+    assert!(filtered > 0.5, "but it does move toward the spike: {filtered}");
+}
+
+#[test]
+fn filtered_readers_are_absent_until_published_and_never_zero() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    clear_latest();
+    assert_eq!(latest_filtered("cpu_load_per_core"), None);
+    assert_eq!(filtered_load_per_core(), None);
+    assert_eq!(filtered_loadavg_1m(8), None);
+    assert_eq!(filtered_cpu_idle_fraction(), None);
+}
+
+#[test]
+fn filtered_loadavg_and_idle_are_derived_from_the_filtered_signals() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    s.step(&readings(), 0.0);
+    let mut b = readings();
+    b.cpu = Some(CpuCounters {
+        idle: 150,
+        total: 300,
+    });
+    publish(&s.step(&b, 5.0));
+    let lpc = filtered_load_per_core().unwrap();
+    assert!(approx(filtered_loadavg_1m(8).unwrap(), lpc * 8.0));
+    // 50% utilisation over the second tick: idle is its complement.
+    assert!(approx(filtered_cpu_idle_fraction().unwrap(), 0.5));
+    clear_latest();
+}
+
 /// Serializes stub write + spawn: a concurrent fork that inherits the stub's
 /// still-open write fd makes `exec` fail with ETXTBSY.
 #[cfg(target_os = "linux")]
@@ -334,4 +387,19 @@ fn query_nvidia_smi_nonzero_exit_and_missing_binary() {
     let err =
         query_nvidia_smi("/nonexistent/nvidia-smi", std::time::Duration::from_secs(1)).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn raw_fallback_readers_serve_an_unpublished_host_and_defer_to_the_record() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    // No record (observability off, no sampler tick): the raw read answers.
+    clear_latest();
+    assert_eq!(load_per_core_or_raw().is_some(), crate::cpu_headroom::load_per_core().is_some());
+    assert_eq!(loadavg_1m_or_raw(8).is_some(), crate::cpu_headroom::read_loadavg_1m().is_some());
+    // A published record wins over the raw read.
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    publish(&s.step(&readings(), 0.0));
+    assert_eq!(load_per_core_or_raw(), filtered_load_per_core());
+    assert_eq!(loadavg_1m_or_raw(8), filtered_loadavg_1m(8));
+    clear_latest();
 }
