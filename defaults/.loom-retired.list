@@ -160,3 +160,7 @@ scripts/tests/test-merge-pr-stale-required-checks.sh
 scripts/check-dependabot-labels.sh
 scripts/tests/test-check-dependabot-labels.sh
 scripts/tests/test-check-pipefail-early-exit.sh
+
+# #12094 (2026-10-16) — the telemetry-replay CLI and its SigNoz replay queries
+# are deleted; the replay doc goes with them.
+docs/telemetry-replay.md
