@@ -80,15 +80,6 @@ pub struct WorkFinderTickSummary {
     pub skipped_host_constraint: usize,
     /// Issues deferred because the concurrency cap was reached.
     pub deferred_capacity: usize,
-    /// Issues deferred because the per-tick admission ramp cap was reached.
-    pub deferred_ramp_cap: usize,
-    /// Issues deferred because the saturation admission brake held new
-    /// admissions this tick (Issue #4903) — the host was already at/over the
-    /// configured load-per-core hold threshold. Distinct from
-    /// [`Self::deferred_capacity`]: the cap was not reached, the *host* was.
-    /// `#[serde(default)]` keeps pre-#4903 wire data / older clients compatible.
-    #[serde(default)]
-    pub deferred_saturation: usize,
     /// Issues deferred because the build back-off (Issue #9410) held new
     /// unstarred issue builds: review + merge debt was high.
     /// `#[serde(default)]` keeps pre-#9410 wire data compatible.
@@ -97,7 +88,7 @@ pub struct WorkFinderTickSummary {
     /// Dispatch attempts that returned an error.
     pub errors: usize,
     /// Whether any workspace was gated by a hold this tick (main red, drain,
-    /// token pool, disk, ...). Any hold sets it, even one that covered a
+    /// token pool, ...). Any hold sets it, even one that covered a
     /// single root: read [`Self::halt_partial`] before calling the tick
     /// halted.
     pub halted: bool,
@@ -113,12 +104,6 @@ pub struct WorkFinderTickSummary {
     /// halt whenever `halted` is set, the old meaning).
     #[serde(default)]
     pub halt_partial: bool,
-    /// Whether the saturation admission brake was engaged for this tick (Issue
-    /// #4903). `true` even when nothing was deferred (an empty backlog on a
-    /// saturated host), so a consumer can tell "held, nothing waiting" from
-    /// "not held". `#[serde(default)]` keeps pre-#4903 wire data compatible.
-    #[serde(default)]
-    pub saturation_held: bool,
     /// Whether the build back-off (Issue #9410) was engaged for any repo this
     /// tick (#10624: the hold is per repo), even with nothing deferred. The
     /// `BUILD-BACKOFF-HELD` tag and the `build_backoff_held` tick result key on
@@ -158,124 +143,33 @@ pub struct WorkFinderTickSummary {
     /// pre-#9288 payload.
     #[serde(default)]
     pub plan: Option<DispatchPlanContext>,
-    /// The terms of this tick's concurrency cap (Issue #10214): the
-    /// configured `maxConcurrent` and the disk / RAM headroom that may hold
-    /// it lower, so a consumer can say *what* limits the cap. `None` for a
+    /// This tick's concurrency cap (Issue #10214): the configured
+    /// `maxConcurrent`, which since #12406 is the cap. `None` for a
     /// pre-#10214 payload and before the first tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<CapView>,
-    /// Each workspace's per-repo limits as this tick resolved them (Issue
-    /// #11606), one entry per workspace the multi-workspace tick ran over.
-    /// Empty for a single-workspace tick and a pre-#11606 payload: that means
-    /// unknown, never "no repo is capped".
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub repo_limits: Vec<RepoLimitView>,
 }
 
-/// One workspace's per-repo dispatch limits, from the tick's own
-/// [`RepoCap`](crate::work_finder::RepoCap) state (Issue #11606).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RepoLimitView {
-    /// The workspace's repo root, as `listing_failed` names it.
-    pub repo: String,
-    /// The workspace's occupancy when the tick finished: the same
-    /// `WorkDispatcher::occupancy` count the per-repo cap gates on, plus this
-    /// tick's admissions.
-    pub in_flight: usize,
-    /// The resolved `maxConcurrentPerRepo`; `None` when uncapped.
-    pub cap: Option<usize>,
-    /// Ready candidates of this repo the tick deferred for the cap.
-    pub deferred_repo_cap: usize,
-}
-
-/// What holds a tick's effective concurrency cap where it is (Issue #10214).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CapLimiter {
-    /// The configured `maxConcurrent`: an operator setting, not a shortage.
-    Configured,
-    /// Disk headroom on the worktree volume (`free GB / per-worktree GB`).
-    Disk,
-    /// A limiter this client does not know (forward compatibility).
-    #[serde(other)]
-    Unknown,
-}
-
-impl CapLimiter {
-    /// The kebab-case wire name (identical to the serde form).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Configured => "configured",
-            Self::Disk => "disk",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-/// The terms of one tick's concurrency cap (Issue #10214): `min(configured,
-/// disk headroom)` (the RAM term was removed in #12330; an older payload's
-/// `ram` field is ignored). The headroom term is `None` when it was
-/// unmeasurable (the work finder then skips that clamp).
+/// One tick's concurrency cap (Issue #10214): the configured
+/// `maxConcurrent`, and nothing else since #12406 (an older payload's `ram`
+/// and `disk` terms are ignored).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapView {
     /// The configured `maxConcurrent`.
     #[serde(default)]
     pub configured: usize,
-    /// Disk headroom: how many worktrees the scratch volume can hold.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disk: Option<usize>,
-}
-
-impl CapView {
-    /// From the work finder's raw terms, where `usize::MAX` means "not
-    /// measured, not clamping".
-    #[must_use]
-    pub fn from_terms(configured: usize, disk: usize) -> Self {
-        Self {
-            configured,
-            disk: (disk != usize::MAX).then_some(disk),
-        }
-    }
-
-    /// The effective cap.
-    #[must_use]
-    pub fn effective(&self) -> usize {
-        self.configured.min(self.disk.unwrap_or(usize::MAX))
-    }
-
-    /// The term that binds. Disk binds only when it is strictly below the
-    /// configured cap.
-    #[must_use]
-    pub fn limiter(&self) -> CapLimiter {
-        if self.disk.is_some_and(|disk| disk < self.configured) {
-            CapLimiter::Disk
-        } else {
-            CapLimiter::Configured
-        }
-    }
-
-    /// Whether a resource shortage (disk), not the operator's setting, holds
-    /// the cap below `maxConcurrent`.
-    #[must_use]
-    pub fn resource_limited(&self) -> bool {
-        self.limiter() == CapLimiter::Disk
-    }
 }
 
 /// Why a starred issue the work finder deferred is still waiting, and where
 /// it stands (Issue #10214). Carried on a `no-capacity` landing row so the
 /// status, the queue view and any escalation can say "queued #88 of 106
-/// (cap 2, disk-limited)" instead of an undifferentiated "no capacity".
+/// (cap 2, concurrency cap full)" instead of an undifferentiated "no capacity".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityWait {
-    /// The work finder's gate: `capacity`, `ramp`, `saturation`,
-    /// `build-backoff`, `repo-cap` or `host-affinity` (`repo-slice` is
-    /// retired with the dispatch slice, #11682, and only read back).
+    /// The work finder's gate: `capacity`, `build-backoff` or
+    /// `host-affinity` (`repo-slice`, `ramp`, `saturation` and `repo-cap`
+    /// are retired, #11682 and #12406, and only read back).
     pub gate: String,
-    /// For the `capacity` gate: which cap term binds, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limiter: Option<CapLimiter>,
     /// 1-based position among the host's waiting starred issues.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<u32>,
@@ -299,25 +193,23 @@ impl CapacityWait {
         self.gate != "host-affinity"
     }
 
-    /// The short phrase naming what limits it, e.g. `disk-limited`.
+    /// The short phrase naming what limits it, e.g. `concurrency cap full`.
     #[must_use]
     pub fn limit_phrase(&self) -> &'static str {
-        match (self.gate.as_str(), self.limiter) {
-            ("capacity", Some(CapLimiter::Disk)) => "disk-limited",
-            ("capacity", Some(CapLimiter::Configured)) => "at the configured cap",
-            ("capacity", _) => "concurrency cap full",
-            ("ramp", _) => "per-tick admission ramp",
-            ("saturation", _) => "host saturated",
-            ("build-backoff", _) => "build back-off",
-            ("repo-cap", _) => "per-repo cap",
-            ("repo-slice", _) => "outside this host's repo slice",
-            ("host-affinity", _) => "host affinity names another host",
+        match self.gate.as_str() {
+            "capacity" => "concurrency cap full",
+            "ramp" => "per-tick admission ramp",
+            "saturation" => "host saturated",
+            "build-backoff" => "build back-off",
+            "repo-cap" => "per-repo cap",
+            "repo-slice" => "outside this host's repo slice",
+            "host-affinity" => "host affinity names another host",
             _ => "deferred",
         }
     }
 
-    /// `queued #88 of 106 (cap 2, disk-limited)`; without a position,
-    /// `waiting (cap 2, disk-limited)`; for a host refusal, `not for this
+    /// `queued #88 of 106 (cap 2, concurrency cap full)`; without a position,
+    /// `waiting (cap 2, concurrency cap full)`; for a host refusal, `not for this
     /// host (host affinity names another host)`.
     #[must_use]
     pub fn summary(&self) -> String {
@@ -376,8 +268,6 @@ impl WorkFinderTickSummary {
             (self.skipped_declined, "declined-skip"),
             (self.skipped_host_constraint, "host-constraint-skip"),
             (self.deferred_capacity, "deferred-capacity"),
-            (self.deferred_ramp_cap, "deferred-ramp"),
-            (self.deferred_saturation, "deferred-saturation"),
             (self.deferred_build_backoff, "deferred-build-backoff"),
             (self.errors, "error"),
         ] {
@@ -395,9 +285,6 @@ impl WorkFinderTickSummary {
             parts.push("HALTED".to_string());
         } else if self.halted {
             parts.push(format!("{} root(s) held", self.held_roots));
-        }
-        if self.saturation_held {
-            parts.push("SATURATION-HELD".to_string());
         }
         // Only when the back-off actually deferred something (#10624): with a
         // per-repo hold some repo is often engaged, and the bare flag would

@@ -2,7 +2,7 @@
 //! edge becomes an `open` / `resolved` incident on loom-ui's Alerts page,
 //! beside the event-bus (Matrix) output and independent of it.
 //!
-//! Rule `fleet.<condition>` (`fleet.dispatch-halted`, `fleet.capacity-limited`,
+//! Rule `fleet.<condition>` (`fleet.dispatch-halted`, `fleet.roles-persistent`,
 //! `fleet.output-missing` …). A `prefix:rest` condition key splits into rule
 //! `fleet.prefix` and incident key `rest`; a plain one uses key `fleet`. The
 //! source is this host, so the incident is per host already.
@@ -101,9 +101,9 @@ mod tests {
 
     #[test]
     fn a_reminder_re_posts_open() {
-        let a = to_alert(&t(Kind::Reminder, "capacity-limited", false)).unwrap();
+        let a = to_alert(&t(Kind::Reminder, "roles-persistent", false)).unwrap();
         assert_eq!(a.state, State::Open);
-        assert_eq!(a.rule, "fleet.capacity-limited");
+        assert_eq!(a.rule, "fleet.roles-persistent");
     }
 
     #[test]

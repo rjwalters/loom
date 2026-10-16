@@ -3,8 +3,9 @@
 //! Samples CPU, memory, disk and network on a fixed interval, filters each raw
 //! series with a first-order EWMA, and returns a
 //! [`HostStatusRecord`](crate::telemetry::kinds::host_status::HostStatusRecord)
-//! for the OTLP gauge export. Nothing consumes it yet: role-span attributes
-//! and admission are later slices.
+//! for the OTLP gauge export. The latest record is published for
+//! [`latest_raw`] readers (role-span attributes, #12113); admission is a later
+//! slice.
 //!
 //! The sampler is split so the arithmetic is testable without an OS:
 //! [`read_os`] turns the platform into a [`Readings`], and
@@ -23,6 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -177,6 +179,32 @@ pub struct HostStatusSampler {
     host_filters: HashMap<&'static str, Ewma>,
     volume_filters: HashMap<&'static str, Ewma>,
     prev: Option<Prev>,
+}
+
+/// The most recent record the collector tick produced (#12113).
+static LATEST: Mutex<Option<HostStatusRecord>> = Mutex::new(None);
+
+/// Store `record` as the latest, for [`latest_raw`] readers such as the
+/// role-span host attributes.
+pub fn publish(record: &HostStatusRecord) {
+    *LATEST.lock().unwrap_or_else(PoisonError::into_inner) = Some(record.clone());
+}
+
+/// The latest record's raw value for `key`. `None` when no record has been
+/// published yet or the record has no such signal (absent is never zero).
+#[must_use]
+pub fn latest_raw(key: &str) -> Option<f64> {
+    LATEST
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|r| r.raw.get(key).copied())
+}
+
+/// Drop the published record (tests share the one global slot).
+#[cfg(test)]
+pub fn clear_latest() {
+    *LATEST.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// `now - prev` over a cumulative counter, `None` when it went backwards (a

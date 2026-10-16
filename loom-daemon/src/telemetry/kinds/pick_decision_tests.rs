@@ -110,7 +110,6 @@ fn every_disposition_maps_and_only_dispatched_is_not_a_skip() {
     assert_eq!(map(Qd::OpenPrBackoff), Some(PickSkipReason::PrOpenSkip));
     assert_eq!(map(Qd::Parked), Some(PickSkipReason::OperatorHold));
     assert_eq!(map(Qd::DeferredCapacity), Some(PickSkipReason::Cap));
-    assert_eq!(map(Qd::DeferredRepoCap), Some(PickSkipReason::Cap));
     assert_eq!(map(Qd::InFlight), Some(PickSkipReason::InFlight));
     assert_eq!(map(Qd::LabelledBlocked), Some(PickSkipReason::Blocked));
 }
