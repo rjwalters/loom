@@ -7,6 +7,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12485**: feat: classify failed steps by StepEnd instead of unclassified:step
+- **PR #12482**: fix(fleet_dispatch): derive live-table age-out from the reaper interval
+- **PR #12474**: fix(fleet-dispatch): re-grant only the same step; read tailnet_node from host records
+- **Issue #12487** (closed): design(eta-fit): durable fix for the dump string-cap so we can train on ALL history (not 7d slices) — streaming vs compact format vs query-time aggregation
+- **Issue #12480** (closed): Step-engine failures all export unclassified:step; derive class from StepEnd (#12028 follow-up)
+- **Issue #12479** (closed): fleet_dispatch worker: derive the live-table age-out from the reaper interval (90 s is hard-coded)
+- **Issue #12357** (closed): Verify live OTLP delivery of host.status gauges (follow-up to #12309)
+- **Issue #12028** (closed): role_tick.outcome failures carry no reason (167/6h vs 12 role_attempt failures)
+- **Issue #11776** (closed): Remove provenance stamping from Loom (moved to telemetry consumers) — staged
 - **PR #12473**: chore: remove stamp-only provenance test, fixture and stale docs
 - **PR #12471**: docs(fleet-captain-dispatch): tailnet node field lives on host records
 - **PR #12467**: feat(fleet-dispatch): worker client claims through the captain first (#12450)
