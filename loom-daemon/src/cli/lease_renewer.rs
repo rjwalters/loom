@@ -258,7 +258,7 @@ impl Store {
         Ok(())
     }
 
-    fn all(&self) -> Vec<(PathBuf, OwnerRecord)> {
+    pub(crate) fn all(&self) -> Vec<(PathBuf, OwnerRecord)> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };

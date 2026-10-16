@@ -50,8 +50,8 @@
 //! in skips every repo the captain's fresh heartbeat covers: no listing and
 //! no per-item read for it, and its sampler state for the repo is dropped,
 //! so taking the repo back after a stale heartbeat starts from a baseline.
-//! See [`crate::observability::captain_gauges`]. Unconfigured, every host
-//! samples as before.
+//! See [`crate::observability::captain_gauges`]. When enabled and with no
+//! captain configured, every host samples as before.
 //!
 //! # Off by default (#12203)
 //!
