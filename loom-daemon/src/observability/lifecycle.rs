@@ -795,6 +795,7 @@ pub fn prepare_execution(
     root: &Path,
     execution: &str,
     story: Option<&super::tracing::StoryRef>,
+    issue: Option<u32>,
 ) {
     // The root carries its own ID-derivation inputs (repo + sweep id) and the
     // installed prompt surface the child is about to run.
@@ -814,6 +815,14 @@ pub fn prepare_execution(
         );
     } else {
         metadata.insert("loom.repo".into(), TraceStore::repo_attribute(root));
+        // #11982: the issue is a plain fact even when `repo_id` did not
+        // resolve and no story trace exists.
+        if let Some(issue) = issue {
+            metadata.insert("loom.issue".into(), issue.to_string());
+        }
+    }
+    if let Some(base) = git_facts::base_sha(root) {
+        metadata.insert(git_facts::BASE_SHA.into(), base);
     }
     if let Some(span) = begin(root, execution, SpanName::Sweep, metadata) {
         span.command(command);
@@ -853,6 +862,18 @@ pub fn finish_execution(
             TraceAttributes::new()
         };
         attrs.extend(host.clone());
+        // #11982: the issue branch tip as of the close; the branch does not
+        // exist at dispatch, so the root cannot carry it earlier.
+        if root_span {
+            if let Some(head) = active
+                .record
+                .attributes
+                .get("loom.issue")
+                .and_then(|issue| git_facts::head_sha(root, issue))
+            {
+                attrs.insert(git_facts::HEAD_SHA.into(), head);
+            }
+        }
         attrs
             .insert("loom.result".into(), if observed { result } else { "exit_unobserved" }.into());
         if !observed {
@@ -1218,6 +1239,7 @@ pub fn role_invocation_classified(
     let drawn = role_draw::take();
     let resumed_from = roll_interruption::take_resumed_from();
     let pr = role_target::take().or_else(|| role_target::take_handoff(root, &execution));
+    let issue = role_target::take_issue();
     let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
         let unlaunched = role_failure::for_unlaunched(&outcome, noted);
         return (outcome, None, unlaunched);
@@ -1250,6 +1272,10 @@ pub fn role_invocation_classified(
     if let Some(pr) = pr {
         close.insert(role_target::PR_NUMBER.into(), pr.to_string());
     }
+    // #11982: an assigned Builder/Curator tick's issue rides its root too.
+    if let Some(issue) = issue {
+        close.insert(role_target::ISSUE.into(), issue.to_string());
+    }
     let result = roll.map_or(result, |roll| {
         roll.apply(&mut close);
         roll_interruption::RESULT.to_owned()
@@ -1258,6 +1284,7 @@ pub fn role_invocation_classified(
     (outcome, trace, None)
 }
 
+pub mod git_facts;
 pub mod role_draw;
 mod role_failure;
 pub mod role_target;

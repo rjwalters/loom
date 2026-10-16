@@ -140,6 +140,9 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
         let mut record = parse_write(&args[2..])?;
         escalation::carry_forward(&target, &mut record)?;
         persist(&dir, &target, &record)?;
+        // Default-off shadow append (#11347); the legacy file stays authoritative
+        // and a journal failure never reaches this command's result.
+        loom_daemon::journal::execution::checkpoint_written(&target, root, issue, &record);
         // Telemetry remains best effort, and only follows a successful durable write.
         loom_daemon::observability::lifecycle::checkpoint_completed(
             root,

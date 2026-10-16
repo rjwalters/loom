@@ -67,6 +67,13 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
     // engine's per-role slots beside the sweep total.
     "pool",
+    // #12038: `loom.forge.hold_items` / `hold_age_seconds`: the artifact
+    // (issue | pr), the hold label's short name, how the start was known
+    // (labels_at | unknown) and the age statistic (oldest | p50 | p90).
+    "artifact",
+    "hold",
+    "basis",
+    "stat",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -434,6 +441,14 @@ pub enum MetricName {
     /// Open items carrying a stage label, labelled `state`.
     #[serde(rename = "loom.forge.stage_items")]
     ForgeStageItems,
+    /// Open items carrying a hold or park label, labelled `repo`,
+    /// `artifact`, `hold`, `basis` (#12038).
+    #[serde(rename = "loom.forge.hold_items")]
+    ForgeHoldItems,
+    /// Seconds held (from the mirror's `labels_at`), labelled `repo`,
+    /// `artifact`, `hold`, `stat` (#12038).
+    #[serde(rename = "loom.forge.hold_age_seconds")]
+    ForgeHoldAgeSeconds,
     /// Seconds since the oldest item of a `stage_items` state entered it,
     /// labelled `state`, `reason`, `repo` (#12027: `pr_refused`).
     #[serde(rename = "loom.forge.stage_oldest_age_seconds")]
@@ -642,6 +657,8 @@ impl MetricName {
             Self::ForgeStageDwell => "loom.forge.stage_dwell",
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
+            Self::ForgeHoldItems => "loom.forge.hold_items",
+            Self::ForgeHoldAgeSeconds => "loom.forge.hold_age_seconds",
             Self::ForgeStageOldestAgeSeconds => "loom.forge.stage_oldest_age_seconds",
             Self::StepActionable => "loom.step.actionable",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
@@ -749,13 +766,17 @@ impl MetricName {
             Self::QueueOldestWait | Self::QueueDispatchWait => "s",
             Self::DispatchSlotTurnaround
             | Self::DispatchIdleSlotSeconds
+            | Self::ForgeHoldAgeSeconds
             | Self::ForgeStageDwell => "s",
             Self::DispatchSlotTurnaroundSamples
             | Self::DispatchIdleSlots
             | Self::DispatchBusySlots
             | Self::DispatchRoleMaxConcurrent
             | Self::DispatchRoleIdleSlots => "{slot}",
-            Self::ForgeStageDwellSamples | Self::ForgeStageItems | Self::StepActionable => "{item}",
+            Self::ForgeStageDwellSamples
+            | Self::ForgeStageItems
+            | Self::ForgeHoldItems
+            | Self::StepActionable => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
             Self::GithubRateLimitReset | Self::ForgeStageOldestAgeSeconds => "s",
@@ -848,6 +869,12 @@ impl MetricName {
             Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
             Self::ForgeStageItems => {
                 "Open items per repo by state: stage labels and queue states (overlapping)."
+            }
+            Self::ForgeHoldItems => {
+                "Open items per repo carrying a hold or park label, by artifact, hold and basis."
+            }
+            Self::ForgeHoldAgeSeconds => {
+                "Seconds a hold label has been applied (oldest, p50, p90), by repo, artifact and hold."
             }
             Self::ForgeStageOldestAgeSeconds => {
                 "Age of the oldest item in a stage_items state, by reason (pr_refused)."
