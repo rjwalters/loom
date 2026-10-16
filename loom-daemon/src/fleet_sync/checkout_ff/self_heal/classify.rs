@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 
 use super::super::{git, Env};
+use super::managed;
 
 /// How old an operation or an `index.lock` must be before it is called stale.
 pub(super) const STALE_AFTER: Duration = Duration::from_secs(30 * 60);
@@ -58,6 +59,10 @@ pub(super) struct Plan {
     pub reset: bool,
     /// Does the branch ref differ from HEAD (an operation moved HEAD)?
     pub branch_differs: bool,
+    /// HEAD is detached with no operation in progress, and has sat there for
+    /// [`managed::detached_after`] (#11989): the repair puts it back on the
+    /// branch.
+    pub detached: bool,
 }
 
 #[derive(Debug)]
@@ -139,7 +144,8 @@ fn stale(touched: Option<SystemTime>, now: DateTime<Utc>) -> bool {
 
 /// The Loom-managed paths: `installed_files` of the install metadata at every
 /// revision in `revs`, plus the metadata file. `Err` when any is missing or
-/// unparseable.
+/// unparseable. A path outside this set may still be Loom's: see
+/// [`managed::resync_owned`].
 fn owned_paths(env: &Env<'_>, root: &Path, revs: &[String]) -> Result<BTreeSet<String>, String> {
     let mut owned = BTreeSet::from([METADATA.to_string()]);
     for rev in revs {
@@ -325,6 +331,16 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
         commits.extend(listed.unwrap_or_default().lines().map(str::to_string));
     }
     let dirty = dirty_paths(env, root)?;
+    // #11989: a HEAD left detached with nothing in progress (a role session's
+    // `git checkout origin/main` or of a PR head in the main checkout). During
+    // a rebase HEAD is detached by design; a merge or cherry-pick on a
+    // detached HEAD is not one this repair knows how to put back.
+    let current = git::current_branch(root, local(env))?;
+    let detached = current.is_none();
+    if detached && matches!(op, Some(Op::Merge | Op::CherryPick)) {
+        return Err("a merge or cherry-pick is in progress on a detached HEAD".to_string());
+    }
+    let stray = detached && op.is_none();
     // Dirt only blocks a fast-forward when there is something to fast-forward
     // to; on a checkout that is not behind it is the operator's to keep. (The
     // clone's own ref is what is compared: a fetch this pass has not made yet
@@ -334,8 +350,16 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
     let blocking_dirt = !dirty.is_empty() && behind > 0;
-    if lock.is_none() && op.is_none() && commits.is_empty() && !blocking_dirt {
+    // A detached HEAD only blocks when it is behind: one at origin's tip (a
+    // tool pinning the checkout to a current commit) serves current files.
+    let stray_behind = stray && behind > 0;
+    if lock.is_none() && op.is_none() && commits.is_empty() && !blocking_dirt && !stray_behind {
         return Ok(Verdict::Clean);
+    }
+    // The repair resets whatever HEAD is on. A checkout someone has on another
+    // named branch is theirs, however Loom-like its commits look.
+    if let Some(on) = current.as_deref().filter(|on| *on != branch) {
+        return Err(format!("the checkout is on `{on}`, not `{branch}`"));
     }
     if commits.len() > MAX_COMMITS {
         return Err(format!("{} local commits are more than are read", commits.len()));
@@ -343,7 +367,30 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
 
     // Whose is it? Fail closed on the metadata.
     let revs = ["HEAD".to_string(), own_ref.clone(), tracking.clone()];
-    let owned = owned_paths(env, root, &revs)?;
+    let listed = owned_paths(env, root, &revs)?;
+    let pins = managed::pins(root);
+    // `rev` is the commit the path was changed in; `None` is the working tree.
+    // A skill the payload ships is the resync's only while it carries the
+    // generation marker (`resync_agent_skills`); a consumer's own, or one
+    // detached from generation by stripping it, is not.
+    let owned = |rev: Option<&str>, p: &str| {
+        if listed.contains(p) {
+            return true;
+        }
+        if !managed::resync_owned(p, &pins) {
+            return false;
+        }
+        if !managed::is_skill(p) {
+            return true;
+        }
+        let content = match rev {
+            None => std::fs::read_to_string(root.join(p)).ok(),
+            Some(sha) => read(env, root, &["show", &format!("{sha}:{p}")])
+                .or_else(|_| read(env, root, &["show", &format!("{sha}^:{p}")]))
+                .ok(),
+        };
+        content.is_some_and(|c| managed::has_marker(&c))
+    };
     let mut judged: Vec<String> = commits.iter().cloned().collect();
     if op == Some(Op::Rebase) {
         let head_name =
@@ -366,12 +413,12 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     for sha in &judged {
         if let Some(path) = commit_paths(env, root, sha)?
             .into_iter()
-            .find(|p| !owned.contains(p))
+            .find(|p| !owned(Some(sha), p))
         {
             return Err(format!("commit {sha} changes `{path}`, which Loom does not manage"));
         }
     }
-    if let Some(path) = dirty.iter().find(|p| !owned.contains(*p)) {
+    if let Some(path) = dirty.iter().find(|p| !owned(None, p)) {
         return Err(format!("`{path}` has an uncommitted change and Loom does not manage it"));
     }
 
@@ -387,7 +434,28 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
             return Err("index.lock is young or not empty".to_string());
         }
     }
-    if (op.is_some() || lock.is_some()) && live_git(root) {
+    // Re-attached only when the repair resets anyway, or the HEAD is behind.
+    let reattach = stray && (stray_behind || !commits.is_empty() || blocking_dirt);
+    if reattach {
+        // A tool that pins a checkout to a commit on purpose (2am's
+        // `provision.sh` keeps geode-fem at the newest green one) says so here;
+        // while main is red such a HEAD is detached, behind and unmoved, which
+        // is exactly the shape this repair puts back.
+        let keep = read(env, root, &["config", "--local", "--get", "loom.checkoutFf.detached"])
+            .unwrap_or_default();
+        if keep.trim().eq_ignore_ascii_case("keep") {
+            return Err("HEAD is detached on purpose (loom.checkoutFf.detached=keep)".to_string());
+        }
+        let moved = managed::head_moved_at(gd);
+        if !moved.is_some_and(|at| {
+            now.signed_duration_since(at)
+                .to_std()
+                .is_ok_and(|age| age >= managed::detached_after())
+        }) {
+            return Err("HEAD is detached and moved recently".to_string());
+        }
+    }
+    if (op.is_some() || lock.is_some() || reattach) && live_git(root) {
         return Err("a git process is running in the repository".to_string());
     }
     if let Some(path) = untracked_in_the_way(env, root, branch)? {
@@ -405,12 +473,13 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     let head = read(env, root, &["rev-parse", "HEAD"])?;
     let tip = read(env, root, &["rev-parse", "--verify", "--quiet", &own_ref]).unwrap_or_default();
     Ok(Verdict::Repair(Plan {
-        reset: op.is_some() || !commits.is_empty() || blocking_dirt,
+        reset: op.is_some() || !commits.is_empty() || blocking_dirt || reattach,
         lock,
         lock_age_min,
         op,
         commits: commits.len(),
         dirty,
         branch_differs: !tip.is_empty() && tip != head,
+        detached: reattach,
     }))
 }

@@ -324,3 +324,8 @@ fn accounts_disable_from_a_repo_cwd_is_repo_scoped_and_says_so() {
         fixture.shared_registry()
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
