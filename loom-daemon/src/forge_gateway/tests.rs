@@ -257,6 +257,34 @@ fn a_pass_publishes_each_owner_and_rewrites_api_host_on_every_publish() {
     assert_eq!(agent_env()[1], (DIR_ENV, None));
 }
 
+/// #12147: the `gh` version is re-probed on each due pass, so a `gh` replaced
+/// on disk is picked up without a daemon restart.
+#[test]
+fn a_replaced_gh_is_reported_on_the_next_refresh() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let config = cfg(&[("gwt-a", "file:/k/a")]);
+    let old = Fake::new(Some(GhVersion(2, 101, 0))).key("/k/a", Ok(KEY));
+    let new = Fake::new(Some(GhVersion(2, 102, 0))).key("/k/a", Ok(KEY));
+    let mut r = Refresher::default();
+    let now = Instant::now();
+    assert!(matches!(r.pass_with(ws, &config, now, &old), PassOutcome::Published { .. }));
+    assert_eq!(r.gh_seen().unwrap().1, GhVersion(2, 101, 0));
+    // Not due yet: the probe is not consulted, nothing changes.
+    assert_eq!(r.pass_with(ws, &config, now, &new), PassOutcome::Unchanged);
+    assert_eq!(r.gh_seen().unwrap().1, GhVersion(2, 101, 0));
+    // Due again (same owners, same config): the new version is reported.
+    let later = now + crate::credential_preflight::GITHUB_APP_REFRESH_INTERVAL;
+    assert!(matches!(r.pass_with(ws, &config, later, &new), PassOutcome::Published { .. }));
+    assert_eq!(r.gh_seen().unwrap().1, GhVersion(2, 102, 0));
+    // `gh` missing mid-run: the gateway goes off, the last-seen stays harmless.
+    let gone = Fake::new(None);
+    let much_later = later + crate::credential_preflight::GITHUB_APP_REFRESH_INTERVAL;
+    assert_eq!(r.pass_with(ws, &config, much_later, &gone), PassOutcome::GhTooOld(None));
+    teardown(&base_dir(ws));
+}
+
 #[test]
 fn an_old_gh_publishes_nothing_and_removes_what_was_there() {
     let _serial = serial();

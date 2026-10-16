@@ -309,3 +309,8 @@ fn replayed_stalled_and_idle_page_on_drawable_work_only() {
     assert_eq!(firing_repos(STALLED, &s, end), ["acme/stuck"]);
     assert_eq!(firing_repos(IDLE, &s, end), ["acme/idle", "acme/stuck"]);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

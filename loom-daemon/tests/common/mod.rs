@@ -181,6 +181,39 @@ pub fn deny_real_gh(cmd: &mut Command) {
     if std::env::var_os("LOOM_GH_BIN").is_none() {
         cmd.env("LOOM_GH_BIN", gh_stub_path());
     }
+    prepend_gh_stub_to_path(cmd);
+}
+
+/// Put [`gh_stub_path`]'s dir ahead of the inherited `PATH` so a bare
+/// `Command::new("gh")` in the spawned daemon (e.g. startup's credential
+/// preflight) resolves to the loud-failing stub, not the real `gh` and not the
+/// `live_gh_guard` stand-in that would fail the whole test binary (#12163). A
+/// later `.env("PATH", ..)` on the same command replaces it outright.
+#[allow(dead_code)]
+pub fn prepend_gh_stub_to_path(cmd: &mut Command) {
+    let dir = gh_stub_path()
+        .parent()
+        .expect("stub has a parent dir")
+        .to_path_buf();
+    let mut dirs = vec![dir];
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
+    }
+    cmd.env("PATH", std::env::join_paths(dirs).expect("join PATH"));
+}
+
+/// Point *this process's* `LOOM_GH_BIN` at [`gh_stub_path`], once, for tests
+/// that reach `gh` in-process through `gh_invocation` (which honors it) and
+/// through children that inherit the environment (#12163). Unlike a `PATH`
+/// rewrite it leaves the `live_gh_guard` self-tests' view of `PATH` alone.
+#[allow(dead_code)]
+pub fn stub_gh_bin_in_process() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("LOOM_GH_BIN").is_none() {
+            std::env::set_var("LOOM_GH_BIN", gh_stub_path());
+        }
+    });
 }
 
 /// Point a spawned daemon's `LOOM_DOCKER_BIN` at a path that does not exist

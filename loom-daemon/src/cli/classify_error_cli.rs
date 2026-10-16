@@ -10,7 +10,7 @@
 //!   Prints exactly one category line — the shell library's uppercase enum —
 //!   and exits `0`. `2` is a usage error (missing `--exit-code`, unreadable
 //!   tail file); stdout stays empty on `2` so the shell library's delegation
-//!   reads it as "could not ask" and falls back to its in-file tables.
+//!   reads it as "could not ask" and gives its degraded answer.
 //! * **Predicate mode** (`--transient <CATEGORY>`): mirrors
 //!   `classification_is_transient` — exit `0` when a retry loop should retry
 //!   that category, `1` when it is terminal. The deny-list answer travels in

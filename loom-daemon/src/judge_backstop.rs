@@ -178,6 +178,95 @@ pub fn more_check_runs(page: &Value, read: usize) -> bool {
     check_runs_listed(page) == CI_PAGE && (read as u64) < total
 }
 
+/// A head's CI as the release reads it (#11972).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiState {
+    /// Something still pending started inside the exemption window
+    /// ([`pending_exempts`]).
+    Young,
+    /// Something is still pending, but every pending run or status is past
+    /// the window or has no start stamp: CI that is stuck, not settling.
+    Stuck,
+    /// Nothing pending was read: CI concluded (or could not be read).
+    Settled,
+}
+
+impl CiState {
+    /// Whether a Judge pass that ended without a verdict at this CI is
+    /// exempt from the no-verdict record. By default only young pending CI
+    /// exempts. A pass that said it stood down for pending CI
+    /// (`--skip-reason ci-pending`) is also exempt once CI has settled since
+    /// (the race #11972 fixes), but never on stuck CI: `forge wait-checks`
+    /// has no age cap, so stuck CI would exempt every pass, and the PR
+    /// planner serves exactly those PRs (#12003); recording them keeps the
+    /// loop bounded.
+    #[must_use]
+    pub fn exempts(self, skipped_for_pending_ci: bool) -> bool {
+        match self {
+            Self::Young => true,
+            Self::Settled => skipped_for_pending_ci,
+            Self::Stuck => false,
+        }
+    }
+}
+
+/// Which read of [`ci_state`] a `get` call is, so each can carry its own
+/// forge-call-stats op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiRead {
+    /// One page of `commits/{sha}/check-runs`.
+    CheckRuns,
+    /// The legacy `commits/{sha}/status`.
+    CommitStatus,
+}
+
+/// `sha`'s [`CiState`], read through `get(kind, path)` with `path` relative
+/// to `repos/{o}/{r}/`: every page of its check runs, up to
+/// [`MAX_CHECK_RUN_PAGES`], then its legacy commit statuses (#11903). Stops at
+/// the first read that is [`CiState::Young`], so the usual cost is one call;
+/// an unreadable read contributes nothing.
+pub fn ci_state(
+    sha: &str,
+    now: DateTime<Utc>,
+    mut get: impl FnMut(CiRead, &str) -> Option<Value>,
+) -> CiState {
+    let base = format!("commits/{sha}/check-runs?per_page={CI_PAGE}");
+    let mut stuck = false;
+    let mut read = 0;
+    for page in 1..=MAX_CHECK_RUN_PAGES {
+        let path = if page == 1 {
+            base.clone()
+        } else {
+            format!("{base}&page={page}")
+        };
+        let Some(v) = get(CiRead::CheckRuns, &path) else {
+            break;
+        };
+        let pending = pending_check_runs(&v);
+        if pending_exempts(&pending, now) {
+            return CiState::Young;
+        }
+        stuck |= !pending.is_empty();
+        read += check_runs_listed(&v);
+        if !more_check_runs(&v, read) {
+            break;
+        }
+    }
+    let status = format!("commits/{sha}/status?per_page={CI_PAGE}");
+    if let Some(v) = get(CiRead::CommitStatus, &status) {
+        let pending = pending_statuses(&v);
+        if pending_exempts(&pending, now) {
+            return CiState::Young;
+        }
+        stuck |= !pending.is_empty();
+    }
+    if stuck {
+        CiState::Stuck
+    } else {
+        CiState::Settled
+    }
+}
+
 /// The label whose presence means "still waiting for a Judge".
 pub const REVIEW_LABEL: &str = "loom:review-requested";
 

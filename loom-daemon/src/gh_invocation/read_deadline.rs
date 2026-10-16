@@ -135,6 +135,26 @@ pub fn escalated() -> bool {
     SCOPE.with(Cell::get).is_some_and(|s| s.escalated)
 }
 
+/// The scope in force on this thread, to carry onto a worker thread
+/// ([`install`]): the step gather reads repos on several threads (#12256),
+/// and each must keep the tick's deadline and writer rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Snapshot(Option<Scope>);
+
+/// This thread's scope, for [`install`] on another thread.
+#[must_use]
+pub fn snapshot() -> Snapshot {
+    Snapshot(SCOPE.with(Cell::get))
+}
+
+/// Put `snapshot` in force on this thread until the guard drops.
+pub fn install(snapshot: Snapshot) -> Guard {
+    Guard {
+        previous: SCOPE.with(|s| s.replace(snapshot.0)),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
 /// Lift the scope until the guard drops.
 pub fn suspend() -> Guard {
     Guard {
@@ -255,5 +275,30 @@ mod tests {
         assert!(passed());
         assert_eq!(clamp(Duration::from_secs(30)), None);
         assert!(writer_fallback_allowed());
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_scope_onto_another_thread() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let _scope = enter(deadline, true);
+        let _writer = allow_writer();
+        let snap = snapshot();
+        std::thread::spawn(move || {
+            // A fresh thread has no scope of its own.
+            assert_eq!(budget(), Budget::Unbounded);
+            {
+                let _g = install(snap);
+                assert!(matches!(budget(), Budget::Left(_)));
+                assert!(escalated());
+                assert!(writer_fallback_allowed());
+            }
+            assert_eq!(budget(), Budget::Unbounded);
+        })
+        .join()
+        .unwrap();
+        // An empty snapshot installs no scope.
+        let none = std::thread::spawn(snapshot).join().unwrap();
+        let _g = install(none);
+        assert_eq!(budget(), Budget::Unbounded);
     }
 }
