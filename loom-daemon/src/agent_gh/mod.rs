@@ -377,6 +377,13 @@ fn run_on_profile(
     // served reads' reader-then-writer chain does. The front is a new
     // process per call, so no withdrawal remembers it: this is decided on
     // every call.
+    // That is also why a reader's 404 is always shed here (#12511): the
+    // facade lets a 404 through as the item's own answer when the reader
+    // recently served the repo (`served::judge_coverage`), but that evidence
+    // is a process-local map and this process has just started, so it is
+    // always empty. Applying the rule would only ever say "no evidence", so a
+    // genuinely missing item (a new-branch probe) exits 75 until the call is
+    // made through the facade.
     let refused = !gateway
         && !out.status.success()
         && read_route::reader_refused(

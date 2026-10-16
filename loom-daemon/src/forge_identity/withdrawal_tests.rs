@@ -97,6 +97,7 @@ fn a_core_rate_limit_withdraws_only_that_owners_core_bucket() {
         readers: vec![reader(app)],
         legacy_logins: vec![],
         writers: Vec::new(),
+        load_failed: false,
     };
     let pick = |repo: &str, resource| {
         super::super::reader_for_resource_at(&roster, repo, resource, during, RoutingMode::Scoped)
@@ -597,5 +598,42 @@ fn fetch_conditional_failures_carry_their_reset_into_the_withdrawal() {
             false
         ),
         "the response's x-ratelimit-reset, not the flat default"
+    );
+}
+
+// ---- evidence-free coverage withdrawal is short (#12511) ---------------------
+
+#[test]
+fn an_evidence_free_404_withdraws_briefly_and_a_403_for_an_hour() {
+    for mode in [RoutingMode::Scoped, RoutingMode::Legacy] {
+        let plan = |f| plan_withdrawal("acme/x", f, t0(), mode, "940020", &no_probe);
+        assert_eq!(
+            plan(Failure::CoverageUnproven),
+            Withdrawal::Repo {
+                until: t0() + forge_read_pool::DEFAULT_WITHDRAWAL
+            }
+        );
+        assert_eq!(
+            plan(Failure::Coverage),
+            Withdrawal::Repo {
+                until: t0() + super::super::REPO_WITHDRAWAL
+            }
+        );
+    }
+    assert!(forge_read_pool::DEFAULT_WITHDRAWAL < super::super::REPO_WITHDRAWAL);
+}
+
+#[test]
+fn a_plain_404_with_no_served_evidence_is_judged_unproven_and_a_403_is_not() {
+    use crate::forge_identity::served::{judge_coverage, CoverageRefusal};
+    let now = t0();
+    let judge = |status, stderr| {
+        judge_coverage("940021", "acme/nobody", "pulls", true, status, stderr, now)
+    };
+    assert_eq!(judge(Some(404), "HTTP 404: Not Found"), CoverageRefusal::WithdrawUnproven);
+    assert_eq!(judge(Some(403), "HTTP 403: Forbidden"), CoverageRefusal::Withdraw);
+    assert_eq!(
+        judge(Some(404), "Resource not accessible by integration"),
+        CoverageRefusal::Withdraw
     );
 }

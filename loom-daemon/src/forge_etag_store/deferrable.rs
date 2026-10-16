@@ -168,7 +168,7 @@ pub(super) fn fetch(
             tried.push(app_id);
             continue;
         }
-        let Some(failure) = reader_failure(&first) else {
+        let Some(mut failure) = reader_failure(&first) else {
             // Not the credential's fault (a 5xx, a network error): another
             // reader would not help.
             return Ok(first);
@@ -194,6 +194,10 @@ pub(super) fn fetch(
                     return Err(shed(site, gh_bin, target, repo, until, Some(&app_id)));
                 }
                 served::CoverageRefusal::Withdraw => {}
+                // No evidence at all: a short withdrawal (#12511).
+                served::CoverageRefusal::WithdrawUnproven => {
+                    failure = Failure::CoverageUnproven;
+                }
             }
         }
         // A rate limit, a refused token, or a 403/404 from a reader with no
