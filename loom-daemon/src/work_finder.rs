@@ -2110,13 +2110,12 @@ pub fn spawn_multi_work_finder_task(
             // due while free space is below the floor (#12406). Hygiene, not
             // admission: it never changes the cap.
             eager_trigger.tick(&fallback_root).await;
-            // Refresh the memoized CPU idle sample — **observational only**
+            // Read the filtered CPU idle (#12114) — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
             // `observed_idle=` figure in the axis line and `loom-daemon status`
             // / `calibrate`, which is how an operator tunes this machine's
             // `maxConcurrent`; it no longer gates admission.
-            let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
-            let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
+            let idle = crate::host_status::filtered_cpu_idle_fraction();
             // The cap, for the published summary and the tick span
             // (`ops::dispatch_facts`).
             tick_summary::record_cap(crate::types::CapView {

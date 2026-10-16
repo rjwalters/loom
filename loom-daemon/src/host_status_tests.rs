@@ -235,3 +235,56 @@ fn volume_free_bytes_reads_an_existing_ancestor_and_none_for_nothing() {
         .join("b");
     assert!(volume_free_bytes(&dir).is_some(), "walks up to the existing /tmp");
 }
+
+// ---- #12114: admission readers see the filtered record ----
+
+#[test]
+fn filtered_readers_smooth_a_one_sample_load_spike() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    // Six calm ticks at 0.5/core, then one 2.0/core spike one tick later (the old raw gate
+    // threshold is 0.9/core).
+    let mut last = None;
+    for i in 0..6 {
+        last = Some(s.step(&readings(), f64::from(i) * 5.0));
+    }
+    let mut spike = readings();
+    spike.load_per_core = Some(2.0);
+    let record = s.step(&spike, 30.0);
+    publish(&record);
+    let raw = latest_raw("cpu_load_per_core").unwrap();
+    let filtered = filtered_load_per_core().unwrap();
+    clear_latest();
+    assert!(last.is_some());
+    assert!(raw >= 0.9, "a raw read trips the 0.9 gate threshold: {raw}");
+    assert!(filtered < 0.9, "the filtered read does not: {filtered}");
+    assert!(filtered > 0.5, "but it does move toward the spike: {filtered}");
+}
+
+#[test]
+fn filtered_readers_are_absent_until_published_and_never_zero() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    clear_latest();
+    assert_eq!(latest_filtered("cpu_load_per_core"), None);
+    assert_eq!(filtered_load_per_core(), None);
+    assert_eq!(filtered_loadavg_1m(8), None);
+    assert_eq!(filtered_cpu_idle_fraction(), None);
+}
+
+#[test]
+fn filtered_loadavg_and_idle_are_derived_from_the_filtered_signals() {
+    let _slot = TEST_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut s = HostStatusSampler::new(HostStatusConfig::default());
+    s.step(&readings(), 0.0);
+    let mut b = readings();
+    b.cpu = Some(CpuCounters {
+        idle: 150,
+        total: 300,
+    });
+    publish(&s.step(&b, 5.0));
+    let lpc = filtered_load_per_core().unwrap();
+    assert!(approx(filtered_loadavg_1m(8).unwrap(), lpc * 8.0));
+    // 50% utilisation over the second tick: idle is its complement.
+    assert!(approx(filtered_cpu_idle_fraction().unwrap(), 0.5));
+    clear_latest();
+}

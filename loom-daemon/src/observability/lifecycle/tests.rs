@@ -297,8 +297,7 @@ fn host_and_admission_attributes_survive_the_span_allowlist() {
 // #12113: role-span host attributes read the `host_status` latest record
 // ---------------------------------------------------------------------------
 
-/// Serialises the tests that publish to `host_status`'s one global slot.
-static HOST_STATUS_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+use crate::host_status::TEST_SLOT as HOST_STATUS_SLOT;
 
 fn host_record(raw: &[(&str, f64)]) -> crate::telemetry::kinds::host_status::HostStatusRecord {
     crate::telemetry::kinds::host_status::HostStatusRecord {

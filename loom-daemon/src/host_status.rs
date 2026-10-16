@@ -187,6 +187,42 @@ pub fn latest_raw(key: &str) -> Option<f64> {
         .and_then(|r| r.raw.get(key).copied())
 }
 
+/// The latest record's filtered (EWMA) value for `key`: the one smoothed source
+/// admission-side readers use (#12114). `None` when no record has been
+/// published yet or the filter has not been fed this signal (absent is never
+/// zero), so a caller keeps its unreadable-sample path for it.
+#[must_use]
+pub fn latest_filtered(key: &str) -> Option<f64> {
+    LATEST
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|r| r.filtered.get(key).copied())
+}
+
+/// Filtered 1-minute load per logical core, the admission-side load reading.
+#[must_use]
+pub fn filtered_load_per_core() -> Option<f64> {
+    latest_filtered("cpu_load_per_core")
+}
+
+/// Filtered 1-minute load average (`load_per_core` times `ncpu`), for the
+/// callers that compare a raw load to a per-core threshold themselves.
+#[must_use]
+pub fn filtered_loadavg_1m(ncpu: usize) -> Option<f64> {
+    filtered_load_per_core().map(|lpc| lpc * ncpu as f64)
+}
+
+/// Filtered CPU idle fraction (`1 - cpu_utilisation`), clamped to `0..=1`.
+#[must_use]
+pub fn filtered_cpu_idle_fraction() -> Option<f64> {
+    latest_filtered("cpu_utilisation").map(|u| (1.0 - u).clamp(0.0, 1.0))
+}
+
+/// Serialises the tests that publish to the one global slot.
+#[cfg(test)]
+pub static TEST_SLOT: Mutex<()> = Mutex::new(());
+
 /// Drop the published record (tests share the one global slot).
 #[cfg(test)]
 pub fn clear_latest() {
