@@ -273,13 +273,14 @@ discover_epic_children() {
   local repo="$1" num="$2" marker="loom:epic:$2:phase:" srcs=""
   EPIC_CHILD_DISCOVERY_COMPLETE=yes
 
+  page_full() { [ "$(printf '%s' "$1" | jq 'length' 2>/dev/null || echo 0)" -ge "$2" ]; }
+  local a a_raw
+
   # (a) phase-marker children — the historical source (champion-epic.md Step 3).
   # Every `gh issue list` below is fetched UNFILTERED and filtered locally with
   # jq: the truncation check must see the raw page, because a full page whose
   # marker matches are few would otherwise look short (#10935). Includes
   # loom:frozen children (discovery, not work).
-  page_full() { [ "$(printf '%s' "$1" | jq 'length' 2>/dev/null || echo 0)" -ge "$2" ]; }
-  local a a_raw
   a_raw=$(${GH_READ:-gh} issue list --repo "$repo" --label="loom:epic-phase" --state=all --limit=500 \
     --json number,state,body 2>/dev/null) \
     || { a_raw='[]'; EPIC_CHILD_DISCOVERY_COMPLETE=no; }
