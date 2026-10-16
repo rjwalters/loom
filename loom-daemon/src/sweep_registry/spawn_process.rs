@@ -414,6 +414,19 @@ impl SweepRegistry {
         };
         if let Some(session) = &session {
             session.apply_env(&mut cmd);
+            // #11913: a step's session, for the ledger its end writes.
+            let id = session
+                .resume
+                .as_ref()
+                .map(|r| r.session_id.clone())
+                .or_else(|| session.claude_session_id.clone());
+            if let (SweepKind::Step { .. }, Some(session_id)) = (kind, id) {
+                crate::step_dispatch::session_ledger::note_session(
+                    &self.config.workspace_root,
+                    sweep_id,
+                    crate::step_dispatch::session_ledger::NotedSession { session_id },
+                );
+            }
         }
         let child = crate::observability::lifecycle::spawn_child(
             &mut cmd,
