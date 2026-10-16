@@ -1326,9 +1326,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // concurrency scaling added in #3811 — Phase B). Opt-in via
     // `LOOM_WORK_FINDER`. Each tick queries the forge for open `loom:issue`
     // items and dispatches up to a **work-driven** cap — recomputed every tick as
-    // `min(disk headroom, ram headroom, configured_max)` (the CPU/load term
-    // added in #3978 was removed in #4512; the token-pool term was removed in
-    // #5270) — through the same `SweepRegistry::dispatch()` path the IPC
+    // the configured max alone (the CPU/load term added in #3978 was removed
+    // in #4512, the token-pool term in #5270, and the disk and RAM terms in
+    // #12330 / #12406) — through the same `SweepRegistry::dispatch()` path the IPC
     // `DispatchSweep` request uses. `LOOM_WORK_FINDER_MAX_CONCURRENT` is
     // repurposed (Phase A → B) from a fixed target into the operator ceiling;
     // the cap also never exceeds the scratch-volume disk headroom nor the

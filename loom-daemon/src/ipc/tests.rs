@@ -3963,7 +3963,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
     // The tempdir has no `.loom/tokens/`, so the pool is 0 — but since
     // #5270 the token axis no longer participates in the dynamic cap, so
     // an empty token pool no longer pins `dynamic_cap` to 0. The cap is
-    // `min(disk_headroom, configured_max)`, where
+    // `configured_max` (#12406), where
     // `configured_max` is resolved the same way `build_daemon_status`
     // resolves it (not assumed to be the built-in default — a host-level
     // config tier may set it, exactly the ambient config this assertion

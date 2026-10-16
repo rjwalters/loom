@@ -2979,8 +2979,8 @@ pub struct CapacityReport {
     pub exhausted_accounts: usize,
     /// The health-adjusted token-axis limit: `healthy_accounts` when a ranking
     /// exists, else the raw token-pool size. The token axis no longer feeds the
-    /// dynamic concurrency cap (`min(disk headroom, ram headroom,
-    /// configured_max)`, removed in #5270) — this field is informational only,
+    /// concurrency cap (removed from it in #5270; the cap is the configured
+    /// `maxConcurrent` since #12406) — this field is informational only,
     /// reported here because it still drives spawn-time account *selection*
     /// (prefer healthier accounts) elsewhere in the daemon.
     pub token_axis_limit: usize,
