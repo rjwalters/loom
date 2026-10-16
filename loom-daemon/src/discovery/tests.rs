@@ -499,6 +499,37 @@ fn a_failed_listing_is_tier_none_and_is_not_retried_until_the_backstop() {
 }
 
 #[test]
+fn a_breaker_skip_is_not_paced_but_a_listing_failure_is() {
+    use super::fallback::{Fallback, ListFailure, Served};
+    let fail = |reason| ListFailure {
+        reason,
+        detail: String::new(),
+    };
+    let t0 = std::time::Instant::now();
+    let after = t0 + Duration::from_secs(1);
+    let mut fb = Fallback::new(Duration::from_secs(60));
+
+    // A breaker skip sent nothing: serves `Failed` now, retried next tick.
+    let served = fb.finish("acme/widgets", t0, Err(fail("breaker")));
+    assert!(matches!(served, Served::Failed(f) if f.reason == "breaker"));
+    assert!(fb.paced("acme/widgets", after).is_none());
+
+    // A listing failure is still paced for the backstop.
+    fb.finish("acme/old", t0, Err(fail("listing")));
+    assert!(matches!(
+        fb.paced("acme/old", after),
+        Some(Served::Failed(f)) if f.reason == "listing"
+    ));
+
+    // A breaker skip after a good listing leaves the window untouched.
+    fb.finish("acme/new", t0, Ok(listed("acme/new", Tier::Gh)));
+    let skip = t0 + Duration::from_secs(30);
+    fb.finish("acme/new", skip, Err(fail("breaker")));
+    assert!(matches!(fb.paced("acme/new", skip), Some(Served::Paced(_))));
+    assert!(fb.paced("acme/new", t0 + Duration::from_secs(61)).is_none());
+}
+
+#[test]
 fn a_reserve_refusal_ends_discovery_draws_from_the_last_listing_and_spares_the_breaker() {
     use crate::gh_invocation::purpose;
     let mut d = Discovery::with_backstop(Duration::ZERO);
