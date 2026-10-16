@@ -837,6 +837,51 @@ mod captain {
         cancel_all(&mut reg);
     }
 
+    /// #12493: the flag set only in the daemon workspace's host-local tier
+    /// reaches a step whose registry is another repo: the step asks the
+    /// captain, and carries the grant. With the host tier off, nothing asks.
+    #[test]
+    #[serial]
+    fn the_host_tier_flag_reaches_a_step_in_another_repo() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let (host, dir) = (tempdir().unwrap(), tempdir().unwrap());
+        let (mut reg, _) = fixture_registry(dir.path());
+        let server = granted();
+        let local = host.path().join(crate::config_resolver::LOCAL_CONFIG_REL);
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(
+            &local,
+            json!({"fleetDispatch": {"enabled": true, "url": server.url()}}).to_string(),
+        )
+        .unwrap();
+        crate::fleet_dispatch::worker::set_host_root(host.path());
+        let (outcome, signals) =
+            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_452, StepRole::Judge)));
+        outcome.unwrap();
+        let claims = server.requests_to(CLAIM_PATH);
+        assert_eq!(claims.len(), 1, "the host's flag must reach this repo's claim");
+        assert_eq!(claims[0]["item"], 9_452);
+        let span = signals
+            .spans
+            .iter()
+            .find(|s| s.name.as_str() == "loom.dispatch.step")
+            .unwrap();
+        assert_eq!(span.attributes["loom.assignment.id"], "a-12450");
+        cancel_all(&mut reg);
+
+        std::fs::write(
+            &local,
+            json!({"fleetDispatch": {"enabled": false, "url": server.url()}}).to_string(),
+        )
+        .unwrap();
+        let (outcome, _) =
+            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_453, StepRole::Judge)));
+        outcome.unwrap();
+        assert_eq!(server.requests_to(CLAIM_PATH).len(), 1, "host tier off: no new claim");
+        cancel_all(&mut reg);
+        crate::fleet_dispatch::worker::reset_for_test();
+    }
+
     /// With the flag off the step spawns exactly as before: no server call.
     #[test]
     #[serial]
