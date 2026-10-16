@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 
 use super::snapshot::{RepoSnapshot, RepoStatus};
 use super::worklist::{self, Worklist};
-use crate::forge_mirror::client::{self, Conditional, MirrorError};
+use crate::forge_mirror::client::{self, Conditional, Freshness, MirrorError};
 
 /// The worklist path.
 pub const PATH: &str = "/v1/mirror/worklist";
@@ -80,6 +80,9 @@ pub enum Miss {
     NotInWorklist,
     /// The worklist names the repo with a `status` that is not `ok`.
     Status(RepoStatus),
+    /// The mirror cannot vouch for the repo ([`Freshness::Unknown`]): its
+    /// `items` may be empty or partial, so they are not the truth.
+    Unvouched,
 }
 
 impl Miss {
@@ -88,7 +91,7 @@ impl Miss {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::NoWorklist(class) => class,
-            Self::NotInWorklist | Self::Status(_) => "repo_status",
+            Self::NotInWorklist | Self::Status(_) | Self::Unvouched => "repo_status",
         }
     }
 
@@ -97,7 +100,7 @@ impl Miss {
     pub fn status(&self) -> RepoStatus {
         match self {
             Self::NoWorklist(_) => RepoStatus::Error,
-            Self::NotInWorklist => RepoStatus::Unknown,
+            Self::NotInWorklist | Self::Unvouched => RepoStatus::Unknown,
             Self::Status(s) => *s,
         }
     }
@@ -181,17 +184,28 @@ impl MirrorBackend {
 impl TickWorklist {
     /// One repo's snapshot from the worklist.
     ///
+    /// A stale repo (known and reconciled, evidence older than the bound) is
+    /// still served; one the mirror cannot vouch for at all is not.
+    ///
     /// # Errors
     ///
-    /// [`Miss`]: the caller falls to the next tier for this repo alone.
-    pub fn repo(&self, slug: &str, _now: DateTime<Utc>) -> Result<Arc<RepoSnapshot>, Miss> {
+    /// [`Miss`]: the caller falls to the next tier for this repo alone. The
+    /// worklist is absent or omits the repo, the repo's `status` is not `ok`,
+    /// or its watermark reads [`Freshness::Unknown`] (not known, moved or
+    /// deleted, never reconciled, or naming another repo): [`Miss::Unvouched`].
+    pub fn repo(&self, slug: &str, now: DateTime<Utc>) -> Result<Arc<RepoSnapshot>, Miss> {
         let Some(list) = &self.worklist else {
             return Err(Miss::NoWorklist(self.failure.as_ref().map_or("transport", |f| f.class)));
         };
-        let repo = list
-            .repos
-            .get(&slug.to_ascii_lowercase())
-            .ok_or(Miss::NotInWorklist)?;
+        let slug = slug.to_ascii_lowercase();
+        let repo = list.repos.get(&slug).ok_or(Miss::NotInWorklist)?;
+        let unvouched = list
+            .marks
+            .get(&slug)
+            .is_none_or(|m| m.freshness(&slug, self.max_staleness, now) == Freshness::Unknown);
+        if unvouched {
+            return Err(Miss::Unvouched);
+        }
         match repo.status {
             RepoStatus::Ok => Ok(repo.clone()),
             other => Err(Miss::Status(other)),
