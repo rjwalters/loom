@@ -68,7 +68,7 @@ pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
 pub use paged::{walk_enabled as page_walk_enabled, WALK_ENV as PAGE_WALK_ENV};
 pub use purpose::ForgePurpose;
-pub use reader_route::{READ_SHED_ENV, SHED_MARKER};
+pub use reader_route::SHED_MARKER;
 
 #[cfg(test)]
 mod tests;
@@ -793,16 +793,8 @@ impl GhInvocation {
         let lookup = move |req: &crate::forge_identity::RouteRequest<'_>| {
             route(req, std::time::SystemTime::now())
         };
-        // `LOOM_READ_ROUTING=legacy`: the pre-W4-C path exactly — no
-        // derivation, no read class, the unconditional writer fallback.
-        if crate::forge_identity::RoutingMode::current()
-            == crate::forge_identity::RoutingMode::Legacy
-        {
-            return self.execute_routed(&lookup, &reader_route::withdraw_reader);
-        }
-        let policy = reader_route::ShedPolicy::current();
         self.with_derived_route()
-            .execute_routed_v2(&lookup, &reader_route::withdraw_reader, policy)
+            .execute_routed_v2(&lookup, &reader_route::withdraw_reader)
     }
 
     /// A read the tick deadline stopped (#12074): shed, nothing sent.

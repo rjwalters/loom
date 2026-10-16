@@ -224,6 +224,33 @@ fn is_rate_limit_probe(args: &[OsString]) -> bool {
     args.first().is_some_and(|a| a == "api") && static_pool(args) == Pool::Other
 }
 
+/// Whether a read was sent on the writer credential without saying so
+/// (#12394): a read the router never moved onto a reader, that no caller
+/// pinned with `GhInvocation::writer_identity` and that no caller gave a
+/// credential of its own. "The writer is never used for reads": this is
+/// the runtime half of the structural guard (`tests/writer_read_guard.rs`).
+#[must_use]
+pub(super) fn is_unmarked_read_on_writer(inv: &GhInvocation) -> bool {
+    inv.intent == super::AccessIntent::Read
+        && super::reader_route::role_of(inv) == crate::forge_identity::IdentityRole::Writer
+        && !inv.writer_only
+        && inv.config_dir.is_none()
+        && !inv.strip_token_env
+}
+
+/// An error-level event for [`is_unmarked_read_on_writer`], so the
+/// operation that spent writer budget on a read is named in the log.
+fn flag_read_on_writer(inv: &GhInvocation) {
+    if is_unmarked_read_on_writer(inv) {
+        log::error!(
+            "gh_invocation: read on the writer credential: {} — the writer is never used for \
+             reads (#12394); route it to a reader, shed it, or pin it with writer_identity() \
+             and list it in tests/writer_read_guard.rs [read-on-writer]",
+            inv.operation.as_str()
+        );
+    }
+}
+
 /// Record one completed invocation (see the module docs for what is skipped)
 /// and return its [`Billing`] facts for the `invoke github` span (#10343).
 /// `captured` is `(stdout, stderr)` for a captured run, `None` for passthrough.
@@ -245,6 +272,7 @@ pub(super) fn record(
             super::reader_route::role_of(inv).as_str(),
         );
     }
+    flag_read_on_writer(inv);
     let caller = inv.operation.as_str();
     let (identity, ro) =
         resolve_with(inv, std::env::var("GH_HOST").ok(), std::env::var("LOOM_REPO").ok());

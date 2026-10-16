@@ -764,9 +764,6 @@ fn a_credential_withdrawal_beside_a_budget_one_is_a_withdrawn_exhaustion() {
     // 2026-10-15: this mix was `Unavailable`, which sent every Hygiene and
     // Observability read to the writer. Both exclusions end on their own.
     assert_eq!(cause_of(&d), ExhaustCause::Withdrawn);
-    assert!(ReadClass::Hygiene.sheds(cause_of(&d)));
-    assert!(ReadClass::Observability.sheds(cause_of(&d)));
-    assert!(!ReadClass::Gate.sheds(cause_of(&d)));
 }
 
 #[test]
@@ -787,14 +784,12 @@ fn an_app_wide_withdrawal_beside_a_budget_one_is_withdrawn_and_a_stale_dir_unava
     assert_eq!(cause_of(&d), ExhaustCause::Withdrawn);
 
     // A stale token directory may never clear: Unavailable, even beside a
-    // withdrawal. Hygiene goes to the writer; Observability still sheds.
+    // withdrawal.
     let r = roster(vec![reader("81393", None), reader("81394", None)]);
     let ws = workspace(&r, &["other"]);
     forge_read_pool::withdraw_until("81393", until);
     let d = route_read_in(ws.path(), &r, &hygiene("acme/stale"), &v2(&cfg), now);
     assert_eq!(cause_of(&d), ExhaustCause::Unavailable);
-    assert!(!ReadClass::Hygiene.sheds(cause_of(&d)));
-    assert!(ReadClass::Observability.sheds(cause_of(&d)));
 }
 
 #[test]

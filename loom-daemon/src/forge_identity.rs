@@ -792,21 +792,18 @@ pub fn apply_read_credential(
 pub enum IdentityRole {
     /// A reader App's own installation pool.
     Reader,
-    /// The writer credential, chosen up front (no usable reader, a write, or
-    /// a read pinned with `GhInvocation::writer_identity`).
+    /// The writer credential, chosen up front (no reader pool on the host, a
+    /// write, or a read pinned with `GhInvocation::writer_identity`).
     Writer,
-    /// The writer, re-running a read a reader failed on.
-    WriterFallback,
 }
 
 impl IdentityRole {
-    /// The accounting value: `reader` / `writer` / `writer-fallback`.
+    /// The accounting value: `reader` / `writer`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             IdentityRole::Reader => "reader",
             IdentityRole::Writer => "writer",
-            IdentityRole::WriterFallback => "writer-fallback",
         }
     }
 }
@@ -859,26 +856,23 @@ pub fn serving_writer_bucket(
     }
 }
 
-/// The one reader-then-writer retry shape (#9537, shared since #9872 by
-/// `forge_etag_store::fetch_conditional` and the `GhInvocation` choke point).
+/// The one reader-only read shape (#12394; was `reader_then_writer`, #9537/#9872).
 ///
-/// With no `reader_dir`, `run` is called once on the writer. Otherwise it runs
-/// on the reader first; a success, or a failure that is not the credential's
-/// (`failure_of` → `None`), is returned as-is. On a rate limit or credential
-/// failure the reader
-/// is withdrawn (`withdraw`, handed the reader's failed result) and the read
-/// re-runs once on the writer (any [`Failure::is_app_wide`] failure: a rate
-/// limit or a refused credential; W4-A scopes the withdrawal, not this
-/// retry). On a
-/// 403/404 ([`Failure::Coverage`]) the read re-runs on the writer and the
-/// reader is withdrawn **only if the writer succeeds**: a resource missing for
-/// everyone must not take the repo's reader offline.
+/// **A read never falls through to the writer.** With no `reader_dir` (the
+/// host has no reader pool, [`RouteDecision::NoPool`]: the writer is the only
+/// credential there is) `run` is called once as [`IdentityRole::Writer`].
+/// Otherwise it runs on the reader once, and whatever that attempt answers is
+/// returned as-is: a success, or a failure the caller already maps to "no
+/// answer this tick". On a rate limit or credential failure the reader is
+/// withdrawn (`withdraw`, handed the reader's failed result) so the next read
+/// is routed past it; a 403/404 ([`Failure::Coverage`]) is the reader's own
+/// answer and withdraws nothing (nothing confirms the resource exists for
+/// anyone, and the writer is not asked).
 ///
 /// # Errors
 ///
-/// Whatever `run` returns; an `Err` from the reader attempt is not retried
-/// (it means the call could not be made, not that the reader was refused).
-pub fn reader_then_writer<T, E>(
+/// Whatever `run` returns.
+pub fn read_via_reader<T, E>(
     reader_dir: Option<&Path>,
     mut run: impl FnMut(Option<&Path>, IdentityRole) -> Result<T, E>,
     succeeded: impl Fn(&T) -> bool,
@@ -892,18 +886,12 @@ pub fn reader_then_writer<T, E>(
     if succeeded(&first) {
         return Ok(first);
     }
-    let Some(failure) = failure_of(&first) else {
-        return Ok(first);
-    };
-    if failure.is_app_wide() {
-        withdraw(failure, &first);
-        return run(None, IdentityRole::WriterFallback);
+    if let Some(failure) = failure_of(&first) {
+        if failure.is_app_wide() {
+            withdraw(failure, &first);
+        }
     }
-    let second = run(None, IdentityRole::WriterFallback)?;
-    if succeeded(&second) {
-        withdraw(failure, &first);
-    }
-    Ok(second)
+    Ok(first)
 }
 
 /// Whether a failed read is the credential's fault (see [`classify_failure`]).

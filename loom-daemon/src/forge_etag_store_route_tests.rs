@@ -128,12 +128,11 @@ printf 'HTTP/2.0 200 OK\r\nEtag: "e"\r\n\r\n{{}}'
     (gh, log)
 }
 
-/// W6: an item-scoped reader `404` is the item's answer — no writer retry —
-/// only when the same reader recently served the same repo's SAME endpoint
-/// family. Evidence for `issues` never covers `pulls`, and a read that is not
-/// item-scoped keeps the Coverage path.
+/// A reader `404` is the reader's own answer whether or not the read is
+/// item-scoped (W6): the writer is never asked to confirm it (#12394), so
+/// same-family evidence no longer changes what runs.
 #[test]
-fn an_item_scoped_reader_404_needs_same_family_evidence() {
+fn a_reader_404_is_the_answer_for_item_scoped_and_plain_reads_alike() {
     let tmp = tempfile::tempdir().unwrap();
     let (gh, log) = item_stub(tmp.path());
     let reader = tmp.path().join("reader-w6");
@@ -150,48 +149,31 @@ fn an_item_scoped_reader_404_needs_same_family_evidence() {
     let item =
         ConditionalRead::new("test_item_scoped", crate::forge_call_stats::ops::PR_VIEW_STATE)
             .item_scoped();
+    let plain =
+        ConditionalRead::new("test_item_scoped", crate::forge_call_stats::ops::PR_VIEW_STATE);
     let status = |site: ConditionalRead, url: &str| {
         let (_, resp, _) =
             fetch_conditional_via(site, &gh, None, &target, url, None, &route).unwrap();
         resp.unwrap().status
     };
     let missing = "repos/acme/w6-item/pulls/5";
-
-    // No evidence: the reader's 404 re-runs on the writer.
-    assert_eq!(status(item, missing), 200);
-    // Evidence for `issues` only: still the writer.
+    // No evidence, evidence for another family, evidence for this one, a
+    // whole-resource read: always the reader's 404, never a writer call.
+    assert_eq!(status(item, missing), 404);
     assert_eq!(status(item, "repos/acme/w6-item/issues/1"), 200);
-    assert_eq!(status(item, missing), 200);
-    // Evidence for `pulls`: the 404 is the item's answer, no writer retry.
+    assert_eq!(status(item, missing), 404);
     assert_eq!(status(item, "repos/acme/w6-item/pulls/6"), 200);
     assert_eq!(status(item, missing), 404);
-    assert_eq!(
-        crate::forge_call_stats::counters::get(crate::forge_identity::served::ITEM_SCOPED_404),
-        1
-    );
-    // A whole-resource read is never item-scoped: Coverage, writer retry.
-    let plain =
-        ConditionalRead::new("test_item_scoped", crate::forge_call_stats::ops::PR_VIEW_STATE);
-    assert_eq!(status(plain, missing), 200);
+    assert_eq!(status(plain, missing), 404);
 
     let calls: Vec<String> = std::fs::read_to_string(&log)
         .unwrap()
         .lines()
         .map(str::to_string)
         .collect();
-    let m = missing;
-    assert_eq!(
-        calls,
-        vec![
-            format!("reader-w6 {m}"),
-            format!("writer {m}"),
-            "reader-w6 repos/acme/w6-item/issues/1".to_string(),
-            format!("reader-w6 {m}"),
-            format!("writer {m}"),
-            "reader-w6 repos/acme/w6-item/pulls/6".to_string(),
-            format!("reader-w6 {m}"),
-            format!("reader-w6 {m}"),
-            format!("writer {m}"),
-        ]
+    assert!(
+        calls.iter().all(|c| c.starts_with("reader-w6 ")),
+        "writer stub NOT invoked: {calls:?}"
     );
+    assert_eq!(calls.len(), 6);
 }

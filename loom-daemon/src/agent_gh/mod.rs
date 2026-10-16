@@ -69,6 +69,9 @@ pub const SENTINEL_ENV: &str = "LOOM_GH_FRONT_ACTIVE";
 /// Nested fronts beyond this are a resolution loop, not a real call.
 const MAX_DEPTH: u32 = 8;
 
+/// `EX_TEMPFAIL`: a shed read, retry later (#12394).
+const EX_TEMPFAIL: i32 = 75;
+
 /// `forge_call_stats` caller for the front's conditional reads.
 pub const STATS_CALLER: &str = "agent_gh_front";
 
@@ -243,7 +246,18 @@ pub fn run(raw: &[OsString]) -> i32 {
                 ledger::book(raw, cwd.as_deref(), Some(dir), route.read);
                 return code;
             }
-            // It did not answer: the next in line, finally direct (below).
+            // It did not answer: the next in line, finally shed or direct.
+        }
+        if route.read && route.pooled {
+            // #12394: a read no gateway or reader answered is shed, never
+            // exec'd on the session's credential (the writer).
+            ledger::book_shed(raw, cwd.as_deref());
+            eprintln!(
+                "gh (loom front): read shed — no reader can serve it right now; the writer is \
+                 never used for reads. Retry later {}",
+                crate::gh_invocation::SHED_MARKER
+            );
+            return EX_TEMPFAIL;
         }
         ledger::book(raw, cwd.as_deref(), None, route.read);
         // #11858: a role tick's passed-through `--json` listing runs

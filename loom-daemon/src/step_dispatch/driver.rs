@@ -293,36 +293,26 @@ struct GatherJob {
     fixes_only: bool,
     repo: String,
     weight: u32,
-    /// Starved for several ticks: this tick may use the writer (#12074).
+    /// Starved for several ticks: the starvation count restarts after this
+    /// tick (it no longer buys the writer: reads never use it, #12394).
     escalated: bool,
 }
 
 /// The forge half of one repo's gather, on whichever worker took it: the
-/// repo's own read guards (the guaranteed floor, the starvation
-/// escalation), then [`super::gather::list`].
+/// repo's own read guard (the guaranteed floor), then [`super::gather::list`].
 fn list_one(
     input: &TickInputs<'_>,
     registry: &Arc<Mutex<SweepRegistry>>,
     idx: usize,
     guaranteed: bool,
-    escalated: bool,
     snapshot: &crate::discovery::TickSnapshot,
     held_capabilities: &BTreeSet<String>,
 ) -> anyhow::Result<Option<super::gather::Listed>> {
     let root = &input.roots[idx];
     // The repo a tick always gathers gets a real read budget, even past the
-    // deadline; a repo starved for several ticks gets one tick on the
-    // writer (#12074).
+    // deadline (#12074).
     let _floor = guaranteed
         .then(|| crate::gh_invocation::read_deadline::at_least(Instant::now() + GUARANTEED_FLOOR));
-    let _writer = escalated.then(|| {
-        log::info!(
-            "work_finder: {}: reads shed for several ticks; this tick may use the writer \
-             (#12074)",
-            root.display()
-        );
-        crate::gh_invocation::read_deadline::allow_writer()
-    });
     let lane = input.lanes.get(idx).copied().unwrap_or_default();
     let red = |fixes: Vec<crate::work_finder::WorkItem>| {
         let mut fixes = fixes;
@@ -419,7 +409,7 @@ impl StepDriver {
         let parent = crate::gh_invocation::telemetry::thread_parent();
         let runtime = tokio::runtime::Handle::try_current().ok();
         let concurrency = input.gather_concurrency.max(1);
-        let job_meta: Vec<(usize, bool)> = jobs.iter().map(|j| (j.idx, j.escalated)).collect();
+        let job_meta: Vec<usize> = jobs.iter().map(|j| j.idx).collect();
         let listed = super::gather_budget::run_ordered(
             job_meta,
             concurrency,
@@ -430,7 +420,7 @@ impl StepDriver {
                     runtime.as_ref().map(tokio::runtime::Handle::enter),
                 )
             },
-            |_, (idx, escalated)| {
+            |_, idx| {
                 let guaranteed = {
                     let mut walk = lock(&walk);
                     if !walk.admit(idx, deadline_passed(input.deadline, Instant::now())) {
@@ -443,7 +433,6 @@ impl StepDriver {
                     &registries[idx],
                     idx,
                     guaranteed,
-                    escalated,
                     &snapshot,
                     &held_capabilities,
                 ))

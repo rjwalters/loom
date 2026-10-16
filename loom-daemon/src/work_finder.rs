@@ -2995,7 +2995,7 @@ pub fn spawn_multi_work_finder_task(
             // read in between is bounded by the tick deadline and fails fast
             // past it; a listing does not fall through to the writer.
             let tick_deadline = std::time::Instant::now() + tick_budget;
-            let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline, true);
+            let read_scope = crate::gh_invocation::read_deadline::enter(tick_deadline);
 
             // `roots` was already resolved (registry reload + missing-root
             // filtering) by `refresh_local_workspace_state` above, before the

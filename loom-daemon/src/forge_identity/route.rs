@@ -67,40 +67,19 @@ pub const MAX_LATCH: Duration = Duration::from_secs(3660);
 /// A latch with no known home reset releases this long after it engaged.
 pub const DEFAULT_LATCH: Duration = Duration::from_secs(3600);
 
-/// How a read may be treated when its readers run dry. W4-B records it on
-/// the request only; W4-C acts on it (shedding is opt-in per site, and
-/// [`ReadClass::Gate`] — the default — keeps today's writer fallback).
+/// What a read decides. Since #12394 the class no longer changes where a read
+/// goes when its readers run dry — every class is shed, never sent to the
+/// writer ("the writer is never used for reads"); it records how much the
+/// caller leans on the answer (telemetry, and the router's headroom reserve).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadClass {
-    /// Gates a decision (dispatch, claim, merge, reap): never shed.
+    /// Gates a decision (dispatch, claim, merge, reap).
     #[default]
     Gate,
     /// Housekeeping that may be deferred.
     Hygiene,
     /// Telemetry that may be deferred.
     Observability,
-}
-
-impl ReadClass {
-    /// Whether a read of this class, with no reader left for `cause`, is
-    /// shed instead of sent to the writer (2026-10-15):
-    ///
-    /// - `Gate`: never shed;
-    /// - `Hygiene`: shed while the readers are out for a time-bounded
-    ///   reason ([`ExhaustCause::Budget`] or [`ExhaustCause::Withdrawn`]);
-    ///   the writer only for a cause that may never clear on its own
-    ///   ([`ExhaustCause::Unavailable`]: a stale or unpublished token
-    ///   directory, or no reader covering the repo);
-    /// - `Observability`: always shed — telemetry may go dark for a pass,
-    ///   the writer's budget is the fleet's dispatch budget.
-    #[must_use]
-    pub fn sheds(self, cause: ExhaustCause) -> bool {
-        match self {
-            Self::Gate => false,
-            Self::Hygiene => matches!(cause, ExhaustCause::Budget | ExhaustCause::Withdrawn),
-            Self::Observability => true,
-        }
-    }
 }
 
 /// Why a reader was chosen.

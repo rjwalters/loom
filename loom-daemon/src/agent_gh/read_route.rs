@@ -32,9 +32,10 @@ use std::path::PathBuf;
 use super::classify::is_slug;
 
 /// How the front may run one passthrough: the gateway profile, then a reader
-/// App (#12245), then the session's credential (the writer). A read with
-/// neither is booked on the writer as `direct_read`, so every read that
-/// reaches the writer is counted.
+/// App (#12245). A read with a pool but no reader that answers is shed
+/// (#12394: the writer is never used for reads); only where no pool exists
+/// is it exec'd on the session's credential, booked on the writer as
+/// `direct_read` so it is counted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrontRoute {
     /// The owner's gateway profile, tried first.
@@ -43,6 +44,13 @@ pub struct FrontRoute {
     pub reader: Option<PathBuf>,
     /// The call was classified as a read.
     pub read: bool,
+    /// The read's repo is certain, so a gateway or reader could serve it
+    /// (#12394). Such a read no gateway or reader answered is shed — never
+    /// exec'd on the session's credential, the writer. Unset where no reader
+    /// can be named (no pool on the host, a TTY, another forge, an unknown
+    /// repo): those stay on the session's credential and are booked as
+    /// `direct_read`.
+    pub pooled: bool,
 }
 
 /// The flags one read shape accepts: those taking a value, and the boolean
@@ -402,6 +410,8 @@ pub fn plan(
         gateway: gateway(&owner),
         reader: reader(&repo),
         read: true,
+        // The repo is certain, so a reader could have served it.
+        pooled: true,
     }
 }
 
