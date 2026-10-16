@@ -872,39 +872,68 @@ pub fn list_building_issues(repo_root: &Path) -> Result<Vec<BuildingIssueRow>> {
     serde_json::from_slice(&out.stdout).context("parse gh issue list JSON")
 }
 
-/// Seconds since the most recent `labeled` timeline event for `loom:building`
-/// on `issue`, or `None` if it cannot be determined (API failure, no such
-/// event, unparseable timestamp). Mirrors `orphan_recovery.py::_get_building_label_age`.
+/// What the forge says about when `loom:building` was last applied
+/// ([`building_label_age`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelAge {
+    /// Seconds since the most recent `labeled loom:building` event.
+    Known(i64),
+    /// The events were read and none applies `loom:building`.
+    NoEvent,
+    /// The events could not be read: the read was shed (no gateway or reader
+    /// could serve it, #12389), timed out, failed, or its answer could not be
+    /// parsed. Not an answer: a caller must not act on it.
+    Unknown,
+}
+
+/// When `loom:building` was last applied to `issue`
+/// (`orphan_recovery.py::_get_building_label_age`).
+///
+/// Every page of the issue's events is read (`per_page=100`, `--paginate`):
+/// the events list is oldest-first, so on an issue with a long history the
+/// newest claim is on the last page, and reading only the first would
+/// report an older claim's age, or none, for a claim made a minute ago.
 #[must_use]
-pub fn building_label_age_seconds(repo_root: &Path, issue: u32) -> Option<i64> {
+pub fn building_label_age(repo_root: &Path, issue: u32) -> LabelAge {
     let CmdOutcome::Ran(out) = run_read(
         "worktree.building_label_age",
         repo_root,
         [
             "api",
-            &format!("repos/{{owner}}/{{repo}}/issues/{issue}/events"),
+            &format!("repos/{{owner}}/{{repo}}/issues/{issue}/events?per_page=100"),
+            "--paginate",
             "--jq",
             r#"[.[] | select(.event == "labeled" and .label.name == "loom:building")] | last | .created_at"#,
         ],
     ) else {
-        return None;
+        return LabelAge::Unknown;
     };
     if !out.status.success() {
-        return None;
+        return LabelAge::Unknown;
     }
-    let ts = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .trim_matches('"')
-        .to_string();
-    if ts.is_empty() || ts == "null" {
-        return None;
+    label_age_from(&String::from_utf8_lossy(&out.stdout), chrono::Utc::now())
+}
+
+/// [`building_label_age`]'s reading of the `--jq` output: one line per page,
+/// each the page's newest claim timestamp or `null`. The newest wins.
+#[must_use]
+pub fn label_age_from(stdout: &str, now: chrono::DateTime<chrono::Utc>) -> LabelAge {
+    let mut newest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for line in stdout.lines() {
+        let ts = line.trim().trim_matches('"');
+        if ts.is_empty() || ts == "null" {
+            continue;
+        }
+        let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            return LabelAge::Unknown;
+        };
+        let dt = dt.with_timezone(&chrono::Utc);
+        newest = Some(newest.map_or(dt, |n| n.max(dt)));
     }
-    let dt = chrono::DateTime::parse_from_rfc3339(&ts).ok()?;
-    Some(
-        chrono::Utc::now()
-            .signed_duration_since(dt.with_timezone(&chrono::Utc))
-            .num_seconds(),
-    )
+    match newest {
+        Some(dt) => LabelAge::Known(now.signed_duration_since(dt).num_seconds()),
+        None => LabelAge::NoEvent,
+    }
 }
 
 /// Whether a `## Orphan Recovery` comment was posted on `issue` within the
@@ -976,6 +1005,20 @@ pub(crate) fn freshest_lease_updated_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #12389: the newest claim across every page wins; no claim event is
+    /// `NoEvent`; an unparseable answer is `Unknown`, never an age.
+    #[test]
+    fn label_age_reads_every_page_and_never_invents_an_answer() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:10:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let pages = "\"2025-01-01T00:00:00Z\"\nnull\n\"2026-01-01T00:09:00Z\"\n";
+        assert_eq!(label_age_from(pages, now), LabelAge::Known(60));
+        assert_eq!(label_age_from("null\nnull\n", now), LabelAge::NoEvent);
+        assert_eq!(label_age_from("", now), LabelAge::NoEvent);
+        assert_eq!(label_age_from("not-a-time\n", now), LabelAge::Unknown);
+    }
 
     fn closes_graph(nodes: &str) -> String {
         format!(

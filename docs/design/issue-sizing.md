@@ -199,7 +199,6 @@ A test file takes its subject's status.
 | `loom-daemon/src/forge_pr_congestion.rs` | `points_from_labels`, a **separate** parser that accepts `points:4` | live |
 | `loom-daemon/src/work_finder/ready_queue_tests.rs` | Ready-queue `story_points` for the disposition exporter | live |
 | `loom-daemon/src/sweep_registry/guards/issue_snapshot_tests.rs` | `points:3` label fixture | live |
-| `loom-daemon/src/observability/captain_gauges/facts_tests.rs` | `points:3` label fixture | live |
 | `loom-daemon/src/label_registry/tests.rs` | `points:1` used as a `replaced_by` fixture | live |
 | `.github/labels.yml` | 6 `points:*` labels marked "(paused)" | live |
 | `defaults/.github/labels.yml` | Same (consumer copy) | live |

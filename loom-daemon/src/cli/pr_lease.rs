@@ -562,7 +562,9 @@ impl Gh {
             .forge_op(fop)
             .program(&self.bin)
             .current_dir(&self.root)
-            // W4-C: these reads verify this claimant's own writes.
+            // W4-C: these reads verify this claimant's own writes. They stay
+            // on the writer (#12389): each one decides whether the lease this
+            // process just posted or renewed holds, so it must see that write.
             .writer_identity()
     }
 

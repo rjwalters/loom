@@ -924,9 +924,27 @@ fn fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work() {
     let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
     let (empty, full) = (workspace(cfg), workspace(cfg));
     let empty_path = empty.path().to_path_buf();
+    // Hold the empty root's probe (which runs inside its blocking task) until
+    // the first-tick assertions are done. An instant probe could finish and
+    // free the budget slot before the walk decides the full root, admitting
+    // it too. Opened on drop so an assertion failure cannot hang the test.
+    struct OpenOnDrop(Gate);
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+    let gate = Gate::default();
+    let _open = OpenOnDrop(gate.clone());
     let probe: QueueProbe = {
         let empty_path = empty_path.clone();
-        Arc::new(move |root, _| Ok(root != empty_path.as_path()))
+        let gate = gate.clone();
+        Arc::new(move |root, _| {
+            if root == empty_path.as_path() {
+                gate.wait();
+            }
+            Ok(root != empty_path.as_path())
+        })
     };
     let invoked = Arc::new(AtomicUsize::new(0));
     let factory: RunnerFactory = {
@@ -948,6 +966,7 @@ fn fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work() {
     assert_eq!(tick.spawned, vec![empty_path.clone()], "the empty root holds the cursor");
     assert_eq!(tick.deferred, 1, "the root with work is deferred by the budget");
     assert!(!d.resume_due(), "nothing has finished yet");
+    gate.open();
 
     let joined = join_one(&rt, &mut d);
     assert_eq!(joined.as_ref().unwrap().1.outcome, RoleTickOutcome::QueueEmpty);

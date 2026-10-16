@@ -160,8 +160,6 @@ pub struct TelemetryKindMeta {
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
-pub mod backlog_level;
-
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
 /// `write_scope.refused` (#12168) — a daemon write the #9548 gate refused.
@@ -172,6 +170,9 @@ pub mod checkout_external_change;
 
 /// `host.export` (#11124).
 pub mod host_export;
+
+/// `host.status` (#12112) — fixed-interval host CPU/memory/disk/network gauges.
+pub mod host_status;
 
 /// Per-kind silence thresholds for `otlp_export` health (#12120).
 pub mod kind_silence;
@@ -477,12 +478,6 @@ macro_rules! telemetry_kind_table {
             WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
-            /// The backlog level the daemon handed one Curator dispatch
-            /// (#11819): open count, target, level. OTLP-only. See
-            /// [`backlog_level`].
-            BacklogLevel = "backlog.level" => $crate::telemetry::kinds::backlog_level::BacklogLevelRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
-
             /// One daemon-pass write the #9548 credential-scope gate refused
             /// (Issue #12168): repo, credential identity, call site and a
             /// closed reason class. OTLP-only. See [`write_scope_refused`].
@@ -500,6 +495,12 @@ macro_rules! telemetry_kind_table {
             /// See [`scope_memory`].
             ScopeMemory = "scope.memory" => $crate::telemetry::kinds::scope_memory::ScopeMemoryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A fixed-interval sample of this host's CPU, memory, disk and
+            /// network, raw and EWMA-filtered (#12112, slice a of #11809). OTLP
+            /// gauges only. See [`host_status`].
+            HostStatus = "host.status" => $crate::telemetry::kinds::host_status::HostStatusRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Gauges, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

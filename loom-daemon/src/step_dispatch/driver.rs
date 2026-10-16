@@ -54,9 +54,9 @@ pub struct TickInputs<'a> {
     /// How many spawns, each in a different repo, the draw runs at once
     /// (#12298, `autonomous.workFinder.spawnConcurrency`); `1` is serial.
     pub spawn_concurrency: usize,
-    /// Which discovery backend builds the tick's snapshot (#12306,
-    /// `autonomous.workFinder.discovery`).
-    pub discovery: crate::discovery::BackendKind,
+    /// The discovery tier chain that builds the tick's snapshot (#12311,
+    /// `forge.mirror.discovery`).
+    pub discovery: crate::discovery::Chain,
 }
 
 /// What a workspace's listing said beyond its items.

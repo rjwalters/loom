@@ -1722,6 +1722,48 @@ pub struct HostHealthRecord {
     /// backward-compatibility contract `protection` established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryPressureSummary>,
+    /// Live `loom-agent-*` cgroup scopes on this host (Issue #12166), read
+    /// from the cgroup tree rather than the sweep registry, so residue that
+    /// outlived its registry entry stays visible. Capped at
+    /// [`crate::agent_scopes::MAX_AGENT_SCOPES`]; the true count is
+    /// `agent_scopes_total`. Empty means "unmeasured or none" (non-Linux, no
+    /// systemd agents slice), never "proved idle".
+    ///
+    /// `#[serde(default)]` so a pre-#12166 record still decodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_scopes: Vec<AgentScopeSummary>,
+    /// Total live agent scopes (uncapped). `None` when the agents slice could
+    /// not be read at all, distinct from `Some(0)` (read, none live).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_scopes_total: Option<u32>,
+}
+
+/// One live `loom-agent-*` scope as seen in the cgroup tree (Issue #12166).
+/// Each measurement is optional: unmeasurable is absent, never zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentScopeSummary {
+    /// Scope unit name (carries the sweep id).
+    pub scope: String,
+    /// Seconds since the scope's cgroup was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_sec: Option<u64>,
+    /// Whether an agent runtime/launcher process is among the scope's procs.
+    pub agent_alive: bool,
+    /// Pid of the longest-running process left in the scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pid: Option<u32>,
+    /// `comm` of that process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_comm: Option<String>,
+    /// Age in seconds of that process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_age_sec: Option<u64>,
+    /// Cumulative CPU time of the scope (`cpu.stat` `usage_usec`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_usec: Option<u64>,
+    /// Seconds since the newest transcript write for the scope's cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_age_sec: Option<u64>,
 }
 
 /// Memory/pressure readings at one host.health sampling moment: physical
