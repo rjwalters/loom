@@ -39,7 +39,8 @@
 //!   never to `loom:pr` — the rebase invalidated the approval.
 //! - **Label only.** A `CONFLICTING` `loom:pr` PR carrying `loom:operator` (or
 //!   its retired names) or `loom:sequenced` gets `loom:merge-conflict` and
-//!   nothing else: no comment, no state swap.
+//!   nothing else: no comment, no state swap. When such a PR turns
+//!   `MERGEABLE`, that label alone is removed again.
 //!
 //! # What it never does
 //!
@@ -170,6 +171,9 @@ pub enum ConflictAction {
     /// A conflicting `loom:pr` PR that is operator-held or sequenced: add
     /// `loom:merge-conflict` only (#12041) — no comment, no state change.
     LabelOnly,
+    /// A mergeable held/sequenced `loom:pr` PR still carrying the label-only
+    /// `loom:merge-conflict`: remove that label and change nothing else.
+    LabelClear,
     /// Mergeable again and carrying `loom:merge-conflict`: return it to review
     /// **if** [`flag_is_latest`] confirms this pass flagged it.
     ClearIfOurs,
@@ -218,7 +222,18 @@ pub fn decide_review_conflict(pr: &ConflictPr) -> ConflictAction {
             },
             _ => ConflictAction::Keep(ConflictKeepReason::NoHeadSha),
         },
-        // A held PR is never cleared (only the label-only path reads one).
+        // The label-only path writes no flag comment, so `ClearIfOurs` could
+        // never recognise its label: drop it directly. `loom:pr` +
+        // `loom:merge-conflict` only arises from that path (the Flag path
+        // removes `loom:pr`).
+        Mergeable::Mergeable
+            if pr.has(APPROVED)
+                && pr.has(MERGE_CONFLICT)
+                && (operator_only || pr.has(super::merge_sequence::SEQUENCE_LABEL)) =>
+        {
+            ConflictAction::LabelClear
+        }
+        // A held PR is never cleared otherwise.
         Mergeable::Mergeable if operator_only => ConflictAction::Keep(ConflictKeepReason::Held),
         Mergeable::Mergeable if pr.has(MERGE_CONFLICT) && !pr.has(REVIEW_REQUESTED) => {
             ConflictAction::ClearIfOurs
@@ -425,6 +440,9 @@ pub struct ReviewConflictStats {
     /// Conflicting operator-held / sequenced `loom:pr` PRs that got
     /// `loom:merge-conflict` only (#12041).
     pub labeled: usize,
+    /// Mergeable held/sequenced `loom:pr` PRs whose label-only
+    /// `loom:merge-conflict` was removed.
+    pub label_cleared: usize,
     pub cleared: usize,
     /// Base conflicts NOT flagged because the PR is sequenced behind an open
     /// predecessor (#9686): the repair would be redundant until it lands.
@@ -570,6 +588,35 @@ pub(super) fn reconcile_review_conflicts_sharing(
                     }
                     Err(e) => log::warn!(
                         "claim_reconciliation: failed to label base conflict on PR #{} in {}: {e}",
+                        pr.number,
+                        root.display()
+                    ),
+                }
+            }
+            ConflictAction::LabelClear => {
+                attempted_write = true;
+                match gh_pr_retrying(
+                    gh_bin,
+                    root,
+                    &[
+                        "edit",
+                        &pr.number.to_string(),
+                        "--remove-label",
+                        MERGE_CONFLICT,
+                    ],
+                ) {
+                    Ok(_) => {
+                        stats.label_cleared += 1;
+                        log::info!(
+                            "claim_reconciliation: PR #{} in {} is MERGEABLE again and \
+                             held/sequenced — removed loom:merge-conflict only",
+                            pr.number,
+                            root.display()
+                        );
+                    }
+                    Err(e) => log::warn!(
+                        "claim_reconciliation: failed to remove base conflict label on PR #{} in \
+                         {}: {e}",
                         pr.number,
                         root.display()
                     ),

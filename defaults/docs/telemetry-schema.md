@@ -1320,6 +1320,7 @@ gradeable by a model or prompt experiment.
 | `tokens_by_model` | array | no | Same grouped, raw (not cost-weighted) shape as `sweep.outcome`'s `tokens_by_model`, summed from the tick's own transcripts. |
 | `models_used` | string array | no | The distinct model ids in `tokens_by_model`, sorted and deduped — "did this tick's session escalate past the model it was launched with?" |
 | `actions` | object | no | Forge-mutating work observed in the transcripts: `issues_labeled`, `prs_merged`, `comments_posted`. |
+| `prompt` | object | no | The checkout the session read its `/loom:<role>` prompt from, as it stood immediately before the spawn (#11989): `commit` (HEAD, full SHA), `loom_version` (the working tree's `.loom/install-metadata.json`), `commits_behind` (HEAD's distance behind the clone's `origin/<default>`) and `on_branch` (`false` for a detached HEAD); each inner key is absent when it cannot be read. Absent on a tick that never resolved a launch. OTLP: `loom.prompt.commit`, `loom.prompt.loom_version`, `loom.prompt.commits_behind`, `loom.prompt.on_branch`, so a role running stale prompts is `loom.prompt.commits_behind > 0`. Additive, no `schema_version` bump. |
 | `source` | string | no | `step` when a step-engine step ran, not a role-runner tick (#11906). Mapped to `loom.role_tick.source`; absent on a role tick. Additive. |
 | `sweep_id` | string | no | The step's sweep id (`step-<role>-<item>-<ts>`), with `source`. Mapped to `loom.sweep_id`. |
 
@@ -2150,6 +2151,7 @@ GitHub rate limit (Issue #10022):
 | `loom.stage_entry.lookups` | delta `Sum` | `{lookup}`; labels `repo`, `kind` | stage-entry times the step engine's provider (`step_dispatch::stage_entry`, #11897) looked up since the previous point, flushed on the same tick, by the source that answered in `kind`: `mirror` (the state mirror's per-item `labels_at`), `events` (the issue's `labeled` events, from the provider's persisted cache or one budgeted read), `created` (the item's creation time) or `none` (not even that). The `mirror` + `events` share is the stage-age coverage the step-dispatch design gates on (#11894). Nothing consumes the provider yet, so the series is empty until the item draw lands. Past 1024 series a new one is counted under `repo` = `overflow`. Accumulated only while an ops sink is registered |
 | `loom.feed.completions` | delta `Sum` | `{completion}`; labels `kind`, `outcome` | public-feed `completion` envelopes the safehouse narration sink built since the previous point (#12152), flushed on the same tick, by the trigger that found the merge in `kind`: `sweep_exit` (an issue sweep's `SweepExited`), `step` (a Champion merge step's `step.item.{N}.ended`) or `reconcile` (the periodic merge-reconciliation pass); `outcome` is `narrated`, or `seeded` for a fresh host's first pass, which records merges without posting them (#4649). The direct measure of merged work reaching the feed: a step emits no `sweep.completed`, so since step dispatch (#12009) that record no longer tracks it. Accumulated only while an ops sink is registered |
 | `loom.feed.reconcile_passes` | delta `Sum` | `{pass}`; label `outcome` | merge-reconciliation ticks of the narration sink that had a workspace to visit (#12152), by `outcome`: `ran` (the forge answered; the workspace's watermark advanced), `deferred` (the rate-limit breaker was cooling; the tick is not spent and the workspace catches up from its watermark later) or `failed` (the forge read failed; the watermark holds). Accumulated only while an ops sink is registered |
+| `loom.ci.queue_depth` | `Gauge` | `{run}`; label `repo` | workflow runs with `status == "queued"` in the page the CI telemetry poll fetched for the repo (#11993), one point per repo per cycle (`0` when none), counted from the run listing `poll_repo` already reads, so it adds no GitHub request. A run older than the rescan floor that is still queued is not counted. Fleet CI contention at that instant, beside the per-run `loom.ci.queued_ms` on `ci.run` / `ci.job` |
 
 `resource` ∈ `core`, `graphql` (`search` too on a bucket point). On an
 ambient-login host's points `account` is the validated `gh` login, else
@@ -2765,7 +2767,7 @@ Un-evaluated issues get no record by design (about 650 rows per tick).
 **Volume.** The step path emits one record per step end, no-ops included. The
 role-tick path emits one per marker or merge act. There is no heartbeat.
 
-**Gauge (D2).** `loom.forge.stage_items{state="pr_refused", reason}` counts open
+**Gauge (D2).** **Off by default** (#12203): the `pr_refused` points are emitted by the stage-dwell sampler, so they are absent unless `observability.stageDwell.enabled` is `true`. `loom.forge.stage_items{state="pr_refused", reason}` counts open
 `loom:pr` PRs on a still-current head that Champion is refusing, and
 `loom.forge.stage_oldest_age_seconds{state="pr_refused", reason, repo}` is
 `now - min(first_refused_at)`. The refusal store is per host (a host-local JSON

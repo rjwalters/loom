@@ -1147,7 +1147,7 @@ async fn forge_gather_loop<S, G>(
 /// The collector's fleet-wide forge gathers, on their own task and timer so
 /// the first one can wait out the startup jitter (#12073), and so a slow one
 /// never delays the host samples above, which run from boot.
-async fn forge_gathers(
+pub(in crate::observability) async fn forge_gathers(
     workspace_root: &Path,
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,

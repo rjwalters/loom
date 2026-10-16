@@ -102,7 +102,7 @@ pub const CAPTURED_USAGE_LIMIT_REFUSAL: &str = "ERROR: You've hit your usage lim
      25, 2026 3:00 PM.";
 
 /// The refusal family this module reads a horizon out of — the same wording
-/// `classify-error.sh`'s `_classify_error_codex` maps to `TOKEN_EXHAUSTED`,
+/// `loom-daemon classify-error`'s codex table maps to `TOKEN_EXHAUSTED`,
 /// restricted to the *usage-limit* rows (the credit-limit and API-error rows
 /// carry no "try again at"). Matched case-insensitively.
 const USAGE_LIMIT_NEEDLES: &[&str] = &[

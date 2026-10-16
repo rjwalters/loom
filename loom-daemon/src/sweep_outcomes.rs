@@ -1185,6 +1185,7 @@ mod tests {
                 preference_tier: None,
                 preference_tap: None,
                 role_draw: None,
+                prompt: None,
                 runtime: None,
                 provider: None,
                 profile: None,

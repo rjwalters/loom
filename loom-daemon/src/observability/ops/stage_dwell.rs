@@ -50,8 +50,7 @@
 //! the whole sampler sits behind [`ENABLED_KEY`]
 //! (`observability.stageDwell.enabled`, default `false`): off, a pass makes no
 //! listing, no per-item read and no `merged_at` read, emits no
-//! `loom.forge.stage_dwell` / `loom.forge.stage_items` point, and the captain
-//! does not arm the `stage-dwell` job. [`INTERVAL_KEY`]
+//! `loom.forge.stage_dwell` / `loom.forge.stage_items` point. [`INTERVAL_KEY`]
 //! (`observability.stageDwell.intervalSecs`) spaces passes further apart than
 //! the collector's forge-gather period. Both are re-read every pass (live).
 
@@ -625,7 +624,7 @@ pub fn stage_points(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Metric
 /// [`stage_points`] split into records of at most
 /// [`crate::telemetry::ops::MAX_POINTS_PER_RECORD`] points. One record would
 /// be truncated by `bounded_points` past that bound, and with per-repo states
-/// a host sampling a few dozen repos (the fleet captain) crosses it. The
+/// a host sampling a few dozen repos crosses it. The
 /// dwell delta pairs come first, so they always ride in the first batch.
 #[must_use]
 pub fn stage_batches(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Vec<MetricPoint>> {
