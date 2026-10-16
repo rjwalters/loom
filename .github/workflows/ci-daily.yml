@@ -425,9 +425,8 @@ jobs:
           # restated here, so this table cannot drift away from the real pin.
           # A pin that stops being findable reads as "?" and warns, rather than
           # silently comparing an empty string and looking current.
-          lychee="$(grep -oE 'VER=v[0-9.]+' .github/workflows/ci.yml | head -n1 | sed 's/^VER=//')"
-          shellcheck_pin="$(grep -oE 'SHELLCHECK_VERSION="?v[0-9.]+' .github/workflows/shell-lint.yml | grep -oE 'v[0-9.]+' | head -n1)"
-          node_pin="$(grep -oE 'node-version: "[0-9]+"' .github/workflows/ci.yml | head -n1 | tr -dc '0-9')"
+          shellcheck_pin="$(grep -oE 'SHELLCHECK_VERSION="?v[0-9.]+' .github/workflows/shell-lint.yml | grep -oE 'v[0-9.]+' | head -n1 || true)"
+          node_pin="$(grep -oE 'node-version: "[0-9]+"' .github/workflows/ci.yml | head -n1 | tr -dc '0-9' || true)"
 
           warned=0
           row() {
@@ -443,8 +442,6 @@ jobs:
             fi
           }
 
-          row "lychee (ci.yml)" "$lychee" \
-            "$(gh api repos/lycheeverse/lychee/releases/latest --jq '.tag_name' 2>/dev/null | sed 's/^lychee-//' || true)"
           row "shellcheck (shell-lint.yml)" "$shellcheck_pin" \
             "$(gh api repos/koalaman/shellcheck/releases/latest --jq '.tag_name' 2>/dev/null || true)"
           # Node against the current LTS major, not `releases/latest` -- that
