@@ -216,10 +216,10 @@ fn sweep_identity_precedence() {
 #[test]
 fn the_lease_body_starts_with_its_marker_and_a_renewal_changes_it() {
     let me = who(Role::Doctor, "s");
-    let first = lease_body(&me, 7, None, "<!-- loom:provenance v1 x -->");
+    let first = lease_body(&me, 7, None);
     assert_eq!(first.lines().next(), Some(me.lease_marker().as_str()));
-    assert!(first.ends_with("<!-- loom:provenance v1 x -->"));
-    let renewed = lease_body(&me, 7, Some(now()), "");
+    assert!(!first.contains("loom:provenance"));
+    let renewed = lease_body(&me, 7, Some(now()));
     assert_ne!(first, renewed);
     assert_eq!(parse_record(&renewed), Some(Record::Lease(me)));
 }

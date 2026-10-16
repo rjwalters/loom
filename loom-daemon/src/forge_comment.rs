@@ -22,7 +22,7 @@
 //! Before this module ~a dozen modules composed a body and POSTed it to
 //! `repos/{n}/issues/{n}/comments` ad hoc. Appending per site would be a
 //! dozen chances to forget; the same reasoning that puts `loom:verdict-sha`
-//! in `post-verdict.sh` and `loom:provenance` in `create-pr.sh` puts the
+//! in `post-verdict.sh` puts the
 //! footer here: a caller cannot post through this module *without* the
 //! footer, so omission is structurally impossible instead of a matter of
 //! remembering. The footer is idempotent on [`FOOTER_MARKER`], so a body

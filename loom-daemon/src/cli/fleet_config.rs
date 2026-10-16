@@ -701,11 +701,10 @@ fn submit_or_print(
     };
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let branch = propose::branch_name(kind, &stamp);
-    let marker = propose::provenance_marker(&ctx.workspace, &loaded.snapshot.manifest.commit);
     let body = format!(
         "Opened by `loom-daemon fleet-config propose {kind}` (see `daemon-reference.md` § \
          \"Fleet store\" for the store's file contract). Merges stay the operator's — this \
-         command only ever proposes.\n\n{renders}\n\n{marker}\n"
+         command only ever proposes.\n\n{renders}\n"
     );
     let proposal = propose::Proposal {
         branch,

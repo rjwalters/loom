@@ -252,9 +252,6 @@ impl SweepRegistry {
             story,
             sweep_id,
         );
-        // #9027: stamp the sweep's commits with the D33 provenance trailers
-        // (a git-env hooksPath override that chains to the repo's own hooks).
-        crate::provenance::hooks::prepare_child(&mut cmd, &self.config.workspace_root, story);
         // #8908: let the transcript-ingest pass join this issue's
         // `session.summary` logs to the execution's trace.
         if let Some(story) = story {
