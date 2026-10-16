@@ -1022,7 +1022,7 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
             }
             if let Some((k, _)) = gh_operand(rest, &["pr"]) {
                 if gh_operand(&rest[k + 1..], &["merge"]).is_some() {
-                    hits.push(Hit::new(GH_PR_MERGE, "gh pr merge"));
+                    hits.push(Hit::new(GH_PR_MERGE, GH_PR_MERGE));
                 }
             }
         }

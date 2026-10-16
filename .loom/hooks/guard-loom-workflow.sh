@@ -1716,12 +1716,12 @@ GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_command_positional_args "$
 # The merge check itself (#12236, slice 1 of #11113) asks the shared command
 # lexer what $COMMAND would EXECUTE: a heredoc body or quoted argument is data,
 # a live/chained/`bash -c`/`eval`/`$( )` merge is not. Exit 0 = live merge, 1 =
-# not; any other answer (no binary, a daemon predating the verb) fails CLOSED to
-# a plain scan of the raw command.
-# requires-daemon: command-analysis optional   #12236 — `gh-pr-merge`; with no usable answer the raw command is scanned unmasked.
+# not; any other answer (no binary, a daemon predating the verb) falls back to
+# the shell-masked copy above, this check's behaviour before the lexer.
+# requires-daemon: command-analysis optional   #12236 — `gh-pr-merge`; with no usable answer the shell-masked copy is scanned.
 GPM_RC=0
 "${LOOM_DAEMON_SELF_BIN:-loom-daemon}" command-analysis gh-pr-merge --command "$COMMAND" >/dev/null 2>&1 || GPM_RC=$?
-if [[ "$GPM_RC" -eq 0 ]] || { [[ "$GPM_RC" -ne 1 ]] && echo "$COMMAND" | grep -qE 'gh\s+pr\s+merge'; }; then
+if [[ "$GPM_RC" -eq 0 ]] || { [[ "$GPM_RC" -ne 1 ]] && echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; }; then
     # Resolve the merge-pr.sh path for the current repo context. Prefer an
     # in-repo installed copy (./.loom/scripts/merge-pr.sh); fall back to the
     # loom-checkout copy under defaults/scripts/ (via $LOOM_HOME) when the repo
