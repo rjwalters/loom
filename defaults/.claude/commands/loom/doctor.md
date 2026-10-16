@@ -822,7 +822,10 @@ comment id, and renews yours while your session lives
 - **claim** exit **0** = held: add `loom:treating` (**2** = an older
   `loom-daemon` without `lease pr`: label alone, as before). **4** = a peer's
   live lease wins (a lost race posts your yield record), **5** = unreadable,
-  any other code (**1** = `loom-daemon` failed to start) = unknown: never
+  **7** = another actor is working the PR (a live lease of another kind on it
+  or its closing issue, or a push by another login inside
+  `LOOM_DOCTOR_PUSH_WINDOW_MINUTES`, default 15; #12105), any other code
+  (**1** = `loom-daemon` failed to start) = unknown: never
   "label-only" — stand down **before** any worktree, snapshot or label action.
   Never touch a worktree a peer's lease holds, or its `loom:treating`.
 - **fence** before every push and the completion write (step 11):

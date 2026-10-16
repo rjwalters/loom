@@ -132,7 +132,10 @@ pub struct StepTick {
 #[must_use]
 pub fn disposition_of(reason: &str) -> Qd {
     match reason {
-        "claimed" | "claim_lost" => Qd::PeerClaim,
+        // #12105: a Doctor standing down on another actor's work
+        // (`peer_active`), or a step held by the Judge no-verdict backstop
+        // (`backstop_hold`), is someone else's claim, not a dispatch error.
+        "claimed" | "claim_lost" | "peer_active" | "backstop_hold" => Qd::PeerClaim,
         "pool_exhausted"
         | "no_token_pool"
         | "token_selection_failed"
@@ -141,6 +144,7 @@ pub fn disposition_of(reason: &str) -> Qd {
         | "admission_refused" => Qd::HostConstraint,
         "roll_paused" => Qd::DeferredCapacity,
         "workspace_commands_missing" => Qd::WorkspaceCommandsMissing,
+        crate::sweep_registry::ALREADY_LANDED_REASON => Qd::AlreadyLanded,
         PASS_REPO_CAP => Qd::DeferredRepoCap,
         PASS_MERGE => Qd::PeerClaim,
         _ => Qd::DispatchError,
@@ -196,6 +200,7 @@ fn refusal_skip(reason: &str) -> PickSkipReason {
         Qd::PeerClaim => PickSkipReason::InFlight,
         Qd::HostConstraint => PickSkipReason::Quota,
         Qd::DeferredCapacity | Qd::DeferredRepoCap => PickSkipReason::Cap,
+        Qd::AlreadyLanded => PickSkipReason::AlreadyLanded,
         _ => PickSkipReason::Error,
     }
 }

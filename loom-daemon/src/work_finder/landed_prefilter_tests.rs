@@ -148,6 +148,130 @@ fn the_query_asks_for_closed_prs_and_the_last_reopen() {
     assert!(q.contains("includeClosedPrs: true"), "{q}");
     assert!(q.contains("REOPENED_EVENT") && q.contains("mergedAt"), "{q}");
     assert!(q.contains("repository { nameWithOwner }"), "{q}");
+    // #12251: the merged PRs of each issue's Builder branch, and the default
+    // branch they must target.
+    assert!(
+        q.contains("b7: pullRequests(headRefName: \"feature/issue-7\", states: [MERGED]"),
+        "{q}"
+    );
+    assert!(q.contains("b9: pullRequests(headRefName: \"feature/issue-9\""), "{q}");
+    assert!(q.contains("defaultBranchRef { name }"), "{q}");
+    assert!(
+        q.contains("baseRefName") && q.contains("headRepository { nameWithOwner }"),
+        "{q}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The Builder-branch landing (#12251)
+// ---------------------------------------------------------------------------
+
+fn branch_pr(number: u32, merged_at: &str, base: &str, head_repo: &str) -> Value {
+    json!({
+        "number": number,
+        "mergedAt": merged_at,
+        "baseRefName": base,
+        "headRepository": { "nameWithOwner": head_repo },
+    })
+}
+
+fn branch_prs(prs: &[Value]) -> Value {
+    json!({ "nodes": prs })
+}
+
+/// A PR built on `feature/issue-N`, merged into the default branch with no
+/// closing keyword, lands issue N: it is not in the closes-graph, but it
+/// finished the work. A merge into another branch, a head in another
+/// repository, or a merge older than the last reopen does not count.
+#[test]
+fn a_merged_builder_branch_pr_lands_the_issue() {
+    let open = alias("OPEN", None, &[], None);
+    let prs = branch_prs(&[branch_pr(40, T1, "main", REPO)]);
+    assert_eq!(branch_landing(&open, &prs, "main", REPO), Some(40));
+    let latest = branch_prs(&[
+        branch_pr(40, T1, "main", REPO),
+        branch_pr(41, T2, "main", REPO),
+    ]);
+    assert_eq!(branch_landing(&open, &latest, "main", REPO), Some(41));
+
+    let stacked = branch_prs(&[branch_pr(40, T1, "feature/issue-3", REPO)]);
+    assert_eq!(branch_landing(&open, &stacked, "main", REPO), None, "not the default branch");
+    let fork = branch_prs(&[branch_pr(40, T1, "main", "outsider/fork")]);
+    assert_eq!(branch_landing(&open, &fork, "main", REPO), None, "a fork's branch");
+    let reopened = alias("OPEN", Some(T2), &[], None);
+    assert_eq!(branch_landing(&reopened, &prs, "main", REPO), None, "reopened after");
+    let closed = alias("CLOSED", None, &[], None);
+    assert_eq!(branch_landing(&closed, &prs, "main", REPO), None, "the 2.5 guard's");
+    assert_eq!(branch_landing(&open, &prs, "", REPO), None, "no default branch read");
+}
+
+/// The answer's verdict: a closing merge names the landing; failing one, a
+/// Builder-branch merge does. The branch read only adds a landing: a missing
+/// branch alias keeps the closes-graph's verdict, verified or not.
+#[test]
+fn parse_landed_counts_a_builder_branch_merge_as_landed() {
+    let body = json!({ "data": { "repository": {
+        "defaultBranchRef": { "name": "main" },
+        "i1": alias("OPEN", None, &[], None),
+        "b1": branch_prs(&[branch_pr(40, T1, "main", REPO)]),
+        "i2": alias("OPEN", None, &[pr(50, "MERGED", Some(T1))], None),
+        "b2": branch_prs(&[branch_pr(51, T2, "main", REPO)]),
+        "i3": alias("OPEN", None, &[], None),
+        "b3": branch_prs(&[]),
+        "i4": alias("OPEN", None, &[], None),
+        "i5": alias("OPEN", None, &[pr(60, "OPEN", None)], Some(30)),
+        "b5": branch_prs(&[branch_pr(61, T1, "main", REPO)]),
+    } } })
+    .to_string();
+    let parsed = parse_landed(&body, &[1, 2, 3, 4, 5], REPO).unwrap();
+    assert_eq!(parsed.get(&1), Some(&Some(40)), "branch-linked, no keyword");
+    assert_eq!(parsed.get(&2), Some(&Some(50)), "the closing merge names it");
+    assert_eq!(parsed.get(&3), Some(&None));
+    assert_eq!(parsed.get(&4), Some(&None), "no branch alias: the closes-graph's verdict");
+    assert_eq!(parsed.get(&5), Some(&Some(61)), "a truncated graph, but a branch merge");
+}
+
+/// #12251: the Builder spawn's check. A branch-linked landing is routed to
+/// Curator and refuses the spawn, so the step draw has no Builder step on the
+/// issue after it (its `loom:issue` is gone); an issue that has not landed,
+/// or one Curator kept, spawns. Every spawn asks afresh.
+#[test]
+fn the_spawn_check_refuses_a_landed_issue_and_routes_it_to_curator() {
+    let mut forge = FakeForge::default()
+        .with_labels(5, &["loom:issue"])
+        .with_labels(6, &["loom:issue"])
+        .with_labels(7, &["loom:issue"]);
+    forge.graph.insert(5, Some(40));
+    forge.graph.insert(6, None);
+    forge.graph.insert(7, Some(70));
+    forge.marked.insert((7, 70));
+    let mut cache = LandedCache::default();
+    let now = Instant::now();
+
+    assert_eq!(spawn_check(&mut forge, &mut cache, 5, now), Some(40));
+    assert_eq!(forge.writes[0], "+5 loom:triage");
+    assert_eq!(forge.writes[1], "-5 loom:issue");
+    assert!(forge.writes[2].contains(&route_marker(40)), "{:?}", forge.writes);
+
+    assert_eq!(spawn_check(&mut forge, &mut cache, 6, now), None, "not landed");
+    assert_eq!(spawn_check(&mut forge, &mut cache, 7, now), None, "Curator kept it");
+    assert_eq!(forge.writes.len(), 3, "{:?}", forge.writes);
+    assert_eq!(spawn_check(&mut forge, &mut cache, 6, now), None);
+    assert_eq!(forge.asked.len(), 4, "every spawn asks, fresh verdict or not");
+}
+
+/// The spawn check fails open: no answer is a spawn, and the backoff after an
+/// unanswered query is honoured without asking.
+#[test]
+fn the_spawn_check_fails_open() {
+    let mut forge = FakeForge::default().with_labels(5, &["loom:issue"]);
+    let mut cache = LandedCache::default();
+    let now = Instant::now();
+    assert_eq!(spawn_check(&mut forge, &mut cache, 5, now), None, "no verdict");
+    cache.failed_at = Some(now);
+    forge.graph.insert(5, Some(40));
+    assert_eq!(spawn_check(&mut forge, &mut cache, 5, now), None, "backing off");
+    assert_eq!(forge.asked.len(), 1);
 }
 
 // ---------------------------------------------------------------------------

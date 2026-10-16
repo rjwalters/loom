@@ -101,7 +101,7 @@ pub fn run_of(
 pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     match spawn_reason {
         "pool_exhausted" | "no_token_pool" | "token_selection_failed" => Some("pool_gate"),
-        "claimed" | "claim_unverified" | "backstop_hold" => Some("claimed"),
+        "claimed" | "claim_unverified" | "backstop_hold" | "peer_active" => Some("claimed"),
         // A failed spawn cools down like a gate, so it is not respawned on
         // every tick. A missing `/loom:<role>` command is refused before the
         // spawn (`workspace_commands_missing`) and says nothing about the
@@ -248,6 +248,8 @@ mod tests {
         assert_eq!(ledger_reason("pool_exhausted"), Some("pool_gate"));
         assert_eq!(ledger_reason("token_selection_failed"), Some("pool_gate"));
         assert_eq!(ledger_reason("backstop_hold"), Some("claimed"));
+        // #12105: another actor working the PR cools the Doctor down.
+        assert_eq!(ledger_reason("peer_active"), Some("claimed"));
         assert_eq!(ledger_reason("claim_unverified"), Some("claimed"));
         assert_eq!(ledger_reason("claim_lost"), Some("claim_lost"));
         assert_eq!(ledger_reason("roll_paused"), None);

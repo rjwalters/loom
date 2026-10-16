@@ -287,10 +287,8 @@ correct. The contract now is:
 
 1. **One row in `loom-daemon/src/telemetry/kinds.rs`** — the only shared line.
    That row generates the enum variant, the wire tag, the gate version, the OTLP
-   routing class, and the native-ingest scope. The file is marked `merge=union`
-   in `.gitattributes`, so two branches that each append a row merge cleanly
-   instead of conflicting (asserted against real `git` by
-   `telemetry::tests::kind_registry::two_branches_each_adding_a_record_kind_merge_cleanly`).
+   routing class, and the native-ingest scope. Concurrent appends conflict like
+   any shared file; resolve by keeping both rows.
 2. **`gate: NEW_KIND_SCHEMA_VERSION`** — never a fresh integer. See the Version
    history note above.
 3. **Payload struct in its own module** — a new family belongs at
@@ -304,18 +302,6 @@ correct. The contract now is:
    reference may instead ship its own `defaults/docs/telemetry-kind-<kind>.md`
    file (symlinked into `.loom/docs/` like every other shipped doc) and link it
    from its section here, which costs zero shared lines.
-
-**What `merge=union` does and does not buy you.** The attribute is read by the
-`git` that performs the merge, so it applies to every merge, rebase or
-`git pull` you run locally and to the merge commit `merge-pr.sh` produces — the
-row append resolves itself, with no hand-editing. It is **not** a guarantee that
-the forge's *mergeability indicator* will stay green: a forge is free to compute
-that status with a plain three-way merge and show `CONFLICTING`. If it does, the
-fix is a `git merge origin/main` in the worktree, which under this attribute
-produces both rows and needs no conflict resolution — the cost is one push, not
-a rebase cycle spent reconstructing two hand-maintained ladders. Reducing the
-*work* a collision costs is the goal; the `kind_registry` merge test asserts
-exactly that property against real `git`.
 
 ### `sweep.started`
 
@@ -1607,10 +1593,12 @@ operator.
 | `payload` | object | The event's own payload, exactly as published on the bus — see `event_bus.rs`'s topic table for each topic's shape. One documented exception, below. |
 
 Since #12222 the same record also carries `daemon.work_finder.first_tick`, once
-per daemon start: `{ "secs_since_start": 94.2, "startup_reconcile_cap_fired":
-true }` — the time from daemon start to the work finder's first completed
-tick, and whether it stopped waiting for the startup claim-reconciliation pass
-at its cap.
+per daemon start: `{ "secs_since_start": 94.2, "gate_wait_secs": 90.0,
+"jitter_delay_secs": 3, "startup_reconcile_cap_fired": true }` — the time from
+daemon start to the work finder's first completed tick, how much of it the
+startup gate held the tick, the host's startup jitter (#12073; absent when
+never armed), and whether the gate stopped waiting for the startup
+claim-reconciliation pass at its cap (#12230 added the middle two).
 
 **The one payload field that is not carried verbatim**:
 `daemon.preflight.advisory`'s `workspace_root` is reduced to its final path
@@ -1630,6 +1618,21 @@ correlation or repo-slug-resolution state.
 On the OTLP path this maps to a log record (severity `Info`) with
 `loom.topic` and `loom.payload` (the payload carried whole as one
 compact-JSON string, since its shape varies per topic) attributes.
+The first-tick record's four fields are also typed attributes (#12230):
+`loom.payload.secs_since_start`, `loom.payload.gate_wait_secs`,
+`loom.payload.jitter_delay_secs` (numbers) and
+`loom.payload.startup_reconcile_cap_fired` (bool), the same names the D1 sink
+flattens to. With `host.name` on the resource, that makes it queryable per
+host:
+
+```sql
+SELECT resources_string['host.name'] AS host,
+       attributes_number['loom.payload.secs_since_start'] AS secs
+FROM signoz_logs.logs_v2
+WHERE attributes_string['loom.topic'] = 'daemon.work_finder.first_tick'
+```
+
+Other topics' fields stay inside `loom.payload` only.
 
 **`daemon.start` (#11197)** — the one topic in this kind that is not a
 mirrored bus event. Exactly one record per daemon process, enqueued by
@@ -1736,6 +1739,12 @@ listing with no `dispatch()` attempt (and so no admission span). The rest of
 `loom.queue.dispatch_wait` (seconds) and `loom.queue.dispatch_wait.samples`
 (issues) are also delta `Sum`s. Together they give the summed queue dwell of the
 issues dispatched in a tick, so the mean wait is `dispatch_wait / samples`.
+`loom.agent_scope.oom_kills` (`{kill}`, #12241) is also a delta `Sum`: one
+point per finished agent scope that had kernel OOM kills inside it (its cgroup
+`memory.events` `oom_kill`), labelled `repo` (the workspace key, as on
+`loom.agent_scope.peak_memory_bytes`) and `role` (see `scope.memory` below).
+Scopes with no kill emit no point. Unlike the host-wide
+`loom.host.oom_kill_total`, it says which steps are being killed.
 Every other name is a **`Gauge`**:
 
 | Metric | Unit | Cadence |
@@ -3857,6 +3866,65 @@ exported. Both OTLP timestamps are `observed_at`.
 `transform/privacy` `keep_keys`, contract-tested). The Curator's admission
 closes are not recorded here: they are GitHub `closed` events with the comment
 prefix `Closed at admission:`.
+
+### `scope.memory` — one agent scope's memory limit, peak and OOM kills
+
+One OTLP log per agent scope (`loom-agent-*.scope`, a sweep, step or role
+agent) when the daemon sees it end (Issue #12241). The daemon samples every
+live scope's cgroup each work-finder tick (`ram_peaks`); this record carries the
+last sample. Linux with cgroup v2 only. Envelopes carry `schema_version: 12`.
+**OTLP-only** (`native: false`). Severity `WARN` when the scope had OOM kills,
+else `INFO`.
+
+The JSON body contains:
+
+- `scope`: the systemd unit name.
+- `workspace`: the workspace directory name the peak history is keyed by, or
+  `(unattributed)`.
+- `repo` / `repo_visibility`: `owner/repo` and `public` / `private`, when the
+  workspace's slug is already resolved (never fetched for this record).
+- `role`: the role the scope ran. This is the live role run's role, else
+  `sweep` for an issue-lock scope, else `unknown`. It is never parsed from the
+  unit name.
+- `issue`: the claimed issue, for an issue-lock scope.
+- `limit_bytes`: the applied `MemoryMax` (the scope's `memory.max`); absent when
+  the scope had none.
+- `limit_source`: where the limit came from, as `loom-daemon ram-scope-limit`
+  decides it:
+  - `env`: the explicit `LOOM_SWEEP_MEMORY_MAX` MiB value;
+  - `config`: reserved for the `autonomous.agentMemoryMax` config key (#12246),
+    not produced yet;
+  - `floor`: a derived limit equal to the floor
+    (`LOOM_SWEEP_MEMORY_MAX_MIN_MB`, default 4096 MiB);
+  - `history`: derived from the repo's observed peak;
+  - `none`: no limit (disabled, no history, at or above host RAM, or rejected
+    by systemd).
+  The daemon classifies from the applied `memory.max` and its own environment
+  (which `spawn-claude.sh` inherits).
+- `peak_bytes`: the scope's `memory.peak`.
+- `events_max`, `oom_kills`: the scope's `memory.events` `max` (times usage hit
+  the limit) and `oom_kill` (processes the kernel OOM-killed inside it).
+- `clipped`: `true` only when a limit applied and `peak_bytes >= limit_bytes`,
+  or `events_max` or `oom_kills` is non-zero. `memory.peak` cannot exceed
+  `memory.max`, so a clipped peak is the cap, not the scope's real need. With
+  no limit it is always `false`: cgroup v2 `oom_kill` also counts kills by the
+  global OOM killer, and such a scope's peak is genuine. The flag is a signal
+  only. The peak history (`~/.loom/ram-peaks.json`) still records every peak,
+  clipped or not; how it should treat a clipped peak is #11094's to decide.
+- `observed_at`, and standard `loom` build provenance. A record whose
+  provenance does not validate is not exported. Both OTLP timestamps are
+  `observed_at`.
+
+The counters are sampled once per work-finder tick, so an event in the last
+interval before the scope exits is not seen. That mostly under-counts kills at
+the very end of a scope; with `OOMPolicy=continue` a scope usually outlives a
+kill inside it.
+
+**OTLP.** Attributes: `loom.role`, `loom.repo` / `loom.repo.visibility` and
+`loom.issue` (when known), and `loom.scope.unit` / `workspace` / `limit_bytes`
+(when a limit applied) / `limit_source` / `peak_bytes` / `events_max` /
+`oom_kills` / `clipped` (a bool) (`SCOPE_MEMORY_LOG_ATTRIBUTE_KEYS`, kept by the
+collector's `transform/privacy` `keep_keys`, contract-tested).
 
 
 ### `daemon.exit` — why the daemon process ended

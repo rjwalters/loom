@@ -65,16 +65,17 @@ fn facts_reach_the_classifier() {
     ];
     let facts = IssueFacts {
         landed: HashMap::from([(5, 50)]),
-        blockers_closed: HashSet::from([6]),
         red_fix: HashSet::new(),
     };
     let items = classify_rows(&rows, &facts);
     assert_eq!(items[0].verdict, Verdict::Step(Step::CuratorKeepOrClose));
     assert_eq!(items[1].verdict, Verdict::Step(Step::ChampionReevaluate));
-    // Unread facts pass the same items.
+    // Without the landed fact the issue is a plain Builder step. The
+    // dependency park needs no fact: Champion re-checks its blockers on every
+    // draw (#12078).
     let items = classify_rows(&rows, &IssueFacts::default());
     assert_eq!(items[0].verdict, Verdict::Step(Step::Builder));
-    assert!(matches!(items[1].verdict, Verdict::Pass(_)));
+    assert_eq!(items[1].verdict, Verdict::Step(Step::ChampionReevaluate));
 }
 
 #[test]
