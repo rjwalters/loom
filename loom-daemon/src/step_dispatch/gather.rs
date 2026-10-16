@@ -306,8 +306,10 @@ pub fn draw_inputs(
 
 /// The Champion re-evaluation ladder's due times in the rows' bodies: a
 /// curated issue's for a promote step, a PR's for a merge step (#11900).
+/// Read at `now`: a marker written under the pre-#12513 ladder is due `now`
+/// ([`super::reeval_ladder::Reeval::due_at`]).
 #[must_use]
-pub fn ladder_due(rows: &[RestIssue]) -> Vec<(u32, StepRole, DateTime<Utc>)> {
+pub fn ladder_due(rows: &[RestIssue], now: DateTime<Utc>) -> Vec<(u32, StepRole, DateTime<Utc>)> {
     rows.iter()
         .filter_map(|r| {
             let role = if r.is_pull_request {
@@ -315,7 +317,7 @@ pub fn ladder_due(rows: &[RestIssue]) -> Vec<(u32, StepRole, DateTime<Utc>)> {
             } else {
                 StepRole::ChampionPromote
             };
-            let due = super::reeval_ladder::due(r.body.as_deref()?, role)?;
+            let due = super::reeval_ladder::due(r.body.as_deref()?, role, now)?;
             Some((r.number, role, due))
         })
         .collect()
@@ -605,7 +607,7 @@ pub fn finish(
         provider.retain_present(&slug, &rows);
     }
     Gathered {
-        ladder: ladder_due(&rows),
+        ladder: ladder_due(&rows, now),
         created_at: rows
             .iter()
             .filter_map(|r| r.created_at.clone().map(|c| (r.number, c)))

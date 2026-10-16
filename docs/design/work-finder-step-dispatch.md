@@ -204,7 +204,7 @@ A step that wrote its verdict and died still holding its claim only loses the cl
 | landed (`verdict:closed`) | Reclassify the item. No more Builder steps. |
 | `noop` | Cooldown per `(item, step)` |
 | fast `failed` | Builder: the #11872 ladder. Every other step (Curator, Champion promote, Judge, Doctor, Champion merge): a ledger-local doubling window capped at 24 h, never the issue quarantine, whose release restores `loom:issue` (#11969) |
-| Champion re-evaluation left the item held or blocked | Ladder from 6 h to 7 d, **stored on the forge**: a `<!-- loom:reeval step=… rung=… next=… -->` line in the item's body, beside its park record or under its hold marker |
+| Champion re-evaluation left the item held or blocked | Ladder of 1, 1, 1, 2, 4, 8, 24, 48, 96 h, then 7 d (#12513; 6 h → 7 d before it), **stored on the forge**: a `<!-- loom:reeval step=… rung=… next=… -->` line in the item's body, beside its park record or under its hold marker. A marker whose `next=` is further off than its rung's delay (written under the old ladder) is due now, once. Not counted toward the repeat cap |
 | `refused`, `pool_gate` or `claimed` | A short cooldown per `(item, step)`, in force before the next tick |
 | `refused`, `claim_lost` | Redraw; counted. A second in a row on the same `(item, step)` arms the refusal cooldown, doubling to 24 h (#11969) |
 | any other `refused` | Reclassify the item |

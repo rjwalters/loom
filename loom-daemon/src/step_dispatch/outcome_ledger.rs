@@ -23,7 +23,7 @@
 //! | `failed` inside the fast-fail window, Builder step | [`Effect::FastFailLadder`]: the #11854/#11872 ladder |
 //! | `failed` inside the fast-fail window, any other step | [`Effect::FastFailWindow`]: a ledger-local doubling window, never the issue quarantine |
 //! | `failed` later | [`Effect::Failed`]: counted toward the repeat cap only |
-//! | Champion `held` / `blocked` | [`Effect::ForgeLadder`]: 6 h → 7 d, on the forge ([`super::reeval_ladder`]) |
+//! | Champion `held` / `blocked` | [`Effect::ForgeLadder`]: 1 h → 7 d, on the forge ([`super::reeval_ladder`]) |
 //!
 //! Champion's other outcomes fold as: `merged`, `rejected`, `promoted`,
 //! `revise`, `operator`, `closed` → `verdict`; `requeued` → `noop`;
@@ -70,7 +70,10 @@
 //! Not runs ([`counts_as_run`]): every `refused` outcome (`pool_gate`,
 //! `claimed`, `claim_lost`, a state refusal: the step never worked the item)
 //! and a `noop` that waited on something outside the item (`ci_pending`), so
-//! a PR sitting in the CI queue does not lose its Judge for a day.
+//! a PR sitting in the CI queue does not lose its Judge for a day. Nor is a
+//! Champion `held` / `blocked` ([`Effect::ForgeLadder`]): the forge ladder is
+//! that outcome's brake, and since #12513 its first three rungs are 1 h each,
+//! so three of them fit in 24 h and the cap would override the ladder.
 //!
 //! **Scope.** The run history is per host: it is not broadcast. The cap a
 //! host arms *is* broadcast, but across N hosts an `(item, step)` can run up
@@ -101,7 +104,8 @@
 //! [`StepCooldowns`] is the pure answer to "is `(item, step)` cooling down at
 //! time T?". The registry builds one per tick from this ledger plus the peers'
 //! broadcasts; the cutover adds the forge ladder's due times
-//! ([`super::reeval_ladder::due`]); the draw reads it as part of `actionable`
+//! ([`super::reeval_ladder::due`], which reads a marker from the pre-#12513
+//! ladder as due now); the draw reads it as part of `actionable`
 //! (`item_draw::WeighContext::cooldowns`).
 
 use std::collections::BTreeMap;
@@ -590,7 +594,10 @@ impl OutcomeLedger {
                 entry.refusals = None;
             }
         }
-        if counted && !matches!(effect, Effect::Advance | Effect::Landed) {
+        // The forge ladder is a Champion hold's brake (#12513): with rungs of
+        // 1, 1, 1 h, three held verdicts fit in 24 h, and the cap would turn
+        // the third rung into a day.
+        if counted && !matches!(effect, Effect::Advance | Effect::Landed | Effect::ForgeLadder) {
             repeat_capped = self.count_run(item, step, now);
         }
         Recorded {
@@ -738,6 +745,12 @@ impl OutcomeLedger {
     /// runs inside the window join the pair's history, and their window in
     /// force is armed (extend-only, capped at [`MAX_SHORT_COOLDOWN`] from
     /// `now` like every window). Lapsed runs and windows are dropped.
+    ///
+    /// A [`CooldownCause::ForgeLadder`] window is not re-armed: it only
+    /// mirrors the forge marker until the listing shows the new body, and
+    /// after a restart the marker itself is read ([`super::reeval_ladder::due`]).
+    /// Re-arming it would also keep a mirror armed under the pre-#12513 ladder
+    /// (up to 24 h) past the rule that reads that marker as due now.
     pub fn restore(&mut self, pairs: Vec<PersistedPair>, now: DateTime<Utc>) {
         let window = self.cfg.repeat_window;
         for p in pairs {
@@ -754,6 +767,9 @@ impl OutcomeLedger {
             }
             if let Some(until) = p.until.filter(|u| *u > now) {
                 let cause = p.cause.unwrap_or(CooldownCause::RepeatCap);
+                if cause == CooldownCause::ForgeLadder {
+                    continue;
+                }
                 self.arm(p.item, p.step, until, cause, now);
             }
         }
