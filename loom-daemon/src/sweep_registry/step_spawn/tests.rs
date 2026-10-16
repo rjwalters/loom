@@ -644,3 +644,180 @@ fn a_lease_that_never_reads_back_refuses_the_builder_claim() {
         "claim_unverified"
     );
 }
+
+// ---- #12450: the captain's claim ------------------------------------------
+
+mod captain {
+    use super::*;
+    use crate::fleet_dispatch::proto::{CLAIM_PATH, REFUSE_PATH, RELEASE_PATH};
+    use crate::fleet_dispatch::test_server::TestServer;
+    use serde_json::json;
+
+    fn enable(root: &Path, url: &str) {
+        write_config(root, &json!({"fleetDispatch": {"enabled": true, "url": url}}).to_string());
+    }
+
+    fn server(claim: serde_json::Value) -> TestServer {
+        TestServer::start(move |path, _| {
+            if path == CLAIM_PATH {
+                (200, claim.clone())
+            } else {
+                (200, json!({"server_epoch": "e1"}))
+            }
+        })
+    }
+
+    fn held() -> TestServer {
+        server(json!({"server_epoch":"e1","granted":false,"reason":"held","held_by":"peer",
+            "retry_after_s":30}))
+    }
+
+    fn granted() -> TestServer {
+        server(json!({"server_epoch":"e1","granted":true,"assignment_id":"a-12450","ttl_s":1200}))
+    }
+
+    /// A non-hermetic Builder registry whose fake `gh` logs every call.
+    fn forge_registry(ws: &Path, leases: &[&str]) -> (SweepRegistry, PathBuf) {
+        let (reg, gh_log, ..) =
+            crate::sweep_registry::test_support::lease_order_dispatch_registry(ws, leases);
+        let commands = ws.join(".claude").join("commands").join("loom");
+        std::fs::write(commands.join("builder.md"), "# builder").unwrap();
+        (reg, gh_log)
+    }
+
+    fn gh_calls(log: &Path) -> String {
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    /// A refused claim is a pass with ZERO forge calls: no landed check, no
+    /// label flip, no lease comment, no lock left behind. Both spawn paths.
+    #[test]
+    #[serial]
+    fn a_captain_refusal_makes_no_forge_call() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let dir = tempdir().unwrap();
+        let (mut reg, gh_log) = forge_registry(dir.path(), &[]);
+        let server = held();
+        enable(dir.path(), &server.url());
+        let request = StepSpawnRequest::new(BUILDER_ITEM, StepRole::Builder);
+        let (result, signals) = capture(|| reg.spawn_step(&request));
+        let refusal = result.unwrap_err().downcast::<StepRefusal>().unwrap();
+        assert_eq!(refusal.reason, "captain_held");
+        assert_eq!(gh_calls(&gh_log), "", "a refusal makes no forge call");
+        assert!(reg.entries.is_empty());
+        assert!(!reg
+            .config
+            .locks_dir()
+            .join(format!("issue-{BUILDER_ITEM}"))
+            .exists());
+        assert_eq!(
+            step_span_reason(&signals.spans),
+            vec![("refused".into(), "captain_held".into())]
+        );
+        assert_eq!(server.requests_to(CLAIM_PATH).len(), 1);
+
+        let registry = Arc::new(Mutex::new(reg));
+        let refusal = SweepRegistry::spawn_step_unlocked(&registry, &request)
+            .unwrap_err()
+            .downcast::<StepRefusal>()
+            .unwrap();
+        assert_eq!(refusal.reason, "captain_held");
+        assert_eq!(gh_calls(&gh_log), "", "nor on the unlocked path");
+        assert!(server.requests_to(REFUSE_PATH).is_empty(), "nothing was granted to give back");
+    }
+
+    /// A grant runs today's path unchanged: the forge is asked as before.
+    /// A refusal further on gives the grant back with its own reason, and
+    /// names the assignment on the step span.
+    #[test]
+    #[serial]
+    fn a_grant_runs_todays_path_and_a_later_refusal_gives_it_back() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let dir = tempdir().unwrap();
+        // A peer's earlier lease: today's forge claim loses the race.
+        let (mut reg, gh_log) = forge_registry(dir.path(), &[PEER_LEASE]);
+        // A per-repo credential pool, so the launch resolves on any host and
+        // the step reaches the forge pre-claim (without one, a host with no
+        // pool is refused `no_token_pool` before the claim is ever made).
+        crate::sweep_registry::test_support::seed_token_pool(dir.path(), "agent-1");
+        let server = granted();
+        enable(dir.path(), &server.url());
+        let request = StepSpawnRequest::new(BUILDER_ITEM, StepRole::Builder);
+        let (result, signals) = capture(|| reg.spawn_step(&request));
+        let refusal = result.unwrap_err().downcast::<StepRefusal>().unwrap();
+        assert_ne!(gh_calls(&gh_log), "", "a grant runs the forge path");
+        assert_eq!(refusal.assignment_id.as_deref(), Some("a-12450"));
+        let refused = server.wait_for(REFUSE_PATH, 1);
+        assert_eq!(refused.len(), 1, "{:?}", server.requests());
+        assert_eq!(refused[0]["assignment_id"], "a-12450");
+        // The peer's lease wins the forge order: the literal token, so a
+        // refusal that gave the grant back under some other reason fails.
+        assert_eq!(refusal.reason, "claim_lost");
+        assert_eq!(refused[0]["reason"], "claim_lost");
+        let span = signals
+            .spans
+            .iter()
+            .find(|s| s.name.as_str() == "loom.dispatch.step")
+            .unwrap();
+        assert_eq!(span.attributes["loom.assignment.id"], "a-12450");
+    }
+
+    /// A granted step that spawns carries the assignment on its span and
+    /// releases it at its end.
+    #[test]
+    #[serial]
+    fn a_granted_step_names_its_assignment_and_releases_it() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let dir = tempdir().unwrap();
+        let (mut reg, _) = fixture_registry(dir.path());
+        let server = granted();
+        enable(dir.path(), &server.url());
+        let (outcome, signals) =
+            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_450, StepRole::Judge)));
+        let outcome = outcome.unwrap();
+        let span = signals
+            .spans
+            .iter()
+            .find(|s| s.name.as_str() == "loom.dispatch.step")
+            .unwrap();
+        assert_eq!(span.attributes["loom.dispatch.admission_result"], "spawned");
+        assert_eq!(span.attributes["loom.assignment.id"], "a-12450");
+        let _ = reg.end_step(
+            &outcome.sweep_id,
+            9_450,
+            StepRole::Judge,
+            Utc::now(),
+            StepEnd::Exited(Some(0)),
+        );
+        let released = server.wait_for(RELEASE_PATH, 1);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0]["assignment_id"], "a-12450");
+        assert_eq!(released[0]["outcome"], "failed", "no outcome line reads as failed");
+        cancel_all(&mut reg);
+    }
+
+    /// With the flag off the step spawns exactly as before: no server call.
+    #[test]
+    #[serial]
+    fn with_the_flag_off_the_server_is_never_asked() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let dir = tempdir().unwrap();
+        let (mut reg, _) = fixture_registry(dir.path());
+        let server = held();
+        write_config(
+            dir.path(),
+            &json!({"fleetDispatch": {"enabled": false, "url": server.url()}}).to_string(),
+        );
+        let (outcome, signals) =
+            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_451, StepRole::Judge)));
+        outcome.unwrap();
+        assert!(server.requests().is_empty());
+        let span = signals
+            .spans
+            .iter()
+            .find(|s| s.name.as_str() == "loom.dispatch.step")
+            .unwrap();
+        assert!(!span.attributes.contains_key("loom.assignment.id"));
+        cancel_all(&mut reg);
+    }
+}

@@ -9,7 +9,9 @@
 //! status surface. So, as `private_dispatch::prepare` does for sweeps:
 //!
 //! 1. **locked**: the roll gate, and a copy of the configuration;
-//! 2. **unlocked**: a Builder step's landed check ([`landed_at_spawn`],
+//! 2. **unlocked**: the captain's claim when fleet dispatch is on
+//!    ([`captain_claim`], #12450: a refusal ends here, with no forge call),
+//!    a Builder step's landed check ([`landed_at_spawn`],
 //!    #12251), then the role's resolvers, containment included;
 //! 3. **locked**: the sweep id, the item's lock, the peer advertisement, and
 //!    the pre-claim command;
@@ -19,6 +21,9 @@
 //!    phase a sweep takes it in), the stagger and the spawn;
 //! 6. **unlocked**: the account-selection poll;
 //! 7. **locked**: [`SweepRegistry::finish_step_spawn`].
+//!
+//! A refusal after a captain's grant gives the grant back
+//! ([`give_back`]), and the spawned step carries it to its release.
 //!
 //! The item's lock taken in phase 3 is what keeps another dispatcher off the
 //! item while the lock is released.
@@ -105,7 +110,12 @@ impl SweepRegistry {
             *slot += now.saturating_duration_since(mark);
             mark = now;
         };
+        // The captain's grant (#12450), set once phase 2 asks; every refusal
+        // after it gives it back.
+        let grant: std::cell::OnceCell<crate::fleet_dispatch::worker::Grant> =
+            std::cell::OnceCell::new();
         let refuse = |refusal: StepRefusal| -> anyhow::Error {
+            let refusal = give_back(grant.get(), refusal);
             let reg = locked(registry);
             reg.record_step_dispatch(
                 request,
@@ -113,6 +123,7 @@ impl SweepRegistry {
                 refusal.reason,
                 None,
                 refusal.claim.as_ref(),
+                refusal.assignment_id.as_deref(),
             );
             log::info!(
                 "sweep_registry: {} step on #{} not spawned — {refusal}",
@@ -122,17 +133,29 @@ impl SweepRegistry {
             anyhow::Error::new(refusal)
         };
         let (item, role, kind) = (request.item, request.role, request.kind());
-        let (config, target) = {
+        let config = {
             let reg = locked(registry);
             if let Err(e) = reg.roll_gate.admit(&kind) {
                 drop(reg);
                 return Err(refuse(StepRefusal::new("roll_paused", e)));
             }
-            let target = (role == StepRole::Builder)
-                .then(|| reg.open_pr_listing_target())
-                .flatten();
-            (reg.config.clone(), target)
+            reg.config.clone()
         };
+        match blocking(|| captain_claim(&config.workspace_root, item, role)) {
+            Ok(Some(granted)) => {
+                let _ = grant.set(granted);
+            }
+            Ok(None) => {}
+            Err(refusal) => {
+                lap(&mut timings.claim);
+                return Err(refuse(refusal));
+            }
+        }
+        lap(&mut timings.claim);
+        // After the captain: resolving the listing target can ask the forge.
+        let target = (role == StepRole::Builder)
+            .then(|| locked(registry).open_pr_listing_target())
+            .flatten();
         if let Some(pr) = target.and_then(|t| blocking(|| landed_at_spawn(&t, item))) {
             lap(&mut timings.resolve);
             locked(registry).hold_landed_builder(item);
@@ -212,6 +235,7 @@ impl SweepRegistry {
             }
         };
         prepared.claim = claim;
+        prepared.assignment = grant.get().cloned();
         let (token_name, runtime, death) = blocking(|| {
             poll_and_classify_spawned_child(
                 &mut prepared.child,

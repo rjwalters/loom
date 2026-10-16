@@ -47,6 +47,15 @@
 //! routed to Curator, the step is refused `already_landed`, and the Builder
 //! is held off it fleet-wide ([`SweepRegistry::hold_landed_builder`]).
 //!
+//! # The captain (#12450)
+//!
+//! With `fleetDispatch.enabled`, the claim is asked of the fleet-dispatch
+//! server first ([`crate::fleet_dispatch::worker::claim`]), after the roll gate and
+//! before the landed check and the pre-claim, so a refusal makes no forge
+//! call at all. A grant runs everything below unchanged; a refusal after it
+//! is sent back as `refuse` with its token, and the step's end as `release`.
+//! With the flag off the call is never made.
+//!
 //! # After the spawn
 //!
 //! Every step's lease is renewed while it runs ([`lease`]); every step has
@@ -132,6 +141,8 @@ pub struct StepRefusal {
     pub detail: String,
     /// How the pre-claim ran, when it was the refusal (#12183).
     pub claim: Option<lease::ClaimFacts>,
+    /// The captain's assignment the refusal gave back (#12450).
+    pub assignment_id: Option<String>,
 }
 
 impl StepRefusal {
@@ -140,8 +151,46 @@ impl StepRefusal {
             reason,
             detail: detail.to_string(),
             claim: None,
+            assignment_id: None,
         }
     }
+
+    /// A refusal of the fleet-dispatch server's (#12450): no forge call ran.
+    pub(crate) fn captain(reason: crate::fleet_dispatch::proto::RefusalReason) -> Self {
+        Self::new(
+            crate::fleet_dispatch::worker::refusal_token(reason),
+            format!("the fleet-dispatch server refused the claim ({})", reason.as_str()),
+        )
+    }
+}
+
+/// Ask the captain for `item` (#12450, module docs): `Ok(Some(grant))`,
+/// `Ok(None)` to claim as today (the flag is off, or the server gave no
+/// usable answer), or the refusal.
+pub(crate) fn captain_claim(
+    root: &Path,
+    item: u32,
+    role: StepRole,
+) -> std::result::Result<Option<crate::fleet_dispatch::worker::Grant>, StepRefusal> {
+    use crate::fleet_dispatch::worker::Ask;
+    match crate::fleet_dispatch::worker::claim(root, item, role) {
+        Ask::Off | Ask::FailOpen => Ok(None),
+        Ask::Granted(grant) => Ok(Some(grant)),
+        Ask::Refused(reason) => Err(StepRefusal::captain(reason)),
+    }
+}
+
+/// Give a granted claim back: tell the server why the step did not run, and
+/// name the assignment on the refusal's span (#12450).
+pub(crate) fn give_back(
+    grant: Option<&crate::fleet_dispatch::worker::Grant>,
+    mut refusal: StepRefusal,
+) -> StepRefusal {
+    if let Some(grant) = grant {
+        crate::fleet_dispatch::worker::refuse(grant, refusal.reason);
+        refusal.assignment_id = Some(grant.assignment_id.clone());
+    }
+    refusal
 }
 
 impl std::fmt::Display for StepRefusal {
@@ -174,6 +223,8 @@ pub struct PreparedStep {
     launch: StepLaunch,
     /// How the won pre-claim ran, for the `spawned` span (#12183).
     claim: Option<lease::ClaimFacts>,
+    /// The captain's grant, when it gave one (#12450).
+    assignment: Option<crate::fleet_dispatch::worker::Grant>,
     _mid_spawn: roll_gate::MidSpawn,
 }
 
@@ -242,6 +293,7 @@ impl SweepRegistry {
                 refusal.reason,
                 None,
                 refusal.claim.as_ref(),
+                refusal.assignment_id.as_deref(),
             );
             log::info!(
                 "sweep_registry: {} step on #{} not spawned — {refusal}",
@@ -261,6 +313,22 @@ impl SweepRegistry {
         self.roll_gate
             .admit(&kind)
             .map_err(|e| StepRefusal::new("roll_paused", e))?;
+        let grant = captain_claim(&self.config.workspace_root, item, role)?;
+        match self.begin_granted_step(request) {
+            Ok(mut prepared) => {
+                prepared.assignment = grant;
+                Ok(prepared)
+            }
+            Err(refusal) => Err(give_back(grant.as_ref(), refusal)),
+        }
+    }
+
+    /// [`Self::begin_step_spawn_inner`] past the captain: today's path.
+    fn begin_granted_step(
+        &mut self,
+        request: &StepSpawnRequest,
+    ) -> std::result::Result<PreparedStep, StepRefusal> {
+        let (item, role, kind) = (request.item, request.role, request.kind());
         if role == StepRole::Builder {
             if let Some(pr) = self
                 .open_pr_listing_target()
@@ -369,6 +437,7 @@ impl SweepRegistry {
                 sweep_id,
                 launch,
                 claim: None,
+                assignment: None,
                 _mid_spawn: self.roll_gate.enter(),
             }),
             Err(e) => {
@@ -528,15 +597,19 @@ impl SweepRegistry {
             sweep_id,
             mut launch,
             claim,
+            assignment,
             ..
         } = prepared;
         let (item, role) = (request.item, request.role);
         if immediate_preflight_death == Some("preflight-token-selection-failed") {
             self.unwind_step_claim(item, role, &sweep_id, true);
             self.record_role_tick_pool_exhausted(role.role_name());
-            let refusal = StepRefusal::new(
-                "token_selection_failed",
-                format!("no account could be selected; see {}", log_path.display()),
+            let refusal = give_back(
+                assignment.as_ref(),
+                StepRefusal::new(
+                    "token_selection_failed",
+                    format!("no account could be selected; see {}", log_path.display()),
+                ),
             );
             self.record_step_dispatch(
                 &request,
@@ -544,6 +617,7 @@ impl SweepRegistry {
                 refusal.reason,
                 None,
                 claim.as_ref(),
+                refusal.assignment_id.as_deref(),
             );
             return Err(refusal.into());
         }
@@ -604,7 +678,15 @@ impl SweepRegistry {
             "ok",
             Some(&sweep_id),
             claim.as_ref(),
+            assignment.as_ref().map(|g| g.assignment_id.as_str()),
         );
+        if let Some(grant) = assignment {
+            crate::fleet_dispatch::worker::note_spawned(
+                &self.config.workspace_root,
+                &sweep_id,
+                grant,
+            );
+        }
         log::info!(
             "sweep_registry: {role} step {sweep_id} on #{item} spawned (pid {pid}, model {}, \
              timeout {}s, #11906)",
@@ -628,6 +710,7 @@ impl SweepRegistry {
         reason: &str,
         sweep_id: Option<&str>,
         claim: Option<&lease::ClaimFacts>,
+        assignment_id: Option<&str>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -642,6 +725,7 @@ impl SweepRegistry {
                 draw: request.draw,
                 sweep_id,
                 claim,
+                assignment_id,
             },
         );
     }

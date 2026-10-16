@@ -41,6 +41,10 @@ pub struct StepDispatch<'a> {
     pub sweep_id: Option<&'a str>,
     /// How the step's pre-claim ran, for a role-keyed lease claim (#12183).
     pub claim: Option<&'a crate::sweep_registry::step_spawn::lease::ClaimFacts>,
+    /// The fleet-dispatch server's assignment, when it granted the claim
+    /// (#12450): `loom.assignment.id`, which joins this span to the
+    /// `loom.fleet_dispatch.call` spans of the same assignment.
+    pub assignment_id: Option<&'a str>,
 }
 
 /// The span for `step` in `repo` at `at`. Pure.
@@ -98,6 +102,9 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
             attributes.insert("loom.dispatch.claim_stderr_tail".into(), tail.clone());
         }
     }
+    if let Some(id) = step.assignment_id {
+        attributes.insert("loom.assignment.id".into(), id.to_string());
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,
@@ -151,6 +158,7 @@ mod tests {
             }),
             sweep_id: Some("step-judge-42-1"),
             claim: None,
+            assignment_id: None,
         }
     }
 
@@ -182,6 +190,26 @@ mod tests {
                 "{key} is dropped at export"
             );
         }
+    }
+
+    /// #12450: a granted step carries the captain's assignment, and it
+    /// survives the export allowlist; a step with none carries no key.
+    #[test]
+    fn a_granted_step_names_its_assignment() {
+        let step = StepDispatch {
+            assignment_id: Some("a-7"),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(
+            span.attributes
+                .get("loom.assignment.id")
+                .map(String::as_str),
+            Some("a-7")
+        );
+        assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&"loom.assignment.id"));
+        let none = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert!(!none.attributes.contains_key("loom.assignment.id"));
     }
 
     #[test]

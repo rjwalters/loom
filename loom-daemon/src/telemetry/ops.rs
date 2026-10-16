@@ -272,9 +272,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.main_red.sha",
     "loom.main_red.action",
     "loom.main_red.source",
-    // `loom.fleet_dispatch.call` spans (#12449): one per captain call — the
-    // side, calling host, endpoint, latency, HTTP status, result, reason,
-    // server epoch and assignment id (`fleet_dispatch::telemetry::KEYS`).
+    // `loom.fleet_dispatch.call` spans (#12449 captain, #12450 worker): one
+    // per call on each side — the side, host, endpoint, latency, HTTP status,
+    // result, reason, server epoch and assignment id
+    // (`fleet_dispatch::telemetry::KEYS`). The item and role ride the shared
+    // `loom.issue` / `loom.pr_number` / `loom.role` keys.
     "loom.fleet_dispatch.side",
     "loom.fleet_dispatch.host",
     "loom.fleet_dispatch.endpoint",
@@ -623,6 +625,10 @@ pub enum MetricName {
     /// at that instant, the complement of the per-run `loom.ci.queued_ms`.
     #[serde(rename = "loom.ci.queue_depth")]
     CiQueueDepth,
+    /// Step ticks a fleet-dispatch worker ran in fallback, by `reason` (why
+    /// fallback began), #12450. Host-level: the resource names the host.
+    #[serde(rename = "loom.fleet_dispatch.fallback_ticks")]
+    FleetDispatchFallbackTicks,
     // ---- Fleet dispatch, captain side (Issue #12449) ----------------------
     /// Fleet-dispatch refusals since the previous point, by `kind` (`claim`
     /// for a claim the captain refused, `refuse` for a worker's `refuse`
@@ -718,6 +724,7 @@ impl MetricName {
             Self::FeedCompletions => "loom.feed.completions",
             Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
             Self::CiQueueDepth => "loom.ci.queue_depth",
+            Self::FleetDispatchFallbackTicks => "loom.fleet_dispatch.fallback_ticks",
             Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
             Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
             Self::FleetDispatchClaimLostAfterGrant => "loom.fleet_dispatch.claim_lost_after_grant",
@@ -762,6 +769,7 @@ impl MetricName {
             | Self::FeedCompletions
             | Self::FeedReconcilePasses
             | Self::AgentScopeOomKills
+            | Self::FleetDispatchFallbackTicks
             | Self::FleetDispatchRefusals
             | Self::FleetDispatchExpired
             | Self::FleetDispatchClaimLostAfterGrant => MetricKind::DeltaCounter,
@@ -828,6 +836,7 @@ impl MetricName {
             Self::FeedReconcilePasses => "{pass}",
             Self::CiQueueDepth => "{run}",
             Self::AgentScopeOomKills => "{kill}",
+            Self::FleetDispatchFallbackTicks => "{tick}",
             Self::FleetDispatchRefusals | Self::FleetDispatchClaimLostAfterGrant => "{claim}",
             Self::FleetDispatchExpired => "{assignment}",
             _ => "By",
@@ -957,6 +966,9 @@ impl MetricName {
             }
             Self::CiQueueDepth => {
                 "Workflow runs queued for a runner in the CI poll window at the end of a poll, by repo."
+            }
+            Self::FleetDispatchFallbackTicks => {
+                "Step ticks run in fleet-dispatch fallback, by the reason fallback began."
             }
             Self::FleetDispatchRefusals => {
                 "Fleet-dispatch refusals at the captain, by kind (claim / refuse) and reason."
