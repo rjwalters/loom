@@ -438,9 +438,13 @@ fn read_net() -> Option<NetCounters> {
     None
 }
 
+/// Deadline for one `nvidia-smi` query: it blocks for long periods on a wedged
+/// driver, and the host-status tick must not stall behind it.
+#[cfg(target_os = "linux")]
+const NVIDIA_SMI_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(target_os = "linux")]
 fn read_gpu() -> Option<GpuReadings> {
-    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Set once `nvidia-smi` is found missing: later ticks neither spawn nor log.
@@ -448,30 +452,82 @@ fn read_gpu() -> Option<GpuReadings> {
     if NO_NVIDIA_SMI.load(Ordering::Relaxed) {
         return None;
     }
-    let out = match Command::new("nvidia-smi")
+    match query_nvidia_smi("nvidia-smi", NVIDIA_SMI_DEADLINE) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            NO_NVIDIA_SMI.store(true, Ordering::Relaxed);
+            None
+        }
+        Err(e) => {
+            log::debug!("nvidia-smi failed to start: {e}");
+            None
+        }
+        Ok(readings) => readings,
+    }
+}
+
+/// Run `program` as `nvidia-smi` with a `deadline`. `Err` is a spawn failure;
+/// `Ok(None)` is a non-zero exit, a timeout (child killed and reaped) or
+/// unparseable output.
+#[cfg(target_os = "linux")]
+fn query_nvidia_smi(
+    program: &str,
+    deadline: std::time::Duration,
+) -> std::io::Result<Option<GpuReadings>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let mut child = Command::new(program)
         .args([
             "--query-gpu=utilization.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-    {
-        Ok(out) => out,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                NO_NVIDIA_SMI.store(true, Ordering::Relaxed);
-            } else {
-                log::debug!("nvidia-smi failed to start: {e}");
+        .spawn()?;
+    // Drain stdout on a thread so a chatty child cannot block on a full pipe.
+    let mut stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(s) = stdout.as_mut() {
+            let _ = s.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            return None;
+            Ok(None) => {
+                log::debug!("nvidia-smi timed out after {deadline:?}; killing");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+            Err(e) => {
+                log::debug!("nvidia-smi wait failed: {e}");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
         }
     };
-    if !out.status.success() {
-        log::debug!("nvidia-smi exited with {}", out.status);
-        return None;
+    if !status.success() {
+        log::debug!("nvidia-smi exited with {status}");
+        return Ok(None);
     }
-    parse_nvidia_smi(&String::from_utf8_lossy(&out.stdout))
+    // The child has exited; the reader normally finishes at once. Bound the
+    // wait in case a grandchild still holds the pipe open.
+    let Ok(buf) = rx.recv_timeout(std::time::Duration::from_millis(500)) else {
+        return Ok(None);
+    };
+    Ok(parse_nvidia_smi(&String::from_utf8_lossy(&buf)))
 }
 
 #[cfg(not(target_os = "linux"))]

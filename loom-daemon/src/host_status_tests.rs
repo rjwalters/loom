@@ -279,3 +279,59 @@ fn volume_free_bytes_reads_an_existing_ancestor_and_none_for_nothing() {
         .join("b");
     assert!(volume_free_bytes(&dir).is_some(), "walks up to the existing /tmp");
 }
+
+/// Serializes stub write + spawn: a concurrent fork that inherits the stub's
+/// still-open write fd makes `exec` fail with ETXTBSY.
+#[cfg(target_os = "linux")]
+static STUB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "linux")]
+fn stub_nvidia_smi(name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("loom-nvsmi-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nvidia-smi");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn query_nvidia_smi_times_out_and_returns_none() {
+    let _guard = STUB_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stub = stub_nvidia_smi("hang", "exec sleep 30");
+    let start = std::time::Instant::now();
+    let got = query_nvidia_smi(stub.to_str().unwrap(), std::time::Duration::from_millis(300));
+    assert!(matches!(got, Ok(None)), "{got:?}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn query_nvidia_smi_parses_stub_output() {
+    let _guard = STUB_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stub = stub_nvidia_smi("ok", "echo '30, 1000, 16000'");
+    let g = query_nvidia_smi(stub.to_str().unwrap(), std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(g.mem_total_bytes, 16000 * 1024 * 1024);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn query_nvidia_smi_nonzero_exit_and_missing_binary() {
+    let _guard = STUB_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stub = stub_nvidia_smi("fail", "echo '30, 1000, 16000'; exit 3");
+    let got = query_nvidia_smi(stub.to_str().unwrap(), std::time::Duration::from_secs(5));
+    assert!(matches!(got, Ok(None)));
+    let err =
+        query_nvidia_smi("/nonexistent/nvidia-smi", std::time::Duration::from_secs(1)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
