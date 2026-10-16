@@ -1,6 +1,6 @@
 //! An item's latest `labeled` times, read from the **end** of its events
-//! (#11924), for stage-dwell ([`super::stage_dwell`]) and the step engine's
-//! stage-entry provider ([`crate::step_dispatch::stage_entry`]).
+//! (#11924), for the step engine's stage-entry provider
+//! ([`crate::step_dispatch::stage_entry`]).
 //!
 //! GitHub lists `GET repos/{repo}/issues/{n}/events` oldest first, 100 to a
 //! page. Reading only page 1 of an item with more than 100 events returns
@@ -22,7 +22,7 @@
 //! cap, not the budget, makes a label "not found".
 //!
 //! Each reader passes its own `caller` (the facade operation), so
-//! `loom.forge.calls` tells stage-dwell's reads from the provider's.
+//! `loom.forge.calls` tells each reader's calls apart.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -32,8 +32,6 @@ use chrono::{DateTime, Utc};
 
 use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-
-use super::stage_dwell::parse_label_times;
 
 /// Most events pages one item read may spend: page 1 (for the `Link`
 /// header), the last page, and one page back from it.
@@ -203,6 +201,31 @@ pub fn last_page(raw: &str) -> Option<u32> {
             .find_map(|kv| kv.strip_prefix("page="))
             .and_then(|n| n.parse().ok())
     })
+}
+
+/// The latest `labeled` time per label in one events page.
+#[must_use]
+pub fn parse_label_times(events: &serde_json::Value) -> BTreeMap<String, DateTime<Utc>> {
+    let mut times = BTreeMap::new();
+    for event in events.as_array().into_iter().flatten() {
+        if event["event"] != "labeled" {
+            continue;
+        }
+        let (Some(name), Some(at)) = (
+            event["label"]["name"].as_str(),
+            event["created_at"]
+                .as_str()
+                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                .map(|t| t.with_timezone(&Utc)),
+        ) else {
+            continue;
+        };
+        let entry = times.entry(name.to_string()).or_insert(at);
+        if at > *entry {
+            *entry = at;
+        }
+    }
+    times
 }
 
 #[cfg(test)]

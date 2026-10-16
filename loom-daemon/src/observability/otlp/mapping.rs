@@ -3,7 +3,6 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod auto_update;
-mod backlog_level;
 mod checkout_external_change;
 mod ci;
 mod daemon_event;
@@ -13,6 +12,7 @@ mod fact_id;
 mod fleet_state;
 mod host_export;
 mod host_resource;
+mod host_status;
 mod issue_estimate;
 mod metadata;
 mod operator_presence;
@@ -22,11 +22,13 @@ mod pass;
 mod pick_decision;
 mod prompt_tree;
 mod role_draw;
+mod roster_change;
 mod scope_memory;
 mod session_output;
 mod token_ranking;
 mod tokens_snapshot;
 mod work_started;
+mod write_scope_refused;
 
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
@@ -582,6 +584,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::HostExport(_)
         | TelemetryRecord::CheckoutExternalChange(_)
+        | TelemetryRecord::RosterChange(_)
         | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::FleetState(_)
@@ -602,6 +605,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| token_ranking::log_parts(r))
                 .or_else(|| host_export::log_parts(r))
                 .or_else(|| checkout_external_change::log_parts(r))
+                .or_else(|| roster_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
@@ -613,7 +617,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SessionOutput(_)
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
-        | TelemetryRecord::BacklogLevel(_)
+        | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
@@ -630,9 +634,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
-                .or_else(|| backlog_level::log_parts(r))
                 .or_else(|| daemon_exit::log_parts(r))
-                .or_else(|| scope_memory::log_parts(r))?;
+                .or_else(|| scope_memory::log_parts(r))
+                .or_else(|| write_scope_refused::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
@@ -861,6 +865,38 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     time_unix_nano,
                 });
             }
+            // Cgroup-derived agent-scope census (#12166). Aggregate gauges only
+            // (per-scope names would be unbounded label cardinality); the
+            // per-scope detail rides on the host.health record itself. Absent
+            // when the agents slice was unreadable, never a fabricated zero.
+            if let Some(total) = r.agent_scopes_total {
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes",
+                    "Live loom-agent-* cgroup scopes on this host, registry-independent.",
+                    "{scope}",
+                    number_data_point::Value::AsInt(i64::from(total)),
+                    time_unix_nano,
+                ));
+                let orphans: Vec<_> = r.agent_scopes.iter().filter(|s| !s.agent_alive).collect();
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes_orphaned",
+                    "Listed agent scopes with no agent process left (residue).",
+                    "{scope}",
+                    number_data_point::Value::AsInt(
+                        i64::try_from(orphans.len()).unwrap_or(i64::MAX),
+                    ),
+                    time_unix_nano,
+                ));
+                if let Some(age) = orphans.iter().filter_map(|s| s.age_sec).max() {
+                    samples.push(memory_gauge(
+                        "loom.host.agent_scope_orphan_max_age_seconds",
+                        "Age of the oldest orphaned agent scope.",
+                        "s",
+                        number_data_point::Value::AsInt(i64::try_from(age).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+            }
             if let Some(cpu_idle_fraction) = r.cpu_idle_fraction {
                 samples.push(MetricSample {
                     name: "loom.host.cpu_idle_fraction",
@@ -1002,6 +1038,7 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             samples
         }
         TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),
+        TelemetryRecord::HostStatus(r) => host_status::samples(r, time_unix_nano),
         // Every kind that is not declared `otlp: Gauges` in
         // `telemetry/kinds.rs` produces no gauge here:
         //   - every lifecycle-shaped kind — including `role_tick.outcome`

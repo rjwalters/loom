@@ -61,6 +61,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // 2am#4367 P4: `loom.forge.calls`' route (gateway | direct_read |
     // direct | none), a closed vocabulary.
     "route",
+    // #12310: `loom.forge.calls`' purpose (discovery | gate | write |
+    // hygiene | observability | unknown), a closed vocabulary.
+    "purpose",
     // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
     // engine's per-role slots beside the sweep total.
     "pool",
@@ -105,13 +108,39 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.phase.spawn_ms",
     "loom.dispatch.spawn_attempts",
     "loom.dispatch.gather_concurrency",
+    // #12306: the tick's discovery snapshot (`ops::dispatch_facts`).
+    "loom.discovery.backend",
+    // #12311: the tier chain's answer, why a repo left the first tier, and
+    // the worklist's own outcome (`ops::dispatch_facts`).
+    "loom.discovery.tier",
+    "loom.discovery.fallback_repos",
+    "loom.discovery.worklist.outcome",
+    "loom.discovery.worklist.error_class",
+    "loom.discovery.worklist.latency_ms",
+    "loom.discovery.repos.requested",
+    "loom.discovery.repos.ok",
+    "loom.discovery.repos.unknown",
+    "loom.discovery.repos.backfilling",
+    "loom.discovery.repos.error",
+    "loom.discovery.items",
+    "loom.discovery.forge_reads",
+    "loom.discovery.stale_repos",
+    "loom.discovery.oldest_watermark_age_secs",
     // #12298: the spawn half's concurrency and its sub-phases.
     "loom.dispatch.spawn_concurrency",
+    // #12310: what a `invoke github` span was for, and why a discovery read
+    // fell back (`reserve`: the gateway refused it below its quota reserve).
+    "loom.forge.purpose",
+    "loom.discovery.fallback_reason",
     "loom.dispatch.spawn_hold",
     "loom.dispatch.phase.spawn_resolve_ms",
     "loom.dispatch.phase.spawn_claim_ms",
     "loom.dispatch.phase.spawn_launch_ms",
     "loom.dispatch.phase.spawn_account_ms",
+    // #12410: the tick's draws and passes by reason (`ops::dispatch_facts`).
+    "loom.dispatch.passes",
+    "loom.dispatch.draws",
+    "loom.dispatch.draws_unspawned",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",
@@ -145,6 +174,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.draw_attempt",
     "loom.step.age_source",
     "loom.step.resumed",
+    // The draw's weight terms (#12185).
+    "loom.step.weight",
+    "loom.step.total_weight",
+    "loom.step.repo_items",
+    "loom.step.in_flight_repo",
     // `loom.dispatch.step` claim facts (Issue #12183).
     "loom.dispatch.claim_outcome",
     "loom.dispatch.claim_exit_code",
@@ -242,9 +276,9 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
 
 /// Longest label value kept, in bytes.
 pub const MAX_LABEL_VALUE_BYTES: usize = 128;
-/// Most labels kept on one point (`loom.forge.calls` carries eleven: #10607's
-/// ten plus 2am#4367's `route`).
-pub const MAX_LABELS_PER_POINT: usize = 11;
+/// Most labels kept on one point (`loom.forge.calls` carries twelve: #10607's
+/// ten, 2am#4367's `route` and #12310's `purpose`).
+pub const MAX_LABELS_PER_POINT: usize = 12;
 /// Most points kept in one record.
 pub const MAX_POINTS_PER_RECORD: usize = 256;
 
@@ -403,19 +437,6 @@ pub enum MetricName {
     /// Role-runner agent slots idle: the ceiling minus agents in flight.
     #[serde(rename = "loom.dispatch.role_idle_slots")]
     DispatchRoleIdleSlots,
-    /// Seconds items spent in a forge label stage, summed, labelled `state`.
-    #[serde(rename = "loom.forge.stage_dwell")]
-    ForgeStageDwell,
-    /// Stage transitions counted in `loom.forge.stage_dwell`, labelled `state`.
-    #[serde(rename = "loom.forge.stage_dwell.samples")]
-    ForgeStageDwellSamples,
-    /// Open items carrying a stage label, labelled `state`.
-    #[serde(rename = "loom.forge.stage_items")]
-    ForgeStageItems,
-    /// Seconds since the oldest item of a `stage_items` state entered it,
-    /// labelled `state`, `reason`, `repo` (#12027: `pr_refused`).
-    #[serde(rename = "loom.forge.stage_oldest_age_seconds")]
-    ForgeStageOldestAgeSeconds,
     /// Items the step tick could draw (weight > 0, after the live claims),
     /// labelled `repo`, sampled every work-finder tick (#11909).
     #[serde(rename = "loom.step.actionable")]
@@ -530,16 +551,6 @@ pub enum MetricName {
     /// `container` (#10600).
     #[serde(rename = "loom.codex_session.mount_drift")]
     CodexSessionMountDrift,
-    // ---- Fleet gauges produced by the captain (W12) ----------------------
-    /// Age of the captain's last production of a fleet gauge job, labelled
-    /// `task` = the job (`observability::captain_gauges::Config::jobs`): on the captain its own,
-    /// on a dispatcher the published `as_of` it last read.
-    #[serde(rename = "loom.captain.gauge_age_seconds")]
-    CaptainGaugeAgeSeconds,
-    /// 1 while a dispatcher produces a fleet gauge job locally because the
-    /// captain's data is stale or absent, 0 while it stands down; by `task` (the job).
-    #[serde(rename = "loom.captain.gauge_fallback")]
-    CaptainGaugeFallback,
     /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
     /// (#11094).
     #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
@@ -627,10 +638,6 @@ impl MetricName {
             Self::DispatchBusySlots => "loom.dispatch.busy_slots",
             Self::DispatchRoleMaxConcurrent => "loom.dispatch.role_max_concurrent",
             Self::DispatchRoleIdleSlots => "loom.dispatch.role_idle_slots",
-            Self::ForgeStageDwell => "loom.forge.stage_dwell",
-            Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
-            Self::ForgeStageItems => "loom.forge.stage_items",
-            Self::ForgeStageOldestAgeSeconds => "loom.forge.stage_oldest_age_seconds",
             Self::StepActionable => "loom.step.actionable",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
@@ -655,8 +662,6 @@ impl MetricName {
             Self::CodexSessionState => "loom.codex_session.state",
             Self::CodexSessionRecord => "loom.codex_session.record",
             Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
-            Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
-            Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
             Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
             Self::AgentScopeOomKills => "loom.agent_scope.oom_kills",
             Self::ForgeMirrorReads => "loom.forge.mirror.reads",
@@ -688,8 +693,6 @@ impl MetricName {
             | Self::DispatchSlotTurnaround
             | Self::DispatchSlotTurnaroundSamples
             | Self::DispatchIdleSlotSeconds
-            | Self::ForgeStageDwell
-            | Self::ForgeStageDwellSamples
             | Self::QueueDispositionRowsDropped
             | Self::GithubRateLimitBreakerSkips
             | Self::ForgeCalls
@@ -737,18 +740,16 @@ impl MetricName {
             Self::PoolExhaustedSeconds | Self::PoolPlanWindowSeconds => "s",
             Self::PoolPlanTokenLimit => "{token}",
             Self::QueueOldestWait | Self::QueueDispatchWait => "s",
-            Self::DispatchSlotTurnaround
-            | Self::DispatchIdleSlotSeconds
-            | Self::ForgeStageDwell => "s",
+            Self::DispatchSlotTurnaround | Self::DispatchIdleSlotSeconds => "s",
             Self::DispatchSlotTurnaroundSamples
             | Self::DispatchIdleSlots
             | Self::DispatchBusySlots
             | Self::DispatchRoleMaxConcurrent
             | Self::DispatchRoleIdleSlots => "{slot}",
-            Self::ForgeStageDwellSamples | Self::ForgeStageItems | Self::StepActionable => "{item}",
+            Self::StepActionable => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
-            Self::GithubRateLimitReset | Self::ForgeStageOldestAgeSeconds => "s",
+            Self::GithubRateLimitReset => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
             Self::ForgeCalls => "{request}",
             Self::ForgeFacadeEvents => "{event}",
@@ -766,8 +767,6 @@ impl MetricName {
             Self::CodexSessionState => "1",
             Self::CodexSessionRecord => "1",
             Self::CodexSessionMountDrift => "{path}",
-            Self::CaptainGaugeAgeSeconds => "s",
-            Self::CaptainGaugeFallback => "1",
             Self::ForgeMirrorReads => "{request}",
             Self::ForgeMirrorChanges => "{change}",
             Self::ForgeMirrorWakeLatency => "s",
@@ -836,14 +835,6 @@ impl MetricName {
             }
             Self::DispatchRoleMaxConcurrent => "The role-runner concurrent agent ceiling.",
             Self::DispatchRoleIdleSlots => "Role-runner agent slots idle under the ceiling.",
-            Self::ForgeStageDwell => "Seconds items spent in a forge label stage, by state.",
-            Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
-            Self::ForgeStageItems => {
-                "Open items per repo by state: stage labels and queue states (overlapping)."
-            }
-            Self::ForgeStageOldestAgeSeconds => {
-                "Age of the oldest item in a stage_items state, by reason (pr_refused)."
-            }
             Self::StepActionable => "Items the step tick could draw this tick, per repo.",
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
@@ -886,12 +877,6 @@ impl MetricName {
             Self::CodexSessionMountDrift => {
                 "Workspace paths a Codex session container is missing, mounts extra, or \
                  mounts though denied, by kind."
-            }
-            Self::CaptainGaugeAgeSeconds => {
-                "Age of the fleet captain's last run of a fleet gauge job, by task."
-            }
-            Self::CaptainGaugeFallback => {
-                "1 while a dispatcher produces a fleet gauge job locally (captain stale)."
             }
             Self::AgentScopePeakMemoryBytes => {
                 "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."

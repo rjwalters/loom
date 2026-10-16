@@ -52,27 +52,17 @@ impl WorkOrigin {
         }
     }
 
-    /// Require exactly one valid standalone provenance record, from a
-    /// trusted PR author. Duplicate records (even identical ones), unknown
-    /// versions and malformed origin values are unknown, never priority.
+    /// A PR is interactive (human) when its author is a present, trusted
+    /// account that is not a bot or GitHub App login. No body marker is read:
+    /// anything else is unknown, never priority.
     pub fn trusted_pr(pr: &Value, trust: &TrustPolicy) -> Self {
-        if crate::comment_trust::Author::from_json(pr)
-            .login
-            .as_deref()
-            .is_none_or(|s| s.trim().is_empty())
-            || !trust.trusts_json(pr)
+        let author = crate::comment_trust::Author::from_json(pr);
+        if author.login.as_deref().is_none_or(|s| s.trim().is_empty())
+            || author.app
+            || !trust.trusts(&author)
         {
             return Self::Unknown;
         }
-        let body = pr["body"].as_str().unwrap_or("");
-        if body.matches("<!-- loom:provenance").count() != 1 {
-            return Self::Unknown;
-        }
-        crate::merge_pr::refs::strip_fenced_code_blocks(body)
-            .lines()
-            .filter(|line| line.starts_with(super::marker::PREFIX))
-            .find_map(super::marker::Marker::parse)
-            .and_then(|m| m.origin)
-            .unwrap_or_default()
+        Self::Interactive
     }
 }

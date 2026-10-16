@@ -287,6 +287,19 @@ fn hold_name_sets_fold_each_retired_name_into_its_replacement() {
 }
 
 #[test]
+fn merge_hold_set_includes_loom_blocked_but_not_review_labels() {
+    // #11907: a `loom:pr` + `loom:blocked` PR (a Champion merge hold) cannot
+    // merge, so it is `merge_hold` and not `merge_wait`.
+    let holds = embedded_set_with_retired("merge_hold");
+    assert!(holds.contains(&"loom:blocked"));
+    assert!(holds.contains(&"loom:operator"));
+    // A label that is not a hold never lifts an approved PR into `merge_hold`.
+    for l in ["loom:pr", "loom:review-requested", "loom:changes-requested"] {
+        assert!(!holds.contains(&l), "{l}");
+    }
+}
+
+#[test]
 fn embedded_set_with_retired_skips_retirements_without_the_property() {
     // loom:operator-priority -> loom:important: not a hold, so not picked up.
     assert!(!embedded_set_with_retired("hold").contains(&"loom:operator-priority"));

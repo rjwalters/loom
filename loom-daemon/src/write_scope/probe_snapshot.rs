@@ -40,7 +40,7 @@ pub(crate) fn from_snapshot(
         Answer::Disabled => None,
         Answer::Listed(Some(_)) => Some(Permission::Write),
         Answer::Listed(None) => {
-            Some(Permission::Insufficient("not in this App installation".into()))
+            Some(Permission::Insufficient(super::probe::NOT_IN_INSTALLATION.into()))
         }
         // A user token: leg 1 decides, except an all-`false` role, which is
         // what an App installation token is served (#11957: a snapshot

@@ -7391,6 +7391,12 @@ sql_ddl_exec_match() {
             return toupper(substr(l, RSTART, RLENGTH))
         return ""
     }
+    function is_wrapper(w,   base) {
+        base = w
+        sub(/^.*\//, "", base)
+        sub(/^\\/, "", base)
+        return base ~ /^(env|command|exec|builtin|sudo|doas|nohup|setsid|nice|ionice|stdbuf|timeout|time|xargs|unbuffer)$/
+    }
     function runs_sql(cmd, toks, m,   j, base) {
         base = cmd
         sub(/^.*\//, "", base)
@@ -7413,20 +7419,27 @@ sql_ddl_exec_match() {
         for (i = 1; i <= n; i++) {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
-            sub(/^sudo[ \t]+/, "", seg)
-            if (sub(/^env([ \t]+|$)/, "", seg)) {
-                sub(/^[ \t]+/, "", seg)
-                stripped = 1
-                while (stripped) {
-                    stripped = 0
-                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
-                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
-                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
+            # Unwrap command-prefix wrappers (#12237). The list mirrors the
+            # heredoc-interpreter scan earlier in this file; keep them in sync.
+            # After a wrapper, skip its -flags, VAR=val and numeric operands. A
+            # bare word right after a flag is that flag operand (`sudo -u pg
+            # psql`, `nice -n 10`) unless it is itself a DB client or wrapper,
+            # so `sudo -E psql` still unwraps to psql.
+            mr = split(seg, raw, /[ \t]+/)
+            j = 1
+            while (j <= mr && raw[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) j++
+            while (j <= mr && is_wrapper(raw[j])) {
+                j++
+                prevflag = 0
+                while (j <= mr) {
+                    if (raw[j] ~ /^-/) { prevflag = 1; j++; continue }
+                    if (raw[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || raw[j] ~ /^[0-9]+([.][0-9]+)?[smhd]?$/) { prevflag = 0; j++; continue }
+                    if (prevflag && !is_wrapper(raw[j]) && !runs_sql(raw[j], raw, mr)) { prevflag = 0; j++; continue }
+                    break
                 }
             }
-            while (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/, "", seg)) {}
-            sub(/^[ \t]+/, "", seg)
-            m = split(seg, toks, /[ \t]+/)
+            m = 0
+            for (k = j; k <= mr; k++) toks[++m] = raw[k]
             if (m == 0 || !runs_sql(toks[1], toks, m)) continue
             ph = phrase(segs[i])
             if (ph != "") { print ph; exit }

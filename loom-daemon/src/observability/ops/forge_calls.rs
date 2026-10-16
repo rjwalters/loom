@@ -60,6 +60,10 @@ pub enum CallOutcome {
     /// A secondary (burst) limit (#11418).
     SecondaryLimited,
     Error,
+    /// A `discovery` read the read gateway refused (`429`) because the pool's
+    /// remaining quota is below the reserve held for gate reads (#12310). Not
+    /// a rate limit: the breaker is untouched.
+    ReserveRefused,
     /// Refused before it was sent by a budget gate (reserved: no producer
     /// yet; the per-bucket gate records it).
     Shed,
@@ -74,6 +78,7 @@ impl CallOutcome {
             Self::RateLimited => "rate_limited",
             Self::SecondaryLimited => "secondary_limited",
             Self::Error => "error",
+            Self::ReserveRefused => "reserve_refused",
             Self::Shed => "shed",
         }
     }
@@ -103,11 +108,14 @@ pub struct CallLabels {
     /// [`crate::forge_gateway::ROUTES`]. With `account`, it reports the
     /// writer installation's read share (`route = direct_read`).
     pub route: &'static str,
+    /// What the call was for (#12310): a
+    /// [`crate::gh_invocation::ForgePurpose`] name, or `unknown`.
+    pub purpose: &'static str,
     pub outcome: CallOutcome,
 }
 
 /// `(caller, op, role, account, cred_owner, installation, target_owner,
-/// resource, agent, route, outcome)`.
+/// resource, agent, route, purpose, outcome)`.
 type Key = (
     String,
     String,
@@ -117,6 +125,7 @@ type Key = (
     String,
     String,
     String,
+    &'static str,
     &'static str,
     &'static str,
     &'static str,
@@ -152,6 +161,7 @@ fn add(store: &mut Series, cap: usize, labels: CallLabels, agent: &'static str, 
         labels.resource,
         agent,
         labels.route,
+        labels.purpose,
         labels.outcome.as_str(),
     );
     let key = if store.len() >= cap && !store.contains_key(&key) {
@@ -163,7 +173,7 @@ fn add(store: &mut Series, cap: usize, labels: CallLabels, agent: &'static str, 
         } else {
             AGENT_OVERFLOW_CALLER.to_string()
         };
-        (caller, o(), o(), o(), o(), o(), o(), o(), agent, key.9, key.10)
+        (caller, o(), o(), o(), o(), o(), o(), o(), agent, key.9, key.10, key.11)
     } else {
         key
     };
@@ -228,6 +238,7 @@ pub fn drain_points() -> Vec<MetricPoint> {
                     resource,
                     agent,
                     route,
+                    purpose,
                     outcome,
                 ),
                 n,
@@ -243,6 +254,7 @@ pub fn drain_points() -> Vec<MetricPoint> {
                     .label("resource", resource)
                     .label("agent", agent)
                     .label("route", route)
+                    .label("purpose", purpose)
                     .label("outcome", outcome)
             },
         )
@@ -301,6 +313,7 @@ mod tests {
             target_owner: format!("target-{i}"),
             resource: format!("res-{}", i % 5),
             route: "direct",
+            purpose: "gate",
             outcome,
         }
     }
@@ -348,6 +361,7 @@ mod tests {
             first.resource,
             NO_AGENT,
             first.route,
+            first.purpose,
             first.outcome.as_str(),
         );
         assert_eq!(store.get(&key).copied(), Some(2 + 5));
@@ -364,6 +378,7 @@ mod tests {
             target_owner: "acme".to_string(),
             resource: "graphql".to_string(),
             route: "direct",
+            purpose: "gate",
             outcome: CallOutcome::Ok,
         }
     }
@@ -398,9 +413,9 @@ mod tests {
             .find(|p| p.labels["caller"] == "issue.view")
             .unwrap();
         assert_eq!(agent(own), NO_AGENT);
-        assert!(points.iter().all(|p| p.labels.len() == 11), "{points:?}");
+        assert!(points.iter().all(|p| p.labels.len() == 12), "{points:?}");
         // The export boundary applies `bounded_points()` (sink and OTLP
-        // mapping); all eleven labels must survive it, not just the raw drain.
+        // mapping); all twelve labels must survive it, not just the raw drain.
         let bounded = crate::telemetry::ops::MetricPointsRecord {
             captured_at: chrono::Utc::now(),
             interval_start: None,

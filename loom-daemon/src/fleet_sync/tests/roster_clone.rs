@@ -749,3 +749,118 @@ fn userinfo_in_a_refused_remote_is_redacted() {
     assert!(!detail.contains("sekrit"), "{detail}");
     assert!(detail.contains("https://***@example.com/a/x.git"), "{detail}");
 }
+
+// ---- roster.change events (#12322) ----
+
+fn actions(pass: &RosterPass) -> Vec<(&'static str, String)> {
+    pass.changes
+        .iter()
+        .map(|e| (e.action.as_str(), e.name.clone()))
+        .collect()
+}
+
+#[test]
+fn every_applied_change_and_every_uncloned_repo_yields_one_event() {
+    let root = tempfile::tempdir().unwrap();
+    let p = |n: &str| root.path().join(n);
+    let plan = plan(vec![
+        Change::Add {
+            name: "new".into(),
+            path: p("new"),
+            weight: 5,
+            maintain_only: true,
+        },
+        Change::SetWeight {
+            name: "heavy".into(),
+            path: p("heavy"),
+            from: 1,
+            to: 3,
+        },
+        Change::SetMaintainOnly {
+            name: "calm".into(),
+            path: p("calm"),
+            to: true,
+        },
+        Change::Remove {
+            name: "gone".into(),
+            path: p("gone"),
+            reason: "fleet: false".into(),
+        },
+        missing(root.path(), "absent", Some(&gh("absent"))),
+    ]);
+    let (pass, _) = run(&plan, true, &Clones::off());
+    assert_eq!(
+        actions(&pass),
+        vec![
+            ("register", "new".to_string()),
+            ("set-weight", "heavy".to_string()),
+            ("set-maintain-only", "calm".to_string()),
+            ("remove", "gone".to_string()),
+            ("skip:not-cloned", "absent".to_string()),
+        ]
+    );
+    let e = &pass.changes;
+    assert_eq!((e[0].to_weight, e[0].maintain_only), (Some(5), Some(true)));
+    assert_eq!((e[1].from_weight, e[1].to_weight), (Some(1), Some(3)));
+    assert_eq!(e[2].maintain_only, Some(true));
+    assert_eq!(e[4].remote.as_deref(), Some(gh("absent").as_str()));
+}
+
+#[test]
+fn a_pass_with_no_changes_and_a_dry_run_emit_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let (pass, _) = run(&plan(vec![]), true, &Clones::off());
+    assert!(pass.changes.is_empty());
+    let dry = plan(vec![missing(root.path(), "absent", Some(&gh("absent")))]);
+    let (pass, _) = run(&dry, false, &Clones::off());
+    assert!(pass.changes.is_empty(), "autoApply off applies and skips nothing");
+}
+
+#[test]
+fn a_failed_apply_emits_no_change_event() {
+    let root = tempfile::tempdir().unwrap();
+    let plan = plan(vec![Change::SetWeight {
+        name: "heavy".into(),
+        path: root.path().join("heavy"),
+        from: 1,
+        to: 3,
+    }]);
+    let pass = summarize(&plan, true, &Clones::off(), &mut |_| anyhow::bail!("registry locked"));
+    assert!(pass.changes.is_empty());
+    assert_eq!(pass.unapplied, 1);
+}
+
+#[test]
+fn a_cloned_repo_registers_and_an_uncloned_one_skips_when_cloning_is_on() {
+    let root = tempfile::tempdir().unwrap();
+    let fake = Fake::new(Behaviour::Clone);
+    let fresh = plan(vec![missing(root.path(), "fresh", Some(&gh("fresh")))]);
+    let (pass, _) = run(&fresh, true, &on(&fake, 5));
+    assert_eq!(actions(&pass), vec![("register", "fresh".to_string())]);
+
+    let root = tempfile::tempdir().unwrap();
+    let fake = Fake::new(Behaviour::FailPartial);
+    let broken = plan(vec![missing(root.path(), "broken", Some(&gh("broken")))]);
+    let (pass, _) = run(&broken, true, &on(&fake, 5));
+    assert_eq!(actions(&pass), vec![("skip:not-cloned", "broken".to_string())]);
+}
+
+#[test]
+fn the_record_carries_host_weights_provenance_and_no_path() {
+    let root = tempfile::tempdir().unwrap();
+    let plan = plan(vec![Change::SetWeight {
+        name: "heavy".into(),
+        path: root.path().join("heavy"),
+        from: 1,
+        to: 3,
+    }]);
+    let (pass, _) = run(&plan, true, &Clones::off());
+    let at = Utc::now();
+    let r = pass.changes[0].record("host-1", at, &|_, _| (None, RepoVisibility::Private));
+    assert_eq!((r.host.as_str(), r.from_weight, r.to_weight), ("host-1", Some(1), Some(3)));
+    assert_eq!(r.visibility, RepoVisibility::Private);
+    assert!(r.repo.is_none(), "an unresolved repo is omitted, not guessed");
+    assert!(r.has_provenance());
+    let body = serde_json::to_string(&r).unwrap();
+    assert!(!body.contains(root.path().to_str().unwrap()), "no absolute path: {body}");
+}

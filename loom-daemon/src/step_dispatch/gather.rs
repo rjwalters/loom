@@ -7,13 +7,13 @@
 //! [`DrawInput`]s. The forge half ([`gather`]) reads them, each read
 //! bounded:
 //!
-//! - **the items**: [`super::listing::list_all_open`] (mirror, else the
-//!   shared ETag walk);
-//! - **the PRs' head and author**: the open-PR listing
-//!   (`forge_pull_listing`, ETag-cached, a Gate read; its last good copy
-//!   stands in on a failure, #12074), so the Builder branch links as it
-//!   does in the open-PR guard. When it cannot be read, a PR row links by its
-//!   body alone;
+//! - **the items, and the PRs' head and author**: the tick's one discovery
+//!   snapshot ([`crate::discovery`], #12306); the gather lists nothing itself.
+//!   The Direct backend lists per repo ([`super::listing::list_all_open`]
+//!   and the ETag-cached open-PR listing), the Mirror backend reads one
+//!   worklist for every repo. The last good copy of either stands in on a
+//!   failure (#12074), so the Builder branch links as it does in the open-PR
+//!   guard. When the PRs cannot be read, a PR row links by its body alone;
 //! - **hold markers** on `loom:blocked` PRs: their trusted comments, cached
 //!   per `(repo, PR, updated_at)`, at most [`MAX_MARKER_READS`] per tick;
 //! - **landed** `loom:issue` items: the landed pre-filter's batched,
@@ -45,6 +45,7 @@ use chrono::{DateTime, Utc};
 
 use super::item_draw::DrawInput;
 use super::stage_entry::{GhEventsReader, StageEntry, StageEntryProvider};
+use crate::discovery::{Target, TickSnapshot};
 use crate::forge_listing::RestIssue;
 use crate::forge_pull_listing::RestPull;
 use crate::step_role::StepRole;
@@ -116,15 +117,15 @@ fn last_good() -> &'static Mutex<LastGood> {
 /// The listing, or on its failure the last good one while it is fresh.
 fn listing_or_last_good(
     slug: &str,
-    listing: anyhow::Result<super::listing::OpenItems>,
+    listing: anyhow::Result<Vec<RestIssue>>,
 ) -> anyhow::Result<(Vec<RestIssue>, bool)> {
     let mut cache = last_good()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match listing {
-        Ok(items) => {
-            cache.insert(slug.to_string(), (Instant::now(), items.rows.clone()));
-            Ok((items.rows, false))
+        Ok(rows) => {
+            cache.insert(slug.to_string(), (Instant::now(), rows.clone()));
+            Ok((rows, false))
         }
         Err(e) => match cache.get(slug) {
             Some((at, rows)) if at.elapsed() < LAST_GOOD_TTL => {
@@ -379,6 +380,8 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    // #12310: the hold-marker comment reads are discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     for row in rows
         .iter()
         .filter(|r| r.is_pull_request && crate::work_finder::is_blocked_hold(&r.labels))
@@ -424,12 +427,14 @@ fn pull_markers(slug: &str, root: &Path, rows: &[RestIssue]) -> HashMap<u32, Pul
 pub fn gather(
     root: &Path,
     registry: &Arc<Mutex<SweepRegistry>>,
+    snapshot: &TickSnapshot,
     main_red: impl FnOnce(Vec<crate::work_finder::WorkItem>) -> bool,
     held_capabilities: &BTreeSet<String>,
     provider: &mut StageEntryProvider,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<Gathered>> {
-    Ok(list(root, registry, main_red, held_capabilities)?.map(|l| finish(l, root, provider, now)))
+    Ok(list(root, registry, snapshot, main_red, held_capabilities)?
+        .map(|l| finish(l, root, provider, now)))
 }
 
 /// One workspace's forge half of [`gather`] (#12256): the listings, the
@@ -452,6 +457,7 @@ pub struct Listed {
 pub fn list(
     root: &Path,
     registry: &Arc<Mutex<SweepRegistry>>,
+    snapshot: &TickSnapshot,
     main_red: impl FnOnce(Vec<crate::work_finder::WorkItem>) -> bool,
     held_capabilities: &BTreeSet<String>,
 ) -> anyhow::Result<Option<Listed>> {
@@ -462,18 +468,28 @@ pub fn list(
     let Some((gh_bin, root_dir, slug)) = target else {
         return Ok(None);
     };
+    // The tick's one snapshot is the only place the items come from (#12306).
+    // #12310: the open-PR listing is discovery.
+    let repo_snapshot = {
+        let _discovery = crate::gh_invocation::purpose::discovery();
+        snapshot.repo(&Target {
+            slug: slug.clone(),
+            gh_bin: gh_bin.clone(),
+            root_dir: root_dir.clone(),
+        })
+    };
     let (rows, stale_listing) = listing_or_last_good(
         &slug,
-        super::listing::list_all_open(&gh_bin, Some(&root_dir), Some(&slug)),
+        repo_snapshot
+            .as_ref()
+            .map(|r| r.rows.clone())
+            .map_err(|e| anyhow::anyhow!("{e:#}")),
     )?;
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
-    let pull_listing = crate::forge_pull_listing::list_open_pulls_cached_as(
-        super::listing::CALLER,
-        &gh_bin,
-        Some(&root_dir),
-        Some(&slug),
-        PULL_PAGES,
-    );
+    let pull_listing = repo_snapshot
+        .ok()
+        .and_then(|r| r.pulls.clone())
+        .ok_or_else(|| anyhow::anyhow!("open-PR listing unavailable"));
     let (pulls, pulls_complete) = pulls_or_last_good(&slug, pull_listing);
     let full: HashMap<u32, RestPull> = pulls.into_iter().map(|p| (p.number, p)).collect();
     let markers = pull_markers(&slug, root, &rows);

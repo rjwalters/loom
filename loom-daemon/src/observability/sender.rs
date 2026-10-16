@@ -337,6 +337,8 @@ mod tests {
                 exporters: Vec::new(),
                 otlp_export: None,
                 memory: None,
+                agent_scopes: Vec::new(),
+                agent_scopes_total: None,
             }),
         );
         // `TelemetryEnvelope::new` stamps `emitted_at` with `Utc::now()`; pin it
