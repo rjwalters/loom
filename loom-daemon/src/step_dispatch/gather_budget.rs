@@ -107,10 +107,37 @@ pub fn spawn_concurrency_from(effective: &serde_json::Value) -> usize {
         })
 }
 
-/// The gather concurrency for the daemon rooted at `root`, read live.
+/// The gather concurrency for the daemon rooted at `root`, read live. Only
+/// the Direct backend lists per repo, so only it takes
+/// `autonomous.workFinder.gatherConcurrency` (#12307).
 #[must_use]
 pub fn gather_concurrency(root: &std::path::Path) -> usize {
-    gather_concurrency_from(&crate::config_resolver::resolve_effective_config(root))
+    gather_concurrency_for(&crate::config_resolver::resolve_effective_config(root))
+}
+
+/// [`gather_concurrency`] for an effective config. On the mirror's worklist
+/// the gather reads one in-memory snapshot, so the key has nothing to
+/// bound: it is ignored (the gather is serial) and, when set, a warning says
+/// so once.
+#[must_use]
+pub fn gather_concurrency_for(effective: &serde_json::Value) -> usize {
+    if crate::discovery::Chain::from_effective(effective).backend()
+        != crate::discovery::BackendKind::Mirror
+    {
+        return gather_concurrency_from(effective);
+    }
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let set =
+        crate::config_resolver::get_path(effective, "autonomous.workFinder.gatherConcurrency")
+            .is_some_and(|v| !v.is_null());
+    if set && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::warn!(
+            "autonomous.workFinder.gatherConcurrency is ignored while forge.mirror.discovery = \
+             \"worklist\": the gather reads the tick's one snapshot, not one listing per repo \
+             (#12307)"
+        );
+    }
+    1
 }
 
 /// The spawn concurrency for the daemon rooted at `root`, read live

@@ -151,6 +151,11 @@ async fn run_collector(
     // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
     let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
     ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Host status gauges (#12112): a fast fixed-interval sample, OTLP-only.
+    let mut host_status = crate::host_status::HostStatusSampler::default();
+    let host_status_started = Instant::now();
+    let mut host_status_timer = tokio::time::interval(host_status.interval());
+    host_status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // First-boot backfill (Issue #5084): run once immediately, before the
     // first snapshot tick, so a sweep adopted across a daemon restart does
     // not wait a full `snapshot_interval` (5 minutes) for its terminal
@@ -189,6 +194,23 @@ async fn run_collector(
             _ = identity_timer.tick() => {
                 identities.sample(queue.as_ref(), &host_id, &workspace_pool, &mut slug_cache)
                     .await;
+            }
+
+            _ = host_status_timer.tick() => {
+                // Inert without an OTLP exporter: no reads, no record.
+                if super::ops::global_ops_sink().is_some() {
+                    let root = workspace_root.clone();
+                    if let Ok(readings) =
+                        tokio::task::spawn_blocking(move || crate::host_status::read_os(&root)).await
+                    {
+                        let record =
+                            host_status.step(&readings, host_status_started.elapsed().as_secs_f64());
+                        queue.offer(TelemetryEnvelope::new(
+                            &host_id,
+                            TelemetryRecord::HostStatus(record),
+                        ));
+                    }
+                }
             }
 
             _ = ratelimit_timer.tick() => {

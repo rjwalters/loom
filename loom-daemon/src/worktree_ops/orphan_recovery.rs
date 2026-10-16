@@ -393,7 +393,25 @@ pub fn check_untracked_building(
             };
 
         if threshold_seconds > 0.0 {
-            let label_age = gh::building_label_age_seconds(repo_root, issue_num);
+            let label_age = match gh::building_label_age(repo_root, issue_num) {
+                gh::LabelAge::Known(age) => Some(age),
+                // Unchanged: no claim event read as "past the grace period".
+                gh::LabelAge::NoEvent => None,
+                gh::LabelAge::Unknown => {
+                    // #12389: the label-age read was shed or failed. "No
+                    // answer" must not read as "past the grace period": a
+                    // claim made a minute ago has no PR or lease yet, so the
+                    // later gates would pass it. Skip the issue this pass.
+                    result.watched.push(WatchedEntry {
+                        issue: issue_num,
+                        title: Some(issue_title.clone()),
+                        reason: "label_age_unverifiable",
+                        age_seconds: None,
+                        threshold_seconds,
+                    });
+                    continue;
+                }
+            };
             if let Some(age) = label_age {
                 if (age as f64) < threshold_seconds {
                     result.watched.push(WatchedEntry {
@@ -622,14 +640,24 @@ pub fn recover_issue(
     label_grace_period_secs: i64,
 ) {
     if label_grace_period_secs > 0 {
-        if let Some(age) = gh::building_label_age_seconds(repo_root, issue) {
-            if age < label_grace_period_secs {
+        match gh::building_label_age(repo_root, issue) {
+            gh::LabelAge::Known(age) if age < label_grace_period_secs => {
                 eprintln!(
                     "Skipping recovery for issue #{issue}: loom:building label applied {age}s ago \
                      (grace period: {label_grace_period_secs}s)"
                 );
                 return;
             }
+            gh::LabelAge::Unknown => {
+                // #12389: a shed or failed label-age read is no answer;
+                // never delete a worktree or flip the label on it.
+                eprintln!(
+                    "Skipping recovery for issue #{issue}: the loom:building label age could not \
+                     be read (shed or failed); retrying next pass"
+                );
+                return;
+            }
+            gh::LabelAge::Known(_) | gh::LabelAge::NoEvent => {}
         }
     }
 

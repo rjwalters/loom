@@ -206,7 +206,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 |---|---|---|
 | [`sweep.outcome`](#sweepoutcome) | log, native + OTLP | `sweep_registry/outcome_journal.rs`, `observability/collector.rs`, `sweep_registry/prless_retry/durable.rs`, `observability/backfill.rs` |
 | [`sweep.started`](#sweepstarted) / [`sweep.phase`](#sweepphase) / [`sweep.completed`](#sweepcompleted) / [`sweep.identity`](#sweepidentity) | log, native + OTLP | `observability/collector.rs` (+ `collector/identity.rs`), `observability/queue.rs`, `observability/shutdown.rs`, `observability/backfill.rs`; `sweep.started` carries the dispatch facts (`model`, `effort`, `effort_source`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id`, #11280; `dispatch_origin`, #11444) from `sweep_registry/start_facts.rs` |
-| Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation). A role tick's `loom.role_attempt` root also carries `loom.role_draw.pick`, `.attempt`, `.table_attempt`, `.layer` and optional `.model` when a `roleDraw` table decided the tick (`observability/lifecycle/role_draw.rs`, [role-draw.md](role-draw.md)) |
+| Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation). A role tick's `loom.role_attempt` root also carries `loom.role_draw.pick`, `.attempt`, `.table_attempt`, `.layer` and optional `.model` when a `roleDraw` table decided the tick (`observability/lifecycle/role_draw.rs`, [role-draw.md](role-draw.md)); it also carries `loom.runtime`, `loom.engine` and, for a session-container run, `loom.session.container` and `loom.session.image_digest` (`observability/lifecycle/role_runtime.rs`, [observability.md](observability.md)) |
 | [`pick.decision`](#pickdecision) | log, OTLP only | `observability/pick_decision.rs` (from `role_tick_telemetry.rs` and `work_finder/tick_summary.rs`) |
 | [`queue.snapshot`](#queuesnapshot) (whole ready queue per tick) | native only | `observability/queue_snapshot.rs` |
 | `loom.queue.issues`, `loom.queue.listing_failed_repos`, `loom.queue.listing_incomplete_repos` ([`metric.points`](#metricpoints)) | metric | `observability/ops/queue.rs` |
@@ -214,6 +214,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
+| [`host.status`](#hoststatus) | gauges, OTLP only | `host_status.rs` (sampler), `observability/collector.rs`, `observability/otlp/mapping/host_status.rs` |
 | [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` Deny branch) |
@@ -2845,7 +2846,7 @@ three non-ETA sources:
 | Source | Rows | Notes |
 |---|---|---|
 | Sweep registries | the sweeps this host runs (`host`, `slot` set) | stage from the sweep's own checkpoint marker: none → `sweep.curator` (entered at dispatch), `curator-done` → `sweep.builder`, `builder-done` / `doctor-done` → `review_wait`, `judge-rejected` → `doctor`, `judge-done` / `merge-done` → `merge_wait`; `entered_at` is the marker's `timestamp` |
-| Review-label listings | open PRs under `loom:review-requested` / `loom:changes-requested` / `loom:pr` (or `loom:treating` alone), plus the per-repo census | ETag-cached REST listings, each walked to its last page (an unchanged page is a free `304`). A walk that fails, reads 10 full pages (more than 1000 PRs under one label) or sees the listing shift mid-walk is a **failed** listing, never a partial one. A row is keyed by the issue the PR body links (a closing keyword first, else `Part of`); a PR linking no issue is in the census only; two PRs for one issue keep the lower PR number. An approved PR under a registry `merge_hold` label is `merge_hold` |
+| Review-label listings | open PRs under `loom:review-requested` / `loom:changes-requested` / `loom:pr` (or `loom:treating` alone), plus the per-repo census | ETag-cached REST listings, each walked to its last page (an unchanged page is a free `304`). A walk that fails, reads 10 full pages (more than 1000 PRs under one label) or sees the listing shift mid-walk is a **failed** listing, never a partial one. A row is keyed by the issue the PR body links (a closing keyword first, else `Part of`); a PR linking no issue is in the census only; two PRs for one issue keep the lower PR number. An approved PR under a registry `merge_hold` label is `merge_hold`; that set includes `loom:blocked` (#11907), so `loom:pr` + `loom:blocked` (a Champion merge hold or any other park) is `merge_hold`, not `merge_wait`. A `loom:blocked` PR without `loom:pr` is not |
 | Work finder's last tick | `ready_wait` for every ready-queue row the planner saw on that tick that is not running here | the same tick the `queue.snapshot` producer reads; each row carries this host's planner `rank` and the planner's inputs. Nothing re-ranks. The work finder walks each repo's `loom:issue` and starred listings to the last page (#11139). A repo whose walk finished is `ready_complete`; a repo whose walk fell short (a later page failed, the page cap, a mid-walk change; the tick's `listing_incomplete`) is not, and its ready rows go out whole with `ready_replace` |
 
 When sources overlap on one `(repo, issue)`, the held row wins, then the PR
@@ -3549,6 +3550,46 @@ like `worktree_root_free_gb`. The same fields ride **span-boundary trace
 attributes** (`loom.host.*`) on role attempts — see
 [tracing.md](tracing.md) — so the state is captured at the decision moment,
 not only on each 30 s sampling cadence.
+
+### `host.status`
+
+A fixed-interval sample of this host's CPU, memory, disk and network, raw and
+EWMA-filtered (Issue #12112, slice a of #11809). One record per 5 s from the
+collector, **only when an OTLP exporter started** (otherwise no reads and no
+record). Envelopes carry `schema_version: 12`. **OTLP-only** (native: `false`),
+exported as gauges. Nothing consumes it yet; role-span attributes, admission and
+GPU are later slices.
+
+The signal table lives in code (`telemetry/kinds/host_status.rs`, `SIGNALS`) and
+is the one source for both the record and the gauge names. `system.*` semconv
+names are used where the semantics match; `loom.host.*` otherwise. A filtered
+series states its time constant in its name (`..._ewma_30s`), so the constants
+are fixed rather than per-host overrides.
+
+| Signal | Raw gauge | Filtered gauge (EWMA tau) |
+|---|---|---|
+| CPU utilisation (0..1) | `system.cpu.utilization` | `loom.host.cpu_utilisation_ewma_30s` |
+| Load per core | `loom.host.cpu_load_per_core` | `loom.host.cpu_load_per_core_ewma_30s` |
+| Memory used | `system.memory.usage` (`state=used`) | `loom.host.mem_used_bytes_ewma_30s` |
+| Memory available | `loom.host.mem_available_bytes` (from `host.health`) | `loom.host.mem_available_bytes_ewma_30s` |
+| Memory pressure grade (0/1/2) | `loom.host.mem_pressure_grade` | `loom.host.mem_pressure_grade_ewma_30s` |
+| Swap used | `system.paging.usage` (`state=used`) | `loom.host.swap_used_bytes_ewma_60s` |
+| Disk I/O busy (busiest whole disk) | `loom.host.disk_io_busy` | `loom.host.disk_io_busy_ewma_30s` |
+| Disk read / write throughput | `loom.host.disk_{read,write}_bytes_per_sec` | `..._ewma_30s` |
+| Network rx / tx throughput | `loom.host.net_{rx,tx}_bytes_per_sec` | `..._ewma_30s` |
+| Volume free bytes (`volume=worktree_root`) | `system.filesystem.usage` (`state=free`) | `loom.host.disk_free_bytes_ewma_300s` |
+| Volume fill rate | `loom.host.disk_fill_rate_bytes_per_sec` | `..._ewma_300s` |
+| Volume time to full | `loom.host.disk_time_to_full_seconds` | `..._ewma_300s` (from the filtered free and rate) |
+
+**Absent is never zero.** A reading that failed, a counter that went backwards
+(reboot or reset) and the first tick of any rate have no data point, and the
+filter keeps its state instead of taking a fake zero. A volume that is not
+filling has no fill rate above zero and no time-to-full. A filter that has gone
+unread for more than five time constants re-seeds. Linux reads every signal;
+macOS reads load, memory pressure, swap and volume space, and leaves CPU
+utilisation, disk I/O and network absent (no cheap non-blocking source). The
+`volume` label is a closed value, never a path, and is on the collector's
+datapoint allowlist.
 
 ### `host.export`
 

@@ -439,6 +439,9 @@ impl StepDriver {
             },
         );
         let listing_ms = millis(listing_started.elapsed());
+        // The other listing readers (blocked queue, quarantine and claim
+        // reconciliation) read this tick's repos instead of listing (#12307).
+        crate::discovery::published::publish(&snapshot);
         // Pass 3, serial and in walk order: stage entry, weighing, shaping.
         let filter_started = Instant::now();
         let mut jobs: Vec<Option<GatherJob>> = jobs.into_iter().map(Some).collect();

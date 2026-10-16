@@ -221,6 +221,27 @@ fn gather_concurrency_reads_a_bounded_positive_integer() {
     }
 }
 
+/// #12307: only the Direct backend lists per repo, so only it takes the key.
+#[test]
+fn the_mirror_worklist_ignores_gather_concurrency() {
+    use serde_json::json;
+    let mirror = |discovery: &str| {
+        json!({
+            "forge": { "mirror": {
+                "origin": "https://events.example.com",
+                "keyRef": "file:/k",
+                "discovery": discovery
+            } },
+            "autonomous": { "workFinder": { "gatherConcurrency": 12 } }
+        })
+    };
+    assert_eq!(gather_concurrency_for(&mirror("worklist")), 1);
+    assert_eq!(gather_concurrency_for(&mirror("direct")), 12);
+    assert_eq!(gather_concurrency_for(&mirror("per_call")), 12);
+    let standalone = json!({ "autonomous": { "workFinder": { "gatherConcurrency": 3 } } });
+    assert_eq!(gather_concurrency_for(&standalone), 3);
+}
+
 #[test]
 fn spawn_concurrency_reads_a_bounded_positive_integer() {
     use serde_json::json;
