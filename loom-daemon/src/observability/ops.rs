@@ -37,7 +37,8 @@
 //! request kind on its own ticker. [`build_gate`] (#11690) one
 //! `build_gate.run` span per host-side run of `buildGate.command`. [`feed`]
 //! (#12152) counts the narration sink's public-feed completions by trigger
-//! and its merge-reconciliation passes by outcome. A new emitter adds a `MetricName`/`SpanName`
+//! and its merge-reconciliation passes by outcome. [`reaper`] (#12461) one
+//! `reaper.pass` span per worktree-reaper pass. A new emitter adds a `MetricName`/`SpanName`
 //! variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
@@ -67,6 +68,7 @@ pub mod ratelimit;
 pub mod read_shed;
 pub mod reader_spill;
 pub mod reader_withdrawal;
+pub mod reaper;
 pub mod redate_chain;
 pub mod scope_memory;
 pub mod stage_entry;
