@@ -24,6 +24,7 @@ fn tick(result: RoleTickResult) -> RoleTickTelemetry {
         preference_tier: None,
         preference_tap: None,
         role_draw: None,
+        prompt: None,
         step_sweep_id: None,
         deferred_by: None,
         shard_owner: None,
