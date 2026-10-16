@@ -61,6 +61,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // 2am#4367 P4: `loom.forge.calls`' route (gateway | direct_read |
     // direct | none), a closed vocabulary.
     "route",
+    // #12310: `loom.forge.calls`' purpose (discovery | gate | write |
+    // hygiene | observability | unknown), a closed vocabulary.
+    "purpose",
     // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
     // engine's per-role slots beside the sweep total.
     "pool",
@@ -105,8 +108,22 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.phase.spawn_ms",
     "loom.dispatch.spawn_attempts",
     "loom.dispatch.gather_concurrency",
+    // #12306: the tick's discovery snapshot (`ops::dispatch_facts`).
+    "loom.discovery.backend",
+    "loom.discovery.repos",
+    "loom.discovery.items",
+    "loom.discovery.forge_reads",
+    "loom.discovery.worklist_latency_ms",
+    "loom.discovery.not_modified",
+    "loom.discovery.reused_previous",
+    "loom.discovery.stale_repos",
+    "loom.discovery.oldest_watermark_age_secs",
     // #12298: the spawn half's concurrency and its sub-phases.
     "loom.dispatch.spawn_concurrency",
+    // #12310: what a `invoke github` span was for, and why a discovery read
+    // fell back (`reserve`: the gateway refused it below its quota reserve).
+    "loom.forge.purpose",
+    "loom.discovery.fallback_reason",
     "loom.dispatch.spawn_hold",
     "loom.dispatch.phase.spawn_resolve_ms",
     "loom.dispatch.phase.spawn_claim_ms",
@@ -145,6 +162,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.draw_attempt",
     "loom.step.age_source",
     "loom.step.resumed",
+    // `loom.dispatch.step` claim facts (Issue #12183).
+    "loom.dispatch.claim_outcome",
+    "loom.dispatch.claim_exit_code",
+    "loom.dispatch.claim_ms",
+    "loom.dispatch.claim_stderr_tail",
     // `loom.dispatch.disposition` spans (Issue #9222).
     "loom.queue.disposition",
     "loom.queue.state",
@@ -237,9 +259,9 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
 
 /// Longest label value kept, in bytes.
 pub const MAX_LABEL_VALUE_BYTES: usize = 128;
-/// Most labels kept on one point (`loom.forge.calls` carries eleven: #10607's
-/// ten plus 2am#4367's `route`).
-pub const MAX_LABELS_PER_POINT: usize = 11;
+/// Most labels kept on one point (`loom.forge.calls` carries twelve: #10607's
+/// ten, 2am#4367's `route` and #12310's `purpose`).
+pub const MAX_LABELS_PER_POINT: usize = 12;
 /// Most points kept in one record.
 pub const MAX_POINTS_PER_RECORD: usize = 256;
 
@@ -570,6 +592,11 @@ pub enum MetricName {
     /// rate-limit breaker cools, `failed` when the forge read failed), #12152.
     #[serde(rename = "loom.feed.reconcile_passes")]
     FeedReconcilePasses,
+    /// Workflow runs sitting `queued` for a runner in a repo's CI poll window
+    /// at the end of a poll, by `repo` (#11993). A gauge: fleet CI contention
+    /// at that instant, the complement of the per-run `loom.ci.queued_ms`.
+    #[serde(rename = "loom.ci.queue_depth")]
+    CiQueueDepth,
 }
 
 impl MetricName {
@@ -655,6 +682,7 @@ impl MetricName {
             Self::StageEntryLookups => "loom.stage_entry.lookups",
             Self::FeedCompletions => "loom.feed.completions",
             Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
+            Self::CiQueueDepth => "loom.ci.queue_depth",
         }
     }
 
@@ -763,6 +791,7 @@ impl MetricName {
             Self::StageEntryLookups => "{lookup}",
             Self::FeedCompletions => "{completion}",
             Self::FeedReconcilePasses => "{pass}",
+            Self::CiQueueDepth => "{run}",
             Self::AgentScopeOomKills => "{kill}",
             _ => "By",
         }
@@ -902,6 +931,9 @@ impl MetricName {
             }
             Self::FeedReconcilePasses => {
                 "Merge-reconciliation passes of the narration sink, by outcome."
+            }
+            Self::CiQueueDepth => {
+                "Workflow runs queued for a runner in the CI poll window at the end of a poll, by repo."
             }
         }
     }

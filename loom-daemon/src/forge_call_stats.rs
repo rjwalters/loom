@@ -405,6 +405,8 @@ pub fn classify(response: Option<&HttpResponse>, exit_ok: bool, stderr: &str) ->
     let outcome = match status {
         Some(304) => Outcome::NotModified,
         Some(200..=299) if exit_ok => Outcome::Ok,
+        // #12310: a gateway reserve refusal is a `429` that is not a limit.
+        _ if crate::gh_invocation::purpose::is_reserve_refusal(stderr) => Outcome::Error,
         _ if is_secondary_limit(response, stderr) => Outcome::SecondaryLimited,
         _ if crate::rate_limit_breaker::indicates_rate_limit(stderr) => Outcome::RateLimited,
         Some(429) => Outcome::RateLimited,

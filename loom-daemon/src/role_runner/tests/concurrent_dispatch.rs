@@ -972,13 +972,16 @@ fn fairness_a_real_run_does_not_resume_and_a_new_tick_replaces_pending() {
     let _enter = rt.enter();
     let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
     let (a, b) = (workspace(cfg), workspace(cfg));
-    let factory: RunnerFactory = Arc::new(|_| {
-        Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
-    });
+    // Hold `a`'s run so its slot is still taken while the walk decides `b`;
+    // an instant run could free the slot first and admit `b` too.
+    let gate = Gate::default();
+    let factory = gated_factory(vec![a.path().to_path_buf()], gate.clone());
     let mut d = dispatcher("judge", factory, admit_only("judge"));
     let in_progress = new_in_progress_guard();
     let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
-    assert_eq!(d.dispatch_tick(roots.clone(), &in_progress).deferred, 1);
+    let first = d.dispatch_tick(roots.clone(), &in_progress);
+    gate.open();
+    assert_eq!(first.deferred, 1);
     let joined = join_one(&rt, &mut d);
     d.handle_joined(joined);
     assert!(!d.resume_due(), "a Success run spent an agent — no resume");

@@ -24,6 +24,8 @@ use std::path::Path;
 /// The REST listing failed; the message carries the `gh` stderr tail so the
 /// rate-limit classifier sees it unchanged.
 pub(super) fn list_blocked(gh_bin: &Path, root: &Path) -> Result<Vec<(u32, Option<String>)>> {
+    // #12310: the blocked-issue listing is discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     let rows = crate::forge_listing::list_issues_cached_as(
         "quarantine_reconciliation",
         gh_bin,
