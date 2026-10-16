@@ -1688,10 +1688,8 @@ on a live host is the daemon's own sync, below
 Every other sub-verb above only reads the store. `propose` is the one place
 `fleet-config` writes to it — and it never writes directly: each sub-verb
 edits `fleet.yml`, the store's one hand-edited source, in memory (#10905),
-then opens a **branch + PR** (never a direct push) carrying that change and
-the hidden `<!-- loom:provenance v1 … -->` marker every Loom-authored PR body
-carries (`loom-daemon/src/provenance`), with `base=` the store commit it
-branched from. Merges stay the operator's, per the store's own branch
+then opens a **branch + PR** (never a direct push) carrying that change, with
+`base=` the store commit it branched from. Merges stay the operator's, per the store's own branch
 policy — this command has no auto-merge path, and it never touches a repo's
 `fleet`/`firewall` flags. `--dry-run` prints the diff and stops before
 opening anything. A store without `fleet.yml` takes no proposal.
