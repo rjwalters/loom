@@ -109,7 +109,7 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 ### 5.1 Transport and identity
 
 - **HTTP/1.1 JSON over the tailnet.** The server binds the captain's tailnet address on a configurable port, with a hand-rolled listener in the style of `serve.rs` and the OTLP relay: identity checked before the body is read, a size cap, a connection cap, short head timeouts, strict parsing, never a panic on a malformed request. No new heavy dependency.
-- **Identity.** The server resolves the caller with the Tailscale LocalAPI `whois` (remote address → node), maps the node to a fleet `host_id` from the roster, and **refuses any node not in the roster with `403`**. The body's `host_id` must match the `whois` mapping, or the request is refused. Identity resolution sits behind a trait, so tests inject identities (section 11).
+- **Identity.** The server resolves the caller with the Tailscale LocalAPI `whois` (remote address → tailnet node), then maps the node to a fleet `host_id` through an **explicit node field on each dispatcher entry** in the fleet config (node name → `host_id`). It never assumes the node name equals the `host_id`; they diverge for operator machines and re-imaged hosts. A node not in that map is **refused with `403`**. The body's `host_id` must match the mapped one, or the request is refused. Identity resolution sits behind a trait, so tests inject identities (section 11).
 - **All endpoints are `POST`** with JSON bodies, and **every response carries `server_epoch`**, which changes on every restart, so a worker can tell its table entries were rebuilt.
 
 | Endpoint | Phase | Purpose |
@@ -141,12 +141,12 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 `{"host_id", "repo", "item", "step"}` → one of:
 
 - `{"granted": true, "assignment_id": "a-…", "ttl_s": 1200}`: run today's pre-claim and forge lease path, unchanged.
-- `{"granted": false, "reason": "held" | "grace" | "not_eligible" | "cap", "held_by": "<host id>"?, "retry_after_s": 60}`: a **free pass with zero forge calls**. The item leaves this tick's pool.
+- `{"granted": false, "reason": "held" | "grace" | "not_eligible" | "cap", "held_by": "<host id>"?, "retry_after_s": 60}`: for `held`, `not_eligible` and `cap`, a **free pass with zero forge calls**; the item leaves this tick's pool. `grace` is the exception (below).
 
 | Reason | Meaning |
 |---|---|
 | `held` | another live assignment holds the `(repo, item)`, or another host holds the repo's Champion merge step; `held_by` names the host when known |
-| `grace` | the server is in its start-up grace window (section 15.1) |
+| `grace` | the server is in its start-up grace window (section 15.1). The worker treats it as **fail-open for that one call**: it takes today's local forge-lease path for that claim. It does **not** count toward the fallback hysteresis (section 9), since it is expected after every roll. |
 | `not_eligible` | the host does not fit the item (section 7.2), or the role is not in its `roles_ok` |
 | `cap` | the host is at its cap (5.2) |
 
@@ -159,7 +159,7 @@ An assignment the host stops listing in `live` without a `refuse` or `release` (
 
 ### 5.5 Failures, from the worker's side
 
-Unreachable, a timeout (short, about 2 s) or a `5xx` is a **failure** and counts toward fallback (section 9). A `claim` refusal is an answer, never a failure. Nothing is retried within the tick.
+Unreachable, a timeout (short, about 2 s) or a `5xx` is a **failure** and counts toward fallback (section 9). A `claim` refusal is an answer, never a failure; a `grace` refusal sends that one claim down today's forge-lease path without counting as a failure. Nothing is retried within the tick.
 
 ### 5.6 `next` (Phase 2 proposal)
 
@@ -252,14 +252,15 @@ Workers keep their local copies of these for the fallback path, so a fallback ti
 
 The fallback must not need the per-host gather that Phase 3 retires. So the fallback is **the #12304 discovery chain at its capped backstop pace** (`discovery/fallback.rs`), which stays for standalone installs anyway, feeding today's local draw.
 
-1. **Enter on 3 consecutive failures** (section 5.5), not on one. A single failed call claims as today for that item, and the worker tries the captain again on the next one.
-2. **In fallback**, each tick:
+1. **A `grace` refusal is not a failure.** After a captain start, `grace` sends that one claim down today's local forge-lease path, and the hysteresis counter is untouched: a roll is routine and must not push hosts into fallback or stall dispatch for the window.
+2. **Enter on 3 consecutive failures** (section 5.5), not on one. A single failed call claims as today for that item, and the worker tries the captain again on the next one.
+3. **In fallback**, each tick:
    - discovers through the worker's own chain, at the backstop pace, not every tick;
    - runs the local draw with a **reduced budget**: one round (`spawn_concurrency` items at most) per tick and no free `claim_lost` allowance, so a captain blip does not restart an eight-way race at full rate;
    - honours its local ledgers and every forge gate, as today;
    - keeps sending heartbeats, which are its probes.
-3. **Leave** after **5 minutes of successful probes**, so a flapping captain does not flip modes every tick.
-4. **Alert** when the fleet's fallback share passes 5% of ticks over an hour. Fail-open is safe for correctness, which is exactly why it can hide a broken captain.
+4. **Leave** after **5 minutes of successful probes**, so a flapping captain does not flip modes every tick.
+5. **Alert** when the fleet's fallback share passes 5% of ticks over an hour. Fail-open is safe for correctness, which is exactly why it can hide a broken captain.
 
 The counts (3 failures, 5 min, one round) are constants, not knobs, until telemetry shows they are wrong.
 
@@ -300,7 +301,7 @@ The pre-check stays a **live** read of labels and state (invariant 3), never ser
 
 - **Tailnet only.** The listener binds the captain's tailnet address, never a wildcard (the `serve::validate_bind` rule).
 - **An access-policy grant.** The tailnet's access policy admits the fleet's dispatching hosts to the captain's port and nothing else, the same pattern the fleet already uses for its telemetry reader.
-- **Identity is `whois` plus the roster.** For each connection the captain asks its local tailnet daemon who the peer is (the Tailscale LocalAPI `whois` for the remote address; the captain process needs read access to the tailnet daemon's local socket). The node must map to a host id in the fleet config, and that id must equal the body's `host`. A tailnet node that is not a fleet host (a workstation, another machine on the tailnet) is refused `403` even if the policy lets it connect. Nothing in the daemon crate does this today (`git grep whois` finds nothing); it is new, small and local.
+- **Identity is `whois` plus an explicit roster map.** For each connection the captain asks its local tailnet daemon who the peer is (the Tailscale LocalAPI `whois` for the remote address; the captain process needs read access to the tailnet daemon's local socket). It maps the returned node to a `host_id` through the node field each dispatcher entry carries in the fleet config, and never by assuming node name == `host_id` (they diverge for operator machines and re-imaged hosts). A node not in the map is refused `403` even if the access policy lets it connect, and the mapped `host_id` must equal the body's. Nothing in the daemon crate does this today (`git grep whois` finds nothing); it is new, small and local.
 - **No new credential.** No token, key or JWT is issued for this. Nothing to rotate or leak. A compromised worker already holds a forge writer credential, so the captain adds no blast radius; server-side caps (5.2) and per-host fit (7.2) stop it from hoarding assignments.
 - **The captain holds no forge write.** It reads the mirror and, until #12317, the gather's reads. It never posts a label, comment or merge. Every bad assignment it could hand out still meets the worker's live pre-check and the forge lease.
 
@@ -407,7 +408,7 @@ The GitHub saving is #12304's (discovery) plus this design's (no writer calls on
 
 ### 15.1 Captain restart mid-assignment
 
-**Nothing is persisted.** On start the captain takes a new `server_epoch` and opens a **grace window**: 90 s by default, or until every roster host has heartbeated, whichever comes first. During it `claim` is refused with `grace` (and, in Phase 2, `next` returns nothing), while heartbeats and their `live` sets are accepted, so the table is rebuilt from the workers before anything is granted. A `grace` refusal is an answer, not a failure (section 5.5): a flagged host spends at most one window not claiming, rather than racing a captain that does not yet know what is live. In Phase 2 the captain also reads the worklist and builds the queue during the window.
+**Nothing is persisted.** On start the captain takes a new `server_epoch` and opens a **grace window**: 90 s by default, or until every roster host has heartbeated, whichever comes first. During it `claim` is answered `{"granted": false, "reason": "grace", "retry_after_s": …}` (and, in Phase 2, `next` returns nothing), while heartbeats and their `live` sets are accepted, so the table is rebuilt from the workers before anything is granted. The worker takes today's local forge-lease path for each `grace`-refused claim, without counting it toward fallback, so a captain roll is never a 90 s dispatch stall; during the window the forge lease settles races as it does today. In Phase 2 the captain also reads the worklist and builds the queue during the window.
 
 Grants outstanding at the crash are lost. Each was either claimed (the host's next `live` set puts it back in the table), refused, or never tried. A new grant of an item someone claimed in the gap ends in that host's pre-claim yielding. Persisting the table would add a second record that can disagree with the forge after a crash.
 
@@ -440,12 +441,10 @@ The worker's closed-issue read refuses it with `already_closed` (or `already_lan
 
 ### 17.2 Open questions for the operator
 
-1. **Grace window.** Phase 1 refuses claims for up to 90 s after a start, so flagged hosts idle briefly on every captain roll. Acceptable, or should a `grace` refusal let the worker claim as today?
-2. **Host identity mapping.** #12449 maps a `whois` node to a `host_id` from the `fleet.json` dispatchers. Should that be the node's name equal to the host id (no new field), or an explicit node field per dispatcher?
-3. **Runtime and toolchain fit.** Are host affinity markers enough for Phase 2, or should the host tier gain explicit runtime/toolchain fields?
-4. **Phase 3 threshold.** Is under 1% fallback ticks over 14 days the right gate?
-5. **Fallback constants.** 3 failures in, 5 minutes of successful probes out, one round per tick, a 5% fallback-share alert: acceptable as starting constants? And should a `403` (a misconfigured host) count as a failure, or only unreachable, timeout and `5xx` as the contract says?
-6. **Heartbeat consumers.** Does anything besides dispatch read the peer heartbeat (#8736), and does it need a replacement?
+1. **Runtime and toolchain fit.** Are host affinity markers enough for Phase 2, or should the host tier gain explicit runtime/toolchain fields?
+2. **Phase 3 threshold.** Is under 1% fallback ticks over 14 days the right gate?
+3. **Fallback constants.** 3 failures in, 5 minutes of successful probes out, one round per tick, a 5% fallback-share alert: acceptable as starting constants? And should a `403` (a misconfigured host) count as a failure, or only unreachable, timeout and `5xx` as the contract says?
+4. **Heartbeat consumers.** Does anything besides dispatch read the peer heartbeat (#8736), and does it need a replacement?
 
 ## 18. Review log
 
@@ -461,3 +460,5 @@ The worker's closed-issue read refuses it with `already_closed` (or `already_lan
 | 2026-10-16 | same | Auth: `whois` plus roster mapping plus an access-policy grant; no JWT. | §11. |
 | 2026-10-16 | same | Nits: stopgap versions; a fleet-spanning worklist key; #12311/#12319 as hostable library code. | §2, §10.1–10.2, §13.5, §14. |
 | 2026-10-16 | same | Minimal first slice: `fleet-dispatch serve`, two flagged workers, `claim` before the pre-claim, exit criteria. | §13.1 is that slice. |
+| 2026-10-16 | Phase 1 build session, by agreement | Open question: should a `grace` refusal stall the claim? | Settled: `grace` is fail-open for that one call (today's forge-lease path) and does not count toward hysteresis. §5.3, §5.5, §9, §15.1. |
+| 2026-10-16 | same | Open question: is the tailnet node name the `host_id`? | Settled: no. Each dispatcher entry carries an explicit node field; `whois` → node → `host_id`; unmapped nodes get `403`. §5.1, §11. |
