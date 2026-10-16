@@ -36,9 +36,11 @@ outcome vocabulary for each mode is the table in its section. Never invent one.
    ```bash
    PR_NUMBER=N
    PR_JSON=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER") || PR_JSON=""
-   NOT_TRIAGE=$(printf '%s\n' loom:pr loom:review-requested loom:changes-requested loom:sequenced external; loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen\n'; loom-daemon labels list --kind claim 2>/dev/null || printf 'loom:reviewing\nloom:treating\nloom:building\n')
+   NOT_TRIAGE=$(printf '%s\n' loom:pr loom:review-requested loom:changes-requested loom:sequenced; loom-daemon labels list --property hard_exclusion 2>/dev/null || printf 'external\n'; loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen\n'; loom-daemon labels list --kind claim 2>/dev/null || printf 'loom:reviewing\nloom:treating\nloom:building\n')
    TRIAGE=$(printf '%s' "$PR_JSON" | jq -r --arg skip "$NOT_TRIAGE" '($skip | split("\n")) as $s | select(.state == "open" and (.draft | not) and (([.labels[].name] - $s) == [.labels[].name])) | "yes"')
    echo "TRIAGE=${TRIAGE:-no}"
+   UNTRUSTED_FORK=$(printf '%s' "$PR_JSON" | jq -r '(.author_association // "NONE") as $a | select((.head.repo.full_name // "") != .base.repo.full_name and ((["OWNER","MEMBER","COLLABORATOR"] | index($a)) == null)) | "yes"')
+   echo "UNTRUSTED_FORK=${UNTRUSTED_FORK:-no}"
    EVALUATED_SHA=$(printf '%s' "$PR_JSON" | jq -r 'select(.state == "open" and any(.labels[]; .name == "loom:pr") and (any(.labels[]; .name | startswith("loom:operator")) | not)) | .head.sha // empty')
    PIN_FILE="$(git rev-parse --git-common-dir)/loom-champion-pin-pr-$PR_NUMBER"; rm -f "$PIN_FILE"
    [ -n "$EVALUATED_SHA" ] && printf '%s %s\n' "$EVALUATED_SHA" "$PPID" > "$PIN_FILE"
@@ -90,7 +92,16 @@ the next step, after a fresh evaluation.
 The step engine sends Champion an open, non-draft PR with no stage label and
 no hold (#12499): hand-opened, or a role stopped before labelling it. Look at
 it once and make **exactly one label transition**, so the PR flows through the
-normal state machine and never comes back here. Read the PR's body and
+normal state machine and never comes back here.
+
+**Outside contributions first.** `UNTRUSTED_FORK=yes` (step 1: the head is a
+fork, or a deleted one, **and** `author_association` is not `OWNER`, `MEMBER`
+or `COLLABORATOR`, `comment-trust.md`) is **always `triage-operator`, never
+`triaged`**: a maintainer decides whether an outside contribution enters the
+automated review-to-merge path. No label marks it (`external` is applied by
+humans), and nothing after triage checks the author, so this row is the guard.
+
+Otherwise, read the PR's body and
 branch, the issue it closes (`Closes #N`, `feature/issue-N`) and the other
 open PRs on that issue. Do not review the code: that is Judge's.
 
@@ -98,11 +109,12 @@ open PRs on that issue. Do not review the code: that is Judge's.
 |---|---|---|
 | `triaged` | **The normal case**: none of the rows below applies | `gh pr edit N --add-label loom:review-requested` |
 | `triage-blocked` | A **duplicate** of another open PR on the same issue, **superseded** (its change is already on the default branch, or a newer PR replaces it), or it **closes an issue that is already closed** | A comment naming the reason and the PR or issue it points at, then `loom-daemon park-record apply --pr N --by champion --reason "<duplicate of #M, superseded by #M, or closes #K, already closed>"` (it adds `loom:blocked`; a reason-only park, so the PR is not released back here when #M closes) |
-| `triage-operator` | It **needs a human decision** that an agent may not make ("Routing to a human" in `label-state-machine.md`), e.g. it carries a change no issue asks for and only the operator can rule on its scope | `loom-daemon operator-decision apply N --input d.json` (2-4 ranked options), or for a human-hands step a comment opening `Operator reason: <class> — <one line>`, then `gh pr edit N --add-label loom:operator` |
+| `triage-operator` | `UNTRUSTED_FORK=yes`, whatever else applies; or it **needs a human decision** that an agent may not make ("Routing to a human" in `label-state-machine.md`), e.g. it carries a change no issue asks for and only the operator can rule on its scope | A ruling: `loom-daemon operator-decision apply N --input d.json` (2-4 ranked options; for an outside contribution, admit it to review or close it), which adds `loom:operator` itself. Only a human-hands step: a comment opening `Operator reason: <class> — <one line>`, then `gh pr edit N --add-label loom:operator` |
 | `not-eligible` | Re-read the labels just before the write: a stage label, hold or claim appeared (a peer moved it) | No writes |
 
 When in doubt between `triaged` and the others, choose `triaged`: Judge
-reviews it, and Judge can still reject it. Never close the PR, push to it, or
+reviews it, and Judge can still reject it. The one exception is
+`UNTRUSTED_FORK=yes`, which is never `triaged`. Never close the PR, push to it, or
 add `loom:pr`.
 
 ## `--issue N`: one promotion verdict

@@ -20,8 +20,10 @@
 #      set lives in ONE table, and --non-item skips both item queues.
 #   3. TRIAGE (#12499) -- --pr N's step-1 block is EXTRACTED and RUN against a
 #      stub PR read: an open, non-draft PR with no stage label, hold or claim
-#      is TRIAGE=yes and nothing else is; the triage section has exactly its
-#      outcomes, each one label transition, review-requested the normal case.
+#      is TRIAGE=yes and nothing else is; an untrusted author's fork PR is
+#      UNTRUSTED_FORK=yes and must end triage-operator, never triaged; the
+#      triage section has exactly its outcomes, each one label transition,
+#      review-requested the normal case.
 #
 # Hermetic: file reads plus a mktemp -d dir with stub gh / git / loom-daemon /
 # merge-pr.sh. No forge, no network.
@@ -237,10 +239,14 @@ run_step1() { # FAKE_PR_JSON
   out=$( cd "$TMP" && FAKE_PR_JSON="$1" PATH="$TMP/bin:$PATH" bash "$TMP/step1.sh" 2>&1 )
   rm -f "$TMP/gitdir"/loom-champion-pin-pr-*
 }
+# HEAD_REPO (a JSON value: the head repo object, or null for a deleted fork)
+# and ASSOC (author_association) default to a same-repo PR by the owner.
 pr_json() { # state draft labels...
   local state="$1" draft="$2"; shift 2
   local ls; ls=$(printf '{"name":"%s"},' "$@"); ls="[${ls%,}]"; [[ $# -eq 0 ]] && ls="[]"
-  printf '{"state":"%s","draft":%s,"head":{"sha":"%s"},"labels":%s}' "$state" "$draft" "$EVAL_SHA" "$ls"
+  local head_repo='{"full_name":"o/r"}'; [[ -n "${HEAD_REPO:-}" ]] && head_repo="$HEAD_REPO"
+  printf '{"state":"%s","draft":%s,"author_association":"%s","head":{"sha":"%s","repo":%s},"base":{"repo":{"full_name":"o/r"}},"labels":%s}' \
+    "$state" "$draft" "${ASSOC:-OWNER}" "$EVAL_SHA" "$head_repo" "$ls"
 }
 run_step1 "$(pr_json open false)"
 check "an open, non-draft PR with no labels is a triage, and pins nothing" eval 'has "TRIAGE=yes" && has "EVALUATED_SHA=none"'
@@ -257,6 +263,21 @@ check "a closed PR is not a triage" has "TRIAGE=no"
 run_step1 "$(pr_json open false loom:pr)"
 check "a loom:pr PR still takes the merge path, pinned" eval 'has "TRIAGE=no" && has "EVALUATED_SHA=$EVAL_SHA"'
 
+run_step1 "$(pr_json open false)"
+check "a same-repo PR by the owner is not an untrusted fork" has "UNTRUSTED_FORK=no"
+for a in CONTRIBUTOR FIRST_TIME_CONTRIBUTOR FIRST_TIMER NONE; do
+  run_step1 "$(HEAD_REPO='{"full_name":"stranger/r"}' ASSOC=$a pr_json open false)"
+  check "a fork PR by a $a author is UNTRUSTED_FORK=yes (and still a triage)" eval 'has "UNTRUSTED_FORK=yes" && has "TRIAGE=yes"'
+done
+run_step1 "$(HEAD_REPO=null ASSOC=NONE pr_json open false)"
+check "a deleted fork by an untrusted author is UNTRUSTED_FORK=yes" has "UNTRUSTED_FORK=yes"
+for a in OWNER MEMBER COLLABORATOR; do
+  run_step1 "$(HEAD_REPO='{"full_name":"insider/r"}' ASSOC=$a pr_json open false)"
+  check "a fork PR by a $a is not an untrusted fork" has "UNTRUSTED_FORK=no"
+done
+run_step1 "$(ASSOC=NONE pr_json open false)"
+check "a same-repo branch is not a fork, whatever the association" has "UNTRUSTED_FORK=no"
+
 TRIAGE_SECTION="$(awk '/^## `--pr N` on an unlabelled PR: triage/{on=1;next} on&&/^## /{exit} on' "$TARGETED_MD")"
 out="$TRIAGE_SECTION"
 check "the triage section exists" eval '[[ -n "$TRIAGE_SECTION" ]]'
@@ -272,6 +293,14 @@ check "triage-blocked: duplicate, superseded, or closing an already-closed issue
   eval 'has "**duplicate**" && has "**superseded**" && has "**closes an issue that is already closed**" && has "park-record apply --pr N --by champion --reason"'
 check "triage-operator: a human decision, through the routing rule" \
   eval 'has "**needs a human decision**" && has "operator-decision apply N" && has "--add-label loom:operator"'
+check "an untrusted fork PR ends triage-operator, never triaged" \
+  eval 'has "is **always \`triage-operator\`, never
+\`triaged\`**" && has "| \`triage-operator\` | \`UNTRUSTED_FORK=yes\`, whatever else applies;" && has "The one exception is
+\`UNTRUSTED_FORK=yes\`, which is never \`triaged\`."'
+check "triage-operator: operator-decision apply adds loom:operator itself (one transition)" \
+  has "which adds \`loom:operator\` itself. Only a human-hands step:"
+check "step 1 reads the hard exclusions from the registry, not a hard-coded list" \
+  doc_has "$TARGETED_MD" "loom-daemon labels list --property hard_exclusion 2>/dev/null || printf 'external\\n'"
 check "triage never merges, closes or pushes" has 'Never close the PR, push to it, or
 add `loom:pr`.'
 
