@@ -629,6 +629,59 @@ fn a_stale_repo_is_served_with_its_watermark_recorded() {
 }
 
 #[test]
+fn a_repo_the_mirror_cannot_vouch_for_is_not_served_but_others_are() {
+    type Edit = fn(&mut Value);
+    let cases: [(&str, Edit); 6] = [
+        ("known false", |w| w["known"] = json!(false)),
+        ("known absent", |w| {
+            w.as_object_mut().unwrap().remove("known");
+        }),
+        ("gone", |w| w["gone"] = json!("moved to acme/new")),
+        ("another repo", |w| w["repo"] = json!("acme/other")),
+        ("no repo named", |w| {
+            w.as_object_mut().unwrap().remove("repo");
+        }),
+        ("never reconciled", |w| {
+            w.as_object_mut().unwrap().remove("last_reconciled_at");
+        }),
+    ];
+    for (why, edit) in cases {
+        let mut body = worklist_body();
+        edit(&mut body["repos"]["acme/old"]["watermark"]);
+        let mut d = Discovery::default();
+        let calls = Arc::new(AtomicU64::new(0));
+        let snap = d
+            .begin_mirror_tick_with(wl(), now(), |_| Fetched {
+                outcome: Ok(Conditional::Modified {
+                    etag: Some("\"w3\"".into()),
+                    body,
+                }),
+                latency: Duration::ZERO,
+            })
+            .with_lister(counting(calls.clone()));
+        assert_eq!(snap.repo(&target("acme/widgets")).unwrap().tier, Tier::Mirror, "{why}");
+        assert_eq!(snap.repo(&target("acme/old")).unwrap().tier, Tier::Gateway, "{why}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{why}: only the unvouched repo falls back");
+        assert_eq!(snap.stats().fallback_repos, vec!["acme/old"], "{why}");
+    }
+}
+
+#[test]
+fn an_uppercase_repo_in_the_watermark_is_still_vouched_for() {
+    let mut body = worklist_body();
+    body["repos"]["acme/old"]["watermark"]["repo"] = json!("ACME/Old");
+    let mut d = Discovery::default();
+    let snap = d.begin_mirror_tick_with(wl(), now(), |_| Fetched {
+        outcome: Ok(Conditional::Modified {
+            etag: Some("\"w4\"".into()),
+            body,
+        }),
+        latency: Duration::ZERO,
+    });
+    assert_eq!(snap.repo(&target("acme/old")).unwrap().tier, Tier::Mirror);
+}
+
+#[test]
 fn the_repo_is_read_once_per_tick() {
     let mut d = Discovery::with_backstop(BACKSTOP);
     let snap = d.begin_mirror_tick_with(wl(), now(), |_| modified("\"w1\""));
