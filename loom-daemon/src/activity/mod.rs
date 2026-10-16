@@ -41,6 +41,7 @@
 //! ```
 
 mod claims;
+pub mod codex_summary;
 mod cost_analytics;
 mod db;
 mod models;

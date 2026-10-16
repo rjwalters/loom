@@ -16,7 +16,7 @@ fn no_statuses() -> Value {
 /// `ci_pending` over one check-run page and one combined status.
 fn pending(page: Value, combined: Value) -> bool {
     let now = Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap();
-    ci_pending(HEAD, now, |path| {
+    ci_pending(HEAD, now, |_, path| {
         Some(if path.contains("/status?") {
             combined.clone()
         } else {
@@ -44,7 +44,7 @@ fn pending_means_a_young_unconcluded_run_or_status() {
     let status = json!({"state": "pending",
         "statuses": [{"state": "pending", "created_at": at(1)}]});
     assert!(pending(runs("completed", at(1)), status), "a pending legacy status");
-    assert!(!ci_pending(HEAD, Utc::now(), |_| None), "unreadable is not pending");
+    assert!(!ci_pending(HEAD, Utc::now(), |_, _| None), "unreadable is not pending");
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn fake_repo(n: u64) -> (tempfile::TempDir, std::path::PathBuf) {
     let gh = root.join("gh");
     std::fs::write(
         &gh,
-        "#!/bin/sh\ncd \"$(dirname \"$0\")\"\necho \"$*\" >> calls.log\nprintf 'HTTP/2 200 OK\\r\\n\\r\\n'\ncase \"$*\" in\n  *check-runs*) cat checks.json;;\n  */status*) cat status.json;;\n  *comments*) echo '[]';;\n  *) cat pulls.json;;\nesac\n",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")\"\necho \"$*\" >> calls.log\nprintf 'HTTP/2 200 OK\\r\\n\\r\\n'\ncase \"$*\" in\n  *check-runs*) sha=$(echo \"$*\" | sed -n 's#.*commits/\\([0-9a-f]*\\)/check-runs.*#\\1#p'); if [ -f \"checks-$sha.json\" ]; then cat \"checks-$sha.json\"; else cat checks.json; fi;;\n  */status*) cat status.json;;\n  *comments*) echo '[]';;\n  *) cat pulls.json;;\nesac\n",
     )
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -148,4 +148,28 @@ fn only_the_rows_about_to_be_served_are_read() {
         CI_SCREENED_ROWS + 1,
         "the gate stops at the first servable row"
     );
+}
+
+/// Reads are capped, not served rows: with the top [`CI_SCREENED_ROWS`] PRs
+/// all pending, none is served, yet the clear PRs behind them are served
+/// without a CI read of their own.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn pending_rows_ahead_of_clear_ones_spend_the_read_budget() {
+    let (dir, gh) = fake_repo(CI_SCREENED_ROWS as u64 + 2);
+    let root = dir.path();
+    set_checks(root, &runs("completed", Some(Utc::now().to_rfc3339())));
+    let pending = runs("in_progress", Some(Utc::now().to_rfc3339()));
+    for i in 1..=CI_SCREENED_ROWS {
+        let file = root.join(format!("checks-{HEAD}{i}.json"));
+        std::fs::write(file, serde_json::to_vec(&pending).unwrap()).unwrap();
+    }
+    clear_cache();
+    let queue = fetch_queue(root, &gh, PrRole::Judge).unwrap();
+    let numbers: Vec<u64> = queue.iter().filter_map(|r| r["number"].as_u64()).collect();
+    let behind = CI_SCREENED_ROWS as u64;
+    assert_eq!(numbers, vec![behind + 1, behind + 2], "the clear PRs are served");
+    let log = std::fs::read_to_string(root.join("calls.log")).unwrap();
+    assert_eq!(log.matches("check-runs").count(), CI_SCREENED_ROWS, "reads stay at the budget");
 }

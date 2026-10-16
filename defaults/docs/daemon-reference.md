@@ -2468,7 +2468,15 @@ blocker is Loom-owned:
 - **What counts as Loom-owned.** The `installed_files` of
   `.loom/install-metadata.json` at HEAD, at the branch tip and at
   `origin/<default>`, plus the metadata file. Missing or unparseable metadata
-  on any side means nothing is repaired. Every local commit (and every commit
+  on any side means nothing is repaired. Because only the installer writes
+  `installed_files`, a file a later release added is missing from it, so a
+  path also counts (#11989) when the payload embedded in the daemon ships a
+  file at that destination. A repo-local file the resync never touches
+  (a repo-local role file under `.loom/roles/` or a repo-local command under
+  `.claude/commands/loom/`) does not,
+  and a `.agents/skills/` file also needs the generation marker. A path pinned in `.loom/resync-ignore` (also as
+  `agents-skills/<rel>`) is never counted that way. A checkout on a named
+  branch other than the default is left alone. Every local commit (and every commit
   of an in-progress rebase, merge or cherry-pick) may change only those paths,
   and so may every dirty tracked path. Dirt counts only on a checkout that is
   behind. Untracked files are never touched; one where `origin` writes a file
@@ -2477,10 +2485,22 @@ blocker is Loom-owned:
   cherry-pick is repaired only when its state is 30 minutes old and no `git`
   process has its working directory in the repo. An `index.lock` is removed
   only when empty, 30 minutes old and no `git` process is live there.
+- **A detached HEAD** with nothing in progress (a role session's `git checkout
+  origin/main` or of a PR head, left in the main checkout) is put back on the
+  default branch when it is behind `origin/<default>`, has not moved for 6
+  hours (`LOOM_CHECKOUT_DETACHED_AFTER_MINUTES`, from the newest line of the
+  HEAD reflog) and every commit on it is Loom-owned. One at origin's tip is
+  left alone: it already serves current files (2am's `provision.sh` keeps
+  geode-fem detached at its newest green commit this way). The branch tip gets
+  its `-branch` rescue ref, then `checkout -B <default> --track
+  origin/<default>`. A pinned checkout that must stay detached while behind
+  (geode-fem while main is red) opts out with `git config --local
+  loom.checkoutFf.detached keep`.
 - **Repair, in order.** `refs/loom/rescue/<UTC ts>` at HEAD (and `<ts>-branch`
   at the branch tip when an operation moved HEAD); the lock; `stash push` of
   the dirty paths as `loom-rescue-<ts>` (not during an operation, whose abort
-  discards them); `<op> --abort`; `reset --hard origin/<default>`. A failure
+  discards them); `<op> --abort`, or the re-attach of a detached HEAD;
+  `reset --hard origin/<default>`. A failure
   stops the repair, before the reset, and the ordinary rules report the
   checkout as before.
 - **Write gates.** Nothing is written while `fleet.autoApply` is off, the host
@@ -2493,8 +2513,8 @@ blocker is Loom-owned:
   the command to run, until the hold clears. Memory is per process, so a
   restart asks once more.
 - **Telemetry.** Each step is an event on `fleet_sync.checkout` with kind
-  `rescue-ref`, `lock-removed`, `stash`, `abort`, `repaired`, `repair-failed`,
-  `rescue-pruned` or `escalated`, and a log line naming the repo path. Carrying
+  `rescue-ref`, `lock-removed`, `stash`, `abort`, `reattached`, `repaired`,
+  `repair-failed`, `rescue-pruned` or `escalated`, and a log line naming the repo path. Carrying
   these to SigNoz is #11386.
 
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
@@ -5957,11 +5977,13 @@ retryable, 1 terminal; 2 is a usage error with empty stdout). It exists so
 consumers stop vendoring `classify-error.sh` (miniset's E2B shim pins the
 daemon instead). The shell library remains the sourced entry point for
 in-repo callers: its public functions delegate to the subcommand when a
-daemon binary resolves and fall back to the in-file tables — byte-identical —
-when none does. The two renderings are pinned equal by
-`defaults/scripts/tests/test-classify-error.sh` (parity on every row of the
-shared `vectors.tsv` fixture) and by the Rust suite that reads the same
-fixture.
+daemon binary resolves, and with none they give a documented fail-safe
+degraded answer (#11219): `classify_error` prints `RECOVERABLE` for any
+non-zero exit other than the 124/137 → `TIMEOUT` short-circuit, and
+`classification_is_transient` returns 0 (retry, bounded by the caller's cap).
+The shell pattern tables were deleted; the Rust suite and
+`defaults/scripts/tests/test-classify-error.sh` read the shared
+`vectors.tsv` / `conformance.tsv` fixtures.
 
 **Session-limit fault handling (#3947).** Stacking can occasionally trip a
 **concurrent-session-limit** fault on a token (the account is healthy but cannot
@@ -6448,6 +6470,8 @@ knobs not yet audited here.
 | `autonomous.workFinder.redMainAutofile.intervalSecs` | — | `600` | Seconds between reconciles of one repo's auto-filed fix issue (#11766); a gate verdict change reconciles sooner. Positive integer; anything else uses the default. **Hot-applies** |
 | `autonomous.workFinder.redFixEscalateAfterSecs` | — | `1800` | How long a `<!-- loom:main-red-fix -->` candidate may wait unclaimed on a red `main` before the daemon files one `loom:operator` alert issue for it (#10118). Positive integer seconds; anything else uses the default. **Hot-applies** (read when a fix is waiting). See "Unpromoted red-main fixes (#10118)" above |
 | `autonomous.workFinder.tickDeadlineSecs` | — | `90` | The wall-clock deadline of one work-finder tick body (#12074). Every forge read from the pre-dispatch holds through the step gather gets only the time left (its own timeout is clamped), a read past the deadline is not sent (a shed: the gather uses its last good listing, a fact keeps the value that passes the item), and once it passes no further repo is gathered: the tick draws from what it gathered, reports `loom.dispatch.gather_truncated`, and the next tick starts at the first repo skipped. The deadline clock starts after the tick's local pre-dispatch work (eager reclaim, CPU sample). At least one repo is gathered every tick, and its reads get at least 20 s even past the deadline. Inside the tick, a read whose readers are out of budget (a rate-limit back-off) is shed rather than moved to the writer App, whatever its class; any other cause (a failing gateway, a coverage miss) still reaches the writer. A repo whose gather was starved (failed, last-good only, or no open-PR listing) for 3 ticks in a row gets one tick on the writer: every budget shed is lifted for that tick, deferrable listings included. Three consecutive gateway attempts that time out or fail with an unmarked 5xx withdraw the gateway for the default window; any gateway answer, on any read path, resets the count. The step tick's open-PR listing stays a Gate read, with its last good copy standing in when it fails. The draw's own claim reads run outside the deadline. Positive integer seconds; anything else uses the default. **Hot-applies** (read at the start of each tick) |
+| `autonomous.workFinder.gatherConcurrency` | — | `8` | How many repos the step gather lists at once (#12256). The forge half of each repo's gather (the item and open-PR listings, hold markers, blocker states, the landed pre-filter, CI at a Judge head) runs on up to this many threads; each keeps the tick's read deadline (`tickDeadlineSecs`) and its starvation rules, and repos are taken in walk order, so a deadline still skips from the end. Stage-entry lookups, weighing and the draw stay serial and run in walk order, so the draw does not depend on which listing answered first. `1` restores the serial gather. Positive integer, at most 32; anything else uses the default. **Hot-applies** (read at each tick) |
+| `autonomous.workFinder.spawnConcurrency` | — | `4` | How many step spawns the work finder's draw runs at once, each in a different repo (#12298). The draw fills its slots in rounds: each round draws one candidate for up to this many open slots, never two in one repo, runs the per-repo cap, RAM, disk and one-merge-per-repo gates for them in draw order (the round's earlier candidates count as admitted, so a round cannot overrun a shared budget), then spawns them together, so their resolvers, pre-claims and account-selection polls overlap. The child launches themselves stay serialised host-wide, at least `dispatchStaggerMs` apart across all repos (the #3887 startup-race gap, which is otherwise kept per repo), so a round never starts several children within milliseconds. Results are applied in draw order, and a refused slot draws again in the next round. Within one repo, claims and step-ledger writes stay one at a time and in order; `workFinder.maxConcurrent`, the free slots and `maxAdmissionsPerTick` bound the tick as before. Before each round the shared GitHub rate-limit breaker is checked: when it has tripped since the tick started, the round is not spawned, its drawn candidates wait for a later tick (`deferred_capacity`, detail `rate_limit_breaker`), and the tick span records `loom.dispatch.spawn_hold`. `1` restores the serial spawns. Positive integer, at most 16; anything else uses the default. **Hot-applies** (read at each tick) |
 | `autonomous.workFinder.landedPrefilter` | — | `false` | The landed pre-filter (#11853): before a `loom:issue` candidate without an open PR is dispatched, one batched GraphQL closes-graph query per workspace asks whether a PR that closes it has merged while it stays open, and routes such an issue to Curator (`loom:triage`) instead of a Builder. **Off by default since #12205** (it cost about 1.5k dispatch-App GraphQL calls an hour fleet-wide). Off, it makes no forge call and every candidate is dispatched as before #11853: a landed-but-open issue can reach a Builder again, bounded by the #11429 journal check, the 2.5 closed-issue guard and the no-op cooldown. On, the query asks only candidates without an open linked PR, at most once per half `LANDED_RECHECK` (15 min) per workspace, backs off 5 min after an unanswered query, and is a repo-targeted Hygiene read (reader pool or gateway; shed, never moved to the writer, when the readers are out of budget). `true` turns it on; anything else is off. **Hot-applies** (read on every call) |
 | *(env only)* | `LOOM_OPEN_PR_MEMO` | `true` | Verified-open-PR memo for the #4123 open-PR dispatch guard (#6788). Falsy (`0`/`false`/`no`/`off`) disables; anything else (including unset) enables. When on, the guard (a) reuses a verified "issue #N has open linked PR #M" answer for 15 minutes instead of re-running the closes-graph query on every work-finder tick, and (b) when **both** the GraphQL probe and its #5911 REST fallback fail, re-verifies that one known PR over a single `GET repos/{owner}/{repo}/pulls/{M}` before conceding. The documented fail-open contract is unchanged: with no memo, or if that recheck also cannot answer, the guard still proceeds. In-memory only — a daemon restart clears it. Disable only to restore the exact pre-#6788 probe |
 | *(env only)* | `LOOM_GUARD_ISSUE_SNAPSHOT` | `true` | Conditional (ETag) issue reads for the 2.5 closed-issue and 2.7 park-label dispatch guards (W9). Falsy (`0`/`false`/`no`/`off`) restores the unconditional `guard.issue_state` / `guard.issue_labels` reads. When on, 2.5 reads `repos/{owner}/{repo}/issues/{N}` reader-first (`guard.issue_view`) and 2.7 reads it on the writer (`guard.issue_labels_view`), each with `If-None-Match` from its own store entry, so a re-attempted, unchanged candidate costs a free `304`. The verdict is always taken from the body the read serves. For 10 minutes after this daemon writes issue N of the repo (keyed by repo and number; a write whose repo is unknown, including a `{owner}/{repo}` placeholder path with no explicit target, is a wildcard that pins N in every repo; the parse is deliberately loose, so any numeric argument of a `gh issue|pr` write may be pinned, and a mis-parse can only add a pin, never drop one), both reads of N are sent without an ETag and keep their identity: 2.5 stays reader-first, 2.7 stays on the writer. Any failure falls back to the unconditional read |
@@ -7750,8 +7774,8 @@ delay as `startup_jitter_delay_secs`, and `loom-daemon health` adds it to the
 work finder's first-tick grace (2 × interval), so a host still inside its
 window reads "warming up", not "no work-finder tick observed".
 
-Not covered: the startup claim-reconciliation pass (it gates the first
-admission and is per-repo `loom:building` only). The stale-blocked release and
+Not covered: the startup claim-reconciliation pass (it holds the first
+tick only up to its cap, below, and is per-repo `loom:building` only). The stale-blocked release and
 fleet-state passes were removed by #11301.
 
 ### Startup reconciliation: a bounded wait (#12222)
@@ -7773,6 +7797,12 @@ start bumps the issue's `updatedAt`, so it is never mistaken for an orphan of
 the previous process. Every other reclaim is the periodic pass's, which always
 runs alongside the work finder.
 
+The comparison allows for clocks (#12230): `updatedAt` is GitHub's clock, to
+the second, and the pass start is this host's. So a claim counts as possibly
+this daemon's if it was updated at or after the pass start rounded down to the
+second, less 60 s. A claim the previous process flipped in its last minute is
+then left to the periodic pass's age gate rather than reclaimed at once.
+
 | Knob | Default | Meaning |
 |---|---|---|
 | `LOOM_STARTUP_RECONCILE_WAIT_SECS` (env) > `autonomous.startupReconcileWaitSecs` (any config tier) | `90` | Longest wait, in seconds, for the startup claim and quarantine passes before the first tick |
@@ -7780,7 +7810,47 @@ runs alongside the work finder.
 The first completed tick logs `work_finder: first tick completed Ns after
 daemon start (startup reconciliation cap fired: …)` and publishes the
 `daemon.work_finder.first_tick` `daemon.event` record (`secs_since_start`,
-`startup_reconcile_cap_fired`).
+`gate_wait_secs`, `jitter_delay_secs`, `startup_reconcile_cap_fired`). On the
+OTLP path it is a `daemon.event` log record with `loom.topic =
+daemon.work_finder.first_tick`, the host in the `host.name` resource
+attribute, and the payload's scalars also as typed `loom.payload.*`
+attributes (#12230), so the duration can be filtered and aggregated per host
+without parsing `loom.payload`. On a fleet host `secs_since_start` includes
+the startup jitter (up to the jitter window), up to one work-finder interval
+and the first tick's own run time, so several minutes is normal.
+
+### Per-agent scope MemoryMax (#11094, #12246)
+
+On a systemd host each agent's `--user` scope gets a `MemoryMax`, so an
+over-budget build is OOM-killed inside its own cgroup rather than by the
+kernel's global OOM killer. `spawn-claude.sh` asks `loom-daemon
+ram-scope-limit` for the value on every spawn; by default it is derived from
+the repo's observed memory peak (`~/.loom/ram-peaks.json`), and a repo with no
+history gets no limit.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `LOOM_SWEEP_MEMORY_MAX` (env) > `autonomous.agentMemoryMax` (any config tier) | `auto` | `"off"` disables the limit; `"auto"` derives it from history as `max(floor, peak * pct / 100)`; a positive integer (string or JSON number) is an explicit limit in MiB |
+| `LOOM_SWEEP_MEMORY_MAX_PCT` (env) > `autonomous.agentMemoryMaxPct` | `200` | Multiple of the observed peak, in percent; values under 100 are ignored |
+| `LOOM_SWEEP_MEMORY_MAX_MIN_MB` (env) > `autonomous.agentMemoryMaxMinMb` | `4096` | Floor for a derived limit, MiB |
+
+Each key resolves on its own: a non-empty env var, then the config tiers
+highest first, then the default. A value that does not parse at a level is
+skipped, so garbage behaves as if unset. The tiers are the repo's own, plus
+the **daemon workspace's** `.loom-local/local.json`, which is where the fleet
+sync writes the host-local tier: the daemon exports its workspace to its
+children as `LOOM_DAEMON_WORKSPACE`, and `ram-scope-limit` slots that file in
+directly below the repo's own `.loom-local/local.json` (above the repo's
+fleet, project and `.loom/config.json` tiers and the machine tier). So a fleet
+turns the limit off everywhere with `"agentMemoryMax": "off"` in the machine
+tier, or on one host in that host's local tier.
+
+The keys are live: every spawn runs a fresh `ram-scope-limit`, so a change
+applies to the next agent without a daemon restart. The subcommand prints one
+stderr line, kept in the agent's spawn log next to the `scope MemoryMax=` line,
+naming the value and the source that decided it, e.g.
+`ram-scope-limit: no MemoryMax (off); agentMemoryMax from config
+autonomous.agentMemoryMax in <workspace>/.loom-local/local.json`.
 
 ### Agent CI wait: `forge wait-checks` (#10330)
 

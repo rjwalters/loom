@@ -1194,3 +1194,8 @@ fn github_shadow_queries_match_the_ratelimit_and_forge_calls_vocabulary() {
         "the SigNoz README no longer documents github-shadow.sql"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
