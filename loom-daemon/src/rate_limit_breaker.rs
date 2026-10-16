@@ -187,6 +187,11 @@ const RATE_LIMIT_SIGNATURES: &[&str] = &[
 /// wrapping it) identifies a rate-limit rejection.
 #[must_use]
 pub fn indicates_rate_limit(text: &str) -> bool {
+    // #12310: the gateway's quota-reserve refusal of a discovery read is a
+    // `429` too, but the pool is not exhausted: claims and writes carry on.
+    if crate::gh_invocation::purpose::is_reserve_refusal(text) {
+        return false;
+    }
     let lowered = text.to_ascii_lowercase();
     RATE_LIMIT_SIGNATURES
         .iter()

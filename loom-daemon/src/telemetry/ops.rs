@@ -61,6 +61,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // 2am#4367 P4: `loom.forge.calls`' route (gateway | direct_read |
     // direct | none), a closed vocabulary.
     "route",
+    // #12310: `loom.forge.calls`' purpose (discovery | gate | write |
+    // hygiene | observability | unknown), a closed vocabulary.
+    "purpose",
     // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
     // engine's per-role slots beside the sweep total.
     "pool",
@@ -121,6 +124,10 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.discovery.oldest_watermark_age_secs",
     // #12298: the spawn half's concurrency and its sub-phases.
     "loom.dispatch.spawn_concurrency",
+    // #12310: what a `invoke github` span was for, and why a discovery read
+    // fell back (`reserve`: the gateway refused it below its quota reserve).
+    "loom.forge.purpose",
+    "loom.discovery.fallback_reason",
     "loom.dispatch.spawn_hold",
     "loom.dispatch.phase.spawn_resolve_ms",
     "loom.dispatch.phase.spawn_claim_ms",
@@ -256,9 +263,9 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
 
 /// Longest label value kept, in bytes.
 pub const MAX_LABEL_VALUE_BYTES: usize = 128;
-/// Most labels kept on one point (`loom.forge.calls` carries eleven: #10607's
-/// ten plus 2am#4367's `route`).
-pub const MAX_LABELS_PER_POINT: usize = 11;
+/// Most labels kept on one point (`loom.forge.calls` carries twelve: #10607's
+/// ten, 2am#4367's `route` and #12310's `purpose`).
+pub const MAX_LABELS_PER_POINT: usize = 12;
 /// Most points kept in one record.
 pub const MAX_POINTS_PER_RECORD: usize = 256;
 

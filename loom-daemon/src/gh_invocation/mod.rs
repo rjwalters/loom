@@ -56,6 +56,7 @@ pub(crate) mod cwd_route;
 mod outcome;
 pub(crate) mod own_writes;
 mod paged;
+pub mod purpose;
 pub mod read_deadline;
 mod reader_route;
 pub mod resolver;
@@ -66,6 +67,7 @@ pub mod transparent;
 pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
 pub use paged::{walk_enabled as page_walk_enabled, WALK_ENV as PAGE_WALK_ENV};
+pub use purpose::ForgePurpose;
 pub use reader_route::{READ_SHED_ENV, SHED_MARKER};
 
 #[cfg(test)]
@@ -340,6 +342,10 @@ pub struct GhInvocation {
     /// fleet store fetch, which must work while the gateway is broken so the
     /// gateway can be unset ([`GhInvocation::gateway_exempt`]).
     gateway_exempt: bool,
+    /// A listing the daemon makes to find work (#12310): the site said so
+    /// ([`GhInvocation::discovery`]) or built the call inside a
+    /// [`purpose::discovery`] scope. Meaningful for reads only.
+    discovery: bool,
 }
 
 impl GhInvocation {
@@ -374,6 +380,7 @@ impl GhInvocation {
             read_class: ReadClass::Gate,
             disagree_counted: false,
             gateway_exempt: false,
+            discovery: purpose::in_discovery_scope(),
         }
     }
 
@@ -521,6 +528,52 @@ impl GhInvocation {
     pub fn read_class(mut self, class: ReadClass) -> Self {
         self.read_class = class;
         self
+    }
+
+    /// Mark this read as **discovery** (#12310): a listing made to find work.
+    /// Tags `loom.forge.purpose = discovery` on its span and metric and, on a
+    /// `gh api` call, sends the `loom.forge.purpose: discovery` request header
+    /// so the read gateway can refuse it first when a pool runs low. Set it
+    /// next to [`GhInvocation::read_class`]; leave a read that gates a write
+    /// untagged.
+    #[must_use]
+    pub fn discovery(mut self) -> Self {
+        self.discovery = true;
+        self
+    }
+
+    /// What this call is for (#12310): a write is `write`; a read is
+    /// `discovery` only when its site said so, else its [`ReadClass`] name.
+    #[must_use]
+    pub fn purpose(&self) -> ForgePurpose {
+        if self.intent == AccessIntent::Write {
+            ForgePurpose::Write
+        } else if self.discovery {
+            ForgePurpose::Discovery
+        } else {
+            ForgePurpose::of_read(self.read_class)
+        }
+    }
+
+    /// The argv handed to `gh`: [`GhInvocation::args`] plus, on a `discovery`
+    /// `gh api` call, the purpose header. No other call sends it.
+    #[must_use]
+    pub(crate) fn spawn_args(&self) -> Vec<OsString> {
+        let mut args = self.args.clone();
+        if self.purpose() == ForgePurpose::Discovery && args.first().is_some_and(|a| a == "api") {
+            args.splice(
+                1..1,
+                [
+                    OsString::from("-H"),
+                    OsString::from(format!(
+                        "{}: {}",
+                        purpose::HEADER_NAME,
+                        purpose::DISCOVERY_VALUE
+                    )),
+                ],
+            );
+        }
+        args
     }
 
     /// This read's [`ReadClass`].
@@ -688,7 +741,7 @@ impl GhInvocation {
     /// Assemble the child. Private: the facade owns execution.
     fn command(&self, program: &str, child_context: Option<&TraceContext>) -> Command {
         let mut cmd = Command::new(program);
-        cmd.args(&self.args);
+        cmd.args(self.spawn_args());
         cmd.env(BOOKED_ENV, "1");
         if let Some(dir) = &self.cwd {
             cmd.current_dir(dir);
@@ -723,6 +776,11 @@ impl GhInvocation {
         }
         // #12074: past the work-finder tick's deadline a read is not sent.
         if self.intent == AccessIntent::Read && read_deadline::passed() {
+            return Ok(self.deadline_shed());
+        }
+        // #12310: the gateway refused a discovery read for its quota reserve
+        // earlier in this tick; the rest of the tick's discovery is not sent.
+        if self.purpose() == ForgePurpose::Discovery && purpose::discovery_ended() {
             return Ok(self.deadline_shed());
         }
         #[cfg(test)]
