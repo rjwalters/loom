@@ -9,9 +9,9 @@
 //! (operator direction: "we should only ever limit parallelism based on the
 //! machine disk/RAM/CPU" — a metered API key has no subscription window, and
 //! overage means even a subscription pool no longer hard-stops at one
-//! either). The dynamic cap is now `min(disk headroom, ram headroom,
-//! configured max)` — see
-//! `crate::work_finder::resolve_dynamic_max_concurrent` (removed, #12406). This module's
+//! either). Since #12406 / #12427 the cap is the configured `maxConcurrent`
+//! alone, with no automatic term
+//! (`crate::work_finder::resolve_dynamic_max_concurrent` was removed, #12406). This module's
 //! machinery ([`token_axis_limit`], [`assess_pressure`], the add-capacity
 //! advisory below) is **not** deleted: it still drives spawn-time account
 //! *selection* (prefer fresher/healthier accounts, skip exhausted/blocked
@@ -464,7 +464,7 @@ pub struct PressureAssessment {
 /// - `min_queued` — the advisory threshold ([`DEFAULT_ADVISORY_MIN_QUEUED`]).
 ///
 /// Since #5270 the token axis no longer participates in the dynamic
-/// concurrency cap (`min(disk, ram, configured_max)`), so `token_bound` is
+/// concurrency cap (the configured `maxConcurrent` since #12406), so `token_bound` is
 /// **not** a cross-axis "is tokens the (co-)minimum cap term" comparison
 /// anymore — that framing would false-positive an add-accounts advisory
 /// whenever *any* other axis (disk, RAM, or the operator ceiling) deferred

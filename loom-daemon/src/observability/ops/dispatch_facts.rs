@@ -196,9 +196,13 @@ pub fn pass_attributes(
     let mut out = vec![
         ("loom.dispatch.draws".to_string(), p.draws.to_string()),
         ("loom.dispatch.draws_unspawned".into(), p.draws_unspawned.to_string()),
+        ("loom.dispatch.budget".into(), p.budget.to_string()),
     ];
     if !p.by_reason.is_empty() {
         out.push(("loom.dispatch.passes".into(), p.render()));
+    }
+    if let Some(stop) = p.stop {
+        out.push(("loom.dispatch.stop".into(), stop.to_string()));
     }
     out
 }
@@ -334,9 +338,14 @@ mod tests {
             passes: Some(crate::step_dispatch::gather_budget::TickPasses {
                 draws: 9,
                 draws_unspawned: 2,
-                by_reason: [("repo_cap".to_string(), 2), ("claim_lost".to_string(), 3)]
-                    .into_iter()
-                    .collect(),
+                by_reason: [
+                    ("merge_in_flight".to_string(), 2),
+                    ("claim_lost".to_string(), 3),
+                ]
+                .into_iter()
+                .collect(),
+                budget: 30,
+                stop: Some("pass_limit"),
             }),
             ..TickReport::default()
         };
@@ -344,7 +353,9 @@ mod tests {
         let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
         assert_eq!(get("loom.dispatch.draws"), Some("9"));
         assert_eq!(get("loom.dispatch.draws_unspawned"), Some("2"));
-        assert_eq!(get("loom.dispatch.passes"), Some("claim_lost=3,repo_cap=2"));
+        assert_eq!(get("loom.dispatch.passes"), Some("claim_lost=3,merge_in_flight=2"));
+        assert_eq!(get("loom.dispatch.budget"), Some("30"));
+        assert_eq!(get("loom.dispatch.stop"), Some("pass_limit"));
         for (key, _) in &attrs {
             assert!(
                 crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
@@ -361,6 +372,7 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "loom.dispatch.draws" && v == "0"));
         assert!(!attrs.iter().any(|(k, _)| k == "loom.dispatch.passes"));
+        assert!(!attrs.iter().any(|(k, _)| k == "loom.dispatch.stop"));
     }
 
     #[test]

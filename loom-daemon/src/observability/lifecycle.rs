@@ -214,18 +214,42 @@ pub fn host_attributes() -> TraceAttributes {
     let pressure = crate::host_pressure::sample();
     let mut attrs = TraceAttributes::new();
     insert_u64(&mut attrs, "loom.host.mem_total_bytes", pressure.mem_total_bytes);
-    insert_u64(&mut attrs, "loom.host.mem_available_bytes", pressure.mem_available_bytes);
     insert_u64(&mut attrs, "loom.host.mem_compressed_bytes", pressure.mem_compressed_bytes);
     insert_u64(&mut attrs, "loom.host.swap_total_bytes", pressure.swap_total_bytes);
-    insert_u64(&mut attrs, "loom.host.swap_used_bytes", pressure.swap_used_bytes);
     insert_u64(&mut attrs, "loom.host.swap_in_bytes_total", pressure.swap_in_bytes_total);
     insert_u64(&mut attrs, "loom.host.swap_out_bytes_total", pressure.swap_out_bytes_total);
     insert_u64(&mut attrs, "loom.host.oom_kill_total", pressure.oom_kill_total);
-    if let Some(pressure) = pressure.memory_pressure {
-        attrs.insert("loom.host.pressure".into(), pressure.as_str().to_string());
+    // #12113: the four signals `host_status` measures read its latest raw
+    // record (raw, so each key keeps its instantaneous meaning); no record yet
+    // or a missing signal leaves the key absent, never zero.
+    let raw = crate::host_status::latest_raw;
+    insert_u64(
+        &mut attrs,
+        "loom.host.mem_available_bytes",
+        raw("mem_available_bytes").map(|v| v as u64),
+    );
+    insert_u64(
+        &mut attrs,
+        "loom.host.swap_used_bytes",
+        raw("swap_used_bytes").map(|v| v as u64),
+    );
+    if let Some(pressure) = raw("mem_pressure_grade").and_then(pressure_from_grade) {
+        attrs.insert("loom.host.pressure".into(), pressure.to_string());
     }
-    insert_f64(&mut attrs, "loom.host.load_per_core", crate::cpu_headroom::load_per_core());
+    insert_f64(&mut attrs, "loom.host.load_per_core", raw("cpu_load_per_core"));
     attrs
+}
+
+/// The span string for a `mem_pressure_grade` value (0/1/2); other values are
+/// unknown, so the key stays absent.
+fn pressure_from_grade(grade: f64) -> Option<&'static str> {
+    use crate::host_pressure::MemoryPressure;
+    match grade {
+        0.0 => Some(MemoryPressure::None.as_str()),
+        1.0 => Some(MemoryPressure::Some.as_str()),
+        2.0 => Some(MemoryPressure::Full.as_str()),
+        _ => None,
+    }
 }
 
 /// Fixed-reason admission attributes for one role tick outcome.

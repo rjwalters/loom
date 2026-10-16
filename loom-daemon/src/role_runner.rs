@@ -173,7 +173,7 @@ pub const ARCHITECT_MAX_PROPOSALS_ENV: &str = "LOOM_ARCHITECT_MAX_PROPOSALS";
 /// `LOOM_WORK_FINDER_MAX_CONCURRENT`, and it exists because that knob bounds
 /// **sweep dispatch only**: role-runner agents are spawned by this module's own
 /// interval / idle loops, never routed through
-/// [`crate::work_finder`]'s `min(disk, ram, maxConcurrent)` admission, so
+/// [`crate::work_finder`]'s `maxConcurrent` admission, so
 /// before #6102 nothing bounded them at all. See
 /// [`resolve_max_concurrent`].
 pub const ROLE_RUNNER_MAX_CONCURRENT_ENV: &str = "LOOM_ROLE_RUNNER_MAX_CONCURRENT";
@@ -2177,7 +2177,7 @@ pub fn default_max_concurrent() -> usize {
 /// agents are spawned by this module's interval loops and the work-finder's
 /// idle-edge path *without* passing through
 /// [`crate::work_finder`]'s admission checks, so they were admitted entirely
-/// outside `min(disk, ram, maxConcurrent)` — an operator lowering that knob
+/// outside the `maxConcurrent` cap — an operator lowering that knob
 /// after a load-induced crash got less protection than the knob's own
 /// documentation implied (#6102). This is the distinct ceiling for the other
 /// half of the host's agent load; the two together, not `maxConcurrent`

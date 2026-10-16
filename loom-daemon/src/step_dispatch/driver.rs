@@ -613,6 +613,8 @@ impl StepDriver {
             draws: result.draws,
             draws_unspawned: result.passes.get(PASS_MERGE).copied().unwrap_or(0),
             by_reason: result.passes.clone(),
+            budget: result.budget,
+            stop: Some(result.stop.as_str()),
         });
         for (idx, failed, listing, held) in &notes {
             note_listing(&mut report, *idx, failed.as_ref(), *listing, *held);
@@ -621,9 +623,12 @@ impl StepDriver {
         report.note_halts(input.halted, Some(input.halt_causes), input.roots.len());
         if !result.passes.is_empty() {
             log::info!(
-                "work_finder: step tick: {} draw(s), {} spawned, passes {:?}",
+                "work_finder: step tick: {} draw(s), {} spawned of {} slot(s), stopped {}, \
+                 passes {:?}",
                 result.draws,
                 report.dispatched,
+                result.budget,
+                result.stop.as_str(),
                 result.passes
             );
         }
