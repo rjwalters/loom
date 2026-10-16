@@ -294,6 +294,121 @@ fn host_and_admission_attributes_survive_the_span_allowlist() {
 }
 
 // ---------------------------------------------------------------------------
+// #12113: role-span host attributes read the `host_status` latest record
+// ---------------------------------------------------------------------------
+
+/// Serialises the tests that publish to `host_status`'s one global slot.
+static HOST_STATUS_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn host_record(raw: &[(&str, f64)]) -> crate::telemetry::kinds::host_status::HostStatusRecord {
+    crate::telemetry::kinds::host_status::HostStatusRecord {
+        captured_at: Utc::now(),
+        interval_secs: 5,
+        raw: raw.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+        filtered: Default::default(),
+        volumes: Vec::new(),
+    }
+}
+
+/// The four keys `host_status` supplies.
+const HOST_STATUS_KEYS: [&str; 4] = [
+    "loom.host.mem_available_bytes",
+    "loom.host.swap_used_bytes",
+    "loom.host.pressure",
+    "loom.host.load_per_core",
+];
+
+#[test]
+fn host_attributes_read_the_latest_host_status_record() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::host_status::publish(&host_record(&[
+        ("mem_available_bytes", 123_456.0),
+        ("swap_used_bytes", 789.0),
+        ("mem_pressure_grade", 1.0),
+        ("cpu_load_per_core", 0.5),
+    ]));
+    let attrs = host_attributes();
+    crate::host_status::clear_latest();
+    assert_eq!(
+        attrs
+            .get("loom.host.mem_available_bytes")
+            .map(String::as_str),
+        Some("123456")
+    );
+    assert_eq!(attrs.get("loom.host.swap_used_bytes").map(String::as_str), Some("789"));
+    assert_eq!(attrs.get("loom.host.pressure").map(String::as_str), Some("some"));
+    assert_eq!(attrs.get("loom.host.load_per_core").map(String::as_str), Some("0.500"));
+}
+
+#[test]
+fn host_attributes_omit_signals_the_record_lacks() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // No record yet (first span before the first tick): all four are absent.
+    crate::host_status::clear_latest();
+    let none = host_attributes();
+    for key in HOST_STATUS_KEYS {
+        assert!(!none.contains_key(key), "{key} must be absent, not zero, with no record");
+    }
+    // A record with only some signals, and an unknown pressure grade.
+    crate::host_status::publish(&host_record(&[
+        ("mem_available_bytes", 42.0),
+        ("mem_pressure_grade", 7.0),
+    ]));
+    let partial = host_attributes();
+    crate::host_status::clear_latest();
+    assert_eq!(
+        partial
+            .get("loom.host.mem_available_bytes")
+            .map(String::as_str),
+        Some("42")
+    );
+    for key in [
+        "loom.host.swap_used_bytes",
+        "loom.host.pressure",
+        "loom.host.load_per_core",
+    ] {
+        assert!(!partial.contains_key(key), "{key} must be absent, not zero");
+    }
+}
+
+#[test]
+fn host_attributes_key_set_is_pinned() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::host_status::publish(&host_record(&[
+        ("mem_available_bytes", 1.0),
+        ("swap_used_bytes", 1.0),
+        ("mem_pressure_grade", 0.0),
+        ("cpu_load_per_core", 1.0),
+    ]));
+    let attrs = host_attributes();
+    crate::host_status::clear_latest();
+    let allowed = [
+        "loom.host.mem_total_bytes",
+        "loom.host.mem_available_bytes",
+        "loom.host.mem_compressed_bytes",
+        "loom.host.swap_total_bytes",
+        "loom.host.swap_used_bytes",
+        "loom.host.swap_in_bytes_total",
+        "loom.host.swap_out_bytes_total",
+        "loom.host.oom_kill_total",
+        "loom.host.pressure",
+        "loom.host.load_per_core",
+    ];
+    for key in attrs.keys() {
+        assert!(allowed.contains(&key.as_str()), "unexpected host attribute {key}");
+    }
+    for key in HOST_STATUS_KEYS {
+        assert!(attrs.contains_key(key), "{key} missing");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #9420: loom.attempt.worked — the dwell-conditioning flag
 // ---------------------------------------------------------------------------
 
