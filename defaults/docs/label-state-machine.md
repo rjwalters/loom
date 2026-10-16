@@ -459,6 +459,17 @@ No role acts on any of these (#11861): the kind tells the human what to do.
 A capability marker on a `loom:operator` item is inert; the capability lane
 reads `loom:blocked` only (below).
 
+### Tracker marker (`<!-- loom:tracker -->`, #10886)
+
+A body marker (not a label, not a hold) for a living tracker or governance hub
+that is meant to stay open with no finite deliverable. It must be a line by
+itself outside any code fence; a quoted or inline mention does not count.
+Champion's Priority 2 discovery skips it and `champion-issue-promo.md` treats it
+as `ALREADY_ROUTED`, so no rejection is counted and it never reaches the N=2
+escalation; Curator leaves it as found. Remove the marker to restore normal
+evaluation. It does not suppress a human-filed `loom:operator` decision.
+`loom:needs-capability` waits need no marker: the registry `hold` set covers them.
+
 ### Capability marker (`<!-- loom:capability=<name> -->`, #6885/#6892)
 
 The marker states, machine-readably, what capability an item needs. On a
