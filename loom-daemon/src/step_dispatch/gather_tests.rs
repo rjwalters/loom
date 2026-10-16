@@ -131,7 +131,7 @@ mod ci_hold {
     /// `pr_planning::ci_pending` (the #12003 rule) over a fixed forge.
     fn forge(page: Value) -> impl FnMut(&str) -> bool {
         move |sha: &str| {
-            crate::pr_planning::ci_pending(sha, now(), |path| {
+            crate::pr_planning::ci_pending(sha, now(), |_, path| {
                 Some(if path.contains("/status?") {
                     json!({"state": "success", "statuses": []})
                 } else {
