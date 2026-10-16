@@ -14,7 +14,11 @@
 //! fabricated zero (the `host.health` omission contract).
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+// `Duration`'s only non-test user is the Linux-only `proc_age_sec`; scoping
+// the import keeps macOS clippy (`-D warnings`) clean.
+#[cfg(any(target_os = "linux", test))]
+use std::time::Duration;
+use std::time::SystemTime;
 
 use crate::telemetry::AgentScopeSummary;
 
