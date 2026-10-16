@@ -102,10 +102,14 @@ async fn serve(
         .await
         .map_err(|e| anyhow!("roster load task failed: {e}"))?
         .context("loading the dispatcher roster from the fleet store")?;
-    if roster.callable() == 0 {
+    let unresolved = roster.unresolved();
+    if !unresolved.is_empty() {
         log::warn!(
-            "fleet-dispatch: no dispatcher entry names a `tailnet_node`, so every caller will \
-             be refused 403"
+            "fleet-dispatch: {} of {} dispatchers have no host record with a `host_id` and a \
+             `tailnet_node` in fleet.json `hosts[]`, so their calls will be refused 403: {}",
+            unresolved.len(),
+            roster.host_ids().len(),
+            unresolved.join(", ")
         );
     }
 

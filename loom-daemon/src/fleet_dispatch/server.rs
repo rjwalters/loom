@@ -275,7 +275,7 @@ impl<I: Identity> Server<I> {
         let decision = self.with_table(|t, now, counters| {
             let d = t.claim(now, host, &req.repo, req.item, &req.step, max);
             if let ClaimDecision::Refused { reason, .. } = &d {
-                counters.claim_refused(reason.as_str());
+                counters.claim_refused(*reason);
             }
             d
         });
