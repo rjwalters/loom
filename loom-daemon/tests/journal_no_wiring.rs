@@ -108,3 +108,8 @@ fn the_crate_root_only_declares_the_module() {
     let mentions: Vec<&str> = main.lines().filter(|l| l.contains("journal_cli")).collect();
     assert_eq!(mentions.len(), 2, "one variant + one dispatch arm: {mentions:?}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

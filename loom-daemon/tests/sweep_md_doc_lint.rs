@@ -919,3 +919,8 @@ fn sweep_md_no_daemon_flag_states_it_governs_dispatch_only() {
          EVERY host whose daemon manages the workspace, not just this one (#6320)"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

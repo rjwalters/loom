@@ -659,3 +659,8 @@ fn every_rehearsal_helper_image_is_already_pinned_by_the_render() {
         );
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
