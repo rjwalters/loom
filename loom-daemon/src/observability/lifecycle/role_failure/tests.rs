@@ -245,7 +245,7 @@ mod role_invocation_close {
             RoleTickOutcome::Failure("`spawn-codex.sh` exited with exit status: 1: tail".into())
         });
         let trace = trace.unwrap();
-        assert_eq!(trace.failure, Some(failure()), "the story copies get the same cause");
+        assert_eq!(trace.failure, Some(failure()), "the trace carries the failure cause");
         let span = root_span(dir.path(), &trace);
         assert_eq!(span.status, SpanStatus::Error);
         assert_eq!(span.attributes["loom.result"], "failure");

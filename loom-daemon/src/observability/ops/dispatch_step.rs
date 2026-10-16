@@ -63,8 +63,8 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
         attributes.insert("loom.repo".into(), slug.to_string());
         attributes.insert("loom.repo.visibility".into(), visibility.to_string());
     }
-    // A PR step's item is a PR; the issue key would name a story that does
-    // not exist (`sweep_registry/step_story.rs`).
+    // A PR step's item is a PR; the issue key would name an issue that does
+    // not exist (`sweep_registry/step_issue.rs`).
     let item_key = if step.role.acts_on_pr() {
         "loom.pr_number"
     } else {

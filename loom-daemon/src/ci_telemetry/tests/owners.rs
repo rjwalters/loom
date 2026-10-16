@@ -14,7 +14,6 @@ use crate::ci_telemetry::owners::{
     parse_logins, resolve_owners, KindCache, Owner, OwnerKind, SOURCE_CONFIG_ORG,
     SOURCE_CONFIG_OWNERS, SOURCE_DEFAULT, SOURCE_ENV_ORG, SOURCE_ENV_OWNERS,
 };
-use crate::telemetry::repo_identity::RepoIdentity;
 
 const USER: &str = "fixture-user";
 const USER_REPOS: &str = "users/fixture-user/repos?per_page=100&type=owner";
@@ -470,18 +469,11 @@ fn a_stale_page_2_in_githubs_real_organizations_id_shape_is_pruned_once_it_stops
 }
 
 // ---------------------------------------------------------------------------
-// Story stitching for a user-owned repo
+// A user-owned repo's run carries no story keys
 // ---------------------------------------------------------------------------
 
-fn gamma_identity(name: &str) -> Option<RepoIdentity> {
-    (name == "fixture-user/gamma").then(|| RepoIdentity {
-        id: 1_073_994_527,
-        full_name: name.to_string(),
-    })
-}
-
 #[test]
-fn a_user_owned_repos_run_stitches_into_its_story() {
+fn a_user_owned_repos_issue_branch_run_carries_no_story_keys() {
     let dir = TempDir::new().unwrap();
     let api = two_owner_api();
     api.edit("repos/fixture-user/gamma/actions/runs?per_page=100", |page| {
@@ -493,12 +485,10 @@ fn a_user_owned_repos_run_stitches_into_its_story() {
     });
     let ctx = CycleContext {
         owners: vec![Owner::probed(USER)],
-        repo_identity: Some(gamma_identity),
         ..two_owners(dir.path(), Arc::default())
     };
     let report = run_cycle(&ctx, &api).unwrap();
     assert!(report.repo_errors.is_empty(), "{:?}", report.repo_errors);
-    assert_eq!(report.summary.story_runs_stitched, 1, "{}", report.summary());
     let stories: BTreeSet<String> = journal(dir.path())
         .into_iter()
         .filter_map(|env| match env.record {
@@ -506,5 +496,5 @@ fn a_user_owned_repos_run_stitches_into_its_story() {
             _ => None,
         })
         .collect();
-    assert_eq!(stories, BTreeSet::from(["fixture-user/gamma#9188".to_string()]));
+    assert!(stories.is_empty(), "no span carries a story key: {stories:?}");
 }

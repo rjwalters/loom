@@ -363,7 +363,7 @@ fn begin_at(
     let journal = Journal::for_context(&store.path(root, execution));
     let at = started_at.unwrap_or(saved.started_at);
     let active = journal
-        .start(saved.context, saved.story.as_ref(), name, at, attributes)
+        .start(saved.context, None, name, at, attributes)
         .ok()?;
     Some(Span { journal, active })
 }
@@ -790,13 +790,7 @@ pub fn phase_transition(root: &Path, execution: &str, phase: &str, issue: u32, p
     );
 }
 
-pub fn prepare_execution(
-    command: &mut Command,
-    root: &Path,
-    execution: &str,
-    story: Option<&super::tracing::StoryRef>,
-    issue: Option<u32>,
-) {
+pub fn prepare_execution(command: &mut Command, root: &Path, execution: &str, issue: Option<u32>) {
     // The root carries its own ID-derivation inputs (repo + sweep id) and the
     // installed prompt surface the child is about to run.
     let mut metadata = crate::telemetry::trace::provenance::workspace(root);
@@ -804,22 +798,14 @@ pub fn prepare_execution(
         ("loom.sweep_id", execution),
         ("loom.timing_source", "dispatch_observed"),
     ]));
-    if let Some(story) = story {
-        metadata.insert("loom.issue".into(), story.issue.to_string());
-        metadata.insert("loom.repo".into(), story.repo.clone());
-        metadata.insert("loom.story_id".into(), story.context.trace_id.as_str().to_owned());
-        metadata.insert("loom.story".into(), story.story.clone());
-        metadata.insert(
-            "loom.story.key_version".into(),
-            crate::telemetry::trace::STORY_KEY_VERSION.into(),
-        );
-    } else {
-        metadata.insert("loom.repo".into(), TraceStore::repo_attribute(root));
-        // #11982: the issue is a plain fact even when `repo_id` did not
-        // resolve and no story trace exists.
-        if let Some(issue) = issue {
-            metadata.insert("loom.issue".into(), issue.to_string());
-        }
+    // The issue is a plain fact, whether or not the repo's GitHub spelling
+    // resolved (#11982).
+    let repo = issue
+        .and_then(|_| super::tracing::resolve_repo(root))
+        .unwrap_or_else(|| TraceStore::repo_attribute(root));
+    metadata.insert("loom.repo".into(), repo);
+    if let Some(issue) = issue {
+        metadata.insert("loom.issue".into(), issue.to_string());
     }
     if let Some(base) = git_facts::base_sha(root) {
         metadata.insert(git_facts::BASE_SHA.into(), base);
@@ -1184,7 +1170,7 @@ pub fn role_execution_id(role: &str, started_at: chrono::DateTime<Utc>) -> Strin
 }
 
 /// A traced role tick's identity, handed back to the role runner so the
-/// after-the-fact story join (#9168) can key and link its per-target spans.
+/// caller can key follow-up spans to the tick's root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleTrace {
     /// The tick's own `loom.role_attempt` root span.
@@ -1194,7 +1180,7 @@ pub struct RoleTrace {
     /// When the root span started.
     pub started_at: chrono::DateTime<Utc>,
     /// Why the tick failed, when it did (#10640) — the same class, code and
-    /// message its root span closed with, for the story copies.
+    /// message its root span closed with.
     pub failure: Option<RoleFailure>,
 }
 
