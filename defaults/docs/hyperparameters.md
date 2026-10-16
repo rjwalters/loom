@@ -46,7 +46,7 @@ below. Types/ranges are strict **on this surface** (see Validation).
 | Group | Key | Default | Range | Governs | Legacy home | Single-knob env |
 |---|---|---|---|---|---|---|
 | `dispatch` | `tickIntervalSecs` | 60 | 5–3600 | Work-finder tick cadence | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` |
-| `dispatch` | `maxConcurrent` | 3 | 1–256 | Sweep concurrency ceiling (dynamic cap stays bounded by disk/RAM) | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` |
+| `dispatch` | `maxConcurrent` | 3 | 1–256 | Sweep concurrency ceiling (dynamic cap stays bounded by disk headroom) | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` |
 | `dispatch` | `maxAdmissionsPerTick` | 3 | 1–64 | Ramp cap: new sweeps admitted per tick (#4234) | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` |
 | `dispatch` | `itemWeightRedMain` | 50 | 1–1000000 (integer) | Step engine item draw (#11896): priority factor of a red-main fix in `weight = actionable × priority × age`. Read per tick by the draw (`step_dispatch/item_draw.rs`) | — | — |
 | `dispatch` | `itemWeightVeryImportant` | 8 | 1–1000000 (integer) | Item-draw priority factor of `loom:very-important`, after the very-important cap (#11896) | — | — |
