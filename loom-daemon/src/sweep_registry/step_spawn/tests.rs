@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::capture::{
-    emit_step_capture, parse_outcome_line, read_outcome_line, tick_outcome, StepCapture, StepEnd,
-    StepOutcomeClass,
+    emit_step_capture, parse_outcome_line, read_outcome_line, step_failure, tick_outcome,
+    StepCapture, StepEnd, StepOutcomeClass,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -397,6 +397,46 @@ fn a_steps_end_maps_to_the_role_ticks_outcome() {
     }
 }
 
+/// #12480: every failing branch of `tick_outcome` has its own closed class,
+/// and `step_failure` is `Some` exactly when `tick_outcome` fails.
+#[test]
+fn a_failed_steps_end_maps_to_its_own_class() {
+    let noop = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=noop reason=x");
+    let failed = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=failed reason=a b");
+    let class = |end, line: Option<&_>| step_failure(end, line).map(|f| f.class().to_string());
+    assert_eq!(class(StepEnd::TimedOut, noop.as_ref()).as_deref(), Some("step-timed-out"));
+    assert_eq!(class(StepEnd::Cancelled, None).as_deref(), Some("step-cancelled"));
+    assert_eq!(
+        class(StepEnd::Exited(Some(0)), failed.as_ref()).as_deref(),
+        Some("step-outcome-failed")
+    );
+    assert_eq!(class(StepEnd::Exited(Some(7)), None).as_deref(), Some("step-exit-nonzero"));
+    assert_eq!(
+        step_failure(StepEnd::Exited(Some(7)), None)
+            .unwrap()
+            .exit_code(),
+        Some(7)
+    );
+    assert_eq!(class(StepEnd::Exited(None), None).as_deref(), Some("step-status-unknown"));
+    assert_eq!(class(StepEnd::Exited(Some(0)), noop.as_ref()), None);
+    assert_eq!(class(StepEnd::Exited(None), noop.as_ref()), None);
+    for end in [
+        StepEnd::Exited(Some(0)),
+        StepEnd::Exited(Some(2)),
+        StepEnd::Exited(None),
+        StepEnd::TimedOut,
+        StepEnd::Cancelled,
+    ] {
+        for line in [None, noop.as_ref(), failed.as_ref()] {
+            assert_eq!(
+                step_failure(end, line).is_some(),
+                matches!(tick_outcome(end, line), RoleTickOutcome::Failure(_)),
+                "{end:?} {line:?}"
+            );
+        }
+    }
+}
+
 /// Capture parity with role ticks (#11877): a step's end writes the same
 /// `role_tick.outcome` record a role tick of that role writes.
 #[test]
@@ -410,6 +450,7 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
         sweep_id: "step-champion_merge-8-1".into(),
         started_at: Utc::now() - chrono::Duration::seconds(30),
         outcome: RoleTickOutcome::Success,
+        failure: None,
         model: "opus".into(),
         effort: "high".into(),
     });

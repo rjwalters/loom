@@ -24,6 +24,7 @@
 //! probe classifies as `failed`, not as the session's word.
 
 use super::*;
+use crate::observability::lifecycle::RoleFailure;
 use crate::role_runner::RoleTickOutcome;
 
 /// The four outcome classes of a targeted step.
@@ -130,6 +131,23 @@ pub fn tick_outcome(end: StepEnd, line: Option<&StepOutcomeLine>) -> RoleTickOut
     }
 }
 
+/// The closed-vocabulary failure behind a failed [`tick_outcome`] (#12480):
+/// `Some` exactly when `tick_outcome` is a `Failure`, one class per branch.
+/// The exit code rides `exit_code`, never the class. Pure.
+#[must_use]
+pub fn step_failure(end: StepEnd, line: Option<&StepOutcomeLine>) -> Option<RoleFailure> {
+    use crate::observability::lifecycle::step;
+    let class = line.map(|l| l.class);
+    match (end, class) {
+        (StepEnd::TimedOut, _) => Some(step::TIMED_OUT.failure(None)),
+        (StepEnd::Cancelled, _) => Some(step::CANCELLED.failure(None)),
+        (_, Some(StepOutcomeClass::Failed)) => Some(step::OUTCOME_FAILED.failure(None)),
+        (StepEnd::Exited(Some(0)), _) | (StepEnd::Exited(None), Some(_)) => None,
+        (StepEnd::Exited(Some(code)), _) => Some(step::EXIT_NONZERO.failure(Some(code))),
+        (StepEnd::Exited(None), None) => Some(step::STATUS_UNKNOWN.failure(None)),
+    }
+}
+
 /// Everything the end-of-step emit needs, read out of the registry.
 #[derive(Debug, Clone)]
 pub(crate) struct StepCapture {
@@ -138,6 +156,7 @@ pub(crate) struct StepCapture {
     pub(crate) sweep_id: SweepId,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) outcome: RoleTickOutcome,
+    pub(crate) failure: Option<RoleFailure>,
     pub(crate) model: String,
     pub(crate) effort: String,
 }
@@ -155,6 +174,7 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
         capture.started_at,
         &capture.outcome,
         Some(crate::role_tick_telemetry::ResolvedLaunch::new(&capture.model, &capture.effort)),
+        capture.failure.clone(),
         &capture.sweep_id,
     );
 }
@@ -222,6 +242,7 @@ impl SweepRegistry {
             sweep_id: sweep_id.to_string(),
             started_at,
             outcome: tick_outcome(end, line.as_ref()),
+            failure: step_failure(end, line.as_ref()),
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
         };
