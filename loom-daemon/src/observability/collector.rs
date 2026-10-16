@@ -1350,6 +1350,14 @@ async fn sample_host_health(
         &crate::observability::global_export_statuses(),
         Utc::now(),
     );
+    // Cgroup-derived agent-scope census (#12166): independent of the registry
+    // so orphaned scopes show. Blocking fs/proc reads; absent on non-Linux.
+    let (agent_scopes, agent_scopes_total) =
+        tokio::task::spawn_blocking(crate::agent_scopes::census)
+            .await
+            .ok()
+            .flatten()
+            .map_or((Vec::new(), None), |(l, t)| (l, Some(t)));
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1387,6 +1395,8 @@ async fn sample_host_health(
         // zero — the same absence contract `protection`/`admission_brake`
         // follow. Swap rates come from the process-global sample history.
         memory: memory_summary(pressure, swap_in_bytes_per_sec, swap_out_bytes_per_sec),
+        agent_scopes,
+        agent_scopes_total,
     }
 }
 
