@@ -59,7 +59,8 @@ struct ResolvedCapacity {
     /// — the token axis was removed from the admission formula entirely, so
     /// there is nothing left for a client-side probe to recompute here; using
     /// the daemon's own authoritative figure guarantees this can never drift
-    /// from what `min(disk, configured_max)` actually evaluates to,
+    /// from what the daemon actually admits against (the configured
+    /// `maxConcurrent` since #12406),
     /// unlike the pre-#5270 client-side `token_axis_effective.min(...)`
     /// recomputation this superseded (which could disagree with the daemon
     /// when accounts were scarce).
@@ -105,8 +106,8 @@ fn resolve_capacity(
             // the way the pre-#5270 formula did (that recomputation could
             // disagree with the daemon whenever accounts were scarce, which is
             // exactly the artificial cap this issue removes). The daemon's own
-            // `dynamic_cap` — `min(disk, configured_max)` — is the sole
-            // authority for the cap. `token_bound`, however, is a starvation
+            // `dynamic_cap` (the configured `maxConcurrent` since #12406) is
+            // the sole authority for the cap. `token_bound`, however, is a starvation
             // signal (zero healthy accounts), independent of the cap — #5305
             // restores it here too so a fresh probe reporting 0 healthy
             // accounts still surfaces the guidance.
@@ -1217,10 +1218,12 @@ fn deep_clean_lines(report: &DaemonStatusReport) -> Vec<String> {
 /// not collect a census at all — an absent measurement renders nothing, never
 /// a misleading `0 worktrees`.
 ///
-/// # Why this is next to the disk-headroom line
+/// # Why this is next to the cap line
 ///
-/// `dynamic_cap = min(disk, configured_max)` already tells an operator
-/// that disk is binding. What it never told them is *why*: a host carrying
+/// Disk no longer bounds the cap (`dynamic_cap` is the configured
+/// `maxConcurrent` since #12406), so a filling disk shows up here and in the
+/// reclamation lines rather than as a lower cap. Free space alone never said
+/// *why* it is short: a host carrying
 /// 39 GB of long-merged `pr-*` worktrees rendered identically to a host that
 /// was genuinely full, and telling the two apart required `du`. The
 /// per-class split is the diagnosis — `pr-* 110` next to `issue-* 14` names
@@ -1791,19 +1794,18 @@ pub(crate) fn print_status_human(
         println!("  host cpu (observed, not a cap term since #4512): {basis}");
     }
 
-    // Artifact reclamation (#5919), printed with the disk term it defends:
-    // "the disk headroom above is N" and "here is why it is or is not being
-    // actively reclaimed" are the same question for an operator staring at a
-    // host whose dynamic cap is half its configured max.
+    // Artifact reclamation (#5919): "how much disk is free" and "here is why it
+    // is or is not being actively reclaimed" are the same question for an
+    // operator watching a host's disk fill. (Disk no longer lowers the cap,
+    // #12406.)
     for line in deep_clean_lines(report) {
         println!("{line}");
     }
 
-    // Worktree footprint (#5939) — printed immediately under the cap
-    // breakdown because it is the explanation for the `disk headroom` term
-    // directly above it. Without this, "disk headroom 4" on a host silently
-    // carrying 110 merged-PR worktrees looked exactly like a host that was
-    // genuinely out of space.
+    // Worktree footprint (#5939) — printed under the cap line because it
+    // explains where a host's disk went. Without it, a host silently carrying
+    // 110 merged-PR worktrees looked exactly like a host that was genuinely
+    // out of space.
     if let Some(lines) = worktree_disk_lines(worktree_disk) {
         println!();
         for line in lines {
@@ -1834,8 +1836,8 @@ pub(crate) fn print_status_human(
     // #4344, re-scoped by #5270/#5305: this used to mean "the token term is
     // starving *dispatch itself*" — true pre-#5270, when the token axis was
     // part of `dynamic_cap`. Since #5270 that is no longer possible on any
-    // auth path: `dynamic_cap` is `min(disk, configured_max)` with no
-    // token term. #5304 hard-coded this to `false` to reflect that, which
+    // auth path: `dynamic_cap` has no token term (and since #12406 it is the
+    // configured `maxConcurrent` alone). #5304 hard-coded this to `false` to reflect that, which
     // also silenced the underlying ranking-divergence detection entirely
     // (#4344's original point) — the daemon's *own* `.ranking` read can still
     // disagree with a fresher probe/ranking even though it no longer affects
@@ -1916,8 +1918,8 @@ pub(crate) fn print_status_human(
             } else if rc.token_bound {
                 // #5305: `token_bound` means genuine starvation (zero healthy
                 // accounts) — since #5270 the concurrency cap itself is
-                // unaffected (it's `min(disk, configured_max)`, no token
-                // term), but with zero healthy accounts every spawn will
+                // unaffected (it is the configured `maxConcurrent`, #12406,
+                // with no token term), but with zero healthy accounts every spawn will
                 // still fail account selection at dispatch time.
                 println!(
                     "  token-bound: NO healthy accounts — the concurrency cap is unaffected \

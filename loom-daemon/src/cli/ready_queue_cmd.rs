@@ -398,7 +398,13 @@ mod tests {
     #[test]
     fn plan_fields_render_and_ordering_comes_from_the_daemon() {
         let now = Utc::now();
-        let mut r = report_with(vec![row(1, 10, QueueDisposition::Dispatched)], now);
+        let mut r = report_with(
+            vec![
+                row(1, 10, QueueDisposition::Dispatched),
+                row(2, 11, QueueDisposition::DeferredCapacity),
+            ],
+            now,
+        );
         // A pre-#9288 daemon: no plan, no keys => no ordering, no invented copy.
         assert!(queue_json(&r, now)["ordering"].is_null());
         assert!(!render_queue(&r, now).contains("Order:"));
