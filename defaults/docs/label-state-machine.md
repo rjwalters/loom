@@ -24,6 +24,7 @@ leaves the issue uncurated. The rubric is in `.loom/docs/story-points.md`.
 
 - [The three holds (#11795)](#the-three-holds-11795)
 - [Routing to a human (#10001, #11795)](#routing-to-a-human-10001-11795)
+- [Closing out a decision: file what it names (#10940)](#closing-out-a-decision-file-what-it-names-10940)
 - [Definition](#definition)
 - [Priority labels are not holds (#11103)](#priority-labels-are-not-holds-11103)
 - [Entry points](#entry-points)
@@ -139,6 +140,33 @@ repairs it), and the curation and claim labels. An external notifier (the 2am
 turns a human-gated label being added into a notification, and resolves it
 when the label is removed or the item closes or merges. Pinned by
 `label_registry::tests::human_gated_is_exactly_the_human_must_act_labels`.
+
+## Closing out a decision: file what it names (#10940)
+
+A decision comment that names a follow-up ("file X", "handed back to Curator")
+is a commitment, and nobody else will act on it. Applying the decision files
+or sets that follow-up **in the same pass**:
+
+1. **File each concrete, authorized follow-up** in the **owning repo** with
+   `./.loom/scripts/create-issue.sh --repo OWNER/REPO` (never a bare
+   `gh issue create`), after `./.loom/scripts/check-duplicate.sh`. If a
+   duplicate exists, link it instead of filing. The new issue enters at
+   `loom:triage` and links back to the decided issue.
+2. **Park the decided issue on it** with
+   `loom-daemon park-record apply --issue N --blocked-by OWNER/REPO#M --by <role>`
+   (a same-repo ref may be `M`), so the park record is in the body. Never a
+   bare `loom:blocked`.
+3. **"Handed back to Curator" is one state:** relabel the issue `loom:triage`
+   (the queue Curator drains), remove the hold, and say in the comment what
+   Curator is to do. A hand-back with no state change is not a hand-back.
+4. **File nothing for casual suggestions.** Only a follow-up the decision
+   comment states as a commitment, or the operator's ruling authorizes,
+   qualifies. Narrative suggestions ("might be worth...") are not filed, and no
+   new work is invented from them.
+
+If the fleet credential cannot write to the owning repo, say so in the
+decision comment and leave the follow-up named there; do not fall back to
+filing it in the wrong repo or drop it silently.
 
 ## Definition
 

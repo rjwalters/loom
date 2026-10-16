@@ -103,6 +103,9 @@ pub struct TickReport {
     /// Where the step tick's wall time went, by phase (#12256). `None` when
     /// no step tick ran.
     pub phases: Option<crate::step_dispatch::gather_budget::TickPhases>,
+    /// What this tick's discovery snapshot cost and covered (#12306). `None`
+    /// when no step tick ran.
+    pub discovery: Option<crate::discovery::SnapshotStats>,
     /// Why the step tick stopped spawning before its slots were filled
     /// (#12298): `rate_limit_breaker` when the breaker tripped mid-tick.
     /// `None` when it never stopped.

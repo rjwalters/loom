@@ -108,6 +108,9 @@ const TABLE: &[(&str, Reloadability)] = &[
     // `ram_headroom::ram_admission_config`, never cached.
     ("autonomous.workFinder.ramAdmission", Reloadability::Live),
     ("autonomous.workFinder.ramChargeGb", Reloadability::Live),
+    // Read from config at every work-finder tick (#12306) —
+    // `discovery::BackendKind::for_root`, never cached.
+    ("autonomous.workFinder.discovery", Reloadability::Live),
     // Read from config at every work-finder tick (#12298) —
     // `step_dispatch::gather_budget::spawn_concurrency`, never cached.
     ("autonomous.workFinder.spawnConcurrency", Reloadability::Live),
