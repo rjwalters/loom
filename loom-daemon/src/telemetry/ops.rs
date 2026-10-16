@@ -92,6 +92,26 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.cap_disk",
     "loom.dispatch.cap_ram",
     "loom.dispatch.pr_open_prefiltered",
+    // #12074: the step gather's cost and coverage. Emitted since #12074 but
+    // missing here until #12256, so export dropped them.
+    "loom.dispatch.gather_ms",
+    "loom.dispatch.repos_gathered",
+    "loom.dispatch.repos_skipped",
+    "loom.dispatch.gather_truncated",
+    // #12256: where the tick's wall time went (`ops::dispatch_facts`).
+    "loom.dispatch.phase.listing_ms",
+    "loom.dispatch.phase.filter_ms",
+    "loom.dispatch.phase.draw_ms",
+    "loom.dispatch.phase.spawn_ms",
+    "loom.dispatch.spawn_attempts",
+    "loom.dispatch.gather_concurrency",
+    // #12298: the spawn half's concurrency and its sub-phases.
+    "loom.dispatch.spawn_concurrency",
+    "loom.dispatch.spawn_hold",
+    "loom.dispatch.phase.spawn_resolve_ms",
+    "loom.dispatch.phase.spawn_claim_ms",
+    "loom.dispatch.phase.spawn_launch_ms",
+    "loom.dispatch.phase.spawn_account_ms",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",
@@ -524,6 +544,11 @@ pub enum MetricName {
     /// (#11094).
     #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
     AgentScopePeakMemoryBytes,
+    /// Processes OOM-killed inside finished agent scopes (`memory.events`
+    /// `oom_kill`), by `repo` and `role` (#12241). One point per finished
+    /// scope that had a kill.
+    #[serde(rename = "loom.agent_scope.oom_kills")]
+    AgentScopeOomKills,
     // ---- The GitHub state mirror (2am#4367 P5) ----------------------------
     /// Discovery listings and change-stream pulls that asked the mirror, by
     /// `caller`, `repo` and `outcome` (`hit`, `stale`, `unknown`, `error`,
@@ -628,6 +653,7 @@ impl MetricName {
             Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
             Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
             Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
+            Self::AgentScopeOomKills => "loom.agent_scope.oom_kills",
             Self::ForgeMirrorReads => "loom.forge.mirror.reads",
             Self::ForgeMirrorChanges => "loom.forge.mirror.changes",
             Self::ForgeMirrorWakeLatency => "loom.forge.mirror.wake_latency",
@@ -675,7 +701,8 @@ impl MetricName {
             | Self::ForgeMirrorWakeLatency
             | Self::StageEntryLookups
             | Self::FeedCompletions
-            | Self::FeedReconcilePasses => MetricKind::DeltaCounter,
+            | Self::FeedReconcilePasses
+            | Self::AgentScopeOomKills => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -741,6 +768,7 @@ impl MetricName {
             Self::StageEntryLookups => "{lookup}",
             Self::FeedCompletions => "{completion}",
             Self::FeedReconcilePasses => "{pass}",
+            Self::AgentScopeOomKills => "{kill}",
             _ => "By",
         }
     }
@@ -860,6 +888,9 @@ impl MetricName {
             }
             Self::AgentScopePeakMemoryBytes => {
                 "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."
+            }
+            Self::AgentScopeOomKills => {
+                "Processes OOM-killed inside finished agent scopes, by repo and role."
             }
             Self::ForgeMirrorReads => {
                 "Reads that asked the GitHub state mirror, by caller, repo and outcome."

@@ -556,7 +556,12 @@ fn a_chunked_record_with_a_closed_repo_replays() {
         split_into_chunks, PickDecisionRecord, PickItemDraw, PickTick,
     };
     let k = key(9);
-    let mut draw = draw_over(three_repos(), k.clone());
+    // Repos 1 and 2 hold 20 items, so after six draws at least 14 are left
+    // to fill the eight draws that follow the closure whatever the seed.
+    let mut pool = pool_in(0, 40);
+    pool.extend(pool_in(1, 10));
+    pool.extend(pool_in(2, 10));
+    let mut draw = draw_over(pool, k.clone());
     let mut draws = Vec::new();
     for i in 0..14 {
         if i == 6 {
