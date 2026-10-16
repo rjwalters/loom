@@ -351,6 +351,9 @@ pub struct LiveScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChargeSource {
     Env,
+    /// `autonomous.workFinder.ramChargeGb` under `ramAdmission: "flat"`
+    /// (#12330).
+    Config,
     Observed,
     Default,
 }
@@ -360,6 +363,7 @@ impl ChargeSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Env => "env",
+            Self::Config => "config",
             Self::Observed => "observed",
             Self::Default => "default",
         }

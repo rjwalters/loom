@@ -2013,6 +2013,16 @@ within 256 characters; absent when nothing is held), so a hold names its repo;
 measured); and `loom.dispatch.pr_open_prefiltered`, the open-PR skips the
 pre-filter made with no admission span.
 
+Since #12330 the multi-workspace loop records those cap terms too (before, only
+the single-workspace loop did, so the production tick span carried none of
+them), and beside them the RAM term's inputs: `loom.dispatch.cap_ram_mode`
+(`observed`, `flat` or `off`: `autonomous.workFinder.ramAdmission`, or `flat`
+when `LOOM_PER_WORKTREE_RAM_GB` is set), `loom.dispatch.cap_ram_reserved_gb`
+(GB held back for the sweeps already in flight) and
+`loom.dispatch.cap_ram_remaining_gb` (available GB left after that
+reservation, which each admission is charged against). The two GB figures are
+absent under `off` and when available RAM is unmeasurable.
+
 Since #12074 the tick span also carries the step gather's cost and coverage
 (absent when no step gather ran): `loom.dispatch.gather_ms` (wall-clock
 milliseconds the gather took), `loom.dispatch.repos_gathered` (repos whose

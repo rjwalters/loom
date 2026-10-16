@@ -455,6 +455,12 @@ pub fn record_tick(
     let held = super::dispatch_facts::current_halted_repos();
     tick.attributes
         .extend(super::dispatch_facts::tick_attributes(report, cap, held));
+    // #12330: the RAM term's model, reservation and remaining budget, only
+    // beside the cap terms of this same tick.
+    if cap.is_some() {
+        tick.attributes
+            .extend(super::dispatch_facts::ram_attributes(crate::ram_headroom::last_term()));
+    }
     sink.emit_metrics_since(super::dispatch_facts::tick_points(report, cap), Some(started_at));
     for span in admission_spans(report, &tick, &repo_refs, &lockouts) {
         sink.emit_span(span);

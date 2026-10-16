@@ -2968,7 +2968,12 @@ pub fn spawn_multi_work_finder_task(
             // finished scopes into the repo history) and charges admission
             // with the observed per-repo peak.
             // The budget charges each candidate its OWN repo's peak (pass 2).
-            let (ram, ram_budget) = crate::ram_headroom::ram_headroom_limit_tick(&pool, &roots);
+            // #12330: `ramAdmission` / `ramChargeGb` choose the model, read
+            // live from the primary workspace's layered config (host tier
+            // included) every tick; `LOOM_PER_WORKTREE_RAM_GB` forces `flat`.
+            let ram_config = crate::ram_headroom::ram_admission_config(&fallback_root);
+            let (ram, ram_budget, ram_term) =
+                crate::ram_headroom::ram_headroom_limit_tick(&pool, &roots, ram_config);
             // Bounded tmpfs-fraction warning (#8572, split from #8512) — logs
             // only, never gates dispatch; see `tmpfs_warning`'s module doc.
             tmpfs_warning::check_and_warn(&fallback_root);
@@ -2991,6 +2996,12 @@ pub fn spawn_multi_work_finder_task(
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
             let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
+            // #12330: the cap's terms and the RAM term's model, reservation and
+            // remaining budget, for the tick span (`ops::dispatch_facts`). This
+            // loop never recorded its terms before, so `cap_limiter` & co.
+            // were only ever exported by the single-workspace loop.
+            tick_summary::record_cap(crate::types::CapView::from_terms(configured_max, disk, ram));
+            crate::ram_headroom::record_term(ram_term);
             // #12074: from here to the step tick nothing awaits, so every forge
             // read in between is bounded by the tick deadline and fails fast
             // past it; a listing does not fall through to the writer.

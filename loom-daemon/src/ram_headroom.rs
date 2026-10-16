@@ -287,16 +287,227 @@ impl RamBudget {
 }
 
 /// Sample the live agent scopes (folding finished scopes' peaks into the repo
-/// history), then return the RAM term and per-repo budget for `roots` — the
-/// production tick entry point (#11094).
+/// history), then return the RAM term, per-repo budget and the term's
+/// telemetry for `roots` under `config` — the production tick entry point
+/// (#11094, #12330). Scopes are sampled in every mode, so the peak history
+/// stays current while a fleet runs `flat` or `off`.
 #[must_use]
 pub fn ram_headroom_limit_tick(
     pool: &std::sync::Arc<crate::workspace_pool::WorkspacePool>,
     roots: &[std::path::PathBuf],
-) -> (usize, Option<RamBudget>) {
+    config: RamAdmissionConfig,
+) -> (usize, Option<RamBudget>, RamTerm) {
     let (scopes, in_flight) = crate::ram_peaks::live_scopes(pool, roots);
     crate::ram_peaks::record_tick(&scopes, roots);
-    ram_headroom_limit_for(roots, &in_flight)
+    ram_headroom_limit_for(roots, &in_flight, config)
+}
+
+// ============================================================================
+// Admission mode (#12330): `autonomous.workFinder.ramAdmission` / `ramChargeGb`
+// ============================================================================
+
+/// Config path choosing how the RAM term is computed (#12330).
+pub const RAM_ADMISSION_KEY: &str = "autonomous.workFinder.ramAdmission";
+/// Config path of the flat per-sweep charge (GB) used by `flat` (#12330).
+pub const RAM_CHARGE_GB_KEY: &str = "autonomous.workFinder.ramChargeGb";
+
+/// How the work finder's RAM term is computed (#12330).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RamMode {
+    /// Per-repo observed peaks (#11094): each in-flight sweep reserves its
+    /// repo's unrealised high-water and each admission is charged its repo's
+    /// padded peak. The default, and the behaviour before #12330.
+    #[default]
+    Observed,
+    /// Every sweep, in flight or new, at one flat charge
+    /// ([`RAM_CHARGE_GB_KEY`], or [`PER_WORKTREE_RAM_GB_ENV`]).
+    Flat,
+    /// No RAM term (`usize::MAX`): disk headroom and the configured
+    /// ceiling still bound the cap.
+    Off,
+}
+
+impl RamMode {
+    /// The config / telemetry spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Flat => "flat",
+            Self::Off => "off",
+        }
+    }
+
+    /// Parse the config spelling (trimmed, case-insensitive); anything else
+    /// is `None`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "observed" => Some(Self::Observed),
+            "flat" => Some(Self::Flat),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// The resolved RAM admission settings for one tick (#12330).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RamAdmissionConfig {
+    pub mode: RamMode,
+    /// The flat per-sweep charge (GB, >= 1); used by [`RamMode::Flat`].
+    pub charge_gb: u64,
+    /// Whether [`PER_WORKTREE_RAM_GB_ENV`] set it (forcing `flat`).
+    pub from_env: bool,
+}
+
+impl Default for RamAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            mode: RamMode::Observed,
+            charge_gb: DEFAULT_PER_WORKTREE_RAM_GB,
+            from_env: false,
+        }
+    }
+}
+
+/// Resolve the RAM admission settings from an effective config and the env
+/// override, with precedence env > config > default (#12330). Pure.
+///
+/// - [`PER_WORKTREE_RAM_GB_ENV`] set (a positive integer) forces `flat` at
+///   that charge, whatever the config says.
+/// - Else [`RAM_ADMISSION_KEY`] (`observed` / `flat` / `off`) and
+///   [`RAM_CHARGE_GB_KEY`] (a positive integer). An unknown mode or a
+///   non-positive / non-integer charge falls back to its default (`observed`,
+///   [`DEFAULT_PER_WORKTREE_RAM_GB`]), never to an error or a zero charge.
+#[must_use]
+pub fn ram_admission_config_from(
+    effective: &serde_json::Value,
+    env_gb: Option<u64>,
+) -> RamAdmissionConfig {
+    if let Some(gb) = env_gb {
+        return RamAdmissionConfig {
+            mode: RamMode::Flat,
+            charge_gb: gb.max(1),
+            from_env: true,
+        };
+    }
+    let mode = crate::config_resolver::get_path(effective, RAM_ADMISSION_KEY)
+        .and_then(serde_json::Value::as_str)
+        .and_then(RamMode::parse)
+        .unwrap_or_default();
+    let charge_gb = crate::config_resolver::get_path(effective, RAM_CHARGE_GB_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_PER_WORKTREE_RAM_GB);
+    RamAdmissionConfig {
+        mode,
+        charge_gb,
+        from_env: false,
+    }
+}
+
+/// The RAM admission settings for the daemon rooted at `root`, read live from
+/// its layered config (host-local tier included) every tick (#12330).
+#[must_use]
+pub fn ram_admission_config(root: &std::path::Path) -> RamAdmissionConfig {
+    ram_admission_config_from(
+        &crate::config_resolver::resolve_effective_config(root),
+        env_per_worktree_ram_gb(),
+    )
+}
+
+/// What one tick's RAM term was, for the `loom.dispatch.tick` span (#12330).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RamTerm {
+    pub mode: RamMode,
+    /// GB held back for the in-flight sweeps; `None` when not computed
+    /// (`off`, or available RAM unmeasurable).
+    pub reserved_gb: Option<u64>,
+    /// Available GB left after the reservation; `None` when not computed.
+    pub remaining_gb: Option<u64>,
+}
+
+/// The RAM term under `config` (#12330). Pure.
+///
+/// - `observed`: [`ram_admission_reserving`] (no env charge — env forces
+///   `flat`), unchanged from #11094.
+/// - `flat`: every in-flight sweep reserves `charge_gb` and each admission is
+///   charged `charge_gb`, so the cap is the in-flight count plus what fits in
+///   `available - in_flight * charge_gb`. With no sweeps in flight this is the
+///   legacy `floor(available / charge)`.
+/// - `off`: `usize::MAX` and no budget.
+#[must_use]
+pub fn ram_admission_mode(
+    config: RamAdmissionConfig,
+    available_gb: u64,
+    store: &crate::ram_peaks::Store,
+    roots: &[std::path::PathBuf],
+    in_flight: &[usize],
+) -> (usize, Option<RamBudget>, RamTerm) {
+    let term = |reserved: Option<u64>, remaining: Option<u64>| RamTerm {
+        mode: config.mode,
+        reserved_gb: reserved,
+        remaining_gb: remaining,
+    };
+    match config.mode {
+        RamMode::Off => (usize::MAX, None, term(None, None)),
+        RamMode::Observed => {
+            let (cap, budget, reserved) =
+                ram_admission_reserving(available_gb, store, roots, in_flight, None);
+            let remaining = budget.as_ref().map_or(available_gb, |b| b.remaining_gb);
+            (cap, budget, term(Some(reserved), Some(remaining)))
+        }
+        RamMode::Flat => {
+            let charge = config.charge_gb.max(1);
+            let occupancy: usize = in_flight.iter().sum();
+            let reserved = u64::try_from(occupancy)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(charge);
+            let remaining = available_gb.saturating_sub(reserved);
+            let source = if config.from_env {
+                crate::ram_peaks::ChargeSource::Env
+            } else {
+                crate::ram_peaks::ChargeSource::Config
+            };
+            let charges = roots
+                .iter()
+                .map(|r| RepoCharge {
+                    repo: crate::ram_peaks::repo_key(r),
+                    gb: charge,
+                    source,
+                })
+                .collect();
+            let additional = ram_headroom(remaining, charge);
+            let budget = RamBudget {
+                remaining_gb: remaining,
+                charges,
+            };
+            (
+                ram_total_cap(additional, occupancy, true),
+                Some(budget),
+                term(Some(reserved), Some(remaining)),
+            )
+        }
+    }
+}
+
+/// The last multi-workspace tick's RAM term (#12330), read by the tick span.
+static LAST_TERM: std::sync::Mutex<Option<RamTerm>> = std::sync::Mutex::new(None);
+
+/// Record this tick's RAM term for the `loom.dispatch.tick` span.
+pub fn record_term(term: RamTerm) {
+    *LAST_TERM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(term);
+}
+
+/// The last recorded RAM term, or `None` before the first tick.
+#[must_use]
+pub fn last_term() -> Option<RamTerm> {
+    *LAST_TERM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Pure RAM admission terms for `roots` (#11094), given `available_gb`, the
@@ -325,6 +536,21 @@ pub fn ram_admission(
     in_flight: &[usize],
     env_gb: Option<u64>,
 ) -> (usize, Option<RamBudget>) {
+    let (cap, budget, _) = ram_admission_reserving(available_gb, store, roots, in_flight, env_gb);
+    (cap, budget)
+}
+
+/// [`ram_admission`], also returning the GB it held back for the in-flight
+/// sweeps (the live reservation plus the unaccounted sweeps' charges; `0` on
+/// the legacy flat path) — the figure the tick span exports (#12330).
+#[must_use]
+pub fn ram_admission_reserving(
+    available_gb: u64,
+    store: &crate::ram_peaks::Store,
+    roots: &[std::path::PathBuf],
+    in_flight: &[usize],
+    env_gb: Option<u64>,
+) -> (usize, Option<RamBudget>, u64) {
     let occupancy: usize = in_flight.iter().sum();
     use crate::ram_peaks::{self, ChargeSource};
     let charges: Vec<RepoCharge> = roots
@@ -342,7 +568,7 @@ pub fn ram_admission(
     let reserved_gb = ram_peaks::reserved_bytes(store).div_ceil(1024 * 1024 * 1024);
     let flat = env_gb.unwrap_or(DEFAULT_PER_WORKTREE_RAM_GB);
     if reserved_gb == 0 && charges.iter().all(|c| c.source != ChargeSource::Observed) {
-        return (ram_headroom(available_gb, flat), None);
+        return (ram_headroom(available_gb, flat), None, 0);
     }
     let reserved_gb = reserved_gb.saturating_add(unaccounted_gb(store, &charges, in_flight));
     let min_charge = charges.iter().map(|c| c.gb).min().unwrap_or(flat);
@@ -351,7 +577,7 @@ pub fn ram_admission(
         remaining_gb: available_gb.saturating_sub(reserved_gb),
         charges,
     };
-    (ram_total_cap(additional, occupancy, true), Some(budget))
+    (ram_total_cap(additional, occupancy, true), Some(budget), reserved_gb)
 }
 
 /// GB to hold back for the in-flight sweeps the live reservation does NOT
@@ -382,28 +608,35 @@ fn unaccounted_gb(
         .fold(0, u64::saturating_add)
 }
 
-/// Observed-history-aware RAM term and per-repo budget for the given
-/// workspace roots (#11094), where `in_flight` is the number of sweeps already
-/// in flight in each root; see [`ram_admission`]. Each repo's charge, its
-/// source, the reservation and the remaining budget are logged (INFO on
-/// change, DEBUG otherwise), so the log names the repo whose history set each
-/// charge.
+/// The RAM term, per-repo budget and telemetry for the given workspace roots
+/// under `config` (#11094, #12330), where `in_flight` is the number of sweeps
+/// already in flight in each root; see [`ram_admission_mode`]. Each repo's
+/// charge, its source, the reservation and the remaining budget are logged
+/// (INFO on change, DEBUG otherwise), so the log names the repo whose history
+/// set each charge.
 #[must_use]
 pub fn ram_headroom_limit_for(
     roots: &[std::path::PathBuf],
     in_flight: &[usize],
-) -> (usize, Option<RamBudget>) {
+    config: RamAdmissionConfig,
+) -> (usize, Option<RamBudget>, RamTerm) {
     let occupancy: usize = in_flight.iter().sum();
-    use crate::ram_peaks;
-    let Some(available) = available_ram_gb() else {
-        return (ram_headroom_limit(), None);
+    let unmeasured = RamTerm {
+        mode: config.mode,
+        reserved_gb: None,
+        remaining_gb: None,
     };
-    let store = ram_peaks::store_path()
-        .map(|p| ram_peaks::load(&p))
+    if config.mode == RamMode::Off {
+        return (usize::MAX, None, unmeasured);
+    }
+    let Some(available) = available_ram_gb() else {
+        // Unknown != zero: skip the clamp (logs the warning).
+        return (ram_headroom_limit_at(None, config.charge_gb), None, unmeasured);
+    };
+    let store = crate::ram_peaks::store_path()
+        .map(|p| crate::ram_peaks::load(&p))
         .unwrap_or_default();
-    let (headroom, budget) =
-        ram_admission(available, &store, roots, in_flight, env_per_worktree_ram_gb());
-    let reserved_gb = ram_peaks::reserved_bytes(&store).div_ceil(1024 * 1024 * 1024);
+    let (headroom, budget, term) = ram_admission_mode(config, available, &store, roots, in_flight);
     let charges = budget.as_ref().map_or_else(
         || "flat".to_string(),
         |b| {
@@ -414,14 +647,16 @@ pub fn ram_headroom_limit_for(
                 .join(",")
         },
     );
-    let remaining = budget.as_ref().map_or(available, |b| b.remaining_gb);
+    let reserved_gb = term.reserved_gb.unwrap_or(0);
+    let remaining = term.remaining_gb.unwrap_or(available);
+    let mode = config.mode.as_str();
     let line = format!(
-        "ram_headroom: charges=[{charges}] in_flight_reservation={reserved_gb}GB \
+        "ram_headroom: mode={mode} charges=[{charges}] in_flight_reservation={reserved_gb}GB \
          available={available}GB remaining={remaining}GB in_flight={occupancy} \
          headroom={headroom}"
     );
     static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    let key = format!("{charges}/{reserved_gb}/{headroom}");
+    let key = format!("{mode}/{charges}/{reserved_gb}/{headroom}");
     let mut last = LAST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -431,7 +666,7 @@ pub fn ram_headroom_limit_for(
         log::info!("{line}");
         *last = Some(key);
     }
-    (headroom, budget)
+    (headroom, budget, term)
 }
 
 /// Resolve the RAM-headroom concurrency bound for the current host: the
@@ -445,8 +680,13 @@ pub fn ram_headroom_limit_for(
 /// the unmeasurable probe as "no RAM available".
 #[must_use]
 pub fn ram_headroom_limit() -> usize {
-    match available_ram_gb() {
-        Some(gb) => ram_headroom(gb, per_worktree_ram_gb()),
+    ram_headroom_limit_at(available_ram_gb(), per_worktree_ram_gb())
+}
+
+/// [`ram_headroom_limit`] for a given probe result and charge.
+fn ram_headroom_limit_at(available: Option<u64>, per_gb: u64) -> usize {
+    match available {
+        Some(gb) => ram_headroom(gb, per_gb),
         None => {
             log::warn!(
                 "ram_headroom: could not measure available RAM on this host — skipping the RAM \
@@ -726,6 +966,148 @@ mod tests {
         assert_eq!(b.remaining_gb, 20, "28 - 8 reserved, not also - 15");
         assert_eq!(cap, 1 + 1, "the running sweep + floor(20 / 15)");
         assert!(b.fits(0));
+    }
+
+    // ===================================================================
+    // ramAdmission / ramChargeGb — #12330
+    // ===================================================================
+
+    /// The #12330 host: 60 GB available, 12 light in-flight sweeps (1 GB
+    /// each) of a repo whose recorded peak pads to 15 GB.
+    fn idle_host_with_heavy_history() -> (crate::ram_peaks::Store, Vec<std::path::PathBuf>) {
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB + GIB / 2]);
+        for i in 0..12 {
+            store
+                .inflight
+                .insert(format!("s{i}"), sweep("heavy", i + 1, GIB));
+        }
+        (store, vec!["/w/heavy".into()])
+    }
+
+    fn cfg(mode: RamMode, charge_gb: u64) -> RamAdmissionConfig {
+        RamAdmissionConfig {
+            mode,
+            charge_gb,
+            from_env: false,
+        }
+    }
+
+    #[test]
+    fn test_ram_mode_observed_keeps_the_11094_numbers() {
+        let (store, roots) = idle_host_with_heavy_history();
+        let (cap, budget, term) =
+            ram_admission_mode(RamAdmissionConfig::default(), 60, &store, &roots, &[12]);
+        // Each sweep reserves 13.5 - 1 = 12.5 GB of unrealised peak: 150 GB
+        // reserved against 60 available, so nothing new fits.
+        assert_eq!(
+            (cap, budget.clone()),
+            ram_admission(60, &store, &roots, &[12], None),
+            "observed is exactly the pre-#12330 term"
+        );
+        assert_eq!(cap, 12, "pinned at the in-flight count: no new admission");
+        assert_eq!(term.mode, RamMode::Observed);
+        assert_eq!(term.reserved_gb, Some(150));
+        assert_eq!(term.remaining_gb, Some(0));
+        assert_eq!(budget.unwrap().charges[0].gb, 15);
+    }
+
+    #[test]
+    fn test_ram_mode_flat_does_not_pin_an_idle_host() {
+        let (store, roots) = idle_host_with_heavy_history();
+        let (cap, budget, term) =
+            ram_admission_mode(cfg(RamMode::Flat, 2), 60, &store, &roots, &[12]);
+        // 12 x 2 GB reserved, (60 - 24) / 2 = 18 more.
+        assert_eq!(cap, 12 + 18);
+        assert_eq!(term.reserved_gb, Some(24));
+        assert_eq!(term.remaining_gb, Some(36));
+        let b = budget.unwrap();
+        assert_eq!(b.charges[0].gb, 2);
+        assert_eq!(b.charges[0].source, crate::ram_peaks::ChargeSource::Config);
+        // With nothing in flight it is the legacy floor(available / charge).
+        let (cap, _, _) = ram_admission_mode(cfg(RamMode::Flat, 4), 21, &store, &roots, &[0]);
+        assert_eq!(cap, 5);
+        // An over-committed host admits nothing new, and never goes below
+        // the running count.
+        let (cap, _, term) = ram_admission_mode(cfg(RamMode::Flat, 8), 60, &store, &roots, &[12]);
+        assert_eq!((cap, term.remaining_gb), (12, Some(0)));
+    }
+
+    #[test]
+    fn test_ram_mode_off_is_unbounded() {
+        let (store, roots) = idle_host_with_heavy_history();
+        let (cap, budget, term) =
+            ram_admission_mode(cfg(RamMode::Off, 2), 60, &store, &roots, &[12]);
+        assert_eq!(cap, usize::MAX);
+        assert!(budget.is_none());
+        assert_eq!((term.reserved_gb, term.remaining_gb), (None, None));
+        // Disk and the configured max still bound the cap.
+        assert_eq!(crate::work_finder::resolve_dynamic_max_concurrent(9, cap, 20), 9);
+        assert_eq!(crate::work_finder::resolve_dynamic_max_concurrent(40, cap, 20), 20);
+    }
+
+    #[test]
+    fn test_ram_admission_config_reads_the_keys() {
+        use serde_json::json;
+        let at = |mode: serde_json::Value, gb: serde_json::Value| json!({"autonomous": {"workFinder": {"ramAdmission": mode, "ramChargeGb": gb}}});
+        assert_eq!(ram_admission_config_from(&json!({}), None), RamAdmissionConfig::default());
+        let c = ram_admission_config_from(&at(json!("flat"), json!(3)), None);
+        assert_eq!((c.mode, c.charge_gb, c.from_env), (RamMode::Flat, 3, false));
+        let c = ram_admission_config_from(&at(json!(" OFF "), json!(3)), None);
+        assert_eq!(c.mode, RamMode::Off);
+        let c = ram_admission_config_from(&at(json!("observed"), json!(3)), None);
+        assert_eq!(c.mode, RamMode::Observed);
+    }
+
+    #[test]
+    fn test_ram_admission_config_garbage_falls_back_to_defaults() {
+        use serde_json::json;
+        let at = |mode: serde_json::Value, gb: serde_json::Value| json!({"autonomous": {"workFinder": {"ramAdmission": mode, "ramChargeGb": gb}}});
+        for (mode, gb) in [
+            (json!("realistic"), json!(0)),
+            (json!(7), json!(-2)),
+            (json!(null), json!("4")),
+            (json!(["flat"]), json!(2.5)),
+        ] {
+            assert_eq!(
+                ram_admission_config_from(&at(mode.clone(), gb.clone()), None),
+                RamAdmissionConfig::default(),
+                "{mode} / {gb}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ram_admission_env_beats_config_and_forces_flat() {
+        use serde_json::json;
+        let off = json!({"autonomous": {"workFinder": {"ramAdmission": "off", "ramChargeGb": 9}}});
+        let c = ram_admission_config_from(&off, Some(4));
+        assert_eq!((c.mode, c.charge_gb, c.from_env), (RamMode::Flat, 4, true));
+        let (store, roots) = idle_host_with_heavy_history();
+        let (_, budget, _) = ram_admission_mode(c, 60, &store, &roots, &[12]);
+        assert_eq!(budget.unwrap().charges[0].source, crate::ram_peaks::ChargeSource::Env);
+    }
+
+    #[test]
+    #[serial]
+    fn test_ram_admission_config_host_tier_beats_workspace_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".loom")).unwrap();
+        std::fs::create_dir_all(root.join(".loom-local")).unwrap();
+        std::fs::write(
+            root.join(".loom/config.json"),
+            r#"{"autonomous": {"workFinder": {"ramAdmission": "observed", "ramChargeGb": 6}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".loom-local/local.json"),
+            r#"{"autonomous": {"workFinder": {"ramAdmission": "flat"}}}"#,
+        )
+        .unwrap();
+        std::env::remove_var(PER_WORKTREE_RAM_GB_ENV);
+        let c = ram_admission_config(root);
+        assert_eq!((c.mode, c.charge_gb), (RamMode::Flat, 6), "host tier wins, keys merge");
     }
 
     #[test]

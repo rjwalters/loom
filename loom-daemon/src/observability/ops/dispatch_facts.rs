@@ -23,6 +23,11 @@
 //!   names the repo from the checkout's `origin` remote (the memoised read the
 //!   tick's listings already make), never a local path.
 //!
+//! - **Why the RAM term is what it is** (#12330).
+//!   `loom.dispatch.cap_ram_mode` (`autonomous.workFinder.ramAdmission`),
+//!   `loom.dispatch.cap_ram_reserved_gb` and
+//!   `loom.dispatch.cap_ram_remaining_gb` ([`ram_attributes`]).
+//!
 //! - **How long the step gather took, and what it covered** (#12074).
 //!   `loom.dispatch.gather_ms`, `loom.dispatch.repos_gathered`,
 //!   `loom.dispatch.repos_skipped` and `loom.dispatch.gather_truncated`, so a
@@ -118,6 +123,26 @@ pub fn tick_attributes(
     }
     if let Some(hold) = &report.spawn_hold {
         out.push(("loom.dispatch.spawn_hold".into(), hold.clone()));
+    }
+    out
+}
+
+/// The tick span's RAM-term attributes (#12330): the admission model
+/// (`observed` / `flat` / `off`), and — when computed — the GB held back for
+/// the in-flight sweeps and the available GB left after it. With
+/// `loom.dispatch.cap_ram` and `loom.dispatch.cap_limiter` they say why the
+/// RAM term is what it is. Pure.
+#[must_use]
+pub fn ram_attributes(term: Option<crate::ram_headroom::RamTerm>) -> Vec<(String, String)> {
+    let Some(term) = term else {
+        return Vec::new();
+    };
+    let mut out = vec![("loom.dispatch.cap_ram_mode".to_string(), term.mode.as_str().to_string())];
+    if let Some(gb) = term.reserved_gb {
+        out.push(("loom.dispatch.cap_ram_reserved_gb".into(), gb.to_string()));
+    }
+    if let Some(gb) = term.remaining_gb {
+        out.push(("loom.dispatch.cap_ram_remaining_gb".into(), gb.to_string()));
     }
     out
 }
@@ -358,6 +383,46 @@ mod tests {
             .find(|p| p.name == MetricName::DispatchPrOpenPrefiltered)
             .unwrap();
         assert_eq!(prefiltered.value, MetricValue::Int(2));
+    }
+
+    /// #12330: the binding axis for each term, and the RAM term's model and
+    /// budget, all on the ops allowlist.
+    #[test]
+    fn tick_facts_name_the_binding_axis_and_the_ram_term() {
+        use crate::ram_headroom::{RamMode, RamTerm};
+        let limiter = |c, d, r| CapView::from_terms(c, d, r).limiter().as_str();
+        assert_eq!(limiter(20, 30, 1), "ram");
+        assert_eq!(limiter(20, 3, 9), "disk");
+        assert_eq!(limiter(20, 30, usize::MAX), "configured", "ram off never binds");
+        assert_eq!(limiter(20, 30, 20), "configured", "a tie is the operator's");
+
+        let attrs = ram_attributes(Some(RamTerm {
+            mode: RamMode::Flat,
+            reserved_gb: Some(24),
+            remaining_gb: Some(36),
+        }));
+        let get = |k: &str| {
+            attrs
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("loom.dispatch.cap_ram_mode"), Some("flat"));
+        assert_eq!(get("loom.dispatch.cap_ram_reserved_gb"), Some("24"));
+        assert_eq!(get("loom.dispatch.cap_ram_remaining_gb"), Some("36"));
+        for (key, _) in &attrs {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
+                "{key}"
+            );
+        }
+        let off = ram_attributes(Some(RamTerm {
+            mode: RamMode::Off,
+            reserved_gb: None,
+            remaining_gb: None,
+        }));
+        assert_eq!(off, vec![("loom.dispatch.cap_ram_mode".to_string(), "off".to_string())]);
+        assert!(ram_attributes(None).is_empty());
     }
 
     #[test]
