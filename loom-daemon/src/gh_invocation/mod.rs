@@ -516,14 +516,16 @@ impl GhInvocation {
         self
     }
 
-    /// Classify this read for reader exhaustion (W4-C). The default,
-    /// [`ReadClass::Gate`], routes the read like the others; whatever the
-    /// class, a read is shed ([`GhCompletion::Shed`]) rather than spending the
-    /// writer's bucket when every reader for its owner and resource is
-    /// withdrawn (#12394). The class still sets the router's headroom
-    /// reserve: mark a read non-`Gate` only when its consumer maps "no
-    /// answer" to skip / unknown and nothing it decides (a dispatch, claim,
-    /// merge, reap, label flip) rests on it.
+    /// Classify this read for the reader router (W4-C). Every class is shed
+    /// ([`GhCompletion::Shed`]) when no reader can serve it: the writer is
+    /// never used for reads (#12394). The class decides how early: the
+    /// default, [`ReadClass::Gate`], takes any usable reader whatever its
+    /// projected budget, while a [`ReadClass::Hygiene`] or
+    /// [`ReadClass::Observability`] read also needs headroom (the router's
+    /// `shedPct` reserve), so it is shed first and the readers' last budget
+    /// is kept for decision-gating reads. Mark a read non-`Gate` only when
+    /// its consumer maps "no answer" to skip / unknown and nothing it decides
+    /// (a dispatch, claim, merge, reap, label flip) rests on it.
     #[must_use]
     pub fn read_class(mut self, class: ReadClass) -> Self {
         self.read_class = class;

@@ -77,6 +77,11 @@ impl Stub {
     /// Run one targeted read against a router offering the gateway first,
     /// then (`with_reader`) a reader, honouring the run's withdrawals.
     fn run(&self, with_reader: bool) -> (GhCompletion, Vec<(String, Failure)>) {
+        self.run_on(with_reader, "acme/r")
+    }
+
+    /// [`Stub::run`] for `repo` (`issues/1` of it).
+    fn run_on(&self, with_reader: bool, repo: &str) -> (GhCompletion, Vec<(String, Failure)>) {
         let withdrawn: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let log = RefCell::new(Vec::new());
         let lookup = |_: &RouteRequest<'_>| {
@@ -108,12 +113,12 @@ impl Stub {
         let inv = GhInvocation::new(
             Operation::new("issue.view"),
             AccessIntent::Read,
-            GhTarget::repo("acme/r").unwrap(),
+            GhTarget::repo(repo).unwrap(),
             Duration::from_secs(10),
         )
         .parent(ParentContext::Missing)
         .program(&self.gh)
-        .args(["api", "repos/acme/r/issues/1"])
+        .args(["api".to_string(), format!("repos/{repo}/issues/1")])
         .read_class(ReadClass::Gate);
         let out = inv
             .execute_routed_v2_at(&lookup, &withdraw, SystemTime::now())
@@ -143,22 +148,40 @@ fn a_bad_gateway_with_no_reader_is_shed_never_sent_to_the_writer() {
     assert_eq!(s.calls(), ["gateway"], "writer stub NOT invoked");
 }
 
-/// A 404 through the gateway is GitHub's answer, not an outage: the gateway
-/// is not outage-withdrawn. It is no answer for the caller either (the
-/// gateway may simply not cover the repo), so it is withdrawn for the repo as
-/// a coverage miss and, with no reader left, the read sheds. The writer is
-/// never asked (#12394).
+/// A 404 from GitHub through the gateway is never an outage. It is the
+/// item's answer only with evidence the gateway covers the repo's family
+/// (W6); without it the gateway is withdrawn for the repo, the next reader
+/// serves the read, and with none left it is shed (#12394 review).
 #[test]
 fn a_not_found_through_the_gateway_is_not_an_outage() {
+    // No evidence, no reader: shed; the gateway is withdrawn for the repo.
     let s = stub(NOT_FOUND, OK, NOT_FOUND);
-    let (out, withdrawals) = s.run(false);
+    let (out, withdrawals) = s.run_on(false, "acme/gw-404-a");
     assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
     assert_eq!(s.calls(), ["gateway"], "writer stub NOT invoked");
     assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
-    assert!(
-        withdrawals.iter().all(|w| w.1 == Failure::Coverage),
-        "only a coverage withdrawal, never an outage: {withdrawals:?}"
+    assert_eq!(withdrawals, [(GATEWAY_APP_ID.to_string(), Failure::Coverage)]);
+
+    // No evidence, a reader behind it: the reader serves the read.
+    let s = stub(NOT_FOUND, OK, NOT_FOUND);
+    let (out, withdrawals) = s.run_on(true, "acme/gw-404-b");
+    assert!(ok(&out), "{out:?}");
+    assert_eq!(s.calls(), ["gateway", "reader"]);
+    assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
+    assert_eq!(withdrawals, [(GATEWAY_APP_ID.to_string(), Failure::Coverage)]);
+
+    // The gateway recently served the repo's `issues`: its 404 is the answer.
+    crate::forge_identity::served::note_reader_served(
+        GATEWAY_APP_ID,
+        "acme/gw-404-c",
+        "issues",
+        SystemTime::now(),
     );
+    let s = stub(NOT_FOUND, OK, NOT_FOUND);
+    let (out, withdrawals) = s.run_on(true, "acme/gw-404-c");
+    assert!(matches!(out, GhCompletion::Captured(_)) && !ok(&out), "{out:?}");
+    assert_eq!(s.calls(), ["gateway"]);
+    assert!(withdrawals.is_empty(), "{withdrawals:?}");
 }
 
 /// A relayed GitHub 5xx, and a non-`api` read's bare `HTTP 500` (gh prints

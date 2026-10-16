@@ -192,6 +192,39 @@ fn an_empty_roster_a_foreign_host_or_no_owner_is_no_pool() {
 // ---- owners filter -------------------------------------------------------------
 
 #[test]
+fn a_pool_with_no_reader_for_the_owner_is_unavailable_not_no_pool() {
+    // The host HAS a reader pool, but every reader's `owners` excludes this
+    // owner: not "no pool" (which would put the read on the writer, #12394
+    // review), an Unavailable exhaustion the read chains shed.
+    let r = roster(vec![
+        reader("81041", Some(&["acme"])),
+        reader("81042", Some(&["acme"])),
+    ]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = RoutingConfig::default();
+    let now = SystemTime::now();
+    let d = route_read_in(ws.path(), &r, &req("third-party/x", None), &v2(&cfg), now);
+    assert!(
+        matches!(
+            d,
+            RouteDecision::Exhausted {
+                cause: ExhaustCause::Unavailable,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
+    assert!(owner_uncovered_in(&r, "third-party", RoutingMode::Scoped));
+    assert!(!owner_uncovered_in(&r, "ACME", RoutingMode::Scoped));
+    // No pool at all, or legacy routing (no owners filter): never uncovered.
+    assert!(!owner_uncovered_in(&roster(vec![]), "third-party", RoutingMode::Scoped));
+    assert!(!owner_uncovered_in(&r, "third-party", RoutingMode::Legacy));
+    // The covered owner still routes to a reader.
+    let d = route_read_in(ws.path(), &r, &req("acme/x", None), &v2(&cfg), now);
+    assert!(matches!(d, RouteDecision::Reader { .. }), "{d:?}");
+}
+
+#[test]
 fn a_reader_limited_to_one_owner_leaves_other_owners_untouched() {
     let base = roster(vec![reader("81051", None), reader("81052", None)]);
     let mut with_third = base.clone();

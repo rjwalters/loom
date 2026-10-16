@@ -8695,8 +8695,25 @@ flips spend. A read never goes to it, whatever its class or cause:
   `ReadShed`; the agent `gh` front's exit `75`). The caller defers it, skips
   the pass or serves from cache. The reader-to-writer fallback is deleted:
   there is no `writer-fallback` role and no kill switch.
-- **A 403/404 is the reader's own answer**, returned as-is. The writer is not
-  asked to confirm it, and the reader is not withdrawn for it.
+- **A 403/404 is an answer only from a reader shown to cover the repo.**
+  The writer is never asked to confirm it, so the reader's own evidence
+  decides (`forge_identity::served::judge_coverage`): an item-scoped read
+  (`repos/<o>/<r>/<family>/<item>`) answered `404` by a reader that served a
+  `200`/`304` for the same repo and endpoint family within the last hour is
+  the item's answer (`forge.item_scoped_404`). A `403`, "Resource not
+  accessible by integration", "Could not resolve to a repository", or any
+  refusal from a reader with no evidence for the repo means the reader is
+  blind to it: it is withdrawn for that repo only, the next reader is tried,
+  and the read is shed when none is left. A plain `404` from a reader that
+  served another family of the repo is shed without a withdrawal, so one
+  missing item cannot take a covering reader off the repo. A refusal is
+  never returned to the caller as "absent" on its own say-so.
+- **A pool with no reader for the owner is not "no pool".** When readers are
+  configured but every one's `owners` excludes the read's owner, the router
+  answers an `unavailable` exhaustion (shed, with an `error` log per owner at
+  most every five minutes), not the no-pool writer path. The agent `gh`
+  front's exit-`75` message then says retrying will not help until a reader
+  for that owner is configured.
 - **Only writes use the writer**: POST, PATCH, PUT, DELETE, GraphQL
   mutations and the minimal read a write needs in the same operation (a
   lease read back right after posting it, merge settings hidden from a reader
@@ -8865,7 +8882,9 @@ name gh's own target and are not conditional.
   item's answer (no writer retry, no withdrawal, `forge.item_scoped_404`)
   only when the same reader answered a `200`/`304` for the same repo and the
   same endpoint family (`issues` vs `pulls`) within the last hour. Otherwise
-  it is a coverage failure, retried on the writer as before.
+  it is no answer: a reader with no evidence for the repo is withdrawn from
+  it and the next reader is tried; with none left the read is shed (see "The
+  writer is never used for reads").
 - **Trust boundary.** A `304` serves the body stored next to the `ETag` in
   the `0700` per-user store. Any process of the same uid (agents included)
   can write it; that is accepted, as the same uid can already edit the

@@ -11,7 +11,9 @@ use std::time::Duration;
 
 /// A `gh` stub that logs the basename of the `GH_CONFIG_DIR` it ran under
 /// (`writer` for anything that is not one of the test's reader dirs) and
-/// answers a rate limit under `reader-limited`, else `200 []`.
+/// answers a rate limit under `reader-limited`, a 403 "not accessible by
+/// integration" under `reader-blind`, a 404 under `reader-gone`, else
+/// `200 []`.
 fn stub(dir: &Path) -> (PathBuf, PathBuf) {
     let log = dir.join("calls.log");
     let gh = dir.join("gh-deferrable-stub");
@@ -26,6 +28,17 @@ if [ "$who" = reader-limited ]; then
   printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Resource: core\r\n\r\n'
   printf '{{"message": "API rate limit exceeded"}}\n'
   echo 'gh: API rate limit exceeded for installation (HTTP 403)' 1>&2
+  exit 1
+fi
+if [ "$who" = reader-blind ]; then
+  printf 'HTTP/2.0 403 Forbidden\r\n\r\n'
+  printf '{{"message": "Resource not accessible by integration"}}\n'
+  echo 'gh: Resource not accessible by integration (HTTP 403)' 1>&2
+  exit 1
+fi
+if [ "$who" = reader-gone ]; then
+  printf 'HTTP/2.0 404 Not Found\r\n\r\n{{"message": "Not Found"}}\n'
+  echo 'gh: Not Found (HTTP 404)' 1>&2
   exit 1
 fi
 printf 'HTTP/2.0 200 OK\r\nEtag: W/"e"\r\n\r\n[]\n'
@@ -262,4 +275,100 @@ fn withdrawn_or_unavailable_readers_never_send_a_read_to_the_writer() {
         }
     }
     assert!(calls(&log).is_empty(), "{:?}", calls(&log));
+}
+
+/// A reader that cannot see the repo (403 "not accessible by integration",
+/// or a 404 with no evidence it covers the repo) is not an answer: it is
+/// withdrawn for the repo and the next reader serves the read (#12394 review).
+#[test]
+fn a_reader_blind_to_the_repo_fails_over_to_the_next_reader() {
+    for refusing in ["reader-blind", "reader-gone"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gh, log) = stub(tmp.path());
+        let blind = tmp.path().join(refusing);
+        let spare = tmp.path().join("reader-spare");
+        std::fs::create_dir_all(&blind).unwrap();
+        std::fs::create_dir_all(&spare).unwrap();
+        let pid = std::process::id();
+        let asked = Cell::new(0);
+        let route = |_: &RouteRequest<'_>| {
+            asked.set(asked.get() + 1);
+            let (dir, app_id) = if asked.get() == 1 {
+                (blind.clone(), format!("w7-{refusing}-{pid}"))
+            } else {
+                (spare.clone(), format!("w7-spare-{pid}"))
+            };
+            RouteDecision::Reader {
+                dir,
+                app_id,
+                placement: Placement::Home,
+            }
+        };
+        let (_, resp, _) =
+            fetch_conditional_via(site(ReadClass::Gate), &gh, None, &target(), URL, None, &route)
+                .unwrap();
+        assert_eq!(resp.unwrap().status, 200, "{refusing}");
+        assert_eq!(calls(&log), [refusing, "reader-spare"], "{refusing}: no writer call");
+        let repo = target().repo.unwrap();
+        assert!(
+            crate::forge_identity::repo_withdrawn_at(
+                &format!("w7-{refusing}-{pid}"),
+                &repo,
+                SystemTime::now()
+            ),
+            "{refusing}: withdrawn for the repo"
+        );
+    }
+}
+
+/// The only reader refusing the repo: the read is shed — never a 404 the
+/// caller would read as "absent", and never the writer.
+#[test]
+fn the_only_reader_refusing_the_repo_is_a_shed_not_an_absent() {
+    for refusing in ["reader-blind", "reader-gone"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gh, log) = stub(tmp.path());
+        let blind = tmp.path().join(refusing);
+        std::fs::create_dir_all(&blind).unwrap();
+        let app = format!("w7-only-{refusing}-{}", std::process::id());
+        let asked = Cell::new(0);
+        // The router offers the reader, then (it is withdrawn from the repo)
+        // nothing: an unavailable pool. And a router that keeps offering it.
+        let then_none = |_: &RouteRequest<'_>| {
+            asked.set(asked.get() + 1);
+            if asked.get() == 1 {
+                RouteDecision::Reader {
+                    dir: blind.clone(),
+                    app_id: app.clone(),
+                    placement: Placement::Home,
+                }
+            } else {
+                RouteDecision::Exhausted {
+                    until: SystemTime::now() + Duration::from_secs(600),
+                    cause: ExhaustCause::Unavailable,
+                }
+            }
+        };
+        let same = |_: &RouteRequest<'_>| RouteDecision::Reader {
+            dir: blind.clone(),
+            app_id: app.clone(),
+            placement: Placement::Home,
+        };
+        for route in [
+            &then_none as &dyn Fn(&RouteRequest<'_>) -> RouteDecision,
+            &same,
+        ] {
+            let r = fetch_conditional_via(
+                site(ReadClass::Gate).item_scoped(),
+                &gh,
+                None,
+                &target(),
+                "repos/o/r/issues/7",
+                None,
+                route,
+            );
+            assert!(is_shed(&r), "{refusing}: {:?}", r.map(|x| x.1.map(|h| h.status)));
+        }
+        assert_eq!(calls(&log), [refusing, refusing], "{refusing}: writer stub NOT invoked");
+    }
 }

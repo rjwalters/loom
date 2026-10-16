@@ -663,6 +663,54 @@ pub fn eligible_readers<'a>(roster: &'a Roster, owner: &str) -> Vec<&'a Identity
         .collect()
 }
 
+/// Whether `roster` has a reader pool but no reader that serves `owner`
+/// (W4-B `owners`): such a read is shed, not sent to the writer, and no
+/// retry will change that until a reader for the owner is configured.
+/// Legacy routing has no owners filter, so it never holds there.
+#[must_use]
+pub fn owner_uncovered_in(roster: &Roster, owner: &str, mode: RoutingMode) -> bool {
+    mode != RoutingMode::Legacy
+        && !owner.is_empty()
+        && !roster.readers.is_empty()
+        && eligible_readers(roster, owner).is_empty()
+}
+
+/// [`owner_uncovered_in`] for the daemon's workspace or the agent front's
+/// reader root; `false` with neither (no pool at all).
+#[must_use]
+pub fn owner_uncovered(owner: &str) -> bool {
+    let Some(ws) = super::workspace_root().or_else(super::front_root) else {
+        return false;
+    };
+    owner_uncovered_in(&super::cached(ws), owner, RoutingMode::current())
+}
+
+/// How often an uncovered owner is logged at `error` (per owner).
+const UNCOVERED_LOG_EVERY: Duration = Duration::from_secs(300);
+
+/// Log (at most every [`UNCOVERED_LOG_EVERY`] per owner) that a read for
+/// `owner` found a reader pool with no reader serving it.
+fn log_owner_uncovered(owner: &str, now: SystemTime) {
+    static LAST: OnceLock<Mutex<HashMap<String, SystemTime>>> = OnceLock::new();
+    let Ok(mut m) = LAST.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
+        return;
+    };
+    let key = owner.to_ascii_lowercase();
+    let due = m.get(&key).is_none_or(|&at| {
+        now.duration_since(at)
+            .is_ok_and(|d| d >= UNCOVERED_LOG_EVERY)
+    });
+    if due {
+        m.insert(key, now);
+        log::error!(
+            "forge_identity: no reader serves owner {owner} (every reader's `owners` excludes \
+             it); its reads are shed, never sent to the writer, until a reader for it is \
+             configured (logged at most every {}s per owner)",
+            UNCOVERED_LOG_EVERY.as_secs()
+        );
+    }
+}
+
 /// What [`route_read_in`] needs beyond the roster.
 #[derive(Debug, Clone, Copy)]
 pub struct RouteEnv<'a> {
@@ -733,6 +781,17 @@ pub fn route_read_in(
         eligible_readers(roster, owner)
     };
     let n = readers.len();
+    if n == 0 && !roster.readers.is_empty() {
+        // A host WITH a reader pool, none of whose readers serves this owner
+        // (W4-B `owners`): not "no pool". `NoPool` sends the read to the
+        // writer, which never serves reads (#12394), so this is an exhaustion
+        // the read chains shed, booked with an error so the gap is seen.
+        log_owner_uncovered(owner, now);
+        return RouteDecision::Exhausted {
+            until: now + forge_read_pool::DEFAULT_WITHDRAWAL,
+            cause: ExhaustCause::Unavailable,
+        };
+    }
     let Some(home) = forge_read_pool::assignment_index(req.owner_repo, n) else {
         return RouteDecision::NoPool;
     };

@@ -89,6 +89,37 @@ pub fn static_pool(args: &[OsString]) -> Pool {
 /// The endpoint is the first `gh api` argument that is not a flag or a flag's
 /// value. Flags taking a value are skipped with it.
 fn api_pool(rest: &[String]) -> Pool {
+    let Some(path) = api_path(rest) else {
+        return Pool::Other;
+    };
+    if path == "graphql" {
+        Pool::Graphql
+    } else if path == "rate_limit" {
+        Pool::Other
+    } else if path.starts_with("search/") {
+        Pool::Search
+    } else {
+        Pool::Core
+    }
+}
+
+/// The REST path of a `gh api` argv (`args[0] == "api"`), leading `/`
+/// dropped; `None` for any other command.
+#[must_use]
+pub(crate) fn api_endpoint(args: &[OsString]) -> Option<String> {
+    let words: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if words.first().map(String::as_str) != Some("api") {
+        return None;
+    }
+    api_path(&words[1..]).map(str::to_string)
+}
+
+/// The first `gh api` argument (after `api`) that is not a flag or a flag's
+/// value, leading `/` dropped.
+fn api_path(rest: &[String]) -> Option<&str> {
     const VALUED: &[&str] = &[
         "-H",
         "--header",
@@ -119,18 +150,9 @@ fn api_pool(rest: &[String]) -> Pool {
             i += 1;
             continue;
         }
-        let path = a.trim_start_matches('/');
-        return if path == "graphql" {
-            Pool::Graphql
-        } else if path == "rate_limit" {
-            Pool::Other
-        } else if path.starts_with("search/") {
-            Pool::Search
-        } else {
-            Pool::Core
-        };
+        return Some(a.trim_start_matches('/'));
     }
-    Pool::Other
+    None
 }
 
 /// Whether the invocation asked `gh api` to print the response headers.

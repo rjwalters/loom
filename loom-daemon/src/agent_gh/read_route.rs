@@ -51,6 +51,10 @@ pub struct FrontRoute {
     /// repo): those stay on the session's credential and are booked as
     /// `direct_read`.
     pub pooled: bool,
+    /// The read's owner, lowercased, when its repo is certain: the shed
+    /// message says whether retrying can help (a reader pool none of whose
+    /// readers serves the owner never will).
+    pub owner: Option<String>,
 }
 
 /// The flags one read shape accepts: those taking a value, and the boolean
@@ -412,6 +416,7 @@ pub fn plan(
         read: true,
         // The repo is certain, so a reader could have served it.
         pooled: true,
+        owner: Some(owner),
     }
 }
 
@@ -444,8 +449,8 @@ pub fn pool_reader(repo: &str, resource: crate::forge_bucket_book::Resource) -> 
 
 /// Whether a reader's failed answer is the reader's own refusal — coverage
 /// (403/404, not accessible by integration), a refused token (401) or a
-/// rate limit — so the read goes on to the writer, as
-/// [`crate::forge_identity::reader_then_writer`] does for served reads.
+/// rate limit — so it is not taken as the answer: the read goes on to the
+/// next in line and is finally shed, never run on the writer (#12394).
 /// `http_status` is the response's status when `gh` printed headers; the
 /// stderr's `HTTP <nnn>` otherwise.
 #[must_use]

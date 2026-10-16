@@ -8,6 +8,7 @@ use crate::forge_bucket_book::Resource;
 use crate::forge_identity::{
     ExhaustCause, Failure, Placement, ReadClass, RouteDecision, RouteRequest,
 };
+use crate::proc_exec::Completion;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
@@ -18,7 +19,6 @@ const OK: &str = "echo '{}'; exit 0";
 const LIMITED: &str =
     "echo 'gh: API rate limit exceeded for installation ID 1 (HTTP 403)' >&2; exit 1";
 const NOT_FOUND: &str = "echo 'gh: Not Found (HTTP 404)' >&2; exit 1";
-const BLIND: &str = "echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1";
 
 /// A stub `gh` logging `GH_CONFIG_DIR|GH_REPO` per call, answering by dir.
 struct Pool {
@@ -150,6 +150,8 @@ impl Pool {
             }
         };
         let withdraw = |app: &str, slug: &str, f: Failure, _why: &str| {
+            // Every withdrawal takes the reader out of this repo's walk (a
+            // coverage one for this repo only, which is the only repo here).
             withdrawn.borrow_mut().insert(app.to_string());
             log.borrow_mut()
                 .push((app.to_string(), slug.to_string(), f));
@@ -436,40 +438,116 @@ fn no_pool_is_one_plain_writer_call() {
     assert_eq!(p.who(), vec![Who::Writer]);
 }
 
-// ===== a 403/404 is no answer: the next reader serves it, or it sheds =====
+// ===== a 403/404: an answer only from a reader that covers the repo =====
+
+const BLIND: &str = "echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1";
+const UNRESOLVED: &str =
+    "echo \"GraphQL: Could not resolve to a Repository with the name 'acme/x'.\" >&2; exit 1";
 
 #[test]
-fn a_reader_that_cannot_see_the_repo_is_withdrawn_and_the_next_reader_serves_it() {
+fn a_covered_readers_item_404_is_the_answer_and_nothing_is_withdrawn() {
+    // W6: reader-2 recently served this repo's `issues`, so its 404 on
+    // `issues/7` is the item's own answer: no other reader, no writer.
     let now = SystemTime::now();
-    for refusal in [BLIND, NOT_FOUND] {
-        // reader-2 (home) refuses; reader-1 serves. The writer is not asked.
-        let p = pool(OK, refusal, OK);
-        let (out, withdrawn, _) = p.run(p.read("cov-a", ReadClass::Gate), &[], now);
-        assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
-        assert_eq!(p.who(), vec![Who::R2, Who::R1], "writer stub NOT invoked");
-        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
-        assert_eq!(withdrawn[0].2, Failure::Coverage);
+    for (name, class) in [
+        ("cov-a-gate", ReadClass::Gate),
+        ("cov-a-hyg", ReadClass::Hygiene),
+        ("cov-a-obs", ReadClass::Observability),
+    ] {
+        let slug = format!("acme/{name}");
+        crate::forge_identity::served::note_reader_served("app-2", &slug, "issues", now);
+        let p = pool(OK, NOT_FOUND, OK);
+        let (out, withdrawn, _) = p.run(p.read(name, class), &[], now);
+        assert!(matches!(out, GhCompletion::Captured(_)), "{class:?}: {out:?}");
+        assert_eq!(p.who(), vec![Who::R2], "{class:?}: writer stub NOT invoked");
+        assert!(withdrawn.is_empty(), "{class:?}: {withdrawn:?}");
     }
 }
 
 #[test]
-fn the_only_reader_refusing_sheds_the_read_and_never_reaches_the_writer() {
+fn evidence_comes_from_a_success_and_another_familys_404_is_shed_not_withdrawn() {
+    // A 200 from reader-2 on `issues/7` is the evidence: recorded by the chain.
     let now = SystemTime::now();
-    for class in [
-        ReadClass::Gate,
-        ReadClass::Hygiene,
-        ReadClass::Observability,
+    let p = pool(OK, OK, OK);
+    let (out, _, _) = p.run(p.read("cov-ev", ReadClass::Gate), &[], now);
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert!(crate::forge_identity::served::reader_recently_served(
+        "app-2",
+        "acme/cov-ev",
+        "issues",
+        now
+    ));
+    // Evidence for `pulls` only does not make an `issues` 404 an answer, but
+    // it does show reader-2 sees the repo: the read is shed (no answer) and
+    // reader-2 is NOT withdrawn, so one missing item cannot take it off the
+    // repo.
+    crate::forge_identity::served::note_reader_served("app-2", "acme/cov-fam", "pulls", now);
+    let p = pool(OK, NOT_FOUND, OK);
+    let (out, withdrawn, _) = p.run(p.read("cov-fam", ReadClass::Gate), &[], now);
+    assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2], "writer stub NOT invoked");
+    assert!(withdrawn.is_empty(), "{withdrawn:?}");
+}
+
+#[test]
+fn an_uncovered_or_refusing_reader_is_withdrawn_for_the_repo_and_the_next_serves() {
+    // A 403 "not accessible by integration", a GraphQL "could not resolve to
+    // a repository", or a 404 with no evidence: the reader is blind to the
+    // repo, not an answer. It is withdrawn (coverage: this repo only) and
+    // the next reader serves the read. Even with evidence, a 403 is never an
+    // item's answer.
+    let now = SystemTime::now();
+    for (name, refusal, seed) in [
+        ("blind-a", BLIND, false),
+        ("blind-b", UNRESOLVED, false),
+        ("blind-c", NOT_FOUND, false),
+        ("blind-d", BLIND, true),
     ] {
-        for refusal in [BLIND, NOT_FOUND] {
-            let p = pool(refusal, refusal, OK);
-            let (out, withdrawn, _) = p.run(p.read("cov-b", class), &[], now);
-            assert!(
-                matches!(out, GhCompletion::Shed { .. }),
-                "{class:?}: a refusal is not a 404 for the caller: {out:?}"
+        if seed {
+            crate::forge_identity::served::note_reader_served(
+                "app-2",
+                &format!("acme/{name}"),
+                "issues",
+                now,
             );
-            assert_eq!(p.who(), vec![Who::R2, Who::R1], "{class:?}: writer NOT invoked");
-            assert_eq!(withdrawn.len(), 2, "{class:?}: {withdrawn:?}");
         }
+        let p = pool(OK, refusal, OK);
+        let (out, withdrawn, _) = p.run(p.read(name, ReadClass::Gate), &[], now);
+        let GhCompletion::Captured(Completion::Exited(o)) = &out else {
+            panic!("{name}: expected reader-1's answer, got {out:?}");
+        };
+        assert!(o.status.success(), "{name}: served by reader-1");
+        assert_eq!(p.who(), vec![Who::R2, Who::R1], "{name}: writer stub NOT invoked");
+        assert_eq!(withdrawn.len(), 1, "{name}: {withdrawn:?}");
+        assert_eq!(withdrawn[0].0, "app-2", "{name}");
+        assert_eq!(withdrawn[0].1, format!("acme/{name}"), "{name}");
+        assert_eq!(withdrawn[0].2, Failure::Coverage, "{name}");
+    }
+}
+
+#[test]
+fn every_reader_refusing_the_repo_sheds_never_absent_and_never_the_writer() {
+    for (name, r1, r2) in [
+        ("blind-all-a", BLIND, BLIND),
+        ("blind-all-b", NOT_FOUND, BLIND),
+        ("blind-all-c", UNRESOLVED, NOT_FOUND),
+    ] {
+        let p = pool(r1, r2, OK);
+        let (out, withdrawn, _) = p.run_as(
+            p.read(name, ReadClass::Gate),
+            &[],
+            SystemTime::now(),
+            ExhaustCause::Unavailable,
+        );
+        assert!(matches!(out, GhCompletion::Shed { .. }), "{name}: {out:?}");
+        assert_eq!(p.who(), vec![Who::R2, Who::R1], "{name}: writer stub NOT invoked");
+        assert!(withdrawn.iter().all(|w| w.2 == Failure::Coverage), "{name}: {withdrawn:?}");
+        // The caller sees "no answer", never a 404 it would read as absent.
+        let outcome = super::super::outcome::classify(Ok(out), Duration::from_secs(10));
+        assert!(
+            matches!(outcome, CmdOutcome::Unavailable(Unavailable::Shed { .. })),
+            "{name}: {outcome:?}"
+        );
     }
 }
 

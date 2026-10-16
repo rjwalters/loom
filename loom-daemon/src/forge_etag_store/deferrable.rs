@@ -11,10 +11,12 @@
 //! 3. when no reader is left the read is **shed**: no request, an `o=shed`
 //!    accounting row, and the error [`ReadShed`]; the caller skips its pass or
 //!    serves from its cache;
-//! 4. a 403/404 is the reader's answer only for an item-scoped 404 from a
-//!    reader that recently served the same repo and endpoint family (the item
-//!    is gone); otherwise the reader cannot see the repo, so it is withdrawn
-//!    for that repo (step 2) and the read sheds if no reader is left;
+//! 4. a 403/404 is an answer only for an item-scoped read from a reader that
+//!    recently served the same repo's endpoint family (W6,
+//!    [`served::judge_coverage`]). A 403, or a refusal from a reader with no
+//!    evidence it sees the repo, withdraws the reader for the repo and goes
+//!    on to the next, as in 2; a plain 404 from a reader that sees the repo
+//!    is shed. Either way a reader's refusal never turns into an "absent";
 //! 5. only a host with no reader pool at all (a target with no repo, or
 //!    [`RouteDecision::NoPool`] before any reader was tried) reads on the
 //!    writer: it is the only credential there is.
@@ -29,9 +31,9 @@ use crate::forge_bucket_book::Resource;
 use crate::forge_identity::{served, Failure, IdentityRole, RouteDecision, RouteRequest};
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
-/// A deferrable conditional read that was not sent: every reader that can
-/// serve the repo is out of budget until about `until`. The caller skips its
-/// pass; nothing went to the writer.
+/// A conditional read that was not sent: no reader can serve the repo until
+/// about `until` (out of budget, withdrawn, or unable to see it). The caller
+/// skips its pass; nothing went to the writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReadShed {
     pub(crate) until: SystemTime,
@@ -43,7 +45,7 @@ impl std::fmt::Display for ReadShed {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         write!(
             f,
-            "read shed: every reader is out of budget until {until}; deferred, not sent to the \
+            "read shed: no reader can serve it until {until}; deferred, not sent to the \
              writer {}",
             crate::gh_invocation::SHED_MARKER
         )
@@ -58,7 +60,7 @@ const MAX_READERS_TRIED: usize = 8;
 /// One deferrable conditional read (see the module docs).
 ///
 /// # Errors
-/// [`ReadShed`] when the readers are out of budget; otherwise as
+/// [`ReadShed`] when no reader can serve the read; otherwise as
 /// [`super::fetch_conditional`].
 pub(super) fn fetch(
     site: ConditionalRead,
@@ -172,18 +174,35 @@ pub(super) fn fetch(
             return Ok(first);
         };
         let why = format!("{} {url}", site.caller);
-        if failure == Failure::Coverage
-            && site.item_scoped
-            && matches!(first.1.as_ref().map(|h| h.status), Some(404))
-            && served::reader_recently_served(&app_id, repo, family, SystemTime::now())
-        {
-            // W6: a reader that just served this repo's endpoint family
-            // answers an item-scoped 404 for the item itself (it does not
-            // exist). Any other 403/404 may be a reader that cannot see the
-            // repo, which is no answer: it is withdrawn for the repo below
-            // and the next reader tried, and the read sheds when none is left.
-            return Ok(first);
+        if failure == Failure::Coverage {
+            match served::judge_coverage(
+                &app_id,
+                repo,
+                family,
+                site.item_scoped,
+                first.1.as_ref().map(|h| h.status),
+                &first.2,
+                SystemTime::now(),
+            ) {
+                // W6: this reader covers the repo's `family`, so its 404 is
+                // the item's own answer: no withdrawal, no other reader.
+                served::CoverageRefusal::Answer => return Ok(first),
+                // A plain 404 from a reader that sees the repo: no answer,
+                // and the reader stays on the repo's other reads.
+                served::CoverageRefusal::Shed => {
+                    let until = SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
+                    return Err(shed(site, gh_bin, target, repo, until, Some(&app_id)));
+                }
+                served::CoverageRefusal::Withdraw => {}
+            }
         }
+        // A rate limit, a refused token, or a 403/404 from a reader with no
+        // evidence it can see the repo (a "not accessible by integration",
+        // an installation that does not include it): withdraw it — for this
+        // repo only on coverage — and ask the router again. Returning the
+        // refusal would read as "absent" to the caller, and placement is
+        // deterministic, so every later read would land on the same blind
+        // reader (#12394 review).
         crate::forge_identity::withdraw_after(&app_id, repo, failure, &why);
         tried.push(app_id);
     }

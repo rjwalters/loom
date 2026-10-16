@@ -13,10 +13,20 @@
 //!    [`GhCompletion::Shed`] without a request, and its caller defers it,
 //!    skips it this tick or serves it from cache.
 //!
-//! A 403/404 ([`Failure::Coverage`]) is not an answer: a reader that cannot
-//! see the repo says the same thing, and every later read would land on it.
-//! It is withdrawn for that repo and the next reader tried; when none is left
-//! the read is shed. It is never re-run on the writer.
+//! A 403/404 is an answer only with evidence the reader covers the repo
+//! (W6, [`crate::forge_identity::served::judge_coverage`]): an item-scoped
+//! `gh api repos/<o>/<r>/<family>/<item>` read answered `404` by a reader
+//! that recently served the same repo's same family. Any other 403/404 (a
+//! "not accessible by integration", "could not resolve to a repository", an
+//! installation that does not include the repo), or any refusal from a
+//! reader with no evidence it sees the repo, means the reader is blind to
+//! it: it is withdrawn **for that repo** ([`Failure::Coverage`]'s scope),
+//! the next reader is tried, as in 2, and the read is shed when none is
+//! left. A plain 404 from a reader that recently served another of the
+//! repo's families is shed without a withdrawal, so one missing item cannot
+//! take a covering reader off the repo. Returning a refusal would read as
+//! "absent" to the caller, and placement is deterministic, so every later
+//! read would land on the same blind reader.
 //!
 //! The one read that still reaches the writer is a host with **no reader
 //! pool at all** ([`RouteDecision::NoPool`] before any reader was tried): the
@@ -32,10 +42,10 @@ use std::time::{Duration, SystemTime};
 use super::{failure_of, succeeded, ReaderLookup, Withdraw};
 use crate::forge_bucket_book::Resource;
 use crate::forge_identity::{
-    ExhaustCause, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest,
+    served, ExhaustCause, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest,
 };
 use crate::gh_invocation::{GhCompletion, GhInvocation};
-use crate::proc_exec::ExecError;
+use crate::proc_exec::{Completion, ExecError};
 
 /// The marker every shed's text carries, so a log line can be traced back.
 pub const SHED_MARKER: &str = "(loom-shed)";
@@ -62,6 +72,27 @@ fn shed_log_due(op: &str, now: SystemTime) -> bool {
             true
         }
     }
+}
+
+/// What a reader's coverage refusal `result` calls for
+/// ([`served::judge_coverage`]): the status comes from the `--include`
+/// headers when `gh` printed them, else the stderr's `HTTP nnn`.
+fn judge_refusal(
+    result: &GhCompletion,
+    app_id: &str,
+    slug: &str,
+    family: &str,
+    item_scoped: bool,
+    now: SystemTime,
+) -> served::CoverageRefusal {
+    let GhCompletion::Captured(Completion::Exited(out)) = result else {
+        return served::CoverageRefusal::Withdraw;
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let status = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
+        .map(|r| r.status)
+        .or_else(|| crate::forge_gateway::outage::http_status_in(&stderr));
+    served::judge_coverage(app_id, slug, family, item_scoped, status, &stderr, now)
 }
 
 /// When a withdrawn reader is expected back, for a shed's `until`.
@@ -106,6 +137,11 @@ impl GhInvocation {
         };
         let owner = crate::credential_preflight::owner_of_nwo(&slug).to_ascii_lowercase();
         let why = format!("{} via the gh choke point", self.operation.as_str());
+        // W6 coverage evidence: the REST path's endpoint family, and whether
+        // it names one item. Not a `gh api` call: no family, no evidence.
+        let endpoint = super::super::accounting::api_endpoint(&self.args).unwrap_or_default();
+        let family = served::endpoint_family(&endpoint);
+        let item_scoped = served::is_item_path(&endpoint);
         let mut tried: HashSet<String> = HashSet::new();
         let mut last_app: Option<String> = None;
         let mut last_failure: Option<Failure> = None;
@@ -142,6 +178,7 @@ impl GhInvocation {
                 .without_token_env()
                 .execute_direct()?;
             if succeeded(&first) {
+                served::note_reader_served(&app_id, &slug, family, now);
                 return Ok(first);
             }
             let fault = if app_id == crate::forge_gateway::GATEWAY_APP_ID {
@@ -174,24 +211,54 @@ impl GhInvocation {
                 // another reader would not help.
                 return Ok(first);
             };
+            if failure == Failure::Coverage {
+                match judge_refusal(&first, &app_id, &slug, family, item_scoped, now) {
+                    // W6: this reader covers the repo's `family`, so its 404
+                    // is the item's own answer: no withdrawal, no other reader.
+                    served::CoverageRefusal::Answer => return Ok(first),
+                    // A plain 404 from a reader that sees the repo: no
+                    // answer, and the reader stays on the repo's other reads.
+                    served::CoverageRefusal::Shed => {
+                        let until = until_after(failure, now);
+                        return Ok(self.shed_read(class, &owner, resource, until, Some(&app_id)));
+                    }
+                    served::CoverageRefusal::Withdraw => {}
+                }
+            }
+            // A rate limit, a refused token, or a 403/404 from a reader with
+            // no evidence it can see the repo: withdraw it (for this repo
+            // only on coverage) and ask the router for the next one.
             withdraw(&app_id, &slug, failure, &why);
             tried.insert(app_id.clone());
             last_app = Some(app_id);
             last_failure = Some(failure);
-            let next = lookup(&request);
-            let next = if tried.contains(crate::forge_gateway::GATEWAY_APP_ID) {
-                crate::forge_gateway::past_gateway(next, &request, now)
-            } else {
-                next
-            };
-            decision = match next {
-                // The pool went away under us: shed.
-                RouteDecision::NoPool => RouteDecision::Exhausted {
-                    until: until_after(failure, now),
-                    cause: ExhaustCause::Unavailable,
-                },
-                other => other,
-            };
+            decision = self.next_after(lookup, &request, &tried, failure, now);
+        }
+    }
+
+    /// The router's next answer after a reader failed with `failure`: past
+    /// the gateway once it was tried, and a pool that went away under us is
+    /// an exhaustion (shed), never "no pool" (the writer).
+    fn next_after(
+        &self,
+        lookup: ReaderLookup<'_>,
+        request: &RouteRequest<'_>,
+        tried: &HashSet<String>,
+        failure: Failure,
+        now: SystemTime,
+    ) -> RouteDecision {
+        let next = lookup(request);
+        let next = if tried.contains(crate::forge_gateway::GATEWAY_APP_ID) {
+            crate::forge_gateway::past_gateway(next, request, now)
+        } else {
+            next
+        };
+        match next {
+            RouteDecision::NoPool => RouteDecision::Exhausted {
+                until: until_after(failure, now),
+                cause: ExhaustCause::Unavailable,
+            },
+            other => other,
         }
     }
 

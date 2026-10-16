@@ -253,9 +253,12 @@ pub fn run(raw: &[OsString]) -> i32 {
             // exec'd on the session's credential (the writer).
             ledger::book_shed(raw, cwd.as_deref());
             eprintln!(
-                "gh (loom front): read shed — no reader can serve it right now; the writer is \
-                 never used for reads. Retry later {}",
-                crate::gh_invocation::SHED_MARKER
+                "{}",
+                shed_message(route.owner.as_deref(), &|o| {
+                    route.gateway.is_none()
+                        && route.reader.is_none()
+                        && crate::forge_identity::route::owner_uncovered(o)
+                })
             );
             return EX_TEMPFAIL;
         }
@@ -420,6 +423,24 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         }
     }
     status.code().unwrap_or(1)
+}
+
+/// The stderr line for a shed passthrough read. When the host's reader pool
+/// has no reader for `owner` at all (`uncovered`), retrying cannot help: the
+/// message says so instead of "retry later".
+fn shed_message(owner: Option<&str>, uncovered: &dyn Fn(&str) -> bool) -> String {
+    let marker = crate::gh_invocation::SHED_MARKER;
+    match owner {
+        Some(o) if uncovered(o) => format!(
+            "gh (loom front): read shed — no reader App on this host serves owner {o}, and the \
+             writer is never used for reads. Retrying will not help until a reader for {o} is \
+             configured {marker}"
+        ),
+        _ => format!(
+            "gh (loom front): read shed — no reader can serve it right now; the writer is \
+             never used for reads. Retry later {marker}"
+        ),
+    }
 }
 
 /// How a passthrough runs (2am#4367 P4, [`read_route`]): a read whose repo
