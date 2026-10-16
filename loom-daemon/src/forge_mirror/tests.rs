@@ -458,6 +458,13 @@ fn only_the_discovery_listings_name_the_mirror() {
         // engine's all-open listing (#11897).
         "work_finder/forge.rs",
         "step_dispatch/listing.rs",
+        // The fleet worklist backend (#12306): one discovery read per tick,
+        // never a claim, label-transition or merge read (invariant 3), so it
+        // does not go through `forge_mirror::discovery`. Its tests drive the
+        // mirror's client and `set_active`.
+        "discovery/mirror.rs",
+        "discovery/tests.rs",
+        "discovery/worklist.rs",
         // The task spawn, the wake seam's source check, and the telemetry drain.
         "daemon_service/observer_tasks.rs",
         "forge_events/wake.rs",

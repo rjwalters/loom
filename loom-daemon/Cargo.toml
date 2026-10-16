@@ -6,7 +6,8 @@ license.workspace = true
 edition = "2021"
 
 [dependencies]
-tokio = { workspace = true }
+# `taskdump` backs the SIGUSR1 task dump (#12079); it also needs `--cfg tokio_unstable`.
+tokio = { workspace = true, features = ["taskdump"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 anyhow = { workspace = true }
@@ -93,3 +94,8 @@ harness = false
 # fleet scripts, and `daemon_update/rebuild.rs` rolling to an older tag that
 # still gates on it — pass `--features otlp`. Do not delete it.
 otlp = []
+
+[lints.rust]
+# `tokio_unstable` is set via `--cfg` in `.cargo/config.toml` for the SIGUSR1
+# task dump (#12079); declare it so `-D warnings` does not trip unexpected_cfgs.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
