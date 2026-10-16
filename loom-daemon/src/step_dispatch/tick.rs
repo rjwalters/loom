@@ -10,9 +10,7 @@
 //!    ([`super::item_draw::pool_weights`]); there is no separate workspace
 //!    draw. A [`DrawError::WeightOverflow`] ends the tick's draws and is
 //!    recorded on the record, never only logged.
-//! 2. **Gate**: the per-repo RAM, disk and count cap
-//!    ([`RepoCap::defer_admission`]). A repo that does not fit is out of the
-//!    draw for the rest of the tick.
+//! 2. **Gate**: one Champion merge per repo at a time (design §6).
 //! 3. **Claim and spawn** through the [`StepSpawner`] (the registry's step
 //!    spawn, #11906): the role's resolvers and pool gate, then the claim.
 //!
@@ -29,9 +27,9 @@
 //!
 //! A refused gate or claim is a **pass**: draw again, up to
 //! [`MAX_DRAWS_PER_SLOT`] draws in one slot and [`MAX_PASSES_PER_TICK`]
-//! passes in the tick. Every pass is counted by its reason. Saturation and
-//! the ramp cap are host-wide, so they bound how many slots the tick fills
-//! rather than refusing one draw.
+//! passes in the tick. Every pass is counted by its reason. The tick fills
+//! every free slot: the cap is the operator's `maxConcurrent` and nothing
+//! else (#12406).
 //!
 //! A **lost claim** ([`REFUSAL_CLAIM_LOST`]: a peer claimed the item first)
 //! is a cheap pass (#12410): the item has already left the tick's pool (draws
@@ -72,7 +70,6 @@ use crate::sweep_registry::step_spawn::{StepDrawTerms, StepSpawnRequest};
 use crate::telemetry::kinds::pick_decision::{PickItemExclusion, PickSkipReason};
 use crate::types::QueueDisposition as Qd;
 use crate::work_finder::ready_queue::TickQueueRow;
-use crate::work_finder::repo_cap::RepoCap;
 use crate::work_finder::step_item::{Lane, PassReason};
 use crate::work_finder::{PriorityCandidate, TickReport};
 
@@ -87,9 +84,6 @@ pub const MAX_PASSES_PER_TICK: u32 = 32;
 /// `MAX_FREE_CLAIM_LOST_PER_TICK` refusals) while each loss still costs a
 /// claim subprocess.
 pub const MAX_FREE_CLAIM_LOST_PER_TICK: u32 = 16;
-
-/// The pass reason of a draw the per-repo cap refused.
-pub const PASS_REPO_CAP: &str = "repo_cap";
 /// The pass reason of a second Champion merge in one repo in one tick.
 pub const PASS_MERGE: &str = "merge_in_flight";
 /// The spawn refusal of a pre-claim that could not be verified
@@ -104,14 +98,9 @@ pub const REFUSAL_CLAIM_LOST: &str = "claim_lost";
 /// `loom.dispatch.stop`, a closed set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TickStop {
-    /// Every slot the tick could fill was filled.
+    /// Every free slot was filled.
     #[default]
     Filled,
-    /// Every slot was filled, but the ramp cap (`maxAdmissionsPerTick`)
-    /// allowed fewer slots than were free.
-    RampCap,
-    /// The saturation brake held every admission.
-    Saturation,
     /// No slot was free.
     NoSlots,
     /// The pool had nothing left to draw.
@@ -132,8 +121,6 @@ impl TickStop {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Filled => "filled",
-            Self::RampCap => "ramp_cap",
-            Self::Saturation => "saturation",
             Self::NoSlots => "no_slots",
             Self::PoolDrained => "pool_drained",
             Self::PassLimit => "pass_limit",
@@ -187,10 +174,6 @@ pub struct StepWorkspace {
 pub struct StepTickLimits {
     /// `max_concurrent - occupancy`, saturating.
     pub free_slots: usize,
-    /// The ramp cap, `max_admissions_per_tick`.
-    pub max_admissions: usize,
-    /// The saturation brake holds new admissions.
-    pub saturation_held: bool,
     /// How many spawns, each in a different repo, run at once (#12298,
     /// `autonomous.workFinder.spawnConcurrency`); `1` is the serial tick.
     pub spawn_concurrency: usize,
@@ -243,12 +226,12 @@ pub trait StepSpawner {
 #[derive(Debug, Clone, Default)]
 pub struct StepTick {
     pub report: TickReport,
-    /// Passes by reason (`claimed`, `pool_exhausted`, `repo_cap`, ...).
+    /// Passes by reason (`claimed`, `pool_exhausted`, `merge_in_flight`, ...).
     pub passes: BTreeMap<String, usize>,
     /// Draws taken, across workspaces.
     pub draws: usize,
-    /// The slots the tick could fill: the free slots, bounded by the ramp
-    /// cap, `0` under the saturation brake.
+    /// The slots the tick could fill: its free slots (#12427 removed every
+    /// automatic admission cap).
     pub budget: usize,
     /// Why the draw loop stopped.
     pub stop: TickStop,
@@ -271,7 +254,6 @@ pub fn disposition_of(reason: &str) -> Qd {
         "roll_paused" => Qd::DeferredCapacity,
         "workspace_commands_missing" => Qd::WorkspaceCommandsMissing,
         crate::sweep_registry::ALREADY_LANDED_REASON => Qd::AlreadyLanded,
-        PASS_REPO_CAP => Qd::DeferredRepoCap,
         PASS_MERGE => Qd::PeerClaim,
         _ => Qd::DispatchError,
     }
@@ -325,7 +307,7 @@ fn refusal_skip(reason: &str) -> PickSkipReason {
     match disposition_of(reason) {
         Qd::PeerClaim => PickSkipReason::InFlight,
         Qd::HostConstraint => PickSkipReason::Quota,
-        Qd::DeferredCapacity | Qd::DeferredRepoCap => PickSkipReason::Cap,
+        Qd::DeferredCapacity => PickSkipReason::Cap,
         Qd::AlreadyLanded => PickSkipReason::AlreadyLanded,
         _ => PickSkipReason::Error,
     }
@@ -387,17 +369,11 @@ pub fn run(
     limits: StepTickLimits,
     seed: &SeedBase,
     knobs: &PoolKnobs,
-    repo_cap: &mut RepoCap,
     spawner: &mut dyn StepSpawner,
 ) -> StepTick {
     let mut pass_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut draws_taken = 0usize;
-    let mut report = TickReport {
-        saturation_held: limits.saturation_held,
-        max_admissions_per_tick: Some(limits.max_admissions),
-        repo_cap: Some(repo_cap.snapshot()),
-        ..TickReport::default()
-    };
+    let mut report = TickReport::default();
 
     // The pool is every repo's items, repos in workspace order.
     workspaces.sort_by_key(|w| w.idx);
@@ -445,15 +421,11 @@ pub fn run(
     let mut draws: Vec<DrawRecord> = Vec::new();
     // A Champion merge was spawned in the repo this tick.
     let mut merging: BTreeSet<usize> = BTreeSet::new();
-    // Draws the spawn or the per-repo cap refused, by repo and reason.
+    // Draws the spawn or the merge rule refused, by repo and reason.
     let mut refused: BTreeMap<usize, BTreeMap<String, usize>> = BTreeMap::new();
     let mut overflow = false;
 
-    let budget = if limits.saturation_held {
-        0
-    } else {
-        limits.free_slots.min(limits.max_admissions)
-    };
+    let budget = limits.free_slots;
     let mut passes = 0u32;
     let mut order: Vec<(usize, u32)> = Vec::new();
     let mut exhausted = false;
@@ -484,9 +456,6 @@ pub fn run(
         if open.is_empty() || passes >= MAX_PASSES_PER_TICK {
             break;
         }
-        // The round's gates see the round's earlier candidates as admitted,
-        // so a batch cannot overrun a cap the candidates share.
-        let mut planned = repo_cap.clone();
         let mut batch: Vec<Pending> = Vec::new();
         let mut done: BTreeSet<usize> = BTreeSet::new();
         'slots: for (slot, (attempts, free)) in open.iter_mut().enumerate() {
@@ -538,17 +507,6 @@ pub fn run(
                 let terms = record.terms;
                 draws.push(record);
                 draws_taken += 1;
-                if planned.defer_admission(&key, &mut report) {
-                    draw.close_repo(idx);
-                    passes += 1;
-                    *pass_counts.entry(PASS_REPO_CAP.to_string()).or_default() += 1;
-                    *refused
-                        .entry(idx)
-                        .or_default()
-                        .entry(PASS_REPO_CAP.to_string())
-                        .or_default() += 1;
-                    continue;
-                }
                 // One Champion merge per repo at a time (design §6): a second
                 // merge drawn in a repo that spawned one this tick passes.
                 let merge = matches!(
@@ -567,7 +525,6 @@ pub fn run(
                     *pass_counts.entry(PASS_MERGE.to_string()).or_default() += 1;
                     continue;
                 }
-                planned.admit_candidate(&key);
                 batch.push(Pending {
                     slot,
                     ws_idx: idx,
@@ -641,7 +598,6 @@ pub fn run(
                     }
                     resolve(&mut report.queue, &key, Qd::Dispatched, None);
                     report.dispatched += 1;
-                    repo_cap.admit_candidate(&key);
                     done.insert(p.slot);
                 }
                 SpawnResult::Refused(reason) => {
@@ -696,9 +652,7 @@ pub fn run(
         }
     }
 
-    let stop = if limits.saturation_held {
-        TickStop::Saturation
-    } else if budget == 0 {
+    let stop = if budget == 0 {
         TickStop::NoSlots
     } else if report.spawn_hold.is_some() {
         TickStop::SpawnHold
@@ -710,30 +664,14 @@ pub fn run(
         TickStop::PassLimit
     } else if gave_up > 0 {
         TickStop::SlotDraws
-    } else if budget < limits.free_slots {
-        TickStop::RampCap
     } else {
         TickStop::Filled
     };
 
-    // Rows nothing resolved wait for a later tick: name the limit that held
-    // them.
-    let held = if limits.saturation_held {
-        Qd::DeferredSaturation
-    } else if limits.max_admissions < limits.free_slots
-        && report.dispatched >= limits.max_admissions
-    {
-        Qd::DeferredRampCap
-    } else {
-        Qd::DeferredCapacity
-    };
+    // Rows nothing resolved wait for a later tick: the cap held them.
     for row in report.queue.iter_mut().filter(|r| r.disposition.is_none()) {
-        row.disposition = Some(held);
-        match held {
-            Qd::DeferredSaturation => report.deferred_saturation += 1,
-            Qd::DeferredRampCap => report.deferred_ramp_cap += 1,
-            _ => report.deferred_capacity += 1,
-        }
+        row.disposition = Some(Qd::DeferredCapacity);
+        report.deferred_capacity += 1;
     }
     // The plan order: the draws as taken, then every pooled item not drawn.
     let drawn: BTreeSet<(usize, u32)> = order.iter().copied().collect();
@@ -743,7 +681,6 @@ pub fn run(
         }
     }
     report.plan_order = order;
-    repo_cap.finish(&mut report);
     let views: Vec<ItemDrawWorkspace<'_>> = workspaces
         .iter()
         .map(|w| ItemDrawWorkspace {

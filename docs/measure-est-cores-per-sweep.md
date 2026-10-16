@@ -3,8 +3,8 @@
 > **⚠️ This document is historical. Do not follow it as current guidance.**
 >
 > **#4512 deleted the CPU-headroom term from the daemon's admission formula.**
-> `resolve_dynamic_max_concurrent` is now `min(token axis, disk headroom,
-> configured maxConcurrent)` — there is no CPU estimate in it, and therefore
+> Since #12406 the cap is the configured `maxConcurrent` and nothing else —
+> there is no CPU estimate in it, and therefore
 > nothing for `LOOM_EST_CORES_PER_SWEEP` (or `LOOM_CPU_UTILIZATION_TARGET`) to
 > tune. Both knobs, and their `autonomous.estCoresPerSweep` /
 > `autonomous.cpuUtilizationTarget` config twins, are **accepted but ignored**;
@@ -15,17 +15,15 @@
 > **What to do instead:**
 >
 > 1. **Tune `autonomous.workFinder.maxConcurrent` empirically.** It is the one
->    per-machine admission knob. Run `loom-daemon calibrate` (measurement-only
->    since #4512) or read `loom-daemon status`: if the cap binds on `ceiling`
->    while the host sits idle, raise it; if it binds on `token`/`disk`, raising
->    it changes nothing.
+>    per-machine admission knob, and the only one. Run `loom-daemon calibrate`
+>    (measurement-only since #4512) or watch the exported `loom.host.*` load,
+>    RAM and disk metrics: if the host sits idle at the cap, raise it; if it is
+>    under pressure, lower it.
 > 2. **Rely on the machine-wide build slot for the heavy stages.** `cargo
 >    build`/`test` and the build gate take a `mkdir`-atomic slot
 >    (`LOOM_BUILD_SLOTS`, default 1) so at most one or two builds run
 >    concurrently on a host regardless of how many sweeps are admitted. This is
 >    what the per-sweep core estimate was a (poor) proxy for.
-> 3. **Trust the host-distress circuit breaker (#4235)** as the safety net — it
->    trips on *measured* load-per-core rather than an estimated constant.
 >
 > See `defaults/docs/daemon-reference.md` → *Why there is no CPU term in
 > admission (#4512)* and *Machine-wide build slot (#4512)*.

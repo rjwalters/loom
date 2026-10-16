@@ -187,12 +187,7 @@ pub(crate) fn render_queue(report: &DaemonStatusReport, now: DateTime<Utc>) -> S
 fn render_plan(plan: &DispatchPlanContext) -> String {
     let s = &plan.slots;
     let opt = |v: Option<usize>| v.map_or_else(|| "?".to_string(), |n| n.to_string());
-    let mut line = format!(
-        "Plan: {} free of {} slot(s), {} admission(s)/tick",
-        opt(s.free),
-        s.max_concurrent,
-        opt(s.max_admissions_per_tick)
-    );
+    let mut line = format!("Plan: {} free of {} slot(s)", opt(s.free), s.max_concurrent);
     if let Some(secs) = plan.tick_interval_secs {
         line.push_str(&format!(", every {secs}s"));
     }
@@ -200,9 +195,6 @@ fn render_plan(plan: &DispatchPlanContext) -> String {
         (plan.shard.configured, plan.shard.host_shard, plan.shard.shard_count)
     {
         line.push_str(&format!(", shard {host}/{count}"));
-    }
-    if s.saturation_held {
-        line.push_str(", SATURATION-HELD");
     }
     line.push('\n');
     line
@@ -409,7 +401,7 @@ mod tests {
         let mut r = report_with(
             vec![
                 row(1, 10, QueueDisposition::Dispatched),
-                row(2, 11, QueueDisposition::DeferredRampCap),
+                row(2, 11, QueueDisposition::DeferredCapacity),
             ],
             now,
         );
@@ -430,7 +422,7 @@ mod tests {
         tick.queue[1].plan = RowPlan {
             position: Some(2),
             plan_state: PlanState::Next,
-            gate: Some(PlanGate::Ramp),
+            gate: Some(PlanGate::Capacity),
             ..RowPlan::default()
         };
         // Row keys alone are enough to name the ordering.
@@ -442,7 +434,6 @@ mod tests {
                 max_concurrent: 2,
                 occupancy: Some(2),
                 free: Some(0),
-                max_admissions_per_tick: Some(1),
                 ..PlanSlots::default()
             },
             tick_interval_secs: Some(60),
@@ -453,15 +444,12 @@ mod tests {
         assert_eq!(j["ordering"], serde_json::json!(["level", "created_at"]));
         assert_eq!(j["plan"]["slots"]["max_concurrent"], 2);
         assert_eq!(j["queue"][1]["plan_state"], "next");
-        assert_eq!(j["queue"][1]["gate"], "ramp");
+        assert_eq!(j["queue"][1]["gate"], "capacity");
         assert_eq!(j["queue"][1]["position"], 2);
         let text = render_queue(&r, now);
         assert!(text.contains("Order: level, then created_at"), "{text}");
-        assert!(
-            text.contains("Plan: 0 free of 2 slot(s), 1 admission(s)/tick, every 60s"),
-            "{text}"
-        );
-        assert!(text.contains("#2 next/ramp"), "{text}");
+        assert!(text.contains("Plan: 0 free of 2 slot(s), every 60s"), "{text}");
+        assert!(text.contains("#2 next/capacity"), "{text}");
         assert!(text.contains("#1 running"), "{text}");
     }
 }

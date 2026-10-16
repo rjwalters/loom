@@ -61,7 +61,6 @@ pub(super) fn roots_to_walk(
 pub(super) struct MachineCaps {
     pub token_pool_size: usize,
     pub token_pool_dir: Option<PathBuf>,
-    pub disk_headroom: usize,
     pub configured_max: usize,
     pub logical_cpus: usize,
     pub loadavg_1m: Option<f64>,
@@ -140,17 +139,12 @@ pub(super) fn machine_caps(
             Some(crate::work_finder::resolve_interval_with_config(&wf_config).as_secs());
     }
     if sections.needs_host_headroom() {
-        caps.disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
         // `needs_host_headroom` implies `needs_work_finder_config`, so
-        // `configured_max` is resolved here.
-        caps.dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
-            caps.disk_headroom,
-            caps.configured_max,
-        );
-        // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is
-        // the minimum of several ceilings, but a ceiling only *binds* once
-        // in-flight occupancy reaches it. Below the cap the limiter is work
-        // availability, not any resource term.
+        // `configured_max` is resolved here. The cap is that value alone
+        // (#12406).
+        caps.dynamic_cap = caps.configured_max;
+        // The cap only *binds* once in-flight occupancy reaches it (#4031);
+        // below it the limiter is work availability.
         caps.capacity_bound = in_flight >= caps.dynamic_cap;
     }
     if sections.needs_cpu_sample() {

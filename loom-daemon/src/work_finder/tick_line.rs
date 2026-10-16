@@ -1,23 +1,17 @@
 //! The multi-workspace loop's `work_finder: tick` INFO line, split out of the
-//! size-frozen `work_finder.rs` when #11191 added the disk admission figures
-//! to it: the free space, the floor, the in-flight reservation and each
-//! repo's disk charge, so a cap of N can be explained from the log afterwards.
+//! size-frozen `work_finder.rs`.
 
 use super::TickReport;
 
 /// The tick-level figures the line reports beside `report`'s counters.
 #[derive(Debug, Clone)]
-pub struct TickLine<'a> {
+pub struct TickLine {
+    /// The cap: the operator's `maxConcurrent` (#12406).
     pub max_concurrent: usize,
     pub pool_size: usize,
     pub token_limit: usize,
     pub min_workspace_healthy: usize,
-    pub disk: usize,
-    pub configured_max: usize,
-    pub max_admissions_per_tick: usize,
     pub workspaces: usize,
-    /// [`crate::disk_admission::note`]: the disk budget's figures.
-    pub disk_note: &'a str,
 }
 
 /// Whether the tick did anything worth an INFO line.
@@ -36,18 +30,15 @@ pub fn worth_logging(report: &TickReport) -> bool {
         || report.skipped_host_constraint > 0
         || report.skipped_pr_open > 0
         || report.skipped_peer_claim > 0
-        || report.deferred_ramp_cap > 0
-        || report.deferred_saturation > 0
-        || report.deferred_repo_cap > 0
 }
 
 /// The line itself.
 #[must_use]
-pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
+pub fn render(report: &TickReport, t: &TickLine) -> String {
     format!(
         "work_finder: tick — cap {} (pool={}, healthy={} [fallback_root probe only], \
          min_workspace_healthy={} [minimum across every registered workspace's own resolved \
-         pool, #7527], disk={} [{}], ceiling={}, ramp_cap={}); {} workspace(s), \
+         pool, #7527]); {} workspace(s), \
          {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
          {} quarantine-skip, {} workspace-commands-missing-skip, \
          {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
@@ -56,18 +47,12 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
          {} host-constraint-skip, \
          {} pr-open-skip, \
          {} peer-claim-skip, \
-         {} deferred (capacity), {} deferred (ramp), \
-         {} deferred (host saturated), \
-         {} deferred (repo cap, #9090), {} deferred (build back-off, #9410), \
+         {} deferred (capacity), {} deferred (build back-off, #9410), \
          {} error(s), {} cross-host-collision(s)",
         t.max_concurrent,
         t.pool_size,
         t.token_limit,
         t.min_workspace_healthy,
-        t.disk,
-        t.disk_note,
-        t.configured_max,
-        t.max_admissions_per_tick,
         t.workspaces,
         report.seen,
         report.dispatched,
@@ -85,9 +70,6 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
         report.skipped_pr_open,
         report.skipped_peer_claim,
         report.deferred_capacity,
-        report.deferred_ramp_cap,
-        report.deferred_saturation,
-        report.deferred_repo_cap,
         report.deferred_build_backoff,
         report.errors,
         report.collisions
@@ -95,7 +77,7 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
 }
 
 /// Log the line at INFO when the tick did anything.
-pub fn log(report: &TickReport, t: &TickLine<'_>) {
+pub fn log(report: &TickReport, t: &TickLine) {
     if worth_logging(report) {
         log::info!("{}", render(report, t));
     }
@@ -106,26 +88,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_tick_line_names_the_disk_reservation_and_charges() {
+    fn the_tick_line_names_the_cap() {
         let report = TickReport {
             dispatched: 1,
             ..TickReport::default()
         };
-        let note = "free 50GB - floor 3GB - reserved 30GB = 17GB; charges [loom:29GB(observed)]";
         let t = TickLine {
-            max_concurrent: 3,
+            max_concurrent: 12,
             pool_size: 4,
             token_limit: 4,
             min_workspace_healthy: 4,
-            disk: 2,
-            configured_max: 12,
-            max_admissions_per_tick: 2,
             workspaces: 1,
-            disk_note: note,
         };
         assert!(worth_logging(&report));
         let line = render(&report, &t);
-        assert!(line.contains(&format!("disk=2 [{note}]")), "{line}");
+        assert!(line.starts_with("work_finder: tick — cap 12 "), "{line}");
         assert!(line.contains("1 dispatched"), "{line}");
         assert!(!worth_logging(&TickReport::default()));
     }

@@ -170,10 +170,7 @@ impl PickSkipReason {
         Some(match disposition {
             Qd::Dispatched => return None,
             Qd::InFlight => Self::InFlight,
-            Qd::DeferredCapacity
-            | Qd::DeferredRampCap
-            | Qd::DeferredSaturation
-            | Qd::DeferredRepoCap => Self::Cap,
+            Qd::DeferredCapacity => Self::Cap,
             Qd::DeferredFileOverlap => Self::OverlapChain,
             Qd::DeferredBuildBackoff
             | Qd::RecheckInterval

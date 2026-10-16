@@ -158,8 +158,6 @@ fn seed() -> SeedBase {
 fn limits(free_slots: usize) -> StepTickLimits {
     StepTickLimits {
         free_slots,
-        max_admissions: free_slots,
-        saturation_held: false,
         spawn_concurrency: 1,
     }
 }
@@ -167,20 +165,18 @@ fn limits(free_slots: usize) -> StepTickLimits {
 fn run_with(
     workspaces: Vec<StepWorkspace>,
     limits: StepTickLimits,
-    cap: &mut RepoCap,
     spawner: &mut FakeSpawner,
 ) -> StepTick {
-    run_knobs(workspaces, limits, PoolKnobs::default(), cap, spawner)
+    run_knobs(workspaces, limits, PoolKnobs::default(), spawner)
 }
 
 fn run_knobs(
     workspaces: Vec<StepWorkspace>,
     limits: StepTickLimits,
     knobs: PoolKnobs,
-    cap: &mut RepoCap,
     spawner: &mut FakeSpawner,
 ) -> StepTick {
-    run(workspaces, limits, &seed(), &knobs, cap, spawner)
+    run(workspaces, limits, &seed(), &knobs, spawner)
 }
 
 #[test]
@@ -189,9 +185,7 @@ fn every_stage_gets_its_step_and_claimed_and_parked_items_are_skipped() {
         refuse: vec![(3, "claimed")],
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    let tick =
-        run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut cap, &mut spawner);
+    let tick = run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut spawner);
     let asked: BTreeSet<(u32, StepRole)> = spawner.asked.iter().map(|a| (a.1, a.2)).collect();
     assert_eq!(
         asked,
@@ -235,16 +229,14 @@ fn a_refused_claim_redraws_within_the_slot() {
         row(3, &["loom:triage"], "", false),
     ];
     let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(None, vec![0]);
     // Find the draw order, then refuse the first two picks.
-    run_with(vec![workspace(0, "acme/one", &rows)], limits(3), &mut cap, &mut spawner);
+    run_with(vec![workspace(0, "acme/one", &rows)], limits(3), &mut spawner);
     let order: Vec<u32> = spawner.asked.iter().map(|a| a.1).collect();
     let mut spawner = FakeSpawner {
         refuse: vec![(order[0], "claimed"), (order[1], "claim_lost")],
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut cap, &mut spawner);
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut spawner);
     let attempts: Vec<(u32, u32)> = spawner.asked.iter().map(|a| (a.1, a.3)).collect();
     assert_eq!(attempts, vec![(order[0], 1), (order[1], 2), (order[2], 3)]);
     assert_eq!(tick.report.dispatched, 1);
@@ -260,8 +252,7 @@ fn a_slot_gives_up_after_eight_draws_and_a_tick_after_thirty_two_passes() {
         refuse_all: Some("pool_exhausted"),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut cap, &mut spawner);
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut spawner);
     assert_eq!(spawner.asked.len(), MAX_DRAWS_PER_SLOT as usize);
     assert_eq!(tick.report.dispatched, 0);
 
@@ -269,59 +260,16 @@ fn a_slot_gives_up_after_eight_draws_and_a_tick_after_thirty_two_passes() {
         refuse_all: Some("claimed"),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut cap, &mut spawner);
+    run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut spawner);
     assert_eq!(spawner.asked.len(), MAX_PASSES_PER_TICK as usize);
-}
-
-#[test]
-fn saturation_holds_every_row_and_a_full_repo_is_drawn_no_more() {
-    let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(None, vec![0]);
-    let tick = run_with(
-        vec![workspace(0, "acme/one", &forge())],
-        StepTickLimits {
-            saturation_held: true,
-            ..limits(4)
-        },
-        &mut cap,
-        &mut spawner,
-    );
-    assert!(spawner.asked.is_empty());
-    assert!(tick
-        .report
-        .queue
-        .iter()
-        .all(|r| r.disposition == Some(Qd::DeferredSaturation)));
-
-    // Repo `one` is at its cap of 2; `two` still gets the slots.
-    let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(Some(2), vec![2, 0]);
-    let two = vec![
-        row(1, &["loom:triage"], "", false),
-        row(2, &["loom:triage"], "", false),
-    ];
-    let tick = run_with(
-        vec![
-            workspace(0, "acme/one", &forge()),
-            workspace(1, "acme/two", &two),
-        ],
-        limits(2),
-        &mut cap,
-        &mut spawner,
-    );
-    assert!(spawner.asked.iter().all(|a| a.0 == 1), "{:?}", spawner.asked);
-    assert_eq!(tick.report.dispatched, 2);
-    assert!(tick.passes.get(PASS_REPO_CAP).copied().unwrap_or(0) <= 1);
 }
 
 #[test]
 fn a_halted_workspace_is_never_drawn() {
     let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(None, vec![0]);
     let mut ws = workspace(0, "acme/one", &forge());
     ws.halted = true;
-    let tick = run_with(vec![ws], limits(4), &mut cap, &mut spawner);
+    let tick = run_with(vec![ws], limits(4), &mut spawner);
     assert!(spawner.asked.is_empty());
     assert!(tick
         .report
@@ -361,9 +309,7 @@ fn a_refused_draw_is_counted_on_the_record() {
         refuse: vec![(3, "claim_lost")],
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    let tick =
-        run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut cap, &mut spawner);
+    let tick = run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut spawner);
     let record = tick.report.item_draw.unwrap();
     let refused = record
         .excluded
@@ -382,9 +328,7 @@ fn claim_lost_refusals_are_counted_as_passes_and_draws() {
         refuse: vec![(3, "claim_lost")],
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    let tick =
-        run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut cap, &mut spawner);
+    let tick = run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut spawner);
     assert_eq!(tick.passes.get("claim_lost"), Some(&1));
     assert!(tick.draws > 1, "{} draws", tick.draws);
 }
@@ -402,8 +346,7 @@ fn claim_lost_refusals_do_not_exhaust_the_tick_passes() {
         refuse_first: Some((40, "claim_lost")),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    let lost = run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut cap, &mut spawner);
+    let lost = run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut spawner);
     // Slot 1: 16 free losses + 8 charged; slots 2 and 3: 8 charged each (the
     // free ones are spent); slots 4..10 spawn.
     assert_eq!(lost.passes.get("claim_lost"), Some(&40), "every loss is still counted");
@@ -415,9 +358,7 @@ fn claim_lost_refusals_do_not_exhaust_the_tick_passes() {
         refuse_first: Some((40, "claimed")),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    let claimed =
-        run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut cap, &mut spawner);
+    let claimed = run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut spawner);
     assert_eq!(spawner.asked.len(), MAX_PASSES_PER_TICK as usize);
     assert_eq!(claimed.report.dispatched, 0);
     assert_eq!(claimed.stop, TickStop::PassLimit);
@@ -434,8 +375,7 @@ fn a_lost_claim_redraws_without_spending_the_slot() {
         refuse_first: Some((10, "claim_lost")),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut cap, &mut spawner);
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut spawner);
     // Ten losses exceed the slot's eight draws, but none is charged.
     assert_eq!(tick.report.dispatched, 1);
     assert_eq!(tick.stop, TickStop::Filled);
@@ -453,25 +393,12 @@ fn the_tick_names_its_stop_and_budget() {
         .map(|n| row(n, &["loom:triage"], "", false))
         .collect();
     let ws = || vec![workspace(0, "acme/one", &rows)];
-    let tick_of = |limits: StepTickLimits| {
-        let mut cap = RepoCap::new(None, vec![0]);
-        run_with(ws(), limits, &mut cap, &mut FakeSpawner::default())
-    };
+    let tick_of = |limits: StepTickLimits| run_with(ws(), limits, &mut FakeSpawner::default());
     let filled = tick_of(limits(4));
     assert_eq!((filled.stop, filled.budget, filled.report.dispatched), (TickStop::Filled, 4, 4));
-    let ramp = tick_of(StepTickLimits {
-        max_admissions: 3,
-        ..limits(30)
-    });
-    assert_eq!((ramp.stop, ramp.budget, ramp.report.dispatched), (TickStop::RampCap, 3, 3));
     let drained = tick_of(limits(30));
     assert_eq!((drained.stop, drained.budget), (TickStop::PoolDrained, 30));
     assert_eq!(drained.report.dispatched, 12);
-    let saturated = tick_of(StepTickLimits {
-        saturation_held: true,
-        ..limits(4)
-    });
-    assert_eq!((saturated.stop, saturated.budget), (TickStop::Saturation, 0));
     assert_eq!(tick_of(limits(0)).stop, TickStop::NoSlots);
     assert_eq!(TickStop::PassLimit.as_str(), "pass_limit");
 }
@@ -495,7 +422,6 @@ fn many(n: u32) -> Vec<RestIssue> {
 #[test]
 fn one_pool_spans_the_workspaces_and_the_record_replays() {
     let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(None, vec![0, 0]);
     let mut busy = workspace(1, "acme/two", &many(3));
     busy.in_flight = 4;
     busy.weight = 16;
@@ -506,7 +432,6 @@ fn one_pool_spans_the_workspaces_and_the_record_replays() {
             backlog_exponent: 0.5,
             busy_exponent: 1.0,
         },
-        &mut cap,
         &mut spawner,
     );
     let repos: BTreeSet<usize> = spawner.asked.iter().map(|a| a.0).collect();
@@ -537,43 +462,11 @@ fn one_pool_spans_the_workspaces_and_the_record_replays() {
 #[test]
 fn a_zero_weight_workspace_is_never_drawn() {
     let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(None, vec![0, 0]);
     let mut off = workspace(0, "acme/off", &many(5));
     off.weight = 0;
-    let tick =
-        run_with(vec![off, workspace(1, "acme/on", &many(5))], limits(8), &mut cap, &mut spawner);
+    let tick = run_with(vec![off, workspace(1, "acme/on", &many(5))], limits(8), &mut spawner);
     assert!(spawner.asked.iter().all(|a| a.0 == 1), "{:?}", spawner.asked);
     assert_eq!(tick.report.dispatched, 5, "the repo that is on drains, no more");
-}
-
-/// A repo the per-repo cap refuses is out of the pool for the rest of the
-/// tick, and the record still replays.
-#[test]
-fn a_capped_repo_leaves_the_pool_and_the_record_replays() {
-    let mut spawner = FakeSpawner::default();
-    // `one` is already at its cap of 8: any draw of it is refused and closes it.
-    let mut cap = RepoCap::new(Some(8), vec![8, 0]);
-    let tick = run_knobs(
-        vec![
-            workspace(0, "acme/one", &many(20)),
-            workspace(1, "acme/two", &many(20)),
-        ],
-        limits(6),
-        PoolKnobs::default(),
-        &mut cap,
-        &mut spawner,
-    );
-    assert!(spawner.asked.iter().all(|a| a.0 == 1));
-    assert_eq!(tick.report.dispatched, 6);
-    let record = tick.report.item_draw.as_ref().unwrap();
-    assert!(record.closures.len() <= 1, "{:?}", record.closures);
-    if let Some(c) = record.closures.first() {
-        assert_eq!(c.repo, "acme/one");
-        assert!(record.draws[c.after_draw as usize..]
-            .iter()
-            .all(|d| d.repo != "acme/one"));
-    }
-    assert_eq!(replay_record(record).unwrap().len(), tick.draws);
 }
 
 /// #12251: a Builder step refused on a landed issue reads as
@@ -596,9 +489,7 @@ fn peer_active_and_backstop_hold_read_as_a_peer_claim() {
         refuse: vec![(3, "peer_active")],
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0]);
-    let tick =
-        run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut cap, &mut spawner);
+    let tick = run_with(vec![workspace(0, "acme/one", &forge())], limits(10), &mut spawner);
     assert_eq!(tick.report.errors, 0, "a stand-down is not a dispatch error");
     let record = tick.report.item_draw.unwrap();
     let refused = record
@@ -637,8 +528,7 @@ fn spawned(spawner: &FakeSpawner, refused: &[u32]) -> Vec<(usize, u32, StepRole)
 #[test]
 fn a_round_spawns_at_most_one_step_per_repo_and_never_an_item_twice() {
     let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(None, vec![0; 4]);
-    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut spawner);
     assert!(spawner.batches.iter().any(|b| b.len() > 1), "{:?}", spawner.batches);
     for batch in &spawner.batches {
         assert!(batch.len() <= 4);
@@ -660,35 +550,15 @@ fn a_round_spawns_at_most_one_step_per_repo_and_never_an_item_twice() {
 }
 
 #[test]
-fn a_concurrent_tick_never_exceeds_the_free_slots_or_the_ramp_cap() {
-    for (free, ramp) in [(3, 10), (10, 3), (5, 5)] {
+fn a_concurrent_tick_fills_every_free_slot() {
+    for free in [3, 10, 5] {
         let mut spawner = FakeSpawner::default();
-        let mut cap = RepoCap::new(None, vec![0; 4]);
-        let tick = run_with(
-            repos(4),
-            StepTickLimits {
-                max_admissions: ramp,
-                ..concurrent(free, 4)
-            },
-            &mut cap,
-            &mut spawner,
-        );
-        let want = free.min(ramp);
-        assert_eq!(tick.report.dispatched, want, "free {free}, ramp {ramp}");
-        assert_eq!(spawner.asked.len(), want, "free {free}, ramp {ramp}");
+        let tick = run_with(repos(4), concurrent(free, 4), &mut spawner);
+        // Four repos of six actionable items each: more than any `free`.
+        let want = free;
+        assert_eq!(tick.report.dispatched, want, "free {free}");
+        assert_eq!(spawner.asked.len(), want, "free {free}");
     }
-}
-
-#[test]
-fn concurrent_spawns_keep_the_repo_caps() {
-    let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(Some(2), vec![1, 0, 2]);
-    let tick = run_with(repos(3), concurrent(10, 4), &mut cap, &mut spawner);
-    let per_repo = |ws: usize| spawner.asked.iter().filter(|a| a.0 == ws).count();
-    assert_eq!((per_repo(0), per_repo(1), per_repo(2)), (1, 2, 0));
-    assert_eq!(tick.report.dispatched, 3);
-    let end = tick.report.repo_cap.unwrap().occupancy_end;
-    assert_eq!(end, vec![2, 2, 2]);
 }
 
 #[test]
@@ -702,14 +572,12 @@ fn one_champion_merge_per_repo_holds_across_rounds() {
         row(80, &["loom:pr"], "Closes #8", true),
     ];
     let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(None, vec![0; 2]);
     let tick = run_with(
         vec![
             workspace(0, "acme/one", &rows),
             workspace(1, "acme/two", &rows),
         ],
         concurrent(10, 4),
-        &mut cap,
         &mut spawner,
     );
     for ws in 0..2 {
@@ -731,14 +599,13 @@ fn refusals_in_a_round_are_counted_in_draw_order() {
         refuse_all: Some("claimed"),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0; 4]);
     let rows: Vec<RestIssue> = (1..=40)
         .map(|n| row(n, &["loom:triage"], "", false))
         .collect();
     let ws: Vec<StepWorkspace> = (0..4)
         .map(|i| workspace(i, &format!("acme/r{i}"), &rows))
         .collect();
-    let tick = run_with(ws, concurrent(4, 4), &mut cap, &mut spawner);
+    let tick = run_with(ws, concurrent(4, 4), &mut spawner);
     assert_eq!(tick.report.dispatched, 0);
     assert_eq!(tick.passes.get("claimed"), Some(&spawner.asked.len()));
     assert!(spawner.asked.len() <= MAX_PASSES_PER_TICK as usize);
@@ -755,8 +622,7 @@ fn refusals_in_a_round_are_counted_in_draw_order() {
         refuse: vec![(1, "claimed"), (3, "pool_exhausted"), (40, "claim_lost")],
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0; 4]);
-    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut spawner);
     let refused = spawner.asked.len() - tick.report.dispatched;
     assert_eq!(tick.passes.values().sum::<usize>(), refused);
     let dispatched_rows = tick
@@ -775,16 +641,14 @@ fn a_concurrency_of_one_or_one_repo_is_the_serial_tick() {
             refuse: vec![(3, "claimed")],
             ..FakeSpawner::default()
         };
-        let mut cap = RepoCap::new(None, vec![0; n]);
-        let tick = run_with(repos(n), concurrent(6, conc), &mut cap, &mut spawner);
+        let tick = run_with(repos(n), concurrent(6, conc), &mut spawner);
         (spawner.asked, tick.report.dispatched, tick.passes)
     };
     // One repo: every round is one draw, whatever the concurrency.
     assert_eq!(order(4, 1), order(1, 1));
     // Several repos at a concurrency of 1: one spawn per round.
     let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(None, vec![0; 3]);
-    run_with(repos(3), concurrent(6, 1), &mut cap, &mut spawner);
+    run_with(repos(3), concurrent(6, 1), &mut spawner);
     assert!(spawner.batches.iter().all(|b| b.len() == 1));
 }
 
@@ -794,8 +658,7 @@ fn a_breaker_tripped_mid_tick_stops_the_next_round() {
         hold_after: Some(1),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0; 4]);
-    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut spawner);
     // One round ran; the second was drawn but never spawned.
     assert_eq!(spawner.batches.len(), 1);
     assert_eq!(tick.report.dispatched, spawner.batches[0].len());
@@ -818,8 +681,7 @@ fn a_breaker_tripped_mid_tick_stops_the_next_round() {
         hold_after: Some(0),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0; 4]);
-    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut spawner);
     assert!(spawner.asked.is_empty());
     assert_eq!(tick.report.dispatched, 0);
 }
@@ -836,14 +698,12 @@ fn an_unverified_claim_ends_the_owners_draws_for_the_tick() {
         refuse_all: Some(REFUSAL_CLAIM_UNVERIFIED),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0, 0]);
     let tick = run_with(
         vec![
             workspace(0, "acme/one", &rows),
             workspace(1, "ACME/two", &rows),
         ],
         limits(10),
-        &mut cap,
         &mut spawner,
     );
     // One draw, not MAX_PASSES_PER_TICK: both repos share the owner.
@@ -854,7 +714,6 @@ fn an_unverified_claim_ends_the_owners_draws_for_the_tick() {
     // A second owner keeps drawing after the first owner's refusal.
     // Find the first acme draw, then refuse it.
     let mut spawner = FakeSpawner::default();
-    let mut cap = RepoCap::new(None, vec![0, 0, 0]);
     run_with(
         vec![
             workspace(0, "acme/one", &rows),
@@ -862,7 +721,6 @@ fn an_unverified_claim_ends_the_owners_draws_for_the_tick() {
             workspace(2, "other/three", &rows),
         ],
         limits(4),
-        &mut cap,
         &mut spawner,
     );
     let first_acme = spawner.asked.iter().find(|a| a.0 != 2).copied().unwrap();
@@ -870,7 +728,6 @@ fn an_unverified_claim_ends_the_owners_draws_for_the_tick() {
         refuse: vec![(first_acme.1, REFUSAL_CLAIM_UNVERIFIED)],
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0, 0, 0]);
     let tick = run_with(
         vec![
             workspace(0, "acme/one", &rows),
@@ -878,7 +735,6 @@ fn an_unverified_claim_ends_the_owners_draws_for_the_tick() {
             workspace(2, "other/three", &rows),
         ],
         limits(4),
-        &mut cap,
         &mut spawner,
     );
     // The refused acme draw is the only acme draw that follows it.
@@ -901,14 +757,12 @@ fn other_refusals_still_redraw_in_the_same_owner() {
         refuse_all: Some("claim_lost"),
         ..FakeSpawner::default()
     };
-    let mut cap = RepoCap::new(None, vec![0, 0]);
     run_with(
         vec![
             workspace(0, "acme/one", &rows),
             workspace(1, "acme/two", &rows),
         ],
         limits(1),
-        &mut cap,
         &mut spawner,
     );
     // Neither owner's repo leaves the draw, and (#12410) a lost claim spends

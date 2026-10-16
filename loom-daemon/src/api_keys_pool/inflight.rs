@@ -11,7 +11,7 @@
 //! | Module | Keyed by | Why it cannot answer this |
 //! |---|---|---|
 //! | [`crate::inflight`] | fingerprint of (command, tree, branch) | identity of a *verification command*, deliberately deduplicating identical work; a credential is not in the key at all |
-//! | [`crate::admission_brake`] | host load-per-core | one point-in-time reading for the whole host; says nothing about which account a spawn will pick, and never runs on the spawn path |
+//! | `crate::admission_brake` (removed, #12406) | host load-per-core | one point-in-time reading for the whole host; says nothing about which account a spawn will pick, and never runs on the spawn path |
 //! | [`crate::build_slot`] | anonymous machine-wide slot | count only, no identity — "may I run something heavy" |
 //!
 //! So this is the third, credential-keyed member of that family, and it reuses
