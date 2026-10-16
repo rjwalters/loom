@@ -319,3 +319,42 @@ mod role_invocation_close {
         assert!(!span.attributes.contains_key(STATUS_MESSAGE));
     }
 }
+
+/// #12481: `unclassified:pre-launch` is an alarm fallback, so every
+/// `return RoleTickOutcome::Failure(..)` in the launch path must have noted a
+/// class (`pre_launch::note` before a spawn, `hold.failure` after) shortly
+/// before it. A source scan, since the sites are spread over a spawn path that
+/// cannot be driven end to end here.
+#[test]
+fn every_failure_return_in_the_launch_path_notes_a_class() {
+    const WINDOW: usize = 30;
+    for (file, source) in [
+        ("role_runner/launch.rs", include_str!("../../../role_runner/launch.rs")),
+        ("role_runner/invocation.rs", include_str!("../../../role_runner/invocation.rs")),
+    ] {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut sites = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("return RoleTickOutcome::Failure(") {
+                continue;
+            }
+            sites += 1;
+            let noted = lines[i.saturating_sub(WINDOW)..i]
+                .iter()
+                .any(|l| l.contains("pre_launch::note(") || l.contains("hold.failure("));
+            assert!(noted, "{file}:{}: a Failure return notes no failure class", i + 1);
+        }
+        assert!(sites > 0, "{file}: the scan found no Failure return; update this test");
+    }
+}
+
+/// #12481: a launched tick the version roll stopped is an interruption, so its
+/// `role_tick.outcome` class is `roll-interrupted` (not the pre-launch
+/// fallback), even when a site had noted a class for the stop's consequences.
+#[test]
+fn a_roll_stopped_failure_reports_roll_interrupted() {
+    let failed = RoleTickOutcome::Failure("exited with signal 15".into());
+    assert_eq!(for_roll_stopped(&failed).unwrap().class(), ROLL_INTERRUPTED);
+    assert_eq!(for_roll_stopped(&failed).unwrap().class(), "roll-interrupted");
+    assert_eq!(for_roll_stopped(&RoleTickOutcome::Success), None);
+}

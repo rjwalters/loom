@@ -1226,8 +1226,10 @@ pub fn role_invocation(
 /// [`role_invocation`], also returning why a tick that failed **before** its
 /// launch failed (#12028). That tick journals no span, so the class its site
 /// noted would otherwise be dropped; it rides back here for the
-/// `role_tick.outcome` record. `None` for a launched tick (its class is on
-/// [`RoleTrace::failure`]) and for any outcome that is not a failure.
+/// `role_tick.outcome` record. A launched tick's class is on
+/// [`RoleTrace::failure`], except one the version roll stopped: its span closes
+/// `interrupted` with no failure, so its [`ROLL_INTERRUPTED`] class rides back
+/// here instead (#12481). `None` for any outcome that is not a failure.
 pub fn role_invocation_classified(
     root: &Path,
     role: &str,
@@ -1259,6 +1261,9 @@ pub fn role_invocation_classified(
     };
     let roll = roll_interruption::stopped(&span);
     let failure = role_failure::for_outcome(&outcome, noted).filter(|_| roll.is_none());
+    let rolled = roll
+        .as_ref()
+        .and_then(|_| role_failure::for_roll_stopped(&outcome));
     let trace = Some(RoleTrace {
         context: span.context().clone(),
         execution: execution.clone(),
@@ -1294,7 +1299,7 @@ pub fn role_invocation_classified(
         roll_interruption::RESULT.to_owned()
     });
     finish_execution(root, &execution, &result, close);
-    (outcome, trace, None)
+    (outcome, trace, rolled)
 }
 
 pub mod git_facts;
@@ -1305,7 +1310,8 @@ pub mod role_target;
 pub mod roll_interruption;
 pub use role_failure::{
     note_role_failure, pre_launch, step, RoleFailure, EXIT_CODE, FAILURE_CLASS,
-    ROLE_FAILURE_ATTRIBUTE_KEYS, UNCLASSIFIED, UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP,
+    ROLE_FAILURE_ATTRIBUTE_KEYS, ROLL_INTERRUPTED, UNCLASSIFIED, UNCLASSIFIED_PRE_LAUNCH,
+    UNCLASSIFIED_STEP,
 };
 
 #[cfg(test)]
