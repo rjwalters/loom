@@ -454,10 +454,9 @@ fn only_the_discovery_listings_name_the_mirror() {
         }
     }
     let expected: std::collections::BTreeSet<String> = [
-        // The two discovery listings (2am#4367 P5), and the step engine's
-        // all-open listing (#11897).
+        // The work finder's discovery listing (2am#4367 P5), and the step
+        // engine's all-open listing (#11897).
         "work_finder/forge.rs",
-        "observability/ops/stage_dwell.rs",
         "step_dispatch/listing.rs",
         // The task spawn, the wake seam's source check, and the telemetry drain.
         "daemon_service/observer_tasks.rs",
@@ -484,13 +483,6 @@ fn only_the_discovery_listings_name_the_mirror() {
     assert_eq!(count("work_finder/forge.rs", "poll_gate::ReadKind::Discovery,"), 1);
     assert_eq!(count("work_finder/forge.rs", "Caller::"), 1);
     assert_eq!(
-        count("observability/ops/stage_dwell.rs", "mirror_listing("),
-        2,
-        "the helper and its caller"
-    );
-    assert_eq!(count("observability/ops/stage_dwell.rs", "poll_gate::ReadKind::Discovery,"), 1);
-    assert_eq!(count("observability/ops/stage_dwell.rs", "Caller::"), 1);
-    assert_eq!(
         count("step_dispatch/listing.rs", "mirror_rows"),
         2,
         "the helper and its one use"
@@ -500,16 +492,12 @@ fn only_the_discovery_listings_name_the_mirror() {
     assert_eq!(count("step_dispatch/listing.rs", "Caller::StepEngine,"), 1);
     assert_eq!(count("step_dispatch/listing.rs", "Caller::"), 1);
     // Only the step engine lists with no label.
-    for rel in ["work_finder/forge.rs", "observability/ops/stage_dwell.rs"] {
-        assert_eq!(count(rel, "Some(label),"), 1, "{rel} lists one label");
-    }
-    // And of those, only the three listings call the listing.
+    assert_eq!(count("work_finder/forge.rs", "Some(label),"), 1, "work_finder lists one label");
+    // And of those, only the two listings call the listing.
     for rel in &users {
         let text = std::fs::read_to_string(src.join(rel)).unwrap();
         let lists = text.contains("list_open(") && text.contains("forge_mirror::discovery");
-        let allowed = rel == "work_finder/forge.rs"
-            || rel == "observability/ops/stage_dwell.rs"
-            || rel == "step_dispatch/listing.rs";
+        let allowed = rel == "work_finder/forge.rs" || rel == "step_dispatch/listing.rs";
         assert!(!lists || allowed, "{rel} calls the mirror listing");
         if allowed {
             assert!(text.contains("ReadKind::Discovery"), "{rel} must ask as a discovery read");

@@ -174,15 +174,8 @@ fn the_captains_listing_names_the_published_slug_on_a_fork_checkout() {
     let (gh, log) = recording_gh(tools.path());
 
     // The captain names the slug it publishes under.
-    super::list_open_with(
-        &gh,
-        checkout.path(),
-        Some("acme/app"),
-        "loom:blocked",
-        "queue_blocked",
-        false,
-    )
-    .unwrap();
+    super::list_open_with(&gh, checkout.path(), Some("acme/app"), "loom:blocked", "queue_blocked")
+        .unwrap();
     let args = listed(&log);
     assert!(args.contains("repos/acme/app/issues"), "{args}");
     assert!(!args.contains("fork-owner"), "{args}");
@@ -190,8 +183,7 @@ fn the_captains_listing_names_the_published_slug_on_a_fork_checkout() {
     // Left to the helper, the same root lists `origin`: the fork. That is
     // what the captain published under the upstream's name before.
     std::fs::remove_file(&log).unwrap();
-    super::list_open_with(&gh, checkout.path(), None, "loom:blocked", "queue_blocked", false)
-        .unwrap();
+    super::list_open_with(&gh, checkout.path(), None, "loom:blocked", "queue_blocked").unwrap();
     assert!(listed(&log).contains("repos/fork-owner/app/issues"), "{}", listed(&log));
 }
 
@@ -209,7 +201,6 @@ fn loom_repo_does_not_redirect_the_captains_listing() {
         Some("acme/app"),
         "loom:blocked",
         "queue_blocked",
-        false,
     );
     std::env::remove_var("LOOM_REPO");
     result.unwrap();

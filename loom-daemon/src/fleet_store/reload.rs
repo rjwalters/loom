@@ -110,11 +110,6 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from the workspace's effective config on every landed pre-filter
     // call (#12205) — `work_finder::landed_prefilter::prefilter_enabled`, never cached.
     ("autonomous.workFinder.landedPrefilter", Reloadability::Live),
-    // #12203: the stage-dwell sampler's switch and spacing are read from the
-    // effective config on every forge-gather pass
-    // (`captain_gauges::resolve` → `stage_dwell::Settings::from_effective`),
-    // never cached.
-    ("observability.stageDwell", Reloadability::Live),
     // #12246: the per-agent-scope `MemoryMax` knobs are resolved by
     // `loom-daemon ram-scope-limit`, a fresh process per agent spawn
     // (`ram_scope_limit::resolve`), never cached by the daemon.
@@ -224,12 +219,6 @@ mod tests {
         ] {
             assert_eq!(classify(path), Reloadability::Live, "{path}");
         }
-    }
-
-    #[test]
-    fn stage_dwell_switch_is_live() {
-        assert_eq!(classify("observability.stageDwell.enabled"), Reloadability::Live);
-        assert_eq!(classify("observability.stageDwell.intervalSecs"), Reloadability::Live);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::observability::captain_gauges::{self as gauges, QUEUE_BLOCKED_JOB, STAGE_DWELL_JOB};
+use crate::observability::captain_gauges::{self as gauges, QUEUE_BLOCKED_JOB};
 
 #[cfg(test)]
 mod registry_tests;
@@ -143,7 +143,6 @@ pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
     // heartbeat, published every 600s by default.
     // The deadline is the heartbeat's own `maxAgeSecs` (1800s), not 2x cadence
     // (1200s): one missed publish puts `as_of` near 1500s and must not fire.
-    gauge(STAGE_DWELL_JOB, "captain-gauges/v1:stage-dwell", &[gauges::ENABLED_KEY]),
     gauge(
         QUEUE_BLOCKED_JOB,
         "captain-gauges/v1:queue-blocked",

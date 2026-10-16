@@ -3,12 +3,11 @@
 //!
 //! # The problem
 //!
-//! Some collector gauges describe the *forge*, not the host: forge label-stage
-//! dwell ([`super::ops::stage_dwell`], `loom.forge.stage_dwell` /
-//! `loom.forge.stage_items`) lists the same stage labels of the same repos on
-//! every host that manages them, every 5 minutes, and reads the same per-item
-//! events. N hosts spend N times the reader budget to export N copies of one
-//! fact (the sums even scale with the host count).
+//! Some collector reads describe the *forge*, not the host: the
+//! `loom:blocked` listing behind `queue.snapshot` ([`super::queue_blocked`])
+//! lists the same repos on every host that manages them. N hosts spend N times
+//! the reader budget to read one fact. (The forge label-stage dwell sampler
+//! that first motivated this was deleted in #12316.)
 //!
 //! # The fix: one producer, assigned
 //!
@@ -21,10 +20,8 @@
 //! bound, as `loom.captain.gauge_fallback = 1` while the dispatchers resume
 //! local production. The hand-back is not seamless: a dispatcher notices a
 //! dead captain only after `maxAgeSecs` plus the clock-skew allowance plus one
-//! collector pass (about 40 minutes at the defaults), stage transitions inside
-//! that window are not sampled by anyone, and the dispatcher then starts from
-//! a baseline. After the gap the gauges are per-host copies again until the
-//! captain returns.
+//! collector pass (about 40 minutes at the defaults). After the gap the reads
+//! are per-host copies again until the captain returns.
 //!
 //! Per-host gauges and every dispatch gate stay local and untouched
 //! (`role_queue_gate`, `role_demand`, the work finder's own listings).
@@ -104,14 +101,12 @@ use self::store::{BlockedFact, FetchCache, Fetched, Heartbeat, JobFacts, Publish
 use crate::fleet_captain::{self as captain, CaptainGate};
 use crate::telemetry::ops::{MetricName, MetricPoint};
 
-/// Forge label-stage dwell ([`super::ops::stage_dwell`]).
-pub const STAGE_DWELL_JOB: &str = "stage-dwell";
 /// Each repo's open `loom:blocked` issues ([`facts`], for
 /// [`super::queue_blocked`]).
 pub const QUEUE_BLOCKED_JOB: &str = "queue-blocked";
 /// Every job this module can arm on the captain. Which ones a host runs is
 /// [`Config::jobs`].
-pub const JOBS: [&str; 2] = [STAGE_DWELL_JOB, QUEUE_BLOCKED_JOB];
+pub const JOBS: [&str; 1] = [QUEUE_BLOCKED_JOB];
 
 /// Config key: arm and publish on the declared captain.
 pub const ENABLED_KEY: &str = "fleet.captainGauges.enabled";
@@ -155,9 +150,6 @@ pub struct Config {
     pub publish_interval: Duration,
     /// `queueBlocked`.
     pub queue_blocked: bool,
-    /// `observability.stageDwell.enabled` (#12203): off, no host arms or
-    /// relies on the `stage-dwell` job.
-    pub stage_dwell: bool,
 }
 
 /// The `fleet.captainGauges` keys in `effective` that nothing reads, as full
@@ -224,19 +216,14 @@ impl Config {
             max_age: secs(MAX_AGE_KEY, DEFAULT_MAX_AGE_SECS),
             publish_interval: secs(PUBLISH_INTERVAL_KEY, DEFAULT_PUBLISH_INTERVAL_SECS),
             queue_blocked: flag(QUEUE_BLOCKED_KEY),
-            stage_dwell: super::ops::stage_dwell::Settings::from_effective(effective).enabled,
         }
     }
 
     /// The jobs this host takes part in, each by its own switch:
-    /// `stage-dwell` by `observability.stageDwell.enabled` (#12203),
     /// `queue-blocked` by `queueBlocked`.
     #[must_use]
     pub fn jobs(&self) -> Vec<&'static str> {
         let mut jobs = Vec::new();
-        if self.stage_dwell {
-            jobs.push(STAGE_DWELL_JOB);
-        }
         if self.queue_blocked {
             jobs.push(QUEUE_BLOCKED_JOB);
         }
@@ -480,22 +467,8 @@ pub fn captain_blocked(slug: &str, now: DateTime<Utc>) -> Option<Vec<BlockedFact
     })
 }
 
-/// On the captain, how long a repo may go unsampled before its sampler state
-/// is too old to diff against (`maxAgeSecs`): by then every dispatcher has
-/// fallen back, baselined and emitted the transitions itself, so replaying
-/// them from the pre-outage state would double count. `None` on every other
-/// host, which keeps catching up as before.
-#[must_use]
-pub fn replay_bound() -> Option<Duration> {
-    with(|s| match (&s.role, &s.config) {
-        (Some(Role::Captain { .. }), Some(config)) => Some(config.max_age),
-        _ => None,
-    })
-}
-
 /// The forge-gauge stage of the collector pass: resolve this pass's role,
-/// produce the captain's facts, publish or read the heartbeat, then sample
-/// the stage dwell, which consults [`captain_covers`].
+/// produce the captain's facts, then publish or read the heartbeat.
 pub(super) async fn forge_gauges(
     workspace_root: &Path,
     workspace_pool: &crate::workspace_pool::WorkspacePool,
@@ -508,16 +481,13 @@ pub(super) async fn forge_gauges(
         move || resolve(&root, &host)
     })
     .await;
-    let mut stage_dwell = super::ops::stage_dwell::Settings::default();
     if let Ok(pass) = resolved {
-        stage_dwell = pass.stage_dwell;
         if pass.role.is_captain() {
             // Before the exchange, so this pass's facts are what it publishes.
             facts::produce(&pass.config, workspace_pool, slug_cache).await;
         }
         let _ = tokio::task::spawn_blocking(move || exchange(&root, &pass, Utc::now())).await;
     }
-    super::ops::stage_dwell::record(workspace_pool, slug_cache, stage_dwell).await;
 }
 
 /// One pass's resolved gating.
@@ -525,8 +495,6 @@ struct Pass {
     role: Role,
     config: Config,
     location: Option<(crate::fleet_store::StoreLocation, String)>,
-    /// `observability.stageDwell`, read with the rest of this pass's config.
-    stage_dwell: super::ops::stage_dwell::Settings,
 }
 
 /// Resolve this pass's role and arm or disarm the jobs. Blocking (config and
@@ -578,7 +546,6 @@ fn resolve(root: &Path, host: &str) -> Pass {
         role,
         config,
         location,
-        stage_dwell: super::ops::stage_dwell::Settings::from_effective(&effective),
     }
 }
 

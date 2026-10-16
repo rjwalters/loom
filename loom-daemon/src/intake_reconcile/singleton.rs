@@ -720,6 +720,15 @@ impl IntakeForge for GhIntakeForge {
             Some(&repo.root),
             None,
         )?;
+        // #12118: the walk journals `issue.estimate` for freshly curated
+        // issues (was the stage-queue walk, removed with the sampler, #12316).
+        crate::telemetry::kinds::issue_estimate::observe::observe(
+            &repo.root,
+            &repo.slug,
+            &rows,
+            &crate::comment_trust::TrustPolicy::for_root(&repo.root),
+            Utc::now(),
+        );
         Ok(super::rows_from_listing(rows))
     }
 
