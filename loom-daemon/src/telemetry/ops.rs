@@ -117,12 +117,20 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.gather_concurrency",
     // #12306: the tick's discovery snapshot (`ops::dispatch_facts`).
     "loom.discovery.backend",
-    "loom.discovery.repos",
+    // #12311: the tier chain's answer, why a repo left the first tier, and
+    // the worklist's own outcome (`ops::dispatch_facts`).
+    "loom.discovery.tier",
+    "loom.discovery.fallback_repos",
+    "loom.discovery.worklist.outcome",
+    "loom.discovery.worklist.error_class",
+    "loom.discovery.worklist.latency_ms",
+    "loom.discovery.repos.requested",
+    "loom.discovery.repos.ok",
+    "loom.discovery.repos.unknown",
+    "loom.discovery.repos.backfilling",
+    "loom.discovery.repos.error",
     "loom.discovery.items",
     "loom.discovery.forge_reads",
-    "loom.discovery.worklist_latency_ms",
-    "loom.discovery.not_modified",
-    "loom.discovery.reused_previous",
     "loom.discovery.stale_repos",
     "loom.discovery.oldest_watermark_age_secs",
     // #12298: the spawn half's concurrency and its sub-phases.
