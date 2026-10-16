@@ -100,6 +100,7 @@ use crate::fleet_store::{self as store, StoreLocation};
 // the otlp-only consumers do not leave them dead in a non-otlp build (#11197).
 pub mod applied;
 pub mod checkout_ff;
+pub mod config_restart;
 mod floor_knowledge;
 pub mod git_spawn_log;
 pub mod identity;
@@ -620,6 +621,10 @@ fn set_floor(floor: Option<String>) {
 pub fn loom_min_version() -> Option<String> {
     floor_cell().lock().ok().and_then(|g| g.clone().flatten())
 }
+
+/// #12424: restart-required config changes since this process booted, beside
+/// the floor. See [`config_restart`].
+pub use config_restart::config_restart_demand;
 
 /// #10719: the `repo_ahead_target` roll demand, beside the floor. The highest
 /// daemon version a registered workspace NEEDS and this host does not run.
@@ -1322,6 +1327,8 @@ pub async fn start(
     workspace_resync::mark_boot();
     let mut inputs = inputs;
     let state = startup_pass(&inputs, bus.as_deref()).await;
+    // #12424: snapshot the rendered tiers for the since-boot comparison.
+    config_restart::record_boot(&inputs.workspace);
     inputs.host = identity::adopted().unwrap_or(inputs.host); // #11740
                                                               // Diverges on `stopped`: this host is not meant to be up at all.
     let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
@@ -1429,6 +1436,8 @@ fn spawn_timer(
                     status.workspaces = workspace_resync::latest();
                     publish(&status);
                     report(&status, bus.as_deref());
+                    // #12424: refresh the since-boot restart-required demand.
+                    config_restart::check(mode, Utc::now());
                     // #10718: last, so the floor is current and a hold this
                     // pass just placed is already in the drain flag. Not
                     // awaited: see `workspace_resync::host`.
