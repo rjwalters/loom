@@ -220,3 +220,72 @@ pub fn launch_recorded(workspace: &Path, log: &Path, record_json: &str) -> Shado
         key: None,
     })
 }
+
+/// The E3 checkpoint fields journaled: an allow-list, so the escalation state
+/// and any future key never reach the journal unreviewed.
+const CHECKPOINT_FIELDS: [&str; 6] = [
+    "phase",
+    "attempt",
+    "model",
+    "pr_number",
+    "task_id",
+    "timestamp",
+];
+
+/// The allow-listed view of a legacy checkpoint record. The same view is read
+/// back from the file by concern verification.
+#[must_use]
+pub fn checkpoint_projection(record: &Value) -> Value {
+    let mut view = Map::new();
+    for key in CHECKPOINT_FIELDS {
+        if let Some(v) = record.get(key).filter(|v| !v.is_null()) {
+            view.insert(key.to_owned(), v.clone());
+        }
+    }
+    Value::Object(view)
+}
+
+/// The E3 item key for a checkpoint file: its stem (`issue-<N>`).
+#[must_use]
+pub fn checkpoint_item(path: &Path) -> String {
+    path.file_stem()
+        .map_or_else(String::new, |s| s.to_string_lossy().into_owned())
+}
+
+/// E3: `issue-<issue>.json` was durably written with `record`.
+pub fn checkpoint_written(
+    path: &Path,
+    workspace: &Path,
+    issue: u32,
+    record: &Value,
+) -> ShadowOutcome {
+    if current_settings().is_none() {
+        return ShadowOutcome::Disabled;
+    }
+    let view = checkpoint_projection(record);
+    let mut fields = Map::new();
+    for key in ["phase", "attempt", "model", "pr_number", "task_id"] {
+        if let Some(v) = view.get(key) {
+            fields.insert(key.to_owned(), v.clone());
+        }
+    }
+    shadow(ShadowRecord {
+        kind: Kind::CheckpointCompleted,
+        store: Store::Checkpoint,
+        path: path.to_path_buf(),
+        item: checkpoint_item(path),
+        change: Change::Set(view),
+        subject: Subject {
+            workspace: workspace.display().to_string(),
+            issue: Some(issue),
+            pr: record["pr_number"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok()),
+            sweep_id: std::env::var("LOOM_SWEEP_ID")
+                .ok()
+                .filter(|v| !v.is_empty()),
+        },
+        fields,
+        key: None,
+    })
+}
