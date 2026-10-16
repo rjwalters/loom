@@ -400,6 +400,11 @@ pub struct RosterPass {
     /// Missing clones this pass cloned or tried to (#11218).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clones: Vec<roster_clone::CloneAttempt>,
+    /// The registry changes this pass applied, and each desired repo it could
+    /// not register because it is not cloned (#12322). Published as
+    /// `roster.change` records; never serialized into the status file.
+    #[serde(skip)]
+    pub changes: Vec<roster_clone::RosterEvent>,
     /// Why the pass could not be completed, when it could not be.
     pub error: Option<String>,
     /// Why the roster was not consulted at all this pass — set when the
@@ -1155,6 +1160,7 @@ fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
         log::debug!("fleet_sync: {summary}");
     }
     roster_clone::announce(status, bus);
+    roster_clone::emit_changes(status);
     loom_ui::report(status); // #11295
     let (Some(bus), true) = (bus, status.drifted() || status.errored()) else {
         return;
