@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12438**: feat: classify audited config blocks and underscore annotations in fleet reload table
+- **PR #12432**: feat: report NVIDIA GPU utilisation and memory in host status
+- **Issue #12423** (closed): reload: classify annotation keys and audited config blocks (#12419 child 1)
+- **Issue #12115** (closed): host_status (slice d): add GPU signals to host_status
 - **PR #12434**: feat: source role-span host attributes from host_status latest record
 - **PR #12435**: step tick: a lost claim is a cheap pass; the tick names its stop and budget
 - **PR #12431**: feat: detect restart-required config changes since boot in fleet-sync
