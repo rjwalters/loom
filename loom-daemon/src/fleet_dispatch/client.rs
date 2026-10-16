@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::step_role::StepRole;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 
 /// One call's deadline: short, so a dead server costs a spawn little.
@@ -203,8 +204,9 @@ pub const RESULT_GRANTED: &str = "granted";
 pub const RESULT_REFUSED: &str = "refused";
 /// `loom.fleet_dispatch.result` of an answered heartbeat, refuse or release.
 pub const RESULT_OK: &str = "ok";
-/// `loom.fleet_dispatch.result` of a call with no usable answer.
-pub const RESULT_FAILED: &str = "failed";
+/// `loom.fleet_dispatch.result` of a call with no usable answer: `error`,
+/// the captain side's value (#12465), so one query reads both sides.
+pub const RESULT_ERROR: &str = "error";
 
 /// One call's facts.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -213,7 +215,7 @@ pub struct CallFacts {
     pub endpoint: &'static str,
     pub latency: Duration,
     /// [`RESULT_GRANTED`], [`RESULT_REFUSED`], [`RESULT_OK`] or
-    /// [`RESULT_FAILED`].
+    /// [`RESULT_ERROR`].
     pub result: &'static str,
     /// The refusal reason, the refuse reason, the release outcome, or a
     /// failed call's [`CallError::token`].
@@ -223,11 +225,18 @@ pub struct CallFacts {
     pub status: Option<u16>,
     pub repo: Option<String>,
     pub item: Option<u64>,
+    /// The step's wire name (`judge`, `champion_merge`, ...).
     pub step: Option<String>,
     pub assignment_id: Option<String>,
 }
 
 /// The span for `facts`, ended at `at`. Pure.
+///
+/// The item and role use the codebase's join keys, as the captain's span of
+/// the same name does (#12465): `loom.issue` or `loom.pr_number` (by whether
+/// the step acts on a PR) and `loom.role` (the role name, as on
+/// `loom.dispatch.step`), never `loom.step.*`, so one query covers both
+/// sides of a call.
 #[must_use]
 pub fn span(facts: &CallFacts, at: DateTime<Utc>) -> SpanRecord {
     let name = SpanName::FleetDispatchCall;
@@ -267,11 +276,20 @@ pub fn span(facts: &CallFacts, at: DateTime<Utc>) -> SpanRecord {
     if let Some(repo) = &facts.repo {
         put("loom.repo", repo.clone());
     }
+    let role = facts
+        .step
+        .as_deref()
+        .and_then(|s| s.parse::<StepRole>().ok());
     if let Some(n) = facts.item {
-        put("loom.step.item", n.to_string());
+        let key = if role.is_some_and(StepRole::acts_on_pr) {
+            "loom.pr_number"
+        } else {
+            "loom.issue"
+        };
+        put(key, n.to_string());
     }
     if let Some(step) = &facts.step {
-        put("loom.step.role", step.clone());
+        put("loom.role", role.map_or_else(|| step.clone(), |r| r.role_name().to_string()));
     }
     if let Some(id) = &facts.assignment_id {
         put("loom.assignment.id", id.clone());
@@ -285,7 +303,7 @@ pub fn span(facts: &CallFacts, at: DateTime<Utc>) -> SpanRecord {
         name,
         started_at,
         ended_at: at,
-        status: if facts.result == RESULT_FAILED {
+        status: if facts.result == RESULT_ERROR {
             SpanStatus::Error
         } else {
             SpanStatus::Ok
@@ -386,25 +404,44 @@ mod tests {
         assert_eq!(attr("loom.fleet_dispatch.server_epoch").as_deref(), Some("e1"));
         assert_eq!(attr("loom.fleet_dispatch.side").as_deref(), Some("worker"));
         assert_eq!(attr("loom.fleet_dispatch.status").as_deref(), Some("200"));
-        for key in span
-            .attributes
-            .keys()
-            .filter(|k| k.starts_with("loom.fleet_dispatch.") || k.starts_with("loom.step."))
-        {
-            assert!(
-                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
-                "{key} is dropped at export"
-            );
+        assert_eq!(attr("loom.pr_number").as_deref(), Some("9"), "a Judge's item is a PR");
+        assert_eq!(attr("loom.issue"), None);
+        assert_eq!(attr("loom.role").as_deref(), Some("judge"));
+        assert!(
+            !span.attributes.keys().any(|k| k.starts_with("loom.step.")),
+            "the captain's join keys, not loom.step.*: {:?}",
+            span.attributes.keys().collect::<Vec<_>>()
+        );
+        // Every key survives the export filter (the lifecycle allowlist plus
+        // `OPS_SPAN_ATTRIBUTE_KEYS`).
+        let exported = span.clone().bounded().attributes;
+        for key in span.attributes.keys() {
+            assert!(exported.contains_key(key), "{key} is dropped at export");
         }
         let failed = super::span(
             &CallFacts {
-                result: RESULT_FAILED,
+                result: RESULT_ERROR,
                 assignment_id: Some("a-1".into()),
+                step: Some("champion_merge".into()),
                 ..facts
             },
             Utc::now(),
         );
         assert_eq!(failed.status, SpanStatus::Error);
+        assert_eq!(failed.attributes["loom.fleet_dispatch.result"], "error");
         assert_eq!(failed.attributes["loom.assignment.id"], "a-1");
+        assert_eq!(failed.attributes["loom.role"], "champion");
+        assert_eq!(failed.attributes["loom.pr_number"], "9");
+        let builder = super::span(
+            &CallFacts {
+                step: Some("builder".into()),
+                item: Some(5),
+                ..CallFacts::default()
+            },
+            Utc::now(),
+        );
+        assert_eq!(builder.attributes["loom.issue"], "5", "a Builder's item is an issue");
+        assert!(!builder.attributes.contains_key("loom.pr_number"));
+        assert_eq!(builder.attributes["loom.role"], "builder");
     }
 }

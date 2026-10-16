@@ -39,6 +39,14 @@
 //! for the whole host, carrying every repo's live steps, the free slots and
 //! the runnable roles the last step tick noted ([`note_capacity`]). In
 //! fallback the heartbeat is the probe that ends it.
+//!
+//! A repo whose live set has not been refreshed for [`LIVE_STALE_AFTER`]
+//! (its workspace was deregistered and its reaper aborted, so neither its
+//! next tick nor its steps' ends will come) leaves the table on the next
+//! tick of any other repo, and its grants are released `failed`. Without
+//! that, every later heartbeat would renew its steps and the captain would
+//! keep their items `held` fleet-wide until this daemon restarts: the
+//! captain's TTL backstop (spec §5.4, §6) only fires on rows nobody renews.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -64,6 +72,10 @@ pub const URL_KEY: &str = "fleetDispatch.url";
 /// reaper's 30 s, so every reaper round sends one even with jitter, while
 /// the reapers of a host's other repos in the same round do not.
 pub const HEARTBEAT_GAP: Duration = Duration::from_secs(25);
+
+/// How long a repo's live set stands without a refresh: three reaper periods
+/// (30 s each). Past it the repo's reaper is taken to be gone (module docs).
+pub const LIVE_STALE_AFTER: Duration = Duration::from_secs(90);
 
 /// The server URL when `root`'s effective config enables fleet dispatch.
 #[must_use]
@@ -127,6 +139,16 @@ pub fn refusal_token(reason: RefusalReason) -> &'static str {
 struct Assigned {
     root: PathBuf,
     grant: Grant,
+    /// When the step was noted spawned: ages out a grant whose repo never
+    /// recorded a live set (deregistered before its first reaper tick).
+    since: Instant,
+}
+
+/// One repo's live steps (by sweep id) and when its reaper last wrote them.
+#[derive(Debug)]
+struct LiveSet {
+    refreshed: Instant,
+    steps: Vec<(String, LiveStep)>,
 }
 
 #[derive(Debug, Default)]
@@ -136,8 +158,8 @@ struct State {
     entry_reason: &'static str,
     /// Live granted steps, by sweep id.
     assignments: HashMap<String, Assigned>,
-    /// Each repo's live steps at its last reaper tick, by sweep id.
-    live_by_root: HashMap<PathBuf, Vec<(String, LiveStep)>>,
+    /// Each repo's live steps at its last reaper tick.
+    live_by_root: HashMap<PathBuf, LiveSet>,
     /// `(free_slots, roles_ok)` at the last step tick.
     capacity: Option<(u32, Vec<String>)>,
     last_heartbeat: Option<Instant>,
@@ -283,7 +305,7 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
         Err(e) => {
             observe(false, Some(&e));
             facts.status = e.status();
-            facts.result = client::RESULT_FAILED;
+            facts.result = client::RESULT_ERROR;
             facts.reason = Some(e.token().to_string());
             log::info!(
                 "fleet_dispatch: claim of {} #{item} got no answer ({e}); claiming as today",
@@ -315,7 +337,7 @@ where
             Err(e) => {
                 observe(false, Some(&e));
                 facts.status = e.status();
-                facts.result = client::RESULT_FAILED;
+                facts.result = client::RESULT_ERROR;
                 facts.reason = Some(e.token().to_string());
             }
         }
@@ -367,6 +389,7 @@ pub fn note_spawned(root: &Path, sweep_id: &str, grant: Grant) {
         Assigned {
             root: root.to_path_buf(),
             grant,
+            since: Instant::now(),
         },
     );
 }
@@ -400,13 +423,21 @@ fn send_release(grant: &Grant, outcome: &str) {
 
 /// The step tick's view of this host: its free slots and the roles whose
 /// pools are not exhausted (`exhausted`, role names), for the heartbeat.
+///
+/// Phase 1 reports pool exhaustion only. Spec §5.2's `roles_ok` also leaves
+/// out roles behind the load brake or a disk back-off; those still run
+/// through today's admission after a grant, and the captain does not yet
+/// use `roles_ok` to pick hosts.
 pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
-    let mut roles: Vec<String> = StepRole::ALL
+    // Several steps share a role name (the Champion's three): a set, so
+    // each role is listed once, in a stable order.
+    let roles: Vec<String> = StepRole::ALL
         .iter()
         .map(|r| r.role_name().to_string())
         .filter(|name| !exhausted.contains(name))
+        .collect::<BTreeSet<String>>()
+        .into_iter()
         .collect();
-    roles.dedup();
     state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles));
 }
 
@@ -428,7 +459,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
             .filter(|(id, a)| a.root == root && !ids.contains(id.as_str()))
             .map(|(id, _)| id.clone())
             .collect();
-        let vanished: Vec<Grant> = gone
+        let mut vanished: Vec<Grant> = gone
             .iter()
             .filter_map(|id| s.assignments.remove(id))
             .map(|a| a.grant)
@@ -449,8 +480,15 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
                 )
             })
             .collect();
-        s.live_by_root.insert(root.to_path_buf(), steps);
         let now = Instant::now();
+        s.live_by_root.insert(
+            root.to_path_buf(),
+            LiveSet {
+                refreshed: now,
+                steps,
+            },
+        );
+        vanished.extend(prune_stale(&mut s, now));
         let due = s
             .last_heartbeat
             .is_none_or(|at| now.saturating_duration_since(at) >= HEARTBEAT_GAP);
@@ -461,7 +499,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
                     live: s
                         .live_by_root
                         .values()
-                        .flatten()
+                        .flat_map(|set| &set.steps)
                         .map(|(_, step)| step.clone())
                         .collect(),
                     free_slots: *free_slots,
@@ -484,6 +522,43 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
         };
         send_detached::<_, HeartbeatResponse>(&url, proto::HEARTBEAT_PATH, request, facts);
     }
+}
+
+/// Drop every repo whose live set is older than [`LIVE_STALE_AFTER`] at
+/// `now`, and take out its grants, to be released `failed` (module docs).
+/// A grant whose repo never recorded a live set ages out the same way from
+/// when it was noted spawned. The repo ticking now was just refreshed, so it
+/// is never dropped. Pure over `state`.
+fn prune_stale(state: &mut State, now: Instant) -> Vec<Grant> {
+    let stale = |at: Instant| now.saturating_duration_since(at) > LIVE_STALE_AFTER;
+    let dropped: BTreeSet<PathBuf> = state
+        .live_by_root
+        .iter()
+        .filter(|(_, set)| stale(set.refreshed))
+        .map(|(root, _)| root.clone())
+        .collect();
+    for root in &dropped {
+        state.live_by_root.remove(root);
+        log::warn!(
+            "fleet_dispatch: {} has not refreshed its live steps for over {}s (its workspace              was deregistered?); dropping them from the heartbeat and releasing their grants",
+            root.display(),
+            LIVE_STALE_AFTER.as_secs()
+        );
+    }
+    let orphaned: Vec<String> = state
+        .assignments
+        .iter()
+        .filter(|(_, a)| {
+            dropped.contains(&a.root)
+                || (!state.live_by_root.contains_key(&a.root) && stale(a.since))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    orphaned
+        .iter()
+        .filter_map(|id| state.assignments.remove(id))
+        .map(|a| a.grant)
+        .collect()
 }
 
 /// The slots this tick may fill, and whether it runs in fallback: the

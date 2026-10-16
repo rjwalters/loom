@@ -736,6 +736,10 @@ mod captain {
         let dir = tempdir().unwrap();
         // A peer's earlier lease: today's forge claim loses the race.
         let (mut reg, gh_log) = forge_registry(dir.path(), &[PEER_LEASE]);
+        // A per-repo credential pool, so the launch resolves on any host and
+        // the step reaches the forge pre-claim (without one, a host with no
+        // pool is refused `no_token_pool` before the claim is ever made).
+        crate::sweep_registry::test_support::seed_token_pool(dir.path(), "agent-1");
         let server = granted();
         enable(dir.path(), &server.url());
         let request = StepSpawnRequest::new(BUILDER_ITEM, StepRole::Builder);
@@ -746,7 +750,10 @@ mod captain {
         let refused = server.wait_for(REFUSE_PATH, 1);
         assert_eq!(refused.len(), 1, "{:?}", server.requests());
         assert_eq!(refused[0]["assignment_id"], "a-12450");
-        assert_eq!(refused[0]["reason"], refusal.reason);
+        // The peer's lease wins the forge order: the literal token, so a
+        // refusal that gave the grant back under some other reason fails.
+        assert_eq!(refusal.reason, "claim_lost");
+        assert_eq!(refused[0]["reason"], "claim_lost");
         let span = signals
             .spans
             .iter()

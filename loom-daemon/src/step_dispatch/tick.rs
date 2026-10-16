@@ -123,6 +123,10 @@ pub enum TickStop {
     SlotDraws,
     /// The spawner held the spawns (the shared rate-limit breaker, #12298).
     SpawnHold,
+    /// The fleet-dispatch captain refused a claim with `cap` (#12450): this
+    /// host is at its fleet cap, so every repo left the draw. Without its own
+    /// stop the tick would read `pool_drained`, which it was not.
+    CaptainCap,
     /// The pool's total weight overflowed ([`DrawError::WeightOverflow`]).
     WeightOverflow,
 }
@@ -138,6 +142,7 @@ impl TickStop {
             Self::PassLimit => "pass_limit",
             Self::SlotDraws => "slot_draws",
             Self::SpawnHold => "spawn_hold",
+            Self::CaptainCap => "captain_cap",
             Self::WeightOverflow => "weight_overflow",
         }
     }
@@ -464,6 +469,7 @@ pub fn run(
     // the order the slots opened.
     let mut open: Vec<(u32, u32)> = Vec::new();
     let mut free_losses = 0u32;
+    let mut captain_capped = false;
     let mut gave_up = 0usize;
     let mut opened = 0usize;
     let mut carry: Option<DrawRecord> = None;
@@ -660,6 +666,7 @@ pub fn run(
                     if reason == REFUSAL_CAPTAIN_CAP {
                         // The captain holds this host at its cap: every repo
                         // leaves the draw for the rest of the tick (#12450).
+                        captain_capped = true;
                         for other in workspaces.iter() {
                             draw.close_repo(other.idx);
                         }
@@ -684,6 +691,8 @@ pub fn run(
         TickStop::NoSlots
     } else if report.spawn_hold.is_some() {
         TickStop::SpawnHold
+    } else if captain_capped {
+        TickStop::CaptainCap
     } else if overflow {
         TickStop::WeightOverflow
     } else if exhausted {

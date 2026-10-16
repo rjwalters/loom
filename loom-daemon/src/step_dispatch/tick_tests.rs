@@ -839,7 +839,8 @@ fn a_captain_cap_refusal_ends_the_ticks_draws() {
     );
     assert_eq!(spawner.asked.len(), 1, "{:?}", spawner.asked);
     assert_eq!(tick.report.dispatched, 0);
-    assert_eq!(tick.stop, TickStop::PoolDrained);
+    assert_eq!(tick.stop, TickStop::CaptainCap, "its own stop, not pool_drained");
+    assert_eq!(TickStop::CaptainCap.as_str(), "captain_cap");
     assert_eq!(disposition_of("captain_cap"), Qd::DeferredCapacity);
     assert_eq!(disposition_of("captain_not_eligible"), Qd::HostConstraint);
 }

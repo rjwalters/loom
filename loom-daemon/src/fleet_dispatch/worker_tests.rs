@@ -226,3 +226,86 @@ fn a_vanished_step_is_released_and_a_refuse_names_its_reason() {
     assert_eq!(released[0]["outcome"], "failed");
     assert!(state().assignments.is_empty());
 }
+
+/// `by` before now (machine uptime is far longer than `by`).
+fn ago(by: Duration) -> Instant {
+    Instant::now()
+        .checked_sub(by)
+        .expect("uptime exceeds the test's backdating")
+}
+
+/// A deregistered workspace's reaper stops ticking: once its live set is
+/// older than `LIVE_STALE_AFTER`, the next tick of another repo drops it
+/// from the heartbeat and releases its grant `failed`, so the captain stops
+/// renewing a row nobody runs.
+#[test]
+#[serial]
+fn a_repo_whose_reaper_stopped_ages_out_and_its_grants_are_released() {
+    reset_for_test();
+    let (a, b) = (tempdir().unwrap(), tempdir().unwrap());
+    let server = granting();
+    enable(a.path(), &server.url(), true);
+    enable(b.path(), &server.url(), true);
+    note_capacity(5, &BTreeSet::new());
+    let Ask::Granted(grant) = claim(a.path(), 7, StepRole::Judge) else {
+        panic!("granted");
+    };
+    note_spawned(a.path(), "step-judge-7-1", grant);
+    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
+    assert_eq!(beats[0]["live"][0]["assignment_id"], "a-1");
+
+    // Still within the window: b's tick keeps a's step listed.
+    state().live_by_root.get_mut(a.path()).unwrap().refreshed =
+        ago(LIVE_STALE_AFTER - Duration::from_secs(5));
+    state().last_heartbeat = None;
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    let beats = server.wait_for(proto::HEARTBEAT_PATH, 2);
+    assert_eq!(beats[1]["live"].as_array().unwrap().len(), 2);
+    assert!(server.requests_to(proto::RELEASE_PATH).is_empty());
+
+    // a is deregistered: no tick refreshes it, and it ages out.
+    state().live_by_root.get_mut(a.path()).unwrap().refreshed =
+        ago(LIVE_STALE_AFTER + Duration::from_secs(1));
+    state().last_heartbeat = None;
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    let beats = server.wait_for(proto::HEARTBEAT_PATH, 3);
+    let live = beats[2]["live"].as_array().unwrap();
+    assert_eq!(live.len(), 1, "a's step left the heartbeat: {live:?}");
+    assert_eq!(live[0]["item"], 9);
+    let released = server.wait_for(proto::RELEASE_PATH, 1);
+    assert_eq!(released[0]["assignment_id"], "a-1");
+    assert_eq!(released[0]["outcome"], "failed");
+    {
+        let s = state();
+        assert!(!s.live_by_root.contains_key(a.path()));
+        assert!(s.live_by_root.contains_key(b.path()), "the ticking repo stays");
+        assert!(s.assignments.is_empty());
+    }
+
+    // A grant whose repo never recorded a live set ages out from its spawn.
+    let Ask::Granted(grant) = claim(a.path(), 8, StepRole::Judge) else {
+        panic!("granted");
+    };
+    note_spawned(a.path(), "step-judge-8-1", grant);
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    assert_eq!(state().assignments.len(), 1, "a fresh grant is not orphaned");
+    state().assignments.get_mut("step-judge-8-1").unwrap().since =
+        ago(LIVE_STALE_AFTER + Duration::from_secs(1));
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    assert_eq!(server.wait_for(proto::RELEASE_PATH, 2).len(), 2);
+    assert!(state().assignments.is_empty());
+}
+
+/// Each role is listed once in `roles_ok`, though three steps share
+/// `champion`.
+#[test]
+#[serial]
+fn roles_ok_names_each_role_once() {
+    reset_for_test();
+    note_capacity(1, &BTreeSet::new());
+    let roles = state().capacity.clone().unwrap().1;
+    let unique: BTreeSet<&String> = roles.iter().collect();
+    assert_eq!(unique.len(), roles.len(), "{roles:?}");
+    assert!(roles.contains(&"champion".to_string()));
+}
