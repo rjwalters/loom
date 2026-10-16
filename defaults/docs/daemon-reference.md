@@ -44,6 +44,7 @@
 - [Observability exporter (`observability`, #4705, epic #4702 Phase 1)](#observability-exporter-observability-4705-epic-4702-phase-1)
 - [Fleet dashboard (`loom-daemon serve`)](#fleet-dashboard-loom-daemon-serve)
 - [Locks and lifecycle](#locks-and-lifecycle)
+- [A tick appears hung — dump the async task tree (`kill -USR1`, #12079)](#a-tick-appears-hung--dump-the-async-task-tree-kill--usr1-12079)
 - [What this page does NOT describe](#what-this-page-does-not-describe)
 - [Related resources](#related-resources)
 <!-- toc:end -->
@@ -4141,8 +4142,9 @@ Judge stamps every verdict comment with
 <!-- loom:verdict-sha sha=<head-sha> verdict=approved|changes-requested -->
 ```
 
-(`.claude/commands/loom/judge.md` → "Verdict SHA Marker"), recording which tree
-the verdict covers. `claim_reconciliation::forge::reconcile_pr_verdicts` runs on
+(`.claude/commands/loom/judge.md` → "Verdict SHA Marker"; `approved` /
+`changes-requested` are canonical, readers also tolerate `approve` /
+`request-changes`), recording which tree the verdict covers. `claim_reconciliation::forge::reconcile_pr_verdicts` runs on
 the same periodic tick as the claim passes: for each open PR carrying a verdict
 label it reads the newest marker **of that verdict's own kind** and compares its
 SHA to the PR's current `headRefOid`. On a mismatch it posts an auditable
@@ -5977,11 +5979,13 @@ retryable, 1 terminal; 2 is a usage error with empty stdout). It exists so
 consumers stop vendoring `classify-error.sh` (miniset's E2B shim pins the
 daemon instead). The shell library remains the sourced entry point for
 in-repo callers: its public functions delegate to the subcommand when a
-daemon binary resolves and fall back to the in-file tables — byte-identical —
-when none does. The two renderings are pinned equal by
-`defaults/scripts/tests/test-classify-error.sh` (parity on every row of the
-shared `vectors.tsv` fixture) and by the Rust suite that reads the same
-fixture.
+daemon binary resolves, and with none they give a documented fail-safe
+degraded answer (#11219): `classify_error` prints `RECOVERABLE` for any
+non-zero exit other than the 124/137 → `TIMEOUT` short-circuit, and
+`classification_is_transient` returns 0 (retry, bounded by the caller's cap).
+The shell pattern tables were deleted; the Rust suite and
+`defaults/scripts/tests/test-classify-error.sh` read the shared
+`vectors.tsv` / `conformance.tsv` fixtures.
 
 **Session-limit fault handling (#3947).** Stacking can occasionally trip a
 **concurrent-session-limit** fault on a token (the account is healthy but cannot
@@ -14737,6 +14741,32 @@ to a fixture (`isolate_daemon_state`: `LOOM_WORKSPACES_PATH`,
 `LOOM_SWEEPS_JOURNAL_PATH`, `LOOM_WATCHES_PATH`, `LOOM_WATCH_RESULTS_LOG`,
 plus the cwd), so a test daemon has no managed workspace to reconcile or
 dispatch against.
+
+## A tick appears hung — dump the async task tree (`kill -USR1`, #12079)
+
+First step when a daemon tick (work finder, role runner, …) stops logging and
+you need to know **which await it is parked on**. Hosts restrict ptrace (yama
+`ptrace_scope=1`), so gdb/strace need root; this needs neither.
+
+```bash
+pgrep -u "$USER" -x loom-daemon          # the daemon's pid
+kill -USR1 <pid>                         # as the daemon's own user
+tail -n 200 ~/.loom/daemon.log           # "SIGUSR1 task dump: N task(s)" + one trace per task
+```
+
+- The daemon keeps running; each signal writes a fresh dump. The handler runs
+  on its own thread with its own runtime, so it works while the IPC accept loop
+  or the main runtime is wedged.
+- The dump is bounded to 10s. A task that never yields to the runtime (a
+  blocking call on a worker thread) stalls tokio's dump; the log then gets
+  `SIGUSR1 task dump timed out after 10s` instead — that itself says a worker
+  is blocked rather than awaiting.
+- Availability: needs tokio's `taskdump` feature (on in `loom-daemon/Cargo.toml`)
+  and `--cfg tokio_unstable` (set in `.cargo/config.toml`), Linux
+  x86/x86_64/aarch64 only. A build without them, or a non-Linux host, logs
+  `SIGUSR1 task dump unavailable` and keeps running — SIGUSR1 never kills the
+  daemon. A build that overrides `RUSTFLAGS` outright drops the cfg and gets the
+  "unavailable" line.
 
 ## What this page does NOT describe
 

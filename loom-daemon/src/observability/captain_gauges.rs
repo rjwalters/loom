@@ -626,7 +626,8 @@ fn exchange(root: &Path, pass: &Pass, now: DateTime<Utc>) {
             }
         }
         Role::Dispatcher { captain } => {
-            if let Some((loc, _)) = location {
+            // No job on: nothing here can use the heartbeat, so skip the read.
+            if let Some((loc, _)) = location.as_ref().filter(|_| !jobs.is_empty()) {
                 match store::fetch_heartbeat(root, loc, &mut fetch) {
                     Fetched::Failed(why) => {
                         log::debug!("captain gauges: heartbeat read failed: {why}");

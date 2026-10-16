@@ -571,6 +571,7 @@ fn daemon_write_paths_are_scoped() {
         ("cli/curation_complete.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
+        ("cli/lease_release.rs", Gated),
         (
             "fleet/drain_reset.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),

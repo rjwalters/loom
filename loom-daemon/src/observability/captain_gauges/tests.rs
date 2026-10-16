@@ -687,3 +687,46 @@ fn a_dispatcher_reports_fallback_per_job_it_takes_part_in() {
     assert!(!out.iter().any(|p| *p
         == MetricPoint::int(MetricName::CaptainGaugeFallback, 1).label("task", STAGE_DWELL_JOB)));
 }
+
+// ---- #12219: a dispatcher with no job on reads no heartbeat ----------------
+
+/// One `exchange` as a `standDown` dispatcher with a store configured, over a
+/// `gh` that logs every call; returns the `gh` call log.
+fn dispatcher_exchange_calls(config: Config) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, log) = (dir.path().join("gh"), dir.path().join("gh.log"));
+    std::fs::write(
+        &gh,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 1\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _gh = crate::gh_invocation::resolver::test_stub::GhBinGuard::set(&gh);
+    let pass = super::Pass {
+        role: dispatcher(),
+        config,
+        location: Some((loc("eta-fit"), "fleet".into())),
+        stage_dwell: Default::default(),
+    };
+    super::exchange(dir.path(), &pass, at(0));
+    std::fs::read_to_string(&log).unwrap_or_default()
+}
+
+#[test]
+fn a_dispatcher_with_no_job_on_makes_no_store_read() {
+    let none = config(json!({"standDown": true}));
+    let none = Config {
+        stage_dwell: false,
+        ..none
+    };
+    assert!(none.jobs().is_empty());
+    assert_eq!(dispatcher_exchange_calls(none), "");
+}
+
+#[test]
+fn a_dispatcher_with_a_job_on_still_reads_the_heartbeat() {
+    let one = config(json!({"standDown": true}));
+    assert_eq!(one.jobs(), [STAGE_DWELL_JOB]);
+    assert!(!dispatcher_exchange_calls(one).is_empty());
+}

@@ -3,6 +3,7 @@
 use super::*;
 use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
+use crate::judge_backstop::CiRead;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::path::Path;
@@ -194,16 +195,20 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
     let mut queue = ordered_queue(rows, role, prefer_human_prs(root), &trust);
     if role == PrRole::Judge {
         let mut guarded = Vec::new();
+        let mut reads = 0;
         for row in queue {
             if !judge_admits(root, gh, &row, &trust)? {
                 continue;
             }
-            // #11971: only the rows a Judge pass would reach first are worth
-            // a CI read; past them the queue is served as-is.
-            if guarded.len() < super::ci_gate::CI_SCREENED_ROWS
-                && ci_pending_at_head(root, gh, &row)
-            {
-                continue;
+            // #11971: only the first rows a Judge pass would reach are worth
+            // a CI read; past that budget the queue is served as-is. Reads
+            // are counted, not served rows: when the top PRs are all pending
+            // none is served, and each would otherwise still cost a read.
+            if reads < super::ci_gate::CI_SCREENED_ROWS {
+                reads += 1;
+                if ci_pending_at_head(root, gh, &row) {
+                    continue;
+                }
             }
             guarded.push(row);
         }
@@ -333,8 +338,12 @@ fn ci_pending_at_head(root: &Path, gh: &Path, row: &Value) -> bool {
 /// role-runner gate above and the step draw's Judge hold (#12042).
 pub fn ci_pending_at_sha(root: &Path, gh: &Path, sha: &str) -> bool {
     super::ci_gate::cached(root, sha, || {
-        super::ci_gate::ci_pending(sha, chrono::Utc::now(), |path| {
-            read(root, gh, ops::CI_CHECK_RUNS_FOR_SHA, path).ok()
+        super::ci_gate::ci_pending(sha, chrono::Utc::now(), |kind, path| {
+            let op = match kind {
+                CiRead::CheckRuns => ops::CI_CHECK_RUNS_FOR_SHA,
+                CiRead::CommitStatus => ops::CI_COMMIT_STATUS,
+            };
+            read(root, gh, op, path).ok()
         })
     })
 }
