@@ -108,9 +108,11 @@ const TABLE: &[(&str, Reloadability)] = &[
     // `ram_headroom::ram_admission_config`, never cached.
     ("autonomous.workFinder.ramAdmission", Reloadability::Live),
     ("autonomous.workFinder.ramChargeGb", Reloadability::Live),
-    // Read from config at every work-finder tick (#12306) —
-    // `discovery::BackendKind::for_root`, never cached.
+    // Read from config at every work-finder tick (#12306, #12311) —
+    // `discovery::Chain::for_root`, never cached. The `autonomous.workFinder`
+    // key is #12306's, read as an alias of `worklist`.
     ("autonomous.workFinder.discovery", Reloadability::Live),
+    ("forge.mirror.discovery", Reloadability::Live),
     // Read from config at every work-finder tick (#12298) —
     // `step_dispatch::gather_budget::spawn_concurrency`, never cached.
     ("autonomous.workFinder.spawnConcurrency", Reloadability::Live),

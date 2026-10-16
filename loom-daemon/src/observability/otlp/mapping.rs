@@ -864,6 +864,38 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     time_unix_nano,
                 });
             }
+            // Cgroup-derived agent-scope census (#12166). Aggregate gauges only
+            // (per-scope names would be unbounded label cardinality); the
+            // per-scope detail rides on the host.health record itself. Absent
+            // when the agents slice was unreadable, never a fabricated zero.
+            if let Some(total) = r.agent_scopes_total {
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes",
+                    "Live loom-agent-* cgroup scopes on this host, registry-independent.",
+                    "{scope}",
+                    number_data_point::Value::AsInt(i64::from(total)),
+                    time_unix_nano,
+                ));
+                let orphans: Vec<_> = r.agent_scopes.iter().filter(|s| !s.agent_alive).collect();
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes_orphaned",
+                    "Listed agent scopes with no agent process left (residue).",
+                    "{scope}",
+                    number_data_point::Value::AsInt(
+                        i64::try_from(orphans.len()).unwrap_or(i64::MAX),
+                    ),
+                    time_unix_nano,
+                ));
+                if let Some(age) = orphans.iter().filter_map(|s| s.age_sec).max() {
+                    samples.push(memory_gauge(
+                        "loom.host.agent_scope_orphan_max_age_seconds",
+                        "Age of the oldest orphaned agent scope.",
+                        "s",
+                        number_data_point::Value::AsInt(i64::try_from(age).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+            }
             if let Some(cpu_idle_fraction) = r.cpu_idle_fraction {
                 samples.push(MetricSample {
                     name: "loom.host.cpu_idle_fraction",

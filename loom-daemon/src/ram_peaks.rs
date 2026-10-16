@@ -696,7 +696,7 @@ pub fn agents_slice_dir_in(cgroup_root: &Path, uid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn agents_slice_dir() -> Option<PathBuf> {
+pub(crate) fn agents_slice_dir() -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let uid = std::fs::metadata("/proc/self").ok()?.uid();
     agents_slice_dir_in(Path::new("/sys/fs/cgroup"), uid)

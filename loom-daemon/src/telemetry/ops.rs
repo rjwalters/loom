@@ -114,12 +114,20 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.gather_concurrency",
     // #12306: the tick's discovery snapshot (`ops::dispatch_facts`).
     "loom.discovery.backend",
-    "loom.discovery.repos",
+    // #12311: the tier chain's answer, why a repo left the first tier, and
+    // the worklist's own outcome (`ops::dispatch_facts`).
+    "loom.discovery.tier",
+    "loom.discovery.fallback_repos",
+    "loom.discovery.worklist.outcome",
+    "loom.discovery.worklist.error_class",
+    "loom.discovery.worklist.latency_ms",
+    "loom.discovery.repos.requested",
+    "loom.discovery.repos.ok",
+    "loom.discovery.repos.unknown",
+    "loom.discovery.repos.backfilling",
+    "loom.discovery.repos.error",
     "loom.discovery.items",
     "loom.discovery.forge_reads",
-    "loom.discovery.worklist_latency_ms",
-    "loom.discovery.not_modified",
-    "loom.discovery.reused_previous",
     "loom.discovery.stale_repos",
     "loom.discovery.oldest_watermark_age_secs",
     // #12298: the spawn half's concurrency and its sub-phases.
@@ -543,16 +551,6 @@ pub enum MetricName {
     /// `container` (#10600).
     #[serde(rename = "loom.codex_session.mount_drift")]
     CodexSessionMountDrift,
-    // ---- Fleet gauges produced by the captain (W12) ----------------------
-    /// Age of the captain's last production of a fleet gauge job, labelled
-    /// `task` = the job (`observability::captain_gauges::Config::jobs`): on the captain its own,
-    /// on a dispatcher the published `as_of` it last read.
-    #[serde(rename = "loom.captain.gauge_age_seconds")]
-    CaptainGaugeAgeSeconds,
-    /// 1 while a dispatcher produces a fleet gauge job locally because the
-    /// captain's data is stale or absent, 0 while it stands down; by `task` (the job).
-    #[serde(rename = "loom.captain.gauge_fallback")]
-    CaptainGaugeFallback,
     /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
     /// (#11094).
     #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
@@ -664,8 +662,6 @@ impl MetricName {
             Self::CodexSessionState => "loom.codex_session.state",
             Self::CodexSessionRecord => "loom.codex_session.record",
             Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
-            Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
-            Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
             Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
             Self::AgentScopeOomKills => "loom.agent_scope.oom_kills",
             Self::ForgeMirrorReads => "loom.forge.mirror.reads",
@@ -771,8 +767,6 @@ impl MetricName {
             Self::CodexSessionState => "1",
             Self::CodexSessionRecord => "1",
             Self::CodexSessionMountDrift => "{path}",
-            Self::CaptainGaugeAgeSeconds => "s",
-            Self::CaptainGaugeFallback => "1",
             Self::ForgeMirrorReads => "{request}",
             Self::ForgeMirrorChanges => "{change}",
             Self::ForgeMirrorWakeLatency => "s",
@@ -883,12 +877,6 @@ impl MetricName {
             Self::CodexSessionMountDrift => {
                 "Workspace paths a Codex session container is missing, mounts extra, or \
                  mounts though denied, by kind."
-            }
-            Self::CaptainGaugeAgeSeconds => {
-                "Age of the fleet captain's last run of a fleet gauge job, by task."
-            }
-            Self::CaptainGaugeFallback => {
-                "1 while a dispatcher produces a fleet gauge job locally (captain stale)."
             }
             Self::AgentScopePeakMemoryBytes => {
                 "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."

@@ -3227,7 +3227,7 @@ pub fn spawn_multi_work_finder_task(
                 spawn_concurrency: crate::step_dispatch::gather_budget::spawn_concurrency(
                     &fallback_root,
                 ),
-                discovery: crate::discovery::BackendKind::for_root(&fallback_root),
+                discovery: crate::discovery::Chain::for_root(&fallback_root),
             });
             drop(tick_parent);
             drop(read_scope);

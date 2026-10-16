@@ -139,36 +139,8 @@ fn far_future_timestamp_does_not_mask_an_outage() {
     assert_eq!(evaluate(&[FLEET], &f, &[], now()).len(), 1);
 }
 
-/// Finding 2: gauges are judged against `maxAgeSecs` (1800s), not 2x the
-/// 600s publish cadence.
-#[test]
-fn captain_gauges_tolerate_one_missed_publish() {
-    let kind = "captain-gauges/v1:queue-blocked";
-    let row = row_for(kind);
-    assert_eq!(row.deadline(), Duration::from_secs(1800));
-    let mut f = Fake::default();
-    f.fleet
-        .insert(kind, now() - chrono::Duration::seconds(1500));
-    assert!(evaluate(&[row], &f, &[], now()).is_empty(), "{kind}");
-    f.fleet
-        .insert(kind, now() - chrono::Duration::seconds(1801));
-    assert_eq!(evaluate(&[row], &f, &[], now()).len(), 1, "{kind}");
-}
-
 fn kinds(c: &[Condition]) -> Vec<&'static str> {
     c.iter().map(|c| c.record_kind).collect()
-}
-
-/// Every captain-gauges deadline is at least the bound the dispatchers use
-/// for that job.
-#[test]
-fn captain_gauge_deadlines_cover_the_heartbeat_contract() {
-    let row = SINGLETON_OUTPUTS
-        .iter()
-        .find(|o| o.job == QUEUE_BLOCKED_JOB)
-        .unwrap();
-    let bound = gauges::DEFAULT_MAX_AGE_SECS;
-    assert!(row.deadline().as_secs() >= bound.unsigned_abs(), "{QUEUE_BLOCKED_JOB}");
 }
 
 /// Opt-in jobs: a fleet with them off is not owed their output; the rest of
@@ -179,23 +151,21 @@ fn disabled_opt_in_jobs_do_not_fire() {
     let r = roster(30);
     let mut f = whole_fleet_at(ago(1), &r);
     for o in SINGLETON_OUTPUTS {
-        if o.record_kind.starts_with("captain-gauges/v1:")
-            || o.record_kind == "ci.run"
+        if o.record_kind == "ci.run"
             || o.job == crate::intake_reconcile::singleton::SINGLETON_JOB_NAME
         {
             f.fleet.remove(o.record_kind);
         }
     }
-    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 3);
+    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 2);
     f.disabled = BTreeSet::from([
-        gauges::ENABLED_KEY,
         CI_TELEMETRY_KEY,
         crate::intake_reconcile::singleton::SINGLETON_KEY,
     ]);
     assert!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).is_empty());
-    // Only the sub-switches off: the intake pass is still owed (gated by the
-    // singleton key alone).
-    f.disabled = BTreeSet::from([gauges::QUEUE_BLOCKED_KEY, CI_TELEMETRY_KEY]);
+    // Only CI telemetry off: the intake pass (gated by the singleton key
+    // alone) is still owed.
+    f.disabled = BTreeSet::from([CI_TELEMETRY_KEY]);
     assert_eq!(kinds(&evaluate(SINGLETON_OUTPUTS, &f, &r, now())), [PASS_HEARTBEAT_KIND]);
 }
 
