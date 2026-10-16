@@ -477,7 +477,18 @@ pub fn item_draw_record(
             .map(|&(idx, after_draw)| PickItemClosure {
                 repo: name(idx),
                 after_draw,
+                steps: Vec::new(),
             })
+            .chain(
+                pool.draw
+                    .step_closures()
+                    .iter()
+                    .map(|(idx, after_draw, steps)| PickItemClosure {
+                        repo: name(*idx),
+                        after_draw: *after_draw,
+                        steps: steps.iter().map(|s| s.as_str().to_string()).collect(),
+                    }),
+            )
             .collect(),
         excluded,
         pools,

@@ -196,6 +196,7 @@ pub fn pass_attributes(
     let mut out = vec![
         ("loom.dispatch.draws".to_string(), p.draws.to_string()),
         ("loom.dispatch.draws_unspawned".into(), p.draws_unspawned.to_string()),
+        ("loom.dispatch.merge_deferred".into(), p.merge_deferred.to_string()),
         ("loom.dispatch.budget".into(), p.budget.to_string()),
     ];
     if !p.by_reason.is_empty() {
@@ -348,8 +349,9 @@ mod tests {
             passes: Some(crate::step_dispatch::gather_budget::TickPasses {
                 draws: 9,
                 draws_unspawned: 2,
+                merge_deferred: 7,
                 by_reason: [
-                    ("merge_in_flight".to_string(), 2),
+                    ("backstop_hold".to_string(), 2),
                     ("claim_lost".to_string(), 3),
                 ]
                 .into_iter()
@@ -363,7 +365,8 @@ mod tests {
         let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
         assert_eq!(get("loom.dispatch.draws"), Some("9"));
         assert_eq!(get("loom.dispatch.draws_unspawned"), Some("2"));
-        assert_eq!(get("loom.dispatch.passes"), Some("claim_lost=3,merge_in_flight=2"));
+        assert_eq!(get("loom.dispatch.merge_deferred"), Some("7"));
+        assert_eq!(get("loom.dispatch.passes"), Some("backstop_hold=2,claim_lost=3"));
         assert_eq!(get("loom.dispatch.budget"), Some("30"));
         assert_eq!(get("loom.dispatch.stop"), Some("pass_limit"));
         for (key, _) in &attrs {
