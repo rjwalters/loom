@@ -127,6 +127,9 @@ if [[ "${1:-} ${2:-}" == "forge comment" ]]; then
   done
   exec gh issue comment "$_n" --repo "$_repo" --body "$_body"
 fi
+# #12475: the reconciliation gate reads comment verdicts through the trust
+# filter on this binary; the stub gh lists none, so echo the (empty) stdin.
+if [[ "${1:-} ${2:-}" == "forge trusted-comments" ]]; then cat; exit 0; fi
 exit 127
 SELF
 chmod +x "$STUB_DIR/self-daemon"
