@@ -308,12 +308,6 @@ owner = "daemon-landing"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/merge_pr/head_sync/fetch.rs"
-calls = 1
-owner = "daemon-landing"
-removal_issue = 9799
-
-[[bypass]]
 path = "loom-daemon/src/merge_pr/partial_reset.rs"
 calls = 1
 owner = "daemon-landing"

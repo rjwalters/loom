@@ -40,9 +40,8 @@
 //! # Fidelity inside the contract
 //!
 //! For every payload inside the contract the three strings are the retired
-//! filters' output byte for byte, AFTER `$(...)` — held by
-//! `tests/merge_pr_check_runs_rollup_differential.rs` against the frozen
-//! filters in `tests/fixtures/merge-pr-check-runs-rollup-retired.sh`:
+//! filters' output byte for byte, AFTER `$(...)` (the differential against the
+//! frozen filters went with the `merge-pr check-runs-rollup` verb, #12063):
 //!
 //! - `unique` sorts and de-duplicates the name VALUES: `null` (a check-run
 //!   with no `name`) sorts before every string, strings sort by UTF-8 bytes

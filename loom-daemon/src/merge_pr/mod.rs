@@ -246,10 +246,9 @@
 //! (#8191 slice): already merged (exit 0) versus closed unmerged (refuse)
 //! versus carry on. Merged wins over closed, since a merged PR also reads
 //! `state: closed`. The shell acts on a positively received verdict; a lost
-//! one falls back to the retired shell predicate (as `revalidate-head` does).
+//! one falls back to the retired shell predicate.
 
 pub mod check_runs_rollup;
-pub mod check_runs_streak;
 pub mod checks_failure;
 pub mod cleanup_paths;
 pub mod closed_building;
@@ -257,17 +256,14 @@ pub mod closed_by_merge;
 pub mod consolidate;
 pub mod dirty_guard;
 pub mod discovered_worktree;
-pub mod head_sync;
 pub mod hold_state;
 pub mod issue_close_gate;
 pub mod labels;
 pub mod loom_pr_guard;
 pub mod merge_route;
-pub mod mergeable_recheck;
 pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
-pub mod poll_wait;
 pub mod pr_state;
 pub mod reconcile;
 pub mod redate;
@@ -275,8 +271,6 @@ pub mod refs;
 pub mod remove_gate;
 pub mod response;
 pub mod retarget_children;
-pub mod retries_used;
-pub mod revalidate_head;
 pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;

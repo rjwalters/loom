@@ -1708,12 +1708,6 @@ jobs:
       - name: merge-pr PR-label fetch freshness (#8550)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
-      - name: merge-pr self-sync head re-read (#8164, #8191 slice 4)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-merge-pr-head-sync-retry.sh
-      - name: merge-pr --auto blocked settle + re-validate (#8410)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-merge-pr-auto-blocked-settle.sh
       - name: merge-pr defaults/ version-bump collision guard (#7827, #8191 slice)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-defaults-version-bump-collision.sh
@@ -1744,13 +1738,6 @@ jobs:
       - name: merge-pr head-SHA-mismatch classifier (#5579, #8191)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-head-mismatch.sh
-      # Moved out of shell-suite-tests by the #8191 mergeable-recheck slice:
-      # the stale-mergeable recheck's terminal classification now delegates to
-      # `loom-daemon merge-pr mergeable-recheck`, so this suite's
-      # require-daemon-bin harness needs the binary this job downloads.
-      - name: merge-pr stale-mergeable recheck (#6104, #8191)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-merge-pr-stale-mergeable.sh
       # Moved out of shell-suite-tests by #8191's reconcile slice: the
       # post-merge stacked-child reconcile decision (#4856) — parent-branch
       # gate, children-rollup parse, safe/unsafe claim check — now delegates
@@ -1832,28 +1819,11 @@ jobs:
       - name: merge-pr async-close-race cleanup gate (#4186, #8191)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-worktree-path.sh
-      # Moved out of shell-suite-tests by #8191's check-runs-rollup slice:
-      # merge-pr.sh's _wait_for_checks_then_sync_merge now reads its
-      # failing/pending/total_count via `loom-daemon merge-pr
-      # check-runs-rollup`, so extracting and running the REAL function (as
-      # both suites below do) needs the binary this job downloads. Both pin
-      # it via loom_test_require_daemon_bin --self-only and FAIL rather than
-      # skip without one.
-      - name: merge-pr wait-for-checks empty-settle guard (#6169, #9091, #8191)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh
-      # test-forge-check-runs-pagination.sh's Parts 1/2/4/5 (forge-helpers.sh
-      # pagination, no daemon involved) move here with Part 3 rather than
-      # splitting the suite.
+      # test-forge-check-runs-pagination.sh (forge-helpers.sh pagination, no
+      # daemon involved) stays in this job since #8191 moved it here.
       - name: forge check-runs pagination + truncated-read settle guard (#8895, #8987, #8191)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-forge-check-runs-pagination.sh
-      # Its #3664 pending-vs-failing assertions used to mirror the retired jq
-      # filters (passing against a copy); they now drive the real
-      # `merge-pr check-runs-rollup`, pinned the same way.
-      - name: merge-pr pending-vs-failing check-runs classification (#3664, #8191)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-merge-pr-unstable-fallback.sh
       # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
       # codex-hooks verify`; the suite pins this job's shared build.
       - name: provision-codex-hooks (#4495, #5005, #9390)
