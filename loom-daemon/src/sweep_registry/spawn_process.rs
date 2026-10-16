@@ -222,14 +222,14 @@ impl SweepRegistry {
         // `PrSet` one. Both the rationale and the clearing (#7915) live in
         // [`child_env_markers::apply_issue_scoped_markers`].
         child_env_markers::apply_issue_scoped_markers(&mut cmd, kind);
-        // The story this run's telemetry and commits belong to: a sweep's
-        // issue, an issue step's item, a PR step's linked issue (#11898).
-        let story = self.step_story_issue(kind);
+        // The issue this run's telemetry belongs to: a sweep's issue, an
+        // issue step's item, a PR step's linked issue (#11898).
+        let issue = self.step_issue(kind);
         crate::observability::tracing::prepare_child(
             &mut cmd,
             &self.config.workspace_root,
             sweep_id,
-            story,
+            issue,
         );
         // #9215: opt-in, default-off — hand the child's OWN Claude Code session
         // the OTel env it needs to emit `claude_code.llm_request` /
@@ -249,16 +249,16 @@ impl SweepRegistry {
             &mut cmd,
             &self.config.workspace_root,
             runtime_admission.map(|a| a.runtime.as_str()),
-            story,
+            issue,
             sweep_id,
         );
         // #8908: let the transcript-ingest pass join this issue's
         // `session.summary` logs to the execution's trace.
-        if let Some(story) = story {
+        if let Some(issue) = issue {
             crate::observability::runtime_usage::join::open(
                 &self.config.workspace_root,
                 sweep_id,
-                story,
+                issue,
             );
         }
         cmd

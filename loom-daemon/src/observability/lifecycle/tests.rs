@@ -202,11 +202,8 @@ fn role_invocation_ids_derive_from_role_and_start_instant() {
     assert_eq!(judge, role_execution_id("judge", at), "recomputable");
     let curator = role_execution_id("curator", at);
     let ws = std::path::Path::new("/nonexistent/loom");
-    let (a, b) = (
-        TraceStore::root_context(ws, &judge, None),
-        TraceStore::root_context(ws, &curator, None),
-    );
-    assert_eq!(a, TraceStore::root_context(ws, &judge, None));
+    let (a, b) = (TraceStore::root_context(ws, &judge), TraceStore::root_context(ws, &curator));
+    assert_eq!(a, TraceStore::root_context(ws, &judge));
     assert_ne!(a.trace_id, b.trace_id);
     assert_ne!(a.span_id, b.span_id);
 }
@@ -1068,10 +1065,10 @@ fn long_multibyte_admission_values_survive_the_export_allowlist() {
     }
 }
 
-/// #11982: the sweep root names its issue and base SHA even when `repo_id` did
-/// not resolve (no story), and gains the issue branch's head SHA at close.
+/// #11982: the sweep root names its issue and base SHA even when the repo's
+/// GitHub identity did not resolve, and gains the issue branch's head SHA at close.
 #[test]
-fn sweep_root_carries_issue_and_commit_facts_without_a_story() {
+fn sweep_root_carries_issue_and_commit_facts_without_a_resolved_identity() {
     let (dir, base, head) = git_facts::tests::repo_with_branch();
     let root_dir = dir.path();
     std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
@@ -1082,9 +1079,9 @@ fn sweep_root_carries_issue_and_commit_facts_without_a_story() {
     .unwrap();
     let mut command = Command::new("true");
     TraceStore::new(root_dir)
-        .load_or_create_story(root_dir, "sweep-11982", None)
+        .load_or_create(root_dir, "sweep-11982")
         .unwrap();
-    prepare_execution(&mut command, root_dir, "sweep-11982", None, Some(42));
+    prepare_execution(&mut command, root_dir, "sweep-11982", Some(42));
     let journal = Journal::for_context(&TraceStore::new(root_dir).path(root_dir, "sweep-11982"));
     let open = journal.active().unwrap();
     let attrs = &open[0].record.attributes;
