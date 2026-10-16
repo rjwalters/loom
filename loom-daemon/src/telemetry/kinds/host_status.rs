@@ -1,5 +1,5 @@
 //! `host.status` (#12112, slice a of #11809): a fixed-interval sample of this
-//! host's CPU, memory, disk and network, raw and EWMA-filtered.
+//! host's CPU, memory, disk, network and GPU, raw and EWMA-filtered.
 //!
 //! `host.health` is a five-minute snapshot and the role spans carry host load
 //! only while a role is running, so an idle host or a dead daemon reported
@@ -180,6 +180,36 @@ pub const SIGNALS: &[SignalSpec] =
             "loom.host.net_tx_bytes_per_sec_ewma_30s",
             "By/s",
             "Network transmit throughput over non-loopback interfaces.",
+            None
+        ),
+        signal!(
+            "gpu_utilisation",
+            Host,
+            30,
+            Some("loom.host.gpu_utilisation"),
+            "loom.host.gpu_utilisation_ewma_30s",
+            "1",
+            "Highest NVIDIA GPU utilisation across GPUs (0..1); absent on hosts without one.",
+            None
+        ),
+        signal!(
+            "gpu_mem_used_bytes",
+            Host,
+            30,
+            Some("loom.host.gpu_mem_used_bytes"),
+            "loom.host.gpu_mem_used_bytes_ewma_30s",
+            "By",
+            "NVIDIA GPU memory in use, summed over GPUs.",
+            None
+        ),
+        signal!(
+            "gpu_mem_total_bytes",
+            Host,
+            30,
+            Some("loom.host.gpu_mem_total_bytes"),
+            "loom.host.gpu_mem_total_bytes_ewma_30s",
+            "By",
+            "NVIDIA GPU memory capacity, summed over GPUs.",
             None
         ),
         signal!(

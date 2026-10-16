@@ -7,6 +7,24 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12438**: feat: classify audited config blocks and underscore annotations in fleet reload table
+- **PR #12432**: feat: report NVIDIA GPU utilisation and memory in host status
+- **Issue #12423** (closed): reload: classify annotation keys and audited config blocks (#12419 child 1)
+- **Issue #12115** (closed): host_status (slice d): add GPU signals to host_status
+- **PR #12434**: feat: source role-span host attributes from host_status latest record
+- **PR #12435**: step tick: a lost claim is a cheap pass; the tick names its stop and budget
+- **PR #12431**: feat: detect restart-required config changes since boot in fleet-sync
+- **PR #12427**: work finder: the cap is maxConcurrent alone; remove automatic and secondary admission caps
+- **PR #12430**: docs: route cross-repo and time-gated leftovers to park records, not loom:operator
+- **PR #12426**: refactor: remove dead provenance hook/marker modules and provenance CLI
+- **Issue #12424** (closed): fleet-sync: detect restart-required changes since boot as a demand (#12419 child 2)
+- **Issue #12410** (closed): Hosts race for the same step draws: 43% of draws refused claim_lost; spread draws per host and export per-tick pass counts
+- **Issue #12406** (closed): Remove the automatic and secondary admission caps: the cap is the operator's maxConcurrent alone
+- **Issue #12346** (closed): Flow-change evidence review (#11708 slice D): role triggers, Builder preflight, Doctor runtime
+- **Issue #12345** (closed): Flow-change evidence review (#11708 slice C): Champion, daemon holds, parking, work finder, labels
+- **Issue #12343** (closed): Flow-change evidence review (#11708 slice A): re-date/freshness and Judge CI-complete rule
+- **Issue #12113** (closed): host_status (slice b): re-point role-span host attributes at host_status
+- **Issue #10942** (closed): Sweeps use bare loom:operator as a re-dispatch brake for cross-repo/time-gated work; file the child or write a dated park instead
 - **PR #12417**: refactor: stop stamping provenance markers on lease comments, proposals and sweep commits
 - **Issue #12330** (closed): RAM admission reserves every in-flight sweep's peak build RAM: cap collapses to 1 on an idle 64 GiB host; make it realistic and fleet-configurable
 - **PR #12336**: fix(daemon): remove RAM admission; dynamic cap = min(disk, maxConcurrent) (#12330)
