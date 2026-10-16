@@ -188,6 +188,13 @@ impl SweepRegistry {
                 l.reason
             ))
         );
+        // #12450: a granted step's assignment ends with the step, its outcome
+        // class the release's outcome (no line reads as `failed`). A no-op
+        // for a step the captain never granted.
+        crate::fleet_dispatch::worker::release(
+            sweep_id,
+            line.as_ref().map_or("failed", |l| l.class.as_str()),
+        );
         if !self.config.skip_label_flip {
             let reason = match end {
                 StepEnd::TimedOut => crate::pr_lease_reap::REASON_TIMEOUT,

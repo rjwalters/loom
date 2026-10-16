@@ -45,6 +45,12 @@
 //! (`loom.dispatch.budget`), so a tick with free slots and few attempts names
 //! its limit.
 //!
+//! A **captain refusal** (#12450, fleet dispatch on): `captain_held` is a
+//! cheap pass like a lost claim, made with no forge call; `captain_cap` ends
+//! the tick's draws, since the captain would refuse every later claim the
+//! same way. In fleet-dispatch fallback ([`StepTickLimits::fallback`]) no
+//! loss is free.
+//!
 //! An **unverifiable claim** ([`REFUSAL_CLAIM_UNVERIFIED`]) is the exception
 //! to "draw again" (#12260): the pre-claim's lease reads and post run on the
 //! forge owner's writer installation, so when one cannot be verified (in
@@ -93,6 +99,12 @@ pub const REFUSAL_CLAIM_UNVERIFIED: &str = "claim_unverified";
 /// The spawn refusal of a claim a peer won first: a cheap pass (module docs,
 /// #12410).
 pub const REFUSAL_CLAIM_LOST: &str = "claim_lost";
+/// The fleet-dispatch server's refusal of an item another host holds
+/// (#12450): a cheap pass like [`REFUSAL_CLAIM_LOST`], and no forge call ran.
+pub const REFUSAL_CAPTAIN_HELD: &str = "captain_held";
+/// The fleet-dispatch server's refusal of a host at its cap (#12450): every
+/// later claim this tick would be refused the same way, so the draw ends.
+pub const REFUSAL_CAPTAIN_CAP: &str = "captain_cap";
 
 /// Why a tick's draw loop stopped (#12410): the tick span's
 /// `loom.dispatch.stop`, a closed set.
@@ -177,6 +189,9 @@ pub struct StepTickLimits {
     /// How many spawns, each in a different repo, run at once (#12298,
     /// `autonomous.workFinder.spawnConcurrency`); `1` is the serial tick.
     pub spawn_concurrency: usize,
+    /// The host is in fleet-dispatch fallback (#12450): no `claim_lost` is
+    /// free (spec #12452 §9.3).
+    pub fallback: bool,
 }
 
 /// What the item draws are seeded from.
@@ -244,7 +259,11 @@ pub fn disposition_of(reason: &str) -> Qd {
         // #12105: a Doctor standing down on another actor's work
         // (`peer_active`), or a step held by the Judge no-verdict backstop
         // (`backstop_hold`), is someone else's claim, not a dispatch error.
-        "claimed" | "claim_lost" | "peer_active" | "backstop_hold" => Qd::PeerClaim,
+        "claimed" | "claim_lost" | "peer_active" | "backstop_hold" | REFUSAL_CAPTAIN_HELD => {
+            Qd::PeerClaim
+        }
+        "captain_not_eligible" => Qd::HostConstraint,
+        REFUSAL_CAPTAIN_CAP | "captain_grace" | "captain_refused" => Qd::DeferredCapacity,
         "pool_exhausted"
         | "no_token_pool"
         | "token_selection_failed"
@@ -609,7 +628,9 @@ pub fn run(
                     // A lost claim is cheap (module docs, #12410): the item
                     // already left the pool and the slot redraws next round
                     // without spending a pass or one of its draws.
-                    if reason == REFUSAL_CLAIM_LOST && free_losses < MAX_FREE_CLAIM_LOST_PER_TICK {
+                    // In fleet-dispatch fallback no loss is free (#12450).
+                    let lost = reason == REFUSAL_CLAIM_LOST || reason == REFUSAL_CAPTAIN_HELD;
+                    if lost && !limits.fallback && free_losses < MAX_FREE_CLAIM_LOST_PER_TICK {
                         free_losses += 1;
                         if let Some((_, free)) = open.get_mut(p.slot) {
                             *free += 1;
@@ -634,6 +655,13 @@ pub fn run(
                             if forge_owner(&other.repo) == owner {
                                 draw.close_repo(other.idx);
                             }
+                        }
+                    }
+                    if reason == REFUSAL_CAPTAIN_CAP {
+                        // The captain holds this host at its cap: every repo
+                        // leaves the draw for the rest of the tick (#12450).
+                        for other in workspaces.iter() {
+                            draw.close_repo(other.idx);
                         }
                     }
                     *pass_counts.entry(reason).or_default() += 1;
