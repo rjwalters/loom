@@ -7,11 +7,10 @@
 //!   not be attributed. `loom.dispatch.halted_repos` names each held repo
 //!   with its cause, from the work finder's halt clock
 //!   ([`crate::work_finder::halt_cause::since::current`]).
-//! - **Why the cap is what it is.** `loom.dispatch.max_concurrent` is
-//!   `min(configured, disk headroom)` (the RAM term was removed in #12330);
-//!   when it dropped, nothing said which term did it. `loom.dispatch.cap_limiter`
-//!   names the binding term and `loom.dispatch.cap_{configured,disk}` carry the terms, also
-//!   exported as the `loom.dispatch.cap_term{kind}` gauge.
+//! - **What the cap is.** `loom.dispatch.max_concurrent` is the configured
+//!   `maxConcurrent`, and nothing else limits it (#12406).
+//!   `loom.dispatch.cap_configured` carries it, also exported as the
+//!   `loom.dispatch.cap_term{kind="configured"}` gauge.
 //! - **Pre-filter skips apart from refusals.**
 //!   `loom.dispatch.decisions{reason=pr_open}` counts both the open-PR
 //!   pre-filter's skips and `dispatch()`'s own refusals. The pre-filter's share
@@ -82,8 +81,8 @@ pub fn halted_repos(
     (!out.is_empty()).then_some(out)
 }
 
-/// The tick span's extra attributes: the cap terms and limiter (when the tick
-/// recorded them), the pre-filter's open-PR skips, and the held repos.
+/// The tick span's extra attributes: the configured cap (when the tick
+/// recorded it), the pre-filter's open-PR skips, and the held repos.
 #[must_use]
 pub fn tick_attributes(
     report: &TickReport,
@@ -95,11 +94,7 @@ pub fn tick_attributes(
         report.pr_open_prefiltered.to_string(),
     )];
     if let Some(cap) = cap {
-        out.push(("loom.dispatch.cap_limiter".into(), cap.limiter().as_str().into()));
         out.push(("loom.dispatch.cap_configured".into(), cap.configured.to_string()));
-        if let Some(disk) = cap.disk {
-            out.push(("loom.dispatch.cap_disk".into(), disk.to_string()));
-        }
     }
     if let Some(repos) = halted_repos {
         out.push(("loom.dispatch.halted_repos".into(), repos));
@@ -201,27 +196,27 @@ pub fn pass_attributes(
     let mut out = vec![
         ("loom.dispatch.draws".to_string(), p.draws.to_string()),
         ("loom.dispatch.draws_unspawned".into(), p.draws_unspawned.to_string()),
+        ("loom.dispatch.budget".into(), p.budget.to_string()),
     ];
     if !p.by_reason.is_empty() {
         out.push(("loom.dispatch.passes".into(), p.render()));
     }
+    if let Some(stop) = p.stop {
+        out.push(("loom.dispatch.stop".into(), stop.to_string()));
+    }
     out
 }
 
-/// The tick's extra metric points: one `loom.dispatch.cap_term{kind}` gauge
-/// per measured term, and `loom.dispatch.pr_open_prefiltered` when non-zero.
+/// The tick's extra metric points: the `loom.dispatch.cap_term{kind="configured"}`
+/// gauge, and `loom.dispatch.pr_open_prefiltered` when non-zero.
 #[must_use]
 pub fn tick_points(report: &TickReport, cap: Option<CapView>) -> Vec<MetricPoint> {
     let mut points = Vec::new();
     if let Some(cap) = cap {
-        let terms = [("configured", Some(cap.configured)), ("disk", cap.disk)];
-        for (kind, value) in terms {
-            if let Some(value) = value {
-                points.push(
-                    MetricPoint::int(MetricName::DispatchCapTerm, int(value)).label("kind", kind),
-                );
-            }
-        }
+        points.push(
+            MetricPoint::int(MetricName::DispatchCapTerm, int(cap.configured))
+                .label("kind", "configured"),
+        );
     }
     if report.pr_open_prefiltered > 0 {
         points.push(MetricPoint::int(
@@ -232,7 +227,7 @@ pub fn tick_points(report: &TickReport, cap: Option<CapView>) -> Vec<MetricPoint
     points
 }
 
-/// The cap terms of the tick just published, when it recorded them.
+/// The cap of the tick just published, when it recorded it.
 #[must_use]
 pub fn published_cap() -> Option<CapView> {
     crate::work_finder::last_tick_summary().and_then(|s| s.cap)
@@ -343,9 +338,14 @@ mod tests {
             passes: Some(crate::step_dispatch::gather_budget::TickPasses {
                 draws: 9,
                 draws_unspawned: 2,
-                by_reason: [("repo_cap".to_string(), 2), ("claim_lost".to_string(), 3)]
-                    .into_iter()
-                    .collect(),
+                by_reason: [
+                    ("merge_in_flight".to_string(), 2),
+                    ("claim_lost".to_string(), 3),
+                ]
+                .into_iter()
+                .collect(),
+                budget: 30,
+                stop: Some("pass_limit"),
             }),
             ..TickReport::default()
         };
@@ -353,7 +353,9 @@ mod tests {
         let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
         assert_eq!(get("loom.dispatch.draws"), Some("9"));
         assert_eq!(get("loom.dispatch.draws_unspawned"), Some("2"));
-        assert_eq!(get("loom.dispatch.passes"), Some("claim_lost=3,repo_cap=2"));
+        assert_eq!(get("loom.dispatch.passes"), Some("claim_lost=3,merge_in_flight=2"));
+        assert_eq!(get("loom.dispatch.budget"), Some("30"));
+        assert_eq!(get("loom.dispatch.stop"), Some("pass_limit"));
         for (key, _) in &attrs {
             assert!(
                 crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
@@ -370,6 +372,7 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "loom.dispatch.draws" && v == "0"));
         assert!(!attrs.iter().any(|(k, _)| k == "loom.dispatch.passes"));
+        assert!(!attrs.iter().any(|(k, _)| k == "loom.dispatch.stop"));
     }
 
     #[test]
@@ -466,13 +469,13 @@ mod tests {
     }
 
     #[test]
-    fn tick_facts_name_the_binding_cap_term_and_prefiltered_skips() {
+    fn tick_facts_carry_the_configured_cap_and_prefiltered_skips() {
         let report = TickReport {
             skipped_pr_open: 3,
             pr_open_prefiltered: 2,
             ..TickReport::default()
         };
-        let cap = CapView::from_terms(12, 4);
+        let cap = CapView { configured: 12 };
         let attrs = tick_attributes(&report, Some(cap), Some("o/a=main_red".into()));
         let get = |k: &str| {
             attrs
@@ -480,10 +483,9 @@ mod tests {
                 .find(|(key, _)| key == k)
                 .map(|(_, v)| v.as_str())
         };
-        assert_eq!(get("loom.dispatch.cap_limiter"), Some("disk"));
         assert_eq!(get("loom.dispatch.cap_configured"), Some("12"));
-        assert_eq!(get("loom.dispatch.cap_disk"), Some("4"));
-        assert_eq!(get("loom.dispatch.cap_ram"), None, "no RAM term since #12330");
+        assert_eq!(get("loom.dispatch.cap_limiter"), None, "no limiter since #12406");
+        assert_eq!(get("loom.dispatch.cap_disk"), None, "no disk term since #12406");
         assert_eq!(get("loom.dispatch.pr_open_prefiltered"), Some("2"));
         assert_eq!(get("loom.dispatch.halted_repos"), Some("o/a=main_red"));
         for (key, _) in &attrs {
@@ -503,44 +505,14 @@ mod tests {
                 })
                 .map(|p| p.value)
         };
-        assert_eq!(term("disk"), Some(MetricValue::Int(4)));
-        assert_eq!(term("ram"), None);
+        assert_eq!(term("disk"), None);
         assert_eq!(term("configured"), Some(MetricValue::Int(12)));
         let prefiltered = points
             .iter()
             .find(|p| p.name == MetricName::DispatchPrOpenPrefiltered)
             .unwrap();
         assert_eq!(prefiltered.value, MetricValue::Int(2));
-    }
-
-    /// #12330: the binding axis is `disk` or `configured`; there is no RAM
-    /// term, so `loom.dispatch.cap_ram` is never exported.
-    #[test]
-    fn tick_facts_name_the_binding_axis_without_a_ram_term() {
-        let limiter = |c, d| CapView::from_terms(c, d).limiter().as_str();
-        assert_eq!(limiter(20, 3), "disk");
-        assert_eq!(limiter(20, 30), "configured");
-        assert_eq!(limiter(20, 20), "configured", "a tie is the operator's");
-        assert_eq!(limiter(20, usize::MAX), "configured", "unmeasured disk never binds");
-        let attrs = tick_attributes(&TickReport::default(), Some(CapView::from_terms(20, 3)), None);
-        assert!(attrs.iter().all(|(k, _)| !k.contains("ram")), "{attrs:?}");
-        assert!(attrs
-            .iter()
-            .any(|(k, v)| k == "loom.dispatch.cap_limiter" && v == "disk"));
-    }
-
-    #[test]
-    fn an_unmeasured_term_is_absent_not_zero() {
-        let report = TickReport::default();
-        let cap = CapView::from_terms(8, usize::MAX);
-        let attrs = tick_attributes(&report, Some(cap), None);
-        assert!(attrs.iter().all(|(k, _)| k != "loom.dispatch.cap_disk"));
-        assert!(attrs
-            .iter()
-            .any(|(k, v)| k == "loom.dispatch.cap_limiter" && v == "configured"));
-        let points = tick_points(&report, Some(cap));
-        assert_eq!(points.len(), 1, "configured only; no prefiltered counter at zero");
-        assert!(tick_attributes(&report, None, None).len() == 1);
+        assert!(tick_attributes(&TickReport::default(), None, None).len() == 1);
     }
 
     /// #12074: the step gather's figures ride the tick span.

@@ -325,52 +325,6 @@ fn the_first_unblocked_candidate_is_dispatched_in_the_same_tick() {
     assert_eq!(report.deferred_capacity, 1, "#11 waits for the slot #10 took");
 }
 
-/// The read is lazy: a tick in which no candidate reaches the dispatch point
-/// asks nothing, so an idle, saturated, at-capacity or halted tick adds no
-/// forge read.
-#[test]
-fn a_tick_that_cannot_place_anything_asks_nothing() {
-    let blocked = [(1, 901), (2, 902)];
-    let asked = |multi: &[(OneShotSource, Disp)]| multi[0].1.asked.borrow().len();
-
-    // At capacity.
-    let mut multi = vec![workspace(
-        &[1, 2, 3],
-        Disp::new(&blocked, Listing::Readable),
-    )];
-    let report = tick_multi(&mut multi, &[1], 0, &[false]);
-    assert_eq!((asked(&multi), report.deferred_capacity), (0, 3));
-
-    // Saturation brake.
-    let mut multi = vec![workspace(
-        &[1, 2, 3],
-        Disp::new(&blocked, Listing::Readable),
-    )];
-    let report = tick_multi_with_saturation_brake(&mut multi, &[1], 5, &[false], usize::MAX, true);
-    assert_eq!((asked(&multi), report.deferred_saturation), (0, 3));
-
-    // Ramp cap of zero admissions.
-    let mut multi = vec![workspace(
-        &[1, 2, 3],
-        Disp::new(&blocked, Listing::Readable),
-    )];
-    let report = tick_multi_with_admission_cap(&mut multi, &[1], 5, &[false], 0);
-    assert_eq!((asked(&multi), report.deferred_ramp_cap), (0, 3));
-
-    // Halted repo.
-    let mut multi = vec![workspace(
-        &[1, 2, 3],
-        Disp::new(&blocked, Listing::Readable),
-    )];
-    tick_multi(&mut multi, &[1], 5, &[true]);
-    assert_eq!(asked(&multi), 0);
-
-    // Nothing ready.
-    let mut multi = vec![workspace(&[], Disp::new(&blocked, Listing::Readable))];
-    tick_multi(&mut multi, &[1], 5, &[false]);
-    assert_eq!(asked(&multi), 0);
-}
-
 /// One question per workspace per tick, each about its own candidates only.
 #[test]
 fn each_workspace_is_asked_once_about_its_own_candidates() {

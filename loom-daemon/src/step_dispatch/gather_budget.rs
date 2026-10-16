@@ -58,8 +58,12 @@ pub struct TickPasses {
     /// Draws that never reached the spawner: a repo at its cap or a second
     /// merge in a repo.
     pub draws_unspawned: usize,
-    /// Passes by reason (`claim_lost`, `repo_cap`, ...).
+    /// Passes by reason (`claim_lost`, `merge_in_flight`, ...).
     pub by_reason: std::collections::BTreeMap<String, usize>,
+    /// The slots the tick could fill (its free slots).
+    pub budget: usize,
+    /// Why the draw loop stopped ([`super::tick::TickStop::as_str`]).
+    pub stop: Option<&'static str>,
 }
 
 impl TickPasses {

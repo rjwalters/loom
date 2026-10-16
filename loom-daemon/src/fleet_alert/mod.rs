@@ -34,15 +34,12 @@ use chrono::{DateTime, Utc};
 use crate::health::summarize_role_ticks;
 use crate::types::{DaemonStatusReport, WorkFinderTickSummary};
 
-pub mod capacity;
 pub mod causes;
 pub mod loom_ui;
 pub mod outputs;
 pub mod state;
 pub mod task;
 
-#[cfg(test)]
-mod capacity_tests;
 #[cfg(test)]
 mod tests;
 
@@ -144,11 +141,6 @@ pub fn classify(
             ),
             fix: fixes.join(" "),
         });
-    }
-
-    // #10214: a resource-limited cap.
-    if let Some(tick) = &status.last_work_finder_tick {
-        out.extend(capacity::conditions(tick));
     }
     out
 }

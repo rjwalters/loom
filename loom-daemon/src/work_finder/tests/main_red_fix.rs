@@ -49,17 +49,7 @@ fn the_marker_leads_the_order_only_on_a_red_main() {
         ]
     };
     let mut multi = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[1],
-        1.into(),
-        &[false],
-        None,
-        usize::MAX,
-        false,
-        None,
-        &[RED],
-    );
+    let report = tick_multi_with_build_backoff(&mut multi, &[1], 1, &[false], None, &[RED], &[]);
     assert_eq!(report.dispatched, 1);
     assert_eq!(multi[0].1.dispatched, vec![9], "red main: the fix leads");
 
@@ -67,7 +57,7 @@ fn the_marker_leads_the_order_only_on_a_red_main() {
     for (lane, want) in [(RED, 9), (RedMainLane::default(), 1)] {
         let mut dispatcher = RecordingDispatcher::default();
         let src = &mut FakeSource::once(items());
-        tick_with_lanes(src, &mut dispatcher, (1.into(), usize::MAX), false, false, lane).unwrap();
+        tick_with_lanes(src, &mut dispatcher, 1, false, lane).unwrap();
         assert_eq!(dispatcher.dispatched, vec![want], "{lane:?}");
     }
 
@@ -89,17 +79,7 @@ fn a_labelled_red_main_fix_outranks_an_important_issue_without_overflow() {
     let important = WorkItem::new(5, vec!["loom:important".into()]);
     let items = vec![very_important(fix(9)), important];
     let mut multi = vec![(FakeSource::once(items), RecordingDispatcher::default())];
-    tick_multi_with_repo_cap(
-        &mut multi,
-        &[1],
-        1.into(),
-        &[false],
-        None,
-        usize::MAX,
-        false,
-        None,
-        &[RED],
-    );
+    tick_multi_with_build_backoff(&mut multi, &[1], 1, &[false], None, &[RED], &[]);
     assert_eq!(multi[0].1.dispatched, vec![9]);
 }
 
@@ -109,17 +89,7 @@ fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
     let items = || vec![issue(1), important.clone(), fix(9)];
 
     let mut multi = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[1],
-        10.into(),
-        &[true],
-        None,
-        usize::MAX,
-        false,
-        None,
-        &[RED],
-    );
+    let report = tick_multi_with_build_backoff(&mut multi, &[1], 10, &[true], None, &[RED], &[]);
     assert!(report.halted, "report.halted semantics are unchanged");
     assert_eq!(multi[0].1.dispatched, vec![9], "only the fix is admitted");
     let rows = ready_queue::finish(&report.queue, &[]);
@@ -135,8 +105,7 @@ fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
 
     let mut dispatcher = RecordingDispatcher::default();
     let src = &mut FakeSource::once(items());
-    let report =
-        tick_with_lanes(src, &mut dispatcher, (10.into(), usize::MAX), true, false, RED).unwrap();
+    let report = tick_with_lanes(src, &mut dispatcher, 10, true, RED).unwrap();
     assert!(report.halted);
     assert_eq!(dispatcher.dispatched, vec![9]);
 }
@@ -153,23 +122,14 @@ fn a_hold_that_is_not_a_verified_red_main_admits_nothing() {
         },
     ] {
         let mut multi = vec![(FakeSource::once(vec![fix(9)]), RecordingDispatcher::default())];
-        let report = tick_multi_with_repo_cap(
-            &mut multi,
-            &[1],
-            10.into(),
-            &[true],
-            None,
-            usize::MAX,
-            false,
-            None,
-            &[lane],
-        );
+        let report =
+            tick_multi_with_build_backoff(&mut multi, &[1], 10, &[true], None, &[lane], &[]);
         assert!(multi[0].1.dispatched.is_empty(), "{lane:?}");
         assert!(report.halted);
 
         let mut dispatcher = RecordingDispatcher::default();
         let src = &mut FakeSource::once(vec![fix(9)]);
-        tick_with_lanes(src, &mut dispatcher, (10.into(), usize::MAX), true, false, lane).unwrap();
+        tick_with_lanes(src, &mut dispatcher, 10, true, lane).unwrap();
         assert!(dispatcher.dispatched.is_empty(), "{lane:?}");
     }
 }
@@ -183,17 +143,7 @@ fn a_red_main_fix_does_not_get_the_overflow_slot() {
             ..RecordingDispatcher::default()
         },
     )];
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[1],
-        2.into(),
-        &[false],
-        None,
-        usize::MAX,
-        false,
-        None,
-        &[RED],
-    );
+    let report = tick_multi_with_build_backoff(&mut multi, &[1], 2, &[false], None, &[RED], &[]);
     assert_eq!((report.dispatched, report.deferred_capacity), (0, 1));
 }
 
@@ -310,17 +260,7 @@ fn multi_tick(
         ..RecordingDispatcher::default()
     };
     let mut multi = vec![(FakeSource::once(items), dispatcher)];
-    let report = tick_multi_with_repo_cap(
-        &mut multi,
-        &[1],
-        1.into(),
-        &[halted],
-        None,
-        usize::MAX,
-        false,
-        None,
-        &[lane],
-    );
+    let report = tick_multi_with_build_backoff(&mut multi, &[1], 1, &[halted], None, &[lane], &[]);
     (multi[0].1.dispatched.clone(), report.seen)
 }
 
@@ -342,9 +282,7 @@ fn an_unpromoted_fix_is_buildable_on_a_red_repo() {
 
         let mut dispatcher = RecordingDispatcher::default();
         let src = &mut FakeSource::once(items());
-        let report =
-            tick_with_lanes(src, &mut dispatcher, (1.into(), usize::MAX), false, false, RED)
-                .unwrap();
+        let report = tick_with_lanes(src, &mut dispatcher, 1, false, RED).unwrap();
         assert_eq!((dispatcher.dispatched, report.seen), (vec![9], 2), "{label}");
     }
 }
@@ -363,8 +301,7 @@ fn an_unpromoted_fix_is_inert_on_a_green_repo() {
     let mut dispatcher = RecordingDispatcher::default();
     let src = &mut FakeSource::once(items());
     let lane = RedMainLane::default();
-    let report =
-        tick_with_lanes(src, &mut dispatcher, (5.into(), usize::MAX), false, false, lane).unwrap();
+    let report = tick_with_lanes(src, &mut dispatcher, 5, false, lane).unwrap();
     assert_eq!((dispatcher.dispatched, report.seen), (vec![1], 1));
 }
 
@@ -567,22 +504,12 @@ fn the_tick_feeds_the_escalation_with_the_fixes_waiting_on_a_red_main() {
         (RedMainLane::default(), false, (false, vec![])),
     ] {
         let mut multi = vec![(FakeSource::once(items()), EscalationRecorder::default())];
-        tick_multi_with_repo_cap(
-            &mut multi,
-            &[1],
-            0.into(),
-            &[halted],
-            None,
-            usize::MAX,
-            false,
-            None,
-            &[lane],
-        );
+        tick_multi_with_build_backoff(&mut multi, &[1], 0, &[halted], None, &[lane], &[]);
         assert_eq!(multi[0].1.calls, vec![expect.clone()], "{lane:?} halted={halted}");
 
         let mut dispatcher = EscalationRecorder::default();
         let src = &mut FakeSource::once(items());
-        tick_with_lanes(src, &mut dispatcher, (0.into(), usize::MAX), halted, false, lane).unwrap();
+        tick_with_lanes(src, &mut dispatcher, 0, halted, lane).unwrap();
         assert_eq!(dispatcher.calls, vec![expect], "single: {lane:?} halted={halted}");
     }
 }

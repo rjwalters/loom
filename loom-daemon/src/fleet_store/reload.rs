@@ -5,8 +5,8 @@
 //! narrative table — the whole point of #9597 is that `render`'s per-key
 //! classification cannot silently drift out of sync with what the daemon
 //! actually does, the way the doc table already has (`autonomous.workFinder`.
-//! `maxConcurrent` / `maxConcurrentPerRepo` / `extraSkipLabels` all went live
-//! in #9060/#9090/pre-existing work without that doc ever being updated —
+//! `maxConcurrent` / `extraSkipLabels` both went live
+//! in #9060/pre-existing work without that doc ever being updated —
 //! exactly the failure this module exists to stop happening again).
 //!
 //! # The mechanical test
@@ -71,25 +71,13 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Per-repo approval/merge policy (#11674): `merge_policy::declared` is
     // read from the effective config on every `fleet.state` export.
     ("repos", Reloadability::Live),
-    // Re-read every multi-workspace work-finder tick since #9060 (the
-    // operator ceiling) / #9090 (the per-repo cap) —
-    // `ConfiguredMaxReloader::refresh()` in
+    // Re-read every multi-workspace work-finder tick since #9060 (the cap,
+    // and since #12406 the only cap) — `ConfiguredMaxReloader::refresh()` in
     // `loom-daemon/src/work_finder/configured_max.rs`, consumed from
-    // `spawn_multi_work_finder_task`'s tick body.
+    // `spawn_multi_work_finder_task`'s tick body. Its `hyperparameters.dispatch`
+    // home is overlaid inside that same `read_work_finder_config` call.
     ("autonomous.workFinder.maxConcurrent", Reloadability::Live),
-    ("autonomous.workFinder.maxConcurrentPerRepo", Reloadability::Live),
-    // #12090: the per-tick admission (ramp) cap rides the same per-tick read
-    // (`ConfiguredMaxReloader::max_admissions_per_tick`), as does its
-    // `hyperparameters.dispatch` home (`apply_hyperparams` overlays it, and
-    // `maxConcurrent`, inside that same `read_work_finder_config` call).
-    ("autonomous.workFinder.maxAdmissionsPerTick", Reloadability::Live),
-    ("hyperparameters.dispatch.maxAdmissionsPerTick", Reloadability::Live),
     ("hyperparameters.dispatch.maxConcurrent", Reloadability::Live),
-    // #12090: the brake's and breaker's thresholds are pushed into their
-    // process-global handles every tick by `ConfiguredMaxReloader::refresh()`
-    // (`admission_brake::global_reload`, `host_breaker::global_reload`).
-    ("autonomous.workFinder.saturationBrake", Reloadability::Live),
-    ("autonomous.hostBreaker", Reloadability::Live),
     // Re-read fresh on every candidate-list call —
     // `WorkDispatcher::extra_skip_labels` in
     // `loom-daemon/src/work_finder/forge.rs` reads
@@ -185,9 +173,9 @@ mod tests {
     }
 
     #[test]
-    fn work_finder_ceiling_and_per_repo_cap_are_live() {
+    fn work_finder_ceiling_is_live() {
         assert_eq!(classify("autonomous.workFinder.maxConcurrent"), Reloadability::Live);
-        assert_eq!(classify("autonomous.workFinder.maxConcurrentPerRepo"), Reloadability::Live);
+        assert_eq!(classify("hyperparameters.dispatch.maxConcurrent"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.extraSkipLabels"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.redFixEscalateAfterSecs"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.landedPrefilter"), Reloadability::Live);
@@ -201,29 +189,6 @@ mod tests {
             classify("hyperparameters.dispatch.tickIntervalSecs"),
             Reloadability::RestartRequired
         );
-    }
-
-    /// #12090: the work-finder tuning keys hot-reload like `maxConcurrent`.
-    #[test]
-    fn work_finder_tuning_keys_are_live() {
-        for path in [
-            "autonomous.workFinder.maxAdmissionsPerTick",
-            "hyperparameters.dispatch.maxAdmissionsPerTick",
-            "hyperparameters.dispatch.maxConcurrent",
-            "autonomous.workFinder.saturationBrake",
-            "autonomous.workFinder.saturationBrake.enabled",
-            "autonomous.workFinder.saturationBrake.loadPerCoreHold",
-            "autonomous.workFinder.saturationBrake.cpuBusyHold",
-            "autonomous.workFinder.saturationBrake.sustainTicks",
-            "autonomous.workFinder.saturationBrake.starvationWarnSecs",
-            "autonomous.workFinder.saturationBrake.starvationEscapeSecs",
-            "autonomous.hostBreaker.enabled",
-            "autonomous.hostBreaker.loadPerCoreTrip",
-            "autonomous.hostBreaker.sustainTicks",
-            "autonomous.hostBreaker.cooldownSecs",
-        ] {
-            assert_eq!(classify(path), Reloadability::Live, "{path}");
-        }
     }
 
     #[test]
@@ -250,7 +215,7 @@ mod tests {
         // A sibling key that merely shares a string prefix with a specific
         // live knob (not a `.`-bounded ancestor) must not falsely match.
         assert_eq!(
-            classify("autonomous.workFinder.maxConcurrentPerRepoLimitFoo"),
+            classify("autonomous.workFinder.maxConcurrentLimitFoo"),
             Reloadability::RestartRequired
         );
     }
