@@ -3113,12 +3113,20 @@ in [`priority-model.md`](priority-model.md)):
   - `loom-daemon workspace list` prints a `WEIGHT` column, heaviest first
     (mutation order on disk is preserved).
 
-- **Work-finder ordering** — `work_finder::tick_multi` takes a `weights`
+- **Step tick (#12185)** — the step engine does not draw a workspace first:
+  it draws one item from a single pool of every actionable item across the
+  workspaces, with weight `w_repo × priority × age × S_r^(α−1) ×
+  (1 + in_flight_repo)^(−β)`, where `w_repo` is the weight above. The
+  `dispatch.weightBonus*` points are retired (accepted, ignored). Knobs and
+  formula: [`hyperparameters.md`](hyperparameters.md#the-item-draw-12185).
+
+- **Work-finder ordering** (the legacy pass-1 queue) — `work_finder::tick_multi` takes a `weights`
   slice parallel to the workspaces. It gathers **every** eligible candidate
   across all workspaces and orders them by **weighted workspace draws**
   (#11103, #11742): each draw picks a workspace with probability
-  `w / Σw`, where `w` is its weight plus the `dispatch.weightBonus*` points it
-  earns for a verified red-main fix, very-important or important work, and
+  `w / Σw`, where `w` is its weight plus the default weight-bonus points it
+  earns for a verified red-main fix, very-important or important work (the
+  `dispatch.weightBonus*` keys no longer change them, #12185), and
   places its next issue (red-main fix, level, oldest, number). There are no
   tiers. `pick.decision` records each candidate's `base_weight`, `bonus` and
   `weight`. It fills the single shared concurrency budget in that order. The
@@ -3162,7 +3170,7 @@ follows the workspace draw, and the single-workspace tick uses the same four
 keys (passed the repo's real verified-red state). The workspace draw has no
 tiers (#11742): every workspace with work is drawn with probability
 `(weight + bonuses) / Σ`, where a verified red-main fix, very-important work
-and important work each add their `dispatch.weightBonus*` points. #11508 removed the legacy keys: the star, its
+and important work each add their default bonus points. #11508 removed the legacy keys: the star, its
 levels and inherited levels, the starred-at time and its restart store
 (`starred-<sha16>.json`, no longer read or written; `LOOM_STARRED_AT_PERSIST` is
 ignored), and `workspace_weight` as a rank key (it weights the workspace
@@ -7756,7 +7764,7 @@ waits a per-host delay, then runs on its normal cadence:
 
 - the work finder's first tick (step gather, discovery listings, inline
   intake);
-- the collector's forge gathers (captain facts, stage dwell, fleet state),
+- the collector's forge gathers (captain facts, fleet state),
   which now run on their own snapshot-cadence timer whose first tick is the
   delay; host-local samples (`host.health`, tokens, disk) still run from boot;
 - the no-op hold re-checks on the reaper tick.
@@ -8536,32 +8544,27 @@ Full module-level rationale (including why `evaluate()` stays pure while
 
 #### Fleet gauges produced by the captain (W12)
 
-Some collector gauges describe the forge, not the host. The forge label-stage
-dwell (`loom.forge.stage_dwell`, `loom.forge.stage_items`; singleton job
-**`stage-dwell`**) lists the same stage labels of the same repos on every host
-that manages them, so N hosts spend N times the reader budget to export N
-copies of one fact. With `fleet.captainGauges` configured, the declared
-captain produces it for the fleet and a dispatcher stops producing it for the
-repos the captain covers, **only while the captain's output is fresh**.
-Assigned, not elected: there is no standby producer. Per-host gauges and
-dispatch gates (`role_queue_gate`, `role_demand`, the work finder's listings)
-are unchanged on every host. Code: `observability/captain_gauges.rs`.
+Some collector reads describe the forge, not the host. The `loom:blocked`
+listing behind `queue.snapshot` (singleton job **`queue-blocked`**) reads the
+same repos on every host that manages them, so N hosts spend N times the
+reader budget on N copies of one fact. With `fleet.captainGauges` configured,
+the declared captain produces it for the fleet and a dispatcher stops
+producing it for the repos the captain covers, **only while the captain's
+output is fresh**. Assigned, not elected: there is no standby producer.
+Per-host gauges and dispatch gates (`role_queue_gate`, `role_demand`, the work
+finder's listings) are unchanged on every host. Code:
+`observability/captain_gauges.rs`.
 
-**The stage-dwell sampler is off by default (#12203).** Every host listing
-every repo's stage labels every 5 minutes cost about 8.9k billable GitHub
-calls an hour on a 6-worker fleet and tripped `rate_limit_breaker`, which
-halts dispatch. Until it runs once per fleet, `observability.stageDwell.enabled`
-gates it entirely: off, a pass makes no stage listing, no open-items walk, no
-per-item events read and no `merged_at` read, exports no
-`loom.forge.stage_dwell` / `loom.forge.stage_items` points, and the captain
-does not arm `stage-dwell` (so no `stage-dwell` row in
-`loom.captain.gauge_*`). The daemon logs one INFO line naming the key on its
-first forge-gather pass, and again whenever the switch flips.
+The forge stage-dwell sampler (`loom.forge.stage_dwell`,
+`loom.forge.stage_items`, the `stage-dwell` job and the
+`observability.stageDwell.*` keys) was deleted in #12316: dwell is a
+consumer's computation over the mirror's per-item label times, and nothing
+the daemon decides reads it. A leftover `observability.stageDwell` key in a
+host config is ignored. An older captain's heartbeat that still lists
+`stage-dwell` parses; the job is never consulted.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `observability.stageDwell.enabled` | `false` | Run the forge stage-dwell sampler (and with it the `stage-dwell` captain job). `true` restores the sampling described above. **Hot-applies** (read every forge-gather pass) |
-| `observability.stageDwell.intervalSecs` | unset | Minimum seconds between two samples while enabled; passes inside it are skipped. Unset, `0` or malformed: every forge-gather pass (5 minutes). A value below that period has no effect. **Hot-applies** |
 | `fleet.captainGauges.enabled` | `false` | On the declared captain: arm the singleton jobs (`host.health.armed_singleton_jobs`) and publish their freshness |
 | `fleet.captainGauges.standDown` | `false` | On a dispatcher: skip a job for the repos a fresh heartbeat covers. Env `LOOM_CAPTAIN_GAUGES_STAND_DOWN` (`0`/`1`) overrides it per host |
 | `fleet.captainGauges.maxAgeSecs` | `1800` | A job's published `as_of` older than this is stale and the dispatcher produces locally again. Two publish intervals plus two collector passes, the fleet refresh's own liveness rule |
@@ -8586,7 +8589,7 @@ transitions the captain already sampled are not replayed.
 
 | Gate | `fleet.captainGauges` | What the pass does |
 |---|---|---|
-| `Armed` | `enabled` | Arms `stage-dwell` (and `queue-blocked` when switched on), produces, and publishes the heartbeat every `publishIntervalSecs` and at once when its content changes |
+| `Armed` | `enabled` | Arms `queue-blocked` (when switched on), produces, and publishes the heartbeat every `publishIntervalSecs` and at once when its content changes |
 | `Refused` | `standDown`, store configured | Skips the repos the fresh heartbeat covers; produces the rest |
 | anything else | | Produces locally, exactly as before |
 
@@ -9354,8 +9357,8 @@ Hygiene — `worktree.issue_state`, `worktree.has_open_pr`, `clean.pr_list`,
 `clean.pr_status_rest`, `worktree.landed_pulls`, `intake.list_open`, and
 `clean.pr_by_number_rest` / `worktree.issue_state_rest` /
 `worktree.issue_closed_at` on a root without a repo fact; Observability —
-`stage_dwell`'s `api.rest` (its `pulls/{n}` merge check), the events
-page walk's `stage_dwell.events` and `stage_entry.events` (#11924),
+the events
+page walk's `stage_entry.events` (#11924),
 `telemetry.repo_identity`. `visibility.repo`, and
 the single-item hygiene reads on a root with a repo fact, are conditional
 reads through the shared ETag store (#10512, W6) and route as `Gate` — not

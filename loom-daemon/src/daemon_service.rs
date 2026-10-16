@@ -2001,6 +2001,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         drain_state.clone(),
     );
 
+    // SIGUSR1 dumps the async task tree to the log for a hung tick (#12079).
+    task_dump::spawn_signal_listener();
+
     // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
     // (Ctrl-C, interactive) and SIGTERM (`kill <pid>`, the default signal a
     // backgrounded daemon receives from `loom-daemon-stop.sh` — #3813). Either
@@ -2011,9 +2014,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // independent detached processes and survive a daemon restart by design
     // (killing the dispatcher must not kill dispatched work). This is the
     // documented "survive, don't drain" decision (see daemon-reference.md).
-    // SIGUSR1 dumps the async task tree to the log for a hung tick (#12079).
-    task_dump::spawn_signal_listener();
-
     let socket_path_clone = socket_path.clone();
     tokio::spawn(async move {
         let signal_name = wait_for_shutdown_signal().await;

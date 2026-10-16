@@ -40,8 +40,6 @@ use crate::forge_listing::RestIssue;
 pub enum Caller {
     /// [`crate::work_finder`]'s candidate listings.
     WorkFinder,
-    /// The stage-dwell sampler's stage listings.
-    StageDwell,
     /// The step engine's all-open listing ([`crate::step_dispatch::listing`],
     /// #11894 §4.2), the only caller that may list with no label.
     StepEngine,
@@ -53,7 +51,6 @@ impl Caller {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::WorkFinder => "work_finder",
-            Self::StageDwell => "stage_dwell",
             Self::StepEngine => "step_engine",
         }
     }

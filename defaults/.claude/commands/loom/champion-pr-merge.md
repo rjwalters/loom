@@ -3091,7 +3091,7 @@ fi
 
 ### Step 4c: Outcome — recommend closing (route to the operator)
 
-Use this when the history shows the **approach itself** is not viable — repeated rejections on the design, a superseded change, or a PR whose premise a merged change invalidated. **Champion is the router here, not the closer**: do not close the PR. Add `loom:operator` (a genuine human ruling is needed here, not a self-clearing wait; see `.loom/docs/label-state-machine.md` → "Routing to a human"), keeping `loom:blocked` + `loom:changes-requested` so the PR leaves the automation queue for good — Mode C pre-flight skips `loom:blocked` PRs and Doctor's queue excludes them — and state the recommendation plainly for the human.
+Use this when the history shows the **approach itself** is not viable — repeated rejections on the design, a superseded change, or a PR whose premise a merged change invalidated. **Champion is the router here, not the closer**: do not close the PR. File a ranked decision with `loom-daemon operator-decision apply` (adds `loom:operator`; a genuine human ruling is needed here, not a self-clearing wait; see `.loom/docs/label-state-machine.md` → "Routing to a human"), keeping `loom:blocked` + `loom:changes-requested` so the PR leaves the automation queue for good — Mode C pre-flight skips `loom:blocked` PRs and Doctor's queue excludes them — and state the recommendation plainly for the human.
 
 ```bash
 PR_NUMBER=<number>
@@ -3104,20 +3104,18 @@ CLOSE_MARKER="<!-- champion:capped-pr-close-recommended -->"
 if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$CLOSE_MARKER\"))")" = "true" ]; then
   echo "Close recommendation already posted for #$PR_NUMBER — skipping"
 else
-  ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$CLOSE_MARKER
+  # Options (operator-decision.md): close this PR / return it to the recovery pass.
+  loom-daemon operator-decision apply "$PR_NUMBER" --input /tmp/decision-"$PR_NUMBER".json \
+    && ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$CLOSE_MARKER
 **Champion: Recommending Closure — Operator Decision Required**
 
-Parked at the Doctor-cycle cap; the rejection history indicates the approach is not viable, not merely unfinished. Champion does not close PRs; routing this to the operator instead.
+Parked at the Doctor-cycle cap; the approach, not the implementation, looks non-viable. Ranked options are in the body.
 
 - **Rejection history**: <SHORT_SUMMARY_OF_THE_ROUNDS>
 - **Why more Doctor cycles will not help**: <WHY_THE_APPROACH_NOT_THE_IMPLEMENTATION_IS_THE_PROBLEM>
-- **Recommendation**: close this PR<AND_OPTIONALLY_WHAT_TO_FILE_INSTEAD>
-
-Added \`loom:operator\` so automation stops re-evaluating this PR. A human should close it, or remove \`loom:operator\` to return it to the Champion recovery pass.
 
 ---
 *Automated by Champion role*"
-  gh pr edit "$PR_NUMBER" --add-label "loom:operator"
   echo "Routed #$PR_NUMBER to the operator with a close recommendation"
 fi
 ```

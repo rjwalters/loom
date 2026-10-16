@@ -62,14 +62,6 @@ fn every_deferrable_site_maps_a_shed_to_no_answer() {
     // the shared ETag walk, whose shed is the store's (`ReadShed`), proven
     // by `forge_listing_open_pages_tests` and `intake_reconcile::tests`.
     {
-        use crate::observability::ops::stage_dwell::{GhStageFetcher, StageFetcher};
-        step(
-            "stage_dwell.label_times",
-            GhStageFetcher
-                .label_times(root, "acme/shed", 3, "loom:curated", 3)
-                .times
-                .is_none(),
-        );
         step(
             "stage_entry.events",
             crate::step_dispatch::stage_entry::EventsSource::label_times(
@@ -82,10 +74,6 @@ fn every_deferrable_site_maps_a_shed_to_no_answer() {
             )
             .times
             .is_none(),
-        );
-        step(
-            "stage_dwell.merged_at",
-            GhStageFetcher.merged_at(root, "acme/shed", 3).is_none(),
         );
     }
     step(
