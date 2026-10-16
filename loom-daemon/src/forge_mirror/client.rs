@@ -202,6 +202,9 @@ impl MirrorItem {
                 .and_then(|c| u32::try_from(c).ok())
                 .unwrap_or(0),
             open_sub_issues,
+            // The mirror row carries no draft flag: a draft PR read through
+            // it is treated as ready (#12499).
+            draft: false,
             labels_at: self.labels_at.as_ref().map(|times| {
                 times
                     .iter()

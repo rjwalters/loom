@@ -109,6 +109,12 @@ pub const PASS_MERGE: &str = "merge_in_flight";
 /// check ([`DrawClaims::merge_in_flight`]) and the peer merge advertisement
 /// key on (the role, not the classifier step), so exempting it here alone
 /// would leave the two halves of the rule disagreeing.
+///
+/// `ChampionTriage` (#12499) is out: it never merges (an unlabelled PR has no
+/// `loom:pr`), so a merge in flight does not hold it back. It runs as the
+/// same role, so while it runs the registry's own-merge check holds the
+/// repo's merges back, as a hold re-evaluation does: a short step, accepted
+/// over a seventh step role.
 pub const MERGE_STEPS: [crate::work_finder::step_item::Step; 2] = [
     crate::work_finder::step_item::Step::ChampionMerge,
     crate::work_finder::step_item::Step::ChampionHoldReevaluate,
@@ -410,7 +416,8 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 | PassReason::Blocked
                 | PassReason::Epic
                 | PassReason::Proposal
-                | PassReason::NoStage,
+                | PassReason::NoStage
+                | PassReason::Draft,
             ) => &mut report.skipped_labeled,
         };
         *slot += n;

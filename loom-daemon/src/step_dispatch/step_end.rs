@@ -217,6 +217,12 @@ mod tests {
         assert!(moved(StepRole::Judge, &["loom:pr"]));
         assert!(!moved(StepRole::Doctor, &["loom:changes-requested"]));
         assert!(moved(StepRole::ChampionMerge, &["loom:blocked"]));
+        // A PR triage (#12499) moved only once it carries a stage or a hold:
+        // an unlabelled PR it left alone did not.
+        assert!(moved(StepRole::ChampionMerge, &["loom:review-requested"]));
+        assert!(moved(StepRole::ChampionMerge, &["loom:operator"]));
+        assert!(!moved(StepRole::ChampionMerge, &[]));
+        assert!(!moved(StepRole::ChampionMerge, &["loom:pr", "loom:blocked"]));
         // A Builder whose PR is open moved, whatever its labels say.
         let p = SweepRegistry::step_post_state(
             StepRole::Builder,

@@ -54,7 +54,7 @@
 //! | PR `loom:changes-requested` | Doctor |
 //! | PR `loom:review-requested` | Judge |
 //! | PR `loom:pr` | Champion merge |
-//! | PR with none of those | pass `no_stage` |
+//! | PR with none of those | Champion triage; a draft passes `draft` |
 //! | issue `loom:epic` | pass `epic` |
 //! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
@@ -94,6 +94,11 @@
 //!   Champion `--issue`'s "every blocker closed" check would be vacuously true
 //!   for them (`champion-targeted.md`, `--issue` step 1). A hold record beside
 //!   a dependency record keeps the hold's kind: fail closed.
+//! - **Triage.** An unlabelled PR (hand-opened, or a role stopped before
+//!   labelling it) is Champion's, not Judge's (#12499): Champion adds
+//!   `loom:review-requested`, or blocks it with a reason, or asks the
+//!   operator. Each of those is a row above this one, so a triaged PR is
+//!   never triaged again. A draft is the author's and passes `draft`.
 //! - **Claims.** The registry's `claim` labels. On an item with an open PR the
 //!   issue's `loom:building` is **not** a claim: it stays on the issue until
 //!   the closing merge (#6199), so reading it as one would pass every PR.
@@ -268,6 +273,9 @@ pub struct PullInput {
     /// The PR is in GitHub's merge queue: it is never drawn again for merge.
     #[serde(default)]
     pub queued: bool,
+    /// The PR is a draft (#12499): an unlabelled one is not drawn for review.
+    #[serde(default)]
+    pub draft: bool,
     /// Markers read from the PR's trusted comments.
     #[serde(default)]
     pub markers: PullMarkers,
@@ -391,6 +399,10 @@ pub enum Step {
     Doctor,
     ChampionMerge,
     ChampionHoldReevaluate,
+    /// An open, non-draft PR with no stage label and no hold (#12499):
+    /// Champion sends it to review, blocks it or asks the operator, one label
+    /// transition, so it never comes back here.
+    ChampionTriage,
 }
 
 impl Step {
@@ -407,6 +419,7 @@ impl Step {
             Step::Doctor => "doctor",
             Step::ChampionMerge => "champion_merge",
             Step::ChampionHoldReevaluate => "champion_hold_reevaluate",
+            Step::ChampionTriage => "champion_triage",
         }
     }
 
@@ -418,7 +431,8 @@ impl Step {
             Step::ChampionPromote
             | Step::ChampionReevaluate
             | Step::ChampionMerge
-            | Step::ChampionHoldReevaluate => "champion",
+            | Step::ChampionHoldReevaluate
+            | Step::ChampionTriage => "champion",
             Step::Builder => "builder",
             Step::Judge => "judge",
             Step::Doctor => "doctor",
@@ -430,7 +444,11 @@ impl Step {
     pub fn acts_on_pr(self) -> bool {
         matches!(
             self,
-            Step::Judge | Step::Doctor | Step::ChampionMerge | Step::ChampionHoldReevaluate
+            Step::Judge
+                | Step::Doctor
+                | Step::ChampionMerge
+                | Step::ChampionHoldReevaluate
+                | Step::ChampionTriage
         )
     }
 }
@@ -451,6 +469,8 @@ pub enum PassReason {
     Epic,
     Proposal,
     NoStage,
+    /// An open draft PR with no stage label (#12499): unfinished, never Judged.
+    Draft,
     /// A Judge step whose PR head has CI still running (#12042). The
     /// classifier never answers it: the step tick's gather applies it from a
     /// forge read (`step_dispatch::gather::hold_ci_pending`), the step path's
@@ -475,6 +495,7 @@ impl PassReason {
             Self::Epic => "epic",
             Self::Proposal => "proposal",
             Self::NoStage => "no_stage",
+            Self::Draft => "draft",
             Self::CiPending => "ci_pending",
         }
     }
@@ -692,8 +713,13 @@ fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
         step(ItemState::ReviewRequested, Step::Judge)
     } else if has(labels, APPROVED) {
         step(ItemState::Approved, Step::ChampionMerge)
+    } else if pr.draft {
+        (ItemState::NoStage, Verdict::Pass(PassReason::Draft))
     } else {
-        (ItemState::NoStage, Verdict::Pass(PassReason::NoStage))
+        // No stage label and no hold (#12499, operator ruling): Champion
+        // triages it once, and its one label transition (review-requested,
+        // blocked or operator) takes the PR to a row above for good.
+        step(ItemState::NoStage, Step::ChampionTriage)
     }
 }
 
@@ -958,6 +984,7 @@ impl PullInput {
             same_repo,
             author_untrusted,
             queued,
+            draft: row.draft,
             markers,
         }
     }
