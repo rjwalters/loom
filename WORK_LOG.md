@@ -7,6 +7,51 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12417**: refactor: stop stamping provenance markers on lease comments, proposals and sweep commits
+- **Issue #12330** (closed): RAM admission reserves every in-flight sweep's peak build RAM: cap collapses to 1 on an idle 64 GiB host; make it realistic and fleet-configurable
+- **PR #12336**: fix(daemon): remove RAM admission; dynamic cap = min(disk, maxConcurrent) (#12330)
+- **Issue #12421** (closed): auto-update: roll back a candidate that fails startup health and quarantine its artifact
+- **Issue #12409** (closed): test flake: fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work fails on Rust Unit Tests (2/5)
+- **Issue #11426** (closed): workspace_resync fails forever on repos with symlinked .claude/commands or .claude/skills (git add: 'beyond a symbolic link') — miniset never dispatched
+- **PR #11869**: fix(resync): skip every payload root behind a symlinked parent (#11426)
+- **PR #12351**: docs: record ADR-0021 step 3 as delivered by forge.mirror
+- **Issue #12384** (closed): discovery fallback: an open-breaker skip is paced like a failed listing
+- **PR #12411**: fix: don't pace a breaker skip in the discovery fallback
+- **PR #12415**: fix: restore frozen opt-out comment above epic-child query (main red)
+- **PR #12385**: feat: emit roster.change telemetry for registry changes and uncloned repos
+- **PR #12414**: feat: export tick draw and pass counts on the dispatch tick span
+- **Issue #10178** (closed): PR stays on stale changes-requested + ci-failure + blocked after a red-main CI gate clears; nothing returns it to review
+- **PR #12390**: feat: return CI-gated PRs to review once their exact head is green
+- **Issue #10886** (closed): Champion escalates issues it can never promote (living trackers, hubs, loom:needs-capability), looping them into the operator's decision queue
+- **PR #12379**: feat: skip body-marked living trackers in Champion and Curator
+- **PR #12413**: test: gate the four sibling fairness tests on their tick's walk (#12403 follow-up)
+- **PR #12400**: feat: enable merge-queue execution gate and add merge_group check template
+- **Issue #10935** (closed): Champion's 'epic looks complete, close?' scans only some children and escalates with operator labels; enumerate all children, route verification to agents
+- **PR #12388**: fix: champion epic completion check enumerates all children, routes verification to agents
+- **Issue #12307** (closed): Move queue_blocked, quarantine, stage dwell and claim-reconciliation listings onto the tick snapshot; delete discovery.rs
+- **PR #12407**: refactor: read the blocked, quarantine and claim listings from the tick snapshot; delete the per-call mirror path
+- **PR #12371**: refactor: stop stamping provenance marker; decide PR origin from author
+- **Issue #12355** (closed): Discovery Mirror backend serves unknown/never-reconciled repos as authoritative
+- **PR #12405**: fix(discovery): refuse worklist repos the mirror cannot vouch for
+- **Issue #12112** (closed): host_status (slice a): host_status sampler, EWMA filters and OTel metric export (no consumers)
+- **PR #12309**: feat(telemetry): export raw and EWMA-filtered host CPU, memory, disk and network gauges
+- **Issue #11907** (closed): fleet-state: is an approved PR held by loom:blocked (Champion hold since #11888) merge_hold or merge_wait?
+- **PR #12387**: feat: count approved loom:blocked PRs as merge_hold in label registry and replay SQL
+- **Issue #12325** (closed): test flake: fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work fails on Rust Unit Tests (2/5)
+- **PR #12403**: test: gate empty root's queue probe in fairness test to remove timing race
+- **Issue #10937** (closed): Champion held-PR blocks are comment-only (no park record), invisible to the unblock sweep and release pass
+- **PR #12404**: docs(champion): record named blockers on Champion holds; Guide skips standing holds
+- **Issue #9816** (closed): daemon: machine-level ownership registry to structurally prevent parallel production daemons
+- **PR #12382**: feat: refuse a second daemon sharing a live daemon's non-scratch pid file
+- **Issue #12342** (closed): Telemetry: role runs should emit host.name, runtime/engine, loom-daemon version, repo, PR and role
+- **PR #12401**: feat: stamp runtime, engine and session container on role_attempt spans
+- **Issue #12389** (closed): Daemon reads drain the writer App on user-account installations (5k/h): route building_label_age, forge_wait_checks, fleet_store_graphql, listings to readers
+- **PR #12399**: fix(forge): CLI subcommands and the resync head query read off the writer (#12389)
+- **Issue #12341** (closed): Judge: report an unrunnable repo test command as a capability gap, not a silent review-requested PR
+- **PR #12393**: docs: add Judge environment-gap park path for unrunnable verification
+- **Issue #12391** (closed): loom-daemon does not build on macOS: tokio taskdump feature is Linux-only (#12079)
+- **Issue #12398** (closed): Declare loom:operator-blocked/-mechanical/-decision and loom:needs-revision in defaults/.github/labels.yml
+- **PR #12392**: fix(build): enable tokio's taskdump on Linux only (macOS builds broken since #12129)
 - **PR #12386**: feat: add host-local step session ledger with default-off resume
 - **Issue #11913** (closed): Session ledger and soft host affinity for resumed role steps
 - **PR #12383**: feat: report cgroup-derived live agent scopes in host.health
