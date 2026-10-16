@@ -114,6 +114,12 @@ pub enum SpanName {
     /// (`created` / `reused` / `closed` / `closed_duplicate`) and the issue.
     #[serde(rename = "main_red.autofile")]
     MainRedAutofile,
+    /// One worktree-reaper pass over one repo and worktree class (Issue
+    /// #12461): an instant span, its own root, with the pass's scanned /
+    /// removed / failed / preserved counts, preserved by fixed reason, and the
+    /// bytes reclaimed. Never a path or the gate's free-text wording.
+    #[serde(rename = "reaper.pass")]
+    ReaperPass,
 }
 
 impl SpanName {
@@ -146,6 +152,7 @@ impl SpanName {
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
             Self::BuildGateRun => "build_gate.run",
             Self::MainRedAutofile => "main_red.autofile",
+            Self::ReaperPass => "reaper.pass",
         }
     }
 }
