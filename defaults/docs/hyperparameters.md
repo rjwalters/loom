@@ -295,7 +295,7 @@ cover it.
 | Value | Meaning |
 |---|---|
 | `direct` (default) | `merge-pr.sh` merges the approved PR itself. This is today's behaviour. |
-| `queue` | Put the approved head on the forge's merge queue. This is dormant; see below. |
+| `queue` | Put the approved head on the forge's merge queue. Opt-in; see below. |
 
 Precedence is `$LOOM_MERGE_MODE` (an empty value counts as unset), then the
 tier-merged config (`config_resolver.rs`, with `.loom-local` above
@@ -325,11 +325,11 @@ like a token.
 Exit codes are 0 for ok, 1 for failed or not capable, 2 for an invalid config,
 3 for could-not-determine, and 4 for a refusal before any forge call.
 
-**Dormant.** Queue execution is compiled off (`QUEUE_EXECUTION_ENABLED = false`).
-Under `direct`, `enqueue` and `dequeue` refuse with `NOT_QUEUE_MODE` before any
-forge call. Under `queue`, they refuse with `EXECUTION_DORMANT` until #9978's
-later phases install the lifecycle safety contract and the required
-merge-group checks. No role or script invokes these verbs yet.
+**Opt-in.** Queue execution is compiled on (`QUEUE_EXECUTION_ENABLED = true`,
+#12323). Under `direct` (the default), `enqueue` and `dequeue` refuse with
+`NOT_QUEUE_MODE` before any forge call. Under `queue`, they reach the forge;
+the repo also needs the `merge_group` check workflow
+(`defaults/optional/github-workflows/merge-group-check.yml`).
 
 ## Tranche roadmap
 
