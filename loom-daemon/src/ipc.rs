@@ -1526,7 +1526,6 @@ pub fn build_daemon_status_for(
         token_pool_size,
         token_pool_dir,
         disk_headroom,
-        ram_headroom,
         configured_max,
         logical_cpus,
         loadavg_1m,
@@ -1547,7 +1546,6 @@ pub fn build_daemon_status_for(
         token_pool_size,
         token_pool_dir,
         disk_headroom,
-        ram_headroom,
         logical_cpus,
         loadavg_1m,
         cpu_idle_fraction,
@@ -2086,12 +2084,11 @@ fn resolve_dispatch_registry(
 struct DispatchHeadroom {
     /// Live (non-terminal) sweep count already registered for this repo.
     occupancy: usize,
-    /// `resolve_dynamic_max_concurrent` — min(disk, ram, configured max). The
-    /// token axis no longer participates (#5270); `token_axis_limit` below is
+    /// `resolve_dynamic_max_concurrent` — min(disk, configured max). Neither
+    /// the token axis (#5270) nor RAM (#12330) participates; `token_axis_limit` below is
     /// kept as an informational account-health figure only.
     dynamic_cap: usize,
     disk_headroom: usize,
-    ram_headroom: usize,
     token_axis_limit: usize,
 }
 
@@ -2111,22 +2108,17 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
     let wf_config = crate::work_finder::read_work_finder_config(repo_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(repo_root);
-    let ram_headroom = crate::ram_headroom::ram_headroom_limit();
     let token_pool_size = crate::tokens::token_pool_size(repo_root);
     let ranking = crate::capacity::read_ranking(repo_root);
     // Informational only since #5270 — no longer part of the dynamic cap.
     let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
-    let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
-        disk_headroom,
-        ram_headroom,
-        configured_max,
-    );
+    let dynamic_cap =
+        crate::work_finder::resolve_dynamic_max_concurrent(disk_headroom, configured_max);
 
     DispatchHeadroom {
         occupancy,
         dynamic_cap,
         disk_headroom,
-        ram_headroom,
         token_axis_limit,
     }
 }
@@ -2211,14 +2203,13 @@ fn dispatch_headroom_message(
         format!(
             "dispatch_sweep: dispatching {kind:?} into {} while occupancy is at/over the \
              computed dynamic-cap headroom (occupancy={} >= dynamic_cap={}; \
-             disk_headroom={}, ram_headroom={}, token_axis_limit={} [informational only, not \
+             disk_headroom={}, token_axis_limit={} [informational only, not \
              capacity-limiting since #5270]) — advisory only per #4234 (dispatch \
              proceeds; the autonomous work finder's own cap is unaffected)",
             repo_root.display(),
             h.occupancy,
             h.dynamic_cap,
             h.disk_headroom,
-            h.ram_headroom,
             h.token_axis_limit
         )
     } else {
@@ -2267,7 +2258,6 @@ fn emit_dispatch_headroom_advisory_on_change(
             "occupancy": h.occupancy,
             "dynamic_cap": h.dynamic_cap,
             "disk_headroom": h.disk_headroom,
-            "ram_headroom": h.ram_headroom,
             "token_axis_limit": h.token_axis_limit,
             "message": message,
         }),
@@ -3023,13 +3013,12 @@ fn handle_request(
             // Model intent survives until the shared runtime-admission boundary.
             log::info!(
                 "dispatch_sweep: {:?}; \
-                 headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
+                 headroom occupancy={} dynamic_cap={} (disk={} tokens={} [informational \
                  only, not capacity-limiting since #5270])",
                 kind,
                 headroom.occupancy,
                 headroom.dynamic_cap,
                 headroom.disk_headroom,
-                headroom.ram_headroom,
                 headroom.token_axis_limit
             );
             match sr.dispatch_with_model(

@@ -23,7 +23,6 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         token_pool_size: 4,
         token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
         disk_headroom: 10,
-        ram_headroom: 10,
         logical_cpus: 8,
         loadavg_1m: Some(1.25),
         cpu_idle_fraction: Some(0.90),

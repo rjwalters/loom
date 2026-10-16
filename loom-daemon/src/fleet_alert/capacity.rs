@@ -13,9 +13,9 @@
 //! so a priority backlog is no longer a FIFO the operator must re-rank.
 
 use super::Condition;
-use crate::types::{CapLimiter, WorkFinderTickSummary};
+use crate::types::WorkFinderTickSummary;
 
-/// Condition key: disk or RAM headroom holds the cap below `maxConcurrent`.
+/// Condition key: disk headroom holds the cap below `maxConcurrent`.
 pub const KEY_CAPACITY_LIMITED: &str = "capacity-limited";
 
 /// The host-level capacity conditions the last tick shows.
@@ -31,17 +31,12 @@ pub fn conditions(tick: &WorkFinderTickSummary) -> Vec<Condition> {
     let effective = tick.cap.map_or(tick.max_concurrent, |c| c.effective());
 
     if let Some(cap) = tick.cap.filter(crate::types::CapView::resource_limited) {
-        let (what, fix) = match cap.limiter() {
-            CapLimiter::Ram => (
-                "Available RAM",
-                "Free memory on this host (stop stray processes) or add RAM / a host.",
-            ),
-            _ => (
-                "Disk headroom on the worktree volume",
-                "Free disk on the worktree volume (reclaim stale worktrees and build \
-                 targets) or add disk / a host.",
-            ),
-        };
+        // Disk is the only resource term since the RAM term's removal (#12330).
+        let (what, fix) = (
+            "Disk headroom on the worktree volume",
+            "Free disk on the worktree volume (reclaim stale worktrees and build \
+             targets) or add disk / a host.",
+        );
         let waiting_part = if waiting > 0 {
             format!(", and {waiting} ready issue(s) are waiting")
         } else {

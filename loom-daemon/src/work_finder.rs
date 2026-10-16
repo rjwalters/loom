@@ -22,21 +22,20 @@
 //! 3. For each remaining issue, dispatches through the existing
 //!    [`SweepRegistry::dispatch`](crate::sweep_registry::SweepRegistry::dispatch)
 //!    path — up to a **work-driven** max-concurrency cap recomputed every tick
-//!    (Phase B, #3811; simplified in #4512; token axis removed / RAM headroom
-//!    added in #5270): `min(disk headroom, ram headroom, configured max)`.
+//!    (Phase B, #3811; simplified in #4512; token axis removed in #5270; RAM
+//!    term removed in #12330): `min(disk headroom, configured max)`.
 //!    `dispatch()` already flips `loom:issue → loom:building`, acquires the
 //!    per-issue `mkdir`-atomic claim lock, and spawns the rotated-token child.
 //!
-//! # Concurrency scaling (Phase B, #3811; CPU term removed in #4512; token axis removed / RAM added in #5270)
+//! # Concurrency scaling (Phase B, #3811; CPU term removed in #4512; token axis removed in #5270; RAM term removed in #12330)
 //!
 //! Phase A resolved a single fixed cap once at daemon startup. Phase B replaces
 //! it with a cap **recomputed every tick** by [`resolve_dynamic_max_concurrent`]
-//! from two live inputs — the worktree-root disk headroom
+//! from one live input — the worktree-root disk headroom
 //! ([`crate::disk_admission::tick`] since #11191: free space net of the
 //! in-flight sweeps' expected growth, at each repo's measured charge; the flat
-//! [`crate::disk_headroom::disk_headroom_limit`] when disabled) and the host's
-//! available-RAM headroom (#5270, [`crate::ram_headroom::ram_headroom_limit`])
-//! — bounded by the per-machine operator ceiling
+//! [`crate::disk_headroom::disk_headroom_limit`] when disabled) — bounded by
+//! the per-machine operator ceiling
 //! (`LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent`).
 //! Since #9060 that ceiling is re-read every multi-workspace tick too
 //! ([`configured_max::ConfiguredMaxReloader`]), so an edit to
@@ -67,9 +66,11 @@
 //! ever limit parallelism based on the machine disk/RAM/CPU" — a metered API
 //! key has no subscription window, and overage means even a subscription pool
 //! no longer hard-stops at one either, so counting *healthy accounts* was
-//! never really a proxy for this host's own capacity. RAM headroom
-//! ([`crate::ram_headroom`]) joined disk headroom as the replacement machine
-//! axis. The heavy stages still serialize where they actually occur, on the
+//! never really a proxy for this host's own capacity. #5270 added a RAM
+//! headroom term in its place; #12330 removed it again (operator ruling): it
+//! reserved every in-flight sweep's worst build peak at once and pinned idle
+//! hosts at one slot, so RAM is now watched from outside admission, through
+//! the host's memory pressure ([`crate::host_pressure`]). The heavy stages still serialize where they actually occur, on the
 //! machine-wide build slot ([`crate::build_slot`]). The host breaker (#4235,
 //! [`crate::host_breaker`]) remains the load safety net that makes a
 //! hand-tuned ceiling safe: a mis-set knob trips a **measured** breaker
@@ -171,9 +172,8 @@ pub const DEFAULT_WORK_FINDER_INTERVAL_SECS: u64 = 60;
 pub const WORK_FINDER_MAX_CONCURRENT_ENV: &str = "LOOM_WORK_FINDER_MAX_CONCURRENT";
 
 /// Default max-concurrency ceiling. The dynamic cap
-/// ([`resolve_dynamic_max_concurrent`]) is bounded by disk headroom and ram
-/// headroom in addition to this ceiling, so this is an upper bound, not a
-/// fixed target.
+/// ([`resolve_dynamic_max_concurrent`]) is bounded by disk headroom in
+/// addition to this ceiling, so this is an upper bound, not a fixed target.
 pub const DEFAULT_WORK_FINDER_MAX_CONCURRENT: usize = 3;
 
 /// Environment variable setting the **per-tick admission cap** (#4234, Gap 3 of
@@ -1626,7 +1626,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // track affinity, so neither reads any state the global seed did not.
     let per_repo_occupancy: Vec<usize> = workspaces.iter().map(|(_, d)| d.occupancy()).collect();
     let mut occupancy: usize = per_repo_occupancy.iter().sum();
-    // #11094: `max_concurrent_per_repo` may carry the tick's per-repo RAM budget.
+    // `max_concurrent_per_repo` may carry the tick's per-repo disk budget (#11191).
     let mut cap = RepoCap::from_limits(max_concurrent_per_repo.into(), per_repo_occupancy);
     // The inert overflow slot (#11508) only reports a live legacy overflow sweep.
     let (max_concurrent, overflow) = OverflowSlot::for_workspaces(workspaces, terms);
@@ -2034,7 +2034,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             ready_queue::resolve(q, &cand, Qd::DeferredRampCap, None);
             continue;
         }
-        // Per-repo cap (#9090) and per-repo RAM charge (#11094) — checked LAST
+        // Per-repo cap (#9090) and per-repo disk charge (#11191) — checked LAST
         // of the admission gates, so a deferral only ever names a repo that the
         // machine-level gates above would have admitted. Work-conserving by
         // construction: the `continue` hands this slot to the next candidate,
@@ -2270,9 +2270,9 @@ pub fn resolve_extra_skip_labels_with_config(config: &WorkFinderConfig) -> Vec<S
 }
 
 /// Compute the **machine-headroom dynamic concurrency cap** (Phase B, #3811;
-/// CPU term removed in #4512; **token axis removed and RAM headroom added in
-/// #5270**):
-/// `min(disk_headroom, ram_headroom, configured_max)`.
+/// CPU term removed in #4512; token axis removed in #5270; **RAM term removed
+/// in #12330**):
+/// `min(disk_headroom, configured_max)`.
 ///
 /// This is the total-concurrency ceiling for the loop, recomputed every tick
 /// from live inputs. It deliberately does **not** fold in the backlog depth:
@@ -2283,20 +2283,28 @@ pub fn resolve_extra_skip_labels_with_config(config: &WorkFinderConfig) -> Vec<S
 /// `loom:building` sweeps that are **not** in the ready backlog. Folding backlog
 /// into the cap here would under-utilize the pool whenever prior-tick sweeps are
 /// still running (a smaller "new work" number would cap total occupancy below
-/// the disk/RAM/configured ceiling). Keeping the cap as `min(disk, ram,
-/// configured)` and letting `tick` apply the backlog bound is what makes
+/// the disk/configured ceiling). Keeping the cap as `min(disk, configured)`
+/// and letting `tick` apply the backlog bound is what makes
 /// concurrency scale up with the backlog and drain to zero when it empties.
 ///
-/// The three remaining bounds map directly to the resource each protects:
+/// The two remaining bounds map directly to the resource each protects:
 /// - `disk_headroom` — never provision more worktrees than the scratch volume
 ///   can hold at `LOOM_PER_WORKTREE_GB` each ([`crate::disk_headroom`]).
-/// - `ram_headroom` — never provision more worktrees than the host's
-///   currently-available memory can hold at `LOOM_PER_WORKTREE_RAM_GB` each
-///   (#5270, [`crate::ram_headroom`]) — the operator-directed "dumb mode"
-///   RAM gate, applied the same way disk headroom already was.
 /// - `configured_max` — **the** per-machine admission knob
 ///   (`LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent`),
 ///   tuned empirically per host.
+///
+/// # Why there is no RAM term any more (#12330)
+///
+/// #5270 added `ram_headroom` (available RAM over a per-sweep charge), and
+/// #11094 charged it with each repo's observed peak and reserved every
+/// in-flight sweep's unrealised peak. That assumed every running sweep hits
+/// its worst build peak at once; once peaks stopped being clipped (#12246) a
+/// dozen API-waiting sweeps reserved more than an idle 64 GiB host had, and
+/// the cap pinned at one slot. Operator ruling on #12330: remove RAM
+/// admission entirely. RAM is watched from outside, through the host's memory
+/// pressure ([`crate::host_pressure`]); builds still serialize on the build
+/// slot ([`crate::build_slot`]).
 ///
 /// # Why there is no token-axis term any more (#5270)
 ///
@@ -2337,7 +2345,7 @@ pub fn resolve_extra_skip_labels_with_config(config: &WorkFinderConfig) -> Vec<S
 ///   high-CPU stages across concurrent sweeps, so N sweeps run while at most 1–2
 ///   build, and the saturation admission brake ([`crate::admission_brake`],
 ///   #4903) holds **new** admissions once the host's observed load-per-core
-///   crosses a threshold — the CPU/RAM "dumb mode" gate the #5270 operator
+///   crosses a threshold — the CPU "dumb mode" gate the #5270 operator
 ///   direction asks for, applied at *admission* time rather than folded back
 ///   into this formula.
 /// - The safety net for a mis-set knob is **measurement, not estimation**: the
@@ -2345,12 +2353,8 @@ pub fn resolve_extra_skip_labels_with_config(config: &WorkFinderConfig) -> Vec<S
 ///   dispatch on observed load-per-core, and the per-tick admission ramp cap
 ///   (#4234) still bounds how fast occupancy can grow.
 #[must_use]
-pub fn resolve_dynamic_max_concurrent(
-    disk_headroom: usize,
-    ram_headroom: usize,
-    configured_max: usize,
-) -> usize {
-    disk_headroom.min(ram_headroom).min(configured_max)
+pub fn resolve_dynamic_max_concurrent(disk_headroom: usize, configured_max: usize) -> usize {
+    disk_headroom.min(configured_max)
 }
 
 // ============================================================================
@@ -2361,10 +2365,10 @@ pub fn resolve_dynamic_max_concurrent(
 /// handle so the daemon can keep it alive for the process lifetime.
 ///
 /// Every `interval`, the task recomputes the **dynamic** concurrency cap
-/// (Phase B, #3811; CPU term removed in #4512) — `min(disk headroom, ram
-/// headroom, configured_max)` via [`resolve_dynamic_max_concurrent`] — from
-/// two live inputs read fresh under `workspace_root` (disk and RAM headroom),
-/// then runs one [`tick`] with it. Those two terms are **not** captured once
+/// (Phase B, #3811; CPU term removed in #4512; RAM term removed in #12330) —
+/// `min(disk headroom, configured_max)` via [`resolve_dynamic_max_concurrent`]
+/// — from the disk headroom read fresh under `workspace_root`, then runs one
+/// [`tick`] with it. That term is **not** captured once
 /// at startup, so a pool that grows/shrinks (`loom-daemon tokens bootstrap`),
 /// a scratch volume that fills/frees, or a draining backlog are all honored
 /// without a daemon restart. `configured_max` — the per-machine admission
@@ -2401,7 +2405,7 @@ where
     log::info!(
         "work_finder: starting loop (interval={}s, configured_max={configured_max}, \
          max_admissions_per_tick={max_admissions_per_tick}, \
-         dynamic cap = min(disk, ram, configured_max) — token axis is \
+         dynamic cap = min(disk, configured_max) — token axis is \
          selection-only, not a cap, since #5270)",
         interval.as_secs()
     );
@@ -2564,12 +2568,6 @@ where
             let ranking = capacity::read_ranking(&workspace_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
-            // RAM headroom (#5270): the second "dumb mode" machine-headroom
-            // axis alongside disk, folded into the same `min(...)`. Read
-            // BEFORE disk since #7512 — the eager-reclaim trigger below needs
-            // to know whether disk is the axis that would bind the cap down,
-            // which is a comparison against this term and `configured_max`.
-            let ram = crate::ram_headroom::ram_headroom_limit();
             // Eager, out-of-cycle reclaim (#7512, #11192): on the tick the
             // disk axis FIRST becomes the term that binds the cap down, and
             // again while free space is below the floor or keeps falling, run
@@ -2583,7 +2581,7 @@ where
             // `EagerTrigger::tick_admission` and `eager_reclaim::run_for`.
             let disk_roots = [workspace_root.clone()];
             let (disk, _) = eager_trigger
-                .tick_admission(&disk_roots, &workspace_root, ram, configured_max)
+                .tick_admission(&disk_roots, &workspace_root, configured_max)
                 .await;
             // Refresh the memoized CPU idle sample. Purely **observational**
             // since #4512 — it no longer feeds admission, it feeds the
@@ -2594,11 +2592,11 @@ where
             // leaves the previous sample in place.
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
-            let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
+            let max_concurrent = resolve_dynamic_max_concurrent(disk, configured_max);
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
-                 since #5270], disk={disk}, ram={ram}, configured_max={configured_max}, \
+                 since #5270], disk={disk}, configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, halted={halted}, \
                  saturation_held={saturation_held}, \
                  observed_idle={})",
@@ -2614,7 +2612,7 @@ where
             match tick_with_lanes(
                 &mut source,
                 &mut dispatcher,
-                (CapTerms::observed(configured_max, disk, ram), max_admissions_per_tick),
+                (CapTerms::observed(configured_max, disk), max_admissions_per_tick),
                 halted,
                 saturation_held,
                 lane,
@@ -2679,7 +2677,7 @@ where
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                              healthy={token_limit}, disk={disk}, \
-                             ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
+                             ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} workspace-commands-missing-skip, \
                              {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
@@ -2722,7 +2720,7 @@ where
                         // cross-axis "did tokens bind the tick" comparison —
                         // `token_limit == 0` (zero healthy accounts) is the
                         // only condition that fires the add-accounts advisory,
-                        // regardless of which axis (disk/RAM/ceiling) actually
+                        // regardless of which axis (disk/ceiling) actually
                         // deferred the work this tick.
                         let assessment = capacity::assess_pressure(
                             ranking.as_ref(),
@@ -2961,14 +2959,11 @@ pub fn spawn_multi_work_finder_task(
             let ranking = capacity::read_ranking_at(&tokens_dir);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
-            // RAM headroom (#5270): the second "dumb mode" machine-headroom
-            // axis alongside disk, folded into the same `min(...)`. Read
-            // BEFORE disk since #7512 — see the single-workspace loop above.
-            // #11094: samples every live agent scope's `memory.peak` (folding
-            // finished scopes into the repo history) and charges admission
-            // with the observed per-repo peak.
-            // The budget charges each candidate its OWN repo's peak (pass 2).
-            let (ram, ram_budget) = crate::ram_headroom::ram_headroom_limit_tick(&pool, &roots);
+            // #11094: sample every live agent scope's `memory.peak`, folding
+            // finished scopes into the repo history (`ram-scope-limit`'s `auto`
+            // mode and `scope.memory` telemetry read it). Recording only since
+            // #12330: RAM is no longer an admission term.
+            crate::ram_peaks::sample_tick(&pool, &roots);
             // Bounded tmpfs-fraction warning (#8572, split from #8512) — logs
             // only, never gates dispatch; see `tmpfs_warning`'s module doc.
             tmpfs_warning::check_and_warn(&fallback_root);
@@ -2981,7 +2976,7 @@ pub fn spawn_multi_work_finder_task(
             // before this tick's cap is finalized. See the single-workspace
             // loop above and `EagerTrigger::tick_admission`.
             let (disk, disk_budget) = eager_trigger
-                .tick_admission(&roots, &fallback_root, ram, configured_max)
+                .tick_admission(&roots, &fallback_root, configured_max)
                 .await;
             // Refresh the memoized CPU idle sample — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
@@ -2990,7 +2985,12 @@ pub fn spawn_multi_work_finder_task(
             // `maxConcurrent`; it no longer gates admission.
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
-            let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
+            let max_concurrent = resolve_dynamic_max_concurrent(disk, configured_max);
+            // #12330: the cap's terms, for the published summary and the tick
+            // span (`ops::dispatch_facts`). This loop never recorded them
+            // before, so `cap_limiter` & co. were only ever exported by the
+            // single-workspace loop.
+            tick_summary::record_cap(crate::types::CapView::from_terms(configured_max, disk));
             // #12074: from here to the step tick nothing awaits, so every forge
             // read in between is bounded by the tick deadline and fails fast
             // past it; a listing does not fall through to the writer.
@@ -3174,7 +3174,7 @@ pub fn spawn_multi_work_finder_task(
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
-                 since #5270], disk={disk}, ram={ram}, configured_max={configured_max}, \
+                 since #5270], disk={disk}, configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
                  per_repo_cap={max_concurrent_per_repo:?} (#9090), \
                  preflight_held={preflight_held_count}, \
@@ -3208,7 +3208,7 @@ pub fn spawn_multi_work_finder_task(
                 max_concurrent,
                 max_admissions: max_admissions_per_tick,
                 saturation_held,
-                limits: (max_concurrent_per_repo, ram_budget, disk_budget).into(),
+                limits: (max_concurrent_per_repo, disk_budget).into(),
                 deadline: Some(tick_deadline),
                 gather_concurrency: crate::step_dispatch::gather_budget::gather_concurrency(
                     &fallback_root,
@@ -3243,7 +3243,6 @@ pub fn spawn_multi_work_finder_task(
                 token_limit,
                 min_workspace_healthy,
                 disk,
-                ram,
                 configured_max,
                 max_admissions_per_tick,
                 workspaces: roots.len(),
@@ -3258,7 +3257,7 @@ pub fn spawn_multi_work_finder_task(
             if !report.halted_fully() {
                 // #5305: see the single-workspace loop above — `token_bound`
                 // is now a pure starvation check, not a cross-axis comparison
-                // against disk/RAM/ceiling.
+                // against disk/ceiling.
                 let assessment = capacity::assess_pressure(
                     ranking.as_ref(),
                     pool_size,

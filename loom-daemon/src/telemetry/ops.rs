@@ -88,12 +88,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // `mixed` (`work_finder::tick_report::error_kind`).
     "loom.dispatch.error_kind",
     // #11858: the held repos with their causes, the cap's binding term and
-    // terms, and the open-PR pre-filter's skips (`ops::dispatch_facts`).
+    // terms (`cap_ram` dropped with the RAM term, #12330), and the open-PR
+    // pre-filter's skips (`ops::dispatch_facts`).
     "loom.dispatch.halted_repos",
     "loom.dispatch.cap_limiter",
     "loom.dispatch.cap_configured",
     "loom.dispatch.cap_disk",
-    "loom.dispatch.cap_ram",
     "loom.dispatch.pr_open_prefiltered",
     // #12074: the step gather's cost and coverage. Emitted since #12074 but
     // missing here until #12256, so export dropped them.

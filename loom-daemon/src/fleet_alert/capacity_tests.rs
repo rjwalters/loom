@@ -64,7 +64,6 @@ fn disk_limited() -> CapView {
     CapView {
         configured: 6,
         disk: Some(2),
-        ram: Some(30),
     }
 }
 
@@ -105,7 +104,6 @@ fn a_configured_cap_with_a_short_queue_asks_nothing() {
     let configured = CapView {
         configured: 4,
         disk: Some(40),
-        ram: None,
     };
     assert!(classify(&status(configured, 12), t0(), WINDOW, TokenCause::Exhausted).is_empty());
     // A disk-limited cap is an ask even with nothing waiting.

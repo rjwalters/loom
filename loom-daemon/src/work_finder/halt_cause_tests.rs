@@ -316,7 +316,10 @@ fn pass_two_defers_a_heavy_repo_on_disk_and_admits_a_light_one() {
         None,
         usize::MAX,
         false,
-        (None, None, Some(disk_budget(14))),
+        crate::work_finder::repo_cap::RepoLimits {
+            per_repo: None,
+            disk: Some(disk_budget(14)),
+        },
         &[],
         &[],
     );
@@ -349,7 +352,10 @@ fn pass_two_debits_each_disk_admission() {
         None,
         usize::MAX,
         false,
-        (None, None, Some(disk_budget(30))),
+        crate::work_finder::repo_cap::RepoLimits {
+            per_repo: None,
+            disk: Some(disk_budget(30)),
+        },
         &[],
         &[],
     );

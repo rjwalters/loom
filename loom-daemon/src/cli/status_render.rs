@@ -59,7 +59,7 @@ struct ResolvedCapacity {
     /// — the token axis was removed from the admission formula entirely, so
     /// there is nothing left for a client-side probe to recompute here; using
     /// the daemon's own authoritative figure guarantees this can never drift
-    /// from what `min(disk, ram, configured_max)` actually evaluates to,
+    /// from what `min(disk, configured_max)` actually evaluates to,
     /// unlike the pre-#5270 client-side `token_axis_effective.min(...)`
     /// recomputation this superseded (which could disagree with the daemon
     /// when accounts were scarce).
@@ -105,7 +105,7 @@ fn resolve_capacity(
             // the way the pre-#5270 formula did (that recomputation could
             // disagree with the daemon whenever accounts were scarce, which is
             // exactly the artificial cap this issue removes). The daemon's own
-            // `dynamic_cap` — `min(disk, ram, configured_max)` — is the sole
+            // `dynamic_cap` — `min(disk, configured_max)` — is the sole
             // authority for the cap. `token_bound`, however, is a starvation
             // signal (zero healthy accounts), independent of the cap — #5305
             // restores it here too so a fresh probe reporting 0 healthy
@@ -359,10 +359,6 @@ pub(crate) fn build_status_json_value_for(
             // whatever cwd `loom-daemon status` itself was run from.
             "token_pool_dir": report.token_pool_dir,
             "disk_headroom": report.disk_headroom,
-            // RAM headroom (#5270) — the second machine-headroom cap term
-            // alongside disk_headroom, since the token axis stopped bounding
-            // admission on any auth path.
-            "ram_headroom": report.ram_headroom,
             // Host CPU OBSERVATIONS (#3978/#4031), not cap terms: #4512 removed
             // the CPU headroom term from admission. Reported because observed
             // idle is the evidence for tuning `configured_max` on this machine.
@@ -1347,7 +1343,7 @@ fn render_admission_brake_line(report: &DaemonStatusReport) -> Option<String> {
 ///
 /// # Why this is next to the disk-headroom line
 ///
-/// `dynamic_cap = min(disk, ram, configured_max)` already tells an operator
+/// `dynamic_cap = min(disk, configured_max)` already tells an operator
 /// that disk is binding. What it never told them is *why*: a host carrying
 /// 39 GB of long-merged `pr-*` worktrees rendered identically to a host that
 /// was genuinely full, and telling the two apart required `du`. The
@@ -1892,8 +1888,8 @@ pub(crate) fn print_status_human(
     let dispatch_cap = report.dynamic_cap;
     println!("\nDynamic concurrency cap: {dispatch_cap}  (the number dispatch uses)");
     println!(
-        "  = min(disk headroom {}, ram headroom {}, configured max {})",
-        report.disk_headroom, report.ram_headroom, report.configured_max
+        "  = min(disk headroom {}, configured max {})",
+        report.disk_headroom, report.configured_max
     );
     // Host CPU OBSERVATION (#3978 AC4; measured-idle signal #4031) — since
     // #4512 this is deliberately NOT a cap term: it is the evidence an operator
@@ -1966,7 +1962,7 @@ pub(crate) fn print_status_human(
     // #4344, re-scoped by #5270/#5305: this used to mean "the token term is
     // starving *dispatch itself*" — true pre-#5270, when the token axis was
     // part of `dynamic_cap`. Since #5270 that is no longer possible on any
-    // auth path: `dynamic_cap` is `min(disk, ram, configured_max)` with no
+    // auth path: `dynamic_cap` is `min(disk, configured_max)` with no
     // token term. #5304 hard-coded this to `false` to reflect that, which
     // also silenced the underlying ranking-divergence detection entirely
     // (#4344's original point) — the daemon's *own* `.ranking` read can still
@@ -2041,15 +2037,14 @@ pub(crate) fn print_status_human(
                 // resource. #9131: `below_cap_line` names any active dispatch
                 // hold (drain, breaker, brake, red main, pool) before blaming
                 // work availability; #4386 pre-flight suppression lives there too.
-                if let Some(line) =
-                    capacity_line::below_cap_line(report, dispatch_cap, "disk/RAM/CPU")
+                if let Some(line) = capacity_line::below_cap_line(report, dispatch_cap, "disk/CPU")
                 {
                     println!("{line}");
                 }
             } else if rc.token_bound {
                 // #5305: `token_bound` means genuine starvation (zero healthy
                 // accounts) — since #5270 the concurrency cap itself is
-                // unaffected (it's `min(disk, ram, configured_max)`, no token
+                // unaffected (it's `min(disk, configured_max)`, no token
                 // term), but with zero healthy accounts every spawn will
                 // still fail account selection at dispatch time.
                 println!(
