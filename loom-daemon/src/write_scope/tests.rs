@@ -402,6 +402,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
+            "claim_reconciliation/ci_gate_recovery.rs",
+            Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
+        ),
+        (
             "forge_disable_auto_merge.rs",
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
@@ -500,8 +504,7 @@ fn daemon_write_paths_are_scoped() {
             Via(
                 "cli/forge_action.rs",
                 "enqueue/dequeue mutations (#10255) run only from `forge merge-queue \
-                 enqueue|dequeue`, vetted via write_target before dispatch; dormant \
-                 behind QUEUE_EXECUTION_ENABLED=false",
+                 enqueue|dequeue`, vetted via write_target before dispatch; opt-in via champion.mergeMode=queue",
             ),
         ),
         (
@@ -516,8 +519,8 @@ fn daemon_write_paths_are_scoped() {
                  path's `revoke_for_root` run only from claim_reconciliation/pass_loop.rs \
                  after gate_root_with, and forge_disable_auto_merge.rs's call follows its \
                  shell-vetted guard. Both are no-ops (no forge call) in direct mode; an \
-                 unresolved mode/repo reports `NOT confirmed` rather than writing; dormant \
-                 behind QUEUE_EXECUTION_ENABLED=false",
+                 unresolved mode/repo reports `NOT confirmed` rather than writing; opt-in via \
+                 champion.mergeMode=queue",
             ),
         ),
         (
@@ -530,8 +533,8 @@ fn daemon_write_paths_are_scoped() {
                  merge-queue revoke` (vetted via write_target) and `revoke_for_root` (behind \
                  gate_root_with / the shell-vetted disable-auto-merge guard). It returns \
                  before any forge call in direct mode, refuses a non-sha target, and only \
-                 ever writes `failure` (withdraws authority); dormant behind \
-                 QUEUE_EXECUTION_ENABLED=false",
+                 ever writes `failure` (withdraws authority); opt-in via \
+                 champion.mergeMode=queue",
             ),
         ),
         ("cli/forge_action.rs", Gated),

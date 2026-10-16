@@ -16,11 +16,14 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 
 use super::gather_budget::{
-    deadline_passed, millis, GatherWalk, SpawnParts, Starvation, TickPhases, GUARANTEED_FLOOR,
+    deadline_passed, millis, GatherWalk, SpawnParts, Starvation, TickPasses, TickPhases,
+    GUARANTEED_FLOOR,
 };
 use super::item_draw::{weigh, ItemWeights, PoolKnobs, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
-use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
+use super::tick::{
+    self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace, PASS_MERGE,
+};
 use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawnTimings};
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
@@ -447,6 +450,9 @@ impl StepDriver {
             },
         );
         let listing_ms = millis(listing_started.elapsed());
+        // The other listing readers (blocked queue, quarantine and claim
+        // reconciliation) read this tick's repos instead of listing (#12307).
+        crate::discovery::published::publish(&snapshot);
         // Pass 3, serial and in walk order: stage entry, weighing, shaping.
         let filter_started = Instant::now();
         let mut jobs: Vec<Option<GatherJob>> = jobs.into_iter().map(Some).collect();
@@ -602,6 +608,11 @@ impl StepDriver {
                 launch_ms: millis(spawner.parts.launch),
                 account_ms: millis(spawner.parts.account),
             },
+        });
+        report.passes = Some(TickPasses {
+            draws: result.draws,
+            draws_unspawned: result.passes.get(PASS_MERGE).copied().unwrap_or(0),
+            by_reason: result.passes.clone(),
         });
         for (idx, failed, listing, held) in &notes {
             note_listing(&mut report, *idx, failed.as_ref(), *listing, *held);

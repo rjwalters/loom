@@ -320,6 +320,8 @@ pub struct GhInvocation {
     stdin_input: Vec<u8>,
     /// Never route this read to a reader App (#9872).
     writer_only: bool,
+    /// Never run this read on the writer (#12389): shed it instead.
+    reader_only: bool,
     /// The identity role the accounting row records; `None` = writer.
     role: Option<crate::forge_identity::IdentityRole>,
     /// The #9777 call identity this execution is accounted under (#9831).
@@ -374,6 +376,7 @@ impl GhInvocation {
             stripped_env: Vec::new(),
             stdin_input: Vec::new(),
             writer_only: false,
+            reader_only: false,
             role: None,
             identity: crate::forge_call_stats::CallIdentity::default(),
             route_slug: None,
@@ -513,6 +516,20 @@ impl GhInvocation {
     #[must_use]
     pub fn writer_identity(mut self) -> Self {
         self.writer_only = true;
+        self
+    }
+
+    /// Never send this read to the writer (#12389, operator ruling #12394:
+    /// the writer is not used for reads). It runs on the gateway or a reader
+    /// App; when none can serve it — no pool, every reader withdrawn or out of
+    /// budget, or a reader that does not cover the repo — it is shed
+    /// ([`GhCompletion::Shed`], "no answer") and the caller defers. Every read
+    /// a CLI subcommand makes with a read route adopted is reader-only
+    /// ([`crate::forge_gateway::cli_reads_reader_only`]). `LOOM_READ_SHED=0`
+    /// lifts it (break-glass).
+    #[must_use]
+    pub fn reader_only(mut self) -> Self {
+        self.reader_only = true;
         self
     }
 

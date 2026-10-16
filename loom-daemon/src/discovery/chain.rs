@@ -6,7 +6,7 @@
 //! | Standalone (no `forge.mirror` block) | `[gh]`, today's behaviour |
 //! | Fleet, `forge.mirror.discovery = "worklist"` | `[mirror, gateway, gh]` |
 //! | Fleet, `= "direct"` (break-glass: a mirror that is wrong, not down) | `[gateway, gh]` |
-//! | Fleet, `= "per_call"` (the default during the transition) | today's per-call mirror leg inside each listing, then the forge |
+//! | Fleet, `= "per_call"` or unset | the same as `"direct"`: the per-call mirror leg is gone (#12307), so this value is only accepted |
 //!
 //! There is never a writer tier. A tick walks its chain from the first tier
 //! and records the tier that answered; every tier failing is [`Tier::None`]
@@ -49,12 +49,12 @@ impl Tier {
 /// `forge.mirror.discovery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// Today's behaviour: each listing asks the mirror per call.
-    #[default]
-    PerCall,
     /// One worklist read per tick.
     Worklist,
-    /// Skip the mirror entirely: the break-glass for a wrong mirror.
+    /// Per-repo listings only; the mirror is not asked. The default, and the
+    /// break-glass for a wrong mirror. `"per_call"`, the retired mode that
+    /// asked the mirror inside each listing, reads as this (#12307).
+    #[default]
     Direct,
 }
 
@@ -135,10 +135,9 @@ impl Chain {
         let mode = match text(MODE_KEY).as_deref() {
             Some("worklist") => Mode::Worklist,
             Some("direct") => Mode::Direct,
-            Some("per_call") => Mode::PerCall,
-            Some(_) => Mode::PerCall,
+            Some(_) => Mode::Direct,
             None if text(LEGACY_KEY).as_deref() == Some("mirror") => Mode::Worklist,
-            None => Mode::PerCall,
+            None => Mode::Direct,
         };
         Self {
             mode: Some(mode),
@@ -152,15 +151,13 @@ impl Chain {
         Self::from_effective(&crate::config_resolver::resolve_effective_config(root))
     }
 
-    /// The tiers walked, first to last. `per_call` has no tier of its own:
-    /// the mirror leg is inside each listing.
+    /// The tiers walked, first to last.
     #[must_use]
     pub fn tiers(&self) -> Vec<Tier> {
         match self.mode {
             None => vec![Tier::Gh],
             Some(Mode::Worklist) => vec![Tier::Mirror, Tier::Gateway, Tier::Gh],
             Some(Mode::Direct) => vec![Tier::Gateway, Tier::Gh],
-            Some(Mode::PerCall) => vec![self.listing],
         }
     }
 
@@ -181,13 +178,6 @@ impl Chain {
             Some(Mode::Worklist) => BackendKind::Mirror,
             _ => BackendKind::Direct,
         }
-    }
-
-    /// Whether the direct backend's listing may ask the mirror per call
-    /// (today's behaviour). The chain's gateway and `gh` tiers never do.
-    #[must_use]
-    pub fn per_call_mirror(&self) -> bool {
-        self.mode == Some(Mode::PerCall)
     }
 
     /// Whether a failed or partial worklist falls back to a paced direct

@@ -1507,6 +1507,9 @@ impl SweepRegistry {
         let gh = self.resolved_gh();
         // W4-C: verifies this daemon's own just-written lease (and its
         // callers fail open after a few retries), so the writer reads it.
+        // #12389 keeps it there on purpose: it is the read half of the
+        // claim-then-verify tie-break, inside the same critical section as
+        // the lease write, and a lagging reader would hide the new comment.
         let mut cmd = self.gh_inv("guard.lease_comments", AccessIntent::Read, &gh);
         cmd = cmd.writer_identity().arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))

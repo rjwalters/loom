@@ -38,13 +38,8 @@
 //!
 //! # What it changes when set
 //!
-//! - **Discovery reads** ([`discovery`]): the work finder's candidate
-//!   listings are read from the
-//!   mirror when the repo's watermark is within the bound, and from today's
-//!   path (the ETag-cached REST listing, through the gateway when that is
-//!   set) otherwise. A stale, unknown, never-reconciled or moved repo, an
-//!   error, a timeout or a malformed answer is a fallback for that repo,
-//!   never a failure and never an empty queue.
+//! - **Discovery reads**: one worklist request per step tick
+//!   ([`crate::discovery`]); there is no per-listing mirror read.
 //! - **Wakes** ([`wake`]): the daemon pulls the change stream for the repos
 //!   it serves, keeps its own cursor (persisted), and publishes each
 //!   non-empty pull as a `forge.event` bus prompt, which ticks the loops
@@ -54,17 +49,15 @@
 //! # What it never changes
 //!
 //! Reads that gate a write. Claim, label-transition and merge reads stay on
-//! the gateway or the forge (ADR-0021's poll_gate invariant 3):
-//! [`discovery::list_open`] answers only
-//! [`crate::forge_events::poll_gate::ReadKind::Discovery`] and returns `None`
-//! (today's path) for every other kind without a request; and only the
-//! discovery listings call it (a source test pins the call sites).
+//! the gateway or the forge (ADR-0021's poll_gate invariant 3): the
+//! worklist ([`crate::discovery`]) is the only mirror read that serves
+//! discovery.
 //!
 //! # Break-glass
 //!
-//! With `forge.mirror` unset, [`active`] is `None`: no discovery listing makes
-//! a request or even resolves its repo, no change stream is pulled, nothing is
-//! published, and every read is exactly today's. The daemon re-reads the
+//! With `forge.mirror` unset, [`active`] is `None`: no mirror request is made,
+//! no change stream is pulled, nothing is published, and every read is
+//! exactly today's. The daemon re-reads the
 //! block every [`CHECK_INTERVAL`], so unsetting it takes effect within a
 //! minute. The fleet store fetch never depends on the mirror.
 
@@ -79,14 +72,70 @@ use crate::aws_ssm::{AwsAccess, AwsProfile};
 use crate::key_ref::KeyRef;
 
 pub mod client;
-pub mod discovery;
 pub mod wake;
 
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-mod all_open_tests;
+/// How a mirror read ended, as the `outcome` label of
+/// `loom.forge.mirror.reads`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Served from the mirror.
+    Hit,
+    /// The watermark was older than the bound.
+    Stale,
+    /// The mirror cannot vouch for the repo.
+    Unknown,
+    /// A request failed (transport, status, auth, malformed).
+    Error,
+    /// Skipped without a request.
+    Skipped,
+}
+
+impl Outcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+            Self::Error => "error",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// The lowercase `owner/name` a listing from `cwd` (or of `repo`) targets,
+/// resolved the way [`crate::forge_listing`] resolves it (`repo`, else
+/// `LOOM_REPO`, else `cwd`'s `origin`), or `None` when it is not a
+/// `github.com` repo the mirror could hold.
+#[must_use]
+pub fn resolve_repo(cwd: Option<&std::path::Path>, repo: Option<&str>) -> Option<String> {
+    let env_repo = std::env::var("LOOM_REPO").ok().filter(|r| !r.is_empty());
+    let target = crate::forge_etag_store::resolve_target(cwd, repo.or(env_repo.as_deref()));
+    if !crate::forge_etag_store::host_scope(&target).eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let slug = target.repo?.to_ascii_lowercase();
+    valid_slug(&slug).then_some(slug)
+}
+
+/// `owner/name` as GitHub allows them.
+#[must_use]
+pub fn valid_slug(slug: &str) -> bool {
+    let Some((owner, name)) = slug.split_once('/') else {
+        return false;
+    };
+    crate::forge_bucket_book::valid_owner(owner)
+        && !name.is_empty()
+        && name.len() <= 100
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
 
 /// The config block.
 pub const CONFIG_KEY: &str = "forge.mirror";

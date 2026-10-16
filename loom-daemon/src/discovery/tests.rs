@@ -95,11 +95,8 @@ fn listed(slug: &str, tier: Tier) -> RepoSnapshot {
 }
 
 /// A lister that answers every repo and counts its calls.
-fn counting(
-    calls: Arc<AtomicU64>,
-) -> impl Fn(&Target, &AtomicU64, bool, Tier) -> Result<RepoSnapshot> {
-    move |t, reads, per_call, tier| {
-        assert!(!per_call, "a fallback tier never asks the mirror per call");
+fn counting(calls: Arc<AtomicU64>) -> impl Fn(&Target, &AtomicU64, Tier) -> Result<RepoSnapshot> {
+    move |t, reads, tier| {
         calls.fetch_add(1, Ordering::SeqCst);
         reads.fetch_add(1, Ordering::Relaxed);
         Ok(listed(&t.slug, tier))
@@ -146,7 +143,6 @@ fn no_mirror_block_is_the_gh_only_chain() {
         let chain = Chain::from_effective(&effective);
         assert_eq!(chain.tiers(), vec![Tier::Gh], "{effective}");
         assert_eq!(chain.backend(), BackendKind::Direct);
-        assert!(!chain.per_call_mirror());
         assert!(!chain.is_worklist());
     }
 }
@@ -154,24 +150,22 @@ fn no_mirror_block_is_the_gh_only_chain() {
 #[test]
 fn a_mirror_block_selects_the_chain_by_discovery_mode() {
     let chain = |d: Option<&str>| Chain::from_effective(&config(d));
-    // The default during the transition is today's per-call behaviour.
-    let per_call = chain(None);
-    assert_eq!(per_call.mode(), Some(Mode::PerCall));
-    assert!(per_call.per_call_mirror());
-    assert_eq!(per_call.backend(), BackendKind::Direct);
-    assert_eq!(chain(Some("per_call")).mode(), Some(Mode::PerCall));
-    assert_eq!(chain(Some("garbage")).mode(), Some(Mode::PerCall));
+    // Unset, `per_call` (retired, #12307) and anything unrecognised list
+    // per repo and never ask the mirror.
+    for d in [None, Some("per_call"), Some("garbage")] {
+        let c = chain(d);
+        assert_eq!(c.mode(), Some(Mode::Direct), "{d:?}");
+        assert_eq!(c.backend(), BackendKind::Direct);
+    }
 
     let worklist = chain(Some("worklist"));
     assert_eq!(worklist.tiers(), vec![Tier::Mirror, Tier::Gateway, Tier::Gh]);
     assert_eq!(worklist.backend(), BackendKind::Mirror);
-    assert!(!worklist.per_call_mirror());
 
     // Break-glass: a mirror that is wrong, not down.
     let direct = chain(Some(" Direct "));
     assert_eq!(direct.tiers(), vec![Tier::Gateway, Tier::Gh]);
     assert_eq!(direct.backend(), BackendKind::Direct);
-    assert!(!direct.per_call_mirror(), "the break-glass never asks the mirror");
 }
 
 #[test]
@@ -280,7 +274,7 @@ fn a_ready_worklist_serves_every_repo_from_the_mirror_tier() {
     let mut d = Discovery::default();
     let snap = d
         .begin_mirror_tick_with(wl(), now(), |_| modified("\"w1\""))
-        .with_lister(|_, _, _, _| panic!("a worklist answer lists nothing"));
+        .with_lister(|_, _, _| panic!("a worklist answer lists nothing"));
     assert_eq!(snap.repo(&target("acme/widgets")).unwrap().tier, Tier::Mirror);
     snap.repo(&target("acme/old")).unwrap();
     let stats = snap.stats();
@@ -478,7 +472,7 @@ fn a_failed_listing_is_tier_none_and_is_not_retried_until_the_backstop() {
     let mut d = Discovery::default();
     let calls = Arc::new(AtomicU64::new(0));
     let failing = |calls: Arc<AtomicU64>| {
-        move |_: &Target, _: &AtomicU64, _: bool, _: Tier| -> Result<RepoSnapshot> {
+        move |_: &Target, _: &AtomicU64, _: Tier| -> Result<RepoSnapshot> {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(anyhow!("no credential"))
         }
@@ -499,6 +493,37 @@ fn a_failed_listing_is_tier_none_and_is_not_retried_until_the_backstop() {
 }
 
 #[test]
+fn a_breaker_skip_is_not_paced_but_a_listing_failure_is() {
+    use super::fallback::{Fallback, ListFailure, Served};
+    let fail = |reason| ListFailure {
+        reason,
+        detail: String::new(),
+    };
+    let t0 = std::time::Instant::now();
+    let after = t0 + Duration::from_secs(1);
+    let mut fb = Fallback::new(Duration::from_secs(60));
+
+    // A breaker skip sent nothing: serves `Failed` now, retried next tick.
+    let served = fb.finish("acme/widgets", t0, Err(fail("breaker")));
+    assert!(matches!(served, Served::Failed(f) if f.reason == "breaker"));
+    assert!(fb.paced("acme/widgets", after).is_none());
+
+    // A listing failure is still paced for the backstop.
+    fb.finish("acme/old", t0, Err(fail("listing")));
+    assert!(matches!(
+        fb.paced("acme/old", after),
+        Some(Served::Failed(f)) if f.reason == "listing"
+    ));
+
+    // A breaker skip after a good listing leaves the window untouched.
+    fb.finish("acme/new", t0, Ok(listed("acme/new", Tier::Gh)));
+    let skip = t0 + Duration::from_secs(30);
+    fb.finish("acme/new", skip, Err(fail("breaker")));
+    assert!(matches!(fb.paced("acme/new", skip), Some(Served::Paced(_))));
+    assert!(fb.paced("acme/new", t0 + Duration::from_secs(61)).is_none());
+}
+
+#[test]
 fn a_reserve_refusal_ends_discovery_draws_from_the_last_listing_and_spares_the_breaker() {
     use crate::gh_invocation::purpose;
     let mut d = Discovery::with_backstop(Duration::ZERO);
@@ -515,7 +540,7 @@ fn a_reserve_refusal_ends_discovery_draws_from_the_last_listing_and_spares_the_b
     let attempts = Arc::new(AtomicU64::new(0));
     let refusing = {
         let attempts = attempts.clone();
-        move |_: &Target, _: &AtomicU64, _: bool, _: Tier| -> Result<RepoSnapshot> {
+        move |_: &Target, _: &AtomicU64, _: Tier| -> Result<RepoSnapshot> {
             attempts.fetch_add(1, Ordering::SeqCst);
             purpose::end_discovery();
             Err(anyhow!("gh: loom-gateway-reserve: discovery refused (HTTP 429)"))
@@ -549,7 +574,7 @@ fn a_reserve_refusal_with_no_earlier_listing_draws_nothing() {
     let mut d = Discovery::default();
     let snap = d
         .begin_mirror_tick_with(wl(), now(), |_| failed(503))
-        .with_lister(|_, _, _, _| {
+        .with_lister(|_, _, _| {
             purpose::end_discovery();
             Err(anyhow!("loom-gateway-reserve"))
         });
@@ -564,8 +589,7 @@ fn the_standalone_chain_makes_no_mirror_or_gateway_request() {
     let mut d = Discovery::default();
     let snap = d
         .begin_tick(Chain::standalone(), now())
-        .with_lister(|t, reads, per_call, tier| {
-            assert!(!per_call);
+        .with_lister(|t, reads, tier| {
             reads.fetch_add(1, Ordering::Relaxed);
             Ok(listed(&t.slug, tier))
         });
@@ -591,27 +615,6 @@ fn the_direct_chains_list_every_tick_with_no_pace() {
 }
 
 #[test]
-fn only_the_per_call_chain_lets_the_listing_ask_the_mirror() {
-    let mut d = Discovery::default();
-    let saw = Arc::new(Mutex::new(Vec::new()));
-    for chain in [
-        Chain::standalone(),
-        Chain::fleet(Mode::PerCall, Tier::Gateway),
-        Chain::fleet(Mode::Direct, Tier::Gateway),
-    ] {
-        let saw = saw.clone();
-        let snap = d
-            .begin_tick(chain, now())
-            .with_lister(move |t, _, per_call, tier| {
-                saw.lock().unwrap().push(per_call);
-                Ok(listed(&t.slug, tier))
-            });
-        snap.repo(&target("acme/widgets")).unwrap();
-    }
-    assert_eq!(*saw.lock().unwrap(), vec![false, true, false]);
-}
-
-#[test]
 fn a_stale_repo_is_served_with_its_watermark_recorded() {
     let mut d = Discovery::with_backstop(BACKSTOP);
     let snap = d.begin_mirror_tick_with(wl(), now(), |_| modified("\"w1\""));
@@ -626,6 +629,59 @@ fn a_stale_repo_is_served_with_its_watermark_recorded() {
     assert_eq!(stats.oldest_watermark_age_secs, Some(4 * 3600));
     assert_eq!(stats.stale_repos, 1);
     assert_eq!(stats.discovery_forge_reads, 0);
+}
+
+#[test]
+fn a_repo_the_mirror_cannot_vouch_for_is_not_served_but_others_are() {
+    type Edit = fn(&mut Value);
+    let cases: [(&str, Edit); 6] = [
+        ("known false", |w| w["known"] = json!(false)),
+        ("known absent", |w| {
+            w.as_object_mut().unwrap().remove("known");
+        }),
+        ("gone", |w| w["gone"] = json!("moved to acme/new")),
+        ("another repo", |w| w["repo"] = json!("acme/other")),
+        ("no repo named", |w| {
+            w.as_object_mut().unwrap().remove("repo");
+        }),
+        ("never reconciled", |w| {
+            w.as_object_mut().unwrap().remove("last_reconciled_at");
+        }),
+    ];
+    for (why, edit) in cases {
+        let mut body = worklist_body();
+        edit(&mut body["repos"]["acme/old"]["watermark"]);
+        let mut d = Discovery::default();
+        let calls = Arc::new(AtomicU64::new(0));
+        let snap = d
+            .begin_mirror_tick_with(wl(), now(), |_| Fetched {
+                outcome: Ok(Conditional::Modified {
+                    etag: Some("\"w3\"".into()),
+                    body,
+                }),
+                latency: Duration::ZERO,
+            })
+            .with_lister(counting(calls.clone()));
+        assert_eq!(snap.repo(&target("acme/widgets")).unwrap().tier, Tier::Mirror, "{why}");
+        assert_eq!(snap.repo(&target("acme/old")).unwrap().tier, Tier::Gateway, "{why}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{why}: only the unvouched repo falls back");
+        assert_eq!(snap.stats().fallback_repos, vec!["acme/old"], "{why}");
+    }
+}
+
+#[test]
+fn an_uppercase_repo_in_the_watermark_is_still_vouched_for() {
+    let mut body = worklist_body();
+    body["repos"]["acme/old"]["watermark"]["repo"] = json!("ACME/Old");
+    let mut d = Discovery::default();
+    let snap = d.begin_mirror_tick_with(wl(), now(), |_| Fetched {
+        outcome: Ok(Conditional::Modified {
+            etag: Some("\"w4\"".into()),
+            body,
+        }),
+        latency: Duration::ZERO,
+    });
+    assert_eq!(snap.repo(&target("acme/old")).unwrap().tier, Tier::Mirror);
 }
 
 #[test]
@@ -650,7 +706,7 @@ fn the_direct_backend_reports_no_worklist_facts_until_it_lists() {
 }
 
 #[test]
-fn the_mirror_backend_never_reaches_the_per_call_listing_path() {
+fn the_mirror_backend_never_reaches_a_per_repo_listing_path() {
     for file in ["mirror.rs", "worklist.rs"] {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src/discovery")
@@ -662,7 +718,6 @@ fn the_mirror_backend_never_reaches_the_per_call_listing_path() {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!code.contains("list_open"), "{file} must not call a per-repo listing");
-        assert!(!code.contains("forge_mirror::discovery"), "{file}");
         assert!(!code.contains("forge_listing::list"), "{file}");
     }
 }
@@ -769,8 +824,9 @@ fn an_inactive_mirror_falls_to_the_next_tier() {
 
 /// The snapshot answers `ReadKind::Discovery` only (`poll_gate` invariant 3):
 /// no claim, label-transition or merge module names it, so no such decision
-/// can read it. The reconcilers that will read it (#12307) join this list in
-/// their own slices.
+/// can read it. The listing readers that moved onto it (#12307) are named
+/// here; each keeps its write-gating checks (`scan_issue`, `mergeable_of`, PR
+/// state) live.
 #[test]
 fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -806,6 +862,14 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         }
     }
     let expected: std::collections::BTreeSet<String> = [
+        // The listing readers (#12307).
+        "claim_reconciliation/open_pr_listing.rs",
+        "claim_reconciliation/open_pr_listing_tests.rs",
+        "observability/queue_blocked.rs",
+        "observability/queue_blocked_tests.rs",
+        "quarantine_reconciliation/listing.rs",
+        // The gather concurrency is the Direct backend's alone.
+        "step_dispatch/gather_budget.rs",
         "observability/ops/dispatch_facts.rs",
         "step_dispatch/driver.rs",
         "step_dispatch/gather.rs",

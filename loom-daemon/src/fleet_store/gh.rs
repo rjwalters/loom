@@ -227,11 +227,19 @@ impl GhTransport {
         })
     }
 
-    /// One GraphQL read under the WRITER credential (#10987): the workspace
-    /// resync's batched default-branch head query, one request for every
-    /// repo of one owner. The writer for the same reason as
-    /// [`Self::get_as_writer`]: a reader App that is not installed on a repo
-    /// answers `NOT_FOUND` for it, which would read as "the repo is gone".
+    /// One GraphQL read on the read path (#10987, #12389): the workspace
+    /// resync's batched default-branch head query, one request for every repo
+    /// of one owner, through the facade's gateway-then-reader chain, targeted
+    /// at this transport's repo so the route is the owner's. Booked as
+    /// `fleet_store_graphql`. Not gateway-exempt: it is not the `fleet.json`
+    /// fetch.
+    ///
+    /// **Reader-only** (operator ruling #12394): it never falls back to the
+    /// writer. With no gateway or reader to serve it, the read is shed and
+    /// this returns an error, so the owner's repos go unanswered and the pass
+    /// asks their remotes (`git ls-remote`) instead. A reader that is not
+    /// installed on one of the repos answers `NOT_FOUND` for it, so the
+    /// caller must not take a fault from this answer as final.
     ///
     /// Returns the response body. `gh` exits non-zero when the answer carries
     /// any `errors` entry and still prints the partial `data`, so the caller
@@ -239,26 +247,43 @@ impl GhTransport {
     /// the rate-limit breaker; one with no body at all is an error.
     ///
     /// # Errors
-    /// `gh` could not run, timed out, or printed no body.
-    pub(crate) fn graphql_as_writer(
+    /// `gh` could not run, timed out, was shed, or printed no body.
+    pub(crate) fn graphql_read(
         &self,
         forge_op: ForgeOp,
         query: &str,
         timeout: Duration,
     ) -> Result<String> {
-        let cred = self.writer();
         let field = format!("query={query}");
-        let inv = self
-            .invocation_within("fleet_store_graphql", forge_op, AccessIntent::Read, &cred, timeout)
-            .args(["api", "graphql", "-f", field.as_str()]);
+        let target = GhTarget::repo(&self.repo).map_err(|e| anyhow::anyhow!(e))?;
+        let inv = GhInvocation::new(
+            Operation::new("fleet_store_graphql"),
+            AccessIntent::Read,
+            target,
+            timeout,
+        )
+        .forge_op(forge_op)
+        .identity_scope(None, Some(&self.repo))
+        .program(&self.gh_bin)
+        .current_dir(&self.workspace_root)
+        .reader_only()
+        .args(["api", "graphql", "-f", field.as_str()]);
+        self.graphql_body(inv, timeout)
+    }
+
+    /// Run a GraphQL query invocation and return its body (see
+    /// [`Self::graphql_read`]).
+    fn graphql_body(&self, inv: GhInvocation, timeout: Duration) -> Result<String> {
         let out = match inv.execute() {
             Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+            Ok(GhCompletion::Shed { .. }) => {
+                anyhow::bail!("the GraphQL query was shed: no gateway or reader can serve it")
+            }
             Ok(_) => anyhow::bail!("the GraphQL query timed out after {}s", timeout.as_secs()),
             Err(e) => {
                 return Err(e).with_context(|| format!("failed to invoke {}", self.gh_bin));
             }
         };
-        *self.last_used.borrow_mut() = Some(cred);
         let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if !out.status.success() {

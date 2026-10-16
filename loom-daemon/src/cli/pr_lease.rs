@@ -562,7 +562,9 @@ impl Gh {
             .forge_op(fop)
             .program(&self.bin)
             .current_dir(&self.root)
-            // W4-C: these reads verify this claimant's own writes.
+            // W4-C: these reads verify this claimant's own writes. They stay
+            // on the writer (#12389): each one decides whether the lease this
+            // process just posted or renewed holds, so it must see that write.
             .writer_identity()
     }
 
@@ -672,7 +674,7 @@ impl Gh {
         Some((open, labels))
     }
 
-    /// The single issue `pr`'s body closes (its provenance story), if any.
+    /// The single issue `pr`'s body closes (its story), if any.
     fn story_issue(&self, pr: u64) -> Option<u32> {
         let out = self
             .inv("pr_lease.pr_body", AccessIntent::Read, ops::PR_VIEW_STATE)
@@ -693,12 +695,7 @@ impl Gh {
 
 /// The lease comment body. `renewed` adds the line that makes each renewal
 /// PATCH change the body (a forge may not advance `updated_at` otherwise).
-pub(crate) fn lease_body(
-    me: &Identity,
-    pr: u64,
-    renewed: Option<DateTime<Utc>>,
-    provenance: &str,
-) -> String {
+pub(crate) fn lease_body(me: &Identity, pr: u64, renewed: Option<DateTime<Utc>>) -> String {
     let mut body = format!(
         "{marker}\nPR #{pr}'s `{label}` claim is held by the {role} of sweep `{sweep}` on host \
          `{host}`. This comment is a **PR lease record** (#9401): its liveness signal is its own \
@@ -714,28 +711,7 @@ pub(crate) fn lease_body(
     if let Some(at) = renewed {
         body.push_str(&format!("\n<!-- loom:pr-lease-renewed at={} -->", at.to_rfc3339()));
     }
-    if !provenance.is_empty() {
-        body.push_str("\n\n");
-        body.push_str(provenance);
-    }
     body
-}
-
-/// The hidden `loom:provenance v1` line for comments this verb posts. `host=`
-/// carries the same published id as the lease marker, so one comment never
-/// pairs an opaque id with the raw hostname it hides (#6322).
-pub(crate) fn provenance_line(root: &Path, me: &Identity, story_issue: Option<u32>) -> String {
-    use loom_daemon::provenance::marker::{collect, MarkerInputs};
-    let mut marker = collect(
-        root,
-        &MarkerInputs {
-            issue: story_issue,
-            sweep: Some(&me.sweep),
-            ..MarkerInputs::default()
-        },
-    );
-    marker.host = me.host.clone();
-    marker.render()
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,7 +985,7 @@ impl Ctx {
                     .flatten()
                     .find(|r| r.id == id)
                     .map_or_else(self.now, |r| r.updated_at);
-                self.start_renewal(id, self.gh.story_issue(self.pr()), leased_at);
+                self.start_renewal(id, leased_at);
                 loom_daemon::observability::lifecycle::role_target::record_claim(self.pr());
                 self.list_held();
                 println!("{} {}", self.me.host, self.me.sweep);
@@ -1023,9 +999,7 @@ impl Ctx {
         if let Some(code) = rows.as_deref().and_then(|r| self.activity_refusal(r)) {
             return code;
         }
-        let story = self.gh.story_issue(self.pr());
-        let provenance = provenance_line(&self.gh.root, &self.me, story);
-        let body = lease_body(&self.me, self.pr(), None, &provenance);
+        let body = lease_body(&self.me, self.pr(), None);
         // Before the post, so the renewer's guard never overestimates the
         // lease's remaining life.
         let leased_at = (self.now)();
@@ -1043,7 +1017,7 @@ impl Ctx {
                     "{}\nThis {role}'s PR lease (sweep `{sweep}`, host `{host}`) was not the \
                      earliest live `{role}` lease on this PR: sweep `{ws}` on host `{wh}` has an \
                      earlier forge-assigned comment id. Standing down before touching a worktree \
-                     or the `{label}` label (#9401, claim-then-verify-order #6287).\n\n{provenance}",
+                     or the `{label}` label (#9401, claim-then-verify-order #6287).",
                     self.me.yield_marker(&winner),
                     role = self.me.role.as_str(),
                     sweep = self.me.sweep,
@@ -1062,7 +1036,7 @@ impl Ctx {
                 EXIT_PEER
             }
             Ordering::Won | Ordering::Unverified => {
-                self.start_renewal(own_id, story, leased_at);
+                self.start_renewal(own_id, leased_at);
                 self.say(&format!(
                     "lease {own_id} held (host={} sweep={}); add `{}` now",
                     self.me.host,
@@ -1090,7 +1064,7 @@ impl Ctx {
                     .flatten()
                     .find(|r| r.id == id)
                     .map_or_else(self.now, |r| r.updated_at);
-                self.start_renewal(id, self.gh.story_issue(self.pr()), leased_at);
+                self.start_renewal(id, leased_at);
                 EXIT_HELD
             }
             ClaimState::HeldByPeer { holder, .. } => {
@@ -1206,7 +1180,7 @@ impl Ctx {
         Ordering::Won
     }
 
-    fn start_renewal(&self, comment_id: u64, story: Option<u32>, leased_at: DateTime<Utc>) {
+    fn start_renewal(&self, comment_id: u64, leased_at: DateTime<Utc>) {
         if !self.manage_renewer {
             return;
         }
@@ -1214,7 +1188,7 @@ impl Ctx {
             self.say("no --watch-pid: lease not renewed, it ages out at the TTL");
             return;
         };
-        let line = renew::spawn(self, comment_id, watch_pid, story, leased_at);
+        let line = renew::spawn(self, comment_id, watch_pid, leased_at);
         self.say(&line);
     }
 

@@ -101,6 +101,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 pub(crate) mod labels_block;
+pub(crate) mod linked_roots;
 pub mod standalone;
 pub(crate) mod surfaces;
 
@@ -134,6 +135,10 @@ const COMMANDS_DIR: &str = ".claude/commands/loom";
 
 /// The pin file. Copied into staging (ownership evidence) but never diffed.
 const RESYNC_IGNORE_PATH: &str = ".loom/resync-ignore";
+
+/// The metadata key recording a version stamp held back because a payload
+/// tree sits behind a symlink the resync cannot write through (#11426).
+const HELD_KEY: &str = "resync_held";
 
 /// The values a resync stamps into `install-metadata.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +258,14 @@ pub struct PayloadDiff {
     /// knows which repo this is reports them
     /// ([`surfaces::log_skipped_once`]).
     pub(crate) skipped_surfaces: Vec<surfaces::Skipped>,
+    /// Roots resynced at a real path because a directory above them is a
+    /// symlink into the repo (#11426): `(logical, real)`. The lists above
+    /// hold the real paths; `installed_files` records the logical ones.
+    aliases: Vec<(String, String)>,
+    /// Payload trees (`.loom`, `.claude/commands/loom`) skipped because a
+    /// directory above them is a symlink out of the repo, or dangles. While
+    /// any is held, [`apply`] does not advance the version stamp (#11426).
+    held: Vec<String>,
 }
 
 impl PayloadDiff {
@@ -276,6 +289,25 @@ impl PayloadDiff {
     #[must_use]
     pub fn stamp(&self) -> &Stamp {
         &self.stamp
+    }
+
+    /// Payload trees this resync cannot reach (see [`Self::held`]).
+    #[must_use]
+    pub fn held_roots(&self) -> &[String] {
+        &self.held
+    }
+
+    /// The path `installed_files` records for a diff path: the logical one
+    /// for a file resynced through an in-repo symlink.
+    fn logical_path(&self, rel: &str) -> String {
+        for (logical, real) in &self.aliases {
+            if let Some(rest) = rel.strip_prefix(real.as_str()) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    return format!("{logical}{rest}");
+                }
+            }
+        }
+        rel.to_string()
     }
 }
 
@@ -522,19 +554,42 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
     // symlink would make the installer write through it, out of staging) and
     // their paths are left out of the diff.
     let mut skipped: Vec<String> = Vec::new();
+    // Roots behind a symlinked directory (#11426): one that resolves inside
+    // the repo is staged at its logical path (where the installer writes it)
+    // but read from, diffed against and written to its real path; one that
+    // cannot be reached is skipped and reported.
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut unreachable: Vec<surfaces::Skipped> = Vec::new();
+    let mut held: Vec<String> = Vec::new();
     for rel in roots
         .iter()
         .map(String::as_str)
         .chain([INSTALL_METADATA_PATH, RESYNC_IGNORE_PATH])
     {
-        // An extra surface reached through a symlinked parent (`.agents` or
-        // `.github` linked elsewhere) is the workspace's to keep, like a
-        // symlinked file.
-        if surfaces::is_extra(rel) && under_symlink(dest, rel) {
-            skipped.push(rel.to_string());
-            continue;
-        }
-        seed(&dest.join(rel), &stage.join(rel), rel, &mut skipped)
+        let real = match linked_roots::locate(dest, rel) {
+            linked_roots::RootPath::Direct => rel.to_string(),
+            linked_roots::RootPath::InRepo(real)
+                if !roots.iter().any(|other| {
+                    other != rel
+                        && (linked_roots::within(&real, other)
+                            || linked_roots::within(other, &real))
+                }) =>
+            {
+                aliases.push((rel.to_string(), real.clone()));
+                real
+            }
+            linked_roots::RootPath::InRepo(real) => {
+                let why = format!("resolves onto another resync root ({real})");
+                note_unreachable(rel, &why, &mut skipped, &mut held, &mut unreachable);
+                continue;
+            }
+            linked_roots::RootPath::Unreachable { link, why } => {
+                let why = format!("{link} is {why}");
+                note_unreachable(rel, &why, &mut skipped, &mut held, &mut unreachable);
+                continue;
+            }
+        };
+        seed(&dest.join(&real), &stage.join(rel), rel, &mut skipped)
             .with_context(|| format!("stage {rel}"))?;
     }
 
@@ -543,6 +598,8 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
     let mut skipped_surfaces = Vec::new();
     surfaces::stage_extras(payload.defaults(), stage, &mut shipped, &mut skipped_surfaces)
         .map_err(|e| anyhow!("stage the extra surfaces: {e}"))?;
+
+    skipped_surfaces.extend(unreachable);
 
     let ownership = OwnershipBoundary::load(dest);
     // A surface the repo pinned in `.loom/resync-ignore` is its own to keep,
@@ -558,16 +615,25 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         added: Vec::new(),
         changed: Vec::new(),
         removed: Vec::new(),
-        stamp_pending: resync_is_pending(dest),
+        // A stamp held back for an unreachable payload tree is owed once
+        // nothing is held any more, even if no file differs by then.
+        stamp_pending: resync_is_pending(dest) || (held.is_empty() && stamp_is_held(dest)),
         stamp: payload.stamp().clone(),
         staging,
         skipped_surfaces,
+        aliases,
+        held,
     };
     let mut staged = BTreeMap::new();
     let mut installed = BTreeMap::new();
     for rel in &roots {
+        let real = diff
+            .aliases
+            .iter()
+            .find(|(logical, _)| logical == rel)
+            .map_or(rel.as_str(), |(_, real)| real.as_str());
         collect_files(&diff.staging.path().join(rel), rel, &mut staged)?;
-        collect_files(&dest.join(rel), rel, &mut installed)?;
+        collect_files(&dest.join(real), rel, &mut installed)?;
     }
     let paths: BTreeSet<&String> = staged.keys().chain(installed.keys()).collect();
     for path in paths {
@@ -586,7 +652,42 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
             _ => {}
         }
     }
+    relocate_aliases(&mut diff)?;
     Ok(diff)
+}
+
+/// Move each aliased root's staged files to its real path and rename the
+/// diff's paths to match (#11426), so [`apply`] writes, and the caller
+/// stages, only real paths: nothing goes through the symlink, and `git add`
+/// never sees a path beyond one.
+fn relocate_aliases(diff: &mut PayloadDiff) -> Result<()> {
+    for (logical, real) in &diff.aliases {
+        let from = diff.staging.path().join(logical);
+        if fs::symlink_metadata(&from).is_err() {
+            continue;
+        }
+        let to = diff.staging.path().join(real);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("stage {real}"))?;
+        }
+        fs::rename(&from, &to).with_context(|| format!("stage {logical} at {real}"))?;
+    }
+    let aliases = diff.aliases.clone();
+    let to_real = |path: &mut String| {
+        for (logical, real) in &aliases {
+            if let Some(rest) = path.strip_prefix(logical.as_str()) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    *path = format!("{real}{rest}");
+                    return;
+                }
+            }
+        }
+    };
+    for list in [&mut diff.added, &mut diff.changed, &mut diff.removed] {
+        list.iter_mut().for_each(&to_real);
+        list.sort();
+    }
+    Ok(())
 }
 
 /// Write `diff` into `dest`. An empty diff writes nothing and returns
@@ -841,12 +942,23 @@ fn diff_excludes(path: &str, skipped: &[String], ownership: &OwnershipBoundary) 
         .any(|name| ownership.is_declared_repo_owned(name))
 }
 
-/// A directory above `rel` in `dest` is a symlink.
-fn under_symlink(dest: &Path, rel: &str) -> bool {
-    Path::new(rel).ancestors().skip(1).any(|dir| {
-        !dir.as_os_str().is_empty()
-            && fs::symlink_metadata(dest.join(dir)).is_ok_and(|m| m.file_type().is_symlink())
-    })
+/// Leave `rel` out of the resync because it sits behind a symlinked
+/// directory the resync cannot write through (#11426), and say why.
+fn note_unreachable(
+    rel: &str,
+    why: &str,
+    skipped: &mut Vec<String>,
+    held: &mut Vec<String>,
+    unreachable: &mut Vec<surfaces::Skipped>,
+) {
+    skipped.push(rel.to_string());
+    if surfaces::is_payload_tree(rel) {
+        held.push(rel.to_string());
+    }
+    unreachable.push(surfaces::Skipped {
+        path: rel.to_string(),
+        why: surfaces::SkipReason::BehindSymlink(why.to_string()),
+    });
 }
 
 fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
@@ -899,6 +1011,15 @@ fn prune_empty_parents(dest: &Path, rel: &str) {
 const PENDING_KEY: &str = "resync_pending";
 
 /// The workspace's metadata records a resync that never reached its stamp.
+/// The metadata records a stamp held back for an unreachable payload tree
+/// (#11426).
+fn stamp_is_held(dest: &Path) -> bool {
+    fs::read_to_string(dest.join(INSTALL_METADATA_PATH))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|v| v.get(HELD_KEY).is_some())
+}
+
 fn resync_is_pending(dest: &Path) -> bool {
     fs::read_to_string(dest.join(INSTALL_METADATA_PATH))
         .ok()
@@ -934,11 +1055,26 @@ fn edit_metadata(
 fn restamp_metadata(dest: &Path, diff: &PayloadDiff) -> Result<()> {
     let stamp = &diff.stamp;
     edit_metadata(dest, |obj| {
-        obj.insert("loom_version".into(), Value::String(stamp.version.to_string()));
-        if let Some(commit) = &stamp.commit {
-            obj.insert("loom_commit".into(), Value::String(commit.clone()));
+        if diff.held.is_empty() {
+            obj.insert("loom_version".into(), Value::String(stamp.version.to_string()));
+            if let Some(commit) = &stamp.commit {
+                obj.insert("loom_commit".into(), Value::String(commit.clone()));
+            }
+            obj.insert("requires_daemon".into(), Value::String(stamp.requires_daemon.clone()));
+            obj.remove(HELD_KEY);
+        } else {
+            // A payload tree this resync could not reach (#11426) is still at
+            // the old release, so the version stamp stays where it was: it is
+            // what `loom.prompt.loom_version` reports. The rest of the
+            // payload is written; the record names what is held and why.
+            obj.insert(
+                HELD_KEY.into(),
+                serde_json::json!({
+                    "version": stamp.version.to_string(),
+                    "roots": diff.held,
+                }),
+            );
         }
-        obj.insert("requires_daemon".into(), Value::String(stamp.requires_daemon.clone()));
         obj.insert(
             "last_resync".into(),
             Value::String(chrono::Utc::now().format("%Y-%m-%d").to_string()),
@@ -960,16 +1096,19 @@ fn record_ownership(obj: &mut serde_json::Map<String, Value>, diff: &PayloadDiff
     let Some(list) = entry.as_array_mut() else {
         return;
     };
-    let removed: BTreeSet<&str> = diff.removed.iter().map(String::as_str).collect();
+    let removed: BTreeSet<String> = diff.removed.iter().map(|r| diff.logical_path(r)).collect();
     list.retain(|v| v.as_str().is_none_or(|p| !removed.contains(p)));
     let mut listed: BTreeSet<String> = list
         .iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
     let owned = diff.added.iter().chain(&diff.changed);
-    for rel in owned.filter(|rel| surfaces::records_ownership(rel)) {
+    for rel in owned
+        .map(|rel| diff.logical_path(rel))
+        .filter(|rel| surfaces::records_ownership(rel))
+    {
         if listed.insert(rel.clone()) {
-            list.push(Value::String(rel.clone()));
+            list.push(Value::String(rel));
         }
     }
 }

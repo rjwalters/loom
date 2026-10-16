@@ -86,6 +86,9 @@ pub struct TickReport {
     /// Where the step tick's wall time went, by phase (#12256). `None` when
     /// no step tick ran.
     pub phases: Option<crate::step_dispatch::gather_budget::TickPhases>,
+    /// The step tick's draws and passes by reason (#12410). `None` when no
+    /// step tick ran.
+    pub passes: Option<crate::step_dispatch::gather_budget::TickPasses>,
     /// What this tick's discovery snapshot cost and covered (#12306). `None`
     /// when no step tick ran.
     pub discovery: Option<crate::discovery::SnapshotStats>,

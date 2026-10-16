@@ -12,6 +12,7 @@ mod fact_id;
 mod fleet_state;
 mod host_export;
 mod host_resource;
+mod host_status;
 mod issue_estimate;
 mod metadata;
 mod operator_presence;
@@ -21,6 +22,7 @@ mod pass;
 mod pick_decision;
 mod prompt_tree;
 mod role_draw;
+mod roster_change;
 mod scope_memory;
 mod session_output;
 mod token_ranking;
@@ -582,6 +584,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::HostExport(_)
         | TelemetryRecord::CheckoutExternalChange(_)
+        | TelemetryRecord::RosterChange(_)
         | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::FleetState(_)
@@ -602,6 +605,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| token_ranking::log_parts(r))
                 .or_else(|| host_export::log_parts(r))
                 .or_else(|| checkout_external_change::log_parts(r))
+                .or_else(|| roster_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
@@ -1034,6 +1038,7 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             samples
         }
         TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),
+        TelemetryRecord::HostStatus(r) => host_status::samples(r, time_unix_nano),
         // Every kind that is not declared `otlp: Gauges` in
         // `telemetry/kinds.rs` produces no gauge here:
         //   - every lifecycle-shaped kind — including `role_tick.outcome`

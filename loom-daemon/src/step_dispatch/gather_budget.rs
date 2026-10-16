@@ -49,6 +49,33 @@ pub struct TickPhases {
     pub spawn_parts: SpawnParts,
 }
 
+/// A tick's draws and passes (#12410): why a tick with free slots made few
+/// spawn attempts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickPasses {
+    /// Item draws taken, across workspaces.
+    pub draws: usize,
+    /// Draws that never reached the spawner: a repo at its cap or a second
+    /// merge in a repo.
+    pub draws_unspawned: usize,
+    /// Passes by reason (`claim_lost`, `merge_in_flight`, ...).
+    pub by_reason: std::collections::BTreeMap<String, usize>,
+}
+
+impl TickPasses {
+    /// The tick span's `loom.dispatch.passes` value: `reason=count` pairs,
+    /// comma-joined in reason order. Refusal reasons are an open set, so
+    /// they ride one attribute value rather than a key each.
+    #[must_use]
+    pub fn render(&self) -> String {
+        self.by_reason
+            .iter()
+            .map(|(reason, n)| format!("{reason}={n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 /// Where the time inside a tick's spawns went (#12298), in milliseconds
 /// summed over its attempts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -107,10 +134,37 @@ pub fn spawn_concurrency_from(effective: &serde_json::Value) -> usize {
         })
 }
 
-/// The gather concurrency for the daemon rooted at `root`, read live.
+/// The gather concurrency for the daemon rooted at `root`, read live. Only
+/// the Direct backend lists per repo, so only it takes
+/// `autonomous.workFinder.gatherConcurrency` (#12307).
 #[must_use]
 pub fn gather_concurrency(root: &std::path::Path) -> usize {
-    gather_concurrency_from(&crate::config_resolver::resolve_effective_config(root))
+    gather_concurrency_for(&crate::config_resolver::resolve_effective_config(root))
+}
+
+/// [`gather_concurrency`] for an effective config. On the mirror's worklist
+/// the gather reads one in-memory snapshot, so the key has nothing to
+/// bound: it is ignored (the gather is serial) and, when set, a warning says
+/// so once.
+#[must_use]
+pub fn gather_concurrency_for(effective: &serde_json::Value) -> usize {
+    if crate::discovery::Chain::from_effective(effective).backend()
+        != crate::discovery::BackendKind::Mirror
+    {
+        return gather_concurrency_from(effective);
+    }
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let set =
+        crate::config_resolver::get_path(effective, "autonomous.workFinder.gatherConcurrency")
+            .is_some_and(|v| !v.is_null());
+    if set && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::warn!(
+            "autonomous.workFinder.gatherConcurrency is ignored while forge.mirror.discovery = \
+             \"worklist\": the gather reads the tick's one snapshot, not one listing per repo \
+             (#12307)"
+        );
+    }
+    1
 }
 
 /// The spawn concurrency for the daemon rooted at `root`, read live

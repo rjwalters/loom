@@ -10,9 +10,11 @@
 //!   Between listings the tick draws from the repo's last listing. This
 //!   covers the failed worklist and a repo that stays `unknown` or `error`.
 //! - **A failed listing is paced too**: it is not retried until the backstop
-//!   passes, and the repo reads `none` meanwhile (no draw). Only a `reserve`
-//!   refusal (the gateway protecting its pool) draws from the last listing,
-//!   and it is retried on the next tick.
+//!   passes, and the repo reads `none` meanwhile (no draw). A `breaker` skip
+//!   sent no request, so it is not paced: it reads `none` for that tick and
+//!   is retried on the next. Only a `reserve` refusal (the gateway
+//!   protecting its pool) draws from the last listing, and it is retried on
+//!   the next tick.
 //! - **Held in memory only**, like the 304 cache: dropped on restart, never
 //!   persisted.
 
@@ -40,7 +42,7 @@ pub enum Served {
     Paced(Arc<RepoSnapshot>),
     /// The listing failed with `reason` and the last good listing (if any)
     /// stands in. Only a `reserve` refusal draws from it; any other failure
-    /// is `None` below.
+    /// is `Failed` below (`breaker` unpaced, `listing` paced).
     Stale(Arc<RepoSnapshot>, ListFailure),
     /// No listing and nothing to draw from: tier `none` for the repo.
     Failed(ListFailure),
@@ -133,9 +135,11 @@ impl Fallback {
         let reserve = failure.reason == "reserve";
         // A reserve refusal is the gateway protecting its pool, not this
         // repo failing: it is retried the next tick (the first tier is tried
-        // again each tick) and the last listing stands in. Every other
-        // failure is paced.
-        if !reserve {
+        // again each tick) and the last listing stands in. A breaker skip
+        // sent nothing, so there is no request load to pace: it is retried
+        // the next tick too, serving `Failed` meanwhile. Every other failure
+        // is paced.
+        if !reserve && failure.reason != "breaker" {
             self.repos.insert(
                 key.to_string(),
                 Entry {
