@@ -794,6 +794,35 @@ async fn mirror_listing(root: &Path, slug: &str, label: &'static str) -> Option<
     .flatten()
 }
 
+/// Every open row carrying a hold or park label, from the state mirror (all
+/// pages, one labelled listing per label), for `loom.forge.hold_*` (#12038).
+/// `None` unless the mirror is live and served every listing fresh: there is
+/// no REST fallback, so such a repo emits no hold points.
+async fn mirror_hold_rows(root: &Path, slug: &str) -> Option<Vec<RestIssue>> {
+    use crate::forge_mirror::discovery::{list_open, Caller, Pages};
+    if !crate::forge_mirror::is_active() {
+        return None;
+    }
+    let (root, slug) = (root.to_path_buf(), slug.to_string());
+    tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        for label in super::hold_age::hold_labels() {
+            rows.extend(list_open(
+                crate::forge_events::poll_gate::ReadKind::Discovery,
+                Caller::StageDwell,
+                Some(&root),
+                Some(&slug),
+                Some(label),
+                Pages::All,
+            )?);
+        }
+        Some(rows)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Sample every managed repo's stage listings and export the dwell points.
 /// A no-op (no forge reads at all) without the OTLP ops sink, or while
 /// `settings` says off or not yet due (#12203).
@@ -813,6 +842,8 @@ pub(in crate::observability) async fn record(
     let mut left_to_captain = Vec::new();
     // #12027: the repos whose `pr_refused` this host reports (stage_queue).
     let mut refused = Vec::new();
+    // #12038: the hold gauges, from the mirror only.
+    let mut holds = Vec::new();
     for root in crate::observability::collector::provisioned_roots(workspace_pool) {
         let root_str = root.to_string_lossy().to_string();
         let Some(slug) =
@@ -828,6 +859,9 @@ pub(in crate::observability) async fn record(
             refused.push((root.clone(), slug.clone()));
             left_to_captain.push(slug);
             continue;
+        }
+        if let Some(rows) = mirror_hold_rows(&root, &slug).await {
+            holds.extend(super::hold_age::points_from_mirror(&slug, &rows, Utc::now()));
         }
         let mut input = RepoInput {
             slug,
@@ -891,6 +925,9 @@ pub(in crate::observability) async fn record(
         drop(guard);
         for batch in stage_batches(&samples, &inputs) {
             sink.emit_metrics_since(batch, previous);
+        }
+        for batch in holds.chunks(crate::telemetry::ops::MAX_POINTS_PER_RECORD) {
+            sink.emit_metrics(batch.to_vec());
         }
         let refused = super::stage_queue::refused_points_for(&refused, Utc::now());
         for batch in refused.chunks(crate::telemetry::ops::MAX_POINTS_PER_RECORD) {

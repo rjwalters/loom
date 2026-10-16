@@ -480,8 +480,9 @@ processors:
           # minted under — one per account/owner, so no new series).
           # loom.forge.calls (#10607) adds agent (an agent role, `-` for the daemon).
           # loom.forge.calls adds route (gateway|direct_read|direct|none: how a call reached GitHub).
+          # loom.forge.hold_items / hold_age_seconds (#12038) add artifact, hold, basis, stat.
           # loom.forge.calls adds purpose (#12310: discovery|gate|write|hygiene|observability|unknown).
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "kind", "container", "installation", "agent", "route", "purpose"])
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "kind", "container", "installation", "agent", "route", "purpose", "artifact", "hold", "basis", "stat"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318
