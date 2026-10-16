@@ -2788,7 +2788,7 @@ Un-evaluated issues get no record by design (about 650 rows per tick).
 **Volume.** The step path emits one record per step end, no-ops included. The
 role-tick path emits one per marker or merge act. There is no heartbeat.
 
-**Gauge (D2).** `loom.forge.stage_items{state="pr_refused", reason}` counts open
+**Gauge (D2).** **Off by default** (#12203): the `pr_refused` points are emitted by the stage-dwell sampler, so they are absent unless `observability.stageDwell.enabled` is `true`. `loom.forge.stage_items{state="pr_refused", reason}` counts open
 `loom:pr` PRs on a still-current head that Champion is refusing, and
 `loom.forge.stage_oldest_age_seconds{state="pr_refused", reason, repo}` is
 `now - min(first_refused_at)`. The refusal store is per host (a host-local JSON
