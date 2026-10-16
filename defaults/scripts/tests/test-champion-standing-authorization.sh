@@ -227,6 +227,101 @@ assert_doc_contains "$CHAMPION_MD" \
     "champion-pr-merge.md's greenCi condition reuses criterion #6's read_ci_checks rather than a second, divergent implementation"
 
 echo
+echo "--- #12528: the shipped standing_auth_eval, executed with stubbed forge reads ---"
+
+# Extract the REAL function and KEPT_SET_PATTERNS from the doc and run them,
+# so the decision is tested rather than mirrored.
+EVAL_SRC="$(mktemp)"
+CFG_DIR="$(mktemp -d)"
+trap 'rm -f "$EVAL_SRC"; rm -rf "$CFG_DIR"' EXIT
+awk '/^KEPT_SET_PATTERNS=\(/{p=1} p{print} /^standing_auth_eval any$/{exit}' "$CHAMPION_MD" | sed '$d' >"$EVAL_SRC"
+
+# run_eval <mode> <config-json> <files> <patches-json> <ci: green|red> <labels>
+# patches-json is the files-API body the stubbed `gh api` returns.
+run_eval() {
+    local mode="$1" cfg="$2" files="$3" api="$4" ci="$5" labels="$6"
+    printf '%s' "$cfg" >"$CFG_DIR/config.json"
+    (
+        CONFIG_FILE="$CFG_DIR/config.json"
+        PR_NUMBER=1
+        FAST_PATH_FILES="$files"
+        LABELS="$labels"
+        gh() { if [ -n "$api" ]; then printf '%s' "$api"; else return 1; fi; }
+        read_ci_checks() {
+            NO_CHECKS=false
+            if [ "$ci" = "green" ]; then CHECKS='[{"name":"t","bucket":"pass"}]'; else CHECKS='[{"name":"t","bucket":"fail"}]'; fi
+        }
+        # shellcheck disable=SC1090
+        source "$EVAL_SRC"
+        standing_auth_eval "$mode"
+        echo "$STANDING_AUTH_RESULT:$STANDING_AUTH_ID"
+    )
+}
+
+CI_CLASS='{"champion":{"standingAuthorizations":[{"id":"ci-steps","filePatterns":[".github/workflows/*.yml"],"conditions":["judgeApproval","greenCi"],"coversCriticalFiles":true,"excludeFilePatterns":[".github/workflows/*publish*"],"forbiddenDiffPatterns":["^\\s*permissions:","secrets\\."]}]}}'
+CI_CLASS_NOFLAG='{"champion":{"standingAuthorizations":[{"id":"ci-steps","filePatterns":[".github/workflows/*.yml"],"conditions":["judgeApproval","greenCi"]}]}}'
+OKPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+# a comment"}]'
+PERMPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+permissions: write-all"}]'
+NOPATCH='[{"filename":".github/workflows/ci.yml"}]'
+WF=".github/workflows/ci.yml"
+
+out="$(run_eval critical "$CI_CLASS" "$WF" "$OKPATCH" green "loom:pr")"
+assert_eq "ELIGIBLE:ci-steps" "$out" "covering class, whole diff in class, approved + green CI: criterion #3 passes, class named"
+
+out="$(run_eval critical "$CI_CLASS" "$(printf '%s\nCargo.toml' "$WF")" "$OKPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "one file outside the class restores FAIL"
+
+out="$(run_eval critical "$CI_CLASS" ".github/workflows/publish.yml" "$OKPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "an excludeFilePatterns file restores FAIL"
+
+out="$(run_eval critical "$CI_CLASS" "$WF" "$PERMPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a forbiddenDiffPatterns line restores FAIL"
+
+out="$(run_eval critical "$CI_CLASS" "$WF" "$NOPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a changed file with no patch (unreadable diff) fails closed"
+
+out="$(run_eval critical "$CI_CLASS" "$WF" "" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a failed files-API read fails closed"
+
+out="$(run_eval critical "$CI_CLASS" "$WF" "$OKPATCH" red "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "red CI (greenCi does not hold) restores FAIL"
+
+out="$(run_eval critical "$CI_CLASS" "$WF" "$OKPATCH" green "loom:review-requested")"
+assert_eq "NOT ELIGIBLE:" "$out" "no Judge approval (judgeApproval does not hold) restores FAIL"
+
+out="$(run_eval critical "$CI_CLASS_NOFLAG" "$WF" "$OKPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a class without coversCriticalFiles never passes criterion #3"
+
+out="$(run_eval any "$CI_CLASS_NOFLAG" "$WF" "$OKPATCH" green "loom:pr")"
+assert_eq "ELIGIBLE:ci-steps" "$out" "criterion #2 behavior of a class without the new keys is unchanged"
+
+BAD_FLAG="${CI_CLASS/\"coversCriticalFiles\":true/\"coversCriticalFiles\":\"true\"}"
+out="$(run_eval critical "$BAD_FLAG" "$WF" "$OKPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a non-boolean coversCriticalFiles does not opt in"
+
+# Kept set: never satisfiable, even when the class names the path and sets the flag.
+for kept in defaults/hooks/guard-x.sh defaults/scripts/merge-pr.sh defaults/scripts/install-loom.sh \
+    defaults/scripts/resync-installed.sh defaults/scripts/spawn-claude.sh \
+    defaults/.claude/commands/loom/champion-pr-merge.md .github/labels.yml db/migrations/001.sql; do
+    KEPT_CFG="{\"champion\":{\"standingAuthorizations\":[{\"id\":\"all\",\"filePatterns\":[\"*\"],\"conditions\":[\"judgeApproval\"],\"coversCriticalFiles\":true}]}}"
+    out="$(run_eval critical "$KEPT_CFG" "$kept" "" green "loom:pr")"
+    assert_eq "NOT ELIGIBLE:" "$out" "kept-set path $kept is never waived, even by a class matching everything"
+done
+
+out="$(run_eval any "$KEPT_CFG" "defaults/hooks/guard-x.sh" "" green "loom:pr")"
+assert_eq "ELIGIBLE:all" "$out" "kept-set floor is critical-mode only: criterion #2 class behavior is unchanged"
+
+echo
+echo "--- Doc pins: #12528 ---"
+assert_doc_contains "$CHAMPION_MD" '`coversCriticalFiles` (#12528' "champion-pr-merge.md documents coversCriticalFiles"
+assert_doc_contains "$CHAMPION_MD" '`excludeFilePatterns` (#12528' "champion-pr-merge.md documents excludeFilePatterns"
+assert_doc_contains "$CHAMPION_MD" '`forbiddenDiffPatterns` (#12528' "champion-pr-merge.md documents forbiddenDiffPatterns"
+assert_doc_contains "$CHAMPION_MD" "standing_auth_eval critical" "criterion #3 runs the class check before it emits FAIL"
+assert_doc_contains "$CHAMPION_MD" "Revertability counts only what happens on merge or roll (#12528)" "revertability-axis sentence is present"
+assert_doc_contains "$CHAMPION_MD" "No standing authorization satisfies the kept set (#12528)" "kept set restated as never satisfiable"
+assert_doc_contains "$PROMPT_DIR/champion-critical-file-hold.md" "A covering standing authorization means no hold (#12528)" "champion-critical-file-hold.md documents the covering class"
+
+echo
 echo "--- Doc pins: champion-reference.md documents the new mechanism ---"
 
 assert_doc_contains "$CHAMPION_REF_MD" \
