@@ -458,3 +458,85 @@ fn switched_on_it_samples_every_pass_or_every_interval() {
     }));
     assert_eq!(zero.interval_secs, None);
 }
+
+// ---- #12219: off means no forge call, end to end ---------------------------
+
+/// Telemetry offered to the global sink, which a test cannot read back
+/// otherwise.
+#[derive(Default)]
+struct SinkQueue(std::sync::Mutex<Vec<String>>);
+
+impl crate::observability::queue::QueueSink for SinkQueue {
+    fn offer(&self, envelope: crate::telemetry::TelemetryEnvelope) {
+        self.0.lock().unwrap().push(format!("{envelope:?}"));
+    }
+    fn offer_durable(&self, envelope: crate::telemetry::TelemetryEnvelope) -> std::io::Result<()> {
+        self.offer(envelope);
+        Ok(())
+    }
+}
+
+/// One full collector forge-gather pass over a workspace whose config sets
+/// `observability.stageDwell.enabled` to `enabled` (absent for `None`), with
+/// a `gh` that logs every call. Returns the `gh` call log and what the global
+/// sink was offered.
+async fn forge_gather_pass(enabled: Option<bool>) -> (String, Vec<String>) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    let config = match enabled {
+        Some(on) => serde_json::json!({"observability": {"stageDwell": {"enabled": on}}}),
+        None => serde_json::json!({}),
+    };
+    std::fs::write(root.join(".loom/config.json"), config.to_string()).unwrap();
+    let (gh, log) = (dir.path().join("gh"), dir.path().join("gh.log"));
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+             [ \"$1\" = repo ] && echo o/repo && exit 0\necho '[]'\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _gh = crate::gh_invocation::resolver::test_stub::GhBinGuard::set(&gh);
+
+    let queue = std::sync::Arc::new(SinkQueue::default());
+    crate::observability::ops::register_global_ops_sink(crate::observability::ops::OpsSink::new(
+        queue.clone(),
+        "host-a",
+    ));
+    let pool = crate::workspace_pool::WorkspacePool::new(
+        std::sync::Arc::new(crate::event_bus::EventBus::new()),
+        tokio::runtime::Handle::current(),
+    );
+    let _registry = pool.get_or_provision(&root);
+    crate::observability::captain_gauges::forge_gauges(&root, &pool, &mut Default::default()).await;
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let offered = queue.0.lock().unwrap().clone();
+    (calls, offered)
+}
+
+#[tokio::test]
+async fn switched_off_a_full_forge_gather_pass_makes_no_gh_call_and_emits_no_stage_point() {
+    // Unset and explicit `false` are the same default.
+    for enabled in [None, Some(false)] {
+        let (calls, offered) = forge_gather_pass(enabled).await;
+        assert_eq!(calls, "", "stage dwell off ({enabled:?}) must not call gh");
+        assert!(
+            offered
+                .iter()
+                .all(|e| !e.contains("stage_dwell") && !e.contains("stage_items")),
+            "stage dwell off ({enabled:?}) emitted a stage point: {offered:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn switched_on_the_same_pass_does_call_gh() {
+    // Pins the test above to a seam that sees calls, so it cannot pass vacuously.
+    let (calls, _) = forge_gather_pass(Some(true)).await;
+    assert!(!calls.is_empty(), "stage dwell on made no gh call");
+}

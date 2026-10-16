@@ -3218,6 +3218,27 @@ fn extract_verdict_sha_filters_on_verdict_kind() {
 }
 
 #[test]
+fn extract_verdict_sha_accepts_the_tolerated_spellings() {
+    // A hand-posted or in-session marker may say `approve` /
+    // `request-changes`; readers are lenient, writers stay canonical.
+    let bodies = vec![marker(SHA_A, "request-changes"), marker(SHA_B, "approve")];
+    assert_eq!(
+        extract_latest_verdict_sha(&bodies, VerdictKind::Approved),
+        Some(SHA_B.to_string())
+    );
+    assert_eq!(
+        extract_latest_verdict_sha(&bodies, VerdictKind::ChangesRequested),
+        Some(SHA_A.to_string())
+    );
+    // Mixed spellings in one PR resolve to the newest.
+    let mixed = vec![marker(SHA_A, "approved"), marker(SHA_B, "approve")];
+    assert_eq!(
+        extract_latest_verdict_sha(&mixed, VerdictKind::Approved),
+        Some(SHA_B.to_string())
+    );
+}
+
+#[test]
 fn extract_verdict_sha_is_none_without_a_marker_of_that_kind() {
     let bodies = vec!["LGTM, approving.".to_string(), marker(SHA_A, "approved")];
     assert_eq!(extract_latest_verdict_sha(&bodies, VerdictKind::ChangesRequested), None);
