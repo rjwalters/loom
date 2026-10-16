@@ -6870,6 +6870,7 @@ Two env vars now cover both the log path and the socket path:
 |---------|---------|---------|
 | `LOOM_DAEMON_LOG` | Full override of the daemon log file path | `<loom dir>/daemon.log` |
 | `LOOM_SOCKET_PATH` | Full override of the daemon's IPC socket path; also implicitly derives the log path (below) when `LOOM_DAEMON_LOG` is unset | `<loom dir>/loom-daemon.sock` |
+| `LOOM_ALLOW_PARALLEL_DAEMON` | `1` lets a second daemon start even though a live loom-daemon already owns the same non-scratch pid file (#9816); without it startup is refused. Scratch-rooted pid files are never refused | unset |
 
 Precedence is **env > default only** (no `autonomous.*` config tier) — `resolve_log_path()`
 checks `LOOM_DAEMON_LOG` first, then falls back to `resolve_loom_dir().join("daemon.log")`,
