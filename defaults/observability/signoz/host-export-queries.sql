@@ -11,7 +11,7 @@
 -- post-reset value, never a negative delta), which stays correct for either
 -- shape.
 --
--- STATUS: queries 1-3 are executed verbatim against the pinned ClickHouse by
+-- STATUS: queries 1-3 and 5 are executed verbatim against the pinned ClickHouse by
 -- loom-daemon/tests/signoz_host_export_queries.rs (CI runs it with --ignored).
 
 -- 1. Hosts with drops in the last 2 h, worst first. Each host's latest sample
@@ -234,3 +234,74 @@ SELECT s.host AS host, s.exporter AS exporter, s.versions AS versions,
        r.reason AS reason, r.reason_delta AS reason_delta
 FROM summary AS s INNER JOIN reason_rows AS r ON s.host = r.host AND s.exporter = r.exporter
 ORDER BY delta DESC, host, exporter, reason_delta DESC;
+
+-- 5. Per-host last state: running / stopped / silent (Issue #10023). One row
+--    per roster host, from the same roster and thresholds as query 3 (paste
+--    the same rows between the markers; the committed rows are placeholders).
+--    The three lifecycle signals the daemon already emits, no new record kinds:
+--      daemon.start  loom.kind = 'daemon.event', loom.topic = 'daemon.start'
+--      daemon.exit   loom.kind = 'daemon.exit' (clean, deliberate exit only)
+--      host.export   loom.kind = 'host.export' (the heartbeat; one per
+--                    host.health interval, carrying queue_depth, dropped_total
+--                    and last_flush_ok_at)
+--      stopped  the latest daemon.exit is newer than the latest daemon.start
+--               (or no start is in the lookback): the daemon said it was going.
+--      running  not stopped, and a host.export inside the host's threshold.
+--               A start with no later exit and a fresh host.export is running,
+--               including a restart after a crash (two starts, no exit between).
+--      silent   not stopped and no host.export inside the threshold: crashed,
+--               SIGKILLed, power loss, asleep, or export failing. Nothing
+--               distinguishes these by absence alone; `cause` does the one
+--               split the data allows, as in query 3: other Loom logs inside
+--               the threshold = exporter_silent (export failing, host up),
+--               none = host_silent (host down or asleep). `cause` is NULL
+--               unless state = 'silent'.
+--    A daemon that exits cleanly while its host.export is still inside the
+--    threshold is `stopped`, not `running`. A host with no signal in the 48 h
+--    lookback is `silent` (last_export NULL). The host key is `host.name`,
+--    falling back to `host.id`.
+WITH roster AS (
+    SELECT host, telemetry
+    FROM values('host String, telemetry String',
+        /* loom:roster:begin */
+        ('example-always', 'always'), ('example-when-awake', 'when_awake')
+        /* loom:roster:end */
+    )
+),
+seen AS (
+    SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
+           maxIf(timestamp, attributes_string['loom.kind'] = 'host.export') AS last_export_ns,
+           maxIf(timestamp, attributes_string['loom.kind'] = 'daemon.event'
+                            AND attributes_string['loom.topic'] = 'daemon.start') AS last_start_ns,
+           maxIf(timestamp, attributes_string['loom.kind'] = 'daemon.exit') AS last_exit_ns,
+           maxIf(timestamp, attributes_string['loom.kind'] NOT IN ('', 'host.export', 'daemon.exit')) AS last_other_ns
+    FROM signoz_logs.distributed_logs_v2
+    WHERE timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 48 HOUR)
+    GROUP BY host
+),
+judged AS (
+    SELECT r.host AS host,
+           r.telemetry AS telemetry,
+           if(r.telemetry = 'always', 900, 86400) AS threshold_seconds,
+           toInt64(ifNull(s.last_export_ns, 0)) AS le_ns,
+           toInt64(ifNull(s.last_start_ns, 0)) AS ls_ns,
+           toInt64(ifNull(s.last_exit_ns, 0)) AS lx_ns,
+           toInt64(ifNull(s.last_other_ns, 0)) AS lo_ns,
+           toInt64(toUnixTimestamp64Nano(now64(9))) AS now_ns
+    FROM roster AS r
+    LEFT JOIN seen AS s ON r.host = s.host
+)
+SELECT host,
+       telemetry,
+       multiIf(lx_ns > 0 AND lx_ns > ls_ns, 'stopped',
+               le_ns > 0 AND intDiv(now_ns - le_ns, 1000000000) <= threshold_seconds, 'running',
+               'silent') AS state,
+       if(ls_ns = 0, NULL, fromUnixTimestamp64Nano(ls_ns)) AS last_start,
+       if(lx_ns = 0, NULL, fromUnixTimestamp64Nano(lx_ns)) AS last_exit,
+       if(le_ns = 0, NULL, fromUnixTimestamp64Nano(le_ns)) AS last_export,
+       if(state = 'silent',
+          if(lo_ns > 0 AND intDiv(now_ns - lo_ns, 1000000000) <= threshold_seconds,
+             'exporter_silent', 'host_silent'),
+          NULL) AS cause
+FROM judged
+ORDER BY host;

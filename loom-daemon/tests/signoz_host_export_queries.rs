@@ -45,16 +45,30 @@ fn alert_query() -> String {
 }
 
 fn roster_of(text: &str) -> &str {
-    assert_eq!(text.matches(BEGIN).count(), 1, "one begin marker");
-    assert_eq!(text.matches(END).count(), 1, "one end marker");
-    let (_, rest) = text.split_once(BEGIN).unwrap();
-    rest.split_once(END).unwrap().0
+    let begins = text.matches(BEGIN).count();
+    assert!(begins >= 1, "a begin marker");
+    assert_eq!(text.matches(END).count(), begins, "one end marker per begin marker");
+    let mut rosters = text
+        .split(BEGIN)
+        .skip(1)
+        .map(|rest| rest.split_once(END).unwrap().0);
+    let first = rosters.next().unwrap();
+    for other in rosters {
+        assert_eq!(other, first, "every query's roster must be the same rows");
+    }
+    first
 }
 
 fn with_roster(text: &str, roster: &str) -> String {
-    let (head, rest) = text.split_once(BEGIN).unwrap();
-    let (_, tail) = rest.split_once(END).unwrap();
-    format!("{head}{BEGIN} {roster} {END}{tail}")
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some((head, tail)) = rest.split_once(BEGIN) {
+        let (_, after) = tail.split_once(END).unwrap();
+        out.push_str(&format!("{head}{BEGIN} {roster} {END}"));
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 // ---------------------------------------------------------------- static ----
@@ -117,6 +131,23 @@ fn committed_roster_rows_are_valid() {
         assert!(!cells[0].is_empty());
         assert!(["always", "when_awake"].contains(&cells[1]), "telemetry {:?}", cells[1]);
     }
+}
+
+#[test]
+fn state_query_reuses_the_roster_and_names_every_state() {
+    let q = sql_query(5);
+    assert_eq!(roster_of(&q), roster_of(SQL), "query 5 uses query 3's roster rows");
+    assert!(q.contains("900") && q.contains("86400"), "query 3's thresholds");
+    for word in [
+        "'running'",
+        "'stopped'",
+        "'silent'",
+        "'exporter_silent'",
+        "'host_silent'",
+    ] {
+        assert!(q.contains(word), "{word}");
+    }
+    assert!(q.contains("daemon.start") && q.contains("daemon.exit") && q.contains("host.export"));
 }
 
 #[test]
@@ -251,6 +282,50 @@ fn replayed_queries_find_silent_roster_hosts_and_drop_steps() {
         .collect();
     let want_alert: BTreeSet<String> = expect.keys().cloned().collect();
     assert_eq!(fired, want_alert);
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn replayed_state_query_reads_running_stopped_and_silent() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
+    let fixture = include_str!("fixtures/signoz_host_export/host_state.sql");
+    let roster = "('s-run','always'), ('s-stop','always'), ('s-expfail','always'), \
+('s-restart','always'), ('s-crash','always'), ('s-back','always'), ('s-never','always'), \
+('s-laptop','when_awake')";
+    let out = rows(&clickhouse(&format!("{fixture}\n{}", with_roster(&sql_query(5), roster))));
+    let got: BTreeMap<String, (String, Option<String>)> = out
+        .iter()
+        .map(|r| {
+            (
+                r["host"].as_str().unwrap().to_owned(),
+                (r["state"].as_str().unwrap().to_owned(), r["cause"].as_str().map(str::to_owned)),
+            )
+        })
+        .collect();
+    let want: BTreeMap<String, (String, Option<String>)> = [
+        ("s-run", "running", None),
+        ("s-stop", "stopped", None),
+        ("s-expfail", "silent", Some("exporter_silent")),
+        ("s-restart", "running", None), // restart after a crash: two starts, no exit
+        ("s-crash", "silent", Some("host_silent")),
+        ("s-back", "running", None), // exit, then a later start
+        ("s-never", "silent", Some("host_silent")),
+        ("s-laptop", "running", None), // when_awake: 16 h < 24 h
+    ]
+    .into_iter()
+    .map(|(h, s, c)| (h.to_owned(), (s.to_owned(), c.map(str::to_owned))))
+    .collect();
+    assert_eq!(got, want, "one row per roster host; s-off is not on the roster");
+    let never = out.iter().find(|r| r["host"] == "s-never").unwrap();
+    assert!(
+        never["last_start"].is_null()
+            && never["last_exit"].is_null()
+            && never["last_export"].is_null()
+    );
+    let stop = out.iter().find(|r| r["host"] == "s-stop").unwrap();
+    assert!(!stop["last_exit"].is_null() && !stop["last_start"].is_null());
 }
 
 #[test]

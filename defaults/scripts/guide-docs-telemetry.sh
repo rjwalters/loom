@@ -103,7 +103,16 @@ GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null) || {
 REPO_ROOT=$(cd "$(dirname "$GIT_COMMON_DIR")" && pwd -P)
 LOG_FILE="${LOOM_GUIDE_DOCS_TELEMETRY_LOG:-$REPO_ROOT/.loom/logs/guide-docs-telemetry.jsonl}"
 
-HOST_ID="${LOOM_HOST_ID:-${HOSTNAME:-$(hostname 2>/dev/null || echo unknown-host)}}"
+# Host id comes from `loom-daemon host-id` (the daemon's own resolver: config >
+# $LOOM_HOST_ID > persisted id, never the hostname) so these envelopes land under
+# the same SigNoz host.id as the daemon's. A non-zero exit (no identity) keeps the
+# `unknown-host` literal; with no loom-daemon on PATH, the prior chain applies.
+if command -v loom-daemon >/dev/null 2>&1; then
+    HOST_ID="$(loom-daemon host-id 2>/dev/null)" || HOST_ID=""
+    HOST_ID="${HOST_ID:-unknown-host}"
+else
+    HOST_ID="${LOOM_HOST_ID:-${HOSTNAME:-$(hostname 2>/dev/null || echo unknown-host)}}"
+fi
 
 # --- Portable duration-string -> seconds -------------------------------------
 # Accepts a bare integer (seconds) or an integer with a single trailing unit

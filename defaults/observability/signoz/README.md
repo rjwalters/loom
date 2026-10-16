@@ -414,6 +414,23 @@ an unrendered import fires loudly instead of staying silently healthy. A host
 that never exported in the 48 h lookback is silent; `state` is
 `exporter_silent` (other Loom logs within its threshold) or `host_silent`.
 
+Query 5 (#10023) turns the lifecycle records the daemon already emits into
+one row per roster host: `state` is `running`, `stopped` or `silent`. It uses
+the same roster rows and thresholds as query 3 (paste the same rows at both
+markers in the file). `stopped` means the latest `daemon.exit` is newer than
+the latest `daemon.start`; a clean exit wins even while a `host.export` is
+still inside its threshold. `running` means not stopped with a `host.export`
+inside the threshold; a restart after a crash (two `daemon.start` with no
+`daemon.exit` between) reads as `running` once exports resume. `silent` means
+not stopped with no `host.export` inside the threshold. Crash, SIGKILL, power
+loss, sleep and a failing exporter all emit nothing, so the absence of
+`daemon.exit` is the signal and `silent` cannot tell them apart by itself. The
+`cause` column makes the one split the data allows: `exporter_silent` (other
+Loom logs inside the threshold: export failing, host up) versus `host_silent`
+(none: host down or asleep). `host.export` is the heartbeat (queue depth,
+durable `dropped_total`, `last_flush_ok_at` per exporter); no separate
+heartbeat record exists. Replay-tested in `signoz_host_export_queries.rs`.
+
 ### Pass activity
 
 `pass-queries.sql` (#10752) answers "what did the daemon's hold-cleanup pass
