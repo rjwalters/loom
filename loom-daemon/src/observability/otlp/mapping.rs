@@ -4,6 +4,7 @@
 
 mod auto_update;
 mod checkout_external_change;
+mod checkout_freshness;
 mod ci;
 mod daemon_event;
 mod daemon_exit;
@@ -25,7 +26,6 @@ mod role_draw;
 mod roster_change;
 mod scope_memory;
 mod session_output;
-mod session_prompt_tree;
 mod token_ranking;
 mod tokens_snapshot;
 mod work_started;
@@ -591,7 +591,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::FleetState(_)
         | TelemetryRecord::PickDecision(_)
         | TelemetryRecord::OperatorPresence(_)
-        | TelemetryRecord::SessionPromptTree(_) => {
+        | TelemetryRecord::CheckoutFreshness(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
             // Issue #10744: one token-ranking refresh round (the round's
@@ -612,7 +612,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
                 .or_else(|| operator_presence::log_parts(r))
-                .or_else(|| session_prompt_tree::log_parts(r))?;
+                .or_else(|| checkout_freshness::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)

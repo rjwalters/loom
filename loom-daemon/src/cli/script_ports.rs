@@ -34,8 +34,6 @@ pub(crate) enum ScriptPortCommand {
     CodexHooks(super::codex_hooks::CodexHooksCommand),
     /// Durable phase completion markers and trace observations (#8525).
     SweepCheckpoint(super::sweep_checkpoint::SweepCheckpointArgs),
-    /// Attended-session checkout freshness telemetry (#12509).
-    PromptTree(super::prompt_tree::PromptTreeArgs),
 
     /// Champion's dependency-classification family (PR 3):
     /// `classify-dependency-block`, `detect-dependency-cycle`,
@@ -657,7 +655,6 @@ impl ScriptPortCommand {
             ScriptPortCommand::SessionExec(args) => args.run(),
             ScriptPortCommand::PrivateWorkspace(args) => args.run(),
             ScriptPortCommand::SweepCheckpoint(args) => args.run(),
-            ScriptPortCommand::PromptTree(args) => args.run(),
             ScriptPortCommand::DepClassify(cmd) => cmd.run(),
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseFetch(args) => args.run(),

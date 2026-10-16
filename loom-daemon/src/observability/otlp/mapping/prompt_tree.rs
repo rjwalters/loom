@@ -29,6 +29,10 @@ pub(super) fn attributes(prompt: Option<&PromptTree>) -> Vec<KeyValue> {
     if let Some(tip) = &prompt.remote_tip {
         out.push(kv_string("loom.prompt.remote_tip", tip.clone()));
     }
+    if let Some(n) = prompt.commits_behind_remote {
+        let n = i64::try_from(n).unwrap_or(i64::MAX);
+        out.push(kv_int("loom.prompt.commits_behind_remote", n));
+    }
     for (key, flag) in [
         ("loom.prompt.origin_ref_stale", prompt.origin_ref_stale),
         ("loom.prompt.remote_foreign", prompt.remote_foreign),
@@ -62,6 +66,7 @@ mod tests {
             commits_behind: Some(121),
             on_branch: Some(false),
             remote_tip: Some("c".repeat(40)),
+            commits_behind_remote: Some(3),
             origin_ref_stale: Some(true),
             remote_repo: Some("o/r".to_string()),
             remote_foreign: Some(false),
@@ -75,6 +80,7 @@ mod tests {
                 "loom.prompt.commits_behind",
                 "loom.prompt.on_branch",
                 "loom.prompt.remote_tip",
+                "loom.prompt.commits_behind_remote",
                 "loom.prompt.origin_ref_stale",
                 "loom.prompt.remote_foreign",
                 "loom.prompt.remote_repo"

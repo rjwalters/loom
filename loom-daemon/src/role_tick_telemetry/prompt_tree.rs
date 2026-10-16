@@ -33,13 +33,19 @@ pub struct PromptTree {
     /// `false` when `HEAD` is detached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_branch: Option<bool>,
-    /// GitHub's tip of the default branch, as `git ls-remote` reported it
-    /// (#12509). Only the attended `session.prompt_tree` record fills it.
+    /// GitHub's tip of the default branch, as the daemon's checkout
+    /// fast-forward pass last heard it (#12509). Absent when no head was heard
+    /// recently: it is never fetched for this record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_tip: Option<String>,
+    /// Commits `HEAD` is missing from [`Self::remote_tip`]. Absent when the tip
+    /// is unknown or not in the object store, never 0 on doubt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits_behind_remote: Option<u64>,
     /// The clone's local `origin/<default>` ref disagrees with
     /// [`Self::remote_tip`] (or does not exist): the remote-tracking ref is
-    /// stale or divergent, so a count against it would under-report.
+    /// stale or divergent, so `commits_behind` would under-report. Absent when
+    /// `remote_tip` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_ref_stale: Option<bool>,
     /// `owner/repo` of the `origin` remote, never a full URL or userinfo.
@@ -55,6 +61,11 @@ pub struct PromptTree {
 /// or a timeout (#12111).
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     git::ok(root, args, LOCAL_TIMEOUT).ok()
+}
+
+/// `root`'s `origin` URL, for classification only: it must not be exported.
+pub(crate) fn git_remote_url(root: &Path) -> Option<String> {
+    git(root, &["remote", "get-url", "origin"])
 }
 
 /// Read the prompt tree of `root`. `None` when `root` is not a git checkout.
@@ -82,7 +93,6 @@ pub fn read(root: &Path) -> Option<PromptTree> {
 }
 
 pub mod remote;
-pub mod session;
 
 #[cfg(test)]
 #[path = "prompt_tree_tests.rs"]

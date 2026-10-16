@@ -216,7 +216,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
 | [`host.status`](#hoststatus) | gauges, OTLP only | `host_status.rs` (sampler), `observability/collector.rs`, `observability/otlp/mapping/host_status.rs` |
 | [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
-| [`session.prompt_tree`](#sessionprompt_tree) | log, OTLP only | `loom-daemon prompt-tree session-start` (user-scope `SessionStart` hook) → `observability/otlp/mapping/session_prompt_tree.rs` |
+| [`checkout.freshness`](#checkoutfreshness) | log, OTLP only | `fleet_sync/checkout_ff` pass → `observability/otlp/mapping/checkout_freshness.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` Deny branch) |
@@ -1352,7 +1352,7 @@ gradeable by a model or prompt experiment.
 | `tokens_by_model` | array | no | Same grouped, raw (not cost-weighted) shape as `sweep.outcome`'s `tokens_by_model`, summed from the tick's own transcripts. |
 | `models_used` | string array | no | The distinct model ids in `tokens_by_model`, sorted and deduped — "did this tick's session escalate past the model it was launched with?" |
 | `actions` | object | no | Forge-mutating work observed in the transcripts: `issues_labeled`, `prs_merged`, `comments_posted`. |
-| `prompt` | object | no | The checkout the session read its `/loom:<role>` prompt from, as it stood immediately before the spawn (#11989): `commit` (HEAD, full SHA), `loom_version` (the working tree's `.loom/install-metadata.json`), `commits_behind` (HEAD's distance behind the clone's `origin/<default>`) and `on_branch` (`false` for a detached HEAD); each inner key is absent when it cannot be read. Absent on a tick that never resolved a launch. OTLP: `loom.prompt.commit`, `loom.prompt.loom_version`, `loom.prompt.commits_behind`, `loom.prompt.on_branch`, so a role running stale prompts is `loom.prompt.commits_behind > 0`. Here `commits_behind` is against the local `origin/<default>` ref; the attended [`session.prompt_tree`](#sessionprompt_tree) measures against GitHub's tip (#12509). Additive, no `schema_version` bump. |
+| `prompt` | object | no | The checkout the session read its `/loom:<role>` prompt from, as it stood immediately before the spawn (#11989): `commit` (HEAD, full SHA), `loom_version` (the working tree's `.loom/install-metadata.json`), `commits_behind` (HEAD's distance behind the clone's `origin/<default>`), `on_branch` (`false` for a detached HEAD) and the remote fields of [`checkout.freshness`](#checkoutfreshness) (`remote_tip`, `commits_behind_remote`, `origin_ref_stale`, `remote_repo`, `remote_foreign`); each inner key is absent when it cannot be read. Absent on a tick that never resolved a launch. OTLP: `loom.prompt.commit`, `loom.prompt.loom_version`, `loom.prompt.commits_behind`, `loom.prompt.on_branch` and the remote fields' `loom.prompt.*` keys, so a role running stale prompts is `loom.prompt.commits_behind > 0`. Here `commits_behind` is against the local `origin/<default>` ref; `commits_behind_remote` measures against GitHub's tip from the head the daemon last heard (#12509). Additive, no `schema_version` bump. |
 | `source` | string | no | `step` when a step-engine step ran, not a role-runner tick (#11906). Mapped to `loom.role_tick.source`; absent on a role tick. Additive. |
 | `sweep_id` | string | no | The step's sweep id (`step-<role>-<item>-<ts>`), with `source`. Mapped to `loom.sweep_id`. |
 
@@ -3576,57 +3576,50 @@ additive (serde-defaulted), so records from before #11527 still parse and no
 [`defaults/observability/signoz/host-export-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
 hosts with drops, or with no `host.export` at all, in the last 2 h. Query 3 compares a rendered `hosts.yml` roster against `host.export` to find silent hosts by absence (#11198). Query 5 combines `daemon.start`, `daemon.exit` and `host.export` into one `running` / `stopped` / `silent` row per roster host (#10023); `stopped` needs a `daemon.exit`, so a crash, kill or power loss reads as `silent`.
 
-### `session.prompt_tree`
+### `checkout.freshness`
 
-The checkout an attended session started in, measured against GitHub's tip
-(Issue #12509). Daemon role ticks already record the prompt tree they launch
-from (`prompt` on `role_tick.outcome`, #11989); a person's Claude Code session
-on a Mac or an AWS box reported nothing, so "how often does a hand-driven
-session run from a stale or divergent checkout" had no answer. **OTLP only**
-(`otlp: Logs`, `native: false`); `observability/otlp/mapping/session_prompt_tree.rs`
+How far one managed checkout is behind GitHub's tip (Issue #12509). Daemon role
+ticks already record the prompt tree they launch from (`prompt` on
+`role_tick.outcome`, #11989), but a checkout with no role tick (an AWS-box
+daemon workspace, a sweep worker's clone) reported nothing, so "how often does a
+daemon host run from a stale or divergent checkout" had no answer. The checkout
+fast-forward pass visits every managed checkout, and emits **one record per
+checkout per pass**. **OTLP only** (`otlp: Logs`, `native: false`), and only when
+the exporter is configured; `observability/otlp/mapping/checkout_freshness.rs`
 maps it, with the record's JSON as the body and `host` on the Resource.
+
+Hosts with no daemon (dev boxes, Macs running hand-driven sessions) are out of
+scope by operator ruling: no hook and no CLI command emits this.
 
 | Field | Type | Notes |
 |---|---|---|
-| `captured_at` | RFC3339 | when the tree was read; the record time |
-| `session_id` | string | opaque Claude Code session id |
-| `source` | string? | `startup`, `resume`, `clear` or `compact` |
-| `prompt` | object | `commit`, `loom_version`, `commits_behind`, `on_branch` as on `role_tick.outcome`, plus `remote_tip`, `origin_ref_stale`, `remote_repo`, `remote_foreign` below; each inner key is absent when it cannot be read |
+| `captured_at` | RFC3339 | when the checkout was read; the record time |
+| `repo` | string? | the workspace's `owner/repo` (`loom.repo`); absent when `origin` is foreign or unparseable |
+| `pass_skipped_reason` | string? | why the pass could not measure against GitHub's tip: `budget` (the pass ran out of time before this checkout; no `prompt`), `low-disk`, `breaker-open`, `backing-off`, `network-off`, `unreachable-stop` or `no-head`. Absent when a tip was known. A stale count never looks fresh |
+| `prompt` | object? | `commit`, `loom_version`, `commits_behind`, `on_branch` as on `role_tick.outcome`, plus the five remote fields below; each inner key is absent when it cannot be read |
 
-**On this record `commits_behind` means behind GitHub's tip**, never the
-local-ref count and never 0 as a fallback. The four remote fields (all optional,
-additive, no `schema_version` bump) ride as attributes:
+The remote fields (all optional, additive, no `schema_version` bump) also ride
+on `role_tick.outcome`'s `prompt`:
 
 | Field | Attribute | Notes |
 |---|---|---|
-| `remote_tip` | `loom.prompt.remote_tip` | full SHA `git ls-remote --symref origin HEAD` reported |
-| `origin_ref_stale` | `loom.prompt.origin_ref_stale` | the local `refs/remotes/origin/<default>` differs from `remote_tip` (or does not exist) |
+| `remote_tip` | `loom.prompt.remote_tip` | full SHA of the default branch's tip, from the head the daemon's checkout pass last heard (`checkout_ff::heard`); absent if none was heard in the last 15 minutes |
+| `commits_behind_remote` | `loom.prompt.commits_behind_remote` | `git rev-list --count HEAD..remote_tip`; absent when `remote_tip` is unknown or not yet in the object store (the fast-forward fetches it whenever it moves, so it is normally present) |
+| `origin_ref_stale` | `loom.prompt.origin_ref_stale` | the local `refs/remotes/origin/<default>` differs from `remote_tip` (or does not exist); absent when `remote_tip` is |
 | `remote_repo` | `loom.prompt.remote_repo` | `owner/repo` of `origin` only; never a URL, userinfo or credential |
-| `remote_foreign` | `loom.prompt.remote_foreign` | `origin` is not the expected repo: a local path, `file://`, another host (`$GH_HOST`, default `github.com`), another repo (`$LOOM_REPO`), or an unparseable URL. No `ls-remote` or fetch runs for a foreign origin. Absent on a Gitea workspace |
+| `remote_foreign` | `loom.prompt.remote_foreign` | `origin` is a local path, `file://`, another host (`$GH_HOST`, default `github.com`) or another repo than the workspace's registered one. Absent on a Gitea workspace. No remote comparison is made for a foreign origin |
 
-The rest ride as `loom.session.output.launch = attended`, `loom.session_id`, and
-`loom.repo` (the `remote_repo`, only when origin is not foreign), plus the
-existing `loom.prompt.commit`, `.loom_version`, `.commits_behind`, `.on_branch`.
+`commits_behind` keeps its meaning (HEAD behind the clone's own
+`origin/<default>`); `commits_behind_remote` is the count against GitHub.
 
-**Measures, never fixes.** When the tip's objects are not local, one
-object-only `git fetch` brings them in without moving `refs/remotes/origin/*`,
-writing `FETCH_HEAD` or touching the working tree (skipped under low disk). If
-`ls-remote` fails or times out (offline), `remote_tip`, `origin_ref_stale` and
-`commits_behind` are absent and the rest of the record is still sent.
+**Measures, never fixes, and asks nothing.** The record adds no network call and
+writes nothing to `.git`: the tip is the one the pass already learned, and the
+only git children are local reads (`rev-parse`, `rev-list`, `remote get-url`,
+`cat-file -e`). Unknown values are absent, never 0.
 
-**Producer.** `loom-daemon prompt-tree session-start`, called by the user-scope
-`SessionStart` hook `prompt-tree-session.sh` (matcher `""`: startup, resume,
-clear, compact). It reads only `session_id`, `cwd` and `source` from the hook
-payload, does nothing for a daemon-launched agent, and needs an OTLP target
-(`observability` config or `$LOOM_PRESENCE_OTLP_ENDPOINT`). The front half is
-local and returns at once; a detached copy does the network reads and posts one
-record. A failed export leaves one line in `.loom/logs/prompt-tree/last.log`;
-there is no retry queue.
-
-**Until the follow-up lands, `commits_behind` on `role_tick.outcome` is still
-measured against the clone's local `origin/<default>` ref** (kept fresh by the
-checkout fast-forward, but stale without saying so when that pass is skipped);
-only this kind measures against GitHub's tip.
+SigNoz: `attributes_string['loom.kind'] = 'checkout.freshness'`, grouped by
+`host.name` and `loom.repo`, with `max(loom.prompt.commits_behind_remote)` and
+`countIf(loom.prompt.origin_ref_stale)`.
 
 ### `operator.presence`
 

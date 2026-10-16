@@ -1,47 +1,26 @@
 //! The remote half of the prompt tree (#12509): how far a checkout is behind
-//! *GitHub's* tip, not just behind its own `origin/<default>` ref, and whether
-//! `origin` is even the expected repo.
+//! GitHub's tip, not just behind its own `origin/<default>` ref, and whether
+//! `origin` is even the workspace's repo.
 //!
-//! Measures, never fixes: the only write is an object-only fetch that moves no
-//! ref, writes no `FETCH_HEAD` and touches no working tree. Every network
-//! fact is absent when it cannot be read; `commits_behind` is never 0 on doubt.
-//! The raw remote URL never leaves [`classify_origin`].
+//! **Local reads only.** The tip is the one the daemon's checkout fast-forward
+//! already learned ([`crate::fleet_sync::checkout_ff::heard_within`]); nothing
+//! here asks a remote, fetches, or writes to `.git`. The only git children are
+//! `remote get-url`, `rev-parse`, `cat-file -e` and `rev-list --count`. Every
+//! remote fact is absent when it cannot be read, and `commits_behind_remote`
+//! is never 0 on doubt. The raw remote URL never leaves [`classify_origin`].
 
 use std::path::Path;
+use std::time::Duration;
 
-use super::{git, PromptTree, LOCAL_TIMEOUT};
+use super::{git, PromptTree};
 use crate::fleet_sync::checkout_ff::git as ff;
 
-/// The two network reads the comparison needs, injectable for tests.
-pub trait Remote {
-    /// `(default branch, tip)` as the remote advertises them.
-    ///
-    /// # Errors
-    /// When the remote could not be asked (offline, timeout, no HEAD).
-    fn probe(&self, root: &Path) -> Result<(String, String), String>;
-    /// Download `branch`'s objects, moving no ref.
-    ///
-    /// # Errors
-    /// When the objects could not be fetched.
-    fn fetch_objects(&self, root: &Path, branch: &str) -> Result<(), String>;
-}
+/// How old a heard head may be and still describe GitHub's tip. The resync
+/// pass that learns it runs every few minutes.
+pub const HEARD_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
-/// The real remote: `git ls-remote --symref` and an object-only fetch.
-pub struct GitRemote;
-
-impl Remote for GitRemote {
-    fn probe(&self, root: &Path) -> Result<(String, String), String> {
-        ff::remote_default_head(root, ff::PROBE_TIMEOUT)
-    }
-
-    fn fetch_objects(&self, root: &Path, branch: &str) -> Result<(), String> {
-        ff::fetch_objects(root, branch, ff::FETCH_TIMEOUT)
-    }
-}
-
-/// What `origin` should be. The repo is `$LOOM_REPO` when set (the convention
-/// `presence` and the lease renewer use); there is no other local source of
-/// truth for an attended checkout.
+/// What `origin` should be: the forge host, and the workspace's registered
+/// repo when the collector has resolved it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expected {
     pub host: String,
@@ -49,12 +28,16 @@ pub struct Expected {
 }
 
 impl Expected {
+    /// The expectation for workspace `root`.
     #[must_use]
-    pub fn from_env() -> Self {
-        let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    pub fn for_root(root: &Path) -> Self {
+        let host = std::env::var("GH_HOST")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "github.com".to_string());
         Self {
-            host: non_empty("GH_HOST").unwrap_or_else(|| "github.com".to_string()),
-            repo: non_empty("LOOM_REPO"),
+            host,
+            repo: crate::observability::repo_ref::registered_repo(root),
         }
     }
 }
@@ -64,7 +47,8 @@ impl Expected {
 pub struct Origin {
     /// `owner/repo` when the URL parses as exactly two path segments.
     pub repo: Option<String>,
-    /// Not the expected forge repo.
+    /// Not the workspace's repo: a local path, `file://`, another host or
+    /// another repo.
     pub foreign: bool,
 }
 
@@ -91,47 +75,47 @@ pub fn classify_origin(url: &str, expected: &Expected) -> Origin {
     }
 }
 
-/// Fill `tree`'s remote facts from `remote`. `commits_behind` is reset first:
-/// on this record it only ever means "behind the remote's tip".
-/// `fetch_allowed` is false under low disk.
-pub fn compare(root: &Path, tree: &mut PromptTree, remote: &dyn Remote, fetch_allowed: bool) {
-    tree.commits_behind = None;
-    let Ok((branch, tip)) = remote.probe(root) else {
-        return;
-    };
-    tree.remote_tip = Some(tip.clone());
-    tree.origin_ref_stale =
-        Some(ff::tracking_head(root, &branch, LOCAL_TIMEOUT).as_deref() != Some(tip.as_str()));
-    let spec = format!("{tip}^{{commit}}");
-    let have = |root: &Path| git(root, &["cat-file", "-e", &spec]).is_some();
-    if !have(root)
-        && (!fetch_allowed || remote.fetch_objects(root, &branch).is_err() || !have(root))
-    {
-        return;
-    }
-    tree.commits_behind =
-        git(root, &["rev-list", "--count", &format!("HEAD..{tip}")]).and_then(|n| n.parse().ok());
+/// A full hex object id: the only shape of tip that reaches a `git` argument.
+fn is_object_id(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// [`super::read`] plus the remote comparison, for an attended session.
-#[must_use]
-pub fn read_with_remote(
-    root: &Path,
-    expected: &Expected,
-    remote: &dyn Remote,
-) -> Option<PromptTree> {
-    let mut tree = super::read(root)?;
-    tree.commits_behind = None;
+/// Fill `tree`'s remote facts. `heard` is `(default branch, tip)` as the
+/// daemon last heard them, if it did. Nothing is guessed: with no head, only
+/// the origin facts are set.
+pub fn fill(root: &Path, tree: &mut PromptTree, expected: &Expected, heard: Option<(&str, &str)>) {
     if matches!(crate::forge_cmd::detect_forge(Some(root)), crate::forge_cmd::ForgeType::Gitea) {
-        return Some(tree);
+        return;
     }
-    let url = git(root, &["remote", "get-url", "origin"]).unwrap_or_default();
+    let url = super::git_remote_url(root).unwrap_or_default();
     let origin = classify_origin(&url, expected);
     tree.remote_repo = origin.repo;
     tree.remote_foreign = Some(origin.foreign);
-    if !origin.foreign {
-        let fetch_allowed = crate::fetch_headroom::skip_reason(root).is_none();
-        compare(root, &mut tree, remote, fetch_allowed);
+    let Some((branch, tip)) = heard.filter(|(b, t)| {
+        !origin.foreign && is_object_id(t) && crate::refname::check_refname(b).is_ok()
+    }) else {
+        return;
+    };
+    tree.remote_tip = Some(tip.to_string());
+    tree.origin_ref_stale =
+        Some(ff::tracking_head(root, branch, ff::LOCAL_TIMEOUT).as_deref() != Some(tip));
+    let spec = format!("{tip}^{{commit}}");
+    if git(root, &["cat-file", "-e", &spec]).is_some() {
+        tree.commits_behind_remote = git(root, &["rev-list", "--count", &format!("HEAD..{tip}")])
+            .and_then(|n| n.parse().ok());
     }
+}
+
+/// [`super::read`] plus the remote facts, from what the daemon last heard.
+#[must_use]
+pub fn read_with_heard(root: &Path) -> Option<PromptTree> {
+    let mut tree = super::read(root)?;
+    let heard = crate::fleet_sync::checkout_ff::heard_within(root, HEARD_MAX_AGE);
+    fill(
+        root,
+        &mut tree,
+        &Expected::for_root(root),
+        heard.as_ref().map(|(b, t)| (b.as_str(), t.as_str())),
+    );
     Some(tree)
 }

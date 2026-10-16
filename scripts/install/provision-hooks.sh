@@ -188,11 +188,6 @@ PROJECT_HOOKS_WIRED=0
 # (inherited by Task subagents). Matcher "" covers startup/resume/clear/compact;
 # the hook is fail-open and stdout-silent, and `LOOM_GH_SHIM=0` opts out.
 #
-# `SessionStart` / `prompt-tree-session.sh` (#12509) is the second SessionStart
-# entry: it records how far an attended session's checkout is behind GitHub's tip
-# (`loom-daemon prompt-tree session-start`). Same matcher "", same fail-open,
-# stdout-silent contract; it does nothing for a daemon-dispatched agent.
-#
 # `roll-pause.sh` (#10830) is wired three times, match-all: PreToolUse parks a
 # daemon-dispatched agent's tool calls at a roll's safe point, and PostToolUse /
 # PostToolUseFailure close its in-flight ledger. It exits at once unless
@@ -205,8 +200,8 @@ PROJECT_HOOKS_WIRED=0
 # `guards.uncommittedWorkConsumerCanary: true` — so wiring it everywhere enables
 # nothing by itself. Each (type, name) pair dedups independently on the
 # `defaults/hooks/<name>` marker, so the two entries never collapse or duplicate.
-_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop SessionStart PreToolUse PostToolUse PostToolUseFailure Stop SubagentStop SessionStart)
-_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "" "" "*" "*" "*" "" "" "")
+_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop SessionStart PreToolUse PostToolUse PostToolUseFailure Stop SubagentStop)
+_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "" "" "*" "*" "*" "" "")
 _PHOOK_NAMES=(
     guard-destructive.sh
     guard-loom-workflow.sh
@@ -221,7 +216,6 @@ _PHOOK_NAMES=(
     roll-pause.sh
     guard-uncommitted-work.sh
     guard-uncommitted-work.sh
-    prompt-tree-session.sh
 )
 
 # Emit the fail-open, workspace-gated, transition-deferring command wrapper for a
