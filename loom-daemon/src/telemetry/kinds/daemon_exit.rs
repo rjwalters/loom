@@ -35,6 +35,9 @@ pub const DAEMON_EXIT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.daemon_exit.in_flight_fate",
     "loom.daemon_exit.uptime_s",
     "loom.daemon_exit.supervisor",
+    "loom.daemon_exit.request_id",
+    "loom.daemon_exit.request_verb",
+    "loom.daemon_exit.caused_by_request_id",
 ];
 
 /// Who asked for the exit, as far as the daemon can know. An external SIGTERM
@@ -130,6 +133,16 @@ pub struct DaemonExitRecord {
     /// Seconds since the daemon recorded its start; absent when it never did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uptime_s: Option<u64>,
+    /// The `daemon.run_state_request` that directly caused this exit (#12546).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// The verb of the request quoted by `request_id` / `caused_by_request_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_verb: Option<String>,
+    /// A recorded stop/drain request that explains a signal exit within the
+    /// operator-stop window; `requested_by` stays `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caused_by_request_id: Option<String>,
     /// When the exit began.
     pub observed_at: DateTime<Utc>,
     /// The emitting build (version and revision).
