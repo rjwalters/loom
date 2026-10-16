@@ -15,6 +15,9 @@
 //! | `Reclassify` | nothing for the first; a second identical state refusal in a row arms the ledger's doubling refusal cooldown, broadcast. Not a repeat-cap run |
 //! | `Failed` (slow) | counted toward the repeat cap |
 //!
+//! A Builder step that arms the repeat cap also gets one marked comment on
+//! its issue giving the reason and release time ([`super::step_cap_notice`], #12500).
+//!
 //! A Builder step's `noop` also feeds the issue's no-op hold (#12024,
 //! [`SweepRegistry::note_builder_step_noop`]). The ledger's own history
 //! cannot bound a promote / Builder-no-op cycle: Champion's promotion is a
@@ -83,6 +86,11 @@ impl SweepRegistry {
             .record(item, step, &run.outcome, run.ran_for, now);
         if step == StepRole::Builder && run.outcome.class == OutcomeClass::Noop {
             self.note_builder_step_noop(item, &run.sweep_id, &run.outcome.reason);
+        }
+        if step == StepRole::Builder && rec.repeat_capped {
+            if let Some(until) = self.step_ledger.cooling_until(item, step, now) {
+                self.note_builder_cap(item, until, now);
+            }
         }
         let champion = step.role_name() == "champion";
         if matches!(rec.effect, Effect::Advance | Effect::Landed) {

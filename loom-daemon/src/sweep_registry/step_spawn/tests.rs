@@ -381,20 +381,62 @@ fn the_outcome_line_is_read_after_this_steps_own_header_only() {
 fn a_steps_end_maps_to_the_role_ticks_outcome() {
     let noop = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=noop reason=x");
     let failed = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=failed reason=x");
-    assert_eq!(tick_outcome(StepEnd::Exited(Some(0)), noop.as_ref()), RoleTickOutcome::Success);
-    assert_eq!(tick_outcome(StepEnd::Exited(None), noop.as_ref()), RoleTickOutcome::Success);
-    for (end, line) in [
-        (StepEnd::Exited(Some(0)), failed.as_ref()),
-        (StepEnd::Exited(Some(1)), None),
-        (StepEnd::Exited(None), None),
-        (StepEnd::TimedOut, noop.as_ref()),
-        (StepEnd::Cancelled, None),
-    ] {
-        assert!(
-            matches!(tick_outcome(end, line), RoleTickOutcome::Failure(_)),
-            "{end:?} {line:?}"
+    let verdict = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=verdict reason=x");
+    let judge = StepRole::Judge;
+    assert_eq!(
+        tick_outcome(judge, StepEnd::Exited(Some(0)), noop.as_ref()),
+        RoleTickOutcome::Success
+    );
+    assert_eq!(
+        tick_outcome(judge, StepEnd::Exited(None), noop.as_ref()),
+        RoleTickOutcome::Success
+    );
+    assert_eq!(tick_outcome(judge, StepEnd::Exited(Some(0)), None), RoleTickOutcome::Success);
+    for role in [StepRole::Builder, judge] {
+        assert_eq!(
+            tick_outcome(role, StepEnd::Exited(Some(0)), verdict.as_ref()),
+            RoleTickOutcome::Success,
+            "{role:?}"
         );
     }
+    for (role, end, line) in [
+        (judge, StepEnd::Exited(Some(0)), failed.as_ref()),
+        (judge, StepEnd::Exited(Some(1)), None),
+        (judge, StepEnd::Exited(None), None),
+        (judge, StepEnd::TimedOut, noop.as_ref()),
+        (judge, StepEnd::Cancelled, None),
+        (StepRole::Builder, StepEnd::Exited(Some(0)), noop.as_ref()),
+        (StepRole::Builder, StepEnd::Exited(None), noop.as_ref()),
+        (StepRole::Builder, StepEnd::Exited(Some(0)), None),
+    ] {
+        assert!(
+            matches!(tick_outcome(role, end, line), RoleTickOutcome::Failure(_)),
+            "{role:?} {end:?} {line:?}"
+        );
+    }
+}
+
+/// #12500: a Builder step that exits 0 with no PR is not a success, and its
+/// failure text carries the line's reason.
+#[test]
+fn a_builder_that_opens_no_pr_reports_no_pr_with_its_reason() {
+    let noop =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=builder target=1 class=noop reason=ci_pending");
+    assert_eq!(
+        tick_outcome(StepRole::Builder, StepEnd::Exited(Some(0)), noop.as_ref()),
+        RoleTickOutcome::Failure("no_pr: ci_pending".to_string())
+    );
+    let class = |line: Option<&_>| {
+        step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), line)
+            .map(|f| f.class().to_string())
+    };
+    assert_eq!(class(noop.as_ref()).as_deref(), Some("step-no-pr"));
+    assert_eq!(class(None).as_deref(), Some("step-no-outcome-line"));
+    assert_eq!(
+        step_failure(StepRole::Judge, StepEnd::Exited(Some(0)), noop.as_ref())
+            .map(|f| f.class().to_string()),
+        None
+    );
 }
 
 /// #12480: every failing branch of `tick_outcome` has its own closed class,
@@ -403,7 +445,9 @@ fn a_steps_end_maps_to_the_role_ticks_outcome() {
 fn a_failed_steps_end_maps_to_its_own_class() {
     let noop = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=noop reason=x");
     let failed = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=failed reason=a b");
-    let class = |end, line: Option<&_>| step_failure(end, line).map(|f| f.class().to_string());
+    let judge = StepRole::Judge;
+    let class =
+        |end, line: Option<&_>| step_failure(judge, end, line).map(|f| f.class().to_string());
     assert_eq!(class(StepEnd::TimedOut, noop.as_ref()).as_deref(), Some("step-timed-out"));
     assert_eq!(class(StepEnd::Cancelled, None).as_deref(), Some("step-cancelled"));
     assert_eq!(
@@ -412,7 +456,7 @@ fn a_failed_steps_end_maps_to_its_own_class() {
     );
     assert_eq!(class(StepEnd::Exited(Some(7)), None).as_deref(), Some("step-exit-nonzero"));
     assert_eq!(
-        step_failure(StepEnd::Exited(Some(7)), None)
+        step_failure(judge, StepEnd::Exited(Some(7)), None)
             .unwrap()
             .exit_code(),
         Some(7)
@@ -420,19 +464,21 @@ fn a_failed_steps_end_maps_to_its_own_class() {
     assert_eq!(class(StepEnd::Exited(None), None).as_deref(), Some("step-status-unknown"));
     assert_eq!(class(StepEnd::Exited(Some(0)), noop.as_ref()), None);
     assert_eq!(class(StepEnd::Exited(None), noop.as_ref()), None);
-    for end in [
-        StepEnd::Exited(Some(0)),
-        StepEnd::Exited(Some(2)),
-        StepEnd::Exited(None),
-        StepEnd::TimedOut,
-        StepEnd::Cancelled,
-    ] {
-        for line in [None, noop.as_ref(), failed.as_ref()] {
-            assert_eq!(
-                step_failure(end, line).is_some(),
-                matches!(tick_outcome(end, line), RoleTickOutcome::Failure(_)),
-                "{end:?} {line:?}"
-            );
+    for role in [judge, StepRole::Builder] {
+        for end in [
+            StepEnd::Exited(Some(0)),
+            StepEnd::Exited(Some(2)),
+            StepEnd::Exited(None),
+            StepEnd::TimedOut,
+            StepEnd::Cancelled,
+        ] {
+            for line in [None, noop.as_ref(), failed.as_ref()] {
+                assert_eq!(
+                    step_failure(role, end, line).is_some(),
+                    matches!(tick_outcome(role, end, line), RoleTickOutcome::Failure(_)),
+                    "{role:?} {end:?} {line:?}"
+                );
+            }
         }
     }
 }
