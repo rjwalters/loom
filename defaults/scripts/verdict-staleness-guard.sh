@@ -20,9 +20,10 @@
 # (the same HTML-comment marker convention as `<!-- loom:standdown claim=... -->`
 # and `<!-- loom:fallback-evaluated sha=... -->`), so the verdict records which
 # tree it covers. `approved` / `changes-requested` are the canonical spellings
-# writers emit; readers also tolerate `approve` / `request-changes`. This script compares that recorded SHA against the PR's
-# CURRENT head SHA and reports FRESH / STALE, optionally performing the
-# clear+re-queue transition itself.
+# writers emit; readers also tolerate `approve` / `request-changes`. This
+# script compares that recorded SHA against the PR's CURRENT head SHA and
+# reports FRESH / STALE, optionally performing the clear+re-queue transition
+# itself.
 #
 # Decision, in priority order (first match wins):
 #   1. NOT_OPEN     — the PR is no longer open (merged, or closed unmerged).
