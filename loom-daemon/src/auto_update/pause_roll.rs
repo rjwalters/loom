@@ -172,6 +172,20 @@ impl RollTarget {
         }
     }
 
+    /// A same-binary restart for restart-required config (#12425): the roll
+    /// is to the running version, so H5 records `from_version == to_version`.
+    /// No artifact identity: nothing is fetched and a newer release never
+    /// supersedes it.
+    #[must_use]
+    pub fn config_restart(running_version: &str) -> Self {
+        Self {
+            source: TargetSource::ConfigRestart,
+            to_version: Some(running_version.to_string()),
+            to_artifact_sha256: None,
+            label: None,
+        }
+    }
+
     /// A source-rebuild roll: the checkout is ahead of the running binary.
     #[must_use]
     pub fn repo_ahead() -> Self {

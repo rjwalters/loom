@@ -37,8 +37,8 @@ pub fn print(current_daemon_pid: Option<u32>) {
 fn render_marker(marker: &PendingRestart, now: chrono::DateTime<chrono::Utc>) -> String {
     let age_mins = (now - marker.rendered_at).num_minutes().max(0);
     format!(
-        "Pending restart: {} — rendered {age_mins}m ago (daemon pid {}); restart the daemon to \
-         apply",
+        "Pending restart: {} — rendered {age_mins}m ago (daemon pid {}); a fleet.autoApply host \
+         restarts itself to apply it, any other: restart the daemon",
         marker.paths.join(", "),
         marker.observed_pid
     )

@@ -624,7 +624,7 @@ pub fn loom_min_version() -> Option<String> {
 
 /// #12424: restart-required config changes since this process booted, beside
 /// the floor. See [`config_restart`].
-pub use config_restart::config_restart_demand;
+pub use config_restart::{armable_demand, config_restart_demand};
 
 /// #10719: the `repo_ahead_target` roll demand, beside the floor. The highest
 /// daemon version a registered workspace NEEDS and this host does not run.

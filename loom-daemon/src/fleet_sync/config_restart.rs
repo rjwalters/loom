@@ -187,6 +187,22 @@ pub fn config_restart_demand() -> Option<ConfigRestartDemand> {
     demand_cell().lock().ok().and_then(|g| g.clone())
 }
 
+/// The demand the self-update loop may act on (#12425): [`config_restart_demand`]
+/// on a host whose last timer pass was [`Mode::Write`], `None` on a
+/// [`Mode::Check`] host, which reports the demand and restarts for nothing.
+#[must_use]
+pub fn armable_demand() -> Option<ConfigRestartDemand> {
+    if !write_mode_cell().load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    config_restart_demand()
+}
+
+fn write_mode_cell() -> &'static std::sync::atomic::AtomicBool {
+    static CELL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &CELL
+}
+
 fn set_demand(demand: Option<ConfigRestartDemand>) {
     if let Ok(mut guard) = demand_cell().lock() {
         *guard = demand;
@@ -200,6 +216,7 @@ pub fn check(mode: Mode, now: DateTime<Utc>) {
     let Some(boot) = boot_cell().lock().ok().and_then(|g| g.clone()) else {
         return;
     };
+    write_mode_cell().store(mode == Mode::Write, std::sync::atomic::Ordering::Relaxed);
     let previous = config_restart_demand();
     let demand = compare(&boot, previous.as_ref(), now);
     let changed =

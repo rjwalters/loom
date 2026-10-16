@@ -141,6 +141,9 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     // #11042: an unsupervised host does not re-fetch a target it already
     // installed and could not roll to.
     let decision = not_rolling::gate(state, trigger, decision);
+    // #12425: nothing else rolling and restart-required config changed since
+    // boot: restart onto this binary.
+    let decision = config_restart::arm(state, decision);
     let unsupervised = trigger.unsupervised().is_some();
     let (kind, outcome, note) = match decision {
         TickDecision::Skip(reason) => {
@@ -294,6 +297,27 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             log_roll_outcome(&outcome, &note);
             (TickDecisionKind::Fetch, Some(outcome_str(&outcome)), note)
         }
+        TickDecision::ConfigRestart { paths } => {
+            // The state a same-binary restart restores (settle clocks, stall
+            // episode, #10877) is written ahead of the restart the roll may
+            // perform at once. Nothing else is recorded: this is not a version
+            // roll, so `last_roll`, the artifact record, the roll attempt and
+            // the backoff stay as they were.
+            state.persist_before_arm(&RebuildOutcome::Success);
+            let drain_accepted = trigger.trigger_pause_roll(&config_restart::target());
+            summary.roll_armed = drain_accepted;
+            summary.config_restart = Some(tick_telemetry::ConfigRestartFacts {
+                source: pause_manifest::TargetSource::ConfigRestart.as_str(),
+                paths: paths.len(),
+            });
+            let note = config_restart::note(&paths, drain_accepted);
+            if drain_accepted {
+                log::warn!("auto_update: {note}");
+            } else {
+                log::error!("auto_update: {note}");
+            }
+            (TickDecisionKind::ConfigRestart, None, note)
+        }
     };
     // #10712: a host below the fleet floor says so on whatever the tick
     // decided (the floor-driven cause, or the unsatisfiable-floor alert). The
@@ -422,6 +446,9 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     state
         .repo_ahead
         .set_basis(floor.demand(), env!("CARGO_PKG_VERSION"));
+    // #12425: and whether the config on disk needs a restart this host may
+    // perform on itself.
+    state.set_config_restart(floor.config_restart());
     // #10954: a loop that runs only for the fleet floor (autoUpdate off) does
     // nothing on a tick where the host has no fleet store.
     let idle = loop_mode::idle_reason(tuning.chase_enabled, state.floor.fleet_host());
@@ -503,6 +530,10 @@ pub(super) struct FloorFeed {
     wake: Arc<dyn Fn() -> &'static crate::fleet_sync::FloorWake + Send + Sync>,
     /// #10719: the highest daemon version a registered workspace needs.
     demand: Arc<dyn Fn() -> Option<floor_roll::repo_ahead::Demand> + Send + Sync>,
+    /// #12425: the restart-required config demand a restart may be armed for.
+    config_restart: Arc<
+        dyn Fn() -> Option<crate::fleet_sync::config_restart::ConfigRestartDemand> + Send + Sync,
+    >,
 }
 
 impl FloorFeed {
@@ -512,6 +543,7 @@ impl FloorFeed {
             read: Arc::new(crate::fleet_sync::floor_knowledge),
             wake: Arc::new(crate::fleet_sync::floor_wake),
             demand: Arc::new(floor_roll::repo_ahead::Demand::live),
+            config_restart: Arc::new(crate::fleet_sync::armable_demand),
         }
     }
 
@@ -525,7 +557,18 @@ impl FloorFeed {
             read: Arc::new(read),
             wake: Arc::new(move || wake),
             demand: Arc::new(|| None),
+            config_restart: Arc::new(|| None),
         }
+    }
+
+    /// The same feed, with a fixed restart-required config demand (#12425).
+    #[cfg(test)]
+    pub(super) fn with_config_restart(
+        mut self,
+        demand: crate::fleet_sync::config_restart::ConfigRestartDemand,
+    ) -> Self {
+        self.config_restart = Arc::new(move || Some(demand.clone()));
+        self
     }
 
     /// The same feed, with a fixed repo-ahead demand (#10719).
@@ -545,6 +588,10 @@ impl FloorFeed {
 
     fn demand(&self) -> Option<floor_roll::repo_ahead::Demand> {
         (self.demand)()
+    }
+
+    fn config_restart(&self) -> Option<crate::fleet_sync::config_restart::ConfigRestartDemand> {
+        (self.config_restart)()
     }
 }
 
