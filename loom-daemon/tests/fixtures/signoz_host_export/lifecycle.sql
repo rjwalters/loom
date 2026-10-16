@@ -56,5 +56,5 @@ FROM values('h String, kind String, topic String, mins Int32',
     ('w-gone', 'host.export', '', 1500),
     -- a daemon.event that is not a start must not count as one
     ('l-othertopic', 'daemon.event', 'daemon.drain.started', 1),
-    ('l-othertopic', 'host.export', '', 40);
+    ('l-othertopic', 'host.export', '', 40));
     -- l-never has no rows at all: silent
