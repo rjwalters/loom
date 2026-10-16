@@ -1042,7 +1042,7 @@
       ]
     },
     {
-      "name": "a PR with no stage label: judge",
+      "name": "a PR with no stage label: champion triage",
       "inputs": {
         "issues": [],
         "pulls": [
@@ -1058,9 +1058,9 @@
         {
           "issue": null,
           "pr": 511,
-          "state": "review_requested",
+          "state": "no_stage",
           "verdict": {
-            "step": "judge"
+            "step": "champion_triage"
           }
         }
       ]
@@ -1086,6 +1086,111 @@
           "state": "no_stage",
           "verdict": {
             "pass": "draft"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an otherwise unlabelled PR with loom:frozen: frozen wins over triage",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 591,
+            "labels": [
+              "loom:frozen"
+            ],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 591,
+          "state": "frozen",
+          "verdict": {
+            "pass": "frozen"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an otherwise unlabelled PR with loom:operator: operator wins over triage",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 592,
+            "labels": [
+              "loom:operator"
+            ],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 592,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an otherwise unlabelled PR with loom:blocked (a triage block): blocked, never triaged again",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 593,
+            "labels": [
+              "loom:blocked"
+            ],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 593,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a PR with only lane and priority labels: champion triage",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 594,
+            "labels": [
+              "loom:ci-failure",
+              "loom:important"
+            ],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 594,
+          "state": "no_stage",
+          "verdict": {
+            "step": "champion_triage"
           }
         }
       ]

@@ -82,6 +82,7 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
         Step::Doctor,
         Step::ChampionMerge,
         Step::ChampionHoldReevaluate,
+        Step::ChampionTriage,
     ];
     for s in steps {
         assert!(verdicts.contains(&Verdict::Step(s)), "no fixture case for {s:?}");
@@ -99,7 +100,7 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
         PassReason::Epic,
         PassReason::Proposal,
         // `NoStage` is only the defensive answer for an item with neither an
-        // issue nor a PR (#12499: an unlabelled PR is a Judge step now).
+        // issue nor a PR (#12499: an unlabelled PR is a Champion triage now).
         PassReason::Draft,
     ];
     for p in passes {
@@ -125,6 +126,8 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
 fn steps_name_their_role_and_target() {
     assert_eq!(Step::CuratorKeepOrClose.role(), "curator");
     assert_eq!(Step::ChampionHoldReevaluate.role(), "champion");
+    assert_eq!(Step::ChampionTriage.role(), "champion");
+    assert!(Step::ChampionTriage.acts_on_pr(), "a triage works the PR");
     let inputs = Inputs {
         issues: vec![IssueInput {
             number: 7,

@@ -18,6 +18,10 @@
 #      champion-targeted.md and leaves the no-argument batch pass in place;
 #      champion-targeted.md defines each mode's outcomes, the --issue verdict
 #      set lives in ONE table, and --non-item skips both item queues.
+#   3. TRIAGE (#12499) -- --pr N's step-1 block is EXTRACTED and RUN against a
+#      stub PR read: an open, non-draft PR with no stage label, hold or claim
+#      is TRIAGE=yes and nothing else is; the triage section has exactly its
+#      outcomes, each one label transition, review-requested the normal case.
 #
 # Hermetic: file reads plus a mktemp -d dir with stub gh / git / loom-daemon /
 # merge-pr.sh. No forge, no network.
@@ -67,6 +71,7 @@ S
 cat > "$TMP/bin/gh" <<S
 #!/usr/bin/env bash
 case "\$*" in
+  "api repos/"*"/pulls/"*) printf '%s' "\${FAKE_PR_JSON:-}" ;;
   *"--json headRefOid"*) echo HEAD_READ >> "$TMP/gh-calls"; echo "\${FAKE_HEAD:-1111111111111111111111111111111111111111}" ;;
 esac
 exit 0
@@ -223,6 +228,52 @@ check "--non-item: never claims, evaluates or writes a verdict on a curated prop
 claims, evaluates or writes a verdict on a curated proposal (epics are
 Priority 4'"'"'s), and it writes nothing on a `loom:pr` PR'
 check "--non-item: the census line is still mandatory" has '`Merge-risk holds:` line is still mandatory'
+
+echo "--- 4. --pr N on an unlabelled PR: triage (#12499) ---"
+awk '/^## `--pr N`: one merge decision/{on=1} on&&/^ *```bash$/{inb=1;next} inb&&/^ *```$/{exit} inb{sub(/^   /,""); print}' "$TARGETED_MD" > "$TMP/step1.sh"
+[[ -s "$TMP/step1.sh" ]] || { echo "FAIL: could not extract --pr step 1 block"; exit 1; }
+bash -n "$TMP/step1.sh" || { echo "FAIL: --pr step 1 block is not valid bash"; exit 1; }
+run_step1() { # FAKE_PR_JSON
+  out=$( cd "$TMP" && FAKE_PR_JSON="$1" PATH="$TMP/bin:$PATH" bash "$TMP/step1.sh" 2>&1 )
+  rm -f "$TMP/gitdir"/loom-champion-pin-pr-*
+}
+pr_json() { # state draft labels...
+  local state="$1" draft="$2"; shift 2
+  local ls; ls=$(printf '{"name":"%s"},' "$@"); ls="[${ls%,}]"; [[ $# -eq 0 ]] && ls="[]"
+  printf '{"state":"%s","draft":%s,"head":{"sha":"%s"},"labels":%s}' "$state" "$draft" "$EVAL_SHA" "$ls"
+}
+run_step1 "$(pr_json open false)"
+check "an open, non-draft PR with no labels is a triage, and pins nothing" eval 'has "TRIAGE=yes" && has "EVALUATED_SHA=none"'
+run_step1 "$(pr_json open false loom:ci-failure loom:important)"
+check "a lane or priority label is not a stage: still a triage" has "TRIAGE=yes"
+run_step1 "$(pr_json open true)"
+check "a draft is never triaged (the classifier passes it, draft)" has "TRIAGE=no"
+for l in loom:pr loom:review-requested loom:changes-requested loom:sequenced loom:blocked loom:operator loom:frozen loom:treating; do
+  run_step1 "$(pr_json open false "$l")"
+  check "$l: not a triage (a stage, hold or claim decides it)" has "TRIAGE=no"
+done
+run_step1 "$(pr_json closed false)"
+check "a closed PR is not a triage" has "TRIAGE=no"
+run_step1 "$(pr_json open false loom:pr)"
+check "a loom:pr PR still takes the merge path, pinned" eval 'has "TRIAGE=no" && has "EVALUATED_SHA=$EVAL_SHA"'
+
+TRIAGE_SECTION="$(awk '/^## `--pr N` on an unlabelled PR: triage/{on=1;next} on&&/^## /{exit} on' "$TARGETED_MD")"
+out="$TRIAGE_SECTION"
+check "the triage section exists" eval '[[ -n "$TRIAGE_SECTION" ]]'
+check "step 1 routes TRIAGE=yes to the triage section" \
+  doc_has "$TARGETED_MD" '`TRIAGE=yes` (open, not a draft, no stage label, no hold, no claim):'
+check "exactly one label transition per triage" has '**exactly one label transition**'
+TRIAGE_OUTCOMES="$(printf '%s\n' "$TRIAGE_SECTION" | awk '/^\| `/{print $2}' | tr -d '`' | tr '\n' ' ')"
+check "triage outcomes: triaged, triage-blocked, triage-operator, not-eligible" \
+  eval '[[ "$TRIAGE_OUTCOMES" == "triaged triage-blocked triage-operator not-eligible " ]]'
+check "triaged: the normal case adds loom:review-requested" \
+  has '| `triaged` | **The normal case**: none of the rows below applies | `gh pr edit N --add-label loom:review-requested` |'
+check "triage-blocked: duplicate, superseded, or closing an already-closed issue, with a reason comment" \
+  eval 'has "**duplicate**" && has "**superseded**" && has "**closes an issue that is already closed**" && has "park-record apply --pr N --by champion --reason"'
+check "triage-operator: a human decision, through the routing rule" \
+  eval 'has "**needs a human decision**" && has "operator-decision apply N" && has "--add-label loom:operator"'
+check "triage never merges, closes or pushes" has 'Never close the PR, push to it, or
+add `loom:pr`.'
 
 echo "Results: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

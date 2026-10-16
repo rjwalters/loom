@@ -26,7 +26,8 @@
 //! | Champion `held` / `blocked` | [`Effect::ForgeLadder`]: 6 h → 7 d, on the forge ([`super::reeval_ladder`]) |
 //!
 //! Champion's other outcomes fold as: `merged`, `rejected`, `promoted`,
-//! `revise`, `operator`, `closed` → `verdict`; `requeued` → `noop`;
+//! `revise`, `operator`, `closed`, and a `--pr` triage's `triaged`,
+//! `triage-blocked`, `triage-operator` (#12499) → `verdict`; `requeued` → `noop`;
 //! `head-moved`, `not-eligible` → `refused` (a state refusal); `failed` →
 //! `failed`.
 //!
@@ -215,9 +216,8 @@ impl StepOutcome {
 pub fn champion_outcome(on_pr: bool, outcome: &str) -> Option<StepOutcome> {
     use OutcomeClass::{Failed, Noop, Refused, Verdict};
     let class = match (on_pr, outcome) {
-        (true, "merged" | "rejected") | (false, "promoted" | "revise" | "operator" | "closed") => {
-            Verdict
-        }
+        (true, "merged" | "rejected" | "triaged" | "triage-blocked" | "triage-operator")
+        | (false, "promoted" | "revise" | "operator" | "closed") => Verdict,
         (true, "held" | "requeued") | (false, "blocked") => Noop,
         (true, "head-moved") | (_, "not-eligible") => Refused,
         (true, "failed") => Failed,

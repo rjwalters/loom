@@ -109,7 +109,7 @@ The classifier (`work_finder/step_item.rs`, `classify`) checks these rows in ord
 | linked PR `loom:changes-requested` | Doctor |
 | linked PR `loom:review-requested` | Judge |
 | linked PR `loom:pr` | Champion merge |
-| PR with no workflow label | none |
+| PR with no workflow label | Champion triage (#12499): it adds `loom:review-requested`, or blocks, or asks the operator; a draft: none (`draft`) |
 | issue `loom:epic` | none (Champion's non-item run) |
 | `loom:architect` / `loom:hermit` / `loom:auditor` proposal, not curated or promoted | none (Champion's non-item run) |
 | `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |

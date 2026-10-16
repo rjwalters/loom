@@ -81,6 +81,10 @@ fn champion_lines_are_read_per_mode_and_folded_onto_the_classes() {
         (true, "head-moved", OutcomeClass::Refused),
         (true, "not-eligible", OutcomeClass::Refused),
         (true, "failed", OutcomeClass::Failed),
+        // A `--pr` triage (#12499): each moves the PR to a stage or a hold.
+        (true, "triaged", OutcomeClass::Verdict),
+        (true, "triage-blocked", OutcomeClass::Verdict),
+        (true, "triage-operator", OutcomeClass::Verdict),
         (false, "promoted", OutcomeClass::Verdict),
         (false, "revise", OutcomeClass::Verdict),
         (false, "operator", OutcomeClass::Verdict),
@@ -93,6 +97,7 @@ fn champion_lines_are_read_per_mode_and_folded_onto_the_classes() {
     }
     assert_eq!(champion_outcome(false, "merged"), None, "not an --issue outcome");
     assert_eq!(champion_outcome(true, "deferred"), None, "never invented");
+    assert_eq!(champion_outcome(false, "triaged"), None, "a PR triage is --pr only");
 }
 
 // ---------------------------------------------------------- the post-state

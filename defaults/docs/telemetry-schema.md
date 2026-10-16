@@ -2775,7 +2775,7 @@ projected reason, so `passVerdictQuery` still parses both):
 | `head_sha` | the head evaluated, when the run recorded it (the Champion pin file, else the mirror); absent otherwise |
 | `step` | `champion_pr` or `champion_issue` |
 | `class` | `verdict`, `noop`, `refused` or `failed` |
-| `reason_set` | `champion_merge_v1` or `champion_promotion_v1` |
+| `reason_set` | `champion_merge_v1`, `champion_promotion_v1` or `champion_triage_v1` |
 | `ledger_class` / `ledger_reason` | the outcome ledger's own classification. It can differ from `class` / `reason`: a red-CI rejection keeps `loom:pr`, so the ledger says `failed unclassified` where the projection says `refused ci_failing`. `probe_failed` when the mirror was not fresh |
 | `criterion` (+ `reason_key` in the body) | the raw `champion:reject:<criterion>:<reason_key>` tokens |
 | `first_refused_at` | when this refusal identity was first seen on this head |
@@ -2790,6 +2790,13 @@ projected reason, so `passVerdictQuery` still parses both):
 (an unnamed criterion). `noop` carries `ci_pending` or `held`. `failed` carries
 `failed` or `unclassified`. A rejection whose duplicate comment the guard
 suppressed keeps the stored identity's reason and `first_refused_at`.
+
+**Champion PR triage (`champion_triage_v1`, `step=champion_pr`, #12499).**
+A `--pr` step on an open, non-draft PR with no stage label and no hold.
+`review_requested` (`triaged`: `loom:review-requested` added) is `verdict`.
+`refused` carries `blocked` (`triage-blocked`) or `operator`
+(`triage-operator`). A triage that ends without one of those words projects as
+the merge gate's rows do (`not_eligible`, `failed`, `unclassified`).
 
 **Champion promotion (`champion_promotion_v1`, `step=champion_issue`,
 `artifact=issue`).** One record per evaluated proposal. `promoted` is
