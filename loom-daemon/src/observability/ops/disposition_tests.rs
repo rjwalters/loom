@@ -38,18 +38,18 @@ fn row(slug: &str, issue: u32, rank: usize, disposition: Qd) -> DispositionRow {
 #[test]
 fn first_sight_emits_changed_with_no_previous_disposition() {
     let mut tracker = DispositionTracker::default();
-    let rows = [row("acme/widgets", 1, 1, Qd::DeferredSaturation)];
+    let rows = [row("acme/widgets", 1, 1, Qd::DeferredBuildBackoff)];
     let emissions = tracker.diff(&rows, &[], at(0), Duration::seconds(600));
     assert_eq!(emissions.len(), 1);
     assert_eq!(emissions[0].transition, Transition::Changed);
     assert_eq!(emissions[0].previous_disposition, None);
-    assert_eq!(emissions[0].disposition, Qd::DeferredSaturation);
+    assert_eq!(emissions[0].disposition, Qd::DeferredBuildBackoff);
 }
 
 #[test]
 fn same_disposition_within_the_refresh_window_emits_nothing() {
     let mut tracker = DispositionTracker::default();
-    let rows = [row("acme/widgets", 1, 1, Qd::DeferredSaturation)];
+    let rows = [row("acme/widgets", 1, 1, Qd::DeferredBuildBackoff)];
     assert_eq!(
         tracker
             .diff(&rows, &[], at(0), Duration::seconds(600))
@@ -63,7 +63,7 @@ fn same_disposition_within_the_refresh_window_emits_nothing() {
 #[test]
 fn same_disposition_after_the_window_emits_refresh() {
     let mut tracker = DispositionTracker::default();
-    let rows = [row("acme/widgets", 1, 1, Qd::DeferredSaturation)];
+    let rows = [row("acme/widgets", 1, 1, Qd::DeferredBuildBackoff)];
     assert_eq!(
         tracker
             .diff(&rows, &[], at(0), Duration::seconds(600))
@@ -79,20 +79,20 @@ fn same_disposition_after_the_window_emits_refresh() {
 #[test]
 fn a_change_emits_changed_with_previous_disposition() {
     let mut tracker = DispositionTracker::default();
-    let first = [row("acme/widgets", 1, 1, Qd::DeferredSaturation)];
+    let first = [row("acme/widgets", 1, 1, Qd::DeferredBuildBackoff)];
     tracker.diff(&first, &[], at(0), Duration::seconds(600));
     let second = [row("acme/widgets", 1, 1, Qd::Dispatched)];
     let emissions = tracker.diff(&second, &[], at(1), Duration::seconds(600));
     assert_eq!(emissions.len(), 1);
     assert_eq!(emissions[0].transition, Transition::Changed);
-    assert_eq!(emissions[0].previous_disposition, Some(Qd::DeferredSaturation));
+    assert_eq!(emissions[0].previous_disposition, Some(Qd::DeferredBuildBackoff));
     assert_eq!(emissions[0].disposition, Qd::Dispatched);
 }
 
 #[test]
 fn a_key_missing_from_a_successfully_listed_repo_emits_left_queue_once() {
     let mut tracker = DispositionTracker::default();
-    let first = [row("acme/widgets", 1, 1, Qd::DeferredSaturation)];
+    let first = [row("acme/widgets", 1, 1, Qd::DeferredBuildBackoff)];
     tracker.diff(&first, &[], at(0), Duration::seconds(600));
     // Repo still listed successfully (not in `failed_slugs`), but issue 1 no
     // longer appears in its rows.
@@ -102,7 +102,7 @@ fn a_key_missing_from_a_successfully_listed_repo_emits_left_queue_once() {
     assert_eq!(emissions[0].issue, 1);
     assert_eq!(
         emissions[0].disposition,
-        Qd::DeferredSaturation,
+        Qd::DeferredBuildBackoff,
         "carries the last-known disposition"
     );
     assert_eq!(emissions[0].rank, None);
@@ -114,7 +114,7 @@ fn a_key_missing_from_a_successfully_listed_repo_emits_left_queue_once() {
 #[test]
 fn a_key_in_a_repo_whose_listing_failed_emits_nothing_and_keeps_its_state() {
     let mut tracker = DispositionTracker::default();
-    let first = [row("acme/widgets", 1, 1, Qd::DeferredSaturation)];
+    let first = [row("acme/widgets", 1, 1, Qd::DeferredBuildBackoff)];
     tracker.diff(&first, &[], at(0), Duration::seconds(600));
     let failed = vec!["acme/widgets".to_string()];
     let emissions = tracker.diff(&[], &failed, at(1), Duration::seconds(600));
@@ -523,7 +523,7 @@ fn changed_emission() -> Emission {
         visibility: RepoVisibility::Public,
         issue: 98,
         rank: Some(3),
-        disposition: Qd::DeferredSaturation,
+        disposition: Qd::DeferredBuildBackoff,
         previous_disposition: Some(Qd::DeferredCapacity),
         transition: Transition::Changed,
         park_label: Some("loom:blocked".to_string()),
@@ -546,7 +546,7 @@ fn every_attribute_survives_the_export_time_allowlist() {
     assert_eq!(span.attributes["loom.repo"], "acme/widgets");
     assert_eq!(span.attributes["loom.repo.visibility"], "public");
     assert_eq!(span.attributes["loom.issue"], "98");
-    assert_eq!(span.attributes["loom.queue.disposition"], "deferred_saturation");
+    assert_eq!(span.attributes["loom.queue.disposition"], "deferred_build_backoff");
     assert_eq!(span.attributes["loom.queue.state"], "ready");
     assert_eq!(span.attributes["loom.queue.rank"], "3");
     // Queue-position metadata (Issue #9669).

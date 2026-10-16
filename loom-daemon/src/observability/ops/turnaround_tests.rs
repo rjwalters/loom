@@ -104,10 +104,10 @@ fn idle_slots_is_cap_minus_occupancy() {
 
 #[test]
 fn idle_slot_seconds_accrue_only_while_ready_work_waited() {
-    // 4 idle slots, 1 issue held by the ramp cap: one usable slot sat idle.
+    // 4 idle slots, 1 issue held by the build back-off: one usable slot sat idle.
     let report = TickReport {
         occupancy: Some(1),
-        deferred_ramp_cap: 1,
+        deferred_build_backoff: 1,
         ..TickReport::default()
     };
     let (_, hold) = idle_points(&report, 5, None, at(0));

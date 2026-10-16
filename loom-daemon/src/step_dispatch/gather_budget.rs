@@ -58,7 +58,7 @@ pub struct TickPasses {
     /// Draws that never reached the spawner: a repo at its cap or a second
     /// merge in a repo.
     pub draws_unspawned: usize,
-    /// Passes by reason (`claim_lost`, `repo_cap`, ...).
+    /// Passes by reason (`claim_lost`, `merge_in_flight`, ...).
     pub by_reason: std::collections::BTreeMap<String, usize>,
 }
 

@@ -27,7 +27,6 @@ fn test_daemon_status_request_response_round_trip() {
         stale_sweeps: vec![],
         token_pool_size: 4,
         token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
-        disk_headroom: 10,
         logical_cpus: 8,
         loadavg_1m: Some(1.25),
         cpu_idle_fraction: Some(0.90),
@@ -123,8 +122,6 @@ fn test_daemon_status_request_response_round_trip() {
             }],
             ..crate::session_status::SessionContainersReport::default()
         }),
-        host_breaker: None,
-        admission_brake: None,
         rate_limit_breaker: None,
         forge_calls: None,
         safehouse: Some(crate::types::SafehouseStatus {
@@ -263,7 +260,6 @@ fn test_daemon_status_request_response_round_trip() {
             assert!(sessions.degraded);
             assert_eq!(sessions.accounts[0].state, "stopped");
             assert_eq!(r.token_pool_dir, Some(std::path::PathBuf::from("/repo/a/.loom/tokens")));
-            assert_eq!(r.disk_headroom, 10);
             assert_eq!(r.logical_cpus, 8);
             assert!(r.auto_update_enabled);
             assert_eq!(
