@@ -216,6 +216,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
         };
     }
 
+    // #12246: children overwrite `LOOM_WORKSPACE` with their target repo;
+    // this keeps the daemon's own (where the fleet's host-local tier lives).
+    loom_daemon::ram_scope_limit::export_daemon_workspace();
+
     // Setup logging to ~/.loom/daemon.log
     setup_logging()?;
 

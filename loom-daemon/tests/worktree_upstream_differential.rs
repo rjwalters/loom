@@ -918,3 +918,8 @@ fn a_backslash_in_the_path_is_re_escaped_by_the_shell_and_not_by_the_port() {
          be confined to the printed hint"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

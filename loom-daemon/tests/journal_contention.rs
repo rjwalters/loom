@@ -121,3 +121,8 @@ fn a_lock_held_by_another_process_is_busy_within_budget() {
     assert_eq!(std::fs::read(&segment).unwrap(), before, "nothing written");
     assert_eq!(stream.append("after", None, json!(3)).unwrap().seq, 2);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

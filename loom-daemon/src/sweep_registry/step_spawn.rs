@@ -38,6 +38,15 @@
 //! only on the reaper's heartbeat, so two hosts cannot draw the same item in
 //! between.
 //!
+//! # Landed work (#12251)
+//!
+//! Before a Builder step claims an issue, the forge is asked once whether
+//! its work already landed: a merged PR that closes it, or one built on its
+//! own `feature/issue-N` branch into the default branch
+//! (`work_finder::landed_prefilter::landed_at_spawn`). A landed issue is
+//! routed to Curator, the step is refused `already_landed`, and the Builder
+//! is held off it fleet-wide ([`SweepRegistry::hold_landed_builder`]).
+//!
 //! # After the spawn
 //!
 //! Every step's lease is renewed while it runs ([`lease`]); every step has
@@ -52,6 +61,7 @@ use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 pub(crate) mod capture;
 pub mod draw_claims;
 pub mod ended;
+pub mod launch_gate;
 pub(crate) mod lease;
 mod pool_state;
 pub(crate) mod span;
@@ -60,6 +70,7 @@ mod unlocked;
 pub(crate) use unlocked::blocking;
 
 pub use timeout::step_timeout;
+pub use unlocked::StepSpawnTimings;
 
 /// One step the engine asks to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +159,22 @@ fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Whether issue `item`'s work already landed, asked of the forge right
+/// before a Builder step claims it (#12251): the merged PR when it did.
+/// `target` is the registry's `(gh, root, slug)`.
+pub(crate) fn landed_at_spawn(target: &(PathBuf, PathBuf, String), item: u32) -> Option<u32> {
+    let (gh_bin, root, slug) = target;
+    crate::work_finder::landed_prefilter::landed_at_spawn(gh_bin, root, slug, item)
+}
+
+/// The refusal of a Builder step on an issue whose work landed by `pr`.
+pub(crate) fn landed_refusal(item: u32, pr: u32) -> StepRefusal {
+    StepRefusal::new(
+        ALREADY_LANDED_REASON,
+        format!("issue #{item} is still open but PR #{pr}, which lands it, has merged"),
+    )
+}
+
 /// Map a role tick's pre-spawn refusal to a step refusal. Pure.
 pub(crate) fn refusal_of(outcome: &crate::role_runner::RoleTickOutcome) -> StepRefusal {
     use crate::role_runner::RoleTickOutcome as O;
@@ -205,6 +232,15 @@ impl SweepRegistry {
         self.roll_gate
             .admit(&kind)
             .map_err(|e| StepRefusal::new("roll_paused", e))?;
+        if role == StepRole::Builder {
+            if let Some(pr) = self
+                .open_pr_listing_target()
+                .and_then(|t| landed_at_spawn(&t, item))
+            {
+                self.hold_landed_builder(item);
+                return Err(landed_refusal(item, pr));
+            }
+        }
         let launch = Self::resolve_step_launch(&self.config, role, &kind)?;
         let sweep_id = generate_sweep_id(&kind);
         let locked = if role.acts_on_pr() {
@@ -219,7 +255,7 @@ impl SweepRegistry {
             self.unwind_step_claim(item, role, &sweep_id, false);
             return Err(refusal);
         }
-        self.spawn_prepared_step(request, &sweep_id, launch)
+        self.spawn_prepared_step(request, &sweep_id, launch, false)
     }
 
     /// Refuse a step whose `/loom:<role>` command is not installed in the
@@ -249,27 +285,41 @@ impl SweepRegistry {
     }
 
     /// The claimed step's launch: the stagger and the child. A failed spawn
-    /// undoes the claim.
+    /// undoes the claim. `host_gate` (a concurrent tick's spawn, #12298)
+    /// also launches through the host-wide gap
+    /// ([`launch_gate::HOST_LAUNCH_GATE`]), so children in different repos
+    /// launch at least the stagger apart too.
     fn spawn_prepared_step(
         &mut self,
         request: &StepSpawnRequest,
         sweep_id: &str,
         launch: StepLaunch,
+        host_gate: bool,
     ) -> std::result::Result<PreparedStep, StepRefusal> {
         let (item, role, kind) = (request.item, request.role, request.kind());
         let sweep_id = sweep_id.to_string();
         self.apply_dispatch_stagger();
         let log_path = self.compute_step_log_path(item, role);
-        match self.spawn_child_process(
-            &kind,
-            &log_path,
-            &sweep_id,
-            launch.model.as_deref(),
-            launch.effort.as_deref(),
-            None,
-            launch.admission.admitted.as_ref(),
-            launch.selection.as_ref(),
-        ) {
+        let spawn = |reg: &Self| {
+            reg.spawn_child_process(
+                &kind,
+                &log_path,
+                &sweep_id,
+                launch.model.as_deref(),
+                launch.effort.as_deref(),
+                None,
+                launch.admission.admitted.as_ref(),
+                launch.selection.as_ref(),
+            )
+        };
+        let spawned = if host_gate {
+            let gap = self.dispatch_stagger;
+            let this = &*self;
+            launch_gate::HOST_LAUNCH_GATE.launch(gap, || spawn(this))
+        } else {
+            spawn(self)
+        };
+        match spawned {
             Ok((child, header_anchor)) => Ok(PreparedStep {
                 child,
                 header_anchor,
