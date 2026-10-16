@@ -305,6 +305,11 @@ pub(crate) enum LeaseOrderDecision {
     /// [`claim_label::LEASELESS_CLAIM_HOST`] plus the label's own timestamp
     /// (see [`LeaseOrderDecision::yield_identity`]).
     YieldToLeaselessClaim { labeled_at: DateTime<Utc> },
+    /// Only from the fail-closed mode ([`SweepRegistry::resolve_lease_order_strict`],
+    /// #12133): the order could not be verified (the read kept failing, or
+    /// this dispatcher's own comment never showed). The fail-open mode reports
+    /// those as [`Proceed`](Self::Proceed); a step claim must refuse instead.
+    Unverified,
 }
 
 /// Resolve whether cross-host dispatch-collision detection runs (Issue #4085,
@@ -1502,6 +1507,9 @@ impl SweepRegistry {
         let gh = self.resolved_gh();
         // W4-C: verifies this daemon's own just-written lease (and its
         // callers fail open after a few retries), so the writer reads it.
+        // #12389 keeps it there on purpose: it is the read half of the
+        // claim-then-verify tie-break, inside the same critical section as
+        // the lease write, and a lagging reader would hide the new comment.
         let mut cmd = self.gh_inv("guard.lease_comments", AccessIntent::Read, &gh);
         cmd = cmd.writer_identity().arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
@@ -1628,6 +1636,37 @@ impl SweepRegistry {
         sweep_id: &str,
         episode_start: DateTime<Utc>,
     ) -> LeaseOrderDecision {
+        self.resolve_lease_order_with(issue, sweep_id, episode_start, false)
+    }
+
+    /// [`resolve_lease_order`](Self::resolve_lease_order) that FAILS CLOSED
+    /// (#12133): an unreadable forge or an invisible own comment, once the
+    /// bounded retries are exhausted, is [`LeaseOrderDecision::Unverified`]
+    /// rather than `Proceed`, and the leaseless-label leg is skipped (a
+    /// builder step's resume re-claims its own `loom:building`, #11852). For a
+    /// claim whose only cross-host mutex is this lease (the Builder step).
+    pub(crate) fn resolve_lease_order_strict(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        episode_start: DateTime<Utc>,
+    ) -> LeaseOrderDecision {
+        self.resolve_lease_order_with(issue, sweep_id, episode_start, true)
+    }
+
+    fn resolve_lease_order_with(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        episode_start: DateTime<Utc>,
+        fail_closed: bool,
+    ) -> LeaseOrderDecision {
+        // What an unverifiable read resolves to once retries are spent.
+        let unverifiable = if fail_closed {
+            LeaseOrderDecision::Unverified
+        } else {
+            LeaseOrderDecision::Proceed
+        };
         // Must match exactly what `write_lease_comment` PUBLISHED for this
         // host (Issue #6322) — comparing against raw `lease_host_identity()` here
         // while the publisher writes `opaque_host_id(lease_host_identity())` would
@@ -1658,7 +1697,7 @@ impl SweepRegistry {
                     std::thread::sleep(LEASE_ORDER_OWN_COMMENT_RETRY_DELAY);
                     continue;
                 }
-                return LeaseOrderDecision::Proceed;
+                return unverifiable;
             };
             let in_window = lease_episode::in_episode(self, &comments, cutoff, renewal_cutoff);
             let Some(own_id) = in_window
@@ -1680,7 +1719,7 @@ impl SweepRegistry {
                     std::thread::sleep(LEASE_ORDER_OWN_COMMENT_RETRY_DELAY);
                     continue;
                 }
-                return LeaseOrderDecision::Proceed;
+                return unverifiable;
             };
             let Some(earliest) = in_window.iter().min_by_key(|c| c.id) else {
                 return LeaseOrderDecision::Proceed;
@@ -1699,8 +1738,19 @@ impl SweepRegistry {
                 // With no peer lease record in-window at all, the label leg
                 // (#9453 Phase 3.1) gets the last word: a leaseless claim is
                 // invisible to every read above.
-                self.confirm_sole_claim(issue, sweep_id, &host, cutoff, renewal_cutoff)
-                    .or_leaseless_claim(self, issue, episode_start, sole)
+                let confirmed = self.confirm_sole_claim(
+                    issue,
+                    sweep_id,
+                    &host,
+                    cutoff,
+                    renewal_cutoff,
+                    fail_closed,
+                );
+                if fail_closed {
+                    confirmed
+                } else {
+                    confirmed.or_leaseless_claim(self, issue, episode_start, sole)
+                }
             };
         }
         // Unreachable in practice (the loop above always returns within its
@@ -1740,7 +1790,13 @@ impl SweepRegistry {
         host: &str,
         cutoff: DateTime<Utc>,
         renewal_cutoff: DateTime<Utc>,
+        fail_closed: bool,
     ) -> LeaseOrderDecision {
+        let unverifiable = if fail_closed {
+            LeaseOrderDecision::Unverified
+        } else {
+            LeaseOrderDecision::Proceed
+        };
         for attempt in 1..=LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS {
             std::thread::sleep(LEASE_ORDER_SOLE_CLAIM_CONFIRM_DELAY);
             let Some(comments) = self.read_lease_comments(issue) else {
@@ -1770,7 +1826,7 @@ impl SweepRegistry {
                     );
                     continue;
                 }
-                return LeaseOrderDecision::Proceed;
+                return unverifiable;
             };
             let in_window = lease_episode::in_episode(self, &comments, cutoff, renewal_cutoff);
             let Some(own_id) = in_window
@@ -1781,8 +1837,9 @@ impl SweepRegistry {
             else {
                 // Own comment is no longer visible in this read — ambiguous
                 // (never invent a refusal from an unverifiable read); fall
-                // open, matching every other branch of this tie-break.
-                return LeaseOrderDecision::Proceed;
+                // open, matching every other branch of this tie-break (or
+                // unverified, when failing closed).
+                return unverifiable;
             };
             if let Some(earliest) = in_window.iter().min_by_key(|c| c.id) {
                 if earliest.id < own_id {

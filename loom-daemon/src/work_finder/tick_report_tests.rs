@@ -158,6 +158,61 @@ fn an_already_landed_refusal_is_recorded_as_a_pick_decision_skip() {
     assert!(record.acted.iter().any(|a| a.number == 1129));
 }
 
+fn maintain_only_hold(issue: u32) -> anyhow::Error {
+    crate::workspace_hold::WorkspaceHeldDispatchError {
+        workspace: PathBuf::from(format!("/tmp/held-{issue}")),
+        kind: crate::workspace_hold::HoldKind::MaintainOnly,
+        detail: "maintain_only".into(),
+    }
+    .into()
+}
+
+/// Issue #11928: a mid-tick `maintain_only` refusal is an informational skip
+/// with a cause, never an error: no `errors` tick, no `error` reason.
+#[test]
+fn a_maintain_only_refusal_in_a_multi_workspace_tick_is_not_an_error() {
+    let mut multi = vec![
+        (
+            Source(items(&[10])),
+            Refusing {
+                refuse: maintain_only_hold,
+                ok: HashSet::new(),
+            },
+        ),
+        (
+            Source(items(&[20])),
+            Refusing {
+                refuse: maintain_only_hold,
+                ok: HashSet::from([20]),
+            },
+        ),
+    ];
+    let report = tick_multi(&mut multi, &[], 4, &[false, false]);
+    assert_eq!(report.errors, 0, "{report:?}");
+    assert_eq!(reason(&report, "error"), 0);
+    assert_eq!(reason(&report, "dispatched"), 1);
+    let held = report.admissions.iter().find(|a| a.issue == 10).unwrap();
+    assert_eq!((held.result, held.reason), ("refused", "maintain_only"));
+    let row = report.queue.iter().find(|r| r.key.number == 10).unwrap();
+    assert_eq!(row.disposition, Some(Qd::WorkspaceHalted));
+}
+
+/// Issue #11928: a host whose only workspace is `maintain_only` records the
+/// same informational skip, not an error.
+#[test]
+fn a_maintain_only_refusal_on_a_single_workspace_host_is_not_an_error() {
+    let mut source = Source(items(&[30]));
+    let mut disp = Refusing {
+        refuse: maintain_only_hold,
+        ok: HashSet::new(),
+    };
+    let report = tick(&mut source, &mut disp, 4, false).unwrap();
+    assert_eq!(report.errors, 0, "{report:?}");
+    assert_eq!(reason(&report, "error"), 0);
+    assert_eq!(report.admissions[0].reason, "maintain_only");
+    assert_eq!(report.admissions[0].result, "refused");
+}
+
 #[test]
 fn a_token_selection_failure_is_token_selection_failed_not_error() {
     let mut multi = vec![(

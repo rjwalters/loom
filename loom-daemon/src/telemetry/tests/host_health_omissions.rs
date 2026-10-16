@@ -31,12 +31,9 @@ fn host_health_omits_built_at_when_unknown() {
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -44,6 +41,8 @@ fn host_health_omits_built_at_when_unknown() {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -79,12 +78,9 @@ fn host_health_omits_managed_repos_when_empty() {
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -92,6 +88,8 @@ fn host_health_omits_managed_repos_when_empty() {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -118,8 +116,6 @@ fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: RoleTickHealth {
             total: 5,
@@ -127,7 +123,6 @@ fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
             persistent: Vec::new(),
         },
         protection: None,
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -135,6 +130,8 @@ fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     let roles = value.get("roles").unwrap();
@@ -160,12 +157,9 @@ fn host_health_omits_worktree_root_total_gb_when_unmeasurable() {
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -173,6 +167,8 @@ fn host_health_omits_worktree_root_total_gb_when_unmeasurable() {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -200,12 +196,9 @@ fn host_health_omits_protection_when_absent() {
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -213,6 +206,8 @@ fn host_health_omits_protection_when_absent() {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -241,12 +236,9 @@ fn host_health_free_without_total_serializes_with_no_fabricated_denominator() {
         worktree_root_free_gb: Some(200),
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -254,6 +246,8 @@ fn host_health_free_without_total_serializes_with_no_fabricated_denominator() {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(
@@ -286,15 +280,12 @@ fn host_health_omits_watchdog_provisioned_when_the_probe_could_not_answer() {
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: Some(HostProtectionSummary {
             state: "unknown".to_string(),
             watchdog_provisioned: None,
         }),
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -302,6 +293,8 @@ fn host_health_omits_watchdog_provisioned_when_the_probe_could_not_answer() {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     });
     let value = serde_json::to_value(&record).unwrap();
     let protection = value.get("protection").unwrap();
@@ -351,12 +344,9 @@ fn sample_record_for_otlp_export(
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -364,5 +354,27 @@ fn sample_record_for_otlp_export(
         exporters: Vec::new(),
         otlp_export,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     })
+}
+
+#[test]
+fn agent_scopes_absent_from_wire_when_unmeasured_and_old_records_decode() {
+    // #12166: no census -> no `agent_scopes*` keys, and a pre-#12166 record
+    // (without them) still decodes as empty / None.
+    let json = serde_json::json!({
+        "captured_at": "2026-01-01T00:00:00Z",
+        "daemon_version": "0.1.0",
+        "build_commit": "x",
+        "uptime_sec": 1,
+        "logical_cpus": 1,
+        "active_sweep_ids": [],
+        "dispatch_halted": false
+    });
+    let r: HostHealthRecord = serde_json::from_value(json).unwrap();
+    assert!(r.agent_scopes.is_empty());
+    assert_eq!(r.agent_scopes_total, None);
+    let v = serde_json::to_value(&r).unwrap();
+    assert!(v.get("agent_scopes").is_none() && v.get("agent_scopes_total").is_none());
 }

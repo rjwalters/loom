@@ -9,7 +9,10 @@
 //! status surface. So, as `private_dispatch::prepare` does for sweeps:
 //!
 //! 1. **locked**: the roll gate, and a copy of the configuration;
-//! 2. **unlocked**: the role's resolvers, containment included;
+//! 2. **unlocked**: the captain's claim when fleet dispatch is on
+//!    ([`captain_claim`], #12450: a refusal ends here, with no forge call),
+//!    a Builder step's landed check ([`landed_at_spawn`],
+//!    #12251), then the role's resolvers, containment included;
 //! 3. **locked**: the sweep id, the item's lock, the peer advertisement, and
 //!    the pre-claim command;
 //! 4. **unlocked**: the pre-claim (non-Builder roles);
@@ -18,6 +21,9 @@
 //!    phase a sweep takes it in), the stagger and the spawn;
 //! 6. **unlocked**: the account-selection poll;
 //! 7. **locked**: [`SweepRegistry::finish_step_spawn`].
+//!
+//! A refusal after a captain's grant gives the grant back
+//! ([`give_back`]), and the spawned step carries it to its release.
 //!
 //! The item's lock taken in phase 3 is what keeps another dispatcher off the
 //! item while the lock is released.
@@ -43,6 +49,33 @@ pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Where one step spawn's time went (#12298), for the tick span's
+/// `loom.dispatch.phase.spawn_*_ms`. A refused spawn stops adding at the
+/// phase that refused it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StepSpawnTimings {
+    /// Phase 2: a Builder step's landed check, then the role's resolvers,
+    /// containment included.
+    pub resolve: Duration,
+    /// Phases 3 and 4, and a Builder's claim flip and lease comment.
+    pub claim: Duration,
+    /// Phase 5 but the Builder's claim: the roll gate, the stagger, the
+    /// spawn.
+    pub launch: Duration,
+    /// Phases 6 and 7: the account-selection poll and the record.
+    pub account: Duration,
+}
+
+impl StepSpawnTimings {
+    /// Add `other` to `self`.
+    pub fn add(&mut self, other: &Self) {
+        self.resolve += other.resolve;
+        self.claim += other.claim;
+        self.launch += other.launch;
+        self.account += other.account;
+    }
+}
+
 impl SweepRegistry {
     /// Spawn one step with the lock released around containment and the
     /// pre-claim (module docs).
@@ -54,9 +87,44 @@ impl SweepRegistry {
         registry: &Arc<Mutex<Self>>,
         request: &StepSpawnRequest,
     ) -> Result<DispatchOutcome> {
+        Self::spawn_step_unlocked_timed(registry, request, &mut StepSpawnTimings::default(), false)
+    }
+
+    /// [`Self::spawn_step_unlocked`], adding where its time went to
+    /// `timings` (#12298). `host_gate`: this spawn may run beside spawns in
+    /// other repos (a concurrent tick), so its launch also keeps the
+    /// host-wide stagger gap ([`super::launch_gate`]).
+    ///
+    /// # Errors
+    /// As [`Self::spawn_step_unlocked`].
+    #[allow(clippy::too_many_lines)] // the seven phases, kept in order.
+    pub fn spawn_step_unlocked_timed(
+        registry: &Arc<Mutex<Self>>,
+        request: &StepSpawnRequest,
+        timings: &mut StepSpawnTimings,
+        host_gate: bool,
+    ) -> Result<DispatchOutcome> {
+        let mut mark = Instant::now();
+        let mut lap = |slot: &mut Duration| {
+            let now = Instant::now();
+            *slot += now.saturating_duration_since(mark);
+            mark = now;
+        };
+        // The captain's grant (#12450), set once phase 2 asks; every refusal
+        // after it gives it back.
+        let grant: std::cell::OnceCell<crate::fleet_dispatch::worker::Grant> =
+            std::cell::OnceCell::new();
         let refuse = |refusal: StepRefusal| -> anyhow::Error {
+            let refusal = give_back(grant.get(), refusal);
             let reg = locked(registry);
-            reg.record_step_dispatch(request, dispatch_step::RESULT_REFUSED, refusal.reason, None);
+            reg.record_step_dispatch(
+                request,
+                dispatch_step::RESULT_REFUSED,
+                refusal.reason,
+                None,
+                refusal.claim.as_ref(),
+                refusal.assignment_id.as_deref(),
+            );
             log::info!(
                 "sweep_registry: {} step on #{} not spawned — {refusal}",
                 request.role,
@@ -73,7 +141,29 @@ impl SweepRegistry {
             }
             reg.config.clone()
         };
-        let launch = match blocking(|| Self::resolve_step_launch(&config, role, &kind)) {
+        match blocking(|| captain_claim(&config.workspace_root, item, role)) {
+            Ok(Some(granted)) => {
+                let _ = grant.set(granted);
+            }
+            Ok(None) => {}
+            Err(refusal) => {
+                lap(&mut timings.claim);
+                return Err(refuse(refusal));
+            }
+        }
+        lap(&mut timings.claim);
+        // After the captain: resolving the listing target can ask the forge.
+        let target = (role == StepRole::Builder)
+            .then(|| locked(registry).open_pr_listing_target())
+            .flatten();
+        if let Some(pr) = target.and_then(|t| blocking(|| landed_at_spawn(&t, item))) {
+            lap(&mut timings.resolve);
+            locked(registry).hold_landed_builder(item);
+            return Err(refuse(landed_refusal(item, pr)));
+        }
+        let resolved = blocking(|| Self::resolve_step_launch(&config, role, &kind));
+        lap(&mut timings.resolve);
+        let launch = match resolved {
             Ok(launch) => launch,
             Err(refusal) => {
                 // The draw excludes a role whose pool is exhausted only from
@@ -101,12 +191,19 @@ impl SweepRegistry {
             (role != StepRole::Builder && !config.skip_label_flip)
                 .then(|| reg.step_claim_command(item, role, &sweep_id))
         };
+        let mut claim = None;
         if let Some(cmd) = claim_cmd {
-            if let Err(refusal) = blocking(|| super::lease::run_step_claim(cmd)) {
-                locked(registry).unwind_step_claim(item, role, &sweep_id, false);
-                return Err(refuse(refusal));
+            let claimed = blocking(|| super::lease::run_step_claim(cmd));
+            lap(&mut timings.claim);
+            match claimed {
+                Ok(facts) => claim = Some(facts),
+                Err(refusal) => {
+                    locked(registry).unwind_step_claim(item, role, &sweep_id, false);
+                    return Err(refuse(refusal));
+                }
             }
         }
+        lap(&mut timings.claim);
         let mut prepared = {
             let mut reg = locked(registry);
             // A roll may have paused spawns while the lock was released (B5):
@@ -118,13 +215,18 @@ impl SweepRegistry {
                 return Err(refuse(StepRefusal::new("roll_paused", e)));
             }
             if role == StepRole::Builder {
-                if let Err(refusal) = reg.pre_claim_step(item, role, &sweep_id) {
+                lap(&mut timings.launch);
+                let claimed = reg.pre_claim_step(item, role, &sweep_id);
+                lap(&mut timings.claim);
+                if let Err(refusal) = claimed {
                     reg.unwind_step_claim(item, role, &sweep_id, false);
                     drop(reg);
                     return Err(refuse(refusal));
                 }
             }
-            match reg.spawn_prepared_step(request, &sweep_id, launch) {
+            let spawned = reg.spawn_prepared_step(request, &sweep_id, launch, host_gate);
+            lap(&mut timings.launch);
+            match spawned {
                 Ok(p) => p,
                 Err(refusal) => {
                     drop(reg);
@@ -132,6 +234,8 @@ impl SweepRegistry {
                 }
             }
         };
+        prepared.claim = claim;
+        prepared.assignment = grant.get().cloned();
         let (token_name, runtime, death) = blocking(|| {
             poll_and_classify_spawned_child(
                 &mut prepared.child,
@@ -139,7 +243,9 @@ impl SweepRegistry {
                 &prepared.header_anchor,
             )
         });
-        locked(registry).finish_step_spawn(prepared, token_name, runtime, death)
+        let finished = locked(registry).finish_step_spawn(prepared, token_name, runtime, death);
+        lap(&mut timings.account);
+        finished
     }
 }
 
@@ -192,5 +298,77 @@ mod tests {
         for id in ids {
             let _ = reg.cancel(&id, Duration::from_millis(50));
         }
+    }
+
+    /// #12298: concurrent spawns in two repos' registries launch through the
+    /// host-wide gate, at least the stagger apart; a serial spawn does not
+    /// touch it.
+    #[test]
+    #[serial]
+    fn concurrent_spawns_in_two_registries_launch_the_stagger_apart() {
+        use super::super::launch_gate::HOST_LAUNCH_GATE;
+        let gap = Duration::from_millis(400);
+        let dirs = [tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap()];
+        let registries: Vec<Arc<Mutex<SweepRegistry>>> = dirs
+            .iter()
+            .map(|d| {
+                let (mut reg, _) = fixture_registry(d.path());
+                reg.set_dispatch_stagger(gap);
+                Arc::new(Mutex::new(reg))
+            })
+            .collect();
+
+        // Serial, in a third registry (so neither concurrent registry has a
+        // stagger of its own to wait out): the gate is not used.
+        let before = HOST_LAUNCH_GATE.last_launch();
+        let serial = SweepRegistry::spawn_step_unlocked(
+            &registries[2],
+            &StepSpawnRequest::new(9_300, StepRole::Doctor),
+        )
+        .unwrap();
+        assert_eq!(HOST_LAUNCH_GATE.last_launch(), before);
+
+        // Concurrent: two launches at once, one per registry. Each is
+        // recorded by the gate as it starts; the second waits out the gap.
+        let started = std::time::Instant::now();
+        let launches: Vec<std::time::Instant> = std::thread::scope(|s| {
+            let handles: Vec<_> = registries[..2]
+                .iter()
+                .zip([9_301u32, 9_302])
+                .map(|(registry, item)| {
+                    s.spawn(move || {
+                        let mut timings = StepSpawnTimings::default();
+                        SweepRegistry::spawn_step_unlocked_timed(
+                            registry,
+                            &StepSpawnRequest::new(item, StepRole::Curator),
+                            &mut timings,
+                            true,
+                        )
+                        .unwrap();
+                        timings
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            vec![HOST_LAUNCH_GATE.last_launch().unwrap()]
+        });
+        // The last launch through the gate started at least one gap after
+        // the first (which started no earlier than `started`).
+        assert!(
+            launches[0].duration_since(started) >= gap,
+            "second launch {:?} after the round began",
+            launches[0].duration_since(started)
+        );
+
+        for registry in &registries {
+            let mut reg = registry.lock().unwrap();
+            let ids: Vec<String> = reg.entries.keys().cloned().collect();
+            for id in ids {
+                let _ = reg.cancel(&id, Duration::from_millis(50));
+            }
+        }
+        drop(serial);
     }
 }

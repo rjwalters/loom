@@ -1,8 +1,7 @@
-//! Eager, out-of-cycle reclaim pass triggered from the 60s dispatch-cap loop
-//! (#7512) — closes the ~14-minute gap between "the disk axis is about to bind
-//! the dispatch cap down" ([`crate::work_finder`]'s
-//! `resolve_dynamic_max_concurrent`) and "the worktree reaper's own reclaim
-//! passes next run" ([`crate::worktree_reaper`]'s 15-minute cadence).
+//! Eager, out-of-cycle reclaim pass triggered from the 60s dispatch loop
+//! (#7512) — closes the ~14-minute gap between "free space on the worktree
+//! volume is below the floor" and "the worktree reaper's own reclaim passes
+//! next run" ([`crate::worktree_reaper`]'s 15-minute cadence).
 //!
 //! # The gap this closes
 //!
@@ -10,12 +9,10 @@
 //! pressure-triggered [`crate::deep_clean`] (#5919), and
 //! [`crate::docker_image_clean`] (#7332) — but all three run on the **worktree
 //! reaper's** `DEFAULT_WORKTREE_REAPER_INTERVAL_SECS = 900` ticker, a different
-//! `tokio::time::interval` from the **dispatch-cap** loop's
-//! `DEFAULT_WORK_FINDER_INTERVAL_SECS = 60`. Nothing coupled the two, so the
-//! dispatch loop could watch free space cross the floor and clamp the cap to 0
-//! for up to ~14 minutes before reclaim was even attempted. That decoupling —
-//! not an absent reclaim mechanism — is what starved dispatch on a host with
-//! gigabytes of its own reclaimable garbage sitting on disk.
+//! `tokio::time::interval` from the dispatch loop's
+//! `DEFAULT_WORK_FINDER_INTERVAL_SECS = 60`. Nothing coupled the two, so free
+//! space could sit below the floor for up to ~14 minutes before reclaim was
+//! even attempted, on a host with gigabytes of its own reclaimable garbage.
 //!
 //! # What this is, and is not
 //!
@@ -34,36 +31,17 @@
 //! cooldown, because the cooldown state each sub-pass consults is theirs, and
 //! this module neither reads nor resets it.
 //!
-//! # Trigger: edge, not level — plus a cooldown of this pass's own
+//! # Trigger: the free-disk floor, plus a cooldown of this pass's own
 //!
-//! [`disk_axis_binds_cap_down`] is the condition ("the disk term would reduce
-//! the cap below what RAM and the configured ceiling alone would allow"), and
-//! [`should_trigger`] fires only on its `false -> true` **transition**, never
-//! on every tick a stubbornly-full disk keeps it true. On top of that,
-//! [`run_pass`] enforces a cooldown of its own
-//! ([`DEFAULT_EAGER_MIN_INTERVAL_SECS`]).
-//!
-//! Both guards exist because of one sub-pass: the merged-PR worktree reap has
-//! **no cooldown of its own** — its cadence *is* the reaper's 15-minute ticker
-//! — and it makes real REST calls to the forge per candidate worktree. Edge
-//! triggering stops a disk that is full for an unrelated reason (a large
-//! dataset, another tenant) from turning the 60s loop into a forge-polling
-//! loop; the pass-level cooldown additionally bounds a disk *oscillating*
-//! across the binding threshold, which would otherwise produce a fresh "edge"
-//! every couple of ticks.
-//!
-//! # …and level, under pressure (#11192)
-//!
-//! Edge alone stopped re-arming on a worker whose disk term bound the cap on
-//! every tick: with `configured_max = 12` the disk term (`free / 8`) binds
-//! whenever free space is under 96 GB, so after one pass at 79 GB free the
-//! trigger stayed disarmed for 7.5 hours while free space fell to 0.
-//! [`EagerTrigger`] (in `level_trigger.rs`) therefore also fires on level:
-//! whenever free space is below the floor (`diskWarnFreeGb`), and whenever
-//! it has fallen another [`DEFAULT_EAGER_FALL_STEP_GB`] below the last pass's
-//! reading while the disk term keeps binding. The 10-minute pass cooldown and
-//! every sub-pass's own cooldown are unchanged, so a level trigger runs at
-//! most one pass per cooldown window.
+//! [`EagerTrigger`] (in `level_trigger.rs`) asks for a pass on every tick
+//! while free space is below the floor (`diskWarnFreeGb`). Since #12406 that
+//! is the only trigger: the disk term it used to watch ("the disk axis binds
+//! the dispatch cap down") is gone from admission. [`run_pass`] enforces a
+//! cooldown of its own ([`DEFAULT_EAGER_MIN_INTERVAL_SECS`]), and every
+//! sub-pass its own, so a level that stays true runs at most one pass per
+//! cooldown window. That matters for one sub-pass: the merged-PR worktree
+//! reap has **no cooldown of its own** and makes real REST calls to the forge
+//! per candidate worktree.
 //!
 //! # Tiers, safest first (#11192)
 //!
@@ -90,13 +68,9 @@
 //!
 //! # Scope: the probed root only
 //!
-//! The dispatch-cap loop's disk term is a single machine-level probe against
-//! one root (`workspace_root` in the single-workspace loop, `fallback_root` in
-//! the production multi-workspace loop — see `work_finder.rs`'s own doc
-//! comments for why). This module reclaims from that same root, mirroring the
-//! existing architecture rather than introducing a "reclaim from every
-//! registered root" fan-out for a disk term that was never measuring every
-//! root in the first place. The scheduled reaper still walks every registered
+//! The dispatch loop probes free space once, against its primary workspace
+//! (`fallback_root`). This module reclaims from that same root rather than
+//! fanning out to every registered root. The scheduled reaper still walks every registered
 //! root on its own cadence, unchanged.
 //!
 //! One exception (#11071): the idle kept-worktree artifact sub-pass
@@ -156,8 +130,7 @@ mod level_tests;
 
 /// Master on/off env override. Default-on: `0`/`false`/`no`/`off` disables,
 /// `1`/`true`/`yes`/`on` force-enables even when config disables it. Disabling
-/// restores exactly the pre-#7512 behavior — the dispatch loop clamps the cap
-/// immediately and only the scheduled reaper's own 15-minute cadence reclaims.
+/// leaves reclaim to the scheduled reaper's own 15-minute cadence.
 pub const EAGER_RECLAIM_ENABLE_ENV: &str = "LOOM_EAGER_RECLAIM";
 
 /// Env override for this pass's own anti-thrash cooldown (seconds).
@@ -166,19 +139,9 @@ pub const EAGER_RECLAIM_MIN_INTERVAL_ENV: &str = "LOOM_EAGER_RECLAIM_MIN_INTERVA
 /// Default cooldown between eager passes for one root: 10 minutes. Shorter
 /// than the reaper's own 15-minute cadence (otherwise this could never be the
 /// thing that runs first, which is the entire point), long enough that a disk
-/// oscillating across the binding threshold cannot re-run the uncooled
-/// merged-PR worktree reap every couple of dispatch ticks.
+/// pinned below the floor cannot re-run the uncooled merged-PR worktree reap
+/// every couple of dispatch ticks.
 pub const DEFAULT_EAGER_MIN_INTERVAL_SECS: u64 = 600;
-
-/// Env override for the level trigger's fall step (GB, #11192).
-pub const EAGER_RECLAIM_FALL_STEP_ENV: &str = "LOOM_EAGER_RECLAIM_FALL_STEP_GB";
-
-/// While the disk term keeps binding the cap down, a fresh pass is due each
-/// time free space has fallen this many GB below the last pass's reading
-/// (#11192). Ten GB is a little more than one sweep's flat admission charge
-/// (`LOOM_PER_WORKTREE_GB = 8`), so steady sweep growth re-arms the pass
-/// without a disk that only wobbles by a few GB doing so.
-pub const DEFAULT_EAGER_FALL_STEP_GB: u64 = 10;
 
 /// Cap on the empty-pass backoff exponent: the merged-PR worktree reap is
 /// spaced at most `cooldown * 2^3` (80 minutes at the default) apart while
@@ -202,9 +165,6 @@ pub struct EagerReclaimConfig {
     /// `…eagerReclaim.minIntervalSecs` — cooldown between eager passes for one
     /// root (a zero/invalid value drops to `None`).
     pub min_interval_secs: Option<u64>,
-    /// `…eagerReclaim.fallStepGb` — the level trigger's fall step (#11192;
-    /// a zero/invalid value drops to `None`).
-    pub fall_step_gb: Option<u64>,
 }
 
 /// Read `.loom/config.json → autonomous.worktreeReaper.eagerReclaim`,
@@ -224,10 +184,6 @@ pub fn read_eager_reclaim_config(repo_root: &Path) -> EagerReclaimConfig {
             .get("minIntervalSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
-        fall_step_gb: block
-            .get("fallStepGb")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&g| g > 0),
     }
 }
 
@@ -254,65 +210,6 @@ pub fn resolve_min_interval_secs(config: &EagerReclaimConfig) -> u64 {
         .unwrap_or(DEFAULT_EAGER_MIN_INTERVAL_SECS)
 }
 
-/// Resolve the level trigger's fall step (GB) — precedence **env > config >
-/// default**. A zero or unparseable env value falls through (#11192).
-#[must_use]
-pub fn resolve_fall_step_gb(config: &EagerReclaimConfig) -> u64 {
-    std::env::var(EAGER_RECLAIM_FALL_STEP_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&g| g > 0)
-        .or(config.fall_step_gb)
-        .unwrap_or(DEFAULT_EAGER_FALL_STEP_GB)
-}
-
-// ============================================================================
-// Trigger (pure)
-// ============================================================================
-
-/// Whether the disk term is the axis that binds
-/// [`crate::work_finder::resolve_dynamic_max_concurrent`] down this tick —
-/// i.e. whether `min(disk, ram, configured_max)` is strictly smaller than
-/// `min(ram, configured_max)` would have been on its own.
-///
-/// This is deliberately broader than "the cap is exactly 0": a root whose disk
-/// term has fallen to 1 while RAM and the operator ceiling would both allow 4
-/// is already losing dispatch slots to disk, and reclaiming then is what keeps
-/// it from reaching 0 at all. It also strictly *implies* the zero case
-/// whenever the other two axes are non-zero, so the acceptance criterion "the
-/// cap is never finalized as 0 without first attempting the eager reclaim" is
-/// covered.
-///
-/// Note that an **unmeasurable** disk probe is `usize::MAX`
-/// ([`crate::disk_headroom::disk_headroom_limit`]'s "unknown != zero"
-/// contract, #4164), which can never be strictly less than another term — so a
-/// broken `df` never triggers reclaim, exactly as it never triggers a clamp.
-#[must_use]
-pub fn disk_axis_binds_cap_down(
-    disk_headroom: usize,
-    ram_headroom: usize,
-    configured_max: usize,
-) -> bool {
-    disk_headroom < ram_headroom.min(configured_max)
-}
-
-/// Whether this tick should run an eager reclaim pass: the disk axis binds the
-/// cap down **now** and did not at the end of the previous tick.
-///
-/// `was_binding` is the caller's own across-tick state, updated *after* the
-/// post-reclaim disk re-probe so a pass that successfully freed space re-arms
-/// the trigger for a genuine future crossing. See the module docs for why this
-/// is edge-triggered rather than level-triggered.
-#[must_use]
-pub fn should_trigger(
-    was_binding: bool,
-    disk_headroom: usize,
-    ram_headroom: usize,
-    configured_max: usize,
-) -> bool {
-    !was_binding && disk_axis_binds_cap_down(disk_headroom, ram_headroom, configured_max)
-}
-
 // ============================================================================
 // Report
 // ============================================================================
@@ -336,9 +233,7 @@ pub struct EagerReclaimReport {
     /// Free GB on the worktree-root volume immediately before this pass,
     /// `None` if unmeasurable (unknown != zero, #4164).
     pub free_gb_before: Option<u64>,
-    /// Free GB immediately after. The dispatch loop does **not** read this to
-    /// finalize its cap — it re-probes its own disk term (`EagerTrigger::settle`)
-    /// — this is for the log line, the level trigger's next reference, and tests.
+    /// Free GB immediately after, for the log line and tests.
     pub free_gb_after: Option<u64>,
     /// The highest tier this pass reached (1–3; 0 when skipped, #11192).
     pub tiers_run: u8,
@@ -747,11 +642,8 @@ pub fn reset_state_for_test() {
 ///
 /// **Blocking** — it shells to `df`/`git`/`docker` and may probe the forge over
 /// REST, so callers must be on the blocking pool, exactly like the reaper's own
-/// `spawn_blocking(move || reap_repo(..))`. The dispatch loop deliberately
-/// `await`s it (through [`EagerTrigger::tick`]) before finalizing the tick's
-/// cap: the whole point is that the cap is not clamped on a stale
-/// measurement, and a tick whose disk axis is binding the cap down is a tick
-/// that was about to dispatch little or nothing anyway.
+/// `spawn_blocking(move || reap_repo(..))`. The dispatch loop `await`s it
+/// through [`EagerTrigger::tick`].
 pub fn run_for(repo_root: &Path, reason: TriggerReason) -> EagerReclaimReport {
     let config = read_eager_reclaim_config(repo_root);
     let reaper_config = crate::worktree_reaper::read_worktree_reaper_config(repo_root);
@@ -814,91 +706,6 @@ mod tests {
 
     fn t(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
-    }
-
-    // ===================================================================
-    // disk_axis_binds_cap_down — the condition
-    // ===================================================================
-
-    #[test]
-    fn test_binds_when_disk_is_the_smallest_axis() {
-        // disk 1 < min(ram 8, max 4) = 4 → disk is the binding axis.
-        assert!(disk_axis_binds_cap_down(1, 8, 4));
-    }
-
-    #[test]
-    fn test_binds_when_disk_is_zero() {
-        // The headline case from #7512: cap 0 while RAM and the ceiling are
-        // both healthy.
-        assert!(disk_axis_binds_cap_down(0, 8, 4));
-    }
-
-    #[test]
-    fn test_does_not_bind_when_another_axis_is_already_smaller() {
-        // RAM is the binding axis, not disk — reclaiming disk would not raise
-        // the cap by a single slot, so there is nothing to do eagerly.
-        assert!(!disk_axis_binds_cap_down(6, 2, 4));
-        // The operator ceiling binds.
-        assert!(!disk_axis_binds_cap_down(6, 8, 4));
-    }
-
-    #[test]
-    fn test_does_not_bind_on_a_tie() {
-        // Equal is not "binding down" — the cap is the same either way.
-        assert!(!disk_axis_binds_cap_down(4, 8, 4));
-    }
-
-    #[test]
-    fn test_unmeasurable_disk_never_binds() {
-        // `disk_headroom_limit` returns usize::MAX when `df` is unmeasurable
-        // (#4164, unknown != zero). It must never trigger a reclaim.
-        assert!(!disk_axis_binds_cap_down(usize::MAX, 8, 4));
-    }
-
-    #[test]
-    fn test_all_axes_zero_does_not_bind() {
-        // A configured_max of 0 (dispatch disabled outright) is not a disk
-        // problem — there is nothing to reclaim *for*.
-        assert!(!disk_axis_binds_cap_down(0, 0, 0));
-    }
-
-    // ===================================================================
-    // should_trigger — edge, not level (fires only when the disk term is
-    // about to bind the cap down, NOT on every dispatch tick).
-    // ===================================================================
-
-    #[test]
-    fn test_should_trigger_fires_on_a_fresh_crossing() {
-        assert!(should_trigger(false, 0, 8, 4));
-    }
-
-    #[test]
-    fn test_should_trigger_does_not_refire_while_stuck() {
-        // Already binding as of the previous tick: staying there must NOT
-        // refire — this is the property that keeps the no-cooldown merged-PR
-        // worktree reap sub-pass from becoming a 60s forge-polling loop.
-        assert!(!should_trigger(true, 0, 8, 4));
-    }
-
-    #[test]
-    fn test_should_trigger_does_not_fire_while_disk_is_healthy() {
-        assert!(!should_trigger(false, 9, 8, 4));
-    }
-
-    #[test]
-    fn test_should_trigger_fires_exactly_once_per_crossing_over_a_tick_run() {
-        // Ticks: disk = 9, 0, 0, 0, 9, 1 with ram 8 / configured_max 4.
-        // Exactly two crossings (index 1 and index 5) — not four, not six.
-        let ticks = [9usize, 0, 0, 0, 9, 1];
-        let mut was_binding = false;
-        let mut fired_at = Vec::new();
-        for (i, &disk) in ticks.iter().enumerate() {
-            if should_trigger(was_binding, disk, 8, 4) {
-                fired_at.push(i);
-            }
-            was_binding = disk_axis_binds_cap_down(disk, 8, 4);
-        }
-        assert_eq!(fired_at, vec![1, 5]);
     }
 
     // ===================================================================
@@ -1037,7 +844,7 @@ mod tests {
             min_interval_secs: 600,
             ledger: PassLedger::default(),
             floor_gb: 20,
-            reason: TriggerReason::Edge,
+            reason: TriggerReason::BelowFloor,
             now,
         }
     }
@@ -1198,7 +1005,7 @@ mod tests {
         reset_state_for_test();
         std::env::set_var(EAGER_RECLAIM_ENABLE_ENV, "0");
         let tmp = tempfile::tempdir().unwrap();
-        let report = run_for(tmp.path(), TriggerReason::Edge);
+        let report = run_for(tmp.path(), TriggerReason::BelowFloor);
         std::env::remove_var(EAGER_RECLAIM_ENABLE_ENV);
         assert!(report.skipped.as_deref().unwrap().contains("disabled"));
         assert!(
@@ -1225,7 +1032,6 @@ mod tests {
         assert!(!resolve_enabled(&EagerReclaimConfig {
             enabled: Some(false),
             min_interval_secs: None,
-            fall_step_gb: None,
         }));
     }
 
@@ -1236,7 +1042,6 @@ mod tests {
         assert!(!resolve_enabled(&EagerReclaimConfig {
             enabled: Some(true),
             min_interval_secs: None,
-            fall_step_gb: None,
         }));
         std::env::remove_var(EAGER_RECLAIM_ENABLE_ENV);
     }
@@ -1252,7 +1057,6 @@ mod tests {
         let config = EagerReclaimConfig {
             enabled: None,
             min_interval_secs: Some(120),
-            fall_step_gb: None,
         };
         assert_eq!(resolve_min_interval_secs(&config), 120);
         std::env::set_var(EAGER_RECLAIM_MIN_INTERVAL_ENV, "45");

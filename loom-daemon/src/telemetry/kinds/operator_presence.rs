@@ -1,23 +1,15 @@
 //! `operator.presence` (#11563): whether a person is at the keyboard of an
 //! operator session, and which issues and PRs that session is driving.
 //!
-//! ETA could not tell operator-driven work that stalls (the operator stepped
-//! away) from work that is merely slow. The daemon derives one of
-//! these (#12121, `crate::observability::presence_derive`) per active
-//! interactive session from its transcript, at most once per throttle window
-//! unless the human typed again.
+//! **Not emitted since #12121.** The daemon records only its own work: it does
+//! not read interactive session transcripts, and no hook or command emits this
+//! record any more. Consumers infer operator work from an item that advanced
+//! with no daemon span (`defaults/docs/operator-presence.md`). The type, its
+//! OTLP mapping and [`OPERATOR_PRESENCE_LOG_ATTRIBUTE_KEYS`] remain so rows
+//! already stored in a backend still decode.
 //!
 //! **No prompt or transcript content, by construction.** The struct has no
-//! text field besides ids and a forge login, and the deriver reads only the
-//! session id and record timestamps out of a transcript. A prompt cannot
-//! reach the wire because there is nowhere to put it.
-//!
-//! **Exported over OTLP** (`otlp: Logs`, `native: false`) now that #11525
-//! settled the transport — "the same path as every other fact". The scalars
-//! ride as the [`OPERATOR_PRESENCE_LOG_ATTRIBUTE_KEYS`] `loom.presence.*`
-//! attributes (which the collector's log `keep_keys` must list; contract-tested)
-//! and the body is the record's JSON, which carries the `driving[]` entries. Records
-//! go straight onto the observability queue.
+//! text field besides ids and a forge login.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -115,3 +115,155 @@ fn a_starved_repo_escalates_to_the_writer_once_every_n_ticks() {
     s.record(root, false, false);
     assert!(!s.escalate(root), "a healthy gather resets the count");
 }
+
+// ---- #12256: the concurrent gather --------------------------------------
+
+#[test]
+fn run_ordered_returns_job_order_whatever_finishes_first() {
+    // Earlier jobs sleep longer, so they finish last on a pool of workers.
+    let jobs: Vec<u64> = (0..16).collect();
+    for workers in [1, 3, 8, 32] {
+        let out = run_ordered(
+            jobs.clone(),
+            workers,
+            || (),
+            |pos, j| {
+                std::thread::sleep(Duration::from_millis(16 - j));
+                Some((pos, j * 10))
+            },
+        );
+        let got: Vec<(usize, (usize, u64))> = out;
+        let want: Vec<(usize, (usize, u64))> = (0..16)
+            .map(|i| (i, (i, u64::try_from(i).unwrap() * 10)))
+            .collect();
+        assert_eq!(got, want, "workers={workers}");
+    }
+}
+
+#[test]
+fn run_ordered_runs_concurrently_and_bounds_workers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let live = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let started = Instant::now();
+    let out = run_ordered(
+        (0..12).collect::<Vec<u32>>(),
+        4,
+        || (),
+        |_, j| {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(40));
+            live.fetch_sub(1, Ordering::SeqCst);
+            Some(j)
+        },
+    );
+    assert_eq!(out.len(), 12);
+    let peak = peak.load(Ordering::SeqCst);
+    assert!(peak <= 4, "peak {peak} exceeds the bound");
+    assert!(peak > 1, "the jobs never overlapped");
+    // 12 jobs × 40 ms serially is 480 ms; four at a time is about 120 ms.
+    assert!(started.elapsed() < Duration::from_millis(400));
+}
+
+#[test]
+fn run_ordered_drops_skipped_jobs_and_runs_setup_per_worker() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let setups = AtomicUsize::new(0);
+    let out = run_ordered(
+        vec!["a", "b", "c", "d"],
+        2,
+        || {
+            setups.fetch_add(1, Ordering::SeqCst);
+        },
+        |pos, j| (pos % 2 == 0).then_some(j),
+    );
+    assert_eq!(out, vec![(0, "a"), (2, "c")]);
+    assert_eq!(setups.load(Ordering::SeqCst), 2);
+    // No jobs: no worker, no result.
+    let none: Vec<(usize, u8)> = run_ordered(Vec::<u8>::new(), 8, || (), |_, j| Some(j));
+    assert!(none.is_empty());
+}
+
+#[test]
+fn run_ordered_takes_jobs_in_order_so_a_deadline_skips_from_the_end() {
+    // The walk admits under one lock in take order: with a budget of 3
+    // admissions, exactly the first three jobs run, on any worker count.
+    // `run_ordered` hands jobs out in order, but a worker that took job 2 can
+    // still lose the race to the lock against the one that took job 3, so the
+    // test gates each job on `entered` (a gate, not a sleep): job `pos`
+    // reaches the admission lock only after jobs `0..pos` have left it.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for workers in [1, 4] {
+        let admitted = std::sync::Mutex::new(0usize);
+        let entered = AtomicUsize::new(0);
+        let out = run_ordered(
+            (0..10).collect::<Vec<usize>>(),
+            workers,
+            || (),
+            |pos, j| {
+                while entered.load(Ordering::Acquire) != pos {
+                    std::thread::yield_now();
+                }
+                let admit = {
+                    let mut a = admitted.lock().unwrap();
+                    let admit = *a < 3;
+                    if admit {
+                        *a += 1;
+                    }
+                    admit
+                };
+                entered.fetch_add(1, Ordering::Release);
+                admit.then_some(j)
+            },
+        );
+        assert_eq!(out.iter().map(|(_, j)| *j).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+}
+
+#[test]
+fn gather_concurrency_reads_a_bounded_positive_integer() {
+    use serde_json::json;
+    let at = |v| json!({"autonomous": {"workFinder": {"gatherConcurrency": v}}});
+    assert_eq!(gather_concurrency_from(&json!({})), DEFAULT_GATHER_CONCURRENCY);
+    assert_eq!(gather_concurrency_from(&at(json!(1))), 1);
+    assert_eq!(gather_concurrency_from(&at(json!(12))), 12);
+    assert_eq!(gather_concurrency_from(&at(json!(1000))), MAX_GATHER_CONCURRENCY);
+    for bad in [json!(0), json!(-3), json!("8"), json!(2.5)] {
+        assert_eq!(gather_concurrency_from(&at(bad)), DEFAULT_GATHER_CONCURRENCY);
+    }
+}
+
+/// #12307: only the Direct backend lists per repo, so only it takes the key.
+#[test]
+fn the_mirror_worklist_ignores_gather_concurrency() {
+    use serde_json::json;
+    let mirror = |discovery: &str| {
+        json!({
+            "forge": { "mirror": {
+                "origin": "https://events.example.com",
+                "keyRef": "file:/k",
+                "discovery": discovery
+            } },
+            "autonomous": { "workFinder": { "gatherConcurrency": 12 } }
+        })
+    };
+    assert_eq!(gather_concurrency_for(&mirror("worklist")), 1);
+    assert_eq!(gather_concurrency_for(&mirror("direct")), 12);
+    assert_eq!(gather_concurrency_for(&mirror("per_call")), 12);
+    let standalone = json!({ "autonomous": { "workFinder": { "gatherConcurrency": 3 } } });
+    assert_eq!(gather_concurrency_for(&standalone), 3);
+}
+
+#[test]
+fn spawn_concurrency_reads_a_bounded_positive_integer() {
+    use serde_json::json;
+    let at = |v| json!({"autonomous": {"workFinder": {"spawnConcurrency": v}}});
+    assert_eq!(spawn_concurrency_from(&json!({})), DEFAULT_SPAWN_CONCURRENCY);
+    assert_eq!(spawn_concurrency_from(&at(json!(1))), 1);
+    assert_eq!(spawn_concurrency_from(&at(json!(6))), 6);
+    assert_eq!(spawn_concurrency_from(&at(json!(1000))), MAX_SPAWN_CONCURRENCY);
+    for bad in [json!(0), json!(-3), json!("4"), json!(2.5)] {
+        assert_eq!(spawn_concurrency_from(&at(bad)), DEFAULT_SPAWN_CONCURRENCY);
+    }
+}

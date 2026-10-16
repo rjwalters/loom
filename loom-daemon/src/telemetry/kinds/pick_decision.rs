@@ -170,10 +170,7 @@ impl PickSkipReason {
         Some(match disposition {
             Qd::Dispatched => return None,
             Qd::InFlight => Self::InFlight,
-            Qd::DeferredCapacity
-            | Qd::DeferredRampCap
-            | Qd::DeferredSaturation
-            | Qd::DeferredRepoCap => Self::Cap,
+            Qd::DeferredCapacity => Self::Cap,
             Qd::DeferredFileOverlap => Self::OverlapChain,
             Qd::DeferredBuildBackoff
             | Qd::RecheckInterval
@@ -203,6 +200,7 @@ impl PickSkipReason {
         use PassReason as P;
         match exclusion {
             Exclusion::PoolExhausted => Self::Quota,
+            Exclusion::MergeInFlight => Self::InFlight,
             Exclusion::BuildBackoff | Exclusion::CoolingDown => Self::Backoff,
             Exclusion::Pass(reason) => match reason {
                 P::Frozen | P::Operator | P::HardExclusion => Self::OperatorHold,
@@ -211,7 +209,7 @@ impl PickSkipReason {
                 P::Sequenced => Self::OverlapChain,
                 P::Blocked => Self::Blocked,
                 P::CapabilityMissing => Self::HostConstraint,
-                P::Epic | P::Proposal | P::NoStage => Self::NoStep,
+                P::Epic | P::Proposal | P::NoStage | P::Draft => Self::NoStep,
                 P::CiPending => Self::Backoff,
             },
         }
@@ -357,13 +355,14 @@ pub struct PickWorkspaceDraw {
     pub seed_host: Option<String>,
 }
 
-/// The step engine's item draws for one tick (#11896): the seed inputs, the
-/// weight-0 exclusion counts, each workspace's starting pool and every draw:
-/// enough to replay the sequence
+/// The step engine's item draws for one tick (#11896, #12185): the seed
+/// inputs, the two exponents, each repo's roster weight and in-flight count,
+/// the weight-0 exclusion counts, the starting pool of every repo and every
+/// draw: enough to replay the sequence
 /// ([`crate::step_dispatch::item_draw::replay_record`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickItemDraw {
-    /// `loom-draw/v2`.
+    /// `loom-draw/v3`.
     pub seed_scheme: String,
     /// The wall-clock minute the seeds were derived from, as decimal text.
     pub seed_minute: String,
@@ -371,31 +370,78 @@ pub struct PickItemDraw {
     pub seed_host: String,
     /// The process tick counter the seeds were derived from, as decimal text.
     pub tick_counter: String,
-    /// How many item draws the tick made, across workspaces.
+    /// How many item draws the tick made.
     pub draws_total: usize,
+    /// The backlog exponent α the pool was weighed with, as decimal text
+    /// (it parses back to the same float). Header: repeats on every chunk.
+    #[serde(default)]
+    pub backlog_exponent: String,
+    /// The busy-ness exponent β, as decimal text. Header.
+    #[serde(default)]
+    pub busy_exponent: String,
+    /// Every repo with an item in the pool: its roster weight, its
+    /// `in_flight_repo` and its starting `n_items`. Header: repeats on every
+    /// chunk, so read it from one chunk only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<PickItemRepo>,
+    /// The repos a per-repo cap took out of the pool mid-tick. Header.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closures: Vec<PickItemClosure>,
     /// Weight-0 items per workspace and reason. Header: repeats on every
     /// chunk, so read it from one chunk only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded: Vec<PickItemExclusion>,
-    /// Each drawn workspace's pool before its first draw, in pool order
-    /// (the chunk's in-order slice). Empty only when nothing was drawn.
+    /// The pool before the first draw, repos in workspace order and each
+    /// repo's items in item order; `index` counts across the whole pool (the
+    /// chunk's in-order slice). Empty only when nothing was drawn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pools: Vec<PickItemPoolEntry>,
     /// Every draw, in order (the chunk's in-order slice).
     pub draws: Vec<PickItemDrawStep>,
-    /// The workspaces whose draw stopped because their pool's total weight
-    /// overflowed `u64` (`DrawError::WeightOverflow`, #11909): no further
-    /// item was drawn from them this tick. Header: repeats on every chunk.
+    /// The repos in the pool when its total weight overflowed `u64`
+    /// (`DrawError::WeightOverflow`, #11909): no further item was drawn this
+    /// tick. Header: repeats on every chunk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weight_overflow: Vec<String>,
 }
 
-/// One item of a workspace's starting pool.
+/// One repo's terms in the item draw (#12185).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemRepo {
+    /// Forge `owner/repo`.
+    pub repo: String,
+    /// `w_repo`: the roster weight.
+    pub weight: u32,
+    /// `in_flight_repo`: the repo's items worked on when the tick drew.
+    pub in_flight: usize,
+    /// `n_items`: the repo's items in the starting pool.
+    pub items: usize,
+    /// `S_r`: the sum of their item weights.
+    pub pool_weight: u64,
+}
+
+/// A repo a per-repo cap took out of the item pool mid-tick, or (with
+/// `steps`) the steps of a repo the tick took out: a repo that started a
+/// Champion merge draws no second one (#12494).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemClosure {
+    /// Forge `owner/repo`.
+    pub repo: String,
+    /// Draws taken before it closed: it is absent from every draw with an
+    /// index at least this.
+    pub after_draw: u32,
+    /// The steps closed (`champion_merge`, ...), as `pools[].step` names
+    /// them; empty (and absent on the wire): the whole repo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<String>,
+}
+
+/// One item of the starting pool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickItemPoolEntry {
     /// Forge `owner/repo`.
     pub repo: String,
-    /// 0-based position in the workspace's pool.
+    /// 0-based position in the whole pool.
     pub index: u32,
     /// The number the step acts on (the PR for a PR step).
     pub number: u32,
@@ -405,7 +451,8 @@ pub struct PickItemPoolEntry {
     pub pr: Option<u32>,
     /// The step (`builder`, `judge`, ...).
     pub step: String,
-    /// The draw weight.
+    /// The item weight `iw`: `priority × (divisor_min + min(age_min,
+    /// cap_min))`.
     pub weight: u64,
     /// The priority factor.
     pub priority: u32,
@@ -430,12 +477,13 @@ pub struct PickItemExclusion {
 }
 
 /// One item draw: the seed, the pool, the roll and the drawn item's weight
-/// terms (`weight = actionable × priority × age`).
+/// terms (`weight = actionable × priority × age`, and the repo terms the pool
+/// weight scales it by).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickItemDrawStep {
-    /// Forge `owner/repo`: also the seed's `workspace` input.
+    /// Forge `owner/repo` of the drawn item.
     pub repo: String,
-    /// 0-based draw index within the workspace (the seed's last input).
+    /// 0-based draw index within the tick (the seed's last input).
     pub draw_index: u32,
     /// The draw's seed, as decimal text.
     pub seed: String,
@@ -445,8 +493,8 @@ pub struct PickItemDrawStep {
     pub total_weight: u64,
     /// The roll in `0..total_weight`.
     pub roll: u64,
-    /// The drawn item's index in the pool as it stood: the workspace's
-    /// `pools[]` entries minus its earlier picks, in pool order.
+    /// The drawn item's index in the pool as it stood: the `pools[]` entries
+    /// minus earlier picks and closed repos, in pool order.
     pub picked_index: usize,
     /// The number the step acts on (the PR for a PR step).
     pub number: u32,
@@ -456,9 +504,27 @@ pub struct PickItemDrawStep {
     pub pr: Option<u32>,
     /// The step (`builder`, `judge`, `champion_merge`, ...).
     pub step: String,
-    /// The drawn item's weight, `priority × (divisor_min + min(age_min,
-    /// cap_min))`.
+    /// The drawn item's item weight `iw`, `priority × (divisor_min +
+    /// min(age_min, cap_min))`.
     pub weight: u64,
+    /// The drawn item's draw weight in this draw: `w_repo × iw ×
+    /// S_r^(α−1) × (1 + in_flight_repo)^(−β)`, scaled to integers
+    /// ([`crate::step_dispatch::item_draw::pool_weights`]). Its share of
+    /// `total_weight` is the item's probability.
+    #[serde(default)]
+    pub draw_weight: u64,
+    /// `w_repo`: the drawn item's repo's roster weight.
+    #[serde(default)]
+    pub repo_weight: u32,
+    /// `n_items`: the repo's items in the pool at this draw.
+    #[serde(default)]
+    pub repo_items: usize,
+    /// `S_r`: the sum of their item weights.
+    #[serde(default)]
+    pub repo_pool_weight: u64,
+    /// `in_flight_repo`: the repo's items worked on.
+    #[serde(default)]
+    pub in_flight_repo: usize,
     /// Always 1 for a drawn item.
     pub actionable: u8,
     /// The priority factor.

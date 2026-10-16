@@ -11,6 +11,7 @@ use super::*;
 mod fact_id;
 mod fleet_provenance;
 mod host_name;
+mod host_status;
 mod loom_kind;
 mod record_id;
 mod start_facts;
@@ -211,8 +212,6 @@ fn host_health_envelope() -> TelemetryEnvelope {
             worktree_root_free_gb: Some(200),
             worktree_root_total_gb: Some(1000),
             active_sweep_ids: Vec::new(),
-            dispatch_halted: false,
-            halt_reason: None,
             managed_repos: Vec::new(),
             roles: crate::telemetry::RoleTickHealth {
                 total: 12,
@@ -226,7 +225,6 @@ fn host_health_envelope() -> TelemetryEnvelope {
                 }],
             },
             protection: None,
-            admission_brake: None,
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
             captainless_singleton_jobs: Vec::new(),
@@ -246,6 +244,8 @@ fn host_health_envelope() -> TelemetryEnvelope {
                 memory_pressure: Some(crate::host_pressure::MemoryPressure::Some),
                 oom_kill_total: Some(3),
             }),
+            agent_scopes: Vec::new(),
+            agent_scopes_total: None,
         }),
     )
 }
@@ -532,6 +532,46 @@ fn unmeasured_memory_summary_produces_no_memory_gauges_at_all() {
 }
 
 #[test]
+fn agent_scope_census_maps_to_aggregate_gauges_and_is_absent_when_unmeasured() {
+    // #12166: unmeasured census -> no gauges at all, never a zero.
+    let names_of = |e: TelemetryEnvelope| -> Vec<String> {
+        let req = build_metrics_request(&[e]).unwrap();
+        req.resource_metrics[0].scope_metrics[0]
+            .metrics
+            .iter()
+            .map(|m| m.name.clone())
+            .collect()
+    };
+    let absent = names_of(host_health_envelope());
+    assert!(!absent
+        .iter()
+        .any(|n| n.starts_with("loom.host.agent_scope")));
+
+    let mut e = host_health_envelope();
+    if let TelemetryRecord::HostHealth(r) = &mut e.record {
+        r.agent_scopes_total = Some(3);
+        r.agent_scopes = vec![crate::telemetry::AgentScopeSummary {
+            scope: "loom-agent-x.scope".into(),
+            age_sec: Some(5 * 3600),
+            agent_alive: false,
+            oldest_pid: None,
+            oldest_comm: None,
+            oldest_age_sec: None,
+            cpu_usec: None,
+            transcript_age_sec: None,
+        }];
+    }
+    let names = names_of(e);
+    for want in [
+        "loom.host.agent_scopes",
+        "loom.host.agent_scopes_orphaned",
+        "loom.host.agent_scope_orphan_max_age_seconds",
+    ] {
+        assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
+    }
+}
+
+#[test]
 fn role_tick_health_becomes_gauge_metrics_with_the_persistent_failure_count() {
     // #5022: `host_health_envelope`'s fixture carries one persistent
     // failure (judge @ /repos/loom, 2 failed ticks of 12 total, 10 ok).
@@ -690,12 +730,9 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: crate::telemetry::RoleTickHealth::default(),
         protection: None,
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -703,6 +740,8 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     };
     let batch = vec![envelope(
         "host-c",
@@ -928,6 +967,7 @@ fn role_tick_outcome_envelope(
             preference_tier: None,
             preference_tap: None,
             role_draw: None,
+            prompt: None,
             // Issue #8507: a Claude tick writes no launch record.
             runtime: None,
             provider: None,

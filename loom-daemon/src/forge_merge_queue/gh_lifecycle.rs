@@ -321,6 +321,7 @@ fn with_live<R>(
         execution_enabled: super::QUEUE_EXECUTION_ENABLED,
         queue: &queue,
         forge: &forge,
+        statuses: &forge,
         events: &events,
         now: chrono::Utc::now(),
     };

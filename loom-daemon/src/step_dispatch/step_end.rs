@@ -36,6 +36,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::outcome_ledger::{self, PostState};
+use super::session_ledger;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_ledger::StepRun;
 use crate::sweep_registry::step_spawn::ended::{self, EndedStep};
@@ -101,7 +102,7 @@ pub fn run_of(
 pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     match spawn_reason {
         "pool_exhausted" | "no_token_pool" | "token_selection_failed" => Some("pool_gate"),
-        "claimed" | "claim_unverified" | "backstop_hold" => Some("claimed"),
+        "claimed" | "claim_unverified" | "backstop_hold" | "peer_active" => Some("claimed"),
         // A failed spawn cools down like a gate, so it is not respawned on
         // every tick. A missing `/loom:<role>` command is refused before the
         // spawn (`workspace_commands_missing`) and says nothing about the
@@ -172,6 +173,10 @@ pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
             .map(|(labels, closed)| post_state(step.role, &labels, closed))
         });
         let run = run_of(&step, outcome_line(&step).as_ref(), post);
+        // #11913: the step's session, for a later step on the same item.
+        if let Some(noted) = session_ledger::take_session(root, &step.sweep_id) {
+            session_ledger::record_ended(root, step.item, step.role, &noted, chrono::Utc::now());
+        }
         log::info!(
             "work_finder: {} step on #{} ({}) classified {} {}",
             step.role,
@@ -212,6 +217,12 @@ mod tests {
         assert!(moved(StepRole::Judge, &["loom:pr"]));
         assert!(!moved(StepRole::Doctor, &["loom:changes-requested"]));
         assert!(moved(StepRole::ChampionMerge, &["loom:blocked"]));
+        // A PR triage (#12499) moved only once it carries a stage or a hold:
+        // an unlabelled PR it left alone did not.
+        assert!(moved(StepRole::ChampionMerge, &["loom:review-requested"]));
+        assert!(moved(StepRole::ChampionMerge, &["loom:operator"]));
+        assert!(!moved(StepRole::ChampionMerge, &[]));
+        assert!(!moved(StepRole::ChampionMerge, &["loom:pr", "loom:blocked"]));
         // A Builder whose PR is open moved, whatever its labels say.
         let p = SweepRegistry::step_post_state(
             StepRole::Builder,
@@ -248,6 +259,8 @@ mod tests {
         assert_eq!(ledger_reason("pool_exhausted"), Some("pool_gate"));
         assert_eq!(ledger_reason("token_selection_failed"), Some("pool_gate"));
         assert_eq!(ledger_reason("backstop_hold"), Some("claimed"));
+        // #12105: another actor working the PR cools the Doctor down.
+        assert_eq!(ledger_reason("peer_active"), Some("claimed"));
         assert_eq!(ledger_reason("claim_unverified"), Some("claimed"));
         assert_eq!(ledger_reason("claim_lost"), Some("claim_lost"));
         assert_eq!(ledger_reason("roll_paused"), None);

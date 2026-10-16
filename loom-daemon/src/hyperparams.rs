@@ -42,9 +42,9 @@
 //!    run is reproducible from the exact vector it ran under.
 //!
 //! Tranche 1 fields (each a real consumed tunable — see the field docs):
-//! `dispatch.{tickIntervalSecs,maxConcurrent,maxAdmissionsPerTick}` (plus
-//! the workspace draw's `dispatch.weightBonus{RedMainFix,VeryImportant,Important}`,
-//! #11742),
+//! `dispatch.{tickIntervalSecs,maxConcurrent}` (plus
+//! the item draw's `dispatch.{itemWeight*,itemAge*,backlogExponent,busyExponent}`,
+//! #11896, #12185),
 //! `lifecycle.{leaseTtlMinutes,idleExitMinutes}`, and
 //! `rework.{buildBackoffHigh,buildBackoffLow}`. The `champion` group (#10753)
 //! carries Champion's promotion-throughput knobs
@@ -65,15 +65,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::config_resolver;
-use crate::priority_pick::{
-    DEFAULT_BONUS_IMPORTANT, DEFAULT_BONUS_RED_MAIN_FIX, DEFAULT_BONUS_VERY_IMPORTANT,
-    WEIGHT_BONUS_RANGE,
-};
 use crate::step_dispatch::item_draw;
 use crate::work_finder::{
     build_backoff::{BuildBackoffConfig, DEFAULT_HIGH, DEFAULT_LOW},
-    DEFAULT_MAX_ADMISSIONS_PER_TICK, DEFAULT_WORK_FINDER_INTERVAL_SECS,
-    DEFAULT_WORK_FINDER_MAX_CONCURRENT,
+    DEFAULT_WORK_FINDER_INTERVAL_SECS, DEFAULT_WORK_FINDER_MAX_CONCURRENT,
 };
 
 /// Env var carrying a **hyperparameter vector** as a JSON object — the
@@ -116,27 +111,9 @@ pub struct DispatchParams {
     /// Operator ceiling on concurrent sweeps this host admits. Source:
     /// `work_finder::DEFAULT_WORK_FINDER_MAX_CONCURRENT` (3). Legacy:
     /// `autonomous.workFinder.maxConcurrent`; env:
-    /// `LOOM_WORK_FINDER_MAX_CONCURRENT`. The dynamic cap is additionally
-    /// bounded by disk/RAM headroom, so this is an upper bound, not a target.
-    /// Range `[1, 256]`.
+    /// `LOOM_WORK_FINDER_MAX_CONCURRENT`. This is the cap, and nothing else
+    /// limits it (#12406). Range `[1, 256]`.
     pub max_concurrent: usize,
-    /// How many *new* sweeps one tick may admit (the #4234 ramp cap).
-    /// Source: `work_finder::DEFAULT_MAX_ADMISSIONS_PER_TICK` (3). Legacy:
-    /// `autonomous.workFinder.maxAdmissionsPerTick`; env:
-    /// `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK`. Range `[1, 64]`.
-    pub max_admissions_per_tick: usize,
-    /// Points the workspace draw adds to a repo's `weight` while its next
-    /// candidate is a verified red-main fix (`dispatch.weightBonusRedMainFix`,
-    /// #11742). Source: `priority_pick::DEFAULT_BONUS_RED_MAIN_FIX` (400). No
-    /// legacy config home and no single-knob env. Range `[0, 1000000]`.
-    /// Appended last: field order is the digest's canonical serialization.
-    pub weight_bonus_red_main_fix: u32,
-    /// Points added while the repo has dispatchable `loom:very-important`
-    /// work (`dispatch.weightBonusVeryImportant`, #11742). Default 100.
-    pub weight_bonus_very_important: u32,
-    /// Points added while the repo has dispatchable `loom:important` work
-    /// (`dispatch.weightBonusImportant`, #11742). Default 20.
-    pub weight_bonus_important: u32,
     /// The step engine's item-draw priority factor for a red-main fix
     /// (`dispatch.itemWeightRedMain`, #11896). Default 50. Range
     /// `[1, 1000000]`. No legacy home, no single-knob env.
@@ -153,6 +130,15 @@ pub struct DispatchParams {
     /// Divisor of the item-draw age term, `1 + min(age, cap) / divisor`
     /// (`dispatch.itemAgeDivisorDays`, #11896). Default 30. Range `[1, 3650]`.
     pub item_age_divisor_days: u32,
+    /// Backlog exponent α of the single-pool item draw
+    /// (`dispatch.backlogExponent`, #12185): 0 keeps a repo's share fixed
+    /// whatever its backlog (the two-stage draw), 1 makes the pool flat. A
+    /// float. Default 0. Range `[0, 1]`. No legacy home, no single-knob env.
+    pub backlog_exponent: f64,
+    /// Busy-ness exponent β (`dispatch.busyExponent`, #12185): a repo's
+    /// weight is divided by `(1 + in_flight_repo)^β`. A float. Default 0 (off).
+    /// Range `[0, 100]`.
+    pub busy_exponent: f64,
 }
 
 /// Lifecycle timeout tunables — how long Loom waits before treating work or
@@ -237,15 +223,13 @@ impl Default for Hyperparameters {
             dispatch: DispatchParams {
                 tick_interval_secs: DEFAULT_WORK_FINDER_INTERVAL_SECS,
                 max_concurrent: DEFAULT_WORK_FINDER_MAX_CONCURRENT,
-                max_admissions_per_tick: DEFAULT_MAX_ADMISSIONS_PER_TICK,
-                weight_bonus_red_main_fix: DEFAULT_BONUS_RED_MAIN_FIX,
-                weight_bonus_very_important: DEFAULT_BONUS_VERY_IMPORTANT,
-                weight_bonus_important: DEFAULT_BONUS_IMPORTANT,
                 item_weight_red_main: item_draw::DEFAULT_WEIGHT_RED_MAIN,
                 item_weight_very_important: item_draw::DEFAULT_WEIGHT_VERY_IMPORTANT,
                 item_weight_important: item_draw::DEFAULT_WEIGHT_IMPORTANT,
                 item_age_cap_days: item_draw::DEFAULT_AGE_CAP_DAYS,
                 item_age_divisor_days: item_draw::DEFAULT_AGE_DIVISOR_DAYS,
+                backlog_exponent: item_draw::DEFAULT_BACKLOG_EXPONENT,
+                busy_exponent: item_draw::DEFAULT_BUSY_EXPONENT,
             },
             lifecycle: LifecycleParams {
                 lease_ttl_minutes: crate::claim_reconciliation::DEFAULT_LEASE_TTL_MINUTES,
@@ -391,7 +375,6 @@ impl std::fmt::Display for Violation {
 /// Range checks for the integer fields, as `(min, max)` inclusive.
 const TICK_INTERVAL_SECS_RANGE: (u64, u64) = (5, 3600);
 const MAX_CONCURRENT_RANGE: (u64, u64) = (1, 256);
-const MAX_ADMISSIONS_PER_TICK_RANGE: (u64, u64) = (1, 64);
 const LEASE_TTL_MINUTES_MAX: f64 = 1440.0;
 const IDLE_EXIT_MINUTES_RANGE: (u64, u64) = (1, 10080);
 const BUILD_BACKOFF_HIGH_RANGE: (u64, u64) = (1, 100_000);
@@ -484,40 +467,93 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
             key.as_str(),
             "tickIntervalSecs"
                 | "maxConcurrent"
-                | "maxAdmissionsPerTick"
-                | "weightBonusRedMainFix"
-                | "weightBonusVeryImportant"
-                | "weightBonusImportant"
                 | "itemWeightRedMain"
                 | "itemWeightVeryImportant"
                 | "itemWeightImportant"
                 | "itemAgeCapDays"
                 | "itemAgeDivisorDays"
-                // Retired with the softmax (#11742). Still accepted, and
-                // ignored, so a host config that set it keeps starting.
+                | "backlogExponent"
+                | "busyExponent"
+                // Retired with the softmax (#11742) and the workspace draw
+                // (#12185). Still accepted, and ignored, so a host config
+                // that set them keeps starting (`--validate` warns).
+                // Retired with the per-tick ramp cap (#12406), the same way.
+                | "maxAdmissionsPerTick"
                 | "drawTemperature"
+                | "weightBonusRedMainFix"
+                | "weightBonusVeryImportant"
+                | "weightBonusImportant"
         ) {
             violations.push(Violation::new(format!("dispatch.{key}"), "unknown key"));
         }
     }
     check_u64(group, "dispatch", "tickIntervalSecs", TICK_INTERVAL_SECS_RANGE, violations);
     check_u64(group, "dispatch", "maxConcurrent", MAX_CONCURRENT_RANGE, violations);
-    check_u64(
-        group,
-        "dispatch",
-        "maxAdmissionsPerTick",
-        MAX_ADMISSIONS_PER_TICK_RANGE,
-        violations,
-    );
-    for key in [
-        "weightBonusRedMainFix",
-        "weightBonusVeryImportant",
-        "weightBonusImportant",
-    ] {
-        check_u64(group, "dispatch", key, WEIGHT_BONUS_RANGE, violations);
-    }
     for (key, range) in item_draw::HYPERPARAM_KEYS {
         check_u64(group, "dispatch", key, range, violations);
+    }
+    check_f64(
+        group,
+        "dispatch",
+        item_draw::BACKLOG_EXPONENT_KEY,
+        item_draw::BACKLOG_EXPONENT_RANGE,
+        violations,
+    );
+    check_f64(
+        group,
+        "dispatch",
+        item_draw::BUSY_EXPONENT_KEY,
+        item_draw::BUSY_EXPONENT_RANGE,
+        violations,
+    );
+}
+
+/// The `dispatch` keys that are accepted but no longer read, found in
+/// `layer` (the retired draw knobs, #12185): for a warning, never a
+/// violation.
+#[must_use]
+pub fn retired_dispatch_keys(layer: &Value) -> Vec<&'static str> {
+    RETIRED_DISPATCH_KEYS
+        .iter()
+        .copied()
+        .filter(|key| {
+            layer
+                .get("dispatch")
+                .and_then(|g| g.get(*key))
+                .is_some_and(|v| !v.is_null())
+        })
+        .collect()
+}
+
+/// `hyperparameters.dispatch` keys still accepted and ignored. `drawTemperature`
+/// went with the softmax (#11742); the `weightBonus*` points went with the
+/// workspace draw (#12185), whose job the item weights' priority factors do;
+/// `maxAdmissionsPerTick` went with the per-tick ramp cap (#12406).
+const RETIRED_DISPATCH_KEYS: [&str; 5] = [
+    "maxAdmissionsPerTick",
+    "drawTemperature",
+    "weightBonusRedMainFix",
+    "weightBonusVeryImportant",
+    "weightBonusImportant",
+];
+
+/// Check one float field: a number, finite, inside the inclusive range.
+fn check_f64(
+    group: &Value,
+    group_name: &str,
+    key: &str,
+    (lo, hi): (f64, f64),
+    violations: &mut Vec<Violation>,
+) {
+    let path = format!("{group_name}.{key}");
+    match group.get(key) {
+        None | Some(Value::Null) => {}
+        Some(value) => match value.as_f64() {
+            None => violations.push(Violation::new(path, "expected a number")),
+            Some(x) if !x.is_finite() || x < lo || x > hi => violations
+                .push(Violation::new(path, format!("expected {lo}..={hi} (inclusive), got {x}"))),
+            Some(_) => {}
+        },
     }
 }
 
@@ -696,6 +732,41 @@ fn pick_u64(
     value
 }
 
+/// Pick one `dispatch` float field (vector > block > default), recording its
+/// source. A value outside `range` or not finite reads as absent, like
+/// [`pick_u64`]'s mistyped values; [`validate_layer`] is the strict gate.
+fn pick_f64(
+    vector: Option<&Value>,
+    block: &Value,
+    key: &str,
+    (lo, hi): (f64, f64),
+    default: f64,
+    sources: &mut BTreeMap<String, Source>,
+) -> f64 {
+    let from_layer = tier_value(vector, block, "dispatch", key)
+        .and_then(Value::as_f64)
+        .filter(|x| x.is_finite() && (lo..=hi).contains(x));
+    let (value, source) = match from_layer {
+        Some(x) => {
+            let from_vector = vector
+                .and_then(|v| v.get("dispatch"))
+                .and_then(|g| g.get(key))
+                .is_some();
+            (
+                x,
+                if from_vector {
+                    Source::EnvVector
+                } else {
+                    Source::Config
+                },
+            )
+        }
+        None => (default, Source::Default),
+    };
+    sources.insert(format!("dispatch.{key}"), source);
+    value
+}
+
 /// Resolve the effective vector for `root` down the full precedence chain,
 /// recording per-field provenance. Pure read — no globals, no validation
 /// (call [`validate_layer`] for the strict gate, [`startup_init`] for both).
@@ -731,7 +802,7 @@ pub fn resolve_effective(root: &Path) -> Resolved {
     let idle_legacy = crate::idle_exit::parse_effective(&effective);
 
     let mut sources = BTreeMap::new();
-    // The item draw's knobs (#11896): no legacy tier, like the bonuses.
+    // The item draw's knobs (#11896): no legacy tier.
     let mut item_sources = BTreeMap::new();
     let mut pick_item = |i: usize, default: u32| -> u32 {
         let key = item_draw::HYPERPARAM_KEYS[i].0;
@@ -766,51 +837,27 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 DEFAULT_WORK_FINDER_MAX_CONCURRENT as u64,
                 &mut sources,
             ) as usize,
-            max_admissions_per_tick: pick_u64(
-                vector.as_ref(),
-                &block,
-                "dispatch",
-                "maxAdmissionsPerTick",
-                wf_legacy.max_admissions_per_tick.map(|n| n as u64),
-                DEFAULT_MAX_ADMISSIONS_PER_TICK as u64,
-                &mut sources,
-            ) as usize,
-            // No legacy tier: the keys are new with #11742.
-            weight_bonus_red_main_fix: u32::try_from(pick_u64(
-                vector.as_ref(),
-                &block,
-                "dispatch",
-                "weightBonusRedMainFix",
-                None,
-                u64::from(DEFAULT_BONUS_RED_MAIN_FIX),
-                &mut sources,
-            ))
-            .unwrap_or(DEFAULT_BONUS_RED_MAIN_FIX),
-            weight_bonus_very_important: u32::try_from(pick_u64(
-                vector.as_ref(),
-                &block,
-                "dispatch",
-                "weightBonusVeryImportant",
-                None,
-                u64::from(DEFAULT_BONUS_VERY_IMPORTANT),
-                &mut sources,
-            ))
-            .unwrap_or(DEFAULT_BONUS_VERY_IMPORTANT),
-            weight_bonus_important: u32::try_from(pick_u64(
-                vector.as_ref(),
-                &block,
-                "dispatch",
-                "weightBonusImportant",
-                None,
-                u64::from(DEFAULT_BONUS_IMPORTANT),
-                &mut sources,
-            ))
-            .unwrap_or(DEFAULT_BONUS_IMPORTANT),
             item_weight_red_main: pick_item(0, item_draw::DEFAULT_WEIGHT_RED_MAIN),
             item_weight_very_important: pick_item(1, item_draw::DEFAULT_WEIGHT_VERY_IMPORTANT),
             item_weight_important: pick_item(2, item_draw::DEFAULT_WEIGHT_IMPORTANT),
             item_age_cap_days: pick_item(3, item_draw::DEFAULT_AGE_CAP_DAYS),
             item_age_divisor_days: pick_item(4, item_draw::DEFAULT_AGE_DIVISOR_DAYS),
+            backlog_exponent: pick_f64(
+                vector.as_ref(),
+                &block,
+                item_draw::BACKLOG_EXPONENT_KEY,
+                item_draw::BACKLOG_EXPONENT_RANGE,
+                item_draw::DEFAULT_BACKLOG_EXPONENT,
+                &mut item_sources,
+            ),
+            busy_exponent: pick_f64(
+                vector.as_ref(),
+                &block,
+                item_draw::BUSY_EXPONENT_KEY,
+                item_draw::BUSY_EXPONENT_RANGE,
+                item_draw::DEFAULT_BUSY_EXPONENT,
+                &mut item_sources,
+            ),
         },
         lifecycle: LifecycleParams {
             lease_ttl_minutes: {
@@ -973,6 +1020,9 @@ pub fn startup_init(root: &Path) -> Result<()> {
             root.join(".loom/config.json").display(),
         );
     }
+    for key in retired_dispatch_keys(&layer) {
+        log::warn!("hyperparams: dispatch.{key} is retired and ignored; delete it from the config");
+    }
     let resolved = resolve_effective(root);
     let fields: String = resolved
         .sources
@@ -1032,6 +1082,12 @@ impl HyperparamsArgs {
         }
         let layer = layer(&self.workspace);
         let violations = validate_layer(&layer);
+        for key in retired_dispatch_keys(&layer) {
+            eprintln!(
+                "hyperparams: warning: dispatch.{key} is retired and ignored; delete it from \
+                 the config"
+            );
+        }
         if violations.is_empty() {
             if self.json {
                 println!("{{\"ok\": true, \"violations\": []}}");
@@ -1090,26 +1146,6 @@ impl HyperparamsArgs {
             resolved.params.dispatch.max_concurrent,
             resolved.sources["dispatch.maxConcurrent"].as_str()
         );
-        println!(
-            "dispatch.maxAdmissionsPerTick  = {:>6}  [{}]",
-            resolved.params.dispatch.max_admissions_per_tick,
-            resolved.sources["dispatch.maxAdmissionsPerTick"].as_str()
-        );
-        println!(
-            "dispatch.weightBonusRedMainFix    = {:>6}  [{}]",
-            resolved.params.dispatch.weight_bonus_red_main_fix,
-            resolved.sources["dispatch.weightBonusRedMainFix"].as_str()
-        );
-        println!(
-            "dispatch.weightBonusVeryImportant = {:>6}  [{}]",
-            resolved.params.dispatch.weight_bonus_very_important,
-            resolved.sources["dispatch.weightBonusVeryImportant"].as_str()
-        );
-        println!(
-            "dispatch.weightBonusImportant     = {:>6}  [{}]",
-            resolved.params.dispatch.weight_bonus_important,
-            resolved.sources["dispatch.weightBonusImportant"].as_str()
-        );
         let d = &resolved.params.dispatch;
         for (key, value) in [
             ("itemWeightRedMain", d.item_weight_red_main),
@@ -1117,6 +1153,15 @@ impl HyperparamsArgs {
             ("itemWeightImportant", d.item_weight_important),
             ("itemAgeCapDays", d.item_age_cap_days),
             ("itemAgeDivisorDays", d.item_age_divisor_days),
+        ] {
+            println!(
+                "dispatch.{key:<24}= {value:>6}  [{}]",
+                resolved.sources[&format!("dispatch.{key}")].as_str()
+            );
+        }
+        for (key, value) in [
+            (item_draw::BACKLOG_EXPONENT_KEY, d.backlog_exponent),
+            (item_draw::BUSY_EXPONENT_KEY, d.busy_exponent),
         ] {
             println!(
                 "dispatch.{key:<24}= {value:>6}  [{}]",

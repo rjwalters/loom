@@ -23,10 +23,11 @@
 //! | `failed` inside the fast-fail window, Builder step | [`Effect::FastFailLadder`]: the #11854/#11872 ladder |
 //! | `failed` inside the fast-fail window, any other step | [`Effect::FastFailWindow`]: a ledger-local doubling window, never the issue quarantine |
 //! | `failed` later | [`Effect::Failed`]: counted toward the repeat cap only |
-//! | Champion `held` / `blocked` | [`Effect::ForgeLadder`]: 6 h → 7 d, on the forge ([`super::reeval_ladder`]) |
+//! | Champion `held` / `blocked` | [`Effect::ForgeLadder`]: 1 h → 7 d, on the forge ([`super::reeval_ladder`]) |
 //!
 //! Champion's other outcomes fold as: `merged`, `rejected`, `promoted`,
-//! `revise`, `operator`, `closed` → `verdict`; `requeued` → `noop`;
+//! `revise`, `operator`, `closed`, and a `--pr` triage's `triaged`,
+//! `triage-blocked`, `triage-operator` (#12499) → `verdict`; `requeued` → `noop`;
 //! `head-moved`, `not-eligible` → `refused` (a state refusal); `failed` →
 //! `failed`.
 //!
@@ -70,22 +71,33 @@
 //! Not runs ([`counts_as_run`]): every `refused` outcome (`pool_gate`,
 //! `claimed`, `claim_lost`, a state refusal: the step never worked the item)
 //! and a `noop` that waited on something outside the item (`ci_pending`), so
-//! a PR sitting in the CI queue does not lose its Judge for a day.
+//! a PR sitting in the CI queue does not lose its Judge for a day. Nor is a
+//! Champion `held` / `blocked` ([`Effect::ForgeLadder`]): the forge ladder is
+//! that outcome's brake, and since #12513 its first three rungs are 1 h each,
+//! so three of them fit in 24 h and the cap would override the ladder. When
+//! the forge write fails there is no ladder, and the registry counts the run
+//! after all ([`OutcomeLedger::count_failed_ladder_write`], #12516).
 //!
-//! **Scope.** The run history is per host and in memory: it is not broadcast
-//! and a restart or roll forgets it. The cap a host arms *is* broadcast, but
-//! across N hosts an `(item, step)` can run up to about `2N + 1` times in
-//! 24 h before any one host caps it. It enforces the gate exactly on one host
-//! (the pilot); fleet-wide it is a bound per host.
+//! **Scope.** The run history is per host: it is not broadcast. The cap a
+//! host arms *is* broadcast, but across N hosts an `(item, step)` can run up
+//! to about `2N + 1` times in 24 h before any one host caps it. It enforces
+//! the gate exactly on one host (the pilot); fleet-wide it is a bound per
+//! host. It survives a restart or roll ([`OutcomeLedger::persisted`], below):
+//! before #12251 a roll emptied it, and a fleet that rolls every few hours
+//! never reached the cap at all.
 //!
 //! # Durability
 //!
-//! The ledger is local, in-memory state. Every window it arms is at most
-//! [`MAX_SHORT_COOLDOWN`] (24 h, the landed cooldown's own ceiling), and the
-//! registry broadcasts each one on the peer channel
-//! (`ClaimKind::StepCooldownArmed`), so peers keep honouring a window after
-//! this host restarts. The restarted host itself does not get its own windows
-//! back (peers never re-send them, and a host ignores its own ads). Nothing
+//! Every window the ledger arms is at most [`MAX_SHORT_COOLDOWN`] (24 h, the
+//! landed cooldown's own ceiling), and the registry broadcasts each one on
+//! the peer channel (`ClaimKind::StepCooldownArmed`), so peers keep honouring
+//! a window after this host restarts. A host never gets its own windows back
+//! from peers (they never re-send them, and a host ignores its own ads), so
+//! the registry mirrors each pair's runs and window to a file in the
+//! workspace's logs directory after every change and reloads it when it is
+//! built (#12251): the restarted host keeps its own windows and its repeat-cap
+//! history. Lapsed runs and windows are dropped on reload. The refusal and
+//! fast-fail streaks and the counters stay in memory. Nothing
 //! longer rides the broadcast: the Champion ladder's
 //! rungs past 24 h live on the forge only (the item's body), and after a
 //! rollback those parks stay parked until a role or a human clears them.
@@ -95,7 +107,8 @@
 //! [`StepCooldowns`] is the pure answer to "is `(item, step)` cooling down at
 //! time T?". The registry builds one per tick from this ledger plus the peers'
 //! broadcasts; the cutover adds the forge ladder's due times
-//! ([`super::reeval_ladder::due`]); the draw reads it as part of `actionable`
+//! ([`super::reeval_ladder::due`], which reads a marker from the pre-#12513
+//! ladder as due now); the draw reads it as part of `actionable`
 //! (`item_draw::WeighContext::cooldowns`).
 
 use std::collections::BTreeMap;
@@ -209,9 +222,8 @@ impl StepOutcome {
 pub fn champion_outcome(on_pr: bool, outcome: &str) -> Option<StepOutcome> {
     use OutcomeClass::{Failed, Noop, Refused, Verdict};
     let class = match (on_pr, outcome) {
-        (true, "merged" | "rejected") | (false, "promoted" | "revise" | "operator" | "closed") => {
-            Verdict
-        }
+        (true, "merged" | "rejected" | "triaged" | "triage-blocked" | "triage-operator")
+        | (false, "promoted" | "revise" | "operator" | "closed") => Verdict,
         (true, "held" | "requeued") | (false, "blocked") => Noop,
         (true, "head-moved") | (_, "not-eligible") => Refused,
         (true, "failed") => Failed,
@@ -336,7 +348,7 @@ pub enum Effect {
     /// slow deaths).
     Failed,
     /// Champion re-evaluation left the item held or blocked: advance the
-    /// 6 h → 7 d ladder on the forge.
+    /// 1 h → 7 d ladder on the forge ([`super::reeval_ladder`]).
     ForgeLadder,
     /// The claim was lost to a peer: redraw, and count it. A second one in a
     /// row on the pair arms the refusal cooldown (module doc).
@@ -401,14 +413,22 @@ pub fn effect_of(
 }
 
 /// Why an `(item, step)` is cooling down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum CooldownCause {
     Noop,
     Refused,
     FastFail,
     Landed,
     RepeatCap,
+    /// The local mirror of a forge ladder marker that was written.
     ForgeLadder,
+    /// A forge ladder marker that could not be written (#12516): the rung's
+    /// window, held here instead. Unlike [`Self::ForgeLadder`] it is restored
+    /// after a restart, since the forge has nothing to read back.
+    ForgeLadderFallback,
 }
 
 /// Counters the ledger keeps (for `pick.decision` and the gates).
@@ -446,6 +466,27 @@ pub fn counts_as_run(outcome: &StepOutcome) -> bool {
         OutcomeClass::Noop => !EXTERNAL_WAIT_NOOPS.contains(&outcome.reason.as_str()),
         OutcomeClass::Verdict | OutcomeClass::Failed => true,
     }
+}
+
+/// One `(item, step)` pair's durable part: its repeat-cap runs and its
+/// window in force ([`OutcomeLedger::persisted`], #12251).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedPair {
+    pub item: u32,
+    pub step: StepRole,
+    #[serde(default)]
+    pub runs: Vec<DateTime<Utc>>,
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub cause: Option<CooldownCause>,
+    /// Marks a [`CooldownCause::ForgeLadderFallback`] window (#12524). It is
+    /// written as `cause: forge_ladder` plus this flag, so a daemon older than
+    /// #12516, which cannot parse the `forge_ladder_fallback` cause and would
+    /// discard the whole file, reads a plain ladder window instead. Restore
+    /// still accepts the `forge_ladder_fallback` cause that #12519 wrote.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback: bool,
 }
 
 /// What [`OutcomeLedger::record`] did.
@@ -567,7 +608,10 @@ impl OutcomeLedger {
                 entry.refusals = None;
             }
         }
-        if counted && !matches!(effect, Effect::Advance | Effect::Landed) {
+        // The forge ladder is a Champion hold's brake (#12513): with rungs of
+        // 1, 1, 1 h, three held verdicts fit in 24 h, and the cap would turn
+        // the third rung into a day.
+        if counted && !matches!(effect, Effect::Advance | Effect::Landed | Effect::ForgeLadder) {
             repeat_capped = self.count_run(item, step, now);
         }
         Recorded {
@@ -576,6 +620,21 @@ impl OutcomeLedger {
             repeat_capped,
             lifted,
         }
+    }
+
+    /// A Champion hold whose forge ladder write failed (#12516): count the run
+    /// toward the repeat cap, which [`Self::record`] skips for
+    /// [`Effect::ForgeLadder`] because the forge ladder is that outcome's
+    /// brake. With the write failing there is no forge ladder, and without
+    /// the cap the item would be re-evaluated every first rung for as long as
+    /// the write keeps failing. Returns whether the cap armed.
+    pub fn count_failed_ladder_write(
+        &mut self,
+        item: u32,
+        step: StepRole,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.count_run(item, step, now)
     }
 
     /// Extend the pair's refusal streak by one `reason` refusal (a different
@@ -683,6 +742,75 @@ impl OutcomeLedger {
                 || e.until.is_some_and(|(u, _)| u > now)
                 || streak_until.is_some_and(|keep| keep > now)
         });
+    }
+
+    /// The durable part of every pair with a run inside the window or a
+    /// window in force at `now` (#12251), in key order.
+    #[must_use]
+    pub fn persisted(&self, now: DateTime<Utc>) -> Vec<PersistedPair> {
+        let window = self.cfg.repeat_window;
+        self.entries
+            .iter()
+            .filter_map(|(&(item, step), e)| {
+                let runs: Vec<_> = e
+                    .runs
+                    .iter()
+                    .copied()
+                    .filter(|at| add(*at, window) > now)
+                    .collect();
+                let live = e.until.filter(|(u, _)| *u > now);
+                (!runs.is_empty() || live.is_some()).then(|| PersistedPair {
+                    item,
+                    step,
+                    runs,
+                    until: live.map(|(u, _)| u),
+                    cause: live.map(|(_, c)| match c {
+                        CooldownCause::ForgeLadderFallback => CooldownCause::ForgeLadder,
+                        c => c,
+                    }),
+                    fallback: live.is_some_and(|(_, c)| c == CooldownCause::ForgeLadderFallback),
+                })
+            })
+            .collect()
+    }
+
+    /// Load `pairs` from [`Self::persisted`] after a restart (#12251): their
+    /// runs inside the window join the pair's history, and their window in
+    /// force is armed (extend-only, capped at [`MAX_SHORT_COOLDOWN`] from
+    /// `now` like every window). Lapsed runs and windows are dropped.
+    ///
+    /// A [`CooldownCause::ForgeLadder`] window is not re-armed: it only
+    /// mirrors the forge marker until the listing shows the new body, and
+    /// after a restart the marker itself is read ([`super::reeval_ladder::due`]).
+    /// Re-arming it would also keep a mirror armed under the pre-#12513 ladder
+    /// (up to 24 h) past the rule that reads that marker as due now. A
+    /// [`CooldownCause::ForgeLadderFallback`] window is re-armed: its marker
+    /// was never written, so there is nothing on the forge to read back.
+    pub fn restore(&mut self, pairs: Vec<PersistedPair>, now: DateTime<Utc>) {
+        let window = self.cfg.repeat_window;
+        for p in pairs {
+            let runs: Vec<_> = p
+                .runs
+                .into_iter()
+                .filter(|at| add(*at, window) > now && *at <= now)
+                .collect();
+            if !runs.is_empty() {
+                let entry = self.entries.entry((p.item, p.step)).or_default();
+                entry.runs.extend(runs);
+                entry.runs.sort_unstable();
+                entry.runs.dedup();
+            }
+            if let Some(until) = p.until.filter(|u| *u > now) {
+                let cause = match p.cause.unwrap_or(CooldownCause::RepeatCap) {
+                    CooldownCause::ForgeLadder if p.fallback => CooldownCause::ForgeLadderFallback,
+                    c => c,
+                };
+                if cause == CooldownCause::ForgeLadder {
+                    continue;
+                }
+                self.arm(p.item, p.step, until, cause, now);
+            }
+        }
     }
 
     /// Every local cooldown in force at `at`, as the draw's query.

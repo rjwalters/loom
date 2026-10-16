@@ -2,7 +2,7 @@
 //!
 //! When the fleet floor rises every dispatcher self-rolls at about the same
 //! moment, and each new daemon's first full gather (the work finder's step
-//! and discovery listings, the stage-dwell sampler, the no-op hold
+//! and discovery listings, the no-op hold
 //! re-checks) used to start within seconds of boot. On 2026-10-15 nine
 //! daemons restarting together drained every gateway App and stopped step
 //! dispatch fleet-wide for about 13 minutes.

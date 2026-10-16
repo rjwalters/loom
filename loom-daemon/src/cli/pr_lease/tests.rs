@@ -216,10 +216,10 @@ fn sweep_identity_precedence() {
 #[test]
 fn the_lease_body_starts_with_its_marker_and_a_renewal_changes_it() {
     let me = who(Role::Doctor, "s");
-    let first = lease_body(&me, 7, None, "<!-- loom:provenance v1 x -->");
+    let first = lease_body(&me, 7, None);
     assert_eq!(first.lines().next(), Some(me.lease_marker().as_str()));
-    assert!(first.ends_with("<!-- loom:provenance v1 x -->"));
-    let renewed = lease_body(&me, 7, Some(now()), "");
+    assert!(!first.contains("loom:provenance"));
+    let renewed = lease_body(&me, 7, Some(now()));
     assert_ne!(first, renewed);
     assert_eq!(parse_record(&renewed), Some(Record::Lease(me)));
 }
@@ -499,6 +499,9 @@ const AUTHOR: &str =
 /// the list after the first comments read (a peer racing the pre-check).
 /// `<dir>/pull` answers the PR read (already in its `--jq` shape) and
 /// `<dir>/checks` the head's check runs; without them both are unreadable.
+/// `<dir>/fail_reads` (`<lo> <hi>`) fails the comment reads numbered `lo..=hi`
+/// (from 0, the pre-check) as a throttled forge would, and `<dir>/fail_patch`
+/// fails every PATCH after recording it.
 /// Every call runs under a lock, so claimants on several threads see one
 /// consistent comment list, as they would on the forge.
 fn fake_gh(dir: &Path) -> PathBuf {
@@ -520,6 +523,7 @@ case " $* " in
     echo "$id" ;;
   *" PATCH "*)
     echo "$*" >> "$D/patched"
+    [ -f "$D/fail_patch" ] && {{ echo 'HTTP 403' >&2; exit 1; }}
     prev=""; body=""; cid=""
     for a in "$@"; do
       [ "$prev" = "-f" ] && body="${{a#body=}}"
@@ -534,6 +538,10 @@ case " $* " in
   *"/pulls/"*) echo "$*" >> "$D/pulled"; cat "$D/pull" 2>/dev/null || echo "" ;;
   *"/comments"*)
     n=$(cat "$D/reads" 2>/dev/null || echo 0); echo $((n + 1)) > "$D/reads"
+    if [ -f "$D/fail_reads" ]; then
+      read -r lo hi < "$D/fail_reads"
+      if [ "$n" -ge "$lo" ] && [ "$n" -le "$hi" ]; then echo 'HTTP 403: rate limit' >&2; exit 1; fi
+    fi
     if [ "$n" -ge 1 ] && [ -f "$D/late" ]; then cat "$D/late" >> "$D/rows"; rm "$D/late"; fi
     cat "$D/rows" ;;
   *) exit 1 ;;
@@ -556,6 +564,9 @@ fn live_row(id: u64, holder: &Identity) -> String {
     ) + "\n"
 }
 
+/// Two short pauses: [`STEP_VERIFY_BACKOFF`]'s shape without its seconds.
+const TEST_STEP_BACKOFF: &[Duration] = &[Duration::from_millis(10), Duration::from_millis(10)];
+
 fn ctx(dir: &Path, me: Identity) -> Ctx {
     Ctx {
         common: Common {
@@ -577,6 +588,7 @@ fn ctx(dir: &Path, me: Identity) -> Ctx {
         now: Utc::now,
         manage_renewer: false,
         lease_file: None,
+        step_verify_backoff: TEST_STEP_BACKOFF,
     }
 }
 
@@ -633,6 +645,112 @@ fn claim_refuses_without_writing_when_the_list_is_unreadable() {
     fs::write(dir.path().join("fail"), "").unwrap();
     assert_eq!(ctx(dir.path(), who(Role::Judge, "s")).claim(), EXIT_UNVERIFIED);
     assert!(posted(dir.path()).is_empty());
+}
+
+// ---- a read-back failure after the claim write (#12252) -------------------
+
+/// The step engine's Judge pre-claim identity (`--step judge`).
+fn stepped_judge(sweep: &str) -> Identity {
+    Identity {
+        step: Some(StepRole::Judge),
+        ..who(Role::Judge, sweep)
+    }
+}
+
+/// Fail every comment read after the pre-check (reads 1 and on).
+fn fail_read_back(dir: &Path) {
+    fs::write(dir.join("fail_reads"), "1 1000\n").unwrap();
+}
+
+#[test]
+fn a_step_claim_whose_read_back_fails_is_refused_and_its_lease_released() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fail_read_back(dir.path());
+    let me = stepped_judge("sweep-step");
+    assert_eq!(ctx(dir.path(), me.clone()).claim(), EXIT_UNVERIFIED);
+    assert_eq!(posted(dir.path()), vec![me.lease_marker()], "the lease was written");
+    let patched = patched(dir.path());
+    assert!(patched.contains("repos/acme/widgets/issues/comments/500"), "{patched}");
+    // Released plainly: a refused step never ran, so no no-verdict record.
+    assert!(patched.contains(&format!("body={}\n", me.released_marker())), "{patched}");
+    // Read-back: initial READ_ATTEMPTS, then one per backoff pause.
+    let reads: u32 = fs::read_to_string(dir.path().join("reads"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(reads, 1 + READ_ATTEMPTS + 2, "bounded: no unbounded retry");
+    // Once reads recover, a peer finds the PR free at once, not after a TTL.
+    fs::remove_file(dir.path().join("fail_reads")).unwrap();
+    assert_eq!(ctx(dir.path(), stepped_judge("sweep-peer")).claim(), EXIT_HELD);
+}
+
+#[test]
+fn a_step_claim_whose_withdrawal_also_fails_still_refuses() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fail_read_back(dir.path());
+    fs::write(dir.path().join("fail_patch"), "").unwrap();
+    assert_eq!(ctx(dir.path(), stepped_judge("s")).claim(), EXIT_UNVERIFIED);
+    assert_eq!(patched(dir.path()).matches(" PATCH ").count(), 1, "one PATCH, no retry loop");
+}
+
+#[test]
+fn a_step_claim_survives_a_throttle_burst_that_clears_within_the_backoff() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    // Every quick read-back fails; the first backoff read succeeds.
+    fs::write(dir.path().join("fail_reads"), format!("1 {READ_ATTEMPTS}\n")).unwrap();
+    let me = stepped_judge("sweep-step");
+    assert_eq!(ctx(dir.path(), me.clone()).claim(), EXIT_HELD);
+    assert!(!dir.path().join("patched").exists(), "a held claim is not withdrawn");
+    assert_eq!(ctx(dir.path(), me).fence(), EXIT_HELD);
+}
+
+#[test]
+fn a_step_claim_that_loses_after_the_backoff_still_yields() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail_reads"), format!("1 {READ_ATTEMPTS}\n")).unwrap();
+    // A peer's earlier lease, visible from the second read on.
+    let peer = stepped_judge("sweep-peer");
+    fs::write(dir.path().join("late"), live_row(100, &peer)).unwrap();
+    let me = stepped_judge("sweep-me");
+    assert_eq!(ctx(dir.path(), me.clone()).claim(), EXIT_PEER);
+    assert_eq!(posted(dir.path()), vec![me.lease_marker(), me.yield_marker(&peer)]);
+}
+
+#[test]
+fn a_step_claim_with_a_clean_read_back_is_held_without_extra_reads() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let me = stepped_judge("sweep-step");
+    assert_eq!(ctx(dir.path(), me).claim(), EXIT_HELD);
+    let reads: u32 = fs::read_to_string(dir.path().join("reads"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The pre-check, one read-back, and the confirmation re-reads.
+    assert_eq!(reads, 2 + CONFIRM_ATTEMPTS);
+    assert!(!dir.path().join("patched").exists());
+}
+
+#[test]
+fn a_stepless_claim_whose_read_back_fails_still_proceeds() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fail_read_back(dir.path());
+    // A role prompt's own claim: #6287's fail-open, its fence catches a loss.
+    assert_eq!(ctx(dir.path(), who(Role::Judge, "s")).claim(), EXIT_HELD);
+    assert!(!dir.path().join("patched").exists());
+    let reads: u32 = fs::read_to_string(dir.path().join("reads"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(reads, 1 + READ_ATTEMPTS, "no step backoff without --step");
 }
 
 #[test]

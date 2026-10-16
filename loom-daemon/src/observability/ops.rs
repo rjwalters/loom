@@ -24,7 +24,7 @@
 //! multi-workspace tick, #8856). [`pool_marks`] (#8931) emits a
 //! reason-classified counter at each seam that marks a pool account, and one
 //! span per pool dispatch hold. [`turnaround`] (#8929) covers slot turnaround
-//! and idle slots per host, [`stage_dwell`] forge label-stage dwell, and
+//! and idle slots per host, and
 //! [`disposition`] (#9222) one span per ready-queue row's disposition, on
 //! transition or periodic refresh. [`ratelimit`] (#10022) exports GitHub
 //! rate-limit breaker trips, quota gauges (per bucket since W1) and breaker
@@ -37,7 +37,8 @@
 //! request kind on its own ticker. [`build_gate`] (#11690) one
 //! `build_gate.run` span per host-side run of `buildGate.command`. [`feed`]
 //! (#12152) counts the narration sink's public-feed completions by trigger
-//! and its merge-reconciliation passes by outcome. A new emitter adds a `MetricName`/`SpanName`
+//! and its merge-reconciliation passes by outcome. [`reaper`] (#12461) one
+//! `reaper.pass` span per worktree-reaper pass. A new emitter adds a `MetricName`/`SpanName`
 //! variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
@@ -67,11 +68,11 @@ pub mod ratelimit;
 pub mod read_shed;
 pub mod reader_spill;
 pub mod reader_withdrawal;
+pub mod reaper;
 pub mod redate_chain;
-pub mod stage_dwell;
+pub mod scope_memory;
 pub mod stage_entry;
 pub mod stage_events;
-pub mod stage_queue;
 pub mod turnaround;
 
 use std::sync::{Arc, OnceLock};

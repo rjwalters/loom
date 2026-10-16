@@ -38,6 +38,19 @@ fn closes_graph(nodes: &str) -> String {
 /// see the module-level test-isolation invariant (#8480).
 #[cfg(unix)]
 fn install_fake_gh(dir: &Path, graphql_payload: &str, graphql_exit: i32) -> FakeGh {
+    install_fake_gh_events(dir, graphql_payload, graphql_exit, true)
+}
+
+/// [`install_fake_gh`], with the `issues/{n}/events` read (the label age)
+/// failing when `events_ok` is false: what a shed or failed read looks like
+/// to the caller (#12389).
+#[cfg(unix)]
+fn install_fake_gh_events(
+    dir: &Path,
+    graphql_payload: &str,
+    graphql_exit: i32,
+    events_ok: bool,
+) -> FakeGh {
     use std::os::unix::fs::PermissionsExt;
 
     let bin = dir.join("bin");
@@ -55,11 +68,13 @@ fn install_fake_gh(dir: &Path, graphql_payload: &str, graphql_exit: i32) -> Fake
          printf '%s' '{payload}'\n\
          exit {exit_code}\n\
          fi\n\
+         case \"$*\" in */events*) {events};; esac\n\
          case \"$*\" in */comments*) exit 0;; esac; if [ \"$1\" = \"api\" ]; then printf '2020-01-01T00:00:00Z\\n'; exit 0; fi\n\
          exit 0\n",
         log = log.display(),
         payload = graphql_payload,
         exit_code = graphql_exit,
+        events = if events_ok { ":" } else { "echo 'HTTP 503' >&2; exit 1" },
     );
     let fake_gh = bin.join("gh");
     std::fs::write(&fake_gh, script).unwrap();
@@ -839,4 +854,60 @@ fn check_stale_pr_claims_never_reclaims_a_fresh_claim_body() {
         "no claim label should have been removed: {}",
         gh.calls()
     );
+}
+
+// ------------------------------------------------------------------
+// #12389: an unreadable label age is no answer
+// ------------------------------------------------------------------
+
+/// The label-age read is shed or fails while the PR probe answers "no open
+/// PR": a claim made a minute ago looks exactly like that. The flagging pass
+/// must skip the issue, not flag it orphaned.
+#[cfg(unix)]
+#[test]
+#[serial(loom_config_env)]
+fn an_unreadable_label_age_never_flags_the_issue_orphaned() {
+    an_unreadable_label_age_never_flags_the_issue_orphaned_body();
+}
+
+#[serial]
+fn an_unreadable_label_age_never_flags_the_issue_orphaned_body() {
+    let dir = tempdir().unwrap();
+    let gh = install_fake_gh_events(dir.path(), &closes_graph(""), 0, false);
+
+    let mut result = OrphanRecoveryResult::default();
+    check_untracked_building(&evidence_without_the_issue(), &mut result, dir.path(), 600, false);
+
+    assert!(result.orphaned.is_empty(), "{:?}", result.orphaned);
+    assert!(
+        result
+            .watched
+            .iter()
+            .any(|w| w.issue == 5501 && w.reason == "label_age_unverifiable"),
+        "{:?}",
+        result.watched
+    );
+    assert!(!gh.calls().contains("issue edit"));
+}
+
+/// The same for the direct entry point: no worktree cleanup and no label
+/// flip when the label age cannot be read, though the PR probe says none.
+#[cfg(unix)]
+#[test]
+#[serial(loom_config_env)]
+fn recover_issue_never_resets_on_an_unreadable_label_age() {
+    recover_issue_never_resets_on_an_unreadable_label_age_body();
+}
+
+#[serial]
+fn recover_issue_never_resets_on_an_unreadable_label_age_body() {
+    let dir = tempdir().unwrap();
+    let gh = install_fake_gh_events(dir.path(), &closes_graph(""), 0, false);
+
+    let mut recovery = OrphanRecoveryResult::default();
+    recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
+
+    let calls = gh.calls();
+    assert!(!calls.contains("issue edit"), "gh calls:\n{calls}");
+    assert!(recovery.recovered.is_empty(), "{:?}", recovery.recovered);
 }

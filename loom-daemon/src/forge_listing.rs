@@ -91,6 +91,9 @@ pub struct RestIssue {
     /// ([`crate::step_dispatch::stage_entry`]). `None` on every REST row (the
     /// listing carries no label times) and on a mirror row that sent none.
     pub labels_at: Option<BTreeMap<String, String>>,
+    /// The REST `draft` flag of a PR row (#12499): an unfinished PR is never
+    /// drawn for review. `false` on an issue row and when the forge omitted it.
+    pub draft: bool,
 }
 
 /// Keep only the real issues in a REST issues listing (Issue #9929).
@@ -172,25 +175,6 @@ pub fn list_issues_cached_as(
     state: &str,
 ) -> Result<Vec<RestIssue>> {
     list_issues_cached_retrying(issue_list(caller), gh_bin, cwd, repo_override, label, state, None)
-        .map(|page| page.rows)
-}
-
-/// [`list_issues_cached_as`] as an **Observability** read
-/// ([`crate::forge_identity::ReadClass::Observability`], #12193): when no
-/// reader can serve it the read is shed, not retried on the writer, and the
-/// call fails with [`store::ReadShed`] (downcast the error to tell it from a
-/// failure). For telemetry samplers only; a gating read keeps
-/// [`list_issues_cached_as`].
-pub fn list_issues_cached_observability_as(
-    caller: &'static str,
-    gh_bin: &Path,
-    cwd: Option<&Path>,
-    repo_override: Option<&str>,
-    label: &str,
-    state: &str,
-) -> Result<Vec<RestIssue>> {
-    let site = issue_list(caller).deferrable(crate::forge_identity::ReadClass::Observability);
-    list_issues_cached_retrying(site, gh_bin, cwd, repo_override, label, state, None)
         .map(|page| page.rows)
 }
 
@@ -282,25 +266,6 @@ pub fn list_open_issues_cached_all_as(
         cwd,
         repo_override,
         crate::forge_identity::ReadClass::Hygiene,
-    )
-}
-
-/// [`list_open_issues_cached_all_as`] as an **Observability** read (#12193):
-/// shed on every exhaust cause while a reader pool exists, never retried on
-/// the writer. For telemetry samplers (`stage_dwell`); the intake pass keeps
-/// the Hygiene class.
-pub fn list_open_issues_cached_all_observability_as(
-    caller: &'static str,
-    gh_bin: &Path,
-    cwd: Option<&Path>,
-    repo_override: Option<&str>,
-) -> Result<Vec<RestIssue>> {
-    list_open_issues_walk(
-        caller,
-        gh_bin,
-        cwd,
-        repo_override,
-        crate::forge_identity::ReadClass::Observability,
     )
 }
 
@@ -873,6 +838,8 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
         comments: u32,
         #[serde(default)]
         sub_issues_summary: Option<serde_json::Value>,
+        #[serde(default)]
+        draft: bool,
     }
     let rows: Vec<RawIssue> = serde_json::from_str(body.trim())?;
     Ok(rows
@@ -892,6 +859,7 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
             is_pull_request: r.pull_request.is_some(),
             open_sub_issues: r.sub_issues_summary.as_ref().and_then(open_sub_issues),
             labels_at: None,
+            draft: r.draft,
         })
         .collect())
 }

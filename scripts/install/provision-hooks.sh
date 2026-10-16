@@ -245,7 +245,7 @@ _phook_cmd() {
 # (#12121), so there is no hook to wire. This only STRIPS the wiring older
 # installs left behind: the three presence-beat.sh hook entries and the
 # LOOM_OPERATOR_PRESENCE=1 env entry, touching nothing else. Idempotent; a
-# no-op when already converged. (An env value of 0 is the opt-out and is kept.)
+# no-op when already converged. (Any other env value, e.g. 0, is left alone.)
 _phook_presence_apply() {
     local settings="$1"
     _phook_presence_edit "$settings" '

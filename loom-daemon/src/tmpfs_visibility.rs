@@ -27,7 +27,7 @@
 //! `/proc/vmstat` (macOS has neither) yields `None` for that field, never a
 //! fabricated `0` that would look identical to "measured and empty" — the
 //! same "unknown != zero" contract [`crate::disk_headroom`] and
-//! [`crate::ram_headroom`] already follow. [`TmpfsVisibilitySnapshot::is_empty`]
+//! the former `ram_headroom` module already follow. [`TmpfsVisibilitySnapshot::is_empty`]
 //! is what [`crate::health::tmpfs_visibility_section`] uses to omit the
 //! section entirely on a host with nothing measurable at all, rather than
 //! rendering an all-`null` line.

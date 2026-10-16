@@ -107,6 +107,12 @@ pub(super) fn run_reconciliation_pass_over_roots(
         // same tick, and holds a predecessor landing just released are seen
         // before the next planning pass reads the label set.
         merge_sequence::reconcile_merge_sequences_with(gh_bin, root, open_prs.as_deref());
+        // #10178: a CI-only gate whose exact head is now green goes back to review.
+        // Rides the conflict pass's shared listing (no extra read); when that pass wrote,
+        // it hands nothing on and this waits one tick. The head is re-read before any write.
+        if let Some(open) = open_prs.as_deref() {
+            super::ci_gate_recovery::reconcile(gh_bin, root, open);
+        }
         // Issue #9464: after every other reconciliation — a claim this pass
         // just reclaimed must not be immediately "healed" back. Re-applies
         // `loom:building` to OPEN issues whose sweep is live here but whose

@@ -217,8 +217,6 @@ impl SweepRegistry {
                 );
             }
             SweepKind::PrSet(prs) => {
-                // #11191: disk admission, as for an issue before step 3.
-                crate::disk_admission::admit_dispatch(&sr.config.workspace_root, kind)?;
                 return Ok(BeginIssueDispatch::Done(sr.dispatch_prset_inner(
                     prs,
                     kind,
@@ -685,17 +683,6 @@ impl SweepRegistry {
             }
             .into());
         }
-
-        // 2.98 Disk admission (#11191): the repo's measured disk charge must fit
-        //      the free space left after the halt floor and the growth the
-        //      in-flight sweeps are still expected to write. Last of the guards,
-        //      so a candidate another guard refuses never leaves a pending
-        //      reservation behind; before any claim, label or spawn. Every
-        //      dispatch route converges here — the work finder, the watchdogs'
-        //      re-dispatch (#3910) and PR-set conversion (#7649, the PrSet arm
-        //      above), the reaper's resume (#4256), IPC/CLI and the epic
-        //      supervisor — so none of them bypasses the work finder's rule.
-        crate::disk_admission::admit_dispatch(&sr.config.workspace_root, kind)?;
 
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);

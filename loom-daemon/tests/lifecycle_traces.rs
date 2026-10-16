@@ -1,4 +1,7 @@
 //! Owned Rust launch/tool contracts. Real provider canaries are separate evidence.
+#[allow(dead_code)]
+mod common;
+
 use loom_daemon::{
     observability::{lifecycle, queue::DurableQueue},
     telemetry::{
@@ -31,6 +34,7 @@ fn fixture() -> &'static PathBuf {
     })
 }
 fn root() -> tempfile::TempDir {
+    common::stub_gh_bin_in_process();
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".loom")).unwrap();
     fs::write(dir.path().join(".loom/config.json"), json!({"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}).to_string()).unwrap();
@@ -38,6 +42,7 @@ fn root() -> tempfile::TempDir {
 }
 fn command(root: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+    common::deny_real_gh(&mut cmd);
     cmd.current_dir(root)
         .env("LOOM_WORKSPACE", root)
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
@@ -115,42 +120,39 @@ fn issue_sweeps(
                 s.name == SpanName::Sweep && s.attributes["loom.sweep_id"] == *execution
             }),
         );
-        // The story-parented root still counts as this journal's root (#9038),
-        // so the drained execution retires instead of leaking its context.
+        // The drained execution retires instead of leaking its context.
         assert!(!TraceStore::new(root).path(root, execution).exists());
     }
     sweeps
 }
 
 #[test]
-fn issue_execution_joins_the_story_trace_and_still_retires() {
+fn issue_execution_is_its_own_root_and_still_retires() {
     let dir = root();
     let root = dir.path();
     git_repo_with_origin(root, "git@github.com:RJWalters/Loom.git");
-    // Stubbed resolver: the D32 v1 key is the repo_id, not the origin's name.
     loom_daemon::telemetry::repo_identity::seed(
         "RJWalters/Loom",
         loom_daemon::telemetry::repo_identity::parse("1073994527 rjwalters/loom"),
     );
-    let story = loom_daemon::telemetry::trace::story_context(1_073_994_527, 9038).unwrap();
-    let sweeps = issue_sweeps(root, &["story-attempt-1", "story-attempt-2"], 9038);
+    let sweeps = issue_sweeps(root, &["issue-attempt-1", "issue-attempt-2"], 9038);
     assert_eq!(sweeps.len(), 2);
     for sweep in &sweeps {
-        assert_eq!(sweep.context.trace_id, story.trace_id);
-        assert_eq!(sweep.parent_span_id.as_ref(), Some(&story.span_id));
+        assert_eq!(sweep.parent_span_id, None);
         assert_eq!(sweep.attributes["loom.issue"], "9038");
         assert_eq!(sweep.attributes["loom.repo"], "rjwalters/loom");
-        assert_eq!(sweep.attributes["loom.story_id"], story.trace_id.as_str());
-        assert_eq!(sweep.attributes["loom.story"], "rjwalters/loom#9038");
-        assert_eq!(sweep.attributes["loom.story.key_version"], "v1");
+        for key in ["loom.story_id", "loom.story", "loom.story.key_version"] {
+            assert!(!sweep.attributes.contains_key(key), "{key} must be absent");
+        }
     }
+    assert_ne!(sweeps[0].context.trace_id, sweeps[1].context.trace_id);
     assert_ne!(sweeps[0].context.span_id, sweeps[1].context.span_id);
 }
 
-/// #10637: a story sweep's `loom.repo` is GitHub's spelling of the repo (the
-/// one `loom.dispatch.*` carries), not the origin's, and never lowercased.
+/// #10637: a sweep's `loom.repo` is GitHub's spelling of the repo (the one
+/// `loom.dispatch.*` carries), not the origin's, and never lowercased.
 #[test]
-fn story_sweep_names_its_repo_as_github_spells_it() {
+fn issue_sweep_names_its_repo_as_github_spells_it() {
     let dir = root();
     let root = dir.path();
     git_repo_with_origin(root, "git@github.com:twoam-fixture/story-case.git");
@@ -161,34 +163,23 @@ fn story_sweep_names_its_repo_as_github_spells_it() {
     let sweeps = issue_sweeps(root, &["case-attempt-1"], 10637);
     assert_eq!(sweeps.len(), 1);
     assert_eq!(sweeps[0].attributes["loom.repo"], "TwoAM-Fixture/Story-Case");
-    assert_eq!(sweeps[0].attributes["loom.story"], "TwoAM-Fixture/Story-Case#10637");
 }
 
 #[test]
-fn unresolvable_repo_id_makes_the_execution_its_own_root() {
+fn unresolvable_repo_identity_still_names_the_issue() {
     let dir = root();
     let root = dir.path();
     git_repo_with_origin(root, "git@github.com:unresolvable-owner/no-repo-id.git");
     loom_daemon::telemetry::repo_identity::seed("unresolvable-owner/no-repo-id", None);
     let sweeps = issue_sweeps(root, &["orphan-attempt-1", "orphan-attempt-2"], 7);
     assert_eq!(sweeps.len(), 2);
-    // Never a name-derived story: no shared trace, no parent, no story attrs.
-    let name_derived = loom_daemon::telemetry::trace::TraceId::derived(&[
-        "loom.story.trace",
-        "unresolvable-owner/no-repo-id",
-        "7",
-    ]);
     for sweep in &sweeps {
         assert_eq!(sweep.parent_span_id, None);
-        assert_ne!(sweep.context.trace_id, name_derived);
-        for key in [
-            "loom.story_id",
-            "loom.story",
-            "loom.story.key_version",
-            "loom.issue",
-        ] {
+        for key in ["loom.story_id", "loom.story", "loom.story.key_version"] {
             assert!(!sweep.attributes.contains_key(key), "{key} must be absent");
         }
+        // #11982: the issue is a plain fact, whatever the identity lookup said.
+        assert_eq!(sweep.attributes["loom.issue"], "7");
     }
     assert_ne!(sweeps[0].context.trace_id, sweeps[1].context.trace_id);
 }
@@ -454,3 +445,8 @@ fn actual_checkpoint_cli_preserves_rapid_judge_doctor_repair_waterfall() {
         }
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

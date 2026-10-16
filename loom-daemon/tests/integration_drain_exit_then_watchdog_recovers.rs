@@ -40,7 +40,7 @@
 
 mod common;
 
-use common::{daemon_bin, isolate_daemon_state, TestClient};
+use common::{daemon_bin, deny_real_gh, gh_stub_path, isolate_daemon_state, TestClient};
 use loom_daemon::ipc::EXIT_RESTART;
 use serial_test::serial;
 use std::io::Write;
@@ -110,6 +110,7 @@ async fn test_drain_exit0_then_watchdog_systemd_kickstart_recovers() {
     // ------------------------------------------------------------------
     let mut cmd = Command::new(daemon_bin());
     isolate_daemon_state(&mut cmd, temp_dir.path());
+    deny_real_gh(&mut cmd);
     let mut child = ChildGuard(
         cmd.current_dir(&workspace_root)
             .env("LOOM_SOCKET_PATH", &socket_path)
@@ -308,7 +309,14 @@ esac
         watchdog_script.display()
     );
 
-    let path_var = format!("{}:{}", stub_dir.display(), std::env::var("PATH").unwrap_or_default());
+    // The gh stub dir sits ahead of the guard's stand-in so the relaunched
+    // daemon's bare `gh` calls hit the loud-failing stub (#12163).
+    let path_var = format!(
+        "{}:{}:{}",
+        stub_dir.display(),
+        gh_stub_path().parent().expect("stub dir").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     let mut watchdog_cmd = Command::new("bash");
     watchdog_cmd
@@ -425,3 +433,8 @@ esac
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

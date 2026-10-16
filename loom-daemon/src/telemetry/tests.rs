@@ -5,7 +5,6 @@
 
 use super::*;
 
-mod admission_brake;
 mod daemon_event;
 mod export_coverage;
 mod fleet_captain;
@@ -160,8 +159,6 @@ fn host_health() -> TelemetryRecord {
         worktree_root_free_gb: Some(200),
         worktree_root_total_gb: Some(1000),
         active_sweep_ids: vec!["sweep-issue-4703-0".to_string()],
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: vec![
             ManagedRepoEntry {
                 slug: "rjwalters/loom".to_string(),
@@ -189,7 +186,6 @@ fn host_health() -> TelemetryRecord {
             state: "protected".to_string(),
             watchdog_provisioned: Some(true),
         }),
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
@@ -197,6 +193,8 @@ fn host_health() -> TelemetryRecord {
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     })
 }
 

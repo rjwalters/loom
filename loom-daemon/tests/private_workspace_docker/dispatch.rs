@@ -518,20 +518,24 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
 impl Fixture {
     /// Dispatch vets that this installation may write to the workspace's repo
     /// (#9548). The disposable forge serves Git, not the REST API, so the
-    /// host's permission probe runs through a `gh` that reports push on the
-    /// fixture's `github/repo` and hands every other call to the real `gh`.
+    /// host's permission probe runs through a fake `gh` that reports push on
+    /// the fixture's `github/repo` (with or without `--include` /
+    /// `--hostname`), reports no App installation, and fails every other call
+    /// loudly instead of reaching the real `gh` (#10138, #12456).
     pub(super) fn write_scope_env(&self) -> [(&'static str, Option<std::ffi::OsString>); 2] {
-        let real = Command::new("sh")
-            .args(["-c", "command -v gh"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .unwrap_or_default();
         let gh = self.root.path().join("write-scope-gh");
         std::fs::write(
             &gh,
-            format!(
-                "#!/bin/sh\nif [ \"$1 $2\" = \"api repos/github/repo\" ]; then echo '{{\"push\":true}}'; exit 0; fi\n[ -n '{real}' ] || exit 127\nexec '{real}' \"$@\"\n"
-            ),
+            "#!/bin/sh\n\
+             [ \"$1\" = api ] || { echo \"write-scope-gh: unexpected call: $*\" >&2; exit 127; }\n\
+             for a in \"$@\"; do\n\
+             case \"$a\" in\n\
+             repos/github/repo) echo '{\"push\":true}'; exit 0 ;;\n\
+             installation/repositories*) echo 'write-scope-gh: not an App installation token' >&2; exit 1 ;;\n\
+             esac\n\
+             done\n\
+             echo \"write-scope-gh: unexpected call: $*\" >&2\n\
+             exit 127\n",
         )
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();

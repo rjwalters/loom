@@ -133,7 +133,6 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
-pub mod admission_brake;
 pub mod agent_gh;
 pub mod agent_session;
 pub mod agent_skills;
@@ -177,9 +176,9 @@ pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
-pub mod disk_admission;
-pub mod disk_footprint;
-pub mod disk_full_halt;
+/// Fleet discovery (#12306): one snapshot of what work exists per step tick,
+/// from the mirror's worklist or per-repo listings.
+pub mod discovery;
 pub mod disk_headroom;
 pub mod dispatch_tap;
 pub mod docker_image_clean;
@@ -194,12 +193,12 @@ pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_alert;
 pub mod fleet_captain;
+pub mod fleet_dispatch;
 pub mod fleet_outputs;
 pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
-pub mod foreign_load;
 pub mod forge_bucket_book;
 pub mod forge_cached_list;
 pub mod forge_cached_view;
@@ -210,6 +209,7 @@ pub mod forge_check_open_pr;
 pub mod forge_cmd;
 pub mod forge_comment;
 pub mod forge_contract;
+pub mod forge_create_issue;
 pub mod forge_denial;
 pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
@@ -251,10 +251,10 @@ pub mod health;
 pub mod health_monitor;
 pub mod hooks_home;
 pub mod host_affinity;
-pub mod host_breaker;
 pub mod host_identity;
 pub mod host_optout;
 pub mod host_pressure;
+pub mod host_status;
 pub mod hyperparams;
 pub mod idle_exit;
 pub mod inflight;
@@ -305,6 +305,7 @@ pub mod pipeline_snapshot;
 pub mod points_marker;
 pub mod pr_latency;
 // #11931: a terminated role run's PR leases are released on its behalf.
+pub mod agent_scopes;
 pub mod pr_lease_reap;
 pub mod pr_planning;
 pub mod preflight;
@@ -316,8 +317,8 @@ pub mod proc_exec;
 pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
-pub mod ram_headroom;
 pub mod ram_peaks;
+pub mod ram_scope_limit;
 pub mod rate_limit_breaker;
 pub mod rebase_guard;
 pub mod reclaim_pr_warning;
@@ -412,6 +413,9 @@ pub mod tap_usage;
 pub mod target_dir_gc;
 /// Orphan sweep for Loom-owned and agent-improvised cargo target dirs (#8370).
 pub mod target_orphan_reclaim;
+/// SIGUSR1-triggered dump of the async task tree to the daemon log, for
+/// diagnosing a hung tick (Issue #12079).
+pub mod task_dump;
 /// Per-task liveness heartbeats for the daemon's long-running loops (Issue
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
 pub mod task_liveness;

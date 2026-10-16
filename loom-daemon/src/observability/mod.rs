@@ -105,7 +105,6 @@
 
 pub mod agent_relay;
 pub mod backfill;
-pub mod captain_gauges;
 pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;
@@ -125,18 +124,19 @@ pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
 pub mod pick_journal;
-pub mod presence_derive;
 pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;
 pub mod repo_ref;
 pub mod request_headers;
+pub mod retired_captain_config;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
 pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
+pub mod standalone_ops;
 pub mod step_verdict;
 pub mod tracing;
 pub mod work_started;

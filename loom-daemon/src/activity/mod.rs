@@ -41,6 +41,7 @@
 //! ```
 
 mod claims;
+pub mod codex_summary;
 mod cost_analytics;
 mod db;
 mod models;
@@ -69,8 +70,7 @@ pub use models::{ActivityEntry, AgentInput, AgentOutput, InputContext, InputType
 // These types are available for future use but not currently imported elsewhere
 #[allow(unused_imports)]
 pub use models::{
-    AgentMetric, LintResults, PrReworkStats, ProductivitySummary, PromptChanges, PromptForgeEvent,
-    PromptForgeEventType, PromptSuccessStats, QualityMetrics, TestResults, TokenUsage,
+    LintResults, PromptChanges, PromptForgeEvent, PromptForgeEventType, QualityMetrics, TestResults,
 };
 
 // Cost analytics types (Issue #1064)

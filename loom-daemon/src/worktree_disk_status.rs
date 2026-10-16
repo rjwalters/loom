@@ -4,8 +4,8 @@
 //!
 //! # Why this exists
 //!
-//! `loom-daemon status` already reports **disk headroom** (`disk_headroom`,
-//! the `min(disk, ram, configured_max)` term that bounds dispatch). What it
+//! `loom-daemon status` already reports **disk headroom** (`disk_headroom`;
+//! no longer a dispatch cap term since #12406). What it
 //! could not report is *why* that headroom is low. A host silently carrying
 //! 39 GB of merged-PR worktrees rendered identically to a host that was
 //! genuinely out of space, and an operator could not tell the two apart

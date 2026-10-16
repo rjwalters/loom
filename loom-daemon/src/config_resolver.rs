@@ -149,6 +149,66 @@ pub(crate) fn soft_read_json_object(path: &Path) -> Value {
     }
 }
 
+/// Run `git -C root <args>`, returning stdout on success (`None` on any
+/// failure: not a repo, missing ref, non-zero exit, non-UTF-8).
+fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// Text of a **tracked** tier file as it stands on the default branch (#10352).
+///
+/// A main checkout that nothing has fast-forwarded silently governs every
+/// worktree's config (a stale `forge.trustedCommenters` dropped an operator
+/// verdict). When `repo_root` is itself a git toplevel whose `HEAD` is a
+/// strict ancestor of `origin/HEAD` **and** `rel` has no local modification
+/// against `HEAD`, this returns the file's text at `origin/HEAD` (`Some("")`
+/// if the ref lacks the path, so a file the default branch removed stops
+/// contributing). Any other case — non-git root, no `origin/HEAD`, diverged
+/// or detached-ahead `HEAD`, local edit — returns `None` and the caller reads
+/// the working copy exactly as before.
+fn default_branch_tier_text(repo_root: &Path, rel: &str) -> Option<String> {
+    let top = git_stdout(repo_root, &["rev-parse", "--show-toplevel"])?;
+    if std::fs::canonicalize(top.trim()).ok()? != std::fs::canonicalize(repo_root).ok()? {
+        return None;
+    }
+    let head = git_stdout(repo_root, &["rev-parse", "--verify", "-q", "HEAD"])?;
+    let remote = git_stdout(repo_root, &["rev-parse", "--verify", "-q", "origin/HEAD"])?;
+    if head.trim() == remote.trim() {
+        return None;
+    }
+    git_stdout(repo_root, &["merge-base", "--is-ancestor", "HEAD", "origin/HEAD"])?;
+    // `diff --quiet` exits 1 on a modification; `git_stdout` maps that to None.
+    git_stdout(repo_root, &["diff", "--quiet", "HEAD", "--", rel])?;
+    // Untracked-at-HEAD working-copy files are local edits too.
+    if repo_root.join(rel).exists()
+        && git_stdout(repo_root, &["cat-file", "-e", &format!("HEAD:{rel}")]).is_none()
+    {
+        return None;
+    }
+    Some(git_stdout(repo_root, &["show", &format!("origin/HEAD:{rel}")]).unwrap_or_default())
+}
+
+/// [`soft_read_json_object`] for a tracked tier, preferring the default
+/// branch's copy when the checkout is strictly behind and clean (#10352).
+fn soft_read_tracked_tier(repo_root: &Path, rel: &str) -> Value {
+    if let Some(text) = default_branch_tier_text(repo_root, rel) {
+        return match serde_json::from_str::<Value>(&text) {
+            Ok(v @ Value::Object(_)) => v,
+            _ => Value::Object(Map::new()),
+        };
+    }
+    soft_read_json_object(&repo_root.join(rel))
+}
+
 /// A loud, top-of-boot-block diagnosis of the **legacy** `.loom/config.json`
 /// tier only (#6499) — the one tier every existing repo actually has
 /// populated, and the one a host-local patch (e.g. `safehouse.socket`,
@@ -257,12 +317,13 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
         effective = deep_merge(&effective, &soft_read_json_object(&defaults_path));
     }
 
-    effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LEGACY_CONFIG_REL)));
-    effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(PROJECT_CONFIG_REL)));
+    effective = deep_merge(&effective, &soft_read_tracked_tier(repo_root, LEGACY_CONFIG_REL));
+    effective = deep_merge(&effective, &soft_read_tracked_tier(repo_root, PROJECT_CONFIG_REL));
     effective =
         deep_merge(&effective, &soft_read_json_object(&repo_root.join(FLEET_REPO_CONFIG_REL)));
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LOCAL_CONFIG_REL)));
 
+    warn_retired_curator_backlog_target(&effective);
     effective
 }
 
@@ -330,6 +391,73 @@ pub fn source_of(repo_root: &Path, dotted: &str) -> Option<PathBuf> {
     tier_paths_by_precedence(repo_root)
         .into_iter()
         .find(|path| get_path(&soft_read_json_object(path), dotted).is_some_and(|v| !v.is_null()))
+}
+
+/// One leaf config key that two or more tiers set to different values, where at
+/// least one of those tiers is a fleet tier (#11703).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierConflict {
+    /// Dotted path of the leaf key, e.g. `buildGate.enabled`.
+    pub key: String,
+    /// Every non-null value found, highest-precedence tier first.
+    pub values: Vec<(PathBuf, Value)>,
+}
+
+impl TierConflict {
+    /// The tier whose value is in effect (the highest-precedence one).
+    #[must_use]
+    pub fn winner(&self) -> &(PathBuf, Value) {
+        &self.values[0]
+    }
+}
+
+fn collect_leaves(prefix: &str, value: &Value, out: &mut Vec<(String, Value)>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                collect_leaves(&key, v, out);
+            }
+        }
+        Value::Null => {}
+        leaf => out.push((prefix.to_string(), leaf.clone())),
+    }
+}
+
+/// Leaf keys on which a fleet tier (the private defaults or
+/// [`FLEET_REPO_CONFIG_REL`]) disagrees with another tier (#11703). Equal values
+/// are not reported; neither are disagreements among non-fleet tiers (normal
+/// layering). Each conflict lists every value highest-precedence first, so the
+/// first entry is the one in effect — this follows [`tier_paths_by_precedence`]
+/// and so tracks any change to the merge order. Arrays are leaves. Soft-fails
+/// like the merge: an unreadable tier contributes nothing.
+#[must_use]
+pub fn tier_conflicts(repo_root: &Path) -> Vec<TierConflict> {
+    let fleet_repo = repo_root.join(FLEET_REPO_CONFIG_REL);
+    let defaults = private_defaults_path();
+    let is_fleet = |p: &Path| p == fleet_repo || defaults.as_deref() == Some(p);
+
+    let mut by_key: std::collections::BTreeMap<String, Vec<(PathBuf, Value)>> =
+        std::collections::BTreeMap::new();
+    for path in tier_paths_by_precedence(repo_root) {
+        let mut leaves = Vec::new();
+        collect_leaves("", &soft_read_json_object(&path), &mut leaves);
+        for (key, val) in leaves {
+            by_key.entry(key).or_default().push((path.clone(), val));
+        }
+    }
+
+    by_key
+        .into_iter()
+        .filter(|(_, vals)| {
+            vals.iter().any(|(p, _)| is_fleet(p)) && vals.iter().any(|(_, v)| *v != vals[0].1)
+        })
+        .map(|(key, values)| TierConflict { key, values })
+        .collect()
 }
 
 /// Look up a dotted key path (e.g. `"autonomous.workFinder.enabled"`) in an
@@ -455,23 +583,26 @@ pub fn fleet_captain_arm_ttl_secs(repo_root: &Path) -> u64 {
         .unwrap_or(DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS)
 }
 
-/// Dotted key read by [`curator_backlog_target`] (#11819).
+/// Dotted key of the retired `curator.backlogTarget` (#11819, retired #12077).
 pub const CURATOR_BACKLOG_TARGET_KEY: &str = "curator.backlogTarget";
 
-/// Read `curator.backlogTarget` (#11819): the number of open issues this repo
-/// should hold, which sets how strict the Curator's admission step is.
+/// Warn, once per process, that `curator.backlogTarget` is set (#12077).
 ///
-/// Resolved through [`resolve_effective_config`], so every tier can set it
-/// (machine defaults < `.loom/config.json` < `.loom-project/project.json` <
-/// `.loom-local/fleet-repo.json` < `.loom-local/local.json`). There is **no
-/// built-in default**: `None` (the step is skipped, the Curator unchanged) on
-/// a missing key, a zero, a negative, a fractional or a non-number value.
-#[must_use]
-pub fn curator_backlog_target(repo_root: &Path) -> Option<u64> {
-    let effective = resolve_effective_config(repo_root);
-    get_path(&effective, CURATOR_BACKLOG_TARGET_KEY)
-        .and_then(Value::as_u64)
-        .filter(|v| *v > 0)
+/// The key drove backlog-pressure admission on role-runner Curator ticks only;
+/// Curator now runs as step-dispatch steps, so the key is retired and ignored.
+/// Returns whether this call gave the warning.
+pub fn warn_retired_curator_backlog_target(effective: &Value) -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if get_path(effective, CURATOR_BACKLOG_TARGET_KEY).is_none()
+        || WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return false;
+    }
+    log::warn!(
+        "config: {CURATOR_BACKLOG_TARGET_KEY} is retired and ignored: Curator no longer \
+         admits by backlog pressure; remove the key (#12077)"
+    );
+    true
 }
 
 #[cfg(test)]
@@ -773,6 +904,51 @@ mod tests {
         // `shared` was overridden by project but not local -> project's
         // value wins over legacy's.
         assert_eq!(effective.get("shared"), Some(&json!(2)));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_resolve_reads_tracked_tier_from_origin_head_when_checkout_is_behind() {
+        use std::process::Command;
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        write(&root.join(LEGACY_CONFIG_REL), r#"{"a": 1}"#);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "one"]);
+        write(
+            &root.join(LEGACY_CONFIG_REL),
+            r#"{"a": 1, "forge": {"trustedCommenters": ["turian"]}}"#,
+        );
+        git(&["commit", "-q", "-am", "two"]);
+        // Publish the newer commit as origin/HEAD, then lag the checkout.
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        git(&["reset", "-q", "--hard", "HEAD~1"]);
+
+        let effective = resolve_effective_config(root);
+        assert_eq!(effective.pointer("/forge/trustedCommenters"), Some(&json!(["turian"])));
+
+        // A local uncommitted edit wins: the working copy is read as today.
+        write(&root.join(LEGACY_CONFIG_REL), r#"{"a": 9}"#);
+        let edited = resolve_effective_config(root);
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(edited, json!({"a": 9}));
     }
 
     #[test]
@@ -1163,6 +1339,55 @@ mod tests {
     // what each tier exercises. Bash:
     // `defaults/scripts/tests/test-config-resolver.sh`.
 
+    // ===== tier_conflicts (#11703) =====
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_tier_conflicts_reports_fleet_vs_repo_with_winner() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join(LEGACY_CONFIG_REL),
+            r#"{"buildGate":{"enabled":true},"same":1}"#,
+        );
+        write(
+            &root.path().join(FLEET_REPO_CONFIG_REL),
+            r#"{"buildGate":{"enabled":false},"same":1}"#,
+        );
+        let conflicts = tier_conflicts(root.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].key, "buildGate.enabled");
+        assert_eq!(conflicts[0].values.len(), 2);
+        let effective = resolve_effective_config(root.path());
+        assert_eq!(get_path(&effective, "buildGate.enabled"), Some(&conflicts[0].winner().1));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_tier_conflicts_ignores_non_fleet_disagreement_and_equal_values() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(&root.path().join(LEGACY_CONFIG_REL), r#"{"a":1,"b":2}"#);
+        write(&root.path().join(LOCAL_CONFIG_REL), r#"{"a":9}"#);
+        write(&root.path().join(FLEET_REPO_CONFIG_REL), r#"{"b":2}"#);
+        let conflicts = tier_conflicts(root.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_tier_conflicts_soft_fails_on_malformed_tier() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(&root.path().join(LEGACY_CONFIG_REL), r#"{"a":1}"#);
+        write(&root.path().join(FLEET_REPO_CONFIG_REL), "{not json");
+        let conflicts = tier_conflicts(root.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert!(conflicts.is_empty());
+    }
+
     // ===== source_of / tier_paths_by_precedence (#4512) =====
 
     #[test]
@@ -1301,49 +1526,17 @@ mod tests {
         assert!(got[0].0.ends_with(LEGACY_CONFIG_REL));
     }
 
-    // ===== curator_backlog_target (#11819) =====
-
-    fn backlog(value: u64) -> String {
-        format!(r#"{{"curator": {{"backlogTarget": {value}}}}}"#)
-    }
+    // ===== retired curator.backlogTarget (#12077) =====
 
     #[test]
-    #[serial(loom_config_env)]
-    fn test_curator_backlog_target_resolves_each_tier_and_a_higher_tier_wins() {
-        let dir = tempdir().unwrap();
-        let defaults = dir.path().join("machine-defaults.json");
-        std::env::set_var(PRIVATE_DEFAULTS_ENV, &defaults);
-        let root = dir.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
-        assert_eq!(curator_backlog_target(&root), None, "unset at every tier");
-        // Lowest to highest precedence; each write must take over.
-        let tiers = [
-            defaults.clone(),
-            root.join(LEGACY_CONFIG_REL),
-            root.join(PROJECT_CONFIG_REL),
-            root.join(FLEET_REPO_CONFIG_REL),
-            root.join(LOCAL_CONFIG_REL),
-        ];
-        for (i, tier) in tiers.iter().enumerate() {
-            let value = 100 + i as u64;
-            write(tier, &backlog(value));
-            assert_eq!(curator_backlog_target(&root), Some(value), "{}", tier.display());
-        }
-        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
-    }
-
-    #[test]
-    #[serial(loom_config_env)]
-    fn test_curator_backlog_target_zero_or_non_integer_is_unset() {
-        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
-        let dir = tempdir().unwrap();
-        for raw in ["0", "-5", "1.5", "\"140\"", "null", "true"] {
-            write(
-                &dir.path().join(LEGACY_CONFIG_REL),
-                &format!(r#"{{"curator": {{"backlogTarget": {raw}}}}}"#),
-            );
-            assert_eq!(curator_backlog_target(dir.path()), None, "{raw}");
-        }
-        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+    fn test_retired_curator_backlog_target_warns_once_and_unset_is_silent() {
+        let unset = serde_json::json!({"curator": {}});
+        assert!(!warn_retired_curator_backlog_target(&unset), "unset key is silent");
+        let set = serde_json::json!({"curator": {"backlogTarget": 100}});
+        let first = warn_retired_curator_backlog_target(&set);
+        let second = warn_retired_curator_backlog_target(&set);
+        assert!(!second, "already warned");
+        // Another test in this process may have warned first.
+        let _ = first;
     }
 }

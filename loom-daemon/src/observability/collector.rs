@@ -66,10 +66,10 @@ use chrono::{DateTime, Utc};
 
 use crate::event_bus::{EventBus, RecvError};
 use crate::telemetry::{
-    is_path_shaped_repo, visibility::derive_visibility, AdmissionBrakeSummary, HostHealthRecord,
-    HostProtectionSummary, ManagedRepoEntry, MemoryPressureSummary, PhaseDuration, RepoVisibility,
-    RoleTickFailureEntry, RoleTickHealth, SweepResult, SweepStartedRecord, TelemetryEnvelope,
-    TelemetryRecord, TokenAccountState, TokenSnapshotRecord,
+    is_path_shaped_repo, visibility::derive_visibility, HostHealthRecord, HostProtectionSummary,
+    ManagedRepoEntry, MemoryPressureSummary, PhaseDuration, RepoVisibility, RoleTickFailureEntry,
+    RoleTickHealth, SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord,
+    TokenAccountState, TokenSnapshotRecord,
 };
 use crate::tokens_pool::{account_inventory, health_snapshot, AccountProvider};
 use crate::types::{Event, RoleTickRecord, SweepKind};
@@ -151,35 +151,11 @@ async fn run_collector(
     // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
     let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
     ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // `operator.presence` and in-session sweep facts, derived from the
-    // session transcripts and lease records on this host (#12121).
-    let mut presence_timer = tokio::time::interval(super::presence_derive::TICK);
-    presence_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let presence = Arc::new(std::sync::Mutex::new(super::presence_derive::Deriver::new(
-        host_id.clone(),
-        &workspace_root,
-    )));
-    // The pass's forge gathers (captain facts, stage dwell, fleet state) on
-    // the snapshot cadence, first fired after this host's startup jitter
-    // (#12073) so a fleet that restarts together does not gather at once.
-    //
-    // They run on their OWN task, never as an arm of the `select!` below: a
-    // gather is forge-bound (shed reads, breaker waits, label-history
-    // pages) and can take longer than `snapshot_interval`. Awaited inline,
-    // a gather that outlasted its period left the `Delay`-mode forge timer
-    // ready again the moment it returned, and the `biased` select — which
-    // polls arms in order — took it again before ever reaching the
-    // snapshot arm, so host.health / tokens / host.export stopped while
-    // fleet.state kept flowing (the 0.19.1163 regression). The guard
-    // aborts the task when the collector stops.
-    let first_gather = crate::startup_jitter::arm(&workspace_root).opens_at();
-    let _forge_task = spawn_forge_gathers(
-        first_gather,
-        snapshot_interval,
-        workspace_root.clone(),
-        Arc::clone(&workspace_pool),
-    );
-
+    // Host status gauges (#12112): a fast fixed-interval sample, OTLP-only.
+    let mut host_status = crate::host_status::HostStatusSampler::default();
+    let host_status_started = Instant::now();
+    let mut host_status_timer = tokio::time::interval(host_status.interval());
+    host_status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // First-boot backfill (Issue #5084): run once immediately, before the
     // first snapshot tick, so a sweep adopted across a daemon restart does
     // not wait a full `snapshot_interval` (5 minutes) for its terminal
@@ -220,19 +196,28 @@ async fn run_collector(
                     .await;
             }
 
-            _ = ratelimit_timer.tick() => {
-                super::ops::ratelimit::record(&workspace_root).await;
+            _ = host_status_timer.tick() => {
+                // Sampled and published even without an OTLP exporter:
+                // admission readers (#12114) need the filtered record. Only the
+                // telemetry offer is exporter-gated.
+                let root = workspace_root.clone();
+                if let Ok(readings) =
+                    tokio::task::spawn_blocking(move || crate::host_status::read_os(&root)).await
+                {
+                    let record =
+                        host_status.step(&readings, host_status_started.elapsed().as_secs_f64());
+                    crate::host_status::publish(&record);
+                    if super::ops::global_ops_sink().is_some() {
+                        queue.offer(TelemetryEnvelope::new(
+                            &host_id,
+                            TelemetryRecord::HostStatus(record),
+                        ));
+                    }
+                }
             }
 
-            _ = presence_timer.tick() => {
-                derive_presence(
-                    &presence,
-                    queue.as_ref(),
-                    &workspace_root,
-                    &workspace_pool,
-                    &mut slug_cache,
-                )
-                .await;
+            _ = ratelimit_timer.tick() => {
+                super::ops::ratelimit::record(&workspace_root).await;
             }
 
             _ = snapshot_timer.tick() => {
@@ -253,37 +238,6 @@ async fn run_collector(
                 run_backfill(&queue, &workspace_root, &workspace_pool).await;
             }
         }
-    }
-}
-
-/// One presence-derivation tick (#12121): skipped when the operator opted
-/// out, otherwise run off the reactor (it reads transcripts and a few small
-/// files) and offered to the queue like any other record.
-async fn derive_presence(
-    presence: &Arc<std::sync::Mutex<super::presence_derive::Deriver>>,
-    queue: &dyn QueueSink,
-    workspace_root: &Path,
-    workspace_pool: &WorkspacePool,
-    slug_cache: &mut HashMap<String, String>,
-) {
-    if !super::presence_derive::enabled() {
-        return;
-    }
-    let dispatched: std::collections::HashSet<String> = collect_active_sweep_ids(workspace_pool)
-        .into_iter()
-        .collect();
-    let slug = resolve_repo_slug_cached(slug_cache, &workspace_root.display().to_string()).await;
-    let (deriver, root) = (Arc::clone(presence), workspace_root.to_path_buf());
-    let envelopes = tokio::task::spawn_blocking(move || {
-        deriver
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tick(Utc::now(), &dispatched, slug.as_deref().map(|s| (s, root.as_path())))
-    })
-    .await
-    .unwrap_or_default();
-    for envelope in envelopes {
-        queue.offer(envelope);
     }
 }
 
@@ -1087,128 +1041,6 @@ async fn sample_snapshots(
     super::ops::codex_session::record();
 }
 
-/// Aborts the wrapped task when dropped, so the forge-gather task never
-/// outlives the collector that spawned it.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Spawn the collector's forge gathers on a task of their own (see
-/// [`forge_gather_loop`]), under [`supervise_forge_gathers`] so a panic in a
-/// gather is logged and the loop restarts instead of ending silently. The
-/// task keeps its own slug memo: the cache is only a `gh repo view`
-/// memoization, so a second copy costs at most one extra lookup per
-/// workspace and shares no lock with the host samples.
-fn spawn_forge_gathers(
-    first: tokio::time::Instant,
-    period: Duration,
-    workspace_root: PathBuf,
-    workspace_pool: Arc<WorkspacePool>,
-) -> AbortOnDrop {
-    AbortOnDrop(tokio::spawn(supervise_forge_gathers(
-        first,
-        period,
-        move || {
-            (
-                workspace_root.clone(),
-                Arc::clone(&workspace_pool),
-                HashMap::<String, String>::new(),
-            )
-        },
-        |(root, pool, cache)| Box::pin(forge_gathers(root, pool, cache)),
-    )))
-}
-
-/// Run [`forge_gather_loop`] as a child task and restart it if it dies. On a
-/// panic the payload is logged at ERROR, the supervisor waits one `period`,
-/// then restarts the loop with fresh state from `make` (a fresh slug memo in
-/// production). Dropping the supervisor drops the child's guard, aborting it.
-async fn supervise_forge_gathers<S, G, M>(
-    first: tokio::time::Instant,
-    period: Duration,
-    mut make: M,
-    gather: G,
-) where
-    M: FnMut() -> S,
-    S: Send + 'static,
-    G: for<'a> FnMut(
-            &'a mut S,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
-        + Clone
-        + Send
-        + 'static,
-{
-    let mut start = first;
-    loop {
-        let mut child =
-            AbortOnDrop(tokio::spawn(forge_gather_loop(start, period, make(), gather.clone())));
-        match (&mut child.0).await {
-            Err(e) if e.is_panic() => {
-                let payload = e.into_panic();
-                let msg = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
-                log::error!(
-                    "observability: forge gather panicked ({msg}); restarting the forge gathers in {}s",
-                    period.as_secs()
-                );
-            }
-            Err(_) => return, // cancelled: the collector is shutting down
-            Ok(()) => log::error!(
-                "observability: forge gather loop exited unexpectedly; restarting in {}s",
-                period.as_secs()
-            ),
-        }
-        tokio::time::sleep(period).await;
-        start = tokio::time::Instant::now();
-    }
-}
-
-/// The forge-gather schedule: first pass at `first` (when the startup-jitter
-/// gate opens), then every `period`. One pass at a time — a pass that runs
-/// long delays the next (`MissedTickBehavior::Delay`) rather than stacking
-/// passes behind it. Generic over the pass so tests can drive the schedule
-/// with a gather that hangs.
-async fn forge_gather_loop<S, G>(
-    first: tokio::time::Instant,
-    period: Duration,
-    mut state: S,
-    mut gather: G,
-) where
-    G: for<'a> FnMut(
-        &'a mut S,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>,
-{
-    let mut timer = tokio::time::interval_at(first, period);
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        timer.tick().await;
-        gather(&mut state).await;
-    }
-}
-
-/// The collector's fleet-wide forge gathers, on their own task and timer so
-/// the first one can wait out the startup jitter (#12073), and so a slow one
-/// never delays the host samples above, which run from boot.
-async fn forge_gathers(
-    workspace_root: &Path,
-    workspace_pool: &WorkspacePool,
-    slug_cache: &mut HashMap<String, String>,
-) {
-    // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
-    // listings plus a bounded per-item budget; a no-op without the ops sink.
-    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
-    // skips the repos a fresh captain covers (`captain_gauges`).
-    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
-}
-
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
 /// `tokens.snapshot` carries (issue #4874). The writers emit a canonical
 /// `%Y-%m-%dT%H:%M:%SZ` instant, but this is the trust boundary between an
@@ -1347,20 +1179,6 @@ async fn sample_host_health(
     // `spawn_blocking` per the exact pattern `work_finder`'s dynamic-cap tick
     // already uses.
     let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
-    // The host-distress breaker (#4235) is the daemon's own authoritative
-    // "is this host refusing new work right now" signal — reused rather than
-    // re-derived (#4975). `None` (no work-finder loop ever registered a
-    // breaker on this host) reads as "not known to be halted", matching every
-    // other unmeasurable field's "unknown != zero" contract.
-    // #8478: the admission brake is the SECOND way this host can be refusing
-    // dispatch, and the incident behind #8478 was invisible fleet-wide because
-    // only the breaker fed `dispatch_halted`. Sampled before the halt pair so
-    // the latter can fold it in.
-    let admission_brake = sample_admission_brake(crate::admission_brake::global_snapshot()).await;
-    let (dispatch_halted, halt_reason) = dispatch_halt_from_breaker(
-        crate::host_breaker::global_snapshot(),
-        admission_brake.as_ref(),
-    );
     // Free AND total (#5356) come from the SAME `df -Pk` sample — one
     // subprocess spawn, not two — so the pair can never disagree about which
     // filesystem or point in time they describe. The caller took that sample
@@ -1400,6 +1218,14 @@ async fn sample_host_health(
         &crate::observability::global_export_statuses(),
         Utc::now(),
     );
+    // Cgroup-derived agent-scope census (#12166): independent of the registry
+    // so orphaned scopes show. Blocking fs/proc reads; absent on non-Linux.
+    let (agent_scopes, agent_scopes_total) =
+        tokio::task::spawn_blocking(crate::agent_scopes::census)
+            .await
+            .ok()
+            .flatten()
+            .map_or((Vec::new(), None), |(l, t)| (l, Some(t)));
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1416,12 +1242,9 @@ async fn sample_host_health(
         worktree_root_free_gb,
         worktree_root_total_gb,
         active_sweep_ids: collect_active_sweep_ids(workspace_pool),
-        dispatch_halted,
-        halt_reason,
         managed_repos: collect_managed_repos(workspace_pool, slug_cache).await,
         roles: sample_role_tick_health(&crate::role_runner::role_tick_records()),
         protection: sample_host_protection().await,
-        admission_brake,
         is_captain: captain_gate.is_captain_flag(),
         armed_singleton_jobs: crate::fleet_captain::armed_singleton_job_names_for_host(
             workspace_root,
@@ -1434,9 +1257,11 @@ async fn sample_host_health(
         )),
         // Memory/pressure slice ("deferred vs killed vs timed out"): the
         // whole object is omitted when nothing was measured — never a flat
-        // zero — the same absence contract `protection`/`admission_brake`
+        // zero — the same absence contract `protection`
         // follow. Swap rates come from the process-global sample history.
         memory: memory_summary(pressure, swap_in_bytes_per_sec, swap_out_bytes_per_sec),
+        agent_scopes,
+        agent_scopes_total,
     }
 }
 
@@ -1502,72 +1327,6 @@ fn swap_sample_rates(pressure: &crate::host_pressure::HostPressure) -> (Option<f
     rates
 }
 
-/// Project this host's [`crate::admission_brake::BrakeSnapshot`] onto the wire
-/// [`AdmissionBrakeSummary`] (Issue #8478), attaching foreign-load attribution
-/// only when the host is actually starving past its own warn threshold.
-///
-/// The `ps` shellout is the reason this is `async` and split from the pure
-/// [`brake_summary_from_snapshot`] below: it runs under `spawn_blocking` (the
-/// same pattern `sample_host_protection` uses for `launchctl`/`systemctl`) and
-/// **only** on a host whose dispatch is already suppressed by load Loom does not
-/// own. A healthy host pays nothing — no subprocess, no `ps` — on every
-/// `host.health` sample, which is the whole reason the gate is on
-/// `dispatch_suppressed_by_foreign_load` rather than on `held`.
-async fn sample_admission_brake(
-    snapshot: Option<crate::admission_brake::BrakeSnapshot>,
-) -> Option<AdmissionBrakeSummary> {
-    let mut summary = brake_summary_from_snapshot(snapshot, Utc::now())?;
-    if summary.dispatch_suppressed_by_foreign_load {
-        summary.top_cpu_consumers = tokio::task::spawn_blocking(|| {
-            let clause = crate::foreign_load::attribution_clause();
-            // `attribution_clause` returns "" on ANY probe failure; an absent
-            // attribution must stay absent rather than becoming an empty
-            // string a consumer would render as a blank answer.
-            (!clause.is_empty()).then_some(clause)
-        })
-        .await
-        .ok()
-        .flatten();
-    }
-    Some(summary)
-}
-
-/// Pure projection of a brake snapshot onto the wire summary — split out of
-/// [`sample_admission_brake`] so the duration arithmetic and the
-/// suppressed-by-foreign-load verdict are unit-testable with a fixed `now` and
-/// no process-global brake registration (the `OnceLock` every other test in
-/// this binary shares can only be set once).
-///
-/// `now` is the emitting host's own clock, so `starving_secs` is computed
-/// locally and a consumer never subtracts a remote timestamp from its own.
-/// Clamped at `0`: a snapshot whose `starving_since` is momentarily ahead of
-/// `now` (a clock adjustment mid-tick) must report "just started", never a
-/// negative duration.
-fn brake_summary_from_snapshot(
-    snapshot: Option<crate::admission_brake::BrakeSnapshot>,
-    now: DateTime<Utc>,
-) -> Option<AdmissionBrakeSummary> {
-    let snapshot = snapshot?;
-    let starving_secs = snapshot
-        .starving_since
-        .map(|since| (now - since).num_seconds().max(0));
-    // Held AND starving at least as long as THIS host considers alarming. Both
-    // conjuncts matter: `starving_since` is only ever set on a held tick, but
-    // stating `held` explicitly keeps the field honest if that ever changes.
-    let dispatch_suppressed_by_foreign_load =
-        snapshot.held && starving_secs.is_some_and(|secs| secs >= snapshot.starvation_warn_secs);
-    Some(AdmissionBrakeSummary {
-        held: snapshot.held,
-        starving_since: snapshot.starving_since,
-        starving_secs,
-        starvation_warn_secs: snapshot.starvation_warn_secs,
-        escape_hatch_grants: snapshot.escape_hatch_grants,
-        dispatch_suppressed_by_foreign_load,
-        // Filled in by `sample_admission_brake` only when suppressed.
-        top_cpu_consumers: None,
-    })
-}
-
 /// Sample this host's watchdog/crash-protection state (Issue #5352) via
 /// [`crate::daemon_install_state::probe_protection`] — the exact same
 /// classification `loom-daemon status`'s `Protection:` line and `--json`'s
@@ -1629,86 +1388,6 @@ fn sample_role_tick_health(records: &[RoleTickRecord]) -> RoleTickHealth {
                 detail: failure.detail,
             })
             .collect(),
-    }
-}
-
-/// Derive `host.health`'s `(dispatch_halted, halt_reason)` pair from a
-/// [`crate::host_breaker::BreakerSnapshot`] (Issue #4975) **or** a
-/// sustained-starving admission brake (Issue #8478). Pure — takes both as
-/// values rather than reading the process-globals directly — so it is
-/// unit-testable for every combination without mutating the one-shot
-/// [`crate::host_breaker::GLOBAL`] handle that every other test in this
-/// binary shares.
-///
-/// `snapshot.suppressed` is already `enabled && phase.suppresses_dispatch()`
-/// (`Open` or `CoolDown`) — reused verbatim rather than re-derived from
-/// `phase` here, so this can never drift from the breaker's own definition of
-/// "refusing work".
-///
-/// # Why the brake belongs in the same pair (#8478)
-///
-/// `dispatch_halted` is consumed as *the* "is this host refusing new work"
-/// signal — the dashboard's `distressReason` renders it generically as
-/// `dispatch halted: <reason>`, never breaker-specifically. But before #8478
-/// only the breaker fed it, so the 2026-09-20 incident — 12 hours of held
-/// admission from foreign load, with the breaker never tripping — presented
-/// fleet-wide as a *healthy idle host*. Folding the brake in makes that host
-/// render as degraded through the consumer path that already exists, with no
-/// dashboard change; [`AdmissionBrakeSummary`] then carries the duration and
-/// the attribution that this boolean-plus-prose pair structurally cannot.
-///
-/// The breaker keeps priority when both fire: it is the stickier, more severe
-/// condition (sustained distress across a cool-down vs. a point-in-time hold),
-/// so its reason is the more actionable one to lead with. Only a brake that has
-/// passed its own `starvation_warn_secs` counts here — a brake holding while
-/// sweeps genuinely drain is healthy backpressure, and reporting *that* as a
-/// halt would flag every busy host in the fleet.
-///
-/// # Why `halt_reason` carries scalars ONLY — never the attribution
-///
-/// `halt_reason` is an unconditional member of `host.health`'s **public**
-/// allowlist (`RECORD_FIELD_ALLOWLIST` in `loom-ui:src/redaction.ts`), copied
-/// verbatim into every unauthenticated fleet response. `top_cpu_consumers` is
-/// deliberately **not** in that allowlist — `redactAdmissionBrakeRow` drops it,
-/// because a list of executable basenames is workload detail that has no safe
-/// truncation (a command name IS the payload).
-///
-/// Interpolating the attribution into this free-text reason would therefore
-/// re-emit, byte for byte, the exact data the row redaction just removed —
-/// defeating the boundary through the other field. So the reason states only
-/// the duration, this host's own threshold, and the non-attributing verdict
-/// "suppressed by load Loom does not own"; [`AdmissionBrakeSummary`]'s
-/// `top_cpu_consumers` is the **sole** carrier of process attribution, and it
-/// stays behind the Access gate where an authenticated `/api/*` viewer reads it
-/// unchanged. The host-local `admission_brake` starvation log line
-/// ([`crate::admission_brake::global_observe`]) is unaffected — it never leaves
-/// the host, so it keeps the full clause.
-///
-/// Pinned end-to-end by
-/// `the_halt_reason_never_carries_process_attribution_past_the_public_boundary`
-/// below and by `loom-ui:test/redactionAdmissionBrake.test.ts`'s
-/// "no process name survives" case, which assert the two halves of the same
-/// boundary (Judge finding on PR #8547).
-fn dispatch_halt_from_breaker(
-    snapshot: Option<crate::host_breaker::BreakerSnapshot>,
-    brake: Option<&AdmissionBrakeSummary>,
-) -> (bool, Option<String>) {
-    match snapshot {
-        Some(snapshot) if snapshot.suppressed => return (true, snapshot.reason),
-        _ => {}
-    }
-    match brake {
-        Some(brake) if brake.dispatch_suppressed_by_foreign_load => (
-            true,
-            Some(format!(
-                "admission brake STARVING for {}s with 0 sweeps in flight (\u{2265} this host's \
-                 starvationWarnSecs {}); dispatch is suppressed by load Loom does not own \
-                 (#8478)",
-                brake.starving_secs.unwrap_or_default(),
-                brake.starvation_warn_secs,
-            )),
-        ),
-        _ => (false, None),
     }
 }
 
@@ -1854,9 +1533,6 @@ fn collect_active_sweep_ids(workspace_pool: &WorkspacePool) -> Vec<String> {
     ids
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod admission_brake_tests;
 // Issue #9477: `sweep.outcome` live-vs-journal precedence.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -1874,10 +1550,6 @@ mod story_points_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod terminal_records_tests;
-// The forge gathers' own task: a slow gather never delays host samples.
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod forge_gather_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;

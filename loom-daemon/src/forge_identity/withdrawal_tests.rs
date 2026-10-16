@@ -96,6 +96,7 @@ fn a_core_rate_limit_withdraws_only_that_owners_core_bucket() {
         writer: None,
         readers: vec![reader(app)],
         legacy_logins: vec![],
+        writers: Vec::new(),
     };
     let pick = |repo: &str, resource| {
         super::super::reader_for_resource_at(&roster, repo, resource, during, RoutingMode::Scoped)

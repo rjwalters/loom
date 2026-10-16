@@ -1,7 +1,7 @@
 //! The production step tick (#11909): the work-finder loop's dispatch call.
 //!
-//! The loop keeps computing what it always did (the dynamic cap, holds,
-//! saturation, the build back-off, the per-repo limits) and hands it here.
+//! The loop computes the cap (the operator's `maxConcurrent`, #12406), the
+//! holds and the build back-off, and hands them here.
 //! This module reads each workspace's items ([`super::gather`]), weighs them
 //! with the registry's live state (step cooldowns, the Champion ladder, the
 //! exhausted role pools), runs [`super::tick::run`] with the registries'
@@ -11,21 +11,23 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 
-use super::gather_budget::{deadline_passed, GatherWalk, Starvation, GUARANTEED_FLOOR};
-use super::item_draw::{weigh, ItemWeights, WeighContext};
+use super::gather_budget::{
+    deadline_passed, millis, GatherWalk, SpawnParts, Starvation, TickPasses, TickPhases,
+    GUARANTEED_FLOOR,
+};
+use super::item_draw::{weigh, ItemWeights, PoolKnobs, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
-use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest};
+use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawnTimings};
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::halt_cause::HaltCause;
-use crate::work_finder::repo_cap::{RepoCap, RepoLimits};
 use crate::work_finder::step_item::{Lane, Step};
-use crate::work_finder::{workspace_draw, RedMainLane, RegistryDispatcher, TickReport};
+use crate::work_finder::{RedMainLane, RegistryDispatcher, TickReport};
 use crate::workspace_pool::WorkspacePool;
 
 /// What the loop computed for this tick, per root and for the host.
@@ -39,13 +41,20 @@ pub struct TickInputs<'a> {
     pub lanes: &'a [RedMainLane],
     /// The build back-off is engaged, per root.
     pub build_backoff: &'a [bool],
+    /// The cap: the operator's `maxConcurrent` (#12406).
     pub max_concurrent: usize,
-    pub max_admissions: usize,
-    pub saturation_held: bool,
-    pub limits: RepoLimits,
     /// The tick's wall-clock deadline (#12074): past it, no further repo is
     /// gathered. `None`: gather every repo.
     pub deadline: Option<Instant>,
+    /// How many repos the gather lists at once (#12256,
+    /// `autonomous.workFinder.gatherConcurrency`); `1` is serial.
+    pub gather_concurrency: usize,
+    /// How many spawns, each in a different repo, the draw runs at once
+    /// (#12298, `autonomous.workFinder.spawnConcurrency`); `1` is serial.
+    pub spawn_concurrency: usize,
+    /// The discovery tier chain that builds the tick's snapshot (#12311,
+    /// `forge.mirror.discovery`).
+    pub discovery: crate::discovery::Chain,
 }
 
 /// What a workspace's listing said beyond its items.
@@ -136,6 +145,7 @@ pub fn actionable_point(
 /// The step tick's state across ticks: the stage-entry provider's cache,
 /// and where the next gather starts (#12074).
 pub struct StepDriver {
+    discovery: crate::discovery::Discovery,
     provider: StageEntryProvider,
     next_start: usize,
     starvation: Starvation,
@@ -144,6 +154,7 @@ pub struct StepDriver {
 impl Default for StepDriver {
     fn default() -> Self {
         Self {
+            discovery: crate::discovery::Discovery::default(),
             provider: StageEntryProvider::load(default_cache_path(), DEFAULT_EVENTS_BUDGET),
             next_start: 0,
             starvation: Starvation::default(),
@@ -153,10 +164,18 @@ impl Default for StepDriver {
 
 /// The registries' step spawn, with the lock released around containment,
 /// the pre-claim and the account-selection poll
-/// ([`SweepRegistry::spawn_step_unlocked`]).
+/// ([`SweepRegistry::spawn_step_unlocked`]). A round's spawns, one per repo,
+/// run on up to `concurrency` threads (#12298).
 struct RegistrySpawner {
     registries: Vec<Arc<Mutex<SweepRegistry>>>,
     roots: Vec<PathBuf>,
+    /// Wall time spent inside spawns this tick (#12256).
+    spent: Duration,
+    attempts: usize,
+    /// How many of a round's spawns run at once (#12298).
+    concurrency: usize,
+    /// Where the spawns' time went, summed over attempts (#12298).
+    parts: StepSpawnTimings,
 }
 
 fn refusal_reason(e: &anyhow::Error) -> String {
@@ -165,11 +184,84 @@ fn refusal_reason(e: &anyhow::Error) -> String {
 }
 
 impl StepSpawner for RegistrySpawner {
+    fn held(&mut self) -> Option<&'static str> {
+        let now = Utc::now();
+        crate::rate_limit_breaker::global()
+            .is_some_and(|rl| rl.skip_if_suppressed("work_finder", now))
+            .then_some("rate_limit_breaker")
+    }
+
     fn spawn(&mut self, idx: usize, request: &StepSpawnRequest) -> SpawnResult {
+        let started = Instant::now();
+        let (result, parts) = self.spawn_one(idx, request, self.concurrency > 1);
+        self.spent += started.elapsed();
+        self.attempts += 1;
+        self.parts.add(&parts);
+        result
+    }
+
+    fn spawn_batch(&mut self, batch: &[(usize, StepSpawnRequest)]) -> Vec<SpawnResult> {
+        if self.concurrency <= 1 || batch.len() <= 1 {
+            return batch
+                .iter()
+                .map(|(idx, request)| self.spawn(*idx, request))
+                .collect();
+        }
+        // Each worker carries the trace parent and the runtime context, as
+        // the gather's do; the draw's reads run outside the tick deadline,
+        // so the (suspended) read scope goes along as it is.
+        let started = Instant::now();
+        let read_scope = crate::gh_invocation::read_deadline::snapshot();
+        let parent = crate::gh_invocation::telemetry::thread_parent();
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let this = &*self;
+        let answered = super::gather_budget::run_ordered(
+            batch.to_vec(),
+            self.concurrency,
+            || {
+                (
+                    crate::gh_invocation::read_deadline::install(read_scope),
+                    crate::gh_invocation::telemetry::enter_parent(parent.clone()),
+                    runtime.as_ref().map(tokio::runtime::Handle::enter),
+                )
+            },
+            |_, (idx, request)| Some(this.spawn_one(idx, &request, true)),
+        );
+        self.spent += started.elapsed();
+        self.attempts += batch.len();
+        // `run_ordered` answers in batch order; a missing answer (a worker
+        // that panicked) is a failed spawn.
+        let mut results = vec![None; batch.len()];
+        for (pos, (result, parts)) in answered {
+            self.parts.add(&parts);
+            if let Some(slot) = results.get_mut(pos) {
+                *slot = Some(result);
+            }
+        }
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| SpawnResult::Refused("spawn_failed".to_string())))
+            .collect()
+    }
+}
+
+impl RegistrySpawner {
+    /// One spawn. `host_gate`: the tick runs spawns concurrently, so the
+    /// launch keeps the host-wide stagger gap (#3887, #12298); a serial
+    /// tick (`spawnConcurrency` 1) launches exactly as before.
+    fn spawn_one(
+        &self,
+        idx: usize,
+        request: &StepSpawnRequest,
+        host_gate: bool,
+    ) -> (SpawnResult, StepSpawnTimings) {
+        let mut parts = StepSpawnTimings::default();
         let Some(registry) = self.registries.get(idx) else {
-            return SpawnResult::Refused("spawn_failed".to_string());
+            return (SpawnResult::Refused("spawn_failed".to_string()), parts);
         };
-        match SweepRegistry::spawn_step_unlocked(registry, request) {
+        let result = match SweepRegistry::spawn_step_unlocked_timed(
+            registry, request, &mut parts, host_gate,
+        ) {
             Ok(_) => SpawnResult::Spawned,
             Err(e) => {
                 let reason = refusal_reason(&e);
@@ -184,15 +276,57 @@ impl StepSpawner for RegistrySpawner {
                 }
                 SpawnResult::Refused(reason)
             }
-        }
+        };
+        (result, parts)
     }
 }
 
-fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
-    registry.lock().map_or(0, |mut reg| {
-        reg.reap_liveness();
-        reg.occupied_issues().len()
-    })
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One repo the tick lists (#12256), set aside by the serial first pass.
+struct GatherJob {
+    idx: usize,
+    fixes_only: bool,
+    repo: String,
+    weight: u32,
+    /// Starved for several ticks: the starvation count restarts after this
+    /// tick (it no longer buys the writer: reads never use it, #12394).
+    escalated: bool,
+}
+
+/// The forge half of one repo's gather, on whichever worker took it: the
+/// repo's own read guard (the guaranteed floor), then [`super::gather::list`].
+fn list_one(
+    input: &TickInputs<'_>,
+    registry: &Arc<Mutex<SweepRegistry>>,
+    idx: usize,
+    guaranteed: bool,
+    snapshot: &crate::discovery::TickSnapshot,
+    held_capabilities: &BTreeSet<String>,
+) -> anyhow::Result<Option<super::gather::Listed>> {
+    let root = &input.roots[idx];
+    // The repo a tick always gathers gets a real read budget, even past the
+    // deadline (#12074).
+    let _floor = guaranteed
+        .then(|| crate::gh_invocation::read_deadline::at_least(Instant::now() + GUARANTEED_FLOOR));
+    let lane = input.lanes.get(idx).copied().unwrap_or_default();
+    let red = |fixes: Vec<crate::work_finder::WorkItem>| {
+        let mut fixes = fixes;
+        let mut dispatcher = RegistryDispatcher::new(registry.clone());
+        crate::work_finder::main_red_fix::evaluate(lane, &mut fixes, &mut dispatcher)
+    };
+    super::gather::list(root, registry, snapshot, red, held_capabilities)
+}
+
+pub(crate) fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
+    // A poisoned lock still holds the real claims; recover rather than report 0.
+    let mut reg = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reg.reap_liveness();
+    reg.occupied_issues().len()
 }
 
 impl StepDriver {
@@ -214,6 +348,9 @@ impl StepDriver {
         let occupied: Vec<usize> = registries.iter().map(occupancy).collect();
         let held_capabilities = crate::capability::held_capabilities();
         let mut workspaces = Vec::new();
+        // Roles whose pool is exhausted in any workspace, for the
+        // fleet-dispatch heartbeat's `roles_ok` (#12450).
+        let mut exhausted_roles: std::collections::BTreeSet<String> = Default::default();
         // Per workspace: (idx, failed listing, listing state, Builders held).
         let mut notes: Vec<(usize, Option<anyhow::Error>, Option<ListingState>, usize)> =
             Vec::new();
@@ -222,11 +359,13 @@ impl StepDriver {
         let mut actionable = Vec::new();
         // #12074: walk from where the last truncated tick stopped; past the
         // deadline, gather no further repo.
-        let mut walk = GatherWalk::new(input.roots.len(), self.next_start, Instant::now());
-        for idx in walk.order().collect::<Vec<_>>() {
+        let walk = Mutex::new(GatherWalk::new(input.roots.len(), self.next_start, Instant::now()));
+        let order: Vec<usize> = lock(&walk).order().collect();
+        // Pass 1, serial and local: settle each repo's ended steps (so the
+        // cooldowns they arm hold for this draw) and set the held repos aside.
+        let mut jobs: Vec<GatherJob> = Vec::new();
+        for idx in order {
             let root = &input.roots[idx];
-            // Record the steps that ended since the last tick first, so the
-            // cooldowns they arm hold for this draw.
             super::step_end::settle(root, &registries[idx]);
             let halted = input.halted.get(idx).copied().unwrap_or(false);
             let lane = input.lanes.get(idx).copied().unwrap_or_default();
@@ -240,6 +379,7 @@ impl StepDriver {
                     idx,
                     repo,
                     weight,
+                    in_flight: 0,
                     weighing: super::item_draw::Weighing {
                         pool: Vec::new(),
                         excluded: Default::default(),
@@ -250,38 +390,77 @@ impl StepDriver {
                 });
                 continue;
             }
-            if !walk.admit(idx, deadline_passed(input.deadline, Instant::now())) {
+            jobs.push(GatherJob {
+                idx,
+                fixes_only,
+                repo,
+                weight,
+                escalated: self.starvation.escalate(root),
+            });
+        }
+        // Pass 2, the forge half, `gather_concurrency` repos at once
+        // (#12256). Each worker carries the tick's read deadline, its trace
+        // parent and the runtime context; a repo past the deadline is
+        // skipped as before. Results come back in walk order.
+        let listing_started = Instant::now();
+        // One snapshot per tick (#12306): the Mirror backend makes its one
+        // worklist request here; Direct lists each repo as the gather asks.
+        let snapshot = self.discovery.begin_tick(input.discovery, now);
+        let read_scope = crate::gh_invocation::read_deadline::snapshot();
+        let parent = crate::gh_invocation::telemetry::thread_parent();
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let concurrency = input.gather_concurrency.max(1);
+        let job_meta: Vec<usize> = jobs.iter().map(|j| j.idx).collect();
+        let listed = super::gather_budget::run_ordered(
+            job_meta,
+            concurrency,
+            || {
+                (
+                    crate::gh_invocation::read_deadline::install(read_scope),
+                    crate::gh_invocation::telemetry::enter_parent(parent.clone()),
+                    runtime.as_ref().map(tokio::runtime::Handle::enter),
+                )
+            },
+            |_, idx| {
+                let guaranteed = {
+                    let mut walk = lock(&walk);
+                    if !walk.admit(idx, deadline_passed(input.deadline, Instant::now())) {
+                        return None;
+                    }
+                    walk.is_guaranteed()
+                };
+                Some(list_one(
+                    input,
+                    &registries[idx],
+                    idx,
+                    guaranteed,
+                    &snapshot,
+                    &held_capabilities,
+                ))
+            },
+        );
+        let listing_ms = millis(listing_started.elapsed());
+        // The other listing readers (blocked queue, quarantine and claim
+        // reconciliation) read this tick's repos instead of listing (#12307).
+        crate::discovery::published::publish(&snapshot);
+        // Pass 3, serial and in walk order: stage entry, weighing, shaping.
+        let filter_started = Instant::now();
+        let mut jobs: Vec<Option<GatherJob>> = jobs.into_iter().map(Some).collect();
+        for (pos, result) in listed {
+            let Some(job) = jobs.get_mut(pos).and_then(Option::take) else {
                 continue;
-            }
-            // The repo a tick always gathers gets a real read budget, even
-            // past the deadline; a repo starved for several ticks gets one
-            // tick on the writer (#12074).
-            let _floor = walk.is_guaranteed().then(|| {
-                crate::gh_invocation::read_deadline::at_least(Instant::now() + GUARANTEED_FLOOR)
-            });
-            let escalated = self.starvation.escalate(root);
-            let _writer = escalated.then(|| {
-                log::info!(
-                    "work_finder: {repo}: reads shed for several ticks; this tick may use the \
-                     writer (#12074)"
-                );
-                crate::gh_invocation::read_deadline::allow_writer()
-            });
-            let registry = &registries[idx];
-            let red = |fixes: Vec<crate::work_finder::WorkItem>| {
-                let mut fixes = fixes;
-                let mut dispatcher = RegistryDispatcher::new(registry.clone());
-                crate::work_finder::main_red_fix::evaluate(lane, &mut fixes, &mut dispatcher)
             };
-            let gathered = match super::gather::gather(
-                root,
-                registry,
-                red,
-                &held_capabilities,
-                &mut self.provider,
-                now,
-            ) {
-                Ok(Some(g)) => g,
+            let GatherJob {
+                idx,
+                fixes_only,
+                repo,
+                weight,
+                escalated,
+            } = job;
+            let root = &input.roots[idx];
+            let registry = &registries[idx];
+            let listed = match result {
+                Ok(Some(l)) => l,
                 Ok(None) => continue,
                 Err(e) => {
                     self.starvation.record(root, true, escalated);
@@ -290,15 +469,19 @@ impl StepDriver {
                     continue;
                 }
             };
+            let gathered = super::gather::finish(listed, root, &mut self.provider, now);
             self.starvation.record(
                 root,
                 gathered.stale_listing || !gathered.pulls_complete,
                 escalated,
             );
-            let (mut cooldowns, pool_exhausted_roles, claims) = registry.lock().map_or_else(
-                |_| (Default::default(), BTreeSet::new(), Default::default()),
-                |reg| (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims()),
-            );
+            let (mut cooldowns, pool_exhausted_roles, claims) = {
+                let reg = registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims())
+            };
+            exhausted_roles.extend(pool_exhausted_roles.iter().cloned());
             for (item, role, until) in &gathered.ladder {
                 cooldowns.insert(*item, *role, *until);
             }
@@ -315,6 +498,10 @@ impl StepDriver {
                 stale_listing: gathered.stale_listing,
                 fixes_only,
             };
+            // `in_flight_repo` (#12185): the repo's items this host runs plus
+            // the live claims peers advertise, counted before the claimed
+            // items leave the pool.
+            let in_flight = claims.items.len();
             let held = shape_pool(&mut weighing, &claims, listing);
             if held > 0 {
                 log::warn!(
@@ -333,11 +520,16 @@ impl StepDriver {
                 idx,
                 repo,
                 weight,
+                in_flight,
                 weighing,
                 halted: false,
                 created_at: gathered.created_at,
             });
         }
+        let filter_ms = millis(filter_started.elapsed());
+        let walk = walk
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let gather = walk.stats(Instant::now());
         self.next_start = walk.next_start();
         if gather.truncated {
@@ -356,10 +548,13 @@ impl StepDriver {
             log::debug!("work_finder: stage-entry cache not written: {e}");
         }
         let total: usize = occupied.iter().sum();
-        let mut repo_cap = RepoCap::from_limits(input.limits.clone(), occupied);
         let mut spawner = RegistrySpawner {
             registries,
             roots: input.roots.to_vec(),
+            spent: Duration::ZERO,
+            attempts: 0,
+            concurrency: input.spawn_concurrency.max(1),
+            parts: StepSpawnTimings::default(),
         };
         let minute = u64::try_from(now.timestamp() / 60).unwrap_or(0);
         let seed = SeedBase {
@@ -370,21 +565,61 @@ impl StepDriver {
         // The draw spawns from what was gathered: its pre-claim reads run
         // normally, outside the gather's read deadline (#12074).
         let _spawning = crate::gh_invocation::read_deadline::suspend();
+        let draw_started = Instant::now();
+        let free_slots = input.max_concurrent.saturating_sub(total);
+        crate::fleet_dispatch::worker::note_capacity(free_slots, &exhausted_roles);
+        // #12450: a host in fleet-dispatch fallback draws one round, with no
+        // free `claim_lost`; unchanged with the flag off.
+        let (free_slots, fallback) = input.roots.first().map_or((free_slots, false), |root| {
+            crate::fleet_dispatch::worker::tick_budget(
+                root,
+                free_slots,
+                input.spawn_concurrency.max(1),
+            )
+        });
         let result = tick::run(
             workspaces,
             StepTickLimits {
-                free_slots: input.max_concurrent.saturating_sub(total),
-                max_admissions: input.max_admissions,
-                saturation_held: input.saturation_held,
+                free_slots,
+                spawn_concurrency: input.spawn_concurrency.max(1),
+                fallback,
             },
             &seed,
-            workspace_draw::tick_seed(),
-            &workspace_draw::weight_bonus(),
-            &mut repo_cap,
+            // Pool-wide, so read once, from the primary workspace like the
+            // work-finder's own hot-applied config.
+            &input
+                .roots
+                .first()
+                .map_or_else(PoolKnobs::default, |root| PoolKnobs::for_root(root)),
             &mut spawner,
         );
+        let draw_total = draw_started.elapsed();
         let mut report = result.report;
         report.gather = Some(gather);
+        report.discovery = Some(snapshot.stats());
+        report.phases = Some(TickPhases {
+            listing_ms,
+            filter_ms,
+            draw_ms: millis(draw_total.saturating_sub(spawner.spent)),
+            spawn_ms: millis(spawner.spent),
+            spawn_attempts: spawner.attempts,
+            gather_concurrency: concurrency,
+            spawn_concurrency: spawner.concurrency,
+            spawn_parts: SpawnParts {
+                resolve_ms: millis(spawner.parts.resolve),
+                claim_ms: millis(spawner.parts.claim),
+                launch_ms: millis(spawner.parts.launch),
+                account_ms: millis(spawner.parts.account),
+            },
+        });
+        report.passes = Some(TickPasses {
+            draws: result.draws,
+            draws_unspawned: result.draws_unspawned,
+            merge_deferred: result.merge_deferred,
+            by_reason: result.passes.clone(),
+            budget: result.budget,
+            stop: Some(result.stop.as_str()),
+        });
         for (idx, failed, listing, held) in &notes {
             note_listing(&mut report, *idx, failed.as_ref(), *listing, *held);
         }
@@ -392,9 +627,12 @@ impl StepDriver {
         report.note_halts(input.halted, Some(input.halt_causes), input.roots.len());
         if !result.passes.is_empty() {
             log::info!(
-                "work_finder: step tick: {} draw(s), {} spawned, passes {:?}",
+                "work_finder: step tick: {} draw(s), {} spawned of {} slot(s), stopped {}, \
+                 passes {:?}",
                 result.draws,
                 report.dispatched,
+                result.budget,
+                result.stop.as_str(),
                 result.passes
             );
         }

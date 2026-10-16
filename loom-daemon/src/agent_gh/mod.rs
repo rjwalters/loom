@@ -69,6 +69,9 @@ pub const SENTINEL_ENV: &str = "LOOM_GH_FRONT_ACTIVE";
 /// Nested fronts beyond this are a resolution loop, not a real call.
 const MAX_DEPTH: u32 = 8;
 
+/// `EX_TEMPFAIL`: a shed read, retry later (#12394).
+const EX_TEMPFAIL: i32 = 75;
+
 /// `forge_call_stats` caller for the front's conditional reads.
 pub const STATS_CALLER: &str = "agent_gh_front";
 
@@ -243,7 +246,21 @@ pub fn run(raw: &[OsString]) -> i32 {
                 ledger::book(raw, cwd.as_deref(), Some(dir), route.read);
                 return code;
             }
-            // It did not answer: the next in line, finally direct (below).
+            // It did not answer: the next in line, finally shed or direct.
+        }
+        if route.read && route.pooled {
+            // #12394: a read no gateway or reader answered is shed, never
+            // exec'd on the session's credential (the writer).
+            ledger::book_shed(raw, cwd.as_deref());
+            eprintln!(
+                "{}",
+                shed_message(route.owner.as_deref(), &|o| {
+                    route.gateway.is_none()
+                        && route.reader.is_none()
+                        && crate::forge_identity::route::owner_uncovered(o)
+                })
+            );
+            return EX_TEMPFAIL;
         }
         ledger::book(raw, cwd.as_deref(), None, route.read);
         // #11858: a role tick's passed-through `--json` listing runs
@@ -406,6 +423,24 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         }
     }
     status.code().unwrap_or(1)
+}
+
+/// The stderr line for a shed passthrough read. When the host's reader pool
+/// has no reader for `owner` at all (`uncovered`), retrying cannot help: the
+/// message says so instead of "retry later".
+fn shed_message(owner: Option<&str>, uncovered: &dyn Fn(&str) -> bool) -> String {
+    let marker = crate::gh_invocation::SHED_MARKER;
+    match owner {
+        Some(o) if uncovered(o) => format!(
+            "gh (loom front): read shed — no reader App on this host serves owner {o}, and the \
+             writer is never used for reads. Retrying will not help until a reader for {o} is \
+             configured {marker}"
+        ),
+        _ => format!(
+            "gh (loom front): read shed — no reader can serve it right now; the writer is \
+             never used for reads. Retry later {marker}"
+        ),
+    }
 }
 
 /// How a passthrough runs (2am#4367 P4, [`read_route`]): a read whose repo

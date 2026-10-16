@@ -32,12 +32,9 @@ pub(super) fn host_health_with_captain(
         worktree_root_free_gb: None,
         worktree_root_total_gb: None,
         active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: Vec::new(),
         roles: RoleTickHealth::default(),
         protection: None,
-        admission_brake: None,
         is_captain,
         armed_singleton_jobs,
         captainless_singleton_jobs: Vec::new(),
@@ -45,6 +42,8 @@ pub(super) fn host_health_with_captain(
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     })
 }
 

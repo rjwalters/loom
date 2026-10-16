@@ -81,6 +81,10 @@ fn champion_lines_are_read_per_mode_and_folded_onto_the_classes() {
         (true, "head-moved", OutcomeClass::Refused),
         (true, "not-eligible", OutcomeClass::Refused),
         (true, "failed", OutcomeClass::Failed),
+        // A `--pr` triage (#12499): each moves the PR to a stage or a hold.
+        (true, "triaged", OutcomeClass::Verdict),
+        (true, "triage-blocked", OutcomeClass::Verdict),
+        (true, "triage-operator", OutcomeClass::Verdict),
         (false, "promoted", OutcomeClass::Verdict),
         (false, "revise", OutcomeClass::Verdict),
         (false, "operator", OutcomeClass::Verdict),
@@ -93,6 +97,7 @@ fn champion_lines_are_read_per_mode_and_folded_onto_the_classes() {
     }
     assert_eq!(champion_outcome(false, "merged"), None, "not an --issue outcome");
     assert_eq!(champion_outcome(true, "deferred"), None, "never invented");
+    assert_eq!(champion_outcome(false, "triaged"), None, "a PR triage is --pr only");
 }
 
 // ---------------------------------------------------------- the post-state
@@ -436,6 +441,20 @@ fn champion_held_or_blocked_goes_to_the_forge_ladder() {
     assert_eq!(rec.effect, Effect::ForgeLadder);
 }
 
+/// #12513: the ladder's 1 h, 1 h, 1 h rungs put three held verdicts inside
+/// 24 h; the repeat cap must not turn the third into a day.
+#[test]
+fn champion_held_runs_are_spaced_by_the_ladder_not_the_repeat_cap() {
+    let mut l = OutcomeLedger::default();
+    for h in 0..6 {
+        let now = t0() + chrono::Duration::hours(h);
+        let rec =
+            l.record(30, StepRole::ChampionMerge, &out(OutcomeClass::Noop, "held"), SLOW, now);
+        assert!(!rec.repeat_capped, "hour {h}");
+        assert_eq!(rec.cooling_until, None, "hour {h}: the registry mirrors the ladder");
+    }
+}
+
 /// Acceptance: no `(item, step)` runs more than 3 times in 24 h without a
 /// state change. A daemon that redraws whenever the query allows, for two
 /// days, with every run failing slowly.
@@ -476,6 +495,108 @@ fn the_repeat_cap_counts_noops_too_and_arms_until_the_oldest_leaves() {
     assert_eq!(
         l.cooling_cause(5, StepRole::Judge, now + mins(122)),
         Some(CooldownCause::RepeatCap)
+    );
+}
+
+/// #12251: the repeat cap survives a restart. A new ledger restored from the
+/// old one's durable part caps on the third run exactly as the old one would
+/// have; before #12251 a roll emptied the history and the cap never armed on
+/// a fleet that rolls every few hours.
+#[test]
+fn the_repeat_cap_holds_across_a_restart() {
+    let now = t0();
+    let failed = out(OutcomeClass::Failed, "crashed");
+    let mut before = OutcomeLedger::default();
+    before.record(5, StepRole::Builder, &failed, SLOW, now);
+    before.record(5, StepRole::Builder, &failed, SLOW, now + mins(30));
+    let durable = before.persisted(now + mins(30));
+    let json = serde_json::to_string(&durable).unwrap();
+
+    let mut after = OutcomeLedger::default();
+    let back: Vec<PersistedPair> = serde_json::from_str(&json).unwrap();
+    after.restore(back, now + mins(60));
+    let rec = after.record(5, StepRole::Builder, &failed, SLOW, now + mins(60));
+    assert!(rec.repeat_capped, "the third run in 24 h caps, restart or not");
+    assert_eq!(rec.cooling_until, Some(now + chrono::Duration::hours(24)));
+
+    // Without the restore, the same run is the first one.
+    let mut forgot = OutcomeLedger::default();
+    assert!(
+        !forgot
+            .record(5, StepRole::Builder, &failed, SLOW, now + mins(60))
+            .repeat_capped
+    );
+}
+
+/// #12251: a window in force comes back with its cause; lapsed runs and
+/// windows are not persisted and not restored.
+#[test]
+fn a_restored_ledger_keeps_live_windows_and_drops_lapsed_ones() {
+    let now = t0();
+    let mut l = OutcomeLedger::default();
+    l.arm(7, StepRole::Builder, now + mins(90), CooldownCause::Landed, now);
+    l.arm(8, StepRole::Judge, now + mins(5), CooldownCause::Noop, now);
+    let durable = l.persisted(now + mins(10));
+    assert_eq!(durable.len(), 1, "{durable:?}");
+    assert_eq!(durable[0].cause, Some(CooldownCause::Landed));
+
+    let mut after = OutcomeLedger::default();
+    after.restore(durable.clone(), now + mins(10));
+    assert_eq!(after.cooling_until(7, StepRole::Builder, now + mins(10)), Some(now + mins(90)));
+    assert_eq!(
+        after.cooling_cause(7, StepRole::Builder, now + mins(10)),
+        Some(CooldownCause::Landed)
+    );
+    let mut late = OutcomeLedger::default();
+    late.restore(durable, now + mins(91));
+    assert!(late.snapshot(now + mins(91)).is_empty(), "lapsed on reload");
+    assert!(late.persisted(now + mins(91)).is_empty());
+}
+
+/// #12513: a Champion ladder mirror is not restored; the forge marker is read
+/// instead (a pre-#12513 one as due now), so the restart that upgrades a
+/// host does not keep an old-ladder 24 h mirror armed.
+#[test]
+fn a_restored_ledger_drops_the_forge_ladder_mirror() {
+    let now = t0();
+    let mut l = OutcomeLedger::default();
+    l.arm(
+        3,
+        StepRole::ChampionMerge,
+        now + chrono::Duration::days(4),
+        CooldownCause::ForgeLadder,
+        now,
+    );
+    l.arm(7, StepRole::Builder, now + mins(90), CooldownCause::Landed, now);
+    // #12516: a fallback for a marker that was never written is restored.
+    l.arm(
+        4,
+        StepRole::ChampionMerge,
+        now + mins(240),
+        CooldownCause::ForgeLadderFallback,
+        now,
+    );
+    let durable = l.persisted(now + mins(1));
+    assert_eq!(durable.len(), 3, "{durable:?}");
+
+    // #12524: the wire form is a plain ladder window plus `fallback`, so a
+    // daemon that predates the fallback cause still parses the file.
+    let json = serde_json::to_string(&durable).unwrap();
+    assert!(!json.contains("forge_ladder_fallback"), "{json}");
+    assert!(json.contains(r#""fallback":true"#), "{json}");
+    let durable: Vec<PersistedPair> = serde_json::from_str(&json).unwrap();
+
+    let mut after = OutcomeLedger::default();
+    after.restore(durable, now + mins(1));
+    assert_eq!(after.cooling_until(3, StepRole::ChampionMerge, now + mins(1)), None);
+    assert_eq!(after.cooling_until(7, StepRole::Builder, now + mins(1)), Some(now + mins(90)));
+    assert_eq!(
+        after.cooling_cause(4, StepRole::ChampionMerge, now + mins(1)),
+        Some(CooldownCause::ForgeLadderFallback)
+    );
+    assert_eq!(
+        after.cooling_until(4, StepRole::ChampionMerge, now + mins(1)),
+        Some(now + mins(240))
     );
 }
 
@@ -728,4 +849,23 @@ fn the_pr_fast_fail_streak_is_consecutive() {
     let at = now + chrono::Duration::hours(30);
     let rec = l.record(70, StepRole::Judge, &fail, quick, at);
     assert_eq!((rec.cooling_until.unwrap() - at).num_seconds(), 60, "back to the base");
+}
+
+/// #12524: a file written by #12519 (cause `forge_ladder_fallback`, no
+/// `fallback` field) still restores as a fallback window.
+#[test]
+fn the_pre_12524_fallback_cause_still_restores() {
+    let now = t0();
+    let until = now + mins(240);
+    let json = format!(
+        r#"[{{"item":4,"step":"champion_merge","until":"{}","cause":"forge_ladder_fallback"}}]"#,
+        until.to_rfc3339()
+    );
+    let pairs: Vec<PersistedPair> = serde_json::from_str(&json).unwrap();
+    let mut l = OutcomeLedger::default();
+    l.restore(pairs, now + mins(1));
+    assert_eq!(
+        l.cooling_cause(4, StepRole::ChampionMerge, now + mins(1)),
+        Some(CooldownCause::ForgeLadderFallback)
+    );
 }

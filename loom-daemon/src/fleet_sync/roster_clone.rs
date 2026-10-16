@@ -58,11 +58,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{FleetSyncStatus, RosterPass};
 use crate::fleet_store::roster::{self, Change, Plan};
+use crate::telemetry::kinds::roster_change::{RosterAction, RosterChangeRecord};
+use crate::telemetry::provenance::Provenance;
+use crate::telemetry::{RepoVisibility, TelemetryRecord};
 
 pub mod memory;
 pub mod staging;
@@ -366,9 +370,14 @@ pub fn summarize(
     for (i, change) in plan.changes.iter().enumerate() {
         match change {
             Change::MissingClone { .. } if clones.cloner.is_some() => missing.push(i),
-            Change::MissingClone { .. } => out.unapplied += 1,
+            Change::MissingClone { .. } => {
+                out.unapplied += 1;
+                out.changes.push(RosterEvent::of(change));
+            }
             other => {
-                record(&mut out, other, apply);
+                if record(&mut out, other, apply) {
+                    out.changes.push(RosterEvent::of(other));
+                }
             }
         }
     }
@@ -412,15 +421,151 @@ pub fn summarize(
         };
         if attempt.outcome != Outcome::Cloned {
             out.unapplied += 1;
+            out.changes.push(RosterEvent::of(change));
             out.clones.push(attempt);
             continue;
         }
         let add = as_add(change);
         out.drift[i] = format!("{} — cloned this pass", roster::describe(&add));
         attempt.registered = record(&mut out, &add, apply);
+        if attempt.registered {
+            out.changes.push(RosterEvent::of(&add));
+        }
         out.clones.push(attempt);
     }
     out
+}
+
+/// Maps `(root, remote)` to a repo slug and its visibility.
+type RepoResolver = dyn Fn(&Path, Option<&str>) -> (Option<String>, RepoVisibility);
+
+/// One roster-pass change (or `skip:not-cloned`), kept until [`emit_changes`]
+/// turns it into a `roster.change` record (#12322).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterEvent {
+    /// Record name.
+    pub name: String,
+    /// What happened.
+    pub action: RosterAction,
+    /// The workspace root (never exported; resolves the repo slug).
+    pub root: PathBuf,
+    /// The record's `remote`, for a repo that is not cloned.
+    pub remote: Option<String>,
+    /// Weight before the change.
+    pub from_weight: Option<u32>,
+    /// Weight after the change.
+    pub to_weight: Option<u32>,
+    /// Maintain-only after the change.
+    pub maintain_only: Option<bool>,
+}
+
+impl RosterEvent {
+    /// The event for `change`.
+    fn of(change: &Change) -> Self {
+        let event = |name: &String, path: &PathBuf, action| Self {
+            name: name.clone(),
+            action,
+            root: path.clone(),
+            remote: None,
+            from_weight: None,
+            to_weight: None,
+            maintain_only: None,
+        };
+        match change {
+            Change::Add {
+                name,
+                path,
+                weight,
+                maintain_only,
+            } => Self {
+                to_weight: Some(*weight),
+                maintain_only: Some(*maintain_only),
+                ..event(name, path, RosterAction::Register)
+            },
+            Change::MissingClone {
+                name,
+                path,
+                remote,
+                weight,
+                maintain_only,
+            } => Self {
+                remote: remote.clone(),
+                to_weight: Some(*weight),
+                maintain_only: Some(*maintain_only),
+                ..event(name, path, RosterAction::SkipNotCloned)
+            },
+            Change::Remove { name, path, .. } => event(name, path, RosterAction::Remove),
+            Change::SetWeight {
+                name,
+                path,
+                from,
+                to,
+            } => Self {
+                from_weight: Some(*from),
+                to_weight: Some(*to),
+                ..event(name, path, RosterAction::SetWeight)
+            },
+            Change::SetMaintainOnly { name, path, to } => Self {
+                maintain_only: Some(*to),
+                ..event(name, path, RosterAction::SetMaintainOnly)
+            },
+        }
+    }
+
+    /// The `roster.change` record for this event as of `at` on `host`.
+    /// `resolve` maps `(root, remote)` to the repo slug and its visibility;
+    /// anything it cannot establish stays private.
+    #[must_use]
+    pub fn record(
+        &self,
+        host: &str,
+        at: DateTime<Utc>,
+        resolve: &RepoResolver,
+    ) -> RosterChangeRecord {
+        let (repo, visibility) = resolve(&self.root, self.remote.as_deref());
+        RosterChangeRecord {
+            repo,
+            visibility,
+            name: self.name.clone(),
+            action: self.action,
+            from_weight: self.from_weight,
+            to_weight: self.to_weight,
+            maintain_only: self.maintain_only,
+            host: host.to_string(),
+            at,
+            loom: Provenance::current(),
+        }
+    }
+}
+
+/// The repo slug and visibility for a roster event: the record's GitHub
+/// `remote` when it has one, else the checkout's own `origin` (a local `git`
+/// call). Visibility is the memoized probe; any failure is private.
+fn resolve_repo(root: &Path, remote: Option<&str>) -> (Option<String>, RepoVisibility) {
+    let slug = remote
+        .and_then(github_slug)
+        .or_else(|| crate::release_resolve::host::repo_slug(root));
+    match slug {
+        Some(slug) => {
+            let visibility = crate::telemetry::visibility::derive_visibility(&slug);
+            (Some(slug), visibility)
+        }
+        None => (None, RepoVisibility::Private),
+    }
+}
+
+/// Emit one `roster.change` record per [`RosterPass::changes`] entry. A pass
+/// with none emits nothing; the roster pass, not the repo's queue, is the
+/// emitter, so an idle repo still produces rows.
+pub(super) fn emit_changes(status: &FleetSyncStatus) {
+    for event in &status.roster.changes {
+        let record = event.record(&status.host, status.at, &resolve_repo);
+        if record.has_provenance() {
+            crate::observability::ops::emit_record(TelemetryRecord::RosterChange(record));
+        } else {
+            log::warn!("fleet_sync: dropped roster.change record: invalid provenance");
+        }
+    }
 }
 
 /// Apply one change, counting it; `true` when it applied.
