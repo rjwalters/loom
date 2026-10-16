@@ -1172,6 +1172,8 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         exporters: Vec::new(),
         otlp_export: None,
         memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
     };
     assert_eq!(
         host_health.roles.persistent.len(),

@@ -334,8 +334,14 @@ impl SweepRegistry {
         let sweep_id = sweep_id.to_string();
         self.apply_dispatch_stagger();
         let log_path = self.compute_step_log_path(item, role);
+        // #11913: a preference, never eligibility. Any reason not to resume
+        // runs the step fresh, exactly as before.
+        let resume = self.step_session_resume(item, role, &launch);
+        let mut request = request.clone();
+        request.resumed = resume.is_some();
+        let request = &request;
         let spawn = |reg: &Self| {
-            reg.spawn_child_process(
+            reg.spawn_child_process_for(
                 &kind,
                 &log_path,
                 &sweep_id,
@@ -344,6 +350,7 @@ impl SweepRegistry {
                 None,
                 launch.admission.admitted.as_ref(),
                 launch.selection.as_ref(),
+                resume.as_ref(),
             )
         };
         let spawned = if host_gate {
@@ -367,6 +374,52 @@ impl SweepRegistry {
             Err(e) => {
                 self.unwind_step_claim(item, role, &sweep_id, true);
                 Err(StepRefusal::new("spawn_failed", format!("{e:#}")))
+            }
+        }
+    }
+
+    /// The session this step resumes, when the session ledger (#11913) says
+    /// so; `None` runs it fresh. A fresh step on an item that had a session
+    /// logs the written handoff the ledger composed.
+    fn step_session_resume(
+        &self,
+        item: u32,
+        role: StepRole,
+        launch: &StepLaunch,
+    ) -> Option<super::resume_handle::RollResumeLaunch> {
+        use crate::step_dispatch::session_ledger::{self as ledger, Decision};
+        let root = &self.config.workspace_root;
+        // Only Claude sessions are pinned and ledgered.
+        let admitted = launch
+            .admission
+            .admitted
+            .as_ref()
+            .map(|a| a.runtime.as_str());
+        if admitted.is_some_and(|r| r != "claude") {
+            return None;
+        }
+        match ledger::decide_for(root, item, role) {
+            Decision::Resume(record) => Some(super::resume_handle::RollResumeLaunch {
+                runtime: record.runtime.clone(),
+                session_id: record.session_id.clone(),
+                prompt: ledger::resume_prompt(&record, role),
+                resume_of: format!("step-ledger:{item}:{}", record.role),
+                resume_count: 1,
+                agent_started_at: None,
+                session_store: record.session_store.clone(),
+                account: record.account.clone(),
+                container: None,
+                sandbox: None,
+                lease_sweep_id: None,
+            }),
+            Decision::Fresh { reason, handoff } => {
+                if let Some(handoff) = handoff {
+                    log::info!(
+                        "sweep_registry: {role} step on #{item} runs fresh ({}): {handoff}",
+                        reason.as_str()
+                    );
+                }
+                None
             }
         }
     }

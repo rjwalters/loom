@@ -217,16 +217,8 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` Deny branch) |
-| Captain gauges: `loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback` ([`metric.points`](#metricpoints)) | metric | `observability/captain_gauges.rs` |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
-
-The captain gauges are emitted by non-ETA code. Since Stage 2 of #11098,
-`fleet.captainGauges.ref` has its own default (`eta-fit`, the branch the
-heartbeat already used; a legacy `fleet.etaFitRef` is still read as the
-fallback), and `captain_gauges/store.rs` uses the neutral
-`fleet_store/publication.rs` helpers instead of `crate::eta::fit`. What is
-emitted did not change.
 
 **Retired ETA-only records (Stage 3 of #11098).** Loom no longer computes or
 exports ETA. These kinds and metrics were removed with the ETA subsystem, with
@@ -1941,18 +1933,6 @@ a label.
 | `loom.codex_session.record` | `1` | `account`, `kind` ∈ `hold`, `drift_removal`, `container` | per session-managed Codex account, `1` while that on-disk record stands, else `0` (#10600): `hold` is an operator `accounts session stop` (`.session-hold.json`); `drift_removal` is the reconciler's fail-closed removal for a denied mount (`.session-drift-removed.json`), which keeps the seat down. Emitted with `loom.codex_session.state`, and omitted the same way |
 | `loom.codex_session.mount_drift` | `{path}` | `account`, `kind` ∈ `missing`, `extra`, `denied`, `container` | per session-managed Codex account whose container has a drift verdict (#10600): how many workspace paths drift that way. `missing`: registered roots it does not mount; `extra`: mounts no longer registered; `denied`: mounts `session start` refuses today (not counted in `extra`). Omitted for a missing, private-clone or unlabelled container, and while the registry cannot be read |
 
-Fleet gauges produced by the captain (W12, `observability/captain_gauges.rs`).
-Gauges on the collector pass, emitted only on a host that is the armed captain
-or a dispatcher with `fleet.captainGauges.standDown`. `task` is the singleton job
-name (`queue-blocked` where that switch is on), the same label key the task-liveness gauges use; never a repo or
-issue. Configuration is in
-[`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12).
-
-| Metric | Unit | Labels | Meaning |
-|---|---|---|---|
-| `loom.captain.gauge_age_seconds` | `s` | `task` | on the captain, the age of its own last finished pass of the job; on a dispatcher, the age of the captain's published `as_of` as last read. Omitted while unknown. Past `fleet.captainGauges.maxAgeSecs` the captain has stopped producing |
-| `loom.captain.gauge_fallback` | `1` | `task` | dispatchers only: `1` while the captain's data for the job is stale or absent and this host produces it locally, `0` while it stands down |
-
 The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
 `loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
 measure how long ready-queue issues have waited; for depth, use
@@ -2054,20 +2034,25 @@ with concurrent spawns they can add up to more than `phase.spawn_ms`):
 | `loom.dispatch.spawn_hold` | Why the draw stopped spawning before its slots were filled: `rate_limit_breaker` when the shared GitHub rate-limit breaker tripped mid-tick (checked before each round's batch). Absent when it never stopped |
 | `loom.dispatch.phase.spawn_account_ms` | The account-selection poll (up to 5 s per spawn) and recording the step |
 
-Since #12306 the tick also records what its discovery snapshot cost and
-covered (the worklist rows are absent in Direct mode, never a 0):
+Since #12306 and #12311 the tick also records what its discovery snapshot
+cost, covered and which tier answered (the worklist rows are absent when the
+chain has no worklist tier, never a 0):
 
 | Attribute | Meaning |
 |---|---|
-| `loom.discovery.backend` | `mirror` (one worklist read) or `direct` (per-repo listings), from `autonomous.workFinder.discovery` |
-| `loom.discovery.repos` | Repos in the snapshot (Mirror: every repo the key may read; Direct: repos listed this tick) (count) |
+| `loom.discovery.backend` | `mirror` (one worklist read) or `direct` (per-repo listings), from `forge.mirror.discovery` |
+| `loom.discovery.tier` | The tier that answered. When repos differ, the most degraded one: `mirror` < `gateway` < `gh` < `none`. `none`: every configured tier failed for some repo, which is not drawn from this tick |
+| `loom.discovery.fallback_reason` | Why a repo left the first tier: `transport`, `auth`, `status` or `malformed` (the worklist request), `repo_status` (the worklist's `status` for the repo was not `ok`, or it omitted the repo), `reserve` (the gateway refused a discovery listing below its quota reserve; ends the tick's discovery, does not trip the breaker), `breaker` (the rate-limit breaker is open) or `listing` (the fallback listing failed). A `reserve` or `breaker` wins over the first reason. Absent when every repo came from the first tier |
+| `loom.discovery.fallback_repos` | The repos listed through a fallback tier this tick, comma-joined (a repo drawn from its last listing, inside the backstop pace, is not named) |
+| `loom.discovery.worklist.outcome` | `ok`, `not_modified` (`304`) or `error` |
+| `loom.discovery.worklist.error_class` | `transport`, `auth`, `status` or `malformed`, when the outcome is `error` |
+| `loom.discovery.worklist.latency_ms` | The `GET /v1/mirror/worklist` round trip (milliseconds) |
+| `loom.discovery.repos.requested` | Repos the gather read this tick (count) |
+| `loom.discovery.repos.{ok,unknown,backfilling,error}` | Of those, by the worklist's `status` for the repo (a repo the worklist omits counts as `unknown`; a failed request counts every repo as `error`) |
 | `loom.discovery.items` | Open issues and PRs in the snapshot (count) |
-| `loom.discovery.forge_reads` | Per-repo forge listing calls made for discovery. `0` in Mirror mode. Per-item gate reads (hold markers, CI at a Judge head) are not listings and are not counted (count) |
-| `loom.discovery.worklist_latency_ms` | The `GET /v1/mirror/worklist` round trip (Mirror only; milliseconds) |
-| `loom.discovery.not_modified` | The worklist answered `304` and the previous snapshot was reused (Mirror only) |
-| `loom.discovery.reused_previous` | The worklist request failed and the previous snapshot stood in; no forge fallback (Mirror only) |
-| `loom.discovery.stale_repos` | Repos whose newest watermark evidence is older than `forge.mirror.maxStalenessSecs`. They are served anyway (Mirror only; count) |
-| `loom.discovery.oldest_watermark_age_secs` | Age of the stalest repo's newest watermark evidence (Mirror only; seconds) |
+| `loom.discovery.forge_reads` | Per-repo forge listing calls made for discovery. `0` while every repo is served by the mirror tier. Per-item gate reads (hold markers, CI at a Judge head) are not listings and are not counted (count) |
+| `loom.discovery.stale_repos` | Repos whose newest watermark evidence is older than `forge.mirror.maxStalenessSecs`. They are served anyway (worklist only; count) |
+| `loom.discovery.oldest_watermark_age_secs` | Age of the stalest repo's newest watermark evidence (worklist only; seconds) |
 
 The `invoke github` spans the tick's own thread and its gather workers open
 are children of the `loom.dispatch.tick` span (`context_source=parent`).

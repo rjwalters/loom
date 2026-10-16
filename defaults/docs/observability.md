@@ -702,12 +702,8 @@ in `loom.dispatch.role_max_concurrent` and `loom.dispatch.role_idle_slots`.
 Forge label-stage dwell is not exported by the daemon (the sampler and
 `loom.forge.stage_dwell` / `loom.forge.stage_items` were deleted in #12316):
 dwell is a consumer's computation over the mirror's per-item label times.
-With `fleet.captainGauges` configured, the fleet captain reads shared forge
-facts for the fleet and dispatchers stand down while its published data is fresh
-(`loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`; see
-[`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12)).
-The same heartbeat can carry a forge fact (`queueBlocked`), so the snapshot's
-`loom:blocked` listing is made by the captain alone.
+The fleet-captain gauge producer (`fleet.captainGauges`, `loom.captain.*`) was
+removed in #11406: every host reads the snapshot's `loom:blocked` listing itself.
 Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 **Merge-chain re-date pressure (#10163).** Three gauges track the #8508
