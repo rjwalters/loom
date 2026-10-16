@@ -18,7 +18,7 @@ The base image's own `FROM` contract (Ubuntu 24.04, `loom-daemon`, Claude Code
 CLI, `git`/`gh`/`jq`/`tmux`/build-essential, non-root `loom` user uid/gid
 `1000`, `/workspace`) is unchanged — see
 [`docker/worker/README.md`](../worker/README.md) for that contract in full.
-This layer adds exactly three things:
+This layer adds exactly these things:
 
 | Addition | Detail |
 |---|---|
@@ -26,6 +26,7 @@ This layer adds exactly three things:
 | Node.js + npm | Codex CLI's only distribution channel is npm, so a Node runtime is a genuine transitive dependency — installed from the official upstream tarball (checksum-verified), not `apt-get install nodejs npm`, which pulls Ubuntu's entire Debian-packaged build-from-source dependency chain for a footprint this image never uses. |
 | tmux-server entrypoint | `tini` (PID 1) → a thin entrypoint script that starts (or resumes) a detached tmux session named `session`, then blocks forever. This is what makes the container *persistent* — see "Entrypoint behavior" below. |
 | `CODEX_HOME` convention | `ENV CODEX_HOME=/home/loom/.codex-profile` — an empty, read-write directory owned by uid `1000` at build time. A per-account Codex profile volume binds over this path at container-start time (Phase 2's session lifecycle); it is never baked with content. |
+| `uv` + `UV_PROJECT_ENVIRONMENT` | Pinned static `uv` binary (multi-arch, from `ghcr.io/astral-sh/uv`) so Judge/Auditor sessions can `uv run pytest` a Python repo; `python3` and `git` already come from loom-worker. `UV_PROJECT_ENVIRONMENT=/tmp/loom-uv-venv` (and `UV_CACHE_DIR=/tmp/loom-uv-cache`) keep uv's venv out of the mounted checkout, whose `.venv` may be a macOS one. `/tmp` is chosen because private-workspace containers run `--read-only --user 1000:1000` with only `/tmp` and the workspace volume writable. The env dir is shared by all projects in the container, so uv recreates it when switching repos. |
 
 **Zero secrets in this image**, same guarantee as the base image — verified
 by [`test-image.sh`](test-image.sh)'s `docker history` scan (extended with

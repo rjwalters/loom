@@ -418,9 +418,11 @@ pub mod tap_usage;
 pub mod target_dir_gc;
 /// Orphan sweep for Loom-owned and agent-improvised cargo target dirs (#8370).
 pub mod target_orphan_reclaim;
+/// SIGUSR1-triggered dump of the async task tree to the daemon log, for
+/// diagnosing a hung tick (Issue #12079).
+pub mod task_dump;
 /// Per-task liveness heartbeats for the daemon's long-running loops (Issue
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
-pub mod task_dump;
 pub mod task_liveness;
 pub mod telemetry;
 pub mod telemetry_join;

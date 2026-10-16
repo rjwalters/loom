@@ -56,7 +56,7 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue:
             command.env(TRACEPARENT_ENV, saved.context.traceparent());
             command.env(W3C_TRACEPARENT_ENV, saved.context.traceparent());
             command.env(CONTEXT_FILE_ENV, store.path(root, execution));
-            super::lifecycle::prepare_execution(command, root, execution, story.as_ref());
+            super::lifecycle::prepare_execution(command, root, execution, story.as_ref(), issue);
         }
         Err(error) => {
             log::warn!("observability: trace context unavailable; child is untraced: {error}")

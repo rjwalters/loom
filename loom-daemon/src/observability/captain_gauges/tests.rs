@@ -10,10 +10,15 @@ use serde_json::{json, Value};
 use super::store::{self, FetchCache, Fetched, Heartbeat, JobFacts, PublishCache};
 use super::{
     content_key, coverage, fresh_job, publish_due, resolve_role, unknown_keys, Config, Role,
-    DEFAULT_MAX_AGE_SECS, DEFAULT_PUBLISH_INTERVAL_SECS, QUEUE_BLOCKED_JOB, STAGE_DWELL_JOB,
-    STAND_DOWN_ENV,
+    DEFAULT_MAX_AGE_SECS, DEFAULT_PUBLISH_INTERVAL_SECS, QUEUE_BLOCKED_JOB, STAND_DOWN_ENV,
 };
 use crate::fleet_captain::CaptainGate;
+
+/// The one job this module arms.
+const JOB: &str = QUEUE_BLOCKED_JOB;
+/// A job an older captain still publishes in its heartbeat (the stage-dwell
+/// sampler's, removed in #12316): it parses and is never consulted.
+const RETIRED_JOB: &str = "stage-dwell";
 use crate::fleet_store::fetch::{Reply, Transport};
 use crate::fleet_store::propose::WriteTransport;
 use crate::fleet_store::StoreLocation;
@@ -34,16 +39,13 @@ fn defaults() -> Config {
     Config::from_effective(&json!({}), &no_env)
 }
 
-/// A `fleet.captainGauges` block, with the stage-dwell sampler switched on
-/// (#12203) so `stage-dwell` is among the jobs.
-fn config(block: Value) -> Config {
-    Config::from_effective(
-        &json!({
-            "fleet": { "captainGauges": block },
-            "observability": { "stageDwell": { "enabled": true } },
-        }),
-        &no_env,
-    )
+/// A `fleet.captainGauges` block, with `queueBlocked` switched on unless the
+/// block says otherwise, so `queue-blocked` is among the jobs.
+fn config(mut block: Value) -> Config {
+    if let Some(block) = block.as_object_mut() {
+        block.entry("queueBlocked").or_insert(json!(true));
+    }
+    Config::from_effective(&json!({ "fleet": { "captainGauges": block } }), &no_env)
 }
 
 fn facts(as_of: DateTime<Utc>, repos: &[&str]) -> JobFacts {
@@ -58,11 +60,11 @@ fn points(
     covered: &super::Coverage,
     now: DateTime<Utc>,
 ) -> Vec<MetricPoint> {
-    super::points(&[STAGE_DWELL_JOB], role, produced, heartbeat, covered, now)
+    super::points(&[JOB], role, produced, heartbeat, covered, now)
 }
 
 fn heartbeat(captain: &str, as_of: DateTime<Utc>, repos: &[&str]) -> Heartbeat {
-    Heartbeat::new(captain, as_of, [(STAGE_DWELL_JOB.to_string(), facts(as_of, repos))].into())
+    Heartbeat::new(captain, as_of, [(JOB.to_string(), facts(as_of, repos))].into())
 }
 
 // ---- config + role ---------------------------------------------------------
@@ -158,24 +160,16 @@ fn a_dispatcher_stands_down_only_on_fresh_data_from_the_declared_captain() {
     let max_age = Duration::seconds(DEFAULT_MAX_AGE_SECS);
     let hb = heartbeat(CAPTAIN, at(0), &["acme/app"]);
     // Fresh, up to and including the bound.
-    assert!(hb.fresh(STAGE_DWELL_JOB, CAPTAIN, at(0), max_age).is_some());
-    assert!(hb
-        .fresh(STAGE_DWELL_JOB, CAPTAIN, at(30), max_age)
-        .is_some());
+    assert!(hb.fresh(JOB, CAPTAIN, at(0), max_age).is_some());
+    assert!(hb.fresh(JOB, CAPTAIN, at(30), max_age).is_some());
     // Stale one second later: the captain is down, the dispatcher takes over.
     let stale = at(30) + Duration::seconds(1);
-    assert!(hb.fresh(STAGE_DWELL_JOB, CAPTAIN, stale, max_age).is_none());
+    assert!(hb.fresh(JOB, CAPTAIN, stale, max_age).is_none());
     // Published by a former captain: never trusted.
-    assert!(hb
-        .fresh(STAGE_DWELL_JOB, "other-host", at(1), max_age)
-        .is_none());
+    assert!(hb.fresh(JOB, "other-host", at(1), max_age).is_none());
     // An as_of from the future beyond the skew is refused.
-    assert!(hb
-        .fresh(STAGE_DWELL_JOB, CAPTAIN, at(-6), max_age)
-        .is_none());
-    assert!(hb
-        .fresh(STAGE_DWELL_JOB, CAPTAIN, at(-4), max_age)
-        .is_some());
+    assert!(hb.fresh(JOB, CAPTAIN, at(-6), max_age).is_none());
+    assert!(hb.fresh(JOB, CAPTAIN, at(-4), max_age).is_some());
     // A job the captain does not produce is never covered.
     assert!(hb.fresh("other-job", CAPTAIN, at(1), max_age).is_none());
 }
@@ -185,7 +179,7 @@ fn coverage_is_per_job_and_per_repo() {
     let hb = heartbeat(CAPTAIN, at(0), &["acme/app", "acme/lib"]);
     let covered = coverage(Some(&hb), CAPTAIN, at(10), &defaults());
     let repos: BTreeSet<String> = ["acme/app".to_string(), "acme/lib".to_string()].into();
-    assert_eq!(covered.get(STAGE_DWELL_JOB), Some(&repos));
+    assert_eq!(covered.get(JOB), Some(&repos));
     assert!(coverage(Some(&hb), CAPTAIN, at(31), &defaults()).is_empty());
     assert!(coverage(None, CAPTAIN, at(1), &defaults()).is_empty());
 }
@@ -193,7 +187,7 @@ fn coverage_is_per_job_and_per_repo() {
 // ---- gauges ----------------------------------------------------------------
 
 fn point(name: MetricName, value: i64) -> MetricPoint {
-    MetricPoint::int(name, value).label("task", STAGE_DWELL_JOB)
+    MetricPoint::int(name, value).label("task", JOB)
 }
 
 #[test]
@@ -231,7 +225,7 @@ fn the_captain_reports_its_own_age_and_a_local_host_reports_nothing() {
     let captain = Role::Captain {
         captain: CAPTAIN.into(),
     };
-    let produced = [(STAGE_DWELL_JOB.to_string(), facts(at(0), &["acme/app"]))].into();
+    let produced = [(JOB.to_string(), facts(at(0), &["acme/app"]))].into();
     let out = points(&captain, &produced, None, &BTreeMap::new(), at(5));
     assert_eq!(out, vec![point(MetricName::CaptainGaugeAgeSeconds, 300)]);
     assert!(points(&captain, &BTreeMap::new(), None, &BTreeMap::new(), at(5)).is_empty());
@@ -444,26 +438,16 @@ fn dispatcher() -> Role {
 }
 
 #[test]
-fn stage_dwell_is_not_a_job_while_its_sampler_is_off() {
-    // #12203: the default, so the captain arms nothing and no dispatcher
-    // reports a `stage-dwell` fallback.
+fn the_job_is_off_until_its_own_switch() {
     let off = Config::from_effective(
         &json!({ "fleet": { "captainGauges": { "enabled": true, "standDown": true } } }),
         &no_env,
     );
-    assert!(!off.stage_dwell);
+    assert!(!off.queue_blocked);
     assert!(off.jobs().is_empty());
     assert!(defaults().jobs().is_empty());
-}
-
-#[test]
-fn the_part_two_job_is_off_until_its_own_switch() {
-    // A part 1 fleet (`enabled` / `standDown` only) runs one job.
-    let part_one = config(json!({"enabled": true, "standDown": true}));
-    assert!(!part_one.queue_blocked);
-    assert_eq!(part_one.jobs(), [STAGE_DWELL_JOB]);
-    let both = config(json!({"standDown": true, "queueBlocked": true}));
-    assert_eq!(both.jobs(), [STAGE_DWELL_JOB, QUEUE_BLOCKED_JOB]);
+    let on = config(json!({"standDown": true}));
+    assert_eq!(on.jobs(), [QUEUE_BLOCKED_JOB]);
 }
 
 /// AC (#11579): a host config still carrying the retired starred-issue job's
@@ -510,7 +494,7 @@ fn the_retired_key_warning_is_given_once() {
 #[test]
 fn a_job_is_relied_on_only_by_a_dispatcher_with_its_switch_and_fresh_data() {
     let on = config(json!({"standDown": true, "queueBlocked": true}));
-    let off = config(json!({"standDown": true}));
+    let off = config(json!({"standDown": true, "queueBlocked": false}));
     let hb = Heartbeat::new(
         CAPTAIN,
         at(0),
@@ -542,7 +526,12 @@ fn a_job_is_relied_on_only_by_a_dispatcher_with_its_switch_and_fresh_data() {
     };
     assert!(!ask(Some(&other), Some(&on), Some(&hb), at(10)));
     // A job the heartbeat does not carry (an older captain).
-    assert!(fresh_job(Some(&role), Some(&on), Some(&hb), STAGE_DWELL_JOB, at(10)).is_none());
+    let older = Heartbeat::new(
+        CAPTAIN,
+        at(0),
+        [(RETIRED_JOB.to_string(), facts(at(0), &["acme/app"]))].into(),
+    );
+    assert!(fresh_job(Some(&role), Some(&on), Some(&older), JOB, at(10)).is_none());
 }
 
 #[test]
@@ -581,7 +570,7 @@ fn the_fact_fields_round_trip_and_stay_out_of_a_part_one_heartbeat() {
     store::publish(&s, &s, &loc("eta-fit"), "main", &part_one, &mut PublishCache::default())
         .unwrap();
     let body = s.file.borrow().as_ref().unwrap().0.clone();
-    assert!(!body.contains("blocked"), "blocked is omitted when empty: {body}");
+    assert!(!body.contains("\"blocked\""), "blocked is omitted when empty: {body}");
 
     let mut blocked = facts(at(1), &["acme/app"]);
     blocked.blocked.insert(
@@ -627,15 +616,15 @@ fn a_reader_that_predates_the_fact_fields_still_reads_the_heartbeat() {
         CAPTAIN,
         at(1),
         [
-            (STAGE_DWELL_JOB.to_string(), facts(at(1), &["acme/app"])),
+            (RETIRED_JOB.to_string(), facts(at(1), &["acme/app"])),
             (QUEUE_BLOCKED_JOB.to_string(), blocked),
         ]
         .into(),
     );
     let old: OldHeartbeat = serde_json::from_str(&serde_json::to_string(&hb).unwrap()).unwrap();
     assert_eq!(old.schema, store::SCHEMA);
-    assert_eq!(old.jobs[STAGE_DWELL_JOB].as_of, at(1));
-    assert!(old.jobs[STAGE_DWELL_JOB].repos.contains("acme/app"));
+    assert_eq!(old.jobs[RETIRED_JOB].as_of, at(1));
+    assert!(old.jobs[RETIRED_JOB].repos.contains("acme/app"));
     // And this reader takes a part 1 heartbeat (no fact fields at all).
     let part_one = format!(
         r#"{{"schema":"{}","captain_host":"{CAPTAIN}","published_at":"2026-10-06T12:00:00Z",
@@ -643,7 +632,7 @@ fn a_reader_that_predates_the_fact_fields_still_reads_the_heartbeat() {
         store::SCHEMA
     );
     let parsed = store::parse(part_one.as_bytes()).unwrap();
-    assert!(parsed.jobs[STAGE_DWELL_JOB].blocked.is_empty());
+    assert!(parsed.jobs[RETIRED_JOB].blocked.is_empty());
     assert!(!parsed.jobs.contains_key(QUEUE_BLOCKED_JOB), "so every dispatcher stays local");
 }
 
@@ -662,30 +651,33 @@ fn a_heartbeat_from_a_captain_that_still_publishes_the_retired_job_parses() {
         store::SCHEMA
     );
     let parsed = store::parse(older.as_bytes()).unwrap();
-    assert!(parsed.jobs.contains_key(STAGE_DWELL_JOB));
+    assert!(parsed.jobs.contains_key(RETIRED_JOB));
     let covered = coverage(Some(&parsed), CAPTAIN, at(10), &defaults());
-    assert_eq!(covered.keys().collect::<Vec<_>>(), [STAGE_DWELL_JOB]);
+    assert!(covered.is_empty(), "the retired job is never consulted: {covered:?}");
 }
 
 #[test]
-fn a_dispatcher_reports_fallback_per_job_it_takes_part_in() {
+fn a_dispatcher_reports_fallback_when_the_captain_publishes_no_such_job() {
     let hb = Heartbeat::new(
         CAPTAIN,
         at(0),
-        [(STAGE_DWELL_JOB.to_string(), facts(at(0), &["acme/app"]))].into(),
+        [(RETIRED_JOB.to_string(), facts(at(0), &["acme/app"]))].into(),
     );
     let covered = coverage(Some(&hb), CAPTAIN, at(10), &defaults());
-    let jobs = [STAGE_DWELL_JOB, QUEUE_BLOCKED_JOB];
-    let out = super::points(&jobs, &dispatcher(), &BTreeMap::new(), Some(&hb), &covered, at(10));
+    let out = super::points(
+        &[QUEUE_BLOCKED_JOB],
+        &dispatcher(),
+        &BTreeMap::new(),
+        Some(&hb),
+        &covered,
+        at(10),
+    );
     let blocked_fallback =
         MetricPoint::int(MetricName::CaptainGaugeFallback, 1).label("task", QUEUE_BLOCKED_JOB);
     assert!(
         out.contains(&blocked_fallback),
         "an older captain publishes no queue-blocked: {out:?}"
     );
-    assert!(out.contains(&point(MetricName::CaptainGaugeFallback, 0)));
-    assert!(!out.iter().any(|p| *p
-        == MetricPoint::int(MetricName::CaptainGaugeFallback, 1).label("task", STAGE_DWELL_JOB)));
 }
 
 // ---- #12219: a dispatcher with no job on reads no heartbeat ----------------
@@ -707,7 +699,6 @@ fn dispatcher_exchange_calls(config: Config) -> String {
         role: dispatcher(),
         config,
         location: Some((loc("eta-fit"), "fleet".into())),
-        stage_dwell: Default::default(),
     };
     super::exchange(dir.path(), &pass, at(0));
     std::fs::read_to_string(&log).unwrap_or_default()
@@ -715,11 +706,7 @@ fn dispatcher_exchange_calls(config: Config) -> String {
 
 #[test]
 fn a_dispatcher_with_no_job_on_makes_no_store_read() {
-    let none = config(json!({"standDown": true}));
-    let none = Config {
-        stage_dwell: false,
-        ..none
-    };
+    let none = config(json!({"standDown": true, "queueBlocked": false}));
     assert!(none.jobs().is_empty());
     assert_eq!(dispatcher_exchange_calls(none), "");
 }
@@ -727,6 +714,6 @@ fn a_dispatcher_with_no_job_on_makes_no_store_read() {
 #[test]
 fn a_dispatcher_with_a_job_on_still_reads_the_heartbeat() {
     let one = config(json!({"standDown": true}));
-    assert_eq!(one.jobs(), [STAGE_DWELL_JOB]);
+    assert_eq!(one.jobs(), [QUEUE_BLOCKED_JOB]);
     assert!(!dispatcher_exchange_calls(one).is_empty());
 }
