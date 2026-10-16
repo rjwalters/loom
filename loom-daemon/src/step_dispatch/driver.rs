@@ -326,11 +326,13 @@ fn list_one(
     super::gather::list(root, registry, red, held_capabilities)
 }
 
-fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
-    registry.lock().map_or(0, |mut reg| {
-        reg.reap_liveness();
-        reg.occupied_issues().len()
-    })
+pub(crate) fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
+    // A poisoned lock still holds the real claims; recover rather than report 0.
+    let mut reg = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reg.reap_liveness();
+    reg.occupied_issues().len()
 }
 
 impl StepDriver {
@@ -469,10 +471,12 @@ impl StepDriver {
                 gathered.stale_listing || !gathered.pulls_complete,
                 escalated,
             );
-            let (mut cooldowns, pool_exhausted_roles, claims) = registry.lock().map_or_else(
-                |_| (Default::default(), BTreeSet::new(), Default::default()),
-                |reg| (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims()),
-            );
+            let (mut cooldowns, pool_exhausted_roles, claims) = {
+                let reg = registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims())
+            };
             for (item, role, until) in &gathered.ladder {
                 cooldowns.insert(*item, *role, *until);
             }
