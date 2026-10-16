@@ -208,3 +208,33 @@ fn loom_repo_does_not_redirect_the_captains_listing() {
     assert!(args.contains("repos/acme/app/issues"), "{args}");
     assert!(!args.contains("stray/other"), "{args}");
 }
+
+/// #12307: in mirror mode the blocked rows come from the tick's snapshot; the
+/// listing is not made, and a repo the snapshot has not read adds no rows.
+#[test]
+#[serial_test::serial]
+fn mirror_mode_derives_the_rows_from_the_snapshot() {
+    use super::{snapshot_rows, Rows};
+    use crate::discovery::published::test_support::{repo, set, MirrorRoot};
+
+    let fixture = MirrorRoot::new("acme/widgets");
+    let mut snapshot = repo("acme/widgets");
+    snapshot.rows = vec![item(5, &["loom:blocked"]), item(6, &["loom:issue"])];
+    set(vec![snapshot]);
+    let Rows::Snapshot(listing) = snapshot_rows(fixture.path()) else {
+        panic!("a mirror chain reads the snapshot");
+    };
+    let repo_ref = QueueRepoRef {
+        repo: "acme/widgets".into(),
+        visibility: RepoVisibility::Private,
+    };
+    let rows = blocked_rows(&repo_ref, &listing);
+    assert_eq!(rows.iter().map(|r| r.issue).collect::<Vec<_>>(), [5]);
+
+    set(Vec::new());
+    assert!(matches!(snapshot_rows(fixture.path()), Rows::Skip));
+    assert_eq!(fixture.gh_calls(), "");
+
+    let standalone = tempfile::tempdir().unwrap();
+    assert!(matches!(snapshot_rows(standalone.path()), Rows::List));
+}

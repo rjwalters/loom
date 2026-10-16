@@ -42,8 +42,8 @@
 //! and no Loom-side step can sit inside that interval. The test
 //! `known_gap_revocation_after_check_pass_can_still_merge` pins the gap so it
 //! cannot be forgotten. Because of it, [`INVARIANT_FULLY_DEMONSTRATED`] is
-//! `false` and queue execution stays dormant
-//! ([`super::QUEUE_EXECUTION_ENABLED`] is unchanged).
+//! `false`; the operator accepted the gap for the Phase C pilot (#10257), which
+//! enabled queue execution ([`super::QUEUE_EXECUTION_ENABLED`]).
 //!
 //! [`merge_group_check`] covers one PR; a merge group can carry several.
 //! [`super::group_authz`] evaluates every member, concludes only after the

@@ -86,7 +86,7 @@ The design builds on these and must not duplicate them.
 | Open-PR release hold | #11876, `4809ef7ed` | **On by default.** On a verified open linked PR a release writes no label, so the issue keeps `loom:building` while its PR is open (`ClaimRelease::HeldByOpenPr`, `sweep_registry/restore_to_ready.rs`). `LOOM_RELEASE_OPEN_PR_VETO=0` switches it off. |
 | Discovery mirror seam | #11845 | `forge_mirror/discovery.rs:36-42, :215-247`: single-label listings for `WorkFinder` and `StageDwell`, with REST fallback |
 | Shared ETag all-open walk | `forge_listing::list_open_issues_cached_all_as` (`:248`) | Used by `observability/ops/stage_queue.rs:115` and the intake singleton |
-| Merge-queue handoff | #9978 A/B, `forge_merge_queue/` | `QUEUE_EXECUTION_ENABLED = false` (`forge_merge_queue/mod.rs:69`). Champion calls `forge merge-queue step` before every merge (#10256 B3) |
+| Merge-queue handoff | #9978 A/B, `forge_merge_queue/` | `QUEUE_EXECUTION_ENABLED = true` (`forge_merge_queue/mod.rs`), opt-in per repo via `champion.mergeMode=queue`. Champion calls `forge merge-queue step` before every merge (#10256 B3) |
 
 ## 4. The model
 

@@ -366,7 +366,8 @@ here would reproduce the #6516 blind spot.
 |---|---|
 | `STRONG_CLOSED == 0` and `WEAK_CLOSED == 0` — no children found by any source | **Not a completion candidate.** An epic that was never decomposed is exactly what the structural criteria are for → continue to Step 1 |
 | `STRONG_OPEN > 0` — containment children still open | Not complete → continue to **Step 0.5**, which stands the epic down if those children were created by someone other than Step 3 (#7666); an epic Champion decomposed itself falls through Step 0.5 to Step 1, and "Phase Progression" handles its next phase |
-| `STRONG_OPEN == 0` and `STRONG_CLOSED > 0` | **Completion candidate** → 0b |
+| `EPIC_CHILD_DISCOVERY_COMPLETE=no` — a source read failed or a list was truncated (#10935) | **Never a completion candidate**, whatever the counts say (they are a lower bound: the open child that was missed is exactly the sky130-sar-adc#23 / #103 failure). End the pass for this epic with no close, no comment and no label; the next pass re-runs discovery. Do not file a verification child for a transient read failure |
+| `STRONG_OPEN == 0` and `STRONG_CLOSED > 0` (discovery complete) | **Completion candidate** → 0b |
 | No strong children at all, but `WEAK_OPEN == 0` and `WEAK_CLOSED > 0` | **Low-confidence candidate**: prose references only, containment never established → 0c's operator ask, **never** an autonomous close |
 
 #### 0b. Verify the deliverables the epic itself names
@@ -398,15 +399,44 @@ than close when you cannot.
 
 #### 0c. Close, or ask the operator to
 
-Close autonomously only when **all four** hold:
+When it cannot close, route the residue to an agent first and to the operator only for a real judgement call (#10935).
+
+Close autonomously only when **all four** hold (and `EPIC_CHILD_DISCOVERY_COMPLETE=yes`, 0a):
 
 1. `STRONG_OPEN == 0` and `STRONG_CLOSED > 0` (0a's completion candidate — containment, not prose).
 2. `$MISSING` is empty (0b).
 3. The epic carries none of `loom:blocked`, `loom:operator`, `loom:frozen`.
 4. No comment on the epic raises outstanding **content** work dated after the last child closed. Champion's own structural verdicts (`<!-- champion:epic-verdict:body-* -->` / "Epic Needs Revision") explicitly do **not** count — those are the format gate this step supersedes, and treating them as objections would restore the deadlock through the back door.
 
+**A closed verification child settles the residue it was filed for (#10935).** The
+child filed below carries `$VERIFY_MARKER` and is itself a strong child, so once
+it closes the next pass reaches 0c with `STRONG_OPEN == 0` and the same residue.
+Read its outcome first (`VERIFY_STATE`, below): `completed` means the check
+passed, so criteria 2 and 4 are **waived for that residue only** (criteria 1 and 3
+and `EPIC_CHILD_DISCOVERY_COMPLETE=yes` still apply) and the epic closes;
+`not-planned` means it was abandoned, not passed, so it routes to the ranked
+decision as `judgement`. Without this rule the verification child would dedupe on
+`EXISTING` forever and the epic would stall with no close, no ask and no hold.
+
 ```bash
-CLOSE_DIRECTLY=yes   # only when all four hold; any doubt at all makes it "no"
+VERIFY_MARKER="<!-- champion:epic-verification-child:$EPIC_NUMBER -->"
+# none | open | completed | not-planned — the newest marker-carrying child decides.
+VERIFY_STATE=$(gh issue list --state=all --limit=50 --search "\"champion:epic-verification-child:$EPIC_NUMBER\" in:body" \
+  --json number,state,stateReason,body,createdAt \
+  | jq -r --arg m "$VERIFY_MARKER" '[.[] | select(.body | contains($m))] | sort_by(.createdAt) | last
+      | if . == null then "none" elif .state == "OPEN" then "open"
+        elif .stateReason == "NOT_PLANNED" then "not-planned" else "completed" end') || VERIFY_STATE=open  # unreadable = do nothing new
+
+# Residue kind (0c's routing). Computed here, before the branch reads it:
+#   machine-checkable — 0b's non-empty $MISSING, or a verification the epic body
+#     itself states ("verify that …", "confirm …"; set it by hand and name the
+#     check in $UNCERTAINTY).
+#   judgement — everything else (criterion 4's comment, prose-only containment).
+RESIDUE_KIND=judgement
+[ -n "$MISSING" ] && RESIDUE_KIND=machine-checkable
+[ "$VERIFY_STATE" = "not-planned" ] && { RESIDUE_KIND=judgement; UNCERTAINTY="the verification child was closed as not planned, so the check never ran. ${UNCERTAINTY:-}"; }
+
+CLOSE_DIRECTLY=yes   # only when all four hold (or VERIFY_STATE=completed waives 2 and 4); any doubt at all makes it "no"
 
 if [ "$CLOSE_DIRECTLY" = "yes" ]; then
   # Same close as "Epic Completion" below, reached without a phase marker.
@@ -418,30 +448,60 @@ All $EPIC_CHILD_STRONG_CLOSED linked children are closed (discovered via: $EPIC_
 ---
 *Automated by Champion role*"
 else
-  # Not confident enough to close unilaterally — one mechanical ask, then hands off.
-  # loom:operator with no decision block: "is this epic done?" is a fact the
-  # operator can confirm by looking, not a preference call.
-  ASK_MARKER="<!-- champion:epic-completion-ask -->"
-  printf '%s\n' "$EPIC_JSON" | jq -e --arg m "$ASK_MARKER" \
-    '.comments[] | select(.body | contains($m))' >/dev/null || {
-    ./.loom/scripts/post-comment.sh "$EPIC_NUMBER" --body "$ASK_MARKER
-**Champion: This Epic Looks Complete — Close?**
+  # Not confident enough to close unilaterally. Classify the residue (#10935):
+  #   machine-checkable — 0b's missing path, or a verification the epic body
+  #     states ("verify that …", "confirm …"): an agent can run it → route to an
+  #     agent as a verification child. NEVER a bare loom:operator.
+  #   judgement — criterion 4's outstanding-content comment, prose-only
+  #     containment, or an acceptance call: → a ranked operator decision.
+  if [ "$RESIDUE_KIND" = "machine-checkable" ]; then
+    # One child per epic: VERIFY_STATE != none means one was already routed (open: wait;
+    # completed: CLOSE_DIRECTLY above already closed the epic).
+    EXISTING=$([ "$VERIFY_STATE" = "none" ] && echo 0 || echo 1)
+    if [ "${EXISTING:-1}" = "0" ]; then
+      ./.loom/scripts/create-issue.sh --parent "$EPIC_NUMBER" --label loom:triage \
+        --title "Verify epic #$EPIC_NUMBER deliverable before closing" --body "$VERIFY_MARKER
+Every child of epic #$EPIC_NUMBER is closed (discovered via: $EPIC_CHILD_SOURCES), but: $UNCERTAINTY
 
-Every child found for this epic is closed (via: $EPIC_CHILD_SOURCES), so its structural Phase 1/2/3 criteria are no longer meaningful to re-run. $UNCERTAINTY
-
-Close it, or say what is outstanding.
+**Acceptance:** run the check, then comment the result here. If it passes, close this issue — Champion closes the epic on its next pass. If it fails, say what is missing and file the work as further children of #$EPIC_NUMBER."
+    fi
+    # The open child is now a strong child (loom:parent marker): Step 0.5 stands
+    # the epic down until it closes, and this step re-runs and closes the epic.
+  else
+    DECISION_MARKER="<!-- champion:epic-completion-ask -->"
+    printf '%s\n' "$EPIC_JSON" | jq -e --arg m "$DECISION_MARKER" \
+      '.comments[] | select(.body | contains($m))' >/dev/null || {
+      DECISION_FILE=$(mktemp)
+      # jq --arg, not a heredoc: $UNCERTAINTY can quote a comment ("/newlines).
+      jq -n --arg n "$EPIC_NUMBER" --arg src "$EPIC_CHILD_SOURCES" --arg u "${UNCERTAINTY:-}" '{
+        question: "Epic #\($n) has every found child closed — close it?",
+        context: "Children found via: \($src). \($u)",
+        options: [
+          {id: "a", label: "Close the epic as delivered",
+           why: "Matches the closed children; right if the residue named above is out of scope for the epic."},
+          {id: "b", label: "Keep it open and name what is outstanding",
+           why: "Right if the residue is real work; costs one more decomposition round."}],
+        recommended: "a"}' > "$DECISION_FILE"
+      loom-daemon operator-decision apply "$EPIC_NUMBER" --input "$DECISION_FILE" \
+        && ./.loom/scripts/post-comment.sh "$EPIC_NUMBER" --body "$DECISION_MARKER
+**Champion: This Epic Looks Complete — Close?** Posted as a ranked decision above.
 
 ---
-*Automated by Champion role*" \
-      && gh issue edit "$EPIC_NUMBER" --add-label "loom:operator"
-  }
+*Automated by Champion role*"
+    }
+  fi
 fi
 ```
 
-`$UNCERTAINTY` is the one specific reason this is an ask rather than a close —
-0b's missing path, "containment was never established (prose references only)",
-or criterion 4's outstanding-content comment. A bare "not confident" does not
-satisfy it.
+`$UNCERTAINTY` is the one specific reason this is not a close — 0b's missing
+path, "containment was never established (prose references only)", or criterion
+4's outstanding-content comment. A bare "not confident" does not satisfy it.
+`$RESIDUE_KIND` is assigned in the block above: `machine-checkable` for 0b's
+non-empty `$MISSING` and for a verification the epic body itself states;
+`judgement` for prose-only containment
+and criterion 4. When unsure, it is `judgement` — but still a ranked decision,
+never a bare `loom:operator` (a hold with no `decision` block is what #10935
+removes).
 
 Either branch **ends the pass for this epic**: do not fall through to Step 1.
 Neither counts against "Epic Rate Limiting" below, and the guard's
@@ -457,8 +517,12 @@ defined by:
 |---|---|
 | All children closed, deliverable on `main`, no content objection — **and no phase markers anywhere** (the #6516 shape) | Autonomous close. **No** Phase 1/2/3 checklist re-run, no "Epic Needs Revision" comment |
 | Same, but already carrying two "Epic Needs Revision" rejections | Same close — the body-hash marker match must not skip past Step 0 |
-| All children closed, but the body names `x/y.spice` that is **not** on `main` | `loom:operator` ask naming `x/y.spice`. **No** close, and no claim that the epic is complete |
-| Only prose "Epic #N" references, all closed | `loom:operator` ask. **No** close |
+| All children closed, but the body names `x/y.spice` that is **not** on `main` | A verification child (`create-issue.sh --parent`, `loom:triage`) naming `x/y.spice`; the open child stands the epic down (Step 0.5); the epic closes once it closes. **No** close now, no bare `loom:operator`, no claim that the epic is complete (#10935) |
+| Verification child closed as completed (`VERIFY_STATE=completed`), no other open child | Autonomous close — criteria 2 and 4 waived for the residue it covered (#10935) |
+| Verification child closed as not planned | Ranked `operator-decision`, `judgement` residue. **No** close |
+| Only prose "Epic #N" references, all closed | Ranked `operator-decision` (2–4 options). **No** close, no bare `loom:operator` |
+| Open child linked only by `<!-- loom:parent #N -->` or the epic's park record (the sky130-sar-adc#23 shape) | Counted as a strong open child → no completion ask; Step 0.5 stands down |
+| A discovery source read failed, or the task list exceeds the cap (`EPIC_CHILD_DISCOVERY_COMPLETE=no`) | No close, no ask, no label this pass; retried next pass |
 | No children found by any source (undecomposed epic) | Falls through Step 0.5 (no children, does not fire) → Step 1 → Step 2's 6 criteria, byte-for-byte the pre-existing behavior |
 | One child still open, **carrying a phase marker** (Champion decomposed it) | Falls through Step 0.5 to Step 1; "Phase Progression" unaffected |
 | One child still open, **discovered without any phase marker** (Curator decomposition / sub-issues / task list) | Step 0.5's tracking-umbrella stand-down: one comment per body hash, then silence. **No** structural evaluation, no `loom:operator` (#7666) |
@@ -471,6 +535,11 @@ defined by:
   query re-blinds the check to every epic Champion did not decompose itself.
 - **Nothing closes on prose alone.** Weak (`Epic #N` mention) evidence may only
   reach the operator ask; autonomous closure requires containment.
+- **A failed or truncated read is never "no children".** Discovery that did not
+  complete must not reach 0b/0c's close, however many children closed (#10935).
+- **The operator is asked only through a ranked decision.** A machine-checkable
+  residue goes to an agent as a verification child; a judgement residue goes
+  through `operator-decision apply`. A bare `loom:operator` is neither.
 - **Absence of children is undecomposed, not done.** All-zero counts must route
   to Step 0.5 (which declines) and on to Step 1, never to 0c.
 
