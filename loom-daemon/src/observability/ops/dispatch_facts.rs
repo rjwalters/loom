@@ -113,7 +113,43 @@ pub fn tick_attributes(
         out.push(("loom.dispatch.repos_skipped".into(), g.repos_skipped.to_string()));
         out.push(("loom.dispatch.gather_truncated".into(), g.truncated.to_string()));
     }
+    if let Some(p) = report.phases {
+        out.extend(phase_attributes(&p));
+    }
+    if let Some(hold) = &report.spawn_hold {
+        out.push(("loom.dispatch.spawn_hold".into(), hold.clone()));
+    }
     out
+}
+
+/// The tick span's per-phase timing (#12256): where a tick's wall time went.
+/// Pure.
+#[must_use]
+pub fn phase_attributes(
+    p: &crate::step_dispatch::gather_budget::TickPhases,
+) -> Vec<(String, String)> {
+    vec![
+        ("loom.dispatch.phase.listing_ms".into(), p.listing_ms.to_string()),
+        ("loom.dispatch.phase.filter_ms".into(), p.filter_ms.to_string()),
+        ("loom.dispatch.phase.draw_ms".into(), p.draw_ms.to_string()),
+        ("loom.dispatch.phase.spawn_ms".into(), p.spawn_ms.to_string()),
+        ("loom.dispatch.spawn_attempts".into(), p.spawn_attempts.to_string()),
+        ("loom.dispatch.gather_concurrency".into(), p.gather_concurrency.to_string()),
+        ("loom.dispatch.spawn_concurrency".into(), p.spawn_concurrency.to_string()),
+        (
+            "loom.dispatch.phase.spawn_resolve_ms".into(),
+            p.spawn_parts.resolve_ms.to_string(),
+        ),
+        ("loom.dispatch.phase.spawn_claim_ms".into(), p.spawn_parts.claim_ms.to_string()),
+        (
+            "loom.dispatch.phase.spawn_launch_ms".into(),
+            p.spawn_parts.launch_ms.to_string(),
+        ),
+        (
+            "loom.dispatch.phase.spawn_account_ms".into(),
+            p.spawn_parts.account_ms.to_string(),
+        ),
+    ]
 }
 
 /// The tick's extra metric points: one `loom.dispatch.cap_term{kind}` gauge
@@ -182,6 +218,53 @@ pub fn current_halted_repos() -> Option<String> {
 mod tests {
     use super::*;
     use crate::telemetry::ops::MetricValue;
+
+    #[test]
+    fn tick_phases_are_attributes_the_export_keeps() {
+        let report = TickReport {
+            phases: Some(crate::step_dispatch::gather_budget::TickPhases {
+                listing_ms: 12_000,
+                filter_ms: 300,
+                draw_ms: 40,
+                spawn_ms: 9_000,
+                spawn_attempts: 5,
+                gather_concurrency: 8,
+                spawn_concurrency: 4,
+                spawn_parts: crate::step_dispatch::gather_budget::SpawnParts {
+                    resolve_ms: 700,
+                    claim_ms: 6_000,
+                    launch_ms: 200,
+                    account_ms: 11_000,
+                },
+            }),
+            gather: Some(crate::step_dispatch::gather_budget::GatherStats::default()),
+            spawn_hold: Some("rate_limit_breaker".to_string()),
+            ..TickReport::default()
+        };
+        let attrs = tick_attributes(&report, None, None);
+        let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("loom.dispatch.phase.listing_ms"), Some("12000"));
+        assert_eq!(get("loom.dispatch.phase.spawn_ms"), Some("9000"));
+        assert_eq!(get("loom.dispatch.spawn_attempts"), Some("5"));
+        assert_eq!(get("loom.dispatch.gather_concurrency"), Some("8"));
+        assert_eq!(get("loom.dispatch.spawn_concurrency"), Some("4"));
+        assert_eq!(get("loom.dispatch.spawn_hold"), Some("rate_limit_breaker"));
+        assert_eq!(get("loom.dispatch.phase.spawn_claim_ms"), Some("6000"));
+        assert_eq!(get("loom.dispatch.phase.spawn_account_ms"), Some("11000"));
+        // Every tick attribute survives export (#12256: the #12074 gather
+        // keys were emitted but missing from the allowlist).
+        for (key, _) in &attrs {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
+                "{key} is not on the export allowlist"
+            );
+        }
+        // No phases, no phase attributes.
+        let bare = tick_attributes(&TickReport::default(), None, None);
+        assert!(!bare
+            .iter()
+            .any(|(k, _)| k.starts_with("loom.dispatch.phase.")));
+    }
     use crate::work_finder::halt_cause::HaltCause;
 
     fn halt(root: &str, cause: Option<HaltCause>) -> RootHalt {

@@ -94,6 +94,10 @@ struct FakeSpawner {
     refuse: Vec<(u32, &'static str)>,
     refuse_all: Option<&'static str>,
     asked: Vec<(usize, u32, StepRole, u32)>,
+    /// Each round's batch, as `(workspace, item)` (#12298).
+    batches: Vec<Vec<(usize, u32)>>,
+    /// Hold the spawns once this many batches ran (#12298).
+    hold_after: Option<usize>,
 }
 
 impl StepSpawner for FakeSpawner {
@@ -108,6 +112,28 @@ impl StepSpawner for FakeSpawner {
             return SpawnResult::Refused(reason.to_string());
         }
         SpawnResult::Spawned
+    }
+
+    fn held(&mut self) -> Option<&'static str> {
+        self.hold_after
+            .is_some_and(|n| self.batches.len() >= n)
+            .then_some("rate_limit_breaker")
+    }
+
+    fn spawn_batch(&mut self, batch: &[(usize, StepSpawnRequest)]) -> Vec<SpawnResult> {
+        self.batches
+            .push(batch.iter().map(|(idx, r)| (*idx, r.item)).collect());
+        // Answer in batch order, as the trait requires, after "running"
+        // them back to front: the order the work finished in is not the
+        // order the tick sees.
+        let mut answers: Vec<(usize, SpawnResult)> = batch
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(pos, (idx, r))| (pos, self.spawn(*idx, r)))
+            .collect();
+        answers.sort_by_key(|(pos, _)| *pos);
+        answers.into_iter().map(|(_, r)| r).collect()
     }
 }
 
@@ -124,6 +150,7 @@ fn limits(free_slots: usize) -> StepTickLimits {
         free_slots,
         max_admissions: free_slots,
         saturation_held: false,
+        spawn_concurrency: 1,
     }
 }
 
@@ -372,4 +399,244 @@ fn peer_active_and_backstop_hold_read_as_a_peer_claim() {
         .find(|e| e.reason == "refused_peer_active")
         .unwrap();
     assert_eq!(refused.skip_reason, PickSkipReason::InFlight);
+}
+
+// ---- #12298: concurrent spawns -------------------------------------------
+
+fn concurrent(free_slots: usize, spawn_concurrency: usize) -> StepTickLimits {
+    StepTickLimits {
+        spawn_concurrency,
+        ..limits(free_slots)
+    }
+}
+
+fn repos(n: usize) -> Vec<StepWorkspace> {
+    (0..n)
+        .map(|i| workspace(i, &format!("acme/r{i}"), &forge()))
+        .collect()
+}
+
+/// The items the spawner was asked for and did not refuse, by workspace.
+fn spawned(spawner: &FakeSpawner, refused: &[u32]) -> Vec<(usize, u32, StepRole)> {
+    spawner
+        .asked
+        .iter()
+        .filter(|a| !refused.contains(&a.1))
+        .map(|a| (a.0, a.1, a.2))
+        .collect()
+}
+
+#[test]
+fn a_round_spawns_at_most_one_step_per_repo_and_never_an_item_twice() {
+    let mut spawner = FakeSpawner::default();
+    let mut cap = RepoCap::new(None, vec![0; 4]);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    assert!(spawner.batches.iter().any(|b| b.len() > 1), "{:?}", spawner.batches);
+    for batch in &spawner.batches {
+        assert!(batch.len() <= 4);
+        let repos: BTreeSet<usize> = batch.iter().map(|(ws, _)| *ws).collect();
+        assert_eq!(repos.len(), batch.len(), "two spawns in one repo: {batch:?}");
+    }
+    let asked: Vec<(usize, u32)> = spawner.asked.iter().map(|a| (a.0, a.1)).collect();
+    let unique: BTreeSet<(usize, u32)> = asked.iter().copied().collect();
+    assert_eq!(unique.len(), asked.len(), "an item was asked twice: {asked:?}");
+    assert_eq!(tick.report.dispatched, 12);
+    assert_eq!(
+        tick.report
+            .queue
+            .iter()
+            .filter(|r| r.disposition == Some(Qd::Dispatched))
+            .count(),
+        12
+    );
+}
+
+#[test]
+fn a_concurrent_tick_never_exceeds_the_free_slots_or_the_ramp_cap() {
+    for (free, ramp) in [(3, 10), (10, 3), (5, 5)] {
+        let mut spawner = FakeSpawner::default();
+        let mut cap = RepoCap::new(None, vec![0; 4]);
+        let tick = run_with(
+            repos(4),
+            StepTickLimits {
+                max_admissions: ramp,
+                ..concurrent(free, 4)
+            },
+            &mut cap,
+            &mut spawner,
+        );
+        let want = free.min(ramp);
+        assert_eq!(tick.report.dispatched, want, "free {free}, ramp {ramp}");
+        assert_eq!(spawner.asked.len(), want, "free {free}, ramp {ramp}");
+    }
+}
+
+#[test]
+fn concurrent_spawns_keep_the_repo_caps() {
+    let mut spawner = FakeSpawner::default();
+    let mut cap = RepoCap::new(Some(2), vec![1, 0, 2]);
+    let tick = run_with(repos(3), concurrent(10, 4), &mut cap, &mut spawner);
+    let per_repo = |ws: usize| spawner.asked.iter().filter(|a| a.0 == ws).count();
+    assert_eq!((per_repo(0), per_repo(1), per_repo(2)), (1, 2, 0));
+    assert_eq!(tick.report.dispatched, 3);
+    let end = tick.report.repo_cap.unwrap().occupancy_end;
+    assert_eq!(end, vec![2, 2, 2]);
+}
+
+#[test]
+fn a_round_does_not_overrun_a_ram_budget_its_repos_share() {
+    use crate::ram_headroom::{RamBudget, RepoCharge};
+    use crate::ram_peaks::ChargeSource;
+    let charge = |repo: &str| RepoCharge {
+        repo: repo.to_string(),
+        gb: 4,
+        source: ChargeSource::Default,
+    };
+    // Room for two 4 GB admissions, across four repos.
+    let limits = crate::work_finder::repo_cap::RepoLimits {
+        per_repo: None,
+        ram: Some(RamBudget {
+            remaining_gb: 9,
+            charges: (0..4).map(|i| charge(&format!("r{i}"))).collect(),
+        }),
+        disk: None,
+    };
+    let mut spawner = FakeSpawner::default();
+    let mut cap = RepoCap::from_limits(limits, vec![0; 4]);
+    let tick = run_with(repos(4), concurrent(8, 4), &mut cap, &mut spawner);
+    assert_eq!(spawner.asked.len(), 2, "{:?}", spawner.batches);
+    assert_eq!(tick.report.dispatched, 2);
+}
+
+#[test]
+fn one_champion_merge_per_repo_holds_across_rounds() {
+    let rows = vec![
+        row(6, &["loom:building"], "", false),
+        row(60, &["loom:pr"], "Closes #6", true),
+        row(7, &["loom:building"], "", false),
+        row(70, &["loom:pr"], "Closes #7", true),
+        row(8, &["loom:building"], "", false),
+        row(80, &["loom:pr"], "Closes #8", true),
+    ];
+    let mut spawner = FakeSpawner::default();
+    let mut cap = RepoCap::new(None, vec![0; 2]);
+    let tick = run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "acme/two", &rows),
+        ],
+        concurrent(10, 4),
+        &mut cap,
+        &mut spawner,
+    );
+    for ws in 0..2 {
+        let merges = spawned(&spawner, &[])
+            .iter()
+            .filter(|a| a.0 == ws && a.2 == StepRole::ChampionMerge)
+            .count();
+        assert_eq!(merges, 1, "repo {ws}: {:?}", spawner.asked);
+    }
+    assert_eq!(tick.report.dispatched, 2);
+    assert_eq!(tick.passes.get(PASS_MERGE), Some(&4));
+}
+
+#[test]
+fn refusals_in_a_round_are_counted_in_draw_order() {
+    // Every spawn refused: each attempt is one pass, the tick stops at the
+    // pass cap, and nothing is dispatched.
+    let mut spawner = FakeSpawner {
+        refuse_all: Some("claimed"),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0; 4]);
+    let rows: Vec<RestIssue> = (1..=40)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let ws: Vec<StepWorkspace> = (0..4)
+        .map(|i| workspace(i, &format!("acme/r{i}"), &rows))
+        .collect();
+    let tick = run_with(ws, concurrent(4, 4), &mut cap, &mut spawner);
+    assert_eq!(tick.report.dispatched, 0);
+    assert_eq!(tick.passes.get("claimed"), Some(&spawner.asked.len()));
+    assert!(spawner.asked.len() <= MAX_PASSES_PER_TICK as usize);
+    assert!(tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.disposition == Some(Qd::PeerClaim))
+        .all(|r| r.detail.as_deref() == Some("claimed")));
+
+    // Some refused: the dispatched count, the passes and the rows agree with
+    // what the spawner answered.
+    let mut spawner = FakeSpawner {
+        refuse: vec![(1, "claimed"), (3, "pool_exhausted"), (40, "claim_lost")],
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0; 4]);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    let refused = spawner.asked.len() - tick.report.dispatched;
+    assert_eq!(tick.passes.values().sum::<usize>(), refused);
+    let dispatched_rows = tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.disposition == Some(Qd::Dispatched))
+        .count();
+    assert_eq!(dispatched_rows, tick.report.dispatched);
+}
+
+#[test]
+fn a_concurrency_of_one_or_one_repo_is_the_serial_tick() {
+    let order = |conc: usize, n: usize| {
+        let mut spawner = FakeSpawner {
+            refuse: vec![(3, "claimed")],
+            ..FakeSpawner::default()
+        };
+        let mut cap = RepoCap::new(None, vec![0; n]);
+        let tick = run_with(repos(n), concurrent(6, conc), &mut cap, &mut spawner);
+        (spawner.asked, tick.report.dispatched, tick.passes)
+    };
+    // One repo: every round is one draw, whatever the concurrency.
+    assert_eq!(order(4, 1), order(1, 1));
+    // Several repos at a concurrency of 1: one spawn per round.
+    let mut spawner = FakeSpawner::default();
+    let mut cap = RepoCap::new(None, vec![0; 3]);
+    run_with(repos(3), concurrent(6, 1), &mut cap, &mut spawner);
+    assert!(spawner.batches.iter().all(|b| b.len() == 1));
+}
+
+#[test]
+fn a_breaker_tripped_mid_tick_stops_the_next_round() {
+    let mut spawner = FakeSpawner {
+        hold_after: Some(1),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0; 4]);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    // One round ran; the second was drawn but never spawned.
+    assert_eq!(spawner.batches.len(), 1);
+    assert_eq!(tick.report.dispatched, spawner.batches[0].len());
+    assert_eq!(tick.report.spawn_hold.as_deref(), Some("rate_limit_breaker"));
+    let held = tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.detail.as_deref() == Some("rate_limit_breaker"))
+        .count();
+    assert!(held > 0);
+    assert!(tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.detail.as_deref() == Some("rate_limit_breaker"))
+        .all(|r| r.disposition == Some(Qd::DeferredCapacity)));
+    // Held before the first round: nothing is spawned at all.
+    let mut spawner = FakeSpawner {
+        hold_after: Some(0),
+        ..FakeSpawner::default()
+    };
+    let mut cap = RepoCap::new(None, vec![0; 4]);
+    let tick = run_with(repos(4), concurrent(12, 4), &mut cap, &mut spawner);
+    assert!(spawner.asked.is_empty());
+    assert_eq!(tick.report.dispatched, 0);
 }
