@@ -964,13 +964,65 @@ else
   fi
 fi
 
+# (f) Operator-named release condition (#12594). A trusted comment opening with
+#     `<!-- loom:release-condition -->` (condition text on the following lines)
+#     binds like a hold until a LATER trusted comment opening with
+#     `<!-- loom:release-condition-met -->` closes it. Latest condition wins
+#     (an amendment replaces it; a `-met` older than the newest condition does
+#     not close it). Champion-authored comments never count, either way. It
+#     needs no prior hold marker, and it overrides release paths (b)-(e) — a new
+#     head must not drop an operator's condition — but NOT `loom:auto-merge-ok`
+#     (a), the explicit human override. Champion never decides a condition is met.
+COND_AT=$(jq -r '
+  [ .comments[]
+    | select((.body | test("champion:|Automated by Champion role")) | not)
+    | select(.body | startswith("<!-- loom:release-condition -->")) ] | last | .createdAt // ""' <<<"$PR_JSON")
+OPEN_CONDITION=false; COND_TEXT=""
+if [ -n "$COND_AT" ]; then
+  COND_MET=$(jq -r --arg at "$COND_AT" '
+    [ .comments[]
+      | select(.createdAt > $at)
+      | select((.body | test("champion:|Automated by Champion role")) | not)
+      | select(.body | startswith("<!-- loom:release-condition-met -->")) ] | length' <<<"$PR_JSON")
+  if [ "$COND_MET" -eq 0 ]; then
+    OPEN_CONDITION=true
+    COND_TEXT=$(jq -r --arg at "$COND_AT" '
+      [ .comments[] | select(.createdAt == $at)
+        | select(.body | startswith("<!-- loom:release-condition -->")) ] | last | .body
+      | split("\n")[1:] | map(select(length > 0)) | .[0:3] | join(" ")' <<<"$PR_JSON")
+  fi
+fi
+if [ "$OPEN_CONDITION" = true ] && [ "$HOLD_OVERRIDE" != true ]; then
+  PRIOR_HOLD=true
+  RELEASE_REASON=""
+  MANUAL_RELEASE_SINCE_HOLD=false   # a human label removal does not satisfy the condition
+  LABEL_REPAIR=false                # the condition, not Champion's marker, is the hold
+fi
+
 if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
   MERGE_BLOCKED_BY_HOLD=true
+  if [ "$OPEN_CONDITION" = true ]; then
+    # Name the condition once per condition comment (idempotent: the marker
+    # carries the condition's createdAt, so an amendment posts a new notice).
+    COND_MARKER="<!-- champion:release-condition-hold cond=$COND_AT -->"
+    if ! jq -e --arg m "$COND_MARKER" '[.comments[].body] | any(startswith($m))' >/dev/null <<<"$PR_JSON"; then
+      ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$COND_MARKER
+**Champion: Holding for an Operator Release Condition**
+
+Not merging: an operator-named release condition is still open — $COND_TEXT
+
+It survives new pushes and re-reviews. It closes when a trusted, non-Champion comment opens with \`<!-- loom:release-condition-met -->\` and cites the evidence; \`loom:auto-merge-ok\` still overrides.
+
+---
+*Automated by Champion role*" >/dev/null 2>&1 || true
+    fi
+    echo "STICKY HOLD: #$PR_NUMBER has an open operator release condition ($COND_TEXT) — not merging"
+  fi
   # Label missing, no removal on record: restore it, so a sticky-held PR
   # never reads as plain approved and stays in the census (#11416).
   [ "$LABEL_REPAIR" = true ] && loom-daemon park-record apply --pr "$PR_NUMBER" \
     --reason "champion merge-risk hold" --by champion >/dev/null 2>&1 || true
-  echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
+  [ "$OPEN_CONDITION" = true ] || echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
   # Post NOTHING (the hold notice is already on the PR — see Hold behavior's
   # idempotency guard) and do NOT merge this PR this pass, whatever the axes say.
   #
@@ -988,6 +1040,7 @@ fi
 |---|---|
 | `PRIOR_HOLD=false` | Judge the four axes normally. No behavior change from before #4742. |
 | `PRIOR_HOLD=true`, no `RELEASE_REASON` | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates criteria #4/#5/#6. |
+| `OPEN_CONDITION=true` (#12594), no `loom:auto-merge-ok` | **HOLD the merge** whatever (b)-(e) and the axes say — `PRIOR_HOLD=true`, `RELEASE_REASON=""`, `MERGE_BLOCKED_BY_HOLD=true`, even with no hold marker on the PR. The notice names the condition (once per condition comment). Closed only by a later trusted, non-Champion `<!-- loom:release-condition-met -->` comment; then the rows below apply as usual. |
 | `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | Criterion #2 **PASS** by override — the axes are not re-scored. Continue to #3. Step 2's reversal block is **mandatory**. |
 | `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416); "Hold behavior"'s first branch executes it (no notice, no label). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below, then the **Held-PR Health Pass**. |
 
