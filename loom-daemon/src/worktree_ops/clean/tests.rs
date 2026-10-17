@@ -285,6 +285,65 @@ fn primary_checkout_sweep_dry_run_removes_nothing() {
     assert!(tmp.path().join("target").is_dir());
 }
 
+// --- clean.keepBuildArtifacts (#12694) --------------------------------
+
+fn write_keep_config(root: &Path, body: &str) {
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::write(root.join(".loom/config.json"), body).unwrap();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn keep_build_artifacts_leaves_existing_dirs_and_reports_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_keep_config(tmp.path(), r#"{"clean":{"keepBuildArtifacts":true}}"#);
+    std::fs::create_dir_all(tmp.path().join("node_modules/pkg")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+
+    for dry_run in [false, true] {
+        let outcomes = sweep_primary_checkout_artifacts(tmp.path(), dry_run);
+        assert!(outcomes
+            .iter()
+            .all(|o| matches!(o, ArtifactOutcome::Kept(_))));
+        assert_eq!(outcomes.len(), PRIMARY_CHECKOUT_ARTIFACTS.len());
+        assert!(tmp.path().join("node_modules/pkg").is_dir());
+        assert!(tmp.path().join("target").is_dir());
+    }
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn keep_build_artifacts_still_reports_absent_dirs_as_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_keep_config(tmp.path(), r#"{"clean":{"keepBuildArtifacts":true}}"#);
+    std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+
+    let outcomes = sweep_primary_checkout_artifacts(tmp.path(), false);
+    assert!(matches!(outcomes[0], ArtifactOutcome::Absent(_))); // target
+    assert!(matches!(outcomes[1], ArtifactOutcome::Kept(_))); // node_modules
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn keep_build_artifacts_non_boolean_or_false_is_ignored() {
+    for body in [
+        r#"{"clean":{"keepBuildArtifacts":"true"}}"#,
+        r#"{"clean":{"keepBuildArtifacts":false}}"#,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_keep_config(tmp.path(), body);
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        let outcomes = sweep_primary_checkout_artifacts(tmp.path(), false);
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, ArtifactOutcome::Reclaimed(_))),
+            "{body}"
+        );
+        assert!(!tmp.path().join("node_modules").exists(), "{body}");
+    }
+}
+
 // --- live-binary protection (#6127) ----------------------------------
 
 /// Copy the host's `sleep` into `<dir>/<name>` and run it, so a live

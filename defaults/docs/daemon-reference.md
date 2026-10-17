@@ -9270,6 +9270,16 @@ path](troubleshooting.md#never-launch-a-service-from-a-build-output-path-6127).
 | `LOOM_DEEP_CLEAN_FREE_GB` | `autonomous.worktreeReaper.deepClean.freeGb` | env > config > `diskWarnFreeGb` | `20` |
 | `LOOM_DEEP_CLEAN_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.deepClean.minIntervalSecs` | env > config > default | `21600` (6h) |
 
+**Opting a checkout out (`clean.keepBuildArtifacts`).** When the primary
+checkout is itself a runtime dependency (e.g. other agents' MCP configs load its
+`node_modules/…/dist` by absolute path), set `"clean": {"keepBuildArtifacts":
+true}` in `.loom/config.json` (boolean, default `false`; resolved through the
+normal fleet/repo tiers). Both `clean --deep` and this pass share one engine
+that then keeps every existing `target/` / `node_modules/` — the CLI prints
+`SKIPPED <name>/ kept (keepBuildArtifacts, <size>)`, the pass logs a `warn`,
+and `status --json` `deep_clean[].last_kept` names what was left. Worktree
+artifact reclaim is unaffected.
+
 **Observability.** `loom-daemon status` prints an `artifact reclaim (deep, per
 repo)` block — when a pass last fired, what it
 reclaimed, and (the common case) why the last evaluation declined, e.g.
