@@ -197,6 +197,15 @@ jobs:
               # re-run those, or the only tests that can catch the regression
               # are skipped on exactly the PRs that cause one (#8665).
               - 'defaults/observability/**'
+              # Same reason: label_registry `include_str!`s defaults/labels.json
+              # and its tests read both labels.yml copies from disk; a
+              # label-file-only PR skipped them and turned main red (#10083).
+              - 'defaults/labels.json'
+              - '.github/labels.yml'
+              - 'defaults/.github/labels.yml'
+              # forge_inventory `include_str!`s the manifest, operations/*.toml
+              # and call-bypass-baseline.toml and fails on drift (#10181).
+              - 'defaults/forge/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
