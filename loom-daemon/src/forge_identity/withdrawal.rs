@@ -14,6 +14,7 @@
 //! |---|---|---|
 //! | primary rate limit | `(app, owner, resource)` | the bucket's reset: the refusal's `x-ratelimit-reset`, else an on-demand `rate_limit` probe showing the bucket empty, else now + 300 s; clamped to [30 s, 3660 s] |
 //! | secondary rate limit | `(app, owner, all)` | now + `Retry-After`, else now + 60 s — never the hourly reset |
+//! | a refusal naming a resource the book does not keep (`code_search`, …) | as a secondary limit (#12630) | as a secondary limit; the bucket book is never marked empty for it |
 //! | bad credentials / 401 | `(app, owner, all)` | now + 300 s |
 //! | coverage (403/404) | `(app, owner/repo)` | now + 3600 s (unchanged) |
 //!
@@ -219,12 +220,22 @@ pub fn classify_failure_in(
         || s.contains("http 429")
         || exhausted_403
     {
-        let resource = headers
+        let named = headers
             .and_then(|h| h.resource.as_deref())
-            .and_then(Resource::parse)
-            .unwrap_or(resource);
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        let booked = named.and_then(Resource::parse);
+        // #12630: a refusal that names a resource the book does not keep
+        // (`code_search`, …) is no evidence about the call's static pool.
+        // Falling back to that pool booked a reader's `core` bucket empty
+        // until the primary reset. Hold it as a secondary limit instead: its
+        // `Retry-After`, else 60 s, with the book untouched. A refusal whose
+        // headers show budget left is held only briefly as well
+        // (`ResetSource::Headroom` in `plan_withdrawal`).
+        let unbooked = named.is_some() && booked.is_none();
+        let secondary = secondary || unbooked;
         return Some(Failure::RateLimited {
-            resource,
+            resource: booked.unwrap_or(resource),
             reset: headers.and_then(|h| h.reset_epoch).and_then(epoch_time),
             secondary,
             retry_after,

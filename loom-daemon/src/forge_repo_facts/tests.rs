@@ -79,6 +79,39 @@ const CASES: &[Case] = &[
         ambiguous_honour: true,
         ambiguous_ignore: true,
     },
+    // #12630: `gh repo set-default` run in a single-remote checkout pins that
+    // remote to itself. gh can only answer with that remote, so the pin is no
+    // ambiguity (an untargeted read there routes to a reader, never shed).
+    Case {
+        name: "set-default = base on the sole remote",
+        remotes: &[ORIGIN],
+        config: &[("remote.origin.gh-resolved", "base")],
+        env: &[],
+        honour: "acme/app",
+        ignore: "acme/app",
+        ambiguous_honour: false,
+        ambiguous_ignore: false,
+    },
+    Case {
+        name: "set-default = the sole remote's own owner/repo",
+        remotes: &[ORIGIN],
+        config: &[("remote.origin.gh-resolved", "acme/app")],
+        env: &[],
+        honour: "acme/app",
+        ignore: "acme/app",
+        ambiguous_honour: false,
+        ambiguous_ignore: false,
+    },
+    Case {
+        name: "set-default on the sole remote naming another repo",
+        remotes: &[ORIGIN],
+        config: &[("remote.origin.gh-resolved", "pinned/tool")],
+        env: &[],
+        honour: "pinned/tool",
+        ignore: "pinned/tool",
+        ambiguous_honour: true,
+        ambiguous_ignore: true,
+    },
     Case {
         name: "set-default = an explicit owner/repo",
         remotes: &[ORIGIN, ("upstream", "https://github.com/up/app.git")],

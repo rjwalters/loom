@@ -213,3 +213,57 @@ fn a_store_read_on_an_explicit_writer_credential_is_still_reader_only() {
         .args(["api", "--include", "repos/o/store-g/commits/main"]);
     assert!(inv.is_reader_only());
 }
+
+/// #12630: the workspace resync claims (and the head check) build their
+/// transport with a managed checkout's root, but reader tokens are
+/// published under the daemon's workspace root only. Resolving the pool at
+/// the checkout found every reader "stale" (no token directory there) and
+/// shed each claim read before any reader was asked.
+#[test]
+fn a_managed_checkout_resolves_its_readers_at_the_daemon_workspace_root() {
+    fn roster(_: &Path) -> crate::forge_identity::Roster {
+        crate::forge_identity::Roster {
+            writer: None,
+            readers: vec![crate::forge_identity::Identity {
+                app_id: "951263".into(),
+                slug: None,
+                private_key_path: PathBuf::from("/keys/951263.pem"),
+                owners: None,
+            }],
+            legacy_logins: vec![],
+            writers: Vec::new(),
+        }
+    }
+    let daemon = tempfile::tempdir().unwrap();
+    let checkout = tempfile::tempdir().unwrap();
+    let dir = crate::forge_read_pool::gh_config_dir_for_owner_app(daemon.path(), "acme", "951263");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hosts.yml"), "github.com:\n").unwrap();
+    crate::forge_identity::sidecar::write_sidecar(
+        &dir,
+        &crate::forge_identity::Sidecar {
+            app_id: "951263".into(),
+            installation_id: "1".into(),
+            owner: Some("acme".into()),
+            role: crate::forge_identity::SidecarRole::Reader,
+            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(50)).to_rfc3339(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // The pre-fix lookup, at the checkout's own root: no reader.
+    let (pooled, next) = reader_pool(checkout.path().to_path_buf(), "acme/widgets", roster);
+    assert!(pooled);
+    assert_eq!(next(), None, "no reader token is ever published under a managed checkout");
+
+    // At the daemon's workspace root, as `GhTransport::new` now resolves it.
+    let root = crate::forge_identity::reader_root_with(checkout.path(), Some(daemon.path()));
+    assert_eq!(root, daemon.path());
+    let (pooled, next) = reader_pool(root, "acme/widgets", roster);
+    assert!(pooled);
+    assert_eq!(next(), Some((dir, "951263".to_string())));
+
+    // A process with no daemon or front root keeps the root it was given.
+    assert_eq!(crate::forge_identity::reader_root_with(checkout.path(), None), checkout.path());
+}

@@ -263,6 +263,155 @@ fn the_probed_reset_is_believed_only_for_an_empty_bucket() {
     assert_eq!(got("unknown"), None);
 }
 
+// ---- #12630: only real evidence empties a bucket ----------------------------
+
+/// Classify `stderr` / `status` / `h` for a call statically spending
+/// `resource`, then apply it for reader `app` on `acme/x` at `now`.
+fn classify_and_withdraw(
+    app: &str,
+    stderr: &str,
+    status: Option<u16>,
+    h: &RateLimitHeaders,
+    resource: Resource,
+    now: SystemTime,
+) -> Withdrawal {
+    let f = classify_failure_in(RoutingMode::Scoped, stderr, status, Some(h), resource).unwrap();
+    withdraw_after_in(RoutingMode::Scoped, app, "acme/x", f, "test", now, &no_probe)
+}
+
+#[test]
+fn a_refusal_whose_headers_show_budget_left_never_empties_the_core_bucket() {
+    // A core call refused with "rate limit" in its text, but its own headers
+    // say the bucket has 4200 left: not a primary limit of that bucket.
+    let now = SystemTime::now();
+    let app = "940101";
+    let mut h = headers(Some(epoch_secs(now) + 3000), None);
+    h.resource = Some("core".into());
+    h.remaining = Some(4200);
+    h.used = Some(800);
+    let w = classify_and_withdraw(
+        app,
+        "gh: rate limit hit for this request (HTTP 403)",
+        Some(403),
+        &h,
+        Resource::Core,
+        now,
+    );
+    let (_, scope, until, source, secondary) = scoped(&w);
+    assert_eq!((scope, source, secondary), (ResourceScope::Core, ResetSource::Headroom, false));
+    assert_eq!(
+        until,
+        now + MIN_SCOPED_WITHDRAWAL,
+        "held briefly, never the hourly reset: {w:?}"
+    );
+    let key = BucketKey::new(&format!("app-{app}"), "acme", Resource::Core);
+    assert_ne!(
+        forge_bucket_book::reading(&key, epoch_secs(now)).and_then(|r| r.remaining),
+        Some(0),
+        "the core bucket is never booked empty"
+    );
+    assert!(!forge_read_pool::is_withdrawn_scoped_at(
+        app,
+        "acme",
+        Resource::Core,
+        now + Duration::from_secs(31)
+    ));
+}
+
+#[test]
+fn a_refusal_naming_an_unbooked_resource_never_falls_back_to_core() {
+    // `x-ratelimit-resource: code_search` (10/min) is no bucket the book
+    // keeps. Before #12630 it fell back to the call's static pool (core) and
+    // booked core empty until the refusal's reset.
+    let now = SystemTime::now();
+    let app = "940102";
+    let mut h = headers(Some(epoch_secs(now) + 2400), None);
+    h.resource = Some("code_search".into());
+    h.limit = Some(10);
+    h.used = Some(10);
+    let w = classify_and_withdraw(
+        app,
+        "gh: API rate limit exceeded (HTTP 403)",
+        Some(403),
+        &h,
+        Resource::Core,
+        now,
+    );
+    let (_, _, until, _, secondary) = scoped(&w);
+    assert!(secondary, "{w:?}");
+    assert!(until <= now + SECONDARY_WITHDRAWAL, "{w:?}");
+    let key = BucketKey::new(&format!("app-{app}"), "acme", Resource::Core);
+    assert_eq!(
+        forge_bucket_book::reading(&key, epoch_secs(now)),
+        None,
+        "nothing is booked for core"
+    );
+    assert!(!forge_read_pool::is_withdrawn_scoped_at(
+        app,
+        "acme",
+        Resource::Core,
+        now + Duration::from_secs(61)
+    ));
+}
+
+#[test]
+fn a_search_limit_books_search_never_core() {
+    // A real primary search limit (30/min) empties the search bucket only.
+    let now = SystemTime::now();
+    let app = "940103";
+    let mut h = headers(Some(epoch_secs(now) + 50), None);
+    h.resource = Some("search".into());
+    h.limit = Some(30);
+    h.used = Some(30);
+    let w = classify_and_withdraw(
+        app,
+        "gh: API rate limit exceeded (HTTP 403)",
+        Some(403),
+        &h,
+        Resource::Core,
+        now,
+    );
+    assert_eq!(scoped(&w).1, ResourceScope::Search, "{w:?}");
+    let book = |r| {
+        forge_bucket_book::reading(
+            &BucketKey::new(&format!("app-{app}"), "acme", r),
+            epoch_secs(now),
+        )
+    };
+    assert_eq!(book(Resource::Search).and_then(|r| r.remaining), Some(0));
+    assert_eq!(book(Resource::Core), None);
+    assert!(!forge_read_pool::is_withdrawn_scoped_at(
+        app,
+        "acme",
+        Resource::Core,
+        now + Duration::from_secs(1)
+    ));
+}
+
+#[test]
+fn a_real_core_limit_still_empties_core_until_its_reset() {
+    // The evidence the book needs: `x-ratelimit-resource: core`, remaining 0.
+    let now = SystemTime::now();
+    let app = "940104";
+    let reset = epoch_secs(now) + 1800;
+    let mut h = headers(Some(reset), None);
+    h.resource = Some("core".into());
+    let w = classify_and_withdraw(
+        app,
+        "gh: API rate limit exceeded for installation ID 1 (HTTP 403)",
+        Some(403),
+        &h,
+        Resource::Core,
+        now,
+    );
+    let (_, scope, until, source, secondary) = scoped(&w);
+    assert_eq!((scope, source, secondary), (ResourceScope::Core, ResetSource::Header, false));
+    assert_eq!(until, epoch_time(reset).unwrap());
+    let key = BucketKey::new(&format!("app-{app}"), "acme", Resource::Core);
+    let r = forge_bucket_book::reading(&key, epoch_secs(now)).unwrap();
+    assert_eq!((r.remaining, r.reset_epoch), (Some(0), reset));
+}
+
 // ---- secondary and credential -----------------------------------------------
 
 #[test]

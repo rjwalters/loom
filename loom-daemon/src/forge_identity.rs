@@ -105,6 +105,26 @@ pub fn workspace_root() -> Option<&'static Path> {
     WORKSPACE_ROOT.get().map(PathBuf::as_path)
 }
 
+/// The root a read made for the checkout at `given` routes against: the one
+/// whose roster and **published reader directories** [`route_read`] uses —
+/// the daemon's workspace root, else the agent front's reader root, else
+/// `given` (a CLI process with neither).
+///
+/// [`spawn_reader_refresh`] publishes reader tokens under the daemon's
+/// workspace root only. A managed checkout's own `.loom/gh-config-by-owner`
+/// holds at most a writer token, so routing against it found every reader
+/// "stale" and shed the read without asking one (#12630).
+#[must_use]
+pub fn reader_root(given: &Path) -> PathBuf {
+    reader_root_with(given, workspace_root().or_else(front_root))
+}
+
+/// [`reader_root`] with the published root injected.
+#[must_use]
+pub fn reader_root_with(given: &Path, published: Option<&Path>) -> PathBuf {
+    published.unwrap_or(given).to_path_buf()
+}
+
 /// Exported to agent sessions (#12207): the daemon's workspace root, whose
 /// roster and published reader directories the agent `gh` front's served
 /// reads may use when no gateway profile answers for the owner. A
