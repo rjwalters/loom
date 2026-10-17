@@ -19,7 +19,7 @@ use crate::sweep_registry::SweepRegistry;
 
 impl SweepRegistry {
     /// A facade invocation for this registry's workspace, bounded by
-    /// [`reap_gh_timeout`].
+    /// [`reap_gh_timeout`]. A read is [`GhInvocation::reader_only`] (#12555).
     pub(in crate::sweep_registry) fn gh_inv(
         &self,
         op: &'static str,
@@ -29,6 +29,13 @@ impl SweepRegistry {
         let inv = GhInvocation::new(Operation::new(op), intent, GhTarget::None, reap_gh_timeout())
             .program(gh)
             .current_dir(&self.config.workspace_root);
+        // #12555: a registry read is a reader's or the gateway's, or it is
+        // shed — never the writer's (#12394).
+        let inv = if intent == AccessIntent::Read {
+            inv.reader_only()
+        } else {
+            inv
+        };
         match crate::claim_reconciliation::gh_call::forge_op_for(op) {
             Some(fop) => inv.forge_op(fop),
             None => inv,
@@ -80,7 +87,10 @@ impl SweepRegistry {
             .unwrap_or_else(|| PathBuf::from("gh"))
     }
 
-    /// [`Self::gh_inv`] + [`Self::run_counted`] for a read.
+    /// [`Self::gh_inv`] + [`Self::run_counted`] for a read: reader-only
+    /// (#12555), including a read-back of this daemon's own write — see
+    /// [`crate::claim_reconciliation::gh_call::read`] for why read-your-write
+    /// does not need the writer.
     pub(in crate::sweep_registry) fn gh_read<I, S>(
         &self,
         op: &'static str,
@@ -92,26 +102,6 @@ impl SweepRegistry {
     {
         let gh = self.configured_gh();
         self.run_counted(self.gh_inv(op, AccessIntent::Read, &gh).args(args))
-    }
-
-    /// [`Self::gh_read`] pinned to the writer: for a read-back of a forge fact
-    /// this daemon just wrote itself (its own label flip, lease, claim), where
-    /// a reader App could still lag the write. Never derives a reader route.
-    pub(in crate::sweep_registry) fn gh_read_own_write<I, S>(
-        &self,
-        op: &'static str,
-        args: I,
-    ) -> std::io::Result<Option<Output>>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        let gh = self.configured_gh();
-        self.run_counted(
-            self.gh_inv(op, AccessIntent::Read, &gh)
-                .writer_identity()
-                .args(args),
-        )
     }
 
     /// [`Self::gh_read`] for a write.
@@ -126,5 +116,31 @@ impl SweepRegistry {
     {
         let gh = self.configured_gh();
         self.run_counted(self.gh_inv(op, AccessIntent::Write, &gh).args(args))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::sweep_registry::SweepRegistryConfig;
+
+    /// #12555: every registry read is reader-only — it can never mint the
+    /// writer, whatever the site adds — and a write is not.
+    #[test]
+    fn registry_reads_are_reader_only_and_writes_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
+        let gh = Path::new("gh");
+        assert!(reg
+            .gh_inv("guard.lease_comments", AccessIntent::Read, gh)
+            .is_reader_only());
+        assert!(reg
+            .gh_inv("guard.claim_timeline", AccessIntent::Read, gh)
+            .writer_identity()
+            .is_reader_only());
+        assert!(!reg
+            .gh_inv("guard.flip_building", AccessIntent::Write, gh)
+            .is_reader_only());
     }
 }

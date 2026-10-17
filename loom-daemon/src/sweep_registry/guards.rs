@@ -879,7 +879,11 @@ impl SweepRegistry {
             return OpenPrProbe::ProbeFailed;
         };
         let gh = self.resolved_gh();
-        let mut cmd = self.gh_inv("guard.open_pr_graphql", AccessIntent::Read, &gh);
+        // GraphQL names its repo in the query, not the path: say which, so
+        // the reader route serves it (#12555) instead of a shed.
+        let mut cmd = self
+            .gh_inv("guard.open_pr_graphql", AccessIntent::Read, &gh)
+            .reader_repo(&format!("{owner}/{repo}"));
         cmd = cmd.args(crate::worktree_ops::gh::open_linked_pr_args(&owner, &repo, issue));
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and `issue_is_closed_or_pr` (#3937).
@@ -1129,11 +1133,10 @@ impl SweepRegistry {
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        // W4-C: read back after this daemon's own flip, so the writer that
-        // made it answers (a reader may lag the write).
+        // #12555: a reader or the gateway answers, never the writer (#12394),
+        // even right after this daemon's own flip (see `gh_call::read`).
         let mut cmd = self.gh_inv("guard.issue_labels", AccessIntent::Read, &gh);
         cmd = cmd
-            .writer_identity()
             .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
@@ -1505,13 +1508,15 @@ impl SweepRegistry {
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        // W4-C: verifies this daemon's own just-written lease (and its
-        // callers fail open after a few retries), so the writer reads it.
-        // #12389 keeps it there on purpose: it is the read half of the
-        // claim-then-verify tie-break, inside the same critical section as
-        // the lease write, and a lagging reader would hide the new comment.
+        // #12555: a reader or the gateway answers, never the writer (#12394).
+        // This is the read half of the claim-then-verify tie-break, and its
+        // freshness guard is the tie-break's own: a read that does not show
+        // this daemon's just-written lease is retried, then unverified
+        // (`resolve_lease_order_with`), never taken as an answer; a peer's
+        // earlier lease the read misses is the confirmation re-reads' job, and
+        // the writer would read a peer's write no fresher.
         let mut cmd = self.gh_inv("guard.lease_comments", AccessIntent::Read, &gh);
-        cmd = cmd.writer_identity().arg("api")
+        cmd = cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
             .arg("--paginate")
             .arg("--jq")
