@@ -215,7 +215,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
 | [`host.status`](#hoststatus) | gauges, OTLP only | `host_status.rs` (sampler), `observability/collector.rs`, `observability/otlp/mapping/host_status.rs` |
-| [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
+| [`operator.presence`](#operatorpresence) | log, OTLP only | none (#12121): no producer exists; the kind and its mapping remain for old rows → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.freshness`](#checkoutfreshness) | log, OTLP only | `fleet_sync/checkout_ff` pass → `observability/otlp/mapping/checkout_freshness.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
@@ -3631,70 +3631,17 @@ SigNoz: `attributes_string['loom.kind'] = 'checkout.freshness'`, grouped by
 
 ### `operator.presence`
 
-Whether a person is at the keyboard of an operator session (Issue #11563).
-ETA could not tell operator-driven work that stalls (the operator stepped away)
-from work that is merely slow, and in-session `/loom:sweep` runs on
-workstations with no daemon emitted nothing. Envelopes carry
-`schema_version: 12`. **Carried over OTLP** (`otlp: Logs`, `native: false`) now
-that #11525 settled the transport direction (direct OTLP, the same path as every
-other fact). `observability/otlp/mapping/operator_presence.rs` maps the
-`loom.presence.*` scalars (`session_id`, `operator`, `last_input_at`,
-`last_activity_at`, `driving_count`) as attributes and carries the record's JSON
-(including `driving[]`) as the body; `host` rides on the Resource as `host.id`.
-The local journal stays the durable buffer (see **Transport and journal**
-below): `presence export` maps each pending envelope through this sibling once a
-`Transport` is wired, so a beat taken while the transport is unreachable is
-never lost. Wiring that sender into `presence export` on each daemonless host is
-#11525's remaining host-provisioning follow-up.
+**No longer emitted (#12121).** The daemon records telemetry for its own work
+and nothing else: it does not read interactive session transcripts, and
+outside sessions do not send telemetry through it. The `presence-beat.sh` hook
+and the `loom-daemon presence …` subcommands that used to emit this record are
+removed, and nothing replaces them. The kind, its OTLP mapping and the
+`loom.presence.*` attribute allowlist stay so rows already in a backend still
+decode.
 
-**No prompt or transcript content, by construction.** The record has no text
-field beyond ids and a forge login, and the producer reads only `session_id`
-and `hook_event_name` from the hook payload. A test asserts a distinctive
-prompt string appears in neither the journal nor the state file.
-
-| Field | Type | Notes |
-|---|---|---|
-| `captured_at` | RFC3339 | the beat time; the record time |
-| `host` | string | the session's host |
-| `session_id` | string | opaque Claude Code session id |
-| `operator` | string? | forge login (`--operator` / `LOOM_OPERATOR`); omitted when unknown |
-| `last_input_at` | RFC3339? | last `UserPromptSubmit` (a human typed); omitted when none seen |
-| `last_activity_at` | RFC3339 | last tool call or Stop |
-| `driving[]` | array | issues/PRs this session holds an in-session lease on: `kind` (`issue`/`pr`), `number`, `sweep_id` |
-
-**Producer.** `loom-daemon presence beat`, called by the hook
-`presence-beat.sh` on `UserPromptSubmit`, `PostToolUse` and `Stop`. A prompt
-always emits; other events emit at most once per 5 minutes. The hook is wired
-by the installer/resync when the fleet key `operatorPresence.enabled` (or
-`LOOM_OPERATOR_PRESENCE=1`) says so, and is absent otherwise; on `Stop` the
-journal is flushed to OTLP with no daemon running. See
-[`operator-presence.md`](operator-presence.md).
-
-**In-session sweeps.** `loom-daemon presence sweep-start` / `sweep-outcome`
-journal `sweep.started` / `sweep.outcome` with `loom.dispatch_origin=operator`
-and the `sweep_id` that appears in the in-session lease comment. With
-`LOOM_OPERATOR_PRESENCE=1`, `lease ensure` calls `sweep-start` itself once the
-lease is publishing, and the sweep's own end emits `sweep.outcome` with no
-extra step: `sweep-checkpoint.sh delete` (the merge's terminal step, or an
-issue found closed) reports `success` with the checkpoint's PR; the renewal
-loop stopping on a closed issue reports `success`; `sweep-lease-renew.sh
-release` while the sweep is still driven reports `failure` (it ended without
-landing). Only a lease this host journaled `sweep.started` for is finished,
-once: the first end signal wins and later ones are no-ops, so a
-daemon-dispatched sweep never gets one. `sweep-outcome` stays available as an
-explicit call.
-
-**Transport and journal.** Until the transport of #11525 exists, every fact is
-appended to `.loom/logs/operator-presence.jsonl` (override
-`LOOM_OPERATOR_PRESENCE_JOURNAL_PATH`) as one `TelemetryEnvelope` line. The
-journal never rotates and never drops: `loom-daemon presence export` stages it,
-hands the whole batch to the transport, and deletes staged files only after the
-transport accepted them. With no transport it reports the pending count and
-leaves everything in place; unparseable lines go to `<journal>.rejected`.
-The hook path is fail-open and discards output, so a failed journal or state
-write is appended (one `<timestamp>\t<error>` line) to the breadcrumb file
-beside the journal, `.loom/logs/operator-presence.errors`;
-`loom-daemon presence status` prints its count and last line.
+Operator activity is **inferred by consumers**, not emitted: an item (issue or
+PR) that advanced with no daemon span covering it was moved by an operator
+session. See [`operator-presence.md`](operator-presence.md).
 
 ### `checkout.external_change`
 

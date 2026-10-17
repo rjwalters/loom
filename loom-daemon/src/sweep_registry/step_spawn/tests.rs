@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::capture::{
-    emit_step_capture, parse_outcome_line, read_outcome_line, release_class_fallback, step_failure,
-    tick_outcome, StepCapture, StepEnd, StepOutcomeClass,
+    emit_step_capture, parse_outcome_line, read_outcome_line, release_class_fallback,
+    release_class_of_line, step_failure, tick_outcome, StepCapture, StepEnd, StepOutcomeClass,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -371,7 +371,7 @@ fn a_champion_steps_release_class_is_its_champion_line_folded() {
         ("merged", "verdict"),
         ("not-eligible", "refused"),
         ("held", "noop"),
-        ("requeued", "noop"),
+        ("requeued", "ci_wait"),
         ("failed", "failed"),
     ] {
         let body = format!("{}CHAMPION-STEP mode=pr item=7 outcome={outcome}\n", header("s-1"));
@@ -988,4 +988,17 @@ mod captain {
         assert!(!span.attributes.contains_key("loom.assignment.id"));
         cancel_all(&mut reg);
     }
+}
+
+/// #12551: a step that ended waiting on CI releases as `ci_wait`, not `noop`.
+#[test]
+fn a_ci_pending_noop_line_releases_as_ci_wait() {
+    let rel = |l: &str| release_class_of_line(&parse_outcome_line(l).unwrap());
+    let line = |class: &str, reason: &str| {
+        format!("LOOM_STEP_OUTCOME role=judge target=7 class={class} reason={reason}")
+    };
+    assert_eq!(rel(&line("noop", "ci_pending")), "ci_wait");
+    assert_eq!(rel(&line("noop", "already_judged")), "noop");
+    assert_eq!(rel(&line("verdict", "approved")), "verdict");
+    assert_eq!(rel(&line("failed", "ci_pending")), "failed");
 }

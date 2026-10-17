@@ -98,6 +98,26 @@ pub fn read_outcome_line(log: &Path, sweep_id: &str) -> Option<StepOutcomeLine> 
     text[start..].lines().rev().find_map(parse_outcome_line)
 }
 
+/// The `reason`s that mean "waiting on CI": Judge's `ci_pending`, and the
+/// Champion `requeued` outcome, which the telemetry projects as `ci_pending`.
+const CI_WAIT_REASONS: [&str; 2] = ["ci_pending", "requeued"];
+
+/// The captain release outcome for a step that ended `class` / `reason`: the
+/// class, except that a `noop` waiting on CI is `ci_wait` (#12551), which the
+/// captain holds briefly instead of climbing its no-progress ladder.
+fn release_token(class: &'static str, reason: &str) -> &'static str {
+    if class == "noop" && CI_WAIT_REASONS.contains(&reason) {
+        crate::fleet_dispatch::table::CI_WAIT_OUTCOME
+    } else {
+        class
+    }
+}
+
+/// The captain release outcome of a step that wrote an outcome line.
+pub(crate) fn release_class_of_line(line: &StepOutcomeLine) -> &'static str {
+    release_token(line.class.as_str(), &line.reason)
+}
+
 /// The release class of a step that wrote no `LOOM_STEP_OUTCOME` line: a
 /// Champion step's `CHAMPION-STEP` outcome folded onto the four classes
 /// ([`crate::step_dispatch::outcome_ledger::parse_outcome_line`]), read after
@@ -116,7 +136,7 @@ pub(crate) fn release_class_fallback(
         return "failed";
     };
     crate::step_dispatch::outcome_ledger::parse_outcome_line(&text[start..], role, item)
-        .map_or("failed", |o| o.class.as_str())
+        .map_or("failed", |o| release_token(o.class.as_str(), &o.reason))
 }
 
 /// How a step's process ended.
@@ -281,7 +301,7 @@ impl SweepRegistry {
         // a triage that did move its PR.
         let release_class = line.as_ref().map_or_else(
             || release_class_fallback(&log_path, sweep_id, role, item),
-            |l| l.class.as_str(),
+            release_class_of_line,
         );
         crate::fleet_dispatch::worker::release(sweep_id, release_class);
         if !self.config.skip_label_flip {
