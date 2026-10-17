@@ -41,8 +41,7 @@ use tokio::sync::Semaphore;
 use super::identity::{Identity, IdentityError};
 use super::proto::{
     AckResponse, ClaimRequest, ClaimResponse, ErrorResponse, HeartbeatRequest, HeartbeatResponse,
-    RefusalReason, RefuseRequest, ReleaseRequest, CLAIM_PATH, HEARTBEAT_PATH, PATHS, REFUSE_PATH,
-    RELEASE_PATH,
+    RefuseRequest, ReleaseRequest, CLAIM_PATH, HEARTBEAT_PATH, PATHS, REFUSE_PATH, RELEASE_PATH,
 };
 use super::roster::{Roster, RosterSource};
 use super::table::{ClaimDecision, Mono, Policy, RefuseOutcome, Table};
@@ -278,10 +277,8 @@ impl<I: Identity> Server<I> {
         call.item = Some((req.repo.clone(), req.item, req.step.clone()));
         let max = self.roster().max_concurrent(host);
         let decision = self.with_table(|t, now, counters| {
-            let d = t.claim(now, host, &req.repo, req.item, &req.step, max);
+            let (d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step, max);
             if let ClaimDecision::Refused { reason, .. } = &d {
-                let cooled = *reason == RefusalReason::Held
-                    && t.cooldown(now, &req.repo, req.item, &req.step).is_some();
                 if cooled {
                     counters.claim_cooled();
                     call.reason = Some(NO_PROGRESS_REASON.to_string());
