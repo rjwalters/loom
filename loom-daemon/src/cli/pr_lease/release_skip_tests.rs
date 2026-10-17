@@ -26,7 +26,7 @@ fn release_at(checks: &str, reason: Option<&str>) -> (String, bool) {
     fs::write(dir.path().join("checks"), checks).unwrap();
     let judge = on("host-a", "run-1");
     assert_eq!(ctx(dir.path(), judge.clone()).claim(), EXIT_HELD);
-    assert_eq!(ctx(dir.path(), judge).release(reason), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), judge).release(reason, None), EXIT_HELD);
     let held = ctx(dir.path(), on("host-b", "run-2")).claim() == backstop::EXIT_BACKSTOP;
     (patched(dir.path()), held)
 }

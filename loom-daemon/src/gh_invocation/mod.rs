@@ -865,18 +865,15 @@ impl GhInvocation {
     ) -> Vec<EnvEntry> {
         let mut plan = Vec::new();
         let slug = self.target.slug();
-        let config_dir = self
-            .config_dir
-            .clone()
-            .or_else(|| {
-                self.cwd
-                    .as_deref()
-                    .and_then(crate::credential_preflight::gh_config_dir_for_root)
-            })
-            .or_else(|| {
-                slug.as_deref()
-                    .and_then(crate::credential_preflight::gh_config_dir_for_owner_slug)
-            });
+        // The write-scope gate probes the same resolution
+        // (`credential_preflight::gh_config_dir_for_call`, #12606), so a
+        // write is vetted under the credential it carries.
+        let config_dir = self.config_dir.clone().or_else(|| {
+            crate::credential_preflight::gh_config_dir_for_call(
+                self.cwd.as_deref(),
+                slug.as_deref(),
+            )
+        });
         if let Some(dir) = config_dir {
             plan.push(EnvEntry {
                 key: "GH_CONFIG_DIR",

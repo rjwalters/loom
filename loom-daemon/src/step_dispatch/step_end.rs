@@ -134,7 +134,8 @@ pub fn record_refusal(
         ran_for: std::time::Duration::ZERO,
         failure_class: None,
     };
-    let mut forge = crate::operator_decision::cli::GhForge::new(root.to_path_buf(), None);
+    let mut forge = crate::operator_decision::cli::GhForge::new(root.to_path_buf(), None)
+        .with_call_site("step_ledger.reeval_ladder");
     if let Ok(mut reg) = registry.lock() {
         reg.record_step_outcome(&run, &mut forge);
     }
@@ -185,8 +186,11 @@ pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
             run.outcome.class.as_str(),
             run.outcome.reason
         );
+        // #12606: the ladder write is vetted under the writer it carries (the
+        // item owner's per-owner credential), not the workspace root's.
         let mut forge =
-            crate::operator_decision::cli::GhForge::new(root.to_path_buf(), Some(slug.clone()));
+            crate::operator_decision::cli::GhForge::new(root.to_path_buf(), Some(slug.clone()))
+                .with_call_site("step_ledger.reeval_ladder");
         if let Ok(mut reg) = registry.lock() {
             reg.record_step_outcome(&run, &mut forge);
             // #12152: the step's terminal bus event (the narration sink's
