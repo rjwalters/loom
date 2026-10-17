@@ -136,6 +136,11 @@ fn own_write_read_backs_never_derive_a_reader_route() {
         env: DeriveEnv::default(),
         checkout: CwdAnswer::Sole("acme/widget".into()),
     });
+    // Only a read of an issue this daemon just wrote is pinned (#12555).
+    crate::gh_invocation::own_writes::note(
+        &["issue".into(), "edit".into(), "7".into()],
+        Some("acme/widget"),
+    );
     let _ = registry.read_lease_comments(7);
     let _ = registry.current_labels_via_rest(7);
     let _ = registry.fetch_claim_labeled_at(7);
@@ -148,5 +153,44 @@ fn own_write_read_backs_never_derive_a_reader_route() {
         let mine: Vec<_> = seen.iter().filter(|s| s.op == op).collect();
         assert!(!mine.is_empty(), "{op} did not run through the facade: {seen:?}");
         assert!(mine.iter().all(|s| s.route_slug.is_none()), "{op} derived: {mine:?}");
+    }
+}
+
+/// #12555: the same read-backs of an issue this daemon has NOT just written
+/// go to a reader, never the writer.
+#[test]
+#[serial]
+fn read_backs_of_an_unwritten_issue_route_to_a_reader() {
+    use crate::forge_identity::{Placement, RouteDecision};
+    use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+    use crate::gh_invocation::test_routing::{install, seen, TestRouting};
+    std::env::remove_var("LOOM_REPO");
+    let dir = tempdir().unwrap();
+    let (registry, _) = crate::sweep_registry::test_support::fixture_registry(dir.path());
+    *registry.owner_repo_cache.lock().unwrap() = Some(("acme".into(), "widget".into()));
+    let _g = install(TestRouting {
+        decision: RouteDecision::Reader {
+            dir: dir.path().join("reader"),
+            app_id: "1".into(),
+            placement: Placement::Home,
+        },
+        env: DeriveEnv::default(),
+        checkout: CwdAnswer::Sole("acme/widget".into()),
+    });
+    let _ = registry.read_lease_comments(9);
+    let _ = registry.current_labels_via_rest(9);
+    let _ = registry.fetch_claim_labeled_at(9);
+    let seen = seen();
+    for op in [
+        "guard.lease_comments",
+        "guard.issue_labels",
+        "guard.claim_timeline",
+    ] {
+        let mine: Vec<_> = seen.iter().filter(|s| s.op == op).collect();
+        assert!(!mine.is_empty(), "{op} did not run through the facade: {seen:?}");
+        assert!(
+            mine.iter().all(|s| s.route_slug.is_some()),
+            "{op} stayed on the writer: {mine:?}"
+        );
     }
 }

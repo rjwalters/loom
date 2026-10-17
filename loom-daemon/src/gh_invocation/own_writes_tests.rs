@@ -184,3 +184,15 @@ fn a_pin_is_scoped_to_its_repo_unless_the_repo_is_unknown() {
     assert!(written_within("acme/app", 4721, window));
     assert!(written_within("acme/other", 4721, window));
 }
+
+/// The read-your-write pin is bounded: a number this process never wrote is
+/// read on a reader, and a written one only for the window (#12555).
+#[test]
+fn the_any_repo_pin_covers_only_a_written_number_within_the_window() {
+    let window = Duration::from_secs(600);
+    assert!(!written_any_repo_within(4730, window));
+    note(&argv(&["issue", "edit", "4730"]), Some("acme/app"));
+    assert!(written_any_repo_within(4730, window));
+    assert!(!written_any_repo_within(4731, window));
+    assert!(!written_any_repo_within(4730, Duration::ZERO));
+}

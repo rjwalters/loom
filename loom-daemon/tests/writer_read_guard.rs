@@ -25,6 +25,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const BASE: &str = "read-back of the daemon's own write (a reader may lag it)";
+const BOUNDED: &str =
+    "read-back of the daemon's own write, on the writer only for READ_YOUR_WRITE_WINDOW after it";
 const ASKER: &str = "asker-dependent probe (the answer depends on WHO asks)";
 const WRITE: &str = "write-intent call (not a read)";
 const NOPOOL: &str = "host with no reader pool: the writer is the only credential";
@@ -35,7 +37,6 @@ const MERGE: &str = "merge settings hidden from a reader App; the merging writer
 /// to the writer. Only ever remove entries.
 const READ_ON_WRITER: &[(&str, &str)] = &[
     ("branch_update.rs", MERGE),
-    ("claim_reconciliation/gh_call.rs", BASE),
     (
         "cli/duplicate_closed_search.rs",
         "FOLLOW-UP: an untargeted search pinned to the writer; no reader route yet",
@@ -44,7 +45,6 @@ const READ_ON_WRITER: &[(&str, &str)] = &[
     ("cli/pr_lease.rs", BASE),
     ("credential_preflight/pool.rs", ASKER),
     ("forge_bucket_book/probe.rs", ASKER),
-    ("forge_check_claim.rs", BASE),
     ("forge_comment.rs", BASE),
     ("forge_etag_store/deferrable.rs", NOPOOL),
     ("forge_identity.rs", PLUMBING),
@@ -54,12 +54,12 @@ const READ_ON_WRITER: &[(&str, &str)] = &[
     ("forge_repo_facts/installation.rs", ASKER),
     ("forge_rerun.rs", WRITE),
     ("gh_invocation/accounting.rs", PLUMBING),
+    ("gh_invocation/own_writes.rs", BOUNDED),
     ("gh_invocation/reader_route.rs", PLUMBING),
     ("gh_invocation/reader_route_v2.rs", NOPOOL),
     ("merge_group_ci/eligibility.rs", ASKER),
     ("merge_pr/head_sync/fetch.rs", BASE),
     ("observability/ops/ratelimit.rs", ASKER),
-    ("sweep_registry/guards.rs", BASE),
     ("sweep_registry/guards/gh_exec.rs", BASE),
     ("write_scope/probe.rs", ASKER),
 ];

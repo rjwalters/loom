@@ -94,6 +94,40 @@ pub(crate) fn written_within(repo: &str, n: u32, window: Duration) -> bool {
     with(|m| fresh(m, &(Some(repo.to_ascii_lowercase()), n)) || fresh(m, &(None, n)))
 }
 
+/// How long after this process wrote an issue or PR a read of it may still
+/// run on the writer (#12555). The only place the writer serves a read: a
+/// read-back of the daemon's own write, which a reader App or the gateway's
+/// cache could answer from before that write. Past the window the read goes
+/// to a reader like any other, so the writer's budget is bounded to the
+/// writes the daemon actually made rather than every claim check.
+pub(crate) const READ_YOUR_WRITE_WINDOW: Duration = Duration::from_secs(600);
+
+/// Whether this process wrote number `n` of **any** repo within the last
+/// `window`. For a read site that cannot name its repo cheaply: a write to
+/// the same number in another repo pins it too, one extra writer read in the
+/// safe direction.
+#[must_use]
+pub(crate) fn written_any_repo_within(n: u32, window: Duration) -> bool {
+    with(|m| {
+        m.iter()
+            .any(|((_, num), at)| *num == n && at.elapsed() < window)
+    })
+}
+
+impl super::GhInvocation {
+    /// Pin this read to the writer only while it reads back a number this
+    /// process just wrote ([`READ_YOUR_WRITE_WINDOW`]); otherwise it routes
+    /// to a reader (#12555: the writer is never used for reads, #12394).
+    #[must_use]
+    pub(crate) fn writer_after_own_write(self, n: u32) -> Self {
+        if written_any_repo_within(n, READ_YOUR_WRITE_WINDOW) {
+            self.writer_identity()
+        } else {
+            self
+        }
+    }
+}
+
 /// The `(repo, number)` pairs a write argv targets: a `gh api` path
 /// `repos/{o}/{r}/(issues|pulls)/{n}[/…]`, or every numeric-looking argument
 /// of `gh issue|pr <verb> …` that is not the value of a number-free flag.

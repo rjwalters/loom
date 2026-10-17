@@ -94,9 +94,32 @@ impl SweepRegistry {
         self.run_counted(self.gh_inv(op, AccessIntent::Read, &gh).args(args))
     }
 
-    /// [`Self::gh_read`] pinned to the writer: for a read-back of a forge fact
-    /// this daemon just wrote itself (its own label flip, lease, claim), where
-    /// a reader App could still lag the write. Never derives a reader route.
+    /// [`Self::gh_read`] for a read-back of issue `issue` after this daemon
+    /// wrote it (its own label flip, lease, claim): on the writer only while
+    /// that write is fresh ([`GhInvocation::writer_after_own_write`]), where
+    /// a reader App or the gateway cache could still answer from before it.
+    /// Past the window it reads through a reader (#12555).
+    pub(in crate::sweep_registry) fn gh_read_after_own_write<I, S>(
+        &self,
+        op: &'static str,
+        issue: u32,
+        args: I,
+    ) -> std::io::Result<Option<Output>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let gh = self.configured_gh();
+        self.run_counted(
+            self.gh_inv(op, AccessIntent::Read, &gh)
+                .writer_after_own_write(issue)
+                .args(args),
+        )
+    }
+
+    /// [`Self::gh_read`] pinned to the writer **unconditionally**: only for
+    /// the first half of a read-modify-write, where a reader's stale body
+    /// would be written back over a newer one.
     pub(in crate::sweep_registry) fn gh_read_own_write<I, S>(
         &self,
         op: &'static str,

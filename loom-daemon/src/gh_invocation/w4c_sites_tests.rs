@@ -268,6 +268,32 @@ fn the_seam_sheds_a_gate_read_too_and_never_routes_it_to_the_writer() {
     assert_eq!(sheds(), 1);
 }
 
+/// #12555: the same claim-check reads of an issue this daemon has NOT just
+/// written go to a reader, never the writer.
+#[test]
+fn claim_check_reads_of_an_unwritten_issue_route_to_a_reader() {
+    let root = tempfile::tempdir().unwrap();
+    let _g = install(deriving(root.path()));
+    let gh = Path::new("gh");
+    let _ = crate::forge_check_claim::read_claim_labels(gh, root.path(), 8);
+    let _ = crate::forge_check_claim::read_freshest_live_lease(
+        gh,
+        root.path(),
+        8,
+        chrono::Utc::now(),
+        30.0,
+    );
+    let seen = seen();
+    for op in ["claim.labels", "claim.lease_comments"] {
+        let mine: Vec<_> = seen.iter().filter(|s| s.op == op).collect();
+        assert!(!mine.is_empty(), "{op} did not run through the facade: {seen:?}");
+        assert!(
+            mine.iter().all(|s| s.route_slug.is_some()),
+            "{op} stayed on the writer: {mine:?}"
+        );
+    }
+}
+
 /// A routing that would put any derivable read on a reader.
 fn deriving(root: &Path) -> TestRouting {
     TestRouting {
@@ -281,14 +307,18 @@ fn deriving(root: &Path) -> TestRouting {
     }
 }
 
-/// The claim check's reads (its caller may just have written the label or
-/// lease it checks) and `merge_group_ci.read` (`permissions` depend on who
-/// asks) are pinned to the writer: driven through their own helpers with a
-/// reader on offer, none derives a route. The unpinned shapes would.
+/// The claim check's reads of an issue this daemon just wrote (#12555: only
+/// then) and `merge_group_ci.read` (`permissions` depend on who asks) are
+/// pinned to the writer: driven through their own helpers with a reader on
+/// offer, none derives a route. The unpinned shapes would.
 #[test]
 fn claim_check_and_merge_group_reads_never_derive() {
     let root = tempfile::tempdir().unwrap();
     let _g = install(deriving(root.path()));
+    super::own_writes::note(
+        &[std::ffi::OsString::from("issue"), "edit".into(), "7".into()],
+        Some("acme/widget"),
+    );
     let gh = Path::new("gh");
     let _ = crate::forge_check_claim::read_claim_labels(gh, root.path(), 7);
     let _ = crate::forge_check_claim::read_freshest_live_lease(

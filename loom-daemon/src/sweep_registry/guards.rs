@@ -1133,7 +1133,7 @@ impl SweepRegistry {
         // made it answers (a reader may lag the write).
         let mut cmd = self.gh_inv("guard.issue_labels", AccessIntent::Read, &gh);
         cmd = cmd
-            .writer_identity()
+            .writer_after_own_write(issue)
             .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
@@ -1506,12 +1506,13 @@ impl SweepRegistry {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
         // W4-C: verifies this daemon's own just-written lease (and its
-        // callers fail open after a few retries), so the writer reads it.
-        // #12389 keeps it there on purpose: it is the read half of the
+        // callers fail open after a few retries). #12389 pins it to the
+        // writer while the lease write is fresh: it is the read half of the
         // claim-then-verify tie-break, inside the same critical section as
         // the lease write, and a lagging reader would hide the new comment.
+        // #12555: only then — any other lease read goes through a reader.
         let mut cmd = self.gh_inv("guard.lease_comments", AccessIntent::Read, &gh);
-        cmd = cmd.writer_identity().arg("api")
+        cmd = cmd.writer_after_own_write(issue).arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
             .arg("--paginate")
             .arg("--jq")

@@ -147,8 +147,10 @@ fn site_problem(lines: &[&str], n: usize, facade: bool) -> Option<String> {
 /// Every problem in `files` (`(path relative to src/, text)`), given the
 /// allowlist. Pure, so the failure modes are themselves tested.
 fn lint(files: &[(String, String)], uncounted: &[(&str, usize, &str)]) -> Vec<String> {
-    let facade =
-        regex::Regex::new(r"GhInvocation|gh_call::read|gh_inv\(|gh_read(_own_write)?\(").unwrap();
+    let facade = regex::Regex::new(
+        r"GhInvocation|gh_call::read|gh_inv\(|gh_read(_after_own_write|_own_write)?\(",
+    )
+    .unwrap();
     let mut problems = Vec::new();
     for (rel, text) in files {
         let lines = code_lines(text);

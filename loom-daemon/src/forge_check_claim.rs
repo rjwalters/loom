@@ -485,17 +485,17 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
     // cross-owner GH_CONFIG_DIR from `root`. `gh issue view` takes --repo
     // (unlike `gh api`, #8263).
     // W4-C: a claim check reads labels its own caller may just have
-    // written: the writer answers.
-    let inv = crate::claim_reconciliation::gh_call::read("claim.labels", gh_bin, root)
-        .writer_identity()
-        .args([
-            "issue",
-            "view",
-            &issue.to_string(),
-            "--json",
-            "labels,state,url",
-        ])
-        .args(crate::claim_reconciliation::gh_call::loom_repo_flag());
+    // written: the writer answers while that write is fresh, else a reader.
+    let inv =
+        crate::claim_reconciliation::gh_call::read_own_write("claim.labels", gh_bin, root, issue)
+            .args([
+                "issue",
+                "view",
+                &issue.to_string(),
+                "--json",
+                "labels,state,url",
+            ])
+            .args(crate::claim_reconciliation::gh_call::loom_repo_flag());
     let Ok(out) = crate::claim_reconciliation::gh_call::output(inv) else {
         return LabelLeg::Unknown;
     };
@@ -664,15 +664,19 @@ pub(crate) fn read_freshest_live_lease(
     // #5401 GH_CONFIG_DIR and the #8263 `LOOM_REPO` -> GH_REPO env contract.
     let jq = issue_lease_comments_jq();
     // W4-C: the lease being checked may be the caller's own, just written.
-    let inv = crate::claim_reconciliation::gh_call::read("claim.lease_comments", gh_bin, root)
-        .writer_identity()
-        .args([
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"),
-            "--paginate",
-            "--jq",
-            &jq,
-        ]);
+    let inv = crate::claim_reconciliation::gh_call::read_own_write(
+        "claim.lease_comments",
+        gh_bin,
+        root,
+        issue,
+    )
+    .args([
+        "api",
+        &format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"),
+        "--paginate",
+        "--jq",
+        &jq,
+    ]);
     let Ok(out) = crate::claim_reconciliation::gh_call::output(inv) else {
         return LeaseLeg::ReadFailed;
     };
