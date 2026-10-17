@@ -327,6 +327,11 @@ pub struct FloorState {
     /// #11029: consecutive ticks a host below its floor could not resolve a
     /// release to roll to. Reset by any other reading and by a changed basis.
     unresolved_streak: u32,
+    /// #12652: an alerted stall was dropped during this tick, by
+    /// [`Self::set_basis`] or [`Self::observe`]. Read through
+    /// [`Self::was_alerted`] so the loom-ui incident is resolved; cleared at
+    /// the start of the next tick's [`Self::set_basis`].
+    alert_dropped: bool,
 }
 
 /// #11029: consecutive below-floor ticks with no resolvable target before the
@@ -350,6 +355,7 @@ impl FloorState {
     /// #10885: a basis under which a fleet host cannot be compared with its
     /// floor is logged at WARN here, once per change, not once per tick.
     pub fn set_basis(&mut self, knowledge: FloorKnowledge, running: &str) {
+        self.alert_dropped = false;
         if self.knowledge == knowledge && self.running == running {
             return;
         }
@@ -357,10 +363,11 @@ impl FloorState {
         self.running = running.to_string();
         self.unresolved_streak = 0;
         let floor = self.floor().map(str::to_string);
-        self.alert = self
-            .alert
-            .take()
+        let before = self.alert.take();
+        self.alert = before
+            .clone()
             .filter(|a| Some(&a.report.floor) == floor.as_ref() && a.report.running == running);
+        self.alert_dropped |= before.is_some() && self.alert.is_none();
         self.verdict = match &self.alert {
             Some(a) => FloorVerdict::Unsatisfiable(a.report.clone()),
             // Classified from the basis alone until [`Self::observe`] sees
@@ -468,7 +475,7 @@ impl FloorState {
         }
         if self.stall().is_none() {
             // A stall that returns later is a new start.
-            self.alert = None;
+            self.alert_dropped |= self.alert.take().is_some();
         }
         match &self.verdict {
             FloorVerdict::Below { target, .. } => Some(target.clone()),
