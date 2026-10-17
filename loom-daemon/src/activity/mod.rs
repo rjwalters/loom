@@ -58,7 +58,6 @@ pub mod test_parser;
 pub mod transcript_archive;
 pub mod transcript_ingest;
 pub mod transcript_parse;
-pub mod tuning;
 mod usage_report;
 pub mod weekly_point_calibration;
 pub mod weekly_point_history;
@@ -144,14 +143,6 @@ pub use pricing_card::{PricingCard, PricingCardError};
 pub use stats::{
     AgentEffectiveness, CostPerIssue, CostRow, DailyVelocity, EffectivenessRow, StatsQueries,
     StatsSummary, SummaryMetrics, VelocityRow, WeeklyVelocity,
-};
-
-// Re-export tuning types and functions (Issue #1074)
-// These types are used for self-tuning based on effectiveness data
-#[allow(unused_imports)]
-pub use tuning::{
-    create_tuning_schema, EffectivenessSnapshot, ProposalStatus, TunableParameter, TuningConfig,
-    TuningHistory, TuningProposal, TuningSummary,
 };
 
 // Issue claim registry types (Issue #1159)
