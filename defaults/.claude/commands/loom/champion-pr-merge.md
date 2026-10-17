@@ -875,29 +875,38 @@ four-axis judgment below.
 
 **Vetted CI-workflow change (#12677, operator ruling 2026-10-17).** A change
 to a CI workflow is not red on blast radius *because it is a workflow* when
-`ci_workflow_blast_eval` returns `WF_BLAST=green`: every changed or renamed
-workflow file is outside the kept set and names no publish, release, deploy
-or merge step, no workflow patch adds or removes a line matching
-`permissions:`, `id-token`, `secrets\.`, `pull_request_target` or
-`workflow_run`, the PR carries `loom:pr` (criterion #1 has already checked
-that the approval is for this head), and CI is green right now. The rest of
-the PR is still judged on all four axes as usual. `WF_BLAST=red` keeps the
-"CI workflows" entry red, and the rationale names `WF_BLAST_REASON`;
-`WF_BLAST=none` means no workflow file changed. Every failed read is red.
+`ci_workflow_blast_eval` returns `WF_BLAST=green`:
+
+- no changed or renamed workflow file is in the kept set, or has
+  publish, release, deploy or merge in its name (case-insensitive);
+- every workflow file has a non-empty patch, and no added or removed workflow
+  line matches, case-insensitively, the words `permissions`, `secrets`,
+  `publish`, `release`, `deploy` or `merge`, or `id-token`,
+  `pull_request_target`, `workflow_run`, `github.token`, `GITHUB_TOKEN`;
+- the PR carries `loom:pr` (criterion #1 has already checked that the approval
+  is for this head) and CI is green right now, with at least one passing
+  check and none pending, failing or cancelled.
+
+The rest of the PR is still judged on all four axes as usual. `WF_BLAST=red`
+keeps the "CI workflows" entry red, and the rationale names `WF_BLAST_REASON`;
+`WF_BLAST=none` means no workflow file changed. Every failed or incomplete read
+is red.
 
 ```bash
 # ci_workflow_blast_eval: sets WF_BLAST (none|green|red) and WF_BLAST_REASON.
-# Reads PR_NUMBER, LABELS, KEPT_SET_PATTERNS, read_ci_checks; reuses DIFF_JSON
-# when this pass already read it.
+# Reads PR_NUMBER, LABELS, KEPT_SET_PATTERNS, read_ci_checks. Always reads the
+# PR's files afresh and checks the list is complete (count == changed_files).
 ci_workflow_blast_eval() {
-  local WF_FILES f pattern LINES_JSON rx rc
+  local WF_FILES CHANGED_COUNT f lf pattern LINES_JSON rx rc
   WF_BLAST=red
   WF_BLAST_REASON=""
   [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { WF_BLAST_REASON="kept set not loaded"; return 0; }
-  if [ -z "${DIFF_JSON:-}" ]; then
-    standing_auth_fetch_diff || { WF_BLAST_REASON="files API unreadable"; return 0; }
-  fi
-  WF_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[] | .filename, (.previous_filename // empty) | select(startswith(".github/workflows/"))' 2>/dev/null) \
+  standing_auth_fetch_diff || { WF_BLAST_REASON="files API unreadable"; return 0; }
+  CHANGED_COUNT=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.changed_files' 2>/dev/null) \
+    || { WF_BLAST_REASON="changed_files unreadable"; return 0; }
+  printf '%s' "$DIFF_JSON" | jq -e --argjson n "${CHANGED_COUNT:-null}" 'type == "array" and length == $n' >/dev/null 2>&1 \
+    || { WF_BLAST_REASON="files API list incomplete"; return 0; }
+  WF_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[] | .filename, (.previous_filename // empty) | select(ascii_downcase | startswith(".github/workflows/"))' 2>/dev/null) \
     || { WF_BLAST_REASON="files API unreadable"; return 0; }
   if [ -z "$WF_FILES" ]; then
     WF_BLAST=none
@@ -905,36 +914,41 @@ ci_workflow_blast_eval() {
   fi
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    case "$(printf '%s' "${f##*/}" | tr '[:upper:]' '[:lower:]')" in
+    lf=$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')
+    case "${lf##*/}" in
       *publish* | *release* | *deploy* | *merge*)
         WF_BLAST_REASON="$f is a publish/release/deploy/merge workflow"
         return 0
         ;;
     esac
     for pattern in "${KEPT_SET_PATTERNS[@]}"; do
+      # Lowercased: Loom-Champion.yml is as much a kept-set path as champion.yml.
       # shellcheck disable=SC2053
-      if [[ "$f" == $pattern ]]; then
+      if [[ "$f" == $pattern || "$lf" == $pattern ]]; then
         WF_BLAST_REASON="$f is in the kept set ($pattern)"
         return 0
       fi
     done
   done <<<"$WF_FILES"
-  # Every workflow file needs a patch: a binary, oversized or pure-rename entry
-  # cannot be checked for forbidden lines.
+  # Every workflow file needs a non-empty patch: a binary, oversized or
+  # pure-rename entry cannot be checked line by line.
   LINES_JSON=$(printf '%s' "$DIFF_JSON" | jq -c '
-    [.[] | select((.filename | startswith(".github/workflows/")) or ((.previous_filename // "") | startswith(".github/workflows/")))]
-    | if all(.[]; (.patch // null) != null) then [.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]] else error("no patch") end' 2>/dev/null) \
+    [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) or (((.previous_filename // "") | ascii_downcase) | startswith(".github/workflows/")))]
+    | if all(.[]; ((.patch // "") | length) > 0) then [.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]] else error("no patch") end' 2>/dev/null) \
     || { WF_BLAST_REASON="a workflow file has no readable patch"; return 0; }
-  for rx in 'permissions:' 'id-token' 'secrets\.' 'pull_request_target' 'workflow_run'; do
-    printf '%s' "$LINES_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx))' >/dev/null 2>&1
+  for rx in '\bpermissions\b' '\bsecrets\b' 'id-token' 'pull_request_target' 'workflow_run' \
+    'github\.token' 'github_token' '\b(publish|release|deploy|merge)\b'; do
+    printf '%s' "$LINES_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx; "i"))' >/dev/null 2>&1
     rc=$?
     # rc 1 = no such line; 0 = a hit; anything else = an error. Only 1 passes.
     [ "$rc" -eq 1 ] || { WF_BLAST_REASON="a workflow line matches '$rx'"; return 0; }
   done
   echo "$LABELS" | grep -q "loom:pr" || { WF_BLAST_REASON="no loom:pr approval"; return 0; }
   read_ci_checks "$PR_NUMBER"
+  # Green = at least one passing check and nothing pending, failing or
+  # cancelled: a workflow edit that skips every job must not pass on its own CI.
   if [ "$NO_CHECKS" != "false" ] \
-    || [ -n "$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel" or .bucket == "pending") | .name' 2>/dev/null)" ]; then
+    || ! printf '%s\n' "$CHECKS" | jq -e 'any(.[]; .bucket == "pass") and all(.[]; .bucket == "pass" or .bucket == "skipping")' >/dev/null 2>&1; then
     WF_BLAST_REASON="CI is not green"
     return 0
   fi

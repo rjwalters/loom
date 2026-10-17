@@ -49,7 +49,9 @@ entry() {
     fi
 }
 
-# run <api-json-or-FAIL> <ci: green|red|pending|none> <labels>
+# run <api-json-or-FAIL> <ci: green|red|pending|none|skipped> <labels>
+# The stubbed `gh api` answers the files read with <api> and the changed_files
+# read with the length of <api> (COUNT overrides it; FAIL fails that read).
 run() {
     local api="$1" ci="$2" labels="$3"
     # shellcheck disable=SC2034,SC2329  # read by the sourced function
@@ -59,7 +61,13 @@ run() {
         DIFF_JSON=""
         gh() {
             [ "$api" = "FAIL" ] && return 1
-            printf '%s' "$api"
+            case " $* " in
+                *" --jq "*)
+                    [ "${COUNT:-}" = FAIL ] && return 1
+                    printf '%s\n' "${COUNT:-$(printf '%s' "$api" | jq 'length')}"
+                    ;;
+                *) printf '%s' "$api" ;;
+            esac
         }
         read_ci_checks() {
             NO_CHECKS=false
@@ -68,6 +76,8 @@ run() {
                 red) CHECKS='[{"name":"t","bucket":"fail"}]' ;;
                 pending) CHECKS='[{"name":"t","bucket":"pending"}]' ;;
                 none) CHECKS=""; NO_CHECKS=true ;;
+                skipped) CHECKS='[{"name":"t","bucket":"skipping"}]' ;;
+                mixed) CHECKS='[{"name":"t","bucket":"pass"},{"name":"u","bucket":"skipping"}]' ;;
             esac
         }
         # shellcheck disable=SC1090
@@ -91,17 +101,29 @@ assert_eq red "$(run "[$CI_WF]" pending "loom:pr")" "CI pending -> red"
 assert_eq red "$(run "[$CI_WF]" none "loom:pr")" "no checks -> red"
 assert_eq red "$(run "[$CI_WF]" green "loom:review-requested")" "no loom:pr -> red"
 assert_eq red "$(run FAIL green "loom:pr")" "files API unreadable -> red"
+assert_eq red "$(run "[$CI_WF]" skipped "loom:pr")" "every check skipped -> red"
+assert_eq green "$(run "[$CI_WF]" mixed "loom:pr")" "one pass plus skipped checks -> green"
+assert_eq red "$(COUNT=2 run "[$CI_WF]" green "loom:pr")" "files list shorter than changed_files -> red"
+assert_eq red "$(COUNT=FAIL run "[$CI_WF]" green "loom:pr")" "changed_files unreadable -> red"
+assert_eq red "$(run '{"message":"x"}' green "loom:pr")" "non-array files body -> red"
 
 echo "Excluded workflow names"
-for name in release.yml publish-pypi.yml deploy.yaml merge-group-check.yml Release.yml; do
+for name in release.yml publish-pypi.yml deploy.yaml merge-group-check.yml Release.yml sub/release.yml; do
     assert_eq red "$(run "[$(entry ".github/workflows/$name" "$P")]" green "loom:pr")" "$name -> red"
 done
-assert_eq red "$(run "[$(entry .github/workflows/champion.yml "$P")]" green "loom:pr")" "kept-set champion workflow -> red"
+for name in champion.yml Loom-Champion.yml JUDGE.yml guard-check.yml; do
+    assert_eq red "$(run "[$(entry ".github/workflows/$name" "$P")]" green "loom:pr")" "kept-set workflow $name -> red"
+done
+assert_eq red "$(run "[$(entry .GitHub/Workflows/release.yml "$P")]" green "loom:pr")" "mixed-case workflows dir still checked -> red"
 assert_eq red "$(run "[$(entry .github/workflows/ci.yml "$P" .github/workflows/release.yml)]" green "loom:pr")" "renamed out of release.yml -> red"
 
 echo "Forbidden lines"
 # shellcheck disable=SC2016  # literal workflow text
-for line in '  permissions:' '      id-token: write' '  token: ${{ secrets.PAT }}' '  pull_request_target:' '  workflow_run:'; do
+for line in '  permissions:' '      id-token: write' '  token: ${{ secrets.PAT }}' '  pull_request_target:' '  workflow_run:' \
+    '      secrets: inherit' '  token: ${{ secrets["PAT"] }}' '  env: ${{ toJSON(secrets) }}' '  token: ${{ SECRETS.PAT }}' \
+    '  "permissions": {contents: write}' '  permissions : write-all' '      - run: gh pr merge --admin --merge "$PR"' \
+    '      - run: npm publish' '      - run: gh release create v1' '      - run: wrangler deploy' \
+    '        env: {GH_TOKEN: ${{ github.token }}}' '        env: {GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}}'; do
     patch=$(printf '@@ -1 +1,2 @@\n x\n+%s' "$line")
     assert_eq red "$(run "[$(entry .github/workflows/ci.yml "$patch")]" green "loom:pr")" "added '$line' -> red"
 done
@@ -111,6 +133,7 @@ patch=$(printf '@@ -1,2 +1,2 @@\n permissions:\n-  x: 1\n+  x: 2')
 assert_eq green "$(run "[$(entry .github/workflows/ci.yml "$patch")]" green "loom:pr")" "'permissions:' only in context -> green"
 NOPATCH='{"filename":".github/workflows/ci.yml"}'
 assert_eq red "$(run "[$NOPATCH]" green "loom:pr")" "workflow file without a patch -> red"
+assert_eq red "$(run '[{"filename":".github/workflows/ci.yml","patch":""}]' green "loom:pr")" "empty patch string -> red"
 assert_eq green "$(run "[$CI_WF,{\"filename\":\"img.png\"}]" green "loom:pr")" "non-workflow file without a patch does not count"
 
 echo "Doc wiring"
