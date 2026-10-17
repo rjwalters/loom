@@ -2039,6 +2039,63 @@ resync_agent_skills() {
         fi
         sync_one "$src" "$dst" "agents-skills/$rel"
     done < <(find -L "$src_dir" -type f -print0 2>/dev/null | sort -z)
+    retire_agent_skills "$src_dir" "$dst_dir"
+}
+
+# retire_agent_skills: delete-side counterpart of resync_agent_skills() (#12507),
+# matching native stage_skills() (loom-daemon/src/init/payload/surfaces.rs).
+# The walk above only visits skills defaults/ ships today, so an installed
+# `loom-<name>/SKILL.md` whose source was removed would stay discoverable
+# forever. The retired set is derived (installed minus shipped), not listed in
+# .loom-retired.list, because ownership has to be proven by the marker.
+#
+# Removes only a regular-file (non-symlink) SKILL.md that carries
+# $AGENT_SKILL_MARKER, in a `loom-*` dir with no source counterpart and no
+# .loom/resync-ignore pin; then `rmdir`s the dir if now empty (never rm -r).
+# Does nothing unless the source set is valid (at least one marker-carrying
+# loom-*/SKILL.md), so a missing/empty/unreadable source never wipes skills.
+retire_agent_skills() {
+    local src_dir="$1" dst_dir="$2"
+    [[ -d "$src_dir" && -d "$dst_dir" ]] || return 0
+
+    local s valid=0
+    for s in "$src_dir"/loom-*/SKILL.md; do
+        if [[ -f "$s" && -r "$s" ]] && grep -qF "$AGENT_SKILL_MARKER" "$s" 2>/dev/null; then
+            valid=1
+            break
+        fi
+    done
+    [[ "$valid" -eq 1 ]] || return 0
+
+    local d name dst rel
+    for d in "$dst_dir"/loom-*/; do
+        d="${d%/}"
+        [[ -d "$d" && ! -L "$d" ]] || continue
+        name="${d##*/}"
+        [[ -e "$src_dir/$name" || -L "$src_dir/$name" ]] && continue
+        dst="$d/SKILL.md"
+        [[ -f "$dst" && ! -L "$dst" ]] || continue
+        grep -qF "$AGENT_SKILL_MARKER" "$dst" 2>/dev/null || continue
+        rel="agents-skills/$name/SKILL.md"
+        if is_ignored "$rel"; then
+            note "  ${YELLOW}skipped${NC}   $rel ${YELLOW}(pinned in .loom/resync-ignore)${NC}"
+            N_SKIPPED=$((N_SKIPPED + 1))
+            continue
+        fi
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            printf '%b\n' "  ${BOLD}would remove${NC} $rel ${YELLOW}(retired generated skill, #12507)${NC}"
+            N_REMOVED=$((N_REMOVED + 1))
+            continue
+        fi
+        if rm -f "$dst" 2>/dev/null; then
+            printf '%b\n' "  ${GREEN}removed${NC}   $rel ${YELLOW}(retired generated skill, #12507)${NC}"
+            N_REMOVED=$((N_REMOVED + 1))
+            rmdir "$d" 2>/dev/null || true
+        else
+            err "failed to remove retired skill $rel"
+            record_failure "$rel"
+        fi
+    done
 }
 
 # ---------- retired payload files (#5981) ----------
