@@ -6315,6 +6315,16 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
   `floor_not_rolling`) is one of `unsatisfiable`, `no_release`,
   `unsupervised`, `backoff`, `terminal`, `roll_refused`; the human status
   prints `Below the fleet floor, NOT rolling (<reason>)`.
+- **Status shows the host's update state** (#12420, epic #10698): the
+  `Host update:` line (and `auto_update.host` in `status --json`) on every
+  `status`, whether or not the loop runs: `H0` current, `H1` settling, `H2`
+  fetching, `H3` staged, `H4` pausing, `H5` verifying, `H7` stalled, or
+  `unknown`, with the running and on-disk versions, the floor when set, and
+  the target with its source (`floor`, `repo-ahead`, `autoUpdate`, `none`).
+  There is no H6. An unreadable on-disk version is `unknown`, never the
+  running version. The `auto_update.tick` record carries `host_state` and
+  `target_source`. Read-only: it changes no target selection, pause/resume,
+  dispatch hold or resync, and starts no poll, timer or credential read.
 - **An unsupervised host fetches each target once** (#11042). With no
   launchd/systemd supervisor the pause-and-roll refuses to start (H7
   `unsupervised`). The release is installed by that first fetch, and later

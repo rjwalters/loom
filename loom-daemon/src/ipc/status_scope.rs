@@ -287,6 +287,16 @@ pub(super) fn overlay_drain(report: &mut DaemonStatusReport, drain: &DrainState)
     // of the sections that walks the roots, so that list is populated
     // whenever the drain section is served.)
     report.drain_roll = drain_status::roll_status(&snap, report.in_flight.len(), Utc::now());
+    // #12420: a running H4 pause outranks every other host-update state.
+    if report
+        .drain_roll
+        .as_ref()
+        .is_some_and(|r| r.pause.is_some())
+    {
+        if let Some(host) = report.host_update.as_mut() {
+            host.state = crate::auto_update::update_observation::HostState::Pausing;
+        }
+    }
     report.drain_paused_by_day = drain.paused_by_day(Utc::now()); // #8652
     report.drain_note = snap.note;
 }

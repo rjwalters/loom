@@ -1555,6 +1555,11 @@ pub struct DaemonStatusReport {
     /// not below the floor or is rolling. Absent from an older daemon.
     #[serde(default)]
     pub auto_update_floor_not_rolling: Option<crate::auto_update::not_rolling::FloorNotRolling>,
+    /// #12420: the host's update state (H0–H5, H7 or `unknown`) with the
+    /// versions, floor and target it was read from. Read-only; present whether
+    /// or not the update loop runs. Absent from an older daemon.
+    #[serde(default)]
+    pub host_update: Option<crate::auto_update::update_observation::HostUpdateObservation>,
     /// #11042: what `autonomous.autoUpdate.enabled` resolved to. Since #10954
     /// `auto_update_enabled` means "the loop runs", which a fleet host's loop
     /// does for the floor alone; this is the setting beside it. `None` before

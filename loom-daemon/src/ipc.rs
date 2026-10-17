@@ -1297,6 +1297,13 @@ pub fn build_daemon_status_for(
     // process-global the loop publishes to. Default (disabled/never-checked)
     // when the loop was never spawned.
     let au = crate::auto_update::global_status_snapshot();
+    // #12420: H4 is overlaid with the live drain (`overlay_drain`).
+    let host_update = Some(crate::auto_update::update_observation::observe(
+        &au,
+        crate::auto_update::pause_resume::status().as_ref(),
+        false,
+        env!("CARGO_PKG_VERSION"),
+    ));
 
     // Per-repo breakdown + the union of in-flight sweeps across every repo. Each
     // root reads its own registry from the pool (the fallback/default root
@@ -1677,6 +1684,7 @@ pub fn build_daemon_status_for(
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
         auto_update_floor_not_rolling: au.floor_not_rolling, // #11042
+        host_update,
         auto_update_config_enabled: crate::auto_update::loop_mode::current()
             .map(crate::auto_update::loop_mode::LoopMode::config_enabled),
         // Long-running task liveness (#10414): every registered loop's
