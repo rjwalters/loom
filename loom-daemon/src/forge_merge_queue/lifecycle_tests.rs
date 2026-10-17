@@ -785,6 +785,28 @@ fn classify_is_conservative() {
 }
 
 #[test]
+fn classify_matches_github_snake_case_tokens() {
+    assert_eq!(classify(Some("checks_timed_out")), RemovalKind::Timeout);
+    assert_eq!(classify(Some("Checks_Timed_Out")), RemovalKind::Timeout);
+    assert_eq!(classify(Some("  checks_timed_out\n")), RemovalKind::Timeout);
+    assert_eq!(classify(Some("failed_checks")), RemovalKind::CheckFailure);
+    assert_eq!(classify(Some("merge_conflict")), RemovalKind::Conflict);
+    assert_eq!(classify(Some("manual")), RemovalKind::Manual);
+    assert_eq!(classify(Some(" Manual ")), RemovalKind::Manual);
+    assert_eq!(classify(Some("manual removal by octocat")), RemovalKind::Unknown);
+    assert_eq!(classify(Some("some_new_token")), RemovalKind::Unknown);
+}
+
+#[test]
+fn manual_removal_does_not_page_the_operator() {
+    let r = super::removal::route(RemovalKind::Manual);
+    assert!(r.add.is_empty() && r.remove.is_empty());
+    assert_eq!(RemovalKind::Manual.as_str(), "manual");
+    assert!(super::removal::drop_prose(RemovalKind::Manual, Some("manual"), None)
+        .contains("**manual**"));
+}
+
+#[test]
 fn markers_for_other_prs_are_ignored_and_newest_wins() {
     let b = vec![
         super::grants::grant_body(8, SHA1, 1, "2026-10-06T10:00:00Z"),
