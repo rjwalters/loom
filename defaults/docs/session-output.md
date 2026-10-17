@@ -423,8 +423,8 @@ stubbed here.
 ## Rollout
 
 - **Required version**: the first release containing the #9764 merge. `main`
-  bumps `VERSION` on nearly every merge and releases are cut at fleet-rollable
-  boundaries ([`release-cadence.md`](release-cadence.md)), so rather than pin a
+  bumps `VERSION` on nearly every merge and releases are cut from green `main` commits
+  ([`release-cadence.md`](release-cadence.md)), so rather than pin a
   number that would already be wrong by the time it shipped, confirm the
   capability on the host you are rolling out to. With `liveOutput.enabled` set,
   a daemon that carries this kind logs exactly one line at startup:
