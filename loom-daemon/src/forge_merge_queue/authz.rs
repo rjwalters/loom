@@ -324,7 +324,7 @@ pub enum HandoffError {
 /// `statuses` receives the `success` for [`REQUIRED_CHECK_CONTEXT`] on
 /// `approved_sha` (the head the grant is pinned to) between the grant and the
 /// enqueue, and a best-effort `failure` on every path that rolls the grant
-/// back afterwards.
+/// back after a successful enqueue (`pending` when the enqueue itself failed).
 ///
 /// # Errors
 ///
@@ -363,7 +363,7 @@ pub fn authorize_and_enqueue(
             // Roll the grant back; a failed rollback is surfaced by the next
             // check, which still re-reads live facts.
             let _ = store.revoke(pr);
-            withdraw_head_status(statuses, pr, approved_sha);
+            clear_head_status(statuses, pr, approved_sha);
             return Err(HandoffError::Enqueue(e));
         }
     };
@@ -388,6 +388,17 @@ pub(super) fn withdraw_head_status(statuses: &dyn StatusApi, pr: u32, head: &str
     let desc = format!("authorization for #{pr} revoked");
     if let Err(e) = statuses.post_status(head, StatusState::Failure, &desc) {
         log::warn!("merge-queue: could not withdraw the head status for #{pr}: {e}");
+    }
+}
+
+/// Best-effort `pending` on the PR head after the enqueue itself failed. The
+/// grant is already revoked, so the merge-group check still denies; but unlike
+/// [`withdraw_head_status`] this leaves no `failure` for the verdict gate to
+/// read as red CI, so re-approving the same head is not routed to Doctor.
+pub(super) fn clear_head_status(statuses: &dyn StatusApi, pr: u32, head: &str) {
+    let desc = format!("authorization for #{pr} pending re-handoff");
+    if let Err(e) = statuses.post_status(head, StatusState::Pending, &desc) {
+        log::warn!("merge-queue: could not clear the head status for #{pr}: {e}");
     }
 }
 
