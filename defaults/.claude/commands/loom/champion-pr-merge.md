@@ -498,16 +498,25 @@ behavior is byte-for-byte unchanged from before #6850.
   the matcher also disqualifies any PR touching a path of the kept set,
   whatever the class says and with or without `coversCriticalFiles`: kept-set
   items 1 and 2 of criterion #2 (irreversible migrations; the merge gate
-  itself — the Champion and Judge prompts, `merge-pr.sh` and its daemon port
-  (`merge_pr*`), every verdict writer/invalidator (`*verdict*`,
-  `claim_reconciliation`), comment trust (`comment_trust*`,
-  `trusted_comments`, `forge_identity_cmd`), and `.loom/config.json` /
+  itself — every Champion and Judge prompt copy and workflow (`*champion*`,
+  `*judge*`), including the sticky-hold logic and its janitor
+  (`champion_hold*`), `merge-pr.sh` and its daemon port (`merge_pr*`), every
+  verdict writer/invalidator (`*verdict*`, `claim_reconciliation`), comment
+  trust (`comment_trust*`, `trusted_comments`), and `.loom/config.json` /
   `defaults/config.json`, which declare the classes) and the remaining red
-  entries (credential/token selection, guard hooks and their wiring,
-  installers/updaters that rewrite installed files on roll,
-  worktree/branch deletion, `.github/labels.yml`). The list is
+  entries (credential/token selection: `*forge_identity*`, `*credential*`,
+  `*tokens*`; guard hooks and their wiring: `*guard*`, `.githooks/*`;
+  installers/updaters that rewrite installed files on roll: `*install.sh`,
+  `*install-loom.sh`, `*resync-installed.sh`,
+  `*auto_update*`, `*daemon_update*`, `*install_binary*`, `*land-resync*`;
+  worktree/branch deletion: `*worktree*`, `*cleanup-branches*`; the label
+  schema and its migrations: `*labels.yml`, `*labels.json`,
+  `*labels_migrate*`). The floor is a **denylist and errs broad**: the
+  patterns are substrings rather than exact paths, so a new file in one of
+  these areas is kept without a list edit, and a path matched by accident only
+  keeps today's hold, which is the safe outcome. The list is
   `KEPT_SET_PATTERNS` in the block below; it is hardcoded, so an operator
-  config cannot widen it. It is matched against both the `filename` and the
+  config cannot narrow it. It is matched against both the `filename` and the
   `previous_filename` of every changed file, so a rename out of a kept-set
   path is caught too. Criterion #2's standing-authorization behavior for
   existing classes (including the `guard-hooks` example above) is unchanged.
@@ -536,25 +545,32 @@ CONFIG_FILE=".loom/config.json"
 # #3 for, with or without `coversCriticalFiles` -- the merge gate itself,
 # guard hooks, credential/token selection, installers/updaters, worktree and
 # branch deletion, label-schema migrations. Hardcoded on purpose: an operator
-# config cannot widen it. Applied in "critical" mode only, so criterion #2's
+# config cannot narrow it. It is a denylist, so it errs broad: an
+# over-matched path only keeps today's hold. Applied in "critical" mode only, so criterion #2's
 # behavior for existing classes is unchanged.
 KEPT_SET_PATTERNS=(
-  # The merge gate itself (kept-set item 2): prompts, scripts, daemon modules.
-  "*champion-pr-merge.md" "*champion-critical-file-hold.md"
-  "*commands/loom/champion*" "*commands/loom/judge*" "*roles/judge.md"
-  "*merge-pr.sh" "*merge_pr*" "*post-verdict.sh" "*verdict*"
-  "*check-review-feedback.sh" "*comment_trust*" "*trusted_comments*"
-  "*forge_identity_cmd*" "*claim_reconciliation*" "*reconcile_pr_verdicts*"
+  # The merge gate itself (kept-set item 2): every Champion and Judge prompt
+  # copy (commands, roles, agents, skills, workflows), the sticky hold and its
+  # janitor (champion_hold*), the Judge backstop and fallback guard,
+  # merge-pr.sh and its daemon port, every verdict writer/invalidator, comment
+  # trust.
+  "*champion*" "*judge*"
+  "*merge-pr.sh" "*merge_pr*" "*verdict*" "*check-review-feedback.sh"
+  "*comment_trust*" "*trusted_comments*" "*claim_reconciliation*"
   "*version_only_diff*" "*version-only-diff*"
   # The config that declares the classes: a PR must not widen its own class.
   "*.loom/config.json" "*defaults/config.json"
-  # Guard hooks and their wiring, token selection.
-  "*/hooks/guard-*" "*hook-wiring*" "*installed-file-guard*"
-  "*.claude/settings.json" "*spawn-claude.sh" "*spawn-worker.sh"
-  "*/tokens/*" "*github-app-token*" "*token-precedence*"
-  # Installers/updaters, worktree and branch deletion, label schema, migrations.
+  # Credential and token selection.
+  "*forge_identity*" "*credential*" "*tokens*" "*github-app-token*"
+  "*token-precedence*" "*spawn-claude.sh" "*spawn-worker.sh"
+  # Guard hooks and their wiring (hook scripts, daemon wiring checks, git hooks).
+  "*guard*" "*hook-wiring*" ".githooks/*" "*.claude/settings.json"
+  # Installers and updaters that rewrite installed files on roll.
   "*install-loom.sh" "*install.sh" "*resync-installed.sh" "*auto_update*"
-  "*worktree.sh" "*loom-clean*" ".github/labels.yml"
+  "*daemon_update*" "*daemon-update*" "*install_binary*" "*land-resync*"
+  # Worktree and branch deletion, label schema and its migrations, migrations.
+  "*worktree*" "*loom-clean*" "*cleanup-branches*"
+  "*labels.yml" "*labels.json" "*labels_migrate*"
   "*migrations/*" "*_migration.py"
 )
 

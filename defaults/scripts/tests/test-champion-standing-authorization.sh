@@ -261,6 +261,12 @@ run_eval() {
         }
         # shellcheck disable=SC1090
         source "$EVAL_SRC"
+        if [ -n "${FETCH_FAILS_AFTER_FILL:-}" ]; then
+            # The read fills DIFF_JSON and still reports failure: only the
+            # caller's own status check can reject it.
+            eval "orig_$(declare -f standing_auth_fetch_diff)"
+            standing_auth_fetch_diff() { orig_standing_auth_fetch_diff; return 1; }
+        fi
         standing_auth_eval "$mode" "$files"
         echo "$STANDING_AUTH_RESULT:$STANDING_AUTH_ID"
     )
@@ -284,6 +290,9 @@ stub_gh() {
     [ "$is_files" -eq 1 ] || return 1
     [ -n "$STUB_API" ] || return 1
     if [ "$is_jq" -eq 1 ]; then printf '%s' "$STUB_API" | jq -r '.[].filename'; else printf '%s\n' "$STUB_API"; fi
+    # STUB_FILES_RC=1: the files read prints what it got, then fails (a
+    # --paginate run that dies after some pages). The output looks complete.
+    [ "${STUB_FILES_RC:-0}" -eq 0 ] || return "$STUB_FILES_RC"
 }
 
 CI_CLASS='{"champion":{"standingAuthorizations":[{"id":"ci-steps","filePatterns":[".github/workflows/*.yml"],"conditions":["judgeApproval","greenCi"],"coversCriticalFiles":true,"excludeFilePatterns":[".github/workflows/*publish*"],"forbiddenDiffPatterns":["^\\s*permissions:","secrets\\."]}]}}'
@@ -310,6 +319,42 @@ assert_eq "NOT ELIGIBLE:" "$out" "a changed file with no patch (unreadable diff)
 
 out="$(run_eval critical "$CI_CLASS" "$WF" "" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a failed files-API read fails closed"
+
+# The read-failure path itself, not only the count check behind it: the files
+# read prints a body that is complete and consistent (the count and set checks
+# would both pass on it) and then exits nonzero. Only honouring the read's own
+# status rejects it.
+out="$(STUB_FILES_RC=1 run_eval critical "$CI_CLASS" "$WF" "$OKPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a files-API read that exits nonzero after printing a complete-looking body fails closed"
+
+out="$(STUB_FILES_RC=0 run_eval critical "$CI_CLASS" "$WF" "$OKPATCH" green "loom:pr")"
+assert_eq "ELIGIBLE:ci-steps" "$out" "negative control: the same body with a zero exit passes"
+
+# The caller honours the read's status: a fetch that fills DIFF_JSON with a
+# complete, consistent body but returns nonzero still disqualifies. (Without
+# this, the call-site check is masked by the count check, because the shipped
+# fetch leaves DIFF_JSON empty on failure.)
+out="$(FETCH_FAILS_AFTER_FILL=1 run_eval critical "$CI_CLASS" "$WF" "$OKPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "criterion #3 rejects a failed files read even when DIFF_JSON was filled"
+
+# standing_auth_fetch_diff directly: a failed read returns nonzero, whether or
+# not the read printed anything.
+fetch_rc() {
+    # shellcheck disable=SC2034  # consumed by the sourced standing_auth_fetch_diff
+    (
+        PR_NUMBER=1
+        STUB_API="$1"
+        STUB_FILES_RC="$2"
+        gh() { stub_gh "$@"; }
+        # shellcheck disable=SC1090
+        source "$EVAL_SRC"
+        standing_auth_fetch_diff
+        echo "rc=$?"
+    )
+}
+assert_eq "rc=1" "$(fetch_rc "" 0)" "standing_auth_fetch_diff: a read that fails with no output returns nonzero"
+assert_eq "rc=1" "$(fetch_rc "$OKPATCH" 1)" "standing_auth_fetch_diff: a read that fails after printing a page returns nonzero"
+assert_eq "rc=0" "$(fetch_rc "$OKPATCH" 0)" "standing_auth_fetch_diff: negative control, a clean read returns zero"
 
 out="$(API_COUNT=FAIL run_eval critical "$CI_CLASS" "$WF" "$OKPATCH" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a failed changed_files read fails closed"
@@ -359,8 +404,8 @@ RENAME_FROM_KEPT='[{"filename":".github/workflows/x.yml","previous_filename":".g
 out="$(run_eval critical "$CI_CLASS" ".github/workflows/x.yml" "$RENAME_FROM_KEPT" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a pure rename out of a kept-set path is caught via previous_filename"
 
-RENAME_FROM_HOOK='[{"filename":"docs/guard.md","previous_filename":"defaults/hooks/guard-destructive.sh","status":"renamed"}]'
-out="$(run_eval critical "$ALL_CFG" "docs/guard.md" "$RENAME_FROM_HOOK" green "loom:pr")"
+RENAME_FROM_HOOK='[{"filename":"docs/notes.md","previous_filename":"defaults/hooks/guard-destructive.sh","status":"renamed"}]'
+out="$(run_eval critical "$ALL_CFG" "docs/notes.md" "$RENAME_FROM_HOOK" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a rename of a guard hook to a harmless path is caught even with no forbiddenDiffPatterns"
 
 RENAME_FROM_OUTSIDE='[{"filename":".github/workflows/ci.yml","previous_filename":"src/ci.yml","status":"renamed"}]'
@@ -411,6 +456,72 @@ for kept in defaults/hooks/guard-x.sh defaults/scripts/merge-pr.sh defaults/scri
     defaults/scripts/post-verdict.sh defaults/scripts/verdict-staleness-guard.sh; do
     out="$(run_eval critical "$ALL_CFG" "$kept" AUTO green "loom:pr")"
     assert_eq "NOT ELIGIBLE:" "$out" "kept-set path $kept is never waived, even by a class matching everything"
+done
+
+echo
+echo "--- #12528: every real path the review named is in the kept set ---"
+
+# Real, current paths in each area the kept set must hold (sticky hold, every
+# Champion/Judge prompt copy and workflow, updater, token and credential
+# selection, guard wiring, label schema, worktree and branch deletion). Each is
+# checked twice: against KEPT_SET_PATTERNS directly, and through the shipped
+# evaluator with a class that matches everything.
+KEPT_REAL_PATHS=(
+    loom-daemon/src/champion_hold.rs loom-daemon/src/champion_hold/classify.rs
+    loom-daemon/src/cli/champion_hold_cmd.rs
+    defaults/roles/champion.md defaults/roles/champion.json defaults/roles/judge.md
+    defaults/roles/judge.json defaults/roles/judge-reference.md defaults/roles/judge-ci-red.md
+    defaults/.claude/agents/loom-champion.md defaults/.claude/agents/loom-judge.md
+    defaults/.agents/skills/loom-champion/SKILL.md defaults/.agents/skills/loom-judge/SKILL.md
+    defaults/.agents/skills/loom-judge-ci-red/SKILL.md defaults/.agents/skills/loom-judge-reference/SKILL.md
+    loom-daemon/src/judge_backstop.rs defaults/scripts/judge-fallback-guard.sh
+    .github/workflows/loom-champion.yml .github/workflows/loom-judge.yml
+    loom-daemon/src/daemon_update/mod.rs loom-daemon/src/daemon_update/provision/txn.rs
+    loom-daemon/src/cli/daemon_update.rs defaults/scripts/cli/loom-daemon-update.sh
+    loom-daemon/src/cli/install_binary.rs defaults/scripts/land-resync-commit.sh
+    loom-daemon/src/forge_identity.rs loom-daemon/src/forge_identity/route.rs
+    loom-daemon/src/forge_identity/served.rs loom-daemon/src/forge_identity/sidecar.rs
+    loom-daemon/src/cli/tokens.rs loom-daemon/src/cli/tokens/select_cmd.rs
+    loom-daemon/src/credential_preflight.rs loom-daemon/src/credential_preflight/pool.rs
+    defaults/scripts/probe-tokens.sh
+    loom-daemon/src/guard_wiring.rs loom-daemon/src/cli/check_guard_wiring.rs
+    loom-daemon/src/mcp_tool_guard.rs defaults/scripts/check-guards-installed.sh
+    .githooks/pre-commit .githooks/pre-push
+    .github/labels.yml defaults/.github/labels.yml defaults/labels.json
+    loom-daemon/src/cli/labels_migrate.rs loom-daemon/src/cli/labels_migrate_holds.rs
+    loom-daemon/src/cli/worktree_remove.rs defaults/scripts/cleanup-branches.sh
+    loom-daemon/src/claim_reconciliation.rs
+)
+
+kept_set_hit() {
+    (
+        # shellcheck disable=SC1090
+        source "$EVAL_SRC"
+        local pattern
+        for pattern in "${KEPT_SET_PATTERNS[@]}"; do
+            # shellcheck disable=SC2053
+            if [[ "$1" == $pattern ]]; then echo KEPT; exit 0; fi
+        done
+        echo "NOT KEPT"
+    )
+}
+
+# In this source repo, the list must name files that exist, so it cannot rot
+# into a list of paths nobody ships. (An installed copy has no loom-daemon/.)
+SRC_ROOT="$(cd "$SCRIPTS_DIR/../.." && pwd)"
+for kept in "${KEPT_REAL_PATHS[@]}"; do
+    if [[ -d "$SRC_ROOT/loom-daemon/src" ]]; then
+        if [[ -e "$SRC_ROOT/$kept" ]]; then r=EXISTS; else r="missing: $kept"; fi
+        assert_eq "EXISTS" "$r" "real path $kept exists in this checkout"
+    fi
+    assert_eq "KEPT" "$(kept_set_hit "$kept")" "KEPT_SET_PATTERNS matches $kept"
+    out="$(run_eval critical "$ALL_CFG" "$kept" AUTO green "loom:pr")"
+    assert_eq "NOT ELIGIBLE:" "$out" "kept-set path $kept is never waived by a class matching everything"
+done
+
+# The floor errs broad, but harmless paths still pass (negative controls).
+for harmless in docs/note.md README.md defaults/scripts/lib/assert.sh loom-daemon/src/main.rs; do
+    assert_eq "NOT KEPT" "$(kept_set_hit "$harmless")" "harmless path $harmless is not in the kept set"
 done
 
 out="$(run_eval any "$ALL_CFG" "defaults/hooks/guard-x.sh" "" green "loom:pr")"
