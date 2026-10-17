@@ -1002,3 +1002,19 @@ fn a_ci_pending_noop_line_releases_as_ci_wait() {
     assert_eq!(rel(&line("verdict", "approved")), "verdict");
     assert_eq!(rel(&line("failed", "ci_pending")), "failed");
 }
+
+/// #12551: a Champion `held` (merge-risk, critical-file or `loom:blocked`
+/// hold) stays on the ladder, while `requeued` (CI still running) is the
+/// `ci_wait` the captain holds flat. `a_champion_steps_release_class_is_its_champion_line_folded`
+/// pins the release tokens.
+#[test]
+fn a_champion_held_climbs_the_ladder_but_requeued_does_not() {
+    use crate::step_dispatch::outcome_ledger::{champion_outcome, effect_of, Effect, LedgerConfig};
+    let cfg = LedgerConfig::default();
+    let ran = std::time::Duration::from_secs(60);
+    let effect = |w: &str| {
+        effect_of(StepRole::ChampionMerge, &champion_outcome(true, w).unwrap(), ran, &cfg)
+    };
+    assert!(matches!(effect("held"), Effect::ForgeLadder));
+    assert!(!matches!(effect("requeued"), Effect::ForgeLadder));
+}
