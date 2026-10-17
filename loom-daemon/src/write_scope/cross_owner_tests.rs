@@ -221,6 +221,32 @@ fn the_ladder_write_on_a_cross_owner_repo_runs_and_is_vetted_under_the_item_owne
     }
 }
 
+/// #12621: the spawn-time refusal's ledger write (`step_end::record_refusal`)
+/// targets the work item's repo, so a checkout registered only under its repo
+/// owner writes under that owner's writer, not the process credential.
+#[test]
+#[serial_test::serial]
+fn the_refusal_ledger_write_targets_the_item_repo_and_runs_under_the_owners_writer() {
+    for register_root in [true, false] {
+        let h = TwoOwners::new(register_root, true);
+        let _repo = EnvGuard::set(&[("LOOM_REPO", Some(std::ffi::OsStr::new(&h.repo_b)))]);
+        let reg = crate::sweep_registry::SweepRegistry::new(
+            crate::sweep_registry::SweepRegistryConfig::new(h.root_b.clone()),
+        );
+        let mut forge = crate::step_dispatch::step_end::refusal_forge(&reg, &h.root_b);
+        let rec = reeval_ladder::record(&mut forge, 7, StepRole::ChampionMerge, chrono::Utc::now());
+        assert!(rec.is_ok(), "register_root={register_root}: {rec:?}");
+
+        let calls = h.calls();
+        let b = TwoOwners::dir(&h.b_cfg);
+        assert!(calls.iter().any(|(_, a)| a.contains("PATCH")), "the write was sent: {calls:?}");
+        assert!(
+            calls.iter().all(|(dir, _)| dir == &b),
+            "nothing ran under the process credential: {calls:?}"
+        );
+    }
+}
+
 /// The gate's own decision names the credential it probed: B's writer for
 /// B's checkout, whether the checkout or only B's owner slug is registered.
 #[test]
