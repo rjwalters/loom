@@ -4,9 +4,24 @@ Operator direction, 2026-10-17. This document defines the intended support
 contract for three operating modes. It does not claim that every current
 installer or helper already satisfies that contract; known gaps are below.
 
-The modes differ in who drives the work and which infrastructure is required.
+The operator defines the three modes by two questions: is there a daemon, and
+is there an operator directing the work?
+
+| Mode | Daemon | Operator |
+| --- | --- | --- |
+| 1. Fleet | Yes | No |
+| 2. Local daemon | Yes | Yes |
+| 3. Operator-directed sessions | No | Yes |
+
+Here, "operator" means an operator participating in the work, not whether the
+installation has a human owner. Fleet operation remains operator-governed but
+does not depend on an attending operator. In local daemon mode the operator
+directs the work engine, which can run tasks independently between interactions.
+The mode is a configured operating model, not a presence detector that changes
+when the operator steps away.
+
 Sweeps and individual roles are work units available within these modes, not
-additional deployment modes.
+additional deployment modes. Their infrastructure requirements follow:
 
 | | Fleet | Local daemon | Operator-directed sessions |
 | --- | --- | --- | --- |
@@ -44,8 +59,8 @@ local orchestration and potentially a local/private Gitea instance.
 The daemon and its agents may use the user's configured GitHub account directly.
 Gitea deployments use their configured Gitea credentials. Neither requires a
 captain, fleet GitOps repository, Cloudflare proxy, GitHub token pool or fleet
-telemetry service. A locally unattended daemon is still this mode; unattended
-execution alone does not make it a fleet worker.
+telemetry service. The local operator can let daemon tasks run independently;
+that does not enroll the machine in the fleet or change its configured mode.
 
 Self-contained means independent of fleet services, not a promise of air-gapped
 execution. The chosen forge and model runtime determine the actual network
