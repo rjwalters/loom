@@ -373,7 +373,7 @@ if [[ "$VERDICT" == "approved" && "${GATE_SKIPPED:-false}" != "true" ]]; then
     RECONCILIATION_MARKER="<!-- loom:review-reconciliation state=$GATE_STATE_TOKEN reviews=${GATE_REVIEWS:-0} blocking_current=${GATE_BLOCK_CURRENT:-0} blocking_older=${GATE_BLOCK_OLDER:-0} inline_unresolved=${GATE_INLINE_UNRESOLVED:-0} source=${GATE_SOURCE:-none} reconciled=yes -->"
     RECONCILIATION_NOTE="---
 
-**Formal review reconciliation (#7647)** — \`check-review-feedback.sh\` reported **$GATE_STATE**: ${GATE_REVIEWS:-0} formal review(s), ${GATE_BLOCK_CURRENT:-0} outstanding at this head, ${GATE_BLOCK_OLDER:-0} at an older head, ${GATE_INLINE_UNRESOLVED:-0} unresolved inline thread(s) (resolution source: ${GATE_SOURCE:-none}).
+**Formal review reconciliation (#7647)** — \`check-review-feedback.sh\` reported **$GATE_STATE**: ${GATE_REVIEWS:-0} formal review(s) and comment verdict(s), ${GATE_BLOCK_CURRENT:-0} outstanding at this head, ${GATE_BLOCK_OLDER:-0} at an older head, ${GATE_INLINE_UNRESOLVED:-0} unresolved inline thread(s) (resolution source: ${GATE_SOURCE:-none}).
 
 $RECONCILED"
   fi

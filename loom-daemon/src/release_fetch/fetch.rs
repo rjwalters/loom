@@ -244,6 +244,9 @@ pub fn download(
     let mut inv = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, DOWNLOAD_TIMEOUT)
         .forge_op(crate::forge_call_stats::ops::RELEASE_RESOLVE_AND_FETCH)
         .current_dir(repo_root)
+        // Reader-only (#12394, #12584): `release` argv is not one the facade
+        // derives a repo from, so the reader route names it.
+        .reader_repo(repo_slug)
         .args(["release", "download", tag, "-R", repo_slug]);
     for p in patterns {
         inv = inv.args(["-p", p]);

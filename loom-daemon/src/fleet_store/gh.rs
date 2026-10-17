@@ -1,23 +1,29 @@
 //! The production [`Transport`]: `gh api --include`, under the daemon's own
 //! forge credentials.
 //!
-//! No new credential is introduced. For a store owned by `OWNER`, requests
-//! run under, in order:
+//! No new credential is introduced. For a store owned by `OWNER`:
 //!
-//! 1. **A reader App** — when the workspace's roster (`forge.identities`,
-//!    [`crate::forge_identity`]) has readers and the daemon has published a
-//!    fresh reader token for `OWNER` ([`crate::forge_identity::read_credential_in`]).
-//!    A store read is a read, so it goes to a reader first, exactly like the
-//!    daemon's own listings.
-//! 2. **The writer App** (`forge.githubApp`) — an installation token for the
-//!    store minted through the workspace's `github-app-token.sh`
-//!    ([`crate::credential_preflight::RealGithubAppMinter`], which reuses its
-//!    own on-disk token cache) and published to the same per-owner
-//!    `GH_CONFIG_DIR` the daemon uses for cross-owner repos
-//!    ([`crate::credential_preflight::github_app_gh_config_dir_for_owner`]).
-//!    Used when no reader is usable, or after a reader's credential failure.
-//! 3. **Ambient `gh` auth** — when no GitHub App is configured at all (a
-//!    standalone install), the same fallback every daemon `gh` call has.
+//! - **Reads run on a reader App, never the writer** (operator ruling #12394,
+//!   #12584) — the reader the workspace's roster (`forge.identities`,
+//!   [`crate::forge_identity`]) routes `OWNER/REPO` to
+//!   ([`crate::forge_identity::read_credential_in`]). A rate limit or a
+//!   refused token withdraws that reader ([`crate::forge_identity::withdraw_after`])
+//!   and the next one serves the read; with none left the read fails as
+//!   **shed** and the caller keeps its last copy. A `404` from a reader that
+//!   can see the repository (it served the repository recently, or answers
+//!   `GET repos/OWNER/REPO`) is the item's own answer — "this ref does not
+//!   exist" — not a coverage gap (#10718's concern).
+//! - **On a host with no reader pool at all** the writer is the only
+//!   credential there is, and reads use it: the writer App (`forge.githubApp`)
+//!   installation token for the store, minted through the workspace's
+//!   `github-app-token.sh` ([`crate::credential_preflight::RealGithubAppMinter`],
+//!   which reuses its own on-disk token cache) and published to the same
+//!   per-owner `GH_CONFIG_DIR` the daemon uses for cross-owner repos
+//!   ([`crate::credential_preflight::github_app_gh_config_dir_for_owner`]),
+//!   else **ambient `gh` auth** when no GitHub App is configured at all (a
+//!   standalone install). That is the one place this file pins the writer on
+//!   a read (`tests/writer_read_guard.rs`).
+//! - **Writes** always run on the writer.
 //!
 //! Every call runs through [`crate::gh_invocation::GhInvocation`] (#10089),
 //! which records it in [`crate::forge_call_stats`] under `fleet_store` /
@@ -35,11 +41,21 @@ use serde_json::Value;
 use super::fetch::{Reply, Transport};
 use crate::credential_preflight::{self as cp, GithubAppMinter, GithubAppOutcome};
 use crate::forge_call_stats::{ops, ForgeOp};
+use crate::forge_identity::{served, Failure, IdentityRole};
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
 
 /// Deadline for one store request (#10089: they were unbounded).
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Readers one read may try before it is shed.
+const MAX_READERS_TRIED: usize = 8;
+
+/// The next usable reader for the transport's repo: `(GH_CONFIG_DIR, app id)`.
+type NextReader = dyn Fn() -> Option<(PathBuf, String)>;
+
+/// `(app id, owner/repo, failure, why)` → withdraw that reader.
+type WithdrawReader = dyn Fn(&str, &str, Failure, &str);
 
 /// Which credential a request ran under, for messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,9 +88,14 @@ pub struct GhTransport {
     gh_bin: String,
     workspace_root: PathBuf,
     repo: String,
-    reader: Option<Credential>,
+    /// The workspace has a reader pool (#12584): its reads never run on the
+    /// writer.
+    pooled: bool,
+    /// The reader the next read runs on.
+    reader: RefCell<Option<(PathBuf, String)>>,
+    next_reader: Box<NextReader>,
+    withdraw: Box<WithdrawReader>,
     writer: RefCell<Option<Credential>>,
-    reader_failed: RefCell<bool>,
     last_used: RefCell<Option<Credential>>,
 }
 
@@ -83,26 +104,57 @@ impl GhTransport {
     /// for the daemon workspace at `workspace_root`.
     #[must_use]
     pub fn new(workspace_root: &Path, repo: &str) -> Self {
-        let roster = crate::forge_identity::resolve(workspace_root);
-        let reader = crate::forge_identity::read_credential_in(
+        let pooled = !crate::forge_identity::resolve(workspace_root)
+            .readers
+            .is_empty();
+        let (root, nwo) = (workspace_root.to_path_buf(), repo.to_string());
+        let next_reader = move || {
+            let roster = crate::forge_identity::resolve(&root);
+            crate::forge_identity::read_credential_in(&root, &roster, &nwo, SystemTime::now())
+        };
+        Self::with_readers(
             workspace_root,
-            &roster,
             repo,
-            SystemTime::now(),
+            pooled,
+            Box::new(next_reader),
+            Box::new(crate::forge_identity::withdraw_after),
         )
-        .map(|(dir, app_id)| Credential::ConfigDir {
-            dir,
-            label: format!("reader app {app_id}"),
-        });
+    }
+
+    /// [`GhTransport::new`] with the reader pool injected: whether there is
+    /// one (`pooled`), the reader lookup, and the withdrawal.
+    fn with_readers(
+        workspace_root: &Path,
+        repo: &str,
+        pooled: bool,
+        next_reader: Box<NextReader>,
+        withdraw: Box<WithdrawReader>,
+    ) -> Self {
+        let reader = if pooled { next_reader() } else { None };
         Self {
             gh_bin: std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string()),
             workspace_root: workspace_root.to_path_buf(),
             repo: repo.to_string(),
-            reader,
+            pooled,
+            reader: RefCell::new(reader),
+            next_reader,
+            withdraw,
             writer: RefCell::new(None),
-            reader_failed: RefCell::new(false),
             last_used: RefCell::new(None),
         }
+    }
+
+    /// A transport whose reader pool is a test's (see
+    /// [`GhTransport::with_readers`]).
+    #[cfg(test)]
+    pub(crate) fn with_test_readers(
+        workspace_root: &Path,
+        repo: &str,
+        pooled: bool,
+        next_reader: Box<NextReader>,
+        withdraw: Box<WithdrawReader>,
+    ) -> Self {
+        Self::with_readers(workspace_root, repo, pooled, next_reader, withdraw)
     }
 
     /// The credential the most recent request ran under.
@@ -120,16 +172,29 @@ impl GhTransport {
         c
     }
 
+    /// One GET under `cred`: a reader's (`reader_app` = its app id), else
+    /// the writer's — which only a host with no reader pool reaches.
     fn run(
         &self,
         cred: &Credential,
+        reader_app: Option<&str>,
         api_path: &str,
         accept: Option<&str>,
         etag: Option<&str>,
     ) -> Result<(Option<crate::forge_listing::HttpResponse>, String, bool)> {
-        let mut inv = self
-            .invocation("fleet_store", ops::GIT_READ_OBJECTS, AccessIntent::Read, cred)
-            .args(["api", "--include", "--method", "GET"]);
+        let inv = self.invocation("fleet_store", ops::GIT_READ_OBJECTS, AccessIntent::Read, cred);
+        let inv = match reader_app {
+            // A reader the transport routed itself: declared, so the facade
+            // keeps it, and no env token can outrank it (#9872).
+            Some(app_id) => inv
+                .identity_role(IdentityRole::Reader)
+                .identity_bucket(&crate::forge_identity::reader_bucket(app_id, &self.repo))
+                .without_token_env(),
+            // No reader pool on this host: the writer is the only credential
+            // there is (#12394's one exception).
+            None => inv.writer_identity(),
+        };
+        let mut inv = inv.args(["api", "--include", "--method", "GET"]);
         if let Some(a) = accept {
             inv = inv.arg("-H").arg(format!("Accept: {a}"));
         }
@@ -199,32 +264,88 @@ impl GhTransport {
         }
     }
 
-    /// One read under the WRITER credential, skipping the reader (#10718).
+    /// One read with no cache validator, on the read path: for a ref this
+    /// transport itself wrote and is about to write again (the resync claim).
     ///
-    /// For a ref this transport itself wrote: a reader App that is not
-    /// installed on the repo answers `404`, which a caller would take for
-    /// "the ref is gone". Reading under the identity that created the ref
-    /// cannot disagree with the write that follows.
+    /// Reader-only, like every store read (#12394, #12584). #10718 kept this
+    /// on the writer because a reader App not installed on the repo answers
+    /// `404`, which would read as "the ref is gone": a reader's `404` is now
+    /// taken as the answer only when that reader can see the repository
+    /// ([`GhTransport::reader_sees_repo`]); otherwise the next reader is
+    /// asked, and with none left the read is shed (an error, never "absent").
     ///
     /// # Errors
-    /// `gh` could not complete the request at all; any HTTP status is `Ok`.
-    pub(crate) fn get_as_writer(&self, api_path: &str) -> Result<Reply> {
-        let (response, stderr, _) = self.run(&self.writer(), api_path, None, None)?;
-        let response = response.ok_or_else(|| {
-            anyhow::anyhow!(
-                "gh api {api_path} failed before an HTTP response: {}",
-                if stderr.is_empty() {
-                    "no output"
-                } else {
-                    &stderr
-                }
-            )
-        })?;
-        Ok(Reply {
-            status: response.status,
-            etag: response.etag,
-            body: response.body,
-        })
+    /// `gh` could not complete the request at all, or no reader can serve
+    /// it; any HTTP status is `Ok`.
+    pub(crate) fn get_fresh(&self, api_path: &str) -> Result<Reply> {
+        self.read(api_path, None, None)
+    }
+
+    /// One store read (see the module docs): a reader's answer, the writer's
+    /// on a host with no reader pool, or an error when it was shed.
+    fn read(&self, api_path: &str, accept: Option<&str>, etag: Option<&str>) -> Result<Reply> {
+        if !self.pooled {
+            let (response, stderr, _) = self.run(&self.writer(), None, api_path, accept, etag)?;
+            return reply_of(api_path, response, &stderr);
+        }
+        let family = served::endpoint_family(api_path);
+        let mut tried: Vec<String> = Vec::new();
+        loop {
+            let Some((dir, app_id)) = self.reader.borrow().clone() else {
+                break;
+            };
+            if tried.contains(&app_id) || tried.len() >= MAX_READERS_TRIED {
+                break;
+            }
+            let cred = Credential::ConfigDir {
+                dir,
+                label: format!("reader app {app_id}"),
+            };
+            let (response, stderr, _) = self.run(&cred, Some(&app_id), api_path, accept, etag)?;
+            let status = response.as_ref().map(|r| r.status);
+            if matches!(status, Some(200..=299 | 304)) {
+                served::note_reader_served(&app_id, &self.repo, family, SystemTime::now());
+                return reply_of(api_path, response, &stderr);
+            }
+            let headers = response.as_ref().map(|r| &r.ratelimit);
+            let resource = crate::forge_bucket_book::Resource::Core;
+            let Some(failure) =
+                crate::forge_identity::classify_failure(&stderr, status, headers, resource)
+            else {
+                // Not the credential's fault (a 5xx, a network error):
+                // another reader would not help.
+                return reply_of(api_path, response, &stderr);
+            };
+            if failure == Failure::Coverage
+                && status == Some(404)
+                && !names_blindness(&stderr)
+                && self.reader_sees_repo(&cred, &app_id)?
+            {
+                // The reader sees the repository: the item is missing.
+                return reply_of(api_path, response, &stderr);
+            }
+            (self.withdraw)(&app_id, &self.repo, failure, &format!("fleet_store {api_path}"));
+            tried.push(app_id);
+            *self.reader.borrow_mut() = (self.next_reader)();
+        }
+        anyhow::bail!(
+            "gh api {api_path} was shed: no reader can serve {} (the writer is never used for \
+             reads, #12394)",
+            self.repo
+        )
+    }
+
+    /// Whether reader `app_id` can see this transport's repository: it
+    /// answered one of the repository's reads recently, or it answers
+    /// `GET repos/OWNER/REPO` now (one extra request, only on a `404` with no
+    /// such evidence).
+    fn reader_sees_repo(&self, cred: &Credential, app_id: &str) -> Result<bool> {
+        if served::reader_recently_served_repo(app_id, &self.repo, SystemTime::now()) {
+            return Ok(true);
+        }
+        let path = format!("repos/{}", self.repo);
+        let (response, _, _) = self.run(cred, Some(app_id), &path, None, None)?;
+        Ok(response.is_some_and(|r| r.status == 200))
     }
 
     /// One GraphQL read on the read path (#10987, #12389): the workspace
@@ -365,44 +486,39 @@ impl super::propose::WriteTransport for GhTransport {
 
 impl Transport for GhTransport {
     fn get(&self, api_path: &str, accept: Option<&str>, etag: Option<&str>) -> Result<Reply> {
-        let use_reader = self.reader.is_some() && !*self.reader_failed.borrow();
-        let first = if use_reader {
-            self.reader.clone().unwrap_or(Credential::Ambient)
-        } else {
-            self.writer()
-        };
-        let (mut response, mut stderr, _) = self.run(&first, api_path, accept, etag)?;
-        if use_reader {
-            let status = response.as_ref().map(|r| r.status);
-            let ok = matches!(status, Some(200..=299 | 304));
-            let headers = response.as_ref().map(|r| &r.ratelimit);
-            let resource = crate::forge_bucket_book::Resource::Core;
-            if !ok
-                && crate::forge_identity::classify_failure(&stderr, status, headers, resource)
-                    .is_some()
-            {
-                // A reader that cannot serve this store (not installed on the
-                // owner, rate-limited) costs one request, then the writer.
-                *self.reader_failed.borrow_mut() = true;
-                (response, stderr, _) = self.run(&self.writer(), api_path, accept, etag)?;
-            }
-        }
-        let response = response.ok_or_else(|| {
-            anyhow::anyhow!(
-                "gh api {api_path} failed before an HTTP response: {}",
-                if stderr.is_empty() {
-                    "no output"
-                } else {
-                    &stderr
-                }
-            )
-        })?;
-        Ok(Reply {
-            status: response.status,
-            etag: response.etag,
-            body: response.body,
-        })
+        self.read(api_path, accept, etag)
     }
+}
+
+/// A store reply from one `gh api --include` run, or why it has none.
+fn reply_of(
+    api_path: &str,
+    response: Option<crate::forge_listing::HttpResponse>,
+    stderr: &str,
+) -> Result<Reply> {
+    let response = response.ok_or_else(|| {
+        anyhow::anyhow!(
+            "gh api {api_path} failed before an HTTP response: {}",
+            if stderr.is_empty() {
+                "no output"
+            } else {
+                stderr
+            }
+        )
+    })?;
+    Ok(Reply {
+        status: response.status,
+        etag: response.etag,
+        body: response.body,
+    })
+}
+
+/// GitHub's own words for a credential that cannot see the repository at
+/// all, as opposed to a missing item (`forge_identity::served`).
+fn names_blindness(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("resource not accessible by integration")
+        || s.contains("could not resolve to a repository")
 }
 
 /// The writer credential for `repo`: an App token minted and published to
@@ -448,3 +564,7 @@ fn writer_credential(workspace_root: &Path, repo: &str) -> Credential {
 #[cfg(test)]
 #[path = "gh_gateway_tests.rs"]
 mod gateway_tests;
+
+#[cfg(test)]
+#[path = "gh_reader_tests.rs"]
+mod reader_tests;

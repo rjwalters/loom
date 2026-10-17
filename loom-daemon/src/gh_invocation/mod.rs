@@ -68,7 +68,7 @@ pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
 pub use paged::{walk_enabled as page_walk_enabled, WALK_ENV as PAGE_WALK_ENV};
 pub use purpose::ForgePurpose;
-pub use reader_route::SHED_MARKER;
+pub use reader_route::{host_has_read_pool, SHED_MARKER};
 
 #[cfg(test)]
 mod tests;
@@ -297,6 +297,50 @@ pub struct EnvEntry {
     pub value: Option<OsString>,
 }
 
+/// A credential a site chose for a read, set aside while the read is routed
+/// to a reader (#12584, [`GhInvocation::route_site_credential`]).
+#[derive(Debug, Clone)]
+struct SiteCredential {
+    config_dir: Option<PathBuf>,
+    strip_token_env: bool,
+    role: Option<crate::forge_identity::IdentityRole>,
+}
+
+/// A `gh` command answered locally, which sends no forge request (the agent
+/// front's ledger list, `agent_gh::ledger::caller_of`): not a read the
+/// reader-only rule governs.
+#[must_use]
+pub fn is_local_command(args: &[OsString]) -> bool {
+    match args.first().and_then(|a| a.to_str()) {
+        None => true,
+        Some(first) => matches!(
+            first,
+            "help"
+                | "version"
+                | "--version"
+                | "--help"
+                | "-h"
+                | "completion"
+                | "config"
+                | "alias"
+                | "extension"
+                | "auth"
+        ),
+    }
+}
+
+/// `gh api rate_limit`: free against every budget, and an answer about the
+/// asking credential itself (a bucket probe), so never reader-only.
+#[must_use]
+pub fn is_rate_limit_reading(args: &[OsString]) -> bool {
+    accounting::api_endpoint(args).is_some_and(|e| {
+        e.trim_start_matches('/')
+            .split('?')
+            .next()
+            .is_some_and(|p| p.trim_end_matches('/') == "rate_limit")
+    })
+}
+
 /// A single `gh` invocation, built and executed through the facade.
 #[derive(Debug, Clone)]
 pub struct GhInvocation {
@@ -320,9 +364,16 @@ pub struct GhInvocation {
     stdin_input: Vec<u8>,
     /// Never route this read to a reader App (#9872).
     writer_only: bool,
-    /// This read may never run on the ambient writer credential (#12555):
-    /// [`GhInvocation::reader_only`].
+    /// This read may never run on the ambient writer credential (#12555),
+    /// whatever else the site pinned: [`GhInvocation::reader_only`]. Every
+    /// other forge read is reader-only too unless the site pinned the writer
+    /// (#12584, [`GhInvocation::is_reader_only`]).
     reader_only: bool,
+    /// The credential a site chose itself for a reader-only read, set aside
+    /// while the read is routed to a reader (#12584,
+    /// [`GhInvocation::route_site_credential`]); restored only on a host
+    /// with no reader pool, where it is the only credential there is.
+    site_credential: Option<SiteCredential>,
     /// The identity role the accounting row records; `None` = writer.
     role: Option<crate::forge_identity::IdentityRole>,
     /// The #9777 call identity this execution is accounted under (#9831).
@@ -378,6 +429,7 @@ impl GhInvocation {
             stdin_input: Vec::new(),
             writer_only: false,
             reader_only: false,
+            site_credential: None,
             role: None,
             identity: crate::forge_call_stats::CallIdentity::default(),
             route_slug: None,
@@ -513,10 +565,14 @@ impl GhInvocation {
 
     /// Keep this read on the writer credential (#9872): for a read whose
     /// answer depends on **who** asks — a permission or write-scope probe,
-    /// `viewer`, `/user` — which a reader App would answer for itself.
+    /// `viewer`, `/user`, the installation's own repository list — which a
+    /// reader App would answer for itself.
     ///
-    /// Has no effect on a [`GhInvocation::reader_only`] read: those can
-    /// never be pinned to the writer (#12555).
+    /// The only way a read reaches the writer on a host with a reader pool
+    /// (#12584), so every file that calls it is listed, with its reason, in
+    /// `tests/writer_read_guard.rs`. Has no effect on an explicit
+    /// [`GhInvocation::reader_only`] read: those can never be pinned to the
+    /// writer (#12555).
     #[must_use]
     pub fn writer_identity(mut self) -> Self {
         self.writer_only = !self.reader_only;
@@ -525,20 +581,26 @@ impl GhInvocation {
 
     /// This read is served by a reader App or the read gateway, or shed — it
     /// never runs on the ambient writer credential (#12555, the #12394
-    /// ruling: "the writer should not be used for reads"). Set by the
+    /// ruling: "the writer should not be used for reads"), and not even
+    /// [`GhInvocation::writer_identity`] can pin it there. Set by the
     /// in-process daemon read helpers (`claim_reconciliation::gh_call::read`,
     /// `SweepRegistry::gh_inv(.., AccessIntent::Read, ..)`).
     ///
-    /// - [`GhInvocation::writer_identity`] is ignored, before or after this.
+    /// Since #12584 every forge read behaves this way unless its site pinned
+    /// the writer ([`GhInvocation::is_reader_only`]); this marker only adds
+    /// that the pin is ignored too.
+    ///
     /// - A read the facade cannot route to a reader (no repo derivable, or
     ///   the checkout's sources disagree) is shed with the usual
     ///   `forge.read.shed` telemetry instead of being sent to the writer.
     /// - The one exception is the one [`GhInvocation::execute`] already
     ///   makes for every read: a host with **no reader pool and no gateway at
     ///   all**, where the writer is the only credential there is.
-    /// - A credential the site chose itself
-    ///   ([`GhInvocation::gh_config_dir`], [`GhInvocation::identity_role`])
-    ///   is left alone.
+    /// - A reader credential the site chose itself
+    ///   ([`GhInvocation::gh_config_dir`] with
+    ///   [`GhInvocation::identity_role`] `Reader`) is left alone; any other
+    ///   chosen credential is set aside and the read is routed
+    ///   ([`GhInvocation::route_site_credential`]).
     ///
     /// Meaningful for [`AccessIntent::Read`] only.
     #[must_use]
@@ -548,10 +610,78 @@ impl GhInvocation {
         self
     }
 
-    /// Whether [`GhInvocation::reader_only`] is set.
+    /// Whether this invocation may never run on the writer credential on a
+    /// host with a reader pool (#12394, #12584): an explicit
+    /// [`GhInvocation::reader_only`] read, or **any** [`AccessIntent::Read`]
+    /// of the forge whose site did not pin the writer with
+    /// [`GhInvocation::writer_identity`] — whatever builder made it and
+    /// whatever credential it was handed.
+    ///
+    /// Two argv shapes are not forge reads and keep their credential: a
+    /// command `gh` answers locally ([`is_local_command`]: `--version`,
+    /// `auth`, `config`, …) and `gh api rate_limit`, which is free and
+    /// reports the asking credential's own budget.
     #[must_use]
     pub fn is_reader_only(&self) -> bool {
         self.reader_only
+            || (self.intent == AccessIntent::Read
+                && !self.writer_only
+                && !is_local_command(&self.args)
+                && !is_rate_limit_reading(&self.args))
+    }
+
+    /// Set aside a credential the site chose for a reader-only read (#12584):
+    /// an explicit [`GhInvocation::gh_config_dir`],
+    /// [`GhInvocation::without_token_env`] or a non-reader
+    /// [`GhInvocation::identity_role`] names the writer (an App's per-owner
+    /// directory, a store's writer token, the process's own login), and the
+    /// writer is never used for reads (#12394). The read is then routed like
+    /// any other: to a reader, or shed. Only on a host with **no reader
+    /// pool** is the chosen credential restored, since there it is the only
+    /// one there is and the site picked the right owner's.
+    ///
+    /// A credential declared a reader's ([`IdentityRole::Reader`], a site
+    /// that routes its own reads) is kept. Applied by every execution
+    /// before the route is derived.
+    ///
+    /// [`IdentityRole::Reader`]: crate::forge_identity::IdentityRole::Reader
+    #[must_use]
+    pub(crate) fn route_site_credential(mut self) -> Self {
+        let chosen = self.config_dir.is_some() || self.strip_token_env || self.role.is_some();
+        if chosen
+            && self.site_credential.is_none()
+            && self.role != Some(crate::forge_identity::IdentityRole::Reader)
+            && matches!(self.contract, OutputContract::Captured { .. })
+            && self.is_reader_only()
+        {
+            log::debug!(
+                "gh_invocation: {} is a read on a credential its site chose; routed to a \
+                 reader instead (#12584)",
+                self.operation.as_str()
+            );
+            self.site_credential = Some(SiteCredential {
+                config_dir: self.config_dir.take(),
+                strip_token_env: std::mem::take(&mut self.strip_token_env),
+                role: self.role.take(),
+            });
+        }
+        self
+    }
+
+    /// Put back the credential [`GhInvocation::route_site_credential`] set
+    /// aside: the no-reader-pool path only.
+    fn restore_site_credential(&mut self) {
+        if let Some(c) = self.site_credential.take() {
+            self.config_dir = c.config_dir;
+            self.strip_token_env = c.strip_token_env;
+            self.role = c.role;
+        }
+    }
+
+    /// Whether a site-chosen credential was set aside for routing (tests).
+    #[cfg(test)]
+    pub(crate) fn has_site_credential_set_aside(&self) -> bool {
+        self.site_credential.is_some()
     }
 
     /// Name the repository this read is about when its argv does not (a

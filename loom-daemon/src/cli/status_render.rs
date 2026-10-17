@@ -14,6 +14,7 @@ mod fleet_store_line;
 mod forge_calls_render;
 mod forge_events_line;
 mod holds;
+mod host_update_line;
 mod last_tick_line;
 mod model_class;
 mod observability_line;
@@ -610,6 +611,7 @@ pub(crate) fn build_status_json_value_for(
             "mode": report.auto_update_mode, // #10954
             "config_enabled": report.auto_update_config_enabled, // #11042
             "floor_not_rolling": report.auto_update_floor_not_rolling, // #11042
+            "host": report.host_update, // #12420
             "last_check": report.auto_update_last_check,
             "last_roll": report.auto_update_last_roll,
             "consecutive_failures": report.auto_update_consecutive_failures,
@@ -2622,6 +2624,7 @@ pub(crate) fn print_status_human(
         }
         last_tick_line::print(report);
     }
+    host_update_line::print(report); // #12420
     task_liveness_line::print(&report.task_liveness);
     session_containers_line::print(report.session_containers.as_ref());
 

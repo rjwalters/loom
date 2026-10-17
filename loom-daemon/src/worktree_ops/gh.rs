@@ -708,10 +708,11 @@ fn legacy_union(
     issue: u32,
     gone: &std::cell::Cell<bool>,
 ) -> OpenPrProbe {
-    let graphql = run_probe(
+    let graphql = run_probe_for(
         "worktree.linked_pr_graphql",
         repo_root,
         open_linked_pr_args(owner, repo, issue),
+        Some(&format!("{owner}/{repo}")),
         &|s| parse_open_linked_pr_trusted(s, repo_root),
         gone,
     );
@@ -747,7 +748,25 @@ fn run_probe(
     classify: &dyn Fn(&str) -> OpenPrProbe,
     gone: &std::cell::Cell<bool>,
 ) -> OpenPrProbe {
-    match run_read(op, repo_root, args) {
+    run_probe_for(op, repo_root, args, None, classify, gone)
+}
+
+/// [`run_probe`] for a read about `slug` that its argv does not spell for
+/// the facade (a GraphQL query): the reader route names it (#12584), so it
+/// is served by a reader instead of being shed.
+fn run_probe_for(
+    op: &'static str,
+    repo_root: &Path,
+    args: Vec<String>,
+    slug: Option<&str>,
+    classify: &dyn Fn(&str) -> OpenPrProbe,
+    gone: &std::cell::Cell<bool>,
+) -> OpenPrProbe {
+    let mut inv = invocation(op, AccessIntent::Read, repo_root, GH_CALL_TIMEOUT, args);
+    if let Some(slug) = slug {
+        inv = inv.reader_repo(slug);
+    }
+    match inv.run() {
         CmdOutcome::Ran(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
             if stdout.contains(REPO_UNRESOLVED) {

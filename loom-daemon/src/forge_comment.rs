@@ -485,9 +485,11 @@ fn gh_api_get(gh_bin: &str, path: &str) -> Result<String, String> {
         GhTarget::None,
         std::time::Duration::from_secs(60),
     )
-    // W4-C: reads back an object this process just created, then patches
-    // it: the writer that created it answers (a reader may lag).
-    .writer_identity()
+    // Reads back an object this process just created, then patches it. A
+    // reader serves it (#12394, #12584: the writer is never used for reads);
+    // the gateway revalidates every cached answer, and a reader that cannot
+    // see the new object yet fails this best-effort footer edit, which is
+    // all it decides.
     .program(gh_bin)
     .arg("api")
     .arg(path)
