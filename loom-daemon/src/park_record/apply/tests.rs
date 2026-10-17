@@ -350,3 +350,68 @@ fn a_leftover_daemon_hold_record_does_not_swallow_an_operator_park() {
         .collect();
     assert_eq!(reasons, vec!["insta-crash quarantine", "operator"]);
 }
+
+mod hold_journal {
+    use super::*;
+    use crate::observability::pick_journal::{parse, set_test_journal, JournalEntry};
+
+    fn champion(reason: &str) -> ApplyRequest {
+        ApplyRequest {
+            by: Some("champion".to_string()),
+            remove_labels: Vec::new(),
+            ..req(&[], Some(reason))
+        }
+    }
+
+    fn holds(f: &mut Fake, r: &ApplyRequest) -> Vec<JournalEntry> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        set_test_journal(Some(path.clone()));
+        run(f, r);
+        set_test_journal(None);
+        parse(&std::fs::read_to_string(&path).unwrap_or_default())
+            .into_iter()
+            .filter(|e| matches!(e, JournalEntry::Hold { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn a_new_champion_hold_journals_one_add_and_a_reapply_none() {
+        let r = champion("champion merge-risk hold");
+        let mut f = Fake::new("body", &["loom:pr"]);
+        let first = holds(&mut f, &r);
+        assert!(
+            matches!(
+                first.as_slice(),
+                [JournalEntry::Hold { number: 10, transition, reason_code, confirmed: true, .. }]
+                    if transition == "add" && reason_code == "merge-risk-hold"
+            ),
+            "{first:?}"
+        );
+        assert!(holds(&mut f, &r).is_empty(), "label already on: no new transition");
+    }
+
+    #[test]
+    fn the_critical_file_hold_has_its_own_reason_code() {
+        let mut f = Fake::new("body", &[]);
+        let e = holds(&mut f, &champion("champion critical-file hold"));
+        assert!(
+            matches!(
+                e.as_slice(),
+                [JournalEntry::Hold { reason_code, .. }] if reason_code == "critical-file-hold"
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn another_role_or_a_dry_run_journals_nothing() {
+        let mut f = Fake::new("body", &[]);
+        assert!(holds(&mut f, &req(&[], Some("operator"))).is_empty());
+        let dry = ApplyRequest {
+            dry_run: true,
+            ..champion("champion merge-risk hold")
+        };
+        assert!(holds(&mut f, &dry).is_empty());
+    }
+}

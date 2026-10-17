@@ -112,6 +112,7 @@ pub mod daemon_exit;
 pub mod daemon_lifecycle;
 pub mod endpoint_policy;
 pub mod exporter;
+pub mod hold_transition;
 mod ingest_key;
 pub mod lifecycle;
 pub mod llm_billing;

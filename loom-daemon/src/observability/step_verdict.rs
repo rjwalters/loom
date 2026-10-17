@@ -288,7 +288,9 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                     by: by.clone(),
                 },
             )),
-            JournalEntry::Queue { .. } | JournalEntry::Listing { .. } => None,
+            JournalEntry::Queue { .. }
+            | JournalEntry::Listing { .. }
+            | JournalEntry::Hold { .. } => None,
         })
         .collect()
 }

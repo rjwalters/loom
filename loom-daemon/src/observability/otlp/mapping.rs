@@ -11,6 +11,7 @@ mod daemon_exit;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
+mod hold_transition;
 mod host_export;
 mod host_resource;
 mod host_status;
@@ -624,6 +625,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::MergeQueueEvent(_)
+        | TelemetryRecord::HoldTransition(_)
         | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::RunStateRequest(_)
         | TelemetryRecord::ScopeMemory(_)
@@ -645,7 +647,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| run_state_request::log_parts(r))
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))
-                .or_else(|| merge_queue_event::log_parts(r))?;
+                .or_else(|| merge_queue_event::log_parts(r))
+                .or_else(|| hold_transition::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);

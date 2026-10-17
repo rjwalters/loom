@@ -115,6 +115,21 @@ pub enum JournalEntry {
         action: String,
         by: String,
     },
+    /// A hold-label transition a daemon subcommand or the Champion prompt
+    /// made on a PR (#12665): the source of `hold.transition`. `confirmed` is
+    /// `false` for a write that was attempted and failed.
+    Hold {
+        at: DateTime<Utc>,
+        number: u32,
+        /// `add` or `remove`.
+        transition: String,
+        reason_code: String,
+        trigger: String,
+        confirmed: bool,
+        /// When the hold began, when the caller knows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entered_at: Option<DateTime<Utc>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +638,32 @@ pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
             is_pr,
             action: action.to_string(),
             by: by.to_string(),
+        });
+    }
+}
+
+/// Journal a hold-label transition on PR `number` (#12665). A no-op outside a
+/// journaled run.
+pub fn record_hold(
+    number: u64,
+    transition: &str,
+    reason_code: &str,
+    trigger: &str,
+    confirmed: bool,
+    entered_at: Option<DateTime<Utc>>,
+) {
+    if journal_path().is_none() {
+        return;
+    }
+    if let Ok(number) = u32::try_from(number) {
+        append(&JournalEntry::Hold {
+            at: Utc::now(),
+            number,
+            transition: transition.to_string(),
+            reason_code: reason_code.to_string(),
+            trigger: trigger.to_string(),
+            confirmed,
+            entered_at,
         });
     }
 }

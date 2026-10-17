@@ -2095,7 +2095,15 @@ EOF
 # reversal-comment pass. merge-pr.sh refuses loom:pr + loom:blocked (#8112),
 # so the label must be off before Step 3. The park record stays in the body.
 if [ -n "$HOLD_REVERSAL_BLOCK" ]; then
-  gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null || true
+  if gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null; then
+    RELEASE_FAILED=""
+  else
+    RELEASE_FAILED="--failed"
+  fi
+  # #12665: journal the release as a `hold.transition` (no forge write; a no-op
+  # outside a role tick). $HOLD_AT is the hold's own timestamp from the precheck.
+  loom-daemon park-record released --pr "$PR_NUMBER" --entered-at "${HOLD_AT:-}" \
+    $RELEASE_FAILED >/dev/null 2>&1 || true
 fi
 "$GH_READ" --clear-cache   # your own write must not be masked by your own cache
 ```

@@ -712,7 +712,9 @@ pub fn role_record(
                 }
             }
             // #12027: read by `step_verdict`, not by the pick record.
-            JournalEntry::Marker { .. } | JournalEntry::Applied { .. } => {}
+            JournalEntry::Marker { .. }
+            | JournalEntry::Applied { .. }
+            | JournalEntry::Hold { .. } => {}
         }
     }
     // Decisions are observed when the agent ran with a journal that was read
@@ -847,6 +849,10 @@ pub fn emit_role_tick(
             &tick.tick_id,
             &journal.entries,
         );
+    }
+    // #12665: the hold-label transitions this tick's agent made.
+    if let Some(journal) = &journal {
+        super::hold_transition::emit_role_tick(&repo_label(root), &journal.entries);
     }
     let holds: &[&str] = crate::role_runner::demand::DebtAxis::for_role(role)
         .map_or(&[], crate::role_runner::demand::axis_park_labels);
