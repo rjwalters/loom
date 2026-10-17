@@ -98,6 +98,27 @@ pub(crate) fn reaped_release_fields(
     }
 }
 
+/// The `outcome=` field a Champion release records (#12616): the step's
+/// `CHAMPION-STEP` outcome word, or `none` when it wrote no line (a step that
+/// died). A merge leaves the release as it was. Anything but `[A-Za-z0-9_-]`
+/// is dropped so the word cannot break the marker.
+pub(crate) fn champion_outcome_fields(role: Role, outcome: Option<&str>) -> String {
+    if role != Role::Champion {
+        return String::new();
+    }
+    let word: String = outcome
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(32)
+        .collect();
+    match word.as_str() {
+        "merged" => String::new(),
+        "" => " outcome=none".to_string(),
+        w => format!(" outcome={w}"),
+    }
+}
+
 /// When the backstop's hold on this PR ends, from its trusted lease `rows`
 /// and its live `(open, head, labels)`; `None` when not held. Pure.
 pub(crate) fn hold(
