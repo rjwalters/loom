@@ -467,18 +467,6 @@ pub fn parse_launch_tap(record_json: &str) -> Option<TapAttribution> {
     })
 }
 
-/// [`parse_launch_tap`] over a whole per-sweep log, anchored exactly as
-/// [`parse_launch_credential_after`] anchors: only at/after this dispatch's
-/// header, and within that region the **last** record wins — the same two
-/// `ingest` helpers, so all four readers of this record share one scan (issue
-/// #8612) and a mid-line mention of the marker cannot drop a tap the way an
-/// unanchored substring search could.
-#[must_use]
-pub fn parse_launch_tap_after(contents: &str, header_anchor: &str) -> Option<TapAttribution> {
-    let region = crate::api_keys_pool::ingest::region_after(contents, header_anchor)?;
-    parse_launch_tap(crate::api_keys_pool::ingest::last_launch_record_body(region)?)
-}
-
 // ============================================================================
 // Phase-worker logs (Issue #11360)
 // ============================================================================
@@ -949,6 +937,11 @@ mod tests {
         format!("# LOOM_LAUNCH {record}")
     }
 
+    /// [`parse_launch_tap`] over the last record body in `log`.
+    fn tap_of(log: &str) -> Option<TapAttribution> {
+        parse_launch_tap(crate::api_keys_pool::ingest::last_launch_record_body(log)?)
+    }
+
     #[test]
     fn a_metered_pool_tap_keys_on_its_provider_not_its_account() {
         let log = log_with(
@@ -961,7 +954,7 @@ mod tests {
                 Some("zai"),
             ),
         );
-        let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
+        let tap = tap_of(&log).unwrap();
         assert_eq!(tap.runtime, "opencode");
         assert_eq!(tap.model_profile.as_deref(), Some("zai-metered"));
         assert_eq!(tap.tap().to_string(), "opencode:zai-metered");
@@ -977,7 +970,7 @@ mod tests {
         for (source, expected) in [("env", "env"), ("none", "harness-own")] {
             let log =
                 log_with("sweep_id=s1", &tap_launch_line(Some("pi"), "pi", None, source, None));
-            let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
+            let tap = tap_of(&log).unwrap();
             assert_eq!(tap.credential_wire(), expected, "{source}");
             assert_eq!(tap.key(), format!("pi@{expected}"), "{source}");
         }
@@ -991,7 +984,7 @@ mod tests {
             "sweep_id=s1",
             &tap_launch_line(None, "opencode", Some("zai-metered"), "pool", Some("zai")),
         );
-        let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
+        let tap = tap_of(&log).unwrap();
         assert_eq!(tap.key(), "opencode:zai-metered@api_keys:zai");
     }
 
@@ -1002,34 +995,13 @@ mod tests {
             "sweep_id=s1",
             r#"# LOOM_LAUNCH {"schema":1,"runtime":"pi","model":"glm-5.3"}"#,
         );
-        assert_eq!(parse_launch_tap_after(&log, "sweep_id=s1"), None);
+        assert_eq!(tap_of(&log), None);
         // Credential present but no runtime to key on — never fabricated.
         let log = log_with(
             "sweep_id=s1",
             r#"# LOOM_LAUNCH {"credentialSource":"pool","credentialProvider":"zai"}"#,
         );
-        assert_eq!(parse_launch_tap_after(&log, "sweep_id=s1"), None);
-    }
-
-    /// Issue #8612 for the tap reader: dropping the tap here would report a
-    /// launch that really spent as "unmeasured", so the same line-anchoring
-    /// the credential and runtime readers got applies.
-    #[test]
-    fn a_mid_line_marker_mention_does_not_suppress_tap_attribution() {
-        let log = format!(
-            "==== loom-daemon dispatch: sweep_id=s1 issue=42 ====\n{}\nagent transcript: the \
-             record is the line beginning \"{}\" — see launch_record.rs\n",
-            tap_launch_line(
-                Some("opencode:zai-metered"),
-                "opencode",
-                Some("zai-metered"),
-                "pool",
-                Some("zai"),
-            ),
-            LAUNCH_RECORD_MARKER,
-        );
-        let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
-        assert_eq!(tap.key(), "opencode:zai-metered@api_keys:zai");
+        assert_eq!(tap_of(&log), None);
     }
 
     #[test]
@@ -1045,7 +1017,7 @@ mod tests {
             })
         );
         let log = log_with("sweep_id=s1", &line);
-        let tap = parse_launch_tap_after(&log, "sweep_id=s1").unwrap();
+        let tap = tap_of(&log).unwrap();
         let rendered = serde_json::to_string(&tap).unwrap();
         assert!(!rendered.contains("sk-fake-secret-material"), "{rendered}");
     }
