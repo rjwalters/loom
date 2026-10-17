@@ -17,9 +17,12 @@
 
 use serde_json::Value;
 
-use super::authz::{AuthzFacts, GrantStore, REQUIRED_CHECK_CONTEXT};
+use super::authz::{GrantStore, REQUIRED_CHECK_CONTEXT};
 use super::gh_lifecycle::GhLifecycleForge;
-use super::group_authz::{group_check, status_for, CheckState, GroupConclusion, MergeGroup};
+use super::group_authz::{
+    group_check, status_for, CheckState, GroupConclusion, MemberFacts, MergeGroup,
+    STATUS_DESCRIPTION_MAX,
+};
 use super::group_github::GroupForge;
 use crate::gh_invocation::AccessIntent;
 
@@ -28,6 +31,9 @@ use crate::gh_invocation::AccessIntent;
 pub enum RunOutcome {
     /// The conclusion was reached and its status confirmed posted.
     Posted(GroupConclusion),
+    /// The conclusion was reached and the commit's newest status already
+    /// carries the same state and description; nothing was written.
+    Unchanged(GroupConclusion),
     /// The conclusion was reached but the status write was not confirmed.
     /// Without a posted `success` GitHub cannot merge the group.
     PostFailed(GroupConclusion, String),
@@ -48,7 +54,7 @@ pub fn run_group_check(
     store: &dyn GrantStore,
     forge: &dyn GroupForge,
     states: &dyn ContextStates,
-    facts_for: &dyn Fn(u32) -> Result<AuthzFacts, String>,
+    facts_for: &dyn Fn(u32) -> Result<MemberFacts, String>,
     commit: &str,
 ) -> RunOutcome {
     let groups = match forge.groups() {
@@ -70,6 +76,13 @@ pub fn run_group_check(
         }
     };
     let (state, desc) = status_for(&conclusion);
+    // Skip a write that would repeat the newest status (each write is an API
+    // call, and GitHub caps statuses per commit and context). An unreadable
+    // newest status falls through to the write: never skip toward silence.
+    let shown: String = desc.chars().take(STATUS_DESCRIPTION_MAX).collect();
+    if matches!(forge.latest_status(commit), Ok(Some((s, d))) if s == state && d == shown) {
+        return RunOutcome::Unchanged(conclusion);
+    }
     match forge.post_status(commit, state, &desc) {
         Ok(()) => RunOutcome::Posted(conclusion),
         Err(e) => RunOutcome::PostFailed(conclusion, e),
@@ -224,10 +237,13 @@ pub fn tick_groups(gh: &str, forge: &GhLifecycleForge) {
             &store,
             forge,
             &states,
-            &|pr| super::forge::read_facts(forge, pr),
+            &|pr| super::forge::read_member_facts(forge, pr),
             &g.commit,
         ) {
             RunOutcome::Posted(c) => log::info!("merge-queue: group {} -> {c:?}", g.commit),
+            RunOutcome::Unchanged(c) => {
+                log::debug!("merge-queue: group {} -> {c:?} (status unchanged)", g.commit);
+            }
             RunOutcome::PostFailed(c, e) => {
                 log::warn!("merge-queue: group {} {c:?}, status unconfirmed: {e}", g.commit);
             }
@@ -241,6 +257,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use std::cell::RefCell;
 
+    use super::super::authz::AuthzFacts;
     use super::super::authz::{Grant, MemoryGrantStore};
     use super::super::group_authz::{Member, StatusApi, StatusState};
     use super::*;
@@ -253,6 +270,8 @@ mod tests {
         groups: Result<Vec<MergeGroup>, String>,
         post_ok: bool,
         posted: RefCell<Vec<(String, StatusState)>>,
+        /// What `latest_status` reports.
+        latest: Result<Option<(StatusState, String)>, String>,
     }
     impl StatusApi for Fake {
         fn post_status(&self, c: &str, s: StatusState, _d: &str) -> Result<(), String> {
@@ -268,6 +287,9 @@ mod tests {
         fn groups(&self) -> Result<Vec<MergeGroup>, String> {
             self.groups.clone()
         }
+        fn latest_status(&self, _c: &str) -> Result<Option<(StatusState, String)>, String> {
+            self.latest.clone()
+        }
     }
     struct States(Result<Vec<(String, CheckState)>, String>);
     impl ContextStates for States {
@@ -281,6 +303,7 @@ mod tests {
             groups,
             post_ok,
             posted: RefCell::default(),
+            latest: Ok(None),
         }
     }
     fn group() -> MergeGroup {
@@ -304,8 +327,8 @@ mod tests {
     fn ci(s: CheckState) -> States {
         States(Ok(vec![("ci".into(), s)]))
     }
-    fn good(_: u32) -> Result<AuthzFacts, String> {
-        Ok(AuthzFacts::approved(HA))
+    fn good(_: u32) -> Result<MemberFacts, String> {
+        Ok(MemberFacts::Open(AuthzFacts::approved(HA)))
     }
     fn last(f: &Fake) -> StatusState {
         f.posted.borrow().last().unwrap().1
@@ -322,7 +345,7 @@ mod tests {
     #[test]
     fn pending_ci_posts_pending_and_never_reads_facts() {
         let f = fake(Ok(vec![group()]), true);
-        let boom = |_: u32| -> Result<AuthzFacts, String> { panic!("facts read while pending") };
+        let boom = |_: u32| -> Result<MemberFacts, String> { panic!("facts read while pending") };
         run_group_check(&granted(), &f, &ci(CheckState::Pending), &boom, GC);
         assert_eq!(last(&f), StatusState::Pending);
     }
@@ -342,7 +365,7 @@ mod tests {
         let held = |_: u32| {
             let mut x = AuthzFacts::approved(HA);
             x.human_hold = super::super::authz::Fact::Known(true);
-            Ok(x)
+            Ok(MemberFacts::Open(x))
         };
         run_group_check(&granted(), &f, &ci(CheckState::Success), &held, GC);
         assert_eq!(last(&f), StatusState::Failure);
@@ -376,6 +399,44 @@ mod tests {
         let f = fake(Ok(vec![group()]), false);
         let r = run_group_check(&granted(), &f, &ci(CheckState::Success), &good, GC);
         assert!(matches!(r, RunOutcome::PostFailed(GroupConclusion::Success, _)));
+    }
+
+    #[test]
+    fn repeated_status_with_same_state_and_description_is_not_rewritten() {
+        let mut f = fake(Ok(vec![group()]), true);
+        f.latest = Ok(Some((StatusState::Pending, "waiting on ci=Pending".into())));
+        let r = run_group_check(&granted(), &f, &ci(CheckState::Pending), &good, GC);
+        assert!(matches!(r, RunOutcome::Unchanged(GroupConclusion::Pending(_))), "{r:?}");
+        assert!(f.posted.borrow().is_empty());
+    }
+
+    #[test]
+    fn changed_state_or_description_or_unreadable_latest_still_posts() {
+        for latest in [
+            Ok(Some((StatusState::Pending, "waiting on other=Pending".into()))),
+            Ok(Some((StatusState::Success, "waiting on ci=Pending".into()))),
+            Ok(None),
+            Err("statuses api down".to_string()),
+        ] {
+            let mut f = fake(Ok(vec![group()]), true);
+            f.latest = latest;
+            let r = run_group_check(&granted(), &f, &ci(CheckState::Pending), &good, GC);
+            assert!(matches!(r, RunOutcome::Posted(_)));
+            assert_eq!(f.posted.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn latest_status_parse_picks_newest_for_our_context() {
+        let v = json!([
+            {"context": "other", "state": "success", "description": "x"},
+            {"context": REQUIRED_CHECK_CONTEXT, "state": "failure", "description": "no"},
+            {"context": REQUIRED_CHECK_CONTEXT, "state": "success", "description": "old"}]);
+        assert_eq!(
+            super::super::group_github::parse_latest_status(&v).unwrap(),
+            Some((StatusState::Failure, "no".to_string()))
+        );
+        assert_eq!(super::super::group_github::parse_latest_status(&json!([])).unwrap(), None);
     }
 
     fn req() -> Vec<String> {
