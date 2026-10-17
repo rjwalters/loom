@@ -434,6 +434,9 @@ fn poll(
     if rollup.total == 0 {
         st.zero_polls += 1;
         let required = resolve_required(reads, st)?;
+        // The authorization context never holds a wait (#12526): a set of
+        // only that context is no required set at all.
+        let required = required.map(|r| verdict::without_authorization(&r));
         let req_state = match &required {
             None => Required::LookupFailed,
             Some(_) if st.required_unreadable => Required::LookupFailed,
@@ -478,7 +481,7 @@ fn poll(
     // waits only on observed pending checks, so a failed lookup (#11837)
     // cannot hide a finished red.
     let needs_required =
-        opts.required_only || (rollup.pending.is_empty() && rollup.failing.is_empty());
+        opts.required_only || (rollup.blocking_pending().is_empty() && rollup.failing.is_empty());
     let required = if needs_required {
         resolve_required(reads, st)?
     } else {
@@ -525,7 +528,7 @@ fn poll(
             sha,
             names,
             sleep: None,
-            idle: rollup.pending.is_empty(),
+            idle: rollup.blocking_pending().is_empty(),
         },
     })
 }

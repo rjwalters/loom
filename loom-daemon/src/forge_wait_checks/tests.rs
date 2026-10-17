@@ -356,6 +356,34 @@ fn zero_rows_with_a_required_context_times_out_never_none() {
     assert_eq!(lookups, 2, "the required lookup runs once per wait (two sources)");
 }
 
+/// #12552: zero rows never TIMEOUT-name the authorization context, and a
+/// required set of only that context is "no required set" (settles NONE).
+#[test]
+fn zero_rows_timeout_never_names_the_authorization_context() {
+    use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT as AUTHZ;
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend", AUTHZ]);
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert_eq!(
+        o,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["Backend".into()]
+        }
+    );
+}
+
+#[test]
+fn zero_rows_with_only_the_authorization_context_required_settles_none() {
+    use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT as AUTHZ;
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&[AUTHZ]);
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert_eq!(o, Outcome::NoChecks { sha: SHA.into() });
+}
+
 #[test]
 fn unreadable_payload_is_error() {
     let f = Forge::new();
@@ -1136,7 +1164,7 @@ fn required_only_alone_emits_no_settle_red_note() {
 /// #12526: Champion posts `loom/merge-authorization` only after the Judge
 /// approves, so the Judge's own CI verdict must not wait on it.
 mod authorization_context {
-    use super::verdict::{decide, Decision, Rollup};
+    use super::verdict::{decide, decide_settled, Decision, Rollup};
     use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT as AUTHZ;
 
     fn rollup(failing: &[&str], pending: &[&str], seen: &[&str]) -> Rollup {
@@ -1195,5 +1223,24 @@ mod authorization_context {
                 Decision::Red(vec!["CI".to_string()])
             );
         }
+    }
+
+    /// #12552: `decide_settled` must not let the authorization context hold
+    /// a finished red back, nor name it in a pending list.
+    #[test]
+    fn settled_ignores_pending_authorization() {
+        let red = rollup(&["CI"], &[AUTHZ], &["CI", AUTHZ]);
+        let absent = rollup(&["CI"], &[], &["CI"]);
+        for required_only in [false, true] {
+            assert_eq!(
+                decide_settled(&red, Some(&req()), required_only),
+                decide_settled(&absent, Some(&req()), required_only)
+            );
+        }
+        let running = rollup(&["CI"], &["Lint", AUTHZ], &["CI", "Lint", AUTHZ]);
+        assert_eq!(
+            decide_settled(&running, Some(&req()), false),
+            Decision::Pending(vec!["Lint".to_string()])
+        );
     }
 }
