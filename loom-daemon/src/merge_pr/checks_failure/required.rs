@@ -265,8 +265,6 @@ pub fn parse_check_runs(rows: &Value) -> Result<Vec<CheckRun>, String> {
                 status: s("status").unwrap_or_default().into(),
                 conclusion: s("conclusion").map(String::from),
                 started_at,
-                actions_run_id: None,
-                actions_job_id: None,
             })
         })
         .collect()

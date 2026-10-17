@@ -9,8 +9,6 @@ fn run(name: &str, status: &str, conclusion: Option<&str>, started: Option<&str>
         status: status.into(),
         conclusion: conclusion.map(String::from),
         started_at: started.map(|t| t.parse().unwrap()),
-        actions_run_id: None,
-        actions_job_id: None,
     }
 }
 
