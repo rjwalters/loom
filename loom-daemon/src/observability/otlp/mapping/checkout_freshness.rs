@@ -7,7 +7,7 @@
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv_string, nanos, prompt_tree};
+use super::{kv_int, kv_string, nanos, prompt_tree};
 use crate::telemetry::TelemetryRecord;
 
 /// `(event_name, severity, record time, attributes, body)` for a
@@ -24,6 +24,10 @@ pub(super) fn log_parts(
     }
     if let Some(reason) = &r.pass_skipped_reason {
         attributes.push(kv_string("loom.pass_skipped_reason", reason.clone()));
+    }
+    if let Some(age) = r.remote_tip_age_s {
+        attributes
+            .push(kv_int("loom.prompt.remote_tip_age_s", i64::try_from(age).unwrap_or(i64::MAX)));
     }
     attributes.extend(prompt_tree::attributes(r.prompt.as_ref()));
     let body = serde_json::to_string(r).unwrap_or_default();
@@ -50,6 +54,7 @@ mod tests {
             captured_at: chrono::Utc::now(),
             repo: Some("o/r".to_string()),
             pass_skipped_reason: skipped.map(str::to_string),
+            remote_tip_age_s: Some(120),
             prompt: Some(PromptTree {
                 commit: "a".repeat(40),
                 loom_version: Some("0.19.1100".to_string()),
