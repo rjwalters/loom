@@ -113,6 +113,18 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     }
 }
 
+/// The forge the ladder writes through: its write scope is vetted under
+/// `root`'s own per-owner credential, not this process's (#12606). Under the
+/// process credential a repo owned by another account than the workspace's
+/// was refused (#9548) and the ladder marker never reached the forge.
+fn root_forge(root: &Path, repo: Option<String>) -> crate::operator_decision::cli::GhForge {
+    crate::operator_decision::cli::GhForge::for_root_credential(
+        root.to_path_buf(),
+        repo,
+        crate::write_scope::default_gh(),
+    )
+}
+
 /// Record a spawn-time refusal of `(item, role)` in the ledger, so the next
 /// draw skips the pair while it cools down and the `claim_lost` counter
 /// counts (the integrated review's M1).
@@ -134,7 +146,7 @@ pub fn record_refusal(
         ran_for: std::time::Duration::ZERO,
         failure_class: None,
     };
-    let mut forge = crate::operator_decision::cli::GhForge::new(root.to_path_buf(), None);
+    let mut forge = root_forge(root, None);
     if let Ok(mut reg) = registry.lock() {
         reg.record_step_outcome(&run, &mut forge);
     }
@@ -185,8 +197,7 @@ pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
             run.outcome.class.as_str(),
             run.outcome.reason
         );
-        let mut forge =
-            crate::operator_decision::cli::GhForge::new(root.to_path_buf(), Some(slug.clone()));
+        let mut forge = root_forge(root, Some(slug.clone()));
         if let Ok(mut reg) = registry.lock() {
             reg.record_step_outcome(&run, &mut forge);
             // #12152: the step's terminal bus event (the narration sink's
@@ -204,6 +215,65 @@ mod tests {
 
     fn labels(ls: &[&str]) -> Vec<String> {
         ls.iter().map(|l| (*l).to_string()).collect()
+    }
+
+    /// #12606: the ladder marker is written on a repo whose owner differs
+    /// from the workspace's. The process credential is read-only there; only
+    /// the root's registered per-owner credential can write, so the write is
+    /// vetted and sent under that one, and a forge built without it is refused.
+    #[test]
+    #[serial_test::serial]
+    fn the_ladder_write_uses_the_roots_owner_credential() {
+        use crate::credential_preflight::{clear_owner_root_registry, register_root_gh_config_dir};
+        use crate::operator_decision::cli::{Forge, GhForge};
+        use crate::write_scope_test_support::WritableRoot;
+        use std::os::unix::fs::PermissionsExt;
+
+        std::env::remove_var("LOOM_REPO");
+        clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("other-owner-root");
+        let fixture = WritableRoot::read_only(&root, None);
+        let owner_dir = base.join("gh-config-owner");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        register_root_gh_config_dir(&root, &owner_dir);
+
+        // Reports `push` for the repo only under the owner's GH_CONFIG_DIR;
+        // logs every PATCH with the credential it ran under.
+        let log = base.join("calls.log");
+        let gh = base.join("gh");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = api ] && [ \"$2\" = 'repos/{repo}' ]; then\n\
+             if [ \"$GH_CONFIG_DIR\" = '{owner}' ]; then echo '{{\"push\":true}}'; \
+             else echo '{{\"pull\":true}}'; fi\n\
+             exit 0\nfi\n\
+             if [ \"$1\" = api ] && [ \"$2\" = installation/repositories ]; then exit 1; fi\n\
+             echo \"$GH_CONFIG_DIR|$*\" >> '{log}'\n\
+             echo '{{}}'\n",
+            repo = fixture.repo,
+            owner = owner_dir.display(),
+            log = log.display(),
+        );
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("LOOM_GH_BIN", &gh);
+
+        let mut forge = root_forge(&root, Some(fixture.repo.clone()));
+        let written = Forge::set_body(&mut forge, 7, "body");
+        let mut process_cred = GhForge::new(root.clone(), Some(fixture.repo.clone()));
+        let refused = Forge::set_body(&mut process_cred, 7, "body");
+        std::env::remove_var("LOOM_GH_BIN");
+
+        assert_eq!(written, Ok(()), "the owner's credential must write");
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("refusing the write (#9548)"), "{refused}");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let patches: Vec<&str> = calls.lines().filter(|l| l.contains("-X PATCH")).collect();
+        assert_eq!(patches.len(), 1, "{calls}");
+        assert!(patches[0].starts_with(&owner_dir.display().to_string()), "{calls}");
+        clear_owner_root_registry();
     }
 
     #[test]

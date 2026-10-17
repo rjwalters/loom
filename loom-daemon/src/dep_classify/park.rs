@@ -85,9 +85,12 @@ pub fn apply(
         remove_labels: remove_labels.to_vec(),
         dry_run: false,
     };
-    let mut forge = crate::operator_decision::cli::GhForge::new(
+    // Vetted under the root's own per-owner credential (#12606): a repo of
+    // another owner than the process credential's is otherwise refused.
+    let mut forge = crate::operator_decision::cli::GhForge::for_root_credential(
         repo_root.to_path_buf(),
         Some(repo.to_string()),
+        crate::write_scope::default_gh(),
     );
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = crate::park_record::apply::apply(&mut forge, &req, &mut out, &mut err);
