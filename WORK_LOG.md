@@ -7,6 +7,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-17
+- **PR #12663**: fix: classify GitHub's snake_case merge-queue removal reasons
+- **PR #12660**: Champion: critical-files-only standing authorization (criticalFilesOnly)
+- **PR #12659**: feat: export merge-queue records to OTLP as merge_queue.event
+- **Issue #12661** (closed): Merge-queue removal classifier misses GitHub's snake_case reasons: checks_timed_out → Unknown → loom:operator
+- **Issue #12648** (closed): Champion: a critical-files-only standing authorization (waive #3 for named critical files, keep #2 judgment for the rest)
 - **PR #12657**: fix: log tick-deadline listing stops at debug in the intake singleton
 - **PR #12654**: fix: resolve the loom-ui floor incident when an alerted stall is dropped
 - **Issue #12652** (closed): fleet.floor-unsatisfiable never posts Resolved after the host rolls (set_basis drops the stored alert)
