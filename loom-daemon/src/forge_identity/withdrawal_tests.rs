@@ -63,6 +63,7 @@ fn a_core_rate_limit_withdraws_only_that_owners_core_bucket() {
         reset: Some(reset),
         secondary: false,
         retry_after: None,
+        remaining: None,
     };
     let w = withdraw_after_in(
         RoutingMode::Scoped,
@@ -130,6 +131,7 @@ fn a_header_reset_books_the_bucket_exhausted() {
         reset: Some(reset),
         secondary: false,
         retry_after: None,
+        remaining: None,
     };
     withdraw_after_in(RoutingMode::Scoped, app, "acme/x", failure, "test", now, &no_probe);
     let key = BucketKey::new("app-940002", "acme", Resource::Graphql);
@@ -137,6 +139,32 @@ fn a_header_reset_books_the_bucket_exhausted() {
     assert_eq!(r.remaining, Some(0));
     assert_eq!(r.reset_epoch, epoch_secs(reset));
     assert_eq!(r.source, forge_bucket_book::Source::Refusal);
+}
+
+#[test]
+fn a_refusal_reporting_headroom_does_not_withdraw_the_reader_until_reset() {
+    // #12630: a refusal whose own headers say the pool has budget (an
+    // implausible or synthetic low reading such as `remaining=30`) must not
+    // park the reader until the pool's hourly reset.
+    let now = t0();
+    let hourly = now + Duration::from_secs(3000);
+    let app = "940020";
+    let failure = Failure::RateLimited {
+        resource: Resource::Core,
+        reset: Some(hourly),
+        secondary: false,
+        retry_after: None,
+        remaining: Some(30),
+    };
+    let w = withdraw_after_in(RoutingMode::Scoped, app, "acme/x", failure, "test", now, &no_probe);
+    let (_, _, until, source, _) = scoped(&w);
+    assert_eq!(until, now + MIN_SCOPED_WITHDRAWAL);
+    assert_eq!(source, ResetSource::Headroom);
+    let key = BucketKey::new("app-940020", "acme", Resource::Core);
+    assert!(
+        forge_bucket_book::reading(&key, epoch_secs(now)).is_none(),
+        "a refusal showing headroom must not book the bucket exhausted"
+    );
 }
 
 // ---- reset source order and clamp -------------------------------------------
@@ -153,6 +181,7 @@ fn the_reset_comes_from_the_header_then_the_probe_then_the_default() {
             reset,
             secondary: false,
             retry_after: None,
+            remaining: None,
         };
         plan_withdrawal("acme/x", f, now, RoutingMode::Scoped, "940003", probe)
     };
@@ -312,6 +341,7 @@ fn a_secondary_withdrawal_covers_every_resource_of_that_owner_only() {
         reset: None,
         secondary: true,
         retry_after: Some(Duration::from_secs(120)),
+        remaining: None,
     };
     withdraw_after_in(RoutingMode::Scoped, app, "acme/x", f, "test", now, &no_probe);
     let during = now + Duration::from_secs(60);
@@ -371,6 +401,7 @@ fn the_refused_pool_comes_from_the_response_else_the_static_pool() {
             reset: epoch_time(1_900_000_500),
             secondary: false,
             retry_after: None,
+            remaining: Some(0),
         }
     );
     let f = classify_failure_in(RoutingMode::Scoped, "", Some(429), None, Resource::Search);

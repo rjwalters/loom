@@ -397,6 +397,7 @@ pub(crate) fn api_failure(
                 reset: reset_epoch.and_then(crate::forge_identity::epoch_time),
                 secondary,
                 retry_after: retry_after_secs.map(Duration::from_secs),
+                remaining: None,
             })
         }
         Err(ApiError::Http { status: 401, .. }) => Some(Failure::Credential),
