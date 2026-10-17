@@ -25,14 +25,6 @@ pub struct CheckRun {
     pub conclusion: Option<String>,
     /// When the run started; `None` until it has.
     pub started_at: Option<DateTime<Utc>>,
-    /// The GitHub Actions workflow run this check belongs to, when it is an
-    /// Actions job (`None` for any other app).
-    pub actions_run_id: Option<u64>,
-    /// The GitHub Actions **job** this check run is, when it is one — the id
-    /// whose log carries the `Merge <head> into <B>` line that gives the
-    /// input-scoped predicate its tested base (#8919). `None` for any other
-    /// app, which is one of the fallback-to-the-time-rule cases.
-    pub actions_job_id: Option<u64>,
 }
 
 pub mod fetch;

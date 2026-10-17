@@ -451,49 +451,14 @@ failing closed rather than evaluating the freshness guard on a subset (#8987)",
                 Some(s) if !s.is_empty() => Some(parse_iso("check run started_at", s)?),
                 _ => None,
             };
-            let app = v.pointer("/app/slug").and_then(|s| s.as_str());
-            let details_url = str_of("details_url");
             Ok(CheckRun {
                 name: str_of("name").unwrap_or_default().to_string(),
                 status: str_of("status").unwrap_or_default().to_string(),
                 conclusion: str_of("conclusion").map(String::from),
                 started_at,
-                actions_run_id: actions_run_id(app, details_url),
-                actions_job_id: actions_job_id(app, details_url),
             })
         })
         .collect()
-}
-
-/// The GitHub Actions workflow run a check run belongs to, when it is an
-/// Actions job. Parsed from `details_url`
-/// (`https://github.com/<o>/<r>/actions/runs/<run>/job/<job>`) and only
-/// trusted when the reporting app is `github-actions`: a third-party app's
-/// check run has no workflow run at all, and a URL that merely looks like one
-/// must not be mistaken for one. Reported for diagnostics; the tested base
-/// comes from the JOB id (see [`actions_job_id`]).
-#[must_use]
-pub fn actions_run_id(app_slug: Option<&str>, details_url: Option<&str>) -> Option<u64> {
-    if app_slug != Some("github-actions") {
-        return None;
-    }
-    let rest = details_url?.split("/actions/runs/").nth(1)?;
-    let id = rest.split('/').next()?;
-    id.parse::<u64>().ok()
-}
-
-/// The GitHub Actions **job** id a check run is, parsed from the same
-/// `details_url` (`…/actions/runs/<run>/job/<job>`) and trusted under the same
-/// `github-actions` app condition as [`actions_run_id`]. This is the id whose
-/// log carries the `Merge <head> into <B>` line (#8919).
-#[must_use]
-pub fn actions_job_id(app_slug: Option<&str>, details_url: Option<&str>) -> Option<u64> {
-    if app_slug != Some("github-actions") {
-        return None;
-    }
-    let rest = details_url?.split("/job/").nth(1)?;
-    let id = rest.split(['/', '?', '#']).next()?;
-    id.parse::<u64>().ok()
 }
 
 #[cfg(test)]
