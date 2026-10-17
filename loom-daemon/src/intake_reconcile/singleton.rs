@@ -418,6 +418,12 @@ pub fn run_repo(
             report.listing_shed = true;
             return report;
         }
+        Err(e) if e.downcast_ref::<store::TickDeadlineReached>().is_some() => {
+            // An expected deferral, not a reader-budget shed: no shed accounting.
+            log::debug!("intake_reconcile: {} listing deferred to the next tick: {e:#}", repo.slug);
+            report.listing_failed = true;
+            return report;
+        }
         Err(e) => {
             log::warn!("intake_reconcile: {} listing skipped this pass: {e:#}", repo.slug);
             report.listing_failed = true;
