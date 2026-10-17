@@ -186,6 +186,7 @@ struct Fake {
     listing: Vec<IntakeRow>,
     listing_fails: bool,
     listing_shed: bool,
+    listing_deadline: bool,
     /// Issue number → what the re-read answers (absent = read failure).
     current: std::collections::BTreeMap<u32, Option<Vec<String>>>,
     write_denied: bool,
@@ -208,6 +209,9 @@ impl IntakeForge for Fake {
             return Err(anyhow::Error::new(store::ReadShed {
                 until: std::time::SystemTime::now(),
             }));
+        }
+        if self.listing_deadline {
+            return Err(anyhow::Error::new(store::TickDeadlineReached));
         }
         if self.listing_fails {
             return Err(anyhow!("listing changed mid-walk"));
@@ -764,6 +768,22 @@ fn a_shed_listing_skips_the_repo_and_is_counted() {
     assert_eq!((pass.repos, pass.shed, pass.labelled), (0, 2, 0));
     assert_eq!(forge.calls, ["list acme/a", "list acme/b"]);
     assert_eq!(crate::forge_call_stats::counters::get(LISTING_SHED), before + 2);
+}
+
+/// A tick-deadline stop is a failed listing, but not a budget shed.
+#[test]
+fn a_tick_deadline_listing_is_failed_but_not_counted_as_shed() {
+    let before = crate::forge_call_stats::counters::get(LISTING_SHED);
+    let mut forge = Fake {
+        listing: vec![row(1, &[])],
+        listing_deadline: true,
+        ..Fake::default()
+    };
+    let report = run_repo(&mut forge, &repo("acme/a"), now(), 50);
+    assert!(report.listing_failed);
+    assert!(!report.listing_shed);
+    assert_eq!(forge.calls, ["list acme/a"]);
+    assert_eq!(crate::forge_call_stats::counters::get(LISTING_SHED), before);
 }
 
 /// End to end with every reader withdrawn for budget: the captain's walk
