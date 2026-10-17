@@ -229,6 +229,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart) | log, OTLP only | `ipc.rs` (`handle_client` run-state verbs), `observability/run_state_request.rs` |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` and the per-call checks, `emit_refused`) |
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
+| [`merge.authorization.evaluated`](#mergeauthorizationevaluated--one-merge-group-authorization-evaluation) | log, OTLP only | `forge_merge_queue/group_run.rs` (`run_group_check`) |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
 
@@ -4046,6 +4047,40 @@ provenance does not validate is not exported. Attributes: `loom.pr_number` and
 `version` / `revision` / `provenance_complete`
 (`MERGE_QUEUE_EVENT_LOG_ATTRIBUTE_KEYS`, kept by the collector's
 `transform/privacy` `keep_keys`, contract-tested). Both timestamps are `at`.
+
+
+### `merge.authorization.evaluated` — one merge-group authorization evaluation
+
+One OTLP log (INFO) per `run_group_check` call (Issue #12666), emitted on
+every return path including an unreadable group listing. It explains the
+`loom/merge-authorization` status the evaluation concluded; it changes neither
+the decision nor the posted status, and adds no forge read (`states()` and
+`latest_status()` are each still read at most once). **OTLP-only**
+(`native: false`). The short-lived `group-check` CLI has no sink and exports
+nothing; production emission is the daemon's `tick_groups` pass.
+
+`reason` is a closed set: `pending-other-checks` (other required checks not
+all successful yet), `pending-checks-unreadable` (their state could not be
+read), `denied` (a member is unauthorized), `denied-membership-unknown` (no
+live group, or one with no members), `status-post-failed` (authorized but the
+status write was not confirmed), `stale-authorization` (a prior `success`
+status is on the commit and the new conclusion is a failure), `groups-unreadable`
+(merge groups could not be read; nothing was posted) and `authorized`. A
+pending evaluation is never reported as denied, stale or post-failed; its
+`status_write` / `status_confirmed` fields carry the write result. `stale` is
+derived only from the newest status the evaluation already read; an unreadable
+newest status is never guessed into it.
+
+The JSON body holds `commit`, `reason`, `pr` (the entry the group was built
+for), `members`, `status_write` (`posted` / `unchanged` / `failed`),
+`status_confirmed` (true for `posted` and `unchanged`), `other_total` /
+`other_success` / `other_pending` / `other_failure` (only when the context read
+succeeded), `at` and `loom` build provenance (there is no policy-version
+constant; a record whose provenance does not validate is not exported). A field
+the evaluation did not read is omitted. Attributes: `loom.pr_number` and
+`loom.merge_authorization.*` (`MERGE_AUTHORIZATION_LOG_ATTRIBUTE_KEYS`, kept by
+the collector's `transform/privacy` `keep_keys`, contract-tested). Event time
+and observed time are both `at`.
 
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused

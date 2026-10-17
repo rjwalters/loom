@@ -162,6 +162,8 @@ pub mod auto_update_tick;
 
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
+/// `merge.authorization.evaluated` (#12666) — one merge-group authorization evaluation.
+pub mod merge_authorization;
 /// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
 pub mod merge_queue_event;
 /// `daemon.run_state_request` (#12546) — who issued a pause/drain/stop/restart.
@@ -532,6 +534,11 @@ macro_rules! telemetry_kind_table {
             /// sink appended, with its classified reason and enqueue-to-event
             /// latency (#12653). OTLP-only. See [`merge_queue_event`].
             MergeQueueEvent = "merge_queue.event" => $crate::telemetry::kinds::merge_queue_event::MergeQueueEventRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One merge-group authorization evaluation with a closed reason
+            /// token (#12666). OTLP-only. See [`merge_authorization`].
+            MergeAuthorization = "merge.authorization.evaluated" => $crate::telemetry::kinds::merge_authorization::MergeAuthorizationRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
