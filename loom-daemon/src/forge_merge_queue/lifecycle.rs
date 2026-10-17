@@ -345,6 +345,11 @@ impl std::fmt::Display for HandoffFailure {
                     required.join(", ")
                 }
             ),
+            HandoffFailure::Authz(HandoffError::WriterCannotPostStatuses(why)) => write!(
+                f,
+                "[WRITER_CANNOT_POST_STATUSES] {why}; no grant was written or revoked and any \
+                 existing queue entry is untouched"
+            ),
             HandoffFailure::Authz(e) => write!(f, "[AUTHZ_REFUSED] {e:?}"),
             HandoffFailure::Telemetry { error, revoked } => write!(
                 f,

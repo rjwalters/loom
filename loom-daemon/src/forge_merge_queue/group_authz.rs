@@ -273,6 +273,22 @@ pub trait StatusApi {
         state: StatusState,
         description: &str,
     ) -> Result<(), String>;
+
+    /// Whether the writer credential can post commit statuses, established
+    /// without writing one. The handoff asks before it grants or revokes
+    /// anything, so a credential that cannot post is a no-op rather than a
+    /// rollback of another identity's grant (#12579).
+    ///
+    /// The default is `Ok`: a seam that cannot tell leaves the post itself to
+    /// fail, as before.
+    ///
+    /// # Errors
+    ///
+    /// The credential is known unable to post; the text names the missing
+    /// permission.
+    fn can_post_statuses(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Map a conclusion to the status Loom posts.

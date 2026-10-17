@@ -94,6 +94,7 @@ see becomes a named `*_UNKNOWN` failure, never a pass.
 | Active `merge_queue` rule on the branch | `NO_MERGE_QUEUE_RULE`, `MERGE_QUEUE_UNKNOWN` |
 | Required status checks exist | `NO_REQUIRED_CHECKS` |
 | Each required check covers `merge_group` | `MISSING_REQUIRED_SUITE`, `REQUIRED_SUITE_UNCOVERED` |
+| Writer App installation has `statuses: write` | `WRITER_CANNOT_POST_STATUSES` |
 | No other audit finding | `WORKFLOW_NOT_QUALIFIED` |
 
 A GitHub App installation token (`ghs_…`, the fleet's usual credential) gets
@@ -102,9 +103,31 @@ check reads that as `PERMISSION_UNKNOWN`, not as a denial. To get a real
 answer, run `eligibility` with a credential whose permissions are visible, or
 record `can_push` in a `--facts` file.
 
+`WRITER_CANNOT_POST_STATUSES` is read from the writer App's installation
+(`GET /orgs/{org}/installations`, matched by app id or slug), never from
+`repos/{nwo}.permissions`. It fires when that installation's `statuses` is
+`read` or absent. It is not evaluated (no failure) when no writer App is
+configured for the owner or the installation list is unreadable.
+
 The `--facts` file has the shape
-`{"repository","owner_type","branch","can_push","rules":[{"type","ruleset_id","parameters"}]}`.
+`{"repository","owner_type","branch","can_push","writer_statuses","rules":[{"type","ruleset_id","parameters"}]}`
+(`writer_statuses` is `read`, `write` or `none`).
 A missing or `null` field means "unknown".
+
+## Handoff is idempotent and refuses a writer that cannot post
+
+`forge merge-queue step` / `handoff` posts the `loom/merge-authorization`
+status on the approved head, so the writer needs `statuses: write`. Two guards
+run before the first grant write or revoke (#12579):
+
+- A PR already queued at the approved head under a live grant for that same head
+  reports `LOOM-MERGE-QUEUE-HANDED-OFF` ("was already in the queue") and changes
+  nothing: no revoke, no re-grant, no status write. A credential that cannot
+  post statuses therefore cannot dequeue a PR another identity queued.
+- Otherwise, a writer App whose installation has `statuses` below `write` is
+  refused with `[WRITER_CANNOT_POST_STATUSES]` (exit 3) before any grant is
+  written. Nothing is revoked and an existing queue entry is left alone. Fix the
+  App's permission; Loom does not change it.
 
 ## How `ci.yml` is qualified
 

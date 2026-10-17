@@ -142,7 +142,11 @@ pub fn render_handoff(pr: u32, sha: &str, r: &Result<EnqueueOutcome, HandoffFail
                 HandoffFailure::Gate(q) => queue_exit_code(q),
                 HandoffFailure::Preflight(_) => 3,
                 HandoffFailure::Authz(HandoffError::Enqueue(q)) => queue_exit_code(q),
-                HandoffFailure::Authz(HandoffError::Store(_) | HandoffError::HeadStatus(_)) => 3,
+                HandoffFailure::Authz(
+                    HandoffError::Store(_)
+                    | HandoffError::HeadStatus(_)
+                    | HandoffError::WriterCannotPostStatuses(_),
+                ) => 3,
                 _ => 1,
             };
             lines(

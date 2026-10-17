@@ -262,6 +262,22 @@ impl StatusApi for GhLifecycleForge {
         )
         .map(|_| ())
     }
+
+    fn can_post_statuses(&self) -> Result<(), String> {
+        // Unreadable or no App writer: unknown, so leave it to the post.
+        match crate::merge_group_ci::eligibility::writer_statuses(
+            self.gh(),
+            self.root(),
+            self.owner(),
+        ) {
+            Some(level) if level != "write" => Err(format!(
+                "the writer App's installation has `statuses: {level}`; posting the \
+                 `{REQUIRED_CHECK_CONTEXT}` status needs `statuses: write` — nothing was \
+                 granted or revoked"
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl GroupForge for GhLifecycleForge {
