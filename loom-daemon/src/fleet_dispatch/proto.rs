@@ -157,6 +157,10 @@ pub enum RefusalReason {
     NotEligible,
     /// The host is at its cap.
     Cap,
+    /// A no-progress hold on the `(repo, item, step)` (#12541), as opposed
+    /// to [`Self::Held`], another host's live claim (#12551). A worker
+    /// that predates it reads it as [`Self::Other`] and still refuses.
+    Cooldown,
     /// A reason this build does not know (a newer server). Never sent by
     /// this server.
     #[serde(other)]
@@ -172,6 +176,7 @@ impl RefusalReason {
             Self::Grace => "grace",
             Self::NotEligible => "not_eligible",
             Self::Cap => "cap",
+            Self::Cooldown => "cooldown",
             Self::Other => "other",
         }
     }
@@ -322,6 +327,7 @@ mod tests {
             RefusalReason::Grace,
             RefusalReason::NotEligible,
             RefusalReason::Cap,
+            RefusalReason::Cooldown,
         ] {
             assert_eq!(serde_json::to_value(r).unwrap(), json!(r.as_str()));
         }
