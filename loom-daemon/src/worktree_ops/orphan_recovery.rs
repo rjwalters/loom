@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use super::claim_file::has_valid_claim;
 use super::gh;
 use super::gh::OpenPrProbe;
-use super::liveness::{active_locked_issues, locks_dir};
+use super::liveness::active_locked_issues;
 use super::spawn_loop_state::{read_spawn_loop_state, SpawnLoopState};
 
 pub const DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECS: i64 = 300;
@@ -1036,13 +1036,6 @@ pub fn format_result_json(result: &OrphanRecoveryResult) -> String {
     serde_json::to_string_pretty(&obj).unwrap_or_default()
 }
 
-/// Path to the spawn-loop claim-lock directory (re-exported for the CLI's
-/// help text / diagnostics).
-#[must_use]
-pub fn locks_dir_for(repo_root: &Path) -> PathBuf {
-    locks_dir(repo_root)
-}
-
 /// The one-line stderr diagnostic printed for the CLI's exit code `2`
 /// ("orphaned claims found in dry-run mode") — issue #6392. Exit `2` here is
 /// a *report*, not a failure: the assessment ran cleanly and simply found
@@ -1090,6 +1083,7 @@ pub fn format_dry_run_orphans_found_stderr(orphaned_count: usize) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::liveness::locks_dir;
     use crate::write_scope_test_support::WritableRoot;
     use serial_test::serial;
     use tempfile::tempdir;

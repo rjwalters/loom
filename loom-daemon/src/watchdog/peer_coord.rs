@@ -392,15 +392,6 @@ pub fn write_sentinel(sentinel: &Path, issue_ref: &str, reporter: &report::Repor
     }
 }
 
-/// The issue reference a previous escalation recorded, if any.
-#[must_use]
-pub fn sentinel_issue_ref(sentinel: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(sentinel).ok()?;
-    let mut it = text.split_whitespace();
-    let _ts = it.next()?;
-    it.next().map(str::to_string)
-}
-
 /// #7664: a REPEAT degradation inside the dedup window comments on the
 /// existing tracking issue and reopens it, instead of filing a fresh one.
 ///
