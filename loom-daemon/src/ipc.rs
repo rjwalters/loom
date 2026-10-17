@@ -10,6 +10,7 @@ use crate::role_validation;
 use crate::sweep_registry::{
     poll_and_classify_spawned_child, BeginCancel, BeginIssueDispatch, SweepRegistry,
 };
+use crate::telemetry::kinds::run_state_request::RunStateVerb;
 use crate::terminal::TerminalManager;
 use crate::types::{CredentialPreflightReport, DaemonStatusReport, Event, Request, Response};
 use crate::workspace_pool::WorkspacePool;
@@ -616,6 +617,9 @@ async fn handle_client(
     drain_state: Arc<DrainState>,
     status_flights: Arc<status_off_runtime::StatusFlights>,
 ) -> Result<()> {
+    // #12546: the peer, read once per connection before the split. Best effort;
+    // a platform without peer credentials leaves the caller fields absent.
+    let peer = crate::observability::run_state_request::Peer::from_cred(stream.peer_cred().ok());
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -799,6 +803,18 @@ async fn handle_client(
             then_exit,
         } = request
         {
+            let request_id = crate::observability::run_state_request::observe(
+                RunStateVerb::Drain,
+                vec![
+                    format!(
+                        "timeout_secs={}",
+                        timeout_secs.map_or(String::new(), |t| t.to_string())
+                    ),
+                    format!("force_after_timeout={force_after_timeout}"),
+                    format!("then_exit={then_exit}"),
+                ],
+                peer,
+            );
             let response = handle_drain_request(
                 &drain_state,
                 &workspace_pool,
@@ -810,6 +826,9 @@ async fn handle_client(
                 // #9588: every IPC drain request comes from an operator.
                 DrainOrigin::Operator,
             );
+            if matches!(response, Response::DaemonDrain { accepted: true, .. }) {
+                crate::observability::run_state_request::arm(&request_id, RunStateVerb::Drain);
+            }
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -819,12 +838,34 @@ async fn handle_client(
 
         // #11812: host maintenance. Acked at once; H4 runs on its supervisor.
         if let Request::PauseThenExit = request {
+            let request_id = crate::observability::run_state_request::observe(
+                RunStateVerb::PauseThenExit,
+                vec![],
+                peer,
+            );
             let response = crate::auto_update::pause_roll::maintenance::handle_request(
                 &drain_state,
                 &workspace_pool,
                 &fallback_root,
                 &event_bus,
             );
+            if let Response::HostMaintenancePause {
+                accepted,
+                manifest_id,
+                ..
+            } = &response
+            {
+                if *accepted {
+                    crate::observability::run_state_request::arm(
+                        &request_id,
+                        RunStateVerb::PauseThenExit,
+                    );
+                }
+                // The manifest id the client prints, for the same request.
+                if let Some(id) = manifest_id {
+                    log::info!("run-state request {request_id}: pause manifest {id}");
+                }
+            }
             writer
                 .write_all(serde_json::to_string(&response)?.as_bytes())
                 .await?;
@@ -834,8 +875,16 @@ async fn handle_client(
         }
 
         if let Request::AbortDrain = request {
+            crate::observability::run_state_request::observe(
+                RunStateVerb::AbortDrain,
+                vec![],
+                peer,
+            );
             let outcome = drain_state.abort_checked();
             let was_draining = outcome == AbortOutcome::Aborted;
+            if was_draining {
+                crate::observability::run_state_request::abort();
+            }
             let _ = event_bus.publish_generic(
                 "daemon.drain.aborted",
                 serde_json::json!({ "was_draining": was_draining }),
@@ -872,11 +921,19 @@ async fn handle_client(
         // and keeps running (do_exit == false). Mirrors the
         // CancelSweep/DaemonStatus interception.
         if let Request::RestartDaemon = request {
+            let request_id = crate::observability::run_state_request::observe(
+                RunStateVerb::Restart,
+                vec![],
+                peer,
+            );
             // #5119: the count is read BEFORE the decision so the ack can state
             // plainly what this exit is about to do to that work (destroyed on
             // systemd's cgroup-scoped stop job, preserved on launchd).
             let in_flight = count_in_flight_sweeps(&workspace_pool, &fallback_root);
             let (response, do_exit) = build_restart_decision(in_flight);
+            if do_exit {
+                crate::observability::run_state_request::arm(&request_id, RunStateVerb::Restart);
+            }
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -912,6 +969,14 @@ async fn handle_client(
             continue;
         }
 
+        if matches!(request, Request::Shutdown) {
+            let id = crate::observability::run_state_request::observe(
+                RunStateVerb::Shutdown,
+                vec![],
+                peer,
+            );
+            crate::observability::run_state_request::arm(&id, RunStateVerb::Shutdown);
+        }
         crate::observability::shutdown::intercept(&request).await;
         let response = handle_request(
             request,

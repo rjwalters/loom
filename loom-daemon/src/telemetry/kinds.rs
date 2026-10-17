@@ -162,6 +162,8 @@ pub mod auto_update_tick;
 
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
+/// `daemon.run_state_request` (#12546) — who issued a pause/drain/stop/restart.
+pub mod run_state_request;
 /// `write_scope.refused` (#12168) — a daemon write the #9548 gate refused.
 pub mod write_scope_refused;
 
@@ -498,6 +500,12 @@ macro_rules! telemetry_kind_table {
             /// whether a relaunch is expected, and the in-flight sweeps. OTLP-only.
             /// See [`daemon_exit`].
             DaemonExit = "daemon.exit" => $crate::telemetry::kinds::daemon_exit::DaemonExitRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One run-state IPC request (pause, drain, abort-drain, stop,
+            /// restart) and its caller, on receipt (#12546). OTLP-only. See
+            /// [`run_state_request`].
+            RunStateRequest = "daemon.run_state_request" => $crate::telemetry::kinds::run_state_request::RunStateRequestRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One agent scope's applied memory limit, its source, the peak

@@ -13,6 +13,7 @@ use std::time::Instant;
 use chrono::Utc;
 
 use super::queue::QueueSink;
+use super::run_state_request::ExitLink;
 use crate::ipc::drain_state::DrainOrigin;
 use crate::telemetry::kinds::daemon_exit::{DaemonExitRecord, InFlightFate, RequestedBy};
 use crate::telemetry::provenance::Provenance;
@@ -118,20 +119,34 @@ pub fn build_record(
         in_flight_sweeps: in_flight,
         in_flight_fate: InFlightFate::for_supervisor(supervisor),
         uptime_s,
+        request_id: None,
+        request_verb: None,
+        caused_by_request_id: None,
         observed_at: Utc::now(),
         loom: Provenance::current(),
     }
 }
 
+/// Quote the request behind the exit (#12546), when the daemon's own state
+/// explains it.
+#[must_use]
+pub fn with_link(mut record: DaemonExitRecord, link: ExitLink) -> DaemonExitRecord {
+    record.request_id = link.request_id;
+    record.caused_by_request_id = link.caused_by_request_id;
+    record.request_verb = link.request_verb.map(|v| v.as_str().to_string());
+    record
+}
+
 fn current_record(cause: ExitCause, code: i32) -> DaemonExitRecord {
     let in_flight = IN_FLIGHT.get().map(|lister| lister()).unwrap_or_default();
-    build_record(
+    let record = build_record(
         cause,
         code,
         in_flight,
         crate::ipc::detect_supervisor().as_deref(),
         STARTED.get().map(|at| at.elapsed().as_secs()),
-    )
+    );
+    with_link(record, super::run_state_request::link_for(cause, Instant::now()))
 }
 
 /// Enqueue the `daemon.exit` record on `sink`.
