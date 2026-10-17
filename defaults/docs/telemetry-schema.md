@@ -4081,9 +4081,15 @@ Attributes: `loom.merge_queue.queue_state` / `queue_complete` / `queue_depth`
 `transform/privacy` `keep_keys`, contract-tested).
 
 **Queue-regime snapshot (`check_response_timeout_minutes`,
-`max_entries_to_build`, `grouping_strategy`): not exported.** No existing read
-returns those fields (`forge_merge_config.rs` reads `repos/<nwo>/rulesets` for
-names and linear-history only), and adding one is out of scope.
+`max_entries_to_build`, `grouping_strategy`): not exported (deferred).** These
+settings live in the active `merge_queue` rule's `parameters`. An existing read
+already carries them: `merge_group_ci/eligibility.rs:347` does
+`GET repos/<nwo>/rules/branches/<branch>?per_page=100` and keeps the active
+`merge_queue` rule's parameters as opaque JSON in `Eligibility.merge_queue`
+(they are not named in non-test Rust because the field is passed through
+untyped). That read is a CLI eligibility check, not a daemon-tick read, so it
+is not used here: emitting from it would be on-demand rather than on change.
+The snapshot is tracked as a follow-up (see the PR for the issue link).
 
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused
