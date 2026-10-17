@@ -31,6 +31,7 @@ struct FakeForge {
     require_head_status: Cell<bool>,
     dequeue_fails: Cell<bool>,
     revoke_on_enqueue: Cell<bool>,
+    enqueue_fails: Cell<bool>,
 }
 
 impl FakeForge {
@@ -46,6 +47,7 @@ impl FakeForge {
             require_head_status: Cell::new(true),
             dequeue_fails: Cell::new(false),
             revoke_on_enqueue: Cell::new(false),
+            enqueue_fails: Cell::new(false),
         }
     }
     fn read_facts(&self) -> Result<AuthzFacts, String> {
@@ -107,6 +109,11 @@ impl QueueApi for FakeForge {
         })
     }
     fn enqueue(&self, _pr: u32, _n: &str, expected: &str) -> Result<EnqueueAck, QueueError> {
+        if self.enqueue_fails.get() {
+            return Err(QueueError::Forge {
+                detail: "502 transient".into(),
+            });
+        }
         let green = self.head_status.borrow().get(expected) == Some(&StatusState::Success);
         if self.require_head_status.get() && !green {
             return Err(QueueError::Forge {
@@ -420,6 +427,18 @@ fn rolled_back_handoff_withdraws_the_head_success() {
     f.revoke_on_enqueue.set(true);
     assert!(handoff(&f, &s).is_err());
     assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Failure));
+}
+
+#[test]
+fn transient_enqueue_failure_leaves_pending_not_failure_and_retry_enqueues() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.enqueue_fails.set(true);
+    let e = handoff(&f, &s).unwrap_err();
+    assert!(matches!(e, HandoffError::Enqueue(_)), "{e:?}");
+    assert_eq!(s.get(PR).unwrap(), None, "grant revoked");
+    assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Pending));
+    f.enqueue_fails.set(false);
+    assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::Enqueued { .. })));
 }
 
 #[test]
