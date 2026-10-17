@@ -626,6 +626,18 @@ assert_eq "NOT ELIGIBLE:" "$out" "no critical-file hit at all: the class does no
 out="$(NO_CRIT_PATTERNS=1 run_eval critical "$CFO_CLASS" "$WF_DOC" "$MIX_OK" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "CRITICAL_PATTERNS not in scope: fails closed"
 
+out="$(NO_CRIT_PATTERNS=1 run_eval critical "$CFO_ALL" "$WF_DOC" "$MIX_OK" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "no CRITICAL_PATTERNS, class without forbiddenDiffPatterns: fails closed (empty-hits guard)"
+
+out="$(run_eval critical "$CFO_ALL" "$DOC" AUTO green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "no hits, class without forbiddenDiffPatterns: not applied (empty-hits guard)"
+
+# A diff over 128 KiB (Linux MAX_ARG_STRLEN) must still reach the class: the diff goes to jq on stdin, never as an argument.
+BIG_MIX="$(head -c 200000 /dev/zero | tr '\0' 'x' | jq -R -s -c --arg wf "$WF" --arg doc "$DOC" \
+    '[{filename:$wf, patch:"@@ -1 +1,2 @@\n name: ci\n+# a comment"}, {filename:$doc, patch:("@@ -1 +1,2 @@\n+" + .)}]')"
+out="$(run_eval critical "$CFO_CLASS" "$WF_DOC" "$BIG_MIX" green "loom:pr")"
+assert_eq "ELIGIBLE:ci-only" "$out" "a >128 KiB files-API diff does not disable the class (no argv-limit failure)"
+
 out="$(run_eval critical "$CFO_CLASS" "$WF_DOC" "$MIX_OK" red "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "red CI: greenCi does not hold"
 

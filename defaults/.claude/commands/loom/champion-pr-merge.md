@@ -643,7 +643,7 @@ standing_auth_fetch_diff() {
 # mode $2 is criterion #3's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
   local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN
-  local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
+  local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   STANDING_AUTH_RESULT="NOT ELIGIBLE"
   STANDING_AUTH_ID=""
   STANDING_AUTH_SCOPE=""
@@ -669,8 +669,10 @@ standing_auth_eval() {
     # the same substring test criterion #3's loop applies. No patterns in
     # scope, or a failed read, leaves CRIT_DIFF empty and every
     # criticalFilesOnly class ineligible (fail closed).
-    CRIT_DIFF=$(printf '%s\n' ${CRITICAL_PATTERNS[@]+"${CRITICAL_PATTERNS[@]}"} | jq -R 'select(length > 0)' | jq -s -c --argjson d "$DIFF_JSON" \
-      '. as $p | [$d[] | . as $f | select(any($p[]; . as $q | (($f.filename | contains($q)) or (($f.previous_filename // "") | contains($q)))))]' 2>/dev/null) || CRIT_DIFF=""
+    # Diff on stdin, patterns as the (small) argument: --argjson of a >128 KiB diff hits MAX_ARG_STRLEN on Linux.
+    CRIT_PATS_JSON=$(printf '%s\n' ${CRITICAL_PATTERNS[@]+"${CRITICAL_PATTERNS[@]}"} | jq -R 'select(length > 0)' | jq -s -c .) || CRIT_PATS_JSON='[]'
+    CRIT_DIFF=$(printf '%s' "$DIFF_JSON" | jq -c --argjson p "$CRIT_PATS_JSON" \
+      '[.[] | . as $f | select(any($p[]; . as $q | (($f.filename | contains($q)) or (($f.previous_filename // "") | contains($q)))))]' 2>/dev/null) || CRIT_DIFF=""
     printf '%s' "$CRIT_DIFF" | jq -e 'length > 0' >/dev/null 2>&1 || CRIT_DIFF=""
     [ -z "$CRIT_DIFF" ] || CRIT_MATCH_FILES=$(printf '%s' "$CRIT_DIFF" | jq -r '.[] | .filename, (.previous_filename // empty)') || CRIT_DIFF=""
   else
