@@ -484,10 +484,10 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
     // #10089: counted via the facade (`claim.labels`); it supplies the #5401
     // cross-owner GH_CONFIG_DIR from `root`. `gh issue view` takes --repo
     // (unlike `gh api`, #8263).
-    // W4-C: a claim check reads labels its own caller may just have
-    // written: the writer answers.
+    // #12555: a reader or the gateway answers, never the writer (#12394).
+    // The labels a claim check gates on are a peer's as often as the
+    // caller's own, and the writer reads a peer's write no fresher.
     let inv = crate::claim_reconciliation::gh_call::read("claim.labels", gh_bin, root)
-        .writer_identity()
         .args([
             "issue",
             "view",
@@ -663,9 +663,10 @@ pub(crate) fn read_freshest_live_lease(
     // #10089: counted via the facade (`claim.lease_comments`); it applies the
     // #5401 GH_CONFIG_DIR and the #8263 `LOOM_REPO` -> GH_REPO env contract.
     let jq = issue_lease_comments_jq();
-    // W4-C: the lease being checked may be the caller's own, just written.
+    // #12555: a reader or the gateway answers, never the writer (#12394).
+    // A lagging read can only miss a lease: the caller's own (it is about to
+    // claim anyway) or a peer's (which the writer reads no fresher).
     let inv = crate::claim_reconciliation::gh_call::read("claim.lease_comments", gh_bin, root)
-        .writer_identity()
         .args([
             "api",
             &format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"),

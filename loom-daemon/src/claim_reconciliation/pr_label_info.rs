@@ -57,15 +57,15 @@ pub(super) struct PrLabelInfo {
 
 /// One REST `pulls/{n}` read (#10507; was GraphQL `gh pr view --json
 /// labels,isDraft`). It runs right after `reclaim_pr`'s own
-/// `claim.pr_reclaim` write, so it is pinned to the WRITER identity
-/// ([`gh_call::read_own_write`]): a reader App can lag that write (W4-C). No
-/// ETag — the write just moved it, so a conditional read would always `200`.
+/// `claim.pr_reclaim` write, and like every daemon read it goes to a reader
+/// or the gateway, never the writer (#12555): it looks only for the state
+/// labels and the draft flag, which that write did not touch, so a reader
+/// lagging the write cannot change its answer. No ETag — the write just moved
+/// it, so a conditional read would always `200`.
 /// `LOOM_REPO` reaches `gh api` as `GH_REPO` through the facade (#8263).
 pub(super) fn pr_label_names(gh_bin: &Path, root: &Path, pr_number: u32) -> Result<PrLabelInfo> {
     let path = format!("repos/{{owner}}/{{repo}}/pulls/{pr_number}");
-    let out = gh_call::output(
-        gh_call::read_own_write("claim.pr_labels", gh_bin, root).args(["api", &path]),
-    )?;
+    let out = gh_call::output(gh_call::read("claim.pr_labels", gh_bin, root).args(["api", &path]))?;
     if !out.status.success() {
         let (root, err) = (root.display(), gh_call::stderr(&out));
         return Err(anyhow!("gh api {path} failed in {root}: {err}"));

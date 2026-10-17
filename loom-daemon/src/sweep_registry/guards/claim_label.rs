@@ -80,17 +80,17 @@ impl SweepRegistry {
     pub(crate) fn fetch_label_applied_at(&self, issue: u32, label: &str) -> Option<DateTime<Utc>> {
         // Counted as `guard.claim_timeline` (#10089); the facade applies the
         // cross-owner GH_CONFIG_DIR (#5401) and `LOOM_REPO` as GH_REPO (#8263 —
-        // `gh api` has no `--repo` flag). Stays on the writer (#12389): it
-        // reads back a claim label this daemon may just have written, right
-        // before a restore or reap acts on it, and a reader or the gateway's
-        // cache could still answer from before that write.
+        // `gh api` has no `--repo` flag). A reader or the gateway answers,
+        // never the writer (#12555, #12394). The claim this guards against is
+        // a PEER's re-claim, which the writer reads no fresher than a reader,
+        // and the gateway's ETag cache revalidates every hit upstream.
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
         let jq = format!(
             r#"[.[] | select(.event == "labeled" and .label.name == "{label}") | .created_at] | max // empty"#
         );
         let jq = jq.as_str();
         let output = self
-            .gh_read_own_write("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
+            .gh_read("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
             .ok()
             .flatten()?;
         if !output.status.success() {
@@ -259,12 +259,14 @@ impl SweepRegistry {
     /// The newest `labeled loom:building` event's `(actor login, created_at)`.
     /// `None` on any read failure or unparseable output (callers fail closed).
     pub(crate) fn fetch_claim_event(&self, issue: u32) -> Option<(String, DateTime<Utc>)> {
-        // Writer-pinned like `fetch_label_applied_at` (#12389): the claim
-        // decision this feeds must see the label event that was just written.
+        // On a reader like `fetch_label_applied_at` (#12555). Freshness guard:
+        // the caller acts only on an event it attributes to its own flip
+        // (`claim_event_is_own_flip`); a read lagging that flip shows an older
+        // event and fails closed (no revert).
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
         let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:building")] | max_by(.created_at) | select(. != null) | "\(.actor.login // "")\t\(.created_at)""#;
         let output = self
-            .gh_read_own_write("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
+            .gh_read("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
             .ok()
             .flatten()?;
         if !output.status.success() {

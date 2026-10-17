@@ -56,6 +56,13 @@ fn build(
     let inv = GhInvocation::new(Operation::new(op), intent, GhTarget::None, timeout)
         .program(gh_bin)
         .current_dir(root);
+    // #12555: a daemon read is a reader's or the gateway's, or it is shed —
+    // never the writer's (#12394).
+    let inv = if intent == AccessIntent::Read {
+        inv.reader_only()
+    } else {
+        inv
+    };
     match forge_op_for(op) {
         Some(fop) => inv.forge_op(fop),
         None => inv,
@@ -146,15 +153,18 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
     })
 }
 
-/// A read ([`AccessIntent::Read`]) — the common case.
+/// A read ([`AccessIntent::Read`]) — the common case. Reader-only
+/// ([`GhInvocation::reader_only`], #12555): served by a reader App or the
+/// read gateway, else shed; never the writer.
+///
+/// That includes a read-back of a fact this daemon just wrote. Read-your-write
+/// does not need the writer: the read is sent unconditionally (no
+/// `If-None-Match` from this daemon), the gateway's ETag cache revalidates
+/// every hit upstream, and GitHub's replica lag after a write is the same
+/// whichever credential asks. See `daemon-reference.md` ("The writer is
+/// never used for reads").
 pub(crate) fn read(op: &'static str, gh_bin: &Path, root: &Path) -> GhInvocation {
     inv(op, AccessIntent::Read, gh_bin, root)
-}
-
-/// A read pinned to the writer: a read-back of a forge fact this daemon just
-/// wrote itself, where a reader App could still lag the write (W4-C).
-pub(crate) fn read_own_write(op: &'static str, gh_bin: &Path, root: &Path) -> GhInvocation {
-    read(op, gh_bin, root).writer_identity()
 }
 
 /// A write ([`AccessIntent::Write`]).

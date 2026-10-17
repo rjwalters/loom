@@ -281,12 +281,12 @@ fn deriving(root: &Path) -> TestRouting {
     }
 }
 
-/// The claim check's reads (its caller may just have written the label or
-/// lease it checks) and `merge_group_ci.read` (`permissions` depend on who
-/// asks) are pinned to the writer: driven through their own helpers with a
-/// reader on offer, none derives a route. The unpinned shapes would.
+/// `merge_group_ci.read` (`permissions` depend on who asks) is pinned to the
+/// writer: driven through its own helper with a reader on offer, it derives
+/// no route. The claim check's reads are not (#12555: they are reader-only
+/// daemon reads), so they take the reader route. The unpinned shapes derive.
 #[test]
-fn claim_check_and_merge_group_reads_never_derive() {
+fn claim_check_reads_ride_the_reader_and_merge_group_reads_never_derive() {
     let root = tempfile::tempdir().unwrap();
     let _g = install(deriving(root.path()));
     let gh = Path::new("gh");
@@ -300,14 +300,17 @@ fn claim_check_and_merge_group_reads_never_derive() {
     );
     let _ = crate::merge_group_ci::eligibility::probe("gh", "acme/widget", Some("main"));
     let seen = seen();
-    for op in [
-        "claim.labels",
-        "claim.lease_comments",
-        "merge_group_ci.read",
+    for (op, derives) in [
+        ("claim.labels", true),
+        ("claim.lease_comments", true),
+        ("merge_group_ci.read", false),
     ] {
         let mine: Vec<_> = seen.iter().filter(|s| s.op == op).collect();
         assert!(!mine.is_empty(), "{op} did not run through the facade: {seen:?}");
-        assert!(mine.iter().all(|s| s.route_slug.is_none()), "{op} derived: {mine:?}");
+        assert!(
+            mine.iter().all(|s| s.route_slug.is_some() == derives),
+            "{op} (derives: {derives}): {mine:?}"
+        );
     }
     // Control: unpinned, the same shapes derive (merge_group_ci's has no
     // cwd, and still derives because its path names the repo).
