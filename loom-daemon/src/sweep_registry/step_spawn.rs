@@ -142,9 +142,12 @@ pub struct StepRefusal {
     /// How the pre-claim ran, when it was the refusal (#12183).
     pub claim: Option<Box<lease::ClaimFacts>>,
     /// The captain's assignment the refusal gave back (#12450).
-    pub assignment_id: Option<String>,
+    pub assignment_id: Option<Box<str>>,
     /// What the captain's refusal said beyond its reason (#12707).
     pub captain: Option<Box<crate::fleet_dispatch::worker::Refusal>>,
+    /// Seconds the captain says its hold lasts (`retry_after_s`), for a
+    /// `captain_cooldown` refusal that carried one (#12704).
+    pub hold_secs: Option<u32>,
 }
 
 impl StepRefusal {
@@ -155,6 +158,7 @@ impl StepRefusal {
             claim: None,
             assignment_id: None,
             captain: None,
+            hold_secs: None,
         }
     }
 
@@ -163,8 +167,12 @@ impl StepRefusal {
         reason: crate::fleet_dispatch::proto::RefusalReason,
         refusal: crate::fleet_dispatch::worker::Refusal,
     ) -> Self {
+        let hold_secs = refusal
+            .retry_after_s
+            .map(|s| u32::try_from(s).unwrap_or(u32::MAX));
         Self {
             captain: Some(Box::new(refusal)),
+            hold_secs,
             ..Self::new(
                 crate::fleet_dispatch::worker::refusal_token(reason),
                 format!("the fleet-dispatch server refused the claim ({})", reason.as_str()),
@@ -197,7 +205,7 @@ pub(crate) fn give_back(
 ) -> StepRefusal {
     if let Some(grant) = grant {
         crate::fleet_dispatch::worker::refuse(grant, refusal.reason);
-        refusal.assignment_id = Some(grant.assignment_id.clone());
+        refusal.assignment_id = Some(grant.assignment_id.as_str().into());
     }
     refusal
 }

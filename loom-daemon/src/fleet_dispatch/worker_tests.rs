@@ -98,6 +98,35 @@ fn a_grant_carries_its_assignment_and_a_refusal_its_reason() {
     assert_eq!(refusal_token(RefusalReason::Cooldown), "captain_cooldown");
 }
 
+/// A cooldown refusal keeps the hold's length for the step tick (#12704); an
+/// answer without one reads as `None`.
+#[test]
+#[serial]
+fn a_cooldown_refusal_keeps_retry_after_and_tolerates_its_absence() {
+    reset_for_test();
+    let dir = tempdir().unwrap();
+    let bare = TestServer::start(|_, _| {
+        (200, json!({"server_epoch":"e1","granted":false,"reason":"cooldown"}))
+    });
+    enable(dir.path(), &bare.url(), true);
+    assert_eq!(
+        claim(dir.path(), 7, StepRole::Judge),
+        Ask::Refused(RefusalReason::Cooldown, Refusal::default())
+    );
+    let timed = refusing("cooldown");
+    enable(dir.path(), &timed.url(), true);
+    assert_eq!(
+        claim(dir.path(), 7, StepRole::Judge),
+        Ask::Refused(
+            RefusalReason::Cooldown,
+            Refusal {
+                held_by: None,
+                retry_after_s: Some(30)
+            }
+        )
+    );
+}
+
 /// `grace` claims as today and leaves the failure run alone: two failures,
 /// any number of graces, then one more failure enters fallback.
 #[test]

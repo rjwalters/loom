@@ -265,6 +265,13 @@ impl RegistrySpawner {
             Ok(_) => SpawnResult::Spawned,
             Err(e) => {
                 let reason = refusal_reason(&e);
+                if let Some(secs) = e
+                    .downcast_ref::<StepRefusal>()
+                    .filter(|r| r.reason == super::tick::REFUSAL_CAPTAIN_COOLDOWN)
+                    .and_then(|r| r.hold_secs)
+                {
+                    lock(registry).arm_captain_hold(request.item, request.role, secs);
+                }
                 if let Some(root) = self.roots.get(idx) {
                     super::step_end::record_refusal(
                         root,

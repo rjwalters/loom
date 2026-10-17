@@ -59,6 +59,16 @@ pub(crate) fn forge() -> Vec<RestIssue> {
 }
 
 pub(crate) fn workspace(idx: usize, repo: &str, rows: &[RestIssue]) -> StepWorkspace {
+    workspace_cooling(idx, repo, rows, Default::default())
+}
+
+/// [`workspace`] weighed against `cooldowns`, as the draw's query returns them.
+fn workspace_cooling(
+    idx: usize,
+    repo: &str,
+    rows: &[RestIssue],
+    cooldowns: crate::step_dispatch::outcome_ledger::StepCooldowns,
+) -> StepWorkspace {
     let pulls = rows
         .iter()
         .filter(|r| r.is_pull_request)
@@ -77,7 +87,7 @@ pub(crate) fn workspace(idx: usize, repo: &str, rows: &[RestIssue]) -> StepWorks
         build_backoff_engaged: false,
         pool_exhausted_roles: BTreeSet::new(),
         workspace_idx: idx,
-        cooldowns: Default::default(),
+        cooldowns,
     };
     StepWorkspace {
         idx,
@@ -1079,6 +1089,48 @@ fn a_captain_cooldown_refusal_is_free_and_does_not_end_the_tick() {
         .queue
         .iter()
         .any(|r| r.disposition == Some(Qd::PeerClaim)));
+}
+
+/// #12704: the pairs a tick's captain refused as cooling down are armed on
+/// the host (`arm_captain_hold`), so the next tick's draw drops them before
+/// any captain call, and counts them.
+#[test]
+fn a_tick_after_captain_cooldown_refusals_does_not_ask_about_them_again() {
+    let rows: Vec<RestIssue> = (1..=6)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut first = FakeSpawner {
+        refuse_first: Some((5, "captain_cooldown")),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut first);
+    let refused: Vec<(u32, StepRole)> = first
+        .asked
+        .iter()
+        .take(5)
+        .map(|(_, item, role, _)| (*item, *role))
+        .collect();
+    assert_eq!(refused.len(), 5, "tick 1 asked about five cooled-down items");
+    assert_eq!(tick.report.dispatched, 1);
+
+    // What `arm_captain_hold` leaves for the next draw's query.
+    let mut cooldowns = crate::step_dispatch::outcome_ledger::StepCooldowns::default();
+    for (item, role) in &refused {
+        cooldowns.insert(*item, *role, now() + chrono::Duration::seconds(300));
+    }
+    let mut second = FakeSpawner::default();
+    let ws = workspace_cooling(0, "acme/one", &rows, cooldowns);
+    let tick = run_with(vec![ws], limits(1), &mut second);
+    assert!(
+        second
+            .asked
+            .iter()
+            .all(|(_, item, role, _)| !refused.contains(&(*item, *role))),
+        "no captain call for a cooled-down item: {:?}",
+        second.asked
+    );
+    assert_eq!(tick.report.dispatched, 1);
+    assert_eq!(tick.report.skipped_noop_cooldown, 5, "counted as cooling down");
 }
 
 /// #12700: captain refusals have their own bound; past it they spend passes,
