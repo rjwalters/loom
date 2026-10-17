@@ -24,6 +24,9 @@ use super::group_authz::{
 use super::lifecycle::{transition_line, Ctx};
 use super::mode::MergeMode;
 use crate::gh_invocation::AccessIntent;
+use crate::telemetry::kinds::merge_queue_observed::{
+    MergeQueueObservedRecord, QueueEntryObservation,
+};
 
 /// Group discovery plus the status write.
 pub trait GroupForge: StatusApi {
@@ -90,7 +93,7 @@ pub const GROUPS_QUERY: &str = "query($owner: String!, $name: String!, $after: S
 const MAX_PAGES: usize = 50;
 
 /// One queue entry: position, member, and its group commit if built yet.
-type Entry = (u64, Member, Option<String>);
+pub type Entry = (u64, Member, Option<String>);
 
 /// Decode one page of [`GROUPS_QUERY`]: its entries and the cursor of the
 /// next page (`None` on the last). No queue (`mergeQueue: null`) is an empty
@@ -183,11 +186,62 @@ fn build_groups(mut entries: Vec<Entry>) -> Vec<MergeGroup> {
         .collect()
 }
 
+/// What one pass over the queue entries saw (#12667): the entries read, and
+/// whether the read reached the last page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRead {
+    /// Every entry read, in page order (not yet sorted by position).
+    pub entries: Vec<Entry>,
+    /// The error that stopped the read, `None` when every page was read.
+    pub error: Option<String>,
+}
+
 /// Read every page via `fetch` (given the cursor to resume after, `None` for
-/// the first page) and build the groups from the complete queue. Discovery is
-/// all-or-nothing: a failed or unconfirmable later page is an error, never a
-/// shorter group list, because [`GroupRevocation::passed_checks_withdrawn`]
-/// reads an empty list as "nothing left to withdraw".
+/// the first page), keeping the entries read before any failure.
+fn read_queue(fetch: &dyn Fn(Option<&str>) -> Result<serde_json::Value, String>) -> QueueRead {
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let step = fetch(cursor.as_deref()).and_then(|v| parse_page(&v));
+        let (page, next) = match step {
+            Ok(ok) => ok,
+            Err(e) => {
+                return QueueRead {
+                    entries,
+                    error: Some(e),
+                }
+            }
+        };
+        entries.extend(page);
+        match next {
+            None => {
+                return QueueRead {
+                    entries,
+                    error: None,
+                }
+            }
+            Some(c) if cursor.as_deref() == Some(c.as_str()) => {
+                return QueueRead {
+                    entries,
+                    error: Some("merge queue cursor did not advance".to_string()),
+                };
+            }
+            Some(c) => cursor = Some(c),
+        }
+    }
+    QueueRead {
+        entries,
+        error: Some(format!(
+            "merge queue deeper than {MAX_PAGES} pages; cannot confirm all groups were read"
+        )),
+    }
+}
+
+/// Read every page via `fetch` and build the groups from the complete queue.
+/// Discovery is all-or-nothing: a failed or unconfirmable later page is an
+/// error, never a shorter group list, because
+/// [`GroupRevocation::passed_checks_withdrawn`] reads an empty list as
+/// "nothing left to withdraw".
 ///
 /// # Errors
 ///
@@ -196,22 +250,67 @@ fn build_groups(mut entries: Vec<Entry>) -> Vec<MergeGroup> {
 pub fn fetch_all_groups(
     fetch: &dyn Fn(Option<&str>) -> Result<serde_json::Value, String>,
 ) -> Result<Vec<MergeGroup>, String> {
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut cursor: Option<String> = None;
-    for _ in 0..MAX_PAGES {
-        let (page, next) = parse_page(&fetch(cursor.as_deref())?)?;
-        entries.extend(page);
-        match next {
-            None => return Ok(build_groups(entries)),
-            Some(c) if cursor.as_deref() == Some(c.as_str()) => {
-                return Err("merge queue cursor did not advance".to_string());
-            }
-            Some(c) => cursor = Some(c),
-        }
+    groups_from_read(read_queue(fetch))
+}
+
+fn groups_from_read(read: QueueRead) -> Result<Vec<MergeGroup>, String> {
+    match read.error {
+        None => Ok(build_groups(read.entries)),
+        Some(e) => Err(e),
     }
-    Err(format!(
-        "merge queue deeper than {MAX_PAGES} pages; cannot confirm all groups were read"
-    ))
+}
+
+/// The `merge.queue.observed` record for one read (#12667), `None` when the
+/// build provenance is not valid. Built from the full entry list, not from
+/// [`build_groups`], which drops an entry with no group commit yet.
+///
+/// A read that failed before any entry was read is `unknown`, never an empty
+/// queue; one that failed later is `observed` with `complete = false`.
+#[must_use]
+pub fn observed_record(
+    read: &QueueRead,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    loom: crate::telemetry::provenance::Provenance,
+) -> Option<MergeQueueObservedRecord> {
+    if !loom.is_valid() {
+        return None;
+    }
+    let unknown = read.error.is_some() && read.entries.is_empty();
+    let mut entries: Vec<QueueEntryObservation> = if unknown {
+        Vec::new()
+    } else {
+        read.entries
+            .iter()
+            .map(|(position, member, commit)| QueueEntryObservation {
+                position: *position,
+                pr: member.pr,
+                head: member.head.clone(),
+                has_group_commit: commit.is_some(),
+            })
+            .collect()
+    };
+    entries.sort_by_key(|e| e.position);
+    Some(MergeQueueObservedRecord {
+        state: if unknown { "unknown" } else { "observed" }.to_owned(),
+        complete: read.error.is_none(),
+        order: entries.iter().map(|e| e.pr).collect(),
+        entries,
+        observed_at,
+        loom,
+    })
+}
+
+/// Emit `read` as a `merge.queue.observed` record. A no-op without an ops sink.
+fn emit_observed(read: &QueueRead) {
+    if let Some(record) = observed_record(
+        read,
+        chrono::Utc::now(),
+        crate::telemetry::provenance::Provenance::current(),
+    ) {
+        crate::observability::ops::emit_record(
+            crate::telemetry::TelemetryRecord::MergeQueueObserved(record),
+        );
+    }
 }
 
 /// Decode a single-page [`GROUPS_QUERY`] response. Pure.
@@ -299,7 +398,9 @@ impl GroupForge for GhLifecycleForge {
     }
 
     fn groups(&self) -> Result<Vec<MergeGroup>, String> {
-        fetch_all_groups(&|after| {
+        // #12667: the one existing entries read also reports what it saw,
+        // on transition (never on a timer); no extra forge call.
+        let read = read_queue(&|after| {
             let mut args: Vec<String> = vec![
                 "api".into(),
                 "graphql".into(),
@@ -321,7 +422,9 @@ impl GroupForge for GhLifecycleForge {
                 return Err(safe_detail(&errs.to_string()));
             }
             Ok(v)
-        })
+        });
+        emit_observed(&read);
+        groups_from_read(read)
     }
 }
 
@@ -473,5 +576,66 @@ mod tests {
         let nocur = json!({"data": {"repository": {"mergeQueue": {"entries": {
             "pageInfo": {"hasNextPage": true, "endCursor": null}, "nodes": []}}}}});
         assert!(fetch_all_groups(&|_| Ok(nocur.clone())).is_err());
+    }
+
+    fn prov() -> crate::telemetry::provenance::Provenance {
+        crate::telemetry::provenance::Provenance {
+            version: "0.19.1".into(),
+            revision: "9d8e226ce0123456789abcdef0123456789abcde".into(),
+            tree_state: "clean".into(),
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn observed_record_orders_entries_and_keeps_the_unbuilt_tail() {
+        let c1 = "1".repeat(40);
+        let p = page(&[node(2, 20, None), node(1, 10, Some(&c1))], None);
+        let read = read_queue(&|_| Ok(p.clone()));
+        let r = observed_record(&read, chrono::Utc::now(), prov()).unwrap();
+        assert_eq!((r.state.as_str(), r.complete), ("observed", true));
+        assert_eq!(r.order, [10, 20]);
+        assert!(r.entries[0].has_group_commit && !r.entries[1].has_group_commit);
+    }
+
+    #[test]
+    fn later_page_failure_is_incomplete_and_first_page_failure_is_unknown() {
+        let c1 = "1".repeat(40);
+        let p1 = page(&[node(1, 10, Some(&c1))], Some("cur1"));
+        let partial = read_queue(&|after| match after {
+            None => Ok(p1.clone()),
+            Some(_) => Err("boom".to_string()),
+        });
+        let r = observed_record(&partial, chrono::Utc::now(), prov()).unwrap();
+        assert_eq!((r.state.as_str(), r.complete, r.order.clone()), ("observed", false, vec![10]));
+
+        let failed = read_queue(&|_| Err("boom".to_string()));
+        let r = observed_record(&failed, chrono::Utc::now(), prov()).unwrap();
+        assert_eq!((r.state.as_str(), r.complete), ("unknown", false));
+        assert!(r.order.is_empty() && r.entries.is_empty());
+    }
+
+    #[test]
+    fn a_null_queue_is_observed_empty_not_unknown() {
+        let none = json!({"data": {"repository": {"mergeQueue": null}}});
+        let read = read_queue(&|_| Ok(none.clone()));
+        let r = observed_record(&read, chrono::Utc::now(), prov()).unwrap();
+        assert_eq!((r.state.as_str(), r.complete), ("observed", true));
+        assert!(r.order.is_empty());
+    }
+
+    #[test]
+    fn invalid_provenance_is_not_exported_and_the_read_count_is_unchanged() {
+        let p = page(&[], None);
+        let calls = std::cell::Cell::new(0);
+        let read = read_queue(&|_| {
+            calls.set(calls.get() + 1);
+            Ok(p.clone())
+        });
+        let mut bad = prov();
+        bad.revision = String::new();
+        assert!(observed_record(&read, chrono::Utc::now(), bad).is_none());
+        // Observing is a pure function of the read: it makes no fetch of its own.
+        assert_eq!(calls.get(), 1);
     }
 }

@@ -230,6 +230,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` and the per-call checks, `emit_refused`) |
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
 | [`hold.transition`](#holdtransition--a-hold-label-applied-to-or-removed-from-a-pr) | log, OTLP only | `park_record/apply.rs` (`journal_hold_add`), `cli/park_record.rs` (`released`), drained by `observability/hold_transition.rs` |
+| [`merge.queue.observed`](#mergequeueobserved--the-merge-queue-as-an-existing-read-saw-it) | log, OTLP only | `forge_merge_queue/group_github.rs` (`GroupForge::groups`) |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
 
@@ -4078,6 +4079,49 @@ Attributes: `loom.repo`, `loom.pr_number` and `loom.hold.transition` /
 `transform/privacy` `keep_keys`, contract-tested). Log time is the write
 (`event_at`); `observed_at` is when the daemon drained the journal. A record
 whose provenance does not validate is not exported.
+
+
+### `merge.queue.observed` — the merge queue as an existing read saw it
+
+One OTLP log (INFO) per run of the existing `mergeQueue.entries` read behind
+`GroupForge::groups()` (Issue #12667, slice of #12653). **No forge call is
+added** and there is no timer: the record exists only when a Loom-owned
+transition ran the read, so a gap between records is **not** an empty queue.
+OTLP-only (`native: false`).
+
+The JSON body holds `state`, `complete`, `order` (PR numbers in `position`
+order), `entries` (`position`, `pr`, `head`, `has_group_commit`),
+`observed_at` and `loom` build provenance; a record whose provenance does not
+validate is not exported. Built from the full entry list, so an entry whose
+group commit is not built yet is still listed.
+
+Known limits are encoded, not hidden:
+
+- `state = unknown`: the read failed before any entry was read. Never an empty
+  queue; an empty queue (`mergeQueue: null` or no entries) is
+  `state = observed`, `complete = true`, `order = []`.
+- `complete = false`: a later page failed, `MAX_PAGES` was hit or the cursor
+  did not advance; `entries` / `order` are a prefix.
+- A merge-group head identifies the top PR of that group, not its rank.
+  Counts derived by replaying `merge_queue.event` enqueue/dequeue are an
+  **approximate** queue, never an exact order; only this record carries the
+  position the forge reported.
+
+Attributes: `loom.merge_queue.queue_state` / `queue_complete` / `queue_depth`
+(omitted when `unknown`) / `version` / `revision` / `provenance_complete`
+(`MERGE_QUEUE_OBSERVED_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested).
+
+**Queue-regime snapshot (`check_response_timeout_minutes`,
+`max_entries_to_build`, `grouping_strategy`): not exported (deferred).** These
+settings live in the active `merge_queue` rule's `parameters`. An existing read
+already carries them: `merge_group_ci/eligibility.rs:347` does
+`GET repos/<nwo>/rules/branches/<branch>?per_page=100` and keeps the active
+`merge_queue` rule's parameters as opaque JSON in `Eligibility.merge_queue`
+(they are not named in non-test Rust because the field is passed through
+untyped). That read is a CLI eligibility check, not a daemon-tick read, so it
+is not used here: emitting from it would be on-demand rather than on change.
+The snapshot is tracked in #12675.
 
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused

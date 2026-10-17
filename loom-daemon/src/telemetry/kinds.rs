@@ -166,6 +166,8 @@ pub mod daemon_exit;
 pub mod hold_transition;
 /// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
 pub mod merge_queue_event;
+/// `merge.queue.observed` (#12667) — the merge queue as one existing read saw it.
+pub mod merge_queue_observed;
 /// `daemon.run_state_request` (#12546) — who issued a pause/drain/stop/restart.
 pub mod run_state_request;
 /// `write_scope.refused` (#12168) — a daemon write the #9548 gate refused.
@@ -540,6 +542,12 @@ macro_rules! telemetry_kind_table {
             /// structured reason and attempted-vs-confirmed state (#12665).
             /// OTLP-only. See [`hold_transition`].
             HoldTransition = "hold.transition" => $crate::telemetry::kinds::hold_transition::HoldTransitionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// The merge queue (order, membership, completeness) as the existing
+            /// `mergeQueue.entries` read saw it (#12667). OTLP-only. See
+            /// [`merge_queue_observed`].
+            MergeQueueObserved = "merge.queue.observed" => $crate::telemetry::kinds::merge_queue_observed::MergeQueueObservedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
