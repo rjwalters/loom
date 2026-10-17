@@ -25,6 +25,7 @@ as `.loom/docs/`).
 | File | Purpose |
 |------|---------|
 | [`agents.md`](agents.md) | Agent role overview. |
+| [`operating-modes.md`](operating-modes.md) | Fleet, local daemon and operator-directed session support contract; infrastructure boundaries and proposed CLI separation. |
 | [`workflows.md`](workflows.md) | Workflow reference. |
 | [`autonomous-mode-e2e.md`](autonomous-mode-e2e.md) | End-to-end autonomous mode walkthrough. |
 | [`measure-est-cores-per-sweep.md`](measure-est-cores-per-sweep.md) | Method for measuring estimated cores per sweep. |
