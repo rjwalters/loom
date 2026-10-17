@@ -144,6 +144,15 @@ pub const WORKTREE_REAPER_DISK_WARN_ENV: &str = "LOOM_WORKTREE_REAPER_DISK_WARN_
 /// worktree's ~1G of build artifacts is reclaimed the same hour.
 pub const DEFAULT_WORKTREE_REAPER_INTERVAL_SECS: u64 = 900;
 
+/// Env override for the open-item idle period (seconds; `0` disables).
+pub const WORKTREE_REAPER_IDLE_OPEN_ENV: &str = "LOOM_WORKTREE_REAPER_IDLE_OPEN_SECS";
+
+/// Default idle period (24 h) before the worktree of an **open** issue / PR is
+/// reapable (issue #12458). Long enough that a builder, judge or doctor step
+/// bouncing on the same item within a day keeps its warm worktree; short
+/// enough that ~400 open-item worktrees do not outlive their usefulness.
+pub const DEFAULT_IDLE_OPEN_SECS: i64 = 24 * 60 * 60;
+
 /// Default low-disk warning floor (GB). Below this, a host is close enough to
 /// full that a sweep's build can fail with a confusing unrelated error.
 pub const DEFAULT_DISK_WARN_FREE_GB: u64 = 20;
@@ -170,6 +179,10 @@ pub struct WorktreeReaperConfig {
     /// `autonomous.worktreeReaper.diskWarnFreeGb` — free-GB floor below which
     /// the pass logs a low-disk warning.
     pub disk_warn_free_gb: Option<u64>,
+    /// `autonomous.worktreeReaper.idleOpenSecs` — how long an `issue-<N>` /
+    /// `pr-<N>` worktree of an **open** item must sit untouched before it is
+    /// reapable (issue #12458). `0` disables the open-item decision.
+    pub idle_open_secs: Option<i64>,
 }
 
 /// Read `.loom/config.json → autonomous.worktreeReaper`, soft-failing every
@@ -196,6 +209,10 @@ pub fn read_worktree_reaper_config(repo_root: &Path) -> WorktreeReaperConfig {
         disk_warn_free_gb: block
             .get("diskWarnFreeGb")
             .and_then(serde_json::Value::as_u64),
+        idle_open_secs: block
+            .get("idleOpenSecs")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|&s| s >= 0),
     }
 }
 
@@ -233,6 +250,20 @@ pub fn resolve_grace_period(config: &WorktreeReaperConfig) -> i64 {
         .unwrap_or(DEFAULT_GRACE_PERIOD_SECS)
 }
 
+/// Resolve the open-item idle period — precedence **env > config > default**.
+/// `None` means the decision is disabled (a `0` from env or config); an
+/// unparseable or negative env value falls through to config/default.
+#[must_use]
+pub fn resolve_idle_open_secs(config: &WorktreeReaperConfig) -> Option<i64> {
+    let secs = std::env::var(WORKTREE_REAPER_IDLE_OPEN_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&s| s >= 0)
+        .or(config.idle_open_secs)
+        .unwrap_or(DEFAULT_IDLE_OPEN_SECS);
+    (secs > 0).then_some(secs)
+}
+
 /// Resolve the low-disk warning floor — precedence **env > config > default**.
 #[must_use]
 pub fn resolve_disk_warn_free_gb(config: &WorktreeReaperConfig) -> u64 {
@@ -257,6 +288,20 @@ pub fn reaper_clean_options(grace_period_secs: i64) -> CleanOptions {
         branches_only: false,
         tmux_only: false,
         require_managed_sentinel: true,
+        // Off here; the production pass layers the configured idle period on
+        // top (`reaper_clean_options_for`), so a caller that builds options
+        // from a bare grace period never reaps an open item.
+        idle_open_secs: None,
+    }
+}
+
+/// [`reaper_clean_options`] plus the idle-open period resolved from `config`
+/// (issue #12458) — what the production reap pass runs with.
+#[must_use]
+pub fn reaper_clean_options_for(config: &WorktreeReaperConfig) -> CleanOptions {
+    CleanOptions {
+        idle_open_secs: resolve_idle_open_secs(config),
+        ..reaper_clean_options(resolve_grace_period(config))
     }
 }
 
@@ -617,7 +662,7 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // enumerate — so drop those before the pass rather than letting the
     // tracker accumulate dead entries between status calls.
     prune_orphaned_removal_records();
-    let opts = reaper_clean_options(resolve_grace_period(config));
+    let opts = reaper_clean_options_for(config);
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
 
     // One hygiene pass (W6 PR2, `worktree_ops::hygiene_pass`): the owner is
@@ -1113,6 +1158,9 @@ mod tests {
     // at its file-size ratchet baseline; see `.loom/docs/file-size-policy.md`.
     mod liveness;
 
+    // #12458's idle-open-item cases live in a sibling file for the same reason.
+    mod idle_open;
+
     // ===================================================================
     // Test fixtures
     // ===================================================================
@@ -1149,6 +1197,7 @@ mod tests {
         tmp
     }
 
+    #[derive(Clone, Debug)]
     struct ProbeSpec {
         active: HashSet<u32>,
         issue_state: String,
@@ -1175,6 +1224,12 @@ mod tests {
         /// stash push`, which must preserve the worktree rather than remove
         /// it.
         quarantine_ok: bool,
+        /// Whether the scripted `idle_for` probe reports the worktree idle for
+        /// the whole open-item period (issue #12458). Default `false`.
+        idle: bool,
+        /// Whether the issue-keyed `unsaved_work` probe (tracked changes or
+        /// untracked user files) reports anything at risk (issue #12458).
+        unsaved: bool,
     }
 
     impl Default for ProbeSpec {
@@ -1193,6 +1248,8 @@ mod tests {
                 branch_reachable: true,
                 is_registered: true,
                 quarantine_ok: true,
+                idle: false,
+                unsaved: false,
             }
         }
     }
@@ -1252,6 +1309,8 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            unsaved_work: &|_: &Path| spec.unsaved,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
 
@@ -1300,6 +1359,7 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
 
@@ -1349,6 +1409,8 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            unsaved_work: &|_: &Path| spec.unsaved,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
 
@@ -1802,6 +1864,8 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            unsaved_work: &|_: &Path| spec.unsaved,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
         let report = reap_worktrees(repo.path(), &opts, &probes, &|_, _| None, &|_, _| false);
@@ -2119,6 +2183,7 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
         let report = reap_pr_worktrees(repo.path(), &opts, &probes, &|_, _| false);
@@ -2182,6 +2247,7 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
 
@@ -2614,6 +2680,7 @@ mod tests {
                 interval_secs: Some(120),
                 grace_period_secs: Some(30),
                 disk_warn_free_gb: Some(5),
+                idle_open_secs: None,
             }
         );
     }

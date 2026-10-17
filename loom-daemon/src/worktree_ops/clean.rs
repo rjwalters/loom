@@ -251,6 +251,12 @@ pub struct CleanOptions {
     /// remover must honor CLAUDE.md's "user-provisioned worktrees are never
     /// removed" contract, because nobody is there to say no.
     pub require_managed_sentinel: bool,
+    /// Idle period (seconds) after which an `issue-<N>` / `pr-<N>` worktree of
+    /// an **open** item becomes reapable (issue #12458). `None` disables the
+    /// decision — the historical behaviour, and what the interactive CLI keeps.
+    /// Only consulted when [`Self::safe`] is set. The unattended reaper sets it
+    /// from `autonomous.worktreeReaper.idleOpenSecs`.
+    pub idle_open_secs: Option<i64>,
 }
 
 impl Default for CleanOptions {
@@ -265,6 +271,7 @@ impl Default for CleanOptions {
             branches_only: false,
             tmux_only: false,
             require_managed_sentinel: false,
+            idle_open_secs: None,
         }
     }
 }
@@ -780,6 +787,16 @@ pub struct WorktreeProbes<'a> {
     pub branch_reachable_from_remotes: &'a dyn Fn(u32) -> bool,
     /// Whether the worktree has uncommitted changes.
     pub uncommitted: &'a dyn Fn(&Path) -> bool,
+    /// Whether the worktree holds anything `git worktree remove --force` would
+    /// destroy and a remote cannot restore: tracked changes **or** untracked
+    /// user files (issue #12458). Wider than [`Self::uncommitted`], which is
+    /// blind to untracked files — acceptable there only because a closed issue
+    /// bounds the gap. Consulted only by the idle-open decision.
+    pub unsaved_work: &'a dyn Fn(&Path) -> bool,
+    /// Whether nothing in the worktree has been written for at least the given
+    /// number of seconds (issue #12458) — the `worktree_activity` gate with the
+    /// idle period as its window. `false` when the probe cannot answer.
+    pub idle_for: &'a dyn Fn(&Path, i64) -> bool,
     /// Wall clock the grace-period gate measures against.
     pub now: DateTime<Utc>,
 }
@@ -860,6 +877,18 @@ pub fn classify_worktree(
     }
 
     let issue_state = (probes.issue_state)(issue_num);
+    if issue_state == "OPEN" && opts.safe && !opts.force {
+        if let Some(idle_secs) = opts.idle_open_secs {
+            return classify_idle_open(
+                worktree_path,
+                idle_secs,
+                probes.idle_for,
+                probes.unsaved_work,
+                &|| (probes.branch_reachable_from_remotes)(issue_num),
+                SkipOpen::Issue(issue_state),
+            );
+        }
+    }
     if issue_state != "CLOSED" {
         return WorktreeDecision::SkipIssueNotClosed(issue_state);
     }
@@ -974,6 +1003,62 @@ pub fn classify_worktree(
     }
 }
 
+/// What an open item's worktree decision falls back to when it is kept — the
+/// skip the classifier produced before #12458 existed, so a kept worktree logs
+/// exactly what it always did.
+enum SkipOpen {
+    /// `issue-<N>`: the observed (non-`CLOSED`) issue state.
+    Issue(String),
+    /// `pr-<N>`: the PR is open.
+    Pr,
+}
+
+impl SkipOpen {
+    fn into_decision(self) -> WorktreeDecision {
+        match self {
+            Self::Issue(state) => WorktreeDecision::SkipIssueNotClosed(state),
+            Self::Pr => WorktreeDecision::SkipPrOpen,
+        }
+    }
+}
+
+/// The idle-open decision (issue #12458): may the worktree of an **open**
+/// issue / PR be removed to reclaim its disk?
+///
+/// Nothing is lost by removing it when all three hold, and the next step for
+/// the item recreates it through the normal `worktree.sh` path:
+///
+/// 1. nothing was written in it for `idle_secs` (the `worktree_activity` gate);
+/// 2. it holds no tracked changes and no untracked user files (`unsaved_work`);
+/// 3. its branch is fully on a remote — or has no commits beyond base, which
+///    `git rev-list <branch> --not --remotes` also reports as reachable.
+///
+/// Cheapest gate first: a worktree touched recently exits on the root `stat`
+/// without a `git` subprocess. A kept worktree reports the skip the open item
+/// always produced ([`SkipOpen`]), except where a *named* gate explains why a
+/// stale worktree is still kept.
+fn classify_idle_open(
+    worktree_path: &Path,
+    idle_secs: i64,
+    idle_for: &dyn Fn(&Path, i64) -> bool,
+    unsaved_work: &dyn Fn(&Path) -> bool,
+    branch_reachable: &dyn Fn() -> bool,
+    open: SkipOpen,
+) -> WorktreeDecision {
+    if idle_secs <= 0 || !idle_for(worktree_path, idle_secs) {
+        return open.into_decision();
+    }
+    if unsaved_work(worktree_path) {
+        return WorktreeDecision::SkipUncommitted;
+    }
+    if !branch_reachable() {
+        return WorktreeDecision::SkipNotMerged(
+            "open item idle, but its branch is not fully pushed to a remote".to_string(),
+        );
+    }
+    WorktreeDecision::Remove
+}
+
 /// The canonicalized path of every currently-registered git worktree for
 /// `repo_root` (including the primary checkout itself), parsed from `git
 /// worktree list --porcelain`.
@@ -1033,8 +1118,22 @@ pub fn production_probes<'a>(
         pr_status: pr_status_fn,
         branch_reachable_from_remotes: branch_reachable_fn,
         uncommitted: &check_uncommitted_changes,
+        unsaved_work: &check_uncommitted_or_unproven_untracked_changes,
+        idle_for: &worktree_idle_for,
         now,
     }
+}
+
+/// Production [`WorktreeProbes::idle_for`]: the `worktree_activity` gate with
+/// the idle period as its window. Anything but a verified `Idle` — recent
+/// writes, or an unreadable root — answers `false`, so the worktree is kept.
+#[must_use]
+pub fn worktree_idle_for(worktree_path: &Path, idle_secs: i64) -> bool {
+    let window = Duration::from_secs(u64::try_from(idle_secs).unwrap_or(0));
+    matches!(
+        crate::worktree_activity::probe_worktree_activity(worktree_path, SystemTime::now(), window),
+        crate::worktree_activity::ActivityProbe::Idle
+    ) && !window.is_zero()
 }
 
 /// Build the `is_registered_worktree` probe closure for [`production_probes`]
@@ -1093,6 +1192,8 @@ pub struct PrWorktreeProbes<'a> {
     pub branch_reachable_from_remotes: &'a dyn Fn(&Path) -> bool,
     /// Whether the worktree has uncommitted changes.
     pub uncommitted: &'a dyn Fn(&Path) -> bool,
+    /// See [`WorktreeProbes::idle_for`] (issue #12458).
+    pub idle_for: &'a dyn Fn(&Path, i64) -> bool,
     /// Wall clock the grace-period gate measures against.
     pub now: DateTime<Utc>,
 }
@@ -1202,7 +1303,18 @@ pub fn classify_pr_worktree(
             }
             WorktreeDecision::Remove
         }
-        PrStatus::Open => WorktreeDecision::SkipPrOpen,
+        PrStatus::Open => match opts.idle_open_secs {
+            Some(idle_secs) if !opts.force => classify_idle_open(
+                worktree_path,
+                idle_secs,
+                probes.idle_for,
+                // `uncommitted` is already the wide probe on the `pr-<N>` side.
+                probes.uncommitted,
+                &|| (probes.branch_reachable_from_remotes)(worktree_path),
+                SkipOpen::Pr,
+            ),
+            _ => WorktreeDecision::SkipPrOpen,
+        },
         PrStatus::NoPr => WorktreeDecision::SkipNotMerged("PR not found".to_string()),
         PrStatus::Unknown => WorktreeDecision::SkipUnknownPrStatus,
     }
@@ -1234,6 +1346,7 @@ pub fn production_pr_probes<'a>(
         // so it does not get the closed-issue gate that bounds that gap on the
         // `issue-<N>` side. Proven cargo output is not user work (#11193).
         uncommitted: &check_uncommitted_or_unproven_untracked_changes,
+        idle_for: &worktree_idle_for,
         now,
     }
 }

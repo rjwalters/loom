@@ -9128,6 +9128,7 @@ stops a host running sweeps at all).
       "enabled": true,
       "intervalSecs": 900,
       "gracePeriodSecs": 600,
+      "idleOpenSecs": 86400,
       "diskWarnFreeGb": 20
     }
   }
@@ -9139,8 +9140,22 @@ stops a host running sweeps at all).
 | `LOOM_WORKTREE_REAPER` | `autonomous.worktreeReaper.enabled` | env > config > default | `true` (on) |
 | `LOOM_WORKTREE_REAPER_INTERVAL_SECS` | `autonomous.worktreeReaper.intervalSecs` | env > config > default | `900` (15 min) |
 | — | `autonomous.worktreeReaper.gracePeriodSecs` | config > default | `600` (10 min) |
+| `LOOM_WORKTREE_REAPER_IDLE_OPEN_SECS` | `autonomous.worktreeReaper.idleOpenSecs` | env > config > default | `86400` (24 h; `0` disables) |
 | `LOOM_WORKTREE_REAPER_DISK_WARN_GB` | `autonomous.worktreeReaper.diskWarnFreeGb` | env > config > default | `20` |
 | `LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES` | — | env > default | `30` (see below) |
+
+#### Idle worktrees of open items (#12458)
+
+Under step dispatch an open issue/PR keeps its worktree until it closes, so a
+busy host accumulates hundreds of them (~400 against 15–20 live sessions).
+`idleOpenSecs` makes the `issue-<N>` / `pr-<N>` worktree of an **open** item
+reapable once **all** hold: no live session or step holds it (the usual
+claim-lock / `.loom-in-use` / process / in-flight gates), nothing was written in
+it for the idle period (the `worktree_activity` gate), it has no tracked changes
+and no untracked user files, and its branch is fully on a remote (or has no
+commits beyond base). The decision lives in `clean::classify_worktree` /
+`classify_pr_worktree` — there is no second removal path — and the item's next
+step recreates the worktree through `worktree.sh`. `0` disables it.
 
 #### Activity gate on the artifact-reclaim pass (#8116)
 

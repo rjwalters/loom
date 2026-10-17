@@ -225,6 +225,7 @@ pub fn deep_clean_options(grace_period_secs: i64) -> CleanOptions {
         branches_only: false,
         tmux_only: false,
         require_managed_sentinel: true,
+        idle_open_secs: None,
     }
 }
 
