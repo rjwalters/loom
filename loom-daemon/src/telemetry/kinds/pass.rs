@@ -302,7 +302,7 @@ pub struct StepFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
     /// The closed reason set the projection's `reason` comes from
-    /// (`champion_merge_v1`, `champion_promotion_v1`).
+    /// (`champion_merge_v1`, `champion_promotion_v1`, `champion_triage_v1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_set: Option<String>,
     /// The outcome ledger's own classification of the step

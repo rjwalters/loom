@@ -337,7 +337,7 @@
       ]
     },
     {
-      "name": "curated + blocked, dependency park, every blocker closed: Champion re-evaluate",
+      "name": "curated + blocked, dependency park: Champion re-evaluate (Champion re-checks the blockers on every draw, #12078)",
       "inputs": {
         "issues": [
           {
@@ -346,8 +346,7 @@
               "loom:curated",
               "loom:blocked"
             ],
-            "park": "dependency",
-            "blockers_closed": true
+            "park": "dependency"
           }
         ],
         "pulls": []
@@ -364,7 +363,7 @@
       ]
     },
     {
-      "name": "curated + blocked, dependency park, a blocker still open: pass",
+      "name": "curated + blocked, dependency park, a blocker still open: still a Champion re-evaluate (the classifier does not read blockers, #12078)",
       "inputs": {
         "issues": [
           {
@@ -373,8 +372,7 @@
               "loom:curated",
               "loom:blocked"
             ],
-            "park": "dependency",
-            "blockers_closed": false
+            "park": "dependency"
           }
         ],
         "pulls": []
@@ -385,13 +383,13 @@
           "pr": null,
           "state": "blocked",
           "verdict": {
-            "pass": "blocked"
+            "step": "champion_reevaluate"
           }
         }
       ]
     },
     {
-      "name": "fast-fail park (quarantine record) is not a dependency park, even if 'every blocker closed' is vacuously true",
+      "name": "fast-fail park (quarantine record) is not a dependency park",
       "inputs": {
         "issues": [
           {
@@ -400,8 +398,7 @@
               "loom:curated",
               "loom:blocked"
             ],
-            "park": "quarantine",
-            "blockers_closed": true
+            "park": "quarantine"
           }
         ],
         "pulls": []
@@ -427,8 +424,7 @@
               "loom:curated",
               "loom:blocked"
             ],
-            "park": "prless_hold",
-            "blockers_closed": true
+            "park": "prless_hold"
           }
         ],
         "pulls": []
@@ -454,8 +450,7 @@
               "loom:curated",
               "loom:blocked"
             ],
-            "park": "champion_hold",
-            "blockers_closed": true
+            "park": "champion_hold"
           }
         ],
         "pulls": []
@@ -481,8 +476,7 @@
               "loom:curated",
               "loom:blocked"
             ],
-            "park": "unstated",
-            "blockers_closed": true
+            "park": "unstated"
           }
         ],
         "pulls": []
@@ -499,7 +493,7 @@
       ]
     },
     {
-      "name": "loom:issue + blocked dependency park with blockers closed: stays blocked, not a step (#11301)",
+      "name": "loom:issue + blocked dependency park: stays blocked, not a step (#11301)",
       "inputs": {
         "issues": [
           {
@@ -508,8 +502,7 @@
               "loom:issue",
               "loom:blocked"
             ],
-            "park": "dependency",
-            "blockers_closed": true
+            "park": "dependency"
           }
         ],
         "pulls": []
@@ -517,6 +510,33 @@
       "expected": [
         {
           "issue": 28,
+          "pr": null,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "promoted (curated + issue) + blocked dependency park: stays blocked, not a Champion step (curated survives promotion, #12078)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 536,
+            "labels": [
+              "loom:curated",
+              "loom:issue",
+              "loom:blocked"
+            ],
+            "park": "dependency"
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 536,
           "pr": null,
           "state": "blocked",
           "verdict": {
@@ -1022,7 +1042,7 @@
       ]
     },
     {
-      "name": "a PR with no stage label: pass",
+      "name": "a PR with no stage label: champion triage",
       "inputs": {
         "issues": [],
         "pulls": [
@@ -1040,7 +1060,137 @@
           "pr": 511,
           "state": "no_stage",
           "verdict": {
-            "pass": "no_stage"
+            "step": "champion_triage"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a draft PR with no stage label: pass draft",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 590,
+            "labels": [],
+            "same_repo": true,
+            "draft": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 590,
+          "state": "no_stage",
+          "verdict": {
+            "pass": "draft"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an otherwise unlabelled PR with loom:frozen: frozen wins over triage",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 591,
+            "labels": [
+              "loom:frozen"
+            ],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 591,
+          "state": "frozen",
+          "verdict": {
+            "pass": "frozen"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an otherwise unlabelled PR with loom:operator: operator wins over triage",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 592,
+            "labels": [
+              "loom:operator"
+            ],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 592,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an otherwise unlabelled PR with loom:blocked (a triage block): blocked, never triaged again",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 593,
+            "labels": [
+              "loom:blocked"
+            ],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 593,
+          "state": "blocked",
+          "verdict": {
+            "pass": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a PR with only lane and priority labels: champion triage",
+      "inputs": {
+        "issues": [],
+        "pulls": [
+          {
+            "number": 594,
+            "labels": [
+              "loom:ci-failure",
+              "loom:important"
+            ],
+            "same_repo": true,
+            "body": "x"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": null,
+          "pr": 594,
+          "state": "no_stage",
+          "verdict": {
+            "step": "champion_triage"
           }
         }
       ]

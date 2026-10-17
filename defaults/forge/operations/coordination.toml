@@ -51,6 +51,9 @@ path = "defaults/.claude/commands/loom/curator.md"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/work_finder/main_red_autofile.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_create_issue.rs"
 
 [[operation]]
 id = "issue.list"
@@ -233,6 +236,9 @@ path = "loom-daemon/src/reclaim_pr_warning.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/unanchored_verdict.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/ci_gate_recovery.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet/drain_reset.rs"
@@ -426,6 +432,9 @@ kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/unanchored_verdict.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/ci_gate_recovery.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/intake_reconcile/demote.rs"
 
 [[operation]]
@@ -537,7 +546,7 @@ adapter_coverage = "partial"
 caller_integration = "partial"
 unknowns = [
   "Gitea's comments-and-timeline endpoint merges comments with events; label-applied timestamps and cross-reference events must survive that shape",
-  "whether `labeled`/`unlabeled` events are retained indefinitely (stage dwell and staleness checks read them)",
+  "whether `labeled`/`unlabeled` events are retained indefinitely (staleness checks read them)",
 ]
 [[operation.callers]]
 kind = "script"
@@ -545,9 +554,6 @@ path = "defaults/scripts/check-evaluating-staleness.sh"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/check-promotion-landed.sh"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/observability/ops/stage_dwell.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/observability/ops/stage_events.rs"

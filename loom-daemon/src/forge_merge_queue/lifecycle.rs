@@ -24,12 +24,13 @@
 use chrono::{DateTime, Utc};
 
 use super::authz::{
-    authorize_and_enqueue, merge_group_check, revoke_then_dequeue, CheckConclusion, DenyReason,
-    HandoffError, Revocation, REQUIRED_CHECK_CONTEXT,
+    authorize_and_enqueue, merge_group_check, revoke_then_dequeue, withdraw_head_status,
+    CheckConclusion, DenyReason, HandoffError, Revocation, REQUIRED_CHECK_CONTEXT,
 };
 use super::events::{secs_between, EventKind, EventSink, QueueEvent};
 use super::forge::{read_facts, LifecycleForge};
 use super::grants::{reason_token, CommentGrantStore, GrantRecord};
+use super::group_authz::StatusApi;
 use super::mode::MergeMode;
 use super::ops::{self, DequeueOutcome, EnqueueOutcome, PrState, QueueApi, QueueError};
 use super::removal::{classify, drop_prose, route, RemovalKind};
@@ -40,6 +41,8 @@ pub struct Ctx<'a> {
     pub execution_enabled: bool,
     pub queue: &'a dyn QueueApi,
     pub forge: &'a dyn LifecycleForge,
+    /// Writer for the `loom/merge-authorization` status on the PR head.
+    pub statuses: &'a dyn StatusApi,
     pub events: &'a dyn EventSink,
     pub now: DateTime<Utc>,
 }
@@ -387,6 +390,7 @@ pub fn handoff(
         ctx.execution_enabled,
         ctx.queue,
         &store,
+        ctx.statuses,
         &|| read_facts(ctx.forge, pr),
         pr,
         approved_sha,
@@ -410,6 +414,7 @@ pub fn handoff(
             // `sweep` discovers queued PRs only through this record: fail closed.
             let revoked =
                 revoke_then_dequeue(ctx.mode, ctx.execution_enabled, ctx.queue, &store, pr);
+            withdraw_head_status(ctx.statuses, pr, approved_sha);
             return Err(HandoffFailure::Telemetry { error, revoked });
         }
     }

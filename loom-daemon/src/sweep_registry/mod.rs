@@ -153,11 +153,12 @@ mod spawn_process;
 mod stacking;
 mod start_facts;
 mod step_adopt;
+pub mod step_cap_notice;
+mod step_issue;
 pub mod step_lease_owner;
 pub mod step_ledger;
 mod step_reap;
 pub mod step_spawn;
-mod step_story;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;
@@ -660,6 +661,11 @@ pub struct SweepRegistry {
     /// The step-outcome ledger (#11900): per-`(item, step)` outcomes and
     /// short cooldowns. See [`step_ledger`].
     step_ledger: crate::step_dispatch::outcome_ledger::OutcomeLedger,
+    /// The ledger's durable part as last written (#12251): an unchanged
+    /// ledger is not rewritten.
+    step_ledger_persisted: String,
+    /// Per item, when the last Builder repeat-cap notice's window ends (#12500).
+    step_cap_notices: HashMap<u32, DateTime<Utc>>,
     /// No-op re-dispatch cooldown parameters (Issue #6670). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -1036,7 +1042,7 @@ impl SweepRegistry {
     /// or [`with_event_bus`](Self::with_event_bus) to attach a bus.
     #[must_use]
     pub fn new(config: SweepRegistryConfig) -> Self {
-        Self {
+        let mut registry = Self {
             config,
             entries: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -1076,6 +1082,8 @@ impl SweepRegistry {
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             step_ledger: Default::default(),
+            step_ledger_persisted: String::new(),
+            step_cap_notices: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
@@ -1095,7 +1103,9 @@ impl SweepRegistry {
             inflight_idempotency: HashMap::new(),
             roll_gate: roll_gate::RollGate::default(),
             missing_command_warned: HashSet::new(),
-        }
+        };
+        registry.restore_step_ledger();
+        registry
     }
 
     /// Construct an empty registry with the given event bus pre-attached.

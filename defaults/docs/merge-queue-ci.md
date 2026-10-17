@@ -9,8 +9,10 @@ matter on it. This document covers the read-only tooling that proves a
 repository's workflows are qualified, the prerequisites for enabling queue mode,
 and how to roll back.
 
-**Status:** this is preparation only. Nothing in Loom enqueues yet: Phases A
-and B, #10255 and #10256, provide the queue controls and the Champion handoff.
+**Status:** queue execution is compiled on (#12323) but opt-in via
+`champion.mergeMode=queue`. Phases A and B, #10255 and #10256, provide the queue
+controls and the Champion handoff; the `merge_group` check workflow is the
+optional template `defaults/optional/github-workflows/merge-group-check.yml`.
 `rjwalters/loom` is user-owned, and GitHub documents merge queues for
 organization-owned repositories, so this repository is **not eligible** for the
 live pilot. Its `ci.yml` carries a `merge_group` trigger anyway. The trigger is
@@ -151,6 +153,18 @@ A missing or `null` field means "unknown".
    approval-to-merge median and p90, re-date pushes, head-induced Judge
    re-reviews, CI runs and runner-minutes per merged PR, and red-main
    incidents.
+
+## The authorization context is excluded from the CI verdict gate (#12526)
+
+`loom/merge-authorization` is a required context on the queue repo, but
+Champion posts it only AFTER the Judge approves. `forge wait-checks` (and so
+`post-verdict.sh` and the CI-gate recovery) therefore ignores it when deciding
+`GREEN`: absent or `pending` it does not hold the wait, or the Judge would
+wait for a status that only its own approval can cause and time out. A posted
+`failure` (a revocation) still counts as failing in both default and
+`--required-only` modes. `merge-pr.sh`'s zero-row settle
+(`merge_pr/zero_checks.rs`) is unchanged: it runs post-authorization and does
+not use the verdict path.
 
 ## Rollback to direct mode
 

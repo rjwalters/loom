@@ -398,6 +398,29 @@ fn a_role_with_no_projection_emits_nothing() {
     assert!(records_for(&ctx, &source, Some(&j), &mut RefusalStore::default()).is_empty());
 }
 
+/// A `--pr` step on an unlabelled PR is a triage (#12499): its three
+/// outcomes project onto their own reason set, never the merge gate's
+/// `failed unclassified`.
+#[test]
+fn a_pr_triage_projects_onto_the_triage_reason_set() {
+    for (word, class, reason) in [
+        ("triaged", "verdict", "review_requested"),
+        ("triage-blocked", "refused", "blocked"),
+        ("triage-operator", "refused", "operator"),
+    ] {
+        let r = one(
+            &step(StepRole::ChampionMerge, 12, Some(word)),
+            Some(&journal(vec![])),
+            &mut RefusalStore::default(),
+            t(5),
+        );
+        assert_eq!(class_reason(&r), (class, reason), "{word}");
+        assert_eq!(r.step.reason_set.as_deref(), Some(champion::TRIAGE_REASON_SET));
+        assert_eq!(r.step.step.as_deref(), Some("champion_pr"));
+        assert!(champion::TRIAGE_REASONS.contains(&reason));
+    }
+}
+
 #[test]
 fn the_staged_step_reads_only_its_own_log_section() {
     let dir = tempfile::tempdir().unwrap();

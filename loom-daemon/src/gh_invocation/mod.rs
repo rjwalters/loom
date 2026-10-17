@@ -56,6 +56,7 @@ pub(crate) mod cwd_route;
 mod outcome;
 pub(crate) mod own_writes;
 mod paged;
+pub mod purpose;
 pub mod read_deadline;
 mod reader_route;
 pub mod resolver;
@@ -66,7 +67,8 @@ pub mod transparent;
 pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
 pub use paged::{walk_enabled as page_walk_enabled, WALK_ENV as PAGE_WALK_ENV};
-pub use reader_route::{READ_SHED_ENV, SHED_MARKER};
+pub use purpose::ForgePurpose;
+pub use reader_route::SHED_MARKER;
 
 #[cfg(test)]
 mod tests;
@@ -340,6 +342,10 @@ pub struct GhInvocation {
     /// fleet store fetch, which must work while the gateway is broken so the
     /// gateway can be unset ([`GhInvocation::gateway_exempt`]).
     gateway_exempt: bool,
+    /// A listing the daemon makes to find work (#12310): the site said so
+    /// ([`GhInvocation::discovery`]) or built the call inside a
+    /// [`purpose::discovery`] scope. Meaningful for reads only.
+    discovery: bool,
 }
 
 impl GhInvocation {
@@ -374,6 +380,7 @@ impl GhInvocation {
             read_class: ReadClass::Gate,
             disagree_counted: false,
             gateway_exempt: false,
+            discovery: purpose::in_discovery_scope(),
         }
     }
 
@@ -509,18 +516,66 @@ impl GhInvocation {
         self
     }
 
-    /// Classify this read for reader exhaustion (W4-C). The default,
-    /// [`ReadClass::Gate`], keeps today's writer fallback; a
-    /// [`ReadClass::Hygiene`] or [`ReadClass::Observability`] read is shed
-    /// ([`GhCompletion::Shed`]) instead of spending the writer's bucket when
-    /// every reader for its owner and resource is withdrawn. Mark a read
-    /// non-`Gate` only when its consumer maps "no answer" to skip / unknown
-    /// and nothing it decides (a dispatch, claim, merge, reap, label flip)
-    /// rests on it.
+    /// Classify this read for the reader router (W4-C). Every class is shed
+    /// ([`GhCompletion::Shed`]) when no reader can serve it: the writer is
+    /// never used for reads (#12394). The class decides how early: the
+    /// default, [`ReadClass::Gate`], takes any usable reader whatever its
+    /// projected budget, while a [`ReadClass::Hygiene`] or
+    /// [`ReadClass::Observability`] read also needs headroom (the router's
+    /// `shedPct` reserve), so it is shed first and the readers' last budget
+    /// is kept for decision-gating reads. Mark a read non-`Gate` only when
+    /// its consumer maps "no answer" to skip / unknown and nothing it decides
+    /// (a dispatch, claim, merge, reap, label flip) rests on it.
     #[must_use]
     pub fn read_class(mut self, class: ReadClass) -> Self {
         self.read_class = class;
         self
+    }
+
+    /// Mark this read as **discovery** (#12310): a listing made to find work.
+    /// Tags `loom.forge.purpose = discovery` on its span and metric and, on a
+    /// `gh api` call, sends the `loom.forge.purpose: discovery` request header
+    /// so the read gateway can refuse it first when a pool runs low. Set it
+    /// next to [`GhInvocation::read_class`]; leave a read that gates a write
+    /// untagged.
+    #[must_use]
+    pub fn discovery(mut self) -> Self {
+        self.discovery = true;
+        self
+    }
+
+    /// What this call is for (#12310): a write is `write`; a read is
+    /// `discovery` only when its site said so, else its [`ReadClass`] name.
+    #[must_use]
+    pub fn purpose(&self) -> ForgePurpose {
+        if self.intent == AccessIntent::Write {
+            ForgePurpose::Write
+        } else if self.discovery {
+            ForgePurpose::Discovery
+        } else {
+            ForgePurpose::of_read(self.read_class)
+        }
+    }
+
+    /// The argv handed to `gh`: [`GhInvocation::args`] plus, on a `discovery`
+    /// `gh api` call, the purpose header. No other call sends it.
+    #[must_use]
+    pub(crate) fn spawn_args(&self) -> Vec<OsString> {
+        let mut args = self.args.clone();
+        if self.purpose() == ForgePurpose::Discovery && args.first().is_some_and(|a| a == "api") {
+            args.splice(
+                1..1,
+                [
+                    OsString::from("-H"),
+                    OsString::from(format!(
+                        "{}: {}",
+                        purpose::HEADER_NAME,
+                        purpose::DISCOVERY_VALUE
+                    )),
+                ],
+            );
+        }
+        args
     }
 
     /// This read's [`ReadClass`].
@@ -688,7 +743,7 @@ impl GhInvocation {
     /// Assemble the child. Private: the facade owns execution.
     fn command(&self, program: &str, child_context: Option<&TraceContext>) -> Command {
         let mut cmd = Command::new(program);
-        cmd.args(&self.args);
+        cmd.args(self.spawn_args());
         cmd.env(BOOKED_ENV, "1");
         if let Some(dir) = &self.cwd {
             cmd.current_dir(dir);
@@ -725,6 +780,11 @@ impl GhInvocation {
         if self.intent == AccessIntent::Read && read_deadline::passed() {
             return Ok(self.deadline_shed());
         }
+        // #12310: the gateway refused a discovery read for its quota reserve
+        // earlier in this tick; the rest of the tick's discovery is not sent.
+        if self.purpose() == ForgePurpose::Discovery && purpose::discovery_ended() {
+            return Ok(self.deadline_shed());
+        }
         #[cfg(test)]
         if let Some(routed) = test_routing::run(&self) {
             return routed;
@@ -735,16 +795,8 @@ impl GhInvocation {
         let lookup = move |req: &crate::forge_identity::RouteRequest<'_>| {
             route(req, std::time::SystemTime::now())
         };
-        // `LOOM_READ_ROUTING=legacy`: the pre-W4-C path exactly — no
-        // derivation, no read class, the unconditional writer fallback.
-        if crate::forge_identity::RoutingMode::current()
-            == crate::forge_identity::RoutingMode::Legacy
-        {
-            return self.execute_routed(&lookup, &reader_route::withdraw_reader);
-        }
-        let policy = reader_route::ShedPolicy::current();
         self.with_derived_route()
-            .execute_routed_v2(&lookup, &reader_route::withdraw_reader, policy)
+            .execute_routed_v2(&lookup, &reader_route::withdraw_reader)
     }
 
     /// A read the tick deadline stopped (#12074): shed, nothing sent.
@@ -861,6 +913,10 @@ impl GhInvocation {
 #[cfg(test)]
 #[path = "test_routing.rs"]
 pub(crate) mod test_routing;
+
+#[cfg(test)]
+#[path = "test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "w4c_sites_tests.rs"]

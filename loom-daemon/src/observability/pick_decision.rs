@@ -32,12 +32,14 @@ use super::pick_journal::{
 };
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
-use crate::step_dispatch::item_draw::{Candidate, DrawRecord, Exclusion, ITEM_DRAW_SEED_SCHEME};
+use crate::step_dispatch::item_draw::{
+    pool_weights, DrawRecord, Exclusion, ItemDraw, PoolRow, ITEM_DRAW_SEED_SCHEME,
+};
 use crate::telemetry::kinds::pick_decision::{
     source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
-    PickDrawCandidate, PickItemDraw, PickItemDrawStep, PickItemExclusion, PickItemPoolEntry,
-    PickLane, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion,
-    PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
+    PickDrawCandidate, PickItemClosure, PickItemDraw, PickItemDrawStep, PickItemExclusion,
+    PickItemPoolEntry, PickItemRepo, PickLane, PickQueueSkip, PickSkipReason, PickSortKey,
+    PickTick, PickVerdict, PickViDemotion, PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
@@ -323,36 +325,52 @@ pub fn workspace_draw_record(
     }
 }
 
-/// One workspace's item draws (#11896), as [`item_draw_record`] reads them.
+/// One workspace's weight-0 items (#11896), as [`item_draw_record`] reads
+/// them.
 #[derive(Debug, Clone, Copy)]
 pub struct ItemDrawWorkspace<'a> {
-    /// The forge slug: the `repo` the record names and the seed's
-    /// `workspace` input.
+    /// The workspace's index among the tick's roots.
+    pub idx: usize,
+    /// The forge slug: the `repo` the record names.
     pub repo: &'a str,
     /// [`Weighing::excluded`](crate::step_dispatch::item_draw::Weighing::excluded).
     pub excluded: &'a std::collections::BTreeMap<Exclusion, usize>,
-    /// The pool before the first draw ([`crate::step_dispatch::item_draw::ItemDraw::starting_pool`]).
-    pub pool: &'a [Candidate],
+}
+
+/// The tick's one item pool and its draws (#12185), as [`item_draw_record`]
+/// reads them.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemDrawPool<'a> {
+    /// The draw: starting pool, repo terms, exponents and closures.
+    pub draw: &'a ItemDraw,
     /// The draws taken, in order.
     pub draws: &'a [DrawRecord],
-    /// The draw stopped on a `WeightOverflow` (#11909).
+    /// The draws stopped on a `WeightOverflow` (#11909).
     pub overflow: bool,
 }
 
-/// The step engine's item draws for one tick (#11896) as `pick.decision`
-/// carries them: the `loom-draw/v2` seed inputs shared by every workspace,
-/// the weight-0 counts by reason and every draw's weight terms. `None` when
-/// no workspace was drawn.
+/// The step engine's item draws for one tick (#11896, #12185) as
+/// `pick.decision` carries them: the `loom-draw/v3` seed inputs, the two
+/// exponents, every repo's roster weight and in-flight count, the weight-0
+/// counts by reason, the starting pool and every draw's weight terms. `None`
+/// when nothing was drawn.
 #[must_use]
 pub fn item_draw_record(
     minute: u64,
     host: &str,
     tick_counter: u64,
     workspaces: &[ItemDrawWorkspace<'_>],
+    pool: &ItemDrawPool<'_>,
 ) -> Option<PickItemDraw> {
-    if workspaces.is_empty() {
+    if workspaces.is_empty() || (pool.draws.is_empty() && !pool.overflow) {
         return None;
     }
+    let name = |idx: usize| -> String {
+        workspaces
+            .iter()
+            .find(|w| w.idx == idx)
+            .map_or_else(|| "repo_unresolved".to_string(), |w| w.repo.to_string())
+    };
     let excluded = workspaces
         .iter()
         .flat_map(|w| {
@@ -366,49 +384,80 @@ pub fn item_draw_record(
                 })
         })
         .collect();
-    let draws: Vec<PickItemDrawStep> = workspaces
+    let draws: Vec<PickItemDrawStep> = pool
+        .draws
         .iter()
-        .flat_map(|w| {
-            w.draws.iter().map(|d| {
-                let c = &d.picked;
-                PickItemDrawStep {
-                    repo: w.repo.to_string(),
-                    draw_index: d.draw_index,
-                    seed: d.seed.to_string(),
-                    pool_size: d.pool_size,
-                    total_weight: d.total_weight,
-                    roll: d.roll,
-                    picked_index: d.picked_index,
-                    number: c.target(),
-                    issue: c.item.issue,
-                    pr: c.item.pr,
-                    step: c.step.as_str().to_string(),
-                    weight: c.terms.weight,
-                    actionable: c.terms.actionable,
-                    priority: c.terms.priority,
-                    level: c.terms.level.as_str().to_string(),
-                    lane: lane_name(c.item.lane).to_string(),
-                    age_permille: c.terms.age_permille,
-                    age_minutes: c.terms.age_minutes,
-                    age_source: c.terms.age_source.as_str().to_string(),
-                }
-            })
-        })
-        .collect();
-    let pools = workspaces
-        .iter()
-        .flat_map(|w| {
-            w.pool.iter().enumerate().map(|(i, c)| PickItemPoolEntry {
-                repo: w.repo.to_string(),
-                index: u32::try_from(i).unwrap_or(u32::MAX),
+        .map(|d| {
+            let c = &d.picked;
+            PickItemDrawStep {
+                repo: name(c.workspace_idx),
+                draw_index: d.draw_index,
+                seed: d.seed.to_string(),
+                pool_size: d.pool_size,
+                total_weight: d.total_weight,
+                roll: d.roll,
+                picked_index: d.picked_index,
                 number: c.target(),
                 issue: c.item.issue,
                 pr: c.item.pr,
                 step: c.step.as_str().to_string(),
                 weight: c.terms.weight,
+                draw_weight: d.terms.weight,
+                repo_weight: d.terms.repo.weight,
+                repo_items: d.terms.repo.items,
+                repo_pool_weight: d.terms.repo.pool_weight,
+                in_flight_repo: d.terms.repo.in_flight,
+                actionable: c.terms.actionable,
                 priority: c.terms.priority,
+                level: c.terms.level.as_str().to_string(),
+                lane: lane_name(c.item.lane).to_string(),
                 age_permille: c.terms.age_permille,
+                age_minutes: c.terms.age_minutes,
                 age_source: c.terms.age_source.as_str().to_string(),
+            }
+        })
+        .collect();
+    let start = pool.draw.starting_pool();
+    let pools = start
+        .iter()
+        .enumerate()
+        .map(|(i, c)| PickItemPoolEntry {
+            repo: name(c.workspace_idx),
+            index: u32::try_from(i).unwrap_or(u32::MAX),
+            number: c.target(),
+            issue: c.item.issue,
+            pr: c.item.pr,
+            step: c.step.as_str().to_string(),
+            weight: c.terms.weight,
+            priority: c.terms.priority,
+            age_permille: c.terms.age_permille,
+            age_source: c.terms.age_source.as_str().to_string(),
+        })
+        .collect();
+    // The starting pool's repos, in pool order (a replay indexes them so).
+    let start_rows: Vec<PoolRow> = start
+        .iter()
+        .map(|c| PoolRow {
+            repo: c.workspace_idx,
+            item_weight: c.terms.weight,
+        })
+        .collect();
+    let at_start = pool_weights(&start_rows, pool.draw.repos(), pool.draw.knobs());
+    let mut order: Vec<usize> = Vec::new();
+    for c in start {
+        if !order.contains(&c.workspace_idx) {
+            order.push(c.workspace_idx);
+        }
+    }
+    let repos = order
+        .iter()
+        .filter_map(|idx| {
+            at_start.repos.get(idx).map(|t| PickItemRepo {
+                repo: name(*idx),
+                weight: t.weight,
+                in_flight: t.in_flight,
+                items: t.items,
+                pool_weight: t.pool_weight,
             })
         })
         .collect();
@@ -418,14 +467,37 @@ pub fn item_draw_record(
         seed_host: host.to_string(),
         tick_counter: tick_counter.to_string(),
         draws_total: draws.len(),
+        backlog_exponent: pool.draw.knobs().backlog_exponent.to_string(),
+        busy_exponent: pool.draw.knobs().busy_exponent.to_string(),
+        repos,
+        closures: pool
+            .draw
+            .closures()
+            .iter()
+            .map(|&(idx, after_draw)| PickItemClosure {
+                repo: name(idx),
+                after_draw,
+                steps: Vec::new(),
+            })
+            .chain(
+                pool.draw
+                    .step_closures()
+                    .iter()
+                    .map(|(idx, after_draw, steps)| PickItemClosure {
+                        repo: name(*idx),
+                        after_draw: *after_draw,
+                        steps: steps.iter().map(|s| s.as_str().to_string()).collect(),
+                    }),
+            )
+            .collect(),
         excluded,
         pools,
         draws,
-        weight_overflow: workspaces
-            .iter()
-            .filter(|w| w.overflow)
-            .map(|w| w.repo.to_string())
-            .collect(),
+        weight_overflow: if pool.overflow {
+            order.iter().map(|&idx| name(idx)).collect()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -519,6 +591,46 @@ pub fn completed_work_finder_record(
         .with_workspace_draw(draw)
         .with_very_important_demoted(demoted)
         .with_dispatch_result(Some(dispatch_result))
+}
+
+/// `dispatch_result` of a work-finder tick skipped whole because the shared
+/// GitHub rate-limit breaker (#4429) was suppressing forge polling (#12083).
+pub const RATE_LIMIT_HELD: &str = "rate_limit_held";
+
+/// A tick the work finder skipped before listing anything (#12083): an empty,
+/// unobserved record so a breaker-skipped tick reads as a tick with a named
+/// `dispatch_result`, not as silence. `outcome` stays `skipped`.
+#[must_use]
+pub fn skipped_work_finder_record(
+    host: &str,
+    at: DateTime<Utc>,
+    dispatch_result: &str,
+) -> PickDecisionRecord {
+    PickDecisionRecord::build(
+        PickTick {
+            role: WORK_FINDER_ROLE.to_string(),
+            host: host.to_string(),
+            tick_id: format!("{WORK_FINDER_ROLE}-{}", crate::telemetry::trace::instant(at)),
+            started_at: at,
+            ended_at: at,
+            outcome: "skipped".to_string(),
+        },
+        Vec::new(),
+    )
+    .with_source(source::READY_QUEUE, false)
+    .with_dispatch_result(Some(dispatch_result))
+}
+
+/// Emit [`skipped_work_finder_record`] for a tick skipped at `at`; a no-op
+/// unless an OTLP exporter is running.
+pub fn emit_skipped_work_finder(dispatch_result: &str, at: DateTime<Utc>) {
+    if exporting() {
+        emit(skipped_work_finder_record(
+            &crate::sweep_registry::host_identity(),
+            at,
+            dispatch_result,
+        ));
+    }
 }
 
 /// The reason every candidate of a tick that never ran the role was skipped.

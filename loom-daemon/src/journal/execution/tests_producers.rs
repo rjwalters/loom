@@ -349,3 +349,128 @@ fn e16_launch_attribution_is_names_only_and_verifies() {
     let report = verify_concern(root.path());
     assert_eq!(report.unexplained[0].fields, ["account"]);
 }
+
+// ---- E3 sweep-checkpoint ------------------------------------------------
+
+fn write_checkpoint(path: &Path, record: &serde_json::Value) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, serde_json::to_vec_pretty(record).unwrap()).unwrap();
+}
+
+fn sample_checkpoint() -> serde_json::Value {
+    json!({
+        "phase": "builder-done",
+        "task_id": "t-1",
+        "timestamp": "2026-10-16T01:02:03Z",
+        "pr_number": 42,
+        "attempt": 2,
+        "model": "opus",
+        "doctor_escalation": {"k": 2, "gh_token": "ghp_secret"},
+        "unlisted": "never-journaled",
+    })
+}
+
+#[test]
+fn e3_checkpoint_write_is_shadowed_allow_listed_and_verifies() {
+    let root = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path = ws.path().join(".loom/sweep-checkpoint/issue-7.json");
+    let record = sample_checkpoint();
+    write_checkpoint(&path, &record);
+    enable(root.path());
+    let outcome = checkpoint_written(&path, ws.path(), 7, &record);
+    assert!(
+        matches!(
+            outcome,
+            ShadowOutcome::Appended {
+                verdict: Verdict::Match,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let first = &records(root.path())[0];
+    assert_eq!(first.kind, "checkpoint.completed");
+    assert_eq!(first.data["subject"]["issue"], 7);
+    assert_eq!(first.data["subject"]["pr"], 42);
+    assert_eq!(first.data["phase"], "builder-done");
+    assert_eq!(first.data["attempt"], 2);
+    let text = serde_json::to_string(&first.data).unwrap();
+    assert!(!text.contains("never-journaled") && !text.contains("ghp_secret"), "{text}");
+    let report = assert_ok(root.path());
+    assert_eq!(store_summary(&report, Store::Checkpoint).matched, 1);
+}
+
+#[test]
+fn e3_default_off_appends_nothing() {
+    let root = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path = ws.path().join("issue-7.json");
+    let record = sample_checkpoint();
+    write_checkpoint(&path, &record);
+    let before = std::fs::read(&path).unwrap();
+    disable();
+    assert_eq!(checkpoint_written(&path, ws.path(), 7, &record), ShadowOutcome::Disabled);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn e3_journal_unavailable_fails_soft_and_legacy_stays_usable() {
+    let ws = tempdir().unwrap();
+    let blocker = ws.path().join("not-a-dir");
+    std::fs::write(&blocker, b"x").unwrap();
+    let path = ws.path().join("issue-7.json");
+    let record = sample_checkpoint();
+    write_checkpoint(&path, &record);
+    enable(&blocker.join("journal"));
+    assert!(matches!(
+        checkpoint_written(&path, ws.path(), 7, &record),
+        ShadowOutcome::Failed(_)
+    ));
+    let legacy: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(legacy, record);
+}
+
+#[test]
+fn e3_rewrites_follow_the_file_and_delete_is_explained_not_divergent() {
+    let root = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path = ws.path().join("issue-9.json");
+    enable(root.path());
+    for phase in ["curator-done", "builder-done"] {
+        let record = json!({"phase": phase, "task_id": "t", "timestamp": "2026-10-16T01:00:00Z",
+            "pr_number": null});
+        write_checkpoint(&path, &record);
+        checkpoint_written(&path, ws.path(), 9, &record);
+    }
+    assert_eq!(kinds(root.path()), ["checkpoint.completed", "checkpoint.completed"]);
+    assert_ok(root.path());
+    // `delete` is not shadowed; the missing file is an explained difference.
+    std::fs::remove_file(&path).unwrap();
+    let report = assert_ok(root.path());
+    assert_eq!(store_summary(&report, Store::Checkpoint).explained["terminal_delete"], 1);
+}
+
+#[test]
+fn e3_unjournaled_phase_change_is_a_reported_divergence() {
+    let root = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path = ws.path().join("issue-3.json");
+    let record =
+        json!({"phase": "curator-done", "task_id": "t", "timestamp": "2026-10-16T01:00:00Z"});
+    write_checkpoint(&path, &record);
+    enable(root.path());
+    checkpoint_written(&path, ws.path(), 3, &record);
+    disable();
+    write_checkpoint(
+        &path,
+        &json!({"phase": "judge-done", "task_id": "t",
+        "timestamp": "2026-10-16T01:00:00Z"}),
+    );
+    let before = std::fs::read(&path).unwrap();
+    let report = verify_concern(root.path());
+    assert!(!report.ok);
+    assert_eq!(report.unexplained[0].item, "issue-3");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}

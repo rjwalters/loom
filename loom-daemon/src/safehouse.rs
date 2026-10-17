@@ -2572,8 +2572,8 @@ fn reconciled_row(row: &Value, cutoff: DateTime<Utc>) -> Option<ReconciledMerged
 /// merges: Builder opens a PR (an open PR is unfinished work, never a
 /// `completion` — `completion_for_exit` holds sweeps to the same rule), and
 /// Judge, Doctor, Curator and promotion move labels. Of the merge step's
-/// outcomes only a `verdict` can be a merge, and its one non-merge verdict,
-/// `rejected`, is ruled out without a forge call; `noop`, `refused` and
+/// outcomes only a `verdict` can be a merge, and its non-merge verdicts,
+/// `rejected` and a PR triage's (#12499), are ruled out without a forge call; `noop`, `refused` and
 /// `failed` never narrate. A `verdict` with another reason (`closed`, or
 /// `unclassified` when the session's line was missing) is still looked up:
 /// the forge's `mergedAt`, not the reason, decides. Pure.
@@ -2583,7 +2583,9 @@ pub(crate) fn step_narrates_completion(
     class: &str,
     reason: &str,
 ) -> bool {
-    role == crate::step_role::StepRole::ChampionMerge && class == "verdict" && reason != "rejected"
+    role == crate::step_role::StepRole::ChampionMerge
+        && class == "verdict"
+        && !matches!(reason, "rejected" | "triaged" | "triage_blocked" | "triage_operator")
 }
 
 /// `gh pr view <pr> --json` [`RECONCILE_PR_FIELDS`]: the merged PR a merge

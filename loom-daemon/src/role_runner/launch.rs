@@ -39,6 +39,8 @@ pub(super) fn apply_role_observability(
     runtime: Option<&str>,
 ) -> Option<crate::observability::agent_relay::SessionLease> {
     use crate::telemetry::trace::store::{TRACEPARENT_ENV, W3C_TRACEPARENT_ENV};
+    // #12342: where the tick runs rides its span at open.
+    crate::observability::lifecycle::role_runtime::note_launch(cmd, runtime);
     let execution = crate::observability::lifecycle::role_command(cmd);
     if let Some(execution) = &execution {
         // #11855: where a won PR claim names this tick's PR.
@@ -526,7 +528,7 @@ pub(super) fn run_role_with_timeout(
                     // a fake saturated/unsaturated host can be asserted
                     // deterministically.
                     let load_per_core =
-                        load_per_core_override.or_else(crate::cpu_headroom::load_per_core);
+                        load_per_core_override.or_else(crate::host_status::load_per_core_or_raw);
                     let outcome =
                         terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
                     // #11931: the agent never reached `lease pr release`; do

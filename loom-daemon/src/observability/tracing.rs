@@ -29,9 +29,7 @@ fn valid_endpoint(endpoint: &str) -> bool {
 /// Persist before spawn. A corrupt/busy/full store disables this execution's
 /// tracing with a diagnostic; it cannot fail the actual issue dispatch.
 ///
-/// An `issue` execution joins that issue's D32 v1 story trace (#9037, #9068)
-/// when the checkout's GitHub `origin` resolves to a `repo_id`; otherwise it
-/// is its own root. There is no name-derived fallback.
+/// Every execution is its own root trace; `issue` is a plain span attribute.
 ///
 /// The context is exported under **both** [`TRACEPARENT_ENV`] (Loom's own
 /// namespaced variable) and [`W3C_TRACEPARENT_ENV`] (the standard `TRACEPARENT`,
@@ -49,14 +47,13 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue:
     if !enabled(root) {
         return;
     }
-    let story = issue.and_then(|issue| resolve_story(root, issue));
     let store = TraceStore::new(root);
-    match store.load_or_create_story(root, execution, story.as_ref().map(|s| &s.context)) {
+    match store.load_or_create(root, execution) {
         Ok(saved) => {
             command.env(TRACEPARENT_ENV, saved.context.traceparent());
             command.env(W3C_TRACEPARENT_ENV, saved.context.traceparent());
             command.env(CONTEXT_FILE_ENV, store.path(root, execution));
-            super::lifecycle::prepare_execution(command, root, execution, story.as_ref());
+            super::lifecycle::prepare_execution(command, root, execution, issue);
         }
         Err(error) => {
             log::warn!("observability: trace context unavailable; child is untraced: {error}")
@@ -64,39 +61,15 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue:
     }
 }
 
-/// The D32 v1 story of `issue` in the checkout at `root`, or `None` when the
-/// `origin` is not a GitHub repo or its `repo_id` cannot be resolved (warned
-/// once per repo by [`crate::telemetry::repo_identity`]).
+/// The checkout's repo as GitHub spells it (#10637), so `loom.repo` agrees
+/// across hosts whose origins differ only in case and matches
+/// `loom.dispatch.*`. `None` when the `origin` is not a GitHub repo or its
+/// identity cannot be resolved (warned once per repo by
+/// [`crate::telemetry::repo_identity`]).
 #[must_use]
-pub fn resolve_story(root: &Path, issue: u32) -> Option<StoryRef> {
+pub fn resolve_repo(root: &Path) -> Option<String> {
     let slug = crate::release_resolve::host::repo_slug(root)?;
-    let identity = crate::telemetry::repo_identity::resolve(&slug)?;
-    let context = match crate::telemetry::trace::story_context(identity.id, issue) {
-        Ok(context) => context,
-        Err(error) => {
-            log::warn!("observability: no story trace for {slug}#{issue}: {error}");
-            return None;
-        }
-    };
-    Some(StoryRef {
-        // GitHub's own spelling (#10637), so `loom.repo` agrees across hosts
-        // whose origins differ only in case and matches `loom.dispatch.*`.
-        // Not an ID input: the story key is the `repo_id`.
-        repo: identity.full_name.clone(),
-        story: format!("{}#{issue}", identity.full_name),
-        issue,
-        context,
-    })
-}
-
-/// The issue an execution's story trace belongs to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoryRef {
-    pub repo: String,
-    pub issue: u32,
-    /// `owner/repo#n` at resolution time (`loom.story`, `Loom-Story:`).
-    pub story: String,
-    pub context: crate::telemetry::trace::TraceContext,
+    Some(crate::telemetry::repo_identity::resolve(&slug)?.full_name)
 }
 
 /// The OTLP signal an OTLP-only record kind belongs to, or `None` for a kind

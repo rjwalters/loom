@@ -43,6 +43,8 @@ test-champion-capped-hold-routing.sh
 test-champion-ci-checks-no-checks-signal.sh
 test-champion-critical-file-check.sh
 test-champion-evaluating-reclaim-trust.sh
+test-champion-epic-child-discovery.sh
+test-champion-epic-escalation-evaluations.sh
 test-champion-epic-escalation-respects-human-hold.sh
 test-champion-epic-phase-marker-normalization.sh
 test-champion-epic-verdict-marker-scope.sh
@@ -58,6 +60,7 @@ test-champion-promotion-throughput.sh
 test-champion-standing-authorization.sh
 test-champion-targeted-modes.sh
 test-champion-terminal-verdicts.sh
+test-champion-tracker-marker-skip.sh
 test-check-cas-recheck-consistency.sh
 test-check-ci-status.sh
 test-ci-suite-manifest-installed-layout.sh
@@ -86,7 +89,6 @@ test-config-tiers-cli-migration.sh
 test-cpu-budget.sh
 test-create-issue-refuse-labels.sh
 test-create-pr-priority-labels.sh
-test-create-pr-provenance.sh
 test-create-pr-rate-limit-fallback.sh
 test-create-pr-review-gate.sh
 test-create-pr-superseded-issue.sh

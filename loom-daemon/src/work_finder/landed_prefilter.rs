@@ -32,7 +32,12 @@
 //! A PR in the issue's GitHub closes-graph (`closedByPullRequestsReferences`,
 //! closed PRs included: a closing keyword such as `Closes #N`, or a
 //! Development-sidebar link) is `MERGED`, merged after the issue was last
-//! reopened, and belongs to the issue's own repository. A `Part of #N` /
+//! reopened, and belongs to the issue's own repository. So is a PR built on
+//! the issue's Builder branch `feature/issue-N` (#12251): the open-PR guard
+//! already links an open PR that way, and once it merges without a closing
+//! keyword the issue stays open with nothing else to say it is done. It
+//! counts when its head is in this repository, it merged into the default
+//! branch, and after the last reopen ([`branch_landing`]). A `Part of #N` /
 //! `Refs #N` PR is not in the closes-graph, so its merge never counts: that
 //! work is unfinished, and the issue keeps its stage (the no-op cooldown
 //! handles a dispatch that finds nothing to do). A merge older than the
@@ -85,6 +90,15 @@
 //! unanswered query is not repeated for [`LANDED_FAIL_BACKOFF`] (#12205), so
 //! a forge that cannot answer costs one query per backoff, not one per tick.
 //!
+//! # At the Builder spawn (#12251)
+//!
+//! The step engine asks once more, for one issue, right before a Builder step
+//! claims it ([`landed_at_spawn`]): a landed issue is routed to Curator as
+//! above and the step is refused `already_landed`. This guard does not read
+//! [`ENABLED_KEY`]: it costs one query per Builder spawn, not one per
+//! workspace per tick, and it is what keeps a landed issue whose `loom:issue`
+//! a claim release restored from being built again on every host.
+//!
 //! # Off by default (#12205)
 //!
 //! [`ENABLED_KEY`] (`autonomous.workFinder.landedPrefilter`, read live from
@@ -136,6 +150,11 @@ pub const LANDED_BATCH: usize = 100;
 /// `first:` on each closes-graph: a truncated graph is no verdict.
 const CLOSING_FIRST: usize = 20;
 
+/// `first:` on each Builder-branch PR listing (#12251). A branch is reused
+/// only when an issue is reopened and built again, so a handful is plenty;
+/// the read only adds a landing, so a truncated one costs nothing.
+const BRANCH_FIRST: usize = 5;
+
 /// Deadline of the closes-graph query.
 const GRAPHQL_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -170,10 +189,11 @@ pub fn route_marker(pr: u32) -> String {
 #[must_use]
 pub fn route_comment(pr: u32) -> String {
     format!(
-        "PR #{pr}, which closes this issue, has merged, but the issue is still open. It goes \
+        "PR #{pr}, which closes this issue (a closing keyword, or built on the issue's own \
+         `feature/issue-N` branch), has merged, but the issue is still open. It goes \
          back to Curator (`loom:triage`) instead of to a Builder: close it if #{pr} finished \
          the work, or curate it again if work remains. This is done once per merged PR \
-         (#11853).\n\n{}",
+         (#11853, #12251).\n\n{}",
         route_marker(pr)
     )
 }
@@ -184,21 +204,35 @@ pub fn route_comment(pr: u32) -> String {
 
 /// One aliased query: each issue's state, its last reopen, and its
 /// closes-graph with closed (and so merged) PRs included, each PR naming its
-/// repository.
+/// repository; beside each issue, the merged PRs from its Builder branch
+/// [`builder_branch`] (#12251), and once, the default branch they must target.
 #[must_use]
 pub fn landed_query(owner: &str, name: &str, issues: &[u32]) -> String {
     let fields: String = issues
         .iter()
         .map(|n| {
+            let branch = builder_branch(*n);
             format!(
                 " i{n}: issue(number: {n}) {{ state timelineItems(itemTypes: [REOPENED_EVENT], \
                  last: 1) {{ nodes {{ ... on ReopenedEvent {{ createdAt }} }} }} \
                  closedByPullRequestsReferences(first: {CLOSING_FIRST}, includeClosedPrs: true) \
-                 {{ totalCount nodes {{ number state mergedAt repository {{ nameWithOwner }} }} }} }}"
+                 {{ totalCount nodes {{ number state mergedAt repository {{ nameWithOwner }} }} }} }} \
+                 b{n}: pullRequests(headRefName: \"{branch}\", states: [MERGED], \
+                 first: {BRANCH_FIRST}) {{ nodes {{ number mergedAt baseRefName \
+                 headRepository {{ nameWithOwner }} }} }}"
             )
         })
         .collect();
-    format!("query {{ repository(owner: \"{owner}\", name: \"{name}\") {{{fields} }} }}")
+    format!(
+        "query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ defaultBranchRef {{ name }}{fields} }} }}"
+    )
+}
+
+/// The Builder's branch for `issue` (`feature/issue-N`), the same name the
+/// open-PR guard links by ([`crate::worktree_ops::linked_pr_listing`]).
+#[must_use]
+pub fn builder_branch(issue: u32) -> String {
+    format!("feature/issue-{issue}")
 }
 
 fn ts(v: &Value) -> Option<DateTime<Utc>> {
@@ -253,9 +287,52 @@ pub fn alias_verdict(issue: &Value, repo: &str) -> Option<Option<u32>> {
     (usize::try_from(total).ok() == Some(nodes.len())).then_some(None)
 }
 
+/// The issue's Builder-branch landing (#12251): the latest PR in `prs` (the
+/// `b{n}` alias of [`landed_query`], merged PRs whose head is
+/// [`builder_branch`]) whose head lives in `repo`, that targets
+/// `default_branch`, and that merged after the issue's last reopen. A PR
+/// built on the issue's own branch finished its work as surely as one that
+/// says `Closes #N`: without the keyword the merge leaves the issue open, and
+/// nothing else would stop the step draw handing it to a Builder again.
+///
+/// A head in another repository (a fork can name its branch anything), a
+/// merge into another branch (a stacked base), or one older than the last
+/// reopen does not count. `None` when `issue` is not an open issue or `prs`
+/// carries no merge that counts: the branch read only ever adds a landing,
+/// it never takes the closes-graph's verdict away.
+#[must_use]
+pub fn branch_landing(issue: &Value, prs: &Value, default_branch: &str, repo: &str) -> Option<u32> {
+    let state = issue.get("state")?.as_str()?;
+    if !state.eq_ignore_ascii_case("open") || default_branch.is_empty() {
+        return None;
+    }
+    let reopened = issue["timelineItems"]["nodes"]
+        .as_array()
+        .and_then(|n| n.iter().filter_map(|e| ts(&e["createdAt"])).max());
+    prs.get("nodes")?
+        .as_array()?
+        .iter()
+        .filter(|pr| pr["baseRefName"].as_str() == Some(default_branch))
+        .filter(|pr| {
+            pr["headRepository"]["nameWithOwner"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+        })
+        .filter_map(|pr| {
+            let number = u32::try_from(pr["number"].as_u64()?).ok()?;
+            let merged = ts(&pr["mergedAt"])?;
+            reopened
+                .is_none_or(|r| merged > r)
+                .then_some((merged, number))
+        })
+        .max()
+        .map(|(_, number)| number)
+}
+
 /// Parse a [`landed_query`] answer for repository `repo` (`owner/name`): the
 /// verdict of each issue that has one. `None` when the answer carries no
-/// `data.repository` at all.
+/// `data.repository` at all. A closing merge names the landing; failing one,
+/// a Builder-branch merge does ([`branch_landing`], #12251).
 #[must_use]
 pub fn parse_landed(body: &str, issues: &[u32], repo: &str) -> Option<HashMap<u32, Option<u32>>> {
     let json: Value = serde_json::from_str(body.trim()).ok()?;
@@ -263,10 +340,24 @@ pub fn parse_landed(body: &str, issues: &[u32], repo: &str) -> Option<HashMap<u3
     if !repository.is_object() {
         return None;
     }
+    let default_branch = repository["defaultBranchRef"]["name"]
+        .as_str()
+        .unwrap_or_default();
     Some(
         issues
             .iter()
-            .filter_map(|n| Some((*n, alias_verdict(repository.get(format!("i{n}"))?, repo)?)))
+            .filter_map(|n| {
+                let issue = repository.get(format!("i{n}"))?;
+                let branch = repository
+                    .get(format!("b{n}"))
+                    .and_then(|prs| branch_landing(issue, prs, default_branch, repo));
+                let verdict = match (alias_verdict(issue, repo), branch) {
+                    (Some(Some(pr)), _) => Some(Some(pr)),
+                    (_, Some(pr)) => Some(Some(pr)),
+                    (verdict, None) => verdict,
+                };
+                Some((*n, verdict?))
+            })
             .collect(),
     )
 }
@@ -555,9 +646,52 @@ pub fn lift<F: LandedForge + ?Sized>(
         .collect()
 }
 
+/// The Builder-step spawn guard (#12251): whether `issue`'s work has landed,
+/// asked fresh, right before a Builder step would claim it. `Some(pr)` when a
+/// merged closing or Builder-branch PR lands it and Curator has not kept that
+/// landing; the landing is routed to Curator here, as [`detect`] routes one.
+/// `None` (spawn) when it has not landed, when Curator kept it, while an
+/// unanswered query backs this workspace off, or when the forge does not
+/// answer: fail open, as every landed read is.
+pub fn spawn_check<F: LandedForge + ?Sized>(
+    forge: &mut F,
+    cache: &mut LandedCache,
+    issue: u32,
+    now: Instant,
+) -> Option<u32> {
+    if cache.backing_off(now) {
+        return None;
+    }
+    settle(forge, cache, &[issue], now);
+    cache.landed(issue)
+}
+
 // ---------------------------------------------------------------------------
 // Production glue
 // ---------------------------------------------------------------------------
+
+/// [`spawn_check`] against the live forge, for the step engine's Builder
+/// spawn (#12251). Not gated by [`ENABLED_KEY`]: that key bounds the
+/// per-tick reads of every candidate, and this is one read per Builder spawn,
+/// the one moment a landed issue costs a session.
+#[must_use]
+pub fn landed_at_spawn(
+    gh_bin: &std::path::Path,
+    root: &std::path::Path,
+    slug: &str,
+    issue: u32,
+) -> Option<u32> {
+    let mut forge = GhLandedForge {
+        gh_bin: gh_bin.to_path_buf(),
+        root: root.to_path_buf(),
+        slug: slug.to_string(),
+    };
+    let mut all = caches()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = all.entry(root.to_path_buf()).or_default();
+    spawn_check(&mut forge, cache, issue, Instant::now())
+}
 
 fn caches() -> &'static Mutex<HashMap<PathBuf, LandedCache>> {
     static CACHES: OnceLock<Mutex<HashMap<PathBuf, LandedCache>>> = OnceLock::new();
@@ -597,6 +731,8 @@ pub fn landed_in(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cache = all.entry(root).or_default();
+        // #12310: the closing-refs reads are discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         detect(&mut forge, cache, candidates, open_pr, Instant::now())
     };
     if !landed.is_empty() {

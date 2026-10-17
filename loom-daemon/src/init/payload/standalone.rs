@@ -233,12 +233,16 @@ pub fn run_with(payload: &Payload, dest: &Path, dry_run: bool) -> Result<Report>
                 "{} (NOT refreshed: {why}; fix its BEGIN/END markers by hand and resync again)",
                 skip.path
             ),
+            SkipReason::BehindSymlink(why) => {
+                format!("{} (NOT resynced: {why})", skip.path)
+            }
         })
         .collect();
     report.partial = diff
         .skipped_surfaces
         .iter()
-        .any(|skip| matches!(skip.why, SkipReason::MalformedMarkers(_)));
+        .any(|skip| matches!(skip.why, SkipReason::MalformedMarkers(_)))
+        || !diff.held_roots().is_empty();
     if diff.is_empty() {
         return Ok(report);
     }

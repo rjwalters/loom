@@ -27,6 +27,13 @@ const TEMPLATE: &str =
     include_str!("../../defaults/observability/signoz/alerts/queue-starvation.json");
 const FIXTURE: &str = include_str!("fixtures/signoz_host_export/fixture.sql");
 
+const LIFECYCLE_FIXTURE: &str = include_str!("fixtures/signoz_host_export/lifecycle.sql");
+const LIFECYCLE_ROSTER: &str =
+    "('l-running','always'), ('l-stopped','always'), ('l-crashed','always'), \
+('l-restart-running','always'), ('l-restart-silent','always'), ('l-exit-restart','always'), \
+('l-nostart','always'), ('l-othertopic','always'), ('l-never','always'), \
+('w-asleep','when_awake'), ('w-gone','when_awake')";
+
 const BEGIN: &str = "/* loom:roster:begin */";
 const END: &str = "/* loom:roster:end */";
 
@@ -58,6 +65,38 @@ fn with_roster(text: &str, roster: &str) -> String {
 }
 
 // ---------------------------------------------------------------- static ----
+
+const LIFECYCLE_BEGIN: &str = "/* loom:lifecycle-roster:begin */";
+const LIFECYCLE_END: &str = "/* loom:lifecycle-roster:end */";
+
+fn lifecycle_roster_of(text: &str) -> &str {
+    assert_eq!(text.matches(LIFECYCLE_BEGIN).count(), 1, "one lifecycle begin marker");
+    assert_eq!(text.matches(LIFECYCLE_END).count(), 1, "one lifecycle end marker");
+    let (_, rest) = text.split_once(LIFECYCLE_BEGIN).unwrap();
+    rest.split_once(LIFECYCLE_END).unwrap().0
+}
+
+#[test]
+fn lifecycle_query_shares_query_3_roster_and_thresholds() {
+    let squash = |t: &str| t.split_whitespace().collect::<String>();
+    assert_eq!(
+        squash(lifecycle_roster_of(SQL)),
+        squash(roster_of(SQL)),
+        "query 5's roster must be the same rows as query 3's"
+    );
+    let q5 = sql_query(5);
+    assert!(q5.contains("900") && q5.contains("86400"), "query 3's thresholds");
+    for s in [
+        "'running'",
+        "'stopped'",
+        "'silent'",
+        "daemon.start",
+        "daemon.exit",
+        "host.export",
+    ] {
+        assert!(q5.contains(s), "query 5 mentions {s}");
+    }
+}
 
 #[test]
 fn alert_shares_the_template_schema() {
@@ -320,3 +359,46 @@ fn replayed_exporter_loss_keeps_reset_steps_and_unknown_coverage() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn replayed_lifecycle_query_reads_running_stopped_and_silent() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
+    let query = {
+        let q = sql_query(5);
+        let (head, rest) = q.split_once(LIFECYCLE_BEGIN).unwrap();
+        let (_, tail) = rest.split_once(LIFECYCLE_END).unwrap();
+        format!("{head}{LIFECYCLE_BEGIN} {LIFECYCLE_ROSTER} {LIFECYCLE_END}{tail}")
+    };
+    let states: BTreeMap<String, String> =
+        rows(&clickhouse(&format!("{LIFECYCLE_FIXTURE}\n{query}")))
+            .iter()
+            .map(|r| {
+                (r["host"].as_str().unwrap().to_owned(), r["state"].as_str().unwrap().to_owned())
+            })
+            .collect();
+    let want: BTreeMap<String, String> = [
+        ("l-running", "running"),
+        ("l-stopped", "stopped"),
+        ("l-crashed", "silent"),
+        ("l-restart-running", "running"),
+        ("l-restart-silent", "silent"),
+        ("l-exit-restart", "running"),
+        ("l-nostart", "running"),
+        ("l-othertopic", "silent"),
+        ("l-never", "silent"),
+        ("w-asleep", "running"),
+        ("w-gone", "silent"),
+    ]
+    .into_iter()
+    .map(|(h, s)| (h.to_owned(), s.to_owned()))
+    .collect();
+    assert_eq!(states, want);
+}
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

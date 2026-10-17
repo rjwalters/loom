@@ -80,7 +80,10 @@ impl SweepRegistry {
     pub(crate) fn fetch_label_applied_at(&self, issue: u32, label: &str) -> Option<DateTime<Utc>> {
         // Counted as `guard.claim_timeline` (#10089); the facade applies the
         // cross-owner GH_CONFIG_DIR (#5401) and `LOOM_REPO` as GH_REPO (#8263 —
-        // `gh api` has no `--repo` flag).
+        // `gh api` has no `--repo` flag). Stays on the writer (#12389): it
+        // reads back a claim label this daemon may just have written, right
+        // before a restore or reap acts on it, and a reader or the gateway's
+        // cache could still answer from before that write.
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
         let jq = format!(
             r#"[.[] | select(.event == "labeled" and .label.name == "{label}") | .created_at] | max // empty"#
@@ -256,6 +259,8 @@ impl SweepRegistry {
     /// The newest `labeled loom:building` event's `(actor login, created_at)`.
     /// `None` on any read failure or unparseable output (callers fail closed).
     pub(crate) fn fetch_claim_event(&self, issue: u32) -> Option<(String, DateTime<Utc>)> {
+        // Writer-pinned like `fetch_label_applied_at` (#12389): the claim
+        // decision this feeds must see the label event that was just written.
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
         let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:building")] | max_by(.created_at) | select(. != null) | "\(.actor.login // "")\t\(.created_at)""#;
         let output = self
@@ -326,7 +331,7 @@ impl LeaseOrderDecision {
     /// yield variant never has to be re-plumbed through the dispatch path.
     pub(crate) fn yield_identity(self) -> Option<(String, String)> {
         match self {
-            Self::Proceed => None,
+            Self::Proceed | Self::Unverified => None,
             Self::Yield {
                 earliest_host,
                 earliest_sweep_id,

@@ -112,7 +112,8 @@ pub(crate) fn token(repo: &str, access: &str, force: bool) -> Result<()> {
             None => fallback_reason = Some("no reader configured".to_string()),
         }
     }
-    let Some(writer) = roster.writer.as_ref() else {
+    let owner = repo.split_once('/').map_or(repo, |(o, _)| o);
+    let Some(writer) = forge_identity::writer_for_owner(&roster, owner) else {
         println!("{}", json!({"status": "not_configured", "access": access}));
         return Ok(());
     };
@@ -191,6 +192,15 @@ pub(crate) fn identities(as_json: bool) -> Result<()> {
     );
     if roster.readers.is_empty() {
         println!("readers: <none: reads use the writer>");
+    }
+    for w in &roster.writers {
+        println!(
+            "writer:  {} for owners {}",
+            show(w),
+            w.owners
+                .as_ref()
+                .map_or_else(|| "<none>".into(), |o| o.join(", "))
+        );
     }
     for r in &roster.readers {
         println!("reader:  {}", show(r));

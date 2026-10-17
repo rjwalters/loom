@@ -31,6 +31,7 @@ roles with no `runtimeRequirements`.
 - [The seven contract points](#the-seven-contract-points)
 - [Phase 1: the `spawn-worker.sh` runtime-dispatch seam](#phase-1-the-spawn-workersh-runtime-dispatch-seam)
 - [Session containers (pointer only)](#session-containers-pointer-only)
+- [Hook settings ownership](#hook-settings-ownership)
 - [Fork mapping table](#fork-mapping-table)
 - [Non-goals](#non-goals)
 - [Related](#related)
@@ -92,7 +93,7 @@ tier-1/tier-2:
   transcript, and no account/usage-pool integration (points 2 and 4 are
   skipped outright). Point 3 (Error classification) is satisfied by the
   **generic-transient fallthrough only**: a tier-3 runtime gets no bespoke
-  pattern table in `classify-error.sh`. Passing its name as the
+  pattern table in the native classifier (`loom-daemon classify-error`). Passing its name as the
   `classify_error` provider argument is safe by construction — an
   unregistered provider matches no table and resolves through the shared
   engine's exit-code-first ordering and generic transients, exactly like any
@@ -2508,6 +2509,16 @@ mounts follow the same [`MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/b
 mirror the per-sweep `--cpus`/`--memory` shape above. Migrating the
 docker-requiring callers (build-gate, sim/build wrappers) onto the seam is
 issue #7854; elastic executor *placement* stays with #3979.
+
+## Hook settings ownership
+
+Loom does not write a consumer repo's `.claude/settings.json` on resync. Loom
+hooks reach a Claude session through launch-time `--settings` (daemon-dispatched
+sessions, never persisted) and user-scope `~/.claude/settings.json` entries; the
+project file stays repo-owned, and resync only reports hooks it does not wire
+(`report_unwired_hooks`). A hook that no non-mutating surface can carry is not
+delivered. Conflict, uninstall, malformed-file and upgrade behaviour are in
+[ADR-0026](https://github.com/rjwalters/loom/blob/main/docs/adr/0026-consumer-hook-settings-ownership.md).
 
 ## Fork mapping table
 

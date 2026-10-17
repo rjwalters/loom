@@ -9,7 +9,7 @@
 //! 60s for ~25 minutes, all failing, plus role sessions spawned straight into
 //! the same wall).
 //!
-//! This breaker is deliberately simpler than [`crate::host_breaker`] (no
+//! This breaker is deliberately simpler than `crate::host_breaker` (removed, #12406) (no
 //! sustain counter — a single unambiguous rate-limit failure is proof enough):
 //!
 //! - Any gh call site that fails feeds its error text to
@@ -50,7 +50,7 @@ mod report_tests;
 
 /// Env var toggling the rate-limit breaker. `0`/`false`/`no`/`off` disables;
 /// truthy forces on. Overrides config. Defaults ON — a safety backstop,
-/// mirroring [`crate::host_breaker::HOST_BREAKER_ENABLE_ENV`].
+/// mirroring `crate::host_breaker::HOST_BREAKER_ENABLE_ENV` (removed, #12406).
 pub const RATE_LIMIT_BREAKER_ENABLE_ENV: &str = "LOOM_RATE_LIMIT_BREAKER";
 
 /// Env var overriding the fallback cooldown (seconds) used when the reset
@@ -105,7 +105,7 @@ pub struct RateLimitBreakerConfigFile {
 
 /// Read `.loom/config.json → autonomous.rateLimitBreaker`, soft-failing every
 /// field to `None` on a missing file, malformed JSON, or a missing block.
-/// Mirrors [`crate::host_breaker::read_host_breaker_config`].
+/// Mirrors `crate::host_breaker::read_host_breaker_config` (removed, #12406).
 #[must_use]
 pub fn read_rate_limit_breaker_config(repo_root: &Path) -> RateLimitBreakerConfigFile {
     let effective = crate::config_resolver::resolve_effective_config(repo_root);
@@ -187,6 +187,11 @@ const RATE_LIMIT_SIGNATURES: &[&str] = &[
 /// wrapping it) identifies a rate-limit rejection.
 #[must_use]
 pub fn indicates_rate_limit(text: &str) -> bool {
+    // #12310: the gateway's quota-reserve refusal of a discovery read is a
+    // `429` too, but the pool is not exhausted: claims and writes carry on.
+    if crate::gh_invocation::purpose::is_reserve_refusal(text) {
+        return false;
+    }
     let lowered = text.to_ascii_lowercase();
     RATE_LIMIT_SIGNATURES
         .iter()
@@ -568,7 +573,7 @@ impl SharedRateLimitBreaker {
 }
 
 /// Process-global breaker handle, mirroring
-/// [`crate::host_breaker`]'s registration shape. Registered once at daemon
+/// `crate::host_breaker` (removed, #12406)'s registration shape. Registered once at daemon
 /// startup (before the startup reconciliation passes — every gh-polling
 /// consumer starts after it). Unset reads as "not suppressed".
 static GLOBAL: OnceLock<Arc<SharedRateLimitBreaker>> = OnceLock::new();
@@ -641,24 +646,28 @@ pub fn global_skip_pass(job: &str) -> bool {
 }
 
 /// Export one fresh trip as a `loom.ratelimit.trip` span (Issue #10022) and,
-/// when a probe reading exists, log its attribution (Issue #9855): the
-/// probe's pool-wide `used` minus this host's own ledger says whether this
-/// daemon exhausted its own pool or an external client sharing the
-/// credential did. `ledger` (`forge_call_stats::consumed_in_window`) is read
-/// only when there is a reading. An untrusted reading (#8997 — possibly
-/// another credential's budget) is logged with a marker but kept off the
-/// span, whose attribution attributes are then omitted rather than wrong.
+/// when a probe reading exists, log its attribution (Issues #9855, #12238):
+/// the tripping `credential`'s `used` minus this host's own ledger on that
+/// same credential leaves the share this host did not record — other hosts
+/// or processes on the credential. `ledger`
+/// (`forge_call_stats::consumed_in_window_for`) is read only when there is a
+/// reading. An untrusted reading (#8997 — possibly another credential's
+/// budget) is logged with a marker but kept off the span, whose attribution
+/// attributes are then omitted rather than wrong; the credential is still
+/// named, since it comes from the failing call, not the reading.
 pub fn export_trip(
     source: &str,
     tripped_at: DateTime<Utc>,
     cooldown_until: Option<DateTime<Utc>>,
     reading: Option<(&BudgetSnapshot, bool)>,
-    ledger: impl FnOnce() -> Option<BTreeMap<Pool, u64>>,
+    credential: Option<crate::observability::ops::ratelimit::TripCredential>,
+    ledger: impl FnOnce() -> Option<BTreeMap<Pool, crate::forge_call_stats::CredentialSpend>>,
 ) {
     let attribution = reading.map_or_else(TripAttribution::default, |(budget, trusted)| {
         let attribution = TripAttribution::from_budget(Some(budget), ledger().as_ref());
         log::warn!(
-            "rate_limit_breaker: attribution: core {} · graphql {} — external is other clients of this credential{}",
+            "rate_limit_breaker: attribution ({}): core {} · graphql {} — unattributed is other hosts or processes on the same credential{}",
+            credential.as_ref().map_or("credential unknown", |c| c.account.as_str()),
             attribution.core.log_text(),
             attribution.graphql.log_text(),
             if trusted { "" } else { " (reading untrusted, see #8997)" },
@@ -669,6 +678,10 @@ pub fn export_trip(
             TripAttribution::default()
         }
     });
+    let attribution = TripAttribution {
+        credential,
+        ..attribution
+    };
     crate::observability::ops::ratelimit::record_trip(
         source,
         tripped_at,
@@ -695,7 +708,7 @@ pub fn global_observe_failure_ctx(
 /// Emit the state-change `daemon.rate_limit_breaker.state` event for a
 /// transition (the trip/release log line is handled by
 /// [`global_observe_failure`] / the loop's release logging). Fire-and-forget,
-/// matching [`crate::host_breaker::emit_transition_event`].
+/// matching `crate::host_breaker::emit_transition_event` (removed, #12406).
 pub fn emit_transition_event(event_bus: &Arc<crate::event_bus::EventBus>, transition: &Transition) {
     if let Err(e) = event_bus.publish_generic(
         "daemon.rate_limit_breaker.state",
@@ -795,6 +808,21 @@ pub mod forge {
         let b = run_probe(inv, now);
         budget_cache::store(key, b, now);
         b
+    }
+
+    /// The credential a probe under `ctx` reads — the one the failing call
+    /// ran under — as the trip span names it (#12238). Local only: path
+    /// shapes and the directory's `identity.json`, never a forge call.
+    #[must_use]
+    pub fn credential_ctx(
+        ctx: &FailureContext,
+    ) -> crate::observability::ops::ratelimit::TripCredential {
+        let cred = crate::gh_invocation::accounting::cred_of(&probe_invocation(ctx));
+        crate::observability::ops::ratelimit::TripCredential {
+            account: cred.account,
+            owner: cred.owner,
+            installation: cred.installation,
+        }
     }
 
     fn probe_invocation(ctx: &FailureContext) -> GhInvocation {

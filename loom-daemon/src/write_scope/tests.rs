@@ -367,24 +367,6 @@ enum Scope {
     /// An operator-run verb with an explicit, configured target, never run by
     /// an autonomous path. Not write-scoped yet; listed so the gap is visible.
     OperatorOnly(&'static str),
-    /// An **autonomous** daemon write to the configured fleet store
-    /// (`fleet.repo`), which is not a managed workspace repo, so
-    /// `write_scope`'s managed + root-credential rule cannot vet it (it would
-    /// refuse every store that is not some workspace's origin). Scoped instead
-    /// by construction, and each part is asserted: the target comes from config
-    /// via `fleet_store::resolve_location`, never gh base-repo resolution; the
-    /// write goes only through the store's `WriteTransport` (the writer App,
-    /// `GhTransport::write_raw`), never a `gh` child of its own; the file
-    /// refuses the store's reviewed branch (`refuse_reviewed_branch`); and the
-    /// named caller reaches the named call only under its captain `gate`
-    /// (e.g. `RefreshGate::Captain`), so only the declared captain (or the
-    /// single refresher it stands for) writes.
-    FleetStore {
-        caller: &'static str,
-        call: &'static str,
-        gate: &'static str,
-        why: &'static str,
-    },
     /// Matches the pattern but is not a forge write.
     NotAWrite(&'static str),
 }
@@ -396,7 +378,7 @@ enum Scope {
 /// managed-repo + WRITE check.
 #[test]
 fn daemon_write_paths_are_scoped() {
-    use Scope::{FleetStore, Gated, NotAWrite, OperatorOnly, OriginResolved, ShellVetted, Via};
+    use Scope::{Gated, NotAWrite, OperatorOnly, OriginResolved, ShellVetted, Via};
     const PASS: &str = "claim_reconciliation/pass_loop.rs";
     const DISPATCH: &str = "sweep_registry/private_dispatch.rs";
     let reviewed: &[(&str, Scope)] = &[
@@ -419,6 +401,10 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "merge-sequence landing-order comment upsert (#10634)"),
         ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
+        (
+            "claim_reconciliation/ci_gate_recovery.rs",
+            Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
+        ),
         (
             "forge_disable_auto_merge.rs",
             Via(PASS, "verdict pass; shell guard vets its own call"),
@@ -482,6 +468,10 @@ fn daemon_write_paths_are_scoped() {
             "sweep_registry/roll_requeue.rs",
             Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
         ),
+        (
+            "sweep_registry/step_cap_notice.rs",
+            Via(DISPATCH, "repeat-cap notice on an item whose Builder step was dispatched (#12500)"),
+        ),
         ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
@@ -506,6 +496,13 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("forge_rerun.rs", Gated),
         (
+            "forge_create_issue.rs",
+            Via(
+                "cli/forge_action.rs",
+                "the `forge create-issue` verb is vetted via may_write_from before create()",
+            ),
+        ),
+        (
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
         ),
@@ -518,8 +515,7 @@ fn daemon_write_paths_are_scoped() {
             Via(
                 "cli/forge_action.rs",
                 "enqueue/dequeue mutations (#10255) run only from `forge merge-queue \
-                 enqueue|dequeue`, vetted via write_target before dispatch; dormant \
-                 behind QUEUE_EXECUTION_ENABLED=false",
+                 enqueue|dequeue`, vetted via write_target before dispatch; opt-in via champion.mergeMode=queue",
             ),
         ),
         (
@@ -534,8 +530,8 @@ fn daemon_write_paths_are_scoped() {
                  path's `revoke_for_root` run only from claim_reconciliation/pass_loop.rs \
                  after gate_root_with, and forge_disable_auto_merge.rs's call follows its \
                  shell-vetted guard. Both are no-ops (no forge call) in direct mode; an \
-                 unresolved mode/repo reports `NOT confirmed` rather than writing; dormant \
-                 behind QUEUE_EXECUTION_ENABLED=false",
+                 unresolved mode/repo reports `NOT confirmed` rather than writing; opt-in via \
+                 champion.mergeMode=queue",
             ),
         ),
         (
@@ -547,9 +543,13 @@ fn daemon_write_paths_are_scoped() {
                  whose callers are exactly the gh_lifecycle.rs ones above: `forge \
                  merge-queue revoke` (vetted via write_target) and `revoke_for_root` (behind \
                  gate_root_with / the shell-vetted disable-auto-merge guard). It returns \
-                 before any forge call in direct mode, refuses a non-sha target, and only \
-                 ever writes `failure` (withdraws authority); dormant behind \
-                 QUEUE_EXECUTION_ENABLED=false",
+                 before any forge call in direct mode, refuses a non-sha target, and writes \
+                 `failure` (withdraws authority) on revoke. The one `success` write (#12496) \
+                 is the PR-head status `authorize_and_enqueue` posts from `forge merge-queue \
+                 handoff` (vetted via write_target), only after the dormant/direct execution \
+                 gate and `evaluate` allowed it, pinned to the grant's approved sha, and rolled \
+                 back to `failure` if the enqueue does not follow; opt-in via \
+                 champion.mergeMode=queue",
             ),
         ),
         ("cli/forge_action.rs", Gated),
@@ -571,6 +571,7 @@ fn daemon_write_paths_are_scoped() {
         ("cli/curation_complete.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
+        ("cli/lease_release.rs", Gated),
         (
             "fleet/drain_reset.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),
@@ -578,15 +579,6 @@ fn daemon_write_paths_are_scoped() {
         (
             "fleet_store/propose/mod.rs",
             OperatorOnly("`fleet-config propose`: a PR against the configured store"),
-        ),
-        (
-            "observability/captain_gauges/store.rs",
-            FleetStore {
-                caller: "observability/captain_gauges.rs",
-                call: "publish_heartbeat(root, loc",
-                gate: "Role::Captain { captain } => {",
-                why: "the armed captain publishes its fleet-gauge heartbeat (W12)",
-            },
         ),
         (
             "cli/merge_pr_consolidate.rs",
@@ -641,7 +633,6 @@ fn daemon_write_paths_are_scoped() {
             "gh_invocation/own_writes.rs",
             NotAWrite("names the label flags to parse a write argv for the numbers it pins, runs none"),
         ),
-        ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         (
             "agent_gh/read_route.rs",
             NotAWrite(
@@ -667,6 +658,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "observability/otlp/relay/server.rs",
             NotAWrite("HTTP method check in the loopback relay receiver"),
+        ),
+        (
+            "fleet_dispatch/server.rs",
+            NotAWrite("HTTP method check in the captain's claim-arbiter listener"),
         ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -750,50 +745,6 @@ fn daemon_write_paths_are_scoped() {
                     "{file} relies on {resolver} resolving origin before any gh repo view"
                 );
             }
-            FleetStore {
-                caller,
-                call,
-                gate,
-                why,
-            } => {
-                let text = std::fs::read_to_string(src.join(file)).unwrap_or_default();
-                assert!(matches(file), "stale entry: {file} ({why}) no longer writes");
-                // The guard is the first statement of `publish`, not merely defined.
-                let guarded = text.find("fn publish(").is_some_and(|f| {
-                    let sig = &text[f..];
-                    sig.find(") -> Result<")
-                        .and_then(|b| sig[b..].find(" {\n").map(|o| &sig[b + o + 3..]))
-                        .is_some_and(|body| {
-                            body.trim_start()
-                                .starts_with("refuse_reviewed_branch(loc, base_ref)?;")
-                        })
-                });
-                assert!(
-                    text.contains("fleet_store::resolve_location(")
-                        && text.contains("WriteTransport")
-                        && guarded
-                        && !text.contains("Command::new"),
-                    "{file} ({why}) must take its target from fleet_store::resolve_location, \
-                     write only through WriteTransport and refuse the reviewed branch"
-                );
-                let caller_text = std::fs::read_to_string(src.join(caller)).unwrap_or_default();
-                let gated_at = caller_text.find(gate);
-                let at = caller_text.find(call);
-                assert!(
-                    gated_at.is_some() && at.is_some() && gated_at < at,
-                    "{file} ({why}): {caller} must reach `{call}` only under {gate}"
-                );
-                let name = call.split('(').next().unwrap_or(call);
-                let callers: Vec<&str> = sources
-                    .iter()
-                    .filter(|(_, t)| {
-                        t.replace(&format!("fn {name}("), "")
-                            .contains(&format!("{name}("))
-                    })
-                    .map(|(rel, _)| rel.as_str())
-                    .collect();
-                assert_eq!(callers, [*caller], "{file} ({why}): only {caller} may call `{name}`");
-            }
             OperatorOnly(why) | NotAWrite(why) => {
                 assert!(matches(file), "stale entry: {file} ({why})");
             }
@@ -860,4 +811,130 @@ fn shell_write_paths_are_vetted() {
          (lib/forge-helpers.sh) and name it on the write, or be listed here with a reason \
          (#9548): {offenders:?}"
     );
+}
+
+// ---- write_scope.refused telemetry (#12168) --------------------------------
+
+fn classified(
+    t: Option<GhTarget>,
+    explicit: bool,
+    origin: Option<&str>,
+    managed: &[&str],
+    probe: &FakeProbe,
+) -> Decision {
+    let m = |r: &str| managed.iter().any(|x| x.eq_ignore_ascii_case(r));
+    decide_classified(
+        &Inputs {
+            target: t,
+            explicit,
+            origin,
+            managed: &m,
+        },
+        probe,
+    )
+}
+
+fn refusals_from_gate(decision: &Decision, times: usize) -> Vec<WriteScopeRefusedRecord> {
+    let root = Path::new("/nonexistent/write-scope-telemetry");
+    let (_, captured) = crate::observability::ops::capture::capture(|| {
+        for _ in 0..times {
+            gate("write-scope-telemetry".into(), root, decision, "claim reconciliation");
+        }
+    });
+    captured
+        .records
+        .into_iter()
+        .filter_map(|r| match r {
+            crate::telemetry::TelemetryRecord::WriteScopeRefused(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn every_deny_branch_has_its_refusal_class() {
+    let w = FakeProbe::new(Permission::Write);
+    let ni = FakeProbe::new(Permission::Insufficient(probe::NOT_IN_INSTALLATION.into()));
+    let ro = FakeProbe::new(Permission::Insufficient("repository role `read`".into()));
+    let unk = FakeProbe::new(Permission::Unknown("timeout".into()));
+    let cases = [
+        (classified(None, false, None, &[], &w), RefusalClass::NoTarget, None),
+        (
+            classified(target("a/b"), false, Some("c/d"), &["a/b"], &w),
+            RefusalClass::TargetMismatch,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), false, None, &["a/b"], &w),
+            RefusalClass::TargetMismatch,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &[], &w),
+            RefusalClass::UnmanagedRepo,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &["a/b"], &ni),
+            RefusalClass::NotInInstallation,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &["a/b"], &ro),
+            RefusalClass::InsufficientPermission,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &["a/b"], &unk),
+            RefusalClass::Unverifiable,
+            Some("a/b"),
+        ),
+    ];
+    for (decision, class, repo) in cases {
+        assert!(!decision.verdict.is_allowed());
+        assert_eq!(decision.class, Some(class));
+        assert_eq!(decision.repo.as_deref(), repo);
+    }
+    let ok = classified(target("a/b"), true, None, &["a/b"], &w);
+    assert!(ok.verdict.is_allowed());
+    assert_eq!(ok.class, None);
+}
+
+#[test]
+fn a_deny_through_the_gate_emits_one_record_each_time_while_the_warn_dedupes() {
+    let unk = FakeProbe::new(Permission::Unknown("timeout".into()));
+    let d = classified(target("acme/widgets"), true, None, &["acme/widgets"], &unk);
+    let records = refusals_from_gate(&d, 3);
+    assert_eq!(records.len(), 3, "the count is not deduplicated");
+    for r in &records {
+        assert_eq!(r.reason, RefusalClass::Unverifiable);
+        assert_eq!(r.repo.as_deref(), Some("acme/widgets"));
+        assert_eq!(r.call_site, "claim reconciliation");
+        assert!(!r.credential.is_empty());
+    }
+}
+
+#[test]
+fn an_allow_through_the_gate_emits_nothing() {
+    let w = FakeProbe::new(Permission::Write);
+    let d = classified(target("acme/widgets"), true, None, &["acme/widgets"], &w);
+    assert!(refusals_from_gate(&d, 2).is_empty());
+}
+
+#[test]
+fn a_deny_with_no_known_repo_omits_it_and_without_a_sink_does_not_panic() {
+    let w = FakeProbe::new(Permission::Write);
+    let d = classified(None, false, None, &[], &w);
+    let records = refusals_from_gate(&d, 1);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].repo, None);
+    assert_eq!(records[0].reason, RefusalClass::NoTarget);
+    // Outside a capture and with no global sink, the gate still just refuses.
+    let root = Path::new("/nonexistent/write-scope-telemetry");
+    assert!(!crate::observability::ops::capture::without_global_sink(|| gate(
+        "k2".into(),
+        root,
+        &d,
+        "x"
+    )));
 }

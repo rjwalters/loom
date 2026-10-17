@@ -256,3 +256,8 @@ fn operator_supplied_task_text_never_reaches_an_exported_span() {
     .unwrap();
     assert!(written.contains(TASK_SENTINEL), "{written}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

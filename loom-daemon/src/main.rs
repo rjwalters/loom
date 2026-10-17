@@ -1091,6 +1091,10 @@ enum Commands {
     /// `state`. Args live in `cli::fleet_config` (main.rs is size-frozen).
     FleetConfig(cli::fleet_config::FleetConfigArgs),
 
+    /// Fleet dispatch (#12449): `serve` runs the captain's claim arbiter.
+    /// Args live in `cli::fleet_dispatch_cmd`.
+    FleetDispatch(cli::fleet_dispatch_cmd::FleetDispatchArgs),
+
     /// The shared bounded journal core (#11345): `verify` a journal root.
     Journal(cli::journal_cli::JournalArgs),
 }
@@ -2344,6 +2348,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
+        Commands::FleetDispatch(args) => args.run().await,
         Commands::Journal(args) => cli::journal_cli::dispatch(args),
         Commands::Stats {
             command,

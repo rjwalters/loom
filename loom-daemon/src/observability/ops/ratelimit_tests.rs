@@ -36,8 +36,24 @@ fn budget(core_used: Option<u64>, graphql_used: Option<u64>) -> BudgetSnapshot {
     }
 }
 
-fn ledger(core: u64, graphql: u64) -> BTreeMap<Pool, u64> {
-    BTreeMap::from([(Pool::Core, core), (Pool::Graphql, graphql)])
+fn spend(daemon: u64, agent: u64) -> CredentialSpend {
+    CredentialSpend { daemon, agent }
+}
+
+/// Daemon-only spend on the tripping credential.
+fn ledger(core: u64, graphql: u64) -> BTreeMap<Pool, CredentialSpend> {
+    BTreeMap::from([
+        (Pool::Core, spend(core, 0)),
+        (Pool::Graphql, spend(graphql, 0)),
+    ])
+}
+
+fn app_credential() -> TripCredential {
+    TripCredential {
+        account: "app-123".into(),
+        owner: Some("octo-org".into()),
+        installation: Some("456".into()),
+    }
 }
 
 fn breaker() -> SharedRateLimitBreaker {
@@ -88,7 +104,8 @@ fn a_trip_emits_one_span_with_source_cooldown_and_attribution() {
             t(0),
             Some(t(1800)),
             Some((&budget(Some(5000), Some(28)), true)),
-            || Some(ledger(98, 5)),
+            Some(app_credential()),
+            || Some(BTreeMap::from([(Pool::Core, spend(90, 8)), (Pool::Graphql, spend(5, 0))])),
         );
     });
     assert_eq!(captured.spans.len(), 1);
@@ -98,12 +115,20 @@ fn a_trip_emits_one_span_with_source_cooldown_and_attribution() {
     let a = &span.attributes;
     assert_eq!(a["loom.ratelimit.source"], "claim_reconciliation");
     assert_eq!(a["loom.ratelimit.cooldown_until"], "2026-07-29T19:36:40Z");
+    assert_eq!(a["github.account"], "app-123");
+    assert_eq!(a["github.cred_owner"], "octo-org");
+    assert_eq!(a["github.installation"], "456");
     assert_eq!(a["github.ratelimit.core.used"], "5000");
     assert_eq!(a["github.ratelimit.core.own"], "98");
-    assert_eq!(a["github.ratelimit.core.external"], "4902");
+    assert_eq!(a["github.ratelimit.core.own_daemon"], "90");
+    assert_eq!(a["github.ratelimit.core.own_agent"], "8");
+    assert_eq!(a["github.ratelimit.core.unattributed"], "4902");
     assert_eq!(a["github.ratelimit.graphql.used"], "28");
     assert_eq!(a["github.ratelimit.graphql.own"], "5");
-    assert_eq!(a["github.ratelimit.graphql.external"], "23");
+    assert_eq!(a["github.ratelimit.graphql.own_daemon"], "5");
+    assert_eq!(a["github.ratelimit.graphql.own_agent"], "0");
+    assert_eq!(a["github.ratelimit.graphql.unattributed"], "23");
+    assert!(!a.keys().any(|k| k.ends_with(".external")), "{a:?}");
     assert_eq!(a["loom.daemon.version"], env!("CARGO_PKG_VERSION"));
     assert!(span.validate().is_ok() && span.context.sampled());
     assert!(a.keys().all(|k| {
@@ -166,6 +191,8 @@ fn an_untrusted_reading_exports_the_trip_without_attribution() {
     assert_eq!(a["loom.ratelimit.source"], "work_finder");
     assert!(a.contains_key("loom.ratelimit.cooldown_until"));
     assert!(!a.keys().any(|k| k.starts_with("github.ratelimit.")), "{a:?}");
+    // The credential comes from the failing call, not the reading: named.
+    assert!(a.contains_key("github.account"), "{a:?}");
 }
 
 #[test]
@@ -226,17 +253,17 @@ fn trip_ids_are_derived_from_job_and_instant() {
 }
 
 #[test]
-fn the_log_line_rendering_is_unchanged() {
+fn the_log_line_names_the_split_and_the_unattributed_rest() {
     let full = PoolShare {
         used: Some(5000),
-        own: Some(98),
+        own: Some(spend(90, 8)),
     };
-    assert_eq!(full.log_text(), "used=5000 own≈98 external≈4902");
+    assert_eq!(full.log_text(), "used=5000 own≈98 (daemon 90, agent 8) unattributed≈4902");
     let sink_off = PoolShare {
         used: Some(5000),
         own: None,
     };
-    assert_eq!(sink_off.log_text(), "used=5000 own=? (sink off) external=?");
+    assert_eq!(sink_off.log_text(), "used=5000 own=? (sink off) unattributed=?");
     assert_eq!(PoolShare::default().log_text(), "used=? (probe without used)");
 }
 
@@ -455,7 +482,7 @@ fn an_app_host_books_its_probe_and_emits_no_owner_less_point() {
             ("acme-10343", "graphql", Some(100), Source::Probe),
         ]
     );
-    let exported = bucket_points(&book, "app-1034301");
+    let exported = bucket_points(&book, &["app-1034301".to_string()]);
     assert_eq!(exported.len(), 6);
     for p in &exported {
         let keys: Vec<&str> = p.labels.keys().map(String::as_str).collect();

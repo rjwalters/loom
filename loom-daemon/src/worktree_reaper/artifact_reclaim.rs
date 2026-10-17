@@ -347,7 +347,17 @@ pub fn collect(
                 ));
                 continue;
             }
-            candidates.push(dir(&name, measured(&meta, &path)));
+            match build_tree::tracks_files_under(&worktree, &name) {
+                Some(false) => candidates.push(dir(&name, measured(&meta, &path))),
+                Some(true) => report.kept.push((
+                    dir(&name, measured(&meta, &path)),
+                    "git tracks files under it: not build output".to_string(),
+                )),
+                None => report.kept.push((
+                    dir(&name, measured(&meta, &path)),
+                    "git cannot list tracked files under it: not proven build output".to_string(),
+                )),
+            }
         }
         for root in discovered_roots(&worktree) {
             let artifact = dir(&root.rel, root_bytes(&worktree, &root));

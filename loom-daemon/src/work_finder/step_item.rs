@@ -27,9 +27,8 @@
 //! # Pure
 //!
 //! No forge call, no environment read, no clock. Everything the classifier
-//! reads arrives in [`Inputs`]; the facts that need the forge (whether a
-//! dependency park's blockers have closed, which merged PRs close an issue,
-//! whether a PR sits in the merge queue, trusted comment markers) are computed
+//! reads arrives in [`Inputs`]; the facts that need the forge (which merged
+//! PRs close an issue, whether a PR sits in the merge queue, trusted comment markers) are computed
 //! by the caller. The adapters at the bottom of this file derive the
 //! body-borne facts with the parsers that already own them, so a caller never
 //! re-implements one. The fixture `loom-daemon/tests/fixtures/
@@ -55,14 +54,14 @@
 //! | PR `loom:changes-requested` | Doctor |
 //! | PR `loom:review-requested` | Judge |
 //! | PR `loom:pr` | Champion merge |
-//! | PR with none of those | pass `no_stage` |
+//! | PR with none of those | Champion triage; a draft passes `draft` |
 //! | issue `loom:epic` | pass `epic` |
 //! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 //! | the same, a capability not held | pass `capability_missing` |
-//! | `loom:curated` + `loom:blocked`, **dependency park**, every blocker closed | Champion re-evaluate |
+//! | `loom:curated` (not `loom:issue`) + `loom:blocked`, **dependency park** | Champion re-evaluate |
 //! | any other blocked issue | pass `blocked` |
-//! | landed: a merged **closing** PR, issue still open | Curator keep-or-close |
+//! | landed: a merged **closing** PR (or one built on the issue's `feature/issue-N` branch into the default branch, #12251), issue still open | Curator keep-or-close |
 //! | `loom:decision-malformed` | Curator |
 //! | `loom:issue` | Builder |
 //! | `loom:curated` | Champion promote |
@@ -85,12 +84,21 @@
 //!   already saw and kept (the trusted route marker naming that PR) does not
 //!   route it again.
 //! - **Park kinds.** Only a *dependency* park — a park record naming a blocker
-//!   — is re-evaluable when its blockers close. A quarantine (and the
+//!   — is re-evaluable. Champion re-checks its blockers on every draw and
+//!   lifts the park or leaves it (#12078); the classifier does not ask the
+//!   forge first, and the Champion re-evaluation ladder
+//!   (`step_dispatch::reeval_ladder`) spaces the draws of a park that stays.
+//!   A quarantine (and the
 //!   fast-fail park, which parks through the quarantine, #11854), the PR-less
 //!   hold, a Champion hold record and an unstated park name no blocker, so
 //!   Champion `--issue`'s "every blocker closed" check would be vacuously true
 //!   for them (`champion-targeted.md`, `--issue` step 1). A hold record beside
 //!   a dependency record keeps the hold's kind: fail closed.
+//! - **Triage.** An unlabelled PR (hand-opened, or a role stopped before
+//!   labelling it) is Champion's, not Judge's (#12499): Champion adds
+//!   `loom:review-requested`, or blocks it with a reason, or asks the
+//!   operator. Each of those is a row above this one, so a triaged PR is
+//!   never triaged again. A draft is the author's and passes `draft`.
 //! - **Claims.** The registry's `claim` labels. On an item with an open PR the
 //!   issue's `loom:building` is **not** a claim: it stays on the issue until
 //!   the closing merge (#6199), so reading it as one would pass every PR.
@@ -168,11 +176,6 @@ pub struct IssueInput {
     /// The kind of `loom:blocked` park the body declares ([`park_kind`]).
     #[serde(default)]
     pub park: ParkKind,
-    /// A [`ParkKind::Dependency`] park whose every named blocker is a closed
-    /// issue or a merged PR (the caller reads the forge). Ignored for every
-    /// other kind.
-    #[serde(default)]
-    pub blockers_closed: bool,
     /// The capabilities a [`ParkKind::Capability`] park declares
     /// ([`declared_capabilities`]). ANDed.
     #[serde(default)]
@@ -202,7 +205,8 @@ pub struct MergedLink {
 #[serde(rename_all = "snake_case")]
 pub enum LinkKind {
     /// In the issue's closes-graph (a closing keyword or a Development-sidebar
-    /// link), merged after the issue was last reopened.
+    /// link), or built on the issue's Builder branch `feature/issue-N` into
+    /// the default branch (#12251), merged after the issue was last reopened.
     Closes,
     /// A partial-increment reference (`Part of #N`, `Contributes to #N`), or a
     /// closing merge older than the issue's last reopen.
@@ -269,6 +273,9 @@ pub struct PullInput {
     /// The PR is in GitHub's merge queue: it is never drawn again for merge.
     #[serde(default)]
     pub queued: bool,
+    /// The PR is a draft (#12499): an unlabelled one is not drawn for review.
+    #[serde(default)]
+    pub draft: bool,
     /// Markers read from the PR's trusted comments.
     #[serde(default)]
     pub markers: PullMarkers,
@@ -392,6 +399,10 @@ pub enum Step {
     Doctor,
     ChampionMerge,
     ChampionHoldReevaluate,
+    /// An open, non-draft PR with no stage label and no hold (#12499):
+    /// Champion sends it to review, blocks it or asks the operator, one label
+    /// transition, so it never comes back here.
+    ChampionTriage,
 }
 
 impl Step {
@@ -408,6 +419,7 @@ impl Step {
             Step::Doctor => "doctor",
             Step::ChampionMerge => "champion_merge",
             Step::ChampionHoldReevaluate => "champion_hold_reevaluate",
+            Step::ChampionTriage => "champion_triage",
         }
     }
 
@@ -419,7 +431,8 @@ impl Step {
             Step::ChampionPromote
             | Step::ChampionReevaluate
             | Step::ChampionMerge
-            | Step::ChampionHoldReevaluate => "champion",
+            | Step::ChampionHoldReevaluate
+            | Step::ChampionTriage => "champion",
             Step::Builder => "builder",
             Step::Judge => "judge",
             Step::Doctor => "doctor",
@@ -431,7 +444,11 @@ impl Step {
     pub fn acts_on_pr(self) -> bool {
         matches!(
             self,
-            Step::Judge | Step::Doctor | Step::ChampionMerge | Step::ChampionHoldReevaluate
+            Step::Judge
+                | Step::Doctor
+                | Step::ChampionMerge
+                | Step::ChampionHoldReevaluate
+                | Step::ChampionTriage
         )
     }
 }
@@ -452,6 +469,8 @@ pub enum PassReason {
     Epic,
     Proposal,
     NoStage,
+    /// An open draft PR with no stage label (#12499): unfinished, never Judged.
+    Draft,
     /// A Judge step whose PR head has CI still running (#12042). The
     /// classifier never answers it: the step tick's gather applies it from a
     /// forge read (`step_dispatch::gather::hold_ci_pending`), the step path's
@@ -476,6 +495,7 @@ impl PassReason {
             Self::Epic => "epic",
             Self::Proposal => "proposal",
             Self::NoStage => "no_stage",
+            Self::Draft => "draft",
             Self::CiPending => "ci_pending",
         }
     }
@@ -693,8 +713,13 @@ fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
         step(ItemState::ReviewRequested, Step::Judge)
     } else if has(labels, APPROVED) {
         step(ItemState::Approved, Step::ChampionMerge)
+    } else if pr.draft {
+        (ItemState::NoStage, Verdict::Pass(PassReason::Draft))
     } else {
-        (ItemState::NoStage, Verdict::Pass(PassReason::NoStage))
+        // No stage label and no hold (#12499, operator ruling): Champion
+        // triages it once, and its one label transition (review-requested,
+        // blocked or operator) takes the PR to a row above for good.
+        step(ItemState::NoStage, Step::ChampionTriage)
     }
 }
 
@@ -724,7 +749,7 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
                 pass(ItemState::Blocked, PassReason::CapabilityMissing)
             };
         }
-        if has(labels, CURATED) && issue.park == ParkKind::Dependency && issue.blockers_closed {
+        if has(labels, CURATED) && !has(labels, READY) && issue.park == ParkKind::Dependency {
             return step(ItemState::Blocked, Step::ChampionReevaluate);
         }
         return pass(ItemState::Blocked, PassReason::Blocked);
@@ -959,6 +984,7 @@ impl PullInput {
             same_repo,
             author_untrusted,
             queued,
+            draft: row.draft,
             markers,
         }
     }

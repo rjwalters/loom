@@ -135,7 +135,6 @@ fn own_write_read_backs_never_derive_a_reader_route() {
         },
         env: DeriveEnv::default(),
         checkout: CwdAnswer::Sole("acme/widget".into()),
-        shed: true,
     });
     let _ = registry.read_lease_comments(7);
     let _ = registry.current_labels_via_rest(7);

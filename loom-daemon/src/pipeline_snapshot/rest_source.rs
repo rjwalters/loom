@@ -35,6 +35,10 @@ use super::{GhPipelineSource, RepoPipelineSnapshot};
 use crate::forge_listing::{self, CachedListing, RestIssue};
 use crate::work_finder::{OPERATOR_HOLD_LABEL, PARK_LABELS};
 
+/// The `forge_call_stats` caller of the snapshot's per-label listings
+/// (`serve`, `status --pipeline`, `health`).
+const LISTING_CALLER: &str = "pipeline_snapshot.label_listing";
+
 /// Whether a metric counts the issue rows or the PR rows of a REST listing
 /// (REST issue listings return both — [`RestIssue::is_pull_request`]).
 #[derive(Debug, Clone, Copy)]
@@ -104,7 +108,10 @@ impl Ctx<'_> {
         if let Some(l) = self.seen.borrow().get(label) {
             return Ok(l.clone());
         }
-        let l = forge_listing::list_issues_cached_persistent(
+        // Its own caller (#12389): this listing used to be booked as the
+        // generic `persistent_listing`, which said nothing about who read.
+        let l = forge_listing::list_issues_cached_persistent_as(
+            LISTING_CALLER,
             &self.src.gh_bin,
             Some(self.root),
             self.repo.as_deref(),

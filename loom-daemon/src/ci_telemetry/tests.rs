@@ -23,12 +23,12 @@ mod journal_rotation;
 mod journal_view;
 mod ledger_retention;
 mod owners;
+mod queue_depth;
 mod queue_time;
 mod reader_routing;
 mod rerun_window;
 mod shard_queue;
 mod step_spans;
-mod story_stitch;
 mod suite_spans;
 mod test_spans;
 mod trigger_reason;
@@ -281,7 +281,6 @@ fn ctx(root: &Path) -> CycleContext<'_> {
         log_capture: LogCaptureGate::Off,
         log_excluded_repos: Vec::new(),
         log_max_bytes: logs::DEFAULT_MAX_BYTES,
-        repo_identity: None,
     }
 }
 

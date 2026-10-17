@@ -47,9 +47,11 @@ pub fn deferred_tick(
         preference_tier: None,
         preference_tap: None,
         role_draw: None,
+        prompt: None,
         step_sweep_id: None,
         deferred_by: Some(deferred_by.to_string()),
         shard_owner,
+        failure_class: None,
     }
 }
 

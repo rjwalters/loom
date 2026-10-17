@@ -254,43 +254,6 @@ fn short_detail_keeps_one_bounded_line() {
     assert_eq!(ready_queue::short_detail(&long).chars().count(), 161);
 }
 
-/// Pass-2 limits resolve to their own dispositions: the ramp cap and the
-/// saturation brake. (No repo-sharding slice since #11682: two workspaces'
-/// candidates both dispatch.)
-#[test]
-fn pass_two_limits_resolve_to_their_own_dispositions() {
-    let src = |ns: &[u32]| {
-        OneShotSource(Some(
-            ns.iter()
-                .map(|n| item(*n, &["loom:issue"], &format!("2026-09-0{n}T00:00:00Z")))
-                .collect(),
-        ))
-    };
-    let mut multi = vec![(src(&[1, 2]), Disp::default())];
-    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false], 1, false);
-    assert_eq!(
-        order(&rows(&r, &[])),
-        vec![
-            (1, QueueDisposition::Dispatched),
-            (2, QueueDisposition::DeferredRampCap)
-        ]
-    );
-
-    let mut multi = vec![(src(&[3]), Disp::default())];
-    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false], 10, true);
-    assert_eq!(order(&rows(&r, &[])), vec![(3, QueueDisposition::DeferredSaturation)]);
-
-    let mut multi = vec![(src(&[4]), Disp::default()), (src(&[5]), Disp::default())];
-    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false, false], 10, false);
-    assert_eq!(
-        order(&rows(&r, &[])),
-        vec![
-            (4, QueueDisposition::Dispatched),
-            (5, QueueDisposition::Dispatched)
-        ]
-    );
-}
-
 /// Brakes that live on the dispatcher, and a real dispatch failure, each get
 /// their own disposition.
 #[test]

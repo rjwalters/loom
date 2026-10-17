@@ -1,4 +1,4 @@
-//! GitHub rate-limit visibility (Issue #10022): breaker trips, own/external
+//! GitHub rate-limit visibility (Issue #10022): breaker trips, own/unattributed
 //! attribution, quota gauges and breaker skips, exported to SigNoz.
 //!
 //! Before this module the only evidence of a starved host was the breaker's
@@ -7,8 +7,11 @@
 //!
 //! - **`loom.ratelimit.trip` span**, one per breaker trip (never per re-trip
 //!   while cooling): the [`Job`] that tripped it, the cooldown end, and the
-//!   probe's `used` per pool split into this host's own ledger share and the
-//!   external share. `own`/`external` are omitted, not zeroed, when the probe
+//!   tripping credential (account, owner, installation) and the probe's
+//!   `used` per pool, split into this host's own ledger share **on that
+//!   credential** (daemon and agent-session calls apart) and the
+//!   `unattributed` rest: other hosts or processes on the same credential
+//!   (#12238). `own`/`unattributed` are omitted, not zeroed, when the probe
 //!   carried no `used` or the forge-call ledger is off.
 //! - **`github.ratelimit.{remaining,used,reset}` gauges** (W1, #10343), one
 //!   series per billed bucket: every point is labelled `resource`,
@@ -44,7 +47,7 @@ use std::sync::{Mutex, PoisonError};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
-use crate::forge_call_stats::Pool;
+use crate::forge_call_stats::{CredentialSpend, Pool};
 use crate::rate_limit_breaker::BudgetSnapshot;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
@@ -125,54 +128,83 @@ impl Job {
 
 // ---------------------------------------------------------------- trip span
 
-/// One pool's share of a trip: the probe's pool-wide `used`, and this host's
-/// own ledger count. Each is `None` when unknown — never reported as 0.
+/// One pool's share of a trip: the probe's `used` for the tripping
+/// credential, and this host's own ledger count **on that credential**
+/// (#12238), split into daemon and agent-session calls. Each is `None` when
+/// unknown — never reported as 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoolShare {
     pub used: Option<u64>,
-    pub own: Option<u64>,
+    pub own: Option<CredentialSpend>,
 }
 
 impl PoolShare {
-    /// `used − own`, when both are known.
+    /// This host's calls on the credential: daemon + agent sessions.
     #[must_use]
-    pub fn external(self) -> Option<u64> {
-        Some(self.used?.saturating_sub(self.own?))
+    pub fn own_total(self) -> Option<u64> {
+        self.own.map(CredentialSpend::total)
     }
 
-    /// The breaker log line's rendering (Issue #9855), unchanged.
+    /// `used − own`, when both are known: the credential's spend this host
+    /// did not record — **other hosts or processes on the same credential**
+    /// (on a fleet sharing an App installation, mostly other hosts'
+    /// daemons), not necessarily anything outside Loom.
+    #[must_use]
+    pub fn unattributed(self) -> Option<u64> {
+        Some(self.used?.saturating_sub(self.own_total()?))
+    }
+
+    /// The breaker log line's rendering (Issues #9855, #12238).
     #[must_use]
     pub fn log_text(self) -> String {
         match (self.used, self.own) {
-            (Some(u), Some(o)) => format!("used={u} own≈{o} external≈{}", u.saturating_sub(o)),
-            (Some(u), None) => format!("used={u} own=? (sink off) external=?"),
+            (Some(u), Some(o)) => format!(
+                "used={u} own≈{} (daemon {}, agent {}) unattributed≈{}",
+                o.total(),
+                o.daemon,
+                o.agent,
+                u.saturating_sub(o.total())
+            ),
+            (Some(u), None) => format!("used={u} own=? (sink off) unattributed=?"),
             (None, _) => "used=? (probe without used)".to_string(),
         }
     }
 }
 
-/// A trip's attribution across both pools.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The credential a trip was refused on, as the span names it: the account
+/// label (`app-<id>`, `ambient`, `env-token`, …), the owner its installation
+/// covers and the installation ID, when known. Never a token or a path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TripCredential {
+    pub account: String,
+    pub owner: Option<String>,
+    pub installation: Option<String>,
+}
+
+/// A trip's attribution across both pools, and the credential it is for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TripAttribution {
+    pub credential: Option<TripCredential>,
     pub core: PoolShare,
     pub graphql: PoolShare,
 }
 
 impl TripAttribution {
-    /// From the trip-time probe and this host's forge-call ledger
-    /// (`forge_call_stats::consumed_in_window`; `None` when the sink is off).
-    /// `own` is only meaningful next to a known `used`, so it is dropped
-    /// when `used` is unknown.
+    /// From the trip-time probe and this host's forge-call ledger for the
+    /// tripping credential (`forge_call_stats::consumed_in_window_for`;
+    /// `None` when the sink is off). `own` is only meaningful next to a
+    /// known `used`, so it is dropped when `used` is unknown.
     #[must_use]
     pub fn from_budget(
         budget: Option<&BudgetSnapshot>,
-        ledger: Option<&BTreeMap<Pool, u64>>,
+        ledger: Option<&BTreeMap<Pool, CredentialSpend>>,
     ) -> Self {
         let share = |used: Option<u64>, pool: Pool| PoolShare {
             used,
-            own: used.and(ledger.map(|m| m.get(&pool).copied().unwrap_or(0))),
+            own: used.and(ledger.map(|m| m.get(&pool).copied().unwrap_or_default())),
         };
         TripAttribution {
+            credential: None,
             core: share(budget.and_then(|b| b.core_used), Pool::Core),
             graphql: share(budget.and_then(|b| b.graphql_used), Pool::Graphql),
         }
@@ -197,11 +229,22 @@ pub fn trip_span(
             until.to_rfc3339_opts(SecondsFormat::Secs, true),
         );
     }
+    if let Some(cred) = &attribution.credential {
+        attributes.insert("github.account".into(), cred.account.clone());
+        if let Some(owner) = &cred.owner {
+            attributes.insert("github.cred_owner".into(), owner.clone());
+        }
+        if let Some(installation) = &cred.installation {
+            attributes.insert("github.installation".into(), installation.clone());
+        }
+    }
     for (pool, share) in [("core", attribution.core), ("graphql", attribution.graphql)] {
         for (field, value) in [
             ("used", share.used),
-            ("own", share.own),
-            ("external", share.external()),
+            ("own", share.own_total()),
+            ("own_daemon", share.own.map(|o| o.daemon)),
+            ("own_agent", share.own.map(|o| o.agent)),
+            ("unattributed", share.unattributed()),
         ] {
             if let Some(value) = value {
                 attributes.insert(format!("github.ratelimit.{pool}.{field}"), value.to_string());
@@ -346,17 +389,18 @@ pub fn quota_points(
 /// Gauges for every believed bucket-book reading (W1), labelled
 /// `resource`, `account`, `owner`, `installation` (#10571, `-` when no
 /// sidecar named one) and `role` — one series per billed bucket. `role` is
-/// `writer` for the workspace's writer App (`writer_account`: the App
-/// minted into the primary credential directory, else the roster's —
-/// [`writer_account_for`]) and `reader` for any other App.
+/// `writer` for any of the workspace's writer Apps (`writer_accounts`: the App
+/// minted into the primary credential directory plus every roster writer,
+/// per-owner ones included — [`writer_accounts_for`], #12446) and `reader`
+/// for any other App.
 #[must_use]
 pub fn bucket_points(
     readings: &[(crate::forge_bucket_book::BucketKey, crate::forge_bucket_book::Reading)],
-    writer_account: &str,
+    writer_accounts: &[String],
 ) -> Vec<MetricPoint> {
     let mut points = Vec::new();
     for (key, reading) in readings {
-        let role = if key.account == writer_account {
+        let role = if writer_accounts.contains(&key.account) {
             "writer"
         } else {
             "reader"
@@ -538,6 +582,19 @@ pub fn writer_account_for(workspace_root: &Path) -> String {
     primary_identity(workspace_root).account
 }
 
+/// Every writer account label for [`bucket_points`]' `role`: the primary
+/// directory's ([`writer_account_for`]) plus each roster writer's (#12446).
+#[must_use]
+pub fn writer_accounts_for(workspace_root: &Path) -> Vec<String> {
+    let mut accounts = vec![writer_account_for(workspace_root)];
+    for a in crate::forge_bucket_book::writer_accounts(workspace_root) {
+        if !accounts.contains(&a) {
+            accounts.push(a);
+        }
+    }
+    accounts
+}
+
 /// An ambient host's account label: the `gh` login (one core call).
 fn resolve_account() -> String {
     forge::viewer_login().map_or_else(|| "unknown".to_string(), |l| login_account_label(&l))
@@ -634,7 +691,7 @@ pub async fn record(workspace_root: &Path) {
             },
             || account(now),
         );
-        (points, writer_account_for(&root))
+        (points, writer_accounts_for(&root))
     })
     .await;
     let Ok((points, writer)) = sampled else {

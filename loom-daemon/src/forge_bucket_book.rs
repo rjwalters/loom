@@ -366,8 +366,11 @@ pub fn reading(key: &BucketKey, now: i64) -> Option<Reading> {
 
 /// Whether `key`'s held reading (of any age) still describes an open window
 /// at `now` — the per-directory probe's "already known this window" test
-/// (#12204): the window's reset is fixed, so a reading inside it, refreshed
-/// by response headers, makes another `/rate_limit` read redundant.
+/// (#12204): the window's reset is fixed, so a reading inside it makes
+/// another `/rate_limit` read redundant. The reading is only kept current by
+/// response headers when the bucket sees traffic; a quiet bucket's reading
+/// goes stale (`Reading::is_fresh` needs it under `MAX_AGE_SECS`, 600 s) while
+/// this still returns true, so it reads unknown until the window resets.
 #[must_use]
 pub fn window_open(key: &BucketKey, now: i64) -> bool {
     book()
@@ -517,11 +520,37 @@ pub fn classify_dir(dir: &Path) -> DirClass {
 /// `app-<id>` from the identity roster, else `app-unknown`.
 #[must_use]
 pub fn writer_account(root: &Path) -> String {
-    crate::forge_identity::cached(root)
-        .writer
+    writer_account_for_owner(root, None)
+}
+
+/// The writer App's account label for `owner`'s writes in the workspace at
+/// `root` (#12446): the `forge.identities.writers[]` entry listing the owner,
+/// else the default writer. `None` is the default writer.
+#[must_use]
+pub fn writer_account_for_owner(root: &Path, owner: Option<&str>) -> String {
+    let roster = crate::forge_identity::cached(root);
+    let writer = match owner {
+        Some(o) => crate::forge_identity::writer_for_owner(&roster, o),
+        None => roster.writer.as_ref(),
+    };
+    writer
         .map(|w| crate::observability::ops::ratelimit::app_account_label(&w.app_id))
         .filter(|label| label != "unknown")
         .unwrap_or_else(|| "app-unknown".to_string())
+}
+
+/// Every writer App's account label in the roster: the default writer and each
+/// `writers[]` entry (#12446).
+#[must_use]
+pub fn writer_accounts(root: &Path) -> Vec<String> {
+    let roster = crate::forge_identity::cached(root);
+    roster
+        .writer
+        .iter()
+        .chain(roster.writers.iter())
+        .map(|w| crate::observability::ops::ratelimit::app_account_label(&w.app_id))
+        .filter(|label| label != "unknown")
+        .collect()
 }
 
 /// The workspace at `root`'s own owner (its `origin` remote's owner,

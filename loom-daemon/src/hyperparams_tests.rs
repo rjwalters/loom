@@ -56,11 +56,7 @@ fn config_block_overrides_defaults_field_wise() {
     assert_eq!(resolved.sources["dispatch.maxConcurrent"], Source::Config);
     assert_eq!(resolved.sources["lifecycle.leaseTtlMinutes"], Source::Config);
     // Untouched fields fall through to their defaults, and say so.
-    assert_eq!(
-        resolved.params.dispatch.max_admissions_per_tick,
-        DEFAULT_MAX_ADMISSIONS_PER_TICK
-    );
-    assert_eq!(resolved.sources["dispatch.maxAdmissionsPerTick"], Source::Default);
+    assert_eq!(resolved.sources["dispatch.itemWeightRedMain"], Source::Default);
 }
 
 #[test]
@@ -148,7 +144,7 @@ fn invalid_env_vector_is_soft_ignored_by_per_tick_readers_but_fatal_at_startup()
 #[test]
 fn validate_accepts_a_well_formed_layer() {
     let violations = validate_layer(&serde_json::json!({
-        "dispatch": {"tickIntervalSecs": 30, "maxConcurrent": 6, "maxAdmissionsPerTick": 2},
+        "dispatch": {"tickIntervalSecs": 30, "maxConcurrent": 6},
         "lifecycle": {"leaseTtlMinutes": 20.5, "idleExitMinutes": 90},
         "rework": {"buildBackoffHigh": 40, "buildBackoffLow": 25},
     }));
@@ -240,12 +236,12 @@ fn work_finder_reader_applies_the_dispatch_overlay() {
     let tmp = empty_workspace();
     write_config(
         tmp.path(),
-        r#"{"hyperparameters": {"dispatch": {"tickIntervalSecs": 45, "maxAdmissionsPerTick": 2}},
+        r#"{"hyperparameters": {"dispatch": {"tickIntervalSecs": 45, "maxConcurrent": 2}},
             "autonomous": {"workFinder": {"intervalSecs": 120}}}"#,
     );
     let config = crate::work_finder::read_work_finder_config(tmp.path());
     assert_eq!(config.interval_secs, Some(45));
-    assert_eq!(config.max_admissions_per_tick, Some(2));
+    assert_eq!(config.max_concurrent, Some(2));
 }
 
 #[test]
@@ -439,62 +435,100 @@ fn champion_values_enter_the_digest() {
 // dispatch.drawTemperature (#11684)
 // ---------------------------------------------------------------------------
 
+/// #12185: the retired `weightBonus*` points are still accepted (and ignored,
+/// with a warning), so a host config that set them keeps starting.
 #[test]
 #[serial]
-fn weight_bonuses_default_and_read_the_config_block() {
+fn retired_weight_bonuses_are_accepted_ignored_and_reported() {
+    let layer = serde_json::json!({"dispatch": {
+        "weightBonusRedMainFix": 40,
+        "weightBonusImportant": -3,
+        "drawTemperature": 80,
+        "itemWeightRedMain": 20,
+    }});
+    // Not violations: nothing reads them, so their values are not checked.
+    assert!(validate_layer(&layer).is_empty());
+    assert_eq!(
+        retired_dispatch_keys(&layer),
+        vec![
+            "drawTemperature",
+            "weightBonusRedMainFix",
+            "weightBonusImportant"
+        ]
+    );
+    assert!(
+        retired_dispatch_keys(&serde_json::json!({"dispatch": {"itemAgeCapDays": 9}})).is_empty()
+    );
+
+    // They no longer move the resolved vector or its digest.
+    let tmp = empty_workspace();
+    let base = resolve_effective(tmp.path());
+    write_config(
+        tmp.path(),
+        r#"{"hyperparameters": {"dispatch": {"weightBonusRedMainFix": 40}}}"#,
+    );
+    let resolved = resolve_effective(tmp.path());
+    assert_eq!(resolved.params, base.params);
+    assert_eq!(digest_of(&resolved.params), digest_of(&base.params));
+    assert!(!resolved
+        .sources
+        .contains_key("dispatch.weightBonusRedMainFix"));
+}
+
+/// #12185: α and β default to 0 (the two-stage draw, no busy-ness), read the
+/// block and the env vector, enter the digest, and are validated by name.
+#[test]
+#[serial]
+fn pool_exponents_default_read_every_tier_and_validate_by_name() {
     let tmp = empty_workspace();
     let resolved = resolve_effective(tmp.path());
     let d = &resolved.params.dispatch;
-    assert_eq!(
-        (
-            d.weight_bonus_red_main_fix,
-            d.weight_bonus_very_important,
-            d.weight_bonus_important
-        ),
-        (
-            DEFAULT_BONUS_RED_MAIN_FIX,
-            DEFAULT_BONUS_VERY_IMPORTANT,
-            DEFAULT_BONUS_IMPORTANT
-        )
-    );
-    assert_eq!(resolved.sources["dispatch.weightBonusRedMainFix"], Source::Default);
+    assert_eq!((d.backlog_exponent, d.busy_exponent), (0.0, 0.0));
+    assert_eq!(resolved.sources["dispatch.backlogExponent"], Source::Default);
+    assert_eq!(resolved.sources["dispatch.busyExponent"], Source::Default);
 
     write_config(
         tmp.path(),
-        r#"{"hyperparameters": {"dispatch": {"weightBonusRedMainFix": 40, "weightBonusImportant": 0}}}"#,
+        r#"{"hyperparameters": {"dispatch": {"backlogExponent": 0.75, "busyExponent": 1}}}"#,
     );
     let resolved = resolve_effective(tmp.path());
-    assert_eq!(resolved.params.dispatch.weight_bonus_red_main_fix, 40);
-    assert_eq!(resolved.params.dispatch.weight_bonus_important, 0);
-    assert_eq!(resolved.sources["dispatch.weightBonusRedMainFix"], Source::Config);
+    assert_eq!(resolved.params.dispatch.backlog_exponent, 0.75);
+    assert_eq!(resolved.params.dispatch.busy_exponent, 1.0);
+    assert_eq!(resolved.sources["dispatch.backlogExponent"], Source::Config);
     assert_ne!(digest_of(&resolved.params), digest_of(&Hyperparameters::default()));
-}
+    // The draw's own reader sees the same block, and re-reads it each tick.
+    let knobs = crate::step_dispatch::item_draw::PoolKnobs::for_root(tmp.path());
+    assert_eq!((knobs.backlog_exponent, knobs.busy_exponent), (0.75, 1.0));
+    write_config(tmp.path(), r#"{"hyperparameters": {"dispatch": {"backlogExponent": 0.25}}}"#);
+    let knobs = crate::step_dispatch::item_draw::PoolKnobs::for_root(tmp.path());
+    assert_eq!((knobs.backlog_exponent, knobs.busy_exponent), (0.25, 0.0));
 
-#[test]
-fn weight_bonuses_are_validated_by_name() {
-    for key in [
-        "weightBonusRedMainFix",
-        "weightBonusVeryImportant",
-        "weightBonusImportant",
+    for (key, bad) in [
+        ("backlogExponent", serde_json::json!(1.01)),
+        ("backlogExponent", serde_json::json!(-0.1)),
+        ("backlogExponent", serde_json::json!("0.5")),
+        ("busyExponent", serde_json::json!(-1)),
+        ("busyExponent", serde_json::json!(101)),
     ] {
-        for bad in [
-            serde_json::json!(-1),
-            serde_json::json!(1_000_001),
-            serde_json::json!(1.5),
-        ] {
-            let violations = validate_layer(&serde_json::json!({"dispatch": {key: bad}}));
-            assert!(
-                violations
-                    .iter()
-                    .any(|v| v.path == format!("dispatch.{key}")),
-                "{key}={bad}: {violations:?}"
-            );
-        }
-        for good in [0, 20, 1_000_000] {
-            let violations = validate_layer(&serde_json::json!({"dispatch": {key: good}}));
-            assert!(violations.is_empty(), "{key}={good}: {violations:?}");
-        }
+        let v = validate_layer(&serde_json::json!({"dispatch": {key: bad.clone()}}));
+        assert_eq!(v.len(), 1, "{key}={bad}: {v:?}");
+        assert_eq!(v[0].path, format!("dispatch.{key}"));
     }
+    for (key, good) in [
+        ("backlogExponent", 0.0),
+        ("backlogExponent", 1.0),
+        ("busyExponent", 0.0),
+        ("busyExponent", 2.5),
+        ("busyExponent", 100.0),
+    ] {
+        let v = validate_layer(&serde_json::json!({"dispatch": {key: good}}));
+        assert!(v.is_empty(), "{key}={good}: {v:?}");
+    }
+    // An out-of-range value written mid-run soft-fails to the default.
+    write_config(tmp.path(), r#"{"hyperparameters": {"dispatch": {"backlogExponent": 4}}}"#);
+    let resolved = resolve_effective(tmp.path());
+    assert_eq!(resolved.params.dispatch.backlog_exponent, 0.0);
+    assert_eq!(resolved.sources["dispatch.backlogExponent"], Source::Default);
 }
 
 /// #11742: the retired `drawTemperature` is still accepted (and ignored), so
@@ -503,35 +537,6 @@ fn weight_bonuses_are_validated_by_name() {
 fn retired_draw_temperature_is_accepted_and_ignored() {
     let violations = validate_layer(&serde_json::json!({"dispatch": {"drawTemperature": 80}}));
     assert!(violations.is_empty(), "{violations:?}");
-}
-
-#[test]
-#[serial]
-fn work_finder_reader_hot_applies_the_weight_bonuses() {
-    use crate::priority_pick::WeightBonus;
-    let tmp = empty_workspace();
-    let config = crate::work_finder::read_work_finder_config(tmp.path());
-    assert_eq!(config.weight_bonus, [None; 3]);
-    assert_eq!(
-        crate::work_finder::config::resolve_weight_bonus(&config),
-        WeightBonus::default()
-    );
-    write_config(
-        tmp.path(),
-        r#"{"hyperparameters": {"dispatch": {"weightBonusVeryImportant": 7}}}"#,
-    );
-    let config = crate::work_finder::read_work_finder_config(tmp.path());
-    assert_eq!(config.weight_bonus, [None, Some(7), None]);
-    // Out of range soft-ignores to the default per tick (startup names it).
-    write_config(
-        tmp.path(),
-        r#"{"hyperparameters": {"dispatch": {"weightBonusVeryImportant": 2000000}}}"#,
-    );
-    let config = crate::work_finder::read_work_finder_config(tmp.path());
-    assert_eq!(
-        crate::work_finder::config::resolve_weight_bonus(&config),
-        WeightBonus::default()
-    );
 }
 
 #[test]

@@ -31,8 +31,30 @@ pub use crate::forge_pull_listing::RestPull;
 pub(crate) const MAX_PAGES: usize = 10;
 
 /// Every open PR of `root`'s repository (`LOOM_REPO` wins), newest first.
+/// With the mirror's worklist as the discovery chain the rows come from the
+/// tick's snapshot and nothing is listed (#12307); a repo the snapshot has
+/// not read, or whose open-PR facts it could not read, is an error like a
+/// failed listing.
 pub(super) fn list_open_prs(gh_bin: &Path, root: &Path) -> Result<Vec<RestPull>> {
-    list_open_pulls_cached_as("claim_reconciliation.pr_list", gh_bin, Some(root), None, MAX_PAGES)
+    use crate::discovery::published::{absent_error, lookup, Lookup};
+    match lookup(root) {
+        Lookup::Repo(repo) => repo
+            .pulls
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("discovery: no open-PR facts for {}", repo.slug)),
+        Lookup::Absent => Err(absent_error(root)),
+        Lookup::NotMirror => {
+            // #12310: the open-PR listing is discovery.
+            let _discovery = crate::gh_invocation::purpose::discovery();
+            list_open_pulls_cached_as(
+                "claim_reconciliation.pr_list",
+                gh_bin,
+                Some(root),
+                None,
+                MAX_PAGES,
+            )
+        }
+    }
 }
 
 /// The open PRs carrying `label`, newest first, capped at

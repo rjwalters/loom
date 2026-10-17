@@ -74,12 +74,12 @@ mod tests {
     #[test]
     fn renders_paths_pid_and_age() {
         let marker = PendingRestart {
-            paths: vec!["autonomous.hostBreaker.enabled".to_string()],
+            paths: vec!["autonomous.mainHealthGate.enabled".to_string()],
             observed_pid: 4242,
             rendered_at: at(2026, 9, 30, 12, 0, 0),
         };
         let line = render_marker(&marker, at(2026, 9, 30, 12, 5, 0));
-        assert!(line.starts_with("Pending restart: autonomous.hostBreaker.enabled"), "{line}");
+        assert!(line.starts_with("Pending restart: autonomous.mainHealthGate.enabled"), "{line}");
         assert!(line.contains("5m ago"), "{line}");
         assert!(line.contains("pid 4242"), "{line}");
     }

@@ -4,10 +4,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::capture::{
-    emit_step_capture, parse_outcome_line, read_outcome_line, tick_outcome, StepCapture, StepEnd,
-    StepOutcomeClass,
+    emit_step_capture, parse_outcome_line, read_outcome_line, release_class_fallback, step_failure,
+    tick_outcome, StepCapture, StepEnd, StepOutcomeClass,
 };
-use super::lease::{claim_args, claim_verdict};
+use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
 use super::*;
 use crate::observability::ops::capture::capture;
@@ -199,11 +199,16 @@ fn the_pre_claim_is_the_role_keyed_lease_with_the_step() {
 
 #[test]
 fn a_lost_or_unreadable_pre_claim_refuses_the_step() {
-    assert_eq!(claim_verdict(Some(0)), Ok(()));
-    assert_eq!(claim_verdict(Some(4)).unwrap_err().reason, "claim_lost");
-    assert_eq!(claim_verdict(Some(6)).unwrap_err().reason, "backstop_hold");
-    assert_eq!(claim_verdict(Some(5)).unwrap_err().reason, "claim_unverified");
-    assert_eq!(claim_verdict(None).unwrap_err().reason, "claim_unverified");
+    assert_eq!(claim_verdict(&ClaimRun::Exited(0)), Ok(()));
+    let reason = |run: ClaimRun| claim_verdict(&run).unwrap_err().reason;
+    assert_eq!(reason(ClaimRun::Exited(4)), "claim_lost");
+    assert_eq!(reason(ClaimRun::Exited(6)), "backstop_hold");
+    // #12105: a Doctor that found another actor active on the PR.
+    assert_eq!(reason(ClaimRun::Exited(7)), "peer_active");
+    assert_eq!(reason(ClaimRun::Exited(5)), "claim_unverified");
+    assert_eq!(reason(ClaimRun::TimedOut), "claim_unverified");
+    assert_eq!(reason(ClaimRun::SpawnFailed), "claim_unverified");
+    assert_eq!(reason(ClaimRun::Signaled), "claim_unverified");
 }
 
 // ---- B3: the timeout ------------------------------------------------------
@@ -351,6 +356,42 @@ fn an_outcome_line_parses_and_the_prompts_template_does_not() {
     .is_none());
 }
 
+/// #12541: a Champion step writes only its `CHAMPION-STEP` line, so the
+/// captain release takes that line's class, not `failed`.
+#[test]
+fn a_champion_steps_release_class_is_its_champion_line_folded() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    let header = |id: &str| {
+        format!("==== loom-daemon dispatch: t sweep_id={id} item=7 step=champion_merge ====\n")
+    };
+    let role = StepRole::ChampionMerge;
+    for (outcome, class) in [
+        ("triaged", "verdict"),
+        ("merged", "verdict"),
+        ("not-eligible", "refused"),
+        ("held", "noop"),
+        ("requeued", "noop"),
+        ("failed", "failed"),
+    ] {
+        let body = format!("{}CHAMPION-STEP mode=pr item=7 outcome={outcome}\n", header("s-1"));
+        std::fs::write(&log, body).unwrap();
+        assert_eq!(release_class_fallback(&log, "s-1", role, 7), class, "{outcome}");
+    }
+    // Another item's line, an earlier run's line, or no line: `failed`.
+    let other = format!("{}CHAMPION-STEP mode=pr item=8 outcome=merged\n", header("s-1"));
+    std::fs::write(&log, other).unwrap();
+    assert_eq!(release_class_fallback(&log, "s-1", role, 7), "failed");
+    let earlier = format!(
+        "{}CHAMPION-STEP mode=pr item=7 outcome=merged\n{}",
+        header("s-1"),
+        header("s-2")
+    );
+    std::fs::write(&log, earlier).unwrap();
+    assert_eq!(release_class_fallback(&log, "s-2", role, 7), "failed");
+    assert_eq!(release_class_fallback(&dir.path().join("none.log"), "s-1", role, 7), "failed");
+}
+
 #[test]
 fn the_outcome_line_is_read_after_this_steps_own_header_only() {
     let dir = tempdir().unwrap();
@@ -376,19 +417,105 @@ fn the_outcome_line_is_read_after_this_steps_own_header_only() {
 fn a_steps_end_maps_to_the_role_ticks_outcome() {
     let noop = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=noop reason=x");
     let failed = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=failed reason=x");
-    assert_eq!(tick_outcome(StepEnd::Exited(Some(0)), noop.as_ref()), RoleTickOutcome::Success);
-    assert_eq!(tick_outcome(StepEnd::Exited(None), noop.as_ref()), RoleTickOutcome::Success);
-    for (end, line) in [
-        (StepEnd::Exited(Some(0)), failed.as_ref()),
-        (StepEnd::Exited(Some(1)), None),
-        (StepEnd::Exited(None), None),
-        (StepEnd::TimedOut, noop.as_ref()),
-        (StepEnd::Cancelled, None),
+    let verdict = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=verdict reason=x");
+    let judge = StepRole::Judge;
+    assert_eq!(
+        tick_outcome(judge, StepEnd::Exited(Some(0)), noop.as_ref()),
+        RoleTickOutcome::Success
+    );
+    assert_eq!(
+        tick_outcome(judge, StepEnd::Exited(None), noop.as_ref()),
+        RoleTickOutcome::Success
+    );
+    assert_eq!(tick_outcome(judge, StepEnd::Exited(Some(0)), None), RoleTickOutcome::Success);
+    for role in [StepRole::Builder, judge] {
+        assert_eq!(
+            tick_outcome(role, StepEnd::Exited(Some(0)), verdict.as_ref()),
+            RoleTickOutcome::Success,
+            "{role:?}"
+        );
+    }
+    for (role, end, line) in [
+        (judge, StepEnd::Exited(Some(0)), failed.as_ref()),
+        (judge, StepEnd::Exited(Some(1)), None),
+        (judge, StepEnd::Exited(None), None),
+        (judge, StepEnd::TimedOut, noop.as_ref()),
+        (judge, StepEnd::Cancelled, None),
+        (StepRole::Builder, StepEnd::Exited(Some(0)), noop.as_ref()),
+        (StepRole::Builder, StepEnd::Exited(None), noop.as_ref()),
+        (StepRole::Builder, StepEnd::Exited(Some(0)), None),
     ] {
         assert!(
-            matches!(tick_outcome(end, line), RoleTickOutcome::Failure(_)),
-            "{end:?} {line:?}"
+            matches!(tick_outcome(role, end, line), RoleTickOutcome::Failure(_)),
+            "{role:?} {end:?} {line:?}"
         );
+    }
+}
+
+/// #12500: a Builder step that exits 0 with no PR is not a success, and its
+/// failure text carries the line's reason.
+#[test]
+fn a_builder_that_opens_no_pr_reports_no_pr_with_its_reason() {
+    let noop =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=builder target=1 class=noop reason=ci_pending");
+    assert_eq!(
+        tick_outcome(StepRole::Builder, StepEnd::Exited(Some(0)), noop.as_ref()),
+        RoleTickOutcome::Failure("no_pr: ci_pending".to_string())
+    );
+    let class = |line: Option<&_>| {
+        step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), line)
+            .map(|f| f.class().to_string())
+    };
+    assert_eq!(class(noop.as_ref()).as_deref(), Some("step-no-pr"));
+    assert_eq!(class(None).as_deref(), Some("step-no-outcome-line"));
+    assert_eq!(
+        step_failure(StepRole::Judge, StepEnd::Exited(Some(0)), noop.as_ref())
+            .map(|f| f.class().to_string()),
+        None
+    );
+}
+
+/// #12480: every failing branch of `tick_outcome` has its own closed class,
+/// and `step_failure` is `Some` exactly when `tick_outcome` fails.
+#[test]
+fn a_failed_steps_end_maps_to_its_own_class() {
+    let noop = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=noop reason=x");
+    let failed = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=failed reason=a b");
+    let judge = StepRole::Judge;
+    let class =
+        |end, line: Option<&_>| step_failure(judge, end, line).map(|f| f.class().to_string());
+    assert_eq!(class(StepEnd::TimedOut, noop.as_ref()).as_deref(), Some("step-timed-out"));
+    assert_eq!(class(StepEnd::Cancelled, None).as_deref(), Some("step-cancelled"));
+    assert_eq!(
+        class(StepEnd::Exited(Some(0)), failed.as_ref()).as_deref(),
+        Some("step-outcome-failed")
+    );
+    assert_eq!(class(StepEnd::Exited(Some(7)), None).as_deref(), Some("step-exit-nonzero"));
+    assert_eq!(
+        step_failure(judge, StepEnd::Exited(Some(7)), None)
+            .unwrap()
+            .exit_code(),
+        Some(7)
+    );
+    assert_eq!(class(StepEnd::Exited(None), None).as_deref(), Some("step-status-unknown"));
+    assert_eq!(class(StepEnd::Exited(Some(0)), noop.as_ref()), None);
+    assert_eq!(class(StepEnd::Exited(None), noop.as_ref()), None);
+    for role in [judge, StepRole::Builder] {
+        for end in [
+            StepEnd::Exited(Some(0)),
+            StepEnd::Exited(Some(2)),
+            StepEnd::Exited(None),
+            StepEnd::TimedOut,
+            StepEnd::Cancelled,
+        ] {
+            for line in [None, noop.as_ref(), failed.as_ref()] {
+                assert_eq!(
+                    step_failure(role, end, line).is_some(),
+                    matches!(tick_outcome(role, end, line), RoleTickOutcome::Failure(_)),
+                    "{role:?} {end:?} {line:?}"
+                );
+            }
+        }
     }
 }
 
@@ -405,6 +532,7 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
         sweep_id: "step-champion_merge-8-1".into(),
         started_at: Utc::now() - chrono::Duration::seconds(30),
         outcome: RoleTickOutcome::Success,
+        failure: None,
         model: "opus".into(),
         effort: "high".into(),
     });
@@ -515,4 +643,349 @@ fn champion_steps_resolve_the_same_command_file() {
         config.role_command_path(StepRole::ChampionMerge)
     );
     assert!(config.role_command_missing(StepRole::ChampionMerge));
+}
+
+// ---- #12133: the Builder claim is claim-then-verify and fails closed ------
+
+const BUILDER_ITEM: u32 = 12133;
+const PEER_LEASE: &str = "<!-- loom:lease host=peer-host sweep=sweep-peer -->";
+
+fn builder_claim(reg: &mut SweepRegistry, sweep: &str) -> std::result::Result<(), StepRefusal> {
+    // A Builder's claim is a label flip and a lease comment: it has no
+    // `lease pr claim` facts to carry (#12183).
+    reg.pre_claim_step(BUILDER_ITEM, StepRole::Builder, sweep)
+        .map(|claim| assert!(claim.is_none(), "a Builder claim carries no facts"))
+}
+
+/// Make the fake `gh`'s `arm` (e.g. the comment read) exit 1 straight away.
+fn break_gh_arm(ws: &Path, arm: &str) {
+    let fake = ws.join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    assert!(script.contains(arm), "harness arm changed shape");
+    std::fs::write(&fake, script.replacen(arm, &format!("{arm}exit 1\n"), 1)).unwrap();
+}
+
+const COMMENT_READ_ARM: &str = "if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n";
+const COMMENT_WRITE_ARM: &str = "if [[ \"$1\" == \"issue\" && \"$2\" == \"comment\" ]]; then\n";
+
+/// The one claimant, with no peer lease anywhere, spawns.
+#[test]
+#[serial]
+fn a_sole_builder_claim_is_verified_and_proceeds() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    assert_eq!(builder_claim(&mut reg, "step-builder-1-1"), Ok(()));
+}
+
+/// A peer's earlier live lease wins: the label flip alone no longer claims.
+#[test]
+#[serial]
+fn a_builder_claim_behind_a_peer_lease_is_lost() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) = crate::sweep_registry::test_support::lease_order_dispatch_registry(
+        dir.path(),
+        &[PEER_LEASE],
+    );
+    assert_eq!(
+        builder_claim(&mut reg, "step-builder-1-1")
+            .unwrap_err()
+            .reason,
+        "claim_lost"
+    );
+}
+
+/// Two hosts racing one item on one forge comment list: exactly one claim.
+#[test]
+#[serial]
+fn two_hosts_racing_one_item_claim_it_once() {
+    use crate::sweep_registry::test_support::lease_order_dispatch_registry;
+    let (dir_a, dir_b) = (tempdir().unwrap(), tempdir().unwrap());
+    let (mut reg_a, _, _, store) = lease_order_dispatch_registry(dir_a.path(), &[]);
+    let (mut reg_b, _, _, store_b) = lease_order_dispatch_registry(dir_b.path(), &[]);
+    let fake_b = dir_b.path().join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake_b).unwrap();
+    std::fs::write(
+        &fake_b,
+        script.replace(&store_b.display().to_string(), &store.display().to_string()),
+    )
+    .unwrap();
+
+    let results = [
+        builder_claim(&mut reg_a, "step-builder-1-1"),
+        builder_claim(&mut reg_b, "step-builder-1-2"),
+    ];
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{results:?}");
+    assert_eq!(results[1].as_ref().unwrap_err().reason, "claim_lost");
+}
+
+/// An unreadable forge is not "no peer": the step is refused, not spawned.
+#[test]
+#[serial]
+fn an_unreadable_lease_order_refuses_the_builder_claim() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    break_gh_arm(dir.path(), COMMENT_READ_ARM);
+    assert_eq!(
+        builder_claim(&mut reg, "step-builder-1-1")
+            .unwrap_err()
+            .reason,
+        "claim_unverified"
+    );
+}
+
+/// A lease comment that cannot be written leaves no mutex: refused.
+#[test]
+#[serial]
+fn an_unwritable_lease_comment_refuses_the_builder_claim() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    break_gh_arm(dir.path(), COMMENT_WRITE_ARM);
+    assert_eq!(
+        builder_claim(&mut reg, "step-builder-1-1")
+            .unwrap_err()
+            .reason,
+        "claim_unverified"
+    );
+}
+
+/// The lease is written but never reads back (stale read): refused.
+#[test]
+#[serial]
+fn a_lease_that_never_reads_back_refuses_the_builder_claim() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _, _, store) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    std::fs::remove_file(&store).unwrap();
+    std::fs::create_dir(&store).unwrap(); // appends fail; the read finds nothing
+    assert_eq!(
+        builder_claim(&mut reg, "step-builder-1-1")
+            .unwrap_err()
+            .reason,
+        "claim_unverified"
+    );
+}
+
+// ---- #12450: the captain's claim ------------------------------------------
+
+mod captain {
+    use super::*;
+    use crate::fleet_dispatch::proto::{CLAIM_PATH, REFUSE_PATH, RELEASE_PATH};
+    use crate::fleet_dispatch::test_server::TestServer;
+    use serde_json::json;
+
+    fn enable(root: &Path, url: &str) {
+        write_config(root, &json!({"fleetDispatch": {"enabled": true, "url": url}}).to_string());
+    }
+
+    fn server(claim: serde_json::Value) -> TestServer {
+        TestServer::start(move |path, _| {
+            if path == CLAIM_PATH {
+                (200, claim.clone())
+            } else {
+                (200, json!({"server_epoch": "e1"}))
+            }
+        })
+    }
+
+    fn held() -> TestServer {
+        server(json!({"server_epoch":"e1","granted":false,"reason":"held","held_by":"peer",
+            "retry_after_s":30}))
+    }
+
+    fn granted() -> TestServer {
+        server(json!({"server_epoch":"e1","granted":true,"assignment_id":"a-12450","ttl_s":1200}))
+    }
+
+    /// A non-hermetic Builder registry whose fake `gh` logs every call.
+    fn forge_registry(ws: &Path, leases: &[&str]) -> (SweepRegistry, PathBuf) {
+        let (reg, gh_log, ..) =
+            crate::sweep_registry::test_support::lease_order_dispatch_registry(ws, leases);
+        let commands = ws.join(".claude").join("commands").join("loom");
+        std::fs::write(commands.join("builder.md"), "# builder").unwrap();
+        (reg, gh_log)
+    }
+
+    fn gh_calls(log: &Path) -> String {
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    /// A refused claim is a pass with ZERO forge calls: no landed check, no
+    /// label flip, no lease comment, no lock left behind. Both spawn paths.
+    #[test]
+    #[serial]
+    fn a_captain_refusal_makes_no_forge_call() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let dir = tempdir().unwrap();
+        let (mut reg, gh_log) = forge_registry(dir.path(), &[]);
+        let server = held();
+        enable(dir.path(), &server.url());
+        let request = StepSpawnRequest::new(BUILDER_ITEM, StepRole::Builder);
+        let (result, signals) = capture(|| reg.spawn_step(&request));
+        let refusal = result.unwrap_err().downcast::<StepRefusal>().unwrap();
+        assert_eq!(refusal.reason, "captain_held");
+        assert_eq!(gh_calls(&gh_log), "", "a refusal makes no forge call");
+        assert!(reg.entries.is_empty());
+        assert!(!reg
+            .config
+            .locks_dir()
+            .join(format!("issue-{BUILDER_ITEM}"))
+            .exists());
+        assert_eq!(
+            step_span_reason(&signals.spans),
+            vec![("refused".into(), "captain_held".into())]
+        );
+        assert_eq!(server.requests_to(CLAIM_PATH).len(), 1);
+
+        let registry = Arc::new(Mutex::new(reg));
+        let refusal = SweepRegistry::spawn_step_unlocked(&registry, &request)
+            .unwrap_err()
+            .downcast::<StepRefusal>()
+            .unwrap();
+        assert_eq!(refusal.reason, "captain_held");
+        assert_eq!(gh_calls(&gh_log), "", "nor on the unlocked path");
+        assert!(server.requests_to(REFUSE_PATH).is_empty(), "nothing was granted to give back");
+    }
+
+    /// A grant runs today's path unchanged: the forge is asked as before.
+    /// A refusal further on gives the grant back with its own reason, and
+    /// names the assignment on the step span.
+    #[test]
+    #[serial]
+    fn a_grant_runs_todays_path_and_a_later_refusal_gives_it_back() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let dir = tempdir().unwrap();
+        // A peer's earlier lease: today's forge claim loses the race.
+        let (mut reg, gh_log) = forge_registry(dir.path(), &[PEER_LEASE]);
+        // A per-repo credential pool, so the launch resolves on any host and
+        // the step reaches the forge pre-claim (without one, a host with no
+        // pool is refused `no_token_pool` before the claim is ever made).
+        crate::sweep_registry::test_support::seed_token_pool(dir.path(), "agent-1");
+        let server = granted();
+        enable(dir.path(), &server.url());
+        let request = StepSpawnRequest::new(BUILDER_ITEM, StepRole::Builder);
+        let (result, signals) = capture(|| reg.spawn_step(&request));
+        let refusal = result.unwrap_err().downcast::<StepRefusal>().unwrap();
+        assert_ne!(gh_calls(&gh_log), "", "a grant runs the forge path");
+        assert_eq!(refusal.assignment_id.as_deref(), Some("a-12450"));
+        let refused = server.wait_for(REFUSE_PATH, 1);
+        assert_eq!(refused.len(), 1, "{:?}", server.requests());
+        assert_eq!(refused[0]["assignment_id"], "a-12450");
+        // The peer's lease wins the forge order: the literal token, so a
+        // refusal that gave the grant back under some other reason fails.
+        assert_eq!(refusal.reason, "claim_lost");
+        assert_eq!(refused[0]["reason"], "claim_lost");
+        let span = signals
+            .spans
+            .iter()
+            .find(|s| s.name.as_str() == "loom.dispatch.step")
+            .unwrap();
+        assert_eq!(span.attributes["loom.assignment.id"], "a-12450");
+    }
+
+    /// A granted step that spawns carries the assignment on its span and
+    /// releases it at its end.
+    #[test]
+    #[serial]
+    fn a_granted_step_names_its_assignment_and_releases_it() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let dir = tempdir().unwrap();
+        let (mut reg, _) = fixture_registry(dir.path());
+        let server = granted();
+        enable(dir.path(), &server.url());
+        let (outcome, signals) =
+            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_450, StepRole::Judge)));
+        let outcome = outcome.unwrap();
+        let span = signals
+            .spans
+            .iter()
+            .find(|s| s.name.as_str() == "loom.dispatch.step")
+            .unwrap();
+        assert_eq!(span.attributes["loom.dispatch.admission_result"], "spawned");
+        assert_eq!(span.attributes["loom.assignment.id"], "a-12450");
+        let _ = reg.end_step(
+            &outcome.sweep_id,
+            9_450,
+            StepRole::Judge,
+            Utc::now(),
+            StepEnd::Exited(Some(0)),
+        );
+        let released = server.wait_for(RELEASE_PATH, 1);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0]["assignment_id"], "a-12450");
+        assert_eq!(released[0]["outcome"], "failed", "no outcome line reads as failed");
+        cancel_all(&mut reg);
+    }
+
+    /// #12493: the flag set only in the daemon workspace's host-local tier
+    /// reaches a step whose registry is another repo: the step asks the
+    /// captain, and carries the grant. With the host tier off, nothing asks.
+    #[test]
+    #[serial]
+    fn the_host_tier_flag_reaches_a_step_in_another_repo() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let (host, dir) = (tempdir().unwrap(), tempdir().unwrap());
+        let (mut reg, _) = fixture_registry(dir.path());
+        let server = granted();
+        let local = host.path().join(crate::config_resolver::LOCAL_CONFIG_REL);
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(
+            &local,
+            json!({"fleetDispatch": {"enabled": true, "url": server.url()}}).to_string(),
+        )
+        .unwrap();
+        crate::fleet_dispatch::worker::set_host_root(host.path());
+        let (outcome, signals) =
+            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_452, StepRole::Judge)));
+        outcome.unwrap();
+        let claims = server.requests_to(CLAIM_PATH);
+        assert_eq!(claims.len(), 1, "the host's flag must reach this repo's claim");
+        assert_eq!(claims[0]["item"], 9_452);
+        let span = signals
+            .spans
+            .iter()
+            .find(|s| s.name.as_str() == "loom.dispatch.step")
+            .unwrap();
+        assert_eq!(span.attributes["loom.assignment.id"], "a-12450");
+        cancel_all(&mut reg);
+
+        std::fs::write(
+            &local,
+            json!({"fleetDispatch": {"enabled": false, "url": server.url()}}).to_string(),
+        )
+        .unwrap();
+        let (outcome, _) =
+            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_453, StepRole::Judge)));
+        outcome.unwrap();
+        assert_eq!(server.requests_to(CLAIM_PATH).len(), 1, "host tier off: no new claim");
+        cancel_all(&mut reg);
+        crate::fleet_dispatch::worker::reset_for_test();
+    }
+
+    /// With the flag off the step spawns exactly as before: no server call.
+    #[test]
+    #[serial]
+    fn with_the_flag_off_the_server_is_never_asked() {
+        crate::fleet_dispatch::worker::reset_for_test();
+        let dir = tempdir().unwrap();
+        let (mut reg, _) = fixture_registry(dir.path());
+        let server = held();
+        write_config(
+            dir.path(),
+            &json!({"fleetDispatch": {"enabled": false, "url": server.url()}}).to_string(),
+        );
+        let (outcome, signals) =
+            capture(|| reg.spawn_step(&StepSpawnRequest::new(9_451, StepRole::Judge)));
+        outcome.unwrap();
+        assert!(server.requests().is_empty());
+        let span = signals
+            .spans
+            .iter()
+            .find(|s| s.name.as_str() == "loom.dispatch.step")
+            .unwrap();
+        assert!(!span.attributes.contains_key("loom.assignment.id"));
+        cancel_all(&mut reg);
+    }
 }
