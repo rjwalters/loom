@@ -4089,7 +4089,7 @@ already carries them: `merge_group_ci/eligibility.rs:347` does
 (they are not named in non-test Rust because the field is passed through
 untyped). That read is a CLI eligibility check, not a daemon-tick read, so it
 is not used here: emitting from it would be on-demand rather than on change.
-The snapshot is tracked as a follow-up (see the PR for the issue link).
+The snapshot is tracked in #12675.
 
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused
