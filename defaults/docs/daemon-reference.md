@@ -8724,6 +8724,14 @@ flips spend. A read never goes to it, whatever its class or cause:
   running on the writer. The host with no reader pool at all is the one
   exception, as below. A GraphQL read that names its repo in the query says
   so with `GhInvocation::reader_repo(slug)` so the reader route serves it.
+  **Break-glass consequence (#12571):** with `LOOM_FACADE_CWD_ROUTING=0` or
+  `LOOM_READ_ROUTING=legacy` no route is derived, so every *untargeted*
+  in-process daemon read on a host that has readers is shed instead of going
+  to the writer. Callers must treat a shed read as "unknown": the issue-sweep
+  lease tie-break fails closed (stands down and retries later), and a PR
+  reclaim whose label read is shed skips the `loom:review-requested`
+  backfill. Only a host with no reader pool and no gateway still reads on
+  the writer.
 - **Read-your-write rides the readers too (#12555).** The read-back helpers
   that pinned the writer (`gh_call::read_own_write`,
   `SweepRegistry::gh_read_own_write`) are removed. The writer bought a read
@@ -8865,7 +8873,7 @@ untargeted reads that will move to them.
 | Variable | Default | Effect |
 |---|---|---|
 | `LOOM_FACADE_CWD_ROUTING` | on | `0` disables the derivation: every untargeted read stays on the writer. Typed reads keep the class-aware chain, so a typed `Observability` read (`telemetry.repo_identity`) can still be shed. Read on every call. |
-| `LOOM_READ_ROUTING` | `v2` | `legacy` reverts W4-A's scoped withdrawal and W4-B's split and spill, and the router's class-aware derivation. It no longer restores a reader → writer fallback (#12394): that path, and the former `LOOM_READ_SHED=0` kill switch, are gone. `LOOM_FACADE_CWD_ROUTING=0` keeps untargeted reads off the readers (a pinned `writer_identity()` read, not a fallback). Read on every call. |
+| `LOOM_READ_ROUTING` | `v2` | `legacy` reverts W4-A's scoped withdrawal and W4-B's split and spill, and the router's class-aware derivation. It no longer restores a reader → writer fallback (#12394): that path, and the former `LOOM_READ_SHED=0` kill switch, are gone. `LOOM_FACADE_CWD_ROUTING=0` derives no route, so on a host with readers every untargeted in-process daemon read is shed rather than sent to the writer (#12571). Read on every call. |
 
 ### Hygiene read path: the checkout's own repo, conditional and fresh (`LOOM_HYGIENE_CONDITIONAL`)
 
