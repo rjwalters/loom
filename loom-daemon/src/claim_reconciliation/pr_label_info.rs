@@ -73,6 +73,20 @@ pub(super) fn pr_label_names(gh_bin: &Path, root: &Path, pr_number: u32) -> Resu
     parse_pull_labels(&out.stdout)
 }
 
+/// [`pr_label_names`], failing CLOSED (#12571): a failed or shed read is
+/// `None`, so `reclaim_pr` skips the backfill instead of guessing "no state
+/// label, not a draft" and adding `loom:review-requested` beside `loom:pr` /
+/// `loom:changes-requested` or on a draft.
+pub(super) fn labels_or_skip(gh_bin: &Path, root: &Path, pr_number: u32) -> Option<PrLabelInfo> {
+    match pr_label_names(gh_bin, root, pr_number) {
+        Ok(info) => Some(info),
+        Err(e) => {
+            log::warn!("claim_reconciliation: PR #{pr_number} label read failed; skipping the review-requested backfill (#12571): {e}");
+            None
+        }
+    }
+}
+
 /// `labels[].name` + `draft` from a REST `pulls/{n}` body. A missing `draft`
 /// is non-draft (the fail-safe direction above).
 fn parse_pull_labels(body: &[u8]) -> Result<PrLabelInfo> {
@@ -253,6 +267,66 @@ esac
         assert!(
             gh_calls.contains("pr edit 503 --add-label loom:review-requested"),
             "a missing draft field must default to non-draft, not panic/skip the backfill: {gh_calls:?}"
+        );
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+        std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+        std::env::remove_var(STALE_TREATING_MINUTES_ENV);
+    }
+
+    /// #12571: a failed (or shed) `pulls/{n}` label read must skip the
+    /// `loom:review-requested` backfill -- the claim label is still removed,
+    /// but guessing "no state label, not a draft" could land the label next
+    /// to `loom:pr` or on a draft.
+    #[test]
+    #[serial]
+    fn reconcile_pr_claims_skips_backfill_when_the_label_read_fails() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+        std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "30");
+        std::env::set_var(STALE_TREATING_MINUTES_ENV, "60");
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let old = (Utc::now() - Duration::minutes(90)).to_rfc3339();
+        let fake_gh = dir.path().join("fake-gh-pr-label-read-fails.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+case "$*" in
+  'pr view'*) echo FORBIDDEN >> "{log}"; exit 97 ;;
+  "api repos/{{owner}}/{{repo}}/pulls/504") echo 'shed' >&2; exit 1 ;;
+esac
+{pulls}exit 0
+"#,
+            log = gh_log.display(),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(504, &["loom:reviewing"])
+                    .head("some-random-branch")
+                    .updated(&old)
+            ]),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+
+        let (checked, reclaimed) = forge::reconcile_pr_claims(&fake_gh, &repo_root);
+
+        assert!(checked >= 1);
+        assert!(reclaimed >= 1, "the stale claim label must still be reclaimed");
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("pr edit 504 --remove-label loom:reviewing"),
+            "expected loom:reviewing to be removed from #504; got: {gh_calls:?}"
+        );
+        assert!(
+            !gh_calls.contains("--add-label loom:review-requested"),
+            "a failed label read must not backfill loom:review-requested; got: {gh_calls:?}"
         );
 
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);

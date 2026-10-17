@@ -457,3 +457,50 @@ fn operator_parked_predecessors_are_not_ready() {
     let t = "2026-10-01T00:00:00Z";
     assert!(!ready(&pr(1, t, &[APPROVED_LABEL, "loom:operator"])));
 }
+
+// --- #12595: blocked predecessor releases; hold_reason names why ---------------
+
+#[test]
+fn a_blocked_predecessor_releases_its_follower_at_an_unchanged_head_but_not_a_moved_one() {
+    let follower = pr(20, "2026-10-02T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
+    let m = soft(20, 10);
+    let listing = vec![
+        pr(10, "2026-10-01T00:00:00Z", &[APPROVED_LABEL, "loom:blocked"]),
+        follower.clone(),
+    ];
+    assert_eq!(decide(&m, &follower, &listing), HoldAction::ReleaseNotReady);
+    // The predecessor's head moved off the recorded pin: the readiness rule
+    // needs the in-flight signal, so this hold is left to the other rules.
+    let moved = PredecessorState {
+        head_sha: Some(sha(99)),
+        ..open_at_pin(10, &Utc::now().to_rfc3339())
+    };
+    let base = hold_action(&m, Some(&moved), follower.head_sha.as_deref(), true, 72.0);
+    assert_ne!(
+        with_readiness(base, &m, Some(&moved), &follower, listing.first()),
+        HoldAction::ReleaseNotReady
+    );
+}
+
+#[test]
+fn hold_reason_names_the_first_condition_keeping_a_hold() {
+    let now = Utc::now().to_rfc3339();
+    let follower = pr(20, "2026-10-02T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
+    let p = open_at_pin(10, &now);
+    let ready_head = pr(10, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
+    let why = |m: &SequenceMarker, pred: Option<&PredecessorState>, h: Option<&SequencePr>| {
+        hold_reason(m, pred, &follower, h)
+    };
+    assert!(why(&marker(20, 10, None, "x"), Some(&p), None).contains("human hold"));
+    assert!(
+        why(&marker(20, 10, Some(SOURCE_PASS), "cons-1"), Some(&p), None).contains("consolidation")
+    );
+    assert!(why(&soft(20, 10), Some(&p), None).contains("outside this tick's listing"));
+    assert!(why(&soft(20, 10), None, Some(&ready_head)).contains("not read open"));
+    assert!(why(&soft(20, 10), Some(&p), Some(&ready_head)).contains("is ready"));
+    let mut stacked = follower.clone();
+    stacked.base_ref = ready_head.head_ref.clone();
+    assert!(hold_reason(&soft(20, 10), Some(&p), &stacked, Some(&ready_head)).contains("stacked"));
+    let blocked = pr(10, "2026-10-01T00:00:00Z", &[APPROVED_LABEL, "loom:blocked"]);
+    assert!(why(&soft(20, 10), Some(&p), Some(&blocked)).contains("not ready"));
+}

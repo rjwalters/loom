@@ -113,6 +113,10 @@ impl SequencePlanArgs {
         for (follower, after) in &report.would_release_no_overlap {
             println!("would release #{follower} (after #{after}): no shared files");
         }
+        // #12595: why each existing hold is still kept (read-only).
+        for (follower, after, why) in &report.held_because {
+            println!("held #{follower} (after #{after}): {why}");
+        }
         println!(
             "would release {} hold(s) with no shared files",
             report.would_release_no_overlap.len()

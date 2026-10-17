@@ -1635,13 +1635,28 @@ impl SweepRegistry {
     /// is FAIL-OPEN — an unreadable timeline is not evidence of anything.
     ///
     /// [`read_lease_comments`]: Self::read_lease_comments
+    #[cfg(test)]
     pub(crate) fn resolve_lease_order(
         &self,
         issue: u32,
         sweep_id: &str,
         episode_start: DateTime<Utc>,
     ) -> LeaseOrderDecision {
-        self.resolve_lease_order_with(issue, sweep_id, episode_start, false)
+        self.resolve_lease_order_with(issue, sweep_id, episode_start, false, true)
+    }
+
+    /// [`resolve_lease_order`](Self::resolve_lease_order) that FAILS CLOSED
+    /// (#12571) like [`resolve_lease_order_strict`](Self::resolve_lease_order_strict)
+    /// but KEEPS the leaseless-label leg, for the issue-sweep claim: an
+    /// unreadable forge or an invisible own comment is
+    /// [`LeaseOrderDecision::Unverified`], never a blind `Proceed`.
+    pub(crate) fn resolve_lease_order_fail_closed(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        episode_start: DateTime<Utc>,
+    ) -> LeaseOrderDecision {
+        self.resolve_lease_order_with(issue, sweep_id, episode_start, true, true)
     }
 
     /// [`resolve_lease_order`](Self::resolve_lease_order) that FAILS CLOSED
@@ -1656,7 +1671,7 @@ impl SweepRegistry {
         sweep_id: &str,
         episode_start: DateTime<Utc>,
     ) -> LeaseOrderDecision {
-        self.resolve_lease_order_with(issue, sweep_id, episode_start, true)
+        self.resolve_lease_order_with(issue, sweep_id, episode_start, true, false)
     }
 
     fn resolve_lease_order_with(
@@ -1665,6 +1680,7 @@ impl SweepRegistry {
         sweep_id: &str,
         episode_start: DateTime<Utc>,
         fail_closed: bool,
+        leaseless_leg: bool,
     ) -> LeaseOrderDecision {
         // What an unverifiable read resolves to once retries are spent.
         let unverifiable = if fail_closed {
@@ -1751,10 +1767,10 @@ impl SweepRegistry {
                     renewal_cutoff,
                     fail_closed,
                 );
-                if fail_closed {
-                    confirmed
-                } else {
+                if leaseless_leg {
                     confirmed.or_leaseless_claim(self, issue, episode_start, sole)
+                } else {
+                    confirmed
                 }
             };
         }
@@ -3166,6 +3182,34 @@ exit 0
         assert_eq!(
             registry.resolve_lease_order(9822, "sweep-mine", Utc::now()),
             LeaseOrderDecision::Proceed
+        );
+    }
+
+    /// #12571: the issue-sweep tie-break fails CLOSED on an unreadable forge.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_fail_closed_is_unverified_when_the_read_fails() {
+        let dir = tempdir().unwrap();
+        let registry = lease_order_unit_registry(dir.path(), "boom", 1);
+        assert_eq!(
+            registry.resolve_lease_order_fail_closed(9826, "sweep-mine", Utc::now()),
+            LeaseOrderDecision::Unverified
+        );
+    }
+
+    /// #12571: ...and when its own lease comment never becomes visible.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_fail_closed_is_unverified_when_its_own_comment_is_not_found() {
+        let dir = tempdir().unwrap();
+        let stdout = format!(
+            r#"{{"id":1,"created_at":"{now}","body":"<!-- loom:lease host=peer-host sweep=sweep-peer -->"}}"#,
+            now = Utc::now().to_rfc3339(),
+        );
+        let registry = lease_order_unit_registry(dir.path(), &stdout, 0);
+        assert_eq!(
+            registry.resolve_lease_order_fail_closed(9827, "sweep-mine", Utc::now()),
+            LeaseOrderDecision::Unverified
         );
     }
 

@@ -126,21 +126,36 @@ mod tests {
     use crate::sweep_registry::SweepRegistryConfig;
 
     /// #12555: every registry read is reader-only — it can never mint the
-    /// writer, whatever the site adds — and a write is not.
+    /// writer, whatever the site adds — and a write is not. #12571: asserts
+    /// the resolved credential too: a read forced through `writer_identity()`
+    /// still derives a reader route, a write derives none.
     #[test]
     fn registry_reads_are_reader_only_and_writes_are_not() {
+        use crate::gh_invocation::cwd_route::{derive_with, CwdAnswer, Derivation, DeriveEnv};
         let dir = tempfile::tempdir().unwrap();
         let reg = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
         let gh = Path::new("gh");
+        let comments = ["api", "repos/{owner}/{repo}/issues/7/comments"];
+        let derived = |inv: GhInvocation| {
+            let inv = inv.current_dir(dir.path()).args(comments);
+            derive_with(&inv, &DeriveEnv::default(), &|_: &Path, _| {
+                CwdAnswer::Sole("acme/widget".to_string())
+            })
+        };
+        let routes_to_reader = |d: Derivation| matches!(d, Derivation::Route { .. });
         assert!(reg
             .gh_inv("guard.lease_comments", AccessIntent::Read, gh)
             .is_reader_only());
-        assert!(reg
+        let pinned = reg
             .gh_inv("guard.claim_timeline", AccessIntent::Read, gh)
-            .writer_identity()
-            .is_reader_only());
-        assert!(!reg
-            .gh_inv("guard.flip_building", AccessIntent::Write, gh)
-            .is_reader_only());
+            .writer_identity();
+        assert!(pinned.is_reader_only());
+        assert!(
+            routes_to_reader(derived(pinned)),
+            "writer_identity() must not pin a registry read to the writer credential"
+        );
+        let write = reg.gh_inv("guard.flip_building", AccessIntent::Write, gh);
+        assert!(!write.is_reader_only());
+        assert!(!routes_to_reader(derived(write)), "a write must never derive a reader route");
     }
 }

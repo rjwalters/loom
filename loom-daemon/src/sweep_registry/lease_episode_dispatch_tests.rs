@@ -607,21 +607,20 @@ fn a_renewed_lease_yields_the_dispatch_from_either_promotion_state() {
     }
 }
 
-/// **Forge read failures stay fail-open.** The new renewal-anchored
-/// membership leg only ever ADDS a refusal on positive, forge-assigned
-/// evidence of a live earlier claim. An unreadable comments endpoint is not
-/// evidence of anything, so it must still resolve to `Proceed` exactly as it
-/// did pre-#8840 — a forge blip may never wedge the fleet's dispatch, which
-/// is the property `resolve_lease_order`'s fail-open contract exists for.
+/// **Forge read failures fail closed (#12571).** An unreadable comments
+/// endpoint is not evidence that no peer holds the claim, so the issue-sweep
+/// tie-break no longer goes ahead blind: it stands down before any builder
+/// spawn, posts no standdown annotation (no peer won), and the dispatch
+/// backoff retries it later.
 ///
 /// The store is seeded with the incident's own renewed record, so the ONLY
-/// reason this dispatch proceeds is that the read failed: make the read
-/// succeed and this is the yielding regression at the top of this file.
+/// reason this dispatch is refused is that the read failed.
 #[test]
 #[serial]
-fn an_unreadable_forge_still_falls_open_to_proceed() {
+fn an_unreadable_forge_fails_closed_without_spawning() {
     let dir = tempdir().unwrap();
     let (mut registry, gh_log, spawn_log, store) = lease_order_dispatch_registry(dir.path(), &[]);
+    registry.config.blind_lease_order = false;
     seed_renewed_lease(
         &store,
         "<!-- loom:lease host=host-d9142cf3 sweep=sweep-20260924T213744Z-76692-1b436e14 -->",
@@ -630,17 +629,14 @@ fn an_unreadable_forge_still_falls_open_to_proceed() {
     );
     break_lease_comment_reads(dir.path(), &store);
 
-    let outcome = registry
+    let err = registry
         .dispatch(&SweepKind::Issue(8846), None, None, None, None)
-        .expect("an unreadable forge must never be turned into a refusal");
-    assert!(outcome.was_new);
-    assert!(
-        wait_for_contents(&spawn_log, "spawned", FIXTURE_CHILD_WAIT_MS),
-        "a fail-open dispatch must still spawn its builder"
-    );
+        .expect_err("an unverifiable lease order must refuse the dispatch");
+    assert!(err.downcast_ref::<LeaseOrderDispatchError>().is_some(), "got: {err:#}");
+    assert!(!spawn_log.exists(), "the stand-down must land before any builder spawn");
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
         !gh_calls.contains("loom:lease-yield"),
-        "no standdown may be posted on an unverifiable read; gh log: {gh_calls}"
+        "no standdown may be posted when no peer won; gh log: {gh_calls}"
     );
 }

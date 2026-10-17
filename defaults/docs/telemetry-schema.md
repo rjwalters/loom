@@ -227,7 +227,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
 | [`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart) | log, OTLP only | `ipc.rs` (`handle_client` run-state verbs), `observability/run_state_request.rs` |
-| [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` Deny branch) |
+| [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` and the per-call checks, `emit_refused`) |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
 
@@ -4030,19 +4030,32 @@ linked through `daemon.exit` instead.
 
 One OTLP log (WARN) per write the credential-scope gate refuses in a daemon
 pass (Issue #12168), emitted from the `Deny` branch of `write_scope::gate`
-(`gate_root`, `gate_root_with`, `gate_repo_with`). **Not deduplicated**: the
+(`gate_root`, `gate_root_with`, `gate_repo_with`) and, since #12606, from the
+per-call checks the daemon's in-process `GhForge` writes make
+(`may_write_from` / `may_write_from_at`, `root_writable_with`,
+`repo_writable_with`: the Champion re-evaluation ladder, stale-blocked and
+dependency parks, step refusals). Before #12606 those refused silently, with a
+`daemon.log` line only. **Not deduplicated**: the
 `daemon.log` WARN fires once per change of reason per key, this record fires
 on every refusal, because the point is a count. **OTLP-only** (`native: false`).
 
-**Scope.** Daemon passes only. Short-lived `loom-daemon forge ...` / `cli/*`
+**Scope.** The daemon process only. Short-lived `loom-daemon forge ...` / `cli/*`
 processes have no OTLP sink, so their refusals (the quoted `refusing the write
 (#9548)` stderr text) are not recorded.
 
 The JSON body contains `repo` (the refused `owner/repo`; absent when the gate
-had no target), `credential` (a non-secret identity: `gh-process-default`,
-`gh-config:<dir name>` for a registered per-owner credential, or `gitea`;
-never a token or a fragment of one), `call_site` (the `what` the pass handed
-the gate), `reason`, `refused_at`, and standard `loom` build provenance; a
+had no target), `repo_owner` (its owner segment), `credential` (a non-secret
+identity of the credential the gate probed, which is the one the write would
+carry: `gh-process-default`, `gh-config:<dir name>` for a registered per-owner
+credential, or `gitea`; never a token or a fragment of one),
+`credential_owner` (the owner whose writer installation that credential holds:
+the owner that registered the directory, or `process` for the process's own
+credential; absent when unknown), `call_site` (the `what` the pass handed the
+gate, or `may_write_from` / `root_writable` / `repo_writable` / a `GhForge`
+call site such as `step_ledger.reeval_ladder`), `reason`, `refused_at`, and
+standard `loom` build provenance. `repo_owner` differing from
+`credential_owner` is a cross-owner write vetted under another owner's writer
+(#12606). A
 record whose provenance does not validate is not exported.
 
 `reason` is a closed set, derived from the typed deny branch rather than parsed
@@ -4050,7 +4063,8 @@ from the sentence: `not-in-installation`, `insufficient-permission`,
 `unverifiable`, `unmanaged-repo`, `target-mismatch`, `no-target`.
 
 **OTLP.** Attributes: `loom.repo` (when known) and `loom.write_scope.reason` /
-`credential` / `call_site` / `version` / `revision` / `provenance_complete`
+`credential` / `credential_owner` / `repo_owner` (each when known) /
+`call_site` / `version` / `revision` / `provenance_complete`
 (`WRITE_SCOPE_REFUSED_LOG_ATTRIBUTE_KEYS`, kept by the collector's
 `transform/privacy` `keep_keys`, contract-tested). Both timestamps are
 `refused_at`; the executing host is `host.id` on the resource.

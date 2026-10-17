@@ -17,11 +17,74 @@ use loom_daemon::types::{Request, Response};
 /// Resolve the daemon's IPC socket path exactly as the running daemon does in
 /// `main()`: honour `LOOM_SOCKET_PATH` (test override) first, else
 /// `~/.loom/loom-daemon.sock`.
+///
+/// When `LOOM_SOCKET_PATH` is unset and the default socket does not exist (a
+/// plain ssh session against a daemon whose systemd user unit sets a custom
+/// path), fall back to the `LOOM_SOCKET_PATH` of this user's running dispatcher,
+/// read from `/proc/<pid>/environ` (#12597).
 pub(crate) fn resolve_socket_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
         return Ok(PathBuf::from(path));
     }
-    Ok(crate::daemon_service::resolve_loom_dir()?.join("loom-daemon.sock"))
+    let default = crate::daemon_service::resolve_loom_dir()?.join("loom-daemon.sock");
+    if default.exists() {
+        return Ok(default);
+    }
+    let pids = loom_daemon::daemon_install_state::pgrep_daemon_pids();
+    Ok(pick_socket_path(
+        default,
+        pids.iter().filter_map(|&pid| daemon_env_socket_path(pid)),
+    ))
+}
+
+/// First `candidates` entry whose socket file exists, else `default`.
+fn pick_socket_path(default: PathBuf, candidates: impl IntoIterator<Item = PathBuf>) -> PathBuf {
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .unwrap_or(default)
+}
+
+/// `LOOM_SOCKET_PATH` from a NUL-separated `/proc/<pid>/environ` blob.
+fn socket_path_from_environ(environ: &[u8]) -> Option<PathBuf> {
+    environ
+        .split(|&b| b == 0)
+        .find_map(|kv| kv.strip_prefix(b"LOOM_SOCKET_PATH="))
+        .filter(|v| !v.is_empty())
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .map(PathBuf::from)
+}
+
+/// The `LOOM_SOCKET_PATH` of process `pid`; `None` when unreadable or unset.
+fn daemon_env_socket_path(pid: u32) -> Option<PathBuf> {
+    socket_path_from_environ(&std::fs::read(format!("/proc/{pid}/environ")).ok()?)
+}
+
+/// Message for an unreachable daemon when the socket file is missing at
+/// `socket_path` yet a dispatcher process for this user is alive (`pids`), so
+/// "Is the daemon running?" would be wrong. `None` means use the generic text.
+pub(crate) fn socket_missing_hint(socket_path: &Path, pids: &[u32]) -> Option<String> {
+    let pid = pids.first()?;
+    if socket_path.exists() {
+        return None;
+    }
+    Some(format!(
+        "Socket not found at {}, but a loom-daemon process (pid {pid}) is running.\n\
+         It was likely started with a different socket path; set LOOM_SOCKET_PATH to it.",
+        socket_path.display()
+    ))
+}
+
+/// Print [`socket_missing_hint`] for the live dispatchers; true when printed.
+pub(crate) fn eprint_socket_missing_hint(socket_path: &Path) -> bool {
+    let pids = loom_daemon::daemon_install_state::pgrep_daemon_pids();
+    match socket_missing_hint(socket_path, &pids) {
+        Some(msg) => {
+            eprintln!("{msg}");
+            true
+        }
+        None => false,
+    }
 }
 
 /// Connect to the running daemon over its Unix socket, send a single `request`,
@@ -123,4 +186,45 @@ pub(crate) fn apply_ipc_timeout_env_floor(base: Duration) -> Duration {
         }
     }
     base
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environ_parsing_finds_socket_path() {
+        let blob = b"HOME=/h\0LOOM_SOCKET_PATH=/run/x/loom.sock\0PATH=/bin\0";
+        assert_eq!(socket_path_from_environ(blob), Some(PathBuf::from("/run/x/loom.sock")));
+        assert_eq!(socket_path_from_environ(b"HOME=/h\0"), None);
+        assert_eq!(socket_path_from_environ(b"LOOM_SOCKET_PATH=\0"), None);
+    }
+
+    #[test]
+    fn pick_prefers_first_existing_candidate_else_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.sock");
+        let b = dir.path().join("b.sock");
+        let c = dir.path().join("c.sock");
+        std::fs::write(&b, "").unwrap();
+        std::fs::write(&c, "").unwrap();
+        let default = PathBuf::from("/nonexistent/default.sock");
+        assert_eq!(pick_socket_path(default.clone(), [a.clone(), b.clone(), c]), b);
+        assert_eq!(pick_socket_path(default.clone(), [a]), default);
+        assert_eq!(pick_socket_path(default.clone(), []), default);
+    }
+
+    #[test]
+    fn hint_only_when_socket_missing_and_pid_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.sock");
+        let msg = socket_missing_hint(&missing, &[42]).unwrap();
+        assert!(msg.contains("Socket not found at"));
+        assert!(msg.contains("pid 42"));
+        assert!(msg.contains("LOOM_SOCKET_PATH"));
+        assert!(socket_missing_hint(&missing, &[]).is_none());
+        let present = dir.path().join("here.sock");
+        std::fs::write(&present, "").unwrap();
+        assert!(socket_missing_hint(&present, &[42]).is_none());
+    }
 }

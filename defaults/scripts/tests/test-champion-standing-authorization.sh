@@ -233,7 +233,9 @@ echo "--- #12528: the shipped standing_auth_eval, executed with stubbed forge re
 # so the decision is tested rather than mirrored.
 EVAL_SRC="$(mktemp)"
 CFG_DIR="$(mktemp -d)"
-trap 'rm -f "$EVAL_SRC" "${BLOCK_SRC:-}"; rm -rf "$CFG_DIR"' EXIT
+LOADER_SRC="$(mktemp)"
+trap 'rm -f "$EVAL_SRC" "$LOADER_SRC" "${BLOCK_SRC:-}"; rm -rf "$CFG_DIR"' EXIT
+awk '/^standing_auth_load_config\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$CHAMPION_MD" >"$LOADER_SRC"
 awk '/^KEPT_SET_PATTERNS=\(/{p=1} p{print} /^standing_auth_eval any$/{exit}' "$CHAMPION_MD" | sed '$d' >"$EVAL_SRC"
 
 # run_eval <mode> <config-json> <files> <api> <ci: green|red> <labels>
@@ -299,6 +301,8 @@ CI_CLASS='{"champion":{"standingAuthorizations":[{"id":"ci-steps","filePatterns"
 CI_CLASS_NOFLAG='{"champion":{"standingAuthorizations":[{"id":"ci-steps","filePatterns":[".github/workflows/*.yml"],"conditions":["judgeApproval","greenCi"]}]}}'
 OKPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+# a comment"}]'
 PERMPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+permissions: write-all"}]'
+SECRETADDPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+  run: echo ${{ secrets.TOKEN }}"}]'
+SECRETDELPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1,2 +1 @@\n name: ci\n-  run: echo ${{ secrets.TOKEN }}"}]'
 NOPATCH='[{"filename":".github/workflows/ci.yml"}]'
 WF=".github/workflows/ci.yml"
 
@@ -313,6 +317,15 @@ assert_eq "NOT ELIGIBLE:" "$out" "an excludeFilePatterns file restores FAIL"
 
 out="$(run_eval critical "$CI_CLASS" "$WF" "$PERMPATCH" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a forbiddenDiffPatterns line restores FAIL"
+
+# Only the 2nd forbiddenDiffPatterns entry (secrets\.) matches; the 1st
+# (^\s*permissions:) matches nothing. A check of only the first pattern passes
+# these, so they pin that every pattern is evaluated (#12590).
+out="$(run_eval critical "$CI_CLASS" "$WF" "$SECRETADDPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a line matching only the 2nd forbiddenDiffPatterns entry (added) restores FAIL"
+
+out="$(run_eval critical "$CI_CLASS" "$WF" "$SECRETDELPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a line matching only the 2nd forbiddenDiffPatterns entry (removed) restores FAIL"
 
 out="$(run_eval critical "$CI_CLASS" "$WF" "$NOPATCH" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a changed file with no patch (unreadable diff) fails closed"
@@ -556,6 +569,8 @@ run_block() {
         loom-daemon() { return 1; }
         read_ci_checks() { NO_CHECKS=false; CHECKS='[{"name":"t","bucket":"pass"}]'; }
         # shellcheck disable=SC1090
+        source "$LOADER_SRC"
+        # shellcheck disable=SC1090
         source "$EVAL_SRC"
         # shellcheck disable=SC1090
         source "$BLOCK_SRC"
@@ -598,6 +613,31 @@ assert_doc_contains "$CHAMPION_REF_MD" \
 assert_doc_contains "$CHAMPION_REF_MD" \
     "#6850" \
     "champion-reference.md's decision matrix references #6850"
+
+echo
+echo "--- Resolved effective config (#12591) ---"
+assert_doc_contains "$CHAMPION_MD" "loom-daemon config get champion.standingAuthorizations --json" "champion-pr-merge.md reads classes through the config verb"
+
+LOADER="$(cat "$LOADER_SRC")"
+STUB_DIR="$(mktemp -d)"
+COMMITTED_DIR="$(mktemp -d)"
+mkdir -p "$COMMITTED_DIR/.loom"
+echo '{"champion":{"standingAuthorizations":[{"id":"committed"}]}}' >"$COMMITTED_DIR/.loom/config.json"
+
+# $1 = stub stdout, $2 = stub exit code; prints the first class id the loader exposes
+load_ids() {
+    printf '#!/usr/bin/env bash\nprintf "%%s" %q\nexit %s\n' "$1" "$2" >"$STUB_DIR/loom-daemon"
+    chmod +x "$STUB_DIR/loom-daemon"
+    (cd "$COMMITTED_DIR" && PATH="$STUB_DIR:$PATH" bash -c "$LOADER"'
+standing_auth_load_config
+jq -c "[.champion.standingAuthorizations[]?.id]" "$CONFIG_FILE"')
+}
+
+assert_eq '["fleet"]' "$(load_ids '{"found":true,"value":[{"id":"fleet"}],"tier":"fleet-repo"}' 0)" "fleet-tier-only class is honoured"
+assert_eq '["committed"]' "$(load_ids '' 2)" "resolver failure falls back to the committed file"
+assert_eq '["committed"]' "$(load_ids 'not json' 0)" "unparseable verb output falls back to the committed file"
+assert_eq '[]' "$(load_ids '{"found":true,"value":"oops","tier":"fleet-repo"}' 0)" "malformed (non-array) value fails closed"
+rm -rf "$STUB_DIR" "$COMMITTED_DIR"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
