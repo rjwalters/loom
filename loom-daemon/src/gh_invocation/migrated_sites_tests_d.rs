@@ -5,16 +5,9 @@
 
 use crate::claim_reconciliation::gh_call;
 use crate::forge_call_stats::{self, ops};
+use crate::gh_invocation::test_support::{calls, stub};
 use crate::types::{ForgeCallCounts, ForgeOperationCounts};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
 
 /// A stub that appends its argv to `log` and prints `out`.
 fn logging_stub(dir: &Path, log: &Path, out: &str) -> PathBuf {
@@ -34,13 +27,6 @@ fn report_after(body: impl FnOnce()) -> Report {
     let report = forge_call_stats::status_report(chrono::Utc::now(), None);
     forge_call_stats::set_test_sink_dir(None);
     (report.host_window.unwrap_or_default(), report.operations.unwrap_or_default())
-}
-
-fn calls(rows: &[ForgeCallCounts], caller: &str) -> u64 {
-    rows.iter()
-        .filter(|r| r.caller == caller)
-        .map(|r| r.ok + r.error)
-        .sum()
 }
 
 fn op_calls(rows: &[ForgeOperationCounts], operation: &str) -> u64 {
