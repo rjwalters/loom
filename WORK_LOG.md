@@ -7,6 +7,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-17
+- **PR #12657**: fix: log tick-deadline listing stops at debug in the intake singleton
+- **PR #12654**: fix: resolve the loom-ui floor incident when an alerted stall is dropped
+- **Issue #12652** (closed): fleet.floor-unsatisfiable never posts Resolved after the host rolls (set_basis drops the stored alert)
+- **Issue #12650** (closed): intake_reconcile singleton: treat TickDeadlineReached like ReadShed on listing
+- **Issue #12633** (closed): WORK_LOG archival (1/4): archive layout and a content-preserving loom-daemon rotation verb
 - **PR #12651**: test: measure guard engines across all suites and the install matrix
 - **PR #12647**: feat: add work-docs archive/check verbs to rotate WORK_LOG.md
 - **PR #12644**: refactor: remove orphaned park_record helpers
