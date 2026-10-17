@@ -77,9 +77,9 @@ outcome vocabulary for each mode is the table in its section. Never invent one.
 | Outcome | When |
 |---|---|
 | `merged` | Step 3 printed `CHAMPION-MERGE-OUTCOME pr=N rc=0` |
-| `held` | Champion's hold (`loom:blocked`) binds (Health Pass ran), or Janitor Part 1 / Step 3 exit 10 (`CHAMPION-HOLD-SKIP`) skipped a park |
+| `held` | Champion's hold (`loom:blocked`) binds (Health Pass ran), or Janitor Part 1 / Step 3 exit 10 (`CHAMPION-HOLD-SKIP`) skipped a park. Never for a CI wait: a hold clears by a human or a push, not by CI finishing, so it climbs the captain's no-progress ladder |
 | `rejected` | A criterion failed and the PR Rejection Workflow ran (Janitor, stale route, CI) |
-| `requeued` | Exit 3, 4, 5, 7, 9 (`CHAMPION-PIN-MISSING`): not merged, still approved, no "Merge Failed" |
+| `requeued` | Exit 3, 4, 5, 7, 9 (`CHAMPION-PIN-MISSING`): not merged, still approved, no "Merge Failed". **Also criterion #6 with CI still running (`SKIP: CI checks still running`, #12551)**: the PR is approved and unheld, so it waits for CI, not for a verdict. The captain releases it as `ci_wait`, a flat 5 min hold, so the PR is re-drawn soon after CI finishes (`held` would wait out the 30 min to 6 h ladder) |
 | `head-moved` | `merge-pr.sh` exit **8**: the head is no longer `EVALUATED_SHA`. Not a failure: post no "Merge Failed", leave the labels; the next step evaluates the new head |
 | `failed` | Exit 1 (Error Handling's "Merge Failed" comment), or no `CHAMPION-MERGE-OUTCOME` line (its "No exit code at all") |
 | `not-eligible` | Step 1 |
