@@ -7,6 +7,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-17
+- **PR #12651**: test: measure guard engines across all suites and the install matrix
+- **PR #12647**: feat: add work-docs archive/check verbs to rotate WORK_LOG.md
+- **PR #12644**: refactor: remove orphaned park_record helpers
+- **PR #12642**: fix: give the tick-deadline deferral its own outcome and wording
+- **Issue #12643** (closed): Remove orphaned park_record helpers: drop_blockers, has_qualified_ref, has_record
+- **Issue #12641** (closed): step_ledger: the work-finder tick-deadline deferral reuses the reader-shed wording ("reader budget low until <now>")
+- **Issue #12456** (closed): [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
+- **Issue #12455** (closed): [ci-daily] Full Suite (clean, unpartitioned)
+- **Issue #12093** (closed): Simplify: retire the dispatch-inert tier:* axis (Level::of ignores it; no consumer) — it only adds confusion beside the real priority labels
+- **Issue #12051** (closed): pass_shard: run the stale-blocked release pass and fleet.state listings on one host per repo
 - **PR #12646**: chore: remove orphaned observability::cycle_guard module
 - **PR #12640**: Route reads for pinned checkouts and managed-checkout resync to readers (closes #12630)
 - **PR #12625**: fix: close feature/issue-N on merge without a closing keyword and block claims on merged branch PRs
