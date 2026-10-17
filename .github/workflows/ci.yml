@@ -333,6 +333,48 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # #12396: two failures PR CI used to miss because only release.yml ran them.
+  # Both feed `CI Result` through its `needs:`; no new required check name.
+  macos-check:
+    name: macOS Compile Check
+    needs: changes
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
+    # release.yml builds aarch64-apple-darwin; nothing else in CI compiles for
+    # macOS (`shell-syntax` has no Rust toolchain), so a Linux-only dependency
+    # feature (#12129's tokio `taskdump`) sat red there for hours. Same package,
+    # features and target as the release build; a check, not a build.
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --package loom-daemon --features otlp --target aarch64-apple-darwin
+
+  otlp-collector:
+    name: OTLP Collector Test (release step)
+    needs: changes
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
+    # release.yml's "Decode released binary telemetry" step, via the same script
+    # (`--release --features otlp`, `--ignored`), so the release cannot hit a
+    # test failure PR CI never saw (#12123 vs v0.19.1168).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: scripts/run-otlp-collector-test.sh --release
+
   node-packages:
     name: Node Packages (MCP server, dashboard)
     needs: changes
@@ -2518,6 +2560,8 @@ jobs:
       - node-packages
       - backend-lint-and-check
       - backend-tests
+      - macos-check
+      - otlp-collector
       - lint
       - shell-syntax
       - native-suites
