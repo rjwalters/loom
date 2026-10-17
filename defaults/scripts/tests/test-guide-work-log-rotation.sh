@@ -104,6 +104,7 @@ run() { # run <wrote> in a subshell with the extracted lib
 
 echo "Test 2: guard skips when the cutoff is not older than lookback + margin"
 : > "$STUB_CALLS"; BASE="$(snapshot)"
+# shellcheck disable=SC2034  # read by rotate_work_log in the sourced lib
 rc="$( (source "$LIB"; WORK_LOG_LOOKBACK_DAYS=50; STUB_MOVED=40 rotate_work_log 1) >"$SANDBOX/out" 2>&1; echo $? )"
 assert_eq "$rc" "1" "rotation refused when lookback (50d) + margin exceeds the 60d cutoff"
 assert_grep 'rotation skipped' "$SANDBOX/out" "a warning is logged"
