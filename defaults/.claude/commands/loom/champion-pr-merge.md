@@ -486,6 +486,24 @@ behavior is byte-for-byte unchanged from before #6850.
   passes #3 too, and the rationale names the class id. A non-boolean value
   (`"true"`, `1`) is not `true`. Without the flag, behavior is byte-for-byte
   unchanged: the class never touches #3.
+- `criticalFilesOnly` (#12648, optional, default `false`) — a literal `true`
+  makes the class waive **criterion #3 only, for the critical files it
+  names**, and nothing else. Its `filePatterns` and `excludeFilePatterns` are
+  matched against the PR's **critical-file hits** alone (the changed files
+  criterion #3 flags, via its `CRITICAL_PATTERNS`, plus each one's
+  `previous_filename` on a rename), and its `forbiddenDiffPatterns` against
+  those files' added/removed lines; the other changed files are not matched.
+  Every critical-file hit must match, and the PR needs at least one. The kept
+  set still applies to **every** changed file, and conditions and fail-closed
+  reads are unchanged. Such a class is **never eligible for criterion #2**:
+  the PR still goes through the four-axis judgment, which can hold it, so the
+  non-critical files are judged as before. It implies `coversCriticalFiles`
+  (that key is not needed). `false` or absent is today's class; any other
+  value (`"true"`, `1`) is malformed and the entry is skipped in both
+  criteria. A version-bearing file that is a critical-file hit (see the
+  version-only carve-out) counts as a hit here too, so it must match as well.
+  Use it for the common mixed PR: one workflow file plus docs or scripts, held
+  only by the workflow file.
 - `excludeFilePatterns` (#12528, optional) — globs, matched like
   `filePatterns`. A PR with **any** changed file matching one is disqualified
   from the class (e.g. `.github/workflows/*publish*`, `*release*`,
@@ -528,7 +546,8 @@ behavior is byte-for-byte unchanged from before #6850.
   critical "$FILES"` re-reads the PR's files once (slurped, so every page is
   one array) and requires: the count equals the PR's `changed_files`, and the
   set of `filename`s equals criterion #3's own `$FILES`. Any mismatch (a
-  partial read, a head that moved between reads) disqualifies the PR.
+  partial read, a head that moved between reads) disqualifies the PR. The
+  critical-file hits of a `criticalFilesOnly` class come from this same read.
 
 **Why this criterion re-checks conditions that are also criteria #1 and #6**:
 those criteria still run independently later in this same pass and still
@@ -539,7 +558,9 @@ authorized class AND every stated condition holds" is this section's own
 gate (per the issue's acceptance criteria): it must never read as "matches
 an authorized class -> assume the rest of the PR is fine". A standing
 authorization only ever waives *this criterion's* four-axis judgment —
-nothing else, and never criteria #1/#3/#4/#5/#6.
+nothing else, and never criteria #1/#3/#4/#5/#6 (except #3 for a class that
+opts in, below). A `criticalFilesOnly` class (#12648) never waives this
+criterion: `standing_auth_eval any` skips it.
 
 ```bash
 PR_NUMBER=<number>
@@ -609,18 +630,24 @@ standing_auth_fetch_diff() {
 }
 
 # standing_auth_eval <any|critical>
-#   any      criterion #2: a class satisfies the four-axis judgment.
-#   critical criterion #3: only a class with "coversCriticalFiles": true, and
-#            no kept-set path, may waive the critical-file FAIL.
-# Sets STANDING_AUTH_RESULT / STANDING_AUTH_ID. Every check fails closed.
-# Reads PR_NUMBER, CONFIG_FILE, LABELS (judgeApproval), read_ci_checks (greenCi)
-# and, in "any" mode, FAST_PATH_FILES. In critical mode $2 is criterion #3's own
-# $FILES.
+#   any      criterion #2: a class satisfies the four-axis judgment. A class
+#            with "criticalFilesOnly" set (#12648) is never eligible here.
+#   critical criterion #3: only a class with "coversCriticalFiles": true or
+#            "criticalFilesOnly": true, and no kept-set path, may waive the
+#            critical-file FAIL. A criticalFilesOnly class matches only the
+#            critical-file hits (CRITICAL_PATTERNS, from criterion #3).
+# Sets STANDING_AUTH_RESULT / STANDING_AUTH_ID, and STANDING_AUTH_SCOPE ("all"
+# or "critical") / STANDING_AUTH_COVERED (the files the class matched). Every
+# check fails closed. Reads PR_NUMBER, CONFIG_FILE, LABELS (judgeApproval),
+# read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
+# mode $2 is criterion #3's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
   local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN
-  local MATCH_FILES CHANGED_COUNT
+  local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   STANDING_AUTH_RESULT="NOT ELIGIBLE"
   STANDING_AUTH_ID=""
+  STANDING_AUTH_SCOPE=""
+  STANDING_AUTH_COVERED=""
   DIFF_JSON=""
   [ -f "$CONFIG_FILE" ] || return 0
   jq -e '(.champion.standingAuthorizations // []) | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 || return 0
@@ -637,6 +664,15 @@ standing_auth_eval() {
     AUTH_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[].filename') || return 0
     [ "$(printf '%s\n' "$AUTH_FILES" | LC_ALL=C sort -u)" = "$(printf '%s\n' "$crit_files" | LC_ALL=C sort -u)" ] || return 0
     MATCH_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[] | .filename, (.previous_filename // empty)') || return 0
+    # Critical-file hits (#12648), for criticalFilesOnly classes: the entries
+    # whose filename (or previous_filename) contains a CRITICAL_PATTERNS entry,
+    # the same substring test criterion #3's loop applies. No patterns in
+    # scope, or a failed read, leaves CRIT_DIFF empty and every
+    # criticalFilesOnly class ineligible (fail closed).
+    CRIT_DIFF=$(printf '%s\n' ${CRITICAL_PATTERNS[@]+"${CRITICAL_PATTERNS[@]}"} | jq -R 'select(length > 0)' | jq -s -c --argjson d "$DIFF_JSON" \
+      '. as $p | [$d[] | . as $f | select(any($p[]; . as $q | (($f.filename | contains($q)) or (($f.previous_filename // "") | contains($q)))))]' 2>/dev/null) || CRIT_DIFF=""
+    printf '%s' "$CRIT_DIFF" | jq -e 'length > 0' >/dev/null 2>&1 || CRIT_DIFF=""
+    [ -z "$CRIT_DIFF" ] || CRIT_MATCH_FILES=$(printf '%s' "$CRIT_DIFF" | jq -r '.[] | .filename, (.previous_filename // empty)') || CRIT_DIFF=""
   else
     # Reuse the SAME freshly-fetched file list the docs-only fast path above
     # just read (FAST_PATH_FILES) -- no second network call, and the same
@@ -653,9 +689,29 @@ standing_auth_eval() {
     EXCLUDES=$(jq -r ".champion.standingAuthorizations[$i].excludeFilePatterns // [] | .[]" "$CONFIG_FILE")
     FORBIDDEN=$(jq -r ".champion.standingAuthorizations[$i].forbiddenDiffPatterns // [] | .[]" "$CONFIG_FILE")
 
+    # criticalFilesOnly (#12648): `null` (absent) or `false` is today's class.
+    # `true` makes a class that waives criterion #3 for the critical-file hits
+    # only and is NEVER eligible for criterion #2, so the PR still gets the
+    # four-axis judgment. Any other value is malformed: skipped in both modes.
+    CFO=$(jq -c ".champion.standingAuthorizations[$i].criticalFilesOnly" "$CONFIG_FILE")
+    ONLY_CRIT=0
+    case "$CFO" in
+      null | false) ;;
+      true) [ "$mode" = "critical" ] || continue; ONLY_CRIT=1 ;;
+      *) continue ;;
+    esac
+
     # Critical mode: only an explicit boolean true opts the class in.
-    if [ "$mode" = "critical" ]; then
+    if [ "$mode" = "critical" ] && [ "$ONLY_CRIT" -eq 0 ]; then
       [ "$(jq -r ".champion.standingAuthorizations[$i].coversCriticalFiles == true" "$CONFIG_FILE")" = "true" ] || continue
+    fi
+
+    # The files the class's patterns must cover: every changed file, or for a
+    # criticalFilesOnly class the critical-file hits alone (none -> skip).
+    CLASS_FILES="$MATCH_FILES"
+    if [ "$ONLY_CRIT" -eq 1 ]; then
+      [ -n "$CRIT_DIFF" ] || continue
+      CLASS_FILES="$CRIT_MATCH_FILES"
     fi
 
     # Fail safe: a malformed entry (no id, no patterns, or no conditions)
@@ -678,9 +734,11 @@ standing_auth_eval() {
     done <<<"$CONDITIONS"
     [ "$UNKNOWN_CONDITION" -eq 1 ] && continue
 
-    # Exact-subset match: every changed file must match at least one
-    # pattern in THIS class, and (#12528) no changed file may match an
-    # excludeFilePatterns glob or, in critical mode, a kept-set path.
+    # Exact-subset match: every file in scope (every changed file, or the
+    # critical-file hits of a criticalFilesOnly class) must match at least
+    # one pattern in THIS class and (#12528) none may match an
+    # excludeFilePatterns glob. In critical mode no CHANGED file at all may
+    # be a kept-set path, whichever scope the class uses.
     local ALL_MATCH=1 file pattern FILE_MATCHED
     while IFS= read -r file; do
       [ -z "$file" ] && continue
@@ -705,7 +763,11 @@ standing_auth_eval() {
           break 2
         fi
       done <<<"$EXCLUDES"
-      if [ "$mode" = "critical" ]; then
+    done <<<"$CLASS_FILES"
+    [ "$ALL_MATCH" -eq 0 ] && continue
+    if [ "$mode" = "critical" ]; then
+      while IFS= read -r file; do
+        [ -z "$file" ] && continue
         for pattern in "${KEPT_SET_PATTERNS[@]}"; do
           # shellcheck disable=SC2053
           if [[ "$file" == $pattern ]]; then
@@ -713,20 +775,23 @@ standing_auth_eval() {
             break 2
           fi
         done
-      fi
-    done <<<"$MATCH_FILES"
-    [ "$ALL_MATCH" -eq 0 ] && continue
+      done <<<"$MATCH_FILES"
+      [ "$ALL_MATCH" -eq 0 ] && continue
+    fi
 
     # forbiddenDiffPatterns (#12528): a regex (jq test(), one engine on every
-    # host) matched against every added/removed line of every changed file,
-    # from the files API read in THIS pass. A file with no patch (binary, too
-    # large for the API to inline, a pure rename), an unreadable diff, or an
-    # invalid regex all disqualify.
+    # host) matched against every added/removed line of every changed file
+    # (of every critical-file hit, for a criticalFilesOnly class: #12648),
+    # from the files API read in THIS pass. A file in scope with no patch
+    # (binary, too large for the API to inline, a pure rename), an unreadable
+    # diff, or an invalid regex all disqualify.
     if [ -n "$FORBIDDEN" ]; then
       local LINES_JSON DIFF_HIT=0 rx rc
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
-      printf '%s' "$DIFF_JSON" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || continue
-      LINES_JSON=$(printf '%s' "$DIFF_JSON" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]]') || continue
+      CLASS_DIFF="$DIFF_JSON"
+      [ "$ONLY_CRIT" -eq 1 ] && CLASS_DIFF="$CRIT_DIFF"
+      printf '%s' "$CLASS_DIFF" | jq -e 'all(.[]; (.patch // null) != null)' >/dev/null 2>&1 || continue
+      LINES_JSON=$(printf '%s' "$CLASS_DIFF" | jq -c '[.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]]') || continue
       while IFS= read -r rx; do
         [ -z "$rx" ] && continue
         # Validate the regex on its own: `any` over zero lines never compiles it.
@@ -779,6 +844,12 @@ standing_auth_eval() {
     if [ "$CONDITIONS_HOLD" -eq 1 ]; then
       STANDING_AUTH_RESULT="ELIGIBLE"
       STANDING_AUTH_ID="$CLASS_ID"
+      STANDING_AUTH_SCOPE="all"
+      STANDING_AUTH_COVERED="$AUTH_FILES"
+      if [ "$ONLY_CRIT" -eq 1 ]; then
+        STANDING_AUTH_SCOPE="critical"
+        STANDING_AUTH_COVERED=$(printf '%s' "$CRIT_DIFF" | jq -r '.[].filename')
+      fi
       return 0
     fi
   done
@@ -814,9 +885,9 @@ four-axis judgment below.
 **Claim/label machinery is not red by itself (#11416).** Loom's own claim, lease, label-transition, dispatch and hand-back code is judged like any other code. Writing labels or claims *when it runs* is not a one-way action: `git revert` restores the old writer, and the state it wrote is re-derivable (janitors, lease reapers, `loom-recover-orphans` and the next tick repair a stranded claim or misrouted label). "Reverting cannot undo forge labels already changed" or "a defect could strand work fleet-wide" is **not** a red reason. Judge-approved + CI green + revert restores the behavior -> green on blast radius and revertability. "Mediates merging" in the table means kept-set item 2, nothing wider. **Kept set** — only these stay red, held for an operator (name the item in the hold bullet):
 1. **Irreversible migration, no rollback step**: a bulk relabel, or a rename/delete in `.github/labels.yml`, of live labels without a restore step; a lease/checkpoint/registry format the previous release cannot read.
 2. **The merge gate itself** — code whose output decides *whether a PR merges*: criteria #1-#6 and the sticky-hold logic (this file, `champion-critical-file-hold.md`); `merge-pr.sh`'s verdict/label/ordering guards; any code that writes or invalidates a verdict label or marker (`post-verdict.sh`, `verdict-staleness-guard.sh`, the daemon's `reconcile_pr_verdicts`, `check-review-feedback.sh`) or decides whose markers and comments are trusted (`comment_trust.rs`, `forge trusted-comments`). The gate cannot vouch for a change to itself. Writing a verdict label (the Judge's `loom:pr` approval) is part of the gate, not a role hand-back; only routing that cannot make a PR mergeable (Builder/Doctor hand-backs, claims) is outside it.
-3. **The other red entries in the table above**, unchanged. Criterion #3 critical files fail #3 regardless, except where a `coversCriticalFiles` class applies (criterion #3 below).
+3. **The other red entries in the table above**, unchanged. Criterion #3 critical files fail #3 regardless, except where a `coversCriticalFiles` or `criticalFilesOnly` class applies (criterion #3 below). A `criticalFilesOnly` class (#12648) does not change this judgment: the PR is judged on these axes as usual.
 
-**No standing authorization satisfies the kept set (#12528).** Items 1 and 2 and the remaining red entries (credential/token selection, guard hooks, installers/updaters that rewrite installed files on roll) can never be waived for criterion #3 by a class, with or without `coversCriticalFiles`: the `KEPT_SET_PATTERNS` floor in "Standing operator authorization" disqualifies the PR from every covering class.
+**No standing authorization satisfies the kept set (#12528).** Items 1 and 2 and the remaining red entries (credential/token selection, guard hooks, installers/updaters that rewrite installed files on roll) can never be waived for criterion #3 by a class, with or without `coversCriticalFiles` or `criticalFilesOnly`: the `KEPT_SET_PATTERNS` floor in "Standing operator authorization" disqualifies the PR from every covering class.
 
 **Decision rule**:
 - Docs-only fast path found `ELIGIBLE` **and** no prior hold is still in force -> **PASS**, continue to criterion #3 — the axes are not judged for this PR (see "Docs-only fast path" above).
@@ -1274,7 +1345,12 @@ standing_auth_load_config             # resolved effective config (#12591)
 STANDING_AUTH_RESULT="NOT ELIGIBLE"   # never inherit criterion #2's ELIGIBLE
 STANDING_AUTH_ID=""
 standing_auth_eval critical "$FILES"
-if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
+if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ] && [ "$STANDING_AUTH_SCOPE" = "critical" ]; then
+  # criticalFilesOnly class (#12648): only this criterion is waived, for the
+  # critical files named. Criterion #2 judged the whole PR on the four axes.
+  echo "PASS (standing authorization '$STANDING_AUTH_ID', #12648): criterion #3 satisfied by a criticalFilesOnly class — critical files: $STANDING_AUTH_COVERED"
+  exit 0
+elif [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
   echo "PASS (standing authorization '$STANDING_AUTH_ID', #12528): criterion #3 satisfied by a coversCriticalFiles class — changed files: $AUTH_FILES"
   # Name STANDING_AUTH_ID in the rationale. $CRITERION3_RESULT is "PASS".
   exit 0
@@ -1322,6 +1398,8 @@ generalize this pattern to any other critical file or any other kind of
 exactly a version-string line change.
 
 **Standing-authorization class (#12528)**: the check-loop runs `standing_auth_eval critical` (defined under criterion #2) before it can emit FAIL. A `champion.standingAuthorizations` class with `"coversCriticalFiles": true` whose `filePatterns` cover **every** changed file, with no changed file in `excludeFilePatterns`, no added/removed line matching `forbiddenDiffPatterns`, no kept-set path, and every `conditions` entry (`judgeApproval`, `greenCi`) holding now, passes this criterion and names the class id. Any one file outside the class, an excluded file, a forbidden diff line, an unreadable diff or a kept-set path restores today's FAIL and the durable hold below. A class without the flag, or no class at all, changes nothing. The check is mechanical, never a judgment call.
+
+**Critical-files-only class (#12648)**: a class with `"criticalFilesOnly": true` is matched against the **critical-file hits** only: the changed files this criterion's `CRITICAL_PATTERNS` flag, and the `previous_filename` of each on a rename. If every hit matches the class's `filePatterns`, no hit matches `excludeFilePatterns`, no added/removed line of a hit's patch matches `forbiddenDiffPatterns` (a hit with no patch fails closed), no changed file at all is a kept-set path, and every condition holds now, this criterion passes and the PASS line names the class (`#12648`) and the critical files. The other changed files are not matched against the class; criterion #2 judged them, and the whole PR, on the four axes, because such a class is never eligible there. A rename into a covered path from outside the class or from a kept-set path, a forbidden line in the workflow patch, or an excluded workflow restores the FAIL and the durable hold. An open hold episode closes through the ordinary PASS row.
 
 **Rationale**: Changes to these files require careful human review due to high impact.
 
