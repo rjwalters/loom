@@ -143,6 +143,12 @@ pub trait PauseHost: Send + Sync {
     fn requeue(&self, c: &Candidate, notice: &RollRequeueNotice) -> Result<(), String>;
     /// Publish an event on the daemon's bus.
     fn emit(&self, topic: &str, payload: serde_json::Value);
+    /// The fleet floor re-read from the store now, not from the last sync
+    /// pass (#12610). H4 asks before it stops anything. Defaults to "no fleet
+    /// store", which never disarms.
+    fn fresh_floor(&self) -> crate::fleet_sync::FloorKnowledge {
+        crate::fleet_sync::FloorKnowledge::NoStore
+    }
 }
 
 /// The production [`PauseHost`]: the workspace pool's sweep registries, the
@@ -371,6 +377,10 @@ pub(crate) fn sweep_candidates(
 }
 
 impl PauseHost for DaemonPauseHost {
+    fn fresh_floor(&self) -> crate::fleet_sync::FloorKnowledge {
+        crate::fleet_sync::refresh_floor()
+    }
+
     fn close_dispatch(&self, closed: bool, run: &str) {
         *self
             .closed_by

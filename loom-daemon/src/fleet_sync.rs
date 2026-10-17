@@ -605,6 +605,31 @@ fn floor_cell() -> &'static Mutex<Option<Option<String>>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
+/// What [`refresh_floor`] needs to reach the store: set once by [`start`].
+fn fresh_floor_inputs() -> &'static OnceLock<(PathBuf, StoreLocation, PathBuf)> {
+    static INPUTS: OnceLock<(PathBuf, StoreLocation, PathBuf)> = OnceLock::new();
+    &INPUTS
+}
+
+/// Re-read the floor from the store now (#12610), not from the last timer
+/// pass, and publish it like a pass would. A roll about to stop agents calls
+/// this so a floor rolled back since the roll was armed is seen before work is
+/// stopped. A store that cannot be reached keeps the last good floor
+/// ([`resolve_floor`]); a host with no fleet store just answers
+/// [`floor_knowledge`]. Blocking (it shells out to `gh`).
+#[must_use]
+pub fn refresh_floor() -> FloorKnowledge {
+    if let Some((workspace, location, cache)) = fresh_floor_inputs().get() {
+        let transport = crate::fleet_store::gh::GhTransport::new(workspace, &location.repo);
+        let read = fetch::load(&transport, cache, location, Policy::AllowStale, Utc::now())
+            .map(|loaded| floor::read(&loaded.snapshot))
+            .map_err(|e| format!("{e:#}"));
+        let pass = resolve_floor(read, last_good_floor().as_deref());
+        floor_knowledge::record_floor(&pass);
+    }
+    floor_knowledge()
+}
+
 #[cfg(test)]
 fn set_floor(floor: Option<String>) {
     if let Ok(mut guard) = floor_cell().lock() {
@@ -1317,6 +1342,11 @@ pub async fn start(
         auto_apply,
         clones: roster_clone::resolve_config(&effective, &|k| std::env::var(k).ok()),
     };
+    let _ = fresh_floor_inputs().set((
+        inputs.workspace.clone(),
+        inputs.location.clone(),
+        inputs.cache.clone(),
+    ));
     log::info!(
         "fleet_sync: enabled — store {} @ {}, host {}, every {}s, autoApply={auto_apply}",
         inputs.location.repo,
