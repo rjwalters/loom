@@ -1056,6 +1056,63 @@ fn a_captain_held_refusal_is_free_and_fallback_makes_no_loss_free() {
     }
 }
 
+/// #12700: `captain_cooldown` (the no-progress hold) is a cheap pass like
+/// `captain_held`, on the captain bound, so a tick whose heaviest items are
+/// all cooled down still fills its slot past `MAX_PASSES_PER_TICK`.
+#[test]
+fn a_captain_cooldown_refusal_is_free_and_does_not_end_the_tick() {
+    let n = MAX_PASSES_PER_TICK + 8;
+    let rows: Vec<RestIssue> = (1..=n + 5)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((n as usize, "captain_cooldown")),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut spawner);
+    assert_eq!(tick.report.dispatched, 1, "the cooled-down draws cost no pass");
+    assert_ne!(tick.stop, TickStop::PassLimit);
+    assert_eq!(tick.passes.get("captain_cooldown"), Some(&(n as usize)));
+    assert_eq!(tick.report.errors, 0, "a cooldown is not a dispatch error");
+    assert!(tick
+        .report
+        .queue
+        .iter()
+        .any(|r| r.disposition == Some(Qd::PeerClaim)));
+}
+
+/// #12700: captain refusals have their own bound; past it they spend passes,
+/// and the lost-claim bound is untouched by them.
+#[test]
+fn captain_refusals_are_bounded_separately_from_lost_claims() {
+    assert_eq!(MAX_FREE_CLAIM_LOST_PER_TICK, 16, "the writer-read bound is unchanged");
+    let cap = MAX_FREE_CAPTAIN_REFUSALS_PER_TICK as usize;
+    let rows: Vec<RestIssue> = (1..=MAX_FREE_CAPTAIN_REFUSALS_PER_TICK + 200)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_all: Some("captain_cooldown"),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut spawner);
+    assert_eq!(tick.report.dispatched, 0);
+    // The free ones, then the slot's own draws, then it gives up.
+    assert_eq!(spawner.asked.len(), cap + MAX_DRAWS_PER_SLOT as usize);
+
+    // In fallback no captain refusal is free.
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((10, "captain_cooldown")),
+        ..FakeSpawner::default()
+    };
+    let fallback = StepTickLimits {
+        fallback: true,
+        ..limits(1)
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], fallback, &mut spawner);
+    assert_eq!(tick.report.dispatched, 0);
+    assert_eq!(spawner.asked.len(), MAX_DRAWS_PER_SLOT as usize);
+}
+
 /// `captain_cap` ends every repo's draws for the tick: the captain would
 /// refuse each later claim the same way.
 #[test]
