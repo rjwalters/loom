@@ -51,6 +51,7 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("issue.estimate", None),
     ("stage.work_started", None),
     ("write_scope.refused", None),
+    ("merge_queue.event", None),
     ("daemon.exit", None),
     ("daemon.run_state_request", None),
     ("scope.memory", None),

@@ -162,6 +162,8 @@ pub mod auto_update_tick;
 
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
+/// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
+pub mod merge_queue_event;
 /// `daemon.run_state_request` (#12546) — who issued a pause/drain/stop/restart.
 pub mod run_state_request;
 /// `write_scope.refused` (#12168) — a daemon write the #9548 gate refused.
@@ -524,6 +526,12 @@ macro_rules! telemetry_kind_table {
             /// fast-forward pass already learned (#12509). OTLP-only. See
             /// [`checkout_freshness`].
             CheckoutFreshness = "checkout.freshness" => $crate::telemetry::kinds::checkout_freshness::CheckoutFreshnessRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One merge-queue record (`enqueued` / `merged` / `removed`) the
+            /// sink appended, with its classified reason and enqueue-to-event
+            /// latency (#12653). OTLP-only. See [`merge_queue_event`].
+            MergeQueueEvent = "merge_queue.event" => $crate::telemetry::kinds::merge_queue_event::MergeQueueEventRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
