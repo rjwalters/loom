@@ -49,6 +49,10 @@ pub enum Code {
     /// An `actions/checkout` step checks out something other than the
     /// merge-group commit (a PR head SHA, a fixed branch, an expression).
     NonMergeGroupCheckout,
+    /// A job runs `forge merge-queue group-check` with no `actions/checkout`
+    /// step: the status write is refused by `write_scope` (#9548) because the
+    /// runner holds no `.loom/` checkout of the target repository (#12568).
+    GroupCheckWithoutCheckout,
     /// `cancel-in-progress` is (or may be) true on `merge_group`: a distinct
     /// commit's run could be cancelled.
     CancellingConcurrency,
@@ -74,6 +78,7 @@ impl Code {
             Code::UndeterminedCondition => "UNDETERMINED_CONDITION",
             Code::PrOnlyStep => "PR_ONLY_STEP",
             Code::NonMergeGroupCheckout => "NON_MERGE_GROUP_CHECKOUT",
+            Code::GroupCheckWithoutCheckout => "GROUP_CHECK_WITHOUT_CHECKOUT",
             Code::CancellingConcurrency => "CANCELLING_CONCURRENCY",
             Code::SharedConcurrencyGroup => "SHARED_CONCURRENCY_GROUP",
             Code::MissingRequiredSuite => "MISSING_REQUIRED_SUITE",
@@ -394,6 +399,28 @@ pub fn audit(
         if relied && mg_trigger {
             if let Some(c) = &wf.concurrency {
                 check_concurrency(c, wf, None, &WorkflowScope(&ctx.mg), &mut wf_findings);
+            }
+        }
+
+        if mg_trigger {
+            for job in &wf.jobs {
+                let group_check = job.steps.iter().find(|s| {
+                    s.run
+                        .as_deref()
+                        .is_some_and(|r| r.contains("merge-queue group-check"))
+                });
+                if let Some(step) = group_check {
+                    if !job.steps.iter().any(Step::is_checkout) {
+                        wf_findings.push(Finding {
+                            code: Code::GroupCheckWithoutCheckout,
+                            workflow: wf.file.clone(),
+                            job: Some(job.id.clone()),
+                            step: Some(step.label()),
+                            line: step.line,
+                            detail: "runs `forge merge-queue group-check` with no `actions/checkout` step; write_scope refuses the status write without a `.loom/` checkout of this repository, so `loom/merge-authorization` never posts".to_string(),
+                        });
+                    }
+                }
             }
         }
 
