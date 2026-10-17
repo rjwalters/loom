@@ -53,6 +53,13 @@ pub struct RepoFacts {
     /// The effective active rules on `branch`. `None` when unreadable.
     #[serde(default)]
     pub rules: Option<Vec<Rule>>,
+    /// The `statuses` permission (`read`, `write`, `none`) of the writer App's
+    /// installation on the owner. `None` when no writer App is configured or
+    /// its installation could not be read; then the prerequisite is not
+    /// evaluated, because `repos/{nwo}.permissions` says nothing for an App
+    /// token (see [`Perms::can_push`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_statuses: Option<String>,
 }
 
 /// A failed prerequisite.
@@ -70,6 +77,9 @@ pub enum Prereq {
     MissingRequiredSuite,
     RequiredSuiteUncovered,
     WorkflowNotQualified,
+    /// The writer App's installation has `statuses` below `write`, so the
+    /// handoff could not post the `loom/merge-authorization` head status.
+    WriterCannotPostStatuses,
 }
 
 impl Prereq {
@@ -86,6 +96,7 @@ impl Prereq {
             Prereq::MissingRequiredSuite => "MISSING_REQUIRED_SUITE",
             Prereq::RequiredSuiteUncovered => "REQUIRED_SUITE_UNCOVERED",
             Prereq::WorkflowNotQualified => "WORKFLOW_NOT_QUALIFIED",
+            Prereq::WriterCannotPostStatuses => "WRITER_CANNOT_POST_STATUSES",
         }
     }
 }
@@ -156,6 +167,12 @@ pub fn evaluate(
             "this credential's repository permissions are not visible; treated as not eligible"
                 .to_string(),
         ),
+    }
+    if let Some(level) = facts.writer_statuses.as_deref().filter(|l| *l != "write") {
+        fail(
+            Prereq::WriterCannotPostStatuses,
+            format!("the writer App's installation has `statuses: {level}`; queue handoff posts the `loom/merge-authorization` commit status and needs `statuses: write` (granting it is an App permission change that needs operator authorization)"),
+        );
     }
     let branch = facts.branch.as_deref().unwrap_or("the default branch");
     let (merge_queue, required) = match &facts.rules {
@@ -261,6 +278,46 @@ fn get(gh: &str, path: &str) -> crate::cmd_out::CmdOutcome {
     .run()
 }
 
+/// The `statuses` level of the installation of the App `app_id` / `slug` in an
+/// `GET /orgs/{org}/installations` body (`{"installations":[{"app_id",
+/// "app_slug","permissions":{"statuses":"read"}}]}`). A listed installation
+/// without a `statuses` key has no access (`none`). `None` when the App is not
+/// listed or the body is not that shape. Pure.
+#[must_use]
+pub fn installation_statuses(body: &Json, app_id: &str, slug: Option<&str>) -> Option<String> {
+    let found = body.get("installations")?.as_array()?.iter().find(|i| {
+        let id = i
+            .get("app_id")
+            .map(|v| v.to_string().trim_matches('"').to_string());
+        id.as_deref() == Some(app_id)
+            || slug.is_some_and(|s| i.get("app_slug").and_then(Json::as_str) == Some(s))
+    })?;
+    let level = found
+        .get("permissions")
+        .and_then(|p| p.get("statuses"))
+        .and_then(Json::as_str)
+        .unwrap_or("none");
+    Some(level.to_string())
+}
+
+/// The writer App's `statuses` level on `owner` ([`installation_statuses`]),
+/// read from the org's installations, not `repos/{nwo}.permissions`. `None`
+/// when no writer App is configured for `owner` or the read failed.
+#[must_use]
+pub fn writer_statuses(gh: &str, root: &std::path::Path, owner: &str) -> Option<String> {
+    let roster = crate::forge_identity::cached(root);
+    let writer = crate::forge_identity::writer_for_owner(&roster, owner)?;
+    match decode_json::<Json, _>(
+        get(gh, &format!("orgs/{owner}/installations?per_page=100")),
+        |_| false,
+    ) {
+        Query::Populated(body) => {
+            installation_statuses(&body, &writer.app_id, writer.slug.as_deref())
+        }
+        _ => None,
+    }
+}
+
 /// Gather [`RepoFacts`] with read-only API calls. Any read that fails leaves
 /// its fact `None`, which [`evaluate`] reports as a named unknown.
 #[must_use]
@@ -276,6 +333,10 @@ pub fn probe(gh: &str, nwo: &str, branch: Option<&str>) -> RepoFacts {
     if let Some(v) = &view {
         facts.owner_type = v.owner.as_ref().and_then(|o| o.kind.clone());
         facts.can_push = v.permissions.as_ref().and_then(Perms::can_push);
+    }
+    if let Some((owner, _)) = nwo.split_once('/') {
+        let root = std::env::current_dir().unwrap_or_default();
+        facts.writer_statuses = writer_statuses(gh, &root, owner);
     }
     facts.branch = branch
         .map(str::to_string)

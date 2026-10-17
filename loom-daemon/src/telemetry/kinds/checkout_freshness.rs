@@ -30,6 +30,7 @@ pub const CHECKOUT_FRESHNESS_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.prompt.commits_behind",
     "loom.prompt.on_branch",
     "loom.prompt.remote_tip",
+    "loom.prompt.remote_tip_age_s",
     "loom.prompt.commits_behind_remote",
     "loom.prompt.origin_ref_stale",
     "loom.prompt.remote_repo",
@@ -50,6 +51,10 @@ pub struct CheckoutFreshnessRecord {
     /// `unreachable-stop`, `no-head`), so a stale count never looks fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass_skipped_reason: Option<String>,
+    /// Seconds since the remote tip was heard, set only when the tip came from
+    /// the daemon's cache rather than being learned this pass (#12565).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_tip_age_s: Option<u64>,
     /// The checkout's prompt tree; absent when it could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<PromptTree>,

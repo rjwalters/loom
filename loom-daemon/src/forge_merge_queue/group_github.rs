@@ -19,6 +19,7 @@ use super::github::safe_detail;
 use super::grants::{reason_token, CommentGrantStore, GrantRecord};
 use super::group_authz::{
     revoke_refail_dequeue, GroupRevocation, Member, MergeGroup, StatusApi, StatusState,
+    STATUS_DESCRIPTION_MAX,
 };
 use super::lifecycle::{transition_line, Ctx};
 use super::mode::MergeMode;
@@ -32,6 +33,43 @@ pub trait GroupForge: StatusApi {
     ///
     /// The queue could not be read or parsed.
     fn groups(&self) -> Result<Vec<MergeGroup>, String>;
+
+    /// The newest [`REQUIRED_CHECK_CONTEXT`] status on `commit` (state and
+    /// description as stored), `None` when it has none.
+    ///
+    /// # Errors
+    ///
+    /// The statuses could not be read or parsed.
+    fn latest_status(&self, commit: &str) -> Result<Option<(StatusState, String)>, String>;
+}
+
+/// The newest [`REQUIRED_CHECK_CONTEXT`] entry of a commit's statuses listing
+/// (GitHub lists newest first). `None` when the context is absent from it.
+///
+/// # Errors
+///
+/// A shape it cannot read, or a status with an unknown state.
+pub fn parse_latest_status(
+    statuses: &serde_json::Value,
+) -> Result<Option<(StatusState, String)>, String> {
+    let list = statuses.as_array().ok_or("unexpected statuses shape")?;
+    let Some(s) = list.iter().find(|s| {
+        s.get("context").and_then(serde_json::Value::as_str) == Some(REQUIRED_CHECK_CONTEXT)
+    }) else {
+        return Ok(None);
+    };
+    let state = match s.get("state").and_then(serde_json::Value::as_str) {
+        Some("success") => StatusState::Success,
+        Some("pending") => StatusState::Pending,
+        Some("failure" | "error") => StatusState::Failure,
+        other => return Err(format!("unknown status state {other:?}")),
+    };
+    let desc = s
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok(Some((state, desc)))
 }
 
 /// Entries carry the group commit (`headCommit`) built for them.
@@ -205,7 +243,7 @@ impl StatusApi for GhLifecycleForge {
             StatusState::Pending => "pending",
             StatusState::Failure => "failure",
         };
-        let desc: String = description.chars().take(140).collect();
+        let desc: String = description.chars().take(STATUS_DESCRIPTION_MAX).collect();
         self.ok(
             "merge_queue.post_status",
             AccessIntent::Write,
@@ -224,9 +262,42 @@ impl StatusApi for GhLifecycleForge {
         )
         .map(|_| ())
     }
+
+    fn can_post_statuses(&self) -> Result<(), String> {
+        // Unreadable or no App writer: unknown, so leave it to the post.
+        match crate::merge_group_ci::eligibility::writer_statuses(
+            self.gh(),
+            self.root(),
+            self.owner(),
+        ) {
+            Some(level) if level != "write" => Err(format!(
+                "the writer App's installation has `statuses: {level}`; posting the \
+                 `{REQUIRED_CHECK_CONTEXT}` status needs `statuses: write` — nothing was \
+                 granted or revoked"
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl GroupForge for GhLifecycleForge {
+    fn latest_status(&self, commit: &str) -> Result<Option<(StatusState, String)>, String> {
+        if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("not a commit sha: {commit:?}"));
+        }
+        let text = self.ok(
+            "merge_queue.latest_status",
+            AccessIntent::Read,
+            &[
+                "api".into(),
+                format!("repos/{}/commits/{commit}/statuses?per_page=100", self.nwo()),
+            ],
+        )?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("unparseable statuses: {e}"))?;
+        parse_latest_status(&v)
+    }
+
     fn groups(&self) -> Result<Vec<MergeGroup>, String> {
         fetch_all_groups(&|after| {
             let mut args: Vec<String> = vec![

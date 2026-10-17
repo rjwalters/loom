@@ -49,7 +49,8 @@ use super::table::{ClaimDecision, Mono, Policy, RefuseOutcome, Table};
 use super::telemetry::{self, Call, Counters};
 
 /// The span reason of a claim refused `held` by a no-progress hold
-/// ([`super::table`], #12541). The wire reason stays `held`.
+/// ([`super::table`], #12541). On the wire it is [`RefusalReason::Cooldown`]
+/// (#12551), so a worker tells it from another host's live claim.
 pub const NO_PROGRESS_REASON: &str = "no_progress_cooldown";
 
 /// Default TCP port of `loom-daemon fleet-dispatch serve`.
@@ -278,13 +279,12 @@ impl<I: Identity> Server<I> {
         call.item = Some((req.repo.clone(), req.item, req.step.clone()));
         let max = self.roster().max_concurrent(host);
         let decision = self.with_table(|t, now, counters| {
-            let d = t.claim(now, host, &req.repo, req.item, &req.step, max);
-            if let ClaimDecision::Refused { reason, .. } = &d {
-                let cooled = *reason == RefusalReason::Held
-                    && t.cooldown(now, &req.repo, req.item, &req.step).is_some();
+            let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step, max);
+            if let ClaimDecision::Refused { reason, .. } = &mut d {
                 if cooled {
                     counters.claim_cooled();
                     call.reason = Some(NO_PROGRESS_REASON.to_string());
+                    *reason = RefusalReason::Cooldown;
                 } else {
                     counters.claim_refused(*reason);
                 }

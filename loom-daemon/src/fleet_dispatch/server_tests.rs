@@ -358,7 +358,7 @@ async fn a_no_progress_release_refuses_every_hosts_next_claim_until_the_cooldown
         );
         let refusal: Value = serde_json::from_str(&reply.body).unwrap();
         assert_eq!(refusal["granted"], json!(false), "{host}");
-        assert_eq!(refusal["reason"], json!("held"), "the wire reason is plain `held`");
+        assert_eq!(refusal["reason"], json!("cooldown"), "a hold is not a live claim (`held`)");
         assert_eq!(refusal["retry_after_s"], json!(1800));
         assert_eq!(call.reason.as_deref(), Some(NO_PROGRESS_REASON));
     }

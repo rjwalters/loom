@@ -910,14 +910,18 @@ fn branch_protection_backs_off_at_the_cap_and_alerts_at_once() {
     let report = only(&pass);
     assert_eq!(report.state, WState::W1, "{report:?}");
     let until = t0() + ChronoDuration::hours(6);
-    assert_eq!(
-        reason(report),
-        format!(
+    // The hook refuses every ref, so the pull-request route fails too and the
+    // old behaviour stands (#12572).
+    let text = reason(report);
+    assert!(
+        text.starts_with(&format!(
             "backoff until {}: push refused by a branch rule: GH006: Protected branch update \
-             failed for refs/heads/main.",
+             failed for refs/heads/main.; pull-request route: pushing chore/loom-resync-v",
             stamp(until)
-        )
+        )),
+        "{text}"
     );
+    assert!(fx.forge.pulls.borrow().is_empty(), "no PR when the branch cannot be pushed");
     assert_eq!(pass.alerts.len(), 1, "alert on the first protection failure");
     let alert = &pass.alerts[0];
     assert_eq!(
@@ -953,6 +957,95 @@ fn branch_protection_backs_off_at_the_cap_and_alerts_at_once() {
         .set(until + ChronoDuration::hours(6) + ChronoDuration::seconds(2));
     assert_eq!(only(&host.pass()).state, WState::W0);
     assert!(host.memory.borrow().backoff.is_empty(), "cleared on success");
+}
+
+/// A pre-receive hook that refuses only the default branch, as a merge queue
+/// does; a side branch lands.
+fn refuse_main_only(fx: &Fixture) {
+    let hook = fx.origin.join("hooks/pre-receive");
+    write(
+        &hook,
+        "#!/bin/sh\nwhile read old new ref; do\n  if [ \"$ref\" = refs/heads/main ]; then\n    \
+         echo 'GH013: Repository rule violations found for refs/heads/main.' >&2\n    exit 1\n  \
+         fi\ndone\n",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn a_refused_default_branch_gets_a_resync_pull_request_once() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    let before = fx.origin_head();
+    let branch = format!("chore/loom-resync-v{RUNNING}");
+
+    let pass = host.pass();
+    let report = only(&pass);
+    assert_eq!(report.state, WState::W1, "{report:?}");
+    assert!(reason(report).contains("resync pull request open: #1 "), "{report:?}");
+    assert_eq!(fx.origin_head(), before, "main is untouched");
+    let pushed = git(&fx.origin, &["rev-parse", &format!("refs/heads/{branch}")]);
+    assert_eq!(
+        git(&fx.origin, &["log", "-1", "--format=%s", &pushed]),
+        format!("chore(loom): resync installed Loom to v{RUNNING}")
+    );
+    assert_eq!(fx.forge.pulls.borrow().len(), 1);
+    assert_eq!(*fx.forge.labels.borrow(), vec![(1, "loom:review-requested".to_string())]);
+    assert_eq!(pass.alerts.len(), 1, "branch-protection stays raised while the PR is open");
+    assert_eq!(pass.alerts[0].kind, "branch-protection");
+    assert_eq!(fx.forge.ref_sha(CLAIM_REF), None, "claim released");
+
+    // Past the backoff the PR is still open: no second branch, commit or PR.
+    host.now.set(t0() + ChronoDuration::hours(7));
+    let again = host.pass();
+    assert!(reason(only(&again)).contains("resync pull request open: #1 "), "{again:?}");
+    assert_eq!(fx.forge.pulls.borrow().len(), 1);
+    assert_eq!(git(&fx.origin, &["rev-parse", &format!("refs/heads/{branch}")]), pushed);
+    assert!(again.alerts.is_empty(), "alerted once per repo");
+}
+
+#[test]
+fn a_resync_branch_left_without_a_pull_request_gets_its_pull_request() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    // The PR was never opened, so the branch exists alone (an earlier try).
+    fx.forge
+        .fault("POST repos/acme/app/pulls", Fault::Status(503));
+    let first = host.pass();
+    assert!(reason(only(&first)).contains("opening the PR: HTTP 503"), "{first:?}");
+    assert!(fx.forge.pulls.borrow().is_empty());
+
+    host.now.set(t0() + ChronoDuration::hours(7));
+    let second = host.pass();
+    assert!(reason(only(&second)).contains("resync pull request open: #1 "), "{second:?}");
+    assert_eq!(fx.forge.pulls.borrow().len(), 1);
+}
+
+#[test]
+fn a_merged_resync_pull_request_makes_the_repo_current_and_clears_the_alert() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    assert_eq!(only(&host.pass()).state, WState::W1);
+    // The merge queue lands the PR: main gains the resync commit.
+    let branch = format!("refs/heads/chore/loom-resync-v{RUNNING}");
+    let sha = git(&fx.origin, &["rev-parse", &branch]);
+    git(&fx.origin, &["update-ref", "-d", &branch]);
+    fx.forge.pulls.borrow_mut().clear();
+    let hook = fx.origin.join("hooks/pre-receive");
+    fs::remove_file(&hook).unwrap();
+    git(&fx.seed, &["fetch", "origin", "--", &sha]);
+    git(&fx.seed, &["merge", "--ff-only", &sha]);
+    git(&fx.seed, &["push", "origin", "HEAD:main"]);
+    host.now.set(t0() + ChronoDuration::hours(7));
+    assert_eq!(only(&host.pass()).state, WState::W0);
+    assert!(host.memory.borrow().backoff.is_empty(), "the alert's backoff is gone");
 }
 
 #[test]

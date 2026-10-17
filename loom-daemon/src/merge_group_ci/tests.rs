@@ -365,6 +365,7 @@ fn org_facts(rules: Vec<Rule>) -> RepoFacts {
         branch: Some("main".into()),
         can_push: Some(true),
         rules: Some(rules),
+        writer_statuses: None,
     }
 }
 
@@ -457,6 +458,7 @@ fn this_repository_shape_is_ineligible() {
         branch: Some("main".into()),
         can_push: Some(true),
         rules: Some(vec![required_rule(&["Structural Checks"])]),
+        writer_statuses: None,
     };
     let got = prereqs(&facts, &[]);
     assert!(got.contains(&Prereq::OwnerNotOrganization));
@@ -569,4 +571,30 @@ fn evaluate_is_pure() {
     let a = serde_json::to_value(evaluate(&facts, &[qualified()], &[])).unwrap();
     let b = serde_json::to_value(evaluate(&facts, &[qualified()], &[])).unwrap();
     assert_eq!(a, b);
+}
+
+#[test]
+fn writer_app_with_statuses_read_is_not_eligible() {
+    let mut facts = org_facts(vec![mq_rule(), required_rule(&["Gate"])]);
+    facts.writer_statuses = Some("read".into());
+    assert_eq!(prereqs(&facts, &[qualified()]), vec![Prereq::WriterCannotPostStatuses]);
+    assert_eq!(Prereq::WriterCannotPostStatuses.as_str(), "WRITER_CANNOT_POST_STATUSES");
+    facts.writer_statuses = Some("write".into());
+    assert!(prereqs(&facts, &[qualified()]).is_empty());
+}
+
+#[test]
+fn installation_permissions_fixture_decides_the_statuses_level() {
+    use super::eligibility::installation_statuses;
+    let body = json!({"total_count": 3, "installations": [
+        {"app_id": 11, "app_slug": "other", "permissions": {"statuses": "write"}},
+        {"app_id": 42, "app_slug": "loom-writer", "permissions": {"contents": "write", "statuses": "read"}},
+        {"app_id": 77, "app_slug": "bare", "permissions": {"contents": "read"}},
+    ]});
+    assert_eq!(installation_statuses(&body, "42", None).as_deref(), Some("read"));
+    assert_eq!(installation_statuses(&body, "0", Some("loom-writer")).as_deref(), Some("read"));
+    assert_eq!(installation_statuses(&body, "77", None).as_deref(), Some("none"));
+    assert_eq!(installation_statuses(&body, "11", None).as_deref(), Some("write"));
+    assert_eq!(installation_statuses(&body, "99", None), None, "not listed: unknown");
+    assert_eq!(installation_statuses(&json!({"message": "x"}), "42", None), None);
 }

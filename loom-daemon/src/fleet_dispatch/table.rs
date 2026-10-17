@@ -132,6 +132,17 @@ pub const DEFAULT_NO_PROGRESS_LADDER: [Duration; 4] = [
 /// for the same thing. Everything else, including an unknown token, holds.
 pub const PROGRESS_OUTCOMES: [&str; 4] = ["verdict", "merged", "moved", "success"];
 
+/// The `release` outcome of a step that ended waiting on CI (Judge
+/// `ci_pending`, Champion `requeued`, #12551): neither progress nor a
+/// failure to find work. It arms [`Policy::ci_wait`], not the escalating
+/// ladder, and leaves the streak and the item's other holds alone.
+pub const CI_WAIT_OUTCOME: &str = "ci_wait";
+
+/// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
+/// the item every ~90 s while CI runs, short enough that its next step is
+/// drawn within minutes of CI finishing.
+pub const DEFAULT_CI_WAIT: Duration = Duration::from_secs(5 * 60);
+
 /// Whether a `release` with `outcome` moved its item (no cooldown).
 /// Conservative: only a clear success skips the hold.
 #[must_use]
@@ -152,6 +163,8 @@ pub struct Policy {
     /// after the `n+1`th consecutive no-progress release, the last rung
     /// repeating. A zero rung arms no hold.
     pub no_progress: [Duration; 4],
+    /// The flat hold after a [`CI_WAIT_OUTCOME`] release (#12551).
+    pub ci_wait: Duration,
 }
 
 impl Policy {
@@ -187,6 +200,7 @@ impl Policy {
             hold_ttl: lease,
             grace,
             no_progress: DEFAULT_NO_PROGRESS_LADDER,
+            ci_wait: DEFAULT_CI_WAIT,
         }
     }
 }
@@ -198,6 +212,7 @@ impl Default for Policy {
             hold_ttl: FORGE_LEASE_TTL,
             grace: DEFAULT_GRACE,
             no_progress: DEFAULT_NO_PROGRESS_LADDER,
+            ci_wait: DEFAULT_CI_WAIT,
         }
     }
 }
@@ -501,6 +516,38 @@ impl Table {
         step: &str,
         max_concurrent: Option<u32>,
     ) -> ClaimDecision {
+        self.claim_traced(now, host, repo, item, step, max_concurrent)
+            .0
+    }
+
+    /// [`Self::claim`], plus whether a refusal came from the no-progress
+    /// hold itself (#12551), not from another host's live claim that merely
+    /// coexists with a hold.
+    pub fn claim_traced(
+        &mut self,
+        now: Mono,
+        host: &str,
+        repo: &str,
+        item: u64,
+        step: &str,
+        max_concurrent: Option<u32>,
+    ) -> (ClaimDecision, bool) {
+        let mut cooled = false;
+        let d = self.decide_claim(now, host, repo, item, step, max_concurrent, &mut cooled);
+        (d, cooled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decide_claim(
+        &mut self,
+        now: Mono,
+        host: &str,
+        repo: &str,
+        item: u64,
+        step: &str,
+        max_concurrent: Option<u32>,
+        cooled: &mut bool,
+    ) -> ClaimDecision {
         self.expire(now);
         if self.in_grace(now) {
             let end = self.started.plus(self.policy.grace);
@@ -530,6 +577,7 @@ impl Table {
         }
         // The fleet-wide no-progress hold (#12541): whoever asks.
         if let Some(c) = self.cooldown(now, repo, item, step) {
+            *cooled = true;
             return refused(RefusalReason::Held, None, now.secs_until(c.until, 1));
         }
         let Ok(parsed) = step.parse::<StepRole>() else {
@@ -651,6 +699,21 @@ impl Table {
             return false;
         };
         let (repo, item) = key;
+        if outcome.trim() == CI_WAIT_OUTCOME {
+            let triple = (repo, item, row.step);
+            let until = now.plus(self.policy.ci_wait);
+            let prior = self.cooldowns.get(&triple).copied();
+            if !self.policy.ci_wait.is_zero() && prior.is_none_or(|c| c.until < until) {
+                self.cooldowns.insert(
+                    triple,
+                    Cooldown {
+                        until,
+                        streak: prior.map_or(0, |c| c.streak),
+                    },
+                );
+            }
+            return true;
+        }
         if release_progressed(outcome) {
             self.cooldowns
                 .retain(|(r, i, _), _| !(*r == repo && *i == item));
