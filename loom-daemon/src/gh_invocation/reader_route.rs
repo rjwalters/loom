@@ -14,9 +14,11 @@
 //!   [`OutputContract::Captured`] (a passthrough stream cannot be retried);
 //! - the target is an explicit `owner/repo` ([`GhTarget::Repo`]), or (W4-C)
 //!   the facade derived one for an untargeted read ([`super::cwd_route`]);
-//! - the caller did not pick a credential itself
-//!   ([`GhInvocation::gh_config_dir`], [`GhInvocation::without_token_env`])
-//!   and does not route its own reads ([`GhInvocation::identity_role`]);
+//! - the caller does not route its own reads (a reader credential it chose,
+//!   [`GhInvocation::gh_config_dir`] with [`GhInvocation::identity_role`]
+//!   `Reader`). Any other credential a caller hands a read is set aside
+//!   first (#12584, [`GhInvocation::route_site_credential`]), so it does not
+//!   keep the read off the readers;
 //! - the caller did not pin the writer ([`GhInvocation::writer_identity`]),
 //!   which a read whose answer depends on **who** asks (a permission or
 //!   write-scope probe, `viewer`, `/user`) must do;
@@ -140,7 +142,7 @@ pub(super) fn role_of(inv: &GhInvocation) -> IdentityRole {
 
 #[path = "reader_route_v2.rs"]
 mod v2;
-pub use v2::SHED_MARKER;
+pub use v2::{host_has_read_pool, SHED_MARKER};
 
 #[cfg(test)]
 #[path = "reader_route_v2_tests.rs"]

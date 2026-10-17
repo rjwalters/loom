@@ -60,9 +60,12 @@
 //! # Transport
 //!
 //! Nothing new: the fleet store's [`Transport`] / [`WriteTransport`] seams.
-//! Production reads under the writer credential ([`ClaimGh`]), because a
-//! reader App that is not installed on the repo answers `404`, and here that
-//! would read as "the claim is gone".
+//! Production reads run on a reader App ([`ClaimGh`]; #12394, #12584: the
+//! writer is never used for reads). A reader App that is not installed on the
+//! repo answers `404`, which here would read as "the claim is gone", so a
+//! reader's `404` counts only when that reader can see the repository
+//! ([`GhTransport::get_fresh`]); otherwise the read fails and the claim step
+//! with it, never "absent".
 
 use std::time::Duration;
 
@@ -223,16 +226,19 @@ impl<T: Transport + WriteTransport> ClaimForge for T {
     }
 }
 
-/// The production forge for the claim: [`GhTransport`], with every read made
-/// under the writer credential (see the module docs).
+/// The production forge for the claim: [`GhTransport`], every read
+/// unconditional and on a reader (see the module docs).
 pub struct ClaimGh(pub GhTransport);
 
 impl Transport for ClaimGh {
     fn get(&self, api_path: &str, _: Option<&str>, _: Option<&str>) -> Result<Reply> {
-        // Read-for-write (#12389 / #12394 allowlist): the claim ref is read
-        // right before this transport writes or deletes it, by the identity
-        // that created it, so it stays on the writer (`fleet_store`).
-        self.0.get_as_writer(api_path)
+        // Read-before-write: the claim ref is read right before this
+        // transport writes or deletes it. No validator, so no cached answer.
+        // A reader that lags a write cannot break correctness: creation is
+        // arbitrated by GitHub (`422 Reference already exists`), every
+        // takeover step re-reads, and the resync push itself is never forced
+        // (see the module docs); the claim only saves duplicate work.
+        self.0.get_fresh(api_path)
     }
 }
 

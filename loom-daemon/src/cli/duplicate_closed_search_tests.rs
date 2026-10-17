@@ -266,13 +266,14 @@ fn a_failed_search_is_unavailable_and_never_retried() {
     }
 }
 
-/// The search call is the facade's, pinned to one credential: no raw process
-/// spawn, and no reader-then-writer second attempt.
+/// The search call is the facade's and reader-only (#12584): no raw process
+/// spawn, no writer pin, and the reader route names the searched repo.
 #[test]
 fn the_request_goes_through_the_facade_once() {
     let src = include_str!("duplicate_closed_search.rs");
     assert_eq!(src.matches("Command::new(").count(), 0);
     assert_eq!(src.matches("GhInvocation::new(").count(), 1);
-    assert!(src.contains(".writer_identity()"));
+    assert!(!src.contains(".writer_identity()"));
+    assert!(src.contains(".reader_repo(slug)"));
     assert!(src.contains("ops::ISSUE_SEARCH"));
 }
