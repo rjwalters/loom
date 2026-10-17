@@ -23,6 +23,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # `group-check` refuses to post a status unless it runs inside a checkout
+      # that has `.loom/` and whose origin is this repository (write_scope, #9548).
+      # Sparse + depth 1 keeps it cheap; the default ref is the merge-group commit.
+      - name: Check out .loom
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .loom
+          fetch-depth: 1
+          ref: ${{ github.event.merge_group.head_sha }}
+
       - name: Install loom-daemon
         env:
           GH_TOKEN: ${{ github.token }}
