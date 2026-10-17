@@ -148,10 +148,30 @@ pub(super) fn heard(root: &Path, branch: &str, since: DateTime<Utc>) -> Option<S
 /// The branch and head the workspace half heard for `root` within `max_age`:
 /// a cache read, never a remote question (#12509). `None` for anything older.
 pub(crate) fn heard_within(root: &Path, max_age: Duration) -> Option<(String, String)> {
+    heard_within_aged(root, max_age).map(|(branch, head, _)| (branch, head))
+}
+
+/// [`heard_within`] plus how many seconds ago the head was heard (#12565).
+pub(crate) fn heard_within_aged(root: &Path, max_age: Duration) -> Option<(String, String, u64)> {
     let max_age = chrono::Duration::from_std(max_age).ok()?;
     let heads = remote_heads().lock().ok()?;
     let (branch, head, at) = heads.get(root)?;
-    (*at >= Utc::now() - max_age).then(|| (branch.clone(), head.clone()))
+    let age = Utc::now() - *at;
+    (age <= max_age)
+        .then(|| (branch.clone(), head.clone(), u64::try_from(age.num_seconds()).unwrap_or(0)))
+}
+
+/// Seed the cache as if `head` was heard at `at` (tests only).
+#[cfg(test)]
+pub(in crate::fleet_sync) fn note_remote_head_at(
+    root: &Path,
+    branch: &str,
+    head: &str,
+    at: DateTime<Utc>,
+) {
+    if let Ok(mut heads) = remote_heads().lock() {
+        heads.insert(root.to_path_buf(), (branch.to_string(), head.to_string(), at));
+    }
 }
 
 // ============================================================================
