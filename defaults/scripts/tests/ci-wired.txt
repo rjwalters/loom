@@ -299,6 +299,7 @@ tests/install/test-daemon-build-otlp-probe.sh
 tests/install/test-daemon-build-shortcut.sh
 tests/install/test-dry-run-preview-manifest.sh
 tests/install/test-forge-detect.sh
+tests/install/test-gitattributes-in-install-worktree.sh
 tests/install/test-git-repo-detection.sh
 tests/install/test-hooks-preserve.sh
 tests/install/test-initial-commit-credential-exclusion.sh
