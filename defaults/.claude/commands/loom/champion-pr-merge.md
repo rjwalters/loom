@@ -428,8 +428,12 @@ orthogonal to two other mechanisms and must not be folded into either:
   per repo and can name genuinely risky-looking files (e.g. guard hooks)
   that this repo's operator has decided are safe *given stated conditions*.
 
-**Config** (optional; absent entirely by default). `.loom/config.json` →
-`champion.standingAuthorizations`, an array of classes:
+**Config** (optional; absent entirely by default). `champion.standingAuthorizations`,
+an array of classes, read from the **resolved effective config**
+(`loom-daemon config get champion.standingAuthorizations --json`, #12591), so a
+class declared only in the fleet / repo-class tier is honoured and a class in the
+committed `.loom/config.json` still works; if the verb is missing or fails the
+committed file is read directly:
 
 ```json
 {
@@ -540,6 +544,27 @@ nothing else, and never criteria #1/#3/#4/#5/#6.
 ```bash
 PR_NUMBER=<number>
 CONFIG_FILE=".loom/config.json"
+
+# Resolved effective config (#12591): classes may be declared in the fleet /
+# repo-class tier, which never reaches the committed file. Materialize the
+# daemon's effective `champion.standingAuthorizations` into a scratch file of
+# the same shape and point CONFIG_FILE at it, so every read below is
+# unchanged. Verb missing, exit != 0/1, or unparseable output -> keep the
+# committed file (today's behavior). Verb succeeds but the value is not an
+# array -> an empty class list (fail closed: nothing is authorized).
+standing_auth_load_config() {
+  local out
+  CONFIG_FILE=".loom/config.json"
+  command -v loom-daemon >/dev/null 2>&1 || return 0
+  out=$(loom-daemon config get champion.standingAuthorizations --json 2>/dev/null)
+  case $? in 0) ;; 1) return 0 ;; *) return 0 ;; esac
+  printf '%s' "$out" | jq -e '.found == true' >/dev/null 2>&1 || return 0
+  CONFIG_FILE=$(mktemp) || { CONFIG_FILE=".loom/config.json"; return 0; }
+  printf '%s' "$out" | jq '{champion: {standingAuthorizations: (if (.value | type) == "array" then .value else [] end)}}' >"$CONFIG_FILE" 2>/dev/null \
+    || echo '{}' >"$CONFIG_FILE"
+}
+
+standing_auth_load_config
 
 # Kept set (#12528): paths no standing authorization may ever waive CRITERION
 # #3 for, with or without `coversCriticalFiles` -- the merge gate itself,
@@ -1245,7 +1270,7 @@ version_only_diff() {
 # must be in this shell; if not, the reset below and a missing function both
 # fall through to today's FAIL path.
 PR_NUMBER=<number>
-CONFIG_FILE=".loom/config.json"
+standing_auth_load_config             # resolved effective config (#12591)
 STANDING_AUTH_RESULT="NOT ELIGIBLE"   # never inherit criterion #2's ELIGIBLE
 STANDING_AUTH_ID=""
 standing_auth_eval critical "$FILES"
