@@ -495,6 +495,38 @@ pub fn codex_registry_names(workspace: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Codex profile directories under the profile root that **no registry names**
+/// (issue #12460): the stray-profile candidates a cache reaper may prune.
+///
+/// Fails closed. Returns an empty list unless `workspace` has its own registry
+/// file -- without one every discovered directory is the adopted pool, so
+/// nothing is "unregistered". Names held by the shared registry
+/// ([`shared_accounts_root`]) also count as registered: the profile root is
+/// host-wide while a workspace registry is per-repo, so a directory this repo
+/// does not list may be live for another. Hidden directories (`.quarantine`)
+/// are never returned, and neither is anything [`discovered_codex_profiles`]
+/// rejects (bad names, symlinks escaping the root).
+pub(crate) fn unregistered_codex_profiles(workspace: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let Some(entries) = read_repo_registry(workspace)? else {
+        return Ok(Vec::new());
+    };
+    let Some(root) = codex_profile_root() else {
+        return Ok(Vec::new());
+    };
+    let mut registered: HashSet<String> = entries
+        .into_iter()
+        .filter(|entry| entry.provider == AccountProvider::Codex)
+        .map(|entry| entry.name)
+        .collect();
+    if let Some(shared) = super::paths::shared_accounts_root() {
+        registered.extend(codex_registry_names(&shared)?);
+    }
+    Ok(discovered_codex_profiles(&root)?
+        .into_iter()
+        .filter(|(name, _)| !registered.contains(name))
+        .collect())
+}
+
 fn claude_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
     let pool = resolve_tokens_dir(workspace);
     let provenance = if pool == super::paths::per_repo_tokens_dir(workspace) {

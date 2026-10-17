@@ -3414,3 +3414,20 @@ heartbeats but its work finder has not ticked for 2x its own interval.
    caches, another tenant) must be freed by hand.
 5. If the host keeps filling, lower its `autonomous.workFinder.maxConcurrent`
    in fleet config.
+
+## Bounding the uv cache and stray Codex profiles (#12460)
+
+**uv cache.** `~/.cache/uv` grows without bound (28 GB on one busy host). The
+daemon does not prune it: uv is a host tool provisioned from
+`infra/aws/loom-worker/` in 2AMLogic/2am, so the bound belongs in the worker
+spec. Run `uv cache prune --ci` (drops pre-built wheels, keeps source-built
+ones) from a cron on the worker, or set `UV_CACHE_DIR` to a volume you can
+size. Prune cache data only; never reinstall or upgrade the tool.
+
+**Codex profiles.** The reaper tick (`cache_reaper::run_for`) removes a directory
+under `~/.loom/codex-profiles/` only when the repo's `.loom/accounts.json`
+exists and neither it nor the shared registry names the directory, nothing
+under it changed in 14 days, and no process has it as `CODEX_HOME`. Hidden dirs
+(`.quarantine`) and registered profiles are never touched; with no registry
+file nothing is pruned. Growth *inside* a registered profile (`sessions/`
+rollouts) is not pruned: check with `du -s ~/.loom/codex-profiles/*`.

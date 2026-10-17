@@ -825,6 +825,10 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // improvised prefixes. Own per-repo cooldown, shared with the eager tier.
     let _ = crate::target_orphan_reclaim::run_for(repo_root);
 
+    // #12460: unregistered, idle codex profile dirs under the host-wide profile
+    // root. Fail-closed on registry/liveness; see `crate::cache_reaper`.
+    let _ = crate::cache_reaper::run_for(repo_root);
+
     report
 }
 
