@@ -296,6 +296,7 @@ section for the full carve-out list).
 **After approval (green → blue):**
 ```bash
 ./.loom/scripts/post-verdict.sh <number> approved "$VERDICT_SHA" \
+    --review-started "$REVIEW_STARTED" --issue-body-sha "<N>=$ISSUE_HASH_N" \
     --body "LGTM! Code quality is excellent, tests pass, implementation is solid."
 ```
 
@@ -305,7 +306,9 @@ section for the full carve-out list).
     --body "Issues found that need addressing before approval..."
 ```
 
-**`post-verdict.sh` applies the verdict label itself (#10581)** and verifies it: approve leaves `loom:pr` and strips `loom:changes-requested`, `loom:ci-failure`, `loom:reviewing`, `loom:review-requested`; changes-requested leaves `loom:changes-requested` and strips `loom:pr`, `loom:reviewing`, `loom:review-requested`. A trailing `&& gh pr edit` in older examples below is redundant but harmless **only because `post-verdict.sh` ran first and stamped the marker**; never add `loom:pr` with a bare `gh pr edit` as the approval itself (#12136). Add only companions (`loom:ci-failure`, `loom:merge-conflict`) yourself. The label is the PRIMARY deliverable — the sweep validates labels, not comments — so **exit 8** (comment posted, labels did not hold) means run the printed repair command now. **Exit 7**, no approval stands: `loom:ci-failure` is on the PR, another verdict at this same head is changes-requested (do not approve over it without a new push; `--overrules-prior "<why each point no longer blocks>"` only when you verified every point), the PR state was unreadable, or a concurrent changes-requested from another host won (labels flipped). A same-head repeat within 10 minutes is deduped: stand down.
+**Stale-Read Gate (#12614).** A review is a statement about the spec as you read it. If the operator comments on the PR or the linked issue, or rewrites the issue body, while you review, your approval is against a stale read (PR #12512 / #12509: approved the old design after the operator said it was rescoped). So capture `REVIEW_STARTED` (UTC, RFC 3339) before reading the PR or issue, and the sha256 of each linked issue body as you read it, and give both to every `approved` call: `--review-started "$REVIEW_STARTED" --issue-body-sha "N=$HASH"`. `verdict-gate` then refuses (exit 7, nothing posted, naming the comment or issue) when a trusted human comment on the PR or a linked issue is newer than `REVIEW_STARTED`, or a body no longer hashes to what you reviewed. Remedy: read what changed, re-review against the **current** spec, capture a fresh `REVIEW_STARTED` and hashes, and retry. Bot and Loom-marker comments never trigger it; `changes-requested` is never refused by it. A missing `--review-started` skips the check with a warning, so never omit it on an approval.
+
+**`post-verdict.sh` applies the verdict label itself (#10581)** and verifies it: approve leaves `loom:pr` and strips `loom:changes-requested`, `loom:ci-failure`, `loom:reviewing`, `loom:review-requested`; changes-requested leaves `loom:changes-requested` and strips `loom:pr`, `loom:reviewing`, `loom:review-requested`. A trailing `&& gh pr edit` in older examples below is redundant but harmless **only because `post-verdict.sh` ran first and stamped the marker**; never add `loom:pr` with a bare `gh pr edit` as the approval itself (#12136). Add only companions (`loom:ci-failure`, `loom:merge-conflict`) yourself. The label is the PRIMARY deliverable — the sweep validates labels, not comments — so **exit 8** (comment posted, labels did not hold) means run the printed repair command now. **Exit 7**, no approval stands: a human commented or the issue was rescoped since `REVIEW_STARTED` (Stale-Read Gate: re-review, do not just re-run), `loom:ci-failure` is on the PR, another verdict at this same head is changes-requested (do not approve over it without a new push; `--overrules-prior "<why each point no longer blocks>"` only when you verified every point), the PR state was unreadable, or a concurrent changes-requested from another host won (labels flipped). A same-head repeat within 10 minutes is deduped: stand down.
 
 **Label transitions:**
 - `loom:review-requested` (green) → `loom:pr` (blue) [approved, ready for Champion auto-merge]
@@ -453,7 +456,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
        # Attempt automated rebase (see detailed workflow in Rebase Check section)
    fi
    ```
-4. **Understand context**: Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
+4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)`; see "Stale-Read Gate" under Verdict SHA Marker): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
 4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist, skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
 5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see Rebase Check section below)
@@ -469,11 +472,11 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
     flag-and-move-on step — see "Live Verification and the Circular-Fixture
     Smell".
 8. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
-8b. **Reconcile formal reviews and inline threads**: `./.loom/scripts/check-review-feedback.sh --number <number> --head-sha "$REVIEW_HEAD_SHA"` — CI green plus friendly issue comments is NOT the whole review record (#7647). Exit 0 = clear; 10/11/12 mean something is outstanding, older-head, or unread, and an approval must dispose of it explicitly. See "Formal Review & Inline Thread Reconciliation" below. **Applies to every approval path, including the fast paths** — `post-verdict.sh` re-runs this gate itself and refuses an ungrounded approval.
+8b. **Reconcile formal reviews and inline threads**: `./.loom/scripts/check-review-feedback.sh --number <number> --head-sha "$REVIEW_HEAD_SHA"` — CI green plus friendly issue comments is NOT the whole review record (#7647); it also reads comment-posted changes-requested verdicts (#12475). Exit 0 = clear; 10/11/12 mean something is outstanding, older-head, or unread, and an approval must dispose of it explicitly. See "Formal Review & Inline Thread Reconciliation" below. **Applies to every approval path, including the fast paths** — `post-verdict.sh` re-runs this gate itself and refuses an ungrounded approval.
 9. **Evaluate changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `./.loom/scripts/post-verdict.sh` to provide evaluation feedback
 11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **Run the Verdict-Time CAS Recheck (see below) immediately before this step** — abort instead of writing if it finds your claim lost, another Judge's verdict already landed, or the head SHA moved off `REVIEW_HEAD_SHA`. It yields `$VERDICT_SHA`, which `post-verdict.sh` MUST be given (see "Verdict SHA Marker") — the script stamps the `<!-- loom:verdict-sha ... -->` marker itself. The script applies the label (the PRIMARY deliverable) itself; see Label Workflow for exits 7/8:
-   - If approved: `post-verdict.sh <number> approved "$VERDICT_SHA" --body ...` (blue `loom:pr` - ready for Champion auto-merge)
+   - If approved: `post-verdict.sh <number> approved "$VERDICT_SHA" --review-started "$REVIEW_STARTED" --issue-body-sha "<N>=$ISSUE_HASH_N" --body ...` (blue `loom:pr` - ready for Champion auto-merge)
    - If changes needed: `post-verdict.sh <number> changes-requested "$VERDICT_SHA" --body ...` (amber - Doctor will address)
    - Then release the PR lease: `loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (also on any stand-down)
 
@@ -768,7 +771,9 @@ emit those spellings yourself.
     --body "..." | --body-file <path>
 ```
 
-never a bare `gh pr comment` (#6382). `$VERDICT_SHA` is the `headRefOid` read
+never a bare `gh pr comment` (#6382). Every **approval** also passes
+`--review-started "$REVIEW_STARTED"` and one `--issue-body-sha "N=$HASH"` per linked issue
+(the "Stale-Read Gate" below, #12614). `$VERDICT_SHA` is the `headRefOid` read
 in the Verdict-Time CAS Recheck immediately above the write; `post-verdict.sh`
 appends the marker itself —
 
@@ -1429,11 +1434,12 @@ Issue #1441: a Judge approved on local-test green while CI was still failing, co
 Issue comments are not the whole review record. A PR carries **three**
 independent feedback surfaces, and Loom's own approval convention (a
 `gh pr comment` + label, never `gh pr review --approve`) lives on only one of
-them:
+them. The gate below covers formal reviews, inline threads, **and** the
+`changes-requested` verdicts posted as comments on surface 1 (#12475):
 
 | Surface | Endpoint | What Loom writes there |
 |---|---|---|
-| General conversation | `/issues/<n>/comments` | Judge verdicts, Doctor/Builder notes |
+| General conversation | `/issues/<n>/comments` | Judge verdicts, Doctor/Builder notes. A `changes-requested` verdict (its `loom:verdict-sha … verdict=changes-requested` marker) from a trusted author, at any head, is gated like a formal review |
 | **Formal reviews** | `/pulls/<n>/reviews` | nothing — but humans and bots submit `CHANGES_REQUESTED` here |
 | **Inline review threads** | `/pulls/<n>/comments` + GraphQL `reviewThreads` | nothing — line-anchored findings and their resolution state |
 
@@ -1457,7 +1463,9 @@ their **actual** resolution state (GraphQL `reviewThreads`, falling back to
 commit association / timestamp, and prints eval-safe `KEY=VALUE` lines
 (enums, integers, SHAs and a findings-file path — never forge text; review
 bodies go only to `REVIEW_FEEDBACK_FINDINGS_FILE`, which is data to read, not
-to `eval`).
+to `eval`). Each trusted `changes-requested` verdict comment counts
+individually (id in `REVIEW_BLOCKING_IDS`) until a later approval whose
+reconciliation marker says `reconciled=yes` has cited it.
 
 | Exit | `REVIEW_FEEDBACK_STATE` | What it means | What you must do |
 |---|---|---|---|
@@ -1482,6 +1490,16 @@ remain blocking**, naming each review id. Scope disagreement ("that is the
 consumer's job") is a reconciliation you must argue explicitly, never an
 inferred override. If a finding genuinely still applies, the verdict is
 `changes-requested`, not an approval with a caveat.
+
+**Re-review after any `changes-requested` verdict (#12475):** your approval
+must carry an explicit per-finding resolution list, one entry for every
+finding in every earlier `changes-requested` verdict on the PR, whatever the
+channel (comment, formal review, inline thread): either `fixed at <file:line>`
+or `still open`. Any `still open` entry blocks approval, so the verdict is
+`changes-requested`. A summary that restates the old claim as satisfied ("one
+champion_merge per repo") without a `file:line` you opened in the tree is not
+a resolution. Put the list in `--reviews-reconciled`; the gate checks that
+every outstanding id is cited, the list is what makes each citation honest.
 
 ### It is enforced by the posting mechanism, not by memory
 
@@ -1654,11 +1672,15 @@ ineligible; only the repo-root file qualifies):
 
 ```bash
 # Docs-only fast path (#6134): eligible ONLY if every changed file is EXACTLY
-# one of these three root-level filenames. This is the same allowlist
+# one of these three root-level filenames, or a month-rotated archive (#12636,
+# DOCS_FAST_PATH_ARCHIVE_RE below). This is the same allowlist
 # Champion's criterion #2 re-derives independently (see champion-pr-merge.md)
 # — the two checks are mirrored, not shared, so a change to one without the
 # other is a visible drift, not a silent gap.
 DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")
+# Archive files (#12636): ONLY the month-rotated archives, month 01-12, one
+# directory deep. Never a directory or *.md allowance.
+DOCS_FAST_PATH_ARCHIVE_RE='^(work_log/WORK_LOG|work_plan/WORK_PLAN)_[0-9]{4}-(0[1-9]|1[0-2])\.md$'
 
 docs_only_fast_path_check() {
   # Reads a newline-separated file list on stdin. Echoes "ELIGIBLE" if every
@@ -1677,6 +1699,9 @@ docs_only_fast_path_check() {
         break
       fi
     done
+    if [ "$matched" -ne 1 ] && [[ "$file" =~ $DOCS_FAST_PATH_ARCHIVE_RE ]]; then
+      matched=1
+    fi
     if [ "$matched" -ne 1 ]; then
       echo "NOT ELIGIBLE: $file"
       return 0
