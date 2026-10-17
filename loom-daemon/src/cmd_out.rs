@@ -108,6 +108,12 @@ pub enum Unavailable {
     /// matches no rate-limit signature, so feeding it to the rate-limit
     /// breaker can never trip it.
     Shed { until: std::time::SystemTime },
+    /// Not run (#12641): a forge read the work-finder tick stopped (its
+    /// deadline passed, or its discovery was ended early). Nothing was sent
+    /// and the reader budget plays no part, so it is deliberately not
+    /// [`Unavailable::Shed`]: an operator must not go looking for a quota
+    /// problem. Its text matches no rate-limit signature either.
+    DeadlineReached,
 }
 
 impl std::fmt::Display for Unavailable {
@@ -118,6 +124,7 @@ impl std::fmt::Display for Unavailable {
             Unavailable::TimedOut { after, .. } => write!(f, "timed out after {after:?}"),
             Unavailable::RoutingBlocked(e) => write!(f, "routing_blocked: {e}"),
             Unavailable::AdapterUnavailable(e) => write!(f, "adapter_unavailable: {e}"),
+            Unavailable::DeadlineReached => write!(f, "deferred: tick deadline reached"),
             Unavailable::Shed { until } => write!(
                 f,
                 "deferred: reader budget low until {} (loom-shed)",

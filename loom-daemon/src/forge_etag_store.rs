@@ -224,7 +224,7 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
 mod deferrable;
 #[cfg(test)]
 pub(crate) use deferrable::install_test_route;
-pub(crate) use deferrable::ReadShed;
+pub(crate) use deferrable::{ReadShed, TickDeadlineReached};
 
 /// Who issued a conditional read and which inventoried forge operation it
 /// serves (#9831).
@@ -434,6 +434,7 @@ fn run_fetch_with(
         Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
         // #12074: the tick deadline passed; nothing was sent.
         Ok(GhCompletion::Shed { until, .. }) => return Err(anyhow::Error::new(ReadShed { until })),
+        Ok(GhCompletion::DeadlineReached) => return Err(anyhow::Error::new(TickDeadlineReached)),
         Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", timeout.as_secs()),
         Err(e) => return Err(e).with_context(|| format!("failed to invoke {}", gh_bin.display())),
     };

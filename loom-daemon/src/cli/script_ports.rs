@@ -421,6 +421,14 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     AffectedFiles(super::affected_files_check::AffectedFilesCommand),
 
+    /// Rotate `WORK_LOG.md` into dated monthly archives (#12633): `work-docs
+    /// archive` moves whole `### YYYY-MM-DD` sections older than the cutoff
+    /// (minimum 45 days, above Guide's 30-day lookback) byte-for-byte into
+    /// `work_log/WORK_LOG_YYYY-MM.md`; `work-docs check` verifies nothing was
+    /// lost or duplicated. Not a port: brand-new native verb.
+    #[command(subcommand)]
+    WorkDocs(super::work_docs_archive::WorkDocsCommand),
+
     /// The fleet singleton-job captain gate (#8848), shell-facing half: is
     /// THIS host the one declared to run `<job-name>`? Exit 0 arm, 3 another
     /// host is the captain, 4 no `fleet.captain` declared at all — three
@@ -704,6 +712,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
+            ScriptPortCommand::WorkDocs(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::Roles(cmd) => cmd.run(),

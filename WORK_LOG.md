@@ -7,6 +7,51 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-17
+- **PR #12651**: test: measure guard engines across all suites and the install matrix
+- **PR #12647**: feat: add work-docs archive/check verbs to rotate WORK_LOG.md
+- **PR #12644**: refactor: remove orphaned park_record helpers
+- **PR #12642**: fix: give the tick-deadline deferral its own outcome and wording
+- **Issue #12643** (closed): Remove orphaned park_record helpers: drop_blockers, has_qualified_ref, has_record
+- **Issue #12641** (closed): step_ledger: the work-finder tick-deadline deferral reuses the reader-shed wording ("reader budget low until <now>")
+- **Issue #12456** (closed): [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
+- **Issue #12455** (closed): [ci-daily] Full Suite (clean, unpartitioned)
+- **Issue #12093** (closed): Simplify: retire the dispatch-inert tier:* axis (Level::of ignores it; no consumer) — it only adds confusion beside the real priority labels
+- **Issue #12051** (closed): pass_shard: run the stale-blocked release pass and fleet.state listings on one host per repo
+- **PR #12646**: chore: remove orphaned observability::cycle_guard module
+- **PR #12640**: Route reads for pinned checkouts and managed-checkout resync to readers (closes #12630)
+- **PR #12625**: fix: close feature/issue-N on merge without a closing keyword and block claims on merged branch PRs
+- **PR #12624**: feat: refuse approvals made against a stale read of the PR or linked-issue spec
+- **PR #12623**: feat: record the Champion step outcome on the released PR lease
+- **PR #12622**: refactor: remove unused daily-velocity query chain
+- **PR #12620**: refactor: remove unread CheckRun actions_run_id/actions_job_id
+- **PR #12617**: write_scope: check a write with the same per-owner credential that performs it (closes #12606)
+- **PR #12629**: test: cover update-tools subject and symlinked sources in resync lineage guard
+- **PR #12628**: fix(step_end): target the item's repo in the spawn-refusal ledger write
+- **PR #12627**: docs: rewrite health guide and align release docs with generated notes
+- **PR #12608**: feat: ignore CHANGELOG-only conflicts in merge sequencing and explain held followers
+- **PR #12605**: fix: find a custom-socket daemon via /proc and report a missing socket accurately
+- **PR #12603**: refactor: remove test-only parse_launch_tap_after reader
+- **PR #12602**: docs: design loom-guard extraction with dual-engine guard comparison tool
+- **PR #12600**: test: pin write-confinement containment and interpreter-heredoc allow cases
+- **PR #12598**: feat: read Champion standing authorizations from the resolved effective config
+- **PR #12586**: fix: fail closed on an unverified issue-sweep lease order and a shed PR label read
+- **Issue #12645** (closed): Remove orphaned observability::cycle_guard (sole consumer deleted in #11098)
+- **Issue #12630** (closed): Readers: gate reads shed as 'no reader can serve' while reader installations have GitHub-reported headroom (per-host bucket accounting)
+- **Issue #12621** (closed): step_end::record_refusal: build its forge with the item's repo so owner-only cross-owner refusal writes use the repo owner's writer
+- **Issue #12618** (closed): resync guard: decide local divergence by content at loom_commit, not by last-commit subject
+- **Issue #12616** (closed): Champion merge step releases its lease on an approved, green PR without merging or saying why
+- **Issue #12615** (closed): Merged feature/issue-N PR without a closing keyword leaves issue N open and re-dispatchable
+- **Issue #12614** (closed): Judge approves against a stale read: re-check for operator comments / issue rescopes made during review before posting a verdict
+- **Issue #12609** (closed): Remove unread CheckRun actions_run_id/actions_job_id fields and parsers
+- **Issue #12606** (closed): Re-eval ladder marker writes refused on cross-owner repos since 0.19.1177: wrong installation credential
+- **Issue #12597** (closed): CLI over a plain ssh session can't find the running daemon ("Is the daemon running?") without LOOM_SOCKET_PATH/LOOM_WORKSPACE
+- **Issue #12596** (closed): Worktree-isolation guard: false positives on out-of-repo paths containing the repo dir name, and on heredoc open() in python -
+- **Issue #12595** (closed): Merge sequencing: follower stays loom:sequenced behind a loom:blocked predecessor; CHANGELOG-only overlap shouldn't serialise
+- **Issue #12592** (closed): Remove parse_launch_tap_after: test-only reader in launch_record.rs
+- **Issue #12591** (closed): Champion standing authorizations: read the resolved effective config, not only the committed .loom/config.json
+- **Issue #12571** (closed): Follow-ups to #12564: fail-closed issue-sweep lease tie-break; no relabel on a shed label read; break-glass docs; stronger test
+- **Issue #12569** (closed): Remove dead daily-velocity query chain in activity/stats
+- **Issue #9725** (closed): docs: generated release notes, historical CHANGELOG and current health guide
 - **PR #12593**: test: cover a match on a non-first forbiddenDiffPatterns entry
 - **Issue #12607** (closed): 1177: write-scope guard refuses step_ledger ladder writes as 'not in this App installation' after reads moved to readers
 - **Issue #12590** (closed): Champion standing authorization: test a hit on a non-first forbiddenDiffPatterns entry (follow-up to #12529)
