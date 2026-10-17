@@ -562,10 +562,13 @@ impl Gh {
             .forge_op(fop)
             .program(&self.bin)
             .current_dir(&self.root)
-            // W4-C: these reads verify this claimant's own writes. They stay
-            // on the writer (#12389): each one decides whether the lease this
-            // process just posted or renewed holds, so it must see that write.
-            .writer_identity()
+        // Reads are reader-only (#12394, #12584): served by a reader App or
+        // the read gateway, or shed (`None`, "no answer"), never the writer.
+        // The lease tie-break only trusts a read that shows this host's own
+        // lease, and the gateway revalidates every cached answer, so a
+        // reader's view of this process's own post is safe to decide on;
+        // a read that misses it reads as "not held yet" and is retried.
+        // Writes name their repo and always run on the writer.
     }
 
     /// Every trusted `loom:pr-lease*` comment on `pr`; `None` on any failure.

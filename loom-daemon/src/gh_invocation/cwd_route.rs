@@ -578,27 +578,30 @@ impl GhInvocation {
     /// checkout resolver injected.
     #[must_use]
     pub(crate) fn with_derived_route_in(
-        mut self,
+        self,
         env: &DeriveEnv,
         checkout: &dyn Fn(&Path, GhRepoEnv) -> CwdAnswer,
     ) -> Self {
-        match derive_with(&self, env, checkout) {
+        // #12584: a writer credential the site chose does not exempt a read
+        // from the reader route.
+        let mut this = self.route_site_credential();
+        match derive_with(&this, env, checkout) {
             Derivation::Route { slug, via } => {
                 log::trace!(
                     "gh_invocation: {} reads {slug} on the reader route ({via:?})",
-                    self.operation.as_str()
+                    this.operation.as_str()
                 );
-                self.route_slug = Some(slug);
+                this.route_slug = Some(slug);
             }
             Derivation::Disagree => {
-                if let Some(cwd) = self.cwd.as_deref() {
-                    note_disagreement(cwd, self.operation.as_str());
-                    self.disagree_counted = true;
+                if let Some(cwd) = this.cwd.as_deref() {
+                    note_disagreement(cwd, this.operation.as_str());
+                    this.disagree_counted = true;
                 }
             }
             Derivation::Writer => {}
         }
-        self
+        this
     }
 }
 

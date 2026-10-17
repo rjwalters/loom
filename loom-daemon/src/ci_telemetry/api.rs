@@ -246,8 +246,10 @@ pub fn parse_raw(raw: &str) -> Option<ApiResponse> {
 
 /// `owner/repo` from a `repos/<owner>/<repo>/…` API path (leading `/`
 /// allowed), for picking the repo's reader. Anything else (`graphql`,
-/// `orgs/…`, a `repositories/<id>/…` page link) is `None` and runs on the
-/// writer unless the caller names the repo ([`GithubApi::get_in`]).
+/// `orgs/…`, a `repositories/<id>/…` page link) is `None`: an owner listing
+/// is routed for its owner ([`owner_of_listing_path`]), and a read with no
+/// route at all is the facade's to route or shed (#12584) unless the caller
+/// names the repo ([`GithubApi::get_in`]).
 pub(super) fn repo_of_path(path: &str) -> Option<String> {
     let mut parts = path.trim_start_matches('/').split('/');
     if parts.next()? != "repos" {
@@ -257,6 +259,40 @@ pub(super) fn repo_of_path(path: &str) -> Option<String> {
     let repo = parts.next().filter(|s| !s.is_empty())?;
     let repo = repo.split(['?', '#']).next().filter(|s| !s.is_empty())?;
     Some(format!("{owner}/{repo}"))
+}
+
+/// The suffix of an owner-listing reader route ([`owner_listing_route`]).
+const OWNER_ROUTE_SUFFIX: &str = "/*";
+
+/// The reader route for a read of `owner`'s repository listing (#12584):
+/// `<owner>/*`, which picks a reader serving `owner` without naming one of
+/// its repositories. A route only: it is never an accounting row's repo.
+#[must_use]
+pub(crate) fn owner_listing_route(owner: &str) -> String {
+    format!("{owner}{OWNER_ROUTE_SUFFIX}")
+}
+
+/// The owner of an owner-scoped listing path (`orgs/<o>/…`, `users/<o>…`):
+/// the discovery listing and the owner-kind probe. Their answers are the
+/// same for any credential that sees the owner's repositories, so a reader
+/// for the owner serves them (#12584) instead of the writer.
+pub(super) fn owner_of_listing_path(path: &str) -> Option<String> {
+    let mut parts = path.trim_start_matches('/').split(['/', '?', '#']);
+    match parts.next()? {
+        "orgs" | "users" => parts.next().filter(|o| !o.is_empty()).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// `(reader route, accounting repo)` for a read the caller says belongs to
+/// `nwo` (or not): an [`owner_listing_route`] steers the reader only; a
+/// read with no repo of its own is routed for the owner its path lists.
+fn route_and_repo(nwo: Option<String>, path: &str) -> (Option<String>, Option<String>) {
+    match nwo {
+        Some(route) if route.ends_with(OWNER_ROUTE_SUFFIX) => (Some(route), None),
+        Some(repo) => (Some(repo.clone()), Some(repo)),
+        None => (owner_of_listing_path(path).map(|o| owner_listing_route(&o)), None),
+    }
 }
 
 /// The inventoried forge operation one poller request serves (#9831).
@@ -392,7 +428,8 @@ impl GhCliApi {
         path: &str,
         extra: &[&str],
     ) -> Result<ApiResponse, ApiError> {
-        let reader = nwo.as_deref().and_then(|r| (self.reader_for)(r));
+        let (route, nwo) = route_and_repo(nwo, path);
+        let reader = route.as_deref().and_then(|r| (self.reader_for)(r));
         // The shared reader → writer retry (#9872, `reader_then_writer`).
         let attempt = crate::forge_identity::read_via_reader(
             reader.as_ref().map(|(dir, _)| dir.as_path()),
@@ -408,11 +445,11 @@ impl GhCliApi {
             Result::is_ok,
             api_failure,
             |failure, _| {
-                let (Some((_, app_id)), Some(nwo)) = (&reader, nwo.as_deref()) else {
+                let (Some((_, app_id)), Some(route)) = (&reader, route.as_deref()) else {
                     return;
                 };
                 let why = format!("ci_telemetry {path}");
-                (self.withdraw)(app_id, nwo, failure, &why);
+                (self.withdraw)(app_id, route, failure, &why);
             },
         );
         match attempt {

@@ -156,8 +156,8 @@ pub fn usage_from_record(obj: &Value) -> Option<UsageRecord> {
 /// collide with another message, so it is counted as its own message.
 ///
 /// The one reader every token path shares: `sum_transcript_usage{,_by_model}`
-/// (sweep outcomes, `loom.runtime.usage` execution spans, `usage-record`
-/// attempt spans) and the role-tick transcript scan — so an execution total
+/// (sweep outcomes, `loom.runtime.usage` execution spans, attempt
+/// spans) and the role-tick transcript scan — so an execution total
 /// and the attempt totals it is compared against can never disagree about how
 /// a message is counted.
 #[derive(Debug, Default)]

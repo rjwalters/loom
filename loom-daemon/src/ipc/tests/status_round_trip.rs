@@ -108,6 +108,14 @@ fn test_daemon_status_request_response_round_trip() {
         auto_update_floor_not_rolling: Some(
             crate::auto_update::not_rolling::FloorNotRolling::Unsupervised,
         ),
+        host_update: Some(crate::auto_update::update_observation::HostUpdateObservation {
+            state: crate::auto_update::update_observation::HostState::Staged,
+            running_version: "0.19.23".into(),
+            on_disk_version: Some("0.19.24".into()),
+            floor: Some("0.19.20".into()),
+            target_version: Some("0.19.24".into()),
+            target_source: crate::auto_update::update_observation::ObservedTargetSource::Floor,
+        }),
         auto_update_config_enabled: Some(false),
         task_liveness: Vec::new(),
         session_containers: Some(crate::session_status::SessionContainersReport {
@@ -262,6 +270,9 @@ fn test_daemon_status_request_response_round_trip() {
             assert_eq!(r.token_pool_dir, Some(std::path::PathBuf::from("/repo/a/.loom/tokens")));
             assert_eq!(r.logical_cpus, 8);
             assert!(r.auto_update_enabled);
+            let host = r.host_update.as_ref().expect("host update survives"); // #12420
+            assert_eq!(host.state.as_str(), "H3");
+            assert_eq!(host.target_source.as_str(), "floor");
             assert_eq!(
                 r.auto_update_mode.as_deref(),
                 Some("fleet floor only (autoUpdate.enabled=false)")

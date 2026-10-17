@@ -95,6 +95,13 @@ fn gh_api(gh: &str, nwo: &str, args: &[&str]) -> Result<String, String> {
         crate::gh_invocation::GhTarget::None,
         std::time::Duration::from_secs(60),
     )
+    // Its one caller reads the classic `branchProtectionRule` over GraphQL:
+    // branch protection is asker-dependent (the REST twin,
+    // `branches/<b>/protection`, is never routed to a reader:
+    // `cwd_route::asker_dependent_path`), and a reader that may not see it
+    // would answer "no required contexts", failing this merge guard open.
+    // The merging writer reads it itself (#12584).
+    .writer_identity()
     .program(gh)
     .arg("api")
     .args(args)

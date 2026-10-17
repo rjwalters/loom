@@ -3,6 +3,17 @@
 **Loom does not emit operator presence.** There is no `operator.presence`
 signal, no presence hook, and no `loom-daemon presence …` subcommand.
 
+## Rule: daemon work only (#12536)
+
+Loom records telemetry for the work the daemon itself does, and nothing else.
+No hook watches AI work outside the daemon, and no `loom-daemon` subcommand an
+attended or outside session can call emits a span, log or metric about that
+session's own work (`usage-record` and `live-output-attend` were removed).
+Consumers infer external operator work from an item that advances with no
+daemon span or record. The in-session lease *comments*
+(`sweep-lease-publish.sh`, `sweep-lease-renew.sh`) are forge-side claim
+coordination, not telemetry, and are kept.
+
 ## What the daemon records
 
 The daemon reports telemetry for its own work, when it is running. It does not

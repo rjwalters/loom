@@ -23,7 +23,6 @@ pub(crate) mod accounts_session;
 mod affected_files_check;
 mod agent_skills;
 pub(crate) mod api_keys;
-pub(crate) mod attend_hook;
 mod branch_update;
 pub(crate) mod cancel;
 pub(crate) mod cargo_target_dir;

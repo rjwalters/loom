@@ -237,6 +237,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
                     ""
                 }
             );
+            status.set_fetching(); // #12420: H2 while the fetch runs
             let outcome = probe.fetch_artifact(&tag, low_priority);
             let info = match &artifact {
                 ArtifactResolution::Resolved(info) => info.clone(),
@@ -429,7 +430,7 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
         Some(note) => idle_tick(state, status, note),
         None => run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline),
     }));
-    let summary = result.unwrap_or_else(|payload| {
+    let mut summary = result.unwrap_or_else(|payload| {
         let note = format!(
             "tick panicked ({}); recorded, and the loop keeps running — the next tick retries",
             panic_message(payload.as_ref())
@@ -440,6 +441,14 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
         status.publish(state.snapshot(true, started_at, note.clone(), &unresolved));
         TickSummary::new(None).finish(TickDecisionKind::Panic, note, &unresolved, None)
     });
+    // #12420: the host's state as this tick leaves it. An armed pause-roll is
+    // H4: the tick that arms it ends with the pause starting.
+    summary.observed = Some(update_observation::observe(
+        &status.snapshot(),
+        pause_resume::status().as_ref(),
+        summary.roll_armed || (summary.drain.armed && summary.drain.target.is_some()),
+        env!("CARGO_PKG_VERSION"),
+    ));
     // #10880 rule 5: a roll that reached this binary, up past its startup
     // grace, took; forget the attempt.
     state
