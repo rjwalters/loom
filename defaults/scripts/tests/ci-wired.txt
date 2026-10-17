@@ -41,6 +41,7 @@ test-build-slot.sh
 test-cargo-test-daemon-guard.sh
 test-champion-capped-hold-routing.sh
 test-champion-ci-checks-no-checks-signal.sh
+test-champion-ci-workflow-blast.sh
 test-champion-critical-file-check.sh
 test-champion-evaluating-reclaim-trust.sh
 test-champion-epic-child-discovery.sh
