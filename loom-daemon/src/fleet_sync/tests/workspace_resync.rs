@@ -1040,7 +1040,7 @@ fn a_merged_resync_pull_request_makes_the_repo_current_and_clears_the_alert() {
     fx.forge.pulls.borrow_mut().clear();
     let hook = fx.origin.join("hooks/pre-receive");
     fs::remove_file(&hook).unwrap();
-    git(&fx.seed, &["fetch", "origin", &sha]);
+    git(&fx.seed, &["fetch", "origin", "--", &sha]);
     git(&fx.seed, &["merge", "--ff-only", &sha]);
     git(&fx.seed, &["push", "origin", "HEAD:main"]);
     host.now.set(t0() + ChronoDuration::hours(7));

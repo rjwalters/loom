@@ -420,6 +420,13 @@ fn daemon_write_paths_are_scoped() {
                 "the resync claim ref of a workspace repo the pass vetted with repo_writable (#10718)",
             ),
         ),
+        (
+            "fleet_sync/workspace_resync/w2.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "the resync PR of a workspace repo the pass vetted with repo_writable (#12572)",
+            ),
+        ),
         ("worktree_ops/gh.rs", Gated),
         (
             "parent_link.rs",
