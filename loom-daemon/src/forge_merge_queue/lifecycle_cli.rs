@@ -21,7 +21,7 @@
 
 use super::authz::{CheckConclusion, HandoffError};
 use super::events::FileEventSink;
-use super::forge::read_facts;
+use super::forge::read_member_facts;
 use super::gh_lifecycle::GhLifecycleForge;
 use super::github::GhQueueApi;
 use super::grants::CommentGrantStore;
@@ -142,7 +142,11 @@ pub fn render_handoff(pr: u32, sha: &str, r: &Result<EnqueueOutcome, HandoffFail
                 HandoffFailure::Gate(q) => queue_exit_code(q),
                 HandoffFailure::Preflight(_) => 3,
                 HandoffFailure::Authz(HandoffError::Enqueue(q)) => queue_exit_code(q),
-                HandoffFailure::Authz(HandoffError::Store(_)) => 3,
+                HandoffFailure::Authz(
+                    HandoffError::Store(_)
+                    | HandoffError::HeadStatus(_)
+                    | HandoffError::WriterCannotPostStatuses(_),
+                ) => 3,
                 _ => 1,
             };
             lines(
@@ -184,6 +188,7 @@ fn ctx<'a>(env: &Env, mode: MergeMode, l: &'a Live) -> Ctx<'a> {
         execution_enabled: env.execution_enabled,
         queue: &l.queue,
         forge: &l.forge,
+        statuses: &l.forge,
         events: &l.events,
         now: chrono::Utc::now(),
     }
@@ -395,13 +400,14 @@ fn group_check_report(env: &Env, commit: &str, repo: Option<&String>) -> Report 
         forge: &l.forge,
         required,
     };
-    let out = run_group_check(&store, &l.forge, &states, &|pr| read_facts(&l.forge, pr), commit);
+    let out =
+        run_group_check(&store, &l.forge, &states, &|pr| read_member_facts(&l.forge, pr), commit);
     match out {
         RunOutcome::Unreadable(e) => undetermined(&format!("merge groups unreadable: {e}")),
         RunOutcome::PostFailed(c, e) => {
             undetermined(&format!("concluded {c:?} but the status was not confirmed posted: {e}"))
         }
-        RunOutcome::Posted(c) => {
+        RunOutcome::Posted(c) | RunOutcome::Unchanged(c) => {
             let (code, word) = match &c {
                 GroupConclusion::Success => (0, "success"),
                 GroupConclusion::Pending(_) => (6, "pending"),

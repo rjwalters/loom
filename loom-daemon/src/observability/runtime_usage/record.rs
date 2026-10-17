@@ -1,5 +1,5 @@
 //! `loom-daemon usage-record`: one role attempt's token usage, journalled
-//! into the issue's story trace (Issue #9303).
+//! into the attempt's own trace (Issue #9303).
 //!
 //! In-session sweeps (an operator's `/loom:sweep`, hand-driven role
 //! subagents) never reach the daemon's terminal transition, so no execution
@@ -18,11 +18,10 @@
 //!      completed `loom.role_attempt` for the role in that execution's journal
 //!      — the one its checkpoint write just finished — else a new attempt span
 //!      under the execution root;
-//!    - **no context** (an operator session): the issue's D32 story
-//!      ([`crate::observability::tracing::resolve_story`]); a completed
-//!      `loom.role_attempt` is journalled under the story root, keyed by
-//!      `(run id, role, attempt, agent id)` and spanning the transcript's
-//!      first..last timestamps;
+//!    - **no context** (an operator session): an `insession-` execution of its
+//!      own; a completed `loom.role_attempt` is journalled under that
+//!      execution's root, keyed by `(run id, role, attempt, agent id)` and
+//!      spanning the transcript's first..last timestamps;
 //! 3. journals one `loom.runtime.usage` span per model under it with
 //!    `loom.usage.scope=attempt` ([`super::spans`]).
 //!
@@ -38,14 +37,11 @@ use chrono::{DateTime, Utc};
 
 use super::cost::Pricing;
 use super::spans::{append_new, model_usage_spans, UsageScope};
-use crate::observability::tracing::StoryRef;
 use crate::script_helpers::sweep_experiment::{sum_transcript_usage_by_model, ModelUsageTotals};
 use crate::script_helpers::transcript_usage::UsageFold;
 use crate::telemetry::trace::journal::Journal;
 use crate::telemetry::trace::store::TraceStore;
-use crate::telemetry::trace::{
-    SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext, STORY_KEY_VERSION,
-};
+use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 
 /// What to record.
 #[derive(Debug, Clone, Default)]
@@ -66,7 +62,7 @@ pub struct Request {
 pub enum Outcome {
     /// Spans journalled (count), or 0 when all were already there.
     Recorded(usize),
-    /// Nothing to do, and why (tracing off, no transcript, no usage, no story).
+    /// Nothing to do, and why (tracing off, no transcript, no usage).
     Skipped(&'static str),
     /// Something failed; the sweep carries on.
     Failed(String),
@@ -79,8 +75,8 @@ pub enum Parent {
         journal: Journal,
         root: TraceContext,
     },
-    /// An operator session: the issue's story.
-    Story(StoryRef),
+    /// An operator session: its own `insession-` execution trace, in `repo`.
+    Session { repo: String },
 }
 
 /// The CLI entry: resolve everything from the environment, never fail.
@@ -99,9 +95,9 @@ pub fn record(cwd: &Path, request: &Request) -> Outcome {
     };
     let parent = match crate::observability::lifecycle::inherited_context(&workspace) {
         Some((journal, root, _launcher)) => Parent::Inherited { journal, root },
-        None => match crate::observability::tracing::resolve_story(&workspace, request.issue) {
-            Some(story) => Parent::Story(story),
-            None => return Outcome::Skipped("the issue's story trace is unresolvable"),
+        None => Parent::Session {
+            repo: crate::observability::tracing::resolve_repo(&workspace)
+                .unwrap_or_else(|| TraceStore::repo_attribute(&workspace)),
         },
     };
     record_transcript(&workspace, request, &transcript, parent, &Pricing::active())
@@ -164,7 +160,7 @@ fn journal_attempt(
                 }
             }
         }
-        Parent::Story(story) => {
+        Parent::Session { repo } => {
             let sweep_id = request
                 .task_id
                 .clone()
@@ -172,13 +168,11 @@ fn journal_attempt(
             common.insert("loom.sweep_id".into(), sweep_id.clone());
             let execution = format!("insession-{sweep_id}");
             let store = TraceStore::new(workspace);
-            store.load_or_create_story(workspace, &execution, Some(&story.context))?;
+            let saved = store.load_or_create(workspace, &execution)?;
             let journal = Journal::for_context(&store.path(workspace, &execution));
             let mut attributes = common.clone();
-            attributes.insert("loom.repo".into(), story.repo.clone());
-            attributes.insert("loom.story".into(), story.story.clone());
-            attributes.insert("loom.story.key_version".into(), STORY_KEY_VERSION.into());
-            let span = attempt_span(&story.context, request, Some(&sweep_id), window, &attributes);
+            attributes.insert("loom.repo".into(), repo);
+            let span = attempt_span(&saved.context, request, Some(&sweep_id), window, &attributes);
             (journal, span.context.clone(), Some(span))
         }
     };

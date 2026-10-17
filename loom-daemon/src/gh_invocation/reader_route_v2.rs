@@ -1,41 +1,47 @@
-//! The class-aware read chain (W4-C): [`GhInvocation::execute_routed_v2`].
+//! The reader-only read chain: [`GhInvocation::execute_routed_v2`].
 //!
-//! Before W4-C a reader that ran dry pushed every read it served back onto
-//! the writer (`reader_then_writer`), so reader exhaustion cascaded into the
-//! very writer bucket the readers exist to protect. The chain now is:
+//! **The writer is never used for reads** (operator ruling, #12394). The
+//! writer App's installation has a fixed hourly budget the fleet's claims,
+//! merges and label flips spend; a read that spilled onto it when the readers
+//! ran dry is what tripped `rate_limit_breaker` fleet-wide. The chain is:
 //!
 //! 1. run on the reader [`crate::forge_identity::route_read`] chose;
 //! 2. on a rate limit or a refused credential: withdraw it (W4-A's scope),
 //!    then ask the router again — the next eligible reader serves the read;
-//! 3. when no reader is left, a [`ReadClass::Gate`] read goes to the writer
-//!    exactly as before. A [`ReadClass::Hygiene`] /
-//!    [`ReadClass::Observability`] read is **shed** — it returns
-//!    [`GhCompletion::Shed`] without a request ([`ReadClass::sheds`]). A
-//!    Hygiene read is shed while the readers are out of **budget**
-//!    ([`ExhaustCause::Budget`]: live rate-limit withdrawals, or the
-//!    router's headroom reserve) or **withdrawn** ([`ExhaustCause::Withdrawn`]:
-//!    App-wide, a refused credential, the gateway's outage withdrawal — all
-//!    time-bounded); when they are out for a reason that may never clear (a
-//!    coverage miss, a stale or unpublished token directory) it goes to the
-//!    writer like a Gate read: shedding there would stop the repo's
-//!    housekeeping for as long as the condition lasts. An Observability read
-//!    is shed for **every** cause: telemetry may go dark, the writer's budget
-//!    is the fleet's dispatch budget. The same holds when the router answers
-//!    [`RouteDecision::Exhausted`] up front. Only a host with no reader pool
-//!    at all ([`RouteDecision::NoPool`] before any reader was tried) serves
-//!    an Observability read on the writer.
+//! 3. when no reader is left — whatever the cause, whatever the
+//!    [`ReadClass`] — the read is **shed**: it returns
+//!    [`GhCompletion::Shed`] without a request, and its caller defers it,
+//!    skips it this tick or serves it from cache.
 //!
-//! A 403/404 keeps today's rule (re-run on the writer; withdraw the reader
-//! for the repo only if the writer could read it). When both answer 404, the
-//! miss is remembered for [`GONE_TTL`] per `(owner/repo, affinity key)`: a
-//! non-`Gate` read inside that window returns the reader's 404 with no
-//! writer retry. A `Gate` read always confirms on the writer.
+//! A 403/404 is an answer only with evidence the reader covers the repo
+//! (W6, [`crate::forge_identity::served::judge_coverage`]): an item-scoped
+//! `gh api repos/<o>/<r>/<family>/<item>` read answered `404` by a reader
+//! that recently served the same repo's same family. Any other 403/404 (a
+//! "not accessible by integration", "could not resolve to a repository", an
+//! installation that does not include the repo), or any refusal from a
+//! reader with no evidence it sees the repo, means the reader is blind to
+//! it: it is withdrawn **for that repo** ([`Failure::Coverage`]'s scope),
+//! the next reader is tried, as in 2, and the read is shed when none is
+//! left. A plain 404 from a reader that recently served another of the
+//! repo's families is shed without a withdrawal, so one missing item cannot
+//! take a covering reader off the repo. Returning a refusal would read as
+//! "absent" to the caller, and placement is deterministic, so every later
+//! read would land on the same blind reader.
 //!
-//! # Kill switch
+//! The one read that still reaches the writer is a host with **no reader
+//! pool at all** ([`RouteDecision::NoPool`] before any reader was tried): the
+//! writer is the only credential there is, so shedding would brick the host.
+//! It runs through `GhInvocation::writer_identity`, the same explicit,
+//! allow-listed marker as an asker-dependent probe, so it is not booked as a
+//! read-on-the-writer error.
 //!
-//! `LOOM_READ_SHED=0` ([`READ_SHED_ENV`]) treats every read as `Gate`: no
-//! shed and no gone-memo shortcut, so Hygiene and Observability reads fall
-//! back to the writer like they did before W4-C.
+//! A read the facade cannot route at all (no repo it can derive, a checkout
+//! whose sources disagree) skips this chain and runs as built. For a
+//! [`GhInvocation::reader_only`] read — every in-process daemon read made
+//! through `claim_reconciliation::gh_call::read` or
+//! `SweepRegistry::gh_inv(.., AccessIntent::Read, ..)` (#12555) — that would
+//! be the writer, so it is shed instead (same `forge.read.shed` span and
+//! `o=shed` row), unless the host has no reader pool at all.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -44,103 +50,17 @@ use std::time::{Duration, SystemTime};
 use super::{failure_of, succeeded, ReaderLookup, Withdraw};
 use crate::forge_bucket_book::Resource;
 use crate::forge_identity::{
-    ExhaustCause, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest,
+    served, ExhaustCause, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest,
 };
 use crate::gh_invocation::{GhCompletion, GhInvocation};
 use crate::proc_exec::{Completion, ExecError};
 
-/// `0` disables shedding (every read falls back to the writer like `Gate`).
-pub const READ_SHED_ENV: &str = "LOOM_READ_SHED";
-
 /// The marker every shed's text carries, so a log line can be traced back.
 pub const SHED_MARKER: &str = "(loom-shed)";
-
-/// How long a "gone for everyone" 404 is remembered.
-pub const GONE_TTL: Duration = Duration::from_secs(3600);
-
-/// Most remembered misses; an insert past this first drops expired ones,
-/// then the soonest-expiring.
-const GONE_CAP: usize = 4096;
 
 /// Readers a single read may try before it stops spilling (a guard: the
 /// router never offers a withdrawn reader twice).
 const MAX_READERS_TRIED: usize = 8;
-
-/// Shedding on or off, read per call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShedPolicy {
-    /// `LOOM_READ_SHED` is not `0`.
-    pub shed: bool,
-}
-
-impl ShedPolicy {
-    /// The live `LOOM_READ_SHED` (read on every call — no `OnceLock`).
-    #[must_use]
-    pub fn current() -> Self {
-        Self {
-            shed: !std::env::var(READ_SHED_ENV).is_ok_and(|v| v.trim() == "0"),
-        }
-    }
-
-    /// The class the chain applies to a read of `class`.
-    fn effective(self, class: ReadClass) -> ReadClass {
-        if self.shed {
-            class
-        } else {
-            ReadClass::Gate
-        }
-    }
-}
-
-/// `(owner/repo lowercased, affinity key)` → remembered until.
-type GoneMap = HashMap<(String, String), SystemTime>;
-
-fn gone_map() -> &'static Mutex<GoneMap> {
-    static MAP: OnceLock<Mutex<GoneMap>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Whether `(owner_repo, key)` is remembered as gone at `now`.
-#[must_use]
-pub fn is_gone_at(owner_repo: &str, key: &str, now: SystemTime) -> bool {
-    gone_map().lock().is_ok_and(|m| {
-        m.get(&(owner_repo.to_ascii_lowercase(), key.to_string()))
-            .is_some_and(|&until| now < until)
-    })
-}
-
-/// Remember `(owner_repo, key)` as gone for everyone from `now`.
-pub fn remember_gone_at(owner_repo: &str, key: &str, now: SystemTime) {
-    let Ok(mut m) = gone_map().lock() else {
-        return;
-    };
-    if m.len() >= GONE_CAP {
-        m.retain(|_, until| *until > now);
-        if m.len() >= GONE_CAP {
-            if let Some(oldest) = m.iter().min_by_key(|(_, u)| **u).map(|(k, _)| k.clone()) {
-                m.remove(&oldest);
-            }
-        }
-    }
-    m.insert((owner_repo.to_ascii_lowercase(), key.to_string()), now + GONE_TTL);
-}
-
-/// A captured run that exited non-zero with an HTTP 404.
-fn is_not_found(result: &GhCompletion) -> bool {
-    let GhCompletion::Captured(Completion::Exited(out)) = result else {
-        return false;
-    };
-    if out.status.success() {
-        return false;
-    }
-    let status = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
-        .map(|r| r.status);
-    if status == Some(404) {
-        return true;
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
-    status.is_none() && stderr.contains("http 404")
-}
 
 /// How often a shed is logged at `info` per operation; the rest are `debug`
 /// (the `forge.read.shed` span still records every one).
@@ -162,15 +82,25 @@ fn shed_log_due(op: &str, now: SystemTime) -> bool {
     }
 }
 
-/// The cause of running out of readers after `failure`: a rate limit is
-/// budget, a refused credential a (time-bounded) withdrawal, anything else
-/// neither.
-fn cause_after(failure: Option<Failure>) -> ExhaustCause {
-    match failure {
-        Some(Failure::RateLimited { .. }) => ExhaustCause::Budget,
-        Some(Failure::Credential) => ExhaustCause::Withdrawn,
-        _ => ExhaustCause::Unavailable,
-    }
+/// What a reader's coverage refusal `result` calls for
+/// ([`served::judge_coverage`]): the status comes from the `--include`
+/// headers when `gh` printed them, else the stderr's `HTTP nnn`.
+fn judge_refusal(
+    result: &GhCompletion,
+    app_id: &str,
+    slug: &str,
+    family: &str,
+    item_scoped: bool,
+    now: SystemTime,
+) -> served::CoverageRefusal {
+    let GhCompletion::Captured(Completion::Exited(out)) = result else {
+        return served::CoverageRefusal::Withdraw;
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let status = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
+        .map(|r| r.status)
+        .or_else(|| crate::forge_gateway::outage::http_status_in(&stderr));
+    served::judge_coverage(app_id, slug, family, item_scoped, status, &stderr, now)
 }
 
 /// When a withdrawn reader is expected back, for a shed's `until`.
@@ -188,96 +118,69 @@ impl GhInvocation {
         self,
         lookup: ReaderLookup<'_>,
         withdraw: Withdraw<'_>,
-        policy: ShedPolicy,
     ) -> Result<GhCompletion, ExecError> {
-        self.execute_routed_v2_at(lookup, withdraw, policy, SystemTime::now())
+        self.execute_routed_v2_at(lookup, withdraw, SystemTime::now())
     }
 
-    /// [`GhInvocation::execute_routed_v2`] at an explicit instant (the gone
-    /// memo's clock).
+    /// [`GhInvocation::execute_routed_v2`] at an explicit instant.
     pub(in crate::gh_invocation) fn execute_routed_v2_at(
         self,
         lookup: ReaderLookup<'_>,
         withdraw: Withdraw<'_>,
-        policy: ShedPolicy,
         now: SystemTime,
     ) -> Result<GhCompletion, ExecError> {
         let Some(slug) = self.reader_slug() else {
+            if self.unroutable_reader_only() {
+                return self.shed_unroutable(lookup, now);
+            }
             return self.execute_direct();
         };
         let host = super::super::accounting::resolved_identity(&self).origin;
         let resource = Resource::of_pool(super::super::accounting::static_pool(&self.args));
         let affinity = super::super::affinity_key(&self.args);
-        let class = policy.effective(self.read_class);
+        let class = self.read_class;
         let request = RouteRequest {
             owner_repo: &slug,
             host: host.as_deref(),
             resource,
             affinity_key: Some(&affinity),
-            // The effective class: under `LOOM_READ_SHED=0` every read is
-            // routed (and falls back) like a Gate read.
             class,
         };
         let owner = crate::credential_preflight::owner_of_nwo(&slug).to_ascii_lowercase();
-        // #12389: a reader-only read never reaches the writer; with no
-        // reader or gateway to serve it, it is shed whatever its class.
-        let barred =
-            policy.shed && (self.reader_only || crate::forge_gateway::cli_reads_reader_only());
         let why = format!("{} via the gh choke point", self.operation.as_str());
+        // W6 coverage evidence: the REST path's endpoint family, and whether
+        // it names one item. Not a `gh api` call: no family, no evidence.
+        let endpoint = super::super::accounting::api_endpoint(&self.args).unwrap_or_default();
+        let family = served::endpoint_family(&endpoint);
+        let item_scoped = served::is_item_path(&endpoint);
         let mut tried: HashSet<String> = HashSet::new();
         let mut last_app: Option<String> = None;
         let mut last_failure: Option<Failure> = None;
         let mut decision = lookup(&request);
         loop {
             let (dir, app_id) = match decision {
-                RouteDecision::NoPool if tried.is_empty() && !barred => {
-                    // No reader pool at all: the writer, as before W4.
-                    return self.execute_direct();
+                RouteDecision::NoPool if tried.is_empty() => {
+                    // No reader pool at all: the writer is the only
+                    // credential there is (the one allow-listed read on it).
+                    return self.writer_only_read();
                 }
                 RouteDecision::NoPool => {
                     let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
-                    // Nothing says budget: the writer serves it, as before
-                    // (except inside a tick's read scope, #12074).
-                    return self.no_reader_left(
-                        class,
-                        barred,
-                        ExhaustCause::Unavailable,
-                        &owner,
-                        resource,
-                        until,
-                        last_app.as_deref(),
-                        true,
-                    );
+                    return Ok(self.shed_read(class, &owner, resource, until, last_app.as_deref()));
                 }
-                RouteDecision::Exhausted { until, cause } => {
-                    return self.no_reader_left(
-                        class,
-                        barred,
-                        cause,
-                        &owner,
-                        resource,
-                        until,
-                        last_app.as_deref(),
-                        !tried.is_empty(),
-                    );
+                RouteDecision::Exhausted { until, .. } => {
+                    return Ok(self.shed_read(class, &owner, resource, until, last_app.as_deref()));
                 }
                 RouteDecision::Reader { dir, app_id, .. } => (dir, app_id),
             };
             if tried.contains(&app_id) || tried.len() >= MAX_READERS_TRIED {
                 // The router offered a reader this read already failed on:
-                // treat it as no reader left (budget only if what it failed
-                // on was a rate limit).
-                let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
-                return self.no_reader_left(
-                    class,
-                    barred,
-                    cause_after(last_failure),
-                    &owner,
-                    resource,
-                    until,
-                    Some(app_id.as_str()),
-                    true,
-                );
+                // treat it as no reader left.
+                let until = last_failure
+                    .map_or(now + crate::forge_read_pool::DEFAULT_WITHDRAWAL, |f| {
+                        until_after(f, now)
+                    });
+                return Ok(self.shed_read(class, &owner, resource, until, Some(app_id.as_str())));
             }
             let first = self
                 .clone()
@@ -286,6 +189,7 @@ impl GhInvocation {
                 .without_token_env()
                 .execute_direct()?;
             if succeeded(&first) {
+                served::note_reader_served(&app_id, &slug, family, now);
                 return Ok(first);
             }
             let fault = if app_id == crate::forge_gateway::GATEWAY_APP_ID {
@@ -295,7 +199,7 @@ impl GhInvocation {
             };
             if fault.reruns() {
                 // 2am#4367 P4: the gateway failed, not the credential: run
-                // the read once more on the readers, then the writer, and
+                // the read once more on the readers (never the writer), and
                 // take the gateway out only when it signalled the fault.
                 if fault == crate::forge_gateway::outage::Fault::Withdraw {
                     super::withdraw_gateway_outage(self.operation.as_str());
@@ -315,122 +219,142 @@ impl GhInvocation {
             }
             let Some(failure) = failure_of(&first, resource) else {
                 // Not the credential's fault (a 5xx, a network error):
-                // neither another reader nor the writer would help.
+                // another reader would not help.
                 return Ok(first);
             };
             if failure == Failure::Coverage {
-                if barred {
-                    // The reader does not cover the repo and the writer may
-                    // not confirm it: no answer.
-                    let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
-                    return self.no_reader_left(
-                        class,
-                        barred,
-                        ExhaustCause::Unavailable,
-                        &owner,
-                        resource,
-                        until,
-                        Some(app_id.as_str()),
-                        true,
-                    );
+                match judge_refusal(&first, &app_id, &slug, family, item_scoped, now) {
+                    // W6: this reader covers the repo's `family`, so its 404
+                    // is the item's own answer: no withdrawal, no other reader.
+                    served::CoverageRefusal::Answer => return Ok(first),
+                    // A plain 404 from a reader that sees the repo: no
+                    // answer, and the reader stays on the repo's other reads.
+                    served::CoverageRefusal::Shed => {
+                        let until = until_after(failure, now);
+                        return Ok(self.shed_read(class, &owner, resource, until, Some(&app_id)));
+                    }
+                    served::CoverageRefusal::Withdraw => {}
                 }
-                if class != ReadClass::Gate
-                    && is_not_found(&first)
-                    && is_gone_at(&slug, &affinity, now)
-                {
-                    // Gone for everyone, recently confirmed: the reader's 404
-                    // is the answer; no writer retry.
-                    return Ok(first);
-                }
-                let second = self.writer_fallback()?;
-                if succeeded(&second) {
-                    withdraw(&app_id, &slug, failure, &why);
-                } else if is_not_found(&first) && is_not_found(&second) {
-                    remember_gone_at(&slug, &affinity, now);
-                }
-                return Ok(second);
             }
+            // A rate limit, a refused token, or a 403/404 from a reader with
+            // no evidence it can see the repo: withdraw it (for this repo
+            // only on coverage) and ask the router for the next one.
             withdraw(&app_id, &slug, failure, &why);
             tried.insert(app_id.clone());
             last_app = Some(app_id);
             last_failure = Some(failure);
-            let next = lookup(&request);
-            let next = if tried.contains(crate::forge_gateway::GATEWAY_APP_ID) {
-                crate::forge_gateway::past_gateway(next, &request, now)
-            } else {
-                next
-            };
-            decision = match next {
-                // The pool went away under us: nothing says budget, so the
-                // writer serves it (a fallback, since a reader was tried).
-                RouteDecision::NoPool => RouteDecision::Exhausted {
-                    until: until_after(failure, now),
-                    cause: ExhaustCause::Unavailable,
-                },
-                other => other,
-            };
+            decision = self.next_after(lookup, &request, &tried, failure, now);
         }
     }
 
-    /// Re-run this read on the writer after a reader could not serve it.
-    fn writer_fallback(&self) -> Result<GhCompletion, ExecError> {
-        self.clone()
-            .identity_role(IdentityRole::WriterFallback)
-            .execute_direct()
+    /// The router's next answer after a reader failed with `failure`: past
+    /// the gateway once it was tried, and a pool that went away under us is
+    /// an exhaustion (shed), never "no pool" (the writer).
+    fn next_after(
+        &self,
+        lookup: ReaderLookup<'_>,
+        request: &RouteRequest<'_>,
+        tried: &HashSet<String>,
+        failure: Failure,
+        now: SystemTime,
+    ) -> RouteDecision {
+        let next = lookup(request);
+        let next = if tried.contains(crate::forge_gateway::GATEWAY_APP_ID) {
+            crate::forge_gateway::past_gateway(next, request, now)
+        } else {
+            next
+        };
+        match next {
+            RouteDecision::NoPool => RouteDecision::Exhausted {
+                until: until_after(failure, now),
+                cause: ExhaustCause::Unavailable,
+            },
+            other => other,
+        }
     }
 
-    /// No reader can serve this read. An Observability read is always shed;
-    /// a Hygiene read whose readers are out of budget or withdrawn is shed;
-    /// everything else — every `Gate` read, and a Hygiene read whose readers
-    /// are [`ExhaustCause::Unavailable`] — goes to the writer (as a fallback
-    /// when a reader was tried, else as the plain writer read it was before
-    /// W4).
-    #[allow(clippy::too_many_arguments)]
-    fn no_reader_left(
+    /// A read on a host with no reader pool: the writer, through the
+    /// explicit `writer_identity` marker. The one place a
+    /// [`GhInvocation::reader_only`] read may reach the writer, so its flag
+    /// is lifted here first (the builder would ignore the pin otherwise).
+    fn writer_only_read(mut self) -> Result<GhCompletion, ExecError> {
+        self.reader_only = false;
+        self.writer_identity().execute_direct()
+    }
+
+    /// A [`GhInvocation::reader_only`] read the facade found no reader route
+    /// for, which would otherwise run on the ambient writer (#12555): no
+    /// derivable repo, a checkout whose sources disagree, an argv shape the
+    /// derivation does not route. A credential the site chose itself is not
+    /// the ambient writer and is left alone.
+    fn unroutable_reader_only(&self) -> bool {
+        self.reader_only
+            && self.intent == super::super::AccessIntent::Read
+            && matches!(self.contract, super::super::OutputContract::Captured { .. })
+            && self.role.is_none()
+            && self.config_dir.is_none()
+            && !self.strip_token_env
+    }
+
+    /// [`Self::unroutable_reader_only`]'s answer: shed, unless this host has
+    /// no reader pool at all (then the writer, as for every read). The repo
+    /// the accounting row would name (the target, `LOOM_REPO`, the
+    /// checkout's remote) is asked of the router only to tell "no pool" from
+    /// "a pool that cannot route this read"; the read is never sent to a
+    /// reader under it, since `gh` itself might resolve another repo.
+    fn shed_unroutable(
+        self,
+        lookup: ReaderLookup<'_>,
+        now: SystemTime,
+    ) -> Result<GhCompletion, ExecError> {
+        let id = super::super::accounting::resolved_identity(&self);
+        let resource = Resource::of_pool(super::super::accounting::static_pool(&self.args));
+        let pooled = match id.repo.as_deref() {
+            Some(slug) => {
+                let affinity = super::super::affinity_key(&self.args);
+                let request = RouteRequest {
+                    owner_repo: slug,
+                    host: id.origin.as_deref(),
+                    resource,
+                    affinity_key: Some(&affinity),
+                    class: self.read_class,
+                };
+                !matches!(lookup(&request), RouteDecision::NoPool)
+            }
+            None => host_has_read_pool(),
+        };
+        if !pooled {
+            return self.writer_only_read();
+        }
+        let owner = id
+            .repo
+            .as_deref()
+            .map(|s| crate::credential_preflight::owner_of_nwo(s).to_ascii_lowercase())
+            .unwrap_or_else(|| "-".to_string());
+        let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
+        log::debug!(
+            "gh_invocation: {} has no reader route; shed, not sent to the writer (#12555)",
+            self.operation.as_str()
+        );
+        Ok(self.shed_read(self.read_class, &owner, resource, until, None))
+    }
+
+    /// No reader can serve this read: shed it, whatever its class and cause.
+    /// Nothing is sent; the caller defers, skips or serves from cache.
+    fn shed_read(
         &self,
         class: ReadClass,
-        barred: bool,
-        cause: ExhaustCause,
         owner: &str,
         resource: Resource,
         until: SystemTime,
         app: Option<&str>,
-        tried: bool,
-    ) -> Result<GhCompletion, ExecError> {
-        // #12074: inside a work-finder tick's read scope, a read whose
-        // readers are out of BUDGET is shed whatever its class: the tick
-        // answers it from its caches, and the writer's (dispatch App's)
-        // budget is left to the claims and merges during a rate-limit
-        // back-off. Any other cause (a failing gateway, a coverage miss)
-        // still reaches the writer, bounded by the deadline's clamp; and a
-        // repo starved for several ticks lifts the rule for one
-        // ([`super::super::read_deadline::writer_fallback_allowed`]).
-        let in_tick = tried
-            && cause == ExhaustCause::Budget
-            && !super::super::read_deadline::writer_fallback_allowed();
-        // A starved repo's escalated tick lifts every budget shed.
-        let escalated = super::super::read_deadline::escalated();
-        // [`ReadClass::sheds`]: an Observability read never reaches the
-        // writer once a reader pool exists, whatever the cause (and an
-        // escalated tick does not lift that); a Hygiene read waits out a
-        // budget exhaustion or a withdrawal. 2026-10-15: the `fleet.state`
-        // history reads drained the writer when a mix of budget and
-        // non-budget withdrawals made the router answer `Unavailable`.
-        // `LOOM_READ_SHED=0` still maps every class to `Gate` before this.
-        let sheds = class.sheds(cause);
-        if !barred && class != ReadClass::Observability && (escalated || (!in_tick && !sheds)) {
-            return if tried {
-                self.writer_fallback()
-            } else {
-                self.clone().execute_direct()
-            };
-        }
+    ) -> GhCompletion {
         self.record_read_shed(class, owner, resource, until, app);
-        Ok(GhCompletion::Shed {
+        GhCompletion::Shed {
             owner: owner.to_string(),
             resource,
             until,
-        })
+        }
     }
 
     /// Book one shed of this read: the `o=shed` accounting row, the
@@ -463,7 +387,7 @@ impl GhInvocation {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         if shed_log_due(op, SystemTime::now()) {
             log::info!(
-                "gh_invocation: {op} shed — every reader for {owner} {} is out of budget \
+                "gh_invocation: {op} shed — no reader can serve {owner} {} \
                  until {until_s}; deferred, not sent to the writer {SHED_MARKER} \
                  (logged at most every {}s per operation)",
                 resource.as_str(),
@@ -471,12 +395,21 @@ impl GhInvocation {
             );
         } else {
             log::debug!(
-                "gh_invocation: {op} shed — every reader for {owner} {} is out of budget \
+                "gh_invocation: {op} shed — no reader can serve {owner} {} \
                  until {until_s} {SHED_MARKER}",
                 resource.as_str()
             );
         }
     }
+}
+
+/// Whether this host has any reader pool or live read gateway: the test
+/// [`GhInvocation::shed_unroutable`] falls back to when it has no repo to ask
+/// the router about.
+fn host_has_read_pool() -> bool {
+    crate::forge_gateway::any_live()
+        || crate::forge_identity::workspace_root()
+            .is_some_and(|ws| !crate::forge_identity::cached(ws).readers.is_empty())
 }
 
 /// The `forge.read.class` value.

@@ -24,6 +24,7 @@
 //! probe classifies as `failed`, not as the session's word.
 
 use super::*;
+use crate::observability::lifecycle::RoleFailure;
 use crate::role_runner::RoleTickOutcome;
 
 /// The four outcome classes of a targeted step.
@@ -97,6 +98,47 @@ pub fn read_outcome_line(log: &Path, sweep_id: &str) -> Option<StepOutcomeLine> 
     text[start..].lines().rev().find_map(parse_outcome_line)
 }
 
+/// The `reason`s that mean "waiting on CI": Judge's `ci_pending`, and the
+/// Champion `requeued` outcome, which the telemetry projects as `ci_pending`.
+const CI_WAIT_REASONS: [&str; 2] = ["ci_pending", "requeued"];
+
+/// The captain release outcome for a step that ended `class` / `reason`: the
+/// class, except that a `noop` waiting on CI is `ci_wait` (#12551), which the
+/// captain holds briefly instead of climbing its no-progress ladder.
+fn release_token(class: &'static str, reason: &str) -> &'static str {
+    if class == "noop" && CI_WAIT_REASONS.contains(&reason) {
+        crate::fleet_dispatch::table::CI_WAIT_OUTCOME
+    } else {
+        class
+    }
+}
+
+/// The captain release outcome of a step that wrote an outcome line.
+pub(crate) fn release_class_of_line(line: &StepOutcomeLine) -> &'static str {
+    release_token(line.class.as_str(), &line.reason)
+}
+
+/// The release class of a step that wrote no `LOOM_STEP_OUTCOME` line: a
+/// Champion step's `CHAMPION-STEP` outcome folded onto the four classes
+/// ([`crate::step_dispatch::outcome_ledger::parse_outcome_line`]), read after
+/// `sweep_id`'s own dispatch header; else `failed`.
+pub(crate) fn release_class_fallback(
+    log: &Path,
+    sweep_id: &str,
+    role: StepRole,
+    item: u32,
+) -> &'static str {
+    let Ok(bytes) = std::fs::read(log) else {
+        return "failed";
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let Some(start) = text.rfind(&format!("sweep_id={sweep_id} ")) else {
+        return "failed";
+    };
+    crate::step_dispatch::outcome_ledger::parse_outcome_line(&text[start..], role, item)
+        .map_or("failed", |o| release_token(o.class.as_str(), &o.reason))
+}
+
 /// How a step's process ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepEnd {
@@ -108,25 +150,85 @@ pub enum StepEnd {
     TimedOut,
 }
 
+/// Whether a clean exit of a `role` step with `class` is a non-success: a
+/// Builder step that exits 0 without opening a PR (`noop`) or without
+/// writing any outcome line (#12500). Other roles' exit 0 is a completion.
+fn clean_exit_failure(role: StepRole, class: Option<StepOutcomeClass>) -> Option<CleanExit> {
+    if role != StepRole::Builder {
+        return None;
+    }
+    match class {
+        Some(StepOutcomeClass::Noop) => Some(CleanExit::NoPr),
+        None => Some(CleanExit::NoOutcomeLine),
+        Some(_) => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CleanExit {
+    NoPr,
+    NoOutcomeLine,
+}
+
 /// The role tick outcome a step's end maps to. The session's `failed`
-/// class, a non-zero exit, a timeout and a cancel are failures; anything
-/// else completed. Pure.
+/// class, a non-zero exit, a timeout and a cancel are failures, and so is a
+/// Builder step that ends without a PR (`noop`, or no outcome line at all,
+/// #12500); anything else completed. Pure.
 #[must_use]
-pub fn tick_outcome(end: StepEnd, line: Option<&StepOutcomeLine>) -> RoleTickOutcome {
+pub fn tick_outcome(
+    role: StepRole,
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+) -> RoleTickOutcome {
     let class = line.map(|l| l.class);
+    let reason = line.map_or("", |l| l.reason.as_str());
+    let clean = clean_exit_failure(role, class);
     match (end, class) {
         (StepEnd::TimedOut, _) => RoleTickOutcome::Failure("step timed out".to_string()),
         (StepEnd::Cancelled, _) => RoleTickOutcome::Failure("step cancelled".to_string()),
-        (_, Some(StepOutcomeClass::Failed)) => RoleTickOutcome::Failure(format!(
-            "step outcome failed: {}",
-            line.map_or("", |l| l.reason.as_str())
-        )),
-        (StepEnd::Exited(Some(0)), _) => RoleTickOutcome::Success,
-        (StepEnd::Exited(Some(code)), _) => RoleTickOutcome::Failure(format!("step exited {code}")),
-        (StepEnd::Exited(None), Some(_)) => RoleTickOutcome::Success,
+        (_, Some(StepOutcomeClass::Failed)) => {
+            RoleTickOutcome::Failure(format!("step outcome failed: {reason}"))
+        }
+        (StepEnd::Exited(Some(code)), _) if code != 0 => {
+            RoleTickOutcome::Failure(format!("step exited {code}"))
+        }
         (StepEnd::Exited(None), None) => {
             RoleTickOutcome::Failure("step exited, status unknown".to_string())
         }
+        _ => match clean {
+            Some(CleanExit::NoPr) => RoleTickOutcome::Failure(format!("no_pr: {reason}")),
+            Some(CleanExit::NoOutcomeLine) => {
+                RoleTickOutcome::Failure("step exited without an outcome line".to_string())
+            }
+            None => RoleTickOutcome::Success,
+        },
+    }
+}
+
+/// The closed-vocabulary failure behind a failed [`tick_outcome`] (#12480):
+/// `Some` exactly when `tick_outcome` is a `Failure`, one class per branch.
+/// The exit code rides `exit_code`, never the class. Pure.
+#[must_use]
+pub fn step_failure(
+    role: StepRole,
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+) -> Option<RoleFailure> {
+    use crate::observability::lifecycle::step;
+    let class = line.map(|l| l.class);
+    match (end, class) {
+        (StepEnd::TimedOut, _) => Some(step::TIMED_OUT.failure(None)),
+        (StepEnd::Cancelled, _) => Some(step::CANCELLED.failure(None)),
+        (_, Some(StepOutcomeClass::Failed)) => Some(step::OUTCOME_FAILED.failure(None)),
+        (StepEnd::Exited(Some(code)), _) if code != 0 => {
+            Some(step::EXIT_NONZERO.failure(Some(code)))
+        }
+        (StepEnd::Exited(None), None) => Some(step::STATUS_UNKNOWN.failure(None)),
+        (StepEnd::Exited(code), _) => match clean_exit_failure(role, class) {
+            Some(CleanExit::NoPr) => Some(step::NO_PR.failure(code)),
+            Some(CleanExit::NoOutcomeLine) => Some(step::NO_OUTCOME_LINE.failure(code)),
+            None => None,
+        },
     }
 }
 
@@ -141,6 +243,7 @@ pub(crate) struct StepCapture {
     /// The advisory `LOOM_STEP_OUTCOME` class and reason (#12362), which
     /// `outcome` collapses.
     pub(crate) step_outcome: Option<(String, String)>,
+    pub(crate) failure: Option<RoleFailure>,
     pub(crate) model: String,
     pub(crate) effort: String,
 }
@@ -158,6 +261,7 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
         capture.started_at,
         &capture.outcome,
         Some(crate::role_tick_telemetry::ResolvedLaunch::new(&capture.model, &capture.effort)),
+        capture.failure.clone(),
         &capture.sweep_id,
         capture.step_outcome.clone(),
     );
@@ -192,6 +296,18 @@ impl SweepRegistry {
                 l.reason
             ))
         );
+        // #12450: a granted step's assignment ends with the step, its outcome
+        // class the release's outcome (no line reads as `failed`). A no-op
+        // for a step the captain never granted. #12541: a Champion step
+        // writes no `LOOM_STEP_OUTCOME` line, only its `CHAMPION-STEP` one,
+        // so its class is that line's fold; before, every Champion release
+        // read `failed`, and the captain's no-progress hold would have held
+        // a triage that did move its PR.
+        let release_class = line.as_ref().map_or_else(
+            || release_class_fallback(&log_path, sweep_id, role, item),
+            release_class_of_line,
+        );
+        crate::fleet_dispatch::worker::release(sweep_id, release_class);
         if !self.config.skip_label_flip {
             let reason = match end {
                 StepEnd::TimedOut => crate::pr_lease_reap::REASON_TIMEOUT,
@@ -218,10 +334,11 @@ impl SweepRegistry {
             role,
             sweep_id: sweep_id.to_string(),
             started_at,
-            outcome: tick_outcome(end, line.as_ref()),
+            outcome: tick_outcome(role, end, line.as_ref()),
             step_outcome: line
                 .as_ref()
                 .map(|l| (l.class.as_str().to_string(), l.reason.clone())),
+            failure: step_failure(role, end, line.as_ref()),
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
         };

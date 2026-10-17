@@ -4,6 +4,7 @@
 
 mod auto_update;
 mod checkout_external_change;
+mod checkout_freshness;
 mod ci;
 mod daemon_event;
 mod daemon_exit;
@@ -22,6 +23,8 @@ mod pass;
 mod pick_decision;
 mod prompt_tree;
 mod role_draw;
+mod roster_change;
+mod run_state_request;
 mod scope_memory;
 mod session_output;
 mod token_ranking;
@@ -604,11 +607,13 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::HostExport(_)
         | TelemetryRecord::CheckoutExternalChange(_)
+        | TelemetryRecord::RosterChange(_)
         | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::FleetState(_)
         | TelemetryRecord::PickDecision(_)
-        | TelemetryRecord::OperatorPresence(_) => {
+        | TelemetryRecord::OperatorPresence(_)
+        | TelemetryRecord::CheckoutFreshness(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
             // Issue #10744: one token-ranking refresh round (the round's
@@ -624,10 +629,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| token_ranking::log_parts(r))
                 .or_else(|| host_export::log_parts(r))
                 .or_else(|| checkout_external_change::log_parts(r))
+                .or_else(|| roster_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
-                .or_else(|| operator_presence::log_parts(r))?;
+                .or_else(|| operator_presence::log_parts(r))
+                .or_else(|| checkout_freshness::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
@@ -637,6 +644,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::DaemonExit(_)
+        | TelemetryRecord::RunStateRequest(_)
         | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
@@ -653,6 +661,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
                 .or_else(|| daemon_exit::log_parts(r))
+                .or_else(|| run_state_request::log_parts(r))
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))?;
             time_unix_nano = parts.source_at;

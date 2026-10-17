@@ -29,7 +29,9 @@
 //!    proceed ([`Revocation::safe_to_transition`]). A failed dequeue after a
 //!    confirmed revoke still leaves the PR unable to pass the check.
 //! 5. **Enqueue re-validates after the write.** [`authorize_and_enqueue`]
-//!    evaluates, grants, enqueues pinned to the approved head, then
+//!    evaluates, grants, posts `success` for [`REQUIRED_CHECK_CONTEXT`] on
+//!    the approved head (GitHub only enqueues a PR whose required checks are
+//!    satisfied on its head, #12496), enqueues pinned to that head, then
 //!    evaluates again; a revocation that raced the enqueue is rolled back
 //!    immediately rather than at the next tick.
 //!
@@ -42,8 +44,8 @@
 //! and no Loom-side step can sit inside that interval. The test
 //! `known_gap_revocation_after_check_pass_can_still_merge` pins the gap so it
 //! cannot be forgotten. Because of it, [`INVARIANT_FULLY_DEMONSTRATED`] is
-//! `false` and queue execution stays dormant
-//! ([`super::QUEUE_EXECUTION_ENABLED`] is unchanged).
+//! `false`; the operator accepted the gap for the Phase C pilot (#10257), which
+//! enabled queue execution ([`super::QUEUE_EXECUTION_ENABLED`]).
 //!
 //! [`merge_group_check`] covers one PR; a merge group can carry several.
 //! [`super::group_authz`] evaluates every member, concludes only after the
@@ -53,6 +55,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use super::group_authz::{status_for, GroupConclusion, StatusApi, StatusState};
 use super::mode::MergeMode;
 use super::ops::{self, DequeueOutcome, EnqueueOutcome, QueueApi, QueueError};
 
@@ -300,6 +303,16 @@ pub enum HandoffError {
     Denied(Vec<DenyReason>),
     /// The grant could not be recorded; nothing was enqueued.
     Store(StoreError),
+    /// The writer credential cannot post the head status (or that could not
+    /// be established), so the handoff would roll back. Refused before any
+    /// grant was written or revoked; another identity's grant and queue entry
+    /// are untouched (#12579). The detail names the missing permission.
+    WriterCannotPostStatuses(String),
+    /// The `success` status for [`REQUIRED_CHECK_CONTEXT`] could not be
+    /// posted on the approved head; the grant was revoked and nothing was
+    /// enqueued. GitHub only enqueues a PR whose required checks are
+    /// satisfied on its head, so the enqueue could not have succeeded.
+    HeadStatus(String),
     /// The enqueue failed; the grant was revoked.
     Enqueue(QueueError),
     /// A revocation raced the enqueue; the grant was revoked and the
@@ -310,18 +323,30 @@ pub enum HandoffError {
     },
 }
 
-/// Check, grant, enqueue, re-check. See the module docs.
+/// Check, grant, post the head status, enqueue, re-check. See the module docs.
+///
+/// Idempotent: a PR already queued at `approved_sha` under a live grant for the
+/// same head reports [`EnqueueOutcome::AlreadyQueued`] before anything is
+/// written, so a second pass (possibly from a credential that cannot post
+/// statuses) can never revoke the standing grant. Otherwise
+/// [`StatusApi::can_post_statuses`] is checked before the first write.
 ///
 /// `read_facts` is called once before any write and once after the enqueue.
+/// `statuses` receives the `success` for [`REQUIRED_CHECK_CONTEXT`] on
+/// `approved_sha` (the head the grant is pinned to) between the grant and the
+/// enqueue, and a best-effort `failure` on every path that rolls the grant
+/// back after a successful enqueue (`pending` when the enqueue itself failed).
 ///
 /// # Errors
 ///
 /// [`HandoffError`]; on every error the PR is left unauthorized.
+#[allow(clippy::too_many_arguments)] // injected seams (queue, grants, statuses, facts), each distinct
 pub fn authorize_and_enqueue(
     mode: MergeMode,
     execution_enabled: bool,
     api: &dyn QueueApi,
     store: &dyn GrantStore,
+    statuses: &dyn StatusApi,
     read_facts: &dyn Fn() -> Result<AuthzFacts, String>,
     pr: u32,
     approved_sha: &str,
@@ -332,18 +357,30 @@ pub fn authorize_and_enqueue(
     if let AuthzDecision::Denied(why) = evaluate(&facts, approved_sha) {
         return Err(HandoffError::Denied(why));
     }
+    if let Some(out) = already_queued(api, store, pr, approved_sha) {
+        return Ok(out);
+    }
+    statuses
+        .can_post_statuses()
+        .map_err(HandoffError::WriterCannotPostStatuses)?;
     store
         .put(Grant {
             pr,
             approved_sha: approved_sha.to_ascii_lowercase(),
         })
         .map_err(HandoffError::Store)?;
+    let (state, desc) = status_for(&GroupConclusion::Success);
+    if let Err(e) = statuses.post_status(approved_sha, state, &desc) {
+        let _ = store.revoke(pr);
+        return Err(HandoffError::HeadStatus(e));
+    }
     let out = match ops::enqueue(api, pr, approved_sha) {
         Ok(o) => o,
         Err(e) => {
             // Roll the grant back; a failed rollback is surfaced by the next
             // check, which still re-reads live facts.
             let _ = store.revoke(pr);
+            clear_head_status(statuses, pr, approved_sha);
             return Err(HandoffError::Enqueue(e));
         }
     };
@@ -354,9 +391,59 @@ pub fn authorize_and_enqueue(
     };
     if let AuthzDecision::Denied(why) = verdict {
         let revocation = revoke_then_dequeue(mode, execution_enabled, api, store, pr);
+        withdraw_head_status(statuses, pr, approved_sha);
         return Err(HandoffError::RevokedDuringEnqueue { why, revocation });
     }
     Ok(out)
+}
+
+/// The PR is open, queued at `approved_sha`, and a live grant covers that same
+/// head: nothing to do. Any read that fails answers `None`, so the normal
+/// (guarded) path runs instead.
+fn already_queued(
+    api: &dyn QueueApi,
+    store: &dyn GrantStore,
+    pr: u32,
+    approved_sha: &str,
+) -> Option<EnqueueOutcome> {
+    let status = api.status(pr).ok()?;
+    if status.state != ops::PrState::Open {
+        return None;
+    }
+    let entry = status.entry?;
+    let queued_head = entry.head_oid.unwrap_or(status.head_oid);
+    if !queued_head.eq_ignore_ascii_case(approved_sha) {
+        return None;
+    }
+    let grant = store.get(pr).ok()??;
+    grant
+        .approved_sha
+        .eq_ignore_ascii_case(approved_sha)
+        .then_some(EnqueueOutcome::AlreadyQueued {
+            position: entry.position,
+        })
+}
+
+/// Best-effort `failure` on the PR head after a handoff rolled its grant
+/// back, so a head `success` never outlives the grant it vouched for. The
+/// grant is already revoked, which is what denies the merge-group check; a
+/// failed write here is logged, not an error of the handoff.
+pub(super) fn withdraw_head_status(statuses: &dyn StatusApi, pr: u32, head: &str) {
+    let desc = format!("authorization for #{pr} revoked");
+    if let Err(e) = statuses.post_status(head, StatusState::Failure, &desc) {
+        log::warn!("merge-queue: could not withdraw the head status for #{pr}: {e}");
+    }
+}
+
+/// Best-effort `pending` on the PR head after the enqueue itself failed. The
+/// grant is already revoked, so the merge-group check still denies; but unlike
+/// [`withdraw_head_status`] this leaves no `failure` for the verdict gate to
+/// read as red CI, so re-approving the same head is not routed to Doctor.
+pub(super) fn clear_head_status(statuses: &dyn StatusApi, pr: u32, head: &str) {
+    let desc = format!("authorization for #{pr} pending re-handoff");
+    if let Err(e) = statuses.post_status(head, StatusState::Pending, &desc) {
+        log::warn!("merge-queue: could not clear the head status for #{pr}: {e}");
+    }
 }
 
 /// Result of [`revoke_then_dequeue`].

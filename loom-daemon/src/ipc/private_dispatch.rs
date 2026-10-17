@@ -16,34 +16,6 @@ pub(super) async fn dispatch_sweep_nonblocking(
     model_profile: Option<String>,
     origin: crate::sweep_registry::DispatchOrigin,
 ) -> Response {
-    // Host-distress circuit breaker (#4235) — unchanged from the previous
-    // synchronous arm; a pure, lock-free global snapshot read.
-    if !force {
-        if let Some(snap) = crate::host_breaker::global_snapshot() {
-            if snap.suppressed {
-                let releases = snap.releases_at.map_or_else(
-                    || " (host still hot — cool-down not yet started)".to_string(),
-                    |r| format!(" (cool-down releases at {r})"),
-                );
-                log::warn!(
-                    "dispatch_sweep: refused {kind:?} — host circuit breaker is {} \
-                     ({}){releases}; running work drains, new dispatch paused. \
-                     Re-run with force to override.",
-                    snap.phase.as_str(),
-                    snap.reason.as_deref().unwrap_or("sustained host distress"),
-                );
-                return Response::Error {
-                    message: format!(
-                        "dispatch_sweep refused: host circuit breaker is {} ({}).{releases} \
-                         Running work is draining and new dispatch is paused (#4235). \
-                         Re-run with force to override.",
-                        snap.phase.as_str(),
-                        snap.reason.as_deref().unwrap_or("sustained host distress"),
-                    ),
-                };
-            }
-        }
-    }
     // GitHub rate-limit circuit breaker (#4429/#4440/#4666) — unchanged.
     if let Some(refusal) = rate_limit_dispatch_refusal(
         &kind,
@@ -134,13 +106,11 @@ pub(super) async fn dispatch_sweep_nonblocking(
 
         log::info!(
             "dispatch_sweep: {:?}; \
-             headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
+             headroom occupancy={} dynamic_cap={} (tokens={} [informational \
              only, not capacity-limiting since #5270])",
             kind,
             headroom.occupancy,
             headroom.dynamic_cap,
-            headroom.disk_headroom,
-            headroom.ram_headroom,
             headroom.token_axis_limit
         );
     }

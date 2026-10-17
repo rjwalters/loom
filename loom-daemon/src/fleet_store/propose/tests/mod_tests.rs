@@ -168,19 +168,6 @@ fn an_unrelated_server_error_is_reported_plainly_without_the_scope_hint() {
 }
 
 #[test]
-fn provenance_marker_carries_the_base_commit_and_is_one_hidden_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let sha = "0123456789abcdef0123456789abcdef01234567";
-    let line = provenance_marker(dir.path(), sha);
-    assert!(line.starts_with("<!-- loom:provenance v1 "));
-    assert!(line.ends_with("-->"));
-    assert_eq!(line.matches("-->").count(), 1);
-    assert!(line.contains(&format!("base={sha}")));
-    // No linked issue behind this action: `none`, not `unknown` (D33).
-    assert!(line.contains("story=none"));
-}
-
-#[test]
 fn drop_unchanged_keeps_real_edits_and_new_files_but_drops_no_ops() {
     let unchanged = FileChange {
         path: "repos.yml".to_string(),

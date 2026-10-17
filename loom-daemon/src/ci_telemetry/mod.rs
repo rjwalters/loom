@@ -80,7 +80,6 @@ pub mod poll;
 pub mod records;
 pub mod rotation;
 pub mod state;
-pub mod story;
 pub mod suites;
 
 use std::path::{Path, PathBuf};

@@ -59,7 +59,6 @@
 //! same checkout. That is documented rather than defended against: a rare
 //! over-count is preferable to the alternative of reporting nothing.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -203,10 +202,12 @@ impl ResolvedLaunch {
     }
 
     /// Record the prompt tree of `root` (#11989): a role session's
-    /// `/loom:<role>` prompt is read from that checkout's working tree.
+    /// `/loom:<role>` prompt is read from that checkout's working tree. The
+    /// remote facts come from the tip the daemon last heard (#12509), never
+    /// from a remote question.
     #[must_use]
     pub fn with_prompt_tree(mut self, root: &Path) -> Self {
-        self.prompt = prompt_tree::read(root);
+        self.prompt = prompt_tree::remote::read_with_heard(root);
         self
     }
 
@@ -341,13 +342,15 @@ pub fn emit_for_tick_correlated(
 
 /// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
 /// record marked `source = "step"` with the step's sweep id, so it is never
-/// counted as a role-runner tick.
+/// counted as a role-runner tick. `failure` is the class the step's end
+/// derived (#12480); `None` on a failure falls back to `unclassified:step`.
 pub fn emit_for_step(
     root: &Path,
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
+    failure: Option<crate::observability::lifecycle::RoleFailure>,
     sweep_id: &str,
     step_outcome: Option<(String, String)>,
 ) {
@@ -358,7 +361,7 @@ pub fn emit_for_step(
         outcome,
         resolved,
         None,
-        None,
+        failure,
         Some(sweep_id.to_string()),
         step_outcome,
     );
@@ -579,15 +582,8 @@ fn tally_command(command: &str, actions: &mut RoleTickActions) {
     }
 }
 
-/// Fold one transcript record's `tool_use` blocks into `actions`, and the
-/// issues/PRs they wrote to into `targets` (#9168); `session` carries the
-/// transcript's shell state (`cd`, `GH_REPO`) between commands (#9180).
-fn tally_record_actions(
-    obj: &Value,
-    actions: &mut RoleTickActions,
-    session: &mut targets::Session,
-    targets: &mut BTreeSet<targets::Target>,
-) {
+/// Fold one transcript record's `tool_use` blocks into `actions`.
+fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
     let container = obj.get("message").filter(|m| m.is_object()).unwrap_or(obj);
     let Some(content) = container.get("content").and_then(Value::as_array) else {
         return;
@@ -604,7 +600,6 @@ fn tally_record_actions(
             continue;
         };
         tally_command(command, actions);
-        targets::collect(command, session, targets);
     }
 }
 
@@ -619,20 +614,10 @@ fn tally_record_actions(
 /// token numbers here cannot drift from `sweep.outcome`'s.
 #[must_use]
 pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
-    scan_transcripts_with_targets(transcripts).map(|(scan, _)| scan)
-}
-
-/// [`scan_transcripts`], also returning every issue/PR the commands wrote
-/// to ([`targets`], #9168) — collected in the same pass, never a second read.
-#[must_use]
-pub fn scan_transcripts_with_targets(
-    transcripts: &[PathBuf],
-) -> Option<(TranscriptScan, BTreeSet<targets::Target>)> {
     use std::collections::BTreeMap;
 
     let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
     let mut actions = RoleTickActions::default();
-    let mut targets = BTreeSet::new();
     let mut read_any = false;
     // One fold across every transcript: deduped on `message.id` per scan, not
     // per file (#8186, #9303, #9315).
@@ -649,7 +634,6 @@ pub fn scan_transcripts_with_targets(
             continue;
         };
         read_any = true;
-        let mut session = targets::Session::default();
         for raw in text.lines() {
             let raw = raw.trim();
             if raw.is_empty() {
@@ -658,7 +642,7 @@ pub fn scan_transcripts_with_targets(
             let Ok(obj) = serde_json::from_str::<Value>(raw) else {
                 continue;
             };
-            tally_record_actions(&obj, &mut actions, &mut session, &mut targets);
+            tally_record_actions(&obj, &mut actions);
             if let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) {
                 fold.add(rec);
             }
@@ -672,13 +656,10 @@ pub fn scan_transcripts_with_targets(
     // fields exist to preserve.
     // `actions` is `Some` on this path by construction: reaching here means at
     // least one transcript was read, so a zero count is an *observation*.
-    read_any.then_some((
-        TranscriptScan {
-            tokens_by_model: totals.into_values().collect(),
-            actions: Some(actions),
-        },
-        targets,
-    ))
+    read_any.then_some(TranscriptScan {
+        tokens_by_model: totals.into_values().collect(),
+        actions: Some(actions),
+    })
 }
 
 /// The distinct model ids in a token breakdown, sorted and deduped — the same
@@ -893,14 +874,9 @@ fn emit_correlated(
                 &role_log,
                 Some((tick.started_at, tick.ended_at)),
             )
-            .map(|tokens_by_model| {
-                (
-                    TranscriptScan {
-                        tokens_by_model,
-                        actions: None,
-                    },
-                    BTreeSet::new(),
-                )
+            .map(|tokens_by_model| TranscriptScan {
+                tokens_by_model,
+                actions: None,
             });
         }
         let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
@@ -911,19 +887,18 @@ fn emit_correlated(
             tick.started_at,
             tick.ended_at,
         );
-        scan_transcripts_with_targets(&transcripts)
+        scan_transcripts(&transcripts)
     });
-    let (scan, targets) = scan.flatten().unzip();
+    let scan = scan.flatten();
     // The launch record's runtime, else the resolved-runtime marker (#8594);
     // absent (unknown, never guessed) for a Claude tick with neither.
-    let story_runtime = usage_runtime.clone().flatten();
-    // #10749: how the tick was billed — read once, stamped on the usage spans
-    // and the story copies. A launch record's own class wins; otherwise a
+    let usage_runtime_name = usage_runtime.clone().flatten();
+    // #10749: how the tick was billed — read once, stamped on the usage spans. A launch record's own class wins; otherwise a
     // Claude/Codex tick is classified by runtime (and a metered backstop tap).
     let llm_billing = tick.result.spawned().then(|| {
         tick_llm_billing(
             runtime_attribution.as_ref(),
-            story_runtime.as_deref(),
+            usage_runtime_name.as_deref(),
             tick.preference_tap.as_deref(),
             &role_log,
         )
@@ -960,15 +935,13 @@ fn emit_correlated(
     // a tick that never spawned (pool exhausted, runtime rejected, queue
     // empty) is visible there. The journal above stays the local copy.
     export(&envelope);
-    // #9168: join the story of every issue/PR this tick wrote to — after the
-    // durable record, so a slow forge lookup can never cost the tick record.
     if let (Some(trace), Some(rows)) = (&trace, &tokens_by_model) {
         usage::journal_execution(
             &tick.root,
             trace,
             &tick.role,
             tick.ended_at,
-            usage::span_runtime(story_runtime.as_deref(), source),
+            usage::span_runtime(usage_runtime_name.as_deref(), source),
             llm_billing.as_ref(),
             rows,
         );
@@ -986,19 +959,6 @@ fn emit_correlated(
             &trace.execution,
             tick.ended_at,
         );
-    }
-    if let (Some(trace), Some(targets)) = (trace, targets) {
-        let facts = story::TickFacts {
-            trace,
-            role: tick.role.clone(),
-            ended_at: tick.ended_at,
-            result: result_label(tick.result),
-            runtime: story_runtime,
-            model: tick.model.clone(),
-            tokens_by_model,
-            llm_billing,
-        };
-        story::emit(&tick.root, &facts, &targets);
     }
 }
 
@@ -1094,8 +1054,6 @@ pub fn label_spawned(label: &str) -> Option<bool> {
 
 pub mod deferred;
 pub mod prompt_tree;
-pub mod story;
-pub mod targets;
 pub mod usage;
 
 #[cfg(test)]

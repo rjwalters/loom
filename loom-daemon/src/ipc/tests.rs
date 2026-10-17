@@ -346,8 +346,6 @@ fn fake_headroom(occupancy: usize, dynamic_cap: usize) -> DispatchHeadroom {
     DispatchHeadroom {
         occupancy,
         dynamic_cap,
-        disk_headroom: 10,
-        ram_headroom: 10,
         token_axis_limit: 5,
     }
 }
@@ -373,8 +371,6 @@ fn dispatch_headroom_message_names_every_axis() {
     let h = DispatchHeadroom {
         occupancy: 4,
         dynamic_cap: 3,
-        disk_headroom: 9,
-        ram_headroom: 7,
         token_axis_limit: 6,
     };
     let kind = SweepKind::Issue(123);
@@ -383,8 +379,8 @@ fn dispatch_headroom_message_names_every_axis() {
     let entered = dispatch_headroom_message(repo, true, &h, &kind);
     assert!(entered.contains("occupancy=4"), "{entered}");
     assert!(entered.contains("dynamic_cap=3"), "{entered}");
-    assert!(entered.contains("disk_headroom=9"), "{entered}");
-    assert!(entered.contains("ram_headroom=7"), "{entered}");
+    assert!(!entered.contains("disk_headroom"), "no disk term since #12406: {entered}");
+    assert!(!entered.contains("ram_headroom"), "no RAM term since #12330: {entered}");
     assert!(entered.contains("token_axis_limit=6"), "{entered}");
     assert!(entered.contains("123"), "{entered}");
     assert!(entered.contains("advisory only"), "{entered}");
@@ -3750,6 +3746,65 @@ fn test_daemon_status_backward_compat_missing_capacity() {
 /// has actually reached the dynamic cap (#4031) — the "currently binding" vs
 /// "smallest ceiling" distinction. With a real token pool (cap > 0) and no
 /// in-flight sweeps, the cap is a ceiling but is NOT binding.
+/// #12406: the cap is the operator's `maxConcurrent` and nothing else. A host
+/// with 1 GB free on its worktree volume, a legacy `LOOM_PER_WORKTREE_GB`
+/// that used to clamp the disk term to zero, and brake/breaker thresholds
+/// that any load would trip still reports the configured cap. Load and RAM
+/// are not admission inputs at all any more (nothing samples them for the
+/// cap), and the work finder's reloader hands the tick the configured value.
+#[test]
+#[serial_test::serial]
+fn a_host_short_of_disk_ram_and_cpu_still_gets_the_configured_cap() {
+    use crate::main_health_gate::WorkspaceHealthStates;
+    use crate::work_finder::{
+        ConfiguredMax, ConfiguredMaxReloader, WORK_FINDER_MAX_CONCURRENT_ENV,
+    };
+    use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::disk_headroom::set_free_gb_override(None);
+            std::env::remove_var("LOOM_PER_WORKTREE_GB");
+            std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+        }
+    }
+    let _restore = Restore;
+    crate::disk_headroom::set_free_gb_override(Some(1));
+    std::env::set_var("LOOM_PER_WORKTREE_GB", "100");
+    std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+
+    let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+    let root = dir.path().to_path_buf();
+    std::env::set_var(REGISTRY_PATH_ENV, dir.path().join("no-such-workspaces.json"));
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::write(
+        root.join(".loom/config.json"),
+        r#"{"autonomous":{"workFinder":{"maxConcurrent":12,"maxConcurrentPerRepo":1,
+            "maxAdmissionsPerTick":1,"saturationBrake":{"loadPerCore":0.01}},
+            "hostBreaker":{"loadPerCore":0.01}}}"#,
+    )
+    .unwrap();
+
+    let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+    pool.seed(root.clone(), sr.clone());
+    let report = build_daemon_status(
+        &pool,
+        &WorkspaceHealthStates::new(),
+        &root,
+        &test_credential_preflight(),
+    );
+    assert_eq!(report.configured_max, 12);
+    assert_eq!(report.dynamic_cap, 12, "1 GB free and tripped-threshold config do not clamp it");
+
+    // The work finder's per-tick read is the same value: the retired keys
+    // (per-repo cap, ramp cap, brake, breaker) are ignored.
+    let initial = ConfiguredMax::resolve(&crate::work_finder::read_work_finder_config(&root));
+    let mut reloader = ConfiguredMaxReloader::new(root.clone(), initial);
+    assert_eq!(reloader.refresh(), 12);
+    std::env::remove_var(REGISTRY_PATH_ENV);
+}
+
 #[test]
 #[serial_test::serial]
 fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
@@ -3762,23 +3817,6 @@ fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
     std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
     let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
     std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
-
-    // #11679: pin the live RAM/disk probes so the cap does not depend on host
-    // load. The guard restores everything on drop, including on panic.
-    struct PinGuard;
-    impl Drop for PinGuard {
-        fn drop(&mut self) {
-            crate::ram_headroom::set_available_ram_gb_override(None);
-            crate::disk_headroom::set_free_gb_override(None);
-            std::env::remove_var("LOOM_PER_WORKTREE_RAM_GB");
-            std::env::remove_var("LOOM_PER_WORKTREE_GB");
-        }
-    }
-    let _pin = PinGuard;
-    crate::ram_headroom::set_available_ram_gb_override(Some(1024));
-    crate::disk_headroom::set_free_gb_override(Some(1024));
-    std::env::set_var("LOOM_PER_WORKTREE_RAM_GB", "1");
-    std::env::set_var("LOOM_PER_WORKTREE_GB", "1");
 
     // Provision a two-token pool so the dynamic cap is > 0 (a real ceiling).
     let tokens_dir = root.join(".loom").join("tokens");
@@ -3925,7 +3963,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
     // The tempdir has no `.loom/tokens/`, so the pool is 0 — but since
     // #5270 the token axis no longer participates in the dynamic cap, so
     // an empty token pool no longer pins `dynamic_cap` to 0. The cap is
-    // `min(disk_headroom, ram_headroom, configured_max)`, where
+    // `configured_max` (#12406), where
     // `configured_max` is resolved the same way `build_daemon_status`
     // resolves it (not assumed to be the built-in default — a host-level
     // config tier may set it, exactly the ambient config this assertion
@@ -3935,12 +3973,8 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
         &crate::work_finder::read_work_finder_config(&root),
     );
     assert_eq!(
-        report.dynamic_cap,
-        report
-            .disk_headroom
-            .min(report.ram_headroom)
-            .min(expected_configured_max),
-        "dynamic cap is min(disk, ram, configured_max) regardless of the empty token pool"
+        report.dynamic_cap, expected_configured_max,
+        "the cap is configured_max regardless of the empty token pool (#12406)"
     );
     // #4345: a pool that never called start_safehouse_narration /
     // start_peer_coordination still reports a live safehouse state — the

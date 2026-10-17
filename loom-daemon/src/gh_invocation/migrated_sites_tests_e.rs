@@ -25,9 +25,9 @@
 //! page is already its own conditional request and row.
 
 use crate::forge_call_stats;
+use crate::gh_invocation::test_support::stub;
 use crate::types::ForgeCallCounts;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// `(file, "--paginate" literals in it, why they are not walkable)`.
 /// Adding an entry is a decision to leave pages uncounted even with the
@@ -318,13 +318,6 @@ fn the_allowlist_is_exact_and_cannot_go_stale() {
 
 // ---- a migrated site end to end: one row per page with the switch on,
 // ---- one row with it off ----
-
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
 
 fn rows_after(switch: Option<&str>, body: impl FnOnce()) -> Vec<ForgeCallCounts> {
     let sink = tempfile::tempdir().unwrap();

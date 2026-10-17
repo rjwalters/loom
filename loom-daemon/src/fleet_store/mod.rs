@@ -43,6 +43,7 @@
 
 pub mod admins;
 pub mod compiled;
+pub mod dispatchers;
 pub mod fetch;
 pub mod floor;
 pub mod gh;

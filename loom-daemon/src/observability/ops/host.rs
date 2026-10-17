@@ -8,7 +8,7 @@
 //! "unknown != zero" rule as every other probe: an unmeasurable reading emits
 //! no point, never a fabricated `0`.
 //!
-//! Sources, with no new crate dependency (the [`crate::ram_headroom`]
+//! Sources, with no new crate dependency (the the former `ram_headroom` module
 //! precedent): Linux reads `/proc/meminfo`; macOS uses `vm_stat` (free +
 //! inactive pages, the `MemAvailable` analogue), `sysctl -n hw.memsize` and
 //! `sysctl -n vm.swapusage`. The worktree volume is the same single `df -Pk`
@@ -121,6 +121,25 @@ fn sysctl(name: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Parse the free + inactive page counts from macOS `vm_stat` output.
+///
+/// `vm_stat` prints one `"<Label>:<spaces><count>."` line per stat; the
+/// reclaimable-equivalent of Linux's `MemAvailable` is free + inactive pages
+/// (inactive pages hold evictable content). Returns `None` when either field
+/// is missing or malformed. (Moved here from the retired `ram_headroom`,
+/// #12330.)
+#[must_use]
+pub fn parse_vm_stat_available_pages(output: &str) -> Option<u64> {
+    let field = |label: &str| -> Option<u64> {
+        let line = output.lines().find(|l| l.trim_start().starts_with(label))?;
+        let value = line.rsplit(':').next()?.trim().trim_end_matches('.');
+        value.parse().ok()
+    };
+    let free = field("Pages free")?;
+    let inactive = field("Pages inactive")?;
+    Some(free + inactive)
+}
+
 #[cfg(target_os = "macos")]
 fn sample_memory() -> HostResources {
     let page_size: Option<u64> = sysctl("hw.pagesize").and_then(|v| v.parse().ok());
@@ -129,9 +148,7 @@ fn sample_memory() -> HostResources {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| {
-            crate::ram_headroom::parse_vm_stat_available_pages(&String::from_utf8_lossy(&o.stdout))
-        });
+        .and_then(|o| parse_vm_stat_available_pages(&String::from_utf8_lossy(&o.stdout)));
     let swap = sysctl("vm.swapusage").and_then(|v| parse_macos_swapusage(&v));
     HostResources {
         memory_available: pages.zip(page_size).map(|(p, s)| p.saturating_mul(s)),

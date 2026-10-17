@@ -110,7 +110,6 @@ fn every_disposition_maps_and_only_dispatched_is_not_a_skip() {
     assert_eq!(map(Qd::OpenPrBackoff), Some(PickSkipReason::PrOpenSkip));
     assert_eq!(map(Qd::Parked), Some(PickSkipReason::OperatorHold));
     assert_eq!(map(Qd::DeferredCapacity), Some(PickSkipReason::Cap));
-    assert_eq!(map(Qd::DeferredRepoCap), Some(PickSkipReason::Cap));
     assert_eq!(map(Qd::InFlight), Some(PickSkipReason::InFlight));
     assert_eq!(map(Qd::LabelledBlocked), Some(PickSkipReason::Blocked));
 }
@@ -406,7 +405,7 @@ fn every_exclusion_maps_to_a_skip_reason() {
     assert_eq!(map(Exclusion::Pass(P::Claimed)), PickSkipReason::InFlight);
     assert_eq!(map(Exclusion::Pass(P::Operator)), PickSkipReason::OperatorHold);
     assert_eq!(map(Exclusion::Pass(P::CapabilityMissing)), PickSkipReason::HostConstraint);
-    for r in [P::Epic, P::Proposal, P::NoStage] {
+    for r in [P::Epic, P::Proposal, P::NoStage, P::Draft] {
         assert_eq!(map(Exclusion::Pass(r)), PickSkipReason::NoStep);
     }
     // Pass-reason wire names match their serde form.
@@ -414,6 +413,7 @@ fn every_exclusion_maps_to_a_skip_reason() {
         P::HardExclusion,
         P::SharedPr,
         P::NoStage,
+        P::Draft,
         P::CapabilityMissing,
     ] {
         assert_eq!(serde_json::to_value(r).unwrap(), serde_json::json!(r.as_str()));
@@ -469,6 +469,7 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
             closures: vec![PickItemClosure {
                 repo: "o/big".to_string(),
                 after_draw: 4,
+                steps: Vec::new(),
             }],
             excluded: vec![PickItemExclusion {
                 repo: "o/r".to_string(),

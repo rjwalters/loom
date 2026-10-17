@@ -114,56 +114,6 @@ fn a_file_overlap_deferral_carries_its_shared_paths_into_the_record() {
     assert!(json["skipped"][1].get("detail").is_none(), "absent, not null");
 }
 
-/// #11811: each skip carries the daemon's un-collapsed disposition, so the
-/// four caps `cap` lumps together stay distinct, plus its `held_until`.
-#[test]
-fn a_skip_carries_its_uncollapsed_disposition_and_hold_expiry() {
-    let mut s = summary(vec![
-        (1, QueueDisposition::Dispatched),
-        (2, QueueDisposition::DeferredRampCap),
-        (3, QueueDisposition::DeferredCapacity),
-        (4, QueueDisposition::DeferredRepoCap),
-        (5, QueueDisposition::DeferredSaturation),
-        (6, QueueDisposition::DispatchBackoff),
-    ]);
-    let until = Utc.with_ymd_and_hms(2026, 10, 4, 12, 30, 0).unwrap();
-    s.queue[5].plan.held_until = Some(until);
-    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
-    let got: Vec<(u32, PickSkipReason, Option<QueueDisposition>)> = r
-        .skipped
-        .iter()
-        .map(|k| (k.number, k.reason, k.disposition))
-        .collect();
-    assert_eq!(
-        got,
-        vec![
-            (2, PickSkipReason::Cap, Some(QueueDisposition::DeferredRampCap)),
-            (3, PickSkipReason::Cap, Some(QueueDisposition::DeferredCapacity)),
-            (4, PickSkipReason::Cap, Some(QueueDisposition::DeferredRepoCap)),
-            (5, PickSkipReason::Cap, Some(QueueDisposition::DeferredSaturation)),
-            (6, PickSkipReason::Backoff, Some(QueueDisposition::DispatchBackoff)),
-        ]
-    );
-    let json = serde_json::to_value(&r).unwrap();
-    assert_eq!(json["skipped"][0]["reason"], "cap", "reason is unchanged");
-    assert_eq!(json["skipped"][0]["disposition"], "deferred_ramp_cap");
-    assert!(json["skipped"][0].get("held_until").is_none(), "absent, not null");
-    assert_eq!(json["skipped"][4]["disposition"], "dispatch_backoff");
-    assert_eq!(json["skipped"][4]["held_until"], "2026-10-04T12:30:00Z");
-    // Older records (no disposition / held_until) still parse.
-    let mut old = json.clone();
-    for k in old["skipped"].as_array_mut().unwrap() {
-        let k = k.as_object_mut().unwrap();
-        k.remove("disposition");
-        k.remove("held_until");
-    }
-    let parsed: PickDecisionRecord = serde_json::from_value(old).unwrap();
-    assert!(parsed
-        .skipped
-        .iter()
-        .all(|k| k.disposition.is_none() && k.held_until.is_none()));
-}
-
 /// #11811: a halted row names its cause, but only a closed-vocabulary token.
 #[test]
 fn a_halted_skip_carries_only_a_closed_vocabulary_cause() {
@@ -522,6 +472,7 @@ fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
         is_pull_request: is_pr,
         open_sub_issues: None,
         labels_at: None,
+        draft: false,
     };
     let root = Path::new("/stash-test/a");
     record_gate_listing(

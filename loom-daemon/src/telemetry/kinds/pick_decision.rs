@@ -170,10 +170,7 @@ impl PickSkipReason {
         Some(match disposition {
             Qd::Dispatched => return None,
             Qd::InFlight => Self::InFlight,
-            Qd::DeferredCapacity
-            | Qd::DeferredRampCap
-            | Qd::DeferredSaturation
-            | Qd::DeferredRepoCap => Self::Cap,
+            Qd::DeferredCapacity => Self::Cap,
             Qd::DeferredFileOverlap => Self::OverlapChain,
             Qd::DeferredBuildBackoff
             | Qd::RecheckInterval
@@ -203,6 +200,7 @@ impl PickSkipReason {
         use PassReason as P;
         match exclusion {
             Exclusion::PoolExhausted => Self::Quota,
+            Exclusion::MergeInFlight => Self::InFlight,
             Exclusion::BuildBackoff | Exclusion::CoolingDown => Self::Backoff,
             Exclusion::Pass(reason) => match reason {
                 P::Frozen | P::Operator | P::HardExclusion => Self::OperatorHold,
@@ -211,7 +209,7 @@ impl PickSkipReason {
                 P::Sequenced => Self::OverlapChain,
                 P::Blocked => Self::Blocked,
                 P::CapabilityMissing => Self::HostConstraint,
-                P::Epic | P::Proposal | P::NoStage => Self::NoStep,
+                P::Epic | P::Proposal | P::NoStage | P::Draft => Self::NoStep,
                 P::CiPending => Self::Backoff,
             },
         }
@@ -422,7 +420,9 @@ pub struct PickItemRepo {
     pub pool_weight: u64,
 }
 
-/// A repo a per-repo cap took out of the item pool mid-tick.
+/// A repo a per-repo cap took out of the item pool mid-tick, or (with
+/// `steps`) the steps of a repo the tick took out: a repo that started a
+/// Champion merge draws no second one (#12494).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickItemClosure {
     /// Forge `owner/repo`.
@@ -430,6 +430,10 @@ pub struct PickItemClosure {
     /// Draws taken before it closed: it is absent from every draw with an
     /// index at least this.
     pub after_draw: u32,
+    /// The steps closed (`champion_merge`, ...), as `pools[].step` names
+    /// them; empty (and absent on the wire): the whole repo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<String>,
 }
 
 /// One item of the starting pool.

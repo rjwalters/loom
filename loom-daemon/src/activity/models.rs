@@ -77,61 +77,6 @@ pub struct AgentOutput {
     pub metadata: Option<String>,
 }
 
-/// Agent productivity metrics for a task
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct AgentMetric {
-    pub id: Option<i64>,
-    pub terminal_id: String,
-    pub agent_role: String,
-    pub agent_system: String,
-    pub task_type: Option<String>,
-    pub github_issue: Option<i32>,
-    pub github_pr: Option<i32>,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub wall_time_seconds: Option<i64>,
-    pub active_time_seconds: Option<i64>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub total_tokens: i64,
-    pub estimated_cost_usd: f64,
-    pub status: String,
-    pub outcome_type: Option<String>,
-    pub test_failures: i32,
-    pub ci_failures: i32,
-    pub commits_count: i32,
-    pub lines_changed: i32,
-    pub context: Option<String>,
-}
-
-/// Token usage record for a single API request
-///
-/// Enhanced to track cache tokens, duration, and provider for LLM resource usage
-/// analytics (Issue #1013).
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct TokenUsage {
-    pub id: Option<i64>,
-    pub input_id: Option<i64>,
-    pub metric_id: Option<i64>,
-    pub timestamp: DateTime<Utc>,
-    pub prompt_tokens: i64,
-    pub completion_tokens: i64,
-    pub total_tokens: i64,
-    pub model: Option<String>,
-    pub estimated_cost_usd: f64,
-    // Enhanced fields for resource tracking (Issue #1013)
-    /// Cache read tokens (prompt caching - reduces input cost)
-    pub tokens_cache_read: Option<i64>,
-    /// Cache write tokens (prompt caching - initial cache creation)
-    pub tokens_cache_write: Option<i64>,
-    /// API response time in milliseconds
-    pub duration_ms: Option<i64>,
-    /// LLM provider: 'anthropic', 'openai', 'google', etc.
-    pub provider: Option<String>,
-}
-
 /// Combined activity entry (input + output)
 /// Used for displaying terminal activity history in UI
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,9 +94,6 @@ pub struct ActivityEntry {
     pub exit_code: Option<i32>,
     pub output_timestamp: Option<DateTime<Utc>>,
 }
-
-/// Type alias for productivity summary: (`agent_system`, `tasks_completed`, `avg_minutes`, `avg_tokens`, `total_cost`)
-pub type ProductivitySummary = Vec<(String, i64, f64, f64, f64)>;
 
 /// Git changes associated with a prompt
 /// Links individual prompts to the git commits/changes they caused
@@ -239,30 +181,6 @@ pub struct TestResults {
 pub struct LintResults {
     pub lint_errors: i32,
     pub format_errors: i32,
-}
-
-/// PR rework statistics for tracking review cycles
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PrReworkStats {
-    /// Average number of rework cycles for PRs that needed changes
-    pub avg_rework_count: f64,
-    /// Maximum rework count seen for any PR
-    pub max_rework_count: i32,
-    /// Number of PRs that required at least one rework cycle
-    pub prs_with_rework: i64,
-    /// Total number of PRs with review tracking
-    pub total_prs_tracked: i64,
-}
-
-/// Prompt-to-test success correlation statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PromptSuccessStats {
-    /// Total number of prompts that have test results
-    pub total_prompts_with_tests: i64,
-    /// Number of prompts where all tests passed (failed = 0, passed > 0)
-    pub prompts_with_all_passing: i64,
-    /// Average test pass rate across all prompts (passed / (passed + failed))
-    pub avg_test_pass_rate: f64,
 }
 
 /// Quality metrics record for tracking test outcomes and code quality

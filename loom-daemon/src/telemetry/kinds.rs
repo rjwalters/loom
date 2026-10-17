@@ -162,11 +162,14 @@ pub mod auto_update_tick;
 
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
+/// `daemon.run_state_request` (#12546) — who issued a pause/drain/stop/restart.
+pub mod run_state_request;
 /// `write_scope.refused` (#12168) — a daemon write the #9548 gate refused.
 pub mod write_scope_refused;
 
 /// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
 pub mod checkout_external_change;
+pub mod roster_change;
 
 /// `host.export` (#11124).
 pub mod host_export;
@@ -182,6 +185,9 @@ pub mod scope_memory;
 
 /// `operator.presence` (#11563) — an operator session's keyboard presence.
 pub mod operator_presence;
+
+/// `checkout.freshness` (#12509) — one managed checkout, measured against GitHub's tip.
+pub mod checkout_freshness;
 
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
 pub mod pass;
@@ -468,6 +474,12 @@ macro_rules! telemetry_kind_table {
             /// it made unreachable. OTLP-only. See [`checkout_external_change`].
             CheckoutExternalChange = "checkout.external_change" => $crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+            /// The roster pass changed this host's workspace registry, or could
+            /// not register a desired repo because it is not cloned (Issue
+            /// #12322). Emitted whatever the repo's queue holds. OTLP-only. See
+            /// [`roster_change`].
+            RosterChange = "roster.change" => $crate::telemetry::kinds::roster_change::RosterChangeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One curation completion's blind difficulty estimate (#11608).
             IssueEstimate = "issue.estimate" => $crate::telemetry::kinds::issue_estimate::IssueEstimateRecord,
@@ -490,6 +502,12 @@ macro_rules! telemetry_kind_table {
             DaemonExit = "daemon.exit" => $crate::telemetry::kinds::daemon_exit::DaemonExitRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
+            /// One run-state IPC request (pause, drain, abort-drain, stop,
+            /// restart) and its caller, on receipt (#12546). OTLP-only. See
+            /// [`run_state_request`].
+            RunStateRequest = "daemon.run_state_request" => $crate::telemetry::kinds::run_state_request::RunStateRequestRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
             /// One agent scope's applied memory limit, its source, the peak
             /// and the OOM kills, when the scope ends (#12241). OTLP-only.
             /// See [`scope_memory`].
@@ -501,6 +519,12 @@ macro_rules! telemetry_kind_table {
             /// gauges only. See [`host_status`].
             HostStatus = "host.status" => $crate::telemetry::kinds::host_status::HostStatusRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Gauges, native: false;
+
+            /// One managed checkout, measured against the remote tip the
+            /// fast-forward pass already learned (#12509). OTLP-only. See
+            /// [`checkout_freshness`].
+            CheckoutFreshness = "checkout.freshness" => $crate::telemetry::kinds::checkout_freshness::CheckoutFreshnessRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

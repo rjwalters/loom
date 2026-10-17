@@ -189,19 +189,32 @@ fn run_ordered_drops_skipped_jobs_and_runs_setup_per_worker() {
 fn run_ordered_takes_jobs_in_order_so_a_deadline_skips_from_the_end() {
     // The walk admits under one lock in take order: with a budget of 3
     // admissions, exactly the first three jobs run, on any worker count.
+    // `run_ordered` hands jobs out in order, but a worker that took job 2 can
+    // still lose the race to the lock against the one that took job 3, so the
+    // test gates each job on `entered` (a gate, not a sleep): job `pos`
+    // reaches the admission lock only after jobs `0..pos` have left it.
+    use std::sync::atomic::{AtomicUsize, Ordering};
     for workers in [1, 4] {
         let admitted = std::sync::Mutex::new(0usize);
+        let entered = AtomicUsize::new(0);
         let out = run_ordered(
             (0..10).collect::<Vec<usize>>(),
             workers,
             || (),
-            |_, j| {
-                let mut a = admitted.lock().unwrap();
-                if *a >= 3 {
-                    return None;
+            |pos, j| {
+                while entered.load(Ordering::Acquire) != pos {
+                    std::thread::yield_now();
                 }
-                *a += 1;
-                Some(j)
+                let admit = {
+                    let mut a = admitted.lock().unwrap();
+                    let admit = *a < 3;
+                    if admit {
+                        *a += 1;
+                    }
+                    admit
+                };
+                entered.fetch_add(1, Ordering::Release);
+                admit.then_some(j)
             },
         );
         assert_eq!(out.iter().map(|(_, j)| *j).collect::<Vec<_>>(), vec![0, 1, 2]);
@@ -219,6 +232,27 @@ fn gather_concurrency_reads_a_bounded_positive_integer() {
     for bad in [json!(0), json!(-3), json!("8"), json!(2.5)] {
         assert_eq!(gather_concurrency_from(&at(bad)), DEFAULT_GATHER_CONCURRENCY);
     }
+}
+
+/// #12307: only the Direct backend lists per repo, so only it takes the key.
+#[test]
+fn the_mirror_worklist_ignores_gather_concurrency() {
+    use serde_json::json;
+    let mirror = |discovery: &str| {
+        json!({
+            "forge": { "mirror": {
+                "origin": "https://events.example.com",
+                "keyRef": "file:/k",
+                "discovery": discovery
+            } },
+            "autonomous": { "workFinder": { "gatherConcurrency": 12 } }
+        })
+    };
+    assert_eq!(gather_concurrency_for(&mirror("worklist")), 1);
+    assert_eq!(gather_concurrency_for(&mirror("direct")), 12);
+    assert_eq!(gather_concurrency_for(&mirror("per_call")), 12);
+    let standalone = json!({ "autonomous": { "workFinder": { "gatherConcurrency": 3 } } });
+    assert_eq!(gather_concurrency_for(&standalone), 3);
 }
 
 #[test]

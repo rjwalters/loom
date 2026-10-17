@@ -2000,6 +2000,10 @@ mod verdict_stale_comment;
 /// leaving a single dispatch call in the match arm here.
 mod verdict_invalidation;
 
+/// Return a PR held only by a machine CI gate to review once its exact head is
+/// green (#10178) — a sibling file per the file-size ratchet.
+pub(crate) mod ci_gate_recovery;
+
 /// The `Keep(Unverifiable)` arm of [`forge::reconcile_pr_verdicts`]: anchor an
 /// unmarked rejection (#6319), re-queue an unmarked approval (#9258) — a
 /// sibling file per the file-size ratchet.
@@ -2142,7 +2146,10 @@ pub mod forge {
         }
         let n = issue.to_string();
         let out = gh_call::output(
-            gh_call::read_own_write("claim.issue_labels", gh_bin, root)
+            // #12555: on a reader, like every daemon read. A reader lagging
+            // the reclaim edit reads as "partially applied", which costs one
+            // idempotent retry of the edit (`verify_reclaim_labels`).
+            gh_call::read("claim.issue_labels", gh_bin, root)
                 .args(["issue", "view", &n, "--json", "labels"])
                 .args(gh_call::loom_repo_flag()),
         )?;

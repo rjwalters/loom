@@ -5,8 +5,8 @@
 //! narrative table — the whole point of #9597 is that `render`'s per-key
 //! classification cannot silently drift out of sync with what the daemon
 //! actually does, the way the doc table already has (`autonomous.workFinder`.
-//! `maxConcurrent` / `maxConcurrentPerRepo` / `extraSkipLabels` all went live
-//! in #9060/#9090/pre-existing work without that doc ever being updated —
+//! `maxConcurrent` / `extraSkipLabels` both went live
+//! in #9060/pre-existing work without that doc ever being updated —
 //! exactly the failure this module exists to stop happening again).
 //!
 //! # The mechanical test
@@ -71,25 +71,13 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Per-repo approval/merge policy (#11674): `merge_policy::declared` is
     // read from the effective config on every `fleet.state` export.
     ("repos", Reloadability::Live),
-    // Re-read every multi-workspace work-finder tick since #9060 (the
-    // operator ceiling) / #9090 (the per-repo cap) —
-    // `ConfiguredMaxReloader::refresh()` in
+    // Re-read every multi-workspace work-finder tick since #9060 (the cap,
+    // and since #12406 the only cap) — `ConfiguredMaxReloader::refresh()` in
     // `loom-daemon/src/work_finder/configured_max.rs`, consumed from
-    // `spawn_multi_work_finder_task`'s tick body.
+    // `spawn_multi_work_finder_task`'s tick body. Its `hyperparameters.dispatch`
+    // home is overlaid inside that same `read_work_finder_config` call.
     ("autonomous.workFinder.maxConcurrent", Reloadability::Live),
-    ("autonomous.workFinder.maxConcurrentPerRepo", Reloadability::Live),
-    // #12090: the per-tick admission (ramp) cap rides the same per-tick read
-    // (`ConfiguredMaxReloader::max_admissions_per_tick`), as does its
-    // `hyperparameters.dispatch` home (`apply_hyperparams` overlays it, and
-    // `maxConcurrent`, inside that same `read_work_finder_config` call).
-    ("autonomous.workFinder.maxAdmissionsPerTick", Reloadability::Live),
-    ("hyperparameters.dispatch.maxAdmissionsPerTick", Reloadability::Live),
     ("hyperparameters.dispatch.maxConcurrent", Reloadability::Live),
-    // #12090: the brake's and breaker's thresholds are pushed into their
-    // process-global handles every tick by `ConfiguredMaxReloader::refresh()`
-    // (`admission_brake::global_reload`, `host_breaker::global_reload`).
-    ("autonomous.workFinder.saturationBrake", Reloadability::Live),
-    ("autonomous.hostBreaker", Reloadability::Live),
     // Re-read fresh on every candidate-list call —
     // `WorkDispatcher::extra_skip_labels` in
     // `loom-daemon/src/work_finder/forge.rs` reads
@@ -144,13 +132,78 @@ const TABLE: &[(&str, Reloadability)] = &[
     // the timer task is spawned — including the very config this `render`
     // itself is driven by.
     ("fleet", Reloadability::RestartRequired),
+    // ...except the captain declaration (#12423): the gate is re-evaluated on
+    // every ci-telemetry tick (`ci_telemetry::gate_tick` →
+    // `fleet_captain::arm_singleton_job`) and on every observability export
+    // (`resolve_gate_for_root` in `observability/collector.rs`).
+    ("fleet.captain", Reloadability::Live),
+    // Audited blocks (#12423). Each entry names the call site that decided it.
+    //
+    // `read_auto_update_config` runs once from `auto_update::loop_mode::start`,
+    // which `daemon_service.rs` calls once per process.
+    ("autonomous.autoUpdate", Reloadability::RestartRequired),
+    // `daemon_service.rs` reads it once at bring-up to decide whether the
+    // reaper loop is spawned at all (and its interval); the per-tick re-read
+    // inside the loop cannot start a loop that was never spawned.
+    ("autonomous.worktreeReaper", Reloadability::RestartRequired),
+    // `observability::read_config` feeds `observer_tasks::spawn` once at
+    // bring-up (exporter wiring, `observability::spawn_task`).
+    ("observability", Reloadability::RestartRequired),
+    // `ci_telemetry::spawn_task_on` resolves the config once (owners,
+    // interval, excluded repos) before the ticker is built; only the
+    // captain gate inside the tick is live (see `fleet.captain`).
+    ("autonomous.ciTelemetry", Reloadability::RestartRequired),
+    // No daemon consumer: `autonomous.eta` is a retired block
+    // (`signoz_read::RETIRED_CONFIG_KEY`, `config_resolver`), only reported as
+    // ignored. Nothing caches it, so no restart changes anything.
+    ("autonomous.eta", Reloadability::Live),
+    // Retired block too (`work_finder::operator_priority::warn_retired_config`
+    // only warns about it); there is no value to pick up.
+    ("autonomous.operatorPriority", Reloadability::Live),
+    // Resolved per dispatch: `runtime_preference::resolve_for_dispatch` takes
+    // the root and reads the effective config on every admission.
+    ("runtimes", Reloadability::Live),
+    // `forge.gateway` is installed once into the process-wide gateway handles
+    // (`forge_gateway` `DAEMON`/`FRONT` `OnceLock`s), so the block defaults to
+    // restart-required; its per-call readers override below.
+    ("forge", Reloadability::RestartRequired),
+    // Read from the effective config on each use:
+    // `credential_preflight::config_github_app_mint_timeout_secs` and
+    // `forge_read_pool` (`resolve_effective_config` per read).
+    ("forge.githubApp", Reloadability::Live),
+    ("forge.githubAppReadPool", Reloadability::Live),
+    // `safehouse::resolve_config` is called once by
+    // `WorkspacePool::start_safehouse_narration` / peer-claim coordination at
+    // start, and the sink/coordinator it builds is held for the process.
+    ("safehouse", Reloadability::RestartRequired),
+    // `codesign.identity` is resolved fresh each time it is needed
+    // (`health::codesign::assess_codesign_identity`, the provisioning
+    // scripts); the daemon holds no copy.
+    ("codesign", Reloadability::Live),
+    // Read from the workspace's effective config on every claim, every
+    // reaper heartbeat and every step tick's budget (#12450) —
+    // `fleet_dispatch::endpoint`, never cached.
+    ("fleetDispatch", Reloadability::Live),
+    // No `loom-daemon` process reads it: ratification keys are consumed by
+    // the branch-update/sign-off scripts, fresh on each invocation.
+    ("ratification", Reloadability::Live),
 ];
 
-/// Classify one dotted config path. Unmatched paths default conservatively to
-/// [`Reloadability::RestartRequired`] — see the module doc's "mechanical
-/// test".
+/// A path with any `_`-prefixed segment is an annotation (`fleet._sync_note`),
+/// not a knob: nothing reads it, so it never needs a restart.
+fn is_annotation(path: &str) -> bool {
+    path.split('.').any(|segment| segment.starts_with('_'))
+}
+
+/// Classify one dotted config path. A `_`-prefixed segment at any depth marks
+/// an annotation and is always [`Reloadability::Live`]. Other unmatched paths
+/// default conservatively to [`Reloadability::RestartRequired`] — see the
+/// module doc's "mechanical test".
 #[must_use]
 pub fn classify(path: &str) -> Reloadability {
+    if is_annotation(path) {
+        return Reloadability::Live;
+    }
     TABLE
         .iter()
         .filter(|(prefix, _)| path == *prefix || path.starts_with(&format!("{prefix}.")))
@@ -178,6 +231,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fleet_dispatch_flag_and_url_are_live() {
+        assert_eq!(classify("fleetDispatch.enabled"), Reloadability::Live);
+        assert_eq!(classify("fleetDispatch.url"), Reloadability::Live);
+    }
+
+    #[test]
     fn role_runner_subtree_is_live() {
         assert_eq!(classify("autonomous.roleRunner"), Reloadability::Live);
         assert_eq!(classify("autonomous.roleRunner.enabled"), Reloadability::Live);
@@ -185,9 +244,9 @@ mod tests {
     }
 
     #[test]
-    fn work_finder_ceiling_and_per_repo_cap_are_live() {
+    fn work_finder_ceiling_is_live() {
         assert_eq!(classify("autonomous.workFinder.maxConcurrent"), Reloadability::Live);
-        assert_eq!(classify("autonomous.workFinder.maxConcurrentPerRepo"), Reloadability::Live);
+        assert_eq!(classify("hyperparameters.dispatch.maxConcurrent"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.extraSkipLabels"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.redFixEscalateAfterSecs"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.landedPrefilter"), Reloadability::Live);
@@ -201,29 +260,6 @@ mod tests {
             classify("hyperparameters.dispatch.tickIntervalSecs"),
             Reloadability::RestartRequired
         );
-    }
-
-    /// #12090: the work-finder tuning keys hot-reload like `maxConcurrent`.
-    #[test]
-    fn work_finder_tuning_keys_are_live() {
-        for path in [
-            "autonomous.workFinder.maxAdmissionsPerTick",
-            "hyperparameters.dispatch.maxAdmissionsPerTick",
-            "hyperparameters.dispatch.maxConcurrent",
-            "autonomous.workFinder.saturationBrake",
-            "autonomous.workFinder.saturationBrake.enabled",
-            "autonomous.workFinder.saturationBrake.loadPerCoreHold",
-            "autonomous.workFinder.saturationBrake.cpuBusyHold",
-            "autonomous.workFinder.saturationBrake.sustainTicks",
-            "autonomous.workFinder.saturationBrake.starvationWarnSecs",
-            "autonomous.workFinder.saturationBrake.starvationEscapeSecs",
-            "autonomous.hostBreaker.enabled",
-            "autonomous.hostBreaker.loadPerCoreTrip",
-            "autonomous.hostBreaker.sustainTicks",
-            "autonomous.hostBreaker.cooldownSecs",
-        ] {
-            assert_eq!(classify(path), Reloadability::Live, "{path}");
-        }
     }
 
     #[test]
@@ -240,6 +276,53 @@ mod tests {
     }
 
     #[test]
+    fn underscore_segment_at_any_depth_is_live() {
+        for path in [
+            "fleet._sync_note",
+            "_note",
+            "autonomous.workFinder.enabled._why",
+            "somethingBrandNew._x.knob",
+            "fleet._a._b",
+        ] {
+            assert_eq!(classify(path), Reloadability::Live, "{path}");
+        }
+        // An underscore that is not at a segment start is a normal key.
+        assert_eq!(classify("fleet.sync_interval"), Reloadability::RestartRequired);
+    }
+
+    #[test]
+    fn fleet_captain_overrides_the_fleet_prefix() {
+        assert_eq!(classify("fleet.captain"), Reloadability::Live);
+    }
+
+    #[test]
+    fn every_audited_block_has_an_explicit_entry() {
+        use Reloadability::{Live, RestartRequired};
+        for (path, want) in [
+            ("autonomous.autoUpdate.enabled", RestartRequired),
+            ("autonomous.worktreeReaper.enabled", RestartRequired),
+            ("observability.enabled", RestartRequired),
+            ("autonomous.ciTelemetry.intervalSecs", RestartRequired),
+            ("autonomous.eta.enabled", Live),
+            ("autonomous.operatorPriority.propagate", Live),
+            ("runtimes.default", Live),
+            ("forge.gateway", RestartRequired),
+            ("forge.githubApp.mintTimeoutSeconds", Live),
+            ("forge.githubAppReadPool", Live),
+            ("safehouse.enabled", RestartRequired),
+            ("codesign.identity", Live),
+            ("ratification.key", Live),
+        ] {
+            assert_eq!(classify(path), want, "{path}");
+            let block = path.split('.').next().unwrap();
+            assert!(
+                TABLE.iter().any(|(prefix, _)| prefix.starts_with(block)),
+                "{block} has no explicit entry"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_path_defaults_conservatively_to_restart_required() {
         assert_eq!(classify("worktree.root"), Reloadability::RestartRequired);
         assert_eq!(classify("somethingBrandNew.knob"), Reloadability::RestartRequired);
@@ -250,7 +333,7 @@ mod tests {
         // A sibling key that merely shares a string prefix with a specific
         // live knob (not a `.`-bounded ancestor) must not falsely match.
         assert_eq!(
-            classify("autonomous.workFinder.maxConcurrentPerRepoLimitFoo"),
+            classify("autonomous.workFinder.maxConcurrentLimitFoo"),
             Reloadability::RestartRequired
         );
     }

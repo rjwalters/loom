@@ -68,7 +68,7 @@ pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
 pub use paged::{walk_enabled as page_walk_enabled, WALK_ENV as PAGE_WALK_ENV};
 pub use purpose::ForgePurpose;
-pub use reader_route::{READ_SHED_ENV, SHED_MARKER};
+pub use reader_route::SHED_MARKER;
 
 #[cfg(test)]
 mod tests;
@@ -320,7 +320,8 @@ pub struct GhInvocation {
     stdin_input: Vec<u8>,
     /// Never route this read to a reader App (#9872).
     writer_only: bool,
-    /// Never run this read on the writer (#12389): shed it instead.
+    /// This read may never run on the ambient writer credential (#12555):
+    /// [`GhInvocation::reader_only`].
     reader_only: bool,
     /// The identity role the accounting row records; `None` = writer.
     role: Option<crate::forge_identity::IdentityRole>,
@@ -513,34 +514,68 @@ impl GhInvocation {
     /// Keep this read on the writer credential (#9872): for a read whose
     /// answer depends on **who** asks — a permission or write-scope probe,
     /// `viewer`, `/user` — which a reader App would answer for itself.
+    ///
+    /// Has no effect on a [`GhInvocation::reader_only`] read: those can
+    /// never be pinned to the writer (#12555).
     #[must_use]
     pub fn writer_identity(mut self) -> Self {
-        self.writer_only = true;
+        self.writer_only = !self.reader_only;
         self
     }
 
-    /// Never send this read to the writer (#12389, operator ruling #12394:
-    /// the writer is not used for reads). It runs on the gateway or a reader
-    /// App; when none can serve it — no pool, every reader withdrawn or out of
-    /// budget, or a reader that does not cover the repo — it is shed
-    /// ([`GhCompletion::Shed`], "no answer") and the caller defers. Every read
-    /// a CLI subcommand makes with a read route adopted is reader-only
-    /// ([`crate::forge_gateway::cli_reads_reader_only`]). `LOOM_READ_SHED=0`
-    /// lifts it (break-glass).
+    /// This read is served by a reader App or the read gateway, or shed — it
+    /// never runs on the ambient writer credential (#12555, the #12394
+    /// ruling: "the writer should not be used for reads"). Set by the
+    /// in-process daemon read helpers (`claim_reconciliation::gh_call::read`,
+    /// `SweepRegistry::gh_inv(.., AccessIntent::Read, ..)`).
+    ///
+    /// - [`GhInvocation::writer_identity`] is ignored, before or after this.
+    /// - A read the facade cannot route to a reader (no repo derivable, or
+    ///   the checkout's sources disagree) is shed with the usual
+    ///   `forge.read.shed` telemetry instead of being sent to the writer.
+    /// - The one exception is the one [`GhInvocation::execute`] already
+    ///   makes for every read: a host with **no reader pool and no gateway at
+    ///   all**, where the writer is the only credential there is.
+    /// - A credential the site chose itself
+    ///   ([`GhInvocation::gh_config_dir`], [`GhInvocation::identity_role`])
+    ///   is left alone.
+    ///
+    /// Meaningful for [`AccessIntent::Read`] only.
     #[must_use]
     pub fn reader_only(mut self) -> Self {
         self.reader_only = true;
+        self.writer_only = false;
         self
     }
 
-    /// Classify this read for reader exhaustion (W4-C). The default,
-    /// [`ReadClass::Gate`], keeps today's writer fallback; a
-    /// [`ReadClass::Hygiene`] or [`ReadClass::Observability`] read is shed
-    /// ([`GhCompletion::Shed`]) instead of spending the writer's bucket when
-    /// every reader for its owner and resource is withdrawn. Mark a read
-    /// non-`Gate` only when its consumer maps "no answer" to skip / unknown
-    /// and nothing it decides (a dispatch, claim, merge, reap, label flip)
-    /// rests on it.
+    /// Whether [`GhInvocation::reader_only`] is set.
+    #[must_use]
+    pub fn is_reader_only(&self) -> bool {
+        self.reader_only
+    }
+
+    /// Name the repository this read is about when its argv does not (a
+    /// GraphQL query with a literal owner and name): the reader attempt is
+    /// routed for `slug`, exactly like a derived route (W4-C). Never changes
+    /// the target, so a writer attempt's environment is unchanged. For a
+    /// read only: the derivation's mutation guard does not see a GraphQL
+    /// document, so never set it on a `mutation`.
+    #[must_use]
+    pub fn reader_repo(mut self, slug: &str) -> Self {
+        self.route_slug = Some(slug.to_string());
+        self
+    }
+
+    /// Classify this read for the reader router (W4-C). Every class is shed
+    /// ([`GhCompletion::Shed`]) when no reader can serve it: the writer is
+    /// never used for reads (#12394). The class decides how early: the
+    /// default, [`ReadClass::Gate`], takes any usable reader whatever its
+    /// projected budget, while a [`ReadClass::Hygiene`] or
+    /// [`ReadClass::Observability`] read also needs headroom (the router's
+    /// `shedPct` reserve), so it is shed first and the readers' last budget
+    /// is kept for decision-gating reads. Mark a read non-`Gate` only when
+    /// its consumer maps "no answer" to skip / unknown and nothing it decides
+    /// (a dispatch, claim, merge, reap, label flip) rests on it.
     #[must_use]
     pub fn read_class(mut self, class: ReadClass) -> Self {
         self.read_class = class;
@@ -810,16 +845,8 @@ impl GhInvocation {
         let lookup = move |req: &crate::forge_identity::RouteRequest<'_>| {
             route(req, std::time::SystemTime::now())
         };
-        // `LOOM_READ_ROUTING=legacy`: the pre-W4-C path exactly — no
-        // derivation, no read class, the unconditional writer fallback.
-        if crate::forge_identity::RoutingMode::current()
-            == crate::forge_identity::RoutingMode::Legacy
-        {
-            return self.execute_routed(&lookup, &reader_route::withdraw_reader);
-        }
-        let policy = reader_route::ShedPolicy::current();
         self.with_derived_route()
-            .execute_routed_v2(&lookup, &reader_route::withdraw_reader, policy)
+            .execute_routed_v2(&lookup, &reader_route::withdraw_reader)
     }
 
     /// A read the tick deadline stopped (#12074): shed, nothing sent.
@@ -936,6 +963,10 @@ impl GhInvocation {
 #[cfg(test)]
 #[path = "test_routing.rs"]
 pub(crate) mod test_routing;
+
+#[cfg(test)]
+#[path = "test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "w4c_sites_tests.rs"]

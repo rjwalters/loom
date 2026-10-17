@@ -86,7 +86,7 @@ The design builds on these and must not duplicate them.
 | Open-PR release hold | #11876, `4809ef7ed` | **On by default.** On a verified open linked PR a release writes no label, so the issue keeps `loom:building` while its PR is open (`ClaimRelease::HeldByOpenPr`, `sweep_registry/restore_to_ready.rs`). `LOOM_RELEASE_OPEN_PR_VETO=0` switches it off. |
 | Discovery mirror seam | #11845 | `forge_mirror/discovery.rs:36-42, :215-247`: single-label listings for `WorkFinder` and `StageDwell`, with REST fallback |
 | Shared ETag all-open walk | `forge_listing::list_open_issues_cached_all_as` (`:248`) | Used by `observability/ops/stage_queue.rs:115` and the intake singleton |
-| Merge-queue handoff | #9978 A/B, `forge_merge_queue/` | `QUEUE_EXECUTION_ENABLED = false` (`forge_merge_queue/mod.rs:69`). Champion calls `forge merge-queue step` before every merge (#10256 B3) |
+| Merge-queue handoff | #9978 A/B, `forge_merge_queue/` | `QUEUE_EXECUTION_ENABLED = true` (`forge_merge_queue/mod.rs`), opt-in per repo via `champion.mergeMode=queue`. Champion calls `forge merge-queue step` before every merge (#10256 B3) |
 
 ## 4. The model
 
@@ -109,7 +109,7 @@ The classifier (`work_finder/step_item.rs`, `classify`) checks these rows in ord
 | linked PR `loom:changes-requested` | Doctor |
 | linked PR `loom:review-requested` | Judge |
 | linked PR `loom:pr` | Champion merge |
-| PR with no workflow label | none |
+| PR with no workflow label | Champion triage (#12499): it adds `loom:review-requested`, or blocks, or asks the operator; a draft: none (`draft`) |
 | issue `loom:epic` | none (Champion's non-item run) |
 | `loom:architect` / `loom:hermit` / `loom:auditor` proposal, not curated or promoted | none (Champion's non-item run) |
 | `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
@@ -142,9 +142,9 @@ Notes on the table:
    - **`actionable` ∈ {0, 1}.** Set to 0 for each "none" row in §4.1, and for a Builder step in a repo whose build backoff is engaged. Red-main fixes are exempt (`work_finder/build_backoff.rs:594`). Also 0 for a step whose role's token pool is exhausted (the `record_role_tick_pool_exhausted` state): the spawn would be refused, so drawing it would only burn the redraw budget (#11896).
    - **`priority`:** red-main ×50, `loom:very-important` ×8, `loom:important` ×3. The `vi_cap` demotion (`work_finder/vi_cap.rs:1-24`) runs over the whole item list first.
    - **`age`** = `1 + min(stage_age_days, 90) / 30`.
-   - **Seed:** `loom-draw/v3` = `sha256("loom-draw/v3:"+minute+":"+host+":"+tick_counter+":"+draw_index)` (`v2` also keyed the workspace). Draws are without replacement and replayable from `pick.decision`, which logs the exponents, each repo's `w_repo`, `in_flight` and `n_items`, the starting pool (in pool order, with item weights), the repos a per-repo cap closed mid-tick, and every draw's roll and picked index.
+   - **Seed:** `loom-draw/v3` = `sha256("loom-draw/v3:"+minute+":"+host+":"+tick_counter+":"+draw_index)` (`v2` also keyed the workspace). Draws are without replacement and replayable from `pick.decision`, which logs the exponents, each repo's `w_repo`, `in_flight` and `n_items`, the starting pool (in pool order, with item weights), the repos closed mid-tick (an owner whose claim cannot be verified, #12260), and every draw's roll and picked index.
    - The weights are numeric hyperparameters in the strict block (`w_repo` excepted: it stays in the roster).
-4. **Gate and claim** for the step's role: saturation, ramp cap, per-repo RAM/disk cap, then the claim (§5). **On a pass, draw again**: at most 8 draws fill one slot and at most 32 passes are taken in one tick (`step_dispatch/tick.rs`, `MAX_DRAWS_PER_SLOT`, `MAX_PASSES_PER_TICK`). Saturation and the ramp cap are host-wide, so they bound how many slots the tick fills rather than refusing one draw; a repo over its RAM, disk or count cap leaves the draw for the rest of the tick. Each pass is counted by its reason, including `claim_lost`, on `pick.decision` (`refused_<reason>` beside the weight-0 counts) and, for the pool gate and the claim, in the outcome ledger.
+4. **Gate and claim** for the step's role: the pool gate, then the claim (§5). There is no capacity gate beyond free slots: #12406 removed the saturation brake, the ramp cap and the per-repo disk cap (the RAM term went in #12330). **On a pass, draw again**: at most 8 draws fill one slot and at most 32 passes are taken in one tick (`step_dispatch/tick.rs`, `MAX_DRAWS_PER_SLOT`, `MAX_PASSES_PER_TICK`). Each pass is counted by its reason, including `claim_lost`, on `pick.decision` (`refused_<reason>` beside the weight-0 counts) and, for the pool gate and the claim, in the outcome ledger.
    - Before the draw, an item this host runs (a live sweep or step) or a peer advertises a live claim on is a `claimed` pass, and while a peer's Champion merge is in flight in the repo every other merge step there is too (`SweepRegistry::draw_claims`, `PeerClaimView::merge_in_flight_at`). The classifier's `claimed` row reads labels only, and a non-Builder step labels its item late.
 5. **Spawn** `/loom:<role> <N>` (§4.4).
 
@@ -159,7 +159,7 @@ The stage-entry provider is a three-source adapter, tried in order:
 
 ### 4.4 Slots and spawn
 
-- **Slots.** Steps draw from `workFinder.maxConcurrent` on every root: the tick fills `maxConcurrent - occupancy` slots, at most `max_admissions_per_tick` of them, none while the saturation brake holds. The role runner keeps its own ceiling for the non-item roles until the two budgets merge (#11911).
+- **Slots.** Steps draw from `workFinder.maxConcurrent` on every root: the tick fills every one of its `maxConcurrent - occupancy` free slots (#12406). The role runner keeps its own ceiling for the non-item roles until the two budgets merge (#11911).
 - **The tick** is `step_dispatch::driver::StepDriver::tick`, called from the work-finder loop in place of the `loom:issue` finder. Per root it lists and classifies (`step_dispatch::gather`), weighs with the registry's live state (`step_cooldowns`, the Champion ladder's due times, `pool_exhausted_roles`), and runs `step_dispatch::tick::run`. The seed's `workspace` input is the forge slug `pick.decision` names as `repo`.
 - **Resolvers.** A step uses the role runner's resolvers for its role (`role_runner/model_resolution.rs`, `resolve_role_runner_model` and `resolve_role_runner_effort`) and admits against the pool of the resolved runtime. Only Builder steps keep the per-issue experiment arm (`sweep_registry/model_dispatch.rs`).
 - **The lock.** The spawn (`SweepRegistry::spawn_step_unlocked`) releases the registry lock around the runtime admission's private-clone containment (#8787), a non-Builder step's pre-claim and the account-selection poll, as `private_dispatch::prepare` does for sweeps.
@@ -204,7 +204,7 @@ A step that wrote its verdict and died still holding its claim only loses the cl
 | landed (`verdict:closed`) | Reclassify the item. No more Builder steps. |
 | `noop` | Cooldown per `(item, step)` |
 | fast `failed` | Builder: the #11872 ladder. Every other step (Curator, Champion promote, Judge, Doctor, Champion merge): a ledger-local doubling window capped at 24 h, never the issue quarantine, whose release restores `loom:issue` (#11969) |
-| Champion re-evaluation left the item held or blocked | Ladder from 6 h to 7 d, **stored on the forge**: a `<!-- loom:reeval step=… rung=… next=… -->` line in the item's body, beside its park record or under its hold marker |
+| Champion re-evaluation left the item held or blocked | Ladder of 1, 1, 1, 2, 4, 8, 24, 48, 96 h, then 7 d (#12513; 6 h → 7 d before it), **stored on the forge**: a `<!-- loom:reeval step=… rung=… next=… -->` line in the item's body, beside its park record or under its hold marker. A marker whose `next=` is further off than its rung's delay (written under the old ladder) is due now, once. Not counted toward the repeat cap, unless the forge write failed: then the rung's window is held locally (restored after a restart) and the run counts (#12516) |
 | `refused`, `pool_gate` or `claimed` | A short cooldown per `(item, step)`, in force before the next tick |
 | `refused`, `claim_lost` | Redraw; counted. A second in a row on the same `(item, step)` arms the refusal cooldown, doubling to 24 h (#11969) |
 | any other `refused` | Reclassify the item |

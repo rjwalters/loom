@@ -268,6 +268,11 @@ unset ⇒ default **3** (`.loom/docs/daemon-reference.md`).
 | Token axis | `healthy × perTokenConcurrency` | 1 of 24 (ranking) / 1 of 21 (live 7 healthy) | 3 of 24 / 3 of 21 | 12.5% / **14.3%** |
 | Per-tick ramp (`maxAdmissionsPerTick` = 3) | new sweeps admitted per tick | 1 of 3 | **3 of 3** | one fan-out issue **saturates an entire tick's admission budget** |
 
+> **Note (#12406).** This is a 2026-07-31 record. The disk term and the
+> per-tick ramp cap have since been removed: the cap is now the configured
+> `autonomous.workFinder.maxConcurrent` alone, and a tick may admit into every
+> free slot. The ramp row and consequence 1 below describe the old model.
+
 Three consequences worth stating plainly:
 
 1. **The ramp cap is the sharp edge, not `maxConcurrent`.** An N=3 fan-out is
@@ -374,8 +379,9 @@ would need to change.
   shape and the do-not-file-follow-ups-autonomously precedent.
 - `.loom/docs/survey-orca-2026-07-31.md` § "Idea 1 — Fan-out / best-of-N
   dispatch" — the *adapt* verdict that produced #4776.
-- `.loom/docs/token-pool.md`, `.loom/docs/daemon-reference.md` §"dynamic cap" /
-  §"Per-tick admission (ramp) cap" — the concurrency model priced in Step 4.
+- `.loom/docs/token-pool.md`, `.loom/docs/daemon-reference.md` — the concurrency model
+  (Step 4 priced the older one, with a disk term and a per-tick ramp cap,
+  both removed by #12406).
 - `defaults/scripts/worktree.sh` — `WORKTREE_PATH` / `BRANCH_NAME` derivation
   and the repo-global `worktree-add` lock (Step 3a).
 - `defaults/scripts/merge-pr.sh`, `defaults/scripts/cleanup-branches.sh` —

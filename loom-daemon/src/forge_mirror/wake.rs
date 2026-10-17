@@ -252,9 +252,9 @@ async fn changes(
         "wake",
         "-",
         if page.is_ok() {
-            super::discovery::Outcome::Hit
+            crate::forge_mirror::Outcome::Hit
         } else {
-            super::discovery::Outcome::Error
+            crate::forge_mirror::Outcome::Error
         },
     );
     client::decode(page?)
@@ -310,9 +310,6 @@ pub fn publish(bus: &EventBus, nudge: &Nudge) {
     if !nudge.prompts() {
         return;
     }
-    for repo in &nudge.repos {
-        super::discovery::release_hold(repo);
-    }
     let events: Vec<serde_json::Value> = nudge.repos.iter().map(|r| json!({ "repo": r })).collect();
     crate::forge_events::poll_gate::ingest_page(&events, nudge.missed && events.is_empty());
     for (repo, kind, secs) in &nudge.latencies {
@@ -342,7 +339,7 @@ fn served_repos(workspace_root: &Path, pool: &crate::workspace_pool::WorkspacePo
     }
     let set: BTreeSet<String> = roots
         .iter()
-        .filter_map(|r| super::discovery::resolve_repo(Some(r), None))
+        .filter_map(|r| super::resolve_repo(Some(r), None))
         .collect();
     set.into_iter().collect()
 }

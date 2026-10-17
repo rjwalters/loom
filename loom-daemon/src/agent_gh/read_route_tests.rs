@@ -137,7 +137,9 @@ fn plan_uses_the_gateway_only_for_a_read_with_a_live_profile() {
         FrontRoute {
             gateway: Some(dir.clone()),
             reader: None,
-            read: true
+            read: true,
+            pooled: true,
+            owner: Some("acme".to_string()),
         }
     );
     // A read for an owner with no profile: direct, but booked as a read.
@@ -146,7 +148,9 @@ fn plan_uses_the_gateway_only_for_a_read_with_a_live_profile() {
         FrontRoute {
             gateway: None,
             reader: None,
-            read: true
+            read: true,
+            pooled: true,
+            owner: Some("other".to_string()),
         }
     );
     assert_eq!(p("pr merge 7 -R acme/repo"), FrontRoute::default());
@@ -172,7 +176,9 @@ fn plan_offers_a_reader_for_a_read_after_the_gateway_and_never_for_a_write() {
         FrontRoute {
             gateway: None,
             reader: Some(rd.clone()),
-            read: true
+            read: true,
+            pooled: true,
+            owner: Some("acme".to_string()),
         }
     );
     // With one, the gateway is first and the reader is next in line.
@@ -196,12 +202,15 @@ fn plan_offers_a_reader_for_a_read_after_the_gateway_and_never_for_a_write() {
         &gateway,
         &reader,
     );
+    // An uncertain repo cannot name a reader: not pooled, so never shed.
     assert_eq!(
         uncertain,
         FrontRoute {
             gateway: None,
             reader: None,
-            read: true
+            read: true,
+            pooled: false,
+            owner: None,
         }
     );
     assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());

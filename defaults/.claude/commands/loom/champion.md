@@ -87,7 +87,7 @@ reads the issue's own title and body (never its aggregate `updatedAt`, #4966):
 # Level, then oldest first (#11103); holds: champion-common.md "Hold set"
 HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
 gh api --paginate "repos/{owner}/{repo}/issues?labels=loom:curated&state=open&per_page=100" \
-  | jq -rs '($ENV.HOLDS | split("\n")) as $h | add | map(select(.pull_request | not)) | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .created_at]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building") or IN($h[])) | not) |
+  | jq -rs '($ENV.HOLDS | split("\n")) as $h | add | map(select(.pull_request | not)) | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .created_at]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building") or IN($h[])) | not) | select((.body // "") | gsub("```[\\s\\S]*?```"; "") | test("(^|\n)<!-- loom:tracker -->[ \\t\\r]*(\n|$)") | not) |
   "#\(.number) \(.title)"'
 ```
 
@@ -99,6 +99,13 @@ gh api --paginate "repos/{owner}/{repo}/issues?labels=loom:curated&state=open&pe
 > alike, so an issue listing drops `.pull_request` rows and a PR listing keeps
 > only them. Per-item reads (comments, body, CI) belong to the item's own
 > evaluation, never to discovery.
+
+> **`<!-- loom:tracker -->` is skipped here too (#10886).** A living tracker or
+> governance hub is never a finite Builder deliverable, so it is not a promotion
+> candidate and must never reach the N=2 rejection escalation. The marker must
+> be a line by itself in the issue body (not inside a code fence or a quote), so
+> discovery needs no extra read. Remove the marker and the issue is evaluated
+> normally. See `label-state-machine.md` → "Tracker marker".
 
 > **Why the `loom:issue`/`loom:building` exclusion is required**: promotion
 > adds `loom:issue` (later `loom:building`) but never removes the proposal
@@ -167,7 +174,7 @@ If no queues have work, report "No work for Champion" and stop.
 
 ## Follow-on Issue Creation
 
-After a merge, `champion-pr-merge.md` Step 5.5 turns added `TODO:`/`FIXME:`/`HACK:`/`XXX:`/`FUTURE:` lines, deferred-scope sections ("Follow-on Work", "Out of Scope", "Deferred", "Phase 2") and "not blocking" review notes into one `loom:triage` issue (Curator admission first, #11820): always for a critical pattern or a follow-on section, else at 3+ TODOs. It skips a duplicate "Follow-on from PR #N". Edge cases: `champion-reference.md` Edge Case 14.
+After a merge, `champion-pr-merge.md` Step 5.5 turns added `TODO:`/`FIXME:`/`HACK:`/`XXX:`/`FUTURE:` lines, deferred-scope sections ("Follow-on Work", "Deferred", "Phase 2"; not "Out of Scope", a deliberate exclusion) and "not blocking" review notes into one `loom:triage` issue (Curator admission first, #11820): always for a critical pattern or a follow-on section, else at 3+ TODOs. It skips a duplicate "Follow-on from PR #N". Edge cases: `champion-reference.md` Edge Case 14.
 
 ---
 

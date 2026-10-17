@@ -5,7 +5,6 @@
 
 use super::*;
 
-mod admission_brake;
 mod daemon_event;
 mod export_coverage;
 mod fleet_captain;
@@ -147,6 +146,38 @@ pub(super) fn sweep_outcome() -> TelemetryRecord {
     })
 }
 
+/// A `HostHealthRecord` with nothing measured: every optional field `None`
+/// or empty. Tests name only the field they are about via struct-update
+/// syntax. A plain function, not a `Default` impl on the production type,
+/// which would invite fabricated zeros.
+pub(super) fn baseline_host_health() -> HostHealthRecord {
+    HostHealthRecord {
+        captured_at: ts(),
+        daemon_version: "0.17.0".to_string(),
+        build_commit: "unknown".to_string(),
+        built_at: None,
+        uptime_sec: 1,
+        logical_cpus: 4,
+        cpu_idle_fraction: None,
+        load_per_core: None,
+        worktree_root_free_gb: None,
+        worktree_root_total_gb: None,
+        active_sweep_ids: Vec::new(),
+        managed_repos: Vec::new(),
+        roles: RoleTickHealth::default(),
+        protection: None,
+        is_captain: None,
+        armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
+        exported_kinds: Vec::new(),
+        exporters: Vec::new(),
+        otlp_export: None,
+        memory: None,
+        agent_scopes: Vec::new(),
+        agent_scopes_total: None,
+    }
+}
+
 fn host_health() -> TelemetryRecord {
     TelemetryRecord::HostHealth(HostHealthRecord {
         captured_at: ts(),
@@ -160,8 +191,6 @@ fn host_health() -> TelemetryRecord {
         worktree_root_free_gb: Some(200),
         worktree_root_total_gb: Some(1000),
         active_sweep_ids: vec!["sweep-issue-4703-0".to_string()],
-        dispatch_halted: false,
-        halt_reason: None,
         managed_repos: vec![
             ManagedRepoEntry {
                 slug: "rjwalters/loom".to_string(),
@@ -189,7 +218,6 @@ fn host_health() -> TelemetryRecord {
             state: "protected".to_string(),
             watchdog_provisioned: Some(true),
         }),
-        admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),

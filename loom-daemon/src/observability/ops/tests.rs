@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use chrono::{Duration, TimeZone, Utc};
 
 use super::dispatch::{decision_counts, tick_points, tick_result, tick_span};
-use super::host::{parse_macos_swapusage, parse_meminfo, HostResources};
+use super::host::{
+    parse_macos_swapusage, parse_meminfo, parse_vm_stat_available_pages, HostResources,
+};
 use super::OpsSink;
 use crate::observability::queue::QueueSink;
 use crate::telemetry::ops::{
@@ -292,6 +294,9 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::FeedCompletions,
         MetricName::FeedReconcilePasses,
         MetricName::CiQueueDepth,
+        MetricName::FleetDispatchRefusals,
+        MetricName::FleetDispatchExpired,
+        MetricName::FleetDispatchClaimLostAfterGrant,
         MetricName::EgressRequests,
         MetricName::EgressTokens,
         MetricName::EgressLatency,
@@ -362,23 +367,22 @@ fn tick_result_precedence() {
     };
     assert_eq!(super::dispatch::tick_result_with(&held, true), "halted_ci_billing");
     assert_eq!(super::dispatch::tick_result_with(&held, false), "halted");
-    // The hold outranks saturation, as before.
+    // The hold outranks an error.
     assert_eq!(
         with(|r| {
             r.halted = true;
             r.halt_causes = vec![HaltCause::Drain];
-            r.saturation_held = true;
+            r.errors = 1;
         }),
         "halted_drain"
     );
-    assert_eq!(with(|r| r.saturation_held = true), "saturation_held");
     assert_eq!(with(|r| r.errors = 1), "error");
-    assert_eq!(with(|r| r.deferred_ramp_cap = 2), "capacity_full");
+    assert_eq!(with(|r| r.deferred_capacity = 2), "capacity_full");
     assert_eq!(with(|r| r.skipped_backoff = 3), "all_skipped");
 }
 
 /// #11649: a held tick's result names the hold its workspaces recorded — a
-/// disk-held tick is not a red `main` — and several causes read `halted`.
+/// drain-held tick is not a red `main` — and several causes read `halted`.
 #[test]
 fn halted_tick_result_names_the_recorded_cause() {
     use super::dispatch::{halted_result, tick_result_with};
@@ -391,13 +395,13 @@ fn halted_tick_result_names_the_recorded_cause() {
         };
         tick_result_with(&report, billing)
     };
-    assert_eq!(held(vec![HaltCause::DiskReservation], false), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::Drain], false), "halted_drain");
     assert_eq!(held(vec![HaltCause::TokenPool], false), "halted_token_pool");
     assert_eq!(held(vec![HaltCause::CiBilling], false), "halted_ci_billing");
     // A global billing block does not relabel another root's named cause.
-    assert_eq!(held(vec![HaltCause::DiskReservation], true), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::Drain], true), "halted_drain");
     assert_eq!(held(vec![HaltCause::MainRed], true), "halted_main_red");
-    assert_eq!(held(vec![HaltCause::MainRed, HaltCause::DiskReservation], false), "halted");
+    assert_eq!(held(vec![HaltCause::MainRed, HaltCause::Drain], false), "halted");
     // Every single cause maps to `halted_` + its wire token.
     for cause in HaltCause::ALL {
         assert_eq!(halted_result(&[cause], false), format!("halted_{}", cause.as_str()));
@@ -410,12 +414,12 @@ fn tick_span_lists_halt_causes_only_when_held() {
     let held = TickReport {
         seen: 2,
         halted: true,
-        halt_causes: vec![HaltCause::Drain, HaltCause::DiskReservation],
+        halt_causes: vec![HaltCause::Drain, HaltCause::TokenPool],
         ..TickReport::default()
     };
     let span = tick_span(&held, 3, at(0), at(1));
     assert_eq!(span.attributes["loom.dispatch.result"], "halted");
-    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,disk_reservation");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,token_pool");
     let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
     assert!(!idle.attributes.contains_key("loom.dispatch.halt_causes"));
 }
@@ -792,4 +796,16 @@ fn tick_span_names_the_error_kind_only_when_it_counted_errors() {
     let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
     assert!(!idle.attributes.contains_key("loom.dispatch.error_kind"));
     assert!(OPS_SPAN_ATTRIBUTE_KEYS.contains(&"loom.dispatch.error_kind"));
+}
+
+#[test]
+fn parse_vm_stat_sums_free_and_inactive() {
+    let out = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                Pages free:                              10000.\n\
+                Pages active:                            50000.\n\
+                Pages inactive:                           5000.\n\
+                Pages speculative:                         100.\n";
+    assert_eq!(parse_vm_stat_available_pages(out), Some(15_000));
+    assert_eq!(parse_vm_stat_available_pages("Pages free: 10000.\n"), None);
+    assert_eq!(parse_vm_stat_available_pages(""), None);
 }

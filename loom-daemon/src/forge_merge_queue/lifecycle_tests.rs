@@ -14,14 +14,16 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use super::authz::{CheckConclusion, DenyReason, HandoffError, REQUIRED_CHECK_CONTEXT};
 use super::events::{EventKind, EventSink, FileEventSink, MemoryEventSink, QueueEvent};
-use super::forge::{LifecycleForge, PrSnapshot, RemovalEvent};
+use super::forge::{GroupRun, LifecycleForge, PrSnapshot, RemovalEvent};
 use super::grants::{latest_record, GrantRecord};
+use super::group_authz::{StatusApi, StatusState};
 use super::lifecycle::*;
 use super::lifecycle_cli::{render_handoff, render_reconciled, EXIT_QUEUED};
 use super::mode::MergeMode;
 use super::ops::*;
 use super::removal::{classify, RemovalKind};
 
+const GROUP_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
 const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
 const SHA2: &str = "fedcba9876543210fedcba9876543210fedcba98";
 const PR: u32 = 7;
@@ -46,8 +48,13 @@ struct Gh {
     queued: RefCell<Option<String>>,
     check: RefCell<Option<CheckConclusion>>,
     removals: RefCell<Vec<RemovalEvent>>,
+    group_runs: RefCell<Result<Vec<GroupRun>, String>>,
     comments_down: Cell<bool>,
     dequeue_fails: Cell<bool>,
+    /// Latest `loom/merge-authorization` status per commit.
+    head_status: RefCell<std::collections::HashMap<String, StatusState>>,
+    status_fails: Cell<bool>,
+    cannot_post: Cell<bool>,
     /// Pushed to the head the instant the enqueue mutation arrives.
     push_during_enqueue: RefCell<Option<String>>,
     calls: Cell<u32>,
@@ -63,8 +70,12 @@ impl Gh {
             queued: RefCell::new(None),
             check: RefCell::new(None),
             removals: RefCell::new(Vec::new()),
+            group_runs: RefCell::new(Ok(Vec::new())),
             comments_down: Cell::new(false),
             dequeue_fails: Cell::new(false),
+            head_status: RefCell::new(std::collections::HashMap::new()),
+            status_fails: Cell::new(false),
+            cannot_post: Cell::new(false),
             push_during_enqueue: RefCell::new(None),
             calls: Cell::new(0),
         }
@@ -109,6 +120,7 @@ impl Gh {
         self.removals.borrow_mut().push(RemovalEvent {
             reason: reason.map(str::to_string),
             created_at: ts(at),
+            before_commit: Some(GROUP_SHA.into()),
         });
     }
     fn count(&self, needle: &str) -> usize {
@@ -147,6 +159,12 @@ impl QueueApi for Gh {
                 actual: None,
             });
         }
+        // GitHub only enqueues a PR whose required check is green on its head.
+        if self.head_status.borrow().get(expected) != Some(&StatusState::Success) {
+            return Err(QueueError::Forge {
+                detail: format!("Required status check \"{REQUIRED_CHECK_CONTEXT}\" is expected"),
+            });
+        }
         *self.queued.borrow_mut() = Some(expected.into());
         Ok(EnqueueAck::Enqueued { position: Some(1) })
     }
@@ -159,6 +177,23 @@ impl QueueApi for Gh {
         }
         *self.queued.borrow_mut() = None;
         Ok(DequeueAck::Dequeued)
+    }
+}
+
+impl StatusApi for Gh {
+    fn post_status(&self, commit: &str, state: StatusState, _d: &str) -> Result<(), String> {
+        self.tick();
+        if self.status_fails.get() {
+            return Err("HTTP 503".into());
+        }
+        self.head_status.borrow_mut().insert(commit.into(), state);
+        Ok(())
+    }
+    fn can_post_statuses(&self) -> Result<(), String> {
+        if self.cannot_post.get() {
+            return Err("installation has `statuses: read`".into());
+        }
+        Ok(())
     }
 }
 
@@ -203,6 +238,10 @@ impl LifecycleForge for Gh {
         self.tick();
         Ok(self.removals.borrow().clone())
     }
+    fn group_check_runs(&self, _commit: &str) -> Result<Vec<GroupRun>, String> {
+        self.tick();
+        self.group_runs.borrow().clone()
+    }
 }
 
 fn ctx<'a>(gh: &'a Gh, ev: &'a dyn EventSink, mode: MergeMode, at: DateTime<Utc>) -> Ctx<'a> {
@@ -211,6 +250,7 @@ fn ctx<'a>(gh: &'a Gh, ev: &'a dyn EventSink, mode: MergeMode, at: DateTime<Utc>
         execution_enabled: true,
         queue: gh,
         forge: gh,
+        statuses: gh,
         events: ev,
         now: at,
     }
@@ -275,6 +315,35 @@ fn handoff_is_idempotent_for_a_queued_head() {
     assert!(matches!(hand(&gh, &ev), Ok(EnqueueOutcome::AlreadyQueued { .. })));
     assert_eq!(gh.count("loom:merge-queue-grant"), 1, "no second grant");
     assert_eq!(kinds(&ev), vec![EventKind::Enqueued], "no duplicate telemetry");
+}
+
+#[test]
+fn credential_that_cannot_post_statuses_leaves_a_queued_pr_alone() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    hand(&gh, &ev).unwrap();
+    gh.cannot_post.set(true);
+    gh.status_fails.set(true);
+    let before = gh.count("loom:merge-queue-grant");
+    assert!(matches!(hand(&gh, &ev), Ok(EnqueueOutcome::AlreadyQueued { .. })));
+    assert!(gh.queued.borrow().is_some(), "still queued");
+    assert_eq!(gh.count("loom:merge-queue-grant"), before, "no revoke, no re-grant");
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(5));
+    assert!(matches!(reconcile_pr(&c, PR), Reconciled::StillQueued { .. }));
+    assert_eq!(kinds(&ev), vec![EventKind::Enqueued]);
+}
+
+#[test]
+fn credential_that_cannot_post_statuses_is_refused_with_the_permission_named() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    gh.cannot_post.set(true);
+    let e = hand(&gh, &ev).unwrap_err();
+    let text = e.to_string();
+    assert!(
+        text.contains("WRITER_CANNOT_POST_STATUSES") && text.contains("statuses"),
+        "{text}"
+    );
+    assert_eq!(gh.count("loom:merge-queue-grant"), 0, "nothing granted");
+    assert!(gh.queued.borrow().is_none());
 }
 
 // ------------------------------------------------------- direct mode / gates
@@ -538,6 +607,103 @@ fn check_failure_and_timeout_use_their_existing_routes() {
     assert_eq!(gh.count("loom:merge-queue-grant"), 2);
 }
 
+// ------------------------------------------------- dropped-infra (#12573)
+
+const FAILED_CHECKS: &str = "Required status check \"Daemon Checks\" failed";
+
+fn run(name: &str, conclusion: &str, failed_steps: u32) -> GroupRun {
+    GroupRun {
+        name: name.into(),
+        conclusion: Some(conclusion.into()),
+        failed_steps,
+    }
+}
+
+fn infra_drop(runs: Result<Vec<GroupRun>, String>) -> (Gh, MemoryEventSink, Reconciled) {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    *gh.group_runs.borrow_mut() = runs;
+    hand(&gh, &ev).unwrap();
+    gh.github_drops(Some(FAILED_CHECKS), t0() + Duration::minutes(3));
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(4));
+    let r = reconcile_pr(&c, PR);
+    (gh, ev, r)
+}
+
+fn is_kind(r: &Reconciled, want: RemovalKind) -> bool {
+    matches!(r, Reconciled::Dropped { kind, .. } if *kind == want)
+}
+
+#[test]
+fn a_cancelled_group_job_is_dropped_infra_and_keeps_the_labels() {
+    let (gh, _, r) = infra_drop(Ok(vec![run("ci", "success", 0), run("test", "cancelled", 0)]));
+    assert!(is_kind(&r, RemovalKind::DroppedInfra), "{r:?}");
+    assert!(gh.has_label("loom:pr") && !gh.has_label("loom:changes-requested"));
+    assert_eq!(gh.count("reason=dropped-infra"), 1);
+    assert_eq!(render_reconciled(PR, &r).code, EXIT_QUEUED);
+}
+
+#[test]
+fn a_real_test_failure_still_routes_to_doctor() {
+    let (gh, _, r) = infra_drop(Ok(vec![run("test", "failure", 1)]));
+    assert!(is_kind(&r, RemovalKind::CheckFailure), "{r:?}");
+    assert!(gh.has_label("loom:changes-requested") && !gh.has_label("loom:pr"));
+}
+
+#[test]
+fn a_mixed_infra_and_real_failure_routes_to_doctor() {
+    let (_, _, r) = infra_drop(Ok(vec![run("a", "cancelled", 0), run("b", "failure", 2)]));
+    assert!(is_kind(&r, RemovalKind::CheckFailure), "{r:?}");
+}
+
+#[test]
+fn a_cancelled_job_with_a_failed_step_is_a_real_failure() {
+    let (_, _, r) = infra_drop(Ok(vec![run("test", "timed_out", 1)]));
+    assert!(is_kind(&r, RemovalKind::CheckFailure), "{r:?}");
+}
+
+#[test]
+fn an_unreadable_empty_or_unfinished_check_set_fails_closed() {
+    for runs in [
+        Err("HTTP 403".to_string()),
+        Ok(Vec::new()),
+        Ok(vec![run("ci", "success", 0)]),
+        Ok(vec![GroupRun {
+            name: "t".into(),
+            conclusion: None,
+            failed_steps: 0,
+        }]),
+    ] {
+        let (gh, _, r) = infra_drop(runs.clone());
+        assert!(is_kind(&r, RemovalKind::CheckFailure), "{runs:?} → {r:?}");
+        assert!(gh.has_label("loom:changes-requested"));
+    }
+}
+
+#[test]
+fn a_drop_without_a_group_commit_is_not_infra() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    *gh.group_runs.borrow_mut() = Ok(vec![run("t", "cancelled", 0)]);
+    hand(&gh, &ev).unwrap();
+    gh.github_drops(Some(FAILED_CHECKS), t0() + Duration::minutes(3));
+    gh.removals.borrow_mut()[0].before_commit = None;
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(4));
+    assert!(is_kind(&reconcile_pr(&c, PR), RemovalKind::CheckFailure));
+}
+
+#[test]
+fn a_second_infra_drop_on_the_same_head_falls_back_to_doctor() {
+    let (gh, ev, r) = infra_drop(Ok(vec![run("t", "cancelled", 0)]));
+    assert!(is_kind(&r, RemovalKind::DroppedInfra));
+    // Champion re-enqueues at the same head; GitHub drops it again.
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(10));
+    assert!(handoff(&c, PR, SHA1, &required_ok).is_ok());
+    gh.github_drops(Some(FAILED_CHECKS), t0() + Duration::minutes(13));
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(14));
+    let r = reconcile_pr(&c, PR);
+    assert!(is_kind(&r, RemovalKind::CheckFailure), "{r:?}");
+    assert!(gh.has_label("loom:changes-requested") && !gh.has_label("loom:pr"));
+}
+
 #[test]
 fn unknown_or_missing_reason_is_reported_unknown_not_guessed() {
     for reason in [
@@ -568,6 +734,7 @@ fn a_removal_older_than_the_grant_is_not_this_drop() {
     gh.removals.borrow_mut().push(RemovalEvent {
         reason: Some("Merge conflict".into()),
         created_at: ts(t0() - Duration::hours(1)),
+        before_commit: None,
     });
     hand(&gh, &ev).unwrap();
     *gh.queued.borrow_mut() = None; // entry vanished with no new removal event
@@ -601,7 +768,7 @@ fn known_gap_merge_after_revocation_is_flagged_in_telemetry() {
     ));
     assert!(ev.all().iter().any(|e| e.merged_after_revocation));
     const { assert!(!super::authz::INVARIANT_FULLY_DEMONSTRATED) };
-    const { assert!(!super::QUEUE_EXECUTION_ENABLED) };
+    const { assert!(super::QUEUE_EXECUTION_ENABLED) };
 }
 
 // ------------------------------------------------------------ pure pieces
@@ -787,7 +954,7 @@ fn step_in_queue_mode_never_looks_direct_when_it_cannot_read_the_forge() {
 
 // ------------------------------------------- group-aware transition (B5 seam)
 
-use super::group_authz::{Member, MergeGroup, StatusApi, StatusState};
+use super::group_authz::{Member, MergeGroup};
 use super::group_github::{group_transition_line, revoke_for_transition_groups, GroupForge};
 
 /// Fake [`GroupForge`]: a fixed discovery result and a status write that can
@@ -827,6 +994,9 @@ impl GroupForge for Groups {
         self.calls.set(self.calls.get() + 1);
         self.found.clone()
     }
+    fn latest_status(&self, _c: &str) -> Result<Option<(StatusState, String)>, String> {
+        Ok(None)
+    }
 }
 
 fn group_with_pr() -> Vec<MergeGroup> {
@@ -857,7 +1027,11 @@ fn group_transition_refails_the_group_containing_the_pr() {
     let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(1));
     let rev = revoke_for_transition_groups(&c, &groups, PR, "stale-verdict").unwrap();
     assert!(rev.passed_checks_withdrawn());
-    assert_eq!(*groups.posted.borrow(), vec![SHA2.to_string()]);
+    assert_eq!(
+        *groups.posted.borrow(),
+        vec![SHA2.to_string(), SHA1.to_string()],
+        "the group commit and the PR head are both re-failed"
+    );
     let line = group_transition_line(&rev);
     assert!(line.contains("re-failed 1 merge-group commit(s)"), "{line}");
     assert!(!line.contains("residual window"), "{line}");
@@ -885,4 +1059,42 @@ fn group_refail_errors_surface_in_the_audit_line() {
         assert!(line.contains("residual window"), "{what}: {line}");
         assert!(gh.queued.borrow().is_none(), "{what}: dequeue still attempted");
     }
+}
+
+// ------------------------------------------------- head status (#12496)
+
+#[test]
+fn handoff_posts_the_head_status_the_ruleset_requires() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    hand(&gh, &ev).unwrap();
+    assert_eq!(gh.head_status.borrow().get(SHA1), Some(&StatusState::Success));
+}
+
+#[test]
+fn handoff_aborts_and_unauthorizes_when_the_head_status_cannot_be_posted() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    gh.status_fails.set(true);
+    let r = hand(&gh, &ev);
+    assert!(matches!(r, Err(HandoffFailure::Authz(HandoffError::HeadStatus(_)))), "{r:?}");
+    assert_eq!(render_handoff(PR, SHA1, &r).code, 3);
+    assert!(gh.queued.borrow().is_none());
+    assert!(!ev_has_enqueued(&ev));
+    let rec = latest_record(&gh.comments.borrow(), PR);
+    assert!(matches!(rec, GrantRecord::Revoked { .. }), "grant rolled back: {rec:?}");
+}
+
+fn ev_has_enqueued(ev: &MemoryEventSink) -> bool {
+    kinds(ev).contains(&EventKind::Enqueued)
+}
+
+#[test]
+fn group_revoke_reports_a_failed_head_write() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    hand(&gh, &ev).unwrap();
+    let mut groups = Groups::new(Ok(group_with_pr()));
+    groups.status_fails = true;
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(1));
+    let rev = revoke_for_transition_groups(&c, &groups, PR, "stale-verdict").unwrap();
+    assert!(rev.head_failed.is_err());
+    assert!(group_transition_line(&rev).contains("PR head status failure NOT confirmed"));
 }

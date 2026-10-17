@@ -267,11 +267,10 @@ fn direct_mode_never_invokes_the_queue_api() {
 }
 
 #[test]
-fn queue_mode_is_dormant_in_this_phase() {
-    const { assert!(!QUEUE_EXECUTION_ENABLED, "Phase A must ship dormant (#9978)") };
+fn queue_mode_refuses_when_execution_is_disabled() {
+    const { assert!(QUEUE_EXECUTION_ENABLED, "Phase C pilot enables execution (#12323)") };
     let api = FakeApi::with(vec![]);
-    let e =
-        guarded_enqueue(MergeMode::Queue, QUEUE_EXECUTION_ENABLED, &api, 7, APPROVED).unwrap_err();
+    let e = guarded_enqueue(MergeMode::Queue, false, &api, 7, APPROVED).unwrap_err();
     assert_eq!(e.code(), "EXECUTION_DORMANT");
     assert!(
         e.to_string()
@@ -590,10 +589,9 @@ fn cli_direct_mode_enqueue_never_spawns_gh() {
     let r = run(&cmd, &env(gh.clone(), MergeMode::Direct, ForgeType::GitHub));
     assert_eq!(r.code, 4);
     assert!(r.stderr[0].contains("[NOT_QUEUE_MODE]"), "{r:?}");
-    let r = run(
-        &MergeQueueCmd::Dequeue { pr: 7, repo: None },
-        &env(gh.clone(), MergeMode::Queue, ForgeType::GitHub),
-    );
+    let mut disabled = env(gh.clone(), MergeMode::Queue, ForgeType::GitHub);
+    disabled.execution_enabled = false;
+    let r = run(&MergeQueueCmd::Dequeue { pr: 7, repo: None }, &disabled);
     assert!(r.stderr[0].contains("[EXECUTION_DORMANT]"), "{r:?}");
     assert_eq!(calls_log(dir.path()), "", "gh must never be invoked");
 }
@@ -601,7 +599,9 @@ fn cli_direct_mode_enqueue_never_spawns_gh() {
 #[test]
 fn cli_mode_and_invalid_config_and_gitea() {
     let r = run(&MergeQueueCmd::Mode, &env("gh".into(), MergeMode::Direct, ForgeType::GitHub));
-    assert_eq!(r.stdout, vec!["merge-queue: mode=direct source=config execution=dormant"]);
+    assert_eq!(r.stdout, vec!["merge-queue: mode=direct source=config execution=enabled"]);
+    let r = run(&MergeQueueCmd::Mode, &env("gh".into(), MergeMode::Queue, ForgeType::GitHub));
+    assert_eq!(r.stdout, vec!["merge-queue: mode=queue source=config execution=enabled"]);
 
     let mut bad = env("gh".into(), MergeMode::Direct, ForgeType::GitHub);
     bad.mode = Err(MergeModeError {

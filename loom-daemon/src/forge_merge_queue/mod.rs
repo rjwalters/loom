@@ -1,4 +1,4 @@
-//! Merge-queue controls — **dormant** (#10255, Phase A of epic #9978).
+//! Merge-queue controls — opt-in via `champion.mergeMode` (#10255, Phase A of epic #9978).
 //!
 //! What lands here, and nothing more:
 //!
@@ -20,13 +20,12 @@
 //!   all of which return before any forge call in `direct` mode.
 //! - [`handle`] — `loom-daemon forge merge-queue …`, for operators and tests.
 //!
-//! # Dormant by construction
+//! # Opt-in by `champion.mergeMode`
 //!
-//! [`QUEUE_EXECUTION_ENABLED`] is a compile-time `false`. Until #9978's later
-//! phases install the lifecycle safety contract and the required merge-group
-//! checks, every mutating entry point refuses with `EXECUTION_DORMANT` even
-//! when `champion.mergeMode=queue` — and under `direct` (the default) it
-//! refuses with `NOT_QUEUE_MODE` before any forge call. The daemon tick
+//! [`QUEUE_EXECUTION_ENABLED`] is a compile-time `true` (Phase C pilot,
+//! #12323). Execution is still opt-in: under `direct` (the default) every
+//! mutating entry point refuses with `NOT_QUEUE_MODE` before any forge call,
+//! so only a repo that sets `champion.mergeMode=queue` reaches the queue API. The daemon tick
 //! and the stale-verdict paths call the lifecycle (no-ops in direct mode).
 //! Champion's merge step (batch and targeted `--pr`) calls `forge merge-queue
 //! step` before `merge-pr.sh` (#10256 Phase B3); `merge-pr.sh` itself does not
@@ -66,9 +65,9 @@ use mode::{resolve_merge_mode, ResolvedMergeMode};
 use ops::{DequeueOutcome, EnqueueOutcome, QueueError};
 use preflight::CapabilityError;
 
-/// Phase A gate. Flipped only by the #9978 phase that installs the safety
-/// contract — never by config.
-pub const QUEUE_EXECUTION_ENABLED: bool = false;
+/// Execution gate. Flipped for the Phase C live pilot (#12323, #10257); the
+/// per-repo opt-in is `champion.mergeMode=queue`, which defaults to `direct`.
+pub const QUEUE_EXECUTION_ENABLED: bool = true;
 
 const PREFIX: &str = "merge-queue:";
 

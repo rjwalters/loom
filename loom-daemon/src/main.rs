@@ -987,7 +987,6 @@ enum Commands {
     #[command(flatten)]
     ScriptPorts(cli::script_ports::ScriptPortCommand),
     Labels(cli::labels_cmd::LabelsArgs),
-    Presence(cli::presence::PresenceArgs),
 
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
@@ -1090,6 +1089,10 @@ enum Commands {
     /// = drift detector), diff/apply the `roster`, and report the desired run
     /// `state`. Args live in `cli::fleet_config` (main.rs is size-frozen).
     FleetConfig(cli::fleet_config::FleetConfigArgs),
+
+    /// Fleet dispatch (#12449): `serve` runs the captain's claim arbiter.
+    /// Args live in `cli::fleet_dispatch_cmd`.
+    FleetDispatch(cli::fleet_dispatch_cmd::FleetDispatchArgs),
 
     /// The shared bounded journal core (#11345): `verify` a journal root.
     Journal(cli::journal_cli::JournalArgs),
@@ -2310,7 +2313,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::ScriptPorts(cmd) => cmd.run(),
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
-        Commands::Presence(cmd) => cmd.run(),
         Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
@@ -2344,6 +2346,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
+        Commands::FleetDispatch(args) => args.run().await,
         Commands::Journal(args) => cli::journal_cli::dispatch(args),
         Commands::Stats {
             command,

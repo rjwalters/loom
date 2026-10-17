@@ -11,7 +11,7 @@
 //! the wire, and a record emitted by a pre-#8848 daemon must still decode.
 
 use super::super::*;
-use super::ts;
+use super::baseline_host_health;
 
 /// A `HostHealthRecord` with only the captain fields varied — every other
 /// field pinned at the "nothing measured" baseline so a captain assertion
@@ -21,32 +21,9 @@ pub(super) fn host_health_with_captain(
     armed_singleton_jobs: Vec<String>,
 ) -> TelemetryRecord {
     TelemetryRecord::HostHealth(HostHealthRecord {
-        captured_at: ts(),
-        daemon_version: "0.17.0".to_string(),
-        build_commit: "unknown".to_string(),
-        built_at: None,
-        uptime_sec: 1,
-        logical_cpus: 4,
-        cpu_idle_fraction: None,
-        load_per_core: None,
-        worktree_root_free_gb: None,
-        worktree_root_total_gb: None,
-        active_sweep_ids: Vec::new(),
-        dispatch_halted: false,
-        halt_reason: None,
-        managed_repos: Vec::new(),
-        roles: RoleTickHealth::default(),
-        protection: None,
-        admission_brake: None,
         is_captain,
         armed_singleton_jobs,
-        captainless_singleton_jobs: Vec::new(),
-        exported_kinds: Vec::new(),
-        exporters: Vec::new(),
-        otlp_export: None,
-        memory: None,
-        agent_scopes: Vec::new(),
-        agent_scopes_total: None,
+        ..baseline_host_health()
     })
 }
 

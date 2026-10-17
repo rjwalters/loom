@@ -3,10 +3,10 @@
 //! `forge_call_stats` row under its operation name.
 
 use super::*;
+use crate::gh_invocation::test_support::{rows_after, stub};
 use crate::gh_invocation::{AccessIntent, GhTarget, Operation, ParentContext};
 use crate::types::ForgeCallCounts;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 fn os(args: &[&str]) -> Vec<OsString> {
@@ -44,13 +44,6 @@ fn static_pool_follows_the_argv() {
     }
 }
 
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
 fn inv(op: &'static str, args: &[&str], program: &Path) -> GhInvocation {
     GhInvocation::new(
         Operation::new(op),
@@ -61,17 +54,6 @@ fn inv(op: &'static str, args: &[&str], program: &Path) -> GhInvocation {
     .parent(ParentContext::Missing)
     .program(program)
     .args(args.iter().copied())
-}
-
-/// Run `body` with THIS thread's call-stats sink at a fresh dir, returning the
-/// host-window rows it produced.
-fn rows_after(body: impl FnOnce()) -> Vec<ForgeCallCounts> {
-    let sink = tempfile::tempdir().unwrap();
-    crate::forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
-    body();
-    let report = crate::forge_call_stats::status_report(chrono::Utc::now(), None);
-    crate::forge_call_stats::set_test_sink_dir(None);
-    report.host_window.unwrap_or_default()
 }
 
 fn row<'a>(rows: &'a [ForgeCallCounts], caller: &str) -> &'a ForgeCallCounts {
@@ -202,4 +184,26 @@ fn a_site_scope_and_operation_win_and_never_merge_origin_into_repo() {
     assert_eq!(id.operation.as_deref(), Some("git.read-objects"));
     assert_eq!(id.origin.as_deref(), Some("gitea.example.com"));
     assert_eq!(id.repo.as_deref(), Some("acme/app"));
+}
+
+/// #12394: a read that reaches the writer unmarked is an error-level event;
+/// a pinned read, a write, a routed reader read and a caller-chosen
+/// credential are not.
+#[test]
+fn only_an_unmarked_read_on_the_writer_is_flagged() {
+    let read = |op: &'static str, intent| {
+        GhInvocation::new(Operation::new(op), intent, GhTarget::None, Duration::from_secs(1))
+    };
+    assert!(is_unmarked_read_on_writer(&read("t.read", AccessIntent::Read)));
+    assert!(!is_unmarked_read_on_writer(&read("t.write", AccessIntent::Write)));
+    assert!(!is_unmarked_read_on_writer(
+        &read("t.pinned", AccessIntent::Read).writer_identity()
+    ));
+    assert!(!is_unmarked_read_on_writer(
+        &read("t.reader", AccessIntent::Read)
+            .identity_role(crate::forge_identity::IdentityRole::Reader)
+    ));
+    assert!(!is_unmarked_read_on_writer(
+        &read("t.dir", AccessIntent::Read).gh_config_dir(Some(Path::new("/x")))
+    ));
 }

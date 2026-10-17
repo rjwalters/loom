@@ -10,6 +10,7 @@ use crate::role_validation;
 use crate::sweep_registry::{
     poll_and_classify_spawned_child, BeginCancel, BeginIssueDispatch, SweepRegistry,
 };
+use crate::telemetry::kinds::run_state_request::RunStateVerb;
 use crate::terminal::TerminalManager;
 use crate::types::{CredentialPreflightReport, DaemonStatusReport, Event, Request, Response};
 use crate::workspace_pool::WorkspacePool;
@@ -616,6 +617,9 @@ async fn handle_client(
     drain_state: Arc<DrainState>,
     status_flights: Arc<status_off_runtime::StatusFlights>,
 ) -> Result<()> {
+    // #12546: the peer, read once per connection before the split. Best effort;
+    // a platform without peer credentials leaves the caller fields absent.
+    let peer = crate::observability::run_state_request::Peer::from_cred(stream.peer_cred().ok());
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -799,6 +803,18 @@ async fn handle_client(
             then_exit,
         } = request
         {
+            let request_id = crate::observability::run_state_request::observe(
+                RunStateVerb::Drain,
+                vec![
+                    format!(
+                        "timeout_secs={}",
+                        timeout_secs.map_or(String::new(), |t| t.to_string())
+                    ),
+                    format!("force_after_timeout={force_after_timeout}"),
+                    format!("then_exit={then_exit}"),
+                ],
+                peer,
+            );
             let response = handle_drain_request(
                 &drain_state,
                 &workspace_pool,
@@ -810,6 +826,9 @@ async fn handle_client(
                 // #9588: every IPC drain request comes from an operator.
                 DrainOrigin::Operator,
             );
+            if matches!(response, Response::DaemonDrain { accepted: true, .. }) {
+                crate::observability::run_state_request::arm(&request_id, RunStateVerb::Drain);
+            }
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -819,12 +838,34 @@ async fn handle_client(
 
         // #11812: host maintenance. Acked at once; H4 runs on its supervisor.
         if let Request::PauseThenExit = request {
+            let request_id = crate::observability::run_state_request::observe(
+                RunStateVerb::PauseThenExit,
+                vec![],
+                peer,
+            );
             let response = crate::auto_update::pause_roll::maintenance::handle_request(
                 &drain_state,
                 &workspace_pool,
                 &fallback_root,
                 &event_bus,
             );
+            if let Response::HostMaintenancePause {
+                accepted,
+                manifest_id,
+                ..
+            } = &response
+            {
+                if *accepted {
+                    crate::observability::run_state_request::arm(
+                        &request_id,
+                        RunStateVerb::PauseThenExit,
+                    );
+                }
+                // The manifest id the client prints, for the same request.
+                if let Some(id) = manifest_id {
+                    log::info!("run-state request {request_id}: pause manifest {id}");
+                }
+            }
             writer
                 .write_all(serde_json::to_string(&response)?.as_bytes())
                 .await?;
@@ -834,8 +875,16 @@ async fn handle_client(
         }
 
         if let Request::AbortDrain = request {
+            crate::observability::run_state_request::observe(
+                RunStateVerb::AbortDrain,
+                vec![],
+                peer,
+            );
             let outcome = drain_state.abort_checked();
             let was_draining = outcome == AbortOutcome::Aborted;
+            if was_draining {
+                crate::observability::run_state_request::abort();
+            }
             let _ = event_bus.publish_generic(
                 "daemon.drain.aborted",
                 serde_json::json!({ "was_draining": was_draining }),
@@ -872,11 +921,19 @@ async fn handle_client(
         // and keeps running (do_exit == false). Mirrors the
         // CancelSweep/DaemonStatus interception.
         if let Request::RestartDaemon = request {
+            let request_id = crate::observability::run_state_request::observe(
+                RunStateVerb::Restart,
+                vec![],
+                peer,
+            );
             // #5119: the count is read BEFORE the decision so the ack can state
             // plainly what this exit is about to do to that work (destroyed on
             // systemd's cgroup-scoped stop job, preserved on launchd).
             let in_flight = count_in_flight_sweeps(&workspace_pool, &fallback_root);
             let (response, do_exit) = build_restart_decision(in_flight);
+            if do_exit {
+                crate::observability::run_state_request::arm(&request_id, RunStateVerb::Restart);
+            }
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -912,6 +969,14 @@ async fn handle_client(
             continue;
         }
 
+        if matches!(request, Request::Shutdown) {
+            let id = crate::observability::run_state_request::observe(
+                RunStateVerb::Shutdown,
+                vec![],
+                peer,
+            );
+            crate::observability::run_state_request::arm(&id, RunStateVerb::Shutdown);
+        }
         crate::observability::shutdown::intercept(&request).await;
         let response = handle_request(
             request,
@@ -1525,8 +1590,6 @@ pub fn build_daemon_status_for(
     let status_scope::MachineCaps {
         token_pool_size,
         token_pool_dir,
-        disk_headroom,
-        ram_headroom,
         configured_max,
         logical_cpus,
         loadavg_1m,
@@ -1546,8 +1609,6 @@ pub fn build_daemon_status_for(
         stale_sweeps,
         token_pool_size,
         token_pool_dir,
-        disk_headroom,
-        ram_headroom,
         logical_cpus,
         loadavg_1m,
         cpu_idle_fraction,
@@ -1625,22 +1686,8 @@ pub fn build_daemon_status_for(
         // on-disk holds/removal records and the reconciler's last action. No
         // docker call, so a wedged Docker never stalls `status`.
         session_containers: status_scope::session_containers(sections),
-        // Host-distress circuit breaker (#4235) — read from the process-global
-        // handle the work-finder loop registers/updates each tick, mirroring the
-        // auto-update global-snapshot pattern above. `None` (no breaker
-        // registered — work-finder off or breaker disabled) reads as "inactive".
-        host_breaker: crate::host_breaker::global_snapshot()
-            .map(crate::host_breaker::BreakerSnapshot::into_status)
-            .map(Box::new),
-        // Saturation admission brake (#4903) — same process-global snapshot
-        // pattern as the host breaker above. This is the field that answers the
-        // question `capacity_bound: false` could not: a host that is refusing new
-        // work because it is already saturated now says so instead of reading as
-        // idle with free slots.
-        admission_brake: crate::admission_brake::global_snapshot()
-            .map(crate::admission_brake::BrakeSnapshot::into_status),
-        // GitHub rate-limit circuit breaker (#4429) — same process-global
-        // snapshot pattern as the host breaker above.
+        // GitHub rate-limit circuit breaker (#4429) — a process-global
+        // snapshot the work-finder loop updates.
         rate_limit_breaker: crate::rate_limit_breaker::global_snapshot()
             .map(crate::rate_limit_breaker::RateLimitSnapshot::into_status)
             .map(Box::new),
@@ -2070,28 +2117,19 @@ fn resolve_dispatch_registry(
 // — the post-spawn account-selection poll, up to `TOKEN_NAME_CAPTURE_TIMEOUT`
 // — is deliberately NOT under this lock; see `dispatch_sweep_nonblocking`'s
 // doc comment for the begin/poll/finish split that keeps it that way. Since
-// #5270 the headroom computed here is `min(disk, ram, configured max)` — cheap
-// filesystem/config reads (plus a non-sleeping `/proc/meminfo` read or a
-// flag-less `vm_stat`
-// snapshot on macOS), no CPU sampling at all. (Before #4512 this had to
-// carefully avoid `cpu_headroom_limit`, whose macOS `iostat` refresh sleeps ~1s
-// and would have stalled every other IPC request on the same registry for that
-// second; removing the CPU term removed that hazard outright, and RAM headroom
-// deliberately preserves the same non-blocking contract.)
+// #12406 the headroom computed here is the configured cap alone — a cheap
+// config read, no host sampling at all.
 
-/// Per-repo dynamic-cap headroom snapshot computed for a `dispatch_sweep`
+/// Per-repo cap headroom snapshot computed for a `dispatch_sweep`
 /// request (#4234). Mirrors the inputs `build_daemon_status` already exposes
 /// on the status surface — no new plumbing, just the same math consulted at
 /// dispatch time instead of only at status-poll time.
 struct DispatchHeadroom {
     /// Live (non-terminal) sweep count already registered for this repo.
     occupancy: usize,
-    /// `resolve_dynamic_max_concurrent` — min(disk, ram, configured max). The
-    /// token axis no longer participates (#5270); `token_axis_limit` below is
-    /// kept as an informational account-health figure only.
+    /// The cap: the configured `maxConcurrent` (#12406). `token_axis_limit`
+    /// below is an informational account-health figure only.
     dynamic_cap: usize,
-    disk_headroom: usize,
-    ram_headroom: usize,
     token_axis_limit: usize,
 }
 
@@ -2109,24 +2147,15 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
         .count();
 
     let wf_config = crate::work_finder::read_work_finder_config(repo_root);
-    let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
-    let disk_headroom = crate::disk_headroom::disk_headroom_limit(repo_root);
-    let ram_headroom = crate::ram_headroom::ram_headroom_limit();
+    let dynamic_cap = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let token_pool_size = crate::tokens::token_pool_size(repo_root);
     let ranking = crate::capacity::read_ranking(repo_root);
     // Informational only since #5270 — no longer part of the dynamic cap.
     let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
-    let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
-        disk_headroom,
-        ram_headroom,
-        configured_max,
-    );
 
     DispatchHeadroom {
         occupancy,
         dynamic_cap,
-        disk_headroom,
-        ram_headroom,
         token_axis_limit,
     }
 }
@@ -2210,15 +2239,12 @@ fn dispatch_headroom_message(
     if low_headroom {
         format!(
             "dispatch_sweep: dispatching {kind:?} into {} while occupancy is at/over the \
-             computed dynamic-cap headroom (occupancy={} >= dynamic_cap={}; \
-             disk_headroom={}, ram_headroom={}, token_axis_limit={} [informational only, not \
-             capacity-limiting since #5270]) — advisory only per #4234 (dispatch \
+             cap (occupancy={} >= dynamic_cap={}; token_axis_limit={} [informational \
+             only, not capacity-limiting since #5270]) — advisory only per #4234 (dispatch \
              proceeds; the autonomous work finder's own cap is unaffected)",
             repo_root.display(),
             h.occupancy,
             h.dynamic_cap,
-            h.disk_headroom,
-            h.ram_headroom,
             h.token_axis_limit
         )
     } else {
@@ -2266,8 +2292,6 @@ fn emit_dispatch_headroom_advisory_on_change(
             "low_headroom": low_headroom,
             "occupancy": h.occupancy,
             "dynamic_cap": h.dynamic_cap,
-            "disk_headroom": h.disk_headroom,
-            "ram_headroom": h.ram_headroom,
             "token_axis_limit": h.token_axis_limit,
             "message": message,
         }),
@@ -2907,43 +2931,6 @@ fn handle_request(
             model_profile,
             dispatch_origin,
         } => {
-            // Host-distress circuit breaker (#4235): a *tripped* breaker
-            // represents SUSTAINED, already-observed host distress across
-            // multiple ticks — a materially stronger signal than the
-            // point-in-time headroom advisory below (which by #4234's deliberate
-            // design only *advises*, never blocks). Because the breaker's signal
-            // is stronger and stateful, it **hard-blocks** an explicit
-            // `dispatch_sweep` by default; an operator who truly wants to
-            // dispatch into a distressed host passes `force: true` to override.
-            // This is the one-sentence reconciliation the issue asks for: the
-            // breaker blocks where the headroom check advises *because* it fires
-            // only on proven, sustained distress, not a single-tick reading.
-            if !force {
-                if let Some(snap) = crate::host_breaker::global_snapshot() {
-                    if snap.suppressed {
-                        let releases = snap.releases_at.map_or_else(
-                            || " (host still hot — cool-down not yet started)".to_string(),
-                            |r| format!(" (cool-down releases at {r})"),
-                        );
-                        log::warn!(
-                            "dispatch_sweep: refused {kind:?} — host circuit breaker is {} \
-                             ({}){releases}; running work drains, new dispatch paused. \
-                             Re-run with force to override.",
-                            snap.phase.as_str(),
-                            snap.reason.as_deref().unwrap_or("sustained host distress"),
-                        );
-                        return Response::Error {
-                            message: format!(
-                                "dispatch_sweep refused: host circuit breaker is {} ({}).{releases} \
-                                 Running work is draining and new dispatch is paused (#4235). \
-                                 Re-run with force to override.",
-                                snap.phase.as_str(),
-                                snap.reason.as_deref().unwrap_or("sustained host distress"),
-                            ),
-                        };
-                    }
-                }
-            }
             // GitHub rate-limit circuit breaker (#4429/#4440, gap closed by
             // #4666): the daemon's own internal polling loops (work-finder,
             // claim/quarantine reconciliation, epic supervisor, role-runner)
@@ -2951,15 +2938,10 @@ fn handle_request(
             // now an explicit `dispatch_sweep` never consulted it, so a
             // brand-new sweep/judge/champion session could still be
             // dispatched while the shared forge rate-limit budget was in a
-            // known cooldown. This is a *distinct* breaker from the
-            // host-distress one above: different root cause (a `gh`
-            // rate-limit cooldown vs. host CPU/memory distress) and different
-            // remediation (waiting for the `gh` rate-limit reset vs. waiting
-            // for host load to drop) — see [`rate_limit_dispatch_refusal`]'s
-            // doc comment for why the decision itself is a pure, `force`-aware
+            // known cooldown. See [`rate_limit_dispatch_refusal`]'s doc
+            // comment for why the decision itself is a pure, `force`-aware
             // helper rather than inlined here. Hard-blocks by default;
-            // `force: true` overrides this breaker independently of the
-            // host-distress one.
+            // `force: true` overrides it.
             if let Some(refusal) = rate_limit_dispatch_refusal(
                 &kind,
                 crate::rate_limit_breaker::global_snapshot().as_ref(),
@@ -3023,13 +3005,11 @@ fn handle_request(
             // Model intent survives until the shared runtime-admission boundary.
             log::info!(
                 "dispatch_sweep: {:?}; \
-                 headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
+                 headroom occupancy={} dynamic_cap={} (tokens={} [informational \
                  only, not capacity-limiting since #5270])",
                 kind,
                 headroom.occupancy,
                 headroom.dynamic_cap,
-                headroom.disk_headroom,
-                headroom.ram_headroom,
                 headroom.token_axis_limit
             );
             match sr.dispatch_with_model(

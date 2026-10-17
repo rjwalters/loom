@@ -6,7 +6,9 @@
 //!    chosen by `hash(owner/repo) mod N` ([`crate::forge_read_pool`], #9248),
 //!    skipping any reader withdrawn after a rate-limit or auth failure. When
 //!    no reader is usable the caller falls back to the writer.
-//! 2. **Which credential does a write use?** Always the writer. Attributed
+//! 2. **Which credential does a write use?** Always a writer: the owner's
+//!    `forge.identities.writers[]` entry when one lists it ([`writer_for_owner`],
+//!    #12446), else the default writer. Attributed
 //!    actions (comments, labels, PRs, pushes, merges, leases, claims) keep one
 //!    predictable author, which is what ruleset bypass actors and every
 //!    "is this ours?" check rely on.
@@ -187,6 +189,14 @@ pub struct Roster {
     pub writer: Option<Identity>,
     /// Read-only Apps that carry forge reads.
     pub readers: Vec<Identity>,
+    /// Per-owner writer Apps (`forge.identities.writers[]`, #12446): a private
+    /// App cannot install on a second account, so a fleet spanning a user and
+    /// an org writes each owner's repos as the App installed there. An entry's
+    /// `owners` names the owners it writes for; [`writer_for_owner`] resolves
+    /// one, and [`Roster::writer`] stays the default for every other owner.
+    /// Empty (the key absent) keeps the single-writer behaviour.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub writers: Vec<Identity>,
     /// Extra logins believed as the fleet (renamed or retired Apps).
     pub legacy_logins: Vec<String>,
 }
@@ -244,6 +254,11 @@ pub fn from_config(
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(identity_from_value).collect())
                     .unwrap_or_default(),
+                writers: ids
+                    .get("writers")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(identity_from_value).collect())
+                    .unwrap_or_default(),
                 legacy_logins: ids
                     .get("legacyLogins")
                     .and_then(Value::as_array)
@@ -269,6 +284,7 @@ pub fn from_config(
                         owners: None,
                     })
                     .collect(),
+                writers: Vec::new(),
                 legacy_logins: Vec::new(),
             }
         };
@@ -280,17 +296,46 @@ pub fn from_config(
     if let Some(w) = &roster.writer {
         roster.readers.retain(|r| r.app_id != w.app_id);
     }
+    let writers = &roster.writers;
     roster
+        .readers
+        .retain(|r| !writers.iter().any(|w| w.app_id == r.app_id));
+    roster
+}
+
+/// The writer that writes for `owner` (case-insensitive): the first
+/// `writers[]` entry whose `owners` lists it, else the default
+/// [`Roster::writer`] (#12446). Mirrors `github-app-token.sh`, so the daemon
+/// and the scripts mint as the same App for an owner.
+#[must_use]
+pub fn writer_for_owner<'a>(roster: &'a Roster, owner: &str) -> Option<&'a Identity> {
+    roster
+        .writers
+        .iter()
+        .find(|w| {
+            w.owners
+                .as_ref()
+                .is_some_and(|l| l.iter().any(|o| o.eq_ignore_ascii_case(owner)))
+        })
+        .or(roster.writer.as_ref())
 }
 
 /// Config problems an operator should see: the writer declared in
 /// `forge.identities` disagreeing with `forge.githubApp`, or declared without
-/// it. `forge identities` prints these (the daemon also logs them), so a
-/// misconfiguration is visible where an operator checks, not only in a log.
+/// it, bad `owners` / `writers[]` entries, an env override that makes the shell
+/// ignore `writers[]`, and read-pool routing problems. `forge identities`
+/// prints these for one workspace. The daemon logs them once at startup, one
+/// WARN line per warning naming the workspace root, for every root of
+/// `WorkspaceRegistry::effective_roots` (its own workspace plus each
+/// registered one; `daemon_startup_reconciliation`), so a misconfiguration is
+/// visible where an operator checks and in the daemon's log. The env check
+/// reads the calling process's environment, which is why the daemon runs it
+/// itself.
 #[must_use]
 pub fn config_warnings(effective: &Value) -> Vec<String> {
     let mut out = writer_warnings(effective);
     out.extend(owners_warnings(effective));
+    out.extend(writers_warnings(effective));
     out.extend(route::routing_config_warnings(effective));
     out
 }
@@ -434,6 +479,80 @@ fn owners_warnings(effective: &Value) -> Vec<String> {
     out
 }
 
+/// Problems with `forge.identities.writers[]` (#12446): an entry that is not an
+/// App identity or lists no valid owner (it would never be chosen), an invalid
+/// owner name (dropped), and an owner claimed by two entries (the first wins).
+fn writers_warnings(effective: &Value) -> Vec<String> {
+    let env_override = ["LOOM_GITHUB_APP_ID", "LOOM_GITHUB_APP_KEY_PATH"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()));
+    writers_warnings_with(effective, env_override)
+}
+
+/// [`writers_warnings`] with the env-override state supplied by the caller.
+///
+/// `github-app-token.sh` lets `LOOM_GITHUB_APP_ID` / `LOOM_GITHUB_APP_KEY_PATH`
+/// beat everything, so with either set every credential delivery, agent write
+/// and `merge-pr.sh` run as that App for every owner. `forge token` (lease
+/// posting) never reads the override and still follows `writers[]`, so the two
+/// would author as different Apps with nothing pointing at the cause.
+fn writers_warnings_with(effective: &Value, env_override: bool) -> Vec<String> {
+    let Some(writers) = crate::config_resolver::get_path(effective, "forge.identities.writers")
+    else {
+        return Vec::new();
+    };
+    let Some(writers) = writers.as_array() else {
+        return vec!["forge.identities.writers must be an array; ignored".to_string()];
+    };
+    let mut out = Vec::new();
+    if env_override && !writers.is_empty() {
+        out.push(
+            "per-owner writers (forge.identities.writers) are ignored by github-app-token.sh while \
+             LOOM_GITHUB_APP_ID / LOOM_GITHUB_APP_KEY_PATH is set (credential delivery, agent and \
+             merge writes use the env App for every owner), but `forge token` still follows them — \
+             unset the override and provision through forge.githubApp"
+                .to_string(),
+        );
+    }
+    let mut claimed: Vec<(String, String)> = Vec::new();
+    for w in writers {
+        let id = w
+            .get("appId")
+            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+            .unwrap_or_else(|| "?".to_string());
+        if identity_from_value(w).is_none() {
+            out.push(format!(
+                "forge.identities.writers (app {id}): needs appId and privateKeyPath; ignored"
+            ));
+            continue;
+        }
+        let listed = w.get("owners").and_then(Value::as_array);
+        for bad in listed.into_iter().flatten().filter(|o| {
+            !o.as_str()
+                .is_some_and(|s| crate::forge_bucket_book::valid_owner(s.trim()))
+        }) {
+            out.push(format!(
+                "forge.identities.writers (app {id}): owners entry {bad} is not a GitHub owner name; dropped"
+            ));
+        }
+        let owners = owners_from_value(w).unwrap_or_default();
+        if owners.is_empty() {
+            out.push(format!(
+                "forge.identities.writers (app {id}): owners lists no valid owner, so the writer is never chosen — list the owners it writes for"
+            ));
+        }
+        for owner in owners {
+            match claimed.iter().find(|(o, _)| *o == owner) {
+                Some((_, first)) => out.push(format!(
+                    "forge.identities.writers: owner {owner} is claimed by app {first} and app {id}; app {first} is used"
+                )),
+                None => claimed.push((owner, id.clone())),
+            }
+        }
+    }
+    out
+}
+
 /// `~/…` → `$HOME/…`. `github-app-token.sh` does not expand `~`, so a
 /// tilde path in config silently reads as "key not readable"; expanding it
 /// here keeps the broker's own minting honest about the same config.
@@ -487,6 +606,7 @@ impl FleetLogins {
     pub fn of(roster: &Roster) -> Self {
         let mut names = BTreeSet::new();
         names.extend(roster.writer.as_ref().and_then(|w| w.slug.clone()));
+        names.extend(roster.writers.iter().filter_map(|w| w.slug.clone()));
         names.extend(roster.readers.iter().filter_map(|r| r.slug.clone()));
         names.extend(roster.legacy_logins.iter().cloned());
         Self {
@@ -562,7 +682,7 @@ pub fn role_of(roster: &Roster, login: &str) -> Option<&'static str> {
         return None;
     }
     let slug_is = |i: &Identity| i.slug.as_deref() == Some(n.as_str());
-    if roster.writer.as_ref().is_some_and(slug_is) {
+    if roster.writer.as_ref().is_some_and(slug_is) || roster.writers.iter().any(slug_is) {
         return Some("writer");
     }
     if roster.readers.iter().any(slug_is) {
@@ -795,21 +915,18 @@ pub fn apply_read_credential(
 pub enum IdentityRole {
     /// A reader App's own installation pool.
     Reader,
-    /// The writer credential, chosen up front (no usable reader, a write, or
-    /// a read pinned with `GhInvocation::writer_identity`).
+    /// The writer credential, chosen up front (no reader pool on the host, a
+    /// write, or a read pinned with `GhInvocation::writer_identity`).
     Writer,
-    /// The writer, re-running a read a reader failed on.
-    WriterFallback,
 }
 
 impl IdentityRole {
-    /// The accounting value: `reader` / `writer` / `writer-fallback`.
+    /// The accounting value: `reader` / `writer`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             IdentityRole::Reader => "reader",
             IdentityRole::Writer => "writer",
-            IdentityRole::WriterFallback => "writer-fallback",
         }
     }
 }
@@ -862,26 +979,23 @@ pub fn serving_writer_bucket(
     }
 }
 
-/// The one reader-then-writer retry shape (#9537, shared since #9872 by
-/// `forge_etag_store::fetch_conditional` and the `GhInvocation` choke point).
+/// The one reader-only read shape (#12394; was `reader_then_writer`, #9537/#9872).
 ///
-/// With no `reader_dir`, `run` is called once on the writer. Otherwise it runs
-/// on the reader first; a success, or a failure that is not the credential's
-/// (`failure_of` → `None`), is returned as-is. On a rate limit or credential
-/// failure the reader
-/// is withdrawn (`withdraw`, handed the reader's failed result) and the read
-/// re-runs once on the writer (any [`Failure::is_app_wide`] failure: a rate
-/// limit or a refused credential; W4-A scopes the withdrawal, not this
-/// retry). On a
-/// 403/404 ([`Failure::Coverage`]) the read re-runs on the writer and the
-/// reader is withdrawn **only if the writer succeeds**: a resource missing for
-/// everyone must not take the repo's reader offline.
+/// **A read never falls through to the writer.** With no `reader_dir` (the
+/// host has no reader pool, [`RouteDecision::NoPool`]: the writer is the only
+/// credential there is) `run` is called once as [`IdentityRole::Writer`].
+/// Otherwise it runs on the reader once, and whatever that attempt answers is
+/// returned as-is: a success, or a failure the caller already maps to "no
+/// answer this tick". On a rate limit or credential failure the reader is
+/// withdrawn (`withdraw`, handed the reader's failed result) so the next read
+/// is routed past it; a 403/404 ([`Failure::Coverage`]) is the reader's own
+/// answer and withdraws nothing (nothing confirms the resource exists for
+/// anyone, and the writer is not asked).
 ///
 /// # Errors
 ///
-/// Whatever `run` returns; an `Err` from the reader attempt is not retried
-/// (it means the call could not be made, not that the reader was refused).
-pub fn reader_then_writer<T, E>(
+/// Whatever `run` returns.
+pub fn read_via_reader<T, E>(
     reader_dir: Option<&Path>,
     mut run: impl FnMut(Option<&Path>, IdentityRole) -> Result<T, E>,
     succeeded: impl Fn(&T) -> bool,
@@ -895,18 +1009,12 @@ pub fn reader_then_writer<T, E>(
     if succeeded(&first) {
         return Ok(first);
     }
-    let Some(failure) = failure_of(&first) else {
-        return Ok(first);
-    };
-    if failure.is_app_wide() {
-        withdraw(failure, &first);
-        return run(None, IdentityRole::WriterFallback);
+    if let Some(failure) = failure_of(&first) {
+        if failure.is_app_wide() {
+            withdraw(failure, &first);
+        }
     }
-    let second = run(None, IdentityRole::WriterFallback)?;
-    if succeeded(&second) {
-        withdraw(failure, &first);
-    }
-    Ok(second)
+    Ok(first)
 }
 
 /// Whether a failed read is the credential's fault (see [`classify_failure`]).
