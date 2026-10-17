@@ -281,6 +281,7 @@ section for the full carve-out list).
 **After approval (green → blue):**
 ```bash
 ./.loom/scripts/post-verdict.sh <number> approved "$VERDICT_SHA" \
+    --review-started "$REVIEW_STARTED" --issue-body-sha "<N>=$ISSUE_HASH_N" \
     --body "LGTM! Code quality is excellent, tests pass, implementation is solid."
 ```
 
@@ -290,7 +291,9 @@ section for the full carve-out list).
     --body "Issues found that need addressing before approval..."
 ```
 
-**`post-verdict.sh` applies the verdict label itself (#10581)** and verifies it: approve leaves `loom:pr` and strips `loom:changes-requested`, `loom:ci-failure`, `loom:reviewing`, `loom:review-requested`; changes-requested leaves `loom:changes-requested` and strips `loom:pr`, `loom:reviewing`, `loom:review-requested`. A trailing `&& gh pr edit` in older examples below is redundant but harmless **only because `post-verdict.sh` ran first and stamped the marker**; never add `loom:pr` with a bare `gh pr edit` as the approval itself (#12136). Add only companions (`loom:ci-failure`, `loom:merge-conflict`) yourself. The label is the PRIMARY deliverable — the sweep validates labels, not comments — so **exit 8** (comment posted, labels did not hold) means run the printed repair command now. **Exit 7**, no approval stands: `loom:ci-failure` is on the PR, another verdict at this same head is changes-requested (do not approve over it without a new push; `--overrules-prior "<why each point no longer blocks>"` only when you verified every point), the PR state was unreadable, or a concurrent changes-requested from another host won (labels flipped). A same-head repeat within 10 minutes is deduped: stand down.
+**Stale-Read Gate (#12614).** A review is a statement about the spec as you read it. If the operator comments on the PR or the linked issue, or rewrites the issue body, while you review, your approval is against a stale read (PR #12512 / #12509: approved the old design after the operator said it was rescoped). So capture `REVIEW_STARTED` (UTC, RFC 3339) before reading the PR or issue, and the sha256 of each linked issue body as you read it, and give both to every `approved` call: `--review-started "$REVIEW_STARTED" --issue-body-sha "N=$HASH"`. `verdict-gate` then refuses (exit 7, nothing posted, naming the comment or issue) when a trusted human comment on the PR or a linked issue is newer than `REVIEW_STARTED`, or a body no longer hashes to what you reviewed. Remedy: read what changed, re-review against the **current** spec, capture a fresh `REVIEW_STARTED` and hashes, and retry. Bot and Loom-marker comments never trigger it; `changes-requested` is never refused by it. A missing `--review-started` skips the check with a warning, so never omit it on an approval.
+
+**`post-verdict.sh` applies the verdict label itself (#10581)** and verifies it: approve leaves `loom:pr` and strips `loom:changes-requested`, `loom:ci-failure`, `loom:reviewing`, `loom:review-requested`; changes-requested leaves `loom:changes-requested` and strips `loom:pr`, `loom:reviewing`, `loom:review-requested`. A trailing `&& gh pr edit` in older examples below is redundant but harmless **only because `post-verdict.sh` ran first and stamped the marker**; never add `loom:pr` with a bare `gh pr edit` as the approval itself (#12136). Add only companions (`loom:ci-failure`, `loom:merge-conflict`) yourself. The label is the PRIMARY deliverable — the sweep validates labels, not comments — so **exit 8** (comment posted, labels did not hold) means run the printed repair command now. **Exit 7**, no approval stands: a human commented or the issue was rescoped since `REVIEW_STARTED` (Stale-Read Gate: re-review, do not just re-run), `loom:ci-failure` is on the PR, another verdict at this same head is changes-requested (do not approve over it without a new push; `--overrules-prior "<why each point no longer blocks>"` only when you verified every point), the PR state was unreadable, or a concurrent changes-requested from another host won (labels flipped). A same-head repeat within 10 minutes is deduped: stand down.
 
 **Label transitions:**
 - `loom:review-requested` (green) → `loom:pr` (blue) [approved, ready for Champion auto-merge]
@@ -438,7 +441,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
        # Attempt automated rebase (see detailed workflow in Rebase Check section)
    fi
    ```
-4. **Understand context**: Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
+4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)`; see "Stale-Read Gate" under Verdict SHA Marker): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
 4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist, skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
 5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see Rebase Check section below)
@@ -458,7 +461,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 9. **Evaluate changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `./.loom/scripts/post-verdict.sh` to provide evaluation feedback
 11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **Run the Verdict-Time CAS Recheck (see below) immediately before this step** — abort instead of writing if it finds your claim lost, another Judge's verdict already landed, or the head SHA moved off `REVIEW_HEAD_SHA`. It yields `$VERDICT_SHA`, which `post-verdict.sh` MUST be given (see "Verdict SHA Marker") — the script stamps the `<!-- loom:verdict-sha ... -->` marker itself. The script applies the label (the PRIMARY deliverable) itself; see Label Workflow for exits 7/8:
-   - If approved: `post-verdict.sh <number> approved "$VERDICT_SHA" --body ...` (blue `loom:pr` - ready for Champion auto-merge)
+   - If approved: `post-verdict.sh <number> approved "$VERDICT_SHA" --review-started "$REVIEW_STARTED" --issue-body-sha "<N>=$ISSUE_HASH_N" --body ...` (blue `loom:pr` - ready for Champion auto-merge)
    - If changes needed: `post-verdict.sh <number> changes-requested "$VERDICT_SHA" --body ...` (amber - Doctor will address)
    - Then release the PR lease: `loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (also on any stand-down)
 
@@ -753,7 +756,9 @@ emit those spellings yourself.
     --body "..." | --body-file <path>
 ```
 
-never a bare `gh pr comment` (#6382). `$VERDICT_SHA` is the `headRefOid` read
+never a bare `gh pr comment` (#6382). Every **approval** also passes
+`--review-started "$REVIEW_STARTED"` and one `--issue-body-sha "N=$HASH"` per linked issue
+(the "Stale-Read Gate" below, #12614). `$VERDICT_SHA` is the `headRefOid` read
 in the Verdict-Time CAS Recheck immediately above the write; `post-verdict.sh`
 appends the marker itself —
 
