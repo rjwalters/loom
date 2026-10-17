@@ -43,6 +43,7 @@ async fn the_old_binary_does_not_pause_again_for_the_target_that_just_failed() {
         to_version: Some(RUNNING.to_string()),
         to_artifact_sha256: Some("abcd".to_string()),
         label: Some(format!("v{RUNNING}@abcd")),
+        floor_at_arm: None,
     };
 
     let started = start_pause_roll(&drain, &pool, &root, &bus, &target);

@@ -946,6 +946,28 @@ Consequences:
   and that tick is skipped; `restart --abort-drain` clears the record and
   releases the hold. A `stopped` host exits at boot, before the loop exists.
 
+### Cancelling an armed floor roll: roll the floor back (#12610)
+
+A floor roll that was armed for a release the operator then withdrew is
+cancelled by **rolling `loom_min_version` back** in the fleet store. Two checks
+act on it, both only while the roll has stopped no agent:
+
+- **On sync.** A host whose synced floor is now met by its running version
+  disarms the pending roll at once (the floor change wakes the self-update loop).
+- **Before H4 stops anything.** After the manifest is written and before the
+  first agent is stopped, H4 re-reads the floor *from the store*, not from the
+  last sync. If it is lower than the floor the roll was armed under, or the
+  running version now meets it, the roll disarms: dispatch resumes, the pause
+  requests and manifest are removed, nothing is stopped, the staged binary is
+  left unused, and `daemon.roll.disarmed` is emitted with the reason. An
+  unreadable or unknown floor never disarms.
+
+Once the first agent is stopped the roll is committed and completes onto the
+armed target; `restart --abort-drain` is refused as before. The window is the
+seconds between the fetch decision and H4 step 4, so roll the floor back
+promptly and run `loom-daemon status` on any host that logged `drain_wait` to
+see whether it disarmed. Only floor-driven rolls are withdrawn this way.
+
 ## 14. Host maintenance: pause and stay down (#11812)
 
 Operator direction (2026-10-13): host maintenance (instance resize, rebuild,

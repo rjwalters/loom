@@ -37,6 +37,7 @@ pub(super) fn target() -> RollTarget {
         to_version: Some("0.19.900".to_string()),
         to_artifact_sha256: Some("abcd".to_string()),
         label: Some("v0.19.900@abcd".to_string()),
+        floor_at_arm: None,
     }
 }
 
@@ -133,6 +134,8 @@ pub(super) struct FakeHost {
     pub(super) requeue_fails: bool,
     /// Called with the item id at the start of each teardown.
     pub(super) on_teardown: Option<Hook>,
+    /// What a fresh read of the fleet floor answers (#12610).
+    pub(super) floor: crate::fleet_sync::FloorKnowledge,
 }
 
 impl PauseHost for FakeHost {
@@ -195,6 +198,9 @@ impl PauseHost for FakeHost {
             .unwrap()
             .push((topic.to_string(), payload));
     }
+    fn fresh_floor(&self) -> crate::fleet_sync::FloorKnowledge {
+        self.floor.clone()
+    }
 }
 
 impl FakeHost {
@@ -247,6 +253,54 @@ pub(super) fn cand(dir: &Path, id: &str, issue: u32, age_secs: i64) -> Candidate
         holds_issue_creation_mutex: false,
         pr: None,
         step: None,
+    }
+}
+
+/// #12610: a floor rolled back while the roll was armed (this host synced it
+/// after arming) disarms the roll before any agent is stopped: dispatch
+/// resumes, nothing is torn down, and the disarm is announced.
+#[test]
+fn a_floor_rolled_back_before_the_stop_disarms_the_roll() {
+    let dir = tempfile::tempdir().unwrap();
+    let drain = Arc::new(DrainState::new());
+    let mut plan = begin(&drain, dir.path(), tuning(30_000));
+    plan.target.floor_at_arm = Some("0.19.900".to_string());
+    let host = Arc::new(FakeHost {
+        cands: vec![cand(dir.path(), "young", 1, 10)],
+        floor: crate::fleet_sync::FloorKnowledge::Set("0.19.890".to_string()),
+        ..FakeHost::default()
+    });
+    assert_eq!(run_h4(&drain, host.clone(), &plan), H4Outcome::StoodDown { promoted: false });
+    assert!(!drain.is_draining(), "dispatch resumed");
+    assert!(host.torn.lock().unwrap().is_empty(), "no agent was stopped");
+    assert!(!plan.manifest_path.exists());
+    let events = host.events.lock().unwrap();
+    let disarmed = events.iter().find(|(t, _)| t == "daemon.roll.disarmed");
+    assert!(
+        disarmed.is_some_and(|(_, p)| p["reason"].as_str().unwrap().contains("lowered")),
+        "{events:?}"
+    );
+}
+
+/// #12610: a floor that still stands (or whose value cannot be read) leaves
+/// the roll alone, and the roll completes unchanged.
+#[test]
+fn a_floor_that_still_demands_the_roll_does_not_disarm_it() {
+    for floor in [
+        crate::fleet_sync::FloorKnowledge::Set("0.19.900".to_string()),
+        crate::fleet_sync::FloorKnowledge::Unknown("store unreachable".to_string()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let drain = Arc::new(DrainState::new());
+        let mut plan = begin(&drain, dir.path(), tuning(30_000));
+        plan.target.floor_at_arm = Some("0.19.900".to_string());
+        let host = Arc::new(FakeHost {
+            cands: vec![cand(dir.path(), "young", 1, 10)],
+            floor,
+            ..FakeHost::default()
+        });
+        assert!(matches!(run_h4(&drain, host.clone(), &plan), H4Outcome::Paused { .. }));
+        assert_eq!(host.torn.lock().unwrap().len(), 1, "the roll went ahead");
     }
 }
 
