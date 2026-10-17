@@ -8,6 +8,11 @@ peer-claim channel and the #7477 cooldown broadcast) is deleted in a later
 slice of the same issue. This ADR stands on its own and does not depend on any
 safehouse document, since those are being deleted too.
 
+Amended by [ADR-0027](0027-captain-owned-fleet-coordination.md) (2026-10-17):
+decision 2 covers only the #7477 cooldown window. The landed cooldown, the
+fleet fast-fail streak and the fleet no-op streak were added after this ADR,
+are not covered by it, and are not dropped by it.
+
 Partly supersedes [ADR-0014](0014-forge-coordination-decoupling.md)
 where that ADR treats safehouse as a coordination accelerator.
 
