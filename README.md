@@ -25,7 +25,7 @@ Loom spawns AI agents that claim issues, implement features, review PRs, and mer
 Loom's [operating modes](docs/operating-modes.md) distinguish fleet operation,
 an isolated local daemon, and operator-directed sessions. That document records
 the intended support contract, current gaps in running without a daemon
-installed, and the proposed separation of CLI tools from the work engine.
+installed, and the planned separation of CLI tools from the work engine.
 
 ```bash
 # Clone and install to your repository

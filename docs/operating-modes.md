@@ -118,19 +118,22 @@ validation of conflicting controls and when a mode change takes effect remain
 implementation design work. No control files or running modes are changed by
 this documentation.
 
-## CLI packaging: proposal, not a selected implementation
+## CLI packaging: approved direction, implementation pending
 
 Consolidating helper logic in Rust must preserve operation without the daemon
-installed. One option raised by the operator is a single **`loom-tools`**
-executable containing the agent-facing CLI. Under that proposal, sessions and
-shell wrappers would invoke the tools directly, while `loom-daemon` would own
-the continuously running work engine. Shared Rust libraries could avoid
-duplicating workflow logic between them.
+installed. The operator approved **`loom-tools` as the standard agent-facing
+CLI in all three modes**, with `loom-daemon` owning the continuously running
+work engine. Both reuse shared Rust library implementations: agents invoke
+the tools CLI, while the daemon calls library functions directly. The migration
+is tracked in [epic #12708](https://github.com/rjwalters/loom/issues/12708),
+with a Claude-coordinated Fable proposal review requested.
 
-The executable name, command layout, extraction scope and migration plan remain
-open. This direction does not require replacing every shell script now, adding
-a daemon token-vending service, or moving local users onto Cloudflare. Current
-language-policy guidance is not evidence that the proposed package exists.
+The command layout, extraction boundaries and installation/version contract
+remain design work under the epic. Reuse the current Rust implementations,
+migrate coherent command families, preserve compatibility through thin wrappers,
+then retire migrated wrappers once consumers have moved. This does not require
+a wholesale crate rewrite, a daemon token-vending service or Cloudflare for
+local users. Direction approval is not evidence that the package has shipped.
 
 ## Current implementation gaps and follow-up checks
 
