@@ -7,6 +7,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-17
+- **PR #12593**: test: cover a match on a non-first forbiddenDiffPatterns entry
+- **Issue #12607** (closed): 1177: write-scope guard refuses step_ledger ladder writes as 'not in this App installation' after reads moved to readers
+- **Issue #12590** (closed): Champion standing authorization: test a hit on a non-first forbiddenDiffPatterns entry (follow-up to #12529)
+- **Issue #11332** (closed): A real fleet commit is authored as the test-fixture identity Loom CI <ci@loom.test>
+- **Issue #10862** (closed): Issue body rewritten mid-build is invisible to the in-flight Builder and to the Judge: stale-spec PR approved and merged
 - **PR #12588**: Make every daemon read reader-only, whatever builder made it (#12584)
 - **PR #12587**: fix: treat merged group predecessor as satisfied; skip unchanged group statuses
 - **PR #12583**: fix: make merge-queue handoff idempotent and refuse a writer that cannot post statuses
