@@ -37,6 +37,7 @@ pub(crate) mod codex_hooks;
 pub(crate) mod codex_sandbox_noop_cli;
 pub(crate) mod codex_usage_cli;
 pub(crate) mod common;
+pub(crate) mod config_get;
 mod daemon_start;
 mod daemon_update;
 pub(crate) mod dep_classify;
