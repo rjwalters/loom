@@ -88,7 +88,11 @@ fn a_grant_carries_its_assignment_and_a_refusal_its_reason() {
     ] {
         let server = refusing(wire);
         enable(dir.path(), &server.url(), true);
-        assert_eq!(claim(dir.path(), 7, StepRole::Judge), Ask::Refused(reason));
+        let refusal = Refusal {
+            held_by: None,
+            retry_after_s: Some(30),
+        };
+        assert_eq!(claim(dir.path(), 7, StepRole::Judge), Ask::Refused(reason, refusal));
     }
     assert_eq!(refusal_token(RefusalReason::Held), "captain_held");
     assert_eq!(refusal_token(RefusalReason::Cooldown), "captain_cooldown");

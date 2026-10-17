@@ -140,9 +140,11 @@ pub struct StepRefusal {
     pub reason: &'static str,
     pub detail: String,
     /// How the pre-claim ran, when it was the refusal (#12183).
-    pub claim: Option<lease::ClaimFacts>,
+    pub claim: Option<Box<lease::ClaimFacts>>,
     /// The captain's assignment the refusal gave back (#12450).
     pub assignment_id: Option<String>,
+    /// What the captain's refusal said beyond its reason (#12707).
+    pub captain: Option<Box<crate::fleet_dispatch::worker::Refusal>>,
 }
 
 impl StepRefusal {
@@ -152,15 +154,22 @@ impl StepRefusal {
             detail: detail.to_string(),
             claim: None,
             assignment_id: None,
+            captain: None,
         }
     }
 
     /// A refusal of the fleet-dispatch server's (#12450): no forge call ran.
-    pub(crate) fn captain(reason: crate::fleet_dispatch::proto::RefusalReason) -> Self {
-        Self::new(
-            crate::fleet_dispatch::worker::refusal_token(reason),
-            format!("the fleet-dispatch server refused the claim ({})", reason.as_str()),
-        )
+    pub(crate) fn captain(
+        reason: crate::fleet_dispatch::proto::RefusalReason,
+        refusal: crate::fleet_dispatch::worker::Refusal,
+    ) -> Self {
+        Self {
+            captain: Some(Box::new(refusal)),
+            ..Self::new(
+                crate::fleet_dispatch::worker::refusal_token(reason),
+                format!("the fleet-dispatch server refused the claim ({})", reason.as_str()),
+            )
+        }
     }
 }
 
@@ -176,7 +185,7 @@ pub(crate) fn captain_claim(
     match crate::fleet_dispatch::worker::claim(root, item, role) {
         Ask::Off | Ask::FailOpen => Ok(None),
         Ask::Granted(grant) => Ok(Some(grant)),
-        Ask::Refused(reason) => Err(StepRefusal::captain(reason)),
+        Ask::Refused(reason, refusal) => Err(StepRefusal::captain(reason, refusal)),
     }
 }
 
@@ -292,8 +301,9 @@ impl SweepRegistry {
                 dispatch_step::RESULT_REFUSED,
                 refusal.reason,
                 None,
-                refusal.claim.as_ref(),
+                refusal.claim.as_deref(),
                 refusal.assignment_id.as_deref(),
+                refusal.captain.as_deref(),
             );
             log::info!(
                 "sweep_registry: {} step on #{} not spawned — {refusal}",
@@ -618,6 +628,7 @@ impl SweepRegistry {
                 None,
                 claim.as_ref(),
                 refusal.assignment_id.as_deref(),
+                None,
             );
             return Err(refusal.into());
         }
@@ -679,6 +690,7 @@ impl SweepRegistry {
             Some(&sweep_id),
             claim.as_ref(),
             assignment.as_ref().map(|g| g.assignment_id.as_str()),
+            None,
         );
         if let Some(grant) = assignment {
             crate::fleet_dispatch::worker::note_spawned(
@@ -703,6 +715,7 @@ impl SweepRegistry {
     }
 
     /// The `loom.dispatch.step` span for one attempt.
+    #[allow(clippy::too_many_arguments)]
     fn record_step_dispatch(
         &self,
         request: &StepSpawnRequest,
@@ -711,6 +724,7 @@ impl SweepRegistry {
         sweep_id: Option<&str>,
         claim: Option<&lease::ClaimFacts>,
         assignment_id: Option<&str>,
+        captain: Option<&crate::fleet_dispatch::worker::Refusal>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -726,6 +740,7 @@ impl SweepRegistry {
                 sweep_id,
                 claim,
                 assignment_id,
+                captain,
             },
         );
     }
