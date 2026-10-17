@@ -229,6 +229,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart) | log, OTLP only | `ipc.rs` (`handle_client` run-state verbs), `observability/run_state_request.rs` |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` and the per-call checks, `emit_refused`) |
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
+| [`hold.transition`](#holdtransition--a-hold-label-applied-to-or-removed-from-a-pr) | log, OTLP only | `park_record/apply.rs` (`journal_hold_add`), `cli/park_record.rs` (`released`), drained by `observability/hold_transition.rs` |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
 
@@ -4046,6 +4047,37 @@ provenance does not validate is not exported. Attributes: `loom.pr_number` and
 `version` / `revision` / `provenance_complete`
 (`MERGE_QUEUE_EVENT_LOG_ATTRIBUTE_KEYS`, kept by the collector's
 `transform/privacy` `keep_keys`, contract-tested). Both timestamps are `at`.
+
+
+### `hold.transition` — a hold label applied to or removed from a PR
+
+One OTLP log (INFO) per Champion hold-label write (Issue #12665, #12653 F2):
+`add` from `park-record apply --by champion` (the merge-risk and critical-file
+holds) and `remove` from `park-record released` (Champion's reversal pass).
+The writers append to the role tick's pick journal and the daemon drains it at
+the end of the tick, so no forge read or polling is added. **OTLP-only**
+(`native: false`).
+
+One record per (PR, transition): an `add` is journaled only when `loom:blocked`
+was not already on the PR, so the every-tick idempotent re-apply emits nothing.
+`confirmed` is `false` for a write that was attempted and failed. An `add`
+opens an episode (`episode_id` = `owner/repo#pr@<unix secs>`, `entered_at` =
+the write). A `remove` cannot name the episode without a forge read: it carries
+the `entered_at` its caller passed, else `entered_at_lower_bound: true` and no
+`entered_at`; a first-seen time is never stamped as the entry. Consumers join a
+`remove` to the latest `add` for the PR. The `merge-pr.sh` #8112 refusal
+(`loom:pr` + `loom:blocked`) only reports an existing hold and writes no label,
+so it emits nothing.
+
+Attributes: `loom.repo`, `loom.pr_number` and `loom.hold.transition` /
+`reason_code` (`merge-risk-hold`, `critical-file-hold`, `champion-park`,
+`hold-released`) / `trigger` (`champion_role`, `release_precheck`) /
+`confirmed` / `episode_id` and `entered_at` (when known) /
+`entered_at_lower_bound` / `version` / `revision` / `provenance_complete`
+(`HOLD_TRANSITION_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested). Log time is the write
+(`event_at`); `observed_at` is when the daemon drained the journal. A record
+whose provenance does not validate is not exported.
 
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused
