@@ -12,38 +12,14 @@
 //! from the two new struct fields.
 
 use super::super::*;
-use super::ts;
+use super::{baseline_host_health, ts};
 
 #[test]
 fn host_health_omits_built_at_when_unknown() {
     // `build.rs` stamps the literal "unknown" when the build host had no
     // usable `date`; that must serialize as an ABSENT field, never as a
     // fabricated instant (the struct's "unknown != zero" contract).
-    let record = TelemetryRecord::HostHealth(HostHealthRecord {
-        captured_at: ts(),
-        daemon_version: "0.17.0".to_string(),
-        build_commit: "unknown".to_string(),
-        built_at: None,
-        uptime_sec: 1,
-        logical_cpus: 4,
-        cpu_idle_fraction: None,
-        load_per_core: None,
-        worktree_root_free_gb: None,
-        worktree_root_total_gb: None,
-        active_sweep_ids: Vec::new(),
-        managed_repos: Vec::new(),
-        roles: RoleTickHealth::default(),
-        protection: None,
-        is_captain: None,
-        armed_singleton_jobs: Vec::new(),
-        captainless_singleton_jobs: Vec::new(),
-        exported_kinds: Vec::new(),
-        exporters: Vec::new(),
-        otlp_export: None,
-        memory: None,
-        agent_scopes: Vec::new(),
-        agent_scopes_total: None,
-    });
+    let record = TelemetryRecord::HostHealth(baseline_host_health());
     let value = serde_json::to_value(&record).unwrap();
     assert!(
         value.get("built_at").is_none(),
@@ -66,31 +42,7 @@ fn host_health_omits_built_at_when_unknown() {
 fn host_health_omits_managed_repos_when_empty() {
     // `skip_serializing_if = "Vec::is_empty"` — a host with no registered
     // workspaces sends no key at all, mirroring `active_sweep_ids`.
-    let record = TelemetryRecord::HostHealth(HostHealthRecord {
-        captured_at: ts(),
-        daemon_version: "0.17.0".to_string(),
-        build_commit: "unknown".to_string(),
-        built_at: None,
-        uptime_sec: 1,
-        logical_cpus: 4,
-        cpu_idle_fraction: None,
-        load_per_core: None,
-        worktree_root_free_gb: None,
-        worktree_root_total_gb: None,
-        active_sweep_ids: Vec::new(),
-        managed_repos: Vec::new(),
-        roles: RoleTickHealth::default(),
-        protection: None,
-        is_captain: None,
-        armed_singleton_jobs: Vec::new(),
-        captainless_singleton_jobs: Vec::new(),
-        exported_kinds: Vec::new(),
-        exporters: Vec::new(),
-        otlp_export: None,
-        memory: None,
-        agent_scopes: Vec::new(),
-        agent_scopes_total: None,
-    });
+    let record = TelemetryRecord::HostHealth(baseline_host_health());
     let value = serde_json::to_value(&record).unwrap();
     assert!(
         value.get("managed_repos").is_none(),
@@ -105,33 +57,12 @@ fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
     // nothing to report — but its empty `persistent` list is omitted from
     // the wire, mirroring `managed_repos`/`active_sweep_ids`.
     let record = TelemetryRecord::HostHealth(HostHealthRecord {
-        captured_at: ts(),
-        daemon_version: "0.17.0".to_string(),
-        build_commit: "unknown".to_string(),
-        built_at: None,
-        uptime_sec: 1,
-        logical_cpus: 4,
-        cpu_idle_fraction: None,
-        load_per_core: None,
-        worktree_root_free_gb: None,
-        worktree_root_total_gb: None,
-        active_sweep_ids: Vec::new(),
-        managed_repos: Vec::new(),
         roles: RoleTickHealth {
             total: 5,
             ok: 5,
             persistent: Vec::new(),
         },
-        protection: None,
-        is_captain: None,
-        armed_singleton_jobs: Vec::new(),
-        captainless_singleton_jobs: Vec::new(),
-        exported_kinds: Vec::new(),
-        exporters: Vec::new(),
-        otlp_export: None,
-        memory: None,
-        agent_scopes: Vec::new(),
-        agent_scopes_total: None,
+        ..baseline_host_health()
     });
     let value = serde_json::to_value(&record).unwrap();
     let roles = value.get("roles").unwrap();
@@ -145,31 +76,7 @@ fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
 fn host_health_omits_worktree_root_total_gb_when_unmeasurable() {
     // "unknown != zero" (#4164/#5356): an unmeasurable total must be
     // ABSENT from the wire, never a fabricated 0.
-    let record = TelemetryRecord::HostHealth(HostHealthRecord {
-        captured_at: ts(),
-        daemon_version: "0.17.0".to_string(),
-        build_commit: "unknown".to_string(),
-        built_at: None,
-        uptime_sec: 1,
-        logical_cpus: 4,
-        cpu_idle_fraction: None,
-        load_per_core: None,
-        worktree_root_free_gb: None,
-        worktree_root_total_gb: None,
-        active_sweep_ids: Vec::new(),
-        managed_repos: Vec::new(),
-        roles: RoleTickHealth::default(),
-        protection: None,
-        is_captain: None,
-        armed_singleton_jobs: Vec::new(),
-        captainless_singleton_jobs: Vec::new(),
-        exported_kinds: Vec::new(),
-        exporters: Vec::new(),
-        otlp_export: None,
-        memory: None,
-        agent_scopes: Vec::new(),
-        agent_scopes_total: None,
-    });
+    let record = TelemetryRecord::HostHealth(baseline_host_health());
     let value = serde_json::to_value(&record).unwrap();
     assert!(
         value.get("worktree_root_total_gb").is_none(),
@@ -184,31 +91,7 @@ fn host_health_omits_protection_when_absent() {
     // `None` (a pre-#5352 daemon, or a probe that could not construct a
     // report at all) must be absent from the wire, not a fabricated
     // `"unknown"` verdict.
-    let record = TelemetryRecord::HostHealth(HostHealthRecord {
-        captured_at: ts(),
-        daemon_version: "0.17.0".to_string(),
-        build_commit: "unknown".to_string(),
-        built_at: None,
-        uptime_sec: 1,
-        logical_cpus: 4,
-        cpu_idle_fraction: None,
-        load_per_core: None,
-        worktree_root_free_gb: None,
-        worktree_root_total_gb: None,
-        active_sweep_ids: Vec::new(),
-        managed_repos: Vec::new(),
-        roles: RoleTickHealth::default(),
-        protection: None,
-        is_captain: None,
-        armed_singleton_jobs: Vec::new(),
-        captainless_singleton_jobs: Vec::new(),
-        exported_kinds: Vec::new(),
-        exporters: Vec::new(),
-        otlp_export: None,
-        memory: None,
-        agent_scopes: Vec::new(),
-        agent_scopes_total: None,
-    });
+    let record = TelemetryRecord::HostHealth(baseline_host_health());
     let value = serde_json::to_value(&record).unwrap();
     assert!(
         value.get("protection").is_none(),
@@ -225,29 +108,9 @@ fn host_health_free_without_total_serializes_with_no_fabricated_denominator() {
     // measured total yet) must still send its free reading — and must
     // NEVER synthesize a total to go with it.
     let record = TelemetryRecord::HostHealth(HostHealthRecord {
-        captured_at: ts(),
-        daemon_version: "0.17.0".to_string(),
         build_commit: "8c16fb5b".to_string(),
-        built_at: None,
-        uptime_sec: 1,
-        logical_cpus: 4,
-        cpu_idle_fraction: None,
-        load_per_core: None,
         worktree_root_free_gb: Some(200),
-        worktree_root_total_gb: None,
-        active_sweep_ids: Vec::new(),
-        managed_repos: Vec::new(),
-        roles: RoleTickHealth::default(),
-        protection: None,
-        is_captain: None,
-        armed_singleton_jobs: Vec::new(),
-        captainless_singleton_jobs: Vec::new(),
-        exported_kinds: Vec::new(),
-        exporters: Vec::new(),
-        otlp_export: None,
-        memory: None,
-        agent_scopes: Vec::new(),
-        agent_scopes_total: None,
+        ..baseline_host_health()
     });
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(
@@ -269,32 +132,11 @@ fn host_health_omits_watchdog_provisioned_when_the_probe_could_not_answer() {
     // provisioning check itself could not answer (no launchctl/systemctl).
     // `watchdog_provisioned` must be absent, not a fabricated `false`.
     let record = TelemetryRecord::HostHealth(HostHealthRecord {
-        captured_at: ts(),
-        daemon_version: "0.17.0".to_string(),
-        build_commit: "unknown".to_string(),
-        built_at: None,
-        uptime_sec: 1,
-        logical_cpus: 4,
-        cpu_idle_fraction: None,
-        load_per_core: None,
-        worktree_root_free_gb: None,
-        worktree_root_total_gb: None,
-        active_sweep_ids: Vec::new(),
-        managed_repos: Vec::new(),
-        roles: RoleTickHealth::default(),
         protection: Some(HostProtectionSummary {
             state: "unknown".to_string(),
             watchdog_provisioned: None,
         }),
-        is_captain: None,
-        armed_singleton_jobs: Vec::new(),
-        captainless_singleton_jobs: Vec::new(),
-        exported_kinds: Vec::new(),
-        exporters: Vec::new(),
-        otlp_export: None,
-        memory: None,
-        agent_scopes: Vec::new(),
-        agent_scopes_total: None,
+        ..baseline_host_health()
     });
     let value = serde_json::to_value(&record).unwrap();
     let protection = value.get("protection").unwrap();
@@ -333,29 +175,8 @@ fn sample_record_for_otlp_export(
     otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
 ) -> TelemetryRecord {
     TelemetryRecord::HostHealth(HostHealthRecord {
-        captured_at: ts(),
-        daemon_version: "0.17.0".to_string(),
-        build_commit: "unknown".to_string(),
-        built_at: None,
-        uptime_sec: 1,
-        logical_cpus: 4,
-        cpu_idle_fraction: None,
-        load_per_core: None,
-        worktree_root_free_gb: None,
-        worktree_root_total_gb: None,
-        active_sweep_ids: Vec::new(),
-        managed_repos: Vec::new(),
-        roles: RoleTickHealth::default(),
-        protection: None,
-        is_captain: None,
-        armed_singleton_jobs: Vec::new(),
-        captainless_singleton_jobs: Vec::new(),
-        exported_kinds: Vec::new(),
-        exporters: Vec::new(),
         otlp_export,
-        memory: None,
-        agent_scopes: Vec::new(),
-        agent_scopes_total: None,
+        ..baseline_host_health()
     })
 }
 
