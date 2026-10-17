@@ -5,6 +5,9 @@
 //! The unit of rotation is a whole `### YYYY-MM-DD` section, moved
 //! byte-for-byte. Everything else (the preamble, any other heading and its
 //! body) stays where it is; the `## Archives` index is regenerated in place.
+//!
+//! `--plan` switches both verbs to `WORK_PLAN.md` (issue #12635, slice 3):
+//! marker-driven, no date logic; see `work_plan_archive.rs`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -32,18 +35,31 @@ pub(crate) enum WorkDocsCommand {
     /// writes nothing when an archive already holds a date being moved, an
     /// archive path is not a regular file, or conservation (`check`) would not
     /// hold afterwards. A log with no parseable date headings is a no-op.
+    ///
+    /// With `--plan`, archives `WORK_PLAN.md` instead: only sections marked
+    /// `<!-- loom:plan-archive -->` move; the generated region never does.
     Archive(ArchiveArgs),
     /// Verify every `- **PR #N**` / `- **Issue #N**` bullet appears exactly
     /// once across `WORK_LOG.md` and its archives, and that the `## Archives`
-    /// index links resolve.
-    Check(RootArgs),
+    /// index links resolve. With `--plan`, verify `WORK_PLAN.md` instead.
+    Check(CheckArgs),
 }
 
 #[derive(clap::Args)]
 pub(crate) struct RootArgs {
     /// Directory holding `WORK_LOG.md` (default: the current directory).
     #[arg(long, value_name = "DIR", default_value = ".")]
-    root: PathBuf,
+    pub(super) root: PathBuf,
+}
+
+#[derive(clap::Args)]
+pub(crate) struct CheckArgs {
+    #[command(flatten)]
+    root: RootArgs,
+
+    /// Check `WORK_PLAN.md` and `work_plan/` instead of the work log.
+    #[arg(long)]
+    plan: bool,
 }
 
 #[derive(clap::Args)]
@@ -59,6 +75,11 @@ pub(crate) struct ArchiveArgs {
     /// Report what would move; write nothing.
     #[arg(long)]
     dry_run: bool,
+
+    /// Archive `WORK_PLAN.md`: move only sections marked
+    /// `<!-- loom:plan-archive -->`. Ignores `--older-than-days`.
+    #[arg(long)]
+    pub(super) plan: bool,
 }
 
 impl WorkDocsCommand {
@@ -66,11 +87,19 @@ impl WorkDocsCommand {
         match self {
             Self::Archive(args) => {
                 let today = chrono::Utc::now().date_naive();
-                let report = archive(&args.root.root, args.older_than_days, today, args.dry_run)?;
+                let report = if args.plan {
+                    super::work_plan_archive::archive_plan(&args.root.root, today, args.dry_run)?
+                } else {
+                    archive(&args.root.root, args.older_than_days, today, args.dry_run)?
+                };
                 println!("{report}");
             }
             Self::Check(args) => {
-                let report = check(&args)?;
+                let report = if args.plan {
+                    super::work_plan_archive::check_plan(&args.root)?
+                } else {
+                    check(&args.root)?
+                };
                 println!("{report}");
             }
         }
@@ -223,7 +252,7 @@ fn archive_month(file_name: &str) -> Option<String> {
 }
 
 /// Read a regular file; error if the path exists and is not one.
-fn read_regular(path: &Path) -> Result<Option<String>> {
+pub(super) fn read_regular(path: &Path) -> Result<Option<String>> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() => Ok(Some(
             fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
@@ -299,7 +328,7 @@ fn new_archive_preamble(month: &str) -> Block {
     }
 }
 
-fn atomic_write(path: &Path, text: &str) -> Result<()> {
+pub(super) fn atomic_write(path: &Path, text: &str) -> Result<()> {
     let tmp = path.with_extension("md.tmp");
     fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))
