@@ -291,6 +291,9 @@ pub struct PostState {
 /// - No post-state (`None`: the forge read failed) is `failed`, reason
 ///   `probe_failed`: the session's own line is never trusted alone.
 /// - A claim still held after exit is `failed`.
+/// - A Champion `not-eligible` on an open item stays that state refusal,
+///   moved or not: it wrote nothing, so the post-state's move is not its
+///   own (#12541).
 /// - A moved or closed item is a `verdict` (reason: the line's, else `closed`
 ///   for a closed item, else [`UNCLASSIFIED`]).
 /// - An unchanged item takes the line's class, except that a `verdict` claim
@@ -308,6 +311,16 @@ pub fn classify(line: Option<&StepOutcome>, post: Option<PostState>) -> StepOutc
             _ => failed_unclassified,
         };
     }
+    // #12541: Champion's `not-eligible` makes no writes by contract
+    // (`champion-targeted.md`), so a "moved" post-state is the label the
+    // stale listing missed, not this step's work. Read as a verdict it reset
+    // the pair and armed nothing, and a PR already in review was redrawn for
+    // Champion on every tick. It stays a state refusal.
+    if !post.closed {
+        if let Some(l) = line.filter(|l| is_no_write_refusal(l)) {
+            return l.clone();
+        }
+    }
     if post.moved || post.closed {
         let reason = match line {
             Some(l) if !(post.closed && l.reason == UNCLASSIFIED) => l.reason.as_str(),
@@ -320,6 +333,15 @@ pub fn classify(line: Option<&StepOutcome>, post: Option<PostState>) -> StepOutc
         Some(l) if l.class != OutcomeClass::Verdict => l.clone(),
         _ => failed_unclassified,
     }
+}
+
+/// The reason of a refusal that, by its role's contract, wrote nothing:
+/// Champion's `not-eligible` (folded to `not_eligible`).
+pub const NO_WRITE_REFUSAL: &str = "not_eligible";
+
+/// Whether `line` is a refusal that wrote nothing ([`NO_WRITE_REFUSAL`]).
+fn is_no_write_refusal(line: &StepOutcome) -> bool {
+    line.class == OutcomeClass::Refused && line.reason == NO_WRITE_REFUSAL
 }
 
 /// What the engine does with an `(item, step)` after its step ended.

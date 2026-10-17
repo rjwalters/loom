@@ -41,11 +41,16 @@ use tokio::sync::Semaphore;
 use super::identity::{Identity, IdentityError};
 use super::proto::{
     AckResponse, ClaimRequest, ClaimResponse, ErrorResponse, HeartbeatRequest, HeartbeatResponse,
-    RefuseRequest, ReleaseRequest, CLAIM_PATH, HEARTBEAT_PATH, PATHS, REFUSE_PATH, RELEASE_PATH,
+    RefusalReason, RefuseRequest, ReleaseRequest, CLAIM_PATH, HEARTBEAT_PATH, PATHS, REFUSE_PATH,
+    RELEASE_PATH,
 };
 use super::roster::{Roster, RosterSource};
 use super::table::{ClaimDecision, Mono, Policy, RefuseOutcome, Table};
 use super::telemetry::{self, Call, Counters};
+
+/// The span reason of a claim refused `held` by a no-progress hold
+/// ([`super::table`], #12541). The wire reason stays `held`.
+pub const NO_PROGRESS_REASON: &str = "no_progress_cooldown";
 
 /// Default TCP port of `loom-daemon fleet-dispatch serve`.
 pub const DEFAULT_PORT: u16 = 7433;
@@ -275,7 +280,14 @@ impl<I: Identity> Server<I> {
         let decision = self.with_table(|t, now, counters| {
             let d = t.claim(now, host, &req.repo, req.item, &req.step, max);
             if let ClaimDecision::Refused { reason, .. } = &d {
-                counters.claim_refused(*reason);
+                let cooled = *reason == RefusalReason::Held
+                    && t.cooldown(now, &req.repo, req.item, &req.step).is_some();
+                if cooled {
+                    counters.claim_cooled();
+                    call.reason = Some(NO_PROGRESS_REASON.to_string());
+                } else {
+                    counters.claim_refused(*reason);
+                }
             }
             d
         });
@@ -295,7 +307,9 @@ impl<I: Identity> Server<I> {
                 retry_after_s,
             } => {
                 call.result = "refused";
-                call.reason = Some(reason.as_str().to_string());
+                if call.reason.is_none() {
+                    call.reason = Some(reason.as_str().to_string());
+                }
                 ClaimResponse::refused(&self.epoch, reason, held_by, retry_after_s)
             }
         };
@@ -327,11 +341,11 @@ impl<I: Identity> Server<I> {
         let req: ReleaseRequest = self.parse(host, body)?;
         call.assignment_id = Some(req.assignment_id.clone());
         call.reason = Some(req.outcome.clone());
-        let known = self.with_table(|t, _, _| {
+        let known = self.with_table(|t, now, _| {
             if let Some(((repo, item), row)) = t.row_by_id(&req.assignment_id) {
                 call.item = Some((repo.clone(), *item, row.step.clone()));
             }
-            t.release(host, &req.assignment_id)
+            t.release_outcome(now, host, &req.assignment_id, &req.outcome)
         });
         Ok(self.ok(&AckResponse {
             server_epoch: self.epoch.clone(),

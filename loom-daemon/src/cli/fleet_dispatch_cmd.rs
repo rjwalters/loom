@@ -13,7 +13,7 @@ use loom_daemon::fleet_dispatch::{
     identity::{TailscaleWhois, DEFAULT_TAILSCALE_SOCKET},
     roster::{FleetStoreRoster, RosterSource},
     server::{self, Options, Server, SystemClock},
-    table::{Policy, DEFAULT_GRACE},
+    table::{Policy, DEFAULT_GRACE, DEFAULT_NO_PROGRESS_LADDER},
 };
 
 /// `loom-daemon fleet-dispatch` arguments.
@@ -43,6 +43,16 @@ enum FleetDispatchCommand {
         /// until it ends or every fleet-mode host has heartbeated.
         #[arg(long, default_value_t = DEFAULT_GRACE.as_secs())]
         grace_secs: u64,
+        /// The no-progress cooldown ladder, seconds, comma-separated (#12541):
+        /// the fleet-wide hold on an `(repo, item, step)` after its first,
+        /// second, third and later consecutive releases that did not move
+        /// the item. Up to four rungs; the last repeats. `0` turns it off.
+        #[arg(
+            long,
+            value_name = "SECS[,SECS...]",
+            default_value = "1800,7200,21600,86400"
+        )]
+        no_progress_cooldown_secs: String,
         /// The tailnet daemon's LocalAPI socket.
         #[arg(long, value_name = "PATH", default_value = DEFAULT_TAILSCALE_SOCKET)]
         tailscale_socket: PathBuf,
@@ -60,13 +70,42 @@ impl FleetDispatchArgs {
                 port,
                 workspace,
                 grace_secs,
+                no_progress_cooldown_secs,
                 tailscale_socket,
                 no_captain_gate,
             } => {
-                serve(&bind, port, &workspace, grace_secs, tailscale_socket, no_captain_gate).await
+                let ladder = parse_ladder(&no_progress_cooldown_secs)?;
+                serve(
+                    &bind,
+                    port,
+                    &workspace,
+                    grace_secs,
+                    ladder,
+                    tailscale_socket,
+                    no_captain_gate,
+                )
+                .await
             }
         }
     }
+}
+
+/// The `--no-progress-cooldown-secs` ladder: one to four whole seconds,
+/// the last repeated to fill four rungs.
+fn parse_ladder(spec: &str) -> Result<[Duration; 4]> {
+    let rungs: Vec<u64> = spec
+        .split(',')
+        .map(|r| r.trim().parse::<u64>())
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow!("invalid --no-progress-cooldown-secs {spec:?}: {e}"))?;
+    if rungs.is_empty() || rungs.len() > DEFAULT_NO_PROGRESS_LADDER.len() {
+        bail!("--no-progress-cooldown-secs takes one to four values, got {spec:?}");
+    }
+    let mut ladder = [Duration::ZERO; 4];
+    for (i, slot) in ladder.iter_mut().enumerate() {
+        *slot = Duration::from_secs(rungs[i.min(rungs.len() - 1)]);
+    }
+    Ok(ladder)
 }
 
 async fn serve(
@@ -74,6 +113,7 @@ async fn serve(
     port: u16,
     workspace: &str,
     grace_secs: u64,
+    no_progress: [Duration; 4],
     tailscale_socket: PathBuf,
     no_captain_gate: bool,
 ) -> Result<()> {
@@ -120,7 +160,8 @@ async fn serve(
     let policy = Policy::for_lease_ttl_minutes(
         loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes(),
         Duration::from_secs(grace_secs),
-    );
+    )
+    .with_no_progress(no_progress);
     let epoch = fleet_dispatch::new_epoch();
     let server = Arc::new(Server::new(
         TailscaleWhois::new(tailscale_socket),
@@ -135,11 +176,30 @@ async fn serve(
         .map_err(|e| anyhow!("failed to bind {addr}:{port}: {e}"))?;
     println!(
         "loom-daemon fleet-dispatch serve: listening on http://{} (epoch {epoch}, assignment \
-         TTL {}s, grace {}s)",
+         TTL {}s, grace {}s, no-progress cooldown {:?}s)",
         listener.local_addr()?,
         policy.assignment_ttl.as_secs(),
-        policy.grace.as_secs()
+        policy.grace.as_secs(),
+        policy.no_progress.map(|d| d.as_secs())
     );
     let _maintenance = server::spawn_maintenance(Arc::clone(&server), source, opts);
     server::run(listener, server, opts).await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ladder_parses_pads_and_rejects() {
+        let secs = |s: &str| parse_ladder(s).unwrap().map(|d| d.as_secs());
+        assert_eq!(secs("1800,7200,21600,86400"), [1800, 7200, 21600, 86400]);
+        assert_eq!(secs("600"), [600; 4]);
+        assert_eq!(secs("60, 120"), [60, 120, 120, 120]);
+        assert_eq!(secs("0"), [0; 4]);
+        assert!(parse_ladder("").is_err());
+        assert!(parse_ladder("1,2,3,4,5").is_err());
+        assert!(parse_ladder("ten").is_err());
+    }
 }

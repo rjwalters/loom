@@ -545,3 +545,157 @@ fn an_in_flight_heartbeat_cannot_revert_a_just_replaced_row() {
     let row = t.row("acme/w", 7).unwrap();
     assert_eq!((row.step.as_str(), row.state), ("doctor", RowState::Live));
 }
+
+// ---------------------------------------------- no-progress cooldown (#12541)
+
+const C: &str = "worker-c";
+
+/// A table with three hosts heartbeated at `now`.
+fn three_hosts(now: Mono) -> Table {
+    let mut t = open_table();
+    for h in [A, B, C] {
+        t.heartbeat(now, h, &hb(h, vec![], 8));
+    }
+    t
+}
+
+fn retry(d: &ClaimDecision) -> u64 {
+    match d {
+        ClaimDecision::Refused { retry_after_s, .. } => *retry_after_s,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_no_progress_release_holds_the_triple_for_every_host_until_it_ends() {
+    for outcome in ["noop", "refused", "failed", "", "something_new"] {
+        let mut t = three_hosts(at(100));
+        let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "champion_merge", Some(40)));
+        assert!(t.release_outcome(at(200), A, &id, outcome));
+        assert!(t.row("acme/w", 9).is_none(), "the row itself is gone");
+        // Every host, the releaser included, is refused `held`, with no
+        // holder and the hold's remaining time as the retry.
+        for host in [A, B, C] {
+            let d = t.claim(at(300), host, "acme/w", 9, "champion_merge", Some(40));
+            assert_eq!(refusal(&d), (RefusalReason::Held, None), "{outcome:?} {host}");
+            assert_eq!(retry(&d), 30 * 60 - 100, "{outcome:?}");
+        }
+        assert!(t.cooldown(at(300), "acme/w", 9, "champion_merge").is_some());
+        // Another step on the item, and the same step elsewhere, are free.
+        granted_id(&t.claim(at(300), B, "acme/w", 9, "judge", Some(40)));
+        granted_id(&t.claim(at(300), C, "acme/w", 10, "champion_merge", Some(40)));
+        // At the hold's end the triple is claimable again.
+        let id = t.row("acme/w", 9).unwrap().assignment_id.clone();
+        assert!(t.release(B, &id));
+        let id = t.row("acme/w", 10).unwrap().assignment_id.clone();
+        assert!(t.release(C, &id));
+        granted_id(&t.claim(at(200 + 30 * 60), C, "acme/w", 9, "champion_merge", Some(40)));
+    }
+}
+
+#[test]
+fn consecutive_no_progress_releases_escalate_and_a_progressing_one_resets() {
+    let mut t = three_hosts(at(100));
+    let mut now = 100;
+    let mut expect = Vec::new();
+    for (host, rung) in [(A, 1800), (B, 7200), (C, 21_600), (A, 86_400), (B, 86_400)] {
+        t.heartbeat(at(now), host, &hb(host, vec![], 8));
+        let id = granted_id(&t.claim(at(now), host, "acme/w", 9, "champion_merge", Some(40)));
+        assert!(t.release_outcome(at(now), host, &id, "noop"));
+        let c = t.cooldown(at(now), "acme/w", 9, "champion_merge").unwrap();
+        expect.push(rung);
+        assert_eq!(c.until, at(now + rung), "rung {}", expect.len());
+        // Still held one second before the end, free at it.
+        assert!(matches!(
+            t.claim(at(now + rung - 1), C, "acme/w", 9, "champion_merge", Some(40)),
+            ClaimDecision::Refused { .. }
+        ));
+        now += rung;
+    }
+    assert_eq!(
+        t.cooldown(at(now), "acme/w", 9, "champion_merge")
+            .unwrap_or(Cooldown {
+                until: at(0),
+                streak: 0
+            })
+            .streak,
+        0,
+        "the hold has ended"
+    );
+
+    // A progressing release of the triple clears the streak: the next
+    // no-progress one starts again at the first rung.
+    t.heartbeat(at(now), A, &hb(A, vec![], 8));
+    let id = granted_id(&t.claim(at(now), A, "acme/w", 9, "champion_merge", Some(40)));
+    assert!(t.release_outcome(at(now), A, &id, "verdict"));
+    assert!(t.cooldown(at(now), "acme/w", 9, "champion_merge").is_none());
+    let id = granted_id(&t.claim(at(now), B, "acme/w", 9, "champion_merge", Some(40)));
+    assert!(t.release_outcome(at(now), B, &id, "noop"));
+    let c = t.cooldown(at(now), "acme/w", 9, "champion_merge").unwrap();
+    assert_eq!((c.until, c.streak), (at(now + 1800), 1));
+}
+
+#[test]
+fn a_progressing_release_holds_nothing_and_clears_every_hold_on_the_item() {
+    let mut t = three_hosts(at(100));
+    for outcome in PROGRESS_OUTCOMES {
+        let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "judge", Some(40)));
+        assert!(t.release_outcome(at(100), A, &id, outcome));
+        granted_id(&t.claim(at(101), B, "acme/w", 9, "judge", Some(40)));
+        let id = t.row("acme/w", 9).unwrap().assignment_id.clone();
+        assert!(t.release(B, &id));
+    }
+    // A Champion step held the PR; a Judge verdict on it later (the item
+    // moved) frees the Champion step at once.
+    let id = granted_id(&t.claim(at(200), A, "acme/w", 9, "champion_merge", Some(40)));
+    assert!(t.release_outcome(at(200), A, &id, "refused"));
+    assert!(t.cooldown(at(201), "acme/w", 9, "champion_merge").is_some());
+    let id = granted_id(&t.claim(at(201), B, "acme/w", 9, "judge", Some(40)));
+    assert!(t.release_outcome(at(202), B, &id, "verdict"));
+    assert!(t.cooldown(at(203), "acme/w", 9, "champion_merge").is_none());
+    granted_id(&t.claim(at(203), C, "acme/w", 9, "champion_merge", Some(40)));
+}
+
+#[test]
+fn a_release_the_table_does_not_know_arms_nothing() {
+    let mut t = three_hosts(at(100));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "builder", Some(40)));
+    assert!(!t.release_outcome(at(100), B, &id, "noop"), "another host's id");
+    assert!(!t.release_outcome(at(100), A, "a-nope", "noop"));
+    assert!(t.cooldown(at(100), "acme/w", 9, "builder").is_none());
+}
+
+#[test]
+fn the_ladder_is_configurable_and_a_zero_rung_holds_nothing() {
+    let policy = Policy::default().with_no_progress([Duration::ZERO; 4]);
+    let mut t = Table::new("epoch-0001", policy, at(0), BTreeSet::new());
+    assert!(!t.in_grace(at(90)));
+    t.heartbeat(at(100), A, &hb(A, vec![], 8));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "judge", Some(40)));
+    assert!(t.release_outcome(at(100), A, &id, "noop"));
+    granted_id(&t.claim(at(101), A, "acme/w", 9, "judge", Some(40)));
+
+    let p = Policy::default();
+    assert_eq!(p.no_progress, DEFAULT_NO_PROGRESS_LADDER);
+    assert_eq!(p.no_progress_hold(1), Duration::from_secs(1800));
+    assert_eq!(p.no_progress_hold(4), Duration::from_secs(86_400));
+    assert_eq!(p.no_progress_hold(99), Duration::from_secs(86_400));
+    assert_eq!(
+        Policy::for_lease_ttl_minutes(30.0, DEFAULT_GRACE).no_progress,
+        DEFAULT_NO_PROGRESS_LADDER
+    );
+}
+
+#[test]
+fn a_streak_is_forgotten_a_last_rung_after_its_hold_ends() {
+    let mut t = three_hosts(at(100));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "judge", Some(40)));
+    assert!(t.release_outcome(at(100), A, &id, "noop"));
+    // Long after: the streak is gone, so the next hold is the first rung.
+    let later = 100 + 1800 + 86_400;
+    t.expire(at(later));
+    t.heartbeat(at(later), A, &hb(A, vec![], 8));
+    let id = granted_id(&t.claim(at(later), A, "acme/w", 9, "judge", Some(40)));
+    assert!(t.release_outcome(at(later), A, &id, "noop"));
+    assert_eq!(t.cooldown(at(later), "acme/w", 9, "judge").unwrap().streak, 1);
+}

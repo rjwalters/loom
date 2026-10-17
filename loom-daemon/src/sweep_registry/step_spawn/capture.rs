@@ -98,6 +98,27 @@ pub fn read_outcome_line(log: &Path, sweep_id: &str) -> Option<StepOutcomeLine> 
     text[start..].lines().rev().find_map(parse_outcome_line)
 }
 
+/// The release class of a step that wrote no `LOOM_STEP_OUTCOME` line: a
+/// Champion step's `CHAMPION-STEP` outcome folded onto the four classes
+/// ([`crate::step_dispatch::outcome_ledger::parse_outcome_line`]), read after
+/// `sweep_id`'s own dispatch header; else `failed`.
+pub(crate) fn release_class_fallback(
+    log: &Path,
+    sweep_id: &str,
+    role: StepRole,
+    item: u32,
+) -> &'static str {
+    let Ok(bytes) = std::fs::read(log) else {
+        return "failed";
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let Some(start) = text.rfind(&format!("sweep_id={sweep_id} ")) else {
+        return "failed";
+    };
+    crate::step_dispatch::outcome_ledger::parse_outcome_line(&text[start..], role, item)
+        .map_or("failed", |o| o.class.as_str())
+}
+
 /// How a step's process ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepEnd {
@@ -253,11 +274,16 @@ impl SweepRegistry {
         );
         // #12450: a granted step's assignment ends with the step, its outcome
         // class the release's outcome (no line reads as `failed`). A no-op
-        // for a step the captain never granted.
-        crate::fleet_dispatch::worker::release(
-            sweep_id,
-            line.as_ref().map_or("failed", |l| l.class.as_str()),
+        // for a step the captain never granted. #12541: a Champion step
+        // writes no `LOOM_STEP_OUTCOME` line, only its `CHAMPION-STEP` one,
+        // so its class is that line's fold; before, every Champion release
+        // read `failed`, and the captain's no-progress hold would have held
+        // a triage that did move its PR.
+        let release_class = line.as_ref().map_or_else(
+            || release_class_fallback(&log_path, sweep_id, role, item),
+            |l| l.class.as_str(),
         );
+        crate::fleet_dispatch::worker::release(sweep_id, release_class);
         if !self.config.skip_label_flip {
             let reason = match end {
                 StepEnd::TimedOut => crate::pr_lease_reap::REASON_TIMEOUT,
