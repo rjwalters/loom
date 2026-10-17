@@ -141,8 +141,8 @@ pub use pricing_card::{PricingCard, PricingCardError};
 // These types are used for the `loom stats` CLI commands
 #[allow(unused_imports)]
 pub use stats::{
-    AgentEffectiveness, CostPerIssue, CostRow, DailyVelocity, EffectivenessRow, StatsQueries,
-    StatsSummary, SummaryMetrics, VelocityRow, WeeklyVelocity,
+    AgentEffectiveness, CostPerIssue, CostRow, EffectivenessRow, StatsQueries, StatsSummary,
+    SummaryMetrics, VelocityRow, WeeklyVelocity,
 };
 
 // Issue claim registry types (Issue #1159)

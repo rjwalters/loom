@@ -374,8 +374,7 @@ impl ActivityDb {
 
 // Implement StatsQueries trait for ActivityDb
 use super::stats::{
-    self, AgentEffectiveness, CostPerIssue, DailyVelocity, StatsQueries, StatsSummary,
-    WeeklyVelocity,
+    self, AgentEffectiveness, CostPerIssue, StatsQueries, StatsSummary, WeeklyVelocity,
 };
 use chrono::NaiveDate;
 
@@ -389,14 +388,6 @@ impl StatsQueries for ActivityDb {
 
     fn get_cost_per_issue(&self, issue_number: Option<i32>) -> rusqlite::Result<Vec<CostPerIssue>> {
         stats::query_cost_per_issue(&self.conn, issue_number)
-    }
-
-    fn get_daily_velocity(
-        &self,
-        start_date: Option<NaiveDate>,
-        end_date: Option<NaiveDate>,
-    ) -> rusqlite::Result<Vec<DailyVelocity>> {
-        stats::query_daily_velocity(&self.conn, start_date, end_date)
     }
 
     fn get_weekly_velocity(&self) -> rusqlite::Result<Vec<WeeklyVelocity>> {
