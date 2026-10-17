@@ -851,6 +851,9 @@ impl GroupForge for Groups {
         self.calls.set(self.calls.get() + 1);
         self.found.clone()
     }
+    fn latest_status(&self, _c: &str) -> Result<Option<(StatusState, String)>, String> {
+        Ok(None)
+    }
 }
 
 fn group_with_pr() -> Vec<MergeGroup> {

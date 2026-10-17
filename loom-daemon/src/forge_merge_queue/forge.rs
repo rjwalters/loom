@@ -8,6 +8,7 @@
 //! default on failure.
 
 use super::authz::{AuthzFacts, Fact};
+use super::group_authz::MemberFacts;
 use super::ops::PrState;
 use crate::claim_reconciliation::{extract_latest_verdict_sha, VerdictKind, VERDICT_HOLD_LABELS};
 
@@ -123,4 +124,27 @@ pub fn read_facts(forge: &dyn LifecycleForge, pr: u32) -> Result<AuthzFacts, Str
     }
     let bodies = forge.trusted_comments(pr)?;
     Ok(facts_from(&snap, &bodies))
+}
+
+/// [`read_facts`] for a merge-group member: a merged PR is reported as
+/// [`MemberFacts::Merged`] (with its head) instead of an outage, so the group
+/// check can tell a landed predecessor from an unreadable one. A PR closed
+/// unmerged stays an `Err`.
+///
+/// # Errors
+///
+/// The snapshot or the comment listing could not be read, or the PR is
+/// closed without merging.
+pub fn read_member_facts(forge: &dyn LifecycleForge, pr: u32) -> Result<MemberFacts, String> {
+    let snap = forge.snapshot(pr)?;
+    match snap.state {
+        PrState::Merged => Ok(MemberFacts::Merged {
+            head: snap.head_sha,
+        }),
+        PrState::Open => {
+            let bodies = forge.trusted_comments(pr)?;
+            Ok(MemberFacts::Open(facts_from(&snap, &bodies)))
+        }
+        other => Err(format!("PR #{pr} is {}", other.as_str())),
+    }
 }
