@@ -8724,7 +8724,36 @@ flips spend. A read never goes to it, whatever its class or cause:
   running on the writer. The host with no reader pool at all is the one
   exception, as below. A GraphQL read that names its repo in the query says
   so with `GhInvocation::reader_repo(slug)` so the reader route serves it.
-- **Read-your-write rides the readers too (#12555).** The read-back helpers
+- **Every read is reader-only, whatever builder made it (#12584).** The
+  rule is the invocation's, not the helper's: `GhInvocation::is_reader_only()`
+  holds for any `AccessIntent::Read` of the forge whose site did not pin
+  the writer with `writer_identity()`, whether it was built by a bare
+  `GhInvocation::new`, an `Operation::new` site, a CLI `.inv(..)` helper
+  (`loom-daemon pr-lease …`) or a transport's own `.invocation(.., cred)`.
+  Such a read is routed to a reader or shed, exactly as above. A credential
+  the site handed it (`gh_config_dir`, `without_token_env`, a writer
+  `identity_role`) does not exempt it: the facade sets that credential
+  aside before deriving the route (`GhInvocation::route_site_credential`)
+  and restores it only on a host with no reader pool, where it is the right
+  owner's writer and the only credential there is. A credential declared a
+  reader's (`identity_role(Reader)`, a site that routes its own reads, such
+  as the ETag store or `ci_telemetry`) is kept. Two argv shapes are not
+  forge reads and keep their credential: a command `gh` answers locally
+  (`--version`, `auth`, `config`, …) and `gh api rate_limit`, which is free
+  and reports the asking credential's own bucket. Reads whose argv names no
+  repository the facade can derive (GraphQL, search, `release`) name it
+  with `reader_repo(slug)`; `ci_telemetry`'s owner listings
+  (`orgs/<o>/repos`, `users/<o>…` and their page links) are routed for the
+  owner. The fleet store transport (`fleet_store::gh`) picks its own reader
+  and never falls back to the writer: a rate-limited or refused reader is
+  withdrawn and the next one serves the read, and a reader's `404` for a
+  ref (the resync claim) is the answer only when that reader can see the
+  repository (it served the repository within the hour, or answers
+  `GET repos/<o>/<r>`); otherwise the read is shed, never read as "absent".
+  The installation snapshot's telemetry reads (visibility, story key) use
+  the reader's snapshot only; with no reader they answer unavailable, which
+  visibility maps to private.
+- **Read-your-write rides the readers too (#12555, #12584).** The read-back helpers
   that pinned the writer (`gh_call::read_own_write`,
   `SweepRegistry::gh_read_own_write`) are removed. The writer bought a read
   only one thing: possibly fresher state for the credential that made the
@@ -8749,21 +8778,30 @@ flips spend. A read never goes to it, whatever its class or cause:
     can only miss its own lease (it is about to claim anyway) or a peer's;
     the outcome write-back probe looks for a comment from an earlier pass;
     the park-hold body read is a read-modify-write whose concurrent edits
-    are another actor's.
-- **Only writes use the writer**: POST, PATCH, PUT, DELETE, GraphQL
-  mutations and the minimal read a write needs in the same operation (a
-  lease read back right after a CLI command posts it, merge settings hidden
-  from a reader App). Each such read is pinned with `GhInvocation::writer_identity()` and
-  its file is listed with a reason in `loom-daemon/tests/writer_read_guard.rs`
-  (`READ_ON_WRITER`); an asker-dependent probe (`/user`, a write-scope
-  probe) is listed the same way.
+    are another actor's;
+  - the `loom-daemon pr-lease` CLI reads (`pr_lease.comments`,
+    `pr_lease.pr_head`, `pr_lease.checks_pending`, `pr_lease.commit_status`)
+    follow the same lease tie-break, and a missed own lease reads as "not
+    held yet" and is retried; the comment facade's footer read-back
+    (`comment.api_get`) only decides a best-effort footer edit; the
+    self-sync head attribution (`merge_guard.head_sync`) re-queues on any
+    head it cannot attribute (#12584).
+- **Only writes use the writer**, plus reads whose answer depends on who
+  asks: merge settings hidden from a reader App, classic branch protection,
+  a write-scope or permission probe, the writer installation's own
+  repository list. Each such read is pinned with
+  `GhInvocation::writer_identity()` and its file is listed with a reason in
+  `loom-daemon/tests/writer_read_guard.rs` (`READ_ON_WRITER`).
 - **Exception, no pool at all.** A host with no reader pool (no readers
   configured, another forge, a target with no repo) has no reader to be out of
   budget; its reads run on the only credential it has, pinned the same way.
 - **Guard.** `tests/writer_read_guard.rs` fails the build if a retired fallback
   name reappears, a new file pins a read to the writer without being listed,
-  a daemon read builder stops marking its reads `reader_only()`, or a
-  writer-pinned read-own-write helper returns (#12555).
+  a daemon read builder stops marking its reads `reader_only()`, a
+  writer-pinned read-own-write helper returns (#12555), any read builder
+  shape (a bare read, an explicit config dir, a stripped token env, a
+  writer role) stops answering `is_reader_only()`, or the route step stops
+  setting a site's credential aside (#12584).
   At runtime a read that reaches the writer unmarked logs an `error`
   (`gh_invocation: read on the writer credential: <op>`).
 - **Telemetry.** Writer-bucket spend by operation is the `forge.calls`

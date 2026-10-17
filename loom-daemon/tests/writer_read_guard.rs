@@ -27,32 +27,40 @@
 //!    The behaviour is unit-tested in `gh_invocation/reader_only_tests.rs`;
 //!    this rule keeps a refactor from dropping the marker.
 //!
+//! 4. **Every** read is reader-only, whatever builder made it (#12584):
+//!    `GhInvocation::is_reader_only()` holds for any forge read its site did
+//!    not pin with `writer_identity()` — a bare `GhInvocation::new`, an
+//!    `Operation::new` site, a `.inv(..)` / `.invocation(.., cred)` helper —
+//!    and a credential a site hands such a read (`gh_config_dir`,
+//!    `without_token_env`, a writer `identity_role`) is set aside so the
+//!    read is routed to a reader or shed; it is restored only on a host with
+//!    no reader pool. This file asserts the public builder answers and the
+//!    wiring that applies them; `gh_invocation/reader_only_tests.rs` and
+//!    `fleet_store/gh_reader_tests.rs` run them against a stub `gh`.
+//!
 //! The runtime half is `gh_invocation::accounting::is_unmarked_read_on_writer`,
 //! which logs an error for any read that reaches the writer unmarked.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-const BASE: &str = "read-back of the daemon's own write (a reader may lag it)";
 const ASKER: &str = "asker-dependent probe (the answer depends on WHO asks)";
 const WRITE: &str = "write-intent call (not a read)";
 const NOPOOL: &str = "host with no reader pool: the writer is the only credential";
 const PLUMBING: &str = "names the role (defines or inspects it); sends no read";
 const MERGE: &str = "merge settings hidden from a reader App; the merging writer reads them";
+const PROTECTION: &str = "classic branch protection (GraphQL) is asker-dependent; a reader that \
+                          cannot see it would answer 'no required contexts' and fail the merge \
+                          guard open";
 
 /// `(file relative to loom-daemon/src, reason)` pairs allowed to pin a read
 /// to the writer. Only ever remove entries.
 const READ_ON_WRITER: &[(&str, &str)] = &[
     ("branch_update.rs", MERGE),
-    (
-        "cli/duplicate_closed_search.rs",
-        "FOLLOW-UP: an untargeted search pinned to the writer; no reader route yet",
-    ),
     ("cli/lease_release.rs", WRITE),
-    ("cli/pr_lease.rs", BASE),
     ("credential_preflight/pool.rs", ASKER),
+    ("fleet_store/gh.rs", NOPOOL),
     ("forge_bucket_book/probe.rs", ASKER),
-    ("forge_comment.rs", BASE),
     ("forge_etag_store/deferrable.rs", NOPOOL),
     ("forge_identity.rs", PLUMBING),
     ("forge_merge_config.rs", MERGE),
@@ -64,7 +72,7 @@ const READ_ON_WRITER: &[(&str, &str)] = &[
     ("gh_invocation/reader_route.rs", PLUMBING),
     ("gh_invocation/reader_route_v2.rs", NOPOOL),
     ("merge_group_ci/eligibility.rs", ASKER),
-    ("merge_pr/head_sync/fetch.rs", BASE),
+    ("merge_pr/stale_checks/fetch.rs", PROTECTION),
     ("observability/ops/ratelimit.rs", ASKER),
     ("write_scope/probe.rs", ASKER),
 ];
@@ -205,8 +213,13 @@ const READER_ONLY_BUILDERS: &[(&str, &str)] = &[
     ("sweep_registry/guards/gh_exec.rs", "fn gh_inv("),
 ];
 
-/// Writer-pinned read helpers retired by #12555.
-const RETIRED_READ_ON_WRITER_HELPERS: &[&str] = &["fn read_own_write", "fn gh_read_own_write"];
+/// Writer-pinned read helpers retired by #12555 and #12584.
+const RETIRED_READ_ON_WRITER_HELPERS: &[&str] = &[
+    "fn read_own_write",
+    "fn gh_read_own_write",
+    "fn get_as_writer",
+    "reader_failed",
+];
 
 #[test]
 fn the_daemon_read_builders_are_reader_only() {
@@ -239,4 +252,130 @@ fn the_daemon_read_builders_are_reader_only() {
         hits.is_empty(),
         "a writer-pinned read-own-write helper came back (#12555): {hits:?}"
     );
+}
+
+/// #12584: whatever builder made it, a read answers `is_reader_only()` unless
+/// its site pinned the writer; a credential handed to it does not exempt it.
+#[test]
+fn every_read_builder_is_reader_only_unless_the_writer_is_pinned() {
+    use loom_daemon::forge_identity::IdentityRole;
+    use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    use std::time::Duration;
+    let dir = std::env::temp_dir();
+    let read = |op: &'static str| {
+        GhInvocation::new(
+            Operation::new(op),
+            AccessIntent::Read,
+            GhTarget::None,
+            Duration::from_secs(1),
+        )
+        .args(["api", "repos/{owner}/{repo}/issues/1/comments"])
+    };
+    // Every builder shape a site uses for a read.
+    let reads = [
+        ("bare", read("t.bare")),
+        ("explicit config dir", read("t.config").gh_config_dir(Some(&dir))),
+        ("no token env", read("t.strip").without_token_env()),
+        ("writer role", read("t.role").identity_role(IdentityRole::Writer)),
+        (
+            "writer credential, all of it",
+            read("t.all")
+                .gh_config_dir(Some(&dir))
+                .without_token_env()
+                .identity_role(IdentityRole::Writer),
+        ),
+        ("targeted", {
+            GhInvocation::new(
+                Operation::new("t.targeted"),
+                AccessIntent::Read,
+                GhTarget::repo("acme/widget").unwrap(),
+                Duration::from_secs(1),
+            )
+            .args(["api", "repos/acme/widget/pulls/1"])
+        }),
+        (
+            "graphql",
+            read("t.graphql")
+                .args(["graphql"])
+                .reader_repo("acme/widget"),
+        ),
+        (
+            "explicit reader_only beats a writer pin",
+            read("t.both").writer_identity().reader_only(),
+        ),
+        (
+            "explicit reader_only, pin after",
+            read("t.both2").reader_only().writer_identity(),
+        ),
+    ];
+    for (what, inv) in reads {
+        assert!(
+            inv.is_reader_only(),
+            "{what}: a read must be reader-only unless the writer is pinned (#12394, #12584)"
+        );
+    }
+    // The only exits: a listed writer pin, a write, and argv that sends no
+    // forge read (a local command, the free `rate_limit` bucket reading).
+    assert!(!read("t.pinned").writer_identity().is_reader_only());
+    assert!(!GhInvocation::new(
+        Operation::new("t.write"),
+        AccessIntent::Write,
+        GhTarget::None,
+        Duration::from_secs(1)
+    )
+    .args(["api", "-X", "POST", "repos/acme/widget/issues/1/comments"])
+    .is_reader_only());
+    for local in [["--version"].as_slice(), ["auth", "status"].as_slice()] {
+        let inv = GhInvocation::new(
+            Operation::new("t.local"),
+            AccessIntent::Read,
+            GhTarget::None,
+            Duration::from_secs(1),
+        )
+        .args(local);
+        assert!(!inv.is_reader_only(), "{local:?} sends no forge read");
+    }
+    let bucket = GhInvocation::new(
+        Operation::new("t.bucket"),
+        AccessIntent::Read,
+        GhTarget::None,
+        Duration::from_secs(1),
+    )
+    .args(["api", "--include", "rate_limit"]);
+    assert!(!bucket.is_reader_only(), "a bucket reading is the asker's own");
+}
+
+/// #12584: the wiring that makes rule 4 hold at execution: the route step
+/// sets a site's writer credential aside, the reader-only test is not
+/// limited to the explicit marker, and the no-pool path is the only one that
+/// restores the credential.
+#[test]
+fn a_site_chosen_credential_is_routed_and_only_restored_without_a_pool() {
+    let gh = |f: &str| code_lines(&src_root().join("gh_invocation").join(f)).join("\n");
+    let route = gh("cwd_route.rs");
+    let at = route
+        .find("fn with_derived_route_in(")
+        .expect("cwd_route.rs: with_derived_route_in");
+    let body: String = route[at..].chars().take(600).collect();
+    assert!(
+        body.contains(".route_site_credential()"),
+        "every execution must set a site's writer credential aside before routing (#12584)"
+    );
+    let chain = gh("reader_route_v2.rs");
+    assert!(
+        chain.contains("self.is_reader_only()"),
+        "the unroutable-read shed must apply to every reader-only read, not only the marker"
+    );
+    assert_eq!(
+        chain.matches("restore_site_credential()").count(),
+        1,
+        "only the no-reader-pool path may restore a site's credential"
+    );
+    let at = chain
+        .find("fn writer_only_read(")
+        .expect("reader_route_v2.rs: writer_only_read");
+    let body: String = chain[at..].chars().take(400).collect();
+    assert!(body.contains("restore_site_credential()"));
+    // Every invocation comes from `GhInvocation::new` (its fields are
+    // private to `gh_invocation`), so the rules above see every read.
 }

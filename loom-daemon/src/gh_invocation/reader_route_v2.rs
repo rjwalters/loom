@@ -36,12 +36,15 @@
 //! read-on-the-writer error.
 //!
 //! A read the facade cannot route at all (no repo it can derive, a checkout
-//! whose sources disagree) skips this chain and runs as built. For a
-//! [`GhInvocation::reader_only`] read — every in-process daemon read made
-//! through `claim_reconciliation::gh_call::read` or
-//! `SweepRegistry::gh_inv(.., AccessIntent::Read, ..)` (#12555) — that would
-//! be the writer, so it is shed instead (same `forge.read.shed` span and
-//! `o=shed` row), unless the host has no reader pool at all.
+//! whose sources disagree) skips this chain. For a reader-only read
+//! ([`GhInvocation::is_reader_only`]) — since #12584 every forge read whose
+//! site did not pin the writer with `writer_identity`, whatever builder made
+//! it — running it as built would be the writer, so it is shed instead (same
+//! `forge.read.shed` span and `o=shed` row), unless the host has no reader
+//! pool at all. A writer credential a site handed such a read
+//! (`gh_config_dir`, `without_token_env`, a writer `identity_role`) is set
+//! aside first ([`GhInvocation::route_site_credential`]) and only restored
+//! on that no-pool path.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -278,17 +281,21 @@ impl GhInvocation {
     /// [`GhInvocation::reader_only`] read may reach the writer, so its flag
     /// is lifted here first (the builder would ignore the pin otherwise).
     fn writer_only_read(mut self) -> Result<GhCompletion, ExecError> {
+        // A credential the site chose (#12584) is the right owner's writer.
+        self.restore_site_credential();
         self.reader_only = false;
         self.writer_identity().execute_direct()
     }
 
-    /// A [`GhInvocation::reader_only`] read the facade found no reader route
-    /// for, which would otherwise run on the ambient writer (#12555): no
-    /// derivable repo, a checkout whose sources disagree, an argv shape the
-    /// derivation does not route. A credential the site chose itself is not
-    /// the ambient writer and is left alone.
+    /// A reader-only read ([`GhInvocation::is_reader_only`]: every forge
+    /// read its site did not pin to the writer, #12584) the facade found no
+    /// reader route for, which would otherwise run on the writer (#12555):
+    /// no derivable repo, a checkout whose sources disagree, an argv shape
+    /// the derivation does not route. A reader credential the site chose
+    /// itself is already routed and is left alone; any other was set aside
+    /// by [`GhInvocation::route_site_credential`].
     fn unroutable_reader_only(&self) -> bool {
-        self.reader_only
+        self.is_reader_only()
             && self.intent == super::super::AccessIntent::Read
             && matches!(self.contract, super::super::OutputContract::Captured { .. })
             && self.role.is_none()
@@ -405,8 +412,11 @@ impl GhInvocation {
 
 /// Whether this host has any reader pool or live read gateway: the test
 /// [`GhInvocation::shed_unroutable`] falls back to when it has no repo to ask
-/// the router about.
-fn host_has_read_pool() -> bool {
+/// the router about, and the line between "no pool, the writer is the only
+/// credential" and "the readers cannot serve this, shed" for a site that
+/// picks its own credentials (#12584).
+#[must_use]
+pub fn host_has_read_pool() -> bool {
     crate::forge_gateway::any_live()
         || crate::forge_identity::workspace_root()
             .is_some_and(|ws| !crate::forge_identity::cached(ws).readers.is_empty())

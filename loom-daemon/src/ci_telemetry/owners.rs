@@ -285,14 +285,18 @@ pub fn discover(
         }
         let cached = cache.get(&path).cloned();
         *requests += 1;
-        let mut response = api.get(&path, cached.as_ref().map(|c| c.etag.as_str()))?;
+        // Every page is routed for `login` (#12584): page 2+ links name the
+        // owner by numeric id, which picks no reader on their own.
+        let route = super::api::owner_listing_route(login);
+        let mut response =
+            api.get_in(Some(&route), &path, cached.as_ref().map(|c| c.etag.as_str()))?;
         let page = match (response.status, cached) {
             (304, Some(page)) => page,
             (304, None) => {
                 // Unreachable in practice (a 304 only answers our ETag);
                 // re-fetch unconditionally rather than trust an empty body.
                 *requests += 1;
-                response = api.get(&path, None)?;
+                response = api.get_in(Some(&route), &path, None)?;
                 cached_page(&response)
             }
             _ => cached_page(&response),
