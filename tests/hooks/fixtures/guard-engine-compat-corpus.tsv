@@ -1,0 +1,30 @@
+# guard-engine-compat-corpus.tsv — corpus for tests/hooks/compare-guard-engines.sh (#8570)
+#
+# Columns (TAB separated; lines starting with # and blank lines are skipped):
+#   1. expect  — deny | ask | allow | any   (`any` = report only; no required verdict)
+#   2. area    — free-text tag used in the report (tmpfs, core, masking, ...)
+#   3. command — the Bash command text handed to the guard (data only; never executed)
+#
+# `expect` is the verdict the SHARED component must produce. It is a requirement
+# of the design, not a snapshot of either engine: a row where an engine misses it
+# is reported as a gap, never silently re-baselined.
+#
+# Tmpfs rows run against a FIXTURE mount table the script generates (/dev/shm and
+# /run/user/1000 are tmpfs, /mnt/ramdisk is ramfs, / is ext4), so they behave the
+# same on any host.
+allow	core	ls -la
+allow	core	cargo build
+allow	core	git status
+deny	core	rm -rf /
+deny	core	git push --force origin main
+allow	masking	gh issue list --search "docker system prune" --jq '.[] | .number'
+deny	body-literal-at	gh pr comment 1 --body @/tmp/body.md
+deny	tmpfs	CARGO_TARGET_DIR=/dev/shm/t cargo build
+deny	tmpfs	cargo build --target-dir /dev/shm/x
+deny	tmpfs	cargo build --target-dir=/dev/shm/x
+deny	tmpfs	export CARGO_TARGET_DIR=/run/user/1000/t && cargo build
+deny	tmpfs	CARGO_TARGET_DIR=/mnt/ramdisk/t cargo test
+deny	tmpfs	cd /tmp && CARGO_TARGET_DIR=/run/user/1000/a/../t cargo check
+allow	tmpfs	CARGO_TARGET_DIR=/var/tmp/t cargo build
+allow	tmpfs	cargo build --target-dir target
+allow	tmpfs	echo /dev/shm/not-a-build-dir
