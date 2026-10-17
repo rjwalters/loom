@@ -387,3 +387,44 @@ fn real_merge_tree_distinguishes_clean_mod_appends_from_same_line_edits() {
     let ghost = at(4, &"1".repeat(40));
     assert!(checker.conflicts(&prs[0], &ghost));
 }
+
+#[test]
+fn a_conflict_confined_to_changelog_md_is_not_an_ordering_conflict() {
+    let tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    assert!(only_changelog_conflicts(&format!("{tree}\nCHANGELOG.md\n")));
+    assert!(!only_changelog_conflicts(&format!("{tree}\nCHANGELOG.md\nsrc/lib.rs\n")));
+    assert!(!only_changelog_conflicts(&format!("{tree}\nsrc/CHANGELOG.md\n")));
+    // No path list (or none readable) fails closed.
+    assert!(!only_changelog_conflicts(&format!("{tree}\n")));
+    assert!(!only_changelog_conflicts(""));
+}
+
+#[test]
+fn real_merge_tree_ignores_a_same_spot_changelog_conflict_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("CHANGELOG.md"), "# Log\n").unwrap();
+    std::fs::write(dir.join("lib.rs"), "a\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "base"]);
+    let edit = |name: &str, log: &str, lib: &str| {
+        git(dir, &["checkout", "-q", "-b", name, "main"]);
+        std::fs::write(dir.join("CHANGELOG.md"), log).unwrap();
+        std::fs::write(dir.join("lib.rs"), lib).unwrap();
+        git(dir, &["commit", "-q", "-am", name]);
+        let head = git(dir, &["rev-parse", "HEAD"]);
+        git(dir, &["checkout", "-q", "main"]);
+        head
+    };
+    let a = edit("a", "# Log\n- a\n", "a\n");
+    let b = edit("b", "# Log\n- b\n", "a\n");
+    let c = edit("c", "# Log\n- c\n", "c\n");
+    let d = edit("d", "# Log\n- d\n", "d\n");
+    if merge_tree_conflicts(dir, &a, &a).is_none() {
+        eprintln!("git without `merge-tree --write-tree`: skipping");
+        return;
+    }
+    assert_eq!(merge_tree_conflicts(dir, &a, &b), Some(false), "CHANGELOG-only");
+    assert_eq!(merge_tree_conflicts(dir, &c, &d), Some(true), "CHANGELOG + lib.rs");
+}

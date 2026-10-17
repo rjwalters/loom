@@ -13,7 +13,9 @@
 //! ```
 //!
 //! — a three-way merge of the two heads against their merge base. Exit 0 is a
-//! clean merge (no edge); exit 1 is a conflict (keep the edge). The command
+//! clean merge (no edge); exit 1 is a conflict (keep the edge), unless the only
+//! conflicted path (`--name-only`) is `CHANGELOG.md`: a same-spot changelog
+//! insertion is resolved by the Doctor, not by serialising merges (#12595). The command
 //! writes objects only: no working tree, index or ref of the workspace is
 //! touched.
 //!
@@ -43,6 +45,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -238,15 +241,37 @@ pub fn merge_tree_conflicts(root: &Path, a: &str, b: &str) -> Option<bool> {
     merge_tree_within(root, a, b, &Deadline::unbounded())
 }
 
+/// The one append-only file whose textual conflicts never order two PRs
+/// (#12595): both PRs prepend an entry at the same spot, which the Doctor
+/// resolves on the rebase, so serialising their merges saves nothing.
+const CHANGELOG_PATH: &str = "CHANGELOG.md";
+
 /// [`merge_tree_conflicts`] with its timeout clamped to `deadline`; `None`
-/// without launching git once the deadline is spent.
+/// without launching git once the deadline is spent. A conflict confined to
+/// [`CHANGELOG_PATH`] reads as a clean merge (#12595).
 fn merge_tree_within(root: &Path, a: &str, b: &str, deadline: &Deadline) -> Option<bool> {
-    let args = ["merge-tree", "--write-tree", "--no-messages", a, b];
-    match git_code(root, &args, GIT_TIMEOUT, deadline)? {
-        0 => Some(false),
-        1 => Some(true),
+    let args = [
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "--no-messages",
+        a,
+        b,
+    ];
+    match git_run(root, &args, GIT_TIMEOUT, deadline)? {
+        (0, _) => Some(false),
+        (1, out) => Some(!only_changelog_conflicts(&out)),
         _ => None,
     }
+}
+
+/// Does `git merge-tree --write-tree --name-only --no-messages` stdout name
+/// [`CHANGELOG_PATH`] as the only conflicted path? Line 1 is the result tree;
+/// the rest are conflicted paths. An empty or unreadable list is `false`
+/// (fail closed: the conflict stays a conflict).
+fn only_changelog_conflicts(stdout: &str) -> bool {
+    let mut paths = stdout.lines().skip(1).filter(|l| !l.is_empty()).peekable();
+    paths.peek().is_some() && paths.all(|p| p == CHANGELOG_PATH)
 }
 
 /// Run `git args…` in `root` with every stream closed, killing it after
@@ -254,6 +279,17 @@ fn merge_tree_within(root: &Path, a: &str, b: &str, deadline: &Deadline) -> Opti
 /// spawn failure, signal, timeout, or an already-spent deadline (nothing is
 /// launched then).
 fn git_code(root: &Path, args: &[&str], timeout: Duration, deadline: &Deadline) -> Option<i32> {
+    git_run(root, args, timeout, deadline).map(|(code, _)| code)
+}
+
+/// As [`git_code`], also returning stdout. The pipe is drained on a thread so
+/// a large output cannot stall the child while this loop polls it.
+fn git_run(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    deadline: &Deadline,
+) -> Option<(i32, String)> {
     let timeout = timeout.min(deadline.remaining());
     if timeout.is_zero() {
         return None;
@@ -263,18 +299,28 @@ fn git_code(root: &Path, args: &[&str], timeout: Duration, deadline: &Deadline) 
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.code(),
+            Ok(Some(status)) => {
+                let out = reader.join().unwrap_or_default();
+                return status.code().map(|c| (c, out));
+            }
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(POLL),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = reader.join();
                 return None;
             }
         }

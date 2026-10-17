@@ -214,6 +214,49 @@ pub fn with_readiness(
     }
 }
 
+/// Why an existing hold is still kept, for the read-only `sequence-plan`
+/// output (#12595): the first [`with_readiness`] condition that fails, or
+/// "predecessor ready". Mirrors that function's order; writes nothing.
+#[must_use]
+pub fn hold_reason(
+    marker: &SequenceMarker,
+    pred: Option<&PredecessorState>,
+    follower: &SequencePr,
+    head: Option<&SequencePr>,
+) -> String {
+    if marker.source.as_deref() != Some(SOURCE_PASS) {
+        return "human hold (no `source=pass`): never auto-released".into();
+    }
+    if marker.plan.starts_with(CONSOLIDATION_PLAN_PREFIX) {
+        return "consolidation reservation: keeps its own contract".into();
+    }
+    let Some(h) = head else {
+        return format!("predecessor #{} is outside this tick's listing", marker.after);
+    };
+    let in_flight = pred
+        .zip(follower.head_sha.as_deref())
+        .is_some_and(|(p, fh)| {
+            matches!(evaluate(marker, p, fh), Verdict::Keep(KeepReason::InFlight))
+        });
+    if !in_flight {
+        return format!(
+            "predecessor #{} is not read open at the recorded head (moved, closed, unreadable, \
+             or the follower head moved): the other hold rules decide",
+            marker.after
+        );
+    }
+    if !provably_unstacked(follower, h) {
+        return format!(
+            "stacked on #{} (or a branch name is unknown): readiness does not release it",
+            marker.after
+        );
+    }
+    if ready(h) {
+        return format!("predecessor #{} is ready", marker.after);
+    }
+    format!("predecessor #{} is not ready: released on the next tick", marker.after)
+}
+
 /// The release reason for [`HoldAction::ReleaseNotReady`]. `head` is the
 /// predecessor's row as this tick read it: a live red or conflicting head is
 /// named concretely (#12010).
