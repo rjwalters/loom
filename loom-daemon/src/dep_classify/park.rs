@@ -88,7 +88,8 @@ pub fn apply(
     let mut forge = crate::operator_decision::cli::GhForge::new(
         repo_root.to_path_buf(),
         Some(repo.to_string()),
-    );
+    )
+    .with_call_site("dep_classify.park");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = crate::park_record::apply::apply(&mut forge, &req, &mut out, &mut err);
     if code == crate::park_record::apply::exit::OK {
