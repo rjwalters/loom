@@ -129,12 +129,15 @@ impl GhProbe {
         Self { gh, config_dir }
     }
 
-    /// Counted through the `gh` facade as `write_scope.probe` (#10089). The
-    /// explicit `config_dir` is the credential under test, so it overrides
-    /// the facade's working-directory lookup; `None` inherits the process's.
-    fn api(&self, args: &[&str]) -> Result<String, String> {
+    /// One probe read. A read-for-write: it must run on the credential of the
+    /// write it gates (#12606), so it is pinned to that writer
+    /// (`writer_identity`, the asker-dependent exception
+    /// `tests/writer_read_guard.rs` lists for this file) and is never
+    /// reader-only. A reader would answer for its own installation and refuse
+    /// every repository it does not cover.
+    pub(crate) fn invocation(&self, args: &[&str]) -> crate::gh_invocation::GhInvocation {
         use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-        let inv = GhInvocation::new(
+        GhInvocation::new(
             Operation::new("write_scope.probe"),
             AccessIntent::Read,
             GhTarget::None,
@@ -145,8 +148,14 @@ impl GhProbe {
         // Asker-dependent: the probe measures THIS credential's write scope.
         .writer_identity()
         .arg("api")
-        .args(args);
-        match inv.run() {
+        .args(args)
+    }
+
+    /// Counted through the `gh` facade as `write_scope.probe` (#10089). The
+    /// explicit `config_dir` is the credential under test, so it overrides
+    /// the facade's working-directory lookup; `None` inherits the process's.
+    fn api(&self, args: &[&str]) -> Result<String, String> {
+        match self.invocation(args).run() {
             crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => {
                 Ok(String::from_utf8_lossy(&o.stdout).into_owned())
             }

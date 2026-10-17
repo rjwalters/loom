@@ -283,8 +283,10 @@ pub struct GhForge {
     write_ok: Option<Result<(), String>>,
     /// `Some(gh)`: vet writes under the workspace's own per-owner credential
     /// with this `gh` (#11437), as the tick's gate does. `None` (the default,
-    /// CLI callers) vets under the process credential.
+    /// CLI callers) vets under the credential the write carries.
     root_credential_gh: Option<PathBuf>,
+    /// The call site a refusal's `write_scope.refused` record names.
+    call_site: &'static str,
 }
 
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -306,16 +308,20 @@ fn encode_segment(s: &str) -> String {
 }
 
 /// The write-scope verdict for `repo` (or the root's origin): under the
-/// root's own credential when `gh` is given (#11437), else the process's.
+/// root's own credential when `gh` is given (#11437), else under the
+/// credential the write itself will carry (#12606: the per-owner writer the
+/// `gh` facade resolves for `root` and `repo`, else the process's). A refusal
+/// is exported as `write_scope.refused` with call site `what`.
 fn scope_verdict(
     root: &std::path::Path,
     repo: Option<&str>,
     gh: Option<&std::path::Path>,
+    what: &str,
 ) -> crate::write_scope::Verdict {
     match (gh, repo.map(str::trim).filter(|r| !r.is_empty())) {
-        (Some(gh), Some(r)) => crate::write_scope::repo_writable_with(root, r, gh),
-        (Some(gh), None) => crate::write_scope::root_writable_with(root, gh),
-        (None, _) => crate::write_scope::may_write_from(root, repo),
+        (Some(gh), Some(r)) => crate::write_scope::repo_writable_with_at(root, r, gh, what),
+        (Some(gh), None) => crate::write_scope::root_writable_with_at(root, gh, what),
+        (None, _) => crate::write_scope::may_write_from_at(root, repo, what),
     }
 }
 
@@ -327,7 +333,16 @@ impl GhForge {
             repo,
             write_ok: None,
             root_credential_gh: None,
+            call_site: "operator_decision.forge",
         }
+    }
+
+    /// Name the call site a refused write's `write_scope.refused` record
+    /// carries (#12606).
+    #[must_use]
+    pub fn with_call_site(mut self, what: &'static str) -> Self {
+        self.call_site = what;
+        self
     }
 
     /// Like [`Self::new`], but writes are vetted under the root's own
@@ -345,8 +360,9 @@ impl GhForge {
     fn check_write(&mut self) -> Result<(), String> {
         let (root, repo) = (&self.repo_root, self.repo.as_deref());
         let gh = self.root_credential_gh.as_deref();
+        let what = self.call_site;
         self.write_ok
-            .get_or_insert_with(|| match scope_verdict(root, repo, gh) {
+            .get_or_insert_with(|| match scope_verdict(root, repo, gh, what) {
                 crate::write_scope::Verdict::Allow(_) => Ok(()),
                 crate::write_scope::Verdict::Deny(why) => {
                     Err(format!("refusing the write (#9548): {why}"))
