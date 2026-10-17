@@ -177,6 +177,7 @@ pub(crate) mod transcript_ingest_cli;
 pub(crate) mod usage_report_cli;
 pub(crate) mod watch;
 mod watchdog;
+mod work_docs_archive;
 pub(crate) mod workspace_fleet;
 pub(crate) mod worktree_base;
 pub(crate) mod worktree_branch_conflict;
