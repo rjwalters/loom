@@ -1975,6 +1975,10 @@ pub struct DeepCleanRepoStatus {
     /// What that firing pass reclaimed, e.g. `"target/ (34.1G)"` or
     /// `"nothing"`.
     pub last_reclaimed: Option<String>,
+    /// What `clean.keepBuildArtifacts` left in place on that pass, e.g.
+    /// `"node_modules/ (1.2G)"` (#12694). `None` when nothing was kept.
+    #[serde(default)]
+    pub last_kept: Option<String>,
 }
 
 mod observability_export;
