@@ -17,6 +17,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12287**: merge-pr: delete the check wait, branch self-sync and mergeable pre-read (#12063 slice 2)
 - **#12321**: refactor: answer the gh pr merge guard from the shared command lexer
 - **#12354**: feat: report auto-update progress and degrade health when checks or convergence stall
+- **#12368**: feat(telemetry): record Judge verdicts and found-work from the real write
 - **#12375**: chore: delete the telemetry-replay CLI, SigNoz replay queries and CI jobs
 - **#12381**: ci: make the macOS flake-shell leg of CI Daily advisory
 - **#12402**: ci: check macOS compile and run the release otlp_collector step on every backend PR
@@ -28,6 +29,9 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12539**: fix: remove retired generated skills in source-backed resync
 - **#12559**: fix: exempt merge-authorization context from wait-checks zero-rows, settled and idle paths
 - **#12570**: fix: check out .loom in the merge-group template and audit group-check without checkout
+- **#12599**: feat: keep operator release conditions binding in Champion's sticky-hold precheck
+- **#12613**: fix: disarm an armed floor roll when the fleet floor is rolled back
+- **#12658**: fix: report a missing guard-destructive engine in check-guards-installed
 
 ## Very Important
 
@@ -35,6 +39,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 - **#12203**: stage_dwell: every host re-lists every repo every 5 min (~8.9k billable GitHub calls/h fleet-wide)
 - **#12568**: merge_group workflow can't post loom/merge-authorization: write_scope refuses (no checkout in the template), so every queued PR times out
+- **#12653**: Emit merge_hold hold-cause + release-actor + merge-queue facts to SigNoz (unblocks merge_hold ETA prediction)
 
 ## Important
 
@@ -59,28 +64,26 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#9081**: guard-background-subagents misses a background Bash started by a foreground subagent: headless sweep exits, Builder's make verify reaped
+- **#9736**: health: detect stalled release updates without a source checkout
 - **#10083**: CI path filter skips label_registry Rust tests on label-file-only PRs (how #10072 turned main red)
 - **#10890**: Daemon dispatches loom:issue + loom:needs-capability items; pre-flight skip then reads as insta-crash and quarantine release re-queues them
 - **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default)
 - **#11112**: Remove the safehouse (Matrix) integration from Loom: narration, ChatOps/Concierge, peer-claim channel (forge leases remain)
 - **#11301**: check-stale-blocked: the per-repo budget probe spends ~1.4k GraphQL points/h on the writer bucket that runs dry
 - **#11787**: issue.estimate coverage gap: operator-session curation sets loom:curated by hand and bypasses curation-complete (loom-ui: 58 of 62 curations since the gate have no estimate)
+- **#12050**: Design captain-owned fleet coordination before removing later peer-claim safeguards
 - **#12085**: Telemetry(doctor): structured parked-PR cause (park reason, doctor_cycles, queue gate, treating age) (ETA doctor, loom-ui#4063 #6)
-- **#12093**: Simplify: retire the dispatch-inert tier:* axis (Level::of ignores it; no consumer) — it only adds confusion beside the real priority labels
 - **#12117**: Telemetry: inventory every kind; fix or delete role_tick.outcome, ci.job.log, session.output
 - **#12167**: telemetry: export peer_coordination verdict and degraded duration on host.health
-- **#12456**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
 - **#12506**: merge sequencing: Phase 1 release skips some followers whose predecessor merged at the recorded head, and fail-closed holds emit no telemetry
-- **#12595**: Merge sequencing: follower stays loom:sequenced behind a loom:blocked predecessor; CHANGELOG-only overlap shouldn't serialise
+- **#12679**: merge queue: external status poster (forge.mergeQueue.statusCommand) and replace the writer-App statuses gate when set
+- **#12681**: Dedupe identical pass()/fail() helpers copied into ~100 test suites via lib/assert.sh
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
-- **#8570**: Guard: refuse a build/scratch dir assignment that resolves onto a tmpfs mount (upstream PR to rjwalters/repo, split from #8512)
-- **#9736**: health: detect stalled release updates without a source checkout
-- **#12051**: pass_shard: run the stale-blocked release pass and fleet.state listings on one host per repo
 - **#12082**: Worktree-isolation guard blocks Bash writes to paths outside the repo when the cwd is the main checkout
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
 - **#12198**: ci-daily: macOS shell flake leg never completes green — decide fix, advisory or remove
@@ -96,23 +99,31 @@ Issues currently being built (`loom:building`).
 - **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution
 - **#12552**: forge wait-checks: apply the loom/merge-authorization exemption to the zero-rows and settled/idle paths too (#12532 follow-up)
 - **#12568**: merge_group workflow can't post loom/merge-authorization: write_scope refuses (no checkout in the template), so every queued PR times out
-- **#12571**: Follow-ups to #12564: fail-closed issue-sweep lease tie-break; no relabel on a shed label read; break-glass docs; stronger test
-- **#12590**: Champion standing authorization: test a hit on a non-first forbiddenDiffPatterns entry (follow-up to #12529)
-- **#12591**: Champion standing authorizations: read the resolved effective config, not only the committed .loom/config.json
-- **#12592**: Remove parse_launch_tap_after: test-only reader in launch_record.rs
 - **#12594**: Champion: an operator-named release condition on a held PR is lost when a new head makes Champion re-judge
-- **#12596**: Worktree-isolation guard: false positives on out-of-repo paths containing the repo dir name, and on heredoc open() in python -
-- **#12597**: CLI over a plain ssh session can't find the running daemon ("Is the daemon running?") without LOOM_SOCKET_PATH/LOOM_WORKSPACE
+- **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
+- **#12610**: auto-update: rolling the fleet floor back doesn't cancel a pause-and-roll already armed (or about to arm) toward the withdrawn version
+- **#12634**: WORK_LOG archival (2/4): Guide runs rotation with archive-aware dedup, staging and batching
+- **#12635**: WORK_LOG archival (3/4): WORK_PLAN archival that never hides open work
+- **#12636**: WORK_LOG archival (4/4): narrow archive paths in Judge/Champion docs-only allowlists, telemetry, imagine seed, install/resync guard
+- **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
+- **#12664**: Remove 15 orphaned pub helpers in loom-daemon with no callers
+- **#12665**: Emit hold.transition facts at Champion merge-risk hold and merge-pr refusal
+- **#12666**: Export merge.authorization.evaluated from run_group_check
+- **#12667**: Export merge.queue.observed and on-change queue-regime snapshot
+- **#12668**: Dedupe logical_cwd/same_dir helpers copied across daemon_start and daemon_update
+- **#12676**: Remove 49 redundant assert_* copies in 35 test suites that already source lib/assert.sh
+- **#12683**: install-loom.sh writes the merge-driver .gitattributes into the target's main checkout but leaves it out of the install PR
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#12586**: fix: fail closed on an unverified issue-sweep lease order and a shed PR label read
-- **#12593**: test: cover a match on a non-first forbiddenDiffPatterns entry
-- **#12598**: feat: read Champion standing authorizations from the resolved effective config
-- **#12599**: feat: keep operator release conditions binding in Champion's sticky-hold precheck
-- **#12600**: test: pin write-confinement containment and interpreter-heredoc allow cases
+- **#12631**: fix: release a Champion CI wait as requeued so it holds flat
+- **#12637**: refactor: split status_render inline tests into per-module files
+- **#12639**: test: create registered roots before registering their gh config dir
+- **#12669**: feat: export the observed merge queue to OTLP as merge.queue.observed
+- **#12684**: fix: write merge-driver .gitattributes into the install worktree
+- **#12685**: refactor: drop shadowing assert helpers from suites sourcing lib/assert.sh
 
 ## Approved (Awaiting Merge)
 
@@ -138,6 +149,14 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12539**: fix: remove retired generated skills in source-backed resync
 - **#12559**: fix: exempt merge-authorization context from wait-checks zero-rows, settled and idle paths
 - **#12570**: fix: check out .loom in the merge-group template and audit group-check without checkout
+- **#12599**: feat: keep operator release conditions binding in Champion's sticky-hold precheck
+- **#12613**: fix: disarm an armed floor roll when the fleet floor is rolled back
+- **#12658**: fix: report a missing guard-destructive engine in check-guards-installed
+- **#12670**: feat: let month-rotated work-log/plan archives pass the docs-only fast path
+- **#12671**: feat: export merge-group authorization evaluations to OTLP
+- **#12672**: feat: export Champion hold-label transitions to OTLP as hold.transition
+- **#12673**: refactor: remove 15 orphaned pub helpers from loom-daemon
+- **#12674**: feat: marker-driven WORK_PLAN archival for work-docs --plan
 
 ## Proposed
 
@@ -195,6 +214,7 @@ Issues carrying `loom:curated`.
 - **#12019**: [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1) *(curated)*
 - **#12029**: Telemetry: merge runs record PR number and observed result (merge-pr chokepoint) — Judge parts moved to #12362; held behind #12063 *(curated)*
 - **#12043**: macOS bash 3.2: 7 shell suites fail on bash-4+ semantics (empty arrays under set -u, ${x,,}, \001 array sentinel, heredoc apostrophe in $(), mapfile, source <()) *(curated)*
+- **#12050**: Design captain-owned fleet coordination before removing later peer-claim safeguards *(curated)*
 - **#12082**: Worktree-isolation guard blocks Bash writes to paths outside the repo when the cwd is the main checkout *(curated)*
 - **#12086**: Telemetry(coverage): every lease-writing host exports pick.decision + fleet.state (ETA ready_wait over-prediction, loom-ui#4063 #7) *(curated)*
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301 *(curated)*
@@ -221,24 +241,32 @@ Issues carrying `loom:curated`.
 - **#12418**: Verify epic #10698 acceptance: completed-vs-not-planned dispositions and live fleet receipts *(curated)*
 - **#12425**: auto-update: arm pause-and-roll from the config-restart demand (#12419 child 3) *(curated)*
 - **#12447**: Epic: captain-assigned dispatch — workers ask the fleet captain for their next assignment from one fleet queue *(curated)*
-- **#12456**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered) *(curated)*
 - **#12458**: Reap idle clean worktrees of open issues/PRs (configurable idle period) *(curated)*
 - **#12460**: Bound shared tool caches (uv) and prune non-live codex profiles *(curated)*
 - **#12481**: Roll-stopped role ticks export unclassified:pre-launch (#12028 follow-up) *(curated)*
 - **#12507**: Source-backed resync leaves retired generated Codex skills discoverable *(curated)*
 - **#12511**: Readers: a failed roster load still routes reads to the writer; evidence-free 404 withdrawal is an hour (follow-up to #12412) *(curated)*
+- **#12551**: fleet_dispatch no-progress hold follow-ups: Doctor outcome line, Judge ci_pending, CI-green release, metric attribution *(curated)*
 - **#12552**: forge wait-checks: apply the loom/merge-authorization exemption to the zero-rows and settled/idle paths too (#12532 follow-up) *(curated)*
 - **#12568**: merge_group workflow can't post loom/merge-authorization: write_scope refuses (no checkout in the template), so every queued PR times out *(curated)*
 - **#12594**: Champion: an operator-named release condition on a held PR is lost when a new head makes Champion re-judge *(curated)*
-- **#12595**: Merge sequencing: follower stays loom:sequenced behind a loom:blocked predecessor; CHANGELOG-only overlap shouldn't serialise *(curated)*
-- **#12596**: Worktree-isolation guard: false positives on out-of-repo paths containing the repo dir name, and on heredoc open() in python - *(curated)*
-- **#12597**: CLI over a plain ssh session can't find the running daemon ("Is the daemon running?") without LOOM_SOCKET_PATH/LOOM_WORKSPACE *(curated)*
+- **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out *(curated)*
+- **#12619**: Restore stand_down doc comment displaced by floor_withdrawn/disarm (pause_roll.rs) *(curated)*
+- **#12634**: WORK_LOG archival (2/4): Guide runs rotation with archive-aware dedup, staging and batching *(curated)*
+- **#12635**: WORK_LOG archival (3/4): WORK_PLAN archival that never hides open work *(curated)*
+- **#12636**: WORK_LOG archival (4/4): narrow archive paths in Judge/Champion docs-only allowlists, telemetry, imagine seed, install/resync guard *(curated)*
+- **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR) *(curated)*
+- **#12665**: Emit hold.transition facts at Champion merge-risk hold and merge-pr refusal *(curated)*
+- **#12666**: Export merge.authorization.evaluated from run_group_check *(curated)*
+- **#12667**: Export merge.queue.observed and on-change queue-regime snapshot *(curated)*
+- **#12679**: merge queue: external status poster (forge.mergeQueue.statusCommand) and replace the writer-App statuses gate when set *(curated)*
 
 ## Proposed (Architect / Hermit)
 
-- **#12093**: Simplify: retire the dispatch-inert tier:* axis (Level::of ignores it; no consumer) — it only adds confusion beside the real priority labels *(hermit)*
-- **#12569**: Remove dead daily-velocity query chain in activity/stats *(hermit)*
-- **#12589**: Remove WORK_LOG.md: derived copy of merged-PR history (8.6k lines, 531 churn commits) *(hermit)*
+- **#12589**: Archive older WORK_PLAN and WORK_LOG content through shared Loom maintenance *(hermit)*
+- **#12655**: Consolidate three duplicated mock HTTP sink test helpers in observability tests *(hermit)*
+- **#12676**: Remove 49 redundant assert_* copies in 35 test suites that already source lib/assert.sh *(hermit)*
+- **#12681**: Dedupe identical pass()/fail() helpers copied into ~100 test suites via lib/assert.sh *(hermit)*
 
 ## Epics
 
@@ -258,14 +286,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 19 |
-| Very important | 2 |
+| Operator merge-risk holds | 23 |
+| Very important | 3 |
 | Important | 13 |
-| Ready (`loom:issue`) | 14 |
-| In Progress (`loom:building`) | 26 |
-| PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 20 |
-| Curated | 90 |
-| Architect / Hermit proposals | 3 |
+| Ready (`loom:issue`) | 15 |
+| In Progress (`loom:building`) | 30 |
+| PRs awaiting review | 6 |
+| Approved PRs awaiting merge | 28 |
+| Curated | 98 |
+| Architect / Hermit proposals | 4 |
 | Active epics | 11 |
 <!-- guide:plan-body:end -->
