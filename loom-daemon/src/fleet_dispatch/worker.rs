@@ -193,6 +193,7 @@ pub fn refusal_token(reason: RefusalReason) -> &'static str {
         RefusalReason::Grace => "captain_grace",
         RefusalReason::NotEligible => "captain_not_eligible",
         RefusalReason::Cap => "captain_cap",
+        RefusalReason::Cooldown => "captain_cooldown",
         RefusalReason::Other => "captain_refused",
     }
 }
