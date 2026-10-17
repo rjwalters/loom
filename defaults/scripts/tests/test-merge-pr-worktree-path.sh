@@ -59,16 +59,7 @@ git -C "$MP_FIX/repo" worktree add -q -b feature/issue-1 "$MP_FIX/wt" 2>/dev/nul
 # merge_pr <args...>: the real merge-pr.sh, run from the registered checkout.
 merge_pr() { (cd "$MP_FIX/repo" && PATH="$MP_FIX/bin:$PATH" "$MERGE_PR" "$@"); }
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # An assertion that CANNOT survive the port to Rust, retired under the
 # three-part test in defaults/docs/verification-recipes.md §6. Printed, not
