@@ -140,6 +140,15 @@ impl Counters {
             .or_default() += 1;
     }
 
+    /// Count a claim refused `held` by a no-progress hold (#12541), under
+    /// its own reason instead of the plain `held`.
+    pub fn claim_cooled(&mut self) {
+        *self
+            .refusals
+            .entry(("claim", super::server::NO_PROGRESS_REASON.to_string()))
+            .or_default() += 1;
+    }
+
     /// Count a `refuse` call's token: one of [`REFUSE_REASONS`], or `other`.
     /// The token is worker-supplied, so it is never a label as sent.
     pub fn refused(&mut self, reason: &str) {

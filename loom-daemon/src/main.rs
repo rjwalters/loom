@@ -987,7 +987,6 @@ enum Commands {
     #[command(flatten)]
     ScriptPorts(cli::script_ports::ScriptPortCommand),
     Labels(cli::labels_cmd::LabelsArgs),
-    Presence(cli::presence::PresenceArgs),
 
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
@@ -2314,7 +2313,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::ScriptPorts(cmd) => cmd.run(),
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
-        Commands::Presence(cmd) => cmd.run(),
         Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {

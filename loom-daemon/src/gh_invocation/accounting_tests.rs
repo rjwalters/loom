@@ -3,10 +3,10 @@
 //! `forge_call_stats` row under its operation name.
 
 use super::*;
+use crate::gh_invocation::test_support::{rows_after, stub};
 use crate::gh_invocation::{AccessIntent, GhTarget, Operation, ParentContext};
 use crate::types::ForgeCallCounts;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 fn os(args: &[&str]) -> Vec<OsString> {
@@ -44,13 +44,6 @@ fn static_pool_follows_the_argv() {
     }
 }
 
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
 fn inv(op: &'static str, args: &[&str], program: &Path) -> GhInvocation {
     GhInvocation::new(
         Operation::new(op),
@@ -61,17 +54,6 @@ fn inv(op: &'static str, args: &[&str], program: &Path) -> GhInvocation {
     .parent(ParentContext::Missing)
     .program(program)
     .args(args.iter().copied())
-}
-
-/// Run `body` with THIS thread's call-stats sink at a fresh dir, returning the
-/// host-window rows it produced.
-fn rows_after(body: impl FnOnce()) -> Vec<ForgeCallCounts> {
-    let sink = tempfile::tempdir().unwrap();
-    crate::forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
-    body();
-    let report = crate::forge_call_stats::status_report(chrono::Utc::now(), None);
-    crate::forge_call_stats::set_test_sink_dir(None);
-    report.host_window.unwrap_or_default()
 }
 
 fn row<'a>(rows: &'a [ForgeCallCounts], caller: &str) -> &'a ForgeCallCounts {

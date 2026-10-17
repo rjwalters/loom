@@ -18,6 +18,15 @@
 //!    needs the writer; a listed file that no longer carries a marker fails
 //!    too (a ratchet: the list only ever gets shorter).
 //!
+//! 3. The in-process daemon read helpers (#12555) —
+//!    `claim_reconciliation::gh_call::read` and
+//!    `SweepRegistry::gh_inv(.., AccessIntent::Read, ..)` — build
+//!    `GhInvocation::reader_only()` reads, which `writer_identity()` cannot
+//!    pin and which are shed rather than sent to the writer when no reader
+//!    route exists. The writer-pinned "read own write" helpers are gone.
+//!    The behaviour is unit-tested in `gh_invocation/reader_only_tests.rs`;
+//!    this rule keeps a refactor from dropping the marker.
+//!
 //! The runtime half is `gh_invocation::accounting::is_unmarked_read_on_writer`,
 //! which logs an error for any read that reaches the writer unmarked.
 
@@ -35,7 +44,6 @@ const MERGE: &str = "merge settings hidden from a reader App; the merging writer
 /// to the writer. Only ever remove entries.
 const READ_ON_WRITER: &[(&str, &str)] = &[
     ("branch_update.rs", MERGE),
-    ("claim_reconciliation/gh_call.rs", BASE),
     (
         "cli/duplicate_closed_search.rs",
         "FOLLOW-UP: an untargeted search pinned to the writer; no reader route yet",
@@ -44,7 +52,6 @@ const READ_ON_WRITER: &[(&str, &str)] = &[
     ("cli/pr_lease.rs", BASE),
     ("credential_preflight/pool.rs", ASKER),
     ("forge_bucket_book/probe.rs", ASKER),
-    ("forge_check_claim.rs", BASE),
     ("forge_comment.rs", BASE),
     ("forge_etag_store/deferrable.rs", NOPOOL),
     ("forge_identity.rs", PLUMBING),
@@ -59,8 +66,6 @@ const READ_ON_WRITER: &[(&str, &str)] = &[
     ("merge_group_ci/eligibility.rs", ASKER),
     ("merge_pr/head_sync/fetch.rs", BASE),
     ("observability/ops/ratelimit.rs", ASKER),
-    ("sweep_registry/guards.rs", BASE),
-    ("sweep_registry/guards/gh_exec.rs", BASE),
     ("write_scope/probe.rs", ASKER),
 ];
 
@@ -190,5 +195,48 @@ fn a_read_is_pinned_to_the_writer_only_at_a_listed_site() {
     assert!(
         stale.is_empty(),
         "READ_ON_WRITER lists files with no writer marker left; remove them (ratchet): {stale:?}"
+    );
+}
+
+/// `(file relative to loom-daemon/src, builder)`: the in-process daemon read
+/// builders, each of which must mark its reads reader-only (#12555).
+const READER_ONLY_BUILDERS: &[(&str, &str)] = &[
+    ("claim_reconciliation/gh_call.rs", "fn build("),
+    ("sweep_registry/guards/gh_exec.rs", "fn gh_inv("),
+];
+
+/// Writer-pinned read helpers retired by #12555.
+const RETIRED_READ_ON_WRITER_HELPERS: &[&str] = &["fn read_own_write", "fn gh_read_own_write"];
+
+#[test]
+fn the_daemon_read_builders_are_reader_only() {
+    for (file, builder) in READER_ONLY_BUILDERS {
+        let code = code_lines(&src_root().join(file)).join("\n");
+        let at = code.find(builder).unwrap_or_else(|| {
+            panic!("{file}: `{builder}` not found; update READER_ONLY_BUILDERS")
+        });
+        let body: String = code[at..].chars().take(1200).collect();
+        assert!(
+            body.contains("AccessIntent::Read") && body.contains(".reader_only()"),
+            "{file}: `{builder}` must mark a read `.reader_only()` (#12555: an in-process daemon \
+             read never mints the writer)"
+        );
+    }
+    let mut files = Vec::new();
+    rust_files(&src_root(), &mut files);
+    let mut hits = Vec::new();
+    for f in &files {
+        let rel = f.strip_prefix(src_root()).unwrap().display().to_string();
+        for line in code_lines(f) {
+            for name in RETIRED_READ_ON_WRITER_HELPERS {
+                if line.contains(name) {
+                    hits.push(format!("{rel}: {name}"));
+                }
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "a writer-pinned read-own-write helper came back (#12555): {hits:?}"
     );
 }

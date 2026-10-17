@@ -330,3 +330,44 @@ async fn a_reload_replaces_the_roster() {
         200
     );
 }
+
+/// #12541: a release that did not move the item holds its `(repo, item,
+/// step)` fleet-wide; the next host's claim is refused `held`, counted and
+/// span-reasoned as the no-progress cooldown, until the hold ends.
+#[tokio::test]
+async fn a_no_progress_release_refuses_every_hosts_next_claim_until_the_cooldown_ends() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    let (reply, _) =
+        s.handle(A, "/v1/claim", claim_body(A, 9, "champion_merge").to_string().as_bytes());
+    let id = serde_json::from_str::<Value>(&reply.body).unwrap()["assignment_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let release = json!({"host_id": A, "assignment_id": id, "outcome": "noop"});
+    let (reply, call) = s.handle(A, "/v1/release", release.to_string().as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(true));
+    assert_eq!(call.item, Some(("acme/w".to_string(), 9, "champion_merge".to_string())));
+
+    for host in [B, A] {
+        let (reply, call) = s.handle(
+            host,
+            "/v1/claim",
+            claim_body(host, 9, "champion_merge").to_string().as_bytes(),
+        );
+        let refusal: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(refusal["granted"], json!(false), "{host}");
+        assert_eq!(refusal["reason"], json!("held"), "the wire reason is plain `held`");
+        assert_eq!(refusal["retry_after_s"], json!(1800));
+        assert_eq!(call.reason.as_deref(), Some(NO_PROGRESS_REASON));
+    }
+    let c = s.counters.lock().unwrap().clone();
+    assert_eq!(c.refusals.get(&("claim", NO_PROGRESS_REASON.to_string())), Some(&2));
+    assert_eq!(c.refusals.get(&("claim", "held".to_string())), None, "counted once");
+
+    clock.set(100 + 1800);
+    let (reply, _) =
+        s.handle(B, "/v1/claim", claim_body(B, 9, "champion_merge").to_string().as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["granted"], json!(true));
+}
