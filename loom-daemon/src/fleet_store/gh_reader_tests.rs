@@ -252,17 +252,29 @@ fn a_managed_checkout_resolves_its_readers_at_the_daemon_workspace_root() {
     )
     .unwrap();
 
-    // The pre-fix lookup, at the checkout's own root: no reader.
+    // Through the constructor `GhTransport::new` delegates to: a transport
+    // for the managed checkout starts on the reader published under the
+    // daemon's workspace root.
+    let t = GhTransport::new_with_reader_root(
+        checkout.path(),
+        Some(daemon.path()),
+        "acme/widgets",
+        roster,
+    );
+    assert!(t.pooled);
+    assert_eq!(
+        *t.reader.borrow(),
+        Some((dir, "951263".to_string())),
+        "the reader pool resolves at the daemon's workspace root, not the checkout's"
+    );
+    // The writer credential still resolves at the checkout's root.
+    assert_eq!(t.workspace_root, checkout.path());
+
+    // The checkout's own root has no reader token: resolving there (the
+    // pre-#12630 behaviour) finds none.
     let (pooled, next) = reader_pool(checkout.path().to_path_buf(), "acme/widgets", roster);
     assert!(pooled);
     assert_eq!(next(), None, "no reader token is ever published under a managed checkout");
-
-    // At the daemon's workspace root, as `GhTransport::new` now resolves it.
-    let root = crate::forge_identity::reader_root_with(checkout.path(), Some(daemon.path()));
-    assert_eq!(root, daemon.path());
-    let (pooled, next) = reader_pool(root, "acme/widgets", roster);
-    assert!(pooled);
-    assert_eq!(next(), Some((dir, "951263".to_string())));
 
     // A process with no daemon or front root keeps the root it was given.
     assert_eq!(crate::forge_identity::reader_root_with(checkout.path(), None), checkout.path());

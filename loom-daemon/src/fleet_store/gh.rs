@@ -127,10 +127,30 @@ impl GhTransport {
     /// still resolves against `workspace_root`.
     #[must_use]
     pub fn new(workspace_root: &Path, repo: &str) -> Self {
-        let (pooled, next_reader) = reader_pool(
-            crate::forge_identity::reader_root(workspace_root),
+        Self::new_with_reader_root(
+            workspace_root,
+            crate::forge_identity::published_reader_root(),
             repo,
             crate::forge_identity::resolve,
+        )
+    }
+
+    /// [`GhTransport::new`] with the root readers are published under
+    /// (`published`: the daemon's workspace root, else the agent front's;
+    /// `None` in a process with neither) and the roster resolver injected.
+    /// The reader pool is resolved at `published`, falling back to
+    /// `workspace_root`; the writer credential always resolves at
+    /// `workspace_root` (#12630).
+    fn new_with_reader_root(
+        workspace_root: &Path,
+        published: Option<&Path>,
+        repo: &str,
+        roster_of: fn(&Path) -> crate::forge_identity::Roster,
+    ) -> Self {
+        let (pooled, next_reader) = reader_pool(
+            crate::forge_identity::reader_root_with(workspace_root, published),
+            repo,
+            roster_of,
         );
         Self::with_readers(
             workspace_root,

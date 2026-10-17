@@ -116,7 +116,14 @@ pub fn workspace_root() -> Option<&'static Path> {
 /// "stale" and shed the read without asking one (#12630).
 #[must_use]
 pub fn reader_root(given: &Path) -> PathBuf {
-    reader_root_with(given, workspace_root().or_else(front_root))
+    reader_root_with(given, published_reader_root())
+}
+
+/// The root this process's reader tokens are published under: the daemon's
+/// workspace root, else the agent front's reader root ([`reader_root`]).
+#[must_use]
+pub fn published_reader_root() -> Option<&'static Path> {
+    workspace_root().or_else(front_root)
 }
 
 /// [`reader_root`] with the published root injected.
