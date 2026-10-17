@@ -28,6 +28,13 @@ writing) will additionally push these records to a cloud backend.
 - [Refreshing the model rate card](#refreshing-the-model-rate-card)
 <!-- toc:end -->
 
+## Scope: daemon work only (#12536)
+
+Every record kind below is emitted by the daemon for work it performs or
+spawns. No CLI, hook or script lets an attended or outside session emit
+telemetry about its own work. A consumer infers external operator work from an
+item that advances with no daemon span or record. See `operator-presence.md`.
+
 ## Envelope
 
 Every record is transmitted inside a versioned envelope:
@@ -1570,13 +1577,14 @@ boundary, schema, ordering, gaps, latency, consumer queries) is in
 [`session-output.md`](session-output.md). This section records only how a
 consumer tells **who started the agent** (Issue #10116).
 
-Two producers emit the kind, and every record says which one with
-`loom.session.output.launch`:
+Every record says who started the agent with `loom.session.output.launch`.
+Only the daemon produces the kind; `attended` appears on records exported
+before #12536 removed the attended tailer:
 
 | `launch` | Producer | `loom.sweep_id` | `loom.attempt` |
 |---|---|---|---|
 | `daemon` | `loom-daemon`'s bus subscriber, for a sweep it dispatched | the dispatch's sweep id (`sweep-issue-<N>-<epoch>`) | the Nth run of that issue in this daemon's lifetime |
-| `attended` | the attended tailer (`loom-daemon live-output-attend`, started by `lease ensure` at a claim step) for a Loom role run as a subagent of an attended Claude Code session | `attended-<first 8 chars of the session id>-<agent id>`: a pure function of the transcript | absent |
+| `attended` | historical only: the attended tailer, removed in #12536 (daemon work only is recorded) | `attended-<first 8 chars of the session id>-<agent id>`: a pure function of the transcript | absent |
 
 The rest of the identity is shared: `loom.repo`, `loom.issue`, `loom.role`,
 `loom.session_id`, and the per-record `loom.session.output.stream_id` /
@@ -2222,7 +2230,6 @@ span's `github.account`, `account` is `app-<app id>`,
 |---|---|---|
 | `execution` | a daemon sweep's last `loom.runtime.run` (else its root) | the sweep's terminal transition, from `sweep.outcome`'s `tokens_by_model` |
 | `execution` | a role-runner tick's own `loom.role_attempt` root | the tick's transcript/native-store scan |
-| `attempt` | the role's `loom.role_attempt` in the execution journal (daemon child), else a `loom.role_attempt` created in the issue's story trace (operator session) | `loom-daemon usage-record`, run by the sweep prompt after each checkpoint write |
 | `attempt` | the tick's story span, **only when the tick stitched exactly one target** | the role runner; a multi-target tick is never split |
 
 #### LLM billing class (#10749)
@@ -2266,8 +2273,7 @@ closed vocabulary and the profile name are emitted: no key value, account
 name or token path. Sum metered spend per day with
 `llm.billing = api` grouped by `llm.provider.profile`.
 
-A daemon sweep's `claude -p` child also runs `usage-record`, so one trace can
-hold both scopes for one `loom.sweep_id`. **Total per `loom.sweep_id` from its
+A trace can hold both scopes for one `loom.sweep_id`. **Total per `loom.sweep_id` from its
 `execution` spans when present, else from the sum of its `attempt` spans —
 never both**; group `attempt` spans by their parent `loom.role_attempt` for the
 per-retry split (`execution − Σattempt` is orchestrator overhead). Price with
