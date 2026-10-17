@@ -7,6 +7,24 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-16
+- **PR #12525**: refactor: remove five unused activity model types and reexports
+- **PR #12519**: step_ledger: brake a Champion hold whose forge ladder write fails (#12516)
+- **PR #12517**: test: make gather_budget deadline-skip test deterministic
+- **PR #12514**: Champion re-evaluation ladder: 1,1,1,2,4,8,24,48,96 h then 7 d; re-time old-ladder markers
+- **PR #12512**: feat: report attended-session checkout freshness against GitHub's tip
+- **PR #12508**: feat: add loom-daemon forge create-issue with structured output and exit codes
+- **PR #12503**: feat: route unlabelled non-draft PRs to a Champion triage step, exclude drafts
+- **PR #12502**: fix: report a Builder step that opens no PR as a failure and explain the repeat cap
+- **PR #12412**: feat: never use the writer App for reads; shed a read no reader can serve
+- **Issue #12521** (closed): Remove unused activity model types (AgentMetric, TokenUsage, PrReworkStats, PromptSuccessStats, ProductivitySummary)
+- **Issue #12516** (closed): Champion ladder: a failing forge marker write re-evaluates the item hourly forever (follow-up to #12514)
+- **Issue #12515** (closed): test flake: gather_budget::run_ordered_takes_jobs_in_order_so_a_deadline_skips_from_the_end (about 5% under load)
+- **Issue #12513** (closed): Champion re-evaluation ladder: 1,1,1,2,4,8,24,48 h (operator ruling), and re-time markers set under the old ladder
+- **Issue #12504** (closed): port create-issue.sh to a Rust `loom-daemon forge create-issue` subcommand (structured output + reliable exit codes; less bash in the forge path)
+- **Issue #12500** (closed): Builder: a run that opens no PR reports success and silently cycles through no-op cooldown
+- **Issue #12499** (closed): step classifier: route an unlabelled open PR (no_stage) to Judge instead of stranding it
+- **Issue #12394** (closed): The writer App is never used for reads: a read with no reader available is shed, not sent to the writer
+- **Issue #11614** (closed): Decision: merged-branch cleanup authorization for unattended Loom merges
 - **PR #12498**: fix: post loom/merge-authorization on the PR head before enqueue
 - **PR #12497**: Step draw: defer merge-blocked Champion items before the draw (#12494)
 - **PR #12495**: fleet_dispatch: read the fleetDispatch flag from the daemon workspace host tier
