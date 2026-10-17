@@ -712,7 +712,7 @@ fn install_fake_gh_pr(
         "#!/usr/bin/env bash\n\
          printf '%s\\n' \"$*\" >> '{log}'\n\
          {pulls}\
-         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n\
+         if [ \"$*\" = \"api repos/{{owner}}/{{repo}}/pulls/{pr_number}\" ]; then\n\
          echo '{{\"labels\":[{labels_json}]}}'\n\
          exit 0\n\
          fi\n\
