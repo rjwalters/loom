@@ -340,19 +340,27 @@ pub fn emit_for_tick_correlated(
     emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None, None);
 }
 
+/// The step-specific inputs of [`emit_for_step`], bundled so the emit stays
+/// under clippy's argument limit.
+pub struct StepTelemetry<'a> {
+    /// The class the step's end derived (#12480); `None` on a failure falls
+    /// back to `unclassified:step`.
+    pub failure: Option<crate::observability::lifecycle::RoleFailure>,
+    pub sweep_id: &'a str,
+    /// The advisory `LOOM_STEP_OUTCOME` class and reason (#12362).
+    pub step_outcome: Option<(String, String)>,
+}
+
 /// [`emit_for_tick`] for a step-engine step (#11906): the same capture, its
 /// record marked `source = "step"` with the step's sweep id, so it is never
-/// counted as a role-runner tick. `failure` is the class the step's end
-/// derived (#12480); `None` on a failure falls back to `unclassified:step`.
+/// counted as a role-runner tick.
 pub fn emit_for_step(
     root: &Path,
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
-    failure: Option<crate::observability::lifecycle::RoleFailure>,
-    sweep_id: &str,
-    step_outcome: Option<(String, String)>,
+    step: StepTelemetry<'_>,
 ) {
     emit_tick(
         root,
@@ -361,9 +369,9 @@ pub fn emit_for_step(
         outcome,
         resolved,
         None,
-        failure,
-        Some(sweep_id.to_string()),
-        step_outcome,
+        step.failure,
+        Some(step.sweep_id.to_string()),
+        step.step_outcome,
     );
 }
 

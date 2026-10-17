@@ -261,9 +261,11 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
         capture.started_at,
         &capture.outcome,
         Some(crate::role_tick_telemetry::ResolvedLaunch::new(&capture.model, &capture.effort)),
-        capture.failure.clone(),
-        &capture.sweep_id,
-        capture.step_outcome.clone(),
+        crate::role_tick_telemetry::StepTelemetry {
+            failure: capture.failure.clone(),
+            sweep_id: &capture.sweep_id,
+            step_outcome: capture.step_outcome.clone(),
+        },
     );
 }
 
