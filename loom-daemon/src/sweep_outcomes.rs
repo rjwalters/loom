@@ -1196,6 +1196,11 @@ mod tests {
                 sweep_id: None,
                 deferred_by: None,
                 shard_owner: None,
+                found_work: None,
+                noop_reason: None,
+                verdicts: None,
+                step_class: None,
+                step_reason: None,
             }),
         )
     }

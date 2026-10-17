@@ -240,6 +240,9 @@ pub(crate) struct StepCapture {
     pub(crate) sweep_id: SweepId,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) outcome: RoleTickOutcome,
+    /// The advisory `LOOM_STEP_OUTCOME` class and reason (#12362), which
+    /// `outcome` collapses.
+    pub(crate) step_outcome: Option<(String, String)>,
     pub(crate) failure: Option<RoleFailure>,
     pub(crate) model: String,
     pub(crate) effort: String,
@@ -258,8 +261,11 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
         capture.started_at,
         &capture.outcome,
         Some(crate::role_tick_telemetry::ResolvedLaunch::new(&capture.model, &capture.effort)),
-        capture.failure.clone(),
-        &capture.sweep_id,
+        crate::role_tick_telemetry::StepTelemetry {
+            failure: capture.failure.clone(),
+            sweep_id: &capture.sweep_id,
+            step_outcome: capture.step_outcome.clone(),
+        },
     );
 }
 
@@ -331,6 +337,9 @@ impl SweepRegistry {
             sweep_id: sweep_id.to_string(),
             started_at,
             outcome: tick_outcome(role, end, line.as_ref()),
+            step_outcome: line
+                .as_ref()
+                .map(|l| (l.class.as_str().to_string(), l.reason.clone())),
             failure: step_failure(role, end, line.as_ref()),
             model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
             effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),

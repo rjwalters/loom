@@ -783,6 +783,10 @@ pub(crate) enum ForgeAction {
         /// `approved` or `changes-requested`.
         #[arg(long)]
         verdict: String,
+        /// The head the verdict was written against; journaled with the
+        /// verdict for telemetry (#12362), never read back from the forge.
+        #[arg(long)]
+        sha: Option<String>,
     },
 
     /// `forge verdict-reconcile <pr> --repo R --verdict V --sha S
@@ -1074,8 +1078,13 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 &nonce,
             );
         }
-        ForgeAction::VerdictLabels { pr, repo, verdict } => {
-            return super::forge_verdict_cmd::verdict_labels(pr, &repo, &verdict);
+        ForgeAction::VerdictLabels {
+            pr,
+            repo,
+            verdict,
+            sha,
+        } => {
+            return super::forge_verdict_cmd::verdict_labels(pr, &repo, &verdict, sha.as_deref());
         }
         ForgeAction::ClaimLiveness {
             number,
@@ -1415,6 +1424,7 @@ mod write_target_tests {
             pr: 7,
             repo: "unmanaged/repo".into(),
             verdict: "approved".into(),
+            sha: None,
         };
         assert_eq!(write_target(&labels), Some(Some("unmanaged/repo".into())));
         let gate = ForgeAction::VerdictGate {

@@ -114,6 +114,10 @@ pub enum JournalEntry {
         is_pr: bool,
         action: String,
         by: String,
+        /// The head the write was made against, when the caller knew it
+        /// (`forge verdict-labels --sha`, #12362).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
     },
 }
 
@@ -250,11 +254,29 @@ pub fn take(root: &Path) -> Option<Journal> {
     if owner != root {
         return None;
     }
-    Some(Journal {
+    Some(journal_of(raw))
+}
+
+/// Read this thread's journal for `root` without consuming it (#12362): the
+/// `role_attempt` span closes before the drain, which still needs the file.
+/// `None` when no journal is attached for `root`.
+#[must_use]
+pub fn peek(root: &Path) -> Option<Journal> {
+    let path = ACTIVE.with(|a| {
+        a.borrow()
+            .as_ref()
+            .filter(|(owner, _)| owner == root)
+            .map(|(_, path)| path.clone())
+    })?;
+    Some(journal_of(std::fs::read_to_string(path)))
+}
+
+fn journal_of(raw: std::io::Result<String>) -> Journal {
+    Journal {
         read: raw.is_ok(),
         entries: parse(raw.as_deref().unwrap_or_default()),
         front_expected: front_expected(),
-    })
+    }
 }
 
 /// Parse journal lines, skipping any that do not decode.
@@ -613,6 +635,21 @@ pub fn record_marker(number: u64, is_pr: bool, body: &str) {
 /// Journal a write a daemon subcommand made on `number` (#12027). A no-op
 /// outside a journaled run.
 pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
+    record_applied_at(number, is_pr, action, by, None);
+}
+
+/// The `by` of the verdict write `forge verdict-labels` journals (#12362).
+pub const VERDICT_LABELS_BY: &str = "verdict-labels";
+
+/// Journal a verdict's label transition on PR `pr` (`approved` or
+/// `changes_requested`, #12362), after it held. A no-op outside a journaled
+/// run; makes no forge call.
+pub fn record_verdict(pr: u64, action: &str, head_sha: Option<&str>) {
+    record_applied_at(pr, true, action, VERDICT_LABELS_BY, head_sha);
+}
+
+/// [`record_applied`] with the head the write was made against (#12362).
+pub fn record_applied_at(number: u64, is_pr: bool, action: &str, by: &str, head_sha: Option<&str>) {
     if journal_path().is_none() {
         return;
     }
@@ -623,6 +660,7 @@ pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
             is_pr,
             action: action.to_string(),
             by: by.to_string(),
+            head_sha: head_sha.filter(|s| !s.is_empty()).map(str::to_string),
         });
     }
 }

@@ -18,7 +18,8 @@
 //!
 //! A role registers a projection ([`projector`]): the evidence about one
 //! item to a closed, versioned `(class, reason)`. This change registers
-//! `champion` only ([`champion`]); other roles add theirs (#12029).
+//! `champion` ([`champion`]) and `judge` ([`judge`], #12362); other roles add
+//! theirs.
 //!
 //! # The ledger's view, record-only
 //!
@@ -59,6 +60,7 @@ use crate::telemetry::kinds::pass::{PassMode, PassVerdictRecord, StepFacts};
 use crate::telemetry::provenance::Provenance;
 
 pub mod champion;
+pub mod judge;
 pub mod refusals;
 
 use refusals::{Observed, RefusalStore};
@@ -83,6 +85,8 @@ pub enum Event {
         at: DateTime<Utc>,
         action: String,
         by: String,
+        /// The head the write was made against, when its writer knew it.
+        head_sha: Option<String>,
     },
 }
 
@@ -131,7 +135,7 @@ pub struct Projection {
     pub store: StoreOp,
 }
 
-/// A role's projection (#12027 registers Champion; #12029 adds Judge).
+/// A role's projection (#12027 registers Champion; #12362 adds Judge).
 #[derive(Debug, Clone, Copy)]
 pub struct Projector {
     /// The `step` value for an item of this kind.
@@ -146,6 +150,7 @@ pub struct Projector {
 pub fn projector(role: &str) -> Option<Projector> {
     match role {
         "champion" => Some(champion::PROJECTOR),
+        "judge" => Some(judge::PROJECTOR),
         _ => None,
     }
 }
@@ -279,6 +284,7 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                 is_pr,
                 action,
                 by,
+                head_sha,
             } => Some((
                 *number,
                 Some(*is_pr),
@@ -286,6 +292,7 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                     at: *at,
                     action: action.clone(),
                     by: by.clone(),
+                    head_sha: head_sha.clone(),
                 },
             )),
             JournalEntry::Queue { .. } | JournalEntry::Listing { .. } => None,

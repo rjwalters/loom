@@ -1363,6 +1363,10 @@ gradeable by a model or prompt experiment.
 | `prompt` | object | no | The checkout the session read its `/loom:<role>` prompt from, as it stood immediately before the spawn (#11989): `commit` (HEAD, full SHA), `loom_version` (the working tree's `.loom/install-metadata.json`), `commits_behind` (HEAD's distance behind the clone's `origin/<default>`), `on_branch` (`false` for a detached HEAD) and the remote fields of [`checkout.freshness`](#checkoutfreshness) (`remote_tip`, `commits_behind_remote`, `origin_ref_stale`, `remote_repo`, `remote_foreign`); each inner key is absent when it cannot be read. Absent on a tick that never resolved a launch. OTLP: `loom.prompt.commit`, `loom.prompt.loom_version`, `loom.prompt.commits_behind`, `loom.prompt.on_branch` and the remote fields' `loom.prompt.*` keys, so a role running stale prompts is `loom.prompt.commits_behind > 0`. Here `commits_behind` is against the local `origin/<default>` ref; `commits_behind_remote` measures against GitHub's tip from the head the daemon last heard (#12509). Additive, no `schema_version` bump. |
 | `source` | string | no | `step` when a step-engine step ran, not a role-runner tick (#11906). Mapped to `loom.role_tick.source`; absent on a role tick. Additive. |
 | `sweep_id` | string | no | The step's sweep id (`step-<role>-<item>-<ts>`), with `source`. Mapped to `loom.sweep_id`. |
+| `found_work` | bool | no | A **launched Judge** role-runner tick won a PR claim (or its prompt named a PR) or wrote a verdict (#12362). `false` is an observation (an idle, spawned tick), never a default; absent for any other role and for a tick that never launched. Mapped to `loom.found_work`. Additive. |
+| `noop_reason` | string | no | Set exactly when `found_work` is `false`: the session's own `LOOM_STEP_OUTCOME role=judge … reason=` (advisory, read from the role log after the tick's last `# LOOM_RUNTIME_RESOLVED` marker), else the daemon-observed `no_claim_no_verdict`. Mapped to `loom.noop_reason`. |
+| `verdicts` | array | no | One `{pr_number, head_sha?, verdict}` per PR a Judge tick wrote a verdict on, from the `forge verdict-labels` write via the pick journal (`verdict` is `approved` or `changes_requested`; `head_sha` is the `--sha` `post-verdict.sh` passed). Omitted when none. Mapped to `loom.role_tick.verdicts` (JSON). |
+| `step_class` / `step_reason` | string | no | On a step-sourced record: the step's `LOOM_STEP_OUTCOME` class and reason, which `result` collapses (`verdict`/`noop`/`refused` all read `success`). Mapped to `loom.role_tick.step_class` / `loom.role_tick.step_reason`. `result` itself is unchanged. |
 
 #### `result` — seven values, and why a skip is not a failure
 
@@ -2761,7 +2765,7 @@ and `INFO` otherwise.
 #### Role step verdicts: `step:<role>` (#12027)
 
 A role step also emits `pass.verdict`, with `mechanism=step:<role>` (today
-`step:champion`; the judge row is #12029). The daemon builds the records from
+`step:champion` and `step:judge`, #12362). The daemon builds the records from
 facts the run already produced, so there is no new GitHub call and no prompt
 change: a `Marker` entry that `loom-daemon forge comment` appends to the pick
 journal (the body's first-line `<!-- ns:kind[:…] -->`), the agent gh front's
@@ -2781,9 +2785,9 @@ projected reason, so `passVerdictQuery` still parses both):
 | Field (`loom.pass.*`) | Notes |
 |---|---|
 | `head_sha` | the head evaluated, when the run recorded it (the Champion pin file, else the mirror); absent otherwise |
-| `step` | `champion_pr` or `champion_issue` |
+| `step` | `champion_pr`, `champion_issue` or `judge_pr` |
 | `class` | `verdict`, `noop`, `refused` or `failed` |
-| `reason_set` | `champion_merge_v1`, `champion_promotion_v1` or `champion_triage_v1` |
+| `reason_set` | `champion_merge_v1`, `champion_promotion_v1`, `champion_triage_v1` or `judge_v1` |
 | `ledger_class` / `ledger_reason` | the outcome ledger's own classification. It can differ from `class` / `reason`: a red-CI rejection keeps `loom:pr`, so the ledger says `failed unclassified` where the projection says `refused ci_failing`. `probe_failed` when the mirror was not fresh |
 | `criterion` (+ `reason_key` in the body) | the raw `champion:reject:<criterion>:<reason_key>` tokens |
 | `first_refused_at` | when this refusal identity was first seen on this head |
@@ -2814,6 +2818,19 @@ the merge gate's rows do (`not_eligible`, `failed`, `unclassified`).
 peer held a fresh `loom:evaluating`) or `not_eligible`. `failed` carries
 `failed` or `unclassified`. There is no `duplicate`: Champion has no duplicate
 close.
+
+**Judge (`judge_v1`, `step=judge_pr`, `artifact=pr`, #12362).** One record per
+PR a verdict was written on. The evidence is the `Applied` entry
+`loom-daemon forge verdict-labels` appends to the pick journal once the label
+transition held (`post-verdict.sh` passes `--sha "$SHA"`, on the main and the
+superseded path; a refused approval, a duplicate loser and a failed transition
+journal nothing). `verdict` carries `approved` or `changes_requested`, with
+`head_sha` from the write. On the step path with no verdict write the step's
+`LOOM_STEP_OUTCOME role=judge` line projects `noop`, `refused` or `failed` with
+its reason (a `verdict` line with no write behind it, or no line, is `failed
+unclassified`). A role-runner tick that wrote no verdict projects nothing;
+spawned-but-idle ticks are counted by `role_tick.outcome.found_work=false`.
+Telemetry only: no label, claim, retry, exit code or ledger effect changes.
 
 **Why is this issue still `curated`?** Join two sources. Evaluated:
 `pass.verdict` with `step=champion_issue` (this record). Not evaluated, which

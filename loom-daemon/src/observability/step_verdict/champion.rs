@@ -273,7 +273,7 @@ fn project_promotion(e: &Evidence) -> Option<Projection> {
                 };
                 (at, reason)
             }
-            Event::Applied { at, action, by } => match (action.as_str(), by.as_str()) {
+            Event::Applied { at, action, by, .. } => match (action.as_str(), by.as_str()) {
                 ("blocked", "park_record") => (at, "blocked_dependency"),
                 ("escalated", "operator_decision") => (at, "needs_operator"),
                 _ => continue,

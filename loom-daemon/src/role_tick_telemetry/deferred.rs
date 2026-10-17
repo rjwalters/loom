@@ -49,6 +49,7 @@ pub fn deferred_tick(
         role_draw: None,
         prompt: None,
         step_sweep_id: None,
+        extras: super::TickExtras::default(),
         deferred_by: Some(deferred_by.to_string()),
         shard_owner,
         failure_class: None,

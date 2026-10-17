@@ -979,6 +979,11 @@ fn role_tick_outcome_envelope(
             sweep_id: None,
             deferred_by: None,
             shard_owner: None,
+            found_work: None,
+            noop_reason: None,
+            verdicts: None,
+            step_class: None,
+            step_reason: None,
         }),
     )
 }
@@ -1009,6 +1014,51 @@ fn a_steps_role_tick_outcome_is_marked_as_a_step() {
     assert_eq!(attr(&records[0], "loom.sweep_id"), s("step-judge-7-1"));
     assert_eq!(attr(&records[1], "loom.role_tick.source"), None);
     assert_eq!(attr(&records[1], "loom.sweep_id"), None);
+}
+
+/// #12362: a Judge tick's found-work split reaches the wire, explicit `false`
+/// included, and a tick that observed nothing leaves every key absent.
+#[test]
+fn role_tick_outcome_maps_the_judge_found_work_split_only_when_observed() {
+    let mut judged = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut judged.record {
+        r.found_work = Some(false);
+        r.noop_reason = Some("no_claim_no_verdict".to_string());
+        r.verdicts = Some(vec![crate::telemetry::JudgeVerdictRecord {
+            pr_number: 4,
+            head_sha: Some("abc".to_string()),
+            verdict: "approved".to_string(),
+        }]);
+        r.step_class = Some("noop".to_string());
+        r.step_reason = Some("already_judged".to_string());
+    }
+    let bare = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    let request = build_logs_request(&[judged, bare]).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let attr = |record: &LogRecord, key: &str| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    let s = |v: &str| Some(any_value::Value::StringValue(v.to_string()));
+    assert_eq!(attr(&records[0], "loom.found_work"), s("false"));
+    assert_eq!(attr(&records[0], "loom.noop_reason"), s("no_claim_no_verdict"));
+    assert_eq!(attr(&records[0], "loom.role_tick.step_class"), s("noop"));
+    assert_eq!(attr(&records[0], "loom.role_tick.step_reason"), s("already_judged"));
+    assert_eq!(
+        attr(&records[0], "loom.role_tick.verdicts"),
+        s(r#"[{"pr_number":4,"head_sha":"abc","verdict":"approved"}]"#)
+    );
+    for key in [
+        "loom.found_work",
+        "loom.noop_reason",
+        "loom.role_tick.verdicts",
+    ] {
+        assert_eq!(attr(&records[1], key), None, "{key}");
+    }
 }
 
 /// Issue #8408 shipped `loom.gated_pool` with no assertion behind it (#8444):
