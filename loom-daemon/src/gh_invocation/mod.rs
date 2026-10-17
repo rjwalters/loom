@@ -68,6 +68,7 @@ pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
 pub use paged::{walk_enabled as page_walk_enabled, WALK_ENV as PAGE_WALK_ENV};
 pub use purpose::ForgePurpose;
+pub(crate) use reader_route::ShedWhy;
 pub use reader_route::{host_has_read_pool, SHED_MARKER};
 
 #[cfg(test)]

@@ -558,9 +558,12 @@ fn note_disagreement(cwd: &Path, op: &str) {
         .map(|mut w| w.insert(cwd.to_path_buf()))
         .unwrap_or(false);
     if first {
+        // Since #12584 a reader-only read with no route is shed, not sent to
+        // the writer: say so, so a shed run can be traced to this root.
         log::warn!(
             "gh_invocation: {} resolves to different repositories locally ({op}); its \
-             untargeted reads stay on the writer ({DISAGREE_COUNTER}={n})",
+             untargeted reads have no reader route and are shed, never sent to the writer \
+             ({DISAGREE_COUNTER}={n})",
             cwd.display()
         );
     }

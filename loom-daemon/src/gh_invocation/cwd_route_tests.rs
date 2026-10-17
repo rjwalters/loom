@@ -350,8 +350,10 @@ fn a_lone_github_origin_is_the_sole_answer() {
 #[test]
 fn ambiguous_checkouts_keep_the_writer_and_count_a_disagreement() {
     let env = Env::new(&[]);
+    // A pin naming another repository than the sole remote: gh answers for
+    // the pin, which this resolver does not cross-check here.
     let pinned = env.repo("pinned", &[("origin", "https://github.com/acme/widget.git")]);
-    env.git(&pinned, &["config", "remote.origin.gh-resolved", "base"]);
+    env.git(&pinned, &["config", "remote.origin.gh-resolved", "acme/other"]);
     let upstream = env.repo(
         "upstream",
         &[
@@ -380,6 +382,29 @@ fn ambiguous_checkouts_keep_the_writer_and_count_a_disagreement() {
             .with_derived_route_in(&DeriveEnv::default(), &checkout_answer);
         assert!(inv.reader_slug().is_none(), "{}", root.display());
         assert!(crate::forge_call_stats::counters::get(DISAGREE_COUNTER) > before);
+    }
+}
+
+/// #12630: `gh repo set-default` in a single-remote checkout writes
+/// `remote.origin.gh-resolved = base`. gh can only answer with that remote,
+/// so the checkout's untargeted reads route to a reader. Counted as a pin,
+/// every such read was unroutable and so shed (`ca=none`, until now + 300 s),
+/// which a host logged as "no reader can serve <owner> core" while its
+/// readers had budget.
+#[test]
+fn a_sole_remote_pinned_to_itself_routes_to_a_reader() {
+    let env = Env::new(&[]);
+    for (name, value) in [("base", "base"), ("self", "acme/widget")] {
+        let root = env.repo(name, &[("origin", "https://github.com/acme/widget.git")]);
+        env.git(&root, &["config", "remote.origin.gh-resolved", value]);
+        assert_eq!(
+            checkout_answer(&root, GhRepoEnv::Honour),
+            CwdAnswer::Sole("acme/widget".into()),
+            "{value}"
+        );
+        let inv = read_in(&root, PLACEHOLDER)
+            .with_derived_route_in(&DeriveEnv::default(), &checkout_answer);
+        assert_eq!(inv.reader_slug().as_deref(), Some("acme/widget"), "{value}");
     }
 }
 

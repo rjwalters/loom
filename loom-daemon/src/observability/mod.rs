@@ -107,7 +107,6 @@ pub mod agent_relay;
 pub mod backfill;
 pub mod claude_code_telemetry;
 pub mod collector;
-pub mod cycle_guard;
 pub mod daemon_event;
 pub mod daemon_exit;
 pub mod daemon_lifecycle;

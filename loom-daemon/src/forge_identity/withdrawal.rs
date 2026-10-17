@@ -14,6 +14,7 @@
 //! |---|---|---|
 //! | primary rate limit | `(app, owner, resource)` | the bucket's reset: the refusal's `x-ratelimit-reset`, else an on-demand `rate_limit` probe showing the bucket empty, else now + 300 s; clamped to [30 s, 3660 s] |
 //! | secondary rate limit | `(app, owner, all)` | now + `Retry-After`, else now + 60 s — never the hourly reset |
+//! | a refusal naming a resource the book does not keep (`code_search`, …) | as a secondary limit (#12630) | as a secondary limit; the bucket book is never marked empty for it |
 //! | bad credentials / 401 | `(app, owner, all)` | now + 300 s |
 //! | coverage (403/404) | `(app, owner/repo)` | now + 3600 s (unchanged) |
 //!
@@ -90,6 +91,10 @@ pub enum Failure {
         secondary: bool,
         /// The refusal's `Retry-After`.
         retry_after: Option<Duration>,
+        /// The pool's `x-ratelimit-remaining` on the refusal. Above zero it
+        /// is GitHub saying the bucket still has budget, so the refusal is
+        /// not an empty pool and is not held until the pool's reset.
+        remaining: Option<u64>,
     },
     /// The reader's token was refused (401, bad credentials).
     Credential,
@@ -107,6 +112,7 @@ impl Failure {
             reset: None,
             secondary: false,
             retry_after: None,
+            remaining: None,
         }
     }
 
@@ -129,11 +135,13 @@ impl Failure {
                 reset: None,
                 secondary,
                 retry_after,
+                remaining,
             } => Self::RateLimited {
                 resource,
                 reset,
                 secondary,
                 retry_after,
+                remaining,
             },
             other => other,
         }
@@ -212,15 +220,26 @@ pub fn classify_failure_in(
         || s.contains("http 429")
         || exhausted_403
     {
-        let resource = headers
+        let named = headers
             .and_then(|h| h.resource.as_deref())
-            .and_then(Resource::parse)
-            .unwrap_or(resource);
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        let booked = named.and_then(Resource::parse);
+        // #12630: a refusal that names a resource the book does not keep
+        // (`code_search`, …) is no evidence about the call's static pool.
+        // Falling back to that pool booked a reader's `core` bucket empty
+        // until the primary reset. Hold it as a secondary limit instead: its
+        // `Retry-After`, else 60 s, with the book untouched. A refusal whose
+        // headers show budget left is held only briefly as well
+        // (`ResetSource::Headroom` in `plan_withdrawal`).
+        let unbooked = named.is_some() && booked.is_none();
+        let secondary = secondary || unbooked;
         return Some(Failure::RateLimited {
-            resource,
+            resource: booked.unwrap_or(resource),
             reset: headers.and_then(|h| h.reset_epoch).and_then(epoch_time),
             secondary,
             retry_after,
+            remaining: headers.and_then(|h| h.remaining),
         });
     }
     if credential {
@@ -251,6 +270,9 @@ pub enum ResetSource {
     Probe,
     /// No reset known: the fixed window for the failure kind.
     Default,
+    /// The refusal itself reported budget left in the pool, so it is not an
+    /// empty bucket: a short probe-the-reader-again hold, never the reset.
+    Headroom,
 }
 
 impl ResetSource {
@@ -260,6 +282,7 @@ impl ResetSource {
             Self::Header => "header",
             Self::Probe => "probe",
             Self::Default => "default",
+            Self::Headroom => "headroom",
         }
     }
 }
@@ -329,6 +352,20 @@ pub fn plan_withdrawal(
                 ResetSource::Default
             },
             secondary: true,
+        },
+        Failure::RateLimited {
+            resource,
+            remaining: Some(n),
+            ..
+        } if n > 0 => Withdrawal::Scoped {
+            // GitHub's own count says this pool has budget. A reading like
+            // that must never park the reader until the pool's reset (#12630),
+            // so hold it only for the minimum and let the next read re-check.
+            owner: owner_lc,
+            scope: ResourceScope::of(resource),
+            until: now + MIN_SCOPED_WITHDRAWAL,
+            source: ResetSource::Headroom,
+            secondary: false,
         },
         Failure::RateLimited {
             resource, reset, ..
@@ -461,9 +498,19 @@ fn apply(app_id: &str, owner_repo: &str, failure: Failure, plan: &Withdrawal, wh
             } else {
                 forge_read_pool::withdraw_scoped_until(app_id, owner, *scope, *until)
             };
+            let (seen_remaining, seen_reset) = match failure {
+                Failure::RateLimited {
+                    remaining, reset, ..
+                } => (
+                    remaining.map_or_else(|| "-".to_string(), |n| n.to_string()),
+                    reset.map_or_else(|| "-".to_string(), |t| epoch_secs(t).to_string()),
+                ),
+                _ => ("-".to_string(), "-".to_string()),
+            };
             log::warn!(
                 "forge_identity: reader app {app_id} withdrawn from {owner} {} for {}s \
-                 (end from {}{}; {why}); its other owners and resources keep serving — W4-A",
+                 (end from {}{}; refusal reported remaining={seen_remaining} \
+                 reset={seen_reset}; {why}); its other owners and resources keep serving — W4-A",
                 scope.as_str(),
                 secs(&held),
                 source.as_str(),
