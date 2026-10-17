@@ -299,6 +299,8 @@ CI_CLASS='{"champion":{"standingAuthorizations":[{"id":"ci-steps","filePatterns"
 CI_CLASS_NOFLAG='{"champion":{"standingAuthorizations":[{"id":"ci-steps","filePatterns":[".github/workflows/*.yml"],"conditions":["judgeApproval","greenCi"]}]}}'
 OKPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+# a comment"}]'
 PERMPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+permissions: write-all"}]'
+SECRETADDPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1 +1,2 @@\n name: ci\n+  run: echo ${{ secrets.TOKEN }}"}]'
+SECRETDELPATCH='[{"filename":".github/workflows/ci.yml","patch":"@@ -1,2 +1 @@\n name: ci\n-  run: echo ${{ secrets.TOKEN }}"}]'
 NOPATCH='[{"filename":".github/workflows/ci.yml"}]'
 WF=".github/workflows/ci.yml"
 
@@ -313,6 +315,15 @@ assert_eq "NOT ELIGIBLE:" "$out" "an excludeFilePatterns file restores FAIL"
 
 out="$(run_eval critical "$CI_CLASS" "$WF" "$PERMPATCH" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a forbiddenDiffPatterns line restores FAIL"
+
+# Only the 2nd forbiddenDiffPatterns entry (secrets\.) matches; the 1st
+# (^\s*permissions:) matches nothing. A check of only the first pattern passes
+# these, so they pin that every pattern is evaluated (#12590).
+out="$(run_eval critical "$CI_CLASS" "$WF" "$SECRETADDPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a line matching only the 2nd forbiddenDiffPatterns entry (added) restores FAIL"
+
+out="$(run_eval critical "$CI_CLASS" "$WF" "$SECRETDELPATCH" green "loom:pr")"
+assert_eq "NOT ELIGIBLE:" "$out" "a line matching only the 2nd forbiddenDiffPatterns entry (removed) restores FAIL"
 
 out="$(run_eval critical "$CI_CLASS" "$WF" "$NOPATCH" green "loom:pr")"
 assert_eq "NOT ELIGIBLE:" "$out" "a changed file with no patch (unreadable diff) fails closed"
