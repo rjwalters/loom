@@ -39,7 +39,53 @@ pub(crate) fn verdict_body_check() -> Result<()> {
     std::process::exit(code)
 }
 
+/// The issues an approval is checked against for a stale read (#12614): those
+/// the PR body closes plus every `--issue-body-sha N=HASH`, each re-read now.
+/// `None` when the PR itself could not be read.
+fn read_linked_issues(
+    repo: &str,
+    pr: u64,
+    hashes: &[(u64, String)],
+    root: &Path,
+) -> Option<Vec<gate::IssueSnapshot>> {
+    let pr_obj = loom_daemon::comment_trust::records::fetch_issue_object(
+        repo,
+        &pr.to_string(),
+        root,
+        false,
+    )?;
+    let body = pr_obj.get("body").and_then(Value::as_str).unwrap_or("");
+    let mut numbers = gate::closing_issues(body);
+    numbers.extend(hashes.iter().map(|(n, _)| *n));
+    numbers.sort_unstable();
+    numbers.dedup();
+    Some(
+        numbers
+            .into_iter()
+            .map(|n| {
+                let ns = n.to_string();
+                let obj =
+                    loom_daemon::comment_trust::records::fetch_issue_object(repo, &ns, root, false);
+                gate::IssueSnapshot {
+                    number: n,
+                    expected_body_sha: hashes.iter().find(|(h, _)| *h == n).map(|(_, v)| v.clone()),
+                    body: obj.map(|o| {
+                        o.get("body")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    }),
+                    comments: loom_daemon::comment_trust::records::fetch_trusted_comments(
+                        repo, &ns, root, false,
+                    ),
+                }
+            })
+            .collect(),
+    )
+}
+
 /// `forge verdict-gate`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verdict_gate(
     pr: u64,
     repo: &str,
@@ -47,9 +93,36 @@ pub(crate) fn verdict_gate(
     sha: &str,
     overrule: &str,
     window_secs: i64,
+    review_started: Option<&str>,
+    issue_body_sha: &[String],
 ) -> Result<()> {
     let kind = verdict_or_exit("verdict-gate", verdict);
     let root = super::forge_identity_cmd::workspace();
+    let started = review_started.map(|s| {
+        chrono::DateTime::parse_from_rfc3339(s.trim())
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| {
+                eprintln!("forge verdict-gate: --review-started must be RFC 3339, got {s:?}");
+                std::process::exit(2)
+            })
+    });
+    let hashes: Vec<(u64, String)> = issue_body_sha
+        .iter()
+        .map(|a| {
+            a.split_once('=')
+                .and_then(|(n, h)| {
+                    Some((n.trim().trim_start_matches('#').parse().ok()?, h.trim().to_string()))
+                })
+                .unwrap_or_else(|| {
+                    eprintln!("forge verdict-gate: --issue-body-sha must be N=HASH, got {a:?}");
+                    std::process::exit(2)
+                })
+        })
+        .collect();
+    let issues = match (started, kind) {
+        (Some(_), VerdictKind::Approved) => read_linked_issues(repo, pr, &hashes, &root),
+        _ => Some(Vec::new()),
+    };
     let comments = loom_daemon::comment_trust::records::fetch_trusted_comments(
         repo,
         &pr.to_string(),
@@ -65,6 +138,8 @@ pub(crate) fn verdict_gate(
         overrule,
         now: chrono::Utc::now(),
         window_secs,
+        review_started: started,
+        issues: issues.as_deref(),
     });
     if matches!(decision, Decision::Proceed(_)) && (comments.is_none() || labels.is_none()) {
         eprintln!(

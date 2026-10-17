@@ -765,6 +765,16 @@ pub(crate) enum ForgeAction {
         /// How recent a same-verdict marker must be to dedupe against.
         #[arg(long, default_value_t = loom_daemon::verdict_gate::DEFAULT_WINDOW_SECS)]
         window_secs: i64,
+        /// RFC 3339 time the Judge began this review (#12614). With it, an
+        /// approval is refused when a trusted human comment on the PR or a
+        /// linked issue is newer, or a linked issue body no longer matches
+        /// `--issue-body-sha`. Absent: unchanged behaviour, with a warning.
+        #[arg(long)]
+        review_started: Option<String>,
+        /// `N=HASH` (repeatable): issue N's body as the Judge reviewed it,
+        /// sha256 of the body without trailing newlines (#12614).
+        #[arg(long = "issue-body-sha")]
+        issue_body_sha: Vec<String>,
     },
 
     /// `forge verdict-labels <pr> --repo R --verdict V` (#10581) — apply the
@@ -1042,6 +1052,8 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             sha,
             overrules_prior,
             window_secs,
+            review_started,
+            issue_body_sha,
         } => {
             return super::forge_verdict_cmd::verdict_gate(
                 pr,
@@ -1050,6 +1062,8 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 &sha,
                 &overrules_prior,
                 window_secs,
+                review_started.as_deref(),
+                &issue_body_sha,
             );
         }
         ForgeAction::VerdictLock { action, pr, repo } => {
@@ -1424,6 +1438,8 @@ mod write_target_tests {
             sha: "a".repeat(40),
             overrules_prior: String::new(),
             window_secs: 600,
+            review_started: None,
+            issue_body_sha: Vec::new(),
         };
         assert_eq!(write_target(&gate), None);
     }
