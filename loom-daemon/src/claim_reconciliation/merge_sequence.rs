@@ -973,6 +973,9 @@ pub struct PlanReport {
     /// Existing holds Phase 1 would release as no-overlap (#10077):
     /// `(follower, predecessor)`.
     pub would_release_no_overlap: Vec<(u32, u32)>,
+    /// Existing holds and why each is still kept (#12595):
+    /// `(follower, predecessor, reason)`. Read-only; nothing is written.
+    pub held_because: Vec<(u32, u32, String)>,
 }
 
 /// Compute the plan report without writing anything.
@@ -1011,6 +1014,16 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     let markers = fetch_markers(gh_bin, root, &eligible, &BTreeMap::new());
     report.groups = plan_repo_checked(&open, &files, &markers, &conflicts);
     let bin = gh_bin.to_string_lossy().to_string();
+    let open_ready = ready::demote_unlandable(&open, &markers);
+    for (n, marker) in &markers {
+        let Some(follower) = open.iter().find(|p| p.number == *n) else {
+            continue;
+        };
+        let pred = predecessor(&bin, root, &open, marker.after);
+        let head = open_ready.iter().find(|p| p.number == marker.after);
+        let why = ready::hold_reason(marker, pred.as_ref(), follower, head);
+        report.held_because.push((*n, marker.after, why));
+    }
     for g in &mut report.groups {
         g.edges.retain(|e| {
             // #10634: the order key, not the plan id — the live pass keeps a
