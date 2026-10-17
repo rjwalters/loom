@@ -23,6 +23,7 @@ use super::group_authz::{
 };
 use super::lifecycle::{transition_line, Ctx};
 use super::mode::MergeMode;
+use super::status_command::StatusPost;
 use crate::gh_invocation::AccessIntent;
 
 /// Group discovery plus the status write.
@@ -228,9 +229,12 @@ pub fn parse_groups(data: &serde_json::Value) -> Result<Vec<MergeGroup>, String>
     Ok(build_groups(entries))
 }
 
-impl StatusApi for GhLifecycleForge {
-    fn post_status(
+impl GhLifecycleForge {
+    /// The status write, via `forge.mergeQueue.statusCommand` when set (no
+    /// fallback to the writer token, #12679) and `gh api` otherwise.
+    fn write_status(
         &self,
+        pr: Option<u32>,
         commit: &str,
         state: StatusState,
         description: &str,
@@ -244,6 +248,23 @@ impl StatusApi for GhLifecycleForge {
             StatusState::Failure => "failure",
         };
         let desc: String = description.chars().take(STATUS_DESCRIPTION_MAX).collect();
+        match self.status_command() {
+            Err(e) => return Err(e.clone()),
+            Ok(Some(cmd)) => {
+                return cmd.post(
+                    self.root(),
+                    &StatusPost {
+                        repo: &self.nwo(),
+                        sha: commit,
+                        context: REQUIRED_CHECK_CONTEXT,
+                        state,
+                        description: &desc,
+                        pr,
+                    },
+                );
+            }
+            Ok(None) => {}
+        }
         self.ok(
             "merge_queue.post_status",
             AccessIntent::Write,
@@ -262,8 +283,39 @@ impl StatusApi for GhLifecycleForge {
         )
         .map(|_| ())
     }
+}
+
+impl StatusApi for GhLifecycleForge {
+    fn post_status(
+        &self,
+        commit: &str,
+        state: StatusState,
+        description: &str,
+    ) -> Result<(), String> {
+        self.write_status(None, commit, state, description)
+    }
+
+    fn post_pr_status(
+        &self,
+        pr: u32,
+        commit: &str,
+        state: StatusState,
+        description: &str,
+    ) -> Result<(), String> {
+        self.write_status(Some(pr), commit, state, description)
+    }
 
     fn can_post_statuses(&self) -> Result<(), String> {
+        // A configured poster replaces the writer App's permission as the gate.
+        match self.status_command() {
+            Err(e) => return Err(e.clone()),
+            Ok(Some(cmd)) => {
+                return cmd
+                    .probe(self.root(), &self.nwo(), REQUIRED_CHECK_CONTEXT)
+                    .map_err(|e| format!("the status command refused its dry-run probe: {e}"));
+            }
+            Ok(None) => {}
+        }
         // Unreadable or no App writer: unknown, so leave it to the post.
         match crate::merge_group_ci::eligibility::writer_statuses(
             self.gh(),

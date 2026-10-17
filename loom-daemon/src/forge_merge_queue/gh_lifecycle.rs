@@ -15,6 +15,7 @@ use super::group_github::{group_transition_line, revoke_for_transition_groups};
 use super::lifecycle::{sweep, Ctx, Reconciled};
 use super::mode::{resolve_merge_mode, MergeMode};
 use super::ops::PrState;
+use super::status_command::{self, StatusCommand};
 use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
@@ -36,6 +37,9 @@ pub struct GhLifecycleForge {
     root: PathBuf,
     owner: String,
     name: String,
+    /// `forge.mergeQueue.statusCommand` as read at construction: `Ok(None)`
+    /// when unset, `Err` when set but unusable (posts then refuse, #12679).
+    status_command: Result<Option<StatusCommand>, String>,
 }
 
 impl GhLifecycleForge {
@@ -49,6 +53,7 @@ impl GhLifecycleForge {
                 root: root.to_path_buf(),
                 owner,
                 name: repo,
+                status_command: status_command::resolve(root),
             }),
             _ => Err("repository must be an `owner/repo` slug".to_string()),
         }
@@ -64,6 +69,10 @@ impl GhLifecycleForge {
 
     pub(super) fn owner(&self) -> &str {
         &self.owner
+    }
+
+    pub(super) fn status_command(&self) -> &Result<Option<StatusCommand>, String> {
+        &self.status_command
     }
 
     pub(super) fn repo_name(&self) -> &str {

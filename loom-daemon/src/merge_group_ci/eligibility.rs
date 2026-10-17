@@ -60,7 +60,19 @@ pub struct RepoFacts {
     /// token (see [`Perms::can_push`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer_statuses: Option<String>,
+    /// `statusCommand` when `forge.mergeQueue.statusCommand` is configured:
+    /// the status posts go through it, so the writer App's `statuses`
+    /// permission is not a prerequisite (#12679). Absent means the writer posts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_route: Option<String>,
+    /// Why the configured status command is unusable: a malformed setting or
+    /// a refused `--dry-run` probe. Only set with `status_route`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_command_error: Option<String>,
 }
+
+/// [`RepoFacts::status_route`] when a status command is configured.
+pub const ROUTE_STATUS_COMMAND: &str = "statusCommand";
 
 /// A failed prerequisite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -80,6 +92,9 @@ pub enum Prereq {
     /// The writer App's installation has `statuses` below `write`, so the
     /// handoff could not post the `loom/merge-authorization` head status.
     WriterCannotPostStatuses,
+    /// `forge.mergeQueue.statusCommand` is set but malformed or refused its
+    /// `--dry-run` probe, so the handoff could not post the head status.
+    StatusCommandRefused,
 }
 
 impl Prereq {
@@ -97,6 +112,7 @@ impl Prereq {
             Prereq::RequiredSuiteUncovered => "REQUIRED_SUITE_UNCOVERED",
             Prereq::WorkflowNotQualified => "WORKFLOW_NOT_QUALIFIED",
             Prereq::WriterCannotPostStatuses => "WRITER_CANNOT_POST_STATUSES",
+            Prereq::StatusCommandRefused => "STATUS_COMMAND_REFUSED",
         }
     }
 }
@@ -168,7 +184,14 @@ pub fn evaluate(
                 .to_string(),
         ),
     }
-    if let Some(level) = facts.writer_statuses.as_deref().filter(|l| *l != "write") {
+    if facts.status_route.as_deref() == Some(ROUTE_STATUS_COMMAND) {
+        if let Some(why) = &facts.status_command_error {
+            fail(
+                Prereq::StatusCommandRefused,
+                format!("`forge.mergeQueue.statusCommand` cannot post the `loom/merge-authorization` status: {why}"),
+            );
+        }
+    } else if let Some(level) = facts.writer_statuses.as_deref().filter(|l| *l != "write") {
         fail(
             Prereq::WriterCannotPostStatuses,
             format!("the writer App's installation has `statuses: {level}`; queue handoff posts the `loom/merge-authorization` commit status and needs `statuses: write` (granting it is an App permission change that needs operator authorization)"),
@@ -334,9 +357,24 @@ pub fn probe(gh: &str, nwo: &str, branch: Option<&str>) -> RepoFacts {
         facts.owner_type = v.owner.as_ref().and_then(|o| o.kind.clone());
         facts.can_push = v.permissions.as_ref().and_then(Perms::can_push);
     }
-    if let Some((owner, _)) = nwo.split_once('/') {
-        let root = std::env::current_dir().unwrap_or_default();
-        facts.writer_statuses = writer_statuses(gh, &root, owner);
+    let root = std::env::current_dir().unwrap_or_default();
+    match crate::forge_merge_queue::status_command::resolve(&root) {
+        Ok(None) => {
+            if let Some((owner, _)) = nwo.split_once('/') {
+                facts.writer_statuses = writer_statuses(gh, &root, owner);
+            }
+        }
+        // Posts go through the command, so the writer App's permission is moot.
+        Ok(Some(cmd)) => {
+            facts.status_route = Some(ROUTE_STATUS_COMMAND.to_string());
+            facts.status_command_error = cmd
+                .probe(&root, nwo, crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT)
+                .err();
+        }
+        Err(e) => {
+            facts.status_route = Some(ROUTE_STATUS_COMMAND.to_string());
+            facts.status_command_error = Some(e);
+        }
     }
     facts.branch = branch
         .map(str::to_string)
