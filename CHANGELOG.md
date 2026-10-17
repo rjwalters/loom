@@ -5,6 +5,13 @@ All notable changes to Loom will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> **Policy note (2026-10-17).** This file is the historical record of Loom
+> changes and is preserved unchanged below. Change summaries for later releases
+> are the generated notes on each
+> [GitHub Release](https://github.com/rjwalters/loom/releases) (`release.yml`
+> generates them); new hand-curated entries are no longer required. Existing
+> entries, including `[Unreleased]`, are kept as written.
+
 ## [Unreleased]
 
 ### Changed
