@@ -6,7 +6,40 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-17
+- **PR #12561**: fix: hold CI-waiting steps briefly and attribute the no-progress metric exactly
+- **PR #12562**: fix: make 'loom update --help' side-effect free
+- **PR #12564**: Daemon reads are reader-only: no writer pins on claim/guard/verdict reads (closes #12555)
+- **PR #12566**: fix: stop treating a bare Out of Scope heading as Champion follow-on work
+- **PR #12543**: refactor: remove unwired Rust uninstall helpers from init scaffolding
+- **PR #12544**: refactor: remove unused activity self-tuning module
+- **PR #12545**: test: dedupe HostHealthRecord literals behind baseline_host_health()
+- **PR #12547**: fix: place frozen opt-out comment directly above epic child query
+- **PR #12550**: feat: record run-state IPC callers and link daemon.exit to the request
+- **PR #12531**: test: share gh_invocation stub/rows_after/calls helpers in one test_support module
+- **PR #12532**: fix: exclude merge-authorization context from wait-checks verdict
+- **PR #12549**: HOTFIX: captain-side no-progress cooldown so champion steps stop looping across hosts
+- **Issue #12558** (closed): loom update --help rebuilds the user MCP bundle before printing help
+- **Issue #12555** (closed): Writer still serves in-process daemon reads: claim/guard/verdict lease, comment and timeline reads (follow-up to #12394/#12412)
+- **Issue #11761** (closed): Keep-it-simple beyond Curator: Judge and Champion gate on unjustified complexity; Curator checks 'already covered' first (follow-up to #11662)
+- **Issue #12509** (closed): Prompt-tree telemetry for attended sessions: report checkout commit and commits behind GitHub's tip, not only on daemon role ticks
+- **Issue #12530** (closed): Remove test-only remove_loom_hooks/remove_loom_permissions from init scaffolding
+- **Issue #12537** (closed): Remove unused activity self-tuning module (tuning.rs): WIP never integrated
+- **Issue #12534** (closed): Dedupe HostHealthRecord test literals behind one baseline constructor
+- **Issue #12416** (closed): main CI red: every_role_queue_query_excludes_frozen flags champion-common.md:283 (#10935)
+- **Issue #12546** (closed): Telemetry gap: daemon run-state IPC (pause/drain/stop/restart) records no caller identity; exit says only requested_by ipc-drain / unknown
+- **Issue #12523** (closed): Consolidate duplicated gh_invocation test helpers (stub, rows_after, calls)
+- **Issue #12553** (closed): Fix stale 'daemon-derived presence' comments left by #12268
+- **Issue #12556** (closed): Writer still serves in-process step claim/guard/verdict reads (lease comments, PR timeline, PR comments): #12394 follow-up
+- **Issue #12526** (closed): Merge-queue deadlock: approval gate (forge wait-checks) waits on loom/merge-authorization, which is only posted after approval
+- **Issue #12541** (closed): HOTFIX: champion steps loop across hosts; add captain-side no-progress cooldown
+
 ### 2026-10-16
+- **PR #12520**: fix: make MCP pre-flight smoke-test bound configurable and skip rebuild on timeout
+- **PR #12527**: step_ledger: persist fallback as a plain ladder window, decode entries individually
+- **Issue #12518** (closed): claude-wrapper MCP pre-flight: the 5 s smoke-test timeout fails healthy servers on a loaded host
+- **Issue #12501** (closed): Decision: work finder file-overlap gate counts loom:building issues and open PRs as occupied (#9781 v1 limitation)
+- **Issue #12524** (closed): Step outcome ledger: one unknown cause makes an older daemon drop the whole file (rollback safety, follow-up to #12519)
 - **PR #12525**: refactor: remove five unused activity model types and reexports
 - **PR #12519**: step_ledger: brake a Champion hold whose forge ladder write fails (#12516)
 - **PR #12517**: test: make gather_budget deadline-skip test deterministic
