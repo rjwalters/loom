@@ -1657,11 +1657,15 @@ ineligible; only the repo-root file qualifies):
 
 ```bash
 # Docs-only fast path (#6134): eligible ONLY if every changed file is EXACTLY
-# one of these three root-level filenames. This is the same allowlist
+# one of these three root-level filenames, or a month-rotated archive (#12636,
+# DOCS_FAST_PATH_ARCHIVE_RE below). This is the same allowlist
 # Champion's criterion #2 re-derives independently (see champion-pr-merge.md)
 # — the two checks are mirrored, not shared, so a change to one without the
 # other is a visible drift, not a silent gap.
 DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")
+# Archive files (#12636): ONLY the month-rotated archives, month 01-12, one
+# directory deep. Never a directory or *.md allowance.
+DOCS_FAST_PATH_ARCHIVE_RE='^(work_log/WORK_LOG|work_plan/WORK_PLAN)_[0-9]{4}-(0[1-9]|1[0-2])\.md$'
 
 docs_only_fast_path_check() {
   # Reads a newline-separated file list on stdin. Echoes "ELIGIBLE" if every
@@ -1680,6 +1684,9 @@ docs_only_fast_path_check() {
         break
       fi
     done
+    if [ "$matched" -ne 1 ] && [[ "$file" =~ $DOCS_FAST_PATH_ARCHIVE_RE ]]; then
+      matched=1
+    fi
     if [ "$matched" -ne 1 ]; then
       echo "NOT ELIGIBLE: $file"
       return 0
