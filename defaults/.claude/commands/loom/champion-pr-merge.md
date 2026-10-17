@@ -873,12 +873,85 @@ If `$STANDING_AUTH_RESULT` is anything other than `ELIGIBLE` (including "no
 `champion.standingAuthorizations` configured"), fall through to the normal
 four-axis judgment below.
 
+**Vetted CI-workflow change (#12677, operator ruling 2026-10-17).** A change
+to a CI workflow is not red on blast radius *because it is a workflow* when
+`ci_workflow_blast_eval` returns `WF_BLAST=green`: every changed or renamed
+workflow file is outside the kept set and names no publish, release, deploy
+or merge step, no workflow patch adds or removes a line matching
+`permissions:`, `id-token`, `secrets\.`, `pull_request_target` or
+`workflow_run`, the PR carries `loom:pr` (criterion #1 has already checked
+that the approval is for this head), and CI is green right now. The rest of
+the PR is still judged on all four axes as usual. `WF_BLAST=red` keeps the
+"CI workflows" entry red, and the rationale names `WF_BLAST_REASON`;
+`WF_BLAST=none` means no workflow file changed. Every failed read is red.
+
+```bash
+# ci_workflow_blast_eval: sets WF_BLAST (none|green|red) and WF_BLAST_REASON.
+# Reads PR_NUMBER, LABELS, KEPT_SET_PATTERNS, read_ci_checks; reuses DIFF_JSON
+# when this pass already read it.
+ci_workflow_blast_eval() {
+  local WF_FILES f pattern LINES_JSON rx rc
+  WF_BLAST=red
+  WF_BLAST_REASON=""
+  [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { WF_BLAST_REASON="kept set not loaded"; return 0; }
+  if [ -z "${DIFF_JSON:-}" ]; then
+    standing_auth_fetch_diff || { WF_BLAST_REASON="files API unreadable"; return 0; }
+  fi
+  WF_FILES=$(printf '%s' "$DIFF_JSON" | jq -r '.[] | .filename, (.previous_filename // empty) | select(startswith(".github/workflows/"))' 2>/dev/null) \
+    || { WF_BLAST_REASON="files API unreadable"; return 0; }
+  if [ -z "$WF_FILES" ]; then
+    WF_BLAST=none
+    return 0
+  fi
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$(printf '%s' "${f##*/}" | tr '[:upper:]' '[:lower:]')" in
+      *publish* | *release* | *deploy* | *merge*)
+        WF_BLAST_REASON="$f is a publish/release/deploy/merge workflow"
+        return 0
+        ;;
+    esac
+    for pattern in "${KEPT_SET_PATTERNS[@]}"; do
+      # shellcheck disable=SC2053
+      if [[ "$f" == $pattern ]]; then
+        WF_BLAST_REASON="$f is in the kept set ($pattern)"
+        return 0
+      fi
+    done
+  done <<<"$WF_FILES"
+  # Every workflow file needs a patch: a binary, oversized or pure-rename entry
+  # cannot be checked for forbidden lines.
+  LINES_JSON=$(printf '%s' "$DIFF_JSON" | jq -c '
+    [.[] | select((.filename | startswith(".github/workflows/")) or ((.previous_filename // "") | startswith(".github/workflows/")))]
+    | if all(.[]; (.patch // null) != null) then [.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]] else error("no patch") end' 2>/dev/null) \
+    || { WF_BLAST_REASON="a workflow file has no readable patch"; return 0; }
+  for rx in 'permissions:' 'id-token' 'secrets\.' 'pull_request_target' 'workflow_run'; do
+    printf '%s' "$LINES_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx))' >/dev/null 2>&1
+    rc=$?
+    # rc 1 = no such line; 0 = a hit; anything else = an error. Only 1 passes.
+    [ "$rc" -eq 1 ] || { WF_BLAST_REASON="a workflow line matches '$rx'"; return 0; }
+  done
+  echo "$LABELS" | grep -q "loom:pr" || { WF_BLAST_REASON="no loom:pr approval"; return 0; }
+  read_ci_checks "$PR_NUMBER"
+  if [ "$NO_CHECKS" != "false" ] \
+    || [ -n "$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel" or .bucket == "pending") | .name' 2>/dev/null)" ]; then
+    WF_BLAST_REASON="CI is not green"
+    return 0
+  fi
+  WF_BLAST=green
+  WF_BLAST_REASON="vetted workflow change: $(printf '%s' "$WF_FILES" | sort -u | tr '\n' ' ')"
+}
+
+ci_workflow_blast_eval
+echo "WF_BLAST=$WF_BLAST${WF_BLAST_REASON:+ ($WF_BLAST_REASON)}"
+```
+
 **The four risk axes** — answer each; **any red answer holds the PR**:
 
 | Axis | Green (safe to auto-merge) | Red (hold for a human) |
 |------|----------------------------|------------------------|
 | **Diff composition** | The bulk of the diff is tests, docs/markdown, fixtures, or a self-contained new module not yet wired into an existing path. The load-bearing hunks are few and you can name them. | Load-bearing hunks change the *existing* behavior of a shared runtime path, and you cannot enumerate them — or the diff is dense enough that you skimmed rather than read it. |
-| **Blast radius** | Changes are confined to one crate/module/role file, or to surfaces whose failure affects a single feature. | Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows, or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature. |
+| **Blast radius** | Changes are confined to one crate/module/role file, or to surfaces whose failure affects a single feature. | Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows (unless `WF_BLAST=green`, #12677), or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature. |
 | **Judge review depth** | The Judge's verdict cites specifics from the diff — named files/functions, concrete behavior, what was run or verified. | A short generic approval ("LGTM", "looks good") with no evidence the diff was read, or a review that explicitly defers verification of some part ("did not check X"). |
 | **Revertability** | `git revert -m 1 <merge-sha>` fully undoes it: no data/schema migration, no published artifact, no state written outside the repo. | The change performs a one-way action when it runs (deletes branches/worktrees, rewrites installed files, publishes a release, migrates data, moves credentials), so reverting the commit does not undo the effect. |
 
@@ -887,7 +960,7 @@ four-axis judgment below.
 **Claim/label machinery is not red by itself (#11416).** Loom's own claim, lease, label-transition, dispatch and hand-back code is judged like any other code. Writing labels or claims *when it runs* is not a one-way action: `git revert` restores the old writer, and the state it wrote is re-derivable (janitors, lease reapers, `loom-recover-orphans` and the next tick repair a stranded claim or misrouted label). "Reverting cannot undo forge labels already changed" or "a defect could strand work fleet-wide" is **not** a red reason. Judge-approved + CI green + revert restores the behavior -> green on blast radius and revertability. "Mediates merging" in the table means kept-set item 2, nothing wider. **Kept set** — only these stay red, held for an operator (name the item in the hold bullet):
 1. **Irreversible migration, no rollback step**: a bulk relabel, or a rename/delete in `.github/labels.yml`, of live labels without a restore step; a lease/checkpoint/registry format the previous release cannot read.
 2. **The merge gate itself** — code whose output decides *whether a PR merges*: criteria #1-#6 and the sticky-hold logic (this file, `champion-critical-file-hold.md`); `merge-pr.sh`'s verdict/label/ordering guards; any code that writes or invalidates a verdict label or marker (`post-verdict.sh`, `verdict-staleness-guard.sh`, the daemon's `reconcile_pr_verdicts`, `check-review-feedback.sh`) or decides whose markers and comments are trusted (`comment_trust.rs`, `forge trusted-comments`). The gate cannot vouch for a change to itself. Writing a verdict label (the Judge's `loom:pr` approval) is part of the gate, not a role hand-back; only routing that cannot make a PR mergeable (Builder/Doctor hand-backs, claims) is outside it.
-3. **The other red entries in the table above**, unchanged. Criterion #3 critical files fail #3 regardless, except where a `coversCriticalFiles` or `criticalFilesOnly` class applies (criterion #3 below). A `criticalFilesOnly` class (#12648) does not change this judgment: the PR is judged on these axes as usual.
+3. **The other red entries in the table above**, unchanged. A CI-workflow change with `WF_BLAST=green` (#12677) is not red for being a workflow; the rest of its diff is judged as usual. Criterion #3 critical files fail #3 regardless, except where a `coversCriticalFiles` or `criticalFilesOnly` class applies (criterion #3 below). A `criticalFilesOnly` class (#12648) does not change this judgment: the PR is judged on these axes as usual.
 
 **No standing authorization satisfies the kept set (#12528).** Items 1 and 2 and the remaining red entries (credential/token selection, guard hooks, installers/updaters that rewrite installed files on roll) can never be waived for criterion #3 by a class, with or without `coversCriticalFiles` or `criticalFilesOnly`: the `KEPT_SET_PATTERNS` floor in "Standing operator authorization" disqualifies the PR from every covering class.
 
