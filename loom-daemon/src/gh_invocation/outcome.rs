@@ -80,6 +80,8 @@ pub(super) fn classify(
         Ok(GhCompletion::Shed { until, .. }) => {
             CmdOutcome::Unavailable(Unavailable::Shed { until })
         }
+        // #12641: the tick stopped the read; not a reader shed.
+        Ok(GhCompletion::DeadlineReached) => CmdOutcome::Unavailable(Unavailable::DeadlineReached),
         Err(ExecError::Spawn(e)) => CmdOutcome::Unavailable(Unavailable::Spawn(e.to_string())),
         Err(ExecError::Collect(e)) => CmdOutcome::Unavailable(Unavailable::Collect(e.to_string())),
     }
@@ -237,7 +239,7 @@ mod tests {
     /// #12074: past the tick deadline a read is shed without running, through
     /// `execute` and through a single execution alike; a write still runs.
     #[test]
-    fn a_read_past_the_tick_deadline_is_shed_unsent() {
+    fn a_read_past_the_tick_deadline_is_deferred_unsent() {
         let tmp = tempfile::tempdir().unwrap();
         let marker = tmp.path().join("ran");
         let program = stub(tmp.path(), &format!("touch '{}'", marker.display()));
@@ -246,9 +248,9 @@ mod tests {
             .unwrap();
         let _scope = super::super::read_deadline::enter(past);
         let out = run_retrying(|| inv(TIMEOUT), &program);
-        assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::Shed { .. })), "{out:?}");
+        assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::DeadlineReached)), "{out:?}");
         let out = inv(TIMEOUT).program(&program).run();
-        assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::Shed { .. })), "{out:?}");
+        assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::DeadlineReached)), "{out:?}");
         assert!(!marker.exists(), "a shed read must not run");
         let write = || {
             GhInvocation::new(
