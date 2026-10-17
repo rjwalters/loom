@@ -4,6 +4,9 @@
 #   1. expect  — deny | ask | allow | any   (`any` = report only; no required verdict)
 #   2. area    — free-text tag used in the report (tmpfs, core, masking, ...)
 #   3. command — the Bash command text handed to the guard (data only; never executed)
+#   4. mounts  — optional mount-table variant: (empty) = the default fixture table,
+#                `unreadable` = the table path does not exist, `tmp-tmpfs` = /tmp is
+#                tmpfs and /dev/shm is not a mount
 #
 # `expect` is the verdict the SHARED component must produce. It is a requirement
 # of the design, not a snapshot of either engine: a row where an engine misses it
@@ -28,3 +31,9 @@ deny	tmpfs	cd /tmp && CARGO_TARGET_DIR=/run/user/1000/a/../t cargo check
 allow	tmpfs	CARGO_TARGET_DIR=/var/tmp/t cargo build
 allow	tmpfs	cargo build --target-dir target
 allow	tmpfs	echo /dev/shm/not-a-build-dir
+allow	tmpfs-unreadable	CARGO_TARGET_DIR=/dev/shm/t cargo build	unreadable
+allow	tmpfs-unreadable	cargo build --target-dir=/dev/shm/x	unreadable
+deny	tmpfs-tmp	CARGO_TARGET_DIR=/tmp/t cargo build	tmp-tmpfs
+deny	tmpfs-tmp	cargo build --target-dir /tmp/x	tmp-tmpfs
+allow	tmpfs-tmp	CARGO_TARGET_DIR=/dev/shm/t cargo build	tmp-tmpfs
+allow	tmpfs-tmp	CARGO_TARGET_DIR=/var/tmp/t cargo build	tmp-tmpfs
