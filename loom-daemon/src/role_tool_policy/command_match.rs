@@ -131,7 +131,22 @@ impl Hit {
 pub fn command_hits(command: &str, home: Option<&str>) -> Vec<Hit> {
     let mut hits = Vec::new();
     analyze_str(command, home, 0, &mut hits);
+    hits.retain(|h| h.capability != GH_PR_MERGE);
     hits
+}
+
+/// Marker `capability` for a live `gh pr merge`; not a role capability, so
+/// [`command_hits`] never returns it.
+const GH_PR_MERGE: &str = "gh-pr-merge";
+
+/// Whether the command line would execute `gh pr merge`: plain, chained, in a
+/// `$( )`, `bash -c`/`eval` payload or wrapper. Text in a quoted argument or an
+/// inert heredoc body does not count.
+#[must_use]
+pub fn executes_gh_pr_merge(command: &str) -> bool {
+    let mut hits = Vec::new();
+    analyze_str(command, None, 0, &mut hits);
+    hits.iter().any(|h| h.capability == GH_PR_MERGE)
 }
 
 /// The `credential-store` hit for an Edit/Write target path, if any.
@@ -178,6 +193,7 @@ fn lex(input: &str) -> Lexed {
     let mut cur = String::new();
     let mut in_word = false;
     let mut pending = WordKind::Plain;
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
     let mut i = 0;
 
     macro_rules! end_word {
@@ -313,6 +329,33 @@ fn lex(input: &str) -> Lexed {
                 continue;
             }
             ' ' | '\t' => end_word!(),
+            '\n' if !heredocs.is_empty() => {
+                end_word!();
+                // The body is data unless the command reads it as code (a shell)
+                // or the body is written to a file that may be run later.
+                let live = seg_runs_shell(&seg) || seg.iter().any(is_file_redirect);
+                i += 1;
+                for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
+                    let body = take_heredoc_body(&c, &mut i, &delim, strip_tabs);
+                    if live {
+                        out.nested.push(body);
+                    }
+                }
+                end_segment!();
+                continue;
+            }
+            '(' if next == Some('(') && !in_word && seg.is_empty() => {
+                // `(( … ))` arithmetic command: its `<<` is a shift, not a heredoc.
+                // Analyzed as one region (so `$( )` inside still counts); a `((`
+                // that does not close as `))` is nested subshells and lexes normally.
+                let (body, end) = take_balanced(&c, i + 2);
+                if c.get(end) == Some(&')') {
+                    out.nested.push(body);
+                    i = end + 1;
+                    continue;
+                }
+                end_segment!();
+            }
             '\n' | ';' | '&' | '|' | '(' | ')' => {
                 end_segment!();
             }
@@ -328,6 +371,17 @@ fn lex(input: &str) -> Lexed {
                 let mut run = 1;
                 while matches!(c.get(i + run), Some('<' | '>')) {
                     run += 1;
+                }
+                if ch == '<' && run == 2 {
+                    let strip_tabs = c.get(i + 2) == Some(&'-');
+                    let (delim, end) = take_heredoc_delimiter(&c, i + 2 + usize::from(strip_tabs));
+                    // Not a redirect (`<<=` shift-assign, `<< 3` shift): keep lexing
+                    // the following lines as commands rather than swallow them.
+                    if is_heredoc_opener(&c, i + 2 + usize::from(strip_tabs), &delim) {
+                        heredocs.push((delim, strip_tabs));
+                        i = end;
+                        continue;
+                    }
                 }
                 pending = if ch == '<' && run >= 3 {
                     WordKind::HereString
@@ -346,6 +400,83 @@ fn lex(input: &str) -> Lexed {
     }
     end_segment!();
     out
+}
+
+/// A `>`/`>>` target other than `/dev/…` or an fd: a file the body may land in.
+fn is_file_redirect(w: &Word) -> bool {
+    w.kind == WordKind::Redirect
+        && !w.text.starts_with("/dev/")
+        && !w.text.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// Whether a `<<` whose delimiter text starts at `start` opens a heredoc: it
+/// needs a delimiter word, and `<<=` or a bare numeric word after a space reads
+/// as an arithmetic shift, not a redirect.
+fn is_heredoc_opener(c: &[char], start: usize, delim: &str) -> bool {
+    if delim.is_empty() || c.get(start) == Some(&'=') {
+        return false;
+    }
+    let spaced = matches!(c.get(start), Some(' ' | '\t'));
+    !(spaced && delim.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+/// The delimiter word of a `<<` heredoc starting at `start` (quotes and
+/// backslashes removed), and the index just past it.
+fn take_heredoc_delimiter(c: &[char], start: usize) -> (String, usize) {
+    let mut i = start;
+    while matches!(c.get(i), Some(' ' | '\t')) {
+        i += 1;
+    }
+    let mut delim = String::new();
+    while i < c.len()
+        && !c[i].is_whitespace()
+        && !matches!(c[i], ';' | '&' | '|' | '(' | ')' | '<' | '>')
+    {
+        match c[i] {
+            q @ ('\'' | '"') => {
+                i += 1;
+                while i < c.len() && c[i] != q {
+                    delim.push(c[i]);
+                    i += 1;
+                }
+            }
+            '\\' => {
+                i += 1;
+                if let Some(&n) = c.get(i) {
+                    delim.push(n);
+                }
+            }
+            other => delim.push(other),
+        }
+        i += 1;
+    }
+    (delim, i)
+}
+
+/// Consume heredoc body lines from `*i` up to and including the line equal to
+/// `delim` (leading tabs ignored for `<<-`). An unterminated heredoc runs to
+/// the end of input, like bash.
+fn take_heredoc_body(c: &[char], i: &mut usize, delim: &str, strip_tabs: bool) -> String {
+    let mut body = String::new();
+    while *i < c.len() {
+        let end = c[*i..]
+            .iter()
+            .position(|&ch| ch == '\n')
+            .map_or(c.len(), |p| *i + p);
+        let line: String = c[*i..end].iter().collect();
+        *i = (end + 1).min(c.len());
+        let cmp = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line.as_str()
+        };
+        if cmp == delim {
+            break;
+        }
+        body.push_str(&line);
+        body.push('\n');
+    }
+    body
 }
 
 /// The body of a `(`-opened region starting at `start` (just past the `(`),
@@ -915,6 +1046,11 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
         "gh" => {
             if let Some(evidence) = gh_forge_secret(rest) {
                 hits.push(Hit::new("forge-secrets", evidence));
+            }
+            if let Some((k, _)) = gh_operand(rest, &["pr"]) {
+                if gh_operand(&rest[k + 1..], &["merge"]).is_some() {
+                    hits.push(Hit::new(GH_PR_MERGE, GH_PR_MERGE));
+                }
             }
         }
         // Multi-call binaries: the first operand is the applet.
