@@ -142,7 +142,10 @@ pub struct StepRefusal {
     /// How the pre-claim ran, when it was the refusal (#12183).
     pub claim: Option<lease::ClaimFacts>,
     /// The captain's assignment the refusal gave back (#12450).
-    pub assignment_id: Option<String>,
+    pub assignment_id: Option<Box<str>>,
+    /// Seconds the captain says its hold lasts (`retry_after_s`), for a
+    /// `captain_cooldown` refusal that carried one (#12704).
+    pub hold_secs: Option<u32>,
 }
 
 impl StepRefusal {
@@ -152,15 +155,21 @@ impl StepRefusal {
             detail: detail.to_string(),
             claim: None,
             assignment_id: None,
+            hold_secs: None,
         }
     }
 
     /// A refusal of the fleet-dispatch server's (#12450): no forge call ran.
-    pub(crate) fn captain(reason: crate::fleet_dispatch::proto::RefusalReason) -> Self {
-        Self::new(
+    pub(crate) fn captain(
+        reason: crate::fleet_dispatch::proto::RefusalReason,
+        retry_after_s: Option<u64>,
+    ) -> Self {
+        let mut refusal = Self::new(
             crate::fleet_dispatch::worker::refusal_token(reason),
             format!("the fleet-dispatch server refused the claim ({})", reason.as_str()),
-        )
+        );
+        refusal.hold_secs = retry_after_s.map(|s| u32::try_from(s).unwrap_or(u32::MAX));
+        refusal
     }
 }
 
@@ -176,7 +185,7 @@ pub(crate) fn captain_claim(
     match crate::fleet_dispatch::worker::claim(root, item, role) {
         Ask::Off | Ask::FailOpen => Ok(None),
         Ask::Granted(grant) => Ok(Some(grant)),
-        Ask::Refused(reason) => Err(StepRefusal::captain(reason)),
+        Ask::Refused(reason, retry_after_s) => Err(StepRefusal::captain(reason, retry_after_s)),
     }
 }
 
@@ -188,7 +197,7 @@ pub(crate) fn give_back(
 ) -> StepRefusal {
     if let Some(grant) = grant {
         crate::fleet_dispatch::worker::refuse(grant, refusal.reason);
-        refusal.assignment_id = Some(grant.assignment_id.clone());
+        refusal.assignment_id = Some(grant.assignment_id.as_str().into());
     }
     refusal
 }
