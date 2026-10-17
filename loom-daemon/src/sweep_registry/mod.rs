@@ -247,6 +247,13 @@ pub struct SweepRegistryConfig {
     /// When `true`, skip the actual label flip via `gh`. Used by unit tests
     /// that don't have GitHub credentials.
     pub skip_label_flip: bool,
+    /// Test seam (#12571): let the issue-sweep lease tie-break go ahead
+    /// blind on an unverifiable read, as it did before it failed closed. On
+    /// by default under `cfg(test)` because most dispatch fixtures' fake `gh`
+    /// never serves the lease comments; the tests that pin the fail-closed
+    /// behaviour turn it off.
+    #[cfg(test)]
+    pub(crate) blind_lease_order: bool,
     /// Override the machine-level sweep journal path (Issue #3953). Defaults
     /// to [`sweep_journal::default_journal_path`] (`~/.loom/sweeps.json`,
     /// env-overridable via `LOOM_SWEEPS_JOURNAL_PATH`). Tests set this to a
@@ -286,6 +293,8 @@ impl SweepRegistryConfig {
             spawn_bin: None,
             gh_bin: None,
             skip_label_flip: false,
+            #[cfg(test)]
+            blind_lease_order: true,
             journal_path: None,
             outcomes_journal_path: None,
             outcome_telemetry_path: None,

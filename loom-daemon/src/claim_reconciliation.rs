@@ -2796,11 +2796,10 @@ pub mod forge {
     /// of the three state labels (`loom:review-requested`,
     /// `loom:changes-requested`, `loom:pr`) **and** it is not a draft (#8250:
     /// a draft PR is not ready for Judge, so the backfill is skipped even
-    /// when it has no state label). The safety-net check is best-effort: a
-    /// failure to read the PR's current labels/draft status defaults to
-    /// treating it as unlabeled and non-draft (adds `loom:review-requested`)
-    /// rather than leaving a PR that might genuinely have no state label
-    /// undiscoverable.
+    /// when it has no state label). The safety-net check fails CLOSED (#12571):
+    /// a failed or shed read of the PR's labels/draft status skips the
+    /// backfill, since guessing "unlabeled, non-draft" could add the label
+    /// next to `loom:pr`/`loom:changes-requested` or on a draft.
     fn reclaim_pr(gh_bin: &Path, root: &Path, pr_number: u32, claim_label: &str) -> Result<()> {
         let n = pr_number.to_string();
         let out = gh_call::output(
@@ -2817,8 +2816,9 @@ pub mod forge {
 
         const STATE_LABELS: [&str; 3] =
             ["loom:review-requested", "loom:changes-requested", "loom:pr"];
-        let pr_info =
-            super::pr_label_info::pr_label_names(gh_bin, root, pr_number).unwrap_or_default();
+        let Some(pr_info) = super::pr_label_info::labels_or_skip(gh_bin, root, pr_number) else {
+            return Ok(());
+        };
         let has_state_label = pr_info
             .labels
             .iter()
