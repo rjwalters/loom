@@ -14,7 +14,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use super::authz::{CheckConclusion, DenyReason, HandoffError, REQUIRED_CHECK_CONTEXT};
 use super::events::{EventKind, EventSink, FileEventSink, MemoryEventSink, QueueEvent};
-use super::forge::{LifecycleForge, PrSnapshot, RemovalEvent};
+use super::forge::{GroupRun, LifecycleForge, PrSnapshot, RemovalEvent};
 use super::grants::{latest_record, GrantRecord};
 use super::group_authz::{StatusApi, StatusState};
 use super::lifecycle::*;
@@ -23,6 +23,7 @@ use super::mode::MergeMode;
 use super::ops::*;
 use super::removal::{classify, RemovalKind};
 
+const GROUP_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
 const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
 const SHA2: &str = "fedcba9876543210fedcba9876543210fedcba98";
 const PR: u32 = 7;
@@ -47,6 +48,7 @@ struct Gh {
     queued: RefCell<Option<String>>,
     check: RefCell<Option<CheckConclusion>>,
     removals: RefCell<Vec<RemovalEvent>>,
+    group_runs: RefCell<Result<Vec<GroupRun>, String>>,
     comments_down: Cell<bool>,
     dequeue_fails: Cell<bool>,
     /// Latest `loom/merge-authorization` status per commit.
@@ -67,6 +69,7 @@ impl Gh {
             queued: RefCell::new(None),
             check: RefCell::new(None),
             removals: RefCell::new(Vec::new()),
+            group_runs: RefCell::new(Ok(Vec::new())),
             comments_down: Cell::new(false),
             dequeue_fails: Cell::new(false),
             head_status: RefCell::new(std::collections::HashMap::new()),
@@ -115,6 +118,7 @@ impl Gh {
         self.removals.borrow_mut().push(RemovalEvent {
             reason: reason.map(str::to_string),
             created_at: ts(at),
+            before_commit: Some(GROUP_SHA.into()),
         });
     }
     fn count(&self, needle: &str) -> usize {
@@ -225,6 +229,10 @@ impl LifecycleForge for Gh {
     fn removals(&self, _pr: u32) -> Result<Vec<RemovalEvent>, String> {
         self.tick();
         Ok(self.removals.borrow().clone())
+    }
+    fn group_check_runs(&self, _commit: &str) -> Result<Vec<GroupRun>, String> {
+        self.tick();
+        self.group_runs.borrow().clone()
     }
 }
 
@@ -562,6 +570,103 @@ fn check_failure_and_timeout_use_their_existing_routes() {
     assert_eq!(gh.count("loom:merge-queue-grant"), 2);
 }
 
+// ------------------------------------------------- dropped-infra (#12573)
+
+const FAILED_CHECKS: &str = "Required status check \"Daemon Checks\" failed";
+
+fn run(name: &str, conclusion: &str, failed_steps: u32) -> GroupRun {
+    GroupRun {
+        name: name.into(),
+        conclusion: Some(conclusion.into()),
+        failed_steps,
+    }
+}
+
+fn infra_drop(runs: Result<Vec<GroupRun>, String>) -> (Gh, MemoryEventSink, Reconciled) {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    *gh.group_runs.borrow_mut() = runs;
+    hand(&gh, &ev).unwrap();
+    gh.github_drops(Some(FAILED_CHECKS), t0() + Duration::minutes(3));
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(4));
+    let r = reconcile_pr(&c, PR);
+    (gh, ev, r)
+}
+
+fn is_kind(r: &Reconciled, want: RemovalKind) -> bool {
+    matches!(r, Reconciled::Dropped { kind, .. } if *kind == want)
+}
+
+#[test]
+fn a_cancelled_group_job_is_dropped_infra_and_keeps_the_labels() {
+    let (gh, _, r) = infra_drop(Ok(vec![run("ci", "success", 0), run("test", "cancelled", 0)]));
+    assert!(is_kind(&r, RemovalKind::DroppedInfra), "{r:?}");
+    assert!(gh.has_label("loom:pr") && !gh.has_label("loom:changes-requested"));
+    assert_eq!(gh.count("reason=dropped-infra"), 1);
+    assert_eq!(render_reconciled(PR, &r).code, EXIT_QUEUED);
+}
+
+#[test]
+fn a_real_test_failure_still_routes_to_doctor() {
+    let (gh, _, r) = infra_drop(Ok(vec![run("test", "failure", 1)]));
+    assert!(is_kind(&r, RemovalKind::CheckFailure), "{r:?}");
+    assert!(gh.has_label("loom:changes-requested") && !gh.has_label("loom:pr"));
+}
+
+#[test]
+fn a_mixed_infra_and_real_failure_routes_to_doctor() {
+    let (_, _, r) = infra_drop(Ok(vec![run("a", "cancelled", 0), run("b", "failure", 2)]));
+    assert!(is_kind(&r, RemovalKind::CheckFailure), "{r:?}");
+}
+
+#[test]
+fn a_cancelled_job_with_a_failed_step_is_a_real_failure() {
+    let (_, _, r) = infra_drop(Ok(vec![run("test", "timed_out", 1)]));
+    assert!(is_kind(&r, RemovalKind::CheckFailure), "{r:?}");
+}
+
+#[test]
+fn an_unreadable_empty_or_unfinished_check_set_fails_closed() {
+    for runs in [
+        Err("HTTP 403".to_string()),
+        Ok(Vec::new()),
+        Ok(vec![run("ci", "success", 0)]),
+        Ok(vec![GroupRun {
+            name: "t".into(),
+            conclusion: None,
+            failed_steps: 0,
+        }]),
+    ] {
+        let (gh, _, r) = infra_drop(runs.clone());
+        assert!(is_kind(&r, RemovalKind::CheckFailure), "{runs:?} → {r:?}");
+        assert!(gh.has_label("loom:changes-requested"));
+    }
+}
+
+#[test]
+fn a_drop_without_a_group_commit_is_not_infra() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    *gh.group_runs.borrow_mut() = Ok(vec![run("t", "cancelled", 0)]);
+    hand(&gh, &ev).unwrap();
+    gh.github_drops(Some(FAILED_CHECKS), t0() + Duration::minutes(3));
+    gh.removals.borrow_mut()[0].before_commit = None;
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(4));
+    assert!(is_kind(&reconcile_pr(&c, PR), RemovalKind::CheckFailure));
+}
+
+#[test]
+fn a_second_infra_drop_on_the_same_head_falls_back_to_doctor() {
+    let (gh, ev, r) = infra_drop(Ok(vec![run("t", "cancelled", 0)]));
+    assert!(is_kind(&r, RemovalKind::DroppedInfra));
+    // Champion re-enqueues at the same head; GitHub drops it again.
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(10));
+    assert!(handoff(&c, PR, SHA1, &required_ok).is_ok());
+    gh.github_drops(Some(FAILED_CHECKS), t0() + Duration::minutes(13));
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(14));
+    let r = reconcile_pr(&c, PR);
+    assert!(is_kind(&r, RemovalKind::CheckFailure), "{r:?}");
+    assert!(gh.has_label("loom:changes-requested") && !gh.has_label("loom:pr"));
+}
+
 #[test]
 fn unknown_or_missing_reason_is_reported_unknown_not_guessed() {
     for reason in [
@@ -592,6 +697,7 @@ fn a_removal_older_than_the_grant_is_not_this_drop() {
     gh.removals.borrow_mut().push(RemovalEvent {
         reason: Some("Merge conflict".into()),
         created_at: ts(t0() - Duration::hours(1)),
+        before_commit: None,
     });
     hand(&gh, &ev).unwrap();
     *gh.queued.borrow_mut() = None; // entry vanished with no new removal event

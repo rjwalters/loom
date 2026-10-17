@@ -42,6 +42,21 @@ pub struct RemovalEvent {
     pub reason: Option<String>,
     /// RFC 3339.
     pub created_at: String,
+    /// The merge-group commit GitHub removed (`beforeCommit.oid`), which
+    /// stays readable after the group ref is deleted. `None` when absent.
+    pub before_commit: Option<String>,
+}
+
+/// One check run on a merge-group commit, reduced to what separates an
+/// infrastructure failure from a real one (see [`super::removal::infra_only`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRun {
+    pub name: String,
+    /// GitHub's check-run conclusion, lower case; `None` while not finished.
+    pub conclusion: Option<String>,
+    /// Steps of the backing job that ended `failure` — a test or build step
+    /// that actually ran and failed.
+    pub failed_steps: u32,
 }
 
 /// Forge operations outside the queue API. Implementations must not put a
@@ -72,6 +87,12 @@ pub trait LifecycleForge {
     ///
     /// The timeline could not be read.
     fn removals(&self, pr: u32) -> Result<Vec<RemovalEvent>, String>;
+    /// The check runs on a merge-group commit (#12573).
+    ///
+    /// # Errors
+    ///
+    /// The runs, or the job detail behind a failed one, could not be read.
+    fn group_check_runs(&self, commit: &str) -> Result<Vec<GroupRun>, String>;
 }
 
 fn has(labels: &[String], wanted: &[&str]) -> bool {
