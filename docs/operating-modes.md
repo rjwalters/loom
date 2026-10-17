@@ -69,6 +69,40 @@ Existing role approvals, repository instructions and review/merge rules still
 apply. Mode selection changes orchestration and infrastructure dependencies;
 it does not waive workflow gates.
 
+## Mode selection alongside existing control flags
+
+Operator clarification: mode should use the existing control-configuration
+path. Loom reads local files; on fleet-managed machines, the fleet control
+repository supplies the desired configuration that fleet sync renders into
+those files. Standalone installations set their controls locally.
+
+A proposed single setting is `mode`, with values `fleet`, `local-daemon` and
+`session`. The key and value spellings are not implemented by this document.
+Use the existing configuration machinery rather than a separate mode file or
+independent booleans for each mode. The fleet control repo would set `fleet`;
+local operators would select either local mode. The effective mode and its
+configuration source should be visible to the operator.
+
+The existing mechanisms have two distinct jobs:
+
+- [Fleet rendering](../loom-daemon/src/fleet_store/render.rs) writes machine
+  defaults and, when supplied by the store, the daemon workspace's host-local
+  configuration. It also manages the per-repo fleet configuration tier.
+- [Configuration resolution](design/config-resolution-tiers.md) combines the
+  resulting local files. A file being called "local" does not establish that
+  its contents are independently owned by the local operator on a fleet host.
+
+[Fleet sync](../loom-daemon/src/fleet_sync.rs) renders at startup; timer passes
+write when `fleet.autoApply` is enabled, otherwise they report drift. Existing
+write guards still apply. This is reconciliation, not a guarantee that every
+local edit is immediately overwritten.
+
+The mode setting must preserve the infrastructure boundaries above, including
+the fleet's control of enrolled workers. Defaults for existing installations,
+validation of conflicting controls and when a mode change takes effect remain
+implementation design work. No control files or running modes are changed by
+this documentation.
+
 ## CLI packaging: proposal, not a selected implementation
 
 Consolidating helper logic in Rust must preserve operation without the daemon
