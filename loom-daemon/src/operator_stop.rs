@@ -37,8 +37,47 @@
 //! - an explicit start (`loom-daemon daemon-start` / `loom-daemon-start.sh`,
 //!   [`discard`]): removes the record before launching; the start writes a
 //!   fresh marker of its own.
+//!
+//! Who writes it: `restart --drain --then-exit` / `fleet drain`, and (#9957)
+//! `loom-daemon-stop.sh` through the hidden [`OperatorStopCommand`] verb, so
+//! the shell stop never carries a second copy of this file's format.
 
 use std::path::{Path, PathBuf};
+
+/// `loom-daemon operator-stop …` — a thin, hidden CLI over this module for
+/// shell callers (Issue #9957). Not an operator-facing command: the record is
+/// written by the stop paths themselves.
+#[derive(clap::Subcommand)]
+pub enum OperatorStopCommand {
+    /// Record an operator stop for `--marker`: move it aside into
+    /// `<marker>.stopped` with `operator_stop_reason=<--reason>`. Exit 0 on
+    /// success, 1 (reason on stderr) on an I/O failure.
+    Record {
+        /// The resolved `autonomy-desired` marker path.
+        #[arg(long)]
+        marker: PathBuf,
+        /// Why, and who: free text, newlines folded to spaces.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+impl OperatorStopCommand {
+    /// Run the verb.
+    ///
+    /// # Errors
+    ///
+    /// The [`record`] failure, for the caller to report and exit non-zero.
+    pub fn run(self) -> anyhow::Result<()> {
+        match self {
+            Self::Record { marker, reason } => {
+                record(&marker, &reason).map_err(anyhow::Error::msg)?;
+                println!("{}", record_path(&marker).display());
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Comment prefix on every line this module adds, so [`clear`] can strip them.
 const COMMENT_PREFIX: &str = "# [operator-stop";
@@ -255,6 +294,56 @@ mod tests {
         assert!(!is_recorded(&marker));
         assert!(!marker.exists(), "discard does not restore — the start writes its own");
         assert!(!discard(&marker));
+    }
+
+    /// #9957: the verb `loom-daemon-stop.sh` calls parses, records with the
+    /// caller in the reason, and `clear` (`--abort-drain`) restores the
+    /// original marker verbatim.
+    #[test]
+    fn the_record_verb_round_trips_through_clear() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: OperatorStopCommand,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("autonomy-desired");
+        std::fs::write(&marker, MARKER_BODY).unwrap();
+        let reason = "loom-daemon-stop.sh caller=bash<claude<launchd";
+        let cli = Cli::try_parse_from([
+            "loom-daemon",
+            "record",
+            "--marker",
+            marker.to_str().unwrap(),
+            "--reason",
+            reason,
+        ])
+        .unwrap();
+        cli.cmd.run().unwrap();
+
+        assert!(!marker.exists(), "the verb moves the marker aside");
+        assert_eq!(field(&marker, "reason").as_deref(), Some(reason));
+        let text = std::fs::read_to_string(record_path(&marker)).unwrap();
+        assert!(text.ends_with(MARKER_BODY), "original lines kept verbatim: {text}");
+
+        assert_eq!(clear(&marker).unwrap(), Cleared::Restored);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), MARKER_BODY);
+    }
+
+    #[test]
+    fn the_record_verb_requires_marker_and_reason() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: OperatorStopCommand,
+        }
+        assert!(Cli::try_parse_from(["loom-daemon", "record", "--reason", "x"]).is_err());
+        assert!(Cli::try_parse_from(["loom-daemon", "record", "--marker", "/m"]).is_err());
     }
 
     #[cfg(unix)]
