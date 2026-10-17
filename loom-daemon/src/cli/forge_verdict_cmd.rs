@@ -39,6 +39,49 @@ pub(crate) fn verdict_body_check() -> Result<()> {
     std::process::exit(code)
 }
 
+/// The body-edit history of issue `n` (GraphQL `userContentEdits`; REST has no
+/// edit time). `None` when the read failed: never a pass (#12714).
+fn read_body_edits(repo: &str, n: u64, root: &Path) -> Option<Vec<gate::BodyEdit>> {
+    let (owner, name) = repo.split_once('/')?;
+    let query = "query($o:String!,$n:String!,$i:Int!){repository(owner:$o,name:$n){\
+                 issueOrPullRequest(number:$i){... on Issue{userContentEdits(first:50){nodes{\
+                 editedAt editor{login __typename}}}}}}}";
+    let args = [
+        "api".to_string(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={query}"),
+        "-f".into(),
+        format!("o={owner}"),
+        "-f".into(),
+        format!("n={name}"),
+        "-F".into(),
+        format!("i={n}"),
+    ];
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = loom_daemon::script_helpers::run_gh(&argv, root, false);
+    let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
+    let nodes = doc
+        .pointer("/data/repository/issueOrPullRequest/userContentEdits/nodes")?
+        .as_array()?;
+    nodes
+        .iter()
+        .map(|e| {
+            let at = chrono::DateTime::parse_from_rfc3339(e.get("editedAt")?.as_str()?).ok()?;
+            let kind = e.pointer("/editor/__typename").and_then(Value::as_str);
+            Some(gate::BodyEdit {
+                at: at.with_timezone(&chrono::Utc),
+                editor: e
+                    .pointer("/editor/login")
+                    .and_then(Value::as_str)
+                    .unwrap_or("an unknown editor")
+                    .to_string(),
+                bot: matches!(kind, Some("Bot" | "Mannequin")),
+            })
+        })
+        .collect()
+}
+
 /// The issues an approval is checked against for a stale read (#12614): those
 /// the PR body closes plus every `--issue-body-sha N=HASH`, each re-read now.
 /// `None` when the PR itself could not be read.
@@ -78,6 +121,7 @@ fn read_linked_issues(
                     comments: loom_daemon::comment_trust::records::fetch_trusted_comments(
                         repo, &ns, root, false,
                     ),
+                    edits: read_body_edits(repo, n, root),
                 }
             })
             .collect(),
@@ -98,7 +142,7 @@ pub(crate) fn verdict_gate(
 ) -> Result<()> {
     let kind = verdict_or_exit("verdict-gate", verdict);
     let root = super::forge_identity_cmd::workspace();
-    let started = review_started.map(|s| {
+    let flag_started = review_started.map(|s| {
         chrono::DateTime::parse_from_rfc3339(s.trim())
             .map(|d| d.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| {
@@ -119,16 +163,23 @@ pub(crate) fn verdict_gate(
                 })
         })
         .collect();
-    let issues = match (started, kind) {
-        (Some(_), VerdictKind::Approved) => read_linked_issues(repo, pr, &hashes, &root),
-        _ => Some(Vec::new()),
-    };
     let comments = loom_daemon::comment_trust::records::fetch_trusted_comments(
         repo,
         &pr.to_string(),
         &root,
         false,
     );
+    // The start comes from the dispatch, not the agent (#12714): the agent's
+    // value may only move it earlier.
+    let dispatch = std::env::var("LOOM_SWEEP_ID")
+        .ok()
+        .and_then(|id| gate::dispatch_epoch(&id))
+        .or_else(|| comments.as_deref().and_then(gate::lease_start));
+    let started = gate::resolve_start(flag_started, dispatch);
+    let issues = match (started, kind) {
+        (Some(_), VerdictKind::Approved) => read_linked_issues(repo, pr, &hashes, &root),
+        _ => Some(Vec::new()),
+    };
     let labels = read_labels(repo, pr, &root);
     let decision = gate::decide(&GateInput {
         verdict: kind,

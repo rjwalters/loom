@@ -116,10 +116,12 @@
 #   --review-started RFC3339   Approvals only (#12614): when this review began
 #       (capture `date -u +%Y-%m-%dT%H:%M:%SZ` when you claim the PR). The gate
 #       refuses the approval when a trusted human comment on the PR or a linked
-#       issue is newer, or a linked issue body no longer matches its
-#       --issue-body-sha; the refusal (exit 7) names the comment or issue. Re-review
-#       against the current spec, then retry with a fresh value. Absent: no such
-#       check, and the gate warns.
+#       issue is newer, a human edited a linked issue body after it, or a body
+#       no longer matches its --issue-body-sha; the refusal (exit 7) names the
+#       comment or edit. The gate's start is the dispatch epoch in $LOOM_SWEEP_ID
+#       (or the PR's judge lease); this value can only move it earlier (#12714).
+#       Re-review against the current spec, then retry. With no start resolvable
+#       at all (no epoch, no lease, no flag) the approval is refused.
 #
 #   --issue-body-sha N=HASH   (repeatable) Issue N's body as you reviewed it:
 #       `printf %s "$(gh api repos/OWNER/REPO/issues/N --jq .body)" | sha256sum | cut -d' ' -f1`.
@@ -525,7 +527,6 @@ fi
 # the build that merges #10684; no version floor is declared for them, because the
 # capability probe above checks them on the resolved binary. Roll loom-daemon
 # before (or with) these scripts: until then, verdicts take the legacy path.
-[[ "$VERDICT" == "approved" && -z "$REVIEW_STARTED" ]] && echo "post-verdict.sh: WARNING — no --review-started, so an operator comment or issue rescope made during this review is not checked (#12614)" >&2
 VG_RC=0; VG_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-gate "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --overrules-prior "$OVERRULE" ${REVIEW_STARTED:+--review-started "$REVIEW_STARTED"} ${ISSUE_HASHES[@]+"${ISSUE_HASHES[@]/#/--issue-body-sha=}"} 2>&1)" || VG_RC=$?  # set -e is on (forge-helpers.sh)
 case "$VG_RC:$VG_OUT" in
   "0:LOOM-VERDICT-GATE PROCEED"*) forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;

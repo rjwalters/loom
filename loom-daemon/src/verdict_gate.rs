@@ -26,12 +26,15 @@
 //!   count to what its gate saw; changes-requested deterministically wins, so
 //!   every interleaving converges on the same outcome.
 //!
-//! - [`stale_read`] — before an approval, when the caller passed
-//!   `--review-started` (#12614). A trusted human comment on the PR or a linked
-//!   issue newer than the review's start, or a linked-issue body that no longer
-//!   hashes to the one the Judge reviewed, means the approval would be against a
-//!   stale read of the spec (PR #12512 / issue #12509: the operator rescoped the
-//!   issue mid-review and the Judge approved the old design anyway).
+//! - [`stale_read`] — before every approval (#12614, #12714). A trusted human
+//!   comment on the PR or a linked issue newer than the review's start, a
+//!   human edit of a linked issue's body after it, or a body that no longer
+//!   hashes to the one the Judge reviewed, means the approval would be against
+//!   a stale read of the spec (PR #12512 / issue #12509: the operator rescoped
+//!   the issue mid-review and the Judge approved the old design anyway). The
+//!   start is the dispatch epoch ([`dispatch_epoch`]) or the PR's judge lease
+//!   ([`lease_start`]), never later than the agent's `--review-started`
+//!   ([`resolve_start`]); an approval with no resolvable start is refused.
 //!
 //! The exact-head CI read (#10485) is deliberately NOT here: that gate reads
 //! check runs through `forge wait-checks`. This one only reads what the forge
@@ -335,6 +338,64 @@ pub struct IssueSnapshot {
     pub body: Option<String>,
     /// The issue's trusted comments now.
     pub comments: Option<Vec<Value>>,
+    /// The body's edit history (GraphQL `userContentEdits`); `None` when it
+    /// could not be read, which is never a pass.
+    pub edits: Option<Vec<BodyEdit>>,
+}
+
+/// One edit of an issue body (#12714). REST has no edit time (`updated_at`
+/// also moves on comments and labels), so this comes from GraphQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyEdit {
+    pub at: DateTime<Utc>,
+    pub editor: String,
+    /// The editor is a bot/App: fleet traffic, not an operator rescope.
+    pub bot: bool,
+}
+
+/// The dispatch time a step sweep id encodes (`step-<role>-<item>-<epoch>`,
+/// optionally `-r<n>`; `generate_sweep_id`). The agent cannot choose it.
+#[must_use]
+pub fn dispatch_epoch(sweep_id: &str) -> Option<DateTime<Utc>> {
+    let secs: i64 = sweep_id
+        .trim()
+        .strip_prefix("step-")?
+        .split('-')
+        .nth(2)?
+        .parse()
+        .ok()?;
+    DateTime::from_timestamp(secs, 0)
+}
+
+/// The creation time of the newest live judge `loom:pr-lease` comment: the
+/// fallback start when `LOOM_SWEEP_ID` does not reach the gate. A released,
+/// yielded or renewed-only record does not match.
+#[must_use]
+pub fn lease_start(pr_comments: &[Value]) -> Option<DateTime<Utc>> {
+    pr_comments
+        .iter()
+        .filter(|c| {
+            c.get("body")
+                .and_then(Value::as_str)
+                .is_some_and(|b| b.contains("<!-- loom:pr-lease role=judge "))
+        })
+        .filter_map(comment_time)
+        .max()
+}
+
+/// The effective review start: the dispatch-derived time, moved only
+/// *earlier* by the agent's `--review-started`, so reporting a late time
+/// cannot hide a pre-claim edit. With no dispatch time the agent's value
+/// stands alone (a manual run); with neither there is none (#12714).
+#[must_use]
+pub fn resolve_start(
+    flag: Option<DateTime<Utc>>,
+    dispatch: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    match (flag, dispatch) {
+        (Some(f), Some(d)) => Some(f.min(d)),
+        (f, d) => f.or(d),
+    }
 }
 
 /// The hash of an issue body that `--issue-body-sha` carries: sha256 hex of the
@@ -346,13 +407,14 @@ pub fn body_sha(body: &str) -> String {
     hex::encode(Sha256::digest(body.trim_end_matches(['\n', '\r']).as_bytes()))
 }
 
-/// The issue numbers a PR body closes (`Closes #N`, `Fixes: #N`, `Resolves #N`
-/// and their inflections), ascending and deduplicated.
+/// The issue numbers a PR body closes or contributes to (`Closes #N`,
+/// `Fixes: #N`, `Resolves #N` and their inflections, plus `Part of #N` and
+/// `Contributes to #N`, #12714), ascending and deduplicated.
 #[must_use]
 pub fn closing_issues(pr_body: &str) -> Vec<u64> {
-    let Ok(re) =
-        regex::Regex::new(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)")
-    else {
+    let Ok(re) = regex::Regex::new(
+        r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|part\s+of|contributes?\s+to)\s*:?\s+#(\d+)",
+    ) else {
         return Vec::new();
     };
     let mut out: Vec<u64> = re
@@ -405,9 +467,9 @@ fn human_comment_after(comments: &[Value], started: DateTime<Utc>) -> Option<Str
         .map(|(_, d)| d)
 }
 
-/// Why an approval would rest on a stale read of the spec, or `None` (#12614).
-/// `issues` is `None` when the linked issues could not be determined; an
-/// unread issue is never a pass.
+/// Why an approval would rest on a stale read of the spec, or `None`
+/// (#12614). Every cause found is named (#12714). `issues` is `None` when the
+/// linked issues could not be determined; an unread issue is never a pass.
 #[must_use]
 pub fn stale_read(
     started: DateTime<Utc>,
@@ -416,45 +478,62 @@ pub fn stale_read(
 ) -> Option<String> {
     let remedy = "re-review against the current spec (read the comment or issue body first), \
                   then approve with a fresh --review-started";
+    let at = started.to_rfc3339();
+    let mut why: Vec<String> = Vec::new();
     if let Some(d) = human_comment_after(pr_comments, started) {
-        return Some(format!(
-            "a human comment landed on the PR after this review started ({}): {d}; {remedy}",
-            started.to_rfc3339()
+        why.push(format!(
+            "a human comment landed on the PR after this review started ({at}): {d}"
         ));
     }
     let Some(issues) = issues else {
-        return Some(
+        why.push(
             "the linked issues could not be determined or read, so a mid-review rescope cannot \
              be ruled out; an unread state is never a pass — retry"
                 .into(),
         );
+        return Some(why.join("; "));
     };
     for issue in issues {
         let n = issue.number;
-        let (Some(body), Some(comments)) = (issue.body.as_deref(), issue.comments.as_deref())
+        let (Some(body), Some(comments), Some(edits)) =
+            (issue.body.as_deref(), issue.comments.as_deref(), issue.edits.as_deref())
         else {
-            return Some(format!(
-                "issue #{n}'s body or comments could not be read, so a mid-review rescope \
-                 cannot be ruled out; an unread state is never a pass — retry"
+            why.push(format!(
+                "issue #{n}'s body, edit history or comments could not be read, so a mid-review \
+                 rescope cannot be ruled out; an unread state is never a pass — retry"
             ));
+            continue;
         };
         if let Some(expected) = issue.expected_body_sha.as_deref() {
             if !expected.trim().eq_ignore_ascii_case(&body_sha(body)) {
-                return Some(format!(
+                why.push(format!(
                     "issue #{n}'s body changed since this review started (it no longer matches \
-                     the body you reviewed); {remedy}"
+                     the body you reviewed)"
                 ));
             }
         }
+        if let Some(e) = edits
+            .iter()
+            .filter(|e| !e.bot && e.at > started)
+            .max_by_key(|e| e.at)
+        {
+            why.push(format!(
+                "issue #{n}'s body was edited by {} at {} after this review started ({at})",
+                e.editor,
+                e.at.to_rfc3339()
+            ));
+        }
         if let Some(d) = human_comment_after(comments, started) {
-            return Some(format!(
-                "a human comment landed on issue #{n} after this review started ({}): {d}; \
-                 {remedy}",
-                started.to_rfc3339()
+            why.push(format!(
+                "a human comment landed on issue #{n} after this review started ({at}): {d}"
             ));
         }
     }
-    None
+    if why.is_empty() {
+        None
+    } else {
+        Some(format!("{}; {remedy}", why.join("; ")))
+    }
 }
 
 /// Everything [`decide`] looks at. `comments` / `labels` are `None` when the
@@ -468,8 +547,8 @@ pub struct GateInput<'a> {
     pub overrule: &'a str,
     pub now: DateTime<Utc>,
     pub window_secs: i64,
-    /// When the Judge began this review (`--review-started`, #12614). `None`
-    /// keeps the pre-#12614 behaviour.
+    /// When this review began, from [`resolve_start`] (#12614, #12714). `None`
+    /// refuses an approval: an unread start is never a pass.
     pub review_started: Option<DateTime<Utc>>,
     /// The linked issues as re-read; see [`stale_read`].
     pub issues: Option<&'a [IssueSnapshot]>,
@@ -502,8 +581,15 @@ pub fn decide(input: &GateInput<'_>) -> Decision {
             ));
         }
     }
-    if let (true, Some(started), Some(comments)) = (approving, input.review_started, input.comments)
-    {
+    if let (true, Some(comments)) = (approving, input.comments) {
+        let Some(started) = input.review_started else {
+            return Decision::Refuse(
+                "no review start time could be resolved (no step dispatch epoch in \
+                 $LOOM_SWEEP_ID, no judge lease on the PR, no --review-started), so a \
+                 mid-review rescope cannot be ruled out; an unread state is never a pass"
+                    .into(),
+            );
+        };
         if let Some(why) = stale_read(started, comments, input.issues) {
             return Decision::Refuse(why);
         }
