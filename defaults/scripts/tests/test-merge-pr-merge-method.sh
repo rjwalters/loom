@@ -41,7 +41,7 @@ WS_FIXTURE_DIR="$(mktemp -d)"
 write_scope_register "$WS_FIXTURE_DIR" owner/repo
 cd "$WS_FIXTURE_DIR"
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
+source "$SCRIPT_DIR/lib/assert.sh"
 
 assert_grep() {
     local pattern="$1" file="$2" msg="$3"
