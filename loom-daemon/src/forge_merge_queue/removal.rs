@@ -16,13 +16,16 @@
 //!   verdict-staleness janitor, which owns head moves; an unknown reason is
 //!   a human decision (`loom:operator`).
 
-use super::forge::{APPROVED_LABEL, CHANGES_REQUESTED_LABEL, OPERATOR_LABEL};
+use super::forge::{GroupRun, APPROVED_LABEL, CHANGES_REQUESTED_LABEL, OPERATOR_LABEL};
 
 /// Why GitHub removed the PR, as far as its own text says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemovalKind {
     Conflict,
     CheckFailure,
+    /// A `failed_checks` drop whose every failed group check was
+    /// infrastructure (#12573); never produced by [`classify`].
+    DroppedInfra,
     Timeout,
     HeadChanged,
     Unknown,
@@ -35,6 +38,7 @@ impl RemovalKind {
         match self {
             RemovalKind::Conflict => "conflict",
             RemovalKind::CheckFailure => "check-failure",
+            RemovalKind::DroppedInfra => "dropped-infra",
             RemovalKind::Timeout => "timeout",
             RemovalKind::HeadChanged => "head-changed",
             RemovalKind::Unknown => "unknown",
@@ -63,6 +67,23 @@ pub fn classify(reason: Option<&str>) -> RemovalKind {
     }
 }
 
+/// True only when the group commit's failures are all infrastructure: at
+/// least one run failed, every failed run ended `cancelled` or `timed_out`,
+/// and none had a step that ran and failed. A run still in progress, any other
+/// conclusion, or no failure at all is not infrastructure (fail closed).
+#[must_use]
+pub fn infra_only(runs: &[GroupRun]) -> bool {
+    let mut failed = 0;
+    for r in runs {
+        match r.conclusion.as_deref() {
+            Some("success" | "neutral" | "skipped") => {}
+            Some("cancelled" | "timed_out") if r.failed_steps == 0 => failed += 1,
+            _ => return false,
+        }
+    }
+    failed > 0
+}
+
 /// Label transition for a removal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
@@ -88,11 +109,13 @@ pub fn route(kind: RemovalKind) -> Route {
             handler: "Routed to Doctor (`loom:pr` → `loom:changes-requested`): a required check \
                       failed on the combined merge-group tree, the same route as a CI failure.",
         },
-        RemovalKind::Timeout => Route {
+        RemovalKind::Timeout | RemovalKind::DroppedInfra => Route {
             add: Vec::new(),
             remove: Vec::new(),
             handler: "Not a failure: `loom:pr` is kept and the next Champion pass re-runs every \
-                      guard and re-enqueues with a fresh authorization, like `merge-pr.sh` exit 5.",
+                      guard and re-enqueues with a fresh authorization, like `merge-pr.sh` exit 5. \
+                      (For `dropped-infra`: every failed group check was cancelled or timed out \
+                      with no failing step, so this is infrastructure, retried once per head.)",
         },
         RemovalKind::HeadChanged => Route {
             add: Vec::new(),
