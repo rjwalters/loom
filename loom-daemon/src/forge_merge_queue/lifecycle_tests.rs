@@ -52,6 +52,7 @@ struct Gh {
     /// Latest `loom/merge-authorization` status per commit.
     head_status: RefCell<std::collections::HashMap<String, StatusState>>,
     status_fails: Cell<bool>,
+    cannot_post: Cell<bool>,
     /// Pushed to the head the instant the enqueue mutation arrives.
     push_during_enqueue: RefCell<Option<String>>,
     calls: Cell<u32>,
@@ -71,6 +72,7 @@ impl Gh {
             dequeue_fails: Cell::new(false),
             head_status: RefCell::new(std::collections::HashMap::new()),
             status_fails: Cell::new(false),
+            cannot_post: Cell::new(false),
             push_during_enqueue: RefCell::new(None),
             calls: Cell::new(0),
         }
@@ -181,6 +183,12 @@ impl StatusApi for Gh {
             return Err("HTTP 503".into());
         }
         self.head_status.borrow_mut().insert(commit.into(), state);
+        Ok(())
+    }
+    fn can_post_statuses(&self) -> Result<(), String> {
+        if self.cannot_post.get() {
+            return Err("installation has `statuses: read`".into());
+        }
         Ok(())
     }
 }
@@ -299,6 +307,35 @@ fn handoff_is_idempotent_for_a_queued_head() {
     assert!(matches!(hand(&gh, &ev), Ok(EnqueueOutcome::AlreadyQueued { .. })));
     assert_eq!(gh.count("loom:merge-queue-grant"), 1, "no second grant");
     assert_eq!(kinds(&ev), vec![EventKind::Enqueued], "no duplicate telemetry");
+}
+
+#[test]
+fn credential_that_cannot_post_statuses_leaves_a_queued_pr_alone() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    hand(&gh, &ev).unwrap();
+    gh.cannot_post.set(true);
+    gh.status_fails.set(true);
+    let before = gh.count("loom:merge-queue-grant");
+    assert!(matches!(hand(&gh, &ev), Ok(EnqueueOutcome::AlreadyQueued { .. })));
+    assert!(gh.queued.borrow().is_some(), "still queued");
+    assert_eq!(gh.count("loom:merge-queue-grant"), before, "no revoke, no re-grant");
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(5));
+    assert!(matches!(reconcile_pr(&c, PR), Reconciled::StillQueued { .. }));
+    assert_eq!(kinds(&ev), vec![EventKind::Enqueued]);
+}
+
+#[test]
+fn credential_that_cannot_post_statuses_is_refused_with_the_permission_named() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    gh.cannot_post.set(true);
+    let e = hand(&gh, &ev).unwrap_err();
+    let text = e.to_string();
+    assert!(
+        text.contains("WRITER_CANNOT_POST_STATUSES") && text.contains("statuses"),
+        "{text}"
+    );
+    assert_eq!(gh.count("loom:merge-queue-grant"), 0, "nothing granted");
+    assert!(gh.queued.borrow().is_none());
 }
 
 // ------------------------------------------------------- direct mode / gates

@@ -54,6 +54,14 @@ impl GhLifecycleForge {
         }
     }
 
+    pub(super) fn gh(&self) -> &str {
+        &self.gh
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(super) fn owner(&self) -> &str {
         &self.owner
     }

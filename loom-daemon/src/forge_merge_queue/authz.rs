@@ -303,6 +303,11 @@ pub enum HandoffError {
     Denied(Vec<DenyReason>),
     /// The grant could not be recorded; nothing was enqueued.
     Store(StoreError),
+    /// The writer credential cannot post the head status (or that could not
+    /// be established), so the handoff would roll back. Refused before any
+    /// grant was written or revoked; another identity's grant and queue entry
+    /// are untouched (#12579). The detail names the missing permission.
+    WriterCannotPostStatuses(String),
     /// The `success` status for [`REQUIRED_CHECK_CONTEXT`] could not be
     /// posted on the approved head; the grant was revoked and nothing was
     /// enqueued. GitHub only enqueues a PR whose required checks are
@@ -319,6 +324,12 @@ pub enum HandoffError {
 }
 
 /// Check, grant, post the head status, enqueue, re-check. See the module docs.
+///
+/// Idempotent: a PR already queued at `approved_sha` under a live grant for the
+/// same head reports [`EnqueueOutcome::AlreadyQueued`] before anything is
+/// written, so a second pass (possibly from a credential that cannot post
+/// statuses) can never revoke the standing grant. Otherwise
+/// [`StatusApi::can_post_statuses`] is checked before the first write.
 ///
 /// `read_facts` is called once before any write and once after the enqueue.
 /// `statuses` receives the `success` for [`REQUIRED_CHECK_CONTEXT`] on
@@ -346,6 +357,12 @@ pub fn authorize_and_enqueue(
     if let AuthzDecision::Denied(why) = evaluate(&facts, approved_sha) {
         return Err(HandoffError::Denied(why));
     }
+    if let Some(out) = already_queued(api, store, pr, approved_sha) {
+        return Ok(out);
+    }
+    statuses
+        .can_post_statuses()
+        .map_err(HandoffError::WriterCannotPostStatuses)?;
     store
         .put(Grant {
             pr,
@@ -378,6 +395,33 @@ pub fn authorize_and_enqueue(
         return Err(HandoffError::RevokedDuringEnqueue { why, revocation });
     }
     Ok(out)
+}
+
+/// The PR is open, queued at `approved_sha`, and a live grant covers that same
+/// head: nothing to do. Any read that fails answers `None`, so the normal
+/// (guarded) path runs instead.
+fn already_queued(
+    api: &dyn QueueApi,
+    store: &dyn GrantStore,
+    pr: u32,
+    approved_sha: &str,
+) -> Option<EnqueueOutcome> {
+    let status = api.status(pr).ok()?;
+    if status.state != ops::PrState::Open {
+        return None;
+    }
+    let entry = status.entry?;
+    let queued_head = entry.head_oid.unwrap_or(status.head_oid);
+    if !queued_head.eq_ignore_ascii_case(approved_sha) {
+        return None;
+    }
+    let grant = store.get(pr).ok()??;
+    grant
+        .approved_sha
+        .eq_ignore_ascii_case(approved_sha)
+        .then_some(EnqueueOutcome::AlreadyQueued {
+            position: entry.position,
+        })
 }
 
 /// Best-effort `failure` on the PR head after a handoff rolled its grant
