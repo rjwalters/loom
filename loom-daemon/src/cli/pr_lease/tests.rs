@@ -768,7 +768,7 @@ fn release_rewrites_the_marker_so_the_claim_frees_at_once() {
     fake_gh(dir.path());
     let a = who(Role::Doctor, "sweep-a");
     fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
-    assert_eq!(ctx(dir.path(), a.clone()).release(None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None), EXIT_HELD);
     let patched = fs::read_to_string(dir.path().join("patched")).unwrap();
     assert!(patched.contains("repos/acme/widgets/issues/comments/100"), "{patched}");
     assert!(patched.contains(&a.released_marker()), "{patched}");
@@ -782,6 +782,40 @@ fn claim_refuses_without_writing_when_write_scope_denies_the_repo() {
     c.gh.write_repo = Err("not a managed repository".to_string());
     assert_eq!(c.claim(), EXIT_UNVERIFIED);
     assert!(posted(dir.path()).is_empty(), "#9548: no write to an unvetted repo");
+}
+
+/// #12616: a Champion's released lease records its step outcome, `none` when
+/// it wrote no `CHAMPION-STEP` line, and nothing for a merge.
+#[test]
+fn a_champion_release_records_its_step_outcome() {
+    let release = |outcome: Option<&str>| {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        let a = who(Role::Champion, "sweep-c");
+        fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
+        assert_eq!(ctx(dir.path(), a.clone()).release(None, outcome), EXIT_HELD);
+        (a, fs::read_to_string(dir.path().join("patched")).unwrap())
+    };
+    let (a, patched) = release(Some("head-moved"));
+    assert!(patched.contains(&a.released_marker_with(" outcome=head-moved")), "{patched}");
+    let (a, patched) = release(None);
+    assert!(patched.contains(&a.released_marker_with(" outcome=none")), "{patched}");
+    let (a, patched) = release(Some("merged"));
+    assert!(patched.contains(&a.released_marker()), "{patched}");
+    let (a, patched) = release(Some("a b-->"));
+    assert!(patched.contains(&a.released_marker_with(" outcome=ab--")), "{patched}");
+}
+
+/// #12616: the daemon's reap of a dead Champion records `outcome=none`.
+#[test]
+fn a_reaped_champion_records_no_outcome() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let dead = who(Role::Champion, "sweep-c");
+    fs::write(dir.path().join("rows"), live_row(100, &dead)).unwrap();
+    assert_eq!(ctx(dir.path(), dead.clone()).reap("timeout"), EXIT_HELD);
+    let patched = fs::read_to_string(dir.path().join("patched")).unwrap();
+    assert!(patched.contains(&dead.released_marker_with(" outcome=none")), "{patched}");
 }
 
 // ---- a timed-out Judge, reaped by the daemon (#11931) ---------------------
@@ -868,7 +902,7 @@ fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() 
     let mut c = ctx(dir.path(), on("host-a", "run-1"));
     c.lease_file = Some(lease_file.clone());
     assert_eq!(c.claim(), EXIT_HELD);
-    assert_eq!(c.release(None), EXIT_HELD);
+    assert_eq!(c.release(None, None), EXIT_HELD);
     assert_eq!(fs::read_to_string(&lease_file).unwrap(), "", "nothing left to reap");
     // A reap after a verdict landed frees the lease and records nothing.
     let dir = TempDir::new().unwrap();
@@ -1143,7 +1177,7 @@ fn a_step_less_fence_and_release_find_the_sessions_stepped_lease() {
     assert_eq!(plain.step, Some(StepRole::ChampionMerge), "the default step differs");
     assert_eq!(ctx(dir.path(), plain.clone()).fence(), EXIT_HELD, "own lease, not a peer's");
     assert_eq!(ctx(dir.path(), plain.clone()).check(), EXIT_HELD);
-    assert_eq!(ctx(dir.path(), plain).release(None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), plain).release(None, None), EXIT_HELD);
     // The released marker keeps the lease's own step.
     assert!(
         patched(dir.path()).contains(&claimed.released_marker()),
@@ -1180,7 +1214,7 @@ fn an_issue_scoped_release_reads_no_pr_head() {
     fake_gh(dir.path());
     let curator = Identity::new(Role::Curator, "host-a".into(), "run-1".into(), None).unwrap();
     fs::write(dir.path().join("rows"), live_row(100, &curator)).unwrap();
-    assert_eq!(ctx(dir.path(), curator.clone()).release(None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), curator.clone()).release(None, None), EXIT_HELD);
     assert!(patched(dir.path()).contains(&curator.released_marker()));
     assert!(!dir.path().join("pulled").exists(), "no PR read for a Curator lease");
 }
