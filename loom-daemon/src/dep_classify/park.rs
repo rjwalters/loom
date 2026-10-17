@@ -84,6 +84,7 @@ pub fn apply(
         at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         remove_labels: remove_labels.to_vec(),
         dry_run: false,
+        is_pr: false,
     };
     let mut forge = crate::operator_decision::cli::GhForge::new(
         repo_root.to_path_buf(),

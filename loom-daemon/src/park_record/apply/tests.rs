@@ -88,6 +88,7 @@ fn req(blocked_by: &[u64], reason: Option<&str>) -> ApplyRequest {
         at: AT.to_string(),
         remove_labels: vec!["loom:building".to_string()],
         dry_run: false,
+        is_pr: false,
     }
 }
 
@@ -358,6 +359,7 @@ mod hold_journal {
     fn champion(reason: &str) -> ApplyRequest {
         ApplyRequest {
             by: Some("champion".to_string()),
+            is_pr: true,
             remove_labels: Vec::new(),
             ..req(&[], Some(reason))
         }
@@ -402,6 +404,16 @@ mod hold_journal {
             ),
             "{e:?}"
         );
+    }
+
+    #[test]
+    fn a_champion_issue_park_journals_no_hold() {
+        let mut f = Fake::new("body", &[]);
+        let issue = ApplyRequest {
+            is_pr: false,
+            ..champion("champion park")
+        };
+        assert!(holds(&mut f, &issue).is_empty());
     }
 
     #[test]

@@ -97,6 +97,9 @@ pub struct ApplyRequest {
     /// Labels to drop once parked (e.g. `loom:building`).
     pub remove_labels: Vec<String>,
     pub dry_run: bool,
+    /// The target is a PR (not an issue). Only a PR park is a merge hold, so
+    /// only it journals a `hold.transition` (#12665).
+    pub is_pr: bool,
 }
 
 /// Why a request is refused before any forge call, or `None` when it may run.
@@ -294,7 +297,7 @@ fn hold_reason_code(reason: Option<&str>) -> &'static str {
 /// `add` (#12665). `confirmed` is `false` for a write that failed. Best-effort
 /// and a no-op outside a journaled run or for any other role.
 fn journal_hold_add(req: &ApplyRequest, confirmed: bool) {
-    if req.dry_run || req.by.as_deref() != Some("champion") {
+    if req.dry_run || !req.is_pr || req.by.as_deref() != Some("champion") {
         return;
     }
     crate::observability::pick_journal::record_hold(

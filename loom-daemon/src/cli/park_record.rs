@@ -215,6 +215,7 @@ impl ApplyArgs {
     fn run(self) -> Result<()> {
         use loom_daemon::operator_decision::cli::{default_repo_root, GhForge};
         use loom_daemon::park_record::apply::{apply, ApplyRequest};
+        let is_pr = self.issue.is_none() && self.pr.is_some();
         let req = ApplyRequest {
             number: self.issue.or(self.pr).unwrap_or_default(),
             repo: self.repo.clone(),
@@ -224,8 +225,8 @@ impl ApplyArgs {
             at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             remove_labels: self.remove_label,
             dry_run: self.dry_run,
+            is_pr,
         };
-        let is_pr = self.issue.is_none() && self.pr.is_some();
         let mut forge = GhForge::new(default_repo_root(), self.repo);
         let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
         loom_daemon::park_record::apply::journal_applied(&req, is_pr, code);

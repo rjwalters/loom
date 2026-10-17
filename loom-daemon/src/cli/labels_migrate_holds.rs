@@ -612,6 +612,7 @@ impl GhHoldsForge {
             at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             remove_labels: Vec::new(),
             dry_run: false,
+            is_pr: false,
         };
         let mut forge = loom_daemon::operator_decision::cli::GhForge::new(
             self.root.clone(),
