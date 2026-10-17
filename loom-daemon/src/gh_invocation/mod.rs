@@ -915,6 +915,10 @@ impl GhInvocation {
 pub(crate) mod test_routing;
 
 #[cfg(test)]
+#[path = "test_support.rs"]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 #[path = "w4c_sites_tests.rs"]
 mod w4c_sites_tests;
 

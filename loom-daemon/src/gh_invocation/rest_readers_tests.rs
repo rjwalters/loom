@@ -7,31 +7,14 @@
 //! classification they had: a `304` is a free `not_modified`, not an error.
 
 use super::GhInvocation;
-use crate::forge_call_stats;
 use crate::forge_call_stats::ops;
 use crate::forge_etag_store::{fetch_conditional, ConditionalRead, Target};
+use crate::gh_invocation::test_support::{rows_after, stub};
 use crate::gh_invocation::{AccessIntent, GhTarget, Operation};
 use crate::types::ForgeCallCounts;
 use serial_test::serial;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
-fn rows_after(body: impl FnOnce()) -> Vec<ForgeCallCounts> {
-    let sink = tempfile::tempdir().unwrap();
-    forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
-    body();
-    let report = forge_call_stats::status_report(chrono::Utc::now(), None);
-    forge_call_stats::set_test_sink_dir(None);
-    report.host_window.unwrap_or_default()
-}
 
 fn row<'a>(rows: &'a [ForgeCallCounts], caller: &str) -> &'a ForgeCallCounts {
     let mut matching = rows.iter().filter(|r| r.caller == caller);

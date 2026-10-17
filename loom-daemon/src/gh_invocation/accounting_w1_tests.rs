@@ -4,18 +4,11 @@
 
 use super::*;
 use crate::forge_bucket_book::{self, BucketKey, Resource};
+use crate::gh_invocation::test_support::stub;
 use crate::gh_invocation::{AccessIntent, GhTarget, Operation, ParentContext};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
-
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
 
 fn inv(op: &'static str, args: &[&str], program: &Path) -> GhInvocation {
     GhInvocation::new(
