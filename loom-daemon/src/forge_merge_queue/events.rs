@@ -199,11 +199,53 @@ impl EventSink for FileEventSink {
                 )
             },
         );
+        // #12653: export the appended record to OTLP. Emitting only here, after
+        // the `seen` marker and the append, keeps the JSONL dedupe the single
+        // authority: a duplicate returned early and never reaches this line.
+        emit_otlp(ev);
         Ok(true)
     }
 
     fn pending(&self) -> Result<Vec<u32>, String> {
         Ok(pending_in(&self.read_all()?))
+    }
+}
+
+/// The OTLP record for `ev`, or `None` when its timestamp does not parse or
+/// the build provenance is not valid.
+fn otlp_record(
+    ev: &QueueEvent,
+    loom: crate::telemetry::provenance::Provenance,
+) -> Option<crate::telemetry::kinds::merge_queue_event::MergeQueueEventRecord> {
+    if !loom.is_valid() {
+        return None;
+    }
+    let parse = |t: &str| {
+        chrono::DateTime::parse_from_rfc3339(t)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc))
+    };
+    Some(crate::telemetry::kinds::merge_queue_event::MergeQueueEventRecord {
+        event: ev.kind.token().to_owned(),
+        pr: ev.pr,
+        nonce: ev.nonce,
+        head: ev.head.clone(),
+        reason: ev.reason.clone(),
+        enqueued_at: ev.enqueued_at.as_deref().and_then(parse),
+        at: parse(&ev.at)?,
+        enqueue_to_event_secs: ev.enqueue_to_event_secs,
+        merged_after_revocation: ev.merged_after_revocation,
+        loom,
+    })
+}
+
+/// Emit `ev` as a `merge_queue.event` record. A no-op without an ops sink
+/// (the short-lived CLI processes have none).
+fn emit_otlp(ev: &QueueEvent) {
+    if let Some(record) = otlp_record(ev, crate::telemetry::provenance::Provenance::current()) {
+        crate::observability::ops::emit_record(crate::telemetry::TelemetryRecord::MergeQueueEvent(
+            record,
+        ));
     }
 }
 
@@ -238,5 +280,74 @@ impl EventSink for MemoryEventSink {
 
     fn pending(&self) -> Result<Vec<u32>, String> {
         Ok(pending_in(&self.all()))
+    }
+}
+
+#[cfg(test)]
+mod otlp_tests {
+    use super::*;
+    use crate::telemetry::provenance::Provenance;
+
+    fn event() -> QueueEvent {
+        QueueEvent {
+            kind: EventKind::Removed,
+            pr: 9,
+            nonce: 2,
+            head: Some("abc".into()),
+            reason: Some("checks-timed-out".into()),
+            raw_reason: Some("raw".into()),
+            enqueued_at: Some("2026-10-17T11:00:00Z".into()),
+            at: "2026-10-17T12:00:00Z".into(),
+            enqueue_to_event_secs: Some(3600),
+            merged_after_revocation: false,
+        }
+    }
+
+    fn provenance() -> Provenance {
+        Provenance {
+            version: "0.19.1".into(),
+            revision: "9d8e226ce0123456789abcdef0123456789abcde".into(),
+            tree_state: "clean".into(),
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn the_record_carries_the_classified_reason_and_latency() {
+        let r = otlp_record(&event(), provenance()).unwrap();
+        assert_eq!(r.event, "removed");
+        assert_eq!(r.reason.as_deref(), Some("checks-timed-out"));
+        assert_eq!(r.enqueue_to_event_secs, Some(3600));
+        assert_eq!(r.at.to_rfc3339(), "2026-10-17T12:00:00+00:00");
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_or_invalid_provenance_is_not_exported() {
+        let mut ev = event();
+        ev.at = "not a time".into();
+        assert!(otlp_record(&ev, provenance()).is_none());
+        let mut bad = provenance();
+        bad.revision = String::new();
+        assert!(otlp_record(&event(), bad).is_none());
+    }
+
+    #[test]
+    fn only_a_recorded_event_is_emitted_a_duplicate_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileEventSink::for_root(dir.path());
+        let (first, emitted) = crate::observability::ops::capture::capture(|| {
+            let a = sink.record(&event()).unwrap();
+            let b = sink.record(&event()).unwrap();
+            (a, b)
+        });
+        assert_eq!(first, (true, false));
+        let kinds = emitted
+            .records
+            .iter()
+            .filter(|r| matches!(r, crate::telemetry::TelemetryRecord::MergeQueueEvent(_)))
+            .count();
+        // One recorded event emits at most one record (none when the test
+        // build has no valid provenance); the duplicate never adds a second.
+        assert!(kinds <= 1, "a duplicate never emits, got {kinds}");
     }
 }

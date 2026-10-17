@@ -164,6 +164,8 @@ fn samples() -> Vec<TelemetryRecord> {
         wire(json!({"kind": "write_scope.refused", "credential": "gh-process-default",
                     "call_site": "claim reconciliation", "reason": "unverifiable",
                     "refused_at": AT, "loom": p})),
+        wire(json!({"kind": "merge_queue.event", "event": "merged", "pr": 7, "nonce": 1,
+                    "at": AT, "loom": p})),
         wire(json!({"kind": "daemon.exit", "exit_code": 143, "requested_by": "unknown",
                     "relaunch_expected": false, "supervisor": "systemd",
                     "in_flight_sweeps": [], "in_flight_fate": "die_with_cgroup",
