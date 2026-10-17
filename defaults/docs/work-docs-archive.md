@@ -19,9 +19,13 @@ of `WORK_LOG.md` lists every archive newest first:
 ```markdown
 ## Archives
 
-- [2026-08](work_log/WORK_LOG_2026-08.md)
-- [2026-07](work_log/WORK_LOG_2026-07.md)
+- 2026-08: work_log/WORK_LOG_2026-08.md
+- 2026-07: work_log/WORK_LOG_2026-07.md
 ```
+
+In the real file each entry is a markdown link (`[YYYY-MM]` text, target
+`work_log/WORK_LOG_YYYY-MM.md`); the example is plain text because the install
+link checker resolves link syntax even inside fences.
 
 **WORK_PLAN (implemented in slice 3)** follows the same shape: `work_plan/WORK_PLAN_YYYY-MM.md`
 and a `## Archives` index in `WORK_PLAN.md`.
