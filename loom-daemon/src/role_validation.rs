@@ -348,22 +348,6 @@ fn check_role_dependencies(configured_roles: Vec<String>) -> ValidationResult {
     }
 }
 
-/// Validate role completeness from a config file path
-///
-/// Convenience function that reads the config file and validates it. Retained
-/// as a thin wrapper for backward compatibility (#4059); the production
-/// validate command now resolves through the config tier chain and calls
-/// [`validate_from_config`] instead.
-pub fn validate_from_file(
-    config_path: &std::path::Path,
-    mode: ValidationMode,
-) -> Result<ValidationResult, String> {
-    let config_json =
-        std::fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {e}"))?;
-
-    Ok(validate_role_completeness(&config_json, mode))
-}
-
 /// Format validation result for console output
 pub fn format_validation_result(result: &ValidationResult, verbose: bool) -> String {
     let mut output = String::new();

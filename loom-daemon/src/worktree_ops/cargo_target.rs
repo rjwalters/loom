@@ -436,17 +436,6 @@ pub fn resolve_for_worktree(worktree_path: &Path) -> PathBuf {
     )
 }
 
-/// Production resolution that distinguishes "no redirect" from "a redirect we
-/// could not read" — see [`resolve_for_worktree_checked_with`].
-#[must_use]
-pub fn resolve_for_worktree_checked(worktree_path: &Path) -> Option<PathBuf> {
-    resolve_for_worktree_checked_with(
-        worktree_path,
-        env_cargo_target_dir().as_deref(),
-        &cargo_metadata_target_directory,
-    )
-}
-
 /// What [`plan_reclaim`] decided about one worktree's resolved target dir.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetDirOutcome {

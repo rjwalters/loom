@@ -167,7 +167,7 @@ const DIFF_COMPOSITION_GREEN: &str = "The bulk of the diff is tests, docs/markdo
 const DIFF_COMPOSITION_RED: &str = "Load-bearing hunks change the *existing* behavior of a shared runtime path, and you cannot enumerate them — or the diff is dense enough that you skimmed rather than read it.";
 
 const BLAST_RADIUS_GREEN: &str = "Changes are confined to one crate/module/role file, or to surfaces whose failure affects a single feature.";
-const BLAST_RADIUS_RED: &str = "Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows, or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature.";
+const BLAST_RADIUS_RED: &str = "Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows (unless `WF_BLAST=green`, #12677), or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature.";
 
 const REVIEW_DEPTH_GREEN: &str = "The Judge's verdict cites specifics from the diff — named files/functions, concrete behavior, what was run or verified.";
 const REVIEW_DEPTH_RED: &str = "A short generic approval (\"LGTM\", \"looks good\") with no evidence the diff was read, or a review that explicitly defers verification of some part (\"did not check X\").";
