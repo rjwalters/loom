@@ -662,7 +662,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
 4. **Read feedback**: Understand what the reviewer is asking for
 5. **Check out PR branch in a dedicated worktree** ("PR Branch Isolation" above; its "Occupied worktree" check first): use `./.loom/scripts/worktree.sh <ISSUE_NUM>` for `feature/issue-<N>` branches or `./.loom/scripts/pr-worktree.sh <PR_NUMBER>` for external/ad-hoc branches, then `cd` into the worktree before running `gh pr checkout`. Then "Verify the pin" (below), before any edit.
 6. **CRITICAL: Assess ALL CI failures FIRST** (see "CI Assessment" section below):
-   - Run `forge wait-checks <number> --timeout 20` to identify ALL failing checks
+   - Run `loom-daemon forge wait-checks <number> --timeout 20` to identify ALL failing checks
    - Fetch logs for each failing check
    - Create a complete list of ALL issues before starting ANY fixes
 7. **Address ALL issues comprehensively**:
@@ -681,7 +681,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
      ./.loom/scripts/rebase-stacked-children.sh feature/issue-<N>
      ```
      It rebases open child PRs that went stale onto your new tip (safe children auto-rebase with a *pinned* force-with-lease; a child whose issue is still `loom:building` gets a deferred-reconciliation comment). No-op without stacked children, and **best-effort** — a failure (conflict, non-GitHub forge) never fails your own work; carry on to step 10. `--dry-run` previews.
-10. **Verify CI remotely**: after push, `forge wait-checks <number> --timeout 20` (GREEN/NONE = pass; else CI Assessment Step 5)
+10. **Verify CI remotely**: after push, `loom-daemon forge wait-checks <number> --timeout 20` (GREEN/NONE = pass; else CI Assessment Step 5)
 11. **Signal completion and unclaim** (run the lease fence and the Verdict-Time CAS Recheck — see below — immediately before this write; abort/stand down instead if either finds your claim lost or the PR already moved; then `lease pr release`):
     - Remove `loom:changes-requested` and `loom:treating` labels
     - Add `loom:review-requested` label (green badge)
@@ -991,7 +991,7 @@ This is the same technique as the Pre-Push Head-SHA Recheck, applied to the
 write that actually matters, not just at claim time.
 
 **Pre-completion checklist** (verify before signaling completion):
-- [ ] All CI checks pass (verified via `forge wait-checks <number>`)
+- [ ] All CI checks pass (verified via `loom-daemon forge wait-checks <number>`)
 - [ ] I ran the stale `loom:treating` claim check before claiming (skipped the PR
       on a fresh claim; reclaimed only on a stale one)
 - [ ] I held the PR lease before adding `loom:treating`, fenced it before each
@@ -1319,7 +1319,7 @@ git commit -m "Address review feedback
 # Pre-push head-SHA recheck — did another agent push while you worked?
 CURRENT_HEAD_SHA=$(gh pr view 42 --json headRefOid --jq '.headRefOid')
 if [ -n "$CURRENT_HEAD_SHA" ] && [ "$CURRENT_HEAD_SHA" != "$CLAIM_HEAD_SHA" ]; then
-  # Re-verify the blocker (gh pr view 42 --comments / forge wait-checks 42) before
+  # Re-verify the blocker (gh pr view 42 --comments / loom-daemon forge wait-checks 42) before
   # continuing — stand down if a concurrent fix already landed.
   echo "Head moved: $CLAIM_HEAD_SHA -> $CURRENT_HEAD_SHA"
 fi
