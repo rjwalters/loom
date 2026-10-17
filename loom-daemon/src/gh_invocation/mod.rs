@@ -269,6 +269,11 @@ pub enum GhCompletion {
         resource: crate::forge_bucket_book::Resource,
         until: std::time::SystemTime,
     },
+    /// Not run (#12641): the work-finder tick stopped this read (deadline
+    /// passed, or discovery ended). No request was sent and no reader budget
+    /// was involved. Classified as
+    /// [`crate::cmd_out::Unavailable::DeadlineReached`].
+    DeadlineReached,
 }
 
 /// Set to `1` on every child the facade spawns (W5): this execution is
@@ -978,17 +983,8 @@ impl GhInvocation {
 
     /// A read the tick deadline stopped (#12074): shed, nothing sent.
     fn deadline_shed(&self) -> GhCompletion {
-        let owner = self
-            .target
-            .slug()
-            .and_then(|s| s.split('/').next().map(str::to_ascii_lowercase))
-            .unwrap_or_else(|| "-".to_string());
         log::debug!("gh: {} not sent: the tick deadline passed (#12074)", self.operation.as_str());
-        GhCompletion::Shed {
-            owner,
-            resource: crate::forge_bucket_book::Resource::Core,
-            until: std::time::SystemTime::now(),
-        }
+        GhCompletion::DeadlineReached
     }
 
     /// Run exactly once under the credential already chosen (no routing).

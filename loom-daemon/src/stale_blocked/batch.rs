@@ -816,6 +816,9 @@ impl StaleBlockedForge for GhStaleBlockedForge {
         .args(["api", "graphql", "-f", field.as_str()]);
         let out = match inv.execute() {
             Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+            Ok(GhCompletion::DeadlineReached) => {
+                return Err(anyhow!("gh api graphql not sent: the tick deadline passed"));
+            }
             Ok(GhCompletion::Shed { .. }) => {
                 return Err(anyhow!("gh api graphql was shed: no reader can serve it"));
             }

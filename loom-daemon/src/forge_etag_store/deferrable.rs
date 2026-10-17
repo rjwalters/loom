@@ -54,6 +54,20 @@ impl std::fmt::Display for ReadShed {
 
 impl std::error::Error for ReadShed {}
 
+/// A conditional read that was not sent because the work-finder tick stopped
+/// it (#12641). Not a [`ReadShed`]: no reader budget is involved. The caller
+/// skips its pass, as for a shed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TickDeadlineReached;
+
+impl std::fmt::Display for TickDeadlineReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deferred: tick deadline reached")
+    }
+}
+
+impl std::error::Error for TickDeadlineReached {}
+
 /// Readers one read may try before it stops asking the router.
 const MAX_READERS_TRIED: usize = 8;
 
