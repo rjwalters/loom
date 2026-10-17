@@ -7,6 +7,24 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-17
+- **PR #12588**: Make every daemon read reader-only, whatever builder made it (#12584)
+- **PR #12587**: fix: treat merged group predecessor as satisfied; skip unchanged group statuses
+- **PR #12583**: fix: make merge-queue handoff idempotent and refuse a writer that cannot post statuses
+- **PR #12582**: fix: retry once when a merge-group failure is lost infrastructure
+- **PR #12581**: fix: give a no-progress hold refusal its own captain_cooldown reason
+- **PR #12580**: feat(workspace_resync): open a resync PR when the default branch refuses a direct push
+- **PR #12577**: fix(checkout_ff): reuse the cached remote head on network-off freshness passes
+- **PR #12576**: refactor: remove unused DaemonError constructors and ErrorCode constants
+- **PR #12575**: feat(ram_peaks): report Config as scope-memory limit source
+- **PR #12560**: fix: post pending, not failure, when the merge-queue enqueue fails
+- **PR #12557**: feat: judge reconciles current linked-issue spec before approving
+- **PR #12542**: refactor: share one paginated fetch helper for guide work-log issues and PRs
+- **PR #12538**: refactor: remove attended-session telemetry emitters
+- **PR #12529**: feat: let a Champion standing authorization cover critical files with mechanical exclusions
+- **PR #12477**: fix: gate approvals on comment-posted changes-requested verdicts
+- **PR #12428**: feat: show a read-only host update state in status and tick records
+- **PR #12268**: refactor: retire the operator-presence hook path (daemon records only its own work)
+- **PR #12155**: feat: warn when effective git user.email is a fixture address
 - **PR #12561**: fix: hold CI-waiting steps briefly and attribute the no-progress metric exactly
 - **PR #12562**: fix: make 'loom update --help' side-effect free
 - **PR #12564**: Daemon reads are reader-only: no writer pins on claim/guard/verdict reads (closes #12555)
@@ -19,6 +37,21 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #12531**: test: share gh_invocation stub/rows_after/calls helpers in one test_support module
 - **PR #12532**: fix: exclude merge-authorization context from wait-checks verdict
 - **PR #12549**: HOTFIX: captain-side no-progress cooldown so champion steps stop looping across hosts
+- **Issue #12585** (closed): group-check fails a merge group once a PR ahead of it merges ('authorization store unavailable: PR is merged'), and reposts pending every pass
+- **Issue #12584** (closed): Writer still serves reads after #12564: fleet_store sync, pr-lease CLI, comment.api_get and a few others
+- **Issue #12579** (closed): Merge-queue handoff from a credential that can't post statuses revokes another identity's live grant and dequeues the PR
+- **Issue #12573** (closed): Merge queue: a group CI job cancelled by a lost runner is classified check-failure, routing a green PR to Doctor and refusing re-enqueue
+- **Issue #12572** (closed): Auto-resync is refused by a merge_queue ruleset on main (GH013) and the repo stays on an old Loom version
+- **Issue #12567** (closed): Remove unused DaemonError constructors and ErrorCode constants in errors.rs
+- **Issue #12565** (closed): checkout.freshness: reuse the cached remote head on passes that skip the network
+- **Issue #12554** (closed): Merge queue: a transient handoff failure leaves loom/merge-authorization=failure, so re-approving the same head is routed to Doctor as a CI failure
+- **Issue #12540** (closed): Finish stale TODO(#12246): scope-memory telemetry never reports LimitSource::Config
+- **Issue #12536** (closed): Telemetry: daemon work only — remove CLI emitters attended sessions use (usage-record, attended session.output, any others)
+- **Issue #12535** (closed): Dedupe fetch_merged_prs_complete / fetch_closed_issues_complete in guide.md
+- **Issue #12528** (closed): Champion: let an operator standing authorization cover criterion #3 (critical files), with mechanical exclusions; one-way = on merge/roll only
+- **Issue #12475** (closed): Judge re-review ignores prior changes-requested verdicts posted as comments (review-reconciliation reads formal reviews only)
+- **Issue #12420** (closed): status/gauges: expose host state H0-H7, target and its source, and per-workspace W state
+- **Issue #12121** (closed): Telemetry: daemon derives operator.presence and in-session sweep.* from observed sessions
 - **Issue #12558** (closed): loom update --help rebuilds the user MCP bundle before printing help
 - **Issue #12555** (closed): Writer still serves in-process daemon reads: claim/guard/verdict lease, comment and timeline reads (follow-up to #12394/#12412)
 - **Issue #11761** (closed): Keep-it-simple beyond Curator: Judge and Champion gate on unjustified complexity; Curator checks 'already covered' first (follow-up to #11662)
