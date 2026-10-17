@@ -255,8 +255,10 @@ pub(crate) async fn handle_restart_command(args: RestartArgs) -> Result<()> {
         Err(e) => {
             eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
             eprintln!();
-            eprintln!("Is the daemon running? Start it with:");
-            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            if !super::common::eprint_socket_missing_hint(&socket_path) {
+                eprintln!("Is the daemon running? Start it with:");
+                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            }
             std::process::exit(1);
         }
     }
@@ -522,8 +524,10 @@ async fn handle_drain_reply(
         Err(e) => {
             eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
             eprintln!();
-            eprintln!("Is the daemon running? Start it with:");
-            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            if !super::common::eprint_socket_missing_hint(socket_path) {
+                eprintln!("Is the daemon running? Start it with:");
+                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            }
             std::process::exit(1);
         }
     }

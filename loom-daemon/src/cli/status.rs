@@ -723,6 +723,10 @@ fn print_status_unreachable_human(
     );
     eprintln!();
 
+    if super::common::eprint_socket_missing_hint(socket_path) {
+        return;
+    }
+
     match install_state {
         None => {
             // Undiagnosable (no loom dir could be resolved) — the pre-#4069
