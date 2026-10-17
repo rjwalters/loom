@@ -736,6 +736,94 @@ fn legacy_union(
     }
 }
 
+/// Verdict of [`probe_merged_branch_pr`] (#12615): did a PR already **merge**
+/// from `feature/issue-N` without declaring the issue a partial increment?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergedBranchPrProbe {
+    /// Verified: a merged same-repo PR headed `feature/issue-N` exists whose
+    /// body neither closes nor partially references `issue` (carries its
+    /// number). The work shipped but the issue was never closed.
+    Merged(u32),
+    /// Verified: the forge answered and no such PR exists.
+    NoneMerged,
+    /// No verdict (gh missing/failed, repo unresolvable, unparseable output).
+    ProbeFailed,
+}
+
+/// `gh` arguments listing closed PRs whose head is `feature/issue-<issue>` in
+/// `owner/repo` itself (the `owner:` qualifier excludes fork branches).
+#[must_use]
+pub fn merged_branch_pr_args(owner: &str, repo: &str, issue: u32) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        format!(
+            "repos/{owner}/{repo}/pulls?state=closed&head={owner}:feature/issue-{issue}&per_page=100"
+        ),
+    ]
+}
+
+/// Classify the raw stdout of the [`merged_branch_pr_args`] listing.
+///
+/// A PR counts only when it is merged (`merged_at` non-null) and its body does
+/// not mention `issue` through [`linkage_refs`] at all: `Part of #N` /
+/// `Contributes to #N` declares a partial increment (slice-branch reuse is
+/// legitimate, #3667), and a closing keyword means GitHub closed the issue
+/// itself, so a still-open issue was reopened on purpose. Anything that is not
+/// a JSON array is [`MergedBranchPrProbe::ProbeFailed`], never an absence.
+#[must_use]
+pub fn parse_merged_branch_pr(stdout: &str, issue: u32) -> MergedBranchPrProbe {
+    let Ok(serde_json::Value::Array(prs)) = serde_json::from_str::<serde_json::Value>(stdout)
+    else {
+        return MergedBranchPrProbe::ProbeFailed;
+    };
+    let mut lowest: Option<u32> = None;
+    for pr in &prs {
+        if pr.get("merged_at").is_none_or(serde_json::Value::is_null) {
+            continue;
+        }
+        let Some(number) = pr
+            .get("number")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+        else {
+            return MergedBranchPrProbe::ProbeFailed;
+        };
+        let body = pr
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if linkage_refs(body).iter().any(|&(n, _)| n == issue) {
+            continue;
+        }
+        lowest = Some(lowest.map_or(number, |l: u32| l.min(number)));
+    }
+    lowest.map_or(MergedBranchPrProbe::NoneMerged, MergedBranchPrProbe::Merged)
+}
+
+/// Best-effort probe for a **merged** PR from `feature/issue-<issue>` that
+/// never closed or partially referenced the issue (#12615; PR #12512 / issue
+/// #12509). One REST read, fail-closed: every failure is
+/// [`MergedBranchPrProbe::ProbeFailed`].
+#[must_use]
+pub fn probe_merged_branch_pr(repo_root: &Path, issue: u32) -> MergedBranchPrProbe {
+    let Some((owner, repo)) = resolve_owner_repo(repo_root) else {
+        return MergedBranchPrProbe::ProbeFailed;
+    };
+    let inv = invocation(
+        "worktree.merged_branch_pr",
+        AccessIntent::Read,
+        repo_root,
+        GH_CALL_TIMEOUT,
+        merged_branch_pr_args(&owner, &repo, issue),
+    );
+    match inv.run() {
+        CmdOutcome::Ran(o) if o.status.success() => {
+            parse_merged_branch_pr(&String::from_utf8_lossy(&o.stdout), issue)
+        }
+        _ => MergedBranchPrProbe::ProbeFailed,
+    }
+}
+
 /// Run one `gh` transport for [`probe_open_linked_pr`] and classify it.
 ///
 /// A spawn error or non-zero exit (rate limit, auth failure, transient forge
@@ -1024,6 +1112,44 @@ pub(crate) fn freshest_lease_updated_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- merged feature/issue-N PR probe (#12615) ---------------------------
+
+    #[test]
+    fn merged_branch_pr_classifies_blocked_clean_partial_and_malformed() {
+        let merged_plain =
+            r#"[{"number":12512,"merged_at":"2026-10-16T01:00:00Z","body":"Summary"}]"#;
+        assert_eq!(parse_merged_branch_pr(merged_plain, 12509), MergedBranchPrProbe::Merged(12512));
+        // Closed unmerged is not a blocker.
+        let unmerged = r#"[{"number":9,"merged_at":null,"body":"Summary"}]"#;
+        assert_eq!(parse_merged_branch_pr(unmerged, 5), MergedBranchPrProbe::NoneMerged);
+        assert_eq!(parse_merged_branch_pr("[]", 5), MergedBranchPrProbe::NoneMerged);
+        // Partial increment and closing keyword both skip.
+        let partial = r#"[{"number":9,"merged_at":"t","body":"Part of #5"}]"#;
+        assert_eq!(parse_merged_branch_pr(partial, 5), MergedBranchPrProbe::NoneMerged);
+        let closes = r#"[{"number":9,"merged_at":"t","body":"Closes #5"}]"#;
+        assert_eq!(parse_merged_branch_pr(closes, 5), MergedBranchPrProbe::NoneMerged);
+        // A partial reference to a different issue does not protect this one.
+        let other = r#"[{"number":9,"merged_at":"t","body":"Part of #6"}]"#;
+        assert_eq!(parse_merged_branch_pr(other, 5), MergedBranchPrProbe::Merged(9));
+        // Null body is a plain, non-linking PR.
+        let nobody = r#"[{"number":9,"merged_at":"t","body":null}]"#;
+        assert_eq!(parse_merged_branch_pr(nobody, 5), MergedBranchPrProbe::Merged(9));
+        // Not an array / unreadable number: no verdict.
+        assert_eq!(
+            parse_merged_branch_pr("{\"message\":\"x\"}", 5),
+            MergedBranchPrProbe::ProbeFailed
+        );
+        assert_eq!(parse_merged_branch_pr("garbage", 5), MergedBranchPrProbe::ProbeFailed);
+        let nonum = r#"[{"merged_at":"t","body":""}]"#;
+        assert_eq!(parse_merged_branch_pr(nonum, 5), MergedBranchPrProbe::ProbeFailed);
+    }
+
+    #[test]
+    fn merged_branch_pr_args_restrict_head_to_the_repo_owner() {
+        let args = merged_branch_pr_args("o", "r", 7);
+        assert_eq!(args[1], "repos/o/r/pulls?state=closed&head=o:feature/issue-7&per_page=100");
+    }
 
     /// #12389: the newest claim across every page wins; no claim event is
     /// `NoEvent`; an unparseable answer is `Unknown`, never an age.

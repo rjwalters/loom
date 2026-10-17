@@ -41,7 +41,7 @@
 //!
 //! | Exit | Meaning | stdout | What the caller must do |
 //! |---|---|---|---|
-//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` | the token | **Hard-abort the claim.** |
+//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` / `MERGED_PR #X` | the token | **Hard-abort the claim.** |
 //! | [`EX_SAFE_TO_CLAIM`] (1) | verified safe to claim | empty | Claim. |
 //! | [`EX_PROBE_FAILED`] (5) | no verdict — any leg's read failed | empty | **Fail closed.** Treat as blocked; check by hand. |
 //! | [`EX_FORGE_DECLINED`] (3) | Gitea — legs 1–3 are GitHub-only | empty | Check by hand. |
@@ -51,6 +51,14 @@
 //! on. Every non-zero code other than exactly `1` means **the question was
 //! not answered**, which a caller must treat as blocked — never as an
 //! all-clear.
+//!
+//! `MERGED_PR #X` (#12615) is leg 1b, one REST read beside `OPEN_PR`: a PR
+//! already **merged** from `feature/issue-N` whose body neither closes nor
+//! partially references (`Part of` / `Contributes to`) the issue — the work
+//! shipped but the issue stayed open (PR #12512 / issue #12509). Never
+//! overridable by `--force-claim`; an unreadable answer exits
+//! [`EX_PROBE_FAILED`]. A PR with a closing keyword is not a blocker: GitHub
+//! closed the issue, so an open one was reopened on purpose.
 //!
 //! `FROZEN` (#11743) is read off leg 2's label snapshot: the issue carries
 //! `loom:frozen`, which only a human removes. Like `OPEN_PR` it is never
@@ -103,7 +111,9 @@ use crate::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
 use crate::forge_cmd::{detect_forge, ForgeType, EX_FORGE_DECLINED};
 use crate::sweep_registry::preflip_labels::claim_labels_in;
 use crate::sweep_registry::{SweepRegistry, LEASE_MARKER_PREFIX};
-use crate::worktree_ops::gh::{probe_open_linked_pr, OpenPrProbe};
+use crate::worktree_ops::gh::{
+    probe_merged_branch_pr, probe_open_linked_pr, MergedBranchPrProbe, OpenPrProbe,
+};
 
 /// Exit code for a **verified** "safe to claim" — the only all-clear.
 /// Deliberately the same value `forge check-open-pr` uses for its verified
@@ -184,6 +194,8 @@ pub(crate) enum BranchLeg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClaimEvidence {
     pub(crate) open_pr: OpenPrProbe,
+    /// `None` = not consulted (an open PR already decided the walk).
+    pub(crate) merged_pr: Option<MergedBranchPrProbe>,
     pub(crate) labels: Option<LabelLeg>,
     pub(crate) lease: Option<LeaseLeg>,
     pub(crate) branch: Option<BranchLeg>,
@@ -277,6 +289,32 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
             );
         }
         OpenPrProbe::NoneOpen => {}
+    }
+
+    // Leg 1b — merged `feature/issue-N` PR that never closed the issue
+    // (#12615). Finished work, not a claim race: never overridable, and an
+    // unreadable answer fails closed like leg 1.
+    match evidence.merged_pr {
+        Some(MergedBranchPrProbe::Merged(pr)) => {
+            return blocked(
+                issue,
+                &format!("MERGED_PR #{pr}"),
+                format!(
+                    "PR #{pr} already merged from feature/issue-{issue} without closing or \
+                     partially referencing the issue — the work shipped (#12615), and \
+                     --force-claim never overrides this leg. Close the issue instead."
+                ),
+            );
+        }
+        Some(MergedBranchPrProbe::ProbeFailed) => {
+            return unanswered(
+                issue,
+                "the merged-branch-PR leg could not read the forge (gh missing, failed, \
+                 rate-limited, or the repository could not be resolved) — and --force-claim \
+                 cannot override a leg it is forbidden to override",
+            );
+        }
+        Some(MergedBranchPrProbe::NoneMerged) | None => {}
     }
 
     // Legs 2–4 — overridable by --force-claim, each blocker/unreadable leg
@@ -756,11 +794,16 @@ pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
     let open_pr = probe_open_linked_pr(&root, issue);
     let mut evidence = ClaimEvidence {
         open_pr,
+        merged_pr: None,
         labels: None,
         lease: None,
         branch: None,
     };
     if matches!(evidence.open_pr, OpenPrProbe::NoneOpen) {
+        evidence.merged_pr = Some(probe_merged_branch_pr(&root, issue));
+    }
+    let merged_clear = matches!(evidence.merged_pr, Some(MergedBranchPrProbe::NoneMerged));
+    if merged_clear {
         evidence.labels = Some(read_claim_labels(&gh_bin, &root, issue));
         let labels_clear = matches!(evidence.labels, Some(LabelLeg::Clean));
         if labels_clear || force_claim {
@@ -794,6 +837,8 @@ mod tests {
     ) -> ClaimEvidence {
         ClaimEvidence {
             open_pr,
+            merged_pr: matches!(open_pr, OpenPrProbe::NoneOpen)
+                .then_some(MergedBranchPrProbe::NoneMerged),
             labels,
             lease,
             branch,
@@ -834,6 +879,41 @@ mod tests {
             "a failed leg must never read as an all-clear: {}",
             v.stderr
         );
+    }
+
+    // --- Leg 1b: MERGED_PR (#12615) -----------------------------------------
+
+    fn with_merged(probe: MergedBranchPrProbe) -> ClaimEvidence {
+        let mut e = evidence(OpenPrProbe::NoneOpen, Some(LabelLeg::Clean), None, None);
+        e.merged_pr = Some(probe);
+        e
+    }
+
+    #[test]
+    fn merged_pr_blocker_is_exit_zero_with_the_merged_pr_token_and_never_overridable() {
+        for force in [false, true] {
+            let v = decide(12509, &with_merged(MergedBranchPrProbe::Merged(12512)), force);
+            assert_eq!(v.code, 0, "force={force}");
+            assert_eq!(v.stdout, "MERGED_PR #12512", "force={force}");
+            assert!(v.stderr.contains("never overrides"), "{}", v.stderr);
+        }
+    }
+
+    #[test]
+    fn merged_pr_read_failure_fails_closed_even_when_forced() {
+        let v = decide(12509, &with_merged(MergedBranchPrProbe::ProbeFailed), true);
+        assert_eq!(v.code, EX_PROBE_FAILED);
+        assert!(v.stdout.is_empty(), "{:?}", v.stdout);
+        assert!(v.stderr.contains("NOT an all-clear"), "{}", v.stderr);
+    }
+
+    /// No merged branch PR (or a partial-increment one, which the probe
+    /// reports as `NoneMerged`) leaves the verdict to the later legs.
+    #[test]
+    fn no_merged_pr_leaves_the_walk_clean() {
+        let v = decide(12509, &with_merged(MergedBranchPrProbe::NoneMerged), false);
+        assert_eq!(v.code, EX_SAFE_TO_CLAIM);
+        assert!(v.stdout.is_empty());
     }
 
     // --- Leg 2: BUILDING ----------------------------------------------------
