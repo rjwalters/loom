@@ -34,7 +34,8 @@
 //!    first;
 //! 2. `held` when another host's row (or a held row) holds the
 //!    `(repo, item)`, or when any other row holds the repo's
-//!    `champion_merge` step;
+//!    `champion_merge` step, or while a no-progress hold is in force on the
+//!    `(repo, item, step)` (below);
 //! 3. `not_eligible` when the step's role is not in the host's last reported
 //!    `roles_ok` (Phase 1 decides eligibility by `roles_ok` only; a step name
 //!    this build does not know has no role, so it is `not_eligible` too);
@@ -43,6 +44,24 @@
 //!    clamped by the fleet config, so a wrong report cannot hoard. A host
 //!    that has not heartbeated this epoch is bounded by `maxConcurrent`
 //!    alone, and refused when that is unknown too.
+//!
+//! # The no-progress cooldown (#12541)
+//!
+//! A step that ends without moving its item (a `release` whose outcome is
+//! not progress, [`release_progressed`]) leaves a fleet-wide hold on its
+//! `(repo, item, step)`: every host's next claim for it is refused `held`
+//! until the hold ends, so no host redraws an item another host just found
+//! nothing to do on. Each host's own outcome ledger cools the pair down too,
+//! but only locally; before this the next host drew it the moment the
+//! assignment was released, every ~90 s across the fleet. The hold escalates
+//! per consecutive no-progress release of the same triple
+//! ([`Policy::no_progress`]: 30 min, 2 h, 6 h, then 24 h), and a progressing
+//! release of **any** step on the item clears every hold on it (the item
+//! changed state, so the next step is a new question). The streak is
+//! forgotten once a hold has been over for the ladder's last rung.
+//!
+//! Soft, like every row: a captain restart forgets the holds, and the hosts'
+//! local ledgers are the only brake until the next no-progress release.
 //!
 //! # A claim on an item the host already holds
 //!
@@ -98,6 +117,39 @@ const CAP_RETRY_SECS: u64 = 30;
 /// `retry_after_s` of a `not_eligible` refusal.
 const NOT_ELIGIBLE_RETRY_SECS: u64 = 60;
 
+/// The default no-progress cooldown ladder (#12541): the hold after the
+/// first, second, third and every later consecutive no-progress release of
+/// one `(repo, item, step)`.
+pub const DEFAULT_NO_PROGRESS_LADDER: [Duration; 4] = [
+    Duration::from_secs(30 * 60),
+    Duration::from_secs(2 * 3600),
+    Duration::from_secs(6 * 3600),
+    Duration::from_secs(24 * 3600),
+];
+
+/// The `release` outcomes that moved the item: the step's `verdict` class
+/// (`proto::ReleaseRequest`), and the plain words a later client may send
+/// for the same thing. Everything else, including an unknown token, holds.
+pub const PROGRESS_OUTCOMES: [&str; 4] = ["verdict", "merged", "moved", "success"];
+
+/// The `release` outcome of a step that ended waiting on CI (Judge
+/// `ci_pending`, Champion `requeued`, #12551): neither progress nor a
+/// failure to find work. It arms [`Policy::ci_wait`], not the escalating
+/// ladder, and leaves the streak and the item's other holds alone.
+pub const CI_WAIT_OUTCOME: &str = "ci_wait";
+
+/// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
+/// the item every ~90 s while CI runs, short enough that its next step is
+/// drawn within minutes of CI finishing.
+pub const DEFAULT_CI_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// Whether a `release` with `outcome` moved its item (no cooldown).
+/// Conservative: only a clear success skips the hold.
+#[must_use]
+pub fn release_progressed(outcome: &str) -> bool {
+    PROGRESS_OUTCOMES.contains(&outcome.trim())
+}
+
 /// The table's timing knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
@@ -107,6 +159,29 @@ pub struct Policy {
     pub hold_ttl: Duration,
     /// The start-up grace window's upper bound.
     pub grace: Duration,
+    /// The no-progress cooldown ladder (module docs): rung `n` is the hold
+    /// after the `n+1`th consecutive no-progress release, the last rung
+    /// repeating. A zero rung arms no hold.
+    pub no_progress: [Duration; 4],
+    /// The flat hold after a [`CI_WAIT_OUTCOME`] release (#12551).
+    pub ci_wait: Duration,
+}
+
+impl Policy {
+    /// This policy with the no-progress ladder `ladder`.
+    #[must_use]
+    pub fn with_no_progress(mut self, ladder: [Duration; 4]) -> Self {
+        self.no_progress = ladder;
+        self
+    }
+
+    /// The hold after the `streak`th (1-based) consecutive no-progress
+    /// release.
+    #[must_use]
+    pub fn no_progress_hold(&self, streak: u32) -> Duration {
+        let i = usize::try_from(streak.saturating_sub(1)).unwrap_or(usize::MAX);
+        self.no_progress[i.min(self.no_progress.len() - 1)]
+    }
 }
 
 impl Policy {
@@ -124,6 +199,8 @@ impl Policy {
             assignment_ttl: lease + ASSIGNMENT_TTL_MARGIN,
             hold_ttl: lease,
             grace,
+            no_progress: DEFAULT_NO_PROGRESS_LADDER,
+            ci_wait: DEFAULT_CI_WAIT,
         }
     }
 }
@@ -134,6 +211,8 @@ impl Default for Policy {
             assignment_ttl: FORGE_LEASE_TTL + ASSIGNMENT_TTL_MARGIN,
             hold_ttl: FORGE_LEASE_TTL,
             grace: DEFAULT_GRACE,
+            no_progress: DEFAULT_NO_PROGRESS_LADDER,
+            ci_wait: DEFAULT_CI_WAIT,
         }
     }
 }
@@ -216,6 +295,15 @@ impl Expired {
     }
 }
 
+/// A no-progress hold on one `(repo, item, step)` (module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cooldown {
+    /// Claims for the triple are refused `held` until then.
+    pub until: Mono,
+    /// Consecutive no-progress releases of the triple.
+    pub streak: u32,
+}
+
 /// The assignment table. See the module docs.
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -227,6 +315,7 @@ pub struct Table {
     rows: BTreeMap<(String, u64), Row>,
     by_id: BTreeMap<String, (String, u64)>,
     hosts: BTreeMap<String, HostState>,
+    cooldowns: BTreeMap<(String, u64, String), Cooldown>,
     next_id: u64,
 }
 
@@ -250,6 +339,7 @@ impl Table {
             rows: BTreeMap::new(),
             by_id: BTreeMap::new(),
             hosts: BTreeMap::new(),
+            cooldowns: BTreeMap::new(),
             next_id: 0,
         }
     }
@@ -288,6 +378,16 @@ impl Table {
     pub fn row_by_id(&self, assignment_id: &str) -> Option<(&(String, u64), &Row)> {
         let key = self.by_id.get(assignment_id)?;
         self.rows.get_key_value(key)
+    }
+
+    /// The no-progress hold on `(repo, item, step)`, if one is in force at
+    /// `now`.
+    #[must_use]
+    pub fn cooldown(&self, now: Mono, repo: &str, item: u64, step: &str) -> Option<Cooldown> {
+        self.cooldowns
+            .get(&(repo.to_string(), item, step.to_string()))
+            .filter(|c| c.until > now)
+            .copied()
     }
 
     /// What the table last heard from `host`.
@@ -329,6 +429,10 @@ impl Table {
                 }
             }
         }
+        // A streak is forgotten once its hold has been over for the
+        // ladder's last rung (module docs), which also bounds the map.
+        let forget = self.policy.no_progress[self.policy.no_progress.len() - 1];
+        self.cooldowns.retain(|_, c| c.until.plus(forget) > now);
         expired
     }
 
@@ -412,6 +516,38 @@ impl Table {
         step: &str,
         max_concurrent: Option<u32>,
     ) -> ClaimDecision {
+        self.claim_traced(now, host, repo, item, step, max_concurrent)
+            .0
+    }
+
+    /// [`Self::claim`], plus whether a refusal came from the no-progress
+    /// hold itself (#12551), not from another host's live claim that merely
+    /// coexists with a hold.
+    pub fn claim_traced(
+        &mut self,
+        now: Mono,
+        host: &str,
+        repo: &str,
+        item: u64,
+        step: &str,
+        max_concurrent: Option<u32>,
+    ) -> (ClaimDecision, bool) {
+        let mut cooled = false;
+        let d = self.decide_claim(now, host, repo, item, step, max_concurrent, &mut cooled);
+        (d, cooled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decide_claim(
+        &mut self,
+        now: Mono,
+        host: &str,
+        repo: &str,
+        item: u64,
+        step: &str,
+        max_concurrent: Option<u32>,
+        cooled: &mut bool,
+    ) -> ClaimDecision {
         self.expire(now);
         if self.in_grace(now) {
             let end = self.started.plus(self.policy.grace);
@@ -438,6 +574,11 @@ impl Table {
                 return refused(RefusalReason::Held, row.host.clone(), retry);
             }
             replaces_own = true;
+        }
+        // The fleet-wide no-progress hold (#12541): whoever asks.
+        if let Some(c) = self.cooldown(now, repo, item, step) {
+            *cooled = true;
+            return refused(RefusalReason::Held, None, now.secs_until(c.until, 1));
         }
         let Ok(parsed) = step.parse::<StepRole>() else {
             return refused(RefusalReason::NotEligible, None, NOT_ELIGIBLE_RETRY_SECS);
@@ -530,13 +671,72 @@ impl Table {
         RefuseOutcome::Dropped
     }
 
-    /// Apply `host`'s `release` of `assignment_id`. `true` when the row was
-    /// this host's and is now gone.
+    /// Apply `host`'s `release` of `assignment_id` as a progressing one (no
+    /// cooldown). `true` when the row was this host's and is now gone.
     pub fn release(&mut self, host: &str, assignment_id: &str) -> bool {
         match self.own_key(host, assignment_id) {
             Some(key) => self.remove(&key).is_some(),
             None => false,
         }
+    }
+
+    /// Apply `host`'s `release` of `assignment_id` with the step's
+    /// `outcome` at `now`: drop the row, then clear the item's holds when
+    /// the outcome moved it ([`release_progressed`]), or arm the next rung
+    /// of the no-progress hold on its `(repo, item, step)` when it did not
+    /// (module docs). `true` when the row was this host's and is now gone.
+    pub fn release_outcome(
+        &mut self,
+        now: Mono,
+        host: &str,
+        assignment_id: &str,
+        outcome: &str,
+    ) -> bool {
+        let Some(key) = self.own_key(host, assignment_id) else {
+            return false;
+        };
+        let Some(row) = self.remove(&key) else {
+            return false;
+        };
+        let (repo, item) = key;
+        if outcome.trim() == CI_WAIT_OUTCOME {
+            let triple = (repo, item, row.step);
+            let until = now.plus(self.policy.ci_wait);
+            let prior = self.cooldowns.get(&triple).copied();
+            if !self.policy.ci_wait.is_zero() && prior.is_none_or(|c| c.until < until) {
+                self.cooldowns.insert(
+                    triple,
+                    Cooldown {
+                        until,
+                        streak: prior.map_or(0, |c| c.streak),
+                    },
+                );
+            }
+            return true;
+        }
+        if release_progressed(outcome) {
+            self.cooldowns
+                .retain(|(r, i, _), _| !(*r == repo && *i == item));
+            return true;
+        }
+        let triple = (repo, item, row.step);
+        let streak = self
+            .cooldowns
+            .get(&triple)
+            .map_or(0, |c| c.streak)
+            .saturating_add(1);
+        let hold = self.policy.no_progress_hold(streak);
+        if hold.is_zero() {
+            return true;
+        }
+        self.cooldowns.insert(
+            triple,
+            Cooldown {
+                until: now.plus(hold),
+                streak,
+            },
+        );
+        true
     }
 
     fn own_key(&self, host: &str, assignment_id: &str) -> Option<(String, u64)> {

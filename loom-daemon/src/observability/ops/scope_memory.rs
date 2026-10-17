@@ -10,7 +10,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
-use crate::ram_peaks::{classify_limit_from_env, scope_role, EndedScope, LimitSource};
+use crate::ram_peaks::{classify_limit_resolved, scope_role, EndedScope, LimitSource};
 use crate::telemetry::kinds::scope_memory::ScopeMemoryRecord;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::provenance::Provenance;
@@ -79,7 +79,7 @@ pub fn emit(e: &EndedScope, root: Option<&Path>) {
             .or_else(|| super::dispatch_facts::fallback_repo_ref(root))
             .map(|r| (r.repo, r.visibility))
     });
-    let r = record(e, classify_limit_from_env(e.limit_bytes), repo, Utc::now());
+    let r = record(e, classify_limit_resolved(e.limit_bytes, root), repo, Utc::now());
     if let Some(point) = oom_kill_point(&r) {
         super::emit_metrics(vec![point]);
     }

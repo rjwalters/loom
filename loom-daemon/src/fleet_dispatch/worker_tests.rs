@@ -84,12 +84,14 @@ fn a_grant_carries_its_assignment_and_a_refusal_its_reason() {
         ("held", RefusalReason::Held),
         ("not_eligible", RefusalReason::NotEligible),
         ("cap", RefusalReason::Cap),
+        ("cooldown", RefusalReason::Cooldown),
     ] {
         let server = refusing(wire);
         enable(dir.path(), &server.url(), true);
         assert_eq!(claim(dir.path(), 7, StepRole::Judge), Ask::Refused(reason));
     }
     assert_eq!(refusal_token(RefusalReason::Held), "captain_held");
+    assert_eq!(refusal_token(RefusalReason::Cooldown), "captain_cooldown");
 }
 
 /// `grace` claims as today and leaves the failure run alone: two failures,

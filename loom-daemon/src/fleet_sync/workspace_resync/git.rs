@@ -312,6 +312,12 @@ pub(super) fn resync_message(host: &str, version: &str) -> String {
     )
 }
 
+/// The branch a resync proposes itself on when the default branch refuses a
+/// direct push (#12572). One per version, so a retry finds its own PR.
+pub(super) fn resync_branch(version: &str) -> String {
+    format!("chore/loom-resync-v{version}")
+}
+
 /// The daemon resync commits among the last [`HISTORY_DEPTH`] commits reachable
 /// from `commit`, newest first. Local: the history is already in the clone.
 pub(super) fn past_resyncs(root: &Path, commit: &str) -> Result<Vec<PastResync>> {

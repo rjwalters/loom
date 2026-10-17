@@ -27,10 +27,13 @@ struct FakeForge {
     /// Latest `loom/merge-authorization` status per commit.
     head_status: RefCell<std::collections::HashMap<String, StatusState>>,
     status_fails: Cell<bool>,
+    /// The writer credential lacks `statuses: write` ([`StatusApi::can_post_statuses`]).
+    cannot_post: Cell<bool>,
     /// GitHub only enqueues a PR whose required check is green on its head.
     require_head_status: Cell<bool>,
     dequeue_fails: Cell<bool>,
     revoke_on_enqueue: Cell<bool>,
+    enqueue_fails: Cell<bool>,
 }
 
 impl FakeForge {
@@ -43,9 +46,11 @@ impl FakeForge {
             check: RefCell::new(None),
             head_status: RefCell::new(std::collections::HashMap::new()),
             status_fails: Cell::new(false),
+            cannot_post: Cell::new(false),
             require_head_status: Cell::new(true),
             dequeue_fails: Cell::new(false),
             revoke_on_enqueue: Cell::new(false),
+            enqueue_fails: Cell::new(false),
         }
     }
     fn read_facts(&self) -> Result<AuthzFacts, String> {
@@ -86,6 +91,12 @@ impl StatusApi for FakeForge {
         self.head_status.borrow_mut().insert(commit.into(), s);
         Ok(())
     }
+    fn can_post_statuses(&self) -> Result<(), String> {
+        if self.cannot_post.get() {
+            return Err("installation has `statuses: read`".into());
+        }
+        Ok(())
+    }
 }
 
 impl QueueApi for FakeForge {
@@ -107,6 +118,11 @@ impl QueueApi for FakeForge {
         })
     }
     fn enqueue(&self, _pr: u32, _n: &str, expected: &str) -> Result<EnqueueAck, QueueError> {
+        if self.enqueue_fails.get() {
+            return Err(QueueError::Forge {
+                detail: "502 transient".into(),
+            });
+        }
         let green = self.head_status.borrow().get(expected) == Some(&StatusState::Success);
         if self.require_head_status.get() && !green {
             return Err(QueueError::Forge {
@@ -423,6 +439,18 @@ fn rolled_back_handoff_withdraws_the_head_success() {
 }
 
 #[test]
+fn transient_enqueue_failure_leaves_pending_not_failure_and_retry_enqueues() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.enqueue_fails.set(true);
+    let e = handoff(&f, &s).unwrap_err();
+    assert!(matches!(e, HandoffError::Enqueue(_)), "{e:?}");
+    assert_eq!(s.get(PR).unwrap(), None, "grant revoked");
+    assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Pending));
+    f.enqueue_fails.set(false);
+    assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::Enqueued { .. })));
+}
+
+#[test]
 fn a_new_head_never_inherits_the_old_success() {
     let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
     handoff(&f, &s).unwrap();
@@ -438,4 +466,63 @@ fn handoff_at(
 ) -> Result<EnqueueOutcome, HandoffError> {
     // Facts still approve SHA1 only: evaluation denies a moved head.
     authorize_and_enqueue(MergeMode::Queue, true, f, store, f, &|| f.read_facts(), PR, sha)
+}
+
+// ---- #12579: idempotent handoff and the writer preflight
+
+#[test]
+fn queued_head_with_a_live_grant_is_a_noop_even_for_a_writer_that_cannot_post() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::Enqueued { .. })));
+    f.cannot_post.set(true);
+    f.status_fails.set(true);
+    f.head_status.borrow_mut().clear();
+    // The grant was written by another identity; its case differs.
+    s.put(Grant {
+        pr: PR,
+        approved_sha: SHA1.to_ascii_uppercase(),
+    })
+    .unwrap();
+    assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::AlreadyQueued { .. })));
+    assert!(f.queued.borrow().is_some(), "still queued");
+    assert!(s.get(PR).unwrap().is_some(), "grant not revoked");
+    assert!(f.head_status.borrow().is_empty(), "no status written");
+}
+
+#[test]
+fn writer_that_cannot_post_refuses_before_any_grant_or_revoke() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.cannot_post.set(true);
+    let e = handoff(&f, &s).unwrap_err();
+    assert!(
+        matches!(&e, HandoffError::WriterCannotPostStatuses(d) if d.contains("statuses")),
+        "{e:?}"
+    );
+    assert_eq!(s.get(PR).unwrap(), None, "no grant written");
+    assert!(f.head_status.borrow().is_empty(), "no status written");
+}
+
+#[test]
+fn queued_entry_without_a_grant_is_not_dequeued_by_a_writer_that_cannot_post() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    *f.queued.borrow_mut() = Some(SHA1.into());
+    f.cannot_post.set(true);
+    assert!(matches!(
+        handoff(&f, &s).unwrap_err(),
+        HandoffError::WriterCannotPostStatuses(_)
+    ));
+    assert!(f.queued.borrow().is_some(), "the PR stays queued");
+}
+
+#[test]
+fn grant_for_another_head_is_not_a_noop() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    *f.queued.borrow_mut() = Some(SHA1.into());
+    s.put(Grant {
+        pr: PR,
+        approved_sha: "f".repeat(40),
+    })
+    .unwrap();
+    assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::AlreadyQueued { .. })));
+    assert_eq!(s.get(PR).unwrap().unwrap().approved_sha, SHA1, "re-granted for the head");
 }

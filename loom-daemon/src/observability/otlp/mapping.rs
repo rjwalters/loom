@@ -24,6 +24,7 @@ mod pick_decision;
 mod prompt_tree;
 mod role_draw;
 mod roster_change;
+mod run_state_request;
 mod scope_memory;
 mod session_output;
 mod token_ranking;
@@ -622,6 +623,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::DaemonExit(_)
+        | TelemetryRecord::RunStateRequest(_)
         | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
@@ -638,6 +640,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
                 .or_else(|| daemon_exit::log_parts(r))
+                .or_else(|| run_state_request::log_parts(r))
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))?;
             time_unix_nano = parts.source_at;

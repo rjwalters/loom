@@ -215,10 +215,11 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
 | [`host.status`](#hoststatus) | gauges, OTLP only | `host_status.rs` (sampler), `observability/collector.rs`, `observability/otlp/mapping/host_status.rs` |
-| [`operator.presence`](#operatorpresence) | log, OTLP only (journal-buffered) | `loom-daemon presence beat` (opt-in operator hook) → `observability/otlp/mapping/operator_presence.rs` |
+| [`operator.presence`](#operatorpresence) | log, OTLP only | none (#12121): no producer exists; the kind and its mapping remain for old rows → `observability/otlp/mapping/operator_presence.rs` |
 | [`checkout.freshness`](#checkoutfreshness) | log, OTLP only | `fleet_sync/checkout_ff` pass → `observability/otlp/mapping/checkout_freshness.rs` |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | [`roster.change`](#rosterchange) | log, OTLP only | `fleet_sync/roster_clone.rs` |
+| [`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart) | log, OTLP only | `ipc.rs` (`handle_client` run-state verbs), `observability/run_state_request.rs` |
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` Deny branch) |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
@@ -2196,7 +2197,7 @@ GitHub rate limit (Issue #10022):
 | `loom.feed.reconcile_passes` | delta `Sum` | `{pass}`; label `outcome` | merge-reconciliation ticks of the narration sink that had a workspace to visit (#12152), by `outcome`: `ran` (the forge answered; the workspace's watermark advanced), `deferred` (the rate-limit breaker was cooling; the tick is not spent and the workspace catches up from its watermark later) or `failed` (the forge read failed; the watermark holds). Accumulated only while an ops sink is registered |
 | `loom.ci.queue_depth` | `Gauge` | `{run}`; label `repo` | workflow runs with `status == "queued"` in the page the CI telemetry poll fetched for the repo (#11993), one point per repo per cycle (`0` when none), counted from the run listing `poll_repo` already reads, so it adds no GitHub request. A run older than the rescan floor that is still queued is not counted. Fleet CI contention at that instant, beside the per-run `loom.ci.queued_ms` on `ci.run` / `ci.job` |
 | `loom.fleet_dispatch.fallback_ticks` | `DeltaCounter` | `{tick}`; label `reason` | step ticks a fleet-dispatch worker ran in fallback (Issue #12450), `reason` the failed call's token that entered it (`transport`, `status_5xx`, `status_4xx`, `malformed`). Fallback ticks draw one round with no free `claim_lost`. Host-level: the resource names the host |
-| `loom.fleet_dispatch.refusals` | `Sum` (delta) | `{claim}`; labels `kind` (`claim` / `refuse`), `reason` | claims the captain refused, by reason (`held` / `grace` / `not_eligible` / `cap`), and workers' `refuse` calls, by token (#12449) |
+| `loom.fleet_dispatch.refusals` | `Sum` (delta) | `{claim}`; labels `kind` (`claim` / `refuse`), `reason` | claims the captain refused, by reason (`held` / `grace` / `not_eligible` / `cap`, and `no_progress_cooldown` for a refusal by a no-progress hold, #12541; the wire reason is `cooldown`, #12551), and workers' `refuse` calls, by token (#12449) |
 | `loom.fleet_dispatch.expired` | `Sum` (delta) | `{assignment}`; label `kind` (`assignment` / `hold`) | captain rows that reached their TTL: a granted or live row nobody renewed, released or refused, or a `claim_lost` hold that ran out (#12449) |
 | `loom.fleet_dispatch.claim_lost_after_grant` | `Sum` (delta) | `{claim}` | grants whose worker then lost the forge order (`refuse` with `claim_lost`): the split-brain and attended-claim measure (#12449) |
 
@@ -3630,70 +3631,17 @@ SigNoz: `attributes_string['loom.kind'] = 'checkout.freshness'`, grouped by
 
 ### `operator.presence`
 
-Whether a person is at the keyboard of an operator session (Issue #11563).
-ETA could not tell operator-driven work that stalls (the operator stepped away)
-from work that is merely slow, and in-session `/loom:sweep` runs on
-workstations with no daemon emitted nothing. Envelopes carry
-`schema_version: 12`. **Carried over OTLP** (`otlp: Logs`, `native: false`) now
-that #11525 settled the transport direction (direct OTLP, the same path as every
-other fact). `observability/otlp/mapping/operator_presence.rs` maps the
-`loom.presence.*` scalars (`session_id`, `operator`, `last_input_at`,
-`last_activity_at`, `driving_count`) as attributes and carries the record's JSON
-(including `driving[]`) as the body; `host` rides on the Resource as `host.id`.
-The local journal stays the durable buffer (see **Transport and journal**
-below): `presence export` maps each pending envelope through this sibling once a
-`Transport` is wired, so a beat taken while the transport is unreachable is
-never lost. Wiring that sender into `presence export` on each daemonless host is
-#11525's remaining host-provisioning follow-up.
+**No longer emitted (#12121).** The daemon records telemetry for its own work
+and nothing else: it does not read interactive session transcripts, and
+outside sessions do not send telemetry through it. The `presence-beat.sh` hook
+and the `loom-daemon presence …` subcommands that used to emit this record are
+removed, and nothing replaces them. The kind, its OTLP mapping and the
+`loom.presence.*` attribute allowlist stay so rows already in a backend still
+decode.
 
-**No prompt or transcript content, by construction.** The record has no text
-field beyond ids and a forge login, and the producer reads only `session_id`
-and `hook_event_name` from the hook payload. A test asserts a distinctive
-prompt string appears in neither the journal nor the state file.
-
-| Field | Type | Notes |
-|---|---|---|
-| `captured_at` | RFC3339 | the beat time; the record time |
-| `host` | string | the session's host |
-| `session_id` | string | opaque Claude Code session id |
-| `operator` | string? | forge login (`--operator` / `LOOM_OPERATOR`); omitted when unknown |
-| `last_input_at` | RFC3339? | last `UserPromptSubmit` (a human typed); omitted when none seen |
-| `last_activity_at` | RFC3339 | last tool call or Stop |
-| `driving[]` | array | issues/PRs this session holds an in-session lease on: `kind` (`issue`/`pr`), `number`, `sweep_id` |
-
-**Producer.** `loom-daemon presence beat`, called by the hook
-`presence-beat.sh` on `UserPromptSubmit`, `PostToolUse` and `Stop`. A prompt
-always emits; other events emit at most once per 5 minutes. The hook is wired
-by the installer/resync when the fleet key `operatorPresence.enabled` (or
-`LOOM_OPERATOR_PRESENCE=1`) says so, and is absent otherwise; on `Stop` the
-journal is flushed to OTLP with no daemon running. See
-[`operator-presence.md`](operator-presence.md).
-
-**In-session sweeps.** `loom-daemon presence sweep-start` / `sweep-outcome`
-journal `sweep.started` / `sweep.outcome` with `loom.dispatch_origin=operator`
-and the `sweep_id` that appears in the in-session lease comment. With
-`LOOM_OPERATOR_PRESENCE=1`, `lease ensure` calls `sweep-start` itself once the
-lease is publishing, and the sweep's own end emits `sweep.outcome` with no
-extra step: `sweep-checkpoint.sh delete` (the merge's terminal step, or an
-issue found closed) reports `success` with the checkpoint's PR; the renewal
-loop stopping on a closed issue reports `success`; `sweep-lease-renew.sh
-release` while the sweep is still driven reports `failure` (it ended without
-landing). Only a lease this host journaled `sweep.started` for is finished,
-once: the first end signal wins and later ones are no-ops, so a
-daemon-dispatched sweep never gets one. `sweep-outcome` stays available as an
-explicit call.
-
-**Transport and journal.** Until the transport of #11525 exists, every fact is
-appended to `.loom/logs/operator-presence.jsonl` (override
-`LOOM_OPERATOR_PRESENCE_JOURNAL_PATH`) as one `TelemetryEnvelope` line. The
-journal never rotates and never drops: `loom-daemon presence export` stages it,
-hands the whole batch to the transport, and deletes staged files only after the
-transport accepted them. With no transport it reports the pending count and
-leaves everything in place; unparseable lines go to `<journal>.rejected`.
-The hook path is fail-open and discards output, so a failed journal or state
-write is appended (one `<timestamp>\t<error>` line) to the breadcrumb file
-beside the journal, `.loom/logs/operator-presence.errors`;
-`loom-daemon presence status` prints its count and last line.
+Operator activity is **inferred by consumers**, not emitted: an item (issue or
+PR) that advanced with no daemon span covering it was moved by an operator
+session. See [`operator-presence.md`](operator-presence.md).
 
 ### `checkout.external_change`
 
@@ -4014,9 +3962,20 @@ not validate is not exported. Both OTLP timestamps are `observed_at`.
 **OTLP.** Severity is WARN for `requested_by=unknown`, INFO otherwise.
 Attributes: `loom.daemon_exit.signal` / `exit_code` / `requested_by` /
 `relaunch_expected` / `supervisor` / `in_flight_count` / `in_flight_sweeps`
-(comma-joined) / `in_flight_fate` / `uptime_s`
+(comma-joined) / `in_flight_fate` / `uptime_s` / `request_id` / `request_verb`
+/ `caused_by_request_id`
 (`DAEMON_EXIT_LOG_ATTRIBUTE_KEYS`, kept by the collector's `transform/privacy`
 `keep_keys`, contract-tested).
+
+**Request link (#12546).** `request_id` and `request_verb` name the
+[`daemon.run_state_request`](#daemonrun_state_request--who-asked-the-daemon-to-pause-drain-stop-or-restart)
+that caused an IPC exit (`ipc-restart`, `ipc-shutdown`, a drain). A SIGTERM
+that arrives within 15 minutes of an *accepted* stop or drain request is
+explained by the daemon's own state: `requested_by` stays `unknown` (the signal
+names no sender) but `caused_by_request_id` and `request_verb` are set. An
+`abort-drain` clears the pending request, and a SIGTERM outside the window
+carries none of the three fields. All three are absent when no request is
+linked.
 
 **Exits that cannot emit.** SIGKILL, the OOM killer, a crash and power loss run
 no code. A host whose `daemon.start` is not preceded by a `daemon.exit` was
@@ -4025,6 +3984,40 @@ and the synchronous `Request::Shutdown` arm in `ipc.rs`, which is unreachable
 because `shutdown::intercept` handles the request first. An exit while the
 exporter is unreachable still completes within the funnel's 2 s flush budget;
 the record then stays queued for the next start.
+
+
+### `daemon.run_state_request` — who asked the daemon to pause, drain, stop, or restart
+
+One OTLP log per run-state IPC request (Issue #12546), emitted when the daemon
+**receives** it: `drain` (`DrainAndRestartDaemon`), `abort-drain`,
+`pause-then-exit` (`restart --pause --then-exit`), `restart` and `shutdown`.
+Envelopes carry `schema_version: 12`. **OTLP-only** (`native: false`), always
+on when OTLP export is on. Exempt from the per-kind silence check: a quiet
+host runs no such verb.
+
+The JSON body contains `request_id` (what `daemon.exit` quotes), `verb`,
+`flags` (`name=value`, e.g. `then_exit=true`; empty for verbs without any),
+`caller_pid` / `caller_uid` (the IPC socket's peer credentials, where the
+platform exposes them), `caller_comm` (the caller's process name),
+`caller_chain` (parent process names, nearest first, at most 8),
+`caller_internal` (true when the caller is the daemon itself, its parent, pid
+1 or a `systemd` / `launchd` process: the supervisor or auto-update path, not an
+operator), `host_id`, `observed_at` and standard `loom` build provenance; a
+record whose provenance does not validate is not exported.
+
+**Names only.** The caller is identified by `/proc/<pid>/comm`; **argv and the
+environment are never read**, because argv can hold secrets. Capture is best
+effort and never fails the request: where peer credentials or `/proc` are
+unavailable (macOS has no `/proc`) the fields are absent and the verb proceeds.
+The caller's own `systemctl` is not resolved for a later SIGTERM; that exit is
+linked through `daemon.exit` instead.
+
+**OTLP.** Severity is INFO. Attributes: `loom.run_state.request_id` / `verb` /
+`flags` (comma-joined) / `caller_pid` / `caller_uid` / `caller_comm` /
+`caller_chain` (`>`-joined) / `caller_internal` / `host_id`
+(`RUN_STATE_REQUEST_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested). Both OTLP timestamps are
+`observed_at`.
 
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused

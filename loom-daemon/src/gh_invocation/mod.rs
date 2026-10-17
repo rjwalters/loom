@@ -320,6 +320,9 @@ pub struct GhInvocation {
     stdin_input: Vec<u8>,
     /// Never route this read to a reader App (#9872).
     writer_only: bool,
+    /// This read may never run on the ambient writer credential (#12555):
+    /// [`GhInvocation::reader_only`].
+    reader_only: bool,
     /// The identity role the accounting row records; `None` = writer.
     role: Option<crate::forge_identity::IdentityRole>,
     /// The #9777 call identity this execution is accounted under (#9831).
@@ -374,6 +377,7 @@ impl GhInvocation {
             stripped_env: Vec::new(),
             stdin_input: Vec::new(),
             writer_only: false,
+            reader_only: false,
             role: None,
             identity: crate::forge_call_stats::CallIdentity::default(),
             route_slug: None,
@@ -510,9 +514,55 @@ impl GhInvocation {
     /// Keep this read on the writer credential (#9872): for a read whose
     /// answer depends on **who** asks — a permission or write-scope probe,
     /// `viewer`, `/user` — which a reader App would answer for itself.
+    ///
+    /// Has no effect on a [`GhInvocation::reader_only`] read: those can
+    /// never be pinned to the writer (#12555).
     #[must_use]
     pub fn writer_identity(mut self) -> Self {
-        self.writer_only = true;
+        self.writer_only = !self.reader_only;
+        self
+    }
+
+    /// This read is served by a reader App or the read gateway, or shed — it
+    /// never runs on the ambient writer credential (#12555, the #12394
+    /// ruling: "the writer should not be used for reads"). Set by the
+    /// in-process daemon read helpers (`claim_reconciliation::gh_call::read`,
+    /// `SweepRegistry::gh_inv(.., AccessIntent::Read, ..)`).
+    ///
+    /// - [`GhInvocation::writer_identity`] is ignored, before or after this.
+    /// - A read the facade cannot route to a reader (no repo derivable, or
+    ///   the checkout's sources disagree) is shed with the usual
+    ///   `forge.read.shed` telemetry instead of being sent to the writer.
+    /// - The one exception is the one [`GhInvocation::execute`] already
+    ///   makes for every read: a host with **no reader pool and no gateway at
+    ///   all**, where the writer is the only credential there is.
+    /// - A credential the site chose itself
+    ///   ([`GhInvocation::gh_config_dir`], [`GhInvocation::identity_role`])
+    ///   is left alone.
+    ///
+    /// Meaningful for [`AccessIntent::Read`] only.
+    #[must_use]
+    pub fn reader_only(mut self) -> Self {
+        self.reader_only = true;
+        self.writer_only = false;
+        self
+    }
+
+    /// Whether [`GhInvocation::reader_only`] is set.
+    #[must_use]
+    pub fn is_reader_only(&self) -> bool {
+        self.reader_only
+    }
+
+    /// Name the repository this read is about when its argv does not (a
+    /// GraphQL query with a literal owner and name): the reader attempt is
+    /// routed for `slug`, exactly like a derived route (W4-C). Never changes
+    /// the target, so a writer attempt's environment is unchanged. For a
+    /// read only: the derivation's mutation guard does not see a GraphQL
+    /// document, so never set it on a `mutation`.
+    #[must_use]
+    pub fn reader_repo(mut self, slug: &str) -> Self {
+        self.route_slug = Some(slug.to_string());
         self
     }
 
@@ -913,6 +963,10 @@ impl GhInvocation {
 #[cfg(test)]
 #[path = "test_routing.rs"]
 pub(crate) mod test_routing;
+
+#[cfg(test)]
+#[path = "test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "w4c_sites_tests.rs"]

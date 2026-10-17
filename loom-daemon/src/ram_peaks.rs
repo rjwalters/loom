@@ -196,7 +196,6 @@ impl From<(u64, u64)> for ScopeSample {
 pub enum LimitSource {
     Env,
     /// An explicit limit from the `autonomous.agentMemoryMax` config key.
-    /// Not produced yet: see [`classify_limit`].
     Config,
     History,
     Floor,
@@ -222,45 +221,56 @@ pub const SCOPE_LIMIT_DEFAULT_FLOOR_MB: u64 = 4096;
 const MIB: u64 = 1024 * 1024;
 
 /// Classify an applied scope limit: no limit is `none`; a limit equal to the
-/// explicit MiB value (`explicit_mb`, from `LOOM_SWEEP_MEMORY_MAX`) is `env`;
-/// one equal to the floor is `floor`; any other is `history` (derived from the
-/// repo's peak).
-///
-/// TODO(#12246): once `autonomous.agentMemoryMax` lands
-/// (`loom_daemon::ram_scope_limit::resolve_process`), an explicit value that
-/// came from a config tier should classify as [`LimitSource::Config`].
+/// explicit MiB value (`explicit`, with the [`LimitSource`] it came from:
+/// `env` for `LOOM_SWEEP_MEMORY_MAX`, `config` for `autonomous.agentMemoryMax`)
+/// is that source; one equal to the floor is `floor`; any other is `history`
+/// (derived from the repo's peak).
 #[must_use]
 pub fn classify_limit(
     limit_bytes: Option<u64>,
-    explicit_mb: Option<u64>,
+    explicit: Option<(u64, LimitSource)>,
     floor_mb: u64,
 ) -> LimitSource {
     let Some(limit) = limit_bytes else {
         return LimitSource::None;
     };
     let mb = limit / MIB;
-    if limit % MIB == 0 && explicit_mb == Some(mb) {
-        LimitSource::Env
-    } else if limit % MIB == 0 && mb == floor_mb {
-        LimitSource::Floor
-    } else {
-        LimitSource::History
+    match explicit {
+        Some((explicit_mb, source)) if limit % MIB == 0 && explicit_mb == mb => source,
+        _ if limit % MIB == 0 && mb == floor_mb => LimitSource::Floor,
+        _ => LimitSource::History,
     }
 }
 
-/// [`classify_limit`] against this process's `LOOM_SWEEP_MEMORY_MAX` and
-/// `LOOM_SWEEP_MEMORY_MAX_MIN_MB` (the daemon's env is the env
-/// `spawn-claude.sh` and `ram-scope-limit` inherit).
+/// [`classify_limit`] against the settings `ram-scope-limit` resolved for
+/// `workspace` (env, then the config tiers; see
+/// [`crate::ram_scope_limit::resolve`]) -- the daemon's env is the env
+/// `spawn-claude.sh` and `ram-scope-limit` inherit. Without a workspace the
+/// daemon's own ([`crate::ram_scope_limit::DAEMON_WORKSPACE_ENV`]) is used.
 #[must_use]
-pub fn classify_limit_from_env(limit_bytes: Option<u64>) -> LimitSource {
-    let get = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
+pub fn classify_limit_resolved(limit_bytes: Option<u64>, workspace: Option<&Path>) -> LimitSource {
+    let resolved = match workspace {
+        Some(w) => crate::ram_scope_limit::resolve_process(w),
+        None => {
+            let daemon = std::env::var_os(crate::ram_scope_limit::DAEMON_WORKSPACE_ENV)
+                .map_or_else(|| PathBuf::from("."), PathBuf::from);
+            crate::ram_scope_limit::resolve_process(&daemon)
+        }
     };
-    let explicit = get("LOOM_SWEEP_MEMORY_MAX").filter(|&v| v > 0);
-    let floor = get("LOOM_SWEEP_MEMORY_MAX_MIN_MB").unwrap_or(SCOPE_LIMIT_DEFAULT_FLOOR_MB);
-    classify_limit(limit_bytes, explicit, floor)
+    classify_resolved(limit_bytes, &resolved)
+}
+
+fn classify_resolved(
+    limit_bytes: Option<u64>,
+    resolved: &crate::ram_scope_limit::Resolved,
+) -> LimitSource {
+    use crate::ram_scope_limit::{MaxMode, Source};
+    let explicit = match (&resolved.max.value, &resolved.max.source) {
+        (MaxMode::Mib(mb), Source::Env(_)) => Some((*mb, LimitSource::Env)),
+        (MaxMode::Mib(mb), Source::Config(..)) => Some((*mb, LimitSource::Config)),
+        _ => None,
+    };
+    classify_limit(limit_bytes, explicit, resolved.floor_mb.value)
 }
 
 /// The role an ended scope ran: the live role run's role
@@ -1199,12 +1209,39 @@ mod tests {
     #[test]
     fn classify_limit_names_its_source() {
         let mib = 1024 * 1024;
-        assert_eq!(classify_limit(None, Some(4096), 4096), LimitSource::None);
-        assert_eq!(classify_limit(Some(6000 * mib), Some(6000), 4096), LimitSource::Env);
+        let env = |mb| Some((mb, LimitSource::Env));
+        let cfg = |mb| Some((mb, LimitSource::Config));
+        assert_eq!(classify_limit(None, env(4096), 4096), LimitSource::None);
+        assert_eq!(classify_limit(Some(6000 * mib), env(6000), 4096), LimitSource::Env);
+        assert_eq!(classify_limit(Some(6000 * mib), cfg(6000), 4096), LimitSource::Config);
         assert_eq!(classify_limit(Some(4096 * mib), None, 4096), LimitSource::Floor);
         assert_eq!(classify_limit(Some(8452 * mib), None, 4096), LimitSource::History);
-        // An explicit env value that is not the applied one is not the source.
-        assert_eq!(classify_limit(Some(8452 * mib), Some(6000), 4096), LimitSource::History);
+        // An explicit value that is not the applied one is not the source.
+        assert_eq!(classify_limit(Some(8452 * mib), env(6000), 4096), LimitSource::History);
+        assert_eq!(classify_limit(Some(8452 * mib), cfg(6000), 4096), LimitSource::History);
+    }
+
+    #[test]
+    fn classify_limit_resolved_reads_the_config_tier() {
+        use crate::ram_scope_limit::{resolve, MAX_ENV};
+        let mib = 1024 * 1024;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".loom")).unwrap();
+        std::fs::write(
+            d.path().join(".loom/config.json"),
+            r#"{"autonomous":{"agentMemoryMax":6000}}"#,
+        )
+        .unwrap();
+        let none = |_: &str| None;
+        let r = resolve(d.path(), &none);
+        assert_eq!(classify_resolved(Some(6000 * mib), &r), LimitSource::Config);
+        // Env wins over config and is labelled `env`.
+        let env = |k: &str| (k == MAX_ENV).then(|| "7000".to_string());
+        let r = resolve(d.path(), &env);
+        assert_eq!(classify_resolved(Some(7000 * mib), &r), LimitSource::Env);
+        // `auto` (no explicit value) stays history-derived.
+        let r = resolve(tempfile::tempdir().unwrap().path(), &none);
+        assert_eq!(classify_resolved(Some(8452 * mib), &r), LimitSource::History);
     }
 
     #[test]

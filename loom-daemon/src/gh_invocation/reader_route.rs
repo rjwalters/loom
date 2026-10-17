@@ -149,3 +149,7 @@ mod v2_tests;
 #[cfg(test)]
 #[path = "reader_route_gateway_tests.rs"]
 mod gateway_tests;
+
+#[cfg(test)]
+#[path = "reader_only_tests.rs"]
+mod reader_only_tests;

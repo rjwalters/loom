@@ -142,10 +142,22 @@ fn member_grant(store: &dyn GrantStore, m: &Member) -> Result<Grant, DenyReason>
     Ok(grant)
 }
 
+/// A member's live state as [`group_check`] needs it: an open PR's
+/// authorization facts, or the fact that it already merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberFacts {
+    Open(AuthzFacts),
+    /// Merged into the base; `head` is the PR head at merge. It satisfies the
+    /// group only if it equals the head the group commit was built from.
+    Merged {
+        head: String,
+    },
+}
+
 fn member_denials(
     store: &dyn GrantStore,
     m: &Member,
-    facts_for: &dyn Fn(u32) -> Result<AuthzFacts, String>,
+    facts_for: &dyn Fn(u32) -> Result<MemberFacts, String>,
 ) -> Vec<DenyReason> {
     let grant = match member_grant(store, m) {
         Ok(g) => g,
@@ -153,7 +165,15 @@ fn member_denials(
     };
     match facts_for(m.pr) {
         Err(e) => vec![DenyReason::StoreUnavailable(e)],
-        Ok(f) => match evaluate(&f, &grant.approved_sha) {
+        // A predecessor that already merged at the group's head has landed
+        // exactly what the group carries; it no longer needs a grant. A merge
+        // at any other head is not what the group was built from: fail closed.
+        Ok(MemberFacts::Merged { head }) if head.eq_ignore_ascii_case(&m.head) => Vec::new(),
+        Ok(MemberFacts::Merged { head }) => vec![DenyReason::GrantForOtherHead {
+            granted: head,
+            actual: m.head.clone(),
+        }],
+        Ok(MemberFacts::Open(f)) => match evaluate(&f, &grant.approved_sha) {
             AuthzDecision::Authorized => Vec::new(),
             AuthzDecision::Denied(why) => why,
         },
@@ -178,7 +198,7 @@ pub fn group_check(
     store: &dyn GrantStore,
     group: &MergeGroup,
     others: Result<Vec<(String, CheckState)>, String>,
-    facts_for: &dyn Fn(u32) -> Result<AuthzFacts, String>,
+    facts_for: &dyn Fn(u32) -> Result<MemberFacts, String>,
 ) -> GroupConclusion {
     if group.members.is_empty() {
         return GroupConclusion::Failure(vec![(
@@ -238,6 +258,9 @@ pub enum StatusState {
     Failure,
 }
 
+/// GitHub truncates a status description to this many characters.
+pub const STATUS_DESCRIPTION_MAX: usize = 140;
+
 /// The commit-status write. GitHub keeps the newest status per context, so a
 /// `failure` posted after a `success` replaces it.
 pub trait StatusApi {
@@ -250,6 +273,22 @@ pub trait StatusApi {
         state: StatusState,
         description: &str,
     ) -> Result<(), String>;
+
+    /// Whether the writer credential can post commit statuses, established
+    /// without writing one. The handoff asks before it grants or revokes
+    /// anything, so a credential that cannot post is a no-op rather than a
+    /// rollback of another identity's grant (#12579).
+    ///
+    /// The default is `Ok`: a seam that cannot tell leaves the post itself to
+    /// fail, as before.
+    ///
+    /// # Errors
+    ///
+    /// The credential is known unable to post; the text names the missing
+    /// permission.
+    fn can_post_statuses(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Map a conclusion to the status Loom posts.
