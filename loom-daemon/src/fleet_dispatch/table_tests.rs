@@ -699,3 +699,50 @@ fn a_streak_is_forgotten_a_last_rung_after_its_hold_ends() {
     assert!(t.release_outcome(at(later), A, &id, "noop"));
     assert_eq!(t.cooldown(at(later), "acme/w", 9, "judge").unwrap().streak, 1);
 }
+
+#[test]
+fn a_ci_wait_release_holds_flat_and_never_climbs_the_ladder() {
+    let mut t = three_hosts(at(100));
+    // Repeated CI-wait releases stay at the flat hold, not 30 min / 2 h / ...
+    let mut now = 100;
+    for host in [A, B, C, A] {
+        t.heartbeat(at(now), host, &hb(host, vec![], 8));
+        let id = granted_id(&t.claim(at(now), host, "acme/w", 9, "judge", Some(40)));
+        assert!(t.release_outcome(at(now), host, &id, CI_WAIT_OUTCOME));
+        let c = t.cooldown(at(now), "acme/w", 9, "judge").unwrap();
+        assert_eq!((c.until, c.streak), (at(now + 300), 0));
+        assert!(matches!(
+            t.claim(at(now + 299), B, "acme/w", 9, "judge", Some(40)),
+            ClaimDecision::Refused { .. }
+        ));
+        now += 300;
+    }
+    granted_id(&t.claim(at(now), B, "acme/w", 9, "judge", Some(40)));
+}
+
+#[test]
+fn a_ci_wait_release_keeps_the_streak_and_a_longer_hold() {
+    let mut t = three_hosts(at(100));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "champion_merge", Some(40)));
+    assert!(t.release_outcome(at(100), A, &id, "noop"));
+    // The 30 min hold ends at 1900; claim just after and wait on CI.
+    t.heartbeat(at(1900), B, &hb(B, vec![], 8));
+    let id = granted_id(&t.claim(at(1900), B, "acme/w", 9, "champion_merge", Some(40)));
+    assert!(t.release_outcome(at(1900), B, &id, CI_WAIT_OUTCOME));
+    let c = t.cooldown(at(1900), "acme/w", 9, "champion_merge").unwrap();
+    assert_eq!((c.until, c.streak), (at(1900 + 300), 1), "streak kept");
+}
+
+#[test]
+fn only_a_hold_refusal_is_traced_as_cooled() {
+    let mut t = three_hosts(at(100));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "judge", Some(40)));
+    // Another host's live claim: held, but not by the hold.
+    let (d, cooled) = t.claim_traced(at(110), B, "acme/w", 9, "judge", Some(40));
+    assert_eq!(refusal(&d).0, RefusalReason::Held);
+    assert!(!cooled);
+    assert!(t.release_outcome(at(120), A, &id, "noop"));
+    let (d, cooled) = t.claim_traced(at(130), B, "acme/w", 9, "judge", Some(40));
+    assert_eq!(refusal(&d).0, RefusalReason::Held);
+    assert!(cooled);
+}
