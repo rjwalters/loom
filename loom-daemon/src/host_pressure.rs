@@ -195,12 +195,6 @@ pub fn swap_rates(
     }
 }
 
-/// True when a byte-rate `Option` carries a usable, finite, non-negative rate.
-#[must_use]
-pub fn valid_rate(r: f64) -> bool {
-    r.is_finite() && r >= 0.0
-}
-
 #[cfg(target_os = "macos")]
 fn sample_macos() -> HostPressure {
     let mut out = HostPressure {
