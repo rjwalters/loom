@@ -62,12 +62,23 @@ unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
       LOOM_GUARD_TMPFS_SCRATCH REPO_GUARD_TMPFS_SCRATCH
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-mkdir "$WORK/repo"
-git -C "$WORK/repo" init -q
-git -C "$WORK/repo" checkout -q -b main 2>/dev/null || true
-git -C "$WORK/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+# The `tmp-tmpfs` rows need a cwd that the fixture table classifies as NOT RAM: the
+# guard stays silent when the acting cwd sits on the same RAM mount as the target
+# (the "already in RAM" exemption), and the default repo lives under $TMPDIR. A
+# second repo under /var/tmp (ext4 in every fixture table) gives that cwd.
+ALT="$(mktemp -d /var/tmp/guard-compare.XXXXXX 2>/dev/null)" \
+    || { echo "a writable /var/tmp is required for the tmp-tmpfs rows" >&2; exit 2; }
+trap 'rm -rf "$WORK" "$ALT"' EXIT
+init_repo() { # <dir>
+    mkdir -p "$1"
+    git -C "$1" init -q
+    git -C "$1" checkout -q -b main 2>/dev/null || true
+    git -C "$1" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+}
+init_repo "$WORK/repo"
+init_repo "$ALT/repo"
 TEST_REPO="$(cd "$WORK/repo" && pwd -P)"
+ALT_REPO="$(cd "$ALT/repo" && pwd -P)"
 
 # Fixture mount table (same format as /proc/mounts).
 MOUNTS="$WORK/mounts"
@@ -77,12 +88,33 @@ tmpfs /dev/shm tmpfs rw 0 0
 tmpfs /run/user/1000 tmpfs rw 0 0
 ramfs /mnt/ramdisk ramfs rw 0 0
 M
+# Variant tables selected by the corpus' optional 4th column:
+#   unreadable - a path that does not exist (macOS / no /proc/mounts): must be silent
+#   tmp-tmpfs  - /tmp is tmpfs but /dev/shm is NOT a mount (systemd-style host),
+#                so classification must follow the mount type, never a /dev/shm prefix
+MOUNTS_UNREADABLE="$WORK/no-such-mount-table"
+MOUNTS_TMP="$WORK/mounts-tmp-tmpfs"
+cat >"$MOUNTS_TMP" <<'M'
+/dev/root / ext4 rw 0 0
+tmpfs /tmp tmpfs rw 0 0
+M
 
-verdict() { # <guard> <command>
+mounts_for() { # <variant> -> path of the mount table to expose to the guard
+    case "$1" in
+        unreadable) printf '%s' "$MOUNTS_UNREADABLE" ;;
+        tmp-tmpfs)  printf '%s' "$MOUNTS_TMP" ;;
+        *)          printf '%s' "$MOUNTS" ;;
+    esac
+}
+
+verdict() { # <guard> <command> [mounts-variant]
+    local out mt cwd="$TEST_REPO"
+    mt="$(mounts_for "${3:-}")"
+    [[ "${3:-}" == tmp-tmpfs ]] && cwd="$ALT_REPO"
     local out
-    out="$(jq -n --arg c "$2" --arg d "$TEST_REPO" \
+    out="$(jq -n --arg c "$2" --arg d "$cwd" \
         '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}' \
-        | REPO_GUARD_MOUNTS_FILE="$MOUNTS" LOOM_GUARD_MOUNTS_FILE="$MOUNTS" \
+        | REPO_GUARD_MOUNTS_FILE="$mt" LOOM_GUARD_MOUNTS_FILE="$mt" \
           bash "$1" 2>/dev/null)"
     if [[ -z "$out" ]]; then echo allow; return; fi
     printf '%s' "$out" | jq -r '.hookSpecificOutput.permissionDecision // "allow"' 2>/dev/null || echo allow
@@ -110,14 +142,14 @@ echo "corpus   : $CORPUS"
 printf '%-13s %-7s %-12s %-12s %s\n' STATUS EXPECT VENDORED CANONICAL "AREA | COMMAND"
 
 bad=0; n=0
-while IFS=$'\t' read -r expect area cmd; do
+while IFS=$'\t' read -r expect area cmd variant; do
     [[ -z "${expect// }" || "$expect" == \#* ]] && continue
     n=$((n + 1))
-    v="$(verdict "$VENDORED" "$cmd")"
+    v="$(verdict "$VENDORED" "$cmd" "$variant")"
     if [[ "$INCOMPLETE" -eq 1 ]]; then
         c="not-measured"
     else
-        c="$(verdict "$CANONICAL" "$cmd")"
+        c="$(verdict "$CANONICAL" "$cmd" "$variant")"
     fi
     if [[ "$expect" == any ]]; then
         if [[ "$INCOMPLETE" -eq 1 ]]; then status="incomplete"
