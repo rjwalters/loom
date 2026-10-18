@@ -171,13 +171,6 @@ pub enum AuthzDecision {
     Denied(Vec<DenyReason>),
 }
 
-impl AuthzDecision {
-    #[must_use]
-    pub fn is_authorized(&self) -> bool {
-        matches!(self, AuthzDecision::Authorized)
-    }
-}
-
 /// Decide whether the PR may be (or stay) queued at `approved_sha`.
 /// Fail-closed: every fact must be known and non-denying.
 #[must_use]

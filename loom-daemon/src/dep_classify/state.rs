@@ -123,11 +123,6 @@ impl ClassifiedRefs {
     pub fn resolved_joined(&self) -> String {
         self.resolved.join(" ")
     }
-
-    #[must_use]
-    pub fn unknown_joined(&self) -> String {
-        self.unknown.join(" ")
-    }
 }
 
 /// Split `nodes` (one per line) by state, using `lookup` to resolve each.

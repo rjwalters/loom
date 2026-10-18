@@ -69,10 +69,6 @@ impl Fallback {
         }
     }
 
-    pub fn set_backstop(&mut self, backstop: Duration) {
-        self.backstop = backstop;
-    }
-
     #[must_use]
     pub fn backstop(&self) -> Duration {
         self.backstop
