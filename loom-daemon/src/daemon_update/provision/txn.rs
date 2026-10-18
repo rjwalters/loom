@@ -14,10 +14,13 @@
 //!
 //! # What this module does NOT do
 //!
-//! It never restores anything. Nothing here reads `<dest>.previous` back,
-//! decides that an install failed, or acts on an unfinished record: those are
-//! the later slices of #9735. This slice only guarantees that the copy and
-//! the record exist for them.
+//! It never decides that an install failed and never acts on an unfinished
+//! record: those are the later slices of #9735. The one thing it reads
+//! `<dest>.previous` back for is [`restore`] (#12776), which the operator and
+//! `fleet roll` paths of `daemon-update` call when the candidate they just
+//! published fails to start. [`restore`] and `publish` hold the same
+//! destination lock, so neither can overwrite the other's `dest`,
+//! `<dest>.previous` or record.
 //!
 //! # The phases
 //!
@@ -196,6 +199,8 @@ pub enum InstallError {
     },
     /// The rename over the destination failed.
     Publish(std::io::Error),
+    /// The destination's install lock could not be taken.
+    Lock(std::io::Error),
 }
 
 impl std::fmt::Display for InstallError {
@@ -225,6 +230,10 @@ impl std::fmt::Display for InstallError {
                 f,
                 "Could not rename the staged binary over the destination: {e}. {UNTOUCHED}"
             ),
+            Self::Lock(e) => write!(
+                f,
+                "Could not take the install lock beside the destination: {e}. {UNTOUCHED}"
+            ),
         }
     }
 }
@@ -249,6 +258,161 @@ impl Published {
             kept.path, kept.version, kept.sha256
         ))
     }
+}
+
+/// Which install this invocation made: read from the record after the
+/// post-provision verify and before the restart (#12776).
+///
+/// `started_at` is unique per [`begin`]; the hashes are of the files as
+/// installed (so after signing), which is why this comes from the record and
+/// not from the pre-signing candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallIdentity {
+    pub started_at: DateTime<Utc>,
+    pub target_sha256: String,
+    pub previous_sha256: String,
+}
+
+/// The identity of the install now recorded beside `dest`, or why there is
+/// none to bind a restore to: no record, a record of an unfinished install,
+/// or a first-ever install (no retained previous binary).
+pub fn snapshot(dest: &Path) -> Result<InstallIdentity, String> {
+    match read_record(dest) {
+        RecordRead::Known(r) if r.phase != Phase::Committed => {
+            Err(format!("the install record is at phase {}, not committed", r.phase.as_str()))
+        }
+        RecordRead::Known(r) => match r.previous {
+            Some(prev) => Ok(InstallIdentity {
+                started_at: r.started_at,
+                target_sha256: r.target.sha256,
+                previous_sha256: prev.sha256,
+            }),
+            None => Err("this was a first-ever install: no previous binary was retained".into()),
+        },
+        RecordRead::Absent => Err("there is no install record".into()),
+        RecordRead::Unreadable(why) => Err(format!("the install record is unreadable ({why})")),
+        RecordRead::UnknownVersion(v) => Err(format!("the install record has schema_version {v}")),
+    }
+}
+
+/// What [`restore`] did.
+#[derive(Debug)]
+pub enum RestoreOutcome {
+    /// `dest` now holds the retained previous bytes. `<dest>.previous` and
+    /// the record are untouched.
+    Restored,
+    /// A precondition failed; `dest`, `<dest>.previous` and the record are
+    /// untouched. The message names the precondition.
+    Refused(String),
+    /// The preconditions held but the copy or rename failed. `dest` is
+    /// untouched (the rename is the last step) and `<dest>.previous` intact.
+    Failed(std::io::Error),
+}
+
+/// Put the retained previous binary back at `dest`, if and only if `dest` is
+/// still the candidate THIS invocation installed (#12776).
+///
+/// Under the destination lock (the one `publish` holds) it re-reads the
+/// record and requires: phase `committed`; `started_at`, `target.sha256` and
+/// `previous.sha256` equal to `expected`; sha256 of `dest` equal to the
+/// target; sha256 of `<dest>.previous` equal to the previous. Any miss is
+/// [`RestoreOutcome::Refused`] with nothing written. Then `<dest>.previous` is
+/// COPIED to a staging file and renamed over `dest`, so the recovery copy
+/// survives. The record is not rewritten: a restored `dest` no longer matches
+/// `target.sha256`, which is what makes a second restore refuse.
+pub fn restore(dest: &Path, expected: &InstallIdentity) -> RestoreOutcome {
+    let _lock = match super::DestLock::acquire(dest) {
+        Ok(l) => l,
+        Err(e) => {
+            return RestoreOutcome::Refused(format!("the install lock could not be taken ({e})"))
+        }
+    };
+    let record = match read_record(dest) {
+        RecordRead::Known(r) => r,
+        RecordRead::Absent => return RestoreOutcome::Refused("there is no install record".into()),
+        RecordRead::Unreadable(why) => {
+            return RestoreOutcome::Refused(format!("the install record is unreadable ({why})"))
+        }
+        RecordRead::UnknownVersion(v) => {
+            return RestoreOutcome::Refused(format!("the install record has schema_version {v}"))
+        }
+    };
+    if record.phase != Phase::Committed {
+        return RestoreOutcome::Refused(format!(
+            "the install record is at phase {}, not committed",
+            record.phase.as_str()
+        ));
+    }
+    let Some(prev) = record.previous.as_ref() else {
+        return RestoreOutcome::Refused(
+            "no previous binary was retained (first-ever install)".into(),
+        );
+    };
+    if record.started_at != expected.started_at
+        || record.target.sha256 != expected.target_sha256
+        || prev.sha256 != expected.previous_sha256
+    {
+        return RestoreOutcome::Refused(
+            "the install record is not the install this run made (another install replaced it)"
+                .into(),
+        );
+    }
+    let keep = previous_path(dest);
+    match sha256_of(dest) {
+        Ok(h) if h == expected.target_sha256 => {}
+        Ok(_) => {
+            return RestoreOutcome::Refused(format!(
+                "{} is not the candidate this run installed (another install replaced it)",
+                dest.display()
+            ))
+        }
+        Err(e) => {
+            return RestoreOutcome::Refused(format!("{} could not be read ({e})", dest.display()))
+        }
+    }
+    match sha256_of(&keep) {
+        Ok(h) if h == expected.previous_sha256 => {}
+        Ok(_) => {
+            return RestoreOutcome::Refused(format!(
+                "{} does not match the recorded sha256 (corrupt or replaced)",
+                keep.display()
+            ))
+        }
+        Err(e) => {
+            return RestoreOutcome::Refused(format!("{} could not be read ({e})", keep.display()))
+        }
+    }
+    match publish_copy(&keep, dest, &expected.previous_sha256) {
+        Ok(()) => RestoreOutcome::Restored,
+        Err(e) => RestoreOutcome::Failed(e),
+    }
+}
+
+/// Copy `from` to a staging file beside `dest` (mode 755, fsync'ed, hash
+/// re-checked against what was copied) and rename it over `dest`.
+fn publish_copy(from: &Path, dest: &Path, expect_sha256: &str) -> std::io::Result<()> {
+    let mut src = std::fs::File::open(from)?;
+    let dir = super::staging_dir(dest);
+    let (tmp_path, mut tmp) = super::create_staging_file(dir, dest)?;
+    let guard = super::StagedFile(Some(tmp_path.clone()));
+    let copied = copy_hashing(&mut src, &mut tmp)?;
+    if copied != expect_sha256 {
+        return Err(std::io::Error::other(format!(
+            "{} changed while it was being copied",
+            from.display()
+        )));
+    }
+    super::make_executable(&tmp)?;
+    tmp.sync_all()?;
+    drop(tmp);
+    std::fs::rename(&tmp_path, dest)?;
+    guard.disarm();
+    super::sync_dir(dir);
+    Ok(())
+}
+
+fn sha256_of(path: &Path) -> std::io::Result<String> {
+    copy_hashing(&mut std::fs::File::open(path)?, &mut std::io::sink())
 }
 
 /// Everything `publish` does before its rename: identify the candidate, keep

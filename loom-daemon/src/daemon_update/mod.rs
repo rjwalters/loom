@@ -32,8 +32,10 @@
 //! | 4 | build verification FAILED — the built binary embeds the wrong commit |
 //! | 5 | post-provision verification FAILED — the destination is not what this run produced |
 //! | 6 | supervised restart REFUSED by the running (old) binary |
-//! | 7 | restart ACK'd but the supervisor never relaunched, and the self-heal also failed |
+//! | 7 | restart ACK'd but the supervisor never relaunched, and the self-heal also failed — and no restore was possible (the reason is printed; #12776) |
 //! | 8 | drain fail-safe preserved — not a failure |
+//! | 9 | the candidate failed to start; the previous binary was RESTORED and its daemon is running. The update did NOT take (#12776) |
+//! | 10 | the candidate failed to start and the restore, or the restart onto the restored binary, failed; the host may be down (#12776) |
 //!
 //! The full behavioural reference is `--help`, rendered from `help.txt`, which
 //! is the script's own leading comment block verbatim.
@@ -858,6 +860,10 @@ fn stage_two(a: &Args, s: Stage) -> ! {
         verify::verify_supervisor_matches_provisioned(dest, &s.sup);
     };
 
+    // The install this invocation made, for a restore after a failed start
+    // (#12776). Read AFTER the verifiers, BEFORE the restart.
+    let mut install_identity: Option<(PathBuf, provision::txn::InstallIdentity)> = None;
+
     if let Some(explicit) = util::env_non_empty("LOOM_DAEMON_BIN") {
         // Explicit operator override — provision directly to that exact path
         // (the one loom-daemon-start.sh will resolve to next), rather than the
@@ -871,6 +877,7 @@ fn stage_two(a: &Args, s: Stage) -> ! {
             exit(1);
         }
         run_verifiers(Some(&dest));
+        install_identity = snapshot_install(&dest);
     } else if let Some(script) = provision_script.as_ref() {
         // The machine-level destination is the one that IS this binary on a
         // normal fleet host — see `selfrepl` for why the write below is a
@@ -888,6 +895,9 @@ fn stage_two(a: &Args, s: Stage) -> ! {
                 } else {
                     Some(&dest_path)
                 });
+                if !dest.is_empty() {
+                    install_identity = snapshot_install(&dest_path);
+                }
             }
             provision::ProvisionOutcome::Failed => {
                 // Hard-fail: a soft warn here (the pre-#4053 behaviour) left
@@ -923,7 +933,22 @@ fn stage_two(a: &Args, s: Stage) -> ! {
         drain_poll_secs: &s.drain_poll_secs,
         built_commit: &built_commit,
         final_line: s.final_line(),
+        install: install_identity.as_ref().map(|(d, i)| (d.as_path(), i)),
     })
+}
+
+/// [`provision::txn::snapshot`], with the reason printed when there is
+/// nothing to bind a restore to (the restart then runs without one).
+fn snapshot_install(dest: &Path) -> Option<(PathBuf, provision::txn::InstallIdentity)> {
+    match provision::txn::snapshot(dest) {
+        Ok(id) => Some((dest.to_path_buf(), id)),
+        Err(why) => {
+            out::say(&format!(
+                "No restore will be attempted if the new daemon fails to start: {why}."
+            ));
+            None
+        }
+    }
 }
 
 /// `${VAR:-unknown}` for the handful of places the script rendered an
