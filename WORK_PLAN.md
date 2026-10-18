@@ -69,7 +69,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#8779**: peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
+- **#8779**: peer-claim coordination is DEGRADED on a dispatch worker (#6157 Layer 3)
 - **#9081**: guard-background-subagents misses a background Bash started by a foreground subagent: headless sweep exits, Builder's make verify reaped
 - **#9736**: health: detect stalled release updates without a source checkout
 - **#10083**: CI path filter skips label_registry Rust tests on label-file-only PRs (how #10072 turned main red)
