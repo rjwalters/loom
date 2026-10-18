@@ -6,7 +6,45 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-18
+
+- **Issue #12720** (closed): Remove test-only/dead wrapper fns in merge_sequence.rs (overlap_components, order_component, plan_group, plan_repo)
+- **PR #12721**: refactor: drop unused merge-sequence convenience wrappers
+
 ### 2026-10-17
+- **Issue #12704** (closed): Step tick: remember captain cooldowns on the host so a tick skips cooled-down items instead of re-asking the captain
+- **PR #12710**: feat: arm a step cooldown from a captain cooldown refusal's retry_after_s
+- **PR #12705**: feat: add champion.outOfBandAcGate switch for the out-of-band AC hold
+- **PR #12706**: docs: define fleet, local daemon, and operator-directed modes
+- **Issue #12634** (closed): WORK_LOG archival (2/4): Guide runs rotation with archive-aware dedup, staging and batching
+- **PR #12680**: feat(guide): rotate WORK_LOG into archives in Document Maintenance
+- **Issue #12668** (closed): Dedupe logical_cwd/same_dir helpers copied across daemon_start and daemon_update
+- **PR #12693**: refactor: share logical_cwd/same_dir helpers across daemon_start, daemon_update and worktree cleanup
+- **Issue #12691** (closed): judge.md cites bare `forge wait-checks`; only `loom-daemon forge wait-checks` resolves
+- **PR #12695**: fix: qualify bare forge wait-checks in Judge/Doctor prompts and lint it
+- **Issue #12694** (closed): deep_clean: a per-workspace keepBuildArtifacts setting honoured by the disk-pressure path, not just wrapper scripts
+- **PR #12697**: feat(clean): add clean.keepBuildArtifacts opt-out for primary-checkout sweeps
+- **Issue #12681** (closed): Dedupe identical pass()/fail() helpers copied into ~100 test suites via lib/assert.sh
+- **PR #12687**: test: dedupe pass()/fail() helpers into lib/assert.sh
+- **Issue #12699** (closed): Remove orphaned role_tick_targets test fixtures (reader deleted in 1fb64a154)
+- **PR #12702**: chore: remove orphaned role_tick_targets test fixtures
+- **Issue #12700** (closed): Step tick: captain_cooldown refusals spend the tick's passes, so every tick stops at pass_limit with slots empty
+- **PR #12701**: step tick: captain refusals are free passes on their own bound (#12700)
+- **PR #12698**: docs: design restore of previous daemon binary on failed roll
+- **Issue #12676** (closed): Remove 49 redundant assert_* copies in 35 test suites that already source lib/assert.sh
+- **PR #12685**: refactor: drop shadowing assert helpers from suites sourcing lib/assert.sh
+- **Issue #12635** (closed): WORK_LOG archival (3/4): WORK_PLAN archival that never hides open work
+- **PR #12674**: feat: marker-driven WORK_PLAN archival for work-docs --plan
+- **Issue #12050** (closed): Design captain-owned fleet coordination before removing later peer-claim safeguards
+- **PR #12690**: docs: add ADR-0027 captain-owned fleet coordination design
+- **Issue #12667** (closed): Export merge.queue.observed and on-change queue-regime snapshot
+- **PR #12669**: feat: export the observed merge queue to OTLP as merge.queue.observed
+- **Issue #12664** (closed): Remove 15 orphaned pub helpers in loom-daemon with no callers
+- **PR #12673**: refactor: remove 15 orphaned pub helpers from loom-daemon
+- **Issue #11441** (closed): Fleet policy lives in fleet-gitops only: move runtimes/autonomous policy out of committed .loom/config.json (tier 2 silently shadows the fleet tier)
+- **PR #12688**: jev_merge_risk: sync BLAST_RADIUS_RED with the #12678 axis-table edit (main CI red)
+- **Issue #12677** (closed): Champion criterion #2: a vetted CI-workflow change is not red on blast radius (operator ruling)
+- **PR #12678**: Champion criterion #2: a vetted CI-workflow change is not red on blast radius
 - **PR #12663**: fix: classify GitHub's snake_case merge-queue removal reasons
 - **PR #12660**: Champion: critical-files-only standing authorization (criticalFilesOnly)
 - **PR #12659**: feat: export merge-queue records to OTLP as merge_queue.event
