@@ -464,6 +464,7 @@ mod tests {
                 "theirs",
                 "--onto",
                 &parent,
+                "--",
                 &fork,
             ])
             .output()
