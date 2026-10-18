@@ -219,6 +219,12 @@ fn ensure_head(root: &Path, pr: &SequencePr, deadline: &Deadline) -> bool {
     let Some(sha) = pr.head_sha.as_deref().filter(|s| !s.is_empty()) else {
         return false;
     };
+    ensure_pr_head(root, pr.number, sha, deadline)
+}
+
+/// [`ensure_head`] for a caller holding a bare PR number and pinned SHA (the
+/// conflict-stacking verb, #12759, reads a `RestPull`, not a `SequencePr`).
+pub(crate) fn ensure_pr_head(root: &Path, number: u32, sha: &str, deadline: &Deadline) -> bool {
     let commit = format!("{sha}^{{commit}}");
     let has = || git_code(root, &["cat-file", "-e", &commit], GIT_TIMEOUT, deadline) == Some(0);
     if has() {
@@ -227,7 +233,7 @@ fn ensure_head(root: &Path, pr: &SequencePr, deadline: &Deadline) -> bool {
     // Fetch to FETCH_HEAD rather than a private ref: the objects land either
     // way, and there is no ref to delete afterwards, so no git command can start
     // after the deadline has expired.
-    let spec = format!("refs/pull/{}/head", pr.number);
+    let spec = format!("refs/pull/{number}/head");
     let fetch = ["fetch", "--quiet", "--no-tags", REMOTE, "--", &spec];
     let fetched = git_code(root, &fetch, FETCH_TIMEOUT, deadline) == Some(0);
     fetched && has()

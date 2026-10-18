@@ -621,6 +621,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("role_tick_telemetry.rs", NotAWrite("classifies commands, runs none")),
         (
+            "stack_parent.rs",
+            NotAWrite("reads the forge and runs local git; only its test names git's `-X theirs`"),
+        ),
+        (
             "gh_invocation/accounting.rs",
             NotAWrite("classifies an invocation's argv for call accounting, runs none"),
         ),

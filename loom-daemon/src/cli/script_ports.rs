@@ -240,6 +240,10 @@ pub(crate) enum ScriptPortCommand {
     /// `serde_json` instead of spliced by hand. Exit 0 resolved, 1 refused.
     WorktreeBase(super::worktree_base::WorktreeBaseArgs),
 
+    /// Which open PR (if any) a Builder's committed work should be stacked on
+    /// (#12759): one `STACK-PARENT …` line, exit 0 for every decision.
+    StackParent(super::stack_parent::StackParentArgs),
+
     /// `worktree.sh`'s in-worktree predicate and both decisions it gated
     /// (#8195 slice 11): the `--check` verb, and the create path's
     /// auto-navigation out of a worktree. The retired
@@ -689,6 +693,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
             ScriptPortCommand::WorktreeSparse(args) => args.run(),
             ScriptPortCommand::WorktreeBase(args) => args.run(),
+            ScriptPortCommand::StackParent(args) => args.run(),
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
             ScriptPortCommand::CodexHooks(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeExisting(args) => args.run(),
