@@ -8,6 +8,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-18
 
+- **PR #12728**: refactor: remove ten unreferenced pub helpers from loom-daemon
+- **PR #12725**: feat: emit merge-queue regime snapshot on change
+- **PR #12724**: test: assert error response for nested JSON, drop non-asserting security tests
+- **PR #12717**: fix(champion): name the gate on a non-merge step instead of a constant ci_pending
+- **Issue #12726** (closed): Remove 10 unreferenced pub fns in loom-daemon (dead code)
+- **Issue #12722** (closed): Fix or remove four test_reject_* security tests that assert nothing
+- **Issue #12715** (closed): Champion non-merge: name the gate that stopped it (reason= on lease + pass.verdict), add sweep_id, stop ci_pending/failed mislabels
+- **Issue #12675** (closed): Emit merge-queue regime snapshot (check_response_timeout, max_entries_to_build, grouping_strategy) on change
+- **Issue #12578** (closed): Decision: fleet writer App lacks statuses:write, so merge-queue handoffs 403 and roll back (dequeuing PRs) on loom-ui
+- **Issue #10440** (closed): Vend the daemon's App installation token to shell consumers on fleet hosts (with a fail-loud down-daemon rule)
 - **Issue #12720** (closed): Remove test-only/dead wrapper fns in merge_sequence.rs (overlap_components, order_component, plan_group, plan_repo)
 - **PR #12721**: refactor: drop unused merge-sequence convenience wrappers
 
