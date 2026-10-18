@@ -8,6 +8,36 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-18
 
+- **PR #12750**: fix: launch Builder steps on the role draw's model
+- **PR #12747**: refactor: remove three uncalled pub fns from loom-daemon
+- **PR #12746**: feat: gate automatic loom:issue promotion on issue-author trust
+- **PR #12744**: refactor: retire inactive host.export fact_id_missing_total counter
+- **PR #12743**: chore: retire unmeasured Judge fan-out experiment scaffold
+- **PR #12742**: docs: landed-size dialect feasibility result with parity corpus and harness
+- **PR #12738**: fix: skip open-PR issues in clean.rs spawn-loop building revert
+- **PR #12737**: feat: export step draw pool and exclusions as per-repo gauges
+- **PR #12736**: refactor: remove orphaned label-age predicates and Held.at from stale_blocked
+- **PR #12731**: docs: clarify captain ci_wait hold covers every Champion requeue
+- **PR #12719**: test: drop bash re-simulations of the worktree cleanup decision tree
+- **PR #12716**: fix: count landed-route marker as Curator keep only after loom:triage is removed
+- **PR #12711**: feat: export hold and refusal facts on fleet-dispatch spans
+- **PR #12689**: feat: route merge-queue status posts through forge.mergeQueue.statusCommand
+- **Issue #12748** (closed): Honor the weighted model choice for Builder steps and private Codex admission
+- **Issue #12745** (closed): Remove uncalled pub wrappers: dispatcher_pairs, list_workspace_providers, read_artifact_text
+- **Issue #12741** (closed): fact_id_missing_total is never incremented: host.export always reports 0 (stub theater)
+- **Issue #12739** (closed): Stale retired-note in test-merge-pr-worktree-path.sh points at removed Test 5b cases T/V/W
+- **Issue #12734** (closed): Export the step draw pool as metrics: drawable items by repo and step, exclusions by repo and reason
+- **Issue #12733** (closed): Parking a PR hands its issue's claim back: loom:building -> loom:issue while the PR stays open
+- **Issue #12730** (closed): Remove orphaned hold.rs label-age predicates and Held.at after the release pass was deleted
+- **Issue #12729** (closed): Captain ci_wait hold still keys on Champion 'requeued' after #12717 reason split
+- **Issue #12712** (closed): Remove bash-simulation tests 4-6 from test-merge-pr-worktree-path.sh: they test a copy of logic now in Rust
+- **Issue #12709** (closed): Remove never-measured Judge fan-out experiment scaffold (~1,000 LOC shipped to every consumer)
+- **Issue #12707** (closed): fleet-dispatch: record held_by, step, hold expiry and ladder rung on claim refusal spans
+- **Issue #12679** (closed): merge queue: external status poster (forge.mergeQueue.statusCommand) and replace the writer-App statuses gate when set
+- **Issue #12548** (closed): Assess a SigNoz/ClickHouse landed-size scoring dialect with an owned parity contract
+- **Issue #10827** (closed): Promotion author gate: don't auto-promote issues authored by untrusted identities (signed decision markers dropped)
+- **Issue #10335** (closed): Per-repo opt-out for the PreToolUse guard hooks that install/upgrade respects
+- **Issue #9161** (closed): A repo cannot declare a merge precondition that a pipeline pass must honour
 - **PR #12728**: refactor: remove ten unreferenced pub helpers from loom-daemon
 - **PR #12725**: feat: emit merge-queue regime snapshot on change
 - **PR #12724**: test: assert error response for nested JSON, drop non-asserting security tests
