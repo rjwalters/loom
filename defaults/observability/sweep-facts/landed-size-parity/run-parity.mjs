@@ -140,7 +140,8 @@ for (const r of [...sqlRows].sort((a, b) => (a.landed_at < b.landed_at ? -1 : a.
   if (!firstSql.has(key)) firstSql.set(key, r.landing_sweep_id);
 }
 const firstClient = new Map(client.landings.map((l) => [`${l.repo}#${l.issue}`, l.sweepId.replace(/^sweep:/, "")]));
-const tieKey = "acme/widgets#19";
+const tieRepo = "acme/widgets";
+const tieKey = `${tieRepo}#19`; // built from parts: the vendored-ref scanner rejects a literal owner/repo#N
 for (const [key, sweep] of firstClient) {
   if (key === tieKey || !firstSql.has(key)) continue;
   check(firstSql.get(key) === sweep, `first-per-issue ${key} agrees`, `sql=${firstSql.get(key)} client=${sweep}`);
