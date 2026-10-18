@@ -614,11 +614,7 @@ fn consecutive_no_progress_releases_escalate_and_a_progressing_one_resets() {
     }
     assert_eq!(
         t.cooldown(at(now), "acme/w", 9, "champion_merge")
-            .unwrap_or(Cooldown {
-                until: at(0),
-                streak: 0
-            })
-            .streak,
+            .map_or(0, |c| c.streak),
         0,
         "the hold has ended"
     );
@@ -740,9 +736,12 @@ fn only_a_hold_refusal_is_traced_as_cooled() {
     // Another host's live claim: held, but not by the hold.
     let (d, cooled) = t.claim_traced(at(110), B, "acme/w", 9, "judge", Some(40));
     assert_eq!(refusal(&d).0, RefusalReason::Held);
-    assert!(!cooled);
+    assert!(cooled.is_none());
     assert!(t.release_outcome(at(120), A, &id, "noop"));
     let (d, cooled) = t.claim_traced(at(130), B, "acme/w", 9, "judge", Some(40));
     assert_eq!(refusal(&d).0, RefusalReason::Held);
-    assert!(cooled);
+    let hold = cooled.unwrap();
+    assert_eq!(hold.streak, 1);
+    assert_eq!(hold.set_by_outcome, "noop");
+    assert_eq!(hold.set_by_assignment_id, id);
 }
