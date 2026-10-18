@@ -184,6 +184,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.total_weight",
     "loom.step.repo_items",
     "loom.step.in_flight_repo",
+    "loom.step.model_selected",
+    "loom.step.model_launched",
     // `loom.dispatch.step` claim facts (Issue #12183).
     "loom.dispatch.claim_outcome",
     "loom.dispatch.claim_exit_code",

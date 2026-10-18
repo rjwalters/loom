@@ -115,6 +115,7 @@ impl ContainmentPreparer for FakePreparer {
         &mut self,
         role: &str,
         explicit: Option<&str>,
+        _drawn_model: Option<&str>,
         rejection: RuntimeRejection,
     ) -> Result<ResolvedRuntime, RuntimeRejection> {
         self.contained

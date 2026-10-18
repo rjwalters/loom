@@ -209,8 +209,10 @@ pub(super) fn host_proof(
 
 /// Resolve the model a candidate runtime would launch with, so account
 /// selection during preparation is model-aware in exactly the way the launch
-/// will be. Supplied by the dispatch path that owns model resolution.
-pub type ModelFor<'a> = Box<dyn Fn(&str) -> Option<String> + 'a>;
+/// will be. Supplied by the dispatch path that owns model resolution. The
+/// second argument is the model a role draw's pick for this candidate pins
+/// (#12748), which the launch uses in preference to a configured default.
+pub type ModelFor<'a> = Box<dyn Fn(&str, Option<&str>) -> Option<String> + 'a>;
 
 /// Prepare a fresh private selection and try to satisfy an eligible
 /// `rejection` with it. The selection — and with it the exclusive account
@@ -335,18 +337,24 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
         &mut self,
         role: &str,
         explicit: Option<&str>,
+        drawn_model: Option<&str>,
         rejection: RuntimeRejection,
     ) -> Result<ResolvedRuntime, RuntimeRejection> {
         if !rejection.containment_eligible() {
             return Err(rejection);
         }
+        let model = (self.model_for)("codex", drawn_model);
         // One dispatch holds one account lease. A re-admission during the same
         // decision (the static pass, then the preference walk) reuses the proof
-        // already prepared instead of selecting a second account.
-        if let Some((_, proof, _)) = &self.held {
-            return admit_with(&self.root, role, explicit, proof);
+        // already prepared instead of selecting a second account — but only
+        // for the same model: account selection is model-aware, so a draw
+        // naming a different model gets its own selection (#12748).
+        if let Some((_, proof, held_model)) = &self.held {
+            if *held_model == model {
+                return admit_with(&self.root, role, explicit, proof);
+            }
+            self.held = None;
         }
-        let model = (self.model_for)("codex");
         let (admitted, selection, proof) = admit_new(
             &self.root,
             role,

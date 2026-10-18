@@ -681,13 +681,23 @@ impl SweepRegistry {
         if token_name != crate::sweep_registry::UNKNOWN_TOKEN_NAME {
             self.clear_role_tick_pool_exhausted(role.role_name());
         }
-        self.record_step_dispatch(
+        let selected = launch
+            .admission
+            .admitted
+            .as_ref()
+            .and_then(|a| a.preference.as_ref())
+            .and_then(|p| p.model.clone());
+        self.record_step_dispatch_with(
             &request,
             dispatch_step::RESULT_SPAWNED,
             "ok",
             Some(&sweep_id),
             claim.as_ref(),
             assignment.as_ref().map(|g| g.assignment_id.as_str()),
+            Some(dispatch_step::StepModels {
+                selected: selected.as_deref(),
+                launched: launch.model.as_deref(),
+            }),
         );
         if let Some(grant) = assignment {
             crate::fleet_dispatch::worker::note_spawned(
@@ -721,6 +731,30 @@ impl SweepRegistry {
         claim: Option<&lease::ClaimFacts>,
         assignment_id: Option<&str>,
     ) {
+        self.record_step_dispatch_with(
+            request,
+            result,
+            reason,
+            sweep_id,
+            claim,
+            assignment_id,
+            None,
+        );
+    }
+
+    /// [`Self::record_step_dispatch`] with the selected and launched models
+    /// of a spawned step (#12748).
+    #[allow(clippy::too_many_arguments)]
+    fn record_step_dispatch_with(
+        &self,
+        request: &StepSpawnRequest,
+        result: &str,
+        reason: &str,
+        sweep_id: Option<&str>,
+        claim: Option<&lease::ClaimFacts>,
+        assignment_id: Option<&str>,
+        models: Option<dispatch_step::StepModels<'_>>,
+    ) {
         dispatch_step::record(
             &self.config.workspace_root,
             &StepDispatch {
@@ -735,6 +769,7 @@ impl SweepRegistry {
                 sweep_id,
                 claim,
                 assignment_id,
+                models,
             },
         );
     }
@@ -796,14 +831,21 @@ impl SweepRegistry {
             job,
             issue,
             format!("step-{role}-{}", uuid::Uuid::new_v4()),
-            Box::new(move |runtime: &str| match &hint {
-                None => DispatchModel::Autonomous.resolve_for_runtime(config, kind, Some(runtime)),
+            // The account is selected for the model the launch below uses
+            // (#12748): the candidate's drawn model when it names one.
+            Box::new(move |runtime: &str, drawn: Option<&str>| match &hint {
+                None => DispatchModel::Autonomous
+                    .resolve_drawn(config, kind, runtime, drawn)
+                    .unwrap_or_else(|_| {
+                        DispatchModel::Autonomous.resolve_for_runtime(config, kind, Some(runtime))
+                    }),
                 Some((model, source)) => {
-                    let (model, _) = models::reconcile_unpinned_model_with_runtime(
-                        runtime,
-                        model.clone(),
-                        source.clone(),
-                    );
+                    let (model, source) = match drawn.filter(|d| !d.trim().is_empty()) {
+                        Some(drawn) => (drawn.to_string(), "role-draw".to_string()),
+                        None => (model.clone(), source.clone()),
+                    };
+                    let (model, _) =
+                        models::reconcile_unpinned_model_with_runtime(runtime, model, source);
                     non_empty(model)
                 }
             }),
@@ -811,7 +853,7 @@ impl SweepRegistry {
         let statically = match crate::runtime_admission::resolve_and_admit(root, name, None) {
             Err(rejection) if rejection.containment_eligible() => {
                 use crate::runtime_preference::ContainmentPreparer;
-                containment.contain(name, None, rejection)
+                containment.contain(name, None, None, rejection)
             }
             other => other,
         };
@@ -835,7 +877,15 @@ impl SweepRegistry {
             Err(rejection) => return Err(StepRefusal::new("runtime_rejected", rejection.reason)),
         };
         let model = match role {
-            StepRole::Builder => DispatchModel::Autonomous.resolve(config, kind, Some(&admitted)),
+            StepRole::Builder => {
+                let drawn = admitted
+                    .preference
+                    .as_ref()
+                    .and_then(|p| p.model.as_deref());
+                DispatchModel::Autonomous
+                    .resolve_drawn(config, kind, &admitted.runtime, drawn)
+                    .map_err(|why| StepRefusal::new("model_runtime_mismatch", why))?
+            }
             _ => {
                 let drawn = admitted.preference.as_ref().and_then(|p| p.model.clone());
                 let (model, source) = match drawn {
