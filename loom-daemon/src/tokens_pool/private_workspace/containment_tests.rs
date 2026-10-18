@@ -278,6 +278,7 @@ fn malformed_or_absent_identity_is_refused() {
         base_revision: revision.into(),
         host_pid: 1,
         control: control.into(),
+        repository: String::new(),
     };
     let config = Config {
         schema_version: 1,
@@ -287,6 +288,7 @@ fn malformed_or_absent_identity_is_refused() {
         docker_desktop: false,
         repository: "https://example.invalid/repo".into(),
         base: "main".into(),
+        repositories: vec![],
         volume: "v".into(),
         profile: profile.clone(),
         gh_config: None,
