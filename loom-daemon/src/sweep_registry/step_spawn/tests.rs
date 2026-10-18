@@ -1002,3 +1002,15 @@ fn a_ci_pending_noop_line_releases_as_ci_wait() {
     assert_eq!(rel(&line("verdict", "approved")), "verdict");
     assert_eq!(rel(&line("failed", "ci_pending")), "failed");
 }
+
+/// #12729: a Champion `requeued` holds as `ci_wait` whatever gate requeued it;
+/// a `skipped` stop stays on the no-progress ladder.
+#[test]
+fn a_champion_requeued_noop_line_releases_as_ci_wait_for_any_gate() {
+    let rel = |l: &str| release_class_of_line(&parse_outcome_line(l).unwrap());
+    let line = |reason: &str| {
+        format!("LOOM_STEP_OUTCOME role=champion target=7 class=noop reason={reason}")
+    };
+    assert_eq!(rel(&line("requeued")), "ci_wait");
+    assert_eq!(rel(&line("skipped")), "noop");
+}

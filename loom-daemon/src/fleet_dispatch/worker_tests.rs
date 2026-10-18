@@ -88,7 +88,11 @@ fn a_grant_carries_its_assignment_and_a_refusal_its_reason() {
     ] {
         let server = refusing(wire);
         enable(dir.path(), &server.url(), true);
-        assert_eq!(claim(dir.path(), 7, StepRole::Judge), Ask::Refused(reason, Some(30)));
+        let refusal = Refusal {
+            held_by: None,
+            retry_after_s: Some(30),
+        };
+        assert_eq!(claim(dir.path(), 7, StepRole::Judge), Ask::Refused(reason, refusal));
     }
     assert_eq!(refusal_token(RefusalReason::Held), "captain_held");
     assert_eq!(refusal_token(RefusalReason::Cooldown), "captain_cooldown");
@@ -107,13 +111,19 @@ fn a_cooldown_refusal_keeps_retry_after_and_tolerates_its_absence() {
     enable(dir.path(), &bare.url(), true);
     assert_eq!(
         claim(dir.path(), 7, StepRole::Judge),
-        Ask::Refused(RefusalReason::Cooldown, None)
+        Ask::Refused(RefusalReason::Cooldown, Refusal::default())
     );
     let timed = refusing("cooldown");
     enable(dir.path(), &timed.url(), true);
     assert_eq!(
         claim(dir.path(), 7, StepRole::Judge),
-        Ask::Refused(RefusalReason::Cooldown, Some(30))
+        Ask::Refused(
+            RefusalReason::Cooldown,
+            Refusal {
+                held_by: None,
+                retry_after_s: Some(30)
+            }
+        )
     );
 }
 

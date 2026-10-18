@@ -314,6 +314,7 @@ pub mod primary_checkout_reaper;
 pub mod priority_pick;
 pub mod private_control_gate;
 pub mod proc_exec;
+pub mod promotion_author;
 pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;

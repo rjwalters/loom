@@ -133,8 +133,8 @@ pub const DEFAULT_NO_PROGRESS_LADDER: [Duration; 4] = [
 pub const PROGRESS_OUTCOMES: [&str; 4] = ["verdict", "merged", "moved", "success"];
 
 /// The `release` outcome of a step that ended waiting on CI (Judge
-/// `ci_pending`, Champion `requeued`, #12551): neither progress nor a
-/// failure to find work. It arms [`Policy::ci_wait`], not the escalating
+/// `ci_pending`) or on a retry (Champion `requeued`, any gate, #12551): neither
+/// progress nor a failure to find work. It arms [`Policy::ci_wait`], not the escalating
 /// ladder, and leaves the streak and the item's other holds alone.
 pub const CI_WAIT_OUTCOME: &str = "ci_wait";
 
@@ -296,12 +296,16 @@ impl Expired {
 }
 
 /// A no-progress hold on one `(repo, item, step)` (module docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cooldown {
     /// Claims for the triple are refused `held` until then.
     pub until: Mono,
     /// Consecutive no-progress releases of the triple.
     pub streak: u32,
+    /// The outcome of the release that set the hold (#12707).
+    pub set_by_outcome: String,
+    /// The assignment whose release set the hold (#12707).
+    pub set_by_assignment_id: String,
 }
 
 /// The assignment table. See the module docs.
@@ -387,7 +391,7 @@ impl Table {
         self.cooldowns
             .get(&(repo.to_string(), item, step.to_string()))
             .filter(|c| c.until > now)
-            .copied()
+            .cloned()
     }
 
     /// What the table last heard from `host`.
@@ -520,9 +524,9 @@ impl Table {
             .0
     }
 
-    /// [`Self::claim`], plus whether a refusal came from the no-progress
-    /// hold itself (#12551), not from another host's live claim that merely
-    /// coexists with a hold.
+    /// [`Self::claim`], plus the no-progress hold when a refusal came from
+    /// it (#12551), not from another host's live claim that merely coexists
+    /// with a hold.
     pub fn claim_traced(
         &mut self,
         now: Mono,
@@ -531,8 +535,8 @@ impl Table {
         item: u64,
         step: &str,
         max_concurrent: Option<u32>,
-    ) -> (ClaimDecision, bool) {
-        let mut cooled = false;
+    ) -> (ClaimDecision, Option<Cooldown>) {
+        let mut cooled = None;
         let d = self.decide_claim(now, host, repo, item, step, max_concurrent, &mut cooled);
         (d, cooled)
     }
@@ -546,7 +550,7 @@ impl Table {
         item: u64,
         step: &str,
         max_concurrent: Option<u32>,
-        cooled: &mut bool,
+        cooled: &mut Option<Cooldown>,
     ) -> ClaimDecision {
         self.expire(now);
         if self.in_grace(now) {
@@ -577,8 +581,9 @@ impl Table {
         }
         // The fleet-wide no-progress hold (#12541): whoever asks.
         if let Some(c) = self.cooldown(now, repo, item, step) {
-            *cooled = true;
-            return refused(RefusalReason::Held, None, now.secs_until(c.until, 1));
+            let retry = now.secs_until(c.until, 1);
+            *cooled = Some(c);
+            return refused(RefusalReason::Held, None, retry);
         }
         let Ok(parsed) = step.parse::<StepRole>() else {
             return refused(RefusalReason::NotEligible, None, NOT_ELIGIBLE_RETRY_SECS);
@@ -702,13 +707,15 @@ impl Table {
         if outcome.trim() == CI_WAIT_OUTCOME {
             let triple = (repo, item, row.step);
             let until = now.plus(self.policy.ci_wait);
-            let prior = self.cooldowns.get(&triple).copied();
-            if !self.policy.ci_wait.is_zero() && prior.is_none_or(|c| c.until < until) {
+            let prior = self.cooldowns.get(&triple).cloned();
+            if !self.policy.ci_wait.is_zero() && prior.as_ref().is_none_or(|c| c.until < until) {
                 self.cooldowns.insert(
                     triple,
                     Cooldown {
                         until,
                         streak: prior.map_or(0, |c| c.streak),
+                        set_by_outcome: CI_WAIT_OUTCOME.to_string(),
+                        set_by_assignment_id: assignment_id.to_string(),
                     },
                 );
             }
@@ -734,6 +741,8 @@ impl Table {
             Cooldown {
                 until: now.plus(hold),
                 streak,
+                set_by_outcome: outcome.trim().to_string(),
+                set_by_assignment_id: assignment_id.to_string(),
             },
         );
         true

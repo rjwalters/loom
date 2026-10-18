@@ -182,9 +182,16 @@ pub enum Ask {
     /// path.
     FailOpen,
     Granted(Grant),
-    /// The reason, and the seconds the refusal says the hold lasts
-    /// (`retry_after_s`; `None` when the answer carried none).
-    Refused(RefusalReason, Option<u64>),
+    Refused(RefusalReason, Refusal),
+}
+
+/// What a claim refusal said beyond its reason (#12707).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Refusal {
+    /// The host holding the item, when the captain named one.
+    pub held_by: Option<String>,
+    /// Seconds before asking again is worthwhile.
+    pub retry_after_s: Option<u64>,
 }
 
 /// The `loom.dispatch.step` reason of a captain refusal: a closed token.
@@ -294,7 +301,7 @@ fn repo_of(root: &Path) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Decision {
     Granted(String),
-    Refused(RefusalReason, Option<u64>),
+    Refused(RefusalReason, Refusal),
 }
 
 /// Read a claim answer; `None` for a grant with no `assignment_id` (a
@@ -305,7 +312,13 @@ fn decide(r: &ClaimResponse) -> Option<Decision> {
         let id = r.assignment_id.clone().filter(|id| !id.is_empty())?;
         Some(Decision::Granted(id))
     } else {
-        Some(Decision::Refused(r.reason.unwrap_or(RefusalReason::Other), r.retry_after_s))
+        Some(Decision::Refused(
+            r.reason.unwrap_or(RefusalReason::Other),
+            Refusal {
+                held_by: r.held_by.clone().filter(|h| !h.is_empty()),
+                retry_after_s: r.retry_after_s,
+            },
+        ))
     }
 }
 
@@ -355,7 +368,7 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
                 step: request.step,
             })
         }
-        Ok((epoch, Decision::Refused(reason, retry_after_s))) => {
+        Ok((epoch, Decision::Refused(reason, refusal))) => {
             // `grace` is expected after every captain roll: it neither
             // counts as a failure nor resets one (spec §9.1).
             if reason != RefusalReason::Grace {
@@ -365,10 +378,13 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
             facts.result = client::RESULT_REFUSED;
             facts.reason = Some(reason.as_str().to_string());
             facts.server_epoch = Some(epoch);
+            facts.held_by.clone_from(&refusal.held_by);
+            facts.retry_after_s = refusal.retry_after_s;
+            facts.hold = reason == RefusalReason::Cooldown;
             if reason == RefusalReason::Grace {
                 Ask::FailOpen
             } else {
-                Ask::Refused(reason, retry_after_s)
+                Ask::Refused(reason, refusal)
             }
         }
         Err(e) => {

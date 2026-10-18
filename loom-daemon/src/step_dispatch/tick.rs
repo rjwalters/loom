@@ -86,6 +86,7 @@ use crate::telemetry::kinds::pick_decision::{PickItemExclusion, PickSkipReason};
 use crate::types::QueueDisposition as Qd;
 use crate::work_finder::ready_queue::TickQueueRow;
 use crate::work_finder::step_item::{Lane, PassReason};
+use crate::work_finder::RepoDepth;
 use crate::work_finder::{PriorityCandidate, TickReport};
 
 /// At most this many item draws fill one slot (design §4.2 step 4).
@@ -344,6 +345,24 @@ pub fn disposition_of(reason: &str) -> Qd {
     }
 }
 
+/// `ws`'s drawable pool by step and its exclusions by reason (#12734). A
+/// held workspace draws nothing, so its pool is empty. Pure.
+fn repo_depth(ws: &StepWorkspace) -> RepoDepth {
+    let mut depth = RepoDepth {
+        repo: ws.repo.clone(),
+        ..RepoDepth::default()
+    };
+    if !ws.halted {
+        for c in &ws.weighing.pool {
+            *depth.pool.entry(c.step.as_str()).or_default() += 1;
+        }
+    }
+    for (reason, &n) in &ws.weighing.excluded {
+        *depth.excluded.entry(reason.as_str()).or_default() += n;
+    }
+    depth
+}
+
 /// Take out of `w`'s pool every item `claims` names (this host's live runs
 /// and the peers' live claims), each a `claimed` pass, and every merge step
 /// ([`MERGE_STEPS`]) but the one being merged while this host or a peer has
@@ -494,6 +513,7 @@ pub fn run(
             .copied()
             .unwrap_or(0);
         report.seen += ws.weighing.pool.len() + ws.weighing.excluded.values().sum::<usize>();
+        report.depth.push(repo_depth(ws));
         report
             .vi_demotions
             .extend(ws.weighing.demotions.iter().cloned());

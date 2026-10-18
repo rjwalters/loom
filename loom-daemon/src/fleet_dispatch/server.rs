@@ -46,7 +46,7 @@ use super::proto::{
 };
 use super::roster::{Roster, RosterSource};
 use super::table::{ClaimDecision, Mono, Policy, RefuseOutcome, Table};
-use super::telemetry::{self, Call, Counters};
+use super::telemetry::{self, Call, Counters, HoldFacts};
 
 /// The span reason of a claim refused `held` by a no-progress hold
 /// ([`super::table`], #12541). On the wire it is [`RefusalReason::Cooldown`]
@@ -281,9 +281,14 @@ impl<I: Identity> Server<I> {
         let decision = self.with_table(|t, now, counters| {
             let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step, max);
             if let ClaimDecision::Refused { reason, .. } = &mut d {
-                if cooled {
+                if let Some(hold) = cooled {
                     counters.claim_cooled();
                     call.reason = Some(NO_PROGRESS_REASON.to_string());
+                    call.hold = Some(HoldFacts {
+                        rung: hold.streak,
+                        set_by_outcome: hold.set_by_outcome,
+                        set_by_assignment_id: hold.set_by_assignment_id,
+                    });
                     *reason = RefusalReason::Cooldown;
                 } else {
                     counters.claim_refused(*reason);
@@ -307,6 +312,8 @@ impl<I: Identity> Server<I> {
                 retry_after_s,
             } => {
                 call.result = "refused";
+                call.held_by.clone_from(&held_by);
+                call.retry_after_s = Some(retry_after_s);
                 if call.reason.is_none() {
                     call.reason = Some(reason.as_str().to_string());
                 }

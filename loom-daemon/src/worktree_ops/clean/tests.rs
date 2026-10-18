@@ -2237,3 +2237,36 @@ fn quarantine_dirty_worktree_returns_none_when_nothing_to_stash() {
 
     assert_eq!(quarantine_dirty_worktree(dir.path(), "issue=1 reason=test"), None);
 }
+
+#[test]
+fn spawn_loop_revert_keeps_building_on_issue_with_open_linked_pr() {
+    // #12733: #10 has an open (parked, `loom:blocked`) PR; #11 has none.
+    let mut edited = Vec::new();
+    let reverted = revert_orphan_building_labels(
+        vec![10, 11],
+        false,
+        |n| n == 10,
+        |n| {
+            edited.push(n);
+            Ok(())
+        },
+    );
+    assert_eq!(edited, vec![11]);
+    assert_eq!(reverted, 1);
+}
+
+#[test]
+fn spawn_loop_revert_dry_run_skips_open_pr_issue_and_writes_nothing() {
+    let mut edited = Vec::new();
+    let reverted = revert_orphan_building_labels(
+        vec![10],
+        true,
+        |_| true,
+        |n| {
+            edited.push(n);
+            Ok(())
+        },
+    );
+    assert!(edited.is_empty());
+    assert_eq!(reverted, 0);
+}

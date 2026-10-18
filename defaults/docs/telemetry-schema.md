@@ -1786,6 +1786,8 @@ Every other name is a **`Gauge`**:
 | Metric | Unit | Cadence |
 |---|---|---|
 | `loom.dispatch.candidates`, `loom.dispatch.max_concurrent` | count | every work-finder tick |
+| `loom.dispatch.pool_items` (`repo`, `step`, #12734) | count | every step-engine tick, non-zero pairs only (absence means zero) |
+| `loom.dispatch.excluded_items` (`repo`, `reason`, #12734) | count | every step-engine tick, non-zero pairs only (absence means zero) |
 | `loom.dispatch.cap_term` (`kind` = `configured`, #11858) | count | every multi-workspace tick |
 | `loom.queue.oldest_wait` (`state` = `ready`/`blocked`) | seconds | every multi-workspace work-finder tick, only for a state with a waiting issue |
 | `loom.queue.starved` (`state` = `ready`/`blocked`) | count | every multi-workspace tick, both states, `0` included |
@@ -1816,6 +1818,18 @@ when both are `0`. `loom.queue.already_landed` (#11858) splits the
 `already_landed` rows by the landed guard's evidence (the row's `detail`), so
 the `forge_closed` / `journal_landed` split is measurable in SigNoz. Issue numbers and repos are never labels. The per-issue rows travel in
 `queue.snapshot`.
+
+`loom.dispatch.pool_items` (#12734) is the canonical **dispatchable depth**:
+the items the work finder can draw right now, per `repo` and `step` (a
+`Step` name), read after claims and the Builder hold are applied, so a held
+workspace contributes none. Do not derive it from `loom:issue` label counts:
+the step classifier excludes an issue whose joined PR is parked, so the label
+count overstates it. `loom.dispatch.excluded_items` is the complement, per
+`repo` and `reason` (a `PassReason` name, or `pool_exhausted`,
+`build_backoff`, `cooling_down`, `merge_in_flight`). Both emit non-zero pairs
+only, so an absent series means zero. `repo` is the registered workspace
+slug; `step` and `reason` are closed sets, so cardinality is bounded.
+`loom.dispatch.candidates` is unchanged and still counts both together.
 
 `loom.dispatch.cap_term` (#11858) carries the cap's terms. Since #12406 the
 only term is `kind="configured"`: the cap is `autonomous.workFinder.maxConcurrent`
@@ -2183,7 +2197,7 @@ Guard denies (Issue #11582):
 | `build_gate.run` span | one per host-side run of `buildGate.command`; pre-flight's is a child of the sweep's execution span, delivered through its trace journal (`LOOM_TRACE_CONTEXT_FILE`; an attended session with no `LOOM_TRACEPARENT` emits none), the main-health gate's is its own root through the ops sink | `loom.build_gate.stage` (`preflight` / `main_health`), `loom.build_gate.tier` (`fast` / `full`), `loom.build_gate.outcome` (`pass` / `pass_flaky` / `fail` / `unresolved` / `timeout` / `unevaluated`), `loom.build_gate.duration_ms`, `loom.build_gate.attempt` (1-based within the pre-flight episode; `1` for main-health) | what host-side gating costs and how often it fails, per stage and tier (#11690: CI is the test gate, pre-flight is the fast tier). Status `error` unless `pass` / `pass_flaky`. Never the command, a path or the output |
 | `reaper.pass` span | one per worktree-reaper pass over one repo and worktree class, through the ops sink: an instant span, its own root (#12461) | `loom.repo` (workspace directory name, never a path), `loom.reaper.class` (`issue` / `pr`), `loom.reaper.phase` (`reap` removes worktrees; `reclaim` removes build-artifact directories from kept ones), `loom.reaper.scanned` / `removed` / `failed` / `preserved` (worktrees for `reap`; artifact directories removed and worktrees left whole for `reclaim`), `loom.reaper.bytes` (bytes freed; `reap` measures only while an ops sink is registered), `loom.reaper.preserved.<reason>` with `<reason>` one of `in_use` / `unmanaged` / `editable_install` / `issue_open` / `pr_open` / `pr_unknown` / `not_merged` / `grace` / `uncommitted` / `private_workspace` / `other` (the gate's fixed category, never its wording; absent when 0) | what the reaper scanned, removed, kept and freed per pass, where #12453 had only host logs and `du`. Status `error` when a removal failed. Carries the daemon version and full SHA like every span |
 | `main_red.autofile` span | instant, its own root, through the ops sink; one per change the daemon makes to a red `main`'s auto-filed fix issue (Issue #11766) | `loom.repo`, `loom.issue`, `loom.main_red.sha` (the failing or green SHA, `unknown` when not known), `loom.main_red.action` (`created` / `reused` / `closed` / `closed_duplicate`; `reused` once per issue per daemon process), `loom.main_red.source` (`gate` / `ci`) | when a red `main` got its fix issue, and when it was closed again. Status `ok` |
-| `loom.fleet_dispatch.call` span | its own root, through the ops sink; one per call on each side, `loom.fleet_dispatch.side` says which: `captain`, one per request the fleet-dispatch captain (`loom-daemon fleet-dispatch serve`, #12449) answered; `worker`, one per call a worker makes to it (#12450). Spec `docs/design/fleet-captain-dispatch.md` | `loom.fleet_dispatch.side` (`captain` / `worker`), `loom.fleet_dispatch.host` (on the captain the caller's roster host id, `-` before it is identified; on a worker its own), `loom.fleet_dispatch.endpoint` (`/v1/heartbeat` / `/v1/claim` / `/v1/refuse` / `/v1/release`, `other` for a path the captain does not serve), `loom.fleet_dispatch.latency_ms`, `loom.fleet_dispatch.status` (HTTP status; on a worker `0` with no answer), `loom.fleet_dispatch.result` (`granted` / `refused` / `ok` / `error`, the same set on both sides), `loom.fleet_dispatch.reason` (the refusal reason, `refuse` token, release outcome, or the error class: on a worker `transport` / `status_5xx` / `status_4xx` / `malformed`), `loom.fleet_dispatch.server_epoch`, `loom.assignment.id`, and `loom.repo` with `loom.issue` or `loom.pr_number` (by whether the step acts on a PR) when the call names an item; a worker's span also carries `loom.role` (the step's role name, as on `loom.dispatch.step`) | which host asked for what and what the captain answered, and when a worker could not reach it (design §12). Both sides use the same keys and values, so one query joins them. Status `error` on a captain's non-200 answer and on a worker's call with no usable answer. `loom.dispatch.step` carries the same `loom.assignment.id` on a granted step |
+| `loom.fleet_dispatch.call` span | its own root, through the ops sink; one per call on each side, `loom.fleet_dispatch.side` says which: `captain`, one per request the fleet-dispatch captain (`loom-daemon fleet-dispatch serve`, #12449) answered; `worker`, one per call a worker makes to it (#12450). Spec `docs/design/fleet-captain-dispatch.md` | `loom.fleet_dispatch.side` (`captain` / `worker`), `loom.fleet_dispatch.host` (on the captain the caller's roster host id, `-` before it is identified; on a worker its own), `loom.fleet_dispatch.endpoint` (`/v1/heartbeat` / `/v1/claim` / `/v1/refuse` / `/v1/release`, `other` for a path the captain does not serve), `loom.fleet_dispatch.latency_ms`, `loom.fleet_dispatch.status` (HTTP status; on a worker `0` with no answer), `loom.fleet_dispatch.result` (`granted` / `refused` / `ok` / `error`, the same set on both sides), `loom.fleet_dispatch.reason` (the refusal reason, `refuse` token, release outcome, or the error class: on a worker `transport` / `status_5xx` / `status_4xx` / `malformed`), `loom.fleet_dispatch.server_epoch`, `loom.assignment.id`, `loom.fleet_dispatch.step` (the step's wire name, when the call names an item), and on a refused claim (#12707) `loom.fleet_dispatch.retry_after_s` (integer seconds), `loom.fleet_dispatch.held_by` (the holding host, only when the captain names one: absent on a no-progress hold) and, when the refusal is a no-progress hold (`reason` `no_progress_cooldown` on the captain, `cooldown` on a worker), `loom.fleet_dispatch.hold_until` (RFC 3339 UTC wall clock: the span's time plus `retry_after_s`; no monotonic value is exported). The captain's span also carries that hold's `loom.fleet_dispatch.hold_rung` (consecutive no-progress releases), `loom.fleet_dispatch.hold_set_by_outcome` and `loom.fleet_dispatch.hold_set_by_assignment_id` (the release that set it). Key ETA queries on `reason`, not on `held_by`. Each key is emitted only when known. And `loom.repo` with `loom.issue` or `loom.pr_number` (by whether the step acts on a PR) when the call names an item; a worker's span also carries `loom.role` (the step's role name, as on `loom.dispatch.step`) | which host asked for what and what the captain answered, and when a worker could not reach it (design §12). Both sides use the same keys and values, so one query joins them. Status `error` on a captain's non-200 answer and on a worker's call with no usable answer. `loom.dispatch.step` carries the same `loom.assignment.id` on a granted step, and on a step a captain refused `loom.dispatch.held_by`, `loom.dispatch.retry_after_s` and (for `captain_cooldown`) `loom.dispatch.hold_until` (#12707) |
 
 GitHub rate limit (Issue #10022):
 
@@ -2634,8 +2648,10 @@ same on every host, whatever its polling time.
 With neither, the record has **no `loom.fact_id` and carries
 `loom.fact_id_missing_reason`** instead: `forge_read_failed` (a history or
 `pulls/{n}` read this pass needed failed) or `no_forge_instant`. Every record
-carries exactly one of the two, and `host.export` counts the second kind
-(`fact_id_missing_total`). Ids keyed on a forge instant are unchanged by
+carries exactly one of the two. (`host.export` once carried a
+`fact_id_missing_total` count of the second kind; it was retired in #12741: no
+producer incremented it after #11301, so it always read `0`. Its absence is not
+a measured zero.) Ids keyed on a forge instant are unchanged by
 #11401. The body field `fact_id_missing_reason` is the producer's view of why
 no forge instant dates the exit, present even when a fallback key applies.
 
@@ -3564,11 +3580,11 @@ elected, there are no caps, and no rate or estimate is computed in the daemon.
 | `exporters[].dropped_total` | integer | records lost over this exporter's lifetime, summed over every reason in `dropped_by_reason`; **durable** (#11527) — survives daemon restarts |
 | `exporters[].dropped_by_reason` | object | the by-reason breakdown behind `dropped_total` (#11527): `queue_overflow`, `capacity_shrink`, `status_<code>`, `non_json_response`, `response_too_large`, `invalid_response`, `trace_unmappable` (envelope counts) and `receiver_rejected` (OTLP partial rejection, in **signal units** — items, not envelopes); omitted when nothing has been lost, and on records from before #11527 |
 | `exporters[].last_flush_ok_at` | RFC3339? | last acked batch; omitted when none this process (unknown, not a fabricated time) |
-| `fact_id_missing_total` | integer | `eta.stage_outcome` exits this process emitted without a `loom.fact_id` (each carried `loom.fact_id_missing_reason`, #11401); cumulative per process lifetime (unlike the durable `dropped_total`, it resets on restart); `0` on records from before #11401 |
 
 Attributes: `loom.host_export.exporters` (count), `.queue_depth` (sum),
-`.dropped_total` (sum), `.last_flush_ok_at` (latest),
-`.fact_id_missing_total`, and `host.lease_id` (#11530).
+`.dropped_total` (sum), `.last_flush_ok_at` (latest), and `host.lease_id`
+(#11530). The retired `fact_id_missing_total` field (#12741) may still appear
+on stored bodies and is ignored on decode; it is no longer emitted.
 
 **`host.lease_id`** is `opaque_host_id(host.id)`: `host-` plus 8 hex chars of
 a salted SHA-256, the same form `loom:lease` comments publish (see

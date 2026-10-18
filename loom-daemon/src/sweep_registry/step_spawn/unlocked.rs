@@ -122,8 +122,9 @@ impl SweepRegistry {
                 dispatch_step::RESULT_REFUSED,
                 refusal.reason,
                 None,
-                refusal.claim.as_ref(),
+                refusal.claim.as_deref(),
                 refusal.assignment_id.as_deref(),
+                refusal.captain.as_deref(),
             );
             log::info!(
                 "sweep_registry: {} step on #{} not spawned — {refusal}",

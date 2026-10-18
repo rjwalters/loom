@@ -166,7 +166,7 @@ pub use main_red_fix::RedMainLane;
 pub use operator_priority::OverflowSlot;
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
-pub use tick_report::{error_kind::DispatchErrorKind, Admission, TickReport};
+pub use tick_report::{error_kind::DispatchErrorKind, Admission, RepoDepth, TickReport};
 #[cfg(test)]
 use tick_summary::reset_last_tick_summary;
 pub use tick_summary::{
