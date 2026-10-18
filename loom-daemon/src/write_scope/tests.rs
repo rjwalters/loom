@@ -406,6 +406,14 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
         ),
         (
+            "claim_reconciliation/orphan_stack.rs",
+            Via(
+                PASS,
+                "orphan-stack pass (#12760): base retarget PATCH, conflict label, flag \
+                 comment; its scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+            ),
+        ),
+        (
             "forge_disable_auto_merge.rs",
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),

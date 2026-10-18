@@ -2015,6 +2015,11 @@ pub mod merge_sequence;
 /// [`forge::reconcile_pr_verdicts`].
 pub mod review_conflict;
 
+/// Retarget open PRs stacked on a parent closed unmerged (#12760) — and its
+/// scratch-worktree git mechanics — sibling files per the file-size ratchet.
+pub mod orphan_stack;
+mod orphan_stack_git;
+
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
 /// rate-limit-breaker re-check that stops it early — a sibling file per the
 /// file-size ratchet rather than more inline logic here.
