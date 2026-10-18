@@ -9,6 +9,7 @@
 //! | `classify --pr N` | `LOOM-CHAMPION-HOLD state=<s> pr=<N> detail=<d>` | 0 |
 //! | `classify`, a hold with `loom:operator`, events unreadable | `state=champion-hold` (no repair this pass) | 0 |
 //! | `classify`, labels or (blocked PR) comments unreadable | (nothing) | 3 |
+//! | `classify`, a clear PR's base unreadable | (nothing) | 3 |
 //! | `merge-failed-marker --pr N --head SHA`, notice due | the marker line | 0 |
 //! | `merge-failed-marker`, notice already posted for this head | (nothing) | 1 |
 //! | `merge-failed-marker`, comments unreadable or no head | (nothing) | 3 |
@@ -24,8 +25,8 @@
 
 use anyhow::Result;
 use loom_daemon::champion_hold::classify::{
-    classify_operator, fetch_operator_adder, merge_failed_notice_due, needs_comments,
-    stray_operator_candidate,
+    classify_operator, fetch_operator_adder, merge_failed_notice_due, needs_comments, stacked_base,
+    stray_operator_candidate, with_stacked_base, PrClass,
 };
 use serde_json::Value;
 
@@ -36,7 +37,9 @@ pub(crate) enum ChampionHoldCommand {
     /// (`loom:blocked` from another actor: skip, no merge, no comment), or
     /// `contradiction` (`loom:pr` beside a contradicting verdict label: the
     /// janitor strips `loom:pr`), or `stray-operator` (a hold the fleet App
-    /// labelled `loom:operator`, #11970: the janitor removes `loom:operator`).
+    /// labelled `loom:operator`, #11970: the janitor removes `loom:operator`),
+    /// or `stacked-on-loom-branch` (based on a Loom stack branch, whether or
+    /// not an open PR still heads it, #12761: skip, no merge, no comment).
     /// Exit 3 with no stdout when a read failed.
     Classify(TargetArgs),
 
@@ -92,6 +95,22 @@ impl TargetArgs {
         let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
         loom_daemon::verdict_gate::label_names(&doc)
     }
+
+    /// A live REST read of `path`, decoded. `None` when unreadable.
+    fn read_json(path: &str, root: &std::path::Path) -> Option<Value> {
+        let out = loom_daemon::script_helpers::run_gh(&["api", path], root, false);
+        serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()
+    }
+
+    /// This PR's base when it is a Loom stack branch (#12761), else `None`.
+    /// One read of the PR for `base.ref`; the parent is not looked up (an
+    /// open, merged or closed parent all mean "do not merge here"). `Err`
+    /// when the base could not be read.
+    fn loom_stack_base(&self, root: &std::path::Path) -> Result<Option<String>, &'static str> {
+        let pull = Self::read_json(&format!("repos/{}/pulls/{}", self.repo(), self.pr), root)
+            .ok_or("base")?;
+        stacked_base(&pull).ok_or("base")
+    }
 }
 
 fn unreadable(verb: &str, pr: u64, what: &str) -> ! {
@@ -116,7 +135,17 @@ impl ChampionHoldCommand {
                 let adder = stray_operator_candidate(&labels, &trusted)
                     .then(|| fetch_operator_adder(t.repo(), t.pr, &root))
                     .flatten();
-                println!("{}", classify_operator(&labels, &trusted, adder).line(t.pr));
+                let class = classify_operator(&labels, &trusted, adder);
+                // Only a clear PR can merge, so only it pays for the base read.
+                let class = if class == PrClass::Clear {
+                    let base = t
+                        .loom_stack_base(&root)
+                        .unwrap_or_else(|what| unreadable("classify", t.pr, what));
+                    with_stacked_base(class, base.as_deref())
+                } else {
+                    class
+                };
+                println!("{}", class.line(t.pr));
                 Ok(())
             }
             ChampionHoldCommand::MergeFailedMarker { target, head } => {
