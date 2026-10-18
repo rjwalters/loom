@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-18
 
+- **Issue #10150** (closed): notify-cleared-blockers runs only from merge-pr.sh: merges made any other way never clear a block
+- **Issue #10196** (closed): telemetry: make SigNoz point-in-time reconstructable — knowable-at timestamps, full fleet-state snapshots over OTLP, per-host export-coverage records, replay contract
+- **Issue #11435** (closed): Failed-roll quarantine: persistent artifact exclusion and eligible-release fallback
+- **Issue #11434** (closed): Roll rollback recovery: retained-binary guard, watchdog and rollback-aware H5
+- **Issue #11433** (closed): Design simple roll-script backup and rollback on failure
 - **PR #12766**: feat: stack a conflicting Builder PR on the open PR it conflicts with
 - **Issue #12759** (closed): Conflict stacking: Builder opens PR on conflicting PR's branch up to maxDepth
 - **PR #12764**: feat(daemon): retarget stacked children whose parent PR closed unmerged
