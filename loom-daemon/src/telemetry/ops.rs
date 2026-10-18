@@ -67,6 +67,8 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
     // engine's per-role slots beside the sweep total.
     "pool",
+    // #12734: `loom.dispatch.pool_items{repo, step}`, a closed set (`Step`).
+    "step",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -338,6 +340,14 @@ pub enum MetricName {
     /// Ready candidates the work finder saw in one tick.
     #[serde(rename = "loom.dispatch.candidates")]
     DispatchCandidates,
+    /// Items the work finder can draw right now, labelled `repo` and `step`
+    /// (#12734): the canonical "dispatchable depth".
+    #[serde(rename = "loom.dispatch.pool_items")]
+    DispatchPoolItems,
+    /// Items the work finder weighed to zero, labelled `repo` and `reason`
+    /// (#12734).
+    #[serde(rename = "loom.dispatch.excluded_items")]
+    DispatchExcludedItems,
     /// The dynamic concurrency cap the tick ran under.
     #[serde(rename = "loom.dispatch.max_concurrent")]
     DispatchMaxConcurrent,
@@ -656,6 +666,8 @@ impl MetricName {
         match self {
             Self::DispatchDecisions => "loom.dispatch.decisions",
             Self::DispatchCandidates => "loom.dispatch.candidates",
+            Self::DispatchPoolItems => "loom.dispatch.pool_items",
+            Self::DispatchExcludedItems => "loom.dispatch.excluded_items",
             Self::DispatchMaxConcurrent => "loom.dispatch.max_concurrent",
             Self::DispatchCapTerm => "loom.dispatch.cap_term",
             Self::DispatchPrOpenPrefiltered => "loom.dispatch.pr_open_prefiltered",
@@ -786,6 +798,8 @@ impl MetricName {
         match self {
             Self::DispatchDecisions
             | Self::DispatchCandidates
+            | Self::DispatchPoolItems
+            | Self::DispatchExcludedItems
             | Self::QueueStarved
             | Self::QueueStarvedByReason
             | Self::QueueDispatchWaitSamples => "{issue}",
@@ -852,6 +866,10 @@ impl MetricName {
         match self {
             Self::DispatchDecisions => "Work-finder candidate outcomes per tick, by reason.",
             Self::DispatchCandidates => "Ready candidates seen by one work-finder tick.",
+            Self::DispatchPoolItems => "Items the work finder can draw now, by repo and step.",
+            Self::DispatchExcludedItems => {
+                "Items the work finder excluded from the draw, by repo and reason."
+            }
             Self::DispatchMaxConcurrent => "Dynamic concurrency cap for the work-finder tick.",
             Self::DispatchCapTerm => "The configured, disk and RAM terms of the tick's cap.",
             Self::DispatchPrOpenPrefiltered => {

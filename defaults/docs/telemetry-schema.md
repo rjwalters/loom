@@ -1786,6 +1786,8 @@ Every other name is a **`Gauge`**:
 | Metric | Unit | Cadence |
 |---|---|---|
 | `loom.dispatch.candidates`, `loom.dispatch.max_concurrent` | count | every work-finder tick |
+| `loom.dispatch.pool_items` (`repo`, `step`, #12734) | count | every step-engine tick, non-zero pairs only (absence means zero) |
+| `loom.dispatch.excluded_items` (`repo`, `reason`, #12734) | count | every step-engine tick, non-zero pairs only (absence means zero) |
 | `loom.dispatch.cap_term` (`kind` = `configured`, #11858) | count | every multi-workspace tick |
 | `loom.queue.oldest_wait` (`state` = `ready`/`blocked`) | seconds | every multi-workspace work-finder tick, only for a state with a waiting issue |
 | `loom.queue.starved` (`state` = `ready`/`blocked`) | count | every multi-workspace tick, both states, `0` included |
@@ -1816,6 +1818,18 @@ when both are `0`. `loom.queue.already_landed` (#11858) splits the
 `already_landed` rows by the landed guard's evidence (the row's `detail`), so
 the `forge_closed` / `journal_landed` split is measurable in SigNoz. Issue numbers and repos are never labels. The per-issue rows travel in
 `queue.snapshot`.
+
+`loom.dispatch.pool_items` (#12734) is the canonical **dispatchable depth**:
+the items the work finder can draw right now, per `repo` and `step` (a
+`Step` name), read after claims and the Builder hold are applied, so a held
+workspace contributes none. Do not derive it from `loom:issue` label counts:
+the step classifier excludes an issue whose joined PR is parked, so the label
+count overstates it. `loom.dispatch.excluded_items` is the complement, per
+`repo` and `reason` (a `PassReason` name, or `pool_exhausted`,
+`build_backoff`, `cooling_down`, `merge_in_flight`). Both emit non-zero pairs
+only, so an absent series means zero. `repo` is the registered workspace
+slug; `step` and `reason` are closed sets, so cardinality is bounded.
+`loom.dispatch.candidates` is unchanged and still counts both together.
 
 `loom.dispatch.cap_term` (#11858) carries the cap's terms. Since #12406 the
 only term is `kind="configured"`: the cap is `autonomous.workFinder.maxConcurrent`
