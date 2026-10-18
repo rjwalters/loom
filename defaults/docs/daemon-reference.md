@@ -4336,6 +4336,26 @@ open `loom:review-requested` and `loom:merge-conflict` PRs.
 | `loom:blocked` / `loom:operator` / `loom:frozen` | Never touched. |
 | `loom:reviewing` / `loom:treating` | Left to the agent in flight. |
 
+#### Orphaned stacked children (parent closed unmerged, #12760)
+
+`merge-pr.sh` reconciles stacked children when a parent **merges**. A parent
+PR **closed without merging** produces no merge event, so its children kept a
+base branch that will never reach the default branch.
+`claim_reconciliation::orphan_stack` runs on the same tick, after the
+review-conflict, merge-sequence and CI-gate passes, on the same shared open-PR
+listing.
+
+| Property | Behavior |
+|----------|----------|
+| Kill switch | `LOOM_ORPHAN_STACK_RECONCILE` (`0`/`false`/`no`/`off` disables), nested inside `LOOM_STALE_CLAIM_RECONCILE`. Defaults **ON**. One host per workspace runs it (the role-runner shard). |
+| Discovery | An open PR whose base is a stackable Loom branch (`feature/issue-<N>`, `feature/harness-ops-<N>`) that is not the head of any open PR. Only those cost a read: `GET pulls?head=<owner>:<base>&state=closed`, newest match. `merged_at == null` ⇒ orphan; a merged parent is left to the merged-parent path. |
+| Gates | Hold labels (`loom:blocked`/`loom:operator`/`loom:frozen` …) and `loom:reviewing`/`loom:treating` are skipped; so is a child whose **issue lease** is fresh or unreadable (not `loom:building`, which a Builder's issue keeps while its PR is open). |
+| Rebase repos | Replay `<closed parent head>..<child head>` onto the fetched default-branch tip in a scratch worktree (`.loom/worktrees/orphan-restack-pr-<N>`, removed afterwards; the primary checkout is never switched). The parent head is fetched via `refs/pull/<N>/head`, so a deleted parent branch does not matter. `forge rebase-guard` must not block; the remote head must still be the listed head; the push is `--force-with-lease=refs/heads/<child>:<listed head>`. Only then is the base retargeted (`PATCH pulls/<N> base=<default>`) and a report comment posted. PRs stacked on the child are replayed onto its new head the same way (base unchanged). |
+| Merge repos | No rewrite and **no retarget** (the closed parent's commits never reached the default branch, so a retarget would carry them into the PR): flagged instead. |
+| Flag | Conflict, refusal (unreadable parent head, rebase-guard block) or merge mode: `loom:merge-conflict` plus one comment carrying `<!-- loom:orphan-stack flagged parent=<N> head=<sha> -->` and the exact commands to finish by hand. Nothing more happens until the child's head moves. |
+| Idempotency | A retargeted child's base is the default branch, so discovery no longer matches it. |
+| Unknowns | A failed read, fetch or push, or a remote head that moved since the listing, is a skip for this tick, never a write. |
+
 ### Startup capacity seed: adopting live survivors (#6262)
 
 The passes above answer "is this *dead* claim reclaimable?". The mirror-image
