@@ -230,6 +230,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`write_scope.refused`](#write_scoperefused--a-daemon-pass-write-the-9548-gate-refused) | log, OTLP only | `write_scope.rs` (`gate()` and the per-call checks, `emit_refused`) |
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
 | [`merge.queue.observed`](#mergequeueobserved--the-merge-queue-as-an-existing-read-saw-it) | log, OTLP only | `forge_merge_queue/group_github.rs` (`GroupForge::groups`) |
+| [`merge.queue.regime`](#mergequeueregime--the-merge-queue-settings-on-change-only) | log, OTLP only | `forge_merge_queue/group_run.rs` (`tick_groups`, from `preflight::github_preflight`) |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
 
@@ -4080,16 +4081,41 @@ Attributes: `loom.merge_queue.queue_state` / `queue_complete` / `queue_depth`
 (`MERGE_QUEUE_OBSERVED_LOG_ATTRIBUTE_KEYS`, kept by the collector's
 `transform/privacy` `keep_keys`, contract-tested).
 
-**Queue-regime snapshot (`check_response_timeout_minutes`,
-`max_entries_to_build`, `grouping_strategy`): not exported (deferred).** These
-settings live in the active `merge_queue` rule's `parameters`. An existing read
-already carries them: `merge_group_ci/eligibility.rs:347` does
-`GET repos/<nwo>/rules/branches/<branch>?per_page=100` and keeps the active
-`merge_queue` rule's parameters as opaque JSON in `Eligibility.merge_queue`
-(they are not named in non-test Rust because the field is passed through
-untyped). That read is a CLI eligibility check, not a daemon-tick read, so it
-is not used here: emitting from it would be on-demand rather than on change.
-The snapshot is tracked in #12675.
+The queue-regime snapshot is the separate [`merge.queue.regime`](#mergequeueregime--the-merge-queue-settings-on-change-only) kind (Issue #12675).
+
+
+### `merge.queue.regime` — the merge-queue settings, on change only
+
+One OTLP log (INFO) when the active `merge_queue` rule's settings
+(`check_response_timeout_minutes`, `max_entries_to_build`, `grouping_strategy`)
+differ from the last ones this daemon process saw for the repository, and once
+on first observation after a daemon start (the dedupe state is in-process, not
+persisted). They shape `merge_wait` / `merge_hold` duration. OTLP-only
+(`native: false`).
+
+**No forge call is added.** The values ride on the `rules/branches/<branch>`
+read that `tick_groups` already makes every daemon tick
+(`preflight::github_preflight`); `Capability` now carries them. The
+`merge_group_ci/eligibility.rs` read is CLI-only (no prior state to compare
+against), so it is not a source.
+
+The JSON body holds `check_response_timeout_minutes`, `max_entries_to_build`,
+`grouping_strategy`, `ambiguous`, `observed_at` and `loom` build provenance; a
+record whose provenance does not validate is not exported.
+
+Known limits are encoded, not hidden:
+
+- A key absent from the rule's `parameters` is `null` in the body and its
+  attribute is omitted. It is never defaulted.
+- `ambiguous = true`: more than one `merge_queue` rule with differing
+  parameters applies to the branch. The three fields are `null`; no value is
+  guessed.
+
+Attributes: `loom.merge_queue.check_response_timeout_minutes` /
+`max_entries_to_build` / `grouping_strategy` (each omitted when unknown) /
+`regime_ambiguous` / `version` / `revision` / `provenance_complete`
+(`MERGE_QUEUE_REGIME_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested).
 
 
 ### `write_scope.refused` — a daemon-pass write the #9548 gate refused

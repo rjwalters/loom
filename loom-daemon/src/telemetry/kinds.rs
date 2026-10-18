@@ -166,6 +166,8 @@ pub mod daemon_exit;
 pub mod merge_queue_event;
 /// `merge.queue.observed` (#12667) — the merge queue as one existing read saw it.
 pub mod merge_queue_observed;
+/// `merge.queue.regime` (#12675) — the merge-queue settings, on change only.
+pub mod merge_queue_regime;
 /// `daemon.run_state_request` (#12546) — who issued a pause/drain/stop/restart.
 pub mod run_state_request;
 /// `write_scope.refused` (#12168) — a daemon write the #9548 gate refused.
@@ -540,6 +542,13 @@ macro_rules! telemetry_kind_table {
             /// `mergeQueue.entries` read saw it (#12667). OTLP-only. See
             /// [`merge_queue_observed`].
             MergeQueueObserved = "merge.queue.observed" => $crate::telemetry::kinds::merge_queue_observed::MergeQueueObservedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// The merge-queue regime (`check_response_timeout_minutes`,
+            /// `max_entries_to_build`, `grouping_strategy`) read from the
+            /// daemon tick's rules read, emitted on change only (#12675).
+            /// OTLP-only. See [`merge_queue_regime`].
+            MergeQueueRegime = "merge.queue.regime" => $crate::telemetry::kinds::merge_queue_regime::MergeQueueRegimeRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

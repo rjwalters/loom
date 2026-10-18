@@ -17,6 +17,7 @@ mod host_status;
 mod issue_estimate;
 mod merge_queue_event;
 mod merge_queue_observed;
+mod merge_queue_regime;
 mod metadata;
 mod operator_presence;
 mod ops;
@@ -626,6 +627,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::MergeQueueEvent(_)
         | TelemetryRecord::MergeQueueObserved(_)
+        | TelemetryRecord::MergeQueueRegime(_)
         | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::RunStateRequest(_)
         | TelemetryRecord::ScopeMemory(_)
@@ -648,7 +650,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))
                 .or_else(|| merge_queue_event::log_parts(r))
-                .or_else(|| merge_queue_observed::log_parts(r))?;
+                .or_else(|| merge_queue_observed::log_parts(r))
+                .or_else(|| merge_queue_regime::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
