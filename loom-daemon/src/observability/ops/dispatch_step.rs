@@ -49,6 +49,19 @@ pub struct StepDispatch<'a> {
     /// `loom.dispatch.retry_after_s`, plus `loom.dispatch.hold_until` (wall
     /// clock) when the refusal is a no-progress hold.
     pub captain: Option<&'a crate::fleet_dispatch::worker::Refusal>,
+    /// The role draw's model against the model actually launched (#12748).
+    pub models: Option<StepModels<'a>>,
+}
+
+/// Selected versus launched model of a spawned step. Distinct on purpose: a
+/// model in the draw record is a *selection*, not proof the launch used it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepModels<'a> {
+    /// The model the role draw's pick named, if it named one.
+    pub selected: Option<&'a str>,
+    /// The `--model` the child was launched with; `None` when the runtime
+    /// picks its own.
+    pub launched: Option<&'a str>,
 }
 
 /// The span for `step` in `repo` at `at`. Pure.
@@ -123,6 +136,14 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
             }
         }
     }
+    if let Some(models) = step.models {
+        if let Some(selected) = models.selected {
+            attributes.insert("loom.step.model_selected".into(), selected.to_string());
+        }
+        if let Some(launched) = models.launched {
+            attributes.insert("loom.step.model_launched".into(), launched.to_string());
+        }
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,
@@ -178,6 +199,7 @@ mod tests {
             claim: None,
             assignment_id: None,
             captain: None,
+            models: None,
         }
     }
 
@@ -213,6 +235,26 @@ mod tests {
 
     /// #12450: a granted step carries the captain's assignment, and it
     /// survives the export allowlist; a step with none carries no key.
+    #[test]
+    fn a_step_span_separates_the_selected_model_from_the_launched_one() {
+        let step = StepDispatch {
+            models: Some(StepModels {
+                selected: Some("sonnet"),
+                launched: Some("opus"),
+            }),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(span.attributes["loom.step.model_selected"], "sonnet");
+        assert_eq!(span.attributes["loom.step.model_launched"], "opus");
+        for key in ["loom.step.model_selected", "loom.step.model_launched"] {
+            assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key));
+        }
+        let none = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert!(!none.attributes.contains_key("loom.step.model_selected"));
+        assert!(!none.attributes.contains_key("loom.step.model_launched"));
+    }
+
     #[test]
     fn a_granted_step_names_its_assignment() {
         let step = StepDispatch {

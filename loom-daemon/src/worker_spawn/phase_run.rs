@@ -981,6 +981,7 @@ mod tests {
         crate::runtime_preference::Tap {
             runtime: "opencode".into(),
             model_profile: Some("zai-flash".into()),
+            model: None,
         }
     }
 
