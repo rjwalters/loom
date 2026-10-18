@@ -92,6 +92,9 @@ path = "defaults/scripts/lib/worktree-forge-pr-check.sh"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_pull_listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/orphan_stack.rs"
 
 [[operation]]
 id = "pr.list-open"
