@@ -133,8 +133,8 @@ pub const DEFAULT_NO_PROGRESS_LADDER: [Duration; 4] = [
 pub const PROGRESS_OUTCOMES: [&str; 4] = ["verdict", "merged", "moved", "success"];
 
 /// The `release` outcome of a step that ended waiting on CI (Judge
-/// `ci_pending`, Champion `requeued`, #12551): neither progress nor a
-/// failure to find work. It arms [`Policy::ci_wait`], not the escalating
+/// `ci_pending`) or on a retry (Champion `requeued`, any gate, #12551): neither
+/// progress nor a failure to find work. It arms [`Policy::ci_wait`], not the escalating
 /// ladder, and leaves the streak and the item's other holds alone.
 pub const CI_WAIT_OUTCOME: &str = "ci_wait";
 
