@@ -4495,6 +4495,29 @@ remedy. It is independent of the #9259 reconcile defer and is not bypassed by
 `--allow-stacked-children`. Repos with `delete_branch_on_merge=true` are
 unaffected by the script, but GitHub's own flow retargets there.
 
+### Conflict stacking config (`stacking.onConflict`, #12758)
+
+The switch and depth cap for conflict stacking (epic #12757): when a new PR
+would conflict with an open PR, it is built on that PR's branch instead of on
+`main`. This entry covers only the config key. The behaviour that reads it is
+#12759.
+
+| Config key | Env override | Default | Meaning |
+|---|---|---|---|
+| `stacking.onConflict.enabled` | *(config only)* | `false` | Stack a conflicting PR on the open PR it conflicts with. A non-bool value is ignored: the default applies and a `WARN` names the key |
+| `stacking.onConflict.maxDepth` | *(config only)* | `3` | Deepest stack allowed; past it the next conflicting PR goes flat against `main`. `0` is valid and means never stack. Negative, non-integer, string, or over `u32` values are ignored the same way. `3` is a starting guess, not a measured value |
+
+Read with `resolve_effective_config` + `get_path`
+(`loom_daemon::stacking_config::stacking_on_conflict(main_root)`), so every
+config tier applies, and from the **main clone** root, not a Builder worktree.
+Each field falls back on its own: a bad `maxDepth` keeps a valid `enabled`. The
+code default is off, so a host outside the fleet sees no change. The fleet
+default (on) is set in fleet-gitops `config.defaults`, which reaches each host
+as the machine defaults tier. A per-repo override goes in that repo's fleet
+`config:` entry, which reaches the host as `.loom-local/fleet-repo.json`
+(#11738) and beats the repo's committed `.loom/config.json`. There is no env
+override and no other per-repo mechanism.
+
 ## Epic supervisor (#3842)
 
 The **epic supervisor** (epic #3842) drives every open `loom:epic` issue

@@ -373,6 +373,8 @@ pub mod session_reconcile;
 pub mod session_status;
 pub mod short_hash;
 pub mod signoz_read;
+/// `stacking.onConflict` accessor: the conflict-stacking switch and depth cap (#12758).
+pub mod stacking_config;
 pub mod stale_blocked;
 pub(crate) mod stale_token_retry;
 pub mod startup_adoption;
