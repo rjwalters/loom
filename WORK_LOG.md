@@ -8,6 +8,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-18
 
+- **PR #12763**: fix(champion): skip an approved PR whose base is a Loom stack branch
+- **PR #12762**: feat: add stacking.onConflict config accessor with fleet-tier resolution
+- **PR #12755**: refactor: remove unreferenced mcp-loom shared exports
+- **PR #12749**: feat: hold several repositories per private Codex account volume
+- **Issue #12761** (closed): Champion can merge a stacked child PR into its open parent's branch when the sequencer has not held it
+- **Issue #12758** (closed): Conflict stacking: config key and fleet-tier resolution (stacking.onConflict)
+- **Issue #12751** (closed): Remove dead exports from mcp-loom shared modules
 - **PR #12750**: fix: launch Builder steps on the role draw's model
 - **PR #12747**: refactor: remove three uncalled pub fns from loom-daemon
 - **PR #12746**: feat: gate automatic loom:issue promotion on issue-author trust
