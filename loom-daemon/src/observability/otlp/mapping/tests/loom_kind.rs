@@ -168,6 +168,8 @@ fn samples() -> Vec<TelemetryRecord> {
                     "at": AT, "loom": p})),
         wire(json!({"kind": "merge.queue.observed", "state": "observed", "complete": true,
                     "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "merge.queue.regime", "ambiguous": false,
+                    "observed_at": AT, "loom": p})),
         wire(json!({"kind": "daemon.exit", "exit_code": 143, "requested_by": "unknown",
                     "relaunch_expected": false, "supervisor": "systemd",
                     "in_flight_sweeps": [], "in_flight_fate": "die_with_cgroup",

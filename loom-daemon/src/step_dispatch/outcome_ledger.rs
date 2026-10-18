@@ -464,6 +464,9 @@ pub enum CooldownCause {
     /// window, held here instead. Unlike [`Self::ForgeLadder`] it is restored
     /// after a restart, since the forge has nothing to read back.
     ForgeLadderFallback,
+    /// A captain's `cooldown` refusal (#12704): its hold, so the next tick
+    /// does not ask again before it ends.
+    CaptainHold,
 }
 
 /// Counters the ledger keeps (for `pick.decision` and the gates).
