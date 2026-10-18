@@ -440,6 +440,7 @@ fn fake_inputs<'a>(
     PassInputs {
         index,
         is_private_clone: private,
+        recover_private: &|_, _, _| Ok(()),
         fallback_workspace: fallback,
         registered: Some(registered),
         denials_for: &|_| Ok(drift::Denials::default()),
@@ -697,19 +698,20 @@ fn a_never_seen_missing_container_uses_the_fallback_workspace() {
 
 #[test]
 #[serial]
-fn a_private_clone_account_is_skipped_not_created() {
+fn a_private_clone_account_is_recovered_never_created_host_mounted() {
     let env = setup(&["alice"], &["alice"]);
     let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
     let mut state = ReconcileState::default();
     let private = |_: &AccountDescriptor| -> anyhow::Result<bool> { Ok(true) };
     assert_eq!(
         pass(&mut lifecycle, &env, &private, &mut state, 0),
-        vec![Outcome::PrivateCloneSkipped]
+        vec![Outcome::PrivateRecovered]
     );
     // Undecidable mode fails closed too.
     let unknown = |_: &AccountDescriptor| -> anyhow::Result<bool> { bail!("bad state") };
+    let mut fresh = ReconcileState::default();
     assert_eq!(
-        pass(&mut lifecycle, &env, &unknown, &mut state, 60),
+        pass(&mut lifecycle, &env, &unknown, &mut fresh, 60),
         vec![Outcome::PrivateCloneSkipped]
     );
     assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
@@ -1140,4 +1142,60 @@ fn an_operator_start_is_never_left_running_and_held() {
     std::fs::create_dir_all(dir.join(session_hold::LAST_START_FILE).join("x")).unwrap();
     let status = lifecycle.start("alice").unwrap();
     assert!(status.running && !status.held, "{status:?}");
+}
+
+/// One pass over alice with a caller-supplied private recovery.
+fn recover_pass(
+    lifecycle: &mut SessionLifecycle<Fake>,
+    env: &Env,
+    recover: &PrivateRecovery<'_>,
+    state: &mut ReconcileState,
+    now: u64,
+) -> Vec<Outcome> {
+    let index = AccountIndex::from_inventories(&[&env.accounts]);
+    let fake = lifecycle.runner().clone();
+    let registered = fake.registered.lock().unwrap().clone();
+    let mut take = || fake.snapshot(&registered);
+    let mut observe = PassSnapshot::new(&mut take);
+    let private = |_: &AccountDescriptor| -> anyhow::Result<bool> { Ok(true) };
+    let inputs = PassInputs {
+        recover_private: recover,
+        ..fake_inputs(&fake, &index, &private, Path::new("/srv/checkouts"), &registered)
+    };
+    reconcile_accounts(lifecycle, &env.accounts, &inputs, &mut observe, state, now)
+        .into_iter()
+        .map(|o| o.outcome)
+        .collect()
+}
+
+#[test]
+#[serial]
+fn private_recovery_failure_backs_off_and_never_touches_the_host_path() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let mut state = ReconcileState::default();
+    let calls = std::cell::Cell::new(0);
+    let failing = |_: &AccountDescriptor, _: Option<&str>, _: &dyn Fn() -> bool| {
+        calls.set(calls.get() + 1);
+        bail!("workspace volume is missing")
+    };
+    let first = recover_pass(&mut lifecycle, &env, &failing, &mut state, 0);
+    assert!(matches!(&first[0], Outcome::Failed { error, .. } if error.contains("volume")));
+    // Inside the backoff window the recovery is not retried.
+    let second = recover_pass(&mut lifecycle, &env, &failing, &mut state, 1);
+    assert!(matches!(second[0], Outcome::BackingOff { .. }));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
+}
+
+#[test]
+#[serial]
+fn private_recovery_hold_at_the_mutation_boundary_is_reported_held() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let mut state = ReconcileState::default();
+    let held = |_: &AccountDescriptor, _: Option<&str>, _: &dyn Fn() -> bool| {
+        Err(anyhow::Error::from(OperatorHeld))
+    };
+    assert_eq!(recover_pass(&mut lifecycle, &env, &held, &mut state, 0), vec![Outcome::Held]);
 }

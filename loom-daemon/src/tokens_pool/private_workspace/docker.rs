@@ -219,6 +219,18 @@ pub(super) fn idle(state: Option<&Value>, container: &str) -> Result<bool> {
         && processes.contains(&"/bin/sleep infinity"))
 }
 
+pub(super) fn volume_exists(volume: &str) -> Result<bool> {
+    let volumes = command(&["volume", "ls", "--format", "{{.Name}}"])?;
+    Ok(volumes.lines().any(|name| name == volume))
+}
+
+/// The recorded image must already be local: recovery never pulls or swaps one.
+pub(super) fn image_present(image: &str) -> Result<()> {
+    command(&["image", "inspect", "--format", "{{.Id}}", image])
+        .map(drop)
+        .with_context(|| format!("recorded session image {image} is not available locally"))
+}
+
 pub(super) fn create(config: &Config, image: &str) -> Result<()> {
     let volumes = command(&["volume", "ls", "--format", "{{.Name}}"])?;
     if volumes.lines().any(|name| name == config.volume) {

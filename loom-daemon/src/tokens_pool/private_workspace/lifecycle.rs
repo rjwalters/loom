@@ -169,6 +169,69 @@ pub fn start(
     snapshot(config, &dir)
 }
 
+/// Unattended recovery of an already-configured private session whose
+/// container is stopped or gone (#12772). Unlike [`start`] it never provisions:
+/// it resolves the persisted identity, resumes a stopped container or recreates
+/// a missing one against the surviving volume and the recorded `image`, then
+/// re-verifies ownership, mounts and controls. It does not run `prepare`, so no
+/// clone, fetch or reset touches unfinished work, and a restart is not an
+/// admission: each job still proves its own containment.
+///
+/// `check_hold` runs under the exclusive account lease, immediately before the
+/// first mutation, and fails the recovery when an operator hold has appeared.
+pub fn recover(
+    workspace: &Path,
+    name: &str,
+    image: Option<&str>,
+    check_hold: &dyn Fn() -> Result<()>,
+) -> Result<Status> {
+    let (config, dir) = resolve(workspace, name)?;
+    let lease = lease::Lease::acquire(&dir)?;
+    let state = docker::inspect(&config.container)?;
+    if let Some(state) = &state {
+        docker::validate(&config, state)?;
+    }
+    lease.recover(&config, state.as_ref())?;
+    if !docker::idle(state.as_ref(), &config.container)? {
+        bail!("private session has an unleased or unverified worker; not recovering it");
+    }
+    match &state {
+        Some(state) if state["State"]["Running"] == true => {}
+        Some(_) => {
+            check_hold()?;
+            docker::command(&["start", &config.container])?;
+        }
+        None => {
+            // `create` would silently make an empty volume; recovery must not.
+            if !docker::volume_exists(&config.volume)? {
+                bail!(
+                    "private workspace volume {} is missing; refusing to create an empty \
+                     replacement (restore it or reconfigure with session start --private-clone)",
+                    config.volume
+                );
+            }
+            let image = image.context(
+                "recorded session image is unknown; refusing to substitute one (start the \
+                 session by hand with --image)",
+            )?;
+            docker::image_present(image)?;
+            check_hold()?;
+            docker::provision_controls(&config, image)?;
+            docker::create(&config, image)?;
+        }
+    }
+    let state = docker::inspect(&config.container)?.context("recovered session disappeared")?;
+    docker::validate(&config, &state)?;
+    if state["State"]["Running"] != true {
+        bail!("recovered private session is not running");
+    }
+    mark_session_managed(&config.profile, &config.container)?;
+    let id = state["Id"].as_str().context("container id unavailable")?;
+    docker::setup(&config)?;
+    docker::control(&config, id)?;
+    snapshot(config, &dir)
+}
+
 fn snapshot(config: Config, dir: &Path) -> Result<Status> {
     let state = docker::inspect(&config.container)?;
     if let Some(state) = &state {
