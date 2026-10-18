@@ -361,6 +361,10 @@ async fn a_no_progress_release_refuses_every_hosts_next_claim_until_the_cooldown
         assert_eq!(refusal["reason"], json!("cooldown"), "a hold is not a live claim (`held`)");
         assert_eq!(refusal["retry_after_s"], json!(1800));
         assert_eq!(call.reason.as_deref(), Some(NO_PROGRESS_REASON));
+        assert_eq!(call.retry_after_s, Some(1800));
+        let hold = call.hold.expect("a hold refusal names its hold");
+        assert_eq!((hold.rung, hold.set_by_outcome.as_str()), (1, "noop"));
+        assert!(!hold.set_by_assignment_id.is_empty());
     }
     let c = s.counters.lock().unwrap().clone();
     assert_eq!(c.refusals.get(&("claim", NO_PROGRESS_REASON.to_string())), Some(&2));

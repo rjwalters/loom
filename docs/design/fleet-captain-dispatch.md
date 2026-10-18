@@ -317,6 +317,7 @@ All signals go out over OTLP with the daemon's existing exporter, with `loom.rep
 | Signal | Where | Meaning |
 |---|---|---|
 | `loom.fleet_dispatch.call` span, one per call | worker and captain | `host`, endpoint, latency, granted or refused, `reason`, `server_epoch` (Phase 2 adds `queue_age_s` and queue size) |
+| Refusal and hold attributes on the call span (#12707) | worker and captain | `step`, `retry_after_s`, `held_by` (when the captain names a holder), and for a no-progress hold `hold_until` (RFC 3339 UTC wall clock); the captain's span adds `hold_rung`, `hold_set_by_outcome`, `hold_set_by_assignment_id`. A refused `loom.dispatch.step` carries `loom.dispatch.held_by` / `retry_after_s` / `hold_until`. Stable names for ETA queries; key on `reason`, since a hold has no `held_by` |
 | `loom.assignment.id` attribute | the existing `loom.dispatch.step` span | joins assign → pre-check → claim → outcome |
 | `claim_lost` after a grant (**derived**, not a new signal) | captain | the existing refusals counter with `reason=claim_lost`, which only a `refuse` after a grant can carry; the split-brain and attended-claim measure |
 | `loom.fleet_dispatch.refusals` counter | captain | refusals by reason: `claim` refusals and `refuse` tokens |

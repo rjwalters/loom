@@ -366,6 +366,8 @@ fn org_facts(rules: Vec<Rule>) -> RepoFacts {
         can_push: Some(true),
         rules: Some(rules),
         writer_statuses: None,
+        status_route: None,
+        status_command_error: None,
     }
 }
 
@@ -459,6 +461,8 @@ fn this_repository_shape_is_ineligible() {
         can_push: Some(true),
         rules: Some(vec![required_rule(&["Structural Checks"])]),
         writer_statuses: None,
+        status_route: None,
+        status_command_error: None,
     };
     let got = prereqs(&facts, &[]);
     assert!(got.contains(&Prereq::OwnerNotOrganization));
@@ -581,6 +585,19 @@ fn writer_app_with_statuses_read_is_not_eligible() {
     assert_eq!(Prereq::WriterCannotPostStatuses.as_str(), "WRITER_CANNOT_POST_STATUSES");
     facts.writer_statuses = Some("write".into());
     assert!(prereqs(&facts, &[qualified()]).is_empty());
+}
+
+#[test]
+fn status_command_route_replaces_the_writer_permission_prerequisite() {
+    let mut facts = org_facts(vec![mq_rule(), required_rule(&["Gate"])]);
+    facts.writer_statuses = Some("read".into());
+    facts.status_route = Some("statusCommand".into());
+    assert!(prereqs(&facts, &[qualified()]).is_empty(), "writer permission is moot");
+    facts.status_command_error = Some("exit 1".into());
+    assert_eq!(prereqs(&facts, &[qualified()]), vec![Prereq::StatusCommandRefused]);
+    assert_eq!(Prereq::StatusCommandRefused.as_str(), "STATUS_COMMAND_REFUSED");
+    let v = serde_json::to_value(evaluate(&facts, &[qualified()], &[])).unwrap();
+    assert_eq!(v["facts"]["status_route"], "statusCommand");
 }
 
 #[test]

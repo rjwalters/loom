@@ -293,6 +293,20 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fleet_dispatch.reason",
     "loom.fleet_dispatch.server_epoch",
     "loom.assignment.id",
+    // Refusal and hold facts (#12707), for ETA queries: the step, the holder,
+    // seconds to retry, the hold's wall-clock end (RFC 3339 UTC), its ladder
+    // rung and the release that set it; `loom.dispatch.*` mirrors the
+    // holder, retry and hold end on a refused `loom.dispatch.step`.
+    "loom.fleet_dispatch.step",
+    "loom.fleet_dispatch.retry_after_s",
+    "loom.fleet_dispatch.held_by",
+    "loom.fleet_dispatch.hold_until",
+    "loom.fleet_dispatch.hold_rung",
+    "loom.fleet_dispatch.hold_set_by_outcome",
+    "loom.fleet_dispatch.hold_set_by_assignment_id",
+    "loom.dispatch.held_by",
+    "loom.dispatch.retry_after_s",
+    "loom.dispatch.hold_until",
     // `reaper.pass` spans (#12461): one worktree-reaper pass over one repo and
     // worktree class — counts, bytes and preserved-by-fixed-reason.
     "loom.reaper.class",
