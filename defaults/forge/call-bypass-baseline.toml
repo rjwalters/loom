@@ -68,18 +68,6 @@ owner = "role-scripts"
 removal_issue = 9799
 
 [[bypass]]
-path = "defaults/scripts/experiments/judge-fanout-corpus-runner.sh"
-calls = 3
-owner = "role-scripts"
-removal_issue = 9799
-
-[[bypass]]
-path = "defaults/scripts/experiments/judge-fanout-experiment.sh"
-calls = 1
-owner = "role-scripts"
-removal_issue = 9799
-
-[[bypass]]
 path = "defaults/scripts/guide-docs-telemetry.sh"
 calls = 1
 owner = "role-scripts"

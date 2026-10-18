@@ -195,23 +195,6 @@ assert_true "resync-installed.sh documents the configs in its surface map" \
   "$(grep -qF '.loom/biome.jsonc       <- defaults/.loom/biome.jsonc' "$RESYNC_SH" && echo true || echo false)"
 
 # ============================================================================
-# Test 6: the parse-erroring experiment script is actually under .loom/
-# ============================================================================
-echo ""
-echo "=== the file that triggered #6031 falls inside the excluded subtree ==="
-
-# defaults/scripts/X installs to .loom/scripts/X, so the Workflow script is
-# covered by .loom/biome.jsonc's blanket exclusion. If it ever moves out of
-# defaults/scripts/, this exclusion stops covering it.
-assert_true "judge-fanout-workflow.js still installs under .loom/scripts/" \
-  "$([[ -f "$REPO_ROOT/defaults/scripts/experiments/judge-fanout-workflow.js" ]] && echo true || echo false)"
-
-# Sanity: it really does contain the top-level `return` that no standard-JS
-# parser will accept (i.e. the exclusion is load-bearing, not cargo-culted).
-assert_true "judge-fanout-workflow.js contains a top-level return" \
-  "$(grep -qE '^return[[:space:]]' "$REPO_ROOT/defaults/scripts/experiments/judge-fanout-workflow.js" && echo true || echo false)"
-
-# ============================================================================
 # Summary
 # ============================================================================
 echo ""
