@@ -768,7 +768,7 @@ fn release_rewrites_the_marker_so_the_claim_frees_at_once() {
     fake_gh(dir.path());
     let a = who(Role::Doctor, "sweep-a");
     fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
-    assert_eq!(ctx(dir.path(), a.clone()).release(None, None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
     let patched = fs::read_to_string(dir.path().join("patched")).unwrap();
     assert!(patched.contains("repos/acme/widgets/issues/comments/100"), "{patched}");
     assert!(patched.contains(&a.released_marker()), "{patched}");
@@ -793,7 +793,7 @@ fn a_champion_release_records_its_step_outcome() {
         fake_gh(dir.path());
         let a = who(Role::Champion, "sweep-c");
         fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
-        assert_eq!(ctx(dir.path(), a.clone()).release(None, outcome), EXIT_HELD);
+        assert_eq!(ctx(dir.path(), a.clone()).release(None, outcome, None), EXIT_HELD);
         (a, fs::read_to_string(dir.path().join("patched")).unwrap())
     };
     let (a, patched) = release(Some("head-moved"));
@@ -804,6 +804,30 @@ fn a_champion_release_records_its_step_outcome() {
     assert!(patched.contains(&a.released_marker()), "{patched}");
     let (a, patched) = release(Some("a b-->"));
     assert!(patched.contains(&a.released_marker_with(" outcome=ab--")), "{patched}");
+}
+
+/// #12715: a requeued or skipped Champion release names the gate it stopped
+/// at; a stop that names none is `unspecified`, never a guess.
+#[test]
+fn a_champion_stop_release_records_its_gate() {
+    let release = |outcome: &str, reason: Option<&str>| {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        let a = who(Role::Champion, "sweep-c");
+        fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
+        assert_eq!(ctx(dir.path(), a.clone()).release(None, Some(outcome), reason), EXIT_HELD);
+        (a, fs::read_to_string(dir.path().join("patched")).unwrap())
+    };
+    for (outcome, reason, want) in [
+        ("skipped", Some("facts_unread"), " outcome=skipped reason=facts_unread"),
+        ("requeued", Some("merge_rc7"), " outcome=requeued reason=merge_rc7"),
+        ("requeued", None, " outcome=requeued reason=unspecified"),
+        ("skipped", Some("a b-->"), " outcome=skipped reason=ab--"),
+        ("held", Some("facts_unread"), " outcome=held"),
+    ] {
+        let (a, patched) = release(outcome, reason);
+        assert!(patched.contains(&a.released_marker_with(want)), "{want}: {patched}");
+    }
 }
 
 /// #12616: the daemon's reap of a dead Champion records `outcome=none`.
@@ -902,7 +926,7 @@ fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() 
     let mut c = ctx(dir.path(), on("host-a", "run-1"));
     c.lease_file = Some(lease_file.clone());
     assert_eq!(c.claim(), EXIT_HELD);
-    assert_eq!(c.release(None, None), EXIT_HELD);
+    assert_eq!(c.release(None, None, None), EXIT_HELD);
     assert_eq!(fs::read_to_string(&lease_file).unwrap(), "", "nothing left to reap");
     // A reap after a verdict landed frees the lease and records nothing.
     let dir = TempDir::new().unwrap();
@@ -1177,7 +1201,7 @@ fn a_step_less_fence_and_release_find_the_sessions_stepped_lease() {
     assert_eq!(plain.step, Some(StepRole::ChampionMerge), "the default step differs");
     assert_eq!(ctx(dir.path(), plain.clone()).fence(), EXIT_HELD, "own lease, not a peer's");
     assert_eq!(ctx(dir.path(), plain.clone()).check(), EXIT_HELD);
-    assert_eq!(ctx(dir.path(), plain).release(None, None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), plain).release(None, None, None), EXIT_HELD);
     // The released marker keeps the lease's own step.
     assert!(
         patched(dir.path()).contains(&claimed.released_marker()),
@@ -1214,7 +1238,7 @@ fn an_issue_scoped_release_reads_no_pr_head() {
     fake_gh(dir.path());
     let curator = Identity::new(Role::Curator, "host-a".into(), "run-1".into(), None).unwrap();
     fs::write(dir.path().join("rows"), live_row(100, &curator)).unwrap();
-    assert_eq!(ctx(dir.path(), curator.clone()).release(None, None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), curator.clone()).release(None, None, None), EXIT_HELD);
     assert!(patched(dir.path()).contains(&curator.released_marker()));
     assert!(!dir.path().join("pulled").exists(), "no PR read for a Curator lease");
 }

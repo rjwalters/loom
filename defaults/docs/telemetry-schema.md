@@ -2786,7 +2786,9 @@ projected reason, so `passVerdictQuery` still parses both):
 | `head_sha` | the head evaluated, when the run recorded it (the Champion pin file, else the mirror); absent otherwise |
 | `step` | `champion_pr` or `champion_issue` |
 | `class` | `verdict`, `noop`, `refused` or `failed` |
-| `reason_set` | `champion_merge_v1`, `champion_promotion_v1` or `champion_triage_v1` |
+| `reason_set` | `champion_merge_v2`, `champion_promotion_v1` or `champion_triage_v1` |
+| `loom.sweep_id` | the step's sweep id, to join a verdict to its session (#12715) |
+| `reason_detail` | the raw `reason=` token of a `skipped` / `requeued` step (body `detail`), bounded to token characters (#12715) |
 | `ledger_class` / `ledger_reason` | the outcome ledger's own classification. It can differ from `class` / `reason`: a red-CI rejection keeps `loom:pr`, so the ledger says `failed unclassified` where the projection says `refused ci_failing`. `probe_failed` when the mirror was not fresh |
 | `criterion` (+ `reason_key` in the body) | the raw `champion:reject:<criterion>:<reason_key>` tokens |
 | `first_refused_at` | when this refusal identity was first seen on this head |
@@ -2795,10 +2797,15 @@ projected reason, so `passVerdictQuery` still parses both):
 | `fact_id` | derived, never random: `derived_hex(["loom.pass.verdict", mechanism, repo, number, head_sha, criterion_key, reason_key, evaluated_at hour], 32)`. A duplicate from another host dedups on read |
 | `version` / `revision` | the deciding build |
 
-**Champion merge gate (`champion_merge_v1`, `step=champion_pr`).**
+**Champion merge gate (`champion_merge_v2`, `step=champion_pr`).**
 `merged` is `verdict`. `refused` carries `ci_failing`, `conflict`, `label`,
 `size`, `critical_file`, `stale`, `head_moved`, `not_eligible` or `unknown`
-(an unnamed criterion). `noop` carries `ci_pending` or `held`. `failed` carries
+(an unnamed criterion). `noop` carries `held`, or, for a `skipped` / `requeued`
+step, the gate it names with `reason=` (#12715): `facts_unread`, `janitor_rc3`,
+`verdict_rc11`, `ci_pending`, `mergeable_unknown`, `pin_missing`, `merge_rc<N>`,
+or `unspecified` when it named none or an unknown one. `ci_pending` is never
+inferred from the word `requeued`. A `skipped` / `requeued` step is never
+ledgered `failed`, even with no readable journal. `failed` carries
 `failed` or `unclassified`. A rejection whose duplicate comment the guard
 suppressed keeps the stored identity's reason and `first_refused_at`.
 
