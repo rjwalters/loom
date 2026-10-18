@@ -19,7 +19,7 @@
 //! | [`PrClass::Contradiction`] | `loom:pr` beside `loom:changes-requested` / `loom:review-requested` | the janitor repairs it (strips `loom:pr`) |
 //! | [`PrClass::ChampionHold`] | `loom:blocked` with a standing hold marker | leaves it; criteria #2/#3 decide |
 //! | [`PrClass::StrayOperator`] | a hold, plus a fleet-added `loom:operator` and no capped-hold recommendation | removes `loom:operator`; the hold stands |
-//! | [`PrClass::StackedOnOpenParent`] | otherwise clear, but based on an open Loom parent's branch | skips the PR: no merge attempt, no comment, no label change |
+//! | [`PrClass::StackedOnLoomBranch`] | otherwise clear, but based on a Loom stack branch | skips the PR: no merge attempt, no comment, no label change |
 //! | [`PrClass::Clear`] | none of these | the 6 criteria run |
 //!
 //! A foreign park is checked first: a PR another actor parked is theirs, even
@@ -34,17 +34,25 @@
 //! are holds for a person and stay ([`classify_operator`]).
 //!
 //! A stacked child (#12761) targets its parent's head branch, not the default
-//! branch. Merging it there moves the parent PR's head under its approval, and
-//! its `Closes #<child>` never fires (a non-default-branch merge). The merge
+//! branch. Merging it there moves the parent PR's head under its approval (or,
+//! once the parent is gone, lands it on a dead branch), and its
+//! `Closes #<child>` never fires (a non-default-branch merge). The merge
 //! sequencer's `StackedBase` edge guards it only above `TRIGGER_OPEN_PRS` open
 //! PRs, and only after a claim-reconcile tick. So a PR that would otherwise be
-//! [`PrClass::Clear`] is [`PrClass::StackedOnOpenParent`] while its base is a
-//! [stackable](crate::merge_pr::stacked_children::is_stackable_parent_branch)
-//! branch that an open PR still heads ([`stacked_base`], [`parent_is_open`],
-//! [`with_stacked_base`]). Once the parent lands and the child is retargeted,
-//! its base is the default branch and it is clear again. A hold, park or
-//! contradiction keeps its own state: none of them merges either, and each has
-//! its own handling.
+//! [`PrClass::Clear`] is [`PrClass::StackedOnLoomBranch`] whenever its base is
+//! a [stackable](crate::merge_pr::stacked_children::is_stackable_parent_branch)
+//! Loom branch (`feature/issue-<N>`, `feature/harness-ops-<N>`), whatever the
+//! state of the parent PR that heads it ([`stacked_base`],
+//! [`with_stacked_base`]). The parent is deliberately not looked up: an open
+//! parent, a merged parent whose branch survived, and a parent closed unmerged
+//! are all a merge Champion must not make. Liveness holds without the lookup:
+//! when the parent lands, GitHub (branch deleted) or the merged-parent
+//! reconcile (branch kept) retargets the child to the default branch, and it
+//! is clear again. A closed parent's orphan stays skipped until #12760's pass
+//! or a human retargets it. Any other base (the default branch, `release/*`,
+//! `develop`, ...) is untouched: a deliberate non-default base still merges. A
+//! hold, park or contradiction keeps its own state: none of them merges
+//! either, and each has its own handling.
 //!
 //! [`merge_failed_marker`] is the second half: the "Merge Failed" notice is
 //! posted at most once per head.
@@ -79,9 +87,9 @@ pub enum PrClass {
     /// Champion's own hold carrying a fleet-added `loom:operator` (#11970):
     /// remove `loom:operator`, leave the hold.
     StrayOperator(HoldKind),
-    /// Based on the named branch, which a still-open Loom parent PR heads
-    /// (#12761): skip, silently, until the parent lands and this is retargeted.
-    StackedOnOpenParent(String),
+    /// Based on the named Loom stack branch (#12761), whether or not an open
+    /// PR still heads it: skip, silently, until this is retargeted.
+    StackedOnLoomBranch(String),
 }
 
 impl PrClass {
@@ -94,7 +102,7 @@ impl PrClass {
             PrClass::ForeignPark => "foreign-park",
             PrClass::Contradiction(_) => "contradiction",
             PrClass::StrayOperator(_) => "stray-operator",
-            PrClass::StackedOnOpenParent(_) => "stacked-on-open-parent",
+            PrClass::StackedOnLoomBranch(_) => "stacked-on-loom-branch",
         }
     }
 
@@ -105,7 +113,7 @@ impl PrClass {
     pub fn line(&self, pr: u64) -> String {
         let detail = match self {
             PrClass::Contradiction(label) => *label,
-            PrClass::StackedOnOpenParent(base) => base.as_str(),
+            PrClass::StackedOnLoomBranch(base) => base.as_str(),
             PrClass::ChampionHold(HoldKind::MergeRisk)
             | PrClass::StrayOperator(HoldKind::MergeRisk) => "merge-risk",
             PrClass::ChampionHold(HoldKind::CriticalFile)
@@ -247,74 +255,31 @@ pub fn classify_operator<L: AsRef<str>, C: AsRef<str>>(
     }
 }
 
-/// A PR's base, from its REST pull object (#12761).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrBase {
-    /// Not a stackable Loom parent branch: the default branch, or any other.
-    Unstacked,
-    /// A stackable Loom parent branch (`feature/issue-<N>`,
-    /// `feature/harness-ops-<N>`).
-    Stacked {
-        /// The branch, e.g. `feature/issue-100`.
-        branch: String,
-        /// `owner:branch`, the REST `head=` filter for the PR it heads.
-        label: String,
-    },
-}
-
-/// The PR's base from its REST pull object (`GET repos/{o}/{r}/pulls/{n}`).
-/// `None` when `base.ref` is missing, or a stacked base names no owner: an
-/// unknown base is never [`PrBase::Unstacked`].
+/// The PR's Loom stack base from its REST pull object
+/// (`GET repos/{o}/{r}/pulls/{n}`, #12761): `Some(Some(branch))` for a
+/// [stackable](crate::merge_pr::stacked_children::is_stackable_parent_branch)
+/// base, `Some(None)` for any other (the default branch, `release/*`, ...).
+/// `None` when `base.ref` is missing or empty: an unknown base is never an
+/// unstacked one.
 #[must_use]
-pub fn stacked_base(pull: &Value) -> Option<PrBase> {
+pub fn stacked_base(pull: &Value) -> Option<Option<String>> {
     let branch = pull.pointer("/base/ref").and_then(Value::as_str)?.trim();
     if branch.is_empty() {
         return None;
     }
-    if !crate::merge_pr::stacked_children::is_stackable_parent_branch(branch) {
-        return Some(PrBase::Unstacked);
-    }
-    let owner = pull
-        .pointer("/base/repo/owner/login")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            pull.pointer("/base/label")
-                .and_then(Value::as_str)
-                .and_then(|l| l.split_once(':'))
-                .map(|(owner, _)| owner)
-        })
-        .map(str::trim)
-        .filter(|o| !o.is_empty())?;
-    Some(PrBase::Stacked {
-        branch: branch.to_string(),
-        label: format!("{owner}:{branch}"),
-    })
+    Some(
+        crate::merge_pr::stacked_children::is_stackable_parent_branch(branch)
+            .then(|| branch.to_string()),
+    )
 }
 
-/// Whether an open PR heads `branch`, from a REST open-pulls listing
-/// (`GET repos/{o}/{r}/pulls?state=open&head=<owner:branch>`). A row counts
-/// only when its `head.ref` is `branch` and its `state` is `open` (or
-/// absent: the listing asked for open PRs). `None` when the listing is not
-/// an array: an unread parent is never a landed one.
+/// `class`, except that a [`PrClass::Clear`] PR based on the Loom stack
+/// branch `stacked_base` is [`PrClass::StackedOnLoomBranch`]. Every other
+/// state stands.
 #[must_use]
-pub fn parent_is_open(listing: &Value, branch: &str) -> Option<bool> {
-    let rows = listing.as_array()?;
-    Some(rows.iter().any(|row| {
-        row.pointer("/head/ref").and_then(Value::as_str) == Some(branch)
-            && row
-                .get("state")
-                .and_then(Value::as_str)
-                .is_none_or(|s| s == "open")
-    }))
-}
-
-/// `class`, except that a [`PrClass::Clear`] PR based on `open_parent_base`
-/// (a stackable branch an open PR heads) is
-/// [`PrClass::StackedOnOpenParent`]. Every other state stands.
-#[must_use]
-pub fn with_stacked_base(class: PrClass, open_parent_base: Option<&str>) -> PrClass {
-    match (class, open_parent_base) {
-        (PrClass::Clear, Some(base)) => PrClass::StackedOnOpenParent(base.to_string()),
+pub fn with_stacked_base(class: PrClass, stacked_base: Option<&str>) -> PrClass {
+    match (class, stacked_base) {
+        (PrClass::Clear, Some(base)) => PrClass::StackedOnLoomBranch(base.to_string()),
         (class, _) => class,
     }
 }
@@ -551,19 +516,11 @@ mod tests {
         })
     }
 
-    fn open_pr(head: &str) -> Value {
-        serde_json::json!({"number": 1, "state": "open", "head": {"ref": head}})
-    }
-
-    /// The CLI's composition, over canned REST reads: labels, the child's
-    /// pull object, and the open-PR listing for its base (#12761).
-    fn classify_stacked(labels: &[&str], pull: &Value, open: &Value) -> Option<PrClass> {
+    /// The CLI's composition, over canned REST reads: labels and the PR's
+    /// pull object (#12761). No parent lookup.
+    fn classify_stacked(labels: &[&str], pull: &Value) -> Option<PrClass> {
         let class = classify(labels, &NONE);
-        let base = match stacked_base(pull)? {
-            PrBase::Stacked { branch, .. } => parent_is_open(open, &branch)?.then_some(branch),
-            PrBase::Unstacked => None,
-        };
-        Some(with_stacked_base(class, base.as_deref()))
+        Some(with_stacked_base(class, stacked_base(pull)?.as_deref()))
     }
 
     #[test]
@@ -571,72 +528,65 @@ mod tests {
         // Two open PRs: parent #1 (feature/issue-1 -> main) and its approved
         // child #2 (-> feature/issue-1). The sequencer does not run at <= 2
         // open PRs, so this state is the only thing between #2 and a merge.
-        let listing = Value::Array(vec![open_pr("feature/issue-1")]);
-        let class = classify_stacked(&["loom:pr"], &pull("feature/issue-1"), &listing);
-        assert_eq!(class, Some(PrClass::StackedOnOpenParent("feature/issue-1".into())));
+        let class = classify_stacked(&["loom:pr"], &pull("feature/issue-1"));
+        assert_eq!(class, Some(PrClass::StackedOnLoomBranch("feature/issue-1".into())));
         assert_eq!(
             class.unwrap().line(2),
-            "LOOM-CHAMPION-HOLD state=stacked-on-open-parent pr=2 detail=feature/issue-1"
+            "LOOM-CHAMPION-HOLD state=stacked-on-loom-branch pr=2 detail=feature/issue-1"
         );
-        let ho = Value::Array(vec![open_pr("feature/harness-ops-350")]);
         assert_eq!(
-            classify_stacked(&["loom:pr"], &pull("feature/harness-ops-350"), &ho),
-            Some(PrClass::StackedOnOpenParent("feature/harness-ops-350".into()))
+            classify_stacked(&["loom:pr"], &pull("feature/harness-ops-350")),
+            Some(PrClass::StackedOnLoomBranch("feature/harness-ops-350".into()))
         );
     }
 
     #[test]
     fn a_default_or_non_loom_base_is_unaffected() {
-        let listing = Value::Array(vec![open_pr("main")]);
         for base in [
             "main",
             "release/1.2",
+            "develop",
             "feature/issue-1-extra",
             "feature/other-3",
         ] {
-            assert_eq!(stacked_base(&pull(base)), Some(PrBase::Unstacked), "{base}");
-            assert_eq!(
-                classify_stacked(&["loom:pr"], &pull(base), &listing),
-                Some(PrClass::Clear),
-                "{base}"
-            );
+            assert_eq!(stacked_base(&pull(base)), Some(None), "{base}");
+            assert_eq!(classify_stacked(&["loom:pr"], &pull(base)), Some(PrClass::Clear), "{base}");
         }
     }
 
     #[test]
-    fn a_landed_parent_leaves_the_child_clear() {
-        // No open PR heads the base any more (a merged parent whose branch
-        // survived): this guard stands down; a closed parent is #12760's.
-        let empty = Value::Array(vec![]);
+    fn a_landed_parent_does_not_clear_the_child() {
+        // A merged parent whose branch survived: the base is still a Loom
+        // stack branch, so the child stays skipped until it is retargeted
+        // (a merge here would land on a branch that already landed).
         assert_eq!(
-            classify_stacked(&["loom:pr"], &pull("feature/issue-1"), &empty),
-            Some(PrClass::Clear)
+            classify_stacked(&["loom:pr"], &pull("feature/issue-1")),
+            Some(PrClass::StackedOnLoomBranch("feature/issue-1".into()))
         );
-        // A same-named head that is not open, or another head, is not it.
-        let closed = serde_json::json!([{"state": "closed", "head": {"ref": "feature/issue-1"}}]);
-        assert_eq!(parent_is_open(&closed, "feature/issue-1"), Some(false));
-        let other = Value::Array(vec![open_pr("feature/issue-9")]);
-        assert_eq!(parent_is_open(&other, "feature/issue-1"), Some(false));
     }
 
     #[test]
-    fn an_unreadable_base_or_parent_is_never_clear() {
+    fn a_closed_unmerged_parent_does_not_clear_the_child() {
+        // The parent was closed and its branch kept: the decision reads only
+        // the child's base, so a dead parent is skipped exactly like a live one.
+        assert_eq!(
+            classify_stacked(&["loom:pr"], &pull("feature/harness-ops-7")),
+            Some(PrClass::StackedOnLoomBranch("feature/harness-ops-7".into()))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_base_is_never_clear() {
         assert_eq!(stacked_base(&serde_json::json!({"number": 2})), None);
         assert_eq!(stacked_base(&serde_json::json!({"base": {"ref": ""}})), None);
-        // A stacked base with no owner cannot be looked up.
-        assert_eq!(stacked_base(&serde_json::json!({"base": {"ref": "feature/issue-1"}})), None);
-        assert_eq!(
-            stacked_base(
-                &serde_json::json!({"base": {"ref": "feature/issue-1", "label": "acme:feature/issue-1"}})
-            ),
-            Some(PrBase::Stacked {
-                branch: "feature/issue-1".into(),
-                label: "acme:feature/issue-1".into()
-            })
-        );
-        assert_eq!(parent_is_open(&serde_json::json!({"message": "Bad credentials"}), "x"), None);
+        assert_eq!(stacked_base(&serde_json::json!({"message": "Bad credentials"})), None);
         let unread = serde_json::json!({"message": "Bad credentials"});
-        assert_eq!(classify_stacked(&["loom:pr"], &pull("feature/issue-1"), &unread), None);
+        assert_eq!(classify_stacked(&["loom:pr"], &unread), None);
+        // No owner is needed any more: there is no head= lookup to build.
+        assert_eq!(
+            stacked_base(&serde_json::json!({"base": {"ref": "feature/issue-1"}})),
+            Some(Some("feature/issue-1".into()))
+        );
     }
 
     #[test]
