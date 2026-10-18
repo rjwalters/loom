@@ -170,7 +170,13 @@ pub(super) fn record_prepared(
         runtime: "codex".into(),
         provider: "codex".into(),
         account: config.account.clone(),
-        repository: config.repository.clone(),
+        // The clone this job acts on (#10796): an additional clone's recovery
+        // record must name it, not the account's primary.
+        repository: if job.repository.is_empty() {
+            config.repository.clone()
+        } else {
+            job.repository.clone()
+        },
         logical_root: root.canonicalize()?,
         owner: job.owner.clone(),
         issue: job.issue,
@@ -315,7 +321,7 @@ fn read_small(root: &Path, path: &Path) -> Result<Vec<u8>> {
 }
 
 pub(super) fn snapshot(issue: Option<u64>) -> Result<Snapshot> {
-    let repo = Path::new(REPO);
+    let repo = &worker_setup::selected_clone()?;
     let branch = issue.map(|n| format!("feature/issue-{n}"));
     let worktree = issue
         .map(|n| repo.join(format!(".loom/worktrees/issue-{n}")))

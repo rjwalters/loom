@@ -252,7 +252,8 @@ fn a_bare_host_process_cannot_produce_worker_evidence() {
     for bound in ["", "not-hex", &"a".repeat(64)] {
         std::env::set_var("LOOM_PRIVATE_CONTROL", bound);
         assert!(
-            in_container("seat", bound, &"b".repeat(40)).is_err(),
+            in_container("seat", bound, &"b".repeat(40), "https://example.invalid/o/r", REPO)
+                .is_err(),
             "a host produced a proof for bound={bound:?}"
         );
     }
@@ -300,10 +301,15 @@ fn malformed_or_absent_identity_is_refused() {
         ("non-hex container", job("not-a-container", &"c".repeat(64), &"b".repeat(40))),
         ("symbolic revision", job(&"a".repeat(64), &"c".repeat(64), "HEAD")),
     ] {
-        assert!(host_proof(&config, &ok, &job).is_err(), "{what}");
+        assert!(host_proof(&config, &ok, &job, &config.primary()).is_err(), "{what}");
     }
-    let proof =
-        host_proof(&config, &ok, &job(&"a".repeat(64), &"c".repeat(64), &"b".repeat(40))).unwrap();
+    let proof = host_proof(
+        &config,
+        &ok,
+        &job(&"a".repeat(64), &"c".repeat(64), &"b".repeat(40)),
+        &config.primary(),
+    )
+    .unwrap();
     assert_eq!(proof.runtime(), "codex");
     assert_eq!(proof.control(), &"c".repeat(64));
     let provenance = proof.provenance(
@@ -321,4 +327,112 @@ fn malformed_or_absent_identity_is_refused() {
     assert!(!rendered.contains(&"a".repeat(64)), "{rendered}");
     assert!(!rendered.contains(&"c".repeat(64)), "{rendered}");
     assert!(!rendered.contains(&*profile.to_string_lossy()), "{rendered}");
+}
+
+/// A proof certifies one clone (#10796): the durable job must name exactly the
+/// clone the selection prepared, and a proof never answers for another
+/// repository.
+#[test]
+fn a_proof_is_bound_to_the_clone_it_was_measured_against() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = profile(dir.path(), Some(&[]), &["fresh"]);
+    let mut config = Config {
+        schema_version: 1,
+        account: "seat".into(),
+        container: "c".into(),
+        engine: "e".into(),
+        docker_desktop: false,
+        repository: "https://example.invalid/o/primary".into(),
+        base: "main".into(),
+        repositories: vec![],
+        volume: "v".into(),
+        profile: profile.clone(),
+        gh_config: None,
+    };
+    let second = identify("https://example.invalid/o/second").unwrap();
+    config.repositories.push(Registered {
+        repository: second.url.clone(),
+        base: "main".into(),
+        slug: second.slug.clone(),
+    });
+    let job = |repository: &str| lease::Job {
+        owner: "fixture".into(),
+        kind: JobKind::Role,
+        issue: None,
+        branch: None,
+        container_id: "a".repeat(64),
+        base_revision: "b".repeat(40),
+        host_pid: 1,
+        control: "c".repeat(64),
+        repository: repository.into(),
+    };
+    let ok = report(true, &profile);
+    let primary = config.primary();
+    let other = config.target(Some(&second.url)).unwrap();
+
+    // The lease of one clone never certifies the other, in either direction.
+    assert!(host_proof(&config, &ok, &job(""), &other).is_err());
+    assert!(host_proof(&config, &ok, &job(&second.url), &primary).is_err());
+    assert!(host_proof(&config, &ok, &job("https://example.invalid/o/third"), &other).is_err());
+
+    let proof = host_proof(&config, &ok, &job(&second.url), &other).unwrap();
+    proof
+        .require_repository("https://example.invalid/o/second.git")
+        .unwrap();
+    assert!(proof
+        .require_repository("https://example.invalid/o/primary")
+        .is_err());
+    let provenance = proof.provenance(vec![], std::collections::BTreeMap::new());
+    assert_eq!(provenance.repository, "example.invalid/o/second");
+    assert_eq!(provenance.clone, format!("{WORK_ROOT}/{}", second.slug));
+    assert!(provenance
+        .summary()
+        .contains("repository=example.invalid/o/second"));
+
+    let primary_proof = host_proof(&config, &ok, &job(""), &primary).unwrap();
+    assert_eq!(primary_proof.provenance(vec![], Default::default()).clone, REPO);
+}
+
+/// Only the primary and a slug directly under the work root are clones.
+#[test]
+fn only_known_clone_shapes_are_accepted() {
+    for ok in [REPO, "/workspace/work/o-n-0123abcd"] {
+        assert!(valid_clone(ok), "{ok}");
+    }
+    for bad in [
+        "",
+        "/workspace",
+        "/workspace/repo/x",
+        "/workspace/work",
+        "/workspace/work/",
+        "/workspace/work/../repo",
+        "/workspace/work/a/b",
+        "/host/repo",
+    ] {
+        assert!(!valid_clone(bad), "{bad}");
+    }
+}
+
+/// The worker looks the identity record up by the repository's own slug, so an
+/// additional clone cannot be answered for by another clone's record.
+#[test]
+fn identity_record_is_derived_from_the_repository_not_chosen() {
+    let id = identify("https://example.invalid/o/second").unwrap();
+    assert_eq!(
+        identity_record("https://example.invalid/o/second", &format!("{WORK_ROOT}/{}", id.slug))
+            .unwrap(),
+        Path::new(WORK_ROOT)
+            .join(".identity")
+            .join(format!("{}.json", id.slug))
+    );
+    assert_eq!(
+        identity_record("https://example.invalid/o/primary", REPO).unwrap(),
+        Path::new(ROOT).join("identity.json")
+    );
+    // A clone directory that is not this repository's slug is another clone.
+    assert!(identity_record(
+        "https://example.invalid/o/other",
+        &format!("{WORK_ROOT}/{}", id.slug)
+    )
+    .is_err());
 }

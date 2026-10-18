@@ -59,7 +59,7 @@ pub(super) fn register(
 
 /// Refuse a repository the fleet roster marks `firewall: true` (notebook,
 /// corporate) before any clone: a cached roster that cannot be read fails closed.
-fn check_firewall(workspace: &Path, id: &RepoId) -> Result<()> {
+pub(super) fn check_firewall(workspace: &Path, id: &RepoId) -> Result<()> {
     let records: Vec<(String, Option<String>)> =
         super::super::session_lifecycle::firewalled_records(workspace)
             .context("cannot read the firewall roster; refusing to clone")?
