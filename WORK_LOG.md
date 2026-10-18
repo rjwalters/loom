@@ -15,6 +15,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-18
 
+- **PR #12778**: feat: replace an orphaned stacked child with a child-only PR in merge-mode repos
+- **Issue #12767** (closed): Merge-mode repos: an orphaned stacked child (parent closed unmerged) is flagged but never de-stacked
 - **PR #12783**: docs: require per-finding status in Doctor's review handoff
 - **Issue #10867** (closed): Judge approves a PR without reconciling open changes-requested findings from other reviewers (operator session); only Champion caught it
 - **Issue #10150** (closed): notify-cleared-blockers runs only from merge-pr.sh: merges made any other way never clear a block
