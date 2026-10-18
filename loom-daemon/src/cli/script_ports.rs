@@ -378,6 +378,14 @@ pub(crate) enum ScriptPortCommand {
     /// refused with nothing mutated, 2 the rebase itself failed.
     ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
 
+    /// The git half of Doctor's orphan-stack replacement recipe (#12767): in a
+    /// merge-mode repository, replay a stacked child's own commits (the closed
+    /// parent's excluded) onto the default branch as a NEW branch, never
+    /// rewriting the original. Exit 0 done, 1 refused with nothing pushed,
+    /// 2 transient.
+    #[command(subcommand)]
+    OrphanReplace(super::orphan_replace::OrphanReplaceCommand),
+
     /// Build a PINNED `--force-with-lease=<branch>:<oid>` push argument, or
     /// refuse (#9487). Backs the lease capture in `reconcile-stack.sh` and
     /// `rebase-stacked-children.sh`. A bare `--force-with-lease` compares
@@ -712,6 +720,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::OrphanReplace(cmd) => cmd.run(),
             ScriptPortCommand::PushLease(cmd) => cmd.run(),
             ScriptPortCommand::BranchUpdate(cmd) => cmd.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),

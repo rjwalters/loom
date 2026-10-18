@@ -61,7 +61,8 @@
 //!   `loom:merge-conflict` and ONE comment naming the closed parent and how to
 //!   finish by hand. In rebase mode that is the exact `rebase --onto` + pinned
 //!   push. In merge mode it is NOT a force-push recipe: the remedy conflicts
-//!   with #10771, and the comment says so and points to #12767. The comment
+//!   with #10771, and the comment says Doctor opens a replacement PR
+//!   ([`crate::orphan_replace`], #12767) and points to its recipe. The comment
 //!   carries [`FLAGGED_MARKER_PREFIX`] keyed by the child's head, so the next
 //!   tick does nothing until the head moves.
 //!
@@ -368,14 +369,14 @@ pub fn flag_comment_body(ctx: &FlagContext<'_>, reason: &FlagReason) -> String {
         // #10771 forbids the rewrite the fix needs; never hand out a
         // force-push recipe as routine in a merge-mode repository.
         FlagReason::MergeMode => format!(
-            "Added `{MERGE_CONFLICT}`. Loom will not fix this automatically: the merge-mode \
-             remedy for a closed stacked parent is tracked in #12767. Until it is settled, a \
-             human decides. One option that needs no force-push is to cherry-pick this PR's \
-             own commits (`{}..{}`) onto a new branch from `{}`, open a new PR from it, and \
-             close this one.\n\n",
+            "Added `{MERGE_CONFLICT}`. Doctor picks this PR up and opens a replacement PR from \
+             `{}` that carries only this PR's own commits (`{}..{}`), then links the two and \
+             closes this one. This branch is never rewritten, and the closed parent's commits \
+             never reach the default branch. The recipe is in `doctor.md`, \"Orphan-stack \
+             replacement\" (#12767).\n\n",
+            ctx.retarget_to.unwrap_or("the default branch"),
             ctx.upstream,
             ctx.head,
-            ctx.retarget_to.unwrap_or("the default branch"),
         ),
         FlagReason::NotLoomBranch => format!(
             "Added `{MERGE_CONFLICT}`. The branch's author needs to move only this PR's own \

@@ -38,6 +38,9 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12684**: fix: write merge-driver .gitattributes into the install worktree
 - **#12696**: feat: accept approve/request-changes aliases in post-verdict.sh
 - **#12718**: fix: take verdict-gate review start from dispatch and fail closed
+- **#12771**: docs: align Judge/Doctor CI-wait recipes and mark unreadable required checks unknown
+- **#12774**: feat: bind private-clone admission and launch to the selected repository clone
+- **#12777**: feat: recover stopped or missing private Codex sessions in reconcile
 
 ## Very Important
 
@@ -69,6 +72,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles
 - **#8779**: peer-claim coordination is DEGRADED on a dispatch worker (#6157 Layer 3)
 - **#9081**: guard-background-subagents misses a background Bash started by a foreground subagent: headless sweep exits, Builder's make verify reaped
 - **#9736**: health: detect stalled release updates without a source checkout
@@ -88,6 +92,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
+- **#10574**: forge wait-checks / judge+doctor prompts: required-contexts via REST, Pending-CI --timeout, doctor step 10 (#10569 follow-ups)
+- **#10796**: Codex multi-repo dispatch: bind clone-specific admission and qualify doctor/builder parity
 - **#12082**: Worktree-isolation guard blocks Bash writes to paths outside the repo when the cwd is the main checkout
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301
 - **#12236**: guard: shared command-analysis lexer + corpus harness, first move: merge-redirect check (slice 1 of #11113)
@@ -112,6 +118,10 @@ Issues currently being built (`loom:building`).
 - **#12683**: install-loom.sh writes the merge-driver .gitattributes into the target's main checkout but leaves it out of the install PR
 - **#12692**: post-verdict.sh: accept `approve` as an alias or name the valid verdicts in the error
 - **#12714**: Verdict gate: take review start from dispatch, fail closed, follow Part-of links (#12624 misses the #12512 case)
+- **#12767**: Merge-mode repos: an orphaned stacked child (parent closed unmerged) is flagged but never de-stacked
+- **#12772**: Recover configured private Codex containers through the existing session reconciler
+- **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
+- **#12776**: Restore retained daemon binary after failed operator or fleet roll
 
 ## PRs Awaiting Review
 
@@ -120,6 +130,9 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
+- **#12778**: feat: replace an orphaned stacked child with a child-only PR in merge-mode repos
+- **#12779**: feat: restore the retained daemon binary when a rolled candidate fails to start
+- **#12780**: refactor: stop planning automatic merge-order holds between independent PRs
 
 ## Approved (Awaiting Merge)
 
@@ -154,6 +167,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12684**: fix: write merge-driver .gitattributes into the install worktree
 - **#12696**: feat: accept approve/request-changes aliases in post-verdict.sh
 - **#12718**: fix: take verdict-gate review start from dispatch and fail closed
+- **#12771**: docs: align Judge/Doctor CI-wait recipes and mark unreadable required checks unknown
+- **#12774**: feat: bind private-clone admission and launch to the selected repository clone
+- **#12777**: feat: recover stopped or missing private Codex sessions in reconcile
 
 ## Proposed
 
@@ -177,9 +193,7 @@ Issues carrying `loom:curated`.
 - **#9957**: daemon: deliberate stops (SIGTERM) are silent autonomy losses — the watchdog goes down with it, the intent marker is deleted, and bootstrap cannot recover *(curated)*
 - **#9978**: feat(champion): optional per-repo merge-queue mode — enqueue Judge-approved PRs to GitHub's merge queue instead of merge-pr.sh's freshness/re-date loop *(curated)*
 - **#10083**: CI path filter skips label_registry Rust tests on label-file-only PRs (how #10072 turned main red) *(curated)*
-- **#10150**: notify-cleared-blockers runs only from merge-pr.sh: merges made any other way never clear a block *(curated)*
 - **#10181**: ci: backend paths filter omits defaults/forge/**, so forge_inventory tests skip on manifest/baseline-only PRs *(curated)*
-- **#10196**: telemetry: make SigNoz point-in-time reconstructable — knowable-at timestamps, full fleet-state snapshots over OTLP, per-host export-coverage records, replay contract *(curated)*
 - **#10257**: merge queue Phase C: combined-tree CI qualification and eligible-repo live pilot (parent #9978) *(curated)*
 - **#10332**: Epic: cut GitHub API usage ~10x — per-consumer quotas, fix chatty loops, then push-not-poll via a loom-ui read mirror (baseline 105k gh calls/day) *(curated)*
 - **#10337**: Dispatcher yields to its own leaseless loom:building label and orphans the issue (3 starred issues 2026-10-05 00:40Z) *(curated)*
@@ -202,7 +216,6 @@ Issues carrying `loom:curated`.
 - **#11287**: Umbrella: Z.ai GLM-5.3-Flash seats landing code in the fleet via OpenCode *(curated)*
 - **#11300**: Z.ai seat telemetry via the egress proxy in transparent observe mode: per-request tokens/latency/429s to SigNoz, OpenCode headers untouched *(curated)*
 - **#11301**: check-stale-blocked: the per-repo budget probe spends ~1.4k GraphQL points/h on the writer bucket that runs dry *(curated)*
-- **#11433**: Design simple roll-script backup and rollback on failure *(curated)*
 - **#11595**: Pause-and-roll budget path can still kill an in-flight merge-pr.sh (follow-up to #11263) *(curated)*
 - **#11703**: Config precedence: fleet-gitops values must override repo-committed .loom/config.json (general rule + enforcement) *(curated)*
 - **#11712**: Daemon: export OTLP only and remove inbound control channels other than config (2am#4300) *(curated)*
@@ -259,7 +272,11 @@ Issues carrying `loom:curated`.
 - **#12714**: Verdict gate: take review start from dispatch, fail closed, follow Part-of links (#12624 misses the #12512 case) *(curated)*
 - **#12740**: Export the holding assignment id on fleet-dispatch 'held' refusal spans *(curated)*
 - **#12753**: Add the remaining AC4 command-capture tests for drawn-model launch (non-Builder, unavailable candidate, private handoff) *(curated)*
+- **#12767**: Merge-mode repos: an orphaned stacked child (parent closed unmerged) is flagged but never de-stacked *(curated)*
 - **#12769**: Stacking follow-ups: retarget-failure flag text, pr.edit-base inventory op, consolidation delete guard, stack-parent fork freshness *(curated)*
+- **#12772**: Recover configured private Codex containers through the existing session reconciler *(curated)*
+- **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies *(curated)*
+- **#12776**: Restore retained daemon binary after failed operator or fleet roll *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -267,6 +284,9 @@ Issues carrying `loom:curated`.
 - **#12655**: Consolidate three duplicated mock HTTP sink test helpers in observability tests *(hermit)*
 - **#12752**: Consolidate duplicate stats query stacks in activity/stats.rs *(hermit)*
 - **#12756**: Remove unused keyset-paging layer in signoz_read.rs (SignozRead, SqlPages, FileRows, PageQuery) *(hermit)*
+- **#12781**: Consolidate three duplicated Scratch temp-dir helpers in session_output tests *(hermit)*
+- **#12784**: Consolidate duplicated human_size / newest_mtime_and_size helpers in loom-daemon *(hermit)*
+- **#12785**: Consolidate duplicated tmpdir and hermetic git helpers in worktree differential tests *(hermit)*
 
 ## Epics
 
@@ -287,14 +307,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 29 |
+| Operator merge-risk holds | 32 |
 | Very important | 3 |
 | Important | 13 |
-| Ready (`loom:issue`) | 13 |
-| In Progress (`loom:building`) | 25 |
-| PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 29 |
-| Curated | 101 |
-| Architect / Hermit proposals | 4 |
+| Ready (`loom:issue`) | 14 |
+| In Progress (`loom:building`) | 31 |
+| PRs awaiting review | 6 |
+| Approved PRs awaiting merge | 32 |
+| Curated | 102 |
+| Architect / Hermit proposals | 7 |
 | Active epics | 12 |
 <!-- guide:plan-body:end -->
