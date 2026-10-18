@@ -327,8 +327,12 @@ fn git_run(
     }
 }
 
-/// [`overlap_components`] where a shared-file pair is an edge only when the
-/// two PRs are stacked or `conflicts` says they really conflict (#10350).
+/// Connected components of the shared-file overlap graph over `eligible`.
+///
+/// `files` maps PR number → its changed paths. PRs without an entry (a
+/// failed files read) are singletons — a failed read must not widen a group
+/// by pretending to know the files. A shared-file pair is an edge only when
+/// the two PRs are stacked or `conflicts` says they really conflict (#10350).
 #[must_use]
 pub fn overlap_components_with(
     eligible: &[&SequencePr],
