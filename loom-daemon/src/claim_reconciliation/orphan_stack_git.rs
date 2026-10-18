@@ -253,3 +253,79 @@ pub fn push_leased(
         Err(out.failure_reason("git push --force-with-lease"))
     }
 }
+
+/// The commits in `upstream..head`, oldest first, as full shas, with a flag
+/// for whether any of them is a merge commit.
+///
+/// # Errors
+/// `git rev-list` could not answer.
+pub fn range_commits(
+    repo: &Path,
+    upstream: &str,
+    head: &str,
+) -> Result<(Vec<String>, bool), String> {
+    let range = format!("{upstream}..{head}");
+    let out = git(repo, &["rev-list", "--reverse", &range], LOCAL_TIMEOUT);
+    if !out.succeeded() {
+        return Err(out.failure_reason("git rev-list"));
+    }
+    let commits: Vec<String> = out
+        .stdout_trimmed()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let merges = git(repo, &["rev-list", "--merges", "--max-count=1", &range], LOCAL_TIMEOUT);
+    if !merges.succeeded() {
+        return Err(merges.failure_reason("git rev-list --merges"));
+    }
+    Ok((commits, !merges.stdout_trimmed().is_empty()))
+}
+
+/// Publish `new_head` as the NEW branch `branch` on the remote: a plain push,
+/// never forced, so it can neither rewrite an existing branch nor race one.
+///
+/// `Ok(())` also when the remote already has `branch` at exactly `new_head`
+/// (a retry of an earlier run that pushed but did not finish).
+///
+/// # Errors
+/// The branch exists at another commit, or the push was rejected.
+pub fn push_new_branch(repo: &Path, branch: &str, new_head: &str) -> Result<(), String> {
+    match live_tip(repo, branch)? {
+        Some(live) if live == new_head => return Ok(()),
+        Some(live) => {
+            return Err(format!(
+                "the remote already has branch '{branch}' at {live}, not {new_head}"
+            ))
+        }
+        None => {}
+    }
+    let refspec = format!("{new_head}:refs/heads/{branch}");
+    let out = git(repo, &["push", REMOTE, &refspec], NET_TIMEOUT);
+    if out.succeeded() {
+        Ok(())
+    } else {
+        Err(out.failure_reason("git push"))
+    }
+}
+
+/// Make the remote branch `branch`, currently at `tip`, readable in `repo`.
+///
+/// # Errors
+/// The fetch failed or did not bring `tip`.
+pub fn fetch_branch(repo: &Path, branch: &str, tip: &str) -> Result<(), String> {
+    if has_commit(repo, tip) {
+        return Ok(());
+    }
+    let refname = format!("refs/heads/{branch}");
+    let out = git(repo, &["fetch", "--quiet", REMOTE, "--", &refname], NET_TIMEOUT);
+    if !out.succeeded() {
+        return Err(out.failure_reason(&format!("git fetch {REMOTE} {refname}")));
+    }
+    if has_commit(repo, tip) {
+        Ok(())
+    } else {
+        Err(format!("fetched {refname} but {tip} is not in it"))
+    }
+}

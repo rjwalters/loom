@@ -4352,10 +4352,39 @@ listing.
 | Gates | Hold labels (`loom:blocked`/`loom:operator`/`loom:frozen` …) and `loom:reviewing`/`loom:treating` are skipped; so is a child whose **issue lease** is fresh or unreadable (not `loom:building`, which a Builder's issue keeps while its PR is open). |
 | Ownership | Only a **Loom branch in this repository** is rewritten: the head must match the same exact `feature/issue-<N>` / `feature/harness-ops-<N>` family, not be the default branch, and have `head.repo` equal to this repository. A PR whose head *is* the default branch is skipped before any read. A human's or fork's head is flagged (never pushed), so later ticks cost no fetch. An unreadable repository identity is a skip. The cascade applies the same rule. |
 | Rebase repos | Replay `<closed parent head>..<child head>` onto the fetched default-branch tip in a scratch worktree (`.loom/worktrees/orphan-restack-pr-<N>`, removed afterwards; the primary checkout is never switched). The parent head is fetched via `refs/pull/<N>/head`, so a deleted parent branch does not matter. The parent head must be an **ancestor** of the child head (`merge-base --is-ancestor`): a parent amended or force-pushed after the child branched would otherwise have its old commits replayed onto the default branch, so that child is flagged, never rewritten (`reconcile_stack`'s `ParentAncestry` refusal). `forge rebase-guard` must not block; the remote head must still be the listed head; the push is `--force-with-lease=refs/heads/<child>:<listed head>`. Only then is the base retargeted (`PATCH pulls/<N> base=<default>`) and a report comment posted. PRs stacked on the child are replayed onto its new head the same way, with the same ancestry check (old child head ⊑ grandchild head; base unchanged). |
-| Merge repos | No rewrite and **no retarget** (the closed parent's commits never reached the default branch, so a retarget would carry them into the PR): flagged instead. The comment gives no force-push recipe: it says the fix needs a rewrite that #10771 forbids and points to #12767, the merge-mode follow-up. |
+| Merge repos | No rewrite and **no retarget** (the closed parent's commits never reached the default branch, so a retarget would carry them into the PR): flagged instead. The comment gives no force-push recipe: it says the fix needs a rewrite that #10771 forbids and that Doctor opens a **replacement PR** (below, #12767). |
 | Flag | Conflict, refusal (the closed parent's PR record has no head, or `refs/pull/<N>/head` fetched without it; a rewritten parent; a rebase-guard block), a non-Loom head, or merge mode: `loom:merge-conflict` plus one comment carrying `<!-- loom:orphan-stack flagged parent=<N> head=<sha> -->` and how to finish by hand (rebase mode: the exact commands). Nothing more happens until the child's head moves. |
 | Idempotency | A retargeted child's base is the default branch, so discovery no longer matches it. |
 | Unknowns | A failed read, fetch (including the closed parent's head) or push, or a remote head that moved since the listing, is a skip for this tick, never a write. |
+
+**Replacement PRs for a flagged merge-mode orphan (#12767).** Doctor is the
+consumer of the merge-mode flag: its Finding Work scan lists PRs with
+`loom:merge-conflict` and a trusted `<!-- loom:orphan-stack flagged … -->`
+comment, and `orphan-stack-replacement.md` is the recipe. The git half is
+`loom-daemon orphan-replace` (`verify`, `create`, `close-check`, `replaced-by`;
+exit 0 done, 1 refused with nothing pushed, 2 transient):
+
+- **Boundary.** The closed parent's head (fetched via `refs/pull/<N>/head`) must be
+  an **ancestor** of the child's head, and `parent..child` must be non-empty
+  and hold no merge commit. Anything else is a refusal (`PARENT_NOT_ANCESTOR`,
+  `MISSING_HEAD`, `EMPTY_RANGE`, `MERGE_IN_RANGE`, `BAD_SHA`); Doctor comments the reason and
+  leaves the flag.
+- **Replacement.** `create` replays only that range onto the freshly fetched
+  default-branch tip in a scratch worktree and pushes the NEW branch
+  `orphan-replace/pr-<child>` without force. A conflict (`CONFLICT`) means the
+  change likely depends on the rejected parent: Doctor investigates and adapts,
+  or parks it; nothing is auto-resolved. A retry reuses the branch when it holds
+  exactly the range (`BRANCH_TAKEN` otherwise).
+- **No inherited verdict.** The replacement PR is opened with
+  `loom:review-requested` only: fresh Judge pass, fresh CI.
+- **Close.** The original is closed only after the replacement exists and both
+  link comments are posted (the original's ends with
+  `<!-- loom:orphan-stack replaced by=<N> -->`, which makes a retry idempotent), and
+  never while open PRs are based on its branch (`close-check` prints
+  `BLOCKED_BY_DESCENDANTS`). Its branch is never rewritten or deleted.
+- **Activation gate.** `stacking.onConflict.enabled` stays **off fleet-wide**
+  until this path is qualified on a real orphan (the fixtures cover the
+  refusals and the replay, not a live run). That qualification is out of band.
 
 ### Startup capacity seed: adopting live survivors (#6262)
 

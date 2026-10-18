@@ -295,6 +295,9 @@ pub mod opencode_usage;
 pub mod operator_decision;
 pub mod operator_stop;
 pub mod orphan_process_reaper;
+/// Replacement PRs for a stacked child orphaned in a merge-mode repository
+/// (#12767): the git half and the decisions, driven by Doctor.
+pub mod orphan_replace;
 pub mod overlap_replay;
 pub mod parent_link;
 pub mod park_record;

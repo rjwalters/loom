@@ -518,6 +518,19 @@ gh pr list --state=open --json number,title,labels,mergeable \
   | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:operator" and .name != "loom:blocked" and .name != "loom:frozen")) | "#\(.number): \(.title)"'
 ```
 
+**Find orphaned stacked children (merge-mode repos, #12767):** a PR flagged by
+the orphan-stack pass has `loom:merge-conflict` plus a trusted
+`<!-- loom:orphan-stack flagged parent=<N> head=<sha> -->` comment, and no
+`loom:changes-requested`, so the queues below never list it. Claim it like any
+other PR (holds excluded, `loom:treating`), then follow
+[`orphan-stack-replacement.md`](orphan-stack-replacement.md) — a replacement PR,
+never a rewrite of its branch.
+```bash
+gh pr list --state=open --label=loom:merge-conflict --json number,labels,comments \
+  | jq -r '.[] | select(.labels | all(.name != "loom:operator" and .name != "loom:blocked" and .name != "loom:frozen" and .name != "loom:treating")) | select(any(.comments[]?; .body | contains("<!-- loom:orphan-stack flagged"))) | "#\(.number)"'
+```
+(A candidate still needs its marker confirmed from a **trusted** author.)
+
 **Find all open PRs:**
 ```bash
 # Check primary queues first
@@ -1069,6 +1082,7 @@ shellcheck scripts/*.sh # Shell scripts (if applicable)
 |---|---|
 | [`cargo-target-isolation.md`](cargo-target-isolation.md) | Any cargo build: use exported `CARGO_TARGET_DIR` or `<worktree>/target`; never `/tmp`, `~`, `.loom/target-*` (#8370). |
 | [`ci-refusals-reference.md`](ci-refusals-reference.md) | A CI read got 403/429, or a job needs a re-run. |
+| [`orphan-stack-replacement.md`](orphan-stack-replacement.md) | A PR carries `loom:merge-conflict` and a trusted `<!-- loom:orphan-stack flagged … -->` comment in a merge-mode repo (stacked child whose parent closed unmerged). |
 
 ### Step 5: Verify Remote CI After Push
 

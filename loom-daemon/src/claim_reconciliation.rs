@@ -2018,7 +2018,7 @@ pub mod review_conflict;
 /// Retarget open PRs stacked on a parent closed unmerged (#12760) — and its
 /// scratch-worktree git mechanics — sibling files per the file-size ratchet.
 pub mod orphan_stack;
-mod orphan_stack_git;
+pub(crate) mod orphan_stack_git;
 
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
 /// rate-limit-breaker re-check that stops it early — a sibling file per the
