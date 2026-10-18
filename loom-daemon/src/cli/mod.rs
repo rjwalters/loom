@@ -159,6 +159,7 @@ pub(crate) mod script_ports;
 mod secret_scan_cmd;
 pub(crate) mod serve_cmd;
 mod skip_labels;
+pub(crate) mod stack_parent;
 mod stale_blocked;
 pub(crate) mod stashes;
 pub(crate) mod stats;

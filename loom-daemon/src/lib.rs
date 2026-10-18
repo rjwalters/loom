@@ -373,6 +373,8 @@ pub mod session_reconcile;
 pub mod session_status;
 pub mod short_hash;
 pub mod signoz_read;
+/// `stack-parent`: the open PR a Builder's conflicting work stacks on (#12759).
+pub mod stack_parent;
 /// `stacking.onConflict` accessor: the conflict-stacking switch and depth cap (#12758).
 pub mod stacking_config;
 pub mod stale_blocked;
