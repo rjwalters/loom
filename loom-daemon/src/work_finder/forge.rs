@@ -291,8 +291,7 @@ pub struct RegistryDispatcher {
 }
 
 impl RegistryDispatcher {
-    /// Construct a dispatcher over the shared registry. Production goes
-    /// through [`dispatcher_pairs`].
+    /// Construct a dispatcher over the shared registry.
     #[must_use]
     pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
         Self { registry }
@@ -715,21 +714,6 @@ impl WorkDispatcher for RegistryDispatcher {
         }
         Ok(outcome.was_new)
     }
-}
-
-/// Build the per-tick `(source, dispatcher)` pair for every root (#3924).
-#[must_use]
-pub fn dispatcher_pairs(
-    pool: &crate::workspace_pool::WorkspacePool,
-    roots: &[PathBuf],
-) -> Vec<(GhWorkSource, RegistryDispatcher)> {
-    roots
-        .iter()
-        .map(|root| {
-            let registry = pool.get_or_provision(root);
-            (GhWorkSource::for_root(root), RegistryDispatcher::new(registry))
-        })
-        .collect()
 }
 
 #[cfg(test)]
