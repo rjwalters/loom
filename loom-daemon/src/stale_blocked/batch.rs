@@ -416,7 +416,6 @@ fn read_text(
     p.held = super::hold::latest_reasoned(&p.body).map(|r| super::Held {
         by: r.by,
         reason: r.reason.unwrap_or_default().trim().to_string(),
-        at: r.at,
     });
     if kind == Artifact::Issue {
         p.named = named::parse_entries(&p.body);
