@@ -388,8 +388,7 @@ mod tests {
 
     #[test]
     fn disabled_lists_nothing() {
-        // `run` short-circuits before the listing; an unreachable gh proves it.
-        std::env::set_var("LOOM_GH_BIN", "/nonexistent/gh");
+        // `run` short-circuits before the listing, so it never reaches `gh`.
         let dir = tempfile::tempdir().unwrap();
         let out = run(dir.path(), 1, None);
         assert_eq!(out.decision, Decision::None(NoneReason::Disabled));
