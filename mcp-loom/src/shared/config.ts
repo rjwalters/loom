@@ -6,7 +6,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { access, readFile, stat, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ConfigFile, StateFile } from "../types.js";
@@ -14,9 +14,6 @@ import { resolveEffectiveConfig } from "./config-resolver.js";
 
 /** Global Loom directory in user's home */
 export const LOOM_DIR = join(homedir(), ".loom");
-
-/** Daemon log file path */
-export const DAEMON_LOG = join(LOOM_DIR, "daemon.log");
 
 /** Browser console log file path */
 export const CONSOLE_LOG_PATH = join(LOOM_DIR, "console.log");
@@ -147,21 +144,6 @@ export function getWorkspacePath(): string {
 }
 
 /**
- * Read a file and check if it exists
- */
-export async function readFileIfExists(filePath: string): Promise<string | null> {
-  try {
-    await access(filePath);
-    return await readFile(filePath, "utf-8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-}
-
-/**
  * Read the global state file
  */
 export async function readStateFile(): Promise<StateFile | null> {
@@ -228,22 +210,4 @@ export async function writeConfigFile(config: ConfigFile): Promise<void> {
   const workspacePath = getWorkspacePath();
   const configPath = join(workspacePath, ".loom", "config.json");
   await writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
-}
-
-/**
- * Read the workspace state file (returns as string for compatibility)
- */
-export async function readWorkspaceStateFile(): Promise<string> {
-  try {
-    const workspacePath = getWorkspacePath();
-    const statePath = join(workspacePath, ".loom", "state.json");
-
-    await access(statePath);
-    return await readFile(statePath, "utf-8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return "State file not found. Workspace may not be initialized.";
-    }
-    throw error;
-  }
 }
