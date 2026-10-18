@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-18
 
+- **PR #12764**: feat(daemon): retarget stacked children whose parent PR closed unmerged
+- **Issue #12760** (closed): Retarget stacked children to main when their parent PR is closed unmerged
 - **PR #12763**: fix(champion): skip an approved PR whose base is a Loom stack branch
 - **PR #12762**: feat: add stacking.onConflict config accessor with fleet-tier resolution
 - **PR #12755**: refactor: remove unreferenced mcp-loom shared exports
