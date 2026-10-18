@@ -59,28 +59,62 @@ pub fn has_commit(repo: &Path, sha: &str) -> bool {
     git(repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")], LOCAL_TIMEOUT).succeeded()
 }
 
+/// What [`ensure_pr_head`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadFetch {
+    /// The commit is readable in the repository.
+    Present,
+    /// The fetch itself failed (network, auth, a timeout, a ref the remote
+    /// did not serve). Transient: the caller retries on a later tick.
+    FetchFailed(String),
+    /// The fetch succeeded, but the commit is still not readable: the PR ref
+    /// does not contain it.
+    Missing,
+}
+
 /// Make `sha` (PR `pr`'s head) readable in `repo`, fetching
 /// `refs/pull/<pr>/head` once if it is not. `refs/pull/<n>/head` survives the
 /// head branch's deletion, which is the case for a parent whose branch was
-/// removed after it closed. `true` iff the commit is readable afterwards.
+/// removed after it closed.
 #[must_use]
-pub fn ensure_pr_head(repo: &Path, pr: u32, sha: &str) -> bool {
+pub fn ensure_pr_head(repo: &Path, pr: u32, sha: &str) -> HeadFetch {
     if has_commit(repo, sha) {
-        return true;
+        return HeadFetch::Present;
     }
     // `--` before the ref operand (#9106).
-    let _ = git(
-        repo,
-        &[
-            "fetch",
-            "--quiet",
-            REMOTE,
-            "--",
-            &format!("refs/pull/{pr}/head"),
-        ],
-        NET_TIMEOUT,
-    );
-    has_commit(repo, sha)
+    let refname = format!("refs/pull/{pr}/head");
+    let out = git(repo, &["fetch", "--quiet", REMOTE, "--", &refname], NET_TIMEOUT);
+    if !out.succeeded() {
+        return HeadFetch::FetchFailed(
+            out.failure_reason(&format!("git fetch {REMOTE} {refname}")),
+        );
+    }
+    if has_commit(repo, sha) {
+        HeadFetch::Present
+    } else {
+        HeadFetch::Missing
+    }
+}
+
+/// Is `ancestor` an ancestor of (or equal to) `descendant`?
+///
+/// The precondition for replaying `ancestor..descendant` as "the commits
+/// `descendant` added on top of `ancestor`": when it does not hold, `git
+/// rebase --onto <x> <ancestor>` does not fail, it replays every commit of
+/// `descendant` that `ancestor` cannot reach, including commits of a parent
+/// that was rewritten after the child branched (`reconcile_stack`'s
+/// `Prerequisite::ParentAncestry`).
+///
+/// # Errors
+/// `git merge-base` could not answer (exit other than 0 or 1, or it did not
+/// run).
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let out = git(repo, &["merge-base", "--is-ancestor", ancestor, descendant], LOCAL_TIMEOUT);
+    match &out {
+        CmdOutcome::Ran(o) if o.status.success() => Ok(true),
+        CmdOutcome::Ran(o) if o.status.code() == Some(1) => Ok(false),
+        _ => Err(out.failure_reason("git merge-base --is-ancestor")),
+    }
 }
 
 /// The remote's live head for `branch`: `Ok(Some(sha))`, `Ok(None)` when the

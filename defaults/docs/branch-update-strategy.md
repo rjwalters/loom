@@ -81,11 +81,14 @@ so a `loom-daemon` predating the subcommand also lands on `merge`.
   freshly fetched default-branch tip in a scratch worktree, checks the result
   with `forge rebase-guard`, pushes with `--force-with-lease` pinned to the
   head it started from, and then retargets the PR to the default branch; PRs
-  stacked on the child are replayed onto its new head the same way. In merge
-  mode it neither rewrites **nor retargets**: the closed parent's commits never
-  reached the default branch, so a retarget alone would carry them into the
-  PR. The child gets `loom:merge-conflict` and one comment with the commands
-  instead, as it does on a conflict. Details:
+  stacked on the child are replayed onto its new head the same way. It only
+  rewrites a Loom branch in this repository whose head contains the parent
+  head (`merge-base --is-ancestor`); anything else is flagged. In merge mode it
+  neither rewrites **nor retargets**: the closed parent's commits never reached
+  the default branch, so a retarget alone would carry them into the PR. The
+  child gets `loom:merge-conflict` and one comment instead. That comment does
+  not hand out a force-push recipe: it says the fix conflicts with this policy
+  and points to #12767 for the merge-mode remedy. Details:
   [daemon-reference.md](daemon-reference.md) → "Orphaned stacked children".
 
 `loom-daemon/tests/branch_update_cli.rs` runs the Doctor's own push block in a

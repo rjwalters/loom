@@ -100,6 +100,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "park_hold.issue_body",
         "park_hold.issue_labels",
         "orphan_stack.parent_lookup",
+        "orphan_stack.comments",
         "orphan_stack.label",
         "orphan_stack.comment",
     ];

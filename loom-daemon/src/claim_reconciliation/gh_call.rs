@@ -101,7 +101,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.issue_comments"
         | "sequence.trusted_bodies"
         | "roster.comments"
-        | "landed.route_marker" => ops::COMMENT_LIST,
+        | "landed.route_marker"
+        | "orphan_stack.comments" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
         "orphan_stack.parent_lookup" => ops::PR_LIST_BY_HEAD,
         "park_hold.issue_view"

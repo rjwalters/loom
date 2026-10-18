@@ -151,6 +151,72 @@ fn flag_marker_is_keyed_by_parent_and_head() {
     assert!(merge.contains("did not retarget"));
 }
 
+#[test]
+fn the_merge_mode_flag_names_the_policy_conflict_and_never_says_force_push() {
+    let head = "f".repeat(40);
+    let ctx = FlagContext {
+        pr: 5,
+        branch: "feature/issue-5",
+        head: &head,
+        cause_pr: 4,
+        orphan: true,
+        onto: "origin/main",
+        upstream: "abc",
+        retarget_to: Some("main"),
+    };
+    let merge = flag_comment_body(&ctx, &FlagReason::MergeMode);
+    assert!(merge.contains("#10771"), "{merge}");
+    assert!(merge.contains("#12767"), "{merge}");
+    assert!(merge.contains("conflicts with this repository's policy"), "{merge}");
+    for forbidden in ["--force", "git push", "git rebase", "gh pr edit"] {
+        assert!(
+            !merge.contains(forbidden),
+            "merge-mode flag must not say `{forbidden}`:\n{merge}"
+        );
+    }
+    // A foreign head gets no command recipe either (it may be a fork, where
+    // `origin` is not its remote).
+    let foreign = flag_comment_body(&ctx, &FlagReason::NotLoomBranch);
+    assert!(foreign.contains("not a Loom branch"), "{foreign}");
+    assert!(!foreign.contains("--force") && !foreign.contains("git push"), "{foreign}");
+    // A rewritten parent: the recipe must not name the parent head as the
+    // upstream, since that is exactly the wrong range.
+    let rewritten = flag_comment_body(&ctx, &FlagReason::ParentRewritten);
+    assert!(rewritten.contains("is not an ancestor"), "{rewritten}");
+    assert!(!rewritten.contains("git rebase --onto origin/main abc"), "{rewritten}");
+    assert!(
+        rewritten.contains("<the parent commit this branch was cut from>"),
+        "{rewritten}"
+    );
+}
+
+#[test]
+fn the_label_delete_path_percent_encodes_the_colon() {
+    assert_eq!(
+        label_delete_path(5, MERGE_CONFLICT),
+        "repos/{owner}/{repo}/issues/5/labels/loom%3Amerge-conflict"
+    );
+}
+
+#[test]
+fn head_owner_admits_only_loom_branches_in_this_repository() {
+    let mut p = pr(1, "feature/issue-1", "feature/issue-2");
+    p.head_repo = Some("Acme/Widgets".to_string());
+    assert_eq!(head_owner(&p, "main", Some("acme/widgets")), HeadOwner::Loom);
+    assert_eq!(head_owner(&p, "main", None), HeadOwner::Unknown);
+    p.head_repo = Some("someone/widgets".to_string());
+    assert_eq!(head_owner(&p, "main", Some("acme/widgets")), HeadOwner::Foreign);
+    p.head_repo = None; // a deleted fork
+    assert_eq!(head_owner(&p, "main", Some("acme/widgets")), HeadOwner::Foreign);
+    p.head_repo = Some("acme/widgets".to_string());
+    for human in ["jdoe/fix", "feature/issue-1-extra", "feature/other-1"] {
+        p.head_ref = Some(human.to_string());
+        assert_eq!(head_owner(&p, "main", Some("acme/widgets")), HeadOwner::Foreign, "{human}");
+    }
+    p.head_ref = Some("main".to_string());
+    assert_eq!(head_owner(&p, "main", Some("acme/widgets")), HeadOwner::DefaultBranch);
+}
+
 // --- the pass, on real repositories -----------------------------------------
 
 fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -291,6 +357,9 @@ impl Fixture {
     }
 }
 
+/// The repository the fake forge says it is; [`open_pr`] heads live in it.
+const REPO: &str = "acme/widgets";
+
 fn open_pr(number: u32, head: &str, sha: &str, base: &str) -> RestPull {
     RestPull {
         number,
@@ -298,6 +367,7 @@ fn open_pr(number: u32, head: &str, sha: &str, base: &str) -> RestPull {
         head_ref: Some(head.to_string()),
         head_sha: Some(sha.to_string()),
         base_ref: Some(base.to_string()),
+        head_repo: Some(REPO.to_string()),
         ..RestPull::default()
     }
 }
@@ -306,6 +376,7 @@ fn open_pr(number: u32, head: &str, sha: &str, base: &str) -> RestPull {
 struct FakeForge {
     parents: BTreeMap<String, ParentPr>,
     strategy_merge: bool,
+    repo_unknown: bool,
     lease: Option<Option<bool>>,
     lookups: RefCell<Vec<String>>,
     comments: RefCell<BTreeMap<u32, Vec<String>>>,
@@ -331,6 +402,9 @@ impl OrphanForge for FakeForge {
         } else {
             Strategy::Rebase
         }
+    }
+    fn repository(&self) -> Option<String> {
+        (!self.repo_unknown).then(|| REPO.to_string())
     }
     fn retarget(&self, pr: u32, base: &str) -> Result<(), String> {
         self.retargets.borrow_mut().push((pr, base.to_string()));
@@ -499,6 +573,8 @@ fn merge_mode_flags_without_rewriting_or_retargeting() {
     assert!(forge.retargets.borrow().is_empty());
     let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
     assert!(posted[0].contains("#10771"));
+    assert!(posted[0].contains("#12767"));
+    assert!(!posted[0].contains("--force"), "{}", posted[0]);
 }
 
 #[test]
@@ -571,4 +647,216 @@ fn a_remote_head_that_moved_since_the_listing_is_retried_not_clobbered() {
     assert_eq!((stats.skipped, stats.retargeted, stats.flagged), (1, 0, 0));
     assert_eq!(fx.origin_rev(B), pushed);
     assert!(forge.retargets.borrow().is_empty());
+}
+
+// --- #12764 review: ancestry, ownership, transient fetches ------------------
+
+fn parents_a(a: &str) -> BTreeMap<String, ParentPr> {
+    [(A.to_string(), closed_parent(1, a))].into_iter().collect()
+}
+
+#[test]
+fn a_parent_rewritten_after_the_child_branched_is_flagged_not_replayed() {
+    let fx = Fixture::new();
+    let _a1 = fx.branch(A, "main", 1, "a.txt", "parent v1\n");
+    let b = fx.branch(B, A, 2, "b.txt", "child\n");
+    // A is amended (rebuilt from main) after B was cut from it, then closed.
+    // Its PR record names A2, which B does not contain.
+    let a2 = fx.branch(A, "main", 1, "a.txt", "parent v2\n");
+    fx.clone_repo();
+    let forge = FakeForge {
+        parents: parents_a(&a2),
+        ..FakeForge::default()
+    };
+    let open = vec![open_pr(2, B, &b, A)];
+    let stats = reconcile_with(&forge, &fx.repo, "main", &open);
+
+    assert_eq!((stats.flagged, stats.retargeted), (1, 0), "{stats:?}");
+    assert_eq!(fx.origin_rev(B), b, "nothing pushed: the replay would carry A1 to main");
+    assert!(forge.retargets.borrow().is_empty());
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].starts_with(&flagged_marker(1, &b)));
+    assert!(posted[0].contains("is not an ancestor"), "{}", posted[0]);
+    assert_eq!(worktree_count(&fx.repo), 1, "refused before any scratch worktree");
+
+    let again = reconcile_with(&forge, &fx.repo, "main", &open);
+    assert_eq!(again.flagged, 0, "deduplicated by head");
+    assert_eq!(forge.added.borrow().len(), 1);
+}
+
+#[test]
+fn a_grandchild_cut_from_an_older_child_head_is_flagged_not_replayed() {
+    let fx = Fixture::new();
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let _b1 = fx.branch(B, A, 2, "b.txt", "child v1\n");
+    let c = fx.branch(C, B, 3, "c.txt", "grandchild\n");
+    // B is rebuilt on A after C was cut from B1: B2 is not an ancestor of C.
+    let b2 = fx.branch(B, A, 2, "b.txt", "child v2\n");
+    fx.clone_repo();
+    let forge = FakeForge {
+        parents: parents_a(&a),
+        ..FakeForge::default()
+    };
+    let open = vec![open_pr(2, B, &b2, A), open_pr(3, C, &c, B)];
+    let stats = reconcile_with(&forge, &fx.repo, "main", &open);
+
+    assert_eq!((stats.retargeted, stats.cascaded, stats.flagged), (1, 0, 1), "{stats:?}");
+    assert_eq!(fx.origin_rev(C), c, "the grandchild is not rewritten");
+    let posted = forge.comments.borrow().get(&3).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].starts_with(&flagged_marker(2, &c)));
+    assert!(posted[0].contains("is not an ancestor"), "{}", posted[0]);
+}
+
+#[test]
+fn only_loom_branches_in_this_repo_are_rewritten() {
+    let fx = Fixture::new();
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "b.txt", "child\n");
+    let human = fx.branch("jdoe/fix", A, 5, "h.txt", "human\n");
+    fx.clone_repo();
+
+    // A human's branch: flagged once per head, never pushed.
+    let forge = FakeForge {
+        parents: parents_a(&a),
+        ..FakeForge::default()
+    };
+    let open = vec![open_pr(5, "jdoe/fix", &human, A)];
+    let stats = reconcile_with(&forge, &fx.repo, "main", &open);
+    assert_eq!((stats.flagged, stats.retargeted), (1, 0), "{stats:?}");
+    assert_eq!(fx.origin_rev("jdoe/fix"), human);
+    assert!(forge.retargets.borrow().is_empty());
+    let posted = forge.comments.borrow().get(&5).cloned().unwrap_or_default();
+    assert!(posted[0].contains("not a Loom branch"), "{}", posted[0]);
+    assert!(!posted[0].contains("--force"), "{}", posted[0]);
+    let again = reconcile_with(&forge, &fx.repo, "main", &open);
+    assert_eq!((again.flagged, again.skipped), (0, 0), "deduplicated by head, no retry loop");
+    assert_eq!(forge.added.borrow().len(), 1);
+
+    // A fork whose branch happens to be named like a Loom branch.
+    let fork = FakeForge {
+        parents: parents_a(&a),
+        ..FakeForge::default()
+    };
+    let mut forked = open_pr(2, B, &b, A);
+    forked.head_repo = Some("someone/fork".to_string());
+    let stats = reconcile_with(&fork, &fx.repo, "main", &[forked]);
+    assert_eq!((stats.flagged, stats.retargeted), (1, 0), "{stats:?}");
+    assert_eq!(fx.origin_rev(B), b);
+
+    // This repository's identity unreadable: a skip, not a flag or a push.
+    let unknown = FakeForge {
+        parents: parents_a(&a),
+        repo_unknown: true,
+        ..FakeForge::default()
+    };
+    let stats = reconcile_with(&unknown, &fx.repo, "main", &[open_pr(2, B, &b, A)]);
+    assert_eq!((stats.skipped, stats.flagged, stats.retargeted), (1, 0, 0), "{stats:?}");
+    assert!(unknown.added.borrow().is_empty() && unknown.comments.borrow().is_empty());
+    assert_eq!(fx.origin_rev(B), b);
+
+    // The default branch as head (a sync PR into the stack branch): no read.
+    let sync = FakeForge {
+        parents: parents_a(&a),
+        ..FakeForge::default()
+    };
+    let main = fx.origin_rev("main");
+    let stats = reconcile_with(&sync, &fx.repo, "main", &[open_pr(6, "main", &main, A)]);
+    assert_eq!(stats, OrphanStats::default());
+    assert!(sync.lookups.borrow().is_empty());
+    assert_eq!(fx.origin_rev("main"), main);
+}
+
+#[test]
+fn a_cascade_never_rewrites_a_grandchild_that_is_not_a_loom_branch() {
+    let fx = Fixture::new();
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "b.txt", "child\n");
+    let top = fx.branch("jdoe/top", B, 3, "t.txt", "human on top\n");
+    fx.clone_repo();
+    let forge = FakeForge {
+        parents: parents_a(&a),
+        ..FakeForge::default()
+    };
+    let open = vec![open_pr(2, B, &b, A), open_pr(3, "jdoe/top", &top, B)];
+    let stats = reconcile_with(&forge, &fx.repo, "main", &open);
+    assert_eq!((stats.retargeted, stats.cascaded, stats.flagged), (1, 0, 1), "{stats:?}");
+    assert_eq!(fx.origin_rev("jdoe/top"), top, "the human branch is never pushed");
+    let posted = forge.comments.borrow().get(&3).cloned().unwrap_or_default();
+    assert!(posted[0].contains("not a Loom branch"), "{}", posted[0]);
+}
+
+#[test]
+fn a_failed_parent_fetch_is_retried_next_tick_not_flagged() {
+    let fx = Fixture::new();
+    // The pass's clone exists before the stack, so A's commit is not in it.
+    fx.clone_repo();
+    run(&fx.author, &["checkout", "-q", "-B", A, "main"]);
+    let a = commit_file(&fx.author, "a.txt", "parent\n", "A: a.txt");
+    let b = fx.branch(B, A, 2, "b.txt", "child\n");
+    // refs/pull/1/head is not served yet: the parent fetch fails.
+    let forge = FakeForge {
+        parents: parents_a(&a),
+        ..FakeForge::default()
+    };
+    let open = vec![open_pr(2, B, &b, A)];
+    let stats = reconcile_with(&forge, &fx.repo, "main", &open);
+    assert_eq!((stats.skipped, stats.flagged, stats.retargeted), (1, 0, 0), "{stats:?}");
+    assert!(forge.added.borrow().is_empty() && forge.comments.borrow().is_empty());
+    assert_eq!(fx.origin_rev(B), b);
+
+    // The fetch works on the next tick: the child is restacked, not stuck.
+    run(&fx.author, &["push", "-q", "origin", &format!("{a}:refs/pull/1/head")]);
+    let stats = reconcile_with(&forge, &fx.repo, "main", &open);
+    assert_eq!(stats.retargeted, 1, "{stats:?}");
+    assert!(!fx.origin_files(B).contains(&"a.txt".to_string()));
+}
+
+#[test]
+fn a_parent_head_absent_from_its_record_or_its_fetched_ref_is_flagged() {
+    let fx = Fixture::new();
+    let _a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "b.txt", "child\n");
+    fx.clone_repo();
+    // The record names a head that refs/pull/1/head (which fetches fine)
+    // does not contain.
+    let missing = FakeForge {
+        parents: parents_a(&"1".repeat(40)),
+        ..FakeForge::default()
+    };
+    let stats = reconcile_with(&missing, &fx.repo, "main", &[open_pr(2, B, &b, A)]);
+    assert_eq!(stats.flagged, 1, "{stats:?}");
+    let posted = missing
+        .comments
+        .borrow()
+        .get(&2)
+        .cloned()
+        .unwrap_or_default();
+    assert!(posted[0].contains("is not in it"), "{}", posted[0]);
+
+    // The record names no head at all.
+    let no_head = FakeForge {
+        parents: [(
+            A.to_string(),
+            ParentPr {
+                number: 1,
+                merged: false,
+                head_sha: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..FakeForge::default()
+    };
+    let stats = reconcile_with(&no_head, &fx.repo, "main", &[open_pr(2, B, &b, A)]);
+    assert_eq!(stats.flagged, 1, "{stats:?}");
+    let posted = no_head
+        .comments
+        .borrow()
+        .get(&2)
+        .cloned()
+        .unwrap_or_default();
+    assert!(posted[0].contains("names no head commit"), "{}", posted[0]);
+    assert_eq!(fx.origin_rev(B), b);
 }
