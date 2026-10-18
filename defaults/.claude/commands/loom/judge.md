@@ -1334,6 +1334,8 @@ Branch on the first stdout line:
 - ⏳ `-TIMEOUT` / `-HEAD-MOVED` - Pending (see "When CI is Pending")
 - `-ERROR` or no sentinel (Gitea / older binary) - run `gh pr checks <PR_NUMBER>` once
 
+**Unknown is never green.** If the required-context lookup fails (rate limit, 403/429, unreadable branch protection), `wait-checks` reports `-TIMEOUT … (required-contexts-unknown)` or `-ERROR`: the result is *unknown*, not passing. It cannot authorize approval; treat it as pending ("When CI is Pending") and never approve on a guess. The reader and its REST fallback are unchanged.
+
 **Step 2: Verify merge state**
 
 ```bash
@@ -1369,10 +1371,10 @@ If checks are still running, **do not block on them or approve on a guess**: in 
 2. **Release your claim** — remove `loom:reviewing`; release the lease with `--skip-reason ci-pending` (below).
 3. **Skip and continue the batch** — next PR; a later tick re-evaluates this one once CI settles.
 
-**Pending-CI skip check.** `loom-daemon forge wait-checks <PR_NUMBER> --timeout 0` is a single ETag'd poll (no wait) that also handles the empty-rollup trap (#6169). Branch on the first **stdout** line:
+**Pending-CI skip check.** Reuse Step 1's snapshot: `loom-daemon forge wait-checks <PR_NUMBER> --timeout 20` is a short ETag'd poll that also handles the empty-rollup trap (#6169); `--timeout 0` would read a no-checks repo as `TIMEOUT` and skip a PR that has nothing to wait for. Branch on the first **stdout** line:
 
 ```bash
-first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 0 2>/dev/null | head -n1)"
+first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 2>/dev/null | head -n1)"
 case "$first" in
   LOOM-CHECKS-TIMEOUT*)   # still pending: release and skip; PR stays loom:review-requested
     gh pr comment <number> --body "CI still running; skipping until it settles."
