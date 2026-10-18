@@ -333,6 +333,24 @@ criterion that was never really out-of-band. There is no automated release,
 deliberately: the PR that would re-evaluate it is already merged, and "a human
 must observe something in the world" cannot be discharged by an engine re-read.
 
+### The author gate on promotion (#10827)
+
+Champion's content criteria say nothing about who wrote the issue. So before any
+**automatic** `loom:issue` write (Champion's Step 3b and the
+`check-promotion-landed.sh --apply` backstop) it asks
+`loom-daemon forge promotion-author --number N`, which judges the issue **author**
+with the same predicate as [`comment-trust.md`](comment-trust.md) (repo insider, a
+fleet App, this daemon, `forge.trustedCommenters`, the fleet admin roster), with
+no second trust table. Only `TRUSTED` promotes. An `UNTRUSTED` author, or an
+`UNKNOWN` one (the issue could not be read), leaves the issue at `loom:curated`
+with one comment (keyed on `<!-- loom:promotion-author-gate -->`, so retries do not
+repeat it). Unreadable evidence never counts as trust.
+
+Adoption is a trusted maintainer applying `loom:issue` by hand, or re-filing the
+issue; an automated Champion verdict alone is not adoption. Trusted authors see no
+change. This is admission control for external submissions, not protection against
+a compromised trusted agent, and it adds no signed decisions or keys.
+
 ## Current implementation
 
 - **Criterion #2 (merge-risk hold)** — `champion-pr-merge.md`: entry in

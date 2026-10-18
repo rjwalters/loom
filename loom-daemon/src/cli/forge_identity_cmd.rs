@@ -358,6 +358,32 @@ pub(crate) fn may_write(repo: Option<String>) -> Result<()> {
     }
 }
 
+/// `forge promotion-author --number N [--repo R]` (#10827): the author gate on
+/// automatic promotion — see [`loom_daemon::promotion_author`]. Prints the
+/// verdict token, then the one-time notice body when the issue is held. Exits 1
+/// when the issue could not be read, so a caller cannot take silence for trust.
+pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
+    use loom_daemon::promotion_author::{classify, notice_body};
+    let root = workspace();
+    let repo = repo.unwrap_or("{owner}/{repo}");
+    let issue = loom_daemon::comment_trust::records::fetch_issue_object(
+        repo,
+        &number.to_string(),
+        &root,
+        false,
+    );
+    let gate = classify(&loom_daemon::comment_trust::TrustPolicy::for_root(&root), issue.as_ref());
+    println!("{}", gate.token());
+    let body = notice_body(&gate);
+    if !body.is_empty() {
+        print!("{body}");
+    }
+    if issue.is_none() {
+        std::process::exit(1)
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::gh_comment;

@@ -2648,8 +2648,10 @@ same on every host, whatever its polling time.
 With neither, the record has **no `loom.fact_id` and carries
 `loom.fact_id_missing_reason`** instead: `forge_read_failed` (a history or
 `pulls/{n}` read this pass needed failed) or `no_forge_instant`. Every record
-carries exactly one of the two, and `host.export` counts the second kind
-(`fact_id_missing_total`). Ids keyed on a forge instant are unchanged by
+carries exactly one of the two. (`host.export` once carried a
+`fact_id_missing_total` count of the second kind; it was retired in #12741: no
+producer incremented it after #11301, so it always read `0`. Its absence is not
+a measured zero.) Ids keyed on a forge instant are unchanged by
 #11401. The body field `fact_id_missing_reason` is the producer's view of why
 no forge instant dates the exit, present even when a fallback key applies.
 
@@ -3578,11 +3580,11 @@ elected, there are no caps, and no rate or estimate is computed in the daemon.
 | `exporters[].dropped_total` | integer | records lost over this exporter's lifetime, summed over every reason in `dropped_by_reason`; **durable** (#11527) — survives daemon restarts |
 | `exporters[].dropped_by_reason` | object | the by-reason breakdown behind `dropped_total` (#11527): `queue_overflow`, `capacity_shrink`, `status_<code>`, `non_json_response`, `response_too_large`, `invalid_response`, `trace_unmappable` (envelope counts) and `receiver_rejected` (OTLP partial rejection, in **signal units** — items, not envelopes); omitted when nothing has been lost, and on records from before #11527 |
 | `exporters[].last_flush_ok_at` | RFC3339? | last acked batch; omitted when none this process (unknown, not a fabricated time) |
-| `fact_id_missing_total` | integer | `eta.stage_outcome` exits this process emitted without a `loom.fact_id` (each carried `loom.fact_id_missing_reason`, #11401); cumulative per process lifetime (unlike the durable `dropped_total`, it resets on restart); `0` on records from before #11401 |
 
 Attributes: `loom.host_export.exporters` (count), `.queue_depth` (sum),
-`.dropped_total` (sum), `.last_flush_ok_at` (latest),
-`.fact_id_missing_total`, and `host.lease_id` (#11530).
+`.dropped_total` (sum), `.last_flush_ok_at` (latest), and `host.lease_id`
+(#11530). The retired `fact_id_missing_total` field (#12741) may still appear
+on stored bodies and is ignored on decode; it is no longer emitted.
 
 **`host.lease_id`** is `opaque_host_id(host.id)`: `host-` plus 8 hex chars of
 a salted SHA-256, the same form `loom:lease` comments publish (see
