@@ -3308,13 +3308,34 @@ fn revert_stale_building_labels_spawn_loop(repo_root: &Path, dry_run: bool) -> u
         return 0;
     }
 
+    revert_orphan_building_labels(
+        orphans,
+        dry_run,
+        |n| super::orphan_recovery::open_linked_pr_blocks_reset(repo_root, n),
+        |n| gh::edit_labels(repo_root, n, "loom:building", "loom:issue"),
+    )
+}
+
+/// Revert `loom:building` -> `loom:issue` on each orphan unless an open linked
+/// PR (or an unverifiable probe) vetoes it (issue #12733). The probe and the
+/// label write are injected so the veto is testable without a forge.
+fn revert_orphan_building_labels(
+    orphans: Vec<u32>,
+    dry_run: bool,
+    open_pr_blocks: impl Fn(u32) -> bool,
+    mut edit_labels: impl FnMut(u32) -> anyhow::Result<()>,
+) -> usize {
     let mut reverted = 0usize;
     for issue_num in orphans {
+        if open_pr_blocks(issue_num) {
+            println!("  Keeping `loom:building` on #{issue_num}: open linked PR (#12733)");
+            continue;
+        }
         if dry_run {
             println!("  Would revert label on #{issue_num}: building -> issue");
             continue;
         }
-        match gh::edit_labels(repo_root, issue_num, "loom:building", "loom:issue") {
+        match edit_labels(issue_num) {
             Ok(()) => {
                 println!("  Reverted #{issue_num}: building -> issue");
                 reverted += 1;
