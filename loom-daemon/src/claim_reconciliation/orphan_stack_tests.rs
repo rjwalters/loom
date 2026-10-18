@@ -166,8 +166,13 @@ fn the_merge_mode_flag_names_the_policy_conflict_and_never_says_force_push() {
     };
     let merge = flag_comment_body(&ctx, &FlagReason::MergeMode);
     assert!(merge.contains("#10771"), "{merge}");
-    assert!(merge.contains("#12767"), "{merge}");
     assert!(merge.contains("conflicts with this repository's policy"), "{merge}");
+    // The flag names its consumer (#12767): Doctor's replacement recipe, not
+    // a human decision and not a tracking issue.
+    assert!(merge.contains("Doctor picks this PR up"), "{merge}");
+    assert!(merge.contains("replacement PR"), "{merge}");
+    assert!(!merge.contains("tracked in #12767"), "{merge}");
+    assert!(!merge.contains("a human decides"), "{merge}");
     for forbidden in ["--force", "git push", "git rebase", "gh pr edit"] {
         assert!(
             !merge.contains(forbidden),
