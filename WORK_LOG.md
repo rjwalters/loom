@@ -16,10 +16,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-19
 
-- **PR #12799**: fix: dedupe archive months in the work-docs index
 - **PR #12797**: feat(ci-telemetry): export per-cycle outcome metrics and task liveness for the poller
-- **Issue #12796** (closed): work-docs archive adds a duplicate archive link when rotating into an existing month file
 - **Issue #12793** (closed): telemetry gap: ci_telemetry poll cycles report no outcome, liveness or commit counts to SigNoz
+- **PR #12799**: fix: dedupe archive months in the work-docs index
+- **Issue #12796** (closed): work-docs archive adds a duplicate archive link when rotating into an existing month file
 - **PR #12791**: feat(telemetry): emit eta.dispatch_eligibility fact for ready_wait prediction
 - **Issue #12790** (closed): emit dispatch eligibility + blocking-reason facts (ready_wait's #1 missing signal; forward-only so urgent)
 
