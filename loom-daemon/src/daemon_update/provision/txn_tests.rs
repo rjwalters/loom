@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::super::{install_to, publish, stage};
+use super::super::{install_to, install_to_published, publish, stage};
 use super::{
     begin, previous_path, read_record, record_path, restore, snapshot, InstallError, InstallRecord,
     Phase, RecordRead, RestoreOutcome, SCHEMA_VERSION, UNKNOWN_VERSION,
@@ -646,8 +646,11 @@ fn the_sidecar_paths_sit_beside_the_destination() {
 fn installed_v2_over_v1() -> (Fixture, super::InstallIdentity) {
     let fx = Fixture::new(Some(&stub_body("1")));
     let cand = fx.candidate("v2", &stub_body("2"));
-    install_to(&cand, &fx.dest).then_some(()).unwrap();
-    let id = snapshot(&fx.dest).unwrap();
+    // The identity comes from the publish itself, as in production.
+    let id = install_to_published(&cand, &fx.dest)
+        .unwrap()
+        .identity()
+        .unwrap();
     (fx, id)
 }
 
@@ -736,6 +739,73 @@ fn a_record_from_another_install_is_refused_even_when_the_hashes_match() {
     let why = refused(restore(&fx.dest, &id));
     assert!(why.contains("not the install this run made"), "{why}");
     assert_eq!(std::fs::read(&fx.dest).unwrap(), stub_body("2"));
+}
+
+/// B publishes after A's publish returned and before A restores. A's identity
+/// came from A's own transaction, so it cannot adopt B's record (the review
+/// concern on #12779: a re-read after the lock was released would).
+#[test]
+fn a_publisher_that_lands_between_publish_and_restore_is_never_undone() {
+    // (label, B's candidate, what B's own restore puts back). An identical
+    // candidate keeps the existing `.previous` (v1), per `publish`.
+    for (label, b_body, b_restores) in [
+        ("different candidate", stub_body("3"), stub_body("2")),
+        ("identical target", stub_body("2"), stub_body("1")),
+    ] {
+        let (fx, a) = installed_v2_over_v1();
+        let b_cand = fx.candidate("b", &b_body);
+        let b = install_to_published(&b_cand, &fx.dest)
+            .unwrap()
+            .identity()
+            .unwrap();
+        assert_ne!(a.started_at, b.started_at, "{label}");
+        let (dest_before, prev_before) = (
+            std::fs::read(&fx.dest).unwrap(),
+            std::fs::read(previous_path(&fx.dest)).unwrap(),
+        );
+        let record_before = std::fs::read(record_path(&fx.dest)).unwrap();
+
+        let why = refused(restore(&fx.dest, &a));
+        assert!(why.contains("not the install this run made"), "{label}: {why}");
+        assert_eq!(std::fs::read(&fx.dest).unwrap(), dest_before, "{label}: B's dest intact");
+        assert_eq!(std::fs::read(previous_path(&fx.dest)).unwrap(), prev_before, "{label}");
+        assert_eq!(std::fs::read(record_path(&fx.dest)).unwrap(), record_before, "{label}");
+        // B's own identity still restores what B's publish retained.
+        assert!(matches!(restore(&fx.dest, &b), RestoreOutcome::Restored), "{label}");
+        assert_eq!(std::fs::read(&fx.dest).unwrap(), b_restores, "{label}");
+    }
+}
+
+/// The machine-script path: the identity crosses the `install-binary publish`
+/// subprocess boundary through the sink file, per destination.
+#[test]
+fn the_identity_sink_carries_the_publishers_own_identity() {
+    let (fx, a) = installed_v2_over_v1();
+    let sink = fx.dir.path().join("identity-sink");
+    let write = |dest: &Path, id: Result<super::InstallIdentity, String>| {
+        let line = super::SinkLine {
+            dest: dest.display().to_string(),
+            why_not: id.clone().err().unwrap_or_default(),
+            identity: id.ok(),
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sink)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            format!("{}\n", serde_json::to_string(&line).unwrap()).as_bytes(),
+        )
+        .unwrap();
+    };
+    write(&fx.dest, Ok(a.clone()));
+    write(Path::new("/elsewhere/loom-daemon"), Err("other".into()));
+    assert_eq!(super::read_reported_identity(&sink, &fx.dest).unwrap(), a);
+    assert!(super::read_reported_identity(&sink, Path::new("/nowhere")).is_err());
+    assert!(super::read_reported_identity(&fx.dir.path().join("absent"), &fx.dest).is_err());
+    write(&fx.dest, Err("first-ever".into()));
+    assert_eq!(super::read_reported_identity(&sink, &fx.dest).unwrap_err(), "first-ever");
 }
 
 #[test]

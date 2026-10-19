@@ -87,9 +87,15 @@ exclusive `flock` on `.<dest-name>.install.lock` beside `dest` (`provision.rs::D
 Every writer of `dest`, `<dest>.previous` and the record goes through `publish` (`install_to`, and
 `install-binary publish` which the machine-level provision script calls), so one lock excludes all of them. The
 kernel drops the lock when its holder dies; the lock file is never deleted. Ownership is bound to the install this
-invocation made: `txn::snapshot` reads `(started_at, target.sha256, previous.sha256)` from the record after the
-post-provision verify and before the restart, and `restore` requires the record, `dest` and `<dest>.previous` to
-still match it. Then re-run the existing supervised restart exactly once against the restored `dest`, through the same
+invocation made, taken from that invocation's own publish transaction and never re-read from the record afterwards
+(the lock is released when `publish` returns, so a later re-read could adopt a second publisher's record). On the
+`LOOM_DAEMON_BIN` path `install_to_published` returns the `Published { record }` that `publish` wrote under the lock,
+and `Published::identity()` reduces it to `(started_at, target.sha256, previous.sha256)`. On the machine-script path
+`publish` runs in a subprocess (`loom-daemon install-binary publish`): it appends that same identity, with its `dest`,
+as one JSON line to the file named by `LOOM_INSTALL_IDENTITY_SINK`, which `provision_machine_daemon` creates and reads
+back (last line whose `dest` equals the provisioned destination exactly; no line means no restore). `restore` requires
+the record, `dest` and `<dest>.previous` to still match that identity, so a publisher B that lands after A's publish
+makes A refuse, whether B's candidate differs or has an identical checksum (`started_at` differs). Then re-run the existing supervised restart exactly once against the restored `dest`, through the same
 `restart_flow` branch, so drain, compatibility checks and paused-work recovery behave as they do for any restart.
 
 **No new persistent state.** The record is not rewritten. A restored `dest` is recognizable because its sha256 no

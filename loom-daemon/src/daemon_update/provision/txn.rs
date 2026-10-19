@@ -260,35 +260,120 @@ impl Published {
     }
 }
 
-/// Which install this invocation made: read from the record after the
-/// post-provision verify and before the restart (#12776).
+/// Which install this invocation made (#12776).
+///
+/// Taken from the record that THIS invocation's own [`publish`] returned
+/// ([`Published::identity`]), which `publish` wrote while it held the
+/// destination lock. It is never re-read from disk afterwards: once the lock
+/// is released another publisher can replace the record, and a re-read would
+/// adopt that install as ours. The machine-script path publishes in a
+/// subprocess, so `install-binary publish` hands the same value back through
+/// [`IDENTITY_SINK_ENV`].
 ///
 /// `started_at` is unique per [`begin`]; the hashes are of the files as
 /// installed (so after signing), which is why this comes from the record and
 /// not from the pre-signing candidate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallIdentity {
     pub started_at: DateTime<Utc>,
     pub target_sha256: String,
     pub previous_sha256: String,
 }
 
-/// The identity of the install now recorded beside `dest`, or why there is
-/// none to bind a restore to: no record, a record of an unfinished install,
-/// or a first-ever install (no retained previous binary).
-pub fn snapshot(dest: &Path) -> Result<InstallIdentity, String> {
-    match read_record(dest) {
-        RecordRead::Known(r) if r.phase != Phase::Committed => {
-            Err(format!("the install record is at phase {}, not committed", r.phase.as_str()))
+impl InstallIdentity {
+    /// The identity of the install `record` describes, or why there is none
+    /// to bind a restore to: an unfinished install (not `committed`), or a
+    /// first-ever install (no retained previous binary).
+    pub fn from_record(record: &InstallRecord) -> Result<Self, String> {
+        if record.phase != Phase::Committed {
+            return Err(format!(
+                "the install record is at phase {}, not committed",
+                record.phase.as_str()
+            ));
         }
-        RecordRead::Known(r) => match r.previous {
-            Some(prev) => Ok(InstallIdentity {
-                started_at: r.started_at,
-                target_sha256: r.target.sha256,
-                previous_sha256: prev.sha256,
+        match &record.previous {
+            Some(prev) => Ok(Self {
+                started_at: record.started_at,
+                target_sha256: record.target.sha256.clone(),
+                previous_sha256: prev.sha256.clone(),
             }),
             None => Err("this was a first-ever install: no previous binary was retained".into()),
-        },
+        }
+    }
+}
+
+impl Published {
+    /// The identity of the install this `publish` made. See [`InstallIdentity`].
+    pub fn identity(&self) -> Result<InstallIdentity, String> {
+        InstallIdentity::from_record(&self.record)
+    }
+}
+
+/// Names a file `install-binary publish` appends one JSON line to after a
+/// successful publish, so the parent `daemon-update` learns which install its
+/// provision script's subprocess made without re-reading the record.
+pub const IDENTITY_SINK_ENV: &str = "LOOM_INSTALL_IDENTITY_SINK";
+
+/// One line of the [`IDENTITY_SINK_ENV`] file.
+#[derive(Debug, Serialize, Deserialize)]
+struct SinkLine {
+    dest: String,
+    /// `None` when this publish left nothing to restore to.
+    identity: Option<InstallIdentity>,
+    #[serde(default)]
+    why_not: String,
+}
+
+/// Append this publish's identity to the file named by [`IDENTITY_SINK_ENV`],
+/// if set. Best-effort: a failure only means no restore is attempted.
+pub fn report_identity(dest: &Path, published: &Published) {
+    let Some(sink) = std::env::var_os(IDENTITY_SINK_ENV).filter(|v| !v.is_empty()) else {
+        return;
+    };
+    let (identity, why_not) = match published.identity() {
+        Ok(id) => (Some(id), String::new()),
+        Err(why) => (None, why),
+    };
+    let line = SinkLine {
+        dest: dest.display().to_string(),
+        identity,
+        why_not,
+    };
+    let Ok(mut text) = serde_json::to_string(&line) else {
+        return;
+    };
+    text.push('\n');
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sink)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+/// The identity the LAST publish to `dest` reported into `sink`, or why there
+/// is none. Exact-path match: a path the script did not publish to is not ours.
+pub fn read_reported_identity(sink: &Path, dest: &Path) -> Result<InstallIdentity, String> {
+    let text = std::fs::read_to_string(sink)
+        .map_err(|_| "no publish reported its install identity".to_string())?;
+    let want = dest.display().to_string();
+    let line = text
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<SinkLine>(l).ok())
+        .find(|l| l.dest == want)
+        .ok_or_else(|| format!("no publish to {want} reported its install identity"))?;
+    line.identity.ok_or(line.why_not)
+}
+
+/// The identity of the install now recorded beside `dest`. A re-read of the
+/// current record, so it can describe ANOTHER invocation's install: tests
+/// only. Production takes the identity from its own publish.
+#[cfg(test)]
+pub fn snapshot(dest: &Path) -> Result<InstallIdentity, String> {
+    match read_record(dest) {
+        RecordRead::Known(r) => InstallIdentity::from_record(&r),
         RecordRead::Absent => Err("there is no install record".into()),
         RecordRead::Unreadable(why) => Err(format!("the install record is unreadable ({why})")),
         RecordRead::UnknownVersion(v) => Err(format!("the install record has schema_version {v}")),

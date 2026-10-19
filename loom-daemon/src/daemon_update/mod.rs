@@ -861,7 +861,8 @@ fn stage_two(a: &Args, s: Stage) -> ! {
     };
 
     // The install this invocation made, for a restore after a failed start
-    // (#12776). Read AFTER the verifiers, BEFORE the restart.
+    // (#12776). Taken from this invocation's own publish, never re-read from
+    // the record afterwards (another publisher may have replaced it).
     let mut install_identity: Option<(PathBuf, provision::txn::InstallIdentity)> = None;
 
     if let Some(explicit) = util::env_non_empty("LOOM_DAEMON_BIN") {
@@ -870,21 +871,22 @@ fn stage_two(a: &Args, s: Stage) -> ! {
         // machine-level default.
         let dest = PathBuf::from(&explicit);
         selfrepl::announce_if_self(&dest);
-        if provision::install_to(&new_bin, &dest) {
+        if let Some(published) = provision::install_to_published(&new_bin, &dest) {
             out::ok(&format!("Provisioned loom-daemon -> {}", dest.display()));
+            // From the transaction this call made, read under the install lock.
+            install_identity = bind_install(&dest, published.identity());
         } else {
             out::err(&format!("Failed to provision to LOOM_DAEMON_BIN={}", dest.display()));
             exit(1);
         }
         run_verifiers(Some(&dest));
-        install_identity = snapshot_install(&dest);
     } else if let Some(script) = provision_script.as_ref() {
         // The machine-level destination is the one that IS this binary on a
         // normal fleet host — see `selfrepl` for why the write below is a
         // rename (#10983) and why every check after it re-execs the path.
         selfrepl::announce_if_self(&provision_target);
         match provision::provision_machine_daemon(script, &new_bin, &s.roots.repo_root) {
-            provision::ProvisionOutcome::Provisioned(dest) => {
+            provision::ProvisionOutcome::Provisioned(dest, identity) => {
                 // provision_machine_daemon exports the destination it wrote to
                 // (even on the version-equality short-circuit) — verify that
                 // destination is the expected build so the short-circuit can no
@@ -896,7 +898,7 @@ fn stage_two(a: &Args, s: Stage) -> ! {
                     Some(&dest_path)
                 });
                 if !dest.is_empty() {
-                    install_identity = snapshot_install(&dest_path);
+                    install_identity = bind_install(&dest_path, identity);
                 }
             }
             provision::ProvisionOutcome::Failed => {
@@ -937,10 +939,14 @@ fn stage_two(a: &Args, s: Stage) -> ! {
     })
 }
 
-/// [`provision::txn::snapshot`], with the reason printed when there is
-/// nothing to bind a restore to (the restart then runs without one).
-fn snapshot_install(dest: &Path) -> Option<(PathBuf, provision::txn::InstallIdentity)> {
-    match provision::txn::snapshot(dest) {
+/// Pair `dest` with the identity of the install this invocation's own
+/// publish made, printing the reason when there is nothing to bind a restore
+/// to (the restart then runs without one).
+fn bind_install(
+    dest: &Path,
+    identity: Result<provision::txn::InstallIdentity, String>,
+) -> Option<(PathBuf, provision::txn::InstallIdentity)> {
+    match identity {
         Ok(id) => Some((dest.to_path_buf(), id)),
         Err(why) => {
             out::say(&format!(

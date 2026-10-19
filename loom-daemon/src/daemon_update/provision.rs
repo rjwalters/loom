@@ -102,7 +102,11 @@ pub enum ProvisionOutcome {
     /// The function ran and succeeded; the payload is `PROVISIONED_DAEMON_BIN`
     /// (possibly empty, which the caller passes straight to the verifier — an
     /// empty destination is itself a verification failure).
-    Provisioned(String),
+    ///
+    /// The second field is the identity of the install the script's own
+    /// `install-binary publish` made, reported by that subprocess (see
+    /// [`txn::IDENTITY_SINK_ENV`]), or why there is none to restore to.
+    Provisioned(String, Result<txn::InstallIdentity, String>),
     /// The function ran and FAILED. A soft warn here (the pre-#4053 behaviour)
     /// left the exit code at 0, which is exactly the "reports success while
     /// shipping nothing" defect.
@@ -124,7 +128,10 @@ pub fn provision_machine_daemon(
     repo_root: &Path,
 ) -> ProvisionOutcome {
     let sink = super::scratch_file("loom-daemon-provisioned-bin");
-    let status = provision_command(script, new_bin, repo_root, &sink).status();
+    let identity_sink = super::scratch_file("loom-daemon-install-identity");
+    let status = provision_command(script, new_bin, repo_root, &sink)
+        .env(txn::IDENTITY_SINK_ENV, &identity_sink)
+        .status();
 
     let code = status.ok().and_then(|s| s.code()).unwrap_or(98);
     if code == 98 {
@@ -133,7 +140,9 @@ pub fn provision_machine_daemon(
     if code != 0 {
         return ProvisionOutcome::Failed;
     }
-    ProvisionOutcome::Provisioned(std::fs::read_to_string(&sink).unwrap_or_default())
+    let dest = std::fs::read_to_string(&sink).unwrap_or_default();
+    let identity = txn::read_reported_identity(&identity_sink, Path::new(&dest));
+    ProvisionOutcome::Provisioned(dest, identity)
 }
 
 /// The `bash -c` that sources `script` and calls `provision_machine_daemon`,
@@ -210,6 +219,12 @@ exit "$rc"
 ///
 /// `true` on success, `false` on any failure (the reason is printed).
 pub fn install_to(new_bin: &Path, dest: &Path) -> bool {
+    install_to_published(new_bin, dest).is_some()
+}
+
+/// [`install_to`], returning the transaction this call made so the caller can
+/// bind a later restore to it (#12776). `None` on failure.
+pub fn install_to_published(new_bin: &Path, dest: &Path) -> Option<Published> {
     let done = stage(new_bin, dest)
         .map_err(InstallError::Stage)
         .and_then(|staged| publish(&staged, dest));
@@ -218,11 +233,11 @@ pub fn install_to(new_bin: &Path, dest: &Path) -> bool {
             if let Some(line) = done.retained_line() {
                 out::say(&line);
             }
-            true
+            Some(done)
         }
         Err(e) => {
             out::err(&e.to_string());
-            false
+            None
         }
     }
 }
