@@ -673,6 +673,29 @@ pub enum MetricName {
     /// `claim_lost`): the split-brain and attended-claim measure.
     #[serde(rename = "loom.fleet_dispatch.claim_lost_after_grant")]
     FleetDispatchClaimLostAfterGrant,
+    // ---- CI telemetry poller cycles (Issue #12793) ------------------------
+    /// CI telemetry poll cycles finished since the previous point, by
+    /// `outcome` (`ok`, `busy`, `backing_off`, `rate_limited`,
+    /// `credential_rejected`, `discovery_failed`, `io_failed`, `panicked`).
+    #[serde(rename = "loom.ci_telemetry.cycles")]
+    CiTelemetryCycles,
+    /// What finished CI telemetry cycles did since the previous point, by
+    /// `kind` (`repos_polled`, `runs_emitted`, `jobs_emitted`,
+    /// `recovered_units`).
+    #[serde(rename = "loom.ci_telemetry.cycle_items")]
+    CiTelemetryCycleItems,
+    /// Wall time of the last finished CI telemetry cycle, by `outcome`.
+    #[serde(rename = "loom.ci_telemetry.cycle_duration")]
+    CiTelemetryCycleDuration,
+    /// Size of the CI telemetry local journal.
+    #[serde(rename = "loom.ci_telemetry.journal_bytes")]
+    CiTelemetryJournalBytes,
+    /// Journal byte offset of the first line the exporter has not yet offered.
+    #[serde(rename = "loom.ci_telemetry.export_cursor_offset")]
+    CiTelemetryExportCursorOffset,
+    /// Age of the oldest journal line not yet exported; `0` when caught up.
+    #[serde(rename = "loom.ci_telemetry.export_lag")]
+    CiTelemetryExportLag,
 }
 
 impl MetricName {
@@ -755,6 +778,12 @@ impl MetricName {
             Self::FeedCompletions => "loom.feed.completions",
             Self::FeedReconcilePasses => "loom.feed.reconcile_passes",
             Self::CiQueueDepth => "loom.ci.queue_depth",
+            Self::CiTelemetryCycles => "loom.ci_telemetry.cycles",
+            Self::CiTelemetryCycleItems => "loom.ci_telemetry.cycle_items",
+            Self::CiTelemetryCycleDuration => "loom.ci_telemetry.cycle_duration",
+            Self::CiTelemetryJournalBytes => "loom.ci_telemetry.journal_bytes",
+            Self::CiTelemetryExportCursorOffset => "loom.ci_telemetry.export_cursor_offset",
+            Self::CiTelemetryExportLag => "loom.ci_telemetry.export_lag",
             Self::FleetDispatchFallbackTicks => "loom.fleet_dispatch.fallback_ticks",
             Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
             Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
@@ -803,7 +832,9 @@ impl MetricName {
             | Self::FleetDispatchFallbackTicks
             | Self::FleetDispatchRefusals
             | Self::FleetDispatchExpired
-            | Self::FleetDispatchClaimLostAfterGrant => MetricKind::DeltaCounter,
+            | Self::FleetDispatchClaimLostAfterGrant
+            | Self::CiTelemetryCycles
+            | Self::CiTelemetryCycleItems => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -868,6 +899,10 @@ impl MetricName {
             Self::FeedCompletions => "{completion}",
             Self::FeedReconcilePasses => "{pass}",
             Self::CiQueueDepth => "{run}",
+            Self::CiTelemetryCycles => "{cycle}",
+            Self::CiTelemetryCycleItems => "{item}",
+            Self::CiTelemetryCycleDuration | Self::CiTelemetryExportLag => "s",
+            Self::CiTelemetryJournalBytes | Self::CiTelemetryExportCursorOffset => "By",
             Self::AgentScopeOomKills => "{kill}",
             Self::FleetDispatchFallbackTicks => "{tick}",
             Self::FleetDispatchRefusals | Self::FleetDispatchClaimLostAfterGrant => "{claim}",
@@ -1003,6 +1038,18 @@ impl MetricName {
             }
             Self::CiQueueDepth => {
                 "Workflow runs queued for a runner in the CI poll window at the end of a poll, by repo."
+            }
+            Self::CiTelemetryCycles => "CI telemetry poll cycles finished, by outcome.",
+            Self::CiTelemetryCycleItems => {
+                "Repos polled, runs and jobs emitted and units recovered by CI telemetry cycles, by kind."
+            }
+            Self::CiTelemetryCycleDuration => "Wall time of the last CI telemetry cycle, by outcome.",
+            Self::CiTelemetryJournalBytes => "Size of the CI telemetry local journal.",
+            Self::CiTelemetryExportCursorOffset => {
+                "Journal byte offset of the first CI telemetry line not yet exported."
+            }
+            Self::CiTelemetryExportLag => {
+                "Age of the oldest CI telemetry journal line not yet exported; 0 when caught up."
             }
             Self::FleetDispatchFallbackTicks => {
                 "Step ticks run in fleet-dispatch fallback, by the reason fallback began."

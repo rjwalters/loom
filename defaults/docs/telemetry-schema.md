@@ -1917,13 +1917,35 @@ land".
 Long-running task liveness (Issue #10414, `observability/ops/liveness.rs`).
 `task_alive` is sampled every 60 s on its own ticker, not on the collector's
 pass. `task_faults` is emitted when a fault happens. The `task` label is a
-fixed daemon loop name: `auto_update` or
+fixed daemon loop name: `auto_update`, `ci_telemetry` or
 `role_runner.<role>`. It is never a repo, issue or path.
 
 | Metric | Unit | Labels | Meaning |
 |---|---|---|---|
 | `loom.daemon.task_alive` | `1` | `task` | `1` while the loop has beaten within its staleness window (two intervals plus 60 s, plus the loop's own iteration bound where it has one), `0` once it has gone silent past the window or marked itself dead |
 | `loom.daemon.task_faults` | `{fault}` | `task`, `reason` ∈ `panic`, `overrun`, `exit` | a delta counter: an iteration panicked and was caught, an iteration ran past the loop's bound, or the loop stopped for good |
+
+CI telemetry poller cycles (Issue #12793, `ci_telemetry/metrics.rs`). Both
+daemon loops (periodic and feed-driven) call one helper after every
+`run_cycle`; the `loom-daemon ci-telemetry` CLI emits nothing. The
+`ci_telemetry` loop beats on every iteration, including a deliberate
+non-captain skip, so a non-captain host reads `task_alive{task="ci_telemetry"} = 1`.
+"Fetching but committing nothing" is `cycles{outcome="ok"}` with
+`cycle_items{kind="runs_emitted"}` and `kind="jobs_emitted"` at `0` while the
+`export_lag` gauge grows.
+
+| Metric | Kind / unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.ci_telemetry.cycles` | delta counter, `{cycle}` | `outcome` ∈ `ok`, `busy`, `backing_off`, `rate_limited`, `credential_rejected`, `discovery_failed`, `io_failed`, `panicked` | one point per finished cycle |
+| `loom.ci_telemetry.cycle_items` | delta counter, `{item}` | `kind` ∈ `repos_polled`, `runs_emitted`, `jobs_emitted`, `recovered_units` | what the cycle did; emitted for `ok` and for `credential_rejected` (the progress made before the abort), not for other failures |
+| `loom.ci_telemetry.cycle_duration` | gauge, `s` | `outcome` | wall time of the cycle |
+| `loom.ci_telemetry.journal_bytes` | gauge, `By` | none | size of the local journal (`0` when absent) |
+| `loom.ci_telemetry.export_cursor_offset` | gauge, `By` | none | journal byte offset of the first line not yet offered for export |
+| `loom.ci_telemetry.export_lag` | gauge, `s` | none | age of the oldest journal line not yet exported; `0` when caught up |
+
+The three gauges are sampled once per cycle, so they go stale if cycles stop;
+read them with `task_alive`. Unseen/held counts and a ledger units-committed
+total are not exported (they need new instrumentation inside `run_cycle`).
 
 IPC request latency (Issue #10765, `observability/ops/ipc_latency.rs`).
 Each IPC request is timed from its line being read to its response being

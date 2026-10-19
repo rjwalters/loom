@@ -301,6 +301,12 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::EgressTokens,
         MetricName::EgressLatency,
         MetricName::EgressTtft,
+        MetricName::CiTelemetryCycles,
+        MetricName::CiTelemetryCycleItems,
+        MetricName::CiTelemetryCycleDuration,
+        MetricName::CiTelemetryJournalBytes,
+        MetricName::CiTelemetryExportCursorOffset,
+        MetricName::CiTelemetryExportLag,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }

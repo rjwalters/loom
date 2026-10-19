@@ -74,6 +74,7 @@ pub mod feed;
 pub mod journal;
 pub mod ledger;
 pub mod logs;
+pub mod metrics;
 pub mod nextest;
 pub mod owners;
 pub mod poll;
@@ -487,11 +488,14 @@ fn spawn_task_with_bus(
         interval.as_secs(),
         resolved.excluded_repos
     );
+    metrics::register_liveness(interval);
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            // A deliberate non-captain skip below still counts as alive (#12793).
+            crate::task_liveness::beat(crate::task_liveness::CI_TELEMETRY, interval);
             // Fleet-captain gate (#8901): re-evaluated every tick, so a
             // `fleet.captain` edit or a host-identity change takes effect on
             // the very next cycle rather than requiring a daemon restart —
@@ -500,13 +504,15 @@ fn spawn_task_with_bus(
             if !gate_tick(&root, &host_id, chrono::Utc::now()) {
                 continue;
             }
-            let root = root.clone();
-            let resolved = resolved.clone();
+            let started = std::time::Instant::now();
+            let (cycle_root, cycle_resolved) = (root.clone(), resolved.clone());
             let outcome = tokio::task::spawn_blocking(move || {
                 let api = api::GhCliApi::from_env();
-                poll::run_cycle(&poll::CycleContext::new(&root, &resolved), &api)
+                poll::run_cycle(&poll::CycleContext::new(&cycle_root, &cycle_resolved), &api)
             })
             .await;
+            metrics::record_cycle(&root, outcome.as_ref().ok(), started.elapsed());
+            crate::task_liveness::beat(crate::task_liveness::CI_TELEMETRY, interval);
             match outcome {
                 Ok(Ok(report)) => log::info!("ci_telemetry: {}", report.summary()),
                 Ok(Err(error)) => log::warn!("ci_telemetry: cycle failed: {error}"),
