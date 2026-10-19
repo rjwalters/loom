@@ -8,6 +8,7 @@ mod checkout_freshness;
 mod ci;
 mod daemon_event;
 mod daemon_exit;
+mod dispatch_eligibility;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
@@ -595,6 +596,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::FleetState(_)
         | TelemetryRecord::PickDecision(_)
         | TelemetryRecord::OperatorPresence(_)
+        | TelemetryRecord::DispatchEligibility(_)
         | TelemetryRecord::CheckoutFreshness(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
@@ -616,6 +618,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
                 .or_else(|| operator_presence::log_parts(r))
+                .or_else(|| dispatch_eligibility::log_parts(r))
                 .or_else(|| checkout_freshness::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);

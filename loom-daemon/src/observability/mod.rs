@@ -110,6 +110,7 @@ pub mod collector;
 pub mod daemon_event;
 pub mod daemon_exit;
 pub mod daemon_lifecycle;
+pub mod dispatch_eligibility;
 pub mod endpoint_policy;
 pub mod exporter;
 mod ingest_key;
@@ -1271,6 +1272,10 @@ pub fn spawn_task(
     // start an exporter, least of all the managed HTTPS one.
     session_output::register_sink(otlp_queues.clone(), &host_id);
     ops_handles.extend(session_output::spawn_task(bus, workspace_root.clone()));
+    // `eta.dispatch_eligibility` (#12790): the dispatcher's schedulability
+    // decision per waiting ready item, OTLP-only, sampled by the collector
+    // below on the same cadence as `queue.snapshot`.
+    dispatch_eligibility::register_sink(otlp_queues.clone(), &host_id);
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.
