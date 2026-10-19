@@ -137,8 +137,9 @@ pub fn spawn(
         );
         return None;
     }
-    // #11295: loom-ui is a second output, independent of the bus (Matrix).
-    let loom_ui = crate::loom_ui_alerts::is_active();
+    // #11295 / #12806: `alert.transition` is a second output, independent of
+    // the bus (Matrix).
+    let loom_ui = crate::alerts::is_active();
     if bus.is_none() && !loom_ui {
         log::info!("fleet_alert: no delivery sink available; alerting is a no-op");
         return None;

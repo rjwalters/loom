@@ -49,11 +49,87 @@ pub fn warn_retired_config(root: &Path) -> Vec<String> {
     keys
 }
 
+/// The dashboard-ingest keys under `observability` that `effective` still
+/// carries (#12812): `observability.ingestKeyFile`, and `observability.endpoint`
+/// only when it is a dashboard `/ingest` target (the key is shared with OTLP
+/// exporters, so a valid OTLP endpoint is never named). Sorted. Pure.
+#[must_use]
+pub fn retired_ingest_keys(effective: &serde_json::Value) -> Vec<String> {
+    let Some(block) = crate::config_resolver::get_path(effective, "observability") else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    if block
+        .get("endpoint")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|endpoint| {
+            endpoint
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .ends_with("/ingest")
+        })
+    {
+        keys.push("observability.endpoint".to_string());
+    }
+    if block.get("ingestKeyFile").is_some() {
+        keys.push("observability.ingestKeyFile".to_string());
+    }
+    keys.sort();
+    keys
+}
+
+/// Log one warning when the workspace at `root` still names the retired
+/// dashboard ingest target (#12812). Called once at daemon startup; never
+/// fails the config load. Returns the keys warned about.
+pub fn warn_retired_ingest_config(root: &Path) -> Vec<String> {
+    let keys = retired_ingest_keys(&crate::config_resolver::resolve_effective_config(root));
+    if !keys.is_empty() {
+        log::warn!(
+            "config: {} name the retired dashboard /ingest target (#12808); the dashboard no \
+             longer accepts it and a 410 is treated as retired, not a failure — delete the keys \
+             from the host config",
+            keys.join(", ")
+        );
+    }
+    keys
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_legacy_ingest_config_is_named_and_an_otlp_endpoint_is_not() {
+        let legacy = json!({"observability": {
+            "endpoint": "https://dash.example.org/ingest",
+            "ingestKeyFile": "/k"}});
+        assert_eq!(
+            retired_ingest_keys(&legacy),
+            ["observability.endpoint", "observability.ingestKeyFile"]
+        );
+        let otlp = json!({"observability": {"endpoint": "http://127.0.0.1:4318"}});
+        assert!(retired_ingest_keys(&otlp).is_empty());
+        assert!(retired_ingest_keys(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_legacy_ingest_config_parses_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            json!({"observability": {"enabled": true, "ingestKeyFile": "/k"}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(warn_retired_ingest_config(dir.path()), ["observability.ingestKeyFile"]);
+        assert!(crate::observability::read_config(dir.path())
+            .ingest_key_file
+            .is_some());
+    }
 
     fn config(block: serde_json::Value) -> serde_json::Value {
         json!({ "fleet": { RETIRED_CONFIG_BLOCK: block } })

@@ -157,6 +157,9 @@ pub struct TelemetryKindMeta {
 // `telemetry/mod.rs`; moving them would churn every in-flight PR that touches
 // them for no schema benefit.)
 
+/// `alert.transition` (#12806) — one alert opening or resolving on this host.
+pub mod alert_transition;
+
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
@@ -563,6 +566,14 @@ macro_rules! telemetry_kind_table {
             /// `ready_wait` signal the dwell facts could not see. OTLP-only.
             /// See [`dispatch_eligibility`].
             DispatchEligibility = "eta.dispatch_eligibility" => $crate::telemetry::kinds::dispatch_eligibility::DispatchEligibilityRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One alert opening (or re-asserting) or resolving on this host
+            /// (#12806), in loom-ui's `alert.transition` schema: body and
+            /// `event.name` are the kind, the fields ride as `alert.*`
+            /// attributes. Replaces the POST to loom-ui's
+            /// `/api/alerts/external`. OTLP-only. See [`alert_transition`].
+            AlertTransition = "alert.transition" => $crate::telemetry::kinds::alert_transition::AlertTransitionRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

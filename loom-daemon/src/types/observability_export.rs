@@ -115,6 +115,11 @@ pub struct ObservabilityExportStatus {
     /// any ack). Non-zero ⇒ [`ObservabilityExportState::Failing`].
     #[serde(default)]
     pub consecutive_failures: u32,
+    /// The sink answered HTTP 410: the dashboard `/ingest` endpoint is retired
+    /// (#12812). The exporter stops sending and the state reads
+    /// [`ObservabilityExportState::Disabled`], not a fault.
+    #[serde(default)]
+    pub sink_retired: bool,
     /// The flush cadence this exporter resolved, in seconds — the unit the
     /// grace window is scaled by, so a host configured with a long interval
     /// does not false-alarm as never-exported. `None` when not running.
@@ -307,6 +312,9 @@ impl ObservabilityExportStatus {
         let Some(uptime) = self.uptime_secs(now) else {
             return ObservabilityExportState::Disabled;
         };
+        if self.sink_retired {
+            return ObservabilityExportState::Disabled;
+        }
         if self
             .ingest_host_id
             .as_ref()

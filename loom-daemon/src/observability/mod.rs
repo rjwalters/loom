@@ -157,8 +157,7 @@ use ingest_key::{entry_needs_key, resolve_for_planned, PlannedKey, NOT_CONFIGURE
 use queue::DurableQueue;
 
 // The ingest-key resolution lives in `ingest_key`; the `pub use` keeps the
-// pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working
-// for `loom_ui_alerts`.
+// pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working.
 pub use ingest_key::resolve_ingest_key_file;
 
 /// `observability.enabled` env override.
