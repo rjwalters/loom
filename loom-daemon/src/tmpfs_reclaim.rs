@@ -376,11 +376,6 @@ impl ScratchDirCandidate {
     }
 }
 
-/// Render a byte count the way every other reclaim pass's CLI does
-/// (`"6.2G"`, `"512K"`, `"0B"`). Public so the `tmpfs-scratch-gc` CLI
-/// front-end renders identical figures to the daemon's own log lines instead
-/// of keeping a second, drift-prone copy of the same formatter.
-#[must_use]
 /// The disposition of one scan — every candidate ends up in exactly one
 /// bucket. Pure function of `(candidates, now, staleness_secs)`: no I/O,
 /// fully unit-testable against a fixture list.
