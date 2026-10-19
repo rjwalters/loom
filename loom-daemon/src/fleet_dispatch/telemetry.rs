@@ -28,7 +28,7 @@ use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes,
 /// Span attribute keys the call span carries beyond the lifecycle allowlist.
 /// Listed in [`crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS`] and the
 /// gateway collector's `keep_keys`.
-pub const KEYS: [&str; 16] = [
+pub const KEYS: [&str; 17] = [
     "loom.fleet_dispatch.side",
     "loom.fleet_dispatch.host",
     "loom.fleet_dispatch.endpoint",
@@ -45,6 +45,7 @@ pub const KEYS: [&str; 16] = [
     "loom.fleet_dispatch.hold_rung",
     "loom.fleet_dispatch.hold_set_by_outcome",
     "loom.fleet_dispatch.hold_set_by_assignment_id",
+    "loom.fleet_dispatch.holder_assignment_id",
 ];
 
 /// The wall-clock end of a hold that has `retry_after_s` left, as RFC 3339
@@ -89,6 +90,8 @@ pub struct Call {
     pub latency_ms: u64,
     /// The host holding the item, on a refusal that knows it (#12707).
     pub held_by: Option<String>,
+    /// The holder's assignment id, on a `held` refusal from a live row (#12740).
+    pub holder_assignment_id: Option<String>,
     /// Seconds before asking again is worthwhile, on a refusal (#12707).
     pub retry_after_s: Option<u64>,
     /// The no-progress hold that refused a claim (#12707).
@@ -140,6 +143,9 @@ pub fn span(call: &Call, started_at: DateTime<Utc>, seq: u64) -> SpanRecord {
     }
     if let Some(held_by) = &call.held_by {
         a.insert("loom.fleet_dispatch.held_by".into(), held_by.clone());
+    }
+    if let Some(id) = &call.holder_assignment_id {
+        a.insert("loom.fleet_dispatch.holder_assignment_id".into(), id.clone());
     }
     if let Some(retry) = call.retry_after_s {
         a.insert("loom.fleet_dispatch.retry_after_s".into(), retry.to_string());
@@ -306,6 +312,21 @@ mod tests {
     }
 
     #[test]
+    fn a_live_row_refusal_exports_the_holders_assignment_id() {
+        let mut call = claim_call();
+        call.held_by = Some("worker-b".into());
+        call.holder_assignment_id = Some("a-7".into());
+        let s = span(&call, Utc::now(), 1);
+        assert_eq!(
+            s.attributes
+                .get("loom.fleet_dispatch.holder_assignment_id")
+                .map(String::as_str),
+            Some("a-7")
+        );
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
     fn a_cooldown_refusal_carries_the_hold_with_a_wall_clock_end() {
         let mut call = claim_call();
         call.retry_after_s = Some(1800);
@@ -324,6 +345,7 @@ mod tests {
         assert_eq!(attr("loom.fleet_dispatch.hold_set_by_outcome").as_deref(), Some("noop"));
         assert_eq!(attr("loom.fleet_dispatch.hold_set_by_assignment_id").as_deref(), Some("a-9"));
         assert_eq!(attr("loom.fleet_dispatch.held_by"), None, "a hold names no host");
+        assert_eq!(attr("loom.fleet_dispatch.holder_assignment_id"), None);
         assert!(s.validate().is_ok());
         let plain = span(&claim_call(), at, 2);
         assert!(!plain

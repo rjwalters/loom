@@ -262,6 +262,9 @@ pub enum ClaimDecision {
     Refused {
         reason: RefusalReason,
         held_by: Option<String>,
+        /// The holder's assignment id, on a `held` refusal from a live row
+        /// (#12740). Telemetry only: never on the wire.
+        holder_assignment_id: Option<String>,
         retry_after_s: u64,
     },
 }
@@ -575,7 +578,7 @@ impl Table {
             }
             if !own {
                 let retry = now.secs_until(row.deadline, 1).min(HELD_RETRY_MAX_SECS);
-                return refused(RefusalReason::Held, row.host.clone(), retry);
+                return held_by_row(row, retry);
             }
             replaces_own = true;
         }
@@ -597,7 +600,7 @@ impl Table {
                 .map(|(_, row)| row)
             {
                 let retry = now.secs_until(row.deadline, 1).min(HELD_RETRY_MAX_SECS);
-                return refused(RefusalReason::Held, row.host.clone(), retry);
+                return held_by_row(row, retry);
             }
         }
         let state = self.hosts.get(host);
@@ -776,6 +779,18 @@ fn refused(reason: RefusalReason, held_by: Option<String>, retry_after_s: u64) -
     ClaimDecision::Refused {
         reason,
         held_by,
+        holder_assignment_id: None,
+        retry_after_s,
+    }
+}
+
+/// A `held` refusal naming the live row that holds the item (#12740).
+fn held_by_row(row: &Row, retry_after_s: u64) -> ClaimDecision {
+    ClaimDecision::Refused {
+        reason: RefusalReason::Held,
+        held_by: row.host.clone(),
+        // A claim-lost hold has no host, so no holder either.
+        holder_assignment_id: row.host.as_ref().map(|_| row.assignment_id.clone()),
         retry_after_s,
     }
 }

@@ -416,6 +416,7 @@ fn claims_are_refused_with_grace_until_the_window_ends() {
         ClaimDecision::Refused {
             reason: RefusalReason::Grace,
             held_by: None,
+            holder_assignment_id: None,
             retry_after_s: 90
         }
     );
@@ -744,4 +745,33 @@ fn only_a_hold_refusal_is_traced_as_cooled() {
     assert_eq!(hold.streak, 1);
     assert_eq!(hold.set_by_outcome, "noop");
     assert_eq!(hold.set_by_assignment_id, id);
+}
+
+#[test]
+fn a_live_row_refusal_names_the_holders_assignment_and_a_cooldown_names_none() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 4));
+    t.heartbeat(at(100), B, &hb(B, vec![], 4));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 1, "builder", Some(40)));
+    let holder = |d: ClaimDecision| match d {
+        ClaimDecision::Refused {
+            reason: RefusalReason::Held,
+            holder_assignment_id,
+            ..
+        } => holder_assignment_id,
+        other => panic!("expected a held refusal, got {other:?}"),
+    };
+    assert_eq!(holder(t.claim(at(101), B, "acme/w", 1, "builder", Some(40))), Some(id));
+    // A refusal that is not a live-row hold carries none.
+    let d = t.claim(at(101), B, "acme/w", 2, "nonsense", Some(40));
+    assert!(
+        matches!(
+            d,
+            ClaimDecision::Refused {
+                holder_assignment_id: None,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
 }

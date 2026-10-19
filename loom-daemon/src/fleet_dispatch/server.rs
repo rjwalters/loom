@@ -309,10 +309,12 @@ impl<I: Identity> Server<I> {
             ClaimDecision::Refused {
                 reason,
                 held_by,
+                holder_assignment_id,
                 retry_after_s,
             } => {
                 call.result = "refused";
                 call.held_by.clone_from(&held_by);
+                call.holder_assignment_id = holder_assignment_id;
                 call.retry_after_s = Some(retry_after_s);
                 if call.reason.is_none() {
                     call.reason = Some(reason.as_str().to_string());
