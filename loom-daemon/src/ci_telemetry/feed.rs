@@ -304,6 +304,8 @@ async fn run_loop(
 ) {
     let mut ticker = tokio::time::interval(driver.base);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let base = driver.base;
+    super::metrics::register_liveness(base);
     loop {
         // Both branches are cancel-safe (`Interval::tick`, `mpsc::recv`).
         let action = tokio::select! {
@@ -329,18 +331,24 @@ async fn run_loop(
                 driver.on_keys(all)
             }
         };
+        // Every iteration beats, including an idle one and a non-captain skip
+        // below; a cycle that never returns stops the beats (#12793).
+        crate::task_liveness::beat(crate::task_liveness::CI_TELEMETRY, base);
         match action {
             Action::Idle => {}
             Action::Sweep => {
                 if !gate_tick(&root, &crate::sweep_registry::host_identity(), Utc::now()) {
                     continue;
                 }
-                let (root, resolved) = (root.clone(), resolved.clone());
+                let started = std::time::Instant::now();
+                let (cycle_root, cycle_resolved) = (root.clone(), resolved.clone());
                 let outcome = tokio::task::spawn_blocking(move || {
                     let api = api::GhCliApi::from_env();
-                    poll::run_cycle(&poll::CycleContext::new(&root, &resolved), &api)
+                    poll::run_cycle(&poll::CycleContext::new(&cycle_root, &cycle_resolved), &api)
                 })
                 .await;
+                super::metrics::record_cycle(&root, outcome.as_ref().ok(), started.elapsed());
+                crate::task_liveness::beat(crate::task_liveness::CI_TELEMETRY, base);
                 match outcome {
                     Ok(Ok(report)) => {
                         driver.sweep_succeeded();
@@ -360,6 +368,7 @@ async fn run_loop(
                     targeted::record_runs(&poll::CycleContext::new(&root, &resolved), &api, &batch)
                 })
                 .await;
+                crate::task_liveness::beat(crate::task_liveness::CI_TELEMETRY, base);
                 note_batch(&mut driver, &counters, keys, outcome);
             }
         }
