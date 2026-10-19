@@ -191,6 +191,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.claim_exit_code",
     "loom.dispatch.claim_ms",
     "loom.dispatch.claim_stderr_tail",
+    // A refused Builder claim's rollback (Issue #12822).
+    "loom.dispatch.claim_rollback",
     // `loom.dispatch.disposition` spans (Issue #9222).
     "loom.queue.disposition",
     "loom.queue.state",
