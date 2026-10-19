@@ -58,6 +58,8 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("daemon.exit", None),
     ("daemon.run_state_request", None),
     ("scope.memory", None),
+    // Only while an alert holds (heartbeat) or on a transition.
+    ("alert.transition", None),
 ];
 
 /// How long `kind` may stay silent; `None` when it is exempt.

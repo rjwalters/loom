@@ -8,8 +8,8 @@
 //!
 //! The tracker lives in memory, so a daemon restarted while the incident was
 //! open would never resolve it. The first healthy sample after start therefore
-//! always sends one `resolved`; for an incident loom-ui does not hold that is
-//! a no-op (`outcome: unknown`).
+//! always sends one `resolved`; for an incident the reader does not hold that
+//! is a no-op.
 
 use std::time::{Duration, Instant};
 
