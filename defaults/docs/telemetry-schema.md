@@ -3380,6 +3380,21 @@ probe stays absent rather than being coerced to a fake zero (the daemon's
 `worktree_root_total_gb` are omitted when unmeasurable. A consumer MUST treat an
 absent measurement as "unknown", never as zero/full.
 
+**Over OTLP (#12811).** `host.health` reaches OTLP as gauges only, grouped by
+`host.id`. The fields below once rode only the native HTTPS body
+(`observability/otlp/mapping/host_health.rs`); absent stays absent:
+
+| Field | OTLP carrier |
+| --- | --- |
+| `active_sweep_ids` | `loom.host.active_sweeps`: value = count (0 when none), `sweep_ids` = sorted, comma-joined, at most 32 ids; fewer ids than the value means truncated |
+| `managed_repos[]` | `loom.host.managed_repo` (1 per repo, `repo`, `visibility`); `weight` as `loom.host.managed_repo_weight` (`repo`), only when known |
+| `protection.state` | `loom.host.protection` (1, `state`) |
+| `built_at` | `loom.host.built_at_seconds` (Unix seconds) |
+| `build_commit` | Resource `loom.daemon.revision` (full SHA) |
+| `roles.persistent[]` | `loom.host.role_persistent_failure` (failures) and `loom.host.role_persistent_failure_last_at_seconds`, both `role` + `workspace` (directory name, never the path); `detail` is not exported |
+| `worktree_root_total_gb` | `loom.host.worktree_volume.total_bytes` (`metric.points`, same `df -Pk` sample; GB = bytes / 1024^3, floored) |
+| `otlp_export.state` | `loom.host.otlp_export` (`state`, `reason`) |
+
 **`worktree_root_total_gb` (Issue #5356).** Total capacity (GB) of the
 worktree-root scratch volume — the denominator `worktree_root_free_gb` needs to
 become a percentage, which is comparable across a heterogeneous fleet in a way an

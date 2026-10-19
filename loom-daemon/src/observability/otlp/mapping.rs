@@ -13,6 +13,7 @@ mod executing_host;
 mod fact_id;
 mod fleet_state;
 mod host_export;
+mod host_health;
 mod host_resource;
 mod host_status;
 mod issue_estimate;
@@ -1053,6 +1054,8 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     ));
                 }
             }
+            // #12811: the fleet-state fields that rode only `/ingest`.
+            samples.extend(host_health::samples(r, time_unix_nano));
             samples
         }
         TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),
