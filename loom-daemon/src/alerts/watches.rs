@@ -1,4 +1,4 @@
-//! The loom-ui alerts with no loop of their own to raise them (#11295),
+//! The alerts with no loop of their own to raise them (#11295),
 //! started once by [`spawn_all`] after [`super::start`]:
 //!
 //! - `daemon.task-dead` ([`crate::task_liveness::loom_ui`]);
