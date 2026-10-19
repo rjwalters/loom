@@ -25,8 +25,8 @@ use std::sync::{Mutex, OnceLock};
 
 use super::memory::FailureKind;
 use super::{Memory, WState, WorkspacePass, ALERT_AFTER};
-use crate::loom_ui_alerts::ledger::Ledger;
-use crate::loom_ui_alerts::{Alert, Severity, State};
+use crate::alerts::ledger::Ledger;
+use crate::alerts::{Alert, Severity, State};
 
 /// Key of the host-level kinds.
 pub const HOST_KEY: &str = "workspaces";

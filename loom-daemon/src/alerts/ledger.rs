@@ -1,5 +1,5 @@
-//! The incidents one level-triggered source has open on loom-ui, kept across
-//! restarts (#11295).
+//! The incidents one level-triggered source has open, kept across restarts
+//! (#11295).
 //!
 //! A source evaluates its condition, hands [`Ledger::reconcile`] the alerts
 //! that hold now, and the ledger posts only the edges: `open` for an incident
@@ -7,12 +7,17 @@
 //! open set is written to `<loom_dir>/loom-ui-alerts/<scope>.json` on every
 //! change, so a daemon restarted while an incident was open still resolves it
 //! on its first evaluation that finds the condition gone, and does not post a
-//! second `open` for one that still holds.
+//! second `open` for one that still holds. (The directory keeps its pre-#12806
+//! name so an upgraded daemon still finds what the previous one had open.)
 //!
-//! A queued post the process dies before sending is lost; the ledger has
-//! already recorded it. An `open` lost that way is posted again by nothing (the
-//! next `resolved` is then a no-op on loom-ui); a lost `resolved` leaves the
-//! incident to loom-ui. Both need a crash inside the outbox's delivery window.
+//! Between edges the `open` is re-sent by the output's heartbeat
+//! ([`super::HEARTBEAT`]); a reloaded ledger hands its open set to it
+//! ([`super::adopt`]).
+//!
+//! A posted edge is offered to the OTLP exporters' durable queue at once; one
+//! the process dies before offering is lost. A lost `open` is re-sent by the
+//! next process's heartbeat; a lost `resolved` leaves the incident to the
+//! reader's 24 h stale rule.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -81,9 +86,9 @@ fn ledger_dir() -> Option<PathBuf> {
 /// The output is off: nothing recorded can be delivered, so forget it all.
 /// A ledger file written before [`super::start`] decided (the credential
 /// preflight, the fleet-sync startup pass) would otherwise record an `open`
-/// loom-ui never got, and a later process with the output on would never post
-/// it. Turning the output off thus also forgets what an earlier process had
-/// open; loom-ui keeps those until they are resolved there.
+/// that never went out, and a later process with the output on would never
+/// post it. Turning the output off thus also forgets what an earlier process
+/// had open; the reader's 24 h stale rule closes those.
 pub fn forget_all() {
     let dir = std::env::var_os(DIR_ENV)
         .filter(|d| !d.is_empty())
@@ -96,9 +101,14 @@ pub fn forget_all() {
 
 impl Ledger {
     /// The production ledger for `scope`, posting through [`super::post`].
+    /// What it reloads as open joins the output's heartbeat.
     #[must_use]
     pub fn load(scope: &str) -> Self {
-        Self::at(path_for(scope), super::post)
+        let ledger = Self::at(path_for(scope), super::post);
+        for entry in ledger.open.values() {
+            super::adopt(opened(entry));
+        }
+        ledger
     }
 
     /// A ledger persisted at `path` (`None`: memory only), posting to `sink`.
@@ -147,7 +157,7 @@ impl Ledger {
                 critical: alert.severity == Severity::Critical,
             },
         );
-        log::info!("loom_ui_alerts: open {} {}", alert.rule, alert.key);
+        log::info!("alerts: open {} {}", alert.rule, alert.key);
         alert.state = State::Open;
         (self.sink)(alert);
         self.save();
@@ -160,7 +170,7 @@ impl Ledger {
         let Some(entry) = self.open.remove(&(rule.to_string(), key.to_string())) else {
             return false;
         };
-        log::info!("loom_ui_alerts: resolved {rule} {key}");
+        log::info!("alerts: resolved {rule} {key}");
         (self.sink)(resolved(&entry, detail));
         self.save();
         true
@@ -217,18 +227,27 @@ impl Ledger {
             std::fs::rename(&tmp, path)
         };
         if let Err(e) = write() {
-            log::warn!("loom_ui_alerts: could not write {}: {e}", path.display());
+            log::warn!("alerts: could not write {}: {e}", path.display());
         }
     }
 }
 
-fn resolved(entry: &Entry, detail: &str) -> Alert {
-    let severity = if entry.critical {
+fn severity(entry: &Entry) -> Severity {
+    if entry.critical {
         Severity::Critical
     } else {
         Severity::Warning
-    };
-    Alert::new(&entry.rule, &entry.key, &entry.title, severity, State::Resolved).with_detail(detail)
+    }
+}
+
+/// The `open` a persisted entry stands for (title and severity only).
+fn opened(entry: &Entry) -> Alert {
+    Alert::new(&entry.rule, &entry.key, &entry.title, severity(entry), State::Open)
+}
+
+fn resolved(entry: &Entry, detail: &str) -> Alert {
+    Alert::new(&entry.rule, &entry.key, &entry.title, severity(entry), State::Resolved)
+        .with_detail(detail)
 }
 
 #[cfg(test)]

@@ -530,6 +530,41 @@ async fn a_pass_baselines_new_repos_then_reads_and_publishes_changes() {
     assert!(seen[1].0.contains("after=acme%2Fwidgets%3A10"), "{}", seen[1].0);
 }
 
+#[tokio::test]
+async fn a_caller_held_mirror_passes_for_its_repo_set_only() {
+    const OTHER: &str = "acme/other";
+    let baseline = json!({"changes": [], "cursor": "", "more": false,
+        "repos": { REPO: rc(0, 10, false) }})
+    .to_string();
+    let next = json!({
+        "changes": [
+            {"seq": 11, "repo": REPO, "kind": "pr", "number": 3, "at": "2026-10-13T11:59:00Z"},
+            {"seq": 4, "repo": OTHER, "kind": "issue", "number": 9, "at": "2026-10-13T11:59:00Z"}
+        ],
+        "cursor": "", "more": false,
+        "repos": { REPO: rc(11, 11, false), OTHER: rc(4, 4, false) }
+    })
+    .to_string();
+    let (addr, _seen) = serve(vec![(200, baseline), (200, next)]);
+    let own = Active::with_key(
+        format!("http://{addr}"),
+        "2ge_captain_key_0123456789abcdef".to_string(),
+        BOUND,
+        Duration::from_secs(30),
+    );
+    let http = client::build_http().unwrap();
+    let repos = vec![REPO.to_string()];
+    let mut cursors = Cursors::new(&own.base_url);
+
+    let (first, r) = wake::pass(&http, &own, &repos, &mut cursors).await;
+    r.unwrap();
+    assert!(!first.prompts(), "a baseline never prompts");
+    let (second, r) = wake::pass(&http, &own, &repos, &mut cursors).await;
+    r.unwrap();
+    assert_eq!(second.repos, std::collections::BTreeSet::from([REPO.to_string()]));
+    assert!(!cursors.repos.contains_key(OTHER));
+}
+
 // ---------------------------------------------------------------- review fixes
 
 #[tokio::test(flavor = "multi_thread")]

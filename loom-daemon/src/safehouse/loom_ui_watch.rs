@@ -18,7 +18,7 @@
 use std::time::{Duration, Instant};
 
 use super::{snapshot_state, SafehouseState, SharedSafehouseState};
-use crate::loom_ui_alerts::{self, Alert, Severity, State};
+use crate::alerts::{self, Alert, Severity, State};
 
 /// How long safehoused must stay unreachable before it is an alert.
 pub const SUSTAIN: Duration = Duration::from_secs(5 * 60);
@@ -28,7 +28,7 @@ pub const SAMPLE: Duration = Duration::from_secs(30);
 pub const RULE: &str = "safehouse.unreachable";
 
 /// The debounce, shared with the other single-key loom-ui watches.
-pub use crate::loom_ui_alerts::sustain::Tracker;
+pub use crate::alerts::sustain::Tracker;
 
 /// The alert for `state`, describing `sample`.
 #[must_use]
@@ -63,7 +63,7 @@ pub fn spawn(runtime: &tokio::runtime::Handle, cell: SharedSafehouseState) {
             let sample = snapshot_state(&cell);
             let healthy = matches!(sample, SafehouseState::Connected { .. });
             if let Some(state) = tracker.observe(healthy, Instant::now(), SUSTAIN) {
-                loom_ui_alerts::post(alert(state, &sample));
+                alerts::post(alert(state, &sample));
             }
         }
     });

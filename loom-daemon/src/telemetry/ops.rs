@@ -69,6 +69,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     "pool",
     // #12734: `loom.dispatch.pool_items{repo, step}`, a closed set (`Step`).
     "step",
+    // #12827: `loom.queue.host_shard{shard_count}`, the host's configured
+    // shard count (one fixed value per host, so it adds no series).
+    "shard_count",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -205,6 +208,15 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.queue.total_candidates",
     "loom.queue.priority_score",
     "loom.queue.halt_cause",
+    // The dispatch-plan fields loom-ui's Backlog reads, carried over OTLP
+    // before `queue.snapshot` is retired (#12827, #12813). Closed sets or
+    // bounded integers, plus the issue's RFC 3339 creation time.
+    "loom.queue.plan_state",
+    "loom.queue.position",
+    "loom.queue.gate",
+    "loom.queue.step",
+    "loom.queue.owning_shard",
+    "loom.queue.created_at",
     // Repo lockout weights on a pr-open-skip row's disposition/admission
     // spans (Issue #9674).
     "lockout.duration_seconds",
@@ -432,6 +444,11 @@ pub enum MetricName {
     /// `unknown`; #11858).
     #[serde(rename = "loom.queue.already_landed")]
     QueueAlreadyLanded,
+    /// This host's shard index on the last work-finder tick's dispatch plan,
+    /// labelled `shard_count` (#12827). Emitted only when sharding is
+    /// configured and the index is known.
+    #[serde(rename = "loom.queue.host_shard")]
+    QueueHostShard,
     // ---- Quota burn and pool state (Issue #8857) ------------------------
     /// Uncached input tokens consumed since the previous sample.
     #[serde(rename = "loom.llm.tokens.input")]
@@ -727,6 +744,7 @@ impl MetricName {
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
             Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
             Self::QueueAlreadyLanded => "loom.queue.already_landed",
+            Self::QueueHostShard => "loom.queue.host_shard",
             Self::LlmTokensInput => "loom.llm.tokens.input",
             Self::LlmTokensOutput => "loom.llm.tokens.output",
             Self::LlmTokensCacheRead => "loom.llm.tokens.cache_read",
@@ -857,6 +875,7 @@ impl MetricName {
                 "{issue}"
             }
             Self::QueueListingFailedRepos | Self::QueueListingIncompleteRepos => "{repository}",
+            Self::QueueHostShard => "{shard}",
             Self::LlmTokensInput
             | Self::LlmTokensOutput
             | Self::LlmTokensCacheRead
@@ -945,6 +964,7 @@ impl MetricName {
                 "Repos whose ready-issue listing came back partial last tick."
             }
             Self::QueueAlreadyLanded => "Already-landed ready issues last tick, by evidence.",
+            Self::QueueHostShard => "This host's dispatch-plan shard index, by shard count.",
             Self::LlmTokensInput => "Uncached input tokens consumed, by provider and model.",
             Self::LlmTokensOutput => "Output tokens produced, by provider and model.",
             Self::LlmTokensCacheRead => "Cache-read input tokens, by provider and model.",
