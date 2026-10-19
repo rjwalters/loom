@@ -490,9 +490,15 @@ processors:
           # loom.forge.calls adds route (gateway|direct_read|direct|none: how a call reached GitHub).
           # loom.forge.calls adds purpose (#12310: discovery|gate|write|hygiene|observability|unknown).
           # host.status (#12112) adds volume (a host volume label, e.g. worktree_root).
+          # host.health's fleet-state gauges (#12811, HOST_HEALTH_DATAPOINT_KEYS in
+          # loom-daemon/src/observability/otlp/mapping/host_health.rs, contract-tested)
+          # add sweep_ids (loom.host.active_sweeps: the sorted, capped in-flight
+          # sweep-id list), visibility (loom.host.managed_repo: public|private)
+          # and workspace (a persistent role failure's workspace directory name,
+          # never its path); repo, state and role were already kept.
           # loom.queue.host_shard (#12827) adds shard_count (the host's configured
           # shard count, one fixed value per host, so no new series).
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "kind", "container", "installation", "agent", "route", "purpose", "volume", "step", "shard_count"])
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "kind", "container", "installation", "agent", "route", "purpose", "volume", "step", "shard_count", "sweep_ids", "visibility", "workspace"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318

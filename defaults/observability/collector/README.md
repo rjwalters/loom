@@ -373,6 +373,16 @@ and again when it exports it (#8857). The #8857 quota metrics
 `provider`, `model` and `state`: per-provider aggregates, never an account
 name or credential.
 
+`host.health`'s fleet-state gauges (#12811, `HOST_HEALTH_DATAPOINT_KEYS` in
+`loom-daemon/src/observability/otlp/mapping/host_health.rs`, contract-tested
+against this list) add `sweep_ids`, `visibility` and `workspace`. `sweep_ids`
+is the one deliberate exception to "low cardinality": it is the host's
+in-flight sweep-id set on `loom.host.active_sweeps` (sorted, at most 32 ids),
+which the dashboard reconciles live sweeps against once `/ingest` is gone. It
+opens a new series only when the set changes, at most once per `host.health`
+sample (about every 5 minutes per host). `workspace` is a directory name, never
+a path.
+
 **The body policy, exactly** (rewritten for #8825; this used to read "does not
 accept raw shell output, prompts or model completions", which is no longer the
 whole truth): this collector is **not** a general arbitrary-log redactor.
