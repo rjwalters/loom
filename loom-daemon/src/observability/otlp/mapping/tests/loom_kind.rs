@@ -190,6 +190,9 @@ fn samples() -> Vec<TelemetryRecord> {
                     "workspace": "loom", "role": "builder", "limit_source": "none",
                     "peak_bytes": 1, "events_max": 0, "oom_kills": 0, "clipped": false,
                     "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "alert.transition", "source": "host-a", "rule": "daemon.down",
+                    "key": "loom-daemon", "state": "open", "severity": "critical",
+                    "title": "down", "observed_at": AT})),
     ]
 }
 
