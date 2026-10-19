@@ -41,6 +41,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12771**: docs: align Judge/Doctor CI-wait recipes and mark unreadable required checks unknown
 - **#12774**: feat: bind private-clone admission and launch to the selected repository clone
 - **#12777**: feat: recover stopped or missing private Codex sessions in reconcile
+- **#12779**: feat: restore the retained daemon binary when a rolled candidate fails to start
 
 ## Very Important
 
@@ -72,7 +73,6 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#8525**: tracing: instrument sweep phases and role attempts, including Pi/OpenCode and repair cycles
 - **#8779**: peer-claim coordination is DEGRADED on a dispatch worker (#6157 Layer 3)
 - **#9081**: guard-background-subagents misses a background Bash started by a foreground subagent: headless sweep exits, Builder's make verify reaped
 - **#9736**: health: detect stalled release updates without a source checkout
@@ -118,7 +118,6 @@ Issues currently being built (`loom:building`).
 - **#12683**: install-loom.sh writes the merge-driver .gitattributes into the target's main checkout but leaves it out of the install PR
 - **#12692**: post-verdict.sh: accept `approve` as an alias or name the valid verdicts in the error
 - **#12714**: Verdict gate: take review start from dispatch, fail closed, follow Part-of links (#12624 misses the #12512 case)
-- **#12767**: Merge-mode repos: an orphaned stacked child (parent closed unmerged) is flagged but never de-stacked
 - **#12772**: Recover configured private Codex containers through the existing session reconciler
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
 - **#12776**: Restore retained daemon binary after failed operator or fleet roll
@@ -130,8 +129,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12631**: fix: release a Champion CI wait as requeued so it holds flat
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
-- **#12778**: feat: replace an orphaned stacked child with a child-only PR in merge-mode repos
-- **#12779**: feat: restore the retained daemon binary when a rolled candidate fails to start
 - **#12780**: refactor: stop planning automatic merge-order holds between independent PRs
 
 ## Approved (Awaiting Merge)
@@ -170,6 +167,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12771**: docs: align Judge/Doctor CI-wait recipes and mark unreadable required checks unknown
 - **#12774**: feat: bind private-clone admission and launch to the selected repository clone
 - **#12777**: feat: recover stopped or missing private Codex sessions in reconcile
+- **#12779**: feat: restore the retained daemon binary when a rolled candidate fails to start
 
 ## Proposed
 
@@ -272,7 +270,6 @@ Issues carrying `loom:curated`.
 - **#12714**: Verdict gate: take review start from dispatch, fail closed, follow Part-of links (#12624 misses the #12512 case) *(curated)*
 - **#12740**: Export the holding assignment id on fleet-dispatch 'held' refusal spans *(curated)*
 - **#12753**: Add the remaining AC4 command-capture tests for drawn-model launch (non-Builder, unavailable candidate, private handoff) *(curated)*
-- **#12767**: Merge-mode repos: an orphaned stacked child (parent closed unmerged) is flagged but never de-stacked *(curated)*
 - **#12769**: Stacking follow-ups: retarget-failure flag text, pr.edit-base inventory op, consolidation delete guard, stack-parent fork freshness *(curated)*
 - **#12772**: Recover configured private Codex containers through the existing session reconciler *(curated)*
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies *(curated)*
@@ -287,6 +284,7 @@ Issues carrying `loom:curated`.
 - **#12781**: Consolidate three duplicated Scratch temp-dir helpers in session_output tests *(hermit)*
 - **#12784**: Consolidate duplicated human_size / newest_mtime_and_size helpers in loom-daemon *(hermit)*
 - **#12785**: Consolidate duplicated tmpdir and hermetic git helpers in worktree differential tests *(hermit)*
+- **#12788**: Dedupe git_ok/git_stdout helpers in worktree_cli onto wip.rs *(hermit)*
 
 ## Epics
 
@@ -307,14 +305,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 32 |
+| Operator merge-risk holds | 33 |
 | Very important | 3 |
 | Important | 13 |
-| Ready (`loom:issue`) | 14 |
-| In Progress (`loom:building`) | 31 |
-| PRs awaiting review | 6 |
-| Approved PRs awaiting merge | 32 |
-| Curated | 102 |
-| Architect / Hermit proposals | 7 |
+| Ready (`loom:issue`) | 13 |
+| In Progress (`loom:building`) | 30 |
+| PRs awaiting review | 4 |
+| Approved PRs awaiting merge | 33 |
+| Curated | 101 |
+| Architect / Hermit proposals | 8 |
 | Active epics | 12 |
 <!-- guide:plan-body:end -->
