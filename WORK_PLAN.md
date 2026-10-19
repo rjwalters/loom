@@ -42,6 +42,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#12774**: feat: bind private-clone admission and launch to the selected repository clone
 - **#12777**: feat: recover stopped or missing private Codex sessions in reconcile
 - **#12779**: feat: restore the retained daemon binary when a rolled candidate fails to start
+- **#12802**: chore(deps): Bump the npm-minor-patch group across 1 directory with 3 updates
 
 ## Very Important
 
@@ -73,7 +74,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#8779**: peer-claim coordination is DEGRADED on a dispatch worker (#6157 Layer 3)
+- **#8779**: peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
 - **#9081**: guard-background-subagents misses a background Bash started by a foreground subagent: headless sweep exits, Builder's make verify reaped
 - **#9736**: health: detect stalled release updates without a source checkout
 - **#10083**: CI path filter skips label_registry Rust tests on label-file-only PRs (how #10072 turned main red)
@@ -121,8 +122,6 @@ Issues currently being built (`loom:building`).
 - **#12772**: Recover configured private Codex containers through the existing session reconciler
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
 - **#12776**: Restore retained daemon binary after failed operator or fleet roll
-- **#12793**: telemetry gap: ci_telemetry poll cycles report no outcome, liveness or commit counts to SigNoz
-- **#12796**: work-docs archive adds a duplicate archive link when rotating into an existing month file
 
 ## PRs Awaiting Review
 
@@ -132,7 +131,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
 - **#12780**: refactor: stop planning automatic merge-order holds between independent PRs
-- **#12797**: feat(ci-telemetry): export per-cycle outcome metrics and task liveness for the poller
 
 ## Approved (Awaiting Merge)
 
@@ -171,6 +169,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#12774**: feat: bind private-clone admission and launch to the selected repository clone
 - **#12777**: feat: recover stopped or missing private Codex sessions in reconcile
 - **#12779**: feat: restore the retained daemon binary when a rolled candidate fails to start
+- **#12802**: chore(deps): Bump the npm-minor-patch group across 1 directory with 3 updates
 
 ## Proposed
 
@@ -227,6 +226,7 @@ Issues carrying `loom:curated`.
 - **#12029**: Telemetry: merge runs record PR number and observed result (merge-pr chokepoint) — Judge parts moved to #12362; held behind #12063 *(curated)*
 - **#12043**: macOS bash 3.2: 7 shell suites fail on bash-4+ semantics (empty arrays under set -u, ${x,,}, \001 array sentinel, heredoc apostrophe in $(), mapfile, source <()) *(curated)*
 - **#12082**: Worktree-isolation guard blocks Bash writes to paths outside the repo when the cwd is the main checkout *(curated)*
+- **#12085**: Telemetry(doctor): structured parked-PR cause (park reason, doctor_cycles, queue gate, treating age) (ETA doctor, loom-ui#4063 #6) *(curated)*
 - **#12086**: Telemetry(coverage): every lease-writing host exports pick.decision + fleet.state (ETA ready_wait over-prediction, loom-ui#4063 #7) *(curated)*
 - **#12094**: Retire the telemetry replay subsystem and the kinds left without a producer by #11301 *(curated)*
 - **#12127**: ci: rebalance Native Port Suites legs so none runs over ~3 min (next PR critical path after #12089) *(curated)*
@@ -277,8 +277,6 @@ Issues carrying `loom:curated`.
 - **#12772**: Recover configured private Codex containers through the existing session reconciler *(curated)*
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies *(curated)*
 - **#12776**: Restore retained daemon binary after failed operator or fleet roll *(curated)*
-- **#12793**: telemetry gap: ci_telemetry poll cycles report no outcome, liveness or commit counts to SigNoz *(curated)*
-- **#12796**: work-docs archive adds a duplicate archive link when rotating into an existing month file *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -311,14 +309,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 33 |
+| Operator merge-risk holds | 34 |
 | Very important | 3 |
 | Important | 13 |
 | Ready (`loom:issue`) | 13 |
-| In Progress (`loom:building`) | 32 |
-| PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 33 |
-| Curated | 103 |
+| In Progress (`loom:building`) | 30 |
+| PRs awaiting review | 4 |
+| Approved PRs awaiting merge | 34 |
+| Curated | 102 |
 | Architect / Hermit proposals | 9 |
 | Active epics | 12 |
 <!-- guide:plan-body:end -->
