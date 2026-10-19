@@ -209,6 +209,26 @@ fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+/// The commit the Builder's work forked from: `merge-base HEAD
+/// origin/<default>`, computed after refreshing that remote-tracking ref. A
+/// stale `origin/<default>` yields an older merge-base, and the caller's
+/// `rebase --onto <parent> <fork>` would then replay default-branch commits
+/// that are not the Builder's own (#12769). A failed fetch is unanswered
+/// (`None`), never a fall-back to the possibly stale ref.
+fn fork_point(worktree: &Path, default_branch: &str) -> Option<String> {
+    let tracking = format!("refs/remotes/origin/{default_branch}");
+    git_out(
+        worktree,
+        &[
+            "fetch",
+            "-q",
+            "origin",
+            &format!("+refs/heads/{default_branch}:{tracking}"),
+        ],
+    )?;
+    git_out(worktree, &["merge-base", "HEAD", &tracking])
+}
+
 /// Run the verb in `worktree` for issue `issue`; `base` is the base the
 /// Builder was already given (`None`/default branch = flat).
 #[must_use]
@@ -243,9 +263,7 @@ pub fn run(worktree: &Path, issue: u32, base: Option<&str>) -> Outcome {
     else {
         return none(NoneReason::ListingFailed);
     };
-    let Some(fork) =
-        git_out(worktree, &["merge-base", "HEAD", &format!("origin/{default_branch}")])
-    else {
+    let Some(fork) = fork_point(worktree, &default_branch) else {
         return none(NoneReason::ListingFailed);
     };
     let deadline: Rc<Deadline> = Deadline::new(BUDGET);
@@ -416,6 +434,33 @@ mod tests {
         std::fs::write(dir.join(name), body).unwrap();
         git(dir, &["add", name]);
         git(dir, &["commit", "-qm", name]);
+    }
+
+    #[test]
+    fn fork_point_fetches_a_stale_default_ref_first() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        let origin = r.join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        let work = r.join("work");
+        git(r, &["clone", "-q", origin.to_str().unwrap(), "work"]);
+        git(&work, &["checkout", "-qb", "main"]);
+        commit_file(&work, "a.txt", "base\n");
+        git(&work, &["push", "-q", "origin", "main"]);
+        // The default branch advances; `origin/main` in `work` stays behind.
+        let other = r.join("other");
+        git(r, &["clone", "-q", origin.to_str().unwrap(), "other"]);
+        commit_file(&other, "c.txt", "newer\n");
+        git(&other, &["push", "-q", "origin", "main"]);
+        let newer = git(&other, &["rev-parse", "HEAD"]);
+        // The Builder cut its branch from the newer default tip.
+        git(&work, &["fetch", "-q", "origin", "main"]);
+        git(&work, &["checkout", "-qb", "feature/issue-99", "FETCH_HEAD"]);
+        commit_file(&work, "b.txt", "own\n");
+        git(&work, &["update-ref", "refs/remotes/origin/main", "HEAD~2"]);
+        assert_ne!(git(&work, &["merge-base", "HEAD", "origin/main"]), newer);
+        assert_eq!(fork_point(&work, "main").as_deref(), Some(newer.as_str()));
     }
 
     #[test]

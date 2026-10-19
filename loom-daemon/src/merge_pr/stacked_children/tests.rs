@@ -414,3 +414,24 @@ fn an_unrunnable_gh_discovers_no_children_rather_than_erroring() {
     assert_eq!(raw, "[]");
     assert!(parse_children(&raw).is_empty());
 }
+
+/// The consolidation attempt branches (`loom/consolidated/<attempt>`) are
+/// deleted by `merge_pr_consolidate` and `consolidate::reconcile` without the
+/// retarget-children guard (#12769). That is safe only while no PR can stack
+/// on them, so a change that makes them stackable must fail here.
+#[test]
+fn consolidation_branches_are_never_stackable_parents() {
+    for branch in [
+        "loom/consolidated/cons-ab12cd34",
+        "loom/consolidated/feature/issue-100",
+        "loom/consolidated/feature/harness-ops-350",
+    ] {
+        assert!(!is_stackable_parent_branch(branch), "{branch}");
+    }
+    assert!(
+        STACKABLE_PARENT_PREFIXES
+            .iter()
+            .all(|p| !p.starts_with(crate::merge_pr::consolidate::BRANCH_NAMESPACE)),
+        "a stackable prefix overlaps the consolidation namespace"
+    );
+}

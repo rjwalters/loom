@@ -382,6 +382,7 @@ struct FakeForge {
     parents: BTreeMap<String, ParentPr>,
     strategy_merge: bool,
     repo_unknown: bool,
+    retarget_failures: std::cell::Cell<u32>,
     lease: Option<Option<bool>>,
     lookups: RefCell<Vec<String>>,
     comments: RefCell<BTreeMap<u32, Vec<String>>>,
@@ -413,6 +414,10 @@ impl OrphanForge for FakeForge {
     }
     fn retarget(&self, pr: u32, base: &str) -> Result<(), String> {
         self.retargets.borrow_mut().push((pr, base.to_string()));
+        if self.retarget_failures.get() > 0 {
+            self.retarget_failures.set(self.retarget_failures.get() - 1);
+            return Err("HTTP 502".to_string());
+        }
         Ok(())
     }
     fn add_label(&self, pr: u32, label: &str) -> Result<(), String> {
@@ -499,6 +504,49 @@ fn closed_parent_child_is_replayed_onto_main_with_only_its_own_commits() {
     assert_eq!(again, OrphanStats::default());
     assert_eq!(forge.lookups.borrow().len(), lookups_before);
     assert_eq!(fx.origin_rev(B), new_b);
+}
+
+#[test]
+fn pushed_earlier_reads_only_a_marker_naming_the_current_head() {
+    let note = format!("{}\nbody", pushed_marker(1, "aaa", "bbb"));
+    let bodies = vec!["unrelated".to_string(), note];
+    assert_eq!(pushed_earlier(&bodies, 1, "bbb").as_deref(), Some("aaa"));
+    assert_eq!(pushed_earlier(&bodies, 1, "ccc"), None, "the head moved on");
+    assert_eq!(pushed_earlier(&bodies, 2, "bbb"), None, "another parent");
+}
+
+#[test]
+fn a_failed_retarget_after_the_push_is_retried_alone_not_flagged() {
+    let fx = Fixture::new();
+    let a = fx.branch(A, "main", 1, "a.txt", "parent\n");
+    let b = fx.branch(B, A, 2, "b.txt", "child\n");
+    fx.clone_repo();
+    let forge = FakeForge {
+        parents: [(A.to_string(), closed_parent(1, &a))]
+            .into_iter()
+            .collect(),
+        retarget_failures: std::cell::Cell::new(1),
+        ..FakeForge::default()
+    };
+    let first = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &b, A)]);
+    assert_eq!((first.retargeted, first.skipped), (0, 1), "{first:?}");
+    let pushed = fx.origin_rev(B);
+    assert_ne!(pushed, b, "the replay was pushed before the retarget failed");
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert!(posted[0].starts_with(&pushed_marker(1, &b, &pushed)), "{posted:?}");
+
+    // Next tick: the PR is still based on the closed parent and its head is
+    // the pushed one. The parent's head is no longer an ancestor, which used
+    // to read as a rewritten parent; now only the retarget is retried.
+    let second = reconcile_with(&forge, &fx.repo, "main", &[open_pr(2, B, &pushed, A)]);
+    assert_eq!((second.retargeted, second.flagged), (1, 0), "{second:?}");
+    assert!(forge.added.borrow().is_empty(), "no flag label");
+    assert_eq!(forge.retargets.borrow().len(), 2);
+    assert_eq!(fx.origin_rev(B), pushed, "nothing pushed again");
+    let posted = forge.comments.borrow().get(&2).cloned().unwrap_or_default();
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert!(posted[1].starts_with(RETARGETED_MARKER_PREFIX));
+    assert!(posted[1].contains(&format!("old={b} new={pushed}")), "{}", posted[1]);
 }
 
 #[test]
