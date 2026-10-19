@@ -16,6 +16,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-19
 
+- **PR #12803**: chore(deps): Bump the cargo-minor-patch group across 1 directory with 3 updates
 - **PR #12797**: feat(ci-telemetry): export per-cycle outcome metrics and task liveness for the poller
 - **Issue #12793** (closed): telemetry gap: ci_telemetry poll cycles report no outcome, liveness or commit counts to SigNoz
 - **PR #12799**: fix: dedupe archive months in the work-docs index
