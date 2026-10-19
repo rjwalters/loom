@@ -110,8 +110,7 @@ pub(super) fn reap_worktrees_generic(
 
         // #12461: what the removal frees, for the `reaper.pass` span only.
         let held = if crate::observability::ops::spans_exported() {
-            crate::target_orphan_reclaim::newest_mtime_and_size(&worktree_path)
-                .map_or(0, |(_, bytes)| bytes)
+            crate::fs_util::newest_mtime_and_size(&worktree_path).map_or(0, |(_, bytes)| bytes)
         } else {
             0
         };

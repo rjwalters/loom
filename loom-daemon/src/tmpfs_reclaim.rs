@@ -58,10 +58,11 @@
 //! `autonomous.tmpfsScratchGc.enabled=false`.
 
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+pub use crate::fs_util::human_size;
+use crate::fs_util::newest_mtime_and_size;
 use chrono::{DateTime, Utc};
 
 // ============================================================================
@@ -380,19 +381,6 @@ impl ScratchDirCandidate {
 /// front-end renders identical figures to the daemon's own log lines instead
 /// of keeping a second, drift-prone copy of the same formatter.
 #[must_use]
-pub fn human_size(bytes: u64) -> String {
-    let b = bytes as f64;
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1}G", b / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1}M", b / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1}K", b / 1024.0)
-    } else {
-        format!("{bytes}B")
-    }
-}
-
 /// The disposition of one scan — every candidate ends up in exactly one
 /// bucket. Pure function of `(candidates, now, staleness_secs)`: no I/O,
 /// fully unit-testable against a fixture list.
@@ -441,40 +429,6 @@ pub fn plan_reclaim(
 // ============================================================================
 // I/O: scanning and removal
 // ============================================================================
-
-/// Recursively find the newest mtime and cumulative size under `path` —
-/// identical discipline to `target_dir_gc`'s own helper of the same shape
-/// (kept as a separate copy rather than a shared dependency: the two modules
-/// have no other coupling, and this is a handful of lines). Best-effort: an
-/// unreadable child is skipped rather than failing the whole walk.
-fn newest_mtime_and_size(path: &Path) -> io::Result<(DateTime<Utc>, u64)> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.is_dir() {
-        let mut newest = mtime_of(&meta);
-        let mut total = 0u64;
-        let entries = match fs::read_dir(path) {
-            Ok(e) => e,
-            Err(_) => return Ok((newest, total)),
-        };
-        for entry in entries.flatten() {
-            if let Ok((child_newest, child_size)) = newest_mtime_and_size(&entry.path()) {
-                if child_newest > newest {
-                    newest = child_newest;
-                }
-                total += child_size;
-            }
-        }
-        Ok((newest, total))
-    } else {
-        Ok((mtime_of(&meta), meta.len()))
-    }
-}
-
-fn mtime_of(meta: &fs::Metadata) -> DateTime<Utc> {
-    meta.modified()
-        .ok()
-        .map_or_else(Utc::now, DateTime::<Utc>::from)
-}
 
 /// Walk every RAM-backed mount point for Loom-named top-level directories.
 /// **Non-recursive into the mount itself** — only direct children of a
