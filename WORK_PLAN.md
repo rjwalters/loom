@@ -121,6 +121,8 @@ Issues currently being built (`loom:building`).
 - **#12772**: Recover configured private Codex containers through the existing session reconciler
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies
 - **#12776**: Restore retained daemon binary after failed operator or fleet roll
+- **#12793**: telemetry gap: ci_telemetry poll cycles report no outcome, liveness or commit counts to SigNoz
+- **#12796**: work-docs archive adds a duplicate archive link when rotating into an existing month file
 
 ## PRs Awaiting Review
 
@@ -130,6 +132,7 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#12637**: refactor: split status_render inline tests into per-module files
 - **#12639**: test: create registered roots before registering their gh config dir
 - **#12780**: refactor: stop planning automatic merge-order holds between independent PRs
+- **#12797**: feat(ci-telemetry): export per-cycle outcome metrics and task liveness for the poller
 
 ## Approved (Awaiting Merge)
 
@@ -274,6 +277,8 @@ Issues carrying `loom:curated`.
 - **#12772**: Recover configured private Codex containers through the existing session reconciler *(curated)*
 - **#12775**: Simplify merge ordering: retire automatic soft holds while preserving explicit dependencies *(curated)*
 - **#12776**: Restore retained daemon binary after failed operator or fleet roll *(curated)*
+- **#12793**: telemetry gap: ci_telemetry poll cycles report no outcome, liveness or commit counts to SigNoz *(curated)*
+- **#12796**: work-docs archive adds a duplicate archive link when rotating into an existing month file *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -285,6 +290,7 @@ Issues carrying `loom:curated`.
 - **#12784**: Consolidate duplicated human_size / newest_mtime_and_size helpers in loom-daemon *(hermit)*
 - **#12785**: Consolidate duplicated tmpdir and hermetic git helpers in worktree differential tests *(hermit)*
 - **#12788**: Dedupe git_ok/git_stdout helpers in worktree_cli onto wip.rs *(hermit)*
+- **#12794**: Dedupe 11 copies of kv_bool (and 3 of kv_int) in OTLP mapping modules *(hermit)*
 
 ## Epics
 
@@ -309,10 +315,10 @@ Issues carrying `loom:curated`.
 | Very important | 3 |
 | Important | 13 |
 | Ready (`loom:issue`) | 13 |
-| In Progress (`loom:building`) | 30 |
-| PRs awaiting review | 4 |
+| In Progress (`loom:building`) | 32 |
+| PRs awaiting review | 5 |
 | Approved PRs awaiting merge | 33 |
-| Curated | 101 |
-| Architect / Hermit proposals | 8 |
+| Curated | 103 |
+| Architect / Hermit proposals | 9 |
 | Active epics | 12 |
 <!-- guide:plan-body:end -->
