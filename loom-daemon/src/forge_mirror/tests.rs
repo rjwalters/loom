@@ -258,6 +258,12 @@ fn only_the_discovery_and_wake_modules_name_the_mirror() {
         "daemon_service/observer_tasks.rs",
         "forge_events/wake.rs",
         "observability/ops/ratelimit.rs",
+        // The captain's fleet queue drives the mirror's change stream to
+        // refresh its entries; it makes no claim, label-transition or merge
+        // read (invariant 3).
+        "fleet_dispatch/queue.rs",
+        "fleet_dispatch/queue_tests.rs",
+        "fleet_dispatch/server.rs",
     ]
     .iter()
     .map(|s| (*s).to_string())

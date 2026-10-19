@@ -169,8 +169,9 @@ impl<I: Identity> Server<I> {
 
     /// Feed the queue one worklist read. `changed` names the repos a change
     /// prompted a re-read of; `None` is the full refresh (a `304` then only
-    /// advances the age). A repo the worklist cannot vouch for keeps its
-    /// entries until the next full refresh; one it omits leaves the queue.
+    /// advances the age). On a change-driven re-read, a repo the worklist lists
+    /// but cannot vouch for keeps its entries, and one it omits leaves the
+    /// queue; a full refresh drops any repo the worklist cannot vouch for.
     pub fn feed_queue(&self, tick: &TickWorklist, changed: Option<&BTreeSet<String>>) {
         let now = self.clock.now();
         let wall = chrono::Utc::now();
