@@ -1417,6 +1417,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     work_finder::operator_priority::warn_retired_config(&sweep_workspace);
     // #11406: the fleet-captain gauge block is gone; its keys warn once.
     loom_daemon::observability::retired_captain_config::warn_retired_config(&sweep_workspace);
+    // #12812: the dashboard /ingest target is retired; legacy keys warn once.
+    loom_daemon::observability::retired_captain_config::warn_retired_ingest_config(
+        &sweep_workspace,
+    );
 
     // Idle-edge role triggering (#4364) is inert without the work-finder loop:
     // the work finder is the sole source of the per-root idle signal, so an

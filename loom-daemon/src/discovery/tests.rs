@@ -812,6 +812,36 @@ fn against_a_fake_server_a_tick_is_one_request_and_the_next_is_a_304() {
 
 #[test]
 #[serial]
+fn a_caller_held_mirror_reads_the_worklist_without_the_global() {
+    let (base, seen) = serve(vec![
+        (200, Some("\"w1\""), worklist_body().to_string()),
+        (304, None, String::new()),
+    ]);
+    crate::forge_mirror::set_active(None);
+    let own = crate::forge_mirror::Active::with_key(
+        base,
+        "2ge_captain_key_0123456789abcdef".to_string(),
+        Duration::from_secs(600),
+        Duration::from_secs(30),
+    );
+    let mut backend = mirror::MirrorBackend::default();
+
+    let first = backend.fetch_from(&own, now());
+    assert!(!first.not_modified);
+    assert_eq!(first.repo("acme/widgets", now()).unwrap().rows.len(), 2);
+
+    let second = backend.fetch_from(&own, now());
+    assert!(second.not_modified);
+    assert_eq!(second.repo("acme/widgets", now()).unwrap().rows.len(), 2);
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].1, None);
+    assert_eq!(seen[1].1.as_deref(), Some("\"w1\""));
+}
+
+#[test]
+#[serial]
 fn an_inactive_mirror_falls_to_the_next_tier() {
     crate::forge_mirror::set_active(None);
     let mut d = Discovery::default();
