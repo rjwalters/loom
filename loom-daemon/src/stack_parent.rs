@@ -223,6 +223,7 @@ fn fork_point(worktree: &Path, default_branch: &str) -> Option<String> {
             "fetch",
             "-q",
             "origin",
+            "--",
             &format!("+refs/heads/{default_branch}:{tracking}"),
         ],
     )?;
