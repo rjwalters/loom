@@ -136,6 +136,8 @@ pub mod activity;
 pub mod agent_gh;
 pub mod agent_session;
 pub mod agent_skills;
+/// Alert transitions as `alert.transition` OTLP log records (#11295, #12806).
+pub mod alerts;
 pub mod api_keys_pool;
 pub mod auto_update;
 pub mod autonomy_marker;
@@ -284,7 +286,6 @@ pub mod live_claim;
 /// run on any spawn of the real `gh` (#10138).
 #[cfg(test)]
 mod live_gh_guard;
-pub mod loom_ui_alerts;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_group_ci;

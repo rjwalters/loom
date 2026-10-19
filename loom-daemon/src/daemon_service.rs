@@ -1413,11 +1413,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
         None
     };
-    // #11295: loom-ui's Alerts page, before its producers below start.
-    // Started before the watches below; alerts raised earlier wait in its outbox.
-    if loom_daemon::loom_ui_alerts::start(&sweep_workspace).is_some() {
-        loom_daemon::loom_ui_alerts::watches::spawn_all(&sweep_workspace);
-    }
     // #11104: star-liveness is gone; its `autonomous.operatorPriority` keys warn once.
     work_finder::operator_priority::warn_retired_config(&sweep_workspace);
     // #11406: the fleet-captain gauge block is gone; its keys warn once.
@@ -1426,11 +1421,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
     loom_daemon::observability::retired_captain_config::warn_retired_ingest_config(
         &sweep_workspace,
     );
-    let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
-        sweep_workspace.clone(),
-        socket_path.clone(),
-        Some(event_bus.clone()),
-    ); // #10164
 
     // Idle-edge role triggering (#4364) is inert without the work-finder loop:
     // the work finder is the sole source of the per-root idle signal, so an
@@ -1946,6 +1936,19 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `observer_tasks` for why they share a call site.
     let _observer_handles =
         observer_tasks::spawn(&sweep_workspace, &event_bus, workspace_pool.clone());
+
+    // #11295 / #12806: alerts go out as `alert.transition` OTLP records, so
+    // the output is decided once the exporters above are up. Alerts raised
+    // earlier (credential preflight, the fleet-sync startup pass) were held
+    // and go out now; the watches and fleet_alert start after it.
+    if loom_daemon::alerts::start().is_some() {
+        loom_daemon::alerts::watches::spawn_all(&sweep_workspace);
+    }
+    let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
+        sweep_workspace.clone(),
+        socket_path.clone(),
+        Some(event_bus.clone()),
+    ); // #10164
 
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state

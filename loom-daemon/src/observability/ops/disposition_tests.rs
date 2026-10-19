@@ -30,6 +30,7 @@ fn row(slug: &str, issue: u32, rank: usize, disposition: Qd) -> DispositionRow {
         priority_score: None,
         story_points: None,
         halt_cause: None,
+        plan: PlanAttributes::default(),
     }
 }
 
@@ -535,6 +536,19 @@ fn changed_emission() -> Emission {
                 .to_string(),
         ),
         halt_cause: None,
+        plan: full_plan(),
+    }
+}
+
+/// Every #12827 dispatch-plan attribute set.
+fn full_plan() -> PlanAttributes {
+    PlanAttributes {
+        plan_state: Some("next"),
+        position: Some(4),
+        gate: Some("capacity"),
+        step: Some("judge"),
+        owning_shard: Some(1),
+        created_at: Some("2026-10-01T00:00:00Z".to_string()),
     }
 }
 
@@ -559,6 +573,13 @@ fn every_attribute_survives_the_export_time_allowlist() {
     assert_eq!(span.attributes["loom.queue.transition"], "changed");
     assert_eq!(span.attributes["loom.queue.previous_disposition"], "deferred_capacity");
     assert_eq!(span.attributes["loom.queue.park_label"], "loom:blocked");
+    // Dispatch-plan attributes (Issue #12827).
+    assert_eq!(span.attributes["loom.queue.plan_state"], "next");
+    assert_eq!(span.attributes["loom.queue.position"], "4");
+    assert_eq!(span.attributes["loom.queue.gate"], "capacity");
+    assert_eq!(span.attributes["loom.queue.step"], "judge");
+    assert_eq!(span.attributes["loom.queue.owning_shard"], "1");
+    assert_eq!(span.attributes["loom.queue.created_at"], "2026-10-01T00:00:00Z");
     assert!(span.validate().is_ok());
 }
 
@@ -755,4 +776,287 @@ fn refresh_secs_falls_back_to_the_default_on_bad_input() {
     assert_eq!(refresh_secs(Some("garbage")), DEFAULT_REFRESH_SECS);
     assert_eq!(refresh_secs(Some("0")), DEFAULT_REFRESH_SECS);
     assert_eq!(refresh_secs(Some("120")), 120);
+}
+
+// ------------------------------------------------------- dispatch-plan attributes (Issue #12827)
+
+use crate::types::{DispatchPlanContext, PlanGate, PlanState, PlanStep, RowPlan};
+use crate::work_finder::step_item::Step;
+
+/// The six #12827 span keys.
+const PLAN_KEYS: [&str; 6] = [
+    "loom.queue.plan_state",
+    "loom.queue.position",
+    "loom.queue.gate",
+    "loom.queue.step",
+    "loom.queue.owning_shard",
+    "loom.queue.created_at",
+];
+
+fn planned_summary(rows: Vec<ReadyQueueRow>) -> WorkFinderTickSummary {
+    WorkFinderTickSummary {
+        queue: rows,
+        plan: Some(DispatchPlanContext::default()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn build_rows_maps_a_full_plan_and_created_at() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let mut queued = summary_row("/repo", 7, 2, Qd::DeferredCapacity, None);
+    queued.created_at = Some("2026-10-01T02:00:00+02:00".to_string());
+    queued.plan = RowPlan {
+        position: Some(3),
+        plan_state: PlanState::Queued,
+        gate: Some(PlanGate::BuildBackoff),
+        owning_shard: Some(2),
+        step: Some(PlanStep::Known(Step::ChampionMerge)),
+        ..RowPlan::default()
+    };
+    let (rows, _) = build_rows(&planned_summary(vec![queued]), &repos);
+    assert_eq!(
+        rows[0].plan,
+        PlanAttributes {
+            plan_state: Some("queued"),
+            position: Some(3),
+            gate: Some("build_backoff"),
+            step: Some("champion_merge"),
+            owning_shard: Some(2),
+            // Re-formatted as UTC, never the raw text.
+            created_at: Some("2026-10-01T00:00:00Z".to_string()),
+        }
+    );
+}
+
+#[test]
+fn build_rows_leaves_every_plan_attribute_absent_without_a_plan() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    // No published plan: the default `Unknown` state says nothing.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row("/repo", 7, 2, Qd::DeferredCapacity, None)],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].plan, PlanAttributes::default());
+
+    // A published plan that gave this row no position, gate, step or shard:
+    // only `plan_state` is set. `position` stays absent, never the rank.
+    let (rows, _) = build_rows(
+        &planned_summary(vec![summary_row("/repo", 7, 2, Qd::DeferredCapacity, None)]),
+        &repos,
+    );
+    assert_eq!(
+        rows[0].plan,
+        PlanAttributes {
+            plan_state: Some("unknown"),
+            ..PlanAttributes::default()
+        }
+    );
+    assert_eq!(rows[0].candidate_rank, 2, "the rank fallback stays on candidate_rank");
+}
+
+#[test]
+fn an_unparseable_created_at_is_never_exported() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let mut row = summary_row("/repo", 7, 1, Qd::DeferredCapacity, None);
+    row.created_at = Some("last tuesday, ask x_secret".to_string());
+    let (rows, _) = build_rows(&planned_summary(vec![row]), &repos);
+    assert_eq!(rows[0].plan.created_at, None);
+}
+
+#[test]
+fn unknown_plan_values_export_the_literal_unknown_never_the_raw_string() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let mut row = summary_row("/repo", 7, 1, Qd::DeferredCapacity, None);
+    row.plan = RowPlan {
+        plan_state: PlanState::Unknown,
+        gate: Some(PlanGate::Unknown),
+        step: Some(PlanStep::Unknown("x_secret".to_string())),
+        ..RowPlan::default()
+    };
+    let (rows, _) = build_rows(&planned_summary(vec![row]), &repos);
+    let mut tracker = DispositionTracker::default();
+    let emissions = tracker.diff(&rows, &[], at(0), Duration::seconds(600));
+    let span = build_span(&emissions[0], at(0), None, &HashMap::new());
+    assert_eq!(span.attributes["loom.queue.plan_state"], "unknown");
+    assert_eq!(span.attributes["loom.queue.gate"], "unknown");
+    assert_eq!(span.attributes["loom.queue.step"], "unknown");
+    assert!(
+        span.attributes
+            .iter()
+            .all(|(k, v)| !k.contains("x_secret") && !v.contains("x_secret")),
+        "{:?}",
+        span.attributes
+    );
+}
+
+#[test]
+fn each_plan_attribute_is_present_only_when_set() {
+    let span = build_span(&changed_emission(), Utc::now(), None, &HashMap::new());
+    for key in PLAN_KEYS {
+        assert!(span.attributes.contains_key(key), "{key} missing");
+    }
+    let empty = Emission {
+        plan: PlanAttributes::default(),
+        ..changed_emission()
+    };
+    let span = build_span(&empty, Utc::now(), None, &HashMap::new());
+    for key in PLAN_KEYS {
+        assert!(!span.attributes.contains_key(key), "{key} present when unset");
+    }
+    // One at a time: each key appears alone when only its field is set.
+    let singles = [
+        PlanAttributes {
+            plan_state: Some("running"),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            position: Some(1),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            gate: Some("file_overlap"),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            step: Some("builder"),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            owning_shard: Some(0),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            created_at: Some("2026-10-01T00:00:00Z".to_string()),
+            ..PlanAttributes::default()
+        },
+    ];
+    for (plan, key) in singles.into_iter().zip(PLAN_KEYS) {
+        let span = build_span(
+            &Emission {
+                plan,
+                ..changed_emission()
+            },
+            Utc::now(),
+            None,
+            &HashMap::new(),
+        );
+        let present: Vec<&str> = PLAN_KEYS
+            .iter()
+            .copied()
+            .filter(|k| span.attributes.contains_key(*k))
+            .collect();
+        assert_eq!(present, vec![key]);
+    }
+}
+
+#[test]
+fn a_left_queue_span_carries_no_plan_attribute() {
+    // From the tracker: the row left, so its emission has no plan.
+    let mut tracker = DispositionTracker::default();
+    let mut planned = row("acme/widgets", 1, 1, Qd::DeferredCapacity);
+    planned.plan = full_plan();
+    tracker.diff(&[planned], &[], at(0), Duration::seconds(600));
+    let emissions = tracker.diff(&[], &[], at(1), Duration::seconds(600));
+    assert_eq!(emissions[0].transition, Transition::LeftQueue);
+    assert_eq!(emissions[0].plan, PlanAttributes::default());
+
+    // And from the span builder, even for a hand-built emission that has one.
+    let emission = Emission {
+        transition: Transition::LeftQueue,
+        rank: None,
+        previous_disposition: None,
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    for key in PLAN_KEYS {
+        assert!(!span.attributes.contains_key(key), "{key} on a left_queue span");
+    }
+}
+
+#[test]
+fn every_plan_key_is_on_the_export_and_collector_allowlists() {
+    let collector = include_str!("../../../../defaults/observability/collector/config.yaml");
+    for key in PLAN_KEYS {
+        assert!(
+            crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key),
+            "{key} not in OPS_SPAN_ATTRIBUTE_KEYS"
+        );
+        assert!(collector.contains(&format!("\"{key}\"")), "{key} not in collector keep_keys");
+    }
+}
+
+/// Cardinality: whatever the plan says, `plan_state`, `gate` and `step`
+/// stay inside their closed vocabularies.
+#[test]
+fn plan_vocabularies_stay_closed_over_arbitrary_rows() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let states = [
+        PlanState::Running,
+        PlanState::Next,
+        PlanState::Queued,
+        PlanState::Blocked,
+        PlanState::Unknown,
+    ];
+    let gates = [
+        None,
+        Some(PlanGate::Capacity),
+        Some(PlanGate::BuildBackoff),
+        Some(PlanGate::FileOverlap),
+        Some(PlanGate::Unknown),
+    ];
+    let queue: Vec<ReadyQueueRow> = (0..300u32)
+        .map(|i| {
+            let mut row = summary_row("/repo", i + 1, i as usize + 1, Qd::DeferredCapacity, None);
+            let step = match i % 3 {
+                0 => Some(PlanStep::Unknown(format!("newer_step_{i}"))),
+                1 => Some(PlanStep::Known(Step::Doctor)),
+                _ => None,
+            };
+            row.plan = RowPlan {
+                plan_state: states[i as usize % states.len()],
+                gate: gates[i as usize % gates.len()],
+                step,
+                ..RowPlan::default()
+            };
+            row
+        })
+        .collect();
+    let (rows, dropped) = build_rows(&planned_summary(queue), &repos);
+    assert_eq!(dropped.truncated, 300 - MAX_ROWS);
+    let mut tracker = DispositionTracker::default();
+    let spans: Vec<SpanRecord> = tracker
+        .diff(&rows, &[], at(0), Duration::seconds(600))
+        .iter()
+        .map(|e| build_span(e, at(0), None, &HashMap::new()))
+        .collect();
+    let distinct = |key: &str| -> HashSet<String> {
+        spans
+            .iter()
+            .filter_map(|s| s.attributes.get(key).cloned())
+            .collect()
+    };
+    let allowed_states: HashSet<String> = ["running", "next", "queued", "blocked", "unknown"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let allowed_gates: HashSet<String> = ["capacity", "build_backoff", "file_overlap", "unknown"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert!(distinct("loom.queue.plan_state").is_subset(&allowed_states));
+    assert!(distinct("loom.queue.gate").is_subset(&allowed_gates));
+    assert_eq!(
+        distinct("loom.queue.step"),
+        ["doctor", "unknown"]
+            .into_iter()
+            .map(String::from)
+            .collect::<HashSet<_>>()
+    );
 }
