@@ -245,6 +245,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::QueueIssues,
         MetricName::QueueListingFailedRepos,
         MetricName::QueueListingIncompleteRepos,
+        MetricName::QueueHostShard,
         MetricName::LlmTokensInput,
         MetricName::LlmTokensOutput,
         MetricName::LlmTokensCacheRead,
@@ -766,6 +767,58 @@ fn queue_points_split_already_landed_by_evidence() {
     assert_eq!(landed("forge_closed_not_planned"), Some(MetricValue::Int(0)));
     assert_eq!(landed("unknown"), Some(MetricValue::Int(1)));
     assert_eq!(landed("free text"), None);
+}
+
+/// #12827: `loom.queue.host_shard{shard_count}` only for a sharded plan
+/// whose host index is known; absent stays absent.
+#[test]
+fn queue_points_emit_host_shard_only_for_a_sharded_plan() {
+    use crate::types::{DispatchPlanContext, PlanShard, WorkFinderTickSummary};
+    let host_shard = |summary: &WorkFinderTickSummary| -> Vec<MetricPoint> {
+        super::queue::queue_points(summary)
+            .into_iter()
+            .filter(|p| p.name == MetricName::QueueHostShard)
+            .collect()
+    };
+    let with_shard = |shard: PlanShard| {
+        let mut summary = queue_summary(&[]);
+        summary.plan = Some(DispatchPlanContext {
+            shard,
+            ..Default::default()
+        });
+        summary
+    };
+
+    let sharded = with_shard(PlanShard {
+        configured: true,
+        host_shard: Some(2),
+        shard_count: Some(3),
+    });
+    let points = host_shard(&sharded);
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].value, MetricValue::Int(2));
+    assert_eq!(points[0].labels.get("shard_count").map(String::as_str), Some("3"));
+    assert_eq!(points[0].labels.len(), 1);
+    assert!(points[0]
+        .labels
+        .keys()
+        .all(|k| OPS_METRIC_LABEL_KEYS.contains(&k.as_str())));
+
+    // Unsharded, sharded with no known index, and no plan at all: nothing.
+    assert!(host_shard(&with_shard(PlanShard::default())).is_empty());
+    assert!(host_shard(&with_shard(PlanShard {
+        configured: true,
+        host_shard: None,
+        shard_count: Some(3),
+    }))
+    .is_empty());
+    assert!(host_shard(&with_shard(PlanShard {
+        configured: false,
+        host_shard: Some(0),
+        shard_count: Some(1),
+    }))
+    .is_empty());
+    assert!(host_shard(&queue_summary(&[])).is_empty());
 }
 
 #[test]

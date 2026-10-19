@@ -1,9 +1,10 @@
-//! Fit raw alert fields to loom-ui's external-alert contract (#11295).
+//! Fit raw alert fields to loom-ui's external-alert schema (#11295, #12806):
+//! the `alert.transition` attribute limits, which are the former POST's own.
 //!
-//! loom-ui answers 400 for anything outside it, and a 400 is dropped, so a
-//! field that cannot be fixed here is an alert lost. Every function is total:
-//! it always returns something loom-ui accepts. Lengths are characters (code
-//! points), as loom-ui counts them.
+//! The reader drops a record with any value outside it, so a field that
+//! cannot be fixed here is an alert lost. Every function is total: it always
+//! returns something the reader accepts. Lengths are characters (code points),
+//! as loom-ui counts them.
 
 /// Max `source`/`rule` length.
 pub const IDENT_MAX: usize = 64;

@@ -2,6 +2,7 @@
 //! parent module's doc comment for the mapping table this file implements;
 //! this module is the field-by-field implementation plus its unit tests.
 
+mod alert_transition;
 mod auto_update;
 mod checkout_external_change;
 mod checkout_freshness;
@@ -13,6 +14,7 @@ mod executing_host;
 mod fact_id;
 mod fleet_state;
 mod host_export;
+mod host_health;
 mod host_resource;
 mod host_status;
 mod issue_estimate;
@@ -587,6 +589,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             (event_name, severity, String::new(), attributes)
         }
         TelemetryRecord::AutoUpdateTick(_)
+        | TelemetryRecord::AlertTransition(_)
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::HostExport(_)
         | TelemetryRecord::CheckoutExternalChange(_)
@@ -610,6 +613,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the body). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
+                .or_else(|| alert_transition::log_parts(r))
                 .or_else(|| token_ranking::log_parts(r))
                 .or_else(|| host_export::log_parts(r))
                 .or_else(|| checkout_external_change::log_parts(r))
@@ -704,7 +708,13 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         severity_number: severity as i32,
         severity_text: severity_text(severity).to_string(),
         body: Some(any_string(body_override.unwrap_or_else(|| event_name.to_string()))),
-        attributes: metadata::bounded(attributes),
+        // #12806: `alert.*` values are fitted to loom-ui's schema limits,
+        // which are wider than the generic bound.
+        attributes: if matches!(envelope.record, TelemetryRecord::AlertTransition(_)) {
+            alert_transition::bounded(attributes)
+        } else {
+            metadata::bounded(attributes)
+        },
         event_name: event_name.to_string(),
         trace_id: envelope
             .trace_context
@@ -1053,6 +1063,8 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     ));
                 }
             }
+            // #12811: the fleet-state fields that rode only `/ingest`.
+            samples.extend(host_health::samples(r, time_unix_nano));
             samples
         }
         TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),

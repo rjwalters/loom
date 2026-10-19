@@ -358,6 +358,24 @@ impl Active {
         }
     }
 
+    /// A mirror this caller holds itself: its own URL, key and bounds, apart
+    /// from the process-global [`active`] (a captain reading with a
+    /// fleet-spanning key). `base_url` is the origin, e.g. `https://<host>`.
+    #[must_use]
+    pub fn with_key(
+        base_url: String,
+        key: String,
+        max_staleness: Duration,
+        change_poll: Duration,
+    ) -> Self {
+        Self {
+            base_url,
+            key,
+            max_staleness,
+            change_poll,
+        }
+    }
+
     /// A loopback mirror for tests.
     #[cfg(test)]
     #[must_use]
