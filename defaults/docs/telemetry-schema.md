@@ -1801,6 +1801,7 @@ Every other name is a **`Gauge`**:
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
 | `loom.queue.listing_incomplete_repos` | count | every work-finder tick |
 | `loom.queue.already_landed` (`reason` = `forge_closed`/`forge_closed_not_planned`/`journal_landed`/`unknown`, #11858) | count | every work-finder tick, `0` included |
+| `loom.queue.host_shard` (`shard_count`, #12827) | shard index | every work-finder tick whose dispatch plan has sharding configured and this host's index known; absent otherwise (never a `0` for "unsharded") |
 | `loom.dispatch.idle_slots` | count | every work-finder tick with an occupancy reading |
 | `loom.dispatch.busy_slots` (`role`), `loom.dispatch.role_max_concurrent`, `loom.dispatch.role_idle_slots` | count | every work-finder tick |
 
@@ -1817,7 +1818,10 @@ listing came back partial (a later page failed, the page cap, a mid-walk
 change): their rows are counted, but not all of them. The depth is whole only
 when both are `0`. `loom.queue.already_landed` (#11858) splits the
 `already_landed` rows by the landed guard's evidence (the row's `detail`), so
-the `forge_closed` / `journal_landed` split is measurable in SigNoz. Issue numbers and repos are never labels. The per-issue rows travel in
+the `forge_closed` / `journal_landed` split is measurable in SigNoz.
+`loom.queue.host_shard` (#12827) is this host's shard index on the tick's
+dispatch plan, labelled with the configured `shard_count` (one fixed value per
+host, so one series per host); an unsharded host exports no point. Issue numbers and repos are never labels. The per-issue rows travel in
 `queue.snapshot`.
 
 `loom.dispatch.pool_items` (#12734) is the canonical **dispatchable depth**:
@@ -2159,6 +2163,12 @@ tick; otherwise a root of its own. Attributes:
 | `loom.queue.candidate_rank` | 1-based queue position at the sampled tick (Issue #9669): the dispatch-plan `position` in the shaped pass-2 candidate order when the row has one, else the comparator `rank` — a blocked row's would-be position once unblocked. Absent on a `left_queue` span |
 | `loom.queue.total_candidates` | the sampled tick's ready-queue row count — the denominator of `loom.queue.candidate_rank` (Issue #9669). Absent on a `left_queue` span |
 | `loom.queue.priority_score` | the comparator keys that placed the row, as one compact JSON object in comparator order, e.g. `{"main_red_fix":false,"level":1,"created_at":"2026-10-01T00:00:00Z","number":42}` (Issue #9669; keys re-cut by #11508; `main_red_fix` leads since #11547). The comparator is lexicographic over named keys — there is no numeric score — so this is the weight itself, taken from the row's plan annotation; absent without one |
+| `loom.queue.plan_state` | the row's dispatch-plan state (#12827): `running` / `next` / `queued` / `blocked` / `unknown`. Present whenever the sampled tick published a dispatch plan (an unknown or newer state exports the literal `unknown`); absent when it published none, and on a `left_queue` span |
+| `loom.queue.position` | the 1-based position the dispatch plan gave the row in the shaped pass-2 order (#12827), present **only** when the plan gave one — unlike `loom.queue.candidate_rank`, it never falls back to the comparator `rank`, so "no position" stays distinguishable. Absent on a `left_queue` span |
+| `loom.queue.gate` | the admission gate holding a deferred row (#12827): `capacity` / `build_backoff` / `file_overlap` / `unknown` (a gate this build does not know, including the retired `out_of_slice`, `ramp`, `saturation`, `repo_cap`). Only when the plan names one; absent on a `left_queue` span |
+| `loom.queue.step` | the step the row advances its item by (#12827): a `Step` name (`builder`, `judge`, `doctor`, `champion_merge`, …) or the literal `unknown` for a step this build does not know — never the raw string. Only when the row names a step; absent means `builder`, as in `queue.snapshot`. Absent on a `left_queue` span |
+| `loom.queue.owning_shard` | the shard that owns the row's workspace (#12827), an integer below the host's `shard_count`; only when sharding is configured. Absent on a `left_queue` span |
+| `loom.queue.created_at` | the issue's creation time from the ready listing (#12827), re-formatted as RFC 3339 UTC with seconds precision (`2026-10-01T00:00:00Z`); only when the listing supplied a parseable one, never the raw text. Absent on a `left_queue` span |
 | `loom.queue.transition` | `changed` (first sight, or the disposition itself changed) / `refresh` (same disposition, resent after the refresh window) / `left_queue` (the row disappeared from a repo whose listing succeeded) |
 | `loom.queue.previous_disposition` | present only on a `changed` transition after the first sighting |
 | `loom.queue.park_label` | only for `parked`/`hard_exclusion`, and only when the label is in the row's closed vocabulary — `PARK_LABELS ∪ SKIP_LABELS` for `parked`, `hard_exclusion::HARD_EXCLUSION_LABELS` (e.g. `external`) for `hard_exclusion` (#9672) — so a span names which rule declined the issue. A repo-configured extra skip label, a rule name outside that set, or any other detail text is never exported |
@@ -2167,6 +2177,23 @@ tick; otherwise a root of its own. Attributes:
 | `lockout.frozen_candidates_count` | only for `open_pr` (Issue #9674): how many ready issues in this repo the #4123 open-PR guard is currently blocking (`pr-open-skip`) — the repo's frozen backlog |
 | `lockout.frozen_points_sum` | only for `open_pr` (Issue #9674): the summed story points of those blocked issues (`points:*` labels, `crate::story_points`); unsized issues contribute nothing — absent is never `0` |
 | `lockout.duration_seconds` | only for `open_pr` (Issue #9674): seconds since this daemon process first observed the repo locked — an observation **floor** on the true lockout age (a daemon restart restarts the clock; the daemon never probes the forge for PR timestamps). A failed listing never reads as a cleared lock |
+
+The six dispatch-plan attributes (#12827: `loom.queue.plan_state`, `position`,
+`gate`, `step`, `owning_shard`, `created_at`) carry the `queue.snapshot` row
+fields loom-ui's Backlog reads, so they have an OTLP carrier before #12813
+retires `queue.snapshot`. They ride the existing emissions (a transition or the
+refresh), with no new trigger, so like `loom.queue.candidate_rank` and
+`loom.queue.priority_score` they hold the value as of the span's emission: a
+change to the plan alone is seen at the next disposition change or refresh.
+None of them is a metric label, and the span count is unchanged. The other
+`queue.snapshot` row fields need no new carrier: `workspace_weight` is the
+repo's `loom.host.managed_repo_weight`, `seen` is `loom.dispatch.seen` on the
+`loom.dispatch.tick` span, and the `listing_failed` count is
+`loom.queue.listing_failed_repos`. Retired with no carrier: `urgent` (always
+`false` since #9244; the label is the live signal), `operator_priority` /
+`operator_priority_at` (no daemon emits them; the priority level is the
+`level` key of `loom.queue.priority_score`), `tier` (no daemon source), and
+the `listing_failed` repo names (only the count is read).
 
 The lockout attributes ride the repo's `open_pr` rows only — the guard's own
 refusals — so a per-repo ranking never double counts the repo's other rows.
