@@ -231,6 +231,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`merge_queue.event`](#merge_queueevent--a-merge-queue-record-exported-to-otlp) | log, OTLP only | `forge_merge_queue/events.rs` (`FileEventSink::record`, after the JSONL append) |
 | [`merge.queue.observed`](#mergequeueobserved--the-merge-queue-as-an-existing-read-saw-it) | log, OTLP only | `forge_merge_queue/group_github.rs` (`GroupForge::groups`) |
 | [`merge.queue.regime`](#mergequeueregime--the-merge-queue-settings-on-change-only) | log, OTLP only | `forge_merge_queue/group_run.rs` (`tick_groups`, from `preflight::github_preflight`) |
+| [`eta.dispatch_eligibility`](#etadispatch_eligibility--why-a-ready-item-is-or-is-not-schedulable) | log, OTLP only | `observability/dispatch_eligibility.rs` (collector sample of the last work-finder tick) |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
 
@@ -2709,6 +2710,54 @@ Its seed's inputs (`seed_scheme`, `seed_minute`, `seed_host`, #11683) were added
 as optional fields under the stability promise above.
 Full field reference, the SigNoz rank-at-instant query and the rows/day volume:
 [`telemetry-kind-pick-decision.md`](telemetry-kind-pick-decision.md).
+
+### `eta.dispatch_eligibility` — why a ready item is (or is not) schedulable
+
+One OTLP-only log record per **waiting** ready item per emission (Issue
+#12790). ETA's worst-fit phase is `ready_wait` — time in `loom:issue` before a
+Builder claims it — and it is a queueing delay the dwell facts
+(`eta.stage_outcome`) cannot see: a `loom:issue` label does not mean the
+dispatcher can select the item right now. This fact journals the dispatcher's
+own decision so `ready_wait` dwell can be split at the eligibility boundary
+(schedulable-waiting vs ineligible — different hazards), and so a reader can
+reconstruct, as of any instant, how many eligible competitors were ahead.
+
+The producer is `observability::dispatch_eligibility`, sampled on the
+collector's snapshot cadence from `work_finder::last_tick_summary` — never from
+the tick loop, and it makes **no forge call**: repo roots resolve only through
+the synchronous `cached_repo_ref` the `queue.snapshot` / `ops::disposition`
+passes already warmed this interval, and an unresolved row is dropped. The
+dispatcher already computed each row's `QueueDisposition`; this only records it.
+
+A fact is emitted for a row whose coarse state is `ready` or `blocked`, when its
+**eligibility class flips** (`transition: changed`, including first sight) or the
+refresh window elapses (`transition: refresh`, default 10 min,
+`LOOM_DISPATCH_ELIGIBILITY_REFRESH_SECS`). A `running` (dispatched / in-flight)
+row gets no fact — it has left `ready_wait` — but it still counts toward the
+work-ahead of the rows behind it, because it occupies the pool. Envelopes carry
+`schema_version: 12`. The body is the record's JSON; `loom.repo`, `loom.issue`
+and `loom.repo.visibility` ride as attributes (all already on the gateway log
+`keep_keys`), so a reader filters the stream and joins it with the dwell facts
+on `(repo, issue)` without a collector change. The wire tag keeps the `eta.`
+prefix so the `loom.kind LIKE 'eta%'` queries catch it.
+
+Body fields (`observability/otlp/mapping/dispatch_eligibility.rs`,
+`telemetry/kinds/dispatch_eligibility.rs`):
+
+| Field | Meaning |
+|---|---|
+| `eligibility` | `eligible` (schedulable, held only by a capacity-style limit) or `blocked` (held by something specific to the item/repo/history). |
+| `reason` | the dispatcher's `QueueDisposition` token — `deferred_capacity`, `deferred_build_backoff`, `deferred_file_overlap`, `open_pr`, `parked`, `workspace_halted`, `quarantined`, `peer_claim`, `host_constraint`, … |
+| `state` | the coarse `ready` / `blocked` state the eligibility is derived from. |
+| `block_start` | when the item entered its current eligibility class on this host, as first observed (the tick of the first same-class sample). An observation floor — a class shorter than one collector interval can be missed, and a daemon restart re-anchors it (same tradeoff as `ops::disposition`). This is the dwell split point. |
+| `transition` | `changed` (class flip / first sight; `block_start` re-anchored) or `refresh` (same class, window elapsed; `block_start` preserved). |
+| `rank` | the item's 1-based bare comparator rank on the host this tick. |
+| `eligible_work_ahead` | **effective** work-ahead: the count of *eligible* items (not `blocked` — running or ready) ranked ahead across the host concurrency pool. Blocked items are excluded, so it is the real number of competitors that take a slot first, not a raw "priority ≥ mine" count. |
+| `eligible_work_ahead_repo` | the same, restricted to this item's own repo (the `maxConcurrentPerRepo` pool). |
+| `resource_pool` | the scheduling class the item competes in: the forge `owner/repo` slug. |
+| `max_concurrent` | the host's effective concurrency cap this tick (the global pool size). |
+| `level` | the issue's priority level (`default` / `important` / `very-important`) — the axis the work-ahead counts are relative to. |
+| `sampled_at` / `tick_at` | the collector sample instant (record time) and the work-finder tick it reflects. |
 
 ### `pass.summary` and `pass.verdict`
 

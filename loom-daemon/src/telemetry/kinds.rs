@@ -160,6 +160,11 @@ pub struct TelemetryKindMeta {
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
+/// `eta.dispatch_eligibility` (#12790) — the dispatcher's schedulability
+/// decision for one ready item, splitting `ready_wait` dwell at the
+/// eligibility boundary.
+pub mod dispatch_eligibility;
+
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
 /// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
@@ -549,6 +554,15 @@ macro_rules! telemetry_kind_table {
             /// daemon tick's rules read, emitted on change only (#12675).
             /// OTLP-only. See [`merge_queue_regime`].
             MergeQueueRegime = "merge.queue.regime" => $crate::telemetry::kinds::merge_queue_regime::MergeQueueRegimeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One ready item's dispatch-eligibility decision as of one
+            /// work-finder tick (Issue #12790): schedulable vs blocked, the
+            /// dispatcher's reason, when the current eligibility class began,
+            /// the effective eligible work-ahead, and the resource pool — the
+            /// `ready_wait` signal the dwell facts could not see. OTLP-only.
+            /// See [`dispatch_eligibility`].
+            DispatchEligibility = "eta.dispatch_eligibility" => $crate::telemetry::kinds::dispatch_eligibility::DispatchEligibilityRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
