@@ -259,7 +259,7 @@ processors:
     log_statements:
       - context: resource
         statements:
-          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision"])
+          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision", "host.cpu.count", "loom.host.mem_total_bytes", "host.arch", "host.type", "cloud.provider", "cloud.region"])
       - context: log
         statements:
           # loom.session_id / loom.agent_id / loom.parent_agent_id (#8669): the
@@ -366,7 +366,7 @@ processors:
     trace_statements:
       - context: resource
         statements:
-          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision"])
+          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision", "host.cpu.count", "loom.host.mem_total_bytes", "host.arch", "host.type", "cloud.provider", "cloud.region"])
       - context: span
         statements:
           # loom.ci.run / loom.ci.job spans (#8824) add CI_SPAN_ATTRIBUTE_KEYS,
@@ -468,7 +468,7 @@ processors:
     metric_statements:
       - context: resource
         statements:
-          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision"])
+          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision", "host.cpu.count", "loom.host.mem_total_bytes", "host.arch", "host.type", "cloud.provider", "cloud.region"])
       - context: datapoint
         statements:
           # loom.ci.{run,job}.duration_ms histograms (#8824) add the
