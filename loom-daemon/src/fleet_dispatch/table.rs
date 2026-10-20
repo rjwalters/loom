@@ -45,7 +45,7 @@
 //! runs above what the host is actually running; refusing on that count
 //! (the former `cap` refusal) stalled hosts that had free slots. Capacity is
 //! the worker's own: it claims only for the free slots its tick computed
-//! (`maxConcurrent`, RAM, disk and load), and a full worker does not ask.
+//! (`maxConcurrent` less what it already runs), and a full worker does not ask.
 //! [`RefusalReason::Cap`] stays in the wire enum for mixed-version fleets,
 //! but this table never emits it.
 //!
