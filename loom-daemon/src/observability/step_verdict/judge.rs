@@ -25,6 +25,7 @@ pub(super) const PROJECTOR: Projector = Projector {
     step_name,
     project,
     outcome_word,
+    reason_word,
 };
 
 fn step_name(_is_pr: bool) -> &'static str {
@@ -62,6 +63,21 @@ fn outcome_word(text: &str, _is_pr: bool, item: u32) -> Option<String> {
                 field("reason").unwrap_or("unclassified")
             )
         })
+    })
+}
+
+/// The raw `reason=` token of the last `LOOM_STEP_OUTCOME role=judge` line for
+/// `item`, verbatim (#12715).
+fn reason_word(text: &str, _is_pr: bool, item: u32) -> Option<String> {
+    text.lines().rev().find_map(|line| {
+        let rest = line.trim().strip_prefix(OUTCOME_LINE_PREFIX)?;
+        let field = |key: &str| {
+            rest.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        };
+        (field("role")? == "judge" && field("target")?.parse::<u32>().ok()? == item)
+            .then(|| field("reason").map(str::to_string))
+            .flatten()
     })
 }
 
