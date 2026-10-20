@@ -44,9 +44,9 @@ use crate::discovery::mirror::TickWorklist;
 
 use super::identity::{Identity, IdentityError};
 use super::proto::{
-    AckResponse, ClaimRequest, ClaimResponse, ErrorResponse, HeartbeatRequest, HeartbeatResponse,
-    RefusalReason, RefuseRequest, ReleaseRequest, CLAIM_PATH, HEARTBEAT_PATH, PATHS, REFUSE_PATH,
-    RELEASE_PATH,
+    AckResponse, Assignment, ClaimRequest, ClaimResponse, ErrorResponse, HeartbeatRequest,
+    HeartbeatResponse, NextRequest, NextResponse, RefusalReason, RefuseRequest, ReleaseRequest,
+    CLAIM_PATH, HEARTBEAT_PATH, NEXT_PATH, PATHS, REFUSE_PATH, RELEASE_PATH,
 };
 use super::queue::{Queue, DEFAULT_REFRESH_SECS};
 use super::roster::{Roster, RosterSource};
@@ -348,6 +348,7 @@ impl<I: Identity> Server<I> {
             CLAIM_PATH => self.claim(host, body, &mut call),
             REFUSE_PATH => self.refuse(host, body, &mut call),
             RELEASE_PATH => self.release(host, body, &mut call),
+            NEXT_PATH => self.next(host, body, &mut call),
             _ => Err(self.error(404, "not found")),
         };
         let reply = reply.unwrap_or_else(|e| e);
@@ -433,6 +434,89 @@ impl<I: Identity> Server<I> {
         Ok(self.ok(&response))
     }
 
+    /// Offer `host` up to `free_slots` items from the queue (#12817), granted
+    /// as a claim would be, in rounds of at most one item per repo (design
+    /// §7.4). An item that already has a row, a role outside the host's
+    /// `roles_ok`, or a refused claim (hold, cooldown, merge serialisation)
+    /// is skipped; the grace window answers empty. An empty list is an
+    /// answer, never an error.
+    fn next(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
+        let req: NextRequest = self.parse(host, body)?;
+        let (mut by_repo, age) = {
+            let queue = self.queue();
+            let mut by_repo: Vec<std::collections::VecDeque<_>> = Vec::new();
+            let mut repos: Vec<&str> = Vec::new();
+            for entry in queue.entries() {
+                match repos.iter().position(|r| *r == entry.repo) {
+                    Some(i) => by_repo[i].push_back(entry.clone()),
+                    None => {
+                        repos.push(&entry.repo);
+                        by_repo.push(std::iter::once(entry.clone()).collect());
+                    }
+                }
+            }
+            (by_repo, queue.age(self.clock.now()))
+        };
+        let slots = usize::try_from(req.free_slots).unwrap_or(usize::MAX);
+        let assignments = self.with_table(|t, now, counters| {
+            let mut out: Vec<Assignment> = Vec::new();
+            'rounds: while out.len() < slots {
+                let mut progressed = false;
+                for entries in &mut by_repo {
+                    if out.len() >= slots {
+                        break 'rounds;
+                    }
+                    while let Some(e) = entries.pop_front() {
+                        let step = e.step.as_str();
+                        let item = u64::from(e.item);
+                        if !req.roles_ok.iter().any(|r| r == e.step.role_name())
+                            || t.row(&e.repo, item).is_some()
+                        {
+                            continue;
+                        }
+                        match t.claim(now, host, &e.repo, item, step) {
+                            ClaimDecision::Granted {
+                                assignment_id,
+                                ttl_s,
+                                ..
+                            } => {
+                                out.push(Assignment {
+                                    assignment_id,
+                                    repo: e.repo.clone(),
+                                    item,
+                                    step: step.to_string(),
+                                    ttl_s,
+                                });
+                                progressed = true;
+                                break;
+                            }
+                            ClaimDecision::Refused {
+                                reason: RefusalReason::Grace,
+                                ..
+                            } => break 'rounds,
+                            ClaimDecision::Refused { reason, .. } => counters.claim_refused(reason),
+                        }
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            out
+        });
+        call.result = if assignments.is_empty() {
+            "ok"
+        } else {
+            "granted"
+        };
+        call.reason = assignments.is_empty().then(|| "empty".to_string());
+        Ok(self.ok(&NextResponse {
+            server_epoch: self.epoch.clone(),
+            queue_age_s: age.map(|a| a.as_secs()),
+            assignments,
+        }))
+    }
+
     fn refuse(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
         let req: RefuseRequest = self.parse(host, body)?;
         call.assignment_id = Some(req.assignment_id.clone());
@@ -516,7 +600,7 @@ macro_rules! host_body {
         }
     )*};
 }
-host_body!(HeartbeatRequest, ClaimRequest, RefuseRequest, ReleaseRequest);
+host_body!(HeartbeatRequest, ClaimRequest, RefuseRequest, ReleaseRequest, NextRequest);
 
 /// A parsed request head.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -791,6 +875,67 @@ pub fn spawn_queue_feed<I: Identity>(
             }
         }
     })
+}
+
+/// The effective-config key for the queue's full-refresh period (§13.4).
+pub const QUEUE_REFRESH_KEY: &str = "fleetDispatch.queueRefreshSecs";
+
+/// The queue's full-refresh period from `effective`, and a warning when the
+/// value is unusable. Absent is the default silently; a non-integer or `0`
+/// falls back to the default with the warning. Pure.
+#[must_use]
+pub fn queue_refresh_in(effective: &serde_json::Value) -> (Duration, Option<String>) {
+    let default = Duration::from_secs(DEFAULT_REFRESH_SECS);
+    let Some(raw) = crate::config_resolver::get_path(effective, QUEUE_REFRESH_KEY) else {
+        return (default, None);
+    };
+    match raw.as_u64().filter(|secs| *secs > 0) {
+        Some(secs) => (Duration::from_secs(secs), None),
+        None => (
+            default,
+            Some(format!(
+                "{QUEUE_REFRESH_KEY} = {raw} must be a positive whole number of seconds; \
+                 using {DEFAULT_REFRESH_SECS}"
+            )),
+        ),
+    }
+}
+
+/// Start the captain's queue from `effective`: apply
+/// `fleetDispatch.queueRefreshSecs`, build the mirror from `forge.mirror`
+/// (key read through `read_key`) and spawn [`spawn_queue_feed`]. The caller
+/// owns the handle for the process lifetime. An unset or unusable mirror
+/// logs a warning and leaves the queue off; it is never a startup failure.
+pub fn start_queue_feed<I: Identity>(
+    server: &Arc<Server<I>>,
+    effective: &serde_json::Value,
+    read_key: &crate::forge_mirror::KeyReader<'_>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let (refresh, warning) = queue_refresh_in(effective);
+    if let Some(warning) = warning {
+        log::warn!("fleet-dispatch: {warning}");
+    }
+    server.set_queue_refresh(refresh);
+    let active = match crate::forge_mirror::build_active(effective, read_key) {
+        Ok(Some(active)) => active,
+        Ok(None) => {
+            log::warn!("fleet-dispatch: forge.mirror is unset; the fleet queue stays empty");
+            return None;
+        }
+        Err(e) => {
+            log::warn!("fleet-dispatch: the mirror key could not be read ({e}); the fleet queue stays empty");
+            return None;
+        }
+    };
+    let http = match crate::forge_mirror::client::build_http() {
+        Ok(http) => http,
+        Err(e) => {
+            log::warn!("fleet-dispatch: no mirror HTTP client ({e}); the fleet queue stays empty");
+            return None;
+        }
+    };
+    let origin = active.base_url.clone();
+    Some(spawn_queue_feed(Arc::clone(server), active, http, origin))
 }
 
 /// Spawn the expiry/counter sweep and the roster reload.

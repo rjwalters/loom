@@ -11,6 +11,7 @@
 //! | [`CLAIM_PATH`] | [`ClaimRequest`] | [`ClaimResponse`] |
 //! | [`REFUSE_PATH`] | [`RefuseRequest`] | [`AckResponse`] |
 //! | [`RELEASE_PATH`] | [`ReleaseRequest`] | [`AckResponse`] |
+//! | [`NEXT_PATH`] | [`NextRequest`] | [`NextResponse`] |
 //!
 //! A `claim` refusal is an **answer** (HTTP 200, `granted: false`), never a
 //! failure. Non-200 statuses carry an [`ErrorResponse`]: `400` malformed,
@@ -34,8 +35,17 @@ pub const REFUSE_PATH: &str = "/v1/refuse";
 /// `POST` path of a release.
 pub const RELEASE_PATH: &str = "/v1/release";
 
-/// Every Phase 1 path.
-pub const PATHS: [&str; 4] = [HEARTBEAT_PATH, CLAIM_PATH, REFUSE_PATH, RELEASE_PATH];
+/// `POST` path of a work request (#12817).
+pub const NEXT_PATH: &str = "/v1/next";
+
+/// Every path.
+pub const PATHS: [&str; 5] = [
+    HEARTBEAT_PATH,
+    CLAIM_PATH,
+    REFUSE_PATH,
+    RELEASE_PATH,
+    NEXT_PATH,
+];
 
 /// The `refuse` reason that holds the item for the forge lease TTL: someone
 /// outside fleet mode won the forge order. Every other reason drops the row.
@@ -296,6 +306,44 @@ pub struct ReleaseRequest {
     pub outcome: String,
 }
 
+/// `POST /v1/next`: "this host has `free_slots` free; what should it run?"
+/// Sent when capacity becomes available, never on a fixed period (#12817).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextRequest {
+    pub host_id: String,
+    /// The worker's own free slots: the most assignments it is offered.
+    pub free_slots: u32,
+    /// Roles the host can run now.
+    pub roles_ok: Vec<String>,
+}
+
+/// One item the captain offers a host. A candidate, never a reason to skip
+/// the worker's gates, live pre-check or forge pre-claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assignment {
+    pub assignment_id: String,
+    /// `owner/name`.
+    pub repo: String,
+    pub item: u64,
+    /// The step wire name.
+    pub step: String,
+    /// Seconds the grant lives without a heartbeat renewing it.
+    pub ttl_s: u64,
+}
+
+/// The answer to `next`. An empty `assignments` is an answer, not an error:
+/// nothing fits this host now, and the worker draws nothing locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextResponse {
+    pub server_epoch: String,
+    /// Seconds since the captain's queue last read the full worklist; absent
+    /// before the first read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_age_s: Option<u64>,
+    #[serde(default)]
+    pub assignments: Vec<Assignment>,
+}
+
 /// The answer to `refuse` and `release`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckResponse {
@@ -403,6 +451,30 @@ mod tests {
         }
         let old: OldCaptainLiveStep = serde_json::from_value(wire).unwrap();
         assert_eq!(old.item, 7);
+    }
+
+    #[test]
+    fn next_round_trips_and_an_empty_answer_is_valid() {
+        let req: NextRequest = serde_json::from_value(
+            json!({"host_id": "w", "free_slots": 3, "roles_ok": ["builder"], "x": 1}),
+        )
+        .unwrap();
+        assert_eq!(req.free_slots, 3);
+        let empty: NextResponse = serde_json::from_value(json!({"server_epoch": "e"})).unwrap();
+        assert!(empty.assignments.is_empty() && empty.queue_age_s.is_none());
+        let resp = NextResponse {
+            server_epoch: "e".into(),
+            queue_age_s: Some(4),
+            assignments: vec![Assignment {
+                assignment_id: "a-1".into(),
+                repo: "a/b".into(),
+                item: 7,
+                step: "builder".into(),
+                ttl_s: 1200,
+            }],
+        };
+        let wire = serde_json::to_value(&resp).unwrap();
+        assert_eq!(serde_json::from_value::<NextResponse>(wire).unwrap(), resp);
     }
 
     #[test]

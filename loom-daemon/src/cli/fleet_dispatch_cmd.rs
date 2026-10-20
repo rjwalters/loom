@@ -183,6 +183,10 @@ async fn serve(
         policy.no_progress.map(|d| d.as_secs())
     );
     let _maintenance = server::spawn_maintenance(Arc::clone(&server), source, opts);
+    let effective = loom_daemon::config_resolver::resolve_effective_config(&root);
+    let _queue_feed = server::start_queue_feed(&server, &effective, &|key_ref, aws| {
+        key_ref.read(aws, loom_daemon::forge_mirror::CONFIG_KEY)
+    });
     server::run(listener, server, opts).await
 }
 

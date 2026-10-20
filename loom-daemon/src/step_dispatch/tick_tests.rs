@@ -107,6 +107,8 @@ struct FakeSpawner {
     refuse_all: Option<&'static str>,
     asked: Vec<(usize, u32, StepRole, u32)>,
     terms: Vec<Option<StepDrawTerms>>,
+    /// Each request's `(item, story_points)` (#12957).
+    points: Vec<(u32, Option<u32>)>,
     /// Each round's batch, as `(workspace, item)` (#12298).
     batches: Vec<Vec<(usize, u32)>>,
     /// Hold the spawns once this many batches ran (#12298).
@@ -120,6 +122,7 @@ impl StepSpawner for FakeSpawner {
         self.asked
             .push((idx, request.item, request.role, request.draw_attempt));
         self.terms.push(request.draw);
+        self.points.push((request.item, request.story_points));
         if let Some(reason) = self.refuse_all {
             return SpawnResult::Refused(reason.to_string());
         }
@@ -1190,4 +1193,85 @@ fn a_captain_cap_refusal_ends_the_ticks_draws() {
     assert_eq!(TickStop::CaptainCap.as_str(), "captain_cap");
     assert_eq!(disposition_of("captain_cap"), Qd::DeferredCapacity);
     assert_eq!(disposition_of("captain_not_eligible"), Qd::HostConstraint);
+}
+
+/// The draw works on a Gitea forge (#12312): rows listed through the direct
+/// backend from recorded Gitea shapes (no `labels_at`, sub-issue counts,
+/// `author_association` or check summary) classify and draw a Curator, a
+/// Champion, a Builder, a Judge and a merge step.
+#[test]
+fn a_gitea_listing_classifies_and_draws_every_stage() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicU64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let gh = dir.path().join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf 'HTTP/1.1 200 OK\r\nETag: "g"\r\n\r\n'
+case "$*" in
+  *'/pulls?'*)
+    echo '[{"number": 40, "state": "open", "labels": [{"name": "loom:review-requested"}], "head": {"ref": "feature/issue-30", "sha": "abc"}, "base": {"ref": "main"}}, {"number": 60, "state": "open", "labels": [{"name": "loom:pr"}], "head": {"ref": "feature/issue-60", "sha": "def"}, "base": {"ref": "main"}}]' ;;
+  *'type=pulls'*)
+    echo '[{"number": 40, "state": "open", "body": "Closes #30", "labels": [{"name": "loom:review-requested"}], "pull_request": {}}, {"number": 60, "state": "open", "body": "Closes #60", "labels": [{"name": "loom:pr"}], "pull_request": {}}]' ;;
+  *)
+    echo '[{"number": 1, "state": "open", "labels": [{"name": "loom:triage"}]}, {"number": 2, "state": "open", "labels": [{"name": "loom:curated"}]}, {"number": 3, "state": "open", "labels": [{"name": "loom:issue"}]}]' ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let target = crate::discovery::Target {
+        slug: format!("acme/gitea-tick-{}", std::process::id()),
+        gh_bin: gh,
+        root_dir: dir.path().to_path_buf(),
+    };
+    let snap = crate::discovery::direct::list_repo(
+        crate::forge_cmd::ForgeType::Gitea,
+        &target,
+        &AtomicU64::new(0),
+        crate::discovery::Tier::Gh,
+    )
+    .unwrap();
+    assert!(snap.rows.iter().all(|r| r.labels_at.is_none()));
+
+    let mut spawner = FakeSpawner::default();
+    run_with(vec![workspace(0, "acme/gitea", &snap.rows)], limits(10), &mut spawner);
+    let asked: BTreeSet<(u32, StepRole)> = spawner.asked.iter().map(|a| (a.1, a.2)).collect();
+    assert_eq!(
+        asked,
+        BTreeSet::from([
+            (1, StepRole::Curator),
+            (2, StepRole::ChampionPromote),
+            (3, StepRole::Builder),
+            (40, StepRole::Judge),
+            (60, StepRole::ChampionMerge),
+        ])
+    );
+}
+
+/// #12957: the tick's queue rows and spawn requests carry each item's story
+/// points from the labels the listing already returned (no forge call); a PR
+/// step carries its closing issue's, an unsized item none.
+#[test]
+fn queue_rows_and_spawn_requests_carry_story_points() {
+    let rows = vec![
+        row(3, &["loom:issue", "points:8"], "", false),
+        row(4, &["loom:building", "points:3"], "", false),
+        row(40, &["loom:review-requested"], "Closes #4", true),
+        row(10, &["loom:issue"], "", false),
+    ];
+    let mut spawner = FakeSpawner::default();
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut spawner);
+    let row_points: BTreeMap<u32, Option<u32>> = tick
+        .report
+        .queue
+        .iter()
+        .map(|r| (r.key.number, r.story_points))
+        .collect();
+    let expected = BTreeMap::from([(3, Some(8)), (40, Some(3)), (10, None)]);
+    assert_eq!(row_points, expected);
+    let asked: BTreeMap<u32, Option<u32>> = spawner.points.into_iter().collect();
+    assert_eq!(asked, expected);
 }

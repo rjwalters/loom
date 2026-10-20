@@ -778,9 +778,9 @@ once as a terminal `left_queue` record when it leaves a repo whose listing
 succeeded. Sampled from the collector's periodic pass (the same cadence as
 `queue.snapshot`), never the tick loop, so a disposition lasting less than one
 collector interval can be missed; a 10-minute-or-longer lookback still always
-contains the current state of every queued issue. Cardinality is bounded: at
-most 256 rows become spans per sample (`loom.queue.disposition_rows_dropped{reason="truncated"}`
-counts the rest), and a row whose repo root never resolved to a forge slug is
+contains the current state of every queued issue. Every queued row becomes a
+span (no volume cap: a cap would make which items carry facts depend on
+iteration order), and a row whose repo root never resolved to a forge slug is
 dropped and counted as `reason="unresolved"` rather than exported with a local
 path. `loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
 in the same change, so `loom.issue` is no longer ambiguous on a multi-repo

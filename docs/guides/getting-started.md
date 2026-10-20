@@ -82,7 +82,15 @@ Minimal requirements to use Loom:
    brew install tmux          # macOS
    sudo apt install tmux      # Debian/Ubuntu
    ```
-4. **Claude Code** (optional, for AI agents)
+4. **bash >= 4** (stock macOS ships 3.2 — install a newer one)
+   ```bash
+   # Verify bash version (must be 4 or newer)
+   bash --version | head -1
+
+   # Install if needed
+   brew install bash          # macOS (Linux distros already ship bash 4+/5)
+   ```
+5. **Claude Code** (optional, for AI agents)
    ```bash
    # Verify Claude Code is installed
    claude --version
@@ -187,6 +195,9 @@ pnpm --version
 
 # Check tmux (all users)
 tmux -V
+
+# Check bash (all users, must be >= 4)
+bash --version | head -1
 
 # Check Claude Code (optional)
 claude --version

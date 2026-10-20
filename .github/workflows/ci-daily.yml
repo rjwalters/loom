@@ -510,7 +510,7 @@ jobs:
           [ -z "$failed" ] || { echo "::error::nextest failed on repetition(s)$failed of 3"; exit 1; }
 
   # ===========================================================================
-  # Item 3 -- flake detection (shell half) and item 5 -- the macOS/bash-3.2 leg.
+  # Item 3 -- flake detection (shell half) and item 5 -- the macOS leg (Homebrew bash 5).
   # ===========================================================================
   flake-shell:
     name: Flake Detection (shell suites, ${{ matrix.os }}, parallelism ${{ matrix.parallelism }})
@@ -528,18 +528,21 @@ jobs:
             parallelism: 1
           - os: ubuntu-latest
             parallelism: 8
-          # Item 5: the macOS / bash 3.2 leg. run-ci-suites.sh claims bash-3.2
-          # support, and ci.yml's macOS leg only checks SYNTAX plus one
-          # self-test -- it never RUNS the suites there. Stock macOS ships
-          # /bin/bash 3.2.57 and `#!/usr/bin/env bash` resolves straight to it,
-          # so this is the interpreter a large share of operators actually
-          # have. Unsharded and single-lane: the first question about a macOS
-          # failure is "is it macOS or is it concurrency", and parallelism 1
-          # answers it up front.
+          # Item 5: the macOS leg. Loom requires bash >= 4 (#12916), so this
+          # leg installs Homebrew bash and tests macOS userland (BSD tools)
+          # under bash 5. ci.yml's macOS leg only checks SYNTAX plus one
+          # self-test -- it never RUNS the suites there. Unsharded and
+          # single-lane: the first question about a macOS failure is "is it
+          # macOS or is it concurrency", and parallelism 1 answers it up front.
           - os: macos-latest
             parallelism: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Homebrew bash (bash >= 4 floor, #12916)
+        if: runner.os == 'macOS'
+        run: |
+          brew list bash >/dev/null 2>&1 || brew install bash
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: Report the bash under test
         run: |
           echo "PATH bash: $(command -v bash)"
