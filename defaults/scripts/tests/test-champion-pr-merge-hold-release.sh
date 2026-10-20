@@ -375,6 +375,65 @@ echo
 echo "Test 13g: the doc states the condition rule"
 assert_doc_contains '`<!-- loom:release-condition -->`' "condition marker documented"
 assert_doc_contains '`<!-- loom:release-condition-met -->`' "met marker documented"
+assert_doc_contains 'select(.body | is_release_instruction)' "path (b) reads the shared release-instruction definition"
+echo
+
+echo "Test 13h: the operator's own form — a 'clear the hold —' that cites the condition closes it; one that does not, or a reinforcement, does not"
+person_comment() { # <createdAt> <body> [author]
+    jq -n --arg at "$1" --arg b "$2" --arg who "${3:-rjwalters}" '{author: {login: $who}, body: $b, createdAt: $at}'
+}
+CLEAR_CITE=$(person_comment "2026-10-12T09:00:00Z" "clear the hold — 2026-10-20 operator ruling (rjwalters, attended session): the release condition in the ruling above is met.
+
+**Evidence**: predecessor #12000 merged in v0.19.1178; every host healthy on it.")
+CLEAR_OTHER=$(person_comment "2026-10-12T09:00:00Z" "clear the hold — the blast-radius hold is accepted; this change is revert-safe.")
+REINFORCE=$(person_comment "2026-10-12T09:00:00Z" "do not clear the hold — the condition is not met yet.")
+# Same head as the hold, so only a comment can release anything.
+FIX_PR=$(pr_json "$HOLD_HEAD" loom:pr loom:blocked); FIX_COMMENTS="[$HOLD_COMMENT, $COND, $CLEAR_CITE]"
+OUT=$(run_precheck)
+assert_contains "$OUT" "BLOCKED=false PRIOR=true" "a citing clear closes the condition and releases the hold"
+assert_contains "$OUT" "REASON=operator comment cleared the hold — rjwalters at 2026-10-12T09:00:00Z" "released on path (b)"
+FIX_COMMENTS="[$HOLD_COMMENT, $COND, $CLEAR_OTHER]"
+OUT=$(run_precheck)
+assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false REASON=" "an unrelated clear releases the merge-risk hold, and the condition re-imposes it"
+assert_contains "$OUT" "release only after predecessor #12000 merges" "the notice names the still-open condition"
+FIX_COMMENTS="[$HOLD_COMMENT, $COND, $REINFORCE]"
+OUT=$(run_precheck)
+assert_contains "$OUT" "BLOCKED=true PRIOR=true" "a reinforcement is not a release"
+echo
+
+echo "Test 13i: an App-spelled author (an unattended fleet role) can neither close a condition nor cite it closed"
+BOT_MET=$(cond_comment "-met" "2026-10-12T09:00:00Z" "predecessor merged" "loom-fleet-dispatch[bot]")
+BOT_CLEAR=$(person_comment "2026-10-12T09:00:00Z" "clear the hold — the release condition is met." "2am-fleet-dispatch-rjwalters[bot]")
+FIX_COMMENTS="[$HOLD_COMMENT, $COND, $BOT_MET]"
+OUT=$(run_precheck)
+assert_contains "$OUT" "BLOCKED=true PRIOR=true" "a [bot] -met does not close the condition"
+FIX_COMMENTS="[$HOLD_COMMENT, $COND, $BOT_CLEAR]"
+OUT=$(run_precheck)
+assert_contains "$OUT" "BLOCKED=true PRIOR=true" "a [bot] citing clear does not close the condition"
+# Closing the condition is not itself a release of the merge-risk hold: at the
+# held head the ordinary rows apply (still held); a new head then releases it.
+FIX_COMMENTS="[$HOLD_COMMENT, $COND, $(cond_comment "-met" "2026-10-12T09:00:00Z" "predecessor merged" "turian")]"
+OUT=$(run_precheck)
+assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false REASON=" "a person's -met closes the condition; the merge-risk hold still stands at its head"
+assert_lacks "$OUT" "POST" "no condition notice once it is closed"
+FIX_PR=$(pr_json "$NEWHEAD" loom:pr loom:blocked)
+OUT=$(run_precheck)
+assert_contains "$OUT" "REASON=new head commit abcdef1" "and the ordinary release paths apply again"
+echo
+
+echo "Test 13j: loom:auto-merge-ok overrides a condition that has no hold marker (path (a) never ran)"
+FIX_PR=$(pr_json "$NEWHEAD" loom:pr loom:auto-merge-ok); FIX_COMMENTS="[$COND]"
+OUT=$(run_precheck)
+assert_contains "$OUT" "BLOCKED=false PRIOR=false" "the label overrides, marker or not"
+assert_lacks "$OUT" "POST" "no condition notice under the override"
+echo
+
+echo "Test 13k: a condition that quotes a Champion marker name still binds, and same-line text is quoted"
+QUOTING=$(person_comment "2026-10-10T09:00:00Z" "<!-- loom:release-condition --> release after #12000 merges; the champion:merge-risk-hold above stays until then")
+FIX_PR=$(pr_json "$NEWHEAD" loom:pr loom:blocked); FIX_COMMENTS="[$HOLD_COMMENT, $QUOTING]"
+OUT=$(run_precheck)
+assert_contains "$OUT" "BLOCKED=true PRIOR=true" "quoting champion:merge-risk-hold does not void the condition"
+assert_contains "$OUT" "release after #12000 merges; the champion:merge-risk-hold above stays until then" "text on the marker line is quoted"
 echo
 
 echo "Test 12: census lists hand-released, unmerged holds (merge-risk and critical-file), not quoted markers"
