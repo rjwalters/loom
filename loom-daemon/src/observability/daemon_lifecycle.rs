@@ -34,6 +34,24 @@ pub fn supervisor() -> String {
     crate::ipc::detect_supervisor().unwrap_or_else(|| "none".to_string())
 }
 
+/// The `daemon.start` payload fields that also ride as typed
+/// `loom.payload.<field>` attributes. The whole payload outgrows the 256-byte
+/// string bound once the #12942 fields are in, so `loom.payload` is dropped
+/// for a real start record and these copies are what SigNoz reads. The
+/// collector's `transform/privacy` allowlist keeps every one (contract-tested).
+pub const START_LOG_ATTRIBUTE_KEYS: &[&str] = &[
+    "loom.payload.version",
+    "loom.payload.revision",
+    "loom.payload.tree_state",
+    "loom.payload.supervisor",
+    "loom.payload.config_sha",
+    "loom.payload.pid",
+    "loom.payload.start_time_unix_ms",
+    "loom.payload.instance",
+    "loom.payload.previous_version",
+    "loom.payload.start_reason",
+];
+
 /// File name of the persisted lifecycle state under the auto-update state dir.
 pub const STATE_FILE: &str = "daemon_lifecycle.json";
 

@@ -296,7 +296,8 @@ ORDER BY host;
 -- 6. Every daemon start per host over a window, with its version and reason
 --    (Issue #12942). One row per `daemon.start` record (loom.kind
 --    `daemon.event`, loom.topic `daemon.start`); the fields come from the
---    record's `loom.payload` JSON. `start_reason` is `roll` (auto-update),
+--    record's typed `loom.payload.<field>` attributes (the whole `loom.payload`
+--    string is over the exporter's 256-byte bound). `start_reason` is `roll` (auto-update),
 --    `restart` (IPC restart or operator drain), `cold` (first start on the
 --    host) or `unknown`. A crash, SIGKILL or power loss records no exit cause,
 --    so the start that follows reads `unknown`: an `unknown` start with no
@@ -304,10 +305,10 @@ ORDER BY host;
 --    when the host had no earlier state. Change the 24 HOUR window as needed.
 SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
        fromUnixTimestamp64Nano(toInt64(timestamp)) AS started_at,
-       JSONExtractString(attributes_string['loom.payload'], 'version') AS version,
-       JSONExtractString(attributes_string['loom.payload'], 'previous_version') AS previous_version,
-       JSONExtractString(attributes_string['loom.payload'], 'start_reason') AS start_reason,
-       JSONExtractString(attributes_string['loom.payload'], 'instance') AS instance
+       attributes_string['loom.payload.version'] AS version,
+       attributes_string['loom.payload.previous_version'] AS previous_version,
+       attributes_string['loom.payload.start_reason'] AS start_reason,
+       attributes_string['loom.payload.instance'] AS instance
 FROM signoz_logs.distributed_logs_v2
 WHERE attributes_string['loom.kind'] = 'daemon.event'
   AND attributes_string['loom.topic'] = 'daemon.start'
@@ -324,9 +325,9 @@ WITH 3 AS max_starts_per_hour
 SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
        toStartOfHour(fromUnixTimestamp64Nano(toInt64(timestamp))) AS hour,
        count() AS starts,
-       countIf(JSONExtractString(attributes_string['loom.payload'], 'start_reason') = 'roll') AS roll_starts,
-       countIf(JSONExtractString(attributes_string['loom.payload'], 'start_reason') = 'restart') AS restart_starts,
-       countIf(JSONExtractString(attributes_string['loom.payload'], 'start_reason') = 'unknown') AS unknown_starts,
+       countIf(attributes_string['loom.payload.start_reason'] = 'roll') AS roll_starts,
+       countIf(attributes_string['loom.payload.start_reason'] = 'restart') AS restart_starts,
+       countIf(attributes_string['loom.payload.start_reason'] = 'unknown') AS unknown_starts,
        starts > max_starts_per_hour AS crash_loop
 FROM signoz_logs.distributed_logs_v2
 WHERE attributes_string['loom.kind'] = 'daemon.event'

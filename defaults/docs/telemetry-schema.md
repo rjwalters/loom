@@ -1699,7 +1699,9 @@ loss, or an exit with no restart intent). `previous_version` is that earlier
 process's crate version, `null` when unknown. Both come from
 `~/.loom/daemon_lifecycle.json` (beside `auto_update_state.json`), which each
 start overwrites and each deliberate exit rewrites with its cause; a missing
-or corrupt file reads as `cold`. A crash loop is more than N `daemon.start`
+or corrupt file reads as `cold`. The whole payload is longer than the exporter's 256-byte string bound, so each
+field also rides as a typed `loom.payload.<field>` attribute
+(`START_LOG_ATTRIBUTE_KEYS`), which is what the queries read. A crash loop is more than N `daemon.start`
 per host per hour, and queries 6 and 7 of
 `defaults/observability/signoz/host-export-queries.sql` list and count them.
 `daemon.shutdown` and a heartbeat stay with #10023/#10065; the naming here
