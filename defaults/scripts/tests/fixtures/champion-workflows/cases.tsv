@@ -16,3 +16,4 @@ publish-npm	.github/workflows/publish.yml	publish-npm.yml	+    runs-on: ubuntu-2
 innocuous-name-publish	.github/workflows/ci.yml	publish-npm.yml	+    runs-on: ubuntu-24.04	held	npm publish under an innocuous name
 pull-request-target	.github/workflows/label.yml	ci-pull-request-target.yml	+      - run: echo labeling	held	privileged trigger
 environment-gated	.github/workflows/stage.yml	ci-environment-gated.yml	+    runs-on: ubuntu-24.04	held	environment: key
+comment-mentions-privileges	.github/workflows/lint-workflows.yml	ci-comment-mentions-privileges.yml	+    runs-on: ubuntu-24.04	covered	whole-line comments naming id-token: write / secrets.X grant nothing (2026-10-20 consumer PR shape)

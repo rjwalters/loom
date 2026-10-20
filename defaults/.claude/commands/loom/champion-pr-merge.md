@@ -532,8 +532,10 @@ behavior is byte-for-byte unchanged from before #6850.
   while the files were read, or a value that is not an array of non-empty
   strings also disqualifies it. Absent or `[]` is today's class, unchanged. No
   default list is built in; the class owns it (example in
-  `champion-reference.md`). A YAML comment line that matches holds the file
-  (conservative; comment stripping is tracked in #12934).
+  `champion-reference.md`). Whole-line YAML comments (`^\s*#`) are not
+  scanned — a comment grants nothing, and the 2026-10-20 fixtures carry
+  comments such as "no id-token: write" — while trailing comments and every
+  other line are.
 - **Kept set — never satisfiable by a class (#12528).** In criterion #3 mode
   the matcher also disqualifies any PR touching a path of the kept set,
   whatever the class says and with or without `coversCriticalFiles`: kept-set
@@ -670,7 +672,14 @@ standing_auth_content_clear() {
     [ -n "$body" ] || return 1
     while IFS= read -r rx; do
       [ -z "$rx" ] && continue
-      printf '%s' "$body" | jq -R -s -e --arg rx "$rx" 'split("\n") | any(.[]; test($rx))' >/dev/null 2>&1
+      # A whole-line YAML comment grants nothing, so it is not scanned: the
+      # 2026-10-20 fixtures hold comments such as "no id-token: write" that
+      # would otherwise read as the privilege they deny. Trailing comments
+      # and every other line stay scanned. The one shape this misses is a
+      # whole-line `#` inside a `run: |` block (Actions interpolates it); a
+      # PR that adds one is caught by forbiddenDiffPatterns, which scan the
+      # changed lines unstripped.
+      printf '%s' "$body" | jq -R -s -e --arg rx "$rx" 'split("\n") | map(select(test("^\\s*#") | not)) | any(.[]; test($rx))' >/dev/null 2>&1
       rc=$?
       # rc 1 = no privileged line; 0 = a privileged line; else error.
       [ "$rc" -eq 1 ] || return 1

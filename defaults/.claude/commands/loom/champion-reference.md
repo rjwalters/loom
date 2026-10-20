@@ -561,7 +561,9 @@ covers any file that does not, whatever it is called. `forbiddenDiffPatterns`
 still catches a PR that adds a privilege. Example list for `ci-steps`:
 `["secrets\\.(?!GITHUB_TOKEN\\b)", "secrets:\\s*inherit", "^\\s*environment:", ":\\s*write\\b", "write-all", "id-token", "pull_request_target", "workflow_run", "^\\s*release:", "types:.*released", "wrangler\\s+deploy", "npm\\s+publish", "gh\\s+release"]`.
 Unreadable or empty content, an oversized or removed file, an invalid regex or
-a head SHA that moved fails closed. The fixture set in
+a head SHA that moved fails closed. Whole-line YAML comments are not scanned
+(a comment grants nothing; the 2026-10-20 fixtures say "no id-token: write"
+in comments); trailing comments and every other line are. The fixture set in
 `defaults/scripts/tests/fixtures/champion-workflows/` (`cases.tsv`) pins the
 expected outcomes so an attended mirror can run the same cases.
 
