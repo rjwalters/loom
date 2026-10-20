@@ -730,7 +730,7 @@ standing_auth_eval() {
     local UNKNOWN_CONDITION=0 cond
     while IFS= read -r cond; do
       case "$cond" in
-        judgeApproval | greenCi) ;;
+        judgeApproval | greenCi | authorIsDependabot | noMajorBump) ;;
         *) UNKNOWN_CONDITION=1 ;;
       esac
     done <<<"$CONDITIONS"
@@ -838,6 +838,32 @@ standing_auth_eval() {
             FAILING=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name')
             PENDING=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "pending") | .name')
             { [ -n "$FAILING" ] || [ -n "$PENDING" ]; } && CONDITIONS_HOLD=0
+          fi
+          ;;
+        authorIsDependabot)
+          # (#12948) The PR author's forge login, read live from the PR
+          # object -- never a comment, title or label claim. A failed or
+          # empty read fails closed. Only the exact bot login qualifies;
+          # `user.type` must also be Bot, so a human account cannot match by
+          # name alone.
+          PR_AUTHOR=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '[.user.login, .user.type] | join(" ")' 2>/dev/null) || PR_AUTHOR=""
+          [ "$PR_AUTHOR" = "dependabot[bot] Bot" ] || CONDITIONS_HOLD=0
+          ;;
+        noMajorBump)
+          # (#12948) Opt-out of semver majors. Reads the version move from
+          # the PR title Dependabot writes ("Bump X from A to B"); a major
+          # is a change of the first component (of the second, for 0.x). A
+          # title that does not parse (group bump, hand-edited title) fails
+          # closed: it is held, not assumed minor.
+          PR_TITLE=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '.title' 2>/dev/null) || PR_TITLE=""
+          if [[ "$PR_TITLE" =~ [Bb]ump\ .*\ from\ v?([0-9]+)\.?([0-9]*)[^\ ]*\ to\ v?([0-9]+)\.?([0-9]*) ]]; then
+            if [ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[3]}" ]; then
+              CONDITIONS_HOLD=0
+            elif [ "${BASH_REMATCH[1]}" = "0" ] && [ "${BASH_REMATCH[2]}" != "${BASH_REMATCH[4]}" ]; then
+              CONDITIONS_HOLD=0
+            fi
+          else
+            CONDITIONS_HOLD=0
           fi
           ;;
       esac
@@ -2349,6 +2375,38 @@ echo "CHAMPION-MERGE-OUTCOME pr=$PR_NUMBER rc=$MERGE_RC"
 outcome is **unknown**: neither failure nor re-queue. Never infer `MERGE_RC`;
 re-read the PR (a killed call may have merged and lost only its report), then
 go to "No exit code at all" in "Error Handling".
+
+### Step 3.5: Rebase conflicting Dependabot siblings (#12948)
+
+Only after Step 3 printed `CHAMPION-MERGE-OUTCOME ... rc=0` for a PR authored by
+`dependabot[bot]`. Sibling bumps in one repo conflict on the lockfile once the
+first merges; Dependabot rebases on request. Comment `@dependabot rebase` once
+on each open Dependabot PR that now reports a conflict. Nothing else: do not
+touch labels, do not push, do not merge them here. They re-enter the ordinary
+evaluation when they come back green. If `main` goes red after a Dependabot
+merge, that is Auditor or Builder work (revert or fix forward); it is not a
+reason to pre-hold the next bump.
+
+```bash
+PR_NUMBER=$1
+AUTHOR=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER" --jq '[.user.login, .user.type] | join(" ")' 2>/dev/null)
+if [ "$AUTHOR" = "dependabot[bot] Bot" ]; then
+  gh api "repos/{owner}/{repo}/pulls?state=open&per_page=100" --paginate \
+    --jq '.[] | select(.user.login == "dependabot[bot]" and .user.type == "Bot") | .number' 2>/dev/null |
+  while read -r SIB; do
+    [ "$SIB" = "$PR_NUMBER" ] && continue
+    # `mergeable` is computed lazily: null = not yet known, so skip it this pass.
+    [ "$(gh api "repos/{owner}/{repo}/pulls/$SIB" --jq '.mergeable' 2>/dev/null)" = "false" ] || continue
+    MARK="<!-- champion:dependabot-rebase pr=$SIB after=$PR_NUMBER -->"
+    gh api "repos/{owner}/{repo}/issues/$SIB/comments" --paginate --jq '.[].body' 2>/dev/null | grep -qF "$MARK" && continue
+    ./.loom/scripts/post-comment.sh "$SIB" --body "@dependabot rebase
+
+Champion: #$PR_NUMBER merged and this bump now conflicts. Requesting a rebase.
+
+$MARK"
+  done
+fi
+```
 
 ### Step 4: Verify Issue Auto-Close
 
