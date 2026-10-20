@@ -15,6 +15,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-20
 
+- **PR #12972**: fix: bound private-workspace Docker calls with the shared deadline runner
+- **PR #12971**: test: real-Docker coverage for private session recovery
+- **PR #12951**: refactor: move the clap CLI tree and handle_cli_command into the loom-daemon library
+- **PR #12774**: feat: bind private-clone admission and launch to the selected repository clone
+- **Issue #12967** (closed): Private-workspace recover: bound Docker calls with a deadline (reconciler thread can stall on a wedged engine)
+- **Issue #12965** (closed): Emit alert.transition as a span (dual-emit with the log), per 2am's span contract
+- **Issue #12937** (closed): loom-tools Phase 2a: move the CLI tree into the library (shared seam, no behavior change) — epic #12708
+- **Issue #12772** (closed): Recover configured private Codex containers through the existing session reconciler
 - **PR #12962**: Telemetry: story points on the step path (loom.dispatch.step, step loom.sweep close, running_by_points gauge)
 - **PR #12956**: test: pin version-policy guard on stale-base manifest-only PRs
 - **PR #12944**: feat: add process identity and start reason to daemon.start
