@@ -253,6 +253,7 @@ pub mod health_monitor;
 pub mod hooks_home;
 pub mod host_affinity;
 pub mod host_identity;
+pub mod host_loss;
 pub mod host_optout;
 pub mod host_pressure;
 pub mod host_shape;

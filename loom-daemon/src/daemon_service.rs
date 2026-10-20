@@ -1114,6 +1114,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
         });
     }
 
+    // #12876: on an EC2 host, watch for spot interruption / rebalance notices.
+    // Never started (no IMDS traffic) elsewhere.
+    {
+        let pool = workspace_pool.clone();
+        let root = sweep_workspace.clone();
+        if loom_daemon::host_loss::spawn(move || loom_daemon::ipc::in_flight_sweeps(&pool, &root)) {
+            log::info!("host_loss: EC2 host; watching for spot interruption notices (#12876)");
+        }
+    }
+
     // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
     // connection that advertises this daemon's dispatch claims and consumes peer
     // advertisements into a shared TTL-bounded view, so peer daemons back off

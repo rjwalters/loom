@@ -682,6 +682,10 @@ fn daemon_write_paths_are_scoped() {
             "fleet_dispatch/server.rs",
             NotAWrite("HTTP method check in the captain's claim-arbiter listener"),
         ),
+        (
+            "host_loss/imds.rs",
+            NotAWrite("IMDSv2 token `PUT` to the link-local metadata endpoint, not the forge"),
+        ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let writes = regex::Regex::new(
