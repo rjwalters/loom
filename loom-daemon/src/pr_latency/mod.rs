@@ -13,7 +13,7 @@
 //!
 //! That is exactly this module's question, so it cannot be a query against
 //! that rollup. There is also **no durable label-transition store** anywhere in
-//! Loom — `forge_events` is a read-only wake signal, not a history — so every
+//! Loom — no wake signal is a history — so every
 //! number here is derived **live** from the forge's own timeline, the same way
 //! [`crate::claim_reconciliation`] derives verdict staleness live. Building a
 //! transitions store would be a materially larger change than "measure first";
