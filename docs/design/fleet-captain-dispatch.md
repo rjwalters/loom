@@ -81,7 +81,7 @@ The design builds on these and must not duplicate them.
 | Session ledger | `step_dispatch/session_ledger.rs` (#11913) | Soft host affinity: a later step on an item may resume the session that ran there. |
 | Discovery | `discovery/` (#12306, #12311) | One `TickSnapshot` per tick. Mirror tier: one ETagged `GET /v1/mirror/worklist`; gateway and `gh` tiers capped at the backstop pace (`discovery/fallback.rs`). Never serves claim, lease, label or merge reads. |
 | Mirror change stream | `forge_mirror/wake.rs` (#10892) | Pulls `GET /v1/changes` with a persisted per-repo cursor; each change becomes a wake prompt. |
-| Gate-read invariant | `forge_events/poll_gate.rs`, invariants 1–3 | An event is a prompt, not a truth; polling is the floor; reads that gate a decision are never held. |
+| Gate-read invariant | ADR-0021 invariants 1–3 (the `poll_gate` module was removed, #12809) | An event is a prompt, not a truth; polling is the floor; reads that gate a decision are never held. |
 | Forge call purpose | `gh_invocation/purpose.rs` (#12310) | `loom.forge.purpose` = discovery \| gate \| write on every forge call. The measure for this design. |
 | Issue lease | `defaults/docs/lease-record.md`, `defaults/docs/lease-renewal.md` | `<!-- loom:lease host=… sweep=… -->`; liveness is the comment's forge `updated_at`; TTL 15 min (`claim_reconciliation::resolve_lease_ttl_minutes`), renewed about every 5 min. **Four writers**: daemon dispatch, in-session sweeps, `worktree.sh`, hand claims. |
 | Step (PR-phase) lease | `sweep_registry/step_spawn/lease.rs` (#11906, #9401) | `<!-- loom:pr-lease role=… host=… sweep=… step=… -->`: pre-claim, renew while the session lives, reap at step end. |

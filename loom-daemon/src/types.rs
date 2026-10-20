@@ -1867,16 +1867,6 @@ pub struct DaemonStatusReport {
     /// pre-#11353 daemon; never read as `ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
-    /// State of the forge event-feed consumer (ADR-0021, #8765): whether this
-    /// daemon is polling its operator-provisioned per-host event feed, under
-    /// which `host_id`, how far its cursor has advanced, and — when it is not
-    /// advancing — which class of failure is responsible.
-    ///
-    /// `None` **only** from a pre-ADR-0021 daemon binary that never computed
-    /// one. A daemon of this vintage with no `forgeEvents` block reports
-    /// `Some(ForgeEventsStatus::disabled())`, so silence is never the answer.
-    #[serde(default)]
-    pub forge_events: Option<ForgeEventsStatus>,
     /// The daemon-wide peer-claim view + transport counters (Issue #5921):
     /// which issues THIS host currently sees claimed, by which host and with
     /// what remaining TTL, plus how many claims have been advertised /
@@ -1985,12 +1975,6 @@ mod observability_export;
 pub use observability_export::{
     ObservabilityExportScope, ObservabilityExportState, ObservabilityExportStatus,
     ObservabilityHostIdMismatch, ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
-};
-
-mod forge_events;
-pub use forge_events::{
-    ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus, PollGatingStatus,
-    PollGatingWorkspace,
 };
 
 mod ready_queue;
