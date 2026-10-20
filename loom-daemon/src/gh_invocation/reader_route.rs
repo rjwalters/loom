@@ -142,6 +142,7 @@ pub(super) fn role_of(inv: &GhInvocation) -> IdentityRole {
 
 #[path = "reader_route_v2.rs"]
 mod v2;
+pub(crate) use v2::ShedWhy;
 pub use v2::{host_has_read_pool, SHED_MARKER};
 
 #[cfg(test)]

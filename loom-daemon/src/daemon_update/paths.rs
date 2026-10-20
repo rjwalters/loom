@@ -13,6 +13,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::util;
+use crate::daemon_start::paths::logical_cwd;
 
 /// `find_repo_root [dir]` — walk up from `dir` (default `$PWD`) to the nearest
 /// ancestor holding both `.git` and `.loom/`, following a linked worktree's
@@ -100,38 +101,6 @@ fn logical_dir(dir: &Path) -> Option<PathBuf> {
         }
     }
     Some(out)
-}
-
-/// bash's `$PWD` when it names the directory we are actually in, else the
-/// resolved physical path. Same reasoning as `daemon_start::paths`: the
-/// operator's logical path is what every message and state file should name.
-fn logical_cwd() -> Option<PathBuf> {
-    let physical = std::env::current_dir().ok()?;
-    if let Some(pwd) = std::env::var_os("PWD") {
-        let logical = PathBuf::from(pwd);
-        if logical.is_absolute() && same_dir(&logical, &physical) {
-            return Some(logical);
-        }
-    }
-    Some(physical)
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(ma), Ok(mb)) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                ma.dev() == mb.dev() && ma.ino() == mb.ino()
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = (ma, mb);
-                a == b
-            }
-        }
-        _ => false,
-    }
 }
 
 /// `is_loom_source_checkout <root>` — does it hold the crate this script

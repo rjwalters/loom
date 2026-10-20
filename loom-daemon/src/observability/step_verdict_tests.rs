@@ -188,8 +188,8 @@ fn a_merge_act_is_verdict_merged_and_clears_the_store() {
 #[test]
 fn an_unread_journal_is_probe_failed_and_the_projection_still_emits() {
     let mut store = RefusalStore::default();
-    let r = one(&step(StepRole::ChampionMerge, 9, Some("requeued")), None, &mut store, t(5));
-    assert_eq!(class_reason(&r), ("noop", "ci_pending"));
+    let r = one(&step(StepRole::ChampionMerge, 9, Some("failed")), None, &mut store, t(5));
+    assert_eq!(class_reason(&r), ("failed", "failed"));
     assert_eq!(r.step.ledger_class.as_deref(), Some("failed"));
     assert_eq!(r.step.ledger_reason.as_deref(), Some("probe_failed"));
     let unread = Journal {
@@ -254,7 +254,8 @@ fn every_merge_marker_row_projects_its_reason() {
 #[test]
 fn every_merge_outcome_row_projects_its_reason() {
     for (outcome, class, reason) in [
-        (Some("requeued"), "noop", "ci_pending"),
+        (Some("requeued"), "noop", "unspecified"),
+        (Some("skipped"), "noop", "unspecified"),
         (Some("held"), "noop", "held"),
         (Some("head-moved"), "refused", "head_moved"),
         (Some("not-eligible"), "refused", "not_eligible"),
@@ -687,4 +688,44 @@ fn a_tick_with_two_verdicts_on_two_prs_projects_two_records_and_a_claim_none() {
     );
     let idle = records_for(&judge_ctx(t(5)), &source, Some(&journal(vec![])), &mut store);
     assert!(idle.is_empty(), "an idle tick projects nothing");
+}
+
+/// #12715: a requeue or skip names its gate, carries the sweep id and the raw
+/// token, and is never ledgered `failed` even with no readable journal.
+#[test]
+fn a_stop_projects_the_gate_it_names_and_is_never_ledger_failed() {
+    let stop = |outcome: &str, reason: &str| {
+        let Source::Step(mut s) = step(StepRole::ChampionMerge, 9, Some(outcome)) else {
+            unreachable!()
+        };
+        let text = s
+            .log_text
+            .take()
+            .unwrap()
+            .replace(&format!("outcome={outcome}"), &format!("outcome={outcome} reason={reason}"));
+        s.log_text = Some(text);
+        Source::Step(s)
+    };
+    for (outcome, reason, want) in [
+        ("skipped", "facts_unread", "facts_unread"),
+        ("skipped", "janitor_rc3", "janitor_rc3"),
+        ("skipped", "verdict_rc11", "verdict_rc11"),
+        ("requeued", "ci_pending", "ci_pending"),
+        ("requeued", "mergeable_unknown", "mergeable_unknown"),
+        ("requeued", "pin_missing", "pin_missing"),
+        ("requeued", "merge_rc7", "merge_rc7"),
+        ("requeued", "merge_rc123", "unspecified"),
+        ("requeued", "bogus", "unspecified"),
+    ] {
+        for journal in [None, Some(journal(vec![]))] {
+            let r =
+                one(&stop(outcome, reason), journal.as_ref(), &mut RefusalStore::default(), t(5));
+            assert_eq!(class_reason(&r), ("noop", want), "{outcome} {reason}");
+            assert_eq!(r.detail.as_deref(), Some(reason));
+            assert_ne!(r.step.ledger_class.as_deref(), Some("failed"), "{outcome} {reason}");
+            assert_eq!(r.step.ledger_reason.as_deref(), Some(outcome));
+            assert_eq!(r.step.sweep_id.as_deref(), Some("step-champion_merge-9-1"));
+            assert!(champion::MERGE_REASONS.contains(&want) || want.starts_with("merge_rc"));
+        }
+    }
 }

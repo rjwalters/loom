@@ -134,10 +134,23 @@ pub fn record_refusal(
         ran_for: std::time::Duration::ZERO,
         failure_class: None,
     };
-    let mut forge = crate::operator_decision::cli::GhForge::new(root.to_path_buf(), None);
-    if let Ok(mut reg) = registry.lock() {
-        reg.record_step_outcome(&run, &mut forge);
-    }
+    let Ok(mut reg) = registry.lock() else {
+        return;
+    };
+    let mut forge = refusal_forge(&reg, root);
+    reg.record_step_outcome(&run, &mut forge);
+}
+
+/// The forge a spawn-time refusal's ledger write goes through (#12621): the
+/// work item's repo is its target (as in [`settle`], #12606), so the repo
+/// owner's writer is selected rather than the process credential.
+pub(crate) fn refusal_forge(
+    reg: &SweepRegistry,
+    root: &Path,
+) -> crate::operator_decision::cli::GhForge {
+    let slug = reg.open_pr_listing_target().map(|(_, _, slug)| slug);
+    crate::operator_decision::cli::GhForge::new(root.to_path_buf(), slug)
+        .with_call_site("step_ledger.reeval_ladder")
 }
 
 /// Record every step of `root` that ended since the last tick (module docs).
@@ -185,8 +198,11 @@ pub fn settle(root: &Path, registry: &Arc<Mutex<SweepRegistry>>) {
             run.outcome.class.as_str(),
             run.outcome.reason
         );
+        // #12606: the ladder write is vetted under the writer it carries (the
+        // item owner's per-owner credential), not the workspace root's.
         let mut forge =
-            crate::operator_decision::cli::GhForge::new(root.to_path_buf(), Some(slug.clone()));
+            crate::operator_decision::cli::GhForge::new(root.to_path_buf(), Some(slug.clone()))
+                .with_call_site("step_ledger.reeval_ladder");
         if let Ok(mut reg) = registry.lock() {
             reg.record_step_outcome(&run, &mut forge);
             // #12152: the step's terminal bus event (the narration sink's

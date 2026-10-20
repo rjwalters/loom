@@ -172,6 +172,7 @@ impl Selection {
             base_revision: String::new(),
             host_pid: std::process::id(),
             control: String::new(),
+            repository: String::new(),
         };
         lease.begin(&job)?;
         // The issue helper owns creation of its worktree/branch in the clone.
@@ -396,6 +397,7 @@ mod tests {
             docker_desktop: false,
             repository: repository.into(),
             base: "main".into(),
+            repositories: vec![],
             volume: format!("loom-codex-workspace-{name}"),
             profile: profile.canonicalize().unwrap(),
             gh_config: None,
@@ -518,6 +520,7 @@ mod tests {
                 base_revision: String::new(),
                 host_pid: std::process::id(),
                 control: "c".repeat(64),
+                repository: String::new(),
             })
             .unwrap();
         Selection {

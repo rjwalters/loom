@@ -26,6 +26,13 @@
 //!   count to what its gate saw; changes-requested deterministically wins, so
 //!   every interleaving converges on the same outcome.
 //!
+//! - [`stale_read`] — before an approval, when the caller passed
+//!   `--review-started` (#12614). A trusted human comment on the PR or a linked
+//!   issue newer than the review's start, or a linked-issue body that no longer
+//!   hashes to the one the Judge reviewed, means the approval would be against a
+//!   stale read of the spec (PR #12512 / issue #12509: the operator rescoped the
+//!   issue mid-review and the Judge approved the old design anyway).
+//!
 //! The exact-head CI read (#10485) is deliberately NOT here: that gate reads
 //! check runs through `forge wait-checks`. This one only reads what the forge
 //! already says about the PR (comments and labels).
@@ -317,6 +324,139 @@ pub fn reconcile(
     }
 }
 
+/// An issue the PR closes or references, as the gate re-read it (#12614).
+/// `body` / `comments` are `None` when the read failed.
+#[derive(Debug, Clone)]
+pub struct IssueSnapshot {
+    pub number: u64,
+    /// The hash of the body the Judge reviewed (`--issue-body-sha N=HASH`).
+    pub expected_body_sha: Option<String>,
+    /// The body as it is now.
+    pub body: Option<String>,
+    /// The issue's trusted comments now.
+    pub comments: Option<Vec<Value>>,
+}
+
+/// The hash of an issue body that `--issue-body-sha` carries: sha256 hex of the
+/// body with trailing newlines removed, which is what
+/// `printf %s "$(gh api … --jq .body)" | sha256sum` yields in a shell.
+#[must_use]
+pub fn body_sha(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(body.trim_end_matches(['\n', '\r']).as_bytes()))
+}
+
+/// The issue numbers a PR body closes (`Closes #N`, `Fixes: #N`, `Resolves #N`
+/// and their inflections), ascending and deduplicated.
+#[must_use]
+pub fn closing_issues(pr_body: &str) -> Vec<u64> {
+    let Ok(re) =
+        regex::Regex::new(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)")
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<u64> = re
+        .captures_iter(pr_body)
+        .filter_map(|c| c[1].parse().ok())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn comment_time(c: &Value) -> Option<DateTime<Utc>> {
+    ["created_at", "createdAt"]
+        .iter()
+        .find_map(|k| c.get(*k).and_then(Value::as_str))
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+}
+
+/// The newest-first-found trusted *human* comment created after `started`:
+/// not an App/bot author, and carrying no Loom marker (verdict, lease,
+/// standdown, claim-activity … traffic is the fleet's own, even when it is
+/// posted through a human token). Returned as a description naming it.
+fn human_comment_after(comments: &[Value], started: DateTime<Utc>) -> Option<String> {
+    comments
+        .iter()
+        .filter(|c| !crate::comment_trust::Author::from_json(c).app)
+        .filter(|c| {
+            !c.get("body")
+                .and_then(Value::as_str)
+                .is_some_and(|b| b.contains("<!-- loom:"))
+        })
+        .filter_map(|c| {
+            let at = comment_time(c).filter(|t| *t > started)?;
+            let who = c
+                .pointer("/user/login")
+                .and_then(Value::as_str)
+                .unwrap_or("an unknown author");
+            let id = c
+                .get("id")
+                .and_then(Value::as_u64)
+                .map_or_else(String::new, |i| format!("comment {i} "));
+            let url = c
+                .get("html_url")
+                .and_then(Value::as_str)
+                .map_or_else(String::new, |u| format!(" ({u})"));
+            Some((at, format!("{id}by {who} at {}{url}", at.to_rfc3339())))
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, d)| d)
+}
+
+/// Why an approval would rest on a stale read of the spec, or `None` (#12614).
+/// `issues` is `None` when the linked issues could not be determined; an
+/// unread issue is never a pass.
+#[must_use]
+pub fn stale_read(
+    started: DateTime<Utc>,
+    pr_comments: &[Value],
+    issues: Option<&[IssueSnapshot]>,
+) -> Option<String> {
+    let remedy = "re-review against the current spec (read the comment or issue body first), \
+                  then approve with a fresh --review-started";
+    if let Some(d) = human_comment_after(pr_comments, started) {
+        return Some(format!(
+            "a human comment landed on the PR after this review started ({}): {d}; {remedy}",
+            started.to_rfc3339()
+        ));
+    }
+    let Some(issues) = issues else {
+        return Some(
+            "the linked issues could not be determined or read, so a mid-review rescope cannot \
+             be ruled out; an unread state is never a pass — retry"
+                .into(),
+        );
+    };
+    for issue in issues {
+        let n = issue.number;
+        let (Some(body), Some(comments)) = (issue.body.as_deref(), issue.comments.as_deref())
+        else {
+            return Some(format!(
+                "issue #{n}'s body or comments could not be read, so a mid-review rescope \
+                 cannot be ruled out; an unread state is never a pass — retry"
+            ));
+        };
+        if let Some(expected) = issue.expected_body_sha.as_deref() {
+            if !expected.trim().eq_ignore_ascii_case(&body_sha(body)) {
+                return Some(format!(
+                    "issue #{n}'s body changed since this review started (it no longer matches \
+                     the body you reviewed); {remedy}"
+                ));
+            }
+        }
+        if let Some(d) = human_comment_after(comments, started) {
+            return Some(format!(
+                "a human comment landed on issue #{n} after this review started ({}): {d}; \
+                 {remedy}",
+                started.to_rfc3339()
+            ));
+        }
+    }
+    None
+}
+
 /// Everything [`decide`] looks at. `comments` / `labels` are `None` when the
 /// read failed — never conflated with "none found".
 #[derive(Debug, Clone)]
@@ -328,6 +468,11 @@ pub struct GateInput<'a> {
     pub overrule: &'a str,
     pub now: DateTime<Utc>,
     pub window_secs: i64,
+    /// When the Judge began this review (`--review-started`, #12614). `None`
+    /// keeps the pre-#12614 behaviour.
+    pub review_started: Option<DateTime<Utc>>,
+    /// The linked issues as re-read; see [`stale_read`].
+    pub issues: Option<&'a [IssueSnapshot]>,
 }
 
 /// The pre-post decision. Pure; see the module docs for the rules.
@@ -355,6 +500,12 @@ pub fn decide(input: &GateInput<'_>) -> Decision {
                  exact head is now green (verify with `loom-daemon forge wait-checks`), remove \
                  the stale label and retry; otherwise post changes-requested"
             ));
+        }
+    }
+    if let (true, Some(started), Some(comments)) = (approving, input.review_started, input.comments)
+    {
+        if let Some(why) = stale_read(started, comments, input.issues) {
+            return Decision::Refuse(why);
         }
     }
     let prior = input.comments.and_then(|c| latest_marker_for(c, input.sha));

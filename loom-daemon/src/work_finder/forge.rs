@@ -91,24 +91,7 @@ impl WorkSource for GhWorkSource {
         if let Some(root) = self.cwd.as_deref() {
             crate::intake_reconcile::maybe_run(&self.gh_bin, root);
         }
-        // Event-gated polling (#9255, opt-in `forgeEvents.pollGating`, default
-        // off): while the feed is `healthy`, a repo with no event since its
-        // last poll returns its held *candidate* listing. Off, this is a bare
-        // call. The claim itself (`dispatch`) re-reads the forge and is never
-        // gated.
-        let repo = self.repo.clone();
-        let cwd = self.cwd.clone();
-        let listed =
-            crate::forge_events::poll_gate::gated_list(cwd.as_deref(), repo.as_deref(), || {
-                self.list_ready_issues_uncached()
-            });
-        // #11139: a fresh listing that fell short is never held, so a gated
-        // tick cannot serve partial rows as the whole queue. (A held listing
-        // leaves `complete` at its per-tick default, `true`.)
-        if !self.complete {
-            crate::forge_events::poll_gate::forget_held(cwd.as_deref());
-        }
-        listed
+        self.list_ready_issues_uncached()
     }
 
     fn listing_complete(&self) -> bool {
@@ -291,8 +274,7 @@ pub struct RegistryDispatcher {
 }
 
 impl RegistryDispatcher {
-    /// Construct a dispatcher over the shared registry. Production goes
-    /// through [`dispatcher_pairs`].
+    /// Construct a dispatcher over the shared registry.
     #[must_use]
     pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
         Self { registry }
@@ -715,21 +697,6 @@ impl WorkDispatcher for RegistryDispatcher {
         }
         Ok(outcome.was_new)
     }
-}
-
-/// Build the per-tick `(source, dispatcher)` pair for every root (#3924).
-#[must_use]
-pub fn dispatcher_pairs(
-    pool: &crate::workspace_pool::WorkspacePool,
-    roots: &[PathBuf],
-) -> Vec<(GhWorkSource, RegistryDispatcher)> {
-    roots
-        .iter()
-        .map(|root| {
-            let registry = pool.get_or_provision(root);
-            (GhWorkSource::for_root(root), RegistryDispatcher::new(registry))
-        })
-        .collect()
 }
 
 #[cfg(test)]

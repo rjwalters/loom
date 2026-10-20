@@ -154,6 +154,7 @@ impl Candidate {
         Tap {
             runtime: self.runtime.clone(),
             model_profile: self.model_profile.clone(),
+            model: self.model.clone(),
         }
     }
 }

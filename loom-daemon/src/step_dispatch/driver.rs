@@ -265,6 +265,13 @@ impl RegistrySpawner {
             Ok(_) => SpawnResult::Spawned,
             Err(e) => {
                 let reason = refusal_reason(&e);
+                if let Some(secs) = e
+                    .downcast_ref::<StepRefusal>()
+                    .filter(|r| r.reason == super::tick::REFUSAL_CAPTAIN_COOLDOWN)
+                    .and_then(|r| r.hold_secs)
+                {
+                    lock(registry).arm_captain_hold(request.item, request.role, secs);
+                }
                 if let Some(root) = self.roots.get(idx) {
                     super::step_end::record_refusal(
                         root,
@@ -443,6 +450,8 @@ impl StepDriver {
         // The other listing readers (blocked queue, quarantine and claim
         // reconciliation) read this tick's repos instead of listing (#12307).
         crate::discovery::published::publish(&snapshot);
+        // Stage arrivals diffed from the same snapshot (#12869); no forge call.
+        crate::observability::stage_entry_fact::observe(&snapshot);
         // Pass 3, serial and in walk order: stage entry, weighing, shaping.
         let filter_started = Instant::now();
         let mut jobs: Vec<Option<GatherJob>> = jobs.into_iter().map(Some).collect();

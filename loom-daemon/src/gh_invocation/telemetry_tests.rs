@@ -538,14 +538,14 @@ fn a_reserve_refusal_is_its_own_outcome_and_leaves_the_breaker_alone() {
         .expect("a reserve_refused series");
     assert_eq!(point.labels.get("purpose").map(String::as_str), Some("discovery"));
     assert!(crate::gh_invocation::purpose::discovery_ended());
-    // The tick's remaining discovery is shed, a gate read still goes out.
+    // The tick's remaining discovery is deferred, a gate read still goes out.
     let tmp = tempfile::tempdir().unwrap();
     let program = stub(tmp.path(), "echo sent");
     let shed = api_op(AccessIntent::Read)
         .discovery()
         .program(&program)
         .execute();
-    assert!(matches!(shed, Ok(GhCompletion::Shed { .. })), "{shed:?}");
+    assert!(matches!(shed, Ok(GhCompletion::DeadlineReached)), "{shed:?}");
     let (gate, _, _) = run(api_op(AccessIntent::Read), "echo sent");
     assert_eq!(stdout_of(gate).trim(), "sent");
     crate::gh_invocation::purpose::reopen_discovery();

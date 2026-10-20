@@ -211,30 +211,6 @@ fn test_daemon_status_request_response_round_trip() {
             since: None,
             kinds: Vec::new(),
         }),
-        forge_events: Some(crate::types::ForgeEventsStatus {
-            state: crate::types::ForgeEventsState::Backoff,
-            endpoint: Some("https://events.internal".to_string()),
-            host_id: Some("robb-studio".to_string()),
-            cursor: 4096,
-            pages_observed: 12,
-            events_observed: 340,
-            consecutive_failures: 5,
-            poll_interval_secs: 300,
-            last_error: Some("auth_failed".to_string()),
-            // #8995: the wake counters are collected in the daemon process and
-            // rendered by the CLI in another, so they only exist as an operator
-            // surface if they survive this hop.
-            wakes: vec![crate::types::ForgeEventsWakeStatus {
-                consumer: "claim-reconcile wake".to_string(),
-                config_key: "claimReconcileWake".to_string(),
-                cadence_secs: 600,
-                min_spacing_secs: 30,
-                prompts: 9,
-                early_ticks: 2,
-                throttled: 7,
-            }],
-            ..Default::default()
-        }),
         peer_claims: None,
         deep_clean: Vec::new(),
         idle_exit: Some(crate::types::IdleExitStatus {
@@ -337,29 +313,6 @@ fn test_daemon_status_request_response_round_trip() {
                 local_cell.endpoint_loopback,
                 "the per-exporter cell keeps its own local-collector flag"
             );
-            // ADR-0021 (#8765): the feed-consumer record survives the wire
-            // too, including the error CLASS underneath a backoff promotion
-            // — `backoff` answers "how often is it retrying", never "why".
-            let feed = r
-                .forge_events
-                .as_ref()
-                .expect("forge_events status round-trips");
-            assert_eq!(feed.state, crate::types::ForgeEventsState::Backoff);
-            assert_eq!(feed.host_id.as_deref(), Some("robb-studio"));
-            assert_eq!(feed.cursor, 4096);
-            assert_eq!(feed.events_observed, 340);
-            assert_eq!(feed.last_error.as_deref(), Some("auth_failed"));
-            assert_eq!(feed.poll_interval_secs, 300);
-            // #8995 item 3: one entry per ARMED consumer, keyed by the flag an
-            // operator greps their config for, with the counters intact — a
-            // truncated `wakes` would render as "armed and idle", which is a
-            // different answer from the truth.
-            let wake = feed.wakes.first().expect("an armed consumer round-trips");
-            assert_eq!(wake.config_key, "claimReconcileWake");
-            assert_eq!(wake.consumer, "claim-reconcile wake");
-            assert_eq!((wake.prompts, wake.early_ticks, wake.throttled), (9, 2, 7));
-            // Derived from the two cadence fields, so it must carry them too.
-            assert_eq!(wake.max_multiplier(), 20);
             assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
             assert!(r.per_repo[0].health_gate_verdict_at.is_some());
             assert_eq!(

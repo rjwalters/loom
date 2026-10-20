@@ -41,6 +41,7 @@ fn deep_report(root: &Path, now: DateTime<Utc>) -> DeepCleanReport {
         },
         deferred: None,
         reclaimed: Vec::new(),
+        kept: Vec::new(),
         free_gb: Some(99),
         at: now,
     }

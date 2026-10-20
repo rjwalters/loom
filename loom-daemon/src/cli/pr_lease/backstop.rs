@@ -98,6 +98,44 @@ pub(crate) fn reaped_release_fields(
     }
 }
 
+/// The `outcome=` field a Champion release records (#12616): the step's
+/// `CHAMPION-STEP` outcome word, or `none` when it wrote no line (a step that
+/// died). A merge leaves the release as it was. Anything but `[A-Za-z0-9_-]`
+/// is dropped so the word cannot break the marker. A `requeued` / `skipped`
+/// outcome also records the gate it stopped at, `reason=<token>` (#12715);
+/// `unspecified` when the step named none.
+pub(crate) fn champion_outcome_fields(
+    role: Role,
+    outcome: Option<&str>,
+    stop_reason: Option<&str>,
+) -> String {
+    if role != Role::Champion {
+        return String::new();
+    }
+    let token = |raw: Option<&str>, max: usize| -> String {
+        raw.unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .take(max)
+            .collect()
+    };
+    let word = token(outcome, 32);
+    match word.as_str() {
+        "merged" => String::new(),
+        "" => " outcome=none".to_string(),
+        w @ ("requeued" | "skipped") => {
+            let reason = token(stop_reason, 32);
+            let reason = if reason.is_empty() {
+                "unspecified"
+            } else {
+                &reason
+            };
+            format!(" outcome={w} reason={reason}")
+        }
+        w => format!(" outcome={w}"),
+    }
+}
+
 /// When the backstop's hold on this PR ends, from its trusted lease `rows`
 /// and its live `(open, head, labels)`; `None` when not held. Pure.
 pub(crate) fn hold(
