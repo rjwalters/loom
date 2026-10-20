@@ -167,6 +167,12 @@ pub(crate) const LEASELESS_CLAIM_HOST: &str = "unknown-host";
 /// `LeaseOrderDispatchError`, and the standdown annotation).
 pub(crate) const LEASELESS_CLAIM_SWEEP_PREFIX: &str = "leaseless-loom-building-label-";
 
+/// The `earliest_host` / `earliest_sweep_id` reported when an issue-sweep
+/// claim stands down because the lease order could not be verified (#12571):
+/// no peer won, so these name the absence of one.
+pub(crate) const UNVERIFIED_LEASE_HOST: &str = "unverified";
+pub(crate) const UNVERIFIED_LEASE_SWEEP: &str = "lease-order-unverified";
+
 /// Whether `in_window` — the lease comments
 /// [`lease_episode::in_episode`](super::lease_episode::in_episode) admitted
 /// into the current claim episode — contains NOTHING but this dispatcher's own

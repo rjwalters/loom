@@ -18,6 +18,10 @@ use std::path::PathBuf;
 
 mod cli;
 mod daemon_service;
+// The lib's test-only env guard, compiled into this bin's test build too.
+#[cfg(test)]
+#[path = "env_test_support.rs"]
+mod env_test_support;
 
 /// Loom daemon - terminal multiplexing and workspace orchestration
 #[derive(Parser)]
@@ -1094,8 +1098,9 @@ enum Commands {
     /// Args live in `cli::fleet_dispatch_cmd`.
     FleetDispatch(cli::fleet_dispatch_cmd::FleetDispatchArgs),
 
-    /// The shared bounded journal core (#11345): `verify` a journal root.
-    Journal(cli::journal_cli::JournalArgs),
+    /// Read the resolved effective config (#12591): `get <key>` prints the
+    /// value and the tier it came from. Args live in `cli::config_get`.
+    Config(cli::config_get::ConfigArgs),
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -2347,7 +2352,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
         Commands::FleetDispatch(args) => args.run().await,
-        Commands::Journal(args) => cli::journal_cli::dispatch(args),
+        Commands::Config(args) => cli::config_get::dispatch(args),
         Commands::Stats {
             command,
             role,

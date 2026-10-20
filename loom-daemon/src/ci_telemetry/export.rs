@@ -19,6 +19,17 @@
 //! backfill); every CI record carries stable GitHub/trace identities, so a
 //! re-offered record is recognisable downstream.
 //!
+//! **Priority lane (#12792).** The journal is dominated ~100:1 by per-test /
+//! step / suite spans, so a strict FIFO cursor leaves the fresh `ci.run` /
+//! `ci.job` facts (what ETA consumes) queued behind millions of older spans
+//! whenever the backfill drain is capped. [`ExportCursor::fast_offset`] is a
+//! second persisted cursor over the *same* journal: each pass first offers the
+//! run/job-class lines ([`is_priority`]) past it, then — only once the fast
+//! lane has reached the end of the journal — continues the bulk cursor, which
+//! skips the priority lines the fast lane already offered. Nothing is dropped
+//! or sampled; the journal rotates only when the bulk cursor (and so the fast
+//! one) is at EOF.
+//!
 //! **Bounded admission (#11115).** Records are offered through
 //! [`QueueSink::offer_backfill`], which never evicts: when any exporter queue
 //! is at its backfill limit the pass stops at that line and leaves it (and
@@ -34,18 +45,30 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::journal::MAX_LINE_BYTES;
-use super::ledger::{complete_len, scan_lines};
+use super::ledger::{complete_len, scan_lines_at};
 use super::rotation::{self, RotationPolicy};
 use super::state::CycleLock;
 use super::{journal_path, read_config, state_dir};
 use crate::observability::queue::{Admission, QueueSink};
 use crate::telemetry::TelemetryEnvelope;
 
+/// Most journal bytes the fast lane reads in one pass. A fast lane catching up
+/// over a multi-GB span backlog (it only offers a sliver of what it reads)
+/// stays bounded in time under the cycle lock and resumes next pass.
+const FAST_LANE_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Persisted progress through the journal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportCursor {
-    /// Journal byte offset of the first line not yet offered.
+    /// Journal byte offset of the first line not yet offered by the bulk
+    /// lane (every line before it has been offered, whatever its kind).
     pub byte_offset: u64,
+    /// Priority-lane progress: every run/job-class line before this offset
+    /// has been offered. `None` (also what a pre-#12792 cursor file reads
+    /// as) means "same as `byte_offset`", so an upgrade starts the fast lane
+    /// at the bulk cursor — not at `0` and not at EOF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_offset: Option<u64>,
     /// Envelopes offered to the export queue so far (cumulative, across
     /// rotations).
     pub exported: u64,
@@ -115,31 +138,74 @@ pub(crate) fn save_cursor_with(
     File::open(&dir)?.sync_all()
 }
 
-/// Where an export pass starts: the cursor, or `0` when the journal's
-/// complete prefix is shorter than the cursor (the journal was replaced,
-/// rotated, or deleted and recreated). Reads only the journal's tail.
-/// `None` when the journal is missing.
-fn start_offset(path: &Path, cursor: &ExportCursor) -> Option<u64> {
+/// Where an export pass starts: the bulk and fast cursors, or `0` for both
+/// when the journal's complete prefix is shorter than the bulk cursor (the
+/// journal was replaced, rotated, or deleted and recreated). The fast offset
+/// is clamped into `[bulk, complete]`. Reads only the journal's tail. `None`
+/// when the journal is missing.
+fn start_offsets(path: &Path, cursor: &ExportCursor) -> Option<(u64, u64)> {
     let mut file = File::open(path).ok()?;
     let complete = complete_len(&mut file).ok()?;
-    Some(if cursor.byte_offset > complete {
-        0
-    } else {
-        cursor.byte_offset
+    if cursor.byte_offset > complete {
+        return Some((0, 0));
+    }
+    let bulk = cursor.byte_offset;
+    Some((bulk, cursor.fast_offset.unwrap_or(0).clamp(bulk, complete)))
+}
+
+/// The `fast_offset` to persist for a pass that ended with the bulk cursor at
+/// `bulk` and the fast lane at `fast`: `None` once the lanes coincide.
+fn normalized_fast(bulk: u64, fast: u64) -> Option<u64> {
+    (fast > bulk).then_some(fast)
+}
+
+/// Just enough of a journal line to classify it without deserialising the
+/// (potentially large) record body.
+#[derive(Deserialize)]
+struct LineHead {
+    record: RecordHead,
+}
+
+#[derive(Deserialize)]
+struct RecordHead {
+    kind: String,
+    #[serde(default, deserialize_with = "lenient_name")]
+    name: Option<String>,
+}
+
+fn lenient_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(name) => Some(name),
+        _ => None,
     })
 }
 
-/// Journal envelopes not yet offered for export. Streams only the bytes
-/// past the cursor (#11045).
+/// Whether a journal line belongs to the priority lane: the `ci.run` /
+/// `ci.job` facts, their `ci.duration` metric carriers, and the
+/// `loom.ci.run` / `loom.ci.job` spans. Everything else (step / suite / test
+/// spans, job-log chunks) is bulk. An unclassifiable line is bulk.
+pub(crate) fn is_priority(line: &[u8]) -> bool {
+    let Ok(head) = serde_json::from_slice::<LineHead>(line) else {
+        return false;
+    };
+    match head.record.kind.as_str() {
+        "ci.run" | "ci.job" | "ci.duration" => true,
+        "trace.span" => matches!(head.record.name.as_deref(), Some("loom.ci.run" | "loom.ci.job")),
+        _ => false,
+    }
+}
+
+/// Journal envelopes not yet offered for export, across both lanes. Streams
+/// only the bytes past the bulk cursor (#11045).
 #[must_use]
 pub fn pending_count(root: &Path) -> usize {
     let path = journal_path(root);
-    let Some(start) = start_offset(&path, &load_cursor(root)) else {
+    let Some((start, fast)) = start_offsets(&path, &load_cursor(root)) else {
         return 0;
     };
     let mut count = 0;
-    let _ = scan_lines(&path, start, MAX_LINE_BYTES, |line| {
-        if !line.trim_ascii().is_empty() {
+    let _ = scan_lines_at(&path, start, MAX_LINE_BYTES, |offset, line| {
+        if !line.trim_ascii().is_empty() && !(offset < fast && is_priority(line)) {
             count += 1;
         }
         true
@@ -188,65 +254,139 @@ pub fn backfill(root: &Path, queue: &dyn QueueSink) -> usize {
     offered
 }
 
+/// How one journal line fared against the export queue.
+enum Offer {
+    Admitted,
+    /// Unparseable: logged and passed over.
+    Skipped,
+    /// The queue deferred or refused it: the lane stops at this line.
+    Stop,
+}
+
+fn offer_line(queue: &dyn QueueSink, line: &[u8]) -> Offer {
+    let text = String::from_utf8_lossy(line);
+    let envelope = match serde_json::from_str::<TelemetryEnvelope>(text.trim()) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            log::warn!("ci_telemetry: skipping unparseable journal line: {error}");
+            return Offer::Skipped;
+        }
+    };
+    match queue.offer_backfill(envelope) {
+        Ok(Admission::Admitted) => Offer::Admitted,
+        Ok(Admission::Deferred) => {
+            // #11115: stop at the first unadmitted record; it stays behind
+            // the cursor and no work is spent on the rest of the journal.
+            log::debug!("ci_telemetry: export deferred — exporter queue at its backfill limit");
+            Offer::Stop
+        }
+        Err(error) => {
+            log::warn!("ci_telemetry: export queue refused a record, will retry: {error}");
+            Offer::Stop
+        }
+    }
+}
+
 /// The export pass proper. The caller holds the cycle lock.
+///
+/// Fast lane first (priority lines past `fast_offset`, byte-bounded), then —
+/// only if the fast lane reached the end of the journal without the queue
+/// pushing back — the bulk lane over everything past `byte_offset`, skipping
+/// priority lines the fast lane already offered.
 fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, ExportCursor) {
-    let mut cursor = load_cursor(root);
-    let Some(start) = start_offset(path, &cursor) else {
+    let cursor = load_cursor(root);
+    let Some((bulk_start, fast_start)) = start_offsets(path, &cursor) else {
         return (0, cursor);
     };
     let mut offered = 0;
-    let scanned = scan_lines(path, start, MAX_LINE_BYTES, |line| {
-        let text = String::from_utf8_lossy(line);
-        let text = text.trim();
-        if text.is_empty() {
+
+    // Fast lane.
+    let mut read = 0_u64;
+    let mut pushed_back = false;
+    let fast_scan = scan_lines_at(path, fast_start, MAX_LINE_BYTES, |_, line| {
+        if read >= FAST_LANE_SCAN_BYTES {
+            pushed_back = true; // out of budget, not at the end yet
+            return false;
+        }
+        read += line.len() as u64 + 1;
+        if line.trim_ascii().is_empty() || !is_priority(line) {
             return true;
         }
-        match serde_json::from_str::<TelemetryEnvelope>(text) {
-            Ok(envelope) => {
-                match queue.offer_backfill(envelope) {
-                    Ok(Admission::Admitted) => offered += 1,
-                    Ok(Admission::Deferred) => {
-                        // #11115: stop at the first unadmitted record; it
-                        // stays behind the cursor and no work is spent on
-                        // the rest of the journal this pass.
-                        log::debug!(
-                            "ci_telemetry: export deferred — exporter queue at its backfill limit"
-                        );
-                        return false;
-                    }
-                    Err(error) => {
-                        log::warn!(
-                            "ci_telemetry: export queue refused a record, will retry: {error}"
-                        );
-                        return false;
-                    }
-                }
+        match offer_line(queue, line) {
+            Offer::Admitted => {
+                offered += 1;
+                true
             }
-            Err(error) => log::warn!("ci_telemetry: skipping unparseable journal line: {error}"),
+            Offer::Skipped => true,
+            Offer::Stop => {
+                pushed_back = true;
+                false
+            }
         }
-        true
     });
-    let offset = match scanned {
+    let fast_end = match fast_scan {
         Ok(offset) => offset,
         Err(error) => {
             log::warn!("ci_telemetry: journal export read failed, will retry: {error}");
             return (0, cursor);
         }
     };
-    if offset != cursor.byte_offset {
+    if pushed_back {
+        // Persist what the fast lane did and leave the bulk lane for later.
         let advanced = ExportCursor {
-            byte_offset: offset,
+            byte_offset: bulk_start,
+            fast_offset: normalized_fast(bulk_start, fast_end),
             exported: cursor.exported + offered as u64,
         };
-        if let Err(error) = save_cursor(root, &advanced) {
-            // Not durable: keep the old cursor (so nothing rotates on it) and
-            // re-offer next pass (at-least-once).
-            log::warn!("ci_telemetry: could not persist export cursor, will retry: {error}");
-            return (offered, cursor);
-        }
-        cursor = advanced;
+        return (offered, persist(root, cursor, advanced));
     }
-    (offered, cursor)
+
+    // Bulk lane. The fast lane is at EOF, so every priority line before
+    // `fast_end` is already offered.
+    let bulk_scan = scan_lines_at(path, bulk_start, MAX_LINE_BYTES, |offset, line| {
+        if line.trim_ascii().is_empty() || (offset < fast_end && is_priority(line)) {
+            return true;
+        }
+        match offer_line(queue, line) {
+            Offer::Admitted => {
+                offered += 1;
+                true
+            }
+            Offer::Skipped => true,
+            Offer::Stop => false,
+        }
+    });
+    let bulk_end = match bulk_scan {
+        Ok(offset) => offset,
+        Err(error) => {
+            log::warn!("ci_telemetry: journal export read failed, will retry: {error}");
+            // The fast lane's offers were not saved: keep the old cursor and
+            // re-offer next pass (at-least-once).
+            return (0, cursor);
+        }
+    };
+    let advanced = ExportCursor {
+        byte_offset: bulk_end,
+        fast_offset: normalized_fast(bulk_end, fast_end.max(bulk_end)),
+        exported: cursor.exported + offered as u64,
+    };
+    (offered, persist(root, cursor, advanced))
+}
+
+/// Durably save `advanced` when it differs from `cursor`; on a failed save keep
+/// (and return) the old cursor so nothing rotates on it and the offers are
+/// re-made next pass (at-least-once).
+fn persist(root: &Path, cursor: ExportCursor, advanced: ExportCursor) -> ExportCursor {
+    if advanced.byte_offset == cursor.byte_offset && advanced.fast_offset == cursor.fast_offset {
+        return cursor;
+    }
+    match save_cursor(root, &advanced) {
+        Ok(()) => advanced,
+        Err(error) => {
+            log::warn!("ci_telemetry: could not persist export cursor, will retry: {error}");
+            cursor
+        }
+    }
 }
 
 /// Rotate the journal when the cursor has passed `policy`'s threshold **and**
@@ -286,6 +426,7 @@ pub(crate) fn rotate_if_due_with(
     // durable, do not rotate.
     let reset = ExportCursor {
         byte_offset: 0,
+        fast_offset: None,
         exported: cursor.exported,
     };
     save_cursor_with(root, &reset, save_hook)?;
@@ -296,5 +437,6 @@ pub(crate) fn rotate_if_due_with(
         policy.keep
     );
     cursor.byte_offset = 0;
+    cursor.fast_offset = None;
     Ok(true)
 }

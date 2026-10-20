@@ -87,12 +87,6 @@ pub fn record(paths: Vec<String>, observed_pid: u32, rendered_at: DateTime<Utc>)
     let mut body = serde_json::to_vec_pretty(&marker)?;
     body.push(b'\n');
     write_atomic(&path, &body).with_context(|| format!("writing {}", path.display()))?;
-    // J3 shadow record (#11349): after the legacy write, never fails it.
-    crate::config_journal::record_pending_restart(
-        &marker.paths,
-        marker.observed_pid,
-        marker.rendered_at,
-    );
     Ok(())
 }
 
@@ -113,7 +107,6 @@ pub fn probe() -> Option<PendingRestart> {
 pub fn clear() {
     if let Some(path) = marker_path() {
         let _ = std::fs::remove_file(path);
-        crate::config_journal::record_pending_cleared();
     }
 }
 

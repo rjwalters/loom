@@ -44,6 +44,31 @@ pub(crate) enum ParkRecordCommand {
     /// `--blocked-by` and no explicit `--reason`, or with a closed blocker.
     /// Idempotent. Exit 4 on a forge failure; a failed body write adds no label.
     Apply(ApplyArgs),
+
+    /// Journal that a Champion hold was released (#12665): the `hold.transition`
+    /// `remove` for a `loom:blocked` removal the caller just made. Writes
+    /// nothing to the forge; a no-op outside a role tick. Exit 0 always.
+    Released(ReleasedArgs),
+}
+
+#[derive(clap::Args)]
+pub(crate) struct ReleasedArgs {
+    /// The PR whose hold was released.
+    #[arg(long, value_name = "N")]
+    pub pr: u64,
+
+    /// Closed token for what released it (e.g. `release_precheck`).
+    #[arg(long, value_name = "TOKEN", default_value = "release_precheck")]
+    pub trigger: String,
+
+    /// When the hold began (RFC 3339), if the caller knows it. Omitted: the
+    /// record carries a lower-bound flag instead of a guessed entry time.
+    #[arg(long = "entered-at", value_name = "TIMESTAMP")]
+    pub entered_at: Option<String>,
+
+    /// The removal was attempted and failed.
+    #[arg(long)]
+    pub failed: bool,
 }
 
 #[derive(clap::Args)]
@@ -129,6 +154,10 @@ impl ParkRecordCommand {
             ParkRecordCommand::Render(args) => args.run(),
             ParkRecordCommand::Parse(args) => args.run(),
             ParkRecordCommand::Apply(args) => args.run(),
+            ParkRecordCommand::Released(args) => {
+                args.run();
+                Ok(())
+            }
         }
     }
 }
@@ -151,11 +180,42 @@ impl RenderArgs {
     }
 }
 
+impl ReleasedArgs {
+    fn run(self) {
+        use loom_daemon::telemetry::kinds::hold_transition::{reason, transition};
+        let token = |t: &str| {
+            let ok = !t.is_empty()
+                && t.len() <= 40
+                && t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+            if ok {
+                t.to_string()
+            } else {
+                "unknown".to_string()
+            }
+        };
+        let entered_at = self
+            .entered_at
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+        loom_daemon::observability::pick_journal::record_hold(
+            self.pr,
+            transition::REMOVE,
+            reason::HOLD_RELEASED,
+            &token(&self.trigger),
+            !self.failed,
+            entered_at,
+        );
+    }
+}
+
 impl ApplyArgs {
     /// Never returns: exits with the command's own code.
     fn run(self) -> Result<()> {
         use loom_daemon::operator_decision::cli::{default_repo_root, GhForge};
         use loom_daemon::park_record::apply::{apply, ApplyRequest};
+        let is_pr = self.issue.is_none() && self.pr.is_some();
         let req = ApplyRequest {
             number: self.issue.or(self.pr).unwrap_or_default(),
             repo: self.repo.clone(),
@@ -165,8 +225,8 @@ impl ApplyArgs {
             at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             remove_labels: self.remove_label,
             dry_run: self.dry_run,
+            is_pr,
         };
-        let is_pr = self.issue.is_none() && self.pr.is_some();
         let mut forge = GhForge::new(default_repo_root(), self.repo);
         let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
         loom_daemon::park_record::apply::journal_applied(&req, is_pr, code);

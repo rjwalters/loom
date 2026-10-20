@@ -169,10 +169,26 @@ impl GhInvocation {
                 }
                 RouteDecision::NoPool => {
                     let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
-                    return Ok(self.shed_read(class, &owner, resource, until, last_app.as_deref()));
+                    let why = ShedWhy::Router("the reader pool went away");
+                    return Ok(self.shed_read(
+                        class,
+                        &owner,
+                        resource,
+                        until,
+                        last_app.as_deref(),
+                        why,
+                    ));
                 }
-                RouteDecision::Exhausted { until, .. } => {
-                    return Ok(self.shed_read(class, &owner, resource, until, last_app.as_deref()));
+                RouteDecision::Exhausted { until, cause } => {
+                    let why = ShedWhy::Router(cause.as_str());
+                    return Ok(self.shed_read(
+                        class,
+                        &owner,
+                        resource,
+                        until,
+                        last_app.as_deref(),
+                        why,
+                    ));
                 }
                 RouteDecision::Reader { dir, app_id, .. } => (dir, app_id),
             };
@@ -183,7 +199,15 @@ impl GhInvocation {
                     .map_or(now + crate::forge_read_pool::DEFAULT_WITHDRAWAL, |f| {
                         until_after(f, now)
                     });
-                return Ok(self.shed_read(class, &owner, resource, until, Some(app_id.as_str())));
+                let why = ShedWhy::Router("every reader offered already failed this read");
+                return Ok(self.shed_read(
+                    class,
+                    &owner,
+                    resource,
+                    until,
+                    Some(app_id.as_str()),
+                    why,
+                ));
             }
             let first = self
                 .clone()
@@ -234,7 +258,15 @@ impl GhInvocation {
                     // answer, and the reader stays on the repo's other reads.
                     served::CoverageRefusal::Shed => {
                         let until = until_after(failure, now);
-                        return Ok(self.shed_read(class, &owner, resource, until, Some(&app_id)));
+                        let why = ShedWhy::Router("a covering reader answered 404 for one item");
+                        return Ok(self.shed_read(
+                            class,
+                            &owner,
+                            resource,
+                            until,
+                            Some(&app_id),
+                            why,
+                        ));
                     }
                     served::CoverageRefusal::Withdraw => {}
                 }
@@ -343,7 +375,7 @@ impl GhInvocation {
             "gh_invocation: {} has no reader route; shed, not sent to the writer (#12555)",
             self.operation.as_str()
         );
-        Ok(self.shed_read(self.read_class, &owner, resource, until, None))
+        Ok(self.shed_read(self.read_class, &owner, resource, until, None, ShedWhy::NoRoute))
     }
 
     /// No reader can serve this read: shed it, whatever its class and cause.
@@ -355,8 +387,9 @@ impl GhInvocation {
         resource: Resource,
         until: SystemTime,
         app: Option<&str>,
+        why: ShedWhy,
     ) -> GhCompletion {
-        self.record_read_shed(class, owner, resource, until, app);
+        self.record_read_shed(class, owner, resource, until, app, why);
         GhCompletion::Shed {
             owner: owner.to_string(),
             resource,
@@ -375,6 +408,7 @@ impl GhInvocation {
         resource: Resource,
         until: SystemTime,
         app: Option<&str>,
+        why: ShedWhy,
     ) {
         super::super::accounting::record_shed(self, app, owner, resource, until);
         #[cfg(test)]
@@ -392,20 +426,61 @@ impl GhInvocation {
         let op = self.operation.as_str();
         let until_s = chrono::DateTime::<chrono::Utc>::from(until)
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if shed_log_due(op, SystemTime::now()) {
+        let now = SystemTime::now();
+        if shed_log_due(op, now) {
+            // #12630: name the cause, and for a router answer what it saw of
+            // each reader (withdrawal, token directory, bucket-book reading
+            // and its source), so a shed run is diagnosable from the log.
+            let readers = match why {
+                ShedWhy::NoRoute => None,
+                ShedWhy::Router(_) => self
+                    .reader_slug()
+                    .or_else(|| super::super::accounting::resolved_identity(self).repo)
+                    .and_then(|slug| {
+                        crate::forge_identity::route::describe_readers(&slug, resource, now)
+                    }),
+            };
             log::info!(
                 "gh_invocation: {op} shed — no reader can serve {owner} {} \
-                 until {until_s}; deferred, not sent to the writer {SHED_MARKER} \
+                 until {until_s} ({}{}); deferred, not sent to the writer {SHED_MARKER} \
                  (logged at most every {}s per operation)",
                 resource.as_str(),
+                why.describe(),
+                readers.map_or_else(String::new, |r| format!(" — {r}")),
                 SHED_LOG_EVERY.as_secs()
             );
         } else {
             log::debug!(
                 "gh_invocation: {op} shed — no reader can serve {owner} {} \
-                 until {until_s} {SHED_MARKER}",
-                resource.as_str()
+                 until {until_s} ({}) {SHED_MARKER}",
+                resource.as_str(),
+                why.describe()
             );
+        }
+    }
+}
+
+/// Why a read was shed, for its log line (#12630).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShedWhy {
+    /// The facade derived no repository for the read, so no reader was
+    /// asked (a checkout whose local sources disagree, an argv shape it does
+    /// not route).
+    NoRoute,
+    /// The router's answer: an [`crate::forge_identity::ExhaustCause`], or
+    /// what the read chain found.
+    Router(&'static str),
+}
+
+impl ShedWhy {
+    /// The cause as the log line names it.
+    #[must_use]
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Self::NoRoute => "no reader route: the read's repository could not be derived, \
+                              so no reader was asked"
+                .to_string(),
+            Self::Router(cause) => format!("router: {cause}"),
         }
     }
 }

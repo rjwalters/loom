@@ -45,6 +45,10 @@ pub struct Tap {
     /// tap draws on. `None` ⇒ the runtime's own default resolution applies
     /// (for the non-native runtimes, which have no profile, always `None`).
     pub model_profile: Option<String>,
+    /// The model a role draw's pick pins (`claude/sonnet`), so a candidate's
+    /// private-containment account selection is for the model it will launch
+    /// with (#12748). `None` for every non-draw tap.
+    pub model: Option<String>,
 }
 
 impl Tap {
@@ -54,6 +58,7 @@ impl Tap {
         Self {
             runtime: runtime.to_string(),
             model_profile: None,
+            model: None,
         }
     }
 
@@ -63,6 +68,7 @@ impl Tap {
         Self {
             runtime: runtime.to_string(),
             model_profile: Some(model_profile.to_string()),
+            model: None,
         }
     }
 }

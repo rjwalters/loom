@@ -807,7 +807,11 @@ impl SweepRegistry {
                     //     from a lane that published no lease record — which
                     //     `yield_identity` reports through this same channel.
                     let decision = acc.unlocked(|r| {
-                        r.resolve_lease_order(issue_number, &sweep_id, episode_start)
+                        #[cfg(test)]
+                        if r.config.blind_lease_order {
+                            return r.resolve_lease_order(issue_number, &sweep_id, episode_start);
+                        }
+                        r.resolve_lease_order_fail_closed(issue_number, &sweep_id, episode_start)
                     });
                     // #11852: a crash resume re-claims the issue's own
                     // `loom:building`, kept while its PR is open — not a
@@ -823,7 +827,16 @@ impl SweepRegistry {
                     if matches!(decision, LeaseOrderDecision::YieldToLeaselessClaim { .. }) {
                         leaseless_flip_window = Some((episode_start, Utc::now()));
                     }
-                    lease_order_yield = decision.yield_identity();
+                    // #12571: an unverified order is "not ours" — stand down
+                    // and retry later rather than build blind.
+                    lease_order_yield = if decision == LeaseOrderDecision::Unverified {
+                        Some((
+                            guards::claim_label::UNVERIFIED_LEASE_HOST.to_string(),
+                            guards::claim_label::UNVERIFIED_LEASE_SWEEP.to_string(),
+                        ))
+                    } else {
+                        decision.yield_identity()
+                    };
                 }
                 Err(e) => {
                     log::warn!(
@@ -901,14 +914,17 @@ impl SweepRegistry {
                     }
                 }
             }
-            acc.unlocked(|r| {
-                r.post_lease_yield_comment(
-                    issue_number,
-                    &sweep_id,
-                    &earliest_host,
-                    &earliest_sweep_id,
-                );
-            });
+            // No peer won an unverified order, so there is nothing to annotate.
+            if earliest_host != guards::claim_label::UNVERIFIED_LEASE_HOST {
+                acc.unlocked(|r| {
+                    r.post_lease_yield_comment(
+                        issue_number,
+                        &sweep_id,
+                        &earliest_host,
+                        &earliest_sweep_id,
+                    );
+                });
+            }
             return Err(LeaseOrderDispatchError {
                 issue: issue_number,
                 sweep_id: sweep_id.clone(),

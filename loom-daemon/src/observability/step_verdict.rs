@@ -95,6 +95,8 @@ pub struct Evidence {
     pub events: Vec<Event>,
     /// The step's outcome word, verbatim (step path only).
     pub outcome: Option<String>,
+    /// The step's `reason=` token, verbatim (step path only, #12715).
+    pub reason: Option<String>,
     /// A step end (always projected), not a role-runner tick.
     pub step_path: bool,
     /// The item's labels as the run's listings served them.
@@ -129,6 +131,8 @@ pub struct Projection {
     /// The verdict rests on a write that landed.
     pub wrote: bool,
     pub store: StoreOp,
+    /// The session's raw reason token, for the record's `detail` (#12715).
+    pub detail: Option<String>,
 }
 
 /// A role's projection (#12027 registers Champion; #12029 adds Judge).
@@ -139,6 +143,8 @@ pub struct Projector {
     pub project: fn(&Evidence) -> Option<Projection>,
     /// The step's outcome word from its log text.
     pub outcome_word: fn(text: &str, is_pr: bool, item: u32) -> Option<String>,
+    /// The step's `reason=` token from its log text (#12715).
+    pub reason_word: fn(text: &str, is_pr: bool, item: u32) -> Option<String>,
 }
 
 /// The projection registered for `role`, if any.
@@ -288,7 +294,9 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                     by: by.clone(),
                 },
             )),
-            JournalEntry::Queue { .. } | JournalEntry::Listing { .. } => None,
+            JournalEntry::Queue { .. }
+            | JournalEntry::Listing { .. }
+            | JournalEntry::Hold { .. } => None,
         })
         .collect()
 }
@@ -348,6 +356,7 @@ pub fn records_for(
                     .map(|(_, _, e)| e)
                     .collect(),
                 outcome: (projector.outcome_word)(text, is_pr, step.item),
+                reason: (projector.reason_word)(text, is_pr, step.item),
                 step_path: true,
                 pre_labels: labels.get(&step.item).cloned().unwrap_or_default(),
             };
@@ -357,7 +366,7 @@ pub fn records_for(
                 return Vec::new();
             };
             let pass_id = derived(&["loom.pass.step", &step.sweep_id]);
-            vec![record(
+            let mut rec = record(
                 ctx,
                 &projector,
                 &pass_id,
@@ -366,7 +375,9 @@ pub fn records_for(
                 Some(&ledger),
                 ctx.now,
                 store,
-            )]
+            );
+            rec.step.sweep_id = Some(step.sweep_id.clone());
+            vec![rec]
         }
         Source::Tick { started_at } => {
             let pass_id = derived(&[
@@ -471,7 +482,7 @@ fn record(
         artifact: if evidence.is_pr { "pr" } else { "issue" }.to_string(),
         verdict: p.class.to_string(),
         reason: Some(p.reason.clone()),
-        detail: None,
+        detail: p.detail.clone(),
         blockers: Vec::new(),
         labels_added: Vec::new(),
         labels_removed: Vec::new(),
@@ -481,6 +492,7 @@ fn record(
         budget: None,
         at: evaluated_at,
         step: StepFacts {
+            sweep_id: None,
             head_sha: p.head_sha,
             step: Some((projector.step_name)(evidence.is_pr).to_string()),
             class: Some(p.class.to_string()),

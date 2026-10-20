@@ -643,3 +643,23 @@ fn a_non_array_ledger_file_is_an_empty_ledger() {
         .step_cooldowns(now)
         .is_cooling(1, StepRole::Builder, now));
 }
+
+/// #12704: a captain's cooldown refusal arms the pair until the hold ends,
+/// extend-only and pruned with the ledger; an absent or zero hold arms nothing.
+#[test]
+#[serial]
+fn a_captain_hold_arms_the_pair_until_it_ends() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _) = fixture_registry(dir.path());
+    let now = Utc::now();
+    reg.arm_captain_hold(9, StepRole::Judge, 0);
+    assert!(!reg.step_cooldowns(now).is_cooling(9, StepRole::Judge, now));
+    reg.arm_captain_hold(9, StepRole::Judge, 120);
+    let cooling = reg.step_cooldowns(now);
+    assert!(cooling.is_cooling(9, StepRole::Judge, now));
+    assert!(!cooling.is_cooling(9, StepRole::Doctor, now));
+    let later = now + chrono::Duration::seconds(130);
+    assert!(!reg
+        .step_cooldowns(later)
+        .is_cooling(9, StepRole::Judge, later));
+}

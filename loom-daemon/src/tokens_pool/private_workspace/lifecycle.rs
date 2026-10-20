@@ -26,6 +26,52 @@ pub(super) fn resolve(workspace: &Path, name: &str) -> Result<(Config, PathBuf)>
     Ok((config, dir))
 }
 
+/// Make `repository` one of the account's repositories. The primary and an
+/// already-registered repository must keep their base; a new one is added
+/// (lazily cloned by its first job). Runs under the idle account lease, so a
+/// pre-#10795 single-repository account is migrated only while no worker can
+/// be using it, and its volume, primary clone and unfinished work are untouched.
+pub(super) fn register(
+    workspace: &Path,
+    config: &mut Config,
+    repository: &str,
+    base: &str,
+) -> Result<()> {
+    if let Ok(known) = config.target(Some(repository)) {
+        if known.base != base {
+            bail!("private repository {} is already configured with base {}; retain its clone and resolve unfinished work before changing the base", known.repository, known.base);
+        }
+        return Ok(());
+    }
+    let id = identify(repository)?;
+    check_firewall(workspace, &id)?;
+    if config.repositories.iter().any(|r| r.slug == id.slug) {
+        bail!("private repository directory name collides with another configured repository");
+    }
+    config.schema_version = config.schema_version.max(2);
+    config.repositories.push(Registered {
+        repository: id.url,
+        base: base.to_owned(),
+        slug: id.slug,
+    });
+    Ok(())
+}
+
+/// Refuse a repository the fleet roster marks `firewall: true` (notebook,
+/// corporate) before any clone: a cached roster that cannot be read fails closed.
+fn check_firewall(workspace: &Path, id: &RepoId) -> Result<()> {
+    let records: Vec<(String, Option<String>)> =
+        super::super::session_lifecycle::firewalled_records(workspace)
+            .context("cannot read the firewall roster; refusing to clone")?
+            .into_iter()
+            .map(|(_, record)| (record.name, record.remote))
+            .collect();
+    if repository::firewalled(id, &records) {
+        bail!("refusing to clone {}: the fleet roster marks it firewall: true", id.key);
+    }
+    Ok(())
+}
+
 pub fn start(
     workspace: &Path,
     name: &str,
@@ -41,15 +87,14 @@ pub fn start(
     let lease = lease::Lease::acquire(&dir)?;
     let engine = docker::engine()?;
     let config = if dir.join("workspace.json").exists() {
-        let existing = load(&dir)?;
-        if existing.repository != repository
-            || existing.base != base
-            || existing.account != account.id.name
+        let mut existing = load(&dir)?;
+        if existing.account != account.id.name
             || existing.profile != profile
             || existing.engine != engine
         {
-            bail!("private workspace identity differs (repository/base/account/profile/engine); retain its volume and resolve unfinished work before configuring a new session");
+            bail!("private workspace identity differs (account/profile/engine); retain its volume and resolve unfinished work before configuring a new session");
         }
+        register(workspace, &mut existing, &repository, base)?;
         existing
     } else {
         let gh_config = std::env::var_os("GH_CONFIG_DIR")
@@ -73,6 +118,7 @@ pub fn start(
             docker_desktop: docker::desktop()?,
             repository,
             base: base.to_owned(),
+            repositories: Vec::new(),
             volume: format!("loom-codex-workspace-{}", account.id.name),
             profile,
             gh_config,
@@ -182,6 +228,11 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
         bail!("job owner must be a nonempty, printable identity");
     }
     let (config, dir) = resolve(workspace, &args.name)?;
+    let target = config.target(args.repository.as_deref())?;
+    if target.slug.is_some() {
+        // Before the lease and any clone: an excluded forge never reaches git.
+        check_firewall(workspace, &identify(&target.repository)?)?;
+    }
     let lease = lease::Lease::acquire(&dir)?;
     let state = docker::inspect(&config.container)?
         .context("private session is stopped; start it first")?;
@@ -200,11 +251,16 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
         base_revision: String::new(),
         host_pid: std::process::id(),
         control: String::new(),
+        repository: if target.slug.is_some() {
+            target.repository.clone()
+        } else {
+            String::new()
+        },
     };
     // Publish before clone/fetch/branch operations; a host crash cannot turn a
     // still-running preparation exec into an apparently free account.
     lease.begin(&job)?;
-    job.base_revision = docker::prepare(&config, id, args.branch.as_deref())?;
+    job.base_revision = docker::prepare_target(&config, &target, id, args.branch.as_deref())?;
     job.control = docker::control(&config, id)?;
     lease.begin(&job)?;
     let mut env: Vec<String> = FORGE_ENV
@@ -216,11 +272,12 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
     // and the bound identity the adapter path carries.
     env.extend(bundle::policy_env());
     env.push(format!("LOOM_PRIVATE_CONTROL={}", job.control));
+    env.push(format!("LOOM_PRIVATE_REPOSITORY={}", target.repository));
     docker::recheck_control(&config, id, &job.control)?;
     let code = crate::session_exec::run_host(crate::session_exec::HostArgs {
         owner_pid: None,
         container: config.container.clone(),
-        workdir: REPO.to_owned(),
+        workdir: target.path.clone(),
         env,
         stderr_file: None,
         command: args.command,

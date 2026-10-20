@@ -20,9 +20,6 @@
 //!   context cap, or a store that is unreachable all mean a fresh step. A
 //!   fresh step on an item that had a record carries a written handoff
 //!   ([`handoff`]), a summary and never the session.
-//!   [`affinity_wait`] is the grace window for a record held by another host
-//!   (one a shared workspace mount could show): past it, the step is
-//!   eligible.
 //! * **Roles.** [`sources`] names which earlier roles' sessions a role may
 //!   resume. A Judge resumes only a Judge: it never inherits the author's
 //!   context ([`Refusal::JudgeMayNotResumeAuthor`]).
@@ -40,8 +37,6 @@ use crate::step_role::StepRole;
 
 /// Env override of [`Config::enabled`].
 pub const ENABLED_ENV: &str = "LOOM_STEP_SESSION_RESUME";
-/// Default grace window a step waits for the host holding its session.
-pub const DEFAULT_GRACE: Duration = Duration::from_secs(10 * 60);
 /// Default time a record stays resumable after its step ended.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
 /// Default cap on the session transcript a resume will carry (bytes).
@@ -53,7 +48,6 @@ const MAX_RECORDS: usize = 512;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub enabled: bool,
-    pub grace: Duration,
     pub ttl: Duration,
     pub context_cap: u64,
 }
@@ -62,7 +56,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: false,
-            grace: DEFAULT_GRACE,
             ttl: DEFAULT_TTL,
             context_cap: DEFAULT_CONTEXT_CAP,
         }
@@ -72,7 +65,7 @@ impl Default for Config {
 impl Config {
     /// The config for the workspace at `root`: env over
     /// `autonomous.stepSessionResume` in `.loom/config.json` over the default
-    /// (off). Keys: `enabled`, `graceSecs`, `ttlSecs`, `contextCapBytes`.
+    /// (off). Keys: `enabled`, `ttlSecs`, `contextCapBytes`.
     #[must_use]
     pub fn load(root: &Path) -> Self {
         let json = std::fs::read_to_string(root.join(".loom").join("config.json"))
@@ -101,9 +94,6 @@ impl Config {
         }
         if let Some(v) = env_enabled.map(str::trim).filter(|v| !v.is_empty()) {
             c.enabled = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-        }
-        if let Some(v) = secs("graceSecs") {
-            c.grace = Duration::from_secs(v);
         }
         if let Some(v) = secs("ttlSecs") {
             c.ttl = Duration::from_secs(v);
@@ -267,24 +257,6 @@ fn newest(ledger: &Ledger, item: u32, role: StepRole) -> Option<&SessionRecord> 
             .filter(|r| r.item == item && r.role == *from && may_resume(r.role, role).is_ok())
             .max_by_key(|r| r.ended_at)
     })
-}
-
-/// How long a step must still wait for the host holding its session: nonzero
-/// only for a record another host holds, inside the grace window. Past it the
-/// step is eligible and runs fresh, so an unavailable holder never blocks an
-/// item. Pure.
-#[must_use]
-pub fn affinity_wait(
-    record: &SessionRecord,
-    now: DateTime<Utc>,
-    local_host: &str,
-    cfg: &Config,
-) -> Duration {
-    if !cfg.enabled || record.host == local_host {
-        return Duration::ZERO;
-    }
-    let age = (now - record.ended_at).to_std().unwrap_or(Duration::ZERO);
-    cfg.grace.saturating_sub(age)
 }
 
 /// The written handoff a fresh step receives in place of a session. A

@@ -145,6 +145,14 @@ if it were. In the incident behind #6883 the fix was wrong, its regression test
 fabricated the source payload the fix assumed, and the bug survived the close
 undetected until a human asked why the item still had not appeared.
 
+**Per-repo switch (#12703)**: optional config key `champion.outOfBandAcGate`
+(boolean; absent = `true`, today's behaviour), resolved through the daemon's
+config tiers (`loom-daemon config get champion.outOfBandAcGate --json`), so
+fleet-gitops can set it for one repo. Only an explicit `false` turns the gate
+off: Step 4 then skips the classifier and never adds `loom:operator` for an
+out-of-band criterion. Absent, unreadable or non-boolean values keep it on.
+First use case: 2AMLogic/loom-ui, whose live site is where testing happens.
+
 **Handling**: `champion-pr-merge.md` → Step 4 → "Out-of-Band Acceptance-Criteria
 Gate" runs `./.loom/scripts/classify-ac-verification.sh --issue <N> --pr <PR>
 --head-sha <head>` for every linked issue before confirming or forcing its close:
@@ -548,6 +556,21 @@ selection, guard hooks, installers/updaters that rewrite installed files on
 roll) is never satisfiable by a class. Revertability is red only for a one-way
 effect that happens on merge or roll, not for one an operator later triggers
 by hand. Absent `coversCriticalFiles`, nothing changes.
+
+**Critical files only (#12648)**: `"criticalFilesOnly": true` narrows a class
+to the critical-file hits. Its `filePatterns`, `excludeFilePatterns` and
+`forbiddenDiffPatterns` are applied to the files criterion #3 flags (and each
+one's `previous_filename`) and nothing else; the kept set still covers every
+changed file. It waives criterion #3 only and is never eligible for criterion
+#2. Class `ci-only` = `ci-steps` above with `criticalFilesOnly: true`:
+
+| PR | Result |
+|---|---|
+| `.github/workflows/ci.yml` plus `docs/guide.md`, Judge-approved, CI green | #3 **PASS** under `ci-only`, naming `ci.yml`; criterion #2 still judges the whole PR on the four axes and may hold it |
+| same PR, `ci.yml` adds a `permissions:` block | forbidden line in a critical file: #3 **FAIL**, hold |
+| `ci.yml` plus `defaults/scripts/install-loom.sh` | kept set: #3 **FAIL**, hold |
+| `src/ci.yml` renamed to `.github/workflows/ci.yml` | the previous name is outside the class: #3 **FAIL**, hold |
+| `docs/guide.md` alone | no critical-file hit: the class does not apply, #3 passes on its own |
 
 **Action** (single authoritative policy — implemented in
 `champion-pr-merge.md` → "Safety Criteria → 2. Merge-Risk Judgment →

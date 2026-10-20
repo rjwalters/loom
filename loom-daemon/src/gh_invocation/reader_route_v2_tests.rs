@@ -568,6 +568,15 @@ fn a_shed_never_reads_as_a_rate_limit() {
     assert!(!crate::rate_limit_breaker::indicates_rate_limit(&wrapped));
 }
 
+/// #12641: the tick-deadline deferral reads as what it is, never as a
+/// reader-budget shed.
+#[test]
+fn the_tick_deadline_deferral_has_its_own_wording() {
+    let text = Unavailable::DeadlineReached.to_string();
+    assert_eq!(text, "deferred: tick deadline reached");
+    assert!(!text.contains("loom-shed") && !text.contains("reader budget"), "{text}");
+}
+
 // ===== accounting =====
 
 #[test]
