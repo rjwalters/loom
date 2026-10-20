@@ -187,6 +187,10 @@ fn samples() -> Vec<TelemetryRecord> {
                     "confirmed": true, "event_at": AT, "observed_at": AT, "loom": p})),
         wire(json!({"kind": "merge_queue.event", "event": "merged", "pr": 7, "nonce": 1,
                     "at": AT, "loom": p})),
+        wire(
+            json!({"kind": "merge.authorization.evaluated", "commit": "9999999999999999999999999999999999999999",
+                    "reason": "authorized", "at": AT, "loom": p}),
+        ),
         wire(json!({"kind": "merge.queue.observed", "state": "observed", "complete": true,
                     "observed_at": AT, "loom": p})),
         wire(json!({"kind": "merge.queue.regime", "ambiguous": false,

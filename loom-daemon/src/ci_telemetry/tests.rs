@@ -22,6 +22,7 @@ mod journal_rotation;
 mod journal_view;
 mod ledger_retention;
 mod owners;
+mod priority_lane;
 mod queue_depth;
 mod queue_time;
 mod reader_routing;
