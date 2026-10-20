@@ -56,11 +56,6 @@ pub const REFRESH_SECS_ENV: &str = "LOOM_DISPATCH_ELIGIBILITY_REFRESH_SECS";
 /// Default refresh cadence: ten minutes (matching `ops::disposition`).
 pub const DEFAULT_REFRESH_SECS: i64 = 600;
 
-/// Most items turned into facts per [`record`] call. An item past this is
-/// dropped (the host's queue is pathologically large); the bound matches
-/// `ops::disposition`.
-pub const MAX_ROWS: usize = 256;
-
 /// Offers `eta.dispatch_eligibility` envelopes, stamped with this daemon's host
 /// id, to the OTLP exporters' queues.
 #[derive(Clone)]
@@ -108,16 +103,23 @@ pub struct EligRow {
     pub slug: String,
     pub visibility: RepoVisibility,
     pub issue: u32,
-    /// 1-based bare comparator rank on the host this tick.
+    /// 1-based bare comparator rank on the host this tick. Comparator order
+    /// only: the step-mode weighted draw (`item_draw`) does not use it, so it
+    /// is not queue position.
     pub rank: u32,
     pub eligibility: Eligibility,
     /// [`QueueDisposition::as_str`].
     pub reason: String,
     /// `ready` or `blocked`.
     pub state: String,
-    /// Eligible items ranked ahead across the host concurrency pool.
+    /// Eligible items with a smaller comparator rank across the host
+    /// concurrency pool. Comparator order, not used by the step-mode weighted
+    /// draw, not queue position (see `pick.decision.item_draw` for the draw
+    /// weight share).
     pub eligible_work_ahead: u32,
-    /// Eligible items ranked ahead within this item's own repo pool.
+    /// Eligible items with a smaller comparator rank within this item's own
+    /// repo pool. Comparator order, not queue position (see
+    /// [`Self::eligible_work_ahead`]).
     pub eligible_work_ahead_repo: u32,
     /// The issue's priority level (`Level::as_str`).
     pub level: String,
@@ -160,9 +162,6 @@ pub fn build_rows(
         let Some(repo) = resolve(&row.repo) else {
             continue;
         };
-        if rows.len() >= MAX_ROWS {
-            break;
-        }
         let rank = u32_from(row.rank);
         let eligible_work_ahead = u32_from(
             competitors

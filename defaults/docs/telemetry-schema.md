@@ -973,6 +973,31 @@ and join them to `loom.tokens_in` / `loom.lines_added` /
 `loom.total_duration_sec` on the same record. Not added to the public
 redaction allowlist, for the same reason as the fields above.
 
+**The step path (#12957).** The step engine exports the same fact under the
+same key and the same rules, so step duration and load can be read by size:
+
+- **`loom.dispatch.step`** carries `loom.story_points` on every attempt
+  (spawned or refused) of a sized item. An issue step (Curator, Builder,
+  Champion promote) reads its issue's label; a PR step (Judge, Doctor,
+  Champion) reads the label of the open issue the PR closes: its lowest
+  `Closes #N` link or Builder branch, the issue the classifier joins it to.
+  A PR that links only by `Part of`, an unsized issue, or a defective label
+  (logged at `warn` once per issue, then at `debug`) carries no key.
+- **The step's `loom.sweep` close** (#12253) carries the same
+  `loom.story_points` the step was spawned with, so step duration by
+  `(loom.role, loom.story_points)` is one query.
+- **`loom.dispatch.running_by_points{role, pool="step", points}`** counts live
+  steps per class (below, in the metric table).
+- **The tick's queue rows** (`step_dispatch/tick.rs`) carry `story_points`,
+  so the per-disposition rows carry size as the issue-sweep path's do.
+
+Every one comes from the labels the step tick's listing already returned
+(`work_finder::step_item::classify` reads `IssueInput.labels`): **no forge
+call** was added. They are facts only: the draw, slot budgets and step
+timeouts do not read them. The points ride the spawn request into the
+registry in memory, so a step this daemon did not spawn (adopted after a
+restart) closes without the key and counts as `unsized`.
+
 #### `disposition` — what the sweep actually DID (Issue #9441)
 
 `result` answers "did the process end well?", which is not the question a
@@ -1685,10 +1710,26 @@ mirrored bus event. Exactly one record per daemon process, enqueued by
 `observability::spawn_task` when the exporters come up (never when telemetry
 is disabled), so a fleet-gitops roll is visible in the backend the moment a
 host's daemon restarts onto new config. Its payload is
-`{"version", "revision", "tree_state", "supervisor", "config_sha", "pid"}` —
+`{"version", "revision", "tree_state", "supervisor", "config_sha", "pid",
+"start_time_unix_ms", "instance", "previous_version", "start_reason"}` —
 the exporting build (`provenance::daemon()`), the process supervisor
 (`launchd`/`systemd`, else `none`), the applied fleet-config SHA (the same
 value the resource's `loom.fleet.config_sha` carries), and the pid.
+Since #12942 it also names this process (`start_time_unix_ms`, epoch ms, and
+`instance`, `<host>/<start-epoch-s>`, which groups one process's records;
+`service.instance.id` stays the host) and why it started: `start_reason` is
+`roll` (the previous process exited for an auto-update), `restart` (IPC
+restart or operator drain), `cold` (no earlier process recorded on the host)
+or `unknown` (an earlier process left no exit cause: a crash, SIGKILL, power
+loss, or an exit with no restart intent). `previous_version` is that earlier
+process's crate version, `null` when unknown. Both come from
+`~/.loom/daemon_lifecycle.json` (beside `auto_update_state.json`), which each
+start overwrites and each deliberate exit rewrites with its cause; a missing
+or corrupt file reads as `cold`. The whole payload is longer than the exporter's 256-byte string bound, so each
+field also rides as a typed `loom.payload.<field>` attribute
+(`START_LOG_ATTRIBUTE_KEYS`), which is what the queries read. A crash loop is more than N `daemon.start`
+per host per hour, and queries 6 and 7 of
+`defaults/observability/signoz/host-export-queries.sql` list and count them.
 `daemon.shutdown` and a heartbeat stay with #10023/#10065; the naming here
 matches that draft so the later of the two is a deletion, not a conflict.
 
@@ -1812,6 +1853,7 @@ Every other name is a **`Gauge`**:
 | `loom.dispatch.idle_slots` | count | every work-finder tick with an occupancy reading |
 | `loom.dispatch.busy_slots` (`role`), `loom.dispatch.role_max_concurrent`, `loom.dispatch.role_idle_slots` | count | every work-finder tick |
 | `loom.dispatch.running_oldest_age_sec` (`role`, `pool="step"`), `loom.dispatch.running_by_age` (`role`, `pool="step"`, `age`), #12873 | seconds, count | every work-finder tick (default 60 s) once a registry has published its steps; the oldest age only for a role with a live step |
+| `loom.dispatch.running_by_points` (`role`, `pool="step"`, `points`), #12957 | count | every work-finder tick (default 60 s) once a registry has published its steps, `0` included |
 
 `loom.queue.issues` (Issue #8852, phase 2) is the ready-queue depth. It has
 one point per queue disposition, labelled `state` (`running`, `ready`,
@@ -1901,10 +1943,44 @@ resource `host.id`), never labelled by issue:
 | `loom.dispatch.role_idle_slots` | `Gauge` | `{slot}` | — | `role_max_concurrent − Σ busy_slots{role≠"sweep"}`, floored at `0`. The host's agent capacity is `max_concurrent + role_max_concurrent` = `Σ busy_slots + idle_slots + role_idle_slots` |
 | `loom.dispatch.running_oldest_age_sec` | `Gauge` | `s` | `role` (a step role name), `pool="step"` | seconds since the oldest live step of that role started (its registry entry's `started_at`), at the tick (#12873). **No point** for a role with no live step (never `0`). A roll-resumed step's age restarts at the resume. Issue sweeps (`role="sweep"`) and role-runner agents have no age series |
 | `loom.dispatch.running_by_age` | `Gauge` | `{slot}` | `role` (a step role name), `pool="step"`, `age` ∈ `lt_15m`, `15m_1h`, `1h_4h`, `ge_4h` | live steps per running-age bucket (#12873); each edge is an exclusive upper bound (a step exactly 15 min old is `15m_1h`). Every step role × bucket reports, `0` included, once any registry has published (the `busy_slots{pool="step"}` rule), so `Σ_age running_by_age{role}` = `busy_slots{role, pool="step"}`. A start ahead of the host clock reads age `0`. At most 5 roles × 5 series per host |
+| `loom.dispatch.running_by_points` | `Gauge` | `{slot}` | `role` (a step role name), `pool="step"`, `points` ∈ `1`, `2`, `3`, `5`, `8`, `13`, `unsized` | live steps per story-point class (#12957), from the points each step was spawned with (`loom.story_points`, above). A **count by class, never a sum of points**: points are ordinal (#11669). Every step role × class reports, `0` included, once any registry has published, so `Σ_points running_by_points{role}` = `busy_slots{role, pool="step"}`. `unsized` is an unsized item, a defective label, or a step adopted after a restart. Facts only: nothing reads it to pick or place work. At most 5 roles × 7 series per host |
+| `loom.forge.hold_items` | `Gauge` | `{item}` | `repo`, `artifact` (`issue` \| `pr`), `hold`, `basis` (`labels_at` \| `unknown`) | open items carrying a hold or park label (#12038), counted under each hold label they carry (an item with two is counted twice). `basis=labels_at` items have a known hold start; `basis=unknown` items do not and are left out of `loom.forge.hold_age_seconds` |
+| `loom.forge.hold_age_seconds` | `Gauge` | `s` | `repo`, `artifact`, `hold`, `stat` (`oldest` \| `p50` \| `p90`) | seconds since the hold label was last applied (#12038), nearest-rank over the `basis=labels_at` items of that `(repo, artifact, hold)`; absent when none has a known start |
 
 Forge label-stage dwell (`loom.forge.stage_dwell`, `loom.forge.stage_items`)
 is no longer exported (#12316): dwell is a consumer's computation over the
 mirror's per-item label times.
+
+**Hold age (#12038, #12369).** `loom.forge.hold_items` and `loom.forge.hold_age_seconds`
+(`observability/ops/hold_age.rs`) say how long items have been held. The
+population is every open issue or PR carrying a registry `park` or `hold` label
+(`loom:blocked`, `loom:operator`, `loom:frozen`, and the retired names that fold
+into them). `hold` is the label with `loom:` stripped and `-` turned into `_`.
+The hold start is `labels_at[<hold label>]` on the row, never `updatedAt`
+(Champion's own notices bump it, #9534). The source is the **step driver's
+discovery snapshot** (#12311): the gauges are emitted once per tick, right
+after the snapshot is taken, and cost **no GitHub calls** and add no
+forge-read caller. A repo the tick could not read (`tier = none`) emits **no
+hold points**, and a repo the tick did not read is not re-emitted from an
+earlier tick (absent, never `0`). The gauges are on whenever an OTLP exporter
+is; there is no separate switch.
+
+Count, oldest and p90 age per repo and hold over time:
+
+```promql
+max by (repo, hold) ({"__name__"="loom.forge.hold_items", basis="labels_at"})
+max by (repo, hold) ({"__name__"="loom.forge.hold_age_seconds", stat="oldest"})
+max by (repo, hold) ({"__name__"="loom.forge.hold_age_seconds", stat="p90"})
+```
+
+The oldest `hold=blocked` issue per repo, in days:
+
+```promql
+max by (repo) ({"__name__"="loom.forge.hold_age_seconds", hold="blocked", artifact="issue", stat="oldest"}) / 86400
+```
+
+Every host that reads a repo reports it, so aggregate with `max by (repo)`,
+not `sum`.
 
 The busy-slot gauges count no PR-set sweep
 (`/loom:sweep --prs`, hand-dispatched), which is in neither pool. The role
@@ -2217,10 +2293,11 @@ latest `lockout.frozen_candidates_count` / `lockout.frozen_points_sum` per
 repo (or `max` over a short window — both are step functions that only move
 when a tick's guard verdicts change).
 
-Free-form dispatch-error text is never exported. Rows past 256 per sample, or
-whose repo root never resolved, are dropped and counted on
-`loom.queue.disposition_rows_dropped{reason}` (`unresolved` / `truncated`), a
-delta counter. The single-workspace work-finder loop records no per-issue
+Free-form dispatch-error text is never exported. Rows whose repo root never
+resolved are dropped and counted on
+`loom.queue.disposition_rows_dropped{reason}` (`unresolved`), a delta counter.
+No row is dropped for volume: a row cap would make which items carry facts
+depend on iteration order. The single-workspace work-finder loop records no per-issue
 queue rows at all (`workspace #N` placeholders never resolve to a slug), so it
 has nothing to export here — the same limitation `queue.snapshot` already
 documents.
@@ -2845,9 +2922,9 @@ Body fields (`observability/otlp/mapping/dispatch_eligibility.rs`,
 | `state` | the coarse `ready` / `blocked` state the eligibility is derived from. |
 | `block_start` | when the item entered its current eligibility class on this host, as first observed (the tick of the first same-class sample). An observation floor — a class shorter than one collector interval can be missed, and a daemon restart re-anchors it (same tradeoff as `ops::disposition`). This is the dwell split point. |
 | `transition` | `changed` (class flip / first sight; `block_start` re-anchored) or `refresh` (same class, window elapsed; `block_start` preserved). |
-| `rank` | the item's 1-based bare comparator rank on the host this tick. |
-| `eligible_work_ahead` | **effective** work-ahead: the count of *eligible* items (not `blocked` — running or ready) ranked ahead across the host concurrency pool. Blocked items are excluded, so it is the real number of competitors that take a slot first, not a raw "priority ≥ mine" count. |
-| `eligible_work_ahead_repo` | the same, restricted to this item's own repo (the `maxConcurrentPerRepo` pool). |
+| `rank` | the item's 1-based bare comparator rank on the host this tick. **Comparator order only: it is not queue position.** In step mode dispatch is a weighted random draw that does not use it; the dispatch-position equivalent is the draw weight share in `pick.decision.item_draw`. |
+| `eligible_work_ahead` | the count of *eligible* items (not `blocked` — running or ready) with a smaller comparator `rank` across the host concurrency pool. Blocked items are excluded. Comparator order, not used by the step-mode weighted draw, so **not** the number of competitors that take a slot first and not queue position; see `pick.decision.item_draw` for the draw weight share. |
+| `eligible_work_ahead_repo` | the same, restricted to this item's own repo (the `maxConcurrentPerRepo` pool). Comparator order, not queue position. |
 | `resource_pool` | the scheduling class the item competes in: the forge `owner/repo` slug. |
 | `max_concurrent` | the host's effective concurrency cap this tick (the global pool size). |
 | `level` | the issue's priority level (`default` / `important` / `very-important`) — the axis the work-ahead counts are relative to. |

@@ -175,11 +175,10 @@ fn an_unresolved_root_is_dropped_and_counted() {
     let (rows, dropped) = build_rows(&summary, &HashMap::new());
     assert!(rows.is_empty());
     assert_eq!(dropped.unresolved, 1);
-    assert_eq!(dropped.truncated, 0);
 }
 
 #[test]
-fn more_than_256_rows_are_truncated_and_counted() {
+fn more_than_256_rows_are_all_emitted() {
     let mut repos = HashMap::new();
     repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
     let queue: Vec<ReadyQueueRow> = (0..300)
@@ -190,9 +189,8 @@ fn more_than_256_rows_are_truncated_and_counted() {
         ..Default::default()
     };
     let (rows, dropped) = build_rows(&summary, &repos);
-    assert_eq!(rows.len(), MAX_ROWS);
-    assert_eq!(dropped.truncated, 300 - MAX_ROWS);
-    assert_eq!(dropped.unresolved, 0);
+    assert_eq!(rows.len(), 300);
+    assert_eq!(dropped, DroppedCounts::default());
 }
 
 #[test]
@@ -243,7 +241,7 @@ fn build_rows_extracts_queue_position_metadata() {
         ..Default::default()
     };
     let (rows, dropped) = build_rows(&summary, &repos);
-    assert!(dropped.unresolved == 0 && dropped.truncated == 0);
+    assert!(dropped.unresolved == 0);
     assert_eq!(rows.len(), 2);
     // Every row sees the same denominator: the tick's ready-queue depth.
     assert_eq!(rows.iter().map(|r| r.total_candidates).collect::<Vec<_>>(), [2, 2]);
@@ -761,10 +759,7 @@ async fn record_without_sink_is_a_noop() {
 #[test]
 fn dropped_points_emit_one_delta_counter_per_nonzero_reason() {
     assert!(dropped_points(DroppedCounts::default()).is_empty());
-    let points = dropped_points(DroppedCounts {
-        unresolved: 2,
-        truncated: 0,
-    });
+    let points = dropped_points(DroppedCounts { unresolved: 2 });
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].name, MetricName::QueueDispositionRowsDropped);
     assert_eq!(points[0].labels["reason"], "unresolved");
@@ -1029,7 +1024,8 @@ fn plan_vocabularies_stay_closed_over_arbitrary_rows() {
         })
         .collect();
     let (rows, dropped) = build_rows(&planned_summary(queue), &repos);
-    assert_eq!(dropped.truncated, 300 - MAX_ROWS);
+    assert_eq!(rows.len(), 300);
+    assert_eq!(dropped, DroppedCounts::default());
     let mut tracker = DispositionTracker::default();
     let spans: Vec<SpanRecord> = tracker
         .diff(&rows, &[], at(0), Duration::seconds(600))

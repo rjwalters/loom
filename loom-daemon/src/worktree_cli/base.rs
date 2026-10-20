@@ -26,9 +26,10 @@
 //! "could not run at all" and is the stub's, never this module's.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use crate::refname::check_refname;
+
+use super::wip::git_ok;
 
 /// One replayed line; see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,18 +216,6 @@ pub fn emit(outcome: &Outcome) -> i32 {
 /// muscle memory) match on: naming WHICH operand was refused.
 fn refusal(what: &str, e: &crate::refname::RefnameError) -> String {
     format!("check_branch_name: REFUSING this {what} — {e}")
-}
-
-fn git_ok(repo: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 #[cfg(test)]

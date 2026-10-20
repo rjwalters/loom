@@ -209,6 +209,10 @@ pub mod host_status;
 /// Per-kind silence thresholds for `otlp_export` health (#12120).
 pub mod kind_silence;
 
+/// Producer-liveness guard: every registered kind has a producer or is on an
+/// explicit producer-less allowlist (#12947, #11301 post-mortem).
+pub mod kind_producer;
+
 /// `scope.memory` (#12241) — one agent scope's memory limit, peak and OOM kills.
 pub mod scope_memory;
 
