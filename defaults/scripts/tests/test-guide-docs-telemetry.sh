@@ -173,7 +173,8 @@ else
     fail "archive paths not recorded verbatim (rc=$RC): $(jq -c '.record.files_changed' <<<"$ARCHIVE_LINE")"
 fi
 # Drop the probe record so later window/count tests see only their own data.
-sed -i '$ d' "$LOG_FILE"
+PROBE_TRIM="$(mktemp)"
+sed '$ d' "$LOG_FILE" > "$PROBE_TRIM" && mv "$PROBE_TRIM" "$LOG_FILE"
 
 if [[ -n "$(jq -r '.emitted_at_epoch' <<<"$LAST_LINE")" ]] && [[ "$(jq -r '.emitted_at_epoch | type' <<<"$LAST_LINE")" == "number" ]]; then
     pass "emitted_at_epoch is present and numeric (used for window filtering)"
