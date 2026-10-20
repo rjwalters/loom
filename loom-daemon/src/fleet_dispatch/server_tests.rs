@@ -36,14 +36,13 @@ impl Identity for DownIdentity {
 }
 
 fn roster() -> Roster {
-    let host = |node: &str, max: u32, fleet_mode: bool| RosterHost {
+    let host = |node: &str, fleet_mode: bool| RosterHost {
         tailnet_node: Some(node.to_string()),
-        max_concurrent: Some(max),
         fleet_mode,
     };
     Roster::new(BTreeMap::from([
-        (A.to_string(), host("node-a", 40, true)),
-        (B.to_string(), host("node-b", 2, true)),
+        (A.to_string(), host("node-a", true)),
+        (B.to_string(), host("node-b", true)),
     ]))
 }
 
@@ -268,17 +267,18 @@ async fn a_restart_takes_a_new_epoch_refuses_with_grace_and_rebuilds_from_heartb
 }
 
 #[tokio::test]
-async fn the_cap_uses_the_rosters_max_concurrent() {
-    // B reports 100 free slots, but its fleet config caps it at 2.
+async fn the_captain_never_refuses_cap() {
+    // B reports 1 free slot; the captain still grants every claim it makes,
+    // because the worker bounds its own claims (#12864).
     let s = open_server("node-b");
-    s.handle(B, "/v1/heartbeat", hb_body(B, json!([]), 100).to_string().as_bytes());
-    for item in [1, 2] {
-        let (reply, _) =
+    s.handle(B, "/v1/heartbeat", hb_body(B, json!([]), 1).to_string().as_bytes());
+    for item in 1..=5 {
+        let (reply, call) =
             s.handle(B, "/v1/claim", claim_body(B, item, "builder").to_string().as_bytes());
-        assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["granted"], json!(true));
+        let body = serde_json::from_str::<Value>(&reply.body).unwrap();
+        assert_eq!(body["granted"], json!(true), "item {item}: {body}");
+        assert_ne!(call.reason.as_deref(), Some("cap"));
     }
-    let (reply, _) = s.handle(B, "/v1/claim", claim_body(B, 3, "builder").to_string().as_bytes());
-    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["reason"], json!("cap"));
 }
 
 #[tokio::test]
@@ -318,7 +318,6 @@ async fn a_reload_replaces_the_roster() {
         "worker-c".to_string(),
         RosterHost {
             tailnet_node: Some("node-c".into()),
-            max_concurrent: None,
             fleet_mode: false,
         },
     );

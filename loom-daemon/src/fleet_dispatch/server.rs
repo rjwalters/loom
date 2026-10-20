@@ -277,9 +277,8 @@ impl<I: Identity> Server<I> {
     fn claim(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
         let req: ClaimRequest = self.parse(host, body)?;
         call.item = Some((req.repo.clone(), req.item, req.step.clone()));
-        let max = self.roster().max_concurrent(host);
         let decision = self.with_table(|t, now, counters| {
-            let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step, max);
+            let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step);
             if let ClaimDecision::Refused { reason, .. } = &mut d {
                 if let Some(hold) = cooled {
                     counters.claim_cooled();
