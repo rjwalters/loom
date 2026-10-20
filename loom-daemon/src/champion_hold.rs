@@ -126,8 +126,10 @@ fn only_the_blocked_park<L: AsRef<str>>(labels: &[L]) -> bool {
 }
 
 /// Whether a trusted comment is an operator release of a hold: it *starts*
-/// with one of the instructions `champion-pr-merge.md` ("Sticky holds") names.
-/// Phrasing that merely mentions them does not match.
+/// with one of the instructions `champion-pr-merge.md` ("Sticky holds") names,
+/// or with the `loom:release-condition-met` marker that closes an operator
+/// release condition (#12594) — a held-at-head PR must be redrawn so Champion
+/// re-reads the condition. Phrasing that merely mentions them does not match.
 fn is_operator_release(comment: &str) -> bool {
     let c = comment.trim_start().to_ascii_lowercase();
     [
@@ -136,6 +138,7 @@ fn is_operator_release(comment: &str) -> bool {
         "override:",
         "merge anyway",
         "ok to merge",
+        "<!-- loom:release-condition-met -->",
     ]
     .iter()
     .any(|p| c.starts_with(p))
@@ -512,9 +515,20 @@ mod tests {
             "  Cleared: fine",
             "merge anyway, it is urgent",
             "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->\n**Approved**",
+            // #12594: closing an operator release condition must redraw the PR.
+            "<!-- loom:release-condition-met -->\npredecessor merged, healthy on every host",
         ] {
             assert_eq!(unreleased_hold_head(&[hold.as_str(), release]), None, "{release}");
         }
+        // The condition itself, or a notice quoting the -met marker, is not a release.
+        assert_eq!(
+            unreleased_hold_head(&[
+                hold.as_str(),
+                "<!-- loom:release-condition -->\nrelease after #12000 merges",
+                "Not merging: it closes when a comment opens with `<!-- loom:release-condition-met -->`",
+            ]),
+            Some("abc1234".into())
+        );
         // A release that predates a fresh hold record does not carry over.
         let fresh = hold_note("def5678");
         assert_eq!(

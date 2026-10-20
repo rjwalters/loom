@@ -16,6 +16,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-20
 
+- **PR #12946**: fix: grant group-check workflow reads and re-run on CI completion
+- **PR #12802**: build(deps): bump the npm-minor-patch group across 1 directory with 3 updates
+- **PR #12658**: fix: report a missing guard-destructive engine in check-guards-installed
+- **PR #12570**: fix: check out .loom in the merge-group template and audit group-check without checkout
+- **PR #12539**: fix: remove retired generated skills in source-backed resync
+- **PR #12321**: refactor: answer the gh pr merge guard from the shared command lexer
+- **PR #12154**: fix(resync): make forge label create/refresh opt-in via --sync-labels
+- **Issue #12568** (closed): merge_group workflow can't post loom/merge-authorization: write_scope refuses (no checkout in the template), so every queued PR times out
+- **Issue #12507** (closed): Source-backed resync leaves retired generated Codex skills discoverable
+- **Issue #12236** (closed): guard: shared command-analysis lexer + corpus harness, first move: merge-redirect check (slice 1 of #11113)
+- **Issue #10770** (closed): resync-installed.sh writes forge labels by default; make forge writes opt-in or list them in --dry-run
 - **PR #12931**: feat(fleet-dispatch): captain next endpoint and capacity-driven request backoff
 - **PR #12929**: build(deps): bump hono from 4.13.7 to 4.13.13 in /mcp-loom
 - **PR #12928**: feat: add fleet-config apply-floor for daemon-less hosts below the fleet floor

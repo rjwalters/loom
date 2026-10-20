@@ -308,6 +308,9 @@ fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut 
                 match paths::resolve_resync_script(repo_root) {
                     Some(script) => {
                         let ok = Command::new(&script)
+                            // Forge label writes are opt-in (#10770); the post-roll
+                            // resync keeps the fleet label auto-heal (#6716).
+                            .arg("--sync-labels")
                             .current_dir(repo_root)
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
