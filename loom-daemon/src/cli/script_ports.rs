@@ -24,10 +24,10 @@ pub(crate) enum ScriptPortCommand {
     Preflight(super::preflight::PreflightArgs),
     /// Supervised persistent-container transport backing spawn-codex.sh.
     #[command(subcommand)]
-    SessionExec(loom_daemon::session_exec::SessionExecCommand),
+    SessionExec(crate::session_exec::SessionExecCommand),
     /// Private workspace endpoint used inside a session container.
     #[command(subcommand)]
-    PrivateWorkspace(loom_daemon::tokens_pool::private_workspace::WorkerCommand),
+    PrivateWorkspace(crate::tokens_pool::private_workspace::WorkerCommand),
     /// Readiness of Loom's managed Codex hook, behind
     /// `provision-codex-hooks.sh verify` (#9390).
     #[command(subcommand)]

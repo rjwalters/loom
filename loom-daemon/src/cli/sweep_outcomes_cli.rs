@@ -12,7 +12,7 @@
 //! The handler bodies stay where they were: the pre-existing paths in
 //! [`crate::cli::misc_cmds::handle_sweep_outcomes_command`] (untouched by
 //! #8057) and the new grouped report in
-//! [`loom_daemon::sweep_outcome_summary`].
+//! [`crate::sweep_outcome_summary`].
 
 use anyhow::{bail, Result};
 use chrono::Utc;
@@ -227,8 +227,8 @@ struct SweepOutcomesSummaryArgs<'a> {
 /// paths (`--records`, the default summary, `--pending-export`) keep reading
 /// exactly one workspace, so no existing script's output silently widens.
 fn handle_summary(args: &SweepOutcomesSummaryArgs) -> Result<()> {
-    use loom_daemon::sweep_outcome_summary as summary;
-    use loom_daemon::workspace_registry::{self, WorkspaceRegistry};
+    use crate::sweep_outcome_summary as summary;
+    use crate::workspace_registry::{self, WorkspaceRegistry};
 
     let group_by = summary::GroupBy::parse(args.group_by)?;
     let since = args
@@ -239,7 +239,7 @@ fn handle_summary(args: &SweepOutcomesSummaryArgs) -> Result<()> {
     // Resolving the repo root is only fatal when we actually need it: with
     // `--all-workspaces` the registry alone is a complete answer, so running
     // from outside any checkout is legitimate there.
-    let repo_root = match loom_daemon::worktree_ops::repo::resolve_repo_root(args.workspace) {
+    let repo_root = match crate::worktree_ops::repo::resolve_repo_root(args.workspace) {
         Ok(root) => Some(root),
         Err(e) if args.all_workspaces => {
             log::debug!("--all-workspaces: ignoring unresolvable workspace root: {e}");
@@ -330,7 +330,7 @@ mod tests {
     /// exactly the `Command` tree the binary builds — the `Args`-struct move
     /// this module performs is only safe if that tree is unchanged. Parsed on
     /// an 8 MiB thread like the binary's (#10616).
-    fn parse(args: &[&str]) -> crate::Commands {
+    fn parse(args: &[&str]) -> crate::cli::Commands {
         try_parse_cli(args)
             .expect("parse")
             .command
@@ -441,7 +441,7 @@ mod tests {
         for case in &cases {
             let argv = case.argv;
             match parse(argv) {
-                crate::Commands::SweepOutcomes(a) => {
+                crate::cli::Commands::SweepOutcomes(a) => {
                     let SweepOutcomesArgs {
                         workspace,
                         model,
@@ -483,7 +483,7 @@ mod tests {
             "--exclude-spawn-deaths",
             "--json",
         ]) {
-            crate::Commands::SweepOutcomes(args) => match args.command {
+            crate::cli::Commands::SweepOutcomes(args) => match args.command {
                 Some(SweepOutcomesAction::Summary {
                     workspace,
                     since,
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn summary_defaults_to_group_by_model_and_a_live_merge_join() {
         match parse(&["loom-daemon", "sweep-outcomes", "summary"]) {
-            crate::Commands::SweepOutcomes(SweepOutcomesArgs {
+            crate::cli::Commands::SweepOutcomes(SweepOutcomesArgs {
                 command:
                     Some(SweepOutcomesAction::Summary {
                         group_by,

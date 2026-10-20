@@ -31,17 +31,17 @@
 //!   ordering pass is the one releaser on landing, ADR-0023 §4).
 //! - Every `gh` call honors `--repo`/`LOOM_REPO` and the per-root credential.
 
-use anyhow::{bail, Context, Result};
-use loom_daemon::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
-use loom_daemon::cmd_out::CmdOutcome;
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-use loom_daemon::merge_pr::consolidate::{
+use crate::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
+use crate::cmd_out::CmdOutcome;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::merge_pr::consolidate::{
     self as cons, attempt_id, candidate_branch, check_eligibility, fetch_component,
     find_open_candidate, live_marker, mapping_body, parse_mapping, pin_check, push_branch,
     remove_worktree, reservation_comment_body, reservation_marker, reservation_present,
     reservation_state, AbortReason, Bounds, CandidateMapping, PrepareOutcome, ReservationState,
 };
-use loom_daemon::merge_pr::sequence::fetch_trusted_bodies;
+use crate::merge_pr::sequence::fetch_trusted_bodies;
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 #[derive(clap::Args)]
@@ -70,7 +70,7 @@ impl ConsolidatePrepareArgs {
         }
         scope_repo(self.repo.as_deref());
         let root = std::env::current_dir()?;
-        let gh = std::path::PathBuf::from(loom_daemon::gh_invocation::gh_bin());
+        let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
         let bounds = Bounds::from_env();
 
         // 1-2. Fetch components + default branch, then eligibility — all
@@ -224,7 +224,7 @@ impl ConsolidateAbortArgs {
     pub(crate) fn run(self) -> Result<()> {
         scope_repo(self.repo.as_deref());
         let root = std::env::current_dir()?;
-        let gh = std::path::PathBuf::from(loom_daemon::gh_invocation::gh_bin());
+        let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
         let reason = match self.cause {
             RequestedCause::Operator => AbortReason::Operator,
             RequestedCause::CiFailure => AbortReason::CiFailure,
@@ -254,7 +254,7 @@ impl ConsolidateReconcileArgs {
         // The orchestration lives in the library so it runs under test
         // end-to-end (restart, unverified component, pushed source). It spawns
         // `gh` through the `gh_invocation` facade, which resolves the program
-        // itself (`loom_daemon::gh_invocation::gh_bin()`'s ladder, #9985).
+        // itself (`crate::gh_invocation::gh_bin()`'s ladder, #9985).
         let report = cons::reconcile::reconcile("git", &root, self.pr)?;
         println!("{}", report.summary());
         if !report.unverified.is_empty() {
@@ -384,8 +384,8 @@ fn live_base(gh: &std::path::Path, root: &std::path::Path, default_branch: &str)
 fn fetch_markers(
     gh: &std::path::Path,
     root: &std::path::Path,
-    components: &[loom_daemon::merge_pr::consolidate::ComponentState],
-) -> std::collections::BTreeMap<u32, loom_daemon::merge_pr::sequence::SequenceMarker> {
+    components: &[crate::merge_pr::consolidate::ComponentState],
+) -> std::collections::BTreeMap<u32, crate::merge_pr::sequence::SequenceMarker> {
     let bin = gh.to_string_lossy().to_string();
     let mut out = std::collections::BTreeMap::new();
     // Only LIVE holds count (label present, not released by a newer release
@@ -408,7 +408,7 @@ fn apply_reservations(
     candidate_pr: u32,
     candidate_head: &str,
     attempt: &str,
-    components: &[loom_daemon::merge_pr::consolidate::ComponentState],
+    components: &[crate::merge_pr::consolidate::ComponentState],
 ) -> Result<usize> {
     let (applied, _) =
         backfill_reservations_inner(gh, root, candidate_pr, candidate_head, attempt, components)?;
@@ -669,7 +669,7 @@ fn backfill_reservations_inner(
     candidate_pr: u32,
     candidate_head: &str,
     attempt: &str,
-    components: &[loom_daemon::merge_pr::consolidate::ComponentState],
+    components: &[crate::merge_pr::consolidate::ComponentState],
 ) -> Result<(usize, usize)> {
     let bin = gh.to_string_lossy().to_string();
     let mut applied = 0;

@@ -30,8 +30,8 @@
 
 use std::path::PathBuf;
 
+use crate::daemon_update::{out, provision};
 use anyhow::Result;
-use loom_daemon::daemon_update::{out, provision};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum InstallBinaryCommand {

@@ -4,8 +4,8 @@
 //! every field explicitly without pushing its parent past the
 //! `.loom/docs/file-size-policy.md` ratchet.
 
+use crate::types::{CapacityReport, CredentialPreflightReport, DaemonStatusReport};
 use chrono::Utc;
-use loom_daemon::types::{CapacityReport, CredentialPreflightReport, DaemonStatusReport};
 
 /// A fully-populated report the fake daemon can serialize back to the client
 /// on a successful round-trip. Every field is compiler-checked, so a schema
