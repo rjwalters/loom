@@ -402,11 +402,13 @@ impl<I: Identity> Server<I> {
             }
             outcome
         });
-        if let Some((repo, item, _)) = &call.item {
-            // The entry is stale or taken: a refresh with the same
-            // `updated_at` must not feed it back (§10.3).
-            if let Ok(item) = u32::try_from(*item) {
-                self.queue().tombstone(repo, item);
+        if outcome != RefuseOutcome::Unknown {
+            if let Some((repo, item, _)) = &call.item {
+                // Only an accepted owner's refusal can suppress the candidate.
+                // Refreshing the same `updated_at` must not re-admit it (§10.3).
+                if let Ok(item) = u32::try_from(*item) {
+                    self.queue().tombstone(repo, item);
+                }
             }
         }
         Ok(self.ok(&AckResponse {
