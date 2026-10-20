@@ -473,6 +473,21 @@ pub fn execute_roll(runner: &dyn CommandRunner, host: &str) -> RollOutcome {
         }
     };
 
+    // 3b. Exit 9/10 (#12776): the candidate failed to start and the update
+    // script put the previous binary back. The measured verdict below would
+    // read that host as Rolled (the restored daemon started after the binary
+    // was last written), so these two codes can only DOWNGRADE the result,
+    // never promote it.
+    if update_out.code == 9 || update_out.code == 10 {
+        return RollOutcome::Failed(format!(
+            "the new binary failed to start on {host} and the update script restored the \
+             previous one (exit {}; 9 = previous daemon running, 10 = restore or restart \
+             failed, host may be down) — the host is NOT on the new build: {}",
+            update_out.code,
+            tail(&update_out.stderr)
+        ));
+    }
+
     // 4. Post-roll measured verdict — the ONLY thing trusted for the final
     // call, never `update_out`'s exit code or stdout/stderr transcript.
     let post_probe = match runner.run(VERDICT_PROBE_SHELL, None) {
@@ -798,6 +813,25 @@ mod tests {
         let calls = runner.calls();
         assert!(calls[2].contains("--force"), "calls[2]: {}", calls[2]);
         assert!(outcome.detail().contains("forced a restart"), "detail: {}", outcome.detail());
+    }
+
+    #[test]
+    fn a_restored_host_is_failed_not_rolled() {
+        // #12776: exit 9 = the update script restored the previous binary and
+        // its daemon started AFTER the binary was written, so the measured
+        // verdict alone would read this host as rolled.
+        for code in [9, 10] {
+            let runner = MockRunner::new(vec![
+                Ok(out(3, "update available", "")),
+                Ok(probe(100, 200)),
+                Ok(out(code, "", "restored")),
+                Ok(probe(500, 200)), // would be `Rolled` on its own
+            ]);
+            let outcome = execute_roll(&runner, "worker-1");
+            assert_eq!(outcome.label(), "FAILED", "exit {code}");
+            assert!(!outcome.is_success());
+            assert!(outcome.detail().contains("NOT on the new build"), "{}", outcome.detail());
+        }
     }
 
     #[test]
