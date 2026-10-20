@@ -488,14 +488,69 @@ struct Pending {
     request: StepSpawnRequest,
 }
 
+/// An item the fleet-dispatch captain offered this host (#12817): spawned
+/// first if it is in the gated pool, and never otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    /// The forge slug, as the captain names it.
+    pub repo: String,
+    pub item: u32,
+    pub role: StepRole,
+}
+
 /// Run one step tick over `workspaces` (module docs).
-#[allow(clippy::too_many_lines)] // one loop, kept whole so the pass rules read in order.
 pub fn run(
+    workspaces: Vec<StepWorkspace>,
+    limits: StepTickLimits,
+    seed: &SeedBase,
+    knobs: &PoolKnobs,
+    spawner: &mut dyn StepSpawner,
+) -> StepTick {
+    run_with_offers(workspaces, limits, seed, knobs, spawner, &[])
+}
+
+/// Take from `pool` the item each of `offers` names, up to `limit`, in
+/// offer order. An offer whose item is not in the pool (a gate or the
+/// classification left it out, or its workspace is held) is not taken, so an
+/// offer cannot skip a gate. Pure.
+fn take_offered(
+    pool: &mut Vec<Candidate>,
+    workspaces: &[StepWorkspace],
+    offers: &[Offer],
+    limit: usize,
+) -> Vec<Candidate> {
+    let mut taken: Vec<Candidate> = Vec::new();
+    for offer in offers {
+        if taken.len() >= limit {
+            break;
+        }
+        let in_repo = |c: &Candidate| {
+            workspaces
+                .iter()
+                .any(|w| w.idx == c.workspace_idx && w.repo.eq_ignore_ascii_case(&offer.repo))
+        };
+        let at = pool.iter().position(|c| {
+            c.target() == offer.item && StepRole::from(c.step) == offer.role && in_repo(c)
+        });
+        if let Some(at) = at {
+            taken.push(pool.remove(at));
+        }
+    }
+    taken
+}
+
+/// [`run`], spawning first the `offers` that pass the gates (#12817): each
+/// is taken from the pool before the draw, spawned through the same spawner
+/// as a draw, and counts against the tick's free slots. The rest of the
+/// slots draw as before.
+#[allow(clippy::too_many_lines)] // one loop, kept whole so the pass rules read in order.
+pub fn run_with_offers(
     mut workspaces: Vec<StepWorkspace>,
     limits: StepTickLimits,
     seed: &SeedBase,
     knobs: &PoolKnobs,
     spawner: &mut dyn StepSpawner,
+    offers: &[Offer],
 ) -> StepTick {
     let mut pass_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut draws_taken = 0usize;
@@ -546,6 +601,7 @@ pub fn run(
         }
     }
     let by_idx: BTreeMap<usize, &StepWorkspace> = workspaces.iter().map(|w| (w.idx, w)).collect();
+    let offered = take_offered(&mut pool, &workspaces, offers, limits.free_slots);
     let mut draw = ItemDraw::new(
         pool,
         repos,
@@ -563,10 +619,83 @@ pub fn run(
     let mut refused: BTreeMap<usize, BTreeMap<String, usize>> = BTreeMap::new();
     let mut overflow = false;
 
-    let budget = limits.free_slots;
     let mut passes = 0u32;
     let mut order: Vec<(usize, u32)> = Vec::new();
     let mut exhausted = false;
+    // The captain's offers that passed the gates spawn first, one at a time,
+    // and hold their slots (#12817). A refusal is counted like a draw's but
+    // spends none of the tick's passes: it was not a draw.
+    let mut offered_spawned = 0usize;
+    for c in &offered {
+        let idx = c.workspace_idx;
+        let Some(&ws) = by_idx.get(&idx) else {
+            continue;
+        };
+        let key = key_of(ws, c);
+        order.push((idx, key.number));
+        let merge = is_merge_step(c.step);
+        if merge && merging.contains(&idx) {
+            merge_deferred += 1;
+            resolve(&mut report.queue, &key, Qd::PeerClaim, Some(PASS_MERGE.to_string()));
+            continue;
+        }
+        if let Some(hold) = spawner.held() {
+            report.spawn_hold = Some(hold.to_string());
+            resolve(&mut report.queue, &key, Qd::DeferredCapacity, Some(hold.to_string()));
+            report.deferred_capacity += 1;
+            break;
+        }
+        let request = StepSpawnRequest {
+            item: key.number,
+            role: StepRole::from(c.step),
+            draw_attempt: 1,
+            age_source: c.terms.age_source.as_str().to_string(),
+            resumed: false,
+            draw: None,
+        };
+        match spawner.spawn(idx, &request) {
+            SpawnResult::Spawned => {
+                if merge {
+                    merging.insert(idx);
+                    for other in draw.close_steps(idx, &MERGE_STEPS) {
+                        resolve(
+                            &mut report.queue,
+                            &key_of(ws, &other),
+                            Qd::PeerClaim,
+                            Some(PASS_MERGE.to_string()),
+                        );
+                        merge_deferred += 1;
+                        *deferred.entry(idx).or_default() += 1;
+                    }
+                }
+                resolve(&mut report.queue, &key, Qd::Dispatched, None);
+                report.dispatched += 1;
+                offered_spawned += 1;
+            }
+            SpawnResult::Refused(reason) => {
+                let disposition = disposition_of(&reason);
+                if disposition == Qd::DispatchError {
+                    report.errors += 1;
+                }
+                resolve(&mut report.queue, &key, disposition, Some(reason.clone()));
+                *refused
+                    .entry(idx)
+                    .or_default()
+                    .entry(reason.clone())
+                    .or_default() += 1;
+                if reason == REFUSAL_CLAIM_UNVERIFIED {
+                    let owner = forge_owner(&ws.repo);
+                    for other in workspaces.iter() {
+                        if forge_owner(&other.repo) == owner {
+                            draw.close_repo(other.idx);
+                        }
+                    }
+                }
+                *pass_counts.entry(reason).or_default() += 1;
+            }
+        }
+    }
+    let budget = limits.free_slots.saturating_sub(offered_spawned);
     // #12298: slots are filled in rounds. Each round draws one candidate
     // for up to `spawn_concurrency` open slots, never two in one repo, and
     // spawns them as one batch; the results are applied in draw order. A
