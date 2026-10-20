@@ -2791,6 +2791,19 @@ and `loom.repo.visibility` ride as attributes (all already on the gateway log
 on `(repo, issue)` without a collector change. The wire tag keeps the `eta.`
 prefix so the `loom.kind LIKE 'eta%'` queries catch it.
 
+**Promoted attributes (#12867).** #12790 left the schedulability signal in the
+body only, so SigNoz's `attributes_string` carried nothing but
+repo/issue/visibility/`record_id` and the fact read as a hollow shell. The
+three fields that answer "why isn't this eligible-looking `loom:issue` being
+picked" now also ride as queryable attributes
+(`DISPATCH_ELIGIBILITY_LOG_ATTRIBUTE_KEYS`, added to the `transform/privacy`
+log `keep_keys`): `loom.eta.dispatch_eligibility.eligibility` (the verdict),
+`loom.eta.dispatch_eligibility.reason` (the blocking-reason token) and
+`loom.eta.dispatch_eligibility.rank` (the candidate rank). They are threaded
+straight from the dispatcher's already-computed `QueueDisposition`, not
+recomputed, and still appear in the body too. The richer fields below
+(`eligible_work_ahead`, `resource_pool`, …) stay body-only (`JSONExtract`).
+
 Body fields (`observability/otlp/mapping/dispatch_eligibility.rs`,
 `telemetry/kinds/dispatch_eligibility.rs`):
 
