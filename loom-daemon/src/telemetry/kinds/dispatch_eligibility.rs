@@ -41,6 +41,22 @@ use crate::telemetry::RepoVisibility;
 /// (distinct from the envelope's gate, which is `NEW_KIND_SCHEMA_VERSION`).
 pub const DISPATCH_ELIGIBILITY_SCHEMA_VERSION: u32 = 1;
 
+/// The `loom.*` attribute keys the OTLP mapping promotes out of the body so
+/// SigNoz can `GROUP BY`/filter on them without a `JSONExtract` (#12867). The
+/// body still carries the full record for the richer fields, but the three
+/// signals that answer "why isn't this eligible-looking item being picked" —
+/// the eligibility **verdict**, the dispatcher's **reason** token (the
+/// blocking reason), and the item's **rank** — are the ones readers query, so
+/// they ride as attributes. Every key here MUST also be on the gateway's
+/// `transform/privacy` log `keep_keys` allowlist, or the collector strips it
+/// before it reaches the store; the mapping's
+/// `attributes_are_declared_and_the_collector_keeps_them` test enforces both.
+pub const DISPATCH_ELIGIBILITY_LOG_ATTRIBUTE_KEYS: &[&str] = &[
+    "loom.eta.dispatch_eligibility.eligibility",
+    "loom.eta.dispatch_eligibility.reason",
+    "loom.eta.dispatch_eligibility.rank",
+];
+
 /// Whether the dispatcher can currently select the item, split at the
 /// eligibility boundary (#12790).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
