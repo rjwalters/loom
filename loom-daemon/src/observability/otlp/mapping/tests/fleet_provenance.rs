@@ -166,12 +166,12 @@ fn the_next_request_carries_a_sha_that_changed_in_process() {
 #[test]
 fn daemon_start_maps_to_a_log_with_topic_and_typed_payload_fields() {
     let batch = vec![envelope(
-        "ip-10-0-12-34.us-west-2.compute.internal",
+        "test-host-a.example.internal",
         crate::observability::daemon_lifecycle::start_record(
             "systemd",
             &crate::observability::daemon_lifecycle::StartContext {
                 start_time_unix_ms: 1_785_000_000_123,
-                instance: "ip-10-0-12-34.us-west-2.compute.internal/1785000000".to_string(),
+                instance: "test-host-a.example.internal/1785000000".to_string(),
                 previous_version: Some("0.19.1198".to_string()),
                 reason: crate::observability::daemon_lifecycle::StartReason::Roll,
             },
@@ -210,10 +210,7 @@ fn daemon_start_maps_to_a_log_with_topic_and_typed_payload_fields() {
         value("loom.payload.start_time_unix_ms"),
         any_value::Value::IntValue(1_785_000_000_123)
     );
-    assert_eq!(
-        string("loom.payload.instance"),
-        "ip-10-0-12-34.us-west-2.compute.internal/1785000000"
-    );
+    assert_eq!(string("loom.payload.instance"), "test-host-a.example.internal/1785000000");
     assert_eq!(string("loom.payload.previous_version"), "0.19.1198");
     assert_eq!(string("loom.payload.start_reason"), "roll");
 }
