@@ -303,6 +303,32 @@ pub fn in_flight_sweep_ids(
     ids
 }
 
+/// The in-flight sweeps with the workspace root each one belongs to (#12876).
+#[must_use]
+pub fn in_flight_sweeps(
+    workspace_pool: &Arc<WorkspacePool>,
+    fallback_root: &Path,
+) -> Vec<crate::host_loss::InFlight> {
+    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let mut out = Vec::new();
+    for root in &workspace_registry.effective_roots(fallback_root) {
+        let registry = workspace_pool.get_or_provision(root);
+        let sr = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        out.extend(
+            sr.list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .map(|info| crate::host_loss::InFlight {
+                    root: root.clone(),
+                    sweep_id: info.sweep_id,
+                }),
+        );
+    }
+    out
+}
+
 /// Cancel every in-flight sweep across all managed roots via the existing
 /// [`SweepRegistry::cancel`] path (Issue #4090, `--force-after-timeout`).
 /// Returns the number cancelled. Blocking cancel is acceptable here: this runs

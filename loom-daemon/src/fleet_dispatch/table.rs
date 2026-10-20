@@ -140,6 +140,11 @@ pub const PROGRESS_OUTCOMES: [&str; 4] = ["verdict", "merged", "moved", "success
 /// ladder, and leaves the streak and the item's other holds alone.
 pub const CI_WAIT_OUTCOME: &str = "ci_wait";
 
+/// The `release` outcome of a step whose host was lost to an EC2 spot
+/// reclaim or rebalance (#12876). Not progress, but not the item's fault
+/// either: the row ends and nothing is held, so the next draw may take it.
+pub const HOST_LOST_OUTCOME: &str = "host_lost";
+
 /// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
 /// the item every ~90 s while CI runs, short enough that its next step is
 /// drawn within minutes of CI finishing.
@@ -691,6 +696,9 @@ impl Table {
             return false;
         };
         let (repo, item) = key;
+        if outcome.trim() == HOST_LOST_OUTCOME {
+            return true;
+        }
         if outcome.trim() == CI_WAIT_OUTCOME {
             let triple = (repo, item, row.step);
             let until = now.plus(self.policy.ci_wait);

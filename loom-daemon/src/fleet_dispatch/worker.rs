@@ -490,6 +490,20 @@ pub fn release(sweep_id: &str, outcome: &str) {
     send_release(&assigned.grant, outcome);
 }
 
+/// This host is being lost (#12876): release every assignment it holds with
+/// `outcome`, so the captain's rows end now instead of at their TTL. Returns
+/// how many releases were sent.
+pub fn release_all(outcome: &str) -> usize {
+    let grants: Vec<Grant> = std::mem::take(&mut state().assignments)
+        .into_values()
+        .map(|a| a.grant)
+        .collect();
+    for grant in &grants {
+        send_release(grant, outcome);
+    }
+    grants.len()
+}
+
 fn send_release(grant: &Grant, outcome: &str) {
     let body = ReleaseRequest {
         host_id: host_id(),
