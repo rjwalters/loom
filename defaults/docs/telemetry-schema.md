@@ -1684,10 +1684,24 @@ mirrored bus event. Exactly one record per daemon process, enqueued by
 `observability::spawn_task` when the exporters come up (never when telemetry
 is disabled), so a fleet-gitops roll is visible in the backend the moment a
 host's daemon restarts onto new config. Its payload is
-`{"version", "revision", "tree_state", "supervisor", "config_sha", "pid"}` —
+`{"version", "revision", "tree_state", "supervisor", "config_sha", "pid",
+"start_time_unix_ms", "instance", "previous_version", "start_reason"}` —
 the exporting build (`provenance::daemon()`), the process supervisor
 (`launchd`/`systemd`, else `none`), the applied fleet-config SHA (the same
 value the resource's `loom.fleet.config_sha` carries), and the pid.
+Since #12942 it also names this process (`start_time_unix_ms`, epoch ms, and
+`instance`, `<host>/<start-epoch-s>`, which groups one process's records;
+`service.instance.id` stays the host) and why it started: `start_reason` is
+`roll` (the previous process exited for an auto-update), `restart` (IPC
+restart or operator drain), `cold` (no earlier process recorded on the host)
+or `unknown` (an earlier process left no exit cause: a crash, SIGKILL, power
+loss, or an exit with no restart intent). `previous_version` is that earlier
+process's crate version, `null` when unknown. Both come from
+`~/.loom/daemon_lifecycle.json` (beside `auto_update_state.json`), which each
+start overwrites and each deliberate exit rewrites with its cause; a missing
+or corrupt file reads as `cold`. A crash loop is more than N `daemon.start`
+per host per hour, and queries 6 and 7 of
+`defaults/observability/signoz/host-export-queries.sql` list and count them.
 `daemon.shutdown` and a heartbeat stay with #10023/#10065; the naming here
 matches that draft so the later of the two is a deletion, not a conflict.
 

@@ -166,7 +166,15 @@ fn the_next_request_carries_a_sha_that_changed_in_process() {
 fn daemon_start_maps_to_a_log_with_topic_and_full_payload() {
     let batch = vec![envelope(
         "host-a",
-        crate::observability::daemon_lifecycle::start_record("systemd"),
+        crate::observability::daemon_lifecycle::start_record(
+            "systemd",
+            &crate::observability::daemon_lifecycle::StartContext {
+                start_time_unix_ms: 0,
+                instance: "host/0".to_string(),
+                previous_version: None,
+                reason: crate::observability::daemon_lifecycle::StartReason::Cold,
+            },
+        ),
     )];
     let logs = build_logs_request(&batch).unwrap();
     let log = &logs.resource_logs[0].scope_logs[0].log_records[0];

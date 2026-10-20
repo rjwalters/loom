@@ -11,7 +11,7 @@
 -- post-reset value, never a negative delta), which stays correct for either
 -- shape.
 --
--- STATUS: queries 1-5 are executed verbatim against the pinned ClickHouse by
+-- STATUS: queries 1-5 are executed verbatim (6-7, #12942, are not replayed yet) against the pinned ClickHouse by
 -- loom-daemon/tests/signoz_host_export_queries.rs (CI runs it with --ignored).
 
 -- 1. Hosts with drops in the last 2 h, worst first. Each host's latest sample
@@ -292,3 +292,45 @@ SELECT host,
        if(le_ns = 0, NULL, fromUnixTimestamp64Nano(le_ns)) AS last_export
 FROM judged
 ORDER BY host;
+
+-- 6. Every daemon start per host over a window, with its version and reason
+--    (Issue #12942). One row per `daemon.start` record (loom.kind
+--    `daemon.event`, loom.topic `daemon.start`); the fields come from the
+--    record's `loom.payload` JSON. `start_reason` is `roll` (auto-update),
+--    `restart` (IPC restart or operator drain), `cold` (first start on the
+--    host) or `unknown`. A crash, SIGKILL or power loss records no exit cause,
+--    so the start that follows reads `unknown`: an `unknown` start with no
+--    `daemon.exit` before it is the crash signal. `previous_version` is empty
+--    when the host had no earlier state. Change the 24 HOUR window as needed.
+SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
+       fromUnixTimestamp64Nano(toInt64(timestamp)) AS started_at,
+       JSONExtractString(attributes_string['loom.payload'], 'version') AS version,
+       JSONExtractString(attributes_string['loom.payload'], 'previous_version') AS previous_version,
+       JSONExtractString(attributes_string['loom.payload'], 'start_reason') AS start_reason,
+       JSONExtractString(attributes_string['loom.payload'], 'instance') AS instance
+FROM signoz_logs.distributed_logs_v2
+WHERE attributes_string['loom.kind'] = 'daemon.event'
+  AND attributes_string['loom.topic'] = 'daemon.start'
+  AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 24 HOUR)
+ORDER BY host, started_at DESC;
+
+-- 7. Daemon starts per host per hour, crash loops flagged (Issue #12942). A
+--    host is `crash_loop` in an hour with more than `max_starts_per_hour`
+--    starts (edit the constant; 3 by default). `unknown_starts` counts the
+--    starts whose predecessor left no exit cause, the crash-shaped ones, so a
+--    burst of deliberate rolls (`roll_starts`, `restart_starts`) is told apart
+--    from a loop.
+WITH 3 AS max_starts_per_hour
+SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
+       toStartOfHour(fromUnixTimestamp64Nano(toInt64(timestamp))) AS hour,
+       count() AS starts,
+       countIf(JSONExtractString(attributes_string['loom.payload'], 'start_reason') = 'roll') AS roll_starts,
+       countIf(JSONExtractString(attributes_string['loom.payload'], 'start_reason') = 'restart') AS restart_starts,
+       countIf(JSONExtractString(attributes_string['loom.payload'], 'start_reason') = 'unknown') AS unknown_starts,
+       starts > max_starts_per_hour AS crash_loop
+FROM signoz_logs.distributed_logs_v2
+WHERE attributes_string['loom.kind'] = 'daemon.event'
+  AND attributes_string['loom.topic'] = 'daemon.start'
+  AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 24 HOUR)
+GROUP BY host, hour
+ORDER BY hour DESC, starts DESC, host;
