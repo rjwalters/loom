@@ -237,6 +237,15 @@ impl TickWorklist {
         }
     }
 
+    /// The repos the worklist carries (lowercase slugs); empty with no
+    /// worklist.
+    #[must_use]
+    pub fn slugs(&self) -> Vec<String> {
+        self.worklist
+            .as_ref()
+            .map_or_else(Vec::new, |w| w.repos.keys().cloned().collect())
+    }
+
     /// `ok`, `not_modified` or `error`.
     #[must_use]
     pub fn outcome(&self) -> &'static str {

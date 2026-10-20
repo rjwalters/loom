@@ -17,6 +17,8 @@
 //! - [`identity`]: remote address → tailnet node (LocalAPI `whois`).
 //! - [`roster`]: tailnet node → fleet `host_id`, and each host's cap, from the
 //!   fleet store's `fleet.json`.
+//! - [`queue`]: the fleet queue, classified from the mirror's worklist, with
+//!   refresh and tombstones, pure (#12816).
 //! - [`server`]: `loom-daemon fleet-dispatch serve`.
 //! - [`telemetry`]: the `loom.fleet_dispatch.call` span and the captain's
 //!   counters.
@@ -25,6 +27,7 @@ pub mod client;
 pub mod fallback;
 pub mod identity;
 pub mod proto;
+pub mod queue;
 pub mod roster;
 pub mod server;
 pub mod table;

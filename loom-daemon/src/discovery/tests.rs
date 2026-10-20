@@ -908,6 +908,13 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         "step_dispatch/gather.rs",
         "work_finder.rs",
         "work_finder/tick_report.rs",
+        // The captain's fleet queue reads the worklist/change stream only; it
+        // makes no claim, label-transition or merge read (invariant 3).
+        "fleet_dispatch/queue.rs",
+        "fleet_dispatch/queue_tests.rs",
+        "fleet_dispatch/server.rs",
+        // Server refusal regressions seed discovery fixtures; no live snapshot read.
+        "fleet_dispatch/server_tests.rs",
     ]
     .iter()
     .map(|s| (*s).to_string())
