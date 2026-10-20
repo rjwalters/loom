@@ -9,6 +9,7 @@
 use super::*;
 use crate::tokens_pool::account_lifecycle::{AccountLifecycle, ProcessCodexRunner};
 use crate::tokens_pool::account_registry::{account_inventory, AccountDescriptor, AccountProvider};
+use crate::tokens_pool::docker_cli;
 use crate::tokens_pool::profile_root_env::ProfileRootEnv;
 use crate::tokens_pool::session_hold::{self, OperatorHeld};
 use crate::tokens_pool::session_lifecycle::container_name;
@@ -37,6 +38,8 @@ struct Engine {
     profile: PathBuf,
     /// `docker start` leaves the container stopped (its process exits at once).
     start_dies: bool,
+    /// `docker start` hits its deadline (a wedged engine).
+    start_times_out: bool,
     calls: Vec<Vec<String>>,
     created: u32,
 }
@@ -130,6 +133,11 @@ impl Engine {
                     bail!("Docker image failed (exit status: 1)")
                 }
             }
+            ["start", _] if self.start_times_out => Err(docker_cli::DockerTimedOut {
+                subcommand: "start".into(),
+                secs: docker_cli::DOCKER_CALL_TIMEOUT.as_secs(),
+            }
+            .into()),
             ["start", container] => {
                 let state = self
                     .containers
@@ -814,4 +822,24 @@ fn an_operator_stop_holds_the_account_down_until_an_operator_start_lifts_it() {
     let error = env.recover(Some(IMAGE)).unwrap_err();
     assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
     assert_eq!(env.mutations(), Vec::<String>::new());
+}
+
+#[test]
+#[serial]
+fn a_wedged_start_surfaces_the_typed_timeout_and_releases_the_lease() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, false);
+    env.engine.borrow_mut().start_times_out = true;
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    // The reconcile pass keys on this type to end the pass as Docker-unavailable.
+    assert!(error.downcast_ref::<docker_cli::DockerTimedOut>().is_some(), "{error:#}");
+    // The flock went with the failed recovery; the account is not wedged.
+    drop(lease::Lease::acquire(&env.dir).unwrap());
+}
+
+#[test]
+fn long_execs_keep_a_budget_beyond_the_quick_call_default() {
+    assert!(docker::EXEC_TIMEOUT > docker_cli::timeout_for(&["exec"]));
+    assert_eq!(docker_cli::timeout_for(&["start", "c"]), docker_cli::DOCKER_CALL_TIMEOUT);
 }
