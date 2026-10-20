@@ -297,6 +297,16 @@ pub fn scan_lines(
     max_line: u64,
     mut visit: impl FnMut(&[u8]) -> bool,
 ) -> io::Result<u64> {
+    scan_lines_at(path, from, max_line, |_, line| visit(line))
+}
+
+/// [`scan_lines`] that also hands `visit` each line's starting byte offset.
+pub fn scan_lines_at(
+    path: &Path,
+    from: u64,
+    max_line: u64,
+    mut visit: impl FnMut(u64, &[u8]) -> bool,
+) -> io::Result<u64> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(from),
@@ -327,7 +337,7 @@ pub fn scan_lines(
             offset += read + rest;
             continue;
         }
-        if !visit(&line[..line.len() - 1]) {
+        if !visit(offset, &line[..line.len() - 1]) {
             break;
         }
         offset += read;
