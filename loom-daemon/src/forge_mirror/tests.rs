@@ -263,6 +263,11 @@ fn only_the_discovery_and_wake_modules_name_the_mirror() {
         "fleet_dispatch/queue.rs",
         "fleet_dispatch/queue_tests.rs",
         "fleet_dispatch/server.rs",
+        // `serve` reads the mirror key to start that feed, and the feed's tests
+        // drive a loopback mirror; neither makes a claim, label-transition or
+        // merge read.
+        "cli/fleet_dispatch_cmd.rs",
+        "fleet_dispatch/server_tests.rs",
     ]
     .iter()
     .map(|s| (*s).to_string())
