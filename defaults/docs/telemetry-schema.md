@@ -972,6 +972,31 @@ and join them to `loom.tokens_in` / `loom.lines_added` /
 `loom.total_duration_sec` on the same record. Not added to the public
 redaction allowlist, for the same reason as the fields above.
 
+**The step path (#12957).** The step engine exports the same fact under the
+same key and the same rules, so step duration and load can be read by size:
+
+- **`loom.dispatch.step`** carries `loom.story_points` on every attempt
+  (spawned or refused) of a sized item. An issue step (Curator, Builder,
+  Champion promote) reads its issue's label; a PR step (Judge, Doctor,
+  Champion) reads the label of the open issue the PR closes: its lowest
+  `Closes #N` link or Builder branch, the issue the classifier joins it to.
+  A PR that links only by `Part of`, an unsized issue, or a defective label
+  (logged at `warn` once per issue, then at `debug`) carries no key.
+- **The step's `loom.sweep` close** (#12253) carries the same
+  `loom.story_points` the step was spawned with, so step duration by
+  `(loom.role, loom.story_points)` is one query.
+- **`loom.dispatch.running_by_points{role, pool="step", points}`** counts live
+  steps per class (below, in the metric table).
+- **The tick's queue rows** (`step_dispatch/tick.rs`) carry `story_points`,
+  so the per-disposition rows carry size as the issue-sweep path's do.
+
+Every one comes from the labels the step tick's listing already returned
+(`work_finder::step_item::classify` reads `IssueInput.labels`): **no forge
+call** was added. They are facts only: the draw, slot budgets and step
+timeouts do not read them. The points ride the spawn request into the
+registry in memory, so a step this daemon did not spawn (adopted after a
+restart) closes without the key and counts as `unsized`.
+
 #### `disposition` — what the sweep actually DID (Issue #9441)
 
 `result` answers "did the process end well?", which is not the question a
@@ -1811,6 +1836,7 @@ Every other name is a **`Gauge`**:
 | `loom.dispatch.idle_slots` | count | every work-finder tick with an occupancy reading |
 | `loom.dispatch.busy_slots` (`role`), `loom.dispatch.role_max_concurrent`, `loom.dispatch.role_idle_slots` | count | every work-finder tick |
 | `loom.dispatch.running_oldest_age_sec` (`role`, `pool="step"`), `loom.dispatch.running_by_age` (`role`, `pool="step"`, `age`), #12873 | seconds, count | every work-finder tick (default 60 s) once a registry has published its steps; the oldest age only for a role with a live step |
+| `loom.dispatch.running_by_points` (`role`, `pool="step"`, `points`), #12957 | count | every work-finder tick (default 60 s) once a registry has published its steps, `0` included |
 
 `loom.queue.issues` (Issue #8852, phase 2) is the ready-queue depth. It has
 one point per queue disposition, labelled `state` (`running`, `ready`,
@@ -1900,6 +1926,7 @@ resource `host.id`), never labelled by issue:
 | `loom.dispatch.role_idle_slots` | `Gauge` | `{slot}` | — | `role_max_concurrent − Σ busy_slots{role≠"sweep"}`, floored at `0`. The host's agent capacity is `max_concurrent + role_max_concurrent` = `Σ busy_slots + idle_slots + role_idle_slots` |
 | `loom.dispatch.running_oldest_age_sec` | `Gauge` | `s` | `role` (a step role name), `pool="step"` | seconds since the oldest live step of that role started (its registry entry's `started_at`), at the tick (#12873). **No point** for a role with no live step (never `0`). A roll-resumed step's age restarts at the resume. Issue sweeps (`role="sweep"`) and role-runner agents have no age series |
 | `loom.dispatch.running_by_age` | `Gauge` | `{slot}` | `role` (a step role name), `pool="step"`, `age` ∈ `lt_15m`, `15m_1h`, `1h_4h`, `ge_4h` | live steps per running-age bucket (#12873); each edge is an exclusive upper bound (a step exactly 15 min old is `15m_1h`). Every step role × bucket reports, `0` included, once any registry has published (the `busy_slots{pool="step"}` rule), so `Σ_age running_by_age{role}` = `busy_slots{role, pool="step"}`. A start ahead of the host clock reads age `0`. At most 5 roles × 5 series per host |
+| `loom.dispatch.running_by_points` | `Gauge` | `{slot}` | `role` (a step role name), `pool="step"`, `points` ∈ `1`, `2`, `3`, `5`, `8`, `13`, `unsized` | live steps per story-point class (#12957), from the points each step was spawned with (`loom.story_points`, above). A **count by class, never a sum of points**: points are ordinal (#11669). Every step role × class reports, `0` included, once any registry has published, so `Σ_points running_by_points{role}` = `busy_slots{role, pool="step"}`. `unsized` is an unsized item, a defective label, or a step adopted after a restart. Facts only: nothing reads it to pick or place work. At most 5 roles × 7 series per host |
 | `loom.forge.hold_items` | `Gauge` | `{item}` | `repo`, `artifact` (`issue` \| `pr`), `hold`, `basis` (`labels_at` \| `unknown`) | open items carrying a hold or park label (#12038), counted under each hold label they carry (an item with two is counted twice). `basis=labels_at` items have a known hold start; `basis=unknown` items do not and are left out of `loom.forge.hold_age_seconds` |
 | `loom.forge.hold_age_seconds` | `Gauge` | `s` | `repo`, `artifact`, `hold`, `stat` (`oldest` \| `p50` \| `p90`) | seconds since the hold label was last applied (#12038), nearest-rank over the `basis=labels_at` items of that `(repo, artifact, hold)`; absent when none has a known start |
 

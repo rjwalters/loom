@@ -893,6 +893,12 @@ pub struct SweepRegistry {
     /// about, so the refusal logs once rather than every tick. A role leaves
     /// the set when its command file is seen again.
     missing_command_warned: HashSet<&'static str>,
+    /// #12957: each live step's story points, keyed by sweep id, from its
+    /// spawn request: the step's `loom.sweep` close and the
+    /// `running_by_points` gauge read them. In memory only, so a step this
+    /// daemon did not spawn (adopted after a restart) reads as unsized.
+    /// Pruned to the registry's entries on every insert.
+    step_points: HashMap<SweepId, u32>,
 }
 
 /// Env var restoring the pre-#6322 behavior of publishing this host's RAW
@@ -1111,6 +1117,7 @@ impl SweepRegistry {
             inflight_idempotency: HashMap::new(),
             roll_gate: roll_gate::RollGate::default(),
             missing_command_warned: HashSet::new(),
+            step_points: HashMap::new(),
         };
         registry.restore_step_ledger();
         registry

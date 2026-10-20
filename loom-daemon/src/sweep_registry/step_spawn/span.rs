@@ -15,8 +15,9 @@
 //!
 //! - [`sweep_close`] is the close a step's end records: the same
 //!   `loom.result` its `role_tick.outcome` reports (`success` / `failure`),
-//!   the step's role, and on a failure a [`StepFailure`] class from the closed
-//!   vocabulary below. [`SweepRegistry::end_step`] journals it at the moment
+//!   the step's role, its story points when the item is sized
+//!   (`loom.story_points`, #12957), and on a failure a [`StepFailure`] class
+//!   from the closed vocabulary below. [`SweepRegistry::end_step`] journals it at the moment
 //!   it sees the end. A step a roll stopped closes as `interrupted_by_roll`,
 //!   as a role tick does.
 //! - [`step_still_running`] is what orphan recovery asks before it closes a
@@ -88,7 +89,8 @@ pub(crate) fn step_failure(end: StepEnd, line: Option<&StepOutcomeLine>) -> Role
 
 /// The `loom.result` and close attributes of a step's `loom.sweep` span.
 /// `outcome` is the tick outcome the step's `role_tick.outcome` reports
-/// ([`super::capture::tick_outcome`]), so the two agree. Pure.
+/// ([`super::capture::tick_outcome`]), so the two agree. `story_points` are
+/// the step's spawn-time points (#12957), absent when unsized. Pure.
 #[must_use]
 pub(crate) fn sweep_close(
     end: StepEnd,
@@ -97,6 +99,7 @@ pub(crate) fn sweep_close(
     role: StepRole,
     model: Option<&str>,
     effort: Option<&str>,
+    story_points: Option<u32>,
 ) -> (String, TraceAttributes) {
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let result = crate::role_tick_telemetry::result_label(result);
@@ -105,6 +108,12 @@ pub(crate) fn sweep_close(
         if let Some(value) = value.filter(|v| !v.is_empty()) {
             close.insert(key.into(), value.to_owned());
         }
+    }
+    if let Some(points) = story_points {
+        close.insert(
+            crate::observability::ops::dispatch_step::STORY_POINTS.into(),
+            points.to_string(),
+        );
     }
     if matches!(outcome, RoleTickOutcome::Failure(_)) {
         close.extend(step_failure(end, line).attributes());
