@@ -852,7 +852,7 @@ fn an_inactive_mirror_falls_to_the_next_tier() {
     assert_eq!(snap.stats().worklist_error_class, Some("transport"));
 }
 
-/// The snapshot answers `ReadKind::Discovery` only (`poll_gate` invariant 3):
+/// The snapshot answers `ReadKind::Discovery` only (ADR-0021 invariant 3):
 /// no claim, label-transition or merge module names it, so no such decision
 /// can read it. The listing readers that moved onto it (#12307) are named
 /// here; each keeps its write-gating checks (`scan_issue`, `mergeable_of`, PR
@@ -897,6 +897,9 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         "claim_reconciliation/open_pr_listing_tests.rs",
         "observability/queue_blocked.rs",
         "observability/queue_blocked_tests.rs",
+        // The eta.stage_entry producer diffs the published snapshot; no forge call.
+        "observability/stage_entry_fact.rs",
+        "observability/stage_entry_fact_tests.rs",
         "quarantine_reconciliation/listing.rs",
         // The gather concurrency is the Direct backend's alone.
         "step_dispatch/gather_budget.rs",
@@ -905,12 +908,19 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         "step_dispatch/gather.rs",
         "work_finder.rs",
         "work_finder/tick_report.rs",
+        // The captain's fleet queue reads the worklist/change stream only; it
+        // makes no claim, label-transition or merge read (invariant 3).
+        "fleet_dispatch/queue.rs",
+        "fleet_dispatch/queue_tests.rs",
+        "fleet_dispatch/server.rs",
+        // Server refusal regressions seed discovery fixtures; no live snapshot read.
+        "fleet_dispatch/server_tests.rs",
     ]
     .iter()
     .map(|s| (*s).to_string())
     .collect();
     assert_eq!(
         users, expected,
-        "a new snapshot reader needs review against poll_gate invariant 3"
+        "a new snapshot reader needs review against ADR-0021 invariant 3"
     );
 }

@@ -42,6 +42,7 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("pick.decision", None),
     ("eta.dispatch_eligibility", None),
     ("eta.stage_occupancy", None),
+    ("eta.stage_entry", None),
     ("pr.resolved", None),
     ("eta.stage_outcome", None),
     ("pass.summary", None),

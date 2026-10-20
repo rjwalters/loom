@@ -35,35 +35,19 @@ const GUARDED_ENV: [&str; 8] = [
     "LOOM_CODEX_PROFILE_ROOT",
 ];
 
-/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+/// The shared env guard plus the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock
+/// (#9964). Field order matters: the env is restored before the lock is released.
 struct EnvGuard(
-    Vec<(&'static str, Option<String>)>,
+    #[allow(dead_code)] crate::env_test_support::EnvGuard,
     #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
 );
 
 impl EnvGuard {
     fn new(profile_root: &Path) -> Self {
         let lock = crate::tokens_pool::profile_root_env::lock();
-        let prior = GUARDED_ENV
-            .iter()
-            .map(|key| (*key, std::env::var(key).ok()))
-            .collect();
-        for key in GUARDED_ENV {
-            std::env::remove_var(key);
-        }
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
-        Self(prior, lock)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.0.drain(..) {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
+        let env = crate::env_test_support::EnvGuard::clear(&GUARDED_ENV)
+            .and_set("LOOM_CODEX_PROFILE_ROOT", Some(profile_root.as_os_str()));
+        Self(env, lock)
     }
 }
 

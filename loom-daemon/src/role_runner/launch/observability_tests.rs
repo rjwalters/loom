@@ -20,26 +20,7 @@ const KEYS: &[&str] = &[
     "OTEL_EXPORTER_OTLP_ENDPOINT",
 ];
 
-struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-impl EnvGuard {
-    fn clear() -> Self {
-        let previous = KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
-        for key in KEYS {
-            std::env::remove_var(key);
-        }
-        Self(previous)
-    }
-}
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
+use crate::env_test_support::EnvGuard;
 
 /// A workspace with Loom's own OTLP tracing on (so the tick opens its
 /// `loom.role_attempt` root) and the Claude Code opt-in set to `telemetry`.
@@ -80,7 +61,7 @@ fn get<'a>(env: &'a [(String, Option<String>)], name: &str) -> Option<&'a Option
 #[test]
 #[serial_test::serial]
 fn role_launch_carries_telemetry_env_with_its_traceparent_when_on() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(KEYS);
     let dir = root(true);
     let env = launch_env(dir.path(), "judge");
     assert_eq!(get(&env, "CLAUDE_CODE_ENABLE_TELEMETRY"), Some(&Some("1".into())));
@@ -105,7 +86,7 @@ fn role_launch_carries_telemetry_env_with_its_traceparent_when_on() {
 #[test]
 #[serial_test::serial]
 fn role_launch_carries_no_managed_env_when_off() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(KEYS);
     // An ambient value on the daemon must not reach the child.
     std::env::set_var("CLAUDE_CODE_ENABLE_TELEMETRY", "1");
     std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318");

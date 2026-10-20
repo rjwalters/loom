@@ -72,6 +72,11 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // #12827: `loom.queue.host_shard{shard_count}`, the host's configured
     // shard count (one fixed value per host, so it adds no series).
     "shard_count",
+    // #12873: `loom.fleet_dispatch.*` captain gauges' worker `host` (a
+    // roster host id, never worker-supplied text) and
+    // `loom.dispatch.running_by_age`'s `age` bucket (a closed set of four).
+    "host",
+    "age",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -194,6 +199,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.claim_exit_code",
     "loom.dispatch.claim_ms",
     "loom.dispatch.claim_stderr_tail",
+    // A refused Builder claim's rollback (Issue #12822).
+    "loom.dispatch.claim_rollback",
     // `loom.dispatch.disposition` spans (Issue #9222).
     "loom.queue.disposition",
     "loom.queue.state",
@@ -316,9 +323,14 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fleet_dispatch.hold_rung",
     "loom.fleet_dispatch.hold_set_by_outcome",
     "loom.fleet_dispatch.hold_set_by_assignment_id",
+    "loom.fleet_dispatch.holder_assignment_id",
     "loom.dispatch.held_by",
     "loom.dispatch.retry_after_s",
     "loom.dispatch.hold_until",
+    // Attempt lineage on a re-granted step (#12875).
+    "loom.dispatch.attempt",
+    "loom.dispatch.prev_assignment_id",
+    "loom.dispatch.prev_end",
     // `reaper.pass` spans (#12461): one worktree-reaper pass over one repo and
     // worktree class — counts, bytes and preserved-by-fixed-reason.
     "loom.reaper.class",
@@ -517,6 +529,14 @@ pub enum MetricName {
     /// Role-runner agent slots idle: the ceiling minus agents in flight.
     #[serde(rename = "loom.dispatch.role_idle_slots")]
     DispatchRoleIdleSlots,
+    /// Seconds the oldest live step of a role has been running, labelled
+    /// `role` and `pool="step"` (#12873). No point for a role with none.
+    #[serde(rename = "loom.dispatch.running_oldest_age_sec")]
+    DispatchRunningOldestAgeSec,
+    /// Live steps per running-age bucket, labelled `role`, `pool="step"`
+    /// and `age` (`lt_15m` / `15m_1h` / `1h_4h` / `ge_4h`), #12873.
+    #[serde(rename = "loom.dispatch.running_by_age")]
+    DispatchRunningByAge,
     /// Items the step tick could draw (weight > 0, after the live claims),
     /// labelled `repo`, sampled every work-finder tick (#11909).
     #[serde(rename = "loom.step.actionable")]
@@ -690,6 +710,20 @@ pub enum MetricName {
     /// `claim_lost`): the split-brain and attended-claim measure.
     #[serde(rename = "loom.fleet_dispatch.claim_lost_after_grant")]
     FleetDispatchClaimLostAfterGrant,
+    /// The captain's rows by `state` (`granted` / `live` per `host`; `held`
+    /// with no host), sampled every server sweep (#12873).
+    #[serde(rename = "loom.fleet_dispatch.rows")]
+    FleetDispatchRows,
+    /// Free slots a host reported in its last fresh heartbeat, by `host`.
+    #[serde(rename = "loom.fleet_dispatch.free_slots_reported")]
+    FleetDispatchFreeSlotsReported,
+    /// Steps a host listed in its last fresh heartbeat, by `host`.
+    #[serde(rename = "loom.fleet_dispatch.live_reported")]
+    FleetDispatchLiveReported,
+    /// Seconds the oldest step in a host's last fresh heartbeat has been
+    /// running, by `host`; no point when the heartbeat carried no start.
+    #[serde(rename = "loom.fleet_dispatch.oldest_live_age_sec")]
+    FleetDispatchOldestLiveAgeSec,
     // ---- CI telemetry poller cycles (Issue #12793) ------------------------
     /// CI telemetry poll cycles finished since the previous point, by
     /// `outcome` (`ok`, `busy`, `backing_off`, `rate_limited`,
@@ -763,6 +797,8 @@ impl MetricName {
             Self::DispatchBusySlots => "loom.dispatch.busy_slots",
             Self::DispatchRoleMaxConcurrent => "loom.dispatch.role_max_concurrent",
             Self::DispatchRoleIdleSlots => "loom.dispatch.role_idle_slots",
+            Self::DispatchRunningOldestAgeSec => "loom.dispatch.running_oldest_age_sec",
+            Self::DispatchRunningByAge => "loom.dispatch.running_by_age",
             Self::StepActionable => "loom.step.actionable",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
             Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
@@ -806,6 +842,10 @@ impl MetricName {
             Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
             Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
             Self::FleetDispatchClaimLostAfterGrant => "loom.fleet_dispatch.claim_lost_after_grant",
+            Self::FleetDispatchRows => "loom.fleet_dispatch.rows",
+            Self::FleetDispatchFreeSlotsReported => "loom.fleet_dispatch.free_slots_reported",
+            Self::FleetDispatchLiveReported => "loom.fleet_dispatch.live_reported",
+            Self::FleetDispatchOldestLiveAgeSec => "loom.fleet_dispatch.oldest_live_age_sec",
         }
     }
 
@@ -889,7 +929,12 @@ impl MetricName {
             | Self::DispatchIdleSlots
             | Self::DispatchBusySlots
             | Self::DispatchRoleMaxConcurrent
-            | Self::DispatchRoleIdleSlots => "{slot}",
+            | Self::DispatchRoleIdleSlots
+            | Self::DispatchRunningByAge
+            | Self::FleetDispatchFreeSlotsReported => "{slot}",
+            Self::DispatchRunningOldestAgeSec | Self::FleetDispatchOldestLiveAgeSec => "s",
+            Self::FleetDispatchRows => "{row}",
+            Self::FleetDispatchLiveReported => "{step}",
             Self::StepActionable => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
@@ -991,6 +1036,10 @@ impl MetricName {
             }
             Self::DispatchRoleMaxConcurrent => "The role-runner concurrent agent ceiling.",
             Self::DispatchRoleIdleSlots => "Role-runner agent slots idle under the ceiling.",
+            Self::DispatchRunningOldestAgeSec => {
+                "Seconds the oldest live step of a role has been running (pool=step)."
+            }
+            Self::DispatchRunningByAge => "Live steps per running-age bucket, by role (pool=step).",
             Self::StepActionable => "Items the step tick could draw this tick, per repo.",
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
@@ -1082,6 +1131,18 @@ impl MetricName {
             }
             Self::FleetDispatchClaimLostAfterGrant => {
                 "Captain grants whose worker then lost the forge order (claim_lost)."
+            }
+            Self::FleetDispatchRows => {
+                "Captain assignment rows by state (granted / live by host, held fleet-wide)."
+            }
+            Self::FleetDispatchFreeSlotsReported => {
+                "Free slots a worker host reported in its last fresh heartbeat."
+            }
+            Self::FleetDispatchLiveReported => {
+                "Steps a worker host listed in its last fresh heartbeat."
+            }
+            Self::FleetDispatchOldestLiveAgeSec => {
+                "Seconds the oldest step in a worker host's last fresh heartbeat has run."
             }
         }
     }

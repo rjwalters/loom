@@ -467,6 +467,10 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "the lease record of a dispatched sweep or step (moved from guards.rs, #11898)"),
         ),
         (
+            "sweep_registry/step_spawn/builder_rollback.rs",
+            Via(DISPATCH, "yields the lease + restores the label of a refused dispatched Builder step (#12822)"),
+        ),
+        (
             "sweep_registry/dispatch/claim_release.rs",
             Via(DISPATCH, "releases the claim of a dispatched sweep found closed post-flip (#11304)"),
         ),
@@ -677,6 +681,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "fleet_dispatch/server.rs",
             NotAWrite("HTTP method check in the captain's claim-arbiter listener"),
+        ),
+        (
+            "host_loss/imds.rs",
+            NotAWrite("IMDSv2 token `PUT` to the link-local metadata endpoint, not the forge"),
         ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

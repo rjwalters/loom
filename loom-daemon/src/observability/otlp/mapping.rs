@@ -33,6 +33,7 @@ mod roster_change;
 mod run_state_request;
 mod scope_memory;
 mod session_output;
+mod stage_entry;
 mod stage_occupancy;
 mod token_ranking;
 mod tokens_snapshot;
@@ -602,6 +603,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::OperatorPresence(_)
         | TelemetryRecord::DispatchEligibility(_)
         | TelemetryRecord::StageOccupancy(_)
+        | TelemetryRecord::StageEntry(_)
         | TelemetryRecord::CheckoutFreshness(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
@@ -626,6 +628,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| operator_presence::log_parts(r))
                 .or_else(|| dispatch_eligibility::log_parts(r))
                 .or_else(|| stage_occupancy::log_parts(r))
+                .or_else(|| stage_entry::log_parts(r))
                 .or_else(|| checkout_freshness::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);

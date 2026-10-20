@@ -168,6 +168,9 @@ pub mod auto_update_tick;
 /// eligibility boundary.
 pub mod dispatch_eligibility;
 
+/// `eta.stage_entry` (#12869) — an item's observed arrival in a pipeline
+/// stage, diffed from the discovery snapshot.
+pub mod stage_entry;
 /// `eta.stage_occupancy` (#12866) — per-repo, per-stage gauge of the items
 /// still waiting in a pre-ready stage (count, oldest age, age buckets).
 pub mod stage_occupancy;
@@ -586,6 +589,13 @@ macro_rules! telemetry_kind_table {
             /// rollup — the still-waiting population `eta.stage_outcome` (exit
             /// only) cannot see. OTLP-only. See [`stage_occupancy`].
             StageOccupancy = "eta.stage_occupancy" => $crate::telemetry::kinds::stage_occupancy::StageOccupancyRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One item's observed arrival in a pipeline stage (Issue #12869),
+            /// diffed from the step driver's per-tick discovery snapshot:
+            /// the arrival (inflow) fact `eta.stage_outcome`'s reconstructed
+            /// `entered_at` could not give. OTLP-only. See [`stage_entry`].
+            StageEntry = "eta.stage_entry" => $crate::telemetry::kinds::stage_entry::StageEntryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
