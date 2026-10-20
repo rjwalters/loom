@@ -712,6 +712,7 @@ impl SweepRegistry {
         self.start_step_lease_renewal(item, role, &sweep_id, pid, &log_path);
         self.publish_step_slots();
         self.emit_dispatch(&sweep_id, &launch.admission, None, None);
+        self.emit_step_work_started(&sweep_id, item, role);
         // A named account proves the role's pool works again (#11909).
         if token_name != crate::sweep_registry::UNKNOWN_TOKEN_NAME {
             self.clear_role_tick_pool_exhausted(role.role_name());

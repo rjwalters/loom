@@ -4069,6 +4069,13 @@ splits into **queue wait** (`entered_at` → `started_at`) and **work time**
   `started_at` is when the agent issued that write, normally its claim label.
   Recorded only when the journal exists (an OTLP exporter runs) and the
   agent's `gh` reaches the agent `gh` front.
+- **A step spawn** (`source: step`, #12904). An issue-acting Builder
+  (`sweep.builder`) or Curator (`sweep.curator`) step whose claim was accepted
+  and whose child launched; `started_at` is the spawn instant. A `sweep.builder`
+  start with `source=step` is the **`ready_wait` exit** (the `loom:issue` →
+  `loom:building` claim). A refused or unwound claim emits nothing, and lease
+  renewal and adoption do not re-emit. PR-acting steps and `ChampionPromote`
+  emit none here (the role tick owns the former).
 
 | Field | Type | Notes |
 |---|---|---|
@@ -4082,7 +4089,7 @@ splits into **queue wait** (`entered_at` → `started_at`) and **work time**
 | `stage_attempt` | integer | 1-based count of this `stage`'s starts within this `sweep_id` (a Doctor loop re-enters `review_wait`); `1` for a role tick |
 | `dispatch_origin` | string? | a sweep's [`dispatch_origin`](#sweepstarted), or `role_runner`. Absent for a sweep this daemon did not dispatch |
 | `started_at` | RFC 3339 | when the agent began (the log record's time) |
-| `source` | string | `sweep_dispatch`, `sweep_checkpoint`, `sweep_observed`, `role_act` |
+| `source` | string | `sweep_dispatch`, `sweep_checkpoint`, `sweep_observed`, `role_act`, `step` |
 | `observed_at` | RFC 3339 | when this daemon emitted it (knowable-at; the log's observed time) |
 | `loom` | object | the emitting build's provenance (required; a record with invalid provenance is not exported) |
 
