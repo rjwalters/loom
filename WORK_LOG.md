@@ -16,6 +16,49 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-20
 
+- **PR #12901**: fix: skip redrawing a Champion-held PR at its recorded hold head
+- **PR #12847**: refactor: remove fleet singleton-output watchdog and intake pass heartbeat
+- **PR #12837**: refactor(daemon): share human_size and newest_mtime_and_size across reclaim modules
+- **PR #12857**: fix: retry release metadata reads and log why they failed
+- **PR #12839**: feat(fleet-dispatch): add the captain's fleet queue with refresh and tombstones
+- **PR #12896**: feat(telemetry): emit eta.stage_entry arrivals diffed from the discovery snapshot
+- **PR #12890**: feat(observability): stamp host CPU count, load and CPU budget on sweep/phase spans
+- **PR #12893**: refactor(loom-daemon): share one test EnvGuard across 14 duplicated copies
+- **PR #12894**: feat(telemetry): captain expiry span and dispatch attempt lineage
+- **PR #12832**: refactor: remove unused keyset-paging layer from signoz_read
+- **PR #12838**: feat(telemetry): export holder assignment id on held refusal spans
+- **PR #12892**: feat(telemetry): close spans and release captain rows on EC2 spot interruption notices
+- **PR #12824**: fix: roll back a refused Builder step's lease so peers do not yield to it
+- **PR #12850**: refactor: remove the dashboard event-feed client and its wake and poll-gating consumers
+- **PR #12858**: docs: fail-closed engineering principle (#12856)
+- **PR #12887**: feat(telemetry): host shape (CPU count, RAM, arch, instance type) as OTLP resource attributes
+- **PR #12888**: feat(telemetry): export captain row vs reported-live gauges and step running ages
+- **PR #12885**: fix(telemetry): record every workspace draw in pick.decision (#12877)
+- **PR #12871**: fix(fleet-dispatch): the captain applies no capacity limit
+- **PR #12821**: fix(watchdog): make peer-coordination health log-only, no GitHub issue lifecycle
+- **PR #12851**: refactor: share tmpdir and hermetic git helpers in worktree differential tests
+- **Issue #12900** (closed): Don't redraw a Champion-held PR at its held head (no-op champion_merge runs hold the repo's merge slot)
+- **Issue #12845** (closed): Remove the fleet singleton-output watchdog (epic #10916 closed as not planned)
+- **Issue #12784** (closed): Consolidate duplicated human_size / newest_mtime_and_size helpers in loom-daemon
+- **Issue #12849** (closed): auto_update: the floor-roll tick usually can't read a release's asset list, so fleet hosts stay below the floor ('no artifact … asset list could not be read')
+- **Issue #12869** (closed): telemetry: emit a true stage-entry (arrival) fact at label-apply, not reconstructed from forge
+- **Issue #12884** (closed): Telemetry(host contention): load samples at sweep/phase start, in-flight sweep count and applied CPU quota on sweep records
+- **Issue #12853** (closed): Consolidate 15 duplicated EnvGuard test helpers in loom-daemon into one shared guard
+- **Issue #12875** (closed): Telemetry(retries): captain assignment-expiry event + dispatch attempt lineage on loom.dispatch.step
+- **Issue #12756** (closed): Remove unused keyset-paging layer in signoz_read.rs (SignozRead, SqlPages, FileRows, PageQuery)
+- **Issue #12740** (closed): Export the holding assignment id on fleet-dispatch 'held' refusal spans
+- **Issue #12876** (closed): Telemetry(spot): watch EC2 spot interruption/rebalance notices; close spans as interrupted_by_host_loss and release the captain row
+- **Issue #12822** (closed): Builder step refused with claim_lost leaves its loom:building label and lease behind (no builder runs, peers yield)
+- **Issue #12874** (closed): Telemetry(host shape): instance type, CPU count, arch and RAM as OTLP resource attributes
+- **Issue #12873** (closed): Telemetry(slots): export held vs running slots and running-work age (worker + captain), so ETA can tell full hosts from stale claims
+- **Issue #12877** (closed): Telemetry(pick.decision): remove MAX_RECORDED_DRAWS=50 cap on workspace_draw.draws (leftover from #11567)
+- **Issue #12872** (closed): Existing native step spans provide lifecycle correlation; typed reader must consume them
+- **Issue #12880** (closed): Telemetry: record spot reclaims and the retries they cause
+- **Issue #12881** (closed): Telemetry: carry host class and host contention on sweep and stage-outcome records
+- **Issue #12879** (closed): Telemetry: emit per-host running vs claimed slot counts (fix null slots.occupancy on the captain)
+- **Issue #12864** (closed): fleet-dispatch: remove the captain-side cap — the captain offers the next important work; limits are enforced only on the crew node
+- **Issue #12818** (closed): Stop peer-coordination watchdog GitHub issue churn; retain local diagnostics
+- **Issue #12785** (closed): Consolidate duplicated tmpdir and hermetic git helpers in worktree differential tests
 - **Issue #12769** (closed): Stacking follow-ups: retarget-failure flag text, pr.edit-base inventory op, consolidation delete guard, stack-parent fork freshness
 - **PR #12836**: fix(stacking): retry failed orphan retarget alone, inventory pr.edit-base, fetch before fork
 - **Issue #12840** (closed): loom-tools Phase 1: inventory and command contract (CLI boundary and migration map) — epic #12708
