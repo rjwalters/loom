@@ -881,7 +881,8 @@ to a CI workflow is not red on blast radius *because it is a workflow* when
   publish, release, deploy or merge in its name (case-insensitive);
 - every workflow file has a non-empty patch, and no added or removed workflow
   line matches, case-insensitively, the words `permissions`, `secrets`,
-  `publish`, `release`, `deploy` or `merge`, or `id-token`,
+  `publish`, `release`, `deploy` or `merge` (the last four ignore YAML
+  comments), or `id-token`,
   `pull_request_target`, `workflow_run`, `github.token`, `GITHUB_TOKEN`;
 - the PR carries `loom:pr` (criterion #1 has already checked that the approval
   is for this head) and CI is green right now, with at least one passing
@@ -897,7 +898,7 @@ is red.
 # Reads PR_NUMBER, LABELS, KEPT_SET_PATTERNS, read_ci_checks. Always reads the
 # PR's files afresh and checks the list is complete (count == changed_files).
 ci_workflow_blast_eval() {
-  local WF_FILES CHANGED_COUNT f lf pattern LINES_JSON rx rc
+  local WF_FILES CHANGED_COUNT f lf pattern LINES_JSON NOCOMMENT_JSON SCAN_JSON rx rc
   WF_BLAST=red
   WF_BLAST_REASON=""
   [ "${#KEPT_SET_PATTERNS[@]}" -gt 0 ] 2>/dev/null || { WF_BLAST_REASON="kept set not loaded"; return 0; }
@@ -936,9 +937,19 @@ ci_workflow_blast_eval() {
     [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) or (((.previous_filename // "") | ascii_downcase) | startswith(".github/workflows/")))]
     | if all(.[]; ((.patch // "") | length) > 0) then [.[].patch | split("\n")[] | select(test("^[+-]")) | .[1:]] else error("no patch") end' 2>/dev/null) \
     || { WF_BLAST_REASON="a workflow file has no readable patch"; return 0; }
+  # The publish/release/deploy/merge words skip YAML comments (#12934): a
+  # whole-line comment is dropped; a trailing ` #...` is cut only on a line with
+  # no quote at all, so `echo "#release"` and any line not parsed safely stay
+  # scanned whole. Every other regex scans the raw lines.
+  NOCOMMENT_JSON=$(printf '%s' "$LINES_JSON" | jq -c '
+    [.[] | select(test("^\\s*#") | not)
+         | if test("[\"\u0027]") then . elif test("\\s#") then sub("\\s#.*$"; "") else . end]' 2>/dev/null) \
+    || { WF_BLAST_REASON="workflow lines unparseable"; return 0; }
   for rx in '\bpermissions\b' '\bsecrets\b' 'id-token' 'pull_request_target' 'workflow_run' \
     'github\.token' 'github_token' '\b(publish|release|deploy|merge)\b'; do
-    printf '%s' "$LINES_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx; "i"))' >/dev/null 2>&1
+    SCAN_JSON=$LINES_JSON
+    case "$rx" in *publish*) SCAN_JSON=$NOCOMMENT_JSON ;; esac
+    printf '%s' "$SCAN_JSON" | jq -e --arg rx "$rx" 'any(.[]; test($rx; "i"))' >/dev/null 2>&1
     rc=$?
     # rc 1 = no such line; 0 = a hit; anything else = an error. Only 1 passes.
     [ "$rc" -eq 1 ] || { WF_BLAST_REASON="a workflow line matches '$rx'"; return 0; }
