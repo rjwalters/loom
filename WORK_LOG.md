@@ -15,6 +15,21 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-20
 
+- **PR #12962**: Telemetry: story points on the step path (loom.dispatch.step, step loom.sweep close, running_by_points gauge)
+- **PR #12956**: test: pin version-policy guard on stale-base manifest-only PRs
+- **PR #12944**: feat: add process identity and start reason to daemon.start
+- **PR #12779**: feat: restore the retained daemon binary when a rolled candidate fails to start
+- **PR #12777**: feat: recover stopped or missing private Codex sessions in reconcile
+- **PR #12613**: fix: disarm an armed floor roll when the fleet floor is rolled back
+- **PR #12599**: feat: keep operator release conditions binding in Champion's sticky-hold precheck
+- **PR #12354**: feat: report auto-update progress and degrade health when checks or convergence stall
+- **Issue #12964** (closed): CI experiment: kache vs rust-cache target/ caching on one ci.yml job
+- **Issue #12957** (closed): Telemetry: story points on the step path (loom.dispatch.step, step loom.sweep close, running_by_points gauge)
+- **Issue #12949** (closed): merge-pr version-policy guard counts main's version bumps on a stale-base PR (split from #12948)
+- **Issue #12942** (closed): Telemetry: emit a daemon start event and per-process identity (crash-loop / roll-restart counting)
+- **Issue #12776** (closed): Restore retained daemon binary after failed operator or fleet roll
+- **Issue #12610** (closed): auto-update: rolling the fleet floor back doesn't cancel a pause-and-roll already armed (or about to arm) toward the withdrawn version
+- **Issue #12594** (closed): Champion: an operator-named release condition on a held PR is lost when a new head makes Champion re-judge
 - **PR #12898**: refactor: reuse release_resolve::host helpers in daemon_update artifact
 - **PR #12955**: test(telemetry): guard a registered loom.kind against losing its last producer (#12947)
 - **PR #12684**: fix: write merge-driver .gitattributes into the install worktree
