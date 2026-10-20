@@ -1190,7 +1190,7 @@ pub fn spawn_multi_install_self_check_task(
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // #11295: the violations standing after each tick, on loom-ui.
-        let mut ledger = crate::loom_ui_alerts::ledger::Ledger::load(loom_ui::SCOPE);
+        let mut ledger = crate::alerts::ledger::Ledger::load(loom_ui::SCOPE);
         loop {
             ticker.tick().await;
             let (mut standing, mut unknown) = (Vec::new(), BTreeSet::new());

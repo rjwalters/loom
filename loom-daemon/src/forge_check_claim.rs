@@ -41,7 +41,7 @@
 //!
 //! | Exit | Meaning | stdout | What the caller must do |
 //! |---|---|---|---|
-//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` / `MERGED_PR #X` | the token | **Hard-abort the claim.** |
+//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` / `MERGED_PR #X` / `TRIAGE` | the token | **Hard-abort the claim.** |
 //! | [`EX_SAFE_TO_CLAIM`] (1) | verified safe to claim | empty | Claim. |
 //! | [`EX_PROBE_FAILED`] (5) | no verdict — any leg's read failed | empty | **Fail closed.** Treat as blocked; check by hand. |
 //! | [`EX_FORGE_DECLINED`] (3) | Gitea — legs 1–3 are GitHub-only | empty | Check by hand. |
@@ -59,6 +59,11 @@
 //! overridable by `--force-claim`; an unreadable answer exits
 //! [`EX_PROBE_FAILED`]. A PR with a closing keyword is not a blocker: GitHub
 //! closed the issue, so an open one was reopened on purpose.
+//!
+//! `TRIAGE` (#12713) is read off the same snapshot: the issue still carries
+//! `loom:triage`, so Curator has not yet decided it (the landed-route
+//! pre-filter parks a merged-PR issue there). A Builder claim on it is the
+//! no-op loop of #12509. Overridable by `--force-claim`, like a claim label.
 //!
 //! `FROZEN` (#11743) is read off leg 2's label snapshot: the issue carries
 //! `loom:frozen`, which only a human removes. Like `OPEN_PR` it is never
@@ -154,6 +159,9 @@ pub(crate) enum LabelLeg {
     /// Read succeeded and the issue carries the operator hold (#11861): a
     /// human must act, and no role does. Never overridable.
     OperatorHold,
+    /// Read succeeded and the issue carries `loom:triage` (#12713): Curator
+    /// has not decided it yet, so no Builder may claim it.
+    AwaitingCurator,
     /// Read succeeded; no claim label present.
     Clean,
     /// The label read failed (gh missing/failed/unparseable) — NOT evidence
@@ -383,6 +391,16 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
                             .to_string(),
                     );
                 }
+                LabelLeg::AwaitingCurator => {
+                    stop = overridable(
+                        "the issue carries `loom:triage` (#12713): Curator has not decided it \
+                         yet (e.g. a merged `Part of` PR routed it back), so a Builder claim \
+                         would be a no-op build"
+                            .to_string(),
+                        Some("TRIAGE"),
+                        &mut forced_past,
+                    );
+                }
                 LabelLeg::Claimed(claims) => {
                     stop = overridable(
                         format!(
@@ -575,10 +593,15 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
         return LabelLeg::OperatorHold;
     }
     let claims = claim_labels_in(&labels);
-    if claims.is_empty() {
-        LabelLeg::Clean
-    } else {
+    if !claims.is_empty() {
         LabelLeg::Claimed(claims)
+    } else if labels
+        .iter()
+        .any(|l| l == crate::intake_reconcile::TRIAGE_LABEL)
+    {
+        LabelLeg::AwaitingCurator
+    } else {
+        LabelLeg::Clean
     }
 }
 
@@ -961,6 +984,16 @@ mod tests {
             );
             assert_eq!((v.code, v.stdout.as_str()), (0, "OPERATOR"), "force={force}");
         }
+    }
+
+    /// #12713: `loom:triage` means Curator has not decided; a Builder claim is
+    /// refused with the token, and only `--force-claim` buys past it.
+    #[test]
+    fn a_triage_issue_is_blocked_with_the_triage_token_unless_forced() {
+        let ev = evidence(OpenPrProbe::NoneOpen, Some(LabelLeg::AwaitingCurator), None, None);
+        let v = decide(12713, &ev, false);
+        assert_eq!((v.code, v.stdout.as_str()), (0, "TRIAGE"));
+        assert_ne!(decide(12713, &ev, true).stdout, "TRIAGE");
     }
 
     #[test]
@@ -1379,6 +1412,13 @@ mod tests {
             let held = write_exec(dir.path(), &format!("gh-operator-{i}.sh"), &script);
             assert_eq!(read_claim_labels(&held, dir.path(), 42), LabelLeg::OperatorHold, "{hold}");
         }
+        // #12713: `loom:triage` is AwaitingCurator; a claim label wins beside it.
+        let triage = write_exec(
+            dir.path(),
+            "gh-triage.sh",
+            r#"echo '{"labels":[{"name":"loom:triage"},{"name":"loom:issue"}]}'"#,
+        );
+        assert_eq!(read_claim_labels(&triage, dir.path(), 42), LabelLeg::AwaitingCurator);
         let both = write_exec(
             dir.path(),
             "gh-both.sh",

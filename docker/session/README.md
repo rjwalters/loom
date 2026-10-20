@@ -345,6 +345,21 @@ Local-path/SSH remotes and URL credentials are unsupported and fail before
 creation. The account's existing persistent authentication profile remains its
 single refresh owner.
 
+**Several repositories per account (#10795).** The first `--private-clone`
+repository stays at `/workspace/repo` (an existing single-repository volume,
+container and unfinished work are untouched). Repeating `session start
+--private-clone URL [--base B]` while the account is idle *registers* another
+repository; nothing is cloned yet. `session job --repository URL` clones it
+lazily to `/workspace/work/<owner>-<name>-<hash>` (the hash of the canonical
+`host/path` keeps one basename under different owners or hosts apart), as an
+independent Git root on the same account volume. A clone is staged and renamed
+into place only when complete, so an interrupted clone is retried, never
+treated as ready. A repository the fleet roster marks `firewall: true`
+(notebook, corporate) is refused before any clone, and a job for an
+unregistered repository is refused. The account-wide lease still admits one
+job at a time across all of the account's clones. Dispatch admission remains
+primary-repository-only until #10796.
+
 `session job` is the explicit lease-consuming primitive for future dispatch.
 `--kind role|sweep|interactive` shares one exclusion domain. It prepares the
 remote base, optionally selects an issue branch, and runs the supplied command

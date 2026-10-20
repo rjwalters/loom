@@ -22,6 +22,11 @@ Loom spawns AI agents that claim issues, implement features, review PRs, and mer
 
 ## Quick Start
 
+Loom's [operating modes](docs/operating-modes.md) distinguish fleet operation,
+an isolated local daemon, and operator-directed sessions. That document records
+the intended support contract, current gaps in running without a daemon
+installed, and the planned separation of CLI tools from the work engine.
+
 ```bash
 # Clone and install to your repository
 git clone https://github.com/rjwalters/loom
@@ -210,6 +215,7 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
   platform, Linux is the primary fleet-worker platform.
 - Git repository
 - tmux (`brew install tmux`)
+- bash >= 4 (`brew install bash` on macOS; stock macOS ships 3.2)
 - [Claude Code](https://claude.ai/code) for AI agents
 
 ### Install Options

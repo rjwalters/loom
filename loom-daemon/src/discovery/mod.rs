@@ -23,7 +23,7 @@
 //! ([`RepoSnapshot`]); the other listing readers consume it through
 //! [`published`] (#12307). Claim,
 //! lease, label-transition and merge reads stay live
-//! (`forge_events/poll_gate.rs` invariant 3): this module never serves them.
+//! (ADR-0021 invariant 3): this module never serves them.
 
 pub mod chain;
 pub mod direct;
@@ -121,7 +121,12 @@ impl Discovery {
             direct_reads: AtomicU64::new(0),
             reserve_hit: AtomicBool::new(false),
             fallback: self.fallback.clone(),
-            lister: Box::new(direct::read_repo),
+            lister: if chain.is_fleet() {
+                // #12312: on the fleet the `gh` tier runs isolated.
+                Box::new(direct::read_repo_fleet)
+            } else {
+                Box::new(direct::read_repo)
+            },
         }
     }
 }

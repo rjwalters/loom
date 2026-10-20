@@ -291,6 +291,11 @@ pub struct PullMarkers {
     /// ([`crate::champion_hold::doctor_cycle_capped`]).
     #[serde(default)]
     pub doctor_cycle_capped: bool,
+    /// The head SHA the standing hold recorded
+    /// ([`crate::champion_hold::unreleased_hold_head`]); `None` when there is
+    /// no parseable record, or a release signal followed it (fail open).
+    #[serde(default)]
+    pub hold_head: Option<String>,
 }
 
 /// One repository's lanes this tick.
@@ -476,6 +481,11 @@ pub enum PassReason {
     /// forge read (`step_dispatch::gather::hold_ci_pending`), the step path's
     /// copy of the #12003 Judge gate.
     CiPending,
+    /// A Champion-held PR still at the head its hold recorded, with no
+    /// release signal (#12900). The classifier never answers it: the step
+    /// tick's gather applies it (`step_dispatch::gather::hold_at_recorded_head`),
+    /// because a `PullInput` carries no head SHA.
+    HeldAtHead,
 }
 
 impl PassReason {
@@ -497,6 +507,7 @@ impl PassReason {
             Self::NoStage => "no_stage",
             Self::Draft => "draft",
             Self::CiPending => "ci_pending",
+            Self::HeldAtHead => "held_at_head",
         }
     }
 }
@@ -959,6 +970,7 @@ impl PullMarkers {
         Self {
             champion_hold: crate::champion_hold::standing_hold(bodies).is_some(),
             doctor_cycle_capped: crate::champion_hold::doctor_cycle_capped(bodies),
+            hold_head: crate::champion_hold::unreleased_hold_head(bodies),
         }
     }
 }
