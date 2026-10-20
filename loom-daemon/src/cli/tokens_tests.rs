@@ -197,12 +197,16 @@ mod resolve_tokens_pool_dir_for_cli_tests {
         let registry_dir = tempfile::tempdir().unwrap();
         write_registry(&registry_dir.path().join("workspaces.json"), &[unrelated.path()]);
         std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
-        std::env::remove_var(SHARED_TOKENS_DIR_ENV); // default shared dir enabled
+        // Shared dir enabled. The lib's test build has no home-dir default, so
+        // set it explicitly rather than relying on the unset-env fallback.
+        let shared = tempfile::tempdir().unwrap();
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, shared.path());
 
         let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
         assert_eq!(dir, shared_tokens_dir().unwrap());
         assert!(anchored);
 
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
         std::env::remove_var(REGISTRY_PATH_ENV);
     }
 

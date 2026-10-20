@@ -893,10 +893,11 @@ mod tests {
         let gh = tmp.path().join("gh-stub");
         std::fs::write(&gh, "#!/bin/sh\necho main\n").unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("LOOM_FORGE_CALL_STATS_DIR", sink.path());
+        // The lib's test-build sink is off unless this thread opts in.
+        crate::forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
         let a = cons_default_branch(&gh, tmp.path()).unwrap();
         let b = live_base(&gh, tmp.path(), "main").unwrap();
-        std::env::remove_var("LOOM_FORGE_CALL_STATS_DIR");
+        crate::forge_call_stats::set_test_sink_dir(None);
         assert_eq!((a.as_str(), b.as_str()), ("main", "main"));
         let mut text = String::new();
         for e in std::fs::read_dir(sink.path()).unwrap() {
