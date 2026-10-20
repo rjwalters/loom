@@ -81,7 +81,7 @@ The design builds on these and must not duplicate them.
 | Session ledger | `step_dispatch/session_ledger.rs` (#11913) | Soft host affinity: a later step on an item may resume the session that ran there. |
 | Discovery | `discovery/` (#12306, #12311) | One `TickSnapshot` per tick. Mirror tier: one ETagged `GET /v1/mirror/worklist`; gateway and `gh` tiers capped at the backstop pace (`discovery/fallback.rs`). Never serves claim, lease, label or merge reads. |
 | Mirror change stream | `forge_mirror/wake.rs` (#10892) | Pulls `GET /v1/changes` with a persisted per-repo cursor; each change becomes a wake prompt. |
-| Gate-read invariant | `forge_events/poll_gate.rs`, invariants 1–3 | An event is a prompt, not a truth; polling is the floor; reads that gate a decision are never held. |
+| Gate-read invariant | ADR-0021 invariants 1–3 (the `poll_gate` module was removed, #12809) | An event is a prompt, not a truth; polling is the floor; reads that gate a decision are never held. |
 | Forge call purpose | `gh_invocation/purpose.rs` (#12310) | `loom.forge.purpose` = discovery \| gate \| write on every forge call. The measure for this design. |
 | Issue lease | `defaults/docs/lease-record.md`, `defaults/docs/lease-renewal.md` | `<!-- loom:lease host=… sweep=… -->`; liveness is the comment's forge `updated_at`; TTL 15 min (`claim_reconciliation::resolve_lease_ttl_minutes`), renewed about every 5 min. **Four writers**: daemon dispatch, in-session sweeps, `worktree.sh`, hand claims. |
 | Step (PR-phase) lease | `sweep_registry/step_spawn/lease.rs` (#11906, #9401) | `<!-- loom:pr-lease role=… host=… sweep=… step=… -->`: pre-claim, renew while the session lives, reap at step end. |
@@ -317,7 +317,7 @@ All signals go out over OTLP with the daemon's existing exporter, with `loom.rep
 | Signal | Where | Meaning |
 |---|---|---|
 | `loom.fleet_dispatch.call` span, one per call | worker and captain | `host`, endpoint, latency, granted or refused, `reason`, `server_epoch` (Phase 2 adds `queue_age_s` and queue size) |
-| Refusal and hold attributes on the call span (#12707) | worker and captain | `step`, `retry_after_s`, `held_by` (when the captain names a holder), and for a no-progress hold `hold_until` (RFC 3339 UTC wall clock); the captain's span adds `hold_rung`, `hold_set_by_outcome`, `hold_set_by_assignment_id`. A refused `loom.dispatch.step` carries `loom.dispatch.held_by` / `retry_after_s` / `hold_until`. Stable names for ETA queries; key on `reason`, since a hold has no `held_by` |
+| Refusal and hold attributes on the call span (#12707) | worker and captain | `step`, `retry_after_s`, `held_by` (when the captain names a holder), and for a no-progress hold `hold_until` (RFC 3339 UTC wall clock); the captain's span adds `hold_rung`, `hold_set_by_outcome`, `hold_set_by_assignment_id`, and on a live-row `held` refusal `holder_assignment_id` (#12740). A refused `loom.dispatch.step` carries `loom.dispatch.held_by` / `retry_after_s` / `hold_until`. Stable names for ETA queries; key on `reason`, since a hold has no `held_by` |
 | `loom.assignment.id` attribute | the existing `loom.dispatch.step` span | joins assign → pre-check → claim → outcome |
 | `claim_lost` after a grant (**derived**, not a new signal) | captain | the existing refusals counter with `reason=claim_lost`, which only a `refuse` after a grant can carry; the split-brain and attended-claim measure |
 | `loom.fleet_dispatch.refusals` counter | captain | refusals by reason: `claim` refusals and `refuse` tokens |

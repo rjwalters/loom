@@ -118,6 +118,9 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
         if let Some(tail) = &claim.stderr_tail {
             attributes.insert("loom.dispatch.claim_stderr_tail".into(), tail.clone());
         }
+        if let Some(rollback) = claim.rollback {
+            attributes.insert("loom.dispatch.claim_rollback".into(), rollback.to_string());
+        }
     }
     if let Some(id) = step.assignment_id {
         attributes.insert("loom.assignment.id".into(), id.to_string());
@@ -346,6 +349,7 @@ mod tests {
             exit_code: Some(5),
             claim_ms: 1234,
             stderr_tail: Some("gh: rate limited".to_string()),
+            rollback: Some("lease_yielded"),
         };
         let step = StepDispatch {
             claim: Some(&facts),
@@ -358,6 +362,7 @@ mod tests {
         assert_eq!(attr("loom.dispatch.claim_exit_code").as_deref(), Some("5"));
         assert_eq!(attr("loom.dispatch.claim_ms").as_deref(), Some("1234"));
         assert_eq!(attr("loom.dispatch.claim_stderr_tail").as_deref(), Some("gh: rate limited"));
+        assert_eq!(attr("loom.dispatch.claim_rollback").as_deref(), Some("lease_yielded"));
         for key in span.attributes.keys().filter(|k| k.contains("claim_")) {
             assert!(
                 crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
