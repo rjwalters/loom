@@ -667,6 +667,16 @@ fn a_progressing_release_holds_nothing_and_clears_every_hold_on_the_item() {
 }
 
 #[test]
+fn a_host_lost_release_ends_the_row_and_holds_nothing() {
+    let mut t = three_hosts(at(100));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "builder"));
+    assert!(t.release_outcome(at(150), A, &id, HOST_LOST_OUTCOME));
+    assert!(t.row("acme/w", 9).is_none(), "the row ends at once");
+    assert!(t.cooldown(at(150), "acme/w", 9, "builder").is_none(), "no hold armed");
+    granted_id(&t.claim(at(151), B, "acme/w", 9, "builder"));
+}
+
+#[test]
 fn a_release_the_table_does_not_know_arms_nothing() {
     let mut t = three_hosts(at(100));
     let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "builder"));
