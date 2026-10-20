@@ -61,7 +61,8 @@
 //!   `loom:merge-conflict` and ONE comment naming the closed parent and how to
 //!   finish by hand. In rebase mode that is the exact `rebase --onto` + pinned
 //!   push. In merge mode it is NOT a force-push recipe: the remedy conflicts
-//!   with #10771, and the comment says so and points to #12767. The comment
+//!   with #10771, and the comment says Doctor opens a replacement PR
+//!   ([`crate::orphan_replace`], #12767) and points to its recipe. The comment
 //!   carries [`FLAGGED_MARKER_PREFIX`] keyed by the child's head, so the next
 //!   tick does nothing until the head moves.
 //!
@@ -102,6 +103,35 @@ pub const FLAGGED_MARKER_PREFIX: &str = "<!-- loom:orphan-stack flagged";
 
 /// Prefix of the marker on the comment that reports a successful retarget.
 pub const RETARGETED_MARKER_PREFIX: &str = "<!-- loom:orphan-stack retargeted";
+
+/// Prefix of the marker on the comment that records a restack whose push
+/// landed but whose base retarget failed (#12769).
+pub const PUSHED_MARKER_PREFIX: &str = "<!-- loom:orphan-stack pushed";
+
+/// The pushed-but-not-retargeted marker line.
+#[must_use]
+pub fn pushed_marker(parent: u32, old_head: &str, new_head: &str) -> String {
+    format!("{PUSHED_MARKER_PREFIX} parent={parent} old={old_head} new={new_head} -->")
+}
+
+/// If an earlier pass already pushed this child's replay and only its retarget
+/// failed, the head it had before that push. `head` is the child's current
+/// head: a marker counts only while it names it as the pushed head, so a later
+/// push by anyone else retires it.
+///
+/// Without this, the next tick finds the rebased branch no longer descends
+/// from the parent's head and mislabels it a rewritten parent.
+#[must_use]
+pub fn pushed_earlier(bodies: &[String], parent: u32, head: &str) -> Option<String> {
+    let suffix = format!(" new={head} -->");
+    let prefix = format!("{PUSHED_MARKER_PREFIX} parent={parent} old=");
+    bodies.iter().find_map(|b| {
+        b.lines().find_map(|l| {
+            let old = l.trim().strip_prefix(&prefix)?.strip_suffix(&suffix)?;
+            (!old.is_empty() && !old.contains(' ')).then(|| old.to_string())
+        })
+    })
+}
 
 /// The flag label (existing; see `.github/labels.yml`).
 pub const MERGE_CONFLICT: &str = "loom:merge-conflict";
@@ -368,14 +398,14 @@ pub fn flag_comment_body(ctx: &FlagContext<'_>, reason: &FlagReason) -> String {
         // #10771 forbids the rewrite the fix needs; never hand out a
         // force-push recipe as routine in a merge-mode repository.
         FlagReason::MergeMode => format!(
-            "Added `{MERGE_CONFLICT}`. Loom will not fix this automatically: the merge-mode \
-             remedy for a closed stacked parent is tracked in #12767. Until it is settled, a \
-             human decides. One option that needs no force-push is to cherry-pick this PR's \
-             own commits (`{}..{}`) onto a new branch from `{}`, open a new PR from it, and \
-             close this one.\n\n",
+            "Added `{MERGE_CONFLICT}`. Doctor picks this PR up and opens a replacement PR from \
+             `{}` that carries only this PR's own commits (`{}..{}`), then links the two and \
+             closes this one. This branch is never rewritten, and the closed parent's commits \
+             never reach the default branch. The recipe is in `doctor.md`, \"Orphan-stack \
+             replacement\" (#12767).\n\n",
+            ctx.retarget_to.unwrap_or("the default branch"),
             ctx.upstream,
             ctx.head,
-            ctx.retarget_to.unwrap_or("the default branch"),
         ),
         FlagReason::NotLoomBranch => format!(
             "Added `{MERGE_CONFLICT}`. The branch's author needs to move only this PR's own \
@@ -718,17 +748,39 @@ pub fn reconcile_with(
             }
         };
 
-        match restack(repo, child.number, branch, head, &onto, &upstream) {
+        // A branch pushed by an earlier pass whose retarget then failed is
+        // already replayed: only the retarget is retried (#12769).
+        let (old_head, attempt) = match pushed_earlier(&bodies, parent.number, head) {
+            Some(old) => (old, Restack::Done(head.to_string())),
+            None => (head.to_string(), restack(repo, child.number, branch, head, &onto, &upstream)),
+        };
+        let head = old_head.as_str();
+        match attempt {
             Restack::Done(new_head) => {
                 if let Err(e) = forge.retarget(child.number, default_branch) {
-                    // The branch is already published; the next tick finds the
-                    // child still orphaned and replays the (now rebased)
-                    // commits again, which is a no-op change of content.
+                    // The branch is already published. Record that, so the
+                    // next tick retries the retarget alone instead of reading
+                    // the rebased branch as a rewritten parent.
                     log::warn!(
                         "claim_reconciliation (orphan stack): PR #{} restacked onto {onto} but \
                          the retarget to '{default_branch}' failed (retrying next tick): {e}",
                         child.number
                     );
+                    if pushed_earlier(&bodies, parent.number, &new_head).is_none() {
+                        let note = format!(
+                            "{}\nLoom replayed this PR's own commits onto `{default_branch}` and \
+                             pushed `{new_head}`, but could not change its base afterwards. It \
+                             retries the base change on its next pass.",
+                            pushed_marker(parent.number, head, &new_head)
+                        );
+                        if let Err(e) = forge.comment(child.number, &note) {
+                            log::warn!(
+                                "claim_reconciliation (orphan stack): PR #{}: pushed-marker \
+                                 comment failed: {e}",
+                                child.number
+                            );
+                        }
+                    }
                     stats.skipped += 1;
                     continue;
                 }

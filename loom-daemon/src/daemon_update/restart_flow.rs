@@ -13,6 +13,7 @@ use std::process::Command;
 use super::args::Args;
 use super::notice::{self, FinalLine};
 use super::out;
+use super::provision::txn::{self, InstallIdentity, RestoreOutcome};
 use super::relaunch;
 use super::restart::{self, poll_interval, secs_of};
 use super::supervisor::{Detected, Manager};
@@ -38,6 +39,9 @@ pub struct Plan<'a> {
     pub drain_poll_secs: &'a str,
     pub built_commit: &'a str,
     pub final_line: FinalLine<'a>,
+    /// The install this invocation made (destination + identity from its
+    /// record), or `None` when there is nothing to bind a restore to (#12776).
+    pub install: Option<(&'a Path, &'a InstallIdentity)>,
 }
 
 /// Never returns.
@@ -250,7 +254,7 @@ fn launchd_restart(p: &Plan<'_>) -> ! {
             "The freshly-built binary IS provisioned, but the daemon's live status is NOT confirmed (pre-restart pid was {pre_shown})."
         ));
         out::err(&format!("Investigate manually: launchctl print {}", p.sup.launchd_service));
-        exit(7);
+        restore_after_failed_start(p, &pre_restart_pid);
     }
 
     // The restart request is served by the RUNNING (old) binary. A pre-#4077
@@ -405,6 +409,9 @@ fn systemd_restart(p: &Plan<'_>) -> ! {
         // either. Only a genuinely `active` unit on a pid
         // the poll simply failed to observe is left alone — touching that
         // would risk bouncing a healthy daemon.
+        // A restore is only safe once the unit is KNOWN not to be running the
+        // candidate: the self-heal below was attempted and nothing came up.
+        let mut may_restore = false;
         if active_state != "active" {
             out::warn(&format!(
                 "Unit is in a non-running state (ActiveState={}, Result={}) — systemd will NOT auto-relaunch a failed or stopped unit. Self-healing via 'systemctl --user reset-failed {2} && systemctl --user start {2}'.",
@@ -429,6 +436,7 @@ fn systemd_restart(p: &Plan<'_>) -> ! {
             }
 
             out::err("loom-daemon restart FAILED: no new, live MainPID was observed even after 'systemctl --user reset-failed && start'.");
+            may_restore = true;
         } else {
             out::err("loom-daemon restart FAILED: the unit is not confirmed relaunched, yet its ActiveState is 'active' on an unchanged/unobserved pid — refusing to bounce a possibly-healthy daemon.");
         }
@@ -437,6 +445,9 @@ fn systemd_restart(p: &Plan<'_>) -> ! {
             "The freshly-built binary IS provisioned, but the daemon's live status is NOT confirmed (pre-restart pid was {pre_shown})."
         ));
         out::err(&format!("Investigate manually: systemctl --user status {}", p.sup.systemd_unit));
+        if may_restore {
+            restore_after_failed_start(p, &pre_restart_pid);
+        }
         exit(7);
     }
 
@@ -536,6 +547,95 @@ fn pidfile_restart(p: &Plan<'_>) -> ! {
         notice::print_final_installed_line(&p.final_line, p.built_commit);
     }
     exit(start_rc)
+}
+
+/// The exit-7 case (#12776): the candidate was published and the supervisor
+/// did not bring a daemon up on it, even after the self-heal.
+///
+/// Restores the retained previous binary once and starts it once, through the
+/// same supervisor verb the failed attempt already fell back to
+/// (`launchctl kickstart` / `systemctl reset-failed && start`). It never
+/// recurses: whatever happens next is the final outcome.
+///
+/// * restore refused (no install of ours to bind to, record or backup does
+///   not match, `dest` is not our candidate): exit 7, the reason printed,
+///   nothing written.
+/// * restore failed, or the restored binary did not come up: exit 10.
+/// * the restored binary came up: exit 9. The update did NOT take, so this is
+///   never exit 0.
+fn restore_after_failed_start(p: &Plan<'_>, pre_restart_pid: &str) -> ! {
+    let Some((dest, identity)) = p.install else {
+        out::err("Not restoring the previous binary: this run has no install record to bind a restore to (a fresh install, or the record was unusable).");
+        exit(7);
+    };
+    let kept = txn::previous_path(dest);
+    out::warn(&format!(
+        "The candidate never started. Restoring the previous binary from {} (once).",
+        kept.display()
+    ));
+    match txn::restore(dest, identity) {
+        RestoreOutcome::Refused(why) => {
+            out::err(&format!(
+                "Not restoring the previous binary: {why}. {} was left as it was; the previous binary, if any, is still at {}.",
+                dest.display(),
+                kept.display()
+            ));
+            exit(7);
+        }
+        RestoreOutcome::Failed(e) => {
+            out::err(&format!(
+                "RESTORE FAILED: {e}. {} was left untouched and the recovery copy is intact at {}. The host may have no running daemon. To restore by hand: cp -p {} {} && then restart the daemon.",
+                dest.display(),
+                kept.display(),
+                kept.display(),
+                dest.display()
+            ));
+            exit(10);
+        }
+        RestoreOutcome::Restored => {}
+    }
+    out::say(&format!(
+        "Restored {} to the previous binary. Starting it once.",
+        dest.display()
+    ));
+    let (_, _, kickstart_secs, interval) = poll_windows(p, "");
+    let new_pid = match p.manager {
+        Manager::Launchd => {
+            restart::launchctl_kickstart(p.sup);
+            restart::wait_for_new_launchd_pid(
+                p.sup,
+                pre_restart_pid,
+                secs_of(&kickstart_secs),
+                interval,
+            )
+        }
+        _ => {
+            restart::systemd_self_heal(p.sup);
+            restart::wait_for_new_systemd_pid(
+                p.sup,
+                pre_restart_pid,
+                secs_of(&kickstart_secs),
+                interval,
+            )
+        }
+    };
+    match new_pid {
+        Some(pid) => {
+            out::err(&format!(
+                "UPDATE FAILED: the new binary never started. The previous binary was restored and is running (pid {pid}). The recovery copy is still at {}. The host is NOT on the new build.",
+                kept.display()
+            ));
+            exit(9);
+        }
+        None => {
+            out::err(&format!(
+                "RESTORE FAILED: the previous binary was put back at {} but no live daemon was observed within {kickstart_secs}s. The recovery copy is still at {}. Start the daemon by hand and investigate.",
+                dest.display(),
+                kept.display()
+            ));
+            exit(10);
+        }
+    }
 }
 
 fn none_or_unknown(value: &str) -> &str {

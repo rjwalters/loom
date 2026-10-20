@@ -122,6 +122,47 @@ fn only_the_blocked_park<L: AsRef<str>>(labels: &[L]) -> bool {
         })
 }
 
+/// Whether a trusted comment is an operator release of a hold: it *starts*
+/// with one of the instructions `champion-pr-merge.md` ("Sticky holds") names,
+/// or with the `loom:release-condition-met` marker that closes an operator
+/// release condition (#12594) — a held-at-head PR must be redrawn so Champion
+/// re-reads the condition. Phrasing that merely mentions them does not match.
+fn is_operator_release(comment: &str) -> bool {
+    let c = comment.trim_start().to_ascii_lowercase();
+    [
+        "clear the hold",
+        "cleared:",
+        "override:",
+        "merge anyway",
+        "ok to merge",
+        "<!-- loom:release-condition-met -->",
+    ]
+    .iter()
+    .any(|p| c.starts_with(p))
+}
+
+/// The head SHA a Champion hold recorded (`champion:hold-state head=<sha>`),
+/// while nothing has released it (#12900). `trusted` is the PR's trusted
+/// comment bodies, oldest first. `None` when no comment records a head, or
+/// when a comment after the newest record is a release signal: a trusted
+/// operator release ([`is_operator_release`]) or a Judge verdict
+/// ([`crate::claim_reconciliation::VERDICT_MARKER_PREFIX`]). Either means the
+/// hold should be re-read at the same head, so the caller draws it again.
+#[must_use]
+pub fn unreleased_hold_head<C: AsRef<str>>(trusted: &[C]) -> Option<String> {
+    let at = trusted
+        .iter()
+        .rposition(|c| crate::merge_pr::hold_state::recorded_head(c.as_ref()).is_some())?;
+    let released = trusted[at + 1..].iter().any(|c| {
+        let c = c.as_ref();
+        is_operator_release(c) || c.contains(crate::claim_reconciliation::VERDICT_MARKER_PREFIX)
+    });
+    if released {
+        return None;
+    }
+    crate::merge_pr::hold_state::recorded_head(trusted[at].as_ref())
+}
+
 /// The label shape of a Champion-held PR that Champion sent to Doctor
 /// (#11861): `loom:changes-requested` beside the blocked hold, and no other
 /// park. Doctor may work it **only** when a standing trusted hold marker
@@ -425,5 +466,56 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].blocker.is_none(), "reason-only: the release pass skips it");
         assert_eq!(records[0].reason.as_deref(), Some(MERGE_RISK_HOLD_REASON));
+    }
+
+    fn hold_note(head: &str) -> String {
+        format!("{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head={head} -->\nHolding")
+    }
+
+    #[test]
+    fn a_hold_records_its_head_until_something_releases_it() {
+        let hold = hold_note("abc1234");
+        assert_eq!(unreleased_hold_head(&[hold.as_str()]), Some("abc1234".into()));
+        let empty: [&str; 0] = [];
+        assert_eq!(unreleased_hold_head(&empty), None, "no record fails open");
+        assert_eq!(unreleased_hold_head(&["just prose"]), None);
+        // The latest record wins.
+        let later = hold_note("def5678");
+        assert_eq!(unreleased_hold_head(&[hold.as_str(), later.as_str()]), Some("def5678".into()));
+        // Unrelated chatter after the hold does not release it.
+        assert_eq!(
+            unreleased_hold_head(&[hold.as_str(), "do not clear the hold yet"]),
+            Some("abc1234".into())
+        );
+    }
+
+    #[test]
+    fn an_operator_clear_or_a_judge_verdict_after_the_hold_releases_it() {
+        let hold = hold_note("abc1234");
+        for release in [
+            "clear the hold \u{2014} QA signed off",
+            "  Cleared: fine",
+            "merge anyway, it is urgent",
+            "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->\n**Approved**",
+            // #12594: closing an operator release condition must redraw the PR.
+            "<!-- loom:release-condition-met -->\npredecessor merged, healthy on every host",
+        ] {
+            assert_eq!(unreleased_hold_head(&[hold.as_str(), release]), None, "{release}");
+        }
+        // The condition itself, or a notice quoting the -met marker, is not a release.
+        assert_eq!(
+            unreleased_hold_head(&[
+                hold.as_str(),
+                "<!-- loom:release-condition -->\nrelease after #12000 merges",
+                "Not merging: it closes when a comment opens with `<!-- loom:release-condition-met -->`",
+            ]),
+            Some("abc1234".into())
+        );
+        // A release that predates a fresh hold record does not carry over.
+        let fresh = hold_note("def5678");
+        assert_eq!(
+            unreleased_hold_head(&[hold.as_str(), "clear the hold", fresh.as_str()]),
+            Some("def5678".into())
+        );
     }
 }

@@ -11,21 +11,12 @@
 
 use std::collections::BTreeMap;
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv, kv_int, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::kinds::pass::{PassOutcome, PassSummaryRecord, PassVerdictRecord, StepFacts};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 fn int(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)

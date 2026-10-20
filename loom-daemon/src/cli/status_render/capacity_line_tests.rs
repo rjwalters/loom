@@ -2,8 +2,8 @@
 //! instead of "the limiter is work availability".
 use super::below_cap_line;
 use crate::cli::status::sample_report::sample_report;
+use crate::types::{DaemonStatusReport, PoolExhaustionHoldStatus, RepoStatus};
 use chrono::Utc;
-use loom_daemon::types::{DaemonStatusReport, PoolExhaustionHoldStatus, RepoStatus};
 use std::path::PathBuf;
 
 const GENERIC: &str = "the limiter is work availability";

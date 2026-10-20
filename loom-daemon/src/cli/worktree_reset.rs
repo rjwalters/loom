@@ -26,7 +26,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::reset;
+use crate::worktree_cli::reset;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeResetArgs {

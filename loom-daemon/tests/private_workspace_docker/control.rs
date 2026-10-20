@@ -134,7 +134,7 @@ impl Fixture {
         self.hook_with(name, event, command, policy)
     }
 
-    fn derive(&self, tag: &str, steps: &str) -> String {
+    pub(super) fn derive(&self, tag: &str, steps: &str) -> String {
         let image = format!("{}-{tag}", self.image);
         self.derived.borrow_mut().push(image.clone());
         let context = self.root.path().join(format!("derived-{tag}"));

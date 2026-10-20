@@ -24,10 +24,10 @@ pub(crate) enum ScriptPortCommand {
     Preflight(super::preflight::PreflightArgs),
     /// Supervised persistent-container transport backing spawn-codex.sh.
     #[command(subcommand)]
-    SessionExec(loom_daemon::session_exec::SessionExecCommand),
+    SessionExec(crate::session_exec::SessionExecCommand),
     /// Private workspace endpoint used inside a session container.
     #[command(subcommand)]
-    PrivateWorkspace(loom_daemon::tokens_pool::private_workspace::WorkerCommand),
+    PrivateWorkspace(crate::tokens_pool::private_workspace::WorkerCommand),
     /// Readiness of Loom's managed Codex hook, behind
     /// `provision-codex-hooks.sh verify` (#9390).
     #[command(subcommand)]
@@ -378,6 +378,14 @@ pub(crate) enum ScriptPortCommand {
     /// refused with nothing mutated, 2 the rebase itself failed.
     ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
 
+    /// The git half of Doctor's orphan-stack replacement recipe (#12767): in a
+    /// merge-mode repository, replay a stacked child's own commits (the closed
+    /// parent's excluded) onto the default branch as a NEW branch, never
+    /// rewriting the original. Exit 0 done, 1 refused with nothing pushed,
+    /// 2 transient.
+    #[command(subcommand)]
+    OrphanReplace(super::orphan_replace::OrphanReplaceCommand),
+
     /// Build a PINNED `--force-with-lease=<branch>:<oid>` push argument, or
     /// refuse (#9487). Backs the lease capture in `reconcile-stack.sh` and
     /// `rebase-stacked-children.sh`. A bare `--force-with-lease` compares
@@ -452,6 +460,13 @@ pub(crate) enum ScriptPortCommand {
     /// on the same no-op branch as an unavailable binary.
     #[command(subcommand)]
     RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
+
+    /// Shared command-lexer verdicts for the guard hooks (#12236): `gh-pr-merge`
+    /// exits 0 when a command line would execute it, 1 when not (a heredoc body
+    /// or quoted argument is data). Any other exit means unanswered; the hook
+    /// fails closed.
+    #[command(subcommand)]
+    CommandAnalysis(super::command_analysis::CommandAnalysisCommand),
 
     /// Per-stage runtime selection views (#11726): `roles draw --explain`
     /// prints each stage's effective weighted, per-attempt draw table on this
@@ -712,6 +727,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::OrphanReplace(cmd) => cmd.run(),
             ScriptPortCommand::PushLease(cmd) => cmd.run(),
             ScriptPortCommand::BranchUpdate(cmd) => cmd.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
@@ -720,6 +736,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorkDocs(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::CommandAnalysis(cmd) => cmd.run(),
             ScriptPortCommand::Roles(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),

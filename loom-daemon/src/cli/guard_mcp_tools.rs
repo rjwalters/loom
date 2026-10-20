@@ -9,12 +9,12 @@
 //! Loom guard hook carries, so a bug here can never wedge Claude Code in a
 //! retry loop or turn a missed check into a broken session.
 //!
-//! The logic lives in [`loom_daemon::mcp_tool_guard`]; this module is stdin,
+//! The logic lives in [`crate::mcp_tool_guard`]; this module is stdin,
 //! stdout, and the exit code.
 
 use anyhow::Result;
 
-use loom_daemon::mcp_tool_guard::{self, HookPayload};
+use crate::mcp_tool_guard::{self, HookPayload};
 
 #[derive(clap::Args)]
 pub(crate) struct GuardMcpToolsArgs {
@@ -42,7 +42,7 @@ impl GuardMcpToolsArgs {
         // A hook's cwd can be a linked worktree; the host-local config tier
         // (`.loom-local/`) lives only in the main checkout, so resolve the
         // toggle against that, exactly as the Stop-hook guard does.
-        let root = loom_daemon::worktree_state::main_checkout_root(&root).unwrap_or(root);
+        let root = crate::worktree_state::main_checkout_root(&root).unwrap_or(root);
 
         let decision = mcp_tool_guard::evaluate(&payload, &root);
         mcp_tool_guard::log_decision(&root, &decision);

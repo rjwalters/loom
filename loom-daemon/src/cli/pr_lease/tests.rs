@@ -14,7 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
-use loom_daemon::forge_identity::{FleetLogins, Roster};
+use crate::forge_identity::{FleetLogins, Roster};
 
 fn now() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-10-11T12:00:00Z")
@@ -81,7 +81,7 @@ fn issue_leases_and_pr_leases_never_read_as_each_other() {
     // The issue-path readers match `<!-- loom:lease host=`; a PR lease must
     // not, and an issue lease must not read as a PR lease.
     let pr = who(Role::Doctor, "s").lease_marker();
-    assert!(!pr.starts_with(loom_daemon::sweep_registry::LEASE_MARKER_PREFIX));
+    assert!(!pr.starts_with(crate::sweep_registry::LEASE_MARKER_PREFIX));
     assert!(!pr.starts_with("<!-- loom:lease-yield host="));
     assert_eq!(parse_record("<!-- loom:lease host=h sweep=s -->"), None);
 }
@@ -894,7 +894,7 @@ fn a_timed_out_judge_is_reaped_into_a_record_that_holds_the_pr_on_every_host() {
     claimant.lease_file = Some(lease_file.clone());
     assert_eq!(claimant.claim(), EXIT_HELD);
     // The won lease is listed for the daemon.
-    let listed = loom_daemon::pr_lease_reap::parse_file(&fs::read_to_string(&lease_file).unwrap());
+    let listed = crate::pr_lease_reap::parse_file(&fs::read_to_string(&lease_file).unwrap());
     assert_eq!(listed, vec![claimant.held()]);
     // The run times out; the role runner reaps on the claimant's behalf.
     assert_eq!(ctx(dir.path(), dead.clone()).reap("timeout"), EXIT_HELD);
@@ -970,7 +970,7 @@ fn a_timed_out_judge_run_counts_toward_the_three_per_day_cap() {
     let rows = c.gh.read_rows(77, &c.policy).unwrap();
     assert_eq!(
         backstop::hold(&rows, c.gh.pr_head(77), Utc::now()),
-        Some(first + chrono::Duration::hours(loom_daemon::judge_backstop::WINDOW_HOURS))
+        Some(first + chrono::Duration::hours(crate::judge_backstop::WINDOW_HOURS))
     );
 }
 
@@ -1147,7 +1147,7 @@ fn a_labelless_claim_renews_without_a_label_check() {
 /// #11898) agrees with this module's parser on every record shape.
 #[test]
 fn the_lib_role_lease_reader_agrees_with_parse_record() {
-    use loom_daemon::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
+    use crate::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
     let me = Identity::new(Role::Champion, "host-a".into(), "s1".into(), None).unwrap();
     let peer = who(Role::Judge, "s2");
     let bodies = [
@@ -1249,7 +1249,7 @@ fn an_issue_scoped_release_reads_no_pr_head() {
 /// next lease is the holder on both.
 #[test]
 fn the_lib_and_bin_lease_holders_agree_when_steps_differ() {
-    use loom_daemon::sweep_registry::step_lease_owner::{earliest_live_holder, RoleLeaseRow};
+    use crate::sweep_registry::step_lease_owner::{earliest_live_holder, RoleLeaseRow};
     let stepped =
         Identity::new(Role::Judge, "host-a".into(), "run-1".into(), Some(StepRole::Judge)).unwrap();
     let plain = Identity::new(Role::Judge, "host-a".into(), "run-1".into(), None).unwrap();

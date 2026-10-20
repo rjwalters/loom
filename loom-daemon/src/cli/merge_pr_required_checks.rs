@@ -1,6 +1,6 @@
 //! `loom-daemon merge-pr required-checks` (#10688): the synchronous merge
 //! path's required-context conclusion gate. Logic and contract:
-//! [`loom_daemon::merge_pr::checks_failure::required`].
+//! [`crate::merge_pr::checks_failure::required`].
 //!
 //! | outcome | stdout | exit |
 //! |---|---|---|
@@ -15,11 +15,11 @@
 //! started_at}], "statuses": <commits/{sha}/status payload>}` and assesses
 //! offline (the fixture seam); a missing `statuses` key reads as none.
 
-use anyhow::Result;
-use loom_daemon::merge_pr::checks_failure::required::{
+use crate::merge_pr::checks_failure::required::{
     assess, bypass_comment, hold_reason, list, live_inputs, parse_check_runs, parse_statuses,
     refusal, Verdict, BYPASSED, CLEAN, HOLD, UNREADABLE,
 };
+use anyhow::Result;
 use serde_json::Value;
 use std::io::Read;
 
@@ -97,7 +97,7 @@ impl RequiredChecksArgs {
                 );
                 if post {
                     let body = bypass_comment(&self.pr, &self.head_sha, &bypassed);
-                    if let Err(e) = loom_daemon::forge_comment::post_comment(
+                    if let Err(e) = crate::forge_comment::post_comment(
                         "gh", None, &self.repo, &self.pr, true, &body,
                     ) {
                         eprintln!("Warning: could not post the --allow-red-required audit comment on PR #{}: {e}", self.pr);

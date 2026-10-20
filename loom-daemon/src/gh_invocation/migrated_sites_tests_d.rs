@@ -103,6 +103,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "orphan_stack.comments",
         "orphan_stack.label",
         "orphan_stack.comment",
+        "orphan_stack.retarget",
     ];
     for name in mapped {
         let op = gh_call::forge_op_for(name).unwrap_or_else(|| panic!("{name} is unmapped"));
