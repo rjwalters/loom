@@ -83,7 +83,16 @@ pub(super) fn kv_string(key: &str, value: impl Into<String>) -> KeyValue {
     kv(key, any_string(value))
 }
 
-fn kv_int(key: &str, value: i64) -> KeyValue {
+pub(super) fn kv_bool(key: &str, value: bool) -> KeyValue {
+    kv(
+        key,
+        AnyValue {
+            value: Some(any_value::Value::BoolValue(value)),
+        },
+    )
+}
+
+pub(super) fn kv_int(key: &str, value: i64) -> KeyValue {
     kv(
         key,
         AnyValue {
