@@ -2215,10 +2215,11 @@ latest `lockout.frozen_candidates_count` / `lockout.frozen_points_sum` per
 repo (or `max` over a short window — both are step functions that only move
 when a tick's guard verdicts change).
 
-Free-form dispatch-error text is never exported. Rows past 256 per sample, or
-whose repo root never resolved, are dropped and counted on
-`loom.queue.disposition_rows_dropped{reason}` (`unresolved` / `truncated`), a
-delta counter. The single-workspace work-finder loop records no per-issue
+Free-form dispatch-error text is never exported. Rows whose repo root never
+resolved are dropped and counted on
+`loom.queue.disposition_rows_dropped{reason}` (`unresolved`), a delta counter.
+No row is dropped for volume: a row cap would make which items carry facts
+depend on iteration order. The single-workspace work-finder loop records no per-issue
 queue rows at all (`workspace #N` placeholders never resolve to a slug), so it
 has nothing to export here — the same limitation `queue.snapshot` already
 documents.
@@ -2843,9 +2844,9 @@ Body fields (`observability/otlp/mapping/dispatch_eligibility.rs`,
 | `state` | the coarse `ready` / `blocked` state the eligibility is derived from. |
 | `block_start` | when the item entered its current eligibility class on this host, as first observed (the tick of the first same-class sample). An observation floor — a class shorter than one collector interval can be missed, and a daemon restart re-anchors it (same tradeoff as `ops::disposition`). This is the dwell split point. |
 | `transition` | `changed` (class flip / first sight; `block_start` re-anchored) or `refresh` (same class, window elapsed; `block_start` preserved). |
-| `rank` | the item's 1-based bare comparator rank on the host this tick. |
-| `eligible_work_ahead` | **effective** work-ahead: the count of *eligible* items (not `blocked` — running or ready) ranked ahead across the host concurrency pool. Blocked items are excluded, so it is the real number of competitors that take a slot first, not a raw "priority ≥ mine" count. |
-| `eligible_work_ahead_repo` | the same, restricted to this item's own repo (the `maxConcurrentPerRepo` pool). |
+| `rank` | the item's 1-based bare comparator rank on the host this tick. **Comparator order only: it is not queue position.** In step mode dispatch is a weighted random draw that does not use it; the dispatch-position equivalent is the draw weight share in `pick.decision.item_draw`. |
+| `eligible_work_ahead` | the count of *eligible* items (not `blocked` — running or ready) with a smaller comparator `rank` across the host concurrency pool. Blocked items are excluded. Comparator order, not used by the step-mode weighted draw, so **not** the number of competitors that take a slot first and not queue position; see `pick.decision.item_draw` for the draw weight share. |
+| `eligible_work_ahead_repo` | the same, restricted to this item's own repo (the `maxConcurrentPerRepo` pool). Comparator order, not queue position. |
 | `resource_pool` | the scheduling class the item competes in: the forge `owner/repo` slug. |
 | `max_concurrent` | the host's effective concurrency cap this tick (the global pool size). |
 | `level` | the issue's priority level (`default` / `important` / `very-important`) — the axis the work-ahead counts are relative to. |
