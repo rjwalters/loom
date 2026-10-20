@@ -107,6 +107,8 @@ struct FakeSpawner {
     refuse_all: Option<&'static str>,
     asked: Vec<(usize, u32, StepRole, u32)>,
     terms: Vec<Option<StepDrawTerms>>,
+    /// Each request's `(item, story_points)` (#12957).
+    points: Vec<(u32, Option<u32>)>,
     /// Each round's batch, as `(workspace, item)` (#12298).
     batches: Vec<Vec<(usize, u32)>>,
     /// Hold the spawns once this many batches ran (#12298).
@@ -120,6 +122,7 @@ impl StepSpawner for FakeSpawner {
         self.asked
             .push((idx, request.item, request.role, request.draw_attempt));
         self.terms.push(request.draw);
+        self.points.push((request.item, request.story_points));
         if let Some(reason) = self.refuse_all {
             return SpawnResult::Refused(reason.to_string());
         }
@@ -1246,4 +1249,29 @@ esac
             (60, StepRole::ChampionMerge),
         ])
     );
+}
+
+/// #12957: the tick's queue rows and spawn requests carry each item's story
+/// points from the labels the listing already returned (no forge call); a PR
+/// step carries its closing issue's, an unsized item none.
+#[test]
+fn queue_rows_and_spawn_requests_carry_story_points() {
+    let rows = vec![
+        row(3, &["loom:issue", "points:8"], "", false),
+        row(4, &["loom:building", "points:3"], "", false),
+        row(40, &["loom:review-requested"], "Closes #4", true),
+        row(10, &["loom:issue"], "", false),
+    ];
+    let mut spawner = FakeSpawner::default();
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut spawner);
+    let row_points: BTreeMap<u32, Option<u32>> = tick
+        .report
+        .queue
+        .iter()
+        .map(|r| (r.key.number, r.story_points))
+        .collect();
+    let expected = BTreeMap::from([(3, Some(8)), (40, Some(3)), (10, None)]);
+    assert_eq!(row_points, expected);
+    let asked: BTreeMap<u32, Option<u32>> = spawner.points.into_iter().collect();
+    assert_eq!(asked, expected);
 }

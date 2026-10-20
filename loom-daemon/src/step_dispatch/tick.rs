@@ -530,7 +530,7 @@ pub fn run(
                 detail: None,
                 updated_at: None,
                 held_until: None,
-                story_points: None,
+                story_points: c.item.story_points,
                 step: Some(c.step),
             });
         }
@@ -678,6 +678,7 @@ pub fn run(
                             repo_items: terms.repo.items,
                             in_flight_repo: terms.repo.in_flight,
                         }),
+                        story_points: picked.item.story_points,
                     },
                     key,
                 });
