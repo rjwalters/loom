@@ -1281,8 +1281,12 @@ else
   if [ "$MANUAL_RELEASE_SINCE_HOLD" != true ] && [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$HOLD_MARKER\"))")" = "true" ]; then
     echo "Merge-risk hold already posted for #$PR_NUMBER — hold stands, no comment"
   else
+    # Standing-authorization digest (#12933): a later change to
+    # `champion.standingAuthorizations` differs from it and re-reads this hold once.
+    HOLD_AUTH=$(loom-daemon config get champion.standingAuthorizations --digest 2>/dev/null)
+    HOLD_AUTH_FIELD=""; [ -n "$HOLD_AUTH" ] && HOLD_AUTH_FIELD=" auth=$HOLD_AUTH"
     ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$HOLD_MARKER
-<!-- champion:hold-state head=$HEAD_SHA -->
+<!-- champion:hold-state head=$HEAD_SHA${HOLD_AUTH_FIELD} -->
 **Champion: Holding for Human Merge**
 
 Judge-approved and passing the mechanical safety criteria, but not

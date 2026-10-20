@@ -168,8 +168,12 @@ if [ "$CRITERION3_RESULT" = "FAIL" ]; then
         CF_WF_NOTE="
 Merging workflow files needs the \`workflow\` token scope: \`gh auth refresh -h github.com -s workflow\`
 "
+      # Standing-authorization digest (#12933): a later change to
+      # `champion.standingAuthorizations` differs from it and re-reads this hold once.
+      HOLD_AUTH=$(loom-daemon config get champion.standingAuthorizations --digest 2>/dev/null)
+      HOLD_AUTH_FIELD=""; [ -n "$HOLD_AUTH" ] && HOLD_AUTH_FIELD=" auth=$HOLD_AUTH"
       ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$HOLD_MARKER
-<!-- champion:hold-state head=$HEAD_SHA -->
+<!-- champion:hold-state head=$HEAD_SHA${HOLD_AUTH_FIELD} -->
 **Champion: Holding for Human Merge — Critical File**
 
 ${CF_REARM_NOTE}This PR modifies a critical file and cannot be automatically merged:

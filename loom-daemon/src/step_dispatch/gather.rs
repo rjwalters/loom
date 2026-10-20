@@ -368,11 +368,20 @@ pub fn hold_ci_pending(
 /// `hold_heads` maps a PR to [`PullMarkers::hold_head`] (already `None` once a
 /// release comment followed); `released` names the PRs carrying
 /// `loom:auto-merge-ok`. Fails open: a PR with no recorded or current head is
-/// drawn. A recorded SHA may be abbreviated, so heads match on prefix. Pure.
+/// drawn. A recorded SHA may be abbreviated, so heads match on prefix.
+///
+/// A change in the repo's standing authorizations is a release signal too
+/// (#12933): `hold_auths` maps a PR to the digest its hold recorded
+/// ([`PullMarkers::hold_auth`]) and `current_auth` is the repo's digest now.
+/// A hold whose digest differs, or that recorded none, is drawn once; its
+/// re-hold records the current digest. `current_auth` of `None` (no digest
+/// available) keeps the head-only rule. Pure.
 pub fn hold_at_recorded_head(
     items: &mut [Item],
     heads: &HashMap<u32, String>,
     hold_heads: &HashMap<u32, String>,
+    hold_auths: &HashMap<u32, String>,
+    current_auth: Option<&str>,
     released: &HashSet<u32>,
 ) -> usize {
     let mut held = 0usize;
@@ -387,6 +396,9 @@ pub fn hold_at_recorded_head(
         let (Some(head), Some(recorded)) = (heads.get(&pr), hold_heads.get(&pr)) else {
             continue;
         };
+        if current_auth.is_some_and(|cur| hold_auths.get(&pr).map(String::as_str) != Some(cur)) {
+            continue;
+        }
         if !recorded.is_empty() && (head.starts_with(recorded) || recorded.starts_with(head)) {
             item.verdict = Verdict::Pass(PassReason::HeldAtHead);
             held += 1;
@@ -545,6 +557,10 @@ pub fn list(
         .iter()
         .filter_map(|p| p.markers.hold_head.clone().map(|h| (p.number, h)))
         .collect();
+    let hold_auths: HashMap<u32, String> = pulls
+        .iter()
+        .filter_map(|p| p.markers.hold_auth.clone().map(|a| (p.number, a)))
+        .collect();
     let linked_by_pr: Vec<u32> = pulls
         .iter()
         .flat_map(|p| {
@@ -617,7 +633,14 @@ pub fn list(
         .filter(|r| r.is_pull_request && has(&r.labels, "loom:auto-merge-ok"))
         .map(|r| r.number)
         .collect();
-    let at_head = hold_at_recorded_head(&mut items, &heads, &hold_heads, &released);
+    let at_head = hold_at_recorded_head(
+        &mut items,
+        &heads,
+        &hold_heads,
+        &hold_auths,
+        Some(crate::champion_hold::standing_auth_digest(root).as_str()),
+        &released,
+    );
     if at_head > 0 {
         log::debug!("work_finder: {slug}: {at_head} held PR(s) unchanged since their hold");
     }
