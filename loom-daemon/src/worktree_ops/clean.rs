@@ -726,6 +726,15 @@ pub enum WorktreeDecision {
     /// see `worktree_ops::clean::quarantine_dirty_worktree` and
     /// `worktree_reaper`'s reap loop.
     RemoveWithQuarantine,
+    /// The idle-open decision (issue #12458): every gate passed for the
+    /// worktree of an **open** issue / PR, but because the item is open the
+    /// caller MUST first push a snapshot of the worktree's whole state to a
+    /// remote backup ref and verify the remote holds it
+    /// (`worktree_ops::open_backup::backup_to_remote`), log that ref, and
+    /// only then remove — a failed or unverifiable backup keeps the worktree.
+    /// Distinct from [`Self::Remove`] so no remover can reach an open item's
+    /// worktree without the backup having happened first.
+    RemoveWithBackup,
     /// Closed issue whose PR did not merge, or that has no PR at all
     /// (payload: which). Also covers a closed-without-merge PR whose branch
     /// could not be proven safe to delete — no `closed_at` timestamp, or its
@@ -1025,13 +1034,20 @@ impl SkipOpen {
 /// The idle-open decision (issue #12458): may the worktree of an **open**
 /// issue / PR be removed to reclaim its disk?
 ///
-/// Nothing is lost by removing it when all three hold, and the next step for
+/// It may be *offered* for removal when all three hold, and the next step for
 /// the item recreates it through the normal `worktree.sh` path:
 ///
 /// 1. nothing was written in it for `idle_secs` (the `worktree_activity` gate);
 /// 2. it holds no tracked changes and no untracked user files (`unsaved_work`);
 /// 3. its branch is fully on a remote — or has no commits beyond base, which
 ///    `git rev-list <branch> --not --remotes` also reports as reachable.
+///
+/// The answer is never a bare [`WorktreeDecision::Remove`]: every one of those
+/// three is an inference, the item is still open, and `git worktree remove
+/// --force` is one-way, so the decision is
+/// [`WorktreeDecision::RemoveWithBackup`] — the remover must first push a
+/// verified snapshot of the worktree to a remote backup ref
+/// (`open_backup::backup_to_remote`) and keeps the worktree if it cannot.
 ///
 /// Cheapest gate first: a worktree touched recently exits on the root `stat`
 /// without a `git` subprocess. A kept worktree reports the skip the open item
@@ -1056,7 +1072,7 @@ fn classify_idle_open(
             "open item idle, but its branch is not fully pushed to a remote".to_string(),
         );
     }
-    WorktreeDecision::Remove
+    WorktreeDecision::RemoveWithBackup
 }
 
 /// The canonicalized path of every currently-registered git worktree for
@@ -2059,6 +2075,18 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 let result =
                     cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run, "clean");
                 record_cleanup_result(stats, &worktree_path, result);
+            }
+            WorktreeDecision::RemoveWithBackup => {
+                // #12458: unreachable here — the interactive pass never sets
+                // `idle_open_secs` — and kept that way on purpose: the
+                // backup-then-remove route for an OPEN item's worktree is the
+                // daemon reaper's alone, so a non-reaper caller that somehow
+                // produces this decision preserves the worktree.
+                println!(
+                    "  Issue #{issue_num} is OPEN - preserving (idle-open backup-then-remove is \
+                     only run by the daemon reaper)"
+                );
+                stats.skipped_open += 1;
             }
             WorktreeDecision::RemoveWithQuarantine => {
                 if opts.dry_run {

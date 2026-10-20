@@ -122,6 +122,7 @@ use crate::worktree_activity::{removal_veto, resolve_activity_window};
 use crate::worktree_ops::clean::{
     self, CleanOptions, WorktreeDecision, WorktreeProbes, DEFAULT_GRACE_PERIOD_SECS,
 };
+use crate::worktree_ops::open_backup;
 
 // ============================================================================
 // Constants
@@ -322,6 +323,12 @@ pub struct ReapReport {
     pub failed: Vec<u32>,
     /// Worktrees a safety gate preserved, keyed by the gate's own wording.
     pub skipped: Vec<(u32, String)>,
+    /// Open-item worktrees (#12458) whose whole state was pushed to a remote
+    /// backup ref before removal — the record names remote, ref, sha, parent
+    /// and branch (`open_backup::BackupRecord`). Every entry here is also in
+    /// [`Self::removed`] or [`Self::failed`]: the backup happened whether or
+    /// not the removal that followed it succeeded.
+    pub backed_up: Vec<(u32, crate::worktree_ops::open_backup::BackupRecord)>,
     /// Bytes the removed worktrees held (#12461). Measured before removal and
     /// only while an ops sink is registered, so `0` means "not measured" as
     /// much as "nothing removed".
@@ -336,11 +343,12 @@ impl ReapReport {
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "scanned={} removed={} failed={} skipped={}",
+            "scanned={} removed={} failed={} skipped={} backed_up={}",
             self.scanned,
             self.removed.len(),
             self.failed.len(),
-            self.skipped.len()
+            self.skipped.len(),
+            self.backed_up.len()
         )
     }
 }
@@ -381,19 +389,22 @@ fn enumerate_worktree_dirs(repo_root: &Path) -> Vec<std::fs::DirEntry> {
 /// Enumerate `issue-<N>` worktrees under `repo_root`'s worktree root, classify
 /// each with [`clean::classify_worktree`], and remove the eligible ones via
 /// `remove` — quarantine-stashing a dirty-but-past-grace worktree via
-/// `quarantine` first (issue #6653) when the decision calls for it.
+/// `quarantine` first (issue #6653) when the decision calls for it, and
+/// pushing an **open** item's worktree to a remote backup ref via `backup`
+/// first (issue #12458) — a failed backup keeps the worktree.
 ///
-/// The probes and the remover are injected so the whole pass is unit-testable
-/// without a forge, a process table, or real `git worktree` state — production
-/// wiring lives in [`reap_repo`].
+/// The probes, the backup and the remover are injected so the whole pass is
+/// unit-testable without a forge, a process table, or real `git worktree`
+/// state — production wiring lives in [`reap_repo`].
 pub fn reap_worktrees(
     repo_root: &Path,
     opts: &CleanOptions,
     probes: &WorktreeProbes<'_>,
     quarantine: &dyn Fn(&Path, u32) -> Option<String>,
+    backup: &dyn Fn(&Path, u32) -> Result<open_backup::BackupRecord, String>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
-    reap_worktrees_confirmed(repo_root, opts, probes, quarantine, remove, &|_| None)
+    reap_worktrees_confirmed(repo_root, opts, probes, quarantine, backup, remove, &|_| None)
 }
 
 /// Enumerate `pr-<N>` worktrees under `repo_root`'s worktree root, classify
@@ -417,9 +428,10 @@ pub fn reap_pr_worktrees(
     repo_root: &Path,
     opts: &CleanOptions,
     probes: &clean::PrWorktreeProbes<'_>,
+    backup: &dyn Fn(&Path, u32) -> Result<open_backup::BackupRecord, String>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
-    reap_pr_worktrees_confirmed(repo_root, opts, probes, remove, &|_| None)
+    reap_pr_worktrees_confirmed(repo_root, opts, probes, backup, remove, &|_| None)
 }
 
 // ============================================================================
@@ -732,9 +744,23 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
         )
     };
 
+    // #12458: an OPEN item's idle worktree is pushed, whole, to a remote
+    // backup ref and read back from the remote before `remover` may run; the
+    // ledger (#5950) gets the ref next to the removal it precedes, so "what
+    // happened to my worktree?" and "where is its content?" have one answer.
+    let backup_issue =
+        |path: &Path, issue: u32| backup_open_worktree(repo_root, path, &format!("issue-{issue}"));
+
     let confirm_issue = |n: u32| pass.confirm_issue(n).keep_reason();
-    let mut report =
-        reap_worktrees_confirmed(repo_root, &opts, &probes, &quarantine, &remover, &confirm_issue);
+    let mut report = reap_worktrees_confirmed(
+        repo_root,
+        &opts,
+        &probes,
+        &quarantine,
+        &backup_issue,
+        &remover,
+        &confirm_issue,
+    );
 
     // pr-<N> pass (#5939): a `pr-<N>` worktree has no backing issue, so it
     // never matched the issue-keyed pass above — the one worktree class no
@@ -779,9 +805,18 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
             )
         })
     };
+    // #12458: same backup-before-removal contract for an open PR's worktree.
+    let backup_pr =
+        |path: &Path, pr: u32| backup_open_worktree(repo_root, path, &format!("pr-{pr}"));
     let confirm_pr = |n: u32| pass.confirm_pull(n).keep_reason();
-    let pr_report =
-        reap_pr_worktrees_confirmed(repo_root, &opts, &pr_probes, &pr_remover, &confirm_pr);
+    let pr_report = reap_pr_worktrees_confirmed(
+        repo_root,
+        &opts,
+        &pr_probes,
+        &backup_pr,
+        &pr_remover,
+        &confirm_pr,
+    );
     log_pr_report(repo_root, &pr_report);
 
     report.free_gb = crate::disk_headroom::worktree_root_free_gb(repo_root);
@@ -873,6 +908,26 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     report
 }
 
+/// The production `backup` closure body for both passes (#12458): push the
+/// open item's worktree to a remote backup ref, verify the remote holds it,
+/// and write the ref to the removal ledger (#5950) under the same path the
+/// removal that follows will be recorded against. `Err` keeps the worktree.
+fn backup_open_worktree(
+    repo_root: &Path,
+    path: &Path,
+    item: &str,
+) -> Result<open_backup::BackupRecord, String> {
+    let record = open_backup::backup_to_remote(path, item, Utc::now())?;
+    crate::worktree_ops::removal_log::record(
+        repo_root,
+        "worktree_reaper",
+        path,
+        record.branch.as_deref(),
+        &format!("idle-open backup pushed before removal: {}", record.describe()),
+    );
+    Ok(record)
+}
+
 /// Export one removal pass as a `reaper.pass` span (#12461).
 fn publish_reap(repo_root: &Path, report: &ReapReport, class: &str) {
     use crate::observability::ops::reaper;
@@ -886,6 +941,12 @@ fn publish_reap(repo_root: &Path, report: &ReapReport, class: &str) {
             failed: report.failed.len(),
             preserved: report.skipped.iter().map(|(_, why)| why.as_str()).collect(),
             bytes: report.bytes_removed,
+            backed_up: report.backed_up.len(),
+            backup_refs: report
+                .backed_up
+                .iter()
+                .map(|(_, record)| record.ref_name.as_str())
+                .collect(),
         },
     );
 }
@@ -903,6 +964,8 @@ fn publish_reclaim(repo_root: &Path, report: &ReclaimReport, class: &str) {
             failed: report.failed.len(),
             preserved: report.skipped.iter().map(|(_, why)| why.as_str()).collect(),
             bytes: report.bytes_freed(),
+            backed_up: 0,
+            backup_refs: Vec::new(),
         },
     );
 }
@@ -1230,6 +1293,11 @@ mod tests {
         /// Whether the issue-keyed `unsaved_work` probe (tracked changes or
         /// untracked user files) reports anything at risk (issue #12458).
         unsaved: bool,
+        /// Whether the scripted remote-backup closure (issue #12458) reports a
+        /// verified push. `true` (the default) simulates a backup the remote
+        /// confirmed; `false` simulates a rejected / offline push, which must
+        /// preserve the worktree.
+        backup_ok: bool,
     }
 
     impl Default for ProbeSpec {
@@ -1250,7 +1318,20 @@ mod tests {
                 quarantine_ok: true,
                 idle: false,
                 unsaved: false,
+                backup_ok: true,
             }
+        }
+    }
+
+    /// The scripted remote-backup record `run_pass` / `run_pr_pass` hand back
+    /// for a successful backup (issue #12458).
+    fn scripted_backup(item: &str) -> open_backup::BackupRecord {
+        open_backup::BackupRecord {
+            remote: "origin".to_string(),
+            ref_name: format!("refs/loom/backup/{item}/feature/{item}/20261020T000000Z"),
+            sha: "deadbeefcafe".to_string(),
+            head: "deadbeefcafe".to_string(),
+            branch: Some(format!("feature/{item}")),
         }
     }
 
@@ -1326,7 +1407,15 @@ mod tests {
             true
         };
 
-        let report = reap_worktrees(repo, opts, &probes, &quarantine, &remover);
+        let backup = |_: &Path, issue: u32| {
+            if spec.backup_ok {
+                Ok(scripted_backup(&format!("issue-{issue}")))
+            } else {
+                Err("scripted push rejection".to_string())
+            }
+        };
+
+        let report = reap_worktrees(repo, opts, &probes, &quarantine, &backup, &remover);
         let removed = removed.lock().unwrap().clone();
         let quarantined = quarantined.lock().unwrap().clone();
         (report, removed, quarantined)
@@ -1369,7 +1458,15 @@ mod tests {
             true
         };
 
-        let report = reap_pr_worktrees(repo, opts, &probes, &remover);
+        let backup = |_: &Path, pr: u32| {
+            if spec.backup_ok {
+                Ok(scripted_backup(&format!("pr-{pr}")))
+            } else {
+                Err("scripted push rejection".to_string())
+            }
+        };
+
+        let report = reap_pr_worktrees(repo, opts, &probes, &backup, &remover);
         let removed = removed.lock().unwrap().clone();
         (report, removed)
     }
@@ -1868,7 +1965,14 @@ mod tests {
             idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
-        let report = reap_worktrees(repo.path(), &opts, &probes, &|_, _| None, &|_, _| false);
+        let report = reap_worktrees(
+            repo.path(),
+            &opts,
+            &probes,
+            &|_, _| None,
+            &|_, _| Err("no backup route in this test".to_string()),
+            &|_, _| false,
+        );
         assert!(report.removed.is_empty());
         assert_eq!(report.failed, vec![500]);
     }
@@ -2186,7 +2290,13 @@ mod tests {
             idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
-        let report = reap_pr_worktrees(repo.path(), &opts, &probes, &|_, _| false);
+        let report = reap_pr_worktrees(
+            repo.path(),
+            &opts,
+            &probes,
+            &|_, _| Err("no backup route in this test".to_string()),
+            &|_, _| false,
+        );
         assert!(report.removed.is_empty());
         assert_eq!(report.failed, vec![5408]);
     }
@@ -2212,6 +2322,7 @@ mod tests {
                 removed: vec![5312],
                 failed: vec![5349],
                 skipped: vec![(5350, "PR still open".to_string())],
+                backed_up: Vec::new(),
                 bytes_removed: 0,
                 free_gb: None,
             },
@@ -2839,10 +2950,11 @@ mod tests {
             removed: vec![1, 2],
             failed: vec![3],
             skipped: vec![(4, "PR still open".to_string())],
+            backed_up: Vec::new(),
             bytes_removed: 0,
             free_gb: Some(10),
         };
-        assert_eq!(report.summary(), "scanned=5 removed=2 failed=1 skipped=1");
+        assert_eq!(report.summary(), "scanned=5 removed=2 failed=1 skipped=1 backed_up=0");
     }
 
     #[test]
