@@ -162,7 +162,10 @@
 set -uo pipefail
 
 usage() {
-  sed -n '2,148p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  # Print the whole leading comment block (line 2 to the first non-comment
+  # line). A hard-coded line range fell behind the header and cut --help off
+  # mid-sentence at exit code 8 (#12692).
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]:-$0}"
 }
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
