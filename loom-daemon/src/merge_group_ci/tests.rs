@@ -178,6 +178,21 @@ fn concurrency_keyed_on_ref_or_run_id_is_unique_on_merge_group() {
 }
 
 #[test]
+fn group_check_without_checkout_is_flagged_and_the_shipped_template_is_clean() {
+    let r = run(
+        &wf("merge-group-check.yml", include_str!("fixtures/group_check_no_checkout.yml")),
+        &[],
+    );
+    assert_eq!(codes_for(&r, Some("group-check")), vec![Code::GroupCheckWithoutCheckout]);
+    assert!(!r.qualified());
+
+    let template =
+        include_str!("../../../defaults/optional/github-workflows/merge-group-check.yml");
+    let r = run(&wf("merge-group-check.yml", template), &[]);
+    assert!(r.findings.is_empty(), "{:?}", r.findings);
+}
+
+#[test]
 fn missing_required_suite_is_reported() {
     let r = run(&qualified(), &["Gate", "Does Not Exist"]);
     assert_eq!(codes_for(&r, None), vec![Code::MissingRequiredSuite]);

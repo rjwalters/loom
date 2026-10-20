@@ -11,6 +11,7 @@ A `merge_group` workflow that runs `loom-daemon forge merge-queue group-check --
 **Install only** in an organization-owned repo whose default branch has a merge queue and `champion.mergeMode: queue`. Copy it to `.github/workflows/`; if that path is admin-protected, the repo operator commits it.
 
 - **`loom-daemon`:** the job downloads the `loom-daemon-x86_64-unknown-linux-gnu` release asset (plus `.sha256`) from `rjwalters/loom` with `gh release download` and verifies the checksum. Set `LOOM_VERSION` to a release that includes `forge merge-queue group-check`.
+- **Checkout:** the job sparse-checks-out `.loom` at the merge-group commit before running `group-check`. Without a `.loom/` checkout whose origin is the repository, `write_scope` refuses the status write (#9548) and the required status never posts; `merge-group-ci audit` reports `GROUP_CHECK_WITHOUT_CHECKOUT` for such a workflow.
 - **Credential:** the workflow's own `github.token` with `permissions: statuses: write` (plus `contents: read`). No App token or secret is used. Unverified: that `github.token` can read the queue entries and PR comments `group-check` needs on a live `merge_group` run; confirm on the first live event (tracked on #10257).
 - The ruleset must list `loom/merge-authorization` and your CI check as required. Run `loom-daemon merge-group-ci audit` on your CI workflow first.
 

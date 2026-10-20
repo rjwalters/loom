@@ -57,6 +57,7 @@ counts as uncovered.
 | `UNDETERMINED_CONDITION` | the condition cannot be decided on `merge_group` |
 | `PR_ONLY_STEP` | a step of a covered job runs on PRs but is skipped on `merge_group` |
 | `NON_MERGE_GROUP_CHECKOUT` | `actions/checkout` `ref:` resolves to something other than the merge-group commit |
+| `GROUP_CHECK_WITHOUT_CHECKOUT` | a job runs `forge merge-queue group-check` with no `actions/checkout` step, so `write_scope` refuses the status write and `loom/merge-authorization` never posts |
 | `CANCELLING_CONCURRENCY` | `cancel-in-progress` is (or may be) true on `merge_group` |
 | `SHARED_CONCURRENCY_GROUP` | the group is not unique to the merge-group commit, so a pending run can be superseded |
 | `MISSING_REQUIRED_SUITE` | a required context matches no job name (matrix names are expanded) |
