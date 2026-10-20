@@ -70,7 +70,6 @@ pub mod api;
 pub mod artifact_spans;
 pub mod billing;
 pub mod export;
-pub mod feed;
 pub mod journal;
 pub mod ledger;
 pub mod logs;
@@ -435,27 +434,9 @@ pub fn journal_path(root: &Path) -> PathBuf {
 
 /// Spawn the daemon-integrated periodic poller, or return `None` when
 /// `autonomous.ciTelemetry.enabled` resolves false (the default — zero side
-/// effects, no task, no file I/O). Never feed-driven: see [`spawn_task_on`].
+/// effects, no task, no file I/O).
 #[must_use]
 pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_task_with_bus(root, None)
-}
-
-/// [`spawn_task`] with the daemon's event bus: feed-driven (#9201, [`feed`])
-/// when `forgeEvents.events.ciTelemetryRuns` resolves true, otherwise the
-/// plain periodic loop, unchanged.
-#[must_use]
-pub fn spawn_task_on(
-    root: PathBuf,
-    bus: &crate::event_bus::EventBus,
-) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_task_with_bus(root, Some(bus))
-}
-
-fn spawn_task_with_bus(
-    root: PathBuf,
-    bus: Option<&crate::event_bus::EventBus>,
-) -> Option<tokio::task::JoinHandle<()>> {
     let resolved = resolve(&read_config(&root));
     if !resolved.enabled {
         log::debug!("ci_telemetry: disabled (set autonomous.ciTelemetry.enabled=true to opt in)");
@@ -477,9 +458,6 @@ fn spawn_task_with_bus(
              autonomous.ciTelemetry.owners / {OWNERS_ENV}",
             resolved.owners_source
         );
-    }
-    if let Some(bus) = bus.filter(|_| feed::consumer_armed(&root)) {
-        return Some(feed::spawn(root, resolved, bus));
     }
     let interval = Duration::from_secs(resolved.interval_secs);
     log::info!(
