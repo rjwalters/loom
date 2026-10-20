@@ -193,6 +193,29 @@ fn group_check_without_checkout_is_flagged_and_the_shipped_template_is_clean() {
 }
 
 #[test]
+fn shipped_group_check_template_pins_permissions_and_recheck_trigger() {
+    let template =
+        include_str!("../../../defaults/optional/github-workflows/merge-group-check.yml");
+    // Uncommented lines only, so the explanatory comments cannot satisfy a pin.
+    let live: Vec<&str> = template
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    for needed in [
+        "statuses: write",
+        "pull-requests: read",
+        "checks: read",
+        "contents: read",
+        "workflow_run:",
+        "types: [completed]",
+        "branches: ['gh-readonly-queue/**']",
+    ] {
+        assert!(live.contains(&needed), "template lost `{needed}`");
+    }
+}
+
+#[test]
 fn missing_required_suite_is_reported() {
     let r = run(&qualified(), &["Gate", "Does Not Exist"]);
     assert_eq!(codes_for(&r, None), vec![Code::MissingRequiredSuite]);
