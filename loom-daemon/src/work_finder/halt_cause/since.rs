@@ -1,7 +1,7 @@
 //! Since when each workspace has been held, and why (Issue #11564).
 //!
 //! The work finder folds its per-root holds into one cause per root every
-//! tick ([`super::causes_per_root`] + [`super::with_disk_holds`]) and then
+//! tick ([`super::causes_per_root`]) and then
 //! forgets them. An ETA reader needs the hold as a fact with a start: a repo
 //! held `install_incompatible` for 70 hours looks, tick by tick, exactly like
 //! one held for a minute. [`HaltClock`] keeps that start.
@@ -107,17 +107,11 @@ impl HaltClock {
 
 static CLOCK: Mutex<HaltClock> = Mutex::new(HaltClock::new());
 
-/// Fold the disk holds into `causes` ([`super::with_disk_holds`]), record the
-/// result on the process clock at the current instant, and return it. The
+/// Record `causes` on the process clock at the current instant, and return it. The
 /// multi-workspace loop's single call: the routing slice it derives
 /// (`cause.is_some()`) is the one recorded here.
 #[must_use]
-pub fn publish(
-    causes: Vec<Option<HaltCause>>,
-    disk: Option<&crate::disk_admission::DiskBudget>,
-    roots: &[PathBuf],
-) -> Vec<Option<HaltCause>> {
-    let causes = super::with_disk_holds(causes, disk);
+pub fn publish(causes: Vec<Option<HaltCause>>, roots: &[PathBuf]) -> Vec<Option<HaltCause>> {
     let tick = roots
         .iter()
         .zip(&causes)

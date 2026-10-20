@@ -8,7 +8,6 @@
 mod observer_tasks;
 
 use loom_daemon::activity::{self, ActivityDb};
-use loom_daemon::admission_brake;
 use loom_daemon::auto_update;
 use loom_daemon::autonomy_marker;
 use loom_daemon::claim_reconciliation;
@@ -19,7 +18,6 @@ use loom_daemon::daemon_startup_reconciliation;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
-use loom_daemon::host_breaker;
 use loom_daemon::hyperparams;
 use loom_daemon::idle_exit;
 use loom_daemon::install_self_check;
@@ -104,6 +102,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     // Handle CLI commands (init mode)
     if let Some(command) = cli.command {
+        // #12389: a subcommand's reads take the gateway, then the reader
+        // pool, the daemon exported to this process (an agent session, a
+        // host job), and are shed rather than sent to the writer (#12394).
+        // Without it every read a CLI makes (`forge wait-checks`,
+        // `recover-orphans`, `check-stale-blocked`, the pipeline snapshot)
+        // spent the writer. With neither exported, nothing changes.
+        loom_daemon::forge_gateway::enable_cli_reads();
         return match command {
             // `status` connects to the running daemon over its Unix socket, so
             // it needs the async runtime (unlike the other sync subcommands).
@@ -401,8 +406,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         ),
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
-    // #11346: J1 concern verification (logged, off-thread; no-op when disabled).
-    loom_daemon::journal::execution::log_startup_verification();
 
     // #6171: record the daemon's own primary workspace root once, before any
     // forge call that could trigger a forced per-owner credential refresh
@@ -411,6 +414,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `.loom/gh-config-by-owner/*` here regardless of which managed repo's
     // checkout root the refresh was triggered from.
     credential_preflight::register_primary_workspace_root(&sweep_workspace);
+    // #12493: fleet dispatch is a host property, carried by this workspace's
+    // host-local tier; every managed repo's claims, ticks and heartbeats read
+    // the flag from here, not from their own repo roots.
+    loom_daemon::fleet_dispatch::worker::set_host_root(&sweep_workspace);
 
     // Startup forge-credential preflight (Issue #4005; GitHub App identity
     // mechanism added by #4430). Resolved once, here — immediately before the
@@ -946,10 +953,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // invariant (#6615) intact despite the passes no longer blocking startup.
     let startup_reconciliation_ready =
         daemon_startup_reconciliation::spawn_startup_passes(sweep_workspace.clone());
-    let _claim_reconciliation_handle = claim_reconciliation::spawn_periodic_reconciliation_task(
-        sweep_workspace.clone(),
-        event_bus.clone(),
-    );
+    let _claim_reconciliation_handle =
+        claim_reconciliation::spawn_periodic_reconciliation_task(sweep_workspace.clone());
 
     // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
     // watchdog knobs from `.loom/config.json → autonomous` with env override
@@ -1105,6 +1110,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
         loom_daemon::observability::daemon_exit::register_in_flight_lister(move || {
             loom_daemon::ipc::in_flight_sweep_ids(&pool, &root)
         });
+    }
+
+    // #12876: on an EC2 host, watch for spot interruption / rebalance notices.
+    // Never started (no IMDS traffic) elsewhere.
+    {
+        let pool = workspace_pool.clone();
+        let root = sweep_workspace.clone();
+        if loom_daemon::host_loss::spawn(move || loom_daemon::ipc::in_flight_sweeps(&pool, &root)) {
+            log::info!("host_loss: EC2 host; watching for spot interruption notices (#12876)");
+        }
     }
 
     // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
@@ -1321,9 +1336,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // concurrency scaling added in #3811 — Phase B). Opt-in via
     // `LOOM_WORK_FINDER`. Each tick queries the forge for open `loom:issue`
     // items and dispatches up to a **work-driven** cap — recomputed every tick as
-    // `min(disk headroom, ram headroom, configured_max)` (the CPU/load term
-    // added in #3978 was removed in #4512; the token-pool term was removed in
-    // #5270) — through the same `SweepRegistry::dispatch()` path the IPC
+    // the configured max alone (the CPU/load term added in #3978 was removed
+    // in #4512, the token-pool term in #5270, and the disk and RAM terms in
+    // #12330 / #12406) — through the same `SweepRegistry::dispatch()` path the IPC
     // `DispatchSweep` request uses. `LOOM_WORK_FINDER_MAX_CONCURRENT` is
     // repurposed (Phase A → B) from a fixed target into the operator ceiling;
     // the cap also never exceeds the scratch-volume disk headroom nor the
@@ -1345,8 +1360,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
-        // #9255: opt-in event-gated polling; read once at startup (restart to change).
-        loom_daemon::forge_events::poll_gate::configure_for(&sweep_workspace, interval);
         // #6203: also resolve *which layer* supplied `configured_max` (env /
         // config / default) so the startup log below can tell an operator
         // whether their `.loom/config.json` edit was actually picked up. This
@@ -1360,9 +1373,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // once, here at startup, naming exactly what is being ignored and what
         // to tune instead.
         work_finder::warn_deprecated_cpu_knobs(&work_finder_config);
-        // The per-tick admission (ramp) cap (#4234) rides in `configured_max`
-        // and, like it, is re-read every tick since #12090.
-        let max_admissions_per_tick = configured_max.max_admissions_per_tick.0;
         // #4084: hold new dispatch off a root while its build-gate run is in
         // flight, so a fresh sweep build does not race the gate's own build for
         // cores (the contention that timed the gate out under #4073's mild
@@ -1371,57 +1381,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
         let suppress_dispatch_during_gate = main_health_gate::resolve_suppress_dispatch_during_gate(
             &main_health_gate::read_autonomous_gate_config(&sweep_workspace),
         );
-        // Host-distress circuit breaker (#4235): resolve its config once at
-        // startup (env > config > default, default-ON) from the daemon's primary
-        // workspace and register the process-global handle. The work-finder loop
-        // (spawned just below) samples load-per-core into it each tick and
-        // consults it as a second dispatch suppressor; `loom-daemon status` and
-        // the `dispatch_sweep` IPC handler read it via the same global. Registered
-        // only when the work-finder is enabled, since the loop is the breaker's
-        // sole sampler — a daemon with no work-finder never trips it (and its
-        // dispatch_sweep sees a Closed/absent breaker: zero behavior change).
-        let host_breaker_config = host_breaker::resolve_config_for(&sweep_workspace);
-        host_breaker::register_global(std::sync::Arc::new(
-            host_breaker::SharedHostBreaker::new(host_breaker_config)
-                .with_disk_guard(&sweep_workspace),
-        ));
-        log::info!(
-            "host_breaker: enabled={} (load_per_core_trip={:.2}, sustain_ticks={}, cooldown_secs={})",
-            host_breaker_config.enabled,
-            host_breaker_config.load_per_core_threshold,
-            host_breaker_config.sustain_ticks,
-            host_breaker_config.cooldown_secs,
-        );
-        // Saturation admission brake (#4903): same startup-resolve +
-        // process-global-registration shape as the breaker above, and registered
-        // in the same place for the same reason — the work-finder loop is its
-        // sole sampler, so a daemon with no work-finder never engages it. The
-        // brake is the *point-in-time* half of the load-aware pair: it holds NEW
-        // admissions while the host is already saturated and releases the moment
-        // it recovers, where the breaker latches on sustained distress and holds
-        // through a cool-down. Neither ever touches a running sweep.
-        let admission_brake_config = admission_brake::resolve_config_for(&sweep_workspace);
-        admission_brake::register_global(std::sync::Arc::new(
-            admission_brake::SharedAdmissionBrake::new(admission_brake_config),
-        ));
-        log::info!(
-            "admission_brake: enabled={} (load_per_core_hold={:.2}; holds NEW sweep admissions \
-             only — in-flight sweeps are never preempted; starvation escape hatch: warn at \
-             {}s, yield one tick at {}s of held+0-in-flight, #5715)",
-            admission_brake_config.enabled,
-            admission_brake_config.load_per_core_threshold,
-            admission_brake_config.starvation_warn_secs,
-            admission_brake_config.starvation_escape_secs,
-        );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, \
-             configured_max={} (source={}), \
-             max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
-             dynamic cap = min(disk, ram, configured_max) — token axis is \
-             selection-only, not a cap, since #5270, \
-             global across workspaces; configured_max, max_admissions_per_tick and the \
-             brake/breaker thresholds are re-read every tick — a config edit hot-applies, \
-             an env override needs a restart, #9060/#12090)",
+             cap = maxConcurrent = {} (source={}; nothing else limits it, #12406), \
+             build_slots={}, global across workspaces; maxConcurrent is re-read every \
+             tick — a config edit hot-applies, an env override needs a restart, #9060)",
             interval.as_secs(),
             configured_max.value,
             configured_max.source,
@@ -1453,18 +1417,20 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
         None
     };
-    // #11295: loom-ui's Alerts page, before its producers below start.
-    // Started before the watches below; alerts raised earlier wait in its outbox.
-    if loom_daemon::loom_ui_alerts::start(&sweep_workspace).is_some() {
-        loom_daemon::loom_ui_alerts::watches::spawn_all(&sweep_workspace);
-    }
     // #11104: star-liveness is gone; its `autonomous.operatorPriority` keys warn once.
     work_finder::operator_priority::warn_retired_config(&sweep_workspace);
-    let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
-        sweep_workspace.clone(),
-        socket_path.clone(),
-        Some(event_bus.clone()),
-    ); // #10164
+    // #11406: the fleet-captain gauge block is gone; its keys warn once.
+    loom_daemon::observability::retired_captain_config::warn_retired_config(&sweep_workspace);
+    // #12812: the dashboard /ingest target is retired; legacy keys warn once.
+    loom_daemon::observability::retired_captain_config::warn_retired_ingest_config(
+        &sweep_workspace,
+    );
+
+    // #12809: the dashboard event-feed client and its consumers are gone;
+    // leftover `forgeEvents` / `LOOM_FORGE_EVENTS_*` settings warn once.
+    loom_daemon::observability::retired_captain_config::warn_retired_forge_events_config(
+        &sweep_workspace,
+    );
 
     // Idle-edge role triggering (#4364) is inert without the work-finder loop:
     // the work finder is the sole source of the per-root idle signal, so an
@@ -1570,14 +1536,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // Fleet-captain singleton tasks that own their loop (`fleet_singletons`):
     // the GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
     // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
-    // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
-    // is on; and the intake reconcile singleton (W7), a config read per tick
+    // off; and the intake reconcile singleton (W7), a config read per tick
     // unless `fleet.intakeReconcile.singleton` makes this host the producer.
     // (The `loom:blocked` release task that used to start here was retired,
     // #11301.) The role-runner decision is resolved here, once, and reused below.
     let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
     let role_runner_on = role_runner::resolve_enabled(&role_runner_config);
-    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus);
+    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone());
 
     // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
     let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);
@@ -1918,8 +1883,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             watch_registry::GhWatchProbe::new(),
             interval,
             expiry,
-            event_bus.clone(),
-            sweep_workspace.clone(),
         ))
     } else {
         log::debug!(
@@ -1981,6 +1944,19 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let _observer_handles =
         observer_tasks::spawn(&sweep_workspace, &event_bus, workspace_pool.clone());
 
+    // #11295 / #12806: alerts go out as `alert.transition` OTLP records, so
+    // the output is decided once the exporters above are up. Alerts raised
+    // earlier (credential preflight, the fleet-sync startup pass) were held
+    // and go out now; the watches and fleet_alert start after it.
+    if loom_daemon::alerts::start().is_some() {
+        loom_daemon::alerts::watches::spawn_all(&sweep_workspace);
+    }
+    let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
+        sweep_workspace.clone(),
+        socket_path.clone(),
+        Some(event_bus.clone()),
+    ); // #10164
+
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state
     // (#3930), and `sweep_workspace` is the `effective_roots` fallback for the
@@ -2001,6 +1977,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         drain_state.clone(),
     );
 
+    // SIGUSR1 dumps the async task tree to the log for a hung tick (#12079).
+    task_dump::spawn_signal_listener();
+
     // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
     // (Ctrl-C, interactive) and SIGTERM (`kill <pid>`, the default signal a
     // backgrounded daemon receives from `loom-daemon-stop.sh` — #3813). Either
@@ -2011,9 +1990,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // independent detached processes and survive a daemon restart by design
     // (killing the dispatcher must not kill dispatched work). This is the
     // documented "survive, don't drain" decision (see daemon-reference.md).
-    // SIGUSR1 dumps the async task tree to the log for a hung tick (#12079).
-    task_dump::spawn_signal_listener();
-
     let socket_path_clone = socket_path.clone();
     tokio::spawn(async move {
         let signal_name = wait_for_shutdown_signal().await;

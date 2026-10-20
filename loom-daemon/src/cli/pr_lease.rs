@@ -562,8 +562,13 @@ impl Gh {
             .forge_op(fop)
             .program(&self.bin)
             .current_dir(&self.root)
-            // W4-C: these reads verify this claimant's own writes.
-            .writer_identity()
+        // Reads are reader-only (#12394, #12584): served by a reader App or
+        // the read gateway, or shed (`None`, "no answer"), never the writer.
+        // The lease tie-break only trusts a read that shows this host's own
+        // lease, and the gateway revalidates every cached answer, so a
+        // reader's view of this process's own post is safe to decide on;
+        // a read that misses it reads as "not held yet" and is retried.
+        // Writes name their repo and always run on the writer.
     }
 
     /// Every trusted `loom:pr-lease*` comment on `pr`; `None` on any failure.
@@ -672,7 +677,7 @@ impl Gh {
         Some((open, labels))
     }
 
-    /// The single issue `pr`'s body closes (its provenance story), if any.
+    /// The single issue `pr`'s body closes (its story), if any.
     fn story_issue(&self, pr: u64) -> Option<u32> {
         let out = self
             .inv("pr_lease.pr_body", AccessIntent::Read, ops::PR_VIEW_STATE)
@@ -693,12 +698,7 @@ impl Gh {
 
 /// The lease comment body. `renewed` adds the line that makes each renewal
 /// PATCH change the body (a forge may not advance `updated_at` otherwise).
-pub(crate) fn lease_body(
-    me: &Identity,
-    pr: u64,
-    renewed: Option<DateTime<Utc>>,
-    provenance: &str,
-) -> String {
+pub(crate) fn lease_body(me: &Identity, pr: u64, renewed: Option<DateTime<Utc>>) -> String {
     let mut body = format!(
         "{marker}\nPR #{pr}'s `{label}` claim is held by the {role} of sweep `{sweep}` on host \
          `{host}`. This comment is a **PR lease record** (#9401): its liveness signal is its own \
@@ -714,28 +714,7 @@ pub(crate) fn lease_body(
     if let Some(at) = renewed {
         body.push_str(&format!("\n<!-- loom:pr-lease-renewed at={} -->", at.to_rfc3339()));
     }
-    if !provenance.is_empty() {
-        body.push_str("\n\n");
-        body.push_str(provenance);
-    }
     body
-}
-
-/// The hidden `loom:provenance v1` line for comments this verb posts. `host=`
-/// carries the same published id as the lease marker, so one comment never
-/// pairs an opaque id with the raw hostname it hides (#6322).
-pub(crate) fn provenance_line(root: &Path, me: &Identity, story_issue: Option<u32>) -> String {
-    use loom_daemon::provenance::marker::{collect, MarkerInputs};
-    let mut marker = collect(
-        root,
-        &MarkerInputs {
-            issue: story_issue,
-            sweep: Some(&me.sweep),
-            ..MarkerInputs::default()
-        },
-    );
-    marker.host = me.host.clone();
-    marker.render()
 }
 
 // ---------------------------------------------------------------------------
@@ -822,6 +801,15 @@ pub(crate) struct ReleaseArgs {
     /// exemption window or unstamped). Absent or unknown: the default.
     #[arg(long, value_name = "REASON")]
     pub(crate) skip_reason: Option<String>,
+    /// A Champion step's `CHAMPION-STEP` outcome word (#12616), recorded on
+    /// the released lease. Absent: recorded as `outcome=none`.
+    #[arg(long, value_name = "WORD")]
+    pub(crate) outcome: Option<String>,
+    /// The gate a non-merging Champion step stopped at (#12715), recorded on
+    /// the released lease beside the outcome: a `reason=` token of the
+    /// step's `CHAMPION-STEP` line (`facts_unread`, `merge_rc7`, ...).
+    #[arg(long, value_name = "TOKEN")]
+    pub(crate) reason: Option<String>,
 }
 
 /// `reap`'s arguments: the dead claimant's exact identity, as its own
@@ -857,7 +845,7 @@ impl PrLeaseAction {
             Self::Fence(c) => with_context(&c, EXIT_HELD, false, |ctx| ctx.fence()),
             Self::Attach(c) => with_context(&c, EXIT_UNVERIFIED, false, |ctx| ctx.attach()),
             Self::Release(r) => with_context(&r.common, EXIT_HELD, true, |ctx| {
-                ctx.release(r.skip_reason.as_deref())
+                ctx.release(r.skip_reason.as_deref(), r.outcome.as_deref(), r.reason.as_deref())
             }),
             Self::Check(c) => with_context(&c, EXIT_UNVERIFIED, false, |ctx| ctx.check()),
             Self::Reap(r) => {
@@ -1009,7 +997,7 @@ impl Ctx {
                     .flatten()
                     .find(|r| r.id == id)
                     .map_or_else(self.now, |r| r.updated_at);
-                self.start_renewal(id, self.gh.story_issue(self.pr()), leased_at);
+                self.start_renewal(id, leased_at);
                 loom_daemon::observability::lifecycle::role_target::record_claim(self.pr());
                 self.list_held();
                 println!("{} {}", self.me.host, self.me.sweep);
@@ -1023,9 +1011,7 @@ impl Ctx {
         if let Some(code) = rows.as_deref().and_then(|r| self.activity_refusal(r)) {
             return code;
         }
-        let story = self.gh.story_issue(self.pr());
-        let provenance = provenance_line(&self.gh.root, &self.me, story);
-        let body = lease_body(&self.me, self.pr(), None, &provenance);
+        let body = lease_body(&self.me, self.pr(), None);
         // Before the post, so the renewer's guard never overestimates the
         // lease's remaining life.
         let leased_at = (self.now)();
@@ -1043,7 +1029,7 @@ impl Ctx {
                     "{}\nThis {role}'s PR lease (sweep `{sweep}`, host `{host}`) was not the \
                      earliest live `{role}` lease on this PR: sweep `{ws}` on host `{wh}` has an \
                      earlier forge-assigned comment id. Standing down before touching a worktree \
-                     or the `{label}` label (#9401, claim-then-verify-order #6287).\n\n{provenance}",
+                     or the `{label}` label (#9401, claim-then-verify-order #6287).",
                     self.me.yield_marker(&winner),
                     role = self.me.role.as_str(),
                     sweep = self.me.sweep,
@@ -1062,7 +1048,7 @@ impl Ctx {
                 EXIT_PEER
             }
             Ordering::Won | Ordering::Unverified => {
-                self.start_renewal(own_id, story, leased_at);
+                self.start_renewal(own_id, leased_at);
                 self.say(&format!(
                     "lease {own_id} held (host={} sweep={}); add `{}` now",
                     self.me.host,
@@ -1090,7 +1076,7 @@ impl Ctx {
                     .flatten()
                     .find(|r| r.id == id)
                     .map_or_else(self.now, |r| r.updated_at);
-                self.start_renewal(id, self.gh.story_issue(self.pr()), leased_at);
+                self.start_renewal(id, leased_at);
                 EXIT_HELD
             }
             ClaimState::HeldByPeer { holder, .. } => {
@@ -1206,7 +1192,7 @@ impl Ctx {
         Ordering::Won
     }
 
-    fn start_renewal(&self, comment_id: u64, story: Option<u32>, leased_at: DateTime<Utc>) {
+    fn start_renewal(&self, comment_id: u64, leased_at: DateTime<Utc>) {
         if !self.manage_renewer {
             return;
         }
@@ -1214,7 +1200,7 @@ impl Ctx {
             self.say("no --watch-pid: lease not renewed, it ages out at the TTL");
             return;
         };
-        let line = renew::spawn(self, comment_id, watch_pid, story, leased_at);
+        let line = renew::spawn(self, comment_id, watch_pid, leased_at);
         self.say(&line);
     }
 
@@ -1248,21 +1234,32 @@ impl Ctx {
     /// is the pass's own `--skip-reason` (#11972): a Judge pass that stood
     /// down for pending CI is not recorded if CI has settled since, only if
     /// it is stuck ([`backstop::CiState::exempts`]).
-    pub(crate) fn release(&self, skip_reason: Option<&str>) -> i32 {
+    pub(crate) fn release(
+        &self,
+        skip_reason: Option<&str>,
+        outcome: Option<&str>,
+        stop_reason: Option<&str>,
+    ) -> i32 {
         if let Some(path) = &self.lease_file {
             loom_daemon::pr_lease_reap::forget_in(path, &self.held());
         }
-        self.release_with(None, skip_reason)
+        self.release_with(None, skip_reason, outcome, stop_reason)
     }
 
     /// `reap`: [`release`](Self::release) on behalf of a claimant the role
     /// runner terminated (#11931). A Judge's reap records the no-verdict pass
     /// whatever the head's CI is doing ([`backstop::reaped_release_fields`]).
     pub(crate) fn reap(&self, reason: &str) -> i32 {
-        self.release_with(Some(reason), None)
+        self.release_with(Some(reason), None, None, None)
     }
 
-    fn release_with(&self, reaped: Option<&str>, skip_reason: Option<&str>) -> i32 {
+    fn release_with(
+        &self,
+        reaped: Option<&str>,
+        skip_reason: Option<&str>,
+        outcome: Option<&str>,
+        stop_reason: Option<&str>,
+    ) -> i32 {
         let stopped = if self.manage_renewer {
             renew::stop(self)
         } else {
@@ -1309,7 +1306,22 @@ impl Ctx {
             lines.next();
             let rest: Vec<&str> = lines.collect();
             // The released marker keeps the lease's own step.
-            let body = format!("{}\n{}", holder.released_marker_with(extra), rest.join("\n"));
+            // A Champion merge step's release records its outcome (#12616);
+            // a reaped one died without releasing, so it has none.
+            let champion = if holder.step == Some(StepRole::ChampionPromote) {
+                String::new()
+            } else {
+                backstop::champion_outcome_fields(
+                    self.me.role,
+                    outcome.filter(|_| reaped.is_none()),
+                    stop_reason.filter(|_| reaped.is_none()),
+                )
+            };
+            let body = format!(
+                "{}\n{}",
+                holder.released_marker_with(&format!("{extra}{champion}")),
+                rest.join("\n")
+            );
             if self.gh.patch(row.id, &body).is_ok() {
                 released += 1;
             }

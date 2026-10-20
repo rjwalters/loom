@@ -359,7 +359,7 @@ impl super::AutoUpdateState {
     /// Log and post the loop-level alert for a freshness incident that opened
     /// or recovered on this tick (once each; see the module doc).
     pub(super) fn alert_on_freshness_edge(&mut self, snapshot: &super::AutoUpdateStatusSnapshot) {
-        use crate::loom_ui_alerts::{Alert, Severity, State};
+        use crate::alerts::{Alert, Severity, State};
         const RULE: &str = "auto-update.stalled";
         let Some(report) = &snapshot.freshness else {
             return;
@@ -367,7 +367,7 @@ impl super::AutoUpdateState {
         match self.freshness.edge(Utc::now(), report) {
             Some(Edge::Opened(summary)) => {
                 log::error!("auto_update: {summary}");
-                crate::loom_ui_alerts::post(
+                crate::alerts::post(
                     Alert::new(
                         RULE,
                         "auto_update",
@@ -380,7 +380,7 @@ impl super::AutoUpdateState {
             }
             Some(Edge::Recovered) => {
                 log::info!("auto_update: progress resumed (successful check, no overdue release)");
-                crate::loom_ui_alerts::post(Alert::new(
+                crate::alerts::post(Alert::new(
                     RULE,
                     "auto_update",
                     "Self-update is making progress again",

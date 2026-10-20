@@ -180,16 +180,91 @@ struct PublishedAt {
 /// *unknown* into *absent* there is exactly the fail-open that issue closes.
 #[must_use]
 pub fn asset_names(root: &Path, repo: &str, tag: Option<&str>) -> Option<Vec<String>> {
+    asset_names_detailed(root, repo, tag).ok()
+}
+
+/// Retries after the first failed read of release metadata (#12849).
+const READ_RETRIES: u32 = 2;
+/// Fixed pause between those attempts; each attempt keeps its own `gh` deadline.
+const READ_BACKOFF: Duration = Duration::from_secs(2);
+/// Longest `gh` stderr excerpt carried into a log line.
+const STDERR_EXCERPT_CHARS: usize = 240;
+
+/// One line saying why a query did not produce a value: exit status plus a
+/// bounded `gh` stderr excerpt (HTTP status / rate-limit text when present).
+fn describe_failure<T>(q: &Query<T>) -> String {
+    match q {
+        Query::Failed { status, stderr } => {
+            let excerpt: String = stderr.chars().take(STDERR_EXCERPT_CHARS).collect();
+            if excerpt.is_empty() {
+                format!("gh {status}")
+            } else {
+                format!("gh {status}: {}", excerpt.replace('\n', " "))
+            }
+        }
+        Query::Malformed { error, .. } => format!("gh output could not be decoded: {error}"),
+        Query::Unavailable(u) => format!("gh did not answer: {u:?}"),
+        Query::Empty => "gh returned an empty result".to_string(),
+        Query::Populated(_) => "no error".to_string(),
+    }
+}
+
+/// Whether another attempt could plausibly change the answer. A routing block
+/// or down adapter is not the forge's doing and is never retried (#9987), and
+/// a definite `Empty` is an answer.
+fn is_transient<T>(q: &Query<T>) -> bool {
+    match q {
+        Query::Failed { .. } | Query::Malformed { .. } => true,
+        Query::Unavailable(u) => !matches!(
+            u,
+            crate::cmd_out::Unavailable::RoutingBlocked(_)
+                | crate::cmd_out::Unavailable::AdapterUnavailable(_)
+        ),
+        Query::Populated(_) | Query::Empty => false,
+    }
+}
+
+/// Run `attempt` until it yields a value, up to `1 + retries` times with
+/// `backoff` between tries. `Err` carries the LAST failure's description.
+fn read_retrying<T>(
+    mut attempt: impl FnMut() -> Query<T>,
+    retries: u32,
+    backoff: Duration,
+) -> Result<T, String> {
+    let mut tries = 0;
+    loop {
+        let q = attempt();
+        match q {
+            Query::Populated(v) => return Ok(v),
+            _ if tries < retries && is_transient(&q) => {
+                tries += 1;
+                std::thread::sleep(backoff);
+            }
+            _ => {
+                let why = describe_failure(&q);
+                return Err(if tries == 0 {
+                    why
+                } else {
+                    format!("{why} (after {} attempts)", tries + 1)
+                });
+            }
+        }
+    }
+}
+
+/// [`asset_names`] with the reason a read failed, retrying transient failures.
+fn asset_names_detailed(root: &Path, repo: &str, tag: Option<&str>) -> Result<Vec<String>, String> {
     let mut args: Vec<&str> = vec!["release", "view"];
     if let Some(t) = tag {
         args.push(t);
     }
     args.extend_from_slice(&["--json", "assets", "-R", repo]);
-    let q: Query<Assets> = gh_query(&args, root, false, |_: &Assets| false);
-    match q {
-        Query::Populated(a) => Some(a.assets.into_iter().map(|a| a.name).collect()),
-        _ => None,
-    }
+    read_retrying(
+        || gh_query::<Assets, _>(&args, root, false, |_: &Assets| false),
+        READ_RETRIES,
+        READ_BACKOFF,
+    )
+    .map(|a| a.assets.into_iter().map(|a| a.name).collect())
 }
 
 /// Which repo's releases to ask about, by **descending** priority (#8513).
@@ -288,16 +363,10 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
         match found {
             Walk::Found { tag, version } => (tag, version),
             Walk::NoneComplete { newest_tag } => {
-                let listed = asset_names(root, &repo, Some(&newest_tag));
+                let listed = asset_names_detailed(root, &repo, Some(&newest_tag));
                 return Resolution::Unresolved(format!(
                     "no listed release of {repo} publishes this platform's artifact; {}",
-                    classify_no_artifact(
-                        root,
-                        &repo,
-                        &newest_tag,
-                        &target,
-                        listed.as_ref().map(Vec::len),
-                    )
+                    classify_no_artifact(root, &repo, &newest_tag, &target, &listed)
                 ));
             }
         }
@@ -323,21 +392,17 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
         // An unreadable asset list is `None` here and resolves to the same
         // empty list it always did: unresolved, fall back to source. (The
         // fetch path treats that `None` differently -- see `asset_names`.)
-        let listed = asset_names(root, &repo, Some(&tag));
+        let listed = asset_names_detailed(root, &repo, Some(&tag));
         let names: Vec<String> = listed.clone().unwrap_or_default();
         if !names.contains(&bin_name) || !names.contains(&sha_name) {
             return Resolution::Unresolved(classify_no_artifact(
-                root,
-                &repo,
-                &tag,
-                &target,
-                listed.as_ref().map(Vec::len),
+                root, &repo, &tag, &target, &listed,
             ));
         }
         (tag, version)
     };
 
-    let published_at = fetch_published_at(&tag, &repo, root);
+    let published_at = fetch_published_at(&tag, &repo, root).ok();
     let asset_sha256 = fetch_asset_sha256(&tag, &repo, &sha_name, root);
     let (installed_version, installed_commit) = installed_identity(inputs.installed_bin.as_deref());
 
@@ -461,14 +526,14 @@ fn walk_releases(root: &Path, repo: &str, bin_name: &str, sha_name: &str) -> Opt
 pub fn explain_no_artifact(root: &Path, repo: &str, tag: &str, target: &str) -> Option<String> {
     let bin_name = format!("loom-daemon-{target}");
     let sha_name = format!("{bin_name}.sha256");
-    let listed = asset_names(root, repo, Some(tag));
+    let listed = asset_names_detailed(root, repo, Some(tag));
     if listed
         .as_ref()
-        .is_some_and(|n| n.contains(&bin_name) && n.contains(&sha_name))
+        .is_ok_and(|n| n.contains(&bin_name) && n.contains(&sha_name))
     {
         return None;
     }
-    Some(classify_no_artifact(root, repo, tag, target, listed.as_ref().map(Vec::len)))
+    Some(classify_no_artifact(root, repo, tag, target, &listed))
 }
 
 /// The one place the no-artifact reason is assembled, shared by [`resolve`]
@@ -483,13 +548,23 @@ fn classify_no_artifact(
     repo: &str,
     tag: &str,
     target: &str,
-    asset_count: Option<usize>,
+    listed: &Result<Vec<String>, String>,
 ) -> String {
     let bin_name = format!("loom-daemon-{target}");
     let sha_name = format!("{bin_name}.sha256");
-    let age =
-        release_age_minutes(fetch_published_at(tag, repo, root).as_deref(), chrono::Utc::now());
-    no_artifact_reason(tag, repo, target, &bin_name, &sha_name, asset_count, age)
+    let published = fetch_published_at(tag, repo, root);
+    let age = release_age_minutes(published.as_deref().ok(), chrono::Utc::now());
+    let read_error = listed.as_ref().err().or(published.as_ref().err());
+    no_artifact_reason(
+        tag,
+        repo,
+        target,
+        &bin_name,
+        &sha_name,
+        listed.as_ref().ok().map(Vec::len),
+        age,
+        read_error.map(String::as_str),
+    )
 }
 
 /// Minutes since `published_at` (an RFC3339 timestamp as `gh` reports it), or
@@ -559,13 +634,21 @@ fn no_artifact_reason(
     sha_name: &str,
     asset_count: Option<usize>,
     age_minutes: Option<i64>,
+    read_error: Option<&str>,
 ) -> String {
     let head =
         format!("release {tag} of {repo} has no artifact for target {target} (checked for {bin_name} + {sha_name})");
     let assets = match asset_count {
         Some(0) => "it publishes no assets at all yet".to_string(),
         Some(n) => format!("it publishes {n} asset(s), none matching this target"),
-        None => "its asset list could not be read".to_string(),
+        None => match read_error {
+            Some(e) => format!("its asset list could not be read ({e})"),
+            None => "its asset list could not be read".to_string(),
+        },
+    };
+    let age_unread = match read_error {
+        Some(e) if asset_count.is_some() => format!("its publish time could not be read ({e})"),
+        _ => "its publish time could not be read".to_string(),
     };
     match (assets_may_still_be_uploading(age_minutes), age_minutes) {
         (true, Some(m)) => format!(
@@ -579,24 +662,25 @@ fn no_artifact_reason(
             human_age(m)
         ),
         (_, None) => format!(
-            "{head}; {assets} and its publish time could not be read, so an in-flight upload cannot be ruled out"
+            "{head}; {assets} and {age_unread}, so an in-flight upload cannot be ruled out"
         ),
     }
 }
 
-/// The release's publish timestamp, verbatim. `None` on an older `gh` that does
-/// not report the field.
-fn fetch_published_at(tag: &str, repo: &str, root: &Path) -> Option<String> {
-    let q: Query<PublishedAt> = gh_query(
-        &["release", "view", tag, "--json", "publishedAt", "-R", repo],
-        root,
-        false,
-        |p: &PublishedAt| p.published_at.is_empty(),
-    );
-    match q {
-        Query::Populated(p) => Some(p.published_at),
-        _ => None,
-    }
+/// The release's publish timestamp, verbatim, retrying transient failures.
+/// `Err` says why it could not be read (#12849).
+fn fetch_published_at(tag: &str, repo: &str, root: &Path) -> Result<String, String> {
+    let args = ["release", "view", tag, "--json", "publishedAt", "-R", repo];
+    read_retrying(
+        || {
+            gh_query::<PublishedAt, _>(&args, root, false, |p: &PublishedAt| {
+                p.published_at.is_empty()
+            })
+        },
+        READ_RETRIES,
+        READ_BACKOFF,
+    )
+    .map(|p| p.published_at)
 }
 
 /// The published sha256 for this platform's binary, read from the release's own

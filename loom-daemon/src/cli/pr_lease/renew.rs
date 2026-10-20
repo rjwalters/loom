@@ -48,9 +48,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use super::super::lease_renewer::{self, Key, Store};
-use super::{
-    claim_state, lease_body, provenance_line, ClaimState, Ctx, Gh, Identity, Role, Row, GH_TIMEOUT,
-};
+use super::{claim_state, lease_body, ClaimState, Ctx, Gh, Identity, Role, Row, GH_TIMEOUT};
 
 /// Renewal cadence, shared with the issue renewer's knob.
 const INTERVAL_ENV: &str = "SWEEP_LEASE_RENEW_INTERVAL_SECS";
@@ -87,7 +85,9 @@ pub(crate) struct RenewLoopArgs {
     pub(crate) comment_id: u64,
     #[arg(long)]
     pub(crate) watch_pid: u32,
-    #[arg(long)]
+    /// Accepted and ignored: renewers started by an older binary still pass it.
+    #[arg(long, hide = true)]
+    #[allow(dead_code)]
     pub(crate) story_issue: Option<u32>,
     #[arg(long, default_value_t = DEFAULT_MAX_AGE_SECS)]
     pub(crate) max_age: u64,
@@ -292,7 +292,6 @@ pub(crate) fn spawn(
     ctx: &Ctx,
     comment_id: u64,
     watch_pid: u32,
-    story: Option<u32>,
     leased_at: DateTime<Utc>,
 ) -> String {
     let interval = std::env::var(INTERVAL_ENV)
@@ -322,9 +321,6 @@ pub(crate) fn spawn(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(story) = story {
-        command.args(["--story-issue", &story.to_string()]);
-    }
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
@@ -409,7 +405,6 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
         say(&format!("renewer stopping: refusing to write here (#9548): {why}"));
         return;
     }
-    let provenance = provenance_line(&root, &me, args.story_issue);
     let policy = loom_daemon::comment_trust::TrustPolicy::for_root(&root);
     let ttl_minutes = loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes();
     let ttl = chrono::Duration::seconds((ttl_minutes * 60.0) as i64);
@@ -460,7 +455,7 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
                     say(&format!("renewer stopping: {why}"));
                     return;
                 }
-                let body = lease_body(&me, args.pr, Some(attempt), &provenance);
+                let body = lease_body(&me, args.pr, Some(attempt));
                 match gh.patch(args.comment_id, &body) {
                     Ok(()) => {
                         last_renewed = attempt;

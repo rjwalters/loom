@@ -47,37 +47,3 @@ fn test_merge_settings_drops_legacy_loom_permissions() {
     assert!(!allow.contains(&"Bash(./.loom/scripts/**:*)"));
     assert_eq!(allow.len(), 3);
 }
-
-#[test]
-fn test_remove_loom_permissions_strips_legacy_rules() {
-    // #9447: uninstall must strip the legacy Loom-shipped rules even though
-    // the current defaults no longer list them, and keep user rules.
-    let mut settings: serde_json::Value = serde_json::from_str(
-        r#"{
-            "permissions": {
-                "allow": [
-                    "Bash(./scripts/*)",
-                    "Bash(./.loom/scripts/*)",
-                    "Bash(./scripts/**:*)",
-                    "Bash(./.loom/scripts/**:*)",
-                    "Bash(make:*)"
-                ]
-            }
-        }"#,
-    )
-    .unwrap();
-
-    let loom_defaults: serde_json::Value = serde_json::from_str(
-        r#"{
-            "permissions": {
-                "allow": ["Bash(./scripts/*)", "Bash(./.loom/scripts/*)"]
-            }
-        }"#,
-    )
-    .unwrap();
-
-    remove_loom_permissions(&mut settings, &loom_defaults);
-
-    let allow = settings["permissions"]["allow"].as_array().unwrap();
-    assert_eq!(allow, &vec![serde_json::json!("Bash(make:*)")]);
-}

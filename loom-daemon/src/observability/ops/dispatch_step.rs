@@ -13,6 +13,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 
 use crate::step_role::StepRole;
+use crate::sweep_registry::step_spawn::StepDrawTerms;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 
 /// `loom.dispatch.admission_result` of a step that launched.
@@ -34,10 +35,37 @@ pub struct StepDispatch<'a> {
     /// Which stage-entry source answered the item's age (design §4.3).
     pub age_source: &'a str,
     pub resumed: bool,
+    /// The weight terms of the draw that picked the step (#12185).
+    pub draw: Option<StepDrawTerms>,
     /// The step's sweep id, once one was assigned.
     pub sweep_id: Option<&'a str>,
     /// How the step's pre-claim ran, for a role-keyed lease claim (#12183).
     pub claim: Option<&'a crate::sweep_registry::step_spawn::lease::ClaimFacts>,
+    /// The fleet-dispatch server's assignment, when it granted the claim
+    /// (#12450): `loom.assignment.id`, which joins this span to the
+    /// `loom.fleet_dispatch.call` spans of the same assignment.
+    pub assignment_id: Option<&'a str>,
+    /// The attempt this grant replaces (#12875): `loom.dispatch.attempt`,
+    /// `loom.dispatch.prev_assignment_id` and `loom.dispatch.prev_end`. Unset
+    /// on a first grant.
+    pub lineage: Option<&'a crate::fleet_dispatch::worker::GrantLineage>,
+    /// The captain's refusal details (#12707): `loom.dispatch.held_by` and
+    /// `loom.dispatch.retry_after_s`, plus `loom.dispatch.hold_until` (wall
+    /// clock) when the refusal is a no-progress hold.
+    pub captain: Option<&'a crate::fleet_dispatch::worker::Refusal>,
+    /// The role draw's model against the model actually launched (#12748).
+    pub models: Option<StepModels<'a>>,
+}
+
+/// Selected versus launched model of a spawned step. Distinct on purpose: a
+/// model in the draw record is a *selection*, not proof the launch used it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepModels<'a> {
+    /// The model the role draw's pick named, if it named one.
+    pub selected: Option<&'a str>,
+    /// The `--model` the child was launched with; `None` when the runtime
+    /// picks its own.
+    pub launched: Option<&'a str>,
 }
 
 /// The span for `step` in `repo` at `at`. Pure.
@@ -60,8 +88,8 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
         attributes.insert("loom.repo".into(), slug.to_string());
         attributes.insert("loom.repo.visibility".into(), visibility.to_string());
     }
-    // A PR step's item is a PR; the issue key would name a story that does
-    // not exist (`sweep_registry/step_story.rs`).
+    // A PR step's item is a PR; the issue key would name an issue that does
+    // not exist (`sweep_registry/step_issue.rs`).
     let item_key = if step.role.acts_on_pr() {
         "loom.pr_number"
     } else {
@@ -76,6 +104,12 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
     attributes.insert("loom.step.draw_attempt".into(), step.draw_attempt.to_string());
     attributes.insert("loom.step.age_source".into(), step.age_source.to_string());
     attributes.insert("loom.step.resumed".into(), step.resumed.to_string());
+    if let Some(draw) = step.draw {
+        attributes.insert("loom.step.weight".into(), draw.weight.to_string());
+        attributes.insert("loom.step.total_weight".into(), draw.total_weight.to_string());
+        attributes.insert("loom.step.repo_items".into(), draw.repo_items.to_string());
+        attributes.insert("loom.step.in_flight_repo".into(), draw.in_flight_repo.to_string());
+    }
     if let Some(id) = step.sweep_id {
         attributes.insert("loom.sweep_id".into(), id.to_string());
     }
@@ -87,6 +121,40 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
         attributes.insert("loom.dispatch.claim_ms".into(), claim.claim_ms.to_string());
         if let Some(tail) = &claim.stderr_tail {
             attributes.insert("loom.dispatch.claim_stderr_tail".into(), tail.clone());
+        }
+        if let Some(rollback) = claim.rollback {
+            attributes.insert("loom.dispatch.claim_rollback".into(), rollback.to_string());
+        }
+    }
+    if let Some(id) = step.assignment_id {
+        attributes.insert("loom.assignment.id".into(), id.to_string());
+    }
+    if let Some(lineage) = step.lineage {
+        attributes.insert("loom.dispatch.attempt".into(), lineage.attempt.to_string());
+        attributes
+            .insert("loom.dispatch.prev_assignment_id".into(), lineage.prev_assignment_id.clone());
+        attributes.insert("loom.dispatch.prev_end".into(), lineage.prev_end.clone());
+    }
+    if let Some(captain) = step.captain {
+        if let Some(held_by) = &captain.held_by {
+            attributes.insert("loom.dispatch.held_by".into(), held_by.clone());
+        }
+        if let Some(retry) = captain.retry_after_s {
+            attributes.insert("loom.dispatch.retry_after_s".into(), retry.to_string());
+            if step.reason == "captain_cooldown" {
+                attributes.insert(
+                    "loom.dispatch.hold_until".into(),
+                    crate::fleet_dispatch::telemetry::hold_until(at, retry),
+                );
+            }
+        }
+    }
+    if let Some(models) = step.models {
+        if let Some(selected) = models.selected {
+            attributes.insert("loom.step.model_selected".into(), selected.to_string());
+        }
+        if let Some(launched) = models.launched {
+            attributes.insert("loom.step.model_launched".into(), launched.to_string());
         }
     }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
@@ -134,8 +202,18 @@ mod tests {
             draw_attempt: 3,
             age_source: "labels_at",
             resumed: false,
+            draw: Some(StepDrawTerms {
+                weight: 4096,
+                total_weight: 65_536,
+                repo_items: 7,
+                in_flight_repo: 2,
+            }),
             sweep_id: Some("step-judge-42-1"),
             claim: None,
+            assignment_id: None,
+            lineage: None,
+            captain: None,
+            models: None,
         }
     }
 
@@ -153,6 +231,10 @@ mod tests {
         assert_eq!(attr("loom.step.draw_attempt").as_deref(), Some("3"));
         assert_eq!(attr("loom.step.age_source").as_deref(), Some("labels_at"));
         assert_eq!(attr("loom.step.resumed").as_deref(), Some("false"));
+        assert_eq!(attr("loom.step.weight").as_deref(), Some("4096"));
+        assert_eq!(attr("loom.step.total_weight").as_deref(), Some("65536"));
+        assert_eq!(attr("loom.step.repo_items").as_deref(), Some("7"));
+        assert_eq!(attr("loom.step.in_flight_repo").as_deref(), Some("2"));
         for key in span
             .attributes
             .keys()
@@ -160,6 +242,118 @@ mod tests {
         {
             assert!(
                 crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
+                "{key} is dropped at export"
+            );
+        }
+    }
+
+    /// #12748: the span keeps the draw's selected model apart from the one
+    /// actually launched.
+    #[test]
+    fn a_step_span_separates_the_selected_model_from_the_launched_one() {
+        let step = StepDispatch {
+            models: Some(StepModels {
+                selected: Some("sonnet"),
+                launched: Some("opus"),
+            }),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(span.attributes["loom.step.model_selected"], "sonnet");
+        assert_eq!(span.attributes["loom.step.model_launched"], "opus");
+        for key in ["loom.step.model_selected", "loom.step.model_launched"] {
+            assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key));
+        }
+        let none = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert!(!none.attributes.contains_key("loom.step.model_selected"));
+        assert!(!none.attributes.contains_key("loom.step.model_launched"));
+    }
+
+    /// #12450: a granted step carries the captain's assignment, and it
+    /// survives the export allowlist; a step with none carries no key.
+    #[test]
+    fn a_granted_step_names_its_assignment() {
+        let step = StepDispatch {
+            assignment_id: Some("a-7"),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(
+            span.attributes
+                .get("loom.assignment.id")
+                .map(String::as_str),
+            Some("a-7")
+        );
+        assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&"loom.assignment.id"));
+        let none = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert!(!none.attributes.contains_key("loom.assignment.id"));
+    }
+
+    /// #12875: a re-granted step names the attempt it replaces; a first
+    /// grant carries none of the three keys.
+    #[test]
+    fn a_retried_step_names_its_predecessor() {
+        let lineage = crate::fleet_dispatch::worker::GrantLineage {
+            attempt: 2,
+            prev_assignment_id: "a-6".into(),
+            prev_end: "expired".into(),
+        };
+        let step = StepDispatch {
+            assignment_id: Some("a-7"),
+            lineage: Some(&lineage),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(span.attributes["loom.dispatch.attempt"], "2");
+        assert_eq!(span.attributes["loom.dispatch.prev_assignment_id"], "a-6");
+        assert_eq!(span.attributes["loom.dispatch.prev_end"], "expired");
+        let first = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        for key in [
+            "loom.dispatch.attempt",
+            "loom.dispatch.prev_assignment_id",
+            "loom.dispatch.prev_end",
+        ] {
+            assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key));
+            assert!(!first.attributes.contains_key(key), "{key} on a first grant");
+        }
+    }
+
+    /// #12707: a captain refusal's holder and retry survive the allowlist; a
+    /// cooldown adds the wall-clock end.
+    #[test]
+    fn a_captain_refusal_names_its_holder_and_retry() {
+        let captain = crate::fleet_dispatch::worker::Refusal {
+            held_by: Some("host-b".into()),
+            retry_after_s: Some(60),
+        };
+        let at: DateTime<Utc> = "2026-10-17T12:00:00Z".parse().unwrap();
+        let held = StepDispatch {
+            captain: Some(&captain),
+            ..judge(RESULT_REFUSED, "captain_held")
+        };
+        let s = span(&held, None, at);
+        let attr = |k: &str| s.attributes.get(k).map(String::as_str);
+        assert_eq!(attr("loom.dispatch.held_by"), Some("host-b"));
+        assert_eq!(attr("loom.dispatch.retry_after_s"), Some("60"));
+        assert_eq!(attr("loom.dispatch.hold_until"), None);
+        let cooled = StepDispatch {
+            captain: Some(&captain),
+            ..judge(RESULT_REFUSED, "captain_cooldown")
+        };
+        let s = span(&cooled, None, at);
+        assert_eq!(
+            s.attributes
+                .get("loom.dispatch.hold_until")
+                .map(String::as_str),
+            Some("2026-10-17T12:01:00Z")
+        );
+        for key in [
+            "loom.dispatch.held_by",
+            "loom.dispatch.retry_after_s",
+            "loom.dispatch.hold_until",
+        ] {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key),
                 "{key} is dropped at export"
             );
         }
@@ -195,6 +389,7 @@ mod tests {
             exit_code: Some(5),
             claim_ms: 1234,
             stderr_tail: Some("gh: rate limited".to_string()),
+            rollback: Some("lease_yielded"),
         };
         let step = StepDispatch {
             claim: Some(&facts),
@@ -207,6 +402,7 @@ mod tests {
         assert_eq!(attr("loom.dispatch.claim_exit_code").as_deref(), Some("5"));
         assert_eq!(attr("loom.dispatch.claim_ms").as_deref(), Some("1234"));
         assert_eq!(attr("loom.dispatch.claim_stderr_tail").as_deref(), Some("gh: rate limited"));
+        assert_eq!(attr("loom.dispatch.claim_rollback").as_deref(), Some("lease_yielded"));
         for key in span.attributes.keys().filter(|k| k.contains("claim_")) {
             assert!(
                 crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),

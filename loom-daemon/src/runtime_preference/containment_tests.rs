@@ -95,6 +95,8 @@ struct FakePreparer {
     verified: bool,
     proof: ContainmentProof,
     contained: Vec<String>,
+    /// The model each `contain` call was asked to select its account for.
+    drawn_models: Vec<Option<String>>,
     held: bool,
     releases: usize,
 }
@@ -105,6 +107,7 @@ impl FakePreparer {
             verified,
             proof: ContainmentProof::fixture("seat"),
             contained: Vec::new(),
+            drawn_models: Vec::new(),
             held: false,
             releases: 0,
         }
@@ -115,8 +118,10 @@ impl ContainmentPreparer for FakePreparer {
         &mut self,
         role: &str,
         explicit: Option<&str>,
+        drawn_model: Option<&str>,
         rejection: RuntimeRejection,
     ) -> Result<ResolvedRuntime, RuntimeRejection> {
+        self.drawn_models.push(drawn_model.map(str::to_owned));
         self.contained
             .push(format!("{role}:{}", explicit.unwrap_or("-")));
         if !self.verified {
@@ -259,4 +264,37 @@ fn read_roles_never_consult_the_preparer() {
     assert_eq!(chosen.tap.runtime, "codex");
     assert!(chosen.admitted.execution.is_none());
     assert!(preparer.contained.is_empty());
+}
+
+/// #12753: a contained candidate's account is selected for the model its draw
+/// pick names, and that is the model the admitted selection carries to launch.
+#[test]
+#[serial_test::serial]
+fn a_contained_draw_selects_its_account_for_the_model_it_launches() {
+    let env = Env::new();
+    env.provision_codex_seat();
+    let dir = workspace(None);
+    fs::write(
+        dir.path().join(".loom/config.json"),
+        serde_json::json!({"runtimes": {"roleDraw": {"builder": [
+            {"attempt": 1, "draw": {"codex/gpt-5.5": 100}}]}}})
+        .to_string(),
+    )
+    .unwrap();
+    let mut preparer = FakePreparer::new(dir.path(), true);
+    let Decision::Preference {
+        resolution, draw, ..
+    } = walk(dir.path(), "builder", &mut preparer)
+    else {
+        panic!("expected the preference path");
+    };
+    let chosen = resolution.chosen.as_ref().unwrap();
+    assert_eq!(chosen.tap.runtime, "codex");
+    assert_eq!(preparer.drawn_models, vec![Some("gpt-5.5".to_string())]);
+    assert_eq!(
+        draw.expect("a draw record").model,
+        preparer.drawn_models[0],
+        "the selected account's model is the launched model"
+    );
+    assert!(preparer.held);
 }

@@ -6,7 +6,9 @@
 //! trusted-comment markers, that every table row has a case) is tested here.
 
 use super::*;
-use crate::champion_hold::{CRITICAL_FILE_HOLD_MARKER, DOCTOR_CYCLE_CAP_MARKER};
+use crate::champion_hold::{
+    CRITICAL_FILE_HOLD_MARKER, DOCTOR_CYCLE_CAP_MARKER, MERGE_RISK_HOLD_MARKER,
+};
 use crate::sweep_registry::park_hold::{
     render_hold_record, PRLESS_HOLD_REASON, QUARANTINE_HOLD_REASON,
 };
@@ -82,6 +84,7 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
         Step::Doctor,
         Step::ChampionMerge,
         Step::ChampionHoldReevaluate,
+        Step::ChampionTriage,
     ];
     for s in steps {
         assert!(verdicts.contains(&Verdict::Step(s)), "no fixture case for {s:?}");
@@ -98,7 +101,9 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
         PassReason::CapabilityMissing,
         PassReason::Epic,
         PassReason::Proposal,
-        PassReason::NoStage,
+        // `NoStage` is only the defensive answer for an item with neither an
+        // issue nor a PR (#12499: an unlabelled PR is a Champion triage now).
+        PassReason::Draft,
     ];
     for p in passes {
         assert!(verdicts.contains(&Verdict::Pass(p)), "no fixture case for {p:?}");
@@ -123,6 +128,8 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
 fn steps_name_their_role_and_target() {
     assert_eq!(Step::CuratorKeepOrClose.role(), "curator");
     assert_eq!(Step::ChampionHoldReevaluate.role(), "champion");
+    assert_eq!(Step::ChampionTriage.role(), "champion");
+    assert!(Step::ChampionTriage.acts_on_pr(), "a triage works the PR");
     let inputs = Inputs {
         issues: vec![IssueInput {
             number: 7,
@@ -209,6 +216,15 @@ fn pull_markers_come_from_trusted_comments() {
     let cap = format!("{DOCTOR_CYCLE_CAP_MARKER}\ncapped");
     let capped = PullMarkers::from_trusted(&trusted(&[&hold, &cap]));
     assert!(capped.champion_hold && capped.doctor_cycle_capped);
+}
+
+#[test]
+fn pull_markers_record_the_hold_head_until_a_release() {
+    let hold = format!("{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head=abc1234 -->");
+    let m = PullMarkers::from_trusted(&trusted(&[&hold]));
+    assert_eq!(m.hold_head.as_deref(), Some("abc1234"));
+    let released = PullMarkers::from_trusted(&trusted(&[&hold, "clear the hold \u{2014} ok"]));
+    assert_eq!(released.hold_head, None);
 }
 
 #[test]

@@ -173,7 +173,7 @@ pub const ARCHITECT_MAX_PROPOSALS_ENV: &str = "LOOM_ARCHITECT_MAX_PROPOSALS";
 /// `LOOM_WORK_FINDER_MAX_CONCURRENT`, and it exists because that knob bounds
 /// **sweep dispatch only**: role-runner agents are spawned by this module's own
 /// interval / idle loops, never routed through
-/// [`crate::work_finder`]'s `min(disk, ram, maxConcurrent)` admission, so
+/// [`crate::work_finder`]'s `maxConcurrent` admission, so
 /// before #6102 nothing bounded them at all. See
 /// [`resolve_max_concurrent`].
 pub const ROLE_RUNNER_MAX_CONCURRENT_ENV: &str = "LOOM_ROLE_RUNNER_MAX_CONCURRENT";
@@ -2177,7 +2177,7 @@ pub fn default_max_concurrent() -> usize {
 /// agents are spawned by this module's interval loops and the work-finder's
 /// idle-edge path *without* passing through
 /// [`crate::work_finder`]'s admission checks, so they were admitted entirely
-/// outside `min(disk, ram, maxConcurrent)` — an operator lowering that knob
+/// outside the `maxConcurrent` cap — an operator lowering that knob
 /// after a load-induced crash got less protection than the knob's own
 /// documentation implied (#6102). This is the distinct ceiling for the other
 /// half of the host's agent load; the two together, not `maxConcurrent`
@@ -2891,10 +2891,7 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
 ) -> RoleTickOutcome {
     crate::role_collision::probe_before_tick(root, role, interval);
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
-    // #11819: a Curator on a repo with `curator.backlogTarget` carries the
-    // daemon-computed backlog level; every other dispatch is unchanged.
-    let outcome =
-        backlog::invoke_with_backlog(runner, root, role, prompt, backlog::count_open_issues);
+    let outcome = runner.invoke(role, prompt);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
     outcome
 }
@@ -3104,7 +3101,7 @@ fn decide_root_tick_detailed(
 /// [`spawn_multi_role_task`] (the multi-workspace entry point wired into
 /// `main.rs`).
 ///
-/// Mirrors [`crate::work_finder::spawn_work_finder_task`] /
+/// Mirrors `crate::work_finder::spawn_work_finder_task` (removed, #12406) /
 /// [`crate::main_health_gate`]: the **first tick is skipped** so several
 /// role loops starting at daemon boot don't burst several `claude` sessions
 /// at once — see the module docs.
@@ -3866,10 +3863,6 @@ fn log_outcome_for_root_deduped(
     pool_exhausted.insert(root.to_path_buf(), action.is_pool_exhausted());
     model_mismatch.insert(root.to_path_buf(), action.is_model_mismatch());
 }
-
-// The Curator's backlog level at dispatch (#11819) — see
-// `role_runner/backlog.rs`.
-pub mod backlog;
 
 // Concurrent per-(repository, role) dispatch, per-role budgets and queue
 // gating (#9391) — see `role_runner/concurrent_dispatch.rs`.

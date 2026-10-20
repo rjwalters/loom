@@ -1,18 +1,19 @@
 use super::*;
-use crate::{
-    forge_identity::{FleetLogins, Roster},
-    provenance::marker::Marker,
-};
+use crate::forge_identity::{FleetLogins, Roster};
 
 fn policy() -> TrustPolicy {
     TrustPolicy::new(FleetLogins::of(&Roster::default()), None, vec!["session-app[bot]".into()])
 }
-fn body(origin: &str) -> String {
-    format!("<!-- loom:provenance v1 build=unknown unknown unknown prompts=unknown unknown sweep=none story=none trace=unknown host=unknown base=unknown run=none origin={origin} -->")
-}
+/// A PR row: `interactive` is a human (trusted, non-App) author; anything else
+/// is opened by a trusted App login, which is never a human.
 fn pr(n: u64, origin: &str, labels: &[&str]) -> Value {
+    let (user, association) = if origin == "interactive" {
+        (json!({"login":"operator","type":"User"}), "OWNER")
+    } else {
+        (json!({"login":"session-app[bot]","type":"Bot"}), "NONE")
+    };
     json!({"number":n,"state":"open","draft":false,"title":"test", "created_at":format!("2026-09-{:02}", n),
-        "body":body(origin),"user":{"login":"session-app[bot]","type":"Bot"},"author_association":"NONE",
+        "body":"","user":user,"author_association":association,
         "labels":labels.iter().map(|l| json!({"name":l})).collect::<Vec<_>>()})
 }
 fn ids(rows: &[Value]) -> Vec<u64> {
@@ -39,39 +40,30 @@ fn every_role_prefers_priority_then_interactive_and_disabled_retains_priority() 
 }
 
 #[test]
-fn malformed_conflicting_legacy_or_untrusted_origin_never_prioritizes() {
-    let trusted = pr(1, "interactive", &[]);
-    assert_eq!(WorkOrigin::trusted_pr(&trusted, &policy()), WorkOrigin::Interactive);
-    let valid = body("interactive");
-    for bad in [
-        String::new(),
-        valid.replace(" origin=interactive", ""),
-        valid.replace("interactive", "bogus"),
-        format!("{valid}\n{valid}"),
-        valid.replace("origin=interactive", "origin=interactive origin=autonomous"),
-        format!("```\n{valid}\n```"),
-        valid.replace("v1", "v2"),
-    ] {
-        let mut row = trusted.clone();
-        row["body"] = json!(bad);
-        assert_eq!(WorkOrigin::trusted_pr(&row, &policy()), WorkOrigin::Unknown, "{row}");
-    }
+fn only_a_trusted_non_app_author_is_interactive() {
+    let human = pr(1, "interactive", &[]);
+    assert_eq!(WorkOrigin::trusted_pr(&human, &policy()), WorkOrigin::Interactive);
+    // A body marker neither grants nor denies it: the author decides.
+    let mut marked = pr(2, "autonomous", &[]);
+    marked["body"] = json!("<!-- loom:provenance v1 origin=interactive -->");
+    assert_eq!(WorkOrigin::trusted_pr(&marked, &policy()), WorkOrigin::Unknown);
     for author in [
         json!({"login":"outsider","type":"User"}),
         json!({"login":"foreign[bot]","type":"Bot"}),
+        json!({"login":"session-app[bot]","type":"Bot"}),
+        json!({"login":"operator","type":"Bot"}),
         Value::Null,
     ] {
-        let mut row = trusted.clone();
+        let mut row = human.clone();
         row["user"] = author;
-        assert_eq!(WorkOrigin::trusted_pr(&row, &policy()), WorkOrigin::Unknown);
+        if row["user"]
+            .as_object()
+            .is_some_and(|u| u["login"] == "outsider")
+        {
+            row["author_association"] = json!("NONE");
+        }
+        assert_eq!(WorkOrigin::trusted_pr(&row, &policy()), WorkOrigin::Unknown, "{row}");
     }
-    let mut human = trusted;
-    human["user"] = json!({"login":"owner"});
-    human["author_association"] = json!("OWNER");
-    human["body"] = json!("");
-    assert_eq!(WorkOrigin::trusted_pr(&human, &policy()), WorkOrigin::Unknown);
-    let parsed = Marker::parse(&valid).unwrap();
-    assert_eq!(Marker::parse(&parsed.render()), Some(parsed));
 }
 
 #[test]

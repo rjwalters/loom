@@ -184,12 +184,9 @@ fn host_health_envelope() -> TelemetryEnvelope {
             worktree_root_free_gb: None,
             worktree_root_total_gb: None,
             active_sweep_ids: Vec::new(),
-            dispatch_halted: false,
-            halt_reason: None,
             managed_repos: Vec::new(),
             roles: crate::telemetry::RoleTickHealth::default(),
             protection: None,
-            admission_brake: None,
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
             captainless_singleton_jobs: Vec::new(),
@@ -197,6 +194,8 @@ fn host_health_envelope() -> TelemetryEnvelope {
             exporters: Vec::new(),
             otlp_export: None,
             memory: None,
+            agent_scopes: Vec::new(),
+            agent_scopes_total: None,
         }),
     )
 }

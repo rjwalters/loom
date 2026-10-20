@@ -141,8 +141,8 @@ fn load(root: &Path) -> Result<Registry> {
 pub(crate) fn dispatch(args: LabelsArgs) -> Result<()> {
     // 2AMLogic/2am#4367: `undeclared` and `migrate` read the forge; run by a
     // host job with LOOM_GH_GATEWAY_DIR set, those reads use the daemon's
-    // published gateway profiles. A no-op without the variable.
-    loom_daemon::forge_gateway::enable_cli();
+    // published gateway profiles. Every subcommand enables that at startup
+    // now (`forge_gateway::enable_cli_reads`, #12389).
     let code = run(args.action)?;
     if code != 0 {
         std::process::exit(code);

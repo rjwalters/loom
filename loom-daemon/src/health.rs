@@ -1250,40 +1250,7 @@ pub fn classify_missing_tick(inputs: &HealthInputs, status: &DaemonStatusReport)
     MissingTick::Dead
 }
 
-/// Whether `disk_headroom` is the **strictly** binding term of the dynamic
-/// concurrency cap `min(disk_headroom, ram_headroom, configured_max)` (#5177;
-/// token axis removed / ram_headroom added in #5270 — see
-/// [`crate::work_finder::resolve_dynamic_max_concurrent`]).
-///
-/// True when disk headroom is at most RAM headroom (a tie resolves to disk,
-/// matching [`crate::calibrate::binding_term`]'s tie-break order) AND
-/// strictly smaller than the operator's configured admission ceiling — i.e.
-/// the scratch volume is throttling dispatch below what `configured_max`
-/// would otherwise allow. A tie **with the ceiling** is deliberately NOT
-/// flagged: that ceiling is the operator's own deliberate choice, not a disk
-/// fault. Mirrors the input shape of
-/// [`crate::work_finder::resolve_dynamic_max_concurrent`] so the two agree on
-/// what "binding" means.
-#[must_use]
-pub fn disk_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
-    disk_headroom <= ram_headroom && disk_headroom < configured_max
-}
-
-/// Whether `ram_headroom` is the **uniquely** binding term of the dynamic
-/// concurrency cap (#5270) — the RAM-headroom mirror of [`disk_binds_cap`].
-///
-/// True only when RAM headroom is strictly smaller than **both** the disk
-/// headroom and the operator's configured admission ceiling. A tie with disk
-/// resolves to [`disk_binds_cap`] instead (mirroring
-/// [`crate::calibrate::binding_term`]'s tie-break order), keeping the two
-/// predicates mutually exclusive so `assess_dispatch` never double-reports
-/// the same throttling event under both names.
-#[must_use]
-pub fn ram_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
-    ram_headroom < disk_headroom && ram_headroom < configured_max
-}
-
-/// Assess the dispatch section: in-flight occupancy against the dynamic cap,
+/// Assess the dispatch section: in-flight occupancy against the cap,
 /// plus the last work-finder tick's dispatch/skip-reason summary.
 #[must_use]
 pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
@@ -1304,9 +1271,6 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
     if status.draining {
         degraded.push("DRAINING".to_string());
     }
-    if status.host_breaker.as_ref().is_some_and(|b| b.suppressed) {
-        degraded.push("host-distress breaker TRIPPED".to_string());
-    }
     if status
         .rate_limit_breaker
         .as_ref()
@@ -1321,50 +1285,6 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
                 .clone()
                 .unwrap_or_else(|| "claude-wrapper preflight tripwire active".to_string()),
         );
-    }
-    // #5177: a small-disk host silently decays as merged worktrees leak their
-    // multi-GB target/ dirs, until disk headroom becomes the binding term of the
-    // cap and throttles the host to a fraction of its configured capacity. That
-    // used to present as a green daemon dispatching at, say, cap 2 — a fault an
-    // operator had to notice in the `min(...)` breakdown. Name it as degraded.
-    if disk_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
-        degraded.push(format!(
-            "disk headroom is throttling dispatch (cap {} bound by disk headroom {} — free scratch \
-             disk; e.g. `loom-daemon clean --aggressive` / `--deep`)",
-            cap, status.disk_headroom
-        ));
-    }
-    // #5270: the RAM-headroom mirror of the #5177 disk case above — the second
-    // "dumb mode" machine-headroom axis, so a critically-low-memory host is
-    // named as degraded the same way a critically-low-disk host already is.
-    if ram_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
-        degraded.push(format!(
-            "RAM headroom is throttling dispatch (cap {} bound by ram headroom {} — free memory \
-             or lower LOOM_PER_WORKTREE_RAM_GB, #5270)",
-            cap, status.ram_headroom
-        ));
-    }
-    // #5270: name the machine axis (max/disk/RAM/CPU) currently HOLDING new
-    // admissions outright — the CPU saturation admission brake is a
-    // point-in-time gate outside the `min(...)` cap formula (see
-    // `crate::admission_brake`'s module docs for why), so it cannot be named
-    // by `disk_binds_cap` / `ram_binds_cap` above; it is checked independently
-    // here, mirroring the host-distress breaker check above it.
-    if status.admission_brake.as_ref().is_some_and(|b| b.held) {
-        let load = status
-            .admission_brake
-            .as_ref()
-            .and_then(|b| b.load_per_core)
-            .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
-        let threshold = status
-            .admission_brake
-            .as_ref()
-            .map_or(0.0, |b| b.load_per_core_threshold);
-        degraded.push(format!(
-            "CPU saturation admission brake HOLDING new admissions (load {load}/core \u{2265} \
-             {threshold:.2} — in-flight sweeps are untouched; releases automatically once load \
-             drops, #5270/#4903)"
-        ));
     }
 
     // #4824: why the tick is missing, when it is. `None` whenever a tick was

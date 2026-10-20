@@ -287,7 +287,6 @@ fn the_live_events_read_has_its_own_caller() {
     fn takes(_: &mut impl EventsSource) {}
     takes(&mut GhEventsReader);
     assert!(crate::gh_invocation::Operation::is_valid(EVENTS_CALLER));
-    assert_ne!(EVENTS_CALLER, crate::observability::ops::stage_dwell::EVENTS_CALLER);
 }
 
 #[test]

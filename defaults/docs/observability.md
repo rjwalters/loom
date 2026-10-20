@@ -19,7 +19,7 @@
 - [3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)](#3b-2-every-daemon-must-export-otlp-otlp_export-issue-11353)
 - [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
 - [3d. Agent telemetry relay (Issue #10964)](#3d-agent-telemetry-relay-issue-10964)
-- [3e. Alerts on loom-ui's Alerts page (Issue #11295)](#3e-alerts-on-loom-uis-alerts-page-issue-11295)
+- [3e. Alerts as `alert.transition` telemetry (Issues #11295, #12806)](#3e-alerts-as-alerttransition-telemetry-issues-11295-12806)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
 - [5. Authenticated vs. public: two views, one redaction policy](#5-authenticated-vs-public-two-views-one-redaction-policy)
 - [5b. Doc-maintenance throughput (Guide, local-only, issue #6136)](#5b-doc-maintenance-throughput-guide-local-only-issue-6136)
@@ -181,7 +181,8 @@ See [execution traces](tracing.md) for persisted trace identity, correlated logs
 completed-span export, and bounded shutdown.
 
 Every OTLP request, on all three signals (traces, logs, metrics), carries one
-resource per emitting host with exactly these attributes:
+resource per emitting host with these identity attributes, followed by the
+host-shape attributes in the next table:
 
 | Resource attribute | Value |
 |---|---|
@@ -192,6 +193,41 @@ resource per emitting host with exactly these attributes:
 | `service.version` | the reporting daemon's version (a `host.health` record's `daemon_version`, else the exporting build's) |
 | `loom.daemon.revision` | the exporting build's full git SHA (`unknown` for a tarball build) — the same value every span carries (#11197) |
 | `loom.fleet.config_sha` | the fleet-gitops commit whose rendered config tiers are **on disk on this host right now**: a 40-hex SHA, `unknown` (a fleet host where no applied commit is established yet, e.g. during a startup-pass timeout), or `none` (no fleet store, `fleet.repo` unset). Never empty, never omitted (#11197) |
+
+**Host shape (#12874).** The emitting host's static shape, so a sweep or phase
+span resolves to its host's size with no join against the
+`loom.host.logical_cpus` gauge:
+
+| Resource attribute | Value |
+|---|---|
+| `host.cpu.count` | logical CPU count (int) — the same source as the `loom.host.logical_cpus` gauge. Always present |
+| `loom.host.mem_total_bytes` | total physical memory in bytes (int; `/proc/meminfo` `MemTotal`, macOS `hw.memsize`). **Absent** when unmeasurable, never `0` |
+| `host.arch` | OTel semconv architecture: `amd64`, `arm64`, else Rust's raw `std::env::consts::ARCH`. Always present |
+| `host.type` | the EC2 instance type (e.g. `c7i.2xlarge`) on Linux once the IMDS probe succeeds; a Mac's `sysctl hw.model` (e.g. `Mac14,6`); absent elsewhere |
+| `cloud.provider`, `cloud.region` | `aws` and the instance's region, from the same IMDS probe; absent on a Mac or any non-EC2 host |
+
+CPU count, RAM, arch and Mac model are read once per process and cached. The
+instance type comes from a single AWS IMDSv2 probe (`PUT /latest/api/token`,
+then `meta-data/instance-type` and `meta-data/placement/region`) spawned at
+telemetry startup on Linux. It bypasses any `HTTP(S)_PROXY`, has a 1 s total
+budget, never retries and is never awaited — so startup is not delayed, and
+batches exported before it lands (or on a host where IMDS is unreachable)
+simply lack `host.type`/`cloud.*`. `eta.stage_outcome` records carry the
+*observing* host's shape, not the executing host's; join through the
+executing `host.id` on `sweep.*` records for that.
+
+**Host load on sweep/phase spans (#12884).** `loom.sweep` and every
+`loom.phase` span carry the `lifecycle::host_attributes()` sample, including
+`loom.host.logical_cpus` and `loom.host.loadavg_1m`, at open and again at
+close. A close overwrites a same-named key, so the plain
+`loom.host.loadavg_1m` / `loom.host.load_per_core` on an exported span are the
+**close-time** sample; the open-time sample is kept under
+`loom.host.start.loadavg_1m` / `loom.host.start.load_per_core`, which no close
+re-stamps. Phase spans opened inside a `spawn-claude.sh` child (the checkpoint
+sites) also carry `loom.host.cpu_budget_cores` and `loom.host.sweeps_in_flight`
+— the CPU quota and the in-flight sweep count it was divided by. Each key is
+absent when unknown, never zero-filled: `sweeps_in_flight` is absent when the
+budget was not shared across sweeps (`LOOM_SWEEP_SHARED_CPU_BUDGET=0`).
 
 `host.name` has one source, the same string as `host.id`: the daemon's host
 identity, which is the operator-assigned `$LOOM_HOST_ID` when it is set and
@@ -600,6 +636,15 @@ tick and get 24h; activity-driven or failure-only kinds are `None` (never flagge
 kind with no row defaults to 24h. A host with no `otlp` exporter reports
 `no_exporter` with no `kinds`, and no error.
 
+Over OTLP (Issue #12905) each kind's `last_export_at` rides the `host.health` gauge
+`loom.host.kind_last_export_seconds{kind}` (unix seconds), so a consumer can refuse an
+`as_of` past a host's coverage. A kind with no export yet has no data point (absent,
+never zero), and a host with no `otlp_export` emits none. Caveats: the value is in
+memory, so after a restart it means "since process start"; and it is a delivery-coverage
+bound ("this host delivered kind K through T"), not proof the producer ran, because
+activity-driven kinds have no silence threshold. `host.health` and `host.export` give the
+host-level bound. `kind` is already on the collector's datapoint allowlist.
+
 ```json
 { "observability": {
     "otlp_required": false,
@@ -642,8 +687,9 @@ labels are listed in
 **Queue dwell and starvation (#8856).** Each multi-workspace tick also emits
 `loom.queue.*` from the same per-issue ready-queue rows that `loom-daemon queue`
 shows (#8852). A row is *waiting* in one of two states. `ready` means only
-capacity is holding it: the concurrency cap, the admission ramp, the saturation
-brake, or the per-repo cap. `blocked` means an automatic hold: a halted repo,
+capacity is holding it: the concurrency cap
+(`autonomous.workFinder.maxConcurrent`, the only admission cap since #12406).
+`blocked` means an automatic hold: a halted repo,
 missing sweep command, quarantine, dispatch backoff, no-op cooldown, PR-less
 retry, or a dispatch error. Running rows are not waiting. Neither are rows held
 deliberately or elsewhere: a park or hard-exclusion label, a decline, another
@@ -668,14 +714,6 @@ Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
 alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
 `defaults/observability/signoz/queue-dwell.sql`.
 
-**Fleet singleton outputs (#10916).** The in-daemon `fleet_alert` path
-(#10924) judges the registered one-host fleet outputs (`ci.run`, the captain
-gauges, and the intake-reconcile completed-pass heartbeat
-`.loom/state/intake-reconcile/last-pass.json`) against
-`fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
-cross-host alert that watched the ETA singletons was removed with the ETA
-subsystem (#11098).
-
 **Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
 gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)
 and `loom.tokens.usage_fraction_weekly` (rolling 7-day, from the
@@ -699,25 +737,11 @@ waited (`loom.dispatch.idle_slot_seconds`). Busy slots by role (#11847,
 sweeps (so `busy_slots{role="sweep"} + idle_slots = max_concurrent`), and each
 role-runner role has its own series, with the role pool's ceiling and spare
 in `loom.dispatch.role_max_concurrent` and `loom.dispatch.role_idle_slots`.
-Forge label-stage dwell
-(`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state, repo}`;
-**off by default** since #12203, switched on by `observability.stageDwell.enabled`,
-so these series are absent on a default fleet)
-covers created → curated, curated → `loom:issue`, building → review requested
-and review requested → merged. Beside the per-label counts, `stage_items` has
-queue states from one ETag-cached open-items walk per repo (#11847):
-`triage`, `unlabeled`, `curated_not_promoted`, `issue_open_pr`,
-`issue_no_pr`, `parked`, `pr_held` and `pr_champion_held` (the Champion-hold
-label shape, `loom:pr` + `loom:blocked`, #11905; it reads no marker, so markerless parks count too). They are absent, not `0`, for a repo
-whose walk did not complete. `stage_items` is per repo, so a per-host total is `sum by (state)`, and the
-states overlap, so never sum across them. It reads ETag-cached stage listings every 5
-minutes plus at most 8 per-item reads per sample, never per tick. With
-`fleet.captainGauges` configured, the fleet captain samples for the fleet and
-dispatchers stand down while its published data is fresh
-(`loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`; see
-[`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12)).
-The same heartbeat can carry a forge fact (`queueBlocked`), so the snapshot's
-`loom:blocked` listing is made by the captain alone.
+Forge label-stage dwell is not exported by the daemon (the sampler and
+`loom.forge.stage_dwell` / `loom.forge.stage_items` were deleted in #12316):
+dwell is a consumer's computation over the mirror's per-item label times.
+The fleet-captain gauge producer (`fleet.captainGauges`, `loom.captain.*`) was
+removed in #11406: every host reads the snapshot's `loom:blocked` listing itself.
 Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 **Merge-chain re-date pressure (#10163).** Three gauges track the #8508
@@ -729,9 +753,23 @@ it reaching zero, #10888): `loom.merge.redate_prs{state}`
 merge-chain head that `main` keeps moving under. Details are in
 [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
+**Retried fleet dispatches (#12875).** When the fleet-dispatch captain
+grants an item and step again after an earlier assignment of the same repo,
+item and step ended, the worker's `loom.dispatch.step` span carries
+`loom.dispatch.attempt` (earlier assignments that ended),
+`loom.dispatch.prev_assignment_id` (the earlier step's `loom.assignment.id`)
+and `loom.dispatch.prev_end` (`released`, `expired`, or `host_lost` when the
+worker released it because its host was lost to a spot interruption, #12876). A first or renewed grant carries none. Each
+expired assignment also gets a captain `loom.fleet_dispatch.call` span with
+endpoint `expire`, result `expired`, reason `lease_expired`, naming the host,
+item, step and assignment id, so expiries are attributable per host and item.
+The captain keeps the lineage in memory, bounded to 4096 steps and 24 h; a
+captain restart resets `attempt`. Keys:
+[`telemetry-schema.md`](telemetry-schema.md).
+
 **Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
 covers candidates that reached a `dispatch()` attempt — a candidate filtered
-out earlier (`workspace_halted`, `parked`, `deferred_saturation`,
+out earlier (`workspace_halted`, `parked`,
 `host_constraint`, a backoff, a cooldown, …) had no per-issue SigNoz record
 at all before this. Every ready-queue row now gets a `loom.dispatch.disposition`
 span on a disposition transition (including first sight), on a periodic
@@ -740,9 +778,9 @@ once as a terminal `left_queue` record when it leaves a repo whose listing
 succeeded. Sampled from the collector's periodic pass (the same cadence as
 `queue.snapshot`), never the tick loop, so a disposition lasting less than one
 collector interval can be missed; a 10-minute-or-longer lookback still always
-contains the current state of every queued issue. Cardinality is bounded: at
-most 256 rows become spans per sample (`loom.queue.disposition_rows_dropped{reason="truncated"}`
-counts the rest), and a row whose repo root never resolved to a forge slug is
+contains the current state of every queued issue. Every queued row becomes a
+span (no volume cap: a cap would make which items carry facts depend on
+iteration order), and a row whose repo root never resolved to a forge slug is
 dropped and counted as `reason="unresolved"` rather than exported with a local
 path. `loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
 in the same change, so `loom.issue` is no longer ambiguous on a multi-repo
@@ -763,17 +801,18 @@ vocabulary (`loom.queue.disposition`'s wire values):
 
 | Operator term | Disposition(s) |
 |---|---|
-| "admission brake" | `deferred_saturation` (decisions reason `saturation`, tick result `saturation_held`) |
 | "build back-off" / "WIP limit" (PR debt high) | `deferred_build_backoff` (decisions reason `build_backoff`, tick result `build_backoff_held`, #9410) |
 | "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, from `queue.snapshot`, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
-| "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full), `deferred_ramp_cap` (per-tick admission cap), or `deferred_repo_cap` (per-repo cap); `deferred_out_of_slice` (repo sharding) is retired, #11682 — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
+| "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full). `deferred_ramp_cap`, `deferred_saturation` and `deferred_repo_cap` are retired (#12406; old payloads decode as `unknown`), as is `deferred_out_of_slice` (repo sharding, #11682) — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
 | "waiting on overlapping work" (same files) | `deferred_file_overlap` (#9781): its `## Affected Files` share a path with same-repo work admitted earlier this tick or already in flight; the row's `detail` (and the `pick.decision` skip's `detail`) names the shared paths. A one-tick scheduling deferral, never a label or hold — see `daemon-reference.md` §"Same-repo file-overlap deferral" |
 | "repo locked by an open PR" | `open_pr` (the #4123 guard's `pr-open-skip`). Since #9674 the repo's `open_pr` rows carry the repo-level `lockout.frozen_candidates_count` / `lockout.frozen_points_sum` / `lockout.duration_seconds` attributes, so rank which repo's lockout is starving the most ready work by grouping those spans on `loom.repo` |
 
 A `workspace_halted` row names its cause on `loom.queue.halt_cause` (#9673):
 the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`,
-`gate_pending`, `token_pool`, `preflight_advisory`, `drain`, `breaker`,
-`write_scope` (#9548) — so
+`gate_pending`, `token_pool`, `preflight_advisory`, `drain`,
+`write_scope` (#9548), `ci_billing`, `install_incompatible`, `daemon_too_old`,
+`maintain_only`, `weight_zero` (`breaker` and `disk_reservation` were removed
+by #12406) — so
 "which hold is this repo under" is filterable straight from the span, no
 join needed. The attribute is absent on a cause-less legacy row (a
 pre-#9017 caller); the fallback there is the `loom.dispatch.tick`-span join
@@ -871,8 +910,7 @@ every span also names the endpoint: `github.route` (a template such as
 for an agent front read), so `api.rest` and `agent_gh_front` spend can be
 ranked by route. That pass also
 emits a `pass.summary` log per pass and a `pass.verdict` per artifact; Champion
-steps add `pass.verdict` rows with `mechanism=step:champion` and a
-`stage_items{state="pr_refused"}` gauge (#12027); see
+steps add `pass.verdict` rows with `mechanism=step:champion`; see
 [`telemetry-schema.md`](telemetry-schema.md) and
 `defaults/observability/signoz/pass-queries.sql`.
 
@@ -978,7 +1016,8 @@ operational check on a fleet host (shadow recipe above), not a CI check.
 **Long-running task liveness and self-update decisions (#10414).** Each
 long-running daemon loop beats a process-global liveness registry
 (`crate::task_liveness`) once per finished iteration. The loops are the
-self-update loop (`auto_update`) and each role-runner
+self-update loop (`auto_update`), the CI telemetry poller (`ci_telemetry`, #12793;
+its per-cycle outcome metrics are in `telemetry-schema.md`) and each role-runner
 loop (`role_runner.<role>`). Every 60 s, on its own ticker independent of the
 collector pass, the daemon exports `loom.daemon.task_alive{task}`. The value
 is `1` while the loop has beaten within its staleness window. That window is
@@ -1060,6 +1099,27 @@ running / ready / blocked counts with a freshness badge (`idle` = recent tick,
 empty queue; `stale` = no new tick for 15 minutes; `no queue data` = the host
 never sent one), and a fleet-wide work queue listing every issue
 with its host, phase, waiting time, blocking reason and issue / PR links.
+
+### Which host and runtime ran a role tick? (#12342)
+
+Answer it from **traces**, not logs: a role-runner tick's identity lives on its
+`loom.role_attempt` span, and a tick may emit no log row at all (a logs query
+that returns only unrelated rows, as in the klayout-tools#3202 report, is a
+wrong-signal query, not necessarily a missing attribute). Filter spans on
+`name = loom.role_attempt` with `loom.role`, `loom.repo` and the time window.
+Each such span carries, at open:
+
+| Key | Meaning |
+|---|---|
+| `host.name` / `host.id` | Resource attributes, from the envelope's host id (#10977) |
+| `loom.daemon.version` / `.revision` | the build, stamped on every span by the journal |
+| `loom.runtime`, `loom.engine` | the admitted runtime and its engine (`codex` / `claude`); no engine for any other runtime |
+| `loom.session.container`, `loom.session.image_digest` | only when the tick ran in a session container: its name and the image ID (`sha256:…`) the session reconciler last observed (no Docker call; absent when there is no fresh snapshot) |
+| `loom.pr_number` / `loom.issue` | the tick's target, at close, when one is known |
+
+A host-process run carries no container keys: unknown is absent, never zero.
+A sweep-dispatched Judge or Doctor has no `loom.role_attempt`; read its
+`loom.phase` span, which carries the PR through the sweep.
 
 ## 3d. Agent telemetry relay (Issue #10964)
 
@@ -1151,13 +1211,14 @@ hash of it, and it is never logged or forwarded.
 | `service.name` | the harness — `claude-code` |
 | `service.instance.id`, `host.id`, `host.name` (whatever host attributes the daemon's own telemetry carries) | this daemon's host identity |
 | `loom.daemon.revision`, `loom.fleet.config_sha` | the relaying build's revision and the host's applied fleet-config SHA (#11197), with the daemon's value — sender-supplied copies are scrubbed with every other `loom.*` key |
+| `host.cpu.count`, `loom.host.mem_total_bytes`, `host.arch`, `host.type`, `cloud.provider`, `cloud.region` | this daemon's host shape (#12874), as on its own telemetry |
 | `loom.runtime`, `loom.session.kind` (`sweep`/`role`), `loom.session.launch` (`daemon`) | from the launch |
 | `loom.repo` | the workspace's forge `owner/name`; absent until resolved, never a directory name |
 | `loom.issue`, `loom.role`, `loom.sweep_id` | the issue, role and sweep (or role-tick execution) id the session was launched for, when it has one |
 | `loom.daemon.version`, `loom.relay.redaction` | the relaying build, and the redaction policy applied |
 
 Whatever the sender put under `service.name`, `service.namespace`,
-`service.instance.id`, `host.*` or `loom.*` — in any letter case — is
+`service.instance.id`, `host.*`, `cloud.*` or `loom.*` — in any letter case — is
 discarded, on the resource and on every scope, record, data point, span, span
 event, link and nested map, so a record-level attribute cannot shadow the
 bound one. Other resource attributes the CLI reports about itself
@@ -1247,23 +1308,26 @@ A session that outlives the daemon that launched it (a sweep adopted after a
 restart) keeps a stale address and exports nothing until it is relaunched —
 unless something else now holds that address, as above.
 
-## 3e. Alerts on loom-ui's Alerts page (Issue #11295)
+## 3e. Alerts as `alert.transition` telemetry (Issues #11295, #12806)
 
-loom-ui is the alert hub for every repo. With the native ingest export
-configured (section 1), the daemon also posts its alerts to
-`POST {loom-ui}/api/alerts/external` (2AMLogic/loom-ui
-`docs/alerts/external.md`) — same ingest key, same host id as `source`, URL
-derived from `observability.endpoint` by replacing its `/ingest` path. No
-ingest config means the output is off. `LOOM_LOOM_UI_ALERTS=0` turns it off
-on a host that exports telemetry; `LOOM_LOOM_UI_ALERTS_URL` overrides the URL.
-The host id must be in loom-ui's `ALERTS_EXTERNAL_HOSTS` (else 403, logged
-and dropped).
+Every daemon alert is an `alert.transition` OTLP log record, emitted through
+the daemon's own OTLP exporter like every other fact (record reference:
+[`telemetry-schema.md` → `alert.transition`](telemetry-schema.md#alerttransition)).
+loom-ui reads them from SigNoz for its Alerts page (2AMLogic/loom-ui
+`docs/alerts/external.md` § "As telemetry (shadow)" is the schema). The daemon
+never calls the dashboard: before #12806 it POSTed these alerts to loom-ui's
+`/api/alerts/external` with the host ingest key, with the URL derived from the
+`/ingest` exporter config; that path and its `LOOM_LOOM_UI_ALERTS` /
+`LOOM_LOOM_UI_ALERTS_URL` settings are gone. No OTLP exporter means the output
+is off. `alert.source` is this host's id (the Resource's `host.id`), the rule
+and key are below, and `alert.observed_at` is when the daemon observed the
+transition.
 
 | Rule | From | Open / resolved |
 |---|---|---|
-| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `output-missing`; `star-backlog` retired by #11510) | `fleet_alert` | condition started (and each reminder) / cleared |
+| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `output-missing`; `star-backlog` retired by #11510, `capacity-limited` by #12406) | `fleet_alert` | condition started (and each reminder) / cleared |
 | `daemon.down` (critical) | the watchdog, a separate process | recovery exhausted / any tick ending the outage |
-| `watchdog.peer-coord-degraded` (critical) | the watchdog | coordination degraded / green |
+| `watchdog.peer-coord-degraded` (critical) | the watchdog (see note below) | coordination degraded / green |
 | `safehouse.unreachable` (critical) | narration sink state | unreachable over 5 minutes / reconnected |
 | `fleet.floor-unsatisfiable` | `auto_update` | the floor ERROR line / floor met |
 | `fleet.floor-malformed` | fleet-sync pass | `loom_min_version` malformed / a valid (or no) floor |
@@ -1277,22 +1341,37 @@ and dropped).
 | `llm-monitor.stale` | llm-monitor `ranking.json` | older than 30 minutes (or unreadable) on two reads 5 minutes apart / fresh (no file: nothing) |
 | `install.<invariant>` (key = workspace root) | `install_self_check`, when enabled | violation standing after the tick / gone, or the check off |
 
+**Peer-coordination visibility tradeoff (#12818).** The watchdog's peer-claim
+coordination check no longer files, comments on, reopens or closes any GitHub
+issue; it reports to the watchdog log (`DIVERGENCE` / `[OK]`) and to the
+`watchdog.peer-coord-degraded` alert above. GitHub notifications were removed
+ahead of verified SigNoz visibility of this signal, which #12167 tracks
+separately; that export is neither claimed nor required by this change. Legacy
+`.watchdog-peer-coord-escalated` / `-cooldown` files are never read or written.
+
 `tokens-zero-healthy` is not sent: loom-ui derives `provider-pool-exhausted`
-from the daemon's pool gauge itself. Delivery is a bounded FIFO drained by one
-task (open always before resolved): a 2xx is done, any other 4xx except 429 is
-dropped and logged, 429 / 5xx / network errors back off (5 s doubling to
-15 min, at most 20 tries). The watchdog posts synchronously (10 s bound) and
-keeps a `<sentinel>.loom-ui` record so an unanswered post retries next tick.
+from the daemon's pool gauge itself. Each transition is offered to the OTLP
+exporters' durable queue at once, in order (open always before resolved).
+While an alert holds, its `open` is re-sent every 6 hours (the schema asks for
+at least every 12, since loom-ui closes an incident unobserved for 24). The
+watchdog, a separate one-shot process that runs while the daemon is down,
+writes its record durably into its own OTLP queue
+(`.loom/logs/watchdog-alerts-ops-queue.N.jsonl` under the marker's
+`repo_root`, exported with that workspace's observability config), flushes it
+within 10 s, and keeps a `<sentinel>.alert` record of an exported `open`, so an
+unexported one retries next tick and a held one is re-sent every 6 hours.
 
 Level-triggered sources keep the incidents they hold open in
-`~/.loom/loom-ui-alerts/<scope>.json`, so a restarted daemon resolves one
+`~/.loom/loom-ui-alerts/<scope>.json` (the pre-#12806 directory name, kept so
+an upgraded daemon finds them), so a restarted daemon resolves one
 the previous process opened once it finds the condition gone, and keeps one
-open while its failure count (process memory) builds up again; a daemon
-that finds the output off removes those files. The single-key
-watches (safehouse, breaker, llm-monitor) send one `resolved` on their first
-healthy sample instead. Alerts raised before the output starts (credential
-preflight, the fleet-sync startup pass) wait in the outbox. llm-monitor's
-quota step-change alert is not in `ranking.json` yet, so it is not sent.
+open (and its heartbeat going) while its failure count (process memory)
+builds up again; a daemon that finds the output off removes those files. The
+single-key watches (safehouse, breaker, llm-monitor) send one `resolved` on
+their first healthy sample instead. Alerts raised before the output starts
+(credential preflight, the fleet-sync startup pass) are held (at most 256) and
+go out once the exporters are up. llm-monitor's quota step-change alert is not
+in `ranking.json` yet, so it is not sent.
 
 `fleet_alert` only runs when `autonomous.fleetAlert.enabled` is on (off by
 default here); the fleet defaults (fleet-gitops) are where to enable it.

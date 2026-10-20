@@ -124,7 +124,17 @@ impl Sandbox {
     }
 
     fn gh(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
-        let mut cmd = Command::new(self.p("bin/gh"));
+        self.run(&self.p("bin/gh"), args, env)
+    }
+
+    /// `loom-daemon <args>` run the way an agent session runs a subcommand
+    /// (#12389), with the session's environment.
+    fn cli(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
+        self.run(Path::new(env!("CARGO_BIN_EXE_loom-daemon")), args, env)
+    }
+
+    fn run(&self, program: &Path, args: &[&str], env: &[(&str, &Path)]) -> Output {
+        let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(self.p("work"))
             .env("LOOM_GH_BIN", self.p("next-gh"))
@@ -168,6 +178,17 @@ impl Sandbox {
         cmd.output().unwrap()
     }
 
+    /// `GH_CONFIG_DIR` of each logged call whose argv contains `part`.
+    fn dirs_with(&self, part: &str) -> Vec<PathBuf> {
+        std::fs::read_to_string(self.p("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_once('|'))
+            .filter(|(_, argv)| argv.contains(part))
+            .map(|(dir, _)| PathBuf::from(dir))
+            .collect()
+    }
+
     /// `GH_CONFIG_DIR` of each logged call whose argv starts with `prefix`.
     fn dirs_for(&self, prefix: &str) -> Vec<PathBuf> {
         std::fs::read_to_string(self.p("calls.log"))
@@ -178,6 +199,19 @@ impl Sandbox {
             .map(|(dir, _)| PathBuf::from(dir))
             .collect()
     }
+}
+
+/// #12394: the read was shed — no reader could serve it, and the writer is
+/// never used for a read.
+fn shed(out: &Output) {
+    assert_eq!(
+        out.status.code(),
+        Some(75),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("read shed"));
 }
 
 fn ok(out: &Output) {
@@ -260,7 +294,7 @@ fn a_gateway_for_another_owner_leaves_a_passthrough_read_to_the_reader() {
 }
 
 #[test]
-fn a_reader_fault_reruns_the_read_on_the_writer_and_withdraws_no_gateway() {
+fn a_reader_fault_sheds_the_read_and_never_uses_the_writer() {
     let sb = Sandbox::new();
     let reader = sb.publish_reader("acme");
     let ws = sb.p("ws");
@@ -270,15 +304,14 @@ fn a_reader_fault_reruns_the_read_on_the_writer_and_withdraws_no_gateway() {
     ];
 
     let diff = sb.gh(DIFF, &env);
-    ok(&diff);
-    assert_eq!(String::from_utf8_lossy(&diff.stdout), "ok\n");
-    assert_eq!(sb.dirs_for("pr diff"), [reader.clone(), sb.p("writer")]);
+    shed(&diff);
+    assert_eq!(sb.dirs_for("pr diff"), std::slice::from_ref(&reader));
     // The gateway's outage marker is never written beside a reader.
     assert!(!reader.parent().unwrap().join("outage-until").exists());
 }
 
 #[test]
-fn a_readers_own_refusal_reruns_the_read_on_the_writer() {
+fn a_readers_own_refusal_sheds_the_read_and_never_uses_the_writer() {
     for msg in [
         "HTTP 404: Not Found (https://api.github.com/repos/acme/widget/pulls/42)",
         "HTTP 403: Resource not accessible by integration",
@@ -295,22 +328,20 @@ fn a_readers_own_refusal_reruns_the_read_on_the_writer() {
         ];
 
         let diff = sb.gh(DIFF, &env);
-        ok(&diff);
-        assert_eq!(String::from_utf8_lossy(&diff.stdout), "ok\n", "{msg}");
-        assert_eq!(String::from_utf8_lossy(&diff.stderr), "", "{msg}");
-        assert_eq!(sb.dirs_for("pr diff"), [reader.clone(), sb.p("writer")], "{msg}");
+        shed(&diff);
+        assert_eq!(sb.dirs_for("pr diff"), std::slice::from_ref(&reader), "{msg}");
     }
 }
 
 #[test]
-fn a_passthrough_read_skips_a_reader_directory_others_can_write() {
+fn a_passthrough_read_skips_a_reader_directory_others_can_write_and_sheds() {
     let sb = Sandbox::new();
     let reader = sb.publish_reader("acme");
     std::fs::set_permissions(&reader, std::fs::Permissions::from_mode(0o770)).unwrap();
     let ws = sb.p("ws");
 
-    ok(&sb.gh(DIFF, &[("LOOM_GH_READER_ROOT", ws.as_path())]));
-    assert_eq!(sb.dirs_for("pr diff"), [sb.p("writer")]);
+    shed(&sb.gh(DIFF, &[("LOOM_GH_READER_ROOT", ws.as_path())]));
+    assert!(sb.dirs_for("pr diff").is_empty(), "no read was sent");
 }
 
 #[test]
@@ -332,4 +363,73 @@ fn without_either_variable_reads_stay_on_the_writer() {
 
     ok(&sb.gh(VIEW, &[]));
     assert_eq!(sb.dirs_for("api --include repos/acme/widget/issues/42"), [sb.p("writer")]);
+}
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
+
+/// #12389: a `loom-daemon` subcommand an agent session runs (here `forge
+/// wait-checks`, the Judge's and Doctor's CI wait) reads through the gateway,
+/// then the reader pool, the daemon exported to the session. Before, it was
+/// neither the daemon nor the front, so every read it made went to the
+/// writer.
+const WAIT: &[&str] = &[
+    "forge",
+    "wait-checks",
+    "42",
+    "--repo",
+    "acme/widget",
+    "--timeout",
+    "0",
+];
+
+#[test]
+fn a_cli_subcommand_in_a_gateway_session_reads_through_the_gateway() {
+    let sb = Sandbox::new();
+    let (base, profile) = sb.publish_gateway("acme");
+    let _ = sb.cli(WAIT, &[("LOOM_GH_GATEWAY_DIR", base.as_path())]);
+    let dirs = sb.dirs_with("repos/acme/widget/pulls/42");
+    assert!(!dirs.is_empty(), "the PR read was never sent");
+    assert!(dirs.iter().all(|d| *d == profile), "{dirs:?}");
+}
+
+#[test]
+fn a_cli_subcommand_with_no_gateway_reads_on_a_reader() {
+    let sb = Sandbox::new();
+    let reader = sb.publish_reader("acme");
+    let ws = sb.p("ws");
+    let _ = sb.cli(WAIT, &[("LOOM_GH_READER_ROOT", ws.as_path())]);
+    let dirs = sb.dirs_with("repos/acme/widget/pulls/42");
+    assert!(!dirs.is_empty(), "the PR read was never sent");
+    assert!(dirs.iter().all(|d| *d == reader), "{dirs:?}");
+}
+
+#[test]
+fn a_cli_subcommand_without_either_variable_reads_on_the_writer() {
+    let sb = Sandbox::new();
+    let _ = sb.cli(WAIT, &[]);
+    let dirs = sb.dirs_with("repos/acme/widget/pulls/42");
+    assert!(!dirs.is_empty(), "the PR read was never sent");
+    assert!(dirs.iter().all(|d| *d == sb.p("writer")), "{dirs:?}");
+}
+
+/// #12394: a CLI subcommand with a read route adopted never reads on the
+/// writer. With its gateway failing and no reader behind it, the read is
+/// shed and the command reports no answer.
+#[test]
+fn a_cli_subcommand_whose_gateway_fails_sheds_instead_of_using_the_writer() {
+    let sb = Sandbox::new();
+    let (base, profile) = sb.publish_gateway("acme");
+    let _ = sb.cli(
+        WAIT,
+        &[
+            ("LOOM_GH_GATEWAY_DIR", base.as_path()),
+            ("STUB_FAIL_DIR", profile.as_path()),
+        ],
+    );
+    let dirs = sb.dirs_with("repos/acme/widget/pulls/42");
+    assert!(!dirs.is_empty(), "the gateway was tried");
+    assert!(!dirs.contains(&sb.p("writer")), "the writer was used: {dirs:?}");
 }

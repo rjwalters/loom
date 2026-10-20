@@ -105,6 +105,17 @@ enum FleetConfigCommand {
         #[arg(long)]
         offline: bool,
     },
+    /// Replace the installed `loom-daemon` binary with a release at or above
+    /// the fleet floor (`loom_min_version`), on a host with no daemon to roll
+    /// itself (#12926). Reads the floor from a store snapshot the forge
+    /// confirms current now, then resolve -> verified fetch -> atomic install,
+    /// keeping one `<binary>.previous`. Never starts, restarts or signals a
+    /// daemon. Daemon hosts keep using the floor roll.
+    ApplyFloor {
+        /// Print the decision; download and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Open a PR against the store instead of hand-editing it (#9599).
     /// Always a branch + PR — never a direct push. Edits `fleet.yml`, the
     /// store's source, and regenerates its renders with the store's own
@@ -192,6 +203,11 @@ impl Ctx {
 fn run(args: FleetConfigArgs) -> Result<i32> {
     let workspace = loom_daemon::worktree_ops::repo::resolve_repo_root(&args.workspace)
         .with_context(|| format!("resolving workspace {}", args.workspace))?;
+    if let FleetConfigCommand::ApplyFloor { dry_run } = args.command {
+        // Resolves its own store location: no store is a no-op here, not an
+        // error, and it never returns (it exits after cleaning its scratch).
+        super::fleet_config_apply_floor::run(&workspace, dry_run);
+    }
     let location = store::require_location(&workspace)?;
     let cache = store::default_cache_dir(&location)?;
     let transport = GhTransport::new(&workspace, &location.repo);
@@ -215,6 +231,9 @@ fn run(args: FleetConfigArgs) -> Result<i32> {
             json,
             offline,
         } => cmd_state(&ctx, host, json, offline),
+        FleetConfigCommand::ApplyFloor { .. } => {
+            unreachable!("handled before the store is required")
+        }
         FleetConfigCommand::Propose { command } => match command {
             ProposeCommand::State {
                 state,
@@ -378,7 +397,15 @@ fn cmd_render(
             print_drift(t, d);
         }
         print_reload_classification(&targets, &drifts);
-        return Ok(render::check_exit_code(&drifts));
+        let mut code = render::check_exit_code(&drifts);
+        if let Some(line) = super::fleet_config_apply_floor::cli_below_floor_line(
+            &loaded.snapshot,
+            super::fleet_config_apply_floor::INSTALLED_VERSION,
+        ) {
+            println!("DRIFT — {line}");
+            code = code.max(1);
+        }
+        return Ok(code);
     }
     let drifts: Vec<Drift> = targets.iter().map(render::drift).collect();
     let (live, restart_required) = classify_drifted_paths(&targets, &drifts);
@@ -389,20 +416,12 @@ fn cmd_render(
             (false, _) => println!("{}: in sync — {}", t.tier.name(), t.path.display()),
             (true, backup) => {
                 wrote = true;
-                loom_daemon::config_journal::append_rendered(
-                    t.tier.name(),
-                    &t.path,
-                    backup.as_deref(),
-                    Some(&loaded.snapshot.manifest.commit),
-                    &restart_required,
-                );
                 let b = backup.map_or_else(String::new, |b| format!(" (backup: {})", b.display()));
                 println!("{}: wrote {}{b}", t.tier.name(), t.path.display());
             }
         }
     }
     if wrote {
-        loom_daemon::config_journal::record_resolved(&ctx.workspace);
         super::fleet_config_reload::report(&ctx.workspace, &live, &restart_required);
     }
     Ok(0)
@@ -701,11 +720,10 @@ fn submit_or_print(
     };
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let branch = propose::branch_name(kind, &stamp);
-    let marker = propose::provenance_marker(&ctx.workspace, &loaded.snapshot.manifest.commit);
     let body = format!(
         "Opened by `loom-daemon fleet-config propose {kind}` (see `daemon-reference.md` § \
          \"Fleet store\" for the store's file contract). Merges stay the operator's — this \
-         command only ever proposes.\n\n{renders}\n\n{marker}\n"
+         command only ever proposes.\n\n{renders}\n"
     );
     let proposal = propose::Proposal {
         branch,

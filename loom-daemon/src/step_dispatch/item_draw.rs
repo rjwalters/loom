@@ -1,14 +1,16 @@
 //! The seeded, weighted item draw (#11896; design: #11894,
 //! `docs/design/work-finder-step-dispatch.md` §4.2 step 3).
 //!
-//! Once a workspace is drawn, the step engine draws **one item** of it to
-//! advance by one step. This module is that draw, as library code the finder
-//! cutover (#11909) calls; nothing here spawns, claims or loops.
+//! The step engine draws **one item** from a single pool of every actionable
+//! item across the host's workspaces, to advance it by one step (#12185; the
+//! earlier two-stage draw picked a workspace first, then an item in it). This
+//! module is that draw, as library code the finder cutover (#11909) calls;
+//! nothing here spawns, claims or loops.
 //!
 //! # The weight
 //!
 //! Every classified item ([`crate::work_finder::step_item::classify`]) gets
-//! `weight = actionable × priority × age`:
+//! an **item weight** `iw = actionable × priority × age`:
 //!
 //! - **`actionable` ∈ {0, 1}.** 0 for a [`Verdict::Pass`], and for a
 //!   [`Step::Builder`] in a repo whose build back-off is engaged. A red-main
@@ -35,10 +37,39 @@
 //! The arithmetic is integer, so a draw replays bit for bit: ages are whole
 //! minutes, and the pooled weight is `priority × (divisor_min +
 //! min(age_min, cap_min))`, which is `priority × age` scaled by the common
-//! factor `divisor_min`. The roll is drawn without modulo bias
-//! ([`roll_for`], rejection sampling), so the draw probabilities are exactly
-//! `w / Σw` of the documented weight. A Σw that would overflow `u64` is an
-//! error ([`DrawError`]), never a silently saturated total.
+//! factor `divisor_min`.
+//!
+//! # The pool weight (#12185)
+//!
+//! The draw weighs an item in the pool by
+//!
+//! ```text
+//! w_item = w_repo × iw × S_r^(α−1) × (1 + in_flight_repo)^(−β)
+//! ```
+//!
+//! where `S_r` is the sum of `iw` over the repo's items still in the pool,
+//! `w_repo` is the repo's roster weight (`workspaces.json`, set from the fleet
+//! store), `in_flight_repo` is how many of the repo's items someone works on
+//! right now (this host's live runs plus the live claims peers advertise), α
+//! is [`PoolKnobs::backlog_exponent`] and β is [`PoolKnobs::busy_exponent`].
+//!
+//! - **α = 0** gives `w_repo × iw / S_r`: the repo's share is its `w_repo`
+//!   whatever its backlog, and `iw` splits it among its items. That is the
+//!   earlier two-stage draw's distribution.
+//! - **α = 1** gives `w_repo × iw`: a flat pool, a repo's share grows with
+//!   its backlog.
+//! - **β = 0** switches the busy-ness term off; a larger β makes a repo with
+//!   work already in flight draw less.
+//!
+//! The terms are real numbers, so the arithmetic is floating point. The
+//! result is scaled so the heaviest item weighs `2^40` and rounded to an
+//! integer (a positive weight never rounds to 0), and the pooled draw is
+//! integer from there: the roll is drawn without modulo bias ([`roll_for`],
+//! rejection sampling), so the draw probabilities are exactly `w / Σw` of the
+//! scaled weights, within `2^-40` of the real formula. [`pool_weights`] is the
+//! one function the draw and [`replay_record`] both weigh with. A Σw that
+//! would overflow `u64` is an error ([`DrawError`]), never a silently
+//! saturated total.
 //!
 //! # The very-important cap
 //!
@@ -50,20 +81,21 @@
 //!
 //! # The seed
 //!
-//! Each draw has its own seed, scheme `loom-draw/v2` ([`item_seed`]):
-//! `sha256("loom-draw/v2:" + minute + ":" + host + ":" + tick_counter + ":" +
-//! workspace + ":" + draw_index)`, first 8 bytes big-endian. The workspace
-//! draw's `loom-draw/v1` is keyed `(minute, host)` only, so two ticks in one
-//! minute repeat it; the tick counter and workspace end that. Draws are
-//! without replacement: a drawn item leaves the pool, and the next draw uses
-//! the next `draw_index`.
+//! Each draw has its own seed, scheme `loom-draw/v3` ([`item_seed`]):
+//! `sha256("loom-draw/v3:" + minute + ":" + host + ":" + tick_counter + ":" +
+//! draw_index)`, first 8 bytes big-endian. (`v2` also keyed the drawn
+//! workspace; there is no workspace draw now.) Draws are without
+//! replacement: a drawn item leaves the pool, and the next draw uses the next
+//! `draw_index`, counted across the whole tick.
 //!
-//! **Replay.** `pick.decision`'s `item_draw` carries the seed inputs, each
-//! workspace's **starting pool** in pool order with every item's weight
-//! (`pools[]`), and every draw's roll and picked index. [`replay_record`]
-//! re-derives each seed and roll from the header and re-runs the selection
-//! over the logged pool minus earlier picks, so the whole sequence replays
-//! from the record alone.
+//! **Replay.** `pick.decision`'s `item_draw` carries the seed inputs, the two
+//! exponents, each repo's roster weight and in-flight count (`repos[]`), the
+//! **starting pool** of every repo in pool order with every item's weight
+//! (`pools[]`), the repos (or a repo's merge steps, #12494) closed mid-tick
+//! (`closures[]`), and every draw's
+//! roll and picked index. [`replay_record`] re-derives each seed and weighs
+//! the logged pool minus earlier picks and closed repos with
+//! [`pool_weights`], so the whole sequence replays from the record alone.
 //!
 //! The tick counter is per process: a daemon restarted within the same
 //! minute starts it again at 0 and reuses that minute's seeds. That is
@@ -85,7 +117,7 @@ use crate::work_finder::vi_cap::{self, ViDemotion};
 use crate::work_finder::WorkItem;
 
 /// The seed-derivation scheme of the item draw; also the hash input's prefix.
-pub const ITEM_DRAW_SEED_SCHEME: &str = "loom-draw/v2";
+pub const ITEM_DRAW_SEED_SCHEME: &str = "loom-draw/v3";
 
 /// Default priority factor of a red-main fix (`dispatch.itemWeightRedMain`).
 pub const DEFAULT_WEIGHT_RED_MAIN: u32 = 50;
@@ -118,7 +150,78 @@ pub const HYPERPARAM_KEYS: [(&str, (u64, u64)); 5] = [
     ("itemAgeDivisorDays", AGE_DIVISOR_DAYS_RANGE),
 ];
 
+/// `hyperparameters.dispatch` key of the backlog exponent α.
+pub const BACKLOG_EXPONENT_KEY: &str = "backlogExponent";
+/// `hyperparameters.dispatch` key of the busy-ness exponent β.
+pub const BUSY_EXPONENT_KEY: &str = "busyExponent";
+/// Default α: 0, the two-stage draw's distribution.
+pub const DEFAULT_BACKLOG_EXPONENT: f64 = 0.0;
+/// Default β: 0, no busy-ness term.
+pub const DEFAULT_BUSY_EXPONENT: f64 = 0.0;
+/// Accepted range of α, inclusive.
+pub const BACKLOG_EXPONENT_RANGE: (f64, f64) = (0.0, 1.0);
+/// Accepted range of β, inclusive. The upper bound only keeps
+/// `(1 + in_flight)^(−β)` far from underflow.
+pub const BUSY_EXPONENT_RANGE: (f64, f64) = (0.0, 100.0);
+
+/// The heaviest item of a draw weighs this many units once scaled to
+/// integers; Σw stays under `u64::MAX` for up to `2^24` pooled items.
+const SCALED_MAX_WEIGHT: f64 = (1u64 << 40) as f64;
+
 const MINUTES_PER_DAY: u64 = 24 * 60;
+
+/// The pool draw's two exponents (strict hyperparameters block,
+/// `dispatch.backlogExponent` and `dispatch.busyExponent`, #12185).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PoolKnobs {
+    /// α in `[0, 1]`: 0 keeps a repo's share fixed whatever its backlog, 1
+    /// lets it grow in proportion to the backlog.
+    pub backlog_exponent: f64,
+    /// β ≥ 0: how strongly a repo with work already in flight is drawn less.
+    pub busy_exponent: f64,
+}
+
+impl Default for PoolKnobs {
+    fn default() -> Self {
+        Self {
+            backlog_exponent: DEFAULT_BACKLOG_EXPONENT,
+            busy_exponent: DEFAULT_BUSY_EXPONENT,
+        }
+    }
+}
+
+impl PoolKnobs {
+    /// Overlay a hyperparameters layer (`{"dispatch": {...}}`) on the
+    /// defaults. A missing, mistyped, non-finite or out-of-range value keeps
+    /// its default, like [`ItemWeights::from_layer`].
+    #[must_use]
+    pub fn from_layer(layer: &Value) -> Self {
+        let d = Self::default();
+        let dispatch = layer.get("dispatch");
+        let pick = |key: &str, (lo, hi): (f64, f64), default: f64| -> f64 {
+            dispatch
+                .and_then(|g| g.get(key))
+                .and_then(Value::as_f64)
+                .filter(|x| x.is_finite() && (lo..=hi).contains(x))
+                .unwrap_or(default)
+        };
+        Self {
+            backlog_exponent: pick(
+                BACKLOG_EXPONENT_KEY,
+                BACKLOG_EXPONENT_RANGE,
+                d.backlog_exponent,
+            ),
+            busy_exponent: pick(BUSY_EXPONENT_KEY, BUSY_EXPONENT_RANGE, d.busy_exponent),
+        }
+    }
+
+    /// The exponents in force for the workspace at `root`, re-read on every
+    /// call so an edit hot-applies on the next tick.
+    #[must_use]
+    pub fn for_root(root: &Path) -> Self {
+        Self::from_layer(&crate::hyperparams::layer(root))
+    }
+}
 
 /// The item draw's numeric knobs (strict hyperparameters block,
 /// `dispatch.item*`).
@@ -263,6 +366,10 @@ pub enum Exclusion {
     BuildBackoff,
     /// The outcome ledger has the `(item, step)` cooling down (#11900).
     CoolingDown,
+    /// A Champion merge step in a repo with a merge in flight, this host's or
+    /// a peer's (#12494; design §6): deferred before the draw, so it costs
+    /// no draw and no pass.
+    MergeInFlight,
 }
 
 impl Exclusion {
@@ -274,6 +381,7 @@ impl Exclusion {
             Self::PoolExhausted => "pool_exhausted",
             Self::BuildBackoff => "build_backoff",
             Self::CoolingDown => "cooling_down",
+            Self::MergeInFlight => "merge_in_flight",
         }
     }
 }
@@ -314,13 +422,17 @@ pub struct WeightTerms {
     pub age_permille: u64,
     /// Where the age came from.
     pub age_source: AgeSource,
-    /// The draw weight: `priority × (divisor_min + min(age_min, cap_min))`.
+    /// The item weight `iw`: `priority × (divisor_min + min(age_min,
+    /// cap_min))`. The pool weight ([`pool_weights`]) scales it by the
+    /// repo's terms.
     pub weight: u64,
 }
 
 /// A pooled item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
+    /// The index of the workspace (repo) it came from.
+    pub workspace_idx: usize,
     pub item: Item,
     pub step: Step,
     pub terms: WeightTerms,
@@ -434,6 +546,7 @@ pub fn weigh(inputs: &[DrawInput], ctx: &WeighContext, weights: &ItemWeights) ->
             age_source,
         );
         pool.push(Candidate {
+            workspace_idx: ctx.workspace_idx,
             item: input.item.clone(),
             step,
             terms,
@@ -456,21 +569,19 @@ pub struct SeedKey {
     pub host: String,
     /// The process's tick counter.
     pub tick_counter: u64,
-    /// The drawn workspace, as `pick.decision` names it (the forge slug).
-    pub workspace: String,
 }
 
 /// The seed of draw `draw_index` under `key`: the first 8 bytes, read
-/// big-endian, of `sha256("loom-draw/v2:" + minute + ":" + host + ":" +
-/// tick_counter + ":" + workspace + ":" + draw_index)`, numbers in plain
-/// decimal, strings verbatim.
+/// big-endian, of `sha256("loom-draw/v3:" + minute + ":" + host + ":" +
+/// tick_counter + ":" + draw_index)`, numbers in plain decimal, strings
+/// verbatim.
 #[must_use]
 pub fn item_seed(key: &SeedKey, draw_index: u32) -> u64 {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(
         format!(
-            "{ITEM_DRAW_SEED_SCHEME}:{}:{}:{}:{}:{draw_index}",
-            key.minute, key.host, key.tick_counter, key.workspace
+            "{ITEM_DRAW_SEED_SCHEME}:{}:{}:{}:{draw_index}",
+            key.minute, key.host, key.tick_counter
         )
         .as_bytes(),
     );
@@ -483,7 +594,7 @@ pub fn item_seed(key: &SeedKey, draw_index: u32) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawError {
     /// Σw does not fit a `u64`. Unreachable at the documented ranges (the
-    /// largest weight is about 2^43, so it needs millions of items), but an
+    /// scaled weights sum to under `2^64` for up to `2^24` items), but an
     /// error rather than a saturated total that would skew the draw.
     WeightOverflow,
 }
@@ -538,24 +649,142 @@ pub fn pick_by_roll(weights: impl IntoIterator<Item = u64>, roll: u64) -> Option
     None
 }
 
-/// The index `pool` draws with `seed`, the pool's total weight and the roll
-/// in `0..total`; `Ok(None)` when the pool weighs nothing. P(i) = `w_i / Σw`.
-///
-/// # Errors
-/// [`DrawError::WeightOverflow`] when Σw does not fit a `u64`.
-pub fn pick_index(pool: &[Candidate], seed: u64) -> Result<Option<(usize, u64, u64)>, DrawError> {
-    let total = total_weight(pool.iter().map(|c| c.terms.weight))?;
-    if total == 0 {
-        return Ok(None);
+/// What the draw knows about a repo besides its items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoTerms {
+    /// `w_repo`: the repo's roster weight (0: never drawn).
+    pub weight: u32,
+    /// `in_flight_repo`: its items someone works on right now.
+    pub in_flight: usize,
+}
+
+/// One pooled item as the pool weight reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolRow {
+    /// The repo's workspace index.
+    pub repo: usize,
+    /// The item weight `iw` ([`WeightTerms::weight`]).
+    pub item_weight: u64,
+}
+
+/// A repo's terms in one draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoDrawTerms {
+    /// `w_repo`.
+    pub weight: u32,
+    /// `in_flight_repo`.
+    pub in_flight: usize,
+    /// `n_items`: the repo's items in the pool at this draw.
+    pub items: usize,
+    /// `S_r`: the sum of their item weights.
+    pub pool_weight: u64,
+}
+
+/// The weights of one draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolWeights {
+    /// The integer draw weight of each row, in row order.
+    pub weights: Vec<u64>,
+    /// The terms of every repo with a row, by workspace index.
+    pub repos: BTreeMap<usize, RepoDrawTerms>,
+}
+
+/// `x^e` for the exponents the knobs make common, without `powf`'s rounding.
+fn power(x: f64, e: f64) -> f64 {
+    if e == 0.0 {
+        1.0
+    } else if e == 1.0 {
+        x
+    } else if e == -1.0 {
+        1.0 / x
+    } else {
+        x.powf(e)
     }
-    let roll = roll_for(seed, total);
-    Ok(pick_by_roll(pool.iter().map(|c| c.terms.weight), roll).map(|i| (i, total, roll)))
+}
+
+/// The draw weights of `rows` (module docs, "The pool weight"):
+/// `w_repo × iw × S_r^(α−1) × (1 + in_flight_repo)^(−β)`, scaled so the
+/// heaviest weighs `2^40`. A row whose repo is not in `repos`, or whose
+/// `w_repo` or `iw` is 0, weighs 0. Pure; the draw and [`replay_record`]
+/// both weigh with it.
+#[must_use]
+pub fn pool_weights(
+    rows: &[PoolRow],
+    repos: &BTreeMap<usize, RepoTerms>,
+    knobs: &PoolKnobs,
+) -> PoolWeights {
+    let mut terms: BTreeMap<usize, RepoDrawTerms> = BTreeMap::new();
+    for row in rows {
+        let known = repos.get(&row.repo).copied().unwrap_or(RepoTerms {
+            weight: 0,
+            in_flight: 0,
+        });
+        let t = terms.entry(row.repo).or_insert(RepoDrawTerms {
+            weight: known.weight,
+            in_flight: known.in_flight,
+            items: 0,
+            pool_weight: 0,
+        });
+        t.items += 1;
+        t.pool_weight = t.pool_weight.saturating_add(row.item_weight);
+    }
+    // Per repo: w_repo × S^(α−1) × (1 + in_flight)^(−β).
+    let factor: BTreeMap<usize, f64> = terms
+        .iter()
+        .map(|(&repo, t)| {
+            let backlog = power(t.pool_weight as f64, knobs.backlog_exponent - 1.0);
+            let busy = power(1.0 + t.in_flight as f64, -knobs.busy_exponent);
+            (repo, f64::from(t.weight) * backlog * busy)
+        })
+        .collect();
+    let raw: Vec<f64> = rows
+        .iter()
+        .map(|row| {
+            let w = row.item_weight as f64 * factor[&row.repo];
+            if w.is_finite() && w > 0.0 {
+                w
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let heaviest = raw.iter().copied().fold(0.0_f64, f64::max);
+    let weights = if heaviest > 0.0 {
+        let scale = SCALED_MAX_WEIGHT / heaviest;
+        raw.iter()
+            .map(|&w| {
+                if w > 0.0 {
+                    ((w * scale).round() as u64).max(1)
+                } else {
+                    0
+                }
+            })
+            .collect()
+    } else {
+        vec![0; rows.len()]
+    };
+    PoolWeights {
+        weights,
+        repos: terms,
+    }
+}
+
+/// The weight terms of one draw: what `pick.decision` and the step span
+/// record beside the drawn item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawTerms {
+    /// The drawn item's integer draw weight.
+    pub weight: u64,
+    /// The pool's total weight when it was drawn.
+    pub total_weight: u64,
+    /// Its repo's terms at that draw.
+    pub repo: RepoDrawTerms,
 }
 
 /// One draw, as `pick.decision` records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrawRecord {
-    /// 0-based position in the tick's draws for this workspace.
+    /// 0-based position in the tick's draws.
     pub draw_index: u32,
     /// [`item_seed`] of the key and `draw_index`.
     pub seed: u64,
@@ -566,58 +795,154 @@ pub struct DrawRecord {
     /// The roll in `0..total_weight`.
     pub roll: u64,
     /// The drawn item's index in the pool as it stood (the starting pool
-    /// minus earlier picks, in pool order).
+    /// minus earlier picks and closed repos, in pool order).
     pub picked_index: usize,
     /// The drawn item.
     pub picked: Candidate,
+    /// The drawn item's weight terms.
+    pub terms: DrawTerms,
 }
 
-/// Successive draws without replacement from one workspace's pool. The
+/// Successive draws without replacement from the tick's one pool. The
 /// cutover takes one draw per slot and draws again on a gate or claim pass.
 #[derive(Debug, Clone)]
 pub struct ItemDraw {
     start: Vec<Candidate>,
     pool: Vec<Candidate>,
+    repos: BTreeMap<usize, RepoTerms>,
+    knobs: PoolKnobs,
     key: SeedKey,
     next_index: u32,
+    /// `(workspace index, draws taken)` of each repo [`Self::close_repo`]
+    /// took out of the pool.
+    closures: Vec<(usize, u32)>,
+    /// `(workspace index, draws taken, steps)` of each partial closure
+    /// [`Self::close_steps`] made (#12494).
+    step_closures: Vec<(usize, u32, Vec<Step>)>,
 }
 
 impl ItemDraw {
+    /// A draw over `pool` (every repo's items, repos in workspace order, each
+    /// repo's in item order), where `repos` holds each repo's terms.
     #[must_use]
-    pub fn new(pool: Vec<Candidate>, key: SeedKey) -> Self {
+    pub fn new(
+        pool: Vec<Candidate>,
+        repos: BTreeMap<usize, RepoTerms>,
+        knobs: PoolKnobs,
+        key: SeedKey,
+    ) -> Self {
         Self {
             start: pool.clone(),
             pool,
+            repos,
+            knobs,
             key,
             next_index: 0,
+            closures: Vec::new(),
+            step_closures: Vec::new(),
         }
     }
 
-    /// The pool before any draw, in pool order: what `pick.decision` logs
-    /// once per workspace so the draws replay.
+    /// The pool before any draw, in pool order: what `pick.decision` logs so
+    /// the draws replay.
     #[must_use]
     pub fn starting_pool(&self) -> &[Candidate] {
         &self.start
     }
 
-    /// The next draw, `Ok(None)` once the pool is empty.
+    /// Each repo's terms, by workspace index.
+    #[must_use]
+    pub fn repos(&self) -> &BTreeMap<usize, RepoTerms> {
+        &self.repos
+    }
+
+    /// The exponents this draw weighs with.
+    #[must_use]
+    pub fn knobs(&self) -> &PoolKnobs {
+        &self.knobs
+    }
+
+    /// Take every remaining item of workspace `idx` out of the pool for the
+    /// rest of the tick (its per-repo cap refused a draw). Recorded, so the
+    /// draws still replay.
+    pub fn close_repo(&mut self, idx: usize) {
+        if self.pool.iter().any(|c| c.workspace_idx == idx) {
+            self.pool.retain(|c| c.workspace_idx != idx);
+            self.closures.push((idx, self.next_index));
+        }
+    }
+
+    /// The repos taken out of the pool, as `(workspace index, draws taken
+    /// before)`: they are absent from every draw with an index at least that.
+    #[must_use]
+    pub fn closures(&self) -> &[(usize, u32)] {
+        &self.closures
+    }
+
+    /// Take every remaining item of workspace `idx` whose step is one of
+    /// `steps` out of the pool for the rest of the tick, and return them in
+    /// pool order (#12494: a repo that started a Champion merge this tick
+    /// draws no second one). Recorded beside [`Self::closures`], so the
+    /// draws still replay. A call that takes nothing records nothing.
+    pub fn close_steps(&mut self, idx: usize, steps: &[Step]) -> Vec<Candidate> {
+        let (taken, kept): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut self.pool)
+            .into_iter()
+            .partition(|c| c.workspace_idx == idx && steps.contains(&c.step));
+        self.pool = kept;
+        if !taken.is_empty() {
+            self.step_closures
+                .push((idx, self.next_index, steps.to_vec()));
+        }
+        taken
+    }
+
+    /// The partial closures, as `(workspace index, draws taken before,
+    /// steps)`: that repo's items of those steps are absent from every draw
+    /// with an index at least that.
+    #[must_use]
+    pub fn step_closures(&self) -> &[(usize, u32, Vec<Step>)] {
+        &self.step_closures
+    }
+
+    /// The next draw, `Ok(None)` once the pool holds nothing drawable.
     ///
     /// # Errors
     /// [`DrawError::WeightOverflow`] when the pool's Σw does not fit a `u64`.
     pub fn try_next(&mut self) -> Result<Option<DrawRecord>, DrawError> {
         let seed = item_seed(&self.key, self.next_index);
         let pool_size = self.pool.len();
-        let Some((i, total_weight, roll)) = pick_index(&self.pool, seed)? else {
+        let rows: Vec<PoolRow> = self
+            .pool
+            .iter()
+            .map(|c| PoolRow {
+                repo: c.workspace_idx,
+                item_weight: c.terms.weight,
+            })
+            .collect();
+        let weighed = pool_weights(&rows, &self.repos, &self.knobs);
+        let total = total_weight(weighed.weights.iter().copied())?;
+        if total == 0 {
+            return Ok(None);
+        }
+        let roll = roll_for(seed, total);
+        let Some(i) = pick_by_roll(weighed.weights.iter().copied(), roll) else {
             return Ok(None);
         };
+        let picked = self.pool.remove(i);
+        let repo = weighed.repos[&picked.workspace_idx];
         let record = DrawRecord {
             draw_index: self.next_index,
             seed,
             pool_size,
-            total_weight,
+            total_weight: total,
             roll,
             picked_index: i,
-            picked: self.pool.remove(i),
+            picked,
+            terms: DrawTerms {
+                weight: weighed.weights[i],
+                total_weight: total,
+                repo,
+            },
         };
         self.next_index += 1;
         Ok(Some(record))
@@ -660,14 +985,16 @@ pub struct ReplayedPick {
     pub pr: Option<u32>,
 }
 
-/// Replay `record`'s draws from what it logged alone: for each workspace,
-/// start from its logged `pools[]` (in `index` order), and for each of its
-/// draws, re-derive the seed from the header, check the logged seed, total
-/// and roll against it, select by the roll over the pool minus earlier picks,
-/// and check the logged picked index and item. Each workspace's logged pool
-/// must be indexed `0..n`, its draws must be numbered consecutively from 0,
-/// and each draw's `pool_size` must be the pool left at that draw. Returns
-/// the picks in draw order. Reassemble a chunked record first.
+/// Replay `record`'s draws from what it logged alone: start from the logged
+/// `pools[]` (in `index` order) and `repos[]`, and for each draw, drop the
+/// repos `closures[]` closed by then (only the rows of a closure's `steps`,
+/// when it names any), weigh the pool left with
+/// [`pool_weights`], re-derive the seed from the header, check the logged
+/// seed, total, roll, weight, picked index and item against it, and remove
+/// the pick. The logged pool must be indexed `0..n` and every row's repo must
+/// be in `repos[]`, the draws must be numbered consecutively from 0, and each
+/// draw's `pool_size` must be the pool left at that draw. Returns the picks
+/// in draw order. Reassemble a chunked record first.
 ///
 /// # Errors
 /// A description of the first draw that does not replay.
@@ -678,59 +1005,91 @@ pub fn replay_record(
         s.parse()
             .map_err(|_| format!("{what} {s:?} is not a number"))
     };
+    let exponent = |s: &str, what: &str| -> Result<f64, String> {
+        s.parse::<f64>()
+            .ok()
+            .filter(|x| x.is_finite())
+            .ok_or_else(|| format!("{what} {s:?} is not a number"))
+    };
     let minute = num(&record.seed_minute, "seed_minute")?;
     let tick_counter = num(&record.tick_counter, "tick_counter")?;
-    let mut pools: BTreeMap<&str, Vec<&crate::telemetry::kinds::pick_decision::PickItemPoolEntry>> =
-        BTreeMap::new();
-    for row in &record.pools {
-        pools.entry(row.repo.as_str()).or_default().push(row);
+    let knobs = PoolKnobs {
+        backlog_exponent: exponent(&record.backlog_exponent, "backlog_exponent")?,
+        busy_exponent: exponent(&record.busy_exponent, "busy_exponent")?,
+    };
+    let mut ids: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut repos: BTreeMap<usize, RepoTerms> = BTreeMap::new();
+    for (id, r) in record.repos.iter().enumerate() {
+        ids.insert(r.repo.as_str(), id);
+        repos.insert(
+            id,
+            RepoTerms {
+                weight: r.weight,
+                in_flight: r.in_flight,
+            },
+        );
     }
-    for rows in pools.values_mut() {
-        rows.sort_by_key(|r| r.index);
+    let mut pool: Vec<&crate::telemetry::kinds::pick_decision::PickItemPoolEntry> =
+        record.pools.iter().collect();
+    pool.sort_by_key(|r| r.index);
+    if pool
+        .iter()
+        .zip(0u32..)
+        .any(|(row, expected)| row.index != expected)
+    {
+        return Err("the logged pool is not indexed 0..n".to_string());
     }
-    for (repo, rows) in &pools {
-        if rows
-            .iter()
-            .zip(0u32..)
-            .any(|(row, expected)| row.index != expected)
-        {
-            return Err(format!("the logged pool of {repo} is not indexed 0..n"));
-        }
-    }
-    // The next draw index each workspace must log: draws are consecutive
-    // from 0 within a workspace, or an earlier pick is missing.
-    let mut next_index: BTreeMap<&str, u32> = BTreeMap::new();
+    let row_repo = |row: &crate::telemetry::kinds::pick_decision::PickItemPoolEntry| {
+        ids.get(row.repo.as_str()).copied().ok_or_else(|| {
+            format!("pool row {} names {}, which repos[] lacks", row.index, row.repo)
+        })
+    };
     let mut picks = Vec::new();
-    for d in &record.draws {
-        let pool = pools
-            .get_mut(d.repo.as_str())
-            .ok_or_else(|| format!("draw {} of {}: no logged pool", d.draw_index, d.repo))?;
-        let expected = next_index.entry(d.repo.as_str()).or_insert(0);
-        if d.draw_index != *expected {
-            return Err(format!(
-                "draw {} of {}: the record skips draw {expected}",
-                d.draw_index, d.repo
-            ));
+    for (expected, d) in (0u32..).zip(&record.draws) {
+        if d.draw_index != expected {
+            return Err(format!("the record skips draw {expected}"));
         }
-        *expected += 1;
-        if d.pool_size != pool.len() {
+        let at = format!("draw {}", d.draw_index);
+        // A closure with `steps` takes only those steps of its repo
+        // (#12494); one without takes the whole repo.
+        let closed: Vec<&crate::telemetry::kinds::pick_decision::PickItemClosure> = record
+            .closures
+            .iter()
+            .filter(|c| c.after_draw <= d.draw_index)
+            .collect();
+        let live: Vec<&crate::telemetry::kinds::pick_decision::PickItemPoolEntry> = pool
+            .iter()
+            .copied()
+            .filter(|row| {
+                !closed.iter().any(|c| {
+                    c.repo == row.repo && (c.steps.is_empty() || c.steps.contains(&row.step))
+                })
+            })
+            .collect();
+        if d.pool_size != live.len() {
             return Err(format!(
-                "draw {} of {}: pool_size {} != {} items left in the logged pool",
-                d.draw_index,
-                d.repo,
+                "{at}: pool_size {} != {} items left in the logged pool",
                 d.pool_size,
-                pool.len()
+                live.len()
             ));
         }
+        let rows: Vec<PoolRow> = live
+            .iter()
+            .map(|row| {
+                Ok(PoolRow {
+                    repo: row_repo(row)?,
+                    item_weight: row.weight,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let weighed = pool_weights(&rows, &repos, &knobs);
+        let total = total_weight(weighed.weights.iter().copied()).map_err(|e| e.to_string())?;
         let key = SeedKey {
             minute,
             host: record.seed_host.clone(),
             tick_counter,
-            workspace: d.repo.clone(),
         };
         let seed = item_seed(&key, d.draw_index);
-        let total = total_weight(pool.iter().map(|r| r.weight)).map_err(|e| e.to_string())?;
-        let at = format!("draw {} of {}", d.draw_index, d.repo);
         if d.seed != seed.to_string() || d.total_weight != total || total == 0 {
             return Err(format!("{at}: seed or total does not match the logged pool"));
         }
@@ -738,15 +1097,22 @@ pub fn replay_record(
         if roll != d.roll {
             return Err(format!("{at}: roll {roll} != logged {}", d.roll));
         }
-        let i = pick_by_roll(pool.iter().map(|r| r.weight), roll)
+        let i = pick_by_roll(weighed.weights.iter().copied(), roll)
             .ok_or_else(|| format!("{at}: roll past the pool"))?;
-        let row = pool.remove(i);
-        if i != d.picked_index || row.issue != d.issue || row.pr != d.pr {
+        let row = live[i];
+        if i != d.picked_index
+            || row.issue != d.issue
+            || row.pr != d.pr
+            || row.repo != d.repo
+            || weighed.weights[i] != d.draw_weight
+        {
             return Err(format!(
                 "{at}: replay picked index {i}, the record names {}",
                 d.picked_index
             ));
         }
+        let index = row.index;
+        pool.retain(|r| r.index != index);
         picks.push(ReplayedPick {
             repo: d.repo.clone(),
             draw_index: d.draw_index,

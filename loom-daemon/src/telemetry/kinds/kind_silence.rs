@@ -17,6 +17,7 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     // Emitted on every collector tick, whatever the host is doing.
     ("host.health", Some(24)),
     ("host.export", Some(24)),
+    ("host.status", Some(24)),
     ("tokens.snapshot", Some(24)),
     // Activity-driven or failure-only: an idle host emits none of these.
     ("sweep.started", None),
@@ -39,6 +40,9 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("auto_update.tick", None),
     ("fleet.state", None),
     ("pick.decision", None),
+    ("eta.dispatch_eligibility", None),
+    ("eta.stage_occupancy", None),
+    ("eta.stage_entry", None),
     ("pr.resolved", None),
     ("eta.stage_outcome", None),
     ("pass.summary", None),
@@ -46,11 +50,20 @@ pub const KIND_SILENCE: &[(&str, Option<i64>)] = &[
     ("token_ranking.refresh", None),
     ("operator.presence", None),
     ("checkout.external_change", None),
+    ("roster.change", None),
     ("issue.estimate", None),
     ("stage.work_started", None),
-    ("backlog.level", None),
+    ("write_scope.refused", None),
+    ("merge_queue.event", None),
+    ("merge.authorization.evaluated", None),
+    ("hold.transition", None),
+    ("merge.queue.observed", None),
+    ("merge.queue.regime", None),
     ("daemon.exit", None),
+    ("daemon.run_state_request", None),
     ("scope.memory", None),
+    // Only while an alert holds (heartbeat) or on a transition.
+    ("alert.transition", None),
 ];
 
 /// How long `kind` may stay silent; `None` when it is exempt.

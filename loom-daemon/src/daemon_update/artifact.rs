@@ -253,6 +253,9 @@ fn gh_release_view(slug: &str, tag: Option<&str>, fields: &str, jq: &str) -> Opt
     let timeout = std::time::Duration::from_secs(60);
     let outcome = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, timeout)
         .forge_op(crate::forge_call_stats::ops::RELEASE_RESOLVE_AND_FETCH)
+        // Reader-only (#12394, #12584): the reader route names the repo the
+        // `release view -R` argv reads, which the facade does not derive.
+        .reader_repo(slug)
         .args(release_view_args(slug, tag, fields, jq))
         .run();
     let ran = outcome.ok_output()?;

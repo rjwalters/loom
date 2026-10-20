@@ -44,11 +44,8 @@ use super::records::{
     RunJson, RunsPage,
 };
 use super::state::{self, CycleLock, CycleSummary, PollStatus};
-use super::story::{self, RepoIdentityFn, RepoStories, Stitch};
 use super::{journal_path, log_capture_gate, state_dir, LogCaptureGate, ResolvedCiTelemetry};
 use crate::telemetry::TelemetryEnvelope;
-
-pub mod targeted;
 
 /// Everything a cycle needs, resolved up front (a seam for tests: `now`,
 /// `host_id`, and the lookback are injectable).
@@ -71,9 +68,6 @@ pub struct CycleContext<'a> {
     pub log_excluded_repos: Vec<String>,
     /// Per-job cap on captured log text (#8825).
     pub log_max_bytes: usize,
-    /// The D32 `repo_id` resolver for story stitching (#9088); `None` turns
-    /// stitching off (no identity probe, no GraphQL request).
-    pub repo_identity: Option<RepoIdentityFn>,
 }
 
 impl<'a> CycleContext<'a> {
@@ -99,7 +93,6 @@ impl<'a> CycleContext<'a> {
                 .map(|exclusion| exclusion.repo.clone())
                 .collect(),
             log_max_bytes: resolved.log_capture_max_bytes,
-            repo_identity: Some(story::resolve_repo_identity),
         }
     }
 
@@ -177,19 +170,6 @@ impl CycleReport {
             text.push_str(&format!(
                 "; tests: {} span(s) from {} JUnit record(s), {} artifact(s) failed",
                 s.test_spans_emitted, s.test_records_read, s.test_artifact_failures
-            ));
-        }
-        let stitched = s.story_runs_stitched
-            + s.story_runs_no_candidate
-            + s.story_runs_ambiguous
-            + s.story_runs_unresolved;
-        if stitched > 0 {
-            text.push_str(&format!(
-                "; story: {} run(s) stitched, {} without candidate, {} ambiguous, {} unresolved",
-                s.story_runs_stitched,
-                s.story_runs_no_candidate,
-                s.story_runs_ambiguous,
-                s.story_runs_unresolved
             ));
         }
         if !self.repo_errors.is_empty() {
@@ -381,7 +361,12 @@ fn record_outcome(
             if report.logs_fetched {
                 status.last_log_fetch_at = Some(ctx.now);
             }
-            if report.repo_errors.is_empty() {
+            // An owner skipped at discovery is recorded as a `repo_errors`
+            // entry too, but the cycle still polled the other owners: it is
+            // not a cycle failure. `classify` reads `status.owners` and
+            // reports `degraded`, naming the skipped owner, instead.
+            let skipped_owners = report.owners.iter().filter(|o| o.error.is_some()).count();
+            if report.repo_errors.len() <= skipped_owners {
                 status.last_ok_at = Some(ctx.now);
                 status.consecutive_failures = 0;
                 status.backoff_until = None;
@@ -788,29 +773,6 @@ fn poll_repo(
     runs.sort_by_key(|r| (r.created_at, r.id));
     emit_queue_depth(full, &runs);
 
-    // #9088: resolve story membership for every run this pass may emit, up
-    // front, so a repo costs at most one identity probe and one batched
-    // GraphQL request per cycle.
-    let stories = ctx.repo_identity.map(|resolve| {
-        let unseen: Vec<&RunJson> = runs
-            .iter()
-            .filter(|run| {
-                run.is_completed() && !ledger.is_seen(&UnitKey::run(full, run.id, run.run_attempt))
-            })
-            .collect();
-        let mut graphql_ok = !report.graphql_suppressed;
-        let stories = RepoStories::prepare(
-            resolve,
-            api,
-            full,
-            &unseen,
-            &mut report.summary.requests,
-            &mut graphql_ok,
-        );
-        report.graphql_suppressed = !graphql_ok;
-        stories
-    });
-
     let mut newest = watermark;
     let mut oldest_incomplete: Option<DateTime<Utc>> = None;
     for run in &runs {
@@ -825,7 +787,7 @@ fn poll_repo(
             );
             continue;
         }
-        match record_run(ctx, api, ledger, journal, repo, run, stories.as_ref(), report)? {
+        match record_run(ctx, api, ledger, journal, repo, run, report)? {
             RunOutcome::Seen | RunOutcome::Recorded => {}
             RunOutcome::Held => hold(
                 run.created_at,
@@ -854,11 +816,9 @@ enum RunOutcome {
     Recorded,
 }
 
-/// Record one **completed** run attempt: list its jobs, resolve suite spans
-/// and story stitching, commit job units then the run unit, emit, and record
-/// the wanted job logs. Shared by the repo sweep ([`poll_repo`]) and the
-/// feed-driven single-run path ([`targeted`], #9201) so the two can never
-/// record a run differently. Never touches the watermark — that is the
+/// Record one **completed** run attempt: list its jobs, resolve suite spans,
+/// commit job units then the run unit, emit, and record
+/// the wanted job logs. Never touches the watermark — that is the
 /// sweep's alone.
 #[allow(clippy::too_many_arguments)]
 fn record_run(
@@ -868,7 +828,6 @@ fn record_run(
     journal: &Journal,
     repo: &RepoJson,
     run: &RunJson,
-    stories: Option<&RepoStories>,
     report: &mut CycleReport,
 ) -> Result<RunOutcome, RepoError> {
     let full = repo.full_name.as_str();
@@ -883,11 +842,6 @@ fn record_run(
     if jobs.iter().any(|job| !job.is_completed()) {
         return Ok(RunOutcome::Held);
     }
-    let stitch = stories.map(|stories| stories.decide(run));
-    let story = match &stitch {
-        Some(Stitch::Stitched(story)) => Some(story),
-        _ => None,
-    };
     // #9089/#9456: suite and per-test spans are resolved BEFORE the commit
     // so they ride in their job's own unit (see `super::artifact_spans` on
     // why, and on what a failure here costs). A rate limit or a dead
@@ -933,13 +887,6 @@ fn record_run(
                 &ctx.host_id,
                 not_started.get(&job.id).copied(),
             );
-            if let Some(story) = story {
-                story::stitch_job(&mut envelopes, story, run, job);
-            }
-            // Appended after stitching so the story pass never sees (and
-            // never copies) a suite or test span into the story trace: a
-            // story trace is a per-issue summary, and one leg's ~118 suite
-            // spans (or its slow-test tail) would swamp it.
             if let Some(spans) = artifact_spans.remove(&job.id) {
                 envelopes.extend(spans);
             }
@@ -950,10 +897,7 @@ fn record_run(
         })
         .filter(|draft| !ledger.is_seen(&draft.key))
         .collect();
-    let mut run_unit = run_envelopes(repo, run, &ctx.host_id);
-    if let Some(story) = story {
-        story::stitch_run(&mut run_unit, story, run);
-    }
+    let run_unit = run_envelopes(repo, run, &ctx.host_id);
     drafts.push(UnitDraft {
         key: run_key,
         envelopes: run_unit,
@@ -965,9 +909,6 @@ fn record_run(
             report.summary.jobs_emitted += 1;
         } else {
             report.summary.runs_emitted += 1;
-            if let Some(stitch) = &stitch {
-                count_stitch(&mut report.summary, full, run, stitch);
-            }
         }
     }
     // #8825: record which jobs' logs are wanted, durably, right after the
@@ -1000,33 +941,6 @@ fn record_run(
         ledger.want_logs(&wanted)?;
     }
     Ok(RunOutcome::Recorded)
-}
-
-/// Count (and log) one emitted run's story decision (#9088). A run that is
-/// not stitched is never silently dropped from the story: it is named here.
-fn count_stitch(summary: &mut CycleSummary, repo: &str, run: &RunJson, stitch: &Stitch) {
-    let (id, attempt) = (run.id, run.run_attempt);
-    match stitch {
-        Stitch::Stitched(story) => {
-            summary.story_runs_stitched += 1;
-            log::debug!("ci_telemetry: {repo} run {id}/{attempt} stitched into {}", story.story);
-        }
-        Stitch::NoCandidate => {
-            summary.story_runs_no_candidate += 1;
-            log::debug!("ci_telemetry: {repo} run {id}/{attempt} has no story candidate");
-        }
-        Stitch::Ambiguous(issues) => {
-            summary.story_runs_ambiguous += 1;
-            log::info!(
-                "ci_telemetry: {repo} run {id}/{attempt} not stitched: several candidate issues \
-                 {issues:?} (never guessed)"
-            );
-        }
-        Stitch::Unresolved(reason) => {
-            summary.story_runs_unresolved += 1;
-            log::info!("ci_telemetry: {repo} run {id}/{attempt} not stitched: {reason}");
-        }
-    }
 }
 
 /// Emit freshly committed units to the journal, then confirm them.

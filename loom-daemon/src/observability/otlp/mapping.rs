@@ -2,18 +2,27 @@
 //! parent module's doc comment for the mapping table this file implements;
 //! this module is the field-by-field implementation plus its unit tests.
 
+mod alert_transition;
 mod auto_update;
-mod backlog_level;
 mod checkout_external_change;
+mod checkout_freshness;
 mod ci;
 mod daemon_event;
 mod daemon_exit;
+mod dispatch_eligibility;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
+mod hold_transition;
 mod host_export;
+mod host_health;
 mod host_resource;
+mod host_status;
 mod issue_estimate;
+mod merge_authorization;
+mod merge_queue_event;
+mod merge_queue_observed;
+mod merge_queue_regime;
 mod metadata;
 mod operator_presence;
 mod ops;
@@ -22,11 +31,16 @@ mod pass;
 mod pick_decision;
 mod prompt_tree;
 mod role_draw;
+mod roster_change;
+mod run_state_request;
 mod scope_memory;
 mod session_output;
+mod stage_entry;
+mod stage_occupancy;
 mod token_ranking;
 mod tokens_snapshot;
 mod work_started;
+mod write_scope_refused;
 
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
@@ -73,7 +87,16 @@ pub(super) fn kv_string(key: &str, value: impl Into<String>) -> KeyValue {
     kv(key, any_string(value))
 }
 
-fn kv_int(key: &str, value: i64) -> KeyValue {
+pub(super) fn kv_bool(key: &str, value: bool) -> KeyValue {
+    kv(
+        key,
+        AnyValue {
+            value: Some(any_value::Value::BoolValue(value)),
+        },
+    )
+}
+
+pub(super) fn kv_int(key: &str, value: i64) -> KeyValue {
     kv(
         key,
         AnyValue {
@@ -579,14 +602,20 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             (event_name, severity, String::new(), attributes)
         }
         TelemetryRecord::AutoUpdateTick(_)
+        | TelemetryRecord::AlertTransition(_)
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::HostExport(_)
         | TelemetryRecord::CheckoutExternalChange(_)
+        | TelemetryRecord::RosterChange(_)
         | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::FleetState(_)
         | TelemetryRecord::PickDecision(_)
-        | TelemetryRecord::OperatorPresence(_) => {
+        | TelemetryRecord::OperatorPresence(_)
+        | TelemetryRecord::DispatchEligibility(_)
+        | TelemetryRecord::StageOccupancy(_)
+        | TelemetryRecord::StageEntry(_)
+        | TelemetryRecord::CheckoutFreshness(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
             // Issue #10744: one token-ranking refresh round (the round's
@@ -599,13 +628,19 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the body). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
+                .or_else(|| alert_transition::log_parts(r))
                 .or_else(|| token_ranking::log_parts(r))
                 .or_else(|| host_export::log_parts(r))
                 .or_else(|| checkout_external_change::log_parts(r))
+                .or_else(|| roster_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
-                .or_else(|| operator_presence::log_parts(r))?;
+                .or_else(|| operator_presence::log_parts(r))
+                .or_else(|| dispatch_eligibility::log_parts(r))
+                .or_else(|| stage_occupancy::log_parts(r))
+                .or_else(|| stage_entry::log_parts(r))
+                .or_else(|| checkout_freshness::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
@@ -613,8 +648,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SessionOutput(_)
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
-        | TelemetryRecord::BacklogLevel(_)
+        | TelemetryRecord::WriteScopeRefused(_)
+        | TelemetryRecord::MergeQueueEvent(_)
+        | TelemetryRecord::MergeAuthorization(_)
+        | TelemetryRecord::HoldTransition(_)
+        | TelemetryRecord::MergeQueueObserved(_)
+        | TelemetryRecord::MergeQueueRegime(_)
         | TelemetryRecord::DaemonExit(_)
+        | TelemetryRecord::RunStateRequest(_)
         | TelemetryRecord::ScopeMemory(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
@@ -630,9 +671,15 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
                 .or_else(|| work_started::log_parts(r))
-                .or_else(|| backlog_level::log_parts(r))
                 .or_else(|| daemon_exit::log_parts(r))
-                .or_else(|| scope_memory::log_parts(r))?;
+                .or_else(|| run_state_request::log_parts(r))
+                .or_else(|| scope_memory::log_parts(r))
+                .or_else(|| write_scope_refused::log_parts(r))
+                .or_else(|| merge_queue_event::log_parts(r))
+                .or_else(|| merge_authorization::log_parts(r))
+                .or_else(|| hold_transition::log_parts(r))
+                .or_else(|| merge_queue_observed::log_parts(r))
+                .or_else(|| merge_queue_regime::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
@@ -682,7 +729,13 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         severity_number: severity as i32,
         severity_text: severity_text(severity).to_string(),
         body: Some(any_string(body_override.unwrap_or_else(|| event_name.to_string()))),
-        attributes: metadata::bounded(attributes),
+        // #12806: `alert.*` values are fitted to loom-ui's schema limits,
+        // which are wider than the generic bound.
+        attributes: if matches!(envelope.record, TelemetryRecord::AlertTransition(_)) {
+            alert_transition::bounded(attributes)
+        } else {
+            metadata::bounded(attributes)
+        },
         event_name: event_name.to_string(),
         trace_id: envelope
             .trace_context
@@ -860,6 +913,56 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     value: number_data_point::Value::AsInt(1),
                     time_unix_nano,
                 });
+                // Issue #12905: the per-kind last acked export (#12120) as one
+                // gauge per kind, so a consumer can refuse an `as_of` past the
+                // coverage this host delivered. A kind with no export yet has
+                // no data point (absent, never zero). `kind` is already on the
+                // collector's datapoint allowlist.
+                for k in &otlp_export.kinds {
+                    if let Some(at) = k.last_export_at {
+                        samples.push(MetricSample {
+                            name: "loom.host.kind_last_export_seconds",
+                            description: "Unix seconds of this daemon's last acked OTLP export \
+                                          of a record kind (in memory: since process start).",
+                            unit: "s",
+                            attributes: vec![kv_string("kind", k.kind.as_str())],
+                            value: number_data_point::Value::AsInt(at.timestamp()),
+                            time_unix_nano,
+                        });
+                    }
+                }
+            }
+            // Cgroup-derived agent-scope census (#12166). Aggregate gauges only
+            // (per-scope names would be unbounded label cardinality); the
+            // per-scope detail rides on the host.health record itself. Absent
+            // when the agents slice was unreadable, never a fabricated zero.
+            if let Some(total) = r.agent_scopes_total {
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes",
+                    "Live loom-agent-* cgroup scopes on this host, registry-independent.",
+                    "{scope}",
+                    number_data_point::Value::AsInt(i64::from(total)),
+                    time_unix_nano,
+                ));
+                let orphans: Vec<_> = r.agent_scopes.iter().filter(|s| !s.agent_alive).collect();
+                samples.push(memory_gauge(
+                    "loom.host.agent_scopes_orphaned",
+                    "Listed agent scopes with no agent process left (residue).",
+                    "{scope}",
+                    number_data_point::Value::AsInt(
+                        i64::try_from(orphans.len()).unwrap_or(i64::MAX),
+                    ),
+                    time_unix_nano,
+                ));
+                if let Some(age) = orphans.iter().filter_map(|s| s.age_sec).max() {
+                    samples.push(memory_gauge(
+                        "loom.host.agent_scope_orphan_max_age_seconds",
+                        "Age of the oldest orphaned agent scope.",
+                        "s",
+                        number_data_point::Value::AsInt(i64::try_from(age).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
             }
             if let Some(cpu_idle_fraction) = r.cpu_idle_fraction {
                 samples.push(MetricSample {
@@ -999,9 +1102,12 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     ));
                 }
             }
+            // #12811: the fleet-state fields that rode only `/ingest`.
+            samples.extend(host_health::samples(r, time_unix_nano));
             samples
         }
         TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),
+        TelemetryRecord::HostStatus(r) => host_status::samples(r, time_unix_nano),
         // Every kind that is not declared `otlp: Gauges` in
         // `telemetry/kinds.rs` produces no gauge here:
         //   - every lifecycle-shaped kind — including `role_tick.outcome`

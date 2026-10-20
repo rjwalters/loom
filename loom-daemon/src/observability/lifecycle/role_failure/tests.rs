@@ -164,6 +164,29 @@ fn every_pre_launch_site_has_its_own_bounded_non_fallback_class() {
     }
 }
 
+/// #12480: the step classes are a closed, bounded, distinct vocabulary, and
+/// the class (not the exit code) is what `role_tick.outcome` exports.
+#[test]
+fn every_step_class_is_bounded_distinct_and_non_fallback() {
+    let mut seen = std::collections::BTreeSet::new();
+    for site in step::ALL {
+        assert!(!site.class.starts_with("unclassified"), "{}", site.class);
+        assert!(
+            site.class
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'-'),
+            "{} is not kebab-case",
+            site.class
+        );
+        assert!(seen.insert(site.class), "duplicate class {}", site.class);
+        assert!(pre_launch::ALL.iter().all(|p| p.class != site.class));
+        let failure = site.failure(Some(3));
+        assert_eq!(failure.class(), site.class);
+        assert!(failure.message().len() <= 256);
+        assert!(!failure.message().chars().any(char::is_control));
+    }
+}
+
 #[test]
 fn a_tick_refused_before_launch_returns_the_class_its_site_noted() {
     let dir = tempfile::tempdir().unwrap();
@@ -245,7 +268,7 @@ mod role_invocation_close {
             RoleTickOutcome::Failure("`spawn-codex.sh` exited with exit status: 1: tail".into())
         });
         let trace = trace.unwrap();
-        assert_eq!(trace.failure, Some(failure()), "the story copies get the same cause");
+        assert_eq!(trace.failure, Some(failure()), "the trace carries the failure cause");
         let span = root_span(dir.path(), &trace);
         assert_eq!(span.status, SpanStatus::Error);
         assert_eq!(span.attributes["loom.result"], "failure");
@@ -295,4 +318,43 @@ mod role_invocation_close {
         assert!(!span.attributes.contains_key(FAILURE_CLASS));
         assert!(!span.attributes.contains_key(STATUS_MESSAGE));
     }
+}
+
+/// #12481: `unclassified:pre-launch` is an alarm fallback, so every
+/// `return RoleTickOutcome::Failure(..)` in the launch path must have noted a
+/// class (`pre_launch::note` before a spawn, `hold.failure` after) shortly
+/// before it. A source scan, since the sites are spread over a spawn path that
+/// cannot be driven end to end here.
+#[test]
+fn every_failure_return_in_the_launch_path_notes_a_class() {
+    const WINDOW: usize = 30;
+    for (file, source) in [
+        ("role_runner/launch.rs", include_str!("../../../role_runner/launch.rs")),
+        ("role_runner/invocation.rs", include_str!("../../../role_runner/invocation.rs")),
+    ] {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut sites = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("return RoleTickOutcome::Failure(") {
+                continue;
+            }
+            sites += 1;
+            let noted = lines[i.saturating_sub(WINDOW)..i]
+                .iter()
+                .any(|l| l.contains("pre_launch::note(") || l.contains("hold.failure("));
+            assert!(noted, "{file}:{}: a Failure return notes no failure class", i + 1);
+        }
+        assert!(sites > 0, "{file}: the scan found no Failure return; update this test");
+    }
+}
+
+/// #12481: a launched tick the version roll stopped is an interruption, so its
+/// `role_tick.outcome` class is `roll-interrupted` (not the pre-launch
+/// fallback), even when a site had noted a class for the stop's consequences.
+#[test]
+fn a_roll_stopped_failure_reports_roll_interrupted() {
+    let failed = RoleTickOutcome::Failure("exited with signal 15".into());
+    assert_eq!(for_roll_stopped(&failed).unwrap().class(), ROLL_INTERRUPTED);
+    assert_eq!(for_roll_stopped(&failed).unwrap().class(), "roll-interrupted");
+    assert_eq!(for_roll_stopped(&RoleTickOutcome::Success), None);
 }

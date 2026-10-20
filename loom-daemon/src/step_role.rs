@@ -23,8 +23,10 @@
 //! keep-or-close, Champion re-evaluate, Champion hold re-evaluation, …). Each
 //! of those runs as one of the six roles here: keep-or-close as
 //! [`StepRole::Curator`], re-evaluate as [`StepRole::ChampionPromote`], hold
-//! re-evaluation as [`StepRole::ChampionMerge`]. `From<Step> for StepRole`
-//! is that fold (#11900); the two enums stay separate.
+//! re-evaluation and PR triage (#12499) as [`StepRole::ChampionMerge`]: both
+//! are Champion on a PR, invoked `--pr N`, holding the PR lease with no claim
+//! label. `From<Step> for StepRole` is that fold (#11900); the two enums stay
+//! separate.
 //!
 //! # Wire form
 //!
@@ -48,8 +50,8 @@ pub enum StepRole {
     Judge,
     /// Doctor on a PR: claim `loom:treating` plus the PR lease.
     Doctor,
-    /// Champion merging (or re-evaluating a hold on) a PR: the PR lease with
-    /// `step=champion_merge`, no claim label.
+    /// Champion merging (or re-evaluating a hold on, or triaging, #12499) a
+    /// PR: the PR lease with `step=champion_merge`, no claim label.
     ChampionMerge,
 }
 
@@ -173,7 +175,9 @@ impl From<crate::work_finder::step_item::Step> for StepRole {
             Step::Builder => StepRole::Builder,
             Step::Judge => StepRole::Judge,
             Step::Doctor => StepRole::Doctor,
-            Step::ChampionMerge | Step::ChampionHoldReevaluate => StepRole::ChampionMerge,
+            Step::ChampionMerge | Step::ChampionHoldReevaluate | Step::ChampionTriage => {
+                StepRole::ChampionMerge
+            }
         }
     }
 }
@@ -225,6 +229,7 @@ mod tests {
             (Step::Doctor, StepRole::Doctor),
             (Step::ChampionMerge, StepRole::ChampionMerge),
             (Step::ChampionHoldReevaluate, StepRole::ChampionMerge),
+            (Step::ChampionTriage, StepRole::ChampionMerge),
         ];
         for (step, role) in table {
             assert_eq!(StepRole::from(step), role, "{step:?}");

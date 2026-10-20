@@ -54,7 +54,7 @@ fn item(n: u32, body: Option<String>, extra_label: Option<&str>) -> WorkItem {
 fn run(workspaces: &mut [(Src, Disp)]) -> TickReport {
     let halted = vec![false; workspaces.len()];
     let prios = vec![1; workspaces.len()];
-    tick_multi_with_sharding(workspaces, &prios, 10, &halted, usize::MAX, false)
+    tick_multi(workspaces, &prios, 10, &halted)
 }
 
 fn row(report: &TickReport, n: u32) -> Option<(Qd, Option<String>)> {
@@ -233,17 +233,7 @@ fn red_fix(n: u32, paths: &[&str]) -> WorkItem {
 }
 
 fn run_lane(workspaces: &mut [(Src, Disp)], halted: bool, lane: RedMainLane) -> TickReport {
-    tick_multi_with_repo_cap(
-        workspaces,
-        &[1],
-        10.into(),
-        &[halted],
-        None,
-        usize::MAX,
-        false,
-        None,
-        &[lane],
-    )
+    tick_multi_with_build_backoff(workspaces, &[1], 10, &[halted], None, &[lane], &[])
 }
 
 /// #11508 (Judge): the red-main-fix lane (#9244) is not a level; it keeps

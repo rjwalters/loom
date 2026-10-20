@@ -206,6 +206,7 @@ pub fn pull_from_row(row: &RestIssue, markers: PullMarkers) -> PullInput {
         same_repo: false,
         author_untrusted: false,
         queued: false,
+        draft: row.draft,
         markers,
     }
 }
@@ -306,8 +307,10 @@ pub fn draw_inputs(
 
 /// The Champion re-evaluation ladder's due times in the rows' bodies: a
 /// curated issue's for a promote step, a PR's for a merge step (#11900).
+/// Read at `now`: a marker written under the pre-#12513 ladder is due `now`
+/// ([`super::reeval_ladder::Reeval::due_at`]).
 #[must_use]
-pub fn ladder_due(rows: &[RestIssue]) -> Vec<(u32, StepRole, DateTime<Utc>)> {
+pub fn ladder_due(rows: &[RestIssue], now: DateTime<Utc>) -> Vec<(u32, StepRole, DateTime<Utc>)> {
     rows.iter()
         .filter_map(|r| {
             let role = if r.is_pull_request {
@@ -315,7 +318,7 @@ pub fn ladder_due(rows: &[RestIssue]) -> Vec<(u32, StepRole, DateTime<Utc>)> {
             } else {
                 StepRole::ChampionPromote
             };
-            let due = super::reeval_ladder::due(r.body.as_deref()?, role)?;
+            let due = super::reeval_ladder::due(r.body.as_deref()?, role, now)?;
             Some((r.number, role, due))
         })
         .collect()
@@ -352,6 +355,40 @@ pub fn hold_ci_pending(
         });
         if pending {
             item.verdict = Verdict::Pass(PassReason::CiPending);
+            held += 1;
+        }
+    }
+    held
+}
+
+/// Turn every [`Step::ChampionHoldReevaluate`] whose PR is still at the head
+/// its hold recorded into a [`PassReason::HeldAtHead`] pass (#12900), and
+/// return how many it held. Such a run re-reads the same head and ends
+/// `held`, a no-op that occupies the repo's `champion_merge` slot.
+/// `hold_heads` maps a PR to [`PullMarkers::hold_head`] (already `None` once a
+/// release comment followed); `released` names the PRs carrying
+/// `loom:auto-merge-ok`. Fails open: a PR with no recorded or current head is
+/// drawn. A recorded SHA may be abbreviated, so heads match on prefix. Pure.
+pub fn hold_at_recorded_head(
+    items: &mut [Item],
+    heads: &HashMap<u32, String>,
+    hold_heads: &HashMap<u32, String>,
+    released: &HashSet<u32>,
+) -> usize {
+    let mut held = 0usize;
+    for item in items.iter_mut() {
+        if item.step() != Some(Step::ChampionHoldReevaluate) {
+            continue;
+        }
+        let Some(pr) = item.target() else { continue };
+        if released.contains(&pr) {
+            continue;
+        }
+        let (Some(head), Some(recorded)) = (heads.get(&pr), hold_heads.get(&pr)) else {
+            continue;
+        };
+        if !recorded.is_empty() && (head.starts_with(recorded) || recorded.starts_with(head)) {
+            item.verdict = Verdict::Pass(PassReason::HeldAtHead);
             held += 1;
         }
     }
@@ -504,6 +541,10 @@ pub fn list(
             }
         })
         .collect();
+    let hold_heads: HashMap<u32, String> = pulls
+        .iter()
+        .filter_map(|p| p.markers.hold_head.clone().map(|h| (p.number, h)))
+        .collect();
     let linked_by_pr: Vec<u32> = pulls
         .iter()
         .flat_map(|p| {
@@ -571,6 +612,15 @@ pub fn list(
     if held > 0 {
         log::debug!("work_finder: {slug}: {held} Judge step(s) held while CI runs at the head");
     }
+    let released: HashSet<u32> = rows
+        .iter()
+        .filter(|r| r.is_pull_request && has(&r.labels, "loom:auto-merge-ok"))
+        .map(|r| r.number)
+        .collect();
+    let at_head = hold_at_recorded_head(&mut items, &heads, &hold_heads, &released);
+    if at_head > 0 {
+        log::debug!("work_finder: {slug}: {at_head} held PR(s) unchanged since their hold");
+    }
     Ok(Some(Listed {
         slug,
         rows,
@@ -605,7 +655,7 @@ pub fn finish(
         provider.retain_present(&slug, &rows);
     }
     Gathered {
-        ladder: ladder_due(&rows),
+        ladder: ladder_due(&rows, now),
         created_at: rows
             .iter()
             .filter_map(|r| r.created_at.clone().map(|c| (r.number, c)))

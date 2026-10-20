@@ -1,8 +1,8 @@
 //! Daemon-side producer of `issue.estimate` (#12118): a curated issue the
 //! daemon observes carries the fact, so no Curator has to run a CLI command.
 //!
-//! The producer rides the stage-queue walk of open issues
-//! (`observability::ops::stage_queue`). An open issue that carries
+//! The producer rides the intake pass's walk of open issues
+//! (`intake_reconcile::singleton`, `GhIntakeForge::list_open`). An open issue that carries
 //! `loom:curated`, was updated within [`WINDOW`], has a trusted author and a
 //! valid estimate marker is journaled through [`super::completion::record`],
 //! which the ordinary backfill pass then exports.

@@ -114,56 +114,6 @@ fn a_file_overlap_deferral_carries_its_shared_paths_into_the_record() {
     assert!(json["skipped"][1].get("detail").is_none(), "absent, not null");
 }
 
-/// #11811: each skip carries the daemon's un-collapsed disposition, so the
-/// four caps `cap` lumps together stay distinct, plus its `held_until`.
-#[test]
-fn a_skip_carries_its_uncollapsed_disposition_and_hold_expiry() {
-    let mut s = summary(vec![
-        (1, QueueDisposition::Dispatched),
-        (2, QueueDisposition::DeferredRampCap),
-        (3, QueueDisposition::DeferredCapacity),
-        (4, QueueDisposition::DeferredRepoCap),
-        (5, QueueDisposition::DeferredSaturation),
-        (6, QueueDisposition::DispatchBackoff),
-    ]);
-    let until = Utc.with_ymd_and_hms(2026, 10, 4, 12, 30, 0).unwrap();
-    s.queue[5].plan.held_until = Some(until);
-    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
-    let got: Vec<(u32, PickSkipReason, Option<QueueDisposition>)> = r
-        .skipped
-        .iter()
-        .map(|k| (k.number, k.reason, k.disposition))
-        .collect();
-    assert_eq!(
-        got,
-        vec![
-            (2, PickSkipReason::Cap, Some(QueueDisposition::DeferredRampCap)),
-            (3, PickSkipReason::Cap, Some(QueueDisposition::DeferredCapacity)),
-            (4, PickSkipReason::Cap, Some(QueueDisposition::DeferredRepoCap)),
-            (5, PickSkipReason::Cap, Some(QueueDisposition::DeferredSaturation)),
-            (6, PickSkipReason::Backoff, Some(QueueDisposition::DispatchBackoff)),
-        ]
-    );
-    let json = serde_json::to_value(&r).unwrap();
-    assert_eq!(json["skipped"][0]["reason"], "cap", "reason is unchanged");
-    assert_eq!(json["skipped"][0]["disposition"], "deferred_ramp_cap");
-    assert!(json["skipped"][0].get("held_until").is_none(), "absent, not null");
-    assert_eq!(json["skipped"][4]["disposition"], "dispatch_backoff");
-    assert_eq!(json["skipped"][4]["held_until"], "2026-10-04T12:30:00Z");
-    // Older records (no disposition / held_until) still parse.
-    let mut old = json.clone();
-    for k in old["skipped"].as_array_mut().unwrap() {
-        let k = k.as_object_mut().unwrap();
-        k.remove("disposition");
-        k.remove("held_until");
-    }
-    let parsed: PickDecisionRecord = serde_json::from_value(old).unwrap();
-    assert!(parsed
-        .skipped
-        .iter()
-        .all(|k| k.disposition.is_none() && k.held_until.is_none()));
-}
-
 /// #11811: a halted row names its cause, but only a closed-vocabulary token.
 #[test]
 fn a_halted_skip_carries_only_a_closed_vocabulary_cause() {
@@ -522,6 +472,7 @@ fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
         is_pull_request: is_pr,
         open_sub_issues: None,
         labels_at: None,
+        draft: false,
     };
     let root = Path::new("/stash-test/a");
     record_gate_listing(
@@ -772,11 +723,12 @@ fn lane_plan_is_stashed_converted_and_drained_once() {
 #[test]
 fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
     use crate::step_dispatch::item_draw::{
-        weight_terms, AgeSource, Candidate, DrawRecord, Exclusion, ItemWeights,
+        weight_terms, AgeSource, Candidate, DrawRecord, DrawTerms, Exclusion, ItemDraw,
+        ItemWeights, PoolKnobs, RepoDrawTerms, RepoTerms, SeedKey,
     };
     use crate::work_finder::step_item::{Item, ItemState, Lane, PassReason, Step, Verdict};
-    assert!(item_draw_record(1, "h", 2, &[]).is_none());
     let picked = Candidate {
+        workspace_idx: 4,
         item: Item {
             issue: Some(7),
             pr: Some(8),
@@ -794,6 +746,44 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
             AgeSource::Mirror,
         ),
     };
+    let draw = ItemDraw::new(
+        vec![picked.clone()],
+        std::collections::BTreeMap::from([(
+            4,
+            RepoTerms {
+                weight: 6,
+                in_flight: 2,
+            },
+        )]),
+        PoolKnobs {
+            backlog_exponent: 0.5,
+            busy_exponent: 1.0,
+        },
+        SeedKey {
+            minute: 29_000_000,
+            host: "host-a".into(),
+            tick_counter: 17,
+        },
+    );
+    let excluded = std::collections::BTreeMap::from([
+        (Exclusion::Pass(PassReason::Claimed), 2),
+        (Exclusion::PoolExhausted, 1),
+    ]);
+    let workspaces = [ItemDrawWorkspace {
+        idx: 4,
+        repo: "o/r",
+        excluded: &excluded,
+    }];
+    let nothing = ItemDrawPool {
+        draw: &draw,
+        draws: &[],
+        overflow: false,
+    };
+    assert!(item_draw_record(1, "h", 2, &[], &nothing).is_none());
+    assert!(
+        item_draw_record(1, "h", 2, &workspaces, &nothing).is_none(),
+        "no draw, no record"
+    );
     let draws = [DrawRecord {
         draw_index: 0,
         seed: 99,
@@ -802,34 +792,52 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
         roll: 5,
         picked_index: 0,
         picked: picked.clone(),
+        terms: DrawTerms {
+            weight: 250_000,
+            total_weight: 1_000_000,
+            repo: RepoDrawTerms {
+                weight: 6,
+                in_flight: 2,
+                items: 3,
+                pool_weight: 77,
+            },
+        },
     }];
-    let excluded = std::collections::BTreeMap::from([
-        (Exclusion::Pass(PassReason::Claimed), 2),
-        (Exclusion::PoolExhausted, 1),
-    ]);
     let d = item_draw_record(
         29_000_000,
         "host-a",
         17,
-        &[ItemDrawWorkspace {
-            repo: "o/r",
-            excluded: &excluded,
-            pool: std::slice::from_ref(&picked),
+        &workspaces,
+        &ItemDrawPool {
+            draw: &draw,
             draws: &draws,
             overflow: false,
-        }],
+        },
     )
     .unwrap();
-    assert_eq!(d.seed_scheme, "loom-draw/v2");
+    assert_eq!(d.seed_scheme, "loom-draw/v3");
     assert_eq!(d.tick_counter, "17");
+    assert_eq!((d.backlog_exponent.as_str(), d.busy_exponent.as_str()), ("0.5", "1"));
     assert_eq!(
-        (d.pools.len(), d.pools[0].pr, d.pools[0].weight),
-        (1, Some(8), d.draws[0].weight)
+        (d.pools.len(), d.pools[0].pr, d.pools[0].weight, d.pools[0].repo.as_str()),
+        (1, Some(8), d.draws[0].weight, "o/r")
     );
+    let repo = &d.repos[0];
+    assert_eq!((repo.repo.as_str(), repo.weight, repo.in_flight, repo.items), ("o/r", 6, 2, 1));
     let step = &d.draws[0];
     assert_eq!(step.number, 8, "a Judge step acts on the PR");
     assert_eq!((step.priority, step.age_permille), (3, 2000));
     assert_eq!((step.age_source.as_str(), step.step.as_str()), ("mirror", "judge"));
+    assert_eq!(
+        (
+            step.draw_weight,
+            step.repo_weight,
+            step.repo_items,
+            step.repo_pool_weight,
+            step.in_flight_repo
+        ),
+        (250_000, 6, 3, 77, 2)
+    );
     let counts: Vec<(&str, PickSkipReason, usize)> = d
         .excluded
         .iter()

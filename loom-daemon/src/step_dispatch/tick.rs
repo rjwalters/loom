@@ -3,19 +3,19 @@
 //!
 //! Each tick, for every free slot:
 //!
-//! 1. **Draw a workspace** among those with items left in their pool, with
-//!    the workspace draw's weights and bonuses
-//!    ([`crate::priority_pick::draw_workspace`], seeded `loom-draw/v1` once
-//!    per tick, #11103).
-//! 2. **Draw an item** from it ([`ItemDraw::try_next`], `loom-draw/v2`,
-//!    seeded per draw with the workspace's forge slug, the name
-//!    `pick.decision` gives it, so the logged draws replay). A
-//!    [`DrawError::WeightOverflow`] ends that workspace's draws for the tick
-//!    and is recorded on the record, never only logged.
-//! 3. **Gate**: the per-repo RAM, disk and count cap
-//!    ([`RepoCap::defer_admission`]). A repo that does not fit is out of the
-//!    draw for the rest of the tick.
-//! 4. **Claim and spawn** through the [`StepSpawner`] (the registry's step
+//! 1. **Draw an item** from one pool of every actionable item across the
+//!    host's workspaces ([`ItemDraw::try_next`], `loom-draw/v3`, seeded per
+//!    draw, #12185). An item's weight is its priority and age scaled by its
+//!    repo's roster weight, backlog and in-flight count
+//!    ([`super::item_draw::pool_weights`]); there is no separate workspace
+//!    draw. A [`DrawError::WeightOverflow`] ends the tick's draws and is
+//!    recorded on the record, never only logged.
+//! 2. **Gate**: one Champion merge per repo at a time (design §6). A repo's
+//!    merge steps leave the pool *before* they are drawn while a merge is in
+//!    flight there (#12494): a merge this host or a peer runs ([`exclude_claimed`]),
+//!    or one this tick spawned ([`ItemDraw::close_steps`]). So a merge-blocked
+//!    item costs no draw and no pass; the tick counts it as `merge_deferred`.
+//! 3. **Claim and spawn** through the [`StepSpawner`] (the registry's step
 //!    spawn, #11906): the role's resolvers and pool gate, then the claim.
 //!
 //! Slots are filled in **rounds** (#12298): each round draws one candidate
@@ -25,13 +25,41 @@
 //! [`StepSpawner::spawn_batch`], which may spawn them at once. The answers
 //! are applied in draw order. So the claim and the step ledger stay per
 //! item and ordered within a repo, a repo spawns at most one step per round,
-//! and with a concurrency of 1 the tick is the serial one.
+//! and with a concurrency of 1 the tick is the serial one. The draws are
+//! the pool's draws in order: one that lands in a repo the round already
+//! holds starts the next round instead of being put back.
 //!
 //! A refused gate or claim is a **pass**: draw again, up to
 //! [`MAX_DRAWS_PER_SLOT`] draws in one slot and [`MAX_PASSES_PER_TICK`]
-//! passes in the tick. Every pass is counted by its reason. Saturation and
-//! the ramp cap are host-wide, so they bound how many slots the tick fills
-//! rather than refusing one draw.
+//! passes in the tick. Every pass is counted by its reason. The tick fills
+//! every free slot: the cap is the operator's `maxConcurrent` and nothing
+//! else (#12406).
+//!
+//! A **lost claim** ([`REFUSAL_CLAIM_LOST`]: a peer claimed the item first)
+//! is a cheap pass (#12410): the item has already left the tick's pool (draws
+//! are without replacement), and the slot draws again at once, but the loss
+//! spends neither the tick's [`MAX_PASSES_PER_TICK`] nor the slot's
+//! [`MAX_DRAWS_PER_SLOT`]. Losing is a fact about a peer, not about this
+//! host's gates, so on a fleet where every host draws the same heavy items it
+//! must not starve the tick of attempts. It has its own bound,
+//! [`MAX_FREE_CLAIM_LOST_PER_TICK`], past which a loss is an ordinary pass.
+//!
+//! Every tick also says why its draw loop stopped ([`TickStop`], the tick
+//! span's `loom.dispatch.stop`) and how many slots it could fill
+//! (`loom.dispatch.budget`), so a tick with free slots and few attempts names
+//! its limit.
+//!
+//! A **captain refusal** (#12450, fleet dispatch on): `captain_held` and
+//! `captain_cooldown` (the no-progress hold, #12581) are cheap passes made
+//! with no forge call. They draw on their own bound,
+//! [`MAX_FREE_CAPTAIN_REFUSALS_PER_TICK`], not on the lost-claim one (#12700):
+//! the captain's highest-weight cooled-down items are drawn first every tick,
+//! and spending passes on them ended every tick at `pass_limit` with its
+//! slots empty. `captain_cap` ends
+//! the tick's draws, since the captain would refuse every later claim the
+//! same way; only an older captain sends it, since #12864 the captain
+//! applies no capacity limit and the worker's own budget is the only one. In fleet-dispatch fallback ([`StepTickLimits::fallback`]) no
+//! loss is free.
 //!
 //! An **unverifiable claim** ([`REFUSAL_CLAIM_UNVERIFIED`]) is the exception
 //! to "draw again" (#12260): the pre-claim's lease reads and post run on the
@@ -48,18 +76,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::item_draw::{Candidate, DrawError, DrawRecord, ItemDraw, SeedKey, Weighing};
-use crate::observability::pick_decision::{item_draw_record, ItemDrawWorkspace};
-use crate::priority_pick::{self, Level, PickRng, WeightBonus, WorkspaceEntry};
+use super::item_draw::{
+    Candidate, DrawError, DrawRecord, ItemDraw, PoolKnobs, RepoTerms, SeedKey, Weighing,
+};
+use crate::observability::pick_decision::{item_draw_record, ItemDrawPool, ItemDrawWorkspace};
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_spawn::draw_claims::DrawClaims;
-use crate::sweep_registry::step_spawn::StepSpawnRequest;
+use crate::sweep_registry::step_spawn::{StepDrawTerms, StepSpawnRequest};
 use crate::telemetry::kinds::pick_decision::{PickItemExclusion, PickSkipReason};
 use crate::types::QueueDisposition as Qd;
 use crate::work_finder::ready_queue::TickQueueRow;
-use crate::work_finder::repo_cap::RepoCap;
 use crate::work_finder::step_item::{Lane, PassReason};
-use crate::work_finder::workspace_draw::{self, DrawLog, DrawStep, SeedInputs};
+use crate::work_finder::RepoDepth;
 use crate::work_finder::{PriorityCandidate, TickReport};
 
 /// At most this many item draws fill one slot (design §4.2 step 4).
@@ -67,14 +95,111 @@ pub const MAX_DRAWS_PER_SLOT: u32 = 8;
 /// At most this many passes in one tick (design §4.2 step 4).
 pub const MAX_PASSES_PER_TICK: u32 = 32;
 
-/// The pass reason of a draw the per-repo cap refused.
-pub const PASS_REPO_CAP: &str = "repo_cap";
-/// The pass reason of a second Champion merge in one repo in one tick.
+/// At most this many `claim_lost` refusals in one tick are free (#12410):
+/// they spend no pass and no slot draw. Past it a loss is an ordinary pass,
+/// so a tick's draws stay bounded (`MAX_PASSES_PER_TICK` +
+/// `MAX_FREE_CLAIM_LOST_PER_TICK` refusals) while each loss still costs a
+/// claim subprocess.
+pub const MAX_FREE_CLAIM_LOST_PER_TICK: u32 = 16;
+/// At most this many captain refusals (`captain_held`, `captain_cooldown`) in
+/// one tick are free (#12700): they spend no pass and no slot draw. Unlike a
+/// lost claim, a captain refusal makes no forge call (one RPC to the
+/// captain), so its bound is separate and larger; the lost-claim bound, and
+/// the writer reads behind it, are unchanged. Draws stay without
+/// replacement, so a tick also stops when its pool drains.
+pub const MAX_FREE_CAPTAIN_REFUSALS_PER_TICK: u32 = 128;
+/// The reason a second Champion merge in one repo is held back (design §6):
+/// the queue row's detail. Since #12494 it is not a pass: the item leaves the
+/// pool before the draw ([`exclude_claimed`], [`ItemDraw::close_steps`]).
 pub const PASS_MERGE: &str = "merge_in_flight";
+
+/// The steps serialised behind a repo's Champion merge (design §6).
+///
+/// `ChampionHoldReevaluate` stays in (#12494 asked whether it must): it is
+/// not a lighter step. It spawns the same [`StepRole::ChampionMerge`] role on
+/// an approved PR under a Champion hold, and when the hold no longer applies
+/// that run merges the PR. Letting it run beside another merge in the repo
+/// would be two merges in flight. It is also what the registry's own-merge
+/// check ([`DrawClaims::merge_in_flight`]) and the peer merge advertisement
+/// key on (the role, not the classifier step), so exempting it here alone
+/// would leave the two halves of the rule disagreeing.
+///
+/// `ChampionTriage` (#12499) is out: it never merges (an unlabelled PR has no
+/// `loom:pr`), so a merge in flight does not hold it back. It runs as the
+/// same role, so while it runs the registry's own-merge check holds the
+/// repo's merges back, as a hold re-evaluation does: a short step, accepted
+/// over a seventh step role.
+pub const MERGE_STEPS: [crate::work_finder::step_item::Step; 2] = [
+    crate::work_finder::step_item::Step::ChampionMerge,
+    crate::work_finder::step_item::Step::ChampionHoldReevaluate,
+];
+
+/// The step is serialised behind its repo's Champion merge ([`MERGE_STEPS`]).
+#[must_use]
+pub fn is_merge_step(step: crate::work_finder::step_item::Step) -> bool {
+    MERGE_STEPS.contains(&step)
+}
 /// The spawn refusal of a pre-claim that could not be verified
 /// (`sweep_registry::step_spawn::lease`): it ends the owner's draws for the
 /// tick (module docs, #12260).
 pub const REFUSAL_CLAIM_UNVERIFIED: &str = "claim_unverified";
+/// The spawn refusal of a claim a peer won first: a cheap pass (module docs,
+/// #12410).
+pub const REFUSAL_CLAIM_LOST: &str = "claim_lost";
+/// The fleet-dispatch server's refusal of an item another host holds
+/// (#12450): a cheap pass like [`REFUSAL_CLAIM_LOST`], and no forge call ran.
+pub const REFUSAL_CAPTAIN_HELD: &str = "captain_held";
+/// The fleet-dispatch server's refusal of an item under the no-progress
+/// hold (#12541, #12581): a cheap pass like [`REFUSAL_CAPTAIN_HELD`] (#12700).
+pub const REFUSAL_CAPTAIN_COOLDOWN: &str = "captain_cooldown";
+/// The fleet-dispatch server's refusal of a host at its cap (#12450): every
+/// later claim this tick would be refused the same way, so the draw ends.
+/// The captain no longer sends it (#12864); kept for an older captain in a
+/// mixed-version fleet.
+pub const REFUSAL_CAPTAIN_CAP: &str = "captain_cap";
+
+/// Why a tick's draw loop stopped (#12410): the tick span's
+/// `loom.dispatch.stop`, a closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TickStop {
+    /// Every free slot was filled.
+    #[default]
+    Filled,
+    /// No slot was free.
+    NoSlots,
+    /// The pool had nothing left to draw.
+    PoolDrained,
+    /// The tick spent its [`MAX_PASSES_PER_TICK`] passes.
+    PassLimit,
+    /// Every open slot gave up after [`MAX_DRAWS_PER_SLOT`] draws.
+    SlotDraws,
+    /// The spawner held the spawns (the shared rate-limit breaker, #12298).
+    SpawnHold,
+    /// The fleet-dispatch captain refused a claim with `cap` (#12450): this
+    /// host is at its fleet cap, so every repo left the draw. Without its own
+    /// stop the tick would read `pool_drained`, which it was not. Only an
+    /// older captain sends `cap`; since #12864 the captain never does.
+    CaptainCap,
+    /// The pool's total weight overflowed ([`DrawError::WeightOverflow`]).
+    WeightOverflow,
+}
+
+impl TickStop {
+    /// The attribute value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::NoSlots => "no_slots",
+            Self::PoolDrained => "pool_drained",
+            Self::PassLimit => "pass_limit",
+            Self::SlotDraws => "slot_draws",
+            Self::SpawnHold => "spawn_hold",
+            Self::CaptainCap => "captain_cap",
+            Self::WeightOverflow => "weight_overflow",
+        }
+    }
+}
 
 /// The forge owner of a workspace's `owner/repo` slug, lowercased (GitHub
 /// owners are case-insensitive). Pure.
@@ -87,7 +212,7 @@ pub fn forge_owner(repo: &str) -> String {
 
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The next value of this process's tick counter, the `loom-draw/v2` seed's
+/// The next value of this process's tick counter, the `loom-draw/v3` seed's
 /// third input.
 #[must_use]
 pub fn next_tick_counter() -> u64 {
@@ -99,11 +224,13 @@ pub fn next_tick_counter() -> u64 {
 pub struct StepWorkspace {
     /// Its index among the tick's roots.
     pub idx: usize,
-    /// The forge slug: the `repo` `pick.decision` names and the item seed's
-    /// `workspace` input.
+    /// The forge slug: the `repo` `pick.decision` names.
     pub repo: String,
-    /// Its roster weight (0: never drawn).
+    /// Its roster weight `w_repo` (0: never drawn).
     pub weight: u32,
+    /// `in_flight_repo`: its items this host runs or a peer advertises a
+    /// live claim on, counted before the draw takes them out of the pool.
+    pub in_flight: usize,
     /// Its items, weighed.
     pub weighing: Weighing,
     /// A hold keeps it out of the tick (red main, drain, preflight, ...).
@@ -117,16 +244,15 @@ pub struct StepWorkspace {
 pub struct StepTickLimits {
     /// `max_concurrent - occupancy`, saturating.
     pub free_slots: usize,
-    /// The ramp cap, `max_admissions_per_tick`.
-    pub max_admissions: usize,
-    /// The saturation brake holds new admissions.
-    pub saturation_held: bool,
     /// How many spawns, each in a different repo, run at once (#12298,
     /// `autonomous.workFinder.spawnConcurrency`); `1` is the serial tick.
     pub spawn_concurrency: usize,
+    /// The host is in fleet-dispatch fallback (#12450): no `claim_lost` is
+    /// free (spec #12452 §9.3).
+    pub fallback: bool,
 }
 
-/// What the item draws are seeded from, besides the workspace.
+/// What the item draws are seeded from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeedBase {
     pub minute: u64,
@@ -173,10 +299,25 @@ pub trait StepSpawner {
 #[derive(Debug, Clone, Default)]
 pub struct StepTick {
     pub report: TickReport,
-    /// Passes by reason (`claimed`, `pool_exhausted`, `repo_cap`, ...).
+    /// Passes by reason (`claimed`, `pool_exhausted`, `merge_in_flight`, ...).
     pub passes: BTreeMap<String, usize>,
     /// Draws taken, across workspaces.
     pub draws: usize,
+    /// The slots the tick could fill: its free slots (#12427 removed every
+    /// automatic admission cap).
+    pub budget: usize,
+    /// Why the draw loop stopped.
+    pub stop: TickStop,
+    /// Merge steps held back because their repo had a merge in flight
+    /// (#12494): before the tick ([`Exclusion::MergeInFlight`]), after a merge
+    /// this tick spawned, or drawn before it spawned. The tick span's
+    /// `loom.dispatch.merge_deferred`.
+    ///
+    /// [`Exclusion::MergeInFlight`]: super::item_draw::Exclusion::MergeInFlight
+    pub merge_deferred: usize,
+    /// Draws that never reached the spawner: a merge step drawn in a repo
+    /// before the round that spawned the repo's merge applied it.
+    pub draws_unspawned: usize,
 }
 
 /// The queue disposition a pass reason reads as.
@@ -186,7 +327,14 @@ pub fn disposition_of(reason: &str) -> Qd {
         // #12105: a Doctor standing down on another actor's work
         // (`peer_active`), or a step held by the Judge no-verdict backstop
         // (`backstop_hold`), is someone else's claim, not a dispatch error.
-        "claimed" | "claim_lost" | "peer_active" | "backstop_hold" => Qd::PeerClaim,
+        "claimed"
+        | "claim_lost"
+        | "peer_active"
+        | "backstop_hold"
+        | REFUSAL_CAPTAIN_HELD
+        | REFUSAL_CAPTAIN_COOLDOWN => Qd::PeerClaim,
+        "captain_not_eligible" => Qd::HostConstraint,
+        REFUSAL_CAPTAIN_CAP | "captain_grace" | "captain_refused" => Qd::DeferredCapacity,
         "pool_exhausted"
         | "no_token_pool"
         | "token_selection_failed"
@@ -196,35 +344,65 @@ pub fn disposition_of(reason: &str) -> Qd {
         "roll_paused" => Qd::DeferredCapacity,
         "workspace_commands_missing" => Qd::WorkspaceCommandsMissing,
         crate::sweep_registry::ALREADY_LANDED_REASON => Qd::AlreadyLanded,
-        PASS_REPO_CAP => Qd::DeferredRepoCap,
         PASS_MERGE => Qd::PeerClaim,
         _ => Qd::DispatchError,
     }
 }
 
+/// `ws`'s drawable pool by step and its exclusions by reason (#12734). A
+/// held workspace draws nothing, so its pool is empty. Pure.
+fn repo_depth(ws: &StepWorkspace) -> RepoDepth {
+    let mut depth = RepoDepth {
+        repo: ws.repo.clone(),
+        ..RepoDepth::default()
+    };
+    if !ws.halted {
+        for c in &ws.weighing.pool {
+            *depth.pool.entry(c.step.as_str()).or_default() += 1;
+        }
+    }
+    for (reason, &n) in &ws.weighing.excluded {
+        *depth.excluded.entry(reason.as_str()).or_default() += n;
+    }
+    depth
+}
+
 /// Take out of `w`'s pool every item `claims` names (this host's live runs
-/// and the peers' live claims), and every Champion merge but the one a peer
-/// is merging while a peer merge is in flight in this repo. Each counts as
-/// a `claimed` pass. Pure.
+/// and the peers' live claims), each a `claimed` pass, and every merge step
+/// ([`MERGE_STEPS`]) but the one being merged while this host or a peer has
+/// a merge in flight in this repo, each a [`Exclusion::MergeInFlight`]
+/// (#12494: deferred before the draw, so it costs no draw and no pass).
+/// Pure.
+///
+/// [`Exclusion::MergeInFlight`]: super::item_draw::Exclusion::MergeInFlight
 pub fn exclude_claimed(w: &mut Weighing, claims: &DrawClaims) {
     use super::item_draw::Exclusion;
-    let before = w.pool.len();
+    let mut claimed = 0usize;
+    let mut deferred = 0usize;
     w.pool.retain(|c| {
         let target = c.target();
-        let merging_elsewhere = c.step == crate::work_finder::step_item::Step::ChampionMerge
-            || c.step == crate::work_finder::step_item::Step::ChampionHoldReevaluate;
-        !(claims.items.contains(&target)
-            || (merging_elsewhere
-                && claims
-                    .merge_in_flight
-                    .as_ref()
-                    .is_some_and(|(pr, _)| *pr != target)))
+        if claims.items.contains(&target) {
+            claimed += 1;
+            return false;
+        }
+        let merging_elsewhere = is_merge_step(c.step)
+            && claims
+                .merge_in_flight
+                .as_ref()
+                .is_some_and(|(pr, _)| *pr != target);
+        if merging_elsewhere {
+            deferred += 1;
+            return false;
+        }
+        true
     });
-    let removed = before - w.pool.len();
-    if removed > 0 {
+    if claimed > 0 {
         *w.excluded
             .entry(Exclusion::Pass(PassReason::Claimed))
-            .or_default() += removed;
+            .or_default() += claimed;
+    }
+    if deferred > 0 {
+        *w.excluded.entry(Exclusion::MergeInFlight).or_default() += deferred;
     }
 }
 
@@ -250,7 +428,7 @@ fn refusal_skip(reason: &str) -> PickSkipReason {
     match disposition_of(reason) {
         Qd::PeerClaim => PickSkipReason::InFlight,
         Qd::HostConstraint => PickSkipReason::Quota,
-        Qd::DeferredCapacity | Qd::DeferredRepoCap => PickSkipReason::Cap,
+        Qd::DeferredCapacity => PickSkipReason::Cap,
         Qd::AlreadyLanded => PickSkipReason::AlreadyLanded,
         _ => PickSkipReason::Error,
     }
@@ -262,13 +440,17 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
     use super::item_draw::Exclusion as E;
     for (reason, &n) in &w.excluded {
         let slot = match reason {
-            E::Pass(PassReason::Claimed | PassReason::Queued) => &mut report.skipped_in_flight,
+            E::Pass(PassReason::Claimed | PassReason::Queued) | E::MergeInFlight => {
+                &mut report.skipped_in_flight
+            }
             E::Pass(PassReason::SharedPr) => &mut report.skipped_pr_open,
             E::Pass(PassReason::CapabilityMissing) | E::PoolExhausted => {
                 &mut report.skipped_host_constraint
             }
             E::BuildBackoff => &mut report.deferred_build_backoff,
-            E::CoolingDown | E::Pass(PassReason::CiPending) => &mut report.skipped_noop_cooldown,
+            E::CoolingDown | E::Pass(PassReason::CiPending | PassReason::HeldAtHead) => {
+                &mut report.skipped_noop_cooldown
+            }
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(
                 PassReason::Frozen
@@ -277,7 +459,8 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 | PassReason::Blocked
                 | PassReason::Epic
                 | PassReason::Proposal
-                | PassReason::NoStage,
+                | PassReason::NoStage
+                | PassReason::Draft,
             ) => &mut report.skipped_labeled,
         };
         *slot += n;
@@ -299,71 +482,50 @@ fn key_of(ws: &StepWorkspace, c: &Candidate) -> PriorityCandidate {
 struct Pending {
     /// Its open slot's position in the round.
     slot: usize,
-    /// Its workspace's position in the tick's drawing state.
-    pos: usize,
     ws_idx: usize,
     key: PriorityCandidate,
     merge: bool,
     request: StepSpawnRequest,
 }
 
-/// One workspace's draw state.
-struct Drawing {
-    ws: StepWorkspace,
-    draw: ItemDraw,
-    draws: Vec<DrawRecord>,
-    /// A Champion merge was spawned in this repo this tick.
-    merging: bool,
-    /// Draws the spawn or the per-repo cap refused, by reason.
-    refused: BTreeMap<String, usize>,
-    /// Out of the draw for the rest of the tick (empty, capped, overflowed).
-    closed: bool,
-    overflow: bool,
-}
-
-impl Drawing {
-    fn entry(&self) -> WorkspaceEntry {
-        let left = self.draw.remaining();
-        WorkspaceEntry {
-            workspace: workspace_draw::workspace_key(self.ws.idx),
-            weight: self.ws.weight,
-            has_red_main_fix: left.iter().any(|c| c.item.lane == Lane::RedMain),
-            has_very_important: left.iter().any(|c| c.terms.level == Level::VeryImportant),
-            has_important: left.iter().any(|c| c.terms.level == Level::Important),
-        }
-    }
-}
-
 /// Run one step tick over `workspaces` (module docs).
 #[allow(clippy::too_many_lines)] // one loop, kept whole so the pass rules read in order.
 pub fn run(
-    workspaces: Vec<StepWorkspace>,
+    mut workspaces: Vec<StepWorkspace>,
     limits: StepTickLimits,
     seed: &SeedBase,
-    (workspace_seed, seed_inputs): (u64, Option<SeedInputs>),
-    bonus: &WeightBonus,
-    repo_cap: &mut RepoCap,
+    knobs: &PoolKnobs,
     spawner: &mut dyn StepSpawner,
 ) -> StepTick {
     let mut pass_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut draws_taken = 0usize;
-    let mut report = TickReport {
-        saturation_held: limits.saturation_held,
-        max_admissions_per_tick: Some(limits.max_admissions),
-        repo_cap: Some(repo_cap.snapshot()),
-        ..TickReport::default()
-    };
+    let mut report = TickReport::default();
 
-    let mut drawing: Vec<Drawing> = Vec::new();
-    for ws in workspaces {
+    // The pool is every repo's items, repos in workspace order.
+    workspaces.sort_by_key(|w| w.idx);
+    let mut repos: BTreeMap<usize, RepoTerms> = BTreeMap::new();
+    let mut pool: Vec<Candidate> = Vec::new();
+    // Merge steps held back by a repo's merge in flight (#12494).
+    let mut merge_deferred = 0usize;
+    let mut draws_unspawned = 0usize;
+    // Those a merge this tick spawned took out of the pool, by repo.
+    let mut deferred: BTreeMap<usize, usize> = BTreeMap::new();
+    for ws in &workspaces {
         count_exclusions(&mut report, &ws.weighing);
+        merge_deferred += ws
+            .weighing
+            .excluded
+            .get(&super::item_draw::Exclusion::MergeInFlight)
+            .copied()
+            .unwrap_or(0);
         report.seen += ws.weighing.pool.len() + ws.weighing.excluded.values().sum::<usize>();
+        report.depth.push(repo_depth(ws));
         report
             .vi_demotions
             .extend(ws.weighing.demotions.iter().cloned());
         for c in &ws.weighing.pool {
             report.queue.push(TickQueueRow {
-                key: key_of(&ws, c),
+                key: key_of(ws, c),
                 disposition: ws.halted.then_some(Qd::WorkspaceHalted),
                 detail: None,
                 updated_at: None,
@@ -372,149 +534,137 @@ pub fn run(
                 step: Some(c.step),
             });
         }
-        let key = SeedKey {
+        if !ws.halted {
+            repos.insert(
+                ws.idx,
+                RepoTerms {
+                    weight: ws.weight,
+                    in_flight: ws.in_flight,
+                },
+            );
+            pool.extend(ws.weighing.pool.iter().cloned());
+        }
+    }
+    let by_idx: BTreeMap<usize, &StepWorkspace> = workspaces.iter().map(|w| (w.idx, w)).collect();
+    let mut draw = ItemDraw::new(
+        pool,
+        repos,
+        *knobs,
+        SeedKey {
             minute: seed.minute,
             host: seed.host.clone(),
             tick_counter: seed.tick_counter,
-            workspace: ws.repo.clone(),
-        };
-        let draw = ItemDraw::new(ws.weighing.pool.clone(), key);
-        let closed = ws.halted || ws.weighing.pool.is_empty() || ws.weight == 0;
-        drawing.push(Drawing {
-            ws,
-            draw,
-            draws: Vec::new(),
-            refused: BTreeMap::new(),
-            merging: false,
-            closed,
-            overflow: false,
-        });
-    }
+        },
+    );
+    let mut draws: Vec<DrawRecord> = Vec::new();
+    // A Champion merge was spawned in the repo this tick.
+    let mut merging: BTreeSet<usize> = BTreeSet::new();
+    // Draws the spawn or the merge rule refused, by repo and reason.
+    let mut refused: BTreeMap<usize, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut overflow = false;
 
-    let budget = if limits.saturation_held {
-        0
-    } else {
-        limits.free_slots.min(limits.max_admissions)
-    };
-    let mut rng = PickRng::from_seed(workspace_seed);
-    let mut steps: Vec<DrawStep> = Vec::new();
-    let mut draws_total = 0usize;
+    let budget = limits.free_slots;
     let mut passes = 0u32;
     let mut order: Vec<(usize, u32)> = Vec::new();
     let mut exhausted = false;
     // #12298: slots are filled in rounds. Each round draws one candidate
-    // for up to `spawn_concurrency` open slots, each in a repo no other
-    // candidate of the round is in, and spawns them as one batch; the
-    // results are applied in draw order. A refused slot stays open for the
-    // next round. With a concurrency of 1 every round is one draw and one
-    // spawn, which is the serial tick exactly.
+    // for up to `spawn_concurrency` open slots, never two in one repo, and
+    // spawns them as one batch; the results are applied in draw order. A
+    // refused slot stays open for the next round. With a concurrency of 1
+    // every round is one draw and one spawn, which is the serial tick
+    // exactly.
+    //
+    // The draws are the pool's draws in order, whatever the batching: a
+    // draw that lands in a repo the round already holds is not put back
+    // (that would change the pool, and its replay) but carried to the
+    // head of the next round.
     let concurrency = limits.spawn_concurrency.max(1);
-    // Draw attempts of each open slot, in the order the slots opened.
-    let mut open: Vec<u32> = Vec::new();
+    // Each open slot's draws and, of those, the free ones (`claim_lost` and
+    // captain refusals), in
+    // the order the slots opened.
+    let mut open: Vec<(u32, u32)> = Vec::new();
+    let mut free_losses = 0u32;
+    let mut free_captain = 0u32;
+    let mut captain_capped = false;
+    let mut gave_up = 0usize;
     let mut opened = 0usize;
+    let mut carry: Option<DrawRecord> = None;
     loop {
         while open.len() < concurrency && opened < budget {
-            open.push(0);
+            open.push((0, 0));
             opened += 1;
         }
         if open.is_empty() || passes >= MAX_PASSES_PER_TICK {
             break;
         }
-        // The round's gates see the round's earlier candidates as admitted,
-        // so a batch cannot overrun a cap the candidates share.
-        let mut planned = repo_cap.clone();
         let mut batch: Vec<Pending> = Vec::new();
         let mut done: BTreeSet<usize> = BTreeSet::new();
-        'slots: for (slot, attempts) in open.iter_mut().enumerate() {
+        'slots: for (slot, (attempts, free)) in open.iter_mut().enumerate() {
             loop {
                 if passes >= MAX_PASSES_PER_TICK {
                     break 'slots;
                 }
-                if *attempts >= MAX_DRAWS_PER_SLOT {
+                // A free refusal does not count toward the slot's draws.
+                if attempts.saturating_sub(*free) >= MAX_DRAWS_PER_SLOT {
                     done.insert(slot);
+                    gave_up += 1;
                     break;
                 }
-                let entries: Vec<WorkspaceEntry> = drawing
-                    .iter()
-                    .filter(|d| {
-                        !d.closed
-                            && !d.draw.remaining().is_empty()
-                            && !batch.iter().any(|p| p.ws_idx == d.ws.idx)
-                    })
-                    .map(Drawing::entry)
-                    .collect();
-                let Some(ws_draw) = priority_pick::draw_workspace(&entries, bonus, &mut rng) else {
-                    // Nothing left to draw outside this round's repos: the
-                    // tick is exhausted when the round is empty, else the
-                    // slot waits for the next round.
-                    exhausted = batch.is_empty();
+                let record = match carry.take() {
+                    Some(record) => record,
+                    None => match draw.try_next() {
+                        Ok(Some(record)) => record,
+                        Ok(None) => {
+                            // The tick is exhausted when the round is empty,
+                            // else the slot waits for the next round.
+                            exhausted = batch.is_empty();
+                            break 'slots;
+                        }
+                        Err(DrawError::WeightOverflow) => {
+                            log::error!(
+                                "work_finder: item draw stopped — {} ({} items pooled)",
+                                DrawError::WeightOverflow,
+                                draw.remaining().len()
+                            );
+                            overflow = true;
+                            exhausted = batch.is_empty();
+                            break 'slots;
+                        }
+                    },
+                };
+                let idx = record.picked.workspace_idx;
+                if batch.iter().any(|p| p.ws_idx == idx) {
+                    carry = Some(record);
                     break 'slots;
-                };
-                let Some(pos) = workspace_draw::workspace_idx(&ws_draw.picked)
-                    .and_then(|idx| drawing.iter().position(|d| d.ws.idx == idx))
-                else {
-                    exhausted = batch.is_empty();
-                    break 'slots;
-                };
-                let d = &mut drawing[pos];
-                draws_total += 1;
-                let record = match d.draw.try_next() {
-                    Ok(Some(record)) => record,
-                    Ok(None) => {
-                        d.closed = true;
-                        continue;
-                    }
-                    Err(DrawError::WeightOverflow) => {
-                        log::error!(
-                            "work_finder: {}: item draw stopped — {} ({} items pooled)",
-                            d.ws.repo,
-                            DrawError::WeightOverflow,
-                            d.draw.remaining().len()
-                        );
-                        d.overflow = true;
-                        d.closed = true;
-                        continue;
-                    }
-                };
-                *attempts += 1;
-                let key = key_of(&d.ws, &record.picked);
-                if steps.len() < workspace_draw::MAX_RECORDED_DRAWS {
-                    steps.push(DrawStep {
-                        draw: ws_draw,
-                        workspace_idx: d.ws.idx,
-                        issue: key.number,
-                    });
                 }
-                order.push((d.ws.idx, key.number));
+                let Some(&ws) = by_idx.get(&idx) else {
+                    exhausted = batch.is_empty();
+                    break 'slots;
+                };
+                let key = key_of(ws, &record.picked);
+                order.push((idx, key.number));
                 let picked = record.picked.clone();
-                d.draws.push(record);
+                let terms = record.terms;
+                draws.push(record);
                 draws_taken += 1;
-                if planned.defer_admission(&key, &mut report) {
-                    d.closed = true;
-                    passes += 1;
-                    *pass_counts.entry(PASS_REPO_CAP.to_string()).or_default() += 1;
-                    *d.refused.entry(PASS_REPO_CAP.to_string()).or_default() += 1;
-                    continue;
-                }
-                // One Champion merge per repo at a time (design §6): a second
-                // merge drawn in a repo that spawned one this tick passes.
-                let merge = matches!(
-                    picked.step,
-                    crate::work_finder::step_item::Step::ChampionMerge
-                        | crate::work_finder::step_item::Step::ChampionHoldReevaluate
-                );
-                if merge && d.merging {
-                    passes += 1;
+                // One Champion merge per repo at a time (design §6). A merge
+                // this tick spawned took the repo's other merge steps out of
+                // the pool (#12494), so the only one left to meet here is one
+                // drawn before that round applied its spawn and carried into
+                // this one. It was already drawn, but it is deferred like
+                // the rest: no pass and none of the slot's draws.
+                let merge = is_merge_step(picked.step);
+                if merge && merging.contains(&idx) {
+                    merge_deferred += 1;
+                    draws_unspawned += 1;
                     resolve(&mut report.queue, &key, Qd::PeerClaim, Some(PASS_MERGE.to_string()));
-                    *d.refused.entry(PASS_MERGE.to_string()).or_default() += 1;
-                    *pass_counts.entry(PASS_MERGE.to_string()).or_default() += 1;
+                    *deferred.entry(idx).or_default() += 1;
                     continue;
                 }
-                planned.admit_candidate(&key);
+                *attempts += 1;
                 batch.push(Pending {
                     slot,
-                    pos,
-                    ws_idx: d.ws.idx,
+                    ws_idx: idx,
                     merge,
                     request: StepSpawnRequest {
                         item: key.number,
@@ -522,6 +672,12 @@ pub fn run(
                         draw_attempt: *attempts,
                         age_source: picked.terms.age_source.as_str().to_string(),
                         resumed: false,
+                        draw: Some(StepDrawTerms {
+                            weight: terms.weight,
+                            total_weight: terms.total_weight,
+                            repo_items: terms.repo.items,
+                            in_flight_repo: terms.repo.in_flight,
+                        }),
                     },
                     key,
                 });
@@ -571,13 +727,28 @@ pub fn run(
             .chain(std::iter::repeat_with(|| SpawnResult::Refused("spawn_failed".to_string())));
         for (p, result) in batch.into_iter().zip(results) {
             let key = p.key;
-            let d = &mut drawing[p.pos];
+            let idx = p.ws_idx;
             match result {
                 SpawnResult::Spawned => {
-                    d.merging |= p.merge;
+                    if p.merge {
+                        merging.insert(idx);
+                        // The repo's other merge steps leave the pool now
+                        // (#12494): drawn, each would only be held back.
+                        for c in draw.close_steps(idx, &MERGE_STEPS) {
+                            if let Some(&ws) = by_idx.get(&idx) {
+                                resolve(
+                                    &mut report.queue,
+                                    &key_of(ws, &c),
+                                    Qd::PeerClaim,
+                                    Some(PASS_MERGE.to_string()),
+                                );
+                            }
+                            merge_deferred += 1;
+                            *deferred.entry(idx).or_default() += 1;
+                        }
+                    }
                     resolve(&mut report.queue, &key, Qd::Dispatched, None);
                     report.dispatched += 1;
-                    repo_cap.admit_candidate(&key);
                     done.insert(p.slot);
                 }
                 SpawnResult::Refused(reason) => {
@@ -586,14 +757,55 @@ pub fn run(
                         report.errors += 1;
                     }
                     resolve(&mut report.queue, &key, disposition, Some(reason.clone()));
-                    passes += 1;
-                    *d.refused.entry(reason.clone()).or_default() += 1;
+                    // A lost claim is cheap (module docs, #12410): the item
+                    // already left the pool and the slot redraws next round
+                    // without spending a pass or one of its draws.
+                    // In fleet-dispatch fallback no loss is free (#12450).
+                    // A captain refusal is cheaper still (#12700): no forge
+                    // call, so it has its own, larger bound.
+                    let captain =
+                        reason == REFUSAL_CAPTAIN_HELD || reason == REFUSAL_CAPTAIN_COOLDOWN;
+                    let (spent, bound) = if captain {
+                        (&mut free_captain, MAX_FREE_CAPTAIN_REFUSALS_PER_TICK)
+                    } else {
+                        (&mut free_losses, MAX_FREE_CLAIM_LOST_PER_TICK)
+                    };
+                    let free_pass = !limits.fallback
+                        && (captain || reason == REFUSAL_CLAIM_LOST)
+                        && *spent < bound;
+                    if free_pass {
+                        *spent += 1;
+                        if let Some((_, free)) = open.get_mut(p.slot) {
+                            *free += 1;
+                        }
+                    } else {
+                        passes += 1;
+                    }
+                    *refused
+                        .entry(idx)
+                        .or_default()
+                        .entry(reason.clone())
+                        .or_default() += 1;
                     if reason == REFUSAL_CLAIM_UNVERIFIED {
-                        let owner = forge_owner(&d.ws.repo);
-                        for other in &mut drawing {
-                            if forge_owner(&other.ws.repo) == owner {
-                                other.closed = true;
+                        // The owner's writer installation cannot verify a
+                        // claim: every workspace of that owner leaves the
+                        // draw for the rest of the tick (#12260).
+                        let owner = match by_idx.get(&idx) {
+                            Some(ws) => forge_owner(&ws.repo),
+                            None => String::new(),
+                        };
+                        for other in workspaces.iter() {
+                            if forge_owner(&other.repo) == owner {
+                                draw.close_repo(other.idx);
                             }
+                        }
+                    }
+                    if reason == REFUSAL_CAPTAIN_CAP {
+                        // The captain holds this host at its cap: every repo
+                        // leaves the draw for the rest of the tick (#12450).
+                        captain_capped = true;
+                        for other in workspaces.iter() {
+                            draw.close_repo(other.idx);
                         }
                     }
                     *pass_counts.entry(reason).or_default() += 1;
@@ -612,61 +824,78 @@ pub fn run(
         }
     }
 
-    // Rows nothing resolved wait for a later tick: name the limit that held
-    // them.
-    let held = if limits.saturation_held {
-        Qd::DeferredSaturation
-    } else if limits.max_admissions < limits.free_slots
-        && report.dispatched >= limits.max_admissions
-    {
-        Qd::DeferredRampCap
+    let stop = if budget == 0 {
+        TickStop::NoSlots
+    } else if report.spawn_hold.is_some() {
+        TickStop::SpawnHold
+    } else if captain_capped {
+        TickStop::CaptainCap
+    } else if overflow {
+        TickStop::WeightOverflow
+    } else if exhausted {
+        TickStop::PoolDrained
+    } else if passes >= MAX_PASSES_PER_TICK {
+        TickStop::PassLimit
+    } else if gave_up > 0 {
+        TickStop::SlotDraws
     } else {
-        Qd::DeferredCapacity
+        TickStop::Filled
     };
+
+    // Rows nothing resolved wait for a later tick: the cap held them.
     for row in report.queue.iter_mut().filter(|r| r.disposition.is_none()) {
-        row.disposition = Some(held);
-        match held {
-            Qd::DeferredSaturation => report.deferred_saturation += 1,
-            Qd::DeferredRampCap => report.deferred_ramp_cap += 1,
-            _ => report.deferred_capacity += 1,
-        }
+        row.disposition = Some(Qd::DeferredCapacity);
+        report.deferred_capacity += 1;
     }
     // The plan order: the draws as taken, then every pooled item not drawn.
     let drawn: BTreeSet<(usize, u32)> = order.iter().copied().collect();
-    for d in &drawing {
-        for c in d.draw.remaining() {
-            if !d.ws.halted && !drawn.contains(&(d.ws.idx, c.target())) {
-                order.push((d.ws.idx, c.target()));
-            }
+    for c in draw.remaining() {
+        if !drawn.contains(&(c.workspace_idx, c.target())) {
+            order.push((c.workspace_idx, c.target()));
         }
     }
     report.plan_order = order;
-    repo_cap.finish(&mut report);
-    report.workspace_draw = (draws_total > 0).then_some(DrawLog {
-        seed: workspace_seed,
-        draws_total,
-        steps,
-        seed_inputs,
-    });
-    let views: Vec<ItemDrawWorkspace<'_>> = drawing
+    let views: Vec<ItemDrawWorkspace<'_>> = workspaces
         .iter()
-        .filter(|d| !d.draws.is_empty() || d.overflow)
-        .map(|d| ItemDrawWorkspace {
-            repo: &d.ws.repo,
-            excluded: &d.ws.weighing.excluded,
-            pool: d.draw.starting_pool(),
-            draws: &d.draws,
-            overflow: d.overflow,
+        .map(|w| ItemDrawWorkspace {
+            idx: w.idx,
+            repo: &w.repo,
+            excluded: &w.weighing.excluded,
         })
         .collect();
-    report.item_draw = item_draw_record(seed.minute, &seed.host, seed.tick_counter, &views);
+    report.item_draw = item_draw_record(
+        seed.minute,
+        &seed.host,
+        seed.tick_counter,
+        &views,
+        &ItemDrawPool {
+            draw: &draw,
+            draws: &draws,
+            overflow,
+        },
+    );
     // The draws a gate or the claim refused, beside the weight-0 counts, so
     // a refused draw is visible on the record (the integrated review's M1).
     if let Some(record) = report.item_draw.as_mut() {
-        for d in &drawing {
-            for (reason, &count) in &d.refused {
+        // The merge steps a merge this tick spawned held back (#12494).
+        for (idx, &count) in &deferred {
+            let repo = by_idx
+                .get(idx)
+                .map_or("repo_unresolved", |w| w.repo.as_str());
+            record.excluded.push(PickItemExclusion {
+                repo: repo.to_string(),
+                reason: format!("deferred_{PASS_MERGE}"),
+                skip_reason: PickSkipReason::InFlight,
+                count,
+            });
+        }
+        for (idx, reasons) in &refused {
+            let repo = by_idx
+                .get(idx)
+                .map_or("repo_unresolved", |w| w.repo.as_str());
+            for (reason, &count) in reasons {
                 record.excluded.push(PickItemExclusion {
-                    repo: d.ws.repo.clone(),
+                    repo: repo.to_string(),
                     reason: format!("refused_{reason}"),
                     skip_reason: refusal_skip(reason),
                     count,
@@ -678,6 +907,10 @@ pub fn run(
         report,
         passes: pass_counts,
         draws: draws_taken,
+        budget,
+        stop,
+        merge_deferred,
+        draws_unspawned,
     }
 }
 

@@ -423,6 +423,8 @@ pub struct AutoUpdateStatusSnapshot {
     pub floor_not_rolling: Option<not_rolling::FloorNotRolling>,
     /// #9736: last successful check, pending age and thresholds.
     pub freshness: Option<freshness::FreshnessReport>,
+    /// #12420: what the last tick saw of the host's update state (read-only).
+    pub observation: update_observation::LoopFacts,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -454,6 +456,16 @@ impl AutoUpdateStatus {
             .lock()
             .expect("auto-update status mutex poisoned")
             .clone()
+    }
+
+    /// #12420: mark a release artifact fetch as running, so `status` can say
+    /// H2 while it does. The tick's closing publish clears it.
+    fn set_fetching(&self) {
+        self.inner
+            .lock()
+            .expect("auto-update status mutex poisoned")
+            .observation
+            .fetching = true;
     }
 
     /// Overwrite the published snapshot.
@@ -623,6 +635,8 @@ pub mod not_rolling;
 use nice::nice_child;
 /// #10880: the failed-roll guard (attempt record, gate, held-roll alert).
 pub mod roll_attempt;
+/// #12420: the read-only host-update state projection.
+pub mod update_observation;
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
@@ -1824,6 +1838,12 @@ impl AutoUpdateState {
             stale_repo: self.stale_repo.repo(),
             floor_not_rolling: None,
             freshness: Some(freshness),
+            observation: update_observation::LoopFacts::of_tick(
+                artifact,
+                &self.floor,
+                &self.repo_ahead,
+                env!("CARGO_PKG_VERSION"),
+            ),
         }
     }
 }

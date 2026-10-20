@@ -240,6 +240,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
                     ""
                 }
             );
+            status.set_fetching(); // #12420: H2 while the fetch runs
             let outcome = probe.fetch_artifact(&tag, low_priority);
             let info = match &artifact {
                 ArtifactResolution::Resolved(info) => info.clone(),
@@ -318,7 +319,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     }
     // #10866: the note and the record's `floor_stall` are state and are set on
     // every tick the stall stands. Only the ERROR line is rate-limited.
-    let floor_was_alerted = state.floor.stall_declared_at().is_some();
+    let floor_was_alerted = state.floor.was_alerted();
     summary.floor_alerted = state
         .floor
         .alert_due(last_check, floor_roll::alert::REMINDER);
@@ -328,7 +329,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         summary.floor_alerted,
         floor_was_alerted,
     ) {
-        crate::loom_ui_alerts::post(alert);
+        crate::alerts::post(alert);
     }
     if let Some(stall) = state.floor.stall() {
         if summary.floor_alerted {
@@ -434,7 +435,7 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
         Some(note) => idle_tick(state, status, note),
         None => run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline),
     }));
-    let summary = result.unwrap_or_else(|payload| {
+    let mut summary = result.unwrap_or_else(|payload| {
         let note = format!(
             "tick panicked ({}); recorded, and the loop keeps running — the next tick retries",
             panic_message(payload.as_ref())
@@ -448,6 +449,14 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     if !is_idle {
         state.alert_on_freshness_edge(&status.snapshot());
     }
+    // #12420: the host's state as this tick leaves it. An armed pause-roll is
+    // H4: the tick that arms it ends with the pause starting.
+    summary.observed = Some(update_observation::observe(
+        &status.snapshot(),
+        pause_resume::status().as_ref(),
+        summary.roll_armed || (summary.drain.armed && summary.drain.target.is_some()),
+        env!("CARGO_PKG_VERSION"),
+    ));
     // #10880 rule 5: a roll that reached this binary, up past its startup
     // grace, took; forget the attempt.
     state

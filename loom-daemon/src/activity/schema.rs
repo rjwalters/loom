@@ -371,22 +371,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // Create cost analytics views
     create_cost_analytics_views(conn);
 
-    // Create tuning schema (Issue #1074)
-    create_tuning_schema(conn);
-
     Ok(())
-}
-
-/// Create tuning-related database tables (Issue #1074).
-///
-/// Wraps the tuning module's schema creation and handles errors gracefully.
-fn create_tuning_schema(conn: &Connection) {
-    match super::tuning::create_tuning_schema(conn) {
-        Ok(()) => log::debug!("Created or verified tuning schema"),
-        Err(e) => {
-            log::warn!("Could not create tuning schema: {e}");
-        }
-    }
 }
 
 /// Create SQL views for cost analytics (Issue #1064).
