@@ -15,6 +15,8 @@ mod docker;
 pub mod export;
 mod lease;
 mod lifecycle;
+#[cfg(test)]
+mod recover_tests;
 mod repository;
 #[cfg(test)]
 mod tests;

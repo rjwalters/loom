@@ -25,7 +25,7 @@
 //! | restarting (2nd+ consecutive pass) | WARN once as a **crash loop**; never reused, never stopped |
 //! | stopped, host-mounted | resume via [`SessionLifecycle::start_with_workspace`] (the `accounts session start` path) |
 //! | missing, host-mounted | recreate ([`recreate_container`]) with the workspace/image of the last operator `start` ([`session_hold::LAST_START_FILE`]), else the label last seen on it, else (logged as a guess) [`default_mount_workspace`]; never `/` |
-//! | stopped/missing, private-clone | skip and WARN once — never recreated host-mounted |
+//! | stopped/missing, private-clone, configured (`workspace.json`) | recover in place ([`private_workspace::recover`], #12772): `docker start` a stopped container, or recreate a missing one against its surviving volume and the image last seen on it; under the exclusive account lease, never `prepare`, never an empty volume, never a substituted image. Not configured or undecidable: skip and WARN once — never recreated host-mounted |
 //!
 //! After a resume/recreate the pass calls [`refresh_session_health_uncached`]
 //! for the restarted accounts (bypassing the probe cache), so a dead
@@ -948,7 +948,12 @@ fn reconcile_one<R: ContainerRunner>(
                 }
                 return Ok(Outcome::PrivateCloneSkipped);
             }
-            (ctx.recover_private)(account, recreate_image.as_deref(), &is_held)?;
+            // The image a missing private container is recreated from is the
+            // one last seen on *this* container, never the recorded operator
+            // start: `LAST_START_FILE` is written only by host-mounted starts
+            // (`start_with_workspace`), so for a private account it can only
+            // describe an earlier host-mounted era of the same account.
+            (ctx.recover_private)(account, mem.image.as_deref(), &is_held)?;
             mem.awaiting_confirm = true;
             log::warn!(
                 "session_reconcile: {container}: private-clone session was {}; recovered it \

@@ -1199,3 +1199,83 @@ fn private_recovery_hold_at_the_mutation_boundary_is_reported_held() {
     };
     assert_eq!(recover_pass(&mut lifecycle, &env, &held, &mut state, 0), vec![Outcome::Held]);
 }
+
+/// A private session that dies after every recovery is retried on the
+/// exponential backoff, not every pass: the recovery "succeeds", the next pass
+/// finds it down again and counts a failure, and each failure doubles the
+/// wait (120 s, 240 s, 480 s ...). The restart storm is bounded the same way
+/// the host-mounted path's is.
+#[test]
+#[serial]
+fn a_private_session_that_dies_after_each_recovery_is_retried_on_the_backoff() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle.runner().seed(
+        &container_name("alice"),
+        false,
+        false,
+        Some(Path::new(private_workspace::REPO)),
+    );
+    let mut state = ReconcileState::default();
+    let calls = std::cell::Cell::new(0);
+    // Reports success but the fake container stays stopped: it died at once.
+    let dies = |_: &AccountDescriptor, _: Option<&str>, _: &dyn Fn() -> bool| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+    let mut run = |now: u64| recover_pass(&mut lifecycle, &env, &dies, &mut state, now);
+    assert_eq!(run(0), vec![Outcome::PrivateRecovered]);
+    let died = run(60);
+    assert!(matches!(died[0], Outcome::Failed { retry_at: 180, .. }), "{died:?}");
+    assert!(matches!(run(120)[0], Outcome::BackingOff { retry_at: 180 }));
+    assert_eq!(run(180), vec![Outcome::PrivateRecovered]);
+    assert!(matches!(run(240)[0], Outcome::Failed { retry_at: 480, .. }));
+    assert!(matches!(run(300)[0], Outcome::BackingOff { retry_at: 480 }));
+    assert_eq!(run(480), vec![Outcome::PrivateRecovered]);
+    assert!(matches!(run(540)[0], Outcome::Failed { retry_at: 1020, .. }));
+    assert_eq!(calls.get(), 3, "one recovery per backoff window, not per pass");
+    assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
+}
+
+/// The image a missing private container is recreated from is the one last
+/// seen on it, never the operator-start record: that record is written only
+/// by host-mounted starts, so for a private account it describes an earlier
+/// host-mounted era. With no sighting at all the hint is `None` (the recovery
+/// then refuses to substitute an image) rather than the host image.
+#[test]
+#[serial]
+fn a_private_recovery_is_handed_the_containers_own_last_image_not_the_operator_start() {
+    let env = setup(&["alice"], &["alice"]);
+    session_hold::record_operator_start(
+        &env.accounts[0].credential_reference,
+        Path::new("/srv/checkouts"),
+        "example/host-session:old",
+        session_hold::now_unix_ms(),
+    )
+    .unwrap();
+    let handed = std::cell::RefCell::new(Vec::<Option<String>>::new());
+    let record = |_: &AccountDescriptor, image: Option<&str>, _: &dyn Fn() -> bool| {
+        handed.borrow_mut().push(image.map(str::to_owned));
+        Ok(())
+    };
+    // Never seen: no image to recreate from.
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let mut state = ReconcileState::default();
+    assert_eq!(
+        recover_pass(&mut lifecycle, &env, &record, &mut state, 0),
+        vec![Outcome::PrivateRecovered]
+    );
+    // Seen stopped (the fake seeds `example/session:pinned`): that image.
+    lifecycle.runner().seed(
+        &container_name("alice"),
+        false,
+        false,
+        Some(Path::new(private_workspace::REPO)),
+    );
+    let mut state = ReconcileState::default();
+    assert_eq!(
+        recover_pass(&mut lifecycle, &env, &record, &mut state, 0),
+        vec![Outcome::PrivateRecovered]
+    );
+    assert_eq!(handed.borrow().as_slice(), [None, Some("example/session:pinned".to_owned())]);
+}

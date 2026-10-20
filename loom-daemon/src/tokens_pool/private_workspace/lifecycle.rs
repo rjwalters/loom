@@ -1,3 +1,4 @@
+use super::super::session_hold::{self, OperatorHeld};
 use super::super::session_lifecycle::{
     container_name, mark_session_managed, DEFAULT_SESSION_IMAGE,
 };
@@ -136,6 +137,11 @@ pub fn start(
         bail!("session has an unleased worker; stop it before preparing the workspace");
     }
     save(&dir.join("workspace.json"), &config)?;
+    // An operator start lifts the hold an operator `stop` left, before the
+    // first mutation, so a failure past this point leaves the session down
+    // and unheld — which the reconciler then recovers on its backoff, the
+    // operator's stated intent — never running and held (#10453, #12772).
+    session_hold::lift_holds(std::slice::from_ref(&config.profile))?;
     match state {
         None => {
             let image = image.unwrap_or(DEFAULT_SESSION_IMAGE);
@@ -179,6 +185,12 @@ pub fn start(
 ///
 /// `check_hold` runs under the exclusive account lease, immediately before the
 /// first mutation, and fails the recovery when an operator hold has appeared.
+/// The hold [`stop`] writes in the account profile is checked there too, so a
+/// caller with a narrower view of the account cannot restart a stopped one.
+/// Because [`stop`] writes its hold and [`recover`] reads it under the same
+/// exclusive lease, the two cannot interleave: a stop either lands before the
+/// check (the recovery refuses) or after the whole recovery (it stops the
+/// recovered container); there is no running-and-held outcome to undo.
 pub fn recover(
     workspace: &Path,
     name: &str,
@@ -187,6 +199,12 @@ pub fn recover(
 ) -> Result<Status> {
     let (config, dir) = resolve(workspace, name)?;
     let lease = lease::Lease::acquire(&dir)?;
+    let held = || -> Result<()> {
+        if session_hold::held_across(std::slice::from_ref(&config.profile)) {
+            return Err(OperatorHeld.into());
+        }
+        check_hold()
+    };
     let state = docker::inspect(&config.container)?;
     if let Some(state) = &state {
         docker::validate(&config, state)?;
@@ -198,7 +216,7 @@ pub fn recover(
     match &state {
         Some(state) if state["State"]["Running"] == true => {}
         Some(_) => {
-            check_hold()?;
+            held()?;
             docker::command(&["start", &config.container])?;
         }
         None => {
@@ -215,7 +233,7 @@ pub fn recover(
                  session by hand with --image)",
             )?;
             docker::image_present(image)?;
-            check_hold()?;
+            held()?;
             docker::provision_controls(&config, image)?;
             docker::create(&config, image)?;
         }
@@ -270,6 +288,12 @@ pub fn stop(workspace: &Path, name: &str, force: bool) -> Result<Status> {
     if !force && !docker::idle(state.as_ref(), &config.container)? {
         bail!("private session has a surviving worker; wait for cleanup or explicitly use --force");
     }
+    // A stop is deliberate, so it stays down: the operator hold is written
+    // under the exclusive lease, before `docker stop`, and the reconciler's
+    // unattended `recover` refuses a held account until an operator `start`
+    // lifts it (#10453, #12772). Written even when no container exists, so a
+    // session already gone is not recreated behind the operator either.
+    session_hold::write_hold(&config.profile, session_hold::now_unix_ms())?;
     if state.is_some() {
         docker::command(&["stop", "--time", "15", &config.container])?;
         let stopped =

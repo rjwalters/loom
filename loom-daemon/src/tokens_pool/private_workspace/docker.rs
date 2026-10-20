@@ -5,6 +5,12 @@ use std::process::{Command, Stdio};
 /// Capture without forwarding Docker stderr: exec/auth errors may contain
 /// credential material. All callers report the operation, never its payload.
 pub(super) fn command(args: &[&str]) -> Result<String> {
+    // Every Docker call of this module goes through here, so a fake installed
+    // on this thread (`fake`, tests only) stands in for the whole engine.
+    #[cfg(test)]
+    if let Some(result) = fake::dispatch(args) {
+        return result;
+    }
     let output = Command::new("docker")
         .args(args)
         .stdin(Stdio::null())
@@ -520,4 +526,37 @@ fn bind_source_matches(config: &Config, mount: &Value, expected: &Path) -> bool 
         || (cfg!(target_os = "macos")
             && config.docker_desktop
             && mount["Source"] == format!("/host_mnt{expected}"))
+}
+
+/// Test seam: every Docker invocation of this module funnels through
+/// [`command`], so a fake installed on the current thread stands in for the
+/// whole engine (containers, volumes, images, execs) and no test touches a
+/// real Docker (#12772).
+#[cfg(test)]
+pub(super) mod fake {
+    use std::cell::RefCell;
+
+    pub(in super::super) type Handler = Box<dyn FnMut(&[&str]) -> anyhow::Result<String>>;
+
+    thread_local! {
+        static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+    }
+
+    /// Route this thread's Docker calls to `handler` until the guard drops.
+    pub(in super::super) fn install(handler: Handler) -> Guard {
+        HANDLER.with(|h| *h.borrow_mut() = Some(handler));
+        Guard
+    }
+
+    pub(in super::super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HANDLER.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn dispatch(args: &[&str]) -> Option<anyhow::Result<String>> {
+        HANDLER.with(|h| h.borrow_mut().as_mut().map(|handler| handler(args)))
+    }
 }
