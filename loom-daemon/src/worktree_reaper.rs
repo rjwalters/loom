@@ -820,7 +820,9 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     let _ = crate::target_orphan_reclaim::run_for(repo_root);
 
     // #12460: unregistered, idle codex profile dirs under the host-wide profile
-    // root. Fail-closed on registry/liveness; see `crate::cache_reaper`.
+    // root. Default off; report-only until `mode=quarantine`; never `rm -rf`s a
+    // profile; refuses when any registry it must consult cannot be read. Own
+    // host-wide cooldown. See `crate::cache_reaper`.
     let _ = crate::cache_reaper::run_for(repo_root);
 
     report

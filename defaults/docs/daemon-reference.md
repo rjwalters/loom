@@ -9781,6 +9781,61 @@ the pinned-`TMPDIR` root; production hosts use the fixed default.
 
 See `loom-daemon/src/native_state_reclaim.rs`.
 
+#### Stray Codex profile reclaim (#12460)
+
+`~/.loom/codex-profiles/` is host-wide and nothing removed directories from
+it. A profile directory is credential-bearing (`auth.json`) and nothing can
+regenerate a credential, so this pass is **off by default**, **report-only
+once on**, and **never deletes a profile**: in `quarantine` mode a candidate is
+renamed into the root's `.quarantine/<name>-<stamp>` (where `accounts remove`
+also parks retired accounts) with a `.cache-reaper.json` marker, and only an
+entry carrying that marker is removed, after the TTL. An operator's own
+`accounts remove` quarantine is never purged here.
+
+A directory is a candidate only when **no registry the daemon can see names
+it** (by `name` or `credential_reference`): the ticking repo's
+`.loom/accounts.json`, every workspace in `~/.loom/workspaces.json`, and the
+shared `~/.loom/accounts.json`. The pass **refuses the whole root** when a
+registered workspace has no registry file (its pool is then every discovered
+directory), when any registry cannot be read, or when `/proc` cannot be
+enumerated (process liveness unknown, so a non-Linux host never quarantines).
+A candidate is still kept when it is session-managed (`.session-managed.json`:
+a stopped container may be started again), has a private-session identity
+(`.private-sessions/<name>/workspace.json`), is the daemon's or any running
+process's `CODEX_HOME`, was modified within `minIdleDays`, or cannot be read
+in full. Growth *inside* a registered profile (`sessions/` rollouts,
+`thread_history_*.sqlite`) is out of scope; see
+[`troubleshooting.md`](troubleshooting.md) → "Bounding the uv cache and stray
+Codex profiles" for the measurement that motivates that.
+
+Rides the 15-minute `worktree_reaper` tick with a **host-wide** cooldown.
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "codexProfileReclaim": {
+        "enabled": false,
+        "mode": "report",
+        "minIdleDays": 14,
+        "quarantineTtlDays": 30,
+        "minIntervalSecs": 3600
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_CODEX_PROFILE_RECLAIM` | `autonomous.worktreeReaper.codexProfileReclaim.enabled` | env > config > default | `false` (off) |
+| `LOOM_CODEX_PROFILE_RECLAIM_MODE` | `….codexProfileReclaim.mode` | env > config > default | `report` (`quarantine` to act; anything else reads as `report`) |
+| `LOOM_CODEX_PROFILE_RECLAIM_MIN_IDLE_DAYS` | `….codexProfileReclaim.minIdleDays` | env > config > default | `14` (values below 7 fall through) |
+| `LOOM_CODEX_PROFILE_RECLAIM_QUARANTINE_TTL_DAYS` | `….codexProfileReclaim.quarantineTtlDays` | env > config > default | `30` (values below 7 fall through) |
+| `LOOM_CODEX_PROFILE_RECLAIM_MIN_INTERVAL_SECS` | `….codexProfileReclaim.minIntervalSecs` | env > config > default | `3600` (1 h) |
+
+See `loom-daemon/src/cache_reaper.rs`.
+
 #### `pr-<N>` worktrees are reaped too (#5939)
 
 Through v0.18.11 every automatic reclaim path was scoped to the `issue-<N>`

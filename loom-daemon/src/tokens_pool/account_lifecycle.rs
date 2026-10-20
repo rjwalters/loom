@@ -853,7 +853,10 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
     }
 }
 
-fn ensure_private_dir(path: &Path) -> Result<()> {
+/// Create `path` (and parents) as a `0700` directory; also tightens an
+/// existing one. Shared with [`crate::cache_reaper`], whose quarantine lives
+/// in the same `.quarantine/` as [`AccountLifecycle::remove`]'s.
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;

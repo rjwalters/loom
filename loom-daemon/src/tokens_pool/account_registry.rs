@@ -495,36 +495,122 @@ pub fn codex_registry_names(workspace: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The answer to "which profile directories does no registry claim?" (issue
+/// #12460), or the reason it cannot be given.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnregisteredProfiles {
+    /// Directories directly under the profile root that **no consulted
+    /// registry** names, by `name` or by `credential_reference`. Empty whenever
+    /// `refused` is set.
+    pub candidates: Vec<(String, PathBuf)>,
+    /// Set when registration could not be determined for the whole root. The
+    /// caller must then treat every directory as live.
+    pub refused: Option<String>,
+}
+
 /// Codex profile directories under the profile root that **no registry names**
-/// (issue #12460): the stray-profile candidates a cache reaper may prune.
+/// (issue #12460): the stray-profile candidates a cache reaper may act on.
 ///
-/// Fails closed. Returns an empty list unless `workspace` has its own registry
-/// file -- without one every discovered directory is the adopted pool, so
-/// nothing is "unregistered". Names held by the shared registry
-/// ([`shared_accounts_root`]) also count as registered: the profile root is
-/// host-wide while a workspace registry is per-repo, so a directory this repo
-/// does not list may be live for another. Hidden directories (`.quarantine`)
-/// are never returned, and neither is anything [`discovered_codex_profiles`]
-/// rejects (bad names, symlinks escaping the root).
-pub(crate) fn unregistered_codex_profiles(workspace: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let Some(entries) = read_repo_registry(workspace)? else {
-        return Ok(Vec::new());
-    };
-    let Some(root) = codex_profile_root() else {
-        return Ok(Vec::new());
-    };
-    let mut registered: HashSet<String> = entries
-        .into_iter()
-        .filter(|entry| entry.provider == AccountProvider::Codex)
-        .map(|entry| entry.name)
-        .collect();
-    if let Some(shared) = super::paths::shared_accounts_root() {
-        registered.extend(codex_registry_names(&shared)?);
+/// The profile root is host-wide while a registry is per-workspace, so a
+/// directory one workspace does not list may be the live pool of another. The
+/// caller therefore passes **every** workspace whose dispatch could select a
+/// profile (the ticking repo plus the whole workspace registry), and a
+/// directory counts as registered when any of them, or the shared registry
+/// ([`shared_accounts_root`]), names it -- by `name` or by
+/// `credential_reference`, since the directory is bound through the latter and
+/// the two need not agree.
+///
+/// Fails closed, as a refusal rather than an empty list, when the answer is
+/// unknowable:
+///
+/// * a consulted workspace exists but has **no** `.loom/accounts.json`: its
+///   pool is then every discovered directory ([`registry_entries_or_adopted`]),
+///   so nothing under the root is unregistered;
+/// * any consulted registry (workspace or shared) cannot be read or parsed;
+/// * the profile root is disabled or cannot be read.
+///
+/// A workspace root that is not a directory on this host is skipped: it can
+/// dispatch nothing here. Hidden directories (`.quarantine`,
+/// `.private-sessions`) are never candidates, and neither is anything
+/// [`discovered_codex_profiles`] rejects (bad names, symlinks escaping the root).
+pub(crate) fn unregistered_codex_profiles(
+    workspaces: &[PathBuf],
+    shared: Option<&Path>,
+) -> UnregisteredProfiles {
+    fn refuse(reason: String) -> UnregisteredProfiles {
+        UnregisteredProfiles {
+            candidates: Vec::new(),
+            refused: Some(reason),
+        }
     }
-    Ok(discovered_codex_profiles(&root)?
-        .into_iter()
-        .filter(|(name, _)| !registered.contains(name))
-        .collect())
+    let Some(root) = codex_profile_root() else {
+        return refuse("Codex profile root is disabled by LOOM_CODEX_PROFILE_ROOT".into());
+    };
+    let mut registered: HashSet<String> = HashSet::new();
+    let mut consulted = 0usize;
+    for workspace in workspaces {
+        if !workspace.is_dir() {
+            continue;
+        }
+        match read_repo_registry(workspace) {
+            Ok(Some(entries)) => {
+                consulted += 1;
+                for entry in entries
+                    .into_iter()
+                    .filter(|entry| entry.provider == AccountProvider::Codex)
+                {
+                    registered.insert(entry.credential_reference);
+                    registered.insert(entry.name);
+                }
+            }
+            Ok(None) => {
+                return refuse(format!(
+                    "workspace {} has no .loom/accounts.json, so every discovered profile is its \
+                     adopted pool",
+                    workspace.display()
+                ));
+            }
+            Err(error) => {
+                return refuse(format!(
+                    "registry of workspace {} is unreadable: {error:#}",
+                    workspace.display()
+                ));
+            }
+        }
+    }
+    if consulted == 0 {
+        return refuse("no workspace registry could be consulted".into());
+    }
+    if let Some(shared) = shared {
+        match read_repo_registry(shared) {
+            Ok(Some(entries)) => {
+                for entry in entries
+                    .into_iter()
+                    .filter(|entry| entry.provider == AccountProvider::Codex)
+                {
+                    registered.insert(entry.credential_reference);
+                    registered.insert(entry.name);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return refuse(format!(
+                    "shared registry under {} is unreadable: {error:#}",
+                    shared.display()
+                ));
+            }
+        }
+    }
+    match discovered_codex_profiles(&root) {
+        Ok(discovered) => UnregisteredProfiles {
+            candidates: discovered
+                .into_iter()
+                .filter(|(name, _)| !registered.contains(name))
+                .collect(),
+            refused: None,
+        },
+        Err(error) => refuse(format!("profile root {} is unreadable: {error:#}", root.display())),
+    }
 }
 
 fn claude_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {

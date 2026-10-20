@@ -3424,10 +3424,29 @@ spec. Run `uv cache prune --ci` (drops pre-built wheels, keeps source-built
 ones) from a cron on the worker, or set `UV_CACHE_DIR` to a volume you can
 size. Prune cache data only; never reinstall or upgrade the tool.
 
-**Codex profiles.** The reaper tick (`cache_reaper::run_for`) removes a directory
-under `~/.loom/codex-profiles/` only when the repo's `.loom/accounts.json`
-exists and neither it nor the shared registry names the directory, nothing
-under it changed in 14 days, and no process has it as `CODEX_HOME`. Hidden dirs
-(`.quarantine`) and registered profiles are never touched; with no registry
-file nothing is pruned. Growth *inside* a registered profile (`sessions/`
-rollouts) is not pruned: check with `du -s ~/.loom/codex-profiles/*`.
+**Codex profiles.** Measure first: `du -sk ~/.loom/codex-profiles/*/* | sort -n`.
+On one operator host (7 profiles, 7.7 GB) 71 % was `sessions/` rollouts and
+19 % `thread_history_*.sqlite`, all *inside* registered, session-managed
+profiles; `auth.json` was 28 KB in total and no directory was stray. Growth
+inside a registered profile is **not** pruned by the daemon; if that is what
+the host holds, pruning stray directories reclaims nothing.
+
+The reaper tick's `cache_reaper::run_for` pass is for the other case, a
+directory under `~/.loom/codex-profiles/` that no registry names any more. It
+is **off by default** (`autonomous.worktreeReaper.codexProfileReclaim.enabled`
+or `LOOM_CODEX_PROFILE_RECLAIM=1`) and once on it only **reports**
+(`cache_reaper: would quarantine …` in the daemon log) until
+`mode: "quarantine"`. It never deletes a profile: a candidate is renamed into
+`~/.loom/codex-profiles/.quarantine/<name>-<stamp>` with a `.cache-reaper.json`
+marker, and only such marked entries are removed, after `quarantineTtlDays`
+(default 30). To recover one, move it back and `loom-daemon accounts adopt`
+it. A directory is a candidate only when no registry the daemon can see
+names it (the ticking repo's `.loom/accounts.json`, every registered
+workspace's, and `~/.loom/accounts.json`), it is not session-managed
+(`.session-managed.json`), has no private-session identity, is no process's
+`CODEX_HOME`, and nothing under it changed in `minIdleDays` (default 14). The
+pass refuses the whole root, and says so in the log, when any workspace it
+must consult has no registry file (its pool is then every directory) or an
+unreadable one, or when `/proc` cannot be read (so a Mac quarantines nothing).
+Knobs: [`daemon-reference.md`](daemon-reference.md) → "Stray Codex profile
+reclaim".
