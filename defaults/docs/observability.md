@@ -705,14 +705,6 @@ Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
 alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
 `defaults/observability/signoz/queue-dwell.sql`.
 
-**Fleet singleton outputs (#10916).** The in-daemon `fleet_alert` path
-(#10924) judges the registered one-host fleet outputs (`ci.run`, the captain
-gauges, and the intake-reconcile completed-pass heartbeat
-`.loom/state/intake-reconcile/last-pass.json`) against
-`fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
-cross-host alert that watched the ETA singletons was removed with the ETA
-subsystem (#11098).
-
 **Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
 gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)
 and `loom.tokens.usage_fraction_weekly` (rolling 7-day, from the
