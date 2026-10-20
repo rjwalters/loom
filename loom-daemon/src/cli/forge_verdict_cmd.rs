@@ -41,10 +41,15 @@ pub(crate) fn verdict_body_check() -> Result<()> {
 
 /// The body-edit history of issue `n` (GraphQL `userContentEdits`; REST has no
 /// edit time). `None` when the read failed: never a pass (#12714).
+///
+/// `n` may name a pull request (`Part of #N` often points at one), so the
+/// field is read through the `Comment` interface both types implement; an
+/// `... on Issue`-only fragment returns no `userContentEdits` for a PR, and
+/// that `None` would refuse every approval linking it, for good.
 fn read_body_edits(repo: &str, n: u64, root: &Path) -> Option<Vec<gate::BodyEdit>> {
     let (owner, name) = repo.split_once('/')?;
     let query = "query($o:String!,$n:String!,$i:Int!){repository(owner:$o,name:$n){\
-                 issueOrPullRequest(number:$i){... on Issue{userContentEdits(first:50){nodes{\
+                 issueOrPullRequest(number:$i){... on Comment{userContentEdits(first:50){nodes{\
                  editedAt editor{login __typename}}}}}}}";
     let args = [
         "api".to_string(),
