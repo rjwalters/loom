@@ -113,6 +113,7 @@ pub mod daemon_lifecycle;
 pub mod dispatch_eligibility;
 pub mod endpoint_policy;
 pub mod exporter;
+pub mod hold_transition;
 mod ingest_key;
 pub mod lifecycle;
 pub mod llm_billing;

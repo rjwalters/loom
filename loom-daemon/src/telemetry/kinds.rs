@@ -177,6 +177,8 @@ pub mod stage_occupancy;
 
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
+/// `hold.transition` (#12665) — a hold label applied to or removed from a PR.
+pub mod hold_transition;
 /// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
 pub mod merge_queue_event;
 /// `merge.queue.observed` (#12667) — the merge queue as one existing read saw it.
@@ -551,6 +553,12 @@ macro_rules! telemetry_kind_table {
             /// sink appended, with its classified reason and enqueue-to-event
             /// latency (#12653). OTLP-only. See [`merge_queue_event`].
             MergeQueueEvent = "merge_queue.event" => $crate::telemetry::kinds::merge_queue_event::MergeQueueEventRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A hold label applied to or removed from a PR, with its
+            /// structured reason and attempted-vs-confirmed state (#12665).
+            /// OTLP-only. See [`hold_transition`].
+            HoldTransition = "hold.transition" => $crate::telemetry::kinds::hold_transition::HoldTransitionRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// The merge queue (order, membership, completeness) as the existing

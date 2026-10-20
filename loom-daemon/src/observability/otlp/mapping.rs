@@ -13,6 +13,7 @@ mod dispatch_eligibility;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
+mod hold_transition;
 mod host_export;
 mod host_health;
 mod host_resource;
@@ -648,6 +649,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::MergeQueueEvent(_)
+        | TelemetryRecord::HoldTransition(_)
         | TelemetryRecord::MergeQueueObserved(_)
         | TelemetryRecord::MergeQueueRegime(_)
         | TelemetryRecord::DaemonExit(_)
@@ -672,6 +674,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))
                 .or_else(|| merge_queue_event::log_parts(r))
+                .or_else(|| hold_transition::log_parts(r))
                 .or_else(|| merge_queue_observed::log_parts(r))
                 .or_else(|| merge_queue_regime::log_parts(r))?;
             time_unix_nano = parts.source_at;
