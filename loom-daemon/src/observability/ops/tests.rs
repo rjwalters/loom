@@ -268,6 +268,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::DispatchRoleIdleSlots,
         MetricName::DispatchRunningOldestAgeSec,
         MetricName::DispatchRunningByAge,
+        MetricName::DispatchRunningByPoints,
         MetricName::StepActionable,
         MetricName::ForgeHoldItems,
         MetricName::ForgeHoldAgeSeconds,
