@@ -790,14 +790,19 @@ impl SweepRegistry {
         );
     }
 
-    /// Publish this registry's live steps by role to `busy_slots` (#11906).
+    /// Publish this registry's live steps by role, each as its start time, to
+    /// `busy_slots` (#11906; the start times feed the age gauges, #12873).
     pub(crate) fn publish_step_slots(&self) {
-        let mut running: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        let mut running: std::collections::BTreeMap<&'static str, Vec<DateTime<Utc>>> =
+            Default::default();
         for info in self.entries.values() {
             if let (SweepKind::Step { role, .. }, SweepState::Running | SweepState::Pending) =
                 (&info.kind, &info.state)
             {
-                *running.entry(role.role_name()).or_insert(0) += 1;
+                running
+                    .entry(role.role_name())
+                    .or_default()
+                    .push(info.started_at);
             }
         }
         crate::observability::ops::busy_slots::set_steps(&self.config.workspace_root, running);
