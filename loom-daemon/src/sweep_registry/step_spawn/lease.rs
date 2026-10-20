@@ -321,12 +321,12 @@ impl SweepRegistry {
 pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimFacts, StepRefusal> {
     let Some(mut cmd) = cmd else {
         let mut refusal = StepRefusal::new("claim_unverified", "no loom-daemon binary");
-        refusal.claim = Some(ClaimFacts {
+        refusal.claim = Some(Box::new(ClaimFacts {
             outcome: "no_binary",
             exit_code: None,
             claim_ms: 0,
             stderr_tail: None,
-        });
+        }));
         return Err(refusal);
     };
     let (run, elapsed, tail) = run_bounded(&mut cmd, CLAIM_TIMEOUT);
@@ -342,7 +342,7 @@ pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimF
             if let Some(tail) = &facts.stderr_tail {
                 refusal.detail = format!("{} (stderr: {tail})", refusal.detail);
             }
-            refusal.claim = Some(facts);
+            refusal.claim = Some(Box::new(facts));
             Err(refusal)
         }
     }

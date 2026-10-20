@@ -406,6 +406,14 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
         ),
         (
+            "claim_reconciliation/orphan_stack.rs",
+            Via(
+                PASS,
+                "orphan-stack pass (#12760): base retarget PATCH, conflict label, flag \
+                 comment; its scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+            ),
+        ),
+        (
             "forge_disable_auto_merge.rs",
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
@@ -596,10 +604,6 @@ fn daemon_write_paths_are_scoped() {
             OperatorOnly("library half of `consolidate-reconcile`, reached only via the CLI verb above"),
         ),
         (
-            "watchdog/peer_coord.rs",
-            NotAWrite("follow-up on the issue this watchdog filed"),
-        ),
-        (
             "forge_probe.rs",
             NotAWrite(
                 "the hosted-trial probe writes to the candidate instance's disposable \
@@ -612,6 +616,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("action names; writes go through dep_classify"),
         ),
         ("role_tick_telemetry.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "stack_parent.rs",
+            NotAWrite("reads the forge and runs local git; only its test names git's `-X theirs`"),
+        ),
         (
             "gh_invocation/accounting.rs",
             NotAWrite("classifies an invocation's argv for call accounting, runs none"),

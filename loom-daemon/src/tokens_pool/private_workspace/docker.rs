@@ -423,7 +423,20 @@ pub(super) fn recheck_control(config: &Config, id: &str, bound: &str) -> Result<
 }
 
 pub(super) fn prepare(config: &Config, id: &str, branch: Option<&str>) -> Result<String> {
-    let mut args = vec!["exec", "--workdir", ROOT];
+    prepare_target(config, &config.primary(), id, branch)
+}
+
+/// Prepare one repository of the account: the primary, or a lazily cloned
+/// additional one. Credentials stay scoped to THAT repository's forge via the
+/// exec's own `LOOM_PRIVATE_REPOSITORY`, never widened on the container.
+pub(super) fn prepare_target(
+    config: &Config,
+    target: &Target,
+    id: &str,
+    branch: Option<&str>,
+) -> Result<String> {
+    let scope = format!("LOOM_PRIVATE_REPOSITORY={}", target.repository);
+    let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
     // `--env NAME` copies the host process's value directly; secrets never
     // appear in argv, config files, remote URLs or our captured output.
     for name in FORGE_ENV {
@@ -439,14 +452,17 @@ pub(super) fn prepare(config: &Config, id: &str, branch: Option<&str>) -> Result
         "--account",
         &config.account,
         "--repository",
-        &config.repository,
+        &target.repository,
         "--base",
-        &config.base,
+        &target.base,
         "--container-id",
         id,
     ]);
     if let Some(branch) = branch {
         args.extend(["--branch", branch]);
+    }
+    if let Some(slug) = &target.slug {
+        args.extend(["--slug", slug]);
     }
     let output = command(&args).context("private workspace endpoint failed; use a current session image supporting private-workspace protocol")?;
     let result: Value = serde_json::from_str(&output)

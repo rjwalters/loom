@@ -1034,6 +1034,11 @@ async fn sample_snapshots(
     // without the ops sink, and without a new work-finder tick since the last
     // export pass.
     super::ops::disposition::record(slug_cache).await;
+    // Per-item dispatch eligibility facts (Issue #12790), OTLP-only: splits
+    // `ready_wait` dwell at the eligibility boundary and records the eligible
+    // work-ahead. Reads only the repo-ref cache the two passes above warmed, so
+    // it makes no forge call; a no-op without the OTLP sink or a fresh tick.
+    super::dispatch_eligibility::record();
     // Per-account Codex session-container state (Issue #10455): export the
     // gauge from the always-on watch's newest observations. No docker call
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot

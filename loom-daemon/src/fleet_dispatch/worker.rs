@@ -59,6 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::client::{self, CallError, CallFacts};
@@ -182,7 +183,16 @@ pub enum Ask {
     /// path.
     FailOpen,
     Granted(Grant),
-    Refused(RefusalReason),
+    Refused(RefusalReason, Refusal),
+}
+
+/// What a claim refusal said beyond its reason (#12707).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Refusal {
+    /// The host holding the item, when the captain named one.
+    pub held_by: Option<String>,
+    /// Seconds before asking again is worthwhile.
+    pub retry_after_s: Option<u64>,
 }
 
 /// The `loom.dispatch.step` reason of a captain refusal: a closed token.
@@ -192,6 +202,8 @@ pub fn refusal_token(reason: RefusalReason) -> &'static str {
         RefusalReason::Held => "captain_held",
         RefusalReason::Grace => "captain_grace",
         RefusalReason::NotEligible => "captain_not_eligible",
+        // A captain built from #12864 on never sends `cap`; kept so this
+        // worker still reads an older captain in a mixed-version fleet.
         RefusalReason::Cap => "captain_cap",
         RefusalReason::Cooldown => "captain_cooldown",
         RefusalReason::Other => "captain_refused",
@@ -292,7 +304,7 @@ fn repo_of(root: &Path) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Decision {
     Granted(String),
-    Refused(RefusalReason),
+    Refused(RefusalReason, Refusal),
 }
 
 /// Read a claim answer; `None` for a grant with no `assignment_id` (a
@@ -303,7 +315,13 @@ fn decide(r: &ClaimResponse) -> Option<Decision> {
         let id = r.assignment_id.clone().filter(|id| !id.is_empty())?;
         Some(Decision::Granted(id))
     } else {
-        Some(Decision::Refused(r.reason.unwrap_or(RefusalReason::Other)))
+        Some(Decision::Refused(
+            r.reason.unwrap_or(RefusalReason::Other),
+            Refusal {
+                held_by: r.held_by.clone().filter(|h| !h.is_empty()),
+                retry_after_s: r.retry_after_s,
+            },
+        ))
     }
 }
 
@@ -353,7 +371,7 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
                 step: request.step,
             })
         }
-        Ok((epoch, Decision::Refused(reason))) => {
+        Ok((epoch, Decision::Refused(reason, refusal))) => {
             // `grace` is expected after every captain roll: it neither
             // counts as a failure nor resets one (spec §9.1).
             if reason != RefusalReason::Grace {
@@ -363,10 +381,13 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
             facts.result = client::RESULT_REFUSED;
             facts.reason = Some(reason.as_str().to_string());
             facts.server_epoch = Some(epoch);
+            facts.held_by.clone_from(&refusal.held_by);
+            facts.retry_after_s = refusal.retry_after_s;
+            facts.hold = reason == RefusalReason::Cooldown;
             if reason == RefusalReason::Grace {
                 Ask::FailOpen
             } else {
-                Ask::Refused(reason)
+                Ask::Refused(reason, refusal)
             }
         }
         Err(e) => {
@@ -509,10 +530,12 @@ pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
 }
 
 /// One reaper tick of the registry at `root`, whose live steps are `live`
-/// (`(sweep_id, item, role)`): record them, release any assignment whose
-/// step is gone without an end, and send the host's heartbeat when one is
-/// due. A no-op while the flag is off and nothing was ever granted.
-pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
+/// (`(sweep_id, item, role, started_at)`): record them, release any
+/// assignment whose step is gone without an end, and send the host's
+/// heartbeat when one is due. `started_at` rides the heartbeat as
+/// [`LiveStep::started_at`] (#12873). A no-op while the flag is off and
+/// nothing was ever granted.
+pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>)]) {
     let url = host_endpoint(root);
     let (vanished, heartbeat) = {
         let mut s = state();
@@ -534,7 +557,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
         let repo = repo_of(root);
         let steps: Vec<(String, LiveStep)> = live
             .iter()
-            .map(|(id, item, role)| {
+            .map(|(id, item, role, started_at)| {
                 let assignment_id = s.assignments.get(id).map(|a| a.grant.assignment_id.clone());
                 (
                     id.clone(),
@@ -543,6 +566,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
                         item: u64::from(*item),
                         step: role.as_str().to_string(),
                         assignment_id,
+                        started_at: Some(*started_at),
                     },
                 )
             })

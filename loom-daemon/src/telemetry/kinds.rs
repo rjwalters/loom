@@ -157,8 +157,16 @@ pub struct TelemetryKindMeta {
 // `telemetry/mod.rs`; moving them would churn every in-flight PR that touches
 // them for no schema benefit.)
 
+/// `alert.transition` (#12806) — one alert opening or resolving on this host.
+pub mod alert_transition;
+
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
+
+/// `eta.dispatch_eligibility` (#12790) — the dispatcher's schedulability
+/// decision for one ready item, splitting `ready_wait` dwell at the
+/// eligibility boundary.
+pub mod dispatch_eligibility;
 
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
@@ -168,6 +176,8 @@ pub mod hold_transition;
 pub mod merge_queue_event;
 /// `merge.queue.observed` (#12667) — the merge queue as one existing read saw it.
 pub mod merge_queue_observed;
+/// `merge.queue.regime` (#12675) — the merge-queue settings, on change only.
+pub mod merge_queue_regime;
 /// `daemon.run_state_request` (#12546) — who issued a pause/drain/stop/restart.
 pub mod run_state_request;
 /// `write_scope.refused` (#12168) — a daemon write the #9548 gate refused.
@@ -548,6 +558,30 @@ macro_rules! telemetry_kind_table {
             /// `mergeQueue.entries` read saw it (#12667). OTLP-only. See
             /// [`merge_queue_observed`].
             MergeQueueObserved = "merge.queue.observed" => $crate::telemetry::kinds::merge_queue_observed::MergeQueueObservedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// The merge-queue regime (`check_response_timeout_minutes`,
+            /// `max_entries_to_build`, `grouping_strategy`) read from the
+            /// daemon tick's rules read, emitted on change only (#12675).
+            /// OTLP-only. See [`merge_queue_regime`].
+            MergeQueueRegime = "merge.queue.regime" => $crate::telemetry::kinds::merge_queue_regime::MergeQueueRegimeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One ready item's dispatch-eligibility decision as of one
+            /// work-finder tick (Issue #12790): schedulable vs blocked, the
+            /// dispatcher's reason, when the current eligibility class began,
+            /// the effective eligible work-ahead, and the resource pool — the
+            /// `ready_wait` signal the dwell facts could not see. OTLP-only.
+            /// See [`dispatch_eligibility`].
+            DispatchEligibility = "eta.dispatch_eligibility" => $crate::telemetry::kinds::dispatch_eligibility::DispatchEligibilityRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One alert opening (or re-asserting) or resolving on this host
+            /// (#12806), in loom-ui's `alert.transition` schema: body and
+            /// `event.name` are the kind, the fields ride as `alert.*`
+            /// attributes. Replaces the POST to loom-ui's
+            /// `/api/alerts/external`. OTLP-only. See [`alert_transition`].
+            AlertTransition = "alert.transition" => $crate::telemetry::kinds::alert_transition::AlertTransitionRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

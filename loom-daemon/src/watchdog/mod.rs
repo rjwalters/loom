@@ -35,8 +35,9 @@
 //! exit codes. The peer-coordination dedup window's own equivalence suite,
 //! `test-loom-daemon-watchdog-dedup.sh`, was retired in #8587 once this
 //! module's `peer_coord` submodule (with its own `#[cfg(test)]` coverage)
-//! became the only implementation — its pre-port shell counterpart had
-//! already been orphaned by this port.
+//! became the only implementation; the dedup window itself went with the
+//! GitHub issue lifecycle in #12818 (peer-coordination now reports to the log
+//! only).
 //!
 //! They run against this code with two harness changes and no altered
 //! expectations: `LOOM_DAEMON_SELF_BIN` pins the binary that implements the
@@ -1114,149 +1115,11 @@ fn peer_coordination(
 
     let degraded = health.verdict == peer_coord::Verdict::Degraded;
     let host = escalate::hostname();
-    loom_ui::peer_coord(&state.peer_coord_sentinel, degraded, &host, &health.summary); // #11295
-    match health.verdict {
-        peer_coord::Verdict::Degraded => {
-            let note = if state.peer_coord_sentinel.exists() {
-                reporter.report(
-                    report::Level::Ok,
-                    &format!(
-                        "peer-coordination degradation already escalated out-of-band (sentinel \
-                         {}).",
-                        state.peer_coord_sentinel.display()
-                    ),
-                );
-                return;
-            } else if let Some(remaining) = peer_coord::cooldown_remaining(
-                &state.peer_coord_cooldown,
-                now_secs(),
-                peer_coord::cooldown_secs(),
-            ) {
-                // #7258: a path that recovers and re-degrades within minutes is
-                // ONE episode to an operator, not two. Filing per flap buries
-                // the signal under duplicates of itself.
-                format!(
-                    "Suppressing a duplicate tracking issue: a previous episode on this host \
-                     recovered within the last {}s cooldown window (#7258) — {remaining}s \
-                     remaining before a repeat degradation would file fresh again. {} is the \
-                     signal for this flap.",
-                    peer_coord::cooldown_secs(),
-                    paths.log.display()
-                )
-            } else if env::var("LOOM_WATCHDOG_ESCALATE").is_some_and(|v| env::is_false(&v)) {
-                format!(
-                    "Out-of-band escalation is disabled — THIS LOGFILE IS THE ONLY SIGNAL for \
-                     this degradation, {}.",
-                    paths.log.display()
-                )
-            } else if let Some(note) = peer_coord::read_cooldown(&state.peer_coord_cooldown)
-                .and_then(|c| {
-                    // #7664: the cooldown has ELAPSED, but this is still the
-                    // same episode if we are inside the (longer) dedup window
-                    // and have a usable prior issue reference. Comment on that
-                    // issue and reopen it rather than filing a duplicate.
-                    //
-                    // This path existed as `repeat_action`/`flap_comment` with
-                    // unit tests and NO callers — the fifth instance in this
-                    // port of code that a comment claimed was wired. The
-                    // CI-wired dedup suite is what proved it: 10 of its 27
-                    // assertions exercise exactly this, and I had not run it.
-                    match peer_coord::repeat_action(
-                        Some(&c),
-                        now_secs(),
-                        peer_coord::dedup_window_secs(),
-                    ) {
-                        peer_coord::Repeat::CommentOn { flap, .. } => peer_coord::dedup_comment(
-                            &c,
-                            &state.peer_coord_sentinel,
-                            &state.peer_coord_cooldown,
-                            &escalate::hostname(),
-                            &health.summary,
-                            flap,
-                            reporter,
-                        ),
-                        peer_coord::Repeat::FileFresh => None,
-                    }
-                })
-            {
-                note
-            } else {
-                // #6222: file a forge tracking issue so the degradation is not
-                // confined to a logfile nobody tails.
-                let cli_dir = cli_dir();
-                let fallback =
-                    env::var("LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR").map(PathBuf::from);
-                let script = escalate::resolve_issue_script(
-                    repo_root.as_deref(),
-                    &cli_dir,
-                    fallback.as_deref(),
-                );
-                let hostname = escalate::hostname();
-                match script.as_deref().and_then(|s| {
-                    peer_coord::file(s, &hostname, &health, &paths.log, &state.peer_coord_sentinel)
-                }) {
-                    Some(issue_ref) => {
-                        peer_coord::write_sentinel(
-                            &state.peer_coord_sentinel,
-                            &issue_ref,
-                            reporter,
-                        );
-                        "ESCALATED out-of-band: filed a forge tracking issue so this degradation \
-                         is not confined to a logfile nobody tails (#6222)."
-                            .to_string()
-                    }
-                    None => format!(
-                        "Out-of-band escalation was NOT possible (no create-issue.sh reachable, \
-                         or the forge call failed) — THIS LOGFILE IS THE ONLY SIGNAL for this \
-                         degradation, {}.",
-                        paths.log.display()
-                    ),
-                }
-            };
-            reporter.report(
-                report::Level::Divergence,
-                &format!("peer-claim coordination is DEGRADED: {}. {note}", health.summary),
-            );
-        }
-        peer_coord::Verdict::Green => {
-            // Only worth a line when there was something to recover FROM.
-            if state.peer_coord_sentinel.exists() {
-                let hostname = escalate::hostname();
-                if peer_coord::recover(
-                    &state.peer_coord_sentinel,
-                    &state.peer_coord_cooldown,
-                    &hostname,
-                    &health.summary,
-                ) {
-                    // Level and wording are contract: the shell reports OK
-                    // here (not WARN) and the retained assertion greps for
-                    // "cleared the escalation sentinel". A paraphrase reads
-                    // the same to a human and silently fails the assertion.
-                    reporter.report(
-                        report::Level::Ok,
-                        &format!(
-                            "peer-claim coordination has RECOVERED ({}) — closed the tracking \
-                             issue and cleared the escalation sentinel (#6222).",
-                            health.summary
-                        ),
-                    );
-                } else {
-                    // Best-effort by design: a missing `gh`, no forge auth, or
-                    // a failed close leaves the sentinel so a LATER healthy
-                    // tick retries, rather than losing track of an open issue.
-                    reporter.report(
-                        report::Level::Warn,
-                        &format!(
-                            "peer-claim coordination has RECOVERED ({}) but closing/commenting \
-                             the tracking issue failed — the sentinel is left in place so a \
-                             later healthy tick retries (#6222).",
-                            health.summary
-                        ),
-                    );
-                }
-            }
-        }
-    }
+    // #11295: the loom-ui alert keys its record file off the sentinel *path*;
+    // the file at that path is no longer read or written by this diagnostic.
+    loom_ui::peer_coord(&state.peer_coord_sentinel, degraded, &host, &health.summary);
+    // #12818: log/report only — no GitHub issue lifecycle for this diagnostic.
+    peer_coord::report_health(&health, reporter);
     let _ = snap;
 }
 

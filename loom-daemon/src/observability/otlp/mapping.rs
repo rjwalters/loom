@@ -2,22 +2,26 @@
 //! parent module's doc comment for the mapping table this file implements;
 //! this module is the field-by-field implementation plus its unit tests.
 
+mod alert_transition;
 mod auto_update;
 mod checkout_external_change;
 mod checkout_freshness;
 mod ci;
 mod daemon_event;
 mod daemon_exit;
+mod dispatch_eligibility;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
 mod hold_transition;
 mod host_export;
+mod host_health;
 mod host_resource;
 mod host_status;
 mod issue_estimate;
 mod merge_queue_event;
 mod merge_queue_observed;
+mod merge_queue_regime;
 mod metadata;
 mod operator_presence;
 mod ops;
@@ -586,6 +590,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             (event_name, severity, String::new(), attributes)
         }
         TelemetryRecord::AutoUpdateTick(_)
+        | TelemetryRecord::AlertTransition(_)
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::HostExport(_)
         | TelemetryRecord::CheckoutExternalChange(_)
@@ -595,6 +600,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::FleetState(_)
         | TelemetryRecord::PickDecision(_)
         | TelemetryRecord::OperatorPresence(_)
+        | TelemetryRecord::DispatchEligibility(_)
         | TelemetryRecord::CheckoutFreshness(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
@@ -608,6 +614,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the body). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
+                .or_else(|| alert_transition::log_parts(r))
                 .or_else(|| token_ranking::log_parts(r))
                 .or_else(|| host_export::log_parts(r))
                 .or_else(|| checkout_external_change::log_parts(r))
@@ -616,6 +623,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))
                 .or_else(|| operator_presence::log_parts(r))
+                .or_else(|| dispatch_eligibility::log_parts(r))
                 .or_else(|| checkout_freshness::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
@@ -628,6 +636,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::MergeQueueEvent(_)
         | TelemetryRecord::HoldTransition(_)
         | TelemetryRecord::MergeQueueObserved(_)
+        | TelemetryRecord::MergeQueueRegime(_)
         | TelemetryRecord::DaemonExit(_)
         | TelemetryRecord::RunStateRequest(_)
         | TelemetryRecord::ScopeMemory(_)
@@ -651,7 +660,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| write_scope_refused::log_parts(r))
                 .or_else(|| merge_queue_event::log_parts(r))
                 .or_else(|| hold_transition::log_parts(r))
-                .or_else(|| merge_queue_observed::log_parts(r))?;
+                .or_else(|| merge_queue_observed::log_parts(r))
+                .or_else(|| merge_queue_regime::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
@@ -701,7 +711,13 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         severity_number: severity as i32,
         severity_text: severity_text(severity).to_string(),
         body: Some(any_string(body_override.unwrap_or_else(|| event_name.to_string()))),
-        attributes: metadata::bounded(attributes),
+        // #12806: `alert.*` values are fitted to loom-ui's schema limits,
+        // which are wider than the generic bound.
+        attributes: if matches!(envelope.record, TelemetryRecord::AlertTransition(_)) {
+            alert_transition::bounded(attributes)
+        } else {
+            metadata::bounded(attributes)
+        },
         event_name: event_name.to_string(),
         trace_id: envelope
             .trace_context
@@ -1050,6 +1066,8 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     ));
                 }
             }
+            // #12811: the fleet-state fields that rode only `/ingest`.
+            samples.extend(host_health::samples(r, time_unix_nano));
             samples
         }
         TelemetryRecord::TokensSnapshot(r) => tokens_snapshot::samples(r, time_unix_nano),

@@ -173,9 +173,6 @@ pub struct Held {
     pub by: Option<String>,
     /// The non-empty `reason="…"`.
     pub reason: String,
-    /// `at=` as written, if any: [`hold::documents_current_block`] compares it
-    /// to the latest `loom:blocked` application.
-    pub at: Option<String>,
 }
 
 /// A cross-repo park-record blocker with its live state (#10443).

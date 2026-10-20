@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Plan with no stalled PRs: the deterministic spelling of the live pass.
+fn plan_repo(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+) -> Vec<SequenceGroup> {
+    plan_repo_with(open_prs, files, markers, &BTreeSet::new())
+}
+
 /// An open, Judge-approved PR. Approved by default: these fixtures exercise
 /// grouping and constraints, and since #10371 no hold is planned behind a
 /// predecessor without `loom:pr` (`merge_sequence_ready_tests.rs` covers that).
@@ -556,7 +565,7 @@ fn a_new_pr_chains_behind_a_held_predecessor() {
     assert_eq!(groups.len(), 1, "{groups:?}");
     let g = &groups[0];
     // The held #1 participates in the order (its marker points out-of-group,
-    // which order_component ignores; it is still a group member and lands
+    // which order_component_with ignores; it is still a group member and lands
     // first by age), and the fresh #2 is planned after it.
     assert_eq!(g.order, vec![1, 2], "{g:?}");
     assert_eq!(g.edges.len(), 1);

@@ -110,6 +110,7 @@ pub mod collector;
 pub mod daemon_event;
 pub mod daemon_exit;
 pub mod daemon_lifecycle;
+pub mod dispatch_eligibility;
 pub mod endpoint_policy;
 pub mod exporter;
 pub mod hold_transition;
@@ -157,8 +158,7 @@ use ingest_key::{entry_needs_key, resolve_for_planned, PlannedKey, NOT_CONFIGURE
 use queue::DurableQueue;
 
 // The ingest-key resolution lives in `ingest_key`; the `pub use` keeps the
-// pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working
-// for `loom_ui_alerts`.
+// pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working.
 pub use ingest_key::resolve_ingest_key_file;
 
 /// `observability.enabled` env override.
@@ -1272,6 +1272,10 @@ pub fn spawn_task(
     // start an exporter, least of all the managed HTTPS one.
     session_output::register_sink(otlp_queues.clone(), &host_id);
     ops_handles.extend(session_output::spawn_task(bus, workspace_root.clone()));
+    // `eta.dispatch_eligibility` (#12790): the dispatcher's schedulability
+    // decision per waiting ready item, OTLP-only, sampled by the collector
+    // below on the same cadence as `queue.snapshot`.
+    dispatch_eligibility::register_sink(otlp_queues.clone(), &host_id);
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.
@@ -1298,6 +1302,12 @@ pub fn spawn_task(
     // `daemon_event`'s module doc for why it is a separate subscriber rather
     // than folded into `collector`.
     let daemon_event_handle = daemon_event::spawn_task(bus, fanout.clone(), host_id.clone());
+    // Host shape (#12874): a one-shot IMDSv2 probe for `host.type` /
+    // `cloud.*` on the resource. Spawned and never awaited — startup is not
+    // delayed, and batches exported before it lands just lack the keys.
+    // Linux only: fleet EC2 hosts are Linux; a Mac reads `hw.model` instead.
+    #[cfg(target_os = "linux")]
+    crate::host_shape::spawn_imds_probe();
     let collector_handle = collector::spawn_task(
         bus,
         fanout,

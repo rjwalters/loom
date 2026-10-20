@@ -29,7 +29,6 @@ pub(super) fn log_parts(
         kv_int("loom.host_export.exporters", to_i64(r.exporters.len() as u64)),
         kv_int("loom.host_export.queue_depth", to_i64(r.queue_depth_sum())),
         kv_int("loom.host_export.dropped_total", to_i64(r.dropped_total_sum())),
-        kv_int("loom.host_export.fact_id_missing_total", to_i64(r.fact_id_missing_total)),
         kv_string("host.lease_id", opaque_host_id(&r.host)),
     ];
     if let Some(at) = r.last_flush_ok_at() {
@@ -66,20 +65,15 @@ mod tests {
                 dropped_by_reason: [("status_400".to_string(), 7)].into(),
                 last_flush_ok_at: Some(chrono::Utc::now()),
             }],
-            fact_id_missing_total: 3,
         });
         let (_, _, _, attributes, body) = log_parts(&record).unwrap();
         assert!(body.contains("\"dropped_total\":7"), "{body}");
-        assert!(body.contains("\"fact_id_missing_total\":3"), "{body}");
+        assert!(!body.contains("fact_id_missing_total"), "{body}");
         assert!(
             attributes
                 .iter()
-                .any(|kv| kv.key == "loom.host_export.fact_id_missing_total"
-                    && kv.value.as_ref().and_then(|v| v.value.as_ref())
-                        == Some(
-                            &opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(3)
-                        )),
-            "the count rides as an attribute"
+                .all(|kv| kv.key != "loom.host_export.fact_id_missing_total"),
+            "the retired counter is no longer exported"
         );
         for kv in &attributes {
             assert!(HOST_EXPORT_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str()), "{}", kv.key);
@@ -102,7 +96,6 @@ mod tests {
             captured_at: chrono::Utc::now(),
             host: "host-a".to_string(),
             exporters: vec![],
-            fact_id_missing_total: 0,
         });
         let (_, _, _, attributes, _) = log_parts(&record).unwrap();
         let lease_id = attributes

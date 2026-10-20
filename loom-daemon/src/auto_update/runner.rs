@@ -326,7 +326,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         summary.floor_alerted,
         floor_was_alerted,
     ) {
-        crate::loom_ui_alerts::post(alert);
+        crate::alerts::post(alert);
     }
     if let Some(stall) = state.floor.stall() {
         if summary.floor_alerted {

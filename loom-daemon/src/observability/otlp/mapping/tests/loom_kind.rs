@@ -140,6 +140,13 @@ fn samples() -> Vec<TelemetryRecord> {
         wire(json!({"kind": "roster.change", "name": "repo", "action": "register",
                     "host": "host-a", "at": AT, "loom": p})),
         TelemetryRecord::PickDecision(pick_decision()),
+        wire(json!({"kind": "eta.dispatch_eligibility", "schema_version": 1,
+                    "repo": "rjwalters/loom", "issue": 7, "host": "host-a",
+                    "eligibility": "eligible", "reason": "deferred_capacity",
+                    "state": "ready", "block_start": AT, "transition": "changed",
+                    "rank": 1, "eligible_work_ahead": 0, "eligible_work_ahead_repo": 0,
+                    "resource_pool": "rjwalters/loom", "max_concurrent": 2,
+                    "level": "default", "sampled_at": AT, "tick_at": AT})),
         wire(json!({"kind": "pr.resolved", "repo": "rjwalters/loom", "pr_number": 1,
                     "state": "merged", "resolved_at": AT, "observed_at": AT,
                     "resolution_sec": 0, "loom": p})),
@@ -171,6 +178,8 @@ fn samples() -> Vec<TelemetryRecord> {
                     "at": AT, "loom": p})),
         wire(json!({"kind": "merge.queue.observed", "state": "observed", "complete": true,
                     "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "merge.queue.regime", "ambiguous": false,
+                    "observed_at": AT, "loom": p})),
         wire(json!({"kind": "daemon.exit", "exit_code": 143, "requested_by": "unknown",
                     "relaunch_expected": false, "supervisor": "systemd",
                     "in_flight_sweeps": [], "in_flight_fate": "die_with_cgroup",
@@ -184,6 +193,9 @@ fn samples() -> Vec<TelemetryRecord> {
                     "workspace": "loom", "role": "builder", "limit_source": "none",
                     "peak_bytes": 1, "events_max": 0, "oom_kills": 0, "clipped": false,
                     "observed_at": AT, "loom": p})),
+        wire(json!({"kind": "alert.transition", "source": "host-a", "rule": "daemon.down",
+                    "key": "loom-daemon", "state": "open", "severity": "critical",
+                    "title": "down", "observed_at": AT})),
     ]
 }
 

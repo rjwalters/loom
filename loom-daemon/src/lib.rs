@@ -136,6 +136,8 @@ pub mod activity;
 pub mod agent_gh;
 pub mod agent_session;
 pub mod agent_skills;
+/// Alert transitions as `alert.transition` OTLP log records (#11295, #12806).
+pub mod alerts;
 pub mod api_keys_pool;
 pub mod auto_update;
 pub mod autonomy_marker;
@@ -213,7 +215,6 @@ pub mod forge_create_issue;
 pub mod forge_denial;
 pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
-pub mod forge_events;
 pub mod forge_gateway;
 pub mod forge_host;
 pub mod forge_identity;
@@ -254,6 +255,7 @@ pub mod host_affinity;
 pub mod host_identity;
 pub mod host_optout;
 pub mod host_pressure;
+pub mod host_shape;
 pub mod host_status;
 pub mod hyperparams;
 pub mod idle_exit;
@@ -283,7 +285,6 @@ pub mod live_claim;
 /// run on any spawn of the real `gh` (#10138).
 #[cfg(test)]
 mod live_gh_guard;
-pub mod loom_ui_alerts;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_group_ci;
@@ -295,6 +296,9 @@ pub mod opencode_usage;
 pub mod operator_decision;
 pub mod operator_stop;
 pub mod orphan_process_reaper;
+/// Replacement PRs for a stacked child orphaned in a merge-mode repository
+/// (#12767): the git half and the decisions, driven by Doctor.
+pub mod orphan_replace;
 pub mod overlap_replay;
 pub mod parent_link;
 pub mod park_record;
@@ -314,6 +318,7 @@ pub mod primary_checkout_reaper;
 pub mod priority_pick;
 pub mod private_control_gate;
 pub mod proc_exec;
+pub mod promotion_author;
 pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
@@ -372,6 +377,10 @@ pub mod session_reconcile;
 pub mod session_status;
 pub mod short_hash;
 pub mod signoz_read;
+/// `stack-parent`: the open PR a Builder's conflicting work stacks on (#12759).
+pub mod stack_parent;
+/// `stacking.onConflict` accessor: the conflict-stacking switch and depth cap (#12758).
+pub mod stacking_config;
 pub mod stale_blocked;
 pub(crate) mod stale_token_retry;
 pub mod startup_adoption;

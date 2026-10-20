@@ -383,6 +383,39 @@ fn an_issue_curator_kept_after_this_landing_is_dispatchable() {
     assert!(forge.writes.is_empty(), "{:?}", forge.writes);
 }
 
+/// #12713: the router's own marker is not a Curator decision. While
+/// `loom:triage` is still on the issue (a no-op Builder put `loom:issue`
+/// back beside it) the landing stays landed, on this host (handed) and on a
+/// peer (marker read), and `lift` does not release the cooldown.
+#[test]
+fn a_marker_with_loom_triage_still_on_is_not_a_curator_keep() {
+    // Peer host: marker on the forge, triage present.
+    let mut forge = FakeForge::default().with_labels(5, &["loom:issue", "loom:triage"]);
+    forge.graph.insert(5, Some(40));
+    forge.marked.insert((5, 40));
+    let mut cache = LandedCache::default();
+    let now = Instant::now();
+    assert_eq!(detect(&mut forge, &mut cache, &[5], &[], now), HashMap::from([(5, 40)]));
+    assert!(forge.writes.is_empty(), "{:?}", forge.writes);
+
+    // This host: routed, then the Builder release re-adds loom:issue.
+    let mut forge = FakeForge::default().with_labels(6, &["loom:issue"]);
+    forge.graph.insert(6, Some(40));
+    let mut cache = LandedCache::default();
+    assert_eq!(detect(&mut forge, &mut cache, &[6], &[], now), HashMap::from([(6, 40)]));
+    forge
+        .labels
+        .insert(6, vec!["loom:issue".into(), "loom:triage".into()]);
+    assert!(lift(&mut forge, &mut cache, &[6], now).is_empty(), "no Curator action yet");
+    assert_eq!(cache.landed(6), Some(40));
+
+    // Curator removes loom:triage after the marker: now it is kept.
+    forge
+        .labels
+        .insert(6, vec!["loom:issue".into(), "loom:curated".into()]);
+    assert_eq!(lift(&mut forge, &mut cache, &[6], now + LANDED_RECHECK), vec![6]);
+}
+
 /// #11901 case 1: a kept issue is not kept forever. A second closing PR that
 /// merges while the issue stays open is a new landing: routed and landed,
 /// whether it is seen on the stale re-ask or the tick its open PR merges.

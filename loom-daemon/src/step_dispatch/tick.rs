@@ -49,10 +49,16 @@
 //! (`loom.dispatch.budget`), so a tick with free slots and few attempts names
 //! its limit.
 //!
-//! A **captain refusal** (#12450, fleet dispatch on): `captain_held` is a
-//! cheap pass like a lost claim, made with no forge call; `captain_cap` ends
+//! A **captain refusal** (#12450, fleet dispatch on): `captain_held` and
+//! `captain_cooldown` (the no-progress hold, #12581) are cheap passes made
+//! with no forge call. They draw on their own bound,
+//! [`MAX_FREE_CAPTAIN_REFUSALS_PER_TICK`], not on the lost-claim one (#12700):
+//! the captain's highest-weight cooled-down items are drawn first every tick,
+//! and spending passes on them ended every tick at `pass_limit` with its
+//! slots empty. `captain_cap` ends
 //! the tick's draws, since the captain would refuse every later claim the
-//! same way. In fleet-dispatch fallback ([`StepTickLimits::fallback`]) no
+//! same way; only an older captain sends it, since #12864 the captain
+//! applies no capacity limit and the worker's own budget is the only one. In fleet-dispatch fallback ([`StepTickLimits::fallback`]) no
 //! loss is free.
 //!
 //! An **unverifiable claim** ([`REFUSAL_CLAIM_UNVERIFIED`]) is the exception
@@ -81,6 +87,7 @@ use crate::telemetry::kinds::pick_decision::{PickItemExclusion, PickSkipReason};
 use crate::types::QueueDisposition as Qd;
 use crate::work_finder::ready_queue::TickQueueRow;
 use crate::work_finder::step_item::{Lane, PassReason};
+use crate::work_finder::RepoDepth;
 use crate::work_finder::{PriorityCandidate, TickReport};
 
 /// At most this many item draws fill one slot (design §4.2 step 4).
@@ -94,6 +101,13 @@ pub const MAX_PASSES_PER_TICK: u32 = 32;
 /// `MAX_FREE_CLAIM_LOST_PER_TICK` refusals) while each loss still costs a
 /// claim subprocess.
 pub const MAX_FREE_CLAIM_LOST_PER_TICK: u32 = 16;
+/// At most this many captain refusals (`captain_held`, `captain_cooldown`) in
+/// one tick are free (#12700): they spend no pass and no slot draw. Unlike a
+/// lost claim, a captain refusal makes no forge call (one RPC to the
+/// captain), so its bound is separate and larger; the lost-claim bound, and
+/// the writer reads behind it, are unchanged. Draws stay without
+/// replacement, so a tick also stops when its pool drains.
+pub const MAX_FREE_CAPTAIN_REFUSALS_PER_TICK: u32 = 128;
 /// The reason a second Champion merge in one repo is held back (design §6):
 /// the queue row's detail. Since #12494 it is not a pass: the item leaves the
 /// pool before the draw ([`exclude_claimed`], [`ItemDraw::close_steps`]).
@@ -135,8 +149,13 @@ pub const REFUSAL_CLAIM_LOST: &str = "claim_lost";
 /// The fleet-dispatch server's refusal of an item another host holds
 /// (#12450): a cheap pass like [`REFUSAL_CLAIM_LOST`], and no forge call ran.
 pub const REFUSAL_CAPTAIN_HELD: &str = "captain_held";
+/// The fleet-dispatch server's refusal of an item under the no-progress
+/// hold (#12541, #12581): a cheap pass like [`REFUSAL_CAPTAIN_HELD`] (#12700).
+pub const REFUSAL_CAPTAIN_COOLDOWN: &str = "captain_cooldown";
 /// The fleet-dispatch server's refusal of a host at its cap (#12450): every
 /// later claim this tick would be refused the same way, so the draw ends.
+/// The captain no longer sends it (#12864); kept for an older captain in a
+/// mixed-version fleet.
 pub const REFUSAL_CAPTAIN_CAP: &str = "captain_cap";
 
 /// Why a tick's draw loop stopped (#12410): the tick span's
@@ -158,7 +177,8 @@ pub enum TickStop {
     SpawnHold,
     /// The fleet-dispatch captain refused a claim with `cap` (#12450): this
     /// host is at its fleet cap, so every repo left the draw. Without its own
-    /// stop the tick would read `pool_drained`, which it was not.
+    /// stop the tick would read `pool_drained`, which it was not. Only an
+    /// older captain sends `cap`; since #12864 the captain never does.
     CaptainCap,
     /// The pool's total weight overflowed ([`DrawError::WeightOverflow`]).
     WeightOverflow,
@@ -307,9 +327,12 @@ pub fn disposition_of(reason: &str) -> Qd {
         // #12105: a Doctor standing down on another actor's work
         // (`peer_active`), or a step held by the Judge no-verdict backstop
         // (`backstop_hold`), is someone else's claim, not a dispatch error.
-        "claimed" | "claim_lost" | "peer_active" | "backstop_hold" | REFUSAL_CAPTAIN_HELD => {
-            Qd::PeerClaim
-        }
+        "claimed"
+        | "claim_lost"
+        | "peer_active"
+        | "backstop_hold"
+        | REFUSAL_CAPTAIN_HELD
+        | REFUSAL_CAPTAIN_COOLDOWN => Qd::PeerClaim,
         "captain_not_eligible" => Qd::HostConstraint,
         REFUSAL_CAPTAIN_CAP | "captain_grace" | "captain_refused" => Qd::DeferredCapacity,
         "pool_exhausted"
@@ -324,6 +347,24 @@ pub fn disposition_of(reason: &str) -> Qd {
         PASS_MERGE => Qd::PeerClaim,
         _ => Qd::DispatchError,
     }
+}
+
+/// `ws`'s drawable pool by step and its exclusions by reason (#12734). A
+/// held workspace draws nothing, so its pool is empty. Pure.
+fn repo_depth(ws: &StepWorkspace) -> RepoDepth {
+    let mut depth = RepoDepth {
+        repo: ws.repo.clone(),
+        ..RepoDepth::default()
+    };
+    if !ws.halted {
+        for c in &ws.weighing.pool {
+            *depth.pool.entry(c.step.as_str()).or_default() += 1;
+        }
+    }
+    for (reason, &n) in &ws.weighing.excluded {
+        *depth.excluded.entry(reason.as_str()).or_default() += n;
+    }
+    depth
 }
 
 /// Take out of `w`'s pool every item `claims` names (this host's live runs
@@ -476,6 +517,7 @@ pub fn run(
             .copied()
             .unwrap_or(0);
         report.seen += ws.weighing.pool.len() + ws.weighing.excluded.values().sum::<usize>();
+        report.depth.push(repo_depth(ws));
         report
             .vi_demotions
             .extend(ws.weighing.demotions.iter().cloned());
@@ -535,10 +577,12 @@ pub fn run(
     // (that would change the pool, and its replay) but carried to the
     // head of the next round.
     let concurrency = limits.spawn_concurrency.max(1);
-    // Each open slot's draws and, of those, the free `claim_lost` ones, in
+    // Each open slot's draws and, of those, the free ones (`claim_lost` and
+    // captain refusals), in
     // the order the slots opened.
     let mut open: Vec<(u32, u32)> = Vec::new();
     let mut free_losses = 0u32;
+    let mut free_captain = 0u32;
     let mut captain_capped = false;
     let mut gave_up = 0usize;
     let mut opened = 0usize;
@@ -558,7 +602,7 @@ pub fn run(
                 if passes >= MAX_PASSES_PER_TICK {
                     break 'slots;
                 }
-                // A free `claim_lost` does not count toward the slot's draws.
+                // A free refusal does not count toward the slot's draws.
                 if attempts.saturating_sub(*free) >= MAX_DRAWS_PER_SLOT {
                     done.insert(slot);
                     gave_up += 1;
@@ -715,9 +759,20 @@ pub fn run(
                     // already left the pool and the slot redraws next round
                     // without spending a pass or one of its draws.
                     // In fleet-dispatch fallback no loss is free (#12450).
-                    let lost = reason == REFUSAL_CLAIM_LOST || reason == REFUSAL_CAPTAIN_HELD;
-                    if lost && !limits.fallback && free_losses < MAX_FREE_CLAIM_LOST_PER_TICK {
-                        free_losses += 1;
+                    // A captain refusal is cheaper still (#12700): no forge
+                    // call, so it has its own, larger bound.
+                    let captain =
+                        reason == REFUSAL_CAPTAIN_HELD || reason == REFUSAL_CAPTAIN_COOLDOWN;
+                    let (spent, bound) = if captain {
+                        (&mut free_captain, MAX_FREE_CAPTAIN_REFUSALS_PER_TICK)
+                    } else {
+                        (&mut free_losses, MAX_FREE_CLAIM_LOST_PER_TICK)
+                    };
+                    let free_pass = !limits.fallback
+                        && (captain || reason == REFUSAL_CLAIM_LOST)
+                        && *spent < bound;
+                    if free_pass {
+                        *spent += 1;
                         if let Some((_, free)) = open.get_mut(p.slot) {
                             *free += 1;
                         }

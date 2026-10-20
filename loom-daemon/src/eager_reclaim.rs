@@ -736,6 +736,7 @@ mod tests {
             },
             deferred: None,
             reclaimed: Vec::new(),
+            kept: Vec::new(),
             free_gb: Some(99),
             at: now,
         }
