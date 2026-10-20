@@ -18,21 +18,12 @@
 //! `loom.session.output.sequence`; `loom.session.output.event_id` is the pure
 //! function of the two that survives a producer restart unchanged.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv, kv_int, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::kinds::session_output::{Coverage, OutputCategory, SessionOutputRecord};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 /// A record a consumer must not present as healthy live output is raised above
 /// `Info` so an alert can key on severity alone: a lost-events gap is an

@@ -58,14 +58,10 @@ fn off_by_default() {
 
 #[test]
 fn config_precedence_is_env_over_block_over_default() {
-    let block =
-        serde_json::json!({"enabled": true, "ttlSecs": 60, "graceSecs": 5, "contextCapBytes": 9});
+    let block = serde_json::json!({"enabled": true, "ttlSecs": 60, "contextCapBytes": 9});
     let c = Config::from_parts(Some(&block), None);
     assert!(c.enabled);
-    assert_eq!(
-        (c.ttl, c.grace, c.context_cap),
-        (Duration::from_secs(60), Duration::from_secs(5), 9)
-    );
+    assert_eq!((c.ttl, c.context_cap), (Duration::from_secs(60), 9));
     assert!(!Config::from_parts(Some(&block), Some("0")).enabled);
     assert!(Config::from_parts(None, Some("true")).enabled);
     assert!(!Config::from_parts(None, None).enabled);
@@ -154,24 +150,6 @@ fn ttl_cap_host_and_store_each_force_a_fresh_step_with_a_handoff() {
         reason(&run(&l, StepRole::Judge, 5, &cfg, false)),
         Some(FreshReason::StoreUnreachable)
     );
-}
-
-#[test]
-fn an_unavailable_holder_never_blocks_eligibility_past_the_grace_window() {
-    let cfg = on();
-    let held = record(7, StepRole::Judge, "host-b", 0, 10);
-    // Inside the 10 min grace the step still waits for the holder.
-    assert_eq!(affinity_wait(&held, at(4), HOST, &cfg), Duration::from_secs(6 * 60));
-    // At and past it the wait is zero: the step is eligible and runs fresh.
-    assert_eq!(affinity_wait(&held, at(10), HOST, &cfg), Duration::ZERO);
-    assert_eq!(affinity_wait(&held, at(500), HOST, &cfg), Duration::ZERO);
-    let l = ledger(vec![held]);
-    assert_eq!(reason(&run(&l, StepRole::Judge, 500, &cfg, true)), Some(FreshReason::OtherHost));
-    // The holder's own host never waits; neither does a disabled ledger.
-    let mine = record(7, StepRole::Judge, HOST, 0, 10);
-    assert_eq!(affinity_wait(&mine, at(1), HOST, &cfg), Duration::ZERO);
-    let theirs = record(7, StepRole::Judge, "host-b", 0, 10);
-    assert_eq!(affinity_wait(&theirs, at(1), HOST, &Config::default()), Duration::ZERO);
 }
 
 #[test]

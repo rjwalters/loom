@@ -768,6 +768,127 @@ fn a_lease_that_never_reads_back_refuses_the_builder_claim() {
     );
 }
 
+// ---- #12822: a refused Builder claim rolls back what it wrote -------------
+
+/// The refusal's `loom.dispatch.claim_rollback` token.
+fn rollback_of(refusal: &StepRefusal) -> Option<&'static str> {
+    refusal.claim.as_deref().and_then(|c| c.rollback)
+}
+
+/// The fake forge's stored comment bodies (first lines).
+fn stored_comments(store: &Path) -> String {
+    std::fs::read_to_string(store).unwrap_or_default()
+}
+
+fn gh_edit_calls(ws: &Path) -> String {
+    std::fs::read_to_string(ws.join("gh-invocations.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("issue edit"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Behind a peer's lease the step yields its own lease and leaves the peer's
+/// lease and the label (the winner's claim) alone.
+#[test]
+#[serial]
+fn a_claim_lost_builder_yields_its_own_lease_and_keeps_the_peers_label() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _, _, store) = crate::sweep_registry::test_support::lease_order_dispatch_registry(
+        dir.path(),
+        &[PEER_LEASE],
+    );
+    let refusal = builder_claim(&mut reg, "step-builder-1-1").unwrap_err();
+    assert_eq!(refusal.reason, "claim_lost");
+    assert_eq!(rollback_of(&refusal), Some("lease_yielded"));
+    let comments = stored_comments(&store);
+    assert!(
+        comments.contains("loom:lease-yield host=") && comments.contains("sweep=step-builder-1-1"),
+        "{comments}"
+    );
+    assert!(comments.contains("earliest_sweep=sweep-peer"), "{comments}");
+    assert!(comments.contains(PEER_LEASE), "the peer's lease is untouched: {comments}");
+    assert!(
+        !gh_edit_calls(dir.path()).contains("--remove-label loom:building"),
+        "the winner's label stays: {}",
+        gh_edit_calls(dir.path())
+    );
+}
+
+/// An unreadable order yields the step's lease and, failing closed, leaves
+/// the label.
+#[test]
+#[serial]
+fn an_unverified_builder_claim_yields_its_lease_and_keeps_the_label() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _, _, store) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    break_gh_arm(dir.path(), COMMENT_READ_ARM);
+    let refusal = builder_claim(&mut reg, "step-builder-1-1").unwrap_err();
+    assert_eq!(refusal.reason, "claim_unverified");
+    assert_eq!(rollback_of(&refusal), Some("lease_yielded"));
+    assert!(stored_comments(&store).contains("loom:lease-yield host="));
+    assert!(!gh_edit_calls(dir.path()).contains("--remove-label loom:building"));
+}
+
+/// A lease that could not be written has nothing to yield; with no peer lease
+/// live the label this step flipped is restored.
+#[test]
+#[serial]
+fn an_unwritable_builder_lease_restores_the_label_when_no_peer_is_live() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(dir.path(), &[]);
+    break_gh_arm(dir.path(), COMMENT_WRITE_ARM);
+    let refusal = builder_claim(&mut reg, "step-builder-1-1").unwrap_err();
+    assert_eq!(refusal.reason, "claim_unverified");
+    assert_eq!(rollback_of(&refusal), Some("label_restored"));
+    assert!(gh_edit_calls(dir.path()).contains("--remove-label loom:building"));
+}
+
+/// The same unwritable lease behind a live peer lease keeps the label.
+#[test]
+#[serial]
+fn an_unwritable_builder_lease_keeps_the_label_behind_a_peer() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) = crate::sweep_registry::test_support::lease_order_dispatch_registry(
+        dir.path(),
+        &[PEER_LEASE],
+    );
+    break_gh_arm(dir.path(), COMMENT_WRITE_ARM);
+    let refusal = builder_claim(&mut reg, "step-builder-1-1").unwrap_err();
+    assert_eq!(rollback_of(&refusal), Some("none"));
+    assert!(!gh_edit_calls(dir.path()).contains("--remove-label loom:building"));
+}
+
+/// A yield that cannot be posted is recorded `failed`; the refusal is still
+/// the original one.
+#[test]
+#[serial]
+fn a_failed_rollback_still_returns_the_original_refusal() {
+    let dir = tempdir().unwrap();
+    let (mut reg, ..) = crate::sweep_registry::test_support::lease_order_dispatch_registry(
+        dir.path(),
+        &[PEER_LEASE],
+    );
+    // The lease write succeeds; the yield (the next comment write) fails.
+    let fake = dir.path().join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    std::fs::write(
+        &fake,
+        script.replacen(
+            COMMENT_WRITE_ARM,
+            &format!("{COMMENT_WRITE_ARM}if [[ \"$*\" == *lease-yield* ]]; then exit 1; fi\n"),
+            1,
+        ),
+    )
+    .unwrap();
+    let refusal = builder_claim(&mut reg, "step-builder-1-1").unwrap_err();
+    assert_eq!(refusal.reason, "claim_lost");
+    assert_eq!(rollback_of(&refusal), Some("failed"));
+}
+
 // ---- #12450: the captain's claim ------------------------------------------
 
 mod captain {
@@ -1001,4 +1122,16 @@ fn a_ci_pending_noop_line_releases_as_ci_wait() {
     assert_eq!(rel(&line("noop", "already_judged")), "noop");
     assert_eq!(rel(&line("verdict", "approved")), "verdict");
     assert_eq!(rel(&line("failed", "ci_pending")), "failed");
+}
+
+/// #12729: a Champion `requeued` holds as `ci_wait` whatever gate requeued it;
+/// a `skipped` stop stays on the no-progress ladder.
+#[test]
+fn a_champion_requeued_noop_line_releases_as_ci_wait_for_any_gate() {
+    let rel = |l: &str| release_class_of_line(&parse_outcome_line(l).unwrap());
+    let line = |reason: &str| {
+        format!("LOOM_STEP_OUTCOME role=champion target=7 class=noop reason={reason}")
+    };
+    assert_eq!(rel(&line("requeued")), "ci_wait");
+    assert_eq!(rel(&line("skipped")), "noop");
 }

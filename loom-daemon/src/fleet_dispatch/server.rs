@@ -27,26 +27,32 @@
 //! roster from its [`RosterSource`] on [`Options::roster_reload`], keeping the
 //! last good roster when a reload fails.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
+use crate::discovery::mirror::TickWorklist;
+
 use super::identity::{Identity, IdentityError};
 use super::proto::{
-    AckResponse, ClaimRequest, ClaimResponse, ErrorResponse, HeartbeatRequest, HeartbeatResponse,
-    RefusalReason, RefuseRequest, ReleaseRequest, CLAIM_PATH, HEARTBEAT_PATH, PATHS, REFUSE_PATH,
-    RELEASE_PATH,
+    AckResponse, Assignment, ClaimRequest, ClaimResponse, ErrorResponse, HeartbeatRequest,
+    HeartbeatResponse, NextRequest, NextResponse, RefusalReason, RefuseRequest, ReleaseRequest,
+    CLAIM_PATH, HEARTBEAT_PATH, NEXT_PATH, PATHS, REFUSE_PATH, RELEASE_PATH,
 };
+use super::queue::{Queue, DEFAULT_REFRESH_SECS};
 use super::roster::{Roster, RosterSource};
-use super::table::{ClaimDecision, Mono, Policy, RefuseOutcome, Table};
-use super::telemetry::{self, Call, Counters};
+use super::table::{ClaimDecision, ExpiredAssignment, Mono, Policy, RefuseOutcome, Table};
+use super::telemetry::{self, Call, Counters, HoldFacts};
+use crate::telemetry::ops::MetricPoint;
 
 /// The span reason of a claim refused `held` by a no-progress hold
 /// ([`super::table`], #12541). On the wire it is [`RefusalReason::Cooldown`]
@@ -124,6 +130,7 @@ pub struct Server<I: Identity> {
     epoch: String,
     roster: RwLock<Arc<Roster>>,
     table: Mutex<Table>,
+    queue: Mutex<Queue>,
     counters: Mutex<Counters>,
     seq: AtomicU64,
 }
@@ -145,9 +152,68 @@ impl<I: Identity> Server<I> {
             epoch,
             roster: RwLock::new(Arc::new(roster)),
             table: Mutex::new(table),
+            queue: Mutex::new(Queue::new(Duration::from_secs(DEFAULT_REFRESH_SECS))),
             counters: Mutex::new(Counters::default()),
             seq: AtomicU64::new(0),
         }
+    }
+
+    /// Set the full-refresh period (`fleetDispatch.queueRefreshSecs`).
+    pub fn set_queue_refresh(&self, refresh: Duration) {
+        self.queue().set_refresh(refresh);
+    }
+
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Feed the queue one worklist read. `changed` names the repos a change
+    /// prompted a re-read of; `None` is the full refresh (a `304` then only
+    /// advances the age). On a change-driven re-read, a repo the worklist lists
+    /// but cannot vouch for keeps its entries, and one it omits leaves the
+    /// queue; a full refresh drops any repo the worklist cannot vouch for.
+    pub fn feed_queue(&self, tick: &TickWorklist, changed: Option<&BTreeSet<String>>) {
+        let now = self.clock.now();
+        let wall = chrono::Utc::now();
+        let mut queue = self.queue();
+        if tick.error_class().is_some() {
+            return;
+        }
+        match changed {
+            None if tick.outcome() == "not_modified" => queue.not_modified(now),
+            None => {
+                let snaps: Vec<_> = tick
+                    .slugs()
+                    .iter()
+                    .filter_map(|s| tick.repo(s, wall).ok())
+                    .collect();
+                queue.refresh_all(now, snaps.iter().map(AsRef::as_ref));
+            }
+            Some(repos) => {
+                let listed: BTreeSet<String> = tick.slugs().into_iter().collect();
+                for repo in repos {
+                    match tick.repo(repo, wall) {
+                        Ok(snap) => queue.refresh_repos([snap.as_ref()]),
+                        Err(_) if !listed.contains(repo) => queue.drop_repo(repo),
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the queue's full refresh is due.
+    #[must_use]
+    pub fn queue_refresh_due(&self) -> bool {
+        self.queue().refresh_due(self.clock.now())
+    }
+
+    /// Entries the queue holds.
+    #[must_use]
+    pub fn queue_len(&self) -> usize {
+        self.queue().len()
     }
 
     /// This process's epoch.
@@ -186,20 +252,61 @@ impl<I: Identity> Server<I> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expired = table.expire(now);
         counters.expired(expired);
-        f(&mut table, now, &mut counters)
+        let out = f(&mut table, now, &mut counters);
+        // After `f`: a claim inside it expires rows first, and they are
+        // reported here too.
+        let rows = table.take_expired();
+        drop(counters);
+        drop(table);
+        for row in &rows {
+            self.report_expired(row);
+        }
+        out
     }
 
-    /// Expire due rows and flush the counters as metric points.
+    /// Emit the captain's span for an assignment that expired (#12875):
+    /// `cause=lease_expired`, naming the host, repo, item, step and
+    /// assignment id.
+    fn report_expired(&self, row: &ExpiredAssignment) {
+        log::info!(
+            "fleet-dispatch: assignment {} ({} #{} {}) on {} expired",
+            row.assignment_id,
+            row.repo,
+            row.item,
+            row.step,
+            row.host.as_deref().unwrap_or("-")
+        );
+        let call = Call {
+            host: row.host.clone(),
+            endpoint: telemetry::EXPIRE_ENDPOINT.to_string(),
+            status: 0,
+            result: telemetry::RESULT_EXPIRED,
+            reason: Some(telemetry::CAUSE_LEASE_EXPIRED.to_string()),
+            server_epoch: self.epoch.clone(),
+            assignment_id: Some(row.assignment_id.clone()),
+            item: Some((row.repo.clone(), row.item, row.step.clone())),
+            ..Call::default()
+        };
+        telemetry::emit_call(&call, chrono::Utc::now(), self.next_seq());
+    }
+
+    /// Expire due rows, then flush the counters and the table's gauges
+    /// (#12873) as metric points, both read under the one table lock.
     pub fn sweep(&self) {
-        self.with_table(|_, _, _| ());
-        let points = self
-            .counters
-            .lock()
-            .map(|mut c| c.take_points())
-            .unwrap_or_default();
+        let points = self.sweep_points(Utc::now());
         if !points.is_empty() {
             crate::observability::ops::emit_metrics(points);
         }
+    }
+
+    /// [`Self::sweep`]'s points at wall-clock `wall_now`, after expiry.
+    pub fn sweep_points(&self, wall_now: DateTime<Utc>) -> Vec<MetricPoint> {
+        self.with_table(|table, now, counters| {
+            let mut points = counters.take_points();
+            let gauges = table.host_gauges(now, super::table::HEARTBEAT_FRESH);
+            points.extend(super::telemetry::gauge_points(&gauges, wall_now));
+            points
+        })
     }
 
     /// Resolve `peer` to its roster host id. `Err` is the reply to send.
@@ -241,6 +348,7 @@ impl<I: Identity> Server<I> {
             CLAIM_PATH => self.claim(host, body, &mut call),
             REFUSE_PATH => self.refuse(host, body, &mut call),
             RELEASE_PATH => self.release(host, body, &mut call),
+            NEXT_PATH => self.next(host, body, &mut call),
             _ => Err(self.error(404, "not found")),
         };
         let reply = reply.unwrap_or_else(|e| e);
@@ -277,13 +385,17 @@ impl<I: Identity> Server<I> {
     fn claim(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
         let req: ClaimRequest = self.parse(host, body)?;
         call.item = Some((req.repo.clone(), req.item, req.step.clone()));
-        let max = self.roster().max_concurrent(host);
         let decision = self.with_table(|t, now, counters| {
-            let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step, max);
+            let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step);
             if let ClaimDecision::Refused { reason, .. } = &mut d {
-                if cooled {
+                if let Some(hold) = cooled {
                     counters.claim_cooled();
                     call.reason = Some(NO_PROGRESS_REASON.to_string());
+                    call.hold = Some(HoldFacts {
+                        rung: hold.streak,
+                        set_by_outcome: hold.set_by_outcome,
+                        set_by_assignment_id: hold.set_by_assignment_id,
+                    });
                     *reason = RefusalReason::Cooldown;
                 } else {
                     counters.claim_refused(*reason);
@@ -295,18 +407,24 @@ impl<I: Identity> Server<I> {
             ClaimDecision::Granted {
                 assignment_id,
                 ttl_s,
+                lineage,
                 ..
             } => {
                 call.result = "granted";
                 call.assignment_id = Some(assignment_id.clone());
                 ClaimResponse::granted(&self.epoch, assignment_id, ttl_s)
+                    .with_lineage(lineage.as_ref())
             }
             ClaimDecision::Refused {
                 reason,
                 held_by,
+                holder_assignment_id,
                 retry_after_s,
             } => {
                 call.result = "refused";
+                call.held_by.clone_from(&held_by);
+                call.holder_assignment_id = holder_assignment_id;
+                call.retry_after_s = Some(retry_after_s);
                 if call.reason.is_none() {
                     call.reason = Some(reason.as_str().to_string());
                 }
@@ -314,6 +432,89 @@ impl<I: Identity> Server<I> {
             }
         };
         Ok(self.ok(&response))
+    }
+
+    /// Offer `host` up to `free_slots` items from the queue (#12817), granted
+    /// as a claim would be, in rounds of at most one item per repo (design
+    /// §7.4). An item that already has a row, a role outside the host's
+    /// `roles_ok`, or a refused claim (hold, cooldown, merge serialisation)
+    /// is skipped; the grace window answers empty. An empty list is an
+    /// answer, never an error.
+    fn next(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
+        let req: NextRequest = self.parse(host, body)?;
+        let (mut by_repo, age) = {
+            let queue = self.queue();
+            let mut by_repo: Vec<std::collections::VecDeque<_>> = Vec::new();
+            let mut repos: Vec<&str> = Vec::new();
+            for entry in queue.entries() {
+                match repos.iter().position(|r| *r == entry.repo) {
+                    Some(i) => by_repo[i].push_back(entry.clone()),
+                    None => {
+                        repos.push(&entry.repo);
+                        by_repo.push(std::iter::once(entry.clone()).collect());
+                    }
+                }
+            }
+            (by_repo, queue.age(self.clock.now()))
+        };
+        let slots = usize::try_from(req.free_slots).unwrap_or(usize::MAX);
+        let assignments = self.with_table(|t, now, counters| {
+            let mut out: Vec<Assignment> = Vec::new();
+            'rounds: while out.len() < slots {
+                let mut progressed = false;
+                for entries in &mut by_repo {
+                    if out.len() >= slots {
+                        break 'rounds;
+                    }
+                    while let Some(e) = entries.pop_front() {
+                        let step = e.step.as_str();
+                        let item = u64::from(e.item);
+                        if !req.roles_ok.iter().any(|r| r == e.step.role_name())
+                            || t.row(&e.repo, item).is_some()
+                        {
+                            continue;
+                        }
+                        match t.claim(now, host, &e.repo, item, step) {
+                            ClaimDecision::Granted {
+                                assignment_id,
+                                ttl_s,
+                                ..
+                            } => {
+                                out.push(Assignment {
+                                    assignment_id,
+                                    repo: e.repo.clone(),
+                                    item,
+                                    step: step.to_string(),
+                                    ttl_s,
+                                });
+                                progressed = true;
+                                break;
+                            }
+                            ClaimDecision::Refused {
+                                reason: RefusalReason::Grace,
+                                ..
+                            } => break 'rounds,
+                            ClaimDecision::Refused { reason, .. } => counters.claim_refused(reason),
+                        }
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            out
+        });
+        call.result = if assignments.is_empty() {
+            "ok"
+        } else {
+            "granted"
+        };
+        call.reason = assignments.is_empty().then(|| "empty".to_string());
+        Ok(self.ok(&NextResponse {
+            server_epoch: self.epoch.clone(),
+            queue_age_s: age.map(|a| a.as_secs()),
+            assignments,
+        }))
     }
 
     fn refuse(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
@@ -331,6 +532,15 @@ impl<I: Identity> Server<I> {
             }
             outcome
         });
+        if outcome != RefuseOutcome::Unknown {
+            if let Some((repo, item, _)) = &call.item {
+                // Only an accepted owner's refusal can suppress the candidate.
+                // Refreshing the same `updated_at` must not re-admit it (§10.3).
+                if let Ok(item) = u32::try_from(*item) {
+                    self.queue().tombstone(repo, item);
+                }
+            }
+        }
         Ok(self.ok(&AckResponse {
             server_epoch: self.epoch.clone(),
             known: outcome != RefuseOutcome::Unknown,
@@ -390,7 +600,7 @@ macro_rules! host_body {
         }
     )*};
 }
-host_body!(HeartbeatRequest, ClaimRequest, RefuseRequest, ReleaseRequest);
+host_body!(HeartbeatRequest, ClaimRequest, RefuseRequest, ReleaseRequest, NextRequest);
 
 /// A parsed request head.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -602,6 +812,130 @@ pub async fn run<I: Identity>(
             drop(permit);
         });
     }
+}
+
+/// Spawn the queue's feed (§10.1, §10.2): pull the change stream every
+/// `active.change_poll` and re-read the repos it names; every
+/// `queueRefreshSecs` re-read the whole worklist, ETag-conditionally. A
+/// failed pull or read leaves the queue as it was (the failure mode is
+/// staleness, never a wrong entry). Cursors are in memory: a restart
+/// baselines every repo and waits for the first full refresh.
+pub fn spawn_queue_feed<I: Identity>(
+    server: Arc<Server<I>>,
+    active: crate::forge_mirror::Active,
+    http: reqwest::Client,
+    origin: String,
+) -> tokio::task::JoinHandle<()> {
+    use crate::discovery::mirror::MirrorBackend;
+    use crate::forge_mirror::wake::{self, Cursors};
+
+    tokio::spawn(async move {
+        let active = Arc::new(active);
+        // Two backends, two ETags: a change-driven read applies only the repos
+        // the stream named, so it must not consume the `200` the full refresh
+        // is owed (a lossy stream would otherwise leave the rest stale on `304`).
+        let change_backend = Arc::new(Mutex::new(MirrorBackend::default()));
+        let full_backend = Arc::new(Mutex::new(MirrorBackend::default()));
+        let mut cursors = Cursors::new(&origin);
+        let mut repos: Vec<String> = Vec::new();
+        let mut tick = tokio::time::interval(active.change_poll.max(Duration::from_secs(1)));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let mut changed: BTreeSet<String> = BTreeSet::new();
+            let mut full = server.queue_refresh_due() || repos.is_empty();
+            if !repos.is_empty() {
+                let (nudge, result) = wake::pass(&http, &active, &repos, &mut cursors).await;
+                if let Err(e) = result {
+                    log::warn!("fleet-dispatch: queue change pull failed: {e}");
+                }
+                changed = nudge.repos;
+                // A truncated or reset cursor may have missed changes.
+                full |= nudge.missed;
+            }
+            if !full && changed.is_empty() {
+                continue;
+            }
+            let backend = if full { &full_backend } else { &change_backend };
+            let (active_r, backend_r) = (Arc::clone(&active), Arc::clone(backend));
+            let read = tokio::task::spawn_blocking(move || {
+                let mut backend = backend_r
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                backend.fetch_from(&active_r, chrono::Utc::now())
+            })
+            .await;
+            let Ok(worklist) = read else {
+                log::warn!("fleet-dispatch: queue worklist read task failed");
+                continue;
+            };
+            server.feed_queue(&worklist, if full { None } else { Some(&changed) });
+            if full {
+                repos = worklist.slugs();
+            }
+        }
+    })
+}
+
+/// The effective-config key for the queue's full-refresh period (§13.4).
+pub const QUEUE_REFRESH_KEY: &str = "fleetDispatch.queueRefreshSecs";
+
+/// The queue's full-refresh period from `effective`, and a warning when the
+/// value is unusable. Absent is the default silently; a non-integer or `0`
+/// falls back to the default with the warning. Pure.
+#[must_use]
+pub fn queue_refresh_in(effective: &serde_json::Value) -> (Duration, Option<String>) {
+    let default = Duration::from_secs(DEFAULT_REFRESH_SECS);
+    let Some(raw) = crate::config_resolver::get_path(effective, QUEUE_REFRESH_KEY) else {
+        return (default, None);
+    };
+    match raw.as_u64().filter(|secs| *secs > 0) {
+        Some(secs) => (Duration::from_secs(secs), None),
+        None => (
+            default,
+            Some(format!(
+                "{QUEUE_REFRESH_KEY} = {raw} must be a positive whole number of seconds; \
+                 using {DEFAULT_REFRESH_SECS}"
+            )),
+        ),
+    }
+}
+
+/// Start the captain's queue from `effective`: apply
+/// `fleetDispatch.queueRefreshSecs`, build the mirror from `forge.mirror`
+/// (key read through `read_key`) and spawn [`spawn_queue_feed`]. The caller
+/// owns the handle for the process lifetime. An unset or unusable mirror
+/// logs a warning and leaves the queue off; it is never a startup failure.
+pub fn start_queue_feed<I: Identity>(
+    server: &Arc<Server<I>>,
+    effective: &serde_json::Value,
+    read_key: &crate::forge_mirror::KeyReader<'_>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let (refresh, warning) = queue_refresh_in(effective);
+    if let Some(warning) = warning {
+        log::warn!("fleet-dispatch: {warning}");
+    }
+    server.set_queue_refresh(refresh);
+    let active = match crate::forge_mirror::build_active(effective, read_key) {
+        Ok(Some(active)) => active,
+        Ok(None) => {
+            log::warn!("fleet-dispatch: forge.mirror is unset; the fleet queue stays empty");
+            return None;
+        }
+        Err(e) => {
+            log::warn!("fleet-dispatch: the mirror key could not be read ({e}); the fleet queue stays empty");
+            return None;
+        }
+    };
+    let http = match crate::forge_mirror::client::build_http() {
+        Ok(http) => http,
+        Err(e) => {
+            log::warn!("fleet-dispatch: no mirror HTTP client ({e}); the fleet queue stays empty");
+            return None;
+        }
+    };
+    let origin = active.base_url.clone();
+    Some(spawn_queue_feed(Arc::clone(server), active, http, origin))
 }
 
 /// Spawn the expiry/counter sweep and the roster reload.

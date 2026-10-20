@@ -236,3 +236,73 @@ fn a_failed_pull_listing_keeps_the_last_good_set_unvouched() {
     assert_eq!(kept, vec![pull]);
     assert!(!ok, "a last good PR listing never vouches for a Builder step");
 }
+
+mod held_at_head {
+    use super::*;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// PR 5, held (`loom:pr` + `loom:blocked`, a standing hold), so it
+    /// classifies as a `ChampionHoldReevaluate` step.
+    fn held_pr() -> Vec<Item> {
+        let rows = vec![row(5, &["loom:pr", "loom:blocked"], "", true)];
+        let markers = PullMarkers {
+            champion_hold: true,
+            ..PullMarkers::default()
+        };
+        let pulls = vec![pull_from_row(&rows[0], markers)];
+        let inputs = build_inputs(
+            &rows,
+            pulls,
+            &IssueFacts::default(),
+            RepoInput::default(),
+            HostInput::default(),
+        );
+        let items = step_item::classify(&inputs);
+        assert_eq!(items[0].step(), Some(Step::ChampionHoldReevaluate), "{items:?}");
+        items
+    }
+
+    fn map(v: &str) -> HashMap<u32, String> {
+        HashMap::from([(5, v.to_string())])
+    }
+
+    fn run(
+        heads: &HashMap<u32, String>,
+        hold: &HashMap<u32, String>,
+        released: &[u32],
+    ) -> (usize, Verdict) {
+        let mut items = held_pr();
+        let n = hold_at_recorded_head(&mut items, heads, hold, &released.iter().copied().collect());
+        (n, items[0].verdict)
+    }
+
+    #[test]
+    fn a_pr_at_its_held_head_is_not_drawn() {
+        let (n, v) = run(&map(HEAD), &map(HEAD), &[]);
+        assert_eq!((n, v), (1, Verdict::Pass(PassReason::HeldAtHead)));
+        assert_eq!(PassReason::HeldAtHead.as_str(), "held_at_head");
+    }
+
+    #[test]
+    fn an_abbreviated_recorded_sha_still_matches() {
+        assert_eq!(run(&map(HEAD), &map(&HEAD[..7]), &[]).0, 1);
+    }
+
+    #[test]
+    fn a_push_makes_it_drawable() {
+        let (n, v) = run(&map("fedcba9876543210"), &map(HEAD), &[]);
+        assert_eq!((n, v), (0, Verdict::Step(Step::ChampionHoldReevaluate)));
+    }
+
+    #[test]
+    fn auto_merge_ok_makes_it_drawable() {
+        assert_eq!(run(&map(HEAD), &map(HEAD), &[5]).0, 0);
+    }
+
+    #[test]
+    fn it_fails_open_without_a_recorded_or_current_head() {
+        assert_eq!(run(&map(HEAD), &HashMap::new(), &[]).0, 0);
+        assert_eq!(run(&HashMap::new(), &map(HEAD), &[]).0, 0);
+    }
+}

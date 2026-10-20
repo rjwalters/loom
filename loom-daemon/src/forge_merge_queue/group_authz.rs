@@ -274,6 +274,23 @@ pub trait StatusApi {
         description: &str,
     ) -> Result<(), String>;
 
+    /// [`post_status`](Self::post_status) on PR `pr`'s own head. An external
+    /// poster (`forge.mergeQueue.statusCommand`, #12679) is told which PR; the
+    /// default ignores it. Group commits hold several PRs and use `post_status`.
+    ///
+    /// # Errors
+    ///
+    /// The status was not confirmed written.
+    fn post_pr_status(
+        &self,
+        _pr: u32,
+        commit: &str,
+        state: StatusState,
+        description: &str,
+    ) -> Result<(), String> {
+        self.post_status(commit, state, description)
+    }
+
     /// Whether the writer credential can post commit statuses, established
     /// without writing one. The handoff asks before it grants or revokes
     /// anything, so a credential that cannot post is a no-op rather than a
@@ -394,7 +411,12 @@ pub fn revoke_refail_dequeue(
     });
     let head_failed = head().and_then(|sha| {
         statuses
-            .post_status(&sha, StatusState::Failure, &format!("authorization for #{pr} revoked"))
+            .post_pr_status(
+                pr,
+                &sha,
+                StatusState::Failure,
+                &format!("authorization for #{pr} revoked"),
+            )
             .map_err(|e| format!("{sha}: {e}"))
     });
     let dequeue = ops::guarded_dequeue(mode, execution_enabled, api, pr);

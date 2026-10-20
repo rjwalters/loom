@@ -75,11 +75,13 @@ fn every_save_step_failure_is_reported_and_leaves_the_old_cursor_intact() {
         let old = ExportCursor {
             byte_offset: 11,
             exported: 3,
+            ..Default::default()
         };
         export::save_cursor_with(dir.path(), &old, &|_| Ok(())).unwrap();
         let new = ExportCursor {
             byte_offset: 99,
             exported: 9,
+            ..Default::default()
         };
         let result = export::save_cursor_with(dir.path(), &new, &failing(step));
         if step == SaveStep::SyncDir {
@@ -146,6 +148,7 @@ fn crash_after_durable_reset_never_skips_a_longer_new_generation() {
             &ExportCursor {
                 byte_offset: 0,
                 exported: cursor.exported,
+                ..Default::default()
             },
             &|_| Ok(()),
         )
@@ -186,7 +189,8 @@ fn legacy_missing_and_corrupt_cursors_stay_safe() {
         export::load_cursor(dir.path()),
         ExportCursor {
             byte_offset: 5,
-            exported: 2
+            exported: 2,
+            ..Default::default()
         }
     );
     std::fs::write(&file, "{not json").unwrap();

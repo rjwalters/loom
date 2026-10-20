@@ -270,6 +270,7 @@ pub(crate) fn edit_invocation(repo: &str, number: i64, base: &str) -> Result<GhI
         target(repo)?,
         std::time::Duration::from_secs(60),
     )
+    .forge_op(crate::forge_call_stats::ops::PR_EDIT_BASE)
     .args([
         "pr",
         "edit",

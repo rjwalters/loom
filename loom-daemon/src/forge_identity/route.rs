@@ -1057,6 +1057,79 @@ fn exhausted_until(
         .unwrap_or(refresh)
 }
 
+/// What this daemon's router sees for each reader that could serve a
+/// `resource` read of `owner_repo` at `now`, for a shed's log line (#12630):
+/// a withdrawal (its scope, end and kind), a stale or unpublished token
+/// directory, or "usable", each with the bucket book's reading (remaining,
+/// limit, reset and source: header, probe or refusal). `None` when there is
+/// no reader root or no reader for the owner.
+#[must_use]
+pub fn describe_readers(owner_repo: &str, resource: Resource, now: SystemTime) -> Option<String> {
+    let ws = super::workspace_root().or_else(super::front_root)?;
+    describe_readers_in(ws, &super::cached(ws), owner_repo, resource, now)
+}
+
+/// [`describe_readers`] against an explicit workspace and roster.
+#[must_use]
+pub fn describe_readers_in(
+    workspace_root: &Path,
+    roster: &Roster,
+    owner_repo: &str,
+    resource: Resource,
+    now: SystemTime,
+) -> Option<String> {
+    let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    let readers = eligible_readers(roster, owner);
+    if owner.is_empty() || readers.is_empty() {
+        return None;
+    }
+    let at = |t: SystemTime| {
+        chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let parts: Vec<String> = readers
+        .iter()
+        .map(|r| {
+            let state = if let Some(t) = forge_read_pool::withdrawn_until(&r.app_id, now) {
+                format!("withdrawn app-wide until {}", at(t))
+            } else if let Some(t) = super::repo_withdrawn_until(&r.app_id, owner_repo, now) {
+                format!("withdrawn from {owner_repo} (coverage) until {}", at(t))
+            } else if let Some(t) =
+                forge_read_pool::scoped_withdrawal_until(&r.app_id, owner, resource, now)
+            {
+                let kind =
+                    if forge_read_pool::is_budget_withdrawn_at(&r.app_id, owner, resource, now) {
+                        "rate limit"
+                    } else {
+                        "credential"
+                    };
+                format!("withdrawn from {} {} until {} ({kind})", owner, resource.as_str(), at(t))
+            } else if !super::dir_is_fresh(&super::reader_dir(workspace_root, owner, r), now) {
+                "token directory stale or unpublished".to_string()
+            } else {
+                "usable".to_string()
+            };
+            let book = bucket_key(&r.app_id, owner, resource)
+                .and_then(|k| forge_bucket_book::reading(&k, epoch(now)))
+                .map_or_else(
+                    || "no book reading".to_string(),
+                    |b| {
+                        let n =
+                            |v: Option<u64>| v.map_or_else(|| "?".to_string(), |v| v.to_string());
+                        format!(
+                            "book {}/{} reset {} from {}",
+                            n(b.remaining),
+                            n(b.limit),
+                            system_time(b.reset_epoch).map_or_else(|| "?".to_string(), at),
+                            b.source.as_str()
+                        )
+                    },
+                );
+            format!("app {}: {state}, {book}", r.app_id)
+        })
+        .collect();
+    Some(parts.join("; "))
+}
+
 /// The bucket a reader's reads of `owner`'s `resource` spend; `None` for an
 /// app id that is not a plain number (no bucket is booked for it).
 fn bucket_key(app_id: &str, owner: &str, resource: Resource) -> Option<BucketKey> {

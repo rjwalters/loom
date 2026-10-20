@@ -34,11 +34,24 @@
 //! the role pool's `Σ busy_slots{role≠"sweep"}` (that sum reads only the
 //! points without a `pool` label). The registries publish their live steps
 //! ([`set_steps`]); with none published, no step point is emitted.
+//!
+//! The same published steps carry each step's start time (its registry
+//! entry's `started_at`), so the tick also reports how long the step pool's
+//! work has been running (#12873): `loom.dispatch.running_oldest_age_sec
+//! {role, pool="step"}`, the oldest live step's age per role (no point for a
+//! role with no live step, never `0`), and `loom.dispatch.running_by_age
+//! {role, pool="step", age}`, live steps per fixed age bucket
+//! ([`AGE_BUCKETS`]), `0` included for every step role and bucket. Ages are
+//! computed at the tick (`now` minus each start), so they advance between
+//! spawn and end events. A roll-resumed step's age restarts at the resume
+//! (its registry entry is new).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::TickReport;
@@ -106,16 +119,16 @@ pub fn busy_points(
 /// The `pool` label value of a step's per-role series (#11906).
 pub const STEP_POOL: &str = "step";
 
-/// The step points for live steps counted by role name: one per step role
-/// name, `0` included. Pure.
+/// Each step role name's live steps, as their start times (#12873).
+pub type StepStarts = BTreeMap<&'static str, Vec<DateTime<Utc>>>;
+
+/// The step points for live steps by role name: one per step role name,
+/// `0` included, counted from each role's start times. Pure.
 #[must_use]
-pub fn step_points(running: &BTreeMap<&'static str, usize>) -> Vec<MetricPoint> {
-    let mut by_role: BTreeMap<&str, usize> = crate::step_role::StepRole::ALL
-        .iter()
-        .map(|role| (role.role_name(), 0))
-        .collect();
-    for (role, count) in running {
-        *by_role.entry(role).or_insert(0) += count;
+pub fn step_points(running: &StepStarts) -> Vec<MetricPoint> {
+    let mut by_role: BTreeMap<&str, usize> = step_role_names().map(|role| (role, 0)).collect();
+    for (role, starts) in running {
+        *by_role.entry(role).or_insert(0) += starts.len();
     }
     by_role
         .into_iter()
@@ -127,30 +140,104 @@ pub fn step_points(running: &BTreeMap<&'static str, usize>) -> Vec<MetricPoint> 
         .collect()
 }
 
-/// Each registry's live steps by role name, keyed by workspace root.
-static STEPS: Mutex<BTreeMap<PathBuf, BTreeMap<&'static str, usize>>> = Mutex::new(BTreeMap::new());
+fn step_role_names() -> impl Iterator<Item = &'static str> {
+    crate::step_role::StepRole::ALL
+        .iter()
+        .map(|role| role.role_name())
+}
 
-/// Record `root`'s live steps by role name (the sweep registry, on every
-/// spawn, end and reaper tick).
-pub fn set_steps(root: &Path, running: BTreeMap<&'static str, usize>) {
+/// Upper edge of the `lt_15m` age bucket.
+pub const AGE_EDGE_15M: Duration = Duration::from_secs(15 * 60);
+/// Upper edge of the `15m_1h` age bucket.
+pub const AGE_EDGE_1H: Duration = Duration::from_secs(60 * 60);
+/// Upper edge of the `1h_4h` age bucket; `ge_4h` is everything from here.
+pub const AGE_EDGE_4H: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// The `age` label values of `loom.dispatch.running_by_age`, youngest first.
+pub const AGE_BUCKETS: [&str; 4] = ["lt_15m", "15m_1h", "1h_4h", "ge_4h"];
+
+/// The [`AGE_BUCKETS`] index of a step `age_secs` old.
+fn age_bucket(age_secs: u64) -> usize {
+    [AGE_EDGE_15M, AGE_EDGE_1H, AGE_EDGE_4H]
+        .iter()
+        .position(|edge| age_secs < edge.as_secs())
+        .unwrap_or(AGE_BUCKETS.len() - 1)
+}
+
+/// Seconds from `started` to `now`; `0` for a start in the future (a clock
+/// step backwards).
+fn age_secs(now: DateTime<Utc>, started: DateTime<Utc>) -> u64 {
+    u64::try_from((now - started).num_seconds()).unwrap_or(0)
+}
+
+/// The running-age points of the live steps `running` at `now` (#12873):
+/// per step role name, the oldest step's age (only for a role with a live
+/// step) and the count in every [`AGE_BUCKETS`] bucket (`0` included). Pure.
+#[must_use]
+pub fn age_points(now: DateTime<Utc>, running: &StepStarts) -> Vec<MetricPoint> {
+    let mut by_role: BTreeMap<&str, Vec<u64>> =
+        step_role_names().map(|role| (role, Vec::new())).collect();
+    for (role, starts) in running {
+        by_role
+            .entry(role)
+            .or_default()
+            .extend(starts.iter().map(|started| age_secs(now, *started)));
+    }
+    let mut points = Vec::new();
+    for (role, ages) in by_role {
+        if let Some(oldest) = ages.iter().max() {
+            points.push(
+                MetricPoint::int(
+                    MetricName::DispatchRunningOldestAgeSec,
+                    i64::try_from(*oldest).unwrap_or(i64::MAX),
+                )
+                .label("role", role)
+                .label("pool", STEP_POOL),
+            );
+        }
+        let mut buckets = [0_usize; AGE_BUCKETS.len()];
+        for age in &ages {
+            buckets[age_bucket(*age)] += 1;
+        }
+        for (age, count) in AGE_BUCKETS.iter().zip(buckets) {
+            points.push(
+                MetricPoint::int(MetricName::DispatchRunningByAge, int(count))
+                    .label("role", role)
+                    .label("pool", STEP_POOL)
+                    .label("age", *age),
+            );
+        }
+    }
+    points
+}
+
+/// Each registry's live steps by role name, keyed by workspace root.
+static STEPS: Mutex<BTreeMap<PathBuf, StepStarts>> = Mutex::new(BTreeMap::new());
+
+/// Record `root`'s live steps by role name, each as its start time (the
+/// sweep registry, on every spawn, end and reaper tick).
+pub fn set_steps(root: &Path, running: StepStarts) {
     STEPS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(root.to_path_buf(), running);
 }
 
-/// Every published registry's live steps, summed by role; `None` when no
+/// Every published registry's live steps, merged by role; `None` when no
 /// registry has published.
-fn published_steps() -> Option<BTreeMap<&'static str, usize>> {
+fn published_steps() -> Option<StepStarts> {
     let steps = STEPS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if steps.is_empty() {
         return None;
     }
-    let mut total = BTreeMap::new();
-    for (role, count) in steps.values().flatten() {
-        *total.entry(*role).or_insert(0) += count;
+    let mut total = StepStarts::new();
+    for (role, starts) in steps.values().flatten() {
+        total
+            .entry(*role)
+            .or_default()
+            .extend(starts.iter().copied());
     }
     Some(total)
 }
@@ -207,6 +294,7 @@ pub fn record_tick(report: &TickReport, roots: &[PathBuf]) {
     let mut points = busy_points(report.occupancy, roles);
     if let Some(steps) = published_steps() {
         points.extend(step_points(&steps));
+        points.extend(age_points(Utc::now(), &steps));
     }
     super::emit_metrics(points);
 }

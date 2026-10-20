@@ -40,23 +40,21 @@
 //!
 //! - **Discovery reads**: one worklist request per step tick
 //!   ([`crate::discovery`]); there is no per-listing mirror read.
-//! - **Wakes** ([`wake`]): the daemon pulls the change stream for the repos
-//!   it serves, keeps its own cursor (persisted), and publishes each
-//!   non-empty pull as a `forge.event` bus prompt, which ticks the loops
-//!   whose `forgeEvents.events.*` consumer is armed early
-//!   ([`crate::forge_events::wake`]). A change is a nudge, never a command.
+//! - **Change stream** ([`wake`]): the daemon pulls the change stream for the
+//!   repos it serves and keeps its own cursor (persisted). The pull wakes no
+//!   loop and gates no poll (#12809).
 //!
 //! # What it never changes
 //!
 //! Reads that gate a write. Claim, label-transition and merge reads stay on
-//! the gateway or the forge (ADR-0021's poll_gate invariant 3): the
+//! the gateway or the forge: the
 //! worklist ([`crate::discovery`]) is the only mirror read that serves
 //! discovery.
 //!
 //! # Break-glass
 //!
 //! With `forge.mirror` unset, [`active`] is `None`: no mirror request is made,
-//! no change stream is pulled, nothing is published, and every read is
+//! no change stream is pulled, and every read is
 //! exactly today's. The daemon re-reads the
 //! block every [`CHECK_INTERVAL`], so unsetting it takes effect within a
 //! minute. The fleet store fetch never depends on the mirror.
@@ -148,9 +146,8 @@ pub const DEFAULT_MAX_STALENESS_SECS: u64 = 600;
 pub const MIN_STALENESS_SECS: u64 = 30;
 
 /// The bound's ceiling: ADR-0021's hard cap on discovery staleness ("never
-/// more than 15 minutes"), the same ceiling the poll gate holds.
-pub const MAX_STALENESS_CEILING_SECS: u64 =
-    crate::forge_events::poll_gate::MAX_STALENESS_CEILING_SECS;
+/// more than 15 minutes").
+pub const MAX_STALENESS_CEILING_SECS: u64 = 15 * 60;
 
 /// Default change-stream pull cadence.
 pub const DEFAULT_CHANGE_POLL_SECS: u64 = 30;
@@ -358,6 +355,24 @@ impl Active {
         }
     }
 
+    /// A mirror this caller holds itself: its own URL, key and bounds, apart
+    /// from the process-global [`active`] (a captain reading with a
+    /// fleet-spanning key). `base_url` is the origin, e.g. `https://<host>`.
+    #[must_use]
+    pub fn with_key(
+        base_url: String,
+        key: String,
+        max_staleness: Duration,
+        change_poll: Duration,
+    ) -> Self {
+        Self {
+            base_url,
+            key,
+            max_staleness,
+            change_poll,
+        }
+    }
+
     /// A loopback mirror for tests.
     #[cfg(test)]
     #[must_use]
@@ -423,6 +438,41 @@ pub enum PassOutcome {
 /// Reads a key from its ref (and region): the reason on failure never names
 /// the key.
 pub type KeyReader<'a> = dyn Fn(&KeyRef, &AwsAccess<'_>) -> Result<String, String> + 'a;
+
+/// Read `cfg`'s key through `read_key`, resolving the AWS region it needs.
+fn read_cfg_key(cfg: &MirrorConfig, read_key: &KeyReader<'_>) -> Result<String, String> {
+    let region = match &cfg.key_ref {
+        KeyRef::Ssm(_) => crate::aws_ssm::resolve_region(cfg.region.as_deref(), &|k| {
+            std::env::var(k).ok().filter(|v| !v.is_empty())
+        }),
+        KeyRef::File(_) => None,
+    };
+    let aws = AwsAccess {
+        region: region.as_deref(),
+        profile: &cfg.aws_profile,
+    };
+    read_key(&cfg.key_ref, &aws)
+}
+
+/// The mirror `effective` configures, with its key read, apart from the
+/// process-global [`active`] (a caller that runs its own feed, e.g. the
+/// fleet-dispatch captain). `Ok(None)` while `forge.mirror` is unset or
+/// unusable; `Err` names why the key could not be read (never the key).
+///
+/// # Errors
+///
+/// The key reader's reason.
+pub fn build_active(effective: &Value, read_key: &KeyReader<'_>) -> Result<Option<Active>, String> {
+    let (cfg, warnings) = parse(effective);
+    for w in warnings {
+        log::warn!("forge_mirror: {w} — 2am#4367");
+    }
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    let key = read_cfg_key(&cfg, read_key)?;
+    Ok(Some(Active::new(&cfg, key)))
+}
 
 /// The refresh loop's memory between passes.
 #[derive(Debug, Default)]
@@ -499,17 +549,7 @@ impl Refresher {
                 return PassOutcome::Unchanged;
             }
         }
-        let region = match &cfg.key_ref {
-            KeyRef::Ssm(_) => crate::aws_ssm::resolve_region(cfg.region.as_deref(), &|k| {
-                std::env::var(k).ok().filter(|v| !v.is_empty())
-            }),
-            KeyRef::File(_) => None,
-        };
-        let aws = AwsAccess {
-            region: region.as_deref(),
-            profile: &cfg.aws_profile,
-        };
-        match read_key(&cfg.key_ref, &aws) {
+        match read_cfg_key(&cfg, read_key) {
             Ok(key) => {
                 if self.fingerprint.as_deref() != Some(fp.as_str()) {
                     log::info!(

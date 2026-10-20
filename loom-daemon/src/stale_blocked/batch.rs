@@ -416,7 +416,6 @@ fn read_text(
     p.held = super::hold::latest_reasoned(&p.body).map(|r| super::Held {
         by: r.by,
         reason: r.reason.unwrap_or_default().trim().to_string(),
-        at: r.at,
     });
     if kind == Artifact::Issue {
         p.named = named::parse_entries(&p.body);
@@ -816,6 +815,9 @@ impl StaleBlockedForge for GhStaleBlockedForge {
         .args(["api", "graphql", "-f", field.as_str()]);
         let out = match inv.execute() {
             Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+            Ok(GhCompletion::DeadlineReached) => {
+                return Err(anyhow!("gh api graphql not sent: the tick deadline passed"));
+            }
             Ok(GhCompletion::Shed { .. }) => {
                 return Err(anyhow!("gh api graphql was shed: no reader can serve it"));
             }

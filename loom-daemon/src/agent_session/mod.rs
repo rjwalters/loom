@@ -524,12 +524,6 @@ pub mod testing {
             self
         }
 
-        /// Queue a sequence of claude-running answers (last one sticks).
-        pub fn queue_claude_running(&self, values: &[bool]) -> &Self {
-            *self.claude_running.borrow_mut() = values.iter().copied().collect();
-            self
-        }
-
         /// All tmux invocations recorded so far, joined with spaces.
         pub fn call_strings(&self) -> Vec<String> {
             self.calls.borrow().iter().map(|c| c.join(" ")).collect()

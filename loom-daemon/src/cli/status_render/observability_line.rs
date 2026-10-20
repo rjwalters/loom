@@ -3,7 +3,7 @@
 //!
 //! A sibling module rather than more lines in `status_render.rs` (an
 //! over-threshold ledger entry — `.loom/docs/file-size-policy.md`), matching
-//! how [`super::forge_events_line`], [`super::holds`] and
+//! how [`super::holds`] and
 //! [`super::model_class`] already live here. Moved verbatim apart from the
 //! #9015 annotation described below.
 //!

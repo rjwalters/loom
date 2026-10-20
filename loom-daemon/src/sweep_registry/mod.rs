@@ -123,7 +123,6 @@ mod fast_fail_park;
 mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
-mod journal_shadow;
 mod landed_guard;
 mod lease_episode;
 pub mod lease_step;
@@ -247,6 +246,13 @@ pub struct SweepRegistryConfig {
     /// When `true`, skip the actual label flip via `gh`. Used by unit tests
     /// that don't have GitHub credentials.
     pub skip_label_flip: bool,
+    /// Test seam (#12571): let the issue-sweep lease tie-break go ahead
+    /// blind on an unverifiable read, as it did before it failed closed. On
+    /// by default under `cfg(test)` because most dispatch fixtures' fake `gh`
+    /// never serves the lease comments; the tests that pin the fail-closed
+    /// behaviour turn it off.
+    #[cfg(test)]
+    pub(crate) blind_lease_order: bool,
     /// Override the machine-level sweep journal path (Issue #3953). Defaults
     /// to [`sweep_journal::default_journal_path`] (`~/.loom/sweeps.json`,
     /// env-overridable via `LOOM_SWEEPS_JOURNAL_PATH`). Tests set this to a
@@ -286,6 +292,8 @@ impl SweepRegistryConfig {
             spawn_bin: None,
             gh_bin: None,
             skip_label_flip: false,
+            #[cfg(test)]
+            blind_lease_order: true,
             journal_path: None,
             outcomes_journal_path: None,
             outcome_telemetry_path: None,
@@ -1678,7 +1686,8 @@ mod tests {
     // RAII guard: saves and clears every host-identity input (`LOOM_HOST_ID`,
     // `HOSTNAME`, `LOOM_HOST_ID_FILE`, `LOOM_CONFIG_DEFAULTS_FILE`) and
     // restores the ambient values on drop.
-    use crate::host_identity::tests::EnvGuard as HostIdentityEnvGuard;
+    use crate::env_test_support::EnvGuard as HostIdentityEnvGuard;
+    use crate::host_identity::tests::GUARDED_ENV as HOST_IDENTITY_ENV;
 
     /// Issue #5063 / #11530: `fleet.hostId` > `LOOM_HOST_ID` > the persisted
     /// id, blanks ignored, and never `$HOSTNAME`. Holds `loom_config_env`
@@ -1688,7 +1697,7 @@ mod tests {
     fn host_identity_env_precedence() {
         #[serial]
         fn inner() {
-            let _guard = HostIdentityEnvGuard::clear();
+            let _guard = HostIdentityEnvGuard::clear(HOST_IDENTITY_ENV);
             let dir = tempfile::tempdir().unwrap();
             let id_file = dir.path().join("host-id");
             std::fs::write(&id_file, "persisted-studio\n").unwrap();

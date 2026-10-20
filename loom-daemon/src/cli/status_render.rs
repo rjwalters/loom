@@ -12,7 +12,6 @@ mod capacity_line;
 mod drain_render;
 mod fleet_store_line;
 mod forge_calls_render;
-mod forge_events_line;
 mod holds;
 mod host_update_line;
 mod last_tick_line;
@@ -338,14 +337,6 @@ pub(crate) fn build_status_json_value_for(
         // `exempt`, with an optional `detail` (the exemption reason).
         //   loom-daemon status --json | jq -e '.otlp_export.state == "ok"'
         "otlp_export": report.otlp_export,
-        // Forge event-feed consumer state (ADR-0021, #8765). Non-null for any
-        // daemon of this vintage and always carrying a `state`, so a watch
-        // loop asserts rather than infers:
-        //   loom-daemon status --json | jq -e '.forge_events.state == "healthy"'
-        // States: disabled | misconfigured | connecting | failing |
-        // auth_failed | host_mismatch | backoff | healthy. `null` only from a
-        // pre-ADR-0021 daemon.
-        "forge_events": report.forge_events,
         // Per-repo pressure-triggered deep-clean state (#5919): when the pass
         // last fired, what it reclaimed, and — for the common non-firing tick
         // — why it declined. Scripted consumers can assert reclamation is
@@ -1201,6 +1192,9 @@ fn deep_clean_lines(report: &DaemonStatusReport) -> Vec<String> {
             (None, _) => "no pass has fired since this daemon started".to_string(),
         };
         lines.push(format!("    {}: {fired}", repo.root.display()));
+        if let Some(kept) = &repo.last_kept {
+            lines.push(format!("      kept (keepBuildArtifacts): {kept}"));
+        }
         if let Some(reason) = &repo.last_reason {
             let when = repo
                 .last_evaluated_at
@@ -2130,10 +2124,6 @@ pub(crate) fn print_status_human(
         println!("\n{banner}");
     }
 
-    // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
-    // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
-    // are five different answers that would otherwise all render as nothing.
-    println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
     // Fleet-store sync (#9596): what the last startup/timer pass found — the
     // drift the timer detects but deliberately does not write. Nothing at all
     // on a host with no `fleet.repo`.
@@ -3667,6 +3657,7 @@ mod status_protection_tests {
             last_free_gb: Some(118),
             last_fired_at: None,
             last_reclaimed: None,
+            last_kept: None,
         }
     }
 
@@ -3708,6 +3699,26 @@ mod status_protection_tests {
         assert!(rendered.contains("last fired 2026-08-10T21:04:10"), "{rendered}");
         assert!(rendered.contains("target/ (34.1G)"), "{rendered}");
         assert!(rendered.contains("DISK PRESSURE"), "{rendered}");
+    }
+
+    #[test]
+    fn deep_clean_names_what_keep_build_artifacts_left_in_place() {
+        let mut entry = deep_clean_entry("/home/u/GitHub/loom");
+        entry.last_kept = Some("node_modules/ (1.2G)".to_string());
+        let mut report = sample_report();
+        report.deep_clean = vec![entry];
+        let rendered = deep_clean_lines(&report).join("\n");
+        assert!(
+            rendered.contains("kept (keepBuildArtifacts): node_modules/ (1.2G)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn deep_clean_status_without_last_kept_still_deserializes() {
+        let json = r#"{"root":"/r","last_evaluated_at":null,"last_reason":null,"last_free_gb":null,"last_fired_at":null,"last_reclaimed":null}"#;
+        let s: loom_daemon::types::DeepCleanRepoStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(s.last_kept, None);
     }
 
     #[test]

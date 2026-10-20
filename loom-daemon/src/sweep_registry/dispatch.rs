@@ -1147,12 +1147,14 @@ impl SweepRegistry {
     /// live steps go to [`crate::fleet_dispatch::worker::on_reaper_tick`], which
     /// sends the host's heartbeat when one is due. A no-op with the flag off.
     pub fn fleet_dispatch_heartbeat(&self) {
-        let live: Vec<(String, u32, crate::step_role::StepRole)> = self
+        let live: Vec<(String, u32, crate::step_role::StepRole, DateTime<Utc>)> = self
             .entries
             .values()
             .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
             .filter_map(|info| match info.kind {
-                SweepKind::Step { item, role } => Some((info.sweep_id.clone(), item, role)),
+                SweepKind::Step { item, role } => {
+                    Some((info.sweep_id.clone(), item, role, info.started_at))
+                }
                 SweepKind::Issue(_) | SweepKind::PrSet(_) => None,
             })
             .collect();

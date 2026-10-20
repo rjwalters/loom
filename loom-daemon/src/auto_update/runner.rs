@@ -316,7 +316,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     }
     // #10866: the note and the record's `floor_stall` are state and are set on
     // every tick the stall stands. Only the ERROR line is rate-limited.
-    let floor_was_alerted = state.floor.stall_declared_at().is_some();
+    let floor_was_alerted = state.floor.was_alerted();
     summary.floor_alerted = state
         .floor
         .alert_due(last_check, floor_roll::alert::REMINDER);
@@ -326,7 +326,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         summary.floor_alerted,
         floor_was_alerted,
     ) {
-        crate::loom_ui_alerts::post(alert);
+        crate::alerts::post(alert);
     }
     if let Some(stall) = state.floor.stall() {
         if summary.floor_alerted {

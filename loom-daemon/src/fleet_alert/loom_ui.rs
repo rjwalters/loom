@@ -1,6 +1,7 @@
-//! The loom-ui output for fleet alerts (#11295): every `Started` / `Cleared`
-//! edge becomes an `open` / `resolved` incident on loom-ui's Alerts page,
-//! beside the event-bus (Matrix) output and independent of it.
+//! The alert output for fleet alerts (#11295, #12806): every `Started` /
+//! `Cleared` edge becomes an `open` / `resolved` `alert.transition` record
+//! (which loom-ui's Alerts page reads from SigNoz), beside the event-bus
+//! (Matrix) output and independent of it.
 //!
 //! Rule `fleet.<condition>` (`fleet.dispatch-halted`, `fleet.roles-persistent`,
 //! `fleet.output-missing` …). A `prefix:rest` condition key splits into rule
@@ -13,7 +14,7 @@
 
 use super::state::{Kind, Transition};
 use super::task::AlertSink;
-use crate::loom_ui_alerts::{self, Alert, Severity, State};
+use crate::alerts::{self, Alert, Severity, State};
 
 /// Condition keys loom-ui already alerts on from its own evidence.
 pub const DERIVED_BY_LOOM_UI: &[&str] = &[super::KEY_TOKENS];
@@ -55,17 +56,17 @@ pub fn to_alert(t: &Transition) -> Option<Alert> {
     )
 }
 
-/// [`AlertSink`] queuing onto [`loom_ui_alerts::post`]; a no-op when that
+/// [`AlertSink`] recording through [`alerts::post`]; a no-op when that
 /// output is off.
 pub struct LoomUiSink;
 
 impl AlertSink for LoomUiSink {
     fn name(&self) -> &'static str {
-        "loom-ui"
+        "alert.transition"
     }
     fn deliver(&self, t: &Transition, _host: &str) -> Result<(), String> {
         if let Some(alert) = to_alert(t) {
-            loom_ui_alerts::post(alert);
+            alerts::post(alert);
         }
         Ok(())
     }

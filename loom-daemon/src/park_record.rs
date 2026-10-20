@@ -224,16 +224,6 @@ fn ref_re() -> &'static Regex {
     })
 }
 
-/// Whether `text` carries at least one park record.
-///
-/// Deliberately keyed on [`parse`] rather than on the sentinel substring: a
-/// truncated `<!-- loom:park` with no terminator is not a record, and treating
-/// it as one would report a park as documented when nothing can read it.
-#[must_use]
-pub fn has_record(text: &str) -> bool {
-    !parse(text).is_empty()
-}
-
 /// Every park record in `text`, in document order, one per declared blocker.
 ///
 /// More than one is legitimate and expected: a multi-blocker park is written as
@@ -345,69 +335,6 @@ pub fn mask_qualified(text: &str) -> String {
 pub fn blockers(text: &str) -> Vec<BlockerRef> {
     let set: BTreeSet<BlockerRef> = parse(text).into_iter().filter_map(|r| r.blocker).collect();
     set.into_iter().collect()
-}
-
-/// Whether any park record in `text` names a **qualified** (`OWNER/REPO#N`)
-/// blocker (#10556).
-///
-/// Read through [`parse`], so it agrees with [`blockers`] exactly: a mention
-/// inside `reason="…"` or outside any marker does not count. A caller that
-/// acts only on local blockers (the #10556 release pass) must skip a park
-/// carrying one rather than let it drop out of a local-only check.
-#[must_use]
-pub fn has_qualified_ref(text: &str) -> bool {
-    parse(text)
-        .iter()
-        .any(|r| r.blocker.as_ref().is_some_and(|b| b.repo.is_some()))
-}
-
-/// `body` with every park record naming a **local** blocker in `resolved`
-/// removed, and every other record kept (#10556's re-park).
-///
-/// `resolved` holds local issue/PR numbers; a qualified `OWNER/REPO#N` record
-/// is never matched by them, so it is always kept.
-///
-/// A marker naming only resolved blockers is dropped — with its whole line
-/// when it stood alone on one. A hand-written multi-reference marker naming a
-/// mix is re-rendered as one record per still-open blocker, keeping its
-/// provenance. Everything else in the body is left byte-for-byte.
-#[must_use]
-pub fn drop_blockers(body: &str, resolved: &[u64]) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut last = 0;
-    // A quoted marker in code is never a record, so never edited (#10837).
-    for (whole, inner) in markers(body) {
-        let records = parse_inner(&body[inner]);
-        let keep: Vec<ParkRecord> = records
-            .iter()
-            .filter(|r| {
-                r.blocker
-                    .as_ref()
-                    .is_none_or(|b| b.repo.is_some() || !resolved.contains(&b.number))
-            })
-            .cloned()
-            .collect();
-        if keep.len() == records.len() {
-            continue;
-        }
-        let (mut start, mut end) = (whole.start, whole.end);
-        let replacement = keep.iter().map(render).collect::<Vec<_>>().join("\n");
-        if replacement.is_empty() {
-            // Take the whole line when the marker was alone on it.
-            let line_start = body[..start].rfind('\n').map_or(0, |i| i + 1);
-            let line_end = body[end..].find('\n').map_or(body.len(), |i| end + i + 1);
-            let alone =
-                body[line_start..start].trim().is_empty() && body[end..line_end].trim().is_empty();
-            if alone && line_start >= last {
-                (start, end) = (line_start, line_end);
-            }
-        }
-        out.push_str(&body[last..start]);
-        out.push_str(&replacement);
-        last = end;
-    }
-    out.push_str(&body[last..]);
-    out
 }
 
 /// Render one park record as the one line a role writes into the artifact body.
