@@ -237,6 +237,7 @@ pub mod forge_rerun;
 pub mod forge_tree_unchanged;
 pub mod forge_version_only_diff;
 pub mod forge_wait_checks;
+pub mod fs_util;
 /// Generated content a quarantine must never stash: name-based artifacts and
 /// content-verified cargo build trees (#5690, #11075).
 pub mod generated_artifact;
