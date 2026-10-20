@@ -105,6 +105,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "orphan_stack.comments" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
         "orphan_stack.parent_lookup" => ops::PR_LIST_BY_HEAD,
+        "orphan_stack.retarget" => ops::PR_EDIT_BASE,
         "park_hold.issue_view"
         | "release_veto.issue_labels"
         | "intake.recheck"
