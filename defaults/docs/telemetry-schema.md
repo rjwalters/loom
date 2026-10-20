@@ -233,6 +233,8 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`merge.queue.observed`](#mergequeueobserved--the-merge-queue-as-an-existing-read-saw-it) | log, OTLP only | `forge_merge_queue/group_github.rs` (`GroupForge::groups`) |
 | [`merge.queue.regime`](#mergequeueregime--the-merge-queue-settings-on-change-only) | log, OTLP only | `forge_merge_queue/group_run.rs` (`tick_groups`, from `preflight::github_preflight`) |
 | [`eta.dispatch_eligibility`](#etadispatch_eligibility--why-a-ready-item-is-or-is-not-schedulable) | log, OTLP only | `observability/dispatch_eligibility.rs` (collector sample of the last work-finder tick) |
+| [`eta.stage_occupancy`](#etastage_occupancy--items-still-waiting-in-a-pre-ready-stage) | log, OTLP only | `observability/stage_occupancy.rs` (collector sample of the open-issue queues) |
+
 | [`eta.stage_entry`](#etastage_entry--an-items-arrival-in-a-stage) | log, OTLP only | `observability/stage_entry_fact.rs` (diff of the step driver's per-tick discovery snapshot) |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
@@ -2834,6 +2836,52 @@ Body fields (`observability/otlp/mapping/dispatch_eligibility.rs`,
 | `max_concurrent` | the host's effective concurrency cap this tick (the global pool size). |
 | `level` | the issue's priority level (`default` / `important` / `very-important`) — the axis the work-ahead counts are relative to. |
 | `sampled_at` / `tick_at` | the collector sample instant (record time) and the work-finder tick it reflects. |
+
+### `eta.stage_occupancy` — items still waiting in a pre-ready stage
+
+One OTLP-only log record per `(repo, stage)` plus one global rollup per stage,
+per collector sample (Issue #12866). `eta.stage_outcome` fires only when an item
+*leaves* a stage, so the items still waiting — the longest-dwell, right-censored
+population — and the backlog a new item must clear were invisible. This gauge
+supplies them. `fleet.state` has no row for these stages and `backlog.level` was
+retired (#12370), so this is a separate kind. It is a gauge: every sample
+restates the current occupancy, with no change detection.
+
+The producer is `observability::stage_occupancy`, driven from the collector's
+snapshot cadence. In mirror mode it reads the tick's published snapshot (every
+open issue per repo) and makes no forge call; otherwise it reads one ETag-cached,
+all-pages listing per stage label per repo (an unchanged listing is a free
+`304`). Envelopes carry `schema_version: 12`. `loom.repo` and
+`loom.repo.visibility` ride as attributes (both already on the gateway log
+`keep_keys`; a global row has no `loom.repo`); the rest is the body JSON. The
+record has slugs, enums and numbers only — no title, body, label text or author.
+
+| `stage` | Population |
+|---|---|
+| `triage_wait` | open issues carrying `loom:triage` |
+| `approval_wait` | open issues carrying `loom:curated` and not `loom:issue` |
+| `operator_hold` | open issues carrying `loom:operator` |
+
+The first two are `FleetStage` wire names; `operator_hold` has no `FleetStage`.
+
+| Field | Meaning |
+|---|---|
+| `scope` | `repo`, or `global` (the rollup over every repo counted this sample). |
+| `repo` | forge `owner/repo`; absent on a global row. |
+| `count` | items in the stage. `0` is a real zero: the repo was scanned and the stage is empty. |
+| `oldest_age_sec` | age of the oldest item; absent when `count` is `0`. |
+| `age_buckets` | item counts per age bucket. Edges (seconds): 3600, 21600, 86400, 259200, 604800, 2592000 (1 h, 6 h, 24 h, 3 d, 7 d, 30 d), so 7 buckets, each lower-inclusive: `[0,1h)`, `[1h,6h)`, `[6h,24h)`, `[24h,3d)`, `[3d,7d)`, `[7d,30d)`, `[30d,∞)`. The constant is `AGE_BUCKET_EDGES_SEC` in `telemetry/kinds/stage_occupancy.rs`. |
+| `repos_counted` / `repos_unknown` | global rows only: repos summed into the row, and scanned repos whose listing for this stage failed or was partial and so are **not** in it. `repos_unknown > 0` makes the row a lower bound. |
+| `sampled_at` | the sample instant (the record time). |
+
+Age is measured from when the stage's label was applied when the listing carries
+that (`labels_at`, the state mirror), else from the issue's creation; creation is
+an upper bound on the time in the stage and exact for `triage_wait`. An item with
+no parseable timestamp counts but is not bucketed.
+
+**Unknown is not zero.** A repo whose listing for a stage failed (or was
+truncated) emits no row for that stage, and a stage no repo could count has no
+global row; a reader must treat an absent row as "not measured", never `0`.
 
 ### `eta.stage_entry` — an item's arrival in a stage
 

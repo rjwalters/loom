@@ -1039,6 +1039,11 @@ async fn sample_snapshots(
     // work-ahead. Reads only the repo-ref cache the two passes above warmed, so
     // it makes no forge call; a no-op without the OTLP sink or a fresh tick.
     super::dispatch_eligibility::record();
+    // Per-stage occupancy gauge (Issue #12866), OTLP-only: the items still
+    // waiting in triage / approval / operator hold. Counts come from the
+    // mirror snapshot or ETag-cached all-pages label listings; a no-op
+    // without the OTLP sink.
+    super::stage_occupancy::record(workspace_pool, slug_cache).await;
     // Per-account Codex session-container state (Issue #10455): export the
     // gauge from the always-on watch's newest observations. No docker call
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot

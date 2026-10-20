@@ -34,6 +34,7 @@ mod run_state_request;
 mod scope_memory;
 mod session_output;
 mod stage_entry;
+mod stage_occupancy;
 mod token_ranking;
 mod tokens_snapshot;
 mod work_started;
@@ -610,6 +611,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::PickDecision(_)
         | TelemetryRecord::OperatorPresence(_)
         | TelemetryRecord::DispatchEligibility(_)
+        | TelemetryRecord::StageOccupancy(_)
         | TelemetryRecord::StageEntry(_)
         | TelemetryRecord::CheckoutFreshness(_) => {
             // One record, stamped at its own time; the body is the record's
@@ -634,6 +636,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| pick_decision::log_parts(r))
                 .or_else(|| operator_presence::log_parts(r))
                 .or_else(|| dispatch_eligibility::log_parts(r))
+                .or_else(|| stage_occupancy::log_parts(r))
                 .or_else(|| stage_entry::log_parts(r))
                 .or_else(|| checkout_freshness::log_parts(r))?;
             time_unix_nano = at;

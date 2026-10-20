@@ -138,6 +138,7 @@ pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
 pub mod stage_entry_fact;
+pub mod stage_occupancy;
 pub mod standalone_ops;
 pub mod step_verdict;
 pub mod tracing;
@@ -1276,6 +1277,9 @@ pub fn spawn_task(
     // decision per waiting ready item, OTLP-only, sampled by the collector
     // below on the same cadence as `queue.snapshot`.
     dispatch_eligibility::register_sink(otlp_queues.clone(), &host_id);
+    // `eta.stage_occupancy` (#12866): the pre-ready stage occupancy gauge,
+    // OTLP-only, sampled by the collector on the same cadence.
+    stage_occupancy::register_sink(otlp_queues.clone(), &host_id);
     // `eta.stage_entry` (#12869): arrivals diffed from the step driver's
     // per-tick discovery snapshot, OTLP-only.
     stage_entry_fact::register_sink(otlp_queues.clone(), &host_id);
