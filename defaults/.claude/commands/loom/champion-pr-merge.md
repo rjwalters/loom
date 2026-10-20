@@ -2399,7 +2399,7 @@ if [ "$AUTHOR" = "dependabot[bot] Bot" ]; then
     [ "$(gh api "repos/{owner}/{repo}/pulls/$SIB" --jq '.mergeable' 2>/dev/null)" = "false" ] || continue
     MARK="<!-- champion:dependabot-rebase pr=$SIB after=$PR_NUMBER -->"
     gh api "repos/{owner}/{repo}/issues/$SIB/comments" --paginate --jq '.[].body' 2>/dev/null | grep -qF "$MARK" && continue
-    ./.loom/scripts/post-comment.sh "$SIB" --body "@dependabot rebase
+    ./.loom/scripts/post-comment.sh "$SIB" --pr --body "@dependabot rebase
 
 Champion: #$PR_NUMBER merged and this bump now conflicts. Requesting a rebase.
 
