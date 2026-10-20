@@ -897,6 +897,9 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         "claim_reconciliation/open_pr_listing_tests.rs",
         "observability/queue_blocked.rs",
         "observability/queue_blocked_tests.rs",
+        // The eta.stage_entry producer diffs the published snapshot; no forge call.
+        "observability/stage_entry_fact.rs",
+        "observability/stage_entry_fact_tests.rs",
         "quarantine_reconciliation/listing.rs",
         // The gather concurrency is the Direct backend's alone.
         "step_dispatch/gather_budget.rs",
