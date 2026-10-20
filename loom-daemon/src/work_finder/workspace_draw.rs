@@ -35,10 +35,6 @@ use crate::priority_pick::{
 };
 use crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT;
 
-/// At most this many draws are kept per tick (the first ones, which decide
-/// the slots); [`DrawLog::draws_total`] carries the uncapped count.
-pub const MAX_RECORDED_DRAWS: usize = 50;
-
 /// One draw: the [`WorkspaceDraw`] record plus the candidate it placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrawStep {
@@ -58,7 +54,7 @@ pub struct DrawLog {
     pub seed: u64,
     /// How many draws the tick made (one per candidate).
     pub draws_total: usize,
-    /// The first [`MAX_RECORDED_DRAWS`] draws, in order.
+    /// Every draw, in order: `steps.len() == draws_total` (#12877).
     pub steps: Vec<DrawStep>,
     /// What [`seed`](Self::seed) was derived from (#11683): `None` when it
     /// was pinned ([`with_seed`]) or passed to [`draw_order`] directly.
@@ -154,13 +150,11 @@ pub fn draw_order(
         }) else {
             break;
         };
-        if steps.len() < MAX_RECORDED_DRAWS {
-            steps.push(DrawStep {
-                draw,
-                workspace_idx: idx,
-                issue: c.number,
-            });
-        }
+        steps.push(DrawStep {
+            draw,
+            workspace_idx: idx,
+            issue: c.number,
+        });
         order.push(c);
     }
     let log = (!order.is_empty()).then_some(DrawLog {
