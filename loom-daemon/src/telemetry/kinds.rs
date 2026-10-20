@@ -224,6 +224,9 @@ pub mod pass;
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
 
+/// `pick.decision` bounded summary (#12974) — the exported form; the full record is archived.
+pub mod pick_summary;
+
 /// `pr.resolved` (#10519) — a PR's merge or close instant, from `fleet.state`.
 pub mod pr_resolved;
 
