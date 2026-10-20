@@ -233,6 +233,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`merge.queue.observed`](#mergequeueobserved--the-merge-queue-as-an-existing-read-saw-it) | log, OTLP only | `forge_merge_queue/group_github.rs` (`GroupForge::groups`) |
 | [`merge.queue.regime`](#mergequeueregime--the-merge-queue-settings-on-change-only) | log, OTLP only | `forge_merge_queue/group_run.rs` (`tick_groups`, from `preflight::github_preflight`) |
 | [`eta.dispatch_eligibility`](#etadispatch_eligibility--why-a-ready-item-is-or-is-not-schedulable) | log, OTLP only | `observability/dispatch_eligibility.rs` (collector sample of the last work-finder tick) |
+| [`eta.stage_entry`](#etastage_entry--an-items-arrival-in-a-stage) | log, OTLP only | `observability/stage_entry_fact.rs` (diff of the step driver's per-tick discovery snapshot) |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | none since #11301 (was `observability/fleet_state/outcomes.rs`, a PR that left the review listings) |
 
@@ -2833,6 +2834,35 @@ Body fields (`observability/otlp/mapping/dispatch_eligibility.rs`,
 | `max_concurrent` | the host's effective concurrency cap this tick (the global pool size). |
 | `level` | the issue's priority level (`default` / `important` / `very-important`) — the axis the work-ahead counts are relative to. |
 | `sampled_at` / `tick_at` | the collector sample instant (record time) and the work-finder tick it reflects. |
+
+### `eta.stage_entry` — an item's arrival in a stage
+
+One OTLP-only log record per observed **arrival** of an issue in a stage
+(`loom:triage`, `loom:curated`, `loom:issue`, `loom:operator`; Issue #12869).
+`eta.stage_outcome` reconstructed `entered_at` from forge label history and
+was retired in #11301; this is the arrival (inflow) fact that gives a consumer
+the real arrival process and, with the per-stage occupancy gauge, each item's
+queue position at arrival.
+
+The producer is `observability::stage_entry_fact`. It diffs each repo's rows in
+the step driver's per-tick discovery snapshot against the previous tick's read
+of the same repo: a stage label present now and absent before is an arrival. It
+makes **no forge call** and needs no label-write chokepoint (label writes come
+from many scripts and agents). Arrival is **tick-granular**. A repo's first
+read after a daemon start, or after the mirror could not vouch for it, only
+seeds the baseline: an item already in a stage has an unknown arrival and
+emits nothing. Pull requests are not recorded. Envelopes carry
+`schema_version: 12`; the body is the record's JSON, and `loom.repo`,
+`loom.issue` and `loom.repo.visibility` ride as attributes.
+
+Body fields (`telemetry/kinds/stage_entry.rs`):
+
+| Field | Meaning |
+|---|---|
+| `stage` | the stage label observed arriving. |
+| `entered_at` | when the item entered the stage: the mirror's `labels_at` time for the label when the snapshot carries it, else the observing tick. |
+| `entered_at_source` | `mirror` (the `labels_at` time) or `observed` (the tick; an upper bound on the arrival). |
+| `observed_at` | when the daemon observed the arrival (record time). |
 
 ### `pass.summary` and `pass.verdict`
 
