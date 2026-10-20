@@ -193,6 +193,17 @@ fn status(root: &Path, json: bool) -> Result<()> {
         state::Health::Stale { age_secs } => {
             serde_json::json!({ "state": "stale", "last_ok_age_secs": age_secs })
         }
+        state::Health::Degraded {
+            age_secs,
+            failing_owners,
+        } => serde_json::json!({
+            "state": "degraded",
+            "last_ok_age_secs": age_secs,
+            "failing_owners": failing_owners
+                .iter()
+                .map(|(owner, error)| serde_json::json!({ "owner": owner, "error": error }))
+                .collect::<Vec<_>>(),
+        }),
         state::Health::Failing {
             since,
             error,
@@ -287,6 +298,17 @@ fn status(root: &Path, json: bool) -> Result<()> {
         state::Health::Stale { age_secs } => format!(
             "STALE — last successful poll {age_secs}s ago (more than 3x the {}s interval)",
             resolved.interval_secs
+        ),
+        state::Health::Degraded {
+            age_secs,
+            failing_owners,
+        } => format!(
+            "DEGRADED — last poll {age_secs}s ago; owner(s) skipped: {}",
+            failing_owners
+                .iter()
+                .map(|(owner, error)| format!("{owner} ({error})"))
+                .collect::<Vec<_>>()
+                .join("; ")
         ),
         state::Health::Failing {
             since,
