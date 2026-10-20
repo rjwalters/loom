@@ -233,8 +233,8 @@ mod tests {
         }
     }
 
-    /// #12450: a granted step carries the captain's assignment, and it
-    /// survives the export allowlist; a step with none carries no key.
+    /// #12748: the span keeps the draw's selected model apart from the one
+    /// actually launched.
     #[test]
     fn a_step_span_separates_the_selected_model_from_the_launched_one() {
         let step = StepDispatch {
@@ -255,6 +255,8 @@ mod tests {
         assert!(!none.attributes.contains_key("loom.step.model_launched"));
     }
 
+    /// #12450: a granted step carries the captain's assignment, and it
+    /// survives the export allowlist; a step with none carries no key.
     #[test]
     fn a_granted_step_names_its_assignment() {
         let step = StepDispatch {
