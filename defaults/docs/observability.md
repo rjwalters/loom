@@ -216,6 +216,19 @@ simply lack `host.type`/`cloud.*`. `eta.stage_outcome` records carry the
 *observing* host's shape, not the executing host's; join through the
 executing `host.id` on `sweep.*` records for that.
 
+**Host load on sweep/phase spans (#12884).** `loom.sweep` and every
+`loom.phase` span carry the `lifecycle::host_attributes()` sample, including
+`loom.host.logical_cpus` and `loom.host.loadavg_1m`, at open and again at
+close. A close overwrites a same-named key, so the plain
+`loom.host.loadavg_1m` / `loom.host.load_per_core` on an exported span are the
+**close-time** sample; the open-time sample is kept under
+`loom.host.start.loadavg_1m` / `loom.host.start.load_per_core`, which no close
+re-stamps. Phase spans opened inside a `spawn-claude.sh` child (the checkpoint
+sites) also carry `loom.host.cpu_budget_cores` and `loom.host.sweeps_in_flight`
+— the CPU quota and the in-flight sweep count it was divided by. Each key is
+absent when unknown, never zero-filled: `sweeps_in_flight` is absent when the
+budget was not shared across sweeps (`LOOM_SWEEP_SHARED_CPU_BUDGET=0`).
+
 `host.name` has one source, the same string as `host.id`: the daemon's host
 identity, which is the operator-assigned `$LOOM_HOST_ID` when it is set and
 otherwise the OS hostname (`$HOSTNAME`, then the `hostname` binary). Set
