@@ -59,6 +59,14 @@ pub trait RollTrigger: Send {
         false
     }
 
+    /// Disarm the armed roll because the fleet floor no longer asks for it
+    /// (#12610). Returns `true` when a roll was discarded; only a pause roll
+    /// that has not stopped any agent can be.
+    fn disarm_roll(&self, why: &str) -> bool {
+        let _ = why;
+        false
+    }
+
     /// Why a roll cannot start on this host because nothing would relaunch
     /// the daemon (Issue #11042), or `None` when a supervisor is present.
     ///
@@ -149,6 +157,19 @@ impl RollTrigger for IpcRollTrigger {
         crate::ipc::detect_supervisor()
             .is_none()
             .then(|| "no supervisor is detected (LOOM_DAEMON_SUPERVISOR unset)".to_string())
+    }
+
+    fn disarm_roll(&self, why: &str) -> bool {
+        let disarmed = self.drain.abort_pause_roll();
+        if disarmed {
+            let note = format!("pause roll disarmed: {why} — dispatch resumed");
+            self.drain.set_note(note.clone());
+            let _ = self
+                .event_bus
+                .publish_generic("daemon.roll.disarmed", serde_json::json!({ "reason": why }));
+            log::warn!("auto_update: {note}");
+        }
+        disarmed
     }
 
     fn supersede_roll(&self, from: &str, to: &str) -> bool {
