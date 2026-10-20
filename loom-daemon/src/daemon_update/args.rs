@@ -257,11 +257,11 @@ mod tests {
         ] {
             assert!(help.contains(flag), "help.txt lost {flag}");
         }
-        // Exit codes 0-8 are branched on by the dispatcher, the daemon's own
+        // Exit codes 0-10 are branched on by the dispatcher, the daemon's own
         // auto-update tick and the retained suites. Anchored at a line start
         // with the banner's real two-space indent: a bare `contains("3")`
         // would be satisfied by any stray digit in 393 lines of prose.
-        for code in 0..=8 {
+        for code in 0..=10 {
             // 2 is not a code this script emits; the banner skips it too.
             if code == 2 {
                 continue;

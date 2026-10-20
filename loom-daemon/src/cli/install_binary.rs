@@ -25,6 +25,9 @@
 //!   exits `1`, removes the staged file and leaves `<dest>` as it was.
 //! * Everything human-facing goes to stderr.
 //!
+//! When `LOOM_INSTALL_IDENTITY_SINK` names a file, `publish` appends the
+//! identity of the install it made to it (`provision::txn::report_identity`).
+//!
 //! There is no restore here and no decision about whether an install was
 //! healthy: see `daemon_update::provision::txn`.
 
@@ -75,6 +78,8 @@ impl InstallBinaryCommand {
                     if let Some(line) = done.retained_line() {
                         out::say(&line);
                     }
+                    // The parent's restore is bound to THIS publish (#12776).
+                    provision::txn::report_identity(&dest, &done);
                     std::process::exit(0);
                 }
                 Err(e) => {

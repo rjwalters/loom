@@ -20,6 +20,9 @@ use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes,
 pub const RESULT_SPAWNED: &str = "spawned";
 /// `loom.dispatch.admission_result` of a step a gate or its claim refused.
 pub const RESULT_REFUSED: &str = "refused";
+/// The story-points attribute (#12957), on this span and the step's
+/// `loom.sweep` close: the key `sweep.started` / `sweep.outcome` use.
+pub const STORY_POINTS: &str = "loom.story_points";
 
 /// One spawn attempt's facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +40,9 @@ pub struct StepDispatch<'a> {
     pub resumed: bool,
     /// The weight terms of the draw that picked the step (#12185).
     pub draw: Option<StepDrawTerms>,
+    /// The item's story points (#12957): `loom.story_points`, absent when
+    /// the item is unsized. A PR step's are its closing issue's.
+    pub story_points: Option<u32>,
     /// The step's sweep id, once one was assigned.
     pub sweep_id: Option<&'a str>,
     /// How the step's pre-claim ran, for a role-keyed lease claim (#12183).
@@ -109,6 +115,9 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
         attributes.insert("loom.step.total_weight".into(), draw.total_weight.to_string());
         attributes.insert("loom.step.repo_items".into(), draw.repo_items.to_string());
         attributes.insert("loom.step.in_flight_repo".into(), draw.in_flight_repo.to_string());
+    }
+    if let Some(points) = step.story_points {
+        attributes.insert(STORY_POINTS.into(), points.to_string());
     }
     if let Some(id) = step.sweep_id {
         attributes.insert("loom.sweep_id".into(), id.to_string());
@@ -208,6 +217,7 @@ mod tests {
                 repo_items: 7,
                 in_flight_repo: 2,
             }),
+            story_points: None,
             sweep_id: Some("step-judge-42-1"),
             claim: None,
             assignment_id: None,
@@ -357,6 +367,29 @@ mod tests {
                 "{key} is dropped at export"
             );
         }
+    }
+
+    /// #12957: a sized step carries its points, and they survive the
+    /// export allowlist; an unsized one has no attribute, never `0`.
+    #[test]
+    fn a_sized_step_carries_its_story_points_and_an_unsized_one_none() {
+        let builder = StepDispatch {
+            role: StepRole::Builder,
+            story_points: Some(5),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&builder, None, Utc::now());
+        assert_eq!(span.attributes.get(STORY_POINTS).map(String::as_str), Some("5"));
+        assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&STORY_POINTS));
+        // A PR step's points are its closing issue's, passed in the same field.
+        let judge_step = StepDispatch {
+            story_points: Some(8),
+            ..judge(RESULT_REFUSED, "claim_lost")
+        };
+        let span = super::span(&judge_step, None, Utc::now());
+        assert_eq!(span.attributes.get(STORY_POINTS).map(String::as_str), Some("8"));
+        let unsized_step = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert!(!unsized_step.attributes.contains_key(STORY_POINTS));
     }
 
     #[test]

@@ -110,6 +110,10 @@ pub struct StepSpawnRequest {
     pub resumed: bool,
     /// The draw that picked it; `None` for a step not drawn (a resume).
     pub draw: Option<StepDrawTerms>,
+    /// The item's story points from the classifier (#12957,
+    /// [`crate::work_finder::step_item::Item::story_points`]): a telemetry
+    /// fact only, never a gate. `None` when unsized or not drawn.
+    pub story_points: Option<u32>,
 }
 
 impl StepSpawnRequest {
@@ -123,6 +127,7 @@ impl StepSpawnRequest {
             age_source: "unknown".to_string(),
             resumed: false,
             draw: None,
+            story_points: None,
         }
     }
 
@@ -709,6 +714,11 @@ impl SweepRegistry {
                 overflow: false,
             },
         );
+        if let Some(points) = request.story_points {
+            let entries = &self.entries;
+            self.step_points.retain(|id, _| entries.contains_key(id));
+            self.step_points.insert(sweep_id.clone(), points);
+        }
         self.start_step_lease_renewal(item, role, &sweep_id, pid, &log_path);
         self.publish_step_slots();
         self.emit_dispatch(&sweep_id, &launch.admission, None, None);
@@ -810,6 +820,7 @@ impl SweepRegistry {
                 age_source: &request.age_source,
                 resumed: request.resumed,
                 draw: request.draw,
+                story_points: request.story_points,
                 sweep_id,
                 claim,
                 assignment_id,
@@ -820,22 +831,29 @@ impl SweepRegistry {
         );
     }
 
-    /// Publish this registry's live steps by role, each as its start time, to
-    /// `busy_slots` (#11906; the start times feed the age gauges, #12873).
+    /// Publish this registry's live steps by role, each as its start time and
+    /// story points, to `busy_slots` (#11906; the start times feed the age
+    /// gauges, #12873, and the points the size gauge, #12957).
     pub(crate) fn publish_step_slots(&self) {
-        let mut running: std::collections::BTreeMap<&'static str, Vec<DateTime<Utc>>> =
-            Default::default();
+        use crate::observability::ops::busy_slots::{self, LiveStep, LiveSteps};
+        let mut running = LiveSteps::new();
         for info in self.entries.values() {
             if let (SweepKind::Step { role, .. }, SweepState::Running | SweepState::Pending) =
                 (&info.kind, &info.state)
             {
-                running
-                    .entry(role.role_name())
-                    .or_default()
-                    .push(info.started_at);
+                running.entry(role.role_name()).or_default().push(LiveStep {
+                    started_at: info.started_at,
+                    points: self.step_points(&info.sweep_id),
+                });
             }
         }
-        crate::observability::ops::busy_slots::set_steps(&self.config.workspace_root, running);
+        busy_slots::set_steps(&self.config.workspace_root, running);
+    }
+
+    /// The story points step `sweep_id` was spawned with (#12957), `None`
+    /// when unsized or unknown to this daemon.
+    pub(crate) fn step_points(&self, sweep_id: &str) -> Option<u32> {
+        self.step_points.get(sweep_id).copied()
     }
 }
 
