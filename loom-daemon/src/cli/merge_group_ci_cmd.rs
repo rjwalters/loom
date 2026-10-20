@@ -1,5 +1,5 @@
 //! `loom-daemon merge-group-ci …` — combined-tree CI qualification for the
-//! merge queue (#10257). Library: `loom_daemon::merge_group_ci`.
+//! merge queue (#10257). Library: `crate::merge_group_ci`.
 //!
 //! | Verb | Exit 0 | Exit 1 | Exit 2 |
 //! |---|---|---|---|
@@ -11,8 +11,8 @@
 
 use std::path::PathBuf;
 
+use crate::merge_group_ci::{self, eligibility, RepoFacts};
 use anyhow::Result;
-use loom_daemon::merge_group_ci::{self, eligibility, RepoFacts};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum MergeGroupCiCommand {

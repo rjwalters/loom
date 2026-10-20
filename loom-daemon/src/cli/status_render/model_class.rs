@@ -9,7 +9,7 @@
 //!
 //! This module supplies the breakdown for both surfaces — the human capacity
 //! line and `--json`'s `capacity.healthy_accounts_by_class` — from the one
-//! shared computation in [`loom_daemon::capacity::model_class`], which
+//! shared computation in [`crate::capacity::model_class`], which
 //! `loom-daemon health`'s `tokens` section also uses. The two commands
 //! therefore cannot disagree about a pool.
 //!
@@ -29,8 +29,8 @@
 //! ratchet, so new rendering logic goes in a sibling module and the parent
 //! keeps only the call.
 
-use loom_daemon::capacity::model_class::{self, ClassCapacity};
-use loom_daemon::types::DaemonStatusReport;
+use crate::capacity::model_class::{self, ClassCapacity};
+use crate::types::DaemonStatusReport;
 
 /// Read the per-class snapshot for the pool this report names, or `None` when
 /// there is no pool directory on the wire or no readable `.ranking` in it.
@@ -67,7 +67,7 @@ pub(crate) fn monitor_utilization_detail(report: &DaemonStatusReport) -> serde_j
 mod tests {
     use super::{capacity_detail, capacity_suffix, monitor_utilization_detail};
     use crate::cli::status::sample_report::sample_report;
-    use loom_daemon::types::DaemonStatusReport;
+    use crate::types::DaemonStatusReport;
     use std::path::Path;
 
     /// A report pointing at `dir` as the daemon-resolved token pool.

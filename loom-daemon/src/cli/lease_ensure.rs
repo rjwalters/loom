@@ -389,7 +389,7 @@ impl LeaseEnsureArgs {
             return Outcome::NoAgentSession;
         }
 
-        let root = match loom_daemon::repo_root::resolve_repo_root(&self.workspace) {
+        let root = match crate::repo_root::resolve_repo_root(&self.workspace) {
             Ok(r) => r,
             Err(e) => return Outcome::NoRepoRoot(e.to_string()),
         };

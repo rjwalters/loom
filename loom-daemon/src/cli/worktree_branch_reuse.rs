@@ -1,6 +1,6 @@
 //! `loom-daemon worktree-branch-reuse` — `worktree.sh`'s local-branch reuse
 //! arm (#8195 slice 14). Exit 0 reuse, 1 refuse; the full contract is on
-//! [`loom_daemon::worktree_cli::branch_reuse`].
+//! [`crate::worktree_cli::branch_reuse`].
 //!
 //! clap because the only caller is `worktree.sh`; `--repo` exists so tests
 //! need not `chdir`.
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::branch_reuse;
+use crate::worktree_cli::branch_reuse;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeBranchReuseArgs {

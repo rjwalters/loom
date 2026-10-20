@@ -29,12 +29,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::comment_trust::TrustPolicy;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::host_identity::lease_host_identity;
+use crate::sweep_registry::opaque_host_id;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use loom_daemon::comment_trust::TrustPolicy;
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-use loom_daemon::host_identity::lease_host_identity;
-use loom_daemon::sweep_registry::opaque_host_id;
 
 use super::lease_co_occupancy::{live_pairs, read_rows, LeaseRow};
 use super::lease_renewer::{self, Store};
@@ -140,10 +140,10 @@ fn my_host_ids() -> Vec<String> {
 }
 
 fn post_comment(gh_bin: &Path, root: &Path, issue: u64, body: &str) -> bool {
-    use loom_daemon::forge_call_stats::ops;
-    let nwo = match loom_daemon::write_scope::may_write_from(root, None) {
-        loom_daemon::write_scope::Verdict::Allow(nwo) => nwo,
-        loom_daemon::write_scope::Verdict::Deny(why) => {
+    use crate::forge_call_stats::ops;
+    let nwo = match crate::write_scope::may_write_from(root, None) {
+        crate::write_scope::Verdict::Allow(nwo) => nwo,
+        crate::write_scope::Verdict::Deny(why) => {
             eprintln!("lease release: refusing to write here (#9548): {why}");
             return false;
         }

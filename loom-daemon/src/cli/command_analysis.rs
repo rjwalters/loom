@@ -4,7 +4,7 @@
 //! The guard hooks used to re-derive "what will this command execute" with
 //! hand-written shell masking, so literal text (a heredoc body, a quoted
 //! argument) was scanned as a live command. This verb answers from
-//! [`loom_daemon::role_tool_policy::command_match`], which lexes the command
+//! [`crate::role_tool_policy::command_match`], which lexes the command
 //! line, recurses into `$( )`, backticks, `bash -c`/`eval` payloads and
 //! wrappers, and treats a heredoc body as data unless a shell reads it or it is
 //! written to a file.
@@ -19,7 +19,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::role_tool_policy::command_match::executes_gh_pr_merge;
+use crate::role_tool_policy::command_match::executes_gh_pr_merge;
 
 /// Exit code for "this command does not execute the queried program".
 pub(crate) const EX_NO: i32 = 1;

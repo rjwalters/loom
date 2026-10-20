@@ -5,7 +5,7 @@
 //! backstop keeps bounding a PR whose CI never finishes.
 
 use super::*;
-use loom_daemon::judge_backstop::SKIP_CI_PENDING;
+use crate::judge_backstop::SKIP_CI_PENDING;
 
 const GREEN: &str = r#"{"total_count":1,"check_runs":[{"status":"completed","started_at":"2026-10-14T05:00:00Z"}]}"#;
 
