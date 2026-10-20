@@ -79,6 +79,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use super::wip::{git_ok, git_stdout};
+
 /// What the ladder concluded. Mirrors the shell's stdout token exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -637,28 +639,6 @@ fn merge_tree_write_tree(repo: &Path, default_sha: &str, tip: &str) -> MergeTree
         Some(1) => MergeTree::Conflict,
         _ => MergeTree::NoAnswer,
     }
-}
-
-fn git_ok(repo: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-fn git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 #[cfg(test)]

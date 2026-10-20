@@ -168,8 +168,19 @@ pub mod auto_update_tick;
 /// eligibility boundary.
 pub mod dispatch_eligibility;
 
+/// `eta.stage_entry` (#12869) — an item's observed arrival in a pipeline
+/// stage, diffed from the discovery snapshot.
+pub mod stage_entry;
+/// `eta.stage_occupancy` (#12866) — per-repo, per-stage gauge of the items
+/// still waiting in a pre-ready stage (count, oldest age, age buckets).
+pub mod stage_occupancy;
+
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
+/// `hold.transition` (#12665) — a hold label applied to or removed from a PR.
+pub mod hold_transition;
+/// `merge.authorization.evaluated` (#12666) — one merge-group authorization evaluation.
+pub mod merge_authorization;
 /// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
 pub mod merge_queue_event;
 /// `merge.queue.observed` (#12667) — the merge queue as one existing read saw it.
@@ -193,6 +204,10 @@ pub mod host_status;
 
 /// Per-kind silence thresholds for `otlp_export` health (#12120).
 pub mod kind_silence;
+
+/// Producer-liveness guard: every registered kind has a producer or is on an
+/// explicit producer-less allowlist (#12947, #11301 post-mortem).
+pub mod kind_producer;
 
 /// `scope.memory` (#12241) — one agent scope's memory limit, peak and OOM kills.
 pub mod scope_memory;
@@ -546,6 +561,17 @@ macro_rules! telemetry_kind_table {
             MergeQueueEvent = "merge_queue.event" => $crate::telemetry::kinds::merge_queue_event::MergeQueueEventRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
+            /// One merge-group authorization evaluation with a closed reason
+            /// token (#12666). OTLP-only. See [`merge_authorization`].
+            MergeAuthorization = "merge.authorization.evaluated" => $crate::telemetry::kinds::merge_authorization::MergeAuthorizationRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A hold label applied to or removed from a PR, with its
+            /// structured reason and attempted-vs-confirmed state (#12665).
+            /// OTLP-only. See [`hold_transition`].
+            HoldTransition = "hold.transition" => $crate::telemetry::kinds::hold_transition::HoldTransitionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
             /// The merge queue (order, membership, completeness) as the existing
             /// `mergeQueue.entries` read saw it (#12667). OTLP-only. See
             /// [`merge_queue_observed`].
@@ -574,6 +600,21 @@ macro_rules! telemetry_kind_table {
             /// attributes. Replaces the POST to loom-ui's
             /// `/api/alerts/external`. OTLP-only. See [`alert_transition`].
             AlertTransition = "alert.transition" => $crate::telemetry::kinds::alert_transition::AlertTransitionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A per-stage occupancy gauge (Issue #12866): how many items sit in
+            /// `triage_wait` / `approval_wait` / `operator_hold` right now, the
+            /// oldest one's age and fixed age buckets, per repo plus a global
+            /// rollup — the still-waiting population `eta.stage_outcome` (exit
+            /// only) cannot see. OTLP-only. See [`stage_occupancy`].
+            StageOccupancy = "eta.stage_occupancy" => $crate::telemetry::kinds::stage_occupancy::StageOccupancyRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One item's observed arrival in a pipeline stage (Issue #12869),
+            /// diffed from the step driver's per-tick discovery snapshot:
+            /// the arrival (inflow) fact `eta.stage_outcome`'s reconstructed
+            /// `entered_at` could not give. OTLP-only. See [`stage_entry`].
+            StageEntry = "eta.stage_entry" => $crate::telemetry::kinds::stage_entry::StageEntryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

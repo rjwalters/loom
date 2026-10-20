@@ -243,16 +243,15 @@ mod tests {
             "dispatch": {"dispatchers": dispatchers},
             "hosts": hosts,
             "config": {
-                "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 20}}},
+                "defaults": {"fleetDispatch": {"enabled": false}},
                 "hosts": {
                     "worker-a": {
-                        "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 30}}},
-                        "local": {"autonomous": {"workFinder": {"maxConcurrent": 40}},
-                                  "fleetDispatch": {"enabled": true, "url": "http://c:1"}}
+                        "defaults": {"fleetDispatch": {"enabled": false}},
+                        "local": {"fleetDispatch": {"enabled": true, "url": "http://c:1"}}
                     },
                     "worker-b": {
-                        "defaults": {"autonomous": {"workFinder": {"maxConcurrent": 8}}},
-                        "local": {"fleetDispatch": {"enabled": true}}
+                        "defaults": {"fleetDispatch": {"enabled": true}},
+                        "local": {"fleetDispatch": {"enabled": null}}
                     }
                 }
             }
@@ -309,13 +308,11 @@ mod tests {
     #[test]
     fn config_follows_the_render_tiers_by_name() {
         let doc = fleet_json(json!([]), json!([]));
-        let max = |host: &str| {
-            tiered(&doc, host, &["autonomous", "workFinder", "maxConcurrent"])
-                .and_then(Value::as_u64)
-        };
-        assert_eq!(max("worker-a"), Some(40), "local wins");
-        assert_eq!(max("worker-b"), Some(8), "host defaults next");
-        assert_eq!(max("worker-c"), Some(20), "fleet defaults last");
+        let enabled =
+            |host: &str| tiered(&doc, host, &["fleetDispatch", "enabled"]).and_then(Value::as_bool);
+        assert_eq!(enabled("worker-a"), Some(true), "local wins");
+        assert_eq!(enabled("worker-b"), Some(true), "a null local falls through to host defaults");
+        assert_eq!(enabled("worker-c"), Some(false), "fleet defaults last");
     }
 
     #[test]

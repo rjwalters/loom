@@ -199,7 +199,9 @@ const OFF: u8 = 2;
 #[derive(Debug, Clone)]
 struct Held {
     alert: Alert,
-    last_sent: Instant,
+    /// When this process last sent it; `None` for an adopted incident, which
+    /// is due at once (the previous process's last send is not counted).
+    last_sent: Option<Instant>,
 }
 
 /// The buffer before [`start`] and the open set the heartbeat re-sends.
@@ -219,7 +221,7 @@ impl Output {
                     id,
                     Held {
                         alert: alert.clone(),
-                        last_sent: now,
+                        last_sent: Some(now),
                     },
                 );
             }
@@ -242,21 +244,26 @@ impl Output {
     fn due(&mut self, now: Instant) -> Vec<Alert> {
         self.open
             .values_mut()
-            .filter(|h| now.saturating_duration_since(h.last_sent) >= HEARTBEAT)
+            .filter(|h| {
+                h.last_sent
+                    .is_none_or(|sent| now.saturating_duration_since(sent) >= HEARTBEAT)
+            })
             .map(|h| {
-                h.last_sent = now;
+                h.last_sent = Some(now);
                 h.alert.clone()
             })
             .collect()
     }
 
-    /// Adopt an incident an earlier process opened, unless already held.
-    fn adopt(&mut self, alert: Alert, now: Instant) {
+    /// Adopt an incident an earlier process opened, unless already held. It is
+    /// due at once: the downtime since that process's last send could already
+    /// exceed the schema's 12 h heartbeat rule.
+    fn adopt(&mut self, alert: Alert) {
         self.open
             .entry((alert.rule.clone(), alert.key.clone()))
             .or_insert(Held {
                 alert,
-                last_sent: now,
+                last_sent: None,
             });
     }
 }
@@ -298,8 +305,9 @@ pub fn start() -> Option<tokio::task::JoinHandle<()>> {
     log::info!("alerts: emitting alert.transition over OTLP (#12806); {held} held before start");
     Some(tokio::spawn(async {
         loop {
-            tokio::time::sleep(HEARTBEAT_CHECK).await;
+            // First, so an incident adopted before start goes out at once.
             heartbeat();
+            tokio::time::sleep(HEARTBEAT_CHECK).await;
         }
     }))
 }
@@ -353,9 +361,12 @@ pub fn post(alert: Alert) {
 }
 
 /// A [`ledger::Ledger`] reloaded `alert` as open from an earlier process: keep
-/// its heartbeat going until the ledger resolves it.
+/// its heartbeat going until the ledger resolves it. Re-sent at once.
 pub fn adopt(alert: Alert) {
     if !is_off() {
-        output().adopt(alert, Instant::now());
+        output().adopt(alert);
+        if is_active() {
+            heartbeat();
+        }
     }
 }

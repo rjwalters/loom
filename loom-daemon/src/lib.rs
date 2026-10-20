@@ -159,7 +159,6 @@ pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;
 pub mod comment_trust;
-pub mod config_journal;
 pub mod config_resolver;
 pub mod cpu_headroom;
 pub mod credential_preflight;
@@ -186,6 +185,8 @@ pub mod dispatch_tap;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
 pub mod eager_reclaim;
+#[cfg(test)]
+pub(crate) mod env_test_support;
 pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
@@ -196,7 +197,6 @@ pub mod fleet;
 pub mod fleet_alert;
 pub mod fleet_captain;
 pub mod fleet_dispatch;
-pub mod fleet_outputs;
 pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
@@ -235,11 +235,11 @@ pub mod forge_rerun;
 pub mod forge_tree_unchanged;
 pub mod forge_version_only_diff;
 pub mod forge_wait_checks;
+pub mod fs_util;
 /// Generated content a quarantine must never stash: name-based artifacts and
 /// content-verified cargo build trees (#5690, #11075).
 pub mod generated_artifact;
 pub mod gh_invocation;
-pub mod gh_repo_env;
 pub mod gh_state_probe;
 pub mod git_ff_identical;
 pub mod git_parser;
@@ -271,7 +271,6 @@ pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
 // #11855: bound Judge re-runs on a PR whose passes end without a verdict.
-pub mod journal;
 pub mod judge_backstop;
 pub mod key_ref;
 pub mod kimi_usage;

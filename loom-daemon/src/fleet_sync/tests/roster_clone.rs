@@ -817,6 +817,37 @@ fn a_pass_with_no_changes_and_a_dry_run_emit_nothing() {
 }
 
 #[test]
+fn skip_not_cloned_emits_on_entry_only_and_re_emits_after_leaving() {
+    let root = tempfile::tempdir().unwrap();
+    let plan = plan(vec![
+        Change::SetWeight {
+            name: "heavy".into(),
+            path: root.path().join("heavy"),
+            from: 1,
+            to: 3,
+        },
+        missing(root.path(), "absent", Some(&gh("absent"))),
+    ]);
+    let (pass, _) = run(&plan, true, &Clones::off());
+    let names = |fresh: &[&RosterEvent]| fresh.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+
+    // Pass 1: the repo enters the uncloned set, so it emits (and set-weight).
+    let (fresh, seen) = fresh_events(&pass.changes, &BTreeSet::new());
+    assert_eq!(names(&fresh), ["heavy", "absent"]);
+
+    // Pass 2: unchanged skip set; only the never-deduplicated row repeats.
+    let (fresh, seen) = fresh_events(&pass.changes, &seen);
+    assert_eq!(names(&fresh), ["heavy"]);
+
+    // Pass 3: the repo left the set (cloned), which clears its dedupe state...
+    let (fresh, seen) = fresh_events(&[], &seen);
+    assert!(fresh.is_empty() && seen.is_empty());
+    // ...so a later re-entry emits again.
+    let (fresh, _) = fresh_events(&pass.changes, &seen);
+    assert_eq!(names(&fresh), ["heavy", "absent"]);
+}
+
+#[test]
 fn a_failed_apply_emits_no_change_event() {
     let root = tempfile::tempdir().unwrap();
     let plan = plan(vec![Change::SetWeight {

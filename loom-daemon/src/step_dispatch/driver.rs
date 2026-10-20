@@ -450,6 +450,10 @@ impl StepDriver {
         // The other listing readers (blocked queue, quarantine and claim
         // reconciliation) read this tick's repos instead of listing (#12307).
         crate::discovery::published::publish(&snapshot);
+        // Stage arrivals diffed from the same snapshot (#12869); no forge call.
+        crate::observability::stage_entry_fact::observe(&snapshot);
+        // Hold-age gauges from the same snapshot (#12369); no forge call.
+        crate::observability::ops::hold_age::observe(&snapshot);
         // Pass 3, serial and in walk order: stage entry, weighing, shaping.
         let filter_started = Instant::now();
         let mut jobs: Vec<Option<GatherJob>> = jobs.into_iter().map(Some).collect();

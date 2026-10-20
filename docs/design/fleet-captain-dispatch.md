@@ -41,7 +41,7 @@ Given 2026-10-16 and not reopened here.
 6. **Auth is the tailnet**, with `whois` caller identity and no per-host credentials.
 7. **Packaging.** A `loom-daemon` subcommand on the captain host, rolled by the version floor, configured from the fleet config.
 8. **Telemetry** over OTLP: assignments, refusals, fallbacks, queue age and refresh cost.
-9. **Keep it simple.** The only capacity cap is the host's own `maxConcurrent` (with its RAM, disk and load terms), enforced by the worker: it asks only for the slots it has free. The captain applies no capacity limit; it offers the next most important eligible work (operator, 2026-10-19, #12864). No knob the design does not need.
+9. **Keep it simple.** The only capacity cap is the host's own `maxConcurrent` (`free_slots` is `maxConcurrent` less what the host already runs), enforced by the worker: it asks only for the slots it has free. The captain applies no capacity limit; it offers the next most important eligible work (operator, 2026-10-19, #12864). No knob the design does not need.
 
 ## 2. Problem
 
@@ -133,8 +133,8 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 
 - A worker sends it **every 30 s**, riding the existing reaper heartbeat (the cadence `SweepRegistry::readvertise_peer_claims` runs on), so a host with a long tick still renews.
 - **`live`** is every step the host runs, including ones the captain never granted (fallback, attended). `assignment_id` is present only for granted ones. This is how the table is rebuilt after a restart. An optional `started_at` (RFC 3339 UTC, #12873) gives each step's start, for the captain's `oldest_live_age_sec` gauge; an older peer omits or ignores it.
-- **`free_slots`** is the worker's own count, bounded by its own `maxConcurrent`, RAM, disk and load terms. The worker enforces its capacity by asking only for those slots; a full worker does not ask. The server applies no capacity limit of its own (#12864): it once refused a host whose rows reached `min(free_slots + live, maxConcurrent)`, but its rows outlive the work they stand for (until a release or the row TTL), so that count ran above what hosts were running and stalled hosts with free slots.
-- **`roles_ok`** is host-local state the captain cannot know: a role whose token pool is exhausted, or behind the load brake or a disk back-off, is left out. Static fit comes from the fleet config (section 7).
+- **`free_slots`** is the worker's own count, `maxConcurrent - occupied` (`step_dispatch/driver.rs`), bounded only by its own `maxConcurrent`. The worker enforces its capacity by asking only for those slots; a full worker does not ask. The server applies no capacity limit of its own (#12864): it once refused a host whose rows reached `min(free_slots + live, maxConcurrent)`, but its rows outlive the work they stand for (until a release or the row TTL), so that count ran above what hosts were running and stalled hosts with free slots.
+- **`roles_ok`** is host-local state the captain cannot know: a role whose token pool is exhausted is left out. Phase 1 reports pool exhaustion only: a role behind the load brake or a disk back-off stays in, and local admission handles it after a grant. Static fit comes from the fleet config (section 7).
 
 ### 5.3 `claim`
 
@@ -162,11 +162,13 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 
 Unreachable, a timeout (short, about 2 s) or a `5xx` is a **failure** and counts toward fallback (section 9). A `403` (the host is not in the node map, or its `host_id` does not match) also fails open and counts toward the hysteresis, and the worker logs it at `ERROR`, so a mapping mistake is loud rather than a silent permanent fallback. A `claim` refusal is an answer, never a failure; a `grace` refusal sends that one claim down today's forge-lease path without counting as a failure. Nothing is retried within the tick.
 
-### 5.6 `next` (Phase 2 proposal)
+### 5.6 `next` (Phase 2; contract accepted 2026-10-19, built in #12817)
 
 `{"host_id", "free_slots", "roles_ok"}` (the heartbeat's host state) → `{"server_epoch", "queue_age_s", "assignments": [{"assignment_id", "repo", "item", "step", "ttl_s", "seed"}]}`.
 
 - An **empty** list is an answer: nothing fits this host now. The worker does **not** draw locally on an empty answer; that would bring the race back exactly when work is scarce.
+- **When a worker asks.** There is no fixed polling period. A worker asks when capacity becomes available, with at most one request in flight and capacity notifications coalesced into one. An empty answer schedules the next request with exponential backoff: nominal delays 30, 60, 120 s, 120 s after that, each multiplied by `(1 − jitter·u)` (`u` uniform in `[0,1)`, independent per host and per delay), so the actual delay never exceeds 120 s and keeps its spread at the cap. The first request after start waits a random `[0, startupSecs)`. Receiving work resets the backoff; repeated capacity checks do not; no free slots stops requests. A rise in free slots may bring the next request forward, but never closer than `initial·(1 − jitter)` to the previous one. A failed call is not an empty answer: it neither escalates nor resets the backoff, and the fallback hysteresis of §9 owns it. Keys, validation and reload behavior: `fleetDispatch.request.*` in `defaults/docs/daemon-reference.md`; tune them through fleet-gitops. This is local capacity scheduling, not a dashboard or event wake: the captain still follows GitHub through the Cloudflare mirror.
+- The captain answers from the queue (§10) as a `claim` would: it skips an item that already has a row, one the host's `roles_ok` does not cover, one a hold refuses, and answers empty in the grace window. It fills up to `free_slots` in rounds of at most one item per repo, and each offered item is granted (a row, as for `claim`). `queue_age_s` is absent until the first full worklist read.
 - `seed` (`loom-draw/v3` minute, tick and draw index) lets `pick.decision` replay the draw from the captain's record.
 - Each assignment goes through the same path as a drawn item: gates, live pre-check, pre-claim, `spawn_batch`. An assignment is a candidate, never a reason to skip a check. `refuse` and `release` close it as in Phase 1.
 
@@ -317,7 +319,7 @@ All signals go out over OTLP with the daemon's existing exporter, with `loom.rep
 | Signal | Where | Meaning |
 |---|---|---|
 | `loom.fleet_dispatch.call` span, one per call | worker and captain | `host`, endpoint, latency, granted or refused, `reason`, `server_epoch` (Phase 2 adds `queue_age_s` and queue size) |
-| Refusal and hold attributes on the call span (#12707) | worker and captain | `step`, `retry_after_s`, `held_by` (when the captain names a holder), and for a no-progress hold `hold_until` (RFC 3339 UTC wall clock); the captain's span adds `hold_rung`, `hold_set_by_outcome`, `hold_set_by_assignment_id`. A refused `loom.dispatch.step` carries `loom.dispatch.held_by` / `retry_after_s` / `hold_until`. Stable names for ETA queries; key on `reason`, since a hold has no `held_by` |
+| Refusal and hold attributes on the call span (#12707) | worker and captain | `step`, `retry_after_s`, `held_by` (when the captain names a holder), and for a no-progress hold `hold_until` (RFC 3339 UTC wall clock); the captain's span adds `hold_rung`, `hold_set_by_outcome`, `hold_set_by_assignment_id`, and on a live-row `held` refusal `holder_assignment_id` (#12740). A refused `loom.dispatch.step` carries `loom.dispatch.held_by` / `retry_after_s` / `hold_until`. Stable names for ETA queries; key on `reason`, since a hold has no `held_by` |
 | `loom.assignment.id` attribute | the existing `loom.dispatch.step` span | joins assign → pre-check → claim → outcome |
 | `claim_lost` after a grant (**derived**, not a new signal) | captain | the existing refusals counter with `reason=claim_lost`, which only a `refuse` after a grant can carry; the split-brain and attended-claim measure |
 | `loom.fleet_dispatch.refusals` counter | captain | refusals by reason: `claim` refusals and `refuse` tokens |
@@ -341,7 +343,7 @@ All signals go out over OTLP with the daemon's existing exporter, with `loom.rep
 
 ### 13.2 Phase 2: the captain assigns from the fleet queue
 
-The queue (section 10), the fleet ledger (section 8) and `next`. Configured workers call `next` each tick; `claim` remains for fallback and older workers. Roll out host by host.
+The queue (section 10), the fleet ledger (section 8) and `next`. Configured workers call `next` when capacity becomes available, with jittered exponential backoff on empty answers (§5.6), not on a tick; `claim` remains for fallback and older workers. Roll out host by host.
 
 **Exit:** over a week, `claim_lost` near 0 on captain-sourced ticks; few `pass_limit` / `slot_draws` stops with free slots; worker discovery at the backstop pace only; a host able to hold about 100 sessions reaches it when the backlog allows.
 
@@ -356,7 +358,7 @@ Phase 1 adds two per-host keys, live-reloadable and set from the fleet config's 
 - `fleetDispatch.enabled` (bool): this host uses the captain. Off by default and on every standalone install.
 - `fleetDispatch.url`: the captain's tailnet URL.
 
-Setting them on two hosts is the Phase 1 A/B; setting them in the fleet defaults puts every host in fleet mode. Phase 2 proposes one more, `fleetDispatch.queueRefreshSecs` (the full-refresh period, default 600), read by the captain.
+Setting them on two hosts is the Phase 1 A/B; setting them in the fleet defaults puts every host in fleet mode. Phase 2 proposes one more, `fleetDispatch.queueRefreshSecs` (the full-refresh period, default 600), read by the captain, and adds the worker's work-request backoff block `fleetDispatch.request.{initialBackoffSecs, maxBackoffSecs, jitter, startupSecs}` (defaults 30, 120, 0.5, 30; #12817, §5.6).
 
 ### 13.5 Follow-up issues
 

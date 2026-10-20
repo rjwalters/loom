@@ -14,6 +14,130 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-20
+
+- **PR #12946**: fix: grant group-check workflow reads and re-run on CI completion
+- **PR #12802**: build(deps): bump the npm-minor-patch group across 1 directory with 3 updates
+- **PR #12658**: fix: report a missing guard-destructive engine in check-guards-installed
+- **PR #12570**: fix: check out .loom in the merge-group template and audit group-check without checkout
+- **PR #12539**: fix: remove retired generated skills in source-backed resync
+- **PR #12321**: refactor: answer the gh pr merge guard from the shared command lexer
+- **PR #12154**: fix(resync): make forge label create/refresh opt-in via --sync-labels
+- **Issue #12568** (closed): merge_group workflow can't post loom/merge-authorization: write_scope refuses (no checkout in the template), so every queued PR times out
+- **Issue #12507** (closed): Source-backed resync leaves retired generated Codex skills discoverable
+- **Issue #12236** (closed): guard: shared command-analysis lexer + corpus harness, first move: merge-redirect check (slice 1 of #11113)
+- **Issue #10770** (closed): resync-installed.sh writes forge labels by default; make forge writes opt-in or list them in --dry-run
+- **PR #12931**: feat(fleet-dispatch): captain next endpoint and capacity-driven request backoff
+- **PR #12929**: build(deps): bump hono from 4.13.7 to 4.13.13 in /mcp-loom
+- **PR #12928**: feat: add fleet-config apply-floor for daemon-less hosts below the fleet floor
+- **PR #12923**: fix: emit every eligibility/disposition row and document rank as comparator order
+- **PR #12922**: feat: emit hold-age gauges from the discovery snapshot
+- **PR #12917**: ci: run macOS shell legs on Homebrew bash 5, document bash >= 4 floor
+- **PR #12859**: refactor: dedupe worktree_cli git_ok/git_stdout helpers onto wip.rs
+- **Issue #12926** (closed): Attended (no-daemon) hosts never converge the loom-daemon CLI to the fleet floor
+- **Issue #12198** (closed): ci-daily: macOS shell flake leg never completes green — decide fix, advisory or remove
+- **Issue #12920** (closed): telemetry: remove the 256-row caps on dispatch_eligibility/disposition; stop presenting rank/work_ahead as queue position
+- **Issue #12916** (closed): Decision: drop bash 3.2 support (require bash >= 4) or gate it per-PR
+- **Issue #12788** (closed): Dedupe git_ok/git_stdout helpers in worktree_cli onto wip.rs
+- **Issue #12369** (closed): Telemetry: re-home the hold-age gauges on the discovery snapshot (dropped with the stage-dwell sampler)
+- **PR #12925**: test(step-dispatch): classify and draw a whole tick from a Gitea listing
+- **PR #12902**: feat(fleet-dispatch): start the captain's queue feed from serve with a configurable refresh period
+- **PR #12919**: feat(discovery): Gitea listings in the direct backend, isolated fleet gh tier
+- **PR #12913**: fix: emit roster skip:not-cloned only when a repo enters the uncloned set
+- **PR #12911**: fix: report skipped CI-telemetry owners as degraded health instead of blanket failure
+- **PR #12912**: feat: add SigNoz alerts for CI telemetry export lag, failing polls and silent arrival
+- **PR #12671**: feat: export merge-group authorization evaluations to OTLP
+- **PR #12914**: fix: offer ci.run/ci.job journal lines ahead of the span backlog
+- **PR #12846**: fix: per-exporter alert delivery, drop stale queued opens, re-send adopted incidents, single-flight queue writes
+- **PR #12891**: refactor(step-dispatch): remove unwired affinity_wait and graceSecs
+- **PR #12883**: feat(telemetry): populate eta.dispatch_eligibility verdict/reason/rank as attributes (#12867)
+- **PR #12906**: feat: emit stage.work_started on a successful issue step spawn
+- **PR #12672**: feat: export Champion hold-label transitions to OTLP as hold.transition
+- **PR #12907**: feat: export per-kind last export time as an OTLP gauge
+- **PR #12882**: feat(telemetry): emit eta.stage_occupancy gauge for items waiting in pre-ready stages
+- **PR #12860**: refactor: share kv_bool/kv_int helpers across OTLP mapping modules
+- **PR #12886**: docs(fleet-dispatch): correct free_slots wording, test name and roster tier-test key
+- **PR #12897**: docs: point CLAUDE.md at the fail-closed principle
+- **PR #12899**: docs: design recent-observed-activity signal from existing Worker data
+- **PR #12889**: test(scaffolding): dedupe mirrored CLAUDE.md/AGENTS.md marker tests
+- **PR #12861**: refactor: remove the #9908 journals and their shadow writes
+- **PR #12855**: refactor: remove dead gh_repo_env module and rehome LOOM_REPO docs
+- **Issue #12019** (closed): [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1)
+- **Issue #12816** (closed): Captain fleet queue from /v1/changes with full-refresh backstop and tombstones
+- **Issue #12086** (closed): Telemetry(coverage): every lease-writing host exports pick.decision + fleet.state (ETA ready_wait over-prediction, loom-ui#4063 #7)
+- **Issue #12910** (closed): roster.change: captain re-emits the same skip:not-cloned set every pass (132k rows/day, 97 repos)
+- **Issue #12908** (closed): Alert when CI telemetry stops arriving in SigNoz (export lag, failing poll, no ci.run arrivals)
+- **Issue #12666** (closed): Export merge.authorization.evaluated from run_group_check
+- **Issue #12792** (closed): ci_telemetry: export cursor stuck behind span backlog; fresh ci.run/ci.job facts never reach SigNoz
+- **Issue #12043** (closed): macOS bash 3.2: 7 shell suites fail on bash-4+ semantics
+- **Issue #12915** (closed): CI Daily red on macOS: bash 3.2 incompatibilities in sync-labels.sh and champion AC-gate test
+- **Issue #12831** (closed): alert.transition follow-ups: watchdog resolve on a dead exporter, leftover queued opens, heartbeat after restart
+- **Issue #12841** (closed): Remove unwired affinity_wait and graceSecs from the step session ledger
+- **Issue #12322** (closed): Roster pass: emit a telemetry record per register / set-priority / skip:not-cloned change
+- **Issue #12867** (closed): telemetry: eta.dispatch_eligibility is a hollow shell — emit the eligibility verdict + blocking_reason
+- **Issue #12904** (closed): telemetry: no live fact marks the end of ready_wait (accepted claim); sweep.started stopped Oct 15 and stage.work_started never fires for it
+- **Issue #12665** (closed): Emit hold.transition facts at Champion merge-risk hold and merge-pr refusal
+- **Issue #12905** (closed): telemetry: per-producer coverage heartbeat so consumers censor at end of known coverage (split from #12904)
+- **Issue #12866** (closed): telemetry: per-stage occupancy gauge (queue depth + age buckets) — de-blind the live waiting population
+- **Issue #12794** (closed): Dedupe 11 copies of kv_bool (and 3 of kv_int) in OTLP mapping modules
+- **Issue #9255** (closed): forge_events: event-gated per-workspace polling under a bounded staleness cap (ADR-0021 amendment step 2)
+- **Issue #12878** (closed): Follow-ups from #12871 (captain cap removal): doc and test-name accuracy
+- **Issue #12856** (closed): Fail-closed engineering pass: adopt the principle + convert the pipeline's silent-failure sites
+- **Issue #12870** (closed): telemetry: operator/human presence heartbeat gauge (online + last-interaction)
+- **Issue #12842** (closed): Dedupe mirrored CLAUDE.md/AGENTS.md scaffolding tests via one parameterised body
+- **Issue #12848** (closed): Unwind the #9908 journals: remove the Phase 2 journal core, execution, telemetry-shadow and config-snapshot journals
+- **Issue #12814** (closed): Remove gh_repo_env.rs: apply_loom_repo_override has no production callers
+- **Issue #12868** (closed): telemetry: merge_hold reason + lifecycle fact (blocking_reason on hold apply/release)
+- **PR #12901**: fix: skip redrawing a Champion-held PR at its recorded hold head
+- **PR #12847**: refactor: remove fleet singleton-output watchdog and intake pass heartbeat
+- **PR #12837**: refactor(daemon): share human_size and newest_mtime_and_size across reclaim modules
+- **PR #12857**: fix: retry release metadata reads and log why they failed
+- **PR #12839**: feat(fleet-dispatch): add the captain's fleet queue with refresh and tombstones
+- **PR #12896**: feat(telemetry): emit eta.stage_entry arrivals diffed from the discovery snapshot
+- **PR #12890**: feat(observability): stamp host CPU count, load and CPU budget on sweep/phase spans
+- **PR #12893**: refactor(loom-daemon): share one test EnvGuard across 14 duplicated copies
+- **PR #12894**: feat(telemetry): captain expiry span and dispatch attempt lineage
+- **PR #12832**: refactor: remove unused keyset-paging layer from signoz_read
+- **PR #12838**: feat(telemetry): export holder assignment id on held refusal spans
+- **PR #12892**: feat(telemetry): close spans and release captain rows on EC2 spot interruption notices
+- **PR #12824**: fix: roll back a refused Builder step's lease so peers do not yield to it
+- **PR #12850**: refactor: remove the dashboard event-feed client and its wake and poll-gating consumers
+- **PR #12858**: docs: fail-closed engineering principle (#12856)
+- **PR #12887**: feat(telemetry): host shape (CPU count, RAM, arch, instance type) as OTLP resource attributes
+- **PR #12888**: feat(telemetry): export captain row vs reported-live gauges and step running ages
+- **PR #12885**: fix(telemetry): record every workspace draw in pick.decision (#12877)
+- **PR #12871**: fix(fleet-dispatch): the captain applies no capacity limit
+- **PR #12821**: fix(watchdog): make peer-coordination health log-only, no GitHub issue lifecycle
+- **PR #12851**: refactor: share tmpdir and hermetic git helpers in worktree differential tests
+- **Issue #12900** (closed): Don't redraw a Champion-held PR at its held head (no-op champion_merge runs hold the repo's merge slot)
+- **Issue #12845** (closed): Remove the fleet singleton-output watchdog (epic #10916 closed as not planned)
+- **Issue #12784** (closed): Consolidate duplicated human_size / newest_mtime_and_size helpers in loom-daemon
+- **Issue #12849** (closed): auto_update: the floor-roll tick usually can't read a release's asset list, so fleet hosts stay below the floor ('no artifact … asset list could not be read')
+- **Issue #12869** (closed): telemetry: emit a true stage-entry (arrival) fact at label-apply, not reconstructed from forge
+- **Issue #12884** (closed): Telemetry(host contention): load samples at sweep/phase start, in-flight sweep count and applied CPU quota on sweep records
+- **Issue #12853** (closed): Consolidate 15 duplicated EnvGuard test helpers in loom-daemon into one shared guard
+- **Issue #12875** (closed): Telemetry(retries): captain assignment-expiry event + dispatch attempt lineage on loom.dispatch.step
+- **Issue #12756** (closed): Remove unused keyset-paging layer in signoz_read.rs (SignozRead, SqlPages, FileRows, PageQuery)
+- **Issue #12740** (closed): Export the holding assignment id on fleet-dispatch 'held' refusal spans
+- **Issue #12876** (closed): Telemetry(spot): watch EC2 spot interruption/rebalance notices; close spans as interrupted_by_host_loss and release the captain row
+- **Issue #12822** (closed): Builder step refused with claim_lost leaves its loom:building label and lease behind (no builder runs, peers yield)
+- **Issue #12874** (closed): Telemetry(host shape): instance type, CPU count, arch and RAM as OTLP resource attributes
+- **Issue #12873** (closed): Telemetry(slots): export held vs running slots and running-work age (worker + captain), so ETA can tell full hosts from stale claims
+- **Issue #12877** (closed): Telemetry(pick.decision): remove MAX_RECORDED_DRAWS=50 cap on workspace_draw.draws (leftover from #11567)
+- **Issue #12872** (closed): Existing native step spans provide lifecycle correlation; typed reader must consume them
+- **Issue #12880** (closed): Telemetry: record spot reclaims and the retries they cause
+- **Issue #12881** (closed): Telemetry: carry host class and host contention on sweep and stage-outcome records
+- **Issue #12879** (closed): Telemetry: emit per-host running vs claimed slot counts (fix null slots.occupancy on the captain)
+- **Issue #12864** (closed): fleet-dispatch: remove the captain-side cap — the captain offers the next important work; limits are enforced only on the crew node
+- **Issue #12818** (closed): Stop peer-coordination watchdog GitHub issue churn; retain local diagnostics
+- **Issue #12785** (closed): Consolidate duplicated tmpdir and hermetic git helpers in worktree differential tests
+- **Issue #12769** (closed): Stacking follow-ups: retarget-failure flag text, pr.edit-base inventory op, consolidation delete guard, stack-parent fork freshness
+- **PR #12836**: fix(stacking): retry failed orphan retarget alone, inventory pr.edit-base, fetch before fork
+- **Issue #12840** (closed): loom-tools Phase 1: inventory and command contract (CLI boundary and migration map) — epic #12708
+- **PR #12844**: docs: add Loom tools CLI boundary and migration map
+- **Issue #12753** (closed): Add the remaining AC4 command-capture tests for drawn-model launch (non-Builder, unavailable candidate, private handoff)
+- **PR #12834**: test: cover non-Builder drawn-model launch, walked draw candidates and private handoff
+
 ### 2026-10-19
 
 - **PR #12803**: chore(deps): Bump the cargo-minor-patch group across 1 directory with 3 updates
@@ -23,6 +147,34 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #12796** (closed): work-docs archive adds a duplicate archive link when rotating into an existing month file
 - **PR #12791**: feat(telemetry): emit eta.dispatch_eligibility fact for ready_wait prediction
 - **Issue #12790** (closed): emit dispatch eligibility + blocking-reason facts (ready_wait's #1 missing signal; forward-only so urgent)
+- **Issue #9908** (closed): Consolidate persistence: one journal per concern, retire duplicated stores
+- **Issue #10916** (closed): Fleet singleton output watchdog: alert when any one-host fleet job stops producing output (not just when its host goes silent)
+- **Issue #12829** (closed): ci-daily.yml: stop POSTing alerts to the loom-ui dashboard (CI pushes nothing to our services)
+- **PR #12843**: ci-daily: stop recording results on loom-ui
+- **Issue #12825** (closed): Fleet Builder claimed an issue under a fresh in-session /loom:sweep lease (step 1b lease not honoured at dispatch)
+- **PR #12835**: fix(dispatch): admit never-renewed lease within first renewal interval to claim episode
+- **Issue #12781** (closed): Consolidate three duplicated Scratch temp-dir helpers in session_output tests
+- **PR #12833**: refactor(session_output): share one tempfile-backed Scratch across test modules
+- **Issue #12811** (closed): OTLP carriers for queue and host.health fields before retiring /ingest
+- **PR #12826**: feat(otlp): carry host.health's /ingest-only fields as gauges (#12811)
+- **Issue #12806** (closed): Daemon alerts to SigNoz: emit alert.transition OTLP logs instead of POSTing the loom-ui dashboard
+- **PR #12828**: Alerts as alert.transition OTLP logs; remove the loom-ui alert POST (#12806)
+- **Issue #12827** (closed): OTLP carriers for the queue.snapshot fields loom-ui's Backlog reads, before #12813 retires queue.snapshot
+- **PR #12830**: feat(telemetry): OTLP carriers for the queue.snapshot plan fields (#12827)
+- **Issue #12815** (closed): Captain-hostable change-stream pull and fleet-wide worklist read (library extraction from forge_mirror/wake.rs)
+- **PR #12820**: feat(forge-mirror): let a caller hold its own mirror for the change pull and worklist read
+- **Issue #12812** (closed): Daemon: treat /ingest 410 as retired and ignore legacy dashboard config keys
+- **PR #12819**: feat(observability): treat /ingest HTTP 410 as retired, warn on legacy ingest keys
+- **Issue #12823** (closed): merge-pr.sh closes issue N for a feature/issue-N PR that declares "Part of #N" (#12615 ignores partial increments)
+- **Issue #11269** (closed): audit-agents phase 2: resolve actual execution placement
+- **Issue #11271** (closed): audit-agents phase 4: Claude, Codex, Pi, and legacy OpenCode adapters
+- **Issue #11270** (closed): audit-agents phase 3: policy-at-action and scoped exception evidence
+- **Issue #9862** (closed): Move fleet forge credentials off human identities: host daemons onto the App installation, Worker onto the App pair, audit the credential mix per host
+- **Issue #9279** (closed): observability: execute the SigNoz backup-restore rehearsal against real backup tarballs
+- **Issue #8946** (closed): observability: create the six CI saved views and apply the logs/traces 7d retention API setting in the SigNoz trial org (live-UI remainder of #8826)
+- **Issue #8723** (closed): observability: roll out the collector session-store mounts on a live trial host (#8686 AC4/AC5)
+- **Issue #11268** (closed): audit-agents phase 1: versioned OpenCode session and action evidence
+- **Issue #9049** (closed): Security: no secrets under any repo/worktree — move all credential state to ~/.loom (21 Claude OAuth tokens leaked, 2nd incident)
 
 ### 2026-10-18
 

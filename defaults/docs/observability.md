@@ -216,6 +216,19 @@ simply lack `host.type`/`cloud.*`. `eta.stage_outcome` records carry the
 *observing* host's shape, not the executing host's; join through the
 executing `host.id` on `sweep.*` records for that.
 
+**Host load on sweep/phase spans (#12884).** `loom.sweep` and every
+`loom.phase` span carry the `lifecycle::host_attributes()` sample, including
+`loom.host.logical_cpus` and `loom.host.loadavg_1m`, at open and again at
+close. A close overwrites a same-named key, so the plain
+`loom.host.loadavg_1m` / `loom.host.load_per_core` on an exported span are the
+**close-time** sample; the open-time sample is kept under
+`loom.host.start.loadavg_1m` / `loom.host.start.load_per_core`, which no close
+re-stamps. Phase spans opened inside a `spawn-claude.sh` child (the checkpoint
+sites) also carry `loom.host.cpu_budget_cores` and `loom.host.sweeps_in_flight`
+— the CPU quota and the in-flight sweep count it was divided by. Each key is
+absent when unknown, never zero-filled: `sweeps_in_flight` is absent when the
+budget was not shared across sweeps (`LOOM_SWEEP_SHARED_CPU_BUDGET=0`).
+
 `host.name` has one source, the same string as `host.id`: the daemon's host
 identity, which is the operator-assigned `$LOOM_HOST_ID` when it is set and
 otherwise the OS hostname (`$HOSTNAME`, then the `hostname` binary). Set
@@ -623,6 +636,15 @@ tick and get 24h; activity-driven or failure-only kinds are `None` (never flagge
 kind with no row defaults to 24h. A host with no `otlp` exporter reports
 `no_exporter` with no `kinds`, and no error.
 
+Over OTLP (Issue #12905) each kind's `last_export_at` rides the `host.health` gauge
+`loom.host.kind_last_export_seconds{kind}` (unix seconds), so a consumer can refuse an
+`as_of` past a host's coverage. A kind with no export yet has no data point (absent,
+never zero), and a host with no `otlp_export` emits none. Caveats: the value is in
+memory, so after a restart it means "since process start"; and it is a delivery-coverage
+bound ("this host delivered kind K through T"), not proof the producer ran, because
+activity-driven kinds have no silence threshold. `host.health` and `host.export` give the
+host-level bound. `kind` is already on the collector's datapoint allowlist.
+
 ```json
 { "observability": {
     "otlp_required": false,
@@ -692,14 +714,6 @@ Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
 alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
 `defaults/observability/signoz/queue-dwell.sql`.
 
-**Fleet singleton outputs (#10916).** The in-daemon `fleet_alert` path
-(#10924) judges the registered one-host fleet outputs (`ci.run`, the captain
-gauges, and the intake-reconcile completed-pass heartbeat
-`.loom/state/intake-reconcile/last-pass.json`) against
-`fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
-cross-host alert that watched the ETA singletons was removed with the ETA
-subsystem (#11098).
-
 **Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
 gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)
 and `loom.tokens.usage_fraction_weekly` (rolling 7-day, from the
@@ -739,6 +753,20 @@ it reaching zero, #10888): `loom.merge.redate_prs{state}`
 merge-chain head that `main` keeps moving under. Details are in
 [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
+**Retried fleet dispatches (#12875).** When the fleet-dispatch captain
+grants an item and step again after an earlier assignment of the same repo,
+item and step ended, the worker's `loom.dispatch.step` span carries
+`loom.dispatch.attempt` (earlier assignments that ended),
+`loom.dispatch.prev_assignment_id` (the earlier step's `loom.assignment.id`)
+and `loom.dispatch.prev_end` (`released`, `expired`, or `host_lost` when the
+worker released it because its host was lost to a spot interruption, #12876). A first or renewed grant carries none. Each
+expired assignment also gets a captain `loom.fleet_dispatch.call` span with
+endpoint `expire`, result `expired`, reason `lease_expired`, naming the host,
+item, step and assignment id, so expiries are attributable per host and item.
+The captain keeps the lineage in memory, bounded to 4096 steps and 24 h; a
+captain restart resets `attempt`. Keys:
+[`telemetry-schema.md`](telemetry-schema.md).
+
 **Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
 covers candidates that reached a `dispatch()` attempt — a candidate filtered
 out earlier (`workspace_halted`, `parked`,
@@ -750,9 +778,9 @@ once as a terminal `left_queue` record when it leaves a repo whose listing
 succeeded. Sampled from the collector's periodic pass (the same cadence as
 `queue.snapshot`), never the tick loop, so a disposition lasting less than one
 collector interval can be missed; a 10-minute-or-longer lookback still always
-contains the current state of every queued issue. Cardinality is bounded: at
-most 256 rows become spans per sample (`loom.queue.disposition_rows_dropped{reason="truncated"}`
-counts the rest), and a row whose repo root never resolved to a forge slug is
+contains the current state of every queued issue. Every queued row becomes a
+span (no volume cap: a cap would make which items carry facts depend on
+iteration order), and a row whose repo root never resolved to a forge slug is
 dropped and counted as `reason="unresolved"` rather than exported with a local
 path. `loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
 in the same change, so `loom.issue` is no longer ambiguous on a multi-repo

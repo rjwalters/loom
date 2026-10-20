@@ -1191,3 +1191,59 @@ fn a_captain_cap_refusal_ends_the_ticks_draws() {
     assert_eq!(disposition_of("captain_cap"), Qd::DeferredCapacity);
     assert_eq!(disposition_of("captain_not_eligible"), Qd::HostConstraint);
 }
+
+/// The draw works on a Gitea forge (#12312): rows listed through the direct
+/// backend from recorded Gitea shapes (no `labels_at`, sub-issue counts,
+/// `author_association` or check summary) classify and draw a Curator, a
+/// Champion, a Builder, a Judge and a merge step.
+#[test]
+fn a_gitea_listing_classifies_and_draws_every_stage() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicU64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let gh = dir.path().join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf 'HTTP/1.1 200 OK\r\nETag: "g"\r\n\r\n'
+case "$*" in
+  *'/pulls?'*)
+    echo '[{"number": 40, "state": "open", "labels": [{"name": "loom:review-requested"}], "head": {"ref": "feature/issue-30", "sha": "abc"}, "base": {"ref": "main"}}, {"number": 60, "state": "open", "labels": [{"name": "loom:pr"}], "head": {"ref": "feature/issue-60", "sha": "def"}, "base": {"ref": "main"}}]' ;;
+  *'type=pulls'*)
+    echo '[{"number": 40, "state": "open", "body": "Closes #30", "labels": [{"name": "loom:review-requested"}], "pull_request": {}}, {"number": 60, "state": "open", "body": "Closes #60", "labels": [{"name": "loom:pr"}], "pull_request": {}}]' ;;
+  *)
+    echo '[{"number": 1, "state": "open", "labels": [{"name": "loom:triage"}]}, {"number": 2, "state": "open", "labels": [{"name": "loom:curated"}]}, {"number": 3, "state": "open", "labels": [{"name": "loom:issue"}]}]' ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let target = crate::discovery::Target {
+        slug: format!("acme/gitea-tick-{}", std::process::id()),
+        gh_bin: gh,
+        root_dir: dir.path().to_path_buf(),
+    };
+    let snap = crate::discovery::direct::list_repo(
+        crate::forge_cmd::ForgeType::Gitea,
+        &target,
+        &AtomicU64::new(0),
+        crate::discovery::Tier::Gh,
+    )
+    .unwrap();
+    assert!(snap.rows.iter().all(|r| r.labels_at.is_none()));
+
+    let mut spawner = FakeSpawner::default();
+    run_with(vec![workspace(0, "acme/gitea", &snap.rows)], limits(10), &mut spawner);
+    let asked: BTreeSet<(u32, StepRole)> = spawner.asked.iter().map(|a| (a.1, a.2)).collect();
+    assert_eq!(
+        asked,
+        BTreeSet::from([
+            (1, StepRole::Curator),
+            (2, StepRole::ChampionPromote),
+            (3, StepRole::Builder),
+            (40, StepRole::Judge),
+            (60, StepRole::ChampionMerge),
+        ])
+    );
+}

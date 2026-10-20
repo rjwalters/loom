@@ -172,11 +172,24 @@ fn an_adopted_incident_does_not_replace_a_live_one() {
     let mut live = alert("r", "k", State::Open);
     live.title = "live".into();
     out.track(&live, t0);
-    out.adopt(alert("r", "k", State::Open), t0 + HEARTBEAT);
-    out.adopt(alert("r", "other", State::Open), t0);
+    out.adopt(alert("r", "k", State::Open));
+    out.adopt(alert("r", "other", State::Open));
     let due = out.due(t0 + HEARTBEAT);
     assert_eq!(due.len(), 2);
     assert!(due.iter().any(|a| a.title == "live"));
+}
+
+#[test]
+fn an_adopted_incident_is_re_sent_at_once_not_a_heartbeat_later() {
+    let mut out = Output::default();
+    let t0 = Instant::now();
+    out.adopt(alert("r", "k", State::Open));
+    let due = out.due(t0);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].key, "k");
+    // Marked sent: the normal heartbeat takes over from there.
+    assert!(out.due(t0 + HEARTBEAT - Duration::from_secs(1)).is_empty());
+    assert_eq!(out.due(t0 + HEARTBEAT).len(), 1);
 }
 
 #[test]

@@ -257,6 +257,17 @@ fn only_the_discovery_and_wake_modules_name_the_mirror() {
         // The task spawn and the telemetry drain.
         "daemon_service/observer_tasks.rs",
         "observability/ops/ratelimit.rs",
+        // The captain's fleet queue drives the mirror's change stream to
+        // refresh its entries; it makes no claim, label-transition or merge
+        // read (invariant 3).
+        "fleet_dispatch/queue.rs",
+        "fleet_dispatch/queue_tests.rs",
+        "fleet_dispatch/server.rs",
+        // `serve` reads the mirror key to start that feed, and the feed's tests
+        // drive a loopback mirror; neither makes a claim, label-transition or
+        // merge read.
+        "cli/fleet_dispatch_cmd.rs",
+        "fleet_dispatch/server_tests.rs",
     ]
     .iter()
     .map(|s| (*s).to_string())

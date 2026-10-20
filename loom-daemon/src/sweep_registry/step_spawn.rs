@@ -712,6 +712,7 @@ impl SweepRegistry {
         self.start_step_lease_renewal(item, role, &sweep_id, pid, &log_path);
         self.publish_step_slots();
         self.emit_dispatch(&sweep_id, &launch.admission, None, None);
+        self.emit_step_work_started(&sweep_id, item, role);
         // A named account proves the role's pool works again (#11909).
         if token_name != crate::sweep_registry::UNKNOWN_TOKEN_NAME {
             self.clear_role_tick_pool_exhausted(role.role_name());
@@ -734,6 +735,7 @@ impl SweepRegistry {
                 selected: selected.as_deref(),
                 launched: launch.model.as_deref(),
             }),
+            assignment.as_ref().and_then(|g| g.lineage.as_ref()),
         );
         if let Some(grant) = assignment {
             crate::fleet_dispatch::worker::note_spawned(
@@ -778,6 +780,7 @@ impl SweepRegistry {
             assignment_id,
             captain,
             None,
+            None,
         );
     }
 
@@ -794,6 +797,7 @@ impl SweepRegistry {
         assignment_id: Option<&str>,
         captain: Option<&crate::fleet_dispatch::worker::Refusal>,
         models: Option<dispatch_step::StepModels<'_>>,
+        lineage: Option<&crate::fleet_dispatch::worker::GrantLineage>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -809,6 +813,7 @@ impl SweepRegistry {
                 sweep_id,
                 claim,
                 assignment_id,
+                lineage,
                 captain,
                 models,
             },

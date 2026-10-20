@@ -836,20 +836,11 @@ jobs:
       # `bash -n` coverage CI had was two hand-listed files (spawn-codex.sh and
       # its test), leaving ~828 of 830 tracked scripts unparsed on every PR.
       #
-      # The macOS leg is the point of the matrix, not redundancy. Stock macOS
-      # ships /bin/bash 3.2.57 -- Apple froze it at the GPLv3 boundary -- and
-      # `#!/usr/bin/env bash` resolves straight to it on an unmodified Mac, so
-      # it is the interpreter a large share of operators actually run. Two
-      # defects reached main on the same day because nothing exercised it:
-      #   #7721  an apostrophe inside a `$(cat <<EOF ...)` heredoc; bash 3.2
-      #          does not skip heredoc bodies when scanning for the closing
-      #          paren, so the file failed to PARSE -- which made
-      #          check-shell-syntax.sh fail, which made resync-installed.sh
-      #          refuse wholesale, blocking every resync on every macOS host.
-      #   #7717  `local -A` and `${x,,}` (bash 4.0+), then an empty-array
-      #          expansion under `set -u` (bash 3.2 calls it unbound; fixed
-      #          upstream in 4.4). The first masked the second.
-      # Both parse and run fine on bash 5, so both were invisible at every gate.
+      # The macOS leg (the separate `shell-syntax` job) exists to exercise BSD
+      # userland, not an old bash: Loom requires bash >= 4 (#12916), so that leg
+      # installs Homebrew bash. Two defects reached main on one day (#7721,
+      # #7717) because nothing exercised macOS; both parse and run fine on
+      # Linux bash 5, so both were invisible at every gate here.
       #
       # Must NOT be path-filtered, for the same reason conflict-markers is not:
       # #7721 landed in a file nobody editing it thought was in scope.
@@ -1191,27 +1182,20 @@ jobs:
 
   shell-syntax:
     name: Shell Syntax (macos-latest)
-    # The ubuntu leg of this former matrix now runs inside Lint (#9065). This job stays separate because it needs a macOS runner: it is
-    # the bash 3.2 leg. Its steps are unchanged.
+    # The ubuntu leg of this former matrix now runs inside Lint (#9065). This job stays separate because it needs a macOS runner: it
+    # checks the scripts against macOS userland (BSD tools) under Homebrew bash 5.
     # #7728: `check-shell-syntax.sh` existed since #6162 but was never wired
     # into CI -- the only match for it in this file was a COMMENT. The single
     # `bash -n` coverage CI had was two hand-listed files (spawn-codex.sh and
     # its test), leaving ~828 of 830 tracked scripts unparsed on every PR.
     #
-    # The macOS leg is the point of the matrix, not redundancy. Stock macOS
-    # ships /bin/bash 3.2.57 -- Apple froze it at the GPLv3 boundary -- and
-    # `#!/usr/bin/env bash` resolves straight to it on an unmodified Mac, so
-    # it is the interpreter a large share of operators actually run. Two
-    # defects reached main on the same day because nothing exercised it:
-    #   #7721  an apostrophe inside a `$(cat <<EOF ...)` heredoc; bash 3.2
-    #          does not skip heredoc bodies when scanning for the closing
-    #          paren, so the file failed to PARSE -- which made
-    #          check-shell-syntax.sh fail, which made resync-installed.sh
-    #          refuse wholesale, blocking every resync on every macOS host.
-    #   #7717  `local -A` and `${x,,}` (bash 4.0+), then an empty-array
-    #          expansion under `set -u` (bash 3.2 calls it unbound; fixed
-    #          upstream in 4.4). The first masked the second.
-    # Both parse and run fine on bash 5, so both were invisible at every gate.
+    # Loom requires bash >= 4 (#12916, operator ruling 2026-10-20). Stock macOS
+    # ships an ancient /bin/bash (Apple froze it at the GPLv3 boundary), so
+    # macOS operators `brew install bash`. Supporting 3.2 was dropped (it kept
+    # CI flaky and cost workaround code); this leg used to run the stock PATH
+    # bash. It now installs Homebrew bash and asserts the floor, so a macOS
+    # runner still catches BSD-userland differences (sed -i, date, stat, ...)
+    # that the ubuntu leg cannot see.
     #
     # Must NOT be path-filtered, for the same reason conflict-markers is not:
     # #7721 landed in a file nobody editing it thought was in scope.
@@ -1219,28 +1203,28 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Homebrew bash
+        if: runner.os == 'macOS'
+        run: |
+          brew list bash >/dev/null 2>&1 || brew install bash
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: Report the bash under test
         run: |
           echo "PATH bash (the one 'bash -n' actually uses): $(command -v bash)"
           bash --version | head -1
           echo "/bin/bash: $(/bin/bash --version | head -1)"
-      - name: Assert this leg really is bash 3.x
+      - name: Assert PATH bash meets the bash >= 4 floor
         if: runner.os == 'macOS'
-        # check-shell-syntax.sh shells out to `bash -n` (line 163), resolved
-        # through PATH -- NOT through its own `#!/usr/bin/env bash`. So this
-        # leg only tests 3.2 for as long as PATH bash is 3.2. If a future
-        # runner image puts a 4.x/5.x bash ahead of /bin/bash, the leg would
-        # quietly become a second copy of the ubuntu one and re-open the exact
-        # blind spot this job exists to close. Fail loudly instead of silently.
+        # check-shell-syntax.sh shells out to `bash -n`, resolved through PATH.
+        # Fail loudly if the brew bash did not land ahead of /bin/bash.
         run: |
           major="$(bash -c 'echo "${BASH_VERSINFO[0]}"')"
-          if [ "$major" -ge 4 ]; then
-            echo "::error::PATH bash is ${major}.x, not the 3.2 this leg exists to test."
-            echo "This leg is now redundant with ubuntu-latest. Pin /bin/bash for the"
-            echo "scan step, or install a 3.2 shim, before trusting this job again."
+          if [ "$major" -lt 4 ]; then
+            echo "::error::PATH bash is ${major}.x, below the bash >= 4 floor."
+            echo "Install Homebrew bash and put its bin dir ahead of /bin on PATH."
             exit 1
           fi
-          echo "PATH bash is ${major}.x -- bash 3.2 coverage confirmed."
+          echo "PATH bash is ${major}.x -- bash >= 4 floor met."
       - name: Parse every tracked shell script
         # `--dir .` rather than a hand-maintained directory list: a new
         # top-level directory holding scripts would otherwise be silently
@@ -1248,15 +1232,12 @@ jobs:
         # and builds nothing -- so the tree is exactly what is tracked.
         # ~830 scripts, ~3s.
         run: bash defaults/scripts/check-shell-syntax.sh --quiet --dir .
-      - name: Run the installed-file write guard suite under bash 3.2
+      - name: Run the installed-file write guard suite on macOS userland
         if: ${{ !cancelled() }}
-        # #12043. Every `bash -n` above passed while this guard FAILED OPEN on
-        # bash 3.2: a `$'\001…'` sentinel inside an array assignment is stored
-        # doubled (CTLESC), so loom_bash_write_targets missed every `>`/`>>`
-        # and every non-solo tee/cp/mv/sed -i write into installed .loom/
-        # files. Parse-clean, runtime-wrong -- only executing the suite under
-        # the 3.2 PATH bash asserted above catches it. All its inputs are
-        # `.sh`, inside this job's `**/*.sh` scanned set. ~4s.
+        # #12043. Parse-clean is not runtime-correct: this guard once failed
+        # open under an old bash. Executing the suite on the macOS runner
+        # (BSD userland, brew bash) asserts the runtime behaviour. All its
+        # inputs are `.sh`, inside this job's `**/*.sh` scanned set. ~4s.
         run: bash defaults/hooks/tests/test-guard-installed-file-writes.sh
 
   native-suites:

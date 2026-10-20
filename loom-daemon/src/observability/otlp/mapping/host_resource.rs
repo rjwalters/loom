@@ -43,7 +43,7 @@ use super::{kv_int, kv_string};
 /// before a roll and exported after it carries the new SHA, the same accepted
 /// behaviour as the `service.version` fallback. "Applied" also means "on
 /// disk", not "live in this process" — restart-only keys
-/// (`config_journal::restart_keys`) take effect on the next start.
+/// take effect on the next start.
 ///
 /// # Host shape (Issue #12874)
 ///
