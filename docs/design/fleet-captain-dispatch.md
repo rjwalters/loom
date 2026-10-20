@@ -41,7 +41,7 @@ Given 2026-10-16 and not reopened here.
 6. **Auth is the tailnet**, with `whois` caller identity and no per-host credentials.
 7. **Packaging.** A `loom-daemon` subcommand on the captain host, rolled by the version floor, configured from the fleet config.
 8. **Telemetry** over OTLP: assignments, refusals, fallbacks, queue age and refresh cost.
-9. **Keep it simple.** The only capacity cap is `maxConcurrent`. No knob the design does not need.
+9. **Keep it simple.** The only capacity cap is the host's own `maxConcurrent` (with its RAM, disk and load terms), enforced by the worker: it asks only for the slots it has free. The captain applies no capacity limit; it offers the next most important eligible work (operator, 2026-10-19, #12864). No knob the design does not need.
 
 ## 2. Problem
 
@@ -133,22 +133,22 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 
 - A worker sends it **every 30 s**, riding the existing reaper heartbeat (the cadence `SweepRegistry::readvertise_peer_claims` runs on), so a host with a long tick still renews.
 - **`live`** is every step the host runs, including ones the captain never granted (fallback, attended). `assignment_id` is present only for granted ones. This is how the table is rebuilt after a restart.
-- **`free_slots`** is the worker's own count. The server enforces a host's live assignments ≤ `min(free_slots + live, maxConcurrent)`, with `maxConcurrent` read from the fleet config, so a wrong report cannot hoard.
+- **`free_slots`** is the worker's own count, bounded by its own `maxConcurrent`, RAM, disk and load terms. The worker enforces its capacity by asking only for those slots; a full worker does not ask. The server applies no capacity limit of its own (#12864): it once refused a host whose rows reached `min(free_slots + live, maxConcurrent)`, but its rows outlive the work they stand for (until a release or the row TTL), so that count ran above what hosts were running and stalled hosts with free slots.
 - **`roles_ok`** is host-local state the captain cannot know: a role whose token pool is exhausted, or behind the load brake or a disk back-off, is left out. Static fit comes from the fleet config (section 7).
 
 ### 5.3 `claim`
 
 `{"host_id", "repo", "item", "step"}` → one of:
 
-- `{"granted": true, "assignment_id": "a-…", "ttl_s": 1200}`: run today's pre-claim and forge lease path, unchanged. A **duplicate claim from the same host for the same `(item, step)`** is an idempotent re-grant: the same `assignment_id`, with the TTL refreshed. A claim for a **different** step on an item the host already holds is a new assignment: it goes through the full policy (the per-repo Champion merge lock, `roles_ok`, the cap), and only a grant replaces the old row, under a new `assignment_id`.
-- `{"granted": false, "reason": "held" | "grace" | "not_eligible" | "cap", "held_by": "<host id>"?, "retry_after_s": 60}`: for `held`, `not_eligible` and `cap`, a **free pass with zero forge calls**; the item leaves this tick's pool. `grace` is the exception (below).
+- `{"granted": true, "assignment_id": "a-…", "ttl_s": 1200}`: run today's pre-claim and forge lease path, unchanged. A **duplicate claim from the same host for the same `(item, step)`** is an idempotent re-grant: the same `assignment_id`, with the TTL refreshed. A claim for a **different** step on an item the host already holds is a new assignment: it goes through the full policy (the per-repo Champion merge lock, `roles_ok`), and only a grant replaces the old row, under a new `assignment_id`.
+- `{"granted": false, "reason": "held" | "grace" | "not_eligible" | "cap", "held_by": "<host id>"?, "retry_after_s": 60}`: for `held` and `not_eligible`, a **free pass with zero forge calls**; the item leaves this tick's pool. `grace` is the exception (below).
 
 | Reason | Meaning |
 |---|---|
 | `held` | another live assignment holds the `(repo, item)`, or another host holds the repo's Champion merge step; `held_by` names the host when known |
 | `grace` | the server is in its start-up grace window (section 15.1). The worker treats it as **fail-open for that one call**: it takes today's local forge-lease path for that claim. It does **not** count toward the fallback hysteresis (section 9), since it is expected after every roll. |
 | `not_eligible` | in Phase 1, the step's role is not in the host's `roles_ok`, and nothing else; Phase 2 adds the per-host fit of section 7.2 |
-| `cap` | the host is at its cap (5.2) |
+| `cap` | legacy: never sent since #12864 (the captain applies no capacity limit, 5.2). It stays in the wire enum so a newer worker reads an older captain in a mixed-version fleet; a worker that receives it ends its tick's draws (`captain_cap`). |
 
 ### 5.4 `refuse` and `release`
 
@@ -215,13 +215,13 @@ A draw for a host is restricted to items that host fits:
 - **One step per item.** No two rows for one item.
 - **The `(item, step)` ledger** (section 8): cooldowns, repeat caps and streaks count every host's outcomes.
 
-There is no new per-repo or per-host quota. **Exact per-repo concurrency was considered and declined**: the operator removed per-repo caps, and `maxConcurrent` is the only cap. The busy term β keeps doing what it does, now on exact counts.
+There is no new per-repo or per-host quota. **Exact per-repo concurrency was considered and declined**: the operator removed per-repo caps, and the host's own `maxConcurrent`, enforced by the worker, is the only cap. The busy term β keeps doing what it does, now on exact counts.
 
 ### 7.4 Rounds, fairness and starvation
 
 - A `next` fills up to `free_slots` in rounds, at most one item per repo per round, as the tick's rounds do (#12298). A host asking for 100 slots gets them spread over the repos it fits.
 - Every repo with `weight > 0` and an actionable item keeps a non-zero share, and its age term grows until it is drawn. A low-priority repo is drawn less, never starved.
-- Calls are answered in arrival order and each takes at most its own free capacity. A host with more free slots gets more work; there is no per-host quota.
+- Calls are answered in arrival order. The worker's request bounds what it takes: it asks only for its own free capacity, and the captain does not check it (#12864). A host with more free slots gets more work; there is no per-host quota, and the captain does not pick hosts by load. The only host targeting is session affinity (a later stage goes back to the host that ran the earlier one, #11913) and explicit host or capability markers (7.2).
 - An item only some hosts fit enters only those hosts' draws; it does not shrink anyone else's share.
 
 ### 7.5 Session affinity
@@ -307,7 +307,7 @@ The pre-check stays a **live** read of labels and state (invariant 3), never ser
 - **Tailnet only.** The listener binds the captain's tailnet address, never a wildcard (the `serve::validate_bind` rule).
 - **An access-policy grant.** The tailnet's access policy admits the fleet's dispatching hosts to the captain's port and nothing else, the same pattern the fleet already uses for its telemetry reader.
 - **Identity is `whois` plus an explicit roster map.** For each connection the captain asks its local tailnet daemon who the peer is (the Tailscale LocalAPI `whois` for the remote address; the captain process needs read access to the tailnet daemon's local socket). It maps the returned node to a `host_id` through the optional `tailnet_node` field on each host record in the fleet config (the `dispatchers` list stays plain host ids), and never by assuming node name == `host_id` (they diverge for operator machines and re-imaged hosts). A node not in the map is refused `403` even if the access policy lets it connect, and the mapped `host_id` must equal the body's. Nothing in the daemon crate does this today (`git grep whois` finds nothing); it is new, small and local.
-- **No new credential.** No token, key or JWT is issued for this. Nothing to rotate or leak. A compromised worker already holds a forge writer credential, so the captain adds no blast radius; server-side caps (5.2) and per-host fit (7.2) stop it from hoarding assignments.
+- **No new credential.** No token, key or JWT is issued for this. Nothing to rotate or leak. A compromised worker already holds a forge writer credential, so the captain adds no blast radius. The captain applies no capacity cap (5.2, #12864), so such a worker could claim more than it runs; per-host fit (7.2) bounds what it can be granted, its rows age out at the row TTL, and every assignment still meets the forge lease.
 - **The captain holds no forge write.** It reads the mirror and, until #12317, the gather's reads. It never posts a label, comment or merge. Every bad assignment it could hand out still meets the worker's live pre-check and the forge lease.
 
 ## 12. Telemetry
@@ -478,3 +478,4 @@ The worker's closed-issue read refuses it with `already_closed` (or `already_lan
 | 2026-10-16 | same (recommended, all taken) | TTL value; grace end; `403`; duplicate claims; Phase 1 `not_eligible`; fallback exit timer; per-repo concurrency. | TTL = `resolve_lease_ttl_minutes() + 5` min; grace ends once every fleet-mode host has heartbeated; `403` fails open, logs `ERROR`, counts toward hysteresis; a same-host duplicate claim is an idempotent re-grant; Phase 1 `not_eligible` is `roles_ok` only; any failure resets the 5-min exit timer; exact per-repo concurrency considered and declined. §5.3, §5.5, §6, §7.3, §9, §15.1. |
 | 2026-10-16 | Judge (changes requested at `d8b31aa3`, on #12465) | A claim from a row's own host for a different step was re-granted, rewriting the row's step and skipping the merge lock and `roles_ok`. | Only the same `(item, step)` is re-granted; a different step runs the full policy and, if granted, replaces the row under a new id. §5.3. |
 | 2026-10-16 | Operator (on #12465) | Where the node field lives: `dispatch.dispatchers` objects would break the store's schema, render step, dashboard and shell readers, which take strings. | `dispatch.dispatchers` stays host-name strings; the node is `hosts[].tailnet_node` on the host record, joined by name. A dispatcher with no record or node is unresolved (`403`, startup warning). §5.1, §11, §13.1. |
+| 2026-10-19 | Operator (attended session, #12864) | "this captain_cap is unwanted; the captain should offer the next important work (unless we are targeting a particular host because it ran an earlier stage) and limits should only be enforced on the crew node side" | The captain's `cap` refusal is removed; capacity is the worker's own request. `cap` stays in the wire enum as legacy. §1, §5.2, §5.3, §7.4, §11. |

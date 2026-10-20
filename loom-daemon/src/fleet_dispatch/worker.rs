@@ -201,6 +201,8 @@ pub fn refusal_token(reason: RefusalReason) -> &'static str {
         RefusalReason::Held => "captain_held",
         RefusalReason::Grace => "captain_grace",
         RefusalReason::NotEligible => "captain_not_eligible",
+        // A captain built from #12864 on never sends `cap`; kept so this
+        // worker still reads an older captain in a mixed-version fleet.
         RefusalReason::Cap => "captain_cap",
         RefusalReason::Cooldown => "captain_cooldown",
         RefusalReason::Other => "captain_refused",

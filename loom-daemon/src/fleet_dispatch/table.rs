@@ -38,12 +38,16 @@
 //!    `(repo, item, step)` (below);
 //! 3. `not_eligible` when the step's role is not in the host's last reported
 //!    `roles_ok` (Phase 1 decides eligibility by `roles_ok` only; a step name
-//!    this build does not know has no role, so it is `not_eligible` too);
-//! 4. `cap` when the host's granted and live rows reach
-//!    `min(free_slots + live, maxConcurrent)`: the last heartbeat's counts,
-//!    clamped by the fleet config, so a wrong report cannot hoard. A host
-//!    that has not heartbeated this epoch is bounded by `maxConcurrent`
-//!    alone, and refused when that is unknown too.
+//!    this build does not know has no role, so it is `not_eligible` too).
+//!
+//! The captain applies **no capacity limit** (#12864). Its rows for a host
+//! live until the worker releases them or their TTL ends, so a count of them
+//! runs above what the host is actually running; refusing on that count
+//! (the former `cap` refusal) stalled hosts that had free slots. Capacity is
+//! the worker's own: it claims only for the free slots its tick computed
+//! (`maxConcurrent`, RAM, disk and load), and a full worker does not ask.
+//! [`RefusalReason::Cap`] stays in the wire enum for mixed-version fleets,
+//! but this table never emits it.
 //!
 //! # The no-progress cooldown (#12541)
 //!
@@ -112,8 +116,6 @@ pub const DEFAULT_GRACE: Duration = Duration::from_secs(90);
 
 /// `retry_after_s` of a `held` refusal, at most.
 const HELD_RETRY_MAX_SECS: u64 = 60;
-/// `retry_after_s` of a `cap` refusal: about one heartbeat.
-const CAP_RETRY_SECS: u64 = 30;
 /// `retry_after_s` of a `not_eligible` refusal.
 const NOT_ELIGIBLE_RETRY_SECS: u64 = 60;
 
@@ -509,8 +511,8 @@ impl Table {
         );
     }
 
-    /// Decide `host`'s claim of `(repo, item)` for `step` at `now`.
-    /// `max_concurrent` is the host's `maxConcurrent` from the fleet config.
+    /// Decide `host`'s claim of `(repo, item)` for `step` at `now`. No
+    /// capacity check: the worker bounds its own claims (#12864).
     pub fn claim(
         &mut self,
         now: Mono,
@@ -518,10 +520,8 @@ impl Table {
         repo: &str,
         item: u64,
         step: &str,
-        max_concurrent: Option<u32>,
     ) -> ClaimDecision {
-        self.claim_traced(now, host, repo, item, step, max_concurrent)
-            .0
+        self.claim_traced(now, host, repo, item, step).0
     }
 
     /// [`Self::claim`], plus the no-progress hold when a refusal came from
@@ -534,14 +534,12 @@ impl Table {
         repo: &str,
         item: u64,
         step: &str,
-        max_concurrent: Option<u32>,
     ) -> (ClaimDecision, Option<Cooldown>) {
         let mut cooled = None;
-        let d = self.decide_claim(now, host, repo, item, step, max_concurrent, &mut cooled);
+        let d = self.decide_claim(now, host, repo, item, step, &mut cooled);
         (d, cooled)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn decide_claim(
         &mut self,
         now: Mono,
@@ -549,7 +547,6 @@ impl Table {
         repo: &str,
         item: u64,
         step: &str,
-        max_concurrent: Option<u32>,
         cooled: &mut Option<Cooldown>,
     ) -> ClaimDecision {
         self.expire(now);
@@ -600,23 +597,13 @@ impl Table {
                 return refused(RefusalReason::Held, row.host.clone(), retry);
             }
         }
-        let state = self.hosts.get(host);
-        if let Some(state) = state {
+        if let Some(state) = self.hosts.get(host) {
             if !state.roles_ok.contains(parsed.role_name()) {
                 return refused(RefusalReason::NotEligible, None, NOT_ELIGIBLE_RETRY_SECS);
             }
         }
-        let reported = state.map(|s| s.free_slots.saturating_add(s.live_reported));
-        let limit = match (reported, max_concurrent) {
-            (Some(r), Some(m)) => Some(r.min(m)),
-            (Some(r), None) => Some(r),
-            (None, m) => m,
-        };
-        // The row being replaced frees its slot for the new step.
-        let held = self.held_by(host).saturating_sub(u32::from(replaces_own));
-        if limit.is_none_or(|l| held >= l) {
-            return refused(RefusalReason::Cap, None, CAP_RETRY_SECS);
-        }
+        // No capacity check here (#12864): the worker asked only because it
+        // has a free slot by its own limits.
         if replaces_own {
             self.remove(&key);
         }
