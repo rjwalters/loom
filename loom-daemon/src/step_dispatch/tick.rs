@@ -652,6 +652,7 @@ pub fn run_with_offers(
             age_source: c.terms.age_source.as_str().to_string(),
             resumed: false,
             draw: None,
+            story_points: c.item.story_points,
         };
         match spawner.spawn(idx, &request) {
             SpawnResult::Spawned => {
