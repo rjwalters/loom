@@ -23,7 +23,7 @@
 //! ([`RepoSnapshot`]); the other listing readers consume it through
 //! [`published`] (#12307). Claim,
 //! lease, label-transition and merge reads stay live
-//! (`forge_events/poll_gate.rs` invariant 3): this module never serves them.
+//! (ADR-0021 invariant 3): this module never serves them.
 
 pub mod chain;
 pub mod direct;

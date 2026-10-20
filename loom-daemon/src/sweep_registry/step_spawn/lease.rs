@@ -120,6 +120,10 @@ pub struct ClaimFacts {
     pub claim_ms: u64,
     /// The last line of the claim's stderr, sanitised and bounded.
     pub stderr_tail: Option<String>,
+    /// What a refused Builder claim's rollback did (#12822): `none`,
+    /// `lease_yielded`, `label_restored`, `both` or `failed`. `None` when no
+    /// rollback ran (a role-keyed claim, which reaps its own leases).
+    pub rollback: Option<&'static str>,
 }
 
 /// What a pre-claim's exit says. Pure.
@@ -326,6 +330,7 @@ pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimF
             exit_code: None,
             claim_ms: 0,
             stderr_tail: None,
+            rollback: None,
         }));
         return Err(refusal);
     };
@@ -335,6 +340,7 @@ pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimF
         exit_code: run.code(),
         claim_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         stderr_tail: tail,
+        rollback: None,
     };
     match claim_verdict(&run) {
         Ok(()) => Ok(facts),

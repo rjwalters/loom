@@ -22,6 +22,7 @@
 //! name ([`crate::step_role::StepRole::as_str`]) in a plain string so a live
 //! entry from a newer worker cannot poison a whole heartbeat.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// `POST` path of the heartbeat.
@@ -110,6 +111,12 @@ pub struct LiveStep {
     /// Present only for a step the captain granted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment_id: Option<String>,
+    /// When the step started on the worker (its registry entry's
+    /// `started_at`, #12873). Additive: an older worker omits it and reads
+    /// as `None`; an older captain ignores it. The captain's
+    /// `loom.fleet_dispatch.oldest_live_age_sec` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 /// `POST /v1/heartbeat`: the host's live set, free slots and runnable roles.
@@ -203,6 +210,18 @@ pub struct ClaimResponse {
     /// Seconds before asking about this item again is worthwhile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_s: Option<u64>,
+    /// Count of earlier grants of this `(repo, item, step)`, set on a grant
+    /// that follows one (#12875). Absent on a first grant and for older
+    /// captains; older workers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// The assignment this grant replaces (#12875).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_assignment_id: Option<String>,
+    /// How that assignment ended: `released`, `expired` or `host_lost`
+    /// (#12875).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_end: Option<String>,
 }
 
 impl ClaimResponse {
@@ -217,7 +236,22 @@ impl ClaimResponse {
             reason: None,
             held_by: None,
             retry_after_s: None,
+            attempt: None,
+            prev_assignment_id: None,
+            prev_end: None,
         }
+    }
+
+    /// This grant, carrying the lineage of the assignment it replaces
+    /// (#12875).
+    #[must_use]
+    pub fn with_lineage(mut self, lineage: Option<&super::table::Lineage>) -> Self {
+        if let Some(l) = lineage {
+            self.attempt = Some(l.attempt);
+            self.prev_assignment_id = Some(l.prev_assignment_id.clone());
+            self.prev_end = Some(l.prev_end.as_str().to_string());
+        }
+        self
     }
 
     /// A refusal.
@@ -236,6 +270,9 @@ impl ClaimResponse {
             reason: Some(reason),
             held_by,
             retry_after_s: Some(retry_after_s),
+            attempt: None,
+            prev_assignment_id: None,
+            prev_end: None,
         }
     }
 }
@@ -333,6 +370,39 @@ mod tests {
         }
         let r: RefusalReason = serde_json::from_value(json!("queue_full")).unwrap();
         assert_eq!(r, RefusalReason::Other);
+    }
+
+    /// #12873: `LiveStep.started_at` is additive in both directions. An old
+    /// worker's step (no field) reads as `None` and re-serialises without
+    /// it; a new worker's step round-trips; an old captain (the pre-#12873
+    /// shape, no `deny_unknown_fields`) reads a new worker's step.
+    #[test]
+    fn a_live_steps_started_at_is_optional_both_ways() {
+        let old_worker = json!({"repo": "acme/w", "item": 7, "step": "builder"});
+        let step: LiveStep = serde_json::from_value(old_worker.clone()).unwrap();
+        assert_eq!(step.started_at, None);
+        assert_eq!(serde_json::to_value(&step).unwrap(), old_worker);
+
+        let new_worker = json!({"repo": "acme/w", "item": 7, "step": "builder",
+                                "started_at": "2026-10-20T01:00:00Z", "future": 1});
+        let step: LiveStep = serde_json::from_value(new_worker).unwrap();
+        let at: DateTime<Utc> = "2026-10-20T01:00:00Z".parse().unwrap();
+        assert_eq!(step.started_at, Some(at));
+        let wire = serde_json::to_value(&step).unwrap();
+        assert_eq!(wire["started_at"], "2026-10-20T01:00:00Z");
+        assert_eq!(serde_json::from_value::<LiveStep>(wire.clone()).unwrap(), step);
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldCaptainLiveStep {
+            repo: String,
+            item: u64,
+            step: String,
+            #[serde(default)]
+            assignment_id: Option<String>,
+        }
+        let old: OldCaptainLiveStep = serde_json::from_value(wire).unwrap();
+        assert_eq!(old.item, 7);
     }
 
     #[test]

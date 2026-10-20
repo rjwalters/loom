@@ -852,7 +852,7 @@ fn an_inactive_mirror_falls_to_the_next_tier() {
     assert_eq!(snap.stats().worklist_error_class, Some("transport"));
 }
 
-/// The snapshot answers `ReadKind::Discovery` only (`poll_gate` invariant 3):
+/// The snapshot answers `ReadKind::Discovery` only (ADR-0021 invariant 3):
 /// no claim, label-transition or merge module names it, so no such decision
 /// can read it. The listing readers that moved onto it (#12307) are named
 /// here; each keeps its write-gating checks (`scan_issue`, `mergeable_of`, PR
@@ -918,6 +918,6 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
     .collect();
     assert_eq!(
         users, expected,
-        "a new snapshot reader needs review against poll_gate invariant 3"
+        "a new snapshot reader needs review against ADR-0021 invariant 3"
     );
 }

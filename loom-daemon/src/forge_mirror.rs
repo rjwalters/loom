@@ -40,23 +40,21 @@
 //!
 //! - **Discovery reads**: one worklist request per step tick
 //!   ([`crate::discovery`]); there is no per-listing mirror read.
-//! - **Wakes** ([`wake`]): the daemon pulls the change stream for the repos
-//!   it serves, keeps its own cursor (persisted), and publishes each
-//!   non-empty pull as a `forge.event` bus prompt, which ticks the loops
-//!   whose `forgeEvents.events.*` consumer is armed early
-//!   ([`crate::forge_events::wake`]). A change is a nudge, never a command.
+//! - **Change stream** ([`wake`]): the daemon pulls the change stream for the
+//!   repos it serves and keeps its own cursor (persisted). The pull wakes no
+//!   loop and gates no poll (#12809).
 //!
 //! # What it never changes
 //!
 //! Reads that gate a write. Claim, label-transition and merge reads stay on
-//! the gateway or the forge (ADR-0021's poll_gate invariant 3): the
+//! the gateway or the forge: the
 //! worklist ([`crate::discovery`]) is the only mirror read that serves
 //! discovery.
 //!
 //! # Break-glass
 //!
 //! With `forge.mirror` unset, [`active`] is `None`: no mirror request is made,
-//! no change stream is pulled, nothing is published, and every read is
+//! no change stream is pulled, and every read is
 //! exactly today's. The daemon re-reads the
 //! block every [`CHECK_INTERVAL`], so unsetting it takes effect within a
 //! minute. The fleet store fetch never depends on the mirror.
@@ -148,9 +146,8 @@ pub const DEFAULT_MAX_STALENESS_SECS: u64 = 600;
 pub const MIN_STALENESS_SECS: u64 = 30;
 
 /// The bound's ceiling: ADR-0021's hard cap on discovery staleness ("never
-/// more than 15 minutes"), the same ceiling the poll gate holds.
-pub const MAX_STALENESS_CEILING_SECS: u64 =
-    crate::forge_events::poll_gate::MAX_STALENESS_CEILING_SECS;
+/// more than 15 minutes").
+pub const MAX_STALENESS_CEILING_SECS: u64 = 15 * 60;
 
 /// Default change-stream pull cadence.
 pub const DEFAULT_CHANGE_POLL_SECS: u64 = 30;

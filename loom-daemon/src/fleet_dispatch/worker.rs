@@ -59,6 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::client::{self, CallError, CallFacts};
@@ -171,6 +172,19 @@ pub struct Grant {
     repo: String,
     item: u64,
     step: String,
+    /// The assignment this grant replaces, when the captain named one
+    /// (#12875).
+    pub lineage: Option<GrantLineage>,
+}
+
+/// What a grant says about the attempt it replaces (#12875): the
+/// `loom.dispatch.attempt`, `loom.dispatch.prev_assignment_id` and
+/// `loom.dispatch.prev_end` of the step's span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantLineage {
+    pub attempt: u32,
+    pub prev_assignment_id: String,
+    pub prev_end: String,
 }
 
 /// What the captain said about one claim.
@@ -201,6 +215,8 @@ pub fn refusal_token(reason: RefusalReason) -> &'static str {
         RefusalReason::Held => "captain_held",
         RefusalReason::Grace => "captain_grace",
         RefusalReason::NotEligible => "captain_not_eligible",
+        // A captain built from #12864 on never sends `cap`; kept so this
+        // worker still reads an older captain in a mixed-version fleet.
         RefusalReason::Cap => "captain_cap",
         RefusalReason::Cooldown => "captain_cooldown",
         RefusalReason::Other => "captain_refused",
@@ -300,7 +316,7 @@ fn repo_of(root: &Path) -> String {
 /// A claim answer, typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Decision {
-    Granted(String),
+    Granted(String, Option<GrantLineage>),
     Refused(RefusalReason, Refusal),
 }
 
@@ -310,7 +326,16 @@ enum Decision {
 fn decide(r: &ClaimResponse) -> Option<Decision> {
     if r.granted {
         let id = r.assignment_id.clone().filter(|id| !id.is_empty())?;
-        Some(Decision::Granted(id))
+        // All three or none: a partial answer names no attempt.
+        let lineage = match (r.attempt, &r.prev_assignment_id, &r.prev_end) {
+            (Some(attempt), Some(prev), Some(end)) if !prev.is_empty() => Some(GrantLineage {
+                attempt,
+                prev_assignment_id: prev.clone(),
+                prev_end: end.clone(),
+            }),
+            _ => None,
+        };
+        Some(Decision::Granted(id, lineage))
     } else {
         Some(Decision::Refused(
             r.reason.unwrap_or(RefusalReason::Other),
@@ -354,7 +379,7 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
         ..CallFacts::default()
     };
     let ask = match answer {
-        Ok((epoch, Decision::Granted(assignment_id))) => {
+        Ok((epoch, Decision::Granted(assignment_id, lineage))) => {
             observe(true, None);
             facts.status = Some(200);
             facts.result = client::RESULT_GRANTED;
@@ -366,6 +391,7 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
                 repo: request.repo,
                 item: request.item,
                 step: request.step,
+                lineage,
             })
         }
         Ok((epoch, Decision::Refused(reason, refusal))) => {
@@ -488,6 +514,20 @@ pub fn release(sweep_id: &str, outcome: &str) {
     send_release(&assigned.grant, outcome);
 }
 
+/// This host is being lost (#12876): release every assignment it holds with
+/// `outcome`, so the captain's rows end now instead of at their TTL. Returns
+/// how many releases were sent.
+pub fn release_all(outcome: &str) -> usize {
+    let grants: Vec<Grant> = std::mem::take(&mut state().assignments)
+        .into_values()
+        .map(|a| a.grant)
+        .collect();
+    for grant in &grants {
+        send_release(grant, outcome);
+    }
+    grants.len()
+}
+
 fn send_release(grant: &Grant, outcome: &str) {
     let body = ReleaseRequest {
         host_id: host_id(),
@@ -527,10 +567,12 @@ pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
 }
 
 /// One reaper tick of the registry at `root`, whose live steps are `live`
-/// (`(sweep_id, item, role)`): record them, release any assignment whose
-/// step is gone without an end, and send the host's heartbeat when one is
-/// due. A no-op while the flag is off and nothing was ever granted.
-pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
+/// (`(sweep_id, item, role, started_at)`): record them, release any
+/// assignment whose step is gone without an end, and send the host's
+/// heartbeat when one is due. `started_at` rides the heartbeat as
+/// [`LiveStep::started_at`] (#12873). A no-op while the flag is off and
+/// nothing was ever granted.
+pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>)]) {
     let url = host_endpoint(root);
     let (vanished, heartbeat) = {
         let mut s = state();
@@ -552,7 +594,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
         let repo = repo_of(root);
         let steps: Vec<(String, LiveStep)> = live
             .iter()
-            .map(|(id, item, role)| {
+            .map(|(id, item, role, started_at)| {
                 let assignment_id = s.assignments.get(id).map(|a| a.grant.assignment_id.clone());
                 (
                     id.clone(),
@@ -561,6 +603,7 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole)]) {
                         item: u64::from(*item),
                         step: role.as_str().to_string(),
                         assignment_id,
+                        started_at: Some(*started_at),
                     },
                 )
             })

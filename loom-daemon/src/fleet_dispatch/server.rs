@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -49,8 +50,9 @@ use super::proto::{
 };
 use super::queue::{Queue, DEFAULT_REFRESH_SECS};
 use super::roster::{Roster, RosterSource};
-use super::table::{ClaimDecision, Mono, Policy, RefuseOutcome, Table};
+use super::table::{ClaimDecision, ExpiredAssignment, Mono, Policy, RefuseOutcome, Table};
 use super::telemetry::{self, Call, Counters, HoldFacts};
+use crate::telemetry::ops::MetricPoint;
 
 /// The span reason of a claim refused `held` by a no-progress hold
 /// ([`super::table`], #12541). On the wire it is [`RefusalReason::Cooldown`]
@@ -250,20 +252,61 @@ impl<I: Identity> Server<I> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expired = table.expire(now);
         counters.expired(expired);
-        f(&mut table, now, &mut counters)
+        let out = f(&mut table, now, &mut counters);
+        // After `f`: a claim inside it expires rows first, and they are
+        // reported here too.
+        let rows = table.take_expired();
+        drop(counters);
+        drop(table);
+        for row in &rows {
+            self.report_expired(row);
+        }
+        out
     }
 
-    /// Expire due rows and flush the counters as metric points.
+    /// Emit the captain's span for an assignment that expired (#12875):
+    /// `cause=lease_expired`, naming the host, repo, item, step and
+    /// assignment id.
+    fn report_expired(&self, row: &ExpiredAssignment) {
+        log::info!(
+            "fleet-dispatch: assignment {} ({} #{} {}) on {} expired",
+            row.assignment_id,
+            row.repo,
+            row.item,
+            row.step,
+            row.host.as_deref().unwrap_or("-")
+        );
+        let call = Call {
+            host: row.host.clone(),
+            endpoint: telemetry::EXPIRE_ENDPOINT.to_string(),
+            status: 0,
+            result: telemetry::RESULT_EXPIRED,
+            reason: Some(telemetry::CAUSE_LEASE_EXPIRED.to_string()),
+            server_epoch: self.epoch.clone(),
+            assignment_id: Some(row.assignment_id.clone()),
+            item: Some((row.repo.clone(), row.item, row.step.clone())),
+            ..Call::default()
+        };
+        telemetry::emit_call(&call, chrono::Utc::now(), self.next_seq());
+    }
+
+    /// Expire due rows, then flush the counters and the table's gauges
+    /// (#12873) as metric points, both read under the one table lock.
     pub fn sweep(&self) {
-        self.with_table(|_, _, _| ());
-        let points = self
-            .counters
-            .lock()
-            .map(|mut c| c.take_points())
-            .unwrap_or_default();
+        let points = self.sweep_points(Utc::now());
         if !points.is_empty() {
             crate::observability::ops::emit_metrics(points);
         }
+    }
+
+    /// [`Self::sweep`]'s points at wall-clock `wall_now`, after expiry.
+    pub fn sweep_points(&self, wall_now: DateTime<Utc>) -> Vec<MetricPoint> {
+        self.with_table(|table, now, counters| {
+            let mut points = counters.take_points();
+            let gauges = table.host_gauges(now, super::table::HEARTBEAT_FRESH);
+            points.extend(super::telemetry::gauge_points(&gauges, wall_now));
+            points
+        })
     }
 
     /// Resolve `peer` to its roster host id. `Err` is the reply to send.
@@ -341,9 +384,8 @@ impl<I: Identity> Server<I> {
     fn claim(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
         let req: ClaimRequest = self.parse(host, body)?;
         call.item = Some((req.repo.clone(), req.item, req.step.clone()));
-        let max = self.roster().max_concurrent(host);
         let decision = self.with_table(|t, now, counters| {
-            let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step, max);
+            let (mut d, cooled) = t.claim_traced(now, host, &req.repo, req.item, &req.step);
             if let ClaimDecision::Refused { reason, .. } = &mut d {
                 if let Some(hold) = cooled {
                     counters.claim_cooled();
@@ -364,19 +406,23 @@ impl<I: Identity> Server<I> {
             ClaimDecision::Granted {
                 assignment_id,
                 ttl_s,
+                lineage,
                 ..
             } => {
                 call.result = "granted";
                 call.assignment_id = Some(assignment_id.clone());
                 ClaimResponse::granted(&self.epoch, assignment_id, ttl_s)
+                    .with_lineage(lineage.as_ref())
             }
             ClaimDecision::Refused {
                 reason,
                 held_by,
+                holder_assignment_id,
                 retry_after_s,
             } => {
                 call.result = "refused";
                 call.held_by.clone_from(&held_by);
+                call.holder_assignment_id = holder_assignment_id;
                 call.retry_after_s = Some(retry_after_s);
                 if call.reason.is_none() {
                     call.reason = Some(reason.as_str().to_string());
