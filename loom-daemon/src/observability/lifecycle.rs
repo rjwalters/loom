@@ -102,6 +102,7 @@ impl Span {
     pub fn finish_attempt(&self, result: &str, status: SpanStatus, worked: Option<bool>) {
         let mut close = attributes(&[("loom.result", result)]);
         insert_worked(&mut close, worked);
+        close.extend(host_attributes());
         self.finish_attributes(status, close.clone());
         if let Ok(active) = self.journal.active() {
             for phase in active {
@@ -237,6 +238,50 @@ pub fn host_attributes() -> TraceAttributes {
         attrs.insert("loom.host.pressure".into(), pressure.to_string());
     }
     insert_f64(&mut attrs, "loom.host.load_per_core", raw("cpu_load_per_core"));
+    // #12884: the raw ingredients of `load_per_core` — the core count it
+    // divides by and the 1-minute load average itself — so a span can be read
+    // without knowing the box. A failed probe leaves the key absent.
+    insert_u64(
+        &mut attrs,
+        "loom.host.logical_cpus",
+        std::thread::available_parallelism()
+            .ok()
+            .map(|n| n.get() as u64),
+    );
+    insert_f64(&mut attrs, "loom.host.loadavg_1m", crate::cpu_headroom::read_loadavg_1m());
+    attrs
+}
+
+/// The CPU quota and in-flight sweep count `spawn-claude.sh` exported into the
+/// child's environment (#12884). Only a child sees them, so the daemon-side
+/// `loom.sweep` root cannot carry these; the phase spans opened in the child
+/// do. A value that is unset or not an integer >= 1 leaves its key absent.
+fn spawn_budget_attributes() -> TraceAttributes {
+    spawn_budget_from(
+        std::env::var("LOOM_SWEEP_CPU_BUDGET_CORES").ok().as_deref(),
+        std::env::var("LOOM_SWEEP_CPU_INFLIGHT").ok().as_deref(),
+    )
+}
+
+fn spawn_budget_from(cores: Option<&str>, in_flight: Option<&str>) -> TraceAttributes {
+    let mut attrs = TraceAttributes::new();
+    for (value, key) in [
+        (cores, "loom.host.cpu_budget_cores"),
+        (in_flight, "loom.host.sweeps_in_flight"),
+    ] {
+        let value = value
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v >= 1);
+        insert_u64(&mut attrs, key, value);
+    }
+    attrs
+}
+
+/// What a `loom.phase` span carries at open: the host state plus the spawn-time
+/// CPU quota and contention.
+fn phase_host_attributes() -> TraceAttributes {
+    let mut attrs = host_attributes();
+    attrs.extend(spawn_budget_attributes());
     attrs
 }
 
@@ -445,11 +490,12 @@ pub fn worker_attempt(root: &Path, role: &str) -> Option<Span> {
     {
         return Some(Span { journal, active });
     }
-    let metadata = attributes(&[
+    let mut metadata = attributes(&[
         ("loom.role", role),
         ("loom.phase", role),
         ("loom.timing_source", "owned_boundary"),
     ]);
+    metadata.extend(phase_host_attributes());
     let at = Utc::now();
     let phase = journal
         .start_linked(
@@ -562,6 +608,7 @@ fn checkpoint_begin_observation(
     if let Some(model) = model {
         metadata.insert("loom.configured_model".into(), model.into());
     }
+    metadata.extend(phase_host_attributes());
     let at = Utc::now();
     let active = journal.active().ok()?;
     metadata.extend(execution_scope(&active, root));
@@ -696,6 +743,7 @@ fn checkpoint_observation(
         ("loom.timing_source", source),
         ("loom.result", result),
     ]);
+    metadata.extend(phase_host_attributes());
     // #9420: a synthetic observation has no observed start, so it is emitted
     // with `started_at == ended_at` — a zero duration that measures nothing.
     // The owned-start branch below overwrites this with `true`: there the
@@ -822,6 +870,7 @@ pub fn prepare_execution(command: &mut Command, root: &Path, execution: &str, is
         ("loom.sweep_id", execution),
         ("loom.timing_source", "dispatch_observed"),
     ]));
+    metadata.extend(host_attributes());
     // The issue is a plain fact, whether or not the repo's GitHub spelling
     // resolved (#11982).
     let repo = issue

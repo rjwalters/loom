@@ -414,6 +414,8 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
     # already reads it gets host-wide coordination for free, with no change
     # on its side.
     export LOOM_SWEEP_CPU_BUDGET_CORES="$_cpu_budget_cores"
+    # #12884: the sweep count the budget was divided by, for the phase spans.
+    export LOOM_SWEEP_CPU_INFLIGHT="$_cpu_inflight"
     if [[ "$_cpu_shared" == "1" ]]; then
         log_info "spawn-claude: CPU budget = ${_cpu_budget_cores} core(s) of ${_cpu_total_cores} (reserved ${_cpu_reserved}) divided across ${_cpu_inflight} in-flight sweep(s) on this host — exported as LOOM_SWEEP_CPU_BUDGET_CORES (issues #5111/#5979)"
     else

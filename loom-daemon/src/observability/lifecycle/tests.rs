@@ -395,6 +395,8 @@ fn host_attributes_key_set_is_pinned() {
         "loom.host.oom_kill_total",
         "loom.host.pressure",
         "loom.host.load_per_core",
+        "loom.host.logical_cpus",
+        "loom.host.loadavg_1m",
     ];
     for key in attrs.keys() {
         assert!(allowed.contains(&key.as_str()), "unexpected host attribute {key}");
@@ -402,6 +404,38 @@ fn host_attributes_key_set_is_pinned() {
     for key in HOST_STATUS_KEYS {
         assert!(attrs.contains_key(key), "{key} missing");
     }
+}
+
+#[test]
+fn host_attributes_carry_the_cpu_count() {
+    let attrs = host_attributes();
+    let cpus: u64 = attrs["loom.host.logical_cpus"].parse().unwrap();
+    assert!(cpus >= 1);
+    // The load average is absent when unmeasurable, never zero-filled.
+    if let Some(load) = attrs.get("loom.host.loadavg_1m") {
+        assert!(load.parse::<f64>().unwrap() >= 0.0);
+    }
+}
+
+#[test]
+fn spawn_budget_attributes_require_integers_of_at_least_one() {
+    let ok = spawn_budget_from(Some("6"), Some(" 3 "));
+    assert_eq!(ok["loom.host.cpu_budget_cores"], "6");
+    assert_eq!(ok["loom.host.sweeps_in_flight"], "3");
+    for bad in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("abc"),
+        Some("-2"),
+        Some("1.5"),
+    ] {
+        let attrs = spawn_budget_from(bad, bad);
+        assert!(attrs.is_empty(), "{bad:?} must leave both keys absent");
+    }
+    let half = spawn_budget_from(Some("4"), None);
+    assert!(half.contains_key("loom.host.cpu_budget_cores"));
+    assert!(!half.contains_key("loom.host.sweeps_in_flight"));
 }
 
 // ---------------------------------------------------------------------------
