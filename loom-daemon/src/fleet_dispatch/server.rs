@@ -699,7 +699,11 @@ pub fn spawn_queue_feed<I: Identity>(
 
     tokio::spawn(async move {
         let active = Arc::new(active);
-        let backend = Arc::new(Mutex::new(MirrorBackend::default()));
+        // Two backends, two ETags: a change-driven read applies only the repos
+        // the stream named, so it must not consume the `200` the full refresh
+        // is owed (a lossy stream would otherwise leave the rest stale on `304`).
+        let change_backend = Arc::new(Mutex::new(MirrorBackend::default()));
+        let full_backend = Arc::new(Mutex::new(MirrorBackend::default()));
         let mut cursors = Cursors::new(&origin);
         let mut repos: Vec<String> = Vec::new();
         let mut tick = tokio::time::interval(active.change_poll.max(Duration::from_secs(1)));
@@ -720,7 +724,8 @@ pub fn spawn_queue_feed<I: Identity>(
             if !full && changed.is_empty() {
                 continue;
             }
-            let (active_r, backend_r) = (Arc::clone(&active), Arc::clone(&backend));
+            let backend = if full { &full_backend } else { &change_backend };
+            let (active_r, backend_r) = (Arc::clone(&active), Arc::clone(backend));
             let read = tokio::task::spawn_blocking(move || {
                 let mut backend = backend_r
                     .lock()
