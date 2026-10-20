@@ -205,17 +205,7 @@ pub(super) fn update(root: &Path, config: &Config, job: &lease::Job, outcome: &s
     }
     record.outcome = outcome.into();
     let mut fresh = false;
-    let mut command = Command::new("docker");
-    command.args([
-        "exec",
-        &job.container_id,
-        "loom-daemon",
-        "private-workspace",
-        "snapshot",
-    ]);
-    if let Some(issue) = job.issue {
-        command.args(["--issue", &issue.to_string()]);
-    }
+    let command = snapshot_command(config, job)?;
     if let Ok(crate::proc_exec::Completion::Exited(output)) =
         crate::proc_exec::run_bounded(command, std::time::Duration::from_secs(2))
     {
@@ -250,6 +240,33 @@ pub(super) fn update(root: &Path, config: &Config, job: &lease::Job, outcome: &s
     }
     // Failed read preserves the last snapshot and records uncertainty.
     save(&path, &record)
+}
+
+/// The in-container snapshot of the clone `job` ran in. The exec must name that
+/// clone itself (#10796): the session container's own environment knows only
+/// the account's primary, so a bare `docker exec … snapshot` would describe
+/// `/workspace/repo` for a job that ran in an additional clone — and a clean,
+/// published primary would then certify an additional clone's unfinished work
+/// as safe. A job whose repository this account no longer registers gets no
+/// snapshot at all rather than the wrong one.
+fn snapshot_command(config: &Config, job: &lease::Job) -> Result<Command> {
+    let target = config
+        .target((!job.repository.is_empty()).then_some(job.repository.as_str()))
+        .context(containment::WRONG_CLONE)?;
+    let mut command = Command::new("docker");
+    command.args([
+        "exec",
+        "--env",
+        &format!("LOOM_PRIVATE_CLONE={}", target.path),
+        &job.container_id,
+        "loom-daemon",
+        "private-workspace",
+        "snapshot",
+    ]);
+    if let Some(issue) = job.issue {
+        command.args(["--issue", &issue.to_string()]);
+    }
+    Ok(command)
 }
 
 fn validate(snapshot: &Snapshot, issue: Option<u64>) -> Result<()> {
@@ -388,6 +405,76 @@ pub(super) fn snapshot(issue: Option<u64>) -> Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The snapshot exec names the clone the job ran in (#10796): an
+    /// additional clone's job is snapshotted there, never at the primary the
+    /// container's own environment defaults to, and a job on a repository the
+    /// account does not register gets no snapshot at all.
+    #[test]
+    fn snapshot_exec_names_the_selected_clone() {
+        let mut config = Config {
+            schema_version: 1,
+            account: "seat".into(),
+            container: "c".into(),
+            engine: "e".into(),
+            docker_desktop: false,
+            repository: "https://example.invalid/o/primary".into(),
+            base: "main".into(),
+            repositories: vec![],
+            volume: "v".into(),
+            profile: PathBuf::from("/nonexistent"),
+            gh_config: None,
+        };
+        let second = identify("https://example.invalid/o/second").unwrap();
+        config.repositories.push(Registered {
+            repository: second.url.clone(),
+            base: "main".into(),
+            slug: second.slug.clone(),
+        });
+        let job = |repository: &str| lease::Job {
+            owner: "fixture".into(),
+            kind: JobKind::Sweep,
+            issue: Some(7),
+            branch: None,
+            container_id: "a".repeat(64),
+            base_revision: "b".repeat(40),
+            host_pid: 1,
+            control: "c".repeat(64),
+            repository: repository.into(),
+        };
+        let argv = |command: &Command| -> Vec<String> {
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let primary = argv(&snapshot_command(&config, &job("")).unwrap());
+        assert!(primary.contains(&format!("LOOM_PRIVATE_CLONE={REPO}")), "{primary:?}");
+
+        let other = argv(&snapshot_command(&config, &job(&second.url)).unwrap());
+        let clone = format!("{WORK_ROOT}/{}", second.slug);
+        assert!(other.contains(&format!("LOOM_PRIVATE_CLONE={clone}")), "{other:?}");
+        assert!(!other.iter().any(|arg| arg.contains(REPO)), "{other:?}");
+        // `docker exec [OPTIONS] CONTAINER COMMAND`: the env option must precede
+        // the container, and the snapshot still carries the job's issue.
+        let env_at = other.iter().position(|arg| arg == "--env").unwrap();
+        let container_at = other.iter().position(|arg| *arg == "a".repeat(64)).unwrap();
+        assert!(env_at < container_at, "{other:?}");
+        assert_eq!(
+            other[container_at + 1..],
+            [
+                "loom-daemon",
+                "private-workspace",
+                "snapshot",
+                "--issue",
+                "7"
+            ]
+        );
+
+        assert!(snapshot_command(&config, &job("https://example.invalid/o/third")).is_err());
+    }
+
     #[test]
     fn export_rejects_foreign_issue_branch_and_checkpoint() {
         let mut s = Snapshot {
