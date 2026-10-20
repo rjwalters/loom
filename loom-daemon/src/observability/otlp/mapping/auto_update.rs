@@ -6,21 +6,12 @@
 //! `JSONExtract`. The deciding build rides as `loom.auto_update.version` /
 //! `_revision` / `_tree_state` / `_provenance_complete`.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv, kv_int, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::kinds::auto_update_tick::{AutoUpdateTickRecord, TickDecisionKind};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 /// The severity a decision warrants: a panic is an error, and so is an
 /// unsatisfiable fleet floor (#10712) or a held floor roll (#10880), whatever

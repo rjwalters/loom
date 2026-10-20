@@ -64,7 +64,6 @@ pub mod phase_tap_usage;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
-pub mod journal_shadow;
 pub mod ops;
 pub mod provenance;
 pub mod queue_snapshot;

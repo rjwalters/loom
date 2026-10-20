@@ -57,7 +57,8 @@
 //! and spending passes on them ended every tick at `pass_limit` with its
 //! slots empty. `captain_cap` ends
 //! the tick's draws, since the captain would refuse every later claim the
-//! same way. In fleet-dispatch fallback ([`StepTickLimits::fallback`]) no
+//! same way; only an older captain sends it, since #12864 the captain
+//! applies no capacity limit and the worker's own budget is the only one. In fleet-dispatch fallback ([`StepTickLimits::fallback`]) no
 //! loss is free.
 //!
 //! An **unverifiable claim** ([`REFUSAL_CLAIM_UNVERIFIED`]) is the exception
@@ -153,6 +154,8 @@ pub const REFUSAL_CAPTAIN_HELD: &str = "captain_held";
 pub const REFUSAL_CAPTAIN_COOLDOWN: &str = "captain_cooldown";
 /// The fleet-dispatch server's refusal of a host at its cap (#12450): every
 /// later claim this tick would be refused the same way, so the draw ends.
+/// The captain no longer sends it (#12864); kept for an older captain in a
+/// mixed-version fleet.
 pub const REFUSAL_CAPTAIN_CAP: &str = "captain_cap";
 
 /// Why a tick's draw loop stopped (#12410): the tick span's
@@ -174,7 +177,8 @@ pub enum TickStop {
     SpawnHold,
     /// The fleet-dispatch captain refused a claim with `cap` (#12450): this
     /// host is at its fleet cap, so every repo left the draw. Without its own
-    /// stop the tick would read `pool_drained`, which it was not.
+    /// stop the tick would read `pool_drained`, which it was not. Only an
+    /// older captain sends `cap`; since #12864 the captain never does.
     CaptainCap,
     /// The pool's total weight overflowed ([`DrawError::WeightOverflow`]).
     WeightOverflow,
@@ -444,7 +448,9 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 &mut report.skipped_host_constraint
             }
             E::BuildBackoff => &mut report.deferred_build_backoff,
-            E::CoolingDown | E::Pass(PassReason::CiPending) => &mut report.skipped_noop_cooldown,
+            E::CoolingDown | E::Pass(PassReason::CiPending | PassReason::HeldAtHead) => {
+                &mut report.skipped_noop_cooldown
+            }
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(
                 PassReason::Frozen

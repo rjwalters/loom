@@ -1,7 +1,7 @@
 //! [`super::repo_slug`] coverage, kept out of `peer_claims.rs` for two
 //! reasons: the test mutates the process-global `LOOM_REPO`, so it must carry
 //! that variable's crate-wide `#[serial]` key (#8496 — see
-//! `gh_repo_env.rs`'s test-isolation invariant), and `peer_claims.rs` is
+//! the `gh_invocation` module docs' test-isolation invariant), and `peer_claims.rs` is
 //! frozen at its current size by `scripts/file-size-baseline.txt`, whose own
 //! preferred remedy is a sibling module.
 

@@ -7,6 +7,14 @@ readers, the authority, the schema/version field, the recovery behaviour and a
 proposed disposition. It then proposes a target journal schema with one writer
 per concern.
 
+> **SUPERSEDED (operator ruling, 2026-10-19, #9908 closed as not planned;
+> unwound by #12848).** The journals described in section 9 (J1 execution,
+> J2 telemetry, J3 configuration-snapshot) and their shadow-write code
+> (`loom_daemon::journal`, `telemetry::journal_shadow`, `config_journal`,
+> `LOOM_TELEMETRY_JOURNAL*`) were removed. The daemon produces telemetry and
+> session transcripts only. Sections 1-8 remain as a store inventory; sections
+> 9-14 are kept as history only and describe no live code.
+
 **Status: proposal for curation.** This phase changes documentation only. It
 creates no runtime store, migrates no reader, deletes no format, and changes no
 forge authority. Phase 4, which retires old formats, still needs the
