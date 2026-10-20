@@ -121,7 +121,12 @@ impl Discovery {
             direct_reads: AtomicU64::new(0),
             reserve_hit: AtomicBool::new(false),
             fallback: self.fallback.clone(),
-            lister: Box::new(direct::read_repo),
+            lister: if chain.is_fleet() {
+                // #12312: on the fleet the `gh` tier runs isolated.
+                Box::new(direct::read_repo_fleet)
+            } else {
+                Box::new(direct::read_repo)
+            },
         }
     }
 }

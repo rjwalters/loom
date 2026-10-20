@@ -165,6 +165,10 @@ jobs:
         if: ${{ !cancelled() }}
         # #10973: replay of the host-disk and work-finder-stale alert rules.
         run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
+      - name: "Ignored: SigNoz CI-telemetry alert rules against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        # #12908: replay of the ci-telemetry export-lagging, poll-failing and arrival-silent rules.
+        run: cargo test --package loom-daemon --features otlp --test signoz_ci_telemetry_alerts -- --ignored --nocapture
       - name: "Ignored: SigNoz step-dispatch alert rules against a real pinned ClickHouse"
         if: ${{ !cancelled() }}
         # #11909: replay of the step-dispatch-stalled and step-slots-idle rules.

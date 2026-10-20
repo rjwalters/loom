@@ -19,6 +19,7 @@ mod host_health;
 mod host_resource;
 mod host_status;
 mod issue_estimate;
+mod merge_authorization;
 mod merge_queue_event;
 mod merge_queue_observed;
 mod merge_queue_regime;
@@ -649,6 +650,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::MergeQueueEvent(_)
+        | TelemetryRecord::MergeAuthorization(_)
         | TelemetryRecord::HoldTransition(_)
         | TelemetryRecord::MergeQueueObserved(_)
         | TelemetryRecord::MergeQueueRegime(_)
@@ -674,6 +676,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))
                 .or_else(|| merge_queue_event::log_parts(r))
+                .or_else(|| merge_authorization::log_parts(r))
                 .or_else(|| hold_transition::log_parts(r))
                 .or_else(|| merge_queue_observed::log_parts(r))
                 .or_else(|| merge_queue_regime::log_parts(r))?;

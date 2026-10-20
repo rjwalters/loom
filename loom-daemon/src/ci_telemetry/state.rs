@@ -167,6 +167,12 @@ pub enum Health {
     /// The last cycle succeeded, but longer ago than three poll intervals —
     /// the poller has gone quiet, which must not read as healthy.
     Stale { age_secs: i64 },
+    /// The last cycle polled, but one or more owners were skipped at
+    /// discovery (`(owner, reason)`); the others are healthy.
+    Degraded {
+        age_secs: i64,
+        failing_owners: Vec<(String, String)>,
+    },
     /// The last cycle failed.
     Failing {
         since: Option<DateTime<Utc>>,
@@ -190,6 +196,7 @@ impl Health {
             Health::NeverPolled => "never-polled",
             Health::Ok { .. } => "ok",
             Health::Stale { .. } => "stale",
+            Health::Degraded { .. } => "degraded",
             Health::Failing { .. } => "failing",
             Health::Refused { .. } => "refused",
         }
@@ -235,10 +242,20 @@ pub fn classify(status: &PollStatus, now: DateTime<Utc>, interval_secs: u64) -> 
     };
     let age_secs = (now - last_ok).num_seconds().max(0);
     let stale_after = i64::try_from(interval_secs.saturating_mul(3)).unwrap_or(i64::MAX);
+    let failing_owners: Vec<(String, String)> = status
+        .owners
+        .iter()
+        .filter_map(|o| Some((o.owner.clone(), o.error.clone()?)))
+        .collect();
     if age_secs > stale_after {
         Health::Stale { age_secs }
-    } else {
+    } else if failing_owners.is_empty() {
         Health::Ok { age_secs }
+    } else {
+        Health::Degraded {
+            age_secs,
+            failing_owners,
+        }
     }
 }
 

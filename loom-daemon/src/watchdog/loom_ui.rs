@@ -9,20 +9,23 @@
 //! that workspace's observability config) and flushes it once, bounded by
 //! [`EXPORT_TIMEOUT`] ([`crate::observability::standalone_ops::deliver`]).
 //!
-//! A `<sentinel>.alert` file records an `open` that was exported: it is
-//! written only once the export succeeded, so an unexported `open` is simply
-//! tried again on the next tick (anything left in the queue goes first), and
-//! removed once the `resolved` is exported, so a healthy tick reads nothing
-//! and opens no connection. While an outage holds, the `open` is re-sent once
-//! the file is [`crate::alerts::HEARTBEAT`] old, inside the reader's 12 h
-//! heartbeat rule.
+//! A `<sentinel>.alert` file records an `open` and which exporters (by index)
+//! it drained to (#12831). An `open` no exporter drained leaves a pending
+//! record naming none, so it is tried again on the next tick. The `resolved`
+//! goes only to the exporters that got the `open`, so an exporter that is down
+//! cannot strand it, and it removes every still-queued `open` of the incident
+//! (anywhere), so an `open` that never got out cannot go out after the outage
+//! ended. The record is removed once the `resolved` drained, so a healthy
+//! tick reads nothing and opens no connection. While an outage holds, the
+//! `open` is re-sent once the file is [`crate::alerts::HEARTBEAT`] old, inside
+//! the reader's 12 h heartbeat rule.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use crate::alerts::{self, Alert, Severity, State};
-use crate::observability::standalone_ops::{self, Delivery};
+use crate::observability::standalone_ops::{self, Delivery, Report};
 use crate::telemetry::TelemetryRecord;
 
 /// Bound on one export: a tick must stay short.
@@ -63,44 +66,89 @@ fn adopt_legacy(sentinel: &Path) {
     }
 }
 
-/// Whether `alert` is owed at `now`: an `open` with no record or one a
-/// heartbeat old, or a `resolved` with a record.
+/// The exporters (indices) an `open` drained to, as `record` holds them:
+/// `None` when there is no record, `Some(None)` for a pre-#12831 record (every
+/// exporter), `Some(Some(list))` otherwise (empty: pending, nothing drained).
+fn read_exporters(record: &Path) -> Option<Option<Vec<usize>>> {
+    let text = std::fs::read_to_string(record).ok()?;
+    let listed = text.lines().find_map(|l| l.strip_prefix("exporters"));
+    Some(listed.map(|l| {
+        l.split_whitespace()
+            .filter_map(|n| n.parse().ok())
+            .collect()
+    }))
+}
+
+fn write_record(record: &Path, exporters: &[usize]) {
+    if let Some(dir) = record.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let list: String = exporters.iter().map(|i| format!(" {i}")).collect();
+    let _ =
+        std::fs::write(record, format!("{}\nexporters{list}\n", chrono::Utc::now().to_rfc3339()));
+}
+
+/// Whether `alert` is owed at `now`: an `open` with no record, a pending one
+/// (no exporter has it yet) or one a heartbeat old, or a `resolved` with a
+/// record.
 #[must_use]
 pub fn owed(record: &Path, alert: &Alert, now: SystemTime) -> bool {
     match alert.state {
         State::Resolved => record.exists(),
-        State::Open => match std::fs::metadata(record).and_then(|m| m.modified()) {
-            Ok(sent) => now
-                .duration_since(sent)
-                .is_ok_and(|age| age >= alerts::HEARTBEAT),
-            Err(_) => true,
-        },
+        State::Open => {
+            if read_exporters(record).is_some_and(|e| e.is_some_and(|e| e.is_empty())) {
+                return true;
+            }
+            match std::fs::metadata(record).and_then(|m| m.modified()) {
+                Ok(sent) => now
+                    .duration_since(sent)
+                    .is_ok_and(|age| age >= alerts::HEARTBEAT),
+                Err(_) => true,
+            }
+        }
     }
 }
 
-/// Send `alert` if it is owed at `now`, keeping `record` in step. `None` when
-/// nothing was owed.
+/// Send `alert` if it is owed at `now`, keeping `record` in step. `deliver`
+/// gets the exporters to target (`None`: all). `None` when nothing was owed.
 pub fn sync(
     record: &Path,
     alert: &Alert,
     now: SystemTime,
-    deliver: impl FnOnce(&Alert) -> Result<Delivery, String>,
+    deliver: impl FnOnce(&Alert, Option<&[usize]>) -> Result<Report, String>,
 ) -> Option<Result<Delivery, String>> {
     if !owed(record, alert, now) {
         return None;
     }
-    let outcome = deliver(alert);
-    if outcome == Ok(Delivery::Exported) {
-        if alert.state == State::Open {
-            if let Some(dir) = record.parent() {
-                let _ = std::fs::create_dir_all(dir);
+    let prior = read_exporters(record);
+    let outcome = match alert.state {
+        State::Open => deliver(alert, None).inspect(|report| {
+            let mut have: Vec<usize> = match &prior {
+                Some(Some(held)) => held.clone(),
+                // A pre-#12831 record: every exporter had it.
+                Some(None) => report.pending.clone(),
+                None => Vec::new(),
+            };
+            have.extend(&report.drained);
+            have.sort_unstable();
+            have.dedup();
+            // Never narrow an existing record on a failed re-send.
+            if !report.drained.is_empty() || prior.is_none() {
+                write_record(record, &have);
             }
-            let _ = std::fs::write(record, format!("{}\n", chrono::Utc::now().to_rfc3339()));
-        } else {
-            let _ = std::fs::remove_file(record);
+        }),
+        State::Resolved => {
+            let only = prior.flatten();
+            deliver(alert, only.as_deref()).inspect(|report| {
+                if report.pending.is_empty() {
+                    let _ = std::fs::remove_file(record);
+                } else {
+                    write_record(record, &report.pending);
+                }
+            })
         }
-    }
-    Some(outcome)
+    };
+    Some(outcome.map(|report| report.delivery()))
 }
 
 /// The workspace this tick exports for, resolved at most once per process.
@@ -116,22 +164,20 @@ fn root() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
-/// Export `alert` through `root`'s OTLP config. Anything an earlier tick left
-/// queued goes first; while that still cannot be exported nothing new is
-/// queued behind it.
-fn export(root: &Path, alert: &Alert) -> Result<Delivery, String> {
+/// Export `alert` through `root`'s OTLP config to the exporters in `only`
+/// (all when `None`). Anything the incident left queued is replaced by it, so
+/// an older `open` can never go out after a newer record.
+fn export(root: &Path, alert: &Alert, only: Option<&[usize]>) -> Result<Report, String> {
     let config = crate::observability::read_config(root);
-    if standalone_ops::flush_pending(&config, root, QUEUE_TAG, EXPORT_TIMEOUT)
-        == Some(Delivery::Queued)
-    {
-        return Ok(Delivery::Queued);
-    }
     let record = alerts::record(alert, &alerts::source_host(), chrono::Utc::now());
+    let (rule, key) = (record.rule.clone(), record.key.clone());
     standalone_ops::deliver(
         &config,
         root,
         QUEUE_TAG,
-        TelemetryRecord::AlertTransition(record),
+        &TelemetryRecord::AlertTransition(record),
+        only,
+        |queued| matches!(queued, TelemetryRecord::AlertTransition(q) if q.rule == rule && q.key == key),
         EXPORT_TIMEOUT,
     )
 }
@@ -145,9 +191,9 @@ fn send(sentinel: &Path, alert: &Alert) {
         return;
     }
     let Some(root) = root() else { return };
-    match sync(&record, alert, SystemTime::now(), |a| export(root, a)) {
+    match sync(&record, alert, SystemTime::now(), |a, only| export(root, a, only)) {
         Some(Ok(Delivery::Queued)) => log::info!(
-            "watchdog: alert {} {} queued, not yet exported; retried next tick",
+            "watchdog: alert {} {} queued, not yet exported everywhere; retried by a later tick",
             alert.rule,
             alert.state.as_str()
         ),
@@ -208,14 +254,25 @@ mod tests {
         SystemTime::now()
     }
 
+    fn report(drained: &[usize], pending: &[usize]) -> Result<Report, String> {
+        Ok(Report {
+            drained: drained.to_vec(),
+            pending: pending.to_vec(),
+        })
+    }
+
+    fn all_drained(_: &Alert, _: Option<&[usize]>) -> Result<Report, String> {
+        report(&[0, 1], &[])
+    }
+
     #[test]
     fn open_is_sent_once_then_holds_until_resolved() {
         let d = tempfile::tempdir().unwrap();
         let record = record_for(&d.path().join("sentinel"));
         let mut sent = Vec::new();
-        let mut deliver = |a: &Alert| {
+        let mut deliver = |a: &Alert, _: Option<&[usize]>| {
             sent.push(a.state);
-            Ok(Delivery::Exported)
+            report(&[0, 1], &[])
         };
         assert_eq!(
             sync(&record, &alert(State::Open), now(), &mut deliver),
@@ -238,23 +295,98 @@ mod tests {
     fn an_unexported_alert_is_retried_next_tick() {
         let d = tempfile::tempdir().unwrap();
         let record = record_for(&d.path().join("sentinel"));
-        let queued = |_: &Alert| Ok(Delivery::Queued);
+        let queued = |_: &Alert, _: Option<&[usize]>| report(&[], &[0, 1]);
         assert!(sync(&record, &alert(State::Open), now(), queued).is_some());
-        assert!(!record.exists(), "a queued open stays owed");
-        let failed = |_: &Alert| Err("no OTLP exporter is configured".to_string());
+        // Pending: no exporter has it, so it stays owed, and a resolve is owed
+        // too (to purge what is queued) but goes to no exporter.
+        assert!(owed(&record, &alert(State::Open), now()));
+        let failed = |_: &Alert, _: Option<&[usize]>| Err("no OTLP exporter is configured".into());
         assert!(sync(&record, &alert(State::Open), now(), failed).is_some());
-        assert!(!record.exists());
-        assert!(sync(&record, &alert(State::Open), now(), |_| Ok(Delivery::Exported)).is_some());
-        assert!(record.exists());
+        assert!(owed(&record, &alert(State::Open), now()));
+        assert!(sync(&record, &alert(State::Open), now(), all_drained).is_some());
+        assert!(!owed(&record, &alert(State::Open), now()));
         assert!(sync(&record, &alert(State::Resolved), now(), queued).is_some());
         assert!(record.exists(), "a queued resolve stays owed");
+    }
+
+    #[test]
+    fn a_resolve_goes_only_to_the_exporters_that_got_the_open() {
+        let d = tempfile::tempdir().unwrap();
+        let record = record_for(&d.path().join("sentinel"));
+        // Exporter 1 is dead: only 0 got the open.
+        let open = |_: &Alert, only: Option<&[usize]>| {
+            assert_eq!(only, None);
+            report(&[0], &[1])
+        };
+        assert_eq!(sync(&record, &alert(State::Open), now(), open), Some(Ok(Delivery::Queued)));
+        assert!(record.exists());
+        assert!(!owed(&record, &alert(State::Open), now()), "held until the heartbeat");
+        let mut targeted = None;
+        let resolve = |_: &Alert, only: Option<&[usize]>| {
+            targeted = only.map(<[usize]>::to_vec);
+            report(&[0], &[])
+        };
+        assert_eq!(
+            sync(&record, &alert(State::Resolved), now(), resolve),
+            Some(Ok(Delivery::Exported))
+        );
+        assert_eq!(targeted, Some(vec![0]), "the dead exporter is not a target");
+        assert!(!record.exists(), "the resolve landed everywhere it was owed");
+    }
+
+    #[test]
+    fn a_resolve_a_target_could_not_take_is_retried_there_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let record = record_for(&d.path().join("sentinel"));
+        assert!(sync(&record, &alert(State::Open), now(), all_drained).is_some());
+        let partial = |_: &Alert, only: Option<&[usize]>| {
+            assert_eq!(only, Some(&[0, 1][..]));
+            report(&[0], &[1])
+        };
+        assert!(sync(&record, &alert(State::Resolved), now(), partial).is_some());
+        let retry = |_: &Alert, only: Option<&[usize]>| {
+            assert_eq!(only, Some(&[1][..]));
+            report(&[1], &[])
+        };
+        assert!(sync(&record, &alert(State::Resolved), now(), retry).is_some());
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn a_resolve_after_an_open_nothing_took_still_purges_but_targets_no_one() {
+        let d = tempfile::tempdir().unwrap();
+        let record = record_for(&d.path().join("sentinel"));
+        let down = |_: &Alert, _: Option<&[usize]>| report(&[], &[0, 1]);
+        assert!(sync(&record, &alert(State::Open), now(), down).is_some());
+        let mut targeted = None;
+        let resolve = |_: &Alert, only: Option<&[usize]>| {
+            targeted = only.map(<[usize]>::to_vec);
+            report(&[], &[])
+        };
+        assert!(sync(&record, &alert(State::Resolved), now(), resolve).is_some());
+        assert_eq!(targeted, Some(vec![]), "no exporter ever had the open");
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn a_pre_upgrade_record_resolves_everywhere() {
+        let d = tempfile::tempdir().unwrap();
+        let record = record_for(&d.path().join("sentinel"));
+        std::fs::write(&record, "2026-10-19T00:00:00Z\n").unwrap();
+        let mut targeted = Some(vec![9]);
+        let resolve = |_: &Alert, only: Option<&[usize]>| {
+            targeted = only.map(<[usize]>::to_vec);
+            report(&[0, 1], &[])
+        };
+        assert!(sync(&record, &alert(State::Resolved), now(), resolve).is_some());
+        assert_eq!(targeted, None);
     }
 
     #[test]
     fn a_held_open_is_re_sent_once_a_heartbeat_old() {
         let d = tempfile::tempdir().unwrap();
         let record = record_for(&d.path().join("sentinel"));
-        assert!(sync(&record, &alert(State::Open), now(), |_| Ok(Delivery::Exported)).is_some());
+        assert!(sync(&record, &alert(State::Open), now(), all_drained).is_some());
         let later = now() + alerts::HEARTBEAT - Duration::from_secs(60);
         assert!(!owed(&record, &alert(State::Open), later));
         let due = now() + alerts::HEARTBEAT + Duration::from_secs(1);
@@ -293,7 +425,9 @@ mod tests {
             &config,
             d.path(),
             QUEUE_TAG,
-            TelemetryRecord::AlertTransition(r),
+            &TelemetryRecord::AlertTransition(r),
+            None,
+            |_| false,
             EXPORT_TIMEOUT
         )
         .is_err());

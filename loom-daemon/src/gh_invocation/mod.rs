@@ -90,6 +90,7 @@ pub mod api_kind;
 pub mod billing;
 pub mod caller_scope;
 pub(crate) mod cwd_route;
+pub mod discovery_isolation;
 mod outcome;
 pub(crate) mod own_writes;
 mod paged;
