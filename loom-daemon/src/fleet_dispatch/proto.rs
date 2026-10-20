@@ -210,6 +210,18 @@ pub struct ClaimResponse {
     /// Seconds before asking about this item again is worthwhile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_s: Option<u64>,
+    /// Count of earlier grants of this `(repo, item, step)`, set on a grant
+    /// that follows one (#12875). Absent on a first grant and for older
+    /// captains; older workers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// The assignment this grant replaces (#12875).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_assignment_id: Option<String>,
+    /// How that assignment ended: `released`, `expired` or `host_lost`
+    /// (#12875).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_end: Option<String>,
 }
 
 impl ClaimResponse {
@@ -224,7 +236,22 @@ impl ClaimResponse {
             reason: None,
             held_by: None,
             retry_after_s: None,
+            attempt: None,
+            prev_assignment_id: None,
+            prev_end: None,
         }
+    }
+
+    /// This grant, carrying the lineage of the assignment it replaces
+    /// (#12875).
+    #[must_use]
+    pub fn with_lineage(mut self, lineage: Option<&super::table::Lineage>) -> Self {
+        if let Some(l) = lineage {
+            self.attempt = Some(l.attempt);
+            self.prev_assignment_id = Some(l.prev_assignment_id.clone());
+            self.prev_end = Some(l.prev_end.as_str().to_string());
+        }
+        self
     }
 
     /// A refusal.
@@ -243,6 +270,9 @@ impl ClaimResponse {
             reason: Some(reason),
             held_by,
             retry_after_s: Some(retry_after_s),
+            attempt: None,
+            prev_assignment_id: None,
+            prev_end: None,
         }
     }
 }
