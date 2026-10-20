@@ -21,34 +21,7 @@ const ENV_KEYS: &[&str] = &[
     RESOURCE_ATTRIBUTES_ENV,
 ];
 
-/// Clears [`ENV_KEYS`] for the duration of a test and restores exactly what
-/// was there before — the pattern `observability::tracing`'s propagation test
-/// uses, so a real fleet host's exported overrides cannot decide this suite.
-struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-impl EnvGuard {
-    fn clear() -> Self {
-        let previous = ENV_KEYS
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
-        for key in ENV_KEYS {
-            std::env::remove_var(key);
-        }
-        Self(previous)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
+use crate::env_test_support::EnvGuard;
 
 /// The shared `observability.endpoint` tier, as read from config.
 fn shared(endpoint: &str) -> super::super::ObservabilityConfig {
@@ -87,7 +60,7 @@ fn command_env(command: &Command) -> Vec<(String, Option<String>)> {
 #[test]
 #[serial]
 fn off_by_default_injects_nothing() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(ENV_KEYS);
     let config = ClaudeCodeTelemetryConfig::default();
     assert!(!resolve_enabled(&config), "FLAGS-OFF posture");
     assert!(
@@ -99,7 +72,7 @@ fn off_by_default_injects_nothing() {
 #[test]
 #[serial]
 fn enabled_injects_the_documented_variables_with_the_shared_endpoint() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(ENV_KEYS);
     let config = ClaudeCodeTelemetryConfig {
         enabled: Some(true),
         ..Default::default()
@@ -138,7 +111,7 @@ fn enabled_injects_the_documented_variables_with_the_shared_endpoint() {
 #[test]
 #[serial]
 fn log_tool_details_is_an_independent_sub_toggle() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(ENV_KEYS);
     let mut config = ClaudeCodeTelemetryConfig {
         enabled: Some(true),
         ..Default::default()
@@ -162,7 +135,7 @@ fn log_tool_details_is_an_independent_sub_toggle() {
 #[test]
 #[serial]
 fn every_knob_resolves_env_over_config_over_default() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(ENV_KEYS);
     // Tier 3: default.
     let empty = ClaudeCodeTelemetryConfig::default();
     assert!(!resolve_enabled(&empty));
@@ -211,7 +184,7 @@ fn every_knob_resolves_env_over_config_over_default() {
 #[test]
 #[serial]
 fn an_unusable_endpoint_fails_closed() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(ENV_KEYS);
     let enabled = ClaudeCodeTelemetryConfig {
         enabled: Some(true),
         ..Default::default()
@@ -237,7 +210,7 @@ fn an_unusable_endpoint_fails_closed() {
 #[test]
 #[serial]
 fn an_unknown_protocol_degrades_to_the_default() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(ENV_KEYS);
     let config = ClaudeCodeTelemetryConfig {
         protocol: Some("HTTP/JSON".to_string()),
         ..Default::default()
@@ -253,7 +226,7 @@ fn an_unknown_protocol_degrades_to_the_default() {
 #[test]
 #[serial]
 fn read_config_parses_the_block_and_tolerates_junk() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(ENV_KEYS);
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
     std::fs::write(
@@ -296,7 +269,7 @@ fn read_config_parses_the_block_and_tolerates_junk() {
 #[test]
 #[serial]
 fn prepare_child_removes_the_managed_set_when_off_and_sets_it_when_on() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(ENV_KEYS);
     let dir = tempfile::tempdir().unwrap();
 
     // Off (no config block at all): every managed name is an explicit
@@ -338,7 +311,7 @@ fn attribute_values_are_percent_encoded() {
 #[test]
 #[serial]
 fn prepare_scheduled_child_stamps_role_and_tick_only_when_on() {
-    let _guard = EnvGuard::clear();
+    let _guard = EnvGuard::clear(ENV_KEYS);
     let dir = tempfile::tempdir().unwrap();
     let attrs = |command: &Command| {
         command

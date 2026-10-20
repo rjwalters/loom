@@ -67,8 +67,6 @@ pub struct TickContext<'a> {
     pub window: Duration,
     pub host: &'a str,
     pub pool_dir: Option<&'a Path>,
-    /// #10916: output-based watchdog data; `None` skips the watchdog.
-    pub outputs: Option<&'a super::outputs::OutputWatch<'a>>,
 }
 
 /// One evaluation pass. Delivers every transition to every sink (a failing
@@ -84,18 +82,13 @@ pub fn run_tick(
         window,
         host,
         pool_dir,
-        outputs,
     } = *ctx;
     // An unreachable status is "unknown", not "healthy": leave state alone.
     let Some(status) = status else {
         return Vec::new();
     };
     let cause = causes::token_cause(status.capacity.total_accounts, pool_dir);
-    let mut observed = classify(status, now, window, cause);
-    // #10916: output-based watchdog for fleet singletons; absent data fires.
-    if let Some(watch) = outputs {
-        observed.extend(super::outputs::conditions(watch, now));
-    }
+    let observed = classify(status, now, window, cause);
     let transitions = state.step(now, &observed);
     for t in &transitions {
         for sink in sinks {
@@ -137,8 +130,9 @@ pub fn spawn(
         );
         return None;
     }
-    // #11295: loom-ui is a second output, independent of the bus (Matrix).
-    let loom_ui = crate::loom_ui_alerts::is_active();
+    // #11295 / #12806: `alert.transition` is a second output, independent of
+    // the bus (Matrix).
+    let loom_ui = crate::alerts::is_active();
     if bus.is_none() && !loom_ui {
         log::info!("fleet_alert: no delivery sink available; alerting is a no-op");
         return None;
@@ -171,8 +165,6 @@ pub fn spawn(
                     window,
                     host: &host,
                     pool_dir: pool_dir.as_deref(),
-                    // The real fleet-store/SigNoz OutputSource is a follow-up.
-                    outputs: None,
                 };
                 let transitions = run_tick(&mut state, &sinks, &ctx, Utc::now());
                 if !transitions.is_empty() {

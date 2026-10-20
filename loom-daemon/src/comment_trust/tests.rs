@@ -263,6 +263,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // through `fetch_trusted_comments`; it fetches nothing itself.
         ("verdict_gate.rs", "parses already-filtered bodies"),
         ("verdict_gate/tests.rs", "test"),
+        // #12900: `unreleased_hold_head` takes the PR's trusted bodies only; its
+        // sole caller (`PullMarkers::from_trusted`) passes `TrustedComments::bodies()`.
+        // It fetches nothing itself.
+        ("champion_hold.rs", "parses already-filtered bodies"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];

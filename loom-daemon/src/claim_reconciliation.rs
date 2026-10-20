@@ -1909,24 +1909,8 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
 /// be redundant. Each tick's `gh` calls block, so it runs on a blocking
 /// thread (`tokio::task::spawn_blocking`), mirroring
 /// [`crate::token_ranking_refresh::spawn_multi_token_ranking_refresh_task`].
-///
-/// **Claim-reconcile wake (#8766, renamed in #8995).** A `loom:building` claim
-/// whose sweep is gone is what *holds* the dispatch queue's head, and this loop
-/// is what releases it — but releasing it does not by itself move the head, so
-/// this is not the head-mover: the work finder still has to tick before the
-/// freed issue is dispatched, which is why the flag names this pass rather than
-/// that effect. `event_bus` lets a `forge.event` prompt of a claim-relevant
-/// shape (a comment on a claimed issue, a PR reaching terminal state) run the
-/// *next ordinary pass now*
-/// instead of at the multi-minute cadence above — and nothing else. The pass
-/// body is untouched: it re-lists `loom:building` issues and re-decides from
-/// the same host-scoped evidence and the same lease gate it always did, so an
-/// early tick can only change *when* that happens. Disabled unless
-/// `forgeEvents.events.claimReconcileWake` is on for `fallback_root`;
-/// otherwise the ticker holds no bus subscription at all.
 pub fn spawn_periodic_reconciliation_task(
     fallback_root: std::path::PathBuf,
-    event_bus: std::sync::Arc<crate::event_bus::EventBus>,
 ) -> tokio::task::JoinHandle<()> {
     // Safehouse-aware cadence (#4431): with live peer-claims carrying the
     // fast in-flight signal (re-advertised each reaper tick), a
@@ -1937,15 +1921,7 @@ pub fn spawn_periodic_reconciliation_task(
         interval.as_secs()
     );
     tokio::spawn(async move {
-        // An `Interval` a claim-relevant `forge.event` prompt may also tick
-        // early (#8766). Disarmed unless
-        // `forgeEvents.events.claimReconcileWake` is on; otherwise it is
-        // exactly `tokio::time::interval(interval)`.
-        let mut ticker = crate::forge_events::wake::EarlyTicker::for_claim_reconcile(
-            interval,
-            &event_bus,
-            &fallback_root,
-        );
+        let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consume the immediate first fire: the startup pass already ran
         // moments ago in `main.rs`, so re-running instantly is redundant.
@@ -2014,6 +1990,11 @@ pub mod merge_sequence;
 /// file per the file-size ratchet, run on the same tick right after
 /// [`forge::reconcile_pr_verdicts`].
 pub mod review_conflict;
+
+/// Retarget open PRs stacked on a parent closed unmerged (#12760) — and its
+/// scratch-worktree git mechanics — sibling files per the file-size ratchet.
+pub mod orphan_stack;
+pub(crate) mod orphan_stack_git;
 
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
 /// rate-limit-breaker re-check that stops it early — a sibling file per the

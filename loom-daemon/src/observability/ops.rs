@@ -57,6 +57,7 @@ pub mod dwell;
 pub mod feed;
 pub mod forge_calls;
 pub mod forge_mirror;
+pub mod hold_age;
 pub mod host;
 pub mod ipc_latency;
 pub mod liveness;

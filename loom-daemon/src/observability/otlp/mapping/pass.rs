@@ -11,21 +11,12 @@
 
 use std::collections::BTreeMap;
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv, kv_int, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::kinds::pass::{PassOutcome, PassSummaryRecord, PassVerdictRecord, StepFacts};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 fn int(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
@@ -100,6 +91,7 @@ fn step_attributes(s: &StepFacts, attributes: &mut Vec<KeyValue>) {
         .first_refused_at
         .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     for (key, value) in [
+        ("loom.sweep_id", s.sweep_id.as_ref()),
         ("loom.pass.head_sha", s.head_sha.as_ref()),
         ("loom.pass.step", s.step.as_ref()),
         ("loom.pass.class", s.class.as_ref()),
@@ -165,6 +157,11 @@ fn verdict(r: &PassVerdictRecord) -> (&'static str, SeverityNumber, u64, Vec<Key
         }
     }
     step_attributes(&r.step, &mut attributes);
+    // A step's detail is the session's own reason token (#12715), bounded and
+    // token-only; any other record's detail stays body-only.
+    if let (Some(_), Some(detail)) = (&r.step.step, &r.detail) {
+        attributes.push(kv_string("loom.pass.reason_detail", detail.clone()));
+    }
     let severity = if r.verdict == "failed" {
         SeverityNumber::Warn
     } else {

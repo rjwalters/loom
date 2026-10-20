@@ -5,9 +5,10 @@
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use crate::fleet_sync;
+use crate::host_shape;
 use crate::telemetry::trace::provenance;
 
-use super::kv_string;
+use super::{kv_int, kv_string};
 
 /// A `Resource` describing the emitting daemon host. `service.version` is
 /// always present: a record-supplied `daemon_version` (from a `host.health`
@@ -42,7 +43,17 @@ use super::kv_string;
 /// before a roll and exported after it carries the new SHA, the same accepted
 /// behaviour as the `service.version` fallback. "Applied" also means "on
 /// disk", not "live in this process" — restart-only keys
-/// (`config_journal::restart_keys`) take effect on the next start.
+/// take effect on the next start.
+///
+/// # Host shape (Issue #12874)
+///
+/// After those seven, the host's static shape from [`host_shape`]:
+/// `host.cpu.count` and `host.arch` always, `loom.host.mem_total_bytes` when
+/// RAM was measured (absent, never `0`), and — where readable —
+/// `host.type` (the EC2 instance type, or a Mac's `hw.model`) plus
+/// `cloud.provider` / `cloud.region` once the one-shot IMDS probe has
+/// succeeded. The cloud cell is read without blocking, so a batch exported
+/// before the probe finishes lacks those keys and the next one has them.
 pub(in crate::observability::otlp) fn resource_for_host(
     host_id: &str,
     daemon_version: Option<&str>,
@@ -50,7 +61,7 @@ pub(in crate::observability::otlp) fn resource_for_host(
     let version = daemon_version
         .filter(|v| !v.is_empty())
         .unwrap_or(env!("CARGO_PKG_VERSION"));
-    let attributes = vec![
+    let mut attributes = vec![
         kv_string("service.name", "loom-daemon"),
         kv_string("service.instance.id", host_id),
         kv_string("host.id", host_id),
@@ -62,6 +73,28 @@ pub(in crate::observability::otlp) fn resource_for_host(
             fleet_sync::applied::applied_config_sha().as_resource_value(),
         ),
     ];
+    let shape = host_shape::static_shape();
+    attributes.push(kv_int(
+        host_shape::HOST_CPU_COUNT,
+        i64::try_from(shape.cpu_count).unwrap_or(i64::MAX),
+    ));
+    if let Some(bytes) = shape.mem_total_bytes.and_then(|b| i64::try_from(b).ok()) {
+        attributes.push(kv_int(host_shape::HOST_MEM_TOTAL_BYTES, bytes));
+    }
+    attributes.push(kv_string(host_shape::HOST_ARCH, shape.arch));
+    // One read of the cloud cell, so `host.type` and `cloud.*` always agree.
+    let cloud = host_shape::cloud_shape();
+    let host_type = cloud
+        .as_ref()
+        .map(|c| c.instance_type.clone())
+        .or_else(|| shape.model.clone());
+    if let Some(host_type) = host_type {
+        attributes.push(kv_string(host_shape::HOST_TYPE, host_type));
+    }
+    if let Some(cloud) = cloud {
+        attributes.push(kv_string(host_shape::CLOUD_PROVIDER, cloud.provider));
+        attributes.push(kv_string(host_shape::CLOUD_REGION, cloud.region));
+    }
     Resource {
         attributes,
         ..Default::default()

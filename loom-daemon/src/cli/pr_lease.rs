@@ -805,6 +805,11 @@ pub(crate) struct ReleaseArgs {
     /// the released lease. Absent: recorded as `outcome=none`.
     #[arg(long, value_name = "WORD")]
     pub(crate) outcome: Option<String>,
+    /// The gate a non-merging Champion step stopped at (#12715), recorded on
+    /// the released lease beside the outcome: a `reason=` token of the
+    /// step's `CHAMPION-STEP` line (`facts_unread`, `merge_rc7`, ...).
+    #[arg(long, value_name = "TOKEN")]
+    pub(crate) reason: Option<String>,
 }
 
 /// `reap`'s arguments: the dead claimant's exact identity, as its own
@@ -840,7 +845,7 @@ impl PrLeaseAction {
             Self::Fence(c) => with_context(&c, EXIT_HELD, false, |ctx| ctx.fence()),
             Self::Attach(c) => with_context(&c, EXIT_UNVERIFIED, false, |ctx| ctx.attach()),
             Self::Release(r) => with_context(&r.common, EXIT_HELD, true, |ctx| {
-                ctx.release(r.skip_reason.as_deref(), r.outcome.as_deref())
+                ctx.release(r.skip_reason.as_deref(), r.outcome.as_deref(), r.reason.as_deref())
             }),
             Self::Check(c) => with_context(&c, EXIT_UNVERIFIED, false, |ctx| ctx.check()),
             Self::Reap(r) => {
@@ -1229,18 +1234,23 @@ impl Ctx {
     /// is the pass's own `--skip-reason` (#11972): a Judge pass that stood
     /// down for pending CI is not recorded if CI has settled since, only if
     /// it is stuck ([`backstop::CiState::exempts`]).
-    pub(crate) fn release(&self, skip_reason: Option<&str>, outcome: Option<&str>) -> i32 {
+    pub(crate) fn release(
+        &self,
+        skip_reason: Option<&str>,
+        outcome: Option<&str>,
+        stop_reason: Option<&str>,
+    ) -> i32 {
         if let Some(path) = &self.lease_file {
             loom_daemon::pr_lease_reap::forget_in(path, &self.held());
         }
-        self.release_with(None, skip_reason, outcome)
+        self.release_with(None, skip_reason, outcome, stop_reason)
     }
 
     /// `reap`: [`release`](Self::release) on behalf of a claimant the role
     /// runner terminated (#11931). A Judge's reap records the no-verdict pass
     /// whatever the head's CI is doing ([`backstop::reaped_release_fields`]).
     pub(crate) fn reap(&self, reason: &str) -> i32 {
-        self.release_with(Some(reason), None, None)
+        self.release_with(Some(reason), None, None, None)
     }
 
     fn release_with(
@@ -1248,6 +1258,7 @@ impl Ctx {
         reaped: Option<&str>,
         skip_reason: Option<&str>,
         outcome: Option<&str>,
+        stop_reason: Option<&str>,
     ) -> i32 {
         let stopped = if self.manage_renewer {
             renew::stop(self)
@@ -1303,6 +1314,7 @@ impl Ctx {
                 backstop::champion_outcome_fields(
                     self.me.role,
                     outcome.filter(|_| reaped.is_none()),
+                    stop_reason.filter(|_| reaped.is_none()),
                 )
             };
             let body = format!(

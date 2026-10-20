@@ -345,17 +345,6 @@ impl GhForge {
         self
     }
 
-    /// Like [`Self::new`], but writes are vetted under the root's own
-    /// per-owner credential probed with `gh_bin` (#11437) — the credential
-    /// the tick's gate admitted the root under, and the one the write uses.
-    #[must_use]
-    pub fn for_root_credential(repo_root: PathBuf, repo: Option<String>, gh_bin: PathBuf) -> Self {
-        Self {
-            root_credential_gh: Some(gh_bin),
-            ..Self::new(repo_root, repo)
-        }
-    }
-
     /// Refuse a forge write the write scope denies (#9548).
     fn check_write(&mut self) -> Result<(), String> {
         let (root, repo) = (&self.repo_root, self.repo.as_deref());

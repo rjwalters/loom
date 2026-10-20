@@ -986,26 +986,6 @@ pub fn writer_bucket(owner: &str) -> Option<String> {
     .then(|| format!("{WRITER_BUCKET_PREFIX}{}", owner.to_ascii_lowercase()))
 }
 
-/// The writer bucket that serves `owner_repo` (#10334), mirroring how a
-/// writer `gh` call picks its credential (`GhInvocation::env_plan`): the
-/// owner's own writer when one is registered for it
-/// (`owner_writer_registered`, `credential_preflight::gh_config_dir_for_owner_slug`),
-/// else the primary writer, booked under the workspace's own owner
-/// (`primary_owner`). With the primary owner unknown, the repo's owner — the
-/// same owner a writer row without a credential owner is booked under.
-#[must_use]
-pub fn serving_writer_bucket(
-    owner_repo: &str,
-    owner_writer_registered: bool,
-    primary_owner: Option<&str>,
-) -> Option<String> {
-    let repo_owner = crate::credential_preflight::owner_of_nwo(owner_repo);
-    match primary_owner {
-        Some(primary) if !owner_writer_registered => writer_bucket(primary),
-        _ => writer_bucket(repo_owner),
-    }
-}
-
 /// The one reader-only read shape (#12394; was `reader_then_writer`, #9537/#9872).
 ///
 /// **A read never falls through to the writer.** With no `reader_dir` (the

@@ -102,6 +102,7 @@ impl Span {
     pub fn finish_attempt(&self, result: &str, status: SpanStatus, worked: Option<bool>) {
         let mut close = attributes(&[("loom.result", result)]);
         insert_worked(&mut close, worked);
+        close.extend(host_attributes());
         self.finish_attributes(status, close.clone());
         if let Ok(active) = self.journal.active() {
             for phase in active {
@@ -237,6 +238,72 @@ pub fn host_attributes() -> TraceAttributes {
         attrs.insert("loom.host.pressure".into(), pressure.to_string());
     }
     insert_f64(&mut attrs, "loom.host.load_per_core", raw("cpu_load_per_core"));
+    // #12884: the raw ingredients of `load_per_core` — the core count it
+    // divides by and the 1-minute load average itself — so a span can be read
+    // without knowing the box. A failed probe leaves the key absent.
+    insert_u64(
+        &mut attrs,
+        "loom.host.logical_cpus",
+        std::thread::available_parallelism()
+            .ok()
+            .map(|n| n.get() as u64),
+    );
+    insert_f64(&mut attrs, "loom.host.loadavg_1m", crate::cpu_headroom::read_loadavg_1m());
+    attrs
+}
+
+/// The CPU quota and in-flight sweep count `spawn-claude.sh` exported into the
+/// child's environment (#12884). Only a child sees them, so the daemon-side
+/// `loom.sweep` root cannot carry these; the phase spans opened in the child
+/// do. A value that is unset or not an integer >= 1 leaves its key absent.
+fn spawn_budget_attributes() -> TraceAttributes {
+    spawn_budget_from(
+        std::env::var("LOOM_SWEEP_CPU_BUDGET_CORES").ok().as_deref(),
+        std::env::var("LOOM_SWEEP_CPU_INFLIGHT").ok().as_deref(),
+    )
+}
+
+fn spawn_budget_from(cores: Option<&str>, in_flight: Option<&str>) -> TraceAttributes {
+    let mut attrs = TraceAttributes::new();
+    for (value, key) in [
+        (cores, "loom.host.cpu_budget_cores"),
+        (in_flight, "loom.host.sweeps_in_flight"),
+    ] {
+        let value = value
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v >= 1);
+        insert_u64(&mut attrs, key, value);
+    }
+    attrs
+}
+
+/// The load keys every close re-stamps, paired with the key that keeps the
+/// open-time sample (#12884). `Journal::finish` extends a span's attributes
+/// with the close set, so a sample taken at open under the plain key is
+/// replaced at close; the `loom.host.start.*` copy is never re-stamped, so the
+/// drained span carries both the start-time and the close-time load. The CPU
+/// count needs no start copy (it does not change during a sweep), and the
+/// spawn budget keys are never re-stamped by a close.
+const START_LOAD_KEYS: [(&str, &str); 2] = [
+    ("loom.host.loadavg_1m", "loom.host.start.loadavg_1m"),
+    ("loom.host.load_per_core", "loom.host.start.load_per_core"),
+];
+
+/// Copy the load sample in `attrs` to its `loom.host.start.*` keys; an absent
+/// sample stays absent.
+fn stamp_start_load(attrs: &mut TraceAttributes) {
+    for (close, start) in START_LOAD_KEYS {
+        if let Some(value) = attrs.get(close).cloned() {
+            attrs.insert(start.into(), value);
+        }
+    }
+}
+
+/// What a span carries at open: the host state, with its load sample also kept
+/// under the `loom.host.start.*` keys a close does not overwrite.
+fn open_host_attributes() -> TraceAttributes {
+    let mut attrs = host_attributes();
+    stamp_start_load(&mut attrs);
     attrs
 }
 
@@ -445,11 +512,14 @@ pub fn worker_attempt(root: &Path, role: &str) -> Option<Span> {
     {
         return Some(Span { journal, active });
     }
-    let metadata = attributes(&[
+    let mut metadata = attributes(&[
         ("loom.role", role),
         ("loom.phase", role),
         ("loom.timing_source", "owned_boundary"),
     ]);
+    // `spawn-worker` runs before `spawn-claude.sh` computes the CPU budget, so
+    // any `LOOM_SWEEP_CPU_*` here is the parent's; only host state is stamped.
+    metadata.extend(open_host_attributes());
     let at = Utc::now();
     let phase = journal
         .start_linked(
@@ -562,6 +632,8 @@ fn checkpoint_begin_observation(
     if let Some(model) = model {
         metadata.insert("loom.configured_model".into(), model.into());
     }
+    metadata.extend(open_host_attributes());
+    metadata.extend(spawn_budget_attributes());
     let at = Utc::now();
     let active = journal.active().ok()?;
     metadata.extend(execution_scope(&active, root));
@@ -696,6 +768,9 @@ fn checkpoint_observation(
         ("loom.timing_source", source),
         ("loom.result", result),
     ]);
+    // The close sample; the synthetic branch below also keeps it as the start.
+    metadata.extend(host_attributes());
+    metadata.extend(spawn_budget_attributes());
     // #9420: a synthetic observation has no observed start, so it is emitted
     // with `started_at == ended_at` — a zero duration that measures nothing.
     // The owned-start branch below overwrites this with `true`: there the
@@ -761,6 +836,10 @@ fn checkpoint_observation(
             return;
         }
     }
+    // A synthetic observation opens and closes at the same instant, so its one
+    // sample is also its start sample. The owned-start branch above must not
+    // carry these keys: it would overwrite the begun attempt's open sample.
+    stamp_start_load(&mut metadata);
     let links = launcher
         .map(|context| crate::telemetry::trace::SpanLink { context })
         .into_iter()
@@ -822,6 +901,7 @@ pub fn prepare_execution(command: &mut Command, root: &Path, execution: &str, is
         ("loom.sweep_id", execution),
         ("loom.timing_source", "dispatch_observed"),
     ]));
+    metadata.extend(open_host_attributes());
     // The issue is a plain fact, whether or not the repo's GitHub spelling
     // resolved (#11982).
     let repo = issue

@@ -171,13 +171,6 @@ pub enum AuthzDecision {
     Denied(Vec<DenyReason>),
 }
 
-impl AuthzDecision {
-    #[must_use]
-    pub fn is_authorized(&self) -> bool {
-        matches!(self, AuthzDecision::Authorized)
-    }
-}
-
 /// Decide whether the PR may be (or stay) queued at `approved_sha`.
 /// Fail-closed: every fact must be known and non-denying.
 #[must_use]
@@ -370,7 +363,7 @@ pub fn authorize_and_enqueue(
         })
         .map_err(HandoffError::Store)?;
     let (state, desc) = status_for(&GroupConclusion::Success);
-    if let Err(e) = statuses.post_status(approved_sha, state, &desc) {
+    if let Err(e) = statuses.post_pr_status(pr, approved_sha, state, &desc) {
         let _ = store.revoke(pr);
         return Err(HandoffError::HeadStatus(e));
     }
@@ -430,7 +423,7 @@ fn already_queued(
 /// failed write here is logged, not an error of the handoff.
 pub(super) fn withdraw_head_status(statuses: &dyn StatusApi, pr: u32, head: &str) {
     let desc = format!("authorization for #{pr} revoked");
-    if let Err(e) = statuses.post_status(head, StatusState::Failure, &desc) {
+    if let Err(e) = statuses.post_pr_status(pr, head, StatusState::Failure, &desc) {
         log::warn!("merge-queue: could not withdraw the head status for #{pr}: {e}");
     }
 }
@@ -441,7 +434,7 @@ pub(super) fn withdraw_head_status(statuses: &dyn StatusApi, pr: u32, head: &str
 /// read as red CI, so re-approving the same head is not routed to Doctor.
 pub(super) fn clear_head_status(statuses: &dyn StatusApi, pr: u32, head: &str) {
     let desc = format!("authorization for #{pr} pending re-handoff");
-    if let Err(e) = statuses.post_status(head, StatusState::Pending, &desc) {
+    if let Err(e) = statuses.post_pr_status(pr, head, StatusState::Pending, &desc) {
         log::warn!("merge-queue: could not clear the head status for #{pr}: {e}");
     }
 }

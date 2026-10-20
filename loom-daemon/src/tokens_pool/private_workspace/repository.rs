@@ -54,6 +54,10 @@ pub struct PrepareArgs {
     pub container_id: String,
     #[arg(long)]
     pub branch: Option<String>,
+    /// Collision-safe directory name of an additional repository (#10795),
+    /// cloned at `<volume>/work/<slug>`. Absent: the legacy `<volume>/repo`.
+    #[arg(long)]
+    pub slug: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -142,8 +146,10 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
         bail!("workspace account and container identity are required");
     }
     let root = root.canonicalize()?;
-    let repo = root.join("repo");
-    let record = root.join("identity.json");
+    let (repo, record, staging) = match &args.slug {
+        None => (root.join("repo"), root.join("identity.json"), None),
+        Some(slug) => additional_paths(&root, slug, &args.account)?,
+    };
     let mut identity = if record.exists() {
         let existing: Identity = serde_json::from_slice(&std::fs::read(&record)?)?;
         if existing.protocol != PROTOCOL
@@ -156,8 +162,13 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
     } else {
         // Empty means truly empty; an interrupted/foreign clone is not ours to
         // clean. Docker's named volume does not require filesystem lost+found.
-        if std::fs::read_dir(&root)?.next().is_some() {
+        if staging.is_none() && std::fs::read_dir(&root)?.next().is_some() {
             bail!("unrecognized nonempty workspace volume; retain it for recovery");
+        }
+        if staging.is_some() && repo.symlink_metadata().is_ok() {
+            bail!(
+                "unrecognized directory where an additional clone belongs; retain it for recovery"
+            );
         }
         let identity = Identity {
             protocol: PROTOCOL.into(),
@@ -169,7 +180,28 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
         save(&record, &identity)?;
         identity
     };
-    if !repo.exists() {
+    if let Some(staging) = &staging {
+        if repo.symlink_metadata().is_err() {
+            // A staging directory is only ever a clone that never completed:
+            // nothing runs in it and it is not the ready path, so it carries
+            // no work and is safe to discard (a ready clone is never staged).
+            discard_staging(staging)?;
+            let relative = staging.strip_prefix(&root)?.to_string_lossy().into_owned();
+            git(
+                &root,
+                &[
+                    "clone",
+                    "--no-local",
+                    "--no-hardlinks",
+                    "--",
+                    &args.repository,
+                    &relative,
+                ],
+            )?;
+            // The ready path appears only once the clone is complete.
+            std::fs::rename(staging, &repo)?;
+        }
+    } else if !repo.exists() {
         git(
             &root,
             &[
@@ -190,6 +222,9 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
         bail!("workspace must own a real clone and private Git objects, without symlinks or alternates");
     }
     private_metadata(&repo.join(".git"))?;
+    if Path::new(git(&repo, &["rev-parse", "--show-toplevel"])?.trim()).canonicalize()? != repo {
+        bail!("workspace clone is not its own independent Git root");
+    }
     if git(&repo, &["remote", "get-url", "origin"])?.trim() != args.repository {
         bail!("private clone origin changed; preserve work and restore its verified identity");
     }
@@ -261,6 +296,84 @@ pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
     identity.revision.clone_from(&revision);
     save(&record, &identity)?;
     Ok(revision)
+}
+
+/// Paths of an additional repository: `(clone, identity record, staging)`.
+/// Refuses unless the account's primary workspace was established first and
+/// every directory on the way is a real directory of this volume.
+fn additional_paths(
+    root: &Path,
+    slug: &str,
+    account: &str,
+) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
+    if !safe_segment(slug) || slug.contains("..") {
+        bail!("additional repository directory name is unsafe");
+    }
+    let primary: Identity = serde_json::from_slice(
+        &std::fs::read(root.join("identity.json"))
+            .context("the account's primary workspace is not prepared; start the session first")?,
+    )?;
+    if primary.protocol != PROTOCOL || primary.account != account {
+        bail!("private workspace account identity mismatch; do not reset or remove unknown work");
+    }
+    let work = root.join("work");
+    let identities = work.join(".identity");
+    for dir in [&work, &identities] {
+        match std::fs::symlink_metadata(dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => bail!("workspace {} must be a real directory, not a link", dir.display()),
+            Err(_) => std::fs::create_dir(dir)?,
+        }
+    }
+    Ok((
+        work.join(slug),
+        identities.join(format!("{slug}.json")),
+        Some(work.join(format!(".cloning-{slug}"))),
+    ))
+}
+
+fn discard_staging(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+/// Forge identity (`host/owner/name`, lowercase) of a roster remote in any of
+/// its spellings: `https://h/o/n(.git)`, `ssh://git@h/o/n`, `git@h:o/n(.git)`.
+fn remote_key(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    let (host, path) = if let Some((_, rest)) = remote.split_once("://") {
+        let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+        rest.split_once('/')?
+    } else {
+        let (host, path) = remote
+            .rsplit_once('@')
+            .map_or(remote, |(_, r)| r)
+            .split_once(':')?;
+        (host, path)
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    Some(format!("{}/{}", host.split(':').next()?, path).to_ascii_lowercase())
+}
+
+/// Whether `id` is a repository the fleet roster marks `firewall: true`
+/// (notebook/corporate). Matches the remote's forge identity, and — failing
+/// closed for a record with no usable remote — the record's own name against
+/// the repository name. `records` are `(name, remote)` pairs.
+pub(super) fn firewalled(id: &RepoId, records: &[(String, Option<String>)]) -> bool {
+    let (authority, rest) = id.key.split_once('/').unwrap_or((id.key.as_str(), ""));
+    let without_port = format!("{}/{rest}", authority.split(':').next().unwrap_or(authority));
+    let name = id.key.rsplit('/').next().unwrap_or("");
+    records
+        .iter()
+        .any(|(record, remote)| match remote.as_deref().and_then(remote_key) {
+            Some(key) => key == without_port,
+            None => record.to_ascii_lowercase() == name,
+        })
 }
 
 fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
