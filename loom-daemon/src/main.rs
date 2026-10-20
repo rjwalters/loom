@@ -1097,9 +1097,6 @@ enum Commands {
     /// Read the resolved effective config (#12591): `get <key>` prints the
     /// value and the tier it came from. Args live in `cli::config_get`.
     Config(cli::config_get::ConfigArgs),
-
-    /// The shared bounded journal core (#11345): `verify` a journal root.
-    Journal(cli::journal_cli::JournalArgs),
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -2352,7 +2349,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
         Commands::FleetDispatch(args) => args.run().await,
         Commands::Config(args) => cli::config_get::dispatch(args),
-        Commands::Journal(args) => cli::journal_cli::dispatch(args),
         Commands::Stats {
             command,
             role,

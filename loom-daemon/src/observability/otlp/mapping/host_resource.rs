@@ -42,7 +42,7 @@ use super::kv_string;
 /// before a roll and exported after it carries the new SHA, the same accepted
 /// behaviour as the `service.version` fallback. "Applied" also means "on
 /// disk", not "live in this process" — restart-only keys
-/// (`config_journal::restart_keys`) take effect on the next start.
+/// take effect on the next start.
 pub(in crate::observability::otlp) fn resource_for_host(
     host_id: &str,
     daemon_version: Option<&str>,

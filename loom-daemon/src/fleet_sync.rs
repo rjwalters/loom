@@ -327,14 +327,12 @@ pub fn config_pass(
         let drifted = drift != Drift::InSync;
         let mut wrote = false;
         let mut detail = describe_drift(&drift);
-        let keys = crate::config_journal::restart_keys(target, mode == Mode::Write && drifted);
         if mode == Mode::Write && drifted {
             let lost = render::lost_top_level_keys(target);
             if lost.is_empty() {
                 match render::write(target, &stamp) {
-                    Ok((w, backup)) => {
+                    Ok((w, _backup)) => {
                         wrote = w;
-                        crate::config_journal::record_rendered(w, target, backup, &commit, &keys);
                     }
                     Err(e) => {
                         error = Some(format!("writing {}: {e:#}", target.path.display()));
@@ -820,7 +818,6 @@ fn write_status(path: &Path, status: &FleetSyncStatus) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(status)?;
     body.push(b'\n');
     fetch::write_atomic(path, &body)?;
-    crate::config_journal::record_sync(status); // J3 shadow, after the legacy write
     Ok(())
 }
 
@@ -878,7 +875,6 @@ pub fn clear_status() {
                 "fleet_sync: no fleet store configured — removed the stale snapshot {}",
                 path.display()
             );
-            crate::config_journal::record_sync_cleared();
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::debug!("fleet_sync: could not remove {}: {e:#}", path.display()),
@@ -1041,8 +1037,6 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // #10885: a floor that differs from the previous pass's wakes the
     // self-update loop, so it acts now and not at its next interval.
     floor_knowledge::record_floor(&floor);
-    // J3 shadow (#11349): config as resolved after this pass (deduplicated).
-    crate::config_journal::record_resolved(&inputs.workspace);
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),

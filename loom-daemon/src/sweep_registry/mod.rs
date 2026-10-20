@@ -123,7 +123,6 @@ mod fast_fail_park;
 mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
-mod journal_shadow;
 mod landed_guard;
 mod lease_episode;
 pub mod lease_step;

@@ -159,7 +159,6 @@ pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;
 pub mod comment_trust;
-pub mod config_journal;
 pub mod config_resolver;
 pub mod cpu_headroom;
 pub mod credential_preflight;
@@ -270,7 +269,6 @@ pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
 // #11855: bound Judge re-runs on a PR whose passes end without a verdict.
-pub mod journal;
 pub mod judge_backstop;
 pub mod key_ref;
 pub mod kimi_usage;
