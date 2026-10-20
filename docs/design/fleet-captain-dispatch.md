@@ -41,7 +41,7 @@ Given 2026-10-16 and not reopened here.
 6. **Auth is the tailnet**, with `whois` caller identity and no per-host credentials.
 7. **Packaging.** A `loom-daemon` subcommand on the captain host, rolled by the version floor, configured from the fleet config.
 8. **Telemetry** over OTLP: assignments, refusals, fallbacks, queue age and refresh cost.
-9. **Keep it simple.** The only capacity cap is the host's own `maxConcurrent` (with its RAM, disk and load terms), enforced by the worker: it asks only for the slots it has free. The captain applies no capacity limit; it offers the next most important eligible work (operator, 2026-10-19, #12864). No knob the design does not need.
+9. **Keep it simple.** The only capacity cap is the host's own `maxConcurrent` (`free_slots` is `maxConcurrent` less what the host already runs), enforced by the worker: it asks only for the slots it has free. The captain applies no capacity limit; it offers the next most important eligible work (operator, 2026-10-19, #12864). No knob the design does not need.
 
 ## 2. Problem
 
@@ -133,8 +133,8 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 
 - A worker sends it **every 30 s**, riding the existing reaper heartbeat (the cadence `SweepRegistry::readvertise_peer_claims` runs on), so a host with a long tick still renews.
 - **`live`** is every step the host runs, including ones the captain never granted (fallback, attended). `assignment_id` is present only for granted ones. This is how the table is rebuilt after a restart.
-- **`free_slots`** is the worker's own count, bounded by its own `maxConcurrent`, RAM, disk and load terms. The worker enforces its capacity by asking only for those slots; a full worker does not ask. The server applies no capacity limit of its own (#12864): it once refused a host whose rows reached `min(free_slots + live, maxConcurrent)`, but its rows outlive the work they stand for (until a release or the row TTL), so that count ran above what hosts were running and stalled hosts with free slots.
-- **`roles_ok`** is host-local state the captain cannot know: a role whose token pool is exhausted, or behind the load brake or a disk back-off, is left out. Static fit comes from the fleet config (section 7).
+- **`free_slots`** is the worker's own count, `maxConcurrent - occupied` (`step_dispatch/driver.rs`), bounded only by its own `maxConcurrent`. The worker enforces its capacity by asking only for those slots; a full worker does not ask. The server applies no capacity limit of its own (#12864): it once refused a host whose rows reached `min(free_slots + live, maxConcurrent)`, but its rows outlive the work they stand for (until a release or the row TTL), so that count ran above what hosts were running and stalled hosts with free slots.
+- **`roles_ok`** is host-local state the captain cannot know: a role whose token pool is exhausted is left out. Phase 1 reports pool exhaustion only: a role behind the load brake or a disk back-off stays in, and local admission handles it after a grant. Static fit comes from the fleet config (section 7).
 
 ### 5.3 `claim`
 

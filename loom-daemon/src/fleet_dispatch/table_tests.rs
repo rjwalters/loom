@@ -293,7 +293,7 @@ fn a_claim_is_granted_regardless_of_the_captains_row_count() {
 }
 
 #[test]
-fn a_later_stage_goes_back_to_the_host_that_ran_the_earlier_one() {
+fn the_captain_grants_a_hosts_own_other_step_claim_and_refuses_other_hosts() {
     // Session affinity (#11913) is the worker's: the host that ran the
     // earlier stage asks for the next one. The captain grants it to that
     // host however many rows it already holds, and holds it against others.
