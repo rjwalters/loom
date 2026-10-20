@@ -162,6 +162,11 @@ pub const PROGRESS_OUTCOMES: [&str; 4] = ["verdict", "merged", "moved", "success
 /// ladder, and leaves the streak and the item's other holds alone.
 pub const CI_WAIT_OUTCOME: &str = "ci_wait";
 
+/// The `release` outcome of a step whose host was lost to an EC2 spot
+/// reclaim or rebalance (#12876). Not progress, but not the item's fault
+/// either: the row ends and nothing is held, so the next draw may take it.
+pub const HOST_LOST_OUTCOME: &str = "host_lost";
+
 /// Default [`Policy::ci_wait`]: long enough that the fleet does not redraw
 /// the item every ~90 s while CI runs, short enough that its next step is
 /// drawn within minutes of CI finishing.
@@ -326,6 +331,9 @@ pub enum ClaimDecision {
     Refused {
         reason: RefusalReason,
         held_by: Option<String>,
+        /// The holder's assignment id, on a `held` refusal from a live row
+        /// (#12740). Telemetry only: never on the wire.
+        holder_assignment_id: Option<String>,
         retry_after_s: u64,
     },
 }
@@ -786,7 +794,7 @@ impl Table {
             }
             if !own {
                 let retry = now.secs_until(row.deadline, 1).min(HELD_RETRY_MAX_SECS);
-                return refused(RefusalReason::Held, row.host.clone(), retry);
+                return held_by_row(row, retry);
             }
             replaces_own = true;
         }
@@ -808,7 +816,7 @@ impl Table {
                 .map(|(_, row)| row)
             {
                 let retry = now.secs_until(row.deadline, 1).min(HELD_RETRY_MAX_SECS);
-                return refused(RefusalReason::Held, row.host.clone(), retry);
+                return held_by_row(row, retry);
             }
         }
         if let Some(state) = self.hosts.get(host) {
@@ -919,6 +927,9 @@ impl Table {
         };
         self.note_ended(&key, &row, PrevEnd::Released, now);
         let (repo, item) = key;
+        if outcome.trim() == HOST_LOST_OUTCOME {
+            return true;
+        }
         if outcome.trim() == CI_WAIT_OUTCOME {
             let triple = (repo, item, row.step);
             let until = now.plus(self.policy.ci_wait);
@@ -991,6 +1002,18 @@ fn refused(reason: RefusalReason, held_by: Option<String>, retry_after_s: u64) -
     ClaimDecision::Refused {
         reason,
         held_by,
+        holder_assignment_id: None,
+        retry_after_s,
+    }
+}
+
+/// A `held` refusal naming the live row that holds the item (#12740).
+fn held_by_row(row: &Row, retry_after_s: u64) -> ClaimDecision {
+    ClaimDecision::Refused {
+        reason: RefusalReason::Held,
+        held_by: row.host.clone(),
+        // A claim-lost hold has no host, so no holder either.
+        holder_assignment_id: row.host.as_ref().map(|_| row.assignment_id.clone()),
         retry_after_s,
     }
 }

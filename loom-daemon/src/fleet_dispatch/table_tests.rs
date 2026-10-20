@@ -435,6 +435,7 @@ fn claims_are_refused_with_grace_until_the_window_ends() {
         ClaimDecision::Refused {
             reason: RefusalReason::Grace,
             held_by: None,
+            holder_assignment_id: None,
             retry_after_s: 90
         }
     );
@@ -669,6 +670,16 @@ fn a_progressing_release_holds_nothing_and_clears_every_hold_on_the_item() {
 }
 
 #[test]
+fn a_host_lost_release_ends_the_row_and_holds_nothing() {
+    let mut t = three_hosts(at(100));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "builder"));
+    assert!(t.release_outcome(at(150), A, &id, HOST_LOST_OUTCOME));
+    assert!(t.row("acme/w", 9).is_none(), "the row ends at once");
+    assert!(t.cooldown(at(150), "acme/w", 9, "builder").is_none(), "no hold armed");
+    granted_id(&t.claim(at(151), B, "acme/w", 9, "builder"));
+}
+
+#[test]
 fn a_release_the_table_does_not_know_arms_nothing() {
     let mut t = three_hosts(at(100));
     let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "builder"));
@@ -864,6 +875,35 @@ fn the_lineage_record_is_bounded() {
     );
     t.expire(at(100 + LINEAGE_MAX as u64 + 20 + LINEAGE_MAX_AGE.as_secs()));
     assert!(t.lineage.is_empty(), "records age out");
+}
+
+#[test]
+fn a_live_row_refusal_names_the_holders_assignment_and_a_cooldown_names_none() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 4));
+    t.heartbeat(at(100), B, &hb(B, vec![], 4));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 1, "builder"));
+    let holder = |d: ClaimDecision| match d {
+        ClaimDecision::Refused {
+            reason: RefusalReason::Held,
+            holder_assignment_id,
+            ..
+        } => holder_assignment_id,
+        other => panic!("expected a held refusal, got {other:?}"),
+    };
+    assert_eq!(holder(t.claim(at(101), B, "acme/w", 1, "builder")), Some(id));
+    // A refusal that is not a live-row hold carries none.
+    let d = t.claim(at(101), B, "acme/w", 2, "nonsense");
+    assert!(
+        matches!(
+            d,
+            ClaimDecision::Refused {
+                holder_assignment_id: None,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
 }
 
 /// #12873: the gauge snapshot. A fresh host reports its slots, live count

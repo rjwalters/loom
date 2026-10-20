@@ -125,6 +125,10 @@ pub enum SpanName {
     /// bytes reclaimed. Never a path or the gate's free-text wording.
     #[serde(rename = "reaper.pass")]
     ReaperPass,
+    /// One EC2 spot interruption or rebalance notice (#12876): an instant
+    /// span, its own root, naming the kind, the host and the sweeps it ended.
+    #[serde(rename = "loom.host.interruption_notice")]
+    HostInterruptionNotice,
 }
 
 impl SpanName {
@@ -159,6 +163,7 @@ impl SpanName {
             Self::MainRedAutofile => "main_red.autofile",
             Self::FleetDispatchCall => "loom.fleet_dispatch.call",
             Self::ReaperPass => "reaper.pass",
+            Self::HostInterruptionNotice => "loom.host.interruption_notice",
         }
     }
 }
@@ -267,6 +272,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                 || crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::observability::llm_billing::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::roll_interruption::KEYS.contains(&key.as_str())
+                || crate::host_loss::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_runtime::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_draw::KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))
