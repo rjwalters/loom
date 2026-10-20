@@ -13,6 +13,7 @@ mod dispatch_eligibility;
 mod executing_host;
 mod fact_id;
 mod fleet_state;
+mod hold_transition;
 mod host_export;
 mod host_health;
 mod host_resource;
@@ -33,6 +34,8 @@ mod roster_change;
 mod run_state_request;
 mod scope_memory;
 mod session_output;
+mod stage_entry;
+mod stage_occupancy;
 mod token_ranking;
 mod tokens_snapshot;
 mod work_started;
@@ -83,7 +86,16 @@ pub(super) fn kv_string(key: &str, value: impl Into<String>) -> KeyValue {
     kv(key, any_string(value))
 }
 
-fn kv_int(key: &str, value: i64) -> KeyValue {
+pub(super) fn kv_bool(key: &str, value: bool) -> KeyValue {
+    kv(
+        key,
+        AnyValue {
+            value: Some(any_value::Value::BoolValue(value)),
+        },
+    )
+}
+
+pub(super) fn kv_int(key: &str, value: i64) -> KeyValue {
     kv(
         key,
         AnyValue {
@@ -600,6 +612,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::PickDecision(_)
         | TelemetryRecord::OperatorPresence(_)
         | TelemetryRecord::DispatchEligibility(_)
+        | TelemetryRecord::StageOccupancy(_)
+        | TelemetryRecord::StageEntry(_)
         | TelemetryRecord::CheckoutFreshness(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
@@ -623,6 +637,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| pick_decision::log_parts(r))
                 .or_else(|| operator_presence::log_parts(r))
                 .or_else(|| dispatch_eligibility::log_parts(r))
+                .or_else(|| stage_occupancy::log_parts(r))
+                .or_else(|| stage_entry::log_parts(r))
                 .or_else(|| checkout_freshness::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
@@ -633,6 +649,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::WriteScopeRefused(_)
         | TelemetryRecord::MergeQueueEvent(_)
+        | TelemetryRecord::HoldTransition(_)
         | TelemetryRecord::MergeQueueObserved(_)
         | TelemetryRecord::MergeQueueRegime(_)
         | TelemetryRecord::DaemonExit(_)
@@ -657,6 +674,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| scope_memory::log_parts(r))
                 .or_else(|| write_scope_refused::log_parts(r))
                 .or_else(|| merge_queue_event::log_parts(r))
+                .or_else(|| hold_transition::log_parts(r))
                 .or_else(|| merge_queue_observed::log_parts(r))
                 .or_else(|| merge_queue_regime::log_parts(r))?;
             time_unix_nano = parts.source_at;
@@ -892,6 +910,24 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     value: number_data_point::Value::AsInt(1),
                     time_unix_nano,
                 });
+                // Issue #12905: the per-kind last acked export (#12120) as one
+                // gauge per kind, so a consumer can refuse an `as_of` past the
+                // coverage this host delivered. A kind with no export yet has
+                // no data point (absent, never zero). `kind` is already on the
+                // collector's datapoint allowlist.
+                for k in &otlp_export.kinds {
+                    if let Some(at) = k.last_export_at {
+                        samples.push(MetricSample {
+                            name: "loom.host.kind_last_export_seconds",
+                            description: "Unix seconds of this daemon's last acked OTLP export \
+                                          of a record kind (in memory: since process start).",
+                            unit: "s",
+                            attributes: vec![kv_string("kind", k.kind.as_str())],
+                            value: number_data_point::Value::AsInt(at.timestamp()),
+                            time_unix_nano,
+                        });
+                    }
+                }
             }
             // Cgroup-derived agent-scope census (#12166). Aggregate gauges only
             // (per-scope names would be unbounded label cardinality); the

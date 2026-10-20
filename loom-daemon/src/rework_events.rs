@@ -214,19 +214,6 @@ pub fn append(workspace_root: &Path, marker: &Marker<'_>) -> std::io::Result<Pat
     drop(file);
 
     prune_if_oversized(&file_path);
-    // #11348: the legacy marker is durable; shadow it into the J2 `rework`
-    // stream. Never fails this call.
-    crate::telemetry::journal_shadow::shadow_append(
-        workspace_root,
-        crate::telemetry::journal_shadow::TelemetryStream::Rework,
-        || {
-            Some(crate::telemetry::journal_shadow::ShadowRecord {
-                kind: format!("rework.{}", marker.kind),
-                key: None,
-                data: line,
-            })
-        },
-    );
     Ok(file_path)
 }
 

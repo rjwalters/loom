@@ -41,7 +41,7 @@ Given 2026-10-16 and not reopened here.
 6. **Auth is the tailnet**, with `whois` caller identity and no per-host credentials.
 7. **Packaging.** A `loom-daemon` subcommand on the captain host, rolled by the version floor, configured from the fleet config.
 8. **Telemetry** over OTLP: assignments, refusals, fallbacks, queue age and refresh cost.
-9. **Keep it simple.** The only capacity cap is the host's own `maxConcurrent` (with its RAM, disk and load terms), enforced by the worker: it asks only for the slots it has free. The captain applies no capacity limit; it offers the next most important eligible work (operator, 2026-10-19, #12864). No knob the design does not need.
+9. **Keep it simple.** The only capacity cap is the host's own `maxConcurrent` (`free_slots` is `maxConcurrent` less what the host already runs), enforced by the worker: it asks only for the slots it has free. The captain applies no capacity limit; it offers the next most important eligible work (operator, 2026-10-19, #12864). No knob the design does not need.
 
 ## 2. Problem
 
@@ -81,7 +81,7 @@ The design builds on these and must not duplicate them.
 | Session ledger | `step_dispatch/session_ledger.rs` (#11913) | Soft host affinity: a later step on an item may resume the session that ran there. |
 | Discovery | `discovery/` (#12306, #12311) | One `TickSnapshot` per tick. Mirror tier: one ETagged `GET /v1/mirror/worklist`; gateway and `gh` tiers capped at the backstop pace (`discovery/fallback.rs`). Never serves claim, lease, label or merge reads. |
 | Mirror change stream | `forge_mirror/wake.rs` (#10892) | Pulls `GET /v1/changes` with a persisted per-repo cursor; each change becomes a wake prompt. |
-| Gate-read invariant | `forge_events/poll_gate.rs`, invariants 1–3 | An event is a prompt, not a truth; polling is the floor; reads that gate a decision are never held. |
+| Gate-read invariant | ADR-0021 invariants 1–3 (the `poll_gate` module was removed, #12809) | An event is a prompt, not a truth; polling is the floor; reads that gate a decision are never held. |
 | Forge call purpose | `gh_invocation/purpose.rs` (#12310) | `loom.forge.purpose` = discovery \| gate \| write on every forge call. The measure for this design. |
 | Issue lease | `defaults/docs/lease-record.md`, `defaults/docs/lease-renewal.md` | `<!-- loom:lease host=… sweep=… -->`; liveness is the comment's forge `updated_at`; TTL 15 min (`claim_reconciliation::resolve_lease_ttl_minutes`), renewed about every 5 min. **Four writers**: daemon dispatch, in-session sweeps, `worktree.sh`, hand claims. |
 | Step (PR-phase) lease | `sweep_registry/step_spawn/lease.rs` (#11906, #9401) | `<!-- loom:pr-lease role=… host=… sweep=… step=… -->`: pre-claim, renew while the session lives, reap at step end. |
@@ -132,9 +132,9 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 → `{"server_epoch": "…", "grace": false}`
 
 - A worker sends it **every 30 s**, riding the existing reaper heartbeat (the cadence `SweepRegistry::readvertise_peer_claims` runs on), so a host with a long tick still renews.
-- **`live`** is every step the host runs, including ones the captain never granted (fallback, attended). `assignment_id` is present only for granted ones. This is how the table is rebuilt after a restart.
-- **`free_slots`** is the worker's own count, bounded by its own `maxConcurrent`, RAM, disk and load terms. The worker enforces its capacity by asking only for those slots; a full worker does not ask. The server applies no capacity limit of its own (#12864): it once refused a host whose rows reached `min(free_slots + live, maxConcurrent)`, but its rows outlive the work they stand for (until a release or the row TTL), so that count ran above what hosts were running and stalled hosts with free slots.
-- **`roles_ok`** is host-local state the captain cannot know: a role whose token pool is exhausted, or behind the load brake or a disk back-off, is left out. Static fit comes from the fleet config (section 7).
+- **`live`** is every step the host runs, including ones the captain never granted (fallback, attended). `assignment_id` is present only for granted ones. This is how the table is rebuilt after a restart. An optional `started_at` (RFC 3339 UTC, #12873) gives each step's start, for the captain's `oldest_live_age_sec` gauge; an older peer omits or ignores it.
+- **`free_slots`** is the worker's own count, `maxConcurrent - occupied` (`step_dispatch/driver.rs`), bounded only by its own `maxConcurrent`. The worker enforces its capacity by asking only for those slots; a full worker does not ask. The server applies no capacity limit of its own (#12864): it once refused a host whose rows reached `min(free_slots + live, maxConcurrent)`, but its rows outlive the work they stand for (until a release or the row TTL), so that count ran above what hosts were running and stalled hosts with free slots.
+- **`roles_ok`** is host-local state the captain cannot know: a role whose token pool is exhausted is left out. Phase 1 reports pool exhaustion only: a role behind the load brake or a disk back-off stays in, and local admission handles it after a grant. Static fit comes from the fleet config (section 7).
 
 ### 5.3 `claim`
 
@@ -317,7 +317,7 @@ All signals go out over OTLP with the daemon's existing exporter, with `loom.rep
 | Signal | Where | Meaning |
 |---|---|---|
 | `loom.fleet_dispatch.call` span, one per call | worker and captain | `host`, endpoint, latency, granted or refused, `reason`, `server_epoch` (Phase 2 adds `queue_age_s` and queue size) |
-| Refusal and hold attributes on the call span (#12707) | worker and captain | `step`, `retry_after_s`, `held_by` (when the captain names a holder), and for a no-progress hold `hold_until` (RFC 3339 UTC wall clock); the captain's span adds `hold_rung`, `hold_set_by_outcome`, `hold_set_by_assignment_id`. A refused `loom.dispatch.step` carries `loom.dispatch.held_by` / `retry_after_s` / `hold_until`. Stable names for ETA queries; key on `reason`, since a hold has no `held_by` |
+| Refusal and hold attributes on the call span (#12707) | worker and captain | `step`, `retry_after_s`, `held_by` (when the captain names a holder), and for a no-progress hold `hold_until` (RFC 3339 UTC wall clock); the captain's span adds `hold_rung`, `hold_set_by_outcome`, `hold_set_by_assignment_id`, and on a live-row `held` refusal `holder_assignment_id` (#12740). A refused `loom.dispatch.step` carries `loom.dispatch.held_by` / `retry_after_s` / `hold_until`. Stable names for ETA queries; key on `reason`, since a hold has no `held_by` |
 | `loom.assignment.id` attribute | the existing `loom.dispatch.step` span | joins assign → pre-check → claim → outcome |
 | `claim_lost` after a grant (**derived**, not a new signal) | captain | the existing refusals counter with `reason=claim_lost`, which only a `refuse` after a grant can carry; the split-brain and attended-claim measure |
 | `loom.fleet_dispatch.refusals` counter | captain | refusals by reason: `claim` refusals and `refuse` tokens |

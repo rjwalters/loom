@@ -16,7 +16,6 @@ mod cursor_durability;
 #[cfg(unix)]
 mod cycle_lock;
 mod dependency_wait;
-mod feed_capture;
 mod job_logs;
 mod join_keys;
 mod journal_rotation;

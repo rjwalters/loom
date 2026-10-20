@@ -206,7 +206,7 @@ fn freshness_needs_a_known_reconciled_recent_repo() {
     assert_eq!(upper.freshness(REPO, BOUND, now()), Freshness::Fresh);
 }
 
-/// poll_gate invariant 3 at the call sites: the mirror serves discovery only.
+/// The mirror serves discovery only.
 /// No claim, label-transition or merge module names it, so no such decision
 /// can read it.
 #[test]
@@ -254,17 +254,22 @@ fn only_the_discovery_and_wake_modules_name_the_mirror() {
         // The reconciliation readers resolve a workspace's repo slug to find
         // its part of the tick's snapshot (#12307); they make no read.
         "discovery/published.rs",
-        // The task spawn, the wake seam's source check, and the telemetry drain.
+        // The task spawn and the telemetry drain.
         "daemon_service/observer_tasks.rs",
-        "forge_events/wake.rs",
         "observability/ops/ratelimit.rs",
+        // The captain's fleet queue drives the mirror's change stream to
+        // refresh its entries; it makes no claim, label-transition or merge
+        // read (invariant 3).
+        "fleet_dispatch/queue.rs",
+        "fleet_dispatch/queue_tests.rs",
+        "fleet_dispatch/server.rs",
     ]
     .iter()
     .map(|s| (*s).to_string())
     .collect();
     assert_eq!(
         users, expected,
-        "a new forge_mirror user needs review against poll_gate invariant 3"
+        "a new forge_mirror user needs review against the discovery-only rule"
     );
 }
 
@@ -370,11 +375,7 @@ fn rc(next_after: u64, latest: u64, truncated: bool) -> Value {
 }
 
 #[test]
-fn change_kinds_map_onto_the_consumers_webhook_types() {
-    use crate::forge_events::wake::{
-        payload_qualifies, CLAIM_RECONCILE_EVENT_TYPES, IN_FLIGHT_PR_EVENT_TYPES,
-        WORK_FINDER_EVENT_TYPES,
-    };
+fn change_kinds_map_onto_webhook_types() {
     assert_eq!(wake::webhook_type("issue", None), Some("issues"));
     assert_eq!(wake::webhook_type("label", Some("issue")), Some("issues"));
     assert_eq!(wake::webhook_type("label", Some("pr")), Some("pull_request"));
@@ -392,14 +393,8 @@ fn change_kinds_map_onto_the_consumers_webhook_types() {
         false,
     );
     wake::apply(&mut cursors, &[REPO.to_string()], &p, now(), &mut nudge);
-    let payload = nudge.payload();
-    assert!(payload_qualifies(&payload, WORK_FINDER_EVENT_TYPES));
-    assert!(!payload_qualifies(&payload, IN_FLIGHT_PR_EVENT_TYPES));
-    assert!(!payload_qualifies(&payload, CLAIM_RECONCILE_EVENT_TYPES));
-    // Routing hints only: no number, label, title or state.
-    let text = payload.to_string();
-    assert!(!text.contains("12") && !text.contains("loom:"), "{text}");
-    assert_eq!(payload["repos"], json!([REPO]));
+    assert_eq!(nudge.types.iter().copied().collect::<Vec<_>>(), vec!["issues"]);
+    assert_eq!(nudge.repos.iter().cloned().collect::<Vec<_>>(), vec![REPO.to_string()]);
     assert_eq!(nudge.latencies, vec![(REPO.to_string(), "label".to_string(), 2.0)]);
     assert_eq!(cursors.repos[REPO], 4);
 }
@@ -492,7 +487,7 @@ fn cursors_persist_per_origin() {
 }
 
 #[tokio::test]
-async fn a_pass_baselines_new_repos_then_reads_and_publishes_changes() {
+async fn a_pass_baselines_new_repos_then_reads_changes() {
     let baseline =
         json!({"changes": [], "cursor": "", "more": false, "repos": { REPO: rc(0, 10, false) }})
             .to_string();
@@ -512,18 +507,11 @@ async fn a_pass_baselines_new_repos_then_reads_and_publishes_changes() {
     assert!(!first.prompts(), "a baseline never prompts");
     assert_eq!(cursors.repos[REPO], 10);
 
-    let bus = crate::event_bus::EventBus::new();
-    let mut sub = bus.subscribe([crate::forge_events::BUS_TOPIC]);
     let (second, r) = wake::pass(&http, &a, &repos, &mut cursors).await;
     r.unwrap();
     assert_eq!(cursors.repos[REPO], 11);
     assert!(second.prompts());
-    wake::publish(&bus, &second);
-    let event = sub.recv().await.unwrap();
-    assert!(crate::forge_events::wake::event_qualifies(
-        &event,
-        crate::forge_events::wake::IN_FLIGHT_PR_EVENT_TYPES
-    ));
+    assert!(second.types.contains("pull_request"));
 
     let seen = seen.lock().unwrap().clone();
     assert!(seen[0].0.contains("after=0") && seen[0].0.contains("limit=1"), "{}", seen[0].0);
@@ -649,11 +637,7 @@ fn a_key_that_cannot_be_read_backs_off_exponentially_to_fifteen_minutes() {
 }
 
 #[test]
-fn a_missed_changes_prompt_wakes_every_consumer() {
-    use crate::forge_events::wake::{
-        payload_qualifies, CLAIM_RECONCILE_EVENT_TYPES, IN_FLIGHT_PR_EVENT_TYPES,
-        WORK_FINDER_EVENT_TYPES,
-    };
+fn a_missed_changes_pass_carries_every_change_type() {
     let mut cursors = Cursors::new("https://m");
     cursors.repos.insert(REPO.into(), 50);
     let mut nudge = Nudge::default();
@@ -665,13 +649,8 @@ fn a_missed_changes_prompt_wakes_every_consumer() {
         &mut nudge,
     );
     assert!(nudge.missed && nudge.count == 0);
-    let payload = nudge.payload();
-    for wanted in [
-        WORK_FINDER_EVENT_TYPES,
-        CLAIM_RECONCILE_EVENT_TYPES,
-        IN_FLIGHT_PR_EVENT_TYPES,
-    ] {
-        assert!(payload_qualifies(&payload, wanted), "{wanted:?}: {payload}");
+    for wanted in wake::MISSED_TYPES {
+        assert!(nudge.types.contains(wanted), "{wanted}: {:?}", nudge.types);
     }
 }
 
@@ -699,7 +678,7 @@ async fn a_pass_that_fails_part_way_still_returns_what_it_read() {
     let (nudge, result) = wake::pass(&http, &a, &[REPO.to_string()], &mut cursors).await;
     assert_eq!(result, Err(MirrorError::Status(500)));
     assert_eq!(cursors.repos[REPO], 11, "the cursor moved past the change read");
-    assert!(nudge.prompts(), "so that change must still be published");
+    assert!(nudge.prompts(), "so that change must still be recorded");
 }
 
 #[test]

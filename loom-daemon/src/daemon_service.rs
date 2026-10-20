@@ -406,8 +406,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         ),
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
-    // #11346: J1 concern verification (logged, off-thread; no-op when disabled).
-    loom_daemon::journal::execution::log_startup_verification();
 
     // #6171: record the daemon's own primary workspace root once, before any
     // forge call that could trigger a forced per-owner credential refresh
@@ -955,10 +953,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // invariant (#6615) intact despite the passes no longer blocking startup.
     let startup_reconciliation_ready =
         daemon_startup_reconciliation::spawn_startup_passes(sweep_workspace.clone());
-    let _claim_reconciliation_handle = claim_reconciliation::spawn_periodic_reconciliation_task(
-        sweep_workspace.clone(),
-        event_bus.clone(),
-    );
+    let _claim_reconciliation_handle =
+        claim_reconciliation::spawn_periodic_reconciliation_task(sweep_workspace.clone());
 
     // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
     // watchdog knobs from `.loom/config.json → autonomous` with env override
@@ -1114,6 +1110,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
         loom_daemon::observability::daemon_exit::register_in_flight_lister(move || {
             loom_daemon::ipc::in_flight_sweep_ids(&pool, &root)
         });
+    }
+
+    // #12876: on an EC2 host, watch for spot interruption / rebalance notices.
+    // Never started (no IMDS traffic) elsewhere.
+    {
+        let pool = workspace_pool.clone();
+        let root = sweep_workspace.clone();
+        if loom_daemon::host_loss::spawn(move || loom_daemon::ipc::in_flight_sweeps(&pool, &root)) {
+            log::info!("host_loss: EC2 host; watching for spot interruption notices (#12876)");
+        }
     }
 
     // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
@@ -1354,8 +1360,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
-        // #9255: opt-in event-gated polling; read once at startup (restart to change).
-        loom_daemon::forge_events::poll_gate::configure_for(&sweep_workspace, interval);
         // #6203: also resolve *which layer* supplied `configured_max` (env /
         // config / default) so the startup log below can tell an operator
         // whether their `.loom/config.json` edit was actually picked up. This
@@ -1419,6 +1423,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
     loom_daemon::observability::retired_captain_config::warn_retired_config(&sweep_workspace);
     // #12812: the dashboard /ingest target is retired; legacy keys warn once.
     loom_daemon::observability::retired_captain_config::warn_retired_ingest_config(
+        &sweep_workspace,
+    );
+
+    // #12809: the dashboard event-feed client and its consumers are gone;
+    // leftover `forgeEvents` / `LOOM_FORGE_EVENTS_*` settings warn once.
+    loom_daemon::observability::retired_captain_config::warn_retired_forge_events_config(
         &sweep_workspace,
     );
 
@@ -1526,14 +1536,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // Fleet-captain singleton tasks that own their loop (`fleet_singletons`):
     // the GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
     // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
-    // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
-    // is on; and the intake reconcile singleton (W7), a config read per tick
+    // off; and the intake reconcile singleton (W7), a config read per tick
     // unless `fleet.intakeReconcile.singleton` makes this host the producer.
     // (The `loom:blocked` release task that used to start here was retired,
     // #11301.) The role-runner decision is resolved here, once, and reused below.
     let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
     let role_runner_on = role_runner::resolve_enabled(&role_runner_config);
-    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus);
+    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone());
 
     // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
     let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);
@@ -1874,8 +1883,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             watch_registry::GhWatchProbe::new(),
             interval,
             expiry,
-            event_bus.clone(),
-            sweep_workspace.clone(),
         ))
     } else {
         log::debug!(

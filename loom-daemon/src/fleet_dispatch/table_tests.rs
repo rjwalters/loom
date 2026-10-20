@@ -39,6 +39,7 @@ fn live(repo: &str, item: u64, step: &str, id: Option<&str>) -> LiveStep {
         item,
         step: step.into(),
         assignment_id: id.map(str::to_string),
+        started_at: None,
     }
 }
 
@@ -67,6 +68,7 @@ fn a_free_item_is_granted_with_the_assignment_ttl() {
         assignment_id,
         ttl_s,
         renewed,
+        lineage,
     } = d
     else {
         panic!("{d:?}")
@@ -74,6 +76,7 @@ fn a_free_item_is_granted_with_the_assignment_ttl() {
     assert!(assignment_id.starts_with("a-epoch-00-"));
     assert_eq!(ttl_s, 20 * 60, "forge lease 15 min + 5 min margin");
     assert!(!renewed);
+    assert_eq!(lineage, None, "a first grant carries no lineage");
     let row = t.row("acme/w", 7).unwrap();
     assert_eq!(row.state, RowState::Granted);
     assert_eq!(row.host.as_deref(), Some(A));
@@ -293,7 +296,7 @@ fn a_claim_is_granted_regardless_of_the_captains_row_count() {
 }
 
 #[test]
-fn a_later_stage_goes_back_to_the_host_that_ran_the_earlier_one() {
+fn the_captain_grants_a_hosts_own_other_step_claim_and_refuses_other_hosts() {
     // Session affinity (#11913) is the worker's: the host that ran the
     // earlier stage asks for the next one. The captain grants it to that
     // host however many rows it already holds, and holds it against others.
@@ -432,6 +435,7 @@ fn claims_are_refused_with_grace_until_the_window_ends() {
         ClaimDecision::Refused {
             reason: RefusalReason::Grace,
             held_by: None,
+            holder_assignment_id: None,
             retry_after_s: 90
         }
     );
@@ -666,6 +670,25 @@ fn a_progressing_release_holds_nothing_and_clears_every_hold_on_the_item() {
 }
 
 #[test]
+fn a_host_lost_release_ends_the_row_and_holds_nothing() {
+    let mut t = three_hosts(at(100));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "builder"));
+    assert!(t.release_outcome(at(150), A, &id, HOST_LOST_OUTCOME));
+    assert!(t.row("acme/w", 9).is_none(), "the row ends at once");
+    assert!(t.cooldown(at(150), "acme/w", 9, "builder").is_none(), "no hold armed");
+    let next = t.claim(at(151), B, "acme/w", 9, "builder");
+    assert_eq!(
+        lineage_of(&next),
+        Some(Lineage {
+            attempt: 1,
+            prev_assignment_id: id,
+            prev_end: PrevEnd::HostLost,
+        }),
+        "#12875: the next grant names the lost assignment"
+    );
+}
+
+#[test]
 fn a_release_the_table_does_not_know_arms_nothing() {
     let mut t = three_hosts(at(100));
     let id = granted_id(&t.claim(at(100), A, "acme/w", 9, "builder"));
@@ -757,4 +780,186 @@ fn only_a_hold_refusal_is_traced_as_cooled() {
     assert_eq!(hold.streak, 1);
     assert_eq!(hold.set_by_outcome, "noop");
     assert_eq!(hold.set_by_assignment_id, id);
+}
+
+fn lineage_of(d: &ClaimDecision) -> Option<Lineage> {
+    match d {
+        ClaimDecision::Granted { lineage, .. } => lineage.clone(),
+        other => panic!("expected a grant, got {other:?}"),
+    }
+}
+
+/// #12875: an expired assignment is reported with its identity, a held row
+/// is not, and the next grant names the expired one.
+#[test]
+fn an_expired_assignment_is_reported_and_the_next_grant_names_it() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 4));
+    t.heartbeat(at(100), B, &hb(B, vec![], 4));
+    let first = t.claim(at(100), A, "acme/w", 7, "builder");
+    assert_eq!(lineage_of(&first), None, "a first grant carries no lineage");
+    let id = granted_id(&first);
+    // A held row (an item someone outside fleet mode owns) is not an assignment.
+    let lost = granted_id(&t.claim(at(100), A, "acme/w", 8, "builder"));
+    t.refuse(at(100), A, &lost, REFUSE_CLAIM_LOST);
+    let ttl = Policy::default().assignment_ttl.as_secs();
+    t.expire(at(100 + ttl));
+    let rows = t.take_expired();
+    assert_eq!(
+        rows,
+        vec![ExpiredAssignment {
+            host: Some(A.into()),
+            repo: "acme/w".into(),
+            item: 7,
+            step: "builder".into(),
+            assignment_id: id.clone(),
+        }]
+    );
+    assert!(t.take_expired().is_empty(), "drained once");
+    let again = t.claim(at(100 + ttl), B, "acme/w", 7, "builder");
+    assert_eq!(
+        lineage_of(&again),
+        Some(Lineage {
+            attempt: 1,
+            prev_assignment_id: id,
+            prev_end: PrevEnd::Expired,
+        })
+    );
+}
+
+/// #12875: an expiry found inside a claim is still reported.
+#[test]
+fn an_expiry_inside_a_claim_is_not_lost() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 4));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 7, "builder"));
+    let ttl = Policy::default().assignment_ttl.as_secs();
+    let d = t.claim(at(100 + ttl), A, "acme/w", 7, "builder");
+    assert_eq!(lineage_of(&d).map(|l| l.prev_assignment_id), Some(id.clone()));
+    assert_eq!(t.take_expired().len(), 1);
+}
+
+/// #12875: a release is `released`, the attempt counts every earlier end,
+/// and a renewal is not a new attempt.
+#[test]
+fn a_release_is_recorded_and_a_renewal_is_not_an_attempt() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 4));
+    let one = granted_id(&t.claim(at(100), A, "acme/w", 7, "builder"));
+    let renewed = t.claim(at(110), A, "acme/w", 7, "builder");
+    assert!(matches!(renewed, ClaimDecision::Granted { renewed: true, .. }));
+    assert_eq!(lineage_of(&renewed), None);
+    assert!(t.release_outcome(at(120), A, &one, "verdict"));
+    let two_d = t.claim(at(130), A, "acme/w", 7, "builder");
+    let two = granted_id(&two_d);
+    assert_eq!(
+        lineage_of(&two_d),
+        Some(Lineage {
+            attempt: 1,
+            prev_assignment_id: one,
+            prev_end: PrevEnd::Released,
+        })
+    );
+    assert!(t.release_outcome(at(140), A, &two, "verdict"));
+    let three = t.claim(at(150), A, "acme/w", 7, "builder");
+    assert_eq!(lineage_of(&three).map(|l| l.attempt), Some(2));
+    // Another step on the same item is its own triple.
+    assert_eq!(lineage_of(&t.claim(at(150), B, "acme/w", 9, "judge")), None);
+}
+
+/// #12875: the record is bounded by size and by age.
+#[test]
+fn the_lineage_record_is_bounded() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 4));
+    for item in 0..(LINEAGE_MAX as u64 + 10) {
+        let id = granted_id(&t.claim(at(100), A, "acme/w", item, "builder"));
+        assert!(t.release_outcome(at(101 + item), A, &id, "verdict"));
+    }
+    assert_eq!(t.lineage.len(), LINEAGE_MAX);
+    assert!(
+        !t.lineage
+            .contains_key(&("acme/w".to_string(), 0, "builder".to_string())),
+        "the oldest end is evicted first"
+    );
+    t.expire(at(100 + LINEAGE_MAX as u64 + 20 + LINEAGE_MAX_AGE.as_secs()));
+    assert!(t.lineage.is_empty(), "records age out");
+}
+
+#[test]
+fn a_live_row_refusal_names_the_holders_assignment_and_a_cooldown_names_none() {
+    let mut t = open_table();
+    t.heartbeat(at(100), A, &hb(A, vec![], 4));
+    t.heartbeat(at(100), B, &hb(B, vec![], 4));
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 1, "builder"));
+    let holder = |d: ClaimDecision| match d {
+        ClaimDecision::Refused {
+            reason: RefusalReason::Held,
+            holder_assignment_id,
+            ..
+        } => holder_assignment_id,
+        other => panic!("expected a held refusal, got {other:?}"),
+    };
+    assert_eq!(holder(t.claim(at(101), B, "acme/w", 1, "builder")), Some(id));
+    // A refusal that is not a live-row hold carries none.
+    let d = t.claim(at(101), B, "acme/w", 2, "nonsense");
+    assert!(
+        matches!(
+            d,
+            ClaimDecision::Refused {
+                holder_assignment_id: None,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
+}
+
+/// #12873: the gauge snapshot. A fresh host reports its slots, live count
+/// and oldest start; a host whose heartbeat went stale keeps only its row
+/// counts; a host never heard from has nothing; a held row is fleet-wide.
+#[test]
+fn the_gauge_snapshot_separates_rows_from_what_hosts_report() {
+    let mut t = open_table();
+    let start = |s: &str| Some(s.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+    let mut early = live("acme/w", 1, "judge", None);
+    early.started_at = start("2026-10-20T10:00:00Z");
+    let mut late = live("acme/w", 2, "builder", None);
+    late.started_at = start("2026-10-20T11:00:00Z");
+    t.heartbeat(at(100), A, &hb(A, vec![early, late], 3));
+    granted_id(&t.claim(at(100), A, "acme/w", 3, "doctor"));
+    // B heartbeats an old-worker step (no start), then goes silent.
+    t.heartbeat(at(100), B, &hb(B, vec![live("acme/w", 4, "judge", None)], 2));
+    // A held row: a granted item lost the forge order.
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 5, "judge"));
+    t.refuse(at(100), A, &id, crate::fleet_dispatch::proto::REFUSE_CLAIM_LOST);
+
+    let g = t.host_gauges(at(150), HEARTBEAT_FRESH);
+    assert_eq!(g.held, 1);
+    let a = &g.hosts[A];
+    assert_eq!((a.granted, a.live), (1, 2));
+    let reported = a.reported.as_ref().unwrap();
+    assert_eq!((reported.free_slots, reported.live_reported), (3, 2));
+    assert_eq!(reported.oldest_live_started_at, start("2026-10-20T10:00:00Z"));
+    let b = &g.hosts[B];
+    assert_eq!((b.granted, b.live), (0, 1));
+    assert_eq!(b.reported.as_ref().unwrap().oldest_live_started_at, None, "no start sent");
+
+    // A heartbeats again; B's last heartbeat is now stale.
+    t.heartbeat(at(250), A, &hb(A, vec![], 4));
+    let g = t.host_gauges(at(250), HEARTBEAT_FRESH);
+    let b = &g.hosts[B];
+    assert_eq!((b.granted, b.live), (0, 1), "a silent host keeps its stale rows");
+    assert_eq!(b.reported, None, "a stale host reports nothing, never 0");
+    let a = g.hosts[A].reported.as_ref().unwrap();
+    assert_eq!((a.free_slots, a.live_reported), (4, 0));
+    assert_eq!(a.oldest_live_started_at, None, "nothing live, no start");
+    assert!(!g.hosts.contains_key("worker-never"), "an unknown host has no entry");
+
+    // Once B's rows expire, B drops out entirely.
+    let g = t.host_gauges(at(2000), HEARTBEAT_FRESH);
+    t.expire(at(2000));
+    let g_after = t.host_gauges(at(2000), HEARTBEAT_FRESH);
+    assert!(g.hosts.contains_key(B));
+    assert!(!g_after.hosts.contains_key(B));
 }
