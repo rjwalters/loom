@@ -132,7 +132,7 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 → `{"server_epoch": "…", "grace": false}`
 
 - A worker sends it **every 30 s**, riding the existing reaper heartbeat (the cadence `SweepRegistry::readvertise_peer_claims` runs on), so a host with a long tick still renews.
-- **`live`** is every step the host runs, including ones the captain never granted (fallback, attended). `assignment_id` is present only for granted ones. This is how the table is rebuilt after a restart.
+- **`live`** is every step the host runs, including ones the captain never granted (fallback, attended). `assignment_id` is present only for granted ones. This is how the table is rebuilt after a restart. An optional `started_at` (RFC 3339 UTC, #12873) gives each step's start, for the captain's `oldest_live_age_sec` gauge; an older peer omits or ignores it.
 - **`free_slots`** is the worker's own count, bounded by its own `maxConcurrent`, RAM, disk and load terms. The worker enforces its capacity by asking only for those slots; a full worker does not ask. The server applies no capacity limit of its own (#12864): it once refused a host whose rows reached `min(free_slots + live, maxConcurrent)`, but its rows outlive the work they stand for (until a release or the row TTL), so that count ran above what hosts were running and stalled hosts with free slots.
 - **`roles_ok`** is host-local state the captain cannot know: a role whose token pool is exhausted, or behind the load brake or a disk back-off, is left out. Static fit comes from the fleet config (section 7).
 
