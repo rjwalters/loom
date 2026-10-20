@@ -636,6 +636,15 @@ tick and get 24h; activity-driven or failure-only kinds are `None` (never flagge
 kind with no row defaults to 24h. A host with no `otlp` exporter reports
 `no_exporter` with no `kinds`, and no error.
 
+Over OTLP (Issue #12905) each kind's `last_export_at` rides the `host.health` gauge
+`loom.host.kind_last_export_seconds{kind}` (unix seconds), so a consumer can refuse an
+`as_of` past a host's coverage. A kind with no export yet has no data point (absent,
+never zero), and a host with no `otlp_export` emits none. Caveats: the value is in
+memory, so after a restart it means "since process start"; and it is a delivery-coverage
+bound ("this host delivered kind K through T"), not proof the producer ran, because
+activity-driven kinds have no silence threshold. `host.health` and `host.export` give the
+host-level bound. `kind` is already on the collector's datapoint allowlist.
+
 ```json
 { "observability": {
     "otlp_required": false,

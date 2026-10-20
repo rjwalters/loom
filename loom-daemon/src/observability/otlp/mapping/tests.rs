@@ -616,6 +616,68 @@ fn role_tick_health_with_no_ticks_sampled_reports_zero_not_no_metric() {
 }
 
 #[test]
+fn otlp_export_kinds_ride_a_per_kind_last_export_gauge() {
+    use crate::observability::otlp_health::{KindExport, OtlpExportHealth, OtlpExportState};
+    let points_for = |health: Option<OtlpExportHealth>| -> Vec<(String, i64)> {
+        let mut record = host_health_envelope();
+        if let TelemetryRecord::HostHealth(r) = &mut record.record {
+            r.otlp_export = health;
+        }
+        let request = build_metrics_request(&[record]).unwrap();
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+        let Some(m) = metrics
+            .iter()
+            .find(|m| m.name == "loom.host.kind_last_export_seconds")
+        else {
+            return Vec::new();
+        };
+        let Some(metric::Data::Gauge(g)) = &m.data else {
+            panic!("gauge expected")
+        };
+        g.data_points
+            .iter()
+            .map(|p| {
+                let kind = p
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key == "kind")
+                    .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
+                        any_value::Value::StringValue(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .expect("kind label");
+                let Some(number_data_point::Value::AsInt(v)) = p.value else {
+                    panic!("int expected")
+                };
+                (kind, v)
+            })
+            .collect()
+    };
+    // Absent `otlp_export` emits no gauge.
+    assert!(points_for(None).is_empty());
+    let at = chrono::DateTime::from_timestamp(1_792_000_000, 0).unwrap();
+    let health = OtlpExportHealth {
+        state: OtlpExportState::Ok,
+        detail: None,
+        since: None,
+        kinds: vec![
+            KindExport {
+                kind: "host.health".into(),
+                last_export_at: Some(at),
+                silent: false,
+            },
+            // No export yet: no data point, never a zero.
+            KindExport {
+                kind: "sweep.started".into(),
+                last_export_at: None,
+                silent: false,
+            },
+        ],
+    };
+    assert_eq!(points_for(Some(health)), vec![("host.health".to_string(), 1_792_000_000)]);
+}
+
+#[test]
 fn otlp_export_state_rides_a_state_labelled_gauge() {
     use crate::observability::otlp_health::{OtlpExportHealth, OtlpExportState};
     let gauge_for = |health: Option<OtlpExportHealth>| {
