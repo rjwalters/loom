@@ -14,6 +14,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-10-20
+
+- **Issue #12769** (closed): Stacking follow-ups: retarget-failure flag text, pr.edit-base inventory op, consolidation delete guard, stack-parent fork freshness
+- **PR #12836**: fix(stacking): retry failed orphan retarget alone, inventory pr.edit-base, fetch before fork
+- **Issue #12840** (closed): loom-tools Phase 1: inventory and command contract (CLI boundary and migration map) — epic #12708
+- **PR #12844**: docs: add Loom tools CLI boundary and migration map
+- **Issue #12753** (closed): Add the remaining AC4 command-capture tests for drawn-model launch (non-Builder, unavailable candidate, private handoff)
+- **PR #12834**: test: cover non-Builder drawn-model launch, walked draw candidates and private handoff
+
 ### 2026-10-19
 
 - **PR #12803**: chore(deps): Bump the cargo-minor-patch group across 1 directory with 3 updates
@@ -23,6 +32,34 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #12796** (closed): work-docs archive adds a duplicate archive link when rotating into an existing month file
 - **PR #12791**: feat(telemetry): emit eta.dispatch_eligibility fact for ready_wait prediction
 - **Issue #12790** (closed): emit dispatch eligibility + blocking-reason facts (ready_wait's #1 missing signal; forward-only so urgent)
+- **Issue #9908** (closed): Consolidate persistence: one journal per concern, retire duplicated stores
+- **Issue #10916** (closed): Fleet singleton output watchdog: alert when any one-host fleet job stops producing output (not just when its host goes silent)
+- **Issue #12829** (closed): ci-daily.yml: stop POSTing alerts to the loom-ui dashboard (CI pushes nothing to our services)
+- **PR #12843**: ci-daily: stop recording results on loom-ui
+- **Issue #12825** (closed): Fleet Builder claimed an issue under a fresh in-session /loom:sweep lease (step 1b lease not honoured at dispatch)
+- **PR #12835**: fix(dispatch): admit never-renewed lease within first renewal interval to claim episode
+- **Issue #12781** (closed): Consolidate three duplicated Scratch temp-dir helpers in session_output tests
+- **PR #12833**: refactor(session_output): share one tempfile-backed Scratch across test modules
+- **Issue #12811** (closed): OTLP carriers for queue and host.health fields before retiring /ingest
+- **PR #12826**: feat(otlp): carry host.health's /ingest-only fields as gauges (#12811)
+- **Issue #12806** (closed): Daemon alerts to SigNoz: emit alert.transition OTLP logs instead of POSTing the loom-ui dashboard
+- **PR #12828**: Alerts as alert.transition OTLP logs; remove the loom-ui alert POST (#12806)
+- **Issue #12827** (closed): OTLP carriers for the queue.snapshot fields loom-ui's Backlog reads, before #12813 retires queue.snapshot
+- **PR #12830**: feat(telemetry): OTLP carriers for the queue.snapshot plan fields (#12827)
+- **Issue #12815** (closed): Captain-hostable change-stream pull and fleet-wide worklist read (library extraction from forge_mirror/wake.rs)
+- **PR #12820**: feat(forge-mirror): let a caller hold its own mirror for the change pull and worklist read
+- **Issue #12812** (closed): Daemon: treat /ingest 410 as retired and ignore legacy dashboard config keys
+- **PR #12819**: feat(observability): treat /ingest HTTP 410 as retired, warn on legacy ingest keys
+- **Issue #12823** (closed): merge-pr.sh closes issue N for a feature/issue-N PR that declares "Part of #N" (#12615 ignores partial increments)
+- **Issue #11269** (closed): audit-agents phase 2: resolve actual execution placement
+- **Issue #11271** (closed): audit-agents phase 4: Claude, Codex, Pi, and legacy OpenCode adapters
+- **Issue #11270** (closed): audit-agents phase 3: policy-at-action and scoped exception evidence
+- **Issue #9862** (closed): Move fleet forge credentials off human identities: host daemons onto the App installation, Worker onto the App pair, audit the credential mix per host
+- **Issue #9279** (closed): observability: execute the SigNoz backup-restore rehearsal against real backup tarballs
+- **Issue #8946** (closed): observability: create the six CI saved views and apply the logs/traces 7d retention API setting in the SigNoz trial org (live-UI remainder of #8826)
+- **Issue #8723** (closed): observability: roll out the collector session-store mounts on a live trial host (#8686 AC4/AC5)
+- **Issue #11268** (closed): audit-agents phase 1: versioned OpenCode session and action evidence
+- **Issue #9049** (closed): Security: no secrets under any repo/worktree — move all credential state to ~/.loom (21 Claude OAuth tokens leaked, 2nd incident)
 
 ### 2026-10-18
 
