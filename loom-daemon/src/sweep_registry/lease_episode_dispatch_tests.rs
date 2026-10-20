@@ -140,6 +140,32 @@ fn dispatch_yields_to_a_renewed_in_session_lease_created_before_the_lookback() {
     );
 }
 
+/// Issue #12825 (2am#5325): a live in-session lease ~200s old and not yet
+/// renewed (the renewer sleeps first, 300s) must still make dispatch yield.
+#[test]
+#[serial]
+fn dispatch_yields_to_a_never_renewed_in_session_lease_in_its_first_interval() {
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log, spawn_log, store) = lease_order_dispatch_registry(dir.path(), &[]);
+    seed_renewed_lease(
+        &store,
+        "<!-- loom:lease host=in-session-host sweep=sweep-issue-12825-live -->",
+        200,
+        200,
+    );
+
+    let err = registry
+        .dispatch(&SweepKind::Issue(12825), None, None, None, None)
+        .expect_err("a live never-renewed lease in its first interval must refuse dispatch");
+    let lease_err = err
+        .downcast_ref::<LeaseOrderDispatchError>()
+        .unwrap_or_else(|| panic!("expected a LeaseOrderDispatchError, got: {err:#}"));
+    assert_eq!(lease_err.earliest_host, "in-session-host");
+    assert!(!spawn_log.exists(), "the yield must land before any builder spawn");
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(gh_calls.contains("loom:lease-yield"), "gh log: {gh_calls}");
+}
+
 /// The anti-wedge complement, and the property
 /// [`LEASE_ORDER_LOOKBACK_SECS`] was introduced for: an OLD lease record
 /// that was never renewed (a real forge sets `updated_at == created_at` at

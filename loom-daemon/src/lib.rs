@@ -256,6 +256,7 @@ pub mod host_affinity;
 pub mod host_identity;
 pub mod host_optout;
 pub mod host_pressure;
+pub mod host_shape;
 pub mod host_status;
 pub mod hyperparams;
 pub mod idle_exit;

@@ -10,6 +10,7 @@ use super::*;
 
 mod fact_id;
 mod fleet_provenance;
+mod host_health;
 mod host_name;
 mod host_status;
 mod loom_kind;
