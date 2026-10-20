@@ -54,14 +54,6 @@ pub enum ShareMode {
     MergeToml,
 }
 
-impl ShareMode {
-    /// `true` for the modes that rewrite a settings document key by key.
-    #[must_use]
-    pub fn is_merge(self) -> bool {
-        matches!(self, ShareMode::MergeJson | ShareMode::MergeToml)
-    }
-}
-
 /// One entry of a provider's sharing table: a profile-relative path and the
 /// mechanism that populates it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

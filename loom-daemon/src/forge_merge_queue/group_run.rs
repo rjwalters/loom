@@ -26,6 +26,7 @@ use super::group_authz::{
 use super::group_github::GroupForge;
 use crate::gh_invocation::AccessIntent;
 use crate::telemetry::kinds::merge_authorization::MergeAuthorizationRecord;
+use crate::telemetry::kinds::merge_queue_regime::{MergeQueueRegimeRecord, QueueRegime};
 
 /// What happened to one `group-check` run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +333,51 @@ impl ContextStates for GhContextStates<'_> {
     }
 }
 
+/// The last regime seen per repository, in this process only (#12675). A
+/// restart re-emits once; nothing is persisted.
+static LAST_REGIME: std::sync::Mutex<Option<std::collections::HashMap<String, QueueRegime>>> =
+    std::sync::Mutex::new(None);
+
+/// Record `regime` for `nwo` in `last`; true when it differs from the last one
+/// seen (or is the first). Pure over its inputs.
+fn regime_changed(
+    last: &mut std::collections::HashMap<String, QueueRegime>,
+    nwo: &str,
+    regime: &QueueRegime,
+) -> bool {
+    if last.get(nwo) == Some(regime) {
+        return false;
+    }
+    last.insert(nwo.to_string(), regime.clone());
+    true
+}
+
+/// Emit a `merge.queue.regime` record when the regime read by this tick's
+/// preflight differs from the last one. No forge call: `regime` came from the
+/// read `tick_groups` already makes.
+fn emit_regime_on_change(nwo: &str, regime: QueueRegime) {
+    let changed = {
+        let mut guard = LAST_REGIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        regime_changed(guard.get_or_insert_with(Default::default), nwo, &regime)
+    };
+    if !changed {
+        return;
+    }
+    let loom = crate::telemetry::provenance::Provenance::current();
+    if !loom.is_valid() {
+        return;
+    }
+    crate::observability::ops::emit_record(crate::telemetry::TelemetryRecord::MergeQueueRegime(
+        MergeQueueRegimeRecord {
+            regime,
+            observed_at: chrono::Utc::now(),
+            loom,
+        },
+    ));
+}
+
 /// Daemon pass: evaluate every live merge group so a group whose other
 /// checks finished since the last look gets its verdict without waiting for
 /// a workflow. Queue mode only. This is an accelerator: the enforcement is
@@ -339,8 +385,12 @@ impl ContextStates for GhContextStates<'_> {
 /// never runs.
 pub fn tick_groups(gh: &str, forge: &GhLifecycleForge) {
     use super::grants::CommentGrantStore;
-    let required = match super::preflight::github_preflight(gh, &forge.nwo(), None) {
-        Ok(c) => c.required_checks,
+    let nwo = forge.nwo();
+    let required = match super::preflight::github_preflight(gh, &nwo, None) {
+        Ok(c) => {
+            emit_regime_on_change(&nwo, c.regime);
+            c.required_checks
+        }
         Err(e) => {
             log::warn!("merge-queue: group pass skipped, required contexts unreadable: {e}");
             return;
@@ -810,5 +860,29 @@ mod tests {
         let st = json!({"total_count": 0, "statuses": []});
         assert!(states_from(&req(), &runs, &st).is_err());
         assert!(states_from(&req(), &json!({}), &st).is_err());
+    }
+
+    fn regime(max: u64) -> QueueRegime {
+        QueueRegime {
+            max_entries_to_build: Some(max),
+            ..QueueRegime::default()
+        }
+    }
+
+    #[test]
+    fn an_unchanged_regime_emits_nothing() {
+        let mut last = std::collections::HashMap::new();
+        assert!(regime_changed(&mut last, "o/r", &regime(5)), "first observation emits");
+        assert!(!regime_changed(&mut last, "o/r", &regime(5)), "unchanged regime emits nothing");
+        assert!(!regime_changed(&mut last, "o/r", &regime(5)));
+    }
+
+    #[test]
+    fn a_changed_regime_emits_again_and_repos_are_independent() {
+        let mut last = std::collections::HashMap::new();
+        assert!(regime_changed(&mut last, "o/r", &regime(5)));
+        assert!(regime_changed(&mut last, "o/r", &regime(3)));
+        assert!(!regime_changed(&mut last, "o/r", &regime(3)));
+        assert!(regime_changed(&mut last, "o/other", &regime(3)));
     }
 }

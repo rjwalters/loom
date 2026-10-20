@@ -43,6 +43,43 @@
 //!   execution and accounting row, so the ledger charges what GitHub
 //!   charges.
 //!
+//! # Crate-wide test-isolation invariant for `LOOM_REPO` (#8496)
+//!
+//! `LOOM_REPO` is process-global, and roughly a dozen test modules mutate it
+//! (`peer_claims::repo_slug_tests`, `claim_reconciliation::repo_env_tests`,
+//! `quarantine_reconciliation`, and the `sweep_registry` guards / dispatch /
+//! reaper / watchdog / outcome-journal test modules). **Every one of those
+//! tests MUST use the crate-default, unnamed `#[serial]` key** — `serial_test`
+//! only mutually excludes tests that share the *same* key, so a second key is a
+//! second, concurrently-running group and a `remove_var("LOOM_REPO")` landing
+//! between another group's `set_var` and its read silently changes that test's
+//! repo identity. Same race class as the `LOOM_GH_BIN` split fixed in #8465 /
+//! #8480.
+//!
+//! **Why the default key and not a dedicated `loom_repo_env` one** (the shape
+//! #8465 / #8480 used for `LOOM_GH_BIN`): most of those bare `#[serial]`
+//! attributes are *already* load-bearing for other shared state they happen to
+//! touch as well — a fake `gh` on `PATH`, the process cwd, `HOME` (#4547).
+//! Moving them to a `LOOM_REPO`-specific key would keep this variable safe
+//! while silently un-serialising all of that against the rest of the default
+//! group. The variable with exactly one writer group (`LOOM_GH_BIN`) is the
+//! one that can afford a private key; this one cannot.
+//!
+//! The one test that also needs `loom_config_env` (for `LOOM_GH_BIN`) —
+//! `role_collision::tests::rest_queue_source_parses_the_live_listing_shape` —
+//! holds **both** locks by nesting a `#[serial]` body inside the
+//! `#[serial(loom_config_env)]` test, because multi-key `#[serial(a, b)]` cannot
+//! name the default group (its key is the empty string; attribute keys are
+//! parsed as identifiers). See that test's own doc comment for the lock order.
+//!
+//! # `gh api` has no `--repo` flag (#8263)
+//!
+//! Only the porcelain subcommands (`gh issue`, `gh pr`, `gh repo`) accept
+//! `--repo`; `gh api` exits `unknown flag: --repo`. A `gh api` call resolves
+//! its repo from the cwd remote or the `GH_REPO` env var, which this facade
+//! sets from the typed target / `LOOM_REPO` override. `tests/gh_api_repo_flag.rs`
+//! fails CI if a `gh api` builder appends `--repo`.
+//!
 //! `gh-cached` substitution for reads, the async/tokio variant and the Gitea
 //! decline move in with the slices that first need them (see #9985's slicing
 //! plan).
@@ -846,7 +883,7 @@ impl GhInvocation {
     /// - `GH_REPO`: the typed target, else — on the **reader** attempt of a
     ///   derived route only (W4-C, [`cwd_route`]) — the derived repo, else
     ///   the machine-global `LOOM_REPO` override
-    ///   (`gh_repo_env::apply_loom_repo_override`'s contract). A writer
+    ///   (see the `LOOM_REPO` section in the module docs). A writer
     ///   attempt never sees the derived repo.
     /// - `LOOM_TRACEPARENT` / `TRACEPARENT`: set together from
     ///   `child_context` — the invocation's own span when it is exported, so

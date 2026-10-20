@@ -27,7 +27,7 @@ fn preparer<'a>(root: &std::path::Path, issue: Option<u64>) -> containment::Prep
         JobKind::Sweep,
         issue,
         "containment-proof".into(),
-        Box::new(|_| None),
+        Box::new(|_, _| None),
     )
 }
 

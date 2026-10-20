@@ -194,13 +194,14 @@ pub(crate) fn handle_session_command(
             println!("{}", serde_json::to_string_pretty(status)?);
         } else {
             println!(
-                "{}: {} (workspace_mode={}, private_root={}, volume={}, repository={}, lease={})",
+                "{}: {} (workspace_mode={}, private_root={}, volume={}, repository={}, additional_repositories={}, lease={})",
                 status.config.account,
                 if status.running { "running" } else { "stopped" },
                 status.workspace_mode,
                 status.private_root,
                 status.config.volume,
                 status.config.repository,
+                status.config.repositories.len(),
                 status
                     .lease
                     .as_ref()

@@ -699,31 +699,6 @@ pub fn default_branch(gh_bin: &Path, root: &Path) -> Result<String> {
     Ok(r.default_branch_ref.name)
 }
 
-/// The live default-branch tip: fetched (not a local ref guess), so
-/// construction starts from what the candidate will actually target.
-pub fn live_base_sha(gh_bin: &Path, root: &Path, default_branch: &str) -> Result<String> {
-    #[derive(Debug, Deserialize)]
-    struct Ref {
-        #[serde(rename = "object")]
-        object: Obj,
-    }
-    #[derive(Debug, Deserialize)]
-    struct Obj {
-        sha: String,
-    }
-    let stdout = gh(
-        "consolidate.base_sha",
-        gh_bin,
-        root,
-        &[
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/commits/{default_branch}"),
-        ],
-    )?;
-    let r: Ref = serde_json::from_slice(&stdout).context("parse commits API JSON")?;
-    Ok(r.object.sha)
-}
-
 /// An open candidate PR for this head branch, if one exists — the adopt-first
 /// check that makes duplicate workers converge (ADR-0023 §5).
 ///

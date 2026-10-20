@@ -20,6 +20,20 @@ use crate::sweep_registry::{
 use crate::types::QueueDisposition as Qd;
 use error_kind::DispatchErrorKind;
 
+/// One workspace's draw pool and exclusions as the step tick weighed them
+/// (#12734), after the claims and the Builder hold were applied: what the
+/// work finder can draw from the repo now. Exported as
+/// `loom.dispatch.pool_items` and `loom.dispatch.excluded_items`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoDepth {
+    /// The forge slug.
+    pub repo: String,
+    /// Drawable items by `Step::as_str`; empty for a held workspace.
+    pub pool: std::collections::BTreeMap<&'static str, usize>,
+    /// Excluded items by `Exclusion::as_str`.
+    pub excluded: std::collections::BTreeMap<&'static str, usize>,
+}
+
 /// Per-tick outcome counts, for observability and test assertions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickReport {
@@ -287,6 +301,9 @@ pub struct TickReport {
     pub vi_demotions: Vec<super::vi_cap::ViDemotion>,
     /// The step tick's item draws (#11909), exported on `pick.decision`.
     pub item_draw: Option<crate::telemetry::kinds::pick_decision::PickItemDraw>,
+    /// Each step-tick workspace's pool and exclusions (#12734). Empty when
+    /// no step tick ran.
+    pub depth: Vec<RepoDepth>,
 }
 
 impl TickReport {

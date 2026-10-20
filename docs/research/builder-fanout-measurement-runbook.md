@@ -5,8 +5,8 @@
 in its own worktree, with Judge picking the winning PR.
 
 **What this document is:** the measurement/design step #4776 was scoped to, and
-the mirror image of `docs/research/judge-fanout-measurement-runbook.md` on the
-generation side. It selects a corpus of historically-hard issues from this repo's
+the mirror image of the (since retired, #12709) `docs/research/judge-fanout-measurement-runbook.md`
+on the generation side. It selects a corpus of historically-hard issues from this repo's
 own record, works one of them through what N=3 would actually require, prices the
 fan-out against this machine's live dispatch cap, and ends in a proceed/defer
 call.
@@ -372,7 +372,7 @@ would need to change.
 
 ## References (read-only)
 
-- `docs/research/judge-fanout-measurement-runbook.md` — the Judge-side
+- `docs/research/judge-fanout-measurement-runbook.md` (retired in #12709; see git history) — the Judge-side
   precedent this document mirrors, and the source of the "do not fabricate
   numbers" invariant.
 - `docs/research/dynamic-workflows-evaluation.md` — keep/defer/reject verdict

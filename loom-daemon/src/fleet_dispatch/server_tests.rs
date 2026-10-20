@@ -1,9 +1,12 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
+use crate::discovery::chain::Tier;
+use crate::discovery::snapshot::{RepoSnapshot, RepoStatus, Source};
 use crate::fleet_dispatch::identity::{StaticIdentity, TailnetNode};
 use crate::fleet_dispatch::proto::RefusalReason;
 use crate::fleet_dispatch::roster::RosterHost;
+use crate::forge_listing::RestIssue;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
@@ -36,14 +39,13 @@ impl Identity for DownIdentity {
 }
 
 fn roster() -> Roster {
-    let host = |node: &str, max: u32, fleet_mode: bool| RosterHost {
+    let host = |node: &str, fleet_mode: bool| RosterHost {
         tailnet_node: Some(node.to_string()),
-        max_concurrent: Some(max),
         fleet_mode,
     };
     Roster::new(BTreeMap::from([
-        (A.to_string(), host("node-a", 40, true)),
-        (B.to_string(), host("node-b", 2, true)),
+        (A.to_string(), host("node-a", true)),
+        (B.to_string(), host("node-b", true)),
     ]))
 }
 
@@ -268,17 +270,18 @@ async fn a_restart_takes_a_new_epoch_refuses_with_grace_and_rebuilds_from_heartb
 }
 
 #[tokio::test]
-async fn the_cap_uses_the_rosters_max_concurrent() {
-    // B reports 100 free slots, but its fleet config caps it at 2.
+async fn the_captain_never_refuses_cap() {
+    // B reports 1 free slot; the captain still grants every claim it makes,
+    // because the worker bounds its own claims (#12864).
     let s = open_server("node-b");
-    s.handle(B, "/v1/heartbeat", hb_body(B, json!([]), 100).to_string().as_bytes());
-    for item in [1, 2] {
-        let (reply, _) =
+    s.handle(B, "/v1/heartbeat", hb_body(B, json!([]), 1).to_string().as_bytes());
+    for item in 1..=5 {
+        let (reply, call) =
             s.handle(B, "/v1/claim", claim_body(B, item, "builder").to_string().as_bytes());
-        assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["granted"], json!(true));
+        let body = serde_json::from_str::<Value>(&reply.body).unwrap();
+        assert_eq!(body["granted"], json!(true), "item {item}: {body}");
+        assert_ne!(call.reason.as_deref(), Some("cap"));
     }
-    let (reply, _) = s.handle(B, "/v1/claim", claim_body(B, 3, "builder").to_string().as_bytes());
-    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["reason"], json!("cap"));
 }
 
 #[tokio::test]
@@ -318,7 +321,6 @@ async fn a_reload_replaces_the_roster() {
         "worker-c".to_string(),
         RosterHost {
             tailnet_node: Some("node-c".into()),
-            max_concurrent: None,
             fleet_mode: false,
         },
     );
@@ -361,6 +363,10 @@ async fn a_no_progress_release_refuses_every_hosts_next_claim_until_the_cooldown
         assert_eq!(refusal["reason"], json!("cooldown"), "a hold is not a live claim (`held`)");
         assert_eq!(refusal["retry_after_s"], json!(1800));
         assert_eq!(call.reason.as_deref(), Some(NO_PROGRESS_REASON));
+        assert_eq!(call.retry_after_s, Some(1800));
+        let hold = call.hold.expect("a hold refusal names its hold");
+        assert_eq!((hold.rung, hold.set_by_outcome.as_str()), (1, "noop"));
+        assert!(!hold.set_by_assignment_id.is_empty());
     }
     let c = s.counters.lock().unwrap().clone();
     assert_eq!(c.refusals.get(&("claim", NO_PROGRESS_REASON.to_string())), Some(&2));
@@ -370,4 +376,159 @@ async fn a_no_progress_release_refuses_every_hosts_next_claim_until_the_cooldown
     let (reply, _) =
         s.handle(B, "/v1/claim", claim_body(B, 9, "champion_merge").to_string().as_bytes());
     assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["granted"], json!(true));
+}
+
+// Queue candidates are discovery fixtures only; every refusal still goes through
+// the server's authenticated-host/body check and the real assignment table.
+fn refusal_queue_snapshot(updated_at: &str) -> RepoSnapshot {
+    RepoSnapshot {
+        slug: "acme/w".to_string(),
+        source: Source::Worklist,
+        tier: Tier::Mirror,
+        status: RepoStatus::Ok,
+        rows: vec![RestIssue {
+            number: 7,
+            title: None,
+            labels: vec!["loom:issue".to_string()],
+            created_at: Some("2026-10-19T10:00:00Z".to_string()),
+            updated_at: Some(updated_at.to_string()),
+            closed_at: None,
+            state: "open".to_string(),
+            body: None,
+            author: None,
+            author_association: None,
+            is_pull_request: false,
+            comments: 0,
+            open_sub_issues: None,
+            labels_at: None,
+            draft: false,
+        }],
+        pulls: None,
+        extras: BTreeMap::new(),
+        watermark: None,
+    }
+}
+
+fn queue_assignment(s: &Server<StaticIdentity>) -> String {
+    let (reply, _) = s.handle(A, "/v1/claim", claim_body(A, 7, "builder").to_string().as_bytes());
+    let grant: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(grant["granted"], json!(true));
+    grant["assignment_id"].as_str().unwrap().to_string()
+}
+
+fn refuse_assignment(s: &Server<StaticIdentity>, host: &str, id: &str, reason: &str) -> bool {
+    let request = json!({"host_id": host, "assignment_id": id, "reason": reason});
+    let (reply, _) = s.handle(host, "/v1/refuse", request.to_string().as_bytes());
+    assert_eq!(reply.status, 200);
+    serde_json::from_str::<Value>(&reply.body).unwrap()["known"]
+        .as_bool()
+        .unwrap()
+}
+
+#[test]
+fn unknown_refusal_preserves_queue_and_same_revision_refresh() {
+    for foreign in [true, false] {
+        for reason in ["stale", "claim_lost"] {
+            let s = open_server("node-a");
+            let snapshot = refusal_queue_snapshot("2026-10-19T10:00:00Z");
+            s.queue().refresh_repos([&snapshot]);
+            let id = queue_assignment(&s);
+            let before = s.queue().repo_entries("acme/w").to_vec();
+            assert_eq!(before.len(), 1);
+            let refused_id = if foreign {
+                id.as_str()
+            } else {
+                "nonexistent-assignment"
+            };
+            assert!(!refuse_assignment(&s, B, refused_id, reason));
+            assert_eq!(s.queue().repo_entries("acme/w"), before);
+            assert_eq!(s.queue().tombstones(), 0);
+            s.queue().refresh_repos([&snapshot]);
+            assert_eq!(s.queue().repo_entries("acme/w"), before);
+            assert_eq!(s.queue().tombstones(), 0);
+            // A still owns the exact assignment; B's refusal changed neither half.
+            assert_eq!(queue_assignment(&s), id);
+        }
+    }
+}
+
+#[test]
+fn already_held_refusal_preserves_refreshed_queue_candidate() {
+    for host in [A, B] {
+        for reason in ["stale", "claim_lost"] {
+            let s = open_server("node-a");
+            let old = refusal_queue_snapshot("2026-10-19T10:00:00Z");
+            s.queue().refresh_repos([&old]);
+            let id = queue_assignment(&s);
+            assert!(refuse_assignment(&s, A, &id, "claim_lost"));
+            assert_eq!((s.queue_len(), s.queue().tombstones()), (0, 1));
+            let newer = refusal_queue_snapshot("2026-10-19T11:00:00Z");
+            s.queue().refresh_repos([&newer]);
+            let before = s.queue().repo_entries("acme/w").to_vec();
+            assert_eq!(before.len(), 1);
+            assert_eq!(s.queue().tombstones(), 0);
+            assert!(!refuse_assignment(&s, host, &id, reason));
+            assert_eq!(s.queue().repo_entries("acme/w"), before);
+            assert_eq!(s.queue().tombstones(), 0);
+            s.queue().refresh_repos([&newer]);
+            assert_eq!(s.queue().repo_entries("acme/w"), before);
+            assert_eq!(s.queue().tombstones(), 0);
+        }
+    }
+}
+
+#[test]
+fn accepted_owner_refusal_tombstones_only_the_current_revision() {
+    for reason in ["stale", "claim_lost"] {
+        let s = open_server("node-a");
+        let old = refusal_queue_snapshot("2026-10-19T10:00:00Z");
+        s.queue().refresh_repos([&old]);
+        let id = queue_assignment(&s);
+        assert!(refuse_assignment(&s, A, &id, reason));
+        assert_eq!((s.queue_len(), s.queue().tombstones()), (0, 1));
+        s.queue().refresh_repos([&old]);
+        assert_eq!((s.queue_len(), s.queue().tombstones()), (0, 1));
+        let newer = refusal_queue_snapshot("2026-10-19T11:00:00Z");
+        s.queue().refresh_repos([&newer]);
+        assert_eq!((s.queue_len(), s.queue().tombstones()), (1, 0));
+    }
+}
+
+/// #12873: a sweep's points carry the table's gauges beside the counter
+/// deltas, from a heartbeat with a step start; a roster host that never
+/// heartbeated has no point at all.
+#[tokio::test]
+async fn a_sweep_emits_the_tables_gauges_with_the_counters() {
+    use crate::telemetry::ops::{MetricName, MetricValue};
+    let s = open_server("node-a");
+    let live = json!([{"repo": "acme/w", "item": 3, "step": "judge",
+                       "started_at": "2026-10-20T11:00:00Z"}]);
+    s.handle(A, "/v1/heartbeat", hb_body(A, live, 2).to_string().as_bytes());
+    let now: chrono::DateTime<chrono::Utc> = "2026-10-20T12:00:00Z".parse().unwrap();
+    let points = s.sweep_points(now);
+    let find = |name: MetricName, host: Option<&str>, state: Option<&str>| {
+        points
+            .iter()
+            .find(|p| {
+                p.name == name
+                    && p.labels.get("host").map(String::as_str) == host
+                    && p.labels.get("state").map(String::as_str) == state
+            })
+            .map(|p| match p.value {
+                MetricValue::Int(v) => v,
+                MetricValue::Double(_) => panic!("int gauges"),
+            })
+    };
+    assert_eq!(find(MetricName::FleetDispatchRows, Some(A), Some("live")), Some(1));
+    assert_eq!(find(MetricName::FleetDispatchRows, Some(A), Some("granted")), Some(0));
+    assert_eq!(find(MetricName::FleetDispatchRows, None, Some("held")), Some(0));
+    assert_eq!(find(MetricName::FleetDispatchFreeSlotsReported, Some(A), None), Some(2));
+    assert_eq!(find(MetricName::FleetDispatchLiveReported, Some(A), None), Some(1));
+    assert_eq!(find(MetricName::FleetDispatchOldestLiveAgeSec, Some(A), None), Some(3600));
+    assert!(
+        !points
+            .iter()
+            .any(|p| p.labels.get("host").map(String::as_str) == Some(B)),
+        "a host never heard from has no point, never 0"
+    );
 }

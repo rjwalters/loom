@@ -147,6 +147,29 @@ fn older_nonoverlapping_archive_gets_appended_in_date_order() {
 }
 
 #[test]
+fn rotating_into_existing_month_keeps_one_index_line() {
+    let dir = setup(&sample());
+    let root = dir.path();
+    fs::create_dir(root.join("work_log")).unwrap();
+    let older = section("2026-08-03", 1);
+    fs::write(
+        root.join("work_log/WORK_LOG_2026-08.md"),
+        format!("# Work Log Archive — 2026-08\n\n{older}"),
+    )
+    .unwrap();
+    run(root).unwrap();
+    let active = read(root, "WORK_LOG.md");
+    assert_eq!(
+        active
+            .matches("- [2026-08](work_log/WORK_LOG_2026-08.md)\n")
+            .count(),
+        1,
+        "{active}"
+    );
+    assert!(active.contains("- [2026-07](work_log/WORK_LOG_2026-07.md)"));
+}
+
+#[test]
 fn floor_is_enforced() {
     let dir = setup(&sample());
     let err = archive(dir.path(), 44, today(), false)

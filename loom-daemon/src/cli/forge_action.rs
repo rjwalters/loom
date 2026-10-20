@@ -684,6 +684,22 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge promotion-author --number N [--repo R]` (#10827) — the author gate
+    /// on automatic promotion to `loom:issue`. Line 1 of stdout is `TRUSTED`,
+    /// `UNTRUSTED <login>` or `UNKNOWN <reason>` (the issue author judged by the
+    /// comment-trust predicate); for the last two the rest is the one-time
+    /// explanatory comment, marker first. Only `TRUSTED` permits promotion;
+    /// exits 0 whenever it decided and 1 when the issue could not be read
+    /// (still printing `UNKNOWN`), so a failed read is never an all-clear.
+    #[command(name = "promotion-author")]
+    PromotionAuthor {
+        #[arg(long, value_name = "N")]
+        number: u64,
+        /// `owner/name` (default: the cwd's repo).
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+    },
+
     /// `forge claim-liveness --number N --label L --claimed-at TS` (#10235) —
     /// print the newest liveness evidence the claim reconciler honors beyond the
     /// claim-activity marker (trusted Judge-progress comment for
@@ -1043,6 +1059,9 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         } => {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
+        }
+        ForgeAction::PromotionAuthor { number, repo } => {
+            return super::forge_identity_cmd::promotion_author(number, repo.as_deref());
         }
         ForgeAction::VerdictBodyCheck => return super::forge_verdict_cmd::verdict_body_check(),
         ForgeAction::VerdictGate {

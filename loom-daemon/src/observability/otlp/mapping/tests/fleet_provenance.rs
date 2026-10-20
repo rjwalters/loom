@@ -38,6 +38,8 @@ fn per_signal_pairs(batch: &[TelemetryEnvelope]) -> [(&'static str, Vec<(String,
             .iter()
             .map(|kv| match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
                 Some(any_value::Value::StringValue(s)) => (kv.key.clone(), s.clone()),
+                // The host-shape counts (#12874) are the only int keys.
+                Some(any_value::Value::IntValue(i)) => (kv.key.clone(), i.to_string()),
                 other => panic!("resource attribute {} is not a string: {other:?}", kv.key),
             })
             .collect()

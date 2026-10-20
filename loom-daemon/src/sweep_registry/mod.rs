@@ -123,7 +123,6 @@ mod fast_fail_park;
 mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
-mod journal_shadow;
 mod landed_guard;
 mod lease_episode;
 pub mod lease_step;
@@ -1687,7 +1686,8 @@ mod tests {
     // RAII guard: saves and clears every host-identity input (`LOOM_HOST_ID`,
     // `HOSTNAME`, `LOOM_HOST_ID_FILE`, `LOOM_CONFIG_DEFAULTS_FILE`) and
     // restores the ambient values on drop.
-    use crate::host_identity::tests::EnvGuard as HostIdentityEnvGuard;
+    use crate::env_test_support::EnvGuard as HostIdentityEnvGuard;
+    use crate::host_identity::tests::GUARDED_ENV as HOST_IDENTITY_ENV;
 
     /// Issue #5063 / #11530: `fleet.hostId` > `LOOM_HOST_ID` > the persisted
     /// id, blanks ignored, and never `$HOSTNAME`. Holds `loom_config_env`
@@ -1697,7 +1697,7 @@ mod tests {
     fn host_identity_env_precedence() {
         #[serial]
         fn inner() {
-            let _guard = HostIdentityEnvGuard::clear();
+            let _guard = HostIdentityEnvGuard::clear(HOST_IDENTITY_ENV);
             let dir = tempfile::tempdir().unwrap();
             let id_file = dir.path().join("host-id");
             std::fs::write(&id_file, "persisted-studio\n").unwrap();
