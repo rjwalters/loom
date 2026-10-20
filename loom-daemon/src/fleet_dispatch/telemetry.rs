@@ -15,6 +15,18 @@
 //!   known tokens, anything else is `other`),
 //!   `loom.fleet_dispatch.expired` by `kind` (`assignment` / `hold`) and
 //!   `loom.fleet_dispatch.claim_lost_after_grant`.
+//! - Gauges read from the table on the same sweep ([`gauge_points`], #12873):
+//!   `loom.fleet_dispatch.rows{host, state}` (`granted` / `live`, `0`
+//!   included, for every host with a row or a fresh heartbeat),
+//!   `loom.fleet_dispatch.rows{state="held"}` (fleet-wide, no `host`), and,
+//!   for a host whose last heartbeat is within
+//!   [`super::table::HEARTBEAT_FRESH`] only, `free_slots_reported{host}`,
+//!   `live_reported{host}` and `oldest_live_age_sec{host}` (the last only
+//!   when the heartbeat carried a step start). `rows{state="live"}` minus
+//!   `live_reported` is a host's stale-claim count. Ages use the captain's
+//!   wall clock against the workers' `started_at`; cross-host skew (NTP,
+//!   seconds) is negligible at minute scale, and a start ahead of the
+//!   captain reads `0`.
 //!
 //! Everything goes through the daemon's ops sink
 //! ([`crate::observability::ops`]); with no OTLP exporter it is a no-op.
@@ -266,6 +278,47 @@ impl Counters {
     }
 }
 
+/// The table's gauge points at wall-clock `now` (module docs, #12873). Pure.
+#[must_use]
+pub fn gauge_points(gauges: &super::table::TableGauges, now: DateTime<Utc>) -> Vec<MetricPoint> {
+    let count = |n: u32| i64::from(n);
+    let mut points = Vec::new();
+    for (host, g) in &gauges.hosts {
+        for (state, n) in [("granted", g.granted), ("live", g.live)] {
+            points.push(
+                MetricPoint::int(MetricName::FleetDispatchRows, count(n))
+                    .label("host", host.as_str())
+                    .label("state", state),
+            );
+        }
+        let Some(reported) = &g.reported else {
+            continue;
+        };
+        points.push(
+            MetricPoint::int(
+                MetricName::FleetDispatchFreeSlotsReported,
+                count(reported.free_slots),
+            )
+            .label("host", host.as_str()),
+        );
+        points.push(
+            MetricPoint::int(MetricName::FleetDispatchLiveReported, count(reported.live_reported))
+                .label("host", host.as_str()),
+        );
+        if let Some(started) = reported.oldest_live_started_at {
+            let age = (now - started).num_seconds().max(0);
+            points.push(
+                MetricPoint::int(MetricName::FleetDispatchOldestLiveAgeSec, age)
+                    .label("host", host.as_str()),
+            );
+        }
+    }
+    points.push(
+        MetricPoint::int(MetricName::FleetDispatchRows, count(gauges.held)).label("state", "held"),
+    );
+    points
+}
+
 /// Emit `call`'s span through the ops sink (a no-op without one).
 pub fn emit_call(call: &Call, started_at: DateTime<Utc>, seq: u64) {
     if crate::observability::ops::spans_exported() {
@@ -372,6 +425,92 @@ mod tests {
         assert_eq!(held.name, MetricName::FleetDispatchRefusals);
         assert_eq!(held.labels.get("kind").map(String::as_str), Some("claim"));
         assert!(c.take_points().is_empty(), "flushed counters reset");
+    }
+
+    /// #12873: a fresh host gets rows and reported points; a stale host
+    /// keeps only its rows; held is fleet-wide with no host; no start, no
+    /// age; a start ahead of the captain reads 0.
+    #[test]
+    fn gauge_points_follow_the_absent_vs_zero_rules() {
+        use super::super::table::{HostGauges, Reported, TableGauges};
+        let now: DateTime<Utc> = "2026-10-20T12:00:00Z".parse().unwrap();
+        let reported = |started: Option<&str>| {
+            Some(Reported {
+                free_slots: 3,
+                live_reported: 1,
+                oldest_live_started_at: started.map(|s| s.parse().unwrap()),
+            })
+        };
+        let gauges = TableGauges {
+            hosts: BTreeMap::from([
+                (
+                    "fresh".to_string(),
+                    HostGauges {
+                        granted: 1,
+                        live: 2,
+                        reported: reported(Some("2026-10-20T11:30:00Z")),
+                    },
+                ),
+                (
+                    "stale".to_string(),
+                    HostGauges {
+                        granted: 0,
+                        live: 4,
+                        reported: None,
+                    },
+                ),
+                (
+                    "old-worker".to_string(),
+                    HostGauges {
+                        reported: reported(None),
+                        ..HostGauges::default()
+                    },
+                ),
+                (
+                    "ahead".to_string(),
+                    HostGauges {
+                        reported: reported(Some("2026-10-20T12:00:09Z")),
+                        ..HostGauges::default()
+                    },
+                ),
+            ]),
+            held: 0,
+        };
+        let points = gauge_points(&gauges, now);
+        let find = |name: MetricName, host: Option<&str>, state: Option<&str>| {
+            points
+                .iter()
+                .find(|p| {
+                    p.name == name
+                        && p.labels.get("host").map(String::as_str) == host
+                        && p.labels.get("state").map(String::as_str) == state
+                })
+                .map(|p| match p.value {
+                    crate::telemetry::ops::MetricValue::Int(v) => v,
+                    crate::telemetry::ops::MetricValue::Double(_) => panic!("int gauges"),
+                })
+        };
+        let rows = MetricName::FleetDispatchRows;
+        assert_eq!(find(rows, Some("fresh"), Some("granted")), Some(1));
+        assert_eq!(find(rows, Some("fresh"), Some("live")), Some(2));
+        assert_eq!(find(rows, Some("stale"), Some("live")), Some(4));
+        assert_eq!(find(rows, Some("stale"), Some("granted")), Some(0), "0, not absent");
+        assert_eq!(find(rows, None, Some("held")), Some(0), "held is fleet-wide, 0 included");
+        let free = MetricName::FleetDispatchFreeSlotsReported;
+        let live = MetricName::FleetDispatchLiveReported;
+        let age = MetricName::FleetDispatchOldestLiveAgeSec;
+        assert_eq!(find(free, Some("fresh"), None), Some(3));
+        assert_eq!(find(live, Some("fresh"), None), Some(1));
+        assert_eq!(find(age, Some("fresh"), None), Some(1800));
+        for name in [free, live, age] {
+            assert_eq!(find(name, Some("stale"), None), None, "a stale host reports nothing");
+        }
+        assert_eq!(find(live, Some("old-worker"), None), Some(1));
+        assert_eq!(find(age, Some("old-worker"), None), None, "no start, no age");
+        assert_eq!(find(age, Some("ahead"), None), Some(0), "a start ahead clamps to 0");
+        for p in &points {
+            assert_eq!(crate::telemetry::ops::bounded_labels(&p.labels), p.labels);
+        }
     }
 
     #[test]

@@ -259,7 +259,7 @@ processors:
     log_statements:
       - context: resource
         statements:
-          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision"])
+          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision", "host.cpu.count", "loom.host.mem_total_bytes", "host.arch", "host.type", "cloud.provider", "cloud.region"])
       - context: log
         statements:
           # loom.session_id / loom.agent_id / loom.parent_agent_id (#8669): the
@@ -366,7 +366,7 @@ processors:
     trace_statements:
       - context: resource
         statements:
-          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision"])
+          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision", "host.cpu.count", "loom.host.mem_total_bytes", "host.arch", "host.type", "cloud.provider", "cloud.region"])
       - context: span
         statements:
           # loom.ci.run / loom.ci.job spans (#8824) add CI_SPAN_ATTRIBUTE_KEYS,
@@ -468,7 +468,7 @@ processors:
     metric_statements:
       - context: resource
         statements:
-          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision"])
+          - keep_keys(attributes, ["service.name", "service.version", "service.instance.id", "host.id", "host.name", "loom.fleet.config_sha", "loom.daemon.revision", "host.cpu.count", "loom.host.mem_total_bytes", "host.arch", "host.type", "cloud.provider", "cloud.region"])
       - context: datapoint
         statements:
           # loom.ci.{run,job}.duration_ms histograms (#8824) add the
@@ -498,7 +498,10 @@ processors:
           # never its path); repo, state and role were already kept.
           # loom.queue.host_shard (#12827) adds shard_count (the host's configured
           # shard count, one fixed value per host, so no new series).
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "kind", "container", "installation", "agent", "route", "purpose", "volume", "step", "shard_count", "sweep_ids", "visibility", "workspace"])
+          # loom.fleet_dispatch.* captain gauges (#12873) add host (a roster host
+          # id, never worker text); loom.dispatch.running_by_age adds age (a
+          # closed set of four buckets).
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "kind", "container", "installation", "agent", "route", "purpose", "volume", "step", "shard_count", "sweep_ids", "visibility", "workspace", "host", "age"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318

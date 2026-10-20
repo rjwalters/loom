@@ -149,7 +149,7 @@ const TABLE: &[(&str, Reloadability)] = &[
     // `observability::read_config` feeds `observer_tasks::spawn` once at
     // bring-up (exporter wiring, `observability::spawn_task`).
     ("observability", Reloadability::RestartRequired),
-    // `ci_telemetry::spawn_task_on` resolves the config once (owners,
+    // `ci_telemetry::spawn_task` resolves the config once (owners,
     // interval, excluded repos) before the ticker is built; only the
     // captain gate inside the tick is live (see `fleet.captain`).
     ("autonomous.ciTelemetry", Reloadability::RestartRequired),

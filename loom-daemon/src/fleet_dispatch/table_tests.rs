@@ -39,6 +39,7 @@ fn live(repo: &str, item: u64, step: &str, id: Option<&str>) -> LiveStep {
         item,
         step: step.into(),
         assignment_id: id.map(str::to_string),
+        started_at: None,
     }
 }
 
@@ -863,4 +864,53 @@ fn the_lineage_record_is_bounded() {
     );
     t.expire(at(100 + LINEAGE_MAX as u64 + 20 + LINEAGE_MAX_AGE.as_secs()));
     assert!(t.lineage.is_empty(), "records age out");
+}
+
+/// #12873: the gauge snapshot. A fresh host reports its slots, live count
+/// and oldest start; a host whose heartbeat went stale keeps only its row
+/// counts; a host never heard from has nothing; a held row is fleet-wide.
+#[test]
+fn the_gauge_snapshot_separates_rows_from_what_hosts_report() {
+    let mut t = open_table();
+    let start = |s: &str| Some(s.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+    let mut early = live("acme/w", 1, "judge", None);
+    early.started_at = start("2026-10-20T10:00:00Z");
+    let mut late = live("acme/w", 2, "builder", None);
+    late.started_at = start("2026-10-20T11:00:00Z");
+    t.heartbeat(at(100), A, &hb(A, vec![early, late], 3));
+    granted_id(&t.claim(at(100), A, "acme/w", 3, "doctor"));
+    // B heartbeats an old-worker step (no start), then goes silent.
+    t.heartbeat(at(100), B, &hb(B, vec![live("acme/w", 4, "judge", None)], 2));
+    // A held row: a granted item lost the forge order.
+    let id = granted_id(&t.claim(at(100), A, "acme/w", 5, "judge"));
+    t.refuse(at(100), A, &id, crate::fleet_dispatch::proto::REFUSE_CLAIM_LOST);
+
+    let g = t.host_gauges(at(150), HEARTBEAT_FRESH);
+    assert_eq!(g.held, 1);
+    let a = &g.hosts[A];
+    assert_eq!((a.granted, a.live), (1, 2));
+    let reported = a.reported.as_ref().unwrap();
+    assert_eq!((reported.free_slots, reported.live_reported), (3, 2));
+    assert_eq!(reported.oldest_live_started_at, start("2026-10-20T10:00:00Z"));
+    let b = &g.hosts[B];
+    assert_eq!((b.granted, b.live), (0, 1));
+    assert_eq!(b.reported.as_ref().unwrap().oldest_live_started_at, None, "no start sent");
+
+    // A heartbeats again; B's last heartbeat is now stale.
+    t.heartbeat(at(250), A, &hb(A, vec![], 4));
+    let g = t.host_gauges(at(250), HEARTBEAT_FRESH);
+    let b = &g.hosts[B];
+    assert_eq!((b.granted, b.live), (0, 1), "a silent host keeps its stale rows");
+    assert_eq!(b.reported, None, "a stale host reports nothing, never 0");
+    let a = g.hosts[A].reported.as_ref().unwrap();
+    assert_eq!((a.free_slots, a.live_reported), (4, 0));
+    assert_eq!(a.oldest_live_started_at, None, "nothing live, no start");
+    assert!(!g.hosts.contains_key("worker-never"), "an unknown host has no entry");
+
+    // Once B's rows expire, B drops out entirely.
+    let g = t.host_gauges(at(2000), HEARTBEAT_FRESH);
+    t.expire(at(2000));
+    let g_after = t.host_gauges(at(2000), HEARTBEAT_FRESH);
+    assert!(g.hosts.contains_key(B));
+    assert!(!g_after.hosts.contains_key(B));
 }
