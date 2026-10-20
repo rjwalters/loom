@@ -1619,7 +1619,10 @@ so a no-op render makes no backup.
 
 `--check` writes nothing: it prints a per-path diff (`~ key: disk -> store`,
 `+`, `-`) and exits `1` on drift, `0` in sync, `2` on error — the drift
-detector. Comparison is semantic (parsed JSON), not textual.
+detector. Comparison is semantic (parsed JSON), not textual. It also reports
+`CLI below floor: installed X, floor Y` (and exits `1`) when the running
+`loom-daemon` is under the store's `loom_min_version` (#12926); that line is
+read-only and does not need `apply-floor` to have run.
 
 **Lossy-reduction guard (2am#1653):** a write that would DROP a top-level
 block the file on disk carries but the store's render does not is refused by
@@ -1637,6 +1640,34 @@ and print a `CACHED … last confirmed current <age> ago` warning; `--offline`
 does so without trying. Rendered config takes effect on the daemon's next
 start for the startup-resolved knobs — see
 [fleet-config-lifecycle](fleet-config-lifecycle.md).
+
+### `fleet-config apply-floor [--dry-run]`
+
+Brings the installed `loom-daemon` binary up to the store's `loom_min_version`
+on a host with **no daemon** (an attended workstation declared
+`loom-daemon: expected: absent`), where nothing else converges it (#12926).
+Daemon hosts keep using the floor roll (`auto_update/floor_roll.rs`); this verb
+is not a second updater loop and starts nothing.
+
+It syncs the store first and acts only on a snapshot the forge confirmed
+current in this invocation (`FailClosed`): a daemon-less host has no fleet-sync
+pass keeping `fleet-sync-status.json` fresh, so forge unreachable means exit `2`
+with the binary untouched. Then, comparing with the floor roll's own
+`parse_triple`:
+
+- installed >= floor, or no floor, or no fleet store configured: no-op, exit
+  `0`, nothing downloaded;
+- installed < floor: resolve the newest release, require it to be >= the floor
+  (otherwise print the `FLEET FLOOR UNSATISFIABLE` note, exit `2`), fetch with
+  the SHA-256 (and, when published, signature) check, and install over
+  `$LOOM_DAEMON_BIN` (else `$LOOM_DAEMON_BIN_DIR/loom-daemon`, else
+  `~/.local/bin/loom-daemon`) with the atomic stage/publish used by
+  `daemon-update`, keeping one `<binary>.previous`.
+
+Any fetch, checksum, signature or install failure exits `2` and leaves the
+existing binary and `.previous` untouched. `--dry-run` prints the decision and
+writes nothing. It never starts, restarts or signals a daemon. Declaring the
+trigger for a host (a timer calling this verb) is fleet-gitops's job.
 
 ### `fleet-config roster [--check | --apply] [--json]`
 

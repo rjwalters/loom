@@ -48,6 +48,7 @@ mod duplicate_closed_search;
 mod duplicate_scan;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_config;
+mod fleet_config_apply_floor;
 mod fleet_config_reload;
 pub(crate) mod fleet_dispatch_cmd;
 pub(crate) mod fleet_experiment;
