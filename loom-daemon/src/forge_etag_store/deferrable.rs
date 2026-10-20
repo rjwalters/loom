@@ -99,6 +99,22 @@ pub(super) fn fetch(
             None,
         )
     };
+    if crate::gh_invocation::discovery_isolation::active() {
+        // #12312: the fleet `gh` tier. Its own config dir, no token variable,
+        // no reader router: a host with nothing logged in there fails closed.
+        return run_fetch_with(
+            site,
+            gh_bin,
+            cwd,
+            target,
+            url,
+            etag,
+            Some(&crate::gh_invocation::discovery_isolation::config_dir()),
+            true,
+            IdentityRole::Writer,
+            None,
+        );
+    }
     let Some(repo) = target.repo.as_deref() else {
         // An unresolved repo has no reader pool to be out of budget.
         return on_writer();
