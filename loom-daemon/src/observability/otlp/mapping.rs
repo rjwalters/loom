@@ -907,6 +907,24 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     value: number_data_point::Value::AsInt(1),
                     time_unix_nano,
                 });
+                // Issue #12905: the per-kind last acked export (#12120) as one
+                // gauge per kind, so a consumer can refuse an `as_of` past the
+                // coverage this host delivered. A kind with no export yet has
+                // no data point (absent, never zero). `kind` is already on the
+                // collector's datapoint allowlist.
+                for k in &otlp_export.kinds {
+                    if let Some(at) = k.last_export_at {
+                        samples.push(MetricSample {
+                            name: "loom.host.kind_last_export_seconds",
+                            description: "Unix seconds of this daemon's last acked OTLP export \
+                                          of a record kind (in memory: since process start).",
+                            unit: "s",
+                            attributes: vec![kv_string("kind", k.kind.as_str())],
+                            value: number_data_point::Value::AsInt(at.timestamp()),
+                            time_unix_nano,
+                        });
+                    }
+                }
             }
             // Cgroup-derived agent-scope census (#12166). Aggregate gauges only
             // (per-scope names would be unbounded label cardinality); the
