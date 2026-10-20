@@ -374,3 +374,42 @@ async fn a_no_progress_release_refuses_every_hosts_next_claim_until_the_cooldown
         s.handle(B, "/v1/claim", claim_body(B, 9, "champion_merge").to_string().as_bytes());
     assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["granted"], json!(true));
 }
+
+/// #12873: a sweep's points carry the table's gauges beside the counter
+/// deltas, from a heartbeat with a step start; a roster host that never
+/// heartbeated has no point at all.
+#[tokio::test]
+async fn a_sweep_emits_the_tables_gauges_with_the_counters() {
+    use crate::telemetry::ops::{MetricName, MetricValue};
+    let s = open_server("node-a");
+    let live = json!([{"repo": "acme/w", "item": 3, "step": "judge",
+                       "started_at": "2026-10-20T11:00:00Z"}]);
+    s.handle(A, "/v1/heartbeat", hb_body(A, live, 2).to_string().as_bytes());
+    let now: chrono::DateTime<chrono::Utc> = "2026-10-20T12:00:00Z".parse().unwrap();
+    let points = s.sweep_points(now);
+    let find = |name: MetricName, host: Option<&str>, state: Option<&str>| {
+        points
+            .iter()
+            .find(|p| {
+                p.name == name
+                    && p.labels.get("host").map(String::as_str) == host
+                    && p.labels.get("state").map(String::as_str) == state
+            })
+            .map(|p| match p.value {
+                MetricValue::Int(v) => v,
+                MetricValue::Double(_) => panic!("int gauges"),
+            })
+    };
+    assert_eq!(find(MetricName::FleetDispatchRows, Some(A), Some("live")), Some(1));
+    assert_eq!(find(MetricName::FleetDispatchRows, Some(A), Some("granted")), Some(0));
+    assert_eq!(find(MetricName::FleetDispatchRows, None, Some("held")), Some(0));
+    assert_eq!(find(MetricName::FleetDispatchFreeSlotsReported, Some(A), None), Some(2));
+    assert_eq!(find(MetricName::FleetDispatchLiveReported, Some(A), None), Some(1));
+    assert_eq!(find(MetricName::FleetDispatchOldestLiveAgeSec, Some(A), None), Some(3600));
+    assert!(
+        !points
+            .iter()
+            .any(|p| p.labels.get("host").map(String::as_str) == Some(B)),
+        "a host never heard from has no point, never 0"
+    );
+}
