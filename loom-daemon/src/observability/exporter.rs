@@ -334,229 +334,19 @@ impl Exporter for HttpsExporter {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::observability::test_sink::HttpSink;
     use crate::telemetry::{HostHealthRecord, TelemetryRecord};
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener};
-    use std::sync::{Arc, Mutex};
+    use std::net::TcpListener;
 
-    /// A tiny hand-rolled HTTP/1.1 mock sink: no framework dependency, just
-    /// enough parsing to read one request's headers + body off a
-    /// `std::net::TcpListener` connection and answer with a fixed status.
-    /// Runs on a blocking thread (the daemon's tests are not all async), so
-    /// [`HttpsExporter`] — an async `reqwest::Client` — talks to it over a
-    /// real loopback socket exactly as it would talk to a real sink.
-    struct MockSink {
-        addr: SocketAddr,
-        requests: Arc<Mutex<Vec<MockRequest>>>,
-        respond_with: Arc<Mutex<u16>>,
-        /// The success-response body (Issue #4830 — the real `/ingest` echoes
-        /// `{"accepted":N,"host_id":"…"}`). Empty by default so the pre-#4830
-        /// "no echo" backend is what the untouched tests below exercise.
-        respond_body: Arc<Mutex<String>>,
-        shutdown: Arc<std::sync::atomic::AtomicBool>,
-        handle: Option<std::thread::JoinHandle<()>>,
+    /// A sink answering `200` with an empty body, so the pre-#4830 "no echo"
+    /// backend is what the untouched tests exercise (the real `/ingest` echoes
+    /// `{"accepted":N,"host_id":"…"}`, set per test via `set_body`).
+    fn mock_sink() -> HttpSink {
+        HttpSink::answering(200, "")
     }
 
-    #[derive(Debug, Clone)]
-    struct MockRequest {
-        auth_header: Option<String>,
-        body: Vec<u8>,
-    }
-
-    impl MockSink {
-        fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let addr = listener.local_addr().unwrap();
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let respond_with = Arc::new(Mutex::new(200u16));
-            let respond_body = Arc::new(Mutex::new(String::new()));
-            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let handle = spawn_accept_loop(
-                listener,
-                requests.clone(),
-                respond_with.clone(),
-                respond_body.clone(),
-                shutdown.clone(),
-            );
-            MockSink {
-                addr,
-                requests,
-                respond_with,
-                respond_body,
-                shutdown,
-                handle: Some(handle),
-            }
-        }
-
-        fn url(&self) -> String {
-            format!("http://{}/ingest", self.addr)
-        }
-
-        fn requests(&self) -> Vec<MockRequest> {
-            self.requests.lock().unwrap().clone()
-        }
-
-        fn set_status(&self, status: u16) {
-            *self.respond_with.lock().unwrap() = status;
-        }
-
-        /// Answer every subsequent request with this body (Issue #4830).
-        fn set_body(&self, body: &str) {
-            *self.respond_body.lock().unwrap() = body.to_string();
-        }
-
-        /// Simulate the sink going offline: stop accepting new connections.
-        /// Existing in-flight requests are unaffected; a *new* POST from the
-        /// exporter will hit connection-refused once the listener itself is
-        /// dropped in [`Self::kill`].
-        fn kill(mut self) -> (SocketAddr, Arc<Mutex<Vec<MockRequest>>>) {
-            self.shutdown
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-            // `requests` is cloned (both point at the same underlying data —
-            // it is an `Arc`) rather than moved, because `Self` implements
-            // `Drop` and cannot be partially moved out of.
-            (self.addr, self.requests.clone())
-        }
-
-        /// Revive a killed sink on the **same** address (rebinding a plain
-        /// TCP listening socket with no established connections is safe
-        /// immediately after close — no TIME_WAIT is incurred on a
-        /// never-accepted listener).
-        fn revive(addr: SocketAddr, requests: Arc<Mutex<Vec<MockRequest>>>) -> Self {
-            let listener = TcpListener::bind(addr).unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let respond_with = Arc::new(Mutex::new(200u16));
-            let respond_body = Arc::new(Mutex::new(String::new()));
-            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let handle = spawn_accept_loop(
-                listener,
-                requests.clone(),
-                respond_with.clone(),
-                respond_body.clone(),
-                shutdown.clone(),
-            );
-            MockSink {
-                addr,
-                requests,
-                respond_with,
-                respond_body,
-                shutdown,
-                handle: Some(handle),
-            }
-        }
-    }
-
-    impl Drop for MockSink {
-        fn drop(&mut self) {
-            self.shutdown
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    fn spawn_accept_loop(
-        listener: TcpListener,
-        requests: Arc<Mutex<Vec<MockRequest>>>,
-        respond_with: Arc<Mutex<u16>>,
-        respond_body: Arc<Mutex<String>>,
-        shutdown: Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false).ok();
-                        if let Some(request) = read_request(&mut stream) {
-                            // Record the request *before* writing the response:
-                            // `emit_batch(...).await` on the client side unblocks
-                            // as soon as the response bytes are visible, which can
-                            // race ahead of this thread's next line. Recording
-                            // first guarantees any caller that has observed the
-                            // response also observes the recorded request.
-                            requests.lock().unwrap().push(request);
-                            let status = *respond_with.lock().unwrap();
-                            let body = respond_body.lock().unwrap().clone();
-                            let _ = write_response(&mut stream, status, &body);
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-        })
-    }
-
-    fn read_request(stream: &mut std::net::TcpStream) -> Option<MockRequest> {
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .ok();
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let header_end;
-        loop {
-            let n = stream.read(&mut chunk).ok()?;
-            if n == 0 {
-                return None;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-                header_end = pos + 4;
-                break;
-            }
-        }
-        let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let auth_header = header_text
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
-            .map(|line| {
-                line.split_once(':')
-                    .map(|x| x.1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string()
-            });
-        let content_length: usize = header_text
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
-            .and_then(|line| line.split_once(':').map(|x| x.1))
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0);
-        while buf.len() < header_end + content_length {
-            let n = stream.read(&mut chunk).ok()?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        let body = buf[header_end..(header_end + content_length).min(buf.len())].to_vec();
-        Some(MockRequest { auth_header, body })
-    }
-
-    fn write_response(
-        stream: &mut std::net::TcpStream,
-        status: u16,
-        body: &str,
-    ) -> std::io::Result<()> {
-        let reason = if status < 300 { "OK" } else { "Error" };
-        let response = format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes())
-    }
-
-    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
+    fn ingest_url(sink: &HttpSink) -> String {
+        format!("{}/ingest", sink.base_url())
     }
 
     /// The identity these tests' daemon reports for itself — matched against
@@ -617,23 +407,23 @@ mod tests {
 
     #[tokio::test]
     async fn emit_batch_posts_the_batch_with_bearer_auth() {
-        let sink = MockSink::start();
-        let exporter = test_exporter(sink.url(), "s3cr3t-ingest-key");
+        let sink = mock_sink();
+        let exporter = test_exporter(ingest_url(&sink), "s3cr3t-ingest-key");
         let batch = vec![one_envelope(), one_envelope()];
         exporter.emit_batch(&batch).await.unwrap();
 
         let requests = sink.requests();
         assert_eq!(requests.len(), 1, "one batch ⇒ one HTTP request");
-        assert_eq!(requests[0].auth_header.as_deref(), Some("Bearer s3cr3t-ingest-key"));
+        assert_eq!(requests[0].values("authorization"), vec!["Bearer s3cr3t-ingest-key"]);
         let decoded: Vec<TelemetryEnvelope> = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(decoded.len(), 2);
     }
 
     #[tokio::test]
     async fn non_2xx_status_is_reported_as_rejected() {
-        let sink = MockSink::start();
+        let sink = mock_sink();
         sink.set_status(500);
-        let exporter = test_exporter(sink.url(), "key");
+        let exporter = test_exporter(ingest_url(&sink), "key");
         let batch = vec![one_envelope()];
         let error = exporter.emit_batch(&batch).await.unwrap_err();
         match error {
@@ -649,11 +439,12 @@ mod tests {
         // read as degraded, and stop sending after the first answer.
         use super::super::queue::DurableQueue;
         use super::super::sender::{try_flush, FlushOutcome, ESCALATE_AFTER_FAILURES};
-        let sink = MockSink::start();
-        let exporter = test_exporter(sink.url(), "key");
+        let sink = mock_sink();
+        let exporter = test_exporter(ingest_url(&sink), "key");
         let dir = tempfile::tempdir().unwrap();
         let queue = DurableQueue::open(dir.path().join("q.jsonl"), 100);
-        let status = super::super::ExportStatus::started("host-test", &sink.url(), "https", 30);
+        let status =
+            super::super::ExportStatus::started("host-test", &ingest_url(&sink), "https", 30);
 
         sink.set_status(500);
         queue.push(one_envelope());
@@ -708,16 +499,16 @@ mod tests {
     async fn kill_and_revive_round_trip_still_talks_to_the_same_exporter() {
         // Exercises the mock sink helper itself (the drain-loop-level
         // kill/revive integration test lives in `super::super::sender`).
-        let sink = MockSink::start();
-        let exporter = test_exporter(sink.url(), "key");
+        let sink = mock_sink();
+        let exporter = test_exporter(ingest_url(&sink), "key");
         exporter.emit_batch(&[one_envelope()]).await.unwrap();
         let (addr, requests) = sink.kill();
         assert!(test_exporter(format!("http://{addr}/ingest"), "key")
             .emit_batch(&[one_envelope()])
             .await
             .is_err());
-        let revived = MockSink::revive(addr, requests);
-        let exporter2 = test_exporter(revived.url(), "key");
+        let revived = HttpSink::revive(addr, requests);
+        let exporter2 = test_exporter(ingest_url(&revived), "key");
         exporter2.emit_batch(&[one_envelope()]).await.unwrap();
         assert_eq!(revived.requests().len(), 2);
     }
@@ -728,10 +519,10 @@ mod tests {
 
     #[tokio::test]
     async fn matching_echoed_host_id_publishes_no_mismatch() {
-        let sink = MockSink::start();
+        let sink = mock_sink();
         sink.set_body(r#"{"accepted":1,"host_id":"host-test"}"#);
         let status = Arc::new(HostIdStatus::default());
-        let exporter = test_exporter_with_status(sink.url(), TEST_HOST_ID, status.clone());
+        let exporter = test_exporter_with_status(ingest_url(&sink), TEST_HOST_ID, status.clone());
 
         exporter.emit_batch(&[one_envelope()]).await.unwrap();
 
@@ -742,10 +533,10 @@ mod tests {
     async fn mismatched_echoed_host_id_is_published_with_both_identities() {
         // The live 2026-07-31 incident: the Studio's key was bound to
         // `robb-pro`, so every record it pushed was filed under that host.
-        let sink = MockSink::start();
+        let sink = mock_sink();
         sink.set_body(r#"{"accepted":1,"host_id":"robb-pro"}"#);
         let status = Arc::new(HostIdStatus::default());
-        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+        let exporter = test_exporter_with_status(ingest_url(&sink), "robb-studio", status.clone());
 
         exporter.emit_batch(&[one_envelope()]).await.unwrap();
 
@@ -756,10 +547,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_mismatch_warns_once_per_lifetime_not_once_per_flush() {
-        let sink = MockSink::start();
+        let sink = mock_sink();
         sink.set_body(r#"{"accepted":1,"host_id":"robb-pro"}"#);
         let status = Arc::new(HostIdStatus::default());
-        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+        let exporter = test_exporter_with_status(ingest_url(&sink), "robb-studio", status.clone());
 
         // Ten flushes, one warning: `mismatch_warned` latches on the first, and
         // `record_mismatch` returns `false` for every subsequent flush — which
@@ -786,10 +577,10 @@ mod tests {
     async fn a_backend_that_echoes_no_host_id_is_not_a_mismatch() {
         // A pre-#4830 backend answers `{"accepted":N}` — unverifiable, not
         // wrong. Must stay silent rather than cry wolf on every flush.
-        let sink = MockSink::start();
+        let sink = mock_sink();
         sink.set_body(r#"{"accepted":1}"#);
         let status = Arc::new(HostIdStatus::default());
-        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+        let exporter = test_exporter_with_status(ingest_url(&sink), "robb-studio", status.clone());
 
         exporter.emit_batch(&[one_envelope()]).await.unwrap();
 
@@ -800,10 +591,10 @@ mod tests {
     async fn a_non_json_success_body_never_fails_the_export() {
         // A proxy answering 200 with HTML must not turn an acked batch into a
         // retry (which would duplicate rows the backend already stored).
-        let sink = MockSink::start();
+        let sink = mock_sink();
         sink.set_body("<html>hello</html>");
         let status = Arc::new(HostIdStatus::default());
-        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+        let exporter = test_exporter_with_status(ingest_url(&sink), "robb-studio", status.clone());
 
         exporter.emit_batch(&[one_envelope()]).await.unwrap();
 
@@ -815,11 +606,11 @@ mod tests {
         // The identity echo is worth a few dozen bytes, not an unbounded read:
         // past MAX_ACK_BODY_BYTES the body is cut off, the truncated JSON fails
         // to parse, and the whole thing degrades to "nothing to compare".
-        let sink = MockSink::start();
+        let sink = mock_sink();
         let padding = "x".repeat(2 * MAX_ACK_BODY_BYTES);
         sink.set_body(&format!(r#"{{"accepted":1,"host_id":"robb-pro","pad":"{padding}"}}"#));
         let status = Arc::new(HostIdStatus::default());
-        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+        let exporter = test_exporter_with_status(ingest_url(&sink), "robb-studio", status.clone());
 
         exporter.emit_batch(&[one_envelope()]).await.unwrap();
 
@@ -832,12 +623,13 @@ mod tests {
     #[tokio::test]
     async fn a_retired_intents_field_on_the_ack_is_ignored() {
         for field in ["[]", "{}", r#""s""#, "null", r#"[{"number":"x"}, 3]"#] {
-            let sink = MockSink::start();
+            let sink = mock_sink();
             sink.set_body(&format!(
                 r#"{{"accepted":1,"host_id":"robb-pro","operator_priority_intents":{field}}}"#
             ));
             let status = Arc::new(HostIdStatus::default());
-            let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+            let exporter =
+                test_exporter_with_status(ingest_url(&sink), "robb-studio", status.clone());
             exporter.emit_batch(&[one_envelope()]).await.unwrap();
             assert!(status.snapshot().is_some(), "{field}: the #4830 host-id check still ran");
         }

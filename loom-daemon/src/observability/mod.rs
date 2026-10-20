@@ -139,6 +139,8 @@ pub mod session_summary;
 pub mod shutdown;
 pub mod standalone_ops;
 pub mod step_verdict;
+#[cfg(test)]
+pub(crate) mod test_sink;
 pub mod tracing;
 pub mod work_started;
 
