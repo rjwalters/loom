@@ -168,6 +168,10 @@ pub mod auto_update_tick;
 /// eligibility boundary.
 pub mod dispatch_eligibility;
 
+/// `eta.stage_occupancy` (#12866) — per-repo, per-stage gauge of the items
+/// still waiting in a pre-ready stage (count, oldest age, age buckets).
+pub mod stage_occupancy;
+
 /// `daemon.exit` (#11839) — why the daemon process ended.
 pub mod daemon_exit;
 /// `merge_queue.event` (#12653) — a merge-queue record exported to OTLP.
@@ -574,6 +578,14 @@ macro_rules! telemetry_kind_table {
             /// attributes. Replaces the POST to loom-ui's
             /// `/api/alerts/external`. OTLP-only. See [`alert_transition`].
             AlertTransition = "alert.transition" => $crate::telemetry::kinds::alert_transition::AlertTransitionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A per-stage occupancy gauge (Issue #12866): how many items sit in
+            /// `triage_wait` / `approval_wait` / `operator_hold` right now, the
+            /// oldest one's age and fixed age buckets, per repo plus a global
+            /// rollup — the still-waiting population `eta.stage_outcome` (exit
+            /// only) cannot see. OTLP-only. See [`stage_occupancy`].
+            StageOccupancy = "eta.stage_occupancy" => $crate::telemetry::kinds::stage_occupancy::StageOccupancyRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
