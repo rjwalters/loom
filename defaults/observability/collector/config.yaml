@@ -509,7 +509,10 @@ processors:
           # loom.fleet_dispatch.* captain gauges (#12873) add host (a roster host
           # id, never worker text); loom.dispatch.running_by_age adds age (a
           # closed set of four buckets).
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "kind", "container", "installation", "agent", "route", "purpose", "volume", "step", "shard_count", "sweep_ids", "visibility", "workspace", "host", "age"])
+          # loom.forge.hold_items / hold_age_seconds (#12038) add artifact
+          # (issue|pr), hold (the hold label's short name), basis
+          # (labels_at|unknown) and stat (oldest|p50|p90).
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "kind", "container", "installation", "agent", "route", "purpose", "volume", "step", "shard_count", "sweep_ids", "visibility", "workspace", "host", "age", "artifact", "hold", "basis", "stat"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318

@@ -904,6 +904,10 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         // The gather concurrency is the Direct backend's alone.
         "step_dispatch/gather_budget.rs",
         "observability/ops/dispatch_facts.rs",
+        // The hold-age gauges read the published snapshot's labels only; no
+        // claim, label-transition or merge read (invariant 3).
+        "observability/ops/hold_age.rs",
+        "observability/ops/hold_age_tests.rs",
         "step_dispatch/driver.rs",
         "step_dispatch/gather.rs",
         // Whole-tick Gitea fixture seeds discovery; no live snapshot read.

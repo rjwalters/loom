@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Hold-age gauges re-homed on the discovery snapshot** (#12369, follow-up to #12038). `loom.forge.hold_items` and `loom.forge.hold_age_seconds{stat=oldest|p50|p90}` (per `repo`, `artifact`, `hold`) are emitted again, once per tick, from the step driver's discovery snapshot (aged from `labels_at`) instead of the stage-dwell sampler deleted in #12316. No forge calls; a repo the tick could not read (`tier = none`) emits nothing. The gauges were never released. See `defaults/docs/telemetry-schema.md`.
+
 ### Changed
 
 - **`eta.dispatch_eligibility` and `loom.dispatch.disposition` no longer cap at 256 rows** (#12920). Both exporters dropped rows past 256 per sample, so which items had facts depended on queue iteration order, a selective missingness an ETA fit cannot correct. Every queued row is now emitted; `loom.queue.disposition_rows_dropped` loses its `truncated` reason (`unresolved` remains). Consumers (loom-ui ETA): `rank` / `eligible_work_ahead(_repo)` keep their names and values but are documented as comparator order only, not queue position. The step-mode draw is weighted random and ignores them; use the draw weight share in `pick.decision.item_draw` for dispatch position.

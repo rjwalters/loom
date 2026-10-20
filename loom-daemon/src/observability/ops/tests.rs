@@ -269,6 +269,8 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::DispatchRunningOldestAgeSec,
         MetricName::DispatchRunningByAge,
         MetricName::StepActionable,
+        MetricName::ForgeHoldItems,
+        MetricName::ForgeHoldAgeSeconds,
         MetricName::QueueDispositionRowsDropped,
         MetricName::MergeRedatePrs,
         MetricName::MergeRedatesMax,

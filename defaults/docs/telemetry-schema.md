@@ -1900,10 +1900,43 @@ resource `host.id`), never labelled by issue:
 | `loom.dispatch.role_idle_slots` | `Gauge` | `{slot}` | — | `role_max_concurrent − Σ busy_slots{role≠"sweep"}`, floored at `0`. The host's agent capacity is `max_concurrent + role_max_concurrent` = `Σ busy_slots + idle_slots + role_idle_slots` |
 | `loom.dispatch.running_oldest_age_sec` | `Gauge` | `s` | `role` (a step role name), `pool="step"` | seconds since the oldest live step of that role started (its registry entry's `started_at`), at the tick (#12873). **No point** for a role with no live step (never `0`). A roll-resumed step's age restarts at the resume. Issue sweeps (`role="sweep"`) and role-runner agents have no age series |
 | `loom.dispatch.running_by_age` | `Gauge` | `{slot}` | `role` (a step role name), `pool="step"`, `age` ∈ `lt_15m`, `15m_1h`, `1h_4h`, `ge_4h` | live steps per running-age bucket (#12873); each edge is an exclusive upper bound (a step exactly 15 min old is `15m_1h`). Every step role × bucket reports, `0` included, once any registry has published (the `busy_slots{pool="step"}` rule), so `Σ_age running_by_age{role}` = `busy_slots{role, pool="step"}`. A start ahead of the host clock reads age `0`. At most 5 roles × 5 series per host |
+| `loom.forge.hold_items` | `Gauge` | `{item}` | `repo`, `artifact` (`issue` \| `pr`), `hold`, `basis` (`labels_at` \| `unknown`) | open items carrying a hold or park label (#12038), counted under each hold label they carry (an item with two is counted twice). `basis=labels_at` items have a known hold start; `basis=unknown` items do not and are left out of `loom.forge.hold_age_seconds` |
+| `loom.forge.hold_age_seconds` | `Gauge` | `s` | `repo`, `artifact`, `hold`, `stat` (`oldest` \| `p50` \| `p90`) | seconds since the hold label was last applied (#12038), nearest-rank over the `basis=labels_at` items of that `(repo, artifact, hold)`; absent when none has a known start |
 
 Forge label-stage dwell (`loom.forge.stage_dwell`, `loom.forge.stage_items`)
 is no longer exported (#12316): dwell is a consumer's computation over the
 mirror's per-item label times.
+
+**Hold age (#12038, #12369).** `loom.forge.hold_items` and `loom.forge.hold_age_seconds`
+(`observability/ops/hold_age.rs`) say how long items have been held. The
+population is every open issue or PR carrying a registry `park` or `hold` label
+(`loom:blocked`, `loom:operator`, `loom:frozen`, and the retired names that fold
+into them). `hold` is the label with `loom:` stripped and `-` turned into `_`.
+The hold start is `labels_at[<hold label>]` on the row, never `updatedAt`
+(Champion's own notices bump it, #9534). The source is the **step driver's
+discovery snapshot** (#12311): the gauges are emitted once per tick, right
+after the snapshot is taken, and cost **no GitHub calls** and add no
+forge-read caller. A repo the tick could not read (`tier = none`) emits **no
+hold points**, and a repo the tick did not read is not re-emitted from an
+earlier tick (absent, never `0`). The gauges are on whenever an OTLP exporter
+is; there is no separate switch.
+
+Count, oldest and p90 age per repo and hold over time:
+
+```promql
+max by (repo, hold) ({"__name__"="loom.forge.hold_items", basis="labels_at"})
+max by (repo, hold) ({"__name__"="loom.forge.hold_age_seconds", stat="oldest"})
+max by (repo, hold) ({"__name__"="loom.forge.hold_age_seconds", stat="p90"})
+```
+
+The oldest `hold=blocked` issue per repo, in days:
+
+```promql
+max by (repo) ({"__name__"="loom.forge.hold_age_seconds", hold="blocked", artifact="issue", stat="oldest"}) / 86400
+```
+
+Every host that reads a repo reports it, so aggregate with `max by (repo)`,
+not `sum`.
 
 The busy-slot gauges count no PR-set sweep
 (`/loom:sweep --prs`, hand-dispatched), which is in neither pool. The role
