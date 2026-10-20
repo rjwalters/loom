@@ -8,7 +8,7 @@
 //! step spawn, and returns the [`TickReport`] every tick consumer (the tick
 //! line, the summary, the dispatch plan, `pick.decision`) reads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -364,6 +364,11 @@ impl StepDriver {
         // `loom.step.actionable{repo}`: the drawable depth the stalled and
         // idle alerts key on. Absent, never 0, for a repo not listed.
         let mut actionable = Vec::new();
+        // `eta.dispatch_state` (#12918): each listed workspace's ladder
+        // markers by item number, kept only when the fact is on.
+        let journal_state = crate::observability::dispatch_state::enabled();
+        let mut reevals: HashMap<usize, HashMap<u32, super::reeval_ladder::Reeval>> =
+            HashMap::new();
         // #12074: walk from where the last truncated tick stopped; past the
         // deadline, gather no further repo.
         let walk = Mutex::new(GatherWalk::new(input.roots.len(), self.next_start, Instant::now()));
@@ -390,6 +395,7 @@ impl StepDriver {
                     weighing: super::item_draw::Weighing {
                         pool: Vec::new(),
                         excluded: Default::default(),
+                        excluded_items: Vec::new(),
                         demotions: Vec::new(),
                     },
                     halted: true,
@@ -484,6 +490,9 @@ impl StepDriver {
                 gathered.stale_listing || !gathered.pulls_complete,
                 escalated,
             );
+            if journal_state {
+                reevals.insert(idx, gathered.reevals.clone());
+            }
             let (mut cooldowns, pool_exhausted_roles, claims) = {
                 let reg = registry
                     .lock()
@@ -552,6 +561,24 @@ impl StepDriver {
         }
         // The draw keeps its workspace order whatever the walk's rotation.
         workspaces.sort_by_key(|w| w.idx);
+        // Pool-wide, so read once, from the primary workspace like the
+        // work-finder's own hot-applied config.
+        let knobs = input
+            .roots
+            .first()
+            .map_or_else(PoolKnobs::default, |root| PoolKnobs::for_root(root));
+        if journal_state {
+            let observed = workspaces
+                .iter()
+                .filter(|w| !w.halted)
+                .map(|w| w.idx)
+                .collect();
+            crate::observability::dispatch_state::observe(
+                super::state_rows::state_rows(&workspaces, &reevals, &knobs),
+                &observed,
+                input.roots,
+            );
+        }
         crate::observability::ops::emit_metrics(actionable);
         if let Err(e) = self.provider.flush() {
             log::debug!("work_finder: stage-entry cache not written: {e}");
@@ -594,12 +621,7 @@ impl StepDriver {
                 fallback,
             },
             &seed,
-            // Pool-wide, so read once, from the primary workspace like the
-            // work-finder's own hot-applied config.
-            &input
-                .roots
-                .first()
-                .map_or_else(PoolKnobs::default, |root| PoolKnobs::for_root(root)),
+            &knobs,
             &mut spawner,
         );
         let draw_total = draw_started.elapsed();

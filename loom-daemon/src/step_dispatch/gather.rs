@@ -88,6 +88,8 @@ pub struct Gathered {
     pub inputs: Vec<DrawInput>,
     /// The Champion re-evaluation ladder's due times, from the bodies.
     pub ladder: Vec<(u32, StepRole, DateTime<Utc>)>,
+    /// The same ladder records' rung and raw `next`, by item number (#12918).
+    pub reevals: HashMap<u32, super::reeval_ladder::Reeval>,
     /// Creation times by number.
     pub created_at: HashMap<u32, String>,
     /// The open-PR listing answered. When it did not, a PR linked only by
@@ -320,6 +322,31 @@ pub fn ladder_due(rows: &[RestIssue], now: DateTime<Utc>) -> Vec<(u32, StepRole,
             };
             let due = super::reeval_ladder::due(r.body.as_deref()?, role, now)?;
             Some((r.number, role, due))
+        })
+        .collect()
+}
+
+/// The ladder record each row's body carries, by number (#12918): the one
+/// [`ladder_due`] reads (a PR's `champion_merge`, an issue's
+/// `champion_promote`), with its rung and its raw `next`. Read at `now` for
+/// the choice between several records, as [`ladder_due`] does.
+#[must_use]
+pub fn ladder_state(
+    rows: &[RestIssue],
+    now: DateTime<Utc>,
+) -> HashMap<u32, super::reeval_ladder::Reeval> {
+    rows.iter()
+        .filter_map(|r| {
+            let role = if r.is_pull_request {
+                StepRole::ChampionMerge
+            } else {
+                StepRole::ChampionPromote
+            };
+            let record = super::reeval_ladder::parse(r.body.as_deref()?)
+                .into_iter()
+                .filter(|e| e.step == role)
+                .max_by_key(|e| e.due_at(now))?;
+            Some((r.number, record))
         })
         .collect()
 }
@@ -656,6 +683,7 @@ pub fn finish(
     }
     Gathered {
         ladder: ladder_due(&rows, now),
+        reevals: ladder_state(&rows, now),
         created_at: rows
             .iter()
             .filter_map(|r| r.created_at.clone().map(|c| (r.number, c)))

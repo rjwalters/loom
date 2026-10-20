@@ -234,6 +234,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`merge.queue.observed`](#mergequeueobserved--the-merge-queue-as-an-existing-read-saw-it) | log, OTLP only | `forge_merge_queue/group_github.rs` (`GroupForge::groups`) |
 | [`merge.queue.regime`](#mergequeueregime--the-merge-queue-settings-on-change-only) | log, OTLP only | `forge_merge_queue/group_run.rs` (`tick_groups`, from `preflight::github_preflight`) |
 | [`eta.dispatch_eligibility`](#etadispatch_eligibility--why-a-ready-item-is-or-is-not-schedulable) | log, OTLP only | `observability/dispatch_eligibility.rs` (collector sample of the last work-finder tick) |
+| [`eta.dispatch_state`](#etadispatch_state--each-classified-items-dispatch-gate-and-when-it-lifts) | log, OTLP only | `observability/dispatch_state.rs` (called from the step driver's tick with `step_dispatch/state_rows.rs` rows) |
 | [`eta.stage_occupancy`](#etastage_occupancy--items-still-waiting-in-a-pre-ready-stage) | log, OTLP only | `observability/stage_occupancy.rs` (collector sample of the open-issue queues) |
 
 | [`eta.stage_entry`](#etastage_entry--an-items-arrival-in-a-stage) | log, OTLP only | `observability/stage_entry_fact.rs` (diff of the step driver's per-tick discovery snapshot) |
@@ -2850,6 +2851,60 @@ Body fields (`observability/otlp/mapping/dispatch_eligibility.rs`,
 | `max_concurrent` | the host's effective concurrency cap this tick (the global pool size). |
 | `level` | the issue's priority level (`default` / `important` / `very-important`) — the axis the work-ahead counts are relative to. |
 | `sampled_at` / `tick_at` | the collector sample instant (record time) and the work-finder tick it reflects. |
+
+### `eta.dispatch_state` — each classified item's dispatch gate, and when it lifts
+
+One OTLP-only log record per **classified open item** (issue or PR, pooled or
+weight-0) per emission (Issue #12918). `eta.dispatch_eligibility` journals the
+work finder's queue disposition for a ready issue; the step dispatcher decides
+differently — it classifies every open item into a step or a pass, then weighs
+it into the draw pool or out of it with an `Exclusion`. An ETA consumer asking
+*when can this gated item next be drawn* needs that per-item decision and the
+gate's release time, neither of which was exported.
+
+The producer is `observability::dispatch_state`, called by the step driver once
+per tick after every workspace is weighed and shaped, with rows built by
+`step_dispatch::state_rows` from facts the tick already holds (the `Weighing`,
+the merged `StepCooldowns`, the ladder markers parsed from the bodies the
+discovery snapshot carries). It makes **no forge call** (`loom.forge.calls` is
+unchanged): repo identity resolves only through the synchronous
+`cached_repo_ref`, and a workspace not yet cached is skipped until it is.
+
+There is **no row cap** (#12920 removes the sibling kinds' 256-row caps). A row
+is emitted when the item is first seen, or when any of (`in_pool`, `exclusion`,
+`gate_until`, `reeval_rung`) changes since its last emission
+(`transition: changed`), and every item is re-stated by a periodic full
+reconciliation (`transition: refresh`, default 10 min,
+`LOOM_DISPATCH_STATE_REFRESH_SECS`). A halted or unlisted workspace is neither
+emitted nor forgotten. Weight drift (`iw`, `weight`) alone is not a change.
+
+An absent `gate_until`, `reeval_rung` or `reeval_next` means *no such gate is
+known* — never "now" or `0`. `exclusion` is `Exclusion::as_str()`: a classifier
+pass reason (`frozen`, `operator`, `claimed`, `shared_pr`, …), `pool_exhausted`,
+`build_backoff`, `cooling_down` or `merge_in_flight`. The Champion
+re-evaluation ladder's due time enters the draw through the cooldowns, so a
+not-yet-due merge/promote item surfaces as `cooling_down` with `gate_until`
+from `StepCooldowns::until`. `pool_exhausted`, `build_backoff` and
+`merge_in_flight` have no per-item end and carry no `gate_until`.
+
+Envelopes carry `schema_version: 12`. The body is the record's JSON;
+`loom.repo`, `loom.repo.visibility` and `loom.issue` (or `loom.pr_number` for a
+PR row) ride as attributes, with the promoted
+`loom.eta.dispatch_state.*` keys (`DISPATCH_STATE_LOG_ATTRIBUTE_KEYS`, all on
+the `transform/privacy` log `keep_keys`; an absent value is an absent
+attribute).
+
+| Field | Meaning |
+|---|---|
+| `number` / `artifact` | the item's number and `issue` / `pr`: the step's target (the PR for a PR step), else the issue, else the PR. |
+| `step` | the classifier's step (`Step::as_str`); absent for a pass. |
+| `in_pool` | whether the item was in the draw pool this tick. |
+| `exclusion` | why it was out of the pool (absent when pooled). |
+| `gate_until` | when the gate lifts, where it has a per-item end (a `cooling_down` window). |
+| `reeval_rung` / `reeval_next` | the Champion re-evaluation ladder rung and `next` from the item's body marker (`champion_merge` on a PR, `champion_promote` on an issue); absent without a marker. |
+| `iw` / `weight` | when pooled: the item weight (priority × age term) and its weight in the host-wide draw (`iw` scaled by its repo's terms). |
+| `transition` | `changed` or `refresh`. |
+| `sampled_at` | the emission instant (record time). |
 
 ### `eta.stage_occupancy` — items still waiting in a pre-ready stage
 
