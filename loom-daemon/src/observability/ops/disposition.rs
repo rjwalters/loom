@@ -56,13 +56,12 @@
 //! incomplete repo, so a transient `gh` failure never reads as "the issue
 //! left the queue".
 //!
-//! # Cardinality bound
+//! # Dropped rows
 //!
-//! At most [`MAX_ROWS`] rows are turned into spans per [`record`] call;
-//! further rows are dropped and counted on
-//! [`MetricName::QueueDispositionRowsDropped`] with `reason = "truncated"`, as
-//! is a row whose repo root never resolved to a forge slug (`reason =
-//! "unresolved"`). A single-workspace-loop tick names every row `workspace
+//! Every row is turned into a span; none is dropped for volume, because a
+//! cap would make which items carry facts depend on iteration order. A row
+//! whose repo root never resolved to a forge slug is dropped and counted on
+//! [`MetricName::QueueDispositionRowsDropped`] (`reason = "unresolved"`). A single-workspace-loop tick names every row `workspace
 //! #N` (never an absolute path), which never resolves either — those rows are
 //! dropped the same way, exactly like `queue_snapshot`.
 //!
@@ -104,10 +103,6 @@ use crate::work_finder::{PARK_LABELS, SKIP_LABELS};
 pub const REFRESH_SECS_ENV: &str = "LOOM_DISPATCH_DISPOSITION_REFRESH_SECS";
 /// Default refresh cadence: ten minutes.
 pub const DEFAULT_REFRESH_SECS: i64 = 600;
-
-/// Most rows turned into spans per [`record`] call. A row past this is
-/// dropped and counted with `reason = "truncated"`.
-pub const MAX_ROWS: usize = 256;
 
 /// How a row's span relates to the previous emission this process made for
 /// the same `(repo, issue)` key. The wire value of
@@ -445,7 +440,6 @@ impl DispositionTracker {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DroppedCounts {
     pub unresolved: usize,
-    pub truncated: usize,
 }
 
 /// The label on `detail`, only for rows whose disposition carries a label in
@@ -520,8 +514,7 @@ fn halt_cause_token(disposition: QueueDisposition, detail: Option<&str>) -> Opti
 /// Build this tick's disposition rows from `summary`'s ranked queue, resolving
 /// each row's repo through `repos` (as [`super::super::repo_ref::resolve_repo_refs`]
 /// already resolved it). A row whose repo did not resolve is dropped and
-/// counted as `unresolved`; a row past [`MAX_ROWS`] is dropped and counted as
-/// `truncated`. Pure.
+/// counted as `unresolved`. Pure.
 #[must_use]
 pub fn build_rows(
     summary: &WorkFinderTickSummary,
@@ -536,10 +529,6 @@ pub fn build_rows(
             dropped.unresolved += 1;
             continue;
         };
-        if rows.len() >= MAX_ROWS {
-            dropped.truncated += 1;
-            continue;
-        }
         rows.push(DispositionRow {
             slug: repo.repo.clone(),
             visibility: repo.visibility,
@@ -612,12 +601,6 @@ pub fn dropped_points(dropped: DroppedCounts) -> Vec<MetricPoint> {
         points.push(
             MetricPoint::int(MetricName::QueueDispositionRowsDropped, int(dropped.unresolved))
                 .label("reason", "unresolved"),
-        );
-    }
-    if dropped.truncated > 0 {
-        points.push(
-            MetricPoint::int(MetricName::QueueDispositionRowsDropped, int(dropped.truncated))
-                .label("reason", "truncated"),
         );
     }
     points

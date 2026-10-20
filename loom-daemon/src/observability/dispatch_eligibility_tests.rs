@@ -111,6 +111,17 @@ fn unresolved_rows_are_dropped_and_level_rides_along() {
     assert_eq!(rows[0].max_concurrent, 2);
 }
 
+#[test]
+fn more_than_256_waiting_rows_are_all_emitted() {
+    let queue: Vec<ReadyQueueRow> = (0..300)
+        .map(|i| qrow("o/r", i + 1, i as usize + 1, Qd::DeferredCapacity))
+        .collect();
+    let rows = build_rows(&summary(queue, 2), resolve_all);
+    assert_eq!(rows.len(), 300);
+    let issues: std::collections::HashSet<u32> = rows.iter().map(|r| r.issue).collect();
+    assert_eq!(issues.len(), 300);
+}
+
 // --------------------------------------------------------- EligibilityTracker::diff
 
 fn elig_row(slug: &str, issue: u32, eligibility: Eligibility, reason: &str) -> EligRow {
