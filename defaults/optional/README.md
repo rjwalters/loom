@@ -12,7 +12,8 @@ A `merge_group` workflow that runs `loom-daemon forge merge-queue group-check --
 
 - **`loom-daemon`:** the job downloads the `loom-daemon-x86_64-unknown-linux-gnu` release asset (plus `.sha256`) from `rjwalters/loom` with `gh release download` and verifies the checksum. Set `LOOM_VERSION` to a release that includes `forge merge-queue group-check`.
 - **Checkout:** the job sparse-checks-out `.loom` at the merge-group commit before running `group-check`. Without a `.loom/` checkout whose origin is the repository, `write_scope` refuses the status write (#9548) and the required status never posts; `merge-group-ci audit` reports `GROUP_CHECK_WITHOUT_CHECKOUT` for such a workflow.
-- **Credential:** the workflow's own `github.token` with `permissions: statuses: write` (plus `contents: read`). No App token or secret is used. Unverified: that `github.token` can read the queue entries and PR comments `group-check` needs on a live `merge_group` run; confirm on the first live event (tracked on #10257).
+- **Credential:** the workflow's own `github.token` with `permissions: statuses: write`, `pull-requests: read`, `checks: read` and `contents: read` (the reads cover the queue, PR and check-run lookups `group-check` makes; without them it fails with `Resource not accessible by integration`). No App token or secret is used. Unverified: the credential WRITE probe for the Actions `github.token`; confirm on a live `merge_group` run (tracked on #10257).
+- **Re-check trigger:** besides `merge_group`, the workflow runs on `workflow_run` (`completed`, branches `gh-readonly-queue/**`) so a `pending` result is re-evaluated when CI finishes. Replace `workflows: ["CI"]` with the name of the workflow that runs your required checks.
 - The ruleset must list `loom/merge-authorization` and your CI check as required. Run `loom-daemon merge-group-ci audit` on your CI workflow first.
 
 ### `github-workflows/label-external-issues.yml`

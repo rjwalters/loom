@@ -67,6 +67,13 @@ counts as uncovered.
 The output records each workflow's and job's `permissions:` for review, but
 permissions do not produce findings.
 
+The shipped `merge-group-check.yml` template needs `statuses: write`,
+`pull-requests: read`, `checks: read` and `contents: read`; without the reads
+`group-check` fails with `Resource not accessible by integration`. It also
+triggers on `workflow_run` (`completed`, `gh-readonly-queue/**`) so the `pending`
+status posted at `checks_requested` is re-evaluated when CI finishes; set
+`workflows:` to the name of your CI workflow.
+
 A job that exists only to trim PR runs, such as `ci.yml`'s `changes`
 path-filter job, declares itself with a marker comment inside the job block:
 
