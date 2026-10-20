@@ -100,10 +100,9 @@
 //! of its fixture under a directory named `re po` for exactly that reason.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use super::branch_landed::{self, Verdict};
-use super::wip::Out;
+use super::wip::{git_ok, git_stdout, Out};
 
 mod holder;
 
@@ -221,8 +220,9 @@ pub fn run_with(opts: &Options, forge: &dyn Fn(&str) -> branch_landed::ForgeProb
 /// as equal (and so suppressed the refusal), and an unresolvable tip is not
 /// evidence of anything.
 fn tip_is_current_default(repo: &Path, opts: &Options) -> bool {
-    let tip = git_stdout(repo, &["rev-parse", &opts.branch]);
-    let default_tip = git_stdout(repo, &["rev-parse", &format!("origin/{}", opts.default_branch)]);
+    let tip = git_stdout(repo, &["rev-parse", &opts.branch]).unwrap_or_default();
+    let default_tip = git_stdout(repo, &["rev-parse", &format!("origin/{}", opts.default_branch)])
+        .unwrap_or_default();
     tip == default_tip
 }
 
@@ -325,32 +325,6 @@ fn json_pr(number: Option<&str>) -> serde_json::Value {
             .unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
     }
-}
-
-fn git_ok(repo: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-fn git_stdout(repo: &Path, args: &[&str]) -> String {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
