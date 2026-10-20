@@ -43,6 +43,10 @@ const ALLOWED_KEYS: &[&str] = &[
     "loom.host.oom_kill_total",
     "loom.host.pressure",
     "loom.host.load_per_core",
+    "loom.host.logical_cpus",
+    "loom.host.loadavg_1m",
+    "loom.host.cpu_budget_cores",
+    "loom.host.sweeps_in_flight",
 ];
 
 fn traced_root() -> tempfile::TempDir {
