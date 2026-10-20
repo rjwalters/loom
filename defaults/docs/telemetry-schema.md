@@ -2996,7 +2996,7 @@ and `INFO` otherwise.
 #### Role step verdicts: `step:<role>` (#12027)
 
 A role step also emits `pass.verdict`, with `mechanism=step:<role>` (today
-`step:champion`; the judge row is #12029). The daemon builds the records from
+`step:champion`, `step:doctor` and `step:curator`; the judge row is #12029). The daemon builds the records from
 facts the run already produced, so there is no new GitHub call and no prompt
 change: a `Marker` entry that `loom-daemon forge comment` appends to the pick
 journal (the body's first-line `<!-- ns:kind[:…] -->`), the agent gh front's
@@ -3016,9 +3016,9 @@ projected reason, so `passVerdictQuery` still parses both):
 | Field (`loom.pass.*`) | Notes |
 |---|---|
 | `head_sha` | the head evaluated, when the run recorded it (the Champion pin file, else the mirror); absent otherwise |
-| `step` | `champion_pr` or `champion_issue` |
+| `step` | `champion_pr`, `champion_issue`, `doctor` or `curator` |
 | `class` | `verdict`, `noop`, `refused` or `failed` |
-| `reason_set` | `champion_merge_v2`, `champion_promotion_v1` or `champion_triage_v1` |
+| `reason_set` | `champion_merge_v2`, `champion_promotion_v1`, `champion_triage_v1`, `doctor_step_v1` or `curator_step_v1` |
 | `loom.sweep_id` | the step's sweep id, to join a verdict to its session (#12715) |
 | `reason_detail` | the raw `reason=` token of a `skipped` / `requeued` step (body `detail`), bounded to token characters (#12715) |
 | `ledger_class` / `ledger_reason` | the outcome ledger's own classification. It can differ from `class` / `reason`: a red-CI rejection keeps `loom:pr`, so the ledger says `failed unclassified` where the projection says `refused ci_failing`. `probe_failed` when the mirror was not fresh |
@@ -3056,6 +3056,33 @@ the merge gate's rows do (`not_eligible`, `failed`, `unclassified`).
 peer held a fresh `loom:evaluating`) or `not_eligible`. `failed` carries
 `failed` or `unclassified`. There is no `duplicate`: Champion has no duplicate
 close.
+
+**Doctor step (`doctor_step_v1`, `step=doctor`, `artifact=pr`, #12921).**
+One record per Doctor step end, no-op included, read from the journal and the
+step's `LOOM_STEP_OUTCOME role=doctor` line (no forge call). `head_sha` is the
+last journaled comment marker's head, absent when none named one; `doctor_cycles`
+has no journaled signal and is not emitted.
+
+| `class` | `reason` |
+|---|---|
+| `verdict` | `fixed_pushed` |
+| `noop` | `no_change` |
+| `refused` | `escalated` (a journaled `operator-decision` / park, or `class=refused`), `gave_up` (`class=refused reason=gave_up`) |
+| `failed` | `failed` (`class=failed`, or no outcome line) |
+
+**Curator step (`curator_step_v1`, `step=curator`, `artifact=issue`, #12921).**
+One record per Curator step end, from the journaled writes (the `loom:curated`
+label the gh front saw, an `operator-decision apply`, a `park-record apply --by
+curator`), else the `LOOM_STEP_OUTCOME role=curator` line. A `verdict` whose
+`reason=` names none of the rows below reads `curated`. `closed`, `rescoped` and
+`decomposed` come from the step's own `reason=` token: nothing journals them.
+
+| `class` | `reason` |
+|---|---|
+| `verdict` | `curated`, `rescoped`, `closed`, `decomposed` |
+| `refused` | `routed_operator` |
+| `noop` | `noop` |
+| `failed` | `failed` (`class=failed`, or no outcome line) |
 
 **Why is this issue still `curated`?** Join two sources. Evaluated:
 `pass.verdict` with `step=champion_issue` (this record). Not evaluated, which
