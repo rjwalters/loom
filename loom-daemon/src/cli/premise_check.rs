@@ -4,10 +4,10 @@
 //! reason `DepClassifyCommand` does: `main.rs` is over
 //! `.loom/docs/file-size-policy.md`'s threshold and frozen, so a new
 //! subcommand must cost it nothing. What the gate answers, and why each rule
-//! exists, is documented on [`loom_daemon::premise_check`].
+//! exists, is documented on [`crate::premise_check`].
 
+use crate::premise_check::cli;
 use anyhow::Result;
-use loom_daemon::premise_check::cli;
 use std::path::PathBuf;
 
 #[derive(clap::Args, Debug)]

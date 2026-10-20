@@ -12,7 +12,7 @@
 //!    holds the numbers, and this is the path that gets them out — a
 //!    human-readable table, or `--json` to feed a reconciliation job.
 //! 2. **Verification.** It is the same
-//!    [`loom_daemon::codex_usage::tokens_by_model`] the sweep and role-tick
+//!    [`crate::codex_usage::tokens_by_model`] the sweep and role-tick
 //!    journals call, so running it against a worktree after a Codex sweep
 //!    shows exactly what that sweep's `tokens_by_model` will carry. That is
 //!    how #8594's "matches the numbers in Codex's own store for that launch"
@@ -25,7 +25,7 @@
 //! This command adds no file read of its own.
 //!
 //! It scans the same home set the daemon does
-//! ([`loom_daemon::codex_usage::codex_homes`]): the ambient `$CODEX_HOME` (or
+//! ([`crate::codex_usage::codex_homes`]): the ambient `$CODEX_HOME` (or
 //! `~/.codex`) **and** every pooled profile under `~/.loom/codex-profiles/`,
 //! which is where a pool-selected sweep's rollouts actually land. Set
 //! `LOOM_CODEX_HOME` to pin exactly one home instead.
@@ -44,7 +44,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
-use loom_daemon::codex_usage::{self, CodexSessionUsage, SessionFilter};
+use crate::codex_usage::{self, CodexSessionUsage, SessionFilter};
 
 /// `loom-daemon codex-usage` arguments.
 #[derive(clap::Args)]
@@ -189,7 +189,7 @@ impl CodexUsageArgs {
             return Ok(None);
         }
         let now = Utc::now();
-        let since = loom_daemon::sweep_outcome_summary::parse_since(&self.since, now)?;
+        let since = crate::sweep_outcome_summary::parse_since(&self.since, now)?;
         let until = match &self.until {
             Some(raw) => DateTime::parse_from_rfc3339(raw)
                 .with_context(|| format!("--until {raw:?} is not RFC3339"))?
@@ -222,7 +222,7 @@ impl CodexUsageArgs {
                     "--issue names one workspace root's worktree; pass exactly one --directory \
                      with it"
                 );
-                loom_daemon::usage_source::sweep_directories(&roots[0], issue)
+                crate::usage_source::sweep_directories(&roots[0], issue)
             }
         };
         Ok(SessionFilter {

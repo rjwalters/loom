@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::retries_used::retries_used;
+use crate::merge_pr::retries_used::retries_used;
 
 #[derive(clap::Args)]
 pub(crate) struct RetriesUsedArgs {

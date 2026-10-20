@@ -83,8 +83,8 @@
 //! Silence is never a route, so a daemon that dies mid-write cannot be read as
 //! `reconcile` — which is the route that force-pushes.
 
+use crate::merge_pr::reconcile::{child_route, defer_comment, plan, Plan, Row};
 use anyhow::Result;
-use loom_daemon::merge_pr::reconcile::{child_route, defer_comment, plan, Plan, Row};
 use std::io::{Read, Write};
 
 /// Read all of stdin as bytes, or exit 2.
@@ -171,16 +171,16 @@ impl ReconcileChildArgs {
         let mut decision = child_route(issue.as_deref(), &labels);
         // AC7 (#12759): `loom:building` alone defers every Loom-built child
         // forever; only a live lease means a Builder is on the branch.
-        if decision.route == loom_daemon::merge_pr::reconcile::Route::Defer {
+        if decision.route == crate::merge_pr::reconcile::Route::Defer {
             if let Some(n) = issue.as_deref().and_then(|i| i.parse::<u32>().ok()) {
                 let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
-                let state = loom_daemon::merge_pr::reconcile::read_lease_state(&root, n);
-                decision = loom_daemon::merge_pr::reconcile::route_with_lease(decision, &state);
+                let state = crate::merge_pr::reconcile::read_lease_state(&root, n);
+                decision = crate::merge_pr::reconcile::route_with_lease(decision, &state);
             }
         }
         let mut out = std::io::stdout().lock();
         writeln!(out, "LOOM-RECONCILE-CHILD {}", decision.route.token())?;
-        if decision.route == loom_daemon::merge_pr::reconcile::Route::Defer {
+        if decision.route == crate::merge_pr::reconcile::Route::Defer {
             let timestamp = self
                 .now
                 .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());

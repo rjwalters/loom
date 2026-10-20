@@ -47,7 +47,7 @@
 //!
 //! `merge-pr.sh` removes worktrees with its own `git worktree remove --force`
 //! rather than through `worktree.sh remove`, so it could not inherit the Rust
-//! reclaim that [`loom_daemon::worktree_ops::clean`], `worktree-remove` and the
+//! reclaim that [`crate::worktree_ops::clean`], `worktree-remove` and the
 //! reaper already share; it carried the last bash copy of the resolve/reclaim
 //! *call sequence* instead. These two verbs are that sequence, split exactly
 //! where the removal has to happen: `cargo metadata` needs the manifest that is
@@ -59,7 +59,7 @@
 //! And one that is a guard (issue #11582):
 //!
 //! * `guard --for-command <text> [--cwd <dir>]` — the `loom:cargo-target-dir`
-//!   `PreToolUse` rule [`loom_daemon::cargo_target_guard`]: exit 1 with a
+//!   `PreToolUse` rule [`crate::cargo_target_guard`]: exit 1 with a
 //!   `BLOCKED [cargo-target-dir]` denial for a cargo build into a target dir
 //!   nothing owns, or a `BLOCKED [cargo-shared-target]` denial when a worktree
 //!   build would fall through to a shared `build.target-dir` (#10646,
@@ -69,8 +69,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_ops::cargo_target::{self, per_worktree, provision};
-use loom_daemon::worktree_root::worktree_root;
+use crate::worktree_ops::cargo_target::{self, per_worktree, provision};
+use crate::worktree_root::worktree_root;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum CargoTargetDirCommand {
@@ -337,7 +337,7 @@ impl ReclaimArgs {
 impl GuardArgs {
     fn run(self) -> Result<()> {
         let cwd = repo_root_or_cwd(self.cwd);
-        use loom_daemon::cargo_target_guard::{self as guard, Verdict};
+        use crate::cargo_target_guard::{self as guard, Verdict};
         match guard::check_process(&self.for_command, &cwd) {
             Some(Verdict::Deny(denial)) => {
                 guard::publish(&denial);

@@ -23,8 +23,8 @@
 //! Every field arrives on stdin, never in argv — check names are
 //! forge/workflow-author-controlled text with no length or character bound.
 
+use crate::merge_pr::checks_failure::{classify, Verdict};
 use anyhow::Result;
-use loom_daemon::merge_pr::checks_failure::{classify, Verdict};
 use std::io::Read;
 
 #[derive(clap::Args)]

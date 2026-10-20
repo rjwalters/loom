@@ -1,13 +1,13 @@
 //! `loom-daemon forge parent body|link` (#10012 §4): the logic behind
 //! `create-issue.sh --parent N`. The script only passes the flag; see
-//! [`loom_daemon::parent_link`].
+//! [`crate::parent_link`].
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use crate::parent_link::{child_body, fetch_parent_body, link_created};
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
-use loom_daemon::parent_link::{child_body, fetch_parent_body, link_created};
 
 #[derive(Subcommand, Debug)]
 pub enum ParentAction {
@@ -39,7 +39,7 @@ fn target(repo: Option<String>) -> Result<(PathBuf, String)> {
     let root = std::env::current_dir()?;
     let slug = match repo {
         Some(r) => r,
-        None => loom_daemon::worktree_ops::gh::resolve_owner_repo(&root)
+        None => crate::worktree_ops::gh::resolve_owner_repo(&root)
             .map(|(o, n)| format!("{o}/{n}"))
             .ok_or_else(|| anyhow!("cannot resolve owner/repo; pass --repo OWNER/REPO"))?,
     };
@@ -49,7 +49,7 @@ fn target(repo: Option<String>) -> Result<(PathBuf, String)> {
 /// The child's issue number, refusing a reference into another repository
 /// (#10012 excludes cross-repo propagation): nothing is written for it.
 fn child_number(child: &str, slug: &str) -> Result<u32> {
-    let (child_slug, number) = loom_daemon::forge_comment::parse_issue_ref(child)
+    let (child_slug, number) = crate::forge_comment::parse_issue_ref(child)
         .ok_or_else(|| anyhow!("--child: not an issue reference: {child:?}"))?;
     if let Some(named) = child_slug {
         if !named.eq_ignore_ascii_case(slug) {
