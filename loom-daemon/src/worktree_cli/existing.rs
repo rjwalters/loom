@@ -102,7 +102,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::wip::Out;
+use super::wip::{git_ok, Out};
 
 /// Everything the arm needs, all of it already resolved by `worktree.sh`.
 pub struct Options {
@@ -393,18 +393,6 @@ fn has_uncommitted(worktree: &Path) -> bool {
         .stderr(Stdio::null())
         .output()
         .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
-}
-
-/// `git -C <dir> <args> >/dev/null 2>/dev/null` — did it exit 0?
-fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 // ---------------------------------------------------------------------------
